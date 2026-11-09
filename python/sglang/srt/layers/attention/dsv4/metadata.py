@@ -406,6 +406,16 @@ def expand_index_page_table(
     blocks_per_page = slots_per_page // index_page_size
     if blocks_per_page == 1:
         return page_table
+    if (
+        page_table.is_cuda
+        and page_table.stride(1) == 1
+        and blocks_per_page & (blocks_per_page - 1) == 0
+    ):
+        from sglang.kernels.ops.attention.dsv4.attn_glue_hip import (
+            expand_index_page_table as expand_index_page_table_triton,
+        )
+
+        return expand_index_page_table_triton(page_table, blocks_per_page)
     bs, n = page_table.shape
     base = page_table.to(torch.int64) * blocks_per_page
     offsets = torch.arange(blocks_per_page, device=page_table.device, dtype=torch.int64)

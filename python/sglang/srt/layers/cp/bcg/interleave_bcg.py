@@ -6,7 +6,7 @@ Graph row capacity is fixed while live token counts and prefix state can change.
 
 import torch
 
-from sglang.srt.arg_groups.overrides import (
+from sglang.srt.arg_groups.model_override_base import (
     model_config_of,
     resolved_view,
     resolving_view,

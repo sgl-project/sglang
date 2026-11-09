@@ -37,6 +37,17 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.utils.common import human_readable_int
 
 
+def _paged_experts_num_resident(value: str) -> Optional[int]:
+    """``auto`` (None: as many as fit, sized after loading) or a positive count."""
+    if value == "auto":
+        return None
+    if value.isdigit() and int(value) > 0:
+        return int(value)
+    raise argparse.ArgumentTypeError(
+        f"must be 'auto' or a positive count, got {value!r}"
+    )
+
+
 class ExecFeatures(msgspec.Struct):
     """Namespace ``exec.features``."""
 
@@ -287,7 +298,7 @@ class ExecKernel(msgspec.Struct):
     fp8_gemm_runner_backend: A[
         str,
         Arg(
-            help="Choose the runner backend for Blockwise FP8 GEMM operations. Options: 'auto' (default, auto-selects based on hardware; MXFP8 dense picks flashinfer_cutedsl on SM100/SM103 and FlashInfer CUTLASS on other supported Blackwell GPUs), 'deep_gemm' (JIT-compiled; enabled by default on NVIDIA Hopper (SM90) and Blackwell (SM100) when DeepGEMM is installed), 'flashinfer_trtllm' (optimal for Blackwell and low-latency), 'flashinfer_cutlass' (FlashInfer CUTLASS groupwise FP8 GEMM), 'flashinfer_cutedsl' (FlashInfer CuTe DSL MXFP8 GEMM on SM100/SM103), 'flashinfer_deepgemm' (Hopper SM90 only; uses swapAB optimization for small M dimensions in decoding), 'cutlass' (optimal for SM120 GPUs), 'triton' (fallback, widely compatible), 'aiter' (ROCm only). ",
+            help="Choose the runner backend for Blockwise FP8 GEMM operations. Options: 'auto' (default, auto-selects based on hardware; MXFP8 dense picks flashinfer_cutedsl on SM100/SM103 and FlashInfer CUTLASS on other supported Blackwell GPUs), 'deep_gemm' (JIT-compiled; enabled by default on NVIDIA Hopper (SM90) and Blackwell (SM100) when DeepGEMM is installed), 'flashinfer_trtllm' (optimal for Blackwell and low-latency), 'flashinfer_cutlass' (FlashInfer CUTLASS groupwise FP8 GEMM), 'flashinfer_cutedsl' (FlashInfer CuTe DSL MXFP8 GEMM on SM100/SM103), 'flashinfer_deepgemm' (Hopper SM90 only; uses swapAB optimization for small M dimensions in decoding), 'cutlass' (optimal for SM120 GPUs), 'triton' (fallback, widely compatible), 'aiter' (ROCm only), 'halops' (MXFP8 w8a8 dense GEMM from the optional HALOps wheel; SM100 only). ",
             cli_name="--fp8-gemm-backend",
             choices=FP8_GEMM_RUNNER_BACKEND_CHOICES,
             resolvable=True,
@@ -1028,16 +1039,22 @@ class ExecMoe(msgspec.Struct):
     # -------------------------------------------------------------------------
     enable_paged_experts: A[
         bool,
-        "Keep only --paged-experts-num-resident routed experts per MoE layer on the GPU and page "
-        "the rest from pinned host memory on demand. Single GPU; the experts must run on the "
+        "Keep only --paged-experts-num-resident (K) routed experts per MoE layer on the GPU and "
+        "page the rest from pinned host memory on demand. Single GPU; the experts must run on the "
         "triton or Marlin MoE runner (supported quantizations: see the Paged Experts docs). "
         "Decode CUDA graphs (full backend) are captured up to K // top_k requests; prefill "
         "graphs must be breakable or disabled.",
     ] = False
     paged_experts_num_resident: A[
         Optional[int],
-        "Number of routed experts per MoE layer kept resident on the GPU. Required with "
-        "--enable-paged-experts; at least the router's top-k.",
+        Arg(
+            help="Number of routed experts per MoE layer kept resident on the GPU, at least the "
+            "router's top-k; or 'auto' (the default): as many as fit in --mem-fraction-static "
+            "next to a KV cache of --max-total-tokens, else of up to --max-running-requests, if "
+            "you set it (else 1), requests of --context-length (default: the model's), at "
+            "least one.",
+            type_parser=_paged_experts_num_resident,
+        ),
     ] = None
 
     # -------------------------------------------------------------------------

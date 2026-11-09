@@ -20,7 +20,7 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (

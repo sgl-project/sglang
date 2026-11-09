@@ -49,7 +49,7 @@ register_cpu_ci(est_time=70, suite="stage-b-test-cpu-intel")
 
 @functools.lru_cache(maxsize=None)
 def _shared_tokenizer(path: str):
-    from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+    from sglang.srt.utils.hf_transformers import get_tokenizer
 
     return get_tokenizer(path)
 

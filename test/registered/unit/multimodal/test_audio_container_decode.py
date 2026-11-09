@@ -13,12 +13,12 @@ import av
 import numpy as np
 import soundfile
 
-from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.multimodal.audio_from_video import (
     decode_audio_container,
     extract_audio_from_video_bytes,
     is_audio_container,
 )
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sglang.srt.utils.common import load_audio
 from sglang.test.ci.ci_register import register_cpu_ci

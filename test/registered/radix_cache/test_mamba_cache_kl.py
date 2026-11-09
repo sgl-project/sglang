@@ -53,27 +53,31 @@ class MambaCacheKLMixin:
         return logprobs - np.logaddexp.reduce(logprobs)
 
 
-class TestMambaLazyInplaceKL(MambaCacheKLMixin, DefaultServerBase):
+class TestMambaLazyFullPoolKL(MambaCacheKLMixin, DefaultServerBase):
     """Guard lazy Mamba checkpoint reuse when the optional track slot is exhausted.
 
     Keep overlap scheduling and decode CUDA graphs enabled. A four-slot pool holds
     two cached prefixes, the request's live state, and its keep checkpoint. The
-    first decode must track in place; delayed prefill processing must not publish
-    that buffer under the old checkpoint length.
+    first decode boundary finds no free track slot, evicts a cached state to get
+    one, and never writes the keep buffer; delayed prefill processing must not
+    publish that buffer under a wrong length.
 
     Compare full-vocabulary next-token distributions at the SAME 255-token prompt,
-    before and after a 32-token decode seeds the cache. Comparing later free-running
-    tokens would confound cache corruption with different generated histories.
+    resumed from a 192-token checkpoint that a 32-token decode left behind and from
+    one a prefill alone wrote. Both resume at the same length, so a correct state
+    matches exactly; comparing later free-running tokens would confound cache
+    corruption with different generated histories.
 
-    GB300 / Qwen3.5-0.8B: reverting the checkpoint invalidation gives KL=0.649448
-    and a stale 192-token cache hit; with the fix KL=0 and the safe hit is 128 tokens.
+    GB300 / Qwen3.5-0.8B: publishing a keep buffer the boundary decode wrote under
+    its old length gives KL=0.649448 on the same 192-token hit; a correct state
+    gives KL=0.
     """
 
     ignore_eos = True
     model = "Qwen/Qwen3.5-0.8B"
     server_env = {
         "SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK": "0",
-        "SGLANG_TEST_MAMBA_LAZY_ALLOC_FAIL": "0",
+        "SGLANG_TEST_MAMBA_LAZY_POOL_FULL": "0",
     }
     other_args = [
         "--skip-tokenizer-init",
@@ -123,29 +127,31 @@ class TestMambaLazyInplaceKL(MambaCacheKLMixin, DefaultServerBase):
         self.assertEqual(len(logprobs), 32)
         self.assertTrue(np.isfinite([row[0] for row in logprobs]).all())
 
-    def test_reuse_distribution_after_inplace_tracking(self):
+    def test_reuse_distribution_after_boundary_decode(self):
         config = AutoConfig.from_pretrained(self.model)
         self.vocab_ids = list(range(config.get_text_config().vocab_size))
         prompt = [42] * 128 + [43] * 127
 
-        # A single output token does not launch the boundary-crossing decode.
+        # A single output token does not launch the boundary-crossing decode, so
+        # the 192-token checkpoint comes from the prefill alone.
         self._warm_prefixes()
+        self._generate(prompt[:192], 1)
         reference = self._generate(prompt, 1, score=True)
-        self.assertEqual(reference["meta_info"]["cached_tokens"], 128)
+        self.assertEqual(reference["meta_info"]["cached_tokens"], 192)
         reference_logprobs = self._distribution(reference)
 
         self._warm_prefixes()
         seed = self._generate(prompt, 32)
         self.assertEqual(seed["meta_info"]["cached_tokens"], 128)
         reused = self._generate(prompt, 1, score=True)
-        self.assertGreaterEqual(reused["meta_info"]["cached_tokens"], 128)
+        self.assertEqual(reused["meta_info"]["cached_tokens"], 192)
         reused_logprobs = self._distribution(reused)
 
         kl = float(
             np.sum(np.exp(reference_logprobs) * (reference_logprobs - reused_logprobs))
         )
         print(
-            f"lazy in-place checkpoint KL(reference || reuse)={kl:.9g}, "
+            f"lazy boundary checkpoint KL(reference || reuse)={kl:.9g}, "
             f"cached_tokens={reused['meta_info']['cached_tokens']}",
             flush=True,
         )

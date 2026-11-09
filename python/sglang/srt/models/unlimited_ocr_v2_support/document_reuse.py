@@ -1073,7 +1073,7 @@ class DocReuse:
         return retained
 
     def _retain_finished(self, req) -> bool:
-        from sglang.srt.managers.schedule_batch import (
+        from sglang.srt.managers.req_types import (
             FINISH_MATCHED_STR,
             FINISH_MATCHED_TOKEN,
         )

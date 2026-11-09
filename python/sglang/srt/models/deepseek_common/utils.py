@@ -19,7 +19,7 @@ import torch
 
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.environ import envs
-from sglang.srt.layers.moe.fused_moe_triton.layer import get_moe_runner_backend
+from sglang.srt.layers.moe import get_moe_runner_backend
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.utils import (
     cpu_has_amx_support,

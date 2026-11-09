@@ -11,11 +11,10 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils import (
     cache_once,
-    get_jit_cuda_arch,
     is_arch_support_pdl,
-    is_hip_runtime,
     load_jit,
     make_cpp_args,
 )
@@ -58,7 +57,7 @@ def _n32k5120_gemm_custom_op(
 
 @cache_once
 def _arch_supported() -> bool:
-    return not is_hip_runtime() and get_jit_cuda_arch().major >= 9
+    return current_arch().is_sm_at_least(9)
 
 
 def can_use_n128k512_gemm(n: int, k: int, m: int, max_m: int = MAX_M) -> bool:

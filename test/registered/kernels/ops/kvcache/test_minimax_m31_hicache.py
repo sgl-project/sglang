@@ -50,6 +50,7 @@ def test_nvfp4_async_hicache_round_trip(layout, backend):
         hicache_io_backend=backend,
         hicache_mem_layout=layout,
         hicache_write_policy="write_through",
+        hicache_host_memory_mode="cache",
     )
     with (
         patch.object(assembler, "get_memory", return_value=memory),

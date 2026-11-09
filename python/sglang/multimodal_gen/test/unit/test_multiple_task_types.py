@@ -62,10 +62,8 @@ def make_args(config, output=None):
 
 
 def test_legacy_enums_and_capabilities():
-    from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
-    from sglang.multimodal_gen.configs.sample.sampling_params import (
-        DataType as OldDataType,
-    )
+    from sglang.multimodal_gen.configs.task_type import DataType as OldDataType
+    from sglang.multimodal_gen.configs.task_type import ModelTaskType
 
     assert ModelTaskType is Task
     assert OldDataType is DataType

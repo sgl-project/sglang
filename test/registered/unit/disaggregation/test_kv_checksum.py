@@ -255,6 +255,7 @@ class _FakeScheduler(SchedulerDisaggregationDecodeMixin):
         )
         self.req_to_token_pool = SimpleNamespace(req_to_token=req_to_token)
         self.tree_cache = None
+        self.enable_hisparse = False
         self.output_streamer = SimpleNamespace(stream_output=self.stream_output)
         self.metrics_reporter = SimpleNamespace(enable_metrics=True)
         self.metrics_collector = Mock()
@@ -577,6 +578,30 @@ class TestGetNewPrebuiltBatchChecksum(unittest.TestCase):
         self.assertEqual(batch.reqs, [skipped])
         self.assertEqual(sched.streamed_aborts, [aborted])
         mock_abort.assert_called_once()
+
+
+class TestKvChecksumMismatchHiSparse(unittest.TestCase):
+    def test_mismatch_releases_hisparse_before_kv(self):
+        # Transfer already admitted the request into HiSparse; the abort must
+        # free its host pages before the KV itself.
+        sched = _FakeScheduler(None, None)
+        sched.enable_hisparse = True
+        calls = []
+        sched.hisparse_coordinator = Mock()
+        sched.hisparse_coordinator.request_finished.side_effect = lambda req: (
+            calls.append(("hisparse", req))
+        )
+        req = _make_req(0xDEADBEEF, 4)
+        with (
+            envs.SGLANG_IS_IN_CI.override(False),
+            patch("sglang.srt.disaggregation.decode.prepare_abort"),
+            patch(
+                "sglang.srt.disaggregation.decode.release_kv_cache",
+                side_effect=lambda req, *a, **kw: calls.append(("kv", req)),
+            ),
+        ):
+            sched._handle_kv_checksum_mismatch(req, "KV checksum mismatch")
+        self.assertEqual(calls, [("hisparse", req), ("kv", req)])
 
 
 _SENTINEL = object()
