@@ -19,7 +19,7 @@ from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_interleave
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.utils.common import strict_contiguous
 from sglang.srt.runtime_context import get_parallel, get_platform
-from sglang.srt.utils import is_gfx95_supported, is_hip, is_sm120
+from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.srt.utils.device import is_gfx1250_supported
 
 _is_hip = is_hip()
@@ -2325,9 +2325,8 @@ def _hc_mix_stats_reduce_kernel(
 # a row must produce the same bits alone and in any batch routed to this backend.
 _HC_MIX_SLICE_CHOICES = (80, 64, 40, 32, 16, 8, 4, 2, 1)
 _HC_MIX_BLOCK_M = 32
-# SM120: BLOCK_K=32 is 1.4-1.55x faster at M>=1024 on RTX PRO 5000 and never
-# slower; still a per-platform constant, so batch invariance holds.
-_HC_MIX_BLOCK_K = 32 if is_sm120() else 64
+# Keep the non-fused projection's reduction order unchanged.
+_HC_MIX_BLOCK_K = 64
 _HC_MIX_NUM_WARPS = 4
 # Triton on AMD has no tf32x3 (gfx942 adds only tf32); "ieee" is the fp32 MFMA
 _HC_MIX_DOT_PRECISION = "ieee" if _is_hip else "tf32x3"
@@ -2354,10 +2353,35 @@ def _block_m_for(m: int) -> int:
     return _HC_MIX_BLOCK_M
 
 
-def _num_slices_for(k: int) -> int:
-    """Slice count depends only on K, never on batch size M."""
-    blocks = k // _HC_MIX_BLOCK_K
-    assert k % _HC_MIX_BLOCK_K == 0, k
+@functools.lru_cache(maxsize=None)
+def _hc_mix_stats_sinkhorn_block_k(device: torch.device) -> int:
+    # Query the input device at launch, not import: capability queries initialize
+    # CUDA and must not run in a parent process before fork. SM121 is unmeasured.
+    # The narrower tile benefits the SM120 split-K projection at large M; small-M
+    # timings and cache-resident inputs need separate measurements.
+    if (
+        device.type == "cuda"
+        and not _is_hip
+        and torch.cuda.get_device_capability(device) == (12, 0)
+    ):
+        return 32
+    return _HC_MIX_BLOCK_K
+
+
+def _hc_mix_stats_sinkhorn_block_m(m: int, block_k: int) -> int:
+    block_m = _block_m_for(m)
+    # With BLOCK_K=32 on SM120, the 8-row tile changes rounding relative to
+    # 16/32-row tiles. Use the latter even for decode to preserve batch invariance.
+    return max(16, block_m) if block_k == 32 else block_m
+
+
+def _num_slices_for(k: int, block_k: int = _HC_MIX_BLOCK_K) -> int:
+    """Slice count depends only on K and tile width, never on batch size M.
+
+    Changing BLOCK_K can also change the selected split-K count.
+    """
+    blocks = k // block_k
+    assert k % block_k == 0, k
     for n in _HC_MIX_SLICE_CHOICES:
         if blocks % n == 0:
             return n
@@ -2377,7 +2401,7 @@ def hc_mix_stats(x_flat: torch.Tensor, hc_fn: torch.Tensor, eps: float) -> torch
     m, k = x_flat.shape
     mix = hc_fn.shape[0]
     assert hc_fn.shape[1] == k
-    num_slices = _num_slices_for(k)
+    num_slices = _num_slices_for(k, _HC_MIX_BLOCK_K)
     mix_pad = max(16, triton.next_power_of_2(mix))
     part_mix = torch.empty(
         (num_slices, m, mix), dtype=torch.float32, device=x_flat.device
@@ -2515,11 +2539,12 @@ def hc_mix_stats_sinkhorn(
     if m == 0:
         return pre, post, comb
 
-    num_slices = _num_slices_for(k)
+    block_k = _hc_mix_stats_sinkhorn_block_k(dev)
+    num_slices = _num_slices_for(k, block_k)
     mix_pad = max(16, triton.next_power_of_2(mix))
     part_mix = torch.empty((num_slices, m, mix), dtype=torch.float32, device=dev)
     part_sq = torch.empty((num_slices, m), dtype=torch.float32, device=dev)
-    block_m = _block_m_for(m)
+    block_m = _hc_mix_stats_sinkhorn_block_m(m, block_k)
     _hc_mix_stats_partial_kernel[(triton.cdiv(m, block_m), num_slices)](
         x_flat,
         hc_fn,
@@ -2533,7 +2558,7 @@ def hc_mix_stats_sinkhorn(
         MIX_PAD=mix_pad,
         NUM_SLICES=num_slices,
         BLOCK_M=block_m,
-        BLOCK_K=_HC_MIX_BLOCK_K,
+        BLOCK_K=block_k,
         DOT_PRECISION=_HC_MIX_DOT_PRECISION,
         num_warps=_HC_MIX_NUM_WARPS,
         num_stages=_HC_MIX_NUM_STAGES,
@@ -2582,6 +2607,7 @@ def hc_mix_stats_sinkhorn(
 # residual), accumulated over a fixed slice count to bound the fp32 error.
 _HC_MIX_COMPENSATED_SLICES = 16
 _HC_MIX_BF16X3_BLOCK_M = 128
+_HC_MIX_BF16X3_BLOCK_K = 64
 _HC_PRENORM_BLOCK_M = 64
 
 
@@ -2674,7 +2700,7 @@ def hc_mix_stats_sinkhorn_bf16x3(
     block_m = 64 if hopper_medium else _HC_MIX_BF16X3_BLOCK_M
     assert x.is_contiguous() and x.dtype == torch.bfloat16
     assert hopper_medium or 4096 <= m <= 65536
-    assert k % (slices * _HC_MIX_BLOCK_K) == 0
+    assert k % (slices * _HC_MIX_BF16X3_BLOCK_K) == 0
     assert len(weight_parts) == 3
     assert all(
         w.shape == (mix, k) and w.dtype == torch.bfloat16 and w.is_contiguous()
@@ -2695,7 +2721,7 @@ def hc_mix_stats_sinkhorn_bf16x3(
         K_PER_SLICE=k // slices,
         MIX_COLS=mix,
         MIX_PAD=triton.next_power_of_2(mix),
-        BLOCK_K=_HC_MIX_BLOCK_K,
+        BLOCK_K=_HC_MIX_BF16X3_BLOCK_K,
         BLOCK_M=block_m,
         num_warps=4,
         num_stages=3,
