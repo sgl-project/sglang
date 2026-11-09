@@ -1,7 +1,19 @@
 // BS1 K3 shared gate/up projection with a SiTU epilogue.
 #pragma once
+#include <sgl_kernel/tensor.h>
+#include <sgl_kernel/utils.h>
+
+#include <sgl_kernel/type.cuh>
+#include <sgl_kernel/utils.cuh>
+#include <sgl_kernel/vec.cuh>
+#include <sgl_kernel/warp.cuh>
+
+#include <sgl_kernel/gemm/dot_product.cuh>
+
+#include <tvm/ffi/container/tensor.h>
+
 #include "../kimi_k3/situ_and_mul.cuh"
-#include "tiny_gemm.cuh"
+#include <cstdint>
 
 namespace sglang {
 
@@ -19,13 +31,18 @@ struct K3SharedSituParams {
 template <bool kHasLinearBeta, bool kUsePDL>
 __global__ __launch_bounds__(448, 1) void k3_shared_situ_kernel(const K3SharedSituParams params) {
   using namespace device;
-  using Trait = GEMMTraitN<1536, 7168, 16, 32>;
-  constexpr uint32_t K = Trait::K;
-  constexpr uint32_t N_SPLIT = Trait::N_SPLIT;
-  constexpr uint32_t kBlockSize = Trait::kBlockSize;
+  // [1, 7168] x [1536, 7168]^T: each CTA owns 16 rows of w (8 gate + 8 up) and
+  // every thread 32B of K (one or two vectors, by the arch's vector width).
+  constexpr uint32_t K = 7168;
+  constexpr uint32_t N_SPLIT = 16;
+  constexpr uint32_t kBytes = 32;
+  constexpr uint32_t kBlockSize = K * sizeof(bf16_t) / kBytes;
   constexpr uint32_t kNumWarps = kBlockSize / kWarpThreads;
-  constexpr uint32_t kUnroll = Trait::kUnroll;
-  using vec_t = AlignedVector<bf16x2_t, Trait::kVecSize / 2>;
+  constexpr uint32_t kVecSize = kMaxVecBytes / sizeof(bf16_t);
+  constexpr uint32_t kUnroll = kBytes / kMaxVecBytes;
+  static_assert(kBytes % kMaxVecBytes == 0, "a thread's 32B of K must be whole vectors");
+  static_assert(kBlockSize == 448, "launch_bounds and the host launch assume 448 threads");
+  using vec_t = AlignedVector<bf16x2_t, kVecSize / 2>;
 
   const uint32_t bx = blockIdx.x;
   const uint32_t tx = threadIdx.x;
