@@ -30,6 +30,7 @@ from sglang.test.ci.ci_register import (
     register_cuda_ci,
     register_xpu_ci,
 )
+from sglang.test.scheduler_test_utils import FakeReq
 
 register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
@@ -60,7 +61,7 @@ def _make_req(rid="test-req-0", origin_input_ids=None, output_ids=None):
         origin_input_ids = list(range(64))
     if output_ids is None:
         output_ids = []
-    req = SimpleNamespace(
+    req = FakeReq(
         rid=rid,
         origin_input_ids=origin_input_ids,
         output_ids=output_ids,
@@ -365,8 +366,8 @@ class TestHiSparseUnit(unittest.TestCase):
         return self.coordinator.swap_in_selected_pages(rpi, sls, batch, layer_id)
 
     def _cleanup_req(self, req, kv_loc, *, logical_only=False):
-        """request_finished -> free KV -> free req slot."""
-        self.coordinator.request_finished(req)
+        """release_request -> free KV -> free req slot."""
+        self.coordinator.release_request(req)
         if logical_only:
             self.allocator.logical_attn_allocator.free(kv_loc)
         else:
@@ -618,7 +619,7 @@ class TestHiSparseUnit(unittest.TestCase):
             initial[1] - seq_len,
         )
 
-        self.coordinator.request_finished(req)
+        self.coordinator.release_request(req)
         self.allocator.logical_attn_allocator.free(torch.cat([kv_loc, out_loc]))
         self._free_req_slot(req)
         self._assert_sizes_restored(initial, "decode_remap")
