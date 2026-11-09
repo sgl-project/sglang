@@ -19,6 +19,7 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.layers.linear import LinearBase
 from sglang.srt.layers.moe import MoeRunnerConfig
+from sglang.srt.layers.moe.moe_runner import aiter as aiter_runner_mod
 from sglang.srt.layers.moe.moe_runner.aiter import AiterQuantType
 from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
 from sglang.srt.layers.quantization.quark import quark as quark_config_mod
@@ -550,9 +551,9 @@ class TestQuarkMxfp4MoEAiterQuantInfo(CustomTestCase):
     experts read the gate and up halves swapped.
     """
 
-    def test_apply_forwards_clamp_separated_layout_and_padding(self):
+    def _apply(self, moe_runner_config):
         scheme = object.__new__(QuarkW4A4MXFp4MoE)
-        scheme.moe_runner_config = MoeRunnerConfig(swiglu_limit=10.0)
+        scheme.moe_runner_config = moe_runner_config
         scheme.runner = _Runner()
 
         layer = SimpleNamespace(
@@ -575,6 +576,7 @@ class TestQuarkMxfp4MoEAiterQuantInfo(CustomTestCase):
             patch.dict(sys.modules, {"aiter.ops.flydsl.moe_common": fake_moe_common}),
             patch.object(quark_moe, "_is_gfx95", True),
             patch.object(quark_moe, "_is_gfx1250", False),
+            patch.object(aiter_runner_mod, "is_gfx95_supported", return_value=True),
         ):
             marker = object()
             result = scheme.apply_weights(layer, marker)
@@ -582,13 +584,26 @@ class TestQuarkMxfp4MoEAiterQuantInfo(CustomTestCase):
         self.assertIs(result, marker)
         quant_info = scheme.runner.quant_info
         self.assertEqual(quant_info.quant_type, AiterQuantType.PER_1X32)
-        self.assertEqual(quant_info.swiglu_limit, 10.0)
         self.assertEqual(quant_info.hidden_pad, 0)
-        self.assertEqual(quant_info.intermediate_pad, 128)
         self.assertEqual(quant_info.fused_moe_kwargs, {"gate_mode": "separated"})
         self.assertIs(quant_info.expert_mask, layer.dispatcher.expert_mask_gpu)
         self.assertTrue(quant_info.w13_weight.is_shuffled)
         self.assertTrue(quant_info.w2_weight.is_shuffled)
+        return quant_info
+
+    def test_apply_forwards_clamp_separated_layout_and_padding(self):
+        # DeepSeek-V4-Pro TP8: plain SiLU with a clamp keeps the 384 -> 512 pad.
+        quant_info = self._apply(MoeRunnerConfig(swiglu_limit=10.0))
+        self.assertEqual(quant_info.swiglu_limit, 10.0)
+        self.assertEqual(quant_info.intermediate_pad, 128)
+
+    def test_apply_drops_padding_for_swiglu_oai(self):
+        # MiniMax-M3 TP8: AITER's CK-Tile SwiGLU-OAI stage 1 is wrong with a pad.
+        quant_info = self._apply(
+            MoeRunnerConfig(gemm1_alpha=1.702, gemm1_beta=1.0, gemm1_clamp_limit=7.0)
+        )
+        self.assertEqual(quant_info.swiglu_limit, 7.0)
+        self.assertEqual(quant_info.intermediate_pad, 0)
 
 
 class TestQuarkMxfp4MoEPaddedTpLoading(CustomTestCase):

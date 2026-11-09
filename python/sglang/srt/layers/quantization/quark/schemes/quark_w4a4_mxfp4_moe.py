@@ -1138,6 +1138,14 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         else:
             _fused_moe_kwargs = None
 
+        swiglu_oai_limit = aiter_swiglu_oai_limit(self.moe_runner_config)
+        # The pad rows are zero-filled, so computing them is exact; declaring them
+        # makes AITER's CK-Tile SwiGLU-OAI stage 1 wrong on the separated gate/up
+        # layout (ROCm/aiter#3862).
+        intermediate_pad = (
+            0 if swiglu_oai_limit is not None else getattr(layer, "intermediate_pad", 0)
+        )
+
         quant_info = AiterMoeQuantInfo(
             w13_weight=w13_weight,
             w2_weight=w2_weight,
@@ -1146,11 +1154,9 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             w2_scale=layer.w2_weight_scale,
             expert_mask=layer.dispatcher.expert_mask_gpu,
             hidden_pad=getattr(layer, "hidden_pad", 0),
-            intermediate_pad=getattr(layer, "intermediate_pad", 0),
+            intermediate_pad=intermediate_pad,
             swiglu_limit=(
-                aiter_swiglu_oai_limit(self.moe_runner_config)
-                or self.moe_runner_config.swiglu_limit
-                or 0.0
+                swiglu_oai_limit or self.moe_runner_config.swiglu_limit or 0.0
             ),
             fused_moe_kwargs=_fused_moe_kwargs,
         )
