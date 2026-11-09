@@ -221,6 +221,11 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
                     else None
                 ),
                 pdd_heads=getattr(self, "pdd_heads", None),
+                sampling_preset=(
+                    release_metadata.sampling_preset
+                    if release_metadata is not None
+                    else None
+                ),
             )
         )
         self.add_stage(
