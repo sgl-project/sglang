@@ -3491,6 +3491,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 # FIXME: without deferred release, a failed receive's device
                 # destination is released at once, with no proof that the
                 # remote writer stopped; a late write can land in reused pages.
+                # Unregister first: a chunk scattered for a room still registered
+                # would index the row the release clears, i.e. other requests' KV.
+                self._unregister_staging_room(decode_req.req.bootstrap_room)
                 self.scheduler.request_retirer.release(decode_req.req, checkpoint=False)
                 receiver = decode_req.kv_receiver
                 receiver.clear()
@@ -3508,10 +3511,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             if i in deferred_indices:
                 # Held for deferred release; metadata buffer freed at resolve time.
                 continue
-            if self.enable_staging and self.staging_handler.is_staging_room(
-                queue[i].req.bootstrap_room
-            ):
-                self.staging_handler.unregister_decode_req(queue[i].req.bootstrap_room)
+            self._unregister_staging_room(queue[i].req.bootstrap_room)
             idx = queue[i].metadata_buffer_index
             assert idx != -1
             # Reset so the next owner sees actual_room == 0 ("not yet written")
@@ -3559,10 +3559,13 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             ]
         )
 
-    def _do_release(self, decode_req: DecodeRequest, idx: int) -> None:
-        room = decode_req.req.bootstrap_room
+    def _unregister_staging_room(self, room: int) -> None:
         if self.enable_staging and self.staging_handler.is_staging_room(room):
             self.staging_handler.unregister_decode_req(room)
+
+    def _do_release(self, decode_req: DecodeRequest, idx: int) -> None:
+        room = decode_req.req.bootstrap_room
+        self._unregister_staging_room(room)
         # release pre-allocated kv cache, but don't insert into the tree since it's failed
         self.scheduler.request_retirer.release(decode_req.req, checkpoint=False)
         self.metadata_buffers.clear_slot(idx)
