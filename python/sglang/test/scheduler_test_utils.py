@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Iterable
 
 from sglang.srt.disaggregation.mode import DisaggregationMode
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler_components.deferred_responses import (
     DeferredResponses,
 )
@@ -30,6 +31,10 @@ class FakeReq(SimpleNamespace):
     # Req's exit_ledger fields.
     exit_via = None
     send_via = None
+
+    # Req's media prefix hold, which aborts drop.
+    mm_prefix_hold = None
+    release_mm_prefix_hold = Req.release_mm_prefix_hold
 
 
 def release_only_retirer(

@@ -18,6 +18,7 @@ import pytest
 import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_test_utils import release_only_retirer
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -110,6 +111,7 @@ def _abort_scheduler():
     scheduler.send_abort_output = lambda out, req: sent.append((out, req))
     scheduler.hisparse_coordinator = None
     scheduler.uocr_runtime = None
+    scheduler.output_streamer = SimpleNamespace(stream_output=None)
     scheduler.init_request_retirer()
     return scheduler, sent, retired, finished
 
@@ -223,10 +225,8 @@ def test_retraction_holds_prompt_kv_after_media_release() -> None:
             assert release_req(
                 req=req,
                 remaing_req_count=0,
-                req_to_token_pool=tree.req_to_token_pool,
-                token_to_kv_pool_allocator=allocator,
                 tree_cache=tree,
-                hisparse_coordinator=None,
+                request_retirer=release_only_retirer(tree_cache=tree),
                 requeue=True,
             )
             tree.evict(EvictParams(num_tokens=100))
