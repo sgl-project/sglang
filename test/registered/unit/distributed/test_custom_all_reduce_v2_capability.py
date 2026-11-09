@@ -191,6 +191,12 @@ def test_hier_sizing(max_size, sizes_own_push, hier_max, two_shot):
         assert heuristic.two_shot_push_threshold == two_shot
 
 
+def _choice_name(choice):
+    if choice is None:
+        return None
+    return "HIER_2SHOT_PUSH" if choice.use_hier else choice.algo.name
+
+
 @pytest.mark.parametrize(
     ("nbytes", "expected"),
     [
@@ -213,8 +219,7 @@ def test_pick_config_hier_at_default_cap(nbytes, expected):
     comm = object.__new__(custom_all_reduce_v2.CustomAllReduceV2)
     comm.disabled = True
     comm.config = custom_all_reduce_v2._fit_hier(config, hier_max)
-    picked = comm._pick_config(nbytes, False)
-    assert (None if picked is None else picked.algo.name) == expected
+    assert _choice_name(comm._pick_config(nbytes, False)) == expected
 
 
 @pytest.mark.parametrize(
@@ -253,9 +258,7 @@ def test_pick_config_hier_2shot_push(nbytes, expected):
         num_mc_blocks=None,
     )
     for use_graph in (False, True):
-        picked = comm._pick_config(nbytes, use_graph)
-        algo = None if picked is None else picked.algo.name
-        assert algo == expected
+        assert _choice_name(comm._pick_config(nbytes, use_graph)) == expected
 
 
 @pytest.mark.parametrize(
