@@ -402,51 +402,14 @@ class SchedulerDllmMixin:
 
         incoming_reqs = [req for req in reqs if req.dllm_phase in _DLLM_INCOMING_PHASES]
         if incoming_reqs:
-            self._process_dllm_incoming_reqs_mixed(
+            # The sibling admission gate charges can_run_list against the free
+            # slot pool plus the rows its requests already hold, so the staging
+            # rows carried here do not starve the incoming ones. Its preemption
+            # branch is unreachable: _should_mix_dllm_batches keeps every round
+            # with priority preemption on the either/or path.
+            self.process_dllm_incoming_reqs(
                 adder, incoming_reqs, running_batch=running_batch
             )
-
-    def _process_dllm_incoming_reqs_mixed(
-        self: Scheduler,
-        adder: PrefillAdder,
-        reqs: List[Req],
-        running_batch: ScheduleBatch,
-    ) -> None:
-        """Admission gate for mixed rounds. The either/or gate compares
-        len(can_run_list) against free req slots, which starves incoming rows
-        here: can_run_list already carries every staging row, and incomplete
-        staging rows hold their req slot across FDFO rounds without drawing on
-        the free pool. Charge the row cap for every scheduled row but the slot
-        pool only for the rows that still need a fresh slot -- the same split
-        req_to_token_pool.alloc() makes. Priority preemption is not wired for
-        mixed rounds.
-        """
-        running_bs = len(running_batch.reqs)
-        new_slots_needed = sum(
-            1 for req in adder.can_run_list if req.kv.req_pool_idx is None
-        )
-        admission_budget = min(
-            self.get_num_allocatable_reqs(running_bs + len(adder.can_run_list)),
-            self.req_to_token_pool.available_size() - new_slots_needed,
-        )
-
-        for req in reqs:
-            if admission_budget <= 0:
-                running_batch.batch_is_full = True
-                break
-
-            req.init_next_round_input(self.tree_cache)
-            res = adder.add_one_req(
-                req,
-                has_chunked_req=True,
-                truncation_align_size=self.truncation_align_size,
-            )
-
-            if res != AddReqResult.CONTINUE:
-                if res == AddReqResult.NO_TOKEN:
-                    running_batch.batch_is_full = True
-                break
-            admission_budget -= 1
 
     def _process_batch_by_phase(
         self,
