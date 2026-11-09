@@ -135,8 +135,9 @@ class SchedulerInternalStateController:
                 state["dspark_info_record"] = info_record
 
     def _add_dllm(self, state: Dict[str, Any]) -> None:
-        # Requested via env var but silently downgraded when FDFO is off, so
-        # report what the scheduler actually resolved rather than what was asked.
+        # Requested via env var but downgraded with a warning when FDFO is off
+        # or the algorithm encodes context separately, so report what the
+        # scheduler actually resolved rather than what was asked.
         state["dllm_mixed_batch_enabled"] = self.scheduler.dllm_mixed_batch_enabled
         state["dllm_num_rounds"] = self.scheduler.dllm_num_rounds
         state["dllm_num_mixed_rounds"] = self.scheduler.dllm_num_mixed_rounds

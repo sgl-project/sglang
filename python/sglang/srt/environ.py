@@ -705,8 +705,9 @@ class Envs:
     # decode-phase rows (denoise blocks) into one mixed round instead of
     # prefill-first either/or rounds. Every row is still exactly one block-size
     # chunk, so the denoise step's uniform-block reshape holds; a prompt-only
-    # row self-finishes on its first denoise step. Requires --dllm-fdfo, where
-    # a round is a single denoise step; ignored otherwise.
+    # row self-finishes on its first denoise step. Requires --dllm-fdfo (a round
+    # is a single denoise step) and an algorithm that does not encode context
+    # in a separate EXTEND forward; downgraded with a warning otherwise.
     SGLANG_ENABLE_DLLM_MIXED_BATCH = EnvBool(False)
     SGLANG_ENABLE_WAITING_PREFIX_REFRESH = EnvBool(True)
     # PD prefill: bootstrap-queued requests each refresh also touches; 0 skips them.
