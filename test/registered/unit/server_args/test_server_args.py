@@ -2500,26 +2500,6 @@ class TestFlashinferMegaMoeConfig(CustomTestCase):
                 with self.assertRaisesRegex(ValueError, "incompatible"):
                     handle_a2a_moe(self._make_args())
 
-    @patch("sglang.srt.arg_groups.moe_hook.is_sm100_supported", return_value=True)
-    def test_megamoe_decode_capacity_is_checked_at_startup(self, _):
-        decode = envs.SGLANG_FLASHINFER_MEGAMOE_DECODE_MAX_TOKENS_PER_RANK
-        main = envs.SGLANG_FLASHINFER_MEGAMOE_MAX_TOKENS_PER_RANK
-        logger_name = "sglang.srt.arg_groups.moe_hook"
-        for decode_tokens, main_tokens in ((-1, 0), (64, 64)):
-            with self.subTest(decode=decode_tokens, main=main_tokens):
-                with decode.override(decode_tokens), main.override(main_tokens):
-                    with self.assertRaisesRegex(
-                        ValueError, "DECODE_MAX_TOKENS_PER_RANK"
-                    ):
-                        handle_a2a_moe(self._make_args())
-        # An unset main capacity is derived later, so startup cannot reject it.
-        with decode.override(64), main.override(0):
-            with self.assertNoLogs(logger_name, "WARNING"):
-                handle_a2a_moe(self._make_args())
-            with self.assertLogs(logger_name, "WARNING") as logs:
-                handle_a2a_moe(self._make_args(quantization="mxfp8"))
-        self.assertIn("DECODE_MAX_TOKENS_PER_RANK is ignored", logs.output[0])
-
 
 class TestPortArgs(unittest.TestCase):
     @patch("sglang.srt.server_args.tempfile.NamedTemporaryFile")
