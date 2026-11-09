@@ -433,20 +433,36 @@ class TokenizerControlMixin:
             raise RuntimeError(result.message)
         return result
 
-    async def start_expert_distribution_record(self: TokenizerManager):
-        self.auto_create_handle_loop()
-        req = ExpertDistributionReq(action=ExpertDistributionReqType.START_RECORD)
-        await self.expert_distribution_communicator(req)
+    async def start_expert_distribution_record(
+        self: TokenizerManager,
+    ) -> ExpertDistributionReqOutput:
+        return await self._execute_expert_distribution(
+            ExpertDistributionReqType.START_RECORD
+        )
 
-    async def stop_expert_distribution_record(self: TokenizerManager):
-        self.auto_create_handle_loop()
-        req = ExpertDistributionReq(action=ExpertDistributionReqType.STOP_RECORD)
-        await self.expert_distribution_communicator(req)
+    async def stop_expert_distribution_record(
+        self: TokenizerManager,
+    ) -> ExpertDistributionReqOutput:
+        return await self._execute_expert_distribution(
+            ExpertDistributionReqType.STOP_RECORD
+        )
 
-    async def dump_expert_distribution_record(self: TokenizerManager):
+    async def dump_expert_distribution_record(
+        self: TokenizerManager,
+    ) -> ExpertDistributionReqOutput:
+        return await self._execute_expert_distribution(
+            ExpertDistributionReqType.DUMP_RECORD
+        )
+
+    async def _execute_expert_distribution(
+        self: TokenizerManager, action: ExpertDistributionReqType
+    ) -> ExpertDistributionReqOutput:
         self.auto_create_handle_loop()
-        req = ExpertDistributionReq(action=ExpertDistributionReqType.DUMP_RECORD)
-        await self.expert_distribution_communicator(req)
+        results = await self.expert_distribution_communicator(
+            ExpertDistributionReq(action=action)
+        )
+        failed = [r for r in results if not r.success]
+        return failed[0] if failed else results[0]
 
     async def init_weights_update_group(
         self: TokenizerManager,

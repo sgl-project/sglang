@@ -1630,19 +1630,25 @@ class Engine(EngineScoreMixin, EngineBase):
         self.loop.run_until_complete(self.tokenizer_manager.stop_profile())
 
     def start_expert_distribution_record(self):
-        self.loop.run_until_complete(
+        ret = self.loop.run_until_complete(
             self.tokenizer_manager.start_expert_distribution_record()
         )
+        if not ret.success:
+            raise RuntimeError(ret.message)
 
     def stop_expert_distribution_record(self):
-        self.loop.run_until_complete(
+        ret = self.loop.run_until_complete(
             self.tokenizer_manager.stop_expert_distribution_record()
         )
+        if not ret.success:
+            raise RuntimeError(ret.message)
 
     def dump_expert_distribution_record(self):
-        self.loop.run_until_complete(
+        ret = self.loop.run_until_complete(
             self.tokenizer_manager.dump_expert_distribution_record()
         )
+        if not ret.success:
+            raise RuntimeError(ret.message)
 
     def get_server_info(self):
         internal_states = self.loop.run_until_complete(

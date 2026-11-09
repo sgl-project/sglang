@@ -6586,6 +6586,13 @@ class Scheduler(
                 )
 
     def expert_distribution_handle(self, recv_req: ExpertDistributionReq):
+        # The noop recorder raises, and a raise here kills the scheduler.
+        if get_exec().moe.expert_distribution_recorder_mode is None:
+            return ExpertDistributionReqOutput(
+                success=False,
+                message="The expert distribution recorder is not enabled. "
+                "Restart the server with --expert-distribution-recorder-mode.",
+            )
         action = recv_req.action
         if action == ExpertDistributionReqType.START_RECORD:
             get_global_expert_distribution_recorder().start_record()
