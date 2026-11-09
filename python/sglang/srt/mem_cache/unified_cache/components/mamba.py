@@ -767,27 +767,6 @@ class MambaComponent(TreeComponent):
             return None
         return previous_cache_len, pool.get_mamba_ping_pong_other_idx(keep_idx)
 
-    def _track_prefill_only_end_state(self, req: Req, token_ids_len: int) -> None:
-        """A prefill-only request ends where its key ends: copy its live state
-        into the keep slot so the tree caches the full key, not only the grid."""
-        tracked = req.kv.mamba_last_track_seqlen
-        if (
-            not req.is_prefill_only
-            or tracked is None
-            or not 0 < tracked < token_ids_len == len(req.origin_input_ids)
-            or req.kv.mamba_ping_pong_track_buffer is None
-        ):
-            return
-        pool = self.cache.req_to_token_pool
-        keep_idx = pool.get_mamba_ping_pong_keep_idx(req)
-        keep_slot = req.kv.mamba_ping_pong_track_buffer[keep_idx].unsqueeze(0)
-        translate = pool.translate_mamba_indices
-        pool.mamba_pool.copy_from(
-            translate(req.kv.mamba_pool_idx.unsqueeze(0)), translate(keep_slot)
-        )
-        req.kv.mamba_prev_track_seqlen = tracked
-        req.kv.mamba_last_track_seqlen = token_ids_len
-
     def prepare_for_caching_req(
         self,
         req: Req,
@@ -812,7 +791,6 @@ class MambaComponent(TreeComponent):
             if cache_len is None:
                 cache_len = 0
             if self.cache.enable_mamba_extra_buffer:
-                self._track_prefill_only_end_state(req, token_ids_len)
                 checkpoint = self._select_finished_checkpoint(req, token_ids_len)
                 if checkpoint is None:
                     return 0
