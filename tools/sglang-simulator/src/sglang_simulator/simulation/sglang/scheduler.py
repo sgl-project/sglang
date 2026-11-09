@@ -16,6 +16,7 @@ from sglang_simulator.hook import (
     validate_required_class_hooks,
 )
 from sglang_simulator.hook.utils import get_obj_from_args
+from sglang_simulator.simulation.iteration_stats import IterationStats
 from sglang_simulator.simulation.manager import ConfigManager, Envs, StateManager
 from sglang_simulator.simulation.sglang.dspark import (
     DSparkStepResult,
@@ -45,6 +46,7 @@ from sglang_simulator.time_predictor.base import (
     ScheduleRequest,
 )
 from sglang_simulator.utils import get_logger
+from sglang_simulator.utils.evidence import open_evidence_jsonl
 from sglang_simulator.utils.json import CustomJsonEncoder
 
 logger = get_logger("sgl_simulator")
@@ -379,7 +381,11 @@ class C_SchedulerHook(BaseHook):
     INFERENCE_PREDICTOR: InferTimePredictor = None
     COORDINATOR = None
 
-    ITERATION_STATS: ClassVar[list[dict]] = []
+    ITERATION_STATS: ClassVar[IterationStats] = IterationStats(
+        Envs.output_dir,
+        compression="zstd" if Envs.evidence_compression() == "zstd" else "zlib",
+        metrics_only=Envs.evidence_level() == "metrics",
+    )
     TOTAL_PREDICTOR_TIME_COST = 0
     CURRENT_PREDICTOR_TIME_COST = 0
     CURRENT_PREDICTED_LATENCY = 0
@@ -1088,17 +1094,45 @@ class C_SchedulerHook(BaseHook):
                     C_SchedulerHook.TOTAL_PREDICTOR_TIME_COST
                 )
                 metrics.update(
-                    calc_iteration_metrics(C_SchedulerHook.ITERATION_STATS, metrics)
+                    calc_iteration_metrics(
+                        C_SchedulerHook.ITERATION_STATS.metric_rows()
+                        if isinstance(C_SchedulerHook.ITERATION_STATS, IterationStats)
+                        else C_SchedulerHook.ITERATION_STATS,
+                        metrics,
+                    )
                 )
                 metrics.update(C_SchedulerHook.INFERENCE_PREDICTOR.get_metrics())
+                if (
+                    Envs.evidence_level() == "full"
+                    and Envs.evidence_compression() == "zstd"
+                ):
+                    metrics["iteration_spool_compression"] = "zstd"
+                if Envs.evidence_level() == "metrics":
+                    metrics["iteration_evidence"] = {
+                        "retention_policy": "metrics",
+                        "persisted": False,
+                        "omitted_by_policy": True,
+                    }
 
                 try:
                     with open(f"{output_dir}/metrics.json", "w") as f:
                         f.write(json.dumps(metrics, cls=CustomJsonEncoder) + "\n")
 
-                    with open(f"{output_dir}/iteration.jsonl", "w") as f:
-                        for item in C_SchedulerHook.ITERATION_STATS:
-                            f.write(json.dumps(item) + "\n")
+                    if Envs.evidence_level() == "full":
+                        compression = Envs.evidence_compression()
+                        suffix = {"none": "", "gzip": ".gz", "zstd": ".zst"}[
+                            compression
+                        ]
+                        with open_evidence_jsonl(
+                            f"{output_dir}/iteration.jsonl{suffix}", compression
+                        ) as f:
+                            if isinstance(
+                                C_SchedulerHook.ITERATION_STATS, IterationStats
+                            ):
+                                C_SchedulerHook.ITERATION_STATS.write_jsonl(f)
+                            else:
+                                for item in C_SchedulerHook.ITERATION_STATS:
+                                    f.write(json.dumps(item) + "\n")
 
                     with open(f"{output_dir}/request.jsonl", "w") as f:
                         for item in stats:

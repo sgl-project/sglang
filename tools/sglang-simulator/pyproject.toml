@@ -19,6 +19,9 @@ sglang-simulator-collect = "sglang_simulator.tools.collect_baseline.collect:main
 sglang-simulator-train = "sglang_simulator.tools.train_ml_time_predictor.train:main"
 
 [project.optional-dependencies]
+zstd = [
+    "zstandard>=0.25,<1",
+]
 aisimulate = [
     "aisimulate==0.13.0",
 ]

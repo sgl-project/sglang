@@ -70,7 +70,7 @@ jobs:
         run: |
           uv pip install -e "python" --index-strategy unsafe-best-match --prerelease allow
           uv pip install pytest
-          uv pip install "./tools/sglang-simulator[aisimulate]"
+          uv pip install "./tools/sglang-simulator[aisimulate,zstd]"
 
       - name: Prebuild HiCache native hash extension
         timeout-minutes: 5
@@ -106,6 +106,8 @@ jobs:
           python3 -m pytest -q tools/sglang-simulator/test/test_simulation_blocking_pacing.py
           python3 -m pytest -q tools/sglang-simulator/test/test_simulation_coordinator.py
           python3 -m pytest -q tools/sglang-simulator/test/test_simulation_predictor_imports.py
+          python3 -m pytest -q tools/sglang-simulator/test/test_iteration_stats.py
+          python3 -m pytest -q tools/sglang-simulator/test/test_evidence_storage.py
           python3 -m pytest -q tools/sglang-simulator/test/test_simulation_timing_metadata.py
           python3 -m pytest -q tools/sglang-simulator/test/test_simulation_token_events.py
           python3 -m pytest -q tools/sglang-simulator/test/test_simulation_coordinated_bridge.py

@@ -406,6 +406,12 @@ Set the real deployment topology under `scheduler` in `--sim-config-path`. That
 topology drives predictor and cache-resource modeling without launching physical
 parallel workers.
 
+CPU-only DSpark simulation keeps packed KV value payloads on PyTorch `meta`
+tensors. Native shapes and dtypes remain available without allocating the unused
+KV values. Integer page allocators, request state and logical token capacities
+remain on CPU; this payload storage choice does not change predicted costs or
+admit accuracy.
+
 Other server options are normal SGLang command-line arguments. For direct Python
 integration, see
 [`test_simulation_sglang_runner.py`](test/test_simulation_sglang_runner.py); for the
@@ -541,6 +547,62 @@ step-level error, and scheduler or cache changes should compare request latency,
 throughput, and prefix-cache reuse against measured traces.
 
 ## Optional committed-output ledger
+
+Iteration records retain their complete JSONL representation in
+`iteration.jsonl`. During a profile window, the scheduler compresses these
+records into an exclusive `.iteration-*.spool` file in the configured output
+directory and keeps only small metric summaries in memory. Provision disk space
+for the spool and final exports; select an output directory on disk for long
+CPU simulations. This changes evidence storage, not virtual costs or progress.
+The spool is removed after a successful export and profile reset. Export or
+spool-write failures preserve it for diagnosis and must not be treated as a
+completed profile.
+
+For long runs, explicitly set `SGLANG_SIMULATOR_EVIDENCE_COMPRESSION=gzip`
+to export `iteration.jsonl.gz` instead. Decompression recovers the unchanged
+JSONL records; metrics and virtual execution are unaffected. The default is
+`none`, retaining `iteration.jsonl`. For native evaluated-cost evidence, an
+explicit path ending in `.gz` selects complete concatenated gzip members,
+one per original JSONL row. Its reported byte count and SHA-256 cover the
+uncompressed JSONL, explicitly identified by `digest_scope`. Artifact custody
+must additionally hash the actual compressed file. An interrupted or failed
+stream is still incomplete and cannot establish successful execution.
+
+For repeated large evidence documents, install this project's optional `zstd`
+extra (`pip install '.[zstd]'`) and explicitly set
+`SGLANG_SIMULATOR_EVIDENCE_COMPRESSION=zstd`. This selects checksummed Zstandard
+frames for the private iteration spool and exports `iteration.jsonl.zst`.
+Use a native evaluated-cost evidence path ending in `.zst` to select one complete,
+checksummed Zstandard frame per original JSONL row. Concatenated frames retain
+completed evaluated rows when a later write fails. The default and existing
+plain/gzip formats remain available without the optional dependency.
+
+Both codecs recover the original JSONL bytes, including row order. Evaluated
+metrics continue to hash and count the uncompressed stream; separately hash
+the compressed artifact for custody. A reader must decode every frame and
+validate its checksum and the uncompressed SHA/size before admitting evidence.
+Record the selected source and codec for each new run. Preserve earlier source
+files, failed spools and compressed identities; never reinterpret an older
+artifact as a different codec. Provision for the spool and final export to
+coexist, and measure peak use before selecting a smaller run budget. Codec
+tests establish storage equivalence, not workload accuracy or successful E2E.
+
+For metrics-only runs, explicitly set `SGLANG_SIMULATOR_EVIDENCE_LEVEL=metrics`
+in the container environment. The default is `full`. Metrics-only mode retains
+the numeric iteration summaries used by metric reduction, request statistics,
+and any separately enabled token-event ledger, while omitting the verbose
+iteration spool/export and native evaluated-cost file (even if its path was
+configured). Metrics explicitly mark those artifacts as omitted by policy;
+the absence does not establish independent per-step cost verification.
+Prediction, request progress, scheduling, and validation of each SDK result
+still run normally. Client-side raw request/response and protocol recording
+are controlled separately by the selected client configuration.
+
+Select the retention level before starting a new process. Record it in the run
+identity and provision storage for the artifacts actually requested. Do not
+change a running process's policy or delete its originals to adopt a new mode.
+Use `full` when downstream acceptance requires complete regional-cost and
+committed-step evidence; a metrics-only run cannot satisfy that contract.
 
 For coordinated OFFLINE runs, set
 `SGLANG_SIMULATOR_TOKEN_EVENTS=/absolute/path/to/token_events.jsonl` to retain

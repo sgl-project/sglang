@@ -4,6 +4,7 @@ No graph, native query construction, cost resolver or acceptance law lives here.
 Evaluated query records are deliberately distinct from committed native events.
 """
 
+import gzip
 import hashlib
 import json
 from pathlib import Path
@@ -15,6 +16,7 @@ from sglang_simulator.simulation.sglang.dspark import (
     DSparkStepTiming,
 )
 from sglang_simulator.time_predictor.base import PredictorError
+from sglang_simulator.utils.evidence import ZstdCodec, evidence_level
 
 
 def _encoded(value):
@@ -77,10 +79,22 @@ class SimOpusNativeCostAdapter:
         self._sink = None
         self._sink_path = None
         self._sink_failed = False
+        self._sink_gzip = False
+        self._sink_zstd = False
+        self._zstd_codec = None
         self._digest = hashlib.sha256()
         self._bytes = 0
-        if cost_evidence_path is not None:
+        self._evidence_level = evidence_level()
+        self._requested_sink_path = (
+            str(Path(cost_evidence_path).absolute())
+            if cost_evidence_path is not None
+            else None
+        )
+        if cost_evidence_path is not None and self._evidence_level == "full":
             self._sink_path = str(Path(cost_evidence_path).absolute())
+            self._sink_gzip = self._sink_path.endswith(".gz")
+            self._sink_zstd = self._sink_path.endswith(".zst")
+            self._zstd_codec = ZstdCodec() if self._sink_zstd else None
             try:
                 self._sink = open(self._sink_path, "xb", buffering=0)  # noqa: SIM115 -- run-owned sink
             except OSError as error:
@@ -262,7 +276,14 @@ class SimOpusNativeCostAdapter:
             raise PredictorError("data_unavailable", "evaluated-cost evidence failed")
         if self._sink is not None:
             try:
-                if self._sink.write(line) != len(line):
+                # Complete members preserve prior rows on interrupted teardown.
+                if self._zstd_codec is not None:
+                    payload = self._zstd_codec.compress(line)
+                elif self._sink_gzip:
+                    payload = gzip.compress(line, compresslevel=1, mtime=0)
+                else:
+                    payload = line
+                if self._sink.write(payload) != len(payload):
                     raise OSError("short evaluated-cost evidence write")
                 self._sink.flush()
             except (OSError, ValueError) as error:
@@ -298,6 +319,23 @@ class SimOpusNativeCostAdapter:
                 "sha256": self._digest.hexdigest(),
                 "persisted": self._sink is not None,
                 "write_failed": self._sink_failed,
+                **(
+                    {
+                        "compression": "zstd" if self._sink_zstd else "gzip",
+                        "digest_scope": "uncompressed_jsonl",
+                    }
+                    if self._sink_gzip or self._sink_zstd
+                    else {}
+                ),
+                **(
+                    {
+                        "retention_policy": "metrics",
+                        "omitted_by_policy": True,
+                        "requested_path": self._requested_sink_path,
+                    }
+                    if self._evidence_level == "metrics"
+                    else {}
+                ),
             },
         }
 

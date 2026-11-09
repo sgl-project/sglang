@@ -1,12 +1,26 @@
 import math
 import os
 
+from sglang_simulator.utils.evidence import evidence_level
 from sglang_simulator.utils.logger import get_logger
 
 logger = get_logger("sgl_simulator")
 
 
 class Envs:
+    @classmethod
+    def evidence_level(cls) -> str:
+        return evidence_level()
+
+    @classmethod
+    def evidence_compression(cls) -> str:
+        value = os.getenv("SGLANG_SIMULATOR_EVIDENCE_COMPRESSION", "none")
+        if value not in {"none", "gzip", "zstd"}:
+            raise ValueError(
+                "SGLANG_SIMULATOR_EVIDENCE_COMPRESSION must be none or gzip or zstd"
+            )
+        return value
+
     @classmethod
     def token_events_path(cls) -> str | None:
         return os.getenv("SGLANG_SIMULATOR_TOKEN_EVENTS") or None
