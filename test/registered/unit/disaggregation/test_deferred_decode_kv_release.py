@@ -1079,6 +1079,35 @@ class TestFailedTransfersDeferOnEveryFailure(CustomTestCase):
         self.assertEqual(released, [entry.req])
         self.assertEqual(list(q._deferred_releases.items()), [])
 
+    def test_immediate_release_unregisters_the_staging_room_first(self):
+        # While the room is registered the decode thread may scatter a chunk
+        # into the request's row; after the release that row is gone, and the
+        # scatter would write into other requests' KV.
+        mgr = _make_manager()
+        mgr.enable_deferred_decode_kv_release = False
+        q = _make_pop_queue(mgr)
+        entry = _make_failed_req(mgr, room=10, idx=6, abort_notified=False)
+        q.queue.join([entry])
+        events = []
+        rooms = {10}
+        q.enable_staging = True
+        q._poll_with_staging = q._poll_with_metadata_gate
+        q.staging_handler = SimpleNamespace(
+            is_staging_room=lambda room: room in rooms,
+            unregister_decode_req=lambda room: (
+                rooms.discard(room),
+                events.append(("unregister", room)),
+            ),
+        )
+        q.scheduler.request_retirer.release = lambda req, *, checkpoint: events.append(
+            ("release", req.bootstrap_room)
+        )
+
+        with patch.object(decode_mod, "prepare_abort"):
+            q.pop_transferred()
+
+        self.assertEqual(events, [("unregister", 10), ("release", 10)])
+
 
 class TestHiSparseDestinationFollowsTheHold(CustomTestCase):
     """Under HiSparse the transfer writes into the coordinator's host pages."""
