@@ -594,6 +594,24 @@ class TestDeferredDestinationPublish(CustomTestCase):
         self.assertIsNone(dr.kv_receiver)
         self.assertEqual(len(queue.queue), 0)
 
+    def test_abort_after_storage_prefetch_completes_before_readmission(self):
+        queue, dr = self._storage_admission_queue(4)
+        self.assertEqual(queue.pop_preallocated(), ([], []))
+        queue.tree_cache.check_prefetch_progress.return_value = True
+        queue._prealloc_reservation_fits.return_value = False
+        self.assertEqual(queue.pop_preallocated(), ([], []))
+        self.assertTrue(dr.hicache_prefetch_done)
+        from sglang.srt.managers.req_types import FINISH_ABORT
+
+        dr.req.finished_reason = FINISH_ABORT("cancelled")
+        dr.req.finished_output = True
+        self.assertEqual(queue.pop_preallocated(), ([], [dr]))
+        self.assertFalse(dr.hicache_prefetch_done)
+        self.assertIsNone(dr.req.lock)
+        self.assertIsNone(dr.kv_receiver)
+        self.assertEqual(len(queue.queue), 0)
+        self.assertTrue(queue.tree_cache.finish.called)
+
     def test_deferred_destination_keeps_its_metadata_slot_until_published(self):
         # The transfer queue frees the metadata slot of any request it fails, so
         # a deferred request must own one before joining the queue, and the

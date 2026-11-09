@@ -1920,6 +1920,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     decode_req.req.rid,
                 )
                 if reclaim_error is not None:
+                    self._cancel_hicache_admission(decode_req)
                     if prefix_match is not None and prefix_match.l1_prefix_len > 0:
                         self.tree_cache.unlock(decode_req.req.lock)
                         decode_req.req.lock = None

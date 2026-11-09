@@ -66,6 +66,20 @@ def _bigram_boundary_tokens(tree_cache) -> int:
     return int(tree_cache.tree_core.is_eagle)
 
 
+def _finish_decode_storage_admission(tree_cache, dr, covered_prefix_len, reason=None):
+    """Settle a completed storage attempt after decode has secured its prefix."""
+    if not getattr(dr, "hicache_prefetch_done", False):
+        return
+    req = dr.req
+    start = getattr(req, "storage_hit_start", None)
+    loaded = getattr(req, "storage_hit_length", 0)
+    fulfilled = 0 if start is None else max(0, min(loaded, covered_prefix_len - start))
+    tree_cache.finish_storage_prefetch_admission(
+        req.cache_request_handle, fulfilled, reason
+    )
+    dr.hicache_prefetch_done = False
+
+
 class DecodeHiCachePreallocMixin:
     """HiCache hooks for ``DecodePreallocQueue``: issue prefetch + reserve tokens."""
 
@@ -203,13 +217,14 @@ class DecodeHiCachePreallocMixin:
         return True
 
     def _cancel_hicache_admission(self, dr: DecodeRequest) -> None:
-        if not dr.hicache_prefetch_pending:
+        if not (dr.hicache_prefetch_pending or dr.hicache_prefetch_done):
             return
         self.tree_cache.finish(dr.req.cache_request_handle, CacheRequestOutcome.ABORT)
         self.tree_cache.unlock(dr.req.lock)
         dr.req.lock = None
         dr.prefix_match = None
         dr.hicache_prefetch_pending = False
+        dr.hicache_prefetch_done = False
 
     def _pin_hicache_host_prefix(self, pm: Optional[DecodePrefixMatch]) -> None:
         if pm is not None and pm.l2_host_hit_length > 0:
@@ -255,14 +270,15 @@ class DecodeHiCacheTransferMixin:
             pm.host_lock_receipt = None
 
     def _clean_hicache_prefetch_resources(self, decode_req: DecodeRequest) -> None:
-        self._release_hicache_host_prefix(decode_req)
-        if (
+        DecodeHiCacheTransferMixin._release_hicache_host_prefix(self, decode_req)
+        if getattr(decode_req, "hicache_prefetch_done", False) or (
             decode_req.prefix_match is not None
             and decode_req.prefix_match.prefetch_registered
         ):
             self.tree_cache.finish(
                 decode_req.req.cache_request_handle, CacheRequestOutcome.ABORT
             )
+            decode_req.hicache_prefetch_done = False
         self.tree_cache.unlock(decode_req.hicache_restore_lock)
         decode_req.hicache_restore_lock = None
 
@@ -312,9 +328,25 @@ class DecodeHiCacheTransferMixin:
         finally:
             dr.req.last_node = owned_node
             # A queued H2D owns its own host reference until its copy completes.
-            self._release_hicache_host_prefix(dr)
+            DecodeHiCacheTransferMixin._release_hicache_host_prefix(self, dr)
+        covered_prefix_len = rematch.device_prefix_len + loaded_len
+        reason = (
+            None
+            if covered_prefix_len >= pm.decode_prefix_len
+            else "cache_admission_shortfall"
+        )
+        if getattr(dr, "hicache_prefetch_done", False):
+            _finish_decode_storage_admission(
+                self.tree_cache, dr, covered_prefix_len, reason
+            )
+        elif pm.l3_storage_hit_length:
+            self.tree_cache.finish_storage_prefetch_admission(
+                dr.req.cache_request_handle,
+                pm.l3_storage_hit_length if reason is None else 0,
+                reason,
+            )
         # Failback: total coverage < required prefix means device alloc likely failed.
-        if rematch.device_prefix_len + loaded_len < pm.decode_prefix_len:
+        if covered_prefix_len < pm.decode_prefix_len:
             logger.warning(
                 "HiCache load_back failed for rid=%s: device_indices=%d, "
                 "new_indices=%d, expected decode_prefix_len=%d (l1=%d, l2=%d, l3=%d)",
@@ -376,6 +408,12 @@ class DecodeHiCacheTransferMixin:
         ]
         if not queued:
             return
+
+        for dr in queued:
+            if dr.prefix_match is not None and not dr.prefix_match.needs_local_restore:
+                _finish_decode_storage_admission(
+                    self.tree_cache, dr, dr.prefix_match.decode_prefix_len
+                )
 
         counter = self.tree_cache.cache_controller.layer_done_counter
         consumer_index = self.tree_cache.ready_to_load_host_cache()

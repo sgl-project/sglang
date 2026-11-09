@@ -249,6 +249,25 @@ class TestDecodeHiCacheL2(CustomTestCase):
         self.assertGreater(self.cache.evict_host(1024), 0)
         self.cache.sanity_check()
 
+    def test_completed_storage_handoff_when_prefix_is_already_on_device(self):
+        self._insert(256)
+        dr = self._request(0)
+        self.assertFalse(dr.prefix_match.needs_local_restore)
+        dr.hicache_prefetch_done = True
+        dr.req.storage_hit_start = 128
+        dr.req.storage_hit_length = 128
+        with patch.object(
+            self.cache,
+            "finish_storage_prefetch_admission",
+            wraps=self.cache.finish_storage_prefetch_admission,
+        ) as finish:
+            self.queue._process_hicache_local_restores([dr])
+        self.assertEqual(dr.hicache_restore_status, HiCacheRestoreResult.READY)
+        self.assertFalse(dr.hicache_prefetch_done)
+        finish.assert_called_once_with(dr.req.cache_request_handle, 128, None)
+        self.cache.unlock(dr.req.lock)
+        self.cache.sanity_check()
+
     def test_concurrent_shared_prefix_and_l1_follower_wait_for_dma(self):
         self._host_prefix()
         requests = [self._request(0), self._request(1)]
