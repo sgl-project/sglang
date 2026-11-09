@@ -80,13 +80,21 @@ def _compute_enable_deep_gemm():
 
 ENABLE_JIT_DEEPGEMM = _compute_enable_deep_gemm()
 
-DEEPGEMM_BLACKWELL = ENABLE_JIT_DEEPGEMM and not _is_sail and get_platform().is_sm100
+# _deep_gemm_build() is the single place mapping a platform to a build, so the
+# feature flags below ask the build rather than the platform boolean.
+_DEEPGEMM_BUILD = _deep_gemm_build()
+
+DEEPGEMM_BLACKWELL = (
+    ENABLE_JIT_DEEPGEMM and _DEEPGEMM_BUILD != "sail" and get_platform().is_sm100
+)
 DEEPGEMM_SCALE_UE8M0 = (
     ENABLE_JIT_DEEPGEMM
-    and not _is_sail
+    and _DEEPGEMM_BUILD != "sail"
     and (get_platform().is_sm100 or get_device_sm() in (120, 121))
 )
-DEEPGEMM_NEED_TMA_ALIGNED_SCALES = not (DEEPGEMM_SCALE_UE8M0 or _is_musa or _is_sail)
+DEEPGEMM_NEED_TMA_ALIGNED_SCALES = not (
+    DEEPGEMM_SCALE_UE8M0 or _is_musa or _DEEPGEMM_BUILD == "sail"
+)
 
 
 def _supports_paged_sparse_mqa_logits() -> bool:

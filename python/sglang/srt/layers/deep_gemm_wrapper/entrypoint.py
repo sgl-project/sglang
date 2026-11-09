@@ -179,13 +179,7 @@ def grouped_gemm_nt_bf16_contig(
 
 
 def get_contiguous_layout_alignment(expected_m: int, num_groups: int) -> int:
-    alignment = (
-        deep_gemm.get_m_alignment_for_contiguous_layout()
-        if _is_sail
-        else deep_gemm.get_mk_alignment_for_contiguous_layout()
-    )
-    if isinstance(alignment, tuple):
-        alignment = alignment[0]
+    alignment = compile_utils.contiguous_m_alignment()
 
     theoretical_alignment = getattr(
         deep_gemm, "get_theoretical_mk_alignment_for_contiguous_layout", None
