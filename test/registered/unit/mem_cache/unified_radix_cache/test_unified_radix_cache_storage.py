@@ -3004,7 +3004,18 @@ class TestUnifiedRadixPrefetchCorruption(
         admission itself is waiting for that lookup to finish."""
         self._check_capacity_wait(abort=False, own_hold=True)
 
-    def _check_capacity_wait(self, *, abort, own_hold=False, retry=False):
+    def test_pd_prefill_does_not_wait_for_unadmitted_owner(self):
+        """A PD prefill waiting for a later owner's admission can block the
+        decode allocation that owner needs; fall back instead of parking."""
+        with mock.patch(
+            "sglang.srt.mem_cache.unified_radix_cache.get_disagg",
+            return_value=SimpleNamespace(disaggregation_mode="prefill"),
+        ):
+            self._check_capacity_wait(abort=False, pd_fallback=True)
+
+    def _check_capacity_wait(
+        self, *, abort, own_hold=False, retry=False, pd_fallback=False
+    ):
         cache, _, _ = build_fixture(self.cfg)
         self._init_hicache(cache)
         first = CacheRequestHandle("first", 0)
@@ -3049,7 +3060,7 @@ class TestUnifiedRadixPrefetchCorruption(
             )
 
         drain()
-        if own_hold:
+        if own_hold or pd_fallback:
             self.assertNotIn(second, cache.ongoing_prefetch)
             self.assertFalse(cache.pending_cache_hit_allocs)
             self.assertTrue(cc.prefetch_buffer.empty())

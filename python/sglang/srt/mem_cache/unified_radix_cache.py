@@ -3627,9 +3627,16 @@ class UnifiedRadixCache(BasePrefixCache):
             # this allocation. Anchor-only waiters must not wait on each
             # other, and a hit larger than an empty pool must fall back.
             return cc.can_fit_prefetch_host_buffers(operation, hit_tokens) and (
-                any(
-                    handle != operation.handle and handle not in self.ongoing_prefetch
-                    for handle in self.prefetch_admission_locks
+                (
+                    # A PD prefill waiting on another request's admission can
+                    # block decode capacity needed by that owner. In-flight IO
+                    # and load-backs below can still release independently.
+                    get_disagg().disaggregation_mode != "prefill"
+                    and any(
+                        handle != operation.handle
+                        and handle not in self.ongoing_prefetch
+                        for handle in self.prefetch_admission_locks
+                    )
                 )
                 or bool(self.ongoing_load_back)
                 or any(
