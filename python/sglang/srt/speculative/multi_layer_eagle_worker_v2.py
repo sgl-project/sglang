@@ -82,6 +82,10 @@ from sglang.srt.speculative.multi_layer_eagle_utils import (
 )
 from sglang.srt.speculative.pp_draft_embedding import resolve_draft_embed_and_head
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_repetition_penalty import (
+    SpecRepetitionState,
+    create_spec_repetition_state,
+)
 from sglang.srt.speculative.spec_utils import (
     draft_pp_context,
     draft_tp_context,
@@ -1047,6 +1051,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
 
 class MultiLayerEagleWorkerV2(BaseSpecWorker):
     _speculative_runtime_hooks = STOCK_SPECULATIVE_RUNTIME_HOOKS
+    _repetition_state: Optional[SpecRepetitionState] = None
 
     def weight_update_runners(self) -> List[Tuple[str, ModelRunner]]:
         return [
@@ -1097,6 +1102,11 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         super().init_attention_backends()
         self._speculative_runtime_hooks = bind_eagle_runtime_hooks(
             self.target_worker, supports_sharded_verify=self.topk == 1
+        )
+        self._repetition_state = create_spec_repetition_state(
+            req_generation=self.req_to_token_pool.req_generation,
+            vocab_size=self.target_worker.model_runner.model_config.vocab_size,
+            device=self.device,
         )
 
     @property
@@ -1222,4 +1232,5 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             metadata_ready_pre_pad=False,
             finalize_tree_path=False,
             grammar_barrier=grammar_barrier,
+            repetition_state=self._repetition_state,
         )

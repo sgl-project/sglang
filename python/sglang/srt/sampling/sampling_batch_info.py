@@ -89,6 +89,8 @@ class SamplingBatchInfo:
     acc_scaling_penalties: Optional[torch.Tensor] = (
         None  # Used in the overlap mode for repetition penalty
     )
+    # Per-request repetition penalties [bs, 1] for the exact spec verify path
+    spec_repetition_penalties: Optional[torch.Tensor] = None
 
     # Whether any request has custom logit processor
     has_custom_logit_processor: bool = False
@@ -431,9 +433,18 @@ class SamplingBatchInfo:
             self.acc_scaling_penalties = (
                 self.penalizer_orchestrator.accumulate_scaling_penalties()
             )
+            repetition = self.penalizer_orchestrator.penalizers.get(
+                penaltylib.BatchedRepetitionPenalizer
+            )
+            self.spec_repetition_penalties = (
+                repetition.repetition_penalties
+                if repetition is not None and repetition.is_prepared()
+                else None
+            )
         else:
             self.acc_additive_penalties = None
             self.acc_scaling_penalties = None
+            self.spec_repetition_penalties = None
 
     def _apply_pre_grammar_logits_transforms(self, logits: torch.Tensor) -> None:
         if self.acc_additive_penalties is not None:

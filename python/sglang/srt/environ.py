@@ -1667,6 +1667,9 @@ class Envs:
     # into a small CUDA graph, collapsing its host dispatch cost to one launch.
     # Experimental; auto-falls back to eager if the backend's prep is not capturable.
     SGLANG_ENABLE_METADATA_GLUE_GRAPH = EnvBool(False)
+    # Apply the repetition penalty per draft position in EAGLE verify and over every
+    # committed token (speculative/spec_repetition_penalty.py).
+    SGLANG_ENABLE_SPEC_EXACT_REPETITION_PENALTY = EnvBool(True)
     # Experimental: capture the EAGLE verify's sampling, acceptance and state commit
     # in CUDA graphs (speculative/eagle_post_verify_graphs.py).
     SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH = EnvBool(
