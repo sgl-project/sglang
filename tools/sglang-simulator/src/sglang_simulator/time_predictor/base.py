@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from typing import Any
 
 from sglang_simulator.simulation.types import SchedulerConfig
 from sglang_simulator.spec.accelerator import AcceleratorInfo
@@ -68,6 +69,15 @@ class ScheduleBatch:
     @property
     def num_gen_requests(self) -> int:
         return self.batch_size if self.is_decode() else 0
+
+
+class PredictorError(RuntimeError):
+    """Predictor failure with a stable machine-readable code."""
+
+    def __init__(self, code: str, message: str, **details: Any) -> None:
+        super().__init__(message)
+        self.code = code
+        self.details = details
 
 
 class InferTimePredictor(ABC):

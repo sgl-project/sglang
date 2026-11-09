@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -48,6 +49,17 @@ class ConfigManager:
 
         # Keep the original value so predictor-specific errors remain clear.
         return path
+
+    @classmethod
+    def resolve_simopus_path(cls, path: str | None) -> str | None:
+        """Resolve the SimOpus systems directory relative to its config file."""
+        if not path:
+            return path
+        path = Path(os.path.expandvars(path)).expanduser()
+        if path.is_absolute():
+            return str(path)
+        config_path = Path(Envs.config_path()).resolve()
+        return str((config_path.parent / path).resolve())
 
     @classmethod
     def reset_config_cache(cls):
