@@ -358,6 +358,12 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset], ...] = (
         _CUDA_SM100_PLUS,
     ),
     (
+        "diffusion.nomas_qk_norm_mrope",
+        KernelBackend.TRITON,
+        "rope.nomas_qk_norm_mrope_triton:fused_nomas_qk_norm_mrope",
+        _CUDA_SM100_PLUS,
+    ),
+    (
         "diffusion.ltx25_decoder_rope",
         KernelBackend.JIT,
         "rope.ltx25_decoder_rope_jit:fused_ltx25_decoder_rope",
@@ -773,6 +779,7 @@ _EXPORTS: dict[str, str] = {
     "timestep_embedding": "modulate.timestep_embedding_jit",
     "fused_temb_table_slices": "modulate.wan_temb_table_slices_triton",
     # Rotary embeddings and the QK-norm chains fused around them
+    "fused_nomas_qk_norm_mrope": "rope.nomas_qk_norm_mrope_triton",
     "try_fused_flux2_qkv_epilogue": "sglang.kernels.kda_kernels.flux2_qkv_epilogue_jit",
     "hunyuan_qkv_rope_pack": "rope.hunyuan_qkv_pack_triton",
     "joint_qkv_cat": "layout.joint_qkv_cat_triton",

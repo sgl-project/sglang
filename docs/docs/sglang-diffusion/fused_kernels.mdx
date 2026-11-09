@@ -161,6 +161,7 @@ kernel replay support does not enable BCG for a model configuration that disable
 | `helios_qk_rope` | JIT CUDA | bit-exact | paired in-place Helios Q/K RoPE with transposed frequency layout |
 | `ltx2_qknorm_split_rope` | KDA (JIT CUDA) | close (validated on B200) | LTX-2 QK-norm + split RoPE |
 | `ltx25_decoder_rope` | JIT CUDA | bit-exact | paired LTX-2.5 decoder 3D RoPE from cached compact axis tables |
+| `fused_nomas_qk_norm_mrope` | Triton | bit-exact against the compiled parameter graph, verified per signature | Nomas PixelUMM VAE BF16 Q/K normalization and 64/32/32-axis RoPE on SM100+, retaining ATen mean squares and the compiled fallback |
 | `hunyuan_qkv_rope_pack` | Triton | bit-exact | QKV pack and RoPE in one pass |
 
 The Klein strided path preserves the BF16 rounding between RMSNorm and RoPE,

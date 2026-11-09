@@ -839,6 +839,69 @@ def test_pixelumm_fused_qk_norm_mrope_is_bitwise_exact(tokens, heads, batch):
     assert torch.equal(actual, expected)
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.version.hip is not None,
+    reason="requires NVIDIA CUDA",
+)
+@torch.inference_mode()
+def test_pixelumm_mrope_fusion_matches_compiled_reference_and_fallback(monkeypatch):
+    from sglang.kernels import ops
+    from sglang.kernels.arch import current_arch
+    from sglang.kernels.ops.diffusion import BitExactFusionGate
+    from sglang.multimodal_gen.runtime.models.vaes import nomas
+
+    if not current_arch().is_sm_at_least(10):
+        pytest.skip("fusion requires SM100+")
+    gate = BitExactFusionGate("test Nomas VAE MRoPE", per_signature=True)
+    monkeypatch.setattr(nomas, "_QK_MROPE_FUSION", gate)
+    kernel = ops.diffusion.fused_nomas_qk_norm_mrope
+    calls = []
+
+    def counted(*args):
+        calls.append(args[0].shape)
+        return kernel(*args)
+
+    monkeypatch.setattr(ops.diffusion, "fused_nomas_qk_norm_mrope", counted)
+    torch.manual_seed(831)
+    for dim, batch, tokens, heads in (
+        (128, 1, 16384, 32),
+        (128, 2, 36, 8),
+        (64, 2, 36, 8),
+    ):
+        attention = (
+            nomas.GenAttention(nomas.GenExpertArch(hidden_size=128, head_dim=dim))
+            .cuda()
+            .bfloat16()
+        )
+        attention.q_norm_t.weight.normal_()
+        attention.q_norm_hw.weight.normal_()
+        x = torch.randn(batch, 35200, heads, dim, device="cuda", dtype=torch.bfloat16)[
+            :, :tokens
+        ]
+        cos, sin = nomas.mrope_tables(attention.arch, (10, 44, 80), "cuda")
+        cos, sin = cos[:, :tokens], sin[:, :tokens]
+        half = dim // 2
+        expected = nomas._compiled_qk_norm_mrope()(
+            x,
+            nomas._mean_square(x[..., :half]),
+            nomas._mean_square(x[..., half:]),
+            attention.q_norm_t.eps,
+            attention.q_norm_t.weight,
+            attention.q_norm_hw.weight,
+            cos,
+            sin,
+            attention.arch.rope_sections,
+            x.dtype,
+        )
+        before = len(calls)
+        actual = attention._prepare_qk(
+            x, cos, sin, attention.q_norm_t, attention.q_norm_hw, x.dtype
+        )
+        assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+        assert (len(calls) > before) == (dim == 128)
+    assert gate.verified_sigs and not gate.disabled
+
+
 def test_scheduler_loader_uses_effective_shift(tmp_path):
 
     from sglang.multimodal_gen.runtime.loader.component_loaders.scheduler_loader import (
