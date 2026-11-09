@@ -104,7 +104,7 @@ class _FencedController(InstantWriteBackController):
             if pool == "kv":
                 pages.update((op.device_indices // PAGE).tolist())
             for transfer in op.pool_transfers or ():
-                if transfer.name.value == pool:
+                if transfer.name == pool:
                     pages.update((transfer.device_indices // PAGE).tolist())
         return pages
 

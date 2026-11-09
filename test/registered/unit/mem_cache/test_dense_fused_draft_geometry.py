@@ -638,6 +638,8 @@ class TestRoutedDraftPool(CustomTestCase):
             fused_draft=FusedDraftPlacement.from_counts(
                 counts={"full": [1], "swa": [1]},
                 regions={"full": full_region, "swa": swa_region},
+                # This pool names its window sub-pool `swa`.
+                hosted={"swa": "window"},
             ),
         )
 

@@ -1341,6 +1341,7 @@ class Scheduler(
 
         self.metrics_collector.emit_constants(
             max_total_num_tokens=self.max_total_num_tokens,
+            max_total_num_tokens_window=self.window_token_capacities(),
             max_total_num_tokens_swa=self.swa_tokens_per_layer,
             weight_memory_usage_gb=self.tp_worker.model_runner.weight_load_mem_usage,
             kv_cache_memory_usage_gb=(
@@ -2689,11 +2690,13 @@ class Scheduler(
             return dict(get_drain_state=lambda: DRAIN_STATE_NO_LISTENER)
         return {}
 
-    def init_pool_stats_observer(self) -> None:
+    def _observed_storage(self):
+        """The sub-pools the pool observers report: a unified pool's own
+        storage, else the static pools described by their sizing."""
         global_tokens = self.max_total_num_tokens * self.kv_shard_widening
         if is_cp_sharded_padded():
             global_tokens = from_cp_sharded(global_tokens)
-        storage = kv_storage_of(
+        return kv_storage_of(
             self.req_to_token_pool,
             self.token_to_kv_pool_allocator,
             shape=StaticPoolShape(
@@ -2703,11 +2706,23 @@ class Scheduler(
                 token_capacity=global_tokens,
                 full_tokens_per_layer=self.full_tokens_per_layer,
                 swa_tokens_per_layer=self.swa_tokens_per_layer,
+                window=self.sliding_window_size,
             ),
         )
+
+    def window_token_capacities(self) -> Dict[str, int]:
+        """Each window pool's token capacity by window name, as its usage gauges
+        divide by; a draft's own window included."""
+        return {
+            usage.label: usage.capacity
+            for usage in self._observed_storage().usage()
+            if usage.metrics == "window"
+        }
+
+    def init_pool_stats_observer(self) -> None:
         self.pool_stats_observer = SchedulerPoolStatsObserver(
             tree_cache=self.tree_cache,
-            storage=storage,
+            storage=self._observed_storage(),
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             session_controller=self.session_controller,
             hisparse_coordinator=self.hisparse_coordinator,
@@ -6088,7 +6103,6 @@ class Scheduler(
                 "Hierarchical cache is disabled", page_size=self.page_size
             )
 
-        from sglang.srt.mem_cache.kv.plan import TREE_WINDOW
         from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
             MooncakeStore,
         )
@@ -6109,16 +6123,18 @@ class Scheduler(
             )
 
         sidecar_pool_specs = ()
-        window = None
+        window_trailing_pages = {}
         if isinstance(tree_cache, UnifiedRadixCache):
             sidecar_pool_specs = tree_cache.sidecar_pool_specs
-            # By family: a unified window's slot is named by its sub-pool.
-            window = tree_cache.component_of(TREE_WINDOW)
+            window_trailing_pages = {
+                str(window.pool_name): window.full_window_pages
+                for window in (
+                    tree_cache.components[ct] for ct in tree_cache.window_slots()
+                )
+            }
         return storage_backend.describe_l3_object_layout(
             sidecar_pool_specs=sidecar_pool_specs,
-            swa_trailing_pages=(
-                window.full_window_pages if window is not None else None
-            ),
+            window_trailing_pages=window_trailing_pages,
             page_size=self.page_size,
         )
 

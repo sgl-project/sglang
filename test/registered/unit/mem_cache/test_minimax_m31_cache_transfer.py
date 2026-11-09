@@ -252,7 +252,9 @@ def test_final_chunk_skips_decode_hit_but_sends_aux_on_full_hit(length, prefix):
         disagg_metadata_buffers=Mock(),
         disagg_prefill_bootstrap_queue=SimpleNamespace(
             kv_manager=SimpleNamespace(
-                kv_args=SimpleNamespace(state_types=[StateType.MINIMAX_INDEX_K])
+                kv_args=SimpleNamespace(
+                    state_types=[StateType.MINIMAX_INDEX_K], state_sub_pools=[None]
+                )
             )
         ),
     )

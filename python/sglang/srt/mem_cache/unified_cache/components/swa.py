@@ -95,11 +95,9 @@ class SWAComponent(TreeComponent):
             raise ValueError("SWAComponent requires a positive window in its slot")
 
         super().__init__(cache, params, slot)
-        # The host pool of the slot's HiCache copies: the one its window slot
-        # names under unified memory, else the window host pool.
-        self.pool_name = (
-            PoolName.SWA if slot.host_pool is None else PoolName(slot.host_pool)
-        )
+        # The host pool of the slot's HiCache copies: the window sub-pool's
+        # own under unified memory, else the window host pool.
+        self.pool_name = PoolName.SWA if slot.host_pool is None else slot.host_pool
         self._independent = windows_stand_alone(params.tree_slots)
         self._session_leaf_covered_len: dict[str, dict[UnifiedTreeNode, int]] = {}
         # The history a prefix keeps, which every reader of the window needs
