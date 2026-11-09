@@ -41,7 +41,6 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_hip,
-    is_mlu,
     is_musa,
     is_npu,
     is_xpu,
@@ -125,9 +124,6 @@ if _use_aiter:
 if is_npu():
     import torch_npu
 
-if is_mlu():
-    import torch_mlu_ops
-
 logger = logging.getLogger(__name__)
 
 
@@ -187,11 +183,6 @@ class SiluAndMul(BaseFusedOp):
             self._musa_swish_glu = nn.SwishGLU()
         return self._musa_swish_glu(x)
 
-    def forward_mlu(self, x: torch.Tensor) -> torch.Tensor:
-        if not x.is_contiguous():
-            return self.forward_native(x)
-        return torch_mlu_ops.active(input=x, act_mode="silu", is_gated=True)
-
 
 class SituAndMul(BaseFusedOp):
     """SituGLU activation used by Kimi K3.
@@ -227,23 +218,6 @@ class SituAndMul(BaseFusedOp):
 
     def forward_cpu(self, x: torch.Tensor) -> torch.Tensor:
         return self.forward_native(x)
-
-    def forward_mlu(self, x: torch.Tensor) -> torch.Tensor:
-        if (
-            x.numel() > 0
-            and x.is_contiguous()
-            and x.shape[-1] % 2 == 0
-            and x.dtype in (torch.float16, torch.bfloat16)
-        ):
-            return torch_mlu_ops.active(
-                input=x,
-                act_mode="situ",
-                is_gated=True,
-                active_coef=self.beta,
-                linear_beta=self.linear_beta,
-            )
-        else:
-            return self.forward_native(x)
 
 
 class GeluAndMul(BaseFusedOp):
@@ -292,24 +266,6 @@ class GeluAndMul(BaseFusedOp):
         )
         return y_npu
 
-    def forward_mlu(self, x: torch.Tensor) -> torch.Tensor:
-        if (
-            x.numel() > 0
-            and x.is_contiguous()
-            and x.shape[-1] % 2 == 0
-            and x.dtype in (torch.float16, torch.bfloat16, torch.float32)
-            and self.approximate in ("none", "tanh")
-            and (x.dtype != torch.float32 or self.approximate != "none")
-        ):
-            return torch_mlu_ops.active(
-                input=x,
-                act_mode="gelu",
-                is_gated=True,
-                gelu_approximate=self.approximate,
-            )
-        else:
-            return self.forward_native(x)
-
 
 class NewGELU(BaseFusedOp):
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
@@ -319,21 +275,6 @@ class NewGELU(BaseFusedOp):
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
         # TODO: Implement the CUDA kernel for NewGELU in sgl-kernel
         return self.forward_native(x)
-
-    def forward_mlu(self, x: torch.Tensor) -> torch.Tensor:
-        if (
-            x.numel() > 0
-            and x.is_contiguous()
-            and x.dtype in (torch.float16, torch.bfloat16, torch.float32)
-        ):
-            return torch_mlu_ops.active(
-                input=x,
-                act_mode="gelu",
-                is_gated=False,
-                gelu_approximate="tanh",
-            )
-        else:
-            return self.forward_native(x)
 
 
 class ReLU2(BaseFusedOp):
@@ -368,16 +309,6 @@ class QuickGELU(BaseFusedOp):
 
     def forward_npu(self, x: torch.Tensor) -> torch.Tensor:
         return torch_npu.npu_fast_gelu(x)
-
-    def forward_mlu(self, x: torch.Tensor) -> torch.Tensor:
-        if (
-            x.numel() > 0
-            and x.is_contiguous()
-            and x.dtype in (torch.float16, torch.bfloat16)
-        ):
-            return torch_mlu_ops.active(input=x, act_mode="quick_gelu", is_gated=False)
-        else:
-            return self.forward_native(x)
 
 
 class XIELU(BaseFusedOp):
