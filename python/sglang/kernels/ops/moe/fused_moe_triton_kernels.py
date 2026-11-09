@@ -24,8 +24,6 @@ from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.utils import get_moe_padding_size
 from sglang.srt.utils import (
-    cpu_has_amx_support,
-    is_cpu,
     is_cuda,
     is_hip,
     is_sm90_supported,
@@ -40,16 +38,7 @@ except:
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
-_is_cpu_amx_available = cpu_has_amx_support()
-_is_cpu = is_cpu()
 _use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
-
-if _is_cuda:
-    pass
-elif _is_cpu and _is_cpu_amx_available:
-    pass
-elif _is_hip:
-    pass
 
 padding_size = get_moe_padding_size(_use_aiter)
 
