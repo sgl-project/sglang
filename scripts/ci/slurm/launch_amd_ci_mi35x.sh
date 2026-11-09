@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Run one AMD CI suite on a single MI35x node scheduled through Spur.
 #
-# Runs on the login node: submits a whole-node job running amd_ci_job_mi35x.sh,
-# streams its log into the step output, and exits with the suite's exit code.
+# Runs on the login node: submits a job running amd_ci_job_mi35x.sh, streams its
+# log into the step output, and exits with the suite's exit code.
 #
 # Spur behaviours handled here (see launch_mi355x.sh, #40113 and #41025):
 #   * batch output is not streamed back, so the job logs to shared storage and
@@ -18,8 +18,13 @@
 #     finished job is polled for it rather than checked once.
 #
 # Usage:
-#   launch_amd_ci_mi35x.sh --suite NAME [--rocm-version rocm10] [--env KEY=VAL]...
-#                          [-- run_suite.py args...]
+#   launch_amd_ci_mi35x.sh --suite NAME [--rocm-version rocm10] [--gpus 1|2|4|8]
+#                          [--env KEY=VAL]... [-- run_suite.py args...]
+#
+#   --gpus is the suite's GPU count, as in the linux-mi35x-gpu-N labels. 8
+#   (the default) holds the node whole; 1, 2 and 4 ask for that many GPUs, so
+#   up to 8/N such jobs share a node, each in its own container that sees only
+#   the GPUs Spur assigned it.
 #
 #   --env sets a variable inside the test container, as the `-e` flags the ARC
 #   workflows pass to amd_ci_exec.sh do (e.g. a benchmark's workload knobs).
@@ -28,8 +33,13 @@
 #   SLURM_PARTITION, SLURM_ACCOUNT, SLURM_QOS
 #   CI_NODE_SCRATCH  node-local directory for the checkout copy and the
 #                    persistent /sgl-data cache (models, pip, MIOpen)
+#   HF_TOKEN         for gated models; passed through to the test container
 # Optional:
 #   SLURM_EXCLUDE    comma-separated nodes to keep the scheduler off
+#   SLURM_WHOLE_NODE_ONLY
+#                    comma-separated nodes kept for 8-GPU jobs; jobs asking for
+#                    fewer GPUs stay off them, so packed small jobs can never
+#                    leave every node partly busy
 #   TIME_LIMIT       default 01:30:00
 #   CI_SHARED_DIR    shared-storage dir for job logs, default $HOME/.amd_ci_spur
 #   SUBMIT_ATTEMPTS  default 3
@@ -38,11 +48,18 @@ set -euo pipefail
 
 SUITE=""
 ROCM_VERSION="rocm10"
+GPUS=8
 EXEC_ENV=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --suite) SUITE="$2"; shift 2 ;;
         --rocm-version) ROCM_VERSION="$2"; shift 2 ;;
+        --gpus)
+            if [[ ! "$2" =~ ^(1|2|4|8)$ ]]; then
+                echo "ERROR: --gpus takes 1, 2, 4 or 8 (got '$2')" >&2
+                exit 2
+            fi
+            GPUS="$2"; shift 2 ;;
         --env)
             if [[ ! "$2" =~ ^[A-Za-z_][A-Za-z0-9_]*= || "$2" == *$'\n'* ]]; then
                 echo "ERROR: --env takes KEY=VAL on one line (got '$2')" >&2
@@ -79,6 +96,7 @@ mkdir -p "$RUN_DIR"
 # Read by amd_ci_job_mi35x.sh; sbatch exports the submitting environment.
 export CI_SRC="$GITHUB_WORKSPACE" CI_SUITE="$SUITE" CI_SUITE_ARGS="$SUITE_ARGS"
 export CI_ROCM_VERSION="$ROCM_VERSION" CI_NODE_SCRATCH CI_EXIT_FILE="$RUN_DIR/exit_code"
+export CI_GPUS="$GPUS"
 # One KEY=VAL per line; an environment variable cannot carry an array.
 CI_EXEC_ENV="$(printf '%s\n' ${EXEC_ENV[@]+"${EXEC_ENV[@]}"})"
 export CI_EXEC_ENV
@@ -123,11 +141,20 @@ for attempt in $(seq 1 "$SUBMIT_ATTEMPTS"); do
     : > "$LOG"
     rm -f "$CI_EXIT_FILE"
     SBATCH_ARGS=(-p "$SLURM_PARTITION" -A "$SLURM_ACCOUNT" -q "$SLURM_QOS"
-                 -N1 --exclusive -t "$TIME_LIMIT" -J "$JOB_NAME" --output "$LOG")
-    [[ -n "${SLURM_EXCLUDE:-}" ]] && SBATCH_ARGS+=(--exclude="$SLURM_EXCLUDE")
+                 -N1 -t "$TIME_LIMIT" -J "$JOB_NAME" --output "$LOG")
+    # A whole node stays --exclusive: the job then clears every stale GPU
+    # container on it. Smaller jobs get only their GPUs (ROCR_VISIBLE_DEVICES).
+    EXCLUDE="${SLURM_EXCLUDE:-}"
+    if (( GPUS == 8 )); then
+        SBATCH_ARGS+=(--exclusive)
+    else
+        SBATCH_ARGS+=(--gres="gpu:$GPUS")
+        [[ -n "${SLURM_WHOLE_NODE_ONLY:-}" ]] && EXCLUDE="${EXCLUDE:+$EXCLUDE,}$SLURM_WHOLE_NODE_ONLY"
+    fi
+    [[ -n "$EXCLUDE" ]] && SBATCH_ARGS+=(--exclude="$EXCLUDE")
     JOB_ID="$(sbatch --parsable "${SBATCH_ARGS[@]}" "$SCRIPT_DIR/amd_ci_job_mi35x.sh")"
     JOB_ID="${JOB_ID%%;*}"
-    echo "Submitted job $JOB_ID (attempt $attempt/$SUBMIT_ATTEMPTS): suite=$SUITE rocm=$ROCM_VERSION"
+    echo "Submitted job $JOB_ID (attempt $attempt/$SUBMIT_ATTEMPTS): suite=$SUITE rocm=$ROCM_VERSION gpus=$GPUS"
 
     LOG_OFFSET=0
     misses=0

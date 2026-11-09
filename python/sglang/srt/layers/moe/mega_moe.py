@@ -52,9 +52,8 @@ _is_hip = is_hip()
 
 
 def _use_amd_flydsl_mega_moe() -> bool:
-    # aiter MegaMoEv2 exists only on ROCm; the platform check keeps the env from
-    # diverting a CUDA run into a path whose kernels it does not have.
-    return _is_hip and envs.SGLANG_AMD_USE_FLYDSL_MEGA_MOE.get()
+    # DeepGEMM MegaMoE has no ROCm kernels: megamoe on ROCm is aiter MegaMoEv2.
+    return _is_hip and get_moe_a2a_backend().is_megamoe()
 
 
 def _mega_moe_mma_type(experts) -> str:
@@ -212,8 +211,7 @@ def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool
 def should_fuse_mega_moe_shared_experts(moe: DeepseekV2MoE) -> bool:
     # DeepGEMM's in-kernel shared expert takes FP8 weights on SM100 fp8xfp4 only.
     return (
-        envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_FUSE_SHARED_EXPERTS.get()
-        and get_moe_a2a_backend().is_megamoe()
+        get_moe_a2a_backend().is_megamoe()
         and getattr(moe.experts, "_mega_moe_weights_built", False)
         and is_sm100_supported()
         and _mega_moe_mma_type(moe.experts) == "fp8xfp4"

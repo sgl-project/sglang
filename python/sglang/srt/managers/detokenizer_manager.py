@@ -15,6 +15,7 @@
 
 import logging
 import signal
+import traceback
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -30,6 +31,7 @@ from sglang.srt.beam_search.output import (
 )
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.environ import envs
+from sglang.srt.hf_transformers import get_tokenizer
 from sglang.srt.kv_canary.perturb.detokenizer import (
     maybe_perturb_batch_token_id_out,
 )
@@ -63,11 +65,10 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import configure_logger, freeze_gc, kill_itself_when_parent_died
-from sglang.srt.utils.hf_transformers import get_tokenizer
+from sglang.srt.utils.common import TypeBasedDispatcher
 from sglang.srt.utils.network import get_zmq_socket
 from sglang.srt.utils.patch_tokenizer import decode_without_hf_kwargs
 from sglang.srt.utils.watchdog import Watchdog
-from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 logger = logging.getLogger(__name__)
 
@@ -501,8 +502,7 @@ def run_detokenizer_process(
         else:
             manager.multi_http_worker_event_loop()
     except Exception:
-        traceback = get_exception_traceback()
-        logger.error(f"DetokenizerManager hit an exception: {traceback}")
+        logger.error(f"DetokenizerManager hit an exception: {traceback.format_exc()}")
         if manager is not None:
             manager.maybe_clear_socket_mapping()
         parent_process.send_signal(signal.SIGQUIT)

@@ -18,7 +18,7 @@ import msgspec
 import numpy as np
 import torch
 
-from sglang.srt.utils.common import get_video_bytes
+from sglang.srt.multimodal.media_io import get_video_bytes
 
 __all__ = [
     "LetterboxInfo",
