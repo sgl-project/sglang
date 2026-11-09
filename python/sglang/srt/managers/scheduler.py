@@ -4682,13 +4682,13 @@ class Scheduler(
         if (
             self.is_mixed_chunk
             and not running_batch.is_empty()
-            and not (new_batch.return_logprob or running_batch.return_logprob)
             # mix_with_running cats input_ids but not input_embeds — shapes would mismatch
             and new_batch.input_embeds is None
+            # Setwise readout requires the prefill-only pooling path.
+            and not any(r.token_indices_to_pool is not None for r in new_batch.reqs)
             # Beam member rows are not supported inside a mixed extend batch.
             and all(r.beam_group is None for r in running_batch.reqs)
         ):
-            # TODO (lianmin): support return_logprob + mixed chunked prefill
             finishing_reqs = self._reqs_finishing_inflight(running_batch)
             running_batch.filter_batch(reqs_to_exclude=finishing_reqs)
             if finishing_reqs:

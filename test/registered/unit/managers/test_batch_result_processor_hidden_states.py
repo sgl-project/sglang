@@ -1,9 +1,11 @@
 import unittest
+from array import array
 from dataclasses import replace
 from types import MethodType, SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
+from parameterized import parameterized
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import (
@@ -12,13 +14,17 @@ from sglang.srt.layers.logits_processor import (
     SamplingMaskStatus,
 )
 from sglang.srt.managers.req_types import FINISH_ABORT
-from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
+from sglang.srt.managers.scheduler_components.logprob_result_processor import (
+    SchedulerLogprobResultProcessor,
+)
 from sglang.srt.managers.utils import GenerationBatchResult
-from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.runtime_context import get_context
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.scheduler_test_utils import FakeReq, release_only_retirer
 from sglang.test.test_utils import CustomTestCase
@@ -515,6 +521,44 @@ class TestPrefillSkippedOutput(CustomTestCase):
 
 
 class TestMixedBatchKvRelease(CustomTestCase):
+    @parameterized.expand([(False,), (True,)])
+    def test_skipped_mixed_rows_advance_logprob_cursor(self, retracted):
+        params = SamplingParams(stop=[], stop_regex=[])
+        skipped, live = [
+            Req(r, "", array("q", [2, 3]), params, return_logprob=True)
+            for r in ("skipped", "live")
+        ]
+        skipped.is_retracted = retracted
+        if not retracted:
+            skipped.finish_outside_step(FINISH_ABORT("already finished"))
+        processor = replace(
+            _make_processor(self),
+            still_in_batch=lambda req: not req.finished() and not req.is_retracted,
+            logprob_result_processor=SchedulerLogprobResultProcessor(
+                model_config=SimpleNamespace(vocab_size=17)
+            ),
+        )
+        batch = ScheduleBatch(
+            [skipped, live], forward_mode=ForwardMode.MIXED, return_logprob=True
+        )
+        result = GenerationBatchResult(
+            logits_output=LogitsProcessorOutput(
+                next_token_logits=None,
+                input_token_logprobs=torch.tensor([-1.0, -2.0, -3.0, -4.0]),
+                next_token_logprobs=torch.tensor([-5.0, -6.0]),
+            ),
+            next_token_ids=torch.tensor([6, 7]),
+            extend_input_len_per_req=[2, 2],
+            extend_logprob_start_len_per_req=[0, 0],
+        )
+        with patch(
+            "sglang.srt.managers.scheduler_components.batch_result_processor.checkpoint_kv_cache"
+        ):
+            processor.process_batch_result_prefill(batch, result)
+        self.assertIsNone(skipped.logprob.input_token_logprobs_val)
+        self.assertEqual(live.logprob.input_token_logprobs_idx, [2, 3])
+        self.assertEqual(live.logprob.input_token_logprobs_val, [None, -3.0])
+
     def test_decode_req_finishing_in_mixed_batch_gets_release_hook(self):
         """A decode req that finishes inside a mixed batch goes through the
         worker's pre-release hook, as it would in a decode batch; a prefill
