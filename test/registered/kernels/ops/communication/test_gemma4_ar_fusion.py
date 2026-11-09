@@ -159,17 +159,20 @@ def test_site(hidden: int, rows: int, round_a: bool):
     ref_res, ref_y = _reference(
         _gather(partial), residual_all, w_a, w_b, scalar, round_a
     )
+    # gather before any assert: a rank that fails alone would hang its peers
+    all_out, all_scales = _gather(out), _gather(scales)
     # this rank's residual rows, then every rank's view of the quantized rows
+    # atol: one bf16 ulp of the first norm (1/32 for |a| < 8) times the 0.75 scalar
     torch.testing.assert_close(
-        residual.float(), ref_res[row0 : row0 + mine].float(), rtol=2e-2, atol=2e-2
+        residual.float(), ref_res[row0 : row0 + mine].float(), rtol=2e-2, atol=3e-2
     )
     deq = out.float() * scales.repeat_interleave(GROUP, dim=1)
     torch.testing.assert_close(
         deq, ref_y, rtol=7e-2, atol=4e-2
     )  # e4m3 has 3 mantissa bits
     assert torch.all(scales > 0)
-    for name, t in (("out", out), ("scales", scales)):
-        for i, other in enumerate(_gather(t)):
+    for name, t, gathered in (("out", out, all_out), ("scales", scales, all_scales)):
+        for i, other in enumerate(gathered):
             assert torch.equal(other, t), f"{name} differs on rank {i}"
 
 
@@ -200,9 +203,10 @@ def test_final(hidden: int, rows: int):
     torch.cuda.synchronize()
     out = staged.clone()
     ref_res, _ = _reference(_gather(partial), residual_all, w_a, w_a, scalar, False)
+    all_out = _gather(out)
     torch.testing.assert_close(out.float(), ref_res.float(), rtol=2e-2, atol=2e-2)
     torch.testing.assert_close(residual, out[row0 : row0 + mine])
-    for i, other in enumerate(_gather(out)):
+    for i, other in enumerate(all_out):
         assert torch.equal(other, out), f"out differs on rank {i}"
 
 
