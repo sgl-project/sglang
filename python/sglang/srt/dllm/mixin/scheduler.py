@@ -598,6 +598,17 @@ class DllmManager:
             return []
         return [req for req in last_batch.reqs if req in self.waiting_queue]
 
+    def any_inflight_reqs(self) -> bool:
+        """Whether a request still occupies the GPU between rounds: a retained
+        FDFO row holding its KV and req slot in the waiting queue. The rows the
+        last round ran are counted through `last_batch`, but a stalled round
+        returns None and leaves `last_batch` empty while the holders' rows are
+        live, so an idle gate reading only the batches would run the idle leak
+        checks against them."""
+        if self.dllm_config is None:
+            return False
+        return any(req.kv.holds_kv for req in self.waiting_queue)
+
     def is_empty(self) -> bool:
         if self.dllm_config is None:
             return True

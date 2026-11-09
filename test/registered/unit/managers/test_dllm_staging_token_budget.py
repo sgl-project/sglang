@@ -55,7 +55,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.dllm.mixin.req import DllmReqPhase, ReqDllmMixin
-from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
+from sglang.srt.dllm.mixin.scheduler import DllmManager, SchedulerDllmMixin
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
@@ -695,6 +695,84 @@ class TestDllmStagingStallBreaker(CustomTestCase):
 
         self.assertEqual(retirer.retracted, [victim])
         self.assertEqual(gate(), self.BLOCK_SIZE)
+
+
+class _InflightStubReq:
+    owner_list = None
+
+    def __init__(self, rid, *, holds_kv):
+        self.rid = rid
+        self.kv = SimpleNamespace(holds_kv=holds_kv)
+
+
+class TestDllmManagerInflightReqs(CustomTestCase):
+    """`any_inflight_reqs` is the idle gate's view of the dLLM manager: the
+    retained FDFO holders parked in its waiting queue. A stalled round returns
+    None, so `last_batch` (which counts the rows a round ran) is empty while
+    the holders' rows are live — the exact state that tripped the idle pool
+    leak check (StateCheckError) on a stalled live run."""
+
+    @staticmethod
+    def _manager():
+        return DllmManager(
+            dllm_config=SimpleNamespace(max_running_requests=4),
+            abort=lambda req: None,
+        )
+
+    def test_retained_holder_counts(self):
+        manager = self._manager()
+        manager.add_waiting_reqs([_InflightStubReq("holder", holds_kv=True)])
+        self.assertTrue(manager.any_inflight_reqs())
+
+    def test_released_waiting_rows_do_not_count(self):
+        manager = self._manager()
+        manager.add_waiting_reqs([_InflightStubReq("released", holds_kv=False)])
+        self.assertFalse(manager.any_inflight_reqs())
+
+    def test_disabled_dllm_reports_nothing(self):
+        manager = DllmManager(dllm_config=None, abort=lambda req: None)
+        self.assertFalse(manager.any_inflight_reqs())
+
+
+class TestSchedulerIdleGateWithRetainedHolder(CustomTestCase):
+    """`Scheduler.is_fully_idle` must stay busy while a retained dLLM row
+    holds its KV between rounds: the idle path runs the pool leak checks, and
+    a holder's live row reads as a leak there. The method only reads
+    scheduler attributes, so call it unbound on a stub."""
+
+    @staticmethod
+    def _scheduler(manager):
+        from sglang.srt.managers.scheduler import Scheduler
+
+        stub = SimpleNamespace(
+            running_batch=SimpleNamespace(is_empty=lambda: True),
+            dllm_config=manager.dllm_config,
+            dllm_manager=manager,
+            # A stalled round ran no batch.
+            last_batch=None,
+            enable_overlap=False,
+            _pp_microbatches_drained=lambda: True,
+            # The real lists, so the DLLM list's exclusion from busy_lists
+            # (upstream counts only the rows a round ran) is exercised too.
+            request_lists=lambda: {ListKind.DLLM: manager.waiting_queue},
+            request_receiver=SimpleNamespace(has_pending=lambda: False),
+            uocr_runtime=None,
+            disaggregation_mode="null",
+            enable_hierarchical_cache=False,
+            enable_lmcache=False,
+            enable_unified_cache_external_linker=False,
+        )
+        return lambda **kwargs: Scheduler.is_fully_idle(stub, **kwargs)
+
+    def test_stalled_round_with_a_retained_holder_is_not_idle(self):
+        manager = TestDllmManagerInflightReqs._manager()
+        manager.add_waiting_reqs([_InflightStubReq("holder", holds_kv=True)])
+        self.assertFalse(self._scheduler(manager)())
+
+    def test_released_queue_is_idle(self):
+        manager = TestDllmManagerInflightReqs._manager()
+        manager.add_waiting_reqs([_InflightStubReq("released", holds_kv=False)])
+        self.assertTrue(self._scheduler(manager)())
 
 
 if __name__ == "__main__":

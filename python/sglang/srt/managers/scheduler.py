@@ -6091,6 +6091,13 @@ class Scheduler(
         # Batch running status
         idle = (
             self.running_batch.is_empty()
+            # Retained dLLM KV holders: the rows the last round ran count via
+            # last_batch, but a stalled round returns None while the holders'
+            # rows stay live (mirroring the ignore_waiting holds_kv guard
+            # below), so the idle pool checks must not run against them.
+            and not (
+                self.dllm_config is not None and self.dllm_manager.any_inflight_reqs()
+            )
             and (self.last_batch is None or self.last_batch.is_empty())
             and (not self.enable_overlap or len(self.result_queue) == 0)
             and self._pp_microbatches_drained()
