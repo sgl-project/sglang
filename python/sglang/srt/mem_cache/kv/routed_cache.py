@@ -49,6 +49,7 @@ class RoutedKVCache(KVCache):
         head_dim: int,
         bs1_floor_terms: Sequence[Tuple[str, int]] = (),
         roles: Optional[Dict[str, str]] = None,
+        windows: Optional[Dict[str, Optional[int]]] = None,
     ):
         # KVCache.__init__ allocates buffers; these views alias the arena,
         # which owns the memory.
@@ -58,6 +59,7 @@ class RoutedKVCache(KVCache):
         self._bs1_floor_terms = tuple(bs1_floor_terms)
         self._owner = owner
         self._roles = dict(roles or {})
+        self._windows = dict(windows or {})
         self._layer_maps = tuple(layer_maps)
         views = {name: view for name, view, _ in self._layer_maps}
         self._owner_view = views.get(owner, self._layer_maps[0][1])
@@ -89,6 +91,7 @@ class RoutedKVCache(KVCache):
             self._layer_maps,
             owner=self._owner,
             roles=self._roles,
+            windows=self._windows,
         )
 
     def id_spaces(self):
@@ -177,8 +180,9 @@ class RoutedKVCache(KVCache):
         dcp_kv_mask: Optional[torch.Tensor] = None,
     ):
         """Write ids arrive physical, in the routed sub-pool's id space: the
-        owner's in ``full_loc`` (else ``loc``), another token sub-pool's in
-        ``swa_loc``, both bound once per forward by the attention backend."""
+        owner's in ``full_loc`` (else ``loc``), a window sub-pool's at its own
+        entry of ``window_locs``, all bound once per forward by the attention
+        backend."""
         self.layer_router.layer(layer.layer_id).store(
             layer, loc_info, cache_k, cache_v, k_scale, v_scale, dcp_kv_mask=dcp_kv_mask
         )
