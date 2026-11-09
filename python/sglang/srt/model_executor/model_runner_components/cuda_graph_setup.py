@@ -18,6 +18,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.distributed.utils import all_gather_single
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.xpu.graph_runner.xpu_graph_runner import XPUGraphRunner
+from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -114,12 +115,18 @@ def has_hybrid_graph_handlers(
     )
 
 
+def _graph_layer_id(layer) -> int:
+    if isinstance(layer, RadixAttention):
+        return int(layer.graph_layer_id)
+    return int(layer.layer_id)
+
+
 def index_attention_layers_by_global_id(
     attention_layers: list[Any],
     mha_companion_layers: list[Any],
     layer_model=None,
 ) -> tuple[list[Any], list[Any]]:
-    """Pad PP-local attention metadata so global layer_id remains a valid index.
+    """Index attention by execution layer, independently of shared KV cache IDs.
 
     Models that re-execute layers pre-expand these lists into position-indexed
     lookup tables (the same layer at several positions); such tables are
@@ -135,7 +142,7 @@ def index_attention_layers_by_global_id(
                 _align_pipeline_layers(mha_companion_layers, layer_model),
             )
         return attention_layers, mha_companion_layers
-    max_layer_id = max(int(layer.layer_id) for layer in populated)
+    max_layer_id = max(_graph_layer_id(layer) for layer in populated)
     # Keep trailing pure MoE layers represented as well. Their graph handler
     # lives in moe_layers, and shrinking this list loses decoder alignment.
     indexed_size = max(
@@ -149,7 +156,7 @@ def index_attention_layers_by_global_id(
             if companion is not None:
                 raise ValueError("MHA companion has no primary attention layer")
             continue
-        layer_id = int(attention.layer_id)
+        layer_id = _graph_layer_id(attention)
         if layer_id < 0:
             raise ValueError(f"invalid or duplicate attention layer_id: {layer_id}")
         if indexed_attention[layer_id] is not None:
@@ -434,7 +441,9 @@ def capture_cuda_graphs(
     if capture_decode_cuda_graph:
         model_runner.maybe_init_uocr_greedy_graph()
         if current_platform.capabilities.graph_capture:
-            decode = capture_decode_graph(model_runner=model_runner)
+            decode = capture_decode_graph(
+                model_runner=model_runner, prefill_runner=prefill.runner
+            )
     else:
         decode = GraphCapture(
             runner=eager_runner,
@@ -491,6 +500,28 @@ def capture_prefill_graph(
             memory_usage_gb=memory_usage_gb,
             capture_time=capture_time,
         )
+
+    # CPU prefill graph capture is owned by CPUGraphRunner; keep the shared
+    # setup path eager for unsupported CPU configurations.
+    if getattr(model_runner, "device", None) == "cpu":
+        if not get_flags().capture.enable_torch_compile:
+            return result(None)
+        if model_runner.is_draft_worker and not force_for_draft_worker:
+            return result(None)
+        if (
+            not hasattr(model_runner, "_uses_cpu_graph_attention_backend")
+            or not model_runner._uses_cpu_graph_attention_backend()
+        ):
+            return result(None)
+        if check_cuda_graph_backend(Phase.PREFILL, Backend.DISABLED):
+            return result(None)
+        prefill_backend = get_exec().graph.cuda_graph_config.prefill.backend
+        if prefill_backend is not None and prefill_backend != Backend.FULL:
+            raise ValueError(
+                f"Unsupported CPU prefill graph backend: {prefill_backend!r}; "
+                "only 'full' is supported on CPU."
+            )
+        return result(CPUGraphRunner(model_runner))
 
     if check_cuda_graph_backend(Phase.PREFILL, Backend.DISABLED):
         logger.info(
@@ -567,10 +598,13 @@ def capture_prefill_graph(
     prefill_config = get_exec().graph.cuda_graph_config.prefill
     prefill_backend = prefill_config.backend
     parallel = get_parallel()
+    from sglang.srt.layers.cp.bcg import supports_prefill_cp_bcg
+
     if (
         prefill_backend == Backend.BREAKABLE
         and parallel.enable_prefill_cp
         and parallel.pp_size > 1
+        and not supports_prefill_cp_bcg(model_runner.server_args)
     ):
         logger.warning(
             "Disable prefill CUDA graph because pipeline parallelism combined "
@@ -700,7 +734,9 @@ def capture_prefill_graph(
     return result(prefill_runner, mem_usage, capture_time)
 
 
-def capture_decode_graph(*, model_runner: ModelRunner) -> GraphCapture:
+def capture_decode_graph(
+    *, model_runner: ModelRunner, prefill_runner: Optional[BaseRunner] = None
+) -> GraphCapture:
     """Capture device graphs."""
     if model_runner.is_draft_worker:
         memory_phase = "draft_decode"
@@ -726,14 +762,37 @@ def capture_decode_graph(*, model_runner: ModelRunner) -> GraphCapture:
     if not model_runner.is_generation:
         # TODO: Currently, cuda graph only captures decode steps, which only exists for generation models
         return no_capture
+
     if get_model().model_impl.lower() == ModelImpl.MINDSPORE:
         return no_capture
-    if model_runner.device != "cpu" and check_cuda_graph_backend(
-        Phase.DECODE, Backend.DISABLED
-    ):
+    if check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED):
         return no_capture
-    if model_runner.device == "cpu" and not get_flags().capture.enable_torch_compile:
-        return no_capture
+
+    if getattr(model_runner, "device", None) == "cpu":
+        if not get_flags().capture.enable_torch_compile:
+            return no_capture
+        if (
+            not hasattr(model_runner, "_uses_cpu_graph_attention_backend")
+            or not model_runner._uses_cpu_graph_attention_backend()
+        ):
+            return no_capture
+        decode_backend = get_exec().graph.cuda_graph_config.decode.backend
+        if decode_backend != Backend.FULL:
+            raise ValueError(
+                f"Unsupported CPU decode graph backend: {decode_backend!r}; "
+                "only 'full' is supported on CPU."
+            )
+        runner = (
+            prefill_runner
+            if isinstance(prefill_runner, CPUGraphRunner)
+            else CPUGraphRunner(model_runner)
+        )
+        return GraphCapture(
+            runner=runner,
+            memory_phase=memory_phase,
+            memory_usage_gb=0,
+            capture_time=0,
+        )
 
     tic = time.perf_counter()
     before_mem = get_available_gpu_memory(model_runner.device, model_runner.gpu_id)

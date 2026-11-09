@@ -21,13 +21,14 @@
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
-#include <sgl_kernel/mbarrier.cuh>
 #include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/type.cuh>
 #include <sgl_kernel/utils.cuh>
 #include <sgl_kernel/warp.cuh>
 
 #include <sgl_kernel/deepseek_v4/fp8_utils.cuh>
+#include <sgl_kernel/ptx/async.cuh>
+#include <sgl_kernel/ptx/barrier.cuh>
 
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
@@ -39,40 +40,12 @@
 
 namespace sglang::device::ptx {
 
-// ---- TMA -------------------------------------------------------------------
-// Coordinate convention: the tensor map's globalDim is (inner, outer) -- dim 0
-// is the stride-1 axis -- and the load takes (x = inner, y = outer). Swapping
-// them loads a transposed tile with plausible magnitudes and scrambled pairing.
-// Warm the cache line holding the tensor-map descriptor so the first TMA does
-// not pay the descriptor fetch on top of the DRAM latency.
-SGL_DEVICE void prefetch_tensormap(const void* tmap) {
-  asm volatile("prefetch.tensormap [%0];" ::"l"(tmap) : "memory");
-}
-
-SGL_DEVICE void
-cp_async_bulk_tensor_2d(uint32_t dst_smem, const CUtensorMap* tmap, int32_t x, int32_t y, uint64_t* bar) {
-  asm volatile(
-      "cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes"
-      " [%0], [%1, {%2, %3}], [%4];" ::"r"(dst_smem),
-      "l"(tmap),
-      "r"(x),
-      "r"(y),
-      "r"(to_shared(bar))
-      : "memory");
-}
-
 // Push partial sums into a peer's inbox and credit its mbarrier byte count.
 SGL_DEVICE void st_async_b32(uint32_t dst_dsmem, float value, uint32_t dst_bar) {
   asm volatile("st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [%0], %1, [%2];" ::"r"(dst_dsmem),
                "f"(value),
                "r"(dst_bar)
                : "memory");
-}
-
-// Generic stores land in a different proxy than the one the MMA and the bulk
-// copy engine read through.
-SGL_DEVICE void fence_proxy_async_shared() {
-  asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
 }
 
 // Retarget a local smem offset at CTA `rank` of this cluster (DSMEM).
@@ -101,10 +74,6 @@ SGL_DEVICE void cluster_arrive_relaxed() {
 }
 SGL_DEVICE void cluster_wait_acquire() {
   asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
-}
-
-SGL_DEVICE void bar_sync(uint32_t id, uint32_t threads) {
-  asm volatile("bar.sync %0, %1;" ::"r"(id), "r"(threads) : "memory");
 }
 
 // ---- tcgen05 ---------------------------------------------------------------
@@ -233,14 +202,6 @@ SGL_DEVICE uint64_t smem_desc_add(uint64_t desc, uint32_t byte_offset) {
 // operands, d_type F32, a/b_type BF16.
 constexpr uint32_t inst_desc_bf16(uint32_t M, uint32_t N) {
   return (1u << 4) | (1u << 7) | (1u << 10) | (((N >> 3) & 0x3Fu) << 17) | (((M >> 4) & 0x1Fu) << 24);
-}
-
-SGL_DEVICE void barrier_sync(uint32_t id, uint32_t n) {
-  asm volatile("barrier.sync %0, %1;" ::"r"(id), "r"(n) : "memory");
-}
-
-SGL_DEVICE void barrier_arrive(uint32_t id, uint32_t n) {
-  asm volatile("barrier.arrive %0, %1;" ::"r"(id), "r"(n) : "memory");
 }
 
 }  // namespace sglang::device::ptx
@@ -483,9 +444,9 @@ __global__ void __cluster_dims__(Trait::kSplitK, 1, 1) __launch_bounds__(Trait::
         ptx::mbar_arrive_expect_tx(&smem.x_landed[h], kXTile);
       }
     }
-    ptx::barrier_arrive(BAR_MBAR_MMA, 64);
+    ptx::bar_arrive<false>(BAR_MBAR_MMA, 64);
   } else if (warp_id == MMA) {
-    ptx::barrier_sync(BAR_MBAR_MMA, 64);
+    ptx::bar_sync<false>(BAR_MBAR_MMA, 64);
     const uint32_t taddr = smem.taddr;
     if (warp::elect_one_lane()) {
       constexpr uint32_t idesc = ptx::inst_desc_bf16(kNTile, kMMax);
@@ -661,33 +622,6 @@ __global__ void __cluster_dims__(Trait::kSplitK, 1, 1) __launch_bounds__(Trait::
 // Host
 // ---------------------------------------------------------------------------
 
-// `rows`/`row_stride_bytes` describe the outer axis; rows >= rows are out of
-// bounds and TMA zero-fills them, which is how tokens >= m get masked.
-inline CUtensorMap make_map(
-    const void* base, uint64_t cols, uint64_t rows, uint64_t row_stride_bytes, uint32_t box_cols, uint32_t box_rows) {
-  CUtensorMap map{};
-  uint64_t dim[2] = {cols, rows};
-  uint64_t stride[1] = {row_stride_bytes};
-  uint32_t box[2] = {box_cols, box_rows};
-  uint32_t elem_stride[2] = {1, 1};
-  // The only driver-API call in the file; there is no runtime-API tensor-map
-  // encoder, so the module links `-lcuda` for it.
-  cuTensorMapEncodeTiled(
-      &map,
-      CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
-      2,
-      const_cast<void*>(base),
-      dim,
-      stride,
-      box,
-      elem_stride,
-      CU_TENSOR_MAP_INTERLEAVE_NONE,
-      CU_TENSOR_MAP_SWIZZLE_128B,
-      CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
-      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return map;
-}
-
 }  // namespace sglang::wo_a_fused
 
 namespace sglang {
@@ -718,7 +652,7 @@ inline void wo_a_fused_run(
     tvm::ffi::Optional<tvm::ffi::TensorView> scales,
     tvm::ffi::Optional<tvm::ffi::TensorView> y) {
   using namespace host;
-  using namespace wo_a_fused;  // make_map, wo_a_fused_kernel
+  using namespace wo_a_fused;  // wo_a_fused_kernel
   using Trait = WoATrait<kMaxTokens, kGroups>;
   constexpr int kMMax = Trait::kMMax;
   constexpr int kNTile = Trait::kNTile;
@@ -782,8 +716,21 @@ inline void wo_a_fused_run(
   CHECK_HOST(m >= 1 && m <= kMMax) << "wo_a_fused supports 1 <= T <= " << kMMax << ", got " << m;
   CHECK_HOST(x_stride0 >= kGroups * kGroupK)
       << "x row stride must cover all " << kGroups << " groups, got " << x_stride0;
-  const auto w_map = make_map(w.data_ptr(), kGroupK, kNOut, kGroupK * 2, kBlockK, kNTile);
-  const auto x_map = make_map(x.data_ptr(), kGroups * kGroupK, m, x_stride0 * 2, kBlockK, kMMax);
+  // bf16 maps of (inner = K, outer = rows); x rows >= m are out of bounds and TMA zero-fills them, which is how the
+  // tokens past m get masked.
+  constexpr auto kMapParams = tma::TensorMapParams{
+      .swizzle = CU_TENSOR_MAP_SWIZZLE_128B,
+      .l2_promotion = CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
+  };
+  const auto w_map = tma::make_map(
+      w.data_ptr(), CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, {kGroupK, kNOut}, {kGroupK * 2}, {kBlockK, kNTile}, kMapParams);
+  const auto x_map = tma::make_map(
+      x.data_ptr(),
+      CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+      {kGroups * kGroupK, static_cast<cuuint64_t>(m)},
+      {static_cast<cuuint64_t>(x_stride0 * 2)},
+      {kBlockK, kMMax},
+      kMapParams);
   const auto launch = [&](const auto* pos) {
     using PosT = std::decay_t<decltype(*pos)>;
     constexpr auto kernel = wo_a_fused_kernel<Trait, PosT>;
