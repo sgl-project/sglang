@@ -23,11 +23,12 @@ import torch
 
 from sglang.kernels.ops.attention import decode_attention as da
 from sglang.srt.utils import is_gfx115_supported
-from sglang.test.ci.ci_register import register_amd_ci
+from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-# No gfx115x runner yet; skips everywhere else.
-register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd-mi35x")
+# CI has no gfx115x runner, so CI checks the stage choice on CPU; the ragged-batch case
+# below needs gfx115x hardware and skips elsewhere.
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 LK, LV, HEADS, MAX_KV_SPLITS = 576, 512, 16, 64
 
@@ -39,6 +40,15 @@ CASES = (
 RUNS = 5
 # bf16 rounding of the output alone measures ~1e-2 against fp32.
 ATOL = 2e-2
+
+
+class TestMlaStage1NumStages(CustomTestCase):
+    def test_gfx115_lk576_uses_two_stages(self):
+        self.assertEqual(da._hip_grouped_num_stages(lk=576, is_gfx115=True), 2)
+
+    def test_lk288_and_other_archs_keep_one_stage(self):
+        self.assertEqual(da._hip_grouped_num_stages(lk=288, is_gfx115=True), 1)
+        self.assertEqual(da._hip_grouped_num_stages(lk=576, is_gfx115=False), 1)
 
 
 @unittest.skipUnless(is_gfx115_supported(), "gfx115x only")

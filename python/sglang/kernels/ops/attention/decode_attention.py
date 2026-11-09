@@ -786,6 +786,12 @@ def _fwd_grouped_kernel_stage1(
         tl.extra.cuda.gdc_launch_dependents()
 
 
+def _hip_grouped_num_stages(*, lk: int, is_gfx115: bool) -> int:
+    # Workaround for #48967: on gfx115x with Lk 576, one stage makes stage-1 partials wrong or
+    # faults (Triton 3.6); two stages are clean, Lk 288 is unaffected. Drop once that is fixed.
+    return 2 if is_gfx115 and lk == 576 else 1
+
+
 def _decode_grouped_att_m_fwd(
     q,
     k_buffer,
@@ -844,9 +850,7 @@ def _decode_grouped_att_m_fwd(
         # https://rocm.docs.amd.com/en/docs-6.2.0/how-to/llm-fine-tuning-optimization/optimizing-triton-kernel.html
         # https://github.com/triton-lang/triton/blob/main/third_party/amd/backend/compiler.py
         extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
-        # Workaround for #48967: on gfx115x with Lk 576, one stage makes stage-1 partials wrong or
-        # faults (Triton 3.6); two stages are clean, Lk 288 is unaffected. Drop once that is fixed.
-        num_stages = 2 if _is_gfx115 and Lk == 576 else 1
+        num_stages = _hip_grouped_num_stages(lk=Lk, is_gfx115=_is_gfx115)
 
     if tune_mla:
         # num_warps reorders the fp32 accumulation, so whoever declined the batch-wide
