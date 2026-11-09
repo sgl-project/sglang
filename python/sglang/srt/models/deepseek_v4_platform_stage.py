@@ -152,6 +152,7 @@ class NonCudaDecoderMixin:
 
         def run_attn_hc(state: mhc.HcState) -> mhc.HcState:
             assert self.attn_hc is not None
+            state = mhc.mega_closed_seam(self.attn_hc, state, local_boundary.extend)
             residual = state.residual
             quantized = [] if self.self_attn.accepts_mxfp8_swizzled_input() else None
             mhc.fork_stats_stream(stats_stream)

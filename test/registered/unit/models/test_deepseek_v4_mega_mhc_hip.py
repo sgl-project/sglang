@@ -127,6 +127,101 @@ class TestHipFlydslDispatch(unittest.TestCase):
         self.assertTrue(torch.equal(state.pre, pre))
 
 
+class TestHipClosedSeam(unittest.TestCase):
+    def _hc(self, hidden=5120):
+        norm = _Norm()
+        norm.weight = torch.ones(hidden, dtype=torch.bfloat16)
+        norm.cast_x_before_out_mul = False
+        norm.variance_size_override = None
+        return mhc.HcSubLayer(
+            cfg=_cfg(),
+            fn=torch.zeros(1),
+            scale=torch.zeros(1),
+            base=torch.zeros(1),
+            norm=norm,
+        )
+
+    def _run(self, state, *, hc=None, extend=True, flag=True):
+        normalized = torch.full((2, 4), 3.0)
+        post_mix = torch.full((2, 4, 1), 4.0)
+        comb = torch.full((2, 4, 4), 5.0)
+        next_pre = torch.full((2, 4), 6.0)
+        calls = []
+
+        def fake_flydsl(residual, *args, **kwargs):
+            calls.append((args, kwargs))
+            return residual, post_mix, comb, normalized, next_pre
+
+        flydsl = types.ModuleType("aiter.ops.flydsl")
+        flydsl.flydsl_mega_mhc = fake_flydsl
+        ops = types.ModuleType("aiter.ops")
+        ops.flydsl = flydsl
+        aiter = types.ModuleType("aiter")
+        aiter.ops = ops
+        hc = hc or self._hc()
+        with (
+            envs.SGLANG_OPT_DSV41_MEGA_MHC_PREFILL.override(flag),
+            mock.patch.object(mhc, "_is_hip", True),
+            mock.patch.object(mhc, "_is_gfx95_supported", True),
+            mock.patch.dict(
+                sys.modules,
+                {"aiter": aiter, "aiter.ops": ops, "aiter.ops.flydsl": flydsl},
+            ),
+        ):
+            out = mhc.mega_closed_seam(hc, state, extend)
+        return out, calls, hc, (next_pre, comb, normalized)
+
+    def test_engram_seam_runs_no_post_mega(self):
+        residual = torch.zeros(2, 4, 5120)
+        pre = torch.full((2, 4), 0.25)
+        state = mhc.HcState(residual, pre)
+        out, calls, hc, (next_pre, comb, normalized) = self._run(state)
+
+        self.assertEqual(len(calls), 1)
+        args, kwargs = calls[0]
+        self.assertIs(args[8], pre)
+        for key in ("sublayer_out", "post_layer_mix", "comb_res_mix", "residual_out"):
+            self.assertNotIn(key, kwargs)
+        self.assertIs(kwargs["norm_weight"], hc.norm.weight)
+        self.assertEqual(kwargs["out_dtype"], "bf16")
+        self.assertIs(out.streams, residual)
+        self.assertIs(out.pre, pre)
+        self.assertIsInstance(out.input, mhc.HcNormed)
+        self.assertTrue(torch.equal(out.input.rows, normalized))
+        self.assertTrue(torch.equal(out.stats[0], next_pre))
+        self.assertEqual(out.stats[1].shape, (2, 4))
+        self.assertTrue(torch.equal(out.stats[2], comb))
+        self.assertIsNone(state.streams)
+
+    def test_first_layer_takes_identity_pre(self):
+        out, calls, _, _ = self._run(mhc.HcState(torch.zeros(2, 4, 5120)))
+        self.assertIsNone(calls[0][0][8])
+        self.assertIsNone(out.pre)
+
+    def test_other_seams_unchanged(self):
+        residual = torch.zeros(2, 4, 5120)
+        pre = torch.zeros(2, 4)
+        cases = {
+            "folded input": (
+                mhc.HcState(residual, pre, mhc.HcNormed(residual[:, 0])),
+                {},
+            ),
+            "folded stats": (
+                mhc.HcState(residual, pre, None, (pre, pre, residual)),
+                {},
+            ),
+            "decode": (mhc.HcState(residual, pre), {"extend": False}),
+            "flag off": (mhc.HcState(residual, pre), {"flag": False}),
+            "no rows": (mhc.HcState(torch.zeros(0, 4, 5120), pre), {}),
+            "norm not fusable": (mhc.HcState(residual, pre), {"hc": self._hc(4096)}),
+        }
+        for name, (state, kwargs) in cases.items():
+            with self.subTest(name):
+                out, calls, _, _ = self._run(state, **kwargs)
+                self.assertIs(out, state)
+                self.assertEqual(calls, [])
+
+
 class TestHipBoundaryExtend(unittest.TestCase):
     def test_prefill_boundaries_extend(self):
         layer = deepseek_v4_platform_stage.NonCudaDecoderMixin()
@@ -151,6 +246,10 @@ class TestHipBoundaryExtend(unittest.TestCase):
             seen.append(next.extend)
             return mock.Mock()
 
+        def closed_seam(hc, state, extend):
+            seen.append(extend)
+            return state
+
         modes = {
             ForwardMode.EXTEND: True,
             ForwardMode.MIXED: True,
@@ -162,6 +261,7 @@ class TestHipBoundaryExtend(unittest.TestCase):
             mock.patch.object(mhc, "use_stats_stream", return_value=False),
             mock.patch.object(mhc, "fork_stats_stream"),
             mock.patch.object(mhc, "combine"),
+            mock.patch.object(mhc, "mega_closed_seam", side_effect=closed_seam),
             mock.patch.object(mhc, "run_attn_post", side_effect=post),
             mock.patch.object(mhc, "run_moe_post", side_effect=post),
         ):
@@ -175,8 +275,8 @@ class TestHipBoundaryExtend(unittest.TestCase):
                         types.SimpleNamespace(forward_mode=mode),
                         None,
                     )
-                    # the attention seam, then the MoE seam
-                    self.assertEqual(seen, [extend, extend])
+                    # the closed-seam check, the attention seam, then the MoE seam
+                    self.assertEqual(seen, [extend, extend, extend])
 
 
 class TestFusedBoundaryRouting(unittest.TestCase):
