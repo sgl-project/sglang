@@ -249,6 +249,7 @@ def test_token_packing_after_dcp_gather():
     rank, world_size = group.rank_in_group, group.world_size
     if not get_platform().is_sm100:
         pytest.skip("token packing requires SM100")
+    from sglang.kernels.ops.attention import flash_mla_interface
     from sglang.kernels.ops.attention.dsa.dequant_k_cache import dequantize_k_cache
     from sglang.kernels.ops.attention.dsa.flashmla_token_pack import (
         flashmla_kv_token_packed,
@@ -341,21 +342,17 @@ def test_token_packing_after_dcp_gather():
             actual = flashmla_kv_token_packed(
                 q[:, :, :512], q[:, :, 512:], cache, rows, 192**-0.5
             )
-            reference = torch.ops.sgl_kernel.sparse_decode_fwd.default(
-                q.unsqueeze(1),
-                cache,
-                rows.unsqueeze(1),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                512,
-                192**-0.5,
-                "V32",
-                0,
+            reference = flash_mla_interface.flash_mla_with_kvcache(
+                q=q.unsqueeze(1),
+                k_cache=cache,
+                block_table=None,
+                cache_seqlens=None,
+                head_dim_v=512,
+                tile_scheduler_metadata=flash_mla_interface.get_mla_metadata()[0],
+                softmax_scale=192**-0.5,
+                is_fp8_kvcache=True,
+                indices=rows.unsqueeze(1),
+                kv_format="V32",
             )[0]
             # Packing reorders KV rows, so compare both BF16 kernels
             # with a complete FP32 reference before checking their pairwise

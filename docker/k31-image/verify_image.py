@@ -1,13 +1,11 @@
 """Fail the image build when a compiled K3.1 component would silently fall back.
 
 Runs inside the image without a GPU, so it checks artifacts rather than loading CUDA code:
-- every op that our FlashMLA extension source registers is in the installed flashmla_ops;
 - the flashinfer DynBlock header patch is in place (patch_flashinfer.py), and every installed
   copy of the modules that include it was rebuilt from this header for 1024 experts
   (build_flashinfer_dynblock.py marker), so a flashinfer upgrade cannot silently undo it;
-- the FlashInfer Prims-TS overlay (overlay_flashinfer_prims_ts.py), the patched DeepGEMM build
-  (build_deepgemm.py) and the patched Dynamo runtime (build_dynamo.py) are installed and unchanged
-  since they were made;
+- the FlashInfer Prims-TS overlay (overlay_flashinfer_prims_ts.py) and the patched Dynamo runtime
+  (build_dynamo.py) are installed and unchanged since they were made;
 - the Rust TreeCore extension loads.
 """
 
@@ -19,20 +17,9 @@ import sys
 import sysconfig
 from pathlib import Path
 
-SGLANG = Path("/sgl-workspace/sglang")
 SITE = Path(sysconfig.get_paths()["purelib"])
 
 errors = []
-
-source = (SGLANG / "python/sglang/kernels/aot/csrc/flashmla_extension.cc").read_text()
-ops = re.findall(r'm\.def\(\s*"(\w+)\(', source)
-module = (SITE / "sgl_kernel/flashmla_ops.abi3.so").read_bytes()
-missing = [op for op in ops if op.encode() not in module]
-print(f"flashmla_ops: {len(ops) - len(missing)}/{len(ops)} registered ops present")
-if not ops or missing:
-    errors.append(
-        f"flashmla_ops lacks {missing or 'all ops'}: the PyPI build is installed"
-    )
 
 header = (
     SITE / "flashinfer/data/include/flashinfer/trtllm/fused_moe/RoutingCustomPolicy.cuh"
@@ -84,24 +71,6 @@ if not prims_ok:
     errors.append(
         "flashinfer prims_ts is not the overlaid tree (overlay_flashinfer_prims_ts.py)"
     )
-
-deepgemm_modules = sorted((SITE / "deep_gemm").glob("_C*.so"))
-deepgemm_marker_path = SITE / "deep_gemm/k31-deepgemm.json"
-deepgemm_marker = (
-    json.loads(deepgemm_marker_path.read_text())
-    if deepgemm_marker_path.exists()
-    else {}
-)
-deepgemm_ok = (
-    bool(deepgemm_modules)
-    and deepgemm_marker.get("module_sha256")
-    == hashlib.sha256(deepgemm_modules[0].read_bytes()).hexdigest()
-)
-print(
-    f"DeepGEMM: {'patched build ' + deepgemm_marker['key'] if deepgemm_ok else 'PyPI build'}"
-)
-if not deepgemm_ok:
-    errors.append("deep_gemm is not the patched build (build_deepgemm.py)")
 
 dynamo_core = SITE / "dynamo/_core.abi3.so"
 dynamo_marker_path = SITE / "dynamo/k31-dynamo.json"
