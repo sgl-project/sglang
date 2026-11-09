@@ -14,9 +14,14 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
 )
 from sglang.srt.mem_cache.pool_host.base import (
-    host_memory_budget_bytes,
+    host_memory_budget_from_plain_hugetlb,
+    host_memory_budget_plain_hugetlb,
     host_memory_budget_scope,
     ranks_per_host,
+)
+from sglang.srt.mem_cache.pool_host.common import (
+    get_allocator_class_from_storage,
+    get_allocator_type,
 )
 from sglang.srt.runtime_context import get_context, get_memory, get_parallel
 
@@ -105,10 +110,14 @@ def _world_cpu_group():
 
 
 @contextmanager
-def _explicit_size_budget():
+def _explicit_size_budget(params: CacheInitParams):
     """Book explicitly sized host pools against a snapshot taken before any rank
     allocates; re-sampling per pool charges a late rank for its peers' pools."""
-    budget = host_memory_budget_bytes()
+    kvcache_device = getattr(
+        params.token_to_kv_pool_allocator.get_kvcache(), "device", None
+    )
+    allocator = get_allocator_class_from_storage(get_allocator_type())
+    budget = host_memory_budget_plain_hugetlb(allocator, kvcache_device)
     group = _world_cpu_group()
     if group is not None:
         torch.distributed.barrier(group=group)
@@ -130,12 +139,24 @@ def auto_size_hicache(
         return
     fraction = get_memory().hicache_host_memory_fraction
     if fraction is None:
-        with _explicit_size_budget():
+        with _explicit_size_budget(params):
             yield
         return
     requested = get_memory().hicache_ratio
     device_bytes = _estimate_hicache_bytes(params, draft_plan)
-    budget = int(host_memory_budget_bytes(auto_size=True) * fraction)
+    kvcache_device = getattr(
+        params.token_to_kv_pool_allocator.get_kvcache(), "device", None
+    )
+    allocator = get_allocator_class_from_storage(get_allocator_type())
+    plain_budget, hugetlb_budget = host_memory_budget_plain_hugetlb(
+        allocator, kvcache_device, auto_size=True
+    )
+    budget = int(
+        host_memory_budget_from_plain_hugetlb(
+            plain_budget, hugetlb_budget, allocator, kvcache_device
+        )
+        * fraction
+    )
     ratio = min(requested, budget * (1 - _ALLOCATION_SLACK_FRACTION) / device_bytes)
     # One collective before any pool is built: PP stages own different pool
     # counts, so a per-pool collective could deadlock.
@@ -162,5 +183,7 @@ def auto_size_hicache(
         ranks_per_host(),
         device_bytes * ratio / 1024**3,
     )
-    with host_memory_budget_scope(budget):
+    with host_memory_budget_scope(
+        (int(plain_budget * fraction), int(hugetlb_budget * fraction))
+    ):
         yield

@@ -47,6 +47,20 @@ def _windowed(pool):
     return pool
 
 
+
+def _cpu_params():
+    return SimpleNamespace(
+        token_to_kv_pool_allocator=SimpleNamespace(
+            get_kvcache=lambda: SimpleNamespace(device="cpu")
+        )
+    )
+
+
+def _plain_left():
+    """Plain RAM left in the active snapshot scope."""
+    return base._host_memory_budget.get()[0]
+
+
 class TestHiCacheAutoSize(CustomTestCase):
     def test_hybrid_target_draft_uses_its_sidecar_slot_capacity(self):
         # EAGLE3 can pair a hybrid target with a plain MHA draft. Full drafts
@@ -244,7 +258,7 @@ class TestHiCacheAutoSize(CustomTestCase):
                 "available_host_memory_bytes",
                 side_effect=lambda **_: host_free["bytes"],
             ),
-            sizing.auto_size_hicache(None, None, enabled=True),
+            sizing.auto_size_hicache(_cpu_params(), None, enabled=True),
         ):
             # Three peers on this host pin their pools before this rank builds its own.
             host_free["bytes"] -= 3 * pool_bytes
@@ -262,7 +276,7 @@ class TestHiCacheAutoSize(CustomTestCase):
                 write_back_staging=pool.hicache_write_back_staging,
             )
             self.assertEqual(host.size * host.size_per_token, pool_bytes)
-            self.assertEqual(base.host_memory_budget_bytes(), rank_budget - pool_bytes)
+            self.assertEqual(_plain_left(), rank_budget - pool_bytes)
         self.assertIsNone(base._host_memory_budget.get())
 
     def test_explicit_size_samples_host_memory_before_the_rank_barrier(self):
@@ -283,9 +297,9 @@ class TestHiCacheAutoSize(CustomTestCase):
                     world_group=SimpleNamespace(cpu_group="cpu")
                 ),
             ),
-            sizing.auto_size_hicache(None, None, enabled=True),
+            sizing.auto_size_hicache(_cpu_params(), None, enabled=True),
         ):
-            self.assertEqual(base.host_memory_budget_bytes(), 1000)
+            self.assertEqual(_plain_left(), 1000)
         names = [name for name, _, _ in calls.mock_calls]
         self.assertEqual(names[:2], ["free", "barrier"])
         calls.barrier.assert_called_once_with(group="cpu")
@@ -307,9 +321,9 @@ class TestHiCacheAutoSize(CustomTestCase):
             patch.object(
                 sizing, "get_parallel", side_effect=RuntimeError("no world group")
             ),
-            sizing.auto_size_hicache(None, None, enabled=True),
+            sizing.auto_size_hicache(_cpu_params(), None, enabled=True),
         ):
-            self.assertEqual(base.host_memory_budget_bytes(), 1000)
+            self.assertEqual(_plain_left(), 1000)
 
     def test_deepseek_v4_host_pools_book_the_snapshot(self):
         alloc = Mock(return_value=torch.empty(1, dtype=torch.uint8))
@@ -339,7 +353,7 @@ class TestHiCacheAutoSize(CustomTestCase):
                 num_host_pages=4,
                 slot_page_size=2,
             )
-            self.assertEqual(base.host_memory_budget_bytes(), 1000 - 132)
+            self.assertEqual(_plain_left(), 1000 - 132)
             state = DeepSeekV4StateHostPool(
                 pool_name="state",
                 state_infos=state_infos,
@@ -347,7 +361,7 @@ class TestHiCacheAutoSize(CustomTestCase):
                 swa_page_size=2,
             )
             self.assertEqual(
-                base.host_memory_budget_bytes(),
+                _plain_left(),
                 1000 - 132 - state.layer_num * 4 * state.state_page_bytes,
             )
 
@@ -359,9 +373,9 @@ class TestHiCacheAutoSize(CustomTestCase):
             patch.object(base, "available_host_memory_bytes", return_value=free_now),
             base.host_memory_budget_scope(1000),
         ):
-            self.assertEqual(base.host_memory_budget_bytes(500), 300)
-            self.assertEqual(base.host_memory_budget_bytes(200), 300)
-            self.assertEqual(base._host_memory_budget.get(), 800)
+            self.assertEqual(base.host_memory_preflight([500]).available_bytes, 300)
+            self.assertEqual(base.host_memory_preflight([200]).available_bytes, 300)
+            self.assertEqual(base._host_memory_budget.get(), (800, 0))
 
 
 if __name__ == "__main__":
