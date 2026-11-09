@@ -34,7 +34,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
 )
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 _UNCACHED_MEGA_MOE_MAX_NUM_SMS = mega_moe._mega_moe_max_num_sms.__wrapped__
 

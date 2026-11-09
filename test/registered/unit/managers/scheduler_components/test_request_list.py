@@ -28,7 +28,7 @@ from sglang.srt.models.unlimited_ocr_v2_support.scheduler_runtime import (
 )
 from sglang.test.scheduler_test_utils import FakeReq
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 # The classes that own the request lists, with their mixins.
 _OWNERS = (

@@ -35,7 +35,7 @@ from sglang.test.unified_allocator_fixtures import (
     build_window_chain,
 )
 
-register_cpu_ci(est_time=13, suite="base-a-test-cpu")
+register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
 
 def _paged_pair(lazy: bool):

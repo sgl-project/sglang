@@ -20,7 +20,7 @@ from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=14, stage="base-b", runner_config="1-gpu-small")
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")

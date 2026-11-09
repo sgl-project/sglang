@@ -18,7 +18,7 @@ from humming.schema import HummingWeightSchema  # noqa: E402
 
 from sglang.srt.layers.quantization import humming_utils  # noqa: E402
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
 
 class TestHummingMoePreparation(CustomTestCase):

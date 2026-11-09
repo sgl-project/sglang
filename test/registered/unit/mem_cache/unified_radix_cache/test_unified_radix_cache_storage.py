@@ -95,7 +95,7 @@ def _window_hit(req):
     return max(Req.window_host_hit_lengths.fget(req).values(), default=0)
 
 
-register_cuda_ci(est_time=28, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=56, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=28, suite="stage-b-test-1-gpu-small-amd")
 
 

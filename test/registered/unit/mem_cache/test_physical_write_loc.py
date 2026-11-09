@@ -48,7 +48,7 @@ from sglang.test.unified_allocator_fixtures import (
     setup_allocator_context,
 )
 
-register_cpu_ci(est_time=38, suite="base-a-test-cpu")
+register_cpu_ci(est_time=43, suite="base-a-test-cpu")
 
 # `set_kv_buffer` dispatches on the platform, so the pools that get written live
 # on the platform's device; the mark itself is device-free.

@@ -26,7 +26,7 @@ from sglang.test.scripted_runtime.tree_core_inspection import (
 )
 from sglang.test.tree_slots import tree_slots_of
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
 def _cache(backend, enable_session=False):

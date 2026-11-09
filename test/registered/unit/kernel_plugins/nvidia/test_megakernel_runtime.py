@@ -28,7 +28,7 @@ from _fakes import (  # noqa: E402
     server_args,
 )
 
-register_cpu_ci(est_time=5, stage="base-a", runner_config="cpu")
+register_cpu_ci(est_time=2, stage="base-a", runner_config="cpu")
 
 
 class OtherBinding:

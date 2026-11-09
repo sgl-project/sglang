@@ -25,7 +25,7 @@ from sglang.srt.layers.layer_boundary.row_transport import (
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=9, suite="base-a-test-cpu")
+register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
 
 class GatheredOperand(ComputeTransport):

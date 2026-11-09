@@ -42,7 +42,7 @@ from sglang.srt.server_args import ServerArgs  # noqa: E402
 from sglang.srt.utils.serialization import safe_pickle_load  # noqa: E402
 from sglang.srt.utils.watchdog import WatchdogRaw  # noqa: E402
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 _SGLANG_DIR = os.path.join(os.path.dirname(__file__), *[os.pardir] * 4)
 

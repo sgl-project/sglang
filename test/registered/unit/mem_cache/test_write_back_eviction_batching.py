@@ -33,7 +33,7 @@ from sglang.test.hicache_write_back_fixtures import (
 )
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class _FencedController(InstantWriteBackController):

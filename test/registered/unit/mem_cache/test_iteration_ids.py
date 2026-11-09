@@ -62,7 +62,7 @@ from sglang.test.unified_allocator_fixtures import (
     stand_in_views,
 )
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 _DEV = "cpu"
 _PS = 2

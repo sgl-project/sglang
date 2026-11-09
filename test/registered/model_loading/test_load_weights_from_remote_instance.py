@@ -38,7 +38,7 @@ from sglang.utils import terminate_process
 
 mp.set_start_method("spawn", force=True)
 
-register_cuda_ci(est_time=126, stage="extra-a", runner_config="2-gpu-large")
+register_cuda_ci(est_time=127, stage="extra-a", runner_config="2-gpu-large")
 register_amd_ci(est_time=190, stage="extra-a", runner_config="2-gpu-large-amd")
 
 

@@ -39,7 +39,7 @@ from sglang.srt.managers.multi_tokenizer_mixin import (
 )
 from sglang.srt.runtime_context import get_context
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
 def _request_stats(prompt_tokens, cached_tokens, cached_tokens_details=None):

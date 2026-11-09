@@ -37,8 +37,8 @@ from sglang.srt.models.qwen4_exp_ple_table import (
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
-register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-small")
+register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-small")
 
 
 class TestPleFileTableAllocator(CustomTestCase):

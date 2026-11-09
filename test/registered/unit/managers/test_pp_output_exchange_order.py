@@ -29,7 +29,7 @@ from sglang.srt.environ import envs  # noqa: E402
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin  # noqa: E402
 from sglang.srt.model_executor.forward_mode import ForwardMode  # noqa: E402
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
 def _posted_output_ops(pp_rank, spec_relay, send_msg, recv_msg, **server_args):

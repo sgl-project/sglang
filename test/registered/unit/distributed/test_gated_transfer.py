@@ -46,8 +46,8 @@ from sglang.srt.utils.cuda_vmm_utils import check_drv
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
-register_cuda_ci(est_time=90, stage="base-c", runner_config="4-gpu-b200")
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cuda_ci(est_time=37, stage="base-c", runner_config="4-gpu-b200")
 
 _MiB = 1 << 20
 _WAIT_EQ = 0x1

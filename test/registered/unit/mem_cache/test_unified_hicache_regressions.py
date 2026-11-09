@@ -21,7 +21,7 @@ from sglang.test.unified_allocator_fixtures import (
     token_ends,
 )
 
-register_cuda_ci(est_time=13, stage="extra-a", runner_config="1-gpu-small")
+register_cuda_ci(est_time=12, stage="extra-a", runner_config="1-gpu-small")
 
 
 class TestHiCacheIndexDomains(unittest.TestCase):

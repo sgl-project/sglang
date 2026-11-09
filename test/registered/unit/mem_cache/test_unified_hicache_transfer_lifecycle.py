@@ -63,7 +63,7 @@ from sglang.test.unified_allocator_fixtures import (
     chain_snapshot,
 )
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 PAGE = 4
 FULL = ComponentType.FULL

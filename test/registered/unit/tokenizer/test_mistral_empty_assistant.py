@@ -5,7 +5,7 @@ from sglang.srt.hf_transformers.mistral_utils import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=0, suite="base-a-test-cpu")
 
 
 def _user(text):

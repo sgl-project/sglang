@@ -1,6 +1,6 @@
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=536, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=851, stage="extra-a", runner_config="1-gpu-large")
 register_amd_ci(est_time=1500, suite="extra-a-test-1-gpu-small-amd")
 """
 Consolidated HiCache variant tests.

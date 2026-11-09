@@ -40,7 +40,7 @@ from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.session.streaming_session import SessionSlot
 from sglang.test.tree_slots import tree_slots_of
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class TestCheckTreeCacheGate(CustomTestCase):

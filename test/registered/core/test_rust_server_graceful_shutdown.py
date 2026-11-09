@@ -24,7 +24,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=120, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=73, stage="base-b", runner_config="1-gpu-small")
 
 # Long enough that the stream outlives the SIGTERM and the health checks.
 MAX_NEW_TOKENS = 2000

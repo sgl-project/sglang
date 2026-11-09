@@ -35,7 +35,7 @@ from sglang.test.hicache_write_back_fixtures import (
 )
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=40, suite="base-a-test-cpu")
+register_cpu_ci(est_time=42, suite="base-a-test-cpu")
 
 DEVICE_TOKENS = 64 * PAGE
 HOST_TOKENS = 64 * PAGE

@@ -22,7 +22,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
     ListKind,
 )
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class TestSchedulerHiCacheEvents(unittest.TestCase):
