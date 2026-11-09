@@ -152,6 +152,8 @@ def test_coordinator_wall_budget_reaches_installed_scheduler_hook(
         assert constructed == []
     else:
         instance = type(native)()
+        pending_work = constructed[0].pop("pending_work")
+        assert callable(pending_work) and pending_work() is False
         assert constructed == [
             {
                 "scheduler": instance,

@@ -2,6 +2,7 @@
 
 import inspect
 import ipaddress
+import json
 import os
 from importlib import metadata
 from urllib.parse import urlsplit
@@ -26,6 +27,43 @@ SIMULATOR_SERVER_ARG_OVERRIDES = {
 
 class SGLangCompatibilityError(RuntimeError):
     pass
+
+
+def _native_predictor_config(target=None):
+    """Read the explicit predictor selection before native argument resolution.
+
+    A CLI config path is established here because ServerArgs resolution invokes
+    the CPU DSPark handler before launch_server's later config logging.
+    """
+    path = os.getenv("SGLANG_SIMULATOR_CONFIG_PATH")
+    if not path or not os.path.isfile(path):
+        candidate = (
+            target.get("sim_config_path")
+            if isinstance(target, dict)
+            else getattr(target, "sim_config_path", None)
+        )
+        if candidate:
+            path = os.path.abspath(candidate)
+            os.environ["SGLANG_SIMULATOR_CONFIG_PATH"] = path
+    if not path:
+        return {}
+    with open(path, encoding="utf-8") as stream:
+        return json.load(stream).get("predictor", {})
+
+
+def native_reference_requested(target=None) -> bool:
+    predictor = _native_predictor_config(target)
+    return (
+        predictor.get("name") == "simopus"
+        and predictor.get("native_segment_profile_id") is not None
+    )
+
+
+def _simulator_overrides(target=None):
+    overrides = SIMULATOR_SERVER_ARG_OVERRIDES
+    if native_reference_requested(target):
+        overrides = {**overrides, "disable_overlap_schedule": False}
+    return overrides
 
 
 def validate_coordinator_endpoint(endpoint: str) -> str:
@@ -58,11 +96,14 @@ def _validate_coordinator_server_args(args, endpoint: str) -> None:
     for name in (
         "enable_hierarchical_cache",
         "enable_lora",
-        "enable_dp_attention",
-        "speculative_algorithm",
     ):
         if getattr(args, name, None):
             raise ValueError(f"coordinator does not support {name}")
+    if getattr(args, "enable_dp_attention", None):
+        raise ValueError("coordinator does not support enable_dp_attention")
+    algorithm = getattr(args, "speculative_algorithm", None)
+    if algorithm and not (algorithm == "DSPARK" and native_reference_requested(args)):
+        raise ValueError("coordinator requires source-bound native DSPark speculation")
     interval = getattr(args, "prefill_decode_interval", None)
     if interval is not None and (type(interval) is not int or interval < 0):
         raise ValueError(
@@ -101,7 +142,7 @@ def _require_parameters(function, required: set[str], surface: str) -> None:
 
 def apply_simulator_server_args(target) -> None:
     """Apply simulator-owned values before constructing the final ServerArgs."""
-    overrides = SIMULATOR_SERVER_ARG_OVERRIDES
+    overrides = _simulator_overrides(target)
     if os.getenv("SGLANG_SIMULATOR_COORDINATOR"):
         overrides = {
             **overrides,
@@ -122,7 +163,7 @@ def validate_simulator_server_args(server_args) -> None:
         _validate_coordinator_server_args(server_args, endpoint)
     mismatches = [
         f"{name}={getattr(server_args, name, None)!r} (expected {expected!r})"
-        for name, expected in SIMULATOR_SERVER_ARG_OVERRIDES.items()
+        for name, expected in _simulator_overrides(server_args).items()
         if getattr(server_args, name, None) != expected
     ]
     if mismatches:

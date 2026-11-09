@@ -19,6 +19,7 @@ class ScheduleRequest:
 @dataclass
 class ScheduleBatch:
     reqs: list[ScheduleRequest] = field(default_factory=list)
+    forward_mode: str | None = None
 
     def __repr__(self) -> str:
         return f"batch_size={len(self.reqs)},reqs={[(req.extend_length, req.past_kv_length) for req in self.reqs]}"
@@ -57,6 +58,8 @@ class ScheduleBatch:
         return not self.is_decode()
 
     def is_decode(self) -> bool:
+        if self.forward_mode is not None:
+            return self.forward_mode == "DECODE"
         for req in self.reqs:
             if req.extend_length > 1:
                 return False

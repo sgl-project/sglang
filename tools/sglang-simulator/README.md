@@ -485,6 +485,7 @@ Supported predictors:
 | `aisimulate` | Operator and module performance-database estimation. |
 | `ml` | A trained sklearn-compatible 18-feature latency model. |
 | `replay` | Exact or nearest-neighbor batch-composition replay. |
+| `simopus` | Public SimOpus forward latency; the optional [native staged route](docs/simopus-native.md) keeps source and progress scope explicit. |
 
 Relative predictor paths are resolved from the simulator configuration location.
 Environment variables in paths use `${NAME}` syntax.
@@ -602,3 +603,11 @@ factories see their original dimensions, including nested initializations, and
 exceptions restore the enclosing geometry/device context. Ordinary pools retain
 their existing compact payload behavior. The optimization is guarded by the
 explicit CPU simulator flags and does not patch a real GPU model's KV payload.
+
+### Source-bound native ADP1 provider
+
+The optional [native provider](docs/simopus-native.md) executes V4.1 Flash
+stages through the public SimOpus SDK and retains SGLang request/KV ownership.
+This layer includes the explicit SourceGolden351 progress policy and rejects
+unsupported topologies. It does not require the ordinary R1 latency provider
+or automatic SDK KV budgeting.

@@ -52,7 +52,8 @@ modules = {}
 for name in ('sglang', 'sglang.srt', 'sglang.srt.utils', 'sglang.srt.utils.common',
              'sglang_simulator', 'sglang_simulator.simulation',
              'sglang_simulator.simulation.sglang',
-             'sglang_simulator.simulation.sglang.sgl_kernel_hook'):
+             'sglang_simulator.simulation.sglang.sgl_kernel_hook',
+             'sglang_simulator.simulation.sglang.dspark_args'):
     module = ModuleType(name)
     module.__path__ = []
     modules[name] = sys.modules[name] = module
@@ -64,6 +65,9 @@ common = modules['sglang.srt.utils.common']
 utils.get_device_capability = common.get_device_capability = capability
 calls = []
 modules['sglang_simulator.simulation.sglang.sgl_kernel_hook'].install_load_utils_stub = lambda: calls.append('loader')
+# The native adapter has its own activation controls. Keep this generic CPU
+# control independent of whether that optional adapter is present in the tree.
+modules['sglang_simulator.simulation.sglang.dspark_args'].install_cpu_dspark_args = lambda: None
 if sys.argv[2] == '1':
     os.environ['SGLANG_SIMULATOR_BOOTSTRAP'] = '1'
 if sys.argv[3] == '1':
