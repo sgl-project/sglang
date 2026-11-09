@@ -71,6 +71,9 @@ def kda_replayssm_exact_fold_kernel(
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
     NULL_BLOCK_ID: tl.constexpr,
     HAS_TRACK: tl.constexpr,
+    ring_indices,
+    stride_ring: tl.constexpr,
+    SEPARATE_RING_INDEX: tl.constexpr,
 ):
     i_v = tl.program_id(0)
     i_n = tl.program_id(1)
@@ -92,6 +95,13 @@ def kda_replayssm_exact_fold_kernel(
     state_idx = tl.load(ssm_state_indices + i_n * stride_indices).to(tl.int64)
     if state_idx <= NULL_BLOCK_ID:
         return
+    if SEPARATE_RING_INDEX:
+        ring_idx = tl.load(ring_indices + i_n * stride_ring).to(tl.int64)
+        # Padding rows are -1. A negative slot aliases request 0's ring.
+        if ring_idx < 0:
+            return
+    else:
+        ring_idx = state_idx
     n_commit = tl.load(accept_lens + i_n * stride_accept).to(tl.int32)
     if n_commit <= 0:
         return
@@ -126,7 +136,7 @@ def kda_replayssm_exact_fold_kernel(
         phys = t.to(tl.int64)
         b_k = tl.load(
             rawk_cache
-            + state_idx * stride_rawk_slot
+            + ring_idx * stride_rawk_slot
             + (i_h * MAX_CACHE_LEN + phys) * K
             + o_k,
             mask=mask_k,
@@ -134,7 +144,7 @@ def kda_replayssm_exact_fold_kernel(
         ).to(tl.float32)
         b_v = tl.load(
             rawv_cache
-            + state_idx * stride_rawv_slot
+            + ring_idx * stride_rawv_slot
             + (i_hv * MAX_CACHE_LEN + phys) * V
             + o_v,
             mask=mask_v,
@@ -142,14 +152,14 @@ def kda_replayssm_exact_fold_kernel(
         ).to(tl.float32)
         b_gk = tl.load(
             gk_cache
-            + state_idx * stride_gk_slot
+            + ring_idx * stride_gk_slot
             + (i_hv * MAX_CACHE_LEN + phys) * K
             + o_k,
             mask=mask_k,
             other=0.0,
         ).to(tl.float32)
         b_beta = tl.load(
-            beta_cache + state_idx * stride_beta_slot + i_hv * MAX_CACHE_LEN + phys
+            beta_cache + ring_idx * stride_beta_slot + i_hv * MAX_CACHE_LEN + phys
         ).to(tl.float32)
 
         # --- verbatim recurrent update, IS_KDA branch (see module docstring) ---
@@ -190,6 +200,7 @@ def commit_kda_replayssm_spec(
     mamba_steps_to_track: torch.Tensor | None = None,  # [B] crossing step (or -1)
     use_qk_l2norm_in_kernel: bool = True,
     null_block_id: int = 0,
+    ring_indices: torch.Tensor | None = None,
 ) -> None:
     """Replay each request's accepted window into its fp32 checkpoint in place.
 
@@ -249,6 +260,9 @@ def commit_kda_replayssm_spec(
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         NULL_BLOCK_ID=null_block_id,
         HAS_TRACK=has_track,
+        ring_indices=ssm_state_indices if ring_indices is None else ring_indices,
+        stride_ring=0 if ring_indices is None else ring_indices.stride(0),
+        SEPARATE_RING_INDEX=ring_indices is not None,
         num_warps=1,
         num_stages=3,
     )
@@ -268,6 +282,7 @@ def commit_kda_replayssm_spec_all_layers(
     mamba_steps_to_track: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = True,
     null_block_id: int = 0,
+    ring_indices: torch.Tensor | None = None,
 ) -> None:
     """Fold every layer's accepted window in a single launch.
 
@@ -328,6 +343,9 @@ def commit_kda_replayssm_spec_all_layers(
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         NULL_BLOCK_ID=null_block_id,
         HAS_TRACK=has_track,
+        ring_indices=ssm_state_indices if ring_indices is None else ring_indices,
+        stride_ring=0 if ring_indices is None else ring_indices.stride(0),
+        SEPARATE_RING_INDEX=ring_indices is not None,
         num_warps=1,
         num_stages=3,
     )
@@ -343,6 +361,7 @@ def commit_kda_replayssm_after_verify(
     mamba_steps_to_track: torch.Tensor | None = None,
     src_indices_raw: torch.Tensor | None = None,
     null_block_id: int = -1,
+    ring_indices: torch.Tensor | None = None,
 ) -> None:
     """Fold each layer's accepted window into `temporal` and roll back conv.
 
@@ -371,6 +390,7 @@ def commit_kda_replayssm_after_verify(
         mamba_track_indices=mamba_track_indices,
         mamba_steps_to_track=mamba_steps_to_track,
         null_block_id=null_block_id,
+        ring_indices=ring_indices,
     )
     # Conv rollback + track-slot conv snapshot, per conv group (fold already did
     # the ssm side via HAS_TRACK). Loop mirrors the recurrent commit's zip; track
