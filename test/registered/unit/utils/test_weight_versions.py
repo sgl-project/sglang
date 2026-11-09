@@ -17,13 +17,13 @@ from sglang.srt.utils.weight_versions import (
     weight_version_spans_to_json,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.scheduler_test_utils import empty_request_lists
+from sglang.test.scheduler_test_utils import FakeReq, empty_request_lists
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
-class _ReqStub:
+class _ReqStub(FakeReq):
     def __init__(self, output_len: int):
         self.output_ids = [0] * output_len
         self.weight_version_events = []
@@ -425,6 +425,7 @@ class TestSpanlessAbortPaths(CustomTestCase):
         scheduler.abort_on_priority_when_disabled = True
         scheduler.send_abort_output = lambda obj, req_arg: sent.append(obj)
         scheduler.tree_cache = scheduler.beam_coordinator = MagicMock()
+        scheduler.output_streamer = MagicMock()
         scheduler.hisparse_coordinator = None
         scheduler.init_request_retirer()
 
