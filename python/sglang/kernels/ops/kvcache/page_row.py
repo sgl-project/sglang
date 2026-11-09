@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Opaque page-row transfers for paged MiniMax NVFP4 caches."""
+"""Opaque page-row transfers between pinned host memory and paged device pools."""
 
 from __future__ import annotations
 
