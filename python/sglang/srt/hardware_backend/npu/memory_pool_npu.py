@@ -4,7 +4,8 @@ import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
-from sglang.srt.layers.dcp.layout import localize_dcp_indices, npu_dcp_interleave_size
+from sglang.srt.hardware_backend.npu.dsa_dcp_config import npu_dcp_interleave_size
+from sglang.srt.layers.dcp.layout import localize_dcp_indices
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKOnlyPool,
     MHATokenToKVPool,
@@ -1013,7 +1014,12 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             for _, uses_global_slots in self._get_disagg_buffer_entries()
         ]
 
-    def get_pd_dcp_target_buffers(self) -> dict[int, torch.Tensor]:
+    def get_pd_dcp_target_buffers(self) -> dict[int, torch.Tensor] | None:
+        if (
+            self.index_head_dim is None
+            or not envs.SGLANG_NPU_DSA_DCP_TOKEN_INTERLEAVE.get()
+        ):
+            return None
         if self.use_fia_nz:
             raise ValueError("NPU DSA token PD requires a row-contiguous KV pool.")
         return {

@@ -8,6 +8,7 @@ import struct
 import threading
 import time
 from collections import defaultdict
+from functools import partial
 from typing import Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
@@ -1639,118 +1640,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             page_bytes.pop(),
         )
 
-    def _prepare_npu_dsa_token_dcp(self, peer: KVArgsRegisterInfo) -> List[int]:
-        buffers = self.kv_args.npu_dsa_dcp_target_buffers
-        if (
-            not buffers
-            or not peer.dst_npu_dsa_token_dcp
-            or not peer.requires_dcp_relayout
-            or peer.dst_draft_rows_dcp_collapsed
-        ):
-            raise ValueError(
-                "NPU DSA token DCP requires matching PD layouts with replicated draft rows"
-            )
-        if len(peer.dst_kv_ptrs) != len(peer.dst_kv_item_lens):
-            raise ValueError("NPU DSA token DCP requires per-entry destination widths")
-        entries = resolve_dcp_dst_entry_indices(
-            self.kv_args.kv_layer_ids,
-            peer.dst_kv_layer_ids,
-            len(self.kv_args.kv_data_ptrs),
-            len(peer.dst_kv_ptrs),
-        )
-        widths = []
-        for ptr, src_bytes, dst_entry in zip(
-            self.kv_args.kv_data_ptrs, self.kv_args.kv_item_lens, entries
-        ):
-            scale = 1 if ptr in buffers else peer.dst_dcp_size
-            width, remainder = divmod(src_bytes, self.kv_args.page_size)
-            if remainder or width <= 0 or dst_entry >= len(peer.dst_kv_item_lens):
-                raise ValueError("Invalid NPU DSA token DCP page geometry")
-            if peer.dst_kv_item_lens[dst_entry] != src_bytes * scale:
-                raise ValueError(
-                    f"NPU DSA token DCP entry {dst_entry} has incompatible page bytes: "
-                    f"prefill={src_bytes}, decode={peer.dst_kv_item_lens[dst_entry]}, "
-                    f"scale={scale}"
-                )
-            widths.append(width)
-        if self._dcp_pack_buffers is None:
-            from sglang.srt.disaggregation.common.dcp_pack import NPUDSADCPPackBuffer
-
-            # A worker reuses one bounded buffer after each synchronous transfer.
-            # Long chunks are split into multiple packs in the send path.
-            size = 32 * 1024 * 1024
-            device_id = self.kv_args.gpu_id
-            pack_buffers = [
-                NPUDSADCPPackBuffer(size, device_id)
-                for _ in self.transfer_queues
-            ]
-            self.engine.batch_register(
-                [pack.buffer.data_ptr() for pack in pack_buffers],
-                [size] * len(pack_buffers),
-            )
-            self._dcp_pack_buffers = pack_buffers
-        return widths
-
-    def _send_npu_dsa_token_dcp(
-        self, session_id, plan, src_ptrs, dst_ptrs, widths, pack_buffer
-    ) -> int:
-        from sglang.srt.disaggregation.common.dcp_pack import try_pack_npu_dsa_dcp_src
-
-        buffers = self.kv_args.npu_dsa_dcp_target_buffers
-        entries = list(zip(src_ptrs, dst_ptrs, widths, strict=True))
-        target = [entry for entry in entries if entry[0] in buffers]
-        replicas = [entry for entry in entries if entry[0] not in buffers]
-
-        def transfer(entries, src_rows, dst_rows):
-            src_groups, dst_groups = group_concurrent_contiguous(src_rows, dst_rows)
-            return self._transfer_data(
-                session_id,
-                [
-                    (src + int(a[0]) * width, dst + int(b[0]) * width, len(a) * width)
-                    for src, dst, width in entries
-                    for a, b in zip(src_groups, dst_groups)
-                ],
-            )
-
-        if target and plan.target_src_token_indices.size:
-            target_widths = [width for _, _, width in target]
-            tensors = [buffers[src] for src, _, _ in target]
-            max_rows = 128
-            if pack_buffer is not None and not pack_buffer.failed:
-                max_rows = max(1, pack_buffer.buffer.nbytes // sum(target_widths))
-            for start in range(0, plan.target_src_token_indices.size, max_rows):
-                src_rows = plan.target_src_token_indices[start : start + max_rows]
-                dst_rows = plan.target_dst_token_indices[start : start + max_rows]
-                packed = (
-                    try_pack_npu_dsa_dcp_src(
-                        pack_buffer, tensors, src_rows, target_widths
-                    )
-                    if pack_buffer is not None
-                    else None
-                )
-                if packed is None:
-                    ret = transfer(target, src_rows, dst_rows)
-                else:
-                    packed_ptrs, packed_rows = packed
-                    ret = transfer(
-                        [
-                            (ptr, dst, width)
-                            for ptr, (_, dst, width) in zip(packed_ptrs, target)
-                        ],
-                        packed_rows,
-                        dst_rows,
-                    )
-                    if ret != 0:
-                        # A synchronous TE timeout can leave reads in flight.
-                        pack_buffer.failed = True
-                if ret != 0:
-                    return ret
-        if replicas and plan.draft_src_token_indices.size:
-            return transfer(
-                replicas, plan.draft_src_token_indices, plan.draft_dst_token_indices
-            )
-        return 0
-
     def send_kvcache_dcp(
         self,
         mooncake_session_id: str,
@@ -1817,13 +1706,18 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         if plan.empty():
             return 0
         if self.kv_args.npu_dsa_dcp_target_buffers is not None:
-            return self._send_npu_dsa_token_dcp(
-                mooncake_session_id,
-                plan,
-                src_kv_ptrs,
-                dst_kv_ptrs,
-                dcp_token_item_lens,
-                pack_buffer,
+            from sglang.srt.hardware_backend.npu.mooncake_dsa_dcp import (
+                send_dsa_token_dcp,
+            )
+
+            return send_dsa_token_dcp(
+                transfer_data=partial(self._transfer_data, mooncake_session_id),
+                plan=plan,
+                src_ptrs=src_kv_ptrs,
+                dst_ptrs=dst_kv_ptrs,
+                widths=dcp_token_item_lens,
+                pack_buffer=pack_buffer,
+                target_buffers=self.kv_args.npu_dsa_dcp_target_buffers,
             )
 
         target_src_kv_ptrs = src_kv_ptrs[:num_target]
@@ -3400,9 +3294,20 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         self.kv_args.npu_dsa_dcp_target_buffers is not None
                         or decode_kv_args.dst_npu_dsa_token_dcp
                     ):
+                        from sglang.srt.hardware_backend.npu.mooncake_dsa_dcp import (
+                            prepare_dsa_token_dcp,
+                        )
+
                         try:
-                            decode_kv_args.dcp_token_item_lens = (
-                                self._prepare_npu_dsa_token_dcp(decode_kv_args)
+                            (
+                                decode_kv_args.dcp_token_item_lens,
+                                self._dcp_pack_buffers,
+                            ) = prepare_dsa_token_dcp(
+                                self.kv_args,
+                                decode_kv_args,
+                                pack_buffers=self._dcp_pack_buffers,
+                                num_workers=len(self.transfer_queues),
+                                register=self.engine.batch_register,
                             )
                         except (ValueError, RuntimeError) as exc:
                             registration_error = str(exc)

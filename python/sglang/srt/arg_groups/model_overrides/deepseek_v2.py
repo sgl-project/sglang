@@ -10,7 +10,6 @@ from sglang.srt.arg_groups.model_override_base import (
     resolving_view,
     use_mla_backend,
 )
-from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
 
 logger = logging.getLogger(__name__)
@@ -108,18 +107,12 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                     )
 
     if is_deepseek_dsa(hf_config):  # DeepSeek 3.2/GLM 5
-        if get_platform().is_npu and envs.SGLANG_NPU_DSA_DCP_TOKEN_INTERLEAVE.get():
-            if cfg.enable_unified_memory:
-                raise ValueError("NPU DSA token DCP requires a static KV pool.")
-            if cfg.disaggregation_mode != "null" and (
-                cfg.disaggregation_transfer_backend != "mooncake"
-                or cfg.enable_prefill_cp
-                or (cfg.dcp_size == 1) != (cfg.disaggregation_mode == "prefill")
-            ):
-                raise ValueError(
-                    "NPU DSA token DCP PD requires Mooncake, prefill CP=1, "
-                    "and prefill DCP1 -> decode DCP-N (N > 1)."
-                )
+        if get_platform().is_npu:
+            from sglang.srt.hardware_backend.npu.dsa_dcp_config import (
+                validate_dsa_token_dcp_config,
+            )
+
+            validate_dsa_token_dcp_config(cfg)
         if not is_kimi_k31(hf_config):
             overrides.update(_dsa_dcp_overrides(cfg))
         # Set attention backend for DeepSeek

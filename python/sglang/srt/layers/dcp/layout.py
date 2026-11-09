@@ -17,7 +17,6 @@ the owner-rule local-index filter."""
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_parallel
 
 # NOTE(yhyang201): under DCP, Kimi-K3.1 shards the DSA index-K cache by token like
@@ -38,12 +37,6 @@ def dsa_shards_index_k() -> bool:
 def dsa_index_k_page_tokens(page_size: int) -> int:
     if dsa_shards_index_k():
         return page_size * get_parallel().attn_dcp_size
-    return page_size
-
-
-def npu_dcp_interleave_size(page_size: int, *, use_dsa: bool) -> int:
-    if use_dsa and envs.SGLANG_NPU_DSA_DCP_TOKEN_INTERLEAVE.get():
-        return 1
     return page_size
 
 
