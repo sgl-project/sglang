@@ -636,8 +636,6 @@ class TestTritonAttention(CustomTestCase):
         )
 
     def test_extend_attention_block_bidirectional(self):
-        """block_boundaries widens the causal mask per sequence to
-        causal | (k < P) | (q >= P); P = -1 keeps the sequence causal."""
         dtype = torch.bfloat16
         device = get_device()
         torch.manual_seed(0)
@@ -677,7 +675,7 @@ class TestTritonAttention(CustomTestCase):
                     boundaries, dtype=torch.int32, device=device
                 ),
             )
-            for i, P in enumerate(boundaries):
+            for i, (P, E) in enumerate(boundaries):
                 P0, L = prefix_lens[i], prefix_lens[i] + extend_lens[i]
                 qs, ks = (
                     slice(qo_indptr[i], qo_indptr[i + 1]),
@@ -691,25 +689,33 @@ class TestTritonAttention(CustomTestCase):
                 )
                 q_abs = torch.arange(P0, L, device=device)[:, None]
                 k_abs = torch.arange(L, device=device)[None, :]
-                mask = (k_abs <= q_abs) | ((P >= 0) & ((k_abs < P) | (q_abs >= P)))
+                mask = (k_abs <= q_abs) | (
+                    (P >= 0) & ((k_abs < P) | ((q_abs >= P) & (k_abs < E)))
+                )
                 s = torch.einsum("qhd,khd->qhk", q_extend[qs].float(), k.float())
                 s = (s * D**-0.5).masked_fill(~mask[:, None, :], float("-inf"))
                 ref = torch.einsum("qhk,khd->qhd", F.softmax(s, dim=-1), v.float())
                 torch.testing.assert_close(o[qs].float(), ref, rtol=1e-2, atol=1e-2)
 
-        # -1 causal, 0 fully bidirectional, boundary at the cached prefix end,
-        # boundary inside the extend part.
+        # (-1, -1) causal, (0, L) fully bidirectional, state end at the cached
+        # prefix end, state end inside the extend part, and a retracted request
+        # whose question block ends before its re-prefilled outputs (E < L).
         check(
             8,
             2,
             128,
             [0, 0, 96, 100, 37],
             [150, 200, 70, 90, 131],
-            [-1, 0, 96, 130, 90],
+            [(-1, -1), (0, 200), (96, 166), (130, 190), (90, 140)],
         )
         # Qwen3.5-shaped heads, tile-aligned (1088 = 17 * 64) and unaligned boundaries.
         check(
-            16, 4, 256, [0, 0, 0, 0], [1150, 1157, 3128, 1150], [-1, 1088, 3059, 1088]
+            16,
+            4,
+            256,
+            [0, 0, 0, 0],
+            [1150, 1157, 3128, 1150],
+            [(-1, -1), (1088, 1157), (3059, 3128), (1088, 1120)],
         )
 
     def test_extend_attention_sliding_window(self):

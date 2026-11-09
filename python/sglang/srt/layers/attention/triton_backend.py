@@ -145,7 +145,8 @@ class ForwardMetadata:
     lean_locks: Optional[torch.Tensor] = None
     # One int32, set by get_num_kv_splits when the decode seq lens are uneven
     uneven_batch: Optional[torch.Tensor] = None
-    # Per-sequence block-bidirectional boundary (int32, -1 = causal), extend only
+    # Per-sequence block-bidirectional (state end, question end) int32 pairs,
+    # (-1, -1) = causal; extend only
     block_boundaries: Optional[torch.Tensor] = None
 
 
@@ -1138,10 +1139,10 @@ class TritonAttnBackend(AttentionBackend):
         block_boundaries = None
         if (
             forward_batch.forward_mode.is_extend()
-            and forward_batch.bidir_prefix_lens is not None
+            and forward_batch.bidir_blocks is not None
         ):
             block_boundaries = torch.tensor(
-                forward_batch.bidir_prefix_lens, dtype=torch.int32, device=self.device
+                forward_batch.bidir_blocks, dtype=torch.int32, device=self.device
             )
 
         self.forward_metadata = ForwardMetadata(

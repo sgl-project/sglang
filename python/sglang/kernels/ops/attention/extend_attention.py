@@ -490,8 +490,10 @@ def _fwd_kernel(
     if USE_CUSTOM_MASK:
         cur_seq_mask_start_idx = tl.load(mask_indptr + cur_seq)
     block_boundary = -1
+    block_end = -1
     if USE_BLOCK_MASK:
-        block_boundary = tl.load(block_boundary_ptr + cur_seq)
+        block_boundary = tl.load(block_boundary_ptr + 2 * cur_seq)
+        block_end = tl.load(block_boundary_ptr + 2 * cur_seq + 1)
 
     # For SWA, we should only load the mask in the sliding window
     window_kv_offset = 0
@@ -769,11 +771,13 @@ def _fwd_kernel(
                 start_n + offs_n[None, :]
             )
             if USE_BLOCK_MASK:
-                # state keys are visible to every row; question rows see every key
+                # state keys are visible to every row; question rows see every
+                # key of the prompt, never a generated one
                 q_abs = cur_seq_len_prefix + cur_block_m * BLOCK_M + offs_m[:, None]
                 k_abs = cur_seq_len_prefix + start_n + offs_n[None, :]
                 mask_causual |= (block_boundary >= 0) & (
-                    (k_abs < block_boundary) | (q_abs >= block_boundary)
+                    (k_abs < block_boundary)
+                    | ((q_abs >= block_boundary) & (k_abs < block_end))
                 )
             mask_causual &= mask_m[:, None] & mask_n[None, :]
             final_mask &= mask_causual

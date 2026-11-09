@@ -533,8 +533,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # Setwise pooling readout positions (CPU tensors, one per request)
     token_indices_to_pool: Optional[List[torch.Tensor]] = None
-    # Per-request block-bidirectional boundary (absolute token index, -1 = causal).
-    bidir_prefix_lens: Optional[List[int]] = None
+    # Per-request block-bidirectional (state end, question end) token indices;
+    # (-1, -1) = causal. The question block ends at the prompt, so a retracted
+    # request's re-prefilled outputs stay causal.
+    bidir_blocks: Optional[List[Tuple[int, int]]] = None
 
     # Joint schema head decision layouts (one per request, None if absent)
     decision_layouts: Optional[List[Optional[List[int]]]] = None
@@ -1260,7 +1262,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if self.forward_mode.is_extend() and any(
             r.bidir_prefix_len >= 0 for r in batch.reqs
         ):
-            self.bidir_prefix_lens = [r.bidir_prefix_len for r in batch.reqs]
+            self.bidir_blocks = [
+                (
+                    (r.bidir_prefix_len, len(r.origin_input_ids))
+                    if r.bidir_prefix_len >= 0
+                    else (-1, -1)
+                )
+                for r in batch.reqs
+            ]
         if self.is_prefill_only:
             if batch.model_config.is_matryoshka and any(
                 r.dimensions is not None for r in batch.reqs
