@@ -174,22 +174,6 @@ def _should_emit_normal_text_as_message(
     return True
 
 
-# The typed /v1/responses stream events validate against OpenAI SDK's narrower
-# ``Reasoning.effort`` literal (none is a request-side extension; xhigh/max
-# postdate it) -- echoing a tier outside this set kills the stream.
-ECHOABLE_REASONING_EFFORTS = frozenset({"minimal", "low", "medium", "high"})
-
-
-def _sanitize_response_dict(d: dict) -> dict:
-    """Mask fields the OpenAI SDK stream-event models would fail to validate.
-
-    ``reasoning.effort`` through the narrower literal above.
-    """
-    if d["reasoning"]["effort"] not in ECHOABLE_REASONING_EFFORTS:
-        d["reasoning"]["effort"] = None
-    return d
-
-
 _RESPONSE_OUTPUT = TypeAdapter(ResponsesResponse.model_fields["output"].annotation)
 
 
@@ -2298,18 +2282,15 @@ class OpenAIServingResponses(OpenAIServingChat):
             sequence_number += 1
             return f"event: {event_type}\ndata: {orjson.dumps(payload).decode()}\n\n"
 
-        initial_response = _sanitize_response_dict(
-            ResponsesResponse.from_request(
-                request,
-                sampling_params,
-                model_name=model_name,
-                created_time=created_time,
-                output=[],
-                status="in_progress",
-                usage=None,
-            ).model_dump()
+        initial_response = ResponsesResponse.from_request(
+            request,
+            sampling_params,
+            model_name=model_name,
+            created_time=created_time,
+            output=[],
+            status="in_progress",
+            usage=None,
         )
-
         for event_type in ("response.created", "response.in_progress"):
             yield _send_event(
                 ResponsesLifecycleEvent(type=event_type, response=initial_response)
