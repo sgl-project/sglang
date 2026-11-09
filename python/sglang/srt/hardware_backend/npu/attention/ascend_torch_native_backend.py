@@ -7,6 +7,16 @@ import torch
 from torch.nn.functional import scaled_dot_product_attention
 
 
+def reference_swa_decode_mask(seq_lens, reference_lens, positions, window_size):
+    """FIA mask (True excludes a key) for full references plus the live suffix."""
+    lengths = seq_lens[:, None]
+    references = reference_lens[:, None]
+    keys = positions[None, :]
+    return (
+        (keys >= lengths) | ((keys >= references) & (keys < lengths - window_size))
+    ).unsqueeze(1)
+
+
 class AscendTorchNativeAttnBackend:
     def __init__(self):
         pass
