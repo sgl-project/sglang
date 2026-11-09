@@ -93,6 +93,7 @@ from sglang.srt.model_executor.runner.early_verify_metadata import (
     VerifyInputSources,
 )
 from sglang.srt.model_executor.runner.flashinfer_autotune import (
+    FlashInferGraphAutotune,
     maybe_flashinfer_autotune_speculative_draft,
 )
 from sglang.srt.model_executor.runner.metadata_glue_graph import MetadataGlueGraph
@@ -1293,6 +1294,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # Warm up + autotune kernels once before capture (run-once across the
         # decode + prefill runners; see BaseRunner.warmup).
         self.warmup()
+        self.flashinfer_graph_autotune = FlashInferGraphAutotune.create(self)
         # warmup() may disable torch.compile for a model whose _can_torch_compile
         # is False; recompute the compile bucket so capture matches.
         if self.enable_torch_compile and not (get_flags().capture.enable_torch_compile):
@@ -1536,12 +1538,18 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     post_warmup_hook=post_warmup_hook,
                     run_lm_head=True,
                 )
-                self.backend.capture_one(
-                    shape_key,
-                    run_once,
-                    capture_inputs=None,
-                    post_warmup_hook=post_warmup_hook,
-                )
+                graph_autotune = self.flashinfer_graph_autotune
+                with (
+                    graph_autotune.capture_context(run_once, post_warmup_hook)
+                    if graph_autotune is not None
+                    else contextlib.nullcontext()
+                ):
+                    self.backend.capture_one(
+                        shape_key,
+                        run_once,
+                        capture_inputs=None,
+                        post_warmup_hook=post_warmup_hook,
+                    )
 
     def _set_dp_real_num_tokens(self, raw_num_token: int) -> None:
         # An idle DP rank replays a fabricated batch whose count may not reach
