@@ -73,10 +73,9 @@ class MlxSamplingParams:
                 "MLX sampling ignores frequency/presence/repetition penalties; "
                 "a request specified them. (Warning logged once.)"
             )
-        # Seed contract, identical to every other backend: SamplingBatchInfo
-        # populates sampling_seed only under --enable-deterministic-inference,
-        # and then seeds every row (default DEFAULT_SAMPLING_SEED).  Outside
-        # that flag a per-request seed is ignored, so it is ignored here too.
+        # Under --enable-deterministic-inference every row is seeded (default
+        # DEFAULT_SAMPLING_SEED), as in SamplingBatchInfo. Unlike the other backends,
+        # MLX ignores per-request seeds outside that flag.
         seed = None
         if deterministic_seeding:
             seed = (

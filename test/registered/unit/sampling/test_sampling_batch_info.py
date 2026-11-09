@@ -573,6 +573,21 @@ class TestFilterBatch(CustomTestCase):
         self.assertFalse(info.has_custom_logit_processor)
         self.assertIsNone(info.custom_logit_processor)
 
+    def test_filter_drops_seeds_with_the_last_explicitly_seeded_row(self):
+        """Once no row has an explicit seed, the batch returns to the unseeded samplers."""
+        info = _make_info(
+            batch_size=3,
+            sampling_seed=torch.tensor([5, 123, 6], dtype=torch.int64),
+            explicit_sampling_seeds=[False, True, False],
+        )
+        info.filter_batch([1, 2], torch.tensor([1, 2]))
+        self.assertEqual(info.sampling_seed.tolist(), [123, 6])
+        self.assertEqual(info.explicit_sampling_seeds, [True, False])
+
+        info.filter_batch([1], torch.tensor([1]))
+        self.assertIsNone(info.sampling_seed)
+        self.assertIsNone(info.explicit_sampling_seeds)
+
     def test_filter_with_none_sampling_seed(self):
         """Test that filter preserves None sampling_seed without error."""
         info = _make_info(batch_size=3)
@@ -660,6 +675,20 @@ class TestMergeBatch(CustomTestCase):
         info1.merge_batch(info2)
         self.assertIsNone(info1.sampling_seed)
 
+    def test_merge_seeds_an_unseeded_side(self):
+        """Merging an unseeded batch with one holding an explicit seed keeps that seed
+        at its offset and gives the unseeded rows seeds of their own."""
+        info1 = _make_info(batch_size=2)
+        info2 = _make_info(
+            batch_size=1,
+            sampling_seed=torch.tensor([123], dtype=torch.int64),
+            explicit_sampling_seeds=[True],
+        )
+        info1.merge_batch(info2)
+        self.assertEqual(info1.sampling_seed.shape[0], 3)
+        self.assertEqual(info1.sampling_seed[2].item(), 123)
+        self.assertEqual(info1.explicit_sampling_seeds, [False, False, True])
+
     def test_merge_with_both_sampling_seeds(self):
         """Test that merge concatenates both sampling_seed tensors."""
         info1 = _make_info(batch_size=2)
@@ -713,6 +742,13 @@ class TestFromScheduleBatch(CustomTestCase):
         )
         exec_patch.start()
         self.addCleanup(exec_patch.stop)
+        self._spec_ns = SimpleNamespace(speculative_algorithm=None)
+        spec_patch = patch(
+            "sglang.srt.sampling.sampling_batch_info.get_spec",
+            return_value=self._spec_ns,
+        )
+        spec_patch.start()
+        self.addCleanup(spec_patch.stop)
 
     def _make_req(
         self,
@@ -794,6 +830,32 @@ class TestFromScheduleBatch(CustomTestCase):
         self.assertIsNotNone(info.sampling_seed)
         self.assertEqual(info.sampling_seed[0].item(), 123)
         self.assertEqual(info.sampling_seed[1].item(), 42)  # default
+
+    def test_explicit_seed_without_deterministic_inference(self):
+        """A request's seed applies without deterministic inference; the batch's
+        other rows get seeds too, and a batch without one stays unseeded."""
+        batch = MagicMock()
+        batch.device = DEVICE
+        batch.reqs = [self._make_req(seed=123), self._make_req(seed=None)]
+        info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
+        self.assertEqual(info.sampling_seed.shape[0], 2)
+        self.assertEqual(info.sampling_seed[0].item(), 123)
+        self.assertEqual(info.explicit_sampling_seeds, [True, False])
+
+        batch.reqs = [self._make_req(seed=None)]
+        info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
+        self.assertIsNone(info.sampling_seed)
+        self.assertIsNone(info.explicit_sampling_seeds)
+
+    def test_explicit_seed_ignored_with_speculative_decoding(self):
+        """Speculative decoding's draft graphs have seed buffers only in deterministic
+        mode, so a request's seed must not reach them outside it."""
+        self._spec_ns.speculative_algorithm = "EAGLE"
+        batch = MagicMock()
+        batch.device = DEVICE
+        batch.reqs = [self._make_req(seed=123)]
+        info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
+        self.assertIsNone(info.sampling_seed)
 
     def test_from_schedule_batch_sampling_flags(self):
         """Test that sampling flags (need_top_p/top_k/min_p) are set correctly."""

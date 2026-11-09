@@ -400,10 +400,11 @@ class Sampler(nn.Module):
                 )
         else:
             backend = get_exec().kernel.sampling_backend
+            if sampling_info.sampling_seed is not None:
+                # Seeded draws must not depend on the row's batch slot; FlashInfer's seeds do,
+                # the torch sampler's (seed, position, token) hash does not.
+                backend = "pytorch"
             if backend in ("flashinfer", "intel_xpu"):
-                assert sampling_info.sampling_seed is None, (
-                    f"Sampling seed is not supported for {backend} backend"
-                )
                 if sampling_info.need_min_p_sampling:
                     # Apply top-p before top-k renormalization to preserve the original
                     # nucleus and match the other samplers' joint support.
@@ -800,8 +801,7 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
 ):
     """
     A top-k, top-p and min-p sampling implementation with native pytorch operations.
-    When sampling_seed is not None, deterministic inference will be enabled, it will sample
-    with the sampling_seed of each request.
+    When sampling_seed is not None, it samples each row with its seed.
 
     By default, returns only sampled token IDs. With return_filtered_probs=True,
     also returns the actual filtered weights, their token-ID permutation, and
@@ -831,10 +831,6 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
     probs_sort[(probs_sum - probs_sort) > top_ps.view(-1, 1)] = 0.0
 
     if need_min_p_sampling:
-        # TODO: probs_sort should be re-normalized for the use of multinomial_with_seed
-        assert sampling_seed is None, (
-            "With sampling seed, multinomial_with_seed will provide wrong results"
-        )
         min_p_thresholds = probs_sort[:, 0] * min_ps
         probs_sort[probs_sort < min_p_thresholds.view(-1, 1)] = 0.0
 

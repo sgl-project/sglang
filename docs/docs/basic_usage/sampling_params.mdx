@@ -299,6 +299,11 @@ Please refer to our dedicated guide on [constrained decoding](../advanced_featur
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Don't stop generation when EOS token is sampled.</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>sampling_seed</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`Optional[int] = None`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Seed for sampling this request. The same seed gives the same tokens when the logits are the same. Logits can differ slightly with the other requests in the batch unless `--enable-deterministic-inference` is set, so a seed alone does not make outputs reproducible across batches. While a batch contains a seeded request, it samples with the PyTorch sampler, which is slower than FlashInfer. With speculative decoding or on the MLX backend, the seed is used only with `--enable-deterministic-inference`.</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>skip_special_tokens</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`bool = True`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Remove special tokens during decoding.</td>
