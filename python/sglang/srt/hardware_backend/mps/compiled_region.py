@@ -10,6 +10,7 @@ import torch
 
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import ForwardMode
 
 
 class UnsupportedMlxRegion(ValueError):
@@ -114,12 +115,36 @@ class RegionBatch(ForwardBatch):
                 "batch_size",
             ):
                 return value
+            if state["forward_mode"] == ForwardMode.EXTEND and name in (
+                "extend_seq_lens",
+                "extend_prefix_lens",
+                "extend_start_loc",
+            ):
+                return value
             if name == "residual_stream" and state["_residual_written"]:
+                return value
+            if (
+                state["forward_mode"] == ForwardMode.EXTEND
+                and name
+                in (
+                    "extend_seq_lens_cpu",
+                    "extend_prefix_lens_cpu",
+                    "extend_logprob_start_lens_cpu",
+                )
+                and isinstance(value, list)
+                and all(type(x) is int or isinstance(x, torch.SymInt) for x in value)
+            ):
+                state["_static_reads"].setdefault(name, list(value))
                 return value
             if value is not None and not isinstance(
                 value, (bool, int, float, str, Enum)
             ):
-                raise UnsupportedMlxRegion(f"Unsupported MLX batch metadata: {name}")
+                if state["forward_mode"] != ForwardMode.EXTEND or not isinstance(
+                    value, torch.SymInt
+                ):
+                    raise UnsupportedMlxRegion(
+                        f"Unsupported MLX batch metadata: {name}"
+                    )
             state["_static_reads"][name] = value
         return value
 
@@ -136,6 +161,11 @@ class RegionBatch(ForwardBatch):
     def track_reads(self, reads):
         self._static_reads = reads
         self._residual_written = False
+
+    def _validate_reads(self):
+        for name, expected in self._static_reads.items():
+            if isinstance(expected, list) and self.__dict__[name] != expected:
+                raise UnsupportedMlxRegion(f"MLX cannot mutate batch metadata: {name}")
 
 
 def static_metadata_matches(batch: ForwardBatch, reads: dict) -> bool:

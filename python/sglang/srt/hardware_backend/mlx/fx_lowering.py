@@ -481,6 +481,17 @@ def _lower_mean(mx, args, kwargs):
     return mx.mean(value, axis=axis, keepdims=keepdims)
 
 
+@mlx_lowering("cumsum", aten=(torch.ops.aten.cumsum.default,), admit=_admit_dtype_kwarg)
+def _lower_cumsum(mx, args, kwargs):
+    value = args[0]
+    dtype = kwargs.get("dtype")
+    if dtype is not None:
+        value = value.astype(_mlx_dtype(dtype, mx))
+    elif value.dtype == mx.bool_ or mx.issubdtype(value.dtype, mx.integer):
+        value = value.astype(mx.int64)
+    return mx.cumsum(value, axis=_arg(args, kwargs, 1, "dim"))
+
+
 def _admit_sdpa(args, kwargs) -> Optional[str]:
     if _arg(args, kwargs, 4, "dropout_p", 0.0) not in (None, 0, 0.0):
         return "SDPA dropout is unsupported"

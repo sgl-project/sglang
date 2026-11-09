@@ -19,6 +19,180 @@ register_mps_ci(est_time=30, suite="stage-a-unit-test-mps")
     "Requires Torch MPS and MLX",
 )
 class TestCompiledGraph(CustomTestCase):
+    def test_dynamic_shape_specialization_is_an_eager_fallback(self):
+        """Length-specific branches must not abort dynamic-prefill initialization."""
+        from sglang.srt.hardware_backend.mps.compiled_graph import CompiledMlxGraph
+        from sglang.srt.hardware_backend.mps.compiled_region import UnsupportedMlxRegion
+
+        class Model(torch.nn.Module):
+            def forward(self, ids, positions, requests, lengths, locations):
+                return ids + (1 if ids.numel() > 8 else 0)
+
+        inputs = (
+            torch.arange(8, device="mps"),
+            torch.arange(8, device="mps"),
+            torch.tensor([0], device="mps"),
+            torch.tensor([8], device="mps"),
+            torch.arange(8, device="mps"),
+        )
+        with self.assertRaisesRegex(UnsupportedMlxRegion, "dynamic MLX export"):
+            CompiledMlxGraph(model=Model(), example_inputs=inputs, dynamic_tokens=True)
+
+    def test_prefill_export_preserves_last_logits_and_private_kv(self):
+        from sglang.srt.hardware_backend.mps.compiled_graph import CompiledMlxGraph
+        from sglang.srt.hardware_backend.mps.compiled_region import (
+            UnsupportedMlxRegion,
+            discover_decode_region,
+        )
+        from sglang.srt.hardware_backend.mps.compiled_runner import (
+            _causal_sdpa,
+            _DecodeModule,
+        )
+        from sglang.srt.layers.logits_processor import LogitsProcessor
+        from sglang.srt.layers.radix_attention import RadixAttention
+        from sglang.srt.model_executor.forward_context import (
+            ForwardContext,
+            forward_context,
+        )
+        from sglang.srt.runtime_context import get_context
+        from sglang.srt.utils.tensor_bridge import mlx_to_torch
+
+        class Model(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.config = SimpleNamespace(vocab_size=17)
+                self.embed = torch.nn.Embedding(17, 64, device="mps")
+                self.layers = torch.nn.ModuleList([RadixAttention(1, 64, 0.125, 1, 0)])
+                self.lm_head = torch.nn.Linear(64, 17, device="mps")
+                self.processor = LogitsProcessor(self.config)
+                self.mutate = False
+
+            def forward(self, input_ids, positions, forward_batch):
+                if self.mutate:
+                    forward_batch.extend_prefix_lens_cpu[0] = 1
+                hidden = self.embed(input_ids) + positions[:, None]
+                hidden = self.layers[0](hidden, hidden, hidden, forward_batch)
+                return self.processor(input_ids, hidden, self.lm_head, forward_batch)
+
+        with get_context().override_server_args(device="mps", enable_fp32_lm_head=True):
+            model = Model().eval()
+            wrapper = _DecodeModule(
+                model=model,
+                req_pool=SimpleNamespace(),
+                kv_pool=SimpleNamespace(page_size=1),
+                region=discover_decode_region(model),
+                prefill=True,
+            )
+            inputs = (
+                torch.tensor([1, 2, 3], device="mps"),
+                torch.arange(3, device="mps"),
+                torch.tensor([1], device="mps"),
+                torch.tensor([3], device="mps"),
+                torch.tensor([5, 6, 7], device="mps"),
+            )
+            lowerings = {
+                torch.ops.aten.scaled_dot_product_attention.default: _causal_sdpa
+            }
+            with forward_context(ForwardContext(attn_backend=wrapper.attention)):
+                graph = CompiledMlxGraph(
+                    model=wrapper,
+                    example_inputs=inputs,
+                    custom_lowerings=lowerings,
+                    dynamic_tokens=True,
+                )
+                self.addCleanup(graph.close)
+                for ids in (
+                    [1, 2, 3],
+                    [4, 5],
+                    [1, 2, 3, 4, 5],
+                    [1, 2, 3, 4],
+                    [1, 2, 3, 4, 5, 6],
+                    [4, 5, 6],
+                ):
+                    current = (
+                        torch.tensor(ids, device="mps"),
+                        torch.arange(len(ids), device="mps"),
+                        inputs[2],
+                        torch.tensor([len(ids)], device="mps"),
+                        torch.arange(5, 5 + len(ids), device="mps"),
+                    )
+                    wrapper.static_reads.clear()
+                    expected = wrapper(*current)
+                    torch.mps.synchronize()
+                    actual = graph.launch(graph.bind(current))
+                    for lhs, rhs in zip(actual, expected):
+                        torch.testing.assert_close(
+                            mlx_to_torch(lhs), rhs, rtol=0.02, atol=0.02
+                        )
+                    self.assertLessEqual(len(graph.compiled), 4)
+                for candidate in (
+                    (inputs[0], inputs[1][:-1], *inputs[2:]),
+                    (inputs[0].float(), *inputs[1:]),
+                    (torch.arange(6, device="mps")[::2], *inputs[1:]),
+                ):
+                    with self.assertRaises(ValueError):
+                        graph.bind(candidate)
+                model.mutate = True
+                with self.assertRaisesRegex(
+                    UnsupportedMlxRegion, "mutate batch metadata"
+                ):
+                    CompiledMlxGraph(
+                        model=wrapper, example_inputs=inputs, custom_lowerings=lowerings
+                    )
+
+    def test_prefill_long_admission_and_authoritative_kv_mapping(self):
+        from sglang.srt.hardware_backend.mps.compiled_runner import (
+            CompiledMlxRunner,
+            _plain_prefill,
+        )
+        from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+        from sglang.srt.model_executor.forward_mode import ForwardMode
+
+        capacity = 33024
+        table = torch.zeros(2, capacity, device="mps", dtype=torch.int32)
+        keys = torch.zeros(capacity + 1, 1, 64, device="mps")
+        runner = object.__new__(CompiledMlxRunner)
+        runner._prefill = True
+        runner._layers = (SimpleNamespace(layer_id=0),)
+        runner.model_runner = SimpleNamespace(
+            model=SimpleNamespace(config=SimpleNamespace(vocab_size=17)),
+            model_config=SimpleNamespace(context_len=capacity),
+            req_to_token_pool=SimpleNamespace(req_to_token=table),
+            token_to_kv_pool=SimpleNamespace(
+                page_size=1, get_key_buffer=lambda _: keys
+            ),
+        )
+        for tokens in (16384, 32768):
+            with self.subTest(tokens=tokens):
+                locations = torch.arange(1, tokens + 1, device="mps")
+                table[1, :tokens] = locations.to(torch.int32)
+                batch = ForwardBatch(
+                    forward_mode=ForwardMode.EXTEND,
+                    batch_size=1,
+                    input_ids=torch.ones(tokens, device="mps", dtype=torch.int64),
+                    positions=torch.arange(tokens, device="mps"),
+                    req_pool_indices=torch.tensor([1], device="mps"),
+                    seq_lens=torch.tensor([tokens], device="mps"),
+                    seq_lens_sum=tokens,
+                    out_cache_loc=locations,
+                    extend_num_tokens=tokens,
+                    extend_seq_lens=torch.tensor([tokens], device="mps"),
+                    extend_seq_lens_cpu=[tokens],
+                    extend_prefix_lens=torch.tensor([0], device="mps"),
+                    extend_prefix_lens_cpu=[0],
+                    extend_start_loc=torch.tensor([0], device="mps"),
+                )
+                self.assertTrue(_plain_prefill(batch))
+                runner._validate_prefill_metadata(batch)
+                table[1, tokens - 1] = 1
+                with self.assertRaisesRegex(ValueError, "KV mapping"):
+                    runner._validate_prefill_metadata(batch)
+                batch.extend_prefix_lens_cpu = [1]
+                self.assertFalse(_plain_prefill(batch))
+                batch.extend_prefix_lens_cpu = [0]
+                batch.batch_size = 2
+                self.assertFalse(_plain_prefill(batch))
+
     def test_radix_lowering_preserves_page_size_and_rejects_broken_pages(self):
         from sglang.kernels.ops.attention.mlx.radix_attention import radix_decode
         from sglang.kernels.ops.attention.mlx.radix_attention_export import (
@@ -259,6 +433,28 @@ class TestCompiledGraph(CustomTestCase):
         region = discover_decode_region(model)
         self.assertEqual(region.position_arg, "position_ids")
         self.assertEqual(tuple(x.layer_id for x in region.layers), (0, 1))
+        from sglang.srt.hardware_backend.mps.compiled_graph import CompiledMlxGraph
+        from sglang.srt.hardware_backend.mps.compiled_runner import CompiledMlxRunner
+
+        runner = object.__new__(CompiledMlxRunner)
+        runner.model_runner = SimpleNamespace(model=model)
+        runner._model_structure = None
+        runner._graphs = {}
+        runner._unsupported_batches = {}
+        runner._pending = None
+        runner._refresh_region()
+        graph = CompiledMlxGraph(
+            model=torch.nn.Linear(4, 4, device="mps"),
+            example_inputs=(torch.ones(1, 4, device="mps"),),
+        )
+        self.addCleanup(graph.close)
+        runner._graphs[1] = graph
+        added = torch.nn.Linear(4, 4, device="mps")
+        model.transformer["blocks"][0].extra = added
+        runner._refresh_region()
+        self.assertTrue(graph.closed)
+        self.assertFalse(runner._graphs)
+        self.assertIn((added, "weight", True), runner._weight_sources)
         model.transformer["blocks"][1].layer_id = 0
         with self.assertRaisesRegex(UnsupportedMlxRegion, "unique"):
             discover_decode_region(model)
@@ -534,6 +730,7 @@ class TestCompiledGraph(CustomTestCase):
         graph = CompiledMlxGraph(model=model, example_inputs=_batch_inputs(batch))
         self.addCleanup(graph.close)
         runner = object.__new__(CompiledMlxRunner)
+        runner._prefill = False
         runner.model_runner = SimpleNamespace(
             model=model,
             model_config=SimpleNamespace(context_len=32),
@@ -544,9 +741,11 @@ class TestCompiledGraph(CustomTestCase):
         runner._max_batch_size = 4
         runner._unsupported_reason = None
         runner._unsupported_batches = {}
-        runner._model_structure = tuple(
-            (name, id(module))
-            for name, module in model.named_modules(remove_duplicate=False)
+        runner._model_structure = (
+            model,
+            tuple(
+                (module, tuple(module._modules.items())) for module in model.modules()
+            ),
         )
         runner._weight_sources = ((model.embedding, "weight", True),)
         model.static_reads = {}
@@ -641,7 +840,12 @@ class TestCompiledGraph(CustomTestCase):
                 elif changed == "length":
                     candidate = (metadata[0], (4,), *metadata[2:])
                 elif changed == "weights":
-                    stamp = ()
+                    original = model.embedding.weight.detach().clone()
+                    with torch.no_grad():
+                        model.embedding.weight.add_(1)
+                    stamp = runner._weights()
+                    with torch.no_grad():
+                        model.embedding.weight.copy_(original)
                 elif changed == "tokens":
                     batch.input_ids = (batch.input_ids + 1) % 4
                 else:

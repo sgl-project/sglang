@@ -274,9 +274,12 @@ def handle_gpu_memory_settings(server_args: Any):
             )
 
     if prefill_cuda_graph_config.bs is None:
-        prefill_cuda_graph_config.bs = generate_prefill_cuda_graph_batch_sizes(
-            prefill_cuda_graph_config.max_bs
-        )
+        if cfg.device == "mps" and cfg.mps_execution_backend == "mlx-compiled":
+            prefill_cuda_graph_config.bs = []
+        else:
+            prefill_cuda_graph_config.bs = generate_prefill_cuda_graph_batch_sizes(
+                prefill_cuda_graph_config.max_bs
+            )
 
     if cuda_graph_config != cfg.cuda_graph_config:
         declare_resolution(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import operator
 from collections.abc import Callable, Mapping
 
 import mlx.core as mx
@@ -99,7 +100,7 @@ def _weighted_rms_pattern(node, norms):
 
 
 class CompiledMlxGraph:
-    """Fixed-shape, read-only export with retained, replaceable Torch storage."""
+    """Read-only export with retained, replaceable Torch storage."""
 
     @torch.no_grad()
     def __init__(
@@ -109,11 +110,26 @@ class CompiledMlxGraph:
         example_inputs,
         attention=None,
         custom_lowerings: Mapping[torch._ops.OpOverload, Callable] | None = None,
+        dynamic_tokens=False,
     ):
         self.model = model
         self.attention = attention
+        self.dynamic_tokens = dynamic_tokens
         self.input_signatures = tuple(_signature(x) for x in example_inputs)
-        exported = torch.export.export(model, example_inputs, strict=False)
+        shapes = None
+        if dynamic_tokens:
+            tokens = torch.export.Dim("prefill_tokens", min=2, max=32768)
+            shapes = ({0: tokens}, {0: tokens}, None, None, {0: tokens})
+        try:
+            exported = torch.export.export(
+                model, example_inputs, strict=False, dynamic_shapes=shapes
+            )
+        except torch._dynamo.exc.UserError as error:
+            if not dynamic_tokens:
+                raise
+            raise UnsupportedMlxRegion(
+                f"Unsupported dynamic MLX export: {error}"
+            ) from error
         exported = exported.run_decompositions({})
         if any(
             s.kind != OutputKind.USER_OUTPUT
@@ -124,6 +140,16 @@ class CompiledMlxGraph:
             )
         self.nodes = tuple(exported.graph.nodes)
         registry = MlxFxLoweringRegistry.standard_export_decoder()
+        if dynamic_tokens:
+            registry.register_function(
+                torch.ops.aten.sym_size.int,
+                lambda mx, args, kwargs: args[0].shape[args[1]],
+            )
+            for operation in (operator.mul, operator.floordiv):
+                registry.register_function(
+                    operation,
+                    lambda mx, args, kwargs, fn=operation: fn(*args, **kwargs),
+                )
         for target, lowering in (custom_lowerings or {}).items():
             registry.register_function(
                 target,
@@ -179,10 +205,23 @@ class CompiledMlxGraph:
             len(self.norms),
             len(self.weighted_norms),
         )
-        self.compiled = {
-            tail: mx.compile(self._function(tail), shapeless=False)
-            for tail in (False, True)
-        }
+        self._token_input = (
+            next(
+                i
+                for i, (kind, target) in enumerate(self.bindings)
+                if kind == InputKind.USER_INPUT and target == 0
+            )
+            if dynamic_tokens
+            else None
+        )
+        self.compiled = (
+            {}
+            if dynamic_tokens
+            else {
+                tail: mx.compile(self._function(tail), shapeless=False)
+                for tail in (False, True)
+            }
+        )
         self.execution_count = 0
 
     def _function(self, tail):
@@ -242,7 +281,20 @@ class CompiledMlxGraph:
     def bind(self, inputs):
         if self.closed:
             raise RuntimeError("Direct MLX graph is closed")
-        if tuple(_signature(x) for x in inputs) != self.input_signatures:
+        signatures = tuple(_signature(x) for x in inputs)
+        if self.dynamic_tokens:
+            tokens = inputs[0].numel()
+            if not 2 <= tokens <= 32768 or any(
+                inputs[i].shape != (tokens,) for i in (0, 1, 4)
+            ):
+                raise ValueError("Invalid dynamic MLX prefill token shape")
+            signatures = tuple(
+                (self.input_signatures[i][0], *signature[1:])
+                if i in (0, 1, 4)
+                else signature
+                for i, signature in enumerate(signatures)
+            )
+        if signatures != self.input_signatures:
             raise ValueError("Direct MLX input shape, dtype, stride or device changed")
         if any(
             parent._modules[name] is not child
@@ -271,7 +323,7 @@ class CompiledMlxGraph:
                 # Shape, dtype, stride and device were checked above.
                 if (
                     cached is None
-                    or tensor.data_ptr() != cached.torch_tensor.data_ptr()
+                    or cached.torch_tensor.data_ptr() != tensor.data_ptr()
                 ):
                     cached = MlxTensorView(tensor, synchronize=False)
                     self.views[index] = cached
@@ -283,7 +335,17 @@ class CompiledMlxGraph:
     def launch(self, arrays, *, tails=None):
         if self.closed:
             raise RuntimeError("Direct MLX graph is closed")
-        outputs = self.compiled[tails is not None](*arrays, *(tails or ()))
+        key = tails is not None
+        if self.dynamic_tokens:
+            key = (arrays[self._token_input].shape[0], key)
+            if key not in self.compiled:
+                if len(self.compiled) == 4:
+                    mx.synchronize()
+                    self.compiled.pop(next(iter(self.compiled)))
+                self.compiled[key] = mx.compile(
+                    self._function(tails is not None), shapeless=False
+                )
+        outputs = self.compiled[key](*arrays, *(tails or ()))
         mx.async_eval(*outputs)
         self.execution_count += 1
         return outputs

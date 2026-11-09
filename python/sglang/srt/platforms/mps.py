@@ -82,7 +82,11 @@ class MpsSRTPlatform(MpsDeviceMixin, SRTPlatform):
     def get_default_attention_backend(self) -> str:
         return "torch_native"
 
-    def get_paged_allocator_cls(self) -> type:
+    def get_paged_allocator_cls(self) -> Optional[type]:
+        from sglang.srt.runtime_context import get_exec
+
+        if get_exec().graph.mps_execution_backend != "mlx-compiled":
+            return None
         from sglang.srt.hardware_backend.mps.allocator import (
             MPSPagedTokenToKVPoolAllocator,
         )

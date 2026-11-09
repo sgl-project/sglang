@@ -473,6 +473,19 @@ class TestLegacyKvPoolHookDeprecation(CustomTestCase):
 class TestMpsDeviceMixin(CustomTestCase):
     """Tests for the built-in Apple MPS platform contract."""
 
+    def test_eager_does_not_load_the_compiled_allocator(self):
+        from sglang.srt.runtime_context import get_context
+
+        with (
+            get_context().override_server_args(
+                device="mps", mps_execution_backend="eager"
+            ),
+            patch.dict(
+                "sys.modules", {"sglang.srt.hardware_backend.mps.allocator": None}
+            ),
+        ):
+            self.assertIsNone(MpsSRTPlatform().get_paged_allocator_cls())
+
     def test_identity_and_backend_defaults(self):
         base = MpsSRTPlatform()
         self.assertTrue(base.is_mps())

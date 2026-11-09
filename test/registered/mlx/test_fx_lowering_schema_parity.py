@@ -79,6 +79,10 @@ _RECIPES: dict[str, dict] = {
     "cos": dict(args=lambda: (_t(4, 4),)),
     "sin": dict(args=lambda: (_t(4, 4),)),
     "sqrt": dict(args=lambda: (_positive(4, 4),)),
+    "cumsum": dict(
+        args=lambda: (torch.tensor([1, 2, 3], dtype=torch.int32), 0),
+        pools={"dtype": [torch.int32, torch.float32]},
+    ),
     "negative": dict(args=lambda: (_t(4, 4),)),
     "expand": dict(
         args=lambda: (_t(1, 4), [3, -1]),

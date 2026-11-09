@@ -508,6 +508,17 @@ def capture_prefill_graph(
             capture_time=capture_time,
         )
 
+    if model_runner.device == "mps":
+        if (
+            model_runner.is_draft_worker
+            or get_exec().graph.mps_execution_backend != "mlx-compiled"
+            or get_exec().graph.cuda_graph_config.prefill.backend != Backend.FULL
+        ):
+            return result(eager_runner)
+        from sglang.srt.hardware_backend.mps.compiled_runner import CompiledMlxRunner
+
+        return result(CompiledMlxRunner(model_runner, prefill=True))
+
     # CPU prefill graph capture is owned by CPUGraphRunner; keep the shared
     # setup path eager for unsupported CPU configurations.
     if getattr(model_runner, "device", None) == "cpu":
