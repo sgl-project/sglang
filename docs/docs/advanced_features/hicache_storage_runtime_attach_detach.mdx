@@ -3,7 +3,7 @@ title: "Runtime Attach/Detach HiCache Storage Backend (No Restart)"
 metatags:
     description: "Dynamically attach/detach HiCache L3 storage backends at runtime via HTTP API. No restart required, idle-state safety checks."
 ---
-This document explains how to **dynamically attach/detach the HiCache L3 storage backend at runtime** (e.g., `mooncake` / `hf3fs` / `nixl` / `file` / `aibrix` / `eic`) while **SGLang is already running and serving traffic**, without restarting the process.
+This document explains how to **dynamically attach/detach the HiCache L3 storage backend at runtime** (e.g., `mooncake` / `hf3fs` / `nixl` / `fast_file` / `file` / `aibrix` / `eic`) while **SGLang is already running and serving traffic**, without restarting the process.
 
 For safety and consistency, the current implementation **strictly requires** these operations to happen only when the service is **idle**:
 

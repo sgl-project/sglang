@@ -21,6 +21,21 @@ pub(crate) struct ModelInfo {
     pub(crate) reasoning_parser: Option<String>,
     pub(crate) tool_call_parser: Option<String>,
     pub(crate) disaggregation_mode: DisaggregationMode,
+    /// Python's launch-time `/model_info` fields, which the HTTP response
+    /// carries after the fields above.
+    #[serde(skip)]
+    pub(crate) launch_fields: Arc<serde_json::Map<String, serde_json::Value>>,
+}
+
+impl ModelInfo {
+    /// The HTTP body: every field of this struct, then the launch-time fields.
+    pub(crate) fn to_json(&self) -> serde_json::Result<serde_json::Value> {
+        let mut body = serde_json::to_value(self)?;
+        if let serde_json::Value::Object(fields) = &mut body {
+            fields.extend((*self.launch_fields).clone());
+        }
+        Ok(body)
+    }
 }
 
 /// Public server metadata plus scheduler-owned runtime metrics.
@@ -47,6 +62,18 @@ pub(crate) struct ServerInfo {
     pub(crate) incremental_streaming_output: bool,
     pub(crate) disaggregation_mode: DisaggregationMode,
     pub(crate) deployment_info: DeploymentInfo,
+    /// Under DP, every rank's listener by rank, published by the listener of
+    /// DP rank 0 so a client can address each rank's listener directly;
+    /// empty, and left out of the JSON, on the other listeners.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) dp_listeners: Vec<DpListener>,
+}
+
+/// One DP rank's listener, as `/server_info`'s `dp_listeners` lists it.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub(crate) struct DpListener {
+    pub(crate) dp_rank: u32,
+    pub(crate) url: String,
 }
 
 impl ServerInfo {
@@ -65,7 +92,8 @@ impl ServerInfo {
 ///
 /// Deserializing into this allowlisted shape is intentional: the scheduler's
 /// raw state also contains its full launch arguments, including credentials.
-/// Unknown fields are discarded before any transport receives the result.
+/// Unknown fields are discarded before any transport receives the result,
+/// except the ones an embedding package registered by name.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 #[serde(default)]
 pub(crate) struct InternalState {
@@ -85,6 +113,105 @@ pub(crate) struct InternalState {
     /// reports at the top level as `startup_time`.
     #[serde(skip_serializing)]
     pub(crate) rust_server_startup_time: Option<serde_json::Value>,
+    /// The fields an embedding package registered for `/server_info`, after
+    /// the typed ones (see [`InternalState::from_scheduler`]).
+    #[serde(flatten, skip_deserializing)]
+    pub(crate) registered: RegisteredState,
+}
+
+impl InternalState {
+    /// One rank's public state from the scheduler's raw `state`: the typed
+    /// fields above, then each of `registered_keys` the scheduler set, in
+    /// that order. Every other field, the launch arguments included, is
+    /// dropped.
+    pub(crate) fn from_scheduler(
+        state: rmpv::Value,
+        registered_keys: &[String],
+    ) -> Result<Self, rmpv::ext::Error> {
+        let registered = match &state {
+            rmpv::Value::Map(fields) => registered_keys
+                .iter()
+                .filter_map(|key| {
+                    let (_, value) = fields
+                        .iter()
+                        .find(|(name, _)| name.as_str() == Some(key.as_str()))?;
+                    Some((key.clone(), value.clone()))
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        Ok(Self {
+            registered: RegisteredState(registered),
+            ..rmpv::ext::from_value(state)?
+        })
+    }
+}
+
+impl InternalState {
+    /// Check an embedding package's registered fields: each must be one
+    /// `/server_info` does not already report for a rank, and named once.
+    pub(crate) fn check_registered_keys(keys: &[String]) -> Result<(), String> {
+        let typed = typed_field_names();
+        for (index, key) in keys.iter().enumerate() {
+            if typed.contains(&key.as_str()) {
+                return Err(format!(
+                    "server_info state key {key:?} names a field /server_info already reports"
+                ));
+            }
+            if keys[..index].contains(key) {
+                return Err(format!("server_info state key {key:?} is registered twice"));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The scheduler fields [`InternalState`] decodes, as its `Deserialize`
+/// names them: a deserializer that records the field list it is asked for.
+fn typed_field_names() -> &'static [&'static str] {
+    use serde::de::{Error, Visitor, value};
+
+    struct FieldNames(Option<&'static [&'static str]>);
+
+    impl<'de> serde::Deserializer<'de> for &mut FieldNames {
+        type Error = value::Error;
+
+        fn deserialize_any<V: Visitor<'de>>(self, _: V) -> Result<V::Value, Self::Error> {
+            Err(Error::custom("only a struct's field names are recorded"))
+        }
+
+        fn deserialize_struct<V: Visitor<'de>>(
+            self,
+            _: &'static str,
+            fields: &'static [&'static str],
+            _: V,
+        ) -> Result<V::Value, Self::Error> {
+            self.0 = Some(fields);
+            Err(Error::custom("field names recorded"))
+        }
+
+        serde::forward_to_deserialize_any! {
+            bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+            bytes byte_buf option unit unit_struct newtype_struct seq tuple
+            tuple_struct map enum identifier ignored_any
+        }
+    }
+
+    let mut names = FieldNames(None);
+    let _ = InternalState::deserialize(&mut names);
+    names.0.expect("InternalState deserializes as a struct")
+}
+
+/// Registered scheduler fields, reported as the scheduler built them. They
+/// stay MessagePack values rather than JSON: their maps may have integer keys,
+/// which JSON reports as strings, as Python's frontend does.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct RegisteredState(Vec<(String, rmpv::Value)>);
+
+impl Serialize for RegisteredState {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_map(self.0.iter().map(|(key, value)| (key, value)))
+    }
 }
 
 /// Public subset of scheduler memory metrics.
@@ -103,7 +230,10 @@ pub(crate) struct MemoryUsage {
     pub(crate) startup_available: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) token_capacity: Option<u64>,
+    /// The target's own window's token capacity, as before windows were named.
     pub(crate) token_capacity_swa: Option<u64>,
+    /// Each sliding-window pool's token capacity, by the window's name.
+    pub(crate) token_capacity_window: Option<BTreeMap<String, u64>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) graph: Option<BTreeMap<String, f64>>,
 }
