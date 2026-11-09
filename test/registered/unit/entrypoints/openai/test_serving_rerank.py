@@ -183,11 +183,23 @@ class TestRerankStructuredTextRouting(CustomTestCase):
     def test_document_media_not_scored_as_text_or_dropped(self):
         # Media in a document with the text template is unsupported: it must
         # keep failing (no silent text scoring, no URL silently discarded).
-        status, body, tm = asyncio.run(
-            _run(Q, [[_text_part(D[0]), _image_part()], D[1]])
-        )
-        self.assertEqual(status, 400)
-        self.assertEqual(tm.prompts, [])
+        for media_part in (_image_part(), _video_part()):
+            for document_index in range(len(D)):
+                with self.subTest(
+                    media_type=media_part["type"], document_index=document_index
+                ):
+                    documents = list(D)
+                    documents[document_index] = [
+                        _text_part(D[document_index]),
+                        media_part,
+                    ]
+                    # Avoid the separate structured-document response error
+                    # masking a routing regression that silently drops media.
+                    status, _, tm = asyncio.run(
+                        _run(Q, documents, return_documents=False)
+                    )
+                    self.assertEqual(status, 400)
+                    self.assertEqual(tm.prompts, [])
 
     def test_query_media_not_scored_as_text(self):
         status, body, tm = asyncio.run(_run([_text_part(Q), _video_part()], D))
