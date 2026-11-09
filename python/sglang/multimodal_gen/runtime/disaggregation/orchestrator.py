@@ -49,11 +49,11 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
     Req,
 )
 from sglang.multimodal_gen.runtime.utils.common import get_zmq_socket
-from sglang.srt.utils.serialization import safe_pickle_loads
 from sglang.multimodal_gen.runtime.utils.perf_logger import (
     MemorySnapshot,
     RequestMetrics,
 )
+from sglang.srt.utils.serialization import safe_pickle_loads
 
 if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.glm_image import (
