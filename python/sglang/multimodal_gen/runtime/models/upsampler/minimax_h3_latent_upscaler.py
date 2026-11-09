@@ -38,8 +38,8 @@ class _ResBlockEmb3D(nn.Module):
 
     def forward(self, x: torch.Tensor, emb: torch.Tensor) -> torch.Tensor:
         h = self.in_layers(x)
-        scale, shift = self.emb_layers(emb).type(h.dtype)[..., None, None, None].chunk(
-            2, dim=1
+        scale, shift = (
+            self.emb_layers(emb).type(h.dtype)[..., None, None, None].chunk(2, dim=1)
         )
         h = self.out_layers(self.out_norm(h) * (1 + scale) + shift)
         return x + h

@@ -569,8 +569,7 @@ def register():
         ],
         model_detectors=[
             lambda model_id: (
-                "openh3regenerate"
-                in model_id.lower().replace("-", "").replace("_", "")
+                "openh3regenerate" in model_id.lower().replace("-", "").replace("_", "")
             )
         ],
     )

@@ -300,9 +300,7 @@ def minimax_h3_validate_canonical_request(
     profile = minimax_h3_task_profile(task_name)
     prompt_text = _require_str(prompt, "prompt")
 
-    normalized_target = _validate_target(
-        target, profile=profile, max_pixels=max_pixels
-    )
+    normalized_target = _validate_target(target, profile=profile, max_pixels=max_pixels)
     requested_frame_count = None
     if normalized_target.get("duration_seconds") is not None:
         requested_frame_count = int(
