@@ -27,6 +27,7 @@ import random
 import time
 from collections import deque
 from concurrent.futures import Future
+from contextlib import contextmanager
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import (
@@ -488,6 +489,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     ):
         parallel = get_parallel()
         self.draft_window_kv = get_spec().speculative_draft_window_kv
+        self._draft_window_slot_events = {}
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.token_to_kv_pool = token_to_kv_pool_allocator.get_kvcache()
@@ -1650,7 +1652,65 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         for decode_req, prefill_dp_rank in resolved:
             self._init_receiver(decode_req, prefill_dp_rank)
 
+    def record_draft_window_forward(
+        self, batch: ScheduleBatch, result: GenerationBatchResult
+    ) -> None:
+        if not self.draft_window_kv or batch.forward_mode.is_prebuilt():
+            return
+        # copy_done is recorded after this forward's writes, including draft
+        # KV commits. Retain the latest use, even for a request whose previous
+        # result finishes while this overlapped forward is still in flight.
+        event = result.copy_done
+        if event is None:
+            # Non-overlap forwards do not always need a result readback event.
+            event = self.scheduler.device_module.Event()
+            if self.scheduler.enable_overlap:
+                event.record(stream=self.scheduler.forward_stream)
+            else:
+                event.record()
+        for slot in batch.req_pool_indices_cpu.tolist():
+            self._draft_window_slot_events[slot] = event
+
+    @contextmanager
+    def _hold_busy_draft_window_slots(self):
+        if not self.draft_window_kv or not self.queue:
+            yield
+            return
+        free_slots = self.req_to_token_pool.free_slots
+        pending = []
+        completed = {}
+        for slot in free_slots:
+            event = self._draft_window_slot_events.get(slot)
+            if event is None:
+                pending.append(0)
+                continue
+            # A batch shares one completion event across its request slots.
+            key = id(event)
+            if key not in completed:
+                completed[key] = event.query()
+            pending.append(int(not completed[key]))
+        pending = all_reduce_flags(pending, self.gloo_group, dist.ReduceOp.MAX)
+        held = [slot for slot, busy in zip(free_slots, pending) if busy]
+        self.req_to_token_pool.free_slots = [
+            slot for slot, busy in zip(free_slots, pending) if not busy
+        ]
+        try:
+            yield
+        finally:
+            # Only allocation is delayed. Queue cleanup/aborts still run, and
+            # the scheduler never waits for unrelated forward-stream work.
+            self.req_to_token_pool.free_slots.extend(held)
+
     def pop_preallocated(
+        self,
+        rids_to_check: Optional[List[str]] = None,
+        pp_good_rids: Optional[List[str]] = None,
+        pp_bad_rids: Optional[List[str]] = None,
+    ) -> Tuple[List[DecodeRequest], List[DecodeRequest]]:
+        with self._hold_busy_draft_window_slots():
+            return self._pop_preallocated(rids_to_check, pp_good_rids, pp_bad_rids)
+
+    def _pop_preallocated(
         self,
         rids_to_check: Optional[List[str]] = None,
         pp_good_rids: Optional[List[str]] = None,
@@ -2385,9 +2445,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         """Send ``decode_req``'s destination, or hold it until the forward in
         flight is done; a held send's rows (``receive_rows``) are held, not
         recorded as the peer's, and re-read at the send (``refresh``)."""
-        if self.draft_window_kv:
-            # Retire previous writes before publishing a recycled draft ring.
-            self.scheduler.forward_stream.synchronize()
         if not metadata_buffer_preassigned:
             decode_req.metadata_buffer_index = (
                 self.req_to_metadata_buffer_idx_allocator.alloc()
@@ -4110,6 +4167,9 @@ class SchedulerDisaggregationDecodeMixin:
             # Launch the current batch
             if batch:
                 result = self.run_batch(batch)
+                self.disagg_decode_prealloc_queue.record_draft_window_forward(
+                    batch, result
+                )
                 self.process_batch_result(batch, result)
             else:
                 # When the server is idle, do self-check and re-init some states
@@ -4193,6 +4253,10 @@ class SchedulerDisaggregationDecodeMixin:
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
             self.launch_batch_sample_if_needed(batch_result, batch)
+            if batch is not None:
+                self.disagg_decode_prealloc_queue.record_draft_window_forward(
+                    batch, batch_result
+                )
 
             # Update last_batch
             self.last_batch = batch
