@@ -2051,6 +2051,11 @@ class Scheduler(
         # HostKVCache.destroy. Called from run_scheduler_process's finally.
         if self.hisparse_coordinator is not None:
             self.hisparse_coordinator.destroy()
+        from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
+
+        kvcache = self.token_to_kv_pool_allocator.get_kvcache()
+        if isinstance(kvcache, QSATokenToKVPool) and kvcache.kv_offload is not None:
+            kvcache.kv_offload.destroy()
         self.tree_cache.release_host_resources()
         if self.decode_offload_manager is not None:
             self.decode_offload_manager.release_host_resources()

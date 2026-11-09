@@ -15,13 +15,20 @@ from typing import List, Optional
 import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.device_pool_info import (
     DevicePoolInfo,
     IndexKeyBufferInfo,
     IndexKeyLayout,
 )
 from sglang.srt.mem_cache.hicache_storage import PoolName
-from sglang.srt.mem_cache.memory_pool import GB, HybridLinearKVPool, MambaPool
+from sglang.srt.mem_cache.memory_pool import (
+    GB,
+    HybridLinearKVPool,
+    MambaPool,
+    MHATokenToKVPool,
+)
+from sglang.srt.mem_cache.qsa_kv_offload import QSAKVHostOffload, QSAKVOffloadLayout
 
 logger = logging.getLogger(__name__)
 
@@ -117,6 +124,7 @@ class QSATokenToKVPool(HybridLinearKVPool):
         quant_method=None,
         post_capture_active: bool = False,
         qsa_indexer_dtype: torch.dtype = torch.bfloat16,
+        kv_offload_layout: Optional[QSAKVOffloadLayout] = None,
     ):
         if page_size <= 1 or page_size % qsa_compress_ratio != 0:
             raise ValueError(
@@ -132,6 +140,29 @@ class QSATokenToKVPool(HybridLinearKVPool):
         self.qsa_key_state_buffer_pool = []
         self.qsa_compressed_k_buffer_pool = []
         self.qsa_rope_position_buffer = torch.empty(0)
+        full_kv_pool = offload_pool = None
+        if kv_offload_layout is not None:
+            if (
+                quant_method is not None
+                or post_capture_active
+                or full_kv_pool_class not in (None, MHATokenToKVPool)
+            ):
+                raise ValueError("QSA K/V offload needs a plain unquantized K/V pool")
+            # The GPU keeps only the hot-cache and scratch rows of the K/V (in
+            # verify mode next to the full pool).
+            offload_pool = MHATokenToKVPool(
+                size=kv_offload_layout.device_rows,
+                page_size=page_size,
+                dtype=dtype,
+                head_num=head_num,
+                head_dim=head_dim,
+                layer_num=len(full_attention_layer_ids),
+                device=device,
+                enable_memory_saver=enable_memory_saver,
+                kv_cache_layout="nhd",
+            )
+            if not envs.SGLANG_DEBUG_QSA_KV_OFFLOAD_VERIFY.get():
+                full_kv_pool = offload_pool
         super().__init__(
             size=size,
             dtype=dtype,
@@ -148,6 +179,18 @@ class QSATokenToKVPool(HybridLinearKVPool):
             full_kv_pool_class=full_kv_pool_class,
             quant_method=quant_method,
             post_capture_active=post_capture_active,
+            full_kv_pool=full_kv_pool,
+        )
+        self.kv_offload = (
+            None
+            if offload_pool is None
+            else QSAKVHostOffload(
+                layout=kv_offload_layout,
+                k_buffers=offload_pool.k_buffer,
+                v_buffers=offload_pool.v_buffer,
+                host_rows=size + page_size,
+                verify=offload_pool is not self.full_kv_pool,
+            )
         )
         if (
             min(
@@ -246,6 +289,10 @@ class QSATokenToKVPool(HybridLinearKVPool):
         ]
         k_size, v_size = self.get_kv_size_bytes()
         self.mem_usage = (k_size + v_size) / GB
+
+    def full_attention_layer_index(self, layer_id: int) -> int:
+        """Index of a full-attention (QSA) layer among this pool's QSA layers."""
+        return self._transfer_full_attention_id(layer_id)
 
     def get_qsa_key_state_buffer(self, layer_id: int) -> torch.Tensor:
         return self.qsa_key_state_buffer_pool[
