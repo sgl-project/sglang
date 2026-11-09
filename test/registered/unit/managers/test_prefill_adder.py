@@ -1119,7 +1119,9 @@ class TestPrefillAdder(CustomTestCase):
         for shard_size in (2, 4):
             capacity = shard_size * tokens_per_rank
             queue = PrefillBootstrapQueue.__new__(PrefillBootstrapQueue)
-            queue.scheduler = SimpleNamespace(output_streamer=MagicMock())
+            queue.scheduler = SimpleNamespace(
+                request_retirer=SimpleNamespace(retire_unadmitted=MagicMock())
+            )
             queue.max_input_len = max_bootstrap_input_len(
                 capacity=capacity, page_size=page_size, shard_size=shard_size
             )
