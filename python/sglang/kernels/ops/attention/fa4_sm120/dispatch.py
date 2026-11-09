@@ -8,6 +8,7 @@ implementation and its launch state remain outside ``flash_attn/cute``.
 from functools import lru_cache
 
 from sglang.kernels.arch import current_arch
+from sglang.srt.environ import envs
 
 
 @lru_cache(maxsize=None)
@@ -30,7 +31,10 @@ def resolve_runtime_policy(
     """Resolve generic and architecture-owned SplitKV launch policy."""
     arch = device_capability[0] * 10 + device_capability[1]
     uses_arch_decode_policy = get_forward_host(arch) is not None
-    no_splitkv = device_capability < (9, 0) or uses_arch_decode_policy
+    # One split leaves a short extend over a long cached prefix on q-tiles x kv-heads CTAs.
+    no_splitkv = device_capability < (9, 0) or (
+        uses_arch_decode_policy and not envs.SGLANG_OPT_SM120_FA4_GENERIC_SPLITKV.get()
+    )
     num_splits = 1 if deterministic or no_splitkv else 0
     decode_num_splits = (
         0 if uses_arch_decode_policy and not deterministic else num_splits
