@@ -80,7 +80,7 @@ register_kernel(
     KernelSpec(
         op="memory.small_field_copy",
         backend=KernelBackend.JIT,
-        target="sglang.kernels.ops.memory.small_field_copy:small_field_copy",
+        target="sglang.kernels.ops.memory.small_field_copy:SmallFieldCopyPlan",
         capabilities=CUDA_ONLY,
     )
 )
@@ -90,5 +90,13 @@ register_kernel(
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.memory.row_compact:row_compact_bf16",
         capabilities=CUDA_ONLY,
+    )
+)
+
+register_kernel(
+    KernelSpec(
+        op="memory.interleave_rows",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.memory.interleave_rows:interleave_rows",
     )
 )

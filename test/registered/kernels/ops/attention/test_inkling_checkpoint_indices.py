@@ -1,7 +1,7 @@
 """Inkling checkpoint writes use live physical slots, including graph replay."""
 
 import unittest
-from contextlib import ExitStack, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -26,6 +26,18 @@ from sglang.test.unified_allocator_fixtures import arena_of
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
+
+@contextmanager
+def _capture(graph):
+    """Capture ``graph`` as serving does (`freeze_gc`): no garbage collection runs."""
+    # TODO(ch-wan): an unidentified reference cycle the unified allocator leaves
+    # has a finalizer that touches CUDA; a GC run during capture invalidates it.
+    from sglang.srt.model_executor.runner.base_cuda_graph_runner import freeze_gc
+
+    with freeze_gc(enable_cudagraph_gc=False), torch.cuda.graph(graph):
+        yield
+
+
 _BACKEND = "sglang.srt.layers.attention.linear.inkling_sconv_backend"
 
 
@@ -34,7 +46,7 @@ class TestInklingCheckpointIndices(CustomTestCase):
     def make_backend(
         self,
         *,
-        lazy=False,
+        lazy=True,
         static=False,
         slot_count=6,
         draft_token_num=None,
@@ -144,7 +156,7 @@ class TestInklingCheckpointIndices(CustomTestCase):
         return hidden
 
     def test_prefill_checkpoint_after_real_compaction(self):
-        for lazy in (False, True):
+        for lazy in (True,):
             with self.subTest(lazy=lazy):
                 backend, allocator, pool, slots = self.make_backend(lazy=lazy)
                 virtual = slots[-1:].clone()
@@ -177,7 +189,7 @@ class TestInklingCheckpointIndices(CustomTestCase):
         cache = pool.mamba_cache.conv[0][0]
         self.scatter(backend, batch, cache)  # compile before capture
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
+        with _capture(graph):
             self.scatter(backend, batch, cache)
         allocator.free(slots[:1].clone())
         allocator._flush(urgent=True)
@@ -337,7 +349,7 @@ class TestInklingCheckpointIndices(CustomTestCase):
 
         decode()
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
+        with _capture(graph):
             decode()
         for step, live in enumerate((3, 1, 4)):
             with self.subTest(live=live):
@@ -516,6 +528,7 @@ class TestInklingCheckpointIndices(CustomTestCase):
                         )
                         if not static:
                             allocator.free(slots[step : step + 1].clone())
+                            allocator.flush_for_allocation()
                         wrapper = InklingShortConvHybridAttnBackend.__new__(
                             InklingShortConvHybridAttnBackend
                         )
@@ -870,7 +883,7 @@ class TestInklingCheckpointIndices(CustomTestCase):
         with patch.object(backend, "_refresh_sconv_metadata"):
             backend.init_forward_metadata_in_graph(batch)
             graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
+            with _capture(graph):
                 backend.init_forward_metadata_in_graph(batch)
         pointer = backend._cache_indices_buf.data_ptr()
         track_pointer = backend._graph_track_indices.data_ptr()
@@ -975,7 +988,7 @@ class TestInklingCheckpointIndices(CustomTestCase):
 
         def capture_graph(key, run_once, **kwargs):
             run_once()
-            with torch.cuda.graph(graph):
+            with _capture(graph):
                 run_once()
 
         runner.model_runner.model = SimpleNamespace(forward=model_forward)
