@@ -122,6 +122,10 @@ class TestDraftDpSyncMetadata(CustomTestCase):
             [1, 3, 0, 2],
         )
         self.assertEqual(forward_batch.global_num_tokens_cpu, [6, 18, 0, 12])
+        self.assertEqual(forward_batch.global_num_tokens_gpu.tolist(), [6, 18, 0, 12])
+        self.assertEqual(
+            forward_batch.global_num_tokens_for_logprob_gpu.tolist(), [1, 3, 0, 2]
+        )
         # The LOCAL count reuses the proposer's persistent buffer; the GLOBAL
         # count is the invariant every DP rank agrees on.
         self.assertIs(
@@ -133,6 +137,30 @@ class TestDraftDpSyncMetadata(CustomTestCase):
         self.assertEqual(forward_batch.global_num_token_non_padded.dtype, torch.int32)
         self.assertEqual(forward_batch.global_num_token_non_padded_cpu, 6)
         self.assertTrue(forward_batch.can_run_decode_cuda_graph)
+
+    def test_dp_meta_slots_alternate_without_mixing_rows(self):
+        """Each fill must publish its own counts and logprob counts, and a slot
+        may only be rewritten after the fill that used it two steps earlier."""
+        proposer = DraftBlockProposer.__new__(DraftBlockProposer)
+        proposer._dp_meta_host = None
+        proposer._dp_meta_device = None
+        proposer._dp_meta_copied = []
+        proposer._dp_meta_slot = 0
+        steps = [
+            ([6, 18, 0, 12], [1, 3, 0, 2]),
+            ([12, 6, 6, 0], [2, 1, 1, 0]),
+            ([0, 0, 24, 6], [0, 0, 4, 1]),
+        ]
+        staged = []
+        for gnt, gnt_logprob in steps:
+            counts, logprob = proposer._stage_dp_meta(gnt, gnt_logprob, "cpu")
+            self.assertEqual(counts.tolist(), gnt)
+            self.assertEqual(logprob.tolist(), gnt_logprob)
+            staged.append((counts, logprob))
+        self.assertNotEqual(staged[0][0].data_ptr(), staged[1][0].data_ptr())
+        self.assertEqual(staged[0][0].data_ptr(), staged[2][0].data_ptr())
+        self.assertEqual(staged[0][1].data_ptr(), staged[2][1].data_ptr())
+        self.assertEqual(staged[1][0].tolist(), steps[1][0])
 
 
 class TestBusyIdleGraphKeyIdentity(CustomTestCase):
