@@ -350,6 +350,100 @@ class TestDcpDraftHeadTransfer(unittest.TestCase):
             self.assertFalse(dst_buffers[1000000].any())
 
 
+class TestDcpDsaIndexKTransfer(unittest.TestCase):
+    def test_moves_keys_and_scales_to_owner_rows(self):
+        page_size, value_bytes, scale_bytes, dcp = 64, 8, 4, 8
+        page_bytes = page_size * (value_bytes + scale_bytes)
+        tokens = 300
+        src_pages = np.array([1, 3, 4, 7, 9], dtype=np.int32)
+        logical = np.arange(tokens)
+        src_rows = src_pages[logical // page_size] * page_size + logical % page_size
+        keys = (np.arange(tokens * value_bytes) % 251).astype(np.uint8)
+        keys = keys.reshape(tokens, value_bytes)
+        scales = (np.arange(tokens * scale_bytes) % 241 + 1).astype(np.uint8)
+        scales = scales.reshape(tokens, scale_bytes)
+
+        def write(buf, rows, k, sc):
+            pages = buf.reshape(-1, page_bytes)
+            for row, key, scale in zip(rows, k, sc):
+                page, off = divmod(int(row), page_size)
+                pages[page, off * value_bytes : (off + 1) * value_bytes] = key
+                start = page_size * value_bytes + off * scale_bytes
+                pages[page, start : start + scale_bytes] = scale
+
+        for dst_rank in range(dcp):
+            with self.subTest(dst_rank=dst_rank):
+                layers = {500000: None, 600000: None}
+                src_buffers = {10000: np.zeros(1024 * 8, dtype=np.uint8)}
+                for base in layers:
+                    src = np.zeros(16 * page_bytes, dtype=np.uint8)
+                    write(src, src_rows, keys, scales)
+                    src_buffers[base] = src
+                dst_buffers = {
+                    base: np.zeros(8 * page_bytes, dtype=np.uint8)
+                    for base in (1000000, 5000000, 6000000)
+                }
+
+                def transfer(session, blocks):
+                    for src, dst, size in blocks:
+                        src_base = max(b for b in src_buffers if b <= src)
+                        dst_base = max(b for b in dst_buffers if b <= dst)
+                        dst_buffers[dst_base][
+                            dst - dst_base : dst - dst_base + size
+                        ] = src_buffers[src_base][
+                            src - src_base : src - src_base + size
+                        ]
+                    return 0
+
+                manager = SimpleNamespace(
+                    is_mla_backend=False,
+                    kv_args=SimpleNamespace(
+                        page_size=page_size,
+                        kv_layer_ids=[],
+                        kv_data_ptrs=[10000],
+                        num_draft_entries=0,
+                        engine_rank=0,
+                        dsa_index_k_token_bytes=(value_bytes, scale_bytes),
+                    ),
+                    attn_tp_size=8,
+                    max_transfer_batch_indices=0,
+                    enable_custom_mem_pool=False,
+                    _transfer_data=transfer,
+                    _await_transfer_futures=lambda futures: max(
+                        f.result() for f in futures
+                    ),
+                    get_mla_kv_ptrs_with_pp=lambda src, dst, *_: (src, dst, len(src)),
+                )
+                manager._dsa_index_k_dcp_params = lambda *args, **kwargs: (
+                    MooncakeKVManager._dsa_index_k_dcp_params(manager, *args, **kwargs)
+                )
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    result = MooncakeKVManager.send_kvcache_dcp(
+                        manager,
+                        "session",
+                        src_pages,
+                        [1000000],
+                        np.array([2], dtype=np.int32),
+                        dcp_token_item_lens=[8],
+                        dst_dcp_size=dcp,
+                        dst_dcp_rank=dst_rank,
+                        src_page_offset=0,
+                        decode_prefix_len=0,
+                        num_kv_tokens=tokens,
+                        executor=executor,
+                        dst_layer_ids=[],
+                        dsa_index_k=([500000, 600000], [5000000, 6000000], page_bytes),
+                    )
+                self.assertEqual(result, 0)
+                owned = np.arange(dst_rank, tokens, dcp)
+                expected = np.zeros(8 * page_bytes, dtype=np.uint8)
+                write(
+                    expected, 2 * page_size + owned // dcp, keys[owned], scales[owned]
+                )
+                for base in (5000000, 6000000):
+                    np.testing.assert_array_equal(dst_buffers[base], expected)
+
+
 class TestDcpPackLifetime(CustomTestCase):
     def test_failed_transfer_drains_before_pack_buffer_reuse(self):
         """A failed layer must not release the pack buffer while another transfer reads it."""

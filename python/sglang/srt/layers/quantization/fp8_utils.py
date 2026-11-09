@@ -1922,6 +1922,18 @@ def _unpack_ue8m0_scale_for_triton(
     return sf_fp32
 
 
+def fp8_input_quant_format(weight: torch.Tensor, num_tokens: int) -> str:
+    """What a fused producer may quantize the input of an MXFP8-converted linear (one
+    with the rowwise copy) to: "fp8_per_token" as ``aiter.per_token_quant_hip`` for the
+    rowwise GEMM, "fp8" as ``aiter_per1x128_quant`` for the bpreshuffle block GEMM, or
+    "" when aiter_w8a8_block_fp8_linear must quantize it itself."""
+    if getattr(weight, "_ptpc_weight", None) is None:
+        return ""
+    if num_tokens <= MXFP8_DENSE_PTPC_DECODE_MAX_M:
+        return "fp8_per_token"
+    return "fp8" if _use_aiter_bpreshuffle_gfx95 else ""
+
+
 def aiter_w8a8_block_fp8_linear(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -1941,8 +1953,8 @@ def aiter_w8a8_block_fp8_linear(
 
     # dense linears converted from MXFP8 carry a rowwise-fp8 copy; its ptpc GEMM
     # beats the block-fp8 GEMMs at decode-sized M
+    ptpc_weight = getattr(weight, "_ptpc_weight", None)
     if input_scale is None:
-        ptpc_weight = getattr(weight, "_ptpc_weight", None)
         if (
             ptpc_weight is not None
             and input_2d.shape[0] <= MXFP8_DENSE_PTPC_DECODE_MAX_M
@@ -1954,6 +1966,15 @@ def aiter_w8a8_block_fp8_linear(
                 bias=bias,
             )
             return out.to(input.dtype).view(*output_shape)
+    elif ptpc_weight is not None and input_scale.shape == (input_2d.shape[0], 1):
+        # quantized per token by a fused producer, see fp8_input_quant_format
+        out = apply_fp8_ptpc_linear(
+            input=(input_2d, input_scale),
+            weight=ptpc_weight,
+            weight_scale=weight._ptpc_scale,
+            bias=bias,
+        )
+        return out.view(*output_shape)
 
     # DeepSeek-V4 e8m0 mxscale route (SGLANG_DSV4_DENSE_MXSCALE): same
     # (16, 16)-preshuffled weight, e8m0 copy of its scale. A producer that
@@ -2781,6 +2802,11 @@ def use_aiter_bpreshuffle_gemm(output_size: int) -> bool:
     return _use_aiter and output_size % 64 == 0
 
 
+# Measured on SM120: a tuned bmm_fp8 + add beat the bias epilogue by up to 1.6x
+# at small M and by 7% at 4096 rows; from 8192 rows on, the epilogue always won.
+_FP8_BIAS_EPILOGUE_MIN_ROWS = 8192
+
+
 def apply_fp8_linear_bmm_flashinfer(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -2810,9 +2836,22 @@ def apply_fp8_linear_bmm_flashinfer(
     else:
         qinput, x_scale = static_quant_fp8(input_2d, input_scale, repeat_scale=False)
         output_dtype = input.dtype
-    output = flashinfer_bmm_fp8(qinput, weight, x_scale, weight_scale, output_dtype)
-    if bias is not None:
-        output = output + bias
+    if bias is not None and qinput.shape[0] >= _FP8_BIAS_EPILOGUE_MIN_ROWS:
+        # bmm_fp8 takes no bias; torch._scaled_mm runs the same cuBLASLt GEMM
+        # and adds the bias in its epilogue instead of in a separate kernel.
+        output = torch._scaled_mm(
+            qinput,
+            weight,
+            out_dtype=output_dtype,
+            scale_a=x_scale,
+            scale_b=weight_scale,
+            bias=bias,
+            use_fast_accum=True,  # bmm_fp8 sets cuBLASLt fast accumulation too
+        )
+    else:
+        output = flashinfer_bmm_fp8(qinput, weight, x_scale, weight_scale, output_dtype)
+        if bias is not None:
+            output = output + bias
     return output.view(*output_shape)
 
 
