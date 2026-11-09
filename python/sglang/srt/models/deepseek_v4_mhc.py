@@ -773,6 +773,59 @@ def mega_closed_seam(hc: HcSubLayer, state: HcState, extend: bool) -> HcState:
     return opened
 
 
+def mega_draft_enabled(
+    attn: HcSubLayer, ffn: HcSubLayer, residual: torch.Tensor
+) -> bool:
+    """Whether a DSpark draft stage takes its seams through Mega-mHC
+    (SGLANG_OPT_DSV41_MEGA_MHC_DRAFT, gfx950)."""
+    return (
+        _is_hip
+        and envs.SGLANG_OPT_DSV41_MEGA_MHC_DRAFT.get()
+        and _can_use_mega_mhc(attn.cfg)
+        and residual.shape[0] > 0
+        and all(
+            make_boundary(hc.norm, accepts_mxfp8=False).norm_fusable
+            for hc in (attn, ffn)
+        )
+    )
+
+
+def mega_draft_open(
+    hc: HcSubLayer, residual: torch.Tensor, pre: Optional[torch.Tensor]
+) -> HcState:
+    """A draft stage's attention seam in one no-post launch: the sublayer input
+    ``norm(sum_k pre[k] * R[k])`` (stream 0 without a pre, as `_combine`) and the
+    triplet from ``residual``, which `mix_stats` would compute."""
+    from aiter.ops.flydsl import flydsl_mega_mhc
+
+    _, post_mix, comb, normalized, next_pre = flydsl_mega_mhc(
+        residual,
+        hc.fn,
+        hc.scale,
+        hc.base,
+        hc.cfg.rms_eps,
+        hc.cfg.eps,
+        hc.cfg.eps,
+        2.0,
+        hc.cfg.sinkhorn_iters,
+        pre,
+        norm_weight=hc.norm.weight,
+        norm_eps=hc.norm.variance_epsilon,
+        out_dtype="bf16",
+    )
+    if next_pre.ndim == 3:
+        next_pre = next_pre.squeeze(-1)
+    stats = (next_pre, post_mix.squeeze(-1), comb)
+    return HcState(residual, pre, HcNormed(normalized), stats)
+
+
+def mega_draft_post(y: torch.Tensor, opened: HcState, nxt: HcSubLayer) -> HcState:
+    """The attention post of an opened draft seam, with the FFN's triplet, combine and
+    norm, in one launch."""
+    pre, post_mix, comb = opened.stats
+    return _hip_flydsl_mega_mhc(y, opened.residual, pre, post_mix, comb, nxt)
+
+
 def _can_use_decode_post_combine(cfg: HcConfig, rows: int) -> bool:
     return (
         0 < rows <= DECODE_POST_COMBINE_MAX_ROWS

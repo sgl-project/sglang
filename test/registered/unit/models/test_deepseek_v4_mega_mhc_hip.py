@@ -279,6 +279,145 @@ class TestHipBoundaryExtend(unittest.TestCase):
                     self.assertEqual(seen, [extend, extend, extend])
 
 
+class TestHipDraftMega(unittest.TestCase):
+    def _hc(self, hidden):
+        norm = _Norm()
+        norm.weight = torch.ones(hidden, dtype=torch.bfloat16)
+        norm.cast_x_before_out_mul = False
+        norm.variance_size_override = None
+        return mhc.HcSubLayer(
+            cfg=_cfg(hidden=hidden),
+            fn=torch.zeros(1),
+            scale=torch.zeros(1),
+            base=torch.zeros(1),
+            norm=norm,
+        )
+
+    def _stage(self, rows=2, hidden=5120):
+        stage = deepseek_v4_platform_stage.NonCudaDSparkMixin()
+        stage.hc_cfg = _cfg(hidden=hidden)
+        stage.hc_stats_stream = None
+        stage.attn_hc, stage.ffn_hc = self._hc(hidden), self._hc(hidden)
+        stage.self_attn = mock.MagicMock()
+        stage.self_attn.return_value = torch.full((rows, hidden), 7.0)
+        stage._run_ffn = mock.Mock(return_value=torch.full((rows, hidden), 8.0))
+        stage.hc_post = mock.Mock(return_value=torch.full((rows, 4, hidden), 9.0))
+        return stage
+
+    def _run(self, stage, residual, prev_pre, *, flag=True, prefill=True, hip=True):
+        rows, hidden = residual.shape[0], residual.shape[-1]
+        # (post_mix, comb, normalized, next_pre) of the no-post launch
+        nopost = (
+            torch.full((rows, 4, 1), 1.0),
+            torch.full((rows, 4, 4), 2.0),
+            torch.full((rows, hidden), 3.0),
+            torch.full((rows, 4), 4.0),
+        )
+        # (updated, next_post, next_comb, normalized, next_pre) of the post launch
+        post = (
+            torch.full((rows, 4, hidden), 5.0),
+            torch.full((rows, 4, 1), 6.0),
+            torch.full((rows, 4, 4), 7.0),
+            torch.full((rows, hidden), 8.0),
+            torch.full((rows, 4), 9.0),
+        )
+        calls = []
+
+        def fake_flydsl(residual, *args, **kwargs):
+            calls.append((residual, args, kwargs))
+            return post if "sublayer_out" in kwargs else (residual, *nopost)
+
+        flydsl = types.ModuleType("aiter.ops.flydsl")
+        flydsl.flydsl_mega_mhc = fake_flydsl
+        ops = types.ModuleType("aiter.ops")
+        ops.flydsl = flydsl
+        aiter = types.ModuleType("aiter")
+        aiter.ops = ops
+        with (
+            envs.SGLANG_OPT_DSV41_MEGA_MHC_DRAFT.override(flag),
+            envs.SGLANG_OPT_DSV41_MEGA_MHC_PREFILL.override(prefill),
+            mock.patch.object(mhc, "_is_hip", hip),
+            mock.patch.object(mhc, "_is_gfx95_supported", True),
+            mock.patch.dict(
+                sys.modules,
+                {"aiter": aiter, "aiter.ops": ops, "aiter.ops.flydsl": flydsl},
+            ),
+        ):
+            out = stage._forward_hc_pre_from_prev(
+                torch.arange(rows), residual, mock.Mock(), prev_pre
+            )
+        return out, calls, nopost, post
+
+    def test_stage_runs_two_launches(self):
+        stage = self._stage()
+        residual = torch.zeros(2, 4, 5120)
+        prev_pre = torch.full((2, 4), 0.25)
+        (out, next_pre), calls, nopost, post = self._run(stage, residual, prev_pre)
+
+        self.assertEqual(len(calls), 2)
+        (r0, a0, k0), (r1, a1, k1) = calls
+        # the attention seam: no post, the carried pre, the attention's weights
+        self.assertIs(r0, residual)
+        self.assertIs(a0[0], stage.attn_hc.fn)
+        self.assertIs(a0[8], prev_pre)
+        self.assertNotIn("sublayer_out", k0)
+        self.assertIs(k0["norm_weight"], stage.attn_hc.norm.weight)
+        self.assertTrue(torch.equal(stage.self_attn.call_args.args[1], nopost[2]))
+        # the attention post with the FFN seam: the attention's mixes, the FFN's weights
+        self.assertIs(r1, residual)
+        self.assertIs(a1[0], stage.ffn_hc.fn)
+        self.assertTrue(torch.equal(a1[8], nopost[3]))
+        self.assertIs(k1["sublayer_out"], stage.self_attn.return_value)
+        self.assertTrue(torch.equal(k1["post_layer_mix"], nopost[0]))
+        self.assertIs(k1["comb_res_mix"], nopost[1])
+        self.assertIs(k1["norm_weight"], stage.ffn_hc.norm.weight)
+        # the FFN reads the second launch's input; its plain post closes the stage
+        self.assertTrue(torch.equal(stage._run_ffn.call_args.args[0], post[3]))
+        x, res, post_mix, comb = stage.hc_post.call_args.args
+        self.assertIs(x, stage._run_ffn.return_value)
+        self.assertIs(res, post[0])
+        self.assertTrue(torch.equal(post_mix, post[1].squeeze(-1)))
+        self.assertIs(comb, post[2])
+        self.assertIs(out, stage.hc_post.return_value)
+        self.assertTrue(torch.equal(next_pre, post[4]))
+
+    def test_first_stage_takes_identity_pre(self):
+        _, calls, _, _ = self._run(self._stage(), torch.zeros(2, 4, 5120), None)
+        self.assertIsNone(calls[0][1][8])
+
+    def test_plain_stage_where_mega_does_not_serve(self):
+        cases = {
+            "switch off": ({"flag": False}, 2, 5120, False),
+            "prefill switch off": ({"prefill": False}, 2, 5120, False),
+            "not HIP": ({"hip": False}, 2, 5120, False),
+            "no rows": ({}, 0, 5120, False),
+            "other width": ({}, 2, 4096, False),
+            "FFN norm not fusable": ({}, 2, 5120, True),
+        }
+        for name, (kwargs, rows, hidden, ffn_cast) in cases.items():
+            with self.subTest(name):
+                stage = self._stage(rows, hidden)
+                stage.ffn_hc.norm.cast_x_before_out_mul = ffn_cast
+                combine = mock.Mock(return_value=torch.zeros(rows, hidden))
+                stats = mock.Mock(
+                    return_value=(
+                        torch.zeros(rows, 4),
+                        torch.zeros(rows, 4),
+                        torch.zeros(rows, 4, 4),
+                    )
+                )
+                with (
+                    mock.patch.object(mhc, "combine", combine),
+                    mock.patch.object(mhc, "mix_stats", stats),
+                ):
+                    _, calls, _, _ = self._run(
+                        stage, torch.zeros(rows, 4, hidden), None, **kwargs
+                    )
+                self.assertEqual(calls, [])
+                self.assertEqual(combine.call_count, 2)
+                self.assertEqual(stats.call_count, 2)
+
+
 class TestFusedBoundaryRouting(unittest.TestCase):
     def test_routing(self):
         layer = mock.Mock(hc_pre_from_prev_sublayer=True, hc_mult=4)
