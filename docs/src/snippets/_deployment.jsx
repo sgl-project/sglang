@@ -119,6 +119,9 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
     return <div style={{padding: 12, color: "#b91c1c"}}>Deployment: missing <code>config</code> prop</div>;
   }
 
+  // ==== COMMAND ENGINE ====
+  // docs/scripts/export_commands.mjs runs this block in Node; keep it free of JSX and React.
+
   // ==== 1. Hardware catalog (shared across cookbooks) ====
   // VRAM is per-GPU on-chip memory, not per-module.
   const AMD_RDMA_DOCKER_FLAGS = [
@@ -949,7 +952,9 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
         // (--dist-init-addr) and NCCL/GLOO traffic are reachable; single-node
         // just maps the serve port.
         hostNetwork ? "  --network host" : `  -p ${servePort}:${servePort}`,
-        ...((multinode || cell.pd) ? fabricFlagsOf(sel.hw).map((f) => "  " + f) : []),
+        // A single-node PD role on the host network moves KV over RDMA too.
+        ...((multinode || cell.pd || (hostNetwork && PD_SERVE_PORTS[sel.pdMode] !== undefined))
+          ? fabricFlagsOf(sel.hw).map((f) => "  " + f) : []),
         // The NPU device block already mounts ~/.cache/.
         ...(vendorOf(sel.hw) === "npu"
           ? [] : ["  -v ~/.cache/huggingface:/root/.cache/huggingface"]),
@@ -992,6 +997,7 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
     }
     return cmd;
   };
+  // ==== end COMMAND ENGINE ====
 
   // Accuracy labels: [field-key, display-label, unit]. Declared per model via
   // `config.accuracyLabels` — the engine ships NO default eval set. A config
