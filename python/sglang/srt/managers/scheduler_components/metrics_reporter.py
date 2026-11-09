@@ -32,6 +32,7 @@ from sglang.srt.observability.metrics_collector import (
     SchedulerStats,
     compute_routing_key_stats,
 )
+from sglang.srt.observability.scheduler_host_sync_logger import SchedulerHostSyncLogger
 from sglang.srt.observability.scheduler_stage_metrics import (
     SchedulerStageMetricsRecorder,
 )
@@ -46,7 +47,6 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.device_timer import DeviceTimer
-from sglang.srt.utils.scheduler_host_sync_logger import SchedulerHostSyncLogger
 from sglang.srt.utils.scheduler_status_logger import SchedulerStatusLogger
 
 if TYPE_CHECKING:

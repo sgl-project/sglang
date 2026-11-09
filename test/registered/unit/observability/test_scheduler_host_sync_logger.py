@@ -14,14 +14,14 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.observability import scheduler_host_sync_logger as host_sync_module
+from sglang.srt.observability.scheduler_host_sync_logger import SchedulerHostSyncLogger
 from sglang.srt.observability.scheduler_stage_metrics import (
     SCHEDULER_STAGE_GET_NEXT_BATCH,
     SCHEDULER_STAGE_PROCESS_BATCH_RESULT,
     SCHEDULER_STAGE_RUN_BATCH,
     SchedulerStageMetricsRecorder,
 )
-from sglang.srt.utils import scheduler_host_sync_logger as host_sync_module
-from sglang.srt.utils.scheduler_host_sync_logger import SchedulerHostSyncLogger
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
