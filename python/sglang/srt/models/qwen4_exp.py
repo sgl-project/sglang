@@ -252,6 +252,14 @@ def _prepare_ple_batch(
 ) -> Optional[_PLEBatch]:
     """Prepare the token layout and the shared N-gram history once per forward."""
 
+    # FIXME: this runs inside the model forward and reads the request pool's
+    # Mamba indices and the state slots' virtual-to-physical map after the
+    # decode graph's declared shared-read end (`in_graph_metadata_prep_done`).
+    # The scheduler's write-after-read barrier releases the schedule stream at
+    # that end, so a request row or state slot reused while this forward runs
+    # can be rewritten before it is read here. Declare a later read end, or move
+    # these reads into metadata preparation.
+
     if forward_batch.tbo_parent_token_range is not None:
         raise NotImplementedError("Qwen4 PLE is not compatible with two-batch overlap")
     spec_algorithm = forward_batch.spec_algorithm

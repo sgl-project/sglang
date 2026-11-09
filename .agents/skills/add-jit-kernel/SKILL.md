@@ -580,13 +580,15 @@ if not current_arch().is_sm_at_least(9):
 
 Query the GPU through `sglang.kernels.arch.current_arch()` (`.is_sm(...)`, `.is_sm_at_least(...)`, `.num_sms`, `.supports_pdl`, `.smem_per_block_optin`, and `.cuda` / `.hip` to narrow by platform), not `torch.cuda.get_device_*` directly. Call it at call time, not import time.
 
+Name the family the kernel was built for. `is_sm_at_least(10)` also admits SM120/SM121, which have no tcgen05/TMEM, so an SM100-only kernel gates on `is_sm(10)`; an SM120 kernel on `is_sm(12)` (SM121 included). Use `is_sm_at_least` only when every later architecture really supports the path.
+
 ---
 
 ## Step 4: Write tests (required)
 
 JIT kernel correctness tests and benchmarks live under `test/registered/kernels/ops/<group>/` and `test/registered/kernels/benchmark/<group>/`, mirroring the wrapper's group under `python/sglang/kernels/ops/` (NOT inside the `sglang` package -- a `register_*_ci(...)` call anywhere under `python/sglang/` is rejected by the `check-no-registered-tests-in-package` pre-commit hook). Only their test-only helpers (e.g. `benchmark/marker.py`) stay alongside the kernel source under `python/sglang/kernels/jit/` and are imported by absolute path. **CI does not run `pytest` in those directories directly.** The unified runner `test/run_suite.py` discovers every `test_*.py` and `bench_*.py` under `test/registered/`, collects `register_*_ci(...)` calls by **statically parsing each file's AST**, and executes the selected suite. Every test file must register at least one CUDA entry or the collector fails its sanity check.
 
-- **PR / per-commit CUDA suites** (see `test/run_suite.py` → `PER_COMMIT_SUITES`): JIT unit tests use `base-b-kernel-unit-test-1-gpu-large` on H100 and `base-b-kernel-unit-test-4-gpu-b200` on B200/SM100 paths (see `.github/workflows/pr-test-jit-kernel.yml`). Multi-GPU JIT tests use `base-b-kernel-unit-test-8-gpu-h200`.
+- **PR / per-commit CUDA suites** (see `test/run_suite.py` → `PER_COMMIT_SUITES`): JIT unit tests use `base-b-kernel-unit-test-1-gpu-large` on H100 and `base-b-kernel-unit-test-4-gpu-b200` on B200/SM100 paths (see `.github/workflows/pr-test-jit-kernel.yml`).
 - **Nightly kernel suite**: register with `stage="nightly"` plus the `runner_config` of the machine it needs (e.g. `1-gpu-large`), giving the `nightly-test-1-gpu-large` suite. `.github/workflows/nightly-test-nvidia.yml` sets `SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1` for the whole nightly run, so the expanded parameter grids apply automatically (see `python/sglang/kernels/jit/utils/common.py` → `should_run_full_tests` / `get_ci_test_range`). There is no separate kernel-only nightly job: every nightly test on one machine type shares that machine's suite.
 
 Registration pattern (module level, **literal** `est_time`, `stage`, and `runner_config` values — required for AST parsing):

@@ -33,7 +33,7 @@ from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
 from sglang.srt.layers.cp.base import disable_cp_strategy
 from sglang.srt.managers.schedule_batch import set_mamba_track_indices_from_reqs
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
-from sglang.srt.mem_cache.kv.router import STATE_PART
+from sglang.srt.mem_cache.kv.decl import STATE_PART
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
@@ -50,8 +50,8 @@ from sglang.srt.utils import (
     next_power_of_2,
 )
 from sglang.srt.utils.async_probe import maybe_detect_oob
-from sglang.srt.utils.common import async_d2h as _async_d2h
 from sglang.srt.utils.common import fast_topk
+from sglang.srt.utils.device import async_d2h as _async_d2h
 from sglang.srt.utils.nvtx_utils import profile_range
 
 _is_cuda = is_cuda()
@@ -1186,6 +1186,15 @@ def commit_mamba_states_after_verify(
     if mambaish_config(model_runner.model_config) is None:
         return
 
+    # FIXME: when the target runner is the forward's last shared reader, this
+    # ReplaySSM branch reads the request pool's Mamba indices and the state map
+    # after the declared shared-read end. The schedule stream may then reuse and
+    # rewrite a finished request's row or state slot while this commit still
+    # reads it. Declare a later read end for this path, or gather the indices
+    # during metadata preparation. The same holds for EAGLE v2's post-verify
+    # graphs: they replay this commit on a side stream joined only after draft
+    # extend, while draft extend's declared read end (pre-, in- or post-replay)
+    # is recorded before that join; only its whole-forward fallback covers it.
     # ReplaySSM spec-verify path (Part B of #28511): the accepted drafts already
     # live in the per-slot circular ring (written during verify). Instead of
     # scattering an intermediate full SSM state into `temporal`, advance the
