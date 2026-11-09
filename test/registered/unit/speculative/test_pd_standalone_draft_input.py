@@ -15,6 +15,7 @@ from sglang.srt.speculative import standalone_disaggregation
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -42,7 +43,7 @@ def _batch(reqs, *, overlap=False):
     )
 
 
-class TestPdStandaloneDraftInput(unittest.TestCase):
+class TestPdStandaloneDraftInput(CustomTestCase):
     def build(self, batch, future_map=None):
         bonus_tokens = torch.tensor([4, 8][: len(batch.reqs)])
         with patch.object(

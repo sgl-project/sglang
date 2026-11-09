@@ -42,12 +42,14 @@ from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
 
-class TestPdStandaloneDecodeCleanup(unittest.TestCase):
+class TestPdStandaloneDecodeCleanup(CustomTestCase):
     def setUp(self):
+        super().setUp()
         self.enterContext(
             get_context().override_server_args(
                 speculative_algorithm="STANDALONE",
