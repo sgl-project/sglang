@@ -34,7 +34,8 @@ register_cuda_ci(
 )
 register_amd_ci(
     est_time=90,
-    suite="stage-b-test-1-gpu-small-amd",
+    suite="nightly-amd-1-gpu",
+    nightly=True,
 )
 
 BASE_MODEL = "meta-llama/Llama-2-7b-hf"
