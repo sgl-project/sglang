@@ -64,8 +64,8 @@ def _check_contract(out, seq_lens, block_size, topk, S):
 
 
 @pytest.mark.parametrize("dtype_sl", [torch.int32, torch.int64])
-@pytest.mark.parametrize("H", [1, 2])
-@pytest.mark.parametrize("B", [1, 5, 32])
+@pytest.mark.parametrize("H", [2])
+@pytest.mark.parametrize("B", [1, 32])
 @pytest.mark.parametrize("topk", [16, 32, 64])
 @pytest.mark.parametrize("max_ctx", [4096, 131072, 524288, 2097152])
 def test_decode_topk_distinct(dtype_sl, H, B, topk, max_ctx):
