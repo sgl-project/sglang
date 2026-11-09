@@ -32,6 +32,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     SidecarPoolSpec,
 )
+from sglang.srt.mem_cache.kv.plan import TREE_WINDOW
 from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
@@ -109,8 +110,15 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
         )
         cache.sidecar_pool_specs = []
         cache.components = {}
+        cache._family_slot_ids = {}
         scheduler.tree_cache = cache
         return scheduler
+
+    @staticmethod
+    def _attach_window(scheduler, slot, full_window_pages):
+        cache = scheduler.tree_cache
+        cache.components[slot] = SimpleNamespace(full_window_pages=full_window_pages)
+        cache._family_slot_ids[TREE_WINDOW] = slot
 
     def test_physical_primary_and_components_match_actual_write_keys(self):
         store = self._store(registered=(PoolName.SWA, PoolName.MAMBA, PoolName.INDEXER))
@@ -120,9 +128,7 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
         mamba.temporal_state_elem_size = 1
         mamba.get_page_buffer_meta = self._host_pool(3).get_page_buffer_meta
         scheduler = self._scheduler(store)
-        scheduler.tree_cache.components[ComponentType.SWA] = SimpleNamespace(
-            full_window_pages=3
-        )
+        self._attach_window(scheduler, ComponentType.SWA, 3)
         scheduler.tree_cache.sidecar_pool_specs = [
             _sidecar(PoolName.INDEXER, PoolHitPolicy.ALL_PAGES)
         ]
@@ -188,9 +194,7 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
                 store.is_mla_backend = mla
                 store.registered_pools[PoolName.SWA].v_buffer = object()
                 scheduler = self._scheduler(backend, hierarchical=hierarchical)
-                scheduler.tree_cache.components[ComponentType.SWA] = SimpleNamespace(
-                    full_window_pages=2
-                )
+                self._attach_window(scheduler, ComponentType.SWA, 2)
                 reply = scheduler.get_hicache_l3_cache_layout(GetHiCacheL3LayoutReq())
                 self.assertEqual(
                     reply.layout, scheduler.get_init_info()["hicache_object_layout"]
@@ -201,6 +205,22 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
                 )
                 if not reply.layout["enabled"]:
                     self.assertTrue(reply.layout["reason"])
+
+    def test_window_named_by_its_sub_pool_reports_its_trailing_pages(self):
+        """A unified window's slot is named by its sub-pool, not `SWA`; the
+        layout still finds it by family and reports its window."""
+        store = self._store(registered=(PoolName.SWA,))
+        store.registered_pools[PoolName.SWA].v_buffer = object()
+        scheduler = self._scheduler(store)
+        self._attach_window(scheduler, ComponentType.of("window_4096"), 4)
+
+        layout = scheduler.get_hicache_l3_cache_layout(GetHiCacheL3LayoutReq()).layout
+        self.assertTrue(layout["enabled"])
+        (window,) = [
+            p for p in layout["hicache_object_layout"]["pools"] if p["pool"] == "swa"
+        ]
+        self.assertEqual(window["hit_policy"], "trailing_pages")
+        self.assertEqual(window["trailing_pages"], 4)
 
     def test_cache_without_controller_does_not_break_startup(self):
         """Pure-SWA and unattached caches must return an unavailable layout."""
