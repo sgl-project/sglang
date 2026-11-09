@@ -580,5 +580,147 @@ class TestHiSparseSpec(CustomTestCase):
             )
 
 
+@pytest.mark.parametrize("item_bytes", [656, 1152])
+@pytest.mark.parametrize("use_graph", [False, True])
+def test_shared_hicache_union_deduplicates_and_preserves_resident_kv(
+    item_bytes, use_graph
+):
+    state = _make_state(
+        num_reqs=3,
+        hot_buffer_size=4096,
+        page_size=1,
+        scratch_size=4096,
+        seq_len=20000,
+        item_words=item_bytes // 8,
+        metadata_occurrences=8192,
+    )
+    storage = torch.empty(
+        (20000, 3, item_bytes // 8), dtype=state.host_cache.dtype, pin_memory=True
+    )
+    host = storage[:, 1]
+    host.copy_(state.host_cache)
+    device = torch.cat(
+        (
+            state.device_buffer,
+            torch.zeros(
+                (12, item_bytes // 8), dtype=state.device_buffer.dtype, device=DEVICE
+            ),
+        )
+    )
+    device_locs = torch.full((3, 20000), -1, dtype=torch.int32, device=DEVICE)
+    for rid in range(3):
+        loc = state.device_buffer.shape[0] + rid
+        device_locs[rid, 7] = loc
+        device[loc] = host[7].to(DEVICE)
+    reqs = torch.tensor([2, 0, 1], dtype=torch.int64, device=DEVICE)
+    real = torch.zeros(1, dtype=torch.int32, device=DEVICE)
+    binding = torch.zeros(2, dtype=torch.int64, device=DEVICE)
+    picks = torch.arange(8192, 10240, dtype=torch.int32, device=DEVICE).repeat(3, 4, 1)
+    lengths = torch.tensor(
+        [12000, 20000, 20000, 20000] * 3, dtype=torch.int32, device=DEVICE
+    )
+    output = torch.full_like(picks, -1)
+    miss_src = torch.empty((3, 8192), dtype=torch.int64, device=DEVICE)
+    miss_dst = torch.empty((3, 8192), dtype=torch.int32, device=DEVICE)
+    miss_count = torch.zeros(3, dtype=torch.int32, device=DEVICE)
+
+    def run(topk=picks, seq_lens=lengths, out=output):
+        load_cache_to_device_buffer_spec_mla(
+            top_k_tokens=topk,
+            device_buffer_tokens=state.device_buffer_tokens,
+            host_cache_locs=state.host_cache_locs,
+            device_buffer_locs=state.device_buffer_locs,
+            host_cache=None,
+            device_buffer=device,
+            top_k_device_locs=out,
+            req_pool_indices=reqs,
+            seq_lens=seq_lens,
+            state=state.swap_state,
+            num_real_reqs=real,
+            device_locs=device_locs,
+            host_binding=binding,
+            miss_src=miss_src,
+            miss_dst=miss_dst,
+            miss_count=miss_count,
+        )
+
+    run()
+    graph = None
+    if use_graph:
+        graph = torch.cuda.CUDAGraph()
+        torch.cuda.synchronize()
+        with torch.cuda.graph(graph):
+            run()
+    binding.copy_(
+        torch.tensor(
+            [host.data_ptr(), host.stride(0) * host.element_size()],
+            dtype=torch.int64,
+            device=DEVICE,
+        )
+    )
+    real.fill_(2)
+    padded_before = state.device_buffer_tokens[1].clone()
+    for overflow in (False, True):
+        if overflow:
+            picks.copy_(
+                torch.arange(8192, 16384, dtype=torch.int32, device=DEVICE)
+                .view(1, 4, 2048)
+                .expand(3, -1, -1)
+            )
+            reqs[:2] = reqs[:2].flip(0)
+        picks[:, :, 0] = 7
+        picks[:, 0, -1] = 15000
+        picks[:, 1, -1] = 15000
+        hot_before = state.device_buffer_tokens[:, :4096].cpu().tolist()
+        expected_misses = []
+        for batch, rid in enumerate(reqs[:2].tolist()):
+            selected = {
+                token
+                for step, row in enumerate(picks[batch].cpu().tolist())
+                for token in row
+                if 0 <= token < int(lengths[batch * 4 + step]) and token != 7
+            }
+            expected_misses.append(len(selected - set(hot_before[rid])))
+        graph.replay() if graph is not None else run()
+        torch.cuda.synchronize()
+        assert miss_count[:2].tolist() == expected_misses
+        assert output[0, 0, -1].item() == -1
+        assert torch.all(output[2] == -1)
+        torch.testing.assert_close(state.device_buffer_tokens[1], padded_before)
+        for batch in range(2):
+            seen = {}
+            for step in range(4):
+                tokens = picks[batch, step].long()
+                valid = tokens < lengths[batch * 4 + step]
+                locs = output[batch, step][valid].long()
+                torch.testing.assert_close(
+                    device[locs].cpu(), host[tokens[valid].cpu()]
+                )
+                for token, loc in zip(tokens[valid].tolist(), locs.tolist()):
+                    assert seen.setdefault(token, loc) == loc
+    for iteration, steps in enumerate((1, 4, 1, 2, 3, 4)):
+        selected = (
+            (
+                (
+                    torch.arange(steps * 2048, dtype=torch.int32, device=DEVICE)
+                    + iteration * 3072
+                )
+                % 20000
+            )
+            .view(1, steps, 2048)
+            .repeat(3, 1, 1)
+        )
+        selected_lens = lengths.view(3, 4)[:, :steps].flatten().contiguous()
+        selected_output = torch.full_like(selected, -1)
+        run(selected, selected_lens, selected_output)
+        torch.cuda.synchronize()
+        for batch in range(2):
+            valid = selected[batch] < selected_lens.view(3, steps)[batch, :, None]
+            torch.testing.assert_close(
+                device[selected_output[batch][valid].long()].cpu(),
+                host[selected[batch][valid].long().cpu()],
+            )
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v", "-s"]))

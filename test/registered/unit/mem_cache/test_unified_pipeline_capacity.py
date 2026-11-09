@@ -2,6 +2,7 @@ import tempfile
 import unittest
 from datetime import timedelta
 
+from sglang.srt.mem_cache.capacity import create_prefill_budget
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -170,10 +171,13 @@ def _build_storage(cfg):
 def _admission(allocator, input_tokens, max_requests):
     tree = NS(
         supports_mamba=lambda: True,
+        supports_prefix_sharing=lambda: True,
+        window_checkpoint_interval=lambda: 0,
+        transfers_in_flight=lambda: False,
         full_evictable_size=lambda: 0,
         mamba_evictable_size=lambda: 0,
     )
-    budget = allocator.create_prefill_budget(tree)
+    budget = create_prefill_budget(allocator, tree)
     admitted = 0
     for _ in range(max_requests):
         fits, _ = budget.check_prefill(
@@ -181,7 +185,6 @@ def _admission(allocator, input_tokens, max_requests):
             total_tokens=input_tokens + 1,
             max_new_tokens=1,
             input_tokens=input_tokens,
-            swa_host_hit_length=0,
             chunk_limit=None,
             state_slots=1,
         )
