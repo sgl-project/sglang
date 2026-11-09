@@ -766,6 +766,67 @@ mod pd_responses_routing_tests {
         }
     }
 
+    /// Cancel the paired request before waiting for either worker's error body.
+    #[tokio::test]
+    async fn test_pd_failure_cancels_peer_before_error_body() {
+        for prefill_fails in [false, true] {
+            let peer = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let rejected = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let peer_url = format!("http://{}", peer.local_addr().unwrap());
+            let rejected_url = format!("http://{}", rejected.local_addr().unwrap());
+            let (started_tx, started_rx) = oneshot::channel();
+            let (cancelled_tx, cancelled_rx) = oneshot::channel();
+            let peer_task = tokio::spawn(async move {
+                let (socket, _) = peer.accept().await.unwrap();
+                let mut socket = BufReader::new(socket);
+                read_responses_post(&mut socket).await;
+                started_tx.send(()).unwrap();
+                assert_eq!(socket.read(&mut [0]).await.unwrap(), 0);
+                cancelled_tx.send(()).unwrap();
+            });
+            let rejected_task = tokio::spawn(async move {
+                let (socket, _) = rejected.accept().await.unwrap();
+                let mut socket = BufReader::new(socket);
+                read_responses_post(&mut socket).await;
+                started_rx.await.unwrap();
+                let body = r#"{"error":{"message":"rejected"}}"#;
+                let headers = format!(
+                    "HTTP/1.1 503 Service Unavailable\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                socket
+                    .get_mut()
+                    .write_all(headers.as_bytes())
+                    .await
+                    .unwrap();
+                // The error cannot finish until the router cancels its peer.
+                cancelled_rx.await.unwrap();
+                socket.get_mut().write_all(body.as_bytes()).await.unwrap();
+            });
+            let mut router = make_pd_router();
+            router.retry_config.max_retries = 0;
+            let (prefill_url, decode_url) = if prefill_fails {
+                (rejected_url, peer_url)
+            } else {
+                (peer_url, rejected_url)
+            };
+            register_workers(&router, prefill_url, decode_url);
+            let request = responses_request(json!({
+                "model": "mock-model", "input": "x", "stream": false
+            }));
+            timeout(Duration::from_secs(3), async {
+                let response = router.route_responses(None, &request, None).await;
+                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+                let body = response.into_body().collect().await.unwrap().to_bytes();
+                assert!(String::from_utf8_lossy(&body).contains("rejected"));
+                peer_task.await.unwrap();
+                rejected_task.await.unwrap();
+            })
+            .await
+            .expect("A failed worker must cancel its peer before reading the error body");
+        }
+    }
+
     /// Detached background responses (`background=true, stream=false`) are
     /// retrieved through the /v1/responses/{id} endpoints, which the PD router
     /// does not implement. They must be rejected deterministically instead of
