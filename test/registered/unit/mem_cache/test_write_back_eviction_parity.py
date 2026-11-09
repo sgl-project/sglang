@@ -24,6 +24,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertParams,
     MatchPrefixParams,
 )
+from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -211,7 +212,7 @@ class _Workload:
                 for _, key in sorted(self.inserted_keys.items())
             )
             state["swa sizes"] = (
-                cache.swa_evictable_size(),
+                cache.window_evictable_size(BaseSWAKVPool.WINDOW_SUB_POOL),
                 self.swa_allocator.swa_available_size(),
                 self.swa_host_pool.available_size(),
             )
@@ -224,14 +225,16 @@ class _Workload:
         key = session.key()
         match = cache.match_prefix(MatchPrefixParams(key=key))
         device_len, host_len = match.device_prefix_len, match.host_hit_length
-        swa_host_len = match.swa_host_hit_length if self.swa else 0
+        window_hits = dict(match.window_host_hit_lengths) if self.swa else {}
+        swa_host_len = max(window_hits.values(), default=0)
         # Lock the hit first: it is not evictable room for the request itself.
         admit_lock = cache.lock(match.last_device_node)
         extend = session.prompt_len - device_len + batch_extend
         if extend > self._full_available() + cache.full_evictable_size() or (
             self.swa
             and extend + WINDOW + PAGE
-            > self.swa_allocator.swa_available_size() + cache.swa_evictable_size()
+            > self.swa_allocator.swa_available_size()
+            + cache.window_evictable_size(BaseSWAKVPool.WINDOW_SUB_POOL)
         ):
             cache.unlock(admit_lock)
             return None
@@ -243,7 +246,7 @@ class _Workload:
             req = SimpleNamespace(
                 rid=f"s{session.sid}",
                 last_node=last_node,
-                swa_host_hit_length=swa_host_len,
+                window_host_hit_lengths=window_hits,
                 mamba_host_hit_length=0,
                 kv=SimpleNamespace(mamba_pool_idx=None),
             )
