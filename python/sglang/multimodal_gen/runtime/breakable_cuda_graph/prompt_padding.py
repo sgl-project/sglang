@@ -260,27 +260,42 @@ def transformer_class_name_matches(current_model: Any, needle: str) -> bool:
 
 
 # --- Model-specific prompt-padder registry ------------------------------- #
-# Each model that needs custom prompt padding registers a (predicate, padder)
-# pair from its own module in ``model_specific_stages`` so the base denoising
-# stage stays model-agnostic. ``padder(call_kwargs, current_model, buckets)``
-# returns the padded kwargs.
+# Each model registers a predicate and prompt padder; it may also provide
+# additional warmup kwargs. This keeps the base denoising stage model-agnostic.
 PromptPadder = Callable[[dict, Any, tuple], dict]
-_PROMPT_PADDERS: list[tuple[Callable[[Any, dict], bool], PromptPadder]] = []
+WarmupKwargsProvider = Callable[[dict, Any], dict | None]
+_PROMPT_PADDERS: list[
+    tuple[Callable[[Any, dict], bool], PromptPadder, WarmupKwargsProvider | None]
+] = []
 
 
 def register_prompt_padder(
-    predicate: Callable[[Any, dict], bool], padder: PromptPadder
+    predicate: Callable[[Any, dict], bool],
+    padder: PromptPadder,
+    *,
+    warmup_kwargs_provider: WarmupKwargsProvider | None = None,
 ) -> None:
-    _PROMPT_PADDERS.append((predicate, padder))
+    _PROMPT_PADDERS.append((predicate, padder, warmup_kwargs_provider))
 
 
 def select_prompt_padder(current_model: Any, call_kwargs: dict) -> PromptPadder | None:
     """Return the registered model-specific padder for ``current_model``, or
     ``None`` to fall back to :func:`pad_masked_prompt_kwargs`."""
     _ensure_model_padders_registered()
-    for predicate, padder in _PROMPT_PADDERS:
+    for predicate, padder, _ in _PROMPT_PADDERS:
         if predicate(current_model, call_kwargs):
             return padder
+    return None
+
+
+def select_warmup_kwargs_provider(
+    current_model: Any, call_kwargs: dict
+) -> WarmupKwargsProvider | None:
+    """Return an optional model-specific additional warmup signature hook."""
+    _ensure_model_padders_registered()
+    for predicate, _, provider in _PROMPT_PADDERS:
+        if provider is not None and predicate(current_model, call_kwargs):
+            return provider
     return None
 
 

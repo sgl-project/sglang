@@ -2533,6 +2533,13 @@ class DenoisingStage(PipelineStage):
                         call_kwargs, current_model=current_model, force_bucket=bucket
                     )
                 )
+            warmup_kwargs_provider = bcg_utils.select_warmup_kwargs_provider(
+                current_model, call_kwargs
+            )
+            if warmup_kwargs_provider is not None:
+                additional_kwargs = warmup_kwargs_provider(call_kwargs, current_model)
+                if additional_kwargs is not None:
+                    runner.capture(**additional_kwargs)
         return runner(
             **self._bcg_pad_prompt_kwargs(call_kwargs, current_model=current_model)
         )
