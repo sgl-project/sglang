@@ -10,19 +10,15 @@ from typing import TYPE_CHECKING
 import torch
 from compressed_tensors.quantization import QuantizationStrategy
 
-from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.sail.quantization.int8_moe_runner import (
+    select_int8_moe_runner_backend,
+)
 from sglang.srt.layers.moe.moe_runner import MoeRunner, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
-from sglang.srt.layers.moe.utils import (
-    MoeRunnerBackend,
-    get_moe_a2a_backend,
-    get_moe_runner_backend,
-)
 from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_scheme import (
     CompressedTensorsMoEScheme,
 )
 from sglang.srt.layers.utils.common import set_weight_attrs
-from sglang.srt.utils import is_sail
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -34,8 +30,6 @@ __all__ = ["CompressedTensorsW8A8Int8MoE"]
 
 logger = logging.getLogger(__name__)
 
-_is_sail = is_sail()
-
 
 class CompressedTensorsW8A8Int8MoE(CompressedTensorsMoEScheme):
     """W8A8 INT8 dynamic-per-token fused MoE scheme for CUDA / SAIL.
@@ -45,8 +39,8 @@ class CompressedTensorsW8A8Int8MoE(CompressedTensorsMoEScheme):
     ``NotImplementedError`` everywhere else. This scheme keeps the identical
     weight layout (per-expert INT8 weights + per-channel FP32 weight scales,
     dynamic per-token activation) but drives the portable Triton / DeepGEMM MoE
-    runner the same way ``W8A8Int8MoEMethod`` in ``quantization/w8a8_int8.py``
-    does.
+    runner through the same ``select_int8_moe_runner_backend`` helper that
+    ``W8A8Int8MoEMethod`` uses.
     """
 
     def __init__(self, weight_quant, input_quant):
@@ -150,27 +144,8 @@ class CompressedTensorsW8A8Int8MoE(CompressedTensorsMoEScheme):
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
-        from sglang.srt.layers import deep_gemm_wrapper
-
         self.moe_runner_config = moe_runner_config
-        # Other platforms keep the existing Triton INT8 path; SAIL DeepEP must use
-        # a compatible runner. The backend selection mirrors
-        # w8a8_int8.W8A8Int8MoEMethod.
-        moe_runner_backend = MoeRunnerBackend.TRITON
-        if _is_sail:
-            requested_backend = get_moe_runner_backend()
-            if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and (
-                get_moe_a2a_backend().is_deepep()
-                or get_moe_a2a_backend().is_mooncake()
-                or requested_backend.is_deep_gemm()
-                or (requested_backend.is_auto() and envs.SGLANG_SAIL_DEEPGEMM_MOE.get())
-            ):
-                moe_runner_backend = MoeRunnerBackend.DEEP_GEMM
-            elif get_moe_a2a_backend().is_deepep() or requested_backend.is_deep_gemm():
-                raise ValueError(
-                    "SAIL INT8 DeepEP requires an available DeepGEMM backend"
-                )
-        self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
+        self.runner = MoeRunner(select_int8_moe_runner_backend(), moe_runner_config)
 
     def apply_weights(
         self,
