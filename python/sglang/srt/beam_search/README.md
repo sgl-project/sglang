@@ -38,6 +38,19 @@ incompatible row layout. Different per-request decode lengths are supported
 within a uniform-width batch: private slot arrays are padded and actual lengths
 are refreshed for each group on every replay.
 
+`SGLANG_BEAM_SHARED_CONTEXT_KERNEL` selects the shared-context attention kernel:
+`default` (the kernel described above), `split_kv` or `stream_k`. Any other value
+raises `ValueError`.
+
+- `split_kv` also splits each group's prompt across CTAs, so that a few groups
+  still fill the GPU, and merges the splits by log-sum-exp.
+- `stream_k` runs a persistent grid that gives every CTA an equal run of all
+  groups' prompt blocks and decode steps.
+- Both replay in the same CUDA graphs as the default kernel.
+- Their tile was tuned on RTX PRO 6000 (SM120) at head_dim 128 and 256 beams.
+  Above head_dim 128 it needs at least 144 KB of shared memory, more than SM86,
+  SM89 and SM120 allow per block.
+
 `SGLANG_ENABLE_BEAM_TRIE_SELECTION_GRAPH=true` separately replays the existing
 compact-trie selection tensor operations. It is off by default. Requests with
 other widths, stop-token handling, or unsupported layouts retain the native
