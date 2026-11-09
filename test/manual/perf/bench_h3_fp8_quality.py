@@ -4,7 +4,7 @@
 Run once without --fp8, then with --fp8 and the same --output directory.
 Frames are compared before lossy file encoding; timings include quantization.
 Audio allows only FP32 roundoff (1e-7 absolute): the unquantized cold/warm
-B300 baseline itself differs by up to 2.8e-8. Video equality remains bit-exact.
+B300 baseline itself differs by up to 2.8e-8. Non-FP8 video comparisons stay bit-exact.
 Requires a CUDA SM100+ GPU with room for the unquantized resident pipeline.
 """
 
@@ -39,6 +39,9 @@ def main():
     parser.add_argument("--steps", type=int, default=5)
     parser.add_argument("--short-edge", type=int, default=768)
     parser.add_argument("--prompt-count", type=int, choices=(1, 2, 3), default=3)
+    parser.add_argument(
+        "--vae-attention", choices=("torch_sdpa", "torch_cudnn_sdpa"), default=None
+    )
     parser.add_argument("--revision", default=None)
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
@@ -53,6 +56,7 @@ def main():
         "cuda": torch.version.cuda,
         "steps": args.steps,
         "short_edge": args.short_edge,
+        "vae_attention": args.vae_attention,
         "model_revision": revision,
         "requests": [],
     }
@@ -65,6 +69,9 @@ def main():
         enable_torch_compile=False,
         warmup_mode="off",
         component_quantizations={"video_vae": "fp8"} if args.fp8 else {},
+        component_attention_backends=(
+            {"video_vae": args.vae_attention} if args.vae_attention else {}
+        ),
     )
     try:
         for index, prompt in enumerate(PROMPTS[: args.prompt_count]):
@@ -114,7 +121,6 @@ def main():
                     "frame_shape": list(frames.shape),
                     "audio_sha256": audio_hash,
                     "wall_s": elapsed,
-                    "generation_s": result.generation_time,
                     "peak_memory_mb": result.peak_memory_mb,
                     "metrics": result.metrics,
                 }
