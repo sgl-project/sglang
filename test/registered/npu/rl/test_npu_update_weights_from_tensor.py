@@ -77,6 +77,10 @@ class TestNpuUpdateWeightsFromTensor(CustomTestCase):
         actual = generation_signature(self.lane_url, PROMPTS)
         self.assertEqual(actual, self.reference, message)
 
+    def _ensure_reference(self):
+        if generation_signature(self.lane_url, PROMPTS) != self.reference:
+            update_full_checkpoint(self.lane_url, MODEL)
+
     def test_01_update_matches_startup_load(self):
         dummy = generation_signature(self.lane_url, PROMPTS)
         self.assertNotEqual(
@@ -99,6 +103,7 @@ class TestNpuUpdateWeightsFromTensor(CustomTestCase):
         self.assertEqual(second, self.reference, "second refit changed the output")
 
     def test_03_update_flattened_bucket(self):
+        self._ensure_reference()
         original = load_checkpoint_tensor(self.tensor_index, TARGET_WEIGHT)
         updated = original.new_full(original.shape, 0.0)
 
@@ -145,6 +150,7 @@ class TestNpuUpdateWeightsFromTensor(CustomTestCase):
         self._assert_serves_reference("second restore did not restore the output")
 
     def test_04_update_subset_changes_output(self):
+        self._ensure_reference()
         original = load_checkpoint_tensor(self.tensor_index, TARGET_WEIGHT)
         updated = original.new_full(original.shape, 0.0)
 
@@ -169,11 +175,8 @@ class TestNpuUpdateWeightsFromTensor(CustomTestCase):
         end_weight_update(self.lane_url)
         self._assert_serves_reference("restoring the subset did not restore the output")
 
-    @unittest.skip(
-        "blocked: a malformed tensor payload closes the server connection instead "
-        "of returning a failed update; enable once the load path reports errors"
-    )
     def test_05_update_failure_is_reported(self):
+        self._ensure_reference()
         bad = torch.zeros(1, dtype=torch.bfloat16, device="npu")
         begin_weight_update(self.lane_url)
         response = requests.post(
