@@ -121,8 +121,9 @@ def _ld_p1(invariant, x, coord):
         num_bits_per_copy=x.element_type.width,
         invariant=True,
     )
-    row = x[coord[:-1] + (None,)]
-    src = cute.make_tensor(row.iterator + coord[-1], cute.make_layout((1,)))
+    src = cute.make_tensor(
+        x.iterator + cute.crd2idx(coord, x.layout), cute.make_layout((1,))
+    )
     dst = cute.make_rmem_tensor(cute.make_layout((1,)), x.element_type)
     cute.copy(atom, src, dst)
     return cutlass.Float32(dst[0])
