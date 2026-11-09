@@ -20,8 +20,12 @@ from sglang.kernels.jit.utils import cache_once, load_jit
 
 WORLD_SIZE = 8
 
-# Keeps each input alive until two calls later, past the next collective's
-# start barrier, so the graph allocator cannot reuse it while peers read it.
+# Peers read y only inside this call's kernel. Every call is followed in the
+# same graph by a TP collective that waits for all ranks (the next call's start
+# barrier; the logits all-gather after the last one), so a rank past it knows
+# every peer finished reading. Holding y until two calls later keeps the graph
+# allocator from giving its block to a kernel captured before that barrier;
+# later reuse, including across replays and graphs, is ordered after it.
 _KEEPALIVE: collections.deque = collections.deque(maxlen=2)
 _EMPTY: dict = {}
 

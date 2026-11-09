@@ -40,7 +40,10 @@ def _next_parity() -> int:
 
 
 def _region_off(ca) -> int:
-    # tail of AITER's 2 x max_size tmp area (its kernels use the head)
+    # Tail of the 2 x max_size tmp area that AITER's IPC CustomAllreduce
+    # (gfx942 / gfx950) allocates after its Signal in the meta buffer; its
+    # 2-stage kernels use only the head (max_size bytes of input per rank).
+    # The symm_mem and VMM (gfx1250) backends have no such area.
     assert ca.max_size >= 32 << 20, "ar_agg needs AITER max_size >= 32 MiB"
     return 2 * ca.max_size - REGION_BYTES
 
@@ -75,6 +78,8 @@ def usable(ca, num_tokens: int, hidden_size: int, nvb: int) -> bool:
         ca is not None
         and not getattr(ca, "disabled", True)
         and hasattr(ca, "_pool")
+        and not getattr(ca, "_use_symm_mem", False)
+        and not getattr(ca, "_use_vmm", False)
         and getattr(ca, "world_size", 0) == WORLD_SIZE
         and getattr(ca, "max_size", 0) >= 32 << 20
         and supported(num_tokens, hidden_size, nvb)
