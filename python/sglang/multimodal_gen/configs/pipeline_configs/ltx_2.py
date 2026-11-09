@@ -47,8 +47,6 @@ def pack_text_embeds(
             Per-layer hidden_states from a text encoder (e.g. `Gemma3ForConditionalGeneration`).
         sequence_lengths (`torch.Tensor of shape `(batch_size,)`):
             The number of valid (non-padded) tokens for each batch instance.
-        device: (`str` or `torch.device`, *optional*):
-            torch device to place the resulting embeddings on
         padding_side: (`str`, *optional*, defaults to `"left"`):
             Whether the text tokenizer performs padding on the `"left"` or `"right"`.
         scale_factor (`int`, *optional*, defaults to `8`):
