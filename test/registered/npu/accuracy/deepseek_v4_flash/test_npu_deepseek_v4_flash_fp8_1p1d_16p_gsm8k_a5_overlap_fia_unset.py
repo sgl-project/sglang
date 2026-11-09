@@ -1,20 +1,22 @@
 import unittest
 
+from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
+    EVALSCOPE,
+    TestNpuAccuracyMultiNodePdSepTestCaseBase,
+)
 from sglang.test.ascend.e2e.test_npu_dual_pass import record_pass1
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
-    BENCHMARK_TOOL_DEFAULT,
     DEEPSEEK_V4_FLASH_DEFAULT_MODEL_PATH,
-    TestNpuPerfMultiNodePdSepTestCaseBase,
 )
 from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(
-    est_time=3600,
-    suite="nightly-perf-4-npu-a5",
+    est_time=7200,
+    suite="nightly-acc-4-npu-a5",
     nightly=True,
 )
 
-CASE_ID = "test_npu_deepseek_v4_flash_fp8_1p1d_4p_in16k_out1k_a5_overlap"
+CASE_ID = "test_npu_deepseek_v4_flash_fp8_1p1d_16p_gsm8k_a5_overlap"
 
 # Pass 1: ASCEND_USE_FIA left unset (image default), CPU seq_lens mirror kept (1).
 _PREFILL_ENVS = {
@@ -67,11 +69,11 @@ _PREFILL_ARGS = [
     "npu",
     "--trust-remote-code",
     "--tp-size",
-    4,
+    16,
     "--pp-size",
     1,
     "--dp-size",
-    1,
+    4,
     "--enable-dp-attention",
     "--enable-dp-lm-head",
     "--moe-a2a-backend",
@@ -105,9 +107,9 @@ _DECODE_ARGS = [
     "npu",
     "--trust-remote-code",
     "--tp-size",
-    4,
+    16,
     "--dp-size",
-    4,
+    16,
     "--enable-dp-attention",
     "--moe-a2a-backend",
     "deepep",
@@ -143,27 +145,22 @@ MODEL_CONFIG = {
 }
 
 
-class TestNPUDeepSeekV4FlashFP8_1P1D_4PIn16kOut1kA5OverlapFiaUnset(
-    TestNpuPerfMultiNodePdSepTestCaseBase
+class TestNPUDeepSeekV4FlashFP8_1P1D_16PGSM8KA5OverlapFiaUnset(
+    TestNpuAccuracyMultiNodePdSepTestCaseBase
 ):
     """Pass 1: SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS=1, ASCEND_USE_FIA unset."""
 
-    benchmark_tool = BENCHMARK_TOOL_DEFAULT
+    benchmark_tool = EVALSCOPE
     model_config = MODEL_CONFIG
-    dataset_name = "random"
-    input_len = 16000
-    output_len = 1000
-    num_prompts = 256
-    max_concurrency = 256
-    random_range_ratio = 1
-    request_rate = float("inf")
-    seed = 1
-    # tpot/output_token_throughput baselines commented out; the +/-2% comparison
-    # against pass 1 is the gate.
+    accuracy = 0.9
+    datasets = ["gsm8k"]
+    limit = 100
+    generation_config = {"max_tokens": 2048, "temperature": 0.01}
+    eval_batch_size = 16
 
-    def test_npu_deepseek_v4_flash_fp8_1p1d_4p_in16k_out1k_a5_overlap_fia_unset(self):
-        """Run pass-1 throughput and record the baseline metrics."""
-        self.run_throughput()
+    def test_npu_deepseek_v4_flash_fp8_1p1d_4p_gsm8k_a5_overlap_fia_unset(self):
+        """Run pass-1 GSM8K and record the baseline accuracy."""
+        self.run_accuracy()
         record_pass1(CASE_ID, self.last_metrics)
 
 
