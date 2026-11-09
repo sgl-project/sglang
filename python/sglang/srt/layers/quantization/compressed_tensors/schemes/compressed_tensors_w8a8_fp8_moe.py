@@ -121,12 +121,15 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                     f"weight quantization block_k = {block_k}."
                 )
 
+        # AITER pads only a concatenated w13 to match its padded w2.
+        concat_w13 = layer.moe_runner_config.is_gated or _use_aiter
         w13_up_dim, w2_down_dim, weight_padded = get_moe_weight_sizes(
             intermediate_size_per_partition,
             is_aiter_moe=_use_aiter,
-            is_concat=True,
+            is_concat=concat_w13,
             is_packed=False,
         )
+        w13_num_shards = 2 if concat_w13 else 1
 
         extra_weight_attrs.update(
             {"weight_padded": weight_padded},
@@ -160,10 +163,10 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
         # WEIGHT_SCALES
         # per-tensor quantization
         if self.weight_quant.strategy == QuantizationStrategy.TENSOR:
-            # Allocate 2 scales for w1 and w3 respectively.
-            # They will be combined to a single scale after weight loading.
+            # One scale per w13 shard; gated layers combine theirs after loading.
             w13_weight_scale = torch.nn.Parameter(
-                torch.ones(num_experts, 2, dtype=torch.float32), requires_grad=False
+                torch.ones(num_experts, w13_num_shards, dtype=torch.float32),
+                requires_grad=False,
             )
             w2_weight_scale = torch.nn.Parameter(
                 torch.ones(num_experts, dtype=torch.float32), requires_grad=False
@@ -188,7 +191,8 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
             w13_weight_scale = torch.nn.Parameter(
                 torch.ones(
                     num_experts,
-                    2 * ((intermediate_size_per_partition + block_n - 1) // block_n),
+                    w13_num_shards
+                    * ((intermediate_size_per_partition + block_n - 1) // block_n),
                     (hidden_size + block_k - 1) // block_k,
                     dtype=torch.float32,
                 ),
@@ -296,7 +300,7 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
             max_w13_scales = layer.w13_weight_scale.max(dim=1).values
             for expert_id in range(layer.num_local_experts):
                 start = 0
-                for shard_id in range(2):
+                for shard_id in range(layer.w13_weight_scale.shape[1]):
                     dq_weight = per_tensor_dequantize(
                         layer.w13_weight[expert_id][start : start + shard_size, :],
                         layer.w13_weight_scale[expert_id][shard_id],
