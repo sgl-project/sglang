@@ -70,8 +70,38 @@ def warmup_npu(device: int = 0) -> None:
     """
 
 
+def _physical_device_id(device: int) -> int:
+    """Map a process-visible logical device index to the host device id."""
+    visible_devices = os.environ.get("ASCEND_RT_VISIBLE_DEVICES")
+    if not visible_devices:
+        return device
+
+    devices = [item.strip() for item in visible_devices.split(",") if item.strip()]
+    if device < 0 or device >= len(devices):
+        raise ValueError(
+            f"logical NPU device {device} is outside ASCEND_RT_VISIBLE_DEVICES="
+            f"{visible_devices!r}"
+        )
+    return int(devices[device])
+
+
+def _npu_smi_card_and_chip(physical_device: int) -> list[str]:
+    """Translate a host device id into npu-smi's card/chip addressing."""
+    out = _npu_smi("info", "-l")
+    chips_per_card = int(re.search(r"Chip Count\s*:\s*(\d+)", out).group(1))
+    if chips_per_card <= 1:
+        return ["-i", str(physical_device)]
+    return [
+        "-i",
+        str(physical_device // chips_per_card),
+        "-c",
+        str(physical_device % chips_per_card),
+    ]
+
+
 def _hbm_capacity_and_rate(device: int = 0):
-    out = _npu_smi("info", "-t", "usages", "-i", str(device))
+    physical_device = _physical_device_id(device)
+    out = _npu_smi("info", "-t", "usages", *_npu_smi_card_and_chip(physical_device))
     capacity = int(re.search(r"HBM Capacity\(MB\)\s*:\s*(\d+)", out).group(1))
     rate = int(re.search(r"HBM Usage Rate\(%\)\s*:\s*(\d+)", out).group(1))
     return capacity * 1024**2, rate
@@ -93,7 +123,11 @@ def wait_for_free_memory(
     timeout: float = 60,
     interval: float = 0.5,
 ) -> None:
-    """Wait for a previous server process to hand device memory back."""
+    """Wait for a previous server process to hand device memory back.
+
+    ``device`` is a process-visible logical index, matching torch device
+    numbering under ``ASCEND_RT_VISIBLE_DEVICES``.
+    """
     deadline = time.time() + timeout
     while time.time() < deadline:
         if npu_free_bytes(device) >= min_free_bytes:
