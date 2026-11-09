@@ -1,8 +1,9 @@
 """Static per-tensor FP8 (amax / 448 weight scale, unit activation scale) for
 Kimi-K3 BF16 dense linears on ROCm; decode GEMMs there are weight-bandwidth bound.
 
-``SGLANG_K3_TARGET_DENSE_FP8``: ``off`` | ``front`` (merged MoE front) |
-``wide`` (front + KDA q/k/v/g).
+``SGLANG_K3_TARGET_DENSE_FP8``: ``auto`` (default: ``wide`` on gfx95 without
+``--enable-amd-monokernel``, ``off`` otherwise) | ``off`` | ``front`` (merged MoE
+front) | ``wide`` (front + KDA q/k/v/g).
 """
 
 from __future__ import annotations
@@ -10,18 +11,34 @@ from __future__ import annotations
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_exec
+from sglang.srt.utils import is_gfx95_supported
 
 _FP8 = torch.float8_e4m3fn
 _FP8_MAX = torch.finfo(_FP8).max
+_SCOPES = ("off", "front", "wide")
+
+
+def resolve_scope(value: str, gfx95: bool, amd_monokernel: bool) -> str:
+    """``auto`` enables ``wide`` only on gfx95, whose FP8 is the OCP E4M3 emitted
+    here (gfx942 uses the fnuz variant), and only without the AMD monokernel,
+    which reads the MoE front and the KDA projections as bf16."""
+    value = value.lower()
+    if value == "auto":
+        return "wide" if gfx95 and not amd_monokernel else "off"
+    if value not in _SCOPES:
+        raise ValueError(
+            f"SGLANG_K3_TARGET_DENSE_FP8={value!r}; expected auto|off|front|wide"
+        )
+    return value
 
 
 def scope() -> str:
-    value = envs.SGLANG_K3_TARGET_DENSE_FP8.get().lower()
-    if value not in ("off", "front", "wide"):
-        raise ValueError(
-            f"SGLANG_K3_TARGET_DENSE_FP8={value!r}; expected off|front|wide"
-        )
-    return value
+    return resolve_scope(
+        envs.SGLANG_K3_TARGET_DENSE_FP8.get(),
+        gfx95=is_gfx95_supported(),
+        amd_monokernel=bool(get_exec().kernel.enable_amd_monokernel),
+    )
 
 
 def front_enabled() -> bool:
