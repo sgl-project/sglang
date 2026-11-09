@@ -1766,12 +1766,18 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # Larger prefills fall back to eager and keep the memory-efficient
         # SUM_LEN. global_num_tokens is identical across ranks (all-gathered),
         # so the decision is consistent cluster-wide.
+        #
+        # A zero-token rank also keeps SUM_LEN: padding it to the bucket would
+        # make the whole group do bucket-sized work for no tokens, while the
+        # graph runner rejects the replay once any rank is inactive. Eager then
+        # computes only the rows that exist.
         prefill_cg = get_exec().graph.cuda_graph_config.prefill
         if (
             self.can_run_dp_prefill_cuda_graph
             and self.is_extend_in_batch
             and prefill_cg.bs
             and max(global_num_tokens) <= max(prefill_cg.bs)
+            and min(global_num_tokens) > 0
             and not prefill_graph_tolerates_sum_len()
         ):
             dp_padding_mode = DpPaddingMode.MAX_LEN
