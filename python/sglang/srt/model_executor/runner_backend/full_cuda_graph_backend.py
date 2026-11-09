@@ -27,6 +27,7 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
 )
@@ -156,17 +157,23 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
             else None
         )
 
-        # Two warmups so kernels are loaded and one-time setup is paid before capture.
+        # Warm up kernels and one-time setup before capture.
         # post_warmup_hook lets the attention backend reset state that warmup mutated.
-        warmup_output = None
-        for warmup_step in range(2):
+        # Pre-carving measures scratch after persistent first-run allocations.
+        # Compiled kernels can defer autotuning until their second invocation.
+        warmups = (
+            2
+            if profiler is not None
+            or envs.SGLANG_ENABLE_GRAPH_POOL_PRECARVE.get()
+            or shape_key.size in runner.compile_bs
+            else 1
+        )
+        for _ in range(warmups):
+            warmup_output = None
             self._device_module.synchronize()
             self._tp_group.barrier()
             with self._precarve.measure():
-                output = forward_fn()
-            if self._reuse_output_buffer and warmup_step == 1:
-                warmup_output = output
-            del output
+                warmup_output = forward_fn()
             if profiler is not None:
                 profiler.step()
             if post_warmup_hook is not None:

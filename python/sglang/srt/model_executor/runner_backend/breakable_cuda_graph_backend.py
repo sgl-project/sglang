@@ -134,8 +134,15 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         capture_inputs: Optional[Any] = None,
         post_warmup_hook: Optional[Callable[[], None]] = None,
     ) -> None:
-        warmup_out = None
-        for _ in range(2):
+        # Pre-carving and deferred autotuning need a second eager pass.
+        warmups = (
+            2
+            if envs.SGLANG_ENABLE_GRAPH_POOL_PRECARVE.get()
+            or shape_key.size in self._cuda_graph_runner.compile_bs
+            else 1
+        )
+        for _ in range(warmups):
+            warmup_out = None
             self._device_module.synchronize()
             self._tp_group.barrier()
             with self._precarve.measure():

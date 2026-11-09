@@ -3,8 +3,8 @@
 These cover the changes from the "cuda graph profile traces" PR that wire the
 runner's torch profiler into the capture loop:
 
-  * When profiling is disabled, ``capture_one`` runs exactly two warmups + one
-    capture and never touches a profiler (behavior-identical to before the PR).
+  * When profiling is disabled, ``capture_one`` runs one warmup + one
+    capture and never touches a profiler.
   * When the runner exposes an active ``_profiler`` (per-bs capture profiling,
     ``--enable-profile-cuda-graph`` + ``SGLANG_GRAPH_BATCH_CAPTURE``),
     ``capture_one`` calls ``profiler.step()`` past the two warmups and once after
@@ -21,12 +21,15 @@ profiler stepping) is pure-Python and runs on CPU.
 
 import contextlib
 import unittest
+import weakref
 from types import SimpleNamespace
 from unittest import mock
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
+from sglang.srt.model_executor.runner_backend import breakable_cuda_graph_backend as bcg
 from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
     FullCudaGraphBackend,
 )
@@ -50,7 +53,7 @@ class _FakeGraphCtx:
         return False
 
 
-def _make_backend(runner):
+def _make_backend(runner, *, breakable=False):
     """Build a ``FullCudaGraphBackend`` without running ``__init__`` (which would
     touch CUDA), wiring just the attributes ``capture_one`` reads."""
     backend = FullCudaGraphBackend.__new__(FullCudaGraphBackend)
@@ -67,6 +70,16 @@ def _make_backend(runner):
     backend._cuda_graph_runner = runner
     backend._device_module = runner.device_module
     backend._tp_group = SimpleNamespace(barrier=mock.Mock(name="barrier"))
+    if breakable:
+        fields = backend.__dict__
+        backend = bcg.BreakableCudaGraphBackend.__new__(bcg.BreakableCudaGraphBackend)
+        backend.__dict__.update(fields)
+        backend._shared_output_buffer = None
+        backend._hicache_graph_events = None
+        backend._debug_eager = False
+        backend._capture_inputs = {}
+        runner.cuda_graph_output_capacity_rows = lambda output: None
+        runner.cuda_graph_output_rows = lambda output: None
     return backend
 
 
@@ -80,6 +93,7 @@ def _make_runner(*, enable_profile, profiler, num_tokens_per_bs=1, mode_name="DE
         num_tokens_per_bs=num_tokens_per_bs,
         capture_forward_mode=SimpleNamespace(name=mode_name),
         enable_profile_cuda_graph=enable_profile,
+        compile_bs=(),
     )
     if profiler is not _UNSET:
         runner._profiler = profiler
@@ -87,7 +101,7 @@ def _make_runner(*, enable_profile, profiler, num_tokens_per_bs=1, mode_name="DE
 
 
 class TestCaptureOneNoProfiling(CustomTestCase):
-    def test_runs_two_warmups_and_capture_without_stepping(self):
+    def test_runs_one_warmup_and_capture_without_stepping(self):
         runner = _make_runner(enable_profile=False, profiler=None)
         backend = _make_backend(runner)
 
@@ -101,13 +115,61 @@ class TestCaptureOneNoProfiling(CustomTestCase):
                 shape_key, forward_fn, post_warmup_hook=post_warmup_hook
             )
 
-        # 2 warmups + 1 capture.
-        self.assertEqual(forward_fn.call_count, 3)
-        # post_warmup_hook only runs in the two warmup iterations.
-        self.assertEqual(post_warmup_hook.call_count, 2)
+        # 1 warmup + 1 capture.
+        self.assertEqual(forward_fn.call_count, 2)
+        # Reset attention state after the warmup.
+        self.assertEqual(post_warmup_hook.call_count, 1)
         # Graph + output are recorded against the shape key.
         self.assertEqual(backend._graphs[shape_key], "GRAPH")
         self.assertIs(backend._outputs[shape_key], sentinel_out)
+
+    def test_second_warmup_for_compilation_or_precarve(self):
+        for breakable, precarve in (
+            (False, False),
+            (False, True),
+            (True, False),
+            (True, True),
+        ):
+            with self.subTest(breakable=breakable, precarve=precarve):
+                runner = _make_runner(enable_profile=False, profiler=None)
+                runner.compile_bs = [] if precarve else [4]
+                backend = _make_backend(runner, breakable=breakable)
+                calls = 0
+
+                def forward():
+                    nonlocal calls
+                    calls += 1
+                    if calls == 2:
+                        runner.device_module.synchronize()
+                    return torch.ones(4, 2)
+
+                @contextlib.contextmanager
+                def capture(**kwargs):
+                    self.assertEqual(calls, 2)
+                    with mock.patch.object(
+                        runner.device_module,
+                        "synchronize",
+                        side_effect=AssertionError("autotuning during capture"),
+                    ):
+                        yield
+
+                runner.device_module.graph.side_effect = capture
+                with (
+                    envs.SGLANG_ENABLE_GRAPH_POOL_PRECARVE.override(precarve),
+                    mock.patch("torch.cuda.CUDAGraph", return_value="GRAPH"),
+                    mock.patch.object(bcg, "BreakableCUDAGraph", return_value="GRAPH"),
+                    mock.patch.object(
+                        bcg, "BreakableCUDAGraphCapture", side_effect=capture
+                    ),
+                    mock.patch.object(
+                        bcg.BreakableCudaGraphBackend,
+                        "deduped_cuda_graph",
+                        new_callable=mock.PropertyMock,
+                        return_value=False,
+                    ),
+                ):
+                    backend.capture_one(ShapeKey(size=4), forward)
+                self.assertEqual(calls, 3)
 
     def test_prefill_shapes_share_one_output_storage(self):
         runner = _make_runner(enable_profile=False, profiler=None, mode_name="EXTEND")
@@ -118,8 +180,6 @@ class TestCaptureOneNoProfiling(CustomTestCase):
             [
                 torch.ones((4, 2)),
                 torch.ones((4, 2)),
-                torch.ones((4, 2)),
-                torch.ones((2, 2)),
                 torch.ones((2, 2)),
                 torch.ones((2, 2)),
             ]
@@ -146,7 +206,7 @@ class TestCaptureOneNoProfiling(CustomTestCase):
         large_out = (torch.ones((4, 2)), torch.ones((4, 3)))
         small_out = (torch.full((2, 2), 2.0), torch.full((2, 3), 3.0))
         plain_out = torch.full((1, 2), 7.0)
-        outputs = iter([large_out] * 3 + [small_out] * 3 + [plain_out] * 3)
+        outputs = iter([large_out] * 2 + [small_out] * 2 + [plain_out] * 2)
         with mock.patch("torch.cuda.CUDAGraph", side_effect=["G4", "G2", "G1"]):
             backend.capture_one(ShapeKey(size=4), lambda: next(outputs))
             backend.capture_one(ShapeKey(size=2), lambda: next(outputs))
@@ -179,7 +239,7 @@ class TestCaptureOneNoProfiling(CustomTestCase):
 
         first_out = (torch.ones((4, 2)), torch.tensor(0.0))
         second_out = (torch.ones((2, 2)), torch.tensor(1.0))
-        outputs = iter([first_out] * 3 + [second_out] * 3)
+        outputs = iter([first_out] * 2 + [second_out] * 2)
         with mock.patch("torch.cuda.CUDAGraph", side_effect=["G4", "G2"]):
             backend.capture_one(ShapeKey(size=4), lambda: next(outputs))
             backend.capture_one(ShapeKey(size=2), lambda: next(outputs))
@@ -200,7 +260,7 @@ class TestCaptureOneNoProfiling(CustomTestCase):
         with mock.patch("torch.cuda.CUDAGraph", return_value="GRAPH"):
             backend.capture_one(ShapeKey(size=2), forward_fn)
 
-        self.assertEqual(forward_fn.call_count, 3)
+        self.assertEqual(forward_fn.call_count, 2)
 
 
 class TestCaptureOneWithProfiling(CustomTestCase):
@@ -220,6 +280,26 @@ class TestCaptureOneWithProfiling(CustomTestCase):
             backend.capture_one(ShapeKey(size=size), forward_fn)
 
         return profiler, forward_fn
+
+    def test_releases_warmup_output_before_next_forward(self):
+        runner = _make_runner(
+            enable_profile=True, profiler=SimpleNamespace(step=lambda: None)
+        )
+        backend = _make_backend(runner)
+        backend._reuse_output_buffer = True
+        outputs = []
+
+        def forward():
+            if outputs:
+                self.assertIsNone(outputs[-1]())
+            output = torch.ones(4, 2)
+            outputs.append(weakref.ref(output))
+            return output
+
+        with mock.patch("torch.cuda.CUDAGraph", return_value="GRAPH"):
+            backend.capture_one(ShapeKey(size=4), forward)
+        self.assertEqual(len(outputs), 3)
+        self.assertEqual(backend._output_buffer.shape, (4, 2))
 
     def test_steps_twice_in_warmup_and_once_after_capture(self):
         profiler, forward_fn = self._run(
