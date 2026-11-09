@@ -52,7 +52,7 @@ class TestDeepGemmMaskedActivationContract(CustomTestCase):
                 ),
                 self.assertRaisesRegex(AssertionError, message),
             ):
-                runner_module.DeepGemmRunnerCore(
+                ep_module.SailDeepGemmEpRunnerCore(
                     MoeRunnerConfig(
                         gemm1_alpha=1.702,
                         gemm1_clamp_limit=limit,
@@ -101,6 +101,7 @@ class TestDeepGemmMaskedActivationContract(CustomTestCase):
         """All six GEMM2 kinds must receive the oai output for their weight layout,
         and clamp must not modify the GEMM1 buffer."""
         from sglang.kernels.ops.quantization import fp8_kernel, int8_kernel, sail_mxfp4
+        from sglang.srt.hardware_backend.sail.moe import activations
         from sglang.srt.hardware_backend.sail.moe import deepgemm_ep as ep_module
         from sglang.srt.layers.moe.moe_runner import deep_gemm as runner_module
         from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
@@ -180,13 +181,15 @@ class TestDeepGemmMaskedActivationContract(CustomTestCase):
                     )
                     for module in (runner_module, ep_module):
                         for name, value in (
-                            ("_is_sail", True),
                             ("dispose_tensor", lambda x: None),
                             ("get_parallel", lambda: SimpleNamespace(tp_group=None)),
                             ("use_symmetric_memory", lambda *a, **kw: nullcontext()),
                             ("is_allocation_symmetric", lambda: False),
                         ):
                             stack.enter_context(patch.object(module, name, value))
+                    # Only the SAIL core branches on the platform; the shared runner
+                    # keeps the upstream path.
+                    stack.enter_context(patch.object(ep_module, "_is_sail", True))
                     stack.enter_context(patch.object(sail_entrypoint, gemm_name, gemm))
                     for flag in (
                         "DEEPGEMM_SCALE_UE8M0",
@@ -242,7 +245,7 @@ class TestDeepGemmMaskedActivationContract(CustomTestCase):
                     result, expected[: result.shape[-1]].expand(3, -1)
                 )
         with self.assertRaisesRegex(AssertionError, "expected bf16"):
-            runner_module._apply_oai_swiglu(packed.float(), 1.702, 7.0, False)
+            activations.apply_oai_swiglu(packed.float(), 1.702, 7.0, False)
 
     def test_masked_runner_forwards_alpha_and_keeps_legacy_launch_defaults(self):
         """BF16, channel FP8/INT8 and W4A16 must propagate the activation protocol
@@ -298,13 +301,15 @@ class TestDeepGemmMaskedActivationContract(CustomTestCase):
                     stack.enter_context(self.subTest(variant=variant, alpha=alpha))
                     for module in (runner_module, ep_module):
                         for name, value in (
-                            ("_is_sail", True),
                             ("dispose_tensor", lambda x: None),
                             ("get_parallel", lambda: SimpleNamespace(tp_group=None)),
                             ("use_symmetric_memory", lambda *a, **kw: nullcontext()),
                             ("is_allocation_symmetric", lambda: False),
                         ):
                             stack.enter_context(patch.object(module, name, value))
+                    # Only the SAIL core branches on the platform; the shared runner
+                    # keeps the upstream path.
+                    stack.enter_context(patch.object(ep_module, "_is_sail", True))
                     stack.enter_context(patch.object(sail_entrypoint, gemm_name, gemm))
                     stack.enter_context(
                         patch.object(
@@ -387,13 +392,15 @@ class TestDeepGemmMaskedActivationContract(CustomTestCase):
         with ExitStack() as stack:
             for module in (runner_module, ep_module):
                 for name, value in (
-                    ("_is_sail", True),
                     ("dispose_tensor", lambda x: None),
                     ("get_parallel", lambda: SimpleNamespace(tp_group=None)),
                     ("use_symmetric_memory", lambda *a, **kw: nullcontext()),
                     ("is_allocation_symmetric", lambda: False),
                 ):
                     stack.enter_context(patch.object(module, name, value))
+            # Only the SAIL core branches on the platform; the shared runner keeps
+            # the upstream path.
+            stack.enter_context(patch.object(ep_module, "_is_sail", True))
             stack.enter_context(
                 patch.object(
                     sail_entrypoint,
@@ -457,13 +464,15 @@ class TestDeepGemmMaskedActivationContract(CustomTestCase):
         with ExitStack() as stack:
             for module in (runner_module, ep_module):
                 for name, value in (
-                    ("_is_sail", True),
                     ("dispose_tensor", lambda x: None),
                     ("get_parallel", lambda: SimpleNamespace(tp_group=None)),
                     ("use_symmetric_memory", lambda *a, **kw: nullcontext()),
                     ("is_allocation_symmetric", lambda: False),
                 ):
                     stack.enter_context(patch.object(module, name, value))
+            # Only the SAIL core branches on the platform; the shared runner keeps
+            # the upstream path.
+            stack.enter_context(patch.object(ep_module, "_is_sail", True))
             stack.enter_context(
                 patch.object(runner_module, "_varlen_deep_gemm_silu_mul_quant", act)
             )
@@ -1040,7 +1049,6 @@ class TestSailDeepGemmFusedApi(CustomTestCase):
 
             with (
                 self.subTest(variant=variant),
-                patch.object(runner_module, "_is_sail", True),
                 patch.object(runner_module, "dispose_tensor"),
                 patch.object(ep_module, "_is_sail", True),
                 patch.object(ep_module, "dispose_tensor"),
@@ -1335,7 +1343,9 @@ class TestSailDeepGemmFusedApi(CustomTestCase):
     def test_deepep_ll_handoff_preserves_mask_and_state(self):
         """LL is already a masked layout, so BF16 W4A16 must not be requantized and
         the routing and capacity must not be lost."""
-        from sglang.srt.layers.moe.moe_runner import deep_gemm as runner_module
+        from sglang.srt.hardware_backend.sail.moe.permute import (
+            pre_permute_deepep_ll_to_deep_gemm,
+        )
         from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 
         ids = torch.tensor([[1, 0]], dtype=torch.int32)
@@ -1349,13 +1359,12 @@ class TestSailDeepGemmFusedApi(CustomTestCase):
             x = torch.empty((2, 3, 64), dtype=dtype)
             scale = None if scale_width is None else torch.empty((2, 3, scale_width))
             state = {}
-            with patch.object(runner_module, "_is_sail", True):
-                payload = runner_module.pre_permute_deepep_ll_to_deep_gemm(
-                    (x, scale, ids, weights, counts, 1),
-                    None,
-                    MoeRunnerConfig(top_k=2),
-                    state,
-                )
+            payload = pre_permute_deepep_ll_to_deep_gemm(
+                (x, scale, ids, weights, counts, 1),
+                None,
+                MoeRunnerConfig(top_k=2),
+                state,
+            )
             self.assertIs(payload.hidden_states, x)
             self.assertIs(payload.hidden_states_scale, scale)
             self.assertIs(payload.masked_m, counts)
@@ -1427,7 +1436,6 @@ class TestSailDeepGemmFusedApi(CustomTestCase):
             return (16, 1)
 
         with (
-            patch.object(runner_module, "_is_sail", True),
             patch.object(runner_module, "dispose_tensor"),
             patch.object(ep_module, "_is_sail", True),
             patch.object(ep_module, "dispose_tensor"),

@@ -26,29 +26,44 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.sail.deep_gemm import entrypoint as sail_entrypoint
+from sglang.srt.hardware_backend.sail.moe.activations import apply_oai_swiglu
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
+from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.deep_gemm import (
     DeepGemmMoeQuantInfo,
     DeepGemmRunnerCore,
     DeepGemmRunnerInput,
     DeepGemmRunnerOutput,
-    _apply_oai_swiglu,
     _apply_swiglu_limit,
     _cast_to_e8m0_with_rounding_up,
     _is_h20,
-    _is_sail,
     _legacy_silu_and_mul,
     _situ_mul_quant_contig_kernel,
 )
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import dispose_tensor
+from sglang.srt.utils import dispose_tensor, is_sail
 
 logger = logging.getLogger(__name__)
+
+_is_sail = is_sail()
 
 
 class SailDeepGemmEpRunnerCore(DeepGemmRunnerCore):
     """DeepGEMM runner with the SAIL-only EP kernels plugged in."""
+
+    def __init__(self, config: MoeRunnerConfig):
+        super().__init__(config)
+        if config.gemm1_alpha is not None and config.activation != "situ":
+            # For SiTU the same fields mean beta/linear_beta, so the oai-swiglu
+            # validation does not apply.
+            assert config.gemm1_clamp_limit is not None, (
+                "gemm1_alpha requires gemm1_clamp_limit"
+            )
+            assert config.swiglu_limit is None, (
+                "swiglu_limit and gemm1_alpha are mutually exclusive"
+            )
+            assert not self.use_swizzle, "swizzle is not supported with gemm1_alpha"
 
     # (masked, quant family) -> method name. Anything absent falls back to the
     # upstream dispatch, which keeps blockwise FP8 on shared code. BF16 stays
@@ -256,7 +271,7 @@ class SailDeepGemmEpRunnerCore(DeepGemmRunnerCore):
                 )
                 del down_input
         elif self.config.gemm1_alpha is not None:
-            down_input = _apply_oai_swiglu(
+            down_input = apply_oai_swiglu(
                 gateup_output,
                 self.config.gemm1_alpha,
                 self.config.gemm1_clamp_limit,
@@ -426,7 +441,7 @@ class SailDeepGemmEpRunnerCore(DeepGemmRunnerCore):
         if self.config.activation == "situ":
             # Same kernel the TP fused engine uses. For SiTU, gemm1_alpha and
             # gemm1_clamp_limit are beta / linear_beta, not oai-swiglu's alpha and
-            # clamp, so they must not reach _apply_oai_swiglu.
+            # clamp, so they must not reach apply_oai_swiglu.
             down_input = torch.empty(
                 (all_tokens, N // 2),
                 device=gateup_output.device,
@@ -434,7 +449,7 @@ class SailDeepGemmEpRunnerCore(DeepGemmRunnerCore):
             )
             self._apply_situ_and_mul(gateup_output.view(-1, N), down_input)
         elif self.config.gemm1_alpha is not None:
-            down_input = _apply_oai_swiglu(
+            down_input = apply_oai_swiglu(
                 gateup_output,
                 self.config.gemm1_alpha,
                 self.config.gemm1_clamp_limit,
@@ -549,7 +564,7 @@ class SailDeepGemmEpRunnerCore(DeepGemmRunnerCore):
                 )
                 self._apply_situ_and_mul(gateup_output.view(-1, N), down_input)
             elif self.config.gemm1_alpha is not None:
-                down_input = _apply_oai_swiglu(
+                down_input = apply_oai_swiglu(
                     gateup_output,
                     self.config.gemm1_alpha,
                     self.config.gemm1_clamp_limit,
@@ -644,7 +659,7 @@ class SailDeepGemmEpRunnerCore(DeepGemmRunnerCore):
             )
             self._apply_situ_and_mul(gateup_output.view(-1, N), down_input)
         elif self.config.gemm1_alpha is not None:
-            down_input = _apply_oai_swiglu(
+            down_input = apply_oai_swiglu(
                 gateup_output,
                 self.config.gemm1_alpha,
                 self.config.gemm1_clamp_limit,
@@ -755,7 +770,7 @@ class SailDeepGemmEpRunnerCore(DeepGemmRunnerCore):
         elif self.config.gemm1_alpha is not None:
             # The fused MXFP4 activation has no alpha variant, so activate first
             # and then produce the same MN-major scales.
-            down_input = _apply_oai_swiglu(
+            down_input = apply_oai_swiglu(
                 gateup_output,
                 self.config.gemm1_alpha,
                 self.config.gemm1_clamp_limit,
@@ -878,7 +893,7 @@ class SailDeepGemmEpRunnerCore(DeepGemmRunnerCore):
         dispose_tensor(hidden_states)
 
         if self.config.gemm1_alpha is not None and self.config.activation != "situ":
-            down_input = _apply_oai_swiglu(
+            down_input = apply_oai_swiglu(
                 gateup_output,
                 self.config.gemm1_alpha,
                 self.config.gemm1_clamp_limit,
