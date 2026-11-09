@@ -63,7 +63,7 @@ _MAX_OFFSET = 2**31
 
 
 @triton.jit
-def _tile_units(
+def _units_per_tile(
     context_cu_seqlens,  # [groups + 1] int32 offsets into context_slots
     decode_lens,  # [groups] int32, decode steps per group
     group,  # the group whose tiles are counted
@@ -87,7 +87,7 @@ def _total_units(
 ):
     total = 0
     for group in range(0, num_groups):
-        total += TILES_PER_GROUP * _tile_units(
+        total += TILES_PER_GROUP * _units_per_tile(
             context_cu_seqlens, decode_lens, group, BLOCK_N, SETUP_UNITS
         )
     return total
@@ -104,21 +104,21 @@ def _locate_unit(
     SETUP_UNITS: tl.constexpr,  # units charged for starting a tile
 ):
     """Group of a unit, the group's first unit and its units per tile."""
-    group_base = 0
+    group_first_unit = 0
     found_group = 0
-    found_base = 0
-    found_units = 1
+    found_first_unit = 0
+    found_units_per_tile = 1
     for group in range(0, num_groups):
-        units = _tile_units(
+        units_per_tile = _units_per_tile(
             context_cu_seqlens, decode_lens, group, BLOCK_N, SETUP_UNITS
         )
-        span = TILES_PER_GROUP * units
-        found = (unit >= group_base) & (unit < group_base + span)
+        group_units = TILES_PER_GROUP * units_per_tile
+        found = (unit >= group_first_unit) & (unit < group_first_unit + group_units)
         found_group = tl.where(found, group, found_group)
-        found_base = tl.where(found, group_base, found_base)
-        found_units = tl.where(found, units, found_units)
-        group_base += span
-    return found_group, found_base, found_units
+        found_first_unit = tl.where(found, group_first_unit, found_first_unit)
+        found_units_per_tile = tl.where(found, units_per_tile, found_units_per_tile)
+        group_first_unit += group_units
+    return found_group, found_first_unit, found_units_per_tile
 
 
 @triton.jit
@@ -179,19 +179,24 @@ def _shared_context_stream_k_kernel(
         BLOCK_N,
         SETUP_UNITS,
     )
-    run_end = ((cta + 1) * total_units) // num_ctas
+    run_end_unit = ((cta + 1) * total_units) // num_ctas
 
-    tile_beams = tl.arange(0, BLOCK_M)
+    beams_in_tile = tl.arange(0, BLOCK_M)
     context_offsets = tl.arange(0, BLOCK_N)
     dims = tl.arange(0, BLOCK_D)
     dim_mask = dims < HEAD_DIM
     negative_infinity = -float("inf")
     softmax_scale_log2 = softmax_scale * 1.4426950408889634
 
-    unit = (cta * total_units) // num_ctas
-    while unit < run_end:
-        group, group_base, tile_units = _locate_unit(
-            unit,
+    # Units number every tile's work in order: SETUP_UNITS, then one per prompt block,
+    # then one per decode step. Each CTA owns an equal run of units across tiles;
+    # each loop pass handles one segment, the part of the run inside one tile.
+    # work_*_in_tile index that tile's prompt blocks, then its decode steps, from 0
+    # (setup units excluded); partial_idx = tile + cta holds a split tile's partials.
+    segment_start_unit = (cta * total_units) // num_ctas
+    while segment_start_unit < run_end_unit:
+        group, group_first_unit, units_per_tile = _locate_unit(
+            segment_start_unit,
             context_cu_seqlens,
             decode_lens,
             num_groups,
@@ -199,17 +204,19 @@ def _shared_context_stream_k_kernel(
             BLOCK_N,
             SETUP_UNITS,
         )
-        tile_in_group = (unit - group_base) // tile_units
-        tile_start = group_base + tile_in_group * tile_units
-        tile_end = tile_start + tile_units
-        segment_end = tl.minimum(run_end, tile_end)
-        # Unit offsets inside the tile; a run of setup units only is skipped.
-        work_start = tl.maximum(unit - tile_start, SETUP_UNITS) - SETUP_UNITS
-        work_end = segment_end - tile_start - SETUP_UNITS
-        if work_start < work_end:
+        tile_in_group = (segment_start_unit - group_first_unit) // units_per_tile
+        tile_first_unit = group_first_unit + tile_in_group * units_per_tile
+        tile_end_unit = tile_first_unit + units_per_tile
+        segment_end_unit = tl.minimum(run_end_unit, tile_end_unit)
+        # A segment of setup units only has no work items, and is skipped.
+        work_start_in_tile = (
+            tl.maximum(segment_start_unit - tile_first_unit, SETUP_UNITS) - SETUP_UNITS
+        )
+        work_end_in_tile = segment_end_unit - tile_first_unit - SETUP_UNITS
+        if work_start_in_tile < work_end_in_tile:
             q_head = tile_in_group // BEAM_BLOCKS
             kv_head = q_head // Q_PER_KV
-            beams = (tile_in_group % BEAM_BLOCKS) * BLOCK_M + tile_beams
+            beams = (tile_in_group % BEAM_BLOCKS) * BLOCK_M + beams_in_tile
             beam_mask = beams < BEAM_WIDTH
             rows = tl.load(
                 row_indices + group * stride_row_group + beams * stride_row_beam,
@@ -232,8 +239,10 @@ def _shared_context_stream_k_kernel(
 
             context_start = tl.load(context_cu_seqlens + group)
             context_length = tl.load(context_cu_seqlens + group + 1) - context_start
-            num_blocks = tl.cdiv(context_length, BLOCK_N)
-            for block in tl.range(work_start, tl.minimum(work_end, num_blocks)):
+            num_prompt_blocks = tl.cdiv(context_length, BLOCK_N)
+            for block in tl.range(
+                work_start_in_tile, tl.minimum(work_end_in_tile, num_prompt_blocks)
+            ):
                 tokens = block * BLOCK_N + context_offsets
                 token_mask = tokens < context_length
                 slots = tl.load(
@@ -272,10 +281,10 @@ def _shared_context_stream_k_kernel(
                     softmax_scale_log2,
                 )
 
-            decode_length = tl.load(decode_lens + group)
+            num_decode_steps = tl.load(decode_lens + group)
             for step in range(
-                tl.maximum(work_start - num_blocks, 0),
-                tl.minimum(work_end - num_blocks, decode_length),
+                tl.maximum(work_start_in_tile - num_prompt_blocks, 0),
+                tl.minimum(work_end_in_tile - num_prompt_blocks, num_decode_steps),
             ):
                 slots = tl.load(
                     decode_slots
@@ -317,7 +326,7 @@ def _shared_context_stream_k_kernel(
                     softmax_scale_log2,
                 )
 
-            if (work_start == 0) & (segment_end == tile_end):
+            if (work_start_in_tile == 0) & (segment_end_unit == tile_end_unit):
                 tl.store(
                     output
                     + rows[:, None] * stride_out_row
@@ -327,23 +336,23 @@ def _shared_context_stream_k_kernel(
                     mask=row_mask,
                 )
             else:
-                # Slot tile + cta is unique: along the units, each new segment
+                # partial_idx is unique: along the units, each new segment
                 # advances the tile, the CTA or both.
-                slot = group * TILES_PER_GROUP + tile_in_group + cta
+                partial_idx = group * TILES_PER_GROUP + tile_in_group + cta
                 # Every work unit holds a token, so every segment has softmax mass.
                 tl.store(
                     partial_output
-                    + ((slot * BLOCK_M + tile_beams) * HEAD_DIM)[:, None]
+                    + ((partial_idx * BLOCK_M + beams_in_tile) * HEAD_DIM)[:, None]
                     + dims[None, :],
                     accumulator / normalizers[:, None],
                     mask=row_mask,
                 )
                 tl.store(
-                    partial_lse + slot * BLOCK_M + tile_beams,
+                    partial_lse + partial_idx * BLOCK_M + beams_in_tile,
                     max_values * softmax_scale_log2 + tl.log2(normalizers),
                     mask=beam_mask,
                 )
-        unit = segment_end
+        segment_start_unit = segment_end_unit
 
 
 @triton.jit
@@ -382,22 +391,24 @@ def _merge_segments_kernel(
         BLOCK_N,
         SETUP_UNITS,
     )
-    group_base = 0
+    group_first_unit = 0
     for previous_group in range(0, group):
-        group_base += TILES_PER_GROUP * _tile_units(
+        group_first_unit += TILES_PER_GROUP * _units_per_tile(
             context_cu_seqlens, decode_lens, previous_group, BLOCK_N, SETUP_UNITS
         )
-    tile_units = _tile_units(
+    units_per_tile = _units_per_tile(
         context_cu_seqlens, decode_lens, group, BLOCK_N, SETUP_UNITS
     )
-    work_start = group_base + tile_in_group * tile_units + SETUP_UNITS
-    tile_end = group_base + (tile_in_group + 1) * tile_units
-    first_cta = _unit_owner(work_start, total_units, num_ctas)
-    last_cta = _unit_owner(tile_end - 1, total_units, num_ctas)
+    tile_first_work_unit = (
+        group_first_unit + tile_in_group * units_per_tile + SETUP_UNITS
+    )
+    tile_end_unit = group_first_unit + (tile_in_group + 1) * units_per_tile
+    first_cta = _unit_owner(tile_first_work_unit, total_units, num_ctas)
+    last_cta = _unit_owner(tile_end_unit - 1, total_units, num_ctas)
     if first_cta != last_cta:
         q_head = tile_in_group // BEAM_BLOCKS
-        tile_beams = tl.program_id(1) * MERGE_ROWS + tl.arange(0, MERGE_ROWS)
-        beams = (tile_in_group % BEAM_BLOCKS) * BLOCK_M + tile_beams
+        beams_in_tile = tl.program_id(1) * MERGE_ROWS + tl.arange(0, MERGE_ROWS)
+        beams = (tile_in_group % BEAM_BLOCKS) * BLOCK_M + beams_in_tile
         beam_mask = beams < BEAM_WIDTH
         dims = tl.arange(0, BLOCK_D)
         mask = beam_mask[:, None] & (dims < HEAD_DIM)[None, :]
@@ -408,18 +419,22 @@ def _merge_segments_kernel(
         accumulator = tl.zeros((MERGE_ROWS, BLOCK_D), tl.float32)
         for cta in range(first_cta, last_cta + 1):
             # Only when units < CTAs can a CTA in the range own no work unit here.
-            run_start = tl.maximum((cta * total_units) // num_ctas, work_start)
-            run_end = tl.minimum(((cta + 1) * total_units) // num_ctas, tile_end)
-            has_segment = run_start < run_end
-            slot = tile + cta
+            segment_start_unit = tl.maximum(
+                (cta * total_units) // num_ctas, tile_first_work_unit
+            )
+            segment_end_unit = tl.minimum(
+                ((cta + 1) * total_units) // num_ctas, tile_end_unit
+            )
+            has_segment = segment_start_unit < segment_end_unit
+            partial_idx = tile + cta
             lse = tl.load(
-                partial_lse + slot * BLOCK_M + tile_beams,
+                partial_lse + partial_idx * BLOCK_M + beams_in_tile,
                 mask=beam_mask & has_segment,
                 other=negative_infinity,
             )
             part = tl.load(
                 partial_output
-                + ((slot * BLOCK_M + tile_beams) * HEAD_DIM)[:, None]
+                + ((partial_idx * BLOCK_M + beams_in_tile) * HEAD_DIM)[:, None]
                 + dims[None, :],
                 mask=mask & has_segment,
                 other=0.0,
@@ -570,7 +585,7 @@ def shared_context_attention_stream_k(
         )
     if (num_tiles + num_ctas) * _BLOCK_M * head_dim >= _MAX_OFFSET:
         raise ValueError("The stream-K partials must have fewer than 2^31 elements")
-    # One slot per (tile, CTA) segment; slot = tile + cta < num_tiles + num_ctas.
+    # One partial row per (tile, CTA) segment: partial_idx = tile + cta < tiles + CTAs.
     partial_output = torch.empty(
         (num_tiles + num_ctas, _BLOCK_M, head_dim),
         dtype=torch.float32,

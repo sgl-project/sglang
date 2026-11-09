@@ -126,13 +126,15 @@ def _shared_context_split_kv_kernel(
     context_length = tl.load(context_cu_seqlens + group + 1) - context_start
     # Split bounds come from the runtime length: a graph replays shorter prompts
     # than it was captured with, which leaves trailing splits empty.
-    split_blocks = tl.cdiv(tl.cdiv(context_length, BLOCK_N), num_splits)
-    split_start = split * split_blocks * BLOCK_N
-    split_end = tl.minimum(split_start + split_blocks * BLOCK_N, context_length)
+    blocks_per_split = tl.cdiv(tl.cdiv(context_length, BLOCK_N), num_splits)
+    split_start_token = split * blocks_per_split * BLOCK_N
+    split_end_token = tl.minimum(
+        split_start_token + blocks_per_split * BLOCK_N, context_length
+    )
 
-    for block_start in tl.range(split_start, split_end, BLOCK_N):
-        tokens = block_start + context_offsets
-        token_mask = tokens < split_end
+    for block_start_token in tl.range(split_start_token, split_end_token, BLOCK_N):
+        tokens = block_start_token + context_offsets
+        token_mask = tokens < split_end_token
         slots = tl.load(
             context_slots + context_start + tokens,
             mask=token_mask,
@@ -170,8 +172,8 @@ def _shared_context_split_kv_kernel(
         )
 
     if split == num_splits - 1:
-        decode_length = tl.load(decode_lens + group)
-        for step in range(0, decode_length):
+        num_decode_steps = tl.load(decode_lens + group)
+        for step in range(0, num_decode_steps):
             slots = tl.load(
                 decode_slots + group * stride_decode_group + step * BEAM_WIDTH + beams,
                 mask=beam_mask,
