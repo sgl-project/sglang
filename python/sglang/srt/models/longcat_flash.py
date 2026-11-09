@@ -324,17 +324,6 @@ class LongcatFlashMoE(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_dim)
         zero_expert_result = None
 
-        if _is_npu and num_tokens == 0:
-            # An empty DP rank must still participate in expert dispatch/combine.
-            final_hidden_states = self.experts(
-                hidden_states, self.topk.empty_topk_output(hidden_states.device)
-            ).view(num_tokens, hidden_dim)
-            # Keep empty identity rows for any boundary gather on this rank.
-            return (
-                final_hidden_states,
-                hidden_states if self.zero_expert_type is not None else None,
-            )
-
         # router_logits: (num_tokens, n_experts)
         router_logits = self.router(hidden_states)
         topk_weights, topk_idx, _ = self.topk(
