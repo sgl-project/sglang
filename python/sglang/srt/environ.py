@@ -162,7 +162,7 @@ class EnvInt(EnvField):
 
 class _DeprecatedEnvFallback:
     """Mixin for EnvField subclasses: if the canonical env var is not set,
-    check *deprecated_name* and emit DeprecationWarning before reading it.
+    check *deprecated_name* and emit a FutureWarning before reading it.
 
     Usage:
         SGLANG_NEW_NAME = EnvBoolWithAlias(True, deprecated_name="SGLANG_OLD_NAME")
@@ -180,7 +180,9 @@ class _DeprecatedEnvFallback:
                     f"Environment variable '{self.deprecated_name}' is deprecated; "
                     f"use '{self.name}' instead. "
                     "The alias will be removed in a future release.",
-                    DeprecationWarning,
+                    # FutureWarning is shown by default; a DeprecationWarning
+                    # raised from library code is hidden from users.
+                    FutureWarning,
                     stacklevel=2,
                 )
                 os.environ[self.name] = fallback
@@ -621,9 +623,8 @@ class Envs:
     # Memory pools and KV-cache sizing
     # ===================================================================
     SGLANG_NATIVE_MOVE_KV_CACHE = EnvBool(False)
-    # Disable lazy compaction in the unified memory pool allocator and
-    # fall back to the per-free eager compaction. Used for production
-    # A/B and quick rollback. Default False (lazy compaction on).
+    # Must stay unset: the unified memory pool compacts only lazily, and
+    # startup refuses --enable-unified-memory with it set.
     SGLANG_DISABLE_LAZY_COMPACTION = EnvBool(False)
     # Periodically log lazy-compaction stats per sub-pool (observability only).
     SGLANG_LOG_LAZY_COMPACTION_STATS = EnvBool(False)
@@ -899,6 +900,10 @@ class Envs:
     # "use_direct_io": false key in --hicache-storage-backend-extra-config.
     SGLANG_HICACHE_NIXL_USE_DIRECT_IO = EnvBool(True)
     SGLANG_HUGEPAGE_SIZE = EnvStr("")
+    # off: normal pages; prefer: hugepages with normal-page fallback;
+    # required: hugepages only, failing immediately when unavailable.
+    # Empty preserves compatibility: off when SIZE is empty, otherwise prefer.
+    SGLANG_HUGEPAGE_MODE = EnvStr("")
     # >0: prefault host pools with a private THP mapping using this many threads; 0 disables.
     SGLANG_HICACHE_HOST_PARALLEL_ALLOC_THREADS = EnvInt(0)
     SGLANG_TEST_HICACHE_BACKEND_RANDOM_DELAY = EnvFloat(None)
@@ -999,6 +1004,13 @@ class Envs:
     # output shape, so they hit FlashInfer's tuned tactics (off: only 97-384 rows do).
     SGLANG_OPT_MXFP4_DEFERRED_FINALIZED_SHAPE = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
+    # MXFP4 trtllm-gen MoE on SM100 / SM103: calls with <= 256 tokens run the JIT
+    # routing + persistent FC1 / FC2 kernels (kernels/ops/moe/mxfp4_decode_moe.py) on
+    # every layer whose shape, activation (SiTU, or SwiGLU with a limit) and MXFP8
+    # activations they cover; anything else runs flashinfer.
+    SGLANG_USE_CUDA_MXFP4_DECODE_MOE = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_K31_DECODE_MOE"
     )
     # Manual MoE input row limit (EPv1 and EPv2); 0 leaves it to SGLANG_MORI_RECV_BOUND.
     SGLANG_MORI_MOE_MAX_INPUT_TOKENS = EnvInt(0)
@@ -2320,11 +2332,6 @@ class Envs:
     SGLANG_K3_SHARDED_MOE = EnvBool(True)
     # Use the ROCm radix-4 router for covered K3 top-k workloads.
     SGLANG_K3_RADIX4_TOPK = EnvBool(False)
-    # Kimi-K3.1 decode routed MoE on SM100/SM103: replace flashinfer's deferred-finalize
-    # trtllm-gen MXFP4 call with the JIT routing + persistent FC1/FC2 kernels
-    # (kernels/ops/moe/k31_decode_moe.py) for covered TP-MoE shapes (896 local
-    # experts, intermediate 384, top-16, <= 256 tokens); anything else runs flashinfer.
-    SGLANG_K31_DECODE_MOE = EnvBool(False)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MIN_HITS = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MAX_SEQLEN = EnvInt(6144)
@@ -2507,6 +2514,10 @@ _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
     ),
     "SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK": _DeprecatedEnv(
         note="Please use '--prefill-delayer-token-usage-low-watermark' instead."
+    ),
+    "SGLANG_USE_SGL_XPU": _DeprecatedEnv(
+        note="Intel XPU always uses the sgl-kernel MoE kernels; pass "
+        "'--moe-runner-backend triton' for the Triton path."
     ),
 }
 
