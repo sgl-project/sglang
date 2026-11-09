@@ -33,9 +33,6 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 _is_cuda = current_platform.is_cuda()
-# Per-signature: each (q shape, q/k strides, device, table instance) is verified
-# against the eager chain on its own, so the linear and softmax layouts and every
-# rebuilt table set pay their own first-sight check.
 _SANA_VIDEO2_ROPE = BitExactFusionGate("SANA-Video 2.0 fused RoPE", per_signature=True)
 
 
@@ -47,8 +44,7 @@ def _apply_rope(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
 def _rope_tables(freqs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     parts = torch.view_as_real(freqs)
     tokens = freqs.shape[-2]
-    # fused_interleaved_rope_fp64 contract: fp64 [1, S, 1, D] tables holding each
-    # pair's value twice; it reads cos at even and sin at odd columns.
+    # fused_interleaved_rope_fp64 reads cos at even and sin at odd columns of [1, S, 1, D].
     cos = parts[..., 0].repeat_interleave(2, dim=-1).reshape(1, tokens, 1, -1)
     sin = parts[..., 1].repeat_interleave(2, dim=-1).reshape(1, tokens, 1, -1)
     return cos.contiguous(), sin.contiguous()
@@ -64,9 +60,6 @@ def _apply_rope_pair(
     def reference():
         return _apply_rope(q, freqs), _apply_rope(k, freqs)
 
-    # The fused kernel wants contiguous [B, S, H, D] bf16 CUDA inputs; the eager
-    # chain stays for every other case. Its fp64 multiply/add and the
-    # fp64 -> fp32 -> bf16 store reproduce the eager roundings bit for bit.
     q_bshd, k_bshd = q.transpose(1, 2), k.transpose(1, 2)
     if not (
         _is_cuda

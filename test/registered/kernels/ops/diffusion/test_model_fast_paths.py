@@ -990,12 +990,8 @@ def test_longcat_qknorm_rope_is_bit_exact():
 
 @pytest.mark.parametrize("heads,head_dim", [(20, 128), (10, 256)])
 def test_sana_video2_rope_pair_is_bit_exact(heads, head_dim, monkeypatch):
-    """The fused path must equal the eager complex128 chain on the exact views the
-    linear (head_dim 128) and softmax (head_dim 256) blocks pass: [B, H, S, D]
-    views of contiguous [B, S, H, D] bf16 activations, complex128 3D tables."""
     torch.manual_seed(5)
     gate = sana_video2._SANA_VIDEO2_ROPE
-    # the gate is module-global; monkeypatch restores its state after the test
     monkeypatch.setattr(gate, "disabled", False)
     monkeypatch.setattr(gate, "verified", False)
     monkeypatch.setattr(gate, "verified_sigs", set())
@@ -1021,7 +1017,6 @@ def test_sana_video2_rope_pair_is_bit_exact(heads, head_dim, monkeypatch):
     assert k_out.stride() == k_ref.stride()
     assert len(gate.verified_sigs) == 1
     assert not gate.disabled
-    # a different token count is a new signature: unverified until it runs
     freqs2 = rope((frames + 1, height, width), torch.device("cuda"))
     tokens2 = (frames + 1) * height * width
     x2 = torch.randn(
@@ -1035,9 +1030,6 @@ def test_sana_video2_rope_pair_is_bit_exact(heads, head_dim, monkeypatch):
     assert torch.equal(q2_out, sana_video2._apply_rope(q2, freqs2))
     assert len(gate.verified_sigs) == 2
     assert not gate.disabled
-    # off-contract inputs take the eager chain without touching the kernel or the
-    # gate: a strided packed-qkv view (the qk_norm=False layout), an fp32 tensor,
-    # and grad mode
     packed = torch.randn(
         batch, tokens, 3 * heads * head_dim, device="cuda", dtype=torch.bfloat16
     )

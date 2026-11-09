@@ -152,9 +152,6 @@ class TestSanaVideo2(unittest.TestCase):
         torch.testing.assert_close(steps, [first, rebuilt], rtol=0, atol=0)
 
     def test_fused_rope_tables_follow_kernel_layout(self):
-        """The fp64 tables hand the kernel each pair's cosine at even and sine at
-        odd columns of a [1, S, 1, D] table, in token order of the complex128
-        frequencies; off the fused path the pair helper is the eager rotation."""
         from sglang.multimodal_gen.runtime.models.dits.sana_video2 import (
             _apply_rope,
             _apply_rope_pair,
