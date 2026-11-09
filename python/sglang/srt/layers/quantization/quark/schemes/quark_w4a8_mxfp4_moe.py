@@ -40,11 +40,7 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 # incorrect results, so route through aiter's triton ``moe_gemm_a8w4`` kernel
 # instead. This uses an unpadded, contraction-major weight layout (no aiter
 # shuffle) prepared in ``process_weights_after_loading``.
-_use_gfx1250_w4a8 = (
-    _is_hip
-    and is_gfx1250_supported()
-    and get_bool_env_var("SGLANG_GFX1250_W4A8_MOE", "true")
-)
+_use_gfx1250_w4a8 = _is_hip and is_gfx1250_supported()
 # Whether to use the aiter CK/ASM shuffled weight layout (gfx950 etc.). Disabled
 # on gfx1250, which uses the triton moe_gemm_a8w4 layout.
 _use_aiter_shuffle_layout = _use_aiter and not _use_gfx1250_w4a8

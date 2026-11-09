@@ -65,7 +65,7 @@ from sglang.srt.managers.req_types import (
     get_return_hidden_states_mode,
 )
 from sglang.srt.multimodal.media_io import ImageData, VideoData
-from sglang.srt.multimodal.mm_utils import has_valid_data
+from sglang.srt.multimodal.mm_utils import batch_single_media_input, has_valid_data
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.observability.req_time_stats import SchedulerOutputTimeStats
 from sglang.srt.sampling.sampling_mask import SamplingMaskChunk
@@ -146,19 +146,17 @@ class SessionParams(msgspec.Struct, kw_only=True, array_like=True):
     # The session identifier. Used by the scheduler to look up or create the
     # Session object that groups all requests in a multi-turn conversation.
     id: Optional[str] = None
-    # A request identifier *within* the session. In non-streaming sessions the
-    # session maintains a tree of request nodes keyed by rid; this field selects
-    # which node to continue from (append) or replace. When None the default
-    # branch point is used (latest node for streaming, all nodes cleared on
-    # replace).
+    # A request identifier *within* the session: the turn to continue from. A
+    # non-streaming session keeps every turn by rid, so a new turn may continue
+    # from any of them. When None, a streaming session continues from its
+    # latest turn and a non-streaming one starts with no history.
     rid: Optional[str] = None
     # Token-level insertion point. When set, the new request's tokens are
     # spliced into the accumulated context at this position instead of being
     # appended at the end (i.e. ``context[:offset] + new_tokens``).
     offset: Optional[int] = None
-    # When True, the request node identified by ``rid`` (or all nodes if
-    # ``rid`` is None) is aborted and its children are cleared before the new
-    # request is inserted. Not supported in streaming sessions.
+    # Unsupported: a request that sets it is rejected. The field keeps the
+    # positional (array_like) wire layout of the fields after it.
     replace: Optional[bool] = None
     # When True, the previous request's generated output tokens are excluded
     # from the accumulated context so the new turn sees only the original input.
@@ -560,23 +558,19 @@ class GenerateReqInput:
                 self.input_ids = [self.input_ids]
             if self.input_embeds is not None:
                 self.input_embeds = [self.input_embeds]
-            # A single request's media list holds all of its items; batch fields hold one entry per request.
-            # A list that is already one entry per request (e.g. [["a.png", "b.png"]]) is kept as is.
-            for field_name in (
-                "image_data",
-                "video_data",
-                "audio_data",
-                "mm_hashes",
-                "mm_content_hashes",
-            ):
-                value = getattr(self, field_name)
-                if isinstance(value, list) and value and not isinstance(value[0], list):
-                    setattr(self, field_name, [value])
+            # keep each request's media and hashes together, including empty lists
+            self.image_data = batch_single_media_input(self.image_data)
+            self.video_data = batch_single_media_input(self.video_data)
+            self.audio_data = batch_single_media_input(self.audio_data)
+            self.mm_hashes = batch_single_media_input(self.mm_hashes)
+            self.mm_content_hashes = batch_single_media_input(self.mm_content_hashes)
 
     def _normalize_single_inputs(self):
         """Normalize inputs for a single example."""
         if self.sampling_params is None:
             self.sampling_params = {}
+        else:
+            self.sampling_params = self.sampling_params.copy()
         if self.rid is None:
             self.rid = uuid.uuid4().hex
         if self.return_logprob is None:
@@ -738,7 +732,9 @@ class GenerateReqInput:
 
     def _normalize_video_data(self, num):
         """Normalize video data for batch processing."""
-        if self.video_data is None:
+        if self.video_data is None or (
+            isinstance(self.video_data, list) and not self.video_data
+        ):
             self.video_data = [None] * num
         elif not isinstance(self.video_data, list):
             self.video_data = [self.video_data] * num
@@ -747,7 +743,9 @@ class GenerateReqInput:
 
     def _normalize_audio_data(self, num):
         """Normalize audio data for batch processing."""
-        if self.audio_data is None:
+        if self.audio_data is None or (
+            isinstance(self.audio_data, list) and not self.audio_data
+        ):
             self.audio_data = [None] * num
         elif not isinstance(self.audio_data, list):
             self.audio_data = [self.audio_data] * num
@@ -757,11 +755,15 @@ class GenerateReqInput:
     def _normalize_sampling_params(self, num):
         """Normalize sampling parameters for batch processing."""
         if self.sampling_params is None:
-            self.sampling_params = [{}] * num
+            self.sampling_params = [{} for _ in range(num)]
         elif isinstance(self.sampling_params, dict):
-            self.sampling_params = [self.sampling_params] * num
+            self.sampling_params = [self.sampling_params.copy() for _ in range(num)]
         else:  # Already a list
-            self.sampling_params = self.sampling_params * self.parallel_sample_num
+            self.sampling_params = [
+                params.copy()
+                for params in self.sampling_params * self.parallel_sample_num
+            ]
+        self.__dict__.pop("_sub_obj_cache", None)
 
     def _normalize_watermark(self, num):
         if isinstance(self.watermark, list):
@@ -1391,6 +1393,8 @@ class EmbeddingReqInput:
                 self.rid = uuid.uuid4().hex
             if self.sampling_params is None:
                 self.sampling_params = {}
+            else:
+                self.sampling_params = self.sampling_params.copy()
             self.sampling_params["max_new_tokens"] = 0
         else:
             if self.rid is None:
@@ -1399,14 +1403,21 @@ class EmbeddingReqInput:
                 assert isinstance(self.rid, list), "The rid should be a list."
 
             if self.sampling_params is None:
-                self.sampling_params = [{}] * self.batch_size
+                self.sampling_params = [{} for _ in range(self.batch_size)]
             elif isinstance(self.sampling_params, dict):
-                self.sampling_params = [self.sampling_params] * self.batch_size
+                self.sampling_params = [
+                    self.sampling_params.copy() for _ in range(self.batch_size)
+                ]
+            else:
+                self.sampling_params = [
+                    params.copy() for params in self.sampling_params
+                ]
             for i in range(self.batch_size):
                 self.sampling_params[i]["max_new_tokens"] = 0
 
             self._normalize_lora_paths(self.batch_size)
 
+        self.__dict__.pop("_sub_obj_cache", None)
         self._validate_rid_uniqueness()
 
     def _validate_mm_batch_lengths(self):
@@ -2245,7 +2256,8 @@ class ReleaseMemoryOccupationReqInput(BaseReq, kw_only=True):
 
 
 class ReleaseMemoryOccupationReqOutput(BaseReq, kw_only=True):
-    pass
+    success: bool
+    message: str
 
 
 class ResumeMemoryOccupationReqInput(BaseReq, kw_only=True):
