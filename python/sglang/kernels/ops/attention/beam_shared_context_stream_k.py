@@ -43,6 +43,7 @@ from sglang.kernels.ops.attention.beam_shared_context import (
     attend_prompt_block,
     check_shared_context_inputs,
     empty_softmax_state,
+    max_element_offset,
     num_sms,
     wave_ctas,
 )
@@ -166,6 +167,7 @@ def _shared_context_stream_k_kernel(
     BLOCK_N: tl.constexpr,  # prompt tokens per work unit
     BLOCK_D: tl.constexpr,  # HEAD_DIM rounded up to a power of 2
     SETUP_UNITS: tl.constexpr,  # units charged for starting a tile
+    WIDE_KV_OFFSETS: tl.constexpr,  # K/V offsets past 2^31: slot * stride needs 64 bits
 ):
     TILES_PER_GROUP: tl.constexpr = Q_HEADS * BEAM_BLOCKS
     cta = tl.program_id(0)
@@ -239,6 +241,8 @@ def _shared_context_stream_k_kernel(
                     mask=token_mask,
                     other=0,
                 )
+                if WIDE_KV_OFFSETS:
+                    slots = slots.to(tl.int64)
                 kv_mask = token_mask[:, None] & dim_mask[None, :]
                 k_values = tl.load(
                     k_buffer
@@ -281,6 +285,8 @@ def _shared_context_stream_k_kernel(
                     mask=beam_mask,
                     other=0,
                 )
+                if WIDE_KV_OFFSETS:
+                    slots = slots.to(tl.int64)
                 k_values = tl.load(
                     k_buffer
                     + slots[:, None] * stride_k_slot
@@ -480,8 +486,8 @@ def shared_context_attention_stream_k(
     _, q_heads, head_dim = q.shape
     if k_buffer.shape[2] != head_dim:
         raise ValueError("Q and K/V buffers must have the same head_dim")
-    if max(k_buffer.numel(), v_buffer.numel(), q.numel()) >= _MAX_OFFSET:
-        raise ValueError("Q and K/V buffers must have fewer than 2^31 elements")
+    if q.numel() >= _MAX_OFFSET:
+        raise ValueError("Q must have fewer than 2^31 elements")
     if decode_slots.stride(1) != 1:
         raise ValueError("Decode slots must be contiguous [groups, steps * beam_width]")
     num_groups, beam_width = row_indices.shape
@@ -499,6 +505,8 @@ def shared_context_attention_stream_k(
         BLOCK_N=_BLOCK_N,
         BLOCK_D=block_d,
         SETUP_UNITS=_SETUP_UNITS,
+        WIDE_KV_OFFSETS=max(map(max_element_offset, (k_buffer, v_buffer)))
+        >= _MAX_OFFSET,
         num_warps=_NUM_WARPS,
         num_stages=_NUM_STAGES,
     )
@@ -560,6 +568,8 @@ def shared_context_attention_stream_k(
         raise ValueError(
             f"Up to {max_units} work units on {num_ctas} CTAs overflow 32-bit unit offsets"
         )
+    if (num_tiles + num_ctas) * _BLOCK_M * head_dim >= _MAX_OFFSET:
+        raise ValueError("The stream-K partials must have fewer than 2^31 elements")
     # One slot per (tile, CTA) segment; slot = tile + cta < num_tiles + num_ctas.
     partial_output = torch.empty(
         (num_tiles + num_ctas, _BLOCK_M, head_dim),

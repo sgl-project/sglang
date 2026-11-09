@@ -283,6 +283,13 @@ def resident_ctas_per_sm(kernel) -> int:
     return count
 
 
+def max_element_offset(tensor: torch.Tensor) -> int:
+    """Largest element offset from the tensor's base that a kernel can address."""
+    return sum(
+        (size - 1) * stride for size, stride in zip(tensor.shape, tensor.stride())
+    )
+
+
 _WAVE_CTAS: dict[tuple, int] = {}
 
 

@@ -35,6 +35,7 @@ from sglang.kernels.ops.attention.beam_shared_context import (
     attend_prompt_block,
     check_shared_context_inputs,
     empty_softmax_state,
+    max_element_offset,
     wave_ctas,
 )
 
@@ -48,6 +49,8 @@ _MAX_SPLITS = 8
 # Measured on RTX PRO 6000: the smallest split count that fills this share of the
 # last wave is within 1-2% of the best one at 1-8 groups; more add merge traffic.
 _MIN_WAVE_EFFICIENCY = 0.8
+# Triton computes Q, output and partial offsets in 32 bits.
+_MAX_OFFSET = 2**31
 
 
 @triton.jit
@@ -88,6 +91,7 @@ def _shared_context_split_kv_kernel(
     BLOCK_M: tl.constexpr,  # beams per program
     BLOCK_N: tl.constexpr,  # prompt tokens per block
     BLOCK_D: tl.constexpr,  # HEAD_DIM rounded up to a power of 2
+    WIDE_KV_OFFSETS: tl.constexpr,  # K/V offsets past 2^31: slot * stride needs 64 bits
 ):
     group = tl.program_id(0) // num_splits
     split = tl.program_id(0) % num_splits
@@ -134,6 +138,8 @@ def _shared_context_split_kv_kernel(
             mask=token_mask,
             other=0,
         )
+        if WIDE_KV_OFFSETS:
+            slots = slots.to(tl.int64)
         kv_mask = token_mask[:, None] & dim_mask[None, :]
         k_values = tl.load(
             k_buffer
@@ -171,6 +177,8 @@ def _shared_context_split_kv_kernel(
                 mask=beam_mask,
                 other=0,
             )
+            if WIDE_KV_OFFSETS:
+                slots = slots.to(tl.int64)
             k_values = tl.load(
                 k_buffer
                 + slots[:, None] * stride_k_slot
@@ -382,6 +390,8 @@ def shared_context_attention_split_kv(
         BLOCK_M=_BLOCK_M,
         BLOCK_N=_BLOCK_N,
         BLOCK_D=block_d,
+        WIDE_KV_OFFSETS=max(map(max_element_offset, (k_buffer, v_buffer)))
+        >= _MAX_OFFSET,
         num_warps=_NUM_WARPS,
         num_stages=_NUM_STAGES,
     )
@@ -436,6 +446,8 @@ def shared_context_attention_split_kv(
             device_index=q.device.index,
         )
         num_splits = num_kv_splits(num_groups * q_heads * beam_blocks, wave)
+    if max(q.numel(), num_splits * rows * q_heads * head_dim) >= _MAX_OFFSET:
+        raise ValueError("Q and the split partials must have fewer than 2^31 elements")
     write_partials = num_splits > 1
     if write_partials:
         partial_output = torch.empty(

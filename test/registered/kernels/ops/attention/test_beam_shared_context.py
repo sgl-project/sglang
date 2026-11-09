@@ -36,7 +36,7 @@ from sglang.kernels.ops.attention.beam_shared_context_stream_k import (
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=50, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-small")
 
 KERNELS = {
     "default": shared_context_attention,
@@ -257,6 +257,64 @@ class TestBeamSharedContextAttention(CustomTestCase):
                 )
                 torch.testing.assert_close(
                     output.float(), case.reference, rtol=1e-2, atol=1e-2
+                )
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_kv_cache_past_2_31_elements(self):
+        """KV offsets past 2^31 elements must not wrap: in 32 bits the split-KV
+        kernel read outside the cache (an illegal memory access)."""
+        if torch.cuda.mem_get_info()[0] < 6 << 30:
+            self.skipTest("needs 6 GB of free GPU memory")
+        device = torch.device("cuda")
+        heads, kv_heads, head_dim, width, capacity = 4, 2, 64, 16, 3
+        context_lens, decode_lens = [70, 300], [2, 1]
+        # Every slot of the case sits past 2^31 elements of the cache.
+        first_slot = (1 << 31) // (kv_heads * head_dim) + 16
+        num_used = sum(context_lens) + len(context_lens) * capacity * width
+        torch.manual_seed(0)
+        # One tensor serves as both K and V, to halve the 4.3 GB it takes.
+        kv = torch.empty(
+            first_slot + num_used,
+            kv_heads,
+            head_dim,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        kv[first_slot:] = torch.randn(
+            num_used, kv_heads, head_dim, dtype=torch.bfloat16, device=device
+        )
+        rows = torch.randperm(len(context_lens) * width, device=device)
+        bucket = _bucket(
+            context_lens,
+            decode_lens,
+            beam_width=width,
+            rows=rows.view(len(context_lens), width),
+            slots=torch.arange(
+                first_slot, first_slot + num_used, dtype=torch.int32, device=device
+            ),
+            decode_capacity=capacity,
+        )
+        q = torch.randn(
+            rows.numel(), heads, head_dim, dtype=torch.bfloat16, device=device
+        )
+        scale = 1.0 / math.sqrt(head_dim)
+        reference = torch.empty(q.shape, dtype=torch.float32, device=device)
+        _reference(q, kv, kv, bucket, scale, reference)
+        for name in ("split_kv", "stream_k"):
+            with self.subTest(kernel=name):
+                output = KERNELS[name](
+                    q,
+                    kv,
+                    kv,
+                    bucket.row_indices,
+                    bucket.context_slots,
+                    bucket.context_cu_seqlens,
+                    bucket.decode_slots,
+                    bucket.decode_lens,
+                    softmax_scale=scale,
+                )
+                torch.testing.assert_close(
+                    output.float(), reference, rtol=1e-2, atol=1e-2
                 )
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
