@@ -53,8 +53,36 @@ class TestRemapKvMapping(CustomTestCase):
         )
         self.assertTrue(torch.equal(self.req_to_token, before))
 
+    def test_snapshots_do_not_alias_the_mapping_after_reparenting(self):
+        before = self.req_to_token.clone()
+        parents = torch.tensor([2, 2, 0])
+        old_map, new_map = remap_kv_mapping(
+            self.req_to_token, self.rows, parents, prefix_len=4, seq_len=7
+        )
+        self.req_to_token.zero_()
+        self.assertTrue(torch.equal(old_map, before[self.rows, 4:7]))
+        self.assertTrue(torch.equal(new_map, before[parents, 4:7]))
+
 
 class TestCollectOrphanSlots(CustomTestCase):
+    def test_shared_slots_and_duplicate_parents_use_set_ownership(self):
+        old = torch.tensor(
+            [[1, 2, 3, 10], [1, 2, 4, 11], [1, 5, 6, 12]], dtype=torch.int32
+        )
+        new = old[torch.tensor([0, 2, 2])]
+        expected = sorted(set(old.flatten().tolist()) - set(new.flatten().tolist()))
+        self.assertEqual(collect_orphan_slots(old, new).tolist(), expected)
+        self.assertEqual(expected, [4, 11])
+
+    def test_empty_and_fully_shared_suffixes_have_no_orphans(self):
+        for old in (
+            torch.empty((3, 0), dtype=torch.int32),
+            torch.tensor([[7, 8, 9]] * 3, dtype=torch.int32),
+        ):
+            with self.subTest(shape=old.shape):
+                new = old[torch.tensor([0, 0, 0])]
+                self.assertEqual(collect_orphan_slots(old, new).numel(), 0)
+
     def test_returns_slots_nobody_inherits(self):
         req_to_token = torch.arange(30, dtype=torch.int64).reshape(3, 10)
         rows = torch.tensor([0, 1, 2], dtype=torch.int64)

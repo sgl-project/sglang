@@ -76,20 +76,26 @@ def append_beam_tail(batch: ScheduleBatch) -> None:
     batch.seq_lens = torch.cat(
         [
             batch.seq_lens,
-            torch.repeat_interleave(batch.seq_lens[leader_idx_dev], widths_dev),
+            torch.repeat_interleave(
+                batch.seq_lens[leader_idx_dev], widths_dev, output_size=t
+            ),
         ]
     )
     if batch.seq_lens_cpu is not None:
         batch.seq_lens_cpu = torch.cat(
             [
                 batch.seq_lens_cpu,
-                torch.repeat_interleave(batch.seq_lens_cpu[leader_idx_cpu], widths_cpu),
+                torch.repeat_interleave(
+                    batch.seq_lens_cpu[leader_idx_cpu], widths_cpu, output_size=t
+                ),
             ]
         )
     batch.orig_seq_lens = torch.cat(
         [
             batch.orig_seq_lens,
-            torch.repeat_interleave(batch.orig_seq_lens[leader_idx_dev], widths_dev),
+            torch.repeat_interleave(
+                batch.orig_seq_lens[leader_idx_dev], widths_dev, output_size=t
+            ),
         ]
     )
     batch.seq_lens_sum = None

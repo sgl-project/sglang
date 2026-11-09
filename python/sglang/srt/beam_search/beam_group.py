@@ -209,6 +209,7 @@ class BeamGroup:
         tokens = sel.tokens.tolist()
         parents = sel.parent_idx.tolist()
         cums = sel.cum_logprobs.tolist()
+        stop_ids = set(self.stop_token_ids.tolist())
         # A parent outside the committed frontier means a tick-gating bug let an
         # unsynchronized step through; fail rather than build a corrupt DAG.
         assert not parents or max(parents) < len(self.leaves), (
@@ -216,7 +217,14 @@ class BeamGroup:
         )
         for token, parent, cum in zip(tokens, parents, cums):
             leaf = BeamNode(token, self.leaves[parent])
-            self.completed.append(CompletedBeam(leaf, cum, new_len, matched_token=None))
+            self.completed.append(
+                CompletedBeam(
+                    leaf,
+                    cum,
+                    new_len,
+                    matched_token=token if token in stop_ids else None,
+                )
+            )
         self.leaves = []
         self.num_committed = new_len
         self.state = BeamGroupState.FINISHED
