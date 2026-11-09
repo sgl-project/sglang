@@ -23,7 +23,7 @@ from copy import deepcopy
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.cuda_graph_lifetime import harness
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 NEW_TOKENS = 9
 RUN_ID = "run-1"

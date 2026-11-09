@@ -32,7 +32,7 @@ from sglang.test.unified_allocator_fixtures import (
     setup_allocator_context,
 )
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
 def _shared_allocator(*, page_size=4, total_bytes=2048, pool_tokens=None, window=8):

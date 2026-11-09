@@ -31,7 +31,7 @@ from sglang.srt.mem_cache.kv.sizing import check_bs1_floor
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.unified_allocator_fixtures import build_test_unified_pools
 
-register_cpu_ci(est_time=9, suite="base-a-test-cpu")
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 _DEV = "cpu"
 

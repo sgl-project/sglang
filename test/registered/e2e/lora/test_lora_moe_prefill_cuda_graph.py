@@ -26,7 +26,7 @@ from sglang.test.kits.lora_prefill_graph_kit import (
 )
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=155, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=209, stage="extra-a", runner_config="1-gpu-large")
 
 
 class TestMoELoRAPrefillCudaGraph(CustomTestCase):

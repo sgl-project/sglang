@@ -13,7 +13,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=64, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=53, stage="base-b", runner_config="1-gpu-small")
 
 
 class TestRequestLengthValidation(CustomTestCase):

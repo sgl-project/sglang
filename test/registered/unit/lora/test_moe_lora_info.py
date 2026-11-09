@@ -20,7 +20,7 @@ from sglang.test.ci.ci_register import (
     register_xpu_ci,
 )
 
-register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=8, stage="base-b", runner_config="1-gpu-small")
 # backend-specific: ROCm's Triton build of _compute_moe_lora_info_kernel,
 # graph-padding clear included.
 register_amd_ci(est_time=5, stage="stage-b", runner_config="1-gpu-small-amd")

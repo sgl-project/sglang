@@ -14,8 +14,8 @@ from sglang.test.unified_allocator_fixtures import (
     setup_allocator_context,
 )
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
-register_cuda_ci(est_time=13, stage="extra-a", runner_config="1-gpu-small")
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cuda_ci(est_time=15, stage="extra-a", runner_config="1-gpu-small")
 
 
 def make_conv_bundle(device, page_size=1, lazy=True, state_slots=40):

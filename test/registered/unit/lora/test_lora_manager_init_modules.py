@@ -36,7 +36,7 @@ from sglang.srt.lora.utils import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
 # A VL model whose vision tower nests under `layers.<i>.` just like the decoder,
 # so get_layer_id() resolves both to layer 0 and only should_apply_lora can tell

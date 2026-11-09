@@ -23,7 +23,7 @@ from sglang.srt.model_executor.encoder_swa_replay import (  # noqa: E402
 )
 from sglang.srt.model_executor.forward_mode import ForwardMode  # noqa: E402
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
 class _FakeReq:

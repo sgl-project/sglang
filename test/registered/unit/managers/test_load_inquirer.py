@@ -21,7 +21,7 @@ from sglang.srt.observability.metrics_collector import SchedulerStats
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.scheduler_test_utils import FakeReq, decode_queue
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
 
 class TestSchedulePolicyWaitingQueueMatching(unittest.TestCase):

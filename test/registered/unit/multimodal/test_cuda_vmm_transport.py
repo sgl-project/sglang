@@ -31,7 +31,7 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=36, stage="base-c", runner_config="4-gpu-gb300")
+register_cuda_ci(est_time=35, stage="base-c", runner_config="4-gpu-gb300")
 
 
 class _FabricUnavailableCudaVmmMemoryPool(CudaVmmMemoryPool):

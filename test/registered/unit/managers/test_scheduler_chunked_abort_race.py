@@ -23,7 +23,7 @@ from sglang.srt.managers.scheduler_components import (  # noqa: E402
 )
 from sglang.test.scheduler_test_utils import FakeReq, empty_request_lists  # noqa: E402
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class _FakeReq(FakeReq):

@@ -42,7 +42,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.utils import multigpu_pytest_main
 
 register_cuda_ci(
-    est_time=300,
+    est_time=79,
     stage="extra-b",
     runner_config="8-gpu-h200",
 )

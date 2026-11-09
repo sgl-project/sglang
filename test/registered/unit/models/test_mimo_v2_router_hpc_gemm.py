@@ -14,7 +14,7 @@ maybe_stub_sgl_kernel()
 from sglang.srt.environ import envs  # noqa: E402
 from sglang.srt.models.mimo_v2 import MoEGate  # noqa: E402
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 def _mimo_config(hidden_size, n_routed_experts, **kwargs):

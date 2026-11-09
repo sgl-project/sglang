@@ -33,7 +33,7 @@ from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
 MAX_LOADED_LORAS = 2
 # Upper bound for steps that finish at once when correct; a broken counter or

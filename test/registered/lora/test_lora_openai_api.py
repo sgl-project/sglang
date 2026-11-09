@@ -16,7 +16,7 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_amd_ci(est_time=30, suite="nightly-amd-1-gpu", nightly=True)
-register_cpu_ci(est_time=7, suite="base-a-test-cpu")
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 register_cpu_ci(est_time=7, suite="stage-b-test-cpu-intel")
 
 SERVED_MODEL_NAME = "test-model"

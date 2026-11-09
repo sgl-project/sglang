@@ -17,7 +17,7 @@ from sglang.test.test_utils import (
 
 # est_time covers two eval rounds.
 register_cuda_ci(
-    est_time=600,
+    est_time=498,
     stage="extra-a",
     runner_config="2-gpu-large",
 )

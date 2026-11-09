@@ -19,7 +19,7 @@ from sglang.srt.speculative import eagle_draft_extend_cuda_graph_runner as mod
 from sglang.srt.speculative import eagle_megakernel
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class TestEagleDraftExtendCudaGraphRunner(unittest.TestCase):

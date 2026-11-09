@@ -17,7 +17,7 @@ from sglang.srt.rust_server.config import (  # noqa: E402
     _partition_cores,
 )
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 def partition(node_cores, **kwargs):

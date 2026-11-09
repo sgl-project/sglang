@@ -45,7 +45,7 @@ def _window_hit(req):
     return max(Req.window_host_hit_lengths.fget(req).values(), default=0)
 
 
-register_cpu_ci(est_time=46, suite="base-a-test-cpu")
+register_cpu_ci(est_time=55, suite="base-a-test-cpu")
 
 _REQ = CacheRequestHandle("r", 0)
 

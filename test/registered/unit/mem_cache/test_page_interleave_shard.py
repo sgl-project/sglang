@@ -127,7 +127,7 @@ from sglang.test.mem_cache_utils import finish_req
 from sglang.test.test_utils import CustomTestCase, enter_scope
 from sglang.test.tree_slots import tree_slots_of
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
 N = 4  # shard size
 PS = 16  # physical page size

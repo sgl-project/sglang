@@ -31,7 +31,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.unified_allocator_fixtures import arena_of
 
-register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=16, stage="base-b", runner_config="1-gpu-small")
 
 _HAS_CUDA = torch.cuda.is_available()
 _DEV = "cuda"

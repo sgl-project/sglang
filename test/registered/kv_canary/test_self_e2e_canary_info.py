@@ -13,7 +13,7 @@ from sglang.test.kv_canary.canary_info_e2e_base import (
     first_mismatch_positions,
 )
 
-register_cuda_ci(est_time=520, stage="extra-a", runner_config="1-gpu-small")
+register_cuda_ci(est_time=210, stage="extra-a", runner_config="1-gpu-small")
 
 
 class TestCanaryInfoPassthroughEagle(CanaryInfoE2EBase):

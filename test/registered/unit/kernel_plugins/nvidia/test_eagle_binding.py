@@ -38,7 +38,7 @@ from sglang.srt.speculative.eagle_megakernel import EagleMegakernel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, stage="base-a", runner_config="cpu")
+register_cpu_ci(est_time=3, stage="base-a", runner_config="cpu")
 
 
 def _backend(cls, **fields):

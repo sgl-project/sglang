@@ -59,7 +59,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import enter_override, enter_scope
 
-register_cpu_ci(2.0, "base-a-test-cpu")
+register_cpu_ci(9, "base-a-test-cpu")
 
 
 register_cpu_ci(est_time=5, suite="stage-b-test-cpu-intel")

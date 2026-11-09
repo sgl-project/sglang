@@ -23,7 +23,7 @@ from sglang.srt.mem_cache.kv.router import PlainPoolRouter  # noqa: E402
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool  # noqa: E402
 from sglang.srt.runtime_context import get_context  # noqa: E402
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 def _backend():

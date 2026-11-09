@@ -19,8 +19,8 @@ from sglang.test.unified_allocator_fixtures import (
     setup_allocator_context,
 )
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
-register_cuda_ci(est_time=18, stage="extra-a", runner_config="1-gpu-small")
+register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+register_cuda_ci(est_time=17, stage="extra-a", runner_config="1-gpu-small")
 
 
 class TestMambaCompaction(CustomTestCase):

@@ -35,7 +35,7 @@ SLOTS = (
 FIRST_WINDOW = tree_slot_ids(SLOTS)["WINDOW_4"]
 SECOND_WINDOW = ComponentType.of("WINDOW_64")
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 @pytest.fixture

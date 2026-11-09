@@ -6,7 +6,7 @@ registration, so they run on CPU with the device capability mocked.
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
 import logging
 import sys

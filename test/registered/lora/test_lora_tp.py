@@ -26,7 +26,7 @@ from sglang.test.lora_utils import (
 )
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=115, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=87, stage="base-b", runner_config="2-gpu-large")
 # backend-specific: ROCm's Triton build of the chunked-SGMV LoRA kernels on
 # TP-sharded adapter weights.
 register_amd_ci(

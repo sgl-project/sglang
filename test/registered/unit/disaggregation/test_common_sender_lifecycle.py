@@ -16,7 +16,7 @@ from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.mori_stub import mori_stub
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 def make_sender(manager_type, room=42, *, sender_type=CommonKVSender):

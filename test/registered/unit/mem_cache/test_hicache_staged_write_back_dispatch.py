@@ -46,7 +46,7 @@ def _window_hit(req):
     return max(Req.window_host_hit_lengths.fget(req).values(), default=0)
 
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 MEMORY_POOL_HOST_MODULE = "sglang.srt.mem_cache.memory_pool_host"
 DSA_POOL_HOST_MODULE = "sglang.srt.mem_cache.pool_host.dsa"

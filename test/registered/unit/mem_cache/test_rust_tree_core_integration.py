@@ -14,8 +14,8 @@ import torch
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.tree_slots import core_window_evictable, core_window_protected
 
-register_cpu_ci(est_time=20, suite="base-a-test-cpu")
-register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-small")
+register_cpu_ci(est_time=16, suite="base-a-test-cpu")
+register_cuda_ci(est_time=14, stage="base-b", runner_config="1-gpu-small")
 
 from sglang.srt.disaggregation.kv_events import (
     AllBlocksCleared,

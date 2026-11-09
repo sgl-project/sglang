@@ -32,7 +32,7 @@ from sglang.srt.models.unlimited_ocr_v2_support.admission import UocrPrefillAdde
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 PAGE, IMG, BOS, EOS = 7, 9, 1, 2
 CFG = {"image_token_id": IMG, "page_token_id": PAGE, "per_page_image_tokens": 3}
