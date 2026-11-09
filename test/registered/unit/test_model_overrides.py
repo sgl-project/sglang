@@ -4013,12 +4013,20 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             moe_runner_backend="triton",
             quantization=None,
         )
+        split_args = SimpleNamespace(
+            attention_backend=None,
+            prefill_attention_backend="triton",
+            decode_attention_backend="triton",
+            moe_runner_backend="triton",
+            quantization=None,
+        )
         platform = Mock(spec=SRTPlatform)
         platform.is_out_of_tree.return_value = True
         platform.get_default_attention_backend.side_effect = NotImplementedError
 
         with patch.object(gemma4_module, "current_platform", platform):
             self.assertEqual(_gemma4_overrides(args, None), {})
+            self.assertEqual(_gemma4_overrides(split_args, None), {})
             platform.get_default_attention_backend.assert_not_called()
             self.assertIn("triton", gemma4_attention_backends())
             platform.get_default_attention_backend.assert_called_once()

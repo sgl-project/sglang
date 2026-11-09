@@ -73,7 +73,9 @@ def _gemma4_overrides(server_args: Any, hf_config: Any) -> dict:
     # If only one split backend is set, keep the other side on a
     # Gemma4-compatible fallback instead of letting generic backend selection
     # choose an unsupported backend later.
-    elif cfg.attention_backend is None:
+    elif cfg.attention_backend is None and (
+        cfg.prefill_attention_backend is None or cfg.decode_attention_backend is None
+    ):
         overrides["attention_backend"] = _gemma4_default_attention_backend(is_diffusion)
     if get_platform().is_sm100 and cfg.moe_runner_backend == "auto":
         if model_config_of(server_args).quantization == "modelopt_fp4":
