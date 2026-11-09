@@ -26,10 +26,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import checkpoint_kv_cache, release_kv_cache
 from sglang.srt.mem_cache.kv.alloc import band as band_module
-from sglang.srt.mem_cache.kv.alloc.band import (
-    relieve_for_alloc,
-    settle_pending_for_recovery,
-)
+from sglang.srt.mem_cache.kv.alloc.band import settle_pending_for_recovery
 from sglang.srt.mem_cache.kv.alloc.pricing import no_relief_plan
 from sglang.srt.mem_cache.layout.fused_draft import (
     DenseDraftRegion,
@@ -854,95 +851,6 @@ class TestUrgentRecoverySettlesFirst(CustomTestCase):
         flt.free(v[:2], _pages=v[:2])
         with _strict(), self.assertRaises(AssertionError):
             flt._make_room("low", flt.entry_bytes_per_page)
-
-    def test_a_pinned_end_donor_is_left_out_of_the_recovery(self):
-        """An owner shortfall asks its pinned window to flush, which reclaims
-        nothing: the recovery reads nothing of the window and leaves its
-        pending pages pending (no forward wait)."""
-        allocator = build_swa_pool(page_size=4, lazy=True)
-        owner, window = allocator.full_attn_allocator, allocator.swa_attn_allocator
-        ids = allocator.alloc(allocator.available_size())
-        _launch(allocator.forward_steps)
-        allocator.free_window(window.sub_pool_name, ids[:8])
-        window.add_pin_source(lambda: True)
-        pending = window._pending_until_retire
-        events = []
-        band = type(window)
-        real_settle, real_tolist = band.settle_pending, torch.Tensor.tolist
-        with (
-            _strict(),
-            mock.patch.object(
-                band,
-                "settle_pending",
-                autospec=True,
-                side_effect=lambda b, *a, **k: (
-                    events.append(("settle", b)) or real_settle(b, *a, **k)
-                ),
-            ),
-            mock.patch.object(
-                torch.Tensor,
-                "tolist",
-                lambda t: events.append(("read", None)) or real_tolist(t),
-            ),
-        ):
-            relieve_for_alloc(owner, 4)
-        self.assertIs(window._pending_until_retire, pending)
-        self.assertEqual(events, [])
-
-    def test_pinned_ends_are_not_read_when_the_float_settles(self):
-        """With every band pinned (as a PD transfer pins them), an owner
-        shortfall's recovery reclaims only in the window float: the float's
-        settle reads ahead the float alone, not the pinned ends the recovery
-        leaves out, and leaves their pending pages pending."""
-        setup_allocator_context()
-        _, allocator = build_tri_pool(page_size=1)
-        owner, window, state = (
-            allocator.full_attn_allocator,
-            allocator.swa_attn_allocator,
-            allocator.mamba_allocator,
-        )
-        ids = allocator.alloc(16).to(torch.int64)
-        slots = []
-        while (slot := allocator.alloc_state_slots(1)) is not None:
-            slots.append(slot)
-        event = mock.Mock(spec=["query", "wait"])
-        event.query.return_value = False
-        _launch(allocator.forward_steps, event)
-        # Pending pages in the float and in both ends.
-        window.free(ids[:4], _pages=ids[:4])
-        owner.free(ids[8:12])
-        state.free(torch.cat(slots[-2:]))
-        for band in (owner, window, state):
-            self.assertTrue(band._pending_until_retire)
-            band.add_pin_source(lambda: True)
-        owner_pending = owner._pending_until_retire
-        state_pending = state._pending_until_retire
-        read, waits = [], []
-        real_read_ahead = type(window)._read_ahead
-        real_ends_read_ahead = type(owner)._read_ahead
-
-        def record(real):
-            def read_ahead(band):
-                read.append(band.sub_pool_name)
-                return real(band)
-
-            return read_ahead
-
-        with (
-            _strict(),
-            mock.patch.object(type(window), "_read_ahead", record(real_read_ahead)),
-            mock.patch.object(type(owner), "_read_ahead", record(real_ends_read_ahead)),
-            mock.patch.object(
-                band_module, "wait_signals", lambda *a, **k: waits.append(1)
-            ),
-        ):
-            relieve_for_alloc(owner, owner.available_size() + 4)
-        self.assertTrue(waits)  # the float's settle waited
-        self.assertIn(window.sub_pool_name, read)
-        self.assertNotIn(owner.sub_pool_name, read)
-        self.assertNotIn(state.sub_pool_name, read)
-        self.assertIs(owner._pending_until_retire, owner_pending)
-        self.assertIs(state._pending_until_retire, state_pending)
 
     def test_a_drained_move_source_keeps_the_host_view(self):
         """A partial compaction under an unfinished forward leaves its moved

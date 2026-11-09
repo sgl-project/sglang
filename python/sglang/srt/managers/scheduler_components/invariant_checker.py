@@ -703,7 +703,8 @@ def create_scheduler_watchdog(
 
     return WatchdogRaw(
         debug_name="Scheduler",
-        get_counter=lambda: scheduler.forward_ct,
+        # A step or a heartbeat while it waits (`Scheduler.feed_watchdog`).
+        get_counter=lambda: (scheduler.forward_ct, scheduler.watchdog_heartbeats),
         is_active=lambda: (
             scheduler.is_initializing or scheduler.cur_batch_for_debug is not None
         ),

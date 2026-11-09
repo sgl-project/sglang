@@ -807,6 +807,9 @@ class Envs:
     SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL = EnvFloat(5.0)
     SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE = EnvInt(2)
     SGLANG_DISAGGREGATION_WAITING_TIMEOUT = EnvInt(300)
+    # Seconds a unified-memory page move waits for network transfers before it
+    # fails; unset: past the bootstrap, waiting and deferred-release timeouts.
+    SGLANG_DISAGGREGATION_PAGE_MOVE_WAIT_TIMEOUT = EnvFloat(None)
     # A wedged RDMA stack fails startup here instead of at the scheduler watchdog.
     SGLANG_DISAGGREGATION_ENGINE_INIT_TIMEOUT = EnvInt(60)
     SGLANG_DISAGGREGATION_NIXL_BACKEND = EnvStr("UCX")

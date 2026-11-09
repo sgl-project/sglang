@@ -3129,7 +3129,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 if staging_deferred:
                     continue
 
-                self._staging_outstanding[kv_chunk.room] -= 1
+                # A room started anew since this chunk was counted no longer
+                # counts it: the decrement and the report find nothing.
+                if kv_chunk.room in self._staging_outstanding:
+                    self._staging_outstanding[kv_chunk.room] -= 1
+                self.note_send_finished(kv_chunk.room, kv_chunk.send_record)
                 if self.enable_deferred_decode_kv_release:
                     # In-flight write finished; if aborted and nothing outstanding,
                     # the pages are idle -> release the held ack.
@@ -3166,6 +3170,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
                 if kv_chunk is not None:
                     self.poison_deferred_ack_room(kv_chunk.room)
+                    # The worker stops: fail its room so that no page move
+                    # waits for a send it will never finish.
+                    self.record_failure(kv_chunk.room, f"Transfer worker failed: {e}")
+                    self.update_status(kv_chunk.room, KVPoll.Failed)
                 raise RuntimeError(
                     f"Transfer thread failed because of {e}. Prefill instance with bootstrap_port={self.bootstrap_port} is dead."
                 )
@@ -3418,8 +3426,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 trace_ctx=trace_ctx,
                 wait_event=wait_event,
                 indices_event=indices_event,
+                send_record=self.send_record(bootstrap_room),
             )
         )
+        self.note_send_enqueued(bootstrap_room)
 
     def get_session_id(self):
         return self.engine.get_session_id()

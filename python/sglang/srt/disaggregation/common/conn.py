@@ -289,6 +289,17 @@ class DeferredAbortAckState(msgspec.Struct):
     prefill_ranks: Set[int]
 
 
+class SendRecord:
+    """A room's sends queued for the transfer worker and finished by it, so a
+    page move can tell when the engine is done with one send's rows."""
+
+    __slots__ = ("queued", "finished")
+
+    def __init__(self) -> None:
+        self.queued = 0
+        self.finished = 0
+
+
 class CommonKVManager(BaseKVManager):
     defer_decode_allocation: bool = False
     deferred_bootstrap: Optional[DeferredBootstrap] = None
@@ -300,6 +311,9 @@ class CommonKVManager(BaseKVManager):
     # carries tagged messages prefix a tag frame and may append a reason:
     # ``[tag, room, status, prefill_rank, reason]``.
     kv_status_msg_tag: Optional[bytes] = None
+    # Each room's `SendRecord`, from its first queued send until the sender is
+    # cleared or the room starts a new lifecycle. Created on first use.
+    _send_records: Optional[Dict[int, SendRecord]] = None
     kv_status_msg_carries_reason: bool = False
     sender_trace_module: Optional[str] = None
     # Sender reports transfer_latency_s (first enqueue -> Success). Otherwise
@@ -711,6 +725,7 @@ class CommonKVManager(BaseKVManager):
                 self._deferred_ack_targets.pop(bootstrap_room, None)
                 self._deferred_ack_poisoned_rooms.discard(bootstrap_room)
                 self._staging_outstanding.pop(bootstrap_room, None)
+                self._forget_sends(bootstrap_room)
                 self.request_status[bootstrap_room] = status
             return
         if status == KVPoll.Failed:
@@ -725,6 +740,39 @@ class CommonKVManager(BaseKVManager):
             # happily promote it back to Transferring or Success.
             return
         self.request_status[bootstrap_room] = max(current, status)
+
+    def send_record(self, bootstrap_room: int) -> SendRecord:
+        """The room's send record, created by its first send (scheduler
+        thread); a queued send carries the record it was counted in."""
+        if self._send_records is None:
+            self._send_records = {}
+        record = self._send_records.get(bootstrap_room)
+        if record is None:
+            record = self._send_records[bootstrap_room] = SendRecord()
+        return record
+
+    def note_send_enqueued(self, bootstrap_room: int) -> None:
+        """A send of the room was queued for the transfer worker (scheduler
+        thread)."""
+        self.send_record(bootstrap_room).queued += 1
+
+    def note_send_finished(
+        self, bootstrap_room: int, record: Optional[SendRecord] = None
+    ) -> None:
+        """The transfer worker is done with a queued send (worker thread); a
+        report whose ``record`` is no longer the room's is dropped."""
+        current = (self._send_records or {}).get(bootstrap_room)
+        if current is not None and (record is None or record is current):
+            current.finished += 1
+
+    def send_counts(self, bootstrap_room: int) -> Tuple[int, int]:
+        """The room's sends queued and finished so far, in queue order."""
+        record = (self._send_records or {}).get(bootstrap_room)
+        return (0, 0) if record is None else (record.queued, record.finished)
+
+    def _forget_sends(self, bootstrap_room: int) -> None:
+        if self._send_records is not None:
+            self._send_records.pop(bootstrap_room, None)
 
     def _notify_bootstrap(self, room: int, notification: BootstrapNotification) -> None:
         if notification is None:
@@ -2492,6 +2540,7 @@ class CommonKVSender(BaseKVSender):
             if status in (KVPoll.Success, KVPoll.Failed):
                 self.conclude_state = status
         self.kv_mgr.request_status.pop(self.bootstrap_room, None)
+        self._retire_sends()
         self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, None)
         self.kv_mgr.transfer_infos.pop(self.bootstrap_room, None)
         with self.kv_mgr.failure_lock:
@@ -2526,6 +2575,11 @@ class CommonKVSender(BaseKVSender):
             is_from_another_rank=failure_reason is None,
         )
 
+    def _retire_sends(self) -> None:
+        """Drop the room's send record once it concluded or failed; a later
+        worker report finds no record and is dropped."""
+        self.kv_mgr._forget_sends(self.bootstrap_room)
+
     def abort(self):
         if self.kv_mgr.deferred_bootstrap is not None and not self._owns_bootstrap_room:
             return
@@ -2535,6 +2589,9 @@ class CommonKVSender(BaseKVSender):
         )
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
         self.conclude_state = KVPoll.Failed
+        # Some abort paths release the request without ever clearing the
+        # sender: retire its sends here, or the record outlives the room.
+        self._retire_sends()
         self.trace_ctx.abort(abort_info={"reason": "Aborted"})
         self.trace_ctx.trace_req_finish()
 

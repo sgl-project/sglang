@@ -35,7 +35,6 @@ import inspect
 import logging
 import os
 from typing import (
-    Callable,
     Dict,
     Generic,
     Hashable,
@@ -48,6 +47,7 @@ from typing import (
     Union,
 )
 
+import numpy as np
 import torch
 from torch.profiler import record_function
 
@@ -73,7 +73,10 @@ from sglang.srt.mem_cache.kv.alloc.page_usage import (
     PageUsage,
 )
 from sglang.srt.mem_cache.kv.alloc.signals import (
+    NetworkWaiter,
+    ReceiveHold,
     StreamTransfer,
+    TransferRelease,
     keys_of,
     signal_fired,
     wait_signals,
@@ -326,11 +329,9 @@ class _AllocatorOperation:
     """One allocator operation over some bands (`allocator_operation`): which
     bands read ahead on the host, everything (``read``) or their free and
     pending pages only (``geometry``), whether it moves pages, and whether a
-    stream wait was queued. ``full_read`` limits which bands an operation
-    that moves reads everything ahead in (all of them when None): a recovery
-    does not read a band it reclaims nothing in."""
+    stream wait was queued."""
 
-    __slots__ = ("bands", "read", "geometry", "moves", "waited", "full_read")
+    __slots__ = ("bands", "read", "geometry", "moves", "waited")
 
     def __init__(self, bands, moves: bool) -> None:
         self.bands = list(bands)
@@ -338,12 +339,6 @@ class _AllocatorOperation:
         self.geometry: Set[int] = set()
         self.moves = moves
         self.waited = False
-        self.full_read: Optional[Set[int]] = None
-
-    def reads_all(self, band) -> bool:
-        """Whether ``band`` reads everything ahead before this operation's
-        first wait (its read plan)."""
-        return self.moves and (self.full_read is None or id(band) in self.full_read)
 
 
 @contextlib.contextmanager
@@ -397,24 +392,15 @@ def settle_pending_for_recovery(bands):
     Inside, the recovery reads no device state on the host (asserted). Nested
     entries over ready bands do nothing.
     """
-    # A band whose urgent flush reclaims nothing (a pinned end) is left out:
-    # its capacity counts its pending pages already, and a read or a wait for
-    # it would buy nothing.
-    bands = tuple(b for b in bands if b is not None and b._recovery_reclaims())
+    bands = tuple(b for b in bands if b is not None)
     # The operation spans the bands' chains: a wait of the recovery comes
-    # after every chain band it may reclaim in read ahead, as the next one
-    # may read it. Its read plan leaves the others out, unless an operation
-    # that moves already planned to read everything.
+    # after every chain band read ahead, as the next one may read it.
     chain = {id(c): c for b in bands for c in b._chain_bands()}
-    outer = next((c._operation for c in chain.values() if c._operation), None)
-    restricts = outer is None or not outer.moves or outer.full_read is not None
-    with allocator_operation(chain.values(), moves=True) as op:
-        if restricts:
-            op.full_read = (op.full_read or set()) | {
-                key for key, c in chain.items() if c._recovery_reclaims()
-            }
-        with _settled_for_recovery(bands, op):
-            yield
+    with (
+        allocator_operation(chain.values(), moves=True) as op,
+        _settled_for_recovery(bands, op),
+    ):
+        yield
 
 
 @contextlib.contextmanager
@@ -441,11 +427,9 @@ def _settled_for_recovery(bands, op):
     for b in bands:
         b._read_ahead()
         op.read.add(id(b))
-    # The rest of the chain too, before any settle waits, by the operation's
-    # read plan: a band a recovery reclaims nothing in (a pinned end) is not
-    # read. The settles' waits (`_before_wait`) follow the same plan.
+    # The rest of the chain too, before any settle waits.
     for c in op.bands:
-        if id(c) not in op.read and op.reads_all(c):
+        if id(c) not in op.read:
             c._read_ahead()
             op.read.add(id(c))
     for b in bands:
@@ -653,6 +637,9 @@ class Band:
         # transfers, and pages a move vacated while readers could still read
         # them (`PageUsage`).
         self.usage = PageUsage()
+        # Move batches that may have moved a held receive row (one issued
+        # while a hold is open).
+        self.held_row_moves = 0
         # Cumulative observability counters (NOT reset at clear()).
         self._stats_n_free_lazy: int = 0
         self._stats_n_release_batch: int = 0
@@ -673,10 +660,6 @@ class Band:
             _STATS_INSTANCES.add(self)
             _install_signal_handlers_once()
         self.live_page_count = 0
-        # Pin sources: DMA initiators (PD transfers) whose queues outlive an
-        # iteration. While any reports busy, no page of this band relocates: the
-        # engine reads or writes the addresses it was handed.
-        self.pin_sources: Tuple[Callable[[], bool], ...] = ()
 
         # Per-call move cap on NON-urgent `_flush`: bounds work per `on_idle()` so
         # a large backlog doesn't block ZMQ IPC. Urgent retries are uncapped.
@@ -851,11 +834,6 @@ class Band:
         """Whether the free list's host copy matches it."""
         return self._host_free is not None
 
-    def _recovery_reclaims(self) -> bool:
-        """Whether an urgent recovery can reclaim anything here: an end whose
-        urgent flush compacts (`_flush`'s gate)."""
-        return not self.pinned_by_source()
-
     def _assert_ready_for_geometry(self, where: str) -> None:
         """Layout-changing geometry decides on holes and live pages only: the
         band holds no pending page and, inside an urgent recovery, its free
@@ -900,15 +878,16 @@ class Band:
         return bands
 
     def _wait_on_stream(self, event) -> None:
-        """Order the current stream's later work after ``event`` (an event, or a
-        tuple of them) without blocking the host. The read-ahead runs before
-        the fired check, so every rank reads the device at the same points:
-        whether an event fired decides only whether a wait is queued, never a
-        layout."""
+        """Order the current stream's later work after ``event`` (an event, a
+        network transfer, or a tuple of them): an event on the GPU, an
+        unreleased network transfer on the host (`network_waiter`). The
+        read-ahead runs before the fired check, so every rank reads the device
+        at the same points: whether an event fired decides only whether a wait
+        is queued, never a layout."""
         self._before_wait()
         if signal_fired(event):
             return
-        wait_signals(event)
+        wait_signals(event, network_waiter=self.network_waiter)
 
     def _before_wait(self) -> None:
         """Before a stream wait: every band of the current allocator operation
@@ -924,7 +903,7 @@ class Band:
         for band in op.bands:
             if id(band) in op.read:
                 continue
-            if op.reads_all(band):
+            if op.moves:
                 band._read_ahead()
                 op.read.add(id(band))
             elif id(band) not in op.geometry and band._fence_may_order_takes():
@@ -1022,12 +1001,14 @@ class Band:
     def _note_moved(self, pairs: Sequence[Tuple[int, int]]) -> None:
         """Pages moved ``src -> dst``, in this order: keep the pages the
         ledger's forwards and transfers name on the host as their ids now
-        translate. Each copy is replaced, not changed in place: a caller still
-        holding the sets it read before the move keeps them as they were."""
+        translate; a transfer recorded by physical units keeps its rows. Each
+        copy is replaced, not changed in place: a caller still holding the
+        sets it read before the move keeps them as they were."""
         if not pairs:
             return
         for use in self.usage.uses:
-            if use.host_pages is None:
+            # Physical units stay the rows an engine was handed.
+            if use.host_pages is None or use.unit_tokens is not None:
                 continue
             pages = set(use.host_pages)
             for src, dst in pairs:
@@ -1047,6 +1028,10 @@ class Band:
     # -- size reporting --
 
     max_live_tokens: Optional[int] = None
+
+    # Waits on the host for network transfers a move cannot avoid; shared by
+    # every band of a chain (`ChainAllocator.set_network_waiter`).
+    network_waiter: Optional[NetworkWaiter] = None
 
     def cap_available(self, tokens: int) -> int:
         if self.max_live_tokens is None:
@@ -1245,19 +1230,10 @@ class Band:
         # Pages pending until their step is processed drain too, after a stream wait.
         return neighbor._reusable_pages() * neighbor.entry_bytes_per_page
 
-    def add_pin_source(self, busy: Callable[[], bool]) -> None:
-        """Keep this band's pages in place whenever ``busy()`` holds."""
-        self.pin_sources = (*self.pin_sources, busy)
-
-    def pinned_by_source(self) -> bool:
-        """Whether a pin source is busy now: its answer changes with no write
-        to the band, so capacity memos ask it each time."""
-        return any(busy() for busy in self.pin_sources)
-
     def moves_blocked(self) -> bool:
-        """Whether a pin currently forbids relocating pages: a busy pin source,
-        or any fixed page for the paths that cannot move around one."""
-        return bool(self.usage.fixed) or self.pinned_by_source()
+        """Whether a fixed page forbids relocating pages, for the paths that
+        cannot move around one."""
+        return bool(self.usage.fixed)
 
     def fix_pages(self, key: Hashable, pages: Sequence[int]) -> None:
         """Keep these physical pages where they are, under ``key`` (added to
@@ -2058,7 +2034,8 @@ class Band:
         writes)``, with ``host`` naming the pages) are transfers still on the
         pages; they fence them for `acquire` to clear. The per-step `free`
         passes none: a host copy runs only over rows its owner keeps locked
-        until it ends. No device read."""
+        until it ends, and a network transfer's rows are freed only once it is
+        released. No device read."""
         parts = [pages] if isinstance(pages, torch.Tensor) else list(pages)
         if sum(part.numel() for part in parts) == 0:
             return
@@ -2098,16 +2075,21 @@ class Band:
         virtuals, record inverse history. Does NOT clear p2v[src] -- callers own
         vacated-region clearing. Returns the moved virtual page ids.
         """
-        assert not self.pinned_by_source(), (
-            f"[{self.sub_pool_name}] page copy while the band is pinned"
-        )
         # Callers keep fixed pages out of `src_pages`.
         v_moved = self.ids.physical_to_virtual[src_pages].clone()  # read pre-wipe
+        self._count_move_batch()
         self._move_pages(src_pages, dst_pages)
         self.ids.virtual_to_physical[v_moved] = dst_pages
         self.ids.physical_to_virtual[dst_pages] = v_moved
         self._inverse_history.append((src_pages, dst_pages, v_moved))
         return v_moved
+
+    def _count_move_batch(self) -> None:
+        """Count a page-move batch that may have moved a held receive row,
+        on every path that rebinds moved pages."""
+        if self.usage.holds_receive_rows():
+            # A held receive row may be among the pages moved.
+            self.held_row_moves += 1
 
     def _move_pages(self, src_pages: torch.Tensor, dst_pages: torch.Tensor) -> None:
         # Whole page envelopes by physical page id, at most `_move_max_pages`
@@ -2222,56 +2204,104 @@ class Band:
             return [
                 (
                     use.signal,
-                    None
-                    if use.ids is None
-                    else self._use_physical_pages(use, widened=True),
+                    None if use.ids is None else self._use_physical_pages(use),
                 )
                 for use in forwards
             ]
 
-    def _use_physical_pages(self, use, *, widened: bool) -> Set[int]:
-        """The physical pages ``use``'s ids name: read from the device the
-        first time (`_physical_pages_of`), then from the host copy, which
-        `_note_moved` keeps current."""
+    def _use_physical_pages(self, use) -> Set[int]:
+        """The physical pages ``use``'s ids name, in the coordinate they were
+        recorded in (``use.widened``): read from the device the first time
+        (`_physical_pages_of`, or `_pages_of_units` for physical units), then
+        from the host copy, which `_note_moved` keeps current."""
         if use.host_pages is None:
-            use.host_pages = self._physical_pages_of(use.ids, widened=widened)
+            use.host_pages = (
+                self._physical_pages_of(use.ids, widened=use.widened)
+                if use.unit_tokens is None
+                else self._pages_of_units(use.ids, use.unit_tokens)
+            )
         return use.host_pages
 
-    def record_transfer(self, signal, ids, *, writes: bool) -> None:
-        """Record a host copy that reads, or with ``writes`` writes, the pages
-        this band's controller ids ``ids`` name, until ``signal`` completes. A
-        copy of a page it writes waits ``signal``; a page it reads that a move
-        vacates is reused only after it. Call it on the stream page moves run
-        on: the ledger copies ``ids`` there."""
+    def record_transfer(
+        self,
+        signal,
+        ids,
+        *,
+        writes: bool,
+        release: Optional[TransferRelease] = None,
+        unit_tokens: Optional[int] = None,
+        widened: bool = False,
+        copy: bool = True,
+    ) -> None:
+        """Record a transfer that reads, or with ``writes`` writes, the pages
+        this band's controller ids ``ids`` name: until ``signal`` completes, or
+        with ``release`` until it is released. ``unit_tokens``: ``ids`` are
+        physical units of that many tokens; ``widened``: alloc-surface token
+        ids, not rank-local rows. A copy of a page it writes waits ``signal``;
+        a page it reads that a move vacates is reused only after it. Call it on
+        the stream page moves run on: the ledger copies ``ids`` there, unless
+        not ``copy``."""
         if ids is None or len(ids) == 0:
             return
-        self.usage.record_transfer(signal, ids, writes=writes)
+        self.usage.record_transfer(
+            signal,
+            ids,
+            writes=writes,
+            release=release,
+            unit_tokens=unit_tokens,
+            widened=widened,
+            copy=copy,
+        )
 
-    def _transfer_page_sets(self) -> List[Tuple[object, Set[int], bool]]:
+    def _transfer_page_sets(
+        self,
+    ) -> List[Tuple[object, Set[int], bool, Optional[TransferRelease]]]:
         """Each live transfer with the physical PAGE ids it touches now, oldest
         first. Pays a D2H sync per transfer; call it before any stream wait."""
         self.usage.prune()
-        transfers = self.usage.transfers()
+        # Held receive rows: nothing touches them yet, so no copy or free
+        # waits on them.
+        transfers = [
+            use
+            for use in self.usage.transfers()
+            if not isinstance(use.release, ReceiveHold)
+        ]
         if not transfers:
             return []
         with record_function("Band._transfer_page_sets"):
             return [
                 (
                     use.signal,
-                    self._use_physical_pages(use, widened=False),
+                    self._use_physical_pages(use),
                     use.writes,
+                    use.release,
                 )
                 for use in transfers
             ]
 
+    def _pages_of_units(self, units, unit_tokens: int) -> Set[int]:
+        """The physical PAGE ids physical ``units`` of ``unit_tokens`` tokens
+        cover. Reads a device tensor on the host (a stream sync)."""
+        if isinstance(units, torch.Tensor):
+            units = units.tolist()
+        rows = self.pool_page_size
+        return {
+            page
+            for unit in np.asarray(units).reshape(-1).tolist()
+            for page in range(
+                unit * unit_tokens // rows, ((unit + 1) * unit_tokens - 1) // rows + 1
+            )
+        }
+
     @staticmethod
     def _readers_of(srcs: Sequence[int], transfer_sets) -> tuple:
         """The keys of the transfers that still read any of ``srcs``: a source
-        they read is reused only after them."""
+        they read is reused only after them. A network transfer keys on its
+        release, which decides when reuse is due alike on every rank."""
         src_set = set(srcs)
         return tuple(
-            signal
-            for signal, pages, writes in transfer_sets
+            signal if release is None else release
+            for signal, pages, writes, release in transfer_sets
             if not writes and not src_set.isdisjoint(pages)
         )
 
@@ -2305,7 +2335,7 @@ class Band:
                 writer = event
         keys = tuple(
             signal
-            for signal, pages, writes in transfer_sets
+            for signal, pages, writes, _ in transfer_sets
             if writes and not src_set.isdisjoint(pages)
         )
         if writer is not None:
@@ -2414,7 +2444,9 @@ class Band:
         events -- a stream-side dependency, not a host block (a retired forward
         can still be running its tail) -- except, when not urgent, a host copy
         still reading them: their bytes are fenced instead, so only a write
-        into them waits it. No watermark / `live_page_count` change.
+        into them waits it; an urgent drain waits for the network transfers
+        still reading one on the host, once for all of them. No watermark /
+        `live_page_count` change.
         """
         self._stats_n_drain_calls += 1
         if not self.usage.has_pending():
@@ -2580,9 +2612,10 @@ class Band:
         `_topmost_survivor` excludes all p2v=-1 pages, so a negative virtual id in
         the batched mapping lookup is a corrupt-state bug and raises.
         """
-        if self.pinned_by_source():
-            # Holes stay in the free list; the next flush picks them up. Fired
-            # pending sources rejoin it now, since that copies nothing.
+        self.usage.prune()
+        if not urgent and self.usage.holds_receive_rows():
+            # Receive rows wait for their publish: leave them, and read
+            # nothing of them on the device, for the step until it.
             self._drain_pending_reuse(urgent=False)
             return 0
         if urgent:
@@ -2596,13 +2629,18 @@ class Band:
             self._absorb_boundary_holes(self._sorted_free_pages_host())
             return 0
         settled = bool(self._recovery_depth)
-        self.usage.prune()
-        # Read the transfers' pages on the host before any stream wait below. A
-        # copy of a page a transfer writes waits it on the GPU
-        # (`_commit_move_batch`) rather than stopping the walk: whether a
-        # transfer is still listed depends on a fired event, which ranks see at
-        # different times.
+        # Read the transfers' pages on the host before any stream wait below.
         transfer_sets = self._transfer_page_sets()
+        # Only a transfer with a logical release may stop a walk: one without
+        # is listed until its event fires, which ranks see at different times;
+        # a copy of a page it writes waits it on the GPU (`_commit_move_batch`).
+        transfer_written = set().union(
+            *(
+                pages
+                for _, pages, writes, release in transfer_sets
+                if writes and release is not None
+            )
+        )
         if self.usage.writes_unknown():
             # A running forward whose writes are unknown may write any survivor.
             if not urgent:
@@ -2692,6 +2730,10 @@ class Band:
                     break  # packed: the rest stays where it is
                 if src in fixed:
                     break  # non-urgent: a fixed page stops the walk
+                if not urgent and src in transfer_written:
+                    # A transfer still writes it: only a move an allocation
+                    # needs waits for that, not an opportunistic one.
+                    break
 
                 # Case A: write race.
                 if write_set is None:
@@ -2840,8 +2882,8 @@ class Band:
         """
         if not srcs:
             return
-        assert not self.pinned_by_source() and not set(srcs) & self.fixed_pages(), (
-            f"[{self.sub_pool_name}] page copy of a pinned or fixed page"
+        assert not set(srcs) & self.fixed_pages(), (
+            f"[{self.sub_pool_name}] page copy of a fixed page"
         )
         with record_function("Band._commit_move_batch"):
             groups = self._reader_groups(srcs, transfer_sets)
@@ -2854,6 +2896,7 @@ class Band:
                 (v_moveds_t >= 0).all(),
                 "invalid p2v mapping in Band._flush",
             )
+            self._count_move_batch()
             self._move_pages(src_pages_t, dst_pages_t)
             # ONE bulk remap (single-writer on schedule_stream), issued after the
             # copies on the same stream: work ordered after it sees moved pages.
@@ -2967,14 +3010,14 @@ class Band:
     def _transfers_on(self, pages: Sequence[int]) -> List[Tuple[object, bool]]:
         """The transfers recorded on this band that touch ``pages`` (physical,
         on the host), as ``(key, writes)``: a copy may still read or write a
-        page freed under it. Reads the transfers' ids, before they are
-        unbound."""
+        page freed under it. A network transfer keys on its release. Reads
+        the transfers' ids, before they are unbound."""
         freed = set(pages)
         if not freed:
             return []
         return [
-            (signal, writes)
-            for signal, touched, writes in self._transfer_page_sets()
+            (signal if release is None else release, writes)
+            for signal, touched, writes, release in self._transfer_page_sets()
             if not freed.isdisjoint(touched)
         ]
 
@@ -3478,10 +3521,6 @@ class FloatBand(Band):
         self._holes_dirty = False
         return True
 
-    def _recovery_reclaims(self) -> bool:
-        # Even pinned, a float absorbs boundary holes and parks, moving nothing.
-        return True
-
     def settle_pending(
         self,
         through: Optional[int] = None,
@@ -3719,7 +3758,7 @@ class FloatBand(Band):
                 # forward, and every transfer touching a source.
                 self._clear_destinations(vacant)
                 self._settle_inflight_forward()
-                for signal, pages, _ in transfer_sets:
+                for signal, pages, _, _ in transfer_sets:
                     if not src_set.isdisjoint(pages):
                         self._wait_on_stream(signal)
                 for i in range(len(ordered)):
