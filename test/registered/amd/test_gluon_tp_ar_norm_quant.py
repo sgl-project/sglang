@@ -46,10 +46,8 @@ def _gfx950_gpus() -> int:
 def _torch_memory_is_ipc_capable() -> bool:
     """Probe HIP IPC on torch memory, which this kernel's rendezvous requires.
 
-    Deliberately a capability probe and not a version check: some ROCm builds
-    (e.g. torch 2.11.0+rocm10.0.0 / HIP 7.15) cannot share caching-allocator
-    memory over IPC, and a runtime that later fixes this re-enables the test
-    with no edit here.
+    Deliberately a capability probe and not a version check, so the test runs
+    on any ROCm build where the rendezvous can actually share torch memory.
     """
     if _gfx950_gpus() < 1:
         return False

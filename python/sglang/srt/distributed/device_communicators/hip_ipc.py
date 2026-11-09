@@ -58,7 +58,17 @@ class HipRTLibrary:
         return cls._instance
 
     def _init_lib(self) -> None:
-        self.lib = ctypes.CDLL("libamdhip64.so")
+        import torch  # noqa: F401  (maps torch's HIP runtime before we look)
+
+        from sglang.srt.distributed.device_communicators.cuda_wrapper import (
+            find_loaded_library,
+        )
+
+        # Bind to the HIP runtime torch already loaded. Loading one by name can
+        # map a second copy (ROCm 10 torch wheels bundle their own), and a
+        # second runtime does not know torch's allocations: it reports a bogus
+        # address range for them and refuses to export them over IPC.
+        self.lib = ctypes.CDLL(find_loaded_library("libamdhip64") or "libamdhip64.so")
         self.lib.hipMalloc.argtypes = [
             ctypes.POINTER(ctypes.c_void_p),
             ctypes.c_size_t,
@@ -111,12 +121,12 @@ class HipRTLibrary:
     def get_address_range(self, ptr: int) -> tuple[int, int]:
         """Segment base and size containing ``ptr``, validated.
 
-        ``hipMemGetAddressRange`` is not merely allowed to fail here -- on some
-        ROCm builds it returns success while writing nonsense for pointers owned
-        by torch's caching allocator (observed: base ``0x100``, size ``2**64-1``
-        on ``torch 2.11.0+rocm10.0.0`` / HIP 7.15). Trusting the status code
-        alone forwards that garbage to ``hipIpcGetMemHandle``, which then fails
-        with an opaque ``hipErrorInvalidValue``. Validate the payload instead.
+        ``hipMemGetAddressRange`` can return success while writing nonsense
+        (observed: base ``0x100``, size ``2**64-1``) when asked by a HIP runtime
+        that does not own the pointer, e.g. a second runtime copy alongside the
+        one torch loaded. Trusting the status code alone forwards that garbage
+        to ``hipIpcGetMemHandle``, which then fails with an opaque
+        ``hipErrorInvalidValue``. Validate the payload instead.
         """
         base = ctypes.c_void_p()
         size = ctypes.c_size_t()
@@ -262,12 +272,11 @@ def create_shared_tensor(
 def torch_memory_is_ipc_capable() -> bool:
     """Can a torch-allocated tensor be published over HIP IPC on this build?
 
-    Not every ROCm build supports this. On ``torch 2.11.0+rocm10.0.0`` (HIP
-    7.15) ``hipMemGetAddressRange`` returns success but yields a bogus range for
-    caching-allocator pointers, and ``hipIpcGetMemHandle`` rejects them --
-    while raw ``hipMalloc`` allocations on the same device share fine. The
-    capability is therefore probed, not inferred from a version number, so a
-    later runtime that fixes it is picked up with no code change.
+    A safety net rather than a known limitation: it fails if the HIP runtime
+    bound by :class:`HipRTLibrary` is not the one that owns torch's
+    allocations, which is how a second runtime copy shows up (a bogus address
+    range and a rejected IPC handle). The capability is probed, not inferred
+    from a version number.
 
     Single-process and side-effect free; the result is cached per process.
     """
