@@ -2,12 +2,18 @@ from __future__ import annotations
 
 import logging
 from array import array
+from http import HTTPStatus
 from typing import TYPE_CHECKING, Callable, List, Optional, Set
 
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.dllm.mixin.req import DllmReqPhase
-from sglang.srt.managers.req_types import FINISH_LENGTH
-from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.managers.req_types import FINISH_ABORT, FINISH_LENGTH
+from sglang.srt.managers.schedule_batch import (
+    Req,
+    ScheduleBatch,
+    release_req,
+    unresumable_abort_message,
+)
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
@@ -71,10 +77,13 @@ class SchedulerDllmMixin:
         self._fetch_waiting_reqs()
 
         # Process batches
-        forward_mode = self._process_dllm_batches(adder, running_batch=running_batch)
+        forward_mode, staging_result = self._process_dllm_batches(
+            adder, running_batch=running_batch
+        )
 
         can_run_list = adder.can_run_list
         if not can_run_list:
+            self._maybe_break_dllm_staging_stall(staging_result, running_batch)
             return None
 
         # Record metrics and update state
@@ -282,19 +291,23 @@ class SchedulerDllmMixin:
 
     def _process_dllm_batches(
         self: Scheduler, adder: PrefillAdder, running_batch: ScheduleBatch
-    ) -> ForwardMode:
-        """Process prefill or decode batches for DLLM."""
+    ) -> tuple[ForwardMode, AddReqResult]:
+        """Process prefill or decode batches for DLLM.
+
+        Returns the forward mode and the staging pass's result, so the caller
+        can tell a round refused by the staging capacity gate (NO_TOKEN) from
+        one that simply had nothing to admit."""
         # Try prefill batch first
         prefill_reqs = self.dllm_manager.get_prefill_requests()
         if prefill_reqs:
-            self._process_batch_by_phase(
+            staging_result = self._process_batch_by_phase(
                 adder,
                 prefill_reqs,
                 DllmReqPhase.STAGING_PREFILL,
                 DllmReqPhase.INCOMING_PREFILL,
                 running_batch=running_batch,
             )
-            return (
+            forward_mode = (
                 ForwardMode.EXTEND
                 if self.dllm_config.requires_separate_context_encoding
                 else ForwardMode.DLLM_EXTEND
@@ -302,14 +315,15 @@ class SchedulerDllmMixin:
         else:
             # Fall back to decode batch
             decode_reqs = self.dllm_manager.get_decode_requests()
-            self._process_batch_by_phase(
+            staging_result = self._process_batch_by_phase(
                 adder,
                 decode_reqs,
                 DllmReqPhase.STAGING_DECODE,
                 DllmReqPhase.INCOMING_DECODE,
                 running_batch=running_batch,
             )
-            return ForwardMode.DLLM_EXTEND
+            forward_mode = ForwardMode.DLLM_EXTEND
+        return forward_mode, staging_result
 
     def _process_batch_by_phase(
         self,
@@ -318,18 +332,92 @@ class SchedulerDllmMixin:
         staging_phase: DllmReqPhase,
         incoming_phase: DllmReqPhase,
         running_batch: ScheduleBatch,
-    ) -> None:
-        """Process a batch, separating staging and incoming requests."""
+    ) -> AddReqResult:
+        """Process a batch, separating staging and incoming requests.
+
+        Returns NO_TOKEN when either pass refused a row for lack of capacity
+        (the stall breaker's signal), the staging pass's non-CONTINUE result
+        otherwise, and CONTINUE when nothing was refused."""
+        staging_result = AddReqResult.CONTINUE
         staging_reqs = [req for req in batch if req.dllm_phase == staging_phase]
         if staging_reqs:
             staging_result = self.process_dllm_staging_reqs(adder, staging_reqs)
             if staging_result != AddReqResult.CONTINUE:
-                return
+                return staging_result
 
         incoming_reqs = [req for req in batch if req.dllm_phase == incoming_phase]
         if incoming_reqs:
-            self.process_dllm_incoming_reqs(
+            incoming_result = self.process_dllm_incoming_reqs(
                 adder, incoming_reqs, running_batch=running_batch
+            )
+            if incoming_result == AddReqResult.NO_TOKEN:
+                # Retained rows can starve incoming rows the same way they
+                # starve staged fresh rows: the pool they hold refuses every
+                # admission while this branch keeps winning the
+                # prefill-over-decode priority, so nothing ever runs.
+                staging_result = incoming_result
+        return staging_result
+
+    def _maybe_break_dllm_staging_stall(
+        self: Scheduler, staging_result: AddReqResult, running_batch: ScheduleBatch
+    ) -> None:
+        """Break a staging livelock after a round that admitted nothing.
+
+        Retained FDFO rows keep their KV between blocks, so they can fill the
+        pool while every one of them needs a *fresh* block (each row's last
+        block resolved mid-generation). The capacity gate in
+        `add_dllm_staging_req` then refuses every row, the round admits
+        nothing, no forward runs, and nothing can ever resolve, finish, or
+        free KV again — a permanent livelock on a small pool.
+
+        Fire only in that exact state: the round reported NO_TOKEN (a
+        capacity refusal, not an empty queue), the round admitted nothing
+        (the caller checked `can_run_list`), and no running batch holds
+        in-flight work that could still free KV (dLLM disables the overlap
+        schedule, so a zero-admission round really is quiescent). Any admitted
+        row makes progress that frees KV eventually, so the breaker never
+        fires while progress is possible.
+
+        Retract one retained row — the newest, which has the least committed
+        work to recompute — releasing its KV uncheckpointed and requeueing it
+        as an incoming request to re-prefill once the stall clears. One victim
+        per stalled round: if its KV does not unstick the next round, that
+        round fires again.
+        """
+        if staging_result != AddReqResult.NO_TOKEN or running_batch.reqs:
+            return
+        victims = [req for req in self.dllm_manager.waiting_queue if req.kv.holds_kv]
+        if not victims:
+            return
+        victim = victims[-1]
+        # The retraction resets the request's dLLM progress
+        # (`Req.reset_dllm_progress`): the unresolved block, re-stageable only
+        # on top of the KV released here, is dropped and redone after the
+        # re-prefill, and the phase goes back to incoming, so the request
+        # re-matches the cache and re-initializes its fill ids. It stays in
+        # the dLLM waiting queue.
+        if release_req(
+            req=victim,
+            remaing_req_count=1,
+            tree_cache=self.tree_cache,
+            request_retirer=self.request_retirer,
+        ):
+            logger.warning(
+                "dLLM staging stalled: retained rows hold the KV pool and no "
+                f"row could be admitted. Retracted {victim.rid} to free its KV."
+            )
+        else:
+            victim.request_finish(
+                FINISH_ABORT(
+                    unresumable_abort_message(),
+                    status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                )
+            )
+            # Leaves the dLLM waiting queue there.
+            self.request_retirer.abort_retracted(victim, reason=victim.to_finish)
+            logger.warning(
+                "dLLM staging stalled and the retained request cannot be "
+                f"resumed. Aborted {victim.rid} to free its KV."
             )
 
     def _update_state_for_batch(

@@ -31,6 +31,11 @@ Hardenings on top:
   fresh-needing row at the head no longer starves zero-cost reuse rows behind
   it, and one budget-exhausting admission per round no longer serializes the
   rest of the queue.
+- ``_maybe_break_dllm_staging_stall`` breaks the livelock the capacity gate
+  can otherwise create: retained rows that all need a fresh block can hold the
+  whole pool, so every round refuses every row, admits nothing, and nothing
+  ever resolves or frees KV. A zero-admission round with a capacity refusal
+  (and no in-flight batch) retracts one retained row to fund the next round.
 
 The capped fallback and whole-block rounding only apply to the classic dLLM
 staging path; separate-context-encoding models keep upstream's fallback, whose
@@ -38,6 +43,7 @@ staging path; separate-context-encoding models keep upstream's fallback, whose
 """
 
 import unittest
+from array import array
 from types import SimpleNamespace
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -45,8 +51,17 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.dllm.mixin.req import DllmReqPhase, ReqDllmMixin
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
+from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
+    ListKind,
+    move,
+)
+from sglang.srt.managers.scheduler_components.request_retirer import (
+    _leave_owner_list,
+)
 from sglang.srt.mem_cache.prefill_budget import PrefillBudget
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -429,6 +444,203 @@ class TestProcessDllmStagingReqsPerRowRefusal(CustomTestCase):
         adder = _ScriptedAdder({"a": AddReqResult.CONTINUE, "b": AddReqResult.CONTINUE})
         result = self._run(adder, ["a", "b"])
         self.assertEqual(result, AddReqResult.CONTINUE)
+
+    def test_batch_by_phase_propagates_the_staging_refusal(self):
+        # The refusal signal feeds the stall breaker: a refused staging pass
+        # must come back as NO_TOKEN from _process_batch_by_phase (and skip
+        # the incoming reqs, which would jump ahead of starved staging rows).
+        incoming_calls = []
+        stub = SimpleNamespace(
+            process_dllm_staging_reqs=lambda adder, reqs: AddReqResult.NO_TOKEN,
+            process_dllm_incoming_reqs=lambda *a, **k: incoming_calls.append(a),
+        )
+        staged = SimpleNamespace(dllm_phase=DllmReqPhase.STAGING_DECODE)
+        incoming = SimpleNamespace(dllm_phase=DllmReqPhase.INCOMING_DECODE)
+        result = SchedulerDllmMixin._process_batch_by_phase(
+            stub,
+            None,
+            [staged, incoming],
+            DllmReqPhase.STAGING_DECODE,
+            DllmReqPhase.INCOMING_DECODE,
+            running_batch=None,
+        )
+        self.assertEqual(result, AddReqResult.NO_TOKEN)
+        self.assertEqual(incoming_calls, [])
+
+    def test_batch_by_phase_propagates_an_incoming_refusal(self):
+        # Retained rows can also starve incoming rows (the pool they hold
+        # refuses every admission while this branch keeps winning the
+        # prefill-over-decode priority), so an incoming NO_TOKEN must reach
+        # the stall breaker too.
+        stub = SimpleNamespace(
+            process_dllm_staging_reqs=lambda adder, reqs: AddReqResult.CONTINUE,
+            process_dllm_incoming_reqs=(
+                lambda adder, reqs, running_batch: AddReqResult.NO_TOKEN
+            ),
+        )
+        staged = SimpleNamespace(dllm_phase=DllmReqPhase.STAGING_DECODE)
+        incoming = SimpleNamespace(dllm_phase=DllmReqPhase.INCOMING_DECODE)
+        result = SchedulerDllmMixin._process_batch_by_phase(
+            stub,
+            None,
+            [staged, incoming],
+            DllmReqPhase.STAGING_DECODE,
+            DllmReqPhase.INCOMING_DECODE,
+            running_batch=None,
+        )
+        self.assertEqual(result, AddReqResult.NO_TOKEN)
+
+
+class _StubStallReq:
+    """Just enough of Req for `_maybe_break_dllm_staging_stall`."""
+
+    owner_list = None
+
+    def __init__(self, *, rid, holds_kv, origin_len=64):
+        self.rid = rid
+        self.kv = SimpleNamespace(holds_kv=holds_kv)
+        self.origin_input_ids = list(range(origin_len))
+        self.output_ids = []
+        self.dllm_config = SimpleNamespace(
+            requires_separate_context_encoding=False, block_size=32
+        )
+        self.dllm_incomplete_ids = array("q", [7] * 4)
+        self.dllm_algo_state = object()
+        self.dllm_phase = DllmReqPhase.STAGING_DECODE
+        self.reset_calls = 0
+        self.to_finish = None
+
+    def reset_for_retract(self):
+        # Req.reset_for_retract ends by resetting the dLLM progress.
+        self.reset_calls += 1
+        ReqDllmMixin.reset_dllm_progress(self)
+
+    def request_finish(self, reason):
+        self.to_finish = reason
+
+
+def _dllm_waiting_queue(reqs):
+    queue = IndexedReqList(ListKind.DLLM)
+    move(reqs, queue)
+    return queue
+
+
+class _StubRetirer:
+    def __init__(self, *, resumable):
+        self.resumable = resumable
+        self.retracted = []
+        self.aborted = []
+
+    def retract(self, req, *, offload_kv):
+        self.retracted.append(req)
+        return self.resumable
+
+    def abort_retracted(self, req, *, reason):
+        # The real retirer takes the request out of the list it is in.
+        _leave_owner_list(req)
+        self.aborted.append((req, reason))
+
+
+class TestDllmStagingStallBreaker(CustomTestCase):
+    """The capacity gate can livelock a small pool: retained rows that all
+    need a fresh block hold every KV slot, every round refuses every row, and
+    with nothing admitted nothing ever resolves or frees KV. A zero-admission
+    round with a capacity refusal must retract one retained row. The method
+    only reads scheduler attributes, so call it unbound on a stub."""
+
+    BLOCK_SIZE = 32
+
+    @staticmethod
+    def _scheduler(reqs, *, resumable=True):
+        return SimpleNamespace(
+            dllm_manager=SimpleNamespace(waiting_queue=_dllm_waiting_queue(reqs)),
+            tree_cache=SimpleNamespace(supports_prefix_sharing=lambda: False),
+            request_retirer=_StubRetirer(resumable=resumable),
+            dllm_config=SimpleNamespace(
+                requires_separate_context_encoding=False, block_size=32
+            ),
+        )
+
+    @staticmethod
+    def _fire(scheduler, *, staging_result=AddReqResult.NO_TOKEN, running_reqs=()):
+        SchedulerDllmMixin._maybe_break_dllm_staging_stall(
+            scheduler, staging_result, SimpleNamespace(reqs=list(running_reqs))
+        )
+
+    def test_stuck_round_retracts_the_newest_retained_row(self):
+        # Oldest first in the waiting queue; the fresh row holds no KV and is
+        # not a candidate. The newest retained row has the least committed
+        # work to recompute, so it is the victim.
+        old = _StubStallReq(rid="old", holds_kv=True)
+        new = _StubStallReq(rid="new", holds_kv=True)
+        fresh = _StubStallReq(rid="fresh", holds_kv=False)
+        scheduler = self._scheduler([old, fresh, new])
+
+        self._fire(scheduler)
+
+        self.assertEqual(scheduler.request_retirer.retracted, [new])
+        self.assertEqual(new.reset_calls, 1)
+        # The unresolved block cannot survive without its retained KV.
+        self.assertEqual(len(new.dllm_incomplete_ids), 0)
+        self.assertIsNone(new.dllm_algo_state)
+        # The victim rejoins as incoming and stays queued for re-prefill.
+        self.assertEqual(new.dllm_phase, DllmReqPhase.INCOMING_PREFILL)
+        self.assertIn(new, list(scheduler.dllm_manager.waiting_queue))
+        # No one else was touched.
+        self.assertEqual(old.reset_calls, 0)
+        self.assertEqual(fresh.reset_calls, 0)
+
+    def test_short_prompt_victim_rejoins_as_incoming_decode(self):
+        # Mirrors Req.reset_dllm_progress: a committed length shorter than one
+        # block restarts in the decode phase on the classic path.
+        victim = _StubStallReq(rid="short", holds_kv=True, origin_len=8)
+        scheduler = self._scheduler([victim])
+        self._fire(scheduler)
+        self.assertEqual(victim.dllm_phase, DllmReqPhase.INCOMING_DECODE)
+
+    def test_no_fire_without_a_capacity_refusal(self):
+        # A round can admit nothing simply because nothing was staged or the
+        # batch was full (OTHER); only a NO_TOKEN refusal means the gate is
+        # starving rows.
+        retained = _StubStallReq(rid="retained", holds_kv=True)
+        for result in (AddReqResult.CONTINUE, AddReqResult.OTHER):
+            scheduler = self._scheduler([retained])
+            self._fire(scheduler, staging_result=result)
+            self.assertEqual(scheduler.request_retirer.retracted, [], result)
+
+    def test_no_fire_while_a_running_batch_is_in_flight(self):
+        # In-flight work can still finish and free KV, so the stall is not
+        # proven; never retract while progress is possible.
+        retained = _StubStallReq(rid="retained", holds_kv=True)
+        scheduler = self._scheduler([retained])
+        self._fire(scheduler, running_reqs=[object()])
+        self.assertEqual(scheduler.request_retirer.retracted, [])
+
+    def test_no_fire_without_a_retained_row(self):
+        # Nothing to free: the refusal is not caused by retained staging KV.
+        scheduler = self._scheduler([_StubStallReq(rid="fresh", holds_kv=False)])
+        self._fire(scheduler)
+        self.assertEqual(scheduler.request_retirer.retracted, [])
+        self.assertEqual(scheduler.request_retirer.aborted, [])
+
+    def test_unresumable_victim_is_aborted_and_dequeued(self):
+        from sglang.srt.runtime_context import get_context
+
+        # unresumable_abort_message() words the abort by disaggregation mode.
+        override = get_context().override_server_args()
+        override.install()
+        self.addCleanup(override.restore)
+
+        victim = _StubStallReq(rid="unresumable", holds_kv=True)
+        scheduler = self._scheduler([victim], resumable=False)
+
+        self._fire(scheduler)
+
+        self.assertIsNotNone(victim.to_finish)
+        self.assertEqual(
+            scheduler.request_retirer.aborted, [(victim, victim.to_finish)]
+        )
+        self.assertNotIn(victim, list(scheduler.dllm_manager.waiting_queue))
 
 
 if __name__ == "__main__":

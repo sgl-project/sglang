@@ -125,13 +125,13 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
             _process_batch_by_phase=Mock(),
         )
 
-        mode = SchedulerDllmMixin._process_dllm_batches(
+        mode, _ = SchedulerDllmMixin._process_dllm_batches(
             scheduler, Mock(), running_batch=Mock()
         )
         self.assertEqual(mode, ForwardMode.EXTEND)
 
         scheduler.dllm_config.requires_separate_context_encoding = False
-        mode = SchedulerDllmMixin._process_dllm_batches(
+        mode, _ = SchedulerDllmMixin._process_dllm_batches(
             scheduler, Mock(), running_batch=Mock()
         )
         self.assertEqual(mode, ForwardMode.DLLM_EXTEND)
@@ -139,7 +139,7 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
         scheduler.dllm_config.requires_separate_context_encoding = True
         scheduler.dllm_manager.get_prefill_requests.return_value = []
         scheduler.dllm_manager.get_decode_requests.return_value = [object()]
-        mode = SchedulerDllmMixin._process_dllm_batches(
+        mode, _ = SchedulerDllmMixin._process_dllm_batches(
             scheduler, Mock(), running_batch=Mock()
         )
         self.assertEqual(mode, ForwardMode.DLLM_EXTEND)
