@@ -73,7 +73,6 @@ def _commit(injector, device="cpu"):
 
 
 def _staged_req(**fields):
-    """A request holding the KV a verify stages for."""
     return FakeReq(kv=SimpleNamespace(holds_kv=True), retraction_count=0, **fields)
 
 
@@ -133,8 +132,7 @@ class TestDeferredCommit(CustomTestCase):
                 self.assertFalse(commit.pending)
 
     def test_rows_of_requests_that_released_their_kv_are_not_written(self):
-        """A request that released its KV since the verify, or holds KV again
-        after a retraction, gets its staged row skipped."""
+        """Also after a retraction and re-admission."""
         for case in ("released", "readmitted"):
             for graph_bs in (None, MAX_BS):
                 with self.subTest(case=case, graph_bs=graph_bs):

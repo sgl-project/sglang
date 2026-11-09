@@ -108,8 +108,7 @@ class SchedulerPPMixin:
     # ran init_pp_loop_state (plain TP, unit-test doubles) read False;
     # init_pp_loop_state overwrites it per instance.
     _pp_spec_relay: bool = False
-    # Records a skipped output's completion behind its microbatch's forward
-    # (`_pp_result_done_event`); made on first use.
+    # Side stream of `_pp_result_done_event`; made on first use.
     _pp_skip_output_stream = None
 
     @DynamicGradMode()
@@ -1028,7 +1027,6 @@ class SchedulerPPMixin:
                 mb_metadata.unified_forward_done if mb_metadata else None
             ),
         )
-        # The scheduler's current stream must not wait the forward.
         d2h_event = self._pp_result_done_event(mb_metadata, side_stream=True)
         return None, batch_result, d2h_event
 
@@ -1038,14 +1036,9 @@ class SchedulerPPMixin:
         *,
         side_stream: bool = False,
     ) -> torch.Event:
-        """The completion event of a PP result: recorded on the current stream
-        after it waits this rank's forward of the micro-batch.
-
-        Processing the result retires that forward, which neither the
-        scheduler's stream nor a received output follows. With ``side_stream``,
-        a side stream waits the forward and records the event instead, so the
-        current stream takes no dependency on it.
-        """
+        """An event recorded after this rank's forward of the micro-batch, which
+        processing the result retires. ``side_stream`` keeps the current stream
+        from waiting on it."""
         stream = self.device_module.current_stream()
         forward_done = mb_metadata.forward_done if mb_metadata else None
         if forward_done is not None:

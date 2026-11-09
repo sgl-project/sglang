@@ -16,8 +16,7 @@ other forward runs the stores eagerly first.
 Contract:
 
 - Every write disarms the staging (commit lengths 0), so a staging is written once.
-- The row of a staged request that released the KV it was staged for before the
-  write, or holds KV again after a retraction, is not written.
+- A row whose request no longer holds its staged KV is not written.
 - A forward that may write or read draft KV (prefill, draft extend, an eager draft)
   runs after the pending write; a draft graph whose rows miss staged ones is preceded
   by an eager write of every staged row.
@@ -75,8 +74,7 @@ class DeferredContextCommit:
         self._store_done: Optional[torch.cuda.Event] = None
         # Host: requests a static verify staged since the last write (0: nothing pending).
         self.staged_bs = 0
-        # Host: those requests in row order, each with its `retraction_count`
-        # then (`note_staged_reqs`).
+        # Host: staged requests by row, with their `retraction_count` at staging.
         self._staged_reqs: tuple = ()
         # Host: a forked projection the static epilogue has not joined yet.
         self._proj_unjoined = False
@@ -175,15 +173,14 @@ class DeferredContextCommit:
         self.staged_bs = live_bs
 
     def note_staged_reqs(self, reqs) -> None:
-        """Host, after a verify of ``reqs``: the requests a staging it made
-        writes for."""
+        """Host, after a verify of ``reqs``."""
         self._staged_reqs = tuple(
             (req, req.retraction_count) for req in reqs[: self.staged_bs]
         )
 
     def _skip_released_rows(self) -> None:
-        """Host, before a pending staging is written: zero the commit length of
-        each row whose request has released the KV it was staged for."""
+        """Host, before a write: zero the rows whose request no longer holds
+        its staged KV."""
         for row, (req, retraction_count) in enumerate(self._staged_reqs):
             if not _holds_staged_kv(req, retraction_count):
                 self.commit_lens[row : row + 1].zero_()
@@ -297,8 +294,8 @@ class DeferredContextCommit:
 
 
 def _holds_staged_kv(req, retraction_count: int) -> bool:
-    """Whether ``req`` holds the KV a staging made at ``retraction_count`` was
-    for: a request takes KV again only after a retraction, which counts it."""
+    """KV taken again after a retraction is new; ``retraction_count`` tells it
+    apart."""
     return req.kv.holds_kv and req.retraction_count == retraction_count
 
 
