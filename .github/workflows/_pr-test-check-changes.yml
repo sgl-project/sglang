@@ -27,6 +27,8 @@ on:
         value: ${{ jobs.run.outputs.jit_kernel }}
       multimodal_gen:
         value: ${{ jobs.run.outputs.multimodal_gen }}
+      multimodal_gen_server:
+        value: ${{ jobs.run.outputs.multimodal_gen_server }}
       processor:
         value: ${{ jobs.run.outputs.processor }}
       server_args_docs:
@@ -52,6 +54,7 @@ jobs:
       sgl_kernel: ${{ steps.filter.outputs.sgl_kernel }}
       jit_kernel: ${{ steps.filter.outputs.jit_kernel || steps.run-mode.outputs.run_all_tests }}
       multimodal_gen: ${{ steps.filter.outputs.multimodal_gen || steps.run-mode.outputs.run_all_tests }}
+      multimodal_gen_server: ${{ steps.filter.outputs.multimodal_gen_server || steps.run-mode.outputs.run_all_tests }}
       processor: ${{ steps.filter.outputs.processor || steps.run-mode.outputs.run_all_tests }}
       server_args_docs: ${{ steps.filter.outputs.server_args_docs || steps.run-mode.outputs.run_all_tests }}
       partitions: ${{ steps.partitions.outputs.partitions }}
@@ -141,6 +144,32 @@ jobs:
               - "scripts/ci/runner_configs.yml"
               - "python/pyproject.toml"
               - "python/sglang/multimodal_gen/**/!(*.md|*.ipynb)"
+              - "python/sglang/srt/model_executor/runner_backend_utils/breakable_cuda_graph/**"
+              - "python/sglang/srt/observability/**"
+              - "python/sglang/kernels/ops/diffusion/**"
+              - "python/sglang/kernels/jit/csrc/diffusion/**"
+              - "test/registered/kernels/ops/diffusion/**"
+              - "test/registered/kernels/benchmark/diffusion/**"
+              - "test/registered/unit/diffusion/**"
+              - "test/registered/e2e/diffusion/**"
+              - "python/sglang/cli/**"
+            # multimodal_gen minus the ComfyUI plugin and its unit tests: nothing in
+            # the server, runtime or GPU suites imports the plugin, so a plugin-only
+            # change runs the diffusion unit suite but not the server suites.
+            multimodal_gen_server:
+              - ".github/workflows/pr-test.yml"
+              - ".github/workflows/pr-test-multimodal-gen.yml"
+              - ".github/workflows/_diffusion-pr-test-stage.yml"
+              - "scripts/ci/cuda/ci_install_dependency_diffusion.sh"
+              - "scripts/ci/runner_configs.yml"
+              - "python/pyproject.toml"
+              - "python/sglang/multimodal_gen/!(*.md|*.ipynb)"
+              - "python/sglang/multimodal_gen/!(apps|test)/**/!(*.md|*.ipynb)"
+              - "python/sglang/multimodal_gen/{apps,test}/!(*.md|*.ipynb)"
+              - "python/sglang/multimodal_gen/apps/!(ComfyUI_SGLDiffusion)/**/!(*.md|*.ipynb)"
+              - "python/sglang/multimodal_gen/test/!(unit)/**/!(*.md|*.ipynb)"
+              - "python/sglang/multimodal_gen/test/unit/!(test_comfyui_*|*.md|*.ipynb)"
+              - "python/sglang/multimodal_gen/test/unit/**/*/!(*.md|*.ipynb)"
               - "python/sglang/srt/model_executor/runner_backend_utils/breakable_cuda_graph/**"
               - "python/sglang/srt/observability/**"
               - "python/sglang/kernels/ops/diffusion/**"
@@ -279,6 +308,7 @@ jobs:
             echo "| sgl_kernel        | ${{ steps.filter.outputs.sgl_kernel }} |"
             echo "| jit_kernel        | ${{ steps.filter.outputs.jit_kernel || steps.run-mode.outputs.run_all_tests }} |"
             echo "| multimodal_gen    | ${{ steps.filter.outputs.multimodal_gen || steps.run-mode.outputs.run_all_tests }} |"
+            echo "| multimodal_gen_server | ${{ steps.filter.outputs.multimodal_gen_server || steps.run-mode.outputs.run_all_tests }} |"
             echo "| server_args_docs  | ${{ steps.filter.outputs.server_args_docs || steps.run-mode.outputs.run_all_tests }} |"
             echo "| b200_runner       | ${{ steps.set-runner.outputs.b200_runner }} |"
             echo "| enable_retry      | ${{ steps.set-retry.outputs.enable_retry }} |"

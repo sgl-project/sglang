@@ -6,6 +6,12 @@ on:
       multimodal_gen:
         required: true
         type: string
+      # False when only the ComfyUI plugin (and its unit tests) changed: the
+      # unit suites still run, the server / GPU suites below are skipped.
+      multimodal_gen_server:
+        required: false
+        type: string
+        default: 'true'
       sgl_kernel:
         required: true
         type: string
@@ -35,7 +41,7 @@ on:
 
 jobs:
   compute-diffusion-partitions:
-    if: inputs.multimodal_gen == 'true'
+    if: inputs.multimodal_gen == 'true' && inputs.multimodal_gen_server == 'true'
     runs-on: ubuntu-latest
     outputs:
       plan-1gpu: ${{ steps.compute.outputs.plan-1gpu }}
@@ -63,7 +69,8 @@ jobs:
       needs.compute-diffusion-partitions.result == 'success' &&
       fromJson(needs.compute-diffusion-partitions.outputs.plan-1gpu).partition_count > 0 &&
       ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
-      inputs.multimodal_gen == 'true'
+      inputs.multimodal_gen == 'true' &&
+      inputs.multimodal_gen_server == 'true'
     uses: ./.github/workflows/_diffusion-pr-test-stage.yml
     with:
       runner_config: diffusion-1-gpu-h100
@@ -76,7 +83,8 @@ jobs:
   multimodal-gen-test-1-5090:
     if: |
       ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
-      inputs.multimodal_gen == 'true'
+      inputs.multimodal_gen == 'true' &&
+      inputs.multimodal_gen_server == 'true'
     uses: ./.github/workflows/_diffusion-pr-test-stage.yml
     with:
       runner_config: diffusion-1-gpu-5090
@@ -93,7 +101,8 @@ jobs:
   bcg-diffusion:
     if: |
       ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
-      inputs.multimodal_gen == 'true'
+      inputs.multimodal_gen == 'true' &&
+      inputs.multimodal_gen_server == 'true'
     uses: ./.github/workflows/_diffusion-pr-test-stage.yml
     with:
       runner_config: diffusion-bcg-1-gpu-h100
@@ -109,7 +118,8 @@ jobs:
       needs.compute-diffusion-partitions.result == 'success' &&
       fromJson(needs.compute-diffusion-partitions.outputs.plan-2gpu).partition_count > 0 &&
       ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
-      inputs.multimodal_gen == 'true'
+      inputs.multimodal_gen == 'true' &&
+      inputs.multimodal_gen_server == 'true'
     uses: ./.github/workflows/_diffusion-pr-test-stage.yml
     with:
       runner_config: diffusion-2-gpu-h100
@@ -123,7 +133,8 @@ jobs:
   multimodal-gen-component-accuracy:
     if: |
       ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
-      inputs.multimodal_gen == 'true'
+      inputs.multimodal_gen == 'true' &&
+      inputs.multimodal_gen_server == 'true'
     uses: ./.github/workflows/_diffusion-pr-test-stage.yml
     with:
       runner_config: diffusion-component-2-gpu-h100
@@ -135,7 +146,8 @@ jobs:
   multimodal-gen-test-4-gpu-b200:
     if: |
       ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
-      inputs.multimodal_gen == 'true'
+      inputs.multimodal_gen == 'true' &&
+      inputs.multimodal_gen_server == 'true'
     uses: ./.github/workflows/_diffusion-pr-test-stage.yml
     with:
       runner_config: diffusion-1-gpu-b200
@@ -202,6 +214,7 @@ jobs:
     if: |
       always() &&
       inputs.multimodal_gen == 'true' &&
+      inputs.multimodal_gen_server == 'true' &&
       (
         needs.multimodal-gen-test-1-gpu.result == 'success' ||
         needs.multimodal-gen-test-1-gpu.result == 'failure' ||
