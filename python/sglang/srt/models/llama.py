@@ -70,6 +70,7 @@ from sglang.srt.models.utils import (
     can_run_silu_fp4_quant_fusion,
     maybe_enable_silu_fp4_quant_fusion,
     silu_and_mul_fp4_quant,
+    unquantize_router_if_stored_so,
 )
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel
@@ -732,6 +733,10 @@ class LlamaForCausalLM(nn.Module):
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
+                # Llama 4: a router the checkpoint stores unquantized although the config quantizes it
+                unquantize_router_if_stored_so(
+                    self, name, loaded_weight, params_dict, (".feed_forward.router",)
+                )
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue

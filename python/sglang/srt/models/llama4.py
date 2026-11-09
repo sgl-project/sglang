@@ -53,7 +53,7 @@ from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.models.llama import LlamaForCausalLM, LlamaMLP
-from sglang.srt.models.utils import apply_qk_norm
+from sglang.srt.models.utils import apply_qk_norm, router_quant_config
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import fast_topk, get_compiler_backend, is_cuda, is_npu
 from sglang.srt.utils.device import get_current_device_stream_fast
@@ -94,11 +94,12 @@ class Llama4MoE(nn.Module):
         self.device_module = torch.get_device_module()
 
         intermediate_size_moe = config.intermediate_size
+        # Built as the checkpoint stores it: see router_quant_config.
         self.router = ReplicatedLinear(
             config.hidden_size,
             config.num_local_experts,
             bias=False,
-            quant_config=None,
+            quant_config=router_quant_config(quant_config),
             prefix=add_prefix("router", prefix),
         )
 
