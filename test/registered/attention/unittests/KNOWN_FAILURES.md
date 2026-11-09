@@ -68,7 +68,6 @@ so that "skipped: ..." results have a quick lookup.
 |---|---|---|---|
 | `flashmla` decode/verify | SM 9.0 (Hopper) only | `mla/test_flashmla.py:_DECODE_REQUIRES_SM90A` | `Dense decode MLA is only supported on SM90a architecture` |
 | `trtllm_mla` | SM 12.0a / 12.1a | `mla/test_trtllm_mla.py::_supported` | FlashInfer XQA MLA dispatch reject |
-| `tokenspeed_mla` | SM ≥ 10.0 + FP8 KV + pkg | `mla/test_tokenspeed_mla.py::_supported` | `tokenspeed_mla` import or kernel dispatch |
 | `trtllm_mha` prefill | SM ≥ 10.0 | `dense/test_trtllm_mha.py` decode-only matrix | FlashInfer TRT-LLM Gen FMHA reject (`Unsupported architecture`) |
 | `dsa` `fa3` impl | SM 9.x only | `dsa_impl_capability("fa3")` | `flash_attn at sgl-kernel is only supported on sm90 and above` |
 | `dsa` `trtllm` impl | exactly SM 10.0 | `dsa_impl_capability("trtllm")` | `Missing TRTLLM-GEN kernel` (compiled for SM10.0) |
@@ -176,7 +175,6 @@ fail at backend init.
 |---|---|---|
 | FlashMLA | `64` only | `server_args.py:2767-2770` |
 | TRT-LLM MLA | `{32, 64}` | `server_args.py:2790-2794` |
-| Tokenspeed MLA | `{32, 64}` | `server_args.py:2809-2813`, `tokenspeed_mla_backend.py:111-113` |
 | TRT-LLM MHA | `{16, 32, 64}` | `server_args.py:2849-2853` |
 | FA4 (non-MLA) | `128` when default-selected | `server_args.py:2862-2870` |
 | DSV4 | `256` only | `deepseek_v4_backend.py:355`, `dsv4/metadata.py:134` |
@@ -191,7 +189,6 @@ fail at backend init.
 | `flashinfer_mla` | `1` only | `flashinfer_mla_backend.py:910-913` |
 | `flashmla` | `1` only | `flashmla_backend.py:555-558` |
 | `trtllm_mla` | `1` only | `trtllm_mla_backend.py:1223-1229` (inherits) |
-| `tokenspeed_mla` | `1` only | `tokenspeed_mla_backend.py:341-347` (inherits) |
 | `dsv4` | `0` or `1` | `deepseek_v4_backend.py:369`, `:363` (HIP) |
 | `trtllm_mha` (graph replay) | `1` only | `trtllm_mha_backend.py:459,492`; `server_args.py:2391-2392` |
 
@@ -199,7 +196,6 @@ fail at backend init.
 
 | Backend | Allowed dtype | Citation |
 |---|---|---|
-| `tokenspeed_mla` | `fp8_e4m3` only | `server_args.py:2814-2818` |
 | `trtllm_mla` | `{fp8_e4m3, fp4_e2m1, bf16, auto}` | `server_args.py:2796-2799` |
 | `fa3` | not `fp8_e5m2` (silently falls back to `triton`) | `server_args.py:2855-2860` |
 | `dsv4` | Packed FP8/BF16 layout enforced by `DeepSeekV4TokenToKVPool` | `deepseek_v4_backend.py:363` |
