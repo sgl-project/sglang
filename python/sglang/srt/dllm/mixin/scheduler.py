@@ -50,15 +50,26 @@ class SchedulerDllmMixin:
             # FDFO only: a round is one denoise step, so a prompt-only row
             # self-finishes on it. The synchronous loop forwards until every
             # block resolves, which a prompt row would ride for no reason.
-            self.dllm_mixed_batch_enabled = self.dllm_config.first_done_first_out_mode
+            # Separate context encoding runs prefill rows as their own EXTEND
+            # forward, which a mixed DLLM_EXTEND round cannot carry.
+            self.dllm_mixed_batch_enabled = (
+                self.dllm_config.first_done_first_out_mode
+                and not self.dllm_config.requires_separate_context_encoding
+            )
             if self.dllm_mixed_batch_enabled:
                 logger.info(
                     "dLLM prefill and decode rows are scheduled into one round."
                 )
-            else:
+            elif not self.dllm_config.first_done_first_out_mode:
                 logger.warning(
                     "SGLANG_ENABLE_DLLM_MIXED_BATCH needs --dllm-fdfo; "
                     "keeping the prefill-first dLLM rounds."
+                )
+            else:
+                logger.warning(
+                    "SGLANG_ENABLE_DLLM_MIXED_BATCH cannot mix rounds for an "
+                    "algorithm that encodes context in a separate EXTEND "
+                    "forward; keeping the prefill-first dLLM rounds."
                 )
 
     def _abort_dllm_req(self: Scheduler, req: Req) -> None:
