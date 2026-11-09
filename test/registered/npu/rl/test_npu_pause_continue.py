@@ -106,20 +106,31 @@ class TestNpuPauseContinue(CustomTestCase):
         return thread
 
     def test_pause_abort_returns_inflight(self):
-        results = {}
-        thread = self._decode_async(512, results)
+        events, errors = [], []
+        thread = self._stream_async(events, errors, max_new_tokens=512)
 
-        time.sleep(0.5)
+        # Wait for the first decoded token and require the request to still be
+        # running; aborting a completed or unstarted request proves nothing.
+        deadline = time.time() + 30
+        while thread.is_alive() and not events and time.time() < deadline:
+            time.sleep(0.02)
+        self.assertTrue(events, "no token was emitted before pause(abort)")
+        self.assertTrue(thread.is_alive(), "request finished before pause(abort)")
+
         pause_generation(self.base_url, mode="abort")
         thread.join(timeout=60)
 
-        self.assertNotIn("error", results)
-        response = results.get("response", {})
-        output_ids = response.get("output_ids", [])
-        finish_type = response.get("meta_info", {}).get("finish_reason", {}).get("type")
-        self.assertTrue(
-            finish_type == "abort" or len(output_ids) < 512,
-            "pause(abort) returned before the in-flight request was aborted",
+        self.assertFalse(errors, f"stream failed: {errors}")
+        self.assertFalse(thread.is_alive(), "request stream did not end after abort")
+        last = events[-1]
+        finish_type = last.get("meta_info", {}).get("finish_reason", {}).get("type")
+        self.assertEqual(
+            finish_type, "abort", f"pause(abort) did not abort the request: {last}"
+        )
+        self.assertLess(
+            len(last.get("output_ids", [])),
+            512,
+            "aborted request produced the full completion",
         )
 
         continue_generation(self.base_url)

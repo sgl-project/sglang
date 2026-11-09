@@ -569,6 +569,10 @@ class SchedulerWeightUpdaterManager:
                     if queue is not None:
                         queue.resume_memory_occupation()
 
+        # Mirror release(): a resumed engine must be idle before the caller
+        # starts the next round of work on the same device.
+        torch.get_device_module().synchronize()
+
         return ResumeMemoryOccupationReqOutput()
 
     def check_weights(self, recv_req: CheckWeightsReqInput):
