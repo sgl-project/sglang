@@ -8,7 +8,7 @@
 #   3. FlashInfer Prims-TS   main 26bb6dc9's prims_ts/ over 0.7.2, for --dsa-*-backend prims_ts
 #   4. Dynamo 1.6.0          ai-dynamo-runtime rebuilt with the session-affinity patches and the
 #                            K3.1 edits to dynamo.sglang, so Dynamo+SGLang serves K3.1 as is
-# FlashMLA and DeepGEMM come from the sgl-flash-mla and sgl-deep-gemm wheels the base image installs.
+# FlashMLA and DeepGEMM come from the sgl-flash-mla and sgl-deep-gemm wheels python/pyproject.toml pins.
 #
 # Files: this Dockerfile, k31.Dockerfile.dockerignore and docker/k31-image/ (helper scripts and
 # the Dynamo patches). Everything else is fetched from public sources at pinned commits: the base

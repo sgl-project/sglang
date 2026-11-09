@@ -281,19 +281,15 @@ def _fast_flashmla_sched_shape(q: torch.Tensor) -> bool:
     # These layouts use the head64 kernel's schedule constants. Native heads
     # require the newer kernel; V4's specialized head128 kernel stays excluded.
     num_heads, head_dim = q.shape[-2], q.shape[-1]
-    return (
-        q.is_cuda
-        and get_platform().is_blackwell
-        and (
-            num_heads == 64
-            or (num_heads == 128 and head_dim == 576)
-            or (
-                1 <= num_heads < 128
-                and get_platform().is_sm100
-                and hasattr(torch.ops.sgl_kernel, "sparse_decode_num_sm_parts")
-            )
-        )
-    )
+    if not (q.is_cuda and get_platform().is_blackwell):
+        return False
+    if num_heads == 64 or (num_heads == 128 and head_dim == 576):
+        return True
+    if not (1 <= num_heads < 128 and get_platform().is_sm100):
+        return False
+    from sglang.kernels.ops.attention import flash_mla_interface
+
+    return flash_mla_interface.supports_native_heads()
 
 
 def _maybe_precompute_flashmla_sched_meta(
@@ -316,16 +312,17 @@ def _maybe_precompute_flashmla_sched_meta(
         return
     if not _fast_flashmla_sched_shape(q):
         return
+    from sglang.kernels.ops.attention import flash_mla_interface
     from sglang.kernels.ops.attention.dsv4.flashmla_sched_meta import (
         META_INTS,
         flashmla_sched_meta,
     )
 
     b, s_q = q.shape[0], q.shape[1]
-    if hasattr(torch.ops.sgl_kernel, "sparse_decode_num_sm_parts"):
+    if flash_mla_interface.supports_native_heads():
         # The native-head kernel divides the SMs across head blocks at small
         # batch sizes. The schedule must use the same partition count.
-        num_sm_parts = torch.ops.sgl_kernel.sparse_decode_num_sm_parts(
+        num_sm_parts = flash_mla_interface.sparse_decode_num_sm_parts(
             b, s_q, q.shape[2]
         )
     else:
