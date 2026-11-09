@@ -30,15 +30,9 @@ from sglang.srt.layers.attention.mqa_logits_utils import (
     mqa_logits_should_chunk,
 )
 from sglang.srt.layers.layernorm import LayerNorm
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
-from sglang.srt.utils import (
-    add_prefix,
-    ceil_align,
-    is_cuda,
-    is_gfx1250_supported,
-    is_hip,
-    is_npu,
-)
+from sglang.srt.utils import ceil_align, is_cuda, is_gfx1250_supported, is_hip, is_npu
 
 if is_cuda():
     try:

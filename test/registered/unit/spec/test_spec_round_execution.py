@@ -448,8 +448,10 @@ def test_non_reporting_tp_rank_does_not_aggregate():
 
 
 @pytest.mark.parametrize("instrumented", [False, True])
+@pytest.mark.parametrize("live_rows", [(True, True), (True, False), (False, False)])
 def test_real_result_processor_accounts_after_feedback_and_preserves_counter(
     instrumented,
+    live_rows,
 ):
     from sglang.srt.managers.scheduler_components.batch_result_processor import (
         SchedulerBatchResultProcessor,
@@ -459,12 +461,17 @@ def test_real_result_processor_accounts_after_feedback_and_preserves_counter(
     reporter = reporter_for_window()
     reporter.update_spec_metrics = MagicMock()
     processor = NS()
+    processor.still_in_batch = lambda req: req.live
+    processor._rows_still_in_batch = (
+        SchedulerBatchResultProcessor._rows_still_in_batch.__get__(processor)
+    )
     processor.metrics_reporter = reporter
     processor.metrics_collector = MagicMock()
     processor.snapshot_auxiliary_output_starts = MagicMock(return_value=None)
     processor.materialize_sampling_mask_output = MagicMock()
 
     def normalize(**kwargs):
+        assert kwargs["still_in_batch_rows"] == list(live_rows)
         # Feedback may activate B before the completed result is accounted.
         worker.speculative_num_steps = 3
         worker.speculative_num_draft_tokens = 4
@@ -476,7 +483,7 @@ def test_real_result_processor_accounts_after_feedback_and_preserves_counter(
         free_group_begin=MagicMock(side_effect=StopIteration)
     )
     batch = NS(
-        reqs=[None, None],
+        reqs=[NS(live=live) for live in live_rows],
         batch_size=lambda: 2,
         spec_algorithm=NS(is_none=lambda: False),
     )

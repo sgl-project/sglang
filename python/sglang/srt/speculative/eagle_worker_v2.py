@@ -124,8 +124,8 @@ from sglang.srt.utils.async_probe import (
     maybe_detect_nan,
     maybe_detect_oob,
 )
-from sglang.srt.utils.common import (
-    fast_topk,
+from sglang.srt.utils.common import fast_topk
+from sglang.srt.utils.device import (
     get_available_gpu_memory,
     is_cpu,
     is_cuda,
@@ -133,8 +133,8 @@ from sglang.srt.utils.common import (
     is_musa,
     is_npu,
     is_xpu,
-    log_info_on_rank0,
 )
+from sglang.srt.utils.log_utils import log_info_on_rank0
 
 _is_cpu = is_cpu()
 _is_npu = is_npu()
