@@ -16,17 +16,9 @@ from sglang.kernels.ops.attention.unlimited_ocr_dash.dispatch import (
     apply_page2d_rope_pair,
     dash_sparse_attn,
     dash_sparse_attn_decode,
-)
-from sglang.kernels.ops.attention.unlimited_ocr_dash.dispatch import (
-    kbar_refresh_tail as kbar_refresh_tail_triton,
-)
-from sglang.kernels.ops.attention.unlimited_ocr_dash.dispatch import (
-    route_decode as route_decode_triton,
-)
-from sglang.kernels.ops.attention.unlimited_ocr_dash.dispatch import (
-    route_prefill as route_prefill_triton,
-)
-from sglang.kernels.ops.attention.unlimited_ocr_dash.dispatch import (
+    kbar_refresh_tail,
+    route_decode,
+    route_prefill,
     win_bounds_decode,
 )
 from sglang.kernels.ops.attention.unlimited_ocr_dash.page2d_rope import (
@@ -137,7 +129,7 @@ def test_decode_route(width, dql, with_img, budget, impl):
     out_idx = torch.full((rows, 16), -7, dtype=torch.int32, device=DEV)
     out_bias = torch.full((rows, 16), 9.0, device=DEV)
     seq_t = torch.tensor(seq, dtype=torch.int32)
-    M = route_decode_triton(
+    M = route_decode(
         idx_q=idx_q.to(DEV),
         k_bar=k_bar.to(DEV),
         block_table=bt.to(DEV),
@@ -188,7 +180,7 @@ def test_prefill_route(with_img, impl):
     ctx_t = torch.tensor(prefix, dtype=torch.int32)
     out_idx = torch.full((total, 16), -7, dtype=torch.int32, device=DEV)
     out_bias = torch.full((total, 16), 9.0, device=DEV)
-    width_out, _, _ = route_prefill_triton(
+    width_out, _, _ = route_prefill(
         idx_q=idx_q.to(DEV),
         k_bar=k_bar.to(DEV),
         block_table=bt.to(DEV),
@@ -243,7 +235,7 @@ def test_kbar_refresh_skips_tokenless_entries(impl):
         max_query_len=BS + 4,
         device=DEV,
     )
-    kbar_refresh_tail_triton(
+    kbar_refresh_tail(
         kv_cache=kv.to(DEV),
         k_bar=k_bar,
         block_table=bt.to(DEV),

@@ -141,7 +141,7 @@ def win_bounds_decode(
     block_size: int,
     local_blocks: int,
     decode_query_len: int,
-    tile: int = _route.SCAN_TILE,
+    tile: int,
 ) -> None:
     if allow.device.type == "mps":
         return mps.win_bounds_decode(
