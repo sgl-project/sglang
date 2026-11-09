@@ -184,4 +184,4 @@ class TestHybridKdaFa4BackendConstraint(CustomTestCase):
 
 
 if __name__ == "__main__":
-    unittest.main(verbosity=3)
+    unittest.main()
