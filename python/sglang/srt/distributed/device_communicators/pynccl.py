@@ -22,7 +22,7 @@ from sglang.srt.distributed.device_communicators.pynccl_wrapper import (
     ncclUniqueId,
 )
 from sglang.srt.distributed.utils import StatelessProcessGroup
-from sglang.srt.utils.common import get_current_device_stream_fast
+from sglang.srt.utils.device import get_current_device_stream_fast
 
 logger = logging.getLogger(__name__)
 

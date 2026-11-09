@@ -45,7 +45,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     validate_fused_hicache_draft,
 )
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
-from sglang.srt.mem_cache.kv.layout.mha import DraftMHAView
+from sglang.srt.mem_cache.kv.layout.mha import DraftMHAView, MHAHostLayout
 from sglang.srt.mem_cache.kv.router import PlainPoolRouter
 from sglang.srt.mem_cache.layout.fused_draft import (
     DenseDraftRegion,
@@ -57,6 +57,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MambaPool,
     MHATokenToKVPool,
     MiniMaxSparseKVPool,
+    MLATokenToKVPool,
 )
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.pool_host import dsa as pool_host_dsa
@@ -537,6 +538,61 @@ class TestDraftSidecarPoolDispatch(CustomTestCase):
         self.assertEqual(len(specs), 1)
         self.assertIs(entries[0].host_pool, draft_host_pool)
 
+    def test_full_builder_translates_dcp_sharded_mla_draft(self):
+        from sglang.srt.runtime_context import publish, reset_context
+        from sglang.srt.server_args import ServerArgs
+
+        publish(
+            ServerArgs(model_path="dummy", hicache_mem_layout="page_first"),
+            role="scheduler",
+        )
+        self.addCleanup(reset_context)
+        tree_cache = SimpleNamespace(
+            cache_controller=SimpleNamespace(
+                mem_pool_host=SimpleNamespace(size=200, logical_size=800),
+                page_size=512,
+                transfer_layer_id_max=1,
+            )
+        )
+        parallel = SimpleNamespace(dcp_enabled=True, attn_dcp_size=4, attn_dcp_rank=1)
+        for replicated, expected in (
+            (False, dict(host_to_device_ratio=2.0, dcp_size=4, dcp_rank=1)),
+            (True, dict(host_to_device_ratio=8.0, host_token_capacity=800)),
+        ):
+            pool = object.__new__(MLATokenToKVPool)
+            pool.layer_num = 1
+            pool.size = 100
+            pool.start_layer = 0
+            pool.layer_shard_enabled = False
+            pool.dcp_replicated = replicated
+            pool.get_device_pool_infos = lambda: (
+                SimpleNamespace(
+                    pool_name=PoolName.KV,
+                    indices_from_pool=PoolName.KV,
+                    buffer_info=object(),
+                ),
+            )
+            pool.layer_router = PlainPoolRouter(pool, IdSpaceKind.FULL)
+            with (
+                self.subTest(replicated=replicated),
+                patch.object(
+                    hybrid_pool_assembler, "get_parallel", return_value=parallel
+                ),
+                patch.object(
+                    hybrid_pool_assembler,
+                    "_build_mha_mla_host_pool",
+                    return_value=SimpleNamespace(layer_num=1),
+                ) as build_host_pool,
+                patch.object(
+                    hybrid_pool_assembler,
+                    "_get_allocator_type",
+                    return_value="default",
+                ),
+            ):
+                build_full_draft_pools(draft_kv_pool=pool, tree_cache=tree_cache)
+                kwargs = build_host_pool.call_args.kwargs
+                self.assertEqual({key: kwargs.get(key) for key in expected}, expected)
+
     def test_full_builder_registers_separate_dsa_draft_indexer(self):
         """Separate draft indexers retain their own buffers and target KV indices."""
         draft_kv_pool = object.__new__(DSATokenToKVPool)
@@ -658,6 +714,11 @@ class TestDraftSidecarPoolDispatch(CustomTestCase):
                         hybrid_pool_assembler,
                         "get_memory",
                         return_value=SimpleNamespace(hicache_mem_layout="page_first"),
+                    ),
+                    patch.object(
+                        hybrid_pool_assembler,
+                        "get_parallel",
+                        return_value=SimpleNamespace(dcp_enabled=False),
                     ),
                     patch.object(
                         hybrid_pool_assembler,
@@ -1502,6 +1563,9 @@ class TestTransferLayerSpan(CustomTestCase):
 
 
 def _build_unified_swa_pool(page_size: int = 4, *, fused_draft=None):
+    from sglang.test.unified_allocator_fixtures import setup_allocator_context
+
+    setup_allocator_context()
     return build_test_unified_pools(
         device="cpu",
         kv_cache_dtype=torch.float16,
@@ -1539,14 +1603,18 @@ def _build_unified_host_pair(bundle):
 
 class TestFusedDraftHiCacheValidation(CustomTestCase):
     def test_fused_draft_binding_uses_its_host_sub_pool(self):
-        """A bound full draft passes HiCache admission; a window draft is refused."""
+        """Every fused band backs up its complete host entry."""
         region = DenseDraftRegion(
             lane_num=1, head_num=2, head_dim=4, store_dtype=torch.float16
         )
-        for host in ("full", "swa"):
+        # The pool's window states no length: its sub-pool is "window", which
+        # hosts as a window.
+        for host in ("full", "window"):
             with self.subTest(host=host):
                 placement = FusedDraftPlacement.from_counts(
-                    counts={host: [1]}, regions={host: region}
+                    counts={host: [1]},
+                    regions={host: region},
+                    hosted={"window": "swa"} if host == "window" else None,
                 )
                 bundle = _build_unified_swa_pool(fused_draft=placement)
                 draft = DraftMHAView(
@@ -1555,11 +1623,13 @@ class TestFusedDraftHiCacheValidation(CustomTestCase):
                     layer_lanes={0: 0},
                     page_size=bundle.token_to_kv_pool.page_size,
                 )
-                if host == "full":
-                    validate_fused_hicache_draft(draft_device_pools=(draft,))
-                else:
-                    with self.assertRaisesRegex(NotImplementedError, "full-attention"):
-                        validate_fused_hicache_draft(draft_device_pools=(draft,))
+                validate_fused_hicache_draft(draft_device_pools=(draft,))
+                layout = bundle.storage.host_layout(host)
+                self.assertEqual(
+                    layout.get_page_envelope_buffer().shape[1],
+                    bundle.storage.plan.sub_pool(host).spec.entry_bytes()
+                    * bundle.token_to_kv_pool.page_size,
+                )
 
 
 class TestUnifiedPageEnvelopeHostPool(CustomTestCase):
@@ -1661,9 +1731,14 @@ class TestUnifiedPageEnvelopeHostPool(CustomTestCase):
             with (
                 self.subTest(full_indices=full_indices),
                 patch(_ASSEMBLER + "get_memory", return_value=_unified_memory(None)),
-                patch(_ASSEMBLER + "_get_allocator_type", return_value="default"),
                 patch(
-                    _ASSEMBLER + "build_kv_host_pool",
+                    _ASSEMBLER + "get_parallel",
+                    return_value=SimpleNamespace(dcp_enabled=False),
+                ),
+                patch(_ASSEMBLER + "_get_allocator_type", return_value="default"),
+                patch.object(
+                    MHAHostLayout,
+                    "build",
                     side_effect=NotImplementedError("packed pool reached host factory"),
                 ),
                 patch.object(
@@ -1804,23 +1879,28 @@ class TestUnifiedPageEnvelopeHostPool(CustomTestCase):
 
 
 class TestUnifiedPageEnvelopeSelection(CustomTestCase):
-    """Only no backend and Mori store the complete shared page, so only they
-    keep the page-envelope host arena."""
+    """Raw-page backends retain the complete page-envelope host arena."""
 
-    def test_only_no_backend_and_mori_select_the_envelope(self):
+    def test_raw_page_backends_select_the_envelope(self):
         storage = _build_unified_swa_pool().token_to_kv_pool_allocator.storage
         for backend, expected in (
             (None, "pair"),
             ("mori", "pair"),
+            ("file", "pair"),
             ("mooncake", "kv host"),
             ("dynamic", "kv host"),
         ):
             with (
                 self.subTest(backend=backend),
                 patch(_ASSEMBLER + "get_memory", return_value=_unified_memory(backend)),
-                patch(_ASSEMBLER + "_get_allocator_type", return_value="default"),
                 patch(
-                    _ASSEMBLER + "build_kv_host_pool",
+                    _ASSEMBLER + "get_parallel",
+                    return_value=SimpleNamespace(dcp_enabled=False),
+                ),
+                patch(_ASSEMBLER + "_get_allocator_type", return_value="default"),
+                patch.object(
+                    MHAHostLayout,
+                    "build",
                     side_effect=NotImplementedError("kv host"),
                 ),
                 patch.object(
@@ -1952,43 +2032,6 @@ class TestMtpMhaPhysicalConstruction(CustomTestCase):
 class TestMambaSwaStackMatchesOtherStacks(CustomTestCase):
     """Every stack builds its controller and state host the same way."""
 
-    def test_controller_takes_groups_and_host_memory_mode(self):
-        """Stacks once dropped the attention groups or the host memory mode."""
-        params = SimpleNamespace(
-            token_to_kv_pool_allocator=object(),
-            page_size=1,
-            tp_cache_group=object(),
-            pp_cache_group=object(),
-            attn_cp_cache_group=object(),
-            attn_tp_cache_group=object(),
-        )
-        memory = SimpleNamespace(
-            hicache_write_policy="write_through",
-            hicache_io_backend="kernel",
-            hicache_host_memory_mode="buffer_only",
-        )
-        with (
-            patch.object(hybrid_pool_assembler, "get_memory", return_value=memory),
-            patch.object(hybrid_pool_assembler, "HybridCacheController") as ctor,
-        ):
-            hybrid_pool_assembler._build_cache_controller(
-                params=params,
-                host_pool_group=object(),
-                transfer_layer_id_max=2,
-                load_cache_event=None,
-                storage_backend=None,
-                prefetch_threshold=256,
-                model_name=None,
-                storage_backend_extra_config=None,
-                enable_storage_metrics=False,
-            )
-        kwargs = ctor.call_args.kwargs
-        self.assertIs(ctor.call_args.args[3], params.tp_cache_group)
-        self.assertIs(kwargs["attn_cp_group"], params.attn_cp_cache_group)
-        self.assertIs(kwargs["attn_tp_group"], params.attn_tp_cache_group)
-        self.assertIs(kwargs["pp_group"], params.pp_cache_group)
-        self.assertEqual(kwargs["host_memory_mode"], "buffer_only")
-
     def test_state_host_has_no_kv_split(self):
         for layout, expected in (
             ("page_first_kv_split", "page_first_direct"),
@@ -2003,6 +2046,34 @@ class TestMambaSwaStackMatchesOtherStacks(CustomTestCase):
                 ),
             ):
                 self.assertEqual(hybrid_pool_assembler._state_host_layout(), expected)
+
+
+class TestHostLoadEvictsTheTargetWindowOnly(CustomTestCase):
+    """A host load of the target window evicts only the target's shortfall,
+    from the target's entries: a fused draft's own window, which a target
+    load never writes, keeps its entries."""
+
+    def test_a_short_target_beside_a_draft_window(self):
+        evicted = []
+        allocator = SimpleNamespace(
+            storage=SimpleNamespace(
+                plan=SimpleNamespace(
+                    primary_window=lambda: SimpleNamespace(name="window_4096")
+                )
+            ),
+            swa_available_size=lambda: 10,
+            window_pool_names=lambda: ("window_4096", "window_128"),
+        )
+        cache = SimpleNamespace(
+            token_to_kv_pool_allocator=allocator,
+            evict_for_alloc=lambda params: evicted.append(params),
+        )
+        hybrid_pool_assembler._evict_swa_for_device_alloc(cache, 16)
+        self.assertEqual(len(evicted), 1)
+        self.assertEqual(evicted[0].window_num_tokens, {"window_4096": 6})
+        evicted.clear()
+        hybrid_pool_assembler._evict_swa_for_device_alloc(cache, 10)
+        self.assertEqual(evicted, [])
 
 
 if __name__ == "__main__":

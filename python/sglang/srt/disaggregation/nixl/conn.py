@@ -83,6 +83,7 @@ _PREPARED_STATE_TYPES = frozenset(
     (
         StateType.MAMBA,
         StateType.SWA,
+        StateType.AUXILIARY_SWA,
         StateType.DSA,
         StateType.QSA_PENDING,
         StateType.QSA_COMPRESSED,
@@ -363,6 +364,7 @@ class KVArgsRegisterInfo:
     requires_dcp_relayout: bool = False
     dcp_token_item_lens: Optional[List[int]] = None
     dcp_dst_region_indices: Optional[List[int]] = None
+    dst_draft_rows_dcp_collapsed: bool = False
     dst_num_slots: Optional[int] = None
     dst_state_item_lens: List[List[int]] = dataclasses.field(default_factory=list)
     dst_state_dim_per_tensor: List[List[int]] = dataclasses.field(default_factory=list)
@@ -440,6 +442,7 @@ class KVArgsRegisterInfo:
             dst_dcp_rank=(
                 int(msg[23].decode("ascii")) if len(msg) > 23 and msg[23] != b"" else 0
             ),
+            dst_draft_rows_dcp_collapsed=(len(msg) > 25 and msg[25] == b"1"),
             dst_num_slots=dst_num_slots,
             dst_state_item_lens=dst_state_item_lens,
             dst_state_dim_per_tensor=dst_state_dim_per_tensor,
@@ -1527,6 +1530,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             peer_info.dcp_token_item_lens = self.prepare_dcp_token_item_lens(
                 dst_kv_item_lens,
                 peer_info.dst_dcp_size,
+                draft_rows_collapsed=peer_info.dst_draft_rows_dcp_collapsed,
             )
             return
 
@@ -1801,6 +1805,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                                     src_page_offset=(kv_chunk.index_slice.start or 0),
                                     decode_prefix_len=req.decode_prefix_len or 0,
                                     num_kv_tokens=kv_chunk.num_kv_tokens,
+                                    draft_rows_collapsed=dst_info.dst_draft_rows_dcp_collapsed,
                                 )
                                 packed_src = self._pack_dcp_rank_once(
                                     pack_buffer,
@@ -3200,7 +3205,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     force_flat=True,
                 )
             elif (
-                st == StateType.SWA
+                st in (StateType.SWA, StateType.AUXILIARY_SWA)
                 and not self.is_mla_backend
                 and self.attn_tp_size != decode_tp_size
             ):
@@ -3218,6 +3223,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 )
             elif st in (
                 StateType.SWA,
+                StateType.AUXILIARY_SWA,
                 StateType.BLOCK_SCALE,
                 StateType.BLOCK_SCALE_SWA,
                 StateType.QSA_PENDING,
@@ -3535,6 +3541,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             str(self.dcp_size).encode("ascii"),
             str(self.dcp_rank).encode("ascii"),
             packed_state_data_lens,
+            b"1" if self.kv_args.draft_rows_dcp_collapsed else b"0",
         ]
 
     def build_receiver_metadata_message(
