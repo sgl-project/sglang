@@ -15,12 +15,7 @@ use super::qwen38::{template_args, template_tools};
 use super::template_context::PreservedRequest;
 use crate::py::py_truthy;
 use crate::render::RenderError;
-use crate::render::reasoning::requested_effort;
-
-/// `protocol.ReasoningEffortTier`.
-const EFFORT_TIERS: &[&str] = &[
-    "none", "minimal", "low", "medium", "high", "xhigh", "ultra", "max",
-];
+use crate::render::reasoning::{EFFORT_TIERS, requested_effort};
 
 /// `apply_chat_template` arguments SGLang passes itself, which fail its call as
 /// kwargs. A falsy `continue_final_message` or `return_assistant_tokens_mask` is
@@ -153,8 +148,11 @@ fn validate_tool_choice(request: &Value, messages: &[Value]) -> Result<(), Strin
             }
         }
     }
+    if message_tools.is_empty() {
+        return Ok(());
+    }
     let names: Vec<Value> = tools.iter().map(|tool| name(tool)).collect();
-    if !message_tools.is_empty() && (1..names.len()).any(|i| names[..i].contains(&names[i])) {
+    if (1..names.len()).any(|i| names[..i].contains(&names[i])) {
         return Err("Tool names must be unique across request and message tools.".into());
     }
     Ok(())

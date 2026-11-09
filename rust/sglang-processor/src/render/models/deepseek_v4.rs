@@ -17,7 +17,7 @@ use tokenizers::{AddedVocabulary, Tokenizer};
 
 use super::pydantic_dump::{continues_final_message, function_dump, pydantic_bool};
 use crate::py::python_json_compact;
-use crate::render::reasoning::{requested_effort, requested_thinking};
+use crate::render::reasoning::{EFFORT_TIERS, requested_effort, requested_thinking};
 
 /// The checkpoint tokenizer's image token; recipe's bundled tokenizer spells it `<｜image｜>`.
 const IMAGE_TOKEN: &str = "<｜deepseek_image｜>";
@@ -334,16 +334,12 @@ fn request_effort_value(effort: &Value) -> Value {
         Value::String(text) => text
             .parse::<f64>()
             .ok()
-            .filter(|_| !TIERS.contains(&text.as_str()))
+            .filter(|_| !EFFORT_TIERS.contains(&text.as_str()))
             .map_or_else(|| effort.clone(), |value| json!(value)),
         Value::Number(number) => number.as_f64().map_or_else(|| effort.clone(), |v| json!(v)),
         _ => effort.clone(),
     }
 }
-
-const TIERS: [&str; 8] = [
-    "none", "minimal", "low", "medium", "high", "xhigh", "ultra", "max",
-];
 
 /// `SGLANG_DSV4_REASONING_EFFORT` / `SGLANG_DSV41_REASONING_EFFORT`.
 fn env_effort(v41: bool) -> Option<Value> {
