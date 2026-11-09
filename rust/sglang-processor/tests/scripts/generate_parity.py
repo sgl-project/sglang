@@ -24,7 +24,6 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from huggingface_hub import snapshot_download
-from transformers import AutoTokenizer
 
 # Fixtures must not depend on the generating machine's environment.
 os.environ["SGLANG_DEFAULT_THINKING"] = "false"
@@ -34,6 +33,7 @@ os.environ["SGLANG_DSV41_REASONING_EFFORT"] = ""
 from sglang.srt.entrypoints.openai import chat_encoding
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
+from sglang.srt.hf_transformers.tokenizer import get_tokenizer
 from sglang.srt.parser.jinja_template_utils import detect_jinja_template_content_format
 from sglang.srt.parser.template_manager import TemplateManager
 from sglang.srt.runtime_context import publish, reset_context
@@ -111,11 +111,8 @@ def generate(fixture_path):
     # The server args `_validate_request` reads.
     reset_context()
     publish(ServerArgs(model_path=path), role="tokenizer")
-    tok = RecordingTokenizer(
-        AutoTokenizer.from_pretrained(
-            path, local_files_only=True, trust_remote_code=True
-        )
-    )
+    # SGLang's loader, whose fixes for transformers v5 the engine's tokenizer gets.
+    tok = RecordingTokenizer(get_tokenizer(path, trust_remote_code=True))
     server = serving_chat(
         fixture["model"],
         path,
@@ -129,9 +126,15 @@ def generate(fixture_path):
         key: config[key] for key in ("model_type", "architectures") if key in config
     }
     fixture["bos_token_id"] = tok.bos_token_id
-    # Jinja checkpoints render with their template; keep it so the test runs offline.
+    # Jinja checkpoints render with their template; keep it so the test runs offline,
+    # with the special tokens the template context carries.
     if server.chat_encoding_spec is None:
         fixture["chat_template"] = tok.chat_template
+        fixture["special_tokens"] = {
+            name: getattr(tok, name)
+            for name in ("bos_token", "eos_token", "unk_token")
+            if getattr(tok, name) is not None
+        }
     inputs = (
         "name",
         "request",
@@ -190,6 +193,7 @@ def generate(fixture_path):
         "tool_call_parser",
         "config",
         "bos_token_id",
+        "special_tokens",
         "chat_template",
     )
     head = {k: fixture[k] for k in keys if k in fixture}
