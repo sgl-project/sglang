@@ -344,7 +344,7 @@ def test_source_counts_are_gathered_before_dispatch_even_on_deepep_auto():
 @pytest.mark.parametrize(
     "data, message",
     [
-        ('{"physical_to_logical_map": [[0, 1]]}', "routing metadata"),
+        ('{"physical_to_logical_map": [[0, 1]]}', "master experts fixed"),
         ('{"logical_count": [[[1, 2]], [[3, 4]]]}', "per source EP rank"),
     ],
 )

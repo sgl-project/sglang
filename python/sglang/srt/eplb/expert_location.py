@@ -850,10 +850,10 @@ def compute_initial_expert_location_metadata(
     moe_ep_rank: int,
     moe_load_balancer=None,
 ) -> Optional[ExpertLocationMetadata]:
+    from sglang.srt.eplb.moe_load_balancer_glue import uses_coupled_placement
+
     data = get_exec().moe.init_expert_location
-    coupled = (
-        moe_load_balancer is not None and moe_load_balancer.placement_policy is not None
-    )
+    coupled = uses_coupled_placement(moe_load_balancer)
     if data == "trivial":
         if coupled:
             return _init_coupled_bootstrap(model_config, moe_ep_rank)
@@ -870,8 +870,8 @@ def compute_initial_expert_location_metadata(
     if "physical_to_logical_map" in data_dict:
         if coupled:
             raise ValueError(
-                "Coupled EvenMoE placement plans from logical_count statistics; "
-                "a physical_to_logical_map carries no routing metadata."
+                "Coupled EvenMoE placement keeps each rank's master experts fixed; "
+                "an arbitrary physical_to_logical_map may not follow that layout."
             )
         logger.info(
             "init_expert_location from init_by_mapping using ServerArgs.init_expert_location"

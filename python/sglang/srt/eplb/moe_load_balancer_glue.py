@@ -143,6 +143,20 @@ def get_moe_load_balancer_pipeline(algorithm):
     return RoutingPipeline.from_value(algorithm)
 
 
+def uses_coupled_placement(pipeline_or_balancer) -> bool:
+    """Whether the routing pipeline brings its own placement policy (today: UltraEP).
+
+    Its placement also produces routing state (a per-source-rank quota), is
+    re-planned per layer from live traffic using per-rank statistics, and keeps
+    each rank's master experts fixed. Accepts a RoutingPipeline or the
+    MoELoadBalancer built from it.
+    """
+    return (
+        pipeline_or_balancer is not None
+        and pipeline_or_balancer.placement_policy is not None
+    )
+
+
 def resolve_pipeline_a2a_backend(pipeline, moe_a2a_backend: str) -> str:
     """The ``--moe-a2a-backend`` to run ``pipeline`` with: the requested one if
     supported, else the pipeline's first supported backend SGLang has."""

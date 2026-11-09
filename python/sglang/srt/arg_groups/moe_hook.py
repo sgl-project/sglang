@@ -47,7 +47,10 @@ def handle_moe_load_balancer(server_args: Any):
     Without the flag, native EPLB dispatch does not import ``evenmoe``.
     """
     cfg = resolving_view(server_args)
-    from sglang.srt.eplb.moe_load_balancer_glue import get_moe_load_balancer_pipeline
+    from sglang.srt.eplb.moe_load_balancer_glue import (
+        get_moe_load_balancer_pipeline,
+        uses_coupled_placement,
+    )
 
     pipeline = get_moe_load_balancer_pipeline(cfg.moe_load_balancer_algorithm)
     if pipeline is not None:
@@ -72,7 +75,7 @@ def handle_moe_load_balancer(server_args: Any):
                 "The selected EvenMoE pipeline changes routing buffers after placement updates; "
                 "--enable-eplb requires --disable-cuda-graph."
             )
-        if pipeline.placement_policy is not None:
+        if uses_coupled_placement(pipeline):
             _check_coupled_placement(cfg)
         declare_resolution(server_args, "_handle_moe_load_balancer", **resolutions)
 

@@ -1018,10 +1018,10 @@ def _placement_is_coupled() -> bool:
     """
     from sglang.srt.eplb.moe_load_balancer_glue import (
         get_configured_moe_load_balancer_pipeline,
+        uses_coupled_placement,
     )
 
-    pipeline = get_configured_moe_load_balancer_pipeline()
-    return pipeline is not None and pipeline.placement_policy is not None
+    return uses_coupled_placement(get_configured_moe_load_balancer_pipeline())
 
 
 class _StatAccumulator(_UtilizationRateAccumulatorMixin):

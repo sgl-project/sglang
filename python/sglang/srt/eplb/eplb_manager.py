@@ -61,10 +61,9 @@ class EPLBManager:
         self._rebalance_num_iterations = get_exec().moe.eplb_rebalance_num_iterations
         self._rebalance_disabled_reason = None
         self._rebalance_disabled_logged = False
-        self.refreshes_per_layer = (
-            moe_load_balancer is not None
-            and moe_load_balancer.placement_policy is not None
-        )
+        from sglang.srt.eplb.moe_load_balancer_glue import uses_coupled_placement
+
+        self.refreshes_per_layer = uses_coupled_placement(moe_load_balancer)
         self._refresh_gate = None
         if self.refreshes_per_layer:
             from evenmoe.policies.l1 import RefreshGate
