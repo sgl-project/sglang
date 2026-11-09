@@ -208,5 +208,46 @@ class TestBailingMRotaryEmbedding(CustomTestCase):
         self.assertTrue(config.vision_config.disable_merger_proj)
 
 
+class TestBailingPositionTokenSearch(CustomTestCase):
+    def test_token_search_never_copies_the_prompt_tail(self):
+        """Locating each media span must not slice the prompt token list."""
+        original_tolist = torch.Tensor.tolist
+        sliced = []
+
+        class Recorder(list):
+            def __getitem__(self, index):
+                if isinstance(index, slice):
+                    sliced.append(index)
+                return super().__getitem__(index)
+
+        def tolist(tensor):
+            values = original_tolist(tensor)
+            return Recorder(values) if tensor.dim() == 1 else values
+
+        config = _position_config()
+        config.text_config.use_interleaved_frame_timestamp = True
+        input_ids = torch.tensor([7, 10, 11, 11, 11, 11, 7, 10, 12, 12, 12, 12, 7])
+        with mock.patch.object(torch.Tensor, "tolist", tolist):
+            positions, delta = (
+                BailingMRotaryEmbedding.bailing_3drope_get_input_positions_tensor(
+                    input_ids,
+                    config,
+                    image_grid_thw=torch.tensor([[1, 4, 4]]),
+                    video_grid_thw=torch.tensor([[1, 4, 4]]),
+                )
+            )
+
+        self.assertEqual(sliced, [])
+        self.assertEqual(
+            positions[:, 0].tolist(),
+            [
+                [0, 1, 2, 2, 2, 2, 3, 4, 5, 5, 5, 5, 6],
+                [0, 1, 2, 2, 3, 3, 3, 4, 5, 5, 6, 6, 6],
+                [0, 1, 2, 3, 2, 3, 3, 4, 5, 6, 5, 6, 6],
+            ],
+        )
+        self.assertEqual(delta.tolist(), [[-6]])
+
+
 if __name__ == "__main__":
     unittest.main()
