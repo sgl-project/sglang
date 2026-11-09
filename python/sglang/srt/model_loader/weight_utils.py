@@ -1711,11 +1711,22 @@ def composed_weight_loader(
 
 
 def runai_safetensors_weights_iterator(
-    hf_weights_files: List[str], is_distributed: bool = False, device: str = "cpu"
+    hf_weights_files: List[str],
+    is_distributed: bool = False,
+    device: str = "cpu",
+    load_group: LoadGroup = _DEFAULT_LOAD_GROUP,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files."""
     from runai_model_streamer import SafetensorsStreamer
 
+    # RunAI's distributed mode spans the whole world; a stage-local draft load
+    # must stream independently to avoid waiting for the other PP stages.
+    if load_group is None or (
+        load_group is not _DEFAULT_LOAD_GROUP
+        and torch.distributed.is_initialized()
+        and load_group.world_size != torch.distributed.get_world_size()
+    ):
+        is_distributed = False
     enable_tqdm = (
         not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     )

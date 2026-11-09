@@ -148,6 +148,30 @@ class TestNemotronHForCausalLMMTP(CustomTestCase):
                     model.lm_head.weight_scale, torch.tensor([0.5])
                 )
 
+    def test_tracks_input_embedding_loaded_from_stream(self):
+        for prefix in ("", "language_model."):
+            for key in ("backbone.embeddings.weight", "model.embed_tokens.weight"):
+                with self.subTest(prefix=prefix, key=key):
+                    model = self._make_head_model()
+                    expected = torch.arange(8.0).reshape(4, 2)
+                    buffer = expected.clone()
+
+                    def weights():
+                        yield prefix + key, buffer
+                        buffer.zero_()
+                        yield prefix + "mtp.layers.0.weight", torch.ones(2, 2)
+
+                    model.load_weights(weights())
+                    self.assertTrue(model.loaded_input_embedding)
+                    torch.testing.assert_close(
+                        model.model.embed_tokens.weight, expected
+                    )
+
+                    model.load_weights(
+                        iter([("mtp.layers.0.weight", torch.ones(2, 2))])
+                    )
+                    self.assertFalse(model.loaded_input_embedding)
+
     def test_embedded_and_headless_mtp_share_complete_target_head(self):
         for embedded in (False, True):
             with self.subTest(embedded=embedded):

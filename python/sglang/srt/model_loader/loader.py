@@ -4098,7 +4098,10 @@ class RunaiModelStreamerLoader(BaseModelLoader):
             )
 
         weights_iterator = runai_safetensors_weights_iterator(
-            hf_weights_files, self._is_distributed, self.target_device_str
+            hf_weights_files,
+            self._is_distributed,
+            self.target_device_str,
+            load_group=self.load_config.load_group,
         )
 
         if self.load_config.draft_model_idx is not None:
