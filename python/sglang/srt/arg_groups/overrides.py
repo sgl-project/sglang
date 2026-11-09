@@ -62,6 +62,7 @@ from sglang.srt.runtime_context import (
     num_dp_ranks_of,
 )
 from sglang.srt.utils.device import (
+    is_confidential_compute,
     is_fi_a2a_supported,
     is_gfx95_supported,
     xpu_has_xmx_support,
@@ -763,6 +764,7 @@ def _pin_dsa_backends(
 
 # Matches the reference fp8_ds_mla cache; trtllm's 576 B layout does not.
 _KIMI_K31_DSA_BACKEND = "flashmla_kv"
+_KIMI_K31_DSA_BACKENDS = ("flashmla_kv", "trtllm")
 # ROCm: the Triton kernels dequantize the same fp8_ds_mla rows and run BF16 dots.
 _KIMI_K31_DSA_BACKEND_HIP = "triton"
 
@@ -782,17 +784,42 @@ def _kimi_k31_kv_cache_dtype(view: Any) -> dict:
 def _kimi_k31_dsa_backends(view: Any) -> dict:
     if view.enable_hisparse:
         raise ValueError("Kimi-K3.1 does not support --enable-hisparse yet.")
-    backend = (
-        _KIMI_K31_DSA_BACKEND_HIP if get_platform().is_hip else _KIMI_K31_DSA_BACKEND
-    )
-    declared = _pin_dsa_backends(
-        view,
-        backend,
-        lambda option, value: (
-            f"Kimi-K3.1 requires {option} {backend!r} to match "
-            f"the reference fp8_ds_mla numerics; got {value!r}."
-        ),
-    )
+    if get_platform().is_hip:
+        backend = _KIMI_K31_DSA_BACKEND_HIP
+        return _pin_dsa_backends(
+            view,
+            backend,
+            lambda option, value: (
+                f"Kimi-K3.1 requires {option} {backend!r} on ROCm; got {value!r}."
+            ),
+        )
+    fields = ("dsa_prefill_backend", "dsa_decode_backend")
+    for field in fields:
+        value = getattr(view, field)
+        if value is not None and value not in _KIMI_K31_DSA_BACKENDS:
+            option = "--" + field.replace("_", "-")
+            raise ValueError(
+                f"Kimi-K3.1 supports {option} {' / '.join(_KIMI_K31_DSA_BACKENDS)}; "
+                f"got {value!r}."
+            )
+    # Both phases read one KV pool (and PD peers exchange it), so an unset
+    # phase follows the set one.
+    chosen = {getattr(view, f) for f in fields} - {None}
+    if len(chosen) > 1:
+        raise ValueError(
+            "Kimi-K3.1 needs the same --dsa-prefill-backend and "
+            "--dsa-decode-backend (flashmla_kv and trtllm use different KV "
+            f"layouts); got {view.dsa_prefill_backend!r} and "
+            f"{view.dsa_decode_backend!r}."
+        )
+    backend = chosen.pop() if chosen else _KIMI_K31_DSA_BACKEND
+    if backend == "trtllm":
+        logger.warning(
+            "Kimi-K3.1 trtllm DSA uses FP8 q and an unscaled FP8 KV cache, not "
+            "the reference fp8_ds_mla numerics. PD prefill and decode must both "
+            "use trtllm."
+        )
+    declared = {f: backend for f in fields if getattr(view, f) is None}
     logger.warning(
         "Set DSA backends for Kimi-K3.1: prefill=%s, decode=%s.", backend, backend
     )
@@ -1055,7 +1082,14 @@ def _flashinfer_allreduce_fusion_auto_enable(view: Any) -> dict:
         and (view.nnodes == 1 or get_platform().is_sm100)
         and view.moe_a2a_backend == "none"
     ):
-        backend = "cutedsl" if is_mimo else "auto"
+        if is_confidential_compute():
+            # mnnvl, cutedsl and multi-node fusion need NVLink multicast, which
+            # Confidential Computing does not provide.
+            if is_mimo or view.nnodes > 1:
+                return {}
+            backend = "trtllm"
+        else:
+            backend = "cutedsl" if is_mimo else "auto"
         logger.info(
             "Auto-enabling FlashInfer AllReduce Fusion (%s) for %s", backend, model_arch
         )

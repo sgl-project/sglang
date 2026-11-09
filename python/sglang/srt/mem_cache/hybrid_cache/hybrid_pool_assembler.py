@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from functools import partial
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
+from sglang.srt.layers.dcp.layout import dsa_shards_index_k
 from sglang.srt.mem_cache.device_pool_info import (
     IndexKeyLayout,
     MHABufferInfo,
@@ -47,7 +48,10 @@ from sglang.srt.mem_cache.pool_host.page_interleave import (
 from sglang.srt.mem_cache.pool_host.page_unified import resolve_kv_host_geometry
 from sglang.srt.mem_cache.pool_host.qsa import QSAIndexerPoolHost
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
-from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.mem_cache.unified_cache.component_type import (
+    ComponentType,
+    tree_slot_ids,
+)
 from sglang.srt.runtime_context import get_memory, get_parallel, get_serving
 
 if TYPE_CHECKING:
@@ -67,12 +71,17 @@ def _get_allocator_type() -> str:
 
 
 def _evict_swa_for_device_alloc(cache: UnifiedRadixCache, required_size: int) -> None:
-    from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+    """Make room for a host load of ``required_size`` rows of the target
+    window: its own shortfall, from its own entries. The load writes no other
+    window, so no other window is short."""
+    from sglang.srt.mem_cache.base_prefix_cache import EvictParams, window_sub_pool_of
 
-    available_size = cache.token_to_kv_pool_allocator.swa_available_size()
-    shortfall = max(0, required_size - available_size)
+    allocator = cache.token_to_kv_pool_allocator
+    shortfall = max(0, required_size - allocator.swa_available_size())
     if shortfall > 0:
-        cache.evict_for_alloc(EvictParams(swa_num_tokens=shortfall))
+        cache.evict_for_alloc(
+            EvictParams(window_num_tokens={window_sub_pool_of(allocator): shortfall})
+        )
 
 
 def _evict_mamba_for_device_alloc(cache: UnifiedRadixCache, required_size: int) -> None:
@@ -273,6 +282,7 @@ def _build_cache_controller(
     model_name: Optional[str],
     storage_backend_extra_config: Optional[dict],
     enable_storage_metrics: bool,
+    kv_storage=None,
 ) -> HybridCacheController:
     memory = get_memory()
     return HybridCacheController(
@@ -293,6 +303,7 @@ def _build_cache_controller(
         transfer_layer_id_max=transfer_layer_id_max,
         enable_storage_metrics=enable_storage_metrics,
         host_memory_mode=memory.hicache_host_memory_mode,
+        kv_storage=kv_storage,
     )
 
 
@@ -1356,14 +1367,10 @@ def _evict_for_host_load(
     shortfall = max(0, required_size - storage.device_room(sub_pool))
     if shortfall == 0:
         return
-    if component == ComponentType.SWA:
-        cache.evict_for_alloc(EvictParams(swa_num_tokens=shortfall))
+    if component == ComponentType.MAMBA:
+        cache.evict_for_alloc(EvictParams(mamba_num=shortfall))
     else:
-        if component == ComponentType.AUXILIARY_SWA:
-            cache.evict_for_alloc(EvictParams(auxiliary_swa_num_tokens=shortfall))
-        else:
-            assert component == ComponentType.MAMBA, component
-            cache.evict_for_alloc(EvictParams(mamba_num=shortfall))
+        cache.evict_for_alloc(EvictParams(window_num_tokens={sub_pool: shortfall}))
 
 
 def build_unified_host_stack(
@@ -1386,7 +1393,8 @@ def build_unified_host_stack(
     page_size = params.page_size
     owner = storage.owner
     sub_pools = storage.sub_pools()
-    owner_component = ComponentType[sub_pools[0].external.tree_component]
+    slot_ids = tree_slot_ids(storage.tree_slots())
+    owner_component = slot_ids[sub_pools[0].external.tree_component]
     layer_maps = {
         s.name: {
             layer_id - storage.start_layer: index
@@ -1494,7 +1502,7 @@ def build_unified_host_stack(
         if s.name == owner:
             continue
         view = storage.view(s.name)
-        component = ComponentType[s.external.tree_component]
+        component = slot_ids[s.external.tree_component]
         drafts = params.mtp_draft_mamba_pools if s.holds_state else token_drafts[s.name]
         if s.name not in host_pools:
             host_pools[s.name] = build_host(s.name, drafts)
@@ -1537,7 +1545,7 @@ def build_unified_host_stack(
             )
         component_host_pools[component] = host_pools[s.name]
 
-    format_tag = storage.plan.storage_format_tag()
+    format_tag = storage.storage_format_tag()
     if format_tag is not None:
         host_pools[owner].storage_format_tag = format_tag
 
@@ -1552,6 +1560,7 @@ def build_unified_host_stack(
         model_name=model_name,
         storage_backend_extra_config=storage_backend_extra_config,
         enable_storage_metrics=enable_storage_metrics,
+        kv_storage=storage,
     )
     return StackBuildResult(
         host_pool_group=host_pool_group,
@@ -1593,6 +1602,8 @@ def _build_sidecar_host_pool(
         buffer_device=root.device,
         dtype=root.store_dtype,
         layer_sharded=root.layer_shard_enabled,
+        dcp_size=root_host_pool.dcp_size if dsa_shards_index_k() else 1,
+        dcp_rank=root_host_pool.dcp_rank if dsa_shards_index_k() else 0,
         allocator_type=_get_allocator_type(),
     )
     host.start_layer, host.end_layer = root.start_layer, root.end_layer
@@ -1686,6 +1697,8 @@ def _build_mha_mla_host_pool(
     allocator_type: str,
     pool_label: str,
     host_token_capacity: int | None = None,
+    dcp_size: int = 1,
+    dcp_rank: int = 0,
 ):
     is_mha = isinstance(buffer_info, MHABufferInfo)
     # The global layout is page_first_kv_split only when the target model
@@ -1713,6 +1726,8 @@ def _build_mha_mla_host_pool(
         end_layer=pool.end_layer,
         target_layer_num=pool.layer_num,
         override_kv_cache_dim=pool.kv_cache_dim,
+        dcp_size=dcp_size,
+        dcp_rank=dcp_rank,
         write_back_staging=pool.hicache_write_back_staging,
         **kwargs,
     )
@@ -1724,6 +1739,8 @@ def build_full_draft_pools(
     tree_cache: Any,
 ) -> tuple[list[SidecarPoolSpec], list[PoolEntry]]:
     """Build draft KV and its sidecars, whose indices follow target full KV."""
+    from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+
     pool = draft_kv_pool
     inner = pool.layer_router.wrapped_view()
     if inner is not None:
@@ -1750,18 +1767,37 @@ def build_full_draft_pools(
         )
     buffer_info = config.pool_infos[PoolName.KV].buffer_info
 
-    # Note(kpham-sgl): DCP x DSpark draft KV is replicated and spans the virtual
-    # loc space, so match the target host's logical_size instead of physical size.
-    draft_host_pool = _build_mha_mla_host_pool(
-        pool=pool,
-        buffer_info=buffer_info,
-        host_to_device_ratio=host_pool_group.logical_size / pool.size,
-        page_size=controller.page_size,
-        layout=get_memory().hicache_mem_layout,
-        allocator_type=_get_allocator_type(),
-        pool_label="draft",
-        host_token_capacity=host_pool_group.logical_size,
-    )
+    if (
+        isinstance(pool, MLATokenToKVPool)
+        and not pool.dcp_replicated
+        and get_parallel().dcp_enabled
+    ):
+        # A DCP-sharded MLA draft holds only its own rows, like the target.
+        parallel = get_parallel()
+        draft_host_pool = _build_mha_mla_host_pool(
+            pool=pool,
+            buffer_info=buffer_info,
+            host_to_device_ratio=host_pool_group.size / pool.size,
+            page_size=controller.page_size,
+            layout=get_memory().hicache_mem_layout,
+            allocator_type=_get_allocator_type(),
+            pool_label="draft",
+            dcp_size=parallel.attn_dcp_size,
+            dcp_rank=parallel.attn_dcp_rank,
+        )
+    else:
+        # Note(kpham-sgl): DCP x DSpark draft KV is replicated and spans the
+        # virtual loc space, so match the target host's logical_size.
+        draft_host_pool = _build_mha_mla_host_pool(
+            pool=pool,
+            buffer_info=buffer_info,
+            host_to_device_ratio=host_pool_group.logical_size / pool.size,
+            page_size=controller.page_size,
+            layout=get_memory().hicache_mem_layout,
+            allocator_type=_get_allocator_type(),
+            pool_label="draft",
+            host_token_capacity=host_pool_group.logical_size,
+        )
 
     specs = [
         SidecarPoolSpec(
@@ -1874,16 +1910,14 @@ def validate_fused_hicache_draft(
         return
     storage = tree_cache.kv_storage()
     for pool in draft_device_pools or ():
-        if pool._arena is not storage.allocator.arena:
+        if not storage.holds_view(pool):
             raise ValueError("fused draft views must share the target storage arena")
     entries = tree_cache.cache_controller.mem_pool_host.entry_map
-    for sub_pool in storage.plan.sub_pools:
-        if sub_pool.spec.draft_region is None:
-            continue
-        entry = entries[PoolName(sub_pool.external.host_pool)]
+    for name in storage.draft_hosting_sub_pools():
+        entry = entries[storage.host_pool_name(name)]
         if not isinstance(entry.host_pool, UnifiedPageEnvelopeHostPool):
             raise ValueError(
-                f"host pool {sub_pool.name!r} must preserve the complete declared entry"
+                f"host pool {name!r} must preserve the complete declared entry"
             )
 
 
@@ -1913,7 +1947,6 @@ def build_hicache_draft_sidecars(
 _COMPONENT_HOST_ATTR: dict[ComponentType, tuple[str, str]] = {
     ComponentType.FULL: ("full_kv_pool_host", "_full_kv_pool_host"),
     ComponentType.SWA: ("swa_kv_pool_host", "_swa_kv_pool_host"),
-    ComponentType.AUXILIARY_SWA: ("auxiliary_swa_kv_pool_host", "_swa_kv_pool_host"),
     ComponentType.MAMBA: ("mamba_pool_host", "_mamba_pool_host"),
     ComponentType.C128: ("c128_kv_pool_host", "_c128_kv_pool_host"),
 }
@@ -2476,8 +2509,13 @@ def _apply_stack_result(
     cache.cache_controller = result.cache_controller
 
     for ct, host_pool in result.component_host_pools.items():
-        cache_attr, component_attr = _COMPONENT_HOST_ATTR[ct]
-        setattr(cache, cache_attr, host_pool)
+        if ct in _COMPONENT_HOST_ATTR:
+            cache_attr, component_attr = _COMPONENT_HOST_ATTR[ct]
+            setattr(cache, cache_attr, host_pool)
+        else:
+            # A further window slot's host pool lives on its component only.
+            assert ct in cache.window_slots(), ct
+            component_attr = "_swa_kv_pool_host"
         setattr(cache.components[ct], component_attr, host_pool)
 
     for sidecar in result.sidecars:
@@ -2561,7 +2599,8 @@ def _nvfp4_main_host_size(
 ) -> float:
     """The --hicache-size share of NVFP4 main KV once index and drafts are paid."""
     from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
-    from sglang.srt.mem_cache.pool_host.base import host_memory_budget_bytes
+    from sglang.srt.mem_cache.pool_host.base import host_memory_preflight
+    from sglang.srt.mem_cache.pool_host.common import get_allocator_class_from_storage
 
     memory = get_memory()
     if memory.hicache_io_backend not in ("kernel", "direct"):
@@ -2574,7 +2613,7 @@ def _nvfp4_main_host_size(
         raise ValueError("Unsupported M3.1 NVFP4 HiCache memory layout")
     main_bytes = sum(main_pool.get_kv_size_bytes()) / main_pool.total_slots
     index_bytes = sum(index_pool.get_kv_size_bytes()) / index_pool.total_slots
-    draft_bytes = 0
+    draft_byte_rates = []
     for draft_pool in params.sidecar_draft_device_pools:
         if (
             type(draft_pool) is not MHATokenToKVPool
@@ -2587,10 +2626,11 @@ def _nvfp4_main_host_size(
                 "M3.1 NVFP4 HiCache requires a dense MHA draft with matching "
                 "token capacity/page size and at most as many layers as the target"
             )
-        draft_bytes += sum(draft_pool.get_kv_size_bytes()) / (
-            draft_pool.size + draft_pool.page_size
+        draft_byte_rates.append(
+            sum(draft_pool.get_kv_size_bytes())
+            / (draft_pool.size + draft_pool.page_size)
         )
-    total_bytes = main_bytes + index_bytes + draft_bytes
+    total_bytes = main_bytes + index_bytes + sum(draft_byte_rates)
     # --hicache-size covers main KV, index payload/scales and draft sidecars.
     host_size = memory.hicache_size * main_bytes / total_bytes
     slots = (
@@ -2599,7 +2639,17 @@ def _nvfp4_main_host_size(
         else int(main_pool.size * memory.hicache_ratio)
     )
     slots = (slots // params.page_size + 1) * params.page_size
-    if slots * total_bytes > host_memory_budget_bytes():
+    device = main_pool.get_device_pool_infos()[0].buffer_info.slab.device
+    allocator = get_allocator_class_from_storage(_get_allocator_type())
+    mapping_lengths = [
+        int(slots * rate) for rate in (main_bytes, index_bytes, *draft_byte_rates)
+    ]
+    # Peek only: the pools bill their own mappings at construction, so booking
+    # the aggregate here would charge the shared scope twice.
+    allocation_bytes, available_bytes = host_memory_preflight(
+        mapping_lengths, allocator, device, book=False
+    )
+    if allocation_bytes > available_bytes:
         raise ValueError(
             "Not enough host memory for M3.1 NVFP4 KV, index and draft caches"
         )
