@@ -56,6 +56,57 @@ class TestBannedTokenColumns(CustomTestCase):
         self.assertTrue(torch.equal(logits, expected))
 
 
+class TestBannedTokensKeepTheVerifyGather(CustomTestCase):
+    """Vocab-shard verify logits are never masked, so a ban turns them off,
+    whichever of the ban and the speculative opt-in comes first."""
+
+    def _eligible(self):
+        processor = _processor(vocab_size=8)
+        processor._sharded_verify_eligible = True
+        processor.sharded_verify = False
+        return processor
+
+    def test_ban_then_opt_in(self):
+        processor = self._eligible()
+        processor.set_banned_token_ids(token_ids=[3], device="cpu")
+        processor.enable_sharded_verify()
+        self.assertFalse(processor.sharded_verify)
+
+    def test_opt_in_then_ban(self):
+        processor = self._eligible()
+        processor.enable_sharded_verify()
+        self.assertTrue(processor.sharded_verify)
+        processor.set_banned_token_ids(token_ids=[3], device="cpu")
+        self.assertFalse(processor.sharded_verify)
+
+    def test_ban_outside_the_vocabulary_keeps_sharded_verify(self):
+        processor = self._eligible()
+        processor.set_banned_token_ids(token_ids=[100], device="cpu")
+        processor.enable_sharded_verify()
+        self.assertTrue(processor.sharded_verify)
+
+
+class TestBannedTokenIdsRejectedOnMlx(CustomTestCase):
+    def _validate(self, token_ids, mlx):
+        from sglang.srt.arg_groups import validation_hook
+
+        with (
+            patch.object(validation_hook, "resolving_view", side_effect=lambda x: x),
+            patch.dict("os.environ", {"SGLANG_USE_MLX": "1" if mlx else "0"}),
+        ):
+            validation_hook.validate_sampling_banned_token_ids(
+                SimpleNamespace(sampling_banned_token_ids=token_ids)
+            )
+
+    def test_mlx_rejects_the_flag(self):
+        with self.assertRaisesRegex(ValueError, "not supported on MLX"):
+            self._validate([5], mlx=True)
+
+    def test_mlx_without_the_flag_and_cuda_with_it_pass(self):
+        self._validate(None, mlx=True)
+        self._validate([5], mlx=False)
+
+
 class TestGetLogitsMasksBannedTokens(CustomTestCase):
     """Both return paths of _get_logits (the fused gather + softcap path and
     the regular path) apply the mask."""

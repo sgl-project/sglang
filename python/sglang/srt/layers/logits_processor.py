@@ -638,7 +638,10 @@ class LogitsProcessor(nn.Module):
         temperature_keys: the bound local key policy may serve temperature rows;
         the stock policy serves greedy rows only.
         """
-        self.sharded_verify = self._sharded_verify_eligible
+        # Vocab-shard logits skip the banned-ids mask, so a ban keeps the gather.
+        self.sharded_verify = (
+            self._sharded_verify_eligible and self.banned_token_cols is None
+        )
         self._sharded_verify_temperature_keys = temperature_keys
 
     def verify_uses_vocab_shards(self, forward_batch: ForwardBatch) -> bool:
@@ -1321,6 +1324,8 @@ class LogitsProcessor(nn.Module):
         else:
             cols = torch.isin(column_token_ids.cpu().long(), ids).nonzero().flatten()
         self.banned_token_cols = cols.to(device) if cols.numel() > 0 else None
+        if self.banned_token_cols is not None:
+            self.sharded_verify = False
         logger.info(
             "Banned token ids: %d of %d logits columns masked.",
             cols.numel(),
