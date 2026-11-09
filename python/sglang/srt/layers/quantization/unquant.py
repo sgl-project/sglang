@@ -832,7 +832,10 @@ class UnquantizedLinearMethod(LinearMethodBase):
             and _use_rdna_splitk_gemv is not None
             and bias is None
             and x.is_contiguous()
-            and layer.weight.is_contiguous()
+            # The kernel reads each weight row at a runtime row stride, so a padded
+            # weight -- gfx115x pads K-dense rows to dodge cache aliasing -- still
+            # routes here; only the K slice itself has to be dense.
+            and layer.weight.stride(-1) == 1
             and x.dtype == torch.bfloat16
             and layer.weight.dtype == torch.bfloat16
             and _use_rdna_splitk_gemv(
