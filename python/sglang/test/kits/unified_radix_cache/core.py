@@ -197,7 +197,11 @@ class UnifiedRadixAllocationEvictionRealComponentsFixtures:
                 capacity["available"] = self._SHORTFALL
 
         params = (
-            EvictParams(swa_num_tokens=self._SHORTFALL)
+            EvictParams(
+                window_num_tokens={
+                    cache.window_sub_pool_of_slot(component_type): self._SHORTFALL
+                }
+            )
             if component_type is ComponentType.SWA
             else EvictParams(mamba_num=self._SHORTFALL)
         )

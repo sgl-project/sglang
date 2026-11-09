@@ -7,6 +7,7 @@ import logging
 import os
 from typing import Any
 
+from sglang.kernels.arch import current_arch
 from sglang.srt.arg_groups.model_override_base import (
     attention_backends_of,
     model_config_of,
@@ -67,6 +68,11 @@ def handle_amd_specifics(server_args: Any):
         # GPU rather than staging it, and the MMU notifier on that registration
         # evicts our KFD queues once per tensor while weights load. In KB.
         os.environ.setdefault("GPU_PINNED_MIN_XFER_SIZE", str(4 * 1024 * 1024))
+        # gfx1250 lacks the fp4-activation WMMA scale instruction, so aiter's
+        # fused_moe has to run MXFP4 experts as a8w4 there; aiter reads this.
+        hip = current_arch().hip
+        if hip is not None and hip.gcn_arch == "gfx1250":
+            os.environ.setdefault("AITER_FORCE_A8W4", "1")
 
 
 def handle_nccl_pre_warm(server_args: Any):
