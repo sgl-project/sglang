@@ -3,7 +3,7 @@ from __future__ import annotations
 import dataclasses
 import enum
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import numpy as np
 import numpy.typing as npt
@@ -90,11 +90,13 @@ class KVArgs:
     # Physical layout of the SWA sub-pool ("nhd", "hnd" or "vectorized_5d");
     # None when the SWA state is not held in an MHA sub-pool.
     swa_kv_cache_layout: Optional[str]
+    dsa_index_k_token_bytes: Optional[Tuple[int, int]] = None
     ib_device: str
     gpu_id: int
     kv_head_num: int
     total_kv_head_num: int
     page_size: int
+    draft_rows_dcp_collapsed: bool = False
     # for system dp
     system_dp_rank: int
     # Local Rust /route registry port; None on scheduler ranks without a listener.

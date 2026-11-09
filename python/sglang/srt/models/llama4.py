@@ -47,21 +47,16 @@ from sglang.srt.layers.moe.utils import RoutingMethodType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_layers
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.models.llama import LlamaForCausalLM, LlamaMLP
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import (
-    add_prefix,
-    fast_topk,
-    get_compiler_backend,
-    is_cuda,
-    is_npu,
-    make_layers,
-)
-from sglang.srt.utils.common import get_current_device_stream_fast
+from sglang.srt.utils import fast_topk, get_compiler_backend, is_cuda, is_npu
+from sglang.srt.utils.device import get_current_device_stream_fast
 
 _is_cuda = is_cuda()
 _is_npu = is_npu()

@@ -132,6 +132,9 @@ class PoolName(str, Enum):
     DEEPSEEK_V4_C4_STATE = "deepseek_v4_c4_state"
     DEEPSEEK_V4_C4_INDEXER_STATE = "deepseek_v4_c4_indexer_state"
     DEEPSEEK_V4_C128_STATE = "deepseek_v4_c128_state"
+    # Full-context MLA layers: latent KV and DSA index keys.
+    ERNIE5_5_MLA = "ernie55_mla"
+    ERNIE5_5_MLA_INDEXER = "ernie55_mla_indexer"
 
     # Draft KV pool
     DRAFT = "draft"
@@ -245,6 +248,14 @@ class PoolTransferResult:
         start, so count the leading run of successes
         """
         self.extra_pool_hit_pages.update(results)
+
+
+def l3_page_span(host_pool: Any) -> int:
+    """Logical slots one L3 key covers for this host pool. Under DCP a key is a
+    widened (logical) page backed by one physical page on each rank; pools
+    without DCP (or with a page of 1, like KDA state) are unchanged."""
+    page_size = getattr(host_pool, "page_size", 1) or 1
+    return page_size * (getattr(host_pool, "dcp_size", 1) or 1)
 
 
 def count_pool_hits(results: dict[str, List[bool]]) -> dict[str, int]:
@@ -1265,7 +1276,7 @@ class HiCacheFile(HiCacheStorage):
         for transfer in transfers:
             host_pool = self.registered_pools[transfer.name]
             keys = transfer.keys or []
-            page_size = getattr(host_pool, "page_size", 1) or 1
+            page_size = l3_page_span(host_pool)
             expected = len(keys) * page_size
             host_indices = transfer.host_indices
 
