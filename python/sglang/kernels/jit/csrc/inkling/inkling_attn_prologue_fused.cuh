@@ -966,6 +966,7 @@ struct AttnPrologueExtendParams {
   int64_t weight_stride_d;
   int64_t kv_buf_stride;
   uint32_t T;
+  uint32_t B;  // real sequences; cu[B] = real tokens
   uint32_t dq;
   uint32_t dkv;
   uint32_t page_size;
@@ -1151,7 +1152,9 @@ __global__ __launch_bounds__(1024, 1) void inkling_attn_prologue_extend_kernel(
   *reinterpret_cast<uint4*>(out + static_cast<int64_t>(t) * p.dkv + ch) = ov;
   if (DO_STORE) {
     const int64_t kv_slot = static_cast<const int64_t*>(p.loc)[t];
-    if (kv_slot >= 0) {  // SWA full->swa translation can yield -1 sentinels
+    // Graph padding tokens (t >= cu[B]) map to slot 0; do not store them.
+    const bool is_real_token = static_cast<int64_t>(t) < static_cast<const int64_t*>(p.cu)[p.B];
+    if (kv_slot >= 0 && is_real_token) {  // SWA full->swa translation can yield -1 sentinels
       if constexpr (USE_MXFP8) {
         float xo[kVecElems];
 #pragma unroll
@@ -1396,6 +1399,7 @@ struct AttnPrologueExtendKernel {
         .weight_stride_d = k_weight.stride(0),
         .kv_buf_stride = k_buf.stride(0),
         .T = T,
+        .B = B,
         .dq = dq,
         .dkv = dkv,
         .page_size = static_cast<uint32_t>(page_size),
