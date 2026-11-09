@@ -13,7 +13,6 @@ from sglang.kernels.ops.moe.shuffle_weighted_sum import (
     shuffle_weighted_sum,
 )
 from sglang.srt.layers.moe import cutlass_moe
-from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEType
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -1011,13 +1010,20 @@ class TestCutlassFp8InactiveRoutes(CustomTestCase):
             scale2 = torch.ones(
                 (experts, hidden // 128, intermediate // 128), device="cuda"
             ).transpose(1, 2)
-        params = CutlassMoEParams(
-            CutlassMoEType.BlockscaledFP8,
-            torch.device("cuda"),
-            experts,
-            intermediate,
-            hidden,
+
+        # Per-expert strides in elements, and the pointer / problem-size scratch the
+        # grouped GEMMs fill in.
+        def strides(value):
+            return torch.full((experts,), value, device="cuda", dtype=torch.int64)
+
+        ab_strides_13, c_strides_13 = strides(hidden), strides(2 * intermediate)
+        ab_strides_2, c_strides_2 = strides(intermediate), strides(hidden)
+        a_ptrs, b_ptrs, out_ptrs, a_scales_ptrs, b_scales_ptrs = (
+            torch.empty(experts, device="cuda", dtype=torch.int64) for _ in range(5)
         )
+        expert_offsets = torch.empty(experts + 1, device="cuda", dtype=torch.int32)
+        problem_sizes1 = torch.empty((experts, 3), device="cuda", dtype=torch.int32)
+        problem_sizes2 = torch.empty_like(problem_sizes1)
         workspace = torch.empty(32 * 1024 * 1024, device="cuda", dtype=torch.uint8)
 
         def run(x, route_ids, route_weights):
@@ -1029,19 +1035,19 @@ class TestCutlassFp8InactiveRoutes(CustomTestCase):
                 scale2,
                 route_weights,
                 route_ids,
-                params.ab_strides_13,
-                params.c_strides_13,
-                params.ab_strides_2,
-                params.c_strides_2,
+                ab_strides_13,
+                c_strides_13,
+                ab_strides_2,
+                c_strides_2,
                 workspace,
-                params.a_ptrs,
-                params.b_ptrs,
-                params.out_ptrs,
-                params.a_scales_ptrs,
-                params.b_scales_ptrs,
-                params.expert_offsets,
-                params.problem_sizes1,
-                params.problem_sizes2,
+                a_ptrs,
+                b_ptrs,
+                out_ptrs,
+                a_scales_ptrs,
+                b_scales_ptrs,
+                expert_offsets,
+                problem_sizes1,
+                problem_sizes2,
                 use_mxfp8=mxfp8,
                 enable_es=(mxfp8, mxfp8),
             )

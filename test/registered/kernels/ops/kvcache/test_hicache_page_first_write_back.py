@@ -21,7 +21,7 @@ from sglang.kernels.ops.kvcache.hicache import (
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=30, stage="jit-kernel-unit", runner_config="amd")
 
 pytestmark = pytest.mark.skipif(
@@ -309,7 +309,8 @@ def test_page_first_staged_write_back_mla(element_dim: int, page_count: int) -> 
     "groups,layers,page_size,heads_per_group,dim",
     [(1, 1, 1, 1, 16), (3, 5, 3, 2, 24), (8, 3, 64, 1, 128)],
 )
-@pytest.mark.parametrize("dtype", [torch.uint8, torch.float16, torch.bfloat16])
+# A byte copy: only the element size reaches the kernel, so bf16 repeats fp16.
+@pytest.mark.parametrize("dtype", [torch.uint8, torch.float16])
 @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("page_count", [0, 1, 2, 5])
 def test_page_unified_staged_write_back(
@@ -417,7 +418,8 @@ def test_page_unified_write_back_invalid_input(invalid, match):
 @pytest.mark.parametrize(
     "layers,page_size,dim", [(1, 1, 16), (5, 3, 512), (3, 64, 576)]
 )
-@pytest.mark.parametrize("dtype", [torch.uint8, torch.float16, torch.bfloat16])
+# A byte copy: only the element size reaches the kernel, so bf16 repeats fp16.
+@pytest.mark.parametrize("dtype", [torch.uint8, torch.float16])
 @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("page_count", [0, 1, 2, 5])
 def test_page_unified_mla_staged_write_back(
