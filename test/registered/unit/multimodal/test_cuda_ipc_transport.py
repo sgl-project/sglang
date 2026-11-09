@@ -112,10 +112,15 @@ class TestCudaIpcTransport(CustomTestCase):
 
     def test_publication_retains_source_without_waiting_for_copy(self):
         """A blocked producer copy must not block publication or lose its source."""
+        for noncontiguous in (False, True):
+            with self.subTest(noncontiguous=noncontiguous):
+                self._check_publication_source_lifetime(noncontiguous)
+
+    def _check_publication_source_lifetime(self, noncontiguous):
         pool = MmItemMemoryPool(1 << 20, 0.01, 0, 1)
-        source = torch.from_dlpack(
-            torch.arange(1024, device="cuda", dtype=torch.float32)
-        )
+        data = torch.arange(1024, device="cuda", dtype=torch.float32).reshape(32, 32)
+        source = torch.from_dlpack(data.T if noncontiguous else data)
+        del data
         source_ref = weakref.ref(source)
         expected = source.cpu()
         copy_stream = torch.cuda.Stream()
@@ -158,8 +163,10 @@ class TestCudaIpcTransport(CustomTestCase):
                 worker.join(10)
                 copy_stream.synchronize()
             lease = leases[0]
-            actual = pool.memory_pool[lease.start : lease.start + lease.nbytes].view(
-                torch.float32
+            actual = (
+                pool.memory_pool[lease.start : lease.start + lease.nbytes]
+                .view(torch.float32)
+                .reshape(expected.shape)
             )
             torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
             deadline = time.monotonic() + 5
@@ -170,6 +177,21 @@ class TestCudaIpcTransport(CustomTestCase):
         finally:
             for proxy in proxies:
                 pool.cancel_proxy(proxy)
+            pool.shutdown()
+
+    def test_failed_reservation_does_not_make_a_contiguous_copy(self):
+        pool = MmItemMemoryPool(1 << 20, 0.01, 0, 1)
+        source = torch.empty((1024, 1024), device="cuda").T
+        try:
+            with patch.object(
+                torch.Tensor,
+                "contiguous",
+                side_effect=AssertionError("copy started before pool reservation"),
+            ):
+                self.assertEqual(pool._pool.copy_tensor(source), (None, None))
+            self.assertEqual(pool.active_lease_count, 0)
+            self.assertEqual(pool._pool._copy_sources, {})
+        finally:
             pool.shutdown()
 
     def test_guarded_batch_never_spills_and_recovers_after_ack(self):

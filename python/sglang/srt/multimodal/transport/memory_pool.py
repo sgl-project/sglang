@@ -234,7 +234,7 @@ class StreamOrderedMmFeaturePool:
         self._slot_generations = [0] * max_inflight_slices
         self._occupied: dict[int, PoolLease] = {}
         # native/DLPack owners must survive the asynchronous producer copy too
-        self._copy_sources: dict[int, torch.Tensor] = {}
+        self._copy_sources: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         self._cancelling: set[int] = set()
         self._lock = threading.Lock()
         self.on_capacity_change = None
@@ -448,8 +448,7 @@ class StreamOrderedMmFeaturePool:
     ) -> tuple[Optional[PoolLease], Optional[torch.Tensor]]:
         if not tensor.is_cuda:
             raise ValueError(f"{self.transport_name} requires a CUDA tensor")
-        source = tensor.contiguous()
-        nbytes = source.numel() * source.element_size()
+        nbytes = tensor.numel() * tensor.element_size()
         if nbytes == 0:
             raise ValueError(f"{self.transport_name} cannot transport an empty tensor")
         reserved = lease is not None
@@ -460,9 +459,11 @@ class StreamOrderedMmFeaturePool:
             return None, None
 
         try:
-            with self._lock:
-                self._copy_sources[lease.slot] = source
             with torch.cuda.device(self.device_id):
+                source = tensor.contiguous()
+                with self._lock:
+                    # Making a contiguous copy also reads the original owner.
+                    self._copy_sources[lease.slot] = (tensor, source)
                 destination = self.byte_tensor[lease.start : lease.start + lease.nbytes]
                 destination.copy_(
                     source.view(torch.uint8).reshape(-1), non_blocking=True
