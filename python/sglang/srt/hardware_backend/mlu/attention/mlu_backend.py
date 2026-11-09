@@ -2,7 +2,8 @@
 
 Uses ragged flash attention for extend and cached single-query attention for
 decode. Mixed batches preserve the shared scheduler's prefill-then-decode order;
-a trailing one-token prefill is also valid input to the single-query kernel.
+the boundary comes from scheduler request identity, so even a one-token prefill
+uses the prefill kernel.
 """
 
 from dataclasses import dataclass
@@ -31,22 +32,25 @@ class ForwardMetadata:
     # Total KV lengths including cached prefixes, shape [batch_size].
     seq_lens: torch.Tensor
 
-    # Cumulative query lengths starting at zero, shape [batch_size + 1].
+    # Cumulative prefill query lengths, shape [prefill_count + 1].
     # Used for extend/mixed batches; None for decode.
     cu_seqlens_q: torch.Tensor | None = None
 
-    # Cumulative KV lengths starting at zero, shape [batch_size + 1].
+    # Cumulative prefill KV lengths, shape [prefill_count + 1].
     # Includes cached prefixes; used for extend/mixed batches, None for decode.
     cu_seqlens_kv: torch.Tensor | None = None
 
-    # Maximum query length in the batch; only consumed by extend/mixed attention.
+    # Maximum prefill query length; only consumed by extend/mixed attention.
     max_seq_len_q: int = 1
 
-    # Maximum KV length including cached prefixes for extend/mixed attention.
+    # Maximum prefill KV length including cached prefixes.
     # Set to the context limit for decode, where this field is not consumed.
     max_seq_len_kv: int = 0
 
-    mixed_prefill_reqs: int = -1
+    # Whether the prefill requests can read the current K/V directly.
+    is_uncached_prefill: bool = False
+
+    mixed_prefill_count: int = -1
     mixed_prefill_tokens: int = 0
 
 
@@ -64,7 +68,6 @@ class MLUAttnBackend(AttentionBackend):
         fb = forward_batch
         if fb.forward_mode.is_idle():
             return
-        # RoPE casts positions inside capture; keep the runner's input buffer.
         tables = (
             self.req_to_token[
                 fb.req_pool_indices, : self.max_context_len : self.page_size
@@ -77,37 +80,67 @@ class MLUAttnBackend(AttentionBackend):
                 tables, seq_lens, max_seq_len_kv=self.max_context_len
             )
         elif fb.forward_mode == ForwardMode.EXTEND or fb.forward_mode.is_mixed():
+            prefill_count = fb.batch_size
+            if fb.forward_mode.is_mixed():
+                prefill_count = fb.mixed_prefill_count
+                if prefill_count is None or not 0 <= prefill_count <= fb.batch_size:
+                    raise ValueError(
+                        "MLU mixed attention requires a valid mixed_prefill_count."
+                    )
+                if any(n != 1 for n in fb.extend_seq_lens_cpu[prefill_count:]):
+                    raise NotImplementedError(
+                        "MLU mixed attention currently requires one query token per decode request."
+                    )
+            query_lens = fb.extend_seq_lens_cpu[:prefill_count]
             meta = ForwardMetadata(
                 block_tables=tables,
                 seq_lens=seq_lens,
                 cu_seqlens_q=torch.nn.functional.pad(
-                    torch.cumsum(fb.extend_seq_lens, dim=0, dtype=torch.int32),
+                    torch.cumsum(
+                        fb.extend_seq_lens[:prefill_count], dim=0, dtype=torch.int32
+                    ),
                     (1, 0),
                 ),
                 cu_seqlens_kv=torch.nn.functional.pad(
-                    torch.cumsum(seq_lens, dim=0, dtype=torch.int32), (1, 0)
+                    torch.cumsum(seq_lens[:prefill_count], dim=0, dtype=torch.int32),
+                    (1, 0),
                 ),
-                max_seq_len_q=max(fb.extend_seq_lens_cpu, default=0),
-                max_seq_len_kv=max(fb.seq_lens_cpu.tolist(), default=0),
+                max_seq_len_q=max(query_lens, default=0),
+                max_seq_len_kv=max(fb.seq_lens_cpu[:prefill_count].tolist(), default=0),
+                is_uncached_prefill=not any(fb.extend_prefix_lens_cpu[:prefill_count]),
             )
+            if fb.forward_mode.is_mixed():
+                meta.mixed_prefill_count = prefill_count
+                meta.mixed_prefill_tokens = sum(query_lens)
         else:
             raise NotImplementedError(
                 f"Unsupported MLU attention forward mode: {fb.forward_mode}"
             )
-        if fb.forward_mode.is_mixed():
-            # Keep a contiguous prefix; trailing one-token prefills can also
-            # use the single-query decode kernel.
-            lengths = fb.extend_seq_lens_cpu
-            split = len(lengths)
-            while split and lengths[split - 1] == 1:
-                split -= 1
-            meta.mixed_prefill_reqs = split
-            meta.mixed_prefill_tokens = sum(lengths[:split])
         self.forward_metadata = meta
+
+    @staticmethod
+    def _validate_attention(layer, sinks, return_lse):
+        if return_lse:
+            raise NotImplementedError("MLU attention does not support return_lse.")
+        if sinks is not None:
+            raise NotImplementedError("MLU attention does not support attention sinks.")
+        if layer.logit_cap != 0:
+            raise NotImplementedError(
+                "MLU attention does not support nonzero logit_cap."
+            )
+        if layer.is_cross_attention:
+            raise NotImplementedError("MLU attention does not support cross-attention.")
+        if layer.attn_type != AttentionType.DECODER:
+            raise NotImplementedError(
+                "MLU attention only supports causal decoder self-attention."
+            )
 
     def forward_extend(
         self, q, k, v, layer, forward_batch, save_kv_cache=True, **kwargs
     ):
+        self._validate_attention(
+            layer, kwargs.get("sinks"), kwargs.get("return_lse", False)
+        )
         meta = self.forward_metadata
         q = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
         if save_kv_cache:
@@ -117,53 +150,51 @@ class MLUAttnBackend(AttentionBackend):
                 k.view(-1, layer.tp_k_head_num, layer.qk_head_dim),
                 v.view(-1, layer.tp_v_head_num, layer.v_head_dim),
             )
-        if meta.mixed_prefill_reqs >= 0:
+        if meta.mixed_prefill_count == 0:
+            return self._forward_decode(q, layer, meta)
+        if 0 < meta.mixed_prefill_count < forward_batch.batch_size:
             out = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
             split = meta.mixed_prefill_tokens
-            if meta.mixed_prefill_reqs:
-                out[:split] = self._forward_prefill(
-                    q[:split],
-                    layer,
-                    meta,
-                    meta.mixed_prefill_reqs,
-                    sinks=kwargs.get("sinks"),
-                )
-            if meta.mixed_prefill_reqs < forward_batch.batch_size:
-                out[split:] = self._forward_decode(
-                    q[split:],
-                    layer,
-                    meta,
-                    meta.mixed_prefill_reqs,
-                    sinks=kwargs.get("sinks"),
-                )
-            return out
-        return self._forward_prefill(q, layer, meta, sinks=kwargs.get("sinks"))
-
-    def _forward_prefill(self, q, layer, meta, num_reqs=None, sinks=None):
-        if sinks is not None:
-            raise NotImplementedError("MLU attention does not support attention sinks.")
-        if layer.logit_cap != 0:
-            raise NotImplementedError(
-                "MLU attention does not support nonzero logit_cap."
+            self._forward_prefill(
+                q[:split],
+                k[:split] if k is not None else None,
+                v[:split] if v is not None else None,
+                layer,
+                meta,
+                out=out[:split],
             )
-        if layer.is_cross_attention:
-            raise NotImplementedError("MLU attention does not support cross-attention.")
-        if layer.attn_type != AttentionType.DECODER:
-            raise NotImplementedError(
-                "MLU attention only supports causal decoder self-attention."
+            self._forward_decode(
+                q[split:],
+                layer,
+                meta,
+                meta.mixed_prefill_count,
+                out=out[split:],
+            )
+            return out
+        return self._forward_prefill(q, k, v, layer, meta)
+
+    def _forward_prefill(self, q, k, v, layer, meta, out=None):
+        if meta.is_uncached_prefill and k is not None and v is not None:
+            k = k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
+            v = v.view(-1, layer.tp_v_head_num, layer.v_head_dim)
+            block_tables = None
+        else:
+            k = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+            v = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
+            count = meta.mixed_prefill_count
+            block_tables = (
+                meta.block_tables[:count] if count >= 0 else meta.block_tables
             )
         window = layer.sliding_window_size
         out = torch_mlu_ops.flash_attention(
             q=q,
-            k=self.token_to_kv_pool.get_key_buffer(layer.layer_id),
-            v=self.token_to_kv_pool.get_value_buffer(layer.layer_id),
-            out=None,
-            cu_seq_lens_q=meta.cu_seqlens_q[: num_reqs + 1]
-            if num_reqs is not None
-            else meta.cu_seqlens_q,
-            cu_seq_lens_kv=meta.cu_seqlens_kv[: num_reqs + 1]
-            if num_reqs is not None
-            else meta.cu_seqlens_kv,
+            k=k,
+            v=v,
+            out=out.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+            if out is not None
+            else None,
+            cu_seq_lens_q=meta.cu_seqlens_q,
+            cu_seq_lens_kv=meta.cu_seqlens_kv,
             alibi_slope=None,
             attn_bias=None,
             max_seq_len_q=meta.max_seq_len_q,
@@ -172,7 +203,7 @@ class MLUAttnBackend(AttentionBackend):
             is_causal=True,
             compute_dtype=torch.float32,
             return_lse=False,
-            block_tables=meta.block_tables[:num_reqs],
+            block_tables=block_tables,
             out_dtype=q.dtype,
             window_size_left=window if window is not None and window > 0 else -1,
             window_size_right=0 if window is not None and window > 0 else -1,
@@ -182,8 +213,10 @@ class MLUAttnBackend(AttentionBackend):
     def forward_decode(
         self, q, k, v, layer, forward_batch, save_kv_cache=True, **kwargs
     ):
+        self._validate_attention(
+            layer, kwargs.get("sinks"), kwargs.get("return_lse", False)
+        )
         meta = self.forward_metadata
-        q = q.view(-1, 1, layer.tp_q_head_num, layer.qk_head_dim)
         if save_kv_cache:
             self.token_to_kv_pool.set_kv_buffer(
                 layer,
@@ -191,28 +224,20 @@ class MLUAttnBackend(AttentionBackend):
                 k.view(-1, layer.tp_k_head_num, layer.qk_head_dim),
                 v.view(-1, layer.tp_v_head_num, layer.v_head_dim),
             )
-        return self._forward_decode(q, layer, meta, sinks=kwargs.get("sinks"))
+        return self._forward_decode(q, layer, meta)
 
-    def _forward_decode(self, q, layer, meta, start_req=0, sinks=None):
-        if sinks is not None:
-            raise NotImplementedError("MLU attention does not support attention sinks.")
-        if layer.logit_cap != 0:
-            raise NotImplementedError(
-                "MLU attention does not support nonzero logit_cap."
-            )
-        if layer.is_cross_attention:
-            raise NotImplementedError("MLU attention does not support cross-attention.")
-        if layer.attn_type != AttentionType.DECODER:
-            raise NotImplementedError(
-                "MLU attention only supports causal decoder self-attention."
-            )
+    def _forward_decode(self, q, layer, meta, start_req=0, out=None):
         q = q.view(-1, 1, layer.tp_q_head_num, layer.qk_head_dim)
         window = layer.sliding_window_size
         out = torch_mlu_ops.single_query_cached_kv_attn(
             q=q,
             k_cache=self.token_to_kv_pool.get_key_buffer(layer.layer_id),
             v_cache=self.token_to_kv_pool.get_value_buffer(layer.layer_id),
-            out=q.new_empty((q.shape[0], 1, layer.tp_q_head_num, layer.v_head_dim)),
+            out=(
+                out.view(-1, 1, layer.tp_q_head_num, layer.v_head_dim)
+                if out is not None
+                else q.new_empty((q.shape[0], 1, layer.tp_q_head_num, layer.v_head_dim))
+            ),
             block_tables=meta.block_tables[start_req:],
             context_lens=meta.seq_lens[start_req:],
             k_cache_quant_scale=None,

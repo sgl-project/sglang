@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import torch
 import torch_mlu  # noqa: F401
+import torch_mlu_ops
 
 from sglang.srt.hardware_backend.mlu.attention.mlu_backend import MLUAttnBackend
 from sglang.srt.hardware_backend.mlu.memory_pool_mlu import MLUMHATokenToKVPool
@@ -18,7 +19,7 @@ register_mlu_ci(est_time=60, suite="pr-test-1-mlu")
 
 
 class TestAttentionMLU(CustomTestCase):
-    def _fixture(self, mode, qlens):
+    def _fixture(self, mode, qlens, mixed_prefill_count=None):
         torch.manual_seed(42)
         pool = MLUMHATokenToKVPool(
             size=256,
@@ -76,6 +77,8 @@ class TestAttentionMLU(CustomTestCase):
             seq_lens_cpu=torch.tensor(lens),
             extend_seq_lens=torch.tensor(qlens, device="mlu"),
             extend_seq_lens_cpu=qlens,
+            extend_prefix_lens_cpu=[n - m for n, m in zip(lens, qlens)],
+            mixed_prefill_count=mixed_prefill_count,
             forward_mode=mode,
             out_cache_loc=loc,
         )
@@ -97,9 +100,49 @@ class TestAttentionMLU(CustomTestCase):
             fn=fn,
         )
 
-    def _check(self, mode, qlens):
-        f = self._fixture(mode, qlens)
-        actual = f.fn(f.q, f.current_k, f.current_v, f.layer, f.fb, save_kv_cache=True)
+    def _check(self, mode, qlens, mixed_prefill_count, window=-1):
+        f = self._fixture(mode, qlens, mixed_prefill_count)
+        f.layer.sliding_window_size = window
+        with (
+            patch.object(
+                torch_mlu_ops, "flash_attention", wraps=torch_mlu_ops.flash_attention
+            ) as prefill,
+            patch.object(
+                torch_mlu_ops,
+                "single_query_cached_kv_attn",
+                wraps=torch_mlu_ops.single_query_cached_kv_attn,
+            ) as decode,
+        ):
+            actual = f.fn(
+                f.q, f.current_k, f.current_v, f.layer, f.fb, save_kv_cache=True
+            )
+        if mode.is_mixed():
+            # Request identity, not query length, selects the prefill path.
+            self.assertEqual(prefill.called, mixed_prefill_count > 0)
+            self.assertEqual(decode.called, mixed_prefill_count < f.fb.batch_size)
+            if 0 < mixed_prefill_count < f.fb.batch_size:
+                split = sum(qlens[:mixed_prefill_count])
+                self.assertEqual(
+                    prefill.call_args.kwargs["out"].data_ptr(), actual.data_ptr()
+                )
+                self.assertEqual(
+                    decode.call_args.kwargs["out"].data_ptr(), actual[split:].data_ptr()
+                )
+        if prefill.called:
+            count = mixed_prefill_count if mode.is_mixed() else f.fb.batch_size
+            if not any(f.fb.extend_prefix_lens_cpu[:count]):
+                self.assertIsNone(prefill.call_args.kwargs["block_tables"])
+                self.assertEqual(
+                    prefill.call_args.kwargs["k"].data_ptr(), f.current_k.data_ptr()
+                )
+                self.assertEqual(
+                    prefill.call_args.kwargs["v"].data_ptr(), f.current_v.data_ptr()
+                )
+            else:
+                self.assertIsNotNone(prefill.call_args.kwargs["block_tables"])
+        # A later consumer may reuse populated KV without receiving current K/V.
+        cached = f.fn(f.q, None, None, f.layer, f.fb, save_kv_cache=False)
+        torch.testing.assert_close(cached, actual, rtol=0.03, atol=0.03)
         actual = actual.view(-1, 8, 128).cpu().float()
         offset = ko = 0
         for n, m in zip((21, 35), qlens):
@@ -107,7 +150,11 @@ class TestAttentionMLU(CustomTestCase):
             k = f.k[ko : ko + n].cpu().float().repeat_interleave(4, 1).transpose(0, 1)
             v = f.v[ko : ko + n].cpu().float().repeat_interleave(4, 1).transpose(0, 1)
             scores = q @ k.transpose(-1, -2) * f.layer.scaling
-            mask = torch.arange(n)[None, :] > torch.arange(n - m, n)[:, None]
+            key_positions = torch.arange(n)[None, :]
+            query_positions = torch.arange(n - m, n)[:, None]
+            mask = key_positions > query_positions
+            if window >= 0:
+                mask |= key_positions < query_positions - window
             expected = (
                 scores.masked_fill(mask, float("-inf")).softmax(-1) @ v
             ).transpose(0, 1)
@@ -118,17 +165,38 @@ class TestAttentionMLU(CustomTestCase):
             ko += n
 
     def test_paged_gqa(self):
-        for mode, qlens in (
-            (ForwardMode.EXTEND, [21, 35]),
-            (ForwardMode.EXTEND, [2, 3]),
-            (ForwardMode.DECODE, [1, 1]),
-            (ForwardMode.MIXED, [2, 1]),
-            (ForwardMode.MIXED, [1, 1]),
+        for mode, qlens, count in (
+            (ForwardMode.EXTEND, [21, 35], None),
+            (ForwardMode.EXTEND, [2, 3], None),
+            (ForwardMode.EXTEND, [21, 3], None),  # Only one request has a prefix.
+            (ForwardMode.DECODE, [1, 1], None),
+            (ForwardMode.MIXED, [2, 3], 2),
+            (ForwardMode.MIXED, [2, 1], 1),
+            (ForwardMode.MIXED, [21, 1], 1),
+            (ForwardMode.MIXED, [1, 1], 1),
+            (ForwardMode.MIXED, [1, 1], 0),
         ):
-            with self.subTest(mode=mode, qlens=qlens):
-                self._check(mode, qlens)
+            with self.subTest(mode=mode, qlens=qlens, count=count):
+                self._check(mode, qlens, count)
 
-    def test_unsupported_features_rejected_before_kernel(self):
+    def test_mixed_sliding_window(self):
+        """Prefill and decode must include the same left window boundary."""
+        self._check(ForwardMode.MIXED, [2, 1], 1, window=8)
+
+    def test_mixed_metadata_rejects_missing_boundary_and_multi_query_decode(self):
+        """Missing scheduler identity and unsupported decode shapes must fail closed."""
+        f = self._fixture(ForwardMode.MIXED, [2, 1], 1)
+        for count in (None, -1, 3):
+            with self.subTest(count=count):
+                f.fb.mixed_prefill_count = count
+                with self.assertRaisesRegex(ValueError, "mixed_prefill_count"):
+                    f.backend.init_forward_metadata(f.fb)
+        f.fb.mixed_prefill_count = 1
+        f.fb.extend_seq_lens_cpu = [2, 2]
+        with self.assertRaisesRegex(NotImplementedError, "one query token per decode"):
+            f.backend.init_forward_metadata(f.fb)
+
+    def test_unsupported_features_rejected_before_kv_write(self):
         for mode, qlens in ((ForwardMode.EXTEND, [2, 3]), (ForwardMode.DECODE, [1, 1])):
             f = self._fixture(mode, qlens)
             cases = (
@@ -141,15 +209,17 @@ class TestAttentionMLU(CustomTestCase):
                     torch.zeros(8, device="mlu", dtype=f.q.dtype),
                     "attention sinks",
                 ),
+                ("return_lse", True, "return_lse"),
             )
             if mode.is_decode():
-                cases = cases[-1:]
+                cases = cases[-2:]
             for field, value, message in cases:
                 with self.subTest(mode=mode, feature=field):
                     # Zero sinks still request unsupported semantics.
-                    kwargs = {"sinks": value} if field == "sinks" else {}
+                    kwargs = {field: value} if field in ("sinks", "return_lse") else {}
                     with (
                         patch.object(f.layer, field, value, create=True),
+                        patch.object(f.pool, "set_kv_buffer") as write_kv,
                         patch("torch_mlu_ops.flash_attention") as prefill,
                         patch("torch_mlu_ops.single_query_cached_kv_attn") as decode,
                     ):
@@ -163,6 +233,7 @@ class TestAttentionMLU(CustomTestCase):
                                 save_kv_cache=True,
                                 **kwargs,
                             )
+                        write_kv.assert_not_called()
                         prefill.assert_not_called()
                         decode.assert_not_called()
 

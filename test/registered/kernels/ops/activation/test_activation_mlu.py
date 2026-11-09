@@ -56,6 +56,21 @@ class TestActivationMLU(CustomTestCase):
                 ).reshape(2, 3, 128)
                 self._check_silu_and_mul(x)
 
+    def test_row_strided_inputs_fall_back(self):
+        """A contiguous last dimension does not imply a contiguous vendor input."""
+        x = torch.randn(4, 128, device="mlu", dtype=torch.bfloat16)[::2]
+        for act in (SiluAndMul(), SituAndMul(), GeluAndMul(), NewGELU(), QuickGELU()):
+            with self.subTest(activation=type(act).__name__):
+                original = x.clone()
+                expected = act.forward_native(x)
+                with patch.object(
+                    torch_mlu_ops, "active", wraps=torch_mlu_ops.active
+                ) as op:
+                    actual = act(x)
+                op.assert_not_called()
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                torch.testing.assert_close(x, original, rtol=0, atol=0)
+
     def test_situ_and_mul(self):
         for dtype, beta, linear_beta in (
             (torch.bfloat16, 1.0, None),
