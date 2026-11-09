@@ -351,9 +351,13 @@ def _rocm_configs(num_sm: int) -> dict[int, AllReduceConfig]:
 
 
 # ROCm (MI450 / gfx1250, 96 CUs). Every size up to 4 GB stays on carv2:
-# 1shot_push, then 2shot_push, then ring_simple. Cutoffs are the last size each
-# won on h13-13 (DPX, graph, bf16, median of 3, back to back, TP2-8). RCCL
-# won only at TP3 2 MB, by 4%. Pull stays off: it lost at every measured size.
+# 1shot_push, then 2shot_push, then ring_simple. The 2shot_push and ring_simple
+# cutoffs are the last size each won on h13-13 (DPX, graph, bf16, median of 3,
+# back to back, TP2-8). 1shot_push wins back to back up to 256 KB-8 MB, but
+# stops at 64 KB: with a late rank and a GEMM before the all-reduce, as in
+# serving, 2shot_push wins from 128 KB, and at TP8 a 256 KB cutoff cost
+# DeepSeek-V4-Flash 18% of its C16 decode throughput. Pull stays off: it lost
+# at every measured size.
 @cache
 def _rocm_gfx1250_configs(num_sm: int) -> dict[int, AllReduceConfig]:
     def config(one_shot: int, two_shot_push: int) -> AllReduceConfig:
@@ -372,19 +376,18 @@ def _rocm_gfx1250_configs(num_sm: int) -> dict[int, AllReduceConfig]:
             num_ring_simple_channels=num_sm,
         )
 
-    # world size: (1shot_push up to, 2shot_push up to). At TP2, 1shot_push
-    # ties ring_simple at 8 MB, so 2shot_push is never picked. TP8 stops
-    # 2shot_push at 8 MB although it wins back to back to 32 MB: serving
-    # DeepSeek-V4-Flash, its 16 MB prefill all-reduces halved prefill
-    # throughput, and ring_simple there matches RCCL.
+    # world size: (1shot_push up to, 2shot_push up to). TP8 stops 2shot_push at
+    # 8 MB although it wins back to back to 32 MB: serving DeepSeek-V4-Flash,
+    # its 16 MB prefill all-reduces halved prefill throughput, and ring_simple
+    # there matches RCCL.
     cutoffs = {
-        2: (8 * MB, 0),
-        3: (1 * MB, 8 * MB),
-        4: (512 * KB, 16 * MB),
-        5: (512 * KB, 8 * MB),
-        6: (512 * KB, 16 * MB),
-        7: (512 * KB, 16 * MB),
-        8: (256 * KB, 8 * MB),
+        2: (64 * KB, 8 * MB),
+        3: (64 * KB, 8 * MB),
+        4: (64 * KB, 16 * MB),
+        5: (64 * KB, 8 * MB),
+        6: (64 * KB, 16 * MB),
+        7: (64 * KB, 16 * MB),
+        8: (64 * KB, 8 * MB),
     }
     configs = {ws: config(*cutoff) for ws, cutoff in cutoffs.items()}
     # 16 ranks span two DPX hosts in one UALink fabric clique. Tuned there with
