@@ -670,6 +670,8 @@ def get_num_indexer_layers(config) -> int:
 
 
 class ModelConfig:
+    dflash_draft_kv_on_swa: bool = False
+
     def __init__(
         self,
         model_path: str,
@@ -694,8 +696,8 @@ class ModelConfig:
         model_config_parser: str = "auto",
         speculative_algorithm: Optional[str] = None,
         is_draft_quantization_explicit: bool = False,
-        dflash_draft_kv_on_swa: bool = False,
         uocr_v2_default_context_len: int = FALLBACK_CONTEXT_LENGTH,
+        dflash_draft_kv_on_swa: bool = False,
     ) -> None:
         # Parse args
         self.model_path = model_path
@@ -1380,7 +1382,7 @@ class ModelConfig:
                 )
         elif self._is_dflash_draft_kv_on_swa():
             self.is_hybrid_swa = True
-            self.is_deepseek_v4_arch = False
+            self.is_compressed_kv_arch = False
             self.swa_attention_layer_ids = list(range(self.num_hidden_layers))
             self.full_attention_layer_ids = []
 

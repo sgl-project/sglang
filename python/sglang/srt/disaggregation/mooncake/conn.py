@@ -2448,6 +2448,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 target_rank_registration_info.dst_attn_tp_size
                             ),
                             executor=executor,
+                            total_kv_heads=(
+                                self.kv_args.num_dflash_draft_kv_heads
+                                if st == StateType.DFLASH_DRAFT_WINDOW
+                                else None
+                            ),
                         )
                         or rc
                     )
@@ -2718,6 +2723,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_tp_rank: int,
         dst_attn_tp_size: int,
         executor: concurrent.futures.ThreadPoolExecutor,
+        total_kv_heads: Optional[int] = None,
     ) -> int:
         blocks = self._get_mha_head_slice_blocks(
             src_ptrs=src_state_data_ptrs,
@@ -2728,6 +2734,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             dst_page_indices=np.asarray(dst_swa_page_indices),
             dst_attn_tp_size=dst_attn_tp_size,
             dst_tp_rank=dst_tp_rank,
+            total_kv_heads=total_kv_heads,
         )
         logger.warning_once(
             "Using SWA state head-slice transfer for different attention TP sizes: "

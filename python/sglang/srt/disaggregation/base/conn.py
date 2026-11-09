@@ -122,6 +122,8 @@ class KVArgs:
     # Only used of npu, for decode total kv layers
     draft_kv_layers: int
     num_draft_entries: int = 0
+    num_dflash_draft_kv_heads: Optional[int] = None
+    dflash_draft_window_layout: Optional[str] = None
 
 
 class KVPoll:

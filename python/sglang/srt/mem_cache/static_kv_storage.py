@@ -67,6 +67,7 @@ def kv_storage_of(
     shape: Optional[StaticPoolShape] = None,
     draft_token_to_kv_pool=None,
     num_hidden_layers: Optional[int] = None,
+    dflash_draft_window_transfer: Optional[bool] = None,
 ) -> KVStorage | StaticKVStorage:
     """What a request's lifecycle, the pool observers and a PD peer go through:
     a unified pool's own storage, else the static pools' one `StaticKVStorage`,
@@ -86,7 +87,11 @@ def kv_storage_of(
     if shape is not None:
         static.bind_shape(shape)
     if draft_token_to_kv_pool is not None or num_hidden_layers is not None:
-        static.bind_transfer_draft(draft_token_to_kv_pool, num_hidden_layers)
+        static.bind_transfer_draft(
+            draft_token_to_kv_pool,
+            num_hidden_layers,
+            dflash_draft_window_transfer=dflash_draft_window_transfer,
+        )
     return static
 
 
@@ -145,12 +150,14 @@ class StaticKVStorage:
         shape: Optional[StaticPoolShape] = None,
         draft_token_to_kv_pool=None,
         num_hidden_layers: Optional[int] = None,
+        dflash_draft_window_transfer: bool = False,
     ):
         self.requests = req_to_token_pool
         self._allocator = token_to_kv_pool_allocator
         self._shape = shape
         self._draft_token_to_kv_pool = draft_token_to_kv_pool
         self._num_hidden_layers = num_hidden_layers
+        self._dflash_draft_window_transfer = dflash_draft_window_transfer
         self._owner_region: Optional[Region] = None
         self._state_entries: Optional[_StaticStateEntries] = None
         # A window pool's kept tail, by the window pool's name, bound once at
@@ -177,16 +184,28 @@ class StaticKVStorage:
         self._shape = shape
 
     def bind_transfer_draft(
-        self, draft_token_to_kv_pool, num_hidden_layers: Optional[int]
+        self,
+        draft_token_to_kv_pool,
+        num_hidden_layers: Optional[int],
+        *,
+        dflash_draft_window_transfer: Optional[bool] = None,
     ) -> None:
         """The draft pool a PD peer registers with the target's, and the
         target's layer count; the state entries are rebuilt from them."""
-        if (draft_token_to_kv_pool, num_hidden_layers) != (
+        if dflash_draft_window_transfer is None:
+            dflash_draft_window_transfer = self._dflash_draft_window_transfer
+        if (
+            draft_token_to_kv_pool,
+            num_hidden_layers,
+            dflash_draft_window_transfer,
+        ) != (
             self._draft_token_to_kv_pool,
             self._num_hidden_layers,
+            self._dflash_draft_window_transfer,
         ):
             self._draft_token_to_kv_pool = draft_token_to_kv_pool
             self._num_hidden_layers = num_hidden_layers
+            self._dflash_draft_window_transfer = dflash_draft_window_transfer
             self._state_entries = None
 
     def adopt_bindings(self, other: StaticKVStorage) -> None:
@@ -195,7 +214,9 @@ class StaticKVStorage:
         self._shape = other._shape
         self._window_retention = other._window_retention
         self.bind_transfer_draft(
-            other._draft_token_to_kv_pool, other._num_hidden_layers
+            other._draft_token_to_kv_pool,
+            other._num_hidden_layers,
+            dflash_draft_window_transfer=other._dflash_draft_window_transfer,
         )
 
     def resume_units(
@@ -773,6 +794,7 @@ class StaticKVStorage:
                 draft_token_to_kv_pool=self._draft_token_to_kv_pool,
                 total_kv_layers=self._num_hidden_layers,
                 state_pool=None if state is None else state.pool,
+                dflash_draft_window_transfer=self._dflash_draft_window_transfer,
             )
         return self._state_entries
 
@@ -826,6 +848,7 @@ def _static_state_entries(
     draft_token_to_kv_pool,
     total_kv_layers: Optional[int],
     state_pool,
+    dflash_draft_window_transfer: bool,
 ) -> _StaticStateEntries:
     """A static pool's state entries in the order PD peers register them; a
     draft's state rides in the target's entries where the pool family shares
@@ -1210,13 +1233,12 @@ def _static_state_entries(
         if row_ptrs:
             add(StateType.REQUEST_ROW, row_ptrs, row_lens, row_item_lens)
 
-    from sglang.srt.runtime_context import get_spec
-
-    if (
-        draft_token_to_kv_pool is not None
-        and get_spec().speculative_dflash_draft_window_transfer
-    ):
-        _add_dflash_draft_window(token_to_kv_pool, draft_token_to_kv_pool, add)
+    if draft_token_to_kv_pool is not None and dflash_draft_window_transfer:
+        _add_dflash_draft_window(
+            token_to_kv_pool=token_to_kv_pool,
+            draft_token_to_kv_pool=draft_token_to_kv_pool,
+            add=add,
+        )
 
     # The recurrent state pool, when the KV pool does not describe it (a
     # window KV pool beside a state sub-pool).
@@ -1253,7 +1275,7 @@ def _static_state_entries(
     )
 
 
-def _add_dflash_draft_window(token_to_kv_pool, draft_token_to_kv_pool, add) -> None:
+def _add_dflash_draft_window(*, token_to_kv_pool, draft_token_to_kv_pool, add) -> None:
     from sglang.srt.disaggregation.base.conn import StateType
     from sglang.srt.disaggregation.utils import is_draft_kv_on_target_swa
     from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
@@ -1272,10 +1294,12 @@ def _add_dflash_draft_window(token_to_kv_pool, draft_token_to_kv_pool, add) -> N
                 "A draft on the target's SWA slots requires a hybrid-SWA target "
                 "pool sharing the draft's SWA index mapping and page size."
             )
-        buf_infos = draft_token_to_kv_pool.get_state_buf_infos()
+        data_ptrs, data_lens, item_lens = draft_token_to_kv_pool.get_state_buf_infos()
     else:
         draft_rows = draft_token_to_kv_pool
-        buf_infos = draft_token_to_kv_pool.get_contiguous_buf_infos()
+        data_ptrs, data_lens, item_lens = (
+            draft_token_to_kv_pool.get_contiguous_buf_infos()
+        )
     # Exact type: an MXFP8 pool would also need its block scales sent.
     if type(draft_rows) is not MHATokenToKVPool:
         raise NotImplementedError(
@@ -1283,8 +1307,10 @@ def _add_dflash_draft_window(token_to_kv_pool, draft_token_to_kv_pool, add) -> N
             f"got {type(draft_rows).__name__}."
         )
     add(
-        StateType.DFLASH_DRAFT_WINDOW,
-        *buf_infos,
+        state_type=StateType.DFLASH_DRAFT_WINDOW,
+        data_ptrs=data_ptrs,
+        data_lens=data_lens,
+        item_lens=item_lens,
         kv_layout=draft_rows.kv_cache_layout,
         view=lambda: draft_rows,
     )

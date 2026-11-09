@@ -561,5 +561,7 @@ POSITIONAL_FIELD_ORDER = (
     "uocr_max_page_tokens",
     "enable_fp4_indexer",
     "paged_experts_enable_disk",
+    "speculative_dflash_draft_kv_on_swa",
+    "speculative_dflash_draft_window_transfer",
 )
 # fmt: on

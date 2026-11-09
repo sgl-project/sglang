@@ -1396,6 +1396,15 @@ class CommonKVManager(BaseKVManager):
                 f"prefill={info.attn_tp_size}, decode={self.attn_tp_size}."
             )
 
+        if (info.kv_layout or "").partition("dflash_draft_window=")[2] != (
+            self.kv_layout or ""
+        ).partition("dflash_draft_window=")[2]:
+            raise RuntimeError(
+                "DFLASH draft transfer mismatch: prefill kv_layout="
+                f"{info.kv_layout}, decode kv_layout={self.kv_layout}. The draft "
+                "window transfer needs the same draft model and draft KV cache "
+                "dtype, and PP, CP and DCP size 1, on both servers."
+            )
         if (
             info.kv_layout is not None
             and self.kv_layout is not None
@@ -1405,14 +1414,6 @@ class CommonKVManager(BaseKVManager):
                 f"KV layout mismatch: prefill server has kv_layout={info.kv_layout}, "
                 f"but decode server has kv_layout={self.kv_layout}. Both servers "
                 f"must use the same --dsv4-attn-backend and SGLANG_DSV4_KV_LAYOUT."
-            )
-        if ("dflash_draft_window=" in (info.kv_layout or "")) != (
-            "dflash_draft_window=" in (self.kv_layout or "")
-        ):
-            raise RuntimeError(
-                "DFLASH draft transfer mismatch: prefill kv_layout="
-                f"{info.kv_layout}, decode kv_layout={self.kv_layout}. The draft "
-                "window transfer needs PP, CP and DCP size 1 on both servers."
             )
 
         local_layout = self.dsv41_spec_layout
@@ -1833,6 +1834,7 @@ class CommonKVManager(BaseKVManager):
         dst_page_indices: npt.NDArray[np.int32],
         dst_attn_tp_size: int,
         dst_tp_rank: int,
+        total_kv_heads: Optional[int] = None,
     ) -> List[Tuple[npt.NDArray[np.uint64], npt.NDArray[np.uint64], int]]:
         # SWA state has no layer ids and its pool starts every PP stage at layer
         # 0, so a prefill stage's entries cannot be paired with the decode layers.
@@ -1880,7 +1882,8 @@ class CommonKVManager(BaseKVManager):
                 f"prefill={len(src_page_indices)}, decode={len(dst_page_indices)}"
             )
 
-        total_kv_heads = resolve_total_kv_heads(self.kv_args, self.attn_tp_size)
+        if total_kv_heads is None:
+            total_kv_heads = resolve_total_kv_heads(self.kv_args, self.attn_tp_size)
         src_head_start, num_heads, dst_head_start, _ = compute_head_slice_params(
             src_attn_tp_size=self.attn_tp_size,
             dst_attn_tp_size=dst_attn_tp_size,

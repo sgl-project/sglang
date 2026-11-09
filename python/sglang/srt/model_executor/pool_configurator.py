@@ -132,6 +132,10 @@ class MemoryPoolConfig:
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+    from sglang.srt.model_executor.model_runner_components.spec_aux_hidden_state import (
+        SpecAuxHiddenStateConfig,
+    )
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 logger = logging.getLogger(__name__)
 
@@ -146,10 +150,15 @@ def _dflash_draft_cell_size(kvc: KVCacheConfigurator) -> int:
     return int(cell_size) * kvc.dflash_draft_loc_space_scale
 
 
-def _dflash_draft_kv_on_swa(kvc: KVCacheConfigurator) -> bool:
-    if kvc.is_draft_worker or not kvc.spec_algorithm.is_dflash():
+def _dflash_draft_kv_on_swa(
+    *,
+    is_draft_worker: bool,
+    spec_algorithm: SpeculativeAlgorithm,
+    spec_aux_config: SpecAuxHiddenStateConfig,
+) -> bool:
+    if is_draft_worker or not spec_algorithm.is_dflash():
         return False
-    draft_model_config = kvc.spec_aux_config.draft_model_config
+    draft_model_config = spec_aux_config.draft_model_config
     return draft_model_config is not None and draft_model_config.dflash_draft_kv_on_swa
 
 
@@ -841,7 +850,11 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
 
         self._draft_cell_size = _dflash_draft_cell_size(kvc)
         self._draft_swa_cell_size = 0
-        if _dflash_draft_kv_on_swa(kvc):
+        if _dflash_draft_kv_on_swa(
+            is_draft_worker=kvc.is_draft_worker,
+            spec_algorithm=kvc.spec_algorithm,
+            spec_aux_config=kvc.spec_aux_config,
+        ):
             self._draft_swa_cell_size = self._draft_cell_size
             self._draft_cell_size = 0
         self._fused_full_entry = kvc.fused_entry_bytes("full")

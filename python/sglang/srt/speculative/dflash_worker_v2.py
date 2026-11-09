@@ -388,6 +388,8 @@ class DFlashWorkerV2(BaseSpecWorker):
     scheduler runs it synchronously when overlap is disabled.
     """
 
+    _draft_kv_on_swa = False
+
     def weight_update_runners(self) -> List[Tuple[str, "ModelRunner"]]:
         return [("draft", self.draft_model_runner)]
 
@@ -705,7 +707,6 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._check_draft_pool_on_swa(token_to_kv_pool_allocator)
 
     def _check_draft_kv_on_swa(self, *, resolved_attention_backend: str) -> None:
-        """Launch resolution already ruled these out; a hit is a resolution bug."""
         parallel = get_parallel()
         disagg = get_disagg()
         pd = disagg.disaggregation_mode != "null"
@@ -713,6 +714,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             layer.self_attn.sliding_window_size for layer in self.draft_model.layers
         ]
         target_window = self.model_runner.sliding_window_size
+        # Launch resolution must reject these configurations.
         unsupported = [
             reason
             for reason, applies in (
@@ -729,7 +731,6 @@ class DFlashWorkerV2(BaseSpecWorker):
                 ("DP attention", parallel.attn_dp_enabled),
                 ("context parallelism", parallel.attn_cp_size > 1),
                 ("decode context parallelism", parallel.attn_dcp_size > 1),
-                # The draft window state entry is validated only on mooncake.
                 (
                     f"PD disaggregation over {disagg.disaggregation_transfer_backend!r}",
                     pd and disagg.disaggregation_transfer_backend != "mooncake",
@@ -738,8 +739,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     "PD disaggregation with pipeline parallelism",
                     pd and parallel.pp_size > 1,
                 ),
-                # The target's SWA eviction keeps every slot the draft reads only
-                # if the draft reads no further back than the target.
+                # The target's SWA eviction frees slots a wider draft window would read.
                 (
                     f"draft windows {draft_windows} beyond the target window "
                     f"{target_window}",
@@ -783,11 +783,10 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
 
     def _draft_swa_write_ids(self, plan: IterationIds) -> Optional[torch.Tensor]:
-        # Read before on_publish: the scheduler may then rewrite the mapping.
         if not self._draft_kv_on_swa:
             return None
         ids = plan.write_ids(
-            self.model_runner.runner_ids, kind=IdSpaceKind.SLIDING_WINDOW
+            reader=self.model_runner.runner_ids, kind=IdSpaceKind.SLIDING_WINDOW
         )
         assert ids is not None, "the target plan has no SWA write ids"
         return ids
@@ -2516,7 +2515,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                 return_iteration_ids=True,
             )
             iteration_ids, batch_output.iteration_ids = batch_output.iteration_ids, None
-            swa_cache_loc = self._draft_swa_write_ids(iteration_ids)
+            # Read before on_publish: the scheduler may then rewrite the mapping.
+            swa_write_ids = self._draft_swa_write_ids(iteration_ids)
 
             logits_output, next_token_ids = (
                 batch_output.logits_output,
@@ -2574,7 +2574,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 target_hidden=logits_output.hidden_states,
                 cache_loc=self._draft_write_ids(iteration_ids),
                 swa_cache_loc=(
-                    swa_cache_loc
+                    swa_write_ids
                     if self._draft_kv_on_swa
                     else self._draft_write_ids(
                         iteration_ids, IdSpaceKind.SLIDING_WINDOW
@@ -2768,7 +2768,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             write_virtual=verify_out_cache_loc,
             read_extent=block_size,
         )
-        verify_swa_cache_loc = self._draft_swa_write_ids(iteration_ids)
+        verify_swa_write_ids = self._draft_swa_write_ids(iteration_ids)
 
         seq_lens_cpu = self._draft_seq_lens_cpu_buf[:bs]
         if self.use_compact_draft_cache:
@@ -3161,7 +3161,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             cache_loc=cache_loc,
             cache_loc_2d=cache_loc.view(verify_out_cache_loc_2d.shape),
             swa_cache_loc=(
-                verify_swa_cache_loc
+                verify_swa_write_ids
                 if self._draft_kv_on_swa
                 else self._draft_write_ids(iteration_ids, IdSpaceKind.SLIDING_WINDOW)
             ),

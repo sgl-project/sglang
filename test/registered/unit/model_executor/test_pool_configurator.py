@@ -1532,20 +1532,22 @@ class TestDflashDraftKvBudget(CustomTestCase):
         self.assertLess(_tokens(10240), _tokens(None))
 
     def test_draft_on_swa_slots_is_charged_per_swa_token(self):
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
         draft_kv_per_token = 10240
         ratio = 0.5
 
         def _pool(on_swa):
             mr = _make_model_runner(
-                self,
+                testcase=self,
                 is_hybrid_swa=True,
                 full_attention_layer_ids=list(range(16)),
                 swa_attention_layer_ids=list(range(16, 32)),
                 swa_num_kv_heads=4,
                 swa_full_tokens_ratio=ratio,
+                speculative_algorithm="DFLASH",
             )
-            mr.spec_algorithm.is_dflash.return_value = True
-            mr.spec_algorithm.is_dflash_family.return_value = True
+            mr.spec_algorithm = SpeculativeAlgorithm.DFLASH
             mr.dflash_draft_cell_size_per_token = draft_kv_per_token
             mr.spec_aux_config = SimpleNamespace(
                 eagle_draft_num_layers=None,
@@ -1558,7 +1560,9 @@ class TestDflashDraftKvBudget(CustomTestCase):
                 )
 
                 cfg = create_memory_pool_configurator(mr)
-                config = cfg.calculate_pool_sizes(10_000_000, get_schedule().page_size)
+                config = cfg.calculate_pool_sizes(
+                    available_bytes=10_000_000, page_size=get_schedule().page_size
+                )
             return cfg._cell_size, config.full_max_total_num_tokens
 
         per_token_cell, per_token_full = _pool(False)

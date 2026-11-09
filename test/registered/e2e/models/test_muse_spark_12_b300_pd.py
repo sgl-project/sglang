@@ -143,7 +143,7 @@ class TestMuseSpark12B300PD(SpecDecodingMixin, PDDisaggregationServerBase):
 
     def test_dflash_draft_kv_on_swa(self):
         for url in (self.prefill_url, self.decode_url):
-            response = requests.get(f"{url}/server_info", timeout=30)
+            response = requests.get(url=f"{url}/server_info", timeout=30)
             response.raise_for_status()
             info = response.json()
             self.assertIs(info["speculative_dflash_draft_kv_on_swa"], True)

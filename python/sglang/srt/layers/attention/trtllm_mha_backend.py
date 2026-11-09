@@ -219,6 +219,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
     # Set in __init__ when decode length-group plans are reused within a forward.
     decode_split_hoist: bool = False
     _decode_group_plans: Optional[DecodeGroupPlans] = None
+    _encoder_only_reads_swa: bool = False
 
     def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
         # Prefill metadata init snapshots all scheduler-shared inputs pre-replay.
@@ -394,7 +395,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         else:
             self._swa_full_to_swa_mapping = None
         self._encoder_only_reads_swa = self._resolve_encoder_only_reads_swa(
-            model_runner
+            model=model_runner.model,
+            draft_kv_on_swa=(
+                self.is_draft_runner
+                and model_runner.model_config.dflash_draft_kv_on_swa
+            ),
         )
 
         # Static page-table width (upper bound). The CUDA-graph path builds the
@@ -651,17 +656,18 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             return model_output
         return output.to(self.q_data_type)
 
-    def _resolve_encoder_only_reads_swa(self, model_runner: ModelRunner) -> bool:
+    def _resolve_encoder_only_reads_swa(
+        self, *, model: torch.nn.Module, draft_kv_on_swa: bool
+    ) -> bool:
         if not (
-            model_runner.is_draft_worker
-            and model_runner.model_config.dflash_draft_kv_on_swa
+            draft_kv_on_swa
             and self.expand_encoder_only_verify
             and self._swa_kv_pool is not None
         ):
             return False
         in_swa_pool = {
             self._is_window_layer(module)
-            for module in model_runner.model.modules()
+            for module in model.modules()
             if isinstance(module, RadixAttention)
             and module.attn_type == AttentionType.ENCODER_ONLY
         }

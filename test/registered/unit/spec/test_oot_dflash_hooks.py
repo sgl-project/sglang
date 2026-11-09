@@ -215,19 +215,22 @@ class TestDFlashDraftKvOnSwaResolution(CustomTestCase):
         ):
             _resolve_dflash_draft_kv_on_swa(args)
         return (
-            resolution_result(args, "speculative_dflash_draft_kv_on_swa"),
-            resolution_result(args, "speculative_dflash_draft_window_transfer"),
+            resolution_result(
+                server_args=args, field="speculative_dflash_draft_kv_on_swa"
+            ),
+            resolution_result(
+                server_args=args, field="speculative_dflash_draft_window_transfer"
+            ),
         )
 
     def test_launch_gates(self):
         cases = (
             ({}, (True, 2048)),
             ({"disaggregation_transfer_backend": "nixl"}, (False, None)),
-            # A real launch rejects PP > 1 earlier; this pins the resolver's own guard.
+            # Full DFLASH launch validation rejects PP > 1 before this resolver.
             ({"pp_size": 2}, (False, None)),
             ({"attn_cp_size": 2}, (False, None)),
             ({"dcp_size": 2}, (False, None)),
-            # The window transfer does not depend on the draft backend.
             ({"speculative_draft_attention_backend": "flashinfer"}, (False, 2048)),
         )
         for overrides, expected in cases:
