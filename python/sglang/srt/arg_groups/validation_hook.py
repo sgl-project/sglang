@@ -802,6 +802,18 @@ def validate_sampling_mask_max_tokens(server_args: Any):
         )
 
 
+def validate_sampling_banned_token_ids(server_args: Any):
+    cfg = resolving_view(server_args)
+    token_ids = cfg.sampling_banned_token_ids
+    if token_ids and min(token_ids) < 0:
+        raise ValueError(
+            f"--sampling-banned-token-ids must be non-negative (got {min(token_ids)})."
+        )
+    if token_ids and envs.SGLANG_USE_MLX.get():
+        # The MLX runner samples from its own logits, which are never masked.
+        raise ValueError("--sampling-banned-token-ids is not supported on MLX.")
+
+
 _AUX_HIDDEN_STATE_CAPTURE_METHODS = ("EAGLE3", "DFLASH", "DSPARK")
 
 

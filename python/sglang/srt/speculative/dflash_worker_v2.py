@@ -630,7 +630,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             for module in self.target_worker.model_runner.model.modules()
             if isinstance(module, LogitsProcessor)
         ]
-        if len(processors) != 1:
+        # A deferred shard never holds the full row that
+        # --sampling-banned-token-ids masks.
+        if len(processors) != 1 or processors[0].banned_token_cols is not None:
             return None
         processors[0].defer_verify_gather = True
         return processors[0]

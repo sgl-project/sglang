@@ -584,6 +584,8 @@ class LogitsProcessor(nn.Module):
         # full-vocabulary gather even when the runtime master switch is on.
         self.sharded_verify = False
         self._sharded_verify_temperature_keys = False
+        # Logits columns of --sampling-banned-token-ids (set_banned_token_ids).
+        self.banned_token_cols: Optional[torch.Tensor] = None
         self.final_logit_softcapping = getattr(
             self.config, "final_logit_softcapping", None
         )
@@ -636,7 +638,10 @@ class LogitsProcessor(nn.Module):
         temperature_keys: the bound local key policy may serve temperature rows;
         the stock policy serves greedy rows only.
         """
-        self.sharded_verify = self._sharded_verify_eligible
+        # Vocab-shard logits skip the banned-ids mask, so a ban keeps the gather.
+        self.sharded_verify = (
+            self._sharded_verify_eligible and self.banned_token_cols is None
+        )
         self._sharded_verify_temperature_keys = temperature_keys
 
     def verify_uses_vocab_shards(self, forward_batch: ForwardBatch) -> bool:
@@ -1240,8 +1245,8 @@ class LogitsProcessor(nn.Module):
                 and logits_metadata.forward_mode.is_target_verify()
             ):
                 return logits
-            return self._gather_softcap_fused(
-                logits, logits_metadata, use_logits_buffer
+            return self._mask_banned_tokens(
+                self._gather_softcap_fused(logits, logits_metadata, use_logits_buffer)
             )
 
         used_tp_lm_head_all_to_all = False
@@ -1293,6 +1298,46 @@ class LogitsProcessor(nn.Module):
                     logits / self.final_logit_softcapping
                 )
 
+        return self._mask_banned_tokens(logits)
+
+    def set_banned_token_ids(
+        self,
+        token_ids: List[int],
+        device: torch.device,
+        column_token_ids: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Set the logits of token_ids to the lowest finite value in every row
+        from now on, so their probability is 0 and every logprob stays finite.
+
+        column_token_ids maps each logits column to its token id, for a head
+        over a reduced vocabulary (a draft hot-token map); None means column c
+        is token c.
+        """
+        ids = torch.tensor(sorted(set(token_ids)), dtype=torch.int64)
+        if column_token_ids is None:
+            if int(ids[-1]) >= self.vocab_size:
+                logger.warning(
+                    "Banned token ids >= the vocabulary size %d are ignored.",
+                    self.vocab_size,
+                )
+            cols = ids[ids < self.vocab_size]
+        else:
+            cols = torch.isin(column_token_ids.cpu().long(), ids).nonzero().flatten()
+        self.banned_token_cols = cols.to(device) if cols.numel() > 0 else None
+        if self.banned_token_cols is not None:
+            self.sharded_verify = False
+        logger.info(
+            "Banned token ids: %d of %d logits columns masked.",
+            cols.numel(),
+            self.vocab_size if column_token_ids is None else len(column_token_ids),
+        )
+
+    def _mask_banned_tokens(self, logits: torch.Tensor) -> torch.Tensor:
+        # A static index, so CUDA-graph capture keeps it.
+        if self.banned_token_cols is not None:
+            logits.index_fill_(
+                -1, self.banned_token_cols, torch.finfo(logits.dtype).min
+            )
         return logits
 
     def _can_gather_softcap_fused(
@@ -1889,3 +1934,21 @@ def should_apply_lm_head_quant_method(lm_head, quant_method) -> bool:
         )
 
     return True
+
+
+def set_banned_token_ids_on_model(
+    *,
+    model: nn.Module,
+    token_ids: List[int],
+    device: torch.device,
+    column_token_ids: Optional[torch.Tensor] = None,
+) -> int:
+    """Mask token_ids in every LogitsProcessor of model; return how many."""
+    num_masked = 0
+    for module in model.modules():
+        if isinstance(module, LogitsProcessor):
+            module.set_banned_token_ids(
+                token_ids=token_ids, device=device, column_token_ids=column_token_ids
+            )
+            num_masked += 1
+    return num_masked
