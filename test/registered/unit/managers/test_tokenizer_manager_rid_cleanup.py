@@ -29,7 +29,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.disaggregation.utils import DisaggregationMode  # noqa: E402
+from sglang.srt.disaggregation.mode import DisaggregationMode  # noqa: E402
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry  # noqa: E402
 from sglang.srt.managers.io_struct import (  # noqa: E402
     AbortReq,
@@ -52,6 +52,41 @@ from sglang.srt.observability.req_time_stats import (  # noqa: E402
 from sglang.srt.runtime_context import get_context
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+
+
+class TestSamplingParamsTruncation(CustomTestCase):
+    def test_batch_truncation_is_independent_of_prompt_order(self):
+        """A long prompt must not truncate the completion budget of shorter peers."""
+        override = get_context().override_server_args()
+        override.install()
+        self.addCleanup(override.restore)
+        manager = TokenizerManager.__new__(TokenizerManager)
+        manager.context_len = 100
+        manager.num_reserved_tokens = 0
+        manager.allow_auto_truncate = True
+        manager.validate_total_tokens = True
+        manager.is_generation = True
+        manager.model_config = SimpleNamespace(
+            joint_head_config=None, pointer_head=None
+        )
+
+        for lengths in ((90, 10), (10, 90)):
+            for per_prompt in (False, True):
+                with self.subTest(lengths=lengths, per_prompt=per_prompt):
+                    shared = {"max_new_tokens": 20}
+                    req = GenerateReqInput(
+                        input_ids=[[1] * length for length in lengths],
+                        sampling_params=[shared, shared] if per_prompt else shared,
+                    )
+                    req.normalize_batch_and_arguments()
+                    for i in range(req.batch_size):
+                        manager._validate_one_request(req[i], req[i].input_ids)
+
+                    self.assertEqual(
+                        [req[i].sampling_params["max_new_tokens"] for i in range(2)],
+                        [min(20, 100 - length) for length in lengths],
+                    )
+                    self.assertEqual(shared, {"max_new_tokens": 20})
 
 
 _NOT_FINISHED = object()  # Sentinel: request has not finished yet

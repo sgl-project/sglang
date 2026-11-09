@@ -24,7 +24,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.router import PlainPoolRouter
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.unified_cache.components.base import ComponentType
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     BufferBackupSnapshot,
 )
@@ -60,8 +60,10 @@ def _pipeline(*, tail_only: bool, window: int = 2, swa_page_size: int = 2):
             swa_component=SimpleNamespace(
                 pool_name=PoolName.SWA, full_window_pages=window
             ),
-            auxiliary_swa_component=SimpleNamespace(
-                pool_name=PoolName.AUXILIARY_SWA, full_window_pages=window + 1
+            further_window_components=(
+                SimpleNamespace(
+                    pool_name=PoolName.AUXILIARY_SWA, full_window_pages=window + 1
+                ),
             ),
             write_backlog_cap=128,
         )

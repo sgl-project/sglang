@@ -164,7 +164,7 @@ class TestDflashDraftSamplerVocabParallel(CustomTestCase):
 @unittest.skipUnless(_HAS_CUDA, "triton kernel requires CUDA")
 class TestRebuildCompactDraftReqToToken(CustomTestCase):
     def _legacy(self, draft, target, req_idx, start, lens, verify_2d, bs, block):
-        from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
+        from sglang.srt.mem_cache.allocation import assign_req_to_token_pool_func
 
         lens64 = lens.to(torch.int64)
         max_len = int(lens64.max().item())

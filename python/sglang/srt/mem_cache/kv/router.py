@@ -15,10 +15,7 @@ from typing import Any, Dict, Optional, Sequence, Tuple
 
 import msgspec
 
-# The part every token KV view holds today; derived parts get their own names.
-KV_PART = "kv"
-# A request's recurrent state, one slot per request, in the state sub-pool.
-STATE_PART = "state"
+from sglang.srt.mem_cache.kv.decl import KV_PART
 
 
 class PartRoute(msgspec.Struct, frozen=True, kw_only=True):
@@ -91,6 +88,20 @@ class KVLayer(msgspec.Struct, frozen=True, kw_only=True):
             **kwargs,
         )
 
+    def store_prefix(
+        self, layer, loc_info, commit_lens, cache_k, cache_v, *args, **kwargs
+    ) -> None:
+        """Commit each request's live prefix using this layer's physical ids."""
+        from sglang.srt.mem_cache.memory_pool import unwrap_write_loc
+
+        write_loc = loc_info if self.plain else self._write_loc(layer, loc_info)
+        loc, _, _ = unwrap_write_loc(write_loc)
+        if not self.plain:
+            kwargs["layer_id_override"] = self.view_layer_id
+        self.view.set_kv_buffer_prefix_valid(
+            layer, loc, commit_lens, cache_k, cache_v, *args, **kwargs
+        )
+
     def store_mla(self, layer, loc_info, cache_k_nope, cache_k_rope) -> None:
         if self.plain:
             self.view.set_mla_kv_buffer(layer, loc_info, cache_k_nope, cache_k_rope)
@@ -101,6 +112,18 @@ class KVLayer(msgspec.Struct, frozen=True, kw_only=True):
             cache_k_nope,
             cache_k_rope,
             layer_id_override=self.view_layer_id,
+        )
+
+    def store_mla_prefix(
+        self, layer, loc_info, commit_lens, cache_k_nope, cache_k_rope
+    ) -> None:
+        from sglang.srt.mem_cache.memory_pool import unwrap_write_loc
+
+        write_loc = loc_info if self.plain else self._write_loc(layer, loc_info)
+        loc, _, _ = unwrap_write_loc(write_loc)
+        kwargs = {} if self.plain else {"layer_id_override": self.view_layer_id}
+        self.view.set_mla_kv_buffer_prefix_valid(
+            layer, loc, commit_lens, cache_k_nope, cache_k_rope, **kwargs
         )
 
     def _write_loc(self, layer, loc_info):
@@ -153,10 +176,14 @@ class KVLayerRouter:
         sub_pools: Tuple[PublicSubPool, ...],
         views: Dict[str, Any],
         layers: Dict[int, KVLayer],
+        roles: Optional[Dict[str, str]] = None,
     ):
         self._pool = pool
         self._sub_pools = sub_pools
         self._by_name = {sub_pool.name: sub_pool for sub_pool in sub_pools}
+        # Attention roles consumers ask for (the sliding-window layers' role)
+        # and the sub-pool that plays each.
+        self._roles = dict(roles or {})
         self._views = views
         self._layers = layers
         self._part_layers: Dict[Tuple[int, str], KVLayer] = {}
@@ -171,6 +198,7 @@ class KVLayerRouter:
         layer_maps: Sequence[Tuple[str, Any, Dict[int, int]]],
         *,
         owner: Optional[str] = None,
+        roles: Optional[Dict[str, str]] = None,
     ) -> KVLayerRouter:
         """A composite's router: per sub-pool, in plan order, its name, its
         view, and each routed model layer's index in that view, which is also
@@ -197,6 +225,7 @@ class KVLayerRouter:
             ),
             views={name: view for name, view, _ in layer_maps},
             layers=layers,
+            roles=roles,
         )
 
     def bind_part(
@@ -275,16 +304,30 @@ class KVLayerRouter:
         return self._sub_pools
 
     def sub_pool(self, name: str) -> Optional[PublicSubPool]:
-        """The named sub-pool, or None when the pool has none by that name."""
-        return self._by_name.get(name)
+        """The named sub-pool (or the one playing the named role), or None
+        when the pool has none by that name."""
+        return self._by_name.get(self._roles.get(name, name))
 
     def routes_to(self, sub_pool: str) -> bool:
         """Whether some layer's KV lives in the named sub-pool."""
         found = self.sub_pool(sub_pool)
         return found is not None and len(found.layer_ids) > 0
 
+    def plays(self, layer_id: int, role: str) -> bool:
+        """Whether the layer's KV lives in the sub-pool playing ``role`` (or
+        named ``role``): a role names the sub-pool by what it does, while a
+        layer's route names it by what it is."""
+        found = self.sub_pool(role)
+        return found is not None and self.route(layer_id).sub_pool == found.name
+
+    def storage_name(self, sub_pool: str) -> str:
+        """Backing sub-pool for an attention role, including routed drafts."""
+        if self._pool.requires_physical_write_loc:
+            return self.view(sub_pool)._sub_pool_name
+        return self._roles.get(sub_pool, sub_pool)
+
     def view(self, sub_pool: str) -> Any:
-        return self._views[sub_pool]
+        return self._views[self._roles.get(sub_pool, sub_pool)]
 
     def wrapped_view(self) -> Optional[Any]:
         """The one token KV view the pool wraps, when all its token KV lives in

@@ -24,7 +24,7 @@ from sglang.test.test_utils import (
 
 # ci-cost-override: the 816B checkpoint needs two TP4 replicas; one full GSM8K
 # pass covers both NVLink PD transfer and the DFlash2 acceptance regression gate.
-register_cuda_ci(est_time=800, stage="base-c", runner_config="8-gpu-b300")
+register_cuda_ci(est_time=800, stage="extra-b", runner_config="8-gpu-b300")
 
 MODEL_PATH = "meta-models/Muse-Spark-Open-816B-A42B-NVFP4"
 DRAFT_MODEL_PATH = "RadixArk/Muse-Spark-Open-DFlash2"

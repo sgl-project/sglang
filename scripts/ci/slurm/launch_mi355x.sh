@@ -6,12 +6,15 @@
 # salloc's (prefill_workers + decode_workers) nodes -- one server per node --
 # and runs the Docker harness: prefill server(s) on the first nodes, decode
 # server(s) on the rest, a standalone load balancer on the prefill node, then an
-# sglang.bench_serving concurrency sweep over MORI. Default recipe is 1P1D (2
+# sglang.benchmark.serving concurrency sweep over MORI. Default recipe is 1P1D (2
 # nodes); see the drive.sh note on reserving 2P2D / 1P3D / 3P1D.
 #
 # Required environment variables (set by the GitHub Actions workflow):
-#   MODEL              - HuggingFace model id (table label / served model)
-#   MODEL_PREFIX       - short prefix, e.g. dsv4flash
+#   MODEL              - HF repo id of the checkpoint to load
+#   HF_CACHE           - HF hub cache root on every compute node (same path on
+#                        each, holding models--<org>--<name>); mounted read-only
+#                        into the containers at the same path
+#   IMAGE              - ROCm SGLang Docker image for every container
 #   PRECISION          - fp8 / fp4
 #   ISL, OSL           - input / output sequence lengths for the sweep
 #   CONFIG_FILE        - path to the recipe YAML (relative to repo root)
@@ -19,7 +22,6 @@
 #   MATRIX_CONFIG_NAME - matrix entry name (used in filenames/tags)
 #   GITHUB_WORKSPACE   - set by GitHub Actions; where result JSONs are written
 # Optional:
-#   MODEL_PATH         - local snapshot dir (preferred over downloading MODEL)
 #   SLURM_PARTITION    - default: amd-sglang
 #   SLURM_NODELIST     - optional explicit node pin (else scheduler chooses)
 #   SLURM_EXCLUDE      - optional comma-separated nodes to keep the scheduler
@@ -46,7 +48,9 @@
 set -euo pipefail
 set -x
 
-: "${MODEL_PREFIX:?}"
+: "${MODEL:?}"
+: "${HF_CACHE:?}"
+: "${IMAGE:?}"
 : "${PRECISION:?}"
 : "${ISL:?}"
 : "${OSL:?}"
@@ -57,7 +61,6 @@ set -x
 
 SLURM_PARTITION="${SLURM_PARTITION:-amd-sglang}"
 TIME_LIMIT="${TIME_LIMIT:-02:30:00}"
-MODEL_PATH="${MODEL_PATH:-${MODEL:-}}"
 
 # Scheduler profile. `slurm` (default) is the amd-sglang MI355X cluster and is
 # the original code path, unchanged. `spur` is the TW PIT cluster, which runs
@@ -86,83 +89,22 @@ fi
 SLURM_ACCOUNT="${SLURM_ACCOUNT:-}"
 SLURM_QOS="${SLURM_QOS:-}"
 
-# Relocate the shared HuggingFace cache root. nightly-configs.yaml pins
-# model_path under /it-share/model_coverage (the mi355x cluster's NFS); a
-# cluster that mirrors the same models elsewhere sets MODEL_ROOT and every
-# recipe/config path is rewritten, so no recipe or config file needs editing.
-MODEL_ROOT="${MODEL_ROOT:-}"
-# Root used to RESOLVE the snapshot hash; defaults to MODEL_ROOT. Set it when
-# MODEL_ROOT is node-local and therefore unreadable from the driver node.
-MODEL_RESOLVE_ROOT="${MODEL_RESOLVE_ROOT:-$MODEL_ROOT}"
-# Optional node-local mirror of the model cache, for clusters where shared
-# storage cannot serve every rank at once. Resolution stays on the shared root:
-# resolve_snapshot runs on the driver node, which has no mirror. Must be assigned
-# after MODEL_RESOLVE_ROOT, which keeps the readable root.
-MODEL_LOCAL_ROOT="${MODEL_LOCAL_ROOT:-}"
-if [[ -n "$MODEL_LOCAL_ROOT" ]]; then
-    if [[ -z "$MODEL_RESOLVE_ROOT" ]]; then
-        echo "ERROR: MODEL_LOCAL_ROOT is set but MODEL_ROOT/MODEL_RESOLVE_ROOT is empty;" >&2
-        echo "       the snapshot hash has to be resolved against a root the driver can read." >&2
-        exit 1
-    fi
-    MODEL_ROOT="$MODEL_LOCAL_ROOT"
-fi
-MODEL_ROOT_FROM="${MODEL_ROOT_FROM:-/it-share/model_coverage}"
-relocate_model_root() {
-    local p="$1"
-    if [[ -n "$MODEL_ROOT" && "$p" == "$MODEL_ROOT_FROM"/* ]]; then
-        printf '%s\n' "$MODEL_ROOT/${p#"$MODEL_ROOT_FROM"/}"
-    else
-        printf '%s\n' "$p"
-    fi
-}
+# A checkpoint is named by its HF repo id and lives in the HF hub layout under
+# $HF_CACHE. drive.sh resolves the snapshot from refs/main on the compute nodes,
+# which are the only hosts that can read a node-local cache.
+hf_cache_dir() { printf '%s/models--%s\n' "$HF_CACHE" "${1//\//--}"; }
+MODEL_DIR="$(hf_cache_dir "$MODEL")"
+DRAFT_DIR=""
+
 SGLANG_USE_CHECKOUT_RUNTIME="${SGLANG_USE_CHECKOUT_RUNTIME:-1}"
 case "${SGLANG_USE_CHECKOUT_RUNTIME,,}" in
     0|false|no|off) SGLANG_USE_CHECKOUT_RUNTIME=0 ;;
     *) SGLANG_USE_CHECKOUT_RUNTIME=1 ;;
 esac
 
-if [[ -z "$MODEL_PATH" ]]; then
-    echo "ERROR: set MODEL_PATH (local snapshot) or MODEL" >&2
-    exit 1
-fi
-
-# Resolve a HuggingFace cache dir (models--org--name) to its live snapshot dir.
-# Lets nightly-configs / recipes point at the shared cache without hardcoding a
-# snapshot hash; a concrete snapshot dir (or plain dir) is returned unchanged.
-# Used for both MODEL_PATH and an optional speculative draft model path.
-resolve_snapshot() {
-    local p="$1"
-    if [[ -f "$p/refs/main" && -d "$p/snapshots" ]]; then
-        local hash resolved
-        hash="$(cat "$p/refs/main")"
-        resolved="$p/snapshots/$hash"
-        if [[ -n "$hash" && -d "$resolved" ]]; then
-            echo "resolved snapshot: $p -> $resolved" >&2
-            echo "$resolved"
-            return 0
-        fi
-        echo "ERROR: refs/main=$hash but $resolved missing" >&2
-        return 1
-    fi
-    echo "$p"
-}
-# Resolve the snapshot against the shared cache first, then relocate. MODEL_ROOT
-# may name a node-local copy that does not exist on the node running this
-# script; resolve_snapshot would then find no refs/main and pass the bare cache
-# dir to the container. Three steps, since the resolve root and the destination
-# root can differ: rewrite onto a readable root, resolve refs/main, then rewrite
-# onto the root the container will see.
-MODEL_PATH="$(MODEL_ROOT="$MODEL_RESOLVE_ROOT" relocate_model_root "$MODEL_PATH")"
-MODEL_PATH="$(resolve_snapshot "$MODEL_PATH")" || exit 1
-MODEL_PATH="$(MODEL_ROOT_FROM="$MODEL_RESOLVE_ROOT" relocate_model_root "$MODEL_PATH")"
-
 # ---------------------------------------------------------------------------
 # Parse the recipe (runtime + bench + topology) into shell vars.
 # ---------------------------------------------------------------------------
-# Ensure PyYAML is available to the host python used for parsing.
-python3 -c 'import yaml' 2>/dev/null || pip install pyyaml -q 2>/dev/null \
-    || pip install --user pyyaml -q 2>/dev/null || true
 
 # Emit KEY=value lines and eval them (robust single-level command substitution;
 # avoids a nested read<<EOF/$(<<PY) heredoc that misparses on some shells).
@@ -176,7 +118,6 @@ def emit(k, v): print(f"{k}={v}")
 # strings). eval treats the RHS as a single shell word. Existing emits stay
 # space-free so the EP<=8 recipes are byte-identical.
 def emitq(k, v): print(f"{k}={shlex.quote(str(v))}")
-emit("IMAGE", rt["image"])
 # Attention backend: single (`attention_backend`) or split
 # (`prefill_attention_backend`/`decode_attention_backend`). Empty when absent so
 # the flag is dropped for a model that omits it.
@@ -247,8 +188,9 @@ emit("MTP_ALGO", m.get("algorithm", "EAGLE"))
 emit("MTP_STEPS", m.get("num_steps", 3))
 emit("MTP_TOPK", m.get("eagle_topk", 1))
 emit("MTP_DRAFT", m.get("num_draft_tokens", 4))
-# External draft checkpoint (EAGLE3 etc.); empty for DSV4's built-in EAGLE head.
-emit("MTP_DRAFT_PATH", m.get("draft_model_path", ""))
+# External draft checkpoint as an HF repo id (EAGLE3 etc.); empty for DSV4's
+# built-in EAGLE head.
+emit("MTP_DRAFT_MODEL", m.get("draft_model", ""))
 # Worker counts double as node counts here: one server per node (TP == GPUs/node).
 # 1P1D today; bumping these reserves 2P2D / 1P3D / 3P1D. Multi-node-per-worker
 # (TP > GPUs/node, needs --dist-init-addr/--nnodes/--node-rank) is out of scope.
@@ -269,10 +211,6 @@ if [[ -z "$RECIPE_VARS" ]]; then
     exit 1
 fi
 eval "$RECIPE_VARS"
-# Optional image override from workflow_dispatch input.
-if [[ -n "${IMAGE_OVERRIDE:-}" ]]; then
-    IMAGE="$IMAGE_OVERRIDE"
-fi
 
 # Nodes per engine: an engine whose TP exceeds one node's GPU count spans
 # ceil(TP/GPUS_PER_NODE) nodes and needs torch-dist multi-node init. EP<=8
@@ -327,6 +265,9 @@ if [[ "$CLUSTER" == "spur" ]]; then
 else
 rm -rf "$WORKDIR"; mkdir -p "$WORKDIR"
 fi
+# Lets runner_disk_preflight.py reclaim this dir if the leg dies before the
+# workflow's cleanup step runs.
+printf '%s\n' "${RUNNER_NAME:-}" > "$WORKDIR/.runner_name"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Stage the workflow checkout on shared NFS so Slurm compute-node containers can
@@ -394,7 +335,6 @@ DSV4_ENV=(
   -e SGLANG_USE_ROCM700A=$ROCM700A
   -e SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton
   -e SGLANG_OPT_FP8_WO_A_GEMM=false -e SGLANG_OPT_USE_JIT_INDEXER_METADATA=false
-  -e SGLANG_OPT_USE_TOPK_V2=false -e SGLANG_OPT_USE_AITER_INDEXER=true
   -e SGLANG_OPT_USE_TILELANG_INDEXER=false -e SGLANG_OPT_USE_TILELANG_MHC_PRE=false
   -e SGLANG_OPT_USE_TILELANG_MHC_POST=false -e SGLANG_FP8_PAGED_MQA_LOGITS_TORCH=1
   -e SGLANG_OPT_USE_MULTI_STREAM_OVERLAP=false -e SGLANG_ROCM_USE_MULTI_STREAM=false
@@ -542,12 +482,15 @@ if [ -n "$_ionic_provider" ] && [ -e "$_ionic_provider" ]; then
 fi
 IONIC_EOF
 
-# drive.sh is a quoted heredoc and expands nothing, so its staging check gets the
-# resolved paths through a file, as model_flags.sh does. Empty path = no check.
+# drive.sh is a quoted heredoc and expands nothing, so it gets the cache dirs of
+# the checkpoints to resolve through a file, as model_flags.sh does.
+if [[ "$MTP_ENABLED" == "1" && -n "$MTP_DRAFT_MODEL" ]]; then
+    DRAFT_DIR="$(hf_cache_dir "$MTP_DRAFT_MODEL")"
+fi
 {
-    printf 'STAGE_LOCAL_PATH=%q\n' "${MODEL_LOCAL_ROOT:+$MODEL_PATH}"
-    printf 'STAGE_SHARED_ROOT=%q\n' "$MODEL_RESOLVE_ROOT"
-} > "$WORKDIR/stage_check.sh"
+    printf 'MODEL_DIR=%q\n' "$MODEL_DIR"
+    printf 'DRAFT_DIR=%q\n' "$DRAFT_DIR"
+} > "$WORKDIR/model_dirs.sh"
 # Same channel for the recipe's RDMA device list, which drive.sh narrows on spur
 # to the ports that are actually up (see the PORT_ACTIVE check there). That
 # check rewrites the list in place with sed, using it as the pattern, so a stray
@@ -583,12 +526,10 @@ if [[ "$MTP_ENABLED" == "1" ]]; then
 --speculative-num-steps $MTP_STEPS --speculative-eagle-topk $MTP_TOPK \
 --speculative-num-draft-tokens $MTP_DRAFT"
     # EAGLE3 (and other draft-model algos) need an external draft checkpoint;
-    # built-in EAGLE (DSV4) omits draft_model_path and this stays unset.
-    if [[ -n "$MTP_DRAFT_PATH" ]]; then
-        _d="$(MODEL_ROOT="$MODEL_RESOLVE_ROOT" relocate_model_root "$MTP_DRAFT_PATH")"
-        _d="$(resolve_snapshot "$_d")" || exit 1
-        DRAFT_RESOLVED="$(MODEL_ROOT_FROM="$MODEL_RESOLVE_ROOT" relocate_model_root "$_d")"
-        EXTRA_COMMON="$EXTRA_COMMON --speculative-draft-model-path $DRAFT_RESOLVED"
+    # built-in EAGLE (DSV4) has none. Single-quoted so it stays literal in the
+    # generated scripts: model_paths.sh, written by drive.sh, sets it at runtime.
+    if [[ -n "$DRAFT_DIR" ]]; then
+        EXTRA_COMMON="$EXTRA_COMMON --speculative-draft-model-path "'$DRAFT_MODEL_PATH'
     fi
 fi
 # Prefix a leading space only when the arg is non-empty (keeps EP<=8 argv byte-
@@ -642,19 +583,13 @@ else
 --disaggregation-transfer-backend $XFER --disaggregation-ib-device $IB$KV_FLAG$DECODE_TAIL"
 fi
 
-# /it-share is the mi355x cluster's model NFS. Mount it only where it exists --
-# docker would otherwise silently create a root-owned empty /it-share on every
-# node of a cluster that keeps its models elsewhere (see MODEL_ROOT).
-IT_SHARE_MOUNT="-v /it-share:/it-share:ro "
-[[ -d /it-share ]] || IT_SHARE_MOUNT=""
-# A cluster that relocates the model cache must bind that root in too, at the
-# same path: --model-path is resolved inside the container, and a missing
-# directory does not fail as "no such file" -- transformers falls back to
+# Mounted at the same path: --model-path is resolved inside the container, and a
+# missing directory does not fail as "no such file" -- transformers falls back to
 # treating it as a HuggingFace repo id and dies with a confusing
 # "Repo id must be in the form 'repo_name' or 'namespace/repo_name'".
-if [[ -n "$MODEL_ROOT" && "$MODEL_ROOT" != /it-share/* ]]; then
-    IT_SHARE_MOUNT="$IT_SHARE_MOUNT-v $MODEL_ROOT:$MODEL_ROOT:ro "
-fi
+# The source may be a symlink, but not one in a sticky world-writable directory
+# such as /tmp: with fs.protected_symlinks=1 dockerd will not follow it.
+HF_CACHE_MOUNT="-v $HF_CACHE:$HF_CACHE:ro"
 # Slurm hosts each server as a long-lived job step and reaps the container when
 # the step ends, so --rm is right there. Spur has no equivalent step (its
 # --overlap path is an interactive exec-into-job), so the container runs
@@ -676,17 +611,10 @@ fi
 DOCKER_COMMON="$DOCKER_LIFECYCLE --network host --ipc host --shm-size 32g $PRIV_ARGS \
 --security-opt seccomp=unconfined \
 --device /dev/kfd --device /dev/dri --device /dev/infiniband \
-${IT_SHARE_MOUNT}-v $HOME:/host_home $CHECKOUT_DOCKER_ARGS"
+$HF_CACHE_MOUNT -v $HOME:/host_home $CHECKOUT_DOCKER_ARGS"
 # Optional extra docker args (e.g. bind-mounting a locally-built lib for
 # validation). Empty by default so the docker argv is byte-identical otherwise.
 [[ -n "${EXTRA_DOCKER_ARGS:-}" ]] && DOCKER_COMMON="$DOCKER_COMMON ${EXTRA_DOCKER_ARGS}"
-
-# Checkpoint paths whose trust_remote_code modules are pre-loaded in the entry
-# script (see warm_remote_code.sh). Colon-separated, draft appended only when a
-# recipe uses an external draft model.
-WARM_MODEL_PATHS="$MODEL_PATH"
-[[ -n "${DRAFT_RESOLVED:-}" ]] && WARM_MODEL_PATHS="$WARM_MODEL_PATHS:$DRAFT_RESOLVED"
-DOCKER_COMMON="$DOCKER_COMMON -e WARM_MODEL_PATHS=$WARM_MODEL_PATHS"
 
 # Spur compute nodes run prolog/epilog hooks that reap any container not tagged
 # with the owning job, so an untagged server is SIGKILLed (rc=137) seconds after
@@ -734,10 +662,10 @@ DENV_ARG="$DENV_ARG$SPUR_DNCCL"
 # Write per-role scripts that srun dispatches to each compute node.
 # ---------------------------------------------------------------------------
 # These are UNQUOTED `<<EOF` heredocs, so $MORI_ENV/$DSV4_ENV_STR/$COMMON_FLAGS/
-# $IMAGE/$MODEL_PATH expand now (at generation). model_flags.sh is sourced at
-# runtime for the model's env/server arrays, so the `${MODEL_ENV_ARGS[@]}` /
-# `${MODEL_SERVER_ARGS[@]}` refs are backslash-escaped to survive into the script
-# and expand after `source`. For DSV4 those arrays are empty and $DSV4_ENV_STR is
+# $IMAGE expand now (at generation). model_flags.sh and model_paths.sh are
+# sourced at runtime, so the `${MODEL_ENV_ARGS[@]}` / `${MODEL_SERVER_ARGS[@]}` /
+# `$MODEL_PATH` refs are backslash-escaped to survive into the script and expand
+# after `source`. For DSV4 those arrays are empty and $DSV4_ENV_STR is
 # set, so the resulting docker argv is byte-identical to the pre-Kimi launcher.
 cat > "$WORKDIR/install_checkout_sglang.sh" <<'EOF'
 #!/bin/bash
@@ -789,7 +717,11 @@ for f in README.md LICENSE; do
 done
 
 python3 -m pip uninstall -y sglang || true
-python3 -m pip install --no-deps --no-build-isolation -e "$RUNTIME_CHECKOUT/python"
+# Install with runtime_base (the torch-free deps) instead of --no-deps: the
+# image can predate a dependency the checkout imports (blake3 from #47120
+# failed every 11-05 job on image 20261104). pip's default only-if-needed
+# strategy leaves already-satisfied packages, including torch/aiter, alone.
+python3 -m pip install --no-build-isolation -e "$RUNTIME_CHECKOUT/python[runtime_base]"
 
 export RUNTIME_CHECKOUT
 export PYTHONPATH="$RUNTIME_CHECKOUT/python:${PYTHONPATH:-}"
@@ -996,6 +928,7 @@ if (( PN_PER > 1 || DN_PER > 1 )); then
 set -euo pipefail
 CIDIR=/host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}
 source "\$CIDIR/model_flags.sh"
+source "\$CIDIR/model_paths.sh"
 bash "\$CIDIR/install_checkout_sglang.sh"
 if [[ "\${SGLANG_USE_CHECKOUT_RUNTIME:-1}" != "0" ]]; then
   export PYTHONPATH=/tmp/sglang-checkout-runtime/python:\${PYTHONPATH:-}
@@ -1010,7 +943,7 @@ else
   DIST_ARGS="$PNCCL_ARG"
 fi
 exec python3 -m sglang.launch_server \
-  --model-path $MODEL_PATH --host 0.0.0.0 --port $PPORT \
+  --model-path \$MODEL_PATH --host 0.0.0.0 --port $PPORT \
   $PREFILL_COMMON_FLAGS "\${MODEL_SERVER_ARGS[@]}" \$DIST_ARGS \
   --disaggregation-mode prefill --disaggregation-bootstrap-port $PBOOT
 EOF
@@ -1020,6 +953,7 @@ EOF
 set -euo pipefail
 CIDIR=/host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}
 source "\$CIDIR/model_flags.sh"
+source "\$CIDIR/model_paths.sh"
 bash "\$CIDIR/install_checkout_sglang.sh"
 if [[ "\${SGLANG_USE_CHECKOUT_RUNTIME:-1}" != "0" ]]; then
   export PYTHONPATH=/tmp/sglang-checkout-runtime/python:\${PYTHONPATH:-}
@@ -1034,7 +968,7 @@ else
   DIST_ARGS="$DNCCL_ARG"
 fi
 exec python3 -m sglang.launch_server \
-  --model-path $MODEL_PATH --host 0.0.0.0 --port $DPORT \
+  --model-path \$MODEL_PATH --host 0.0.0.0 --port $DPORT \
   $DECODE_COMMON_FLAGS "\${MODEL_SERVER_ARGS[@]}" \$DIST_ARGS \
   --disaggregation-mode decode --disaggregation-bootstrap-port $DBOOT
 EOF
@@ -1075,13 +1009,14 @@ else
 set -euo pipefail
 CIDIR=/host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}
 source "\$CIDIR/model_flags.sh"
+source "\$CIDIR/model_paths.sh"
 bash "\$CIDIR/install_checkout_sglang.sh"
 if [[ "\${SGLANG_USE_CHECKOUT_RUNTIME:-1}" != "0" ]]; then
   export PYTHONPATH=/tmp/sglang-checkout-runtime/python:\${PYTHONPATH:-}
 fi
 bash "\$CIDIR/warm_remote_code.sh"
 exec python3 -m sglang.launch_server \
-  --model-path $MODEL_PATH --host 0.0.0.0 --port $PPORT \
+  --model-path \$MODEL_PATH --host 0.0.0.0 --port $PPORT \
   $PREFILL_COMMON_FLAGS "\${MODEL_SERVER_ARGS[@]}" \
   --disaggregation-mode prefill --disaggregation-bootstrap-port $PBOOT$PNCCL_ARG
 EOF
@@ -1091,13 +1026,14 @@ EOF
 set -euo pipefail
 CIDIR=/host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}
 source "\$CIDIR/model_flags.sh"
+source "\$CIDIR/model_paths.sh"
 bash "\$CIDIR/install_checkout_sglang.sh"
 if [[ "\${SGLANG_USE_CHECKOUT_RUNTIME:-1}" != "0" ]]; then
   export PYTHONPATH=/tmp/sglang-checkout-runtime/python:\${PYTHONPATH:-}
 fi
 bash "\$CIDIR/warm_remote_code.sh"
 exec python3 -m sglang.launch_server \
-  --model-path $MODEL_PATH --host 0.0.0.0 --port $DPORT \
+  --model-path \$MODEL_PATH --host 0.0.0.0 --port $DPORT \
   $DECODE_COMMON_FLAGS "\${MODEL_SERVER_ARGS[@]}" \
   --disaggregation-mode decode --disaggregation-bootstrap-port $DBOOT$DNCCL_ARG
 EOF
@@ -1174,6 +1110,7 @@ docker run $DOCKER_COMMON "\${IONIC_MOUNTS[@]}" --name mi355x_bench \
   -e PIP=\$PIP -e DIP=\$DIP -e PCSV=\$PCSV \
   $IMAGE bash -lc '
     CIDIR=/host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}
+    source \$CIDIR/model_paths.sh
     bash \$CIDIR/install_checkout_sglang.sh
     if [ "\${SGLANG_USE_CHECKOUT_RUNTIME:-1}" != "0" ]; then
       export PYTHONPATH=/tmp/sglang-checkout-runtime/python:\${PYTHONPATH:-}
@@ -1208,8 +1145,8 @@ $PREFILL_WAIT_ROUTER
       echo "=== concurrency=\$C ==="
       OUT=/host_home/.mi355x_ci/${MATRIX_CONFIG_NAME}/raw_conc\${C}.json
       rm -f \$OUT
-      python3 -m sglang.bench_serving --backend sglang \
-        --host 127.0.0.1 --port $LBPORT --model $MODEL_PATH \
+      python3 -m sglang.benchmark.serving --backend sglang \
+        --host 127.0.0.1 --port $LBPORT --model \$MODEL_PATH \
         --dataset-name random --random-input-len $ISL --random-output-len $OSL \
         --random-range-ratio $RRR --max-concurrency \$C \
         --num-prompts \$((C*$NPF)) --warmup-requests \$C \
@@ -1491,25 +1428,56 @@ PIP=$(resolve_ip "$PNODE") || exit 1
 DIP=$(resolve_ip "$DNODE") || exit 1
 echo "[drive] prefill nodes: ${PNODES[*]} ; decode nodes: ${DNODES[*]}"
 echo "[drive] bench targets prefill=$PNODE($PIP) decode=$DNODE($DIP)"
-# The local copy is staged out of band and does not survive a reboot. Without
-# this the container falls back to the shared root and the only symptom is a
-# health-wait timeout 50 minutes later.
-source "$WORKDIR/stage_check.sh"
-if [[ -n "$STAGE_LOCAL_PATH" ]]; then
-  _stage_bad=0
+# The node-local HF caches are staged out of band, so a node can be missing a
+# checkpoint (never staged, or wiped) or hold a different revision. Resolve the
+# snapshot from refs/main on every allocated node and require the same hash on
+# all of them; otherwise the first symptom is a health-wait timeout 50 minutes
+# later, or prefill and decode silently serving different weights.
+source "$WORKDIR/model_dirs.sh"
+resolve_snapshot() {  # <cache dir> -> snapshot dir, identical on every node
+  local dir="$1" want="" n out _try
   for n in "${NODES[@]}"; do
-    if ! srun_local_or_step "$n" test -d "$STAGE_LOCAL_PATH" >/dev/null 2>&1; then
-      echo "ERROR: $n is missing the node-local snapshot $STAGE_LOCAL_PATH" >&2
-      _stage_bad=1
+    # __ok__ separates "the step ran" from a flaky srun dispatch, as in
+    # container_state().
+    out=""
+    for _try in 1 2 3; do
+      out="$(srun_local_or_step "$n" bash -c \
+          "h=\$(cat $dir/refs/main 2>/dev/null); if [ -n \"\$h\" ] && [ -d $dir/snapshots/\$h ]; then echo hash=\$h; else echo missing; fi; echo __ok__" \
+          2>/dev/null | tr -d '\r')"
+      [[ "$out" == *__ok__* ]] && break
+      out=""
+      sleep 2
+    done
+    if [[ -z "$out" ]]; then
+      echo "ERROR: could not check $dir on $n (srun failed 3 times)" >&2
+      return 1
     fi
+    out="$(sed -n 's/^hash=//p' <<< "$out")"
+    if [[ -z "$out" ]]; then
+      echo "ERROR: $n has no snapshot of $dir (refs/main or its snapshot dir is missing)" >&2
+      return 1
+    fi
+    if [[ -n "$want" && "$out" != "$want" ]]; then
+      echo "ERROR: $n has snapshot $out of $dir, but ${NODES[0]} has $want" >&2
+      return 1
+    fi
+    want="$out"
   done
-  if (( _stage_bad )); then
-    echo "ERROR: re-stage the model onto every allocated node, or unset MODEL_LOCAL_ROOT" >&2
-    echo "       to read from $STAGE_SHARED_ROOT (slow: large checkpoints will time out)." >&2
-    exit 1
-  fi
-  echo "[drive] node-local snapshot present on all ${#NODES[@]} nodes"
+  printf '%s/snapshots/%s\n' "$dir" "$want"
+}
+MODEL_PATH=$(resolve_snapshot "$MODEL_DIR") || { echo "ERROR: stage the checkpoint into HF_CACHE on every node" >&2; exit 1; }
+DRAFT_MODEL_PATH=""
+if [[ -n "$DRAFT_DIR" ]]; then
+  DRAFT_MODEL_PATH=$(resolve_snapshot "$DRAFT_DIR") || { echo "ERROR: stage the draft checkpoint into HF_CACHE on every node" >&2; exit 1; }
 fi
+# Sourced by the entry scripts and bench.sh inside the containers, which mount
+# HF_CACHE at the same path. WARM_MODEL_PATHS feeds warm_remote_code.sh.
+{
+  printf 'export MODEL_PATH=%q\n' "$MODEL_PATH"
+  printf 'export DRAFT_MODEL_PATH=%q\n' "$DRAFT_MODEL_PATH"
+  printf 'export WARM_MODEL_PATHS=%q\n' "$MODEL_PATH${DRAFT_MODEL_PATH:+:$DRAFT_MODEL_PATH}"
+} > "$WORKDIR/model_paths.sh"
+echo "[drive] same snapshot on all ${#NODES[@]} nodes: $MODEL_PATH${DRAFT_MODEL_PATH:+ (draft $DRAFT_MODEL_PATH)}"
 # The recipe's ib_devices is a fixed list, but a pit2 port can stay down for
 # days (some never link after a reboot). Handing a dead port to NCCL or mori
 # fails init with a network error that names neither the node nor the port.
@@ -1905,11 +1873,32 @@ EOF
     }
     SPUR_RESUBMITS_LEFT=${SPUR_RESUBMITS_LEFT:-20}
 
+    # Containers are started -d (detached) on spur, so killing this script does
+    # not kill them -- only the explicit teardown below does, and only if the
+    # script is still alive to reach it. A killed/disconnected runner otherwise
+    # leaves the job (and its containers) running until TIME_LIMIT. This trap
+    # covers that case the same way the normal path already covers a clean
+    # finish; it does not cover a hard SIGKILL or a severed connection.
+    spur_cleanup_on_exit() {
+        [[ "${SPUR_LEG_JOB_ID:-}" =~ ^[0-9]+$ ]] || return 0
+        local _nodes
+        _nodes=$(scontrol show job "$SPUR_LEG_JOB_ID" 2>/dev/null \
+            | tr ' ' '\n' | sed -n 's/^NodeList=//p' | tr ',' '\n' | grep -vx '(null)' || true)
+        for _n in $_nodes; do
+            echo "[launch] reaping containers on $_n for spur job $SPUR_LEG_JOB_ID" >&2
+            ssh -o BatchMode=yes -o ConnectTimeout=10 -n "$_n" \
+                'docker rm -f mi355x_prefill mi355x_decode mi355x_bench' \
+                >/dev/null 2>&1 || true
+        done
+        scancel "$SPUR_LEG_JOB_ID" 2>/dev/null || true
+    }
+
     spur_submit_leg
     if [[ ! "$SPUR_LEG_JOB_ID" =~ ^[0-9]+$ ]]; then
         echo "ERROR: could not parse a job id out of: $SBATCH_MSG" >&2
         SALLOC_RC=1
     else
+        trap spur_cleanup_on_exit EXIT INT TERM
         echo "[launch] spur job $SPUR_LEG_JOB_ID submitted; streaming $SBATCH_OUT"
         tail -F "$SBATCH_OUT" 2>/dev/null &
         SPUR_TAIL_PID=$!
@@ -1999,10 +1988,9 @@ EOF
         # 1774/1775 held all four nodes long after their legs had been recorded
         # rc=1. Unconditional, because reaching here means this leg is done with
         # its nodes either way.
-        if spur_job_alive "$SPUR_LEG_JOB_ID"; then
-            echo "[launch] releasing spur job $SPUR_LEG_JOB_ID"
-            scancel "$SPUR_LEG_JOB_ID" 2>/dev/null || true
-        fi
+        echo "[launch] releasing spur job $SPUR_LEG_JOB_ID"
+        trap - EXIT INT TERM
+        spur_cleanup_on_exit
     fi
 else
     salloc -p "$SLURM_PARTITION" -N"$TOTAL_NODES" "${NODELIST_ARG[@]}" "${EXCLUDE_ARG[@]}" "${EXCLUSIVE_ARG[@]}" \
@@ -2097,7 +2085,7 @@ fi
 #   median_ttft_ms             ->  median_ttft_ms              (TTFT; /1000 -> s)
 #   median_tpot_ms             ->  median_tpot_ms              (TPOT; -> interactivity)
 #   median_e2e_latency_ms      ->  median_e2el_ms              (E2E latency; /1000 -> s)
-#   (none; injected here)      ->  model_id                    (served model, from $MODEL_PATH)
+#   (none; injected here)      ->  model_id                    (served model: the HF repo id $MODEL)
 # ---------------------------------------------------------------------------
 # GPU counts are per-ROLE totals across all engines: PW prefill engines of PTP
 # GPUs each, DW decode engines of DTP each. For EP<=8 (PW=DW=1) this is PTP/DTP
@@ -2128,7 +2116,7 @@ for C in ${CONCS//,/ }; do
     done
     [[ -f "$RAW" ]] || { echo "WARN: missing $RAW (not visible after 60s)"; continue; }
     DEST="$GITHUB_WORKSPACE/${RESULT_FILENAME}_${MATRIX_CONFIG_NAME}_conc${C}_gpus_${TOTAL_GPUS}_ctx_${PREFILL_GPUS_TOTAL}_gen_${DECODE_GPUS_TOTAL}.json"
-    MODEL_ID="$MODEL_PATH" python3 - "$RAW" "$DEST" "$C" <<'PY'
+    MODEL_ID="$MODEL" python3 - "$RAW" "$DEST" "$C" <<'PY'
 import json, os, sys
 raw_path, dest, conc = sys.argv[1], sys.argv[2], int(sys.argv[3])
 line = [l for l in open(raw_path).read().splitlines() if l.strip()][-1]
