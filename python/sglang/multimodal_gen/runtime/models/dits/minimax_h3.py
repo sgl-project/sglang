@@ -2542,6 +2542,67 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
         cache.weight_files = native_adaln_weight_files(weights_path)
         cache.invalidate()
 
+    def _adaln_memo_params(
+        self, adaln_input: torch.Tensor, unique_timesteps: torch.Tensor
+    ) -> tuple[tuple[torch.Tensor, ...], ...] | None:
+        """Per-block AdaLN parameters memoized by the step's exact timesteps.
+
+        A block's AdaLN projection depends only on the step's unique timesteps
+        (the time embedding feeds a fixed weight), and a few-step release
+        reuses the same timestep schedule for every request. Each block's
+        projection is a weight-bandwidth-bound GEMV (2688 x 96768 BF16 =
+        520 MB read per block per step), so serving it from a small memo keyed
+        by the timesteps' bit patterns removes it after the first request with
+        the same schedule. The memo holds exactly what the same projection
+        computed for the same input, so outputs are bit-identical.
+        The memo is dropped when an AdaLN weight changes.
+        """
+        max_entries = 32
+        if (
+            self.adaln_cache is not None
+            or get_tp_world_size() > 1
+            or torch.compiler.is_compiling()
+            or torch.cuda.is_current_stream_capturing()
+            or envs.SGLANG_CACHE_DIT_ENABLED
+            or hasattr(self, "_sglang_cache_dit_adapter")
+            or is_layerwise_offloaded_module(self)
+            or not all(type(block) is MiniMaxH3DiTBlock for block in self.blocks)
+            or any(block.adaln_proj is None for block in self.blocks)
+        ):
+            return None
+        weights = [block.adaln_proj.linear.weight for block in self.blocks]
+        version = tuple((w.data_ptr(), w._version) for w in weights)
+        memo = self.__dict__.get("_adaln_memo")
+        if memo is None or memo[0] != version:
+            memo = (version, {})
+            self.__dict__["_adaln_memo"] = memo
+        entries = memo[1]
+        key = (
+            tuple(
+                unique_timesteps.detach()
+                .view(-1)
+                .float()
+                .cpu()
+                .view(torch.int32)
+                .tolist()
+            ),
+            tuple(adaln_input.shape),
+            adaln_input.dtype,
+            adaln_input.device,
+        )
+        outputs = entries.pop(key, None)
+        if outputs is None:
+            outputs = [
+                block.adaln_proj.project_local(adaln_input) for block in self.blocks
+            ]
+            while len(entries) >= max_entries:
+                entries.pop(next(iter(entries)))
+        entries[key] = outputs
+        return tuple(
+            block.adaln_proj.split_output(output)
+            for block, output in zip(self.blocks, outputs)
+        )
+
     def _can_batch_block_adaln(self) -> bool:
         return (
             self.adaln_cache is None
@@ -3488,6 +3549,10 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
                     cache_plan_index=adaln_cache_plan_index,
                     num_timesteps=adaln_input.shape[0],
                 )
+            elif (
+                memo := self._adaln_memo_params(adaln_input, unique_timesteps)
+            ) is not None:
+                block_adaln_params = memo
             elif self._can_batch_block_adaln():
                 local_adaln = torch.stack(
                     [
