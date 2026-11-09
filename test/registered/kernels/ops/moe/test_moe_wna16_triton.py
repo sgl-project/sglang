@@ -117,6 +117,87 @@ def test_w4a16_rejects_incomplete_scale_grid():
         _launch_w4a16(b, scales=[1.0], group_size=128)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("path", ["fused", "runner_core"])
+@pytest.mark.parametrize("inplace", [False, True])
+def test_w2_block_shape_reaches_both_runner_paths(path, inplace):
+    """Both Triton runner entry points must use w2_block_shape for the down GEMM."""
+    from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+    from sglang.srt.layers.moe.moe_runner.triton import (
+        TritonMoeQuantInfo,
+        TritonRunnerCore,
+        fused_experts_none_to_triton,
+        pre_permute_standard_to_triton,
+    )
+    from sglang.srt.layers.moe.topk import StandardTopKOutput
+    from sglang.srt.layers.moe.utils import MoeRunnerBackend
+    from sglang.srt.runtime_context import get_context, get_flags
+    from sglang.test.layer_ut_utils import init_single_process_dist
+
+    init_single_process_dist(master_port=29641)
+    hidden, intermediate = 128, 160
+    x = torch.full((1, hidden), 1 / hidden, dtype=torch.float16, device="cuda")
+    w13 = torch.full(
+        (1, 2 * intermediate, hidden // 2), 0x99, dtype=torch.uint8, device="cuda"
+    )
+    w2 = torch.full(
+        (1, hidden, intermediate // 2), 0x99, dtype=torch.uint8, device="cuda"
+    )
+    w13_scale = torch.ones((1, 2 * intermediate, 1), dtype=x.dtype, device=x.device)
+    w2_scale = (
+        torch.arange(1, 6, dtype=x.dtype, device=x.device)
+        .view(1, 1, 5)
+        .expand(1, hidden, 5)
+        .contiguous()
+    )
+    info = TritonMoeQuantInfo(
+        w13_weight=w13,
+        w2_weight=w2,
+        use_int4_w4a16=True,
+        w13_scale=w13_scale,
+        w2_scale=w2_scale,
+        block_shape=[0, 128],
+        w2_block_shape=[0, 32],
+    )
+    config = MoeRunnerConfig(
+        num_experts=1,
+        num_local_experts=1,
+        hidden_size=hidden,
+        intermediate_size_per_partition=intermediate,
+        top_k=1,
+        activation="silu",
+        is_gated=True,
+        inplace=inplace,
+    )
+    dispatch = SimpleNamespace(
+        hidden_states=x,
+        hidden_states_pre_quant=None,
+        topk_output=StandardTopKOutput(
+            topk_weights=torch.ones((1, 1), dtype=torch.float32, device="cuda"),
+            topk_ids=torch.zeros((1, 1), dtype=torch.int32, device="cuda"),
+            router_logits=torch.zeros((1, 1), dtype=torch.float32, device="cuda"),
+        ),
+    )
+    with (
+        get_context().override_server_args(model_path="dummy"),
+        get_flags().moe.override(runner_backend=MoeRunnerBackend.TRITON),
+    ):
+        if path == "fused":
+            result = fused_experts_none_to_triton(dispatch, info, config).hidden_states
+        else:
+            state = {}
+            runner_input = pre_permute_standard_to_triton(dispatch, info, config, state)
+            result = (
+                TritonRunnerCore(config).run(runner_input, info, state).hidden_states
+            )
+
+    # GEMM1 yields gate=up=1; GEMM2 uses five 32-element groups with scales 1..5.
+    activation = torch.nn.functional.silu(torch.tensor(1.0)).to(x.dtype).float()
+    expected = torch.full_like(result, float(activation * (32 * sum(range(1, 6)))))
+    torch.testing.assert_close(result, expected, rtol=1e-3, atol=0.5)
+    assert (result.data_ptr() == x.data_ptr()) == inplace
+
+
 if __name__ == "__main__":
     args = ["-x" if arg == "-f" else arg for arg in sys.argv[1:]]
     sys.exit(pytest.main([__file__, *args]))
