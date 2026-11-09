@@ -9,7 +9,9 @@ import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import InsertParams
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.kv.alloc.chain import ChainRoles
+from sglang.srt.mem_cache.kv.alloc.band import Band
+from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
 from sglang.srt.mem_cache.kv.alloc.pricing import (
     ChainSnapshot,
     FloatChain,
@@ -18,9 +20,12 @@ from sglang.srt.mem_cache.kv.alloc.pricing import (
 )
 from sglang.srt.mem_cache.kv.build import UnifiedBuildContext, build_unified_pools
 from sglang.srt.mem_cache.kv.decl import (
+    FullLifetime,
     MHAGeometry,
     MLAGeometry,
     StateGeometry,
+    StateLifetime,
+    WindowLifetime,
     kv_layer_decls,
 )
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec, MHAView
@@ -33,9 +38,9 @@ from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.runtime_context import mamba_cache_chunk_size, publish, reset_context
 from sglang.srt.server_args import ServerArgs
-from sglang.test.tree_slots import tree_slots_of
+from sglang.test.tree_slots import storage_tree_slots, tree_slots_of
 
 
 def chain_snapshot(allocator) -> ChainSnapshot:
@@ -62,6 +67,22 @@ def pin_every_band(allocator, busy) -> None:
     """Register ``busy`` as a pin source over every band of a chain allocator,
     as PD and HiCache register theirs over every sub-pool."""
     allocator.add_pin_source(tuple(m.sub_pool_name for m in allocator.members), busy)
+
+
+HOLD = "test-hold"
+
+
+def hold_band(band, key=HOLD) -> None:
+    """Keep a band's live pages where they are: none of them moves, and the
+    band's extent keeps covering them, though it still reuses holes and
+    extends."""
+    first, end = band._span_range()
+    p2v = band.ids.physical_to_virtual[first:end].tolist()
+    band.fix_pages(key, [first + i for i, v in enumerate(p2v) if v >= 0])
+
+
+def release_band(band, key=HOLD) -> None:
+    band.unfix_pages(key)
 
 
 def setup_allocator_context():
@@ -99,7 +120,9 @@ def build_swa_pool(*, page_size=1, lazy=True, ratio=(1, 1), total_bytes=None):
     return bundle.token_to_kv_pool_allocator
 
 
-def build_tri_pool(*, page_size=1, lazy=True, ratio=(1, 1), temporal=(1, 4, 8)):
+def build_tri_pool(
+    *, page_size=1, lazy=True, ratio=(1, 1), temporal=(1, 4, 8), total_bytes=None
+):
     """Full + SWA + Mamba composite over real CPU pools; returns the pool
     bundle and its allocator."""
     full_layers, swa_layers = ratio
@@ -137,12 +160,16 @@ def build_tri_pool(*, page_size=1, lazy=True, ratio=(1, 1), temporal=(1, 4, 8)):
         enable_mamba_extra_buffer_lazy=False,
         disable_overlap_schedule=True,
         sliding_window_size=32,
+        total_bytes=total_bytes,
     )
     return bundle, bundle.token_to_kv_pool_allocator
 
 
 class FakeKVCache:
     """buf[p] == virtual id stored at physical slot p (-1 free); moves copy it."""
+
+    # A private pool, indexed by the allocator's ids as they are.
+    requires_physical_write_loc = False
 
     def __init__(self, source, name=None):
         # A bare size for a pool no arena moves; else the band of ``source``
@@ -154,6 +181,13 @@ class FakeKVCache:
             source.follow(name, self)
         # buf[p] == virtual id currently stored at physical slot p (-1 if free).
         self.buf = torch.full((size,), -1, dtype=torch.int64)
+        self.allocator = None
+
+    def id_spaces(self):
+        return {IdSpaceKind.FULL: IdSpace(key=(IdSpaceKind.FULL, None))}
+
+    def attach_allocator(self, allocator):
+        self.allocator = allocator
 
     def move_units(
         self, dst_pages: torch.Tensor, src_pages: torch.Tensor, page_size: int
@@ -163,19 +197,24 @@ class FakeKVCache:
         src_loc = (src_pages[:, None] * page_size + slots).flatten()
         self.buf[dst_loc] = self.buf[src_loc].clone()
 
+    def move_kv_cache(self, dst_loc, src_loc):
+        self.buf[dst_loc] = self.buf[src_loc].clone()
+
 
 class FakeUnifiedSWAKVPool:
-    class _SubKV(FakeKVCache):
-        def __init__(self, arena, name):
-            super().__init__(arena, name)
-            self.allocator = None
-
-        def attach_allocator(self, allocator):
-            self.allocator = allocator
-
     def __init__(self, arena: KVArena):
-        self.full_kv_pool = self._SubKV(arena, "full")
-        self.swa_kv_pool = self._SubKV(arena, "swa")
+        self.full_kv_pool = FakeKVCache(arena, "full")
+        self.swa_kv_pool = FakeKVCache(arena, "swa")
+        self.full_to_swa_index_mapping = None
+
+    @property
+    def layer_router(self):
+        # Its sub-pools by name; no sub-pool plays a role under another name.
+        from sglang.srt.mem_cache.kv.router import KVLayerRouter
+
+        return KVLayerRouter.from_layer_maps(
+            self, [("full", self.full_kv_pool, {}), ("swa", self.swa_kv_pool, {})]
+        )
 
 
 class SpecArena(KVArena):
@@ -254,7 +293,14 @@ def plan_stand_in(arena: SpecArena, fused_draft=None) -> SimpleNamespace:
     """What draft binding reads of a plan, over a test arena's specs."""
     return SimpleNamespace(
         fused_draft=fused_draft,
-        sub_pool=lambda name: SimpleNamespace(spec=arena.spec(name)),
+        sub_pool=lambda name: SimpleNamespace(
+            spec=arena.spec(name),
+            lifetime=FullLifetime()
+            if name == "full"
+            else StateLifetime()
+            if name == "mamba"
+            else WindowLifetime(window=64),
+        ),
     )
 
 
@@ -267,6 +313,119 @@ def stand_in_views(roles: ChainRoles, kvcache, state=None) -> Dict[str, object]:
     if roles.state is not None:
         views[roles.state] = state
     return views
+
+
+def build_paged_band_pair(
+    *,
+    page_size: int,
+    n_full_pages=16,
+    n_swa_pages=8,
+    full_layer_num=2,
+    swa_layer_num=2,
+):
+    """Peered full (grows up) and SWA (grows down) paged `Band`s over one CPU
+    arena; returns ``(arena, full, swa, full_kv, swa_kv)``."""
+    full_spec = MHASubPoolSpec(
+        name="full",
+        layer_num=full_layer_num,
+        head_num=2,
+        head_dim=4,
+        store_dtype=torch.float16,
+        grow_direction="up",
+    )
+    swa_spec = MHASubPoolSpec(
+        name="swa",
+        layer_num=swa_layer_num,
+        head_num=2,
+        head_dim=4,
+        store_dtype=torch.float16,
+        grow_direction="down",
+    )
+    total = (
+        n_full_pages * page_size * full_spec.entry_bytes()
+        + n_swa_pages * page_size * swa_spec.entry_bytes()
+    )
+    arena = arena_of(
+        total_bytes=total,
+        sub_pool_specs=[full_spec, swa_spec],
+        device="cpu",
+        enable_memory_saver=False,
+        page_size=page_size,
+    )
+    full_kv = FakeKVCache(arena, "full")
+    swa_kv = FakeKVCache(arena, "swa")
+    full = Band(
+        arena=arena,
+        sub_pool_name="full",
+        device="cpu",
+        is_id_owner=True,
+        page_size=page_size,
+    )
+    swa = Band(
+        arena=arena,
+        sub_pool_name="swa",
+        device="cpu",
+        is_id_owner=True,
+        page_size=page_size,
+    )
+    full.bind_peer(swa)
+    swa.bind_peer(full)
+    return arena, full, swa, full_kv, swa_kv
+
+
+def build_window_chain(
+    *,
+    n_full_slots=32,
+    n_swa_slots=16,
+    full_layer_num=4,
+    swa_layer_num=2,
+    head_num=2,
+    head_dim=4,
+    page_size=1,
+):
+    """A full + SWA `ChainAllocator` over a CPU arena and a stand-in KV pool;
+    returns ``(arena, allocator, kvcache)``."""
+    full_spec = MHASubPoolSpec(
+        name="full",
+        layer_num=full_layer_num,
+        head_num=head_num,
+        head_dim=head_dim,
+        store_dtype=torch.float16,
+        grow_direction="up",
+    )
+    swa_spec = MHASubPoolSpec(
+        name="swa",
+        layer_num=swa_layer_num,
+        head_num=head_num,
+        head_dim=head_dim,
+        store_dtype=torch.float16,
+        grow_direction="down",
+    )
+    total = (
+        n_full_slots * full_spec.entry_bytes() + n_swa_slots * swa_spec.entry_bytes()
+    )
+    arena = arena_of(
+        total_bytes=total,
+        sub_pool_specs=[full_spec, swa_spec],
+        device="cpu",
+        enable_memory_saver=False,
+        page_size=page_size,
+    )
+    kvcache = FakeUnifiedSWAKVPool(arena)
+    roles = ChainRoles(owner="full", window="swa")
+    allocator = ChainAllocator(
+        roles=roles,
+        arena=arena,
+        kvcache=kvcache,
+        views=stand_in_views(roles, kvcache),
+        device="cpu",
+        full_max_total_num_tokens=n_full_slots,
+        swa_max_total_num_tokens=n_swa_slots,
+        page_size=page_size,
+        need_sort=False,
+        forward_stream=None,
+    )
+    return arena, allocator, kvcache
 
 
 def tri_sub_pool_specs(
@@ -303,13 +462,17 @@ def tri_sub_pool_specs(
 def build_swa_cache(
     *,
     occupancy=96,
-    lazy=False,
+    lazy=True,
     page_size=1,
     ratio=(1, 1),
     total_bytes=None,
     sessions=False,
     window=None,
 ):
+    if total_bytes is None:
+        # These eviction fixtures reserve 100 pages of byte space including
+        # sinks, leaving 99 joint pages for the pressure-sensitive scenarios.
+        total_bytes = 100 * page_size * sum(ratio) * 32
     allocator = build_swa_pool(
         page_size=page_size, lazy=lazy, ratio=ratio, total_bytes=total_bytes
     )
@@ -327,8 +490,8 @@ def build_swa_cache(
             token_to_kv_pool_allocator=allocator,
             page_size=page_size,
             sliding_window_size=128 * page_size if window is None else window,
-            tree_slots=tree_slots_of(
-                (ComponentType.FULL, ComponentType.SWA),
+            tree_slots=storage_tree_slots(
+                allocator.storage,
                 window=128 * page_size if window is None else window,
             ),
         )
@@ -353,9 +516,14 @@ def build_tri_cache(
     ratio=(1, 1),
     sessions=False,
     state_cache=True,
+    total_bytes=None,
 ):
     bundle, a = build_tri_pool(
-        page_size=page_size, lazy=lazy, ratio=ratio, temporal=temporal
+        page_size=page_size,
+        lazy=lazy,
+        ratio=ratio,
+        temporal=temporal,
+        total_bytes=total_bytes,
     )
     c = UnifiedRadixCache(
         CacheInitParams(
@@ -364,13 +532,14 @@ def build_tri_cache(
             token_to_kv_pool_allocator=a,
             page_size=page_size,
             sliding_window_size=128 * page_size,
-            tree_slots=tree_slots_of(
-                (
+            tree_slots=storage_tree_slots(
+                a.storage,
+                window=128 * page_size,
+                components=(
                     (ComponentType.FULL, ComponentType.SWA, ComponentType.MAMBA)
                     if state_cache
                     else (ComponentType.FULL, ComponentType.SWA)
                 ),
-                window=128 * page_size,
             ),
             enable_session_radix_cache=sessions,
         )
@@ -383,7 +552,7 @@ class UnifiedGeometry(msgspec.Struct, frozen=True, kw_only=True):
 
     ``chain`` names its kinds: "swa" (full + window), "mamba" (full + state) or
     "tri" (full + window + state); the layer ids given per kind must match.
-    ``byte_budget`` is the token side's byte budget (state slots ride on top);
+    ``byte_budget`` is the complete device-storage budget;
     without it the token capacities size the buffer.
     """
 
@@ -469,12 +638,12 @@ def build_test_unified_pools(
     unified_total_bytes=None,
     model_context_len=None,
     extra_max_context_len=0,
-    max_num_reqs=0,
+    max_num_reqs=1,
     enable_memory_saver=False,
     post_capture_active=False,
     need_sort=False,
     forward_stream=None,
-    lazy_compaction=False,
+    lazy_compaction=True,
     is_draft_worker=False,
     enable_mamba_extra_buffer=False,
     enable_mamba_extra_buffer_lazy=False,
@@ -517,11 +686,10 @@ def build_test_unified_pools(
         state_geometry=(
             StateGeometry.of(mamba2_cache_params) if mamba_layer_ids else None
         ),
+        checkpoint_interval=mamba_cache_chunk_size() if mamba_layer_ids else None,
     )
     sizing = KVSizingInputs(
-        token_budget_bytes=total_bytes
-        if total_bytes is not None
-        else unified_total_bytes,
+        budget_bytes=total_bytes if total_bytes is not None else unified_total_bytes,
         full_tokens=(
             full_max_total_num_tokens
             if full_max_total_num_tokens is not None
@@ -531,6 +699,7 @@ def build_test_unified_pools(
         state_slots=max_mamba_cache_size,
         context_len=model_context_len,
         floor_window=sliding_window_size,
+        alignment=1,
     )
     ctx = UnifiedBuildContext(
         device=device,
@@ -602,15 +771,17 @@ def build_unified_bundle(geometry: UnifiedGeometry):
         state_geometry=(
             StateGeometry.of(cache_params) if cache_params is not None else None
         ),
+        checkpoint_interval=mamba_cache_chunk_size() if g.state_layer_ids else None,
     )
     by_tokens = g.byte_budget is None or bool(g.state_layer_ids)
     sizing = KVSizingInputs(
-        token_budget_bytes=g.byte_budget,
+        budget_bytes=g.byte_budget,
         full_tokens=g.full_tokens if by_tokens else None,
         window_tokens=g.swa_tokens if by_tokens and g.swa_layer_ids else None,
         state_slots=g.state_slots if g.state_layer_ids else 0,
         context_len=g.context_len,
         floor_window=g.window if g.swa_layer_ids else None,
+        alignment=1,
     )
     ctx = UnifiedBuildContext(
         device=g.device,
