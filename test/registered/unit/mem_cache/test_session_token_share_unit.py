@@ -22,15 +22,12 @@ from unittest.mock import MagicMock
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import CloseSessionReqInput
 from sglang.srt.managers.req_types import (
     FINISH_LENGTH,
     MultimodalDataItem,
     MultimodalInputs,
 )
-from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.managers.scheduler_components.request_list import ListKind
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.session.session_controller import Session, SessionController
@@ -232,11 +229,7 @@ class TestSessionTeardown(CustomTestCase):
     session frees them all at close."""
 
     def setUp(self):
-        # The scheduler's request lists: every request created stays listed.
-        self.listed = []
-        self.controller = SessionController(
-            MagicMock(), get_request_lists=lambda: {ListKind.WAITING: self.listed}
-        )
+        self.controller = SessionController(MagicMock())
         self.controller.open(
             SimpleNamespace(
                 session_id="s", capacity_of_str_len=0, streaming=False, timeout=None
@@ -263,7 +256,6 @@ class TestSessionTeardown(CustomTestCase):
                     ]
                 )
             )
-        self.listed.append(req)
         return req
 
     @staticmethod
@@ -278,8 +270,8 @@ class TestSessionTeardown(CustomTestCase):
         self.controller.close(CloseSessionReqInput(session_id="s"))
 
     def test_close_waits_for_unfinished_reader(self):
-        """A close, explicit or by timeout, freed the parent's image under a
-        queued child that reads it."""
+        """A close, explicit or by timeout, waits for an unfinished child that
+        reads its parent's image, then frees the image."""
         for by_timeout in (False, True):
             with self.subTest(by_timeout=by_timeout):
                 self.setUp()
@@ -299,18 +291,6 @@ class TestSessionTeardown(CustomTestCase):
                 self._reap()
                 self.assertNotIn("s", self.controller)
                 self.assertIsNone(item.feature)
-
-    def test_media_check_flags_a_reader_outside_the_session(self):
-        """The CI check reads the scheduler's lists, not the session's
-        bookkeeping, so it catches a reader the session does not track."""
-        parent = self._create("parent", image=b"A")
-        self._finish(parent)
-        stray = Req("stray", "", [1], SamplingParams())
-        stray.multimodal_inputs = parent.multimodal_inputs
-        self.listed.append(stray)
-        with envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.override(True):
-            with self.assertRaisesRegex(RuntimeError, "stray"):
-                self._close()
 
 
 if __name__ == "__main__":

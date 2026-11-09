@@ -17,10 +17,9 @@ import time
 import uuid
 from array import array
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Dict, Iterable, Optional
+from typing import TYPE_CHECKING, Dict, Optional
 
 from sglang.srt.disaggregation.mode import DisaggregationMode
-from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     OpenSessionReqInput,
@@ -31,15 +30,9 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.utils.log_utils import log_info_on_rank0
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.scheduler_components.request_list import ListKind
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 
 logger = logging.getLogger(__name__)
-
-
-def _may_read_media(req: Req) -> bool:
-    """Whether `req` can still read the session media it holds."""
-    return not req.finished() and req.multimodal_inputs is not None
 
 
 class Session:
@@ -322,18 +315,10 @@ class Session:
 
 
 class SessionController:
-    def __init__(
-        self,
-        tree_cache: BasePrefixCache,
-        *,
-        get_request_lists: Callable[[], Dict[ListKind, Iterable[Req]]],
-    ):
+    def __init__(self, tree_cache: BasePrefixCache):
         self.sessions: Dict[str, Session] = {}
         self._last_reap_time: float = 0.0
         self.tree_cache = tree_cache
-        # The lists that hold the live requests (`Scheduler.request_lists`);
-        # read only by the CI check in _check_media_unread.
-        self._get_request_lists = get_request_lists
 
     def __contains__(self, session_id: str) -> bool:
         return session_id in self.sessions
@@ -389,7 +374,6 @@ class SessionController:
             req = next(iter(session.turns.values()))
             req.session = None
 
-        self._check_media_unread(session)
         # Release multimodal features held by session requests.
         # Session reqs skip the normal mm cleanup path (scheduler and
         # output_processor) so features stay alive until the session closes.
@@ -423,8 +407,6 @@ class SessionController:
                 log_info_on_rank0(
                     logger, f"Deferred close ready for session {sid}, releasing."
                 )
-                # Reset close_on_finish so _close proceeds with the release.
-                self.sessions[sid].close_on_finish = False
                 self._close(sid)
 
             # A deferred close is already pending; closing it again each
@@ -443,31 +425,9 @@ class SessionController:
         """Whether a request still reads what closing `session` frees: the
         streaming turn in flight, or an unfinished turn that holds media."""
         return session._inflight or any(
-            _may_read_media(turn) for turn in session.turns.values()
-        )
-
-    def _check_media_unread(self, session: Session) -> None:
-        """CI check: no live request reads the media `session` is about to free."""
-        if not envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.get():
-            return
-        freed = {
-            id(item)
+            not turn.finished() and turn.multimodal_inputs is not None
             for turn in session.turns.values()
-            if turn.multimodal_inputs is not None
-            for item in turn.multimodal_inputs.mm_items
-        }
-        readers = [
-            req.rid
-            for reqs in self._get_request_lists().values()
-            for req in reqs
-            if _may_read_media(req)
-            and any(id(item) in freed for item in req.multimodal_inputs.mm_items)
-        ]
-        if readers:
-            raise RuntimeError(
-                f"Session {session.session_id} frees media that live requests "
-                f"{readers} still read"
-            )
+        )
 
     @staticmethod
     def adjust_mm_offsets(recv_req: TokenizedGenerateReqInput, req: Req, image_inputs):

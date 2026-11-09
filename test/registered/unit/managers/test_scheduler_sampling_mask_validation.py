@@ -108,9 +108,7 @@ class TestSchedulerSamplingMaskValidation(CustomTestCase):
                 scheduler.init_request_retirer()
                 scheduler.server_args = SimpleNamespace(sampling_mask_max_tokens=64)
                 scheduler._create_generation_req = lambda recv_req, **kw: Req(**kw)
-                scheduler.session_controller = SessionController(
-                    MagicMock(), get_request_lists=lambda: {}
-                )
+                scheduler.session_controller = SessionController(MagicMock())
                 scheduler.session_controller.open(
                     SimpleNamespace(
                         session_id="s",
