@@ -293,12 +293,328 @@ class TestGemma4DiffusionWeightLoading(unittest.TestCase):
         )
         model.vision_tower = None
         model.register_parameter("learned_weight", torch.nn.Parameter(torch.ones(1)))
+        skipped_param = torch.nn.Parameter(torch.ones(1))
+        skipped_param._skip_weight_check = True
+        model.register_parameter("k_scale", skipped_param)
+        model.register_parameter(
+            "w13_blockscale_swizzled", torch.nn.Parameter(torch.ones(1))
+        )
         model.register_buffer("derived_cache", torch.ones(1), persistent=False)
 
         with patch("sglang.srt.models.gemma4_diffusion.logger.warning") as warning:
             model.load_weights([])
 
         self.assertEqual(warning.call_args.args[1], ["learned_weight"])
+
+    def test_per_expert_quantized_and_full_attn_k_to_v_loading(self):
+        model = DiffusionGemmaForBlockDiffusion.__new__(DiffusionGemmaForBlockDiffusion)
+        torch.nn.Module.__init__(model)
+        model.text_config = SimpleNamespace(
+            layer_types=["full_attention"], num_experts=2, tie_word_embeddings=True
+        )
+        model.vision_tower = None
+
+        recorded_calls = []
+
+        def _make_tracked_param(tag):
+            p = torch.nn.Parameter(torch.zeros(1), requires_grad=False)
+
+            def _loader(param, loaded_weight, *args, **kwargs):
+                recorded_calls.append((tag, float(loaded_weight.item()), args, kwargs))
+
+            p.weight_loader = _loader
+            return p
+
+        params = {
+            "model.layers.0.moe.experts.w13_weight": _make_tracked_param("w13_weight"),
+            "model.layers.0.moe.experts.w13_weight_scale": _make_tracked_param(
+                "w13_weight_scale"
+            ),
+            "model.layers.0.moe.experts.w13_weight_scale_2": _make_tracked_param(
+                "w13_weight_scale_2"
+            ),
+            "model.layers.0.moe.experts.w13_input_scale": _make_tracked_param(
+                "w13_input_scale"
+            ),
+            "model.layers.0.moe.experts.w2_weight": _make_tracked_param("w2_weight"),
+            "model.layers.0.moe.experts.w2_weight_scale": _make_tracked_param(
+                "w2_weight_scale"
+            ),
+            "model.layers.0.self_attn.qkv_proj.weight": _make_tracked_param(
+                "qkv_weight"
+            ),
+            "model.layers.0.self_attn.qkv_proj.weight_scale": _make_tracked_param(
+                "qkv_weight_scale"
+            ),
+            "model.layers.0.self_attn.attn.k_scale": _make_tracked_param("attn_k_scale"),
+            "model.layers.0.self_attn.attn.v_scale": _make_tracked_param("attn_v_scale"),
+            "model.layers.0.self_attn.attn_bidir.k_scale": _make_tracked_param(
+                "bidir_k_scale"
+            ),
+            "model.layers.0.self_attn.attn_bidir.v_scale": _make_tracked_param(
+                "bidir_v_scale"
+            ),
+        }
+
+        with (
+            patch.object(
+                model, "named_parameters", return_value=list(params.items())
+            ),
+            patch.object(model, "named_buffers", return_value=[]),
+            patch("sglang.srt.models.gemma4_diffusion.logger.warning") as warning,
+        ):
+            loaded = model.load_weights(
+                [
+                    (
+                        "model.decoder.layers.0.experts.0.gate_proj.weight",
+                        torch.tensor([1.0]),
+                    ),
+                    (
+                        "model.decoder.layers.0.experts.0.gate_proj.weight_scale",
+                        torch.tensor([2.0]),
+                    ),
+                    (
+                        "model.decoder.layers.0.experts.0.up_proj.weight_scale_2",
+                        torch.tensor([3.0]),
+                    ),
+                    (
+                        "model.decoder.layers.0.experts.1.down_proj.weight",
+                        torch.tensor([4.0]),
+                    ),
+                    (
+                        "model.decoder.layers.0.experts.1.down_proj.weight_scale",
+                        torch.tensor([5.0]),
+                    ),
+                    (
+                        "model.decoder.layers.0.experts.1.gate_proj.input_scale",
+                        torch.tensor([6.0]),
+                    ),
+                    (
+                        "model.decoder.layers.0.self_attn.q_proj.weight",
+                        torch.tensor([7.0]),
+                    ),
+                    (
+                        "model.decoder.layers.0.self_attn.k_proj.weight",
+                        torch.tensor([8.0]),
+                    ),
+                    (
+                        "model.decoder.layers.0.self_attn.k_proj.weight_scale",
+                        torch.tensor([9.0]),
+                    ),
+                    (
+                        "model.decoder.layers.0.self_attn.k_proj.k_scale",
+                        torch.tensor([10.0]),
+                    ),
+                ]
+            )
+
+        warning.assert_not_called()
+        self.assertEqual(loaded, set(params.keys()))
+        self.assertIn(
+            (
+                "w13_weight",
+                1.0,
+                ("model.layers.0.moe.experts.w13_weight",),
+                {"shard_id": "w1", "expert_id": 0},
+            ),
+            recorded_calls,
+        )
+        self.assertIn(
+            (
+                "w13_weight_scale",
+                2.0,
+                ("model.layers.0.moe.experts.w13_weight_scale",),
+                {"shard_id": "w1", "expert_id": 0},
+            ),
+            recorded_calls,
+        )
+        self.assertIn(
+            (
+                "w13_weight_scale_2",
+                3.0,
+                ("model.layers.0.moe.experts.w13_weight_scale_2",),
+                {"shard_id": "w3", "expert_id": 0},
+            ),
+            recorded_calls,
+        )
+        self.assertIn(
+            (
+                "w2_weight",
+                4.0,
+                ("model.layers.0.moe.experts.w2_weight",),
+                {"shard_id": "w2", "expert_id": 1},
+            ),
+            recorded_calls,
+        )
+        self.assertIn(
+            (
+                "w2_weight_scale",
+                5.0,
+                ("model.layers.0.moe.experts.w2_weight_scale",),
+                {"shard_id": "w2", "expert_id": 1},
+            ),
+            recorded_calls,
+        )
+        self.assertIn(
+            (
+                "w13_input_scale",
+                6.0,
+                ("model.layers.0.moe.experts.w13_input_scale",),
+                {"shard_id": "w1", "expert_id": 1},
+            ),
+            recorded_calls,
+        )
+        # k_proj.weight and k_proj.weight_scale must duplicate into both "k" and "v" shards
+        self.assertIn(("qkv_weight", 8.0, ("k",), {}), recorded_calls)
+        self.assertIn(("qkv_weight", 8.0, ("v",), {}), recorded_calls)
+        self.assertIn(("qkv_weight_scale", 9.0, ("k",), {}), recorded_calls)
+        self.assertIn(("qkv_weight_scale", 9.0, ("v",), {}), recorded_calls)
+        # k_proj.k_scale on a full-attention layer populates k_scale & v_scale on attn & attn_bidir
+        for scale_tag in (
+            "attn_k_scale",
+            "attn_v_scale",
+            "bidir_k_scale",
+            "bidir_v_scale",
+        ):
+            self.assertIn((scale_tag, 10.0, (), {}), recorded_calls)
+
+
+class TestGemma4DiffusionQuantConfigMapping(unittest.TestCase):
+    def test_compressed_tensors_fp8_ignore_mapping(self):
+        from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+            CompressedTensorsConfig,
+        )
+        from sglang.srt.layers.quantization.compressed_tensors.utils import (
+            should_ignore_layer,
+        )
+
+        raw_quant_cfg = {
+            "config_groups": {
+                "group_0": {
+                    "format": "float-quantized",
+                    "input_activations": {
+                        "dynamic": True,
+                        "num_bits": 8,
+                        "strategy": "token",
+                        "symmetric": True,
+                        "type": "float",
+                    },
+                    "targets": ["Linear"],
+                    "weights": {
+                        "dynamic": False,
+                        "num_bits": 8,
+                        "strategy": "channel",
+                        "symmetric": True,
+                        "type": "float",
+                    },
+                }
+            },
+            "format": "float-quantized",
+            "ignore": [
+                "lm_head",
+                "model.decoder.layers.0.router.proj",
+                "model.decoder.self_conditioning.down_proj",
+                "model.decoder.self_conditioning.gate_proj",
+                "model.decoder.self_conditioning.up_proj",
+                "model.encoder.embed_vision.embedding_projection",
+                "model.encoder.language_model.layers.0.router.proj",
+                "model.encoder.vision_tower.encoder.layers.0.mlp.down_proj.linear",
+                "model.encoder.vision_tower.encoder.layers.0.mlp.gate_proj.linear",
+                "model.encoder.vision_tower.encoder.layers.0.mlp.up_proj.linear",
+                "model.encoder.vision_tower.encoder.layers.0.self_attn.k_proj.linear",
+                "model.encoder.vision_tower.encoder.layers.0.self_attn.o_proj.linear",
+                "model.encoder.vision_tower.encoder.layers.0.self_attn.q_proj.linear",
+                "model.encoder.vision_tower.encoder.layers.0.self_attn.v_proj.linear",
+                "model.encoder.vision_tower.patch_embedder.input_proj",
+            ],
+            "packed_modules_mapping": DiffusionGemmaForBlockDiffusion.packed_modules_mapping,
+        }
+        qcfg = CompressedTensorsConfig.from_config(raw_quant_cfg)
+        qcfg.apply_weight_name_mapper(
+            DiffusionGemmaForBlockDiffusion.hf_to_sglang_mapper
+        )
+
+        ignored_sglang_prefixes = [
+            "lm_head",
+            "model.layers.0.router.proj",
+            "model.self_conditioning.gate_up_proj",
+            "model.self_conditioning.down_proj",
+            "embed_vision.embedding_projection",
+            "vision_tower.patch_embedder.input_proj",
+            "vision_tower.encoder.layers.0.self_attn.qkv_proj",
+            "vision_tower.encoder.layers.0.self_attn.o_proj.linear",
+            "vision_tower.encoder.layers.0.mlp.gate_up_proj",
+            "vision_tower.encoder.layers.0.mlp.down_proj.linear",
+        ]
+        for pfx in ignored_sglang_prefixes:
+            self.assertTrue(
+                should_ignore_layer(
+                    pfx, ignore=qcfg.ignore, fused_mapping=qcfg.packed_modules_mapping
+                ),
+                f"Expected {pfx} to be ignored in CompressedTensorsConfig",
+            )
+
+        quantized_sglang_prefixes = [
+            "model.layers.0.self_attn.qkv_proj",
+            "model.layers.0.self_attn.o_proj",
+            "model.layers.0.mlp.gate_up_proj",
+            "model.layers.0.mlp.down_proj",
+            "model.layers.0.moe.experts.0.gate_proj",
+            "model.layers.0.moe.experts.0.up_proj",
+            "model.layers.0.moe.experts.0.down_proj",
+        ]
+        for pfx in quantized_sglang_prefixes:
+            self.assertFalse(
+                should_ignore_layer(
+                    pfx, ignore=qcfg.ignore, fused_mapping=qcfg.packed_modules_mapping
+                ),
+                f"Expected {pfx} to remain quantized in CompressedTensorsConfig",
+            )
+
+    def test_modelopt_nvfp4_exclusion_mapping(self):
+        from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
+
+        qcfg = ModelOptFp4Config.from_config(
+            {
+                "quantization": {
+                    "quant_algo": "NVFP4",
+                    "kv_cache_quant_algo": "FP8",
+                    "group_size": 16,
+                    "exclude_modules": [
+                        "lm_head",
+                        "*embed_vision*",
+                        "*mlp*",
+                        "*router*",
+                        "*self_attn*",
+                        "*self_conditioning*",
+                        "*vision_tower*",
+                        "model.decoder.layers.0.experts.99",
+                    ],
+                },
+                "packed_modules_mapping": DiffusionGemmaForBlockDiffusion.packed_modules_mapping,
+            }
+        )
+        qcfg.apply_weight_name_mapper(
+            DiffusionGemmaForBlockDiffusion.hf_to_sglang_mapper
+        )
+
+        for excluded in (
+            "lm_head",
+            "embed_vision.embedding_projection",
+            "vision_tower.patch_embedder.input_proj",
+            "vision_tower.encoder.layers.0.self_attn.qkv_proj",
+            "model.self_conditioning.gate_up_proj",
+            "model.layers.0.self_attn.qkv_proj",
+            "model.layers.0.mlp.gate_up_proj",
+            "model.layers.0.router.proj",
+            "model.layers.0.moe.experts.99",
+        ):
+            self.assertTrue(
+                qcfg.is_layer_excluded(excluded),
+                f"Expected {excluded} to be excluded in ModelOptQuantConfig",
+            )
+
+        self.assertFalse(qcfg.is_layer_excluded("model.layers.0.moe.experts"))
 
 
 if __name__ == "__main__":

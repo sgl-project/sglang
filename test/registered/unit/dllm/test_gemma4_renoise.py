@@ -233,6 +233,27 @@ class TestGemma4Renoise(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "GPU execution"):
             Gemma4Renoise.configure_server_args(SimpleNamespace(device="cpu"))
 
+        for quant in ("compressed-tensors", "fp8", "modelopt_fp4"):
+            quant_args = SimpleNamespace(
+                device="cuda",
+                _model_config=SimpleNamespace(hf_config=hf_config, quantization=quant),
+                model_path="diffusiongemma",
+                pp_size=1,
+                dcp_size=1,
+                attn_cp_size=1,
+                attention_backend="triton",
+                prefill_attention_backend=None,
+                decode_attention_backend=None,
+                disable_radix_cache=False,
+                cuda_graph_config=CudaGraphConfig(
+                    decode=PhaseConfig(backend=Backend.FULL),
+                    prefill=PhaseConfig(backend=Backend.DISABLED),
+                ),
+                chunked_prefill_size=128,
+            )
+            Gemma4Renoise.configure_server_args(quant_args)
+            self.assertTrue(resolving_view(quant_args).disable_radix_cache)
+
     def test_required_attention_backend_uses_generic_override_pass(self):
         view = SimpleNamespace(
             dllm_algorithm="Gemma4Renoise",

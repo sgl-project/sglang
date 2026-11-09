@@ -36,6 +36,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -59,6 +60,7 @@ from sglang.srt.models.gemma4_mm import (
     Gemma4MultimodalEmbedder,
 )
 from sglang.srt.models.gemma4_vision import Gemma4VisionEncoder
+from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import flatten_nested_list, is_sm100_supported
@@ -442,6 +444,18 @@ class DiffusionGemmaForBlockDiffusion(PreTrainedModel):
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
 
+    hf_to_sglang_mapper = WeightsMapper(
+        orig_to_new_prefix={
+            "model.decoder.": "model.",
+            "model.encoder.language_model.": "model.",
+            "model.encoder.vision_tower.": "vision_tower.",
+            "model.encoder.embed_vision.": "embed_vision.",
+        },
+        orig_to_new_substr={
+            ".experts.": ".moe.experts.",
+        },
+    )
+
     def __init__(
         self,
         config,
@@ -459,10 +473,6 @@ class DiffusionGemmaForBlockDiffusion(PreTrainedModel):
             and getattr(config.text_config, "tie_word_embeddings", False)
         ):
             raise NotImplementedError("DiffusionGemma requires tied word embeddings")
-        if quant_config is not None:
-            raise NotImplementedError(
-                "DiffusionGemma does not support quantized loading"
-            )
 
         self.config = config
         self.text_config = config.text_config
@@ -614,7 +624,22 @@ class DiffusionGemmaForBlockDiffusion(PreTrainedModel):
             ("moe.experts.w13_weight", "moe.experts.gate_up_proj", ("w1", "w3")),
             ("moe.experts.w2_weight", "moe.experts.down_proj", ("w2",)),
         ]
-        num_experts = self.text_config.num_experts
+        num_experts = getattr(self.text_config, "num_experts", None) or 0
+        # Per-expert checkpoint format used by compressed-tensors FP8
+        # (e.g. RedHatAI/diffusiongemma-26B-A4B-it-FP8-dynamic) and ModelOpt
+        # NVFP4 (e.g. nvidia/diffusiongemma-26B-A4B-it-NVFP4):
+        #   experts.<id>.{gate,up,down}_proj.{weight,weight_scale,
+        #                                     weight_scale_2,input_scale}
+        per_expert_params_mapping = (
+            FusedMoE.make_expert_params_mapping(
+                ckpt_gate_proj_name="gate_proj",
+                ckpt_down_proj_name="down_proj",
+                ckpt_up_proj_name="up_proj",
+                num_experts=num_experts,
+            )
+            if num_experts
+            else []
+        )
         # Full-attention layers have no v_proj in the checkpoint (value == key).
         k_eq_v_layers = {
             i
@@ -689,25 +714,32 @@ class DiffusionGemmaForBlockDiffusion(PreTrainedModel):
             )
 
             orig_name = name
-            # 1) Fused MoE experts (checked first: gate_up_proj contains "up_proj").
-            for param_name, weight_name, shard_ids in fused_expert_params_mapping:
-                name = orig_name
-                if weight_name not in name:
+            # 1) Per-expert MoE checkpoint layout (compressed-tensors FP8, ModelOpt NVFP4).
+            for (
+                param_name,
+                weight_name,
+                expert_id,
+                shard_id,
+            ) in per_expert_params_mapping:
+                if weight_name not in orig_name:
                     continue
-                name = name.replace(weight_name, param_name)
+                name = orig_name.replace(weight_name, param_name)
                 if name not in params_dict:
                     continue
                 param = params_dict[name]
-                weight_loader = param.weight_loader
-                for i in range(num_experts):
-                    chunks = loaded_weight[i].chunk(len(shard_ids), dim=0)
-                    for chunk, sid in zip(chunks, shard_ids):
-                        weight_loader(param, chunk, name, sid, i)
+                param.weight_loader(
+                    param,
+                    loaded_weight,
+                    name,
+                    shard_id=shard_id,
+                    expert_id=expert_id,
+                )
                 loaded_params.add(name)
                 break
             else:
-                # 2) Fused QKV / gate_up (+ k->v dup for full-attention layers).
-                for param_name, weight_name, shard_id in stacked_params_mapping:
+                # 2) BF16 fused MoE experts (checked before stacked_params_mapping:
+                #    gate_up_proj contains "up_proj").
+                for param_name, weight_name, shard_ids in fused_expert_params_mapping:
                     name = orig_name
                     if weight_name not in name:
                         continue
@@ -716,27 +748,63 @@ class DiffusionGemmaForBlockDiffusion(PreTrainedModel):
                         continue
                     param = params_dict[name]
                     weight_loader = param.weight_loader
-                    weight_loader(param, loaded_weight, shard_id)
-                    if should_dup_k_to_v and weight_name == "k_proj":
-                        weight_loader(param, loaded_weight, "v")
+                    for i in range(num_experts):
+                        chunks = loaded_weight[i].chunk(len(shard_ids), dim=0)
+                        for chunk, sid in zip(chunks, shard_ids):
+                            weight_loader(param, chunk, name, sid, i)
                     loaded_params.add(name)
                     break
                 else:
-                    # 3) Everything else (norms, scalars, router.proj/scale, embed).
-                    name = orig_name
-                    if name.endswith(".bias") and name not in params_dict:
-                        continue
-                    name = maybe_remap_kv_scale_name(name, params_dict)
-                    if name is None or name not in params_dict:
-                        continue
-                    param = params_dict[name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, loaded_weight)
-                    loaded_params.add(name)
+                    # 3) Fused QKV / gate_up (+ k->v dup for full-attention layers).
+                    for param_name, weight_name, shard_id in stacked_params_mapping:
+                        name = orig_name
+                        if weight_name not in name:
+                            continue
+                        name = name.replace(weight_name, param_name)
+                        if name not in params_dict:
+                            continue
+                        param = params_dict[name]
+                        weight_loader = param.weight_loader
+                        weight_loader(param, loaded_weight, shard_id)
+                        if should_dup_k_to_v and weight_name == "k_proj":
+                            weight_loader(param, loaded_weight, "v")
+                        loaded_params.add(name)
+                        break
+                    else:
+                        # 4) Everything else (norms, scalars, router.proj/scale, embed, kv_scale).
+                        name = orig_name
+                        if name.endswith(".bias") and name not in params_dict:
+                            continue
+                        name = maybe_remap_kv_scale_name(name, params_dict)
+                        if name is None or name not in params_dict:
+                            continue
+                        target_names = [name]
+                        if should_dup_k_to_v and name.endswith(".attn.k_scale"):
+                            v_scale_name = name.replace(
+                                ".attn.k_scale", ".attn.v_scale"
+                            )
+                            if v_scale_name in params_dict:
+                                target_names.append(v_scale_name)
+                        for tgt_name in list(target_names):
+                            if ".attn." in tgt_name:
+                                bidir_name = tgt_name.replace(".attn.", ".attn_bidir.")
+                                if bidir_name in params_dict:
+                                    target_names.append(bidir_name)
+                        for tgt_name in target_names:
+                            param = params_dict[tgt_name]
+                            weight_loader = getattr(
+                                param, "weight_loader", default_weight_loader
+                            )
+                            weight_loader(param, loaded_weight)
+                            loaded_params.add(tgt_name)
 
-        unloaded = dict(self.named_parameters()).keys() - loaded_params
+        unloaded = {
+            k
+            for k, v in self.named_parameters()
+            if k not in loaded_params
+            and not getattr(v, "_skip_weight_check", False)
+            and not k.endswith("_blockscale_swizzled")
+        }
         if unloaded:
             logger.warning(
                 "Some weights were not initialized from checkpoint: %s",
