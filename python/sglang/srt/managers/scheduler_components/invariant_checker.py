@@ -180,10 +180,16 @@ class SchedulerInvariantChecker:
     ) -> Tuple[bool, str]:
         """Check: available + evictable + protected + session_held + uncached == total."""
         total_accounted = available + evictable + protected + session_held + uncached
-        leak = total_accounted != total
+        residue = total_accounted - total
+        leak = residue != 0
+        diff_str = (
+            f", residue={residue:+d} ({'over-free' if residue < 0 else 'leak'})"
+            if leak
+            else ""
+        )
         msg = (
             f"[{pool_name}] {total=}, {available=}, {evictable=}, "
-            f"{protected=}, {session_held=}, {uncached=}"
+            f"{protected=}, {session_held=}, {uncached=}{diff_str}"
         )
         return leak, msg
 

@@ -456,6 +456,43 @@ class TestShardedFullPoolInvariant(CustomTestCase):
         self.assertTrue(leak, msg)
         self.assertIn("align", msg.lower())
 
+    def test_check_pool_invariant_residue_reporting(self):
+        # Balanced: no leak, no residue annotation
+        leak, msg = SchedulerInvariantChecker._check_pool_invariant(
+            "token_to_kv_pool",
+            available=8,
+            evictable=4,
+            protected=4,
+            session_held=0,
+            total=16,
+        )
+        self.assertFalse(leak)
+        self.assertNotIn("residue", msg)
+
+        # Over-free (negative residue)
+        leak, msg = SchedulerInvariantChecker._check_pool_invariant(
+            "token_to_kv_pool",
+            available=6,
+            evictable=4,
+            protected=4,
+            session_held=0,
+            total=16,
+        )
+        self.assertTrue(leak)
+        self.assertIn("residue=-2 (over-free)", msg)
+
+        # Leak (positive residue)
+        leak, msg = SchedulerInvariantChecker._check_pool_invariant(
+            "token_to_kv_pool",
+            available=10,
+            evictable=4,
+            protected=4,
+            session_held=0,
+            total=16,
+        )
+        self.assertTrue(leak)
+        self.assertIn("residue=+2 (leak)", msg)
+
 
 if __name__ == "__main__":
     unittest.main()

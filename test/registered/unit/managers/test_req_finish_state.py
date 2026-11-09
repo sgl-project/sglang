@@ -6,7 +6,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 from sglang.srt.managers import schedule_batch
-from sglang.srt.managers.req_types import FINISH_ABORT, FINISH_LENGTH
+from sglang.srt.managers.req_types import (
+    FINISH_ABORT,
+    FINISH_LENGTH,
+    FINISH_MATCHED_STR,
+)
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test import field_writes
@@ -24,6 +28,7 @@ _OWNER_SCOPES = {
     "Req.request_discard",
     "Req.clear_requested_finish",
     "Req.finish_outside_step",
+    "Req.finish_with_trim",
     # The step commit's finish checks.
     "Req.update_finish_state",
     "Req._check_token_based_finish",
@@ -93,6 +98,34 @@ class TestReqFinishMethods(CustomTestCase):
         self.assertEqual(list(req.origin_input_ids), [0])
         self.assertEqual(req.logprob_start_len, -1)
         self.assertEqual(req.routed_experts_start_len, 0)
+
+    def test_finish_with_trim(self):
+        req = Req("r", "", [1, 2, 3], SamplingParams(max_new_tokens=10))
+        req.output_ids = [10, 11, 12, 13, 14]
+        reason = FINISH_MATCHED_STR(matched="repetition")
+        req.finish_with_trim(2, reason=reason)
+        self.assertTrue(req.finished())
+        self.assertEqual(req.finished_len, 2)
+        self.assertIs(req.finished_reason, reason)
+        self.assertEqual(list(req.output_ids_through_stop), [10, 11])
+
+    def test_finish_with_trim_clamps_and_owned_kv_len(self):
+        req = Req("r", "", [1, 2, 3], SamplingParams(max_new_tokens=10))
+        req.output_ids = [10, 11, 12, 13, 14]
+        req.send_token_offset = 3
+        # Attempting to trim below already streamed tokens clamps to send_token_offset
+        req.finish_with_trim(1)
+        self.assertEqual(req.finished_len, 3)
+
+        # cache_protected_len protection in owned_kv_len
+        req2 = Req("r2", "", [1, 2, 3, 4], SamplingParams())
+        req2.output_ids = [10, 11, 12]
+        req2.kv.kv_committed_len = 7
+        req2.kv.cache_protected_len = 5  # prompt (4) + 1 output token protected
+        req2.finish_with_trim(0)
+        # finished_len clamps to min_prefix_tokens (5 - 4 = 1)
+        self.assertEqual(req2.finished_len, 1)
+        self.assertEqual(req2.owned_kv_len(), 5)
 
 
 if __name__ == "__main__":

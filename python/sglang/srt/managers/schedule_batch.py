@@ -581,7 +581,9 @@ class Req(ReqDllmMixin):
         # Check finish
         self.tokenizer = None
         self.finished_reason: Optional[BaseFinishReason] = None
-        # finished position (in output_ids), used when checking stop conditions with speculative decoding
+        # Finished position (in output_ids), used when checking stop conditions with speculative decoding.
+        # Contract: Set only inside update_finish_state or via finish_with_trim().
+        # Post-hoc manual mutation voids pool accounting.
         self.finished_len = None
         # Whether this request has finished output
         self.finished_output = None
@@ -966,16 +968,23 @@ class Req(ReqDllmMixin):
     def owned_kv_len(self) -> int:
         # Report only the prompt prefix so thinking + answer fall into the
         # overallocated range and are reclaimed by release_kv_cache. #22373.
-        if get_serving().strip_thinking_cache and self.reasoning_tokens > 0:
+        try:
+            strip_thinking = get_serving().strip_thinking_cache
+        except ValueError:
+            strip_thinking = False
+        if strip_thinking and self.reasoning_tokens > 0:
             return min(self.kv.kv_committed_len, len(self.origin_input_ids))
         if self.finished_len is None:
             return self.kv.kv_committed_len
         # A verify step commits a whole accepted chunk, so output_ids can run
         # past the stop; the client never sees those tokens, so nothing matches.
-        return min(
-            self.kv.kv_committed_len,
+        # Clamp to at least cache_protected_len so overallocated KV release
+        # does not reclaim pages belonging to the tree-protected prefix.
+        stop_len = max(
+            self.kv.cache_protected_len,
             len(self.origin_input_ids) + len(self.output_ids_through_stop),
         )
+        return min(self.kv.kv_committed_len, stop_len)
 
     def update_spec_correct_drafts_histogram(self, num_correct_drafts: int):
         """Record one step accepted draft count (excludes bonus token) into the histogram."""
@@ -1449,6 +1458,30 @@ class Req(ReqDllmMixin):
         or transferring (an abort, a PD handoff), or its result is decided
         elsewhere (a beam group, the dLLM context limit)."""
         self.finished_reason = reason
+
+    def finish_with_trim(
+        self,
+        finished_len: int,
+        reason: Optional[BaseFinishReason] = None,
+    ) -> None:
+        """Safely finish the request early with a trimmed output length.
+
+        Guarantees that finished_len does not shrink below already-streamed tokens
+        or cache_protected_len, and caps at max_new_tokens.
+        """
+        clamped_len = max(0, min(finished_len, len(self.output_ids)))
+        if self.send_token_offset > 0:
+            clamped_len = max(clamped_len, self.send_token_offset)
+        min_prefix_tokens = max(
+            0, self.kv.cache_protected_len - len(self.origin_input_ids)
+        )
+        clamped_len = max(clamped_len, min_prefix_tokens)
+
+        self.finished_len = clamped_len
+        self.finished_reason = (
+            reason if reason is not None else FINISH_MATCHED_STR(matched="trim")
+        )
+        self._cap_finished_len_at_max_new_tokens()
 
     def update_finish_state(self, new_accepted_len: int = 1):
         if self.finished():
