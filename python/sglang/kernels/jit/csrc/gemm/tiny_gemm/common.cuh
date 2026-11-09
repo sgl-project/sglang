@@ -23,20 +23,6 @@ struct TinyGEMMParams {
   uint32_t num_tokens;
 };
 
-namespace device::tiny_gemm {
-
-// nvcc deficiency: after inline asm (the PDL wait) a generic pointer loses its address space and 32-byte
-// loads split into generic LD.E.128s. Call this on the pointer right before the load, after the asm.
-template <typename T>
-SGL_DEVICE const T* assume_global(const T* ptr) {
-#ifndef USE_ROCM
-  __builtin_assume(__isGlobal(ptr));
-#endif
-  return ptr;
-}
-
-}  // namespace device::tiny_gemm
-
 namespace host::tiny_gemm {
 
 // Checks x [M, K] (row-strided), w [N, K] and out [M, N]; x rows are loaded as whole `x_align`-byte vectors.
