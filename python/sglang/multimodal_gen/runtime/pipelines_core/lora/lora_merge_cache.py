@@ -37,6 +37,7 @@ _DISK_HEADROOM = 1.15
 def lora_merge_cache_key(
     base_paths: list[str],
     adapters: list[tuple[str, float, float | None]],
+    fingerprints: list[tuple[int, int] | None] | None = None,
 ) -> str:
     """Key of one merged-weights combination.
 
@@ -44,15 +45,22 @@ def lora_merge_cache_key(
     the revision hash); `adapters` are ordered (lora_path, strength, alpha)
     triples — order matters, merges compose in order. Include adapter file
     modification times so same-size local checkpoint updates invalidate the cache.
+    `fingerprints` are optional (size, mtime_ns) snapshots taken when each adapter
+    was loaded; they replace the merge-time stat so a file replaced after loading
+    cannot be cached under the replacement's identity.
     """
     parts = [os.path.realpath(p) for p in sorted(base_paths)]
-    for path, strength, alpha in adapters:
+    for i, (path, strength, alpha) in enumerate(adapters):
         real = os.path.realpath(path)
-        try:
-            stat = os.stat(real)
-            size, mtime_ns = stat.st_size, stat.st_mtime_ns
-        except OSError:
-            size, mtime_ns = -1, -1
+        snapshot = fingerprints[i] if fingerprints else None
+        if snapshot is not None:
+            size, mtime_ns = snapshot
+        else:
+            try:
+                stat = os.stat(real)
+                size, mtime_ns = stat.st_size, stat.st_mtime_ns
+            except OSError:
+                size, mtime_ns = -1, -1
         parts.append(f"{real}|{size}|{mtime_ns}|{strength}|{alpha}")
     return hashlib.sha1("||".join(parts).encode()).hexdigest()[:16]
 
@@ -84,6 +92,11 @@ class LoraMergeCache:
         for meta in entries.values():
             if not os.path.exists(os.path.join(self.root, meta.get("file", ""))):
                 return False
+        try:
+            os.utime(self.root)  # most recently used: evicted last
+        except OSError:
+            # Evicted by another instance after the file checks: a cache miss.
+            return False
         self._entries = entries
         return True
 
@@ -100,7 +113,12 @@ class LoraMergeCache:
         meta = self._entries.get(name)
         if meta is None:
             return None
-        mapped = safetensors_load_file(os.path.join(self.root, meta["file"]))
+        try:
+            mapped = safetensors_load_file(os.path.join(self.root, meta["file"]))
+        except FileNotFoundError:
+            # Another instance evicted this store after is_complete().
+            self._entries = {}
+            return None
         tensor = mapped.get("weight")
         if (
             tensor is None
@@ -118,13 +136,29 @@ class LoraMergeCache:
 
     # -- capture (first run) --------------------------------------------------
 
+    def _evict_for(self, need: float) -> None:
+        """Drop the least recently used other stores until `need` bytes are free."""
+        parent = os.path.dirname(self.root)
+        others = [
+            e.path for e in os.scandir(parent) if e.is_dir() and e.path != self.root
+        ]
+        for stale in sorted(others, key=os.path.getmtime):
+            if shutil.disk_usage(parent).free >= need:
+                break
+            shutil.rmtree(stale, ignore_errors=True)
+            logger.info("Evicted old LoRA merge cache %s", stale)
+
     def _ensure_writable(self) -> bool:
         if self._writable is not None:
             return self._writable
         try:
             os.makedirs(self.root, exist_ok=True)
+            need = self.expected_bytes * _DISK_HEADROOM
             usage = shutil.disk_usage(self.root)
-            if usage.free < self.expected_bytes * _DISK_HEADROOM:
+            if usage.free < need:
+                self._evict_for(need)
+                usage = shutil.disk_usage(self.root)
+            if usage.free < need:
                 logger.warning(
                     "LoRA merge cache needs %.1f GiB free under %s but only "
                     "%.1f GiB is available; merged weights stay in anonymous "
@@ -154,8 +188,8 @@ class LoraMergeCache:
             return None
         fname = hashlib.sha1(name.encode()).hexdigest()[:16] + ".safetensors"
         path = os.path.join(self.root, fname)
+        tmp = f"{path}.tmp.{os.getpid()}"
         try:
-            tmp = f"{path}.tmp.{os.getpid()}"
             safetensors_save_file({"weight": merged.contiguous()}, tmp)
             os.replace(tmp, path)
             mapped = safetensors_load_file(path)["weight"]
@@ -167,8 +201,8 @@ class LoraMergeCache:
                 exc,
             )
             try:
-                if os.path.exists(path):
-                    os.remove(path)
+                if os.path.exists(tmp):
+                    os.remove(tmp)
             except OSError:
                 pass
             return None
