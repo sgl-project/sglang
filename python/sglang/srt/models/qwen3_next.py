@@ -7,9 +7,9 @@ import torch
 import triton
 from torch import nn
 
-from sglang.kernels.ops.attention import gdn_fused_decode_aiter
 from sglang.kernels.ops.attention.fla.fused_norm_gate import FusedRMSNormGated
 from sglang.kernels.ops.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
+from sglang.kernels.ops.attention.linear import gdn_fused_decode_aiter
 from sglang.kernels.ops.attention.qk_gemma_norm_rope import qk_gemma_norm_rope
 from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
     fused_qkvzba_split_reshape_cat,

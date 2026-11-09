@@ -18,7 +18,7 @@ from unittest import mock
 
 import torch
 
-from sglang.kernels.ops.attention import gdn_fused_decode_aiter as adapter
+from sglang.kernels.ops.attention.linear import gdn_fused_decode_aiter as adapter
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 

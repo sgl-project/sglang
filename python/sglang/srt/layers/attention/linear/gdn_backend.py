@@ -3,7 +3,7 @@ from typing import Optional, Tuple, Union
 import msgspec
 import torch
 
-from sglang.kernels.ops.attention import gdn_fused_decode_aiter
+from sglang.kernels.ops.attention.linear import gdn_fused_decode_aiter
 from sglang.kernels.ops.attention.linear.fused_gdn_gating import fused_gdn_gating
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     CAUSAL_CONV1D_FWD_BLOCK_M,
