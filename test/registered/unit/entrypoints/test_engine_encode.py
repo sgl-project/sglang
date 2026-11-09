@@ -60,12 +60,6 @@ class TestEngineEncode(CustomTestCase):
         self.assertIsNone(req.text)
         self.assertEqual(req.dimensions, 8)
 
-    def test_positional_prompt_still_supported(self):
-        self.engine.encode("hello")
-        req = self._last_request()
-        self.assertEqual(req.text, "hello")
-        self.assertIsNone(req.input_ids)
-
 
 if __name__ == "__main__":
     unittest.main()

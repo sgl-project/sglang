@@ -51,9 +51,7 @@ def _rank_scope(attn_tp_rank):
 
 class TestScheduleDecisionLog(CustomTestCase):
     def test_blocked_queue_logs_each_state_once(self):
-        """A queue blocked without batch_is_full retries every iteration; only
-        a change in the pass's counters, or an admitting pass in between,
-        should produce another empty-pass line."""
+        """A blocked queue retries every iteration, so each counter state logs once."""
         free_tokens = [100]
         s = _scheduler(free_tokens)
         with _rank_scope(0), self.assertLogs(LOGGER, level="INFO") as logs:

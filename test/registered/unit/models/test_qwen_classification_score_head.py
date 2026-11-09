@@ -29,12 +29,8 @@ class TestQwenClassificationScoreHead(CustomTestCase):
     def test_score_head_has_no_bias(self):
         for case in _CASES:
             with self.subTest(cls=case[1]):
-                self.assertIsNone(_build(*case).score.bias)
-
-    def test_checkpoint_score_bias_is_rejected(self):
-        for case in _CASES:
-            with self.subTest(cls=case[1]):
                 model = _build(*case)
+                self.assertIsNone(model.score.bias)
                 with self.assertRaisesRegex(ValueError, "score.bias"):
                     model.load_weights([("score.bias", torch.zeros(2))])
 

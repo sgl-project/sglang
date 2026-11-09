@@ -270,14 +270,7 @@ class TestScoreAndPool(CustomTestCase):
 
 
 class TestDisableNormalizeEmbedding(CustomTestCase):
-    """--disable-normalize-embedding turns off the Pooler's L2 normalization.
-
-    ``Pooler.__init__`` reads the resolved flag from the ``model`` config bag,
-    so these tests publish a context via ``override_server_args`` rather than
-    faking the accessor. Construction against an *unpublished* context stays
-    supported and keeps normalization — see
-    ``test_unpublished_context_keeps_normalization``.
-    """
+    """Pooler reads the flag from a published config, so these tests publish one."""
 
     def setUp(self):
         torch.manual_seed(42)
@@ -319,13 +312,7 @@ class TestDisableNormalizeEmbedding(CustomTestCase):
             )
 
     def test_unpublished_context_keeps_normalization(self):
-        """Pooler stays constructible without a published server context.
-
-        Config bags fail closed before ``publish``, so reading the flag
-        unconditionally would make ``Pooler(normalize=True)`` raise in any
-        standalone/offline construction path. With no published model
-        namespace there is no override to honor, so normalization is kept.
-        """
+        """Config bags fail closed before publish, so offline Poolers skip the flag."""
         self.addCleanup(reset_context)
         reset_context()
         pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)

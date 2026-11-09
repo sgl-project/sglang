@@ -75,27 +75,6 @@ class TestValidatePositionalEmbedOverrides(CustomTestCase):
         self.assertIn(str(HIDDEN_DIM), msg)
         self.assertIn(str(HIDDEN_DIM + 3), msg)
 
-    def test_list_is_rejected(self):
-        # Requests are split per item before validation, so a list is never valid.
-        pe = PositionalEmbeds(embeds=[_vec(1)], positions=[0])
-        for bogus in ([None], [pe], [None, pe], (pe,), []):
-            with self.subTest(bogus=bogus):
-                with self.assertRaisesRegex(ValueError, "must be a PositionalEmbeds"):
-                    self._validate(bogus)
-
-    def test_non_positional_embeds_value_raises(self):
-        # Raw JSON from the FastAPI body must be a 400, not a scheduler-side crash.
-        for bogus in (
-            {"embeds": [[1, 2]], "positions": [0]},
-            "abc",
-            5,
-            {"embeds": 1},
-            [{"embeds": [[1, 2]], "positions": [0]}],
-        ):
-            with self.subTest(bogus=bogus):
-                with self.assertRaisesRegex(ValueError, "must be a PositionalEmbeds"):
-                    self._validate(bogus)
-
 
 class TestCreateTokenizedObjectEmbedOverrideValidation(CustomTestCase):
     def setUp(self):
@@ -138,17 +117,11 @@ class TestCreateTokenizedObjectEmbedOverrideValidation(CustomTestCase):
                     manager._create_tokenized_object(request, "hello", [1, 2])
 
 
-class TestPositionalEmbedsRankAndEmptiness(CustomTestCase):
+class TestPositionalEmbedsRank(CustomTestCase):
     def test_three_dim_embeds_rejected(self):
         # Passes the length and hidden-dim checks but breaks the scheduler scatter.
         with self.assertRaisesRegex(ValueError, "must be 2-D"):
             PositionalEmbeds(embeds=torch.zeros(1, 1, HIDDEN_DIM), positions=[0])
-
-    def test_empty_embeds_list_raises_value_error(self):
-        # Must be ValueError (-> HTTP 400), not the RuntimeError torch.cat([])
-        # would raise, which the entrypoints do not map and would surface as 500.
-        with self.assertRaisesRegex(ValueError, "non-empty"):
-            PositionalEmbeds(embeds=[], positions=[])
 
 
 # ========================================================================

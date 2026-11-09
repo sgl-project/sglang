@@ -138,7 +138,7 @@ class Qwen3ForSequenceClassification(Qwen3ForPooledOutput):
         prefix: str = "",
     ) -> None:
         super().__init__(config, quant_config, prefix)
-        # Matches HF GenericForSequenceClassification; no checkpoint ships a bias.
+        # Matches HF GenericForSequenceClassification, whose score head has no bias.
         self.score = nn.Linear(config.hidden_size, config.num_labels, bias=False)
         # Use normalize=True for qwen3 embedding based on official implementation
         # Reference: https://github.com/QwenLM/Qwen3-Embedding/blob/main/examples/qwen3_embedding_transformers.py#L55

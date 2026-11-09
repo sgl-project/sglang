@@ -921,8 +921,7 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         )
 
     def test_generate_rids_stay_unpadded(self):
-        # Clients and the Rust server rebuild `<rid>_<i>`; padding is only for
-        # score/embedding batches.
+        # Clients and the Rust server rebuild unpadded `<rid>_<i>` for generate.
         req = GenerateReqInput(text="x", rid="base", sampling_params={"n": 12})
         req.normalize_batch_and_arguments()
         self.assertEqual(req.rid[0], "base_0")

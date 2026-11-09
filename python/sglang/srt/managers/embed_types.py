@@ -60,10 +60,8 @@ class PositionalEmbeds(msgspec.Struct, array_like=True):
                 # [1, hidden_dim] (already has the leading dim) → plain concat.
                 self.embeds = torch.cat(self.embeds, dim=0)
         if isinstance(self.embeds, torch.Tensor):
-            # Enforce rank here: validate_positional_embed_overrides only inspects
-            # the last dim, so a [N, 1, hidden_dim] input would satisfy both the
-            # length check below and the hidden-dim check, then fail deep inside the
-            # scheduler's scatter and abort every co-batched request.
+            # validate_positional_embed_overrides reads only the last dim,
+            # and a [N, 1, hidden_dim] input would abort its whole scheduler batch.
             if self.embeds.dim() != 2:
                 raise ValueError(
                     f"positional_embed_overrides embeds must be 2-D [N, hidden_dim], "
@@ -90,12 +88,8 @@ class PositionalEmbeds(msgspec.Struct, array_like=True):
             self.embeds = self.embeds.reconstruct_on_target_device(target_device)
 
 
+# Raising here returns HTTP 400, where a bad value would abort its scheduler batch.
 def validate_positional_embed_overrides(value: object, *, hidden_size: int) -> None:
-    """Reject a malformed ``positional_embed_overrides`` at request ingestion.
-
-    A bad value would otherwise fail msgpack decode or the embed scatter inside the
-    scheduler and abort every co-batched request; raising here surfaces as HTTP 400.
-    """
     if not isinstance(value, PositionalEmbeds):
         raise ValueError(
             "positional_embed_overrides must be a PositionalEmbeds, got "

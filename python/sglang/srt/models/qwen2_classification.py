@@ -43,7 +43,7 @@ class Qwen2ForSequenceClassification(nn.Module):
         self.model = Qwen2Model(
             config, quant_config=quant_config, prefix=add_prefix("model", prefix)
         )
-        # Matches HF GenericForSequenceClassification; no checkpoint ships a bias.
+        # Matches HF GenericForSequenceClassification, whose score head has no bias.
         self.score = nn.Linear(config.hidden_size, config.num_labels, bias=False)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=False)
 

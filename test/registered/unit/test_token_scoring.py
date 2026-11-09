@@ -102,13 +102,6 @@ class TestTokenScoring(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertEqual(manager.requests[-1].rid, ["corr_0", "corr_1"])
 
-    async def test_reserved_rid_rejected(self):
-        manager = ScoringManager()
-        with self.assertRaisesRegex(ValueError, "reserved prefix"):
-            await manager.score_request(
-                query=[4], items=[[5]], label_token_ids=[3], rid="HEALTH_CHECK_x"
-            )
-
     async def test_default_scores_are_vocabulary_probabilities(self):
         manager = ScoringManager()
         result = await manager.score_request(

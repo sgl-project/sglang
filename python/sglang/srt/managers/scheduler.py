@@ -515,8 +515,6 @@ class Scheduler(
     # Unlimited-OCR collaborators; None for every other model.
     uocr_runtime: Optional[UocrSchedulerRuntime] = None
     resolve_forward_inputs = staticmethod(resolve_forward_inputs)
-    # Allocate per instance only when a consumer first defers a response.
-    _deferred_responses: Optional[Dict[str, Tuple[Req, ResponseCompletion]]] = None
     # Class-level defaults so stub schedulers built via __new__ skip the log.
     log_schedule_decisions: bool = False
     _last_empty_schedule_decision: Optional[Tuple[int, ...]] = None

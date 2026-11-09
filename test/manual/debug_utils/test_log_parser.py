@@ -7,9 +7,7 @@ from sglang.test.test_utils import CustomTestCase
 
 class TestLogParser(CustomTestCase):
     def test_log_parser(self):
-        # The last line covers the full scheduler prefix: the ranks in the order
-        # configure_scheduler_process emits them (DP PP ATTN_CP MOE_DP TP EP)
-        # followed by the PID suffix.
+        # The last line uses the rank order configure_scheduler_process emits, then PID.
         lines = """
 (SGLangEngine pid=35555) [2025-10-31 03:45:20 TP0] Decode batch [51341], #running-req: 317, #token: 1094261, token usage: 0.67, cuda graph: True, gen throughput (token/s): 14806.57, #queue-req: 0,
 (SGLangEngine pid=111711, ip=10.15.36.1) [2025-10-31 03:45:20 TP0] Decode batch [39913], #running-req: 78, #token: 432100, token usage: 0.27, cuda graph: True, gen throughput (token/s): 7269.16, #queue-req: 0,
