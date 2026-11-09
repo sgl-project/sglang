@@ -238,7 +238,10 @@ def checkpoint_kv_cache(req: Req, tree_cache: BasePrefixCache) -> None:
     assert not req.finished(), f"checkpointing finished request {req.rid}"
     if not req.skip_radix_cache_insert:
         tree_cache.checkpoint(req, up_to=req.extend_end)
-        if req.multimodal_inputs is not None:
+        if (
+            envs.SGLANG_ENABLE_MM_RELEASE_AT_CONSUMPTION.get()
+            and req.multimodal_inputs is not None
+        ):
             from sglang.srt.managers.mm_utils import (
                 release_inserted_mm_features,
                 should_release_mm_features,
