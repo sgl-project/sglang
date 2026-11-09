@@ -36,9 +36,12 @@ class _Stream:
 class _Event:
     def __init__(self):
         self.stream = None
+        self.after = None
 
     def record(self, stream=None):
         self.stream = stream
+        # What the stream had waited when the event was recorded.
+        self.after = list(stream.waited)
 
 
 class _Device:
@@ -111,7 +114,7 @@ class TestSkippedOutputRetirement(CustomTestCase):
         _, result, completion = stage._pp_make_skip_output_result(_batch(), meta)
         self.assertIs(result.unified_forward_done, unified_forward_done)
         self.assertIsNot(completion.stream, stage.device_module.current)
-        self.assertEqual(completion.stream.waited, [forward_done])
+        self.assertEqual(completion.after, [forward_done])
         # The scheduler's own stream takes no dependency on the forward.
         self.assertEqual(stage.device_module.current.waited, [])
         # One side stream serves every skipped output.
@@ -161,7 +164,7 @@ class TestReceivedOutputRetirement(CustomTestCase):
                 0, 0, [target], [meta], deque(), None
             )
         self.assertIs(completion.stream, copy_stream)
-        self.assertEqual(copy_stream.waited, [forward_done])
+        self.assertEqual(completion.after, [forward_done])
         self.assertEqual(stage.device_module.current.waited, [])
 
 
