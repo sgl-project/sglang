@@ -76,6 +76,10 @@ class TestGatherReusedBlockLocs(CustomTestCase):
         got, want = self._gather([5, 0, 3], [0, 12, 4], 4)
         self.assertTrue(torch.equal(got, want))
         self.assertEqual([row[0] for row in got.tolist()], [5000, 12, 3004])
+        # torch.equal no longer compares dtype, so pin the out_dtype cast
+        # explicitly: in an all-reuse batch fresh_slots is None and
+        # out_cache_loc's dtype comes solely from this cast (the pool is int32).
+        self.assertEqual(got.dtype, torch.int64)
 
     def test_block_touching_the_row_end_does_not_bleed_into_the_next_row(self):
         # A block ending exactly at WIDTH is the case a flat index gets wrong
