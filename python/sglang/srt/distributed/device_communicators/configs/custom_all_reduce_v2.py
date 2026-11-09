@@ -353,7 +353,18 @@ def _rocm_gfx1250_configs(num_sm: int) -> dict[int, AllReduceConfig]:
         num_pull_blocks=32,
         num_mc_blocks=None,
     )
-    return {world_size: default for world_size in range(2, 9)}
+    configs = {world_size: default for world_size in range(2, 9)}
+    # 16 ranks span two DPX hosts in one UALink fabric clique. Tuned there with
+    # and without a late rank: across hosts 2shot_push pays two fabric hops, so
+    # 1shot_push wins to 256 KB, and a block per CU keeps 2shot_push ahead of
+    # RCCL to 64 MB.
+    tp16 = heuristic._replace(
+        one_shot_push_threshold=256 * KB, two_shot_push_threshold=64 * MB
+    )
+    configs[16] = default._replace(
+        graph=tp16, eager=tp16, num_push_blocks=min(num_sm, 96)
+    )
+    return configs
 
 
 @cache

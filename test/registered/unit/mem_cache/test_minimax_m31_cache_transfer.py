@@ -32,8 +32,8 @@ from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.minimax_m3_nvfp4_pool import MiniMaxM3Nvfp4KVPool
 from sglang.srt.mem_cache.pool_host import base
 from sglang.srt.mem_cache.pool_host.base import (
-    host_memory_budget_bytes,
     host_memory_budget_scope,
+    host_memory_preflight,
 )
 from sglang.srt.mem_cache.pool_host.common import ALLOC_MEMORY_FUNCS
 from sglang.srt.mem_cache.pool_host.minimax_m3_nvfp4 import (
@@ -488,8 +488,8 @@ def test_unsupported_stack_fails_before_allocating_host_memory(case):
         patch.object(assembler, "get_memory", return_value=memory),
         patch(_MAIN_HOST) as allocate,
         patch(
-            "sglang.srt.mem_cache.pool_host.base.host_memory_budget_bytes",
-            return_value=1 if case == "budget" else 10**9,
+            "sglang.srt.mem_cache.pool_host.base.host_memory_preflight",
+            return_value=(2, 1) if case == "budget" else (0, 10**9),
         ),
     ):
         with pytest.raises((ValueError, NotImplementedError)):
@@ -596,7 +596,7 @@ def test_dspark_hicache_shares_capacity_and_total_budget(
                 sum(entry.host_pool.kv_buffer.nbytes for entry in group.entries)
                 == budget
             )
-            assert host_memory_budget_bytes() == 0
+            assert host_memory_preflight().available_bytes == 0
             draft_entry = group.get_entry(PoolName.DRAFT)
             layers = [draft_entry.layer_mapper(i) for i in range(6)]
             assert layers == [0, 1, 2, 3, 4, None]
@@ -699,7 +699,10 @@ def test_dspark_default_hicache_auto_size_fits_all_pools(cpu_host_allocation):
             )
             assert {entry.host_pool.size for entry in group.entries} == {384}
             assert actual_bytes <= 0.8 * rank_budget
-            assert host_memory_budget_bytes() == int(0.8 * rank_budget) - actual_bytes
+            assert (
+                host_memory_preflight().available_bytes
+                == int(0.8 * rank_budget) - actual_bytes
+            )
         finally:
             for entry in group.entries:
                 entry.host_pool.destroy()
