@@ -204,6 +204,35 @@ class TestCudaIpcTransport(CustomTestCase):
         finally:
             pool.shutdown()
 
+    def test_failed_ready_write_keeps_inflight_copy_reserved(self):
+        """A failed publication must not reuse bytes an enqueued copy still writes."""
+        pool = MmItemMemoryPool(1 << 20, 0.01, 0, 1, max_inflight_slices=1)
+        source = torch.full((64 << 10,), 73, dtype=torch.uint8, device="cuda")
+        torch.cuda.synchronize()
+        stream = torch.cuda.Stream()
+        try:
+            with torch.cuda.stream(stream):
+                # finite work makes an outstanding copy observable without a wait cycle
+                torch.cuda._sleep(500_000_000)
+                with (
+                    patch(
+                        "sglang.srt.multimodal.transport.memory_pool.stream_write_value32",
+                        side_effect=RuntimeError("producer-ready write failed"),
+                    ),
+                    self.assertRaisesRegex(RuntimeError, "producer-ready write failed"),
+                ):
+                    pool.wrap_tensor(source, use_pool_handle_cache=True)
+            self.assertTrue(
+                stream.query() or pool.active_lease_count == 1,
+                "failed publication released a slice before its copy completed",
+            )
+            stream.synchronize()
+            self.assertEqual(pool.active_lease_count, 0)
+            self.assertEqual(pool._pool._copy_sources, {})
+        finally:
+            stream.synchronize()
+            pool.shutdown()
+
     def test_guarded_batch_never_spills_and_recovers_after_ack(self):
         pool = MmItemMemoryPool(1 << 20, 0.01, 0, 1)
         publisher = BoundedFeaturePublisher(pool, 0, cpu_tensors=False)
