@@ -53,6 +53,8 @@ def _tile_shape(m: int, n: int, num_sms: int) -> tuple[int, int]:
 def quack_swiglu_gemm_supported(x: torch.Tensor, weight: torch.Tensor) -> bool:
     return (
         x.dim() == 2
+        # 0 rows kill the process in quack's launcher (SIGFPE, quack-kernels 0.6.5).
+        and x.shape[0] > 0
         and x.dtype == torch.bfloat16
         and weight.dtype == torch.bfloat16
         and x.is_contiguous()

@@ -116,6 +116,14 @@ class TestQuackSwigluGemm(CustomTestCase):
         expected, _ = mlp.down_proj(mlp.act_fn(base(x)[0] + 1.0))
         torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
+    def test_empty_batch_keeps_unfused_path(self):
+        """An empty batch must not reach the fused GEMM: quack's launcher kills
+        the process (SIGFPE) on 0 rows."""
+        mlp = self._mlp()
+        _, out, fused = self._run(mlp, 0)
+        self.assertFalse(fused)
+        self.assertEqual(out.shape, (0, HIDDEN))
+
     def test_mlp_takes_fused_path(self):
         """With the flag on, decode-sized and prefill-sized batches both take
         the fused GEMM and match the fp32 MLP."""
