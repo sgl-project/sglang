@@ -1123,9 +1123,13 @@ class Envs:
     # ROCm/AITER path. Requires GPU_MAX_HW_QUEUES>=5 to avoid HW-queue serialization.
     SGLANG_ROCM_USE_MULTI_STREAM = EnvBool(False)
     # With the Kimi-K3 radix-4 router on (SGLANG_K3_RADIX4_TOPK), also emit
-    # AITER's BM=16 MoE sort from its launch for decode-sized M (needs
+    # AITER's BM=16 MoE sort from its launch, up to the size cap below (needs
     # ROCm/aiter#6484).
     SGLANG_OPT_HIP_K3_RADIX4_FUSE_SORT = EnvBool(True)
+    # AITER takes the sort only where its tuned kernel for M uses BM=16: up to
+    # 512 tokens in its Kimi-K3 A8W4 table. Its A4W4 table picks BM=32 for 65-256
+    # tokens, where the sort is computed and dropped; set 64 there.
+    SGLANG_OPT_HIP_K3_RADIX4_FUSE_SORT_MAX_TOKENS = EnvInt(512)
     SGLANG_ROCM_SMALLM_MOE = EnvBool(True)
     SGLANG_ROCM_SMALLM_FP8_BS = EnvBool(True)
     # Quark MXFP4 dense linear on gfx95: use AITER's preshuffled ASM/CK FP4 GEMM

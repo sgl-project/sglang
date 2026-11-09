@@ -45,6 +45,7 @@
 #include <tvm/ffi/container/tensor.h>
 
 #include "route_radix4_sort.cuh"  // BM=16 sort scratch; hashed via this TU
+#include <algorithm>
 #include <cstdint>
 
 namespace sglang {
@@ -54,6 +55,16 @@ inline constexpr uint32_t kRadix4TopK = 16;
 inline constexpr uint32_t kRadix4Block = 256;
 inline constexpr uint32_t kRadix4Wave = 64;
 inline constexpr uint32_t kRadix4SortBlockM = 16;
+// Up to this many tokens the last CTA to arrive sorts every route (four per
+// thread at most); past it the last ceil(M / kRadix4TailChunk) CTAs share the
+// sort, a token chunk each. They wait for each other, so their number stays far
+// below what any GPU partition holds at once: past 512 tokens the chunks grow.
+inline constexpr uint32_t kRadix4LeaderSortMaxTokens = 64;
+inline constexpr uint32_t kRadix4TailChunk = 16;
+inline constexpr uint32_t kRadix4MaxTailCtas = 32;
+inline constexpr int kRadix4SortNone = 0;
+inline constexpr int kRadix4SortLeader = 1;
+inline constexpr int kRadix4SortTail = 2;
 
 /// log2(e): aiter computes exp(-x) as exp2f(-kAiterSigmoidLog2E * x) rather than
 /// expf(-x). Matched bit for bit with topk_softmax_kernels_group.cu's C_LOG2E.
@@ -68,8 +79,11 @@ struct RouteRadix4Params {
   uint32_t stride_out;
   fp32_t routed_scaling_factor;
   bool renormalize;
-  // Fused BM=16 sort (null when the kernel is route-only).
-  int32_t* __restrict__ arrival = nullptr;
+  // Fused BM=16 sort (null when the kernel is route-only). sort_ws is
+  // [leader arrival, tail parity, tail arrival 0, tail arrival 1], zeroed once.
+  int32_t* __restrict__ sort_ws = nullptr;
+  // The tail sort (kRadix4SortTail) is shared by the last tail_ctas CTAs.
+  int32_t tail_ctas = 0;
   int32_t* __restrict__ sorted_token_ids = nullptr;
   int32_t* __restrict__ sorted_expert_ids = nullptr;
   fp32_t* __restrict__ sorted_weights = nullptr;
@@ -212,8 +226,10 @@ SGL_DEVICE void stage_wave_sum(float v, int lane, int wid, float* out) {
 
 }  // namespace radix4
 
-template <typename T, int EXPERTS, int TOPK, int BLOCK, bool kFuseSort = false>
+template <typename T, int EXPERTS, int TOPK, int BLOCK, int kSort = kRadix4SortNone>
 __global__ __launch_bounds__(BLOCK) void route_radix4_kernel(__grid_constant__ const RouteRadix4Params params) {
+  constexpr bool kFuseSort = kSort != kRadix4SortNone;
+  constexpr bool kTailSort = kSort == kRadix4SortTail;
   constexpr int WAVE = static_cast<int>(kRadix4Wave);
   constexpr int NWAVE = BLOCK / WAVE;
   constexpr int VPT = (EXPERTS + BLOCK - 1) / BLOCK;
@@ -278,13 +294,20 @@ __global__ __launch_bounds__(BLOCK) void route_radix4_kernel(__grid_constant__ c
   __shared__ int sort_count[kFuseSort ? EXPERTS : 1];
   __shared__ int sort_cumsum[kFuseSort ? (EXPERTS + 1) : 1];
   __shared__ int s_leader;
+  __shared__ int s_ticket;
+  __shared__ int sort_before[kTailSort ? EXPERTS : 1];
+  __shared__ uint32_t sort_mask[kTailSort ? EXPERTS : 1];
 
+  // No CTA of a launch knows when every tail CTA has seen the final arrival
+  // count, so none can reset it. Two counters alternate instead: each launch
+  // clears the one the launch before used, and the last arrival flips the parity.
+  int32_t* tail_arrival = nullptr;
   if constexpr (kFuseSort) {
     // Routing-independent, so issued first to drain during the radix search;
     // pads stay in wave 0, the only wave that releases at the arrival barrier.
     radix4_sort::reset_counts<EXPERTS, BLOCK>(sort_count);
     if (wid == 0)
-      radix4_sort::pad_sorted_slice<static_cast<int>(kRadix4Wave)>(
+      radix4_sort::pad_sorted_slice<static_cast<int>(kRadix4Wave), kTailSort>(
           params.sorted_token_ids,
           params.m_indices,
           params.sorted_weights,
@@ -292,6 +315,15 @@ __global__ __launch_bounds__(BLOCK) void route_radix4_kernel(__grid_constant__ c
           static_cast<int>(gridDim.x),
           token,
           static_cast<int>(gridDim.x));
+    if constexpr (kTailSort) {
+      const int parity = __hip_atomic_load(&params.sort_ws[1], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) & 1;
+      tail_arrival = &params.sort_ws[2 + parity];
+      if (token == 0 && tid == 0) params.sort_ws[2 + (parity ^ 1)] = 0;
+      for (int e = tid; e < EXPERTS; e += BLOCK) {
+        sort_before[e] = 0;
+        sort_mask[e] = 0u;
+      }
+    }
   }
 
   or_all = radix4::wave_bitor_dpp(or_all);
@@ -507,11 +539,63 @@ __global__ __launch_bounds__(BLOCK) void route_radix4_kernel(__grid_constant__ c
     }
     const size_t o = static_cast<size_t>(token) * params.stride_out + rank;
     const bool padded = params.num_non_padded != nullptr && token >= *params.num_non_padded;
-    params.out_w[o] = padded ? 0.0f : s_w[tid] * scale;
-    params.out_i[o] = padded ? 0 : id;
+    const float w = padded ? 0.0f : s_w[tid] * scale;
+    const int out_id = padded ? 0 : id;
+    if constexpr (kTailSort) {
+      // Tail CTAs on other XCDs read the row back: write it through, so that
+      // retiring the stores releases it without an L2 write-back.
+      __hip_atomic_store(&params.out_w[o], w, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+      __hip_atomic_store(&params.out_i[o], out_id, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    } else {
+      params.out_w[o] = w;
+      params.out_i[o] = out_id;
+    }
   }
 
-  if constexpr (kFuseSort) {
+  if constexpr (kTailSort) {
+    const int M = static_cast<int>(gridDim.x);
+    const int first_helper = M - params.tail_ctas;
+    // Every store another CTA reads (route row, pad slice) is wave 0's and
+    // written through, so retiring them is the release.
+    if (wid == 0) __builtin_amdgcn_s_waitcnt(0x0f70);  // vmcnt(0)
+    __syncthreads();
+    if (tid == 0) {
+      const int ticket = atomicAdd(tail_arrival, 1);
+      // Only the last tail_ctas arrivals wait, and only for CTAs that have already
+      // taken a ticket, so waiting cannot keep any CTA of the grid from running.
+      if (ticket >= first_helper && ticket != M - 1)
+        while (__hip_atomic_load(tail_arrival, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) < M)
+          __builtin_amdgcn_s_sleep(1);
+      // This XCD's L2 may hold stale lines of the other CTAs' rows.
+      if (ticket >= first_helper) __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+      s_ticket = ticket;
+    }
+    __syncthreads();
+    const int ticket = s_ticket;
+    if (ticket >= first_helper) {
+      radix4_sort::sort_tail_stable<EXPERTS, TOPK, static_cast<int>(kRadix4SortBlockM), BLOCK>(
+          sort_count,
+          sort_before,
+          sort_mask,
+          sort_cumsum,
+          params.out_i,
+          params.out_w,
+          params.sorted_token_ids,
+          params.sorted_expert_ids,
+          params.sorted_weights,
+          params.cumsum_tensor,
+          params.reverse_sorted,
+          params.m_indices,
+          params.num_non_padded,
+          ticket - first_helper,
+          params.tail_ctas,
+          M,
+          ticket == M - 1);
+      // Every CTA read the parity before arriving.
+      if (ticket == M - 1 && tid == 0) params.sort_ws[1] ^= 1;
+    }
+    radix4_sort::zero_bf16_row<BLOCK>(params.moe_buf, token, static_cast<int>(params.moe_dim));
+  } else if constexpr (kFuseSort) {
     // A release costs every wave an L2 write-back + invalidate, so all stores
     // ordered against the counter (route row, pad slice) live in wave 0 only.
     // A grid of one reads back only its own writes and skips the handshake.
@@ -522,7 +606,7 @@ __global__ __launch_bounds__(BLOCK) void route_radix4_kernel(__grid_constant__ c
       } else {
         __threadfence();
         if (lane == 0) {
-          const bool last = atomicAdd(params.arrival, 1) == static_cast<int>(gridDim.x) - 1;
+          const bool last = atomicAdd(&params.sort_ws[0], 1) == static_cast<int>(gridDim.x) - 1;
           // Pairs with every other CTA's release (on a multi-XCD part this L2 may hold
           // stale lines of their rows); taken before the barrier, which extends it to all waves.
           if (last) __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
@@ -546,7 +630,7 @@ __global__ __launch_bounds__(BLOCK) void route_radix4_kernel(__grid_constant__ c
           params.reverse_sorted,
           params.m_indices,
           static_cast<int>(gridDim.x));
-      if (tid == 0) params.arrival[0] = 0;
+      if (tid == 0) params.sort_ws[0] = 0;
     }
     radix4_sort::zero_bf16_row<BLOCK>(params.moe_buf, token, static_cast<int>(params.moe_dim));
   }
@@ -616,7 +700,7 @@ struct RouteRadix4SortKernel {
       const tvm::ffi::TensorView bias,
       const tvm::ffi::TensorView out_w,
       const tvm::ffi::TensorView out_i,
-      const tvm::ffi::TensorView arrival,
+      const tvm::ffi::TensorView sort_ws,
       const tvm::ffi::TensorView sorted_token_ids,
       const tvm::ffi::TensorView sorted_expert_ids,
       const tvm::ffi::TensorView sorted_weights,
@@ -653,7 +737,7 @@ struct RouteRadix4SortKernel {
     // The three sorted rows are padded as one strided sweep, so they have to
     // agree on a length that covers a whole number of BM blocks.
     auto S_ = SymbolicSize{"sorted_len"};
-    TensorMatcher({1}).with_dtype<int32_t>().with_device(device_).verify(arrival);
+    TensorMatcher({4}).with_dtype<int32_t>().with_device(device_).verify(sort_ws);
     TensorMatcher({S_})  //
         .with_dtype<int32_t>()
         .with_device(device_)
@@ -677,6 +761,8 @@ struct RouteRadix4SortKernel {
         << "route_radix4 is specialized for N=896, K=16";
     CHECK_HOST(out_w.stride(0) == K_.unwrap() && out_i.stride(0) == K_.unwrap())
         << "fused sort needs packed [M, K] rows";
+    CHECK_HOST(M_.unwrap() <= static_cast<int64_t>(kRadix4MaxTailCtas) * radix4_sort::kTailMaxChunkTokens)
+        << "the fused sort covers at most 1024 tokens";
     CHECK_HOST(S_.unwrap() % kRadix4SortBlockM == 0 && S_.unwrap() / kRadix4SortBlockM <= sorted_expert_ids.size(0))
         << "sorted rows must hold whole BM=16 blocks, one expert id each";
 
@@ -720,7 +806,7 @@ struct RouteRadix4SortKernel {
         .stride_out = static_cast<uint32_t>(out_w.stride(0)),
         .routed_scaling_factor = static_cast<fp32_t>(routed_scaling_factor),
         .renormalize = renormalize,
-        .arrival = static_cast<int32_t*>(arrival.data_ptr()),
+        .sort_ws = static_cast<int32_t*>(sort_ws.data_ptr()),
         .sorted_token_ids = static_cast<int32_t*>(sorted_token_ids.data_ptr()),
         .sorted_expert_ids = static_cast<int32_t*>(sorted_expert_ids.data_ptr()),
         .sorted_weights = static_cast<fp32_t*>(sorted_weights.data_ptr()),
@@ -731,16 +817,24 @@ struct RouteRadix4SortKernel {
         .moe_dim = moe_dim,
         .sorted_capacity = static_cast<uint32_t>(S_.unwrap()),
         .num_non_padded = non_padded_ptr,
+        .tail_ctas = static_cast<int32_t>(std::min((M + kRadix4TailChunk - 1) / kRadix4TailChunk, kRadix4MaxTailCtas)),
     };
 
     constexpr auto kExperts = static_cast<int>(kRadix4NumExperts);
     constexpr auto kTopK = static_cast<int>(kRadix4TopK);
     constexpr auto kBlock = static_cast<int>(kRadix4Block);
     const auto device = device_.unwrap();
+    const bool tail = M > kRadix4LeaderSortMaxTokens;
     if (score_dtype.is_type<bf16_t>()) {
-      LaunchKernel(M, kBlock, device)(route_radix4_kernel<bf16_t, kExperts, kTopK, kBlock, true>, params);
+      LaunchKernel(M, kBlock, device)(
+          tail ? route_radix4_kernel<bf16_t, kExperts, kTopK, kBlock, kRadix4SortTail>
+               : route_radix4_kernel<bf16_t, kExperts, kTopK, kBlock, kRadix4SortLeader>,
+          params);
     } else {
-      LaunchKernel(M, kBlock, device)(route_radix4_kernel<fp32_t, kExperts, kTopK, kBlock, true>, params);
+      LaunchKernel(M, kBlock, device)(
+          tail ? route_radix4_kernel<fp32_t, kExperts, kTopK, kBlock, kRadix4SortTail>
+               : route_radix4_kernel<fp32_t, kExperts, kTopK, kBlock, kRadix4SortLeader>,
+          params);
     }
   }
 };

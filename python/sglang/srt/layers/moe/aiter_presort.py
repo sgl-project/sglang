@@ -1,10 +1,11 @@
 """Hand AITER's fused_moe the BM=16 sort the radix-4 router writes on ROCm.
 
-At decode batch sizes AITER's fused_moe spends a launch on moe_sorting and
-another on zeroing its output. route_radix4_with_sort emits both from the
-routing launch; register_presorted_moe (ROCm/aiter#6484) hands that sort to the
-next fused_moe call, which uses it when the call's topk tensors, M and block_m
-match and ignores it otherwise. Without that AITER API the router runs unfused.
+At decode and verify batch sizes AITER's fused_moe spends one or two launches on
+moe_sorting, which also zeroes its output. route_radix4_with_sort emits both from
+the routing launch; register_presorted_moe (ROCm/aiter#6484) hands that sort to
+the next fused_moe call, which uses it when the call's topk tensors, M and
+block_m match and ignores it otherwise. Without that AITER API the router runs
+unfused.
 """
 
 from __future__ import annotations
@@ -41,7 +42,9 @@ def clear_registration() -> None:
 def enabled(scores: torch.Tensor) -> bool:
     return (
         envs.SGLANG_OPT_HIP_K3_RADIX4_FUSE_SORT.get()
-        and 1 <= scores.shape[0] <= moe_route_radix4.FUSED_SORT_MAX_TOKENS
+        and 1
+        <= scores.shape[0]
+        <= envs.SGLANG_OPT_HIP_K3_RADIX4_FUSE_SORT_MAX_TOKENS.get()
         and _registrar() is not None
         and moe_route_radix4.fused_sort_ready(scores.device)
     )

@@ -5,7 +5,9 @@ biased_grouped_topk_gpu's aiter branch for covered inputs; anything else falls
 back to aiter. Kernel notes live in jit/csrc/moe/route_radix4_hip.cuh.
 
 route_radix4_with_sort also writes AITER's BM=16 MoE sort from the same launch,
-for a caller that hands it to AITER's fused_moe in place of moe_sorting.
+for a caller that hands it to AITER's fused_moe in place of moe_sorting. Up to 64
+tokens the last CTA to finish routing sorts; past that the last ceil(M / 16)
+CTAs share the sort, one 16-token chunk each.
 """
 
 from __future__ import annotations
@@ -24,9 +26,6 @@ if TYPE_CHECKING:
 _NUM_EXPERTS = 896
 _TOPK = 16
 _SORT_BLOCK_M = 16
-# Decode batch sizes; the leader CTA sorts every route alone, so the fused sort
-# stops paying off as M grows. Tested up to 128.
-FUSED_SORT_MAX_TOKENS = 64
 # One block per token, so the grid outgrows the machine somewhere past a
 # thousand tokens and the kernel turns throughput-bound, where spreading a token
 # over four waves is a cost rather than a win. Measured break-even is ~1.5k
@@ -36,9 +35,9 @@ _MAX_TOKENS = 1024
 
 logger = logging.getLogger(__name__)
 
-# Per (device, stream): CTAs elect the sort leader by counting arrivals on it,
-# so launches in flight on two streams must not share one.
-_ARRIVAL: dict[tuple[torch.device, int], torch.Tensor] = {}
+# Per (device, stream): the sort's arrival counters, which launches in flight on
+# two streams must not share. Four int32 (see RouteRadix4Params::sort_ws).
+_SORT_WS: dict[tuple[torch.device, int], torch.Tensor] = {}
 
 
 def supported_hardware() -> bool:
@@ -152,26 +151,26 @@ def route_radix4(
 def fused_sort_ready(device: torch.device) -> bool:
     """Whether route_radix4_with_sort may launch on the current stream now.
 
-    Its arrival counter must start at zero, and a counter first allocated
-    during CUDA graph capture is only zeroed when that one graph replays.
+    Its arrival counters must start at zero, and counters first allocated
+    during CUDA graph capture are only zeroed when that one graph replays.
     """
     key = (device, torch.cuda.current_stream(device).cuda_stream)
-    return key in _ARRIVAL or not torch.cuda.is_current_stream_capturing()
+    return key in _SORT_WS or not torch.cuda.is_current_stream_capturing()
 
 
-def _arrival_counter(device: torch.device) -> torch.Tensor:
+def _sort_workspace(device: torch.device) -> torch.Tensor:
     key = (device, torch.cuda.current_stream(device).cuda_stream)
-    counter = _ARRIVAL.get(key)
-    if counter is None:
+    ws = _SORT_WS.get(key)
+    if ws is None:
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
                 "route_radix4_with_sort first ran on this stream during graph "
                 "capture; run it once eagerly on the capture stream first"
             )
-        # The leader resets it to zero after every launch.
-        counter = torch.zeros(1, dtype=torch.int32, device=device)
-        _ARRIVAL[key] = counter
-    return counter
+        # Zeroed once; every launch leaves it ready for the next one.
+        ws = torch.zeros(4, dtype=torch.int32, device=device)
+        _SORT_WS[key] = ws
+    return ws
 
 
 def _sorted_capacity(n_tokens: int) -> int:
@@ -221,7 +220,7 @@ def route_radix4_with_sort(
         bias,
         out_w,
         out_i,
-        _arrival_counter(device),
+        _sort_workspace(device),
         sorted_token_ids,
         sorted_expert_ids,
         sorted_weights,
