@@ -8,6 +8,7 @@ from torch import nn
 
 from sglang.srt.configs.qwen4_exp import Qwen4ExpTextConfig
 from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
+from sglang.srt.layers.utils.common import set_weight_attrs
 from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbeddingShardIndices,
 )
@@ -17,7 +18,6 @@ from sglang.srt.models.qwen4_exp import (
     Qwen4ExpPLELayer,
 )
 from sglang.srt.runtime_context import get_context, get_parallel
-from sglang.srt.utils import set_weight_attrs
 from sglang.test.ci.ci_register import register_cuda_ci, register_xpu_ci
 
 register_cuda_ci(est_time=45, stage="base-b-kernel-unit", runner_config="1-gpu-small")
@@ -244,17 +244,17 @@ def test_qwen4_ple_offload_avoids_device_table(single_rank_runtime_context):
 
 
 def _file_backend_supported() -> bool:
-    from sglang.srt.models.qwen4_exp_ple_table import device_uses_host_page_tables
+    from sglang.srt.models.qwen4_exp_ple_table import device_reads_pageable_memory
 
     return (
         torch.cuda.is_available()
-        and device_uses_host_page_tables(torch.cuda.current_device()) is True
+        and device_reads_pageable_memory(torch.cuda.current_device()) is True
     )
 
 
 @pytest.mark.skipif(
     not _file_backend_supported(),
-    reason="the file backend needs pageable host memory reachable through host page tables",
+    reason="the file backend needs a device that reads pageable host memory",
 )
 @pytest.mark.parametrize("embedding_dim", [7, 160])
 def test_qwen4_ple_file_backend_matches_pinned(embedding_dim):
@@ -286,7 +286,7 @@ def test_qwen4_ple_file_backend_matches_pinned(embedding_dim):
 
 @pytest.mark.skipif(
     not _file_backend_supported(),
-    reason="the file backend needs pageable host memory reachable through host page tables",
+    reason="the file backend needs a device that reads pageable host memory",
 )
 def test_qwen4_ple_file_backend_fp8_table():
     embedding_dim = 160
