@@ -74,6 +74,7 @@ def batch(lengths=(127, 0)):
     return SimpleNamespace(
         batch_size=len(lengths),
         forward_mode=ForwardMode.TARGET_VERIFY,
+        hisparse_coordinator=None,
         # Match the int64 input lengths created by ScheduleBatch and graph buffers.
         seq_lens=torch.tensor(lengths, dtype=torch.int64),
         seq_lens_cpu=None,
