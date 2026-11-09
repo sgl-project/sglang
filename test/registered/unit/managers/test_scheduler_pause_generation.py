@@ -149,6 +149,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.invariant_checker = MagicMock()
         scheduler.kv_events_publisher = MagicMock()
         scheduler.beam_coordinator = MagicMock()
+        scheduler.output_streamer = MagicMock()
         scheduler.send_abort_output = MagicMock()
         scheduler.init_request_retirer()
         return scheduler

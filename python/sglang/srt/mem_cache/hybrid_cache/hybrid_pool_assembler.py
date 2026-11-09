@@ -1697,6 +1697,8 @@ def _build_mha_mla_host_pool(
     allocator_type: str,
     pool_label: str,
     host_token_capacity: int | None = None,
+    dcp_size: int = 1,
+    dcp_rank: int = 0,
 ):
     is_mha = isinstance(buffer_info, MHABufferInfo)
     # The global layout is page_first_kv_split only when the target model
@@ -1724,6 +1726,8 @@ def _build_mha_mla_host_pool(
         end_layer=pool.end_layer,
         target_layer_num=pool.layer_num,
         override_kv_cache_dim=pool.kv_cache_dim,
+        dcp_size=dcp_size,
+        dcp_rank=dcp_rank,
         write_back_staging=pool.hicache_write_back_staging,
         **kwargs,
     )
@@ -1735,6 +1739,8 @@ def build_full_draft_pools(
     tree_cache: Any,
 ) -> tuple[list[SidecarPoolSpec], list[PoolEntry]]:
     """Build draft KV and its sidecars, whose indices follow target full KV."""
+    from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+
     pool = draft_kv_pool
     inner = pool.layer_router.wrapped_view()
     if inner is not None:
@@ -1761,18 +1767,37 @@ def build_full_draft_pools(
         )
     buffer_info = config.pool_infos[PoolName.KV].buffer_info
 
-    # Note(kpham-sgl): DCP x DSpark draft KV is replicated and spans the virtual
-    # loc space, so match the target host's logical_size instead of physical size.
-    draft_host_pool = _build_mha_mla_host_pool(
-        pool=pool,
-        buffer_info=buffer_info,
-        host_to_device_ratio=host_pool_group.logical_size / pool.size,
-        page_size=controller.page_size,
-        layout=get_memory().hicache_mem_layout,
-        allocator_type=_get_allocator_type(),
-        pool_label="draft",
-        host_token_capacity=host_pool_group.logical_size,
-    )
+    if (
+        isinstance(pool, MLATokenToKVPool)
+        and not pool.dcp_replicated
+        and get_parallel().dcp_enabled
+    ):
+        # A DCP-sharded MLA draft holds only its own rows, like the target.
+        parallel = get_parallel()
+        draft_host_pool = _build_mha_mla_host_pool(
+            pool=pool,
+            buffer_info=buffer_info,
+            host_to_device_ratio=host_pool_group.size / pool.size,
+            page_size=controller.page_size,
+            layout=get_memory().hicache_mem_layout,
+            allocator_type=_get_allocator_type(),
+            pool_label="draft",
+            dcp_size=parallel.attn_dcp_size,
+            dcp_rank=parallel.attn_dcp_rank,
+        )
+    else:
+        # Note(kpham-sgl): DCP x DSpark draft KV is replicated and spans the
+        # virtual loc space, so match the target host's logical_size.
+        draft_host_pool = _build_mha_mla_host_pool(
+            pool=pool,
+            buffer_info=buffer_info,
+            host_to_device_ratio=host_pool_group.logical_size / pool.size,
+            page_size=controller.page_size,
+            layout=get_memory().hicache_mem_layout,
+            allocator_type=_get_allocator_type(),
+            pool_label="draft",
+            host_token_capacity=host_pool_group.logical_size,
+        )
 
     specs = [
         SidecarPoolSpec(
