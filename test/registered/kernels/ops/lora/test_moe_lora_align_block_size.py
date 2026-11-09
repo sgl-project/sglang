@@ -14,7 +14,7 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 # test_fused_moe_lora_kernel.py runs this align kernel against a torch reference
 # on the kernel lane; this wider matrix runs nightly.
-register_cuda_ci(est_time=18, stage="nightly", runner_config="1-gpu-large")
+register_cuda_ci(est_time=18, stage="nightly", runner_config="1-gpu-small")
 # backend-specific: the HIP JIT build of moe_lora_align_kernel.cu and its
 # wave64 per-warp expert counters.
 register_amd_ci(est_time=30, stage="jit-kernel-unit", runner_config="amd")

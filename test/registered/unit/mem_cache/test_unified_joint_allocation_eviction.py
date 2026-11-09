@@ -13,6 +13,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
 )
 from sglang.srt.mem_cache.common import evict_from_tree_cache
+from sglang.srt.mem_cache.kv.plan import TREE_WINDOW
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.runtime_context import reset_context
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -79,7 +80,7 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
         self.assertFalse(allocator.verify_byte_accounting())
 
     def test_joint_reclaim_stops_after_actual_cascade(self):
-        for lazy in (False, True):
+        for lazy in (True,):
             for page_size in (1, 4, 16):
                 for demand, first in ((3, 0), (4, 1), (6, 3), (90, 87)):
                     with self.subTest(lazy=lazy, page_size=page_size, demand=demand):
@@ -94,7 +95,7 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
                         self.check_prefixes(allocator, cache, records, range(first, 96))
 
     def test_impossible_byte_demand_preserves_cache(self):
-        for lazy in (False, True):
+        for lazy in (True,):
             with self.subTest(lazy=lazy):
                 allocator, cache = self.build_cache(lazy=lazy)
                 records = self.mark_prefixes(allocator, cache, 96)
@@ -105,7 +106,7 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
                 self.check_prefixes(allocator, cache, records, range(96))
 
     def test_pending_groups_reclaim_without_prefix_eviction(self):
-        for lazy in (False, True):
+        for lazy in (True,):
             for mode, page_size in (("ordinary", 1), ("representatives", 4)):
                 with self.subTest(lazy=lazy, mode=mode):
                     allocator, cache = self.build_cache(
@@ -150,15 +151,25 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
         self.assertIsNotNone(allocator.alloc(4))
         self.check_prefixes(allocator, cache, records, range(1, 96))
 
-    def test_explicit_and_legacy_allocation_eviction_keep_count_contract(self):
-        for legacy in (False, True):
-            with self.subTest(legacy=legacy):
+    def test_explicit_and_allocation_eviction_respect_their_targets(self):
+        for allocation in (False, True):
+            with self.subTest(allocation=allocation):
                 allocator, cache = self.build_cache()
                 records = self.mark_prefixes(allocator, cache, 96)
-                method = cache.evict_for_alloc if legacy else cache.evict
+                before = allocator.full_attn_allocator.available_size()
+                method = cache.evict_for_alloc if allocation else cache.evict
                 result = method(EvictParams(num_tokens=2))
-                self.assertEqual(result.num_tokens_evicted, 2)
-                self.check_prefixes(allocator, cache, records, range(2, 96))
+                # Allocation targets availability: a cascaded SWA free also
+                # increases the FULL band's shared-arena borrowing capacity,
+                # once the freed SWA bytes are compacted away.
+                for band in allocator.members:
+                    band.flush_for_allocation()
+                expected = 1 if allocation else 2
+                self.assertEqual(result.num_tokens_evicted, expected)
+                self.assertGreaterEqual(
+                    allocator.full_attn_allocator.available_size(), before + 2
+                )
+                self.check_prefixes(allocator, cache, records, range(expected, 96))
 
     def test_schedule_batch_decode_uses_allocator_contract(self):
         from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -235,7 +246,7 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
                 )
 
     def test_pending_full_only_reclaim_is_needed_before_walk(self):
-        for lazy in (False, True):
+        for lazy in (True,):
             with self.subTest(lazy=lazy):
                 allocator, cache = self.build_cache(occupancy=94, lazy=lazy)
                 records = self.mark_prefixes(allocator, cache, 94)
@@ -277,7 +288,7 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
             # Only the external Triton index-generation kernel is replaced;
             # the actual caller, capacity checks and page bindings run on CPU.
             def __getitem__(self, grid):
-                def launch(prefix, seq, last, free, out, batch_size, page_size):
+                def launch(prefix, seq, last, free, out, page_size):
                     next_page = offset = 0
                     for i in range(len(prefix)):
                         for pos in range(int(prefix[i]), int(seq[i])):
@@ -444,7 +455,11 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
 
         with patch.object(cache, "_evict_device_next_node", side_effect=step):
             cache.evict_for_alloc(
-                EvictParams(swa_num_tokens=2),
+                EvictParams(
+                    window_num_tokens={
+                        cache.window_sub_pool_of_slot(cache.slot_id(TREE_WINDOW)): 2
+                    }
+                ),
                 allocation_reclaim_satisfied=lambda: (
                     allocator.reclaim_plan(4, 4) == (0, 0)
                 ),

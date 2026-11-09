@@ -1,9 +1,10 @@
 """CPU-only tests for Quark MXFP4 AITER GEMM layout helpers and the ROCm
 --fp4-gemm-backend choices (aiter / triton)."""
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_amd_ci(est_time=5, stage="stage-b", runner_config="1-gpu-small-amd")
 
 import argparse
 import os
@@ -14,6 +15,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 import torch
+from torch._subclasses.fake_tensor import FakeTensorMode
 
 from sglang.srt.arg_groups.choices import FP4_GEMM_RUNNER_BACKEND_CHOICES
 from sglang.srt.environ import envs
@@ -32,6 +34,7 @@ from sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4 import (
     _swizzle_asm_fp4_scale,
 )
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils import is_hip
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -417,6 +420,21 @@ class TestQuarkMxfp4AutoLayerSelection(CustomTestCase):
         layer = self._process(Fp4GemmRunnerBackend.AITER, set(), n=96)
         self.assertFalse(layer.use_aiter_asm_fp4_gemm)
         self.assertIs(layer.weight, self.loaded_weight)  # not shuffled for AITER
+
+
+@unittest.skipUnless(is_hip(), "needs a ROCm build with aiter")
+class TestQuarkMxfp4DynamicQuantFake(CustomTestCase):
+    def test_fake_scale_matches_aiter_column_major_layout(self):
+        """The fake must report aiter's column-major (1, M) scale strides;
+        any other layout fails Inductor's assert_size_stride under torch.compile."""
+        m, n = 37, 2080
+        with FakeTensorMode():
+            x = torch.empty((m, n), dtype=torch.bfloat16)
+            x_fp4, scale = torch.ops.sglang.aiter_dynamic_mxfp4_quant(x)
+
+        self.assertEqual(tuple(x_fp4.shape), (m, n // 2))
+        self.assertEqual(tuple(scale.shape), (m, n // 32))
+        self.assertEqual(scale.stride(), (1, m))
 
 
 if __name__ == "__main__":
