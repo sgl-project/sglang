@@ -209,7 +209,6 @@ class TestOperandConversions(CustomTestCase):
             with (
                 self.subTest(preshuffled=preshuffled),
                 envs.SGLANG_ROCM_MXFP8_AITER_PRESHUFFLE.override(preshuffled),
-                envs.SGLANG_OPT_HIP_FLYDSL_MXFP8.override(False),
             ):
                 layer = torch.nn.Module()
                 layer.weight = torch.nn.Parameter(plain.clone(), requires_grad=False)
