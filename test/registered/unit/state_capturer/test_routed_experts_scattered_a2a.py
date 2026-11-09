@@ -192,6 +192,7 @@ class TestCaptureRoutedIdsOnly(CustomTestCase):
             moe_num_token_non_padded=None,
             tbo_parent_token_range=(2, 5),
             tbo_parent_dp_offset=6,
+            tbo_dp_global_num_tokens_bound=None,
             global_dp_buffer_len=None,
             tbo_padded_len=3,
             global_num_tokens_cpu=None,

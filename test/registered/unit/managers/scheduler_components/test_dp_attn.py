@@ -597,6 +597,7 @@ class TestDPShutdownVote(CustomTestCase):
             dp_balance_stats=None,
         )
         tbo_preparer = Mock()
+        tbo_preparer.local_tbo_split_num_tokens = 0
         tbo_preparer.prepare_all_gather.return_value = (True, ForwardMode.DECODE.value)
         tbo_preparer.compute_output.return_value = (None, ForwardMode.DECODE)
 
@@ -761,6 +762,7 @@ class TestDPDrainColumn(CustomTestCase):
             dp_balance_stats=None,
         )
         tbo_preparer = Mock()
+        tbo_preparer.local_tbo_split_num_tokens = 0
         tbo_preparer.prepare_all_gather.return_value = (True, ForwardMode.DECODE.value)
         tbo_preparer.compute_output.return_value = (None, ForwardMode.DECODE)
 
