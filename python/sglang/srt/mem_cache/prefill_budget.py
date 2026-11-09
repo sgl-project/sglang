@@ -20,7 +20,7 @@ realizes the selected reservation before a host transfer pins device rows.
 """
 
 from contextlib import nullcontext
-from typing import Optional
+from typing import Dict, Mapping, Optional
 
 from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
 from sglang.srt.layers.cp.utils import (
@@ -30,7 +30,16 @@ from sglang.srt.layers.cp.utils import (
     get_cp_sharded_padded_chunk_tokens,
 )
 from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
-from sglang.srt.mem_cache.kv.alloc.interim import ChainAdmissionRules
+from sglang.srt.mem_cache.base_prefix_cache import evictable_by_sub_pool
+from sglang.srt.mem_cache.capacity import reclaim_for_load_back
+from sglang.srt.mem_cache.kv.alloc.demand import (
+    DemandPurpose,
+    KVDemand,
+    chunk_granule,
+    demand_inputs,
+    largest_fitting_chunk,
+    window_retirement,
+)
 
 
 def estimate_swa_kv_tokens(
@@ -68,6 +77,13 @@ def estimate_swa_kv_tokens(
     return reserved
 
 
+def _single_window_hit(
+    window_host_hit_lengths: Optional[Mapping[str, int]],
+) -> int:
+    """Host hit tokens of a pool keeping one window, whatever its name."""
+    return max((window_host_hit_lengths or {}).values(), default=0)
+
+
 class PrefillBudget:
     """Fixed token pool. Offsets include pending allocations and decode headroom."""
 
@@ -78,6 +94,12 @@ class PrefillBudget:
     state_slot_cost = 0
     has_state_slots = False
     requires_final_shape_check = False
+    # Admission prices the whole request and selects the chunk limit it fits
+    # at (`check_prefill`); every admission path runs and commits that limit.
+    admits_whole_requests = False
+    # Set when `check_prefill` refuses a request no wait can admit;
+    # the scheduler aborts it instead of keeping it queued.
+    unschedulable = False
 
     def __init__(self, allocator, tree_cache, *, num_mixed_decode_tokens: int = 0):
         self.allocator = allocator
@@ -99,9 +121,8 @@ class PrefillBudget:
         full_tokens: int,
         extend_input_len: int,
         max_new_tokens: int,
-        swa_host_hit_length: int,
         chunk_limit: int | None,
-        auxiliary_swa_host_hit_length: int = 0,
+        window_host_hit_lengths: Optional[Mapping[str, int]] = None,
         state_slots: int = 0,
     ) -> bool:
         """Prepare pools whose admission depends on movable shared space."""
@@ -130,7 +151,7 @@ class PrefillBudget:
         return self._available_and_evictable() - self.current_offset
 
     @property
-    def remaining_swa(self):
+    def remaining_window_tokens(self):
         return 0
 
     def has_capacity(self) -> bool:
@@ -140,6 +161,9 @@ class PrefillBudget:
         return self.remaining_total > 0 and self.remaining_current > 0
 
     def request_state_slots(self, req) -> int:
+        return 0
+
+    def request_held_state_slots(self, req) -> int:
         return 0
 
     def state_slots_exhausted(self) -> bool:
@@ -155,12 +179,16 @@ class PrefillBudget:
         total_tokens: int,
         max_new_tokens: int,
         input_tokens: int,
-        swa_host_hit_length: int,
         chunk_limit: int | None,
-        auxiliary_swa_host_hit_length: int = 0,
+        window_host_hit_lengths: Optional[Mapping[str, int]] = None,
         state_slots: int = 0,
+        chunk_align: int | None = None,
+        host_hit_tokens: int = 0,
+        held_state_slots: int = 0,
     ) -> tuple[bool, int | None]:
-        """Return admission feasibility and a memory bound on the requested chunk."""
+        """Return admission feasibility and a memory bound on the requested
+        chunk. ``host_hit_tokens`` are the prompt tokens a host hit restores,
+        which ``total_tokens`` charges and ``extend_input_len`` leaves out."""
         return (
             (True, chunk_limit)
             if total_tokens + state_slots * self.state_slot_cost < self.remaining_total
@@ -175,9 +203,13 @@ class PrefillBudget:
         max_new_tokens: int,
         chunk_limit: int | None,
         state_slots: int = 0,
-        swa_host_hit_length: int = 0,
-        auxiliary_swa_host_hit_length: int = 0,
+        window_host_hit_lengths: Optional[Mapping[str, int]] = None,
+        admitted_chunk_limit: int | None = None,
+        cached_tokens: int = 0,
     ) -> bool:
+        """Whether the selected shape fits. ``admitted_chunk_limit`` (the
+        chunk limit admission chose) and ``cached_tokens`` are for budgets
+        that price a request's chunking; a fixed pool charges tokens."""
         return paged_input + state_slots * self.state_slot_cost <= min(
             self.remaining_current, self.remaining_total
         )
@@ -195,11 +227,13 @@ class PrefillBudget:
 
     def fit_chunk(
         self,
+        req,
         *,
         extend_input_len: int,
         max_new_tokens: int,
         chunk_limit: int,
         state_slots: int = 0,
+        chunk_align: int | None = None,
     ) -> int | None:
         return chunk_limit
 
@@ -212,7 +246,15 @@ class PrefillBudget:
         state_slots: int = 0,
         chunk_limit: int | None = None,
         is_chunked_continuation: bool = False,
+        unfinished_input_len: int = 0,
+        deferred_max_new_tokens: int = 0,
+        admitted_chunk_limit: int | None = None,
+        cached_tokens: int = 0,
     ) -> None:
+        """Charge one admitted chunk or request. ``unfinished_input_len`` and
+        ``deferred_max_new_tokens`` describe the rest of a request this chunk
+        does not finish; a budget that commits whole requests charges them,
+        at the chunk limit admission chose (``admitted_chunk_limit``)."""
         extend_input_len = self.ceil_paged_tokens(extend_input_len)
         immediate = (
             extend_input_len
@@ -232,20 +274,26 @@ class SWAPrefillBudget(PrefillBudget):
         self.all_swa = all_swa
         self.req_ring = is_swa_req_ring(self.allocator)
 
+    def _window_evictable(self) -> int:
+        """Evictable tokens of the static pools' one window."""
+        from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+
+        return self.tree_cache.window_evictable_size(BaseSWAKVPool.WINDOW_SUB_POOL)
+
     def _available_and_evictable(self):
         if self.all_swa:
             global_swa_available_size = self.allocator.swa_available_size()
             if is_cp_sharded_padded():
                 global_swa_available_size = from_cp_sharded(global_swa_available_size)
-            return global_swa_available_size + self.tree_cache.swa_evictable_size()
+            return global_swa_available_size + self._window_evictable()
         global_full_available_size = self.allocator.full_available_size()
         if is_cp_sharded_padded():
             global_full_available_size = from_cp_sharded(global_full_available_size)
         return global_full_available_size + self.tree_cache.full_evictable_size()
 
     @property
-    def remaining_swa(self):
-        evictable = 0 if self.req_ring else self.tree_cache.swa_evictable_size()
+    def remaining_window_tokens(self):
+        evictable = 0 if self.req_ring else self._window_evictable()
         global_swa_available_size = self.allocator.swa_available_size()
         if is_cp_sharded_padded():
             global_swa_available_size = from_cp_sharded(global_swa_available_size)
@@ -257,7 +305,7 @@ class SWAPrefillBudget(PrefillBudget):
         max_new_tokens,
         *,
         chunk_limit=None,
-        swa_host_hit_length=0,
+        window_host_hit_lengths=None,
     ):
         if self.req_ring:
             return self.allocator.swa_ring_cost_tokens
@@ -267,7 +315,7 @@ class SWAPrefillBudget(PrefillBudget):
             sliding_window_size=self.tree_cache.sliding_window_size,
             page_size=self.page_size,
             allocation_limit=chunk_limit,
-            host_hit_length=swa_host_hit_length,
+            host_hit_length=_single_window_hit(window_host_hit_lengths),
         )
 
     def swa_never_fits(self, extend_input_len, max_new_tokens, **kwargs):
@@ -280,16 +328,16 @@ class SWAPrefillBudget(PrefillBudget):
     def _chunk_cap(
         self,
         max_new_tokens,
-        swa_host_hit_length=0,
+        window_host_hit_lengths=None,
         *,
         prefix_tokens=None,
     ):
         # Only the sliding window stays locked between chunks, so a smaller
         # chunk can bound the transient SWA footprint of a longer prompt.
         headroom = self.swa_tokens(
-            0, max_new_tokens, swa_host_hit_length=swa_host_hit_length
+            0, max_new_tokens, window_host_hit_lengths=window_host_hit_lengths
         )
-        cap = int(self.remaining_swa) - headroom
+        cap = int(self.remaining_window_tokens) - headroom
         cap = max(0, cap // self.page_size * self.page_size)
         if is_cp_sharded_padded() and cap > 0:
             # Keep SWA availability at the caller; the helper only aligns tokens.
@@ -306,10 +354,12 @@ class SWAPrefillBudget(PrefillBudget):
         total_tokens: int,
         max_new_tokens: int,
         input_tokens: int,
-        swa_host_hit_length: int,
         chunk_limit: int | None,
-        auxiliary_swa_host_hit_length: int = 0,
+        window_host_hit_lengths: Optional[Mapping[str, int]] = None,
         state_slots: int = 0,
+        chunk_align: int | None = None,
+        host_hit_tokens: int = 0,
+        held_state_slots: int = 0,
     ) -> tuple[bool, int | None]:
         if total_tokens + state_slots * self.state_slot_cost >= self.remaining_total:
             return False, None
@@ -323,12 +373,12 @@ class SWAPrefillBudget(PrefillBudget):
             extend_input_len,
             max_new_tokens,
             chunk_limit=chunk_limit,
-            swa_host_hit_length=swa_host_hit_length,
+            window_host_hit_lengths=window_host_hit_lengths,
         )
         fits = (
-            needed <= self.remaining_swa
+            needed <= self.remaining_window_tokens
             if self.req_ring
-            else needed < self.remaining_swa
+            else needed < self.remaining_window_tokens
         )
         if fits:
             return True, chunk_limit
@@ -339,13 +389,18 @@ class SWAPrefillBudget(PrefillBudget):
             extend_input_len,
             max_new_tokens,
             chunk_limit=chunk_limit,
-            swa_host_hit_length=swa_host_hit_length,
+            window_host_hit_lengths=window_host_hit_lengths,
         ):
             cap = self._chunk_cap(
                 max_new_tokens,
-                swa_host_hit_length,
+                window_host_hit_lengths,
                 prefix_tokens=prefix_tokens,
             )
+            if chunk_align:
+                # A cap below the truncation alignment would cut the chunk
+                # to nothing: such a request waits instead.
+                granule = chunk_granule(self.page_size, chunk_align)
+                cap = cap // granule * granule
         if chunk_limit is None or cap <= 0:
             return False, None
         return True, min(chunk_limit, cap)
@@ -353,8 +408,8 @@ class SWAPrefillBudget(PrefillBudget):
     def has_capacity(self) -> bool:
         if is_cp_sharded_padded():
             # CP can reuse padding in already reserved SWA pages with zero fresh capacity.
-            return super().has_capacity() and self.remaining_swa >= 0
-        return super().has_capacity() and self.remaining_swa > 0
+            return super().has_capacity() and self.remaining_window_tokens >= 0
+        return super().has_capacity() and self.remaining_window_tokens > 0
 
     def available_chunk_tokens(self, chunk_limit: int) -> int | None:
         available_tokens = int(self.remaining_total)
@@ -365,7 +420,7 @@ class SWAPrefillBudget(PrefillBudget):
             available_tokens,
         )
         if not self.req_ring:
-            available_tokens = int(self.remaining_swa)
+            available_tokens = int(self.remaining_window_tokens)
             if is_cp_sharded_padded():
                 available_tokens = get_cp_sharded_padded_available_tokens(
                     available_tokens, reserved_tokens=self.page_size
@@ -384,9 +439,12 @@ class SWAPrefillBudget(PrefillBudget):
         max_new_tokens: int,
         chunk_limit: int | None,
         state_slots: int = 0,
-        swa_host_hit_length: int = 0,
-        auxiliary_swa_host_hit_length: int = 0,
+        window_host_hit_lengths: Optional[Mapping[str, int]] = None,
+        admitted_chunk_limit: int | None = None,
+        cached_tokens: int = 0,
     ) -> bool:
+        # The window estimate reads the limit only through min(extend, limit),
+        # and the extend is already cut to the admitted limit: keep ``chunk_limit``.
         return (
             super().can_allocate_prefill(
                 paged_input=paged_input,
@@ -399,9 +457,9 @@ class SWAPrefillBudget(PrefillBudget):
                 extend_input_len,
                 max_new_tokens,
                 chunk_limit=chunk_limit,
-                swa_host_hit_length=swa_host_hit_length,
+                window_host_hit_lengths=window_host_hit_lengths,
             )
-            <= self.remaining_swa
+            <= self.remaining_window_tokens
         )
 
     def reserve(
@@ -413,7 +471,13 @@ class SWAPrefillBudget(PrefillBudget):
         state_slots: int = 0,
         chunk_limit: int | None = None,
         is_chunked_continuation: bool = False,
+        unfinished_input_len: int = 0,
+        deferred_max_new_tokens: int = 0,
+        admitted_chunk_limit: int | None = None,
+        cached_tokens: int = 0,
     ) -> None:
+        # Charges only this chunk, already cut to the admitted limit; the
+        # static estimate keeps ``chunk_limit`` (see `can_allocate_prefill`).
         super().reserve(
             extend_input_len,
             max_new_tokens,
@@ -429,201 +493,438 @@ class SWAPrefillBudget(PrefillBudget):
             )
 
 
-class ChainPrefillBudget(SWAPrefillBudget):
-    """The prefill budget of every unified chain, following the chain's rules."""
+class ChainPrefillBudget(PrefillBudget):
+    """The prefill budget of every unified chain: one admission rule.
 
-    def __init__(
-        self,
-        allocator,
-        tree_cache,
-        *,
-        rules: ChainAdmissionRules,
-        num_mixed_decode_tokens: int = 0,
-    ):
+    A request is charged its FULL tokens, each window's retained tail and its
+    state slots (`request_demand`, shared with the memory clip), and admitted when
+    the allocator's `admits` finds a layout for it plus the pending work.
+    A chunked request is admitted whole and recommits its rest before other
+    requests of the pass, so each chunk needs only the rows it writes now.
+    """
+
+    load_back_needs_full_tokens = True
+    requires_final_shape_check = True
+    admits_whole_requests = True
+
+    def __init__(self, allocator, tree_cache, *, num_mixed_decode_tokens: int = 0):
         super().__init__(
             allocator, tree_cache, num_mixed_decode_tokens=num_mixed_decode_tokens
         )
-        self.rules = rules
-        self.pending_state_slots = 0
-        self.state_slot_cost = rules.state_slot_cost
-        self.load_back_needs_full_tokens = rules.window == "joint"
-        if rules.window == "joint":
-            self.swa_offset = num_mixed_decode_tokens
         self.has_state_slots = allocator.mamba_allocator is not None
-        self.requires_final_shape_check = (
-            rules.window == "joint" or self.has_state_slots
+        self.pending_state_slots = 0
+        # (sub-pool, retained window) per window sub-pool.
+        self.windows = tuple(
+            (name, tree_cache.window_retain_size(name))
+            for name in allocator.window_pool_names()
         )
-        self.auxiliary_window_size = (
-            tree_cache.window_retain_size("AUXILIARY_SWA")
-            if len(allocator._windows) > 1
-            else None
+        # When the scheduler retires window rows (`window_retirement`).
+        self.retirement = window_retirement(
+            shares_prefixes=tree_cache.supports_prefix_sharing()
         )
-        self.auxiliary_swa_offset = (
-            num_mixed_decode_tokens if self.auxiliary_window_size is not None else 0
-        )
+        # The window decode keeps behind the latest state checkpoint.
+        self.checkpoint_interval = tree_cache.window_checkpoint_interval()
+        # A mixed decode token writes one row in every window too.
+        self.window_offsets = {
+            name: num_mixed_decode_tokens for name, _ in self.windows
+        }
+        # The rows this pass's forward writes, without the commitments and
+        # decode that come later (`current_offset` is the token sub-pool's).
+        self.window_current_offsets = dict(self.window_offsets)
 
-    def auxiliary_tokens(
-        self, extend_input_len, max_new_tokens, *, chunk_limit=None, host_hit_length=0
-    ):
-        return estimate_swa_kv_tokens(
+    def _available_and_evictable(self):
+        # The scalar budget counts owner (FULL) tokens: admission prices every
+        # sub-pool itself, and `available_size` understates small-window needs.
+        available = self.allocator.full_available_size()
+        if is_cp_sharded_padded():
+            available = from_cp_sharded(available)
+        return available + self.tree_cache.full_evictable_size()
+
+    def request_demand(
+        self,
+        extend_input_len,
+        max_new_tokens,
+        *,
+        purpose: DemandPurpose = DemandPurpose.ADMIT,
+        chunk_limit=None,
+        host_hit_lengths: Optional[Mapping[str, int]] = None,
+        state_slots=0,
+        extra_tokens=0,
+        cached_tokens=0,
+    ) -> KVDemand:
+        """What one request still needs over this pool's windows, built for
+        ``purpose`` as every site builds it (`demand.demand_inputs`)."""
+        return demand_inputs(
+            purpose,
             extend_input_len,
             max_new_tokens,
-            sliding_window_size=self.auxiliary_window_size,
+            windows=dict(self.windows),
             page_size=self.page_size,
-            allocation_limit=chunk_limit,
-            host_hit_length=host_hit_length,
+            chunk_limit=chunk_limit,
+            prefill_retire_lag=self.retirement.prefill_retire_lag,
+            decode_retire_lag=self.retirement.decode_retire_lag,
+            eviction_interval=self.retirement.eviction_interval,
+            checkpoint_interval=self.checkpoint_interval,
+            state_slots=state_slots,
+            cached_tokens=cached_tokens,
+            host_hit_lengths=host_hit_lengths,
+            extra_tokens=extra_tokens,
+        ).demand()
+
+    def window_tokens(
+        self,
+        extend_input_len,
+        max_new_tokens,
+        *,
+        purpose: DemandPurpose = DemandPurpose.ADMIT,
+        chunk_limit=None,
+        host_hit_lengths: Optional[Mapping[str, int]] = None,
+        cached_tokens=0,
+    ):
+        """The tokens one request reserves in each window sub-pool; host hits
+        are given per window sub-pool."""
+        return dict(
+            self.request_demand(
+                extend_input_len,
+                max_new_tokens,
+                purpose=purpose,
+                chunk_limit=chunk_limit,
+                host_hit_lengths=host_hit_lengths,
+                cached_tokens=cached_tokens,
+            ).window_tokens
         )
 
     def request_state_slots(self, req) -> int:
-        return self.allocator.storage.pending_state_slots(req)
+        from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 
-    @property
-    def rem_state_slots(self):
-        if not self.has_state_slots:
-            return None
-        # Load-back may materialize slots during selection. Read current physical
-        # capacity, then subtract only requests still waiting for allocation.
-        available = self.allocator.mamba_allocator.schedulable_available_size()
-        if self.tree_cache.supports_mamba():
-            available += self.tree_cache.mamba_evictable_size()
-        return available - self.pending_state_slots
+        # A chain is unified memory: its storage is the pool's own.
+        return kv_storage_of(None, self.allocator).pending_state_slots(req)
 
-    def state_slots_exhausted(self) -> bool:
-        return self.rem_state_slots is not None and self.rem_state_slots <= 0
+    def request_held_state_slots(self, req) -> int:
+        from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 
-    def state_slots_fit(self, state_slots: int) -> bool:
-        if self.rem_state_slots is None:
+        return kv_storage_of(None, self.allocator).held_state_slots(req)
+
+    def _others_hold_memory(self, req) -> bool:
+        """Whether anything but ``req`` holds memory it gives back when it ends;
+        asked of memory, since the running batch misses PD sends and microbatches."""
+        from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
+
+        return kv_storage_of(None, self.allocator).others_hold_rows(req)
+
+    def _waiting_frees_memory(self) -> bool:
+        """Whether memory comes back to a request that waits: admitted work, a
+        forward or host copy in flight, or a row other work holds (not a parked row)."""
+        if self.total_offset > 0 or self.pending_state_slots > 0:
             return True
-        return state_slots <= self.rem_state_slots
+        steps = getattr(self.allocator, "forward_steps", None)
+        if steps is not None and steps.in_flight():
+            return True
+        if self.tree_cache.transfers_in_flight():
+            return True
+        return self._others_hold_memory(None)
 
-    def _available_and_evictable(self):
-        if self.rules.window == "none":
-            return PrefillBudget._available_and_evictable(self)
-        return super()._available_and_evictable()
+    def _refuse(self) -> tuple[bool, None]:
+        """Refuse a request no chunk of which fits now: it waits while waiting
+        frees memory, and is unschedulable when nothing will."""
+        self.unschedulable = not self._waiting_frees_memory()
+        return False, None
+
+    def _no_window_tokens(self) -> Dict[str, int]:
+        return {name: 0 for name, _ in self.windows}
+
+    def _fits(
+        self, full_tokens, window_tokens, state_slots=0, *, empty_pool=False, now=False
+    ):
+        """Whether the pending work plus this demand is admitted (the demand alone
+        with ``empty_pool``); with ``now``, pending is only this pass's forward rows."""
+        if empty_pool:
+            full_pending, window_pending, state_pending = 0, None, 0
+        elif now:
+            full_pending = self.current_offset
+            window_pending = self.window_current_offsets
+            state_pending = self.pending_state_slots
+        else:
+            full_pending = self.total_offset
+            window_pending = self.window_offsets
+            state_pending = self.pending_state_slots
+        demand = KVDemand(
+            full_tokens + full_pending,
+            {
+                name: window_tokens[name]
+                + (window_pending[name] if window_pending else 0)
+                for name, _ in self.windows
+            },
+            state_slots + state_pending,
+        )
+
+        return self.allocator.admits(
+            demand,
+            evictable=(
+                None
+                if empty_pool
+                else evictable_by_sub_pool(self.tree_cache, self.allocator)
+            ),
+            empty_pool=empty_pool,
+        )
+
+    def _admits(self, demand: KVDemand, **kwargs) -> bool:
+        return self._fits(
+            demand.full_tokens, demand.window_tokens, demand.state_slots, **kwargs
+        )
 
     @property
-    def remaining_swa(self):
-        return 0 if self.rules.window == "none" else super().remaining_swa
+    def remaining_window_tokens(self):
+        # Token view for paths that size work by a token count (dLLM): the
+        # fewest tokens any window can still take, less what is pending on it.
+        if not self.windows:
+            return 0
+        return min(
+            self.allocator.window_available_size(name)
+            + self.tree_cache.window_evictable_size(name)
+            - self.window_offsets[name]
+            for name, _ in self.windows
+        )
 
     def has_capacity(self) -> bool:
-        if self.rules.window == "joint":
-            return self._fits(0, 0)
-        fits = (
-            PrefillBudget.has_capacity(self)
-            if self.rules.window == "none"
-            else super().has_capacity()
-        )
-        return fits and (not self.has_state_slots or self._state_fits(0, 0, 0))
+        return self._fits(0, self._no_window_tokens())
 
-    def _state_fits(self, full_tokens, swa_tokens, state_slots):
-        return self.allocator.prefill_state_fits(
-            full_tokens + self.total_offset,
-            swa_tokens + self.swa_offset,
-            state_slots + self.pending_state_slots,
-            full_evictable_tokens=self.tree_cache.full_evictable_size(),
-            swa_evictable_tokens=(
-                self.tree_cache.swa_evictable_size()
-                if self.rules.window != "none"
-                else 0
-            ),
-            state_evictable_slots=(
-                self.tree_cache.mamba_evictable_size()
-                if self.tree_cache.supports_mamba()
-                else 0
-            ),
+    def state_slots_fit(self, state_slots: int) -> bool:
+        return not self.has_state_slots or self._fits(
+            0, self._no_window_tokens(), state_slots
         )
 
-    def check_prefill(self, **kwargs) -> tuple[bool, int | None]:
-        if self.rules.window == "joint":
-            return self._joint_check_prefill(**kwargs)
-        state_slots = kwargs.pop("state_slots", 0)
-        if self.rules.window == "none":
-            result = PrefillBudget.check_prefill(self, **kwargs)
-            window_tokens = 0
-        else:
-            result = super().check_prefill(**kwargs)
-            window_tokens = self.swa_tokens(
-                kwargs["extend_input_len"],
-                kwargs["max_new_tokens"],
-                chunk_limit=kwargs["chunk_limit"],
-                swa_host_hit_length=kwargs["swa_host_hit_length"],
+    def state_slots_exhausted(self) -> bool:
+        return not self.state_slots_fit(1)
+
+    def check_prefill(
+        self,
+        *,
+        extend_input_len: int,
+        total_tokens: int,
+        max_new_tokens: int,
+        input_tokens: int,
+        chunk_limit: int | None,
+        window_host_hit_lengths: Optional[Mapping[str, int]] = None,
+        state_slots: int = 0,
+        chunk_align: int | None = None,
+        host_hit_tokens: int = 0,
+        held_state_slots: int = 0,
+    ) -> tuple[bool, int | None]:
+        """Admit the whole request if it fits; otherwise, with chunking, at the
+        largest chunk limit at which all of it fits an empty pool, if it fits now.
+
+        Transient pressure waits (a chunk cut to what is free now starves running
+        decodes); when nothing will give memory back, the largest limit that fits
+        now is taken, or the request is refused as `unschedulable`. The returned
+        limit is what `can_allocate_prefill` and `reserve` price at, and lies on
+        the truncation grid (``chunk_align``), so it never cuts an empty chunk.
+        The empty-pool check counts the ``held_state_slots`` the request already
+        holds, or it would wait on its own memory forever."""
+        self.unschedulable = False
+        host_hits = dict(window_host_hit_lengths or {})
+        granule = chunk_granule(self.page_size, chunk_align)
+        # Host-hit rows are charged page-ceiled with the extend, as the shape
+        # check's ``paged_input`` charges them, so whatever is admitted passes it.
+        host_rows = self.ceil_paged_tokens(
+            extend_input_len + host_hit_tokens
+        ) - self.ceil_paged_tokens(extend_input_len)
+        extra_tokens = (
+            total_tokens
+            - extend_input_len
+            - host_hit_tokens
+            + host_rows
+            - max_new_tokens
+            - self.page_size
+        )
+        cached_tokens = input_tokens - extend_input_len
+
+        def demand_at(limit):
+            return self.request_demand(
+                extend_input_len,
+                max_new_tokens,
+                chunk_limit=limit,
+                host_hit_lengths=host_hits,
+                state_slots=state_slots,
+                extra_tokens=extra_tokens,
+                cached_tokens=cached_tokens,
             )
-        if (
-            result[0]
-            and self.has_state_slots
-            and not self._state_fits(kwargs["total_tokens"], window_tokens, state_slots)
-        ):
-            return False, None
-        return result
+
+        def whole_request_at(limit):
+            # The rows a host hit restores are prompt rows here.
+            return self.request_demand(
+                input_tokens,
+                max_new_tokens,
+                chunk_limit=limit,
+                state_slots=state_slots + held_state_slots,
+                extra_tokens=extra_tokens - host_rows,
+            )
+
+        demand = demand_at(chunk_limit)
+        if self._admits(demand):
+            return True, chunk_limit
+        if chunk_limit is None:
+            return self._refuse()
+        ceiling = (
+            chunk_limit
+            if self._admits(whole_request_at(chunk_limit), empty_pool=True)
+            else self._whole_request_chunk_limit(
+                whole_request_at, chunk_limit, empty_pool=True, granule=granule
+            )
+        )
+        if ceiling:
+            if ceiling < chunk_limit and self._admits(demand_at(ceiling)):
+                return True, ceiling
+            # Transient pressure waits while something will give memory back;
+            # otherwise take the largest limit at which all of it fits now.
+            if self._waiting_frees_memory():
+                return False, None
+            limit = self._whole_request_chunk_limit(demand_at, ceiling, granule=granule)
+            return (True, limit) if limit else self._refuse()
+        # No chunk lets all of it fit an empty pool (the clip prices no host
+        # hit): take the largest chunk that fits now, at the caller's charge.
+        cap = self._chunk_cap(
+            max_chunk_tokens=min(chunk_limit, max(0, extend_input_len - 1)),
+            chunk_limit=chunk_limit,
+            host_hit_lengths=host_hits,
+            state_slots=state_slots,
+            extra_tokens=extra_tokens,
+            granule=granule,
+        )
+        return (True, min(chunk_limit, cap)) if cap > 0 else self._refuse()
+
+    def _whole_request_chunk_limit(
+        self, demand_at, chunk_limit, *, empty_pool=False, granule=None
+    ):
+        """The largest chunk limit on ``granule`` (a page by default), at
+        most ``chunk_limit``, at which the whole request
+        (``demand_at(limit)``) is admitted now (or in an empty pool)."""
+        return largest_fitting_chunk(
+            lambda limit: self._admits(demand_at(limit), empty_pool=empty_pool),
+            chunk_limit,
+            granule or self.page_size,
+        )
+
+    def _chunk_fits(
+        self,
+        tokens,
+        headroom,
+        *,
+        chunk_limit,
+        host_hit_lengths,
+        state_slots,
+        extra_tokens=0,
+        empty_pool=False,
+        now=False,
+    ):
+        # A chunk alone: it spans no more than its chunk, so it keeps no
+        # window beside the next one.
+        return self._admits(
+            self.request_demand(
+                tokens,
+                headroom,
+                chunk_limit=chunk_limit,
+                host_hit_lengths=host_hit_lengths,
+                state_slots=state_slots,
+                extra_tokens=extra_tokens,
+            ),
+            empty_pool=empty_pool,
+            now=now,
+        )
+
+    def _chunk_cap(
+        self,
+        *,
+        max_chunk_tokens,
+        chunk_limit,
+        host_hit_lengths,
+        state_slots,
+        extra_tokens=0,
+        now=False,
+        granule=None,
+    ):
+        """The largest chunk on ``granule`` (a page by default), without
+        decode headroom, the budget admits (with ``now``, whose rows are
+        there now)."""
+        return largest_fitting_chunk(
+            lambda tokens: self._chunk_fits(
+                tokens,
+                0,
+                chunk_limit=chunk_limit,
+                host_hit_lengths=host_hit_lengths,
+                state_slots=state_slots,
+                extra_tokens=extra_tokens,
+                now=now,
+            ),
+            max_chunk_tokens,
+            granule or self.page_size,
+        )
 
     def available_chunk_tokens(self, chunk_limit: int) -> int | None:
-        if self.rules.window == "joint":
-            return chunk_limit if chunk_limit > 0 else None
-        if self.rules.window == "none":
-            return PrefillBudget.available_chunk_tokens(self, chunk_limit)
-        return super().available_chunk_tokens(chunk_limit)
+        return chunk_limit if chunk_limit > 0 else None
 
-    def fit_chunk(self, **kwargs) -> int | None:
-        if self.rules.window == "joint":
-            return self._joint_fit_chunk(**kwargs)
-        if not self.has_state_slots:
-            return super().fit_chunk(**kwargs)
-        chunk_limit = super().fit_chunk(**kwargs)
-        if chunk_limit is None:
-            return None
-        return self._fit_chunk_limit(
-            extend_input_len=kwargs["extend_input_len"],
-            max_new_tokens=kwargs["max_new_tokens"],
-            chunk_limit=chunk_limit,
-            fits=lambda tokens, headroom: self.can_allocate_prefill(
-                paged_input=self.ceil_paged_tokens(tokens) + headroom + self.page_size,
-                extend_input_len=tokens,
-                max_new_tokens=headroom,
-                chunk_limit=chunk_limit,
-                state_slots=kwargs.get("state_slots", 0),
-            ),
-        )
-
-    def _fit_chunk_limit(self, *, extend_input_len, max_new_tokens, chunk_limit, fits):
-        """Choose a bounded chunk with decode headroom only on its final pass."""
+    def fit_chunk(
+        self,
+        req,
+        *,
+        extend_input_len: int,
+        max_new_tokens: int,
+        chunk_limit: int,
+        state_slots: int = 0,
+        chunk_align: int | None = None,
+    ) -> int | None:
+        """The next chunk of the admitted chunked request ``req``: it needs only
+        the rows it writes now. Without them it waits while others hold rows,
+        else shrinks onto the truncation grid, so a lone request always finishes."""
         candidate = min(extend_input_len, chunk_limit)
-        finishes = candidate >= extend_input_len
-        if fits(candidate, max_new_tokens if finishes else 0):
-            return chunk_limit
-        upper = max(0, candidate - 1) if finishes else candidate
-        low, high = 0, upper // self.page_size
-        while low < high:
-            mid = (low + high + 1) // 2
-            if fits(mid * self.page_size, 0):
-                low = mid
-            else:
-                high = mid - 1
-        return min(chunk_limit, low * self.page_size) if low else None
-
-    def can_allocate_prefill(self, **kwargs) -> bool:
-        if self.rules.window == "joint":
-            return self._joint_can_allocate_prefill(**kwargs)
-        state_slots = kwargs.pop("state_slots", 0)
-        if self.rules.window == "none":
-            fits = PrefillBudget.can_allocate_prefill(self, **kwargs)
-            window_tokens = 0
-        else:
-            fits = super().can_allocate_prefill(**kwargs)
-            window_tokens = self.swa_tokens(
-                kwargs["extend_input_len"],
-                kwargs["max_new_tokens"],
-                chunk_limit=kwargs["chunk_limit"],
-                swa_host_hit_length=kwargs.get("swa_host_hit_length", 0),
-            )
-        return fits and (
-            not self.has_state_slots
-            or self._state_fits(kwargs["paged_input"], window_tokens, state_slots)
+        fits = dict(
+            chunk_limit=chunk_limit,
+            host_hit_lengths=None,
+            state_slots=state_slots,
+            now=True,
         )
+        if self._chunk_fits(candidate, 0, **fits):
+            return chunk_limit
+        if self._others_hold_memory(req):
+            return None
+        cap = self._chunk_cap(
+            max_chunk_tokens=candidate,
+            granule=chunk_granule(self.page_size, chunk_align),
+            **fits,
+        )
+        return min(chunk_limit, cap) if cap else None
 
-    def prepare_load_back(self, **kwargs) -> bool:
-        if self.rules.window == "joint":
-            return self._joint_prepare_load_back(**kwargs)
-        return super().prepare_load_back(**kwargs)
+    def can_allocate_prefill(
+        self,
+        *,
+        paged_input: int,
+        extend_input_len: int,
+        max_new_tokens: int,
+        chunk_limit: int | None,
+        state_slots: int = 0,
+        window_host_hit_lengths: Optional[Mapping[str, int]] = None,
+        admitted_chunk_limit: int | None = None,
+        cached_tokens: int = 0,
+    ) -> bool:
+        """Whether the selected shape fits, priced at ``admitted_chunk_limit`` as
+        admission priced it, with ``paged_input`` as the token sub-pool's charge."""
+        return self._admits(
+            self.request_demand(
+                extend_input_len,
+                max_new_tokens,
+                chunk_limit=(
+                    chunk_limit
+                    if admitted_chunk_limit is None
+                    else admitted_chunk_limit
+                ),
+                host_hit_lengths=dict(window_host_hit_lengths or {}),
+                state_slots=state_slots,
+                extra_tokens=paged_input
+                - self.ceil_paged_tokens(extend_input_len)
+                - self.page_size,
+                cached_tokens=cached_tokens,
+            )
+        )
 
     def reserve(
         self,
@@ -634,71 +935,35 @@ class ChainPrefillBudget(SWAPrefillBudget):
         state_slots: int = 0,
         chunk_limit: int | None = None,
         is_chunked_continuation: bool = False,
+        unfinished_input_len: int = 0,
+        deferred_max_new_tokens: int = 0,
+        admitted_chunk_limit: int | None = None,
+        cached_tokens: int = 0,
     ) -> None:
-        if self.rules.window == "none":
-            PrefillBudget.reserve(
-                self,
-                extend_input_len,
-                max_new_tokens,
-                extra_tokens=extra_tokens,
-                state_slots=0,
-            )
-        else:
-            super().reserve(
-                extend_input_len,
-                max_new_tokens,
-                extra_tokens=extra_tokens,
-                state_slots=0,
-                chunk_limit=chunk_limit,
-                is_chunked_continuation=is_chunked_continuation,
-            )
-        self.pending_state_slots += state_slots
-        if self.auxiliary_window_size is not None:
-            self.auxiliary_swa_offset += self.auxiliary_tokens(
-                self.ceil_paged_tokens(extend_input_len),
-                max_new_tokens,
-                chunk_limit=chunk_limit,
-            )
-
-    def _fits(
-        self,
-        full_tokens,
-        swa_tokens,
-        *,
-        empty_pool=False,
-        auxiliary_swa_tokens=None,
-        state_slots=0,
-    ):
-        demand = {}
-        if self.has_state_slots:
-            demand["state_slots"] = state_slots + (
-                0 if empty_pool else self.pending_state_slots
-            )
-        if self.auxiliary_window_size is not None:
-            demand["auxiliary_swa_tokens"] = (
-                full_tokens if auxiliary_swa_tokens is None else auxiliary_swa_tokens
-            ) + (0 if empty_pool else self.auxiliary_swa_offset)
-        return self.allocator.can_reserve(
-            full_tokens + (0 if empty_pool else self.total_offset),
-            swa_tokens + (0 if empty_pool else self.swa_offset),
-            full_evictable_tokens=0
-            if empty_pool
-            else self.tree_cache.full_evictable_size(),
-            swa_evictable_tokens=0
-            if empty_pool
-            else self.tree_cache.swa_evictable_size(),
-            auxiliary_swa_evictable_tokens=0
-            if empty_pool
-            else self.tree_cache.auxiliary_swa_evictable_size(),
-            state_evictable_slots=(
-                self.tree_cache.mamba_evictable_size()
-                if self.has_state_slots and not empty_pool
-                else 0
-            ),
-            empty_pool=empty_pool,
-            require_token_slack=empty_pool,
-            **demand,
+        """Charge an admitted chunk now and commit its whole request (the rest of
+        the prompt and its decode stay pending), priced as admission priced it."""
+        if admitted_chunk_limit is not None:
+            chunk_limit = admitted_chunk_limit
+        extend_input_len = self.ceil_paged_tokens(extend_input_len)
+        committed = self.request_demand(
+            extend_input_len + unfinished_input_len,
+            max_new_tokens + deferred_max_new_tokens,
+            chunk_limit=chunk_limit,
+            extra_tokens=extra_tokens,
+            cached_tokens=cached_tokens,
         )
+        now = self.request_demand(
+            extend_input_len,
+            0,
+            chunk_limit=chunk_limit,
+            extra_tokens=extra_tokens,
+        )
+        self.total_offset += committed.full_tokens
+        self.current_offset += now.full_tokens
+        self.pending_state_slots += state_slots
+        for name, _ in self.windows:
+            self.window_offsets[name] += committed.window_tokens[name]
+            self.window_current_offsets[name] += now.window_tokens[name]
 
     def _load_back_demand(
         self,
@@ -706,189 +971,36 @@ class ChainPrefillBudget(SWAPrefillBudget):
         full_tokens: int,
         extend_input_len: int,
         max_new_tokens: int,
-        swa_host_hit_length: int,
         chunk_limit: int | None,
-        auxiliary_swa_host_hit_length: int = 0,
+        window_host_hit_lengths: Optional[Mapping[str, int]] = None,
         state_slots: int = 0,
     ):
-        # H2D pins the restored bands. Realize the selected joint budget while their
-        # holes can still be compacted, including pending prefill/decode demand.
+        # H2D pins the restored rows. Realize the selected budget while the
+        # chain can still be compacted, including pending prefill/decode demand.
         full_tokens = int(self.ceil_paged_tokens(full_tokens + self.total_offset))
-        swa_tokens = int(
-            self.ceil_paged_tokens(
-                self.swa_tokens(
-                    extend_input_len,
-                    max_new_tokens,
-                    chunk_limit=chunk_limit,
-                    swa_host_hit_length=swa_host_hit_length,
-                )
-                + self.swa_offset
-            )
+        windows = {
+            name: int(self.ceil_paged_tokens(tokens + self.window_offsets[name]))
+            for name, tokens in self.window_tokens(
+                extend_input_len,
+                max_new_tokens,
+                purpose=DemandPurpose.LOAD_BACK,
+                chunk_limit=chunk_limit,
+                host_hit_lengths=dict(window_host_hit_lengths or {}),
+            ).items()
+        }
+        return KVDemand(
+            full_tokens,
+            windows,
+            state_slots + self.pending_state_slots if self.has_state_slots else 0,
         )
-        demand = {}
-        if self.has_state_slots:
-            demand["state_slots"] = state_slots + self.pending_state_slots
-        if self.auxiliary_window_size is not None:
-            demand["auxiliary_swa_tokens"] = self.ceil_paged_tokens(
-                self.auxiliary_tokens(
-                    extend_input_len,
-                    max_new_tokens,
-                    chunk_limit=chunk_limit,
-                    host_hit_length=auxiliary_swa_host_hit_length,
-                )
-                + self.auxiliary_swa_offset
-            )
-        return full_tokens, swa_tokens, demand
 
-    def _joint_prepare_load_back(self, **kwargs) -> bool:
-        full_tokens, swa_tokens, demand = self._load_back_demand(**kwargs)
+    def prepare_load_back(self, **kwargs) -> bool:
         return (
-            self.allocator.reclaim_for_prealloc(
-                self.tree_cache, full_tokens, swa_tokens, **demand
+            reclaim_for_load_back(
+                self.tree_cache, self.allocator, self._load_back_demand(**kwargs)
             )
             is None
         )
 
     def load_back_scope(self, **kwargs):
-        if self.rules.window != "joint":
-            return nullcontext()
-        full_tokens, swa_tokens, demand = self._load_back_demand(**kwargs)
-        return self.allocator.scoped_physical_takes(full_tokens, swa_tokens, **demand)
-
-    def _joint_chunk_cap(
-        self,
-        *,
-        max_chunk_tokens,
-        chunk_limit,
-        swa_host_hit_length=0,
-        auxiliary_swa_host_hit_length=0,
-        state_slots=0,
-    ):
-        lo, hi = 0, max(0, max_chunk_tokens) // self.page_size
-        while lo < hi:
-            mid = (lo + hi + 1) // 2
-            tokens = mid * self.page_size
-            if self._fits(
-                tokens + self.page_size,
-                self.swa_tokens(
-                    tokens,
-                    0,
-                    chunk_limit=chunk_limit,
-                    swa_host_hit_length=swa_host_hit_length,
-                ),
-                auxiliary_swa_tokens=self.auxiliary_tokens(
-                    tokens,
-                    0,
-                    chunk_limit=chunk_limit,
-                    host_hit_length=auxiliary_swa_host_hit_length,
-                ),
-                state_slots=state_slots,
-            ):
-                lo = mid
-            else:
-                hi = mid - 1
-        return lo * self.page_size
-
-    def _joint_check_prefill(
-        self,
-        *,
-        extend_input_len: int,
-        total_tokens: int,
-        max_new_tokens: int,
-        input_tokens: int,
-        swa_host_hit_length: int,
-        chunk_limit: int | None,
-        auxiliary_swa_host_hit_length: int = 0,
-        state_slots: int = 0,
-    ) -> tuple[bool, int | None]:
-        needed = self.swa_tokens(
-            extend_input_len,
-            max_new_tokens,
-            chunk_limit=chunk_limit,
-            swa_host_hit_length=swa_host_hit_length,
-        )
-        auxiliary_tokens = self.auxiliary_tokens(
-            extend_input_len,
-            max_new_tokens,
-            chunk_limit=chunk_limit,
-            host_hit_length=auxiliary_swa_host_hit_length,
-        )
-        if self._fits(
-            total_tokens,
-            needed,
-            auxiliary_swa_tokens=auxiliary_tokens,
-            state_slots=state_slots,
-        ):
-            return True, chunk_limit
-        if chunk_limit is None or self._fits(
-            input_tokens + max_new_tokens + self.page_size,
-            self.swa_tokens(input_tokens, max_new_tokens, chunk_limit=chunk_limit),
-            auxiliary_swa_tokens=self.auxiliary_tokens(
-                input_tokens,
-                max_new_tokens,
-                chunk_limit=chunk_limit,
-            ),
-            empty_pool=True,
-            state_slots=state_slots,
-        ):
-            return False, None
-        cap = self._joint_chunk_cap(
-            max_chunk_tokens=min(chunk_limit, max(0, extend_input_len - 1)),
-            chunk_limit=chunk_limit,
-            swa_host_hit_length=swa_host_hit_length,
-            auxiliary_swa_host_hit_length=auxiliary_swa_host_hit_length,
-            state_slots=state_slots,
-        )
-        return (True, min(chunk_limit, cap)) if cap > 0 else (False, None)
-
-    def _joint_fit_chunk(
-        self,
-        *,
-        extend_input_len: int,
-        max_new_tokens: int,
-        chunk_limit: int,
-        state_slots: int = 0,
-    ) -> int | None:
-        return self._fit_chunk_limit(
-            extend_input_len=extend_input_len,
-            max_new_tokens=max_new_tokens,
-            chunk_limit=chunk_limit,
-            fits=lambda tokens, headroom: self._fits(
-                self.ceil_paged_tokens(tokens) + headroom + self.page_size,
-                self.swa_tokens(tokens, headroom, chunk_limit=chunk_limit),
-                auxiliary_swa_tokens=self.auxiliary_tokens(
-                    tokens,
-                    headroom,
-                    chunk_limit=chunk_limit,
-                ),
-                state_slots=state_slots,
-            ),
-        )
-
-    def _joint_can_allocate_prefill(
-        self,
-        *,
-        paged_input: int,
-        extend_input_len: int,
-        max_new_tokens: int,
-        chunk_limit: int | None,
-        state_slots: int = 0,
-        swa_host_hit_length: int = 0,
-        auxiliary_swa_host_hit_length: int = 0,
-    ) -> bool:
-        return self._fits(
-            paged_input + max_new_tokens,
-            self.swa_tokens(
-                extend_input_len,
-                max_new_tokens,
-                chunk_limit=chunk_limit,
-                swa_host_hit_length=swa_host_hit_length,
-            ),
-            auxiliary_swa_tokens=self.auxiliary_tokens(
-                extend_input_len,
-                max_new_tokens,
-                chunk_limit=chunk_limit,
-                host_hit_length=auxiliary_swa_host_hit_length,
-            ),
-            state_slots=state_slots,
-        )
+        return self.allocator.scoped_physical_takes(self._load_back_demand(**kwargs))

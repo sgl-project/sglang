@@ -693,6 +693,17 @@ class BaseRunner(ABC):
         else:
             lora_ids = None
 
+        # kv-canary token-oracle request ids; the buffers hold them only when
+        # the oracle is enabled.
+        rids_int = (
+            buffers.rids_int[:batch_size] if buffers.rids_int is not None else None
+        )
+        bootstrap_room_ids_int = (
+            buffers.bootstrap_room_ids_int[:batch_size]
+            if buffers.bootstrap_room_ids_int is not None
+            else None
+        )
+
         forward_batch = ForwardBatch(
             forward_mode=capture_forward_mode,
             batch_size=batch_size,
@@ -729,6 +740,8 @@ class BaseRunner(ABC):
             ),
             global_forward_mode=capture_forward_mode,
             lora_ids=lora_ids,
+            rids_int=rids_int,
+            bootstrap_room_ids_int=bootstrap_room_ids_int,
         )
         mr.runner_ids.bind_runner_slots(forward_batch)
 
