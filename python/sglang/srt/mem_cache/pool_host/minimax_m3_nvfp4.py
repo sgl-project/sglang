@@ -171,7 +171,7 @@ class MiniMaxM3Nvfp4IndexKPoolHost(HostKVCache):
         device = self.device_rows[0].device
         if not (_is_cuda or _is_hip) or device.type != "cuda" or not self.pin_memory:
             return
-        from sglang.kernels.ops.kvcache.nvfp4_hicache import warmup_page_row_transfer
+        from sglang.kernels.ops.kvcache.page_row import warmup_page_row_transfer
 
         # The kernel IO backend has no fallback; fail at construction, not mid-serving.
         warmup_page_row_transfer()
@@ -194,7 +194,7 @@ class MiniMaxM3Nvfp4IndexKPoolHost(HostKVCache):
         self._host_stride = self._host_layer_pages(0).stride(0)
 
     def _copy_page_rows(self, tables, host_pages, device_pages, *, load):
-        from sglang.kernels.ops.kvcache.nvfp4_hicache import transfer_page_rows
+        from sglang.kernels.ops.kvcache.page_row import transfer_page_rows
 
         transfer_page_rows(
             *tables,
@@ -213,7 +213,7 @@ class MiniMaxM3Nvfp4IndexKPoolHost(HostKVCache):
             and host_indices.is_cuda
             and host_indices.device == device_indices.device
         ):
-            from sglang.kernels.ops.kvcache.nvfp4_hicache import prepare_nvfp4_pages
+            from sglang.kernels.ops.kvcache.page_row import prepare_nvfp4_pages
 
             return prepare_nvfp4_pages(
                 host_indices, device_indices, self.size, self.device_slots
