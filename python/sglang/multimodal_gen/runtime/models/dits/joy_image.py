@@ -97,7 +97,7 @@ def _joy_image_qk_rope(
         or q.dtype != torch.bfloat16
         or k.dtype != q.dtype
         or k.device != q.device
-        or torch.cuda.get_device_capability(q.device) != (9, 0)
+        or torch.cuda.get_device_capability(q.device) not in ((9, 0), (10, 3))
         or any(x.stride() != (q.shape[1] * 12288, 12288, 128, 1) for x in (q, k))
         or cache.ndim != 2
         or cache.shape[1] != 128

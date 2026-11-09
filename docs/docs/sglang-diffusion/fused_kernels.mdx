@@ -215,10 +215,11 @@ unsupported layouts, gradient-bearing inputs, and unverified signatures
 during graph capture use the native path. This does not enable model-level
 BCG support.
 
-For large Hopper BF16 image Q/K with 32 heads of width 128, Joy also uses
-the existing out-of-place QK-Norm + RoPE kernel to read the packed projection
-directly. This removes two input copies while retaining the original CUDA
-arithmetic and contiguous outputs. Each new signature is checked bitwise;
+On SM90 and SM103, Joy uses the existing out-of-place QK-Norm + RoPE
+kernel for packed BF16 image Q/K tensors with 32 heads of width 128 and
+at least 16,777,216 elements. It reads the packed projection directly,
+removing two input copies while retaining the original CUDA arithmetic
+and contiguous outputs. Each new signature is checked bitwise;
 inputs remain intact if the operation fails. Other shapes and platforms,
 compilation, unverified capture, and `SGLANG_ENABLE_FUSED_QKNORM_ROPE=0`
 retain the original helper.
