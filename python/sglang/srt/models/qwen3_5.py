@@ -731,6 +731,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             and ba.bias is None
         ):
             return
+        if qkvz.weight.device.type == "cpu" or ba.weight.device.type == "cpu":
+            # CPU offload stages registered parameters, but this derived cache
+            # would remain on the host. Keep the separate-projection path.
+            return
         fused = torch.cat([qkvz.weight.data, ba.weight.data], dim=0).contiguous()
         self._fused_in_proj_qkvz_width = qkvz.weight.shape[0]
         qkvz.weight.data = fused[: self._fused_in_proj_qkvz_width]
