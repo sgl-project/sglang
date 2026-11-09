@@ -54,10 +54,18 @@ from sglang.srt.layers.attention.graph_variants import (
 from sglang.srt.layers.cp.utils import is_mla_cp_enabled
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
+    require_attn_tp_gather,
+    require_mlp_tp_gather,
     set_dp_buffer_len,
     set_is_extend_in_batch,
 )
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.logits_processor import (
+    VERIFY_FULL_LOGITS,
+    VERIFY_LOGITS_VARIANTS,
+    VERIFY_VOCAB_SHARDS,
+    LogitsProcessor,
+    LogitsProcessorOutput,
+)
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     CudaGraphBufferRegistry,
     GraphSlot,
@@ -100,8 +108,10 @@ from sglang.srt.model_executor.runner_backend_utils import CUDA_GRAPH_CAPTURE_FA
 from sglang.srt.model_executor.runner_utils.buffers import DecodeInputBuffers
 from sglang.srt.model_executor.runner_utils.capture_mode import (
     _set_capture_attention_variant,
+    capture_logits_variant,
     capture_lora_variant,
     get_capture_attention_variant,
+    get_capture_logits_variant,
     model_capture_mode,
 )
 from sglang.srt.model_executor.runner_utils.deepep_adapter import (
@@ -117,12 +127,7 @@ from sglang.srt.model_executor.runner_utils.pool import (
 from sglang.srt.model_executor.runner_utils.shared_read_event import make_external_event
 from sglang.srt.models.unlimited_ocr_v2_support.decode_graph_io import UOCRDecodeGraphIO
 from sglang.srt.runtime_context import get_exec, get_flags, get_parallel, get_spec
-from sglang.srt.utils import (
-    empty_context,
-    get_available_gpu_memory,
-    require_attn_tp_gather,
-    require_mlp_tp_gather,
-)
+from sglang.srt.utils import empty_context, get_available_gpu_memory
 from sglang.srt.utils.device_timer import device_timer_ctx
 
 try:
@@ -143,6 +148,16 @@ def _attention_variant_during_prep(attention_variant):
         yield
     finally:
         _set_capture_attention_variant(before)
+
+
+def _sharded_verify_logits_processor(model) -> Optional[LogitsProcessor]:
+    processors = [
+        module
+        for module in model.modules()
+        if isinstance(module, LogitsProcessor)
+        and getattr(module, "sharded_verify", False)
+    ]
+    return processors[0] if len(processors) == 1 else None
 
 
 # Draft metadata glue: steps between two "draft glue" tally lines per rank
@@ -268,6 +283,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     # size); class defaults, since runners built without __init__ set neither
     attention_graph_variants: Optional[AttentionGraphVariants] = None
     attention_variant_sizes: Optional[frozenset[int]] = None
+    # The target-verify logits formats, (None,) unless the target shards its verify
+    logits_graph_variants: tuple = (None,)
+    _verify_logits_processor: Optional[LogitsProcessor] = None
     # Set in __init__: which DSpark runner's prep the glue graph serves past the guard.
     _draft_metadata_glue = False
     _target_metadata_glue = False
@@ -419,6 +437,18 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     tokens_per_request=self.captured_req_width,
                 )
             )
+        # A sharded-verify target captures both logits formats; each batch picks one.
+        self._verify_logits_processor = (
+            _sharded_verify_logits_processor(model_runner.model)
+            if self.capture_forward_mode == ForwardMode.TARGET_VERIFY
+            and not model_runner.is_draft_worker
+            else None
+        )
+        self.logits_graph_variants = (
+            VERIFY_LOGITS_VARIANTS
+            if self._verify_logits_processor is not None
+            else (None,)
+        )
 
         self.ragged_verify_mode = (
             ragged_verify_compact_graphs_enabled(self.model_runner.spec_algorithm)
@@ -754,6 +784,29 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             attention_variant=attention_variant,
         )
 
+    def _with_logits_variant(self, key, logits_variant: Optional[str]):
+        if logits_variant is None:
+            return key
+        return dataclasses.replace(key, logits_variant=logits_variant)
+
+    def _resolve_logits_variant(
+        self, forward_batch: ForwardBatch, *, padded: bool = False
+    ) -> Optional[str]:
+        processor = self._verify_logits_processor
+        if processor is None:
+            return None
+        # The full-logits graph gathers the vocabulary of every padding row too;
+        # a padded replay keeps shards so the consumer gathers only real rows.
+        if padded or processor.verify_uses_vocab_shards(forward_batch):
+            return VERIFY_VOCAB_SHARDS
+        return VERIFY_FULL_LOGITS
+
+    def _replay_pads_rows(self, *, raw_bs: int, bs: int, is_ragged: bool) -> bool:
+        # Every TP rank sees the same raw_bs and bucket list, hence the same
+        # choice. Under MLP TP gather the bucket follows the largest DP batch,
+        # so padding differs per rank and only the sampling decides there.
+        return not is_ragged and not self.require_mlp_tp_gather and bs != raw_bs
+
     def _capture_graph_size(self, *, bs: int, num_tokens: int) -> int:
         return num_tokens if self.ragged_verify_mode else bs
 
@@ -808,10 +861,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if not model_runner.spec_algorithm.is_dspark():
             return False
         from sglang.srt.speculative.dspark_components.dspark_config import (
-            draft_is_deepseek_v4,
+            draft_uses_compressed_kv_attention,
         )
 
-        return not draft_is_deepseek_v4()
+        return not draft_uses_compressed_kv_attention()
 
     def _ragged_capture_slots(self, num_tokens: int) -> int:
         if envs.SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE.get():
@@ -850,13 +903,28 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         cap_layout = self._captured_ragged_layouts.get(graph_size_key)
         if cap_layout is None:
             return
+        from sglang.kernels.ops.speculative.ragged_verify_kernels import (
+            PaddedLayout,
+            PadVerifyLayout,
+        )
+
         live = ragged_layout
-        if live.bs != cap_layout.bs or live.cap is None:
-            live = live.padded_to_bucket(
-                padded_bs=cap_layout.bs, cap=self.captured_req_width
-            )
-        cap_layout.verify_lens.copy_(live.verify_lens)
-        cap_layout.qo_indptr_device.copy_(live.qo_indptr_device)
+        if live.bs == cap_layout.bs and live.cap is not None:
+            cap_layout.verify_lens.copy_(live.verify_lens)
+            cap_layout.qo_indptr_device.copy_(live.qo_indptr_device)
+            cap_layout.extend_start_loc.copy_(live.extend_start_loc)
+            return
+        PadVerifyLayout.execute(
+            verify_lens=live.verify_lens,
+            graph_num_tokens=live.graph_num_tokens,
+            padded_bs=cap_layout.bs,
+            cap=self.captured_req_width,
+            out=PaddedLayout(
+                verify_lens=cap_layout.verify_lens,
+                qo_indptr=cap_layout.qo_indptr_device,
+                extend_start_loc=cap_layout.extend_start_loc,
+            ),
+        )
 
     @staticmethod
     def _max_dp_batch_size(forward_batch: ForwardBatch) -> int:
@@ -913,14 +981,17 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         else:
             cuda_graph_bs = forward_batch.batch_size
 
-        graph_key = self._make_graph_key(
-            cuda_graph_bs,
-            variant_label=self._resolve_lora_variant(forward_batch),
-            attention_variant=(
-                self._resolve_attention_variant(forward_batch, cuda_graph_bs)
-                if self.disable_padding
-                else None
+        graph_key = self._with_logits_variant(
+            self._make_graph_key(
+                cuda_graph_bs,
+                variant_label=self._resolve_lora_variant(forward_batch),
+                attention_variant=(
+                    self._resolve_attention_variant(forward_batch, cuda_graph_bs)
+                    if self.disable_padding
+                    else None
+                ),
             ),
+            self._resolve_logits_variant(forward_batch),
         )
 
         is_bs_supported = (
@@ -1010,6 +1081,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         bs: int,
         variant_label: Optional[str],
         attention_variant: Optional[str],
+        logits_variant: Optional[str] = None,
     ) -> None:
         """Name the trace for one capture. bs alone is not unique: the capture
         loop multiplies it by the lora and attention variants (DSA captures
@@ -1021,6 +1093,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         parts = [f"bs_{bs}"]
         if attention_variant is not None:
             parts.append(attention_variant)
+        if logits_variant is not None:
+            parts.append(logits_variant)
         if variant_label is not None:
             parts.append(variant_label)
         self._profile_trace_tag = "_".join(parts)
@@ -1205,6 +1279,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         with self.model_context():
             self._capture()
 
+    def _capture_profile_options(self) -> CaptureProfileOptions:
+        per_shape = self._graph_batch_capture_active()
+        if per_shape:
+            self._profile_trace_tag = None
+        return CaptureProfileOptions(
+            runner_name=self._profile_runner_name(),
+            per_shape=per_shape,
+            get_trace_tag=lambda: getattr(self, "_profile_trace_tag", None),
+        )
+
     def _capture(self) -> None:
         # Warm up + autotune kernels once before capture (run-once across the
         # decode + prefill runners; see BaseRunner.warmup).
@@ -1225,16 +1309,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # the original unscheduled pass leaves this None.
         self._profiler = None
         if self.enable_profile_cuda_graph:
-            per_shape = self._graph_batch_capture_active()
-            if per_shape:
-                self._profile_trace_tag = None
-            profile_options = CaptureProfileOptions(
-                runner_name=self._profile_runner_name(),
-                per_shape=per_shape,
-                get_trace_tag=lambda: getattr(self, "_profile_trace_tag", None),
-            )
+            profile_options = self._capture_profile_options()
             profile_context = self.backend.capture_profile_context(profile_options)
-            if per_shape:
+            if profile_options.per_shape:
                 self._profiler = profile_context
 
         # share_buffers() coalesces seq_lens / seq_lens_cpu through the process-
@@ -1301,21 +1378,28 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 with capture_lora_variant(variant_label):
                     for attention_variant in attention_variants:
                         _set_capture_attention_variant(attention_variant)
-                        self._set_profile_trace_tag(
-                            bs, variant_label, attention_variant
-                        )
-                        with self.backend.prepare_capture_forward(
-                            self.model_runner.model,
-                            enable_compile=bs in self.compile_bs,
-                            num_tokens=bs * self.captured_req_width,
-                            tp_group=get_parallel().tp_group,
-                        ) as forward:
-                            self.capture_one_shape(
+                        for logits_variant in self.logits_graph_variants:
+                            self._set_profile_trace_tag(
                                 bs,
-                                forward,
                                 variant_label,
                                 attention_variant,
+                                logits_variant,
                             )
+                            with (
+                                capture_logits_variant(logits_variant),
+                                self.backend.prepare_capture_forward(
+                                    self.model_runner.model,
+                                    enable_compile=bs in self.compile_bs,
+                                    num_tokens=bs * self.captured_req_width,
+                                    tp_group=get_parallel().tp_group,
+                                ) as forward,
+                            ):
+                                self.capture_one_shape(
+                                    bs,
+                                    forward,
+                                    variant_label,
+                                    attention_variant,
+                                )
         _set_capture_attention_variant(None)
 
     def capture_one_shape(
@@ -1432,10 +1516,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
 
             with canary_ctx:
-                shape_key = self._make_graph_key(
-                    self._capture_graph_size(bs=bs, num_tokens=num_tokens),
-                    variant_label,
-                    attention_variant,
+                shape_key = self._with_logits_variant(
+                    self._make_graph_key(
+                        self._capture_graph_size(bs=bs, num_tokens=num_tokens),
+                        variant_label,
+                        attention_variant,
+                    ),
+                    get_capture_logits_variant(),
                 )
                 # Adaptive runners may own a different backend than model_runner.
                 post_warmup_hook = getattr(
@@ -1545,8 +1632,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 )
             variant_label = self._resolve_lora_variant(forward_batch)
             attention_variant = self._resolve_attention_variant(forward_batch, self.bs)
-            self._replay_graph_key = self._make_graph_key(
-                graph_size_key, variant_label, attention_variant
+            self._replay_graph_key = self._with_logits_variant(
+                self._make_graph_key(graph_size_key, variant_label, attention_variant),
+                self._resolve_logits_variant(
+                    forward_batch,
+                    padded=self._replay_pads_rows(
+                        raw_bs=self.raw_bs, bs=self.bs, is_ragged=is_ragged
+                    ),
+                ),
             )
             return
 
@@ -1658,8 +1751,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self._early_verify_metadata.count_variant(
                 attention_variant, taken=early_staged
             )
-        self._replay_graph_key = self._make_graph_key(
-            graph_size_key, variant_label, attention_variant
+        self._replay_graph_key = self._with_logits_variant(
+            self._make_graph_key(graph_size_key, variant_label, attention_variant),
+            self._resolve_logits_variant(
+                forward_batch,
+                padded=self._replay_pads_rows(
+                    raw_bs=raw_bs, bs=bs, is_ragged=is_ragged
+                ),
+            ),
         )
 
     def _staged_signature(self, forward_batch: ForwardBatch) -> Optional[tuple]:
@@ -1692,13 +1791,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
     def _glues_draft_metadata(self) -> bool:
         """Whether this draft runner's metadata prep runs through the glue graph: a
-        static-verify draft runner whose backend accepts it."""
+        draft runner whose backend accepts it."""
         if not self.model_runner.is_draft_worker:
             return False
-        if envs.SGLANG_RAGGED_VERIFY_MODE.get() != "static":
-            why = "ragged verify"
-        else:
-            why = self.attn_backend.glue_draft_metadata()
+        why = self.attn_backend.glue_draft_metadata()
         if why:
             logger.info("Draft metadata glue graph off: %s.", why)
             return False
