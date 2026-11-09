@@ -20,6 +20,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.pause_state import PauseState
 from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     KeyedReqList,
@@ -296,6 +297,8 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
             reqs=batch.reqs[:],
         )
         scheduler.result_queue = deque([pending])
+        # The partial scheduler has none of the lists request_lists() reads.
+        scheduler.request_lists = lambda: {}
 
         self.assertEqual(scheduler.collect_inflight_reqs(), {req})
 
@@ -392,7 +395,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
 
         self.assertEqual(scheduler.total_prefill_busy_us, total_us([14.0 - 6.25]))
         # Every window ended before this step's end, so none is kept.
-        self.assertEqual(len(scheduler._pause_intervals), 0)
+        self.assertEqual(scheduler.pause_state.consume_paused_time(0.0, 14.0), 0.0)
 
     def test_pause_inside_an_idle_gap_is_not_subtracted_from_the_next_prefill(self):
         scheduler = self.make_scheduler([])
@@ -412,11 +415,14 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         self.pause(scheduler, 1.0)
         self.pause(scheduler, 2.0)
         self.resume(scheduler, 3.0)
-        self.assertEqual(list(scheduler._pause_intervals), [(1.0, 3.0)])
+        # One window, [1.0, 3.0].
+        self.assertEqual(scheduler.pause_state.consume_paused_time(0.0, 1.5), 0.5)
+        self.assertEqual(scheduler.pause_state.consume_paused_time(0.0, 4.0), 2.0)
 
     def pause(self, scheduler, paused_at):
         with patch(
-            "sglang.srt.managers.scheduler.time.monotonic", return_value=paused_at
+            "sglang.srt.managers.scheduler_components.pause_state.time.monotonic",
+            return_value=paused_at,
         ):
             Scheduler.pause_generation(
                 scheduler, PauseGenerationReqInput(mode="in_place")
@@ -424,7 +430,8 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
 
     def resume(self, scheduler, resumed_at):
         with patch(
-            "sglang.srt.managers.scheduler.time.monotonic", return_value=resumed_at
+            "sglang.srt.managers.scheduler_components.pause_state.time.monotonic",
+            return_value=resumed_at,
         ):
             Scheduler.continue_generation(
                 scheduler, ContinueGenerationReqInput(torch_empty_cache=False)
@@ -550,14 +557,16 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler.running_reqs = KeyedReqList(ListKind.DECODING)
         scheduler.prefill_launched_reqs = KeyedReqList(ListKind.PREFILL_LAUNCHED)
         scheduler.tp_size = get_parallel().tp_size
+        scheduler.dp_tp_group = SimpleNamespace(
+            world_size=get_parallel().attn_tp_size
+            if get_parallel().attn_dp_enabled
+            else get_parallel().tp_size
+        )
         scheduler.gracefully_exit = False
-        scheduler._engine_paused = False
-        scheduler._deferred_input_requests = []
+        scheduler.pause_state = PauseState()
         scheduler._sched_idled = False
         scheduler._prev_step = None
         scheduler._prev_prefill_end_ts = None
-        scheduler._pause_intervals = deque(maxlen=scheduler_module.PAUSE_WINDOWS_MAX)
-        scheduler._pause_started_at = None
         scheduler.forward_ct = 0
         scheduler.processed_tokens_counter = 0
         scheduler.spec_algorithm = SpeculativeAlgorithm.NONE
@@ -648,6 +657,36 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler.disagg_decode_transfer_queue = SimpleNamespace(
             queue=[], staging_handler=None
         )
+
+
+class TestPrefillOverlapShutdownVote(CustomTestCase):
+    """On shutdown the overlap prefill loop launches nothing new, yet still runs
+    the one batch selection whose MLP-sync gather carries a group-local
+    ShutdownReq to the other attention-DP ranks."""
+
+    def setUp(self):
+        super().setUp()
+        enter_scope(self, published_topology(role="scheduler"))
+
+    def _selections_after_shutdown(self, vote_pending: bool) -> int:
+        scheduler = TestSchedulerIdleStepCounters.make_scheduler(self, [None])
+
+        def honor_shutdown(**kwargs):
+            scheduler.gracefully_exit = True
+            return True
+
+        scheduler.ingest_requests = Mock(side_effect=honor_shutdown)
+        scheduler.dp_attn_adapter = SimpleNamespace(
+            shutdown_vote_pending=lambda: vote_pending
+        )
+        Scheduler.event_loop_overlap_disagg_prefill(scheduler)
+        return scheduler.get_next_disagg_prefill_batch_to_run.call_count
+
+    def test_unsent_vote_still_reaches_the_gather(self):
+        self.assertEqual(self._selections_after_shutdown(vote_pending=True), 1)
+
+    def test_no_new_selection_without_a_vote_to_send(self):
+        self.assertEqual(self._selections_after_shutdown(vote_pending=False), 0)
 
 
 if __name__ == "__main__":
