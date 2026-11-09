@@ -220,7 +220,9 @@ class TestTrackMambaStateDtype(CustomTestCase):
                     ssm_states = torch.zeros(16, 1, 2, 2)[::2]
                     cache = SimpleNamespace(conv=[conv_states], temporal=ssm_states)
                     backend.state_layer_cache = lambda _: cache
-                    expected_indices = torch.arange(2) if contiguous else indices
+                    # Staged copies keep the padding sink at row 0, so the
+                    # requests sit at rows 1..n.
+                    expected_indices = torch.arange(1, 3) if contiguous else indices
                     # Fewer real tokens than rows marks a padded batch.
                     metadata.logical_num_tokens = 4 if contiguous else 3
 

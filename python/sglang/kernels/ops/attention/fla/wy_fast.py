@@ -9,6 +9,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.attention.fla.index import prepare_chunk_indices
+from sglang.srt.utils import use_gfx115_kernels
 
 
 # @triton.autotune(
@@ -41,8 +42,14 @@ def recompute_w_u_fwd_kernel(
     IS_VARLEN: tl.constexpr,
     v_stride_t=0,
     STRIDED_V: tl.constexpr = False,
+    HEAD_MAJOR: tl.constexpr = False,
 ):
-    i_t, i_bh = tl.program_id(0).to(tl.int64), tl.program_id(1).to(tl.int64)
+    # HEAD_MAJOR: heads vary fastest across the grid, so the programs running at once read
+    # the same token rows ([T, H, D] puts each head's row of a chunk 4 KB apart)
+    if HEAD_MAJOR:
+        i_bh, i_t = tl.program_id(0).to(tl.int64), tl.program_id(1).to(tl.int64)
+    else:
+        i_t, i_bh = tl.program_id(0).to(tl.int64), tl.program_id(1).to(tl.int64)
     i_b, i_h = i_bh // H, i_bh % H
     if IS_VARLEN:
         i_n, i_t = (
@@ -130,7 +137,9 @@ def recompute_w_u_fwd(
             v = v.contiguous()
     u = v.new_empty(B, T, H, V)
     w = k.new_empty(B, T, H, K)
-    recompute_w_u_fwd_kernel[(NT, B * H)](
+    head_major = use_gfx115_kernels()
+    recompute_w_u_fwd_kernel[(B * H, NT) if head_major else (NT, B * H)](
+        HEAD_MAJOR=head_major,
         k=k,
         v=v,
         beta=beta,
