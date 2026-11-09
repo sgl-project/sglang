@@ -19,7 +19,7 @@ from types import SimpleNamespace
 import numpy as np
 import requests
 
-from sglang.srt.utils.common import kill_process_tree
+from sglang.srt.utils.process import kill_process_tree
 from sglang.test.kits.radix_cache_server_kit import run_radix_attention_test
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (

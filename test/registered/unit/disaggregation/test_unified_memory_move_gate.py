@@ -24,6 +24,7 @@ from sglang.srt.disaggregation.utils import disagg_transfers_in_flight
 from sglang.srt.managers.scheduler_components.request_list import ListKind
 from sglang.srt.mem_cache.kv.alloc.band import Band
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator
+from sglang.srt.mem_cache.kv.alloc.page_usage import PageUsage
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.scheduler_test_utils import FakeReq, decode_queue
@@ -163,10 +164,12 @@ class TestPinnedPeerHolesAreNotSchedulable(CustomTestCase):
     class _Peer:
         def __init__(self, sources):
             self.lazy_compaction = True
-            self._free_phys_pages = [0, 1, 2, 3]  # only len() is read
-            self._load_pinned_pages = 0
+            self.usage = PageUsage()  # no page fixed
             self.entry_bytes_per_page = 512
             self.pin_sources = sources
+
+        def _reusable_pages(self):
+            return 4  # four holes, nothing pending
 
         def _is_frontier_transparent(self):
             return False
@@ -339,9 +342,9 @@ class TestUnifiedAllocatorsPublishTheTransferContract(CustomTestCase):
 
     def test_every_ordering_event_reaches_every_member(self):
         """Every member that can relocate pages must hear each event its moves
-        wait on: a member that misses a HiCache copy's event may move a page the
-        copy still reads or writes. Recurrent state is written by its own
-        kernels, so its member gets no in-flight token ids."""
+        wait on: a member that misses a forward's event may move a page the
+        forward still reads or writes. Recurrent state is written by its own
+        kernels, so its member gets the state slots, not the token ids."""
         for chain in self._CHAINS:
             alloc = self._chain(chain)
             received = {m.sub_pool_name: {} for m in alloc.members}
@@ -349,7 +352,6 @@ class TestUnifiedAllocatorsPublishTheTransferContract(CustomTestCase):
                 for member in alloc.members:
                     got = received[member.sub_pool_name]
                     for name, hook in (
-                        ("set_hicache_transfer_done_event", "hicache"),
                         ("set_latest_forward_done_event", "forward_done"),
                         ("set_inflight_forward", "inflight"),
                     ):
@@ -357,16 +359,15 @@ class TestUnifiedAllocatorsPublishTheTransferContract(CustomTestCase):
                             mock.patch.object(
                                 member,
                                 name,
-                                side_effect=lambda *args, got=got, hook=hook: (
+                                side_effect=lambda *args, got=got, hook=hook, **_: (
                                     got.__setitem__(hook, args[-1])
                                 ),
                             )
                         )
                 event, ids = object(), torch.tensor([5, 6])
-                alloc.set_hicache_transfer_done_event("load", event)
                 alloc.set_latest_forward_done_event(event)
-                alloc.set_inflight_forward(event, ids)
-            for hook in ("hicache", "forward_done", "inflight"):
+                alloc.set_inflight_forward(event, ids, torch.tensor([3]))
+            for hook in ("forward_done", "inflight"):
                 with self.subTest(chain=chain, hook=hook):
                     self.assertEqual(
                         {name for name, got in received.items() if hook in got},
@@ -376,7 +377,7 @@ class TestUnifiedAllocatorsPublishTheTransferContract(CustomTestCase):
             with self.subTest(chain=chain, hook="inflight ids"):
                 for name, got in received.items():
                     if name == "mamba":
-                        self.assertIsNone(got["inflight"])
+                        self.assertEqual(got["inflight"].tolist(), [3])
                     else:
                         self.assertEqual(got["inflight"].tolist(), [5, 6])
 

@@ -41,6 +41,7 @@ from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
 from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
+from sglang.srt.mem_cache.kv.router import KVLayerRouter
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.state_capturer.base import BaseTopkCapturer
 from sglang.test.test_utils import CustomTestCase
@@ -541,6 +542,8 @@ class TestWriteIds(CustomTestCase):
                     kvcache=SimpleNamespace(
                         full_kv_pool=FakeKVCache(pool, "full"),
                         mamba_pool=FakeKVCache(pool, "mamba"),
+                        # No sub-pool plays a role.
+                        layer_router=KVLayerRouter.from_layer_maps(None, ()),
                     ),
                     views=stand_in_views(
                         ChainRoles(owner="full", state="mamba"),
