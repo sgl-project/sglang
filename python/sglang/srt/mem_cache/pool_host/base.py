@@ -402,6 +402,15 @@ def synchronized(func):
     return wrapper
 
 
+def reject_unsupported_io_backend(pool_name: str, io_backend: str) -> None:
+    """Fail at startup for a pool without support for an opt-in IO backend."""
+    if io_backend == "direct_kernel":
+        raise ValueError(
+            f"{pool_name} does not support HiCache IO backend 'direct_kernel'; "
+            "use 'direct'."
+        )
+
+
 class HostKVCache(abc.ABC):
     dcp_size = 1
     dcp_rank = 0
@@ -707,6 +716,14 @@ class HostKVCache(abc.ABC):
         sizes = meta[1] if meta else None
         return int(sizes[0]) if sizes else None
 
+    def prepare_io_backend(self, io_backend: str) -> None:
+        """Validate this pool for `io_backend` and build its transfer kernels.
+
+        Runs once at controller startup, so an unsupported pool fails there
+        rather than on its first transfer.
+        """
+        reject_unsupported_io_backend(type(self).__name__, io_backend)
+
     def prepare_transfer_indices(
         self, host_indices, device_indices, io_backend
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -715,7 +732,8 @@ class HostKVCache(abc.ABC):
         Normal host pools expose physical indices directly and controllers have
         already moved them to the backend-required device. Shared compacting
         pools override this hook and resolve their logical ids while the transfer
-        engine holds a layout lease.
+        engine holds a layout lease. Page-row backends return page ids, which
+        their transfer methods then take in place of token slots.
         """
         return host_indices, device_indices
 

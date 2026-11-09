@@ -11,6 +11,7 @@ from sglang.kernels.ops.kvcache.hicache import (
 from sglang.kernels.ops.kvcache.hicache import (
     transfer_hicache_all_layer_mla_staged_lf_pf as jit_transfer_hicache_all_layer_mla_staged_lf_pf,
 )
+from sglang.kernels.ops.kvcache.hicache_direct import HiCacheDirectKernel
 from sglang.srt.mem_cache.device_pool_info import IndexKeyBufferInfo
 from sglang.srt.mem_cache.pool_host._kvcacheio import (
     MLA_KVCACHEIO_OPS,
@@ -145,6 +146,8 @@ class DSAIndexerPoolHost(HostKVCache):
         self.size_per_token = self.indexer_layout_dim // self.page_size
         self.can_use_jit = False
         self.can_use_write_back_jit = False
+        # Built by prepare_io_backend("direct_kernel").
+        self._direct_kernel: HiCacheDirectKernel | None = None
         if self._is_dummy:
             self.index_k_with_scale_buffer = None
             self.index_k_device_ptrs = None
@@ -287,6 +290,32 @@ class DSAIndexerPoolHost(HostKVCache):
             device=self._buffer_device,
         )
 
+    def prepare_io_backend(self, io_backend: str) -> None:
+        if io_backend != "direct_kernel" or self._is_dummy:
+            return
+        unsupported = None
+        if self.layout != "page_first_direct":
+            unsupported = f"it needs the page_first_direct layout, got {self.layout}"
+        elif self.dcp_size != 1:
+            unsupported = "decode context parallelism is not supported"
+        elif self._is_device_layer_sharded():
+            unsupported = "layer-sharded device pools are not supported"
+        # The packed device buffers follow host layer order, drafts included.
+        self._direct_kernel = HiCacheDirectKernel(
+            pool_name=type(self).__name__,
+            unsupported=unsupported,
+            host_pool=self.index_k_with_scale_buffer,
+            device_layers=self.packed_device_index_buffers,
+            page_size=self.page_size,
+        )
+
+    def prepare_transfer_indices(self, host_indices, device_indices, io_backend):
+        if io_backend == "direct_kernel":
+            return self._direct_kernel.page_ids(host_indices, device_indices)
+        return super().prepare_transfer_indices(
+            host_indices, device_indices, io_backend
+        )
+
     def get_hybrid_pool_buffer(self):
         return [self.index_k_with_scale_buffer]
 
@@ -328,6 +357,13 @@ class DSAIndexerPoolHost(HostKVCache):
             if is_draft
             else self._host_layer_index(layer_id)
         )
+
+        if io_backend == "direct_kernel":
+            # Indices are the page ids from prepare_transfer_indices.
+            self._direct_kernel.copy(
+                host_indices, device_indices, load=True, host_layer=host_layer_id
+            )
+            return
 
         host_page_indices, device_page_indices = self._get_indexer_page_indices(
             host_indices, device_indices
@@ -454,6 +490,10 @@ class DSAIndexerPoolHost(HostKVCache):
                     io_backend,
                     is_draft=True,
                 )
+            return
+
+        if io_backend == "direct_kernel":
+            self._direct_kernel.copy(host_indices, device_indices, load=False)
             return
 
         host_page_indices, device_page_indices = self._get_indexer_page_indices(

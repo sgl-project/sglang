@@ -25,6 +25,7 @@ from sglang.kernels.ops.kvcache.hicache import (
 from sglang.kernels.ops.kvcache.hicache import (
     transfer_hicache_one_layer_mla_page_unified_lf as jit_transfer_hicache_one_layer_mla_page_unified_lf,
 )
+from sglang.kernels.ops.kvcache.hicache_direct import HiCacheDirectKernel
 from sglang.srt.layers.dcp.layout import maybe_dcp_kernel_indices
 from sglang.srt.mem_cache.device_pool_info import MLABufferInfo, MLASplitBuffers
 from sglang.srt.mem_cache.pool_host._kvcacheio import (
@@ -245,6 +246,8 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             host_token_capacity=host_token_capacity,
             is_dummy=self._is_dummy,
         )
+        # Built by prepare_io_backend("direct_kernel").
+        self._direct_kernel: Optional[HiCacheDirectKernel] = None
         if self._is_dummy:
             self.token_stride_size = self.kv_cache_dim * self.dtype.itemsize
             self.layout_dim = self.token_stride_size * self.layer_num
@@ -528,6 +531,33 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             ),
             dtype=self.dtype,
             device=self._transfer_device,
+        )
+
+    def prepare_io_backend(self, io_backend: str) -> None:
+        if io_backend != "direct_kernel" or self._is_dummy:
+            return
+        unsupported = None
+        if self.layout != "page_first_direct":
+            unsupported = f"it needs the page_first_direct layout, got {self.layout}"
+        elif not self.device_rows_packed:
+            unsupported = "the device KV rows are strided"
+        elif self.dcp_size != 1:
+            unsupported = "decode context parallelism is not supported"
+        elif self._layer_shard_enabled:
+            unsupported = "layer-sharded device pools are not supported"
+        self._direct_kernel = HiCacheDirectKernel(
+            pool_name=type(self).__name__,
+            unsupported=unsupported,
+            host_pool=self.kv_buffer,
+            device_layers=self.device_kv_buffers,
+            page_size=self.page_size,
+        )
+
+    def prepare_transfer_indices(self, host_indices, device_indices, io_backend):
+        if io_backend == "direct_kernel":
+            return self._direct_kernel.page_ids(host_indices, device_indices)
+        return super().prepare_transfer_indices(
+            host_indices, device_indices, io_backend
         )
 
     def _indexer_slot_range_for_layer(self, buffers, device_layer_id):
@@ -839,6 +869,11 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
+        elif io_backend == "direct_kernel":
+            # Indices are the page ids from prepare_transfer_indices.
+            self._direct_kernel.copy(
+                host_indices, device_indices, load=True, host_layer=host_layer_id
+            )
         elif io_backend == "kernel_ascend":
             info_index = layer_id - self._device_layer_num + 1 if is_draft else 0
             native = self._native_infos[info_index].native_buffers()
@@ -1168,6 +1203,8 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
+        elif io_backend == "direct_kernel":
+            self._direct_kernel.copy(host_indices, device_indices, load=False)
         elif io_backend == "kernel_ascend":
             native = self._native_infos[0].native_buffers()
             if self.layout == "page_first_kv_split":

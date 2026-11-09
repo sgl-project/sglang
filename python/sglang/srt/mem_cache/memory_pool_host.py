@@ -73,6 +73,7 @@ from sglang.srt.mem_cache.pool_host import HostKVCache
 from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
     host_memory_preflight,
+    reject_unsupported_io_backend,
     synchronized,
 )
 from sglang.srt.mem_cache.pool_host.common import (
@@ -126,6 +127,9 @@ class LogicalHostPool:
         # until an allocation needs the released slots.
         self.release_slots = []
         self.num_release_slots = 0
+
+    def prepare_io_backend(self, io_backend: str) -> None:
+        reject_unsupported_io_backend(type(self).__name__, io_backend)
 
     def destroy(self) -> None:
         """Logical anchors own no backing buffers or registrations to release."""
