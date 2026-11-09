@@ -2121,6 +2121,68 @@ def test_sm120_paged_decode_graph_splits_follow_replay_lengths(monkeypatch):
             _assert_attention_close(out[index : index + 1], reference)
 
 
+def test_sm120_paged_decode_fixed_grain_covers_unaligned_window(monkeypatch):
+    """A sliding window whose visible span is a whole number of KV tiles starts inside
+    a tile and touches one tile more than the plan counted; it must still be attended."""
+    sm120_forward_host.clear_launch_plans()
+    plans = []
+    original_resolve_plan = Sm120ForwardHost.resolve_plan
+
+    def record_plan(**kwargs):
+        plan = original_resolve_plan(**kwargs)
+        plans.append(plan)
+        return plan
+
+    monkeypatch.setattr(Sm120ForwardHost, "resolve_plan", staticmethod(record_plan))
+    torch.manual_seed(20261109)
+    # More than eight batch/head groups selects the fixed-grain generic SplitKV path.
+    batch_size, num_q_heads, head_dim, page_size = 12, 6, 256, 64
+    window_left, max_seqlen = 511, 2048  # a visible span of exactly eight tiles
+    pages_per_request = max_seqlen // page_size
+    q = torch.randn(
+        batch_size, num_q_heads, head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    k_cache = torch.randn(
+        batch_size * pages_per_request,
+        page_size,
+        1,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    v_cache = torch.randn_like(k_cache)
+    page_table = torch.arange(
+        batch_size * pages_per_request, device="cuda", dtype=torch.int32
+    ).view(batch_size, pages_per_request)
+    cu_seqlens_q = torch.arange(batch_size + 1, device="cuda", dtype=torch.int32)
+    # Every window starts inside a tile, so each request touches nine tiles.
+    lengths = [1000, 1337, 777, 2000, 1500, 1111, 650, 999, 1234, 900, 1700, 1801]
+    out = flash_attn_with_kvcache(
+        q=q,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        page_table=page_table,
+        cache_seqlens=torch.tensor(lengths, device="cuda", dtype=torch.int32),
+        cu_seqlens_q=cu_seqlens_q,
+        max_seqlen_q=1,
+        max_seqlen_k=max_seqlen,
+        causal=True,
+        window_size=(window_left, 0),
+        num_splits=0,
+    )
+
+    assert plans
+    for plan in plans:
+        assert plan.num_splits > 1 and plan.split_kv_blocks_per_cta > 0
+    for index, length in enumerate(lengths):
+        pages = page_table[index]
+        start = length - 1 - window_left
+        k = k_cache.index_select(0, pages).flatten(0, 1)[start:length]
+        v = v_cache.index_select(0, pages).flatten(0, 1)[start:length]
+        reference, _ = _attention_reference(q[index : index + 1], k, v)
+        _assert_attention_close(out[index : index + 1], reference)
+
+
 def test_sm120_paged_decode_transpose_is_cache_order_independent():
     """Gather and page-TMA transpose must not share a compiled specialization."""
     torch.manual_seed(20260729)
