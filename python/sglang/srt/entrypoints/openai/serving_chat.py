@@ -70,6 +70,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionStreamResponse,
     ChatCompletionTokenLogprob,
     ChatMessage,
+    ChatTemplateCacheEntry,
     ChoiceLogprobs,
     DeltaMessage,
     ErrorResponse,
@@ -529,7 +530,7 @@ class OpenAIServingChat(OpenAIServingBase):
         self._template_reads_reasoning_content = (
             self._chat_template_reads_reasoning_content()
         )
-        self._chat_template_cache: OrderedDict[bytes, tuple[array, Optional[str]]] = (
+        self._chat_template_cache: OrderedDict[bytes, ChatTemplateCacheEntry] = (
             OrderedDict()
         )
         self._doc_splitter = ChatDocSplitter.for_model(
@@ -1324,9 +1325,9 @@ class OpenAIServingChat(OpenAIServingBase):
         ):
             prompt = processed_messages.prompt
             if prompt is None:
-                # A text-only request that is sent as text is decoded only here.
-                prompt = self.tokenizer_manager.tokenizer.decode(
-                    processed_messages.prompt_ids
+                prompt = self._decode_chat_prompt(
+                    processed_messages.prompt_ids,
+                    processed_messages.chat_template_cache_entry,
                 )
             return "text", prompt
         if isinstance(processed_messages.prompt_ids, str):
@@ -2111,7 +2112,7 @@ class OpenAIServingChat(OpenAIServingBase):
         """Apply Jinja chat template"""
         prompt = ""
         prompt_ids = []
-        decoded_prompt = None
+        cache_entry = None
         openai_compatible_messages = []
         image_data = []
         video_data = []
@@ -2292,18 +2293,15 @@ class OpenAIServingChat(OpenAIServingBase):
                 if self._tokenizer_auto_adds_specials or add_special_tokens
                 else {}
             )
-            # Only a request with media needs the prompt text: the MM processor
-            # reads it. A text-only request is decoded later, and only if it is
-            # not sent as ids.
             has_media = bool(image_data or video_data or audio_data or modalities)
             try:
-                prompt_ids, decoded_prompt = self._render_and_encode_chat_template(
+                prompt_ids, cache_entry = self._render_and_encode_chat_template(
                     openai_compatible_messages,
                     tools=tools,
                     template_kwargs=extra_template_kwargs,
                     encode_kwargs=encode_kwargs,
                     use_cache=is_multimodal,
-                    decode_prompt=has_media,
+                    has_media=has_media,
                     add_generation_prompt=add_generation_prompt is not False,
                 )
             except Exception:
@@ -2315,13 +2313,13 @@ class OpenAIServingChat(OpenAIServingBase):
                     else None
                 )
                 try:
-                    prompt_ids, decoded_prompt = self._render_and_encode_chat_template(
+                    prompt_ids, cache_entry = self._render_and_encode_chat_template(
                         openai_compatible_messages,
                         tools=tools,
                         template_kwargs=extra_template_kwargs,
                         encode_kwargs=encode_kwargs,
                         use_cache=is_multimodal,
-                        decode_prompt=has_media,
+                        has_media=has_media,
                         add_generation_prompt=add_generation_prompt is not False,
                     )
                 except _CHAT_TEMPLATE_CLIENT_ERRORS as template_error:
@@ -2335,17 +2333,14 @@ class OpenAIServingChat(OpenAIServingBase):
                 prompt_ids = self._append_assistant_prefix_to_prompt_ids(
                     prompt_ids, assistant_prefix
                 )
-                # The cached decode corresponds to prompt_ids before the prefix.
-                decoded_prompt = None
+                cache_entry = None
 
-            if is_multimodal and has_media:
+            if is_multimodal:
                 prompt = (
-                    decoded_prompt
-                    if decoded_prompt is not None
-                    else self.tokenizer_manager.tokenizer.decode(prompt_ids)
+                    self._decode_chat_prompt(prompt_ids, cache_entry)
+                    if has_media
+                    else None
                 )
-            elif is_multimodal:
-                prompt = None
 
         stop = request.stop
         image_data = image_data if image_data else None
@@ -2360,7 +2355,18 @@ class OpenAIServingChat(OpenAIServingBase):
             audio_data=audio_data,
             modalities=modalities,
             stop=stop,
+            chat_template_cache_entry=cache_entry,
         )
+
+    def _decode_chat_prompt(
+        self, prompt_ids: list[int], cache_entry: Optional[ChatTemplateCacheEntry]
+    ) -> str:
+        if cache_entry is not None and cache_entry.decoded_prompt is not None:
+            return cache_entry.decoded_prompt
+        prompt = self.tokenizer_manager.tokenizer.decode(prompt_ids)
+        if cache_entry is not None:
+            cache_entry.decoded_prompt = prompt
+        return prompt
 
     def _render_and_encode_chat_template(
         self,
@@ -2370,9 +2376,9 @@ class OpenAIServingChat(OpenAIServingBase):
         template_kwargs: Dict[str, Any],
         encode_kwargs: Dict[str, Any],
         use_cache: bool,
-        decode_prompt: bool = True,
+        has_media: bool = False,
         add_generation_prompt: bool = True,
-    ) -> tuple[List[int], Optional[str]]:
+    ) -> tuple[List[int], Optional[ChatTemplateCacheEntry]]:
         cache_key = None
         if use_cache:
             try:
@@ -2398,8 +2404,7 @@ class OpenAIServingChat(OpenAIServingBase):
             cached = self._chat_template_cache.get(cache_key)
             if cached is not None:
                 self._chat_template_cache.move_to_end(cache_key)
-                prompt_ids, decoded_prompt = cached
-                return list(prompt_ids), decoded_prompt
+                return list(cached.prompt_ids), cached
 
         if self._prompt_text_round_trip_is_lossy:
             # Re-encoding rendered text would drop the template's control tokens.
@@ -2438,22 +2443,19 @@ class OpenAIServingChat(OpenAIServingBase):
                 prompt_ids = parallel_prompt_encode(
                     self.tokenizer_manager.tokenizer, rendered_prompt, encode_kwargs
                 )
-        decoded_prompt = (
-            self.tokenizer_manager.tokenizer.decode(prompt_ids)
-            if cache_key is not None and decode_prompt
-            else None
-        )
+        if cache_key is None:
+            return prompt_ids, None
 
-        if cache_key is not None:
-            # An array holds an ID in 4 bytes. A tuple of Python ints needs about 25.
-            self._chat_template_cache[cache_key] = (
-                array("i", prompt_ids),
-                decoded_prompt,
-            )
-            if len(self._chat_template_cache) > _CHAT_TEMPLATE_CACHE_MAX_SIZE:
-                self._chat_template_cache.popitem(last=False)
+        try:
+            cached_ids = tuple(prompt_ids) if has_media else array("I", prompt_ids)
+        except OverflowError:
+            cached_ids = tuple(prompt_ids)
+        cache_entry = ChatTemplateCacheEntry(cached_ids)
+        self._chat_template_cache[cache_key] = cache_entry
+        if len(self._chat_template_cache) > _CHAT_TEMPLATE_CACHE_MAX_SIZE:
+            self._chat_template_cache.popitem(last=False)
 
-        return prompt_ids, decoded_prompt
+        return prompt_ids, cache_entry
 
     def _apply_conversation_template(
         self,
