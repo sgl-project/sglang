@@ -252,6 +252,62 @@ class TestGDNDecodeFusedProjectionConv1D(unittest.TestCase):
             with self.subTest(case=case):
                 self._run_case(**case)
 
+    def test_amd_kernel_is_bit_exact_with_generic_kernel(self):
+        # Force each kernel through the public wrapper on the same GPU, so the
+        # AMD conv kernel is covered on every runner, not only on ROCm.
+        torch.manual_seed(41)
+        batch, qkv_dim, v_dim, num_v_heads, head_v_dim = 33, 640, 256, 2, 128
+        for width in (2, 3, 4):
+            for with_bias in (False, True):
+                for activation in (None, "silu"):
+                    with self.subTest(
+                        width=width, with_bias=with_bias, activation=activation
+                    ):
+                        dtype = torch.bfloat16
+                        qkvz = torch.randn(
+                            batch, qkv_dim + v_dim, device="cuda", dtype=dtype
+                        )
+                        ba = torch.randn(
+                            batch, 2 * num_v_heads, device="cuda", dtype=dtype
+                        )
+                        weight = torch.randn(qkv_dim, width, device="cuda", dtype=dtype)
+                        bias = (
+                            torch.randn(qkv_dim, device="cuda", dtype=dtype)
+                            if with_bias
+                            else None
+                        )
+                        state = torch.randn(
+                            batch + 2, qkv_dim, width, device="cuda", dtype=dtype
+                        )
+                        indices = torch.randperm(
+                            batch + 2, device="cuda", dtype=torch.int64
+                        )[:batch].to(torch.int32)
+                        indices[-1] = -1
+
+                        results = []
+                        for is_hip in (False, True):
+                            state_run = state.clone()
+                            with mock.patch.object(
+                                triton_gdn_fused_proj, "_is_hip", is_hip
+                            ):
+                                outs = fused_qkvzba_causal_conv1d_update_contiguous(
+                                    qkvz,
+                                    ba,
+                                    state_run,
+                                    weight,
+                                    bias,
+                                    indices,
+                                    qkv_dim=qkv_dim,
+                                    v_dim=v_dim,
+                                    num_v_heads=num_v_heads,
+                                    head_v_dim=head_v_dim,
+                                    activation=activation,
+                                )
+                            results.append((*outs, state_run))
+                        torch.cuda.synchronize()
+                        for generic, amd in zip(*results):
+                            torch.testing.assert_close(amd, generic, rtol=0, atol=0)
+
     def test_cuda_graph_replay(self):
         batch = 4
         qkv_dim, v_dim, num_v_heads, head_v_dim = 128, 64, 2, 32
@@ -381,6 +437,19 @@ class TestGDNDecodeFusedProjectionConv1D(unittest.TestCase):
         )
         self.assertFalse(eligible)
         self.assertIn("FP16, BF16, or FP32", reason)
+
+
+class TestGDNDecodeFusedProjectionConv1DAMDKernel(TestGDNDecodeFusedProjectionConv1D):
+    """Run the whole suite against the AMD conv kernel.
+
+    The wrapper only picks `_fused_qkvzba_causal_conv1d_update_contiguous_kernel_amd`
+    when `_is_hip` is set, so force it here to cover that kernel on any GPU.
+    """
+
+    def setUp(self):
+        patcher = mock.patch.object(triton_gdn_fused_proj, "_is_hip", True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
 
 if __name__ == "__main__":
