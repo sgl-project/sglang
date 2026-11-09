@@ -1403,8 +1403,7 @@ class HiSparseCoordinator:
         req.hisparse_staging = False
 
     def release_request(self, req: Req):
-        """Free what a request holds here, whether it finished, aborted or was
-        retracted; one still in staging has its host copy in flight."""
+        """Free what a request holds here, whether finished, aborted or retracted."""
         if req.hisparse_staging:
             self._release_staging(req)
             return

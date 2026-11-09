@@ -515,9 +515,6 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         self.assertEqual([entry["req"] for entry in requeue_log], [last_req])
 
     def test_retract_takes_hisparse_staging_requests(self):
-        """A prefilled request waits in HiSparse staging until a running loop
-        collects it, which a paused loop never does: the retract takes the whole
-        staging queue, each request once, also one the last batch holds."""
         scheduler = self._new_scheduler()
         # `older` was prefilled a step earlier and still waits for its host
         # copy; `newer` is the last prefill batch, staged too.
@@ -547,7 +544,6 @@ class TestSchedulerPauseGeneration(CustomTestCase):
 
         self.assertEqual([entry["req"] for entry in requeue_log], [newer, older])
         self.assertEqual(len(coordinator.ack_staging_queue), 0)
-        # Each staged request syncs the staging stream before its host slots go.
         self.assertEqual(coordinator.write_staging_stream.synchronize.call_count, 2)
         for req in (older, newer):
             self.assertEqual(req.retraction_count, 1)
@@ -1068,9 +1064,8 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler._add_request_to_queue = lambda req: scheduler.waiting_queue.join(
             [req]
         )
-        # After one dLLM round each request is queued in the dLLM list and its
-        # staging subset, mid-decode with an unresolved FDFO block; last_batch is
-        # that round's DLLM_EXTEND batch, never merged into the running batch.
+        # Mid-decode after one round: in both dLLM lists with an unresolved FDFO
+        # block; last_batch is that round's DLLM_EXTEND batch, never merged.
         reqs = []
         for slot, rid in enumerate(("a", "b")):
             req = Req(
@@ -1110,11 +1105,6 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         self.assertEqual(scheduler.dllm_manager.staging_queue, [])
 
     def test_dllm_retract_takes_requests_left_out_of_the_last_round(self):
-        """A dLLM request keeps its row between rounds. One the last round left
-        out, as a prefill round leaves out the decoding requests, is retracted
-        too, its row released, and comes back as a prefill of its prompt and
-        output. One the last round finished leaves the dLLM lists, which a
-        paused loop would otherwise keep busy."""
         scheduler = self._new_scheduler()
         dllm_config = DllmConfig(
             algorithm="LowConfidence",

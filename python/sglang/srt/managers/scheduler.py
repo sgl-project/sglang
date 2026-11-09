@@ -6263,13 +6263,10 @@ class Scheduler(
     def _retract_batches(
         self, batches: List[Tuple[ScheduleBatch, Optional[ScheduleBatch]]]
     ) -> None:
-        """Retract, once for the whole pause, the requests of each
-        `(running_batch, last_batch)` pair (one per PP micro-batch), of
-        `last_batch` when it is a prefill not merged into it yet, the chunked
-        request, and the queued requests that hold KV (HiSparse staging, dLLM),
-        none of them in flight. PD decode also retracts the waiting requests that
-        hold KV; PD prefill keeps the chunked request and a prefill already
-        handed to transfer."""
+        """Retract every request that holds KV, once for the whole pause; `batches`
+        holds one `(running_batch, last_batch)` pair per PP micro-batch, none in
+        flight. PD prefill keeps the chunked request and a prefill already handed
+        to transfer."""
         retract_reqs = []
         for running_batch, last_batch in batches:
             retract_reqs += [r for r in running_batch.reqs if not r.finished()]
@@ -6295,14 +6292,13 @@ class Scheduler(
             retract_reqs.append(self.chunked_req)
 
         if self.hisparse_coordinator is not None:
-            # A prefilled request waits in staging for its host copy, and only a
-            # running loop moves it on. Take the whole queue so TP ranks agree.
+            # Only a running loop moves a staged request on; the whole queue, so
+            # TP ranks agree.
             retract_reqs += self.hisparse_coordinator.ack_staging_queue.take()
 
         if self.dllm_config is not None:
-            # A dLLM request keeps its row between rounds, also one left out of
-            # the last round. One the last round finished leaves only at the
-            # next schedule, which a paused loop never reaches.
+            # A dLLM request keeps its row between rounds; a finished one leaves
+            # the lists only at the next schedule, which a paused loop never reaches.
             self.dllm_manager.filter_finished_reqs()
             retract_reqs += self.dllm_manager.take(lambda r: r.kv.holds_kv)
 
@@ -6311,8 +6307,7 @@ class Scheduler(
             # retract them too, so their KV is rebuilt under the new weights.
             retract_reqs += self.waiting_queue.take(lambda r: r.kv.holds_kv)
 
-        # A request reached from two sources (a batch and the chunked request,
-        # a staged or dLLM request in the last batch) is retracted once.
+        # The chunked, a staged or a dLLM request may also sit in a batch.
         retract_reqs = list(dict.fromkeys(retract_reqs))
 
         if self.decode_offload_manager is not None:

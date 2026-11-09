@@ -77,7 +77,6 @@ def _batch():
 
 
 def _launch(stage, forward_result):
-    """Launch one microbatch on a forward stream and return its metadata."""
     forward_stream = _Stream("forward")
     stage.forward_stream_ctx = stage.device_module.stream(forward_stream)
     stage._pp_wait_forward_dependencies = lambda: None
@@ -121,9 +120,6 @@ class TestSkippedOutputRetirement(CustomTestCase):
         self.assertEqual(len(stage.device_module.made), 1)
 
     def test_completion_follows_the_forward_without_the_unified_pool(self):
-        """The launch records the microbatch's forward end whatever the pool, so
-        the skipped output's completion follows that forward, not the current
-        stream."""
         stage = _Stage()
         forward_stream, meta = _launch(stage, _forward_result())
         _, result, completion = stage._pp_make_skip_output_result(_batch(), meta)

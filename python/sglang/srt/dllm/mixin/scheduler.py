@@ -495,8 +495,7 @@ class DllmManager:
         self.take(lambda req: req.finished())
 
     def take(self, pred: Callable[[Req], bool]) -> List[Req]:
-        """Drop the requests matching `pred` from both queues and return them;
-        the staging queue is a subset of the waiting queue."""
+        """Drop and return requests matching `pred`; staging is a subset of waiting."""
         taken = self.waiting_queue.take(pred)
         leaving = set(taken)
         self.staging_queue = [req for req in self.staging_queue if req not in leaving]

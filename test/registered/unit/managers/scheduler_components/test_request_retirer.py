@@ -130,8 +130,6 @@ class TestRelease(CustomTestCase):
 
 class TestReleaseHiSparseStaging(CustomTestCase):
     def test_syncs_the_staging_copy_before_freeing(self):
-        # A request still in HiSparse staging has its host copy in flight on
-        # the staging stream; its slots are freed only after that stream syncs.
         calls = []
         req = FakeReq(
             finished_reason=FINISH_LENGTH(length=0),

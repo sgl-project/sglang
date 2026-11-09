@@ -25,15 +25,13 @@ class ReqDllmMixin:
         self.reset_dllm_progress()
 
     def reset_dllm_progress(self: Req):
-        """Start the request as incoming. A retracted one, its KV released,
-        re-encodes its prompt and output, and an unresolved FDFO block goes
-        with its KV."""
         self.dllm_initialized = False
         self.dllm_incomplete_ids = array("q")
         self.dllm_algo_state = None
         self.dllm_phase: Optional[DllmReqPhase] = None
         if self.dllm_config is None:
             return
+        # A retracted request re-encodes its output too.
         committed_len = len(self.origin_input_ids) + len(self.output_ids)
         if (
             self.dllm_config.requires_separate_context_encoding

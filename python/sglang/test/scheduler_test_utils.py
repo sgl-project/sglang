@@ -92,8 +92,7 @@ def staging_hisparse_coordinator(
     num_rows: int, reqs: Iterable = ()
 ) -> HiSparseCoordinator:
     """A `HiSparseCoordinator` with only what releasing a staged request reads,
-    its streams and pools mocks, holding `reqs` in staging; each req's
-    `kv.req_pool_idx` is its row."""
+    mocked, holding `reqs` in staging at row `req.kv.req_pool_idx`."""
     coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
     coordinator.ack_staging_queue = IndexedReqList(
         ListKind.HISPARSE_STAGING, req_of=lambda act: act.req

@@ -202,9 +202,6 @@ class TestLoRALRUUnload(CustomTestCase):
 
 class TestSchedulerLoRAUnload(CustomTestCase):
     def test_overlap_unload_waits_for_launched_forward(self):
-        """Under overlap a step launched before the unload request may still run
-        the adapter; the unload zeroes its slot on the schedule stream only after
-        that stream waits the forward stream."""
         events = []
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.enable_overlap = True
