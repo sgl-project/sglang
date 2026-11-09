@@ -3,10 +3,10 @@
 # NIXL and NCCL. Published by .github/workflows/release-docker-efa.yml.
 #
 #   docker build -f docker/efa.Dockerfile \
-#       --build-arg BASE_IMAGE=lmsysorg/sglang:latest-runtime -t sglang:efa docker/
+#       --build-arg BASE_IMAGE=lmsysorg/sglang:latest -t sglang:efa docker/
 #
 # The host still provides the EFA kernel module and memlock limits.
-ARG BASE_IMAGE=lmsysorg/sglang:latest-runtime
+ARG BASE_IMAGE=lmsysorg/sglang:latest
 FROM ${BASE_IMAGE}
 
 ARG TARGETARCH

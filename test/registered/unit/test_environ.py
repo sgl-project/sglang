@@ -24,6 +24,7 @@ NV_MEGA_RUNTIME_CHILDREN = (
     "SGLANG_OPT_DSV41_BLOCKWISE_REJECTION",
     "SGLANG_OPT_DSV41_DSPARK_ONE_LAUNCH_COMMIT_STAGE",
     "SGLANG_OPT_MXFP4_DEFERRED_FINALIZED_SHAPE",
+    "SGLANG_OPT_CUTEDSL_EP_DEFERRED_FINALIZE",
     "SGLANG_OPT_CUDA_GRAPH_FILL_FAST_PATH",
     "SGLANG_OPT_DSV41_DSPARK_PREPARE_INPUTS_ONCE",
     "SGLANG_OPT_DSV41_DSPARK_MID_FOLD",
@@ -33,6 +34,7 @@ NV_MEGA_RUNTIME_CHILDREN = (
     "SGLANG_OPT_DSV41_POST_FORWARD_CUDA_GRAPH",
     "SGLANG_OPT_DSV41_SAMPLING_ACCEPT_GRAPH",
     "SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH",
+    "SGLANG_OPT_SPEC_RELAY_IN_PLACE",
     "SGLANG_OPT_SMALL_FIELD_COPY_VECTORIZED",
     "SGLANG_OPT_SPEC_VERIFY_REUSE_STAGED_INPUTS",
     "SGLANG_OPT_SPEC_POST_VERIFY_ONE_LAUNCH_LOAD",
@@ -204,10 +206,12 @@ class TestRenamedEnvAliases(unittest.TestCase):
                 os.environ.pop(new, None)
             with envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(False):
                 value = field.get()
-        deprecations = [w for w in caught if issubclass(w.category, DeprecationWarning)]
+        deprecations = [w for w in caught if issubclass(w.category, FutureWarning)]
         return field, value, deprecations
 
-    def test_former_name_applies_with_a_deprecation_warning(self):
+    def test_former_name_applies_with_a_visible_warning(self):
+        """The warning must reach users: a DeprecationWarning raised from library
+        code is filtered out by Python's default warning filters."""
         for new, old in RENAMED_NV_MEGA_RUNTIME_CHILDREN.items():
             with self.subTest(new=new):
                 field, value, deprecations = self._read(new, {old: "1"})
