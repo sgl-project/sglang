@@ -103,7 +103,10 @@ class _FakeStorage:
         self.cursor += num_tokens
         return torch.arange(start, start + num_tokens, dtype=torch.int64)
 
-    def take_extend(self, *, num_tokens, **_kwargs) -> torch.Tensor:
+    def take_extend(self, *, num_tokens, seq_lens_cpu=None, **_kwargs) -> torch.Tensor:
+        self.last_extend_seq_lens = (
+            None if seq_lens_cpu is None else seq_lens_cpu.tolist()
+        )
         return self.take_tokens(num_tokens)
 
 
@@ -216,9 +219,10 @@ class TestAllocExtendLocWithKvReuseBatching(CustomTestCase):
         )
 
 
-class TestPagedEmptyPrefixFiller(CustomTestCase):
-    """The paged branch's last_loc filler: one shared [-1] tensor, created only
-    when a row with an empty prefix actually needs it."""
+class TestPagedKvReuseBranch(CustomTestCase):
+    """The paged fresh-allocation branch: reuse rows book only their prefix,
+    and the last_loc filler is one shared [-1] tensor, created only when a row
+    with an empty prefix actually needs it."""
 
     def _run_paged(self, *, reuse_kv, prefix_lens, extend_lens, prefix_tensors):
         batch = _make_batch(
@@ -227,6 +231,7 @@ class TestPagedEmptyPrefixFiller(CustomTestCase):
         batch.seq_lens_cpu = torch.tensor(
             [p + e for p, e in zip(prefix_lens, extend_lens)], dtype=torch.int64
         )
+        self._storage = batch.tree_cache.token_to_kv_pool_allocator.storage
         with envs.SGLANG_DLLM_BATCHED_GATHER_MIN_ROWS.override(-1):
             return _alloc_extend_loc_with_kv_reuse(
                 batch,
@@ -266,6 +271,20 @@ class TestPagedEmptyPrefixFiller(CustomTestCase):
         )
         self.assertEqual(creations, 0)
         self.assertEqual(out.shape[0], 7)
+
+    def test_reuse_rows_book_only_their_prefix_with_the_paged_allocator(self):
+        # A reuse row's retained block already holds pages; passing
+        # prefix + extend as its length would book those pages a second time.
+        self._run_paged(
+            reuse_kv=[True, False],
+            prefix_lens=[8, 4],
+            extend_lens=[4, 3],
+            prefix_tensors=[
+                torch.arange(8, dtype=torch.int64),
+                torch.arange(4, dtype=torch.int64),
+            ],
+        )
+        self.assertEqual(self._storage.last_extend_seq_lens, [8, 7])
 
     def test_empty_prefixes_share_one_filler(self):
         creations, out = self._filler_creations(
