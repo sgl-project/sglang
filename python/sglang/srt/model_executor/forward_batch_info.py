@@ -1226,8 +1226,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         if ret.forward_mode.is_idle():
             ret.positions = torch.empty((0,), dtype=torch.int64, device=device)
-            if _is_npu and model_runner.ngram_embedding_manager.enabled:
-                ret._init_ngram_embedding_info(batch, device)
             if model_runner.model_config.model_is_mrope:
                 # DP padding can turn an idle rank into a target verify batch.
                 ret.mrope_positions = ret.positions.unsqueeze(0).expand(3, -1)
