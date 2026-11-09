@@ -79,6 +79,8 @@ class SchedulerInvariantChecker:
     # Whether the idle pool checks skip this idle iteration.
     get_skip_idle_pool_checks: Callable[[], bool] = field(default=lambda: False)
     reporter: FailureReporter = field(default_factory=FailureReporter)
+    # Requests awaiting their final output; a sent one leaves at the next idle check.
+    awaiting_output: Set[Req] = field(default_factory=set)
     recent_busy_msgs: Deque[str] = field(
         default_factory=lambda: deque(maxlen=BUSY_MEM_CHECK_LOG_RING_SIZE)
     )
@@ -106,6 +108,11 @@ class SchedulerInvariantChecker:
                 phase=CheckPhase.BUSY,
                 when=envs.SGLANG_CHECK_KV_PAGE_INVARIANTS.get,
                 fn=self._check_kv_page_invariants,
+            ),
+            StateCheck(
+                phase=CheckPhase.IDLE,
+                when=envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.get,
+                fn=self._check_unsent_outputs,
             ),
             StateCheck(
                 phase=CheckPhase.IDLE,
@@ -624,6 +631,23 @@ class SchedulerInvariantChecker:
         self._raise_if_any(
             {req for req in running - in_running_batch if req.inflight_steps <= 0},
             "Requests in running but in no running batch or step",
+        )
+
+    def expect_output(self, req: Req) -> None:
+        """Record that `req`, now kept by the scheduler, owes a final output."""
+        if envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.get():
+            self.awaiting_output.add(req)
+
+    def _check_unsent_outputs(self) -> None:
+        """At idle, every request the scheduler kept has sent its final output or
+        is still in a list: idle leaves some lists full (held, parked, deferred)."""
+        self.awaiting_output = {
+            req for req in self.awaiting_output if req.send_via is None
+        }
+        listed = {req for reqs in self.get_request_lists().values() for req in reqs}
+        self._raise_if_any(
+            self.awaiting_output - listed,
+            "Requests in no list that never sent their final output",
         )
 
     def _check_batch_consistency(self, batch: ScheduleBatch) -> None:
