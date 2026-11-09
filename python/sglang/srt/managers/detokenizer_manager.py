@@ -144,6 +144,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
 
         if get_observability().enable_metrics:
             start_cpu_monitor_thread("detokenizer")
+        self._init_delivery_metrics()
 
     def init_request_dispatcher(self):
         self._request_dispatcher = TypeBasedDispatcher(
@@ -160,7 +161,11 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         """The event loop that handles requests"""
         while True:
             with self.soft_watchdog.disable():
-                recv_obj = sock_recv(self.recv_from_scheduler)
+                recv_obj = (
+                    sock_recv(self.recv_from_scheduler)
+                    if self.delivery_seconds is None
+                    else self._recv_with_delivery_metrics()
+                )
             output = self._request_dispatcher(recv_obj)
             if output is not None:
                 sock_send(self.send_to_tokenizer, output)

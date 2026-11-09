@@ -31,6 +31,7 @@ import traceback
 import zlib
 from functools import lru_cache
 from multiprocessing import shared_memory
+from time import monotonic_ns
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import msgspec
@@ -62,13 +63,18 @@ from sglang.srt.managers.io_struct import (
     unwrap_from_pickle,
     wrap_as_pickle,
 )
+from sglang.srt.managers.ipc_metrics import (
+    read_clock_domain,
+    sock_recv_with_timestamp,
+    sock_send_with_timestamp,
+)
 from sglang.srt.managers.load_snapshot import (
     create_load_snapshot_reader,
     zmq_reader_owner,
 )
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.trace import process_tracing_init
-from sglang.srt.runtime_context import get_observability
+from sglang.srt.runtime_context import get_observability, get_serving
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     configure_logger,
@@ -86,9 +92,10 @@ _cached_output_fields = lru_cache(maxsize=None)(msgspec.structs.fields)
 
 
 class SocketMapping:
-    def __init__(self):
+    def __init__(self, *, clock_domain: Optional[bytes] = None):
         self._zmq_context = zmq.Context()
         self._mapping: Dict[str, zmq.Socket] = {}
+        self.clock_domain = clock_domain
 
     def clear_all_sockets(self):
         for socket in self._mapping.values():
@@ -112,7 +119,12 @@ class SocketMapping:
 
         if ipc_name not in self._mapping:
             self._register_ipc_mapping(ipc_name, is_tokenizer=is_tokenizer)
-        sock_send(self._mapping[ipc_name], output)
+        if self.clock_domain is None:
+            sock_send(self._mapping[ipc_name], output)
+        else:
+            sock_send_with_timestamp(
+                self._mapping[ipc_name], output, clock_domain=self.clock_domain
+            )
 
 
 def _extract_field_by_index(
@@ -361,6 +373,54 @@ def _send_output_to_tokenizer_workers(
 class MultiHttpWorkerDetokenizerMixin:
     """Mixin class for DetokenizerManager"""
 
+    delivery_seconds = None
+
+    def _init_delivery_metrics(self: DetokenizerManager):
+        self.delivery_seconds = None
+        self.delivery_clock_domain = None
+        if (
+            not get_observability().enable_metrics
+            or get_serving().detokenizer_worker_num <= 1
+        ):
+            return
+
+        # Import after the launcher configures PROMETHEUS_MULTIPROC_DIR.
+        from prometheus_client import Histogram
+
+        self.delivery_clock_domain = read_clock_domain()
+        self.delivery_seconds = Histogram(
+            "sglang:detokenizer_delivery_seconds",
+            "Time from router send before serialization to detokenizer receive "
+            "after deserialization",
+            buckets=(
+                0.0001,
+                0.0005,
+                0.001,
+                0.005,
+                0.01,
+                0.05,
+                0.1,
+                0.5,
+                1.0,
+                5.0,
+                10.0,
+                30.0,
+                60.0,
+                120.0,
+            ),
+        )
+
+    def _recv_with_delivery_metrics(self: DetokenizerManager):
+        send_time_ns, recv_obj = sock_recv_with_timestamp(
+            self.recv_from_scheduler,
+            expected_clock_domain=self.delivery_clock_domain,
+        )
+        if send_time_ns is not None:
+            elapsed_ns = monotonic_ns() - send_time_ns
+            if elapsed_ns >= 0:
+                self.delivery_seconds.observe(elapsed_ns / 1e9)
+        return recv_obj
+
     def maybe_clear_socket_mapping(self: DetokenizerManager):
         if hasattr(self, "socket_mapping"):
             self.socket_mapping.clear_all_sockets()
@@ -372,7 +432,11 @@ class MultiHttpWorkerDetokenizerMixin:
         # paused while waiting for input and fed once per processed message.
         while True:
             with self.soft_watchdog.disable():
-                recv_obj = sock_recv(self.recv_from_scheduler)
+                recv_obj = (
+                    sock_recv(self.recv_from_scheduler)
+                    if self.delivery_seconds is None
+                    else self._recv_with_delivery_metrics()
+                )
             output = self._request_dispatcher(recv_obj)
             if output is not None:
                 # Fan out the output back to the originating tokenizer worker(s).
@@ -535,10 +599,20 @@ class MultiDetokenizerRouter:
     be the key: only some outputs of a request carry its ``http_worker_ipc``.
     """
 
-    def __init__(self, ipc_name_list: List[str], port_args: PortArgs):
+    def __init__(
+        self,
+        ipc_name_list: List[str],
+        port_args: PortArgs,
+        *,
+        enable_metrics: bool = False,
+    ):
         self.ipc_name_list = ipc_name_list
         self.num_workers = len(ipc_name_list)
-        self.socket_mapping = SocketMapping()
+        self.socket_mapping = SocketMapping(
+            clock_domain=(
+                read_clock_domain() if enable_metrics and self.num_workers > 1 else None
+            )
+        )
         context = zmq.Context(2)
         self.recv_from_scheduler = get_zmq_socket(
             context, zmq.PULL, port_args.detokenizer_ipc_name, True
@@ -617,7 +691,9 @@ def run_multi_detokenizer_router_process(
     try:
         if enable_metrics:
             start_cpu_monitor_thread("detokenizer_router")
-        router = MultiDetokenizerRouter(ipc_name_list, port_args)
+        router = MultiDetokenizerRouter(
+            ipc_name_list, port_args, enable_metrics=enable_metrics
+        )
         router.event_loop()
     except Exception:
         logger.error(
