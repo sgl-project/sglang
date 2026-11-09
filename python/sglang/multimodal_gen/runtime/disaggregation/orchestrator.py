@@ -49,6 +49,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
     Req,
 )
 from sglang.multimodal_gen.runtime.utils.common import get_zmq_socket
+from sglang.srt.utils.serialization import safe_pickle_loads
 from sglang.multimodal_gen.runtime.utils.perf_logger import (
     MemorySnapshot,
     RequestMetrics,
@@ -543,7 +544,7 @@ class DiffusionServer:
         payload = parts[-1]
 
         try:
-            reqs = pickle.loads(payload)
+            reqs = safe_pickle_loads(payload)
             if not isinstance(reqs, list):
                 reqs = [reqs]
             if len(reqs) != 1:
