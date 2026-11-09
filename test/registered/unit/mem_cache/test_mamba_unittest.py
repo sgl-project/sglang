@@ -9,6 +9,7 @@ from sglang.kernels.ops.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHU
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.mem_cache import memory_pool as memory_pool_module
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
@@ -461,6 +462,63 @@ class TestMamba(unittest.TestCase):
         server_args = ServerArgs(model_path="dummy", page_size=1)
         server_args._mamba_cache_chunk_size = FLA_CHUNK_SIZE
         set_global_server_args_for_scheduler(server_args)
+
+    def _temporal_slot_bytes(self, mamba_pool):
+        temporal = mamba_pool.mamba_cache.temporal
+        return temporal.element_size() * temporal.numel() // temporal.shape[1]
+
+    def test_mamba_pool_copy_from_chunk_boundaries(self):
+        """copy_from must copy every slot exactly once when the slot count is not a
+        multiple of the chunk size, on both the fused and the fallback path."""
+        _, req_to_token_pool, _ = self._setup_pools()
+        mamba_pool = req_to_token_pool.mamba_pool
+        temporal = mamba_pool.mamba_cache.temporal
+        slot_bytes = self._temporal_slot_bytes(mamba_pool)
+        num_slots = 5
+        src = req_to_token_pool.mamba_allocator.alloc(num_slots)
+        dst = req_to_token_pool.mamba_allocator.alloc(num_slots)
+        temporal[:, src] = torch.randn_like(temporal[:, src])
+        expected = temporal[:, src].clone()
+        untouched = temporal.clone()
+        untouched[:, dst] = expected
+
+        for disable_fused in (False, True):
+            with self.subTest(disable_fused=disable_fused):
+                temporal[:, dst] = 0
+                with (
+                    envs.SGLANG_DISABLE_FUSED_MAMBA_SLOT_OPS.override(disable_fused),
+                    patch.object(
+                        memory_pool_module,
+                        "_MAMBA_TEMPORAL_COPY_CHUNK_BYTES",
+                        2 * slot_bytes,
+                    ),
+                ):
+                    mamba_pool.copy_from(src, dst)
+                torch.testing.assert_close(temporal[:, dst], expected)
+                torch.testing.assert_close(temporal, untouched)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA memory stats")
+    def test_mamba_pool_copy_from_peak_memory_is_chunked(self):
+        """A burst copy_from must not allocate one temporary for all source slots;
+        its peak extra memory stays near the chunk budget, not n * slot size."""
+        _, req_to_token_pool, _ = self._setup_pools()
+        mamba_pool = req_to_token_pool.mamba_pool
+        slot_bytes = self._temporal_slot_bytes(mamba_pool)
+        num_slots = 8
+        src = req_to_token_pool.mamba_allocator.alloc(num_slots)
+        dst = req_to_token_pool.mamba_allocator.alloc(num_slots)
+
+        with patch.object(
+            memory_pool_module, "_MAMBA_TEMPORAL_COPY_CHUNK_BYTES", 2 * slot_bytes
+        ):
+            torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats()
+            baseline = torch.cuda.memory_allocated()
+            mamba_pool.copy_from(src, dst)
+            torch.cuda.synchronize()
+            extra = torch.cuda.max_memory_allocated() - baseline
+
+        self.assertLessEqual(extra, 3 * slot_bytes)
 
     def test_mamba_pool_cpu_offload(self):
         """MambaPool.get_cpu_copy / load_cpu_copy round-trips conv and temporal state."""

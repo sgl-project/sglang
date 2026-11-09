@@ -20,8 +20,9 @@ from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
 from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
+    KeyedReqList,
     ListKind,
-    _RequestList,
 )
 from sglang.srt.managers.scheduler_pp_mixin import PPBatchMetadata
 from sglang.srt.managers.utils import GenerationBatchResult, get_logprob_from_pp_outputs
@@ -553,8 +554,8 @@ def test_disaggregated_prefill_consumes_auxiliary_output_after_commit():
         batch_result_processor=processor,
         spec_algorithm=SimpleNamespace(is_eagle=lambda: False),
         tree_cache=object(),
-        disagg_prefill_transfer_queue=_RequestList(ListKind.PD_SENDING),
-        prefill_launched_reqs=_RequestList(ListKind.PREFILL_LAUNCHED),
+        disagg_prefill_transfer_queue=IndexedReqList(ListKind.PD_SENDING),
+        prefill_launched_reqs=KeyedReqList(ListKind.PREFILL_LAUNCHED),
         checkpoint_disagg_prefill=Mock(),
         send_kv_chunk=Mock(),
         metrics_reporter=SimpleNamespace(report_prefill_stats=Mock()),
