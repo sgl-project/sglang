@@ -25,6 +25,7 @@ from sglang.srt.hardware_backend.npu.moe.activation import (
 )
 from sglang.srt.hardware_backend.npu.moe.routing import (
     INT8_QUANT_MODE,
+    combine_local_expert_routes,
     npu_moe_finalize_routing,
     npu_moe_init_routing,
     quant_mode_dtype,
@@ -96,10 +97,7 @@ if TYPE_CHECKING:
         DeepEPNormalDispatchOutput,
     )
 
-from sglang.srt.layers.moe.utils import (
-    MoeRunnerBackend,
-    get_moe_a2a_backend,
-)
+from sglang.srt.layers.moe.utils import MoeRunnerBackend, get_moe_a2a_backend
 
 
 # ---------------------------------------------------------------------------
@@ -494,41 +492,37 @@ def _pre_permute_allgather(
     runner_config: MoeRunnerConfig,
     running_state: dict,
 ) -> AscendRunnerInput:
-    """Keep only the local-expert routes and group them by expert.
-
-    Non-local routes get weight 0 and the sentinel expert id
-    ``num_local_experts`` — never -1, which corrupts expert counts even at
-    weight zero.
-    """
+    """Group globally identified routes for the local expert range."""
     num_local_experts = runner_config.num_local_experts
     topk_ids = dispatch_output.topk_ids
-    local_ids = topk_ids - runner_config.moe_ep_rank * num_local_experts
-    is_local = (local_ids >= 0) & (local_ids < num_local_experts)
-    topk_weights = dispatch_output.topk_weights.masked_fill(~is_local, 0)
-    local_ids = local_ids.masked_fill(~is_local, num_local_experts)
+    num_experts = runner_config.num_experts
+    first_expert = runner_config.moe_ep_rank * num_local_experts
+    last_expert = first_expert + num_local_experts
+    is_local = (topk_ids >= first_expert) & (topk_ids < last_expert)
+    # Padded TopK entries can be -1. Use an in-range ID outside this rank's
+    # expert range if one exists, and always skip these entries in combine.
+    padding_expert = last_expert if last_expert < num_experts else 0
+    routing_ids = topk_ids.masked_fill(
+        (topk_ids < 0) | (topk_ids >= num_experts), padding_expert
+    )
 
     routed = npu_moe_init_routing(
         dispatch_output.hidden_states,
-        local_ids,
-        num_local_experts,
+        routing_ids,
+        num_experts,
         quant_mode=dispatch_output.quant_mode,
         scale=dispatch_output.hidden_states_scale,
-        active_num=local_ids.numel(),
-    )
-    # Dropped routes must not read garbage: point their reverse-mapping rows
-    # at the last capacity row, which the post-permute zeroes before finalize.
-    expanded_row_idx = routed.expanded_row_idx.masked_fill(
-        ~is_local.reshape(-1), local_ids.numel() - 1
+        active_num=topk_ids.numel(),
+        active_expert_range=[first_expert, last_expert],
     )
 
     state = dispatch_output.forward_state
     if state is None:
         raise RuntimeError("allgather dispatch output is missing forward state")
-    state.topk_weights = topk_weights
-    state.expanded_row_idx = expanded_row_idx
-    state.topk_ids = local_ids
-    state.expert_tokens = routed.expert_tokens
-    state.num_routes = local_ids.numel()
+    state.topk_weights = dispatch_output.topk_weights
+    state.expanded_row_idx = routed.expanded_row_idx.masked_fill(
+        ~is_local.flatten(), -1
+    )
     running_state["ascend_ops_forward_state"] = state
     return AscendRunnerInput(
         hidden_states=routed.hidden_states,
@@ -602,9 +596,7 @@ def post_permute_ascend_to_standard(
     running_state: dict,
 ) -> StandardCombineInput:
     """Weighted top-k sum of the grouped expert output back into ``[T, H]``."""
-    from sglang.srt.layers.moe.token_dispatcher.standard import (
-        StandardCombineInput,
-    )
+    from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
 
     state = running_state.pop("ascend_routing")
     final_hidden_states = npu_moe_finalize_routing(
@@ -650,53 +642,17 @@ def post_permute_ascend_to_ascend_ops(
                 hidden_states, local_expanded_row_idx
             )
     elif isinstance(state, _AllGatherState):
-        hidden_states = _allgather_weighted_sum(runner_output, runner_config, state)
+        if state.expanded_row_idx is None or state.topk_weights is None:
+            raise RuntimeError("allgather forward state is incomplete")
+        hidden_states = combine_local_expert_routes(
+            runner_output.hidden_states, state.expanded_row_idx, state.topk_weights
+        )
     else:
         # MC2 / decode: the combine op applies the top-k weights itself.
         hidden_states = runner_output.hidden_states
     return AscendOpsCombineInput(
         hidden_states=hidden_states,
         forward_state=state,
-    )
-
-
-def _allgather_weighted_sum(
-    runner_output: AscendRunnerOutput,
-    runner_config: MoeRunnerConfig,
-    state,
-) -> torch.Tensor:
-    """Weighted top-k sum over the full gathered route capacity.
-
-    Finalize mode 2 requires the full ``[global_tokens * top_k, hidden]``
-    shape; unused capacity rows are zeroed so dropped routes never read NaN.
-    """
-    if (
-        state.num_routes is None
-        or state.expert_tokens is None
-        or state.expanded_row_idx is None
-        or state.topk_weights is None
-        or state.topk_ids is None
-    ):
-        raise RuntimeError("allgather forward state is incomplete")
-    hidden_states = runner_output.hidden_states
-    expert_output = torch.zeros(
-        (state.num_routes, runner_config.hidden_size),
-        dtype=torch.float32,
-        device=hidden_states.device,
-    )
-    expert_output[: hidden_states.shape[0]].copy_(hidden_states)
-    unused_rows = (
-        torch.arange(expert_output.shape[0], device=expert_output.device)
-        >= state.expert_tokens.sum()
-    )
-    expert_output.masked_fill_(unused_rows[:, None], 0)
-    # Keep weighted expert sums in FP32 across ranks: rounding each rank's
-    # partial output to BF16 before the ReduceScatter loses precision.
-    return npu_moe_finalize_routing(
-        expert_output,
-        state.expanded_row_idx,
-        topk_weights=state.topk_weights,
-        topk_ids=state.topk_ids,
     )
 
 
