@@ -259,7 +259,10 @@ class AscendFAImpl(AttentionImpl):
     ) -> None:
         self.causal = causal
         self.softmax_scale = softmax_scale
-        config, server_args = self._get_attention_config()
+        config, server_args = self._get_attention_config(
+            extra_impl_args.get("selected_attention_backend"),
+            extra_impl_args.get("is_cross_attention", False),
+        )
         self._sd_executor = None
         if "precision" in config:
             self._sd_executor = AscendQuantAttention(
@@ -290,7 +293,12 @@ class AscendFAImpl(AttentionImpl):
                 self._ensure_rot_matrix(head_size)
 
     @staticmethod
-    def _get_attention_config() -> tuple[dict, Any]:
+    def _get_attention_config(
+        selected_attention_backend: AttentionBackendEnum | None = None,
+        is_cross_attention: bool = False,
+    ) -> tuple[dict, Any]:
+        from sglang.multimodal_gen.configs.attention_roles import AttentionRole
+        from sglang.multimodal_gen.runtime.layers.attention import selector
         from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 
         try:
@@ -298,6 +306,19 @@ class AscendFAImpl(AttentionImpl):
         except ValueError:
             # Direct native callers do not have to initialize ServerArgs.
             return {}, None
+        role = AttentionRole.CROSS if is_cross_attention else AttentionRole.SELF
+        requested_backend = (
+            selected_attention_backend
+            or selector.get_global_forced_attn_backend()
+            or selector.get_component_forced_attn_backend_for_role(role)
+            or selector.get_component_forced_attn_backend()
+        )
+        backend_name = server_args.attention_backend
+        if requested_backend is not None:
+            backend_name = requested_backend.name
+        # FA may be a dense fallback for another backend; its config is not ours.
+        if backend_name is not None and backend_name.lower() != "fa":
+            return {}, server_args
         return server_args.attention_backend_config or {}, server_args
 
     @classmethod

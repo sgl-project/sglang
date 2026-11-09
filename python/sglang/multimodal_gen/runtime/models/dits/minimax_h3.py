@@ -1080,6 +1080,7 @@ class MiniMaxH3Attention(nn.Module):
             prefix=self.prefix,
             packed_trailing_padding=True,
             quant_config=self._quant_config,
+            selected_attention_backend=self._selected_attention_backend,
         )
         # Ring only supports FA (see _minimax_h3_attention_core_impl); keep
         # the resolved enum alongside the impl instance instead of a second

@@ -217,6 +217,8 @@ Some backends require additional configuration. You can pass these parameters vi
 
 ### Supported Configuration Parameters
 
+For quantized Ascend FA, see [MindIE-SD configuration](#ascend-quantized-attention-with-mindie-sd).
+
 **Sliding Tile Attention (`sliding_tile_attn`)**
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
@@ -1002,6 +1004,9 @@ FP8, MXFP8, and MXFP4 attention. This integration targets MiniMax-H3;
 Wan/FLUX support is out of scope. Omitting `precision` preserves the existing
 native Ascend FA behavior and does not require MindIE-SD.
 
+When FA is an internal dense fallback for another selected backend, that
+backend's `precision` does not enable quantized FA.
+
 #### Install the optional SDK
 
 Install the official [MindIE-SD 3.2.0 wheel](https://pypi.org/project/mindiesd/3.2.0/#files)
@@ -1033,12 +1038,12 @@ libraries, and operator failures raise errors rather than falling back to native
 
 #### Configure attention
 
-| Key | Default | Purpose |
-| --- | --- | --- |
-| `precision` | Native FA when omitted | `fp8`, `mxfp8`, or `mxfp4`; selects MindIE-SD. |
-| `fp8_fa_mode` | `HIGH_PRECISION` | FP8 only; `C8V16_TILING512` is the alternate mode for head dimension 128. |
-| `head_chunk_size` | `4` | MHA heads per SD call. Use `0` to disable chunking, or another positive integer. |
-| `qk_rotation` | `true` for H3 | Apply online Q/K rotation before quantization. |
+| Parameter | Type | Description | Default |
+| --- | --- | --- | --- |
+| `precision` | `str` | `fp8`, `mxfp8`, or `mxfp4`; selects MindIE-SD. | Unset (native FA) |
+| `fp8_fa_mode` | `str` | FP8 only; `HIGH_PRECISION` or `C8V16_TILING512` (head dimension 128). | `HIGH_PRECISION` |
+| `head_chunk_size` | `int` | MHA heads per SD call. Use `0` to disable chunking, or another positive integer. | `4` |
+| `qk_rotation` | `bool` | Apply online Q/K rotation before quantization. | `true`; `false` for checkpoints with offline Q/K rotation |
 
 For example, run MiniMax-H3 on two NPUs with FP8 C8V16 and the default chunk size:
 

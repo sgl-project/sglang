@@ -43,11 +43,8 @@ def adapter(monkeypatch):
     from sglang.multimodal_gen.runtime import server_args
 
     config = {"precision": "fp8"}
-    monkeypatch.setattr(
-        server_args,
-        "get_global_server_args",
-        lambda: SimpleNamespace(attention_backend_config=config),
-    )
+    args = SimpleNamespace(attention_backend="fa", attention_backend_config=config)
+    monkeypatch.setattr(server_args, "get_global_server_args", lambda: args)
     provider = Mock(side_effect=_reference)
     sdk = ModuleType("mindiesd")
     sdk.quant_attention = provider
@@ -520,6 +517,71 @@ def legacy_native(monkeypatch, adapter):
     return config, provider, build, quant, native_mx, native_float
 
 
+@pytest.mark.parametrize(
+    "global_backend,override,scope,precision,expected_sd",
+    [
+        (None, None, "global", "fp8", True),
+        ("FA", None, "global", "fp8", True),
+        ("rain_fusion_attn", None, "deferred", "mix", False),
+        ("rain_fusion_attn", None, "global", "fp8", False),
+        ("torch_sdpa", "FA", "component", "fp8", True),
+        ("torch_sdpa", "FA", "self", "fp8", True),
+        ("fa", "RAIN_FUSION_ATTN", "cross", "fp8", False),
+        ("torch_sdpa", "FA", "deferred", "fp8", True),
+        ("fa", "RAIN_FUSION_ATTN", "deferred", "fp8", False),
+    ],
+)
+def test_fallback_fa_does_not_consume_another_backends_precision(
+    monkeypatch, legacy_native, global_backend, override, scope, precision, expected_sd
+):
+    """A dense fallback must not inherit the selected sparse backend's precision."""
+    from sglang.multimodal_gen.configs.attention_roles import AttentionRole
+    from sglang.multimodal_gen.runtime import server_args
+    from sglang.multimodal_gen.runtime.layers.attention import selector
+    from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import MiniMaxH3Attention
+
+    config, sd, build, _, _, native_float = legacy_native
+    config.update(precision=precision, qk_rotation=False)
+    server_args.get_global_server_args().attention_backend = global_backend
+    backend = AttentionBackendEnum[override] if override else None
+    context = SimpleNamespace(backend=None, backend_by_role={})
+    if scope == "component":
+        context.backend = backend
+    elif scope in ("self", "cross"):
+        context.backend = (
+            AttentionBackendEnum.FA
+            if scope == "cross"
+            else AttentionBackendEnum.RAIN_FUSION_ATTN
+        )
+        context.backend_by_role[AttentionRole(scope)] = backend
+    monkeypatch.setattr(selector, "get_component_attn_backend_context", lambda: context)
+    if scope == "deferred":
+        # H3 constructs its implementation after the component context has ended.
+        attention = SimpleNamespace(
+            head_dim=64,
+            num_heads=4,
+            softmax_scale=0.37,
+            prefix="blocks.0.attn",
+            _quant_config=None,
+            _selected_attention_backend=backend,
+        )
+        MiniMaxH3Attention._set_attention_backend(attention, AscendFABackend)
+        impl = attention._attention_impl
+    else:
+        impl = build(is_cross_attention=scope == "cross")
+    query = torch.randn(1, 7, 4, 64)
+    actual = impl.forward(query, query, query, None)
+    if expected_sd:
+        torch.testing.assert_close(
+            actual, _reference(query, query, query, **sd.call_args.kwargs)
+        )
+        native_float.assert_not_called()
+    else:
+        torch.testing.assert_close(actual, torch.zeros_like(query))
+        native_float.assert_called_once()
+        sd.assert_not_called()
+
+
 @pytest.mark.parametrize("kind", ["MXFP8Config", "ModelSlimConfig"])
 @pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize("offline", [False, True])
@@ -918,6 +980,7 @@ def test_h3_quant_config_reaches_native_mxfp8_dispatch(legacy_native, packed):
     attention.softmax_scale = 128**-0.5
     attention.prefix = "blocks.0.attn"
     attention._quant_config = MXFP8Config()
+    attention._selected_attention_backend = None
     attention._set_attention_backend(AscendFABackend)
     impl = attention._attention_impl
     assert impl._quant_scheme == "MXFP8" and impl._sd_executor is None
@@ -974,7 +1037,9 @@ def native_impl(native, monkeypatch):
         monkeypatch.setattr(
             server_args,
             "get_global_server_args",
-            lambda: SimpleNamespace(attention_backend_config=config),
+            lambda: SimpleNamespace(
+                attention_backend="fa", attention_backend_config=config
+            ),
         )
         return AscendFAImpl(num_heads, head_size, False, head_size**-0.5, **kwargs)
 
