@@ -43,12 +43,13 @@ __global__ void paged_experts_decide_kernel(
     int32_t* run_ids,       // [T] out: slot of each entry (0 for padding)
     float* run_w) {         // [T] out: weight of each entry (0 for padding)
   extern __shared__ int s_state[];
-  int32_t* s_expert_slot = s_state;              // [E]
-  int32_t* s_slot_expert = s_state + E;          // [K]
-  int32_t* s_lastuse = s_state + E + K;          // [K]
-  int32_t* s_topk = s_state + E + 2 * K;         // [T]
-  int32_t* s_miss = s_state + E + 2 * K + T;     // [T] entry positions whose expert is not resident
-  int32_t* s_now = s_state + E + 2 * K + 2 * T;  // [1] the step, broadcast from thread 0
+  int32_t* s_expert_slot = s_state;                    // [E]
+  int32_t* s_slot_expert = s_state + E;                // [K]
+  int32_t* s_lastuse = s_state + E + K;                // [K]
+  int32_t* s_topk = s_state + E + 2 * K;               // [T]
+  int32_t* s_miss = s_state + E + 2 * K + T;           // [T] entry positions whose expert is not resident
+  int32_t* s_now = s_state + E + 2 * K + 2 * T;        // [1] the step, broadcast from thread 0
+  int32_t* s_count = s_state + E + 2 * K + 2 * T + 1;  // [1] the plan size, broadcast from warp 0
 
   const int tid = threadIdx.x;
   const int lane = tid & 31;
@@ -122,9 +123,13 @@ __global__ void paged_experts_decide_kernel(
       ++n;
       __syncwarp();  // the next search reads this eviction
     }
-    if (lane == 0) *count = n;
+    if (lane == 0) {
+      *count = n;
+      *s_count = n;
+    }
   }
-  __syncthreads();  // the slots of the experts paged in above
+  __syncthreads();  // the slots of the experts paged in above, and the plan size
+  const int n = *s_count;
   for (int i = tid; i < T; i += blockDim.x) {
     const int e = s_topk[i];
     const int s = (e < 0 || e >= E) ? -1 : s_expert_slot[e];
@@ -132,12 +137,17 @@ __global__ void paged_experts_decide_kernel(
     run_w[i] = s >= 0 ? weights[i] : 0.f;
   }
   __syncthreads();  // every reader of the staged state has finished with it
-  for (int i = tid; i < K; i += blockDim.x) {
-    slot_expert[i] = s_slot_expert[i];
-    slot_lastuse[i] = s_lastuse[i];
+  // Without a page-in both slot tables are exactly as they were staged: only the last-use stamps
+  // of the resident experts moved. (Writing just the touched slots instead is not cheaper: 80
+  // scattered stores against 400 coalesced ones.)
+  if (n > 0) {
+    for (int i = tid; i < K; i += blockDim.x)
+      slot_expert[i] = s_slot_expert[i];
+    for (int i = tid; i < E; i += blockDim.x)
+      expert_slot[i] = s_expert_slot[i];
   }
-  for (int i = tid; i < E; i += blockDim.x)
-    expert_slot[i] = s_expert_slot[i];
+  for (int i = tid; i < K; i += blockDim.x)
+    slot_lastuse[i] = s_lastuse[i];
 }
 
 template <typename T>
@@ -228,13 +238,15 @@ void paged_experts_decide(
   TensorMatcher({One}).with_dtype<int32_t>().with_device<kDLGPU>(device_).verify(step).verify(count);
   RuntimeCheck(T.unwrap() <= K.unwrap(), "paged_experts_decide needs at most K routed entries, got ", T.unwrap());
 
-  // The kernel stages expert_slot[E], slot_expert[K], slot_lastuse[K], topk[T], miss[T], step[1].
-  const int smem_bytes = static_cast<int>((E.unwrap() + 2 * K.unwrap() + 2 * T.unwrap() + 1) * sizeof(int32_t));
+  // The kernel stages expert_slot[E], slot_expert[K], slot_lastuse[K], topk[T], miss[T], step[1], count[1].
+  const int smem_bytes = static_cast<int>((E.unwrap() + 2 * K.unwrap() + 2 * T.unwrap() + 2) * sizeof(int32_t));
 #ifndef USE_ROCM
   if (smem_bytes > 48 * 1024) {
-    // Past the default 48 KB reservation: opt in up to the device limit, which the launch enforces.
-    runtime::init_per_device(
-        device_.unwrap(), [=] { runtime::set_max_dynamic_smem(paged_experts_decide_kernel, smem_bytes); });
+    // Past the default 48 KB reservation: opt in once per device to the device maximum, not the
+    // first launch's size, because auto K can give later layers a larger K (the launch bound then
+    // enforces the actual size).
+    runtime::set_max_dynamic_smem_per_device<paged_experts_decide_kernel>(
+        device_.unwrap(), runtime::get_max_smem_per_block(device_.unwrap().device_id));
   }
 #endif
   LaunchKernel(1, kDecideThreads, device_.unwrap(), smem_bytes)(
