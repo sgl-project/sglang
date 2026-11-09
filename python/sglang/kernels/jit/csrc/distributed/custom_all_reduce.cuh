@@ -32,6 +32,10 @@
 
 #include <sgl_kernel/distributed/communicator.cuh>
 
+#ifdef USE_ROCM
+#include "two_shot_push_unrolled.cuh"
+#endif
+
 #include <tvm/ffi/extra/stl.h>
 #include <tvm/ffi/object.h>
 
@@ -178,7 +182,7 @@ ALL_REDUCE_KERNEL void all_reduce_1shot_push_kernel(const __grid_constant__ AllR
     Lamport::clear_pos_zero(vec.data());
 #pragma unroll
     for (uint32_t i = 0; i < kWorldSize; ++i) {
-      ptx::st_relaxed_16B(vec, push_ptrs[i], vid);
+      ptx::st_relaxed_nt_16B(vec, push_ptrs[i], vid);
     }
   }
 
@@ -197,7 +201,7 @@ ALL_REDUCE_KERNEL void all_reduce_1shot_push_kernel(const __grid_constant__ AllR
       bool has_zero = false;
 #pragma unroll
       for (uint32_t i = 0; i < kWorldSize; ++i) {
-        ptx::ld_relaxed_16B(vec[i], poll_ptrs[i], vid);
+        ptx::ld_nt_16B(vec[i], poll_ptrs[i], vid);
       }
 #pragma unroll
       for (uint32_t i = 0; i < kWorldSize; ++i) {
@@ -209,7 +213,7 @@ ALL_REDUCE_KERNEL void all_reduce_1shot_push_kernel(const __grid_constant__ AllR
     out_vec.store(params.output, vid);
 #pragma unroll
     for (uint32_t i = 0; i < kWorldSize; ++i) {
-      ptx::st_global_16B(pos_zero_vec, poll_ptrs[i], vid);
+      ptx::st_nt_16B(pos_zero_vec, poll_ptrs[i], vid);
     }
   }
 
@@ -259,7 +263,7 @@ ALL_REDUCE_KERNEL void all_reduce_2shot_push_kernel(const __grid_constant__ AllR
       vec_t vec;
       vec.load(params.input, peer * chunk_vecs + j);
       Lamport::clear_pos_zero(vec.data());
-      ptx::st_relaxed_16B(vec, push_ptr, j);
+      ptx::st_relaxed_nt_16B(vec, push_ptr, j);
     }
   }
 
@@ -283,7 +287,7 @@ ALL_REDUCE_KERNEL void all_reduce_2shot_push_kernel(const __grid_constant__ AllR
       bool has_zero = false;
 #pragma unroll
       for (uint32_t i = 0; i < kWorldSize; ++i) {
-        if (i != r) ptx::ld_relaxed_16B(vec[i], poll_ptrs[i], j);
+        if (i != r) ptx::ld_nt_16B(vec[i], poll_ptrs[i], j);
       }
 #pragma unroll
       for (uint32_t i = 0; i < kWorldSize; ++i) {
@@ -300,12 +304,12 @@ ALL_REDUCE_KERNEL void all_reduce_2shot_push_kernel(const __grid_constant__ AllR
     Lamport::clear_pos_zero(out_vec.data());
 #pragma unroll
     for (uint32_t i = 0; i < kWorldSize; ++i) {
-      if (i != r) ptx::st_relaxed_16B(out_vec, epoch.slot_ptr(/*dst=*/i, /*src=*/r), chunk_vecs + j);
+      if (i != r) ptx::st_relaxed_nt_16B(out_vec, epoch.slot_ptr(/*dst=*/i, /*src=*/r), chunk_vecs + j);
     }
     out_vec.store(params.output, vid);
 #pragma unroll
     for (uint32_t i = 0; i < kWorldSize; ++i) {
-      if (i != r) ptx::st_global_16B(pos_zero_vec, poll_ptrs[i], j);
+      if (i != r) ptx::st_nt_16B(pos_zero_vec, poll_ptrs[i], j);
     }
   }
 
@@ -315,10 +319,10 @@ ALL_REDUCE_KERNEL void all_reduce_2shot_push_kernel(const __grid_constant__ AllR
     for (auto j = group_tid; j < peer_len; j += group_stride) {
       vec_t vec;
       do {
-        ptx::ld_relaxed_16B(vec, poll_ptr, chunk_vecs + j);
+        ptx::ld_nt_16B(vec, poll_ptr, chunk_vecs + j);
       } while (Lamport::has_pos_zero(vec.data()));
       vec.store(params.output, peer * chunk_vecs + j);
-      ptx::st_global_16B(pos_zero_vec, poll_ptr, chunk_vecs + j);
+      ptx::st_nt_16B(pos_zero_vec, poll_ptr, chunk_vecs + j);
     }
   }
 
@@ -479,6 +483,13 @@ struct AllReduceKernel {
       // 2shot_push; with ranks arriving skewed 256 is up to 40% faster up to 4 MB.
       // Larger sizes keep the rule.
       if (two_shot && is_gfx1250() && nbytes <= int64_t{4} << 20) block_size = 256u;
+      if constexpr (kWorldSize <= 8) {
+        if (two_shot && is_gfx1250() && nbytes >= kTwoShotPushUnrolledMinBytes<kWorldSize>) {
+          LaunchKernel(push.default_blocks, kTwoShotPushThreads, stream)  //
+              .enable_pdl(kUsePDL)(all_reduce_2shot_push_unrolled_kernel<T, kWorldSize, kUsePDL, PushParams>, params);
+          return out;
+        }
+      }
 #endif
       if (two_shot) {
         // at least `kWorldSize - 1` warps in all, 1 for each peer
