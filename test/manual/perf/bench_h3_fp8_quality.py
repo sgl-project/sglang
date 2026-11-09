@@ -97,17 +97,17 @@ def main():
                     raise RuntimeError(f"generation failed: {index}/{quality}")
                 frames = np.stack(result.frames)
                 assert frames.dtype == np.uint8 and result.audio is not None
-                audio_hash = hashlib.sha256(
-                    result.audio.cpu().numpy().tobytes()
-                ).hexdigest()
+                audio = result.audio.cpu().numpy()
+                audio_hash = hashlib.sha256(audio.tobytes()).hexdigest()
                 reference_path = args.output / f"reference-{index}-{quality}.npz"
                 if not args.fp8 and not reference_path.exists():
-                    np.savez(reference_path, frames=frames, audio_hash=audio_hash)
+                    np.savez(reference_path, frames=frames, audio=audio)
                 row = {
                     "prompt": index,
                     "quality": quality,
                     "iteration": iteration,
                     "frame_shape": list(frames.shape),
+                    "audio_sha256": audio_hash,
                     "wall_s": elapsed,
                     "generation_s": result.generation_time,
                     "peak_memory_mb": result.peak_memory_mb,
@@ -119,7 +119,20 @@ def main():
                 with np.load(reference_path) as reference:
                     expected = reference["frames"]
                     assert frames.shape == expected.shape
-                    assert audio_hash == str(reference["audio_hash"])
+                    row["audio_max_abs"] = float(
+                        np.max(np.abs(audio - reference["audio"]))
+                    )
+                    row["frames_equal"] = np.array_equal(frames, expected)
+                    if row["audio_max_abs"] or (
+                        quality != "high" and not row["frames_equal"]
+                    ):
+                        np.savez(
+                            args.output / f"mismatch-{label}-{index}-{iteration}.npz",
+                            frames=frames,
+                            audio=audio,
+                        )
+                        print(json.dumps(row), flush=True)
+                    np.testing.assert_array_equal(audio, reference["audio"])
                     if quality != "high":
                         np.testing.assert_array_equal(frames, expected)
                     else:
