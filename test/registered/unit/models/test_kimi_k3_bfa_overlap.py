@@ -173,12 +173,17 @@ class TestKimiK3BfaOverlap(CustomTestCase):
     def test_front_weight_reload_preserves_views(self):
         """Reload must refresh captured front weights and restore parameter views."""
 
+        class UnshardedFront(SimpleNamespace):
+            @property
+            def _front_shard(self):
+                return None
+
         def module(rows):
             return SimpleNamespace(
                 weight=torch.ones(rows, 16, device="cuda", dtype=torch.bfloat16)
             )
 
-        owner = SimpleNamespace(
+        owner = UnshardedFront(
             use_latent_moe=True,
             shared_experts=None,
             gate=module(8),
@@ -366,6 +371,7 @@ class TestKimiK3BfaOverlap(CustomTestCase):
             v_head_dim=8,
             w_kc=None,
             w_vc=None,
+            _dcp_v_weights=None,
         )
         owner = SimpleNamespace(
             config=SimpleNamespace(full_attention_layer_ids=[0]),
