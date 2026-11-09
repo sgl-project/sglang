@@ -3,6 +3,7 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/modelopt.py
 from __future__ import annotations
 
+import copy
 import logging
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
@@ -66,14 +67,11 @@ from sglang.srt.layers.quantization.utils import (
 )
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils import alias_or_bind_derived_param, copy_or_rebind_param
+from sglang.srt.layers.utils.common import set_weight_attrs
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils.common import (
-    get_device_capability,
-    is_cuda,
-    round_up,
-    set_weight_attrs,
-)
+from sglang.srt.utils.common import round_up
 from sglang.srt.utils.custom_op import register_custom_op
+from sglang.srt.utils.device import get_device_capability, is_cuda
 from sglang.srt.utils.patch_torch import register_fake_if_exists
 
 if TYPE_CHECKING:
@@ -677,6 +675,7 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
                 weight_scale=layer.weight_scale,
                 input_scale=layer.input_scale,
                 bias=bias,
+                pre_quant_output_dtype=layer.orig_dtype,
             )
         return apply_fp8_linear(
             input=x,
@@ -685,6 +684,7 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
             input_scale=layer.input_scale,
             bias=bias,
             cutlass_fp8_supported=self.cutlass_fp8_supported,
+            pre_quant_output_dtype=layer.orig_dtype,
         )
 
 
@@ -817,11 +817,13 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
         nvfp4a16_config: ModelOptFp4Config,
         mxfp8_config: Fp8Config,
         fp8_block_config: Fp8Config,
+        mxfp8_linear_config: Optional[Fp8Config] = None,
     ) -> None:
         super().__init__(kv_cache_quant_algo, exclude_modules, packed_modules_mapping)
         self.quantized_layers = quantized_layers
         self.fp8_config = fp8_config
         self.mxfp8_config = mxfp8_config
+        self.mxfp8_linear_config = mxfp8_linear_config or mxfp8_config
         self.fp8_block_config = fp8_block_config
         self.nvfp4_config = nvfp4_config
         self.nvfp4a16_config = nvfp4a16_config
@@ -931,6 +933,13 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             packed_modules_mapping=packed_modules_mapping,
             use_mxfp8=True,
         )
+        # On CUDA GPUs other than Blackwell no dense GEMM takes 1x32 MXFP8 scales
+        # (DeepGEMM asserts on them on Hopper), so dense MXFP8 layers are
+        # converted to block-FP8 [128,128] at load. MoE keeps the MXFP8 config.
+        mxfp8_linear_config = mxfp8_config
+        if is_cuda() and not get_platform().is_blackwell:
+            mxfp8_linear_config = copy.copy(mxfp8_config)
+            mxfp8_linear_config.convert_mxfp8_to_block_fp8 = True
         # Block-FP8 (FP8_PB_WO / FP8_BLOCK_SCALES): fp8 weight with a per-block
         # weight_scale_inv; the block size comes from the checkpoint's
         # group_size (128 by default). One config serves Linear and FusedMoE.
@@ -964,6 +973,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             fp8_config=fp8_config,
             mxfp8_config=mxfp8_config,
             fp8_block_config=fp8_block_config,
+            mxfp8_linear_config=mxfp8_linear_config,
             nvfp4_config=nvfp4_config,
             nvfp4a16_config=nvfp4a16_config,
         )
@@ -1055,7 +1065,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             if quant_algo in _BLOCK_FP8_ALGOS:
                 return Fp8LinearMethod(self.fp8_block_config)
             if quant_algo == "MXFP8":
-                return Fp8LinearMethod(self.mxfp8_config)
+                return Fp8LinearMethod(self.mxfp8_linear_config)
             if quant_algo == "NVFP4":
                 return ModelOptFp4LinearMethod(self.nvfp4_config)
             if quant_algo == "W4A16_NVFP4":
@@ -3207,6 +3217,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             and (
                 moe_runner_backend.is_flashinfer_trtllm()
                 or moe_runner_backend.is_flashinfer_megamoe()
+                or self._is_cutedsl_v2_standard
             )
         ), f"{activation=} is unsupported by {moe_runner_backend}"
 

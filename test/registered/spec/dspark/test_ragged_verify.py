@@ -5,6 +5,8 @@ import torch
 from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyLayout,
     build_ragged_target_verify_geometry,
+    compute_uniform_extend_lengths,
+    ragged_verify_token_rows,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -30,6 +32,26 @@ class TestRaggedTargetVerifyGeometry(CustomTestCase):
         self.assertEqual(geometry.cu_seqlens_q.tolist(), [0, 8, 9, 12])
         self.assertEqual(geometry.cu_seqlens_k.tolist(), [0, 18, 39, 72])
         self.assertEqual(geometry.max_seq_len_q, 8)
+
+
+class TestUniformExtendLengths(CustomTestCase):
+    def test_without_host_seq_lens(self):
+        seq_lens = torch.tensor([10, 20, 30], dtype=torch.int32)
+        lengths = compute_uniform_extend_lengths(
+            seq_lens=seq_lens, seq_lens_cpu=None, extend_len=5
+        )
+        self.assertEqual(lengths.seq_lens_extended.tolist(), [15, 25, 35])
+        self.assertIsNone(lengths.seq_lens_cpu_extended)
+        self.assertEqual(lengths.extend_seq_lens_cpu, [5, 5, 5])
+        self.assertEqual(lengths.num_tokens, 15)
+
+    def test_with_host_seq_lens(self):
+        seq_lens = torch.tensor([10, 20], dtype=torch.int32)
+        lengths = compute_uniform_extend_lengths(
+            seq_lens=seq_lens, seq_lens_cpu=[10, 20], extend_len=5
+        )
+        self.assertEqual(lengths.seq_lens_cpu_extended, [15, 25])
+        self.assertEqual(lengths.num_tokens, 10)
 
 
 class TestPaddedRaggedVerifyGeometry(CustomTestCase):
@@ -84,6 +106,17 @@ class TestPaddedRaggedVerifyGeometry(CustomTestCase):
         padded = raw.padded_to_bucket(padded_bs=8)
         self.assertEqual(padded.verify_lens.tolist(), [8, 8, 0, 0, 0, 0, 0, 0])
         self.assertEqual(int(padded.qo_indptr_device[-1]), 16)
+
+
+class TestRaggedVerifyTokenRows(CustomTestCase):
+    def test_empty_rows_and_padding_tail(self):
+        layout = RaggedVerifyLayout.from_verify_lens_device(
+            verify_lens=torch.tensor([2, 0, 3, 1, 0], dtype=torch.int32),
+            graph_num_tokens=9,
+        )
+        self.assertEqual(
+            ragged_verify_token_rows(layout, 9).tolist(), [0, 0, 2, 2, 2, 3, 5, 5, 5]
+        )
 
 
 class TestCaptureVerifyLens(CustomTestCase):

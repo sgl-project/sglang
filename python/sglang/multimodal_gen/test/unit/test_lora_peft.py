@@ -7,10 +7,15 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
+from sglang.multimodal_gen.configs.models.dits.flux import FluxArchConfig
+from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 from sglang.multimodal_gen.runtime.pipelines_core.lora.format_adapter import (
+    _convert_ai_toolkit_flux_lora,
+    logger,
     normalize_lora_state_dict,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.lora.peft_adapter import (
+    apply_peft_config,
     get_peft_lora_alpha,
     load_peft_config,
 )
@@ -106,3 +111,48 @@ def test_diffusers_adapter_metadata_supplies_transformer_peft_config(tmp_path):
     (tmp_path / "adapter_config.json").write_text(json.dumps({"lora_alpha": 4}))
     with pytest.raises(ValueError, match="conflicts with safetensors metadata"):
         load_peft_config(str(weight_path))
+
+
+def test_peft_config_applies_to_keys_without_weight_suffix():
+    # Kohya H3 conversion emits blocks.N.*.lora_A/B without ".weight".
+    lora_b = torch.ones(8, 4)
+    out = apply_peft_config(
+        {"blocks.0.attn.lora_A": torch.ones(4, 8), "blocks.0.attn.lora_B": lora_b},
+        {"use_rslora": True, "alpha_pattern": {"attn": 8}},
+    )
+    torch.testing.assert_close(out["blocks.0.attn.lora_B"], lora_b * 2.0)
+    assert out["blocks.0.attn.alpha"].item() == 8
+
+
+def test_ai_toolkit_flux_alpha_follows_renamed_modules():
+    state = {}
+    for module, rows in (
+        ("double_blocks.0.img_attn.qkv", 12),
+        ("double_blocks.0.img_attn.proj", 4),
+        ("double_blocks.0.img_mlp.0", 8),
+        ("single_blocks.0.linear1", 20),
+        ("single_blocks.0.linear2", 4),
+    ):
+        state[f"{module}.lora_A.weight"] = torch.randn(2, 4)
+        state[f"{module}.lora_B.weight"] = torch.randn(rows, 2)
+        state[f"{module}.alpha"] = torch.tensor(1.0)
+    out = _convert_ai_toolkit_flux_lora(state, logger)
+    alphas = {k for k in out if k.endswith(".alpha")}
+    assert alphas == {
+        f"{target}.alpha"
+        for target in (
+            "transformer_blocks.0.attn.to_q",
+            "transformer_blocks.0.attn.to_k",
+            "transformer_blocks.0.attn.to_v",
+            "transformer_blocks.0.attn.to_out.0",
+            "single_transformer_blocks.0.attn.to_qkv_mlp_proj",
+            "single_transformer_blocks.0.attn.to_out",
+            "double_blocks.0.img_mlp.0",
+        )
+    }
+    mapping = get_param_names_mapping(FluxArchConfig().param_names_mapping)
+    assert {mapping(k)[0] for k in out if ".img_mlp." in k} == {
+        "transformer_blocks.0.ff.linear_in.lora_A.weight",
+        "transformer_blocks.0.ff.linear_in.lora_B.weight",
+        "transformer_blocks.0.ff.linear_in.alpha",
+    }

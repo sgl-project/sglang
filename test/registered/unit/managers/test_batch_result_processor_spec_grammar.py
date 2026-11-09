@@ -18,12 +18,14 @@ from sglang.srt.managers.scheduler_components.batch_result_processor import (
 )
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.mem_cache.kv_weight_version_tracker import KvWeightVersionTracker
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import (
     REQUEST_REASONING_END_TOKEN_IDS_KEY,
     SamplingParams,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_test_utils import release_only_retirer
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -72,8 +74,6 @@ def _make_processor() -> SchedulerBatchResultProcessor:
     return SchedulerBatchResultProcessor(
         is_generation=True,
         disaggregation_mode=None,
-        enable_overlap=False,
-        enable_overlap_mlx=False,
         model_config=SimpleNamespace(
             think_end_ids=None, self_opened_think_start_ids=None
         ),
@@ -81,6 +81,7 @@ def _make_processor() -> SchedulerBatchResultProcessor:
         tree_cache=None,
         hisparse_coordinator=None,
         req_to_token_pool=None,
+        kv_weight_version_tracker=None,
         decode_offload_manager=None,
         metrics_collector=None,
         metrics_reporter=SimpleNamespace(
@@ -91,7 +92,9 @@ def _make_processor() -> SchedulerBatchResultProcessor:
         logprob_result_processor=None,
         output_streamer=SimpleNamespace(),
         beam_coordinator=SimpleNamespace(),
+        request_retirer=release_only_retirer(),
         abort_request=lambda *a, **k: None,
+        still_in_batch=lambda req: True,
     )
 
 
@@ -122,7 +125,7 @@ def _commit_disagg_handoff(
     processor: SchedulerBatchResultProcessor,
     token_id: int,
     *,
-    replayed_boundary: bool = False,
+    is_rebootstrap: bool = False,
 ) -> None:
     queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
     queue.scheduler = SimpleNamespace(
@@ -145,30 +148,58 @@ def _commit_disagg_handoff(
             None,
             None,
             torch.tensor([1], dtype=torch.long),
-        )
+        ),
+        get_customized_info=lambda _: None,
     )
     req.bootstrap_host = "127.0.0.1"
     req.bootstrap_room = 1
-    if replayed_boundary:
-        req.pd_rebootstrap_forced_output_id = token_id
     decode_req = DecodeRequest(
         req=req,
         kv_receiver=SimpleNamespace(clear=lambda: None),
         metadata_buffer_index=0,
-        is_rebootstrap=replayed_boundary,
+        is_rebootstrap=is_rebootstrap,
     )
 
     queue._commit_transfer_to_req(decode_req)
 
 
 class TestSpecV2GrammarTruncation(CustomTestCase):
+    def test_grammar_commit_does_not_relabel_forward_recorded_kv(self) -> None:
+        """Grammar commitment leaves forward-recorded provenance unchanged."""
+        pool = SimpleNamespace(req_to_token=torch.tensor([[1, 2, 3, 7, 5, 6]]))
+        tracker = KvWeightVersionTracker(
+            num_slots=10, device="cpu", req_to_token_pool=pool
+        )
+        tracker.record(slot_indices=torch.tensor([1, 2, 3, 7, 5, 6]), version="v0")
+        tracker.record(slot_indices=torch.tensor([7, 5, 6]), version="v1")
+        req = _make_req(terminate_after=2)
+        req.kv.req_pool_idx = 0
+        req.kv.kv_committed_len = 3
+        processor = replace(
+            _make_processor(),
+            req_to_token_pool=pool,
+            kv_weight_version_tracker=tracker,
+        )
+        batch = _FakeBatch([req])
+        batch.out_cache_loc = torch.tensor([1, 2, 3])
+        result = _make_result(4, [3], [101, 102, 103, 0])
+
+        processor._resolve_spec_v2_tokens(result, batch, [True])
+
+        spans = tracker._lookup_spans(torch.tensor([1, 2, 3, 7, 5, 6]))
+        self.assertEqual(
+            [(span.version, span.start, span.end) for span in spans],
+            [("v0", 0, 3), ("v1", 3, 6)],
+        )
+        self.assertEqual(req.kv.kv_committed_len, 5)
+
     def test_resolve_truncates_after_grammar_completion(self):
         req = _make_req(terminate_after=2)
         proc = _make_processor()
         # stride=4, accept_len=3 -> proposed [101, 102, 103]; grammar finishes at 102.
         result = _make_result(4, [3], [101, 102, 103, 0])
 
-        predict_tokens = proc._resolve_spec_v2_tokens(result, _FakeBatch([req]))
+        predict_tokens = proc._resolve_spec_v2_tokens(result, _FakeBatch([req]), [True])
 
         self.assertEqual(predict_tokens, [[101, 102]])
         # No pre-claim: commit the full retained run (no -1 refund).
@@ -179,7 +210,7 @@ class TestSpecV2GrammarTruncation(CustomTestCase):
         proc = _make_processor()
         result = _make_result(4, [3], [201, 202, 203, 0])
 
-        predict_tokens = proc._resolve_spec_v2_tokens(result, _FakeBatch([req]))
+        predict_tokens = proc._resolve_spec_v2_tokens(result, _FakeBatch([req]), [True])
 
         self.assertEqual(predict_tokens, [[201, 202, 203]])
         self.assertEqual(req.kv.kv_committed_len, 3)
@@ -290,8 +321,11 @@ class TestReasoningTokenAccounting(CustomTestCase):
             [17],
         ]
 
-        _commit_disagg_handoff(req, processor, 17, replayed_boundary=True)
+        # The kept output id 17 was counted before the retract.
+        req.output_ids = [17]
+        _commit_disagg_handoff(req, processor, 17, is_rebootstrap=True)
 
+        self.assertEqual(req.output_ids, [17])
         self.assertEqual(req.reasoning_tokens, 0)
         self.assertFalse(req._is_reasoning_over)
 
@@ -353,6 +387,7 @@ class TestFinishedMambaSpecCheckpoint(CustomTestCase):
             tree.supports_mamba.return_value = True
             tree.claim_kv_row.return_value = False
             tree.token_to_kv_pool_allocator.page_size = 1
+            tree.logical_page_size = 1
             processor = replace(
                 _make_processor(),
                 tree_cache=tree,
@@ -360,7 +395,7 @@ class TestFinishedMambaSpecCheckpoint(CustomTestCase):
                     offload_kv_cache=lambda req: True
                 ),
             )
-            tokens = processor._resolve_spec_v2_tokens(result, batch)[0]
+            tokens = processor._resolve_spec_v2_tokens(result, batch, [True])[0]
             req.output_ids.extend(tokens)
             req.update_finish_state(len(tokens))
             self.assertTrue(req.finished())

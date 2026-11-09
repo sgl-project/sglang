@@ -29,7 +29,7 @@ import logging
 from array import array
 from collections import deque
 from dataclasses import replace
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Sequence
 
 import msgspec
 import torch
@@ -181,7 +181,7 @@ def validate_buffer_only_stack(
     swa_component: Optional[SWAComponent],
     storage_prefetch_threshold: int = 256,
     *,
-    auxiliary_swa_component: Optional[SWAComponent] = None,
+    further_window_components: Sequence[SWAComponent] = (),
 ) -> None:
     """Post-assembly buffer-mode fences.
 
@@ -209,7 +209,7 @@ def validate_buffer_only_stack(
                 f"source={spec.indices_from_pool}, source_slots={source_size}."
             )
     window_pools = []
-    for component in (swa_component, auxiliary_swa_component):
+    for component in (swa_component, *further_window_components):
         if component is None:
             continue
         pool = component._swa_kv_pool_host
@@ -283,19 +283,25 @@ class BufferModePipeline:
         write_backlog_cap: int,
         max_context_len: int = 0,
         *,
-        auxiliary_swa_component: Optional[SWAComponent] = None,
+        further_window_components: Sequence[SWAComponent] = (),
     ):
         self._cache = cache
         self._swa_component = swa_component
-        self._auxiliary_swa_component = auxiliary_swa_component
+        # Window slots beyond the tree's first, each with its own host pool.
+        self._further_window_components = tuple(further_window_components)
         self._swa_tail_only = envs.SGLANG_ENABLE_HICACHE_SWA_TAIL_ONLY_BACKUP.get()
         # Metadata-only pending-write backlog cap, measured in unique FULL
         # snapshot spans; beyond it new spans are dropped at admission.
         self.write_backlog_cap = write_backlog_cap
-        from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+        from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 
         kvcache = cache.token_to_kv_pool_allocator.get_kvcache()
-        full_pool = kvcache.full_kv_pool if isinstance(kvcache, SWAKVPool) else kvcache
+        router = kvcache.layer_router
+        full_pool = (
+            router.view(IdSpaceKind.FULL)
+            if router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is not None
+            else kvcache
+        )
         # Clamp by admission headroom: pins must leave room for the largest
         # allowed request, else a queued hold can wedge admission permanently
         # (pool full, nothing retractable). No-headroom pools take no pins.
@@ -363,7 +369,7 @@ class BufferModePipeline:
     def _swa_components(self):
         return (
             component
-            for component in (self._swa_component, self._auxiliary_swa_component)
+            for component in (self._swa_component, *self._further_window_components)
             if component is not None
         )
 
@@ -783,14 +789,14 @@ class BufferModePipeline:
         (prepare_prefetch allocates its window here and a failed alloc
         forfeits the whole prefetch), plus a 10% burst absorber mirroring
         live_cap."""
-        window_pages = 0
-        if pool_name == PoolName.SWA and self._swa_component is not None:
-            window_pages = self._swa_component.full_window_pages
-        elif (
-            pool_name == PoolName.AUXILIARY_SWA
-            and self._auxiliary_swa_component is not None
-        ):
-            window_pages = self._auxiliary_swa_component.full_window_pages
+        window_pages = next(
+            (
+                component.full_window_pages
+                for component in self._swa_components()
+                if component.pool_name == pool_name
+            ),
+            0,
+        )
         return max(window_pages * host_pool.page_size, host_pool.size // 10)
 
     def _validate_backup_intent(
@@ -1156,7 +1162,7 @@ class BufferModePipeline:
             list(entry.keys_by_pool[PoolName.KV]) if intent.pool == PoolName.KV else []
         )
         prefix_keys = snapshot.prefix_keys
-        if intent.pool in (PoolName.SWA, PoolName.AUXILIARY_SWA):
+        if intent.pool in {c.pool_name for c in self._swa_components()}:
             keys = entry.keys_by_pool[intent.pool]
             skipped_pages = len(snapshot.hash_values) - len(keys)
             if skipped_pages > 0:
@@ -1507,8 +1513,8 @@ class BufferModePipeline:
         if plan is None:
             self._resolve_device_covered(req)
             return True
+        # Each window's host hit is read off the plan (`window_host_hit_lengths`).
         req.host_hit_length = plan.full_tokens
-        req.swa_host_hit_length = plan.window_tokens(ComponentType.SWA)
         req.mamba_host_hit_length = plan.mamba_slots
         # The device alone serves only this pass's joint match; the rest of the
         # span, fetched FULL or resident FULL the aux tail unlocks, is storage's.
@@ -1523,7 +1529,7 @@ class BufferModePipeline:
     ) -> None:
         req.prefix_len = matched_len
         req.last_node = node_id
-        req.kv.cache_protected_len = matched_len
+        req.kv.protect_prefix(matched_len)
 
     def _build_staged_prefetch_plan(
         self, f: _StagedPrefetch, key: RadixKey, matched_len: int
@@ -1568,12 +1574,20 @@ class BufferModePipeline:
             # The device already covers every pool's remaining demand.
             return None
         return StagedPrefetchPlan(
-            f.operation_id, key, matched_len, full_tokens, windows, mamba_slots
+            f.operation_id,
+            key,
+            matched_len,
+            full_tokens,
+            windows,
+            mamba_slots,
+            window_sub_pools={
+                ct: self._cache.window_sub_pool_of_slot(ct) for ct in windows
+            },
         )
 
     def _resolve_device_covered(self, req: Req) -> None:
         req.host_hit_length = 0
-        req.swa_host_hit_length = 0
+        req.matched_window_host_hit_lengths = {}
         req.mamba_host_hit_length = 0
         self._clear_storage_hit(req)
         self.release_staged_hold(req.cache_request_handle, reason="device_covered")
@@ -1749,13 +1763,8 @@ class BufferModePipeline:
         assert plan is not None, f"staged prefetch was not planned for {req.rid}"
         assert f.operation_id == plan.operation_id
         assert (f.extra_key, f.cache_salt) == (req.extra_key, req.cache_salt)
-        assert (
-            req.host_hit_length,
-            req.swa_host_hit_length,
-            req.mamba_host_hit_length,
-        ) == (
+        assert (req.host_hit_length, req.mamba_host_hit_length) == (
             plan.full_tokens,
-            plan.window_tokens(ComponentType.SWA),
             plan.mamba_slots,
         ), f"staged load-back budget changed for {req.rid}"
 
@@ -1847,6 +1856,7 @@ class BufferModePipeline:
                         cache._apply_cache_action(action)
                 offset += end - start
             component.restore_buffer_mapping(torch.cat(full_parts), window_dev)
+        cache.name_loaded_window_rows_by_owner(state.load_transfers)
 
         insert_result = self._insert_loaded_prefix(
             state, req, plan, prefix_indices=prefix_indices
