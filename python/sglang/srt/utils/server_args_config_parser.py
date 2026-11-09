@@ -11,6 +11,8 @@ from typing import Any, Dict, List
 
 import yaml
 
+from sglang.srt.arg_groups.argparse_actions import DeprecatedAction
+
 logger = logging.getLogger(__name__)
 
 
@@ -28,6 +30,14 @@ def _takes_one_value(action: argparse.Action) -> bool:
     return isinstance(action, argparse._StoreAction) or action.nargs is None
 
 
+def _is_boolean_flag(action: argparse.Action) -> bool:
+    return isinstance(action, argparse._StoreTrueAction) or (
+        isinstance(action, DeprecatedAction)
+        and action.nargs == 0
+        and action.error_message is None
+    )
+
+
 class ConfigArgumentMerger:
     """Handles merging of configuration file arguments with command-line arguments."""
 
@@ -37,19 +47,17 @@ class ConfigArgumentMerger:
         boolean_actions: List[str] = None,
     ):
         """Initialize with list of store_true action names."""
-        # NOTE: Only store_true, store and other single-value actions are supported.
+        # NOTE: Only boolean flags, store and other single-value actions are supported.
         if parser is not None:
             self.parser = parser
             self.store_true_actions = [
                 key
                 for action in parser._actions
-                if isinstance(action, argparse._StoreTrueAction)
+                if _is_boolean_flag(action)
                 for key in _config_keys(action)
             ]
             supported = [
-                a
-                for a in parser._actions
-                if isinstance(a, argparse._StoreTrueAction) or _takes_one_value(a)
+                a for a in parser._actions if _is_boolean_flag(a) or _takes_one_value(a)
             ]
             supported_keys = {key for a in supported for key in _config_keys(a)}
             self.unsupported_actions = {
@@ -186,7 +194,7 @@ class ConfigArgumentMerger:
         """
         Add boolean argument to the list.
 
-        Only store_true flags:
+        Store_true and retired no-op flags:
             - value True -> add flag
             - value False -> skip
         Regular booleans:
