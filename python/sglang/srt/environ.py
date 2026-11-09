@@ -742,6 +742,9 @@ class Envs:
     # forward; typically KV-cache transfers that use DMA instead of a 2-block SM
     # copy kernel, so as not to disturb persistent kernels.
     SGLANG_ENABLE_MLP_SYNC_METADATA_FILL = EnvBool(False)
+    # Ascend DSV4 + DSPARK: verify running requests' draft windows in the
+    # mixed-chunk prefill forward. Eager prefill only; see verify_merged_mixed_enabled.
+    SGLANG_ENABLE_MIXED_PREFILL_SPEC_COORDINATION = EnvBool(False)
     # PP: skip output send/recv when the entire batch consists of non-final chunked prefill requests,
     # since process_batch_result_prefill discards next_token_ids for those anyway.
     SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM = EnvBool(False)
