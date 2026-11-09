@@ -103,7 +103,9 @@ def convert_output_score_rows(
     """
     if logits_output.next_token_top_logprobs_val is None:
         return
-    preserve = [req.sampling_params.array_output_logprobs for req in reqs]
+    preserve = [
+        getattr(req.sampling_params, "array_output_logprobs", False) for req in reqs
+    ]
     for suffix, dtype in (("val", "float32"), ("idx", "int32")):
         name = "next_token_top_logprobs_" + suffix
         rows = getattr(logits_output, name)
@@ -563,7 +565,8 @@ class SchedulerBatchResultProcessor:
                 logits_output.input_token_logprobs = tuple(
                     logits_output.input_token_logprobs.tolist()
                 )
-            convert_output_score_rows(logits_output, batch.reqs)
+            if logits_output.next_token_top_logprobs_val is not None:
+                convert_output_score_rows(logits_output, batch.reqs)
             if logits_output.next_token_token_ids_logprobs_val:
                 logits_output.next_token_token_ids_logprobs_val = [
                     v.tolist() for v in logits_output.next_token_token_ids_logprobs_val
@@ -1133,7 +1136,8 @@ class SchedulerBatchResultProcessor:
 
         if batch.return_logprob:
             next_token_logprobs = logits_output.next_token_logprobs.tolist()
-            convert_output_score_rows(logits_output, batch.reqs)
+            if logits_output.next_token_top_logprobs_val is not None:
+                convert_output_score_rows(logits_output, batch.reqs)
 
             if logits_output.next_token_token_ids_logprobs_val:
                 logits_output.next_token_token_ids_logprobs_val = [

@@ -590,6 +590,9 @@ class _GenerationStreamAccumulator:
                 self.input_token_ids_logprobs_idx.append([])
 
             if req.return_logprob:
+                preserve_arrays = getattr(
+                    req.sampling_params, "array_output_logprobs", False
+                )
                 logprob_end = (
                     len(output_ids_) if req.is_retracted else max(len(output_ids_), 1)
                 )
@@ -606,27 +609,23 @@ class _GenerationStreamAccumulator:
                 rows = req.logprob.output_top_logprobs_val[
                     send_output_token_logprobs_offset:logprob_end
                 ]
-                self.output_top_logprobs_val.append(
-                    [] if req.sampling_params.array_output_logprobs else rows
-                )
+                self.output_top_logprobs_val.append([] if preserve_arrays else rows)
                 self.output_top_logprobs_val_array.append(
                     np.asarray(rows, dtype=np.float32).reshape(
                         -1, req.logprob.top_logprobs_num
                     )
-                    if req.sampling_params.array_output_logprobs
+                    if preserve_arrays
                     else None
                 )
                 rows = req.logprob.output_top_logprobs_idx[
                     send_output_token_logprobs_offset:logprob_end
                 ]
-                self.output_top_logprobs_idx.append(
-                    [] if req.sampling_params.array_output_logprobs else rows
-                )
+                self.output_top_logprobs_idx.append([] if preserve_arrays else rows)
                 self.output_top_logprobs_idx_array.append(
                     np.asarray(rows, dtype=np.int32).reshape(
                         -1, req.logprob.top_logprobs_num
                     )
-                    if req.sampling_params.array_output_logprobs
+                    if preserve_arrays
                     else None
                 )
                 self.output_token_ids_logprobs_val.append(
