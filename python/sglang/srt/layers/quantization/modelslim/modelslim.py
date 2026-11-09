@@ -665,8 +665,7 @@ class ModelSlimConfig(QuantizationConfig):
         if output_sizes is not None and len(output_sizes) == len(shards):
             shards = [shard for shard, size in zip(shards, output_sizes) if size != 0]
         components = [
-            self._resolve_quant_prefix(parent + separator + shard)
-            for shard in shards
+            self._resolve_quant_prefix(parent + separator + shard) for shard in shards
         ]
         present = [p + ".weight" in self.quant_description for p in components]
         if any(present):
@@ -766,7 +765,9 @@ class ModelSlimConfig(QuantizationConfig):
         quant_prefixes = self._resolve_linear_quant_prefixes(
             prefix, output_sizes=getattr(layer, "output_sizes", None)
         )
-        prefix = quant_prefixes[0]  # All components were checked to use the same scheme.
+        prefix = quant_prefixes[
+            0
+        ]  # All components were checked to use the same scheme.
 
         linear_quant_schemes = [
             ("W4A4_DYNAMIC", ModelSlimW4A4Int4),
