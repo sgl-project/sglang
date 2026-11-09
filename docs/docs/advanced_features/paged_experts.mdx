@@ -47,6 +47,9 @@ requests, and breakable prefill graphs run the paged MoE layers as eager breaks.
 - **`--paged-experts-num-resident K|auto`**: Routed experts per MoE layer kept on the GPU, at least
   the router's `top_k`; larger values page less but leave less memory for the KV cache. `auto` (the
   default) sizes K after the model is loaded; see [Choosing K](#choosing-k).
+- **`--paged-experts-enable-disk`**: Let Paged Experts write to disk: keep each MoE layer's
+  experts in the [expert cache](#the-expert-cache), so that later starts read them instead of
+  loading and repacking them. Off by default; requires `--enable-paged-experts`.
 
 ## Supported Configurations and Limitations
 
@@ -84,7 +87,9 @@ requests, and breakable prefill graphs run the paged MoE layers as eager breaks.
   `--weight-loader-disable-mmap`), loading makes no second copy of the experts: each expert is
   read from the checkpoint once, straight into the pinned host store. With other loaders, and
   for checkpoints that store every expert in one tensor (e.g. gpt-oss), the experts are first
-  loaded into a pageable copy of every expert, as large as the host store.
+  loaded into a pageable copy of every expert, as large as the host store. With
+  `--paged-experts-enable-disk`, later starts read the experts from the
+  [expert cache](#the-expert-cache) instead.
 
 ## How It Works
 
@@ -141,6 +146,65 @@ without a graph. Prefill steps plan their waves on the host: under a breakable p
 paged MoE layer is an eager break between graph segments, so the rest of the layer stack stays
 captured. Both paths share one LRU state, so residency carries over between captured and
 uncaptured steps.
+
+### The expert cache
+
+Loading the experts takes most of a start for large MoE models, and formats on the Marlin
+runner also repack them. With `--paged-experts-enable-disk`, every MoE layer with more experts
+than K (under `--paged-experts-num-resident auto`, more than the router's top-k: K is sized
+after loading) keeps its experts on disk after loading, in the layout of the host store, one
+file per layer under `$SGLANG_CACHE_DIR/paged_experts/<model>-<key>/` (by default
+`~/.cache/sglang`; `<model>` is the Hugging Face id, or the folder name and a hash of its path).
+The files take about as much disk as the experts: on an RTX 5070 Ti with 62 GB of RAM and a
+PCIe 5.0 NVMe, Qwen3-30B-A3B-GPTQ-Int4 keeps 13.9 GiB (`load_model` 33 s, 22 s from the cache),
+Qwen3-30B-A3B-FP8 27.0 GiB (51 s, 29 s) and Qwen3-Next-80B-A3B-Instruct-NVFP4 40.7 GiB. After
+loading, one log line names the model's directory and what the cache did: layers read, rebuilt
+or written. Without the flag, a start whose experts the cache could keep logs its size and
+location once.
+
+- **A later start reads the files instead of loading and repacking.** It reads a layer's file
+  straight into the host store, then still loads a few groups of experts from the checkpoint
+  with the current code, each as wide as the router's top-k whatever K: the first experts, the
+  last ones, the first ones shifted by one, and a group sampled anew at every start, so that
+  over restarts every expert is checked. On the Marlin runner it repacks them. It compares
+  their bytes with what it read; a file that does not give the same bytes for all of them, does
+  not fit its layer or cannot be read is rebuilt from every expert and replaced, and a warning
+  names the first group that differed. With mapped safetensors (see Startup), the other
+  experts are not loaded at all unless the file is rebuilt; with other loaders, and for
+  checkpoints that store every expert in one tensor, every expert is still loaded and the
+  cache saves the repack only.
+- **The key** covers the checkpoint files the loader read (path, size and modification time of
+  the weight files and of the folder's `*.json`) and the torch, triton and kernel package
+  versions (the model's directory), and per layer its format and MoE runner, its tensors and
+  the content of the source files that repack the experts (the layer's file). A change to how
+  the experts are loaded reaches every expert, so the checked groups catch it without a new
+  key. The cache needs the default loader (`--load-format auto`, `safetensors`, `pt`, `npcache`,
+  `mistral`, `fastsafetensors`, `instanttensor`), which reports the files it read.
+- **One set per model.** Writing a file under a new key first removes the model's directories
+  under other keys and the layer's file under another layer key, also to make the space for
+  it. So the cache does not grow over time: it holds one set of files per model it has
+  served. Starts that alternate `--quantization` or `--moe-runner-backend` on the same
+  checkpoint replace each other's layer files at every start. Check the space with
+  `du -sh $SGLANG_CACHE_DIR/paged_experts`; to clear a model, delete its `<model>-*`
+  directory (the next start with the flag rebuilds it).
+- **Writes** run in the background with direct I/O and are published complete or not at all
+  (a staging file, then a rename), so concurrent starts can share the directory; a start that
+  is killed mid-write leaves a staging file that a later start removes. A write is skipped
+  when it would leave less than 8 GiB free: on a nearly full disk, the layers written until
+  then stay, and the warning says how much the next one needed. Reading or writing the cache
+  never fails a start; it only costs the time it would have saved.
+- **Who can write the directory controls the served weights**: a start serves the cached
+  experts outside the checked groups as they are on disk. Keep `$SGLANG_CACHE_DIR` private to
+  the users who run the server, as for the other caches there.
+- **Not detected:** a change that alters only some experts (for example a branch that depends
+  on the values of their scales) outside the files in the key, until a sampled group covers
+  one of those experts; and a checkpoint file or cache file altered in place, outside the
+  checked groups, with its size and modification time kept (no checksum, as SGLang's other
+  caches). If in doubt, delete the model's directory.
+
+In a container, mount `$SGLANG_CACHE_DIR` (or a directory it points to) to keep the files
+across restarts; without a mount they are written into the container's own filesystem, which
+takes the disk space and loses them with the container.
 
 ## Choosing K
 

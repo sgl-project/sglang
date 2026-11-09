@@ -903,13 +903,28 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         cap_layout = self._captured_ragged_layouts.get(graph_size_key)
         if cap_layout is None:
             return
+        from sglang.kernels.ops.speculative.ragged_verify_kernels import (
+            PaddedLayout,
+            PadVerifyLayout,
+        )
+
         live = ragged_layout
-        if live.bs != cap_layout.bs or live.cap is None:
-            live = live.padded_to_bucket(
-                padded_bs=cap_layout.bs, cap=self.captured_req_width
-            )
-        cap_layout.verify_lens.copy_(live.verify_lens)
-        cap_layout.qo_indptr_device.copy_(live.qo_indptr_device)
+        if live.bs == cap_layout.bs and live.cap is not None:
+            cap_layout.verify_lens.copy_(live.verify_lens)
+            cap_layout.qo_indptr_device.copy_(live.qo_indptr_device)
+            cap_layout.extend_start_loc.copy_(live.extend_start_loc)
+            return
+        PadVerifyLayout.execute(
+            verify_lens=live.verify_lens,
+            graph_num_tokens=live.graph_num_tokens,
+            padded_bs=cap_layout.bs,
+            cap=self.captured_req_width,
+            out=PaddedLayout(
+                verify_lens=cap_layout.verify_lens,
+                qo_indptr=cap_layout.qo_indptr_device,
+                extend_start_loc=cap_layout.extend_start_loc,
+            ),
+        )
 
     @staticmethod
     def _max_dp_batch_size(forward_batch: ForwardBatch) -> int:
@@ -1776,13 +1791,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
     def _glues_draft_metadata(self) -> bool:
         """Whether this draft runner's metadata prep runs through the glue graph: a
-        static-verify draft runner whose backend accepts it."""
+        draft runner whose backend accepts it."""
         if not self.model_runner.is_draft_worker:
             return False
-        if envs.SGLANG_RAGGED_VERIFY_MODE.get() != "static":
-            why = "ragged verify"
-        else:
-            why = self.attn_backend.glue_draft_metadata()
+        why = self.attn_backend.glue_draft_metadata()
         if why:
             logger.info("Draft metadata glue graph off: %s.", why)
             return False
@@ -1895,10 +1907,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # seq_lens_cpu / seq_lens_sum / req_pool_indices / out_cache_loc when the
         # runtime mode is IDLE, so IDLE and active DECODE are different python branches
         # and must not share a captured graph. Under the early metadata the variant
-        # picks the prep's branch too (early install or Raw copy).
+        # picks the prep's branch too; every early variant installs the same metadata,
+        # so they share one glue graph.
         key = (bs, str(self.capture_forward_mode), actual_mode)
         if self._early_verify_metadata is None:
             return key
+        if attention_variant in DSV41_EARLY_VERIFY_VARIANTS:
+            return key + ("early",)
         return key + (attention_variant,)
 
     def _prep_attention_variant(self, attention_variant):
