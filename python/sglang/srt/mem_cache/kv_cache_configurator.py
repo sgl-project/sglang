@@ -2662,7 +2662,15 @@ class KVCacheConfigurator:
                 f"--qsa-indexer-dtype {qsa_indexer_dtype} needs a model with a "
                 "compressed QSA indexer (Qwen4-Exp); this model has none"
             )
+        offload = get_memory().enable_qsa_kv_offload and (
+            not self.is_draft_worker or get_memory().qsa_kv_offload_draft
+        )
         if qsa_profile is None:
+            if offload:
+                raise ValueError(
+                    "--enable-qsa-kv-offload sized this pool's K/V for the host, "
+                    "but the model has no compressed QSA indexer"
+                )
             pool_class = HybridLinearKVPool
             extra_args["use_mla"] = self.use_mla_backend
         else:
@@ -2675,6 +2683,24 @@ class KVCacheConfigurator:
                 num_request_slots=req_to_token_pool.req_to_token.shape[0],
                 qsa_indexer_dtype=resolve_qsa_indexer_dtype(qsa_indexer_dtype),
             )
+            if offload:
+                from sglang.srt.mem_cache.qsa_kv_offload import (
+                    offload_layout_from_config,
+                )
+
+                num_request_slots = req_to_token_pool.req_to_token.shape[0]
+                budgeted_slots = get_schedule().max_running_requests + 1
+                if num_request_slots > budgeted_slots:
+                    raise RuntimeError(
+                        f"QSA K/V offload: {num_request_slots} request slots exceed "
+                        f"the {budgeted_slots} its GPU hot-cache budget holds"
+                    )
+                extra_args["kv_offload_layout"] = offload_layout_from_config(
+                    hf_config=self.model_config.hf_config,
+                    num_request_slots=num_request_slots,
+                    page_size=self.pool_page_size,
+                    draft=self.is_draft_worker,
+                )
         if self.modelslim_cache_layout is not None:
             full_pool_class = partial(
                 full_pool_class,

@@ -453,3 +453,19 @@ Tool calls: [('get_weather', '{"location": "Beijing"}')]
 ```
 
 </Accordion>
+
+### 2.3 Long Context on One GPU: QSA K/V Host Offload
+
+Qwen3.8-Flash-Next decodes with QSA sparse attention: each query reads at most 2,048 of its context's tokens per QSA layer, but every token's full-attention K/V normally stays in GPU memory. In long-context, many-session deployments that K/V, not compute, caps the number of concurrent requests. `--enable-qsa-kv-offload` keeps the full-attention K/V in pinned host memory and keeps on the GPU, per request, only a cache of the blocks the indexer selects. The output is unchanged (bit-exact), and the radix cache keeps working.
+
+```bash
+sglang serve --model-path nvidia/Qwen3.8-Flash-Next-NVFP4 --quantization modelopt_fp4 \
+  --enable-qsa-kv-offload --qsa-kv-offload-host-size 60 --qsa-kv-offload-hot-blocks 1024 \
+  --max-running-requests 32 --disable-prefill-cuda-graph
+```
+
+- **Host memory:** `--qsa-kv-offload-host-size` GB per TP rank, pinned. The logical KV pool is the smaller of what the GPU and the host allow; each token costs the full K/V bytes on the host. This store comes on top of other pinned host memory, in particular the PLE n-gram embedding table, which this model offloads to pinned host memory by default (`--ple-offload-embedding`). Size the host store so that both fit in host RAM.
+- **GPU memory:** per logical token only the QSA index and any MTP draft pool. Per request slot, `(hot_blocks + 2) × compress_ratio` K/V rows per QSA layer (about 0.1 GB at 1,024 blocks with a BF16 KV cache), plus one extend scratch.
+- **With MTP:** the draft model's QSA layer keeps its full K/V on the GPU, which is then most of the per-token GPU cost. `--qsa-kv-offload-draft` offloads it the same way: its host rows come out of `--qsa-kv-offload-host-size`, and the GPU keeps one more hot cache per request slot for the draft layer.
+- **What limits concurrency next:** the GDN (Mamba) state cache. Give it the freed GPU memory with `--max-mamba-cache-size`.
+- **Not combinable with:** HiCache, HiSparse, LMCache, PD disaggregation, DP attention, context or pipeline parallelism, mixed chunked prefill, n-gram or tree speculation (`--speculative-eagle-topk` > 1), or prefill CUDA graphs. Chain MTP speculation is supported. Decode CUDA graphs need CUDA; on ROCm the offload runs eagerly, so add `--disable-cuda-graph`.

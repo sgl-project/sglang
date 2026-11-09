@@ -305,6 +305,26 @@ class Memory(msgspec.Struct):
     ] = None
 
     # -------------------------------------------------------------------------
+    # QSA K/V host offload
+    # -------------------------------------------------------------------------
+    enable_qsa_kv_offload: A[
+        bool,
+        "Keep the full-attention K/V of QSA sparse-attention models (Qwen4-Exp) in pinned host memory, with a per-request GPU cache of the blocks the indexer selects. Works with the radix cache. Requires --max-running-requests and --qsa-kv-offload-host-size.",
+    ] = False
+    qsa_kv_offload_host_size: A[
+        int,
+        "Pinned host memory for the offloaded QSA K/V in GB per TP rank. Caps the logical KV pool together with the GPU budget.",
+    ] = 0
+    qsa_kv_offload_hot_blocks: A[
+        int,
+        "GPU cache size per request and QSA layer, in compressed indexer blocks. Must hold one forward's selected blocks of every query row of a request (at least the indexer's block top-k times the verify rows). Each block costs compress_ratio K/V rows per QSA layer per request slot (Qwen3.8-Flash-Next with a BF16 KV cache: about 0.1 GB per request slot at 1024).",
+    ] = 1024
+    qsa_kv_offload_draft: A[
+        bool,
+        "With --enable-qsa-kv-offload and an MTP draft (--speculative-algorithm NEXTN or EAGLE), also keep the draft model's QSA K/V in pinned host memory, with the same per-request GPU cache. The host size then covers both models' K/V.",
+    ] = False
+
+    # -------------------------------------------------------------------------
     # LMCache
     # -------------------------------------------------------------------------
     enable_lmcache: A[
