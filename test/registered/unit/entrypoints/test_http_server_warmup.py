@@ -129,6 +129,45 @@ class TestSkippedWarmupGcFreeze(unittest.TestCase):
         self.assertEqual(freezes, [("http://127.0.0.1:30000/freeze_gc", None)])
         self.assertEqual(state.tokenizer_manager.server_status, ServerStatus.Up)
 
+    def test_gc_freeze_gives_up_on_a_server_that_never_answers(self):
+        """With server warmup skipped, a server that cannot reach its own URL must
+        still report Up within the wait cap; it used to poll for up to 12 minutes."""
+        from sglang.srt.runtime_context import get_context
+
+        override = get_context().override_server_args(skip_server_warmup=True)
+        override.install()
+        self.addCleanup(override.restore)
+
+        seconds = [0.0]  # simulated time; every request hangs until its timeout
+        freezes = []
+
+        def sleep(duration):
+            seconds[0] += duration
+
+        def get(url, timeout, **kwargs):
+            seconds[0] += timeout
+            raise requests.exceptions.ReadTimeout("no answer")
+
+        def post(url, **kwargs):
+            freezes.append(url)
+            return SimpleNamespace(raise_for_status=lambda: None)
+
+        server_args = SimpleNamespace(url=lambda: "http://127.0.0.1:30000")
+        state = SimpleNamespace(tokenizer_manager=SimpleNamespace(server_status=None))
+        with (
+            patch.object(http_server, "_global_state", state),
+            patch.object(http_server, "ssl_verify_of", lambda _: True),
+            patch.object(http_server.time, "sleep", sleep),
+            patch.object(http_server.time, "monotonic", lambda: seconds[0]),
+            patch.object(http_server.requests, "get", get),
+            patch.object(http_server.requests, "post", post),
+        ):
+            http_server._wait_and_warmup(server_args)
+
+        self.assertLessEqual(seconds[0], http_server._SKIPPED_WARMUP_WAIT_S + 1)
+        self.assertEqual(freezes, [])
+        self.assertEqual(state.tokenizer_manager.server_status, ServerStatus.Up)
+
 
 if __name__ == "__main__":
     unittest.main()
