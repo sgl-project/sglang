@@ -33,6 +33,7 @@ from sglang.srt.mem_cache.kv.build import UnifiedBuildContext, build_kv_storage
 from sglang.srt.mem_cache.kv.decl import (
     MHAGeometry,
     StateGeometry,
+    WindowLayers,
     kv_layer_decls,
 )
 from sglang.srt.mem_cache.kv.plan import plan_kv_storage
@@ -105,35 +106,36 @@ def _window_pool(total_bytes):
     ).token_to_kv_pool_allocator
 
 
-def _draft_window(window, name="draft_swa"):
+def _draft_window(window):
     """A fused draft whose window layers get a band of their own."""
     return FusedDraftPlacement.from_counts(
-        counts={name: [1]},
+        counts={"draft_swa": [1]},
         regions={
-            name: DenseDraftRegion(
+            "draft_swa": DenseDraftRegion(
                 lane_num=1, head_num=1, head_dim=8, store_dtype=torch.bfloat16
             )
         },
-        new_bands={name: DraftBand(kind="window", window=window)},
+        new_bands={"draft_swa": DraftBand(kind="window", window=window)},
     )
 
 
 def _storage(
     *, windows=(), state=False, full_tokens=64, window_tokens=64, fused_draft=None
 ):
-    """A storage of page 4: one FULL layer, at most one window layer (its
-    length in ``windows``, None for one the model does not state), with
-    ``state`` two state layers, and a ``fused_draft``'s bands."""
+    """A storage of page 4: one FULL layer, a layer per window length (None
+    for one the model does not state), with ``state`` two state layers, and
+    a ``fused_draft``'s bands."""
     setup_allocator_context()
-    assert len(windows) <= 1, "a target declares at most one window"
-    layer = 1 + len(windows)
+    layer = 1
+    groups = []
+    for window in windows:
+        groups.append(WindowLayers(layer_ids=(layer,), geometry=_DENSE, window=window))
+        layer += 1
     state_layers = (layer, layer + 1) if state else ()
     decls = kv_layer_decls(
         full_layer_ids=(0,),
         full_geometry=_DENSE,
-        window_layer_ids=(1,) if windows else (),
-        window_geometry=_DENSE if windows else None,
-        window=windows[0] if windows else None,
+        windows=groups,
         state_layer_ids=state_layers,
         state_geometry=_STATE if state else None,
         checkpoint_interval=4 if state else None,
@@ -526,12 +528,7 @@ class TestMemoryClip(_AdderCase):
     def test_clip_prices_stated_windows_before_retention_binds(self):
         """BUG REGRESSION. Before retention binds, a window that states its own
         length (a draft's) is priced by it, as after binding."""
-        storage = _storage(
-            windows=(None,),
-            full_tokens=128,
-            window_tokens=128,
-            fused_draft=_draft_window(8, name="window_8"),
-        )
+        storage = _storage(windows=(None, 8), full_tokens=128, window_tokens=128)
         allocator = storage.allocator
         self.assertIsNone(allocator.retained_windows)
         self.assertEqual(allocator._ceiling_windows(32), {"window": 32, "window_8": 8})

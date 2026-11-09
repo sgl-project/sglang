@@ -19,18 +19,11 @@ from sglang.srt.mem_cache.kv.build import UnifiedBuildContext, build_kv_storage
 from sglang.srt.mem_cache.kv.decl import (
     MHAGeometry,
     StateGeometry,
+    WindowLayers,
     kv_layer_decls,
 )
-from sglang.srt.mem_cache.kv.plan import plan_kv_storage, sub_pool_names
+from sglang.srt.mem_cache.kv.plan import plan_kv_storage
 from sglang.srt.mem_cache.kv.sizing import KVSizingInputs, size_plan
-from sglang.srt.mem_cache.layout.fused_draft import (
-    LAYER_WINDOW,
-    DraftKVGeometry,
-    DraftKVProfile,
-    DraftLayerSet,
-    PlacementContext,
-    place_fused_draft,
-)
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.unified_allocator_fixtures import setup_allocator_context
@@ -39,45 +32,24 @@ register_cuda_ci(est_time=20, stage="extra-a", runner_config="1-gpu-large")
 
 _MHA = MHAGeometry(head_num=1, head_dim=8, v_head_dim=8, kv_cache_dtype=torch.bfloat16)
 _PAGE = 4
-# The target's window (the scheduler's sliding window) and a shorter fused
-# draft window, a sub-pool of its own.
+# The target's window (the scheduler's sliding window) and two shorter windows
+# of their own sub-pools, as draft windows of other lengths are.
 _TARGET_WINDOW = 16
-_WINDOWS = (_TARGET_WINDOW, 8)
-
-
-def _draft_window_placement(decls, target_window, draft_window):
-    return place_fused_draft(
-        profile=DraftKVProfile(
-            num_layers=1,
-            kinds={
-                LAYER_WINDOW: DraftLayerSet(
-                    layer_ids=(0,),
-                    window=draft_window,
-                    geometry=DraftKVGeometry(head_num=1, head_dim=8, v_head_dim=8),
-                )
-            },
-        ),
-        num_runners=1,
-        ctx=PlacementContext(
-            host_names=sub_pool_names(decls), target_window=target_window
-        ),
-        store_dtype=torch.bfloat16,
-    ).placement
+_WINDOWS = (_TARGET_WINDOW, 8, 4)
 
 
 def _storage(windows=_WINDOWS, device="cpu", state=False):
-    """One full layer, the target's window layer, a fused draft window when
-    ``windows`` names one, and with ``state`` one recurrent state layer."""
+    """One full layer, one layer per window, and with ``state`` one recurrent
+    state layer after them."""
     setup_allocator_context()
-    target, *drafts = windows
-    assert len(drafts) <= 1, "a draft adds at most one window"
-    state_layer = 2
+    state_layer = len(windows) + 1
     decls = kv_layer_decls(
         full_layer_ids=(0,),
         full_geometry=_MHA,
-        window_layer_ids=(1,),
-        window_geometry=_MHA,
-        window=target,
+        windows=[
+            WindowLayers(layer_ids=(i + 1,), geometry=_MHA, window=w)
+            for i, w in enumerate(windows)
+        ],
         state_layer_ids=(state_layer,) if state else (),
         state_geometry=(
             StateGeometry(
@@ -90,8 +62,7 @@ def _storage(windows=_WINDOWS, device="cpu", state=False):
             else None
         ),
     )
-    placement = _draft_window_placement(decls, target, drafts[0]) if drafts else None
-    plan = plan_kv_storage(decls, page_size=_PAGE, fused_draft=placement)
+    plan = plan_kv_storage(decls, page_size=_PAGE)
     sized = size_plan(
         plan,
         KVSizingInputs(
@@ -106,7 +77,7 @@ def _storage(windows=_WINDOWS, device="cpu", state=False):
     ctx = UnifiedBuildContext(
         device=device,
         start_layer=0,
-        end_layer=2 + int(state),
+        end_layer=len(windows) + 1 + int(state),
         enable_memory_saver=False,
         need_sort=False,
         max_num_reqs=3,
@@ -235,7 +206,7 @@ class TestUnifiedWindowLengths(CustomTestCase):
         storage.bind_window_retention(_TARGET_WINDOW, {"window_8": 13})
         self.assertEqual(
             storage.retained_window_lengths(),
-            {"window_16": 16, "window_8": 13},
+            {"window_16": 16, "window_8": 13, "window_4": 4},
         )
         for seq_len in (5, 23, 37, 64):
             with self.subTest(seq_len=seq_len):
@@ -267,6 +238,16 @@ class TestUnifiedWindowLengths(CustomTestCase):
                     )
                 }
                 self.assertEqual(received, sent)
+
+    def test_each_layer_routes_to_its_window(self):
+        """A window layer's route carries its own window; a full layer's none."""
+        storage = _storage()
+        router = storage.allocator.get_kvcache().layer_router
+        for i, window in enumerate(_WINDOWS):
+            name = f"window_{window}"
+            self.assertEqual(router.sub_pool(name).window, window)
+            self.assertEqual(router.layer(i + 1).route.window, window)
+        self.assertIsNone(router.layer(0).route.window)
 
     def test_draft_window_sidecar_follows_the_target_window_host_pool(self):
         """BUG REGRESSION. A non-fused window draft's HiCache sidecar must use

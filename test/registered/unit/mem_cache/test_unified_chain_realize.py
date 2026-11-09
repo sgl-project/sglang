@@ -21,18 +21,11 @@ from sglang.srt.mem_cache.kv.build import UnifiedBuildContext, build_kv_storage
 from sglang.srt.mem_cache.kv.decl import (
     MHAGeometry,
     StateGeometry,
+    WindowLayers,
     kv_layer_decls,
 )
-from sglang.srt.mem_cache.kv.plan import plan_kv_storage, sub_pool_names
+from sglang.srt.mem_cache.kv.plan import plan_kv_storage
 from sglang.srt.mem_cache.kv.sizing import KVSizingInputs, size_plan
-from sglang.srt.mem_cache.layout.fused_draft import (
-    LAYER_WINDOW,
-    DraftKVGeometry,
-    DraftKVProfile,
-    DraftLayerSet,
-    PlacementContext,
-    place_fused_draft,
-)
 from sglang.srt.runtime_context import mamba_cache_chunk_size
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -92,37 +85,16 @@ def _allocator(device, chain, lazy):
 _MHA = MHAGeometry(head_num=1, head_dim=8, v_head_dim=8, kv_cache_dtype=torch.float16)
 
 
-def _draft_window_placement(decls, target_window, draft_window):
-    return place_fused_draft(
-        profile=DraftKVProfile(
-            num_layers=1,
-            kinds={
-                LAYER_WINDOW: DraftLayerSet(
-                    layer_ids=(0,),
-                    window=draft_window,
-                    geometry=DraftKVGeometry(head_num=1, head_dim=8, v_head_dim=8),
-                )
-            },
-        ),
-        num_runners=1,
-        ctx=PlacementContext(
-            host_names=sub_pool_names(decls), target_window=target_window
-        ),
-        store_dtype=torch.float16,
-    ).placement
-
-
 def _several_floats(device, windows, state, lazy):
-    """full + two window floats (the target's, then a fused draft's of another
-    length), with a state end below them or not."""
+    """full + several window floats, with a state end below them or not."""
     first_window = 2 if state else 1
-    target, draft = windows
     decls = kv_layer_decls(
         full_layer_ids=(0,),
         full_geometry=_MHA,
-        window_layer_ids=(first_window,),
-        window_geometry=_MHA,
-        window=target,
+        windows=[
+            WindowLayers(layer_ids=(first_window + i,), geometry=_MHA, window=w)
+            for i, w in enumerate(windows)
+        ],
         state_layer_ids=(1,) if state else (),
         state_geometry=(
             StateGeometry(
@@ -136,11 +108,7 @@ def _several_floats(device, windows, state, lazy):
         ),
         checkpoint_interval=mamba_cache_chunk_size() if state else None,
     )
-    plan = plan_kv_storage(
-        decls,
-        page_size=1,
-        fused_draft=_draft_window_placement(decls, target, draft),
-    )
+    plan = plan_kv_storage(decls, page_size=1)
     sized = size_plan(
         plan,
         KVSizingInputs(
@@ -155,7 +123,7 @@ def _several_floats(device, windows, state, lazy):
     ctx = UnifiedBuildContext(
         device=device,
         start_layer=0,
-        end_layer=first_window + 1,
+        end_layer=first_window + len(windows),
         enable_memory_saver=False,
         need_sort=False,
         max_num_reqs=4,
@@ -293,11 +261,16 @@ class TestChainRealize(CustomTestCase):
         self.assertGreater(refused, 0)
 
     def _check_several_floats(self, device, seed, count):
-        # Two window floats between the owner's end and a state end (or
-        # none), with transfers on live pages finishing while the
+        # Two or three window floats between the owner's end and a state end
+        # (or none), with transfers on live pages finishing while the
         # rearrangement waits for them.
         rng = random.Random(seed)
-        shapes = (((32, 16), False), ((32, 16), True))
+        shapes = (
+            ((32, 16), False),
+            ((32, 16, 8), False),
+            ((32, 16), True),
+            ((32, 16, 8), True),
+        )
         realized = refused = 0
         floats = set()
         while realized < count:
@@ -568,7 +541,7 @@ class TestChainRealize(CustomTestCase):
         # the sends still read outside the bands for the next relief to avoid.
         rng = random.Random(seed)
         side = torch.cuda.Stream() if device == "cuda" else None
-        shapes = (((32, 16), False), ((32, 16), True))
+        shapes = (((32, 16), False), ((32, 16, 8), True))
         waits = []
         realized = refused = kept_in_place = 0
         while realized < count:
