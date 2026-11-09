@@ -24,11 +24,11 @@ from typing import Any, ClassVar
 import msgspec
 
 from sglang.multimodal_gen import envs
-from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import (
     Cosmos3Config,
     _transformer_config,
 )
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -156,11 +156,6 @@ COSMOS3_MULTIVIEW_INFERENCE_DEFAULT_KEYS = frozenset(
         "control_guidance_interval",
         "normalize_cfg",
     }
-)
-# Written by the Sep/Oct-1 exporters, dropped by the Oct-7 contract (sglang never
-# read sigma_max; negative_metadata_mode is a request field).
-COSMOS3_MULTIVIEW_OPTIONAL_INFERENCE_DEFAULT_KEYS = frozenset(
-    {"sigma_max", "negative_metadata_mode"}
 )
 COSMOS3_MULTIVIEW_RESOLUTIONS = ("480", "720")
 
