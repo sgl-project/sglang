@@ -2325,7 +2325,6 @@ def _hc_mix_stats_reduce_kernel(
 # a row must produce the same bits alone and in any batch routed to this backend.
 _HC_MIX_SLICE_CHOICES = (80, 64, 40, 32, 16, 8, 4, 2, 1)
 _HC_MIX_BLOCK_M = 32
-# Keep the non-fused projection's reduction order unchanged.
 _HC_MIX_BLOCK_K = 64
 _HC_MIX_NUM_WARPS = 4
 # Triton on AMD has no tf32x3 (gfx942 adds only tf32); "ieee" is the fp32 MFMA
@@ -2355,10 +2354,8 @@ def _block_m_for(m: int) -> int:
 
 @functools.lru_cache(maxsize=None)
 def _hc_mix_stats_sinkhorn_block_k(device: torch.device) -> int:
-    # Query the input device at launch, not import: capability queries initialize
-    # CUDA and must not run in a parent process before fork. SM121 is unmeasured.
-    # The narrower tile benefits the SM120 split-K projection at large M; small-M
-    # timings and cache-resident inputs need separate measurements.
+    # Query the input device lazily to avoid initializing CUDA before fork.
+    # SM121 has not been measured.
     if (
         device.type == "cuda"
         and not _is_hip
@@ -2368,18 +2365,8 @@ def _hc_mix_stats_sinkhorn_block_k(device: torch.device) -> int:
     return _HC_MIX_BLOCK_K
 
 
-def _hc_mix_stats_sinkhorn_block_m(m: int, block_k: int) -> int:
-    block_m = _block_m_for(m)
-    # With BLOCK_K=32 on SM120, the 8-row tile changes rounding relative to
-    # 16/32-row tiles. Use the latter even for decode to preserve batch invariance.
-    return max(16, block_m) if block_k == 32 else block_m
-
-
 def _num_slices_for(k: int, block_k: int = _HC_MIX_BLOCK_K) -> int:
-    """Slice count depends only on K and tile width, never on batch size M.
-
-    Changing BLOCK_K can also change the selected split-K count.
-    """
+    """Slice count depends only on K and tile width, never on batch size M."""
     blocks = k // block_k
     assert k % block_k == 0, k
     for n in _HC_MIX_SLICE_CHOICES:
@@ -2401,7 +2388,7 @@ def hc_mix_stats(x_flat: torch.Tensor, hc_fn: torch.Tensor, eps: float) -> torch
     m, k = x_flat.shape
     mix = hc_fn.shape[0]
     assert hc_fn.shape[1] == k
-    num_slices = _num_slices_for(k, _HC_MIX_BLOCK_K)
+    num_slices = _num_slices_for(k)
     mix_pad = max(16, triton.next_power_of_2(mix))
     part_mix = torch.empty(
         (num_slices, m, mix), dtype=torch.float32, device=x_flat.device
@@ -2544,7 +2531,10 @@ def hc_mix_stats_sinkhorn(
     mix_pad = max(16, triton.next_power_of_2(mix))
     part_mix = torch.empty((num_slices, m, mix), dtype=torch.float32, device=dev)
     part_sq = torch.empty((num_slices, m), dtype=torch.float32, device=dev)
-    block_m = _hc_mix_stats_sinkhorn_block_m(m, block_k)
+    block_m = _block_m_for(m)
+    if block_k == 32:
+        # SM120's 8-row tile changes rounding relative to 16/32-row batches.
+        block_m = max(16, block_m)
     _hc_mix_stats_partial_kernel[(triton.cdiv(m, block_m), num_slices)](
         x_flat,
         hc_fn,

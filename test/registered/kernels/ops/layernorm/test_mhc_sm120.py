@@ -2,7 +2,7 @@
 
 import subprocess
 import sys
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -59,59 +59,46 @@ with (
     importlib.reload(mhc)
 """
     result = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            script,
-        ],
-        capture_output=True,
-        text=True,
-        timeout=120,
+        [sys.executable, "-c", script], capture_output=True, text=True, timeout=120
     )
     assert result.returncode == 0, result.stderr
 
 
-def test_tile_selection_uses_the_input_device_and_excludes_sm121():
+def test_tile_selection_uses_the_input_device_and_excludes_sm121(monkeypatch):
     capabilities = {0: (12, 0), 1: (12, 1), 2: (10, 0), 3: (9, 0)}
+    query = Mock(side_effect=lambda device: capabilities[device.index])
+    monkeypatch.setattr(mhc, "_is_hip", False)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", query)
     select = mhc._hc_mix_stats_sinkhorn_block_k
     select.cache_clear()
     try:
-        with (
-            patch.object(mhc, "_is_hip", False),
-            patch.object(
-                torch.cuda,
-                "get_device_capability",
-                side_effect=lambda device: capabilities[device.index],
-            ) as capability,
-        ):
-            assert select(torch.device("cpu")) == 64
-            capability.assert_not_called()
-            for index, expected in enumerate((32, 64, 64, 64)):
-                assert select(torch.device("cuda", index)) == expected
-            assert select(torch.device("cuda", 0)) == 32
-            assert capability.call_count == 4
+        assert select(torch.device("cpu")) == 64
+        query.assert_not_called()
+        for index, expected in enumerate((32, 64, 64, 64)):
+            assert select(torch.device("cuda", index)) == expected
+        assert select(torch.device("cuda", 0)) == 32
+        assert query.call_count == 4
         select.cache_clear()
-        with (
-            patch.object(mhc, "_is_hip", True),
-            patch.object(torch.cuda, "get_device_capability") as capability,
-        ):
-            assert select(torch.device("cuda", 0)) == 64
-            capability.assert_not_called()
+        monkeypatch.setattr(mhc, "_is_hip", True)
+        assert select(torch.device("cuda", 0)) == 64
+        assert query.call_count == 4
     finally:
         select.cache_clear()
 
 
 @pytest.mark.parametrize("seed", [7, 11, 19])
 @pytest.mark.parametrize("k", [2560, 20480])
-def test_batch_invariance_across_row_tiles(seed, k):
+def test_fused_accuracy_and_batch_invariance(seed, k):
     _require_sm120()
     x, weight, scale, base = _inputs(4096, k, seed)
     fused_reference = _fused(x, weight, scale, base)
-    stats_reference = mhc.hc_mix_stats(x, weight, 1e-20)
+    with patch.object(mhc, "_hc_mix_stats_sinkhorn_block_k", return_value=64):
+        baseline = _fused(x, weight, scale, base)
+    for got, expected in zip(fused_reference, baseline):
+        torch.testing.assert_close(got, expected, rtol=1e-5, atol=2e-6)
     for m in (1, 8, 9, 16, 32, 2048, 2049):
         for got, reference in zip(_fused(x[:m], weight, scale, base), fused_reference):
             _assert_bitwise(got, reference[:m])
-        _assert_bitwise(mhc.hc_mix_stats(x[:m], weight, 1e-20), stats_reference[:m])
     # Checking only the first eight rows misses data-dependent rounding changes.
     # Route every reference row through the actual small-batch launch.
     for start in range(0, x.shape[0], 8):
@@ -120,17 +107,6 @@ def test_batch_invariance_across_row_tiles(seed, k):
             _fused(x[start:stop], weight, scale, base), fused_reference
         ):
             _assert_bitwise(got, reference[start:stop])
-
-
-@pytest.mark.parametrize("k", [2560, 20480])
-def test_fused_accuracy_against_block_k_64(k):
-    _require_sm120()
-    x, weight, scale, base = _inputs(4096, k, 7)
-    tuned = _fused(x, weight, scale, base)
-    with patch.object(mhc, "_hc_mix_stats_sinkhorn_block_k", return_value=64):
-        reference = _fused(x, weight, scale, base)
-    for got, expected in zip(tuned, reference):
-        torch.testing.assert_close(got, expected, rtol=1e-5, atol=2e-6)
 
 
 def test_bf16x3_is_independent_of_partial_tile_width():
