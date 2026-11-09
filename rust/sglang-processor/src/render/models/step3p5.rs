@@ -24,8 +24,8 @@ const EFFORT_TIERS: &[&str] = &[
 
 /// `apply_chat_template` arguments SGLang passes itself, which fail its call as
 /// kwargs. A falsy `continue_final_message` or `return_assistant_tokens_mask` is
-/// that argument's default and a `chat_template` renders another template; the
-/// engine renders those.
+/// that argument's default and a server's default `chat_template` renders
+/// another template; the engine renders those.
 const FAILING_KWARGS: &[&str] = &[
     "add_generation_prompt",
     "conversation",
@@ -161,9 +161,13 @@ fn validate_tool_choice(request: &Value, messages: &[Value]) -> Result<(), Strin
 }
 
 /// The request's kwargs over the server's defaults that `apply_chat_template`
-/// rejects, a 400 in Python rather than a different render.
+/// rejects, a 400 in Python rather than a different render; `_validate_request`
+/// rejects the request's own `chat_template` unless the server trusts it.
 fn failing_kwargs(request: &Value, defaults: &HashMap<String, Value>) -> Result<(), String> {
     let own = request["chat_template_kwargs"].as_object();
+    if own.is_some_and(|kwargs| kwargs.contains_key("chat_template")) {
+        return Err("Request-supplied chat_template is not allowed.".into());
+    }
     let kwarg = |key: &&str| {
         own.and_then(|kwargs| kwargs.get(*key))
             .or_else(|| defaults.get(*key))
@@ -398,6 +402,17 @@ mod tests {
         assert!(matches!(
             checkpoint.render_request(request(json!({})), &defaults),
             Err(TemplateError::Renderer { .. })
+        ));
+        // The request's own template is a 400 (`_validate_request`); a server
+        // default renders another template, on the engine.
+        assert!(matches!(
+            render(&checkpoint, request(json!({"chat_template": "X"}))),
+            Err(TemplateError::Renderer { .. })
+        ));
+        let defaults = HashMap::from([("chat_template".to_owned(), json!("X"))]);
+        assert!(matches!(
+            checkpoint.render_request(request(json!({})), &defaults),
+            Err(TemplateError::NeedsRenderFallback { .. })
         ));
         // A falsy flag is `apply_chat_template`'s default: left to the engine.
         assert!(matches!(
