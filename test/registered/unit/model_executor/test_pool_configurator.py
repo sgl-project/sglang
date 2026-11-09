@@ -96,8 +96,10 @@ def _make_model_runner(
     mr = MagicMock()
 
     mr.use_mla_backend = use_mla_backend
+    mr.modelslim_cache_layout = None
     mr.is_draft_worker = False
     mr.dflash_draft_cell_size_per_token = None
+    mr.dflash_draft_loc_space_scale = 1
     mr.num_effective_layers = num_layers
     mr.start_layer = 0
     mr.end_layer = num_layers
@@ -451,6 +453,7 @@ class TestHybridSWAConfigurator(CustomTestCase):
         configurator = object.__new__(KVCacheConfigurator)
         configurator.model_config = mr.model_config
         configurator.is_hybrid_swa = True
+        configurator.use_mla_backend = False
         configurator.is_draft_worker = False
         target = configurator._derive_pool_sizes(config=config)
         configurator.is_draft_worker = True
@@ -960,6 +963,64 @@ class TestEagleConfigurator(CustomTestCase):
         "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
         return_value=576,
     )
+    def test_eagle_dcp_replicated_draft_does_not_exceed_budget(
+        self,
+        _mock_calculate_mla_kv_cache_dim,
+    ):
+        """The EAGLE draft pool spans every DCP virtual location with its own KV
+        heads: GQA heads replicate over DCP on the target only, an MLA latent has none.
+        """
+        available = 10_000_000
+        num_layers = 32
+        eagle_draft_num_layers = 1
+        tp_size = 8
+        total_kv_heads = 8
+
+        def num_kv_heads(tensor_parallel_size, dcp_size=1):
+            return total_kv_heads // (tensor_parallel_size // dcp_size)
+
+        for use_mla_backend in (True, False):
+            for dcp_size in (1, 4):
+                with self.subTest(use_mla_backend=use_mla_backend, dcp_size=dcp_size):
+                    mr = _make_model_runner(
+                        self, num_layers=num_layers, use_mla_backend=use_mla_backend
+                    )
+                    mr.model_config.get_num_kv_heads = num_kv_heads
+                    mr.spec_algorithm.is_eagle.return_value = True
+                    mr.spec_algorithm.is_standalone.return_value = False
+                    mr.spec_algorithm.is_none.return_value = False
+                    mr.spec_aux_config.eagle_draft_num_layers = eagle_draft_num_layers
+
+                    with (
+                        mock_cpu_env(tp_size=tp_size),
+                        get_parallel().override(attn_dcp_size=dcp_size),
+                    ):
+                        from sglang.srt.model_executor.pool_configurator import (
+                            create_memory_pool_configurator,
+                        )
+
+                        cfg = create_memory_pool_configurator(mr)
+                        config = cfg.calculate_pool_sizes(available, 1)
+
+                    if use_mla_backend:
+                        target_per_layer = draft_per_layer = 576 * KV_SIZE
+                    else:
+                        mc = mr.model_config
+                        head_bytes = (mc.head_dim + mc.v_head_dim) * KV_SIZE
+                        target_per_layer = num_kv_heads(tp_size, dcp_size) * head_bytes
+                        draft_per_layer = num_kv_heads(tp_size) * head_bytes
+                    per_token = (
+                        target_per_layer * num_layers
+                        + draft_per_layer * eagle_draft_num_layers * dcp_size
+                    )
+                    used = config.max_total_num_tokens * per_token
+                    self.assertLessEqual(used, available)
+                    self.assertGreater(used, available * 0.99)
+
+    @patch(
+        "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
+        return_value=576,
+    )
     def test_dsa_draft_full_indexer_cost_does_not_exceed_budget(
         self,
         _mock_calculate_mla_kv_cache_dim,
@@ -1346,6 +1407,8 @@ class TestDflashDraftKvBudget(CustomTestCase):
             head_dim=64,
             v_head_dim=32,
             get_num_kv_heads=lambda tp: 8 // tp,
+            hf_config=None,
+            attention_arch=AttentionArch.MHA,
         )
         aux = SpecAuxHiddenStateConfig(
             draft_model_config=draft, dflash_draft_num_layers=2
@@ -1390,21 +1453,20 @@ class TestDflashDraftKvBudget(CustomTestCase):
                 self.assertEqual(config.dflash_draft_cell_size_per_token, expected)
                 self.assertIs(config.draft_parallel_layout, layout)
 
-    def test_dcp_replication_scales_draft_budget(self):
-        """The replicated draft pool spans every DCP virtual location."""
+    def test_dcp_draft_budget_follows_draft_loc_space_scale(self):
+        """The DFLASH draft KV is charged once per draft_loc_space_scale row."""
         draft_kv_per_token = 10_240
-        mr = _make_model_runner(self)
-        mr.spec_algorithm.is_dflash_family.return_value = True
-        mr.spec_aux_config = SimpleNamespace(
-            eagle_draft_num_layers=None,
-            dflash_draft_num_layers=5,
-        )
-
-        mr.dflash_draft_cell_size_per_token = draft_kv_per_token
-
         target_kv_per_token = 4 * (64 + 64) * 32 * KV_SIZE
-        for dcp_size in (1, 8):
-            with self.subTest(dcp_size=dcp_size):
+        for dcp_size, loc_space_scale in ((1, 1), (8, 8), (8, 1)):
+            mr = _make_model_runner(self)
+            mr.spec_algorithm.is_dflash_family.return_value = True
+            mr.spec_aux_config = SimpleNamespace(
+                eagle_draft_num_layers=None,
+                dflash_draft_num_layers=5,
+            )
+            mr.dflash_draft_cell_size_per_token = draft_kv_per_token
+            mr.dflash_draft_loc_space_scale = loc_space_scale
+            with self.subTest(dcp_size=dcp_size, loc_space_scale=loc_space_scale):
                 # TP=8 makes both topologies valid. The mock deliberately keeps
                 # target geometry fixed so this assertion isolates the draft term.
                 with (
@@ -1419,8 +1481,26 @@ class TestDflashDraftKvBudget(CustomTestCase):
 
                 self.assertEqual(
                     cfg._cell_size,
-                    target_kv_per_token + draft_kv_per_token * dcp_size,
+                    target_kv_per_token + draft_kv_per_token * loc_space_scale,
                 )
+
+    def test_draft_loc_space_scale(self):
+        """An MLA draft that executes DCP keeps per-rank rows."""
+        from sglang.srt.mem_cache.kv_cache_configurator import draft_loc_space_scale
+
+        hf_config = SimpleNamespace(architectures=["DFlashDraftModel"])
+        self.assertEqual(
+            draft_loc_space_scale(
+                hf_config=hf_config, use_mla_backend=True, dcp_size=8
+            ),
+            1,
+        )
+        self.assertEqual(
+            draft_loc_space_scale(
+                hf_config=hf_config, use_mla_backend=False, dcp_size=8
+            ),
+            8,
+        )
 
     def test_hybrid_swa_budget_shrinks_by_draft_pool(self):
         """The HybridSWA budget must charge the DFLASH draft pool."""
@@ -1909,7 +1989,10 @@ class TestFusedDraftPricing(unittest.TestCase):
         charged twice (once inside the entry, once as a private pool)."""
         mr, cfg = self._make(fused_entry=None, draft_layers=2)
         mr.spec_aux_config.eagle_draft_swa_num_layers = 2
-        mr.fused_entry_bytes.side_effect = lambda name: 4_321 if name == "swa" else None
+        mr.target_window_sub_pool.return_value = "window_4096"
+        mr.fused_entry_bytes.side_effect = lambda name: (
+            4_321 if name == "window_4096" else None
+        )
         with mock_cpu_env():
             from sglang.srt.model_executor.pool_configurator import (
                 HybridSWAPoolConfigurator,

@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.kernels.ops.speculative.spec_tree import TreeMaskMode
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention import trtllm_mha_backend
 from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
@@ -13,7 +14,7 @@ from sglang.srt.layers.attention.verify_mask import (
     tree_mask_numel,
 )
 from sglang.srt.runtime_context import get_context
-from sglang.srt.speculative.eagle_utils import TreeMaskMode, default_tree_mask_mode
+from sglang.srt.speculative.eagle_utils import default_tree_mask_mode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 

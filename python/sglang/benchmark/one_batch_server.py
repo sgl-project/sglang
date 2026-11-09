@@ -39,7 +39,7 @@ from sglang.benchmark.stream_metrics import (
 )
 from sglang.benchmark.utils import get_processor, get_tokenizer
 from sglang.profiler import run_profile
-from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST
 from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.server_args import ServerArgs

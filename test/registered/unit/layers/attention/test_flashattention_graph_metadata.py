@@ -367,6 +367,7 @@ class TestUnifiedVerifyGraphMetadata(CustomTestCase):
         swa = torch.arange(24, device=device, dtype=torch.int32)
         swa[7] = -1
         runner_ids = RunnerIds.__new__(RunnerIds)
+        runner_ids._role_sub_pools = {}
         runner_ids._spaces = {
             IdSpaceKind.FULL: IdSpace(key="full", read_v2p=full),
         }
