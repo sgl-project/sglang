@@ -20,9 +20,9 @@ from transformers import Gemma2Config
 
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput, Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.gemma2 import Gemma2ForCausalLM, Gemma2Model
-from sglang.srt.utils import add_prefix
 
 
 class Gemma2ForSequenceClassification(nn.Module):
@@ -53,9 +53,9 @@ class Gemma2ForSequenceClassification(nn.Module):
         input_embeds: torch.Tensor = None,
         get_embedding: bool = True,
     ) -> EmbeddingPoolerOutput:
-        assert (
-            get_embedding
-        ), "Gemma2ForSequenceClassification is only used for embedding"
+        assert get_embedding, (
+            "Gemma2ForSequenceClassification is only used for embedding"
+        )
 
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
         last_token_hidden = self.pooler(hidden_states, forward_batch).embeddings

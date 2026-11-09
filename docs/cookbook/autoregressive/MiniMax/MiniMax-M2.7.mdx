@@ -497,7 +497,7 @@ This section uses **industry-standard configurations** for comparable benchmark 
 - Prompt: `eval/aai/mcq-4choices` (4-choice multiple choice, matching [Artificial Analysis methodology](https://artificialanalysis.ai/methodology/intelligence-benchmarking)) -- sgl-eval's default for this benchmark
 - Evaluation command:
 ```bash Command
-pip install git+https://github.com/sgl-project/sgl-eval.git
+pip install sgl-eval
 
 sgl-eval run gpqa \
     --base-url http://localhost:30000/v1 \
@@ -629,7 +629,7 @@ Accuracy: 92.34%
 
 - Benchmark Command:
 ```shell Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --model MiniMaxAI/MiniMax-M2.7 \
   --dataset-name random \
@@ -671,7 +671,7 @@ Median ITL (ms):                         8.02
 
 - Benchmark Command:
 ```shell Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --model MiniMaxAI/MiniMax-M2.7 \
   --dataset-name random \

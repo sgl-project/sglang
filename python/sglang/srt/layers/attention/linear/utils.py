@@ -5,11 +5,16 @@ from typing import TYPE_CHECKING, Optional
 
 import msgspec
 
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_exec
-from sglang.srt.utils.common import rank0_log
+from sglang.srt.utils.log_utils import rank0_log
 
 if TYPE_CHECKING:
     pass
+
+
+def pp_spec_stable_rows_enabled() -> bool:
+    return envs.SGLANG_ENABLE_PP_SPEC.get()
 
 
 class LinearAttnKernelBackend(Enum):
@@ -63,7 +68,7 @@ class LinearAttnBackends(msgspec.Struct, frozen=True):
     """One runner's linear-attn kernel choice, per phase.
 
     Per runner, not per process: a target and its draft coexist and can want
-    different kernels (only the runner whose model is GDN gets the SM100
+    different kernels (only eligible GDN/KDA runners get the
     FlashInfer prefill default, and an explicit flag applies to whichever runner
     was launched with it).
     """
@@ -78,8 +83,8 @@ def resolve_linear_attn_backends(
 ) -> LinearAttnBackends:
     """This runner's kernel choice from the published leaves.
 
-    ``prefill_default`` is the caller's own auto-default (the SM100 GDN
-    domain); an explicitly configured ``--linear-attn-prefill-backend`` wins.
+    ``prefill_default`` is the caller's own auto-default;
+    an explicitly configured ``--linear-attn-prefill-backend`` wins.
     """
     mamba = get_exec().mamba
     base = mamba.linear_attn_backend
@@ -103,25 +108,47 @@ def resolve_linear_attn_backends(
     return backends
 
 
+def select_verify_intermediate_state_indices(
+    default_indices, req_pool_indices, valid, pool_size: int
+):
+    if not pp_spec_stable_rows_enabled():
+        return default_indices
+
+    import torch
+
+    req_rows = req_pool_indices[: valid.shape[0]]
+    return torch.where(valid, req_rows, torch.full_like(req_rows, pool_size)).to(
+        torch.int32
+    )
+
+
 def build_verify_intermediate_state_indices(pool_size: int, device):
     """Per-request row index into the speculative intermediate scratch
     (`intermediate_ssm` / `intermediate_conv_window`) for the MTP /
     target_verify path: request slot i owns scratch row i.
 
     The scratch is allocated with one extra padding row (the `+1` in
-    MambaPool.SpeculativeState, index `pool_size`). Warmup and MLP-sync
-    batches can be padded past the pool capacity — under DP attention
-    `get_eager_max_batch_size` ceil-aligns the eager warmup bs to attn_tp —
-    and the verify kernels index this table positionally up to that padded
-    bs. Size the table to the padded maximum and clamp every out-of-pool row
-    onto the padding row: pad rows race onto one discard row, which is
-    value-irrelevant (same convention as the ragged-verify ghost row).
+    MambaPool.SpeculativeState, index `pool_size`). Eager warmup, MLP-sync,
+    and CUDA graph batches can be padded past the pool capacity. Graph CP
+    alignment applies even when the model skips MLP-sync, so the graph
+    maximum can exceed the eager maximum. Verify kernels index this table
+    positionally up to the padded batch size. Cover both maxima and clamp
+    every out-of-pool row onto the padding row: pad rows race onto one
+    discard row, which is value-irrelevant (same convention as the
+    ragged-verify ghost row).
     """
     import torch
 
-    from sglang.srt.utils.common import get_eager_max_batch_size
+    from sglang.srt.layers.dp_attention import (
+        get_cuda_graph_max_batch_size,
+        get_eager_max_batch_size,
+    )
 
-    padded_bs = max(get_eager_max_batch_size(pool_size), pool_size)
+    padded_bs = max(
+        pool_size,
+        get_eager_max_batch_size(pool_size),
+        get_cuda_graph_max_batch_size(pool_size),
+    )
     indices = torch.arange(pool_size, dtype=torch.int32, device=device)
     if padded_bs > pool_size:
         indices = torch.cat(

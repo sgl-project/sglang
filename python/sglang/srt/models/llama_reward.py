@@ -25,9 +25,9 @@ from sglang.srt.layers.pooler import (
     pool_hidden_states,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.llama import LlamaForCausalLM, LlamaModel
-from sglang.srt.utils import add_prefix
 
 
 class LlamaForSequenceClassification(nn.Module):
@@ -58,9 +58,9 @@ class LlamaForSequenceClassification(nn.Module):
         input_embeds: torch.Tensor = None,
         get_embedding: bool = True,
     ) -> EmbeddingPoolerOutput:
-        assert (
-            get_embedding
-        ), "LlamaForSequenceClassification is only used for embedding"
+        assert get_embedding, (
+            "LlamaForSequenceClassification is only used for embedding"
+        )
 
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
         last_token_hidden = self.pooler(hidden_states, forward_batch).embeddings
@@ -110,9 +110,9 @@ class LlamaForSequenceClassificationWithNormal_Weights(LlamaForSequenceClassific
         input_embeds: torch.Tensor = None,
         get_embedding: bool = True,
     ) -> EmbeddingPoolerOutput:
-        assert (
-            get_embedding
-        ), "LlamaForSequenceClassification is only used for embedding"
+        assert get_embedding, (
+            "LlamaForSequenceClassification is only used for embedding"
+        )
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
         logits = self.score(hidden_states)
         weights = self.weights(hidden_states)

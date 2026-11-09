@@ -74,9 +74,7 @@ class BaseKVCacheMethod(QuantizeMethodBase):
                 v_scale *= 2
 
         if not isinstance(k_scale, float) or not isinstance(v_scale, float):
-            raise ValueError(
-                "Only support per-tensor scaling factor " "for fp8 KV cache"
-            )
+            raise ValueError("Only support per-tensor scaling factor for fp8 KV cache")
 
         # These are used in the final Attention.forward()
         layer.k_scale.copy_(k_scale)

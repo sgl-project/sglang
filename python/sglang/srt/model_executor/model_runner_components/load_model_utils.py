@@ -5,7 +5,7 @@ import logging
 import os
 import socket
 import threading
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any
 
 import msgspec
 import torch
@@ -16,13 +16,18 @@ from sglang.srt.arg_groups.overrides import (
     modelexpress_url_of,
 )
 from sglang.srt.configs.device_config import DeviceConfig
-from sglang.srt.configs.load_config import LoadConfig, LoadFormat
+from sglang.srt.configs.load_config import (
+    _DEFAULT_LOAD_GROUP,
+    LoadConfig,
+    LoadFormat,
+    LoadGroup,
+)
 from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
 from sglang.srt.debug_utils.tensor_dump_forward_hook import (
     register_forward_hook_for_model,
 )
-from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
+from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.model_loader.loader import get_model_loader
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
@@ -34,8 +39,10 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_model,
     get_observability,
+    get_parallel,
+    get_spec,
 )
-from sglang.srt.utils.common import is_npu
+from sglang.srt.utils.device import is_npu
 from sglang.srt.utils.network import NetworkAddress
 
 if TYPE_CHECKING:
@@ -49,6 +56,49 @@ _is_npu = is_npu()
 
 
 UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data processing
+
+
+def reserve_rope_cache_for_long_sequences(model, model_config, logger=None):
+    """Pre-expand RoPE cache for long sequences and speculative decoding.
+
+    Runs inside `ModelRunner`, past publish, so the three config inputs come
+    from the bags: the context length and the two speculative counts are
+    resolution's answers.
+    """
+    from sglang.srt.environ import envs
+
+    SAFETY_FACTOR = envs.SGLANG_SPEC_EXPANSION_SAFETY_FACTOR.get()
+    MARGIN = envs.SGLANG_ROPE_CACHE_SAFETY_MARGIN.get()
+    ALIGN = envs.SGLANG_ROPE_CACHE_ALIGN.get()
+
+    # 1) Estimate base context upper bound
+    base_ctx = (
+        get_model().context_length
+        or getattr(model_config, "context_len", None)
+        or getattr(model_config, "max_model_len", None)
+        or getattr(model_config.hf_text_config, "max_position_embeddings", None)
+        or 2048
+    )
+
+    # 2) Speculative decoding expansion
+    steps = int(get_spec().speculative_num_steps or 0)
+    draft = int(get_spec().speculative_num_draft_tokens or 0)
+    reserve = base_ctx + steps * draft * SAFETY_FACTOR + MARGIN
+
+    # 3) Align to reduce reallocation frequency
+    reserve = (reserve + ALIGN - 1) // ALIGN * ALIGN
+
+    # Recursively expand all RoPE layers
+    def reserve_rope_cache_recursive(module):
+        for child in module.children():
+            if hasattr(child, "_ensure_cos_sin_cache_length") and hasattr(
+                child, "cos_sin_cache"
+            ):
+                child._ensure_cos_sin_cache_length(reserve - 1)
+            else:
+                reserve_rope_cache_recursive(child)
+
+    reserve_rope_cache_recursive(model)
 
 
 def maybe_precompile_model_kernels_after_loading(model, device: str) -> None:
@@ -68,8 +118,8 @@ def maybe_precompile_model_kernels_after_loading(model, device: str) -> None:
 class LoadedModel(msgspec.Struct, frozen=True, kw_only=True):
     loader: Any
     model: Any
-    remote_instance_weight_info: Optional[Any]
-    startup_weight_load: Optional[Any] = None
+    remote_instance_weight_info: Any | None
+    startup_weight_load: Any | None = None
 
 
 def maybe_downgrade_dtype_for_legacy_gpu(*, model_config: ModelConfig) -> None:
@@ -87,14 +137,16 @@ def maybe_downgrade_dtype_for_legacy_gpu(*, model_config: ModelConfig) -> None:
 
 
 def maybe_trigger_remote_instance_nccl_send_group(
-    *, tp_rank: int, load_format: Optional[str] = None
+    *, tp_rank: int, load_format: str | None = None
 ) -> None:
     """``load_format`` is this runner's effective format: a draft loading under
     ``--speculative-draft-draft-load-format`` needs its own send group, and the
     target's format cannot answer for it."""
     if (
-        load_format or get_model().load_format
-    ) == LoadFormat.REMOTE_INSTANCE and get_model().remote_instance_weight_loader_backend == RemoteInstanceWeightLoaderBackend.NCCL:
+        (load_format or get_model().load_format) == LoadFormat.REMOTE_INSTANCE
+        and get_model().remote_instance_weight_loader_backend
+        == RemoteInstanceWeightLoaderBackend.NCCL
+    ):
         if tp_rank == 0:
             instance_ip = NetworkAddress.resolve_host(socket.gethostname())
             t = threading.Thread(
@@ -109,14 +161,39 @@ def maybe_trigger_remote_instance_nccl_send_group(
             t.start()
 
 
-def load_kv_cache_scales(*, model, kv_cache_dtype: str) -> None:
+def _kv_cache_scales_to_tensors(model, device: str) -> None:
+    """The models' ``load_kv_cache_scales`` assign float scales, while attention
+    backends read a device tensor plus its host copy, the way
+    ``BaseKVCacheMethod`` stores checkpoint scales."""
+    for module in model.modules():
+        if not isinstance(module, RadixAttention):
+            continue
+        for name in ("k_scale", "v_scale"):
+            scale = getattr(module, name)
+            if isinstance(scale, float):
+                setattr(module, f"{name}_float", scale)
+                setattr(
+                    module,
+                    name,
+                    torch.tensor(scale, dtype=torch.float32, device=device),
+                )
+
+
+def load_kv_cache_scales(*, model, kv_cache_dtype: str, device: str) -> None:
     """``kv_cache_dtype`` is the caller's resolved value. Required rather than
     defaulted: a fallback to ``server_args`` would be a hidden global read for
     any future caller that forgets to pass one."""
+    quant_config = getattr(model, "quant_config", None)
+    if _is_npu and quant_config is not None and quant_config.get_name() == "modelslim":
+        # This helper loads a separate --quantization-param-path calibration file.
+        # ModelSlim loads KV scales from the checkpoint with model weights.
+        return
+
     if kv_cache_dtype == "fp8_e4m3":
         if get_model().quantization_param_path is not None:
             if callable(getattr(model, "load_kv_cache_scales", None)):
                 model.load_kv_cache_scales(get_model().quantization_param_path)
+                _kv_cache_scales_to_tensors(model, device)
                 logger.info(
                     "Loaded KV cache scaling factors from %s",
                     get_model().quantization_param_path,
@@ -130,12 +207,11 @@ def load_kv_cache_scales(*, model, kv_cache_dtype: str) -> None:
         else:
             logger.warning(
                 "Using FP8 KV cache but no scaling factors "
-                "provided. Defaulting to scaling factors of 1.0. "
-                "This may lead to less accurate results!"
+                "provided. Defaulting to scaling factors of 1.0."
             )
 
 
-def resolve_sliding_window_size(model, model_config: ModelConfig) -> Optional[int]:
+def resolve_sliding_window_size(model, model_config: ModelConfig) -> int | None:
     # Parse other args
     sliding_window_size = None
     if hasattr(model, "get_attention_sliding_window_size"):
@@ -195,12 +271,13 @@ def build_load_config(
     *,
     server_args: ServerArgs,
     tp_rank: int,
-    load_format: Optional[str] = None,
+    load_format: str | None = None,
     remote_instance_weight_transporter_engine: Any,
     remote_instance_weight_transporter_session_id: str,
-    draft_model_idx: Optional[int],
+    draft_model_idx: int | None,
     weight_cache_mode: str,
-    weight_cache_socket: Optional[str],
+    weight_cache_socket: str | None,
+    load_group: LoadGroup = _DEFAULT_LOAD_GROUP,
 ) -> LoadConfig:
     from sglang.srt.configs.modelopt_config import ModelOptConfig
 
@@ -230,6 +307,7 @@ def build_load_config(
         draft_model_idx=draft_model_idx,
         weight_cache_mode=weight_cache_mode,
         weight_cache_socket=weight_cache_socket,
+        load_group=load_group,
     )
 
 
@@ -254,7 +332,6 @@ def maybe_enable_ipc_weight_cache(
 
 def load_model_with_memory_saver(
     *,
-    server_args: ServerArgs,
     model_config: ModelConfig,
     load_config: LoadConfig,
     device: str,
@@ -264,6 +341,38 @@ def load_model_with_memory_saver(
 ) -> LoadedModel:
     # Remove monkey_patch when linear.py quant remove dependencies with vllm
     monkey_patch_vllm_parallel_state()
+
+    if not is_draft_worker:
+        architectures = model_config.hf_config.architectures or []
+        is_qwen4_exp = "Qwen4ExpForConditionalGeneration" in architectures
+        ple_offload_embedding = get_exec().offload.ple_offload_embedding
+        if ple_offload_embedding and not is_qwen4_exp:
+            raise ValueError(
+                "--ple-offload-embedding only supports Qwen4ExpForConditionalGeneration"
+            )
+        if is_qwen4_exp:
+            model_config.hf_text_config.ple_offload_embedding = ple_offload_embedding
+            model_config.hf_text_config.ple_offload_backend = (
+                get_exec().offload.ple_offload_backend
+            )
+            if get_exec().offload.ple_offload_backend != "file":
+                model_config.hf_text_config.ple_offload_dir = (
+                    get_exec().offload.ple_offload_dir
+                )
+            else:
+                from sglang.srt.models.qwen4_exp_ple_table import (
+                    check_file_backend_supported,
+                    default_ple_table_dir,
+                )
+
+                model_config.hf_text_config.ple_offload_dir = (
+                    get_exec().offload.ple_offload_dir
+                    or default_ple_table_dir(get_model().model_path)
+                )
+                if ple_offload_embedding and device == "cuda":
+                    check_file_backend_supported(
+                        torch.cuda.current_device() if torch.cuda.is_available() else 0
+                    )
 
     enable_cpu_backup = get_exec().features.enable_weights_cpu_backup or (
         is_draft_worker and get_exec().features.enable_draft_weights_cpu_backup
@@ -290,7 +399,7 @@ def load_model_with_memory_saver(
             model_config=model_config,
         )
         device_config = DeviceConfig(device, gpu_id)
-        if server_args.is_startup_weight_load_overlap:
+        if get_model().is_startup_weight_load_overlap:
             from sglang.srt.model_executor.model_runner_components.startup_weight_load import (
                 StartupWeightLoadManager,
             )
@@ -312,6 +421,12 @@ def load_model_with_memory_saver(
             remote_instance_weight_info = (
                 loader.remote_instance_transfer_engine_weight_info
             )
+    if (
+        not is_draft_worker
+        and get_exec().offload.ple_offload_embedding
+        and device == "cuda"
+    ):
+        current_platform.empty_cache()
     # Cache needs to be cleared after loading model weights (in the loader.load_model function).
     # To avoid conflict with memory_saver_adapter.region, empty_cache operation is now moved here.
     if _is_npu:
@@ -328,19 +443,19 @@ def load_model_with_memory_saver(
 
 def dist_barrier_after_load(
     *,
-    elastic_ep_backend: Optional[str],
+    elastic_ep_backend: str | None,
     tp_rank: int,
     is_ep_joiner: bool = False,
 ) -> None:
     if elastic_ep_backend == "mooncake":
         # Mooncake does not support `monitored_barrier`
         if not is_ep_joiner:
-            dist.barrier(group=get_tp_group().cpu_group)
+            dist.barrier(group=get_parallel().tp_group.cpu_group)
     else:
         # Handle the case where some ranks do not finish loading.
         try:
             dist.monitored_barrier(
-                group=get_tp_group().cpu_group,
+                group=get_parallel().tp_group.cpu_group,
                 timeout=datetime.timedelta(seconds=UNBALANCED_MODEL_LOADING_TIMEOUT_S),
                 wait_all_ranks=True,
             )

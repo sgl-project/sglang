@@ -1,12 +1,12 @@
 from typing import TYPE_CHECKING, Optional
 
 import torch
-from sgl_kernel_npu.norm.l1_norm import l1_norm
 
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location_dispatch import topk_ids_logical_to_physical
 from sglang.srt.layers.moe.topk import (
     StandardTopKOutput,
+    _zero_topk_weights_padded_region,
     capture_routed_experts_if_allowed,
     select_experts,
 )
@@ -14,20 +14,6 @@ from sglang.srt.layers.moe.topk import (
 if TYPE_CHECKING:
     from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
     from sglang.srt.layers.moe.topk import TopKConfig, TopKOutput
-
-
-def _apply_routed_scaling_after_renorm(
-    topk_weights: torch.Tensor,
-    topk_config: "TopKConfig",
-) -> torch.Tensor:
-    """Mirror GPU post-renorm scaling when apply_routed_scaling_factor_on_output is set."""
-    if (
-        topk_config.renormalize
-        and topk_config.apply_routed_scaling_factor_on_output
-        and topk_config.routed_scaling_factor is not None
-    ):
-        return topk_weights * topk_config.routed_scaling_factor
-    return topk_weights
 
 
 def fused_topk_npu(
@@ -38,7 +24,6 @@ def fused_topk_npu(
     expert_location_dispatch_info: Optional["ExpertLocationDispatchInfo"] = None,
     layer_id: Optional[int] = None,
 ) -> "TopKOutput":
-
     use_grouped_topk = topk_config.use_grouped_topk
     renormalize = topk_config.renormalize
     correction_bias = topk_config.correction_bias
@@ -74,9 +59,11 @@ def fused_topk_npu(
         )
 
         if renormalize:
+            from sgl_kernel_npu.norm.l1_norm import l1_norm
+
             topk_weights = l1_norm(
                 topk_weights
-                if topk_config.num_fused_shared_experts == 0
+                if topk_config.num_shared_topk_slots == 0
                 else topk_weights[:, :-1]
             )
         topk_weights = topk_weights.to(torch.float32)
@@ -124,9 +111,44 @@ def fused_topk_npu(
             expert_location_dispatch_info=expert_location_dispatch_info,
         )
 
-    if expert_location_dispatch_info is not None:
-        topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
-    get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
-    capture_routed_experts_if_allowed(topk_config, layer_id, topk_ids)
+    return _finalize_topk_npu(
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+        router_logits=router_logits,
+        topk_config=topk_config,
+        num_token_non_padded=num_token_non_padded,
+        expert_location_dispatch_info=expert_location_dispatch_info,
+        layer_id=layer_id,
+    )
 
+
+def _finalize_topk_npu(
+    *,
+    topk_ids,
+    topk_weights,
+    router_logits,
+    topk_config,
+    num_token_non_padded,
+    expert_location_dispatch_info,
+    layer_id,
+):
+    num_shared = topk_config.num_shared_topk_slots
+    routed_ids = topk_ids[:, :-num_shared] if num_shared else topk_ids
+    capture_routed_experts_if_allowed(topk_config, layer_id, routed_ids)
+    routed_ids = topk_ids_logical_to_physical(routed_ids, expert_location_dispatch_info)
+    topk_ids = (
+        torch.cat([routed_ids, topk_ids[:, -num_shared:]], dim=-1)
+        if num_shared
+        else routed_ids
+    )
+    # NPU dispatch retains valid IDs; duplicating a padded row's routes onto
+    # expert zero can exceed per-expert capacity in fused dispatch backends.
+    _zero_topk_weights_padded_region(topk_weights, num_token_non_padded)
+    recorder_ids = routed_ids
+    if num_token_non_padded is not None:
+        rows = torch.arange(topk_ids.shape[0], device=topk_ids.device)
+        recorder_ids = routed_ids.masked_fill(
+            (rows >= num_token_non_padded)[:, None], -1
+        )
+    get_global_expert_distribution_recorder().on_select_experts(topk_ids=recorder_ids)
     return StandardTopKOutput(topk_weights, topk_ids, router_logits)

@@ -255,12 +255,12 @@ class TestClusterWideDiscovery:
             # A regression that quietly hardcoded a namespace filter would
             # still produce total=2 if labels happened to match elsewhere,
             # but only one of these IPs would surface.
-            assert any(
-                ip_a in u for u in urls
-            ), f"worker_a IP {ip_a} (ns {NAMESPACE}) not in {urls}"
-            assert any(
-                ip_b in u for u in urls
-            ), f"worker_b IP {ip_b} (ns {EXTRA_NAMESPACE}) not in {urls}"
+            assert any(ip_a in u for u in urls), (
+                f"worker_a IP {ip_a} (ns {NAMESPACE}) not in {urls}"
+            )
+            assert any(ip_b in u for u in urls), (
+                f"worker_b IP {ip_b} (ns {EXTRA_NAMESPACE}) not in {urls}"
+            )
         finally:
             _safe_delete_pod(worker_a, NAMESPACE)
             _safe_delete_pod(worker_b, EXTRA_NAMESPACE)

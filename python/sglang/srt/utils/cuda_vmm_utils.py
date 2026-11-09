@@ -358,6 +358,7 @@ static size_t g_cursors[BUMPARENA_MAX_EXTENTS];
 static size_t g_num_extents = 0;
 static size_t g_freed_bytes = 0;
 static size_t g_align = 512;
+static int g_best_fit = 0;
 static std::mutex g_mu;
 static size_t align_up(size_t v, size_t a){{ return (v + a - 1) / a * a; }}
 void bumparena_set_extents_{sfx}(const uintptr_t* bases, const size_t* sizes, size_t n){{
@@ -372,6 +373,7 @@ void bumparena_set_extents_{sfx}(const uintptr_t* bases, const size_t* sizes, si
   }}
 }}
 void bumparena_set_align_{sfx}(size_t a){{ std::lock_guard<std::mutex> lk(g_mu); if (a) g_align=a; }}
+void bumparena_set_best_fit_{sfx}(int on){{ std::lock_guard<std::mutex> lk(g_mu); g_best_fit = on; }}
 size_t bumparena_cursor_{sfx}(void){{
   std::lock_guard<std::mutex> lk(g_mu);
   size_t total = 0;
@@ -380,14 +382,21 @@ size_t bumparena_cursor_{sfx}(void){{
 }}
 void* bumparena_malloc_{sfx}(size_t size, int device, void* stream){{
   std::lock_guard<std::mutex> lk(g_mu);
+  size_t need = align_up(size, g_align);
+  size_t pick = BUMPARENA_MAX_EXTENTS;
   for (size_t i = 0; i < g_num_extents; ++i) {{
-    size_t need = g_cursors[i] + align_up(size, g_align);
-    if (need > g_reserved[i]) continue;
-    void* p = reinterpret_cast<void*>(g_bases[i] + g_cursors[i]);
-    g_cursors[i] = need;
-    return p;
+    size_t avail = g_reserved[i] - g_cursors[i];
+    if (avail < need) continue;
+    // First fit is for callers that map physical pages at the offsets they
+    // are handed, so extent order is theirs to choose.
+    if (!g_best_fit) {{ pick = i; break; }}
+    if (pick == BUMPARENA_MAX_EXTENTS ||
+        avail < g_reserved[pick] - g_cursors[pick]) pick = i;
   }}
-  return 0;   // no extent fits -- surfaces as an allocator OOM
+  if (pick == BUMPARENA_MAX_EXTENTS) return 0;   // no extent fits -- surfaces as an allocator OOM
+  void* p = reinterpret_cast<void*>(g_bases[pick] + g_cursors[pick]);
+  g_cursors[pick] += need;
+  return p;
 }}
 size_t bumparena_freed_{sfx}(void){{ std::lock_guard<std::mutex> lk(g_mu); return g_freed_bytes; }}
 void bumparena_free_{sfx}(void* ptr, size_t size, int device, void* stream){{
@@ -401,8 +410,8 @@ void bumparena_free_{sfx}(void* ptr, size_t size, int device, void* stream){{
 class BumpArenaStub:
     """JIT-built pluggable bump allocator over caller-provided device VA extents.
 
-    ``malloc`` first-fits an extent and hands out ``base + cursor``; ``free``
-    is a no-op. Plain ``torch.empty`` can thus be placed on externally managed
+    ``malloc`` picks an extent and hands out ``base + cursor``; ``free`` is a
+    no-op. Plain ``torch.empty`` can thus be placed on externally managed
     storage by wrapping ``allocator`` in a ``torch.cuda.MemPool``.
     ``set_extents`` re-points the arena and resets every cursor, letting one
     stub serve successive region sets.
@@ -462,6 +471,9 @@ class BumpArenaStub:
         self._fn_set_align = lib[f"bumparena_set_align_{self.sfx}"]
         self._fn_set_align.argtypes = [ctypes.c_size_t]
         self._fn_set_align.restype = None
+        self._fn_set_best_fit = lib[f"bumparena_set_best_fit_{self.sfx}"]
+        self._fn_set_best_fit.argtypes = [ctypes.c_int]
+        self._fn_set_best_fit.restype = None
         self._fn_cursor = lib[f"bumparena_cursor_{self.sfx}"]
         self._fn_cursor.argtypes = []
         self._fn_cursor.restype = ctypes.c_size_t
@@ -485,6 +497,9 @@ class BumpArenaStub:
 
     def set_align(self, nbytes: int) -> None:
         self._fn_set_align(ctypes.c_size_t(nbytes))
+
+    def set_best_fit(self, on: bool) -> None:
+        self._fn_set_best_fit(ctypes.c_int(1 if on else 0))
 
     @property
     def cursor_bytes(self) -> int:
@@ -652,7 +667,7 @@ class VmmReservation:
 
 def all_ranks_ok(group: ProcessGroup, ok: bool) -> bool:
     """True iff ``ok`` holds on every rank in ``group`` (BAND all-reduce)."""
-    flag = torch.tensor([1 if ok else 0], dtype=torch.int32)
+    flag = torch.tensor([1 if ok else 0], dtype=torch.int32, device="cpu")
     dist.all_reduce(flag, op=dist.ReduceOp.BAND, group=group)
     return flag.item() == 1
 
@@ -865,6 +880,50 @@ def exchange_posix_fds(
             pass
 
 
+def exchange_shareable_handles(
+    retained_handles, group: ProcessGroup, rank: int, world_size: int
+):
+    """Export this rank's retained VMM handles and collect every peer's.
+
+    FABRIC handles when every rank can export them; otherwise POSIX fds over UNIX
+    sockets, which only reach ranks on this host, so a group spanning hosts raises.
+    Returns ``(use_fabric, peer_handles)``: ``peer_handles[(peer_rank, idx)]`` is a
+    FABRIC handle or a received fd the caller must close. This rank's exported fds
+    are closed here.
+    """
+    fabric_handles, local_fds, use_fabric = export_shareable_handles(
+        retained_handles, group, rank
+    )
+    if use_fabric:
+        all_fabric = [None] * world_size
+        dist.all_gather_object(all_fabric, fabric_handles, group=group)
+        return True, {
+            (r, i): handle
+            for r, handles in enumerate(all_fabric)
+            if r != rank
+            for i, handle in enumerate(handles)
+        }
+    try:
+        info = [None] * world_size
+        dist.all_gather_object(
+            info, (socket.gethostname(), len(local_fds)), group=group
+        )
+        if len({host for host, _ in info}) > 1:
+            raise RuntimeError(
+                "VMM handles cannot reach ranks on other hosts without FABRIC "
+                "handles (one NVLink domain with IMEX)"
+            )
+        return False, exchange_posix_fds(
+            group, rank, world_size, local_fds, [n for _, n in info]
+        )
+    finally:
+        for fd in local_fds:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
 def import_peer_handle(fabric_handle, fd, *, use_fabric: bool, peer_rank: int):
     """Import a peer allocation handle (FABRIC or POSIX fd). Returns the handle.
 
@@ -974,7 +1033,6 @@ class VmmGraphInputManager:
         """
         FABRIC_HANDLE_BYTES = 64
         MAX_VMM_BASES = 4096
-        MAX_CHUNKS_PER_INPUT = 16
 
         t0 = time.perf_counter()
 
@@ -1010,12 +1068,15 @@ class VmmGraphInputManager:
             local_input_chunks = [
                 [int(idx) for idx in indices] for indices in input_chunk_indices
             ]
-            for chunks in local_input_chunks:
-                if len(chunks) > MAX_CHUNKS_PER_INPUT:
-                    raise RuntimeError(
-                        "Too many VMM chunks for graph input: "
-                        f"{len(chunks)} > {MAX_CHUNKS_PER_INPUT}"
-                    )
+            # Every rank must pack the same input struct, so the per-input span
+            # width is the widest input on any rank (floored at 16 slots).
+            widest_input = torch.tensor(
+                [max((len(c) for c in local_input_chunks), default=0)],
+                dtype=torch.int64,
+                device="cpu",
+            )
+            dist.all_reduce(widest_input, op=dist.ReduceOp.MAX, group=self.group)
+            max_chunks_per_input = max(16, int(widest_input.item()))
 
             # All-gather base metadata and per-input VMM spans. A captured tensor
             # can cross expandable-segment allocation boundaries, so peer mappings
@@ -1026,7 +1087,7 @@ class VmmGraphInputManager:
             base_struct = struct.Struct(
                 f"<QQ{FABRIC_HANDLE_BYTES}s" if use_fabric else "<QQ"
             )
-            input_struct = struct.Struct(f"<QQ{MAX_CHUNKS_PER_INPUT}Q")
+            input_struct = struct.Struct(f"<QQ{max_chunks_per_input}Q")
             base_offset = header_struct.size
             input_offset = base_offset + MAX_VMM_BASES * base_struct.size
             payload_size = input_offset + new_count * input_struct.size
@@ -1052,7 +1113,7 @@ class VmmGraphInputManager:
             for i, (chunks, offset) in enumerate(
                 zip(local_input_chunks, input_offsets)
             ):
-                padded_chunks = chunks + [0] * (MAX_CHUNKS_PER_INPUT - len(chunks))
+                padded_chunks = chunks + [0] * (max_chunks_per_input - len(chunks))
                 input_struct.pack_into(
                     local_payload,
                     input_offset + i * input_struct.size,

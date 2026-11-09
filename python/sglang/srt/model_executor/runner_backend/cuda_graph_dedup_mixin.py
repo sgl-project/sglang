@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 
 import torch
 
+from sglang.srt.runtime_context import get_exec
+
 try:
     from cuda.bindings import driver as cuda_drv
     from cuda.bindings import runtime as cuda_rt
@@ -39,20 +41,6 @@ def dedup_update(graph_exec: int, raw_graph: int) -> tuple[bool, str]:
 
 def maybe_cuda_result(result):
     return None if int(result[0]) != 0 else checkCudaErrors(result)
-
-
-def kernel_name(params) -> str:
-    assert cuda_drv is not None
-    for handle, getter in (
-        (getattr(params, "kern", None), cuda_drv.cuKernelGetName),
-        (getattr(params, "func", None), cuda_drv.cuFuncGetName),
-    ):
-        if handle is None or int(handle) == 0:
-            continue
-        name = maybe_cuda_result(getter(handle))
-        if name is not None:
-            return name.decode("utf-8", "replace")
-    return f"func:{int(getattr(params, 'func', 0))}"
 
 
 def kernel_attrs(node) -> tuple[tuple[str, object], ...]:
@@ -105,12 +93,27 @@ def kernel_attrs(node) -> tuple[tuple[str, object], ...]:
 def kernel_node_payload(node):
     assert cuda_drv is not None
     params = checkCudaErrors(cuda_drv.cuGraphKernelNodeGetParams(node))
+    attrs = kernel_attrs(node)
+    attr_values = dict(attrs)
+    # Some drivers cannot read preferredClusterDim and silently retain its old
+    # value after cudaGraphExecUpdate. Even identical kernel handles and grids
+    # can have different preferred clusters (e.g. Blackwell cuBLAS TF32 GEMMs).
+    # Keep these captures separate rather than updating an executable with an
+    # unknown cluster layout. Ordinary, non-clustered kernels still deduplicate.
+    # Verified on B300: driver 590.48.01 needs this fallback; user-space driver
+    # 595.58.03 reads preferredClusterDim via the driver API and updates correctly,
+    # so matching captures still share executables without a version check.
+    opaque_cluster = (
+        any(attr_values.get("clusterDim", (0, 0, 0)))
+        and "preferredClusterDim" not in attr_values
+    )
+    # Grid dimensions vary across buckets and are validated by the exec update.
     return (
-        kernel_name(params),
-        (int(params.gridDimX), int(params.gridDimY), int(params.gridDimZ)),
+        (int(params.kern), int(params.func)),
         (int(params.blockDimX), int(params.blockDimY), int(params.blockDimZ)),
         int(params.sharedMemBytes),
-        kernel_attrs(node),
+        attrs,
+        int(node) if opaque_cluster else None,
     )
 
 
@@ -183,8 +186,8 @@ def graph_signature(raw_graph: int):
 class GraphExecGroup:
     graph_exec: int
     current_raw_graph: int
-    compat_exec: int | None
     graphs: list[DedupedCudaGraph] = field(default_factory=list)
+    uploaded: bool = False
 
 
 @dataclass(eq=False, slots=True)
@@ -204,6 +207,8 @@ class DedupedCudaGraphRegistry:
     def __init__(self):
         self.groups: dict[tuple, GraphExecGroup] = {}
         self.sealed = False
+        self.upload_stream: int | None = None
+        self.upload_event: int | None = None
 
     def instantiate(self, raw_graph: int) -> int:
         assert cuda_rt is not None
@@ -211,6 +216,23 @@ class DedupedCudaGraphRegistry:
             cuda_rt.cudaGraphInstantiateWithFlags(raw_graph, 0)
         )
         return graph_exec
+
+    def upload(self, group: GraphExecGroup, stream: int) -> None:
+        assert cuda_rt is not None
+        # A first launch would upload through `stream`, and that upload can
+        # block the host behind the stream's running work. A private idle
+        # stream uploads at once; `stream` waits on it.
+        if self.upload_stream is None:
+            self.upload_stream = checkCudaErrors(
+                cuda_rt.cudaStreamCreateWithFlags(cuda_rt.cudaStreamNonBlocking)
+            )
+            self.upload_event = checkCudaErrors(
+                cuda_rt.cudaEventCreateWithFlags(cuda_rt.cudaEventDisableTiming)
+            )
+        checkCudaErrors(cuda_rt.cudaGraphUpload(group.graph_exec, self.upload_stream))
+        checkCudaErrors(cuda_rt.cudaEventRecord(self.upload_event, self.upload_stream))
+        checkCudaErrors(cuda_rt.cudaStreamWaitEvent(stream, self.upload_event, 0))
+        group.uploaded = True
 
     def destroy_exec(self, graph_exec: int) -> None:
         assert cuda_rt is not None
@@ -224,9 +246,10 @@ class DedupedCudaGraphRegistry:
 
         group = self.groups.get(signature)
         if group is not None:
-            assert group.compat_exec is not None
-            ok, detail = dedup_update(group.compat_exec, graph.raw_graph)
+            # An incompatible cudaGraphExecUpdate does not modify the executable.
+            ok, detail = dedup_update(group.graph_exec, graph.raw_graph)
             assert ok, f"CUDA graph dedup register update failed ({detail})"
+            group.current_raw_graph = graph.raw_graph
             graph.group = group
             group.graphs.append(graph)
             return graph
@@ -234,7 +257,6 @@ class DedupedCudaGraphRegistry:
         group = GraphExecGroup(
             graph_exec=self.instantiate(graph.raw_graph),
             current_raw_graph=graph.raw_graph,
-            compat_exec=self.instantiate(graph.raw_graph),
             graphs=[graph],
         )
         graph.group = group
@@ -242,13 +264,7 @@ class DedupedCudaGraphRegistry:
         return graph
 
     def seal(self) -> None:
-        if self.sealed:
-            return
         self.sealed = True
-        for group in self.groups.values():
-            if group.compat_exec is not None:
-                self.destroy_exec(group.compat_exec)
-                group.compat_exec = None
 
     def stats(self) -> tuple[int, int]:
         return sum(len(group.graphs) for group in self.groups.values()), len(
@@ -258,9 +274,9 @@ class DedupedCudaGraphRegistry:
     def replay(self, graph: DedupedCudaGraph, stream: int) -> None:
         assert cuda_rt is not None
         group = graph.group
-        assert (
-            group is not None
-        ), "captured CUDA graph does not belong to this dedup state"
+        assert group is not None, (
+            "captured CUDA graph does not belong to this dedup state"
+        )
 
         raw_graph = graph.raw_graph
         graph_exec = group.graph_exec
@@ -272,15 +288,14 @@ class DedupedCudaGraphRegistry:
             )
             group.current_raw_graph = raw_graph
 
+        if not group.uploaded:
+            self.upload(group, stream)
         checkCudaErrors(cuda_rt.cudaGraphLaunch(graph_exec, stream))
 
     def close(self) -> None:
         self.sealed = True
 
         for group in self.groups.values():
-            if group.compat_exec is not None:
-                self.destroy_exec(group.compat_exec)
-                group.compat_exec = None
             self.destroy_exec(group.graph_exec)
             for graph in group.graphs:
                 if graph.original_graph is not None:
@@ -290,6 +305,10 @@ class DedupedCudaGraphRegistry:
             group.graphs.clear()
 
         self.groups.clear()
+        if self.upload_stream is not None:
+            checkCudaErrors(cuda_rt.cudaEventDestroy(self.upload_event))
+            checkCudaErrors(cuda_rt.cudaStreamDestroy(self.upload_stream))
+            self.upload_stream = self.upload_event = None
 
 
 class DedupedCudaGraphMixin:
@@ -313,7 +332,7 @@ class DedupedCudaGraphMixin:
         server_args = getattr(model_runner, "server_args", None)
         return bool(
             server_args is not None
-            and getattr(server_args, "enable_memory_saver", False)
+            and get_exec().features.enable_memory_saver
             and get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH")
         )
 

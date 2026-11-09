@@ -46,7 +46,7 @@ export const config = {
   // Reproduce commands for the Benchmark card's "Reproduce" modal.
   benchmarkCommands: {
     speed:
-`python3 -m sglang.bench_serving \\
+`python3 -m sglang.benchmark.serving \\
   --backend sglang \\
   --host {{CURL_HOST}} --port {{CURL_PORT}} \\
   --model {{MODEL_NAME}} \\
@@ -57,7 +57,7 @@ export const config = {
   --warmup-requests 64 --flush-cache`,
     accuracy: {
       gsm8k_pct:
-`# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
+`# To install sgl-eval: pip install sgl-eval
 sgl-eval run gsm8k \\
   --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1 \\
   --num-threads 32`,
@@ -134,7 +134,7 @@ sgl-eval run gsm8k \\
         "--max-running-requests 64",
         "--mem-fraction-static 0.92",
         "--chunked-prefill-size 2048",
-        "--nsa-prefill-backend fa3",
+        "--dsa-prefill-backend fa3",
         "--kv-cache-dtype bfloat16",
         "--model-loader-extra-config '{\"enable_multithread_load\":true,\"num_threads\":12}'",
         "--host {{HOST_IP}}",
@@ -154,7 +154,7 @@ sgl-eval run gsm8k \\
         "--max-running-requests 64",
         "--mem-fraction-static 0.92",
         "--chunked-prefill-size 2048",
-        "--nsa-prefill-backend fa3",
+        "--dsa-prefill-backend fa3",
         "--kv-cache-dtype bfloat16",
         "--model-loader-extra-config '{\"enable_multithread_load\":true,\"num_threads\":12}'",
         "--host {{HOST_IP}}",
@@ -173,7 +173,7 @@ sgl-eval run gsm8k \\
         "--max-running-requests 64",
         "--mem-fraction-static 0.92",
         "--chunked-prefill-size 2048",
-        "--nsa-prefill-backend fa3",
+        "--dsa-prefill-backend fa3",
         "--kv-cache-dtype bfloat16",
         "--model-loader-extra-config '{\"enable_multithread_load\":true,\"num_threads\":12}'",
         "--host {{HOST_IP}}",
@@ -192,7 +192,7 @@ sgl-eval run gsm8k \\
         "--max-running-requests 64",
         "--mem-fraction-static 0.92",
         "--chunked-prefill-size 2048",
-        "--nsa-prefill-backend fa3",
+        "--dsa-prefill-backend fa3",
         "--kv-cache-dtype bfloat16",
         "--model-loader-extra-config '{\"enable_multithread_load\":true,\"num_threads\":12}'",
         "--host {{HOST_IP}}",

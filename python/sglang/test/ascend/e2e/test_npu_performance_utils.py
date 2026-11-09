@@ -16,6 +16,7 @@ from urllib.parse import urlparse
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ascend.e2e.gen_dataset_fixed_len import (
     generate_gsm8k_dataset,
+    generate_gsm8k_shared_prefix_dataset,
     generate_mm_dataset,
     generate_random_dataset,
     save_jsonl,
@@ -166,6 +167,7 @@ GLM5_TOP64_PRUNED_GSM8K_MODEL_PATH = (
 )
 GLM_5_1_W4A8_MODEL_PATH = "/root/.cache/modelscope/hub/models/Eco-Tech/GLM-5.1-w4a8"
 GLM_5_2_W4A8_MODEL_PATH = "/root/.cache/modelscope/hub/models/Eco-Tech/GLM-5.2-w4a8"
+GLM_5_2_W8A8_MODEL_PATH = "/root/.cache/modelscope/hub/models/Eco-Tech/GLM-5.2-w8a8"
 MINIMAX_M2_5_W8A8_MODEL_PATH = (
     "/root/.cache/modelscope/hub/models/Eco-Tech/MiniMax-M2.5-w8a8-QuaRot"
 )
@@ -181,6 +183,13 @@ QWEN3_5_397B_W8A8_MODEL_PATH = (
 )
 DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH = (
     "/root/.cache/modelscope/hub/models/Eco-Tech/DeepSeek-V4-Flash-0731-w8a8"
+)
+DEEPSEEK_V4_PRO_0813_W4A8_MODEL_PATH = (
+    "/root/.cache/modelscope/hub/models/Eco-Tech/DeepSeek-V4-Pro-0813-w4a8"
+)
+# DeepSeek-V4-Flash default model for Ascend 950 testcase
+DEEPSEEK_V4_FLASH_DEFAULT_MODEL_PATH = (
+    "/root/.cache/modelscope/hub/models/deepseek-ai/DeepSeek-V4-Flash-0731"
 )
 QWEN3_5_397B_W4A8_MODEL_PATH = (
     "/root/.cache/modelscope/hub/models/Eco-Tech/Qwen3.5-397B-A17B-w4a8-mtp"
@@ -222,6 +231,20 @@ TPOT_TOLERANCE_HIGH = 1.02  # +2%
 TTFT_TOLERANCE = 1.02  # +2%
 E2E_TOLERANCE = 1.02  # +2%
 OUTPUT_TOKEN_THROUGHPUT_TOLERANCE = 0.98  # -2%
+
+
+def _get_spec_num_draft_tokens(other_args):
+    """Extract the value of --speculative-num-draft-tokens from server args."""
+    if not other_args:
+        return None
+    args = [str(arg) for arg in other_args]
+    if "--speculative-num-draft-tokens" not in args:
+        return None
+    idx = args.index("--speculative-num-draft-tokens")
+    if idx + 1 >= len(args):
+        return None
+    return int(args[idx + 1])
+
 
 # Package filtering keywords
 PACKAGE_FILTER_KEYWORDS = [
@@ -369,8 +392,22 @@ def run_bench_serving(
     repeat_rate=None,
     temperature=None,
     top_p=None,
+    gsp_num_groups=None,
+    gsp_prompts_per_group=None,
+    cache_report=False,
     env=None,
 ):
+    """Run sglang.bench_serving against a live server and parse its metrics.
+
+    With cache_report=True the returned metrics dict additionally carries
+    the server's hierarchical KV hit rates:
+      - cache_hit_rate_pct: overall KV hit rate across all tiers
+      - device_hit_rate_pct: L1 tier hit rate (device = GPU/NPU memory)
+      - host_hit_rate_pct: L2 tier hit rate (host = CPU memory / HiCache)
+    Thresholds for these tiers are declared on the test case as the
+    min_hit_rate_pcts class attribute and enforced by assert_metrics,
+    which requires cache_report=True to have any values to check.
+    """
     metrics_path = os.getenv("METRICS_DATA_FILE")
     result_file = (
         "./bench_log.txt"
@@ -385,7 +422,7 @@ def run_bench_serving(
         cmd_args = [
             PYTHON_FOR_TEST_TOOL,
             "-m",
-            "sglang.bench_serving",
+            "sglang.benchmark.serving",
             "--host",
             host,
             "--port",
@@ -397,9 +434,9 @@ def run_bench_serving(
             "--dataset-name",
             dataset_name,
             "--gsp-num-groups",
-            "1",
+            str(gsp_num_groups) if gsp_num_groups else "1",
             "--gsp-prompts-per-group",
-            str(num_prompts),
+            str(gsp_prompts_per_group) if gsp_prompts_per_group else str(num_prompts),
             "--gsp-system-prompt-len",
             (
                 str(int((repeat_rate if repeat_rate is not None else 0.9) * input_len))
@@ -430,11 +467,17 @@ def run_bench_serving(
             cmd_args.extend(["--temperature", str(temperature)])
         if top_p is not None:
             cmd_args.extend(["--top-p", str(top_p)])
+        if seed:
+            cmd_args.extend(["--seed", str(seed)])
+        if warmup_requests:
+            cmd_args.extend(["--warmup-requests", str(warmup_requests)])
+        if cache_report:
+            cmd_args.append("--cache-report")
     else:
         cmd_args = [
             PYTHON_FOR_TEST_TOOL,
             "-m",
-            "sglang.bench_serving",
+            "sglang.benchmark.serving",
             "--host",
             host,
             "--port",
@@ -565,6 +608,28 @@ def run_bench_serving(
                     parts = stripped_line.split()
                     if len(parts) >= 5:
                         metrics["mean_e2e_latency"] = parts[4]
+                elif "Accept length" in stripped_line:
+                    # Format: "Accept length:                           4.35"
+                    parts = stripped_line.split()
+                    if len(parts) >= 3:
+                        metrics["accept_length"] = parts[2]
+                elif stripped_line.startswith("Cache hit rate:"):
+                    # Overall KV hit rate, e.g. "Cache hit rate: 82.2%"
+                    parts = stripped_line.split()
+                    if len(parts) >= 4:
+                        metrics["cache_hit_rate_pct"] = parts[3].rstrip("%")
+                elif stripped_line.startswith("Device:") and stripped_line.endswith(
+                    "%"
+                ):
+                    # L1 (device KV cache) hit rate, e.g. "Device: 19.7%"
+                    parts = stripped_line.split()
+                    if len(parts) >= 2:
+                        metrics["device_hit_rate_pct"] = parts[1].rstrip("%")
+                elif stripped_line.startswith("Host:") and stripped_line.endswith("%"):
+                    # L2 (host HiCache) hit rate, e.g. "Host: 19.7%"
+                    parts = stripped_line.split()
+                    if len(parts) >= 2:
+                        metrics["host_hit_rate_pct"] = parts[1].rstrip("%")
         reader_done.set()
         process.wait()
         if process.returncode != 0:
@@ -577,7 +642,6 @@ def run_bench_serving(
         reader_done.set()
         if process.stdout is not None and not process.stdout.closed:
             process.stdout.close()
-
     return metrics
 
 
@@ -634,6 +698,26 @@ def run_aisbench(
             )
         dataset_path = dataset_file
         logger.info(f"Dataset generated: {dataset_path}")
+
+    elif dataset_type == "gsm8k-shared-prefix" and not dataset_path:
+        # Identical natural-text rows (one GSM8K QA pool padded past
+        # input_len): every request hits the same ~131072-token radix
+        # prefix, mirroring the dev shared-prefix shape. Emitted as
+        # test.jsonl because GSM8KDataset hardcodes that name inside the
+        # config's path dir; identical rows are not deduped.
+        dataset_file = "/tmp/datasets/gsm8k_shared_prefix/test.jsonl"
+        if not os.path.exists(dataset_file):
+            generate_gsm8k_shared_prefix_dataset(
+                model_path=model_path,
+                source_dataset_path=GSM8K_DATASET_TRAIN_FILE,
+                batch_size=num_prompts,
+                input_len=input_len,
+                output_file=dataset_file,
+                output_format="aisbench",
+            )
+        dataset_path = dataset_file
+        dataset_type = AISBENCHMARK_DATASET_GSM8K
+        logger.info(f"Shared-prefix GSM8K dataset ready: {dataset_path}")
 
     elif dataset_type == AISBENCHMARK_DATASET_MM_CUSTOM_GEN and not dataset_path:
         dataset_file = f"/tmp/datasets/mm.jsonl"
@@ -712,6 +796,12 @@ def run_aisbench(
         metrics = {}
         full_output = "\n".join(output_lines)
 
+        # With warmup passes enabled the stdout carries one summarizer
+        # table per invocation; only the last one is the formal run.
+        last_table = full_output.rfind("Performance Parameters")
+        if last_table != -1:
+            full_output = full_output[last_table:]
+
         simplified_output = re.sub(r"[^\w\s.]", " ", full_output)
 
         tpot_match = re.search(r"TPOT\s+total\s+([\d.]+)\s+ms", simplified_output)
@@ -721,7 +811,7 @@ def run_aisbench(
         else:
             logger.warning("Could not extract mean_tpot from output")
             logger.error(
-                f"Simplified output snippet around TPOT: {simplified_output[simplified_output.find('TPOT')-20:simplified_output.find('TPOT')+50] if 'TPOT' in simplified_output else 'TPOT not found'}"
+                f"Simplified output snippet around TPOT: {simplified_output[simplified_output.find('TPOT') - 20 : simplified_output.find('TPOT') + 50] if 'TPOT' in simplified_output else 'TPOT not found'}"
             )
 
         tps_matches = re.findall(
@@ -751,7 +841,7 @@ def run_aisbench(
         else:
             logger.warning("Could not extract total_tps from output")
             logger.warning(
-                f"Simplified output snippet around Output Token Throughput: {simplified_output[simplified_output.find('Output')-20:simplified_output.find('Output')+100] if 'Output' in simplified_output else 'Output not found'}"
+                f"Simplified output snippet around Output Token Throughput: {simplified_output[simplified_output.find('Output') - 20 : simplified_output.find('Output') + 100] if 'Output' in simplified_output else 'Output not found'}"
             )
 
         ttft_match = re.search(r"TTFT\s+total\s+([\d.]+)\s+ms", simplified_output)
@@ -761,7 +851,7 @@ def run_aisbench(
         else:
             logger.warning("Could not extract mean_ttft from output")
             logger.warning(
-                f"Simplified output snippet around TTFT: {simplified_output[simplified_output.find('TTFT')-20:simplified_output.find('TTFT')+50] if 'TTFT' in simplified_output else 'TTFT not found'}"
+                f"Simplified output snippet around TTFT: {simplified_output[simplified_output.find('TTFT') - 20 : simplified_output.find('TTFT') + 50] if 'TTFT' in simplified_output else 'TTFT not found'}"
             )
 
         e2el_match = re.search(r"E2EL\s+total\s+([\d.]+)\s+ms", simplified_output)
@@ -771,7 +861,7 @@ def run_aisbench(
         else:
             logger.warning("Could not extract mean_e2e_latency from output")
             logger.warning(
-                f"Simplified output snippet around E2EL: {simplified_output[simplified_output.find('E2EL')-20:simplified_output.find('E2EL')+50] if 'E2EL' in simplified_output else 'E2EL not found'}"
+                f"Simplified output snippet around E2EL: {simplified_output[simplified_output.find('E2EL') - 20 : simplified_output.find('E2EL') + 50] if 'E2EL' in simplified_output else 'E2EL not found'}"
             )
 
         concurrency_match = re.search(
@@ -783,7 +873,7 @@ def run_aisbench(
         else:
             logger.warning("Could not extract concurrency from output")
             logger.warning(
-                f"Simplified output snippet around Concurrency: {simplified_output[simplified_output.find('Concurrency')-20:simplified_output.find('Concurrency')+50] if 'Concurrency' in simplified_output else 'Concurrency not found'}"
+                f"Simplified output snippet around Concurrency: {simplified_output[simplified_output.find('Concurrency') - 20 : simplified_output.find('Concurrency') + 50] if 'Concurrency' in simplified_output else 'Concurrency not found'}"
             )
 
         max_concurrency_match = re.search(
@@ -795,7 +885,7 @@ def run_aisbench(
         else:
             logger.warning("Could not extract max_concurrency from output")
             logger.warning(
-                f"Simplified output snippet around Max Concurrency: {simplified_output[simplified_output.find('Max Concurrency')-20:simplified_output.find('Max Concurrency')+50] if 'Max Concurrency' in simplified_output else 'Max Concurrency not found'}"
+                f"Simplified output snippet around Max Concurrency: {simplified_output[simplified_output.find('Max Concurrency') - 20 : simplified_output.find('Max Concurrency') + 50] if 'Max Concurrency' in simplified_output else 'Max Concurrency not found'}"
             )
 
         req_throughput_match = re.search(
@@ -810,7 +900,7 @@ def run_aisbench(
         else:
             logger.warning("Could not extract request_throughput from output")
             logger.warning(
-                f"Simplified output snippet around Request Throughput: {simplified_output[simplified_output.find('Request')-20:simplified_output.find('Request')+50] if 'Request' in simplified_output else 'Request not found'}"
+                f"Simplified output snippet around Request Throughput: {simplified_output[simplified_output.find('Request') - 20 : simplified_output.find('Request') + 50] if 'Request' in simplified_output else 'Request not found'}"
             )
 
         total_requests_match = re.search(
@@ -822,7 +912,7 @@ def run_aisbench(
         else:
             logger.warning("Could not extract total_requests from output")
             logger.warning(
-                f"Simplified output snippet around Total Requests: {simplified_output[simplified_output.find('Total Requests')-20:simplified_output.find('Total Requests')+50] if 'Total Requests' in simplified_output else 'Total Requests not found'}"
+                f"Simplified output snippet around Total Requests: {simplified_output[simplified_output.find('Total Requests') - 20 : simplified_output.find('Total Requests') + 50] if 'Total Requests' in simplified_output else 'Total Requests not found'}"
             )
 
         failed_requests_match = re.search(
@@ -834,7 +924,7 @@ def run_aisbench(
         else:
             logger.warning("Could not extract failed_requests from output")
             logger.warning(
-                f"Simplified output snippet around Failed Requests: {simplified_output[simplified_output.find('Failed Requests')-20:simplified_output.find('Failed Requests')+50] if 'Failed Requests' in simplified_output else 'Failed Requests not found'}"
+                f"Simplified output snippet around Failed Requests: {simplified_output[simplified_output.find('Failed Requests') - 20 : simplified_output.find('Failed Requests') + 50] if 'Failed Requests' in simplified_output else 'Failed Requests not found'}"
             )
 
         logger.info(f"All extracted metrics: {metrics}")
@@ -869,7 +959,14 @@ def assert_metrics(self, metrics):
         raise Exception("No metrics obtained from benchmark")
 
     tc_name = self.__class__.__name__
-    if self.tpot and metrics.get("mean_tpot"):
+    # The perf knobs below are declared on the perf test bases; callers from
+    # other bases (e.g. accuracy cases) may not define them, so read them
+    # defensively instead of relying on class attributes.
+    tpot = getattr(self, "tpot", None)
+    output_token_throughput = getattr(self, "output_token_throughput", None)
+    ttft = getattr(self, "ttft", None)
+    mean_e2e_latency = getattr(self, "mean_e2e_latency", None)
+    if tpot and metrics.get("mean_tpot"):
         dump_metric(
             "tpot",
             float(metrics["mean_tpot"]),
@@ -877,10 +974,10 @@ def assert_metrics(self, metrics):
         )
         dump_metric(
             "tpot_baseline",
-            float(self.tpot),
+            float(tpot),
             labels={"test_case": tc_name, "type": "perf"},
         )
-    if self.output_token_throughput and metrics.get("total_tps"):
+    if output_token_throughput and metrics.get("total_tps"):
         dump_metric(
             "throughput",
             float(metrics["total_tps"]),
@@ -888,10 +985,10 @@ def assert_metrics(self, metrics):
         )
         dump_metric(
             "throughput_baseline",
-            float(self.output_token_throughput),
+            float(output_token_throughput),
             labels={"test_case": tc_name, "type": "perf"},
         )
-    if self.ttft and metrics.get("mean_ttft"):
+    if ttft and metrics.get("mean_ttft"):
         dump_metric(
             "ttft",
             float(metrics["mean_ttft"]),
@@ -899,10 +996,10 @@ def assert_metrics(self, metrics):
         )
         dump_metric(
             "ttft_baseline",
-            float(self.ttft),
+            float(ttft),
             labels={"test_case": tc_name, "type": "perf"},
         )
-    if self.mean_e2e_latency and metrics.get("mean_e2e_latency"):
+    if mean_e2e_latency and metrics.get("mean_e2e_latency"):
         dump_metric(
             "e2e_latency",
             float(metrics["mean_e2e_latency"]),
@@ -910,36 +1007,137 @@ def assert_metrics(self, metrics):
         )
         dump_metric(
             "e2e_latency_baseline",
-            float(self.mean_e2e_latency),
+            float(mean_e2e_latency),
             labels={"test_case": tc_name, "type": "perf"},
         )
 
-    if self.tpot:
-        if self.tpot < TPOT_THRESHOLD:
+    spec_num_draft_tokens = _get_spec_num_draft_tokens(
+        getattr(self, "other_args", None)
+    )
+    # accept_rate = accept_length / --speculative-num-draft-tokens.
+    # Dump only when all inputs are present; the mandatory checks below
+    # decide pass/fail when the baseline is set.
+    if (
+        getattr(self, "accept_rate", None)
+        and metrics.get("accept_length")
+        and spec_num_draft_tokens
+    ):
+        accept_rate = float(metrics["accept_length"]) / spec_num_draft_tokens
+        dump_metric(
+            "accept_rate",
+            accept_rate,
+            labels={"test_case": tc_name, "type": "perf"},
+        )
+        dump_metric(
+            "accept_rate_baseline",
+            float(self.accept_rate),
+            labels={"test_case": tc_name, "type": "perf"},
+        )
+
+    if tpot:
+        if tpot < TPOT_THRESHOLD:
             self.assertLessEqual(
                 float(metrics["mean_tpot"]),
-                self.tpot + TPOT_TOLERANCE_LOW,
+                tpot + TPOT_TOLERANCE_LOW,
             )
         else:
             self.assertLessEqual(
                 float(metrics["mean_tpot"]),
-                self.tpot * TPOT_TOLERANCE_HIGH,
+                tpot * TPOT_TOLERANCE_HIGH,
             )
-    if self.output_token_throughput:
+    if output_token_throughput:
         self.assertGreaterEqual(
             float(metrics["total_tps"]),
-            self.output_token_throughput * OUTPUT_TOKEN_THROUGHPUT_TOLERANCE,
+            output_token_throughput * OUTPUT_TOKEN_THROUGHPUT_TOLERANCE,
         )
-    if self.ttft:
+    if ttft:
         self.assertLessEqual(
             float(metrics["mean_ttft"]),
-            self.ttft * TTFT_TOLERANCE,
+            ttft * TTFT_TOLERANCE,
         )
-    if self.mean_e2e_latency:
+    if mean_e2e_latency:
         self.assertLessEqual(
             float(metrics["mean_e2e_latency"]),
-            self.mean_e2e_latency * E2E_TOLERANCE,
+            mean_e2e_latency * E2E_TOLERANCE,
         )
+    # Once an accept_rate baseline is set, a missing "Accept length" line
+    # (e.g. server_info request failed or spec decoding inactive) or a
+    # missing --speculative-num-draft-tokens arg must fail the test
+    # instead of being silently skipped.
+    if getattr(self, "accept_rate", None):
+        self.assertIsNotNone(
+            metrics.get("accept_length"),
+            "accept_length not found in bench_serving output "
+            "while accept_rate baseline is set",
+        )
+        self.assertIsNotNone(
+            spec_num_draft_tokens,
+            "--speculative-num-draft-tokens not found in other_args "
+            "while accept_rate baseline is set",
+        )
+        self.assertGreater(
+            float(metrics["accept_length"]) / spec_num_draft_tokens,
+            self.accept_rate,
+        )
+    # Once a hit-rate baseline dict is set, a missing "Cache Hit Details"
+    # section (e.g. the case did not set cache_report=True or the server
+    # was launched without --enable-cache-report) must fail the test
+    # instead of being silently skipped. Keys map HiCache tiers to their
+    # parsed metrics; values are percentage thresholds (10 = 10%).
+    min_hit_rate_pcts = getattr(self, "min_hit_rate_pcts", None)
+    if min_hit_rate_pcts:
+        hit_rate_keys = {
+            "cache": "cache_hit_rate_pct",
+            "device": "device_hit_rate_pct",
+            "host": "host_hit_rate_pct",
+        }
+        unknown_tiers = sorted(set(min_hit_rate_pcts) - set(hit_rate_keys))
+        if unknown_tiers:
+            raise Exception(
+                f"Unknown hit-rate tiers {unknown_tiers} in "
+                f"min_hit_rate_pcts; supported tiers: {sorted(hit_rate_keys)}"
+            )
+        for tier, threshold in min_hit_rate_pcts.items():
+            if metrics.get(hit_rate_keys[tier]) is None:
+                if metrics.get("cache_hit_rate_pct") is not None:
+                    # The overall rate was parsed, so the cache report
+                    # itself worked; only the tier line is missing.
+                    hint = (
+                        "cache_report worked but this tier has no line; "
+                        "the tier may never have been engaged (e.g. L1 "
+                        "capacity sufficed so L2 saw no traffic, or the "
+                        "workload had no prefix reuse), or radix cache "
+                        "is disabled on the server - inspect the "
+                        "server-side Cache Hit Details output"
+                    )
+                else:
+                    hint = (
+                        "did the case set cache_report=True and the server "
+                        "run with --enable-cache-report?"
+                    )
+                self.assertIsNotNone(
+                    metrics.get(hit_rate_keys[tier]),
+                    f"{tier} hit rate not found in bench_serving output "
+                    f"while min_hit_rate_pcts['{tier}'] is set; {hint}",
+                )
+            dump_metric(
+                f"{tier}_hit_rate",
+                float(metrics[hit_rate_keys[tier]]),
+                labels={"test_case": tc_name, "type": "perf"},
+            )
+            dump_metric(
+                f"{tier}_hit_rate_baseline",
+                float(threshold),
+                labels={"test_case": tc_name, "type": "perf"},
+            )
+            # Strictly greater: a zero threshold stays meaningful (any
+            # actual hit must be > 0), instead of trivially passing on >=.
+            self.assertGreater(
+                float(metrics[hit_rate_keys[tier]]),
+                float(threshold),
+                f"{tier} hit rate {metrics[hit_rate_keys[tier]]}% is not "
+                f"above {threshold}%",
+            )
 
 
 class TestNpuPerformanceTestCaseBase(CustomTestCase):
@@ -970,6 +1168,9 @@ class TestNpuPerformanceTestCaseBase(CustomTestCase):
     tpot = None
     mean_e2e_latency = None
     output_token_throughput = None
+    # Baseline for accept_length / speculative-num-draft-tokens; None disables
+    # the assertion.
+    accept_rate = None
 
     dp = None
     generation_kwargs = None
@@ -1365,7 +1566,9 @@ class TestNpuPerfMultiNodePdSepTestCaseBase(CustomTestCase):
         cls.role = (
             "router"
             if "router" in cls.hostname
-            else "prefill" if "prefill" in cls.hostname else "decode"
+            else "prefill"
+            if "prefill" in cls.hostname
+            else "decode"
         )
         logger.info(f"Init {cls.host} {cls.role=}!")
 

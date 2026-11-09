@@ -13,8 +13,8 @@ import unittest
 import aiohttp
 
 from sglang.benchmark.datasets.sharegpt import sample_sharegpt_requests
+from sglang.srt.hf_transformers import get_tokenizer
 from sglang.srt.utils import kill_process_tree
-from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -72,9 +72,9 @@ class _BeamSweepBase(CustomTestCase):
         cls.prompts = [r.prompt for r in rows if r.prompt_len < MAX_PROMPT_LEN][
             :NUM_PROMPTS
         ]
-        assert (
-            len(cls.prompts) == NUM_PROMPTS
-        ), f"only {len(cls.prompts)} short prompts sampled"
+        assert len(cls.prompts) == NUM_PROMPTS, (
+            f"only {len(cls.prompts)} short prompts sampled"
+        )
 
     @classmethod
     def tearDownClass(cls):

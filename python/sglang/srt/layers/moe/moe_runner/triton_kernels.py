@@ -93,9 +93,9 @@ class TritonKernelsRunnerCore(MoeRunnerCore):
             triton_kernel_fused_experts_with_bias,
         )
 
-        assert (
-            self.config.is_gated
-        ), "Only gated MoEs are supported for Triton Kernels runner"
+        assert self.config.is_gated, (
+            "Only gated MoEs are supported for Triton Kernels runner"
+        )
 
         hidden_states = runner_input.hidden_states
 
@@ -114,9 +114,9 @@ class TritonKernelsRunnerCore(MoeRunnerCore):
         has_bias = quant_info.w13_bias is not None or quant_info.w2_bias is not None
 
         if has_bias:
-            assert (
-                quant_info.w13_bias is not None and quant_info.w2_bias is not None
-            ), "Bias execution requires both w13_bias and w2_bias"
+            assert quant_info.w13_bias is not None and quant_info.w2_bias is not None, (
+                "Bias execution requires both w13_bias and w2_bias"
+            )
             output = triton_kernel_fused_experts_with_bias(
                 hidden_states=hidden_states,
                 w1=quant_info.w13_weight,
@@ -170,9 +170,9 @@ def pre_permute_standard_to_triton_kernels(
     hidden_states = dispatch_output.hidden_states
     topk_output = dispatch_output.topk_output
 
-    assert TopKOutputChecker.format_is_triton_kernels(
-        topk_output
-    ), "Triton-kernel runner expects TritonKernelTopKOutput"
+    assert TopKOutputChecker.format_is_triton_kernels(topk_output), (
+        "Triton-kernel runner expects TritonKernelTopKOutput"
+    )
 
     a_ragged_metadata, gather_indx, scatter_indx, gate_scal, n_expts_act = topk_output
 

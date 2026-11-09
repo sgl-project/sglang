@@ -8,19 +8,16 @@ from urllib.parse import unquote, urlparse
 import pybase64
 import torch
 
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalProcessorOutput,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
 from sglang.srt.models.moss_vl import MossVLForConditionalGeneration
+from sglang.srt.multimodal.media_io import download_remote_media
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
 from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
-from sglang.srt.utils.common import download_remote_media
 
 
 class MossVLImageProcessor(SGLangBaseProcessor):
@@ -537,9 +534,10 @@ class MossVLImageProcessor(SGLangBaseProcessor):
         *args,
         **kwargs,
     ):
-        normalized_video_data, temp_video_paths = (
-            await self._normalize_video_inputs_async(request_obj.video_data)
-        )
+        (
+            normalized_video_data,
+            temp_video_paths,
+        ) = await self._normalize_video_inputs_async(request_obj.video_data)
 
         try:
             base_output = await self.load_mm_data(

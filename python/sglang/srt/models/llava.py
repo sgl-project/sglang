@@ -38,23 +38,20 @@ from transformers.models.llava.modeling_llava import LlavaMultiModalProjector
 # leave till last and symbol only in case circular import
 import sglang.srt.models as sgl_models
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.managers.mm_utils import general_mm_embed_routine
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalInputs,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaForCausalLM
-from sglang.srt.models.mistral import MistralForCausalLM
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
 from sglang.srt.multimodal.mm_utils import (
     get_anyres_image_grid_shape,
     unpad_image,
     unpad_image_shape,
 )
-from sglang.srt.utils import add_prefix, flatten_nested_list, logger
+from sglang.srt.multimodal.modality import Modality
+from sglang.srt.utils import flatten_nested_list, logger
 
 _KNOWN_BROKEN_AUTOMODEL_CONFIG = "VoxtralRealtimeTextConfig"
 _KNOWN_BROKEN_AUTOMODEL_ERROR = "Could not find VoxtralRealtimeTextModel"
@@ -64,11 +61,12 @@ class LlavaBaseForCausalLM(nn.Module):
     @staticmethod
     def _infer_image_aspect_ratio(mm_items):
         """Determine image_aspect_ratio from processor metadata or item count."""
-        # Check if processor stored the aspect_ratio it used
+        # The processor records the ratio it actually preprocessed with. A recorded
+        # `None` means a plain square resize (llava-1.5), so the padded token count
+        # must not be derived from an anyres grid.
         for item in mm_items:
-            ar = item.model_specific_data.get("image_aspect_ratio")
-            if ar is not None:
-                return ar
+            if "image_aspect_ratio" in item.model_specific_data:
+                return item.model_specific_data["image_aspect_ratio"] or "square"
         # Fallback: multi-image or video → pad, single image → anyres
         image_items = [item for item in mm_items if item.is_image()]
         has_video = any(item.is_video() for item in mm_items)
@@ -90,6 +88,9 @@ class LlavaBaseForCausalLM(nn.Module):
         image_aspect_ratio = self._infer_image_aspect_ratio(image_inputs.mm_items)
         offset_list = []
         image_inputs.image_pad_len = []
+        # Inclusive [start, end] placeholder spans per item; general_mm_embed_routine
+        # locates each item's tokens in the expanded input_ids through them.
+        item_spans = [[] for _ in image_inputs.mm_items]
         for image_idx, image_s in enumerate(image_sizes):
             if len(image_sizes) > 16:
                 # 2x2 pooling with stride 2
@@ -130,7 +131,8 @@ class LlavaBaseForCausalLM(nn.Module):
             except ValueError:
                 offset = 0
             # old_len + pad_len - 1, because we need to remove image_token_id
-            pad_token = pad_values[image_idx % len(pad_values)]
+            item_idx = image_idx % len(pad_values)
+            pad_token = pad_values[item_idx]
             input_ids = (
                 input_ids[:offset]
                 + array("q", [pad_token]) * new_image_feature_len
@@ -138,6 +140,11 @@ class LlavaBaseForCausalLM(nn.Module):
             )
             offset_list.append(offset)
             image_inputs.image_pad_len.append(new_image_feature_len)
+            # Earlier items are already expanded, so `offset` is the final index.
+            item_spans[item_idx].append((offset, offset + new_image_feature_len - 1))
+
+        for item, spans in zip(image_inputs.mm_items, item_spans):
+            item.offsets = spans
 
         image_inputs.image_offsets = offset_list
         return input_ids
@@ -473,14 +480,15 @@ class LlavaBaseForCausalLM(nn.Module):
         # huggingface_name or path_of_clip_relative_to_llava_model_dir
         # We put the initialization here instead of __init__ to allow it being reused by other subclasses.
         vision_path = self.config.mm_vision_tower
+        device = next(self.language_model.parameters()).device
         if "clip" in vision_path:
             self.vision_tower = CLIPVisionModel.from_pretrained(
                 vision_path, torch_dtype=torch.float16
-            ).cuda()
+            ).to(device)
         elif "siglip" in vision_path:
             self.vision_tower = SiglipVisionModel.from_pretrained(
                 vision_path, torch_dtype=torch.float16
-            ).cuda()
+            ).to(device)
             # Siglip needs all feature tokens
             self.config.mm_vision_select_feature = "full"
         self.vision_tower.eval()
@@ -603,6 +611,9 @@ class LlavaMistralForCausalLM(LlavaBaseForCausalLM):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
+        # mistral.py subclasses LlavaForConditionalGeneration from this module
+        from sglang.srt.models.mistral import MistralForCausalLM
+
         super().__init__()
 
         self.config = config
@@ -649,7 +660,7 @@ class LlavaForConditionalGeneration(LlavaBaseForCausalLM):
     def dtype(self):
         return self.torch_dtype
 
-    def pad_input_ids(self, input_ids: List[int], image_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, image_inputs: MultimodalInputs) -> array:
         if hasattr(self.vision_tower, "pad_input_ids"):
             return self.vision_tower.pad_input_ids(input_ids, image_inputs)
         else:
@@ -803,16 +814,27 @@ class LlavaForConditionalGeneration(LlavaBaseForCausalLM):
         Returns:
             torch.Tensor: features from image inputs, concatenated
         """
+        # Requesting hidden states materialises one tensor per layer (~1.8 GiB per
+        # 1540px image); the plain forward returns the same tensor as the last entry.
+        last_layer_only = self.vision_feature_layer == -1
         features = []
         for item in items:
             # in each item, we assume pixel_values is always batched
             pixel_values, image_sizes = item.feature, item.image_sizes
-            image_outputs = self.vision_tower(
-                pixel_values, image_sizes, output_hidden_states=True
-            )
-            selected_image_feature = image_outputs.hidden_states[
-                self.vision_feature_layer
-            ]
+            if not isinstance(pixel_values, torch.Tensor):
+                # LlavaImageProcessor hands back numpy pixel values.
+                pixel_values = torch.as_tensor(
+                    np.asarray(pixel_values), device=self.vision_tower.device
+                )
+            if last_layer_only:
+                selected_image_feature = self.vision_tower(pixel_values, image_sizes)
+            else:
+                image_outputs = self.vision_tower(
+                    pixel_values, image_sizes, output_hidden_states=True
+                )
+                selected_image_feature = image_outputs.hidden_states[
+                    self.vision_feature_layer
+                ]
 
             if self.vision_feature_select_strategy in ["default", "patch"]:
                 selected_image_feature = selected_image_feature[:, 1:]
@@ -858,10 +880,9 @@ class LlavaForConditionalGeneration(LlavaBaseForCausalLM):
         weight name remapping as the weights are already properly structured with
         'language_model' and 'vision_tower' prefixes in the safetensors files.
         """
-        if (
-            self.vision_feature_select_strategy == "patch"
-            or self.vision_feature_select_strategy == "full"
-        ):
+        # HF spells the drop-CLS strategy "default"; `get_image_feature` treats it
+        # as "patch", so the token count must not gain the CLS slot here either.
+        if self.vision_feature_select_strategy in ("default", "patch", "full"):
             pass
         elif self.vision_feature_select_strategy == "cls_patch":
             self.image_feature_len += 1

@@ -1,5 +1,5 @@
 # /// script
-# requires-python = ">=3.10"
+# requires-python = ">=3.11"
 # dependencies = ["msgspec", "requests", "plotly", "kaleido", "numpy"]
 # ///
 from __future__ import annotations
@@ -687,8 +687,7 @@ def run_one_round(
     rank_rows = fetch_rank_rows(base_url=context.base_url)
     if len(rank_rows) != len(watermarks):
         raise RuntimeError(
-            f"DP rank count changed mid-profile: {len(watermarks)} -> "
-            f"{len(rank_rows)}."
+            f"DP rank count changed mid-profile: {len(watermarks)} -> {len(rank_rows)}."
         )
     new_rank_rows = [
         [row for row in rows if row.forward_ct > watermark]

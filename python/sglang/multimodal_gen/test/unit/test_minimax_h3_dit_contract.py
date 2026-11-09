@@ -11,14 +11,19 @@ from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
     MiniMaxH3DiTArchConfig,
     MiniMaxH3DiTConfig,
 )
-from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-    maybe_init_distributed_environment_and_model_parallel,
-    model_parallel_is_initialized,
+from sglang.multimodal_gen.runtime.breakable_cuda_graph.runner import (
+    BaseBreakableCudaGraphRunner,
 )
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionRequirements,
 )
-from sglang.multimodal_gen.runtime.layers.attention.backends.sdpa import SDPAImpl
+from sglang.multimodal_gen.runtime.layers.attention.backends.cube_sparse_attn import (
+    CubeSparseAttentionBackend,
+)
+from sglang.multimodal_gen.runtime.layers.attention.backends.sdpa import (
+    DynamicCudnnSDPAImpl,
+    SDPAImpl,
+)
 from sglang.multimodal_gen.runtime.layers.attention.selector import (
     component_attn_backend_context_manager,
 )
@@ -35,25 +40,69 @@ from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
     MINIMAX_H3_FP32_BUFFER_NAMES,
     MINIMAX_H3_FP32_PARAM_NAMES,
+    MiniMaxH3Attention,
     MiniMaxH3DiTBlock,
     MiniMaxH3DiTModel,
     _copy_grouped_qkv_tp_shard,
     _diffusers_h3_checkpoint,
+    _minimax_h3_group_attend,
     _modulate_gate,
     _qkv_scale_block_rows,
     _reorder_grouped_qkv_to_qkv,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
-from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import (
-    ensure_distributed_env_defaults,
-)
+from sglang.srt.utils import get_device
+
+pytestmark = pytest.mark.usefixtures("single_process_model_parallel")
 
 
-def _ensure_single_process_parallel_runtime() -> None:
-    if model_parallel_is_initialized():
-        return
-    ensure_distributed_env_defaults()
-    maybe_init_distributed_environment_and_model_parallel(tp_size=1, sp_size=1)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph replay")
+@torch.no_grad()
+def test_embedding_pool_outputs_match_eager_across_replays():
+    state = SimpleNamespace(
+        hidden_size=4,
+        arch=SimpleNamespace(time_embed_dim=2),
+        video_patch_proj=lambda x: (x * 2, None),
+        audio_patch_proj=lambda x: (x * 3, None),
+        _time_embedding=lambda t: torch.stack((t, t + 1), dim=-1),
+    )
+
+    class Embedding(torch.nn.Module):
+        def forward(self, **kwargs):
+            return MiniMaxH3DiTModel._embed(state, **kwargs)
+
+    device = torch.device("cuda:0")
+    kwargs = dict(
+        x=torch.randn(4, 4, device=device),
+        audio_x=torch.randn(5, 4, device=device),
+        text_embeddings_selected=torch.randn(2, 4, device=device, dtype=torch.bfloat16),
+        unique_timesteps=torch.tensor([0.5], device=device),
+        img_pos=torch.tensor([2, 3], device=device),
+        audio_pos=torch.tensor([4], device=device),
+        text_pos=torch.tensor([0, 1], device=device),
+        refiner_cu_seqlens=torch.tensor([0, 2, 2], device=device),
+        refiner_max_seqlen=2,
+        row_start=0,
+        row_stop=6,
+        device=device,
+        refined_prompt_embeds_length=2,
+    )
+    model = Embedding()
+    runner = BaseBreakableCudaGraphRunner(model, device)
+    try:
+        assert runner.capture(**kwargs)
+        assert next(iter(runner.entries.values())).num_segments == 2
+        for value in (0.25, 0.75):
+            kwargs["unique_timesteps"].fill_(value)
+            kwargs["x"].normal_()
+            kwargs["audio_x"].normal_()
+            kwargs["text_embeddings_selected"].normal_()
+            expected = model(**kwargs)
+            actual = runner(**kwargs)
+            for result, reference in zip(actual, expected):
+                torch.testing.assert_close(result, reference, rtol=0, atol=0)
+    finally:
+        runner.reset()
 
 
 def test_pruned_adaln_lora_projection_preserves_affine_term():
@@ -61,6 +110,7 @@ def test_pruned_adaln_lora_projection_preserves_affine_term():
         arch=SimpleNamespace(adaln_affine_input_dim=3, time_embed_dim=2),
         adaln_basis=torch.tensor([[1.0, 0.0, 2.0], [0.0, 1.0, -1.0]]),
         adaln_mean=torch.tensor([1.0, 2.0, 3.0]),
+        _adaln_precomputed=False,
     )
     prefix = "blocks.0.adaln_proj.linear."
     a = torch.tensor([[2.0, 3.0, 4.0]])
@@ -233,7 +283,9 @@ def test_cache_dit_preservation_only_makes_first_gate_out_of_place():
     block.norm1 = torch.nn.Identity()
     block.norm2 = torch.nn.Identity()
     block.attn = _KwargIdentity()
+    block.attn.qkv_proj = SimpleNamespace(quant_method=UnquantizedLinearMethod())
     block.mlp = torch.nn.Identity()
+    block.mlp.fc1 = SimpleNamespace(quant_method=UnquantizedLinearMethod())
     gate_modes = []
 
     def fake_gate(residual, _gate, _other, _indices, *, dtype, allow_inplace=True):
@@ -256,7 +308,7 @@ def test_cache_dit_preservation_only_makes_first_gate_out_of_place():
 
     with (
         patch(
-            "sglang.multimodal_gen.runtime.models.dits.minimax_h3._modulate_scale_shift",
+            "sglang.multimodal_gen.runtime.models.dits.minimax_h3._modulate_rmsnorm_scale_shift",
             side_effect=lambda value, *_args, **_kwargs: value,
         ),
         patch(
@@ -355,6 +407,36 @@ def test_cache_dit_out_of_place_gate_preserves_cuda_input():
     torch.testing.assert_close(output, expected, rtol=0, atol=0)
 
 
+# DynamicCudnnSDPAImpl is a CUDA-platform backend; on ROCm its FlashAttention
+# fallback needs the flash_attn package, which the ROCm images do not ship.
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.version.hip is not None,
+    reason="requires CUDA (DynamicCudnnSDPAImpl is not selected on ROCm)",
+)
+def test_group_attend_skips_only_the_trailing_alignment_rows():
+    """The pipelined Ulysses group attention gives the real rows the bytes of
+    forward_varlen and leaves the packing's alignment rows zero."""
+    used, total = 16400, 16448  # long enough for FA4 on sm_103
+    impl = DynamicCudnnSDPAImpl(
+        num_heads=2, head_size=128, causal=False, softmax_scale=128**-0.5
+    )
+    torch.manual_seed(0)
+    q, k, v = (
+        torch.randn(total, 2, 128, device="cuda", dtype=torch.bfloat16)
+        for _ in range(3)
+    )
+    bounds = (0, used, total)
+    kwargs = dict(
+        cu_seqlens=torch.tensor(bounds, device="cuda", dtype=torch.int32),
+        cu_seqlens_host=bounds,
+        max_seqlen=used,
+    )
+    ref = impl.forward_varlen(q, k, v, **kwargs)
+    got = _minimax_h3_group_attend(impl, **kwargs)(q, k, v)
+    assert torch.equal(got[:used], ref[:used])
+    assert not got[used:].any()
+
+
 def test_tp_and_ulysses_admission_uses_tp_local_shapes():
     arch = MiniMaxH3DiTArchConfig()
     model = MiniMaxH3DiTModel.__new__(MiniMaxH3DiTModel)
@@ -409,8 +491,108 @@ def test_tp_and_ulysses_admission_uses_tp_local_shapes():
         )
 
 
+def test_cube_backend_advertises_packed_varlen_capability():
+    assert CubeSparseAttentionBackend.supports_packed_varlen()
+
+
+def test_attention_retains_transformer_scoped_backend():
+    with (
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.minimax_h3."
+            "get_component_forced_attn_backend",
+            return_value=AttentionBackendEnum.CUBE_SPARSE_ATTN,
+        ),
+        torch.device("meta"),
+    ):
+        attention = MiniMaxH3Attention(
+            MiniMaxH3DiTArchConfig(), None, prefix="blocks.0.attn"
+        )
+
+    assert (
+        attention._selected_attention_backend is AttentionBackendEnum.CUBE_SPARSE_ATTN
+    )
+
+
+def test_model_lazy_resolver_keeps_transformer_scoped_backend():
+    with (
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.minimax_h3."
+            "get_component_forced_attn_backend",
+            return_value=AttentionBackendEnum.CUBE_SPARSE_ATTN,
+        ),
+        torch.device("meta"),
+    ):
+        model = MiniMaxH3DiTModel(
+            config=MiniMaxH3DiTConfig(), hf_config={}, quant_config=None
+        )
+
+    class FakeBackend:
+        @staticmethod
+        def get_enum():
+            return AttentionBackendEnum.CUBE_SPARSE_ATTN
+
+    with (
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.minimax_h3.get_attn_backend",
+            return_value=FakeBackend,
+        ) as resolve,
+        patch.object(MiniMaxH3Attention, "_set_attention_backend") as install,
+    ):
+        model._resolve_attention_backend_once()
+
+    resolve.assert_called_once_with(
+        model.arch.attention_head_dim,
+        torch.bfloat16,
+        selected_attention_backend=AttentionBackendEnum.CUBE_SPARSE_ATTN,
+        attention_requirements=AttentionRequirements(packed_varlen=True),
+    )
+    attention_count = sum(
+        isinstance(module, MiniMaxH3Attention) for module in model.modules()
+    )
+    assert install.call_count == attention_count
+    assert model._resolved_attention_backend is AttentionBackendEnum.CUBE_SPARSE_ATTN
+
+
+def test_token_refiner_routes_cube_selection_to_exact_fa():
+    class FakeImpl:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    class FakeBackend:
+        def __init__(self, enum):
+            self.enum = enum
+
+        def get_enum(self):
+            return self.enum
+
+        def get_impl_cls(self):
+            return FakeImpl
+
+    cube = FakeBackend(AttentionBackendEnum.CUBE_SPARSE_ATTN)
+    fa = FakeBackend(AttentionBackendEnum.FA)
+    attention = MiniMaxH3Attention.__new__(MiniMaxH3Attention)
+    torch.nn.Module.__init__(attention)
+    attention.head_dim = 128
+    attention.num_heads = 8
+    attention.softmax_scale = 128**-0.5
+    attention.prefix = "test.attn"
+    attention._cube_sparse_capable = False
+
+    with patch(
+        "sglang.multimodal_gen.runtime.models.dits.minimax_h3.get_attn_backend",
+        return_value=fa,
+    ) as resolve:
+        attention._set_attention_backend(cube)
+
+    assert attention._attention_backend_enum is AttentionBackendEnum.FA
+    resolve.assert_called_once_with(
+        128,
+        torch.bfloat16,
+        selected_attention_backend=AttentionBackendEnum.FA,
+    )
+
+
 def test_meta_model_captures_component_attention_override():
-    _ensure_single_process_parallel_runtime()
     with (
         component_attn_backend_context_manager(
             AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN,
@@ -432,7 +614,6 @@ def test_meta_model_captures_component_attention_override():
 
 def test_meta_model_enforces_mixed_precision_weight_contract():
     expected_fp32 = set(MINIMAX_H3_FP32_PARAM_NAMES) | set(MINIMAX_H3_FP32_BUFFER_NAMES)
-    _ensure_single_process_parallel_runtime()
     with torch.device("meta"):
         model = MiniMaxH3DiTModel(
             config=MiniMaxH3DiTConfig(),
@@ -451,7 +632,6 @@ def test_meta_model_enforces_mixed_precision_weight_contract():
 
 
 def test_pruned_meta_model_preserves_curve_adaln_fp32_island():
-    _ensure_single_process_parallel_runtime()
     config = MiniMaxH3DiTConfig(
         arch_config=MiniMaxH3DiTArchConfig(
             adaln_curve_grid=1025,
@@ -472,7 +652,6 @@ def test_pruned_meta_model_preserves_curve_adaln_fp32_island():
 
 
 def test_online_fp8_keeps_fp32_boundaries_and_ignored_layers_unquantized():
-    _ensure_single_process_parallel_runtime()
     with torch.device("meta"):
         model = MiniMaxH3DiTModel(
             config=MiniMaxH3DiTConfig(),
@@ -505,7 +684,6 @@ def _block_fp8_quant_config(block: int = 128, **kwargs) -> Fp8Config:
 
 
 def _meta_h3(quant_config) -> MiniMaxH3DiTModel:
-    _ensure_single_process_parallel_runtime()
     with torch.device("meta"):
         return MiniMaxH3DiTModel(
             config=MiniMaxH3DiTConfig(), hf_config={}, quant_config=quant_config
@@ -707,16 +885,20 @@ def test_packed_qkv_exchange_preserves_rank_and_head_order(_):
         torch.testing.assert_close(actual[index], expected)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_cuda_ulysses_qkv_pack_is_bit_exact():
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() or torch.xpu.is_available()),
+    reason="requires CUDA or XPU",
+)
+def test_ulysses_qkv_pack_is_bit_exact():
     from sglang.kernels.ops.diffusion import pack_qkv_destination_major
 
+    device = get_device()
     torch.manual_seed(23)
     rows, world_size, heads, head_size = 65, 8, 56, 128
     qkv = torch.randn(
         rows,
         3 * heads * head_size,
-        device="cuda",
+        device=device,
         dtype=torch.bfloat16,
     )
     q, k, v = (
@@ -729,7 +911,7 @@ def test_cuda_ulysses_qkv_pack_is_bit_exact():
         rows,
         local_heads,
         3 * head_size,
-        device="cuda",
+        device=device,
         dtype=torch.bfloat16,
     )
     for index, tensor in enumerate((q, k, v)):
@@ -740,3 +922,34 @@ def test_cuda_ulysses_qkv_pack_is_bit_exact():
 
     actual = pack_qkv_destination_major(q.contiguous(), k.contiguous(), v, world_size)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("compiling", [False, True])
+def test_compiled_attention_runs_its_fused_section_eager(compiling):
+    arch = MiniMaxH3DiTArchConfig()
+    with torch.device("meta"):
+        attention = MiniMaxH3Attention(arch, None, prefix="blocks.0.attn")
+    tokens = 4
+    out = torch.empty(tokens, attention.local_inner_dim, device="meta")
+
+    with (
+        patch.object(torch.compiler, "is_compiling", return_value=compiling),
+        patch.object(MiniMaxH3Attention, "_attend", return_value=out) as attend,
+        patch.object(
+            MiniMaxH3Attention, "_attend_eager", return_value=out
+        ) as attend_eager,
+    ):
+        result = attention(
+            torch.empty(tokens, arch.hidden_size, device="meta"),
+            rope_cache=None,
+            cu_seqlens=torch.empty(2, dtype=torch.int32, device="meta"),
+            max_seqlen=tokens,
+        )
+
+    assert result.shape == (tokens, arch.hidden_size)
+    assert (attend_eager if compiling else attend).call_count == 1
+    assert (attend if compiling else attend_eager).call_count == 0
+
+
+def test_eager_attention_section_is_hidden_from_dynamo():
+    assert MiniMaxH3Attention._attend_eager._torchdynamo_disable

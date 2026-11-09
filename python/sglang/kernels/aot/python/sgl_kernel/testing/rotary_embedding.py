@@ -17,9 +17,6 @@ class FusedSetKVBufferArg:
     k_buffer: torch.Tensor
     v_buffer: torch.Tensor
     cache_loc: torch.Tensor
-    # Kept for backward compatibility with old sgl_kernel test/bench callsites.
-    k_scale: Optional[float] = None
-    v_scale: Optional[float] = None
 
     def to_jit(self) -> _JitFusedSetKVBufferArg:
         return _JitFusedSetKVBufferArg(
@@ -112,9 +109,9 @@ class RotaryEmbedding(torch.nn.Module):
         fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """A PyTorch-native implementation of forward()."""
-        assert (
-            fused_set_kv_buffer_arg is None
-        ), "fused_set_kv_buffer_arg is not supported for native implementation"
+        assert fused_set_kv_buffer_arg is None, (
+            "fused_set_kv_buffer_arg is not supported for native implementation"
+        )
 
         if offsets is not None:
             positions = positions + offsets
@@ -182,9 +179,9 @@ class SglKernelRotaryEmbedding(RotaryEmbedding):
         offsets: Optional[torch.Tensor] = None,
         fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        assert (
-            fused_set_kv_buffer_arg is None
-        ), "fused_set_kv_buffer_arg is not supported for sgl-kernel implementation"
+        assert fused_set_kv_buffer_arg is None, (
+            "fused_set_kv_buffer_arg is not supported for sgl-kernel implementation"
+        )
         if self.cos_sin_cache.dtype != query.dtype:
             self.cos_sin_cache = self.cos_sin_cache.to(query.dtype)
         torch.ops.sgl_kernel.rotary_embedding(

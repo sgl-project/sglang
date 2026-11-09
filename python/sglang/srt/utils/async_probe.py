@@ -1,14 +1,17 @@
-"""Async invariant probes — fire torch._assert_async without CPU sync.
+"""Async invariant probes — fire device-side assertions without CPU sync.
 
-All probes are gated on SGLANG_ENABLE_ASYNC_ASSERT (default off in prod).
-When the gate is on, a violation surfaces as an assertion at the next CUDA
-sync point instead of as a silent NaN cascade or illegal-address crash.
+NaN probes run when SGLANG_ENABLE_NAN_LOGITS_CHECK or SGLANG_ENABLE_ASYNC_ASSERT
+is enabled. Other probes require SGLANG_ENABLE_ASYNC_ASSERT. Both flags default
+off. A violation surfaces at the next CUDA sync point instead of a silent NaN
+cascade or illegal-address crash.
 """
 
 import logging
 from typing import Optional
 
 import torch
+import triton
+import triton.language as tl
 
 from sglang.srt.environ import envs
 
@@ -55,7 +58,10 @@ _nan_warner = _AsyncNanWarner()
 def maybe_warn_nan(tensor: Optional[torch.Tensor], msg: str = ""):
     """Non-fatal counterpart of maybe_detect_nan: throttled sync-free warning
     instead of crashing. Callers sanitize the tensor themselves."""
-    if envs.SGLANG_ENABLE_ASYNC_ASSERT.get():
+    if (
+        envs.SGLANG_ENABLE_NAN_LOGITS_CHECK.get()
+        or envs.SGLANG_ENABLE_ASYNC_ASSERT.get()
+    ):
         # The hard assert path already covers detection.
         return
     if tensor is None:
@@ -64,7 +70,7 @@ def maybe_warn_nan(tensor: Optional[torch.Tensor], msg: str = ""):
 
 
 def sanitize_nan_logits(logits: torch.Tensor, msg: str = ""):
-    """Detect NaN (assert in CI, throttled warning in prod), then sanitize in
+    """Detect NaN (assert when enabled, otherwise a throttled warning), then sanitize in
     place: NaN logits (e.g. fp16 activation overflow) are undefined behavior
     in sampling kernels and can come back as out-of-vocab token ids. +-1e30
     rather than dtype min/max because callers divide logits by temperature,
@@ -88,15 +94,69 @@ def maybe_assert_sum(tensor: torch.Tensor, expected: int, msg: str = "") -> None
     torch._assert_async(tensor.sum() == expected, msg)
 
 
+_NAN_CHECK_BLOCK = 1024
+
+
+# Device assertions must remain enabled independently of TRITON_DEBUG.
+@triton.jit(debug=True, do_not_specialize=["columns", "blocks_per_row", "stride_row"])
+def _assert_no_nan_kernel(
+    tensor,
+    columns,
+    blocks_per_row,
+    stride_row,
+    stride_col,
+    MESSAGE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    block = tl.program_id(0)
+    row = (block // blocks_per_row).to(tl.int64)
+    cols = (block % blocks_per_row).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    values = tl.load(tensor + row * stride_row + cols * stride_col, cols < columns, 0)
+    tl.device_assert(values == values, MESSAGE)
+
+
 def maybe_detect_nan(tensor: Optional[torch.Tensor], msg: str = ""):
     """Async NaN check — no GPU-CPU sync, error surfaces at next sync point."""
-    if not envs.SGLANG_ENABLE_ASYNC_ASSERT.get():
+    if not (
+        envs.SGLANG_ENABLE_NAN_LOGITS_CHECK.get()
+        or envs.SGLANG_ENABLE_ASYNC_ASSERT.get()
+    ):
         return
     # A None tensor means there is nothing to probe, e.g. hidden_states on
     # capture_hidden_mode=NULL paths (STANDALONE speculative decoding).
     if tensor is None:
         return
-    torch._assert_async(~torch.any(torch.isnan(tensor)), f"NaN detected! {msg}")
+    message = f"NaN detected! {msg}"
+    contiguous = tensor.is_contiguous()
+    # torch.compile can eliminate the read-only Triton call, losing its assertion.
+    if torch.compiler.is_compiling() or not (
+        tensor.is_cuda
+        and tensor.is_floating_point()
+        and (contiguous or tensor.ndim == 2)
+    ):
+        torch._assert_async(~torch.any(torch.isnan(tensor)), message)
+        return
+    if tensor.numel() == 0:
+        return
+    if contiguous:
+        rows, columns, stride_row, stride_col = 1, tensor.numel(), 0, 1
+    else:
+        rows, columns = tensor.shape
+        stride_row, stride_col = tensor.stride()
+        if 0 < stride_row < stride_col:
+            rows, columns = columns, rows
+            stride_row, stride_col = stride_col, stride_row
+    blocks_per_row = triton.cdiv(columns, _NAN_CHECK_BLOCK)
+    _assert_no_nan_kernel[(rows * blocks_per_row,)](
+        tensor,
+        columns,
+        blocks_per_row,
+        stride_row,
+        stride_col,
+        message,
+        _NAN_CHECK_BLOCK,
+        num_warps=4,
+    )
 
 
 def maybe_detect_inf(tensor: Optional[torch.Tensor], msg: str = ""):
@@ -138,27 +198,6 @@ def maybe_detect_oob(indices: Optional[torch.Tensor], low: int, high: int, msg: 
     torch._assert_async(
         indices.max() < high,
         f"index >= {high} (out of range): {msg}",
-    )
-
-
-def maybe_detect_kernel_facing_loc(
-    indices: Optional[torch.Tensor], page_size: int, blocks_per_page: int, msg: str
-):
-    """Async check that a write loc is in the pool's KERNEL-FACING id space.
-
-    A kernel-facing id is `phys_page * (page_size * blocks_per_page) + offset`
-    with `offset < page_size`, so its remainder modulo the page stride is
-    below page_size; a VIRTUAL id satisfies that only in the first block.
-    Vacuous at blocks_per_page 1. Virtual ids are in range for the OOB probe,
-    so this is the only check that separates them.
-    """
-    if blocks_per_page <= 1 or not envs.SGLANG_ENABLE_ASYNC_ASSERT.get():
-        return
-    if indices is None or indices.numel() == 0:
-        return
-    torch._assert_async(
-        (indices % (page_size * blocks_per_page) < page_size).all(),
-        f"write loc outside the kernel-facing id space (virtual ids?): {msg}",
     )
 
 

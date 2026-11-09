@@ -6,6 +6,8 @@ import warnings
 from typing import Dict, List, Optional, Union
 
 import aiohttp
+import msgspec
+import msgspec.structs
 import requests
 
 from sglang.lang.backend.base_backend import BaseBackend
@@ -133,18 +135,14 @@ class RuntimeEndpoint(BaseBackend):
 
         dtype_regex = None
         if sampling_params.dtype in ["int", int]:
-
             dtype_regex = REGEX_INT
             sampling_params.stop.extend([" ", "\n"])
         elif sampling_params.dtype in ["float", float]:
-
             dtype_regex = REGEX_FLOAT
             sampling_params.stop.extend([" ", "\n"])
         elif sampling_params.dtype in ["str", str]:
-
             dtype_regex = REGEX_STR
         elif sampling_params.dtype in ["bool", bool]:
-
             dtype_regex = REGEX_BOOL
         else:
             raise RuntimeError(f"Invalid dtype: {sampling_params.dtype}")
@@ -387,7 +385,12 @@ class Runtime:
         # Pre-allocate a port before building the config, so the config is born
         # with the port this runtime will serve on.
         requested_port = kwargs.pop(
-            "port", ServerArgs.__dataclass_fields__["port"].default
+            "port",
+            next(
+                f.default
+                for f in msgspec.structs.fields(ServerArgs)
+                if f.name == "port"
+            ),
         )
         for port in range(requested_port, 40000):
             if is_port_available(port):
@@ -458,8 +461,8 @@ class Runtime:
         self.endpoint.cache_prefix(prefix)
 
     def get_tokenizer(self):
-        from sglang.srt.arg_groups.overrides import resolving_view
-        from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+        from sglang.srt.arg_groups.model_override_base import resolving_view
+        from sglang.srt.hf_transformers import get_tokenizer
 
         cfg = resolving_view(self.server_args)
         return get_tokenizer(

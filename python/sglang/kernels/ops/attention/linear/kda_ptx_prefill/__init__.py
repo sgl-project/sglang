@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Hand-written PTX/tcgen05 KDA chunked-prefill kernel (GB300 / sm_103a).
+"""Hand-written PTX/tcgen05 KDA chunked-prefill kernel (sm_100a / sm_103a).
 
 Vendored from the upstream ``kda_prefill`` artifact (commit 33583615): the CUDA
 source in ``kernels/jit/csrc/attention/kda_prefill.cu`` plus the FLA-signature
@@ -10,6 +10,10 @@ source in ``kernels/jit/csrc/attention/kda_prefill.cu`` plus the FLA-signature
 The extension is JIT-compiled with ``torch.utils.cpp_extension`` on first use
 (~1-2 min, cached under ``TORCH_EXTENSIONS_DIR``); concurrent TP ranks
 serialize on torch's build lock and then load the cached .so.
+
+The kernel uses only the tcgen05 subset that sm_100a and sm_103a share, so it
+is built for whichever of the two the device is (arch-specific cubins do not
+run across them).
 """
 
 import os
@@ -18,6 +22,9 @@ import torch
 
 K = 128  # head dim (qk == v), fixed by the kernel
 CHUNK = 64  # kernel chunk size, fixed
+
+# Compute capability -> build target: B200 / GB200 and B300 / GB300.
+SM_ARCHS = {(10, 0): "100a", (10, 3): "103a"}
 
 _EXT_NAME = "kda_prefill_ptx"
 _ext = None
@@ -29,6 +36,10 @@ def load_ext():
     if _ext is None:
         from torch.utils import cpp_extension
 
+        from sglang.srt.utils.cpp_extension_loader import (
+            load_extension_with_recovery,
+        )
+
         src = os.path.join(
             os.path.dirname(os.path.abspath(__file__)),
             "../../../../jit/csrc/attention/kda_prefill.cu",
@@ -39,8 +50,16 @@ def load_ext():
         stubs = os.path.join(
             cpp_extension.CUDA_HOME or "/usr/local/cuda", "lib64", "stubs"
         )
-        _ext = cpp_extension.load(
-            name=_EXT_NAME,
+        capability = torch.cuda.get_device_capability()
+        if capability not in SM_ARCHS:
+            raise RuntimeError(
+                "PTX KDA prefill needs SM100 or SM103, got "
+                f"SM{capability[0]}{capability[1]}"
+            )
+        arch = SM_ARCHS[capability]
+        _ext = load_extension_with_recovery(
+            # One cached build per arch, so a shared extensions dir can hold both.
+            name=f"{_EXT_NAME}_sm{arch}",
             sources=[src],
             extra_cuda_cflags=[
                 "-O3",
@@ -48,7 +67,7 @@ def load_ext():
                 "-use_fast_math",
                 "-lineinfo",
                 "-gencode",
-                "arch=compute_103a,code=sm_103a",
+                f"arch=compute_{arch},code=sm_{arch}",
             ],
             extra_cflags=["-O3"],
             extra_ldflags=[f"-L{stubs}", "-lcuda"],
@@ -107,9 +126,9 @@ def chunk_kda_fwd(
     Returns the fla-shaped 12-tuple: (o [B,T,H,128] bf16, final_state
     [N,H,128,128] fp32 or None, then Nones, ..., h, initial_state).
     """
-    assert (
-        chunk_size == CHUNK
-    ), f"kda_prefill supports chunk_size={CHUNK} only, got {chunk_size}"
+    assert chunk_size == CHUNK, (
+        f"kda_prefill supports chunk_size={CHUNK} only, got {chunk_size}"
+    )
     if cp_context is not None or disable_recompute:
         raise NotImplementedError(
             "kda_prefill is the inference forward path: cp_context, "
@@ -124,9 +143,9 @@ def chunk_kda_fwd(
     if state_v_first and initial_state is not None:
         # [V,K]-layout state: pure transpose (K==V==128), exact, ~us/call
         initial_state = initial_state.transpose(-1, -2).contiguous()
-    assert (
-        q.dim() == 4 and q.shape[-1] == K and v.shape[-1] == K
-    ), f"expected [B,T,H,{K}] q/k/v, got q={tuple(q.shape)} v={tuple(v.shape)}"
+    assert q.dim() == 4 and q.shape[-1] == K and v.shape[-1] == K, (
+        f"expected [B,T,H,{K}] q/k/v, got q={tuple(q.shape)} v={tuple(v.shape)}"
+    )
     B, T, H, _ = q.shape
 
     cu_cpu = None
@@ -145,9 +164,9 @@ def chunk_kda_fwd(
     betaf = beta.reshape(Tt, H).contiguous()
 
     if use_gate_in_kernel:
-        assert (
-            A_log is not None and dt_bias is not None
-        ), "use_gate_in_kernel=True requires A_log and dt_bias"
+        assert A_log is not None and dt_bias is not None, (
+            "use_gate_in_kernel=True requires A_log and dt_bias"
+        )
         assert g.dtype == torch.bfloat16, f"raw gate input must be bf16, got {g.dtype}"
         gf = g.reshape(Tt, H, K).contiguous()
         sg = lower_bound is not None  # fla: lb presence selects safe-gate

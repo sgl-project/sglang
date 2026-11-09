@@ -24,9 +24,9 @@ class AscendLoRABackend(BaseLoRABackend):
     def run_lora_a_embedding(
         self, input_ids, weights, vocab_size, extra_embeddings=None, *args, **kwargs
     ):
-        assert (
-            extra_embeddings is None
-        ), "Ascend LoRA embedding backend does not support extra embeddings (added tokens)."
+        assert extra_embeddings is None, (
+            "Ascend LoRA embedding backend does not support extra embeddings (added tokens)."
+        )
 
         total_seq_len = input_ids.shape[0]
         if weights.numel() == 0:
@@ -104,7 +104,7 @@ class AscendLoRABackend(BaseLoRABackend):
             output_tensor = base_output
 
         torch.ops.npu.sgemmv_expand(
-            x,
+            x.to(dtype=torch.float),
             weights,
             self.batch_info.weight_indices,
             self.batch_info.seg_lens,
@@ -152,6 +152,7 @@ class AscendLoRABackend(BaseLoRABackend):
             self.batch_info.lora_ranks,
             self.batch_info.scalings,
             lora_a_output,
+            n_slices,
         )
 
         torch.ops.npu.sgemmv_expand(
@@ -182,6 +183,7 @@ class AscendLoRABackend(BaseLoRABackend):
         total_seq_len, _ = x.shape
         _, weight_intermediate_dim, _ = gate_up_lora_a.shape
         _, weight_out_dim, _ = gate_up_lora_b.shape
+        n_slices = 2
 
         if base_output is None:
             output_tensor = torch.zeros(
@@ -202,6 +204,7 @@ class AscendLoRABackend(BaseLoRABackend):
             self.batch_info.lora_ranks,
             self.batch_info.scalings,
             lora_a_output,
+            n_slices,
         )
 
         torch.ops.npu.sgemmv_expand(
@@ -216,7 +219,7 @@ class AscendLoRABackend(BaseLoRABackend):
 
         return output_tensor
 
-    def init_cuda_graph_batch_info(
+    def init_decode_cuda_graph_batch_info(
         self,
         max_bs_in_cuda_graph: int,
         num_tokens_per_req: int,
@@ -268,9 +271,9 @@ class AscendLoRABackend(BaseLoRABackend):
         bs = forward_batch.batch_size
 
         if use_cuda_graph:
-            assert (
-                self.npu_graph_batch_info is not None
-            ), "NPU Graph batch info is not initialized."
+            assert self.npu_graph_batch_info is not None, (
+                "NPU Graph batch info is not initialized."
+            )
             batch_info = self.npu_graph_batch_info
             batch_info.bs = forward_batch.batch_size
             batch_info.num_segments = forward_batch.batch_size

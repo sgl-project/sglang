@@ -29,7 +29,6 @@ TORCH_DTYPES = [torch.float16]
 
 
 class TestClipModels(unittest.TestCase):
-
     @classmethod
     def setUpClass(cls):
         mp.set_start_method("spawn", force=True)
@@ -61,12 +60,12 @@ class TestClipModels(unittest.TestCase):
         )
         print("text similarity diff", abs(text_similarity - 1))
         print("image similarity diff", abs(image_similarity - 1))
-        assert torch.all(
-            abs(text_similarity - 1) < prefill_tolerance
-        ), "embeddings are not all close"
-        assert torch.all(
-            abs(image_similarity - 1) < prefill_tolerance
-        ), "embeddings are not all close"
+        assert torch.all(abs(text_similarity - 1) < prefill_tolerance), (
+            "embeddings are not all close"
+        )
+        assert torch.all(abs(image_similarity - 1) < prefill_tolerance), (
+            "embeddings are not all close"
+        )
 
     def test_accuracy(self):
         for model, prefill_tolerance in MODELS:

@@ -86,7 +86,7 @@ The generator only emits a runnable command for combinations that NVIDIA / SGLan
 
 - **DP attention**:
 
-    By default the attention layers are tensor-parallel (sharded across all TP ranks). Enabling DP attention (the toggle above, or `--dp <N> --enable-dp-attention`) instead runs attention as `N` data-parallel groups: each DP rank serves its own slice of the requests with its own KV cache. `--dp` must divide `--tp`.
+    By default the attention layers are tensor-parallel (sharded across all TP ranks). Enabling DP attention (the toggle above, or `--attn-dp-size <N>`) instead runs attention as `N` data-parallel groups: each DP rank serves its own slice of the requests with its own KV cache. `--attn-dp-size` must divide `--tp`.
 
 - **Expert parallel (EP)**:
 
@@ -422,7 +422,7 @@ Content:
 1. **Define goal & metrics** — peak token throughput (input+output), TTFT, P99 ITL, MFU; measured at fixed accuracy.
 2. **Choose baselines** — Strategy A (TP-only) vs Strategy B (TP + expert-parallel). Hold model checkpoint, precision, and KV-cache dtype constant.
 3. **Sweep** — `{batch ∈ 1,4,16,64, concurrency ∈ 16,64,256, seq_len ∈ 1k,8k,32k}` per strategy.
-4. **Workload** — `sglang.bench_serving --dataset-name random` with matched input/output budgets.
+4. **Workload** — `sglang.benchmark.serving --dataset-name random` with matched input/output budgets.
 5. **Analysis** — per-config throughput table + roofline overlay; bootstrap CIs over 3 reruns to bound noise.
 ```
 
@@ -453,7 +453,7 @@ python3 -m sglang.launch_server \
 - Benchmark Command:
 
 ```shell Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --model nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4 \
   --dataset-name random \
@@ -528,8 +528,13 @@ python3 -m sglang.launch_server \
 
 **Run Benchmark**
 ```bash Command
-python3 benchmark/gsm8k/bench_sglang.py
+sgl-eval run gsm8k \
+  --base-url http://127.0.0.1:30000/v1 \
+  --num-examples 200 \
+  --num-threads 64
 ```
+
+Historical results below use the removed harness and are not measurements of the sgl-eval command above.
 
 **Test Results:**
 ```text Output
@@ -543,7 +548,9 @@ Output throughput: 745.333 token/s
 
 **Run Benchmark**
 ```bash Command
-python3 benchmark/mmlu/bench_sglang.py
+sgl-eval run mmlu \
+  --base-url http://127.0.0.1:30000/v1 \
+  --num-threads 64 --max-tokens 2048
 ```
 
 **Test Results:**

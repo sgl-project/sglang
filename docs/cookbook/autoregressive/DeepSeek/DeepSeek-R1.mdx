@@ -37,8 +37,6 @@ For more details, please refer to the [official DeepSeek-R1 repository](https://
 
 Please refer to the [official SGLang installation guide](../../../docs/get-started/install) for installation instructions.
 
-For SGLang CPU installation, please refer to the [CPU version installation guide](../../../docs/hardware-platforms/cpu_server#installation).
-
 ## 3. Model Deployment
 
 This section provides deployment configurations optimized for different hardware platforms and use cases.
@@ -79,7 +77,7 @@ DeepSeek-R1 shares the same MoE architecture as DeepSeek-V3, so the same hardwar
     </tr>
     <tr>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><strong>INT8</strong></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>16× A100/A800, 32× L40S, Xeon 6980P CPU, 4× Atlas 800I A3</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>16× A100/A800, 32× L40S, Xeon 6980P CPU, 4× Ascend A3 Series</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><strong>W4A8 / AWQ / MXFP4 / NVFP4</strong></td>
@@ -95,7 +93,7 @@ DeepSeek-R1 shares the same MoE architecture as DeepSeek-V3, so the same hardwar
 python3 -m sglang.compile_deep_gemm --model deepseek-ai/DeepSeek-R1 --tp 8 --trust-remote-code
 ```
 
-**Data Parallelism Attention (`--enable-dp-attention`):** Recommended for high-throughput scenarios. Use `--enable-dp-attention --tp 8 --dp 8` on a single 8-GPU node.
+**Data Parallelism Attention (`--attn-dp-size`):** Recommended for high-throughput scenarios. Use `--tp 8 --attn-dp-size 8` on a single 8-GPU node.
 
 **NCCL timeout:** If model loading is slow, increase: `--dist-timeout 3600`.
 
@@ -466,7 +464,7 @@ python -m sglang.launch_server \
 - Low Concurrency (Latency-Optimized)
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
   --backend sglang \
   --model deepseek-ai/DeepSeek-R1-0528 \
   --dataset-name random \
@@ -519,7 +517,7 @@ Max ITL (ms):                            15.45
 - Medium Concurrency (Balanced)
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
   --backend sglang \
   --model deepseek-ai/DeepSeek-R1-0528 \
   --dataset-name random \
@@ -572,7 +570,7 @@ Max ITL (ms):                            461.90
 - High Concurrency (Throughput-Optimized)
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
   --backend sglang \
   --model deepseek-ai/DeepSeek-R1-0528 \
   --dataset-name random \
@@ -627,7 +625,7 @@ Max ITL (ms):                            2052.85
 - Low Concurrency
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
   --backend sglang \
   --model deepseek-ai/DeepSeek-R1-0528 \
   --dataset-name random \
@@ -680,7 +678,7 @@ Max ITL (ms):                            15.18
 - Medium Concurrency
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
   --backend sglang \
   --model deepseek-ai/DeepSeek-R1-0528 \
   --dataset-name random \
@@ -733,7 +731,7 @@ Max ITL (ms):                            226.59
 - High Concurrency
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
   --backend sglang \
   --model deepseek-ai/DeepSeek-R1-0528 \
   --dataset-name random \
@@ -788,7 +786,7 @@ Max ITL (ms):                            237.91
 - Low Concurrency
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
   --backend sglang \
   --model deepseek-ai/DeepSeek-R1-0528 \
   --dataset-name random \
@@ -841,7 +839,7 @@ Max ITL (ms):                            14.06
 - Medium Concurrency
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
   --backend sglang \
   --model deepseek-ai/DeepSeek-R1-0528 \
   --dataset-name random \
@@ -894,7 +892,7 @@ Max ITL (ms):                            1471.36
 - High Concurrency
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
   --backend sglang \
   --model deepseek-ai/DeepSeek-R1-0528 \
   --dataset-name random \
@@ -977,11 +975,13 @@ Document model accuracy on standard benchmarks:
 - Benchmark Command
 
 ```bash Command
-python3 benchmark/gsm8k/bench_sglang.py \
-  --num-shots 8 \
-  --num-questions 1316 \
-  --parallel 1316
+sgl-eval run gsm8k \
+  --base-url http://127.0.0.1:30000/v1 \
+  --num-examples 1319 \
+  --num-threads 1316
 ```
+
+Historical results below use the removed harness and are not measurements of the sgl-eval command above.
 
 **Test Results:**
 

@@ -77,7 +77,7 @@ MI45X_DEEPSEEK_V4_FLASH_MODELS = [
             "deepseek-v4",
             "--chunked-prefill-size",
             "8192",
-            "--cuda-graph-max-bs",
+            "--cuda-graph-max-bs-decode",
             "256",
             "--max-running-requests",
             "256",
@@ -92,7 +92,6 @@ MI45X_DEEPSEEK_V4_FLASH_MODELS = [
             "SGLANG_USE_ROCM700A": "0",
             "SGLANG_HACK_FLASHMLA_BACKEND": "unified_kv_triton",
             "AITER_BF16_FP8_MOE_BOUND": "0",
-            "AITER_FORCE_A8W4": "1",
             "SGLANG_USE_AITER_MOE_GU_ITLV": "0",
             "SGLANG_OPT_FUSE_MHC_POST_PRE": "0",
             "ENABLE_CK": "0",
@@ -196,9 +195,9 @@ class TestDeepSeekV4FlashEvalMI45x(unittest.TestCase):
 
         for config in self.models:
             with self.subTest(model=config.model_path):
-                print(f"\n{'='*60}")
+                print(f"\n{'=' * 60}")
                 print(f"Testing: {config.model_path}")
-                print(f"{'='*60}")
+                print(f"{'=' * 60}")
 
                 env = os.environ.copy()
                 for key, value in config.env_vars.items():

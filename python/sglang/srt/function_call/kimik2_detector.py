@@ -333,9 +333,9 @@ class KimiK2Detector(BaseFormatDetector):
                     )
                     if argument_diff:
                         self._last_arguments += argument_diff
-                        self.streamed_args_for_tool[
-                            self.current_tool_id
-                        ] += argument_diff
+                        self.streamed_args_for_tool[self.current_tool_id] += (
+                            argument_diff
+                        )
 
                 if end_idx == -1:
                     # Args still streaming.
@@ -468,6 +468,7 @@ class KimiK2Detector(BaseFormatDetector):
             tools=converted_tools,
             tool_choice=converted_tool_choice,
             reasoning=thinking_mode,
+            parallel_tool_calls=parallel_tool_calls,
         )
 
     def get_structural_tag_name(self) -> str:

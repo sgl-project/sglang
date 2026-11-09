@@ -54,52 +54,10 @@ def fused_interleaved_rope_fp64(
     q_out = torch.empty_like(q)
     k_out = torch.empty_like(k)
     module = _jit_interleaved_rope_fp64_module(q.dtype)
-    module.interleaved_rope_fp64(
-        q_out.view(-1),
-        k_out.view(-1),
-        q.view(-1),
-        k.view(-1),
-        cos.view(-1),
-        sin.view(-1),
-        q.shape[0],
-        q.shape[1],
-        q.shape[2],
-        q.shape[3],
-    )
+    module.interleaved_rope_fp64(q_out, k_out, q, k, cos, sin)
     return q_out, k_out
 
 
-def can_use_interleaved_rope_fp64(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-) -> bool:
-    if q.dim() != 4:
-        return False
-    expected_table_shape = (1, q.shape[1], 1, q.shape[3])
-    return (
-        q.dtype is torch.bfloat16
-        and k.dtype is q.dtype
-        and q.is_cuda
-        and k.is_cuda
-        and q.device == k.device == cos.device == sin.device
-        and k.shape == q.shape
-        and q.shape[-1] % 2 == 0
-        and q.is_contiguous()
-        and k.is_contiguous()
-        and q.data_ptr() % 4 == 0
-        and k.data_ptr() % 4 == 0
-        and cos.dtype is torch.float64
-        and sin.dtype is torch.float64
-        and cos.shape == expected_table_shape
-        and sin.shape == expected_table_shape
-        and cos.is_contiguous()
-        and sin.is_contiguous()
-    )
-
-
 __all__ = [
-    "can_use_interleaved_rope_fp64",
     "fused_interleaved_rope_fp64",
 ]

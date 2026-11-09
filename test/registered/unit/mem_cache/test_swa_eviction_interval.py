@@ -1,0 +1,144 @@
+import unittest
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
+
+import torch
+
+from sglang.srt.environ import envs
+from sglang.srt.layers.moe.utils import MoeA2ABackend
+from sglang.srt.managers.schedule_batch import ReqKvInfo, ScheduleBatch
+from sglang.srt.mem_cache.radix_cache import RadixCache
+from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
+from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.runtime_context import get_flags
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=9, suite="base-a-test-cpu")
+
+
+class _SwaCache(RadixCache):
+    def __init__(self):
+        self.disable = False
+        self.sliding_window_size = 128
+        self.page_size = 16
+        self.req_to_token_pool = SimpleNamespace(
+            req_to_token=torch.arange(1024).reshape(1, -1)
+        )
+        self.token_to_kv_pool_allocator = Mock(
+            spec=[
+                "free_swa_segment",
+                "free_group_begin",
+                "free_group_end",
+                "page_size",
+                "storage",
+                "window_pool_names",
+                "get_kvcache",
+            ]
+        )
+        allocator = self.token_to_kv_pool_allocator
+        allocator.page_size = 16
+        allocator.storage = None
+        # A static window pool keeping the 128-token window.
+        allocator.window_pool_names = lambda: ("swa",)
+        allocator.get_kvcache = lambda: SimpleNamespace(request_window=None)
+        kv_storage_of(self.req_to_token_pool, allocator).bind_window_retention(
+            128, None
+        )
+        self.trim_calls = 0
+
+    def supports_swa(self):
+        return True
+
+    def swa_retain_floor(self, req):
+        # Read once per window retirement the scheduler runs.
+        self.trim_calls += 1
+        return super().swa_retain_floor(req)
+
+
+class TestSWAEvictionInterval(unittest.TestCase):
+    def test_scheduler_gates_on_request_cursor_before_protected_prefix(self):
+        for protected, shield in [(256, 0), (0, 249)]:
+            with (
+                self.subTest(protected=protected, shield=shield),
+                envs.SGLANG_SWA_EVICTION_INTERVAL.override(128),
+                envs.SGLANG_OPT_RELEASE_PREFILL_SWA.override(False),
+            ):
+                cache = _SwaCache()
+                req = SimpleNamespace(
+                    seqlen=401,
+                    decode_batch_idx=1,
+                    kv=ReqKvInfo(
+                        req_pool_idx=0,
+                        cache_protected_len=protected,
+                        window_evict_floor=shield,
+                    ),
+                )
+                batch = ScheduleBatch(
+                    reqs=[req],
+                    tree_cache=cache,
+                    req_to_token_pool=cache.req_to_token_pool,
+                    token_to_kv_pool_allocator=cache.token_to_kv_pool_allocator,
+                    forward_mode=ForwardMode.DECODE,
+                )
+                free = cache.token_to_kv_pool_allocator.free_swa_segment
+
+                # The raw cursor makes eviction due; the protected prefix only
+                # limits which rows may be freed, not when the interval starts.
+                batch.maybe_evict_swa()
+                self.assertEqual(cache.trim_calls, 1)
+                free.assert_called_once()
+                self.assertTrue(
+                    torch.equal(free.call_args.args[0], torch.arange(256, 272))
+                )
+                self.assertEqual(free.call_args.kwargs, {"start_pos": 256})
+                self.assertEqual(req.kv.get_evicted_seqlen("swa"), 272)
+                free.reset_mock()
+
+                # Not due: the window's own cursor gates the retirement.
+                req.seqlen = 528
+                batch.maybe_evict_swa()
+                self.assertEqual(cache.trim_calls, 1)
+                free.assert_not_called()
+
+                req.seqlen += 1
+                batch.maybe_evict_swa()
+                self.assertEqual(cache.trim_calls, 2)
+                free.assert_called_once()
+                self.assertTrue(
+                    torch.equal(free.call_args.args[0], torch.arange(272, 400))
+                )
+
+    def test_forward_cadence_is_not_gated_again_by_token_interval(self):
+        cache = _SwaCache()
+        req = SimpleNamespace(
+            seqlen=201,
+            decode_batch_idx=1,
+            kv=ReqKvInfo(req_pool_idx=0),
+        )
+        batch = ScheduleBatch(
+            reqs=[req],
+            tree_cache=cache,
+            req_to_token_pool=cache.req_to_token_pool,
+            token_to_kv_pool_allocator=cache.token_to_kv_pool_allocator,
+            forward_mode=ForwardMode.DECODE,
+            forward_iter=127,
+        )
+        free = cache.token_to_kv_pool_allocator.free_swa_segment
+        with (
+            patch("sglang.srt.managers.schedule_batch._is_hip", True),
+            get_flags().moe.override(a2a_backend=MoeA2ABackend.MEGAMOE),
+            envs.SGLANG_SWA_EVICTION_INTERVAL.override(128),
+            envs.SGLANG_OPT_RELEASE_PREFILL_SWA.override(False),
+        ):
+            batch.maybe_evict_swa()
+            free.assert_not_called()
+            batch.forward_iter += 1
+            batch.maybe_evict_swa()
+
+        free.assert_called_once()
+        self.assertTrue(torch.equal(free.call_args.args[0], torch.arange(64)))
+        self.assertEqual(req.kv.get_evicted_seqlen("swa"), 64)
+
+
+if __name__ == "__main__":
+    unittest.main()

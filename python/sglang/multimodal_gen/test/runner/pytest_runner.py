@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
+import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Sequence
@@ -98,13 +100,13 @@ def parse_junit_xml_for_case_results(xml_path: str) -> dict[str, str]:
 
 
 def _run_pytest_attempt(cmd: list[str]) -> tuple[int, str]:
+    sys.stdout.flush()
     process = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         bufsize=0,
     )
-
     output_bytes = bytearray()
     while True:
         chunk = process.stdout.read(4096)
@@ -116,6 +118,18 @@ def _run_pytest_attempt(cmd: list[str]) -> tuple[int, str]:
 
     process.wait()
     return process.returncode, output_bytes.decode("utf-8", errors="replace")
+
+
+def _estimate_failed_test_time(xml_path: str | None, attempt_time: float) -> float:
+    if xml_path is None or not Path(xml_path).exists():
+        return attempt_time
+
+    failed_time = sum(
+        float(testcase.get("time", "0"))
+        for testcase in ET.parse(xml_path).getroot().iter("testcase")
+        if testcase.find("failure") is not None or testcase.find("error") is not None
+    )
+    return failed_time if failed_time > 0 else attempt_time
 
 
 def _extract_collection_line(full_output: str) -> str | None:
@@ -132,12 +146,14 @@ def _extract_short_test_summary(full_output: str) -> list[str]:
     for line in full_output.splitlines():
         stripped = line.strip()
         if "short test summary info" in stripped:
+            summary_lines = []
             in_summary = True
             continue
         if not in_summary:
             continue
         if stripped.startswith("="):
-            break
+            in_summary = False
+            continue
         if not stripped or stripped.startswith("!"):
             continue
         summary_lines.append(stripped)
@@ -153,12 +169,24 @@ def _extract_failure_tail(full_output: str, max_lines: int = 20) -> list[str]:
     return lines[-max_lines:]
 
 
+def _read_failure_reasons(xml_path: str | None) -> list[str]:
+    if xml_path is None or not Path(xml_path).exists():
+        return []
+
+    reasons = []
+    for testcase in ET.parse(xml_path).getroot().iter("testcase"):
+        for failure in (*testcase.findall("failure"), *testcase.findall("error")):
+            name = f"{testcase.get('classname', '')}::{testcase.get('name', '')}"
+            message = failure.get("message") or failure.text or ""
+            reasons.append(f"{name}\n{message}".rstrip())
+    return reasons
+
+
 def _summary_has_retryable_failure(summary_lines: list[str]) -> bool:
     for line in summary_lines:
         lowered = line.lower()
         if (
-            "[performance]" in line
-            or "SafetensorError" in line
+            "SafetensorError" in line
             or "FileNotFoundError" in line
             or "TimeoutError" in line
             or "out of memory" in lowered
@@ -185,11 +213,10 @@ def _is_retryable_failure(full_output: str) -> bool:
     if _is_consistency_failure(full_output):
         return False
 
+    if "[performance]" in full_output:
+        return True
+
     summary_lines = _extract_short_test_summary(full_output)
-    is_perf_assertion = (
-        "multimodal_gen/test/server/test_server_utils.py" in full_output
-        and "AssertionError" in full_output
-    )
     is_aggregated_retryable_failure = _summary_has_retryable_failure(summary_lines)
 
     is_flaky_ci_assertion = (
@@ -202,12 +229,7 @@ def _is_retryable_failure(full_output: str) -> bool:
         "out of memory" in full_output.lower() or "oom killer" in full_output.lower()
     )
 
-    return (
-        is_perf_assertion
-        or is_aggregated_retryable_failure
-        or is_flaky_ci_assertion
-        or is_oom_error
-    )
+    return is_aggregated_retryable_failure or is_flaky_ci_assertion or is_oom_error
 
 
 def _print_attempt_tail_summary(
@@ -259,6 +281,7 @@ def run_pytest(
     filter_expr: str | None = None,
     junit_xml_path: str | None = None,
     exitfirst: bool = False,
+    failure_summary: list[str] | None = None,
 ) -> tuple[int, list[str], dict[str, str]]:
     if not files:
         print("No files to run.")
@@ -284,6 +307,8 @@ def run_pytest(
         base_cmd.extend(["-k", filter_expr])
 
     max_retries = 6
+    retry_deadline = os.environ.get("SGLANG_DIFFUSION_RETRY_DEADLINE")
+    retry_deadline = float(retry_deadline) if retry_deadline else None
     attempt_reports = []
     for i in range(max_retries + 1):
         is_retry = i > 0
@@ -298,7 +323,9 @@ def run_pytest(
             f"for {len(files)} assigned item(s)"
         )
 
+        attempt_start = time.monotonic()
         returncode, full_output = _run_pytest_attempt(cmd)
+        attempt_time = time.monotonic() - attempt_start
         retryable = returncode not in (0, 5) and _is_retryable_failure(full_output)
         attempt_reports.append(
             {
@@ -324,24 +351,34 @@ def run_pytest(
         if returncode == 0:
             if is_retry:
                 print(f"Recovered retryable failures on attempt {i + 1}.")
-            _print_attempt_tail_summary(attempt_reports, len(files))
-            return (0, list(all_executed_cases), all_case_results)
+            break
         if returncode == 5:
             print(
                 "No tests collected (exit code 5). This is expected when filters "
                 "deselect all tests in a partition. Treating as success."
             )
-            _print_attempt_tail_summary(attempt_reports, len(files))
-            return (0, list(all_executed_cases), all_case_results)
+            break
 
         if not retryable:
-            _print_attempt_tail_summary(attempt_reports, len(files))
-            return (returncode, list(all_executed_cases), all_case_results)
+            break
 
         if i == max_retries:
             print(f"Max retry exceeded ({max_retries})")
-            _print_attempt_tail_summary(attempt_reports, len(files))
-            return (returncode, list(all_executed_cases), all_case_results)
+            break
+
+        if retry_deadline is not None:
+            remaining = retry_deadline - time.time()
+            retry_estimate = _estimate_failed_test_time(junit_xml_path, attempt_time)
+            # leave headroom for pytest startup and variation in the failed cases
+            required = retry_estimate * 1.1 + 30
+            if remaining < required:
+                print(
+                    f"Retry budget exhausted: {remaining:.1f}s remaining, "
+                    f"next failed-item retry needs approximately {required:.1f}s. "
+                    "Preserving the failing result instead of starting another attempt.",
+                    flush=True,
+                )
+                break
 
         print(
             f"Retryable failure detected on attempt {i + 1}. "
@@ -349,8 +386,12 @@ def run_pytest(
         )
 
     _print_attempt_tail_summary(attempt_reports, len(files))
+    if failure_summary is not None and returncode not in (0, 5):
+        failure_summary.extend(
+            _read_failure_reasons(junit_xml_path) or attempt_reports[-1]["failure_tail"]
+        )
     return (
-        attempt_reports[-1]["returncode"],
+        0 if returncode == 5 else returncode,
         list(all_executed_cases),
         all_case_results,
     )

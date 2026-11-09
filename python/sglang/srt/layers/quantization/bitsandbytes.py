@@ -16,7 +16,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
-from sglang.srt.utils import set_weight_attrs
+from sglang.srt.layers.utils.common import set_weight_attrs
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -320,9 +320,9 @@ class BitsAndBytesLinearMethod(LinearMethodBase):
                 matmul_states[i].CB = qweight[offsets[i] : offsets[i + 1]]
                 matmul_states[i].SCB = quant_states[i].to(x.device)
                 matmul_states[i].threshold = self.quant_config.llm_int8_threshold
-                matmul_states[i].has_fp16_weights = (
-                    self.quant_config.llm_int8_has_fp16_weight
-                )
+                matmul_states[
+                    i
+                ].has_fp16_weights = self.quant_config.llm_int8_has_fp16_weight
                 matmul_states[i].is_training = False
                 if (
                     matmul_states[i].threshold > 0.0

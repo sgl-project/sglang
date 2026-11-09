@@ -20,6 +20,7 @@
 import logging
 import math
 import re
+from array import array
 from collections.abc import Iterable
 from typing import List, Optional, Tuple
 
@@ -30,19 +31,16 @@ from transformers import PretrainedConfig
 
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
+    pad_mm_tokens,
 )
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalInputs,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.idefics2 import Idefics2VisionTransformer
 from sglang.srt.models.llama import LlamaForCausalLM
 from sglang.srt.models.phi4mm_audio import AudioEmbedding
+from sglang.srt.multimodal.modality import Modality
 
 logger = logging.getLogger(__name__)
 
@@ -105,9 +103,9 @@ class Phi4MMImageEncoder(nn.Module):
         self.base_feat_height_target = self.base_feat_height_target // 2
 
         # with_hd_transform and with_learnable_separator should have same value
-        assert (
-            self.use_hd_transform == self.with_learnable_separator
-        ), "use_hd_transform and with_learnable_separator should have same value"
+        assert self.use_hd_transform == self.with_learnable_separator, (
+            "use_hd_transform and with_learnable_separator should have same value"
+        )
         assert self.use_hd_transform, "learnable separator is only for hd transform"
         # 1024 * 4, merge spatial to channel dimension
         self.glb_GN = nn.Parameter(
@@ -210,9 +208,11 @@ class Phi4MMImageEncoder(nn.Module):
         assert (
             base_feat_height == base_feat_height_target
             and base_feat_width == base_feat_height_target
-        ), f'base_feat_height: {base_feat_height},"\
+        ), (
+            f'base_feat_height: {base_feat_height},"\
                 f" base_feat_width: {base_feat_width}, "\
                 f"expect {base_feat_height_target} features for hd transform'
+        )
 
         # bs x max_num_crops x (24x24) x C
         img_features = img_features.view(
@@ -359,10 +359,10 @@ class Phi4MMImageEncoder(nn.Module):
                 )
 
             # temp_len = int((h*w+1)*144 + 1 + (h+1)*12)
-            assert (
-                temp_len == output_imgs[-1].shape[1]
-            ), f'temp_len: {temp_len}, output_imgs[-1].shape[1]: "\
+            assert temp_len == output_imgs[-1].shape[1], (
+                f'temp_len: {temp_len}, output_imgs[-1].shape[1]: "\
                     "{output_imgs[-1].shape[1]}'
+            )
 
             output_len.append(temp_len)
 
@@ -473,9 +473,8 @@ class Phi4MMForCausalLM(nn.Module):
 
         return hidden_states
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
-        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
-        return pattern.pad_input_tokens(input_ids, mm_inputs)
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
+        return pad_mm_tokens(input_ids, mm_inputs)
 
     def should_apply_lora(self, module_name: str) -> bool:
         return bool(self.lora_pattern.match(module_name))
