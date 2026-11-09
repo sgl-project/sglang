@@ -141,16 +141,12 @@ logger = logging.getLogger(__name__)
 
 
 def _has_dflash_draft_kv(kvc: KVCacheConfigurator) -> bool:
-    """Whether the target's per-token budget carries a draft KV row. A DFLASH
-    draft KV ring is a small fixed pool instead, so it charges nothing here."""
-    from sglang.srt.speculative.dflash_draft_ring import draft_kv_ring_enabled
-
+    """Whether the target's per-token budget carries a draft KV row."""
     # DFLASH and DSPARK only build the draft on the final PP stage.
     return (
         not kvc.is_draft_worker
         and kvc.spec_algorithm.is_dflash_family()
         and (kvc.pp_size == 1 or kvc.pp_group.is_last_rank)
-        and not (kvc.spec_algorithm.is_dflash() and draft_kv_ring_enabled())
     )
 
 
