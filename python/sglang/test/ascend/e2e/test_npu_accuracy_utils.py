@@ -665,6 +665,9 @@ class TestNpuAccuracyMultiNodePdSepTestCaseBase(CustomTestCase):
         )
         logger.info(f"Init {cls.host} {cls.role=}!")
 
+        # The L3 storage backend must be reachable before the model server
+        # starts, so bring up the MetaService first (prefill node only).
+        cls.start_meta_service()
         cls.start_pd_server()
         cls.start_router_server()
 
@@ -701,9 +704,6 @@ class TestNpuAccuracyMultiNodePdSepTestCaseBase(CustomTestCase):
     @classmethod
     @check_role(allowed_roles=["prefill", "decode"])
     def start_pd_server(cls):
-        # The L3 storage backend must be reachable before the model server
-        # starts, so bring up the MetaService first.
-        cls.start_meta_service()
         logger.info(f"Starting pd separation node...")
         cls.process = launch_pd_separation_node(cls.model_config)
         logger.info(f"Pd separation node started with PID: {cls.process.pid}")

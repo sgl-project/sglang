@@ -40,6 +40,11 @@ SERVICE_PORT = (
 PREFILL_DECODE_PORT = 8000
 BOOTSTRAP_INIT_PORT = 8995
 
+# npu_memcache L3 backend MetaService ports.
+META_SERVICE_PORT = 5007
+CONFIG_STORE_PORT = 6007
+META_METRICS_PORT = 8007
+
 # Timeouts and delays
 ROUTER_CONFIGMAP_TIMEOUT = 300
 SERVER_INITIALIZATION_DELAY = 30
@@ -157,6 +162,21 @@ def get_host_ip():
     if not host_ip:
         raise RuntimeError(f"Missing required environment variables: POD_IP={host_ip}")
     return host_ip
+
+
+def build_meta_service_config():
+    """Return the npu_memcache MetaService endpoints for the current pod.
+
+    Uses the pod's real IP (POD_IP) instead of loopback so a multi-pod
+    prefill instance can reach the MetaService across nodes; falls back to
+    loopback when POD_IP is unset (e.g. local test collection outside k8s).
+    """
+    host = os.getenv("POD_IP", "127.0.0.1")
+    return {
+        "meta_service_url": f"tcp://{host}:{META_SERVICE_PORT}",
+        "config_store_url": f"tcp://{host}:{CONFIG_STORE_PORT}",
+        "metrics_url": f"http://{host}:{META_METRICS_PORT}",
+    }
 
 
 def get_k8s_api():

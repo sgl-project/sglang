@@ -4,6 +4,9 @@ import unittest
 from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
     TestNpuAccuracyMultiNodePdSepTestCaseBase,
 )
+from sglang.test.ascend.e2e.test_npu_multi_node_utils import (
+    build_meta_service_config,
+)
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
     DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH,
     assert_metrics,
@@ -17,15 +20,9 @@ register_npu_ci(
     nightly=True,
 )
 
-META_SERVICE_PORT = 5007
-CONFIG_STORE_PORT = 6007
-META_METRICS_PORT = 8007
-
-METASERVICE_CONFIG = {
-    "meta_service_url": f"tcp://127.0.0.1:{META_SERVICE_PORT}",
-    "config_store_url": f"tcp://127.0.0.1:{CONFIG_STORE_PORT}",
-    "metrics_url": f"http://127.0.0.1:{META_METRICS_PORT}",
-}
+# Endpoints use the prefill pod's real IP (POD_IP) so a multi-pod prefill
+# instance can reach the MetaService across nodes.
+METASERVICE_CONFIG = build_meta_service_config()
 
 # Local service config for the npu_memcache L3 backend; it must point at the
 # same MetaService/config-store endpoints as METASERVICE_CONFIG.
@@ -269,8 +266,8 @@ class TestNPUDeepSeekV4Flash0731W8A8PDSEPGPQAHigh(
 
     model_config = DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_MODEL_CONFIG
     # Start the npu_memcache MetaService on the prefill node before the model
-    # server, as required by the L3 cache backend. Its ports are derived from
-    # the pod's visible devices (see METASERVICE_CONFIG above).
+    # server, as required by the L3 cache backend. Its endpoints use this
+    # pod's real IP (see build_meta_service_config above).
     meta_service_config = METASERVICE_CONFIG
     # (reference: Flash W8A8 GPQA Diamond baseline is 0.874).
     accuracy = 0.874
