@@ -281,7 +281,7 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
             disaggregation_mode=DisaggregationMode.DECODE,
             disagg_decode_transfer_queue=queue,
             disagg_decode_prealloc_queue=SimpleNamespace(
-                queue=[], pre_allocated_token_counts=lambda: (0, 0)
+                queue=[], pre_allocated_token_counts=lambda windows: (0, {})
             ),
             running_batch=SimpleNamespace(reqs=[]),
             request_lists=lambda: {kind: [] for kind in ListKind},
@@ -292,7 +292,8 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
                 get_pool_stats=lambda: SimpleNamespace(
                     update_scheduler_stats=lambda stats: None,
                     full_capacity=1,
-                    is_hybrid_swa=False,
+                    windows=(),
+                    target_window_stats=lambda: None,
                 ),
                 streaming_session_count=lambda: 0,
                 session_held_tokens=lambda: 0,
@@ -363,7 +364,7 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
                 queue=[],
                 retracted_queue=[],
                 num_tokens_pre_allocated=0,
-                pre_allocated_token_counts=lambda: (0, 0),
+                pre_allocated_token_counts=lambda windows: (0, {}),
             ),
             running_batch=batch,
             waiting_queue=[],
@@ -376,7 +377,8 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
                     get_decode_usage_msg_parts=lambda: [],
                     update_scheduler_stats=lambda stats: None,
                     full_capacity=1,
-                    is_hybrid_swa=False,
+                    windows=(),
+                    target_window_stats=lambda: None,
                 ),
                 streaming_session_count=lambda: 0,
                 session_held_tokens=lambda: 0,

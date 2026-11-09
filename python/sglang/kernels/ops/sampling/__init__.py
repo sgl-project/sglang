@@ -108,9 +108,26 @@ def softmax(
 def argmax(logits: torch.Tensor) -> torch.Tensor:
     """Row-wise int64 argmax of ``[rows, vocab]``; a value tie takes the lowest index.
 
-    The JIT kernel never picks a NaN, while the torch fallback (unaligned rows) does.
+    The CUDA JIT kernel never picks a NaN; the NPU kernel and torch fallback
+    preserve torch.argmax's NaN selection.
     """
     import torch
+
+    if logits.is_cuda and PlatformInfo.detect().device_type == "npu":
+        if (
+            logits.dim() == 2
+            and logits.dtype == torch.float32
+            and logits.stride(1) == 1
+            and (
+                logits.shape[0] <= 64
+                or (logits.shape[0] <= 384 and logits.shape[1] >= 65536)
+            )
+            and logits.shape[1] >= 4096
+        ):
+            from sgl_kernel_npu.operators.sample import row_argmax
+
+            return row_argmax(logits)
+        return torch.argmax(logits, dim=-1)
 
     from sglang.kernels.ops.sampling import argmax_jit
 

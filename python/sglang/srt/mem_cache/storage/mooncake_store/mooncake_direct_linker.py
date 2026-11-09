@@ -8,6 +8,7 @@ from concurrent.futures import Future, ThreadPoolExecutor, wait
 from copy import deepcopy
 from queue import Empty, Queue
 
+import numpy as np
 import torch
 
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -355,11 +356,11 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 if prefetch and not completion.set_running_or_notify_cancel():
                     continue
                 try:
-                    ready.synchronize()
                     if prefetch:
+                        ready.synchronize()
                         completion.set_result(self.load_all_layers(pending))
                     else:
-                        self.load_layer_wise(completion, list(pending.values()))
+                        self.load_layer_wise(completion, list(pending.values()), ready)
                 except BaseException as error:
                     if prefetch:
                         completion.set_result(False)
@@ -373,32 +374,46 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 self.load_queue.task_done()
 
     def load_layer_wise(
-        self, counter_index: int, request_transfers: list[list[PoolTransfer]]
+        self,
+        counter_index: int,
+        request_transfers: list[list[PoolTransfer]],
+        ready_event=None,
     ) -> None:
-        started = []
+        session_keys = []
         futures: list[list[Future]] = []
         try:
             batches: dict[PoolName, tuple[list[str], list[int]]] = {}
             for transfers in request_transfers:
                 for transfer in transfers:
-                    keys, locations = batches.setdefault(transfer.name, ([], []))
+                    keys, _ = batches.setdefault(transfer.name, ([], []))
                     component_keys, _ = self.storage._get_hybrid_page_component_keys(
                         list(transfer.keys), transfer
                     )
                     keys.extend(self.storage._tag_keys(component_keys))
-                    locations.extend(
+            # Wait before opening sessions so the slot fence does not consume
+            # their leases. Key preparation above still overlaps the GPU work.
+            if ready_event is not None:
+                ready_event.synchronize()
+            # Track every submitted key: a failed batch can still open some sessions.
+            session_keys = [key for keys, _ in batches.values() for key in keys]
+            if session_keys:
+                result = self.storage.store.batch_get_session_start(session_keys)
+                if list(result) != [0] * len(session_keys):
+                    raise RuntimeError(
+                        f"Mooncake get session start failed: keys={len(session_keys)}, "
+                        f"results={result}"
+                    )
+            for transfers in request_transfers:
+                for transfer in transfers:
+                    batches[transfer.name][1].extend(
                         self.pools[transfer.name].prepare_locations(
                             transfer.host_indices
                         )
                     )
-            for keys, _ in batches.values():
-                result = self.storage.store.batch_get_session_start(keys)
-                if list(result) != [0] * len(keys):
-                    raise RuntimeError(
-                        f"Mooncake get session start failed: keys={len(keys)}, "
-                        f"results={result}"
-                    )
-                started.append(keys)
+            batches = {
+                name: (keys, np.asarray(locations, dtype=np.int64))
+                for name, (keys, locations) in batches.items()
+            }
 
             groups = [
                 range(start, min(start + self.load_layer_group, self.num_layers))
@@ -426,9 +441,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             self.layer_done_counter.fail(counter_index, error)
             logger.exception("Mooncake layer-wise load batch failed")
         finally:
-            for keys in started:
+            if session_keys:
                 try:
-                    self.storage.store.batch_get_session_end(keys)
+                    self.storage.store.batch_get_session_end(session_keys)
                 except BaseException as error:
                     self.layer_done_counter.fail(counter_index, error)
                     logger.exception("Mooncake layer-wise load session cleanup failed")
@@ -440,7 +455,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             if meta is None:
                 continue
             if merged is None:
-                merged = meta
+                # Pool metadata may share read-only size/offset rows.
+                # Grouping extends each row, so give it independent ownership.
+                merged = tuple([list(row) for row in rows] for rows in meta)
                 continue
             for merged_rows, rows in zip(merged, meta):
                 for merged_row, row in zip(merged_rows, rows):

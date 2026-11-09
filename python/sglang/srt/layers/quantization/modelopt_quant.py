@@ -2506,7 +2506,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         weight_loader = self.prepare_weight_loader(
             layer, extra_weight_attrs.get("weight_loader")
         )
-        if get_moe_runner_backend().is_flashinfer_megamoe():
+        moe_runner_backend = get_moe_runner_backend()
+        if moe_runner_backend.is_flashinfer_megamoe():
             from sglang.srt.layers.moe.flashinfer_megamoe import (
                 make_nvfp4_megamoe_weight_loader,
             )
@@ -2557,13 +2558,16 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w13_weight_scale", w13_weight_scale)
 
-        # TRTLLM replaces blockscale_swizzled with an alias to weight_scale
-        # during process_weights_after_loading, so skip the expensive
-        # swizzle+allocate here to avoid GPU memory fragmentation
-        if (
+        # AUTO is resolved later in create_moe_runner(); process_weights_after_loading()
+        # rebinds the swizzled scales for every backend that reads them.
+        skip_swizzled_blockscales = (
             self.enable_flashinfer_trtllm_moe
-            or get_moe_runner_backend().is_flashinfer_megamoe()
-        ):
+            or moe_runner_backend.is_flashinfer_megamoe()
+            or moe_runner_backend.is_marlin()
+            or moe_runner_backend.is_lora_marlin()
+            or moe_runner_backend.is_auto()
+        )
+        if skip_swizzled_blockscales:
             layer.w13_blockscale_swizzled = None
         else:
             layer.w13_blockscale_swizzled = Parameter(
@@ -2583,10 +2587,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w2_weight_scale", w2_weight_scale)
 
-        if (
-            self.enable_flashinfer_trtllm_moe
-            or get_moe_runner_backend().is_flashinfer_megamoe()
-        ):
+        if skip_swizzled_blockscales:
             layer.w2_blockscale_swizzled = None
         else:
             layer.w2_blockscale_swizzled = Parameter(

@@ -1289,17 +1289,20 @@ class MiniMaxH3Attention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.out_proj",
         )
-        # VSA compression gate; stays bf16 and unquantized (zero gate == pure sparse).
+        # VSA compression gate; bf16 and unquantized (zero gate == pure sparse),
+        # unless a serialized checkpoint quantized it (FastVideo's Comfy INT8 file).
         self.to_gate_compress: ColumnParallelLinear | None = None
         if arch.has_gate_compress and prefix.startswith("blocks."):
+            gate_prefix = f"{prefix}.to_gate_compress"
+            markers = getattr(quant_config, "layer_markers", None) or {}
             self.to_gate_compress = ColumnParallelLinear(
                 arch.hidden_size,
                 self.inner_dim,
                 bias=False,
                 gather_output=False,
                 params_dtype=_BF16_DTYPE,
-                quant_config=None,
-                prefix=f"{prefix}.to_gate_compress",
+                quant_config=quant_config if gate_prefix in markers else None,
+                prefix=gate_prefix,
             )
         # VDN-H3: None for the dense model and for the token refiner
         self.hybrid = MiniMaxH3VDNHybridAttention.build(

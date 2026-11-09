@@ -1152,6 +1152,23 @@ def test_auto_allocation(out_dtype, column_major_scales, scale_ue8m0):
     assert torch.equal(_as_int32(s_auto), _as_int32(s_buf)), "scales differ"
 
 
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability()[0] >= 10,
+    reason="SM100+ uses the tanh-form SiLU (as the AOT op), which flushes this group to 0",
+)
+def test_fused_silu_tiny_group():
+    """A group whose SiLU values are all tiny (gate=-20) keeps nonzero codes."""
+    x = torch.empty(1, 2 * G, device="cuda", dtype=torch.bfloat16)
+    x[:, :G] = -20.0
+    x[:, G:] = 32.0
+    x_q, x_s = per_token_group_quant(x, group_size=G, fuse_silu_and_mul=True)
+    torch.cuda.synchronize()
+    ref = (torch.nn.functional.silu(x[:, :G].float()) * x[:, G:].float()).flatten()
+    assert bool((x_q.view(torch.uint8) != 0).all()), "tiny SiLU group flushed to zero"
+    deq = x_q.float().flatten() * x_s.float().flatten()[0]
+    torch.testing.assert_close(deq, ref, rtol=0.13, atol=0.0)
+
+
 if __name__ == "__main__":
     import sys
 

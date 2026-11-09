@@ -55,6 +55,9 @@ class HybridAttnBackend(AttentionBackend):
             prefill_backend, "extend_dummy_seqs_capped_by_req_pool", False
         )
 
+    def window_capacity_children(self) -> list:
+        return [self.prefill_backend, self.decode_backend]
+
     @property
     def supports_ragged_verify_graph(self) -> bool:
         # Ragged verify is TARGET_VERIFY-only; delegate to its executor.

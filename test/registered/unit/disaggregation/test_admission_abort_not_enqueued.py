@@ -243,7 +243,9 @@ class TestAdmissionAbortNotEnqueued(CustomTestCase):
         sched = _make_scheduler()
         q = _decode_queue(sched)
         q.token_to_kv_pool_allocator.prealloc_ceiling_fits.return_value = False
-        q._prealloc_required_tokens = MagicMock(return_value=(1 << 30, 1 << 30))
+        q._prealloc_required = MagicMock(return_value=(1 << 30, {}))
+        q._prealloc_demand = MagicMock()
+        q._state_slots = MagicMock(return_value=0)
         q._uses_swa_tail_prealloc = MagicMock(return_value=False)
         q._check_if_req_exceed_kv_capacity = MethodType(
             DecodePreallocQueue._check_if_req_exceed_kv_capacity, q

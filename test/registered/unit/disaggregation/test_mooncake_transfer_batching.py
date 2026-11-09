@@ -550,6 +550,8 @@ class TestMooncakeEarlySend(CustomTestCase):
             check_status=lambda room: KVPoll.WaitingForInput,
             transfer_infos={1: {"127.0.0.1:80": object()}},
             transfer_queues=[queue],
+            send_record=MagicMock(),
+            note_send_enqueued=MagicMock(),
         )
         indices_ready = MagicMock()
         MooncakeKVManager.add_transfer_request(
@@ -611,6 +613,7 @@ class TestMooncakeEarlySend(CustomTestCase):
             _maybe_ack_drained_abort=MagicMock(),
             validate_aux_buffers=MagicMock(),
             bootstrap_port=8998,
+            note_send_finished=MagicMock(),
         )
         manager.check_status = lambda room: manager.request_status[room]
         return manager, queue

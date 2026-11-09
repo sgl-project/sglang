@@ -200,7 +200,7 @@ class TestNPUScatterPaKVCache(unittest.TestCase):
 
         pool.set_kv_buffer(
             layer,
-            KVWriteLoc(loc, swa_loc),
+            KVWriteLoc(loc, window_locs={SWAKVPool.WINDOW_SUB_POOL: swa_loc}),
             cache_k,
             cache_v,
         )

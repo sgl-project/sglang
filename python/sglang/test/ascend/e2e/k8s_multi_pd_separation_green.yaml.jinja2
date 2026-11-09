@@ -80,7 +80,13 @@ spec:
         - name: share
           mountPath: /root/sglang
           subPath: {{ sglang_source_relative_path }}
+        - name: shm-volume
+          mountPath: /dev/shm
       volumes:
+      - name: shm-volume
+        emptyDir:
+          medium: Memory
+          sizeLimit: "16Gi"
       - name: share
         hostPath:
           path: /home
@@ -184,7 +190,13 @@ spec:
         - name: share
           mountPath: /root/sglang
           subPath: {{ sglang_source_relative_path }}
+        - name: shm-volume
+          mountPath: /dev/shm
       volumes:
+      - name: shm-volume
+        emptyDir:
+          medium: Memory
+          sizeLimit: "16Gi"
       - name: share
         hostPath:
           path: /home
@@ -286,7 +298,13 @@ spec:
         - name: share
           mountPath: /root/sglang
           subPath: {{ sglang_source_relative_path }}
+        - name: shm-volume
+          mountPath: /dev/shm
       volumes:
+      - name: shm-volume
+        emptyDir:
+          medium: Memory
+          sizeLimit: "16Gi"
       - name: share
         hostPath:
           path: /home

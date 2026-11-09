@@ -22,6 +22,7 @@ from sglang.srt.managers.scheduler_components.invariant_checker import (
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     PoolStats,
     SchedulerPoolStatsObserver,
+    WindowPoolStats,
     kv_private_window_tokens,
 )
 from sglang.srt.managers.scheduler_components.request_list import ListKind
@@ -61,7 +62,21 @@ class TestCheckTreeCacheGate(CustomTestCase):
             full_token_usage=0.0,
             full_available_size=1024,
             full_evictable_size=0,
-            is_hybrid_swa=hybrid_swa,
+            windows=(
+                (
+                    WindowPoolStats(
+                        name="window_128",
+                        sub_pool="window_128",
+                        capacity=1024,
+                        available_size=1024,
+                        evictable_size=0,
+                        num_used=0,
+                        token_usage=0.0,
+                    ),
+                )
+                if hybrid_swa
+                else ()
+            ),
             is_hybrid_ssm=hybrid_ssm,
         )
         return SchedulerInvariantChecker(
@@ -124,6 +139,55 @@ class TestCheckTreeCacheGate(CustomTestCase):
             checker.run(CheckPhase.IDLE)
 
             checker.tree_cache.sanity_check.assert_not_called()
+
+
+class TestEveryWindowIsConserved(CustomTestCase):
+    def test_a_further_window_leak_is_reported_by_its_own_counts(self):
+        """Each window is checked with its own slot's protected, session-held
+        and uncached counts; a leak in a further window is caught."""
+        tree_cache = MagicMock()
+        tree_cache.window_protected_size.side_effect = {
+            "window_128": 16,
+            "window_64": 8,
+        }.__getitem__
+        observer = MagicMock()
+        observer.session_held_window_tokens.side_effect = {
+            "window_128": 0,
+            "window_64": 4,
+        }.__getitem__
+        checker = SchedulerInvariantChecker(
+            disaggregation_mode=DisaggregationMode.NULL,
+            page_size=1,
+            tree_cache=tree_cache,
+            token_to_kv_pool_allocator=MagicMock(),
+            req_to_token_pool=MagicMock(),
+            pool_stats_observer=observer,
+            scheduler_stage_metrics=None,
+        )
+
+        def window(name, available):
+            return WindowPoolStats(
+                name=name,
+                sub_pool=name,
+                capacity=128,
+                available_size=available,
+                evictable_size=100,
+                num_used=0,
+                token_usage=0.0,
+            )
+
+        with patch(
+            "sglang.srt.managers.scheduler_components.invariant_checker.is_swa_req_ring",
+            return_value=False,
+        ):
+            leak, msg = checker._check_window_pool(window("window_128", 12))
+            self.assertFalse(leak, msg)
+            leak, msg = checker._check_window_pool(window("window_64", 16), uncached=0)
+            self.assertFalse(leak, msg)
+            # One token of the further window is owned by nobody.
+            leak, msg = checker._check_window_pool(window("window_64", 15))
+            self.assertTrue(leak)
+            self.assertIn("[window_64]", msg)
 
 
 class TestPrivateSwaTokens(CustomTestCase):
@@ -313,9 +377,7 @@ class TestShardedFullPoolInvariant(CustomTestCase):
         checker = self._make_checker()
         self._active_partial_page(checker)
         self._allocate(self.PAGE_SIZE)  # Leak in addition to the active tail.
-        self.assertEqual(
-            checker._get_total_uncached_sizes(has_window=False), (self.PAGE_SIZE, 0)
-        )
+        self.assertEqual(checker._get_total_uncached_sizes(), (self.PAGE_SIZE, {}))
         with (
             envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(1),
             self.assertRaisesRegex(StateCheckError, "Full Pool Mem Leak Detected"),
@@ -333,10 +395,8 @@ class TestShardedFullPoolInvariant(CustomTestCase):
                 if parked:
                     self.last_batch = SimpleNamespace(reqs=[], is_empty=lambda: True)
                     self.running_batch = self.last_batch
-                uncached, swa_uncached = checker._get_total_uncached_sizes(
-                    has_window=False
-                )
-                self.assertEqual((uncached, swa_uncached), (self.PAGE_SIZE, 0))
+                uncached, window_uncached = checker._get_total_uncached_sizes()
+                self.assertEqual((uncached, window_uncached), (self.PAGE_SIZE, {}))
                 stats = checker.pool_stats_observer.get_pool_stats()
                 leak, msg = checker._check_full_pool(stats, uncached=uncached)
                 self.assertFalse(leak, msg)
@@ -359,9 +419,7 @@ class TestShardedFullPoolInvariant(CustomTestCase):
                 if parked:
                     self.last_batch = SimpleNamespace(reqs=[], is_empty=lambda: True)
                     self.running_batch = self.last_batch
-                self.assertEqual(
-                    checker._get_total_uncached_sizes(has_window=False), (0, 0)
-                )
+                self.assertEqual(checker._get_total_uncached_sizes(), (0, {}))
                 self.assertEqual(
                     checker.pool_stats_observer.session_held_tokens(), self.PAGE_SIZE
                 )

@@ -658,7 +658,9 @@ class TestCPZigzagStrategy(CustomTestCase):
                 return_value=routed(pool).layer_router,
             ),
         ):
-            strategy.materialize_full_kv(forward_batch, layer, key, value, swa_loc)
+            strategy.materialize_full_kv(
+                forward_batch, layer, key, value, window_locs={"window_8": swa_loc}
+            )
 
         gather.assert_called_once()
         gathered_kv, gathered_forward_batch = gather.call_args.args
@@ -672,7 +674,7 @@ class TestCPZigzagStrategy(CustomTestCase):
         self.assertIs(written_layer, layer)
         self.assertIsInstance(write_loc, KVWriteLoc)
         self.assertIs(write_loc.loc, cache_loc)
-        self.assertTrue(torch.equal(write_loc.swa_loc, swa_loc[:3]))
+        self.assertTrue(torch.equal(write_loc.window_locs["window_8"], swa_loc[:3]))
         self.assertTrue(written_key.is_contiguous())
         self.assertTrue(written_value.is_contiguous())
         self.assertTrue(torch.equal(written_key, key))

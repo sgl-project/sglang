@@ -413,6 +413,10 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             (swa_capacity, self.swa_available_size()),
         )
 
+    def owner_available_size(self):
+        """What the token pool can serve now: its full-attention side."""
+        return self.full_available_size()
+
     def full_available_size(self):
         return min(
             self.logical_attn_allocator.full_available_size(),
@@ -425,13 +429,9 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def window_pool_names(self):
         return self.logical_attn_allocator.window_pool_names()
 
-    def reclaim_for_prealloc(
-        self, tree_cache, full_tokens: int, swa_tokens: int
-    ) -> str | None:
+    def reclaim_for_prealloc(self, tree_cache, demand) -> str | None:
         # C4 needs no reclaim here: full_available_size prices it into the budget.
-        return self.logical_attn_allocator.reclaim_for_prealloc(
-            tree_cache, full_tokens, swa_tokens
-        )
+        return self.logical_attn_allocator.reclaim_for_prealloc(tree_cache, demand)
 
     def free_swa(self, free_indices: torch.Tensor):
         self.logical_attn_allocator.free_swa(free_indices)
