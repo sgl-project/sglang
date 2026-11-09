@@ -733,10 +733,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         # v2 here only registers additional hybrid pools.
         if host_pool_name == PoolName.KV:
             return
-        # Draft pools fall through to the generic path below: their MLA/MHA
-        # layout is independent from the target (a bf16 draft can sit on an
-        # FP8 DSA target), so every physical buffer must be registered instead
-        # of assuming a single target-shaped ``kv_buffer``.
+        if host_pool_name == PoolName.DRAFT:
+            self.registered_pools[host_pool_name] = host_pool
+            super().register_buffer(host_pool.kv_buffer)
+            return
 
         # Keep a name->pool mapping so batch v2 can resolve PoolTransfer.name to
         # the corresponding host pool implementation at runtime.
