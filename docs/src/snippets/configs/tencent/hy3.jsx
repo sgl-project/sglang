@@ -13,7 +13,7 @@
 export const config = {
   modelName: "Hy3",
 
-  supportedHardware: ["h200", "b200", "b300", "gb200", "gb300"],
+  supportedHardware: ["h200", "b200", "b300", "gb200", "gb300", "a3"],
 
   variants: [
     { id: "default", label: "Default" },
@@ -37,6 +37,8 @@ export const config = {
   },
 
   placeholders: {
+    DATASET_PATH: { target: "command", label: "Local ShareGPT dataset (Ascend)", default: "/datasets/ShareGPT/ShareGPT_V3_unfiltered_cleaned_split.json" },
+    MODEL_PATH: { target: "command", label: "Local Hy3 directory (Ascend)", default: "/models/Hy3" },
     HOST_IP:   { target: "command", label: "Bind host",        default: "0.0.0.0"        },
     PORT:      { target: "command", label: "Bind port",        default: "30000"          },
     NODE0_IP:  { target: "command", label: "Head node IP",     default: "<node0-ip>"      },
@@ -46,7 +48,11 @@ export const config = {
     CURL_PORT: { target: "curl",    label: "Server port",       default: "30000"           },
   },
 
-  curl: `curl http://{{CURL_HOST}}:{{CURL_PORT}}/v1/chat/completions \\
+  curl: (sel) => sel.hw === "a3"
+    ? `curl http://{{CURL_HOST}}:{{CURL_PORT}}/v1/chat/completions \\
+-H 'Content-Type: application/json' \\
+-d '{ "model": "{{MODEL_NAME}}", "messages": [{"role":"user","content":"What is the capital of France?"}], "max_tokens": 128, "temperature": 0, "top_p": 1.0, "chat_template_kwargs": {"reasoning_effort":"no_think"} }'`
+    : `curl http://{{CURL_HOST}}:{{CURL_PORT}}/v1/chat/completions \\
 -H 'Content-Type: application/json' \\
 -d '{ "model": "{{MODEL_NAME}}", "messages": [{"role":"user","content":"Hello"}] }'`,
 
@@ -78,6 +84,32 @@ sgl-eval run aime26 \\
     numPromptsByConc: { 1: 32, 16: 32, 64: 128, 256: 512, 1024: 2048 },
   },
 
+  benchmarkCommandsByHardware: {
+    a3: {
+      speed: `export SGLANG_USE_CPU_ENGINE=1
+
+python3 -m sglang.benchmark.serving \\
+  --backend sglang-oai-chat \\
+  --host {{CURL_HOST}} --port {{CURL_PORT}} \\
+  --model "{{MODEL_PATH}}" --served-model-name {{MODEL_NAME}} --tokenizer "{{MODEL_PATH}}" \\
+  --dataset-name sharegpt --dataset-path "{{DATASET_PATH}}" \\
+  --num-prompts {{NUM_PROMPTS}} --max-concurrency {{MAX_CONCURRENCY}} \\
+  --seed 42 --warmup-requests 4 --flush-cache \\
+  --extra-request-body '{"chat_template_kwargs":{"reasoning_effort":"no_think"}}' \\
+  --output-file hy3-a3-sharegpt.jsonl`,
+      accuracy: {
+        gsm8k_pct: `evalscope eval \\
+  --model {{MODEL_NAME}} \\
+  --api-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1 --api-key EMPTY \\
+  --eval-type openai_api --datasets gsm8k \\
+  --dataset-args '{"gsm8k":{"few_shot_num":1,"few_shot_random":false}}' \\
+  --generation-config '{"temperature":0,"max_tokens":4096,"extra_body":{"chat_template_kwargs":{"reasoning_effort":"no_think"}}}' \\
+  --eval-batch-size 16 --seed 42 --timeout 600`,
+      },
+      numPromptsByConc: { 16: 128 },
+    },
+  },
+
   accuracyLabels: [
     ["gsm8k_pct", "GSM8K (1-shot)", "%"],
     ["aime26_pct", "AIME26",         "%"],
@@ -100,7 +132,16 @@ sgl-eval run aime26 \\
     b300:  "lmsysorg/sglang:dev",
     gb200: "lmsysorg/sglang:dev",
     gb300: "lmsysorg/sglang:dev",
+    a3: "quay.io/ascend/sglang:cann9.0.0-a3-v0.5.16",
   },
+
+  dockerShmSize: "64g",
+  dockerHostNetworkWhen: (sel) => sel.hw === "a3",
+  dockerMounts: (sel) => sel.hw === "a3"
+    ? ['"{{MODEL_PATH}}:{{MODEL_PATH}}:ro"'] : [],
+  dockerRunCommand: (sel) => sel.hw === "a3"
+    ? "bash -lc 'source /usr/local/Ascend/ascend-toolkit/set_env.sh && source /usr/local/Ascend/nnal/atb/set_env.sh && exec sglang serve \"$@\"' --"
+    : "sglang serve",
 
   github: {
     cookbookModel: "tencent/Hy3",
@@ -117,22 +158,22 @@ sgl-eval run aime26 \\
       knobs: [
         { id: "tp", label: "TP", values: [
           null,
-          1,
-          2,
-          4,
-          8,
-          { value: 16, disable: { nodes: ["single"] },
+          { value: 1, disable: { hw: ["a3"] }, disableReason: "The A3 BF16 recipe uses tensor parallelism across 16 devices." },
+          { value: 2, disable: { hw: ["a3"] }, disableReason: "The A3 BF16 recipe uses tensor parallelism across 16 devices." },
+          { value: 4, disable: { hw: ["a3"] }, disableReason: "The A3 BF16 recipe uses tensor parallelism across 16 devices." },
+          { value: 8, disable: { hw: ["a3"] }, disableReason: "The A3 BF16 recipe uses tensor parallelism across 16 devices." },
+          { value: 16, disable: { hw: ["h200", "b200", "b300", "gb200", "gb300"], nodes: ["single"] },
             disableReason: "TP=16 requires 16 ranks — switch the Deploy panel's Nodes to Multi-Nodes first." },
         ]},
         { id: "dpAttn", label: "DP-Attention",
           values: [
             null,
             false,
-            1,
-            2,
-            4,
-            8,
-            { value: 16, disable: { nodes: ["single"] },
+            { value: 1, hide: { hw: ["a3"] } },
+            { value: 2, hide: { hw: ["a3"] } },
+            { value: 4, hide: { hw: ["a3"] } },
+            { value: 8, hide: { hw: ["a3"] } },
+            { value: 16, hide: { hw: ["a3"] }, disable: { nodes: ["single"] },
               disableReason: "DP-Attention=16 requires 16 ranks — switch the Deploy panel's Nodes to Multi-Nodes first." },
           ],
           labels: { "auto": "Auto", "false": "Off" } },
@@ -141,6 +182,7 @@ sgl-eval run aime26 \\
 
     // ----- Card 2: "MoE Parallelism" -----
     moe: {
+      showWhen: (base) => base.hw !== "a3",
       backend: {
         options: [
           { id: null,                label: "Inherited" },
@@ -172,6 +214,7 @@ sgl-eval run aime26 \\
 
     // ----- Card 4: "Speculative Decoding" -----
     speculative: {
+      showWhen: (base) => base.hw !== "a3",
       options: [
         { id: "current",    label: "Inherited from base" },
         { id: "off",        label: "Off (greedy)" },
@@ -192,6 +235,7 @@ sgl-eval run aime26 \\
 
     // ----- Card 5: "PD Disaggregation" -----
     pdDisagg: {
+      showWhen: (base) => base.hw !== "a3",
       modes: [
         { id: "off",     label: "Off" },
         { id: "prefill", label: "Prefill role" },
@@ -223,6 +267,7 @@ sgl-eval run aime26 \\
 
     // ----- Card 6: "Hierarchical KV Cache" -----
     hicache: {
+      excludesHw: ["a3"],
       backends: [
         { id: "null_placeholder", label: "Auto" },
         { id: "file",      label: "File" },
@@ -240,6 +285,44 @@ sgl-eval run aime26 \\
   },
 
   cells: [
+    {
+      match: { hw: "a3", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" },
+      verified: true,
+      warn: "One Atlas 800I A3 server: 8 cards, 16 devices, 64 GB per device. Set MODEL_PATH to your local Hy3 directory. See [Ascend setup](#ascend-setup).",
+      env: [
+        "SGLANG_SET_CPU_AFFINITY=1",
+        "ASCEND_USE_FIA=1",
+        "STREAMS_PER_DEVICE=32",
+        "HCCL_BUFFSIZE=3000",
+        "HCCL_OP_EXPANSION_MODE=AIV",
+        "HCCL_SOCKET_IFNAME=lo",
+        "GLOO_SOCKET_IFNAME=lo",
+        "SGLANG_ENABLE_SPEC_V2=1",
+        "SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1",
+        "DEEP_NORMAL_MODE_USE_INT8_QUANT=1",
+      ],
+      flags: [
+        '--model-path "{{MODEL_PATH}}"',
+        '--served-model-name "{{MODEL_NAME}}"',
+        "--attention-backend ascend",
+        "--reasoning-parser auto",
+        "--tool-call-parser auto",
+        "--device npu",
+        "--tp-size 16",
+        "--mem-fraction-static 0.84",
+        "--dtype bfloat16",
+        "--base-gpu-id 0",
+        "--prefill-max-requests 40",
+        "--max-running-requests 40",
+        "--cuda-graph-bs 4 8 16 20 24 28 32 36 40",
+        "--speculative-algorithm EAGLE",
+        "--speculative-num-steps 2",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 3",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
     // ====================================================================
     // H200 (141GB) — TP=8 for BF16 (~590GB)
     // ====================================================================
