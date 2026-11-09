@@ -576,6 +576,7 @@ class TestPPMambaPoolSizing(CustomTestCase):
             mambaish_config=SimpleNamespace(mamba2_cache_params=params),
             extra_mamba_cache_bytes_per_req=0,
             extra_mamba_cache_bytes_per_request_row=0,
+            _req_pool_pre_alloc_size=lambda: 0,
             fused_entry_bytes=lambda name: (
                 fused_state_entry if name == "mamba" else None
             ),
@@ -708,31 +709,46 @@ class TestExtraMambaCacheSizing(CustomTestCase):
                         )
 
     def test_speculative_auto_capacity_keeps_scratch_separate(self):
-        self.assertEqual(self._size(0, draft_tokens=2), (3, 88 << 20))
-        self.assertEqual(self._size(4 << 20, draft_tokens=2), (2, 80 << 20))
+        # The fixture mock returns 3 pre-allocation rows, so the intermediate
+        # reserve spans (capped_reqs + 3 + 1) rows. K=3 from the joint solve
+        # (40 MiB budget, 4 MiB per req, D=2, ratio=2 -- solve unchanged);
+        # 120 - 4*(1+3+1)*2 - 4*(3+1) = 120 - 40 - 16 = 64 MiB.
+        self.assertEqual(self._size(0, draft_tokens=2), (3, 64 << 20))
+        # 4 MiB extra per slot: K=2, 120 - 4*(1+3+1)*2 - (4+4)*(2+1)
+        # = 120 - 40 - 24 = 56 MiB.
+        self.assertEqual(self._size(4 << 20, draft_tokens=2), (2, 56 << 20))
 
     def test_pd_prefill_does_not_reserve_speculative_scratch(self):
         """A PD prefill server's hybrid req pool never allocates the per-draft-token
         verify snapshots, so none of the three capacity branches may charge them."""
         prefill = dict(disaggregation_mode="prefill")
-        # Fixed capacity: 8 slots, ratio 2 -> 4 capped reqs; the (4 + 1) * 2 * 4 MiB
-        # scratch is only charged outside PD prefill.
+        # Fixed capacity: 8 slots, ratio 2 -> 4 capped reqs; the mock's 3
+        # pre-allocation rows are charged, so the scratch is
+        # (4 + 3 + 1) * 2 * 4 MiB = 64 MiB; 120 - 64 - (8+1)*4 = 20 MiB.
+        # The scratch is only charged outside PD prefill.
         self.assertEqual(
-            self._size(0, draft_tokens=2, max_mamba_cache_size=8), (8, 44 << 20)
+            self._size(0, draft_tokens=2, max_mamba_cache_size=8), (8, 20 << 20)
         )
         self.assertEqual(
             self._size(0, draft_tokens=2, max_mamba_cache_size=8, **prefill),
             (8, 84 << 20),
         )
         # Capacity from max_running_requests with the radix cache disabled.
+        # The branch solves K to 8, so the scratch spans (8 + 3 + 1) rows:
+        # 120 - 4*(8+3+1)*2 - (8+1)*4 = 120 - 96 - 36 = -12 MiB (the synthetic
+        # fixture just pins the arithmetic; a real launch would refuse).
         fixed = dict(disable_radix_cache=True, max_running_requests=8)
-        self.assertEqual(self._size(0, draft_tokens=2, **fixed), (8, 12 << 20))
+        self.assertEqual(self._size(0, draft_tokens=2, **fixed), (8, -12 << 20))
         self.assertEqual(
             self._size(0, draft_tokens=2, **fixed, **prefill), (8, 84 << 20)
         )
         # Auto capacity sizes like a non-speculative server.
         self.assertEqual(self._size(0, draft_tokens=2, **prefill), self._size(0))
-        # Prefill pools that still allocate the snapshots keep the reserve.
+        # Prefill pools that still allocate the snapshots keep the reserve,
+        # including the mock's 3 pre-allocation rows:
+        # 120 - 4*(4+3+1)*2 - (8+1)*4 = 120 - 64 - 36 = 20 MiB. Under
+        # role-switch the decode-shape raise adds (4+3)*1 rows, below the
+        # explicit K of 8, so main slots stay charged at 8.
         for allocates in (
             dict(enable_pd_role_switch=True),
             dict(enable_unified_memory=True),
@@ -746,7 +762,7 @@ class TestExtraMambaCacheSizing(CustomTestCase):
                         **prefill,
                         **allocates,
                     ),
-                    (8, 44 << 20),
+                    (8, 20 << 20),
                 )
 
 
