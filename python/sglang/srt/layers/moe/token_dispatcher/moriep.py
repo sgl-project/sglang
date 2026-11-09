@@ -118,6 +118,45 @@ def mori_recv_bound(
     return sum(sender_rows)
 
 
+# Op instances that already logged their first segmented dispatch / fallback.
+_segmented_logged: set[int] = set()
+_segmented_fallback_logged: set[int] = set()
+
+# Most rows a segmented dispatch may hand the MoE, relative to the rows it really
+# carries: the stride is the largest rank's rows, so uneven ranks pad the others.
+# Arbitrary first cut from the gapmoe microbenchmark (handoff
+# 2026-11-04-epv2-gapped-moe-bench): ~1.06x cost nothing and 2x lost the whole
+# gain at 8192 rows per source; re-tune with an uneven sweep.
+SEGMENTED_MAX_ROW_INFLATION = 1.25
+
+
+def segmented_rows_per_rank(sender_rows: Optional[tuple[int, ...]]) -> int:
+    """The most MoE rows any rank dispatches, from the gathered per-DP-rank rows
+    (each split over its attention TP ranks), or 0 when they cannot tell."""
+    parallel = get_parallel()
+    if (
+        parallel.attn_dp_size <= 1
+        or parallel.tp_size != parallel.moe_ep_size
+        or parallel.attn_cp_size != 1
+    ):
+        return 0
+    if (
+        sender_rows is None
+        or len(sender_rows) != parallel.attn_dp_size
+        or any(rows < 0 for rows in sender_rows)
+    ):
+        return 0
+    return -(-max(sender_rows) // parallel.attn_tp_size)
+
+
+def segmented_rows_fit(*, stride: int, ep_size: int, total_rows: int) -> bool:
+    """Whether a segmented dispatch's ep_size * stride MoE rows stay within
+    SEGMENTED_MAX_ROW_INFLATION of the total_rows every rank sends."""
+    return (
+        0 < total_rows and ep_size * stride <= SEGMENTED_MAX_ROW_INFLATION * total_rows
+    )
+
+
 def _max_dispatch_tokens_per_rank() -> int:
     return mori_max_dispatch_tokens_per_rank(get_server_args())
 
@@ -714,6 +753,15 @@ def init_mori_epv2_op(
         cfg_fields = EpDispatchCombineConfig.__dataclass_fields__
         if async_ll_transport == "sdma" and "async_ll_own_sdma_queue" in cfg_fields:
             cfg_kwargs.update(async_ll_own_sdma_queue=True)
+        # The segmented receive layout needs no switch: "auto" lets
+        # MORI build it only where this op's config supports it. fp8/fp4 dispatch
+        # can be dequantized before the MoE; kept to the measured dtypes.
+        if (
+            async_ll_transport == "sdma"
+            and "async_ll_recv_layout" in cfg_fields
+            and dispatch_dtype in (DispatchDtype.bf16, DispatchDtype.mxfp8)
+        ):
+            cfg_kwargs.update(async_ll_recv_layout="auto")
     cfg = EpDispatchCombineConfig(
         **cfg_kwargs,
         # Only the hip backend has the AsyncLL kernels; gfx950 defaults to flydsl,
@@ -739,7 +787,9 @@ def init_mori_epv2_op(
                 "set SGLANG_MORI_EP_V2=false to use EPv1"
             )
         # The launch config is tuned for the intranode kernels; let MORI's
-        # internode tables pick the geometry.
+        # internode tables pick the geometry. The segmented layout is single-node
+        # only.
+        cfg_kwargs.pop("async_ll_recv_layout", None)
         cfg = EpDispatchCombineConfig(
             **cfg_kwargs, gpu_per_node=lsa_size, kernel_backend="hip"
         )
@@ -763,6 +813,7 @@ def init_mori_epv2_op(
         + (f" async_ll_transport={async_ll_transport}" if async_ll else "")
         + (
             f" own_sdma_queue={cfg_kwargs.get('async_ll_own_sdma_queue', False)}"
+            f" recv_layout={getattr(op.cfg, 'async_ll_recv_layout', 'compact')}"
             if async_ll
             else ""
         )
@@ -1486,6 +1537,9 @@ class _MoriEPv2DispatcherImplBase(_MoriEPDispatcherImplBase):
             self._tbo_enabled and not self._uses_async_ll
         )
         self._mori_op = None
+        # Stride of an AsyncLL segmented dispatch in flight, 0 for MORI's compact
+        # receive; see _MoriEPv2DispatcherImplAsyncLL._segmented_stride.
+        self._segment_stride = 0
         self.fp8_quant_func = None
         self.fp4_quant_func = None
         self.mxfp8_quant_func = None
@@ -1813,12 +1867,70 @@ class _MoriEPv2DispatcherImplAsyncLL(_MoriEPv2DispatcherImplBase):
         # The returned views are valid only after dispatch_recv; the inputs stay
         # alive in `state` until then.
         hidden_states, topk_weights, topk_ids, scale = state[:4]
+        self._segment_stride = self._segmented_stride()
+        # Passed only when set, so MORI builds without the segmented layout keep
+        # working.
+        seg = {"segment_stride": self._segment_stride} if self._segment_stride else {}
         self._pending_dispatch = self.mori_op.dispatch_send(
-            hidden_states, topk_weights, scale, topk_ids, return_routing=True
+            hidden_states, topk_weights, scale, topk_ids, return_routing=True, **seg
         )
         if not self._overlap:
             self.mori_op.dispatch_recv()
         return state
+
+    def _segmented_stride(self) -> int:
+        """Per-source rows of a segmented dispatch, or 0 for MORI's compact receive.
+
+        Every input is identical on all ranks (gathered DP rows, the batch-wide
+        extend flag, graph capture), as MORI needs: a rank that picked another
+        stride would read its peers' rows at the wrong offsets.
+        """
+        cfg = self.mori_op.cfg
+        if not getattr(cfg, "async_ll_segmented", False):
+            return 0
+        if torch.cuda.is_current_stream_capturing() or not get_is_extend_in_batch():
+            return 0
+        rows_per_rank = segmented_rows_per_rank(self._dispatch_sender_rows)
+        if not 0 < rows_per_rank <= cfg.effective_max_recv_per_rank:
+            return 0
+        stride = min(
+            round_logical_recv_rows(rows_per_rank, pow2_buckets=False),
+            cfg.effective_max_recv_per_rank,
+        )
+        total_rows = sum(self._dispatch_sender_rows)
+        ep_size = get_parallel().moe_ep_size
+        if not segmented_rows_fit(
+            stride=stride, ep_size=ep_size, total_rows=total_rows
+        ):
+            if self.instance_id not in _segmented_fallback_logged:
+                _segmented_fallback_logged.add(self.instance_id)
+                logger.info(
+                    f"[MORI EPv2] AsyncLL segmented receive skipped for uneven rows: "
+                    f"instance={self.instance_id} stride={stride} "
+                    f"rows={self._dispatch_sender_rows}"
+                )
+            return 0
+        if self._num_tokens > stride:
+            # Falling back here alone would desynchronize the ranks.
+            raise RuntimeError(
+                f"MORI segmented receive: {self._num_tokens} local MoE rows exceed the "
+                f"stride {stride} derived from the DP rows {self._dispatch_sender_rows}"
+            )
+        if self.instance_id not in _segmented_logged:
+            _segmented_logged.add(self.instance_id)
+            logger.info(
+                f"[MORI EPv2] AsyncLL segmented receive in use: "
+                f"instance={self.instance_id} first stride={stride} "
+                f"rows={self._dispatch_sender_rows}"
+            )
+        return stride
+
+    def _select_recv_cap(self) -> int:
+        if self._segment_stride:
+            # The segments already bound the rows; nothing to trim.
+            self._recv_cap = 0
+            return 0
+        return super()._select_recv_cap()
 
     def _dispatch_transport(
         self, hidden_states, topk_weights, topk_ids, scale, ready_event

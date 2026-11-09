@@ -188,6 +188,22 @@ class TestMoriRecvBound(CustomTestCase):
         self.assertEqual(self._bound(12, None, subbatch=True), 0)
 
 
+class TestMoriSegmentedRowsFit(CustomTestCase):
+    """Uneven ranks must fall back to the compact receive before the segmented
+    receive pads the MoE input past SEGMENTED_MAX_ROW_INFLATION."""
+
+    def test_rows_fit(self):
+        fit = moriep.segmented_rows_fit
+        # Even 4096-row micro-batches: 8 * 4096 rows for 32768 real ones.
+        self.assertTrue(fit(stride=4096, ep_size=8, total_rows=8 * 4096))
+        self.assertTrue(fit(stride=4224, ep_size=8, total_rows=8 * 4096))
+        # One rank at 678 of 2283 rows (seen in AgentX): 8 * 678 = 2.4x.
+        self.assertFalse(fit(stride=678, ep_size=8, total_rows=2283))
+        # Small batches round the stride up to 32 and fall back.
+        self.assertFalse(fit(stride=32, ep_size=8, total_rows=24))
+        self.assertFalse(fit(stride=32, ep_size=8, total_rows=0))
+
+
 class TestMoriEPv2TboPerCall(_MoriEPv2TestCase):
     """--enable-two-batch-overlap must only change the calls that belong to a TBO
     micro-batch; decode, verify and unsplit prefill forwards of the same server

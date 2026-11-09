@@ -572,6 +572,9 @@ def _pre_permute_deepep_to_aiter(
         from sglang.kernels.ops.quantization.rocm_upscale import upscale, upscale_mxfp4
 
         a1_scale = dispatch_output.hidden_states_scale
+        # Under MORI's segmented receive this is world_size * stride:
+        # every row is an input, holes masked by expert_mask. Never None, which
+        # aiter's 1-stage fp8 blockscale path cannot take.
         num_local_tokens = dispatch_output.num_recv_tokens_per_expert
         output_dtype = dispatch_output.out_dtype
         output = getattr(dispatch_output, "expert_output", None)
