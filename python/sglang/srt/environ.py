@@ -1373,7 +1373,7 @@ class Envs:
     SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE = EnvInt(4096)
     SGLANG_FLASHINFER_DECODE_SPLIT_TILE_SIZE = EnvInt(2048)
     SGLANG_FLASHINFER_AUTOTUNE_CACHE = EnvBool(True)
-    # Use a separate graph-policy cache for single-rank full decode capture.
+    # Use a separate managed cache for single-rank full decode capture.
     # Eager execution and other graph paths retain the startup cache.
     SGLANG_ENABLE_FLASHINFER_GRAPH_AUTOTUNE = EnvBool(False)
     # Also autotune one EXTEND-shaped dummy at max_prefill_tokens during

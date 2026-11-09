@@ -444,14 +444,14 @@ class FlashInferGraphAutotune:
         post_warmup_hook: Optional[Callable[[], None]],
     ):
         from flashinfer import autotune_v2
-        from flashinfer.autotune_cache import MeasurementPolicy
 
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("FlashInfer graph tuning must precede CUDA capture")
+        # Preserve each operation's existing measurement settings. This scope
+        # changes cache ownership, not the profiling objective.
         options = dict(
             cache_root=self.cache_root,
             cache_scope="context",
-            measurement_policy=MeasurementPolicy(execution_mode="cuda_graph"),
             skip_ops=self.skip_ops,
         )
         try:
