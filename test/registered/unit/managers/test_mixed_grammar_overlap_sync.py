@@ -61,6 +61,13 @@ class TestMixedGrammarOverlapSync(unittest.TestCase):
         self.assertTrue(SpeculativeAlgorithm.DFLASH.supports_mixed_grammar_barrier())
         self.assertFalse(_early(_batch(ForwardMode.DECODE)))
 
+    def test_dspark_syncs(self):
+        # DSPARK's mixed-batch prefill does not run the barrier.
+        self.assertFalse(SpeculativeAlgorithm.DSPARK.supports_mixed_grammar_barrier())
+        self.assertTrue(
+            _early(_batch(ForwardMode.DECODE, algo=SpeculativeAlgorithm.DSPARK))
+        )
+
     def test_without_mixed_chunk_overlaps(self):
         batch = _batch(ForwardMode.DECODE, algo=SpeculativeAlgorithm.EAGLE)
         self.assertFalse(_early(batch, mixed_chunk=False))

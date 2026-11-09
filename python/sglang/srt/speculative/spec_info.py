@@ -173,8 +173,9 @@ class SpeculativeAlgorithm(Enum):
     def supports_mixed_grammar_barrier(self) -> bool:
         # Whether the worker runs the grammar barrier between the target extend
         # forward and its sampling, so a mixed batch's decode rows see the
-        # previous batch's committed tokens without a synchronous step.
-        return self.is_dflash_family()
+        # previous batch's committed tokens without a synchronous step. Only the
+        # DFlash worker passes the barrier to the target extend as before_sample.
+        return self.is_dflash()
 
     def has_draft_kv(self) -> bool:
         """Whether the draft phase writes KV chains. NGRAM does not (its tree
