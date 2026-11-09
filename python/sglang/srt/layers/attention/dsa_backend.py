@@ -141,7 +141,7 @@ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 _IS_GFX95 = is_gfx95_supported()
 
 if TYPE_CHECKING:
-    from sgl_kernel.flash_mla import FlashMLASchedMeta
+    from flash_mla.flash_mla_interface import FlashMLASchedMeta
 
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -334,12 +334,9 @@ def _adjacent_absorbed_q(
 def _flashmla_kv_padded_heads(num_heads: int) -> int:
     """Use native head counts when the installed SM100 kernel supports them."""
     if _is_cuda and get_platform().is_sm100 and 1 <= num_heads <= 128:
-        # Importing the wrapper loads the extension and registers its ops.
-        from sgl_kernel import flash_mla
+        from sglang.kernels.ops.attention import flash_mla_interface
 
-        if flash_mla._flashmla_import_error is None and hasattr(
-            torch.ops.sgl_kernel, "sparse_decode_num_sm_parts"
-        ):
+        if flash_mla_interface.supports_native_heads():
             return num_heads
     if num_heads <= 64:
         return 64
@@ -692,15 +689,15 @@ class DeepseekSparseAttnBackend(
 
         return flash_mla_sparse_fwd(**kwargs)
 
-    # flashmla_kv decode and its metadata use sgl_kernel's FlashMLA, which also
-    # takes the native (unpadded) prefill head count.
     def _call_flash_mla_with_kvcache(self, **kwargs):
-        from sgl_kernel.flash_mla import flash_mla_with_kvcache
+        from sglang.kernels.ops.attention.flash_mla_interface import (
+            flash_mla_with_kvcache,
+        )
 
         return flash_mla_with_kvcache(**kwargs)
 
     def _call_get_mla_metadata(self, **kwargs):
-        from sgl_kernel.flash_mla import get_mla_metadata
+        from sglang.kernels.ops.attention.flash_mla_interface import get_mla_metadata
 
         return get_mla_metadata(**kwargs)
 
@@ -3874,8 +3871,7 @@ class DeepseekSparseAttnBackend(
         # The schedule depends on topk_length, so it is built per call, by the
         # DeepSeek-V4 scheduler kernel's windowed schedule (FlashMLA's own walk
         # over the partitions sits on the critical path for tens of us).
-        from sgl_kernel.flash_mla import get_mla_metadata
-
+        from sglang.kernels.ops.attention.flash_mla_interface import get_mla_metadata
         from sglang.srt.layers.attention.deepseek_v4_backend import (
             _maybe_precompute_flashmla_sched_meta,
         )

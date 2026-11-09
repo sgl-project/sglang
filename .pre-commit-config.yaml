@@ -9,7 +9,7 @@ repos:
       - id: destroyed-symlinks
       - id: trailing-whitespace
         # Preserve unified-diff context lines.
-        exclude: ^(python/sglang/kernels/aot/patches/flashmla/|docker/k31-image/.*\.patch$)
+        exclude: ^docker/k31-image/.*\.patch$
       - id: end-of-file-fixer
         exclude: ^docker/k31-image/.*\.patch$
       - id: check-yaml
