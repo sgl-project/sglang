@@ -6,12 +6,13 @@ from typing import TYPE_CHECKING, Optional
 import msgspec
 import torch
 
+from sglang.srt.arg_groups.choices import DRAFT_ATTENTION_BACKEND_CHOICES
 from sglang.srt.configs.load_config import _DEFAULT_LOAD_GROUP, LoadGroup
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
 from sglang.srt.runtime_context import attention_backends, get_platform, get_spec
-from sglang.srt.server_args import DRAFT_ATTENTION_BACKEND_CHOICES, ServerArgs
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 
@@ -48,6 +49,8 @@ def resolve_draft_worker_attention_backend(*, algo_label: Optional[str] = None) 
         draft_backend, _ = attention_backends()
     if draft_backend is None:
         return platform_fallback
+    if algo_label == "DFLASH" and draft_backend == "cutedsl_mla":
+        return draft_backend
     if draft_backend not in DRAFT_ATTENTION_BACKEND_CHOICES:
         fallback = platform_fallback
         if algo_label is not None:
