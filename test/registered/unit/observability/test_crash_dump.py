@@ -546,16 +546,19 @@ class TestCrashDumpTriggers(CustomTestCase):
             patch.object(scheduler_module.psutil, "Process") as process,
         ):
             process.return_value.parent.return_value = parent
-            scheduler_module.run_scheduler_process(
-                server_args=MagicMock(),
-                port_args=MagicMock(),
-                gpu_id=0,
-                tp_rank=0,
-                pp_rank=0,
-                dp_rank=None,
-                pipe_writer=MagicMock(),
-            )
+            with self.assertRaises(SystemExit) as exited:
+                scheduler_module.run_scheduler_process(
+                    server_args=MagicMock(),
+                    port_args=MagicMock(),
+                    gpu_id=0,
+                    tp_rank=0,
+                    pp_rank=0,
+                    dp_rank=None,
+                    pipe_writer=MagicMock(),
+                )
         self.assertEqual(calls, ["dump", signal.SIGQUIT])
+        # A crash must not exit 0, which SubprocessWatchdog reads as a clean shutdown.
+        self.assertEqual(exited.exception.code, 1)
 
     def test_watchdog_timeout_dumps_before_sigquit(self):
         """The watchdog's own thread writes the dump on a timeout, then still

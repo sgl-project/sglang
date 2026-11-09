@@ -20,6 +20,7 @@ This file implements HTTP APIs for the inference engine via fastapi.
 import asyncio
 import dataclasses
 import errno
+import inspect
 import logging
 import os
 import signal
@@ -2697,9 +2698,9 @@ class _SigquitForwardingMultiprocess(Multiprocess):
     took over is called from the supervisor loop instead.
     """
 
-    def __init__(self, config: uvicorn.Config, sockets: List[socket.socket]):
+    def __init__(self, *args, **kwargs):
         self._sigquit_handler = signal.getsignal(signal.SIGQUIT)
-        super().__init__(config, sockets=sockets)
+        super().__init__(*args, **kwargs)
 
     def handle_quit(self) -> None:
         if callable(self._sigquit_handler):
@@ -2707,6 +2708,21 @@ class _SigquitForwardingMultiprocess(Multiprocess):
         else:
             logger.error("Received SIGQUIT from a child process; exiting.")
             kill_process_tree(os.getpid())
+
+
+def _run_uvicorn_workers(app_path: str, **uvicorn_options) -> None:
+    """What ``uvicorn.run()`` does for workers > 1, minus its SIGQUIT trap."""
+    config = uvicorn.Config(app_path, **uvicorn_options)
+    sockets = [config.bind_socket()]
+    if "target" in inspect.signature(Multiprocess.__init__).parameters:
+        # uvicorn < 0.51 (not pinned on every platform): the supervisor is
+        # given the server's run().
+        supervisor = _SigquitForwardingMultiprocess(
+            config, target=uvicorn.Server(config=config).run, sockets=sockets
+        )
+    else:
+        supervisor = _SigquitForwardingMultiprocess(config, sockets=sockets)
+    supervisor.run()
 
 
 class _ReusePortMultiprocess(_SigquitForwardingMultiprocess):
@@ -3151,11 +3167,7 @@ def _setup_and_run_http_server(
                     )
                     supervisor.run()
                 else:
-                    # What uvicorn.run() does for workers > 1, minus its SIGQUIT trap.
-                    config = uvicorn.Config(app_path, **uvicorn_options)
-                    _SigquitForwardingMultiprocess(
-                        config, sockets=[config.bind_socket()]
-                    ).run()
+                    _run_uvicorn_workers(app_path, **uvicorn_options)
     finally:
         if get_serving().tokenizer_worker_num > 1:
             if multi_tokenizer_args_shm is not None:

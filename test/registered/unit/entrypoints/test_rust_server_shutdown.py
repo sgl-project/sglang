@@ -540,6 +540,48 @@ def test_a_clean_exit_without_sigterm_bounds_the_others(monkeypatch):
             proc.join()
 
 
+def _crashes_soon():
+    time.sleep(0.5)
+    os._exit(1)
+
+
+def test_a_crash_without_sigterm_bounds_the_others_and_still_reports(monkeypatch):
+    """A scheduler that crashed (non-zero exit) while a sibling is wedged in a
+    collective: the exit bound still applies, so the launcher returns even when
+    a custom SIGQUIT handler leaves the tree alive, and the watchdog stays
+    armed, so the crash is still reported."""
+    from sglang.srt.utils.watchdog import SubprocessWatchdog
+
+    monkeypatch.setattr(rust_shutdown, "_SCHEDULER_EXIT_TIMEOUT_SECS", 1)
+    sigquits = []
+    previous = signal.signal(signal.SIGQUIT, lambda *_: sigquits.append(True))
+    ctx = mp.get_context("fork")
+    ready = ctx.Event()
+    crashed = ctx.Process(target=_crashes_soon)
+    wedged = ctx.Process(target=_wedged_child, args=(ready,))
+    crashed.start()
+    wedged.start()
+    watchdog = SubprocessWatchdog([crashed, wedged], interval=0.1)
+    try:
+        assert ready.wait(30)
+        watchdog.start()
+        drain = rust_shutdown.RustServerSigtermDrain(
+            [crashed, wedged], [crashed], watchdog, _name()
+        )
+        start = time.monotonic()
+        drain.wait()
+        assert 0.5 + 1 <= time.monotonic() - start < 0.5 + 1 + 3
+        assert (crashed.exitcode, wedged.exitcode) == (1, -signal.SIGKILL)
+        assert sigquits, "the crash was not reported"
+    finally:
+        watchdog.stop()
+        signal.signal(signal.SIGQUIT, previous)
+        for proc in (crashed, wedged):
+            if proc.exitcode is None:
+                proc.kill()
+            proc.join()
+
+
 def test_main_process_raises_on_an_unreaped_scheduler(restore_sigterm, monkeypatch):
     """A killed scheduler not reaped within the bound raises, as Python's
     ``kill_process_tree`` does, instead of blocking the main process."""
