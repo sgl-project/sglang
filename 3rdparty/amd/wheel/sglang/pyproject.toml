@@ -96,7 +96,7 @@ diffusion_hip = [
   "remote-pdb",
   "st_attn==0.0.7",
   "vsa==0.0.4",
-  "runai_model_streamer>=0.15.5",
+  "runai_model_streamer>=0.17.2",
   "cache-dit==1.3.0",
   "addict",
 ]
@@ -129,7 +129,7 @@ diffusion_musa = [
   "remote-pdb",
   "st_attn==0.0.7",
   "vsa==0.0.4",
-  "runai_model_streamer>=0.15.5",
+  "runai_model_streamer>=0.17.2",
   "cache-dit==1.1.8",
   "addict",
 ]

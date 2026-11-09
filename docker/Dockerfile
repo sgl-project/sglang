@@ -535,7 +535,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     matplotlib \
     tabulate \
     termplotlib \
-    "runai-model-streamer[s3,gcs,azure]>=0.15.7"
+    "runai-model-streamer[s3,gcs,azure]>=0.17.2"
 
 # DeepEP needs SGL_NCCL_VERSION at runtime even if torch pins another version;
 # install it after the constrained dependency solve so the solve cannot revert it.
