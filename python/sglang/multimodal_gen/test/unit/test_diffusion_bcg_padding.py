@@ -11,9 +11,6 @@ from sglang.multimodal_gen.runtime.breakable_cuda_graph import (
 from sglang.multimodal_gen.runtime.breakable_cuda_graph.model_padders import (
     qwen_image21 as qwen21_padder,
 )
-from sglang.multimodal_gen.runtime.breakable_cuda_graph.model_padders import (
-    sana_video as sana_video_padder,
-)
 from sglang.multimodal_gen.runtime.breakable_cuda_graph.runner import (
     DiffusionBreakableCudaGraphRunner,
     _CaptureEntry,
@@ -79,6 +76,20 @@ class ZImageTransformer2DModel(torch.nn.Module):
 
 class SanaVideoTransformer3DModel(torch.nn.Module):
     pass
+
+
+class _FakeBCGRunner:
+    def __init__(self):
+        self.capture_calls = 0
+        self.captures = {}
+
+    def capture(self, **kwargs):
+        self.capture_calls += 1
+        self.captures.setdefault(_signature_kwargs(kwargs), kwargs)
+        return True
+
+    def __call__(self, **kwargs):
+        return _signature_kwargs(kwargs) in self.captures
 
 
 class TestQualityFusionBCGCompatibility(unittest.TestCase):
@@ -723,191 +734,101 @@ class TestDiffusionBCGPadding(unittest.TestCase):
         hidden_states_mask = torch.ones(1, width, dtype=torch.bool)
         return {
             "hidden_states": torch.zeros(1, 8, 4),
-            "encoder_hidden_states": ([embeddings],),
-            "encoder_attention_mask": [attention_mask],
-            "encoder_hidden_states_mask": (hidden_states_mask,),
+            "encoder_hidden_states": embeddings,
+            "encoder_attention_mask": attention_mask,
+            "encoder_hidden_states_mask": [hidden_states_mask],
             "timestep": torch.zeros(1),
             "other_kwargs": {"preserved": True},
         }
 
-    def test_sana_video_warmup_kwargs_pad_all_nested_prompt_tensors(self):
-        kwargs = self._sana_kwargs(64)
-
-        padded = sana_video_padder.sana_video_warmup_kwargs(
-            kwargs, self.sana_video_model
-        )
-
-        self.assertIsNot(padded, kwargs)
-        self.assertIsInstance(padded["encoder_hidden_states"], tuple)
-        self.assertIsInstance(padded["encoder_hidden_states"][0], list)
-        self.assertIsInstance(padded["encoder_attention_mask"], list)
-        self.assertIsInstance(padded["encoder_hidden_states_mask"], tuple)
-        self.assertEqual(
-            bcg_utils.first_tensor(padded["encoder_hidden_states"]).shape,
-            (1, 300, 4),
-        )
-        self.assertEqual(
-            bcg_utils.first_tensor(padded["encoder_attention_mask"]).shape,
-            (1, 300),
-        )
-        self.assertEqual(
-            bcg_utils.first_tensor(padded["encoder_hidden_states_mask"]).shape,
-            (1, 300),
-        )
-        self.assertFalse(
-            bcg_utils.first_tensor(padded["encoder_attention_mask"])[0, 64:].any()
-        )
-        self.assertFalse(
-            bcg_utils.first_tensor(padded["encoder_hidden_states_mask"])[0, 64:].any()
-        )
-        self.assertIs(padded["hidden_states"], kwargs["hidden_states"])
-        self.assertIs(padded["other_kwargs"], kwargs["other_kwargs"])
-
-    def test_sana_video_warmup_captures_both_widths_and_serving_never_captures(self):
-        class _FakeRunner:
-            def __init__(self):
-                self.capture_calls = []
-                self.signatures = []
-                self.captures = []
-
-            def capture(self, **kwargs):
-                self.capture_calls.append(kwargs)
-                signature = _signature_kwargs(kwargs)
-                if signature not in self.signatures:
-                    self.signatures.append(signature)
-                    self.captures.append(kwargs)
-                return True
-
-            def __call__(self, **kwargs):
-                return kwargs
-
-        runner = _FakeRunner()
-        short_kwargs = self._sana_kwargs(64)
-        with (
-            self._patch_buckets(128, 256, 512),
-            patch(
-                "sglang.multimodal_gen.runtime.managers.forward_context.get_forward_context",
-                return_value=SimpleNamespace(
-                    forward_batch=SimpleNamespace(is_warmup=True)
-                ),
-            ),
-        ):
-            self.stage._bcg_run(runner, short_kwargs, self.sana_video_model)
-
-        captured_widths = {
-            bcg_utils.first_tensor(item["encoder_hidden_states"]).shape[1]
-            for item in runner.captures
-        }
-        self.assertEqual(captured_widths, {64, 300})
-        self.assertEqual(len(runner.captures), 2)
-
-        capture_call_count = len(runner.capture_calls)
-        with patch(
-            "sglang.multimodal_gen.runtime.managers.forward_context.get_forward_context",
-            return_value=SimpleNamespace(
-                forward_batch=SimpleNamespace(is_warmup=False)
-            ),
-        ):
-            served = self.stage._bcg_run(
-                runner, self._sana_kwargs(300), self.sana_video_model
-            )
-
-        self.assertEqual(len(runner.capture_calls), capture_call_count)
-        self.assertEqual(
-            bcg_utils.first_tensor(served["encoder_hidden_states"]).shape[1], 300
-        )
-
-    def test_sana_video_long_warmup_captures_compact_signature_for_serving(self):
-        class _FakeRunner:
-            def __init__(self):
-                self.capture_calls = []
-                self.signatures = []
-                self.captures = []
-
-            def capture(self, **kwargs):
-                self.capture_calls.append(kwargs)
-                signature = _signature_kwargs(kwargs)
-                if signature not in self.signatures:
-                    self.signatures.append(signature)
-                    self.captures.append(kwargs)
-                return True
-
-            def __call__(self, **kwargs):
-                return _signature_kwargs(kwargs) in self.signatures
-
-        runner = _FakeRunner()
-        warmup_kwargs = self._sana_kwargs(300)
+    def test_sana_video_warmup_captures_both_widths_and_serves_either_signature(self):
         prompt_keys = (
             "encoder_hidden_states",
             "encoder_attention_mask",
             "encoder_hidden_states_mask",
         )
-        original_tensors = {
-            key: bcg_utils.first_tensor(warmup_kwargs[key]) for key in prompt_keys
-        }
-        with (
-            self._patch_buckets(128, 256, 512),
-            patch(
-                "sglang.multimodal_gen.runtime.managers.forward_context.get_forward_context",
-                return_value=SimpleNamespace(
-                    forward_batch=SimpleNamespace(is_warmup=True)
-                ),
-            ),
-        ):
-            self.assertTrue(
-                self.stage._bcg_run(runner, warmup_kwargs, self.sana_video_model)
-            )
+        for initial_width in (64, 300):
+            with self.subTest(initial_width=initial_width):
+                runner = _FakeBCGRunner()
+                warmup_kwargs = self._sana_kwargs(initial_width)
+                original_tensors = {
+                    key: bcg_utils.first_tensor(warmup_kwargs[key])
+                    for key in prompt_keys
+                }
+                original_snapshots = {
+                    key: tensor.clone() for key, tensor in original_tensors.items()
+                }
+                with (
+                    self._patch_buckets(128, 256, 512),
+                    patch(
+                        "sglang.multimodal_gen.runtime.managers.forward_context.get_forward_context",
+                        return_value=SimpleNamespace(
+                            forward_batch=SimpleNamespace(is_warmup=True)
+                        ),
+                    ),
+                ):
+                    self.assertTrue(
+                        self.stage._bcg_run(
+                            runner, warmup_kwargs, self.sana_video_model
+                        )
+                    )
 
-        captured_widths = {
-            bcg_utils.first_tensor(item["encoder_hidden_states"]).shape[1]
-            for item in runner.captures
-        }
-        self.assertEqual(captured_widths, {64, 300})
-        compact_kwargs = next(
-            item
-            for item in runner.captures
-            if bcg_utils.first_tensor(item["encoder_hidden_states"]).shape[1] == 64
-        )
-        self.assertIsInstance(compact_kwargs["encoder_hidden_states"], tuple)
-        self.assertIsInstance(compact_kwargs["encoder_hidden_states"][0], list)
-        self.assertIsInstance(compact_kwargs["encoder_attention_mask"], list)
-        self.assertIsInstance(compact_kwargs["encoder_hidden_states_mask"], tuple)
-        for key in prompt_keys:
-            original = original_tensors[key]
-            compact = bcg_utils.first_tensor(compact_kwargs[key])
-            self.assertEqual(original.shape[1], 300)
-            self.assertEqual(compact.shape[1], 64)
-            self.assertEqual(compact.dtype, original.dtype)
-            self.assertEqual(compact.device, original.device)
-            torch.testing.assert_close(compact, original[:, :64])
-        self.assertIs(compact_kwargs["hidden_states"], warmup_kwargs["hidden_states"])
-        self.assertIs(compact_kwargs["other_kwargs"], warmup_kwargs["other_kwargs"])
+                captured_by_width = {
+                    bcg_utils.first_tensor(kwargs["encoder_hidden_states"]).shape[
+                        1
+                    ]: kwargs
+                    for kwargs in runner.captures.values()
+                }
+                self.assertEqual(set(captured_by_width), {64, 300})
+                self.assertEqual(len(runner.captures), 2)
 
-        capture_count = len(runner.capture_calls)
-        serving_kwargs = self._sana_kwargs(64)
-        with patch(
-            "sglang.multimodal_gen.runtime.managers.forward_context.get_forward_context",
-            return_value=SimpleNamespace(
-                forward_batch=SimpleNamespace(is_warmup=False)
-            ),
-        ):
-            self.assertTrue(
-                self.stage._bcg_run(runner, serving_kwargs, self.sana_video_model)
-            )
-        self.assertEqual(len(runner.capture_calls), capture_count)
+                alternate_width = 300 if initial_width == 64 else 64
+                alternate_kwargs = captured_by_width[alternate_width]
+                self.assertIsInstance(
+                    alternate_kwargs["encoder_hidden_states_mask"], list
+                )
+                self.assertIs(
+                    alternate_kwargs["hidden_states"], warmup_kwargs["hidden_states"]
+                )
+                self.assertIs(
+                    alternate_kwargs["other_kwargs"], warmup_kwargs["other_kwargs"]
+                )
+                for key in prompt_keys:
+                    original = original_tensors[key]
+                    original_after_warmup = bcg_utils.first_tensor(warmup_kwargs[key])
+                    alternate = bcg_utils.first_tensor(alternate_kwargs[key])
+                    self.assertEqual(original_after_warmup.shape[1], initial_width)
+                    torch.testing.assert_close(
+                        original_after_warmup, original_snapshots[key]
+                    )
+                    self.assertEqual(alternate.shape[1], alternate_width)
+                    self.assertEqual(alternate.dtype, original.dtype)
+                    self.assertEqual(alternate.device, original.device)
+                    if initial_width == 64:
+                        torch.testing.assert_close(alternate[:, :64], original)
+                        self.assertFalse(alternate[:, 64:].any())
+                    else:
+                        torch.testing.assert_close(alternate, original[:, :64])
 
-    def test_sana_long_warmup_and_generic_warmup_keep_existing_shapes(self):
-        class _FakeRunner:
-            def __init__(self):
-                self.captures = []
+                capture_count = runner.capture_calls
+                serving_width = alternate_width
+                with patch(
+                    "sglang.multimodal_gen.runtime.managers.forward_context.get_forward_context",
+                    return_value=SimpleNamespace(
+                        forward_batch=SimpleNamespace(is_warmup=False)
+                    ),
+                ):
+                    self.assertTrue(
+                        self.stage._bcg_run(
+                            runner,
+                            self._sana_kwargs(serving_width),
+                            self.sana_video_model,
+                        )
+                    )
+                self.assertEqual(runner.capture_calls, capture_count)
 
-            def capture(self, **kwargs):
-                self.captures.append(kwargs)
-                return True
-
-            def __call__(self, **kwargs):
-                return kwargs
-
+    def test_generic_qwen_warmup_keeps_existing_buckets(self):
+        runner = _FakeBCGRunner()
         with (
             self._patch_buckets(64, 128),
             patch(
@@ -917,24 +838,16 @@ class TestDiffusionBCGPadding(unittest.TestCase):
                 ),
             ),
         ):
-            sana_runner = _FakeRunner()
-            self.stage._bcg_run(
-                sana_runner, self._sana_kwargs(300), self.sana_video_model
+            self.assertTrue(
+                self.stage._bcg_run(runner, self._qwen_kwargs(19), self.qwen_model)
             )
-            generic_runner = _FakeRunner()
-            self.stage._bcg_run(generic_runner, self._qwen_kwargs(19), self.qwen_model)
 
-        sana_widths = {
-            bcg_utils.first_tensor(item["encoder_hidden_states"]).shape[1]
-            for item in sana_runner.captures
+        captured_widths = {
+            bcg_utils.first_tensor(kwargs["encoder_hidden_states"]).shape[1]
+            for kwargs in runner.captures.values()
         }
-        generic_widths = {
-            bcg_utils.first_tensor(item["encoder_hidden_states"]).shape[1]
-            for item in generic_runner.captures
-        }
-        self.assertEqual(sana_widths, {300})
-        self.assertEqual(len(sana_runner.captures), 2)
-        self.assertEqual(generic_widths, {64, 128})
+        self.assertEqual(captured_widths, {64, 128})
+        self.assertEqual(len(runner.captures), 2)
 
     def test_flux_unmasked_conditioning_keeps_one_signature_for_all_buckets(self):
         # FLUX attends to all 512 T5 tokens, including tokenizer padding.

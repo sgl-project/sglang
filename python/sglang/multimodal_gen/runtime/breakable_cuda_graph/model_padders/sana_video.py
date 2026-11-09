@@ -52,11 +52,6 @@ def _resize_nested_prompt_dim(value: Any, source: int, target: int) -> Any:
         return [_resize_nested_prompt_dim(item, source, target) for item in value]
     if isinstance(value, tuple):
         return tuple(_resize_nested_prompt_dim(item, source, target) for item in value)
-    if isinstance(value, dict):
-        return {
-            key: _resize_nested_prompt_dim(item, source, target)
-            for key, item in value.items()
-        }
     return value
 
 
