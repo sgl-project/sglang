@@ -71,6 +71,8 @@ class ExpertLocationMetadata:
     logical_to_rank_dispatch_physical_map: Optional[torch.Tensor]
     # layer_id -> per-layer state an EvenMoE placement plan publishes for its
     # routing half (carried into PlacementSnapshot.metadata; see adapters.sglang).
+    # Kept in the plan's own layout: the native maps above are padded to
+    # num_physical_experts and cannot stand in for it.
     mlb_routing_metadata: dict = field(default_factory=dict)
     # dispatch algorithm -> int32 (map, replica count), built on first use by mega_gate_maps
     _mega_gate_maps: dict = field(default_factory=dict, init=False, repr=False)
