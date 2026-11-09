@@ -325,14 +325,10 @@ RUN mkdir -p /etc/sglang/constraints && : > /etc/sglang/constraints/torch-rocm.t
 # Base image 950 with ROCm 10.0.0 and args (Python 3.12 + torch 2.11)
 FROM $BASE_IMAGE_950_ROCM1000 AS gfx950-rocm1000
 ENV BUILD_VLLM="0"
-# Keeps the SDK's Triton. uTLX (BUILD_UTLX=1, see the uTLX step) needs Triton
-# with plugin support, which the SDK's lacks, so then it is replaced by the
-# commit the SDK's wheel comes from, built from source like gfx1250's; the
-# suffix keeps the version torch pins.
-ENV BUILD_TRITON="0"
-ENV TRITON_REPO_DEFAULT="https://github.com/ROCm/triton.git"
-ENV TRITON_COMMIT_DEFAULT="4cff872ced001ea92d9fcf05b3f6517e2b486d19"
-ENV TRITON_WHEEL_VERSION_SUFFIX=".rocm10.0.0"
+# Unlike the gfx942 image, this one replaces the SDK's Triton.
+ENV BUILD_TRITON="1"
+# Triton v3.9.0, built from source below.
+ENV TRITON_COMMIT_DEFAULT="b7ddcf86c095de79527ba3098503e73158bb94bd"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
@@ -346,7 +342,7 @@ RUN mkdir -p /etc/sglang/constraints && : > /etc/sglang/constraints/torch-rocm.t
 # flavor name, so they apply here unchanged.
 FROM $BASE_IMAGE_1250_ROCM1000 AS gfx1250-rocm1000
 ENV BUILD_VLLM="0"
-# Unlike the gfx942/gfx950 images, this one replaces the SDK's Triton.
+# Unlike the gfx942 image, this one replaces the SDK's Triton.
 ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
@@ -1236,8 +1232,7 @@ RUN cd /tmp/whl \
 # torch 2.11 names this `triton-rocm`; uninstall it so the pin is the only Triton.
 #
 # With BUILD_UTLX=1 (see the uTLX step below) the source build also gets plugin
-# support, so the build tree is written once; gfx950-rocm1000 builds Triton from
-# source only then.
+# support, so the build tree is written once.
 RUN if [ "$BUILD_TRITON" = "1" ] || [ "$BUILD_UTLX" = "1" ]; then \
         case "${GPU_ARCH}" in \
           gfx950-rocm1000|gfx1250-rocm1000|gfx1250-rocm1010) \
@@ -1256,8 +1251,8 @@ RUN if [ "$BUILD_TRITON" = "1" ] || [ "$BUILD_UTLX" = "1" ]; then \
                      commit -q -am "Revert $rev" || exit 1; \
                done \
             && if [ "${BUILD_UTLX}" = "1" ]; then \
-                 # ROCm/triton#983, fetched because the gfx1250 flavors clone upstream
-                 # Triton; uncommitted so the version keeps the hash torch pins.
+                 # ROCm/triton#983, fetched because these flavors clone upstream
+                 # Triton; uncommitted so the version keeps TRITON_COMMIT's hash.
                  git fetch -q https://github.com/ROCm/triton.git 89c3a46ba4908396313782443229eee3541a08f2 \
                  && git cherry-pick --no-commit 89c3a46ba4908396313782443229eee3541a08f2 \
                  && export TRITON_EXT_ENABLED=ON; \
@@ -1276,8 +1271,9 @@ RUN if [ "$BUILD_TRITON" = "1" ] || [ "$BUILD_UTLX" = "1" ]; then \
      && python3 -c "import torch; from importlib.metadata import version; v = version('triton'); k = version('triton-kernels'); assert torch.version.hip is not None, torch.__version__; print(f'[Triton] ROCm Torch {torch.__version__}, Triton {v}, triton-kernels {k}')"; \
     fi
 
-# torch 2.11 still Requires-Dist: triton-rocm after the swap above.
-RUN case "${GPU_ARCH}" in *-rocm724|gfx1250-rocm1010) python3 -c "import pathlib,re,importlib.metadata as m; p=pathlib.Path(m.distribution('torch')._path)/'METADATA'; v=m.version('triton'); t,n=re.subn(r'^Requires-Dist: (?:triton|triton-rocm)==[^\s;]+', 'Requires-Dist: triton=='+v, p.read_text(), count=1, flags=re.M); assert n==1, n; p.write_text(t)" ;; esac
+# After the swap above torch still Requires-Dist the Triton it shipped with
+# (triton-rocm on rocm724), so pip cannot resolve anything that depends on torch.
+RUN case "${GPU_ARCH}" in *-rocm724|gfx950-rocm1000|gfx1250-rocm1000|gfx1250-rocm1010) python3 -c "import pathlib,re,importlib.metadata as m; p=pathlib.Path(m.distribution('torch')._path)/'METADATA'; v=m.version('triton'); t,n=re.subn(r'^Requires-Dist: (?:triton|triton-rocm)==[^\s;]+', 'Requires-Dist: triton=='+v, p.read_text(), count=1, flags=re.M); assert n==1, n; p.write_text(t)" ;; esac
 
 # -----------------------
 # uTLX (standalone TLX) for sglang's TLX kernels, built with BUILD_UTLX=1 on
