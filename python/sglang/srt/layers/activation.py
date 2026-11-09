@@ -212,9 +212,11 @@ class SituAndMul(BaseFusedOp):
         return situ_and_mul(x, None, self.beta, self.linear_beta)
 
     def forward_npu(self, x: torch.Tensor) -> torch.Tensor:
-        from sgl_kernel_npu.activation.situ import situ_and_mul
+        from sgl_kernel_npu.operators.activation import situ_and_mul
 
-        return situ_and_mul(x)
+        return situ_and_mul(
+            x, beta=self.beta, linear_beta=self.linear_beta, impl="auto"
+        )
 
     def forward_cpu(self, x: torch.Tensor) -> torch.Tensor:
         return self.forward_native(x)
