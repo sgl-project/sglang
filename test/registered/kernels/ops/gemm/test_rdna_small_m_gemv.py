@@ -88,6 +88,13 @@ class TestGate(CustomTestCase):
         with mock.patch.object(splitk, "_is_disabled", return_value=True):
             self.assertFalse(splitk.use_rdna_splitk_gemv(1, 4096, 1024, torch.bfloat16))
 
+    def test_kernel_requires_a_dense_k_slice(self):
+        # The kernel reads each row's K slice at the row stride it is given, so a
+        # transposed weight (K not dense) must be refused before any launch.
+        weight = torch.randn(1024, 4096, dtype=torch.bfloat16).t()
+        with self.assertRaises(AssertionError):
+            splitk.rdna_splitk_gemv(torch.randn(1, 4096, dtype=torch.bfloat16), weight)
+
 
 @unittest.skipUnless(is_hip(), "the split-K GEMV path is only wired up on ROCm")
 class TestKernel(CustomTestCase):
@@ -120,6 +127,23 @@ class TestKernel(CustomTestCase):
         for n, k in [(10240, 2560), (18432, 2560), (2560, 9216), (5120, 17408)]:
             with self.subTest(n=n, k=k):
                 self._run_case(n, k)
+
+    def test_padded_weight_rows(self):
+        """gfx115x pads K-dense weight rows to a wider stride; the view must be read
+        at its own row stride rather than skipped or read as if it were dense."""
+        torch.manual_seed(2)
+        n, k = 4096, 1024
+        x = torch.randn(1, k, dtype=torch.bfloat16, device="cuda")
+        w = torch.randn(n, k, dtype=torch.bfloat16, device="cuda") * 0.05
+        padded = torch.nn.functional.pad(w, (0, 64))[:, :-64]
+        self.assertFalse(padded.is_contiguous())
+        self.assertEqual(padded.stride(), (k + 64, 1))
+        self.assertTrue(torch.equal(padded, w))
+        self.assertTrue(
+            torch.equal(
+                splitk.rdna_splitk_gemv(x, padded), splitk.rdna_splitk_gemv(x, w)
+            )
+        )
 
     def test_batch_invariant(self):
         """Same output regardless of what else is in flight."""
