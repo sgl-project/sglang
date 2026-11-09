@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -556,13 +557,14 @@ class TestDSAMetadataKernels(CustomTestCase):
             (_fused_dsa_target_verify_metadata_kernel, verify),
             (_fused_dsa_draft_extend_metadata_kernel, draft),
         ):
-            with self.subTest(kernel=check.__name__):
-                kernel_cache = kernel.device_caches[self.device.index or 0][0]
+            kernel_cache = kernel.device_caches[torch.cuda.current_device()][0]
+            with (
+                self.subTest(kernel=check.__name__),
+                patch.dict(kernel_cache, clear=True),
+            ):
                 for bs in (9, 12, 16):
                     check(list(range(9, 9 + bs)))
-                    if bs == 9:
-                        compiled_after_first = len(kernel_cache)
-                self.assertEqual(len(kernel_cache), compiled_after_first)
+                    self.assertEqual(len(kernel_cache), 1, f"batch size {bs}")
 
     def test_large_batch_coverage(self):
         bs = 16 * 1024

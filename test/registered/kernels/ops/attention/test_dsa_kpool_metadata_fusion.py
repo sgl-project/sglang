@@ -1,6 +1,7 @@
 """KPool fused metadata must retain live tails and refresh captured buffers."""
 
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -31,14 +32,12 @@ class TestKPoolMetadataFusion(CustomTestCase):
             ("draft_static", _fused_dsa_draft_extend_metadata_kpool_kernel),
             ("draft_variable", _fused_dsa_draft_extend_metadata_kpool_kernel),
         ):
-            with self.subTest(mode=mode):
-                kernel_cache = kernel.device_caches[torch.cuda.current_device()][0]
+            kernel_cache = kernel.device_caches[torch.cuda.current_device()][0]
+            with self.subTest(mode=mode), patch.dict(kernel_cache, clear=True):
                 # 16 catches Triton's specialization on divisibility by 16.
                 for bs in (9, 12, 16):
                     self._check_batch_metadata(mode, bs)
-                    if bs == 9:
-                        compiled_after_first = len(kernel_cache)
-                    self.assertEqual(len(kernel_cache), compiled_after_first)
+                    self.assertEqual(len(kernel_cache), 1, f"batch size {bs}")
 
     def _check_batch_metadata(self, mode, bs):
         device, width, next_n, topk, kpool = "cuda", 256, 4, 64, 4
