@@ -7,8 +7,10 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.batch_overlap.operations import _StageExecutor
 from sglang.srt.configs.shared_experts import SharedExpertsConfig
 from sglang.srt.layers.moe.utils import MoeA2ABackend
+from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.state_capturer import base as base_mod
 from sglang.srt.state_capturer import routed_experts as re_mod
@@ -115,6 +117,94 @@ class TestCaptureRoutedIdsOnly(CustomTestCase):
                 self.assertTrue(
                     torch.equal(cap.device_cache.buffer[:4, 1, : self.TOPK_SIZE], ids)
                 )
+
+    def test_tbo_children_write_their_parent_rows(self):
+        """Children must not overwrite each other, even when padded to a common length."""
+        cap = self._capturer()
+        for token_range, value in (((0, 1), 1), ((1, 4), 2)):
+            ids = torch.full((3, self.TOPK_SIZE), value, dtype=torch.int32)
+            with forward_context(
+                ForwardContext(attn_backend=None, tbo_parent_token_range=token_range)
+            ):
+                self._capture(cap, ids, "deepep")
+        self.assertEqual(cap.device_cache.buffer[:4, 1, 0].tolist(), [1, 2, 2, 2])
+
+    def _read_non_ep_dp_tbo(self, rank, parent_sizes, split):
+        """Capture both gathered children on ``rank`` and read back its parent rows."""
+        cap = self._capturer()
+        cap.device_cache.buffer.fill_(-7)
+        cap.topk_size = self.TOPK_SIZE
+        ranges = [
+            [(0, split[r]), (split[r], size)] for r, size in enumerate(parent_sizes)
+        ]
+        padded = [max(e - s for s, e in rank_ranges) for rank_ranges in ranges]
+        offset = sum(parent_sizes[:rank])
+        with (
+            mock.patch.object(
+                re_mod, "get_moe_a2a_backend", return_value=MoeA2ABackend("none")
+            ),
+            mock.patch.object(re_mod, "is_dp_attention_enabled", return_value=True),
+            mock.patch.object(re_mod, "get_dp_global_num_tokens", return_value=padded),
+            mock.patch.object(re_mod, "dp_slot_in", return_value=rank),
+            mock.patch("sglang.srt.layers.dp_attention.dp_slot_in", return_value=rank),
+        ):
+            for child in range(2):
+                gathered = []
+                for r, rank_ranges in enumerate(ranges):
+                    s, e = rank_ranges[child]
+                    gathered += [100 * (r + 1) + i for i in range(s, e)]
+                    gathered += [-1] * (padded[r] - (e - s))
+                ids = torch.tensor(gathered, dtype=torch.int32)
+                ids = ids.unsqueeze(1).expand(-1, self.TOPK_SIZE + 1)
+                with forward_context(
+                    ForwardContext(
+                        attn_backend=None,
+                        tbo_parent_token_range=ranges[rank][child],
+                        tbo_parent_dp_offset=offset,
+                    )
+                ):
+                    cap.capture(layer_id=1, topk_indices=ids)
+            batch = SimpleNamespace(
+                global_num_tokens_cpu=parent_sizes,
+                out_cache_loc=torch.empty(parent_sizes[rank]),
+            )
+            return cap._get_local_slice(batch, False, None)[:, 1, 0].tolist()
+
+    def test_non_ep_dp_tbo_reads_each_ranks_rows(self):
+        """Gathered children must land where each DP rank's readback looks."""
+        for parent_sizes, split in (
+            ([4, 4], [2, 2]),
+            ([2, 6], [1, 3]),
+            ([6, 2], [4, 1]),
+            ([0, 4], [0, 2]),
+            ([3, 1], [3, 0]),
+        ):
+            for rank, size in enumerate(parent_sizes):
+                with self.subTest(parent_sizes=parent_sizes, rank=rank):
+                    self.assertEqual(
+                        self._read_non_ep_dp_tbo(rank, parent_sizes, split),
+                        [100 * (rank + 1) + i for i in range(size)],
+                    )
+
+    def test_stage_executor_exposes_parent_rows(self):
+        """A child's ForwardContext must carry the rows capture writes."""
+        batch = SimpleNamespace(
+            moe_num_token_non_padded=None,
+            tbo_parent_token_range=(2, 5),
+            tbo_parent_dp_offset=6,
+            global_dp_buffer_len=None,
+            tbo_padded_len=3,
+            global_num_tokens_cpu=None,
+            dp_padding_mode=SimpleNamespace(is_max_len=lambda: False),
+        )
+        executor = _StageExecutor(
+            "test",
+            [],
+            {"forward_batch": batch},
+            child_ctx=ForwardContext(attn_backend=None),
+        )
+        self.assertEqual(executor._child_ctx.tbo_parent_token_range, (2, 5))
+        self.assertEqual(executor._child_ctx.tbo_parent_dp_offset, 6)
 
     def test_other_widths_are_rejected(self):
         """Only the routed-only width may be padded; any other width is a caller bug."""

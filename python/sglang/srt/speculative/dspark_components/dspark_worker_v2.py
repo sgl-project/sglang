@@ -45,7 +45,7 @@ from sglang.srt.speculative.draft_worker_common import (
 )
 from sglang.srt.speculative.dspark_components.dspark_config import (
     DSV4_DRAFT_ATTENTION_BACKEND,
-    draft_is_deepseek_v4,
+    draft_uses_compressed_kv_attention,
     resolve_runtime_config,
 )
 from sglang.srt.speculative.dspark_components.dspark_deferred_commit import (
@@ -95,9 +95,10 @@ from sglang.srt.speculative.spec_utils import (
 from sglang.srt.utils import (
     is_cuda,
     is_cuda_alike,
+    is_hip,
     is_npu,
 )
-from sglang.srt.utils.common import async_h2d
+from sglang.srt.utils.device import async_h2d
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -191,7 +192,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         if not self._hosts_draft:
             return
 
-        self._draft_is_moe = draft_is_deepseek_v4()
+        self._draft_is_moe = draft_uses_compressed_kv_attention()
         self.draft_parallel_layout = resolve_draft_parallel_layout(
             model_draft_parallel_spec(
                 target_worker.model_runner.spec_aux_config.draft_model_config,
@@ -363,7 +364,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._greedy_draft = envs.SGLANG_DSPARK_USE_GREEDY_DRAFT.get()
         markov_head = self.draft_model.markov_head
         self._sharded_accept = (
-            envs.SGLANG_DSPARK_SHARDED_ACCEPT.get()
+            is_hip()
             and not self._greedy_draft
             and markov_head is not None
             and markov_head.vocab_shard is not None

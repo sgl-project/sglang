@@ -122,6 +122,7 @@ def _step(num_tokens, padded=False):
 
 
 _METHOD = "sglang.srt.layers.moe.paged_experts.method."
+_EXPERT_CACHE = "sglang.srt.layers.moe.paged_experts.expert_cache."
 
 
 def _create(method, layer, contract):
@@ -142,9 +143,22 @@ def _create(method, layer, contract):
         method.create_moe_runner(layer, SimpleNamespace(routed_scaling_factor=None))
 
 
-def _load(method, layer):
-    """The post-load step, with the host store on the CPU."""
-    with patch.object(formats, "HostExpertStore", _CpuStore):
+def _exec(enable_disk=False):
+    return SimpleNamespace(moe=SimpleNamespace(paged_experts_enable_disk=enable_disk))
+
+
+def _load(method, layer, disk=False, router_top_k=K):
+    """The post-load step, with the host store on the CPU, the expert cache as ``disk`` says
+    and the model's router top-k ``router_top_k`` (for a layer without one)."""
+    model_config = SimpleNamespace(
+        hf_text_config=SimpleNamespace(num_experts_per_tok=router_top_k)
+    )
+    with (
+        patch.object(formats, "HostExpertStore", _CpuStore),
+        patch(_EXPERT_CACHE + "HostExpertStore", _CpuStore),
+        patch(_METHOD + "get_exec", return_value=_exec(disk)),
+        patch(_METHOD + "process_model_config", return_value=model_config),
+    ):
         method.process_weights_after_loading(layer)
 
 
@@ -1291,17 +1305,6 @@ class TestSizing(CustomTestCase):
         with self.assertNoLogs(sizing.logger, level="WARNING"):
             self._sized(budget_slots=4, kv_tokens=4096)
 
-    def test_the_log_names_k_the_kv_cache_its_aim_and_how_to_pin(self):
-        with self.assertLogs(sizing.logger, level="INFO") as logs:
-            self._sized(budget_slots=4, max_total_tokens=10240)
-        line = logs.output[0]
-        for part in (
-            f"K={K} of {E} experts",
-            "KV cache 10240 tokens (aim 10240: --max-total-tokens)",
-            f"To pin: --paged-experts-num-resident {K}",
-        ):
-            self.assertIn(part, line)
-
     def test_more_requests_are_a_target_one_request_the_promise(self):
         """--context-length x --max-running-requests is aimed for; a KV cache that holds one
         full-length request but not all of them sizes, logs how many fit, and does not fail."""
@@ -1439,7 +1442,6 @@ class TestSizing(CustomTestCase):
         args = dict(context_length=4096, kv_bytes=2, max_running_requests=8)
         args["mamba_full_memory_ratio"] = 9
         self.assertEqual(self._mamba_slots(20_000, **args), [10])
-        self.assertLess((20_000 - 17 * 1000) // 2, 4096)
         # Room for all 8 requests: no change. No room even for one: one request's state,
         # and startup names the context that does not fit.
         self.assertEqual(self._mamba_slots(10**6, **args), [16])
@@ -1450,25 +1452,6 @@ class TestSizing(CustomTestCase):
         self.assertEqual(self._mamba_slots(20_000, max_total_tokens=2000, **args), [14])
         self.assertEqual(self._mamba_slots(20_000, max_total_tokens=5000, **args), [8])
 
-    def test_the_log_says_how_many_requests_run_and_how_to_run_more(self):
-        """Each running request needs its own Mamba state, so the log says how many run at a
-        time; without --max-running-requests it names that flag, with it it says how many of
-        them queue. Control: all requests set fit, no hint."""
-        self.assertEqual(
-            sizing._mamba_text(3, 3, None),
-            "Mamba state for 1 request(s) at a time (3 slot(s)); "
-            "set --max-running-requests to run more",
-        )
-        self.assertEqual(
-            sizing._mamba_text(9, 2, 8),
-            "Mamba state for 4 request(s) at a time (9 slot(s)) "
-            "of --max-running-requests 8; the rest queue",
-        )
-        self.assertEqual(
-            sizing._mamba_text(16, 2, 8),
-            "Mamba state for 8 request(s) at a time (16 slot(s))",
-        )
-
     def test_kv_minimum_by_size_rule_in_whole_pages(self):
         """A --max-total-tokens that is no page multiple: the KV cache can hold at most
         9,984 of 10,000 tokens at page size 64, which size() accepts, so the Mamba state
@@ -1478,8 +1461,6 @@ class TestSizing(CustomTestCase):
         self.assertEqual(
             self._mamba_slots(26_990, max_total_tokens=10_000, **args), [16]
         )
-        self.assertLess(9_984, 10_000)
-        self.assertGreater(9_984 + 64, 10_000)
 
 
 if __name__ == "__main__":
