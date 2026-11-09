@@ -348,28 +348,16 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
-        from sglang.srt.layers.moe.utils import (
-            get_moe_a2a_backend,
-            get_moe_runner_backend,
-        )
-
         self.moe_runner_config = moe_runner_config
         # Other platforms keep the existing Triton INT8 path; SAIL DeepEP must use
-        # a compatible runner.
+        # a compatible runner, and the SAIL package owns that choice.
         moe_runner_backend = MoeRunnerBackend.TRITON
         if _is_sail:
-            requested_backend = get_moe_runner_backend()
-            if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and (
-                get_moe_a2a_backend().is_deepep()
-                or get_moe_a2a_backend().is_mooncake()
-                or requested_backend.is_deep_gemm()
-                or (requested_backend.is_auto() and envs.SGLANG_SAIL_DEEPGEMM_MOE.get())
-            ):
-                moe_runner_backend = MoeRunnerBackend.DEEP_GEMM
-            elif get_moe_a2a_backend().is_deepep() or requested_backend.is_deep_gemm():
-                raise ValueError(
-                    "SAIL INT8 DeepEP requires an available DeepGEMM backend"
-                )
+            from sglang.srt.hardware_backend.sail.quantization.int8_moe_runner import (
+                select_int8_moe_runner_backend,
+            )
+
+            moe_runner_backend = select_int8_moe_runner_backend()
         self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
 
     def get_triton_quant_info(self, layer: torch.nn.Module) -> TritonMoeQuantInfo:

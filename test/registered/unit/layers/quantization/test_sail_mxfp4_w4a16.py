@@ -11,6 +11,7 @@ import torch
 from sglang.srt.arg_groups.overrides import declare_resolution
 from sglang.srt.arg_groups.platform_hook import handle_sail_backends
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.sail.quantization import mxfp4 as sail_mxfp4
 from sglang.srt.layers.moe.utils import MoeA2ABackend, MoeRunnerBackend
 from sglang.srt.layers.quantization import mxfp4
 from sglang.srt.runtime_context import get_flags, override_platform
@@ -50,7 +51,7 @@ class TestSailMxfp4W4a16(CustomTestCase):
             with (
                 self.subTest(runner=runner, a2a=a2a, jit=jit),
                 patch.object(mxfp4, "_is_sail", True),
-                patch.object(mxfp4.deep_gemm_wrapper, "ENABLE_JIT_DEEPGEMM", jit),
+                patch.object(sail_mxfp4.deep_gemm_wrapper, "ENABLE_JIT_DEEPGEMM", jit),
                 envs.SGLANG_SAIL_DEEPGEMM_MXFP4_W4A16.override(True),
                 get_flags().moe.override(runner_backend=runner, a2a_backend=a2a),
                 self.assertRaises(error),
@@ -81,6 +82,33 @@ class TestSailMxfp4W4a16(CustomTestCase):
             self.assertEqual(seed.moe_runner_backend, "auto")
             self.assertEqual(seed.moe_a2a_backend, "deepep")
 
+    def test_platform_hook_leaves_the_hardware_half_to_the_quant_method(self):
+        """The argument hook only sees the arguments: resolving a W4A16 MMA start
+        must not look at the device or the DeepGEMM build. Both probes are armed
+        to fail if they run, which is also what lets this pass on CPU."""
+        seed = SimpleNamespace(moe_runner_backend="auto", moe_a2a_backend="none")
+        declare_resolution(
+            seed, "test", moe_runner_backend="deep_gemm", moe_a2a_backend="none"
+        )
+        with (
+            override_platform(is_sail=True),
+            envs.SGLANG_SAIL_DEEPGEMM_DENSE.override(False),
+            envs.SGLANG_SAIL_DEEPGEMM_MOE.override(False),
+            envs.SGLANG_SAIL_DEEPGEMM_MXFP4_W4A16_MMA.override(True),
+            patch(
+                "sglang.srt.arg_groups.platform_hook.use_mla_backend",
+                return_value=False,
+            ),
+            patch.object(
+                sail_mxfp4,
+                "get_device_sm",
+                side_effect=AssertionError("the hook must not probe the device"),
+            ),
+            # Without an available DeepGEMM the availability check would raise.
+            patch.object(sail_mxfp4.deep_gemm_wrapper, "ENABLE_JIT_DEEPGEMM", False),
+        ):
+            handle_sail_backends(seed)
+
     def test_opt_in_does_not_change_other_platforms_or_native_default(self):
         for sail, valu, mma in (
             (False, True, False),
@@ -93,8 +121,8 @@ class TestSailMxfp4W4a16(CustomTestCase):
             with (
                 self.subTest(sail=sail, valu=valu, mma=mma),
                 patch.object(mxfp4, "_is_sail", sail),
-                patch.object(mxfp4, "get_device_sm", return_value=89),
-                patch.object(mxfp4.deep_gemm_wrapper, "ENABLE_JIT_DEEPGEMM", True),
+                patch.object(sail_mxfp4, "get_device_sm", return_value=89),
+                patch.object(sail_mxfp4.deep_gemm_wrapper, "ENABLE_JIT_DEEPGEMM", True),
                 get_flags().moe.override(
                     runner_backend=MoeRunnerBackend.DEEP_GEMM,
                     a2a_backend=MoeA2ABackend.NONE,
@@ -242,24 +270,23 @@ class TestSailMxfp4W4a16(CustomTestCase):
         """The weight ABI choice must first reject mutually exclusive modes, old
         architectures and the wrong communication backend."""
         with (
-            patch.object(mxfp4, "_is_sail", True),
-            patch.object(mxfp4.deep_gemm_wrapper, "ENABLE_JIT_DEEPGEMM", True),
+            patch.object(sail_mxfp4.deep_gemm_wrapper, "ENABLE_JIT_DEEPGEMM", True),
             get_flags().moe.override(
                 runner_backend=MoeRunnerBackend.DEEP_GEMM,
                 a2a_backend=MoeA2ABackend.DEEPEP,
             ),
         ):
             with self.assertRaisesRegex(ValueError, "mutually exclusive"):
-                mxfp4.Mxfp4MoEMethod._validate_sail_mxfp4_w4a16(True, True)
+                sail_mxfp4.validate_w4a16_modes(True, True)
             for sm, mma in ((80, False), (89, True), (100, True)):
                 with (
                     self.subTest(sm=sm, mma=mma),
-                    patch.object(mxfp4, "get_device_sm", return_value=sm),
+                    patch.object(sail_mxfp4, "get_device_sm", return_value=sm),
                 ):
-                    mxfp4.Mxfp4MoEMethod._validate_sail_mxfp4_w4a16(not mma, mma)
-            with patch.object(mxfp4, "get_device_sm", return_value=80):
+                    sail_mxfp4.validate_w4a16_modes(not mma, mma)
+            with patch.object(sail_mxfp4, "get_device_sm", return_value=80):
                 with self.assertRaisesRegex(ValueError, "SM89"):
-                    mxfp4.Mxfp4MoEMethod._validate_sail_mxfp4_w4a16(False, True)
+                    sail_mxfp4.validate_w4a16_modes(False, True)
 
     def test_mma_creates_direct_weights_without_bias(self):
         """64-alignment must not misuse Marlin's 128/256 padding or create an

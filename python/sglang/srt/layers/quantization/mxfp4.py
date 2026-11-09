@@ -20,7 +20,7 @@ from __future__ import annotations
 import os
 from dataclasses import fields, replace
 from functools import lru_cache
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 from torch.nn.parameter import Parameter
@@ -30,7 +30,6 @@ from torch.nn.parameter import Parameter
 # setdefault preserves any explicit user override.
 os.environ.setdefault("TLLM_LOG_LEVEL", "INFO")
 from sglang.srt.environ import envs
-from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.amx_utils import (
     CPUQuantMethod,
     _amx_process_weight_after_loading,
@@ -42,10 +41,8 @@ from sglang.srt.layers.moe.utils import (
     get_moe_runner_backend,
     route_dropped_experts_to_local,
 )
-from sglang.srt.layers.parameter import GroupQuantScaleParameter, ModelWeightParameter
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
-    LinearMethodBase,
     QuantizationConfig,
     QuantizeMethodBase,
 )
@@ -58,7 +55,6 @@ from sglang.srt.runtime_context import (
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_device_capability,
-    get_device_sm,
     is_cpu,
     is_flashinfer_available,
     is_gfx95_supported,
@@ -231,12 +227,6 @@ if _is_hip:
         from aiter.utility.fp4_utils import e8m0_shuffle
     except ImportError as err:
         dynamic_mxfp4_quant = e8m0_shuffle = err
-
-
-def _preprocess_sail_mxfp4_scales(scales: torch.Tensor) -> torch.Tensor:
-    from deep_gemm import preprocess_mxfp4_scales
-
-    return preprocess_mxfp4_scales(scales)
 
 
 def _pad_hopper_mxfp4_scale(scale, k_size):
@@ -417,6 +407,10 @@ class Mxfp4Config(QuantizationConfig):
                 return UnquantizedLinearMethod()
             # SAIL DeepGEMM supports serialized MXFP4 dense weights.
             elif self.is_checkpoint_mxfp4_serialized and _is_sail:
+                from sglang.srt.hardware_backend.sail.quantization.mxfp4 import (
+                    Mxfp4LinearMethod,
+                )
+
                 return Mxfp4LinearMethod(prefix=prefix)
             else:
                 raise NotImplementedError
@@ -432,99 +426,6 @@ class Mxfp4Config(QuantizationConfig):
 
     def get_scaled_act_names(self) -> List[str]:
         return []
-
-
-class Mxfp4LinearMethod(LinearMethodBase):
-    def __init__(
-        self,
-        prefix: str,
-    ):
-        if not (
-            _is_sail and get_device_sm() >= 89 and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-        ):
-            raise RuntimeError(
-                "SAIL MXFP4 dense requires SM89+ and an available DeepGEMM."
-            )
-        self.prefix = prefix
-
-    def create_weights(
-        self,
-        layer: torch.nn.Module,
-        input_size_per_partition: int,
-        output_partition_sizes: List[int],
-        input_size: int,
-        output_size: int,
-        params_dtype: torch.dtype,
-        **extra_weight_attrs,
-    ):
-        weight_loader = extra_weight_attrs.get("weight_loader")
-        self.logical_widths = output_partition_sizes
-        weight_dtype = torch.uint8
-        scale_dtype = torch.uint8
-        mxfp4_block = 32
-        extra_weight_attrs.update({"quant_method": "group"})
-
-        if input_size_per_partition % mxfp4_block != 0:
-            raise ValueError(
-                f"Weight input_size_per_partition = {input_size_per_partition} is not divisible by {mxfp4_block}."
-            )
-
-        weight = ModelWeightParameter(
-            data=torch.empty(
-                sum(output_partition_sizes),
-                input_size_per_partition // 2,
-                dtype=weight_dtype,
-            ),
-            input_dim=1,
-            output_dim=0,
-            weight_loader=weight_loader,
-        )
-        layer.register_parameter("weight", weight)
-
-        weight_scale = GroupQuantScaleParameter(
-            data=torch.empty(
-                sum(output_partition_sizes),
-                input_size_per_partition // mxfp4_block,
-                dtype=scale_dtype,
-            ),
-            input_dim=1,
-            output_dim=0,
-            weight_loader=weight_loader,
-        )
-        layer.register_parameter("weight_scale", weight_scale)
-
-    def process_weights_after_loading(self, layer):
-        layer.weight = Parameter(layer.weight.t(), requires_grad=False)
-
-        weight_scale = layer.weight_scale
-        processed_scale = _preprocess_sail_mxfp4_scales(weight_scale)
-        layer.weight_scale = Parameter(processed_scale, requires_grad=False)
-
-    def apply(
-        self,
-        layer: torch.nn.Module,
-        x: torch.Tensor,
-        bias: Optional[torch.Tensor] = None,
-    ):
-        from sglang.kernels.ops.quantization.sail_mxfp4 import downcast_to_mxfp4
-        from sglang.srt.hardware_backend.sail.deep_gemm.sail_fused_deepgemm_ops import (
-            gemm_nt_f4f4bf16,
-        )
-
-        output_shape = (*x.shape[:-1], layer.weight.shape[1])
-        x_flat = x.reshape(-1, x.shape[-1])
-        if x_flat.shape[0] == 0:
-            return torch.empty(output_shape, dtype=x.dtype, device=x.device)
-        if bias is not None:
-            bias = bias.to(torch.float32)
-        x_q, x_scale = downcast_to_mxfp4(x_flat, axis=1)
-        out = torch.empty(
-            (x_q.shape[0], layer.weight.shape[1]),
-            dtype=torch.bfloat16,
-            device=x_q.device,
-        )
-        gemm_nt_f4f4bf16(x_q, x_scale, layer.weight.t(), layer.weight_scale, bias, out)
-        return out.to(x.dtype).reshape(output_shape)
 
 
 class Mxfp4MoEMethod(FusedMoEMethodBase):
@@ -554,11 +455,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         # MoE runner, so it needs the same unpadded checkpoint layout and
         # DeepGEMM scale preparation even when the runner is flashinfer_mxfp4.
         self.use_mega_moe = get_moe_a2a_backend().is_megamoe()
-        valu_enabled = envs.SGLANG_SAIL_DEEPGEMM_MXFP4_W4A16.get()
-        mma_enabled = envs.SGLANG_SAIL_DEEPGEMM_MXFP4_W4A16_MMA.get()
-        self._validate_sail_mxfp4_w4a16(valu_enabled, mma_enabled)
-        self.use_deepgemm_mxfp4_w4a16_valu = _is_sail and valu_enabled
-        self.use_deepgemm_mxfp4_w4a16_mma = _is_sail and mma_enabled
+        (
+            self.use_deepgemm_mxfp4_w4a16_valu,
+            self.use_deepgemm_mxfp4_w4a16_mma,
+        ) = self._sail_w4a16_modes()
         self.flashinfer_mxfp4_moe_precision = (
             get_exec().moe.flashinfer_mxfp4_moe_precision
         )
@@ -596,54 +496,26 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 )
 
     @staticmethod
-    def _validate_sail_mxfp4_w4a16(valu_enabled: bool, mma_enabled: bool) -> None:
+    def _sail_w4a16_modes() -> Tuple[bool, bool]:
+        """The W4A16 modes this platform resolved; both stay off elsewhere."""
         if not _is_sail:
-            return
-        if valu_enabled and mma_enabled:
-            raise ValueError(
-                "SAIL MXFP4 W4A16 VALU and MMA modes are mutually exclusive."
-            )
-        if not (valu_enabled or mma_enabled):
-            return
-        if mma_enabled and get_device_sm() < 89:
-            raise ValueError("SAIL MXFP4 W4A16 MMA requires SM89+.")
-        if not get_moe_runner_backend().is_deep_gemm():
-            raise ValueError(
-                "SAIL MXFP4 W4A16 requires --moe-runner-backend deep_gemm."
-            )
-        a2a = get_moe_a2a_backend()
-        if not (a2a.is_none() or a2a.is_deepep()):
-            raise ValueError(
-                "SAIL MXFP4 W4A16 only supports --moe-a2a-backend none or deepep."
-            )
-        if not deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
-            raise RuntimeError(
-                "SAIL MXFP4 W4A16 requires an available DeepGEMM; check the "
-                "dependencies and SGLANG_ENABLE_JIT_DEEPGEMM."
-            )
+            return False, False
+        from sglang.srt.hardware_backend.sail.quantization.mxfp4 import (
+            resolved_w4a16_modes,
+        )
+
+        return resolved_w4a16_modes()
 
     @staticmethod
     def is_sail_deepgemm_moe_runner_backend_enabled() -> bool:
         """Only select SAIL FP4xFP4; the NVIDIA W4A8 backend is left unchanged."""
         if not _is_sail:
             return False
-        moe_runner_backend = get_moe_runner_backend()
-        available = deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and get_device_sm() >= 89
-        if moe_runner_backend.is_deep_gemm():
-            if not available:
-                raise RuntimeError(
-                    "SAIL MXFP4 MoE requires SM89+ and an available DeepGEMM."
-                )
-            return True
-        return (
-            moe_runner_backend.is_auto()
-            and available
-            and (
-                get_moe_a2a_backend().is_deepep()
-                or get_moe_a2a_backend().is_mooncake()
-                or envs.SGLANG_SAIL_DEEPGEMM_MOE.get()
-            )
+        from sglang.srt.hardware_backend.sail.quantization.mxfp4 import (
+            deepgemm_moe_runner_backend_enabled,
         )
+
+        return deepgemm_moe_runner_backend_enabled()
 
     @property
     def use_deep_gemm_w4a8(self) -> bool:
@@ -1402,6 +1274,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # the weights -- the whole point of MXFP4 on XPU.
             return
         elif self.is_sail_deepgemm_moe_runner_backend_enabled():
+            from sglang.srt.hardware_backend.sail.quantization.mxfp4 import (
+                preprocess_sail_mxfp4_scales,
+            )
+
             if self.with_bias:
                 w13_weight_bias = layer.w13_weight_bias.to(torch.float32)
                 w2_weight_bias = layer.w2_weight_bias.to(torch.float32)
@@ -1417,11 +1293,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             for idx, scale_uint8 in enumerate(w2_weight_scale):
                 processed_w2_scale.append(scale_uint8)
 
-            w13_scale = _preprocess_sail_mxfp4_scales(
+            w13_scale = preprocess_sail_mxfp4_scales(
                 torch.stack(processed_w13_scale, dim=0)
             )
             layer.w13_weight_scale = Parameter(w13_scale, requires_grad=False)
-            w2_scale = _preprocess_sail_mxfp4_scales(
+            w2_scale = preprocess_sail_mxfp4_scales(
                 torch.stack(processed_w2_scale, dim=0)
             )
             layer.w2_weight_scale = Parameter(w2_scale, requires_grad=False)
