@@ -101,7 +101,6 @@ RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
     ccache \
     git-lfs \
     # MPI and NUMA
-    libopenmpi-dev \
     libnuma1 \
     libnuma-dev \
     numactl \
@@ -124,7 +123,7 @@ RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
     libgtest-dev \
     libjsoncpp-dev \
     libunwind-dev \
-    libboost-all-dev \
+    libboost-dev \
     libssl-dev \
     libgrpc-dev \
     libgrpc++-dev \
@@ -136,7 +135,6 @@ RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
     libcurl4-openssl-dev \
     libczmq4 \
     libczmq-dev \
-    libfabric-dev \
     linux-libc-dev \
     # Package building tools
     devscripts \
@@ -331,7 +329,7 @@ ARG GDRCOPY_VERSION=2.5.1
 ARG MAX_JOBS=8
 
 RUN yum install -y --nogpgcheck --enablerepo=powertools \
-        cmake curl gcc gcc-c++ git infiniband-diags libfabric libfabric-devel \
+        cmake curl gcc gcc-c++ git infiniband-diags \
         libibverbs libibverbs-devel libibverbs-utils librdmacm librdmacm-devel \
         make patchelf perftest pkgconfig rdma-core wget \
  && yum clean all && rm -rf /var/cache/yum
