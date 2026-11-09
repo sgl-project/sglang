@@ -142,6 +142,30 @@ struct PullWorkSpace {
   uint8_t* mc_workspace;                          // multicast VA of the local workspace, or null
 };
 
+/// One ring's state on one rank, padded to a cache line like `Semaphore`. All
+/// counts are 64-bit so no comparison ever wraps.
+struct alignas(128) RingSemaphore {
+  uint64_t drained;  // packets the successor has drained from this rank; only the successor writes it
+  uint64_t packet;   // packets this rank's ring has sent (and received); rank-local
+  uint64_t ready;    // packets the predecessor has published here; only the predecessor writes it
+};
+static_assert(sizeof(RingSemaphore) == 128, "must match _SEMAPHORE_BYTES in custom_all_reduce_v2.py");
+
+/// Kernel-facing view of a ring plane from one rank: its own receive FIFOs
+/// (the predecessor pushes into them), the successor's FIFOs (this rank pushes
+/// into them), and the semaphore rows of this rank and both neighbours.
+/// `credits` (local) holds what the neighbours report; `prev_credits` is where
+/// this rank reports what it drained, `next_credits` what it published.
+struct RingWorkSpace {
+  uint8_t* recv;
+  uint8_t* send;
+  RingSemaphore* credits;
+  RingSemaphore* prev_credits;
+  RingSemaphore* next_credits;
+  uint32_t slot_bytes;
+  uint32_t num_slots;
+};
+
 /// The -0.0 bit pattern per element type, which the Lamport protocol writes in place of +0.0.
 template <typename T>
 struct FloatTrait {};
@@ -337,7 +361,8 @@ struct McBarrier {
 namespace host::distributed {
 
 using device::distributed::EpochCounter, device::distributed::Semaphore;
-using device::distributed::PullWorkSpace, device::distributed::PushWorkSpace;
+using device::distributed::PullWorkSpace, device::distributed::PushWorkSpace, device::distributed::RingWorkSpace;
+using device::distributed::RingSemaphore;
 using TensorView = tvm::ffi::TensorView;
 template <typename T>
 using Optional = tvm::ffi::Optional<T>;
@@ -459,8 +484,52 @@ struct PullPlaneObj : public tvm::ffi::Object, BasePlane {
   }
 };
 
+/**
+ * \brief Ring plane: symmetric FIFOs per rank plus one semaphore per ring,
+ *        for the ring all-reduce.
+ *
+ * Each block of the launch runs one ring (channel), so each rank holds
+ * `[num_rings][num_slots][slot_bytes]`: ring i of the predecessor streams
+ * packets into slot `packet % num_slots` of row i. The counters in the
+ * semaphores persist across launches, so the semaphores MUST be zero-filled
+ * before first use.
+ *
+ * Holds no storage: the caller (Python) owns the tensors and their lifetime.
+ */
+struct RingPlaneObj : public tvm::ffi::Object, BasePlane {
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("sgl.distributed.RingPlane", RingPlaneObj, tvm::ffi::Object);
+
+  // Defined in csrc/distributed/registry.cuh (only the registration module needs the implementation).
+  RingPlaneObj(
+      uint32_t rank,
+      uint32_t world_size,
+      std::vector<TensorView> workspaces,   // world_size * [num_rings][num_slots][slot_bytes]
+      std::vector<TensorView> semaphores);  // world_size * [num_rings]
+
+  uint32_t num_rings;                                    // one per block of the launch
+  uint32_t num_slots;                                    // FIFO depth per ring, a power of two
+  int64_t slot_bytes;                                    // one packet
+  std::array<RingSemaphore*, kMaxWorldSize> semaphores;  // symmetric memory
+  std::array<uint8_t*, kMaxWorldSize> workspaces;        // symmetric memory
+
+  RingWorkSpace get_workspace() const {
+    const auto next = (rank + 1) % world_size;
+    const auto prev = (rank + world_size - 1) % world_size;
+    return RingWorkSpace{
+        workspaces[rank],
+        workspaces[next],
+        semaphores[rank],
+        semaphores[prev],
+        semaphores[next],
+        static_cast<uint32_t>(slot_bytes),
+        num_slots,
+    };
+  }
+};
+
 SGLANG_REGISTER_FFI_REFERENCE_CLASS(PushPlaneRef, PushPlaneObj);
 SGLANG_REGISTER_FFI_REFERENCE_CLASS(PullPlaneRef, PullPlaneObj);
+SGLANG_REGISTER_FFI_REFERENCE_CLASS(RingPlaneRef, RingPlaneObj);
 
 /**
  * \brief The planes every kernel in this directory takes, plus the launch
@@ -479,7 +548,7 @@ struct CommunicatorObj : public tvm::ffi::Object {
    * modules are separate shared objects that see this header but never link
    * that translation unit, so everything they call has to be inline here.
    */
-  CommunicatorObj(Optional<PushPlaneRef> push, Optional<PullPlaneRef> pull);
+  CommunicatorObj(Optional<PushPlaneRef> push, Optional<PullPlaneRef> pull, Optional<RingPlaneRef> ring_simple);
 
   uint32_t get_rank() const {
     return m_push.has_value() ? m_push.value()->rank : m_pull.value()->rank;
@@ -494,6 +563,9 @@ struct CommunicatorObj : public tvm::ffi::Object {
   bool has_pull() const {
     return m_pull.has_value();
   }
+  bool has_ring_simple() const {
+    return m_ring_simple.has_value();
+  }
   /// The planes as handles, for callers that hold on to one (Python). Kernels
   /// want `get_*_obj()` below, which skips the refcount traffic.
   Optional<PushPlaneRef> get_push() const {
@@ -502,6 +574,9 @@ struct CommunicatorObj : public tvm::ffi::Object {
   Optional<PullPlaneRef> get_pull() const {
     return m_pull;
   }
+  Optional<RingPlaneRef> get_ring_simple() const {
+    return m_ring_simple;
+  }
   const PushPlaneObj& get_push_obj() const {
     CHECK_HOST(m_push.has_value()) << "This communicator has no push plane";
     return *m_push.value().get();
@@ -509,6 +584,10 @@ struct CommunicatorObj : public tvm::ffi::Object {
   const PullPlaneObj& get_pull_obj() const {
     CHECK_HOST(m_pull.has_value()) << "This communicator has no pull plane";
     return *m_pull.value().get();
+  }
+  const RingPlaneObj& get_ring_simple_obj() const {
+    CHECK_HOST(m_ring_simple.has_value()) << "This communicator has no ring_simple plane";
+    return *m_ring_simple.value().get();
   }
 
   /*
@@ -537,6 +616,7 @@ struct CommunicatorObj : public tvm::ffi::Object {
   std::optional<uint32_t> m_pull_multicast_blocks;
   Optional<PushPlaneRef> m_push;
   Optional<PullPlaneRef> m_pull;
+  Optional<RingPlaneRef> m_ring_simple;
 };
 
 SGLANG_REGISTER_FFI_REFERENCE_CLASS(CommunicatorRef, CommunicatorObj);

@@ -64,7 +64,7 @@ __global__ __launch_bounds__(1024, 1) void pair_push_kernel(const __grid_constan
     vec_t vec;
     vec.load(params.input, kAllGather ? j : peer * chunk_vecs + j);
     Lamport::clear_pos_zero(vec.data());
-    ptx::st_relaxed_16B(vec, push_ptr, j);
+    ptx::st_relaxed_nt_16B(vec, push_ptr, j);
     // remap before the local store too, so both ranks hold identical bits
     if constexpr (kAllGather) vec.store(params.output, r * chunk_vecs + j);
   }
@@ -76,7 +76,7 @@ __global__ __launch_bounds__(1024, 1) void pair_push_kernel(const __grid_constan
     // in either order
     vec_t vec[2];
     do {
-      ptx::ld_relaxed_16B(vec[0], poll_ptr, j);
+      ptx::ld_nt_16B(vec[0], poll_ptr, j);
     } while (Lamport::has_pos_zero(vec[0].data()));
     if constexpr (kAllGather) {
       vec[0].store(params.output, peer * chunk_vecs + j);
@@ -84,7 +84,7 @@ __global__ __launch_bounds__(1024, 1) void pair_push_kernel(const __grid_constan
       vec[1].load(params.input, r * chunk_vecs + j);
       reduce_vec(vec).store(params.output, j);
     }
-    ptx::st_global_16B(pos_zero_vec, poll_ptr, j);
+    ptx::st_nt_16B(pos_zero_vec, poll_ptr, j);
   }
 
   PDLTriggerSecondary<kUsePDL>();
