@@ -118,7 +118,7 @@ def _make_prealloc_queue(
     queue.scheduler = SimpleNamespace(
         enable_hisparse=enable_hisparse,
         tp_worker=tp_worker,
-        output_streamer=MagicMock(),
+        request_retirer=SimpleNamespace(retire_unadmitted=MagicMock()),
     )
     return queue
 
@@ -133,7 +133,6 @@ def _make_req(rid: str, prompt_len: int):
         origin_input_ids=[0] * prompt_len,
         output_ids=[],
         return_logprob=False,
-        pd_rebootstrap_in_progress=False,
         finished_reason=None,
     )
 
@@ -155,7 +154,7 @@ class TestCheckIfReqExceedKvCapacity(CustomTestCase):
         req = _make_req("hisparse-long", prompt_len=2048)
 
         self.assertFalse(queue._check_if_req_exceed_kv_capacity(req))
-        queue.scheduler.output_streamer.stream_output.assert_not_called()
+        queue.scheduler.request_retirer.retire_unadmitted.assert_not_called()
 
     def test_hisparse_rejects_beyond_host_backed_size(self):
         """Requests longer than host-backed capacity are still aborted."""
@@ -167,9 +166,7 @@ class TestCheckIfReqExceedKvCapacity(CustomTestCase):
         req = _make_req("hisparse-too-long", prompt_len=5000)
 
         self.assertTrue(queue._check_if_req_exceed_kv_capacity(req))
-        queue.scheduler.output_streamer.stream_output.assert_called_once_with(
-            [req], req.return_logprob
-        )
+        queue.scheduler.request_retirer.retire_unadmitted.assert_called_once_with(req)
         # prepare_abort sets finished_reason to a BAD_REQUEST FINISH_ABORT.
         self.assertIsNotNone(req.finished_reason)
 
@@ -184,13 +181,11 @@ class TestCheckIfReqExceedKvCapacity(CustomTestCase):
         req = _make_req("non-hisparse-too-long", prompt_len=2048)
 
         self.assertTrue(queue._check_if_req_exceed_kv_capacity(req))
-        queue.scheduler.output_streamer.stream_output.assert_called_once_with(
-            [req], req.return_logprob
-        )
+        queue.scheduler.request_retirer.retire_unadmitted.assert_called_once_with(req)
 
     def test_rebootstrap_input_len_used_for_capacity(self):
         """Rebootstrap requests carry both prompt and emitted output_ids; the
-        admission gate must use the rebootstrap-aware length (prompt + output)
+        admission gate must use the pre-alloc fill length (prompt + output - 1)
         rather than just the prompt length."""
         queue = _make_prealloc_queue(
             enable_hisparse=True,
@@ -200,9 +195,8 @@ class TestCheckIfReqExceedKvCapacity(CustomTestCase):
         req = _Req(
             rid="rebootstrap",
             origin_input_ids=[0] * 60,
-            output_ids=[0] * 60,  # 60 + 60 = 120 > 100
+            output_ids=[0] * 60,  # 60 + 59 = 119 > 100
             return_logprob=False,
-            pd_rebootstrap_in_progress=True,
             finished_reason=None,
         )
         self.assertTrue(queue._check_if_req_exceed_kv_capacity(req))

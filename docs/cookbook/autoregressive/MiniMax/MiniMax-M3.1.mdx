@@ -146,7 +146,7 @@ The B300 **Low-Latency** recipe serves batch-size-1 decode through the MSA-V1 Mo
   - **Hierarchical KV cache** (`--enable-hierarchical-cache`). At the default ratio of 2, the host pools (main KV, index K and draft KV) take about 350 GB per rank, so one TP4 server needs about 1.4 TB of host memory. On a host with less free memory, the server lowers the ratio until the pools fit in 80% of it. When two servers share a host, lower `--hicache-host-memory-fraction` on each.
   - **FP8 DSpark draft KV cache** (`--speculative-draft-kv-cache-dtype fp8_e4m3`). The same memory holds 9% more tokens. The draft cache only affects which draft tokens get accepted; the target model still verifies every token.
 - **`--prefill-decode-interval 16`** runs 16 decode steps after each prefill batch before the next prefill. With 64 concurrent sessions and HiCache on MI350X, it lowered P90 inter-token latency by about 10% at the cost of about 3% throughput.
-- The High-Throughput recipe was measured on MI350X. MI355X runs the same command but has not been measured with it.
+- **High-Throughput on MI355X** sets `--hicache-size 180 --hicache-write-policy write_back` and `HSA_USERPTR_FOR_PAGED_MEM=0`, and keeps the default bf16 draft KV cache. The environment variable backs the HiCache host pools with `hipHostMalloc`; without it the first HiCache write fails with a HIP illegal memory access. 180 GB per rank lets two TP4 servers share one host. With 64 concurrent sessions it reached 90,168 tokens/s per GPU with a P90 TTFT of 1.21 s.
 
 ## 3. Advanced Usage
 

@@ -7,6 +7,7 @@ import signal
 import socket
 import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
@@ -35,6 +36,8 @@ from sglang.srt.arg_groups.hicache_hook import (
     handle_hicache_ratio_default,
 )
 from sglang.srt.arg_groups.hisparse_hook import (
+    _hisparse_allowed_backends,
+    _hisparse_default_backend,
     validate_hisparse,
     validate_hisparse_dsa_backend,
     validate_hisparse_kv_cache_dtype,
@@ -71,6 +74,7 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.arg_groups.parallel_hook import (
     handle_context_parallelism,
     handle_data_parallelism,
+    handle_eplb_and_dispatch,
 )
 from sglang.srt.arg_groups.pd_disaggregation_hook import handle_pd_disaggregation
 from sglang.srt.arg_groups.serving_hook import (
@@ -143,21 +147,21 @@ class TestServerArgsPositionalOrder(CustomTestCase):
             (95, "disable_attn_tp_gather"),
             (96, "enable_p2p_check"),
             (97, "device"),
-            (535, "grpc_response_timeout_secs"),
-            (536, "enable_paged_experts"),
-            (537, "paged_experts_num_resident"),
-            (538, "enable_nvidia_megakernel"),
-            (539, "enable_megamoe_for_layernorm_sp"),
+            (532, "grpc_response_timeout_secs"),
+            (533, "enable_paged_experts"),
+            (534, "paged_experts_num_resident"),
+            (535, "enable_nvidia_megakernel"),
+            (536, "enable_megamoe_for_layernorm_sp"),
         ):
             with self.subTest(index=index):
                 self.assertEqual(fields[index].name, name)
         defaults = ServerArgs(model_path="dummy")
         # Surviving legacy inputs retain their slots after an intentional removal.
-        positional = [getattr(defaults, field.name) for field in fields[:536]]
+        positional = [getattr(defaults, field.name) for field in fields[:533]]
         positional[95] = True
         positional[96] = False
         positional[97] = "cpu"
-        positional[535] = 123.0
+        positional[532] = 123.0
 
         args = ServerArgs(*positional)
 
@@ -174,20 +178,261 @@ class TestServerArgsPositionalOrder(CustomTestCase):
             POSITIONAL_FIELD_ORDER,
         )
 
-    def test_new_parallel_flag_keeps_keyword_and_cli_inputs(self):
+
+class TestMuseSparkLaunchDefaults(CustomTestCase):
+    """Minimal recipes must resolve before generic memory/backend defaults."""
+
+    def resolve(
+        self,
+        *,
+        platform="blackwell",
+        checkpoint="modelopt_fp4",
+        arch="MuseSparkForConditionalGeneration",
+        draft_arch="DFlash2DraftModel",
+        **options,
+    ):
+        from sglang.srt.arg_groups.model_override_base import resolving_view
+        from sglang.srt.arg_groups.muse_spark_hook import apply_muse_spark_env_defaults
+
+        inputs = dict(
+            model_path="dummy",
+            tp_size=4,
+            ep_size=4,
+            enable_layernorm_sp=True,
+            enable_megamoe_for_layernorm_sp=None,
+            device="cuda",
+        )
+        inputs.update(options)
+        args = ServerArgs(**inputs)
+        args.model_path = "/local/checkpoint"
+        args._quantization_explicitly_unset = checkpoint == "unquant"
+        hf = SimpleNamespace(architectures=[arch])
+        args._model_config = SimpleNamespace(hf_config=hf, quantization=checkpoint)
+        draft = SimpleNamespace(
+            architectures=[draft_arch], dflash_config={"block_size": 16}
+        )
+        with (
+            patch.dict(os.environ),
+            override_platform(
+                is_cuda=platform != "amd",
+                is_hip=platform == "amd",
+                is_sm100=platform == "blackwell",
+                is_sm90=platform == "hopper",
+                is_blackwell=platform == "blackwell",
+            ),
+            patch(
+                "sglang.srt.arg_groups.muse_spark_hook.get_config",
+                side_effect=lambda path, **kw: draft if path == "/local/draft" else hf,
+            ),
+        ):
+            apply_muse_spark_env_defaults(args)
+        return resolving_view(args)
+
+    def test_nvfp4_hardware_defaults_and_explicit_overrides(self):
+        for platform, runner, fraction in (
+            ("blackwell", "flashinfer_trtllm", 0.8),
+            ("hopper", "marlin", 0.85),
+        ):
+            with self.subTest(platform=platform):
+                cfg = self.resolve(platform=platform)
+                self.assertEqual(
+                    (cfg.quantization, cfg.moe_runner_backend, cfg.mem_fraction_static),
+                    ("modelopt_fp4", runner, fraction),
+                )
+                explicit = self.resolve(
+                    platform=platform,
+                    quantization="quark_mxfp4",
+                    moe_runner_backend="triton",
+                    mem_fraction_static=0.72,
+                    enable_megamoe_for_layernorm_sp=False,
+                )
+                self.assertEqual(
+                    (
+                        explicit.quantization,
+                        explicit.moe_runner_backend,
+                        explicit.mem_fraction_static,
+                        explicit.enable_megamoe_for_layernorm_sp,
+                    ),
+                    ("quark_mxfp4", "triton", 0.72, False),
+                )
+
+    def test_megamoe_conditions_and_opt_out(self):
+        self.assertTrue(self.resolve().enable_megamoe_for_layernorm_sp)
+        self.assertTrue(
+            self.resolve(disaggregation_mode="prefill").enable_megamoe_for_layernorm_sp
+        )
+        for options in (
+            {"disaggregation_mode": "decode"},
+            {"enable_layernorm_sp": False},
+            {"ep_size": 1},
+            {"ep_size": 2},
+            {"platform": "hopper"},
+            {"checkpoint": None},
+            {"checkpoint": "unquant"},
+            {"enable_megamoe_for_layernorm_sp": False},
+        ):
+            with self.subTest(options=options):
+                self.assertFalse(
+                    self.resolve(**options).enable_megamoe_for_layernorm_sp
+                )
+
+    def test_other_models_and_amd_keep_existing_defaults(self):
+        for options in (
+            {"platform": "amd", "checkpoint": "quark_mxfp4"},
+            {"arch": "LlamaForCausalLM"},
+        ):
+            with self.subTest(options=options):
+                cfg = self.resolve(**options)
+                self.assertIsNone(cfg.quantization)
+                self.assertEqual(cfg.moe_runner_backend, "auto")
+                self.assertIsNone(cfg.mem_fraction_static)
+                self.assertFalse(cfg.enable_megamoe_for_layernorm_sp)
+
+    def test_dflash2_config_defaults_preserve_explicit_choices(self):
+        inputs = dict(
+            speculative_algorithm="DFLASH", speculative_draft_model_path="/local/draft"
+        )
+        for platform in ("blackwell", "hopper"):
+            with self.subTest(platform=platform):
+                cfg = self.resolve(platform=platform, **inputs)
+                self.assertEqual(
+                    (
+                        cfg.speculative_draft_attention_backend,
+                        cfg.speculative_num_draft_tokens,
+                    ),
+                    ("fa4", 8),
+                )
+        cfg = self.resolve(
+            **inputs,
+            speculative_draft_attention_backend="triton",
+            speculative_num_draft_tokens=4,
+        )
+        self.assertEqual(
+            (cfg.speculative_draft_attention_backend, cfg.speculative_num_draft_tokens),
+            ("triton", 4),
+        )
+        cfg = self.resolve(**inputs, speculative_dflash_block_size=4)
+        self.assertIsNone(cfg.speculative_num_draft_tokens)
+        for options in ({"draft_arch": "DFlashDraftModel"}, {"platform": "amd"}):
+            with self.subTest(options=options):
+                self.assertIsNone(
+                    self.resolve(
+                        **inputs, **options
+                    ).speculative_draft_attention_backend
+                )
+
+    def test_minimal_local_recipe_resolves_through_the_full_pipeline(self):
+        """Omitted flags must reach later validators for both ModelOpt formats."""
+        from sglang.srt.configs.muse_spark import MuseSparkConfig
+
+        for platform in ("blackwell", "hopper"):
+            for standalone_quant_config in (False, True):
+                with (
+                    self.subTest(platform=platform, standalone=standalone_quant_config),
+                    tempfile.TemporaryDirectory() as folder,
+                    patch.dict(os.environ),
+                ):
+                    target, draft = Path(folder) / "target", Path(folder) / "draft"
+                    quant = {
+                        "quant_method": "modelopt",
+                        "quant_algo": "NVFP4",
+                        "group_size": 16,
+                    }
+                    config = MuseSparkConfig(
+                        architectures=["MuseSparkForConditionalGeneration"]
+                    )
+                    if not standalone_quant_config:
+                        config.quantization_config = quant
+                    config.save_pretrained(target)
+                    if standalone_quant_config:
+                        (target / "hf_quant_config.json").write_text(
+                            json.dumps({"quantization": quant})
+                        )
+                    draft.mkdir()
+                    (draft / "config.json").write_text(
+                        json.dumps(
+                            {
+                                "model_type": "qwen3",
+                                "architectures": ["DFlash2DraftModel"],
+                                "hidden_size": 4096,
+                                "num_hidden_layers": 5,
+                                "num_attention_heads": 32,
+                                "num_key_value_heads": 8,
+                                "head_dim": 128,
+                                "vocab_size": 202048,
+                                "dflash_config": {
+                                    "block_size": 16,
+                                    "selector_rank": 256,
+                                },
+                            }
+                        )
+                    )
+                    with (
+                        override_platform(
+                            is_cuda=True,
+                            is_hip=False,
+                            is_sm100=platform == "blackwell",
+                            is_sm90=platform == "hopper",
+                            is_blackwell=platform == "blackwell",
+                        ),
+                        patch(
+                            "sglang.srt.arg_groups.memory_hook.get_device_memory_capacity",
+                            return_value=183000,
+                        ),
+                    ):
+                        args = ServerArgs(
+                            model_path=str(target),
+                            device="cuda",
+                            tp_size=4,
+                            ep_size=4,
+                            enable_layernorm_sp=platform == "blackwell",
+                            speculative_algorithm="DFLASH",
+                            speculative_draft_model_path=str(draft),
+                        )
+                        args.resolve_once()
+                        self.assertEqual(
+                            resolution_result(args, "quantization"), "modelopt_fp4"
+                        )
+                        self.assertEqual(
+                            resolution_result(args, "moe_runner_backend"),
+                            "flashinfer_trtllm"
+                            if platform == "blackwell"
+                            else "marlin",
+                        )
+                        self.assertEqual(
+                            resolution_result(args, "mem_fraction_static"),
+                            0.8 if platform == "blackwell" else 0.85,
+                        )
+                        self.assertEqual(
+                            resolution_result(
+                                args, "speculative_draft_attention_backend"
+                            ),
+                            "fa4",
+                        )
+                        self.assertEqual(
+                            resolution_result(args, "speculative_num_draft_tokens"), 8
+                        )
+                        self.assertEqual(
+                            resolution_result(args, "enable_megamoe_for_layernorm_sp"),
+                            platform == "blackwell",
+                        )
+                        self.assertTrue(
+                            envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.get()
+                        )
+
+    def test_megamoe_cli_distinguishes_auto_from_explicit_disable(self):
         parser = argparse.ArgumentParser()
         ServerArgs.add_cli_args(parser)
-        for enabled in (False, True):
-            with self.subTest(enabled=enabled):
-                keyword_args = ServerArgs(
-                    model_path="dummy", enable_megamoe_for_layernorm_sp=enabled
+        for flags, expected in (
+            ([], None),
+            (["--enable-megamoe-for-layernorm-sp"], True),
+            (["--no-enable-megamoe-for-layernorm-sp"], False),
+        ):
+            with self.subTest(flags=flags):
+                args = ServerArgs.from_cli_args(
+                    parser.parse_args(["--model-path", "dummy", *flags])
                 )
-                argv = ["--model-path", "dummy"]
-                if enabled:
-                    argv.append("--enable-megamoe-for-layernorm-sp")
-                cli_args = ServerArgs.from_cli_args(parser.parse_args(argv))
-                self.assertEqual(keyword_args.enable_megamoe_for_layernorm_sp, enabled)
-                self.assertEqual(cli_args.enable_megamoe_for_layernorm_sp, enabled)
+                self.assertIs(args.enable_megamoe_for_layernorm_sp, expected)
 
 
 class TestPrepareServerArgs(CustomTestCase):
@@ -287,6 +532,28 @@ class TestPrepareServerArgs(CustomTestCase):
         # daemon to build the same static EPLB layout as the engine.
         handle_load_format(args)
 
+    def test_eplb_recorder_mode_compatibility(self):
+        def make_args(mode):
+            return ServerArgs(
+                model_path="dummy",
+                tp_size=2,
+                ep_size=2,
+                enable_eplb=True,
+                expert_distribution_recorder_mode=mode,
+            )
+
+        for mode in ("per_pass", "per_token"):
+            with (
+                self.subTest(mode=mode),
+                self.assertRaisesRegex(
+                    ValueError, "needs --expert-distribution-recorder-mode stat"
+                ),
+            ):
+                handle_eplb_and_dispatch(make_args(mode))
+        for mode in (None, "stat", "stat_approx"):
+            with self.subTest(mode=mode):
+                handle_eplb_and_dispatch(make_args(mode))
+
     def test_instanttensor_requires_cuda_device(self):
         for device in ("cpu", "xpu", "npu", "musa", "hpu", "mps"):
             with (
@@ -317,6 +584,37 @@ class TestPrepareServerArgs(CustomTestCase):
                     load_format=load_format,
                     chunked_prefill_size=-1,
                 ).check_server_args()
+
+    @staticmethod
+    def _check_with_custom_mem_pool(device: str, pool: str) -> None:
+        with patch.dict(os.environ, {"SGLANG_MOONCAKE_CUSTOM_MEM_POOL": pool}):
+            ServerArgs(
+                model_path="dummy",
+                served_model_name="dummy",
+                device=device,
+                chunked_prefill_size=-1,
+            ).check_server_args()
+
+    def test_mooncake_custom_mem_pool_rejected_on_xpu(self):
+        """XPU has no CUDA allocator for Mooncake's pools; fail at startup."""
+        for pool in ("INTRA_NODE_NVLINK", "NVLINK"):
+            with (
+                self.subTest(pool=pool),
+                self.assertRaisesRegex(
+                    ValueError, "SGLANG_MOONCAKE_CUSTOM_MEM_POOL is not supported"
+                ),
+            ):
+                self._check_with_custom_mem_pool("xpu", pool)
+
+    def test_mooncake_custom_mem_pool_check_is_xpu_only(self):
+        """Other devices keep their behaviour, and a disabling value passes on XPU."""
+        for device, pool in (
+            ("cuda", "INTRA_NODE_NVLINK"),
+            ("npu", "INTRA_NODE_NVLINK"),
+            ("xpu", "False"),
+        ):
+            with self.subTest(device=device, pool=pool):
+                self._check_with_custom_mem_pool(device, pool)
 
     def test_enable_w4a4_mxfp4_megamoe_preserves_legacy_deepgemm_env(self):
         deepgemm_env = {
@@ -616,6 +914,11 @@ class TestPrepareServerArgs(CustomTestCase):
             base_args + ["--dsv4-prefill-backend", "flashmla_sparse_q8"]
         )
         self.assertEqual(q8_args.dsv4_prefill_backend, "flashmla_sparse_q8")
+
+        cutedsl_args = parser.parse_args(
+            base_args + ["--dsv4-prefill-backend", "cutedsl_h16"]
+        )
+        self.assertEqual(cutedsl_args.dsv4_prefill_backend, "cutedsl_h16")
 
         with self.assertRaises(SystemExit):
             parser.parse_args(base_args + ["--dsv4-prefill-backend", "flashmla_kv"])
@@ -963,10 +1266,15 @@ class TestMultimodalFeatureTransport(CustomTestCase):
         server_args = ServerArgs(model_path="dummy", nnodes=2)
         self._set_model_type(server_args, is_multimodal=True)
 
-        with self.assertLogs(serving_hook.logger, level="INFO") as logs:
-            handle_multimodal_feature_transport(server_args)
+        with patch.dict(os.environ, {}, clear=False):
+            envs.SGLANG_USE_CUDA_IPC_TRANSPORT.clear()
+            with self.assertLogs(serving_hook.logger, level="INFO") as logs:
+                handle_multimodal_feature_transport(server_args)
 
-        self.assertEqual(resolution_result(server_args, "mm_feature_transport"), "cpu")
+            self.assertEqual(
+                resolution_result(server_args, "mm_feature_transport"), "cpu"
+            )
+
         self.assertIn("has not opted into CUDA VMM", "\n".join(logs.output))
 
     @patch("sglang.srt.arg_groups.serving_hook.os.path.exists", return_value=False)
@@ -1373,23 +1681,19 @@ class TestKV4Compatibility(unittest.TestCase):
 class TestLoraForwardDomains(unittest.TestCase):
     def test_rejects_concurrent_forwards(self):
         for runner in ("auto", "lora_cutedsl"):
-            for options in (
-                {"enable_pdmux": True},
-                {"enable_two_batch_overlap": True},
-            ):
-                with self.subTest(runner=runner, options=options):
-                    args = ServerArgs(
-                        model_path="dummy",
-                        tp_size=2,
-                        enable_lora=True,
-                        lora_backend="triton_v2",
-                        moe_runner_backend=runner,
-                        max_lora_rank=8,
-                        lora_target_modules=["down_proj"],
-                        **options,
-                    )
-                    with self.assertRaises(ValueError):
-                        check_lora_server_args(args)
+            with self.subTest(runner=runner):
+                args = ServerArgs(
+                    model_path="dummy",
+                    tp_size=2,
+                    enable_lora=True,
+                    lora_backend="triton_v2",
+                    moe_runner_backend=runner,
+                    max_lora_rank=8,
+                    lora_target_modules=["down_proj"],
+                    enable_two_batch_overlap=True,
+                )
+                with self.assertRaises(ValueError):
+                    check_lora_server_args(args)
 
 
 class TestLoadBalanceMethod(unittest.TestCase):
@@ -1532,18 +1836,30 @@ class TestPdDecodeExtraSlots(CustomTestCase):
 
 class TestSkipTokenizerInit(unittest.TestCase):
     def test_skip_tokenizer_worker_counts(self):
-        server_args = ServerArgs(
-            model_path="dummy",
-            skip_tokenizer_init=True,
-            tokenizer_worker_num=4,
-            detokenizer_worker_num=3,
-        )
+        # Tokenizer fanout is preserved in both modes. The Python server's
+        # detokenizer workers only decode, so with no decode work they are
+        # coerced to 1; Rust-server mode starts none and skips the coercion.
+        for rust_server, detokenizer_worker_num in ((False, 1), (True, 3)):
+            with (
+                self.subTest(rust_server=rust_server),
+                envs.SGLANG_RUST_SERVER.override(rust_server),
+            ):
+                server_args = ServerArgs(
+                    model_path="dummy",
+                    skip_tokenizer_init=True,
+                    tokenizer_worker_num=4,
+                    detokenizer_worker_num=3,
+                )
 
-        handle_tokenizer_batching(server_args)
+                handle_tokenizer_batching(server_args)
 
-        # Tokenizer fanout preserved; detokenizer coerced to 1 (no decode work).
-        self.assertEqual(resolution_result(server_args, "tokenizer_worker_num"), 4)
-        self.assertEqual(resolution_result(server_args, "detokenizer_worker_num"), 1)
+                self.assertEqual(
+                    resolution_result(server_args, "tokenizer_worker_num"), 4
+                )
+                self.assertEqual(
+                    resolution_result(server_args, "detokenizer_worker_num"),
+                    detokenizer_worker_num,
+                )
 
 
 class TestHiSparseDsaBackendPolicy(unittest.TestCase):
@@ -1553,10 +1869,8 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
     def _resolve(kv_cache_dtype, **kw):
         from types import SimpleNamespace
 
-        from sglang.srt.arg_groups.overrides import (
-            ResolvedView,
-            _dsa_split_backend_resolution,
-        )
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
+        from sglang.srt.arg_groups.overrides import _dsa_split_backend_resolution
 
         hf = SimpleNamespace(architectures=["DeepseekV32ForCausalLM"])
         defaults = dict(
@@ -1585,21 +1899,21 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
             ),
         }
 
-    @override_platform(is_hip=False)
+    @override_platform(is_hip=False, is_xpu=False)
     def test_hisparse_defaults_to_flashmla_sparse_on_cuda_bfloat16(self):
         resolved = self._resolve("bfloat16")
 
         self.assertEqual(resolved["dsa_prefill_backend"], "flashmla_sparse")
         self.assertEqual(resolved["dsa_decode_backend"], "flashmla_sparse")
 
-    @override_platform(is_hip=False)
+    @override_platform(is_hip=False, is_xpu=False)
     def test_hisparse_defaults_to_flashmla_kv_on_cuda_fp8(self):
         resolved = self._resolve("fp8_e4m3")
 
         self.assertEqual(resolved["dsa_prefill_backend"], "flashmla_kv")
         self.assertEqual(resolved["dsa_decode_backend"], "flashmla_kv")
 
-    @override_platform(is_hip=False)
+    @override_platform(is_hip=False, is_xpu=False)
     def test_hisparse_accepts_flashinfer_sparse_mla_on_cuda_fp8(self):
         """SM120 GLM DSA resolves both DSA backends to flashinfer_sparse_mla, so
         the fp8 hisparse allow-set must admit it or --enable-hisparse cannot
@@ -1655,7 +1969,7 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "tilelang"):
             validate_hisparse_dsa_backend(server_args, "dsa_prefill_backend", "prefill")
 
-    @override_platform(is_hip=False)
+    @override_platform(is_hip=False, is_xpu=False)
     def test_hisparse_rejects_rocm_backend_on_cuda(self):
         server_args = ServerArgs(
             model_path="dummy",
@@ -1666,6 +1980,66 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "flashmla_sparse"):
             validate_hisparse_dsa_backend(server_args, "dsa_decode_backend", "decode")
+
+    @override_platform(is_hip=False, is_xpu=True)
+    def test_hisparse_accepts_intel_xpu_backend_on_xpu(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_hisparse=True,
+            kv_cache_dtype="bfloat16",
+            dsa_prefill_backend="intel_xpu",
+            dsa_decode_backend="intel_xpu",
+        )
+
+        validate_hisparse_dsa_backend(server_args, "dsa_prefill_backend", "prefill")
+        validate_hisparse_dsa_backend(server_args, "dsa_decode_backend", "decode")
+
+    @override_platform(is_hip=False, is_xpu=True)
+    def test_hisparse_default_backend_is_allowed_on_xpu(self):
+        self.assertIn(
+            _hisparse_default_backend("bfloat16"),
+            _hisparse_allowed_backends("bfloat16"),
+        )
+
+    @override_platform(is_hip=False, is_xpu=True)
+    def test_hisparse_rejects_fp8_kv_cache_on_xpu(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_hisparse=True,
+            kv_cache_dtype="fp8_e4m3",
+            dsa_decode_backend="intel_xpu",
+        )
+        # The message must name the dtype to switch to: the allow-set is empty
+        # here, so "use one of []" and "omit the option" are both dead ends.
+        with self.assertRaisesRegex(ValueError, r"fp8_e4m3.*--kv-cache-dtype=bfloat16"):
+            validate_hisparse_dsa_backend(server_args, "dsa_decode_backend", "decode")
+
+    @override_platform(is_hip=False, is_xpu=True)
+    def test_hisparse_rejects_cuda_backend_on_xpu(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_hisparse=True,
+            kv_cache_dtype="bfloat16",
+            dsa_decode_backend="flashmla_sparse",
+        )
+        with self.assertRaisesRegex(ValueError, "intel_xpu"):
+            validate_hisparse_dsa_backend(server_args, "dsa_decode_backend", "decode")
+
+    def test_intel_xpu_is_a_dsa_backend_cli_choice(self):
+        parser = server_args_module.argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        args = parser.parse_args(
+            [
+                "--model-path",
+                "dummy",
+                "--dsa-prefill-backend",
+                "intel_xpu",
+                "--dsa-decode-backend",
+                "intel_xpu",
+            ]
+        )
+        self.assertEqual(args.dsa_prefill_backend, "intel_xpu")
+        self.assertEqual(args.dsa_decode_backend, "intel_xpu")
 
     def test_hisparse_accepts_bfloat16_kv_cache_dtype(self):
         server_args = ServerArgs(
@@ -1738,7 +2112,6 @@ class TestFa4PageSizeAutoForce(CustomTestCase):
         # real model_config. Pre-set the attribute so get_model_config returns
         # early without touching ModelConfig.from_server_args.
         args._model_config = MagicMock()
-        args._model_config.hf_config.dual_chunk_attention_config = None
         return args
 
     @override_platform(is_sm100=True)
@@ -1748,7 +2121,7 @@ class TestFa4PageSizeAutoForce(CustomTestCase):
 
         handle_attention_backend_compatibility(args)
 
-        from sglang.srt.arg_groups.overrides import resolved_view
+        from sglang.srt.arg_groups.model_override_base import resolved_view
 
         self.assertEqual(args.page_size, 1)  # the field stays pristine
         self.assertEqual(resolved_view(args).page_size, 128)
@@ -1760,7 +2133,7 @@ class TestFa4PageSizeAutoForce(CustomTestCase):
 
         handle_attention_backend_compatibility(args)
 
-        from sglang.srt.arg_groups.overrides import resolved_view
+        from sglang.srt.arg_groups.model_override_base import resolved_view
 
         self.assertEqual(args.page_size, 1)  # the field stays pristine
         self.assertEqual(resolved_view(args).page_size, 128)
@@ -1819,6 +2192,23 @@ class TestContextParallelServerArgs(CustomTestCase):
 
         with self.assertRaisesRegex(ValueError, "DeepSeek V3.2.*interleave"):
             handle_context_parallelism(server_args)
+
+    def test_sharded_padded_cp_kv_layout_refuses_unified_memory(self):
+        for unified in (False, True):
+            with (
+                self.subTest(unified=unified),
+                patch(
+                    "sglang.srt.layers.cp.base.is_cp_sharded_padded", return_value=True
+                ),
+            ):
+                server_args = self._new_cp_args(enable_unified_memory=unified)
+                if unified:
+                    with self.assertRaisesRegex(
+                        ValueError, "--enable-unified-memory does not support"
+                    ):
+                        handle_context_parallelism(server_args)
+                else:
+                    handle_context_parallelism(server_args)
 
     def test_generic_v1_cp_options_are_not_public_cli(self):
         removed_options = (
@@ -2187,22 +2577,51 @@ class TestPortArgs(unittest.TestCase):
         self.assertTrue(port_args.detokenizer_ipc_name.startswith("tcp://127.0.0.1:"))
         self.assertIsInstance(port_args.nccl_port, int)
 
-    def test_init_new_with_dp_rank(self):
-        server_args = ServerArgs(model_path="dummy")
-        server_args.port = 30000
-        server_args.nccl_port = None
-        server_args.attn_dp_size = 4
-        server_args.nnodes = 1
-        server_args.dist_init_addr = "192.168.1.1:25000"
+    @patch("sglang.srt.server_args.wait_port_available")
+    def test_init_new_with_dp_rank(self, wait_port_available):
+        # The Python server's DataParallelController hands rank 2 its port in
+        # worker_ports, already bound. Rust-server mode has none, so it derives
+        # the port as port_base + 6 + dp_rank, with port_base = dist_init_port
+        # + 1, and checks that the port is free.
+        for rust_server, worker_ports, scheduler_input_port in (
+            (False, [25006, 25007, 25008, 25009], 25008),
+            (True, None, 25001 + 6 + 2),
+        ):
+            wait_port_available.reset_mock()
+            with (
+                self.subTest(rust_server=rust_server),
+                envs.SGLANG_RUST_SERVER.override(rust_server),
+            ):
+                server_args = ServerArgs(model_path="dummy")
+                server_args.port = 30000
+                server_args.nccl_port = None
+                server_args.attn_dp_size = 4
+                server_args.nnodes = 1
+                server_args.dist_init_addr = "192.168.1.1:25000"
 
-        worker_ports = [25006, 25007, 25008, 25009]
-        port_args = PortArgs.init_new(server_args, dp_rank=2, worker_ports=worker_ports)
+                port_args = PortArgs.init_new(
+                    server_args, dp_rank=2, worker_ports=worker_ports
+                )
 
-        self.assertTrue(port_args.scheduler_input_ipc_name.endswith(":25008"))
-
-        self.assertTrue(port_args.tokenizer_ipc_name.startswith("tcp://192.168.1.1:"))
-        self.assertTrue(port_args.detokenizer_ipc_name.startswith("tcp://192.168.1.1:"))
-        self.assertIsInstance(port_args.nccl_port, int)
+                self.assertEqual(
+                    port_args.scheduler_input_ipc_name,
+                    f"tcp://192.168.1.1:{scheduler_input_port}",
+                )
+                self.assertEqual(
+                    wait_port_available.call_args_list,
+                    (
+                        [call(scheduler_input_port, "scheduler_input_port")]
+                        if rust_server
+                        else []
+                    ),
+                )
+                self.assertTrue(
+                    port_args.tokenizer_ipc_name.startswith("tcp://192.168.1.1:")
+                )
+                self.assertTrue(
+                    port_args.detokenizer_ipc_name.startswith("tcp://192.168.1.1:")
+                )
+                self.assertIsInstance(port_args.nccl_port, int)
 
     def test_init_new_with_ipv4_address(self):
         server_args = ServerArgs(model_path="dummy")
@@ -2839,16 +3258,6 @@ class TestAscendOpsArgs(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "incompatible.*ascend_ops"):
             handle_a2a_moe(server_args)
 
-    def test_ascend_ops_rejected_by_waterfill_with_config(self):
-        server_args = ServerArgs(
-            model_path="dummy",
-            moe_a2a_backend="ascend_ops",
-            moe_ascend_ops_config="{}",
-            enable_waterfill=True,
-        )
-        with self.assertRaisesRegex(ValueError, "incompatible.*ascend_ops"):
-            handle_a2a_moe(server_args)
-
     def test_ascend_ops_speculative_draft_requires_npu(self):
         server_args = ServerArgs(
             model_path="dummy",
@@ -2895,7 +3304,7 @@ class TestWaterfillArgs(CustomTestCase):
         # dummy-model path short-circuits __post_init__; invoke the handler directly.
         handle_a2a_moe(server_args)
 
-        from sglang.srt.arg_groups.overrides import resolved_view
+        from sglang.srt.arg_groups.model_override_base import resolved_view
 
         self.assertTrue(server_args.disable_shared_experts_fusion)
         self.assertFalse(resolved_view(server_args).disable_shared_experts_fusion)
@@ -2910,7 +3319,7 @@ class TestWaterfillArgs(CustomTestCase):
         # dummy-model path short-circuits __post_init__; invoke the handler directly.
         handle_a2a_moe(server_args)
 
-        from sglang.srt.arg_groups.overrides import resolved_view
+        from sglang.srt.arg_groups.model_override_base import resolved_view
 
         self.assertEqual(server_args.moe_a2a_backend, "none")  # pristine
         self.assertEqual(resolved_view(server_args).moe_a2a_backend, "deepep")
@@ -2926,7 +3335,7 @@ class TestWaterfillArgs(CustomTestCase):
         # dummy-model path short-circuits __post_init__; invoke the handler directly.
         handle_a2a_moe(server_args)
 
-        from sglang.srt.arg_groups.overrides import resolved_view
+        from sglang.srt.arg_groups.model_override_base import resolved_view
 
         self.assertEqual(resolved_view(server_args).moe_a2a_backend, "megamoe")
         self.assertFalse(resolved_view(server_args).disable_shared_experts_fusion)
@@ -3524,7 +3933,7 @@ class TestDeepEPv2Args(CustomTestCase):
             handle_a2a_moe(args)
 
     def test_declarations_resolve_ep_size_and_fusion(self):
-        from sglang.srt.arg_groups.overrides import resolved_view
+        from sglang.srt.arg_groups.model_override_base import resolved_view
 
         args = self._args(moe_runner_backend="auto", tp_size=2)
         handle_a2a_moe(args)
@@ -3532,7 +3941,7 @@ class TestDeepEPv2Args(CustomTestCase):
         self.assertTrue(resolved_view(args).disable_shared_experts_fusion)
 
     def test_auto_runner_defaults_to_deep_gemm(self):
-        from sglang.srt.arg_groups.overrides import resolved_view
+        from sglang.srt.arg_groups.model_override_base import resolved_view
 
         args = self._args(moe_runner_backend="auto")
         handle_a2a_moe(args)
@@ -4577,10 +4986,8 @@ class TestDcpKvEventContract(CustomTestCase):
     def test_kv_event_block_size_widens_a_single_token_page(self):
         # page_size=1 + DCP is a real deployment shape: the allocator is still
         # paged, at dcp_size.
-        from sglang.srt.arg_groups.overrides import (
-            kv_event_block_size_of,
-            resolving_view,
-        )
+        from sglang.srt.arg_groups.model_override_base import resolving_view
+        from sglang.srt.arg_groups.overrides import kv_event_block_size_of
 
         args = ServerArgs(model_path="dummy", tp_size=8, dcp_size=8, page_size=1)
         self.assertEqual(kv_event_block_size_of(resolving_view(args)), 8)
@@ -4705,6 +5112,72 @@ class TestLaunchCommand(CustomTestCase):
         self.assertNotIn(
             "launch_command", ServerArgs(model_path="/tmp/x").resolved_dict()
         )
+
+
+class TestAccessKeyRedaction(CustomTestCase):
+    """The access keys and the TLS key password reach nothing that reports the
+    configuration: not the launch command, `/server_info`, the startup log or
+    the record's repr. Anyone holding the API key can read those, and the
+    admin key must stay out of their reach."""
+
+    # Spellings argparse accepts: an abbreviation with `=`, a value with a
+    # space, a value that spells another key flag, and a repeated flag.
+    ARGV = [
+        "--model-path",
+        "/tmp/x",
+        "--api-key",
+        "alpha beta",
+        "--admin-api-ke=alpha-admin",
+        "--api-key=--admin-api-key=x",
+        "--admin-api-key",
+        "second-admin",
+        "--ssl-keyfile-password",
+        "tls-secret",
+    ]
+    SECRETS = (
+        "alpha beta",
+        "alpha-admin",
+        "--admin-api-key=x",
+        "second-admin",
+        "tls-secret",
+    )
+
+    def _assert_no_secret(self, text: str):
+        for secret in self.SECRETS:
+            self.assertNotIn(secret, text)
+
+    def test_launch_command_redacts_every_spelling(self):
+        server_args = prepare_server_args(self.ARGV)
+        self.assertEqual(
+            server_args.launch_command,
+            "--model-path /tmp/x --api-key <redacted> --admin-api-ke=<redacted> "
+            "--api-key=<redacted> --admin-api-key <redacted> "
+            "--ssl-keyfile-password <redacted>",
+        )
+        # Redaction is for display only: the server still authenticates with
+        # the values the operator gave, the last of each repeated flag.
+        self.assertEqual(server_args.api_key, "--admin-api-key=x")
+        self.assertEqual(server_args.admin_api_key, "second-admin")
+
+    def test_server_info_reports_whether_a_key_is_set_not_its_value(self):
+        from sglang.srt.entrypoints.server_utils import build_server_info
+
+        info = build_server_info(prepare_server_args(self.ARGV), {})
+        self.assertEqual(info["api_key"], "<redacted>")
+        self.assertEqual(info["admin_api_key"], "<redacted>")
+        self.assertEqual(info["ssl_keyfile_password"], "<redacted>")
+        self._assert_no_secret(json.dumps(info, default=str))
+        unset = build_server_info(prepare_server_args(["--model-path", "/tmp/x"]), {})
+        self.assertIsNone(unset["api_key"])
+        self.assertIsNone(unset["admin_api_key"])
+        self.assertIsNone(unset["ssl_keyfile_password"])
+
+    def test_startup_log_and_repr(self):
+        from sglang.srt.entrypoints.engine import _server_args_for_logging
+
+        server_args = prepare_server_args(self.ARGV)
+        self._assert_no_secret(str(_server_args_for_logging(server_args)))
+        self._assert_no_secret(repr(server_args))
 
 
 class TestNoneMeansUnset(CustomTestCase):
@@ -4976,8 +5449,11 @@ class TestDcpCommBackendDefault(CustomTestCase):
         self.assertEqual(self._resolved(dcp_size=1), "ag_rs")
 
     @override_platform(is_npu=True, is_cuda=False, is_hip=False, is_xpu=False)
-    def test_a5_npu_supports_dcp(self):
-        self.assertEqual(self._resolved(dcp_size=2), "ag_rs")
+    def test_npu_supports_dcp(self):
+        with patch(
+            "sglang.srt.arg_groups.overrides.is_fi_a2a_supported", return_value=False
+        ):
+            self.assertEqual(self._resolved(dcp_size=2), "ag_rs")
 
     @override_platform(is_cuda=True, is_hip=False)
     def test_fi_a2a_where_supported(self):
@@ -5082,6 +5558,188 @@ class TestLazyReexports(CustomTestCase):
     def test_an_unknown_attribute_still_raises(self):
         with self.assertRaises(AttributeError):
             server_args_module.NotAThing
+
+
+class TestRustServerUnsupportedArgs(CustomTestCase):
+    # A non-default CLI setting for every refused argument.
+    REFUSED = {
+        "ssl_keyfile": ["--ssl-keyfile", "key.pem"],
+        "ssl_certfile": ["--ssl-certfile", "cert.pem"],
+        "ssl_ca_certs": ["--ssl-ca-certs", "ca.pem"],
+        "ssl_keyfile_password": ["--ssl-keyfile-password", "pw"],
+        "enable_ssl_refresh": ["--enable-ssl-refresh"],
+        "allowed_media_domains": ["--allowed-media-domains", "example.com"],
+        "media_url_max_file_size_mb": ["--media-url-max-file-size-mb", "0"],
+        "enable_trace": ["--enable-trace"],
+        "warmups": ["--warmups", "voice_chat"],
+        "completion_template": ["--completion-template", "deepseek_coder"],
+        "hf_chat_template_name": ["--hf-chat-template-name", "tool_use"],
+        "enable_custom_logit_processor": ["--enable-custom-logit-processor"],
+        "enable_return_routed_experts": ["--enable-return-routed-experts"],
+        "enable_lora": ["--enable-lora"],
+        "lora_paths": ["--lora-paths", "adapter=/adapters/a"],
+        "tokenizer_mode": ["--tokenizer-mode", "slow"],
+        "tokenizer_backend": ["--tokenizer-backend", "fastokens"],
+        "gc_warning_threshold_secs": ["--gc-warning-threshold-secs", "1"],
+        "tokenizer_metrics_allowed_custom_labels": [
+            "--tokenizer-metrics-allowed-custom-labels",
+            "tenant",
+        ],
+        "enable_http2": ["--enable-http2"],
+        "mm_preprocess_cache_size_mb": ["--mm-preprocess-cache-size-mb", "512"],
+        "language_only": ["--language-only"],
+        "checkpoint_engine_wait_weights_before_ready": [
+            "--checkpoint-engine-wait-weights-before-ready"
+        ],
+        "delete_ckpt_after_loading": ["--delete-ckpt-after-loading"],
+        "return_input_ids": ["--return-input-ids"],
+        "return_output_ids": ["--return-output-ids"],
+    }
+
+    @staticmethod
+    def _resolve(cli_args, rust_server=True):
+        args = prepare_server_args(["--model-path", "dummy", *cli_args])
+        # `override` leaves the variable set when its body raises.
+        with patch.dict(os.environ), envs.SGLANG_RUST_SERVER.override(rust_server):
+            args.resolve_once()
+
+    def test_every_unsupported_arg_is_refused_by_name(self):
+        self.assertEqual(
+            set(self.REFUSED), set(validation_hook.RUST_SERVER_UNSUPPORTED_ARGS)
+        )
+        for name, cli_args in self.REFUSED.items():
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(
+                    ValueError, f"does not support {cli_args[0]}:"
+                ):
+                    self._resolve(cli_args)
+                # The Python frontend honors them.
+                self._resolve(cli_args, rust_server=False)
+
+    def test_error_names_every_offending_flag(self):
+        with self.assertRaises(ValueError) as ctx:
+            self._resolve([arg for args in self.REFUSED.values() for arg in args])
+        message = str(ctx.exception)
+        for cli_args in self.REFUSED.values():
+            self.assertIn(cli_args[0], message)
+
+    def test_tool_strict_level_is_refused(self):
+        with envs.SGLANG_TOOL_STRICT_LEVEL.override(2):
+            with self.assertRaisesRegex(
+                ValueError, "does not support SGLANG_TOOL_STRICT_LEVEL:"
+            ):
+                self._resolve([])
+            self._resolve([], rust_server=False)
+
+    def test_args_a_model_package_honors_are_not_refused(self):
+        args = prepare_server_args(
+            [
+                "--model-path",
+                "dummy",
+                "--mm-preprocess-cache-size-mb",
+                "512",
+                "--enable-http2",
+            ]
+        )
+        self.assertEqual(
+            validation_hook.rust_server_unsupported_args(
+                args, honored={"mm_preprocess_cache_size_mb"}
+            ),
+            ["--enable-http2"],
+        )
+
+    def test_supported_and_default_valued_args_pass(self):
+        self._resolve(
+            [
+                # Accepted in Rust-server mode.
+                "--log-requests",
+                "--log-requests-level",
+                "1",
+                "--crash-dump-folder",
+                "/tmp/dumps",
+                "--trust-remote-code",
+                "--enable-request-time-stats-logging",
+                "--skip-server-warmup",
+                # Honored by the Rust server.
+                "--enable-cache-report",
+                "--default-chat-template-kwargs",
+                '{"enable_thinking": false}',
+                "--enable-strict-thinking",
+                "--api-key",
+                "sk-test",
+                "--admin-api-key",
+                "sk-admin",
+                # Refused arguments at their default values.
+                "--media-url-max-file-size-mb",
+                "64",
+                "--tokenizer-mode",
+                "auto",
+                "--tokenizer-backend",
+                "huggingface",
+                # Python disables the GC warning when this is not positive.
+                "--gc-warning-threshold-secs",
+                "-1",
+                # The preprocessing cache off, as in the Rust pipelines.
+                "--mm-preprocess-cache-size-mb",
+                "0",
+            ]
+        )
+
+
+class TestPrefillWeightVersionCompatibility(CustomTestCase):
+    def test_untracked_kv_paths_rejected(self) -> None:
+        """Reject paths that load or produce KV without preserving provenance:
+        KV restored from a host or storage tier carries no weight version, and
+        PD prefill workers do not stamp prompt tokens yet."""
+        # Rust-server mode refuses the flag before the dLLM and speculative
+        # checks, with a message this regex also accepts, so pin the mode
+        # against an inherited SGLANG_RUST_SERVER=1.
+        self.enterContext(envs.SGLANG_RUST_SERVER.override(False))
+        flag = "enable-prefill-weight-versions"
+        for overrides, message in [
+            ({"enable_unified_memory": True}, flag),
+            ({"enable_encoder_swa_bounded_replay": True}, flag),
+            ({"enable_lmcache": True}, flag),
+            ({"enable_unified_cache_external_linker": True}, flag),
+            ({"dllm_algorithm": "LowConfidence"}, flag),
+            ({"speculative_algorithm": "NGRAM"}, flag),
+            ({"speculative_algorithm": "UNO"}, flag),
+            ({"speculative_algorithm": "DSPARK"}, flag),
+            ({"enable_hierarchical_cache": True}, "enable-hierarchical-cache"),
+            ({"disaggregation_mode": "prefill"}, "disaggregation"),
+        ]:
+            with self.subTest(overrides=overrides):
+                args = ServerArgs(
+                    model_path="dummy", enable_prefill_weight_versions=True, **overrides
+                )
+                with self.assertRaisesRegex(ValueError, message):
+                    handle_cache_compatibility(args)
+
+    def test_a_plain_engine_is_accepted(self) -> None:
+        # Rust-server mode refuses the flag, so pin the mode against an inherited
+        # SGLANG_RUST_SERVER=1.
+        self.enterContext(envs.SGLANG_RUST_SERVER.override(False))
+        handle_cache_compatibility(
+            ServerArgs(model_path="dummy", enable_prefill_weight_versions=True)
+        )
+
+    def test_rust_response_without_provenance_rejected(self) -> None:
+        """Reject the Rust response path that cannot serialize prompt versions."""
+        args = ServerArgs(model_path="dummy", enable_prefill_weight_versions=True)
+        with envs.SGLANG_RUST_SERVER.override(True):
+            with self.assertRaisesRegex(ValueError, "SGLANG_RUST_SERVER"):
+                handle_cache_compatibility(args)
+
+
+class TestPagedExpertsNumResident(unittest.TestCase):
+    def test_takes_auto_or_a_positive_count(self):
+        from sglang.srt.arg_groups.fields.exec_ import _paged_experts_num_resident
+
+        self.assertIsNone(_paged_experts_num_resident("auto"))
+        self.assertEqual(_paged_experts_num_resident("12"), 12)
+        for bad in ("0", "-1", "abc", "max", "AUTO", " 12"):
+            with self.assertRaises(argparse.ArgumentTypeError):
+                _paged_experts_num_resident(bad)
 
 
 if __name__ == "__main__":
