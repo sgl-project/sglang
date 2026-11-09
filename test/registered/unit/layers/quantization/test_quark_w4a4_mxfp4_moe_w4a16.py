@@ -85,10 +85,14 @@ def _to_rank_local(topk_ids: torch.Tensor, rank: int) -> torch.Tensor:
     return torch.where(owned, local, -1).to(torch.int32)
 
 
-def _w4a16_enabled_on(arch: str) -> bool:
+def _reload_on(arch: str):
     props = SimpleNamespace(gcnArchName=arch)
     with mock.patch("torch.cuda.get_device_properties", return_value=props):
-        return importlib.reload(quark_w4a4_mxfp4_moe)._use_triton_w4a16
+        return importlib.reload(quark_w4a4_mxfp4_moe)
+
+
+def _w4a16_enabled_on(arch: str) -> bool:
+    return _reload_on(arch)._use_triton_w4a16
 
 
 @unittest.skipUnless(is_hip(), "needs a ROCm build")
@@ -102,6 +106,16 @@ class TestQuarkMxfp4MoeW4A16Gate(unittest.TestCase):
 
     def test_gfx1151_uses_the_w4a16_path(self):
         self.assertTrue(_w4a16_enabled_on("gfx1151"))
+
+    def test_only_gfx1151_overrides_the_triton_kernels_tiles(self):
+        # Measured on gfx1151 only; other W4A16 archs keep triton_kernels' defaults.
+        self.assertEqual(
+            _reload_on("gfx1151")._TRITON_W4A16_TILE_CONSTRAINTS,
+            {"block_n": 64, "num_warps": 4},
+        )
+        for arch in ("gfx1100", "gfx1201", "gfx942:sramecc+:xnack-"):
+            with self.subTest(arch=arch):
+                self.assertEqual(_reload_on(arch)._TRITON_W4A16_TILE_CONSTRAINTS, {})
 
 
 @unittest.skipUnless(
@@ -151,6 +165,15 @@ class TestQuarkMxfp4MoeW4A16ExpertParallel(unittest.TestCase):
 
         self.assertEqual(out.shape, self.hidden_states.shape)
         self.assertTrue(torch.equal(out, torch.zeros_like(out)))
+
+    def test_tile_constraints_do_not_leak_past_the_moe(self):
+        # triton_kernels' constraints are shared with every other matmul in the process.
+        from triton_kernels.matmul_details import opt_flags
+
+        scheme, layer = _build_rank(self.weights, slice(None), self.runner_config)
+        _run(scheme, layer, self.hidden_states, self.topk_weights, self.topk_ids)
+
+        self.assertEqual(opt_flags._get_opt_flags_constraints(), {})
 
     def test_clamped_swiglu_config_is_rejected(self):
         clamped = MoeRunnerConfig(activation="silu", gemm1_clamp_limit=7.0)

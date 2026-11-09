@@ -119,6 +119,14 @@ _use_triton_w4a16 = (
     _is_hip and "gfx1151" in torch.cuda.get_device_properties(0).gcnArchName
 )
 _TRITON_W4A16_NUM_WARPS = 8
+# triton_kernels' AMD defaults give the batch-1 gate/up GEMM 32 workgroups of 2 warps
+# on gfx1151; these tiles were measured there only, other archs keep the defaults.
+# TODO(twoask): drop once the ROCm triton-kernels pin includes triton-lang/triton#10810.
+_TRITON_W4A16_TILE_CONSTRAINTS = (
+    {"block_n": 64, "num_warps": 4}
+    if _is_hip and "gfx1151" in torch.cuda.get_device_properties(0).gcnArchName
+    else {}
+)
 
 
 class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
@@ -1220,6 +1228,7 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
     ) -> CombineInput:
         from sgl_kernel import silu_and_mul
         from triton_kernels.matmul import matmul
+        from triton_kernels.matmul_details.opt_flags import scoped_opt_flags_constraints
         from triton_kernels.tensor import make_ragged_tensor_metadata
 
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
@@ -1243,27 +1252,31 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         ragged = make_ragged_tensor_metadata(counts[:-1], num_tokens * top_k)
         gammas = topk_weights.reshape(-1).to(torch.float32)[combine]
 
-        gate_up = matmul(
-            x,
-            self.w13_triton_weight,
-            None,
-            a_ragged_metadata=ragged,
-            gather_indx=gather,
-            precision_config=self.w13_precision_config,
-        )
-        act = torch.empty(
-            (gate_up.shape[0], self.intermediate_size), dtype=x.dtype, device=x.device
-        )
-        silu_and_mul(gate_up.view(-1, 2 * self.intermediate_size), act)
-        out = matmul(
-            act,
-            self.w2_triton_weight,
-            None,
-            a_ragged_metadata=ragged,
-            scatter_indx=combine,
-            gammas=gammas,
-            precision_config=self.w2_precision_config,
-        )
+        # Scoped: the constraints are process-wide state shared with every other matmul.
+        with scoped_opt_flags_constraints(_TRITON_W4A16_TILE_CONSTRAINTS):
+            gate_up = matmul(
+                x,
+                self.w13_triton_weight,
+                None,
+                a_ragged_metadata=ragged,
+                gather_indx=gather,
+                precision_config=self.w13_precision_config,
+            )
+            act = torch.empty(
+                (gate_up.shape[0], self.intermediate_size),
+                dtype=x.dtype,
+                device=x.device,
+            )
+            silu_and_mul(gate_up.view(-1, 2 * self.intermediate_size), act)
+            out = matmul(
+                act,
+                self.w2_triton_weight,
+                None,
+                a_ragged_metadata=ragged,
+                scatter_indx=combine,
+                gammas=gammas,
+                precision_config=self.w2_precision_config,
+            )
         # The scatter writes row i to flat slot combine[i] (num_tokens * top_k
         # rows) without reducing over top_k, so do the reduction here.
         out = out.view(num_tokens, top_k, -1)
