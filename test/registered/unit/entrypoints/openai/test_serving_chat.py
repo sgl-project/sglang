@@ -4698,6 +4698,71 @@ class ServingChatTestCase(CustomTestCase):
         self.assertIn("sglext", dumped_response)
         self.assertNotIn("meta_info", dumped_response["choices"][0])
 
+    def test_sglext_routed_experts_forward_the_result_dtype(self):
+        """sglext names the dtype the result carries, streaming or not."""
+        meta_info = {
+            "id": "chatcmpl-dtype-test",
+            "prompt_tokens": 10,
+            "completion_tokens": 2,
+            "cached_tokens": 0,
+            "routed_experts": "cm91dGUtYQ==",
+            "routed_experts_dtype": "int16",
+            "finish_reason": {"type": "stop", "matched": None},
+            "output_token_logprobs": None,
+            "output_top_logprobs": None,
+            "weight_version": "default",
+        }
+        request_args = dict(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            max_tokens=100,
+            return_routed_experts=True,
+        )
+
+        response = self.chat._build_chat_response(
+            ChatCompletionRequest(**request_args),
+            [{"text": "Response", "meta_info": meta_info}],
+            1234567890,
+        )
+        self.assertEqual(response.sglext.routed_experts_dtype, "int16")
+
+        async def _mock_generate():
+            yield {"text": "Response", "meta_info": meta_info, "index": 0}
+
+        self.tm.generate_request.return_value = _mock_generate()
+        req = ChatCompletionRequest(**request_args, stream=True)
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
+        ) as conv_mock:
+            conv_ins = Mock()
+            conv_ins.get_prompt.return_value = "Test prompt"
+            conv_mock.return_value = conv_ins
+            adapted_request, _ = self.chat._convert_to_internal_request(
+                req, self.fastapi_request
+            )
+
+            async def run_stream():
+                return [
+                    chunk
+                    async for chunk in self.chat._generate_chat_stream(
+                        adapted_request, req, self.fastapi_request
+                    )
+                ]
+
+        chunks = get_or_create_event_loop().run_until_complete(run_stream())
+        sglext = [
+            data["sglext"]
+            for data in (
+                json.loads(chunk[len("data: ") :])
+                for chunk in chunks
+                if chunk.startswith("data: ") and chunk.strip() != "data: [DONE]"
+            )
+            if "sglext" in data
+        ]
+        self.assertEqual(len(sglext), 1)
+        self.assertEqual(sglext[0]["routed_experts"], "cm91dGUtYQ==")
+        self.assertEqual(sglext[0]["routed_experts_dtype"], "int16")
+
     def test_non_streaming_meta_info_omits_response_level_routed_experts(self):
         req = ChatCompletionRequest(
             model="x",

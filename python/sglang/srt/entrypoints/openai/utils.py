@@ -271,11 +271,12 @@ def should_include_usage(
 def process_routed_experts_from_ret(
     ret_item: dict[str, Any],
     request: ChatCompletionRequest | CompletionRequest,
-) -> str | None:
-    """Process routed experts from a ret item in non-streaming response."""
+) -> tuple[str | None, str | None]:
+    """Process routed experts and their dtype from a non-streaming ret item."""
     if not getattr(request, "return_routed_experts", False):
-        return None
-    return ret_item["meta_info"].get("routed_experts", None)
+        return None, None
+    meta_info = ret_item["meta_info"]
+    return meta_info.get("routed_experts"), meta_info.get("routed_experts_dtype")
 
 
 def cached_tokens_details_from_dict(

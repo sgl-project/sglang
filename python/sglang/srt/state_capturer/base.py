@@ -34,10 +34,11 @@ class BaseDeviceCache:
         topk_size: int,
         device: str,
         name: str,
+        dtype: torch.dtype = torch.int32,
     ):
         self.buffer = torch.zeros(
             (max_batch_size, num_layers, topk_size),
-            dtype=torch.int32,
+            dtype=dtype,
             device=device,
         )
         self.num_layers = num_layers
@@ -62,12 +63,18 @@ class BaseDeviceCache:
 
 class BaseHostCache:
     def __init__(
-        self, num_tokens: int, num_layers: int, topk_size: int, name: str, device: str
+        self,
+        num_tokens: int,
+        num_layers: int,
+        topk_size: int,
+        name: str,
+        device: str,
+        dtype: torch.dtype = torch.int32,
     ):
         alloc = ALLOC_MEMORY_FUNCS[device]
         self.buffer = alloc(
             (num_tokens, num_layers, topk_size),
-            dtype=torch.int32,
+            dtype=dtype,
             device="cpu",
             pin_memory=True,
             allocator=HostTensorAllocator(),
@@ -129,6 +136,7 @@ class BaseTopkCapturer:
         name: str,
         device_topk_size: Optional[int] = None,
         allocate_caches: bool = True,
+        dtype: torch.dtype = torch.int32,
     ):
         """device_topk_size defaults to topk_size; pass a different value when
         the device buffer needs extra columns (e.g. fused shared experts) that
@@ -136,6 +144,9 @@ class BaseTopkCapturer:
         Without caches, forwards copy nothing back, callers must check
         has_host_cache before get_topk, and the subclass must not call
         capture().
+        dtype stores both caches and may be narrower than the int32 ids when
+        every kept id fits: capture narrows on the device, and get_topk returns
+        this dtype, so responses must report it.
         """
         self.num_layers = num_layers
         self.topk_size = topk_size
@@ -150,6 +161,7 @@ class BaseTopkCapturer:
                 topk_size=topk_size,
                 name=name,
                 device=device,
+                dtype=dtype,
             )
             if allocate_caches
             else None
@@ -161,6 +173,7 @@ class BaseTopkCapturer:
                 topk_size=self.device_topk_size,
                 device=device,
                 name=name,
+                dtype=dtype,
             )
             if allocate_caches
             else None

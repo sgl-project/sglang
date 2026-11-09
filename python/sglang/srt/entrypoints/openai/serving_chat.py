@@ -2604,7 +2604,10 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
                 cached_tokens[index] = content["meta_info"].get("cached_tokens", 0)
                 hidden_states[index] = content["meta_info"].get("hidden_states", None)
-                routed_experts[index] = content["meta_info"].get("routed_experts", None)
+                routed_experts[index] = (
+                    content["meta_info"].get("routed_experts", None),
+                    content["meta_info"].get("routed_experts_dtype", None),
+                )
                 cached_tokens_details[index] = content["meta_info"].get(
                     "cached_tokens_details", None
                 )
@@ -2782,10 +2785,11 @@ class OpenAIServingChat(OpenAIServingBase):
                         )
                         yield f"data: {hidden_states_chunk.model_dump_json()}\n\n"
 
-            sglext_routed = None
+            sglext_routed = sglext_routed_dtype = None
             if request.return_routed_experts and routed_experts:
-                sglext_routed = next(
-                    (v for v in routed_experts.values() if v is not None), None
+                sglext_routed, sglext_routed_dtype = next(
+                    (v for v in routed_experts.values() if v[0] is not None),
+                    (None, None),
                 )
 
             sglext_cached_tokens_details = None
@@ -2823,6 +2827,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
             sglext_full = SglExt(
                 routed_experts=sglext_routed,
+                routed_experts_dtype=sglext_routed_dtype,
                 cached_tokens_details=sglext_cached_tokens_details,
                 spec_tokens_details=sglext_spec_tokens_details,
                 input_ids=sglext_input_ids,
@@ -2956,8 +2961,8 @@ class OpenAIServingChat(OpenAIServingBase):
 
         # Build sglext at response level (from first ret_item, as these are per-request)
         first_ret = ret[0]
-        routed_experts = (
-            None
+        routed_experts, routed_experts_dtype = (
+            (None, None)
             if request.return_meta_info
             else process_routed_experts_from_ret(first_ret, request)
         )
@@ -2992,6 +2997,7 @@ class OpenAIServingChat(OpenAIServingBase):
         ):
             response_sglext = SglExt(
                 routed_experts=routed_experts,
+                routed_experts_dtype=routed_experts_dtype,
                 cached_tokens_details=cached_tokens_details,
                 spec_tokens_details=spec_tokens_details,
                 input_ids=input_ids,
