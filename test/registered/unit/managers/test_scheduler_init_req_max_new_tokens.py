@@ -7,9 +7,9 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
-from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.unified_allocator_fixtures import build_test_unified_pools
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -199,7 +199,7 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
             self.assertEqual(req.sampling_params.min_new_tokens, 16)
 
     def test_unified_budget_rounds_prompt_and_decode_together(self):
-        bundle = init_unified_swa_pools(
+        bundle = build_test_unified_pools(
             device="cpu",
             kv_cache_dtype=torch.float16,
             head_num=1,
@@ -221,6 +221,8 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
         scheduler = self._new_scheduler(page_size=4)
         scheduler.token_to_kv_pool_allocator = bundle.token_to_kv_pool_allocator
         scheduler.sliding_window_size = 4
+        # As the cache builder does: the pool's window states no length.
+        bundle.token_to_kv_pool_allocator.storage.bind_window_retention(4, None)
         scheduler.chunked_prefill_size = 4
         scheduler.max_new_tokens_limit = None
         for prompt_len in (4, 5, 6, 7):

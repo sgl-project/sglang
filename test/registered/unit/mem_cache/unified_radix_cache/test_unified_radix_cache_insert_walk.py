@@ -7,10 +7,7 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.managers.schedule_batch import (
-    FINISH_ABORT,
-    FINISH_LENGTH,
-)
+from sglang.srt.managers.req_types import FINISH_ABORT, FINISH_LENGTH
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     EvictParams,
@@ -24,9 +21,7 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeDeviceKVFullOnly,
     UpdatePendingBackupOnNodeSplit,
 )
-from sglang.srt.mem_cache.unified_cache.components.base import (
-    ComponentType,
-)
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     DecSwaLockOnlyResult,
     DemoteResult,
@@ -385,7 +380,11 @@ class TestResumableInsertWalkSWA(ResumableInsertWalkSWAFixtures, CustomTestCase)
         cache.insert(InsertParams(key=key, value=self._alloc(allocator, len(seq))))
         self.assertIsNotNone(node_device_value(cache, prefix_node, ComponentType.SWA))
 
-        cache.evict(EvictParams(num_tokens=0, swa_num_tokens=sw))
+        cache.evict(
+            EvictParams(
+                window_num_tokens={cache.window_sub_pool_of_slot(ComponentType.SWA): sw}
+            )
+        )
         self.assertIsNone(node_device_value(cache, prefix_node, ComponentType.SWA))
         self.assertIsNotNone(node_device_value(cache, window_node, ComponentType.SWA))
         self.assertIsNotNone(node_device_value(cache, window_node, ComponentType.FULL))

@@ -8,10 +8,8 @@ from sglang.multimodal_gen.configs.models.encoders.ming_image import (
     MingImageEncoderConfig,
 )
 from sglang.multimodal_gen.configs.models.vaes.qwenimage import QwenImageVAEConfig
-from sglang.multimodal_gen.configs.pipeline_configs.base import (
-    ImagePipelineConfig,
-    ModelTaskType,
-)
+from sglang.multimodal_gen.configs.pipeline_configs.base import ImagePipelineConfig
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 
 
 @dataclass

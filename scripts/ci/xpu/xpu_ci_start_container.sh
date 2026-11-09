@@ -161,8 +161,12 @@ echo "Launching container: ${CONTAINER_NAME} from ${IMAGE}"
 # UR_L0_V2_FORCE_DISABLE_COPY_OFFLOAD=1: with copy offload on, a new process's first
 # H2D copy intermittently deadlocks on the copy engine (bcs and ccs both parked
 # in MI_SEMAPHORE_WAIT) and urEventWait blocks forever; keep copies on ccs.
+# SYS_PTRACE: Level Zero IPC (NIXL's UCX ze_ipc and Mooncake's XPU transport) maps
+# the peer's device memory via pidfd_getfd(), which needs ptrace rights. Without
+# them NIXL fails with EPERM and Mooncake stops copying KV card to card.
 docker run -dt \
   --shm-size 8g \
+  --cap-add SYS_PTRACE \
   --group-add 992 \
   ${VIDEO_GID:+--group-add "${VIDEO_GID}"} \
   ${RENDER_GID:+--group-add "${RENDER_GID}"} \
