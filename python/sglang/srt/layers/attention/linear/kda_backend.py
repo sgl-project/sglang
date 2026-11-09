@@ -23,6 +23,7 @@ from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKerne
 from sglang.srt.layers.attention.linear.utils import (
     LinearAttnKernelBackend,
     build_verify_intermediate_state_indices,
+    pp_spec_stable_rows_enabled,
     select_verify_intermediate_state_indices,
 )
 from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
@@ -547,6 +548,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 model_runner.device,
             )
         )
+        # Without PP spec the positional table above is final; the verify-time
+        # row mask that only PP spec reads would cost a launch per layer.
+        self._pp_spec_stable_rows = pp_spec_stable_rows_enabled()
         # Fused-accept spec path (flashinfer recurrent_kda): the next verify
         # seeds itself in-kernel from the accepted checkpoint slot
         # (num_accepted_tokens), so the per-round SSM commit scatter is skipped.
@@ -1329,12 +1333,15 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 if ring_indices is not None:
                     ring_kwargs["ring_indices"] = ring_indices
         intermediate_conv_window_cache = mamba_cache_params.intermediate_conv_window[0]
-        intermediate_state_indices = select_verify_intermediate_state_indices(
-            self.verify_intermediate_state_indices,
-            forward_batch.req_pool_indices,
-            cache_indices[: query_start_loc.shape[0] - 1] >= 0,
-            self.req_to_token_pool.size,
-        )
+        if self._pp_spec_stable_rows:
+            intermediate_state_indices = select_verify_intermediate_state_indices(
+                self.verify_intermediate_state_indices,
+                forward_batch.req_pool_indices,
+                cache_indices[: query_start_loc.shape[0] - 1] >= 0,
+                self.req_to_token_pool.size,
+            )
+        else:
+            intermediate_state_indices = self.verify_intermediate_state_indices
 
         draft_token_num = forward_batch.spec_info.draft_token_num
         ragged_layout = forward_batch.ragged_verify_layout

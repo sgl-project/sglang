@@ -154,6 +154,7 @@ class TestKDAFusedVerifyBackend(CustomTestCase):
         backend.verify_intermediate_state_indices = torch.arange(
             slots.numel(), device="cuda", dtype=torch.int32
         )
+        backend._pp_spec_stable_rows = False
         backend.accept_lens_pool = None
         backend.kernel_dispatcher = KDAKernelDispatcher(
             LinearAttnKernelBackend.TRITON,
