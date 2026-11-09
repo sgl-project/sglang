@@ -131,8 +131,11 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
         )
 
     def validate_quality_deployment(self, server_args) -> None:
-        """Fail closed unless the resident server matches the deployment
-        audited for quality="high"."""
+        """Validate the FP8 decoder profile or the existing H200 Cache-DiT profile."""
+
+        if server_args.component_quantizations.get("video_vae") == "fp8":
+            self._validate_video_vae_quantization(server_args)
+            return
 
         attention_backend = self._server_arg_value(server_args.attention_backend)
         attention_backend = (
@@ -366,6 +369,11 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
                 "The MiniMax-H3 online FP8 video VAE decoder requires the fp16 "
                 "decode autocast recipe; drop --component-precisions.video_vae "
                 "and --disable-autocast"
+            )
+        if server_args.enable_torch_compile or server_args.enable_breakable_cuda_graph:
+            raise ValueError(
+                "MiniMax-H3 high FP8 decode requires eager execution for "
+                "request-scoped weight switching"
             )
         if server_args.residency_mode("video_vae") != RESIDENT:
             raise ValueError(

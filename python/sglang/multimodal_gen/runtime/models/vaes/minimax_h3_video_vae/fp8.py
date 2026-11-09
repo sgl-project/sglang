@@ -1,9 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Online FP8 installation for the H3 decoder's 144 block linears.
+"""Decode-scoped FP8 for high-quality H3 requests; never replace source weights."""
 
-The opt-in deployment flag quantizes the four linears per block at load time.
-Other weights keep their precision; request quality does not control FP8.
-"""
+from contextlib import contextmanager
 
 import torch
 from torch import nn
@@ -51,7 +49,6 @@ def install_fp8_block_linears(decoder) -> int:
     # Validate every target before replacing any module; an offloaded or
     # unprepared decoder fails here with the original modules intact.
     paths = inspect_fp8_scope(decoder)
-    decoder.prepare_autocast_linear_weights(torch.float16)
     for path in paths:
         source = decoder.get_submodule(path)
         if source.weight.dtype != torch.float16 or not source.weight.is_cuda:
@@ -62,7 +59,6 @@ def install_fp8_block_linears(decoder) -> int:
         source = decoder.get_submodule(path)
         decoder.set_submodule(path, OnlineFP8Linear.from_linear(source))
     decoder.fp8_installed = True
-    decoder._autocast_linear_dtype = torch.float16
     reason = structure_reject_reason(decoder)
     decoder.fused_decoder_ready = reason is None
     if reason is not None:
@@ -70,3 +66,28 @@ def install_fp8_block_linears(decoder) -> int:
             "MiniMax-H3 VAE: FP8 decoder blocks keep the eager producers (%s)", reason
         )
     return len(paths)
+
+
+@contextmanager
+def use_fp8_decoder(decoder, enabled: bool):
+    """Restore original modules even if quantization, decode or cancellation fails."""
+    if not enabled:
+        yield
+        return
+    if decoder.fp8_installed:
+        raise RuntimeError("MiniMax-H3 FP8 decode is already active")
+    originals = {
+        path: decoder.get_submodule(path) for path in inspect_fp8_scope(decoder)
+    }
+    fused_ready = decoder.fused_decoder_ready
+    qk_weight = decoder._fused_qk_weight
+    try:
+        install_fp8_block_linears(decoder)
+        yield
+    finally:
+        # keep the original modules, not dequantized copies; no FP8 cache survives a request
+        for path, module in originals.items():
+            decoder.set_submodule(path, module)
+        decoder.fp8_installed = False
+        decoder.fused_decoder_ready = fused_ready
+        decoder._fused_qk_weight = qk_weight

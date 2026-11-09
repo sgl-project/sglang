@@ -592,7 +592,7 @@ class VAELoader(WeightOverrideComponentLoader):
             server_args, component_name
         )
 
-    def _quantize_decoder_if_requested(
+    def _validate_decoder_quantization(
         self, vae, server_args: ServerArgs, component_name: str
     ) -> None:
         if (
@@ -600,9 +600,11 @@ class VAELoader(WeightOverrideComponentLoader):
             is None
         ):
             return
-        swapped = vae.quantize_decoder_fp8()
+        count = vae.validate_decoder_fp8()
         logger.info(
-            "VAE: %s holds %d decoder linears in online FP8", component_name, swapped
+            "VAE: %s enables online FP8 for %d decoder linears on high requests only",
+            component_name,
+            count,
         )
 
     def customized_load_kwargs_for_component(
@@ -785,7 +787,7 @@ class VAELoader(WeightOverrideComponentLoader):
                         "VAE: converted %d Conv3d weights to channels_last_3d", n
                     )
             _hold_decoder_weights_in_decode_dtype(vae, server_args, component_name)
-            self._quantize_decoder_if_requested(vae, server_args, component_name)
+            self._validate_decoder_quantization(vae, server_args, component_name)
             return current_platform.optimize_vae(vae)
 
         loaded = {}
@@ -853,6 +855,6 @@ class VAELoader(WeightOverrideComponentLoader):
             component_weights_path,
             component_type=component_type,
         )
-        self._quantize_decoder_if_requested(vae, server_args, component_name)
+        self._validate_decoder_quantization(vae, server_args, component_name)
         vae = current_platform.optimize_vae(vae)
         return vae

@@ -17,7 +17,8 @@ from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae import (
     AutoencoderKLLegacy,
 )
 from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.fp8 import (
-    install_fp8_block_linears,
+    inspect_fp8_scope,
+    use_fp8_decoder,
 )
 
 
@@ -96,28 +97,19 @@ class MiniMaxH3VideoVAE(AutoencoderKLLegacy, LayerwiseOffloadableModuleMixin):
     def prepare_decoder_autocast_weights(self, dtype) -> int:
         return self.decoder.prepare_autocast_linear_weights(dtype)
 
-    def quantize_decoder_fp8(self) -> int:
-        """Replace the 144 decoder block linears with online FP8 modules."""
-        return install_fp8_block_linears(self.decoder)
+    def validate_decoder_fp8(self) -> int:
+        return len(inspect_fp8_scope(self.decoder))
+
+    def use_decoder_fp8(self, enabled: bool):
+        return use_fp8_decoder(self.decoder, enabled)
 
     def validate_weight_update_source(self, *, weights_path: str | None) -> None:
-        """Reject a runtime weight update once the decoder holds FP8 weights.
-
-        The updater copies checkpoint tensors into parameters. The FP8 block
-        linears hold rounded payloads next to per-channel scales, so such a
-        copy would serve a decoder whose scales no longer match its weights,
-        and the rollback would write the same way. Runs before any weight is
-        written, so the served decoder stays intact.
-        """
+        """Weight updates must not overlap a temporary FP8 decode."""
         del weights_path
         if self.decoder.fp8_installed:
             raise ValueError(
-                "MiniMax-H3 video_vae was started with "
-                "--component-quantizations.video_vae fp8; its decoder block "
-                "linears hold FP8 weights with per-channel scales that an "
-                "in-place weight update cannot requantize. Restart the server "
-                "on the new checkpoint, or pass a target_modules list that leaves "
-                "video_vae out (an omitted target_modules updates every module)"
+                "MiniMax-H3 video_vae has an active FP8 decode; "
+                "retry the weight update after the request finishes"
             )
 
 

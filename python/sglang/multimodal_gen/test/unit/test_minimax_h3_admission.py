@@ -537,7 +537,9 @@ def test_high_quality_deployment_rejects_transformer_weight_override():
 
 def test_high_quality_request_warns_when_bcg_suppresses_cache_dit():
     stage = MiniMaxH3DenoisingStage.__new__(MiniMaxH3DenoisingStage)
-    stage.server_args = SimpleNamespace(enable_breakable_cuda_graph=True)
+    stage.server_args = SimpleNamespace(
+        enable_breakable_cuda_graph=True, component_quantizations={}
+    )
     stage._cache_dit_enabled = False
     batch = SimpleNamespace(
         sampling_params=SimpleNamespace(
@@ -606,15 +608,22 @@ def test_admission_rejects_steps_exceeding_online_adaln_gpu_plans():
         assert stage.forward(batch, server_args) is batch
 
 
-def test_lossless_quality_does_not_enable_h3_cache_dit():
+@pytest.mark.parametrize("quality", ["exact", "lossless", "high"])
+@pytest.mark.parametrize("fp8", [False, True])
+def test_non_cache_quality_does_not_enable_h3_cache_dit(quality, fp8):
+    if quality == "high" and not fp8:
+        pytest.skip("the existing high profile deliberately enables Cache-DiT")
     stage = MiniMaxH3DenoisingStage.__new__(MiniMaxH3DenoisingStage)
-    stage.server_args = SimpleNamespace(enable_breakable_cuda_graph=False)
+    stage.server_args = SimpleNamespace(
+        enable_breakable_cuda_graph=False,
+        component_quantizations={"video_vae": "fp8"} if fp8 else {},
+    )
     stage._cache_dit_enabled = False
     stage._minimax_h3_cache_mode = None
     stage._minimax_h3_quality = "exact"
     batch = SimpleNamespace(
         sampling_params=SimpleNamespace(
-            quality="lossless",
+            quality=quality,
             _explicit_fields={"quality"},
             enable_cache_dit=None,
             cache_dit_params=None,
@@ -627,9 +636,50 @@ def test_lossless_quality_does_not_enable_h3_cache_dit():
     with patch.object(DenoisingStage, "_cache_dit_requested", return_value=True):
         stage._maybe_enable_cache_dit(50, batch)
 
-    assert stage._minimax_h3_quality == "lossless"
+    assert stage._minimax_h3_quality == quality
     assert stage._minimax_h3_cache_mode is None
     assert not stage._cache_dit_enabled
+
+
+def test_high_fp8_admission_keeps_the_denoise_schedule():
+    metadata = MiniMaxH3ReleaseMetadata.from_model_index(
+        {
+            "_minimax_h3": {
+                "schema_version": 1,
+                "partition": "fl2va",
+                "tasks": ["t2va", "fl2va"],
+                "task_aliases": {},
+                "sigma_shift_scales": {"video": 12.0, "audio": 3.0},
+            }
+        }
+    )
+    stage = MiniMaxH3PartitionAdmissionStage(metadata)
+    args = _quality_server_args()
+    args.pipeline_config = MiniMaxH3PipelineConfig()
+    args.component_quantizations = {"video_vae": "fp8"}
+    args.component_quantization_ignored_layers = {}
+    args.component_precisions = {}
+    args.disable_autocast = False
+    args.residency_mode = lambda component: "resident"
+    batch = SimpleNamespace(
+        sampling_params=SimpleNamespace(
+            task="t2va", quality="high", enable_cache_dit=None
+        ),
+        num_inference_steps=5,
+        is_warmup=False,
+    )
+    with (
+        patch.object(current_platform, "is_cuda", return_value=True),
+        patch(
+            "sglang.multimodal_gen.configs.pipeline_configs.minimax_h3.is_cuda_sm_at_least",
+            return_value=True,
+        ),
+    ):
+        assert stage.forward(batch, args) is batch
+        assert batch.num_inference_steps == 5
+        batch.sampling_params.enable_cache_dit = True
+        with pytest.raises(ValueError, match="cannot combine with Cache-DiT"):
+            stage.forward(batch, args)
 
 
 def test_quality_admission_fails_closed_outside_validated_request():

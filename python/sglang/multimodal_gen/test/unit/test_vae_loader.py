@@ -469,15 +469,15 @@ class TestVAELoader(unittest.TestCase):
         ):
             loader.resolve_component_quantization_override(qwen_args, "vae")
 
-    def test_fp8_override_quantizes_the_h3_decoder_before_optimize_vae(self):
+    def test_fp8_override_only_validates_at_load(self):
         class _H3LikeVAE(nn.Module):
             def __init__(self, *_args, **_kwargs):
                 super().__init__()
                 self.proj = nn.Linear(2, 2, bias=False)
                 self.calls = []
 
-            def quantize_decoder_fp8(self):
-                self.calls.append("fp8")
+            def validate_decoder_fp8(self):
+                self.calls.append("validate")
                 return 144
 
         def optimize(vae):
@@ -515,7 +515,8 @@ class TestVAELoader(unittest.TestCase):
             )
             loaded = loader.load_customized(root, server_args, "video_vae")
 
-        self.assertEqual(loaded.calls, ["fp8", "optimize"])
+        self.assertEqual(loaded.calls, ["validate", "optimize"])
+        torch.testing.assert_close(loaded.proj.weight, torch.eye(2), rtol=0, atol=0)
 
     @unittest.skipUnless(torch.cuda.is_available(), "needs a CUDA device")
     def test_a_host_start_store_does_not_pull_the_fp8_decoder_to_the_host(self):
@@ -533,7 +534,7 @@ class TestVAELoader(unittest.TestCase):
                 self.proj.to(dtype=dtype)
                 return converted
 
-            def quantize_decoder_fp8(self):
+            def validate_decoder_fp8(self):
                 # The installer's precondition: resident, prepared fp16 weights.
                 weight = self.proj.weight
                 if not (weight.is_cuda and weight.dtype == torch.float16):

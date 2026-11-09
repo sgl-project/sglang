@@ -29,6 +29,7 @@ from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae import (
 )
 from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.fp8 import (
     install_fp8_block_linears,
+    use_fp8_decoder,
 )
 from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.vae_vit import (
     ViT3DDecoder,
@@ -204,6 +205,7 @@ def test_install_fp8_block_linears_swaps_the_released_144_linears(stub_server_ar
     """Install once, preserve non-target weights, and reject dtype changes."""
     with torch.device("cuda"):
         decoder = _released_decoder(num_layers=36).eval()
+    decoder.prepare_autocast_linear_weights(torch.float16)
     assert install_fp8_block_linears(decoder) == 144
     assert decoder.fp8_installed and decoder.fused_decoder_ready
     swapped = [m for m in decoder.modules() if isinstance(m, OnlineFP8Linear)]
@@ -218,6 +220,65 @@ def test_install_fp8_block_linears_swaps_the_released_144_linears(stub_server_ar
     assert decoder.prepare_autocast_linear_weights(torch.float16) == 0
     with pytest.raises(ValueError, match="FP16 autocast"):
         decoder.prepare_autocast_linear_weights(torch.bfloat16)
+
+
+def test_quality_switch_restores_modules_outputs_and_live_memory(stub_server_args):
+    with torch.device("cuda"):
+        decoder = _released_decoder(num_layers=36).eval()
+    decoder.prepare_autocast_linear_weights(torch.float16)
+    for block in decoder.transformer_blocks:
+        block.scale1.fill_(0.2)
+        block.scale2.fill_(0.2)
+    originals = dict(decoder.named_parameters())
+    pointers = {name: value.data_ptr() for name, value in originals.items()}
+    value = torch.randn(1, 17, 2048, device="cuda")
+    ids = torch.randn(1, 17, 3, device="cuda")
+    rope = prepare_rotary_pos_emb(decoder.pos_embed(ids), dtype=torch.float16, batch=1)
+    with set_forward_context(0, None), torch.autocast("cuda", dtype=torch.float16):
+        expected = decoder._run_blocks(value, rope)
+        live_bytes = torch.cuda.memory_allocated()
+        for quality in ("exact", "lossless", "high", "lossless", "high", "exact"):
+            with use_fp8_decoder(decoder, quality == "high"):
+                assert decoder.fp8_installed == (quality == "high")
+                actual = decoder._run_blocks(value, rope)
+                if quality != "high":
+                    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                else:
+                    assert torch.isfinite(actual).all()
+                del actual
+            assert not decoder.fp8_installed
+            assert decoder._fused_qk_weight is None
+            assert torch.cuda.memory_allocated() == live_bytes
+            for name, parameter in decoder.named_parameters():
+                assert parameter is originals[name]
+                assert parameter.data_ptr() == pointers[name]
+
+        with pytest.raises(RuntimeError, match="decode failed"):
+            with use_fp8_decoder(decoder, True):
+                raise RuntimeError("decode failed")
+        assert not decoder.fp8_installed
+        torch.testing.assert_close(
+            decoder._run_blocks(value, rope), expected, rtol=0, atol=0
+        )
+
+    # a failed conversion must restore even the modules already swapped
+    convert = OnlineFP8Linear.from_linear
+    calls = 0
+
+    def fail_second(source):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("quantization failed")
+        return convert(source)
+
+    with patch.object(OnlineFP8Linear, "from_linear", side_effect=fail_second):
+        with pytest.raises(RuntimeError, match="quantization failed"):
+            with use_fp8_decoder(decoder, True):
+                pytest.fail("conversion should fail before decode")
+    assert not decoder.fp8_installed
+    for name, parameter in decoder.named_parameters():
+        assert parameter is originals[name]
 
 
 if __name__ == "__main__":

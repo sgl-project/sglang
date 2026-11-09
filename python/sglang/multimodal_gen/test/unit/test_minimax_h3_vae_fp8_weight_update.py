@@ -17,7 +17,7 @@ from safetensors.torch import save_file
 from sglang.multimodal_gen.runtime.models.vaes.minimax_h3 import MiniMaxH3VideoVAE
 from sglang.multimodal_gen.runtime.post_training.weights_updater import WeightsUpdater
 
-REJECTION = "--component-quantizations.video_vae fp8"
+REJECTION = "active FP8 decode"
 
 
 class _Decoder(nn.Module):

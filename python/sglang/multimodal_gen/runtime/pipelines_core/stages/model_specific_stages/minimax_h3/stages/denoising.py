@@ -463,6 +463,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
     def _cache_dit_requested(self) -> bool:
         return (
             getattr(self, "_minimax_h3_quality", "exact") == "high"
+            and self.server_args.component_quantizations.get("video_vae") != "fp8"
             or super()._cache_dit_requested()
         )
 
@@ -485,7 +486,12 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             # Spectrum skips the block stack; Cache-DiT wraps those blocks.
             desired_mode = None
         elif quality == "high":
-            desired_mode = "high"
+            # FP8 high changes only decode, not the H200-audited denoise trajectory
+            desired_mode = (
+                None
+                if self.server_args.component_quantizations.get("video_vae") == "fp8"
+                else "high"
+            )
         else:
             desired_mode = "generic" if generic_requested else None
         current_mode = getattr(self, "_minimax_h3_cache_mode", None)

@@ -238,6 +238,12 @@ class MiniMaxH3PartitionAdmissionStage(PipelineStage):
         high_quality = quality == "high"
         if high_quality and not batch.is_warmup:
             server_args.pipeline_config.validate_quality_deployment(server_args)
+            if server_args.component_quantizations.get("video_vae") == "fp8":
+                if batch.sampling_params.enable_cache_dit:
+                    raise ValueError(
+                        "MiniMax-H3 high FP8 decode cannot combine with Cache-DiT"
+                    )
+                return batch
             plan = minimax_h3_plan_from_batch(batch)
             if plan is None:
                 raise ValueError(

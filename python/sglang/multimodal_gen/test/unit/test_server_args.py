@@ -3196,6 +3196,15 @@ class TestOffloadDefaults(_CudaPlatformTestCase):
                     MiniMaxH3PipelineConfig(), kwargs=base
                 )
         with patch(sm_gate, return_value=True):
+            for field in ("enable_torch_compile", "enable_breakable_cuda_graph"):
+                with (
+                    self.subTest(field=field),
+                    self.assertRaisesRegex(ValueError, "eager execution"),
+                ):
+                    self._from_dict_with_pipeline_config(
+                        MiniMaxH3PipelineConfig(),
+                        kwargs={**base, "performance_mode": "speed", field: True},
+                    )
             with self.assertRaisesRegex(ValueError, "fp16 decode autocast"):
                 self._from_dict_with_pipeline_config(
                     MiniMaxH3PipelineConfig(),

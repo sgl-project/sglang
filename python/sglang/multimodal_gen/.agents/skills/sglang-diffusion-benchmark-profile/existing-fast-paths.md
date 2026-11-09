@@ -408,13 +408,14 @@ framework-specific optimization workflow.
   built on `per_token_group_quant_fp8` + `apply_fp8_linear`), and
   `runtime/models/vaes/minimax_h3_video_vae/{fp8.py,fused_decoder.py}`.
 - Behavior: `--component-quantizations.video_vae fp8` swaps the 144 ViT decoder
-  block linears for `OnlineFP8Linear` at load (SM100+, resident fp16 decode
+  block linears for `OnlineFP8Linear` during high decode only (SM100+, resident fp16 decode
   autocast) and, when the released block layout is recognised once at install,
   runs the blocks on the fused producers: residual add + RMSNorm + per-token
   FP8 quantization feeding each GEMM, SiLU-gated activation + quantization,
   residual add + output LayerNorm, the in-place weightless Q/K RMSNorm+RoPE on
-  the packed QKV output. A deployment-level precision change outside the
-  quality tiers: every level, `exact` included, decodes through it.
+  the packed QKV output. The original modules are restored on exit, including
+  failures; exact/lossless never use or retain FP8 weights. Include conversion
+  time and temporary dual-weight residency in performance/memory measurements.
 - Numerical contract: close, not bit-exact (>= 99.9% identical E4M3 bins and a
   half-ulp dequantized bound per producer); the decoder output stays within a
   fraction of a percent RMS of the eager FP8 blocks.

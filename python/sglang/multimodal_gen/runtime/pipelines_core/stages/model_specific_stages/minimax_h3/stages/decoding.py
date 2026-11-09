@@ -499,6 +499,11 @@ class MiniMaxH3DecodingStage(DecodingStage):
                     decode_kwargs["on_frames"] = stream
                 try:
                     with (
+                        selected_video_vae.use_decoder_fp8(
+                            batch.sampling_params.quality == "high"
+                            and server_args.component_quantizations.get("video_vae")
+                            == "fp8"
+                        ),
                         use_vae_fast_path(
                             selected_video_vae,
                             quality_allows(batch.sampling_params.quality, "lossless"),
