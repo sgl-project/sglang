@@ -951,6 +951,15 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         self.assertEqual(group.sources[PoolName.INDEXER], PoolName.KV)
         self.assertEqual(indexer.layer_mapping, {3: 0})
         self.assertEqual(indexer.prepare_locations(torch.tensor([2, 3])), [1])
+        self.assertEqual(
+            {name: entry.tp_replicated for name, entry in group.entry_map.items()},
+            {
+                PoolName.KV: True,
+                PoolName.INDEXER: True,
+                PoolName.MAMBA: False,
+                PoolName.DRAFT: False,
+            },
+        )
         kvcache.full_kv_pool = mla
 
         mla_draft = MLATokenToKVPool.__new__(MLATokenToKVPool)

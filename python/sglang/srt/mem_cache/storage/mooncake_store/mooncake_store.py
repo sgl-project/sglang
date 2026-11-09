@@ -1029,7 +1029,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         if isinstance(host_pool, DevicePoolEntry):
             # A direct-linker entry packs every buffer of a page into one object.
             object_name = "k" if transfer.name == PoolName.KV else transfer.name
-            suffix = f"_{self.mla_suffix}_{object_name}"
+            pool_suffix = getattr(self, "pool_suffixes", {}).get(
+                transfer.name, self.mla_suffix
+            )
+            suffix = f"_{pool_suffix}_{object_name}"
             return [f"{page_key}{suffix}" for page_key in page_keys], 1
 
         # Suffix order must match get_page_buffer_meta() for one page, because

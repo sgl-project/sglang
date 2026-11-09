@@ -51,6 +51,47 @@ def _storage_suffix(
     return "_".join(parts)
 
 
+def _shared_pool_suffix(
+    *, tp_shared: bool, tp_rank: int, attn_cp_rank: int, pp_rank: int
+) -> str:
+    """Key suffix for a pool whose pages are byte-identical across attention TP.
+    The versioned shared term keeps it from aliasing an older per-rank object."""
+    parts = ["tpshared_v1" if tp_shared else f"tp{tp_rank}"]
+    parts.extend((f"cp{attn_cp_rank}", f"pp{pp_rank}"))
+    return "_".join(parts)
+
+
+def _storage_sharing(
+    pools,
+    *,
+    rank_replicated: bool,
+    tp_rank: int,
+    tp_size: int,
+    attn_cp_rank: int,
+    pp_rank: int,
+    offload_owner: bool,
+):
+    """Per-pool key suffixes and the pools this rank offloads. A pool replicated
+    across attention TP is written by TP rank 0 only and read by every rank."""
+    tp_shared = {
+        name
+        for name, pool in pools.items()
+        if not rank_replicated and tp_size > 1 and pool.tp_replicated
+    }
+    suffixes = {
+        name: _shared_pool_suffix(
+            tp_shared=True, tp_rank=tp_rank, attn_cp_rank=attn_cp_rank, pp_rank=pp_rank
+        )
+        for name in tp_shared
+    }
+    offload_pools = {
+        name
+        for name in pools
+        if offload_owner and (name not in tp_shared or tp_rank == 0)
+    }
+    return suffixes, offload_pools, tp_shared
+
+
 class MooncakeDirectLinker(UnifiedCacheLinker):
     def __init__(
         self,
@@ -125,14 +166,26 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         )
         self.storage.mla_suffix = storage_suffix
         self.storage.mha_suffix = storage_suffix
+        self.storage.pool_suffixes, self.offload_pools, tp_shared = _storage_sharing(
+            self.pools,
+            rank_replicated=rank_replicated,
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+            attn_cp_rank=params.attn_cp_rank,
+            pp_rank=params.pp_rank,
+            offload_owner=self.offload_owner,
+        )
         logger.info(
             "Mooncake direct linker storage topology: "
-            "rank_replicated=%s, tp_rank=%d/%d, offload_owner=%s, suffix=%s",
+            "rank_replicated=%s, tp_rank=%d/%d, offload_owner=%s, suffix=%s, "
+            "tp_shared=%s, offload_pools=%s",
             rank_replicated,
             tp_rank,
             tp_size,
             self.offload_owner,
             storage_suffix,
+            sorted(tp_shared),
+            sorted(self.offload_pools),
         )
 
         self.register_buffers()
@@ -499,7 +552,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         if not expanded:
             return False
         self.freeze_gc_once()
-        if not self.offload_owner:
+        expanded = [t for t in expanded if t.name in self.offload_pools]
+        if not expanded:
             self.offload_results.put(True)
             return True
         kv = next(transfer for transfer in transfers if transfer.name == PoolName.KV)

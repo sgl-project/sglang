@@ -32,6 +32,7 @@ class DevicePoolEntry:
         page_size: int,
         rows_are_pages: bool,
         packed: bool = True,
+        tp_replicated: bool = False,
         index_mapper: Callable[[torch.Tensor], torch.Tensor] | None = None,
     ):
         self.name = name
@@ -41,6 +42,9 @@ class DevicePoolEntry:
         self.layer_mapping = layer_mapping
         self.page_size = page_size
         self.packed = packed
+        # MLA-family pages have no head dimension to shard, so every attention-TP
+        # rank holds identical bytes; KDA state in the same group is sharded.
+        self.tp_replicated = tp_replicated
         self._index_mapper = index_mapper
         self._page_offsets = torch.arange(page_size)
         self._row_span = 1 if rows_are_pages else page_size
@@ -572,6 +576,7 @@ def _build_mamba_device_pool_group(
             layer_mapping=full_mapping,
             page_size=page_size,
             rows_are_pages=False,
+            tp_replicated=True,
         ),
         _mamba_device_pool_entry(
             params.token_to_kv_pool_allocator.state, kvcache.start_layer
@@ -601,6 +606,7 @@ def _build_mamba_device_pool_group(
                     },
                     page_size=page_size,
                     rows_are_pages=True,
+                    tp_replicated=True,
                 )
             )
     entries.extend(_sidecar_draft_entries(params, page_size))
@@ -628,6 +634,7 @@ def _sidecar_draft_entries(params: Any, page_size: int) -> list[DevicePoolEntry]
                 layer_mapping=layer_mapping,
                 page_size=page_size,
                 rows_are_pages=False,
+                tp_replicated=True,
             )
         else:
             entry = _mha_device_pool_entry(
