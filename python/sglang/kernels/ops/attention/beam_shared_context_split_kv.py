@@ -35,18 +35,18 @@ from sglang.kernels.ops.attention.beam_shared_context import (
     attend_prompt_block,
     check_shared_context_inputs,
     empty_softmax_state,
-    num_sms,
+    wave_ctas,
 )
 
-# Measured on RTX PRO 6000 (SM120) at 256 beams, head_dim 128: fastest at 1-8
-# groups and 256-2048 prompt tokens.
+# Fastest of ten tiles on RTX PRO 6000 at 256 beams, head_dim 128; untuned elsewhere.
+# Shared memory: 64 KB at head_dim <= 128; 144 KB up to 256, past SM86/89/120's 99 KB.
 _BLOCK_M = 128
 _BLOCK_N = 64
 _NUM_WARPS = 8
 _NUM_STAGES = 2
 _MAX_SPLITS = 8
-# Measured: the smallest split count that fills this share of the last wave is
-# within 1-2% of the best one at 1-8 groups; more splits only add merge traffic.
+# Measured on RTX PRO 6000: the smallest split count that fills this share of the
+# last wave is within 1-2% of the best one at 1-8 groups; more add merge traffic.
 _MIN_WAVE_EFFICIENCY = 0.8
 
 
@@ -318,13 +318,13 @@ def _merge_splits_kernel(
 
 def num_kv_splits(
     num_tiles: int,  # programs without splits: groups * q_heads * beam blocks
-    num_sms: int,  # SMs on the device
+    wave: int,  # CTAs the GPU holds at once: SMs times CTAs per SM
 ) -> int:
     """Pick the prompt split count from static shapes only, so graphs keep it."""
     best_splits, best_efficiency = 1, 0.0
     for splits in range(1, _MAX_SPLITS + 1):
         ctas = num_tiles * splits
-        efficiency = ctas / (triton.cdiv(ctas, num_sms) * num_sms)
+        efficiency = ctas / (triton.cdiv(ctas, wave) * wave)
         if efficiency >= _MIN_WAVE_EFFICIENCY:
             return splits
         if efficiency > best_efficiency:
@@ -372,67 +372,94 @@ def shared_context_attention_split_kv(
     _, q_heads, head_dim = q.shape
     kv_heads = k_buffer.shape[1]
 
+    rows = num_groups * beam_width
     beam_blocks = triton.cdiv(beam_width, _BLOCK_M)
-    if num_splits is None:
-        num_splits = num_kv_splits(
-            num_groups * q_heads * beam_blocks,
-            num_sms(q.device.index),
+    block_d = triton.next_power_of_2(head_dim)
+    constexprs = dict(
+        BEAM_WIDTH=beam_width,
+        Q_PER_KV=q_heads // kv_heads,
+        HEAD_DIM=head_dim,
+        BLOCK_M=_BLOCK_M,
+        BLOCK_N=_BLOCK_N,
+        BLOCK_D=block_d,
+        num_warps=_NUM_WARPS,
+        num_stages=_NUM_STAGES,
+    )
+
+    def kernel_args(partial_output, partial_lse, splits, partial_strides):
+        return (
+            q,
+            k_buffer,
+            v_buffer,
+            row_indices,
+            context_slots,
+            context_cu_seqlens,
+            decode_slots,
+            decode_lens,
+            output,
+            partial_output,
+            partial_lse,
+            softmax_scale,
+            splits,
+            q.stride(0),
+            q.stride(1),
+            row_indices.stride(0),
+            row_indices.stride(1),
+            k_buffer.stride(0),
+            k_buffer.stride(1),
+            v_buffer.stride(0),
+            v_buffer.stride(1),
+            decode_slots.stride(0),
+            output.stride(0),
+            output.stride(1),
+            *partial_strides,
         )
+
+    if num_splits is None:
+        # Any split count above 1 compiles to the same kernel: probe it with the
+        # partials' dtype and contiguous strides, before they are allocated.
+        wave = wave_ctas(
+            key=("split_kv", q.device.index, q.dtype, k_buffer.dtype)
+            + tuple(sorted(constexprs.items())),
+            compile_kernel=lambda: _shared_context_split_kv_kernel.warmup(
+                *kernel_args(
+                    torch.float32,
+                    torch.float32,
+                    2,
+                    (rows * q_heads * head_dim, q_heads * head_dim, head_dim)
+                    + (rows * q_heads, q_heads),
+                ),
+                WRITE_PARTIALS=True,
+                grid=(1,),
+                **constexprs,
+            ),
+            device_index=q.device.index,
+        )
+        num_splits = num_kv_splits(num_groups * q_heads * beam_blocks, wave)
     write_partials = num_splits > 1
     if write_partials:
         partial_output = torch.empty(
-            (num_splits, num_groups * beam_width, q_heads, head_dim),
+            (num_splits, rows, q_heads, head_dim),
             dtype=torch.float32,
             device=q.device,
         )
         partial_lse = torch.empty(
-            (num_splits, num_groups * beam_width, q_heads),
+            (num_splits, rows, q_heads),
             dtype=torch.float32,
             device=q.device,
         )
     else:
         partial_output = partial_lse = output.new_empty((1, 1, 1))
 
-    block_d = triton.next_power_of_2(head_dim)
     _shared_context_split_kv_kernel[(num_groups * num_splits, q_heads, beam_blocks)](
-        q,
-        k_buffer,
-        v_buffer,
-        row_indices,
-        context_slots,
-        context_cu_seqlens,
-        decode_slots,
-        decode_lens,
-        output,
-        partial_output,
-        partial_lse,
-        softmax_scale,
-        num_splits,
-        q.stride(0),
-        q.stride(1),
-        row_indices.stride(0),
-        row_indices.stride(1),
-        k_buffer.stride(0),
-        k_buffer.stride(1),
-        v_buffer.stride(0),
-        v_buffer.stride(1),
-        decode_slots.stride(0),
-        output.stride(0),
-        output.stride(1),
-        partial_output.stride(0),
-        partial_output.stride(1),
-        partial_output.stride(2),
-        partial_lse.stride(0),
-        partial_lse.stride(1),
-        BEAM_WIDTH=beam_width,
-        Q_PER_KV=q_heads // kv_heads,
-        HEAD_DIM=head_dim,
+        *kernel_args(
+            partial_output,
+            partial_lse,
+            num_splits,
+            partial_output.stride()[:3] + partial_lse.stride()[:2],
+        ),
         WRITE_PARTIALS=write_partials,
-        BLOCK_M=_BLOCK_M,
-        BLOCK_N=_BLOCK_N,
-        BLOCK_D=block_d,
-        num_warps=_NUM_WARPS,
-        num_stages=_NUM_STAGES,
+        **constexprs,
     )
     if write_partials:
         _merge_splits_kernel[(num_groups * beam_width,)](
