@@ -89,7 +89,8 @@ class _ConfigPickler(pickle.Pickler):
     def reducer_override(self, obj):
         import torch
 
-        if isinstance(obj, torch.Tensor) and obj.device.type == "cpu":
+        # Tensor subclasses may need globals rejected by the weights-only loader.
+        if type(obj) in (torch.Tensor, torch.nn.Parameter) and obj.device.type == "cpu":
             # Tensor's pickle reducer uses legacy torch.save, which warns on NPU.
             buffer = io.BytesIO()
             torch.save(obj, buffer, _use_new_zipfile_serialization=True)

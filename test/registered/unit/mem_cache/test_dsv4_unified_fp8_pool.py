@@ -113,6 +113,7 @@ class _StubTokenToKVPool:
     up a whole DeepSeekV4TokenToKVPool.
     """
 
+    compressed_buffer_info = DeepSeekV4TokenToKVPool.compressed_buffer_info
     _unified_page_views = DeepSeekV4TokenToKVPool._unified_page_views
     unified_region_buffers = DeepSeekV4TokenToKVPool.unified_region_buffers
     unified_rope_region_buffers = DeepSeekV4TokenToKVPool.unified_rope_region_buffers
@@ -204,6 +205,31 @@ class TestDSV4UnifiedRegionBuffers(CustomTestCase):
                 self.assertEqual(
                     view.data_ptr(), buf.data_ptr() + swa_pages * row_bytes
                 )
+
+    def test_native_description_keeps_both_halves_and_excludes_swa(self):
+        for fp8 in (False, True):
+            pool, stub = self._stub(fp8=fp8)
+            for ratio in (4, 128):
+                with self.subTest(fp8=fp8, ratio=ratio):
+                    info = stub.compressed_buffer_info(ratio)
+                    self.assertEqual(info.rope is not None, fp8)
+                    layer_ids = [
+                        i for i, r in enumerate(self.STAGE_RATIOS) if r == ratio
+                    ]
+                    regions = [(info.kv, pool.kv_buffer)]
+                    if fp8:
+                        regions.append((info.rope, pool.kv_buffer_rope))
+                    for region, buffers in regions:
+                        self.assertEqual(region.page_slots, self.PAGE_SIZE // ratio)
+                        self.assertEqual(len(region.buffers), len(layer_ids))
+                        for view, layer_id in zip(region.buffers, layer_ids):
+                            native = buffers[layer_id]
+                            ring_bytes = pool.swa_pages * native[0].nbytes
+                            self.assertEqual(
+                                view.data_ptr(), native.data_ptr() + ring_bytes
+                            )
+                            self.assertEqual(view.nbytes, native.nbytes - ring_bytes)
+                            self.assertEqual(region.page_bytes, view[0].nbytes)
 
 
 class TestResolveUnifiedKvFp8(CustomTestCase):

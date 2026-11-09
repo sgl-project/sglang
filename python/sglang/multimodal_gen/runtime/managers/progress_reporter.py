@@ -48,7 +48,7 @@ class ReportingTqdm(tqdm):
     def __init__(
         self,
         *args: Any,
-        reporter: ProgressReporter,
+        reporter: ProgressReporter | None,
         request_ids: list[str],
         progress_range: tuple[float, float] = (0.0, 1.0),
         **kwargs: Any,
@@ -65,7 +65,7 @@ class ReportingTqdm(tqdm):
         displayed = super().update(n)
         # tqdm.__iter__ calls update() itself; __iter__ counts those steps
         if not self._iterating:
-            self._advance(n or 0)
+            self._report(n or 0)
         return displayed
 
     def __iter__(self):
@@ -73,13 +73,13 @@ class ReportingTqdm(tqdm):
         try:
             for obj in super().__iter__():
                 yield obj
-                self._advance(1)
+                self._report(1)
         finally:
             self._iterating = False
 
-    def _advance(self, n: float) -> None:
+    def _report(self, n: float) -> None:
         total = self.total
-        if not total or n <= 0 or self._completed >= total:
+        if self._reporter is None or not total or n <= 0 or self._completed >= total:
             return
         self._completed = min(self._completed + n, total)
         percent = int(self._completed * 100 // total)

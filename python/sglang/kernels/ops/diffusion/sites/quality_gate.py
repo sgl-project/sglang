@@ -58,10 +58,8 @@ class QualityGatedFusion:
         if not sites:
             return False
 
-        # Static rejections are input-independent; avoid repeated warnings.
-        rejected_attr = f"{self.enabled_attr}_static_rejected"
-        if getattr(root, rejected_attr, False):
-            return False
+        # Weights and devices can change between mounts; cache only the message.
+        rejected_attr = f"{self.enabled_attr}_last_rejection"
 
         if self.reject_reason is not None:
             for site in sites:
@@ -69,16 +67,18 @@ class QualityGatedFusion:
                 if reason is None:
                     continue
                 self._set_enabled(sites, False)
-                setattr(root, rejected_attr, True)
-                logger.info(
-                    "%s: %s site failed static guards (%s); keeping the "
-                    "whole model on the reference path",
-                    self.name,
-                    type(site).__name__,
-                    reason,
-                )
+                rejection = (type(site).__name__, reason)
+                if getattr(root, rejected_attr, None) != rejection:
+                    setattr(root, rejected_attr, rejection)
+                    logger.info(
+                        "%s: %s site failed static guards (%s); keeping the "
+                        "whole model on the reference path",
+                        self.name,
+                        *rejection,
+                    )
                 return False
 
+        setattr(root, rejected_attr, None)
         self._set_enabled(sites, True)
         return True
 

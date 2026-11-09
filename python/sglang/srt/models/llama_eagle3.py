@@ -14,8 +14,8 @@ limitations under the License.
 """
 
 from sglang.srt.configs.draft_parallel import DraftParallelSpec, DraftTPExecution
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.runtime_context import get_spec
-from sglang.srt.utils import add_prefix
 
 # Adapted from
 # https://github.com/SafeAILab/EAGLE/blob/main/eagle/model/cnets.py
@@ -379,6 +379,11 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
 
     def get_hot_token_id(self):
         return self.hot_token_id
+
+    @staticmethod
+    def sliding_layer_window_size(config) -> Optional[int]:
+        # The draft's window is a server argument, not part of its config.
+        return get_spec().speculative_draft_window_size
 
     def get_attention_sliding_window_size(self) -> Optional[int]:
         return self._draft_window_size
