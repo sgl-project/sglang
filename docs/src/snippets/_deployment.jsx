@@ -148,6 +148,7 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
       { id: "h20-3e", label: "H20-3e", vram: "141GB" },
       { id: "h800",  label: "H800",  vram: "80GB"  },
     ],
+    rubin: [],
     // ROCm multi-node runs the RDMA NICs straight through: /dev/infiniband
     // covers rdma_cm plus the per-NIC uverbsN nodes, IPC_LOCK + an unlimited
     // memlock let the transport pin its registered buffers, and the stack /
