@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from sglang.srt import runtime_context as rc  # noqa: E402
 from sglang.srt.disaggregation import role_switch  # noqa: E402
 from sglang.srt.disaggregation.mode import DisaggregationMode  # noqa: E402
+from sglang.srt.environ import envs  # noqa: E402
 from sglang.srt.managers.io_struct import (  # noqa: E402
     PdRoleSwitchReqInput,
     PdRoleSwitchReqOutput,
@@ -367,6 +368,14 @@ class TestPdRoleSwitchStartupValidation(unittest.TestCase):
     all-to-all / pipeline parallelism are sized at startup and not rebuilt, so
     a flip with those on would silently deadlock. The PD arg hook must reject
     the combination up-front instead of failing at flip time."""
+
+    def setUp(self):
+        super().setUp()
+        # Rust-server mode does not serve /pd_role_switch, and its PD arg hook
+        # imports the transfer backend (mori here, not installed in CI) to
+        # check its bootstrap server, so pin the mode against an inherited
+        # SGLANG_RUST_SERVER=1.
+        self.enterContext(envs.SGLANG_RUST_SERVER.override(False))
 
     def _sa(self, **kw):
         base = dict(

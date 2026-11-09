@@ -1,6 +1,7 @@
 """Regression tests for batched Mooncake load sessions."""
 
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import Mock, call
 
@@ -27,6 +28,10 @@ class TestLayerWiseLoadSessions(CustomTestCase):
             for name in ("kv", "index")
         }
         self.linker.num_layers = 1
+        self.linker.load_layer_group = 1
+        self.linker.load_threads = 1
+        self.linker.load_io_executor = ThreadPoolExecutor(max_workers=1)
+        self.addCleanup(self.linker.load_io_executor.shutdown)
         self.linker.layer_done_counter = Mock()
         self.transfers = [
             [

@@ -696,6 +696,9 @@ std::tuple<at::Tensor, at::Tensor> topk_softmax_cpu(
       case 512:
         LAUNCH_TOPK_SOFTMAX_KERNEL(512);
         break;
+      case 2560:
+        LAUNCH_TOPK_SOFTMAX_KERNEL(2560);
+        break;
       default:
         TORCH_CHECK(false, "Unexpected num_experts: ", num_experts);
     }
