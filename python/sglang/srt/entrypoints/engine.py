@@ -291,6 +291,8 @@ class Engine(EngineScoreMixin, EngineBase):
     _attached = False
     tokenizer_router: Optional[MultiTokenizerRouter] = None
     _multi_tokenizer_shm = None
+    # True once __init__ froze the GC; shutdown() may run on a partly built Engine.
+    _froze_gc = False
 
     def __init__(self, **kwargs):
         """
@@ -411,6 +413,16 @@ class Engine(EngineScoreMixin, EngineBase):
             trace_set_thread_info(thread_label)
 
         self.loop = self._ensure_event_loop()
+
+        # Freeze the startup heap as `sglang serve` does after warmup; collect first,
+        # since this is the caller's process and its existing garbage must stay collectable.
+        if (
+            self.tokenizer_manager is not None
+            and envs.SGLANG_ENGINE_FREEZE_GC_AFTER_STARTUP.get()
+        ):
+            gc.collect()
+            self.tokenizer_manager.freeze_gc_sync()
+            self._froze_gc = True
 
     def get_all_child_pids(self) -> List[int]:
         """Returns a list of all child process PIDs."""
@@ -1567,11 +1579,19 @@ class Engine(EngineScoreMixin, EngineBase):
 
             kill_process_tree(os.getpid(), include_parent=False, wait_timeout=60)
         finally:
+            self._unfreeze_gc()
             if isinstance(self.tokenizer_manager, TokenizerManager):
                 mm_processor = getattr(self.tokenizer_manager, "mm_processor", None)
                 if mm_processor is not None:
                     mm_processor.shutdown()
                 self.tokenizer_manager.cuda_vmm_feature_transport.shutdown()
+
+    def _unfreeze_gc(self):
+        # gc.unfreeze() is process-wide, so this also thaws objects frozen by
+        # anyone else; it lets engines built and shut down in one process be collected.
+        if self._froze_gc:
+            gc.unfreeze()
+            self._froze_gc = False
 
     def __enter__(self):
         return self
@@ -1925,15 +1945,12 @@ class Engine(EngineScoreMixin, EngineBase):
         To maintain a high performance server with low latency, we want to reduce the
         stalls caused by the garbage collector scanning through a large number of objects.
 
-        It is usually helpful to start the server and warm it up with real requests to
-        initialize many of the long-lived objects that do not need to be garbage collected.
-
-        After sufficient warmup, we can call this function to freeze the garbage collector
-        so that all objects created before this point are considered out of scope for garbage
-        collection.
+        The engine already freezes the garbage collector at startup. After warming it
+        up with real requests, call this again to also freeze the long-lived objects
+        created since, so they are considered out of scope for garbage collection.
         """
 
-        self.loop.run_until_complete(self.tokenizer_manager.freeze_gc())
+        self.tokenizer_manager.freeze_gc_sync()
 
     """
     Execute an RPC call on all scheduler processes.
