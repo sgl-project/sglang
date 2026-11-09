@@ -2842,6 +2842,91 @@ class TestUnifiedRadixPrefetchCorruption(
 
         cache.sanity_check()
 
+    def test_prefetch_over_already_cached_span_reports_already_cached(self):
+        """A span another request cached during the read is freed as a duplicate
+        and reported; only the new tail is credited as loaded from storage."""
+        cache, allocator, _ = build_fixture(self.cfg)
+        self._init_hicache(cache)
+        cache.enable_storage_metrics = True
+        cache.storage_metrics_collector = mock.Mock()
+
+        parent_id = self._insert_device(
+            cache, allocator, list(range(1, 1 + 3 * self.ps))
+        )
+        self.assertGreater(write_backup(cache, parent_id), 0)
+        # Another request lands the first two pages of the span on host first.
+        cached_id = self._attach_host_child(cache, parent_id, start_token=1000)
+        self.assertIsNotNone(cached_id)
+        cached_tokens = 2 * self.ps
+
+        prefetch_key = RadixKey(
+            array("q", list(range(1000, 1000 + 3 * self.ps)))
+        ).page_aligned(self.ps)
+        completed_tokens = len(prefetch_key)
+        host_indices = cache.cache_controller.mem_pool_host.alloc(completed_tokens)
+        self.assertIsNotNone(host_indices)
+        host_used = cache.cache_controller.mem_pool_host.size - (
+            cache.cache_controller.mem_pool_host.available_size()
+        )
+
+        operation = mock.Mock()
+        operation.host_indices = host_indices
+        operation.completed_tokens = completed_tokens
+        operation.storage_start = 0
+        operation.pool_storage_result = PoolTransferResult(
+            kv_hit_pages=completed_tokens // self.ps, extra_pool_hit_pages={}
+        )
+        anchor_lock_params = cache.inc_host_lock_ref(parent_id).to_dec_params()
+        req_id = CacheRequestHandle("already-cached", 0)
+        operation.handle = req_id
+        operation.request_id = req_id.rid
+        cache.ongoing_prefetch[req_id] = _OngoingPrefetch(
+            parent_id,
+            prefetch_key,
+            host_indices,
+            operation,
+            anchor_lock_params,
+            {},
+        )
+        cache._record_storage_prefetch_hit(req_id, completed_tokens)
+        cache.cache_controller.prefetch_tokens_occupied = completed_tokens
+        hashes = [f"h{i}" for i in range(completed_tokens // self.ps)]
+        operation.hash_value = hashes
+
+        with (
+            mock.patch.object(cache, "_can_terminate_prefetch", return_value=True),
+            mock.patch.object(
+                cache,
+                "_check_hybrid_prefetch_result",
+                return_value=completed_tokens,
+            ),
+            mock.patch.object(
+                cache.cache_controller,
+                "terminate_prefetch",
+                return_value=(completed_tokens, hashes),
+            ),
+            mock.patch.object(operation, "is_terminated", return_value=False),
+        ):
+            self.assertTrue(cache.check_prefetch_progress(req_id))
+
+        self.assertEqual(
+            cache.pop_prefetch_loaded_tokens(req_id), completed_tokens - cached_tokens
+        )
+        # The duplicate head goes back to the host pool; the tail stays in the tree.
+        self.assertEqual(
+            cache.cache_controller.mem_pool_host.size
+            - cache.cache_controller.mem_pool_host.available_size(),
+            host_used - cached_tokens,
+        )
+        cache.storage_metrics_collector.log_prefetched_tokens.assert_called_once_with(
+            completed_tokens
+        )
+        cache.storage_metrics_collector.log_storage_prefetch_unfulfilled_tokens.assert_called_once_with(
+            cached_tokens, "already_cached"
+        )
+
+        cache.sanity_check()
+
     def test_write_through_eviction_counts_unbacked_tokens(self):
         cache, allocator, _ = build_fixture(self.cfg)
         self._init_hicache(cache)

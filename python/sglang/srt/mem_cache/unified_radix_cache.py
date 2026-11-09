@@ -2986,7 +2986,9 @@ class UnifiedRadixCache(BasePrefixCache):
         self._apply_cache_actions(insert_result.cache_actions)
 
         if insert_result.host_insert_dropped:
-            self._resolve_storage_prefetch_tokens(request, insert_result.prefix_len)
+            self._resolve_storage_prefetch_tokens(
+                request, insert_result.prefix_len, reason="already_cached"
+            )
             self._finish_storage_prefetch(request, fulfilled_tokens=0, reason="dropped")
             self.cache_controller.append_host_mem_release(
                 host_indices=host_indices[:completed_tokens],
@@ -3014,7 +3016,9 @@ class UnifiedRadixCache(BasePrefixCache):
             # Cache mode has only completed L3 -> L2 here. Keep the usable
             # storage span unresolved until admission proves that L2 -> L1
             # load-back actually materialized it for this request.
-            self._resolve_storage_prefetch_tokens(request, insert_result.prefix_len)
+            self._resolve_storage_prefetch_tokens(
+                request, insert_result.prefix_len, reason="already_cached"
+            )
 
         self.dec_host_lock_ref(last_host_node_id, anchor_lock_params)
         del self.ongoing_prefetch[request]
