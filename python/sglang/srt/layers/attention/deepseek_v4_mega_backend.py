@@ -26,8 +26,6 @@ def interleave_query_rows(x: torch.Tensor, num_heads: int) -> torch.Tensor:
 def pack_query(
     q: torch.Tensor, padded_heads: int, out: Optional[torch.Tensor] = None
 ) -> torch.Tensor:
-    # Writes only the real heads' slots;
-    # an ``out`` passed in must already hold zeros in the padded heads' slots.
     tokens, heads, _ = q.shape
     if out is None:
         out = q.new_zeros(tokens, padded_heads, HEAD_DIM)
@@ -38,8 +36,6 @@ def pack_query(
 
 
 def max_packed_query_rows(*, max_running_requests: int, rows_per_request: int) -> int:
-    # A decode or verify batch and, except on a PD decode server (no extend forwards),
-    # a prefill chunk or a prefill-graph or decoder-tail bucket.
     graphs = get_exec().graph.cuda_graph_config
     max_bs = max(max_running_requests, graphs.decode.max_bs or 0)
     rows = get_eager_max_batch_size(max_bs) * rows_per_request
@@ -83,8 +79,7 @@ class DeepseekV4MegaAttnBackend(DeepseekV4AttnBackend):
     def packed_query_buffer(
         self, rows: int, padded_heads: int, dtype: torch.dtype
     ) -> Optional[torch.Tensor]:
-        # Zeroed once and never reallocated, so captured graphs keep its address;
-        # a forward with more rows gets None and packs into fresh zeros.
+        # Never reallocated: captured graphs keep its address.
         if self._packed_query is None:
             assert not torch.cuda.is_current_stream_capturing()
             self._packed_query = torch.zeros(

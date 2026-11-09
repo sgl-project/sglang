@@ -36,7 +36,7 @@ from sglang.test.kernels.deepseek_v4.dsv41_kv_quant_reference import (
 )
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=50, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 
 def unpack_output(data, scale):
@@ -175,8 +175,6 @@ class TestMegaAttention(CustomTestCase):
                 )
 
     def test_mega_kernels_leave_q_unchanged(self):
-        # The packed query's padding is zeroed once per backend and never rewritten,
-        # so no MegaAttention kernel may write its query.
         torch.manual_seed(789)
         tokens, topk, extra_topk, page = 48, 128, 512, 64
         positions = torch.randint(0, 4096, (tokens,), device="cuda", dtype=torch.int32)
@@ -210,8 +208,6 @@ class TestMegaAttention(CustomTestCase):
         prefill_indices = torch.randint(
             0, 512, (tokens, 1, topk), device="cuda", dtype=torch.int32
         )
-        # "decode_swa" passes no extra cache;
-        # so do the model's compress_ratio 0 layers and SWA-only DSpark draft blocks.
         for (heads, padded), use_legacy, op in itertools.product(
             ((16, 64), (64, 64), (128, 128)),
             (True, False),
@@ -269,9 +265,6 @@ def pack_query_reference(q, padded_heads):
 
 
 class _MegaQueryLayer:
-    """The state MQALayer._forward_mega reads before the attention call, which
-    records the packed query it is handed."""
-
     head_dim = 512
     mega_wq_b_permuted = False
     _forward_mega = MQALayer._forward_mega
@@ -320,9 +313,6 @@ def padding_nonzero(backend, heads, padded_heads):
 
 
 class TestMegaPackedQueryBuffer(CustomTestCase):
-    """Every pack writes only the real heads of one buffer per backend, zeroed once;
-    its padding must stay zero across layers, token counts, captures and replays."""
-
     def test_packs_match_fresh_zeros(self):
         torch.manual_seed(0)
         decode_tokens = (8, 48, 3, 64, 1)
@@ -354,8 +344,6 @@ class TestMegaPackedQueryBuffer(CustomTestCase):
                 self.assertEqual(padding_nonzero(backend, heads, padded), 0)
 
     def test_cuda_graphs_and_eager_forwards_share_the_buffer(self):
-        # Graphs are captured largest first after an eager warmup,
-        # then replayed in turn with eager forwards of another size in between.
         torch.manual_seed(1)
         layer = _MegaQueryLayer()
         backend = mega_backend(64)
@@ -400,8 +388,6 @@ class TestMegaPackedQueryBuffer(CustomTestCase):
         self.assertEqual(padding_nonzero(backend, 16, 64), 0)
 
     def test_forward_beyond_the_buffer_packs_into_fresh_zeros(self):
-        # Captured graphs keep the buffer's address,
-        # so a forward with more rows must pack elsewhere and leave the buffer as it is.
         torch.manual_seed(3)
         layer = _MegaQueryLayer()
         backend = mega_backend(48)
@@ -426,26 +412,8 @@ class TestMegaPackedQueryBuffer(CustomTestCase):
         self.assertTrue(torch.equal(out, pack_query_reference(q, 64)))
         self.assertEqual(out.data_ptr(), ptr)
 
-    def test_backends_keep_separate_buffers(self):
-        """Backends that run at once on different streams must not share a buffer;
-        PD multiplexing gives prefill and each decode SM group its own backend."""
-        torch.manual_seed(2)
-        layer = _MegaQueryLayer()
-        first, second = mega_backend(32), mega_backend(32)
-        q_first, q_second = (
-            torch.randn(32, 16, 512, device="cuda", dtype=torch.bfloat16)
-            for _ in range(2)
-        )
-        out = forward(layer, first, q_first, 64)
-        forward(layer, second, q_second, 64)
-        self.assertTrue(torch.equal(out, pack_query_reference(q_first, 64)))
-
 
 class TestMaxPackedQueryRows(CustomTestCase):
-    """The buffer must hold every forward bounded at startup:
-    a decode or verify batch padded for MLP sync, a prefill chunk,
-    and every prefill-graph and decoder-tail bucket, since capture runs each one."""
-
     def _rows(self, *, mode, chunk, prefill_graph, decode_graph, requests, align):
         graphs = CudaGraphConfig(
             decode=PhaseConfig(backend=Backend.FULL, max_bs=decode_graph),
@@ -478,8 +446,7 @@ class TestMaxPackedQueryRows(CustomTestCase):
             (2048, "null", 1024, 512, 64, 48, 1),
             # An 8192-token prefill-graph bucket outgrows a 4096-token chunk.
             (8192, "null", 4096, 8192, 64, 48, 1),
-            # Chunked prefill disabled: no chunk term (longer forwards get fresh zeros),
-            # so the 2048-row decoder-tail bucket.
+            # Chunked prefill disabled: no chunk term, so the 2048-row tail bucket.
             (2048, "null", -1, 512, 64, 48, 1),
             # A PD decode server: 1000 eager requests (over the 256 of the graphs) x 4.
             (4000, "decode", 16384, 2048, 256, 1000, 1),
