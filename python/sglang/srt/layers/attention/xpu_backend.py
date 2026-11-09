@@ -165,6 +165,14 @@ class XPUAttentionBackend(AttentionBackend):
     ):
         super().__init__()
 
+        # With the XPU monokernel no step reads the host copy of seq_lens: the captured
+        # graphs' replay metadata is built from the device tensors, so the scheduler's
+        # per-step D2H (and the wait for the previous verify it implies) is skipped.
+        # Without it the default (True) is kept and nothing changes.
+        self.needs_cpu_seq_lens = not getattr(
+            get_exec().kernel, "enable_xpu_monokernel", False
+        )
+
         assert not (
             model_runner.sliding_window_size is not None
             and model_runner.model_config.is_encoder_decoder
@@ -274,6 +282,15 @@ class XPUAttentionBackend(AttentionBackend):
         self.bidirectional_block_ids = None
         # Set with the ids by models whose full-attention layers stay causal.
         self.bidirectional_sliding_layers_only = False
+
+    @staticmethod
+    def _max_seq_len(forward_batch: ForwardBatch) -> int:
+        """The longest sequence in the batch: from the host copy when the scheduler
+        kept one, else read back from the device (an eager step only)."""
+        lens = forward_batch.seq_lens_cpu
+        if lens is None:
+            lens = forward_batch.seq_lens
+        return int(lens.max().item())
 
     def _assert_dcp_supported(self):
         if self.has_swa:
@@ -407,7 +424,7 @@ class XPUAttentionBackend(AttentionBackend):
                     metadata.cache_seqlens_int32 = (
                         seqlens_in_batch + (self.speculative_step_id + 1)
                     ).to(torch.int32)
-                    metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item() + (
+                    metadata.max_seq_len_k = self._max_seq_len(forward_batch) + (
                         self.speculative_step_id + 1
                     )
                     metadata.cu_seqlens_q = torch.arange(
@@ -425,7 +442,7 @@ class XPUAttentionBackend(AttentionBackend):
                 else:
                     metadata.cache_seqlens_int32 = (seqlens_in_batch).to(torch.int32)
                     metadata.max_seq_len_q = self.topk
-                    metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
+                    metadata.max_seq_len_k = self._max_seq_len(forward_batch)
                     metadata.cu_seqlens_q = torch.arange(
                         0,
                         batch_size * self.topk + 1,
@@ -476,7 +493,7 @@ class XPUAttentionBackend(AttentionBackend):
             else:
                 # Normal Decode
                 metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
-                metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
+                metadata.max_seq_len_k = self._max_seq_len(forward_batch)
                 metadata.cu_seqlens_q = torch.arange(
                     0, batch_size + 1, dtype=torch.int32, device=device
                 )
@@ -502,7 +519,7 @@ class XPUAttentionBackend(AttentionBackend):
                 ).to(torch.int32)
                 metadata.max_seq_len_q = num_tokens_per_req
                 metadata.max_seq_len_k = (
-                    forward_batch.seq_lens_cpu.max().item() + num_tokens_per_req
+                    self._max_seq_len(forward_batch) + num_tokens_per_req
                 )
                 metadata.cu_seqlens_q = torch.arange(
                     0,
@@ -525,7 +542,7 @@ class XPUAttentionBackend(AttentionBackend):
             else:
                 metadata.cache_seqlens_int32 = forward_batch.seq_lens.to(torch.int32)
                 metadata.max_seq_len_q = self.speculative_num_draft_tokens
-                metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
+                metadata.max_seq_len_k = self._max_seq_len(forward_batch)
                 metadata.cu_seqlens_q = torch.arange(
                     0,
                     batch_size * self.speculative_num_draft_tokens + 1,
@@ -628,7 +645,7 @@ class XPUAttentionBackend(AttentionBackend):
             or forward_batch.forward_mode.is_dllm_extend()
         ):
             metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
-            metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
+            metadata.max_seq_len_k = self._max_seq_len(forward_batch)
             metadata.cu_seqlens_k = torch.nn.functional.pad(
                 torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
             )
@@ -1840,12 +1857,13 @@ class XPUAttentionBackend(AttentionBackend):
         req_pool_indices = req_pool_indices[:bs]
 
         metadata = self.decode_cuda_graph_metadata[bs]
-        max_len = (
-            seq_lens_cpu.max().item()
-            if seq_lens_cpu is not None
-            else seq_lens.max().item()
-        )
-        metadata.max_seq_len_k = max_len + kv_len_offset
+        if seq_lens_cpu is not None:
+            metadata.max_seq_len_k = seq_lens_cpu.max().item() + kv_len_offset
+        else:
+            # Replays run the captured kernels, which fixed their bounds at capture; the
+            # page-table refresh below needs only a bound on the pages to rewrite. The
+            # table's width (in pages) bounds the length without a device read.
+            metadata.max_seq_len_k = metadata.page_table.shape[1] * self.page_size
 
         # target-verify and draft-extend pack multiple query rows per request;
         # rebuild cu_seqlens_q as a strided ramp (0, q, 2q, ...). Plain/draft
@@ -2211,8 +2229,6 @@ class XPUAttentionBackend(AttentionBackend):
 class XPUMultiStepDraftBackend:
     """Wrap multiple XPU attention backends for consecutive draft decode steps."""
 
-    needs_cpu_seq_lens: bool = False
-
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -2231,6 +2247,7 @@ class XPUMultiStepDraftBackend:
             )
             for i in range(speculative_num_steps - 1)
         ]
+        self.needs_cpu_seq_lens = self.attn_backends[0].needs_cpu_seq_lens
         self.max_context_len = self.attn_backends[0].max_context_len
         self.device = model_runner.device
         self.token_to_kv_pool = model_runner.token_to_kv_pool
