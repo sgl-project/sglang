@@ -1949,8 +1949,15 @@ def _set_envs_and_config(server_args: ServerArgs):
         or cfg.enable_nccl_nvls
         or cfg.enable_symm_mem
     ):
-        os.environ["NCCL_NVLS_ENABLE"] = str(
-            int(cfg.enable_nccl_nvls or cfg.enable_symm_mem)
+        # The native NCCL allgather can multicast registered scratch.
+        # Auto mode (2) permits NVLS where supported and lets NCCL fall back;
+        # explicit flags retain their existing forced-enable behavior.
+        os.environ["NCCL_NVLS_ENABLE"] = (
+            "1"
+            if cfg.enable_nccl_nvls or cfg.enable_symm_mem
+            else "2"
+            if kv_shard_symmetric_scratch
+            else "0"
         )
     if "NCCL_GRAPH_MIXING_SUPPORT" not in os.environ or cfg.enable_symm_mem:
         # Note(wh): NCCL_GRAPH_MIXING_SUPPORT=0 can help improve performance for symmetric kernels.

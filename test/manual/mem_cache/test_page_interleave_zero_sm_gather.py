@@ -15,7 +15,8 @@
 
 Covers symmetric-window ownership and release, zero NCCL kernel launches,
 the cross-node fallback, and comparisons against ordinary NCCL on 2 and 4
-ranks, including CUDA graph replay. Needs NCCL >= 2.31.2 (CI pins an older
+ranks with NVLS disabled and enabled, including CUDA graph replay. Uses
+native NCCL allgather throughout. Needs NCCL >= 2.31.2 (CI pins an older
 NCCL) and at least 2 GPUs. Run with:
     CUDA_VISIBLE_DEVICES=0,1,2,3 python3 \
         test/manual/mem_cache/test_page_interleave_zero_sm_gather.py
@@ -255,12 +256,19 @@ class TestPageInterleaveZeroSmGatherMultiGpu(CustomTestCase):
         if NCCLLibrary().ncclGetRawVersion() < _NCCL_SYMMETRIC_SCRATCH_MIN_VERSION:
             self.skipTest("the symmetric gather scratch needs NCCL >= 2.31.2")
 
-    def _compare_allgather(self, world):
+    def _compare_allgather(self, world, nvls):
         if torch.cuda.device_count() < world:
             self.skipTest(f"copy-engine allgather comparison needs {world} GPUs")
         self._require_patched_nccl()
         with (
-            temp_set_env(NCCL_CUMEM_ENABLE="1", NCCL_CTA_POLICY=None),
+            temp_set_env(
+                NCCL_CUMEM_ENABLE="1",
+                NCCL_CTA_POLICY=None,
+                NCCL_NVLS_ENABLE=str(nvls),
+                # Exercise native payload multicast for these <= 1 MiB
+                # sends when NVLS is enabled, independent of tuning.
+                NCCL_CE_COLL_AG_MULTICAST_THRESHOLD=str(1 << 20),
+            ),
             tempfile.TemporaryDirectory(prefix="sglang-zero-sm-gather-") as tmp,
         ):
             mp.spawn(
@@ -271,10 +279,14 @@ class TestPageInterleaveZeroSmGatherMultiGpu(CustomTestCase):
             )
 
     def test_copy_engine_matches_ordinary_allgather_two_gpu(self):
-        self._compare_allgather(2)
+        for nvls in (0, 1):
+            with self.subTest(nvls=nvls):
+                self._compare_allgather(2, nvls)
 
     def test_copy_engine_matches_ordinary_allgather_four_gpu(self):
-        self._compare_allgather(4)
+        for nvls in (0, 1):
+            with self.subTest(nvls=nvls):
+                self._compare_allgather(4, nvls)
 
     def test_copy_engine_window_gather_and_release(self):
         """The zero-SM pool registers its scratch as a symmetric window, still
