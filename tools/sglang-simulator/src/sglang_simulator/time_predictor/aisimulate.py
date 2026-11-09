@@ -21,7 +21,9 @@ except ModuleNotFoundError as exc:
         raise
     raise ModuleNotFoundError(
         "Install the AISimulate SDK with: "
-        "pip install -e 'tools/sglang-simulator[aisimulate]'"
+        "pip install -e 'tools/sglang-simulator[aisimulate]'. "
+        "For Replay or ML without automatic KV-cache memory estimation, "
+        "set --max-total-tokens explicitly."
     ) from exc
 
 from sglang_simulator.simulation.types import (
