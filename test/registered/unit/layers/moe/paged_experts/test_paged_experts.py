@@ -1652,6 +1652,15 @@ class TestSizing(CustomTestCase):
                 "get_memory",
                 return_value=SimpleNamespace(disable_radix_cache=False),
             ),
+            patch.object(
+                kvc_mod,
+                "get_disagg",
+                return_value=SimpleNamespace(
+                    disaggregation_mode=None,
+                    enable_pd_role_switch=False,
+                    disaggregation_decode_extra_slots=None,
+                ),
+            ),
         ):
             rest = kvc_mod.KVCacheConfigurator._handle_max_mamba_cache(
                 fake, rest_bytes / sizing._GIB
@@ -1681,6 +1690,94 @@ class TestSizing(CustomTestCase):
                 budget, per_slot, mamba_full_memory_ratio=ratio
             )
             self.assertEqual(size, sizing._mamba_share(budget, ratio, per_slot))
+
+    def test_spec_budget_prices_the_max_draft_width(self):
+        """With spec decode on, the pool builds intermediate_ssm over
+        ``max_speculative_num_draft_tokens()`` (adaptive EAGLE publishes a width
+        above the initial ``--speculative-num-draft-tokens``), so the budget must
+        reserve at the same width. Pins the explicit --max-mamba-cache-size branch
+        against the hand-computed charge with the max width; a control shows the
+        initial width would undercharge."""
+        from sglang.srt.mem_cache import kv_cache_configurator as kvc_mod
+
+        per_slot = 1_000_000
+        d_init, d_max, ratio = 2, 6, 2
+        sched = self._schedule(max_mamba_cache_size=16, max_running_requests=100)
+        context = SimpleNamespace(
+            override=lambda source, **f: [setattr(sched, k, v) for k, v in f.items()]
+        )
+        fake = SimpleNamespace(
+            mambaish_config=SimpleNamespace(
+                mamba2_cache_params=SimpleNamespace(
+                    layers=[0, 1], mamba_cache_per_req=per_slot
+                )
+            ),
+            pp_size=1,
+            fused_entry_bytes=lambda name: None,
+            spec_algorithm=SimpleNamespace(is_none=lambda: False),
+            hybrid_gdn_config=None,
+            hybrid_kda_config=None,
+            extra_mamba_cache_bytes_per_req=0,
+            attn_dp_size=1,
+            allocate_intermediate_ssm=True,
+            _calculate_mamba_ratio=lambda: ratio,
+        )
+        exec_ = SimpleNamespace(
+            mamba=SimpleNamespace(enable_linear_replayssm_spec=False)
+        )
+        spec = SimpleNamespace(speculative_num_draft_tokens=d_init)
+        disagg = SimpleNamespace(
+            disaggregation_mode=None,
+            enable_pd_role_switch=False,
+            disaggregation_decode_extra_slots=None,
+        )
+        rest_gb = 10.0
+        with (
+            patch.object(kvc_mod, "get_schedule", return_value=sched),
+            patch.object(kvc_mod, "get_context", return_value=context),
+            patch.object(kvc_mod, "get_exec", return_value=exec_),
+            patch.object(kvc_mod, "get_spec", return_value=spec),
+            patch.object(
+                kvc_mod, "max_speculative_num_draft_tokens", return_value=d_max
+            ),
+            patch.object(
+                kvc_mod,
+                "get_memory",
+                return_value=SimpleNamespace(disable_radix_cache=False),
+            ),
+            patch.object(kvc_mod, "get_disagg", return_value=disagg),
+        ):
+            rest = kvc_mod.KVCacheConfigurator._handle_max_mamba_cache(fake, rest_gb)
+        capped_reqs = min(100, 16 // ratio)
+        intermediate = per_slot * (capped_reqs + 1) * d_max
+        main_state = (16 + 1) * per_slot
+        self.assertEqual(
+            round((rest_gb - rest) * sizing._GIB), intermediate + main_state
+        )
+        self.assertNotEqual(intermediate, per_slot * (capped_reqs + 1) * d_init)
+
+    def test_replayssm_ring_charge_counts_pd_decode_pre_alloc_rows(self):
+        """On PD decode the request-scoped ring spans
+        ``mamba_spec_state_size + 1 = (num_reqs + pre_alloc) + 1`` rows, so the
+        charge grows linearly with the pre-allocation slots."""
+        from sglang.srt.mem_cache.kv_cache_configurator import (
+            replayssm_ring_memory_charge,
+        )
+
+        per_req = 64_000
+        pre_alloc = 12
+        base_fixed, _ = replayssm_ring_memory_charge(
+            per_req, request_scoped=True, max_running_requests=96, attn_dp_size=1
+        )
+        fixed, _ = replayssm_ring_memory_charge(
+            per_req,
+            request_scoped=True,
+            max_running_requests=96,
+            attn_dp_size=1,
+            pre_alloc_rows=pre_alloc,
+        )
+        self.assertEqual(fixed - base_fixed, pre_alloc * per_req)
+        self.assertEqual(fixed, per_req * (96 + pre_alloc + 1))
 
     def test_mamba_state_holds_the_requests_the_kv_cache_aims_for(self):
         """2 state slots per request: one request by default, the --max-running-requests set
