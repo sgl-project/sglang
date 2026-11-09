@@ -93,7 +93,10 @@ elif _is_xpu:
         transfer_kv_per_layer_ph_lf,
     )
 if _is_npu:
-    from sgl_kernel_npu.operators.data_move import TransferDirection, transfer_kv_dim_exchange
+    from sgl_kernel_npu.operators.data_move import (
+        TransferDirection,
+        transfer_kv_dim_exchange,
+    )
 
 logger = logging.getLogger(__name__)
 
