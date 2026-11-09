@@ -399,13 +399,33 @@ def _redact_field(name: str, value: Any) -> Any:
 
 
 def _sequence_to_string_truncated(data: Union[List, Tuple], max_length: int) -> str:
-    data = _maybe_redact_watermark_secrets(data)
-    if all(isinstance(v, (int, float, bool, type(None))) for v in data):
-        return str(data)
-    items = ", ".join(_dataclass_to_string_truncated(v, max_length) for v in data)
-    if isinstance(data, tuple):
-        return f"({items},)" if len(data) == 1 else f"({items})"
-    return f"[{items}]"
+    # Nested sequences recurse here directly, one frame per level as `str()`
+    # did. Elements are redacted where they are rendered, as dict fields are.
+    if len(data) > max_length:
+        half_length = max_length // 2
+        parts = (data[:half_length], data[-half_length:])
+    else:
+        parts = (data,)
+    rendered = []
+    for part in parts:
+        if all(isinstance(v, (int, float, bool, type(None))) for v in part):
+            rendered.append(str(part))
+            continue
+        items = ", ".join(
+            [
+                (
+                    _sequence_to_string_truncated(v, max_length)
+                    if isinstance(v, (list, tuple))
+                    else _dataclass_to_string_truncated(v, max_length)
+                )
+                for v in part
+            ]
+        )
+        if isinstance(part, tuple):
+            rendered.append(f"({items},)" if len(part) == 1 else f"({items})")
+        else:
+            rendered.append(f"[{items}]")
+    return " ... ".join(rendered)
 
 
 # TODO unify this w/ `_transform_data_for_logging` if we find performance enough
@@ -421,15 +441,7 @@ def _dataclass_to_string_truncated(
         else:
             return f"{repr(data)}"
     elif isinstance(data, (list, tuple)):
-        if len(data) > max_length:
-            half_length = max_length // 2
-            return (
-                _sequence_to_string_truncated(data[:half_length], max_length)
-                + " ... "
-                + _sequence_to_string_truncated(data[-half_length:], max_length)
-            )
-        else:
-            return _sequence_to_string_truncated(data, max_length)
+        return _sequence_to_string_truncated(data, max_length)
     elif isinstance(data, dict):
         parts = []
         for k, v in data.items():

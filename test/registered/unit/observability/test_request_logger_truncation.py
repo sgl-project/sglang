@@ -46,6 +46,26 @@ class TestRequestLoggerListTruncation(CustomTestCase):
             _dataclass_to_string_truncated(("a", "b"), MAX_LENGTH), "('a', 'b')"
         )
 
+    def test_text_deeply_nested_list(self):
+        # `str()` printed this before list elements were rendered one by one.
+        depth = 500
+        nested = 1
+        for _ in range(depth):
+            nested = [nested]
+
+        self.assertEqual(
+            _dataclass_to_string_truncated({"x": nested}, MAX_LENGTH),
+            "{'x': " + "[" * depth + "1" + "]" * depth + "}",
+        )
+
+    def test_text_list_redacts_watermark_secrets(self):
+        self.assertEqual(
+            _dataclass_to_string_truncated(
+                [{"watermark_key": "s", "watermark": {"key": "s"}}], 2048
+            ),
+            "[{'watermark_key': '<redacted>', 'watermark': {'key': '<redacted>'}}]",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
