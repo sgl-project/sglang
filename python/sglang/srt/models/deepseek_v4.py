@@ -1637,7 +1637,10 @@ class MQALayer(MqaAttentionBase):
         if forward_batch.forward_mode.is_idle():
             return q.new_zeros(q.shape[0], self.n_local_groups, self.o_lora_rank)
         if not self.mega_wq_b_permuted:
-            q = pack_query(q, kernel_num_heads)
+            out = attn_backend.packed_query_buffer(
+                rows=q.shape[0], padded_heads=kernel_num_heads, dtype=q.dtype
+            )
+            q = pack_query(q, kernel_num_heads, out=out)
         if forward_batch.forward_mode.is_extend() and is_in_breakable_cuda_graph():
             rows = q.shape[0]
             if self._mega_mxfp8_output(rows):
