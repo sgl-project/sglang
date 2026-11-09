@@ -601,6 +601,10 @@ pub struct GenerateMetaInfo {
     /// tokens.
     #[prost(message, optional, tag = "21")]
     pub cached_tokens_details: ::core::option::Option<CachedTokensDetails>,
+    /// The data-parallel rank whose scheduler served the request, on every
+    /// frame; null when the server runs without data parallelism.
+    #[prost(uint32, optional, tag = "22")]
+    pub dp_rank: ::core::option::Option<u32>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct WeightVersionSpan {
@@ -982,6 +986,26 @@ pub struct DeploymentInfo {
     /// KV-cache event streams published by this deployment.
     #[prost(message, repeated, tag = "19")]
     pub kv_event_sources: ::prost::alloc::vec::Vec<KvEventSource>,
+    /// Every Rust listener this launch runs on this node, in port-offset order.
+    /// Each of them reports the same list, so one connection finds the rest.
+    #[prost(message, repeated, tag = "20")]
+    pub node_listeners: ::prost::alloc::vec::Vec<NodeRustListener>,
+}
+/// One Rust listener: the HTTP (and native gRPC) server embedded by a DP-group
+/// leader scheduler.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct NodeRustListener {
+    /// The listener binds --port + port_offset and --grpc-port + port_offset.
+    #[prost(uint32, tag = "1")]
+    pub port_offset: u32,
+    /// The DP rank it serves; equals that listener's DeploymentInfo.dp_rank.
+    #[prost(uint32, tag = "2")]
+    pub dp_rank: u32,
+    #[prost(uint32, tag = "3")]
+    pub http_port: u32,
+    /// Unset without native gRPC.
+    #[prost(uint32, optional, tag = "4")]
+    pub grpc_port: ::core::option::Option<u32>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct KvEventSource {
