@@ -13,8 +13,8 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
-from sglang.kernels.ops.diffusion.common.platform import is_cuda_sm_at_least
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -92,12 +92,6 @@ def _denorm_clamp_out(
     module.denorm_clamp(value, out, mean0, mean1, mean2, std0, std1, std2)
 
 
-def minimax_h3_vae_output_device_supported(device: torch.device | int) -> bool:
-    """Whether ``device`` can run these kernels at all (CUDA SM100 or newer);
-    the ``can_use_*`` predicates check the tensors on top of this."""
-    return is_cuda_sm_at_least(_MIN_SM, device)
-
-
 def minimax_h3_vae_temporal_blend_write(
     part: torch.Tensor,
     overlap: torch.Tensor | None,
@@ -158,9 +152,7 @@ def can_use_minimax_h3_vae_temporal_blend_write(
     out_storage = out.untyped_storage().data_ptr()
     if any(t.untyped_storage().data_ptr() == out_storage for t in tensors[:-1]):
         return False
-    return (
-        is_cuda_sm_at_least(_MIN_SM, part.device) and not torch.compiler.is_compiling()
-    )
+    return current_arch().is_sm_at_least(*_MIN_SM) and not torch.compiler.is_compiling()
 
 
 def minimax_h3_vae_denorm_clamp(
@@ -204,7 +196,7 @@ def can_use_minimax_h3_vae_denorm_clamp(
         and (out is None or (out is value and value.is_contiguous()))
         and len(mean) == 3
         and len(std) == 3
-        and is_cuda_sm_at_least(_MIN_SM, value.device)
+        and current_arch().is_sm_at_least(*_MIN_SM)
         and not torch.compiler.is_compiling()
     )
 
@@ -213,6 +205,5 @@ __all__ = [
     "can_use_minimax_h3_vae_denorm_clamp",
     "can_use_minimax_h3_vae_temporal_blend_write",
     "minimax_h3_vae_denorm_clamp",
-    "minimax_h3_vae_output_device_supported",
     "minimax_h3_vae_temporal_blend_write",
 ]

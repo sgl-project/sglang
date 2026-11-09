@@ -21,12 +21,13 @@ from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_test_utils import FakeReq, release_only_retirer
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
-class _Req:
+class _Req(FakeReq):
     def __init__(self, *, allocated: bool = True):
         self.rid = "aborted-prefill"
         self.cache_request_handle = CacheRequestHandle(self.rid, 0)
@@ -41,6 +42,9 @@ class _Req:
         self.to_finish = FINISH_ABORT() if allocated else None
         self.finished_reason = None if allocated else FINISH_ABORT()
         self.discard_output_reason = None
+        self.session = None
+        self.get_mm_token_counts = Mock()
+        self.release_mm_inputs_on_abort = Mock()
         self.return_logprob = False
         self.return_sampling_mask = False
         self.grammar = None
@@ -72,6 +76,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         )
         self.spec_algorithm = SpeculativeAlgorithm.NONE
         self.tree_cache = Mock()
+        self.request_retirer = release_only_retirer(self.tree_cache)
         self.disagg_prefill_transfer_queue = IndexedReqList(ListKind.PD_SENDING)
         self.disagg_prefill_pending_chunk_rids = {"aborted-prefill"}
         self.send_kv_chunk = Mock()
@@ -283,7 +288,10 @@ class TestPrefillCompleteResult(CustomTestCase):
             req.disagg_kv_sender.mark_prefill_complete.assert_called_once_with()
         scheduler.send_kv_chunk.assert_not_called()
 
-    @patch("sglang.srt.disaggregation.prefill.release_kv_cache", side_effect=_free_req)
+    @patch(
+        "sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache",
+        side_effect=_free_req,
+    )
     def test_aborted_final_result_never_publishes_ready(self, release):
         scheduler = _Scheduler()
         req = _Req()

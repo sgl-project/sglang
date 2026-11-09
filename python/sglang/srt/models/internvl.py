@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import logging
 from array import array
 from typing import Iterable, List, Optional, Tuple, Union
 
@@ -46,7 +47,8 @@ from sglang.srt.multimodal.mm_utils import run_dp_sharded_vision_model
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.runtime_context import get_mm
 from sglang.srt.utils import is_cuda
-from sglang.utils import logger
+
+logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
 

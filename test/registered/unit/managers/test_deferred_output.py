@@ -19,6 +19,7 @@ from sglang.srt.managers.scheduler_components.deferred_responses import (
 from sglang.srt.managers.scheduler_components.output_streamer import (
     SchedulerOutputStreamer,
 )
+from sglang.srt.managers.scheduler_components.pause_state import PauseState
 from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
 )
@@ -207,7 +208,7 @@ def test_held_responses_do_not_change_idle_state():
     # release must still see the same idle state on every rank.
     scheduler = _scheduler()
     scheduler.request_receiver = object.__new__(SchedulerRequestReceiver)
-    scheduler._engine_paused = False
+    scheduler.pause_state = PauseState()
     scheduler.enable_overlap = False
     scheduler.last_batch = None
     scheduler.running_batch = SimpleNamespace(is_empty=lambda: True)
@@ -216,6 +217,7 @@ def test_held_responses_do_not_change_idle_state():
     scheduler.grammar_manager = SimpleNamespace(grammar_queue=[])
     scheduler.enable_hierarchical_cache = False
     scheduler.enable_lmcache = False
+    scheduler.enable_unified_cache_external_linker = False
     scheduler.enable_hisparse = False
     scheduler.defer_response(_req("held"), Future())
 
