@@ -29,6 +29,10 @@
 #   --env sets a variable inside the test container, as the `-e` flags the ARC
 #   workflows pass to amd_ci_exec.sh do (e.g. a benchmark's workload knobs).
 #
+#   Files the suite writes to $CI_ARTIFACT_DIR in the container are copied to
+#   $GITHUB_WORKSPACE/ci_artifacts once the job has finished, for the workflow
+#   to upload or summarize.
+#
 # Required environment (set in the runner's .env, like the DI nightly runner):
 #   SLURM_PARTITION, SLURM_ACCOUNT, SLURM_QOS
 #   CI_NODE_SCRATCH  node-local directory for the checkout copy and the
@@ -140,6 +144,8 @@ for attempt in $(seq 1 "$SUBMIT_ATTEMPTS"); do
     LOG="$RUN_DIR/attempt${attempt}.log"
     : > "$LOG"
     rm -f "$CI_EXIT_FILE"
+    # Per attempt, so an abandoned attempt that starts late cannot supply them.
+    export CI_ARTIFACT_RUN_DIR="$RUN_DIR/attempt${attempt}.artifacts"
     SBATCH_ARGS=(-p "$SLURM_PARTITION" -A "$SLURM_ACCOUNT" -q "$SLURM_QOS"
                  -N1 -t "$TIME_LIMIT" -J "$JOB_NAME" --output "$LOG")
     # A whole node stays --exclusive: the job then clears every stale GPU
@@ -186,6 +192,11 @@ for attempt in $(seq 1 "$SUBMIT_ATTEMPTS"); do
     stream_log           # also picks up the last lines of the log
 
     if [[ -s "$CI_EXIT_FILE" ]]; then
+        # The job copies its artifacts out before it writes the exit code.
+        if [[ -d "$CI_ARTIFACT_RUN_DIR" ]]; then
+            mkdir -p "$GITHUB_WORKSPACE/ci_artifacts"
+            cp -r "$CI_ARTIFACT_RUN_DIR/." "$GITHUB_WORKSPACE/ci_artifacts/" || true
+        fi
         rc="$(tr -dc 0-9 < "$CI_EXIT_FILE")"
         echo "Job $JOB_ID finished with exit code ${rc:-unknown}"
         exit "${rc:-1}"
