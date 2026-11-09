@@ -126,9 +126,10 @@ KIMI_K3_W4A8_32P_MODEL_CONFIG = {
 class TestNPUKimiK3W4A832PMixIn128kOut1kDecodePrefix(
     TestNpuPerfMultiNodePdMixTestCaseBase
 ):
-    """Pure decode low latency: 128k input with a fully shared prefix
-    (repeat_rate=1, i.e. dp * prefix_num requests in total) / 1024 out,
-    C4, mean TPOT <= 30 ms, via the official aisbench prefix mode."""
+    """Pure decode low latency: 128k input with a 99% shared prefix
+    (repeat_rate=0.99, the ~1.3k-token tail keeps the decode content on
+    math tokens) / 1024 out, C4, mean TPOT <= 30 ms, via the official
+    aisbench prefix mode."""
 
     model_config = KIMI_K3_W4A8_32P_MODEL_CONFIG
     benchmark_tool = AISBENCHMARK
@@ -138,7 +139,7 @@ class TestNPUKimiK3W4A832PMixIn128kOut1kDecodePrefix(
     output_len = 1024
     num_prompts = 4
     max_concurrency = 4
-    repeat_rate = 1
+    repeat_rate = 0.99
     request_rate = 0
     dp = 4
     tpot = 30.0
