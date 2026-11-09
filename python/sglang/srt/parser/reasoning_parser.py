@@ -2012,6 +2012,15 @@ class CohereCommand4Detector(BaseReasoningFormatDetector):
         self._buffer += new_text
         buf = self._buffer
 
+        if not self._reasoning_done and not self.stripped_think_start:
+            # Drop an echoed <|START_THINKING|> as detect_and_parse does.
+            think_start_text = self.think_start_token + self.think_start_self_label
+            if think_start_text.startswith(buf) and buf != think_start_text:
+                return StreamingParseResult()
+            if buf.startswith(think_start_text):
+                buf = self._buffer = buf[len(think_start_text) :]
+            self.stripped_think_start = True
+
         if not self._reasoning_done:
             # Look for any marker that ends reasoning: an explicit
             # END_THINKING, or an implicit transition via the start of the
@@ -2050,7 +2059,12 @@ class CohereCommand4Detector(BaseReasoningFormatDetector):
                 self._buffer = buf[first_pos:]
             self._reasoning_done = True
             if reasoning_chunk:
-                return StreamingParseResult(reasoning_text=reasoning_chunk)
+                # The answer block may have arrived in this same chunk.
+                rest = self.parse_streaming_increment("")
+                return StreamingParseResult(
+                    normal_text=rest.normal_text,
+                    reasoning_text=reasoning_chunk + rest.reasoning_text,
+                )
             buf = self._buffer
 
         # Reasoning is closed. Decide between text-stripping and

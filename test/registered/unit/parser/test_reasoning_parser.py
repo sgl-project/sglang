@@ -1109,6 +1109,28 @@ class TestStreamingChunkSizeInvariance(CustomTestCase):
             (one_shot.reasoning_text, one_shot.normal_text), ("lead<think>r", "tail")
         )
 
+    def test_cohere_echoed_think_start_is_stripped(self):
+        """Some Cohere checkpoints echo <|START_THINKING|> although the chat
+        template already emitted it; streaming must drop it as detect_and_parse does."""
+        cases = [
+            (
+                "<|START_THINKING|>abc<|END_THINKING|><|START_TEXT|>answer<|END_TEXT|>",
+                ("abc", "answer"),
+            ),
+            ("abc<|END_THINKING|><|START_TEXT|>answer<|END_TEXT|>", ("abc", "answer")),
+            ("<|START_THINKING|>abc", ("abc", "")),
+        ]
+        for stream_reasoning in (True, False):
+            for text, expected in cases:
+                with self.subTest(stream_reasoning=stream_reasoning, text=text):
+                    self._assert_invariant(
+                        lambda: CohereCommand4Detector(
+                            stream_reasoning=stream_reasoning
+                        ),
+                        text,
+                        expected,
+                    )
+
 
 class TestGptOssDetector(CustomTestCase):
     """Test cases for GptOssDetector which delegates to HarmonyParser."""
