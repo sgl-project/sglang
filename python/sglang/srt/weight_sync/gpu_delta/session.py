@@ -1,7 +1,7 @@
 """Ordered control plane for an exclusively owned GPU delta receiver.
 
 The tokenizer sends ordered controls for a Miles-owned update.
-Concurrent administration, retries, and arbitrary API sequences are unsupported.
+Failed controls are not retried; Miles replaces the affected engine.
 Preparation owns immutable buffers; update pauses, fences readers, retracts, then mutates on the
 scheduler thread. Failed or ambiguous updates require restart, never XOR retry.
 """
@@ -94,12 +94,13 @@ class DeltaSession:
 
     def prepare(self, request: dict) -> dict:
         with self._lock:
-            if self._session is not None and self._session.state in {
-                "ABORTED",
-                "FAILED",
-                "POISONED",
-            }:
-                raise ValueError("failed or aborted delta session requires restart")
+            if self._session is not None and self._session.state != "RESUMED":
+                raise ValueError("unsettled delta session requires restart")
+            if (
+                self._provenance
+                and request["stream_id"] != self._provenance["stream_id"]
+            ):
+                raise ValueError("receiver incarnation belongs to another delta stream")
             if self._prepare_future is not None and self._prepare_future.done():
                 self._prepare_future.result()
             if (
@@ -123,6 +124,12 @@ class DeltaSession:
             session = self._session = _Session(request=request)
             self._prepare_future = self._executor.submit(self._prepare, session)
             return self.status()
+
+    def _transaction(self, session_id: str) -> _Session:
+        session = self._session
+        if session is None or session.request["session_id"] != session_id:
+            raise ValueError("delta operation belongs to a different session")
+        return session
 
     @profiling.annotate("gpu_delta.prepare")
     def _prepare(self, session: _Session) -> None:
@@ -150,12 +157,15 @@ class DeltaSession:
     @profiling.annotate("gpu_delta.scheduler.apply")
     def apply(
         self,
+        session_id: str,
         fence: Callable[[], None],
         retract: Callable[[], None],
         flush: Callable[[], bool] | None,
     ) -> dict:
         with self._lock:
-            session = self._session
+            session = self._transaction(session_id)
+            if session.state != "PREPARED":
+                raise ValueError("delta apply requires a prepared session")
             # The scheduler has stopped new work. From this point a peer may
             # already be mutating. The tokenizer does not abort after apply dispatch.
             session.state = "APPLYING"
@@ -198,14 +208,21 @@ class DeltaSession:
             return receipt
 
     @profiling.annotate("gpu_delta.scheduler.resume")
-    def resume(self, resume: Callable[[int], None], keep_pause: bool = False) -> dict:
+    def resume(
+        self, session_id: str, resume: Callable[[int], None], keep_pause: bool = False
+    ) -> dict:
         with self._lock:
-            session = self._session
-            if session is None or session.state != "APPLIED":
+            session = self._transaction(session_id)
+            if session.state != "APPLIED":
                 raise ValueError("delta resume requires an applied session")
-            self.version = session.request["target_version"]
             session.state = "RESUMING"
-            resume(self.version)
+            try:
+                resume(session.request["target_version"])
+            except Exception as exc:
+                session.state = "POISONED"
+                session.message = f"resume failed: {exc}; restart required"
+                raise
+            self.version = session.request["target_version"]
             # Version commit does not end a pause retained by the caller.
             if not keep_pause:
                 session.resumed_ns = time.monotonic_ns()
@@ -229,7 +246,9 @@ class DeltaSession:
                     "state": "ABORTED",
                     "session_id": session_id,
                 }
-            session = self._session
+            session = self._transaction(session_id)
+            if session.state not in {"PREPARING", "PREPARED", "FAILED", "ABORTED"}:
+                raise ValueError("cannot abort a delta after apply dispatch")
             session.state = "ABORTED"
             # Wake ranks waiting for their shared preparation owner, including
             # when that owner failed before reaching host-cache construction.
@@ -372,6 +391,8 @@ class GpuDeltaSchedulerControl:
             }
             backend = GpuDeltaBackend(runner, identity)
             self.session = DeltaSession(identity, backend)
+        elif self.session.identity["engine_id"] != engine_id:
+            raise ValueError("receiver incarnation belongs to another engine")
         elif self.session.backend is None:
             from sglang.srt.weight_sync.gpu_delta.receiver import GpuDeltaBackend
 
@@ -424,8 +445,12 @@ class GpuDeltaSchedulerControl:
                 if receipt.get("session_id") != request.session_id:
                     raise ValueError("delta status belongs to a different session")
             elif isinstance(request, delta_io.ApplyGpuDeltaReqInput):
+                session = self.session._transaction(request.session_id)
+                if session.state != "PREPARED":
+                    raise ValueError("delta apply requires a prepared session")
                 self.scheduler._engine_paused = True
                 receipt = self.session.apply(
+                    request.session_id,
                     self.scheduler.device_module.synchronize,
                     lambda: self.scheduler.pause_generation(
                         io.PauseGenerationReqInput(mode="retract")
@@ -448,7 +473,9 @@ class GpuDeltaSchedulerControl:
                             io.ContinueGenerationReqInput(torch_empty_cache=False)
                         )
 
-                receipt = self.session.resume(resume, keep_pause=request.keep_pause)
+                receipt = self.session.resume(
+                    request.session_id, resume, keep_pause=request.keep_pause
+                )
             elif isinstance(request, delta_io.AbortGpuDeltaReqInput):
                 receipt = self.session.abort(request.session_id)
             else:
@@ -461,6 +488,8 @@ class GpuDeltaSchedulerControl:
                 if self.session is not None
                 else {"identity": None, "state": "REJECTED"}
             )
+            if receipt["state"] == "POISONED":
+                self.scheduler._engine_paused = True
             success, message = False, str(exc)
         receipt["generation_paused"] = self.scheduler._engine_paused
         replies = [(success, message, receipt)]

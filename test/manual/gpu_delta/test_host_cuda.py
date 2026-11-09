@@ -187,6 +187,226 @@ def test_bitcomp_receiver_double_buffer_exact_updates_and_stale_target(
             backend.close()
 
 
+@pytest.mark.parametrize(
+    "failure", ["before_apply", "during_apply", "after_apply", "after_resume"]
+)
+def test_bitcomp_failed_transaction_requires_fresh_receiver_recovery(
+    failure, monkeypatch
+):
+    """Exercise transaction recovery around real CUDA writes, not fake payloads."""
+    import torch
+    from miles.utils.gpu_delta.encoder import GpuBatchEncoder
+    from miles.utils.gpu_delta.publication import PublicationWriter
+
+    from sglang.srt.weight_sync.gpu_delta import checkpoint
+    from sglang.srt.weight_sync.gpu_delta.bindings import _digest
+    from sglang.srt.weight_sync.gpu_delta.host import host_cache_id
+    from sglang.srt.weight_sync.gpu_delta.receiver import GpuDeltaBackend
+    from sglang.srt.weight_sync.gpu_delta.session import DeltaSession
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    frame_bytes = 1 << 20
+    monkeypatch.setenv("GPU_DELTA_CPU_WORKERS", "4")
+    monkeypatch.setenv("GPU_DELTA_LAYERS_PER_BATCH", "1")
+    encoder = GpuBatchEncoder(device, codec="bitcomp-zstd", frame_bytes=frame_bytes)
+    sessions = []
+    with tempfile.TemporaryDirectory(
+        prefix="gpu-delta-ft-", dir="/dev/shm"
+    ) as directory:
+        root = Path(directory)
+        monkeypatch.setenv("GPU_DELTA_HOST_CACHE_DIR", str(root / "cache"))
+
+        def receiver(incarnation):
+            model = torch.nn.Module()
+            model.config = SimpleNamespace(
+                architectures=["DeepseekV3ForCausalLM"], num_hidden_layers=2
+            )
+            model.num_fused_shared_experts = 0
+            model.model = torch.nn.Module()
+            model.model.layers = torch.nn.ModuleList(
+                [torch.nn.Module() for _ in range(2)]
+            )
+            for layer in model.model.layers:
+                layer.weight = torch.nn.Parameter(
+                    torch.zeros((1, frame_bytes), dtype=torch.uint8, device=device),
+                    requires_grad=False,
+                )
+            model.model.raw = torch.nn.Parameter(
+                torch.zeros(17, dtype=torch.uint8, device=device), requires_grad=False
+            )
+            inventory = {
+                name: {"dtype": "U8", "shape": list(value.shape)}
+                for name, value in model.named_parameters()
+            }
+            monkeypatch.setattr(
+                checkpoint, "read_canonical_checkpoint_inventory", lambda _: inventory
+            )
+            identity = dict(
+                engine_id=directory,
+                host_cache_id=host_cache_id(directory),
+                tp_rank=0,
+                dp_rank=0,
+                pid=os.getpid(),
+                rank_id=f"native-receiver-{incarnation}",
+            )
+            backend = GpuDeltaBackend(SimpleNamespace(model=model), identity)
+            session = DeltaSession(identity, backend)
+            sessions.append(session)
+            return model, session
+
+        def publish(model, session, version):
+            before = {
+                name: value.detach().cpu().flatten().pin_memory()
+                for name, value in model.named_parameters()
+            }
+            after = {
+                name: torch.full_like(value, 16 + version).pin_memory()
+                for name, value in before.items()
+            }
+            definitions = session.backend.describe()["tensors"]
+            matrices = [row for row in definitions if row["encoding"] == "xor_bytes"]
+            encoded = encoder.finish_device(
+                encoder.encode_device(
+                    [(before[row["name"]], after[row["name"]]) for row in matrices]
+                )
+            )
+            writer = PublicationWriter(
+                root / str(version),
+                "native-ft-stream",
+                version - 1,
+                version,
+                _digest(sorted(definitions, key=lambda row: row["name"])),
+                "bitcomp-zstd",
+                frame_bytes=frame_bytes,
+            )
+            try:
+                for row, result in zip(matrices, encoded, strict=True):
+                    writer.add_encoded_tensor(
+                        row["name"],
+                        *result[:4],
+                        dtype=row["dtype"],
+                        shape=row["shape"],
+                        views=row["views"],
+                    )
+                raw = next(row for row in definitions if row["name"] == "model.raw")
+                writer.add_raw_tensor(
+                    raw["name"],
+                    before[raw["name"]].numpy(),
+                    after[raw["name"]].numpy(),
+                    raw["dtype"],
+                    raw["shape"],
+                    raw["views"],
+                )
+                metadata = dict(
+                    writer.finish(),
+                    session_id=f"native-ft-update-{version}",
+                    validate_payload_hash=True,
+                    participants=[session.identity],
+                )
+            finally:
+                writer.close()
+            return metadata, before, after
+
+        def prepare(session, metadata):
+            session.prepare(metadata)
+            session._prepare_future.result(timeout=90)
+            assert session.status()["state"] == "PREPARED", session.status()
+
+        def assert_weights(model, expected):
+            for name, value in model.named_parameters():
+                assert torch.equal(value.detach().cpu().flatten(), expected[name]), name
+
+        try:
+            model, session = receiver("original")
+            metadata, before, after = publish(model, session, 1)
+            prepare(session, metadata)
+            assert_weights(model, before)
+            prepared = session._session.prepared
+            apply_batch = prepared._apply_batch
+            applications, resumed = [], []
+
+            def checked_batch(batch):
+                apply_batch(batch)
+                applications.append(batch)
+                if failure == "during_apply":
+                    raise RuntimeError("injected failure after the first CUDA batch")
+
+            monkeypatch.setattr(prepared, "_apply_batch", checked_batch)
+
+            def fence():
+                if failure == "before_apply":
+                    raise RuntimeError("injected reader fence failure")
+
+            if failure in {"before_apply", "during_apply"}:
+                with pytest.raises(RuntimeError, match="injected"):
+                    session.apply(metadata["session_id"], fence, lambda: None, None)
+                torch.cuda.synchronize(device)
+                assert session.status()["state"] == "POISONED"
+                assert session.version == 0
+                if failure == "before_apply":
+                    assert_weights(model, before)
+                else:
+                    assert len(applications) == 1
+                    assert torch.equal(
+                        model.model.layers[0].weight.cpu().flatten(),
+                        after["model.layers.0.weight"],
+                    )
+                    assert torch.equal(
+                        model.model.layers[1].weight.cpu().flatten(),
+                        before["model.layers.1.weight"],
+                    )
+                with pytest.raises(ValueError):
+                    session.apply(
+                        metadata["session_id"], lambda: None, lambda: None, None
+                    )
+                with pytest.raises(ValueError):
+                    session.resume(metadata["session_id"], resumed.append)
+                assert not resumed
+            else:
+                # The coordinator loses a reply after actual GPU writes. It must
+                # quarantine this incarnation rather than resubmit the XOR.
+                session.apply(metadata["session_id"], fence, lambda: None, None)
+                assert session.status()["state"] == "APPLIED"
+                assert_weights(model, after)
+                if failure == "after_resume":
+                    session.resume(metadata["session_id"], resumed.append)
+                with pytest.raises(ValueError):
+                    session.apply(metadata["session_id"], fence, lambda: None, None)
+                assert len(applications) == 2
+                assert_weights(model, after)
+            assert resumed == ([1] if failure == "after_resume" else [])
+            session._executor.shutdown(wait=True)
+            if session._session.prepared is not None:
+                session._session.prepared.close()
+            session.backend.close()
+            # Replacement starts from actual fresh model storage and a new rank
+            # identity; only this incarnation may consume the base-zero payload.
+            model, session = receiver("replacement")
+            metadata = dict(metadata, participants=[session.identity])
+            prepare(session, metadata)
+            resumed = []
+            session.apply(metadata["session_id"], lambda: None, lambda: None, None)
+            session.resume(metadata["session_id"], resumed.append)
+            assert_weights(model, after)
+            metadata, before, after = publish(model, session, 2)
+            prepare(session, metadata)
+            assert_weights(model, before)
+            session.apply(metadata["session_id"], lambda: None, lambda: None, None)
+            session.resume(metadata["session_id"], resumed.append)
+            assert session.version == 2 and resumed == [1, 2]
+            assert_weights(model, after)
+        finally:
+            for session in sessions:
+                session._executor.shutdown(wait=True)
+                if (
+                    session._session is not None
+                    and session._session.prepared is not None
+                ):
+                    session._session.prepared.close()
+                if session.backend is not None:
+                    session.backend.close()
+
+
 def _pinned_mapping_consumer(rank, path, expected, barrier, output):
     import torch
 

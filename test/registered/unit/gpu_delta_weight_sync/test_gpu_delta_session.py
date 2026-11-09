@@ -130,7 +130,7 @@ def prepare_ready(session, backend, req=None):
 
 def applied(session, backend, req=None):
     prepare_ready(session, backend, req)
-    return session.apply(lambda: None, lambda: None, lambda: True)
+    return session.apply("publication-1", lambda: None, lambda: None, lambda: True)
 
 
 @pytest.mark.parametrize(
@@ -273,7 +273,7 @@ def test_engine_release_runs_off_scheduler_and_before_next_prepare(make_session)
 
     backend.payload.release_and_close = cleanup
     try:
-        assert session.resume(lambda _: None)["state"] == "RESUMED"
+        assert session.resume("publication-1", lambda _: None)["state"] == "RESUMED"
         assert entered.wait(2)
         assert other.status()["state"] == "PREPARING"
         assert not other_backend.payload.released.is_set()
@@ -306,6 +306,36 @@ def test_bad_publication_never_mutates(make_session):
     assert session.status()["state"] == "ABORTED"
 
 
+def test_wrong_or_repeated_transaction_never_replays_xor(make_session):
+    session, backend = make_session()
+    req = request([session.identity])
+    prepare_ready(session, backend, req)
+    with pytest.raises(ValueError, match="requires restart"):
+        session.prepare(req)
+    with pytest.raises(ValueError, match="different session"):
+        session.apply("stale", lambda: None, lambda: None, None)
+    assert backend.payload.applications == 0
+    session.apply("publication-1", lambda: None, lambda: None, None)
+    with pytest.raises(ValueError, match="prepared session"):
+        session.apply("publication-1", lambda: None, lambda: None, None)
+    with pytest.raises(ValueError, match="cannot abort"):
+        session.abort("publication-1")
+    session.resume("publication-1", lambda _: None)
+    with pytest.raises(ValueError, match="applied session"):
+        session.resume("publication-1", lambda _: None)
+    assert backend.payload.applications == 1
+    with pytest.raises(ValueError, match="another delta stream"):
+        session.prepare(
+            req
+            | {
+                "session_id": "other",
+                "stream_id": "other-job",
+                "base_version": 1,
+                "target_version": 2,
+            }
+        )
+
+
 @pytest.mark.parametrize("failure", ["fence", "retract", "flush", "apply"])
 def test_update_failure_is_terminal_and_never_reclaims_after_failed_fence(
     make_session, failure
@@ -323,6 +353,7 @@ def test_update_failure_is_terminal_and_never_reclaims_after_failed_fence(
 
     with pytest.raises(RuntimeError):
         session.apply(
+            "publication-1",
             lambda: phase("fence"),
             lambda: phase("retract"),
             lambda: phase("flush"),
@@ -340,6 +371,12 @@ def test_update_failure_is_terminal_and_never_reclaims_after_failed_fence(
         and status["scheduler_timing"]["blocked_s"] is None
     )
     assert not backend.payload.released.is_set()
+    count = backend.payload.applications
+    with pytest.raises(ValueError, match="prepared session"):
+        session.apply("publication-1", lambda: None, lambda: None, None)
+    with pytest.raises(ValueError, match="applied session"):
+        session.resume("publication-1", lambda _: None)
+    assert backend.payload.applications == count
 
 
 def test_resume_failure_retains_ownership(make_session):
@@ -347,9 +384,10 @@ def test_resume_failure_retains_ownership(make_session):
     applied(session, backend)
     with pytest.raises(RuntimeError, match="resume failed"):
         session.resume(
+            "publication-1",
             lambda _: (_ for _ in ()).throw(RuntimeError("resume failed")),
         )
-    assert session.status()["state"] == "RESUMING"
+    assert session.status()["state"] == "POISONED"
     assert not backend.payload.released.is_set()
     assert session.status()["scheduler_timing"]["blocked_s"] is None
 
@@ -370,14 +408,14 @@ def test_scheduler_blocked_timing_excludes_background_prepare(
         assert session.status()["scheduler_timing"]["pause_started_ns"] == now[0]
         now[0] = 20_000_000_000
 
-    receipt = session.apply(fence, lambda: None, lambda: True)
+    receipt = session.apply("publication-1", fence, lambda: None, lambda: True)
     assert receipt["state"] == "APPLIED"
     assert receipt["identity"] == session.identity
     assert receipt["result"] == {"applied": True, "target_version": 1}
     full_result = session.status()["result"]
     assert full_result["timings"] == {"host_prepare_s": 0.25}
     now[0] = 60_000_000_000
-    resumed = session.resume(lambda _: None)
+    resumed = session.resume("publication-1", lambda _: None)
     assert resumed["result"] == full_result
     assert {
         k: v
@@ -607,7 +645,7 @@ def test_clear_drains_release_before_private_close_and_shared_unlink(
 
     backend.payload.release_and_close_original = backend.payload.release_and_close
     backend.payload.release_and_close = cleanup
-    session.resume(lambda version: None)
+    session.resume("publication-1", lambda version: None)
     assert entered.wait(2)
     from concurrent.futures import ThreadPoolExecutor
 
@@ -667,7 +705,7 @@ def test_failed_async_release_prevents_resource_reuse(make_session, next_operati
         raise OSError("state release failed")
 
     backend.payload.release_and_close = fail_release
-    session.resume(lambda _: None)
+    session.resume("publication-1", lambda _: None)
     if next_operation == "clear":
         with pytest.raises(OSError, match="state release failed"):
             session.clear()
@@ -943,7 +981,9 @@ def test_describe_binds_published_scheduler_ranks(
         control.session.version = 7
         assert control.session.clear()["version"] == 7
         control.session.release_cache(owner=True)
-        fresh = control._describe("unused-new-engine-name")
+        with pytest.raises(ValueError, match="another engine"):
+            control._describe("unused-new-engine-name")
+        fresh = control._describe("engine-0")
         assert fresh["identity"] == receipt["identity"] and fresh["version"] == 7
         assert len(backends) == 2 and cache_engines == ["engine-0"]
         control.session._executor.shutdown(wait=True)
@@ -985,11 +1025,11 @@ def test_nvtx_pause_ends_only_after_successful_unpause(
 
     if outcome == "apply_failed":
         with pytest.raises(RuntimeError, match="control failure"):
-            session.apply(fail, lambda: None, None)
+            session.apply("publication-1", fail, lambda: None, None)
         assert session.status()["state"] == "POISONED"
         assert events[-1] == ("mark", "gpu_delta.pause.poisoned")
     else:
-        session.apply(lambda: None, lambda: None, None)
+        session.apply("publication-1", lambda: None, lambda: None, None)
         assert events == [("start", "gpu_delta.pause")]
 
         def resume(version):
@@ -1000,9 +1040,9 @@ def test_nvtx_pause_ends_only_after_successful_unpause(
 
         if outcome == "resume_failed":
             with pytest.raises(RuntimeError, match="control failure"):
-                session.resume(resume)
+                session.resume("publication-1", resume)
         else:
-            session.resume(resume, keep_pause=outcome == "retained")
+            session.resume("publication-1", resume, keep_pause=outcome == "retained")
     if outcome == "resumed":
         assert events[-2:] == [("resume", 1), ("end", 17)]
         assert session._session.nvtx_pause_id is None
