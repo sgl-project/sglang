@@ -16,7 +16,6 @@
 import faulthandler
 import logging
 import multiprocessing as mp
-import signal
 import threading
 import time
 import traceback
@@ -25,7 +24,6 @@ from dataclasses import dataclass
 from enum import Enum, auto
 from multiprocessing.connection import Connection, wait
 
-import psutil
 import setproctitle
 import zmq
 
@@ -85,7 +83,10 @@ from sglang.srt.utils.network import (
     get_zmq_socket,
     get_zmq_socket_on_host,
 )
-from sglang.srt.utils.process import kill_itself_when_parent_died
+from sglang.srt.utils.process import (
+    kill_itself_when_parent_died,
+    notify_parent_of_failure,
+)
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.watchdog import Watchdog
 
@@ -938,7 +939,6 @@ def run_data_parallel_controller_process(
     setproctitle.setproctitle("sglang::data_parallel_controller")
     faulthandler.enable()
     kill_itself_when_parent_died()
-    parent_process = psutil.Process().parent()
 
     load_plugins()
     # This process reads the config namespaces before spawning schedulers.
@@ -993,4 +993,4 @@ def run_data_parallel_controller_process(
         logger.error(
             f"DataParallelController hit an exception: {traceback.format_exc()}"
         )
-        parent_process.send_signal(signal.SIGQUIT)
+        notify_parent_of_failure()

@@ -529,8 +529,6 @@ class TestCrashDumpTriggers(CustomTestCase):
         scheduler = MagicMock()
         scheduler.run_event_loop.side_effect = RuntimeError("boom")
         scheduler.dump_requests_before_crash.side_effect = lambda: calls.append("dump")
-        parent = MagicMock()
-        parent.send_signal.side_effect = lambda sig: calls.append(sig)
         with (
             patch.multiple(
                 scheduler_module,
@@ -543,9 +541,12 @@ class TestCrashDumpTriggers(CustomTestCase):
                 ),
                 Scheduler=MagicMock(return_value=scheduler),
             ),
-            patch.object(scheduler_module.psutil, "Process") as process,
+            patch.object(
+                scheduler_module,
+                "notify_parent_of_failure",
+                side_effect=lambda: calls.append(signal.SIGQUIT),
+            ),
         ):
-            process.return_value.parent.return_value = parent
             scheduler_module.run_scheduler_process(
                 server_args=MagicMock(),
                 port_args=MagicMock(),
@@ -568,18 +569,20 @@ class TestCrashDumpTriggers(CustomTestCase):
             calls.append("dump")
             raise _Panic("dump failed")
 
-        parent = MagicMock()
-        parent.send_signal.side_effect = lambda sig: (
-            calls.append(sig),
-            signalled.set(),
-        )
+        def _notify_parent_of_failure():
+            calls.append(signal.SIGQUIT)
+            signalled.set()
+            return True
+
         active = [True]
         with (
             patch("sglang.srt.utils.watchdog.pyspy_dump_schedulers"),
-            patch("sglang.srt.utils.watchdog.psutil.Process") as process,
+            patch(
+                "sglang.srt.utils.watchdog.notify_parent_of_failure",
+                side_effect=_notify_parent_of_failure,
+            ),
             patch("sglang.srt.utils.watchdog.time.sleep", lambda s: real_sleep(0.001)),
         ):
-            process.return_value.parent.return_value = parent
             WatchdogRaw(
                 debug_name="test",
                 get_counter=lambda: 0,
