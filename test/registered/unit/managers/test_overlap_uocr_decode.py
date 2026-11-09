@@ -1,6 +1,6 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -8,7 +8,14 @@ from sglang.srt.layers.attention.unlimited_ocr_v2_backend import (
     UnlimitedOCRV2AttnBackend,
 )
 from sglang.srt.managers.overlap_utils import FutureMap, resolve_forward_inputs
+from sglang.srt.managers.req_types import FINISH_ABORT
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.pause_state import PauseState
+from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
+    ListKind,
+)
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
 )
@@ -17,6 +24,7 @@ from sglang.srt.models.unlimited_ocr_v2_support.greedy_graph import UocrGreedyGr
 from sglang.srt.models.unlimited_ocr_v2_support.scheduler_runtime import (
     UocrSchedulerRuntime,
 )
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.scheduler_test_utils import FakeReq
@@ -138,13 +146,14 @@ class TestDeferredThenEagerDecode(CustomTestCase):
         scheduler.future_map.output_tokens_buf.zero_()
         scheduler.uocr_runtime = _hooks(lambda: graph_io)
         scheduler.beam_coordinator = Mock()
-        scheduler.chunked_req = None
+        scheduler.chunked_reqs = IndexedReqList(ListKind.CHUNKED)
 
         indices = torch.tensor([2, 5])
         published = torch.tensor([41, 43], dtype=torch.int32)
         graph_io.relay[indices] = published.to(torch.int64)
         result = SimpleNamespace(
             next_draft_input=None,
+            accept_lens=None,
             has_sampled_token_ids=True,
             next_token_ids=published,
             can_run_cuda_graph=True,
@@ -316,7 +325,7 @@ class TestFlushWithDocumentState(CustomTestCase):
         seen = []
         scheduler = object.__new__(Scheduler)
         scheduler.uocr_runtime = hooks
-        scheduler._engine_paused = False
+        scheduler.pause_state = PauseState()
         scheduler.is_fully_idle = lambda **kw: True
         scheduler.tree_cache = Mock()
         scheduler.tree_cache.reset.side_effect = lambda: seen.append(
@@ -327,6 +336,7 @@ class TestFlushWithDocumentState(CustomTestCase):
             "token_to_kv_pool_allocator",
             "grammar_manager",
             "metrics_reporter",
+            "invariant_checker",
         ):
             setattr(scheduler, name, Mock())
         scheduler.draft_worker = None
@@ -335,6 +345,28 @@ class TestFlushWithDocumentState(CustomTestCase):
         self.assertTrue(scheduler.flush_cache(empty_cache=False))
         self.assertEqual(seen, [{}])
         self.assertEqual(aborted, [held])
+
+    def test_aborted_held_window_is_answered_through_the_abort_output(self):
+        """A held window's abort must reach the Rust server's ring, which the
+        zmq tokenizer socket does not feed, and leave the window finished."""
+        held = Req("w1", "", [1], SamplingParams())
+        scheduler = object.__new__(Scheduler)
+        scheduler.rust_server = Mock()
+        for name in (
+            "tree_cache",
+            "beam_coordinator",
+            "uocr_runtime",
+            "output_streamer",
+        ):
+            setattr(scheduler, name, Mock())
+        scheduler.hisparse_coordinator = None
+        scheduler.init_request_retirer()
+
+        with patch("sglang.srt.managers.utils.get_serving"):
+            scheduler._abort_uocr_doc_windows([held])
+
+        scheduler.rust_server.push_abort.assert_called_once()
+        self.assertIsInstance(held.finished_reason, FINISH_ABORT)
 
 
 if __name__ == "__main__":
