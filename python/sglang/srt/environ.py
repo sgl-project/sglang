@@ -897,6 +897,9 @@ class Envs:
     # Buffer mode: store only the SWA window ending at each node (what a
     # prefetch ending there restores) instead of every SWA page.
     SGLANG_ENABLE_HICACHE_SWA_TAIL_ONLY_BACKUP = EnvBool(False)
+    # Cache mode, PP=1: re-back up a hit host prefix to storage once its last
+    # storage write is this many seconds old (present keys are skipped); 0 disables.
+    SGLANG_HICACHE_STORAGE_BACKUP_REFRESH_SECONDS = EnvInt(0)
     SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR = EnvStr(None)
     # Enable O_DIRECT when opening NIXL POSIX backend files (bypasses OS page cache).
     # Disable with SGLANG_HICACHE_NIXL_USE_DIRECT_IO=0 or via the

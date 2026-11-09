@@ -83,6 +83,7 @@ from sglang.srt.mem_cache.kv.plan import (
 )
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.storage_backup_refresh import StorageBackupRefresh
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     BackupKV,
@@ -377,6 +378,7 @@ class UnifiedRadixCache(BasePrefixCache):
         # Write-side dedupe: beliefs about what storage already holds, so
         # re-inserts of hot prefixes skip the redundant backup.
         self.storage_existence_cache = StorageExistenceCache()
+        self.storage_backup_refresh: Optional[StorageBackupRefresh] = None
         # Cumulative prefetch-outcome counters, exported through the
         # log_storage_metrics flow.
         self._prefetch_outcome_stats: dict[str, float] = {
@@ -637,6 +639,17 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
         self.load_back_threshold = 10
         self.prefetch_stop_policy = get_memory().hicache_storage_prefetch_policy
+        refresh_s = envs.SGLANG_HICACHE_STORAGE_BACKUP_REFRESH_SECONDS.get()
+        if refresh_s > 0:
+            if self.host_memory_mode == "cache" and self.pp_size == 1:
+                self.storage_backup_refresh = StorageBackupRefresh(
+                    refresh_s, self._all_reduce
+                )
+            else:
+                logger.warning(
+                    "SGLANG_HICACHE_STORAGE_BACKUP_REFRESH_SECONDS needs cache "
+                    "host memory mode and PP=1; ignored."
+                )
 
         # Runtime attach/detach of the L3 backend (startup, admin API, atexit).
         atexit.register(self.shutdown)
@@ -2493,6 +2506,8 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         if spec is None:
             return
+        if self.storage_backup_refresh is not None and spec.hash_value:
+            self.storage_backup_refresh.stamp(spec.hash_value[-1])
 
         kv_xfer = PoolTransfer(
             name=PoolName.KV,
@@ -2516,6 +2531,12 @@ class UnifiedRadixCache(BasePrefixCache):
             node_id,
             self.inc_host_lock_ref(node_id).to_dec_params(),
         )
+
+    def _refresh_storage_backups(self, node_id: NodeId) -> None:
+        for info in self.tree_core.collect_path_info([node_id])[0]:
+            key = self.tree_core.get_last_hash_value(info.node_id)
+            if key is not None and not self.storage_backup_refresh.is_fresh(key):
+                self.write_backup_storage(info.node_id)
 
     def is_backuped(self, node_id: NodeId) -> bool:
         return self.tree_core.is_backuped(node_id)
@@ -2590,6 +2611,8 @@ class UnifiedRadixCache(BasePrefixCache):
     ) -> Optional[bool]:
         if not self.enable_storage or self.cache_controller is None:
             return
+        if self.storage_backup_refresh is not None:
+            self._refresh_storage_backups(last_host_node_id)
 
         req_id = request.rid
         self.storage_prefetch_retries.cancel(req_id)
@@ -4262,6 +4285,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 extra_release_counts=extra_release_counts,
                 log_metrics=True,
             )
+            if self.storage_backup_refresh is not None:
+                self.storage_backup_refresh.step()
         if self.buffer_pipeline is not None:
             self.buffer_pipeline.flush_pending_writes()
         if self.enable_storage_metrics and self.storage_metrics_collector is not None:

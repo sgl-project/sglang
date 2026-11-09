@@ -4248,7 +4248,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         (device_value, comp_xfers)
     }
 
-    /// Gather a node's device->storage backup spec; None if the node is not backuped.
+    /// Gather a storage backup spec only after the node's D2H copy is ready.
     pub fn build_storage_backup_spec(
         &self,
         node_id: NodeId,
@@ -4256,7 +4256,9 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     ) -> Result<Option<StorageBackupSpec>, NodeAccessError> {
         let node_id = self.arena.resolve(node_id)?;
         let node = self.arena.node(node_id);
-        if !node.backuped() {
+        // Host indices are published before D2H completes; the pending mark
+        // follows splits and component backups covering this node.
+        if !node.backuped() || node.write_through_pending_id.is_some() {
             return Ok(None);
         }
         let prefix_keys = pass_prefix_keys.then(|| self.arena.prefix_hash_values(node.parent));
