@@ -1895,8 +1895,7 @@ class OpenAIServingChat(OpenAIServingBase):
         template_tool_parser = None
 
         effective_tools = self._effective_tools(request)
-        # A grammar reaching its terminal state ends generation regardless of
-        # `ignore_eos`, so only install it when the request allows tool calls.
+        # Only install the full-assistant grammar when the request allows tool calls.
         glm_constraint = (
             FunctionCallParser.ToolCallParserEnum.get(self.tool_call_parser)
             is Glm47MoeDetector

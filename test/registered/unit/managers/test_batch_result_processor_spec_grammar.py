@@ -98,8 +98,8 @@ def _make_processor() -> SchedulerBatchResultProcessor:
     )
 
 
-def _make_req(terminate_after: int) -> Req:
-    sp = SamplingParams(max_new_tokens=256, temperature=0)
+def _make_req(terminate_after: int, ignore_eos: bool = False) -> Req:
+    sp = SamplingParams(max_new_tokens=256, temperature=0, ignore_eos=ignore_eos)
     sp.normalize(None)
     req = Req(
         rid="r0",
@@ -214,6 +214,28 @@ class TestSpecV2GrammarTruncation(CustomTestCase):
 
         self.assertEqual(predict_tokens, [[201, 202, 203]])
         self.assertEqual(req.kv.kv_committed_len, 3)
+
+    def test_resolve_keeps_all_after_grammar_completion_under_ignore_eos(self):
+        req = _make_req(terminate_after=2, ignore_eos=True)
+        proc = _make_processor()
+        result = _make_result(4, [3], [301, 302, 303, 0])
+
+        predict_tokens = proc._resolve_spec_v2_tokens(result, _FakeBatch([req]), [True])
+
+        # The request keeps decoding under ignore_eos, so the whole verified run
+        # is committed; the tokens past the grammar's terminal token are not fed
+        # to the terminated grammar.
+        self.assertEqual(predict_tokens, [[301, 302, 303]])
+        self.assertEqual(req.kv.kv_committed_len, 3)
+        self.assertEqual(req.grammar.accepted, [301, 302])
+
+        # Later steps also commit their full run.
+        result = _make_result(4, [2], [304, 305, 0, 0])
+        predict_tokens = proc._resolve_spec_v2_tokens(result, _FakeBatch([req]), [True])
+
+        self.assertEqual(predict_tokens, [[304, 305]])
+        self.assertEqual(req.kv.kv_committed_len, 5)
+        self.assertEqual(req.grammar.accepted, [301, 302])
 
 
 class TestReasoningTokenAccounting(CustomTestCase):
