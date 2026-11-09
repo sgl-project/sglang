@@ -40,7 +40,7 @@ BASE_ARGS = (
     "--disable-cuda-graph",
     "--mem-fraction-static",
     "0.55",
-    "--max-model-len",
+    "--context-length",
     "512",
     "--max-running-requests",
     "4",

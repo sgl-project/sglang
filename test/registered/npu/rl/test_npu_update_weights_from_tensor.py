@@ -46,7 +46,7 @@ BASE_ARGS = (
     "--disable-radix-cache",
     "--mem-fraction-static",
     "0.5",
-    "--max-model-len",
+    "--context-length",
     "512",
     "--max-running-requests",
     "4",
