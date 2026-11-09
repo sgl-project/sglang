@@ -18,7 +18,6 @@ from sglang.srt.speculative.dspark_components.dspark_verify import (
     DsparkVerifyEpilogue,
 )
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
-from sglang.test.scheduler_test_utils import FakeReq
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -70,10 +69,6 @@ def _commit(injector, device="cpu"):
         torch.randn(MAX_BS * STRIDE, KV_WIDTH, device=device) for _ in range(3)
     ]
     return commit
-
-
-def _staged_req(**fields):
-    return FakeReq(kv=SimpleNamespace(holds_kv=True), retraction_count=0, **fields)
 
 
 def _stage(commit, bs):
@@ -130,32 +125,6 @@ class TestDeferredCommit(CustomTestCase):
                 self.assertEqual(len(injector.stores), int(flushes))
                 commit.after_draft_forward(graph_ran=graph_bs is not None)
                 self.assertFalse(commit.pending)
-
-    def test_rows_of_requests_that_released_their_kv_are_not_written(self):
-        """Also after a retraction and re-admission."""
-        for case in ("released", "readmitted"):
-            for graph_bs in (None, MAX_BS):
-                with self.subTest(case=case, graph_bs=graph_bs):
-                    live, other = _staged_req(), _staged_req()
-                    injector = _Injector()
-                    commit = _commit(injector)
-                    commit._forked_bs = {MAX_BS}
-                    _stage(commit, 3)
-                    commit.note_static_verify(3)
-                    commit.note_staged_reqs([live, live, other])
-                    if case == "released":
-                        other.kv.holds_kv = False
-                    else:
-                        other.retraction_count += 1
-                    commit.before_draft_forward(graph_bs=graph_bs)
-                    if graph_bs is None:
-                        (store,) = injector.stores
-                        self.assertTrue(bool((store["swa_loc"][:2] != -1).all()))
-                        other_row = store["swa_loc"][2 * STRIDE : 3 * STRIDE]
-                        self.assertTrue(bool((other_row == -1).all()))
-                    else:
-                        # What the draft graph reads when it writes the staging.
-                        self.assertEqual(commit.commit_lens.tolist()[:3], [2, 0, 0])
 
 
 class TestEpilogueStagesOnlyAfterItsProjection(CustomTestCase):

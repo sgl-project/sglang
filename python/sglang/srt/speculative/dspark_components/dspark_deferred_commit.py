@@ -16,7 +16,6 @@ other forward runs the stores eagerly first.
 Contract:
 
 - Every write disarms the staging (commit lengths 0), so a staging is written once.
-- A row whose request no longer holds its staged KV is not written.
 - A forward that may write or read draft KV (prefill, draft extend, an eager draft)
   runs after the pending write; a draft graph whose rows miss staged ones is preceded
   by an eager write of every staged row.
@@ -74,8 +73,6 @@ class DeferredContextCommit:
         self._store_done: Optional[torch.cuda.Event] = None
         # Host: requests a static verify staged since the last write (0: nothing pending).
         self.staged_bs = 0
-        # Host: staged requests by row, with their `retraction_count` at staging.
-        self._staged_reqs: tuple = ()
         # Host: a forked projection the static epilogue has not joined yet.
         self._proj_unjoined = False
         # Host, capture only: forked stores the draft's first KV store has not joined yet.
@@ -172,20 +169,6 @@ class DeferredContextCommit:
         """Host, after a static verify graph ran ``live_bs`` requests."""
         self.staged_bs = live_bs
 
-    def note_staged_reqs(self, reqs) -> None:
-        """Host, after a verify of ``reqs``."""
-        self._staged_reqs = tuple(
-            (req, req.retraction_count) for req in reqs[: self.staged_bs]
-        )
-
-    def _skip_released_rows(self) -> None:
-        """Host, before a write: zero the rows whose request no longer holds
-        its staged KV."""
-        for row, (req, retraction_count) in enumerate(self._staged_reqs):
-            if not _holds_staged_kv(req, retraction_count):
-                self.commit_lens[row : row + 1].zero_()
-        self._staged_reqs = ()
-
     # Draft side: the gated stores.
 
     def write(self, bs: Optional[int] = None) -> None:
@@ -219,7 +202,6 @@ class DeferredContextCommit:
         """Host: write a pending staging now (an eager forward follows)."""
         # A graph captured here would replay the write on every later replay.
         if self.pending and not _capturing():
-            self._skip_released_rows()
             self.write()
             self.staged_bs = 0
             self.num_written_eagerly += 1
@@ -237,7 +219,6 @@ class DeferredContextCommit:
                 self.num_written_eagerly,
                 self._eager_reasons,
             )
-        self._skip_released_rows()
         if graph_bs is None:
             self.flush("eager draft")
         elif graph_bs not in self._forked_bs:
@@ -288,15 +269,8 @@ class DeferredContextCommit:
         """Drop whatever warmups or captures staged on placeholder inputs."""
         self.commit_lens.zero_()
         self.staged_bs = 0
-        self._staged_reqs = ()
         self._fork_unjoined = False
         self._proj_unjoined = False
-
-
-def _holds_staged_kv(req, retraction_count: int) -> bool:
-    """KV taken again after a retraction is new; ``retraction_count`` tells it
-    apart."""
-    return req.kv.holds_kv and req.retraction_count == retraction_count
 
 
 def _capturing() -> bool:
