@@ -1268,6 +1268,30 @@ class LayerNorm(BaseFusedOp):
         else:
             return self.forward_native(x)
 
+    def forward_mlu(self, x: torch.Tensor) -> torch.Tensor:
+        weight = self.weight if self.elementwise_affine else None
+        bias = self.bias if self.use_bias else None
+        if (
+            x.numel() > 0
+            and x.dtype in (torch.float16, torch.bfloat16, torch.float32)
+            and x.dtype == self.dtype
+            and x.stride(-1) == 1
+            and (weight is None or weight.dtype == x.dtype)
+            and (bias is None or bias.dtype == x.dtype)
+        ):
+            output = torch_mlu_ops.fused_layer_norm(
+                x=x.reshape(-1, self.hidden_size),
+                residual=None,
+                gamma=weight,
+                beta=bias,
+                bias=None,
+                eps=self.variance_epsilon,
+                store_output_before_norm=False,
+            )
+            return output.reshape(x.shape)
+        else:
+            return self.forward_native(x)
+
 
 class GemmaRMSNorm(BaseFusedOp):
     supports_non_attn_tp_allreduce = True
@@ -1460,6 +1484,56 @@ class GemmaRMSNorm(BaseFusedOp):
         # above); opt into the CUDA-path implementation explicitly.
         return self._forward_impl(x, residual, post_residual_addition)
 
+    def forward_mlu(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+        post_residual_addition: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if (
+            envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
+            or is_batch_invariant_mode_enabled()
+        ):
+            raise NotImplementedError(
+                "Deterministic inference is not supported for MLU RMSNorm yet."
+            )
+        if (
+            x.numel() > 0
+            and x.dtype in (torch.float16, torch.bfloat16, torch.float32)
+            and x.stride(-1) == 1
+            and self.weight.dtype == x.dtype
+            and (
+                residual is None
+                or (residual.dtype == x.dtype and residual.stride(-1) == 1)
+            )
+            and (
+                residual is None
+                or post_residual_addition is None
+                or post_residual_addition.dtype == x.dtype
+            )
+        ):
+            if residual is not None and post_residual_addition is not None:
+                residual = residual + post_residual_addition
+            shape = x.shape
+            result = torch_mlu_ops.fused_rms_norm(
+                x=x.reshape(-1, shape[-1]),
+                residual=(
+                    residual.reshape(-1, shape[-1]) if residual is not None else None
+                ),
+                gamma=self.weight,
+                beta=None,
+                bias=None,
+                eps=self.variance_epsilon,
+                store_output_before_norm=residual is not None,
+                gamma_add_coef=1.0,
+            )
+            if residual is None:
+                return result.reshape(shape)
+            output, residual_out = result
+            return output.reshape(shape), residual_out.reshape(shape)
+        else:
+            return self.forward_native(x, residual, post_residual_addition)
+
     def forward_with_allreduce_fusion(
         self,
         x: torch.Tensor,
@@ -1578,6 +1652,46 @@ class Gemma3RMSNorm(BaseFusedOp):
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.eps}"
 
+    def forward_mlu(
+        self, x: torch.Tensor, residual: Optional[torch.Tensor] = None
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if (
+            envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
+            or is_batch_invariant_mode_enabled()
+        ):
+            raise NotImplementedError(
+                "Deterministic inference is not supported for MLU RMSNorm yet."
+            )
+        if (
+            x.numel() > 0
+            and x.dtype in (torch.float16, torch.bfloat16, torch.float32)
+            and x.stride(-1) == 1
+            and self.weight.dtype == x.dtype
+            and (
+                residual is None
+                or (residual.dtype == x.dtype and residual.stride(-1) == 1)
+            )
+        ):
+            shape = x.shape
+            result = torch_mlu_ops.fused_rms_norm(
+                x=x.reshape(-1, shape[-1]),
+                residual=(
+                    residual.reshape(-1, shape[-1]) if residual is not None else None
+                ),
+                gamma=self.weight,
+                beta=None,
+                bias=None,
+                eps=self.eps,
+                store_output_before_norm=residual is not None,
+                gamma_add_coef=1.0,
+            )
+            if residual is None:
+                return result.reshape(shape)
+            output, residual_out = result
+            return output.reshape(shape), residual_out.reshape(shape)
+        else:
+            return self.forward_native(x, residual)
+
 
 class Gemma4RMSNorm(BaseFusedOp):
     def __init__(
@@ -1664,6 +1778,35 @@ class Gemma4RMSNorm(BaseFusedOp):
         # delegate to the pure-PyTorch implementation.
         return self.forward_native(x)
 
+    def forward_mlu(self, x: torch.Tensor) -> torch.Tensor:
+        if (
+            envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
+            or is_batch_invariant_mode_enabled()
+        ):
+            raise NotImplementedError(
+                "Deterministic inference is not supported for MLU RMSNorm yet."
+            )
+        gamma = self.weight if self.with_scale else None
+        if (
+            x.numel() > 0
+            and x.dtype in (torch.float16, torch.bfloat16, torch.float32)
+            and x.stride(-1) == 1
+            and (gamma is None or gamma.dtype == x.dtype)
+        ):
+            output = torch_mlu_ops.fused_rms_norm(
+                x=x.reshape(-1, x.shape[-1]),
+                residual=None,
+                gamma=gamma,
+                beta=None,
+                bias=None,
+                eps=self.eps,
+                store_output_before_norm=False,
+                gamma_add_coef=self.scale_shift if self.with_scale else 0.0,
+            )
+            return output.reshape(x.shape)
+        else:
+            return self.forward_native(x)
+
 
 class RMSNormWithoutScale(BaseFusedOp):
     def __init__(self, hidden_size: int, eps=1e-6):
@@ -1683,6 +1826,26 @@ class RMSNormWithoutScale(BaseFusedOp):
 
     def forward_cuda(self, x):
         return self.forward_native(x)
+
+    def forward_mlu(self, x: torch.Tensor) -> torch.Tensor:
+        if (
+            x.numel() > 0
+            and x.stride(-1) == 1
+            and (x.dtype in (torch.float16, torch.bfloat16, torch.float32))
+        ):
+            output = torch_mlu_ops.fused_rms_norm(
+                x=x.reshape(-1, x.shape[-1]),
+                residual=None,
+                gamma=None,
+                beta=None,
+                bias=None,
+                eps=self.eps,
+                store_output_before_norm=False,
+                gamma_add_coef=0.0,
+            )
+            return output.reshape(x.shape)
+        else:
+            return self.forward_native(x)
 
     def extra_repr(self):
         return f"{self.hidden_size}, eps={self.eps}"

@@ -1,10 +1,21 @@
 """Tests for RMSNorm forward_mlu results."""
 
 import unittest
+from unittest.mock import patch
 
 import torch
 import torch_mlu  # noqa: F401 -- registers the MLU device backend
+import torch_mlu_ops
 
+from sglang.kernels.fused_op import get_fused_op_backend, set_fused_op_backend
+from sglang.srt.environ import envs
+from sglang.srt.layers.layernorm import (
+    Gemma3RMSNorm,
+    Gemma4RMSNorm,
+    GemmaRMSNorm,
+    LayerNorm,
+    RMSNormWithoutScale,
+)
 from sglang.test.ci.ci_register import register_mlu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -140,6 +151,140 @@ class TestRMSNormMLU(CustomTestCase):
                             torch.testing.assert_close(
                                 actual, expected, rtol=1e-2, atol=1e-2
                             )
+
+    def _check_gemma(self, norm, x, *args):
+        expected = norm.forward_native(x, *args)
+        with patch.object(
+            torch_mlu_ops, "fused_rms_norm", wraps=torch_mlu_ops.fused_rms_norm
+        ) as op:
+            actual = norm(x, *args)
+        if x.dtype == torch.bfloat16 and not args:
+            op.assert_called()
+        tol = 1e-5 if x.dtype == torch.float32 else 0.03
+        torch.testing.assert_close(actual, expected, rtol=tol, atol=tol)
+
+    def test_gemma_numerics(self):
+        for cls in (GemmaRMSNorm, Gemma3RMSNorm, Gemma4RMSNorm):
+            for dtype in (torch.float16, torch.bfloat16, torch.float32):
+                with self.subTest(cls=cls.__name__, dtype=dtype):
+                    kwargs = {"scale_shift": 1.0} if cls is Gemma4RMSNorm else {}
+                    norm = cls(128, **kwargs).to(device="mlu", dtype=dtype)
+                    with torch.no_grad():
+                        norm.weight.uniform_(-0.5, 0.5)
+                    x = torch.randn(2, 3, 128, device="mlu", dtype=dtype)
+                    self._check_gemma(norm, x)
+                    # Low-precision addition order is a separate contract;
+                    # it does not need repeating for every dtype.
+                    if dtype == torch.bfloat16 and cls is not Gemma4RMSNorm:
+                        residual, post = torch.randn_like(x), torch.randn_like(x)
+                        self._check_gemma(norm, x, residual)
+                        if cls is GemmaRMSNorm:
+                            self._check_gemma(norm, x, residual, post)
+                            self._check_gemma(norm, x, None, post)
+
+    def test_gemma_native_fallback(self):
+        for cls in (GemmaRMSNorm, Gemma3RMSNorm, Gemma4RMSNorm):
+            for x in (
+                torch.randn(2, 128, device="mlu", dtype=torch.bfloat16),
+                torch.randn(128, 2, device="mlu", dtype=torch.float32).T,
+                torch.empty(0, 128, device="mlu", dtype=torch.float32),
+            ):
+                norm = cls(128).to(device="mlu", dtype=torch.float32)
+                with patch.object(
+                    torch_mlu_ops, "fused_rms_norm", wraps=torch_mlu_ops.fused_rms_norm
+                ) as op:
+                    actual = norm(x)
+                op.assert_not_called()
+                torch.testing.assert_close(
+                    actual, norm.forward_native(x), rtol=0, atol=0
+                )
+            if cls is not Gemma4RMSNorm:
+                norm = cls(128).to(device="mlu", dtype=torch.bfloat16)
+                x = torch.randn(2, 128, device="mlu", dtype=torch.bfloat16)
+                additions = [(torch.randn_like(x, dtype=torch.float32),)]
+                if cls is GemmaRMSNorm:
+                    additions.append(
+                        (torch.randn_like(x), torch.randn_like(x, dtype=torch.float32))
+                    )
+                for args in additions:
+                    with patch.object(
+                        torch_mlu_ops,
+                        "fused_rms_norm",
+                        wraps=torch_mlu_ops.fused_rms_norm,
+                    ) as op:
+                        actual = norm(x, *args)
+                    op.assert_not_called()
+                    torch.testing.assert_close(
+                        actual, norm.forward_native(x, *args), rtol=0, atol=0
+                    )
+            with envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.override(True):
+                with self.assertRaisesRegex(NotImplementedError, "Deterministic"):
+                    norm.forward_mlu(x)
+
+    def test_gemma4_scale_options(self):
+        for with_scale, shift in ((True, 0.25), (False, 3.0)):
+            with self.subTest(with_scale=with_scale, shift=shift):
+                norm = Gemma4RMSNorm(128, scale_shift=shift, with_scale=with_scale).to(
+                    device="mlu", dtype=torch.bfloat16
+                )
+                x = torch.randn(2, 128, device="mlu", dtype=torch.bfloat16)
+                self._check_gemma(norm, x)
+
+
+class TestSimpleNormMLU(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        torch.manual_seed(42)
+        backend = get_fused_op_backend()
+        self.addCleanup(set_fused_op_backend, backend)
+        set_fused_op_backend(None)
+
+    def _check(self, norm, x, native=False):
+        original = x.clone()
+        expected = norm.forward_native(x)
+        op = "fused_layer_norm" if isinstance(norm, LayerNorm) else "fused_rms_norm"
+        with patch.object(
+            torch_mlu_ops, op, wraps=getattr(torch_mlu_ops, op)
+        ) as kernel:
+            actual = norm(x)
+        if native:
+            kernel.assert_not_called()
+        elif x.dtype == torch.bfloat16:
+            kernel.assert_called()
+        tolerance = 0 if native else (1e-5 if x.dtype == torch.float32 else 0.03)
+        torch.testing.assert_close(actual, expected, rtol=tolerance, atol=tolerance)
+        torch.testing.assert_close(x, original, rtol=0, atol=0)
+
+    def test_numerics(self):
+        for dtype in (torch.float16, torch.bfloat16, torch.float32):
+            x = torch.randn(2, 3, 128, device="mlu", dtype=dtype)
+            for affine, bias in ((True, True), (True, False), (False, True)):
+                with self.subTest(dtype=dtype, affine=affine, bias=bias):
+                    norm = LayerNorm(
+                        128, elementwise_affine=affine, bias=bias, dtype=dtype
+                    ).to("mlu")
+                    with torch.no_grad():
+                        norm.weight.uniform_(0.5, 1.5)
+                        norm.bias.uniform_(-0.5, 0.5)
+                    self._check(norm, x)
+            self._check(RMSNormWithoutScale(128).to("mlu"), x)
+
+    def test_native_fallback(self):
+        for norm in (LayerNorm(128).to("mlu"), RMSNormWithoutScale(128).to("mlu")):
+            for x in (
+                torch.empty(0, 128, device="mlu"),
+                torch.randn(128, 3, device="mlu").T,
+                torch.randn(3, 128, device="mlu", dtype=torch.float64),
+            ):
+                with self.subTest(
+                    norm=type(norm).__name__, shape=x.shape, dtype=x.dtype
+                ):
+                    self._check(norm, x, native=True)
+        self._check(
+            LayerNorm(128).to("mlu"),
+            torch.randn(3, 128, device="mlu", dtype=torch.bfloat16),
+            native=True,
+        )
 
 
 if __name__ == "__main__":

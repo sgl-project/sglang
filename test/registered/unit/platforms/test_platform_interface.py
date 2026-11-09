@@ -637,6 +637,55 @@ class TestMluSRTPlatform(CustomTestCase):
         self.assertTrue(base.is_pin_memory_available(device="mlu"))
         self.assertFalse(base.is_pin_memory_available(device="cpu"))
 
+    def test_incompatible_attention_backend_rejected_for_each_phase(self):
+        """A valid base backend must not hide an incompatible phase override."""
+        from sglang.srt.arg_groups.overrides import record_foreign_defaults
+        from sglang.srt.server_args import ServerArgs
+
+        for field in (
+            "attention_backend",
+            "prefill_attention_backend",
+            "decode_attention_backend",
+        ):
+            with self.subTest(field=field):
+                fields = dict.fromkeys(
+                    (
+                        "attention_backend",
+                        "prefill_attention_backend",
+                        "decode_attention_backend",
+                    ),
+                    "mlu",
+                )
+                fields[field] = "triton"
+                args = ServerArgs(model_path="unused", device="mlu", **fields)
+                with self.assertRaisesRegex(ValueError, f"{field}='mlu'"):
+                    record_foreign_defaults(
+                        args,
+                        "platform:mlu",
+                        MluSRTPlatform().apply_server_args_defaults,
+                    )
+
+    def test_unsupported_runtime_settings_fail_during_resolution(self):
+        from sglang.srt.arg_groups.overrides import record_foreign_defaults
+        from sglang.srt.server_args import ServerArgs
+
+        for fields, message in (
+            ({"sampling_backend": "flashinfer"}, "pytorch sampling backend"),
+            ({"quantization": "awq"}, "unquantized weights"),
+            ({"speculative_algorithm": "EAGLE"}, "speculative decoding"),
+        ):
+            with self.subTest(fields=fields):
+                args = ServerArgs(model_path="unused", device="mlu", **fields)
+                with self.assertRaisesRegex(
+                    ValueError if "sampling_backend" in fields else NotImplementedError,
+                    message,
+                ):
+                    record_foreign_defaults(
+                        args,
+                        "platform:mlu",
+                        MluSRTPlatform().apply_server_args_defaults,
+                    )
+
 
 class TestPinMemoryAvailability(CustomTestCase):
     """Tests for common pin-memory helper dispatch through platforms."""

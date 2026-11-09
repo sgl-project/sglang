@@ -77,3 +77,40 @@ class MluSRTPlatform(MluDeviceMixin, SRTPlatform):
 
     def get_dispatch_key_name(self) -> str:
         return "mlu"
+
+    def apply_server_args_defaults(self, server_args) -> None:
+        if server_args.quantization is not None:
+            raise NotImplementedError(
+                "MLU GQA inference currently requires unquantized weights."
+            )
+        if server_args.speculative_algorithm is not None:
+            raise NotImplementedError("MLU speculative decoding is not supported yet.")
+        if server_args.sampling_backend not in (None, "pytorch"):
+            raise ValueError("MLU inference requires the pytorch sampling backend.")
+        for field in (
+            "attention_backend",
+            "prefill_attention_backend",
+            "decode_attention_backend",
+        ):
+            backend = getattr(server_args, field)
+            if backend not in (None, "mlu"):
+                raise ValueError(f"MLU GQA inference requires {field}='mlu'.")
+            if backend is None:
+                setattr(server_args, field, "mlu")
+        if server_args.sampling_backend is None:
+            server_args.sampling_backend = "pytorch"
+        if server_args.page_size is None:
+            server_args.page_size = 16
+        server_args.disable_custom_all_reduce = True
+
+    def get_default_attention_backend(self) -> str:
+        return "mlu"
+
+    def get_kv_pool_cls(self, *, kind):
+        if kind == "mha":
+            from sglang.srt.hardware_backend.mlu.memory_pool_mlu import (
+                MLUMHATokenToKVPool,
+            )
+
+            return MLUMHATokenToKVPool
+        return None
