@@ -7,11 +7,15 @@ from typing import Any
 import torch
 
 from sglang.multimodal_gen import envs
+from sglang.multimodal_gen.configs.attention_roles import AttentionRole
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.layers.attention.selector import (
     component_attn_backend_context_manager,
     get_component_forced_attn_backend,
     get_global_forced_attn_backend,
+)
+from sglang.multimodal_gen.runtime.layers.quantization.configs.convrot_int8_config import (
+    ConvRotInt8Config,
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     OnlineQuantizationComponentLoader,
@@ -168,10 +172,12 @@ class TransformerLoader(OnlineQuantizationComponentLoader):
         attn_backend,
         component_attn_name: str | None,
         require_backend_selection: bool,
+        backend_by_role: dict[AttentionRole, AttentionBackendEnum] | None = None,
     ):
         return component_attn_backend_context_manager(
             attn_backend,
             component_name=component_attn_name,
+            backend_by_role=backend_by_role,
             allow_global_backend_fallback=False,
             require_backend_selection=require_backend_selection,
         )
@@ -293,6 +299,14 @@ class TransformerLoader(OnlineQuantizationComponentLoader):
         dit_config.update_model_arch(config)
 
         cls_name = config.pop("_class_name")
+        override_cls_name = server_args.pipeline_config.transformer_class_override
+        if override_cls_name is not None and override_cls_name != cls_name:
+            logger.info(
+                "Overriding transformer class from %s to %s",
+                cls_name,
+                override_cls_name,
+            )
+            cls_name = override_cls_name
         model_cls, _ = ModelRegistry.resolve_model_cls(cls_name)
         is_minimax_h3 = model_cls.__name__ == "MiniMaxH3DiTModel"
         if is_minimax_h3:
@@ -332,6 +346,12 @@ class TransformerLoader(OnlineQuantizationComponentLoader):
                             "separate AdaLN cache or online AdaLN rebuild"
                         )
 
+        resolve_checkpoint_quantization = getattr(
+            model_cls, "resolve_checkpoint_quantization", None
+        )
+        if resolve_checkpoint_quantization is not None:
+            checkpoint_quant_config = resolve_checkpoint_quantization(safetensors_list)
+
         quant_spec = resolve_transformer_quant_load_spec(
             hf_config=config,
             server_args=component_server_args,
@@ -365,6 +385,11 @@ class TransformerLoader(OnlineQuantizationComponentLoader):
             or cpu_offload_flag
         )
         use_fsdp = server_args.should_use_fsdp_for_component(component_name)
+        if use_fsdp and not getattr(quant_spec.quant_config, "supports_fsdp", True):
+            raise ValueError(
+                f"{quant_spec.quant_config.get_name()} does not support FSDP; "
+                "use TP and/or Ulysses SP"
+            )
         if quant_spec.uses_comfy_layer_markers and use_fsdp:
             raise ValueError(
                 "Comfy quantized checkpoints do not support FSDP "
@@ -378,6 +403,15 @@ class TransformerLoader(OnlineQuantizationComponentLoader):
             raise ValueError(
                 "AutoRound checkpoints do not support diffusion FSDP inference; "
                 "use TP and/or sequence parallelism instead"
+            )
+        if (
+            use_fsdp
+            and isinstance(quant_spec.quant_config, ConvRotInt8Config)
+            and not quant_spec.quant_config.is_checkpoint_int8_serialized
+        ):
+            # Only the comfy_kitchen backend has run under FSDP.
+            quant_spec.quant_config.require_comfy_kitchen(
+                "has not been validated with diffusion FSDP inference"
             )
 
         if quant_spec.gguf_file is not None:
@@ -476,7 +510,10 @@ class TransformerLoader(OnlineQuantizationComponentLoader):
                 runtime_quant_config=quant_spec.runtime_quant_config,
                 quantized_cpu_load_supported=(
                     quant_spec.gguf_file is not None
-                    or quant_spec.is_serialized_kitchen_int8
+                    or getattr(
+                        quant_spec.quant_config, "supports_quantized_cpu_load", False
+                    )
+                    or quant_spec.is_convrot_int8
                     or quant_spec.is_serialized_kitchen_w4a8
                 ),
             )

@@ -15,8 +15,8 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_int8_config import (
-    KitchenInt8Config,
+from sglang.multimodal_gen.runtime.layers.quantization.configs.convrot_int8_config import (
+    ConvRotInt8Config,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.kitchen_w4a4 import (
     KitchenW4A4LinearMethod,
@@ -55,7 +55,7 @@ class KitchenW4A4Config(QuantizationConfig):
             if marker.get("format") == "int8_tensorwise"
         }
         self._int8_config = (
-            KitchenInt8Config(layer_markers=int8_markers) if int8_markers else None
+            ConvRotInt8Config(layer_markers=int8_markers) if int8_markers else None
         )
 
         for prefix, marker in layer_markers.items():
@@ -155,6 +155,3 @@ class KitchenW4A4Config(QuantizationConfig):
             )
         convrot_group_size, _ = self._parse_marker(prefix, marker)
         return self._supports_input_size(input_size_per_partition, convrot_group_size)
-
-    def get_scaled_act_names(self) -> list[str]:
-        return []

@@ -315,7 +315,10 @@ bool is_valid_config(
         GROUP_BLOCKS,                                                                                                  \
         IS_ZP_FLOAT,                                                                                                   \
         kIsEP,                                                                                                         \
-        kHasBias>;                                                                                                     \
+        kHasBias,                                                                                                      \
+        kExpertIdsAreSorted,                                                                                           \
+        kZeroInactiveOutput,                                                                                           \
+        kHasInactivePrefixCount>;                                                                                      \
   }
 
 // COMMON: cases for (group_blocks in [-1, 2, 4, 8] and is_zp_float == false)
@@ -404,6 +407,7 @@ bool is_valid_config(
 #define MXFP4_GET_IF(W_TYPE)            \
   MXFP4_GET_IF_M1(W_TYPE, 8, 8, 256)    \
   MXFP4_GET_IF_M1(W_TYPE, 8, 4, 128)    \
+  MXFP4_GET_IF_M1(W_TYPE, 4, 8, 128)    \
   MXFP4_GET_IF_M234(W_TYPE, 16, 4, 256) \
   MXFP4_GET_IF_M234(W_TYPE, 8, 4, 128)
 
@@ -439,7 +443,13 @@ bool is_valid_config(
   ACT_GET_IF_M234(W_TYPE, 16, 4, 256) \
   ACT_GET_IF_M234(W_TYPE, 8, 4, 128)
 
-template <typename scalar_t, bool kIsEP, bool kHasBias>
+template <
+    typename scalar_t,
+    bool kIsEP,
+    bool kHasBias,
+    bool kExpertIdsAreSorted,
+    bool kZeroInactiveOutput,
+    bool kHasInactivePrefixCount>
 MarlinFuncPtr get_marlin_kernel(
     const host::ScalarType q_type,
     int thread_m_blocks,
@@ -475,7 +485,13 @@ MarlinFuncPtr get_marlin_kernel(
   return kernel;
 }
 
-template <typename scalar_t, bool kIsEP, bool kHasBias>
+template <
+    typename scalar_t,
+    bool kIsEP,
+    bool kHasBias,
+    bool kExpertIdsAreSorted,
+    bool kZeroInactiveOutput,
+    bool kHasInactivePrefixCount>
 exec_config_t determine_exec_config(
     const host::ScalarType& q_type,
     int prob_m,
@@ -492,6 +508,16 @@ exec_config_t determine_exec_config(
     bool is_zp_float,
     int max_shared_mem,
     int sms) {
+#if SGL_CUDA_ARCH == 900
+  if constexpr (std::is_same_v<scalar_t, __nv_bfloat16> && !kIsEP && !kHasBias) {
+    // H200 TP8 DeepSeek-V4.1 gate/up: six sparse expert rows need a narrower
+    // N tile and fewer persistent blocks than the occupancy-only heuristic.
+    if (q_type == host::kFE2M1f && group_size == 32 && prob_m == 1 && prob_n == 640 && prob_k == 5120 && top_k == 6 &&
+        thread_m_blocks == 1 && m_block_size_8 && !has_act_order && !has_zp) {
+      return exec_config_t{2, thread_config_t{128, 64, 128}};
+    }
+  }
+#endif
   exec_config_t exec_cfg = exec_config_t{1, thread_config_t{-1, -1, -1}};
   thread_config_t* thread_configs = thread_m_blocks > 1 ? large_batch_thread_configs : small_batch_thread_configs;
   int thread_configs_size = thread_m_blocks > 1 ? sizeof(large_batch_thread_configs) / sizeof(thread_config_t)
@@ -538,17 +564,18 @@ exec_config_t determine_exec_config(
       group_blocks = group_size == -1 ? -1 : (group_size / 16);
     }
 
-    auto kernel = get_marlin_kernel<scalar_t, kIsEP, kHasBias>(
-        q_type,
-        thread_m_blocks,
-        th_config.thread_n / 16,
-        th_config.thread_k / 16,
-        m_block_size_8,
-        has_act_order,
-        has_zp,
-        group_blocks,
-        th_config.num_threads,
-        is_zp_float);
+    auto kernel =
+        get_marlin_kernel<scalar_t, kIsEP, kHasBias, kExpertIdsAreSorted, kZeroInactiveOutput, kHasInactivePrefixCount>(
+            q_type,
+            thread_m_blocks,
+            th_config.thread_n / 16,
+            th_config.thread_k / 16,
+            m_block_size_8,
+            has_act_order,
+            has_zp,
+            group_blocks,
+            th_config.num_threads,
+            is_zp_float);
 
     if (kernel == MarlinDefault) continue;
 
@@ -576,7 +603,13 @@ exec_config_t determine_exec_config(
   return exec_cfg;
 }
 
-template <typename scalar_t, bool kIsEP, bool kHasBias>
+template <
+    typename scalar_t,
+    bool kIsEP,
+    bool kHasBias,
+    bool kExpertIdsAreSorted,
+    bool kZeroInactiveOutput,
+    bool kHasInactivePrefixCount>
 void marlin_mm(
     const void* A,
     const void* B,
@@ -716,7 +749,13 @@ void marlin_mm(
     host::RuntimeCheck(prob_k % thread_k == 0, "prob_k = ", prob_k, " is not divisible by thread_k = ", thread_k);
   } else {
     // Auto config
-    exec_cfg = determine_exec_config<scalar_t, kIsEP, kHasBias>(
+    exec_cfg = determine_exec_config<
+        scalar_t,
+        kIsEP,
+        kHasBias,
+        kExpertIdsAreSorted,
+        kZeroInactiveOutput,
+        kHasInactivePrefixCount>(
         q_type,
         prob_m,
         prob_n,
@@ -788,17 +827,18 @@ void marlin_mm(
       ", max_shared_mem = ",
       max_shared_mem);
 
-  auto kernel = get_marlin_kernel<scalar_t, kIsEP, kHasBias>(
-      q_type,
-      thread_m_blocks,
-      thread_n_blocks,
-      thread_k_blocks,
-      m_block_size_8,
-      has_act_order,
-      has_zp,
-      group_blocks,
-      num_threads,
-      is_zp_float);
+  auto kernel =
+      get_marlin_kernel<scalar_t, kIsEP, kHasBias, kExpertIdsAreSorted, kZeroInactiveOutput, kHasInactivePrefixCount>(
+          q_type,
+          thread_m_blocks,
+          thread_n_blocks,
+          thread_k_blocks,
+          m_block_size_8,
+          has_act_order,
+          has_zp,
+          group_blocks,
+          num_threads,
+          is_zp_float);
 
   if (kernel == MarlinDefault) {
     host::Panic(
@@ -839,7 +879,13 @@ void marlin_mm(
 
 }  // namespace device::marlin_moe
 
-template <typename scalar_t, bool kIsEP, bool kHasBias>
+template <
+    typename scalar_t,
+    bool kIsEP,
+    bool kHasBias,
+    bool kExpertIdsAreSorted,
+    bool kZeroInactiveOutput,
+    bool kHasInactivePrefixCount>
 void moe_wna16_marlin_gemm(
     tvm::ffi::TensorView a,
     tvm::ffi::TensorView c,
@@ -876,6 +922,8 @@ void moe_wna16_marlin_gemm(
     bool is_zp_float) {
   using namespace host;
 
+  static_assert(!kIsEP || !kExpertIdsAreSorted, "Sorted block IDs are specialized only without EP");
+  static_assert(!kHasInactivePrefixCount || (kExpertIdsAreSorted && !kIsEP));
   RuntimeCheck(is_ep == kIsEP, "is_ep does not match the compiled Marlin MoE specialization");
   RuntimeCheck(has_bias == kHasBias, "has_bias does not match the compiled Marlin MoE specialization");
 
@@ -919,6 +967,9 @@ void moe_wna16_marlin_gemm(
   auto device = SymbolicDevice{};
   device.set_options<kDLCUDA>();
   TensorMatcher({-1, -1}).with_dtype<scalar_t>().with_device(device).verify(a);
+  if constexpr (kHasInactivePrefixCount) {
+    TensorMatcher({2}).with_dtype<int32_t>().with_device(device).ensure_alignment(8).verify(num_tokens_post_padded);
+  }
 
   device.verify(b_q_weight.device());
   RuntimeCheck(b_q_weight.is_contiguous(), "b_q_weight is not contiguous");
@@ -1076,45 +1127,46 @@ void moe_wna16_marlin_gemm(
   // Early return for zero-size M (moved after all validation)
   if (size_m == 0) return;
 
-  device::marlin_moe::marlin_mm<scalar_t, kIsEP, kHasBias>(
-      a.data_ptr(),
-      b_q_weight.data_ptr(),
-      c.data_ptr(),
-      c_tmp.data_ptr(),
-      b_bias.data_ptr(),
-      b_scales.data_ptr(),
-      global_scale.data_ptr(),
-      b_zeros.data_ptr(),
-      g_idx.data_ptr(),
-      perm.data_ptr(),
-      a_tmp.data_ptr(),
-      sorted_token_ids.data_ptr(),
-      expert_ids.data_ptr(),
-      num_tokens_post_padded.data_ptr(),
-      topk_weights.data_ptr(),
-      static_cast<int>(moe_block_size),
-      static_cast<int>(top_k),
-      mul_topk_weights,
-      is_ep,
-      static_cast<int>(size_m),
-      static_cast<int>(size_n),
-      static_cast<int>(size_k),
-      workspace.data_ptr(),
-      b_q_type,
-      has_bias,
-      has_act_order,
-      is_k_full,
-      has_zp,
-      static_cast<int>(num_groups),
-      static_cast<int>(group_size),
-      dev,
-      stream,
-      thread_k,
-      thread_n,
-      sms,
-      use_atomic_add,
-      use_fp32_reduce,
-      is_zp_float);
+  device::marlin_moe::
+      marlin_mm<scalar_t, kIsEP, kHasBias, kExpertIdsAreSorted, kZeroInactiveOutput, kHasInactivePrefixCount>(
+          a.data_ptr(),
+          b_q_weight.data_ptr(),
+          c.data_ptr(),
+          c_tmp.data_ptr(),
+          b_bias.data_ptr(),
+          b_scales.data_ptr(),
+          global_scale.data_ptr(),
+          b_zeros.data_ptr(),
+          g_idx.data_ptr(),
+          perm.data_ptr(),
+          a_tmp.data_ptr(),
+          sorted_token_ids.data_ptr(),
+          expert_ids.data_ptr(),
+          num_tokens_post_padded.data_ptr(),
+          topk_weights.data_ptr(),
+          static_cast<int>(moe_block_size),
+          static_cast<int>(top_k),
+          mul_topk_weights,
+          is_ep,
+          static_cast<int>(size_m),
+          static_cast<int>(size_n),
+          static_cast<int>(size_k),
+          workspace.data_ptr(),
+          b_q_type,
+          has_bias,
+          has_act_order,
+          is_k_full,
+          has_zp,
+          static_cast<int>(num_groups),
+          static_cast<int>(group_size),
+          dev,
+          stream,
+          thread_k,
+          thread_n,
+          sms,
+          use_atomic_add,
+          use_fp32_reduce,
+          is_zp_float);
 }
 
 }  // namespace sglang

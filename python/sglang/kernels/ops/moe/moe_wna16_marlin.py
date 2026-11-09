@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
 from sglang.kernels.kernel_api_logging import debug_kernel_api
 
@@ -17,9 +18,21 @@ _MAX_THREAD_N = 256
 
 @cache_once
 def _jit_moe_wna16_marlin_module(
-    dtype: torch.dtype, is_ep: bool, has_bias: bool
+    dtype: torch.dtype,
+    is_ep: bool,
+    has_bias: bool,
+    expert_ids_are_sorted: bool = False,
+    zero_inactive_output: bool = False,
+    has_inactive_prefix_count: bool = False,
 ) -> Module:
-    args = make_cpp_args(dtype, is_ep, has_bias)
+    args = make_cpp_args(
+        dtype,
+        is_ep,
+        has_bias,
+        expert_ids_are_sorted,
+        zero_inactive_output,
+        has_inactive_prefix_count,
+    )
     return load_jit(
         "moe_wna16_marlin",
         *args,
@@ -67,14 +80,30 @@ def moe_wna16_marlin_gemm(
     use_atomic_add: bool = False,
     use_fp32_reduce: bool = False,
     is_zp_float: bool = False,
+    expert_ids_are_sorted: bool = False,
+    zero_inactive_output: bool = False,
+    has_inactive_prefix_count: bool = False,
 ) -> torch.Tensor:
+    """Project routes, preserving inactive rows in a caller-provided output.
+
+    Inactive rows are zero when this function allocates the output. With
+    ``zero_inactive_output=True``, the GEMM also zeros caller-owned rows present
+    in inactive routing blocks; omitted routes remain untouched.
+    ``expert_ids_are_sorted`` certifies ascending block expert IDs within the
+    padded token count, with any -1 blocks first. Unused tail entries are ignored.
+    Leave it false after remapping that can produce scattered inactive blocks.
+    The sorted specialization is only used without expert parallelism.
+    ``has_inactive_prefix_count`` additionally certifies that a supporting
+    producer wrote an aligned int32 pair ``[padded_tokens, inactive_blocks]``
+    for these tables and this block size. It is ignored outside sorted non-EP.
+    """
     device = a.device
 
     # Allocate output if not provided
     if c_or_none is not None:
         c = c_or_none
     else:
-        c = torch.empty((size_m * top_k, size_n), dtype=a.dtype, device=device)
+        c = torch.zeros((size_m * top_k, size_n), dtype=a.dtype, device=device)
 
     # Early return for zero-size M
     if size_m == 0:
@@ -117,7 +146,7 @@ def moe_wna16_marlin_gemm(
 
     # Allocate c_tmp for fp32 reduce
     if use_fp32_reduce and not use_atomic_add:
-        sms = torch.cuda.get_device_properties(device).multi_processor_count
+        sms = current_arch().num_sms
         # max num of threadblocks is sms * 4
         max_c_tmp_size = min(
             size_n * sorted_token_ids.size(0),
@@ -136,7 +165,14 @@ def moe_wna16_marlin_gemm(
     b_bias_t = _or_empty(b_bias_or_none, device, a.dtype)
     global_scale_t = _or_empty(global_scale_or_none, device, a.dtype)
 
-    module = _jit_moe_wna16_marlin_module(a.dtype, is_ep, has_bias)
+    module = _jit_moe_wna16_marlin_module(
+        a.dtype,
+        is_ep,
+        has_bias,
+        expert_ids_are_sorted and not is_ep,
+        zero_inactive_output,
+        has_inactive_prefix_count and expert_ids_are_sorted and not is_ep,
+    )
     module.moe_wna16_marlin_gemm(
         a,
         c,

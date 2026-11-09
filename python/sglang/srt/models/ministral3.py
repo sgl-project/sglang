@@ -4,6 +4,8 @@ import torch
 from transformers import PretrainedConfig
 
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.llama import (
     LlamaAttention,
@@ -11,7 +13,6 @@ from sglang.srt.models.llama import (
     LlamaForCausalLM,
     LlamaModel,
 )
-from sglang.srt.utils import add_prefix, make_pp_layers
 
 
 def _get_llama_4_attn_scale(
@@ -39,6 +40,7 @@ class Ministral3Attention(LlamaAttention):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         bias: bool = False,
+        reduce_results: bool = True,
     ) -> None:
         super().__init__(
             config=config,
@@ -54,6 +56,7 @@ class Ministral3Attention(LlamaAttention):
             quant_config=quant_config,
             prefix=prefix,
             bias=bias,
+            reduce_results=reduce_results,
         )
         # Ministral3 specific: llama 4 style scaling beta
         self.llama_4_scaling_beta = config.rope_parameters.get("llama_4_scaling_beta")
@@ -128,7 +131,9 @@ class Ministral3DecoderLayer(LlamaDecoderLayer):
             prefix=add_prefix("self_attn", prefix),
             bias=getattr(config, "attention_bias", False)
             or getattr(config, "bias", False),
+            reduce_results=False,
         )
+        self.input_layernorm.fuse_input_quant(self.self_attn.qkv_proj)
 
 
 class Ministral3Model(LlamaModel):
@@ -151,6 +156,7 @@ class Ministral3Model(LlamaModel):
                 prefix=prefix,
             ),
             prefix="model.layers",
+            stage_facts=lambda idx: Ministral3DecoderLayer.stage_facts(config, idx),
         )
 
 

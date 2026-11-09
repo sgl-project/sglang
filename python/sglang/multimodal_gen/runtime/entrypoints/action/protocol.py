@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import dataclasses
 import io
+import itertools
 import time
 import uuid
 from functools import lru_cache
@@ -97,7 +98,45 @@ def _decode_tensor_payload(payload: dict[str, Any]) -> Any:
     return array
 
 
+def _uint8_pixels(rows: list) -> np.ndarray | None:
+    """3-level lists of ints in [0, 255] -> uint8; ``bytes()`` runs in C."""
+    try:
+        height, width, channels = len(rows), len(rows[0]), len(rows[0][0])
+        if any(len(row) != width for row in rows):
+            return None
+        flat = bytes(itertools.chain.from_iterable(itertools.chain.from_iterable(rows)))
+    except (TypeError, ValueError):
+        return None
+    if len(flat) != height * width * channels:
+        return None
+    return np.frombuffer(flat, dtype=np.uint8).reshape(height, width, channels)
+
+
+def _pixel_list_to_array(value: list) -> Any:
+    """JSON pixel lists (``image.tolist()``) -> numpy; other lists are unchanged.
+
+    Nested Python lists cost seconds per request in the IPC tree walks and
+    pickling between the server processes; one array costs nothing.
+    """
+    try:
+        first = value[0][0][0]
+    except (TypeError, IndexError, KeyError):
+        return value
+    if isinstance(first, bool) or not isinstance(first, (int, float)):
+        return value
+    array = _uint8_pixels(value) if isinstance(first, int) else None
+    if array is not None:
+        return array
+    try:
+        array = np.asarray(value)
+    except ValueError:
+        return value
+    return array if array.dtype.kind in "iuf" else value
+
+
 def _normalize_image_value(value: Any) -> Any:
+    if isinstance(value, list):
+        return _pixel_list_to_array(value)
     if not isinstance(value, dict):
         return value
     if "b64_json" in value or "base64" in value:
@@ -114,6 +153,9 @@ def _normalize_observation(observation: dict[str, Any]) -> dict[str, Any]:
         normalized["images"] = {
             name: _normalize_image_value(value) for name, value in images.items()
         }
+    for name, value in observation.items():
+        if name.startswith("observation.images."):
+            normalized[name] = _normalize_image_value(value)
     for name in ("image", "image_path", "input_reference"):
         if name in normalized:
             value = normalized[name]

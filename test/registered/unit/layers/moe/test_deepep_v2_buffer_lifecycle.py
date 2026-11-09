@@ -1,6 +1,7 @@
 """CPU-only tests for the DeepEP v2 ElasticBuffer ownership facade."""
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -10,7 +11,7 @@ from sglang.srt.runtime_context import get_resources, reset_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class _FakeGroup:
@@ -149,6 +150,36 @@ class TestDeepEPv2BufferLifecycle(CustomTestCase):
         impl._validate_common(torch.empty(4, 128), torch.zeros(4, 2))
         with self.assertRaisesRegex(ValueError, "per-rank buffer capacity"):
             impl._validate_common(torch.empty(5, 128), torch.zeros(5, 2))
+
+    def test_masked_capacity_covers_source_rows_and_graph_padding(self):
+        impl = object.__new__(deepep_v2._DeepEPv2Impl)
+        impl.group = _FakeGroup()
+        impl.num_max_dispatch_tokens_per_rank = 1152
+        parallel = SimpleNamespace(
+            attn_dp_size=1,
+            attn_cp_size=1,
+            tp_size=4,
+            tp_group=SimpleNamespace(device_group=impl.group),
+        )
+        with patch.object(deepep_v2, "get_parallel", return_value=parallel):
+            for rows, expected in ((0, 128), (160, 768), (264, 1152), (1152, 4608)):
+                with self.subTest(rows=rows):
+                    capacity = impl._masked_token_capacity(rows, 4)
+                    self.assertEqual(capacity, expected)
+                    self.assertGreaterEqual(capacity, min(4608, rows * 4 + 3))
+
+            # Rank-local rows cannot bound other sources in these topologies.
+            for overrides in (
+                dict(attn_dp_size=2),
+                dict(attn_cp_size=2),
+                dict(tp_size=8),
+                dict(tp_group=None),
+                dict(tp_group=SimpleNamespace(device_group=_FakeGroup())),
+            ):
+                with self.subTest(overrides=overrides):
+                    topology = SimpleNamespace(**(vars(parallel) | overrides))
+                    with patch.object(deepep_v2, "get_parallel", return_value=topology):
+                        self.assertEqual(impl._masked_token_capacity(160, 4), 4608)
 
 
 if __name__ == "__main__":

@@ -16,8 +16,8 @@ import msgspec
 from sglang.srt.arg_groups.arg_utils import (
     A,
     Arg,
+    json_list_type,
 )
-from sglang.srt.utils.common import json_list_type
 
 
 class Observability(msgspec.Struct):
@@ -143,7 +143,7 @@ class Observability(msgspec.Struct):
     ] = False
     kv_events_config: A[
         Optional[str],
-        "Config in json format for NVIDIA dynamo KV event publishing. Publishing will be enabled if this flag is used. Runtime-load publishing for load-aware routers is a separate opt-in; see --load-publish-endpoint.",
+        "Config in json format for NVIDIA dynamo KV event publishing. Publishing will be enabled if this flag is used. Runtime-load publishing for load-aware routers is a separate opt-in; see --load-publish-endpoint. Set replay_endpoint (e.g. tcp://*:5558) to let routers re-fetch dropped batches; /server_info advertises its port.",
     ] = None
     load_publish_endpoint: A[
         Optional[str],
@@ -164,7 +164,7 @@ class Observability(msgspec.Struct):
     enable_trace: A[bool, "Enable opentelemetry trace"] = False
     trace_modules: A[
         str,
-        "Select the components to trace. Available options are 'request' and 'mooncake'. Format: <module1 name>,<module2 name>,...",
+        "Select the components to trace. Available options are 'request', 'mooncake', and 'hicache'. Format: <module1 name>,<module2 name>,...",
     ] = "request"
     otlp_traces_endpoint: A[
         str,

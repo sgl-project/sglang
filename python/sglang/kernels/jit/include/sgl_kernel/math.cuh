@@ -8,6 +8,8 @@
 #pragma once
 #include <sgl_kernel/type.cuh>
 
+#include <cstdint>
+
 namespace sglang {
 
 namespace device::math {
@@ -60,24 +62,6 @@ SGL_DEVICE T exp(T a) {
   return DTypeTrait<T>::exp(a);
 }
 
-/// \brief Fast approximate sigmoid for FP32 device code.
-SGL_DEVICE float sigmoid_fast(float x) {
-  return 1.0f / (1.0f + __expf(-x));
-}
-
-/// \brief Fast approximate SiLU for FP32 device code.
-SGL_DEVICE float silu_fast(float x) {
-  return x * sigmoid_fast(x);
-}
-
-/// \brief Fast approximate softplus for FP32 device code.
-///
-/// Values above 20 use the asymptotic result directly, avoiding overflow and
-/// an unnecessary exponential while matching common softplus kernels.
-SGL_DEVICE float softplus_fast(float x) {
-  return x > 20.0f ? x : log1pf(__expf(x));
-}
-
 /// \brief Returns sin(a).
 template <typename T>
 SGL_DEVICE T sin(T a) {
@@ -110,6 +94,95 @@ SGL_DEVICE float fma_f32_bf16(bf16_t a, bf16_t b, float acc) {
 // overload above (the bf16 -> f32 convert is exact).
 SGL_DEVICE float fma_f32_bf16(bf16_t a, float b, float acc) {
   return fmaf(cast<fp32_t>(a), b, acc);
+}
+
+// Packed fp32x2 arithmetic (one FFMA2 / FMUL2 / FADD2 on SM100+, round to nearest). The fallback is bit-identical:
+// `__fmul_rn` / `__fadd_rn` keep the compiler from contracting the result into a neighbouring FMA.
+SGL_DEVICE float2 fma_f32x2(float2 a, float2 b, float2 c) {
+#if SGL_ARCH_BLACKWELL_OR_GREATER
+  float2 d;
+  const auto a_bits = reinterpret_cast<const uint64_t&>(a);
+  const auto b_bits = reinterpret_cast<const uint64_t&>(b);
+  const auto c_bits = reinterpret_cast<const uint64_t&>(c);
+  auto& d_bits = reinterpret_cast<uint64_t&>(d);
+  asm("fma.rn.f32x2 %0, %1, %2, %3;" : "=l"(d_bits) : "l"(a_bits), "l"(b_bits), "l"(c_bits));
+  return d;
+#else
+  return make_float2(fmaf(a.x, b.x, c.x), fmaf(a.y, b.y, c.y));
+#endif
+}
+
+SGL_DEVICE float2 mul_f32x2(float2 a, float2 b) {
+#if SGL_ARCH_BLACKWELL_OR_GREATER
+  float2 d;
+  const auto a_bits = reinterpret_cast<const uint64_t&>(a);
+  const auto b_bits = reinterpret_cast<const uint64_t&>(b);
+  auto& d_bits = reinterpret_cast<uint64_t&>(d);
+  asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(d_bits) : "l"(a_bits), "l"(b_bits));
+  return d;
+#else
+  return make_float2(__fmul_rn(a.x, b.x), __fmul_rn(a.y, b.y));
+#endif
+}
+
+SGL_DEVICE float2 add_f32x2(float2 a, float2 b) {
+#if SGL_ARCH_BLACKWELL_OR_GREATER
+  float2 d;
+  const auto a_bits = reinterpret_cast<const uint64_t&>(a);
+  const auto b_bits = reinterpret_cast<const uint64_t&>(b);
+  auto& d_bits = reinterpret_cast<uint64_t&>(d);
+  asm("add.rn.f32x2 %0, %1, %2;" : "=l"(d_bits) : "l"(a_bits), "l"(b_bits));
+  return d;
+#else
+  return make_float2(__fadd_rn(a.x, b.x), __fadd_rn(a.y, b.y));
+#endif
+}
+
+/**
+ * \brief Fast uint32 division and modulo by a compile-time constant divisor.
+ *
+ * This struct is only exact when the divisor is less than `2^31`. Larger dividends
+ * will lead to incorrect results. Be careful when using this struct.
+ */
+struct fast_mod_div_u32_t {
+ public:
+  explicit constexpr fast_mod_div_u32_t(uint32_t d) : m_divisor(d) {
+    if (d > 1) {
+      const uint32_t log2_ceil = 32 - std::countl_zero(d - 1);
+      const uint32_t p = 31 + log2_ceil;
+      m_magic = static_cast<uint32_t>(((uint64_t{1} << p) + d - 1) / d);
+      m_shift = p - 32;
+    } else {
+      m_magic = 0;
+      m_shift = 0;
+    }
+  }
+
+  template <typename T>
+  SGL_DEVICE friend uint32_t operator/(T n, const fast_mod_div_u32_t& d) {
+    static_assert(std::is_unsigned_v<T> && sizeof(T) <= sizeof(uint32_t));
+    return d.m_divisor == 1 ? n : __umulhi(n, d.m_magic) >> d.m_shift;
+  }
+
+  template <typename T>
+  SGL_DEVICE friend uint32_t operator%(T n, const fast_mod_div_u32_t& d) {
+    static_assert(std::is_unsigned_v<T> && sizeof(T) <= sizeof(uint32_t));
+    return n - (n / d) * d.m_divisor;
+  }
+
+  constexpr operator uint32_t() const {
+    return m_divisor;
+  }
+
+ private:
+  uint32_t m_divisor;
+  uint32_t m_magic;
+  uint32_t m_shift;
+};
+
+template <typename T>
+SGL_DEVICE uint2 div(T n, const fast_mod_div_u32_t& d) {
+  return {n / d, n % d};
 }
 
 }  // namespace device::math

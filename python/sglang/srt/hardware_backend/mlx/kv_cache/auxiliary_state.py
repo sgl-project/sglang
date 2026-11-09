@@ -16,6 +16,7 @@ import mlx.core as mx
 import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams, InsertResult
+from sglang.srt.mem_cache.kv.state_storage import StateStorage
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.unified_cache.components.base import TreeComponent
 from sglang.srt.mem_cache.unified_cache.components.mamba import (
@@ -215,22 +216,22 @@ class MlxAuxiliaryStatePool:
         return self._index(index) in self._snapshots
 
 
+class MlxAuxiliaryStateStorage(StateStorage):
+    """The auxiliary-state slots, as the radix cache's state component reaches
+    them through the token allocator. The MLX table binds a request's slot when
+    it binds the row, and release keeps the MLX table's rules."""
+
+    def acquire(self, table, reqs, rows, fresh_rows) -> None:
+        """Nothing left to bind: the MLX table's ``alloc`` gave each request
+        its auxiliary slot, or kept the one it holds, with its row."""
+
+    def release(self, table, req, mamba_ping_pong_track_buffer_to_keep=None):
+        table.free_mamba_cache(req, mamba_ping_pong_track_buffer_to_keep)
+
+
 class MlxAuxiliaryStateReqToTokenPool(ReqToTokenPool):
-    """Req-to-token pool with MLX auxiliary-state slot bookkeeping.
-
-    Auxiliary-slot release has exactly one owner per configuration:
-
-    * Radix cache enabled: the ``MlxAuxiliaryStateComponent`` of the unified
-      radix cache owns release — on finish it either frees the slot or
-      transfers it to the tree, nulling ``req.kv.mamba_pool_idx`` before the
-      request row is freed. The pool must NOT free auxiliary slots itself.
-    * Radix cache disabled (``ChunkCache``): no tree component exists, and
-      ``release_kv_cache``'s ``free_mamba_cache`` fallback is gated on
-      ``HybridReqToTokenPool``, which this pool is not — so the pool itself
-      owns release. Construct with ``owns_auxiliary_state_release=True`` and
-      ``free(req)`` returns the slot together with the request row; without
-      this, every finished request leaks its slot until allocation asserts.
-    """
+    """Req-to-token pool with MLX auxiliary-state slot bookkeeping. It never
+    frees auxiliary slots: ``MlxAuxiliaryStateComponent`` owns their release."""
 
     def __init__(
         self,
@@ -240,7 +241,6 @@ class MlxAuxiliaryStateReqToTokenPool(ReqToTokenPool):
         device: str,
         enable_memory_saver: bool,
         auxiliary_state_size: int,
-        owns_auxiliary_state_release: bool = False,
     ):
         super().__init__(
             size=size,
@@ -248,7 +248,6 @@ class MlxAuxiliaryStateReqToTokenPool(ReqToTokenPool):
             device=device,
             enable_memory_saver=enable_memory_saver,
         )
-        self._owns_auxiliary_state_release = owns_auxiliary_state_release
         self.mamba_pool = MlxAuxiliaryStatePool(
             size=auxiliary_state_size,
             device=device,
@@ -258,6 +257,14 @@ class MlxAuxiliaryStateReqToTokenPool(ReqToTokenPool):
         # Keep the MLX-owned name beside it so local code can avoid model-
         # specific terminology.
         self.auxiliary_state_pool = self.mamba_pool
+        self.state = MlxAuxiliaryStateStorage(
+            sub_pool="mamba",
+            pool=self.mamba_pool,
+            slots=self.mamba_pool,
+            layer_map={},
+            short_conv_pool=None,
+            ngram_pool=None,
+        )
         self.enable_mamba_extra_buffer = False
         self.req_index_to_auxiliary_state_index_mapping = torch.zeros(
             self._alloc_size, dtype=torch.int32, device=device
@@ -301,6 +308,7 @@ class MlxAuxiliaryStateReqToTokenPool(ReqToTokenPool):
             if mamba_ping_pong_track_buffer_to_keep is None:
                 self.auxiliary_state_pool.free(track_buffer)
             req.kv.mamba_ping_pong_track_buffer = None
+            req.kv.mamba_ping_pong_empty = None
             req.kv.mamba_next_track_idx = None
             req.kv.mamba_last_track_idx = None
 
@@ -309,16 +317,6 @@ class MlxAuxiliaryStateReqToTokenPool(ReqToTokenPool):
             req,
             mamba_ping_pong_track_buffer_to_keep=track_buffer_to_keep,
         )
-
-    def free(self, req):
-        if self._owns_auxiliary_state_release:
-            # No-radix configuration: nothing else will ever release the
-            # auxiliary slot, so return it with the request row. Keyed on
-            # req.kv.mamba_pool_idx (None-safe, nulled by free_mamba_cache), NOT
-            # on req_index_to_auxiliary_state_index_mapping, which may point
-            # at a slot the radix tree owns.
-            self.free_mamba_cache(req)
-        super().free(req)
 
     def clear(self):
         super().clear()
@@ -329,7 +327,7 @@ class MlxAuxiliaryStateReqToTokenPool(ReqToTokenPool):
 class MlxAuxiliaryStateComponent(MambaComponent):
     """Unified radix component for MLX native auxiliary-state snapshots."""
 
-    def __init__(self, cache, params):
+    def __init__(self, cache, params, slot):
         if params.enable_mamba_extra_buffer:
             raise NotImplementedError(
                 "MLX auxiliary-state radix cache does not support "
@@ -341,7 +339,7 @@ class MlxAuxiliaryStateComponent(MambaComponent):
                 "MlxAuxiliaryStateComponent requires MlxAuxiliaryStatePool, "
                 f"got {type(pool)}"
             )
-        TreeComponent.__init__(self, cache, params)
+        TreeComponent.__init__(self, cache, params, slot)
         self.enable_mamba_extra_buffer = False
         self._mamba_pool_host = None
 
@@ -412,6 +410,7 @@ class MlxAuxiliaryStateComponent(MambaComponent):
                 if track_buffer is not None:
                     self.cache.req_to_token_pool.auxiliary_state_pool.free(track_buffer)
                 req.kv.mamba_ping_pong_track_buffer = None
+                req.kv.mamba_ping_pong_empty = None
                 req.kv.mamba_next_track_idx = None
                 req.kv.mamba_last_track_idx = None
             req.kv.mamba_last_track_seqlen = None
@@ -437,6 +436,7 @@ class MlxAuxiliaryStateComponent(MambaComponent):
             if track_buffer is not None:
                 self.cache.req_to_token_pool.auxiliary_state_pool.free(track_buffer)
                 req.kv.mamba_ping_pong_track_buffer = None
+                req.kv.mamba_ping_pong_empty = None
                 req.kv.mamba_next_track_idx = None
                 req.kv.mamba_last_track_idx = None
             req.kv.mamba_pool_idx = None

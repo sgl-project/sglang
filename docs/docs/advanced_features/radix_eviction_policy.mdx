@@ -25,6 +25,7 @@ Select one with `--radix-eviction-policy`. All of them fall back to least-recent
 | `slru` | Prefixes still in the probationary segment, then the least recent within a segment. | Like `lfu`, but you want a hard floor on how much a one-off prefix can displace a proven one. See [`slru` parameters](#slru-parameters). |
 | `priority` | The prefix belonging to the lowest-priority request, then the least recent. | You run [priority scheduling](/docs/advanced_features/server_arguments) and want cache retention to follow the same ranking as admission. |
 | `tlru` | The tail of a conversation beyond what its next prefill needs to meet the TTFT budget ("TEL-safe" tokens), then the least recent. | Agentic / multi-turn workloads where tail TTFT matters more than raw hit rate. See [`tlru` parameters](#tlru-parameters). Requires the unified radix cache (the default tree). |
+| `joint_lru` | The least recent of the full-attention and SWA KV, ranked in one shared order. | Full/SWA hybrid models with `--enable-unified-memory` on the unified radix cache (the default tree), where both kinds of KV share one byte buffer; there it rejects `--enable-session-radix-cache` and tree cores without the joint walk, such as the `rust` tree core. Elsewhere it acts as `lru`. |
 
 Notes on the scoring inputs:
 
@@ -52,7 +53,7 @@ TypeError: SLRUStrategy.__init__() got an unexpected keyword argument 'protected
 
 ### Policy parameters
 
-`slru` and `tlru` take parameters. `lru`, `lfu`, and `priority` take none, so `--radix-eviction-policy-config` has no effect with them and any key is an error.
+`slru` and `tlru` take parameters. `lru`, `joint_lru`, `lfu`, and `priority` take none, so `--radix-eviction-policy-config` has no effect with them and any key is an error.
 
 #### `slru` parameters
 
