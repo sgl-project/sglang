@@ -203,15 +203,21 @@ def _sm100_configs(num_sm: int) -> dict[int, AllReduceConfig]:
     }
 
 
-# SM107 (Rubin, VR)
+# SM107 (Rubin, VR). World 2 / 4 / 8 / 16 tuned on VR;
 @cache
 def _sm107_configs(num_sm: int) -> dict[int, AllReduceConfig]:
     mc_blocks = {4: 128, 5: 128, 6: 128, 7: 128, 8: 96, 16: 32}
 
-    def config(world_size: int, *, graph: tuple, eager: tuple) -> AllReduceConfig:
+    def config(
+        world_size: int, *, graph: tuple, eager: tuple, two_shot_push: int = 0
+    ) -> AllReduceConfig:
         return AllReduceConfig(
-            graph=_pack_heuristic(*graph),
-            eager=_pack_heuristic(*eager),
+            graph=_pack_heuristic(*graph)._replace(
+                two_shot_push_threshold=two_shot_push
+            ),
+            eager=_pack_heuristic(*eager)._replace(
+                two_shot_push_threshold=two_shot_push
+            ),
             num_push_blocks=num_sm,
             num_pull_blocks=min(192, num_sm),
             num_mc_blocks=mc_blocks.get(world_size),
@@ -230,8 +236,9 @@ def _sm107_configs(num_sm: int) -> dict[int, AllReduceConfig]:
         ),
         4: config(
             4,
-            graph=(6.938 * MB, 6.938 * MB, 128.0 * MB),
-            eager=(9.812 * MB, 9.812 * MB, 128.0 * MB, Range(9.812 * MB, 128 * MB)),
+            graph=(1.000 * MB, 1.000 * MB, 128.0 * MB),
+            eager=(1.000 * MB, 1.000 * MB, 128.0 * MB, Range(9.812 * MB, 128 * MB)),
+            two_shot_push=16 * MB,
         ),
         5: config(
             5,
@@ -250,13 +257,15 @@ def _sm107_configs(num_sm: int) -> dict[int, AllReduceConfig]:
         ),
         8: config(
             8,
-            graph=(2.438 * MB, 2.438 * MB, 128.0 * MB, Range(2.438 * MB, 128 * MB)),
-            eager=(2.438 * MB, 2.438 * MB, 128.0 * MB, Range(2.438 * MB, 128 * MB)),
+            graph=(384 * KB, 384 * KB, 128.0 * MB, Range(2.438 * MB, 128 * MB)),
+            eager=(384 * KB, 384 * KB, 128.0 * MB, Range(2.438 * MB, 128 * MB)),
+            two_shot_push=16 * MB,
         ),
         16: config(
             16,
-            graph=(832.0 * KB, 832.0 * KB, 128.0 * MB, Range(832 * KB, 128 * MB)),
-            eager=(832.0 * KB, 832.0 * KB, 128.0 * MB, Range(832 * KB, 128 * MB)),
+            graph=(256 * KB, 256 * KB, 128.0 * MB, Range(832 * KB, 128 * MB)),
+            eager=(256 * KB, 256 * KB, 128.0 * MB, Range(832 * KB, 128 * MB)),
+            two_shot_push=16 * MB,
         ),
     }
 
@@ -312,10 +321,51 @@ def _sm90_configs(num_sm: int) -> dict[int, AllReduceConfig]:
     }
 
 
+# ROCm (MI350X / gfx950). Block counts tuned at TP2/4/6/8; the thresholds are
+# still the conservative default.
+@cache
+def _rocm_configs(num_sm: int) -> dict[int, AllReduceConfig]:
+    default = AllReduceConfig(
+        graph=Heuristic(1 * MB, 1 * MB, 16 * MB),
+        eager=Heuristic(1 * MB, 1 * MB, 16 * MB),
+        num_push_blocks=num_sm,
+        # each pull block runs its own cross-GPU barrier: 32 blocks are 40-65%
+        # faster than one per CU at TP8 from 1 MB, and within a few % of the
+        # best grid at TP2/4/6
+        num_pull_blocks=32,
+        num_mc_blocks=None,
+    )
+    return {world_size: default for world_size in range(2, 9)}
+
+
+# ROCm (MI450 / gfx1250, 96 CUs). Tuned at TP8, also with one rank arriving late
+# and a GEMM before each all-reduce (the serving decode pattern). A grid of one
+# block per CU loses the most under skew; 2shot_push beats 1shot_push from
+# 128 KB and the pull algos at every size; above 8 MB RCCL is faster than a
+# 64-block 2shot_push.
+@cache
+def _rocm_gfx1250_configs(num_sm: int) -> dict[int, AllReduceConfig]:
+    heuristic = Heuristic(64 * KB, 0, 0, two_shot_push_threshold=8 * MB)
+    default = AllReduceConfig(
+        graph=heuristic,
+        eager=heuristic,
+        num_push_blocks=min(num_sm, 64),
+        num_pull_blocks=32,
+        num_mc_blocks=None,
+    )
+    return {world_size: default for world_size in range(2, 9)}
+
+
 @cache
 def _get_all_reduce_configs() -> dict[int, AllReduceConfig]:
+    props = torch.cuda.get_device_properties()
+    num_sm = props.multi_processor_count
+    if torch.version.hip:
+        # ROCm reports gfx9xx as capability 9.x: never fall into the SM90 table
+        if props.gcnArchName.startswith("gfx1250"):
+            return _rocm_gfx1250_configs(num_sm)
+        return _rocm_configs(num_sm)
     cuda_major, cuda_minor = torch.cuda.get_device_capability()
-    num_sm = torch.cuda.get_device_properties().multi_processor_count
     if cuda_major == 9:
         return _sm90_configs(num_sm)
     if cuda_major == 10:

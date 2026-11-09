@@ -107,6 +107,7 @@ The Gemma 4 series offers models in various sizes and architectures, optimized f
 
 - SGLang automatically selects the Triton attention backend for Gemma 4 models (required for bidirectional image-token attention during prefill).
 - **Attention backend on Blackwell (B200/sm100)**: SGLang defaults to the `trtllm_mha` backend on sm100, which is fastest for text but applies *causal* attention to image tokens. For multimodal (image) workloads on B200, pass `--attention-backend triton` to restore bidirectional image-token attention and full vision quality. Text-only and audio workloads are unaffected by the default.
+- **Attention backend on Intel XPU (BMG)**: for the 12B, 26B-A4B and 31B models (`use_bidirectional_attention: "vision"`), `--attention-backend intel_xpu` gives image tokens bidirectional attention within each image on the sliding-window layers, while full-attention layers stay causal, as in Hugging Face; E2B and E4B keep image tokens causal. The sgl-kernel-xpu mask has no sliding-window variant, so it applies only while the longest sequence in the prefill batch, counting its cached prefix, fits in the 1024-token window; otherwise image tokens fall back to causal attention for the whole batch. A short image request batched with a long prompt, or sent after a long chat history, loses it too. For document and OCR workloads, `--mm-process-config '{"image":{"max_soft_tokens":560}}'` keeps a single image with a short prompt inside the window; 1120 does not.
 - **Gemma 4 26B-A4B on B200**: Use `--mem-fraction-static 0.75` to leave workspace headroom for the Triton MoE path.
 - For the 26B-A4B MoE model, consider `--tp 2` for high-throughput workloads.
 - **Speculative Decoding (MTP)**: Each Gemma 4 variant ships with a paired `*-assistant` draft model that enables NEXTN multi-token prediction. Enable it via the selector above, or pass `--speculative-algorithm NEXTN --speculative-draft-model-path google/gemma-4-<variant>-it-assistant --speculative-num-steps 5 --speculative-num-draft-tokens 6 --speculative-eagle-topk 1`. MTP can significantly reduce latency for interactive use cases. The 26B-A4B MoE model requires `--tp 2` when MTP is enabled.
@@ -602,7 +603,7 @@ sglang serve --model-path google/gemma-4-E2B-it
 **Latency Benchmark (Text)**
 
 ```bash Command
-python3 -m sglang.bench_serving --backend sglang \
+python3 -m sglang.benchmark.serving --backend sglang \
   --host 0.0.0.0 --port 30000 \
   --dataset-name random --num-prompts 10 --max-concurrency 1
 ```
@@ -629,7 +630,7 @@ Median ITL (ms):                         4.05
 **Latency Benchmark (Image)**
 
 ```bash Command
-python3 -m sglang.bench_serving --backend sglang-oai-chat \
+python3 -m sglang.benchmark.serving --backend sglang-oai-chat \
   --host 0.0.0.0 --port 30000 \
   --dataset-name image --image-count 2 --image-resolution 720p \
   --random-input-len 128 --random-output-len 1024 \
@@ -659,7 +660,7 @@ Median ITL (ms):                         4.04
 **Throughput Benchmark (Text)**
 
 ```bash Command
-python3 -m sglang.bench_serving --backend sglang \
+python3 -m sglang.benchmark.serving --backend sglang \
   --host 0.0.0.0 --port 30000 \
   --dataset-name random --num-prompts 1000 --max-concurrency 100
 ```
@@ -686,7 +687,7 @@ Median ITL (ms):                         5.99
 **Throughput Benchmark (Image)**
 
 ```bash Command
-python3 -m sglang.bench_serving --backend sglang-oai-chat \
+python3 -m sglang.benchmark.serving --backend sglang-oai-chat \
   --host 0.0.0.0 --port 30000 \
   --dataset-name image --image-count 2 --image-resolution 720p \
   --random-input-len 128 --random-output-len 1024 \
@@ -1006,7 +1007,7 @@ sglang serve --model-path google/gemma-4-31B-it
 **Latency Benchmark (Text)**
 
 ```bash Command
-python3 -m sglang.bench_serving --backend sglang \
+python3 -m sglang.benchmark.serving --backend sglang \
   --host 0.0.0.0 --port 30000 \
   --dataset-name random --num-prompts 10 --max-concurrency 1
 ```
@@ -1033,7 +1034,7 @@ Median ITL (ms):                         24.23
 **Throughput Benchmark (Text)**
 
 ```bash Command
-python3 -m sglang.bench_serving --backend sglang \
+python3 -m sglang.benchmark.serving --backend sglang \
   --host 0.0.0.0 --port 30000 \
   --dataset-name random --num-prompts 1000 --max-concurrency 100
 ```
@@ -1067,7 +1068,7 @@ sglang serve --model-path google/gemma-4-26B-A4B-it
 **Latency Benchmark (Text)**
 
 ```bash Command
-python3 -m sglang.bench_serving --backend sglang \
+python3 -m sglang.benchmark.serving --backend sglang \
   --host 0.0.0.0 --port 30000 \
   --dataset-name random --num-prompts 10 --max-concurrency 1
 ```
@@ -1094,7 +1095,7 @@ Median ITL (ms):                         9.57
 **Throughput Benchmark (Text)**
 
 ```bash Command
-python3 -m sglang.bench_serving --backend sglang \
+python3 -m sglang.benchmark.serving --backend sglang \
   --host 0.0.0.0 --port 30000 \
   --dataset-name random --num-prompts 1000 --max-concurrency 100
 ```
@@ -1128,7 +1129,7 @@ sglang serve --model-path google/gemma-4-12B-it
 **Latency Benchmark (Text)**
 
 ```bash Command
-python3 -m sglang.bench_serving --backend sglang \
+python3 -m sglang.benchmark.serving --backend sglang \
   --host 0.0.0.0 --port 30000 \
   --dataset-name random --num-prompts 10 --max-concurrency 1
 ```
@@ -1154,7 +1155,7 @@ Median ITL (ms):                         9.19
 **Latency Benchmark (Image)**
 
 ```bash Command
-python3 -m sglang.bench_serving --backend sglang-oai-chat \
+python3 -m sglang.benchmark.serving --backend sglang-oai-chat \
   --host 0.0.0.0 --port 30000 \
   --dataset-name image --image-count 2 --image-resolution 720p \
   --random-input-len 128 --random-output-len 1024 \
@@ -1182,7 +1183,7 @@ Median ITL (ms):                         9.17
 **Throughput Benchmark (Text)**
 
 ```bash Command
-python3 -m sglang.bench_serving --backend sglang \
+python3 -m sglang.benchmark.serving --backend sglang \
   --host 0.0.0.0 --port 30000 \
   --dataset-name random --num-prompts 1000 --max-concurrency 100
 ```
