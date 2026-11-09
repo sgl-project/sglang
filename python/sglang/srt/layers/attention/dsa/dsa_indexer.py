@@ -15,6 +15,7 @@ from sglang.kernels.ops.attention.dsa.fp8_fused_writer_hip import (
     prepare_aiter_rope_caches,
 )
 from sglang.kernels.ops.attention.dsa.litetopk_prefill import (
+    FP8_INDEXER_MAX_SPAN,
     fp8_indexer_topk,
     is_fp8_indexer_supported,
 )
@@ -1769,9 +1770,11 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         k_offset = k_fp8.shape[0]
         # Short contexts keep the dense path: with fewer than ~8 x topk keys the sampled filter keeps most keys
         # and loses to DeepGEMM logits + top-k (measured on B200 / B300).
+        # A block spans at most k_offset keys (a conservative bound); past FP8_INDEXER_MAX_SPAN rows lose the sample.
         if (
             self.use_prefill_lite_topk
             and max_seq_len >= 8 * self.index_topk
+            and k_offset <= FP8_INDEXER_MAX_SPAN
             and isinstance(metadata, DSAIndexerMetadata)
             and not metadata.force_unfused_topk
         ):
@@ -1781,7 +1784,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 k_fp8,
                 k_scale,
                 ks,
-                ke,
+                # The dense top-k stops at ks + seq_lens_expanded; ERNIE's window shortens only those lengths.
+                torch.minimum(ke, ks + seq_lens_expanded),
                 metadata,
                 topk_result[:q_offset],
             )
@@ -1963,6 +1967,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             ke,
             self.index_topk,
             out_offsets=None if offsets is None else offsets[: out.shape[0]],
+            num_ctas=self._lite_topk_num_ctas(),
             out=out,
         )
         if metadata.topk_transform_method == TopkTransformMethod.PAGED:
@@ -1973,6 +1978,14 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 metadata.get_token_to_batch_idx()[: out.shape[0]],
                 metadata.attn_metadata.page_size,
             )
+
+    def _lite_topk_num_ctas(self) -> int:
+        if not deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+            return 0  # one CTA per SM
+        with self._with_real_sm_count():
+            # DeepGEMM's live count, as the dense logits get it: two-batch overlap lowers it, and on PP ranks
+            # _with_real_sm_count replaces it with the recv reserve (resolve_num_sms is cached at init).
+            return deep_gemm.get_num_sms()
 
     @staticmethod
     def _dcp_gather_index_k(

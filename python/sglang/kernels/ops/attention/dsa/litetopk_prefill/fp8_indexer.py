@@ -29,6 +29,9 @@ DEFAULT_KV_STAGES = 3
 DEFAULT_Q_STAGES = 2
 # Query rows per CTA block by head count (kBlockQ = 256 / heads in fp8_indexer.cuh).
 FP8_INDEXER_BLOCK_ROWS = {32: 8, 64: 4}
+# Widest key span of one block that the strided sample covers (fp8_indexer.cuh: kMaxSampleTiles x 256 x 257);
+# rows of a wider block past the sample get T = -inf, and those over the slab cap are clipped.
+FP8_INDEXER_MAX_SPAN = 32 * 256 * 257
 
 
 @cache_once
@@ -142,7 +145,9 @@ def fp8_indexer_candidates(
     of single keys on an odd stride (65, 129 or 257 by span) of the row's
     scores (``j' = ceil((1 + 4 sqrt(2 / j)) j)``,
     ``j = topk * samples / keys``), so the candidates contain the row's exact
-    top-``topk``. Rows with at most ``dense_bound`` keys (default ``topk``)
+    top-``topk`` while every block spans at most ``FP8_INDEXER_MAX_SPAN`` keys
+    (``kv_fp8.shape[0]`` bounds the span; rows past the sample get ``T = -inf``).
+    Rows with at most ``dense_bound`` keys (default ``topk``)
     keep every key (``T = -inf``). ``counts`` keeps counting past ``cap``; such
     rows set ``overflow``. The ``s w`` half of ``relu(s) w`` comes from the
     tensor core (q' in four e4m3 terms), so the scores differ from DeepGEMM's

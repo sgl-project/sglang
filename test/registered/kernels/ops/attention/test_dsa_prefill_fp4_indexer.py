@@ -2,6 +2,7 @@
 slab must hold the exact top-k of the reference logits, with the reference's own scores."""
 
 import itertools
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -9,6 +10,8 @@ import torch
 from sglang.kernels.ops.attention.dsa.litetopk_prefill import fp4_indexer_topk
 from sglang.kernels.ops.attention.dsa.litetopk_prefill.fp4_indexer import (
     FP4_INDEXER_CAP,
+    FP4_INDEXER_DENSE_LEN,
+    FP4_INDEXER_MAX_SPAN,
     fp4_indexer_candidates,
     is_fp4_indexer_supported,
 )
@@ -211,6 +214,102 @@ def test_fp4_indexer_topk(heads, topk, ratio, requests):
         valid[:, : ref.shape[1]], ref, torch.full_like(ref, float("-inf"))
     )
     assert torch.equal(got.sort(dim=1, descending=True).values[:, : ref.shape[1]], ref)
+
+
+@pytest.mark.parametrize("heads", [32, 64])
+def test_fp4_indexer_max_span(heads):
+    """A block spanning FP4_INDEXER_MAX_SPAN[heads] keys samples its farthest rows; rows past that span get none."""
+    from deep_gemm.utils.math import per_token_cast_to_fp4
+
+    # One block of 128 // heads rows: the last `rows` rows of each request.
+    far, rows = 1024, 64 // heads
+    for near, sampled in (
+        (FP4_INDEXER_MAX_SPAN[heads] - far, True),
+        (FP4_INDEXER_MAX_SPAN[heads], False),
+    ):
+        ke = [near - rows + 1 + i for i in range(rows)]
+        ke += [near + far - rows + 1 + i for i in range(rows)]
+        ks = torch.tensor([0] * rows + [near] * rows, dtype=torch.int32, device="cuda")
+        ke = torch.tensor(ke, dtype=torch.int32, device="cuda")
+        torch.manual_seed(3)
+        q = torch.randn(2 * rows, heads, 128, device="cuda", dtype=torch.bfloat16)
+        kv = torch.randn(near + far, 128, device="cuda", dtype=torch.bfloat16)
+        q_fp4, q_sf = per_token_cast_to_fp4(
+            q.view(-1, 128), use_ue8m0=True, gran_k=32, use_packed_ue8m0=True
+        )
+        kv_fp4, kv_sf = per_token_cast_to_fp4(
+            kv, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True
+        )
+        weights = torch.randn(2 * rows, heads, device="cuda", dtype=torch.bfloat16)
+        res = fp4_indexer_candidates(
+            q_fp4.view(2 * rows, heads, 64).contiguous(),
+            q_sf.view(2 * rows, heads).contiguous(),
+            weights,
+            kv_fp4.contiguous(),
+            kv_sf.view(-1).contiguous(),
+            ks,
+            ke,
+            512,
+        )
+        far_samples = res.samples[rows:]
+        if sampled:
+            assert bool((far_samples > 0).all()), far_samples
+        else:
+            assert bool((far_samples == 0).all()), far_samples
+
+
+@pytest.mark.parametrize("heads", [32, 64])
+def test_full_topk_lite_dispatch_at_max_span(monkeypatch, heads):
+    """DeepSeek-V4.1 full top-k layers take the fp4 lite path while the gathered index keys fit FP4_INDEXER_MAX_SPAN,
+    or every row is dense; otherwise they take the dense path."""
+    from sglang.srt.layers.attention.dsv4.v41_indexer import full_topk
+
+    class LitePath(Exception):
+        pass
+
+    class DensePath(Exception):
+        pass
+
+    def lite_path(*args, **kwargs):
+        raise LitePath
+
+    def dense_path(*args, **kwargs):
+        raise DensePath
+
+    monkeypatch.setattr(full_topk.FullTopKIndexer, "_prefill_lite_topk", lite_path)
+    indexer = full_topk.FullTopKIndexer(
+        token_to_kv_pool=SimpleNamespace(get_low_ratio_index_k_fp4=dense_path),
+        req_to_token=None,
+        use_deep_gemm_prefill=True,
+        use_deep_gemm_decode=True,
+        use_prefill_lite_topk=True,
+    )
+    rows = 1024
+    inputs = SimpleNamespace(
+        reset_outputs=lambda: None,
+        out_raw_indices=torch.empty(rows, 512, dtype=torch.int32),
+        row_shard=None,
+        layer_id=0,
+    )
+    span, dense = FP4_INDEXER_MAX_SPAN[heads], FP4_INDEXER_DENSE_LEN
+    for lens, path in (
+        ([span - 65536, 65536], LitePath),
+        # The longest request fits; only the batch's gathered keys pass the span.
+        ([span - 65536, 65540], DensePath),
+        # Every block is dense and samples nothing, however many keys the batch gathers.
+        ([dense] * (span // dense + 1), LitePath),
+    ):
+        data = SimpleNamespace(
+            num_rows=rows,
+            lens_per_request=lens,
+            k_slots=torch.empty(sum(lens), dtype=torch.int64),
+            q_sf=torch.empty(rows, heads, dtype=torch.int32),
+        )
+        monkeypatch.setattr(
+            full_topk, "get_deep_gemm_prefill_data", lambda _, d=data: d
+        )
+        with pytest.raises(path):
+            indexer.topk_prefill(inputs)
 
 
 if __name__ == "__main__":

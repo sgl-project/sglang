@@ -27,12 +27,15 @@ def fp8_indexer_topk(
     topk: int,
     *,
     out_offsets: Optional[torch.Tensor] = None,
+    num_ctas: int = 0,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Top-``topk`` keys of every row for the fp8 indexer (operands as in
     :func:`fp8_indexer_candidates`): ``out[r]`` holds ``j - ks[r] + out_offsets[r]`` for the
     ``topk`` highest-scoring keys ``j`` in ``[ks[r], ke[r])``, unordered, ``-1`` past
     ``min(topk, ke[r] - ks[r])``. ``out`` is int32 ``[rows, topk]``, ``topk`` in {512, 1024, 2048}.
+    ``num_ctas`` caps the persistent indexer grid (0: one CTA per SM). Callers keep ``kv_fp8.shape[0]`` at most
+    ``FP8_INDEXER_MAX_SPAN``: rows of a block spanning more keys may get no sample and a clipped slab.
     """
     if out is None:
         out = torch.empty(
@@ -40,7 +43,9 @@ def fp8_indexer_topk(
         )
     if q_fp8.shape[0] == 0:  # e.g. a dummy run: nothing to launch
         return out
-    cands = fp8_indexer_candidates(q_fp8, weights, kv_fp8, kv_scale, ks, ke, topk)
+    cands = fp8_indexer_candidates(
+        q_fp8, weights, kv_fp8, kv_scale, ks, ke, topk, num_ctas=num_ctas
+    )
     topk_candidates(
         cands.scores,
         cands.indices,
@@ -69,7 +74,8 @@ def fp4_indexer_topk(
     :func:`fp4_indexer_candidates`), over its bf16 scores: ``out[r]`` holds
     ``j - ks[r] + out_offsets[r]`` for the ``topk`` highest-scoring keys ``j`` in ``[ks[r], ke[r])``,
     unordered, ``-1`` past ``min(topk, ke[r] - ks[r])``. ``out`` is int32 ``[rows, topk]``, ``topk``
-    in {512, 1024, 2048}.
+    in {512, 1024, 2048}. Callers keep ``kv_fp4.shape[0]`` at most ``FP4_INDEXER_MAX_SPAN[heads]``, as for
+    :func:`fp8_indexer_topk`.
     """
     if out is None:
         out = torch.empty((q_sf.shape[0], topk), dtype=torch.int32, device=q_fp4.device)
