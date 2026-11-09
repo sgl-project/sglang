@@ -47,7 +47,7 @@ pip install -e "tools/sglang-simulator[aisimulate]"
 ```
 
 The extra pins `aisimulate==0.13.0`. The official wheels require Python
-3.11–3.13 and cover Linux x86_64/aarch64 and macOS arm64. This release exposes
+3.11Ã¢â‚¬â€œ3.13 and cover Linux x86_64/aarch64 and macOS arm64. This release exposes
 the modern `aisimulate.sdk` namespace.
 
 AISimulate 0.13.0 requires NumPy>=2.1,<3, replacing the NumPy 1.26.4 pin
@@ -63,7 +63,8 @@ No old-package uninstall is needed in a fresh environment.
 
 Use the `aisimulate` predictor name for the existing static op-level path,
 including phase scale factors.
-The shared memory-estimation path also uses this SDK for ML/replay predictors.
+The default memory-estimation path also uses this SDK for ML/replay predictors.
+An explicit token capacity or the optional resource budget below avoids that path.
 
 #### Migrating from AIConfigurator
 
@@ -340,3 +341,71 @@ error. This changes import timing without replacing the quantizer.
 The CPU pool plumbing translates an explicit logical token capacity to the
 native pool byte budget. Its bounded search rejects unreachable layouts rather
 than spinning indefinitely, preserving native sizing and rounding.
+
+### Optional SDK resource budget
+
+`memory_budget.provider: "simopus"` selects a separate structural resource
+estimate for the declared target deployment. It does not select the latency
+predictor: replay, ML or another predictor can use this budget independently.
+The configuration pins the SDK revision, model identity and an explicit policy.
+Unsupported layouts fail rather than falling back to host memory or guessed
+capacity. An explicit `--max-total-tokens` takes precedence and does not load
+the resource SDK. With no `memory_budget`, existing target capacity estimation
+is unchanged. Successful optional budgets are included in `metrics.json` with
+their resource, policy and topology provenance.
+
+#### Replay with an independent resource budget
+
+[`replay_simopus_budget.json`](examples/sim_configs/replay_simopus_budget.json)
+combines the existing replay table with an SDK resource budget for Qwen3-8B.
+It needs the CPU bootstrap and shared SDK loader, not the SimOpus latency or
+native staged provider. Install the simulator and a SimOpus SDK build exposing
+`build_model_resources` and `estimate_memory_budget`; AISimulate is not required
+for this example. The replay table and its 1 ms miss fallback are demonstration
+latencies, not measured model performance.
+
+From the repository root, create a local configuration pinned to the SDK that
+is actually installed. Keep it beside the example so its relative replay-table
+path remains valid:
+
+```bash
+python3 - <<'PY'
+import json
+import re
+from pathlib import Path
+
+import simopus
+
+source = Path("tools/sglang-simulator/examples/sim_configs/replay_simopus_budget.json")
+config = json.loads(source.read_text())
+revision = simopus.__revision__
+assert re.fullmatch(r"[0-9a-f]{40}", revision), "Install a revision-stamped SDK build"
+config["memory_budget"]["provider_revision"] = revision
+source.with_name("replay_simopus_budget.local.json").write_text(
+    json.dumps(config, indent=2) + "\n"
+)
+PY
+
+SGLANG_USE_CPU_ENGINE=1 CUDA_VISIBLE_DEVICES="" HIP_VISIBLE_DEVICES="" \
+python3 -m sglang_simulator.simulation.sglang.launch_server \
+  --model-path "$PWD/tools/sglang-simulator/test/assets/qwen3-8b" \
+  --tokenizer-path "$PWD/tools/sglang-simulator/examples/assets/tokenizer" \
+  --sim-config-path tools/sglang-simulator/examples/sim_configs/replay_simopus_budget.local.json \
+  --max-running-requests 8 --disable-overlap-schedule --page-size 1 \
+  --skip-server-warmup --device cpu --port 30000
+```
+
+Do **not** pass `--max-total-tokens`: it deliberately bypasses automatic sizing.
+The local model fixture supplies configuration without downloading weights;
+`model_revision: null` makes no Hugging Face revision claim. The SDK records its
+configuration SHA and resource digest. For an actual local Qwen3-8B checkpoint,
+use its model/tokenizer directories and set `memory_budget.model_revision` to
+that checkpoint's full commit rather than inventing a revision for the fixture.
+The checked-in example pins the SDK revision used by its resource integration
+test; the preparation command above explicitly replaces that pin for your build.
+
+`GET /server_info` reports the selected `max_total_num_tokens`. After a profiled
+request, `metrics.json.memory_budget` records the same capacity and SDK/model/
+policy/topology provenance. This is a capacity simulation, not a physical OOM
+guarantee; speculative, sliding-window and other unsupported pool layouts still
+fail explicitly.
