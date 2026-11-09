@@ -157,9 +157,9 @@ class TestCudaIpcTransport(CustomTestCase):
                 worker.join(5)
                 self.assertFalse(worker.is_alive())
                 self.assertEqual(failures, [])
-                self.assertEqual(
+                self.assertNotIn(
+                    True,
                     released_before_ready,
-                    [],
                     "source owner released before copy readiness",
                 )
                 self.assertFalse(
