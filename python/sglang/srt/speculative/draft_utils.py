@@ -438,9 +438,21 @@ class DraftBackendFactory:
                 DeepseekV4AscendMultiStepDraftBackend,
             )
 
+            backend_cls = DeepseekV4AscendMultiStepDraftBackend
+            if (
+                getattr(
+                    self.draft_model_runner.model_config.hf_config, "model_type", None
+                )
+                == "deepseek_v41"
+            ):
+                from sglang.srt.hardware_backend.npu.attention.ascend_dsv41_backend import (
+                    DeepseekV41AscendMultiStepDraftBackend,
+                )
+
+                backend_cls = DeepseekV41AscendMultiStepDraftBackend
             return (
                 "dsv4",
-                DeepseekV4AscendMultiStepDraftBackend(
+                backend_cls(
                     self.draft_model_runner, self.topk, self.speculative_num_steps
                 ),
             )

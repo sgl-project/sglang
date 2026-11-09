@@ -41,8 +41,44 @@ class NPUSwigluWithLimit(BaseActivation):
         return (F.silu(gate) * up).to(hidden_states.dtype), None
 
 
+def _clipped_swiglu_quant(
+    hidden_states: torch.Tensor,
+    limit: float,
+    group_list: Optional[torch.Tensor] = None,
+    group_list_type: int = 1,
+):
+    """A3 DSV4 W8A8: clip before SiLU, then quantize each row for GMM2."""
+    if group_list is not None:
+        if group_list_type not in (0, 1):
+            raise ValueError("group_list_type must be cumulative (0) or counts (1)")
+        counts = group_list
+        if group_list_type == 0:
+            counts = torch.diff(group_list, prepend=group_list.new_zeros(1))
+        if hidden_states.ndim == 3:
+            # Expert-major fixed-capacity buffers used by low-latency dispatch.
+            rows = torch.arange(hidden_states.shape[1], device=hidden_states.device)
+            valid = rows[None, :] < counts[:, None]
+        else:
+            rows = torch.arange(hidden_states.shape[0], device=hidden_states.device)
+            valid = rows < counts.sum()
+        # Grouped matmul does not initialize unused capacity. Mask before SiLU
+        # and reduction, so stale NaNs cannot leak into graph-padded outputs.
+        hidden_states = hidden_states.masked_fill(~valid.unsqueeze(-1), 0)
+    gate, up = hidden_states.float().chunk(2, dim=-1)
+    values = F.silu(gate.clamp(max=limit)) * up.clamp(min=-limit, max=limit)
+    scale = (values.abs().amax(-1) / 127.0).clamp_min(1e-30)
+    # Same nearest-integer convention as the existing DeepEP swiglu_quant.
+    quantized = torch.floor(values / scale.unsqueeze(-1) + 0.5).clamp(-128, 127)
+    return quantized.to(torch.int8), scale
+
+
 class NPUSwigluQuant(BaseActivation):
+    def __init__(self, swiglu_limit: Optional[float] = None):
+        self.swiglu_limit = swiglu_limit
+
     def _apply_activation(self, hidden_states: torch.Tensor):
+        if self.swiglu_limit is not None:
+            return _clipped_swiglu_quant(hidden_states, self.swiglu_limit)
         hidden_states, swiglu_out_scale = torch.ops.npu.npu_dequant_swiglu_quant(
             hidden_states,
             quant_mode=1,
@@ -87,11 +123,16 @@ class NPUSwigluDeepEPKernel(BaseActivation):
         need_quant: bool = True,
         alpha: Optional[float] = None,
         limit: Optional[float] = None,
+        swiglu_limit: Optional[float] = None,
     ):
         self.need_quant = need_quant
         self.alpha = alpha
         self.limit = limit
+        self.swiglu_limit = swiglu_limit
         self._use_oai = alpha is not None and limit is not None
+        if swiglu_limit is not None:
+            assert need_quant and not self._use_oai
+            return
         if self._use_oai:
             from sgl_kernel_npu.activation.swiglu_oai_quant import (
                 swiglu_oai_quant,
@@ -109,6 +150,10 @@ class NPUSwigluDeepEPKernel(BaseActivation):
         group_list: torch.Tensor,
         group_list_type: int,
     ):
+        if self.swiglu_limit is not None:
+            return _clipped_swiglu_quant(
+                hidden_states, self.swiglu_limit, group_list, group_list_type
+            )
         if self._use_oai:
             hidden_states, per_token_scale = self._kernel(
                 hidden_states,
