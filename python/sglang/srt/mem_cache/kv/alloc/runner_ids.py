@@ -151,6 +151,10 @@ class RunnerIds:
         # the pool does (`_call_spaces`): only an NPU DCP target's plan
         # localizes its writes.
         self._spaces: Dict[str, IdSpace] = {}
+        # The sub-pool playing each attention role this runner's pool names
+        # by role: the one place a role becomes a sub-pool name. Id spaces are
+        # keyed by sub-pool name only.
+        self._role_sub_pools: Dict[str, str] = {}
         self._call_spaces: Optional[Dict[str, IdSpace]] = None
         if self.is_translating:
             if is_cp_sharded_padded():
@@ -159,6 +163,12 @@ class RunnerIds:
                     "A sharded --cp-kv-layout does not support --enable-unified-memory."
                 )
             alloc = token_to_kv_pool_allocator
+            # A target's and a fused draft's pool both name the sub-pool
+            # playing the sliding-window role: the target's window, or the
+            # sub-pool a draft's window layers live in.
+            window = token_to_kv_pool.layer_router.sub_pool(IdSpaceKind.SLIDING_WINDOW)
+            if window is not None:
+                self._role_sub_pools[IdSpaceKind.SLIDING_WINDOW] = window.name
             self._capture_page_size = alloc.page_size
             self._translate_full = alloc.translate_kv_loc
             # DCP read ids stay WIDENED to the consumer: selecting this rank's
@@ -264,18 +274,24 @@ class RunnerIds:
             else None
         )
 
+    def sub_pool_name(self, kind: str) -> str:
+        """The sub-pool ``kind`` names: a role (the window storage of a backend
+        with one window rail) resolved to the sub-pool playing it, a sub-pool
+        name as it is."""
+        return self._role_sub_pools.get(kind, kind)
+
     def space(self, kind: str) -> Optional[IdSpace]:
-        """How this runner's ``kind`` sub-pool (a kind or a sub-pool name)
+        """How this runner's ``kind`` sub-pool (a role or a sub-pool name)
         names the iteration's slots, or None when its pool has no such
         sub-pool."""
-        return self._spaces.get(kind)
+        return self._spaces.get(self.sub_pool_name(kind))
 
     def ids_in(self, kind: str, virtual_ids: torch.Tensor) -> torch.Tensor:
         """``virtual_ids`` as this runner's ``kind`` sub-pool indexes them, for
         a consumer outside an iteration's plan (a static pool's per-call read,
         a transfer). Reads inside an iteration take the plan's tables."""
         spaces = self._spaces if self._call_spaces is None else self._call_spaces
-        return spaces[kind].ids(virtual_ids)
+        return spaces[self.sub_pool_name(kind)].ids(virtual_ids)
 
     @functools.cached_property
     def _state_spaces(self) -> Dict[str, IdSpace]:
@@ -299,7 +315,7 @@ class RunnerIds:
         """
         return (
             IdSpaceKind.SLIDING_WINDOW
-            if IdSpaceKind.SLIDING_WINDOW in self._spaces
+            if self.space(IdSpaceKind.SLIDING_WINDOW) is not None
             else IdSpaceKind.FULL
         )
 
@@ -529,7 +545,7 @@ class RunnerIds:
     # -- readers ---------------------------------------------------------------
 
     def _reads_translated(self, kind: IdSpaceKind) -> bool:
-        space = self._spaces.get(kind)
+        space = self.space(kind)
         return space is not None and space.read_v2p is not None
 
     def read_source(

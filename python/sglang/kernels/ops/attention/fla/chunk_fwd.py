@@ -12,6 +12,7 @@ from sglang.kernels.ops.attention.fla.utils import (
     is_tf32_supported,
 )
 from sglang.kernels.ops.attention.fla.wy_fast import recompute_w_u_fwd
+from sglang.srt.utils import use_gfx115_kernels
 
 # TF32 for the block-merge dot products (16x16 matmuls) is safe and ~2x faster on SM90.
 # The numerically sensitive forward-substitution uses scalar ops, not tl.dot.
@@ -53,6 +54,7 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
     BK: tl.constexpr,
     USE_G: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    HEAD_MAJOR: tl.constexpr = False,
 ):
     """
     Fused kernel: compute beta * K @ K^T (lower triangular) + solve_tril (I+A)^{-1} in one pass.
@@ -67,7 +69,12 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
     4. Block merge to get full (I+A)^{-1}
     5. Write result to A (output)
     """
-    i_t, i_bh = tl.program_id(0).to(tl.int64), tl.program_id(1).to(tl.int64)
+    # HEAD_MAJOR: heads vary fastest across the grid, so the programs running at once read
+    # the same token rows ([T, H, D] puts each head's row of a chunk 4 KB apart)
+    if HEAD_MAJOR:
+        i_bh, i_t = tl.program_id(0).to(tl.int64), tl.program_id(1).to(tl.int64)
+    else:
+        i_t, i_bh = tl.program_id(0).to(tl.int64), tl.program_id(1).to(tl.int64)
     i_b, i_h = i_bh // H, i_bh % H
 
     if IS_VARLEN:
@@ -418,7 +425,11 @@ def chunk_gated_delta_rule_fwd_intra(
 
     # Step 1: fused kkt + solve_tril
     A = torch.zeros(B, T, H, BT, device=k.device, dtype=k.dtype)
-    chunk_gated_delta_rule_fwd_kkt_solve_kernel[(NT, B * H)](
+    head_major = use_gfx115_kernels()
+    chunk_gated_delta_rule_fwd_kkt_solve_kernel[
+        (B * H, NT) if head_major else (NT, B * H)
+    ](
+        HEAD_MAJOR=head_major,
         k=k,
         g=g,
         beta=beta,
