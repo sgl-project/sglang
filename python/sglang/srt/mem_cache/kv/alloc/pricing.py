@@ -46,11 +46,25 @@ class BandSnapshot(msgspec.Struct, frozen=True, gc=False):
     num_virtual_pages: int
     low_page: int = 0  # float only
     high_page: int = 0  # float only
+    # Pages ``[first, end)`` holding every page that cannot move (a load
+    # reservation); the band's extent must keep covering them. None when there
+    # is none.
+    fixed: Optional[Tuple[int, int]] = None
+    # Pages pending until their step is processed: counted in `holes` (a take
+    # uses them), yet their bytes stay the band's until they are settled.
+    pending: int = 0
 
     @property
     def transparent(self) -> bool:
-        """An empty float: its neighbours' frontier walks see through it."""
-        return self.grow == "float" and self.live == 0
+        """An empty float, none of its pages fixed or pending until their step
+        is processed: its neighbours' frontier walks see through it. A fixed or
+        pending page keeps a float's span over it."""
+        return (
+            self.grow == "float"
+            and self.live == 0
+            and self.fixed is None
+            and self.pending == 0
+        )
 
     @property
     def drains(self) -> bool:
@@ -87,7 +101,7 @@ class ChainSnapshot(msgspec.Struct, frozen=True, gc=False):
         bands = self.bands
         for i in range(self.positions[name] - 1, -1, -1):
             band = bands[i]
-            if band.live or band.grow != "float":
+            if not band.transparent:
                 return band.high_byte
         return 0
 
@@ -96,7 +110,7 @@ class ChainSnapshot(msgspec.Struct, frozen=True, gc=False):
         bands = self.bands
         for i in range(self.positions[name] + 1, len(bands)):
             band = bands[i]
-            if band.live or band.grow != "float":
+            if not band.transparent:
                 return band.low_byte
         return self.total_bytes
 
@@ -122,7 +136,9 @@ def snapshot_band(band: Band) -> BandSnapshot:
         band.min_page_index,
         band.lazy_compaction,
         band.moves_blocked(),
-        band._free_phys_pages.numel(),
+        # Holes, and pages pending until their step is processed: a take reaches
+        # those after it settles them (`Band.settle_pending`).
+        band._reusable_pages(),
         # `allocated_count() // page_size`: lazy ends count live pages apart
         # from the holes and pending pages inside their span.
         band.live_page_count if band.lazy_compaction else span,
@@ -134,6 +150,8 @@ def snapshot_band(band: Band) -> BandSnapshot:
         band.ids.num_virtual_ids,
         band.low_wm_page if floats else 0,
         band.high_wm_page if floats else 0,
+        band.fixed_extent(),
+        band._pending_until_retire_pages,
     )
 
 
@@ -631,3 +649,264 @@ def float_byte_shortfall(
     sink_bytes = min(band.min_page * band.page_bytes for band in (fa, sa, ma))
     required = num_tokens // snap.page_size * (fa.page_bytes + sa.page_bytes)
     return max(0, required + live_bytes + sink_bytes - snap.total_bytes)
+
+
+def reclaimed_snapshot(
+    snapshot: ChainSnapshot, reclaim_pages: Dict[str, int], *, empty_pool: bool = False
+) -> ChainSnapshot:
+    """Conservative geometry after reclaim, without guessing where holes lie.
+
+    Unblocked ends can realize their compacted frontiers by an urgent flush.
+    Pinned ends retain their spans. Partial float frees remain holes in place;
+    empty floats become transparent unless a page of theirs is fixed, which
+    keeps the span as holes. No live float relocation is credited.
+    """
+    bands = []
+    for b in snapshot.bands:
+        reclaimed = (
+            b.live if empty_pool else min(b.live, max(0, reclaim_pages.get(b.name, 0)))
+        )
+        live = b.live - reclaimed
+        low, high, span = b.low_byte, b.high_byte, b.span
+        holes, pending = b.holes + reclaimed, b.pending
+        # A float's fixed page keeps its span, as an end's does. Recovery
+        # settles every pending page first: a float left with no live page
+        # parks, and an unblocked end's urgent flush absorbs them.
+        empties = b.fixed is None if b.grow == "float" else not b.blocked
+        if empty_pool or (not live and empties):
+            span = holes = pending = 0
+            low = high = (
+                b.num_pages if b.grow == "down" else b.min_page
+            ) * b.page_bytes
+        elif b.grow != "float" and not b.blocked:
+            span, holes, pending = live, 0, 0
+            if b.grow == "up":
+                high = (b.min_page + live) * b.page_bytes
+            else:
+                low = (b.num_pages - live) * b.page_bytes
+        bands.append(
+            msgspec.structs.replace(
+                b,
+                live=live,
+                span=span,
+                holes=holes,
+                pending=pending,
+                low_byte=low,
+                high_byte=high,
+                free_virtual_pages=(
+                    b.num_virtual_pages - b.min_page
+                    if empty_pool
+                    else b.free_virtual_pages + reclaimed
+                ),
+                # An empty pool's floats hold nothing to keep in place.
+                fixed=None if empty_pool and b.grow == "float" else b.fixed,
+            )
+        )
+    return msgspec.structs.replace(snapshot, bands=tuple(bands))
+
+
+class PhysicalTake(msgspec.Struct, frozen=True, gc=False, kw_only=True):
+    """A holes-first take, with an explicit extension and its source geometry."""
+
+    pages: int
+    holes: int
+    live: int
+    low_byte: int
+    high_byte: int
+    fresh: Optional[Tuple[int, int]] = None
+
+    def prefix(self, pages: int, *, page_bytes: int) -> PhysicalTake:
+        """Consume part of this take while staying inside its certified span."""
+        if not 0 <= pages <= self.pages:
+            raise ValueError("a physical take prefix exceeds its reservation")
+        fresh = None
+        if self.fresh is not None:
+            start, end = self.fresh
+            reuse = self.pages - (end - start)
+            extension = max(0, pages - reuse)
+            if extension:
+                # Low-side growth must remain adjacent to the live span.
+                fresh = (
+                    (end - extension, end)
+                    if end * page_bytes == self.low_byte
+                    else (start, start + extension)
+                )
+        return msgspec.structs.replace(self, pages=pages, fresh=fresh)
+
+
+class NoReliefPlan(msgspec.Struct, frozen=True, gc=False):
+    takes: Dict[str, PhysicalTake]
+
+
+def no_relief_plan(
+    snapshot: ChainSnapshot, demands: Tuple[Tuple[str, int], ...]
+) -> Optional[NoReliefPlan]:
+    """Place takes without moving live pages or releasing boundary holes.
+
+    A live float may extend on either side; empty floats pack in chain order
+    between fixed spans. Of the feasible choices for a fixed span, the lowest
+    high frontier dominates every other choice for the remaining bands. The
+    walk is linear in the number of bands and feasibility is downward closed
+    in demand. Allocation must use the returned extensions, not its usual
+    midpoint/roomier-side heuristic.
+    """
+    counts = dict(demands)
+    if len(counts) != len(demands) or any(
+        name not in snapshot.positions for name in counts
+    ):
+        raise ValueError("physical demand must name distinct chain bands")
+    takes = {}
+    pending = []
+    frontier = 0
+
+    def take(b, pages, fresh=None):
+        return PhysicalTake(
+            pages=pages,
+            holes=b.holes,
+            live=b.live,
+            low_byte=b.low_byte,
+            high_byte=b.high_byte,
+            fresh=fresh,
+        )
+
+    def pack_empty(high):
+        edge, packed = frontier, {}
+        for b, pages in pending:
+            start = max(b.min_page, -(-edge // b.page_bytes))
+            end = start + pages
+            if end > b.num_pages or end * b.page_bytes > high:
+                return None
+            packed[b.name] = take(b, pages, (start, end))
+            edge = end * b.page_bytes
+        return packed
+
+    for b in snapshot.bands:
+        pages = counts.get(b.name, 0)
+        if pages < 0 or b.live + pages > b.num_pages - b.min_page:
+            return None
+        if b.transparent:
+            if b.holes:
+                raise ValueError("an empty float must have released its hole span")
+            if pages:
+                pending.append((b, pages))
+            else:
+                takes[b.name] = take(b, 0)
+            continue
+        holes = b.holes if b.lazy or b.grow == "float" else 0
+        extension = max(0, pages - holes)
+        delta = extension * b.page_bytes
+        if b.grow == "up":
+            choices = ((b.low_byte, b.high_byte + delta),)
+        elif b.grow == "down":
+            choices = ((b.low_byte - delta, b.high_byte),)
+        elif extension:
+            choices = (
+                (b.low_byte - delta, b.high_byte),
+                (b.low_byte, b.high_byte + delta),
+            )
+        else:
+            choices = ((b.low_byte, b.high_byte),)
+        for low, high in choices:
+            if low < b.min_page * b.page_bytes or high > b.num_pages * b.page_bytes:
+                continue
+            if low < frontier:
+                continue
+            packed = pack_empty(low)
+            if packed is None:
+                continue
+            fresh = None
+            if extension:
+                fresh = (
+                    (low // b.page_bytes, b.low_byte // b.page_bytes)
+                    if low < b.low_byte
+                    else (b.high_byte // b.page_bytes, high // b.page_bytes)
+                )
+            takes.update(packed)
+            takes[b.name] = take(b, pages, fresh)
+            frontier = high
+            pending = []
+            break
+        else:
+            return None
+    packed = pack_empty(snapshot.total_bytes)
+    if packed is None:
+        return None
+    takes.update(packed)
+    return NoReliefPlan(takes)
+
+
+def sequential_fit(
+    snapshot: ChainSnapshot, demands: Tuple[Tuple[str, int], ...]
+) -> bool:
+    """Price physical takes in their actual order, without relocation credit.
+
+    Empty floats choose the midpoint of their current neighbours, so changing
+    an earlier demand can change a later float's placement. This predicate is
+    exact for the no-relief takes, but is not assumed monotone in total demand.
+    """
+    bands = snapshot.bands
+    lows = [b.low_byte for b in bands]
+    highs = [b.high_byte for b in bands]
+    live = [b.live for b in bands]
+    # Opaque: live pages, or pages pending until their step is processed.
+    occupied = [b.live + b.pending for b in bands]
+    for name, pages in demands:
+        if pages < 0:
+            return False
+        if not pages:
+            continue
+        i = snapshot.index(name)
+        b = bands[i]
+        holes = b.holes if b.lazy or b.grow == "float" else 0
+        extension = max(0, pages - holes)
+        if b.live + pages > b.num_pages - b.min_page:
+            return False
+        low = next(
+            (
+                highs[j]
+                for j in range(i - 1, -1, -1)
+                if occupied[j] or bands[j].grow != "float"
+            ),
+            0,
+        )
+        high = next(
+            (
+                lows[j]
+                for j in range(i + 1, len(bands))
+                if occupied[j] or bands[j].grow != "float"
+            ),
+            snapshot.total_bytes,
+        )
+        lo = max(b.min_page, -(-low // b.page_bytes))
+        hi = min(b.num_pages, high // b.page_bytes)
+        if extension:
+            if b.grow == "up":
+                end = highs[i] // b.page_bytes + extension
+                if end > hi:
+                    return False
+                highs[i] = end * b.page_bytes
+            elif b.grow == "down":
+                start = lows[i] // b.page_bytes - extension
+                if start < lo:
+                    return False
+                lows[i] = start * b.page_bytes
+            elif not occupied[i]:
+                if extension > hi - lo:
+                    return False
+                start = lo + (hi - lo - extension) // 2
+                lows[i], highs[i] = (
+                    start * b.page_bytes,
+                    (start + extension) * b.page_bytes,
+                )
+            else:
+                start, end = lows[i] // b.page_bytes, highs[i] // b.page_bytes
+                below, above = start - lo, hi - end
+                if extension > max(below, above):
+                    return False
+                if above >= below:
+                    highs[i] += extension * b.page_bytes
+                else:
+                    lows[i] -= extension * b.page_bytes
+        live[i] += pages
+        occupied[i] += pages
+    return True

@@ -26,6 +26,7 @@ dependencies = [
   "anthropic>=0.20.0",
   "apache-tvm-ffi==0.1.11",
   "av==16.1.0 ; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'armv7l')",
+  "blake3>=1.0.0",
   "blobfile==3.0.0",
   "build",
   "compressed-tensors==0.18.0",
@@ -37,13 +38,11 @@ dependencies = [
   "easydict",  # Required by remote model code (e.g. DeepSeek-OCR) loaded via trust_remote_code; validated by transformers 5.4+ check_imports
   "einops",
   "fastapi",
-  "flash-attn-4>=4.0.0b18",
-  "flashinfer_python[cu13]==0.7.2", # keep it aligned with jit-cache version in Dockerfile
+  "flashinfer_python[cu13]==0.7.3", # keep it aligned with jit-cache version in Dockerfile
   "gguf",
-  "humming-kernels[cu13]==0.1.12",
+  "humming-kernels[cu13]==0.1.18",
   "interegular",
   "IPython",
-  "kernels>=0.14.1,<0.15",
   "llguidance>=1.7.6,<2.0.0",
   "mistral_common>=1.11.5",
   "modelscope",
@@ -61,7 +60,8 @@ dependencies = [
   "outlines==0.1.11",
   "packaging",
   "partial_json_parser",
-  "pillow",
+  # The Rust image pipeline (dynamo-multimodal) reproduces Pillow 12.x bicubic.
+  "pillow<13",
   "prometheus-client>=0.20.0",
   "psutil",
   "py-spy",
@@ -77,8 +77,8 @@ dependencies = [
   "sentencepiece==0.2.1",  # 0.2.2 rejects null pieces in InternVL tokenizers.
   "setproctitle",
   "sgl-deep-ep==0.1.2.post1",
-  "sgl-deep-gemm==0.2.3.post2",
-  "sgl-flash-mla==1.0.0",
+  "sgl-deep-gemm==0.2.6",
+  "sgl-flash-mla==1.0.2",
   "sglang-kernel==0.4.10",
   "smg-grpc-servicer>=0.9.0",
   "soundfile==0.13.1",
@@ -219,6 +219,7 @@ killall_sglang = "sglang.cli.killall:main"
 
 [tool.setuptools.package-data]
 "sglang" = [
+  "cli/_commands/*.json",
   "srt/**/*",
   "kernels/**/*",
   "multimodal_gen/apps/realtime_webui/**/*"
@@ -269,6 +270,3 @@ fallback_version = "0.0.0.dev0"
 # ([package.metadata.sglang] python-module in each crate).
 # This CUDA pyproject builds all of them; platform variants restrict the set
 # via [tool.sglang] rust-extensions (see pyproject_other.toml).
-
-[tool.kernels.dependencies]
-"kernels-community/sgl-flash-attn3" = 1

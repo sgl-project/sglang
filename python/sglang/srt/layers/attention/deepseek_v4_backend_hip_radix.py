@@ -105,7 +105,8 @@ from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_ver
 from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.dsv41_request_window import window_layout
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
@@ -115,6 +116,8 @@ from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
 from sglang.srt.utils import ceil_align, is_gfx95_supported
 
 if TYPE_CHECKING:
+    from flash_mla.flash_mla_interface import FlashMLASchedMeta
+
     from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
         FP4DecodeWorkspace,
         FP4KWriteMetadata,
@@ -122,7 +125,6 @@ if TYPE_CHECKING:
         FP4RowgroupDecodeWorkspace,
         FP4RowgroupPrefillWorkspace,
     )
-    from sglang.kernels.ops.attention.flash_mla_interface import FlashMLASchedMeta
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
 
@@ -1020,7 +1022,10 @@ class DeepseekV4HipRadixBackend(
         # output mode of the fp8 verify: deepseek_v4 fuses the fp8 wo_a quant into it
         self._fp8_verify_epi = (
             "invrope_mxfp8"
-            if any(getattr(m, "wo_a_fp8", False) for m in model_runner.model.modules())
+            if any(
+                getattr(m, "wo_a_fp8_block128", False)
+                for m in model_runner.model.modules()
+            )
             else "bf16"
         )
         self._fp8_split_kv_hint: Dict[int, int] = {}
@@ -1042,7 +1047,6 @@ class DeepseekV4HipRadixBackend(
             self.enable_deepseek_v4_fp4_indexer
             and self.speculative_num_steps == 0
             and self.has_c4
-            and envs.SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP.get()
         ):
             from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
                 aiter_has_fp4_rowgroup,
@@ -1059,10 +1063,9 @@ class DeepseekV4HipRadixBackend(
                     self._fp4_c4_rowgroup_columns,
                 )
             else:
-                logger.warning(
-                    "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP is set but the installed AITER "
-                    "has no row-group FP4 MQA logits kernel (#6145); keeping the "
-                    "schedule-based C4 indexer."
+                logger.info(
+                    "DSv4 C4 indexer: the installed AITER has no row-group FP4 MQA "
+                    "logits kernel (#6145); using the schedule-based C4 indexer."
                 )
         self.speculative_step_id = speculative_step_id
         self.forward_metadata: Union[
