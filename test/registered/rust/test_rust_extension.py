@@ -599,6 +599,23 @@ crate-type = ["cdylib"]
                 )
         self.assertNotIn(module_name, sys.modules)
 
+    def test_command_version_times_out(self):
+        with (
+            mock.patch.object(
+                rust_extension.subprocess,
+                "run",
+                side_effect=subprocess.TimeoutExpired(cmd="cargo", timeout=60),
+            ) as run,
+            self.assertRaisesRegex(RuntimeError, "failed to query the Rust toolchain"),
+        ):
+            rust_extension._command_version(
+                "cargo", "--version", "--verbose", cwd=Path(".")
+            )
+        self.assertEqual(
+            run.call_args.kwargs["timeout"],
+            rust_extension._TOOLCHAIN_PROBE_TIMEOUT_SECONDS,
+        )
+
     def test_checked_in_crates_are_discovered_from_wheel_metadata(self):
         # No crate reads `proto/` at build time: the generated bindings are
         # checked in under rust/sglang-api-types and

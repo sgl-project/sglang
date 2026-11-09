@@ -44,6 +44,10 @@ _BUILD_ENVIRONMENT_VARIABLES = (
 
 _RUST_WORKSPACE = Path(__file__).resolve().parents[4] / "rust"
 
+# A wedged toolchain probe must not block startup forever; the probe is only
+# used to fingerprint the build, so a timeout is handled like a missing toolchain.
+_TOOLCHAIN_PROBE_TIMEOUT_SECONDS = 60
+
 
 @dataclass(frozen=True)
 class _CrateSpec:
@@ -337,8 +341,13 @@ def _command_version(command: str, *arguments: str, cwd: Path) -> str:
             capture_output=True,
             text=True,
             cwd=cwd,
+            timeout=_TOOLCHAIN_PROBE_TIMEOUT_SECONDS,
         )
-    except (OSError, subprocess.CalledProcessError) as exc:
+    except (
+        OSError,
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+    ) as exc:
         raise RuntimeError(
             f"failed to query the Rust toolchain with `{command} {' '.join(arguments)}`"
         ) from exc
