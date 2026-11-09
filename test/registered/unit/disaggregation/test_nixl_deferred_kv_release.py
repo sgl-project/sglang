@@ -26,7 +26,7 @@ from sglang.srt.disaggregation.nixl.conn import NixlKVManager
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 ROOM = 11
 DECODE_IP = "10.0.0.3"
@@ -37,6 +37,7 @@ def _manager(
     *, enabled: bool = True, status: KVPoll | None = KVPoll.WaitingForInput
 ) -> NixlKVManager:
     manager = NixlKVManager.__new__(NixlKVManager)
+    manager.customized_info_enabled = False
     manager.enable_deferred_decode_kv_release = enabled
     manager._deferred_ack_targets = {}
     manager._deferred_ack_poisoned_rooms = set()
@@ -58,7 +59,6 @@ def _chunk() -> TransferKVChunk:
         prefill_kv_indices=np.array([1], dtype=np.int32),
         index_slice=slice(0, 1),
         is_last_chunk=False,
-        chunk_id=0,
         prefill_aux_index=None,
         state_indices=None,
     )
@@ -166,7 +166,12 @@ class TestNixlAbortNotification(
         manager.transfer_source_rank = 0
         manager.src_mem_kind = "VRAM"
         manager._num_slots_src = 4
-        manager.kv_args = SimpleNamespace(kv_data_ptrs=[0x1000], kv_item_lens=[16])
+        manager.kv_args = SimpleNamespace(
+            kv_data_ptrs=[0x1000],
+            kv_item_lens=[16],
+            aux_data_ptrs=[0x3000],
+            aux_item_lens=[64],
+        )
         manager.prep_handles = {"": "src-prep"}
         manager.decode_kv_args_table = {}
         manager.transfer_infos = {ROOM: {}}
@@ -179,6 +184,8 @@ class TestNixlAbortNotification(
                 kv_xfer_segments=None,
                 dst_homogeneous_mem_kind="VRAM",
                 dst_kv_ptrs=[0x2000],
+                dst_aux_ptrs=[0x4000],
+                dst_aux_item_lens=None,
                 dst_num_slots=None,
                 gpu_id=0,
             )

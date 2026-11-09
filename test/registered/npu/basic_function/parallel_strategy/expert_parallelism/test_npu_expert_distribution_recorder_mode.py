@@ -30,6 +30,7 @@ class TestExpertDistributionRecorderModeStatic(CustomTestCase):
     """
 
     expert_distribution_recorder_mode = "stat"
+    enable_eplb = True
 
     path = "/tmp/pt"
 
@@ -50,7 +51,7 @@ class TestExpertDistributionRecorderModeStatic(CustomTestCase):
                 "2",
                 "--expert-parallel-size",
                 "2",
-                "--enable-eplb",
+                *(["--enable-eplb"] if cls.enable_eplb else []),
                 "--moe-a2a-backend",
                 "deepep",
                 "--deepep-mode",
@@ -124,10 +125,12 @@ class TestExpertDistributionRecorderModeStatApprox(
 
 class TestExpertDistributionRecorderPerPass(TestExpertDistributionRecorderModeStatic):
     expert_distribution_recorder_mode = "per_pass"
+    enable_eplb = False
 
 
 class TestExpertDistributionRecorderPerToken(TestExpertDistributionRecorderModeStatic):
     expert_distribution_recorder_mode = "per_token"
+    enable_eplb = False
 
 
 if __name__ == "__main__":
