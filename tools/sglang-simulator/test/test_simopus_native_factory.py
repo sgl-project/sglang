@@ -56,8 +56,9 @@ def test_invalid_factory_inputs_refuse_before_loading_assets(tmp_path, changes, 
     assert error.value.code == code
 
 
+@pytest.mark.parametrize("cpu_detail", ["on", "off"])
 def test_factory_loads_real_native_assets_and_public_umd(
-    public_adapter, tmp_path, monkeypatch
+    public_adapter, tmp_path, monkeypatch, cpu_detail
 ):
     import simopus
     import simopus.sdk as sdk
@@ -67,6 +68,9 @@ def test_factory_loads_real_native_assets_and_public_umd(
     )
 
     adapter, database, options = public_adapter
+    if cpu_detail == "off":
+        monkeypatch.setenv("SGLANG_SIMULATOR_EVIDENCE_LEVEL", "metrics")
+        monkeypatch.setenv("SGLANG_SIMULATOR_METRICS_CPU_DETAIL", "off")
     args = inputs(tmp_path)
     args["config"].tp_size = adapter.native_source_policy.tp_size
     args["provider_revision"] = simopus.__revision__
@@ -103,13 +107,36 @@ def test_factory_loads_real_native_assets_and_public_umd(
             model_ref="explicit CPU progress double; not source-law admission",
         ),
     )
+    load_assets = sdk.load_native_region_assets
+    asset_loads = []
+
+    def load_once(*args, **kwargs):
+        if asset_loads:
+            raise FileExistsError("synthetic exclusive initialization receipt exists")
+        assets = load_assets(*args, **kwargs)
+        asset_loads.append(assets)
+        return assets
+
+    monkeypatch.setattr(sdk, "load_native_region_assets", load_once)
     result = SimOpusDSparkTimePredictor(**args)
+    assert len(asset_loads) == 1
+    costs = result.dspark_runtime.session.cost_model
+    assert costs.assets is asset_loads[0]
+    assert costs.model._native_region_assets is costs.assets
     assert (
         result.dspark_runtime.session.cost_model.assets.execution_profile_id
         == options["native_segment_profile_id"]
     )
     assert result.dspark_runtime._draft_buffer_capacity == 0
     assert result.get_metrics()["simopus"]["committed_steps"] == 0
+    assert result.dspark_runtime.reference_driver is not None
+    if cpu_detail == "off":
+        assert (
+            result.dspark_runtime.session.cost_model.get_cost_metrics()[
+                "evaluated_evidence"
+            ]["full_native_cost_ledger_available"]
+            is False
+        )
     with pytest.raises(PredictorError, match="worker stage"):
         result.predict_infer_time(None)
     result.reset_metrics()

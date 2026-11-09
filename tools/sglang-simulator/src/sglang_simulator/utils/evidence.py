@@ -14,6 +14,16 @@ def evidence_level():
     return value
 
 
+def metrics_cpu_detail_enabled():
+    """Keep legacy evidence work unless an explicit metrics-only opt-in disables it."""
+    value = os.getenv("SGLANG_SIMULATOR_METRICS_CPU_DETAIL", "on")
+    if value not in {"on", "off"}:
+        raise ValueError("SGLANG_SIMULATOR_METRICS_CPU_DETAIL must be on or off")
+    if value == "off" and evidence_level() != "metrics":
+        raise ValueError("metrics CPU detail off requires metrics evidence retention")
+    return value == "on"
+
+
 class ZstdCodec:
     """Small reusable contexts; each encoded row is a complete checksummed frame."""
 

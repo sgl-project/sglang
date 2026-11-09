@@ -129,4 +129,5 @@ jobs:
           OMP_NUM_THREADS=2 python3 -m pytest -q \
             tools/sglang-simulator/test/test_dspark_*.py \
             tools/sglang-simulator/test/test_native_*.py \
-            tools/sglang-simulator/test/test_simopus_native_factory.py
+            tools/sglang-simulator/test/test_simopus_native_factory.py \
+            tools/sglang-simulator/test/test_metrics_cpu_detail.py

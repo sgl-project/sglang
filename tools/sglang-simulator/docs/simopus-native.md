@@ -36,9 +36,11 @@ Unavailable cold cost cells remain explicit data gaps.
 
 ## Configuration
 
-Install SimOpus with its native prepared-region public API; the integration was
-checked against main `284f19f736cda6275870dc1b032ff850635aa01f`. Pin the
-installed revision in `provider_revision`. Use a reviewed local model config
+Install SimOpus with its native prepared-region public API. The original
+structured integration was checked against SDK commit
+`e1e0d7a2a89bcd5d1098e2807f591394c020ac21`; this historical check does not
+establish support for later optional numeric APIs. Pin the actual installed
+revision in `provider_revision`. Use a reviewed local model config
 matching the SDK's authoritative model revision, without downloading weights.
 
 The `predictor` object selects these inputs:
@@ -84,6 +86,53 @@ SDK documents. Evaluated documents remain `committed_event: false`; the separate
 event record links them to the actual committed forward ID. Costs evaluated
 before a later failure are not counted as committed worker events. An optional
 exclusive cost JSONL also preserves those failed-attempt evaluations.
+
+For a new metrics-only run, the explicit combination
+`SGLANG_SIMULATOR_EVIDENCE_LEVEL=metrics` and
+`SGLANG_SIMULATOR_METRICS_CPU_DETAIL=off` also skips construction of discarded
+iteration detail and full evaluated-cost documents. The latter flag defaults to
+`on`; existing full and metrics runs retain their evidence behavior. Setting it
+to `off` with full retention is rejected.
+
+This opt-in uses the public SDK `estimate_prepared_forward_ms` API through the
+verified SDK factory. Prepared source binding, execution-profile, supported-domain
+and leaf-cost guards still run. It changes no cost formula, request, progress
+draw, native reference event or timing conversion. It does not provide the
+structured result's post-hoc evidence-schema validation. Full native cost
+ledgers, query-source classification and cost digests are explicitly unavailable;
+their SHA256 and byte counts are `null`. Phase references use
+`simopus-metrics:<profile>:<forward>:<phase>`, an identity label rather than a cost
+digest. This mode cannot supply a full native-ledger audit or reconstruct the
+omitted records. Functional equivalence controls alone do not grant timing or
+accuracy acceptance, or establish a wall-clock speedup.
+
+### SDK contract for metrics CPU detail off
+
+The structured route requires `estimate_prepared_forward_result`. The optional
+numeric route additionally requires a callable public
+`UMDStaticModel.estimate_prepared_forward_ms` and reuses one already initialized
+model/assets pair from `load_native_region_assets` and
+`build_umd_static_model(..., native_region_assets=assets)`. Entering numeric mode
+must not load assets or construct a second pair again.
+
+The adapter retains exact model/assets type checks, numeric-API callability and
+the model's `_native_region_assets` identity check. That private identity field
+is a pinned SDK compatibility check, not a new public SDK interface. A missing
+API or an incompatible pair fails initialization with
+`provider_initialization_failed`; numeric mode does not silently fall back or
+relax source/runtime/topology guards.
+
+Software controls for both paths have also run with SDK commit
+`284f19f736cda6275870dc1b032ff850635aa01f`. This records the tested SDK identity;
+it does not relabel earlier measurements or qualify GPU timing or end-to-end
+accuracy. With that exact SDK installed, require the integration checks:
+
+```bash
+SGLANG_SIMULATOR_REQUIRE_SIMOPUS_SDK=1 python -m pytest -q \
+  tools/sglang-simulator/test/test_native_public_sdk.py \
+  tools/sglang-simulator/test/test_simopus_native_factory.py \
+  tools/sglang-simulator/test/test_metrics_cpu_detail.py
+```
 
 CPU controls include real public SDK projection, unequal ordered P/Q, real native
 result/reserve/FutureMap interfaces, result-owned accounting, FIFO and cancelled

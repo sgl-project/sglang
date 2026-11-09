@@ -7,6 +7,7 @@ Evaluated query records are deliberately distinct from committed native events.
 import gzip
 import hashlib
 import json
+import math
 from pathlib import Path
 
 from sglang_simulator.simulation.sglang.dspark import (
@@ -16,7 +17,11 @@ from sglang_simulator.simulation.sglang.dspark import (
     DSparkStepTiming,
 )
 from sglang_simulator.time_predictor.base import PredictorError
-from sglang_simulator.utils.evidence import ZstdCodec, evidence_level
+from sglang_simulator.utils.evidence import (
+    ZstdCodec,
+    evidence_level,
+    metrics_cpu_detail_enabled,
+)
 
 
 def _encoded(value):
@@ -66,9 +71,37 @@ class SimOpusNativeCostAdapter:
                 getattr(error, "code", "provider_initialization_failed"),
                 "public native SDK initialization failed",
             ) from error
-        return cls(model, assets, cost_evidence_path=cost_evidence_path)
+        if metrics_cpu_detail_enabled():
+            return cls(model, assets, cost_evidence_path=cost_evidence_path)
+        return cls.from_prepared_sdk(
+            model, assets, cost_evidence_path=cost_evidence_path
+        )
 
-    def __init__(self, model, assets, *, cost_evidence_path=None):
+    @classmethod
+    def from_prepared_sdk(cls, model, assets, *, cost_evidence_path=None):
+        """Reuse one public-factory model and its exact already-loaded assets."""
+        from simopus.sdk import NativeRegionAssets, UMDStaticModel
+
+        if (
+            type(model) is not UMDStaticModel
+            or type(assets) is not NativeRegionAssets
+            or getattr(model, "_native_region_assets", None) is not assets
+            or not callable(getattr(model, "estimate_prepared_forward_ms", None))
+        ):
+            raise PredictorError(
+                "provider_initialization_failed",
+                "metrics CPU detail off requires a public model bound to these assets",
+            )
+        return cls(
+            model,
+            assets,
+            cost_evidence_path=cost_evidence_path,
+            _numeric_forward=model.estimate_prepared_forward_ms,
+        )
+
+    def __init__(
+        self, model, assets, *, cost_evidence_path=None, _numeric_forward=None
+    ):
         self.model = model
         self.assets = assets
         # The native event driver consumes source observations, never cost options.
@@ -85,6 +118,14 @@ class SimOpusNativeCostAdapter:
         self._digest = hashlib.sha256()
         self._bytes = 0
         self._evidence_level = evidence_level()
+        self._omit_cpu_detail = not metrics_cpu_detail_enabled()
+        if self._omit_cpu_detail and not callable(_numeric_forward):
+            raise PredictorError(
+                "provider_initialization_failed",
+                "metrics CPU detail off requires public SDK factory initialization",
+            )
+        self._numeric_forward = _numeric_forward
+        self._last_metrics_phases = []
         self._requested_sink_path = (
             str(Path(cost_evidence_path).absolute())
             if cost_evidence_path is not None
@@ -209,6 +250,35 @@ class SimOpusNativeCostAdapter:
                 "execution_profile": self.assets.capture_profile,
                 "runtime": {"native_region_stage": {"phase": phase, **inputs}},
             }
+            if self._omit_cpu_detail:
+                milliseconds = self._numeric_forward(**arguments)
+                if (
+                    type(milliseconds) not in (float, int)
+                    or not math.isfinite(milliseconds)
+                    or milliseconds <= 0
+                ):
+                    raise ValueError(
+                        "prepared numeric cost must be finite and positive"
+                    )
+                cost = DSparkPhaseCost(
+                    phase,
+                    milliseconds / 1000,
+                    f"simopus-metrics:{self.assets.execution_profile_id}:"
+                    f"{step.forward_id}:{phase}",
+                )
+                self._last_metrics_phases.append((step.forward_id, phase))
+                counts = self._counts.setdefault(
+                    (phase, "not_recorded"),
+                    {
+                        "phase": phase,
+                        "source": "not_recorded",
+                        "queries": 0,
+                        "seconds": 0.0,
+                    },
+                )
+                counts["queries"] += 1
+                counts["seconds"] += cost.seconds
+                return cost
             result = self.model.estimate_prepared_forward_result(**arguments)
         except PerfDataNotAvailableError as error:
             raise PredictorError(
@@ -304,12 +374,33 @@ class SimOpusNativeCostAdapter:
 
     def predict_step(self, step):
         self.last_evaluations = []
+        self._last_metrics_phases = []
         return DSparkStepTiming(
             step.forward_id,
             tuple(self.query_phase(phase, step) for phase in step.required_phases),
         ).validate_for(step)
 
     def get_cost_metrics(self):
+        if self._omit_cpu_detail:
+            return {
+                "query_scope": "evaluated_cost_queries_not_committed_events",
+                "by_phase_source": [dict(row) for row in self._counts.values()],
+                "evaluated_evidence": {
+                    "path": None,
+                    "bytes": None,
+                    "sha256": None,
+                    "persisted": False,
+                    "write_failed": False,
+                    "retention_policy": "metrics",
+                    "cpu_detail": "off",
+                    "omitted_by_policy": True,
+                    "requested_path": self._requested_sink_path,
+                    "full_native_cost_ledger_available": False,
+                    "full_cost_digest_available": False,
+                    "cost_reference_scheme": "profile/forward/phase; not a cost digest",
+                    "query_source_classification_available": False,
+                },
+            }
         return {
             "query_scope": "evaluated_cost_queries_not_committed_events",
             "by_phase_source": [dict(row) for row in self._counts.values()],
@@ -341,6 +432,14 @@ class SimOpusNativeCostAdapter:
 
     def evaluated_evidence_for(self, step):
         """Immutable full SDK documents for the exact result being published."""
+        if self._omit_cpu_detail:
+            if tuple(self._last_metrics_phases) != tuple(
+                (step.forward_id, phase) for phase in step.required_phases
+            ):
+                raise PredictorError(
+                    "data_unavailable", "native numeric phase coverage is incomplete"
+                )
+            return ()
         if tuple(
             (row["forward_id"], row["phase"]) for row in self.last_evaluations
         ) != tuple((step.forward_id, phase) for phase in step.required_phases):

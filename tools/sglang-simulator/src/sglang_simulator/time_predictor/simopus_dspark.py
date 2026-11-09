@@ -16,6 +16,7 @@ from sglang_simulator.time_predictor.native_checkpoint import (
     _geometry,
     _require,
 )
+from sglang_simulator.utils.evidence import metrics_cpu_detail_enabled
 
 
 class SimOpusDSparkTimePredictor(InferTimePredictor):
@@ -181,9 +182,22 @@ class SimOpusDSparkTimePredictor(InferTimePredictor):
                 allow_download=False,
                 native_region_assets=assets,
             )
-            costs = SimOpusNativeCostAdapter(
-                prepared, assets, cost_evidence_path=native_cost_evidence_path
-            )
+            if metrics_cpu_detail_enabled():
+                costs = SimOpusNativeCostAdapter(
+                    prepared, assets, cost_evidence_path=native_cost_evidence_path
+                )
+            else:
+                # Reuse this public-factory pair. Asset loading can have an
+                # exclusive initialization receipt and must happen only once.
+                costs = SimOpusNativeCostAdapter.from_prepared_sdk(
+                    prepared,
+                    assets,
+                    cost_evidence_path=native_cost_evidence_path,
+                )
+                _require(
+                    costs.assets.to_dict() == assets.to_dict(),
+                    "numeric cost factory assets differ from progress source assets",
+                )
             self.dspark_runtime = DSparkNativeRuntime(
                 session=DSparkSession(costs, progress),
                 topology=DSparkTopology(config.tp_size, 1, 1),

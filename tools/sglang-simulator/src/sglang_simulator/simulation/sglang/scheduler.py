@@ -16,7 +16,10 @@ from sglang_simulator.hook import (
     validate_required_class_hooks,
 )
 from sglang_simulator.hook.utils import get_obj_from_args
-from sglang_simulator.simulation.iteration_stats import IterationStats
+from sglang_simulator.simulation.iteration_stats import (
+    IterationStats,
+    append_iteration_metrics_or_detail,
+)
 from sglang_simulator.simulation.manager import ConfigManager, Envs, StateManager
 from sglang_simulator.simulation.sglang.dspark import (
     DSparkStepResult,
@@ -899,8 +902,14 @@ class C_SchedulerHook(BaseHook):
                 def process_and_account():
                     ret = process_native_result()
                     if accounting is not None:
-                        C_SchedulerHook.ITERATION_STATS.append(
+                        append_iteration_metrics_or_detail(
+                            C_SchedulerHook.ITERATION_STATS,
                             {
+                                "forward_latency": current_inference_dur,
+                                "l2_load_latency": 0.0,
+                                "cpu_overhead": 0.0,
+                            },
+                            lambda: {
                                 "forward_mode": simulation_batch.forward_mode,
                                 "requests": simulation_batch.request_info(),
                                 "forward_latency": current_inference_dur,
@@ -911,7 +920,7 @@ class C_SchedulerHook(BaseHook):
                                 "postprocess_latency": 0.0,
                                 "cpu_overhead": 0.0,
                                 **native_event_evidence(),
-                            }
+                            },
                         )
                     consume_accounting()
                     return ret
@@ -1015,8 +1024,14 @@ class C_SchedulerHook(BaseHook):
                         # Chunked request: nothing to do
                         pass
                 # Iteration statistics
-                C_SchedulerHook.ITERATION_STATS.append(
+                append_iteration_metrics_or_detail(
+                    C_SchedulerHook.ITERATION_STATS,
                     {
+                        "forward_latency": current_inference_dur,
+                        "l2_load_latency": hicache_l2_load_dur,
+                        "cpu_overhead": cpu_overhead,
+                    },
+                    lambda: {
                         **(
                             {
                                 "forward_mode": simulation_batch.forward_mode,
@@ -1036,7 +1051,7 @@ class C_SchedulerHook(BaseHook):
                         - process_batch_result_start,
                         "cpu_overhead": cpu_overhead,
                         **native_event_evidence(),
-                    }
+                    },
                 )
             else:
                 now = time.time()

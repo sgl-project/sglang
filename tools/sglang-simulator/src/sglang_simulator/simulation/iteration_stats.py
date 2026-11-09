@@ -7,7 +7,7 @@ import tempfile
 import zlib
 from pathlib import Path
 
-from sglang_simulator.utils.evidence import ZstdCodec
+from sglang_simulator.utils.evidence import ZstdCodec, metrics_cpu_detail_enabled
 
 
 class IterationStats:
@@ -25,6 +25,7 @@ class IterationStats:
         self._output_directory = output_directory
         self.compression = compression
         self.metrics_only = metrics_only
+        self.omit_cpu_detail = not metrics_cpu_detail_enabled() and metrics_only
         self._codec = (
             ZstdCodec() if compression == "zstd" and not metrics_only else None
         )
@@ -133,3 +134,11 @@ class IterationStats:
         self._offsets.clear()
         self._metrics.clear()
         self._failed = False
+
+
+def append_iteration_metrics_or_detail(store, metrics, detail_factory):
+    """Avoid constructing unused detail only in the explicit CPU-detail-off mode."""
+    if isinstance(store, IterationStats) and store.omit_cpu_detail:
+        store.append(metrics)
+    else:
+        store.append(detail_factory())
