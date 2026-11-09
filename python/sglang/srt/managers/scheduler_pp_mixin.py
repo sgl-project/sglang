@@ -605,8 +605,8 @@ class SchedulerPPMixin:
 
     def _pp_retract_microbatches(self: Scheduler) -> None:
         """Retract the requests of every micro-batch, none of them in flight."""
+        self._retract_batches(list(zip(self.running_mbs, self.last_mbs)))
         for mb_id in range(self.pp_loop_size):
-            self._retract_batch(self.running_mbs[mb_id], self.last_mbs[mb_id])
             self.last_mbs[mb_id] = None
         self.last_batch = None
         self.cur_batch_for_debug = None

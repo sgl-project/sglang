@@ -492,19 +492,18 @@ class DllmManager:
 
     def filter_finished_reqs(self) -> None:
         """Remove finished requests from both queues."""
-        self.waiting_queue.take(lambda req: req.finished())
-        self.staging_queue = [req for req in self.staging_queue if not req.finished()]
+        self.take(lambda req: req.finished())
 
-    def leave(self, reqs: List[Req]) -> None:
-        """Drop the given requests from both queues; ones not in are ignored."""
-        self.waiting_queue.leave(reqs)
-        leaving = set(reqs)
+    def take(self, pred: Callable[[Req], bool]) -> List[Req]:
+        """Drop the requests matching `pred` from both queues and return them;
+        the staging queue is a subset of the waiting queue."""
+        taken = self.waiting_queue.take(pred)
+        leaving = set(taken)
         self.staging_queue = [req for req in self.staging_queue if req not in leaving]
+        return taken
 
     def _abort(self, recv_req: AbortReq) -> None:
-        aborted_reqs = [req for req in self.waiting_queue if recv_req.matches(req.rid)]
-        self.leave(aborted_reqs)
-        for req in aborted_reqs:
+        for req in self.take(lambda req: recv_req.matches(req.rid)):
             self._abort_one(req)
 
     def init_next_round(self) -> None:

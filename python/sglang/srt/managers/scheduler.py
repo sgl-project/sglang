@@ -6255,44 +6255,41 @@ class Scheduler(
             self._drain_mlx_pending_jobs()
         # The pause starts once the in-flight result has drained.
         self.pause_state.start_window()
-        self._retract_batch(self.running_batch, self.last_batch)
+        self._retract_batches([(self.running_batch, self.last_batch)])
         self.last_batch = None
         self.cur_batch_for_debug = None
         self._publish_paused_state()
 
-    def _retract_batch(
-        self, running_batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
+    def _retract_batches(
+        self, batches: List[Tuple[ScheduleBatch, Optional[ScheduleBatch]]]
     ) -> None:
-        """Retract the requests of `running_batch`, of `last_batch` when it is a
-        prefill not merged into it yet, the chunked request, and the queued
-        requests that hold KV (HiSparse staging, dLLM), none of them in flight.
-        PD decode also retracts the waiting requests that hold KV; PD prefill
-        keeps the chunked request and a prefill already handed to transfer."""
-        retract_reqs = [r for r in running_batch.reqs if not r.finished()]
-        if (
-            last_batch is not None
-            and last_batch.forward_mode.is_extend()
-            # A running batch that DP attention converted to extend is
-            # last_batch itself; its requests are already listed above.
-            and last_batch is not running_batch
-            # Skip merge for disagg prefill: completed prefill requests are
-            # already in disagg_prefill_transfer_queue. Merging them into
-            # running_batch leaks them, since the prefill event loop never
-            # calls update_running_batch to clean them up.
-            and self.disaggregation_mode != DisaggregationMode.PREFILL
-        ):
-            retract_reqs += [
-                r
-                for r in last_batch.reqs
-                # Under PP an earlier micro-batch's retract may have taken it,
-                # as the chunked or a staged request.
-                if not r.finished() and not r.is_retracted
-            ]
+        """Retract, once for the whole pause, the requests of each
+        `(running_batch, last_batch)` pair (one per PP micro-batch), of
+        `last_batch` when it is a prefill not merged into it yet, the chunked
+        request, and the queued requests that hold KV (HiSparse staging, dLLM),
+        none of them in flight. PD decode also retracts the waiting requests that
+        hold KV; PD prefill keeps the chunked request and a prefill already
+        handed to transfer."""
+        retract_reqs = []
+        for running_batch, last_batch in batches:
+            retract_reqs += [r for r in running_batch.reqs if not r.finished()]
+            if (
+                last_batch is not None
+                and last_batch.forward_mode.is_extend()
+                # A running batch that DP attention converted to extend is
+                # last_batch itself; its requests are already listed above.
+                and last_batch is not running_batch
+                # Skip merge for disagg prefill: completed prefill requests are
+                # already in disagg_prefill_transfer_queue. Merging them into
+                # running_batch leaks them, since the prefill event loop never
+                # calls update_running_batch to clean them up.
+                and self.disaggregation_mode != DisaggregationMode.PREFILL
+            ):
+                retract_reqs += [r for r in last_batch.reqs if not r.finished()]
 
         if (
             self.chunked_req is not None
             and not self.chunked_req.finished()
-            and self.chunked_req not in retract_reqs
             and self.disaggregation_mode != DisaggregationMode.PREFILL
         ):
             retract_reqs.append(self.chunked_req)
@@ -6300,28 +6297,23 @@ class Scheduler(
         if self.hisparse_coordinator is not None:
             # A prefilled request waits in staging for its host copy, and only a
             # running loop moves it on. Take the whole queue so TP ranks agree.
-            retract_reqs += [
-                r
-                for r in self.hisparse_coordinator.ack_staging_queue
-                if r not in retract_reqs
-            ]
+            retract_reqs += self.hisparse_coordinator.ack_staging_queue.take()
 
         if self.dllm_config is not None:
-            # A request the last round finished leaves the dLLM lists only at the
+            # A dLLM request keeps its row between rounds, also one left out of
+            # the last round. One the last round finished leaves only at the
             # next schedule, which a paused loop never reaches.
             self.dllm_manager.filter_finished_reqs()
-            # A dLLM request keeps its row between rounds, also one left out of
-            # the last round.
-            retract_reqs += [
-                r
-                for r in self.dllm_manager.waiting_queue
-                if r.kv.holds_kv and r not in retract_reqs
-            ]
+            retract_reqs += self.dllm_manager.take(lambda r: r.kv.holds_kv)
 
         if self.disaggregation_mode == DisaggregationMode.DECODE:
             # Transferred requests wait for a slot holding their row and KV;
             # retract them too, so their KV is rebuilt under the new weights.
             retract_reqs += self.waiting_queue.take(lambda r: r.kv.holds_kv)
+
+        # A request reached from two sources (a batch and the chunked request,
+        # a staged or dLLM request in the last batch) is retracted once.
+        retract_reqs = list(dict.fromkeys(retract_reqs))
 
         if self.decode_offload_manager is not None:
             # Pending offload copies may still read the device KV that retraction frees,
@@ -6337,14 +6329,12 @@ class Scheduler(
                 request_retirer=self.request_retirer,
                 offload_kv=False,
             )
-        # Empties the batch through filter_batch so a beam tail goes with the reqs.
-        running_batch.filter_batch(keep_indices=[])
-        # Under PP the other micro-batches keep running.
+        for running_batch, _ in batches:
+            # Empties the batch through filter_batch so a beam tail goes with the reqs.
+            running_batch.filter_batch(keep_indices=[])
+            running_batch.batch_is_full = False
         self.running_reqs.leave(retract_reqs)
         self.prefill_launched_reqs.leave(retract_reqs)
-        if self.dllm_config is not None:
-            # Retracted dLLM requests are still queued in the dLLM lists.
-            self.dllm_manager.leave(retract_reqs)
         for req in retract_reqs:
             if req in reqs_to_abort:
                 # retract_all recorded the reason and freed any member rows.
@@ -6354,7 +6344,6 @@ class Scheduler(
                 self.disagg_decode_prealloc_queue.hold_rebootstrap(req)
             else:
                 self._add_request_to_queue(req)
-        running_batch.batch_is_full = False
         # In disagg-PREFILL, keep a live mid-chunk chunked_req rather than retract it:
         # freeing its KV under a live disagg KV-sender crashes pop_bootstrapped or
         # sends freed/reused KV to decode. Kept, it resumes prefill after the pause.

@@ -4,8 +4,12 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Iterable
+from unittest.mock import MagicMock
+
+import torch
 
 from sglang.srt.disaggregation.mode import DisaggregationMode
+from sglang.srt.managers.hisparse_coordinator import HiSparseAct, HiSparseCoordinator
 from sglang.srt.managers.scheduler_components.deferred_responses import (
     DeferredResponses,
 )
@@ -82,3 +86,32 @@ def empty_request_lists(scheduler: Scheduler) -> None:
         output_streamer=None,
         send_abort=None,
     )
+
+
+def staging_hisparse_coordinator(
+    num_rows: int, reqs: Iterable = ()
+) -> HiSparseCoordinator:
+    """A `HiSparseCoordinator` with only what releasing a staged request reads,
+    its streams and pools mocks, holding `reqs` in staging; each req's
+    `kv.req_pool_idx` is its row."""
+    coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
+    coordinator.ack_staging_queue = IndexedReqList(
+        ListKind.HISPARSE_STAGING, req_of=lambda act: act.req
+    )
+    coordinator.write_staging_stream = MagicMock()
+    coordinator.req_to_token_pool = SimpleNamespace(
+        req_to_token=torch.zeros((num_rows, 8), dtype=torch.int64)
+    )
+    coordinator.token_to_kv_pool_allocator = MagicMock()
+    coordinator.mem_pool_host = MagicMock()
+    coordinator.mem_pool_host.allocated_host_indices.return_value = torch.empty(0)
+    coordinator.req_to_host_pool = torch.full((num_rows, 8), -1, dtype=torch.int64)
+    coordinator.req_to_host_pool_allocated_len = torch.zeros(
+        num_rows, dtype=torch.int64
+    )
+    coordinator._skip_first_backup = {}
+    coordinator.spec_swap = MagicMock()
+    for req in reqs:
+        req.hisparse_staging = True
+        coordinator.ack_staging_queue.join([HiSparseAct(None, MagicMock(), req)])
+    return coordinator

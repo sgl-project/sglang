@@ -23,7 +23,6 @@ from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.dllm.mixin.req import DllmReqPhase
 from sglang.srt.dllm.mixin.scheduler import DllmManager
 from sglang.srt.managers.cache_controller import HiCacheAck
-from sglang.srt.managers.hisparse_coordinator import HiSparseAct, HiSparseCoordinator
 from sglang.srt.managers.io_struct import (
     AbortReq,
     ContinueGenerationReqInput,
@@ -56,6 +55,7 @@ from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.test.scheduler_test_utils import staging_hisparse_coordinator
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 register_cpu_ci(est_time=8, suite="stage-b-test-cpu-intel")
@@ -490,6 +490,9 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         """retract of a folded-in last extend batch must release through the scheduler-owned hisparse coordinator."""
         scheduler = self._new_scheduler()
         scheduler.hisparse_coordinator = MagicMock()
+        scheduler.hisparse_coordinator.ack_staging_queue = IndexedReqList(
+            ListKind.HISPARSE_STAGING
+        )
         scheduler.init_request_retirer()
         last_req = self._make_req("last")
         last_req.kv.req_pool_idx = 0
@@ -508,34 +511,14 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         ):
             scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
 
-        scheduler.hisparse_coordinator.request_finished.assert_called_once_with(
-            last_req
-        )
+        scheduler.hisparse_coordinator.release_request.assert_called_once_with(last_req)
         self.assertEqual([entry["req"] for entry in requeue_log], [last_req])
 
     def test_retract_takes_hisparse_staging_requests(self):
         """A prefilled request waits in HiSparse staging until a running loop
         collects it, which a paused loop never does: the retract takes the whole
-        staging queue, each request once, and a later PP micro-batch's retract,
-        its last batch holding a staged request, takes nothing more."""
+        staging queue, each request once, also one the last batch holds."""
         scheduler = self._new_scheduler()
-        coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
-        coordinator.ack_staging_queue = IndexedReqList(
-            ListKind.HISPARSE_STAGING, req_of=lambda act: act.req
-        )
-        coordinator.write_staging_stream = MagicMock()
-        coordinator.req_to_token_pool = SimpleNamespace(
-            req_to_token=torch.zeros((2, 8), dtype=torch.int64)
-        )
-        coordinator.token_to_kv_pool_allocator = MagicMock()
-        coordinator.mem_pool_host = MagicMock()
-        coordinator.mem_pool_host.allocated_host_indices.return_value = torch.empty(0)
-        coordinator.req_to_host_pool = torch.full((2, 8), -1, dtype=torch.int64)
-        coordinator.req_to_host_pool_allocated_len = torch.zeros(2, dtype=torch.int64)
-        coordinator._skip_first_backup = {}
-        coordinator.spec_swap = MagicMock()
-        scheduler.hisparse_coordinator = coordinator
-        scheduler.init_request_retirer()
         # `older` was prefilled a step earlier and still waits for its host
         # copy; `newer` is the last prefill batch, staged too.
         older = self._make_req("older")
@@ -543,8 +526,9 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         for slot, req in enumerate((older, newer)):
             req.kv.req_pool_idx = slot
             req.extend_end = 3
-            req.hisparse_staging = True
-            coordinator.ack_staging_queue.join([HiSparseAct(None, MagicMock(), req)])
+        coordinator = staging_hisparse_coordinator(2, [older, newer])
+        scheduler.hisparse_coordinator = coordinator
+        scheduler.init_request_retirer()
         scheduler.running_batch = ScheduleBatch(reqs=[], batch_is_full=True)
         prefill = self._make_batch(
             scheduler,
@@ -560,7 +544,6 @@ class TestSchedulerPauseGeneration(CustomTestCase):
             side_effect=lambda req, *_, **__: setattr(req.kv, "req_pool_idx", None),
         ):
             scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
-            scheduler._retract_batch(ScheduleBatch(reqs=[]), prefill)
 
         self.assertEqual([entry["req"] for entry in requeue_log], [newer, older])
         self.assertEqual(len(coordinator.ack_staging_queue), 0)
@@ -1089,7 +1072,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         # staging subset, mid-decode with an unresolved FDFO block; last_batch is
         # that round's DLLM_EXTEND batch, never merged into the running batch.
         reqs = []
-        for rid in ("a", "b"):
+        for slot, rid in enumerate(("a", "b")):
             req = Req(
                 rid=rid,
                 origin_input_text="",
@@ -1097,6 +1080,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
                 sampling_params=SamplingParams(),
                 dllm_config=dllm_config,
             )
+            req.kv.req_pool_idx = slot
             req.dllm_initialized = True
             req.dllm_phase = DllmReqPhase.STAGING_DECODE
             req.dllm_incomplete_ids = array("q", [7, 99, 99, 99])
@@ -1109,7 +1093,11 @@ class TestSchedulerPauseGeneration(CustomTestCase):
             scheduler, list(reqs), forward_mode=ForwardMode.DLLM_EXTEND
         )
 
-        scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
+        with patch(
+            "sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache",
+            side_effect=lambda req, *_, **__: setattr(req.kv, "req_pool_idx", None),
+        ):
+            scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
 
         lists = scheduler.request_lists()
         for req in reqs:

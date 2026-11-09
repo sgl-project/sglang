@@ -19,31 +19,29 @@ class DllmReqPhase(str, enum.Enum):
 
 class ReqDllmMixin:
     def init_diffusion_llm(self: Req, dllm_config: DllmConfig):
-        self.dllm_incomplete_ids = array("q")
-        self.dllm_algo_state = None
-        self.dllm_block_offset = 0
         self.dllm_config = dllm_config
+        self.dllm_block_offset = 0
         self.dllm_has_literal_mask = False
-        self.dllm_phase: Optional[DllmReqPhase] = self._incoming_dllm_phase()
+        self.reset_dllm_progress()
 
-    def _incoming_dllm_phase(self: Req) -> Optional[DllmReqPhase]:
-        if self.dllm_config is None:
-            return None
-        if self.dllm_config.requires_separate_context_encoding:
-            return DllmReqPhase.INCOMING_PREFILL
-        # A retracted request re-encodes its output too.
-        committed_len = len(self.origin_input_ids) + len(self.output_ids)
-        if committed_len < self.dllm_config.block_size:
-            return DllmReqPhase.INCOMING_DECODE
-        return DllmReqPhase.INCOMING_PREFILL
-
-    def reset_dllm_for_retract(self: Req):
-        """A retracted request, its KV released, is admitted again as incoming;
-        an unresolved FDFO block goes with its KV."""
+    def reset_dllm_progress(self: Req):
+        """Start the request as incoming. A retracted one, its KV released,
+        re-encodes its prompt and output, and an unresolved FDFO block goes
+        with its KV."""
         self.dllm_initialized = False
-        self.dllm_phase = self._incoming_dllm_phase()
         self.dllm_incomplete_ids = array("q")
         self.dllm_algo_state = None
+        self.dllm_phase: Optional[DllmReqPhase] = None
+        if self.dllm_config is None:
+            return
+        committed_len = len(self.origin_input_ids) + len(self.output_ids)
+        if (
+            self.dllm_config.requires_separate_context_encoding
+            or committed_len >= self.dllm_config.block_size
+        ):
+            self.dllm_phase = DllmReqPhase.INCOMING_PREFILL
+        else:
+            self.dllm_phase = DllmReqPhase.INCOMING_DECODE
 
     def is_dllm(self: Req) -> bool:
         return self.dllm_config is not None

@@ -7,16 +7,15 @@ from unittest.mock import MagicMock, patch
 import torch
 
 import sglang
-from sglang.srt.managers.hisparse_coordinator import HiSparseAct, HiSparseCoordinator
 from sglang.srt.managers.req_types import FINISH_ABORT, FINISH_LENGTH
 from sglang.srt.managers.scheduler_components import request_retirer
-from sglang.srt.managers.scheduler_components.request_list import (
-    IndexedReqList,
-    ListKind,
-)
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.scheduler_test_utils import FakeReq, release_only_retirer
+from sglang.test.scheduler_test_utils import (
+    FakeReq,
+    release_only_retirer,
+    staging_hisparse_coordinator,
+)
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
@@ -134,37 +133,24 @@ class TestReleaseHiSparseStaging(CustomTestCase):
         # A request still in HiSparse staging has its host copy in flight on
         # the staging stream; its slots are freed only after that stream syncs.
         calls = []
-        coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
-        coordinator.ack_staging_queue = IndexedReqList(
-            ListKind.HISPARSE_STAGING, req_of=lambda act: act.req
-        )
-        coordinator.write_staging_stream = SimpleNamespace(
-            synchronize=lambda: calls.append("sync")
-        )
-        coordinator.req_to_token_pool = SimpleNamespace(
-            req_to_token=torch.zeros((1, 8), dtype=torch.int64)
-        )
-        coordinator.token_to_kv_pool_allocator = SimpleNamespace(
-            free_hisparse=lambda locs: calls.append("free device")
-        )
-        coordinator.mem_pool_host = MagicMock()
-        coordinator.mem_pool_host.allocated_host_indices.return_value = torch.ones(2)
-        coordinator.mem_pool_host.free.side_effect = lambda indices: calls.append(
-            "free host"
-        )
-        coordinator.req_to_host_pool = torch.zeros((1, 8), dtype=torch.int64)
-        coordinator.req_to_host_pool_allocated_len = torch.full((1,), 2)
-        coordinator._skip_first_backup = {}
-        coordinator.spec_swap = MagicMock()
         req = FakeReq(
             finished_reason=FINISH_LENGTH(length=0),
             kv=SimpleNamespace(
                 holds_kv=True, holds_mamba=False, retraction_backup=None, req_pool_idx=0
             ),
             extend_end=3,
-            hisparse_staging=True,
         )
-        coordinator.ack_staging_queue.join([HiSparseAct(None, MagicMock(), req)])
+        coordinator = staging_hisparse_coordinator(1, [req])
+        coordinator.write_staging_stream.synchronize.side_effect = lambda: calls.append(
+            "sync"
+        )
+        coordinator.token_to_kv_pool_allocator.free_hisparse.side_effect = lambda locs: (
+            calls.append("free device")
+        )
+        coordinator.mem_pool_host.allocated_host_indices.return_value = torch.ones(2)
+        coordinator.mem_pool_host.free.side_effect = lambda indices: calls.append(
+            "free host"
+        )
         retirer = release_only_retirer(MagicMock(), hisparse_coordinator=coordinator)
 
         with patch.object(

@@ -1123,7 +1123,7 @@ class TestHiSparseDestinationFollowsTheHold(CustomTestCase):
         q.scheduler.request_retirer = release_only_retirer(
             q.tree_cache,
             SimpleNamespace(
-                request_finished=lambda req: log.append(("hisparse", req.rid))
+                release_request=lambda req: log.append(("hisparse", req.rid))
             ),
         )
         return q

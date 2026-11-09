@@ -1375,12 +1375,8 @@ class HiSparseCoordinator:
 
         return top_k_indices
 
-    def abort_staging_request(self, req: Req) -> None:
-        """Remove a request from the staging queue and free its host + device resources.
-
-        For a request admitted into staging whose host copy has not completed
-        (req.hisparse_staging is True), when it is released or retracted.
-        """
+    def _release_staging(self, req: Req) -> None:
+        """Remove a request from the staging queue and free its host + device resources."""
         # Remove from staging queue
         self.ack_staging_queue.leave([req])
         # Wait for any in-flight staging DMA to complete before freeing
@@ -1406,11 +1402,11 @@ class HiSparseCoordinator:
         self.spec_swap.free_unrotated_scratch(req.kv.req_pool_idx)
         req.hisparse_staging = False
 
-    def request_finished(self, req: Req):
+    def release_request(self, req: Req):
         """Free what a request holds here, whether it finished, aborted or was
-        retracted."""
+        retracted; one still in staging has its host copy in flight."""
         if req.hisparse_staging:
-            self.abort_staging_request(req)
+            self._release_staging(req)
             return
 
         # release resources only after the execution of a potential overlapped batch

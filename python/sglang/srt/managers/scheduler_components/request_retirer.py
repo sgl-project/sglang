@@ -96,14 +96,14 @@ class RequestRetirer:
         discard_kv_cache_backup(req, self.tree_cache)
         # HiSparse clears its mapping of the row before the row is freed.
         if req.kv.holds_kv and self.hisparse_coordinator is not None:
-            self.hisparse_coordinator.request_finished(req)
+            self.hisparse_coordinator.release_request(req)
         if req.kv.holds_kv or req.kv.holds_mamba:
             release_kv_cache(req, self.tree_cache, checkpoint=checkpoint)
 
     def retract(self, req: Req, *, offload_kv: bool) -> bool:
         """Release a retracted request's memory uncheckpointed; return whether it can resume."""
         if req.kv.holds_kv and self.hisparse_coordinator is not None:
-            self.hisparse_coordinator.request_finished(req)
+            self.hisparse_coordinator.release_request(req)
 
         # PD decode backs the KV up to host to restore it without recompute; a caller
         # that will rebootstrap passes offload_kv=False to skip the copy.

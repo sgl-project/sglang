@@ -136,7 +136,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
     launch_batch_sample_if_needed = Scheduler.launch_batch_sample_if_needed
     _copy_result_to_cpu = Scheduler._copy_result_to_cpu
     pause_generation = Scheduler.pause_generation
-    _retract_batch = Scheduler._retract_batch
+    _retract_batches = Scheduler._retract_batches
     _publish_paused_state = Scheduler._publish_paused_state
     continue_generation = Scheduler.continue_generation
     increment_scheduler_iterations = Scheduler.increment_scheduler_iterations
