@@ -1,8 +1,9 @@
 """Unquantized MoE expert compute for Apple MPS.
 
-Small batches (decode) run two Metal GEMV kernels (``moe.metal``) that read the
-selected experts' weights in place; larger batches sort the (token, expert)
-pairs by expert and run one torch GEMM pair per active expert.
+Small batches (decode) run two Metal GEMV kernels (``moe.metal``, compiled at
+runtime with ``torch.mps.compile_shader``) that read the selected experts'
+weights in place; larger batches sort the (token, expert) pairs by expert and
+run one torch GEMM pair per active expert.
 """
 
 from __future__ import annotations

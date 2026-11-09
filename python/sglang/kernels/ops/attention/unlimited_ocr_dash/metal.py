@@ -1,10 +1,11 @@
 """Metal kernels for the DASH attention path on Apple MPS.
 
-MSL sources live in ``dash.metal`` next to this module and are compiled with
-``torch.mps.compile_shader`` (either ahead of time via ``compile_kernels`` when
-the attention backend is constructed, or on first use). Each wrapper returns
-False when a shape is outside what the kernel was written for, and the caller
-falls back to the torch implementation in ``mps.py``.
+MSL sources live in ``dash.metal`` next to this module and are compiled at
+runtime with ``torch.mps.compile_shader``: by ``compile_kernels`` when the
+attention backend is constructed, or on first use. They run on torch MPS
+tensors and are not part of the AOT ``sgl_kernel`` Metal build. Each wrapper
+returns False when a shape is outside what the kernel was written for, and the
+caller falls back to the torch implementation in ``mps.py``.
 """
 
 from __future__ import annotations

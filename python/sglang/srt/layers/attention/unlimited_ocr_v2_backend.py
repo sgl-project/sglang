@@ -19,17 +19,9 @@ from sglang.kernels.ops.attention.unlimited_ocr_dash.decode_meta import (
 from sglang.kernels.ops.attention.unlimited_ocr_dash.dispatch import (
     dash_sparse_attn,
     dash_sparse_attn_decode,
-)
-from sglang.kernels.ops.attention.unlimited_ocr_dash.dispatch import (
-    kbar_refresh_tail as kbar_refresh_tail_triton,
-)
-from sglang.kernels.ops.attention.unlimited_ocr_dash.dispatch import (
-    route_decode as route_decode_triton,
-)
-from sglang.kernels.ops.attention.unlimited_ocr_dash.dispatch import (
-    route_prefill as route_prefill_triton,
-)
-from sglang.kernels.ops.attention.unlimited_ocr_dash.dispatch import (
+    kbar_refresh_tail,
+    route_decode,
+    route_prefill,
     win_bounds_decode,
 )
 from sglang.kernels.ops.attention.unlimited_ocr_dash.route import (
@@ -1295,7 +1287,7 @@ class UnlimitedOCRV2AttnBackend(AttentionBackend):
                 device=self.device,
                 out=self._kbar_plan_buf,
             )
-        kbar_refresh_tail_triton(
+        kbar_refresh_tail(
             kv_cache=kv,
             k_bar=k_bar,
             block_table=md.block_table,
@@ -1306,7 +1298,7 @@ class UnlimitedOCRV2AttnBackend(AttentionBackend):
         )
         img = self._image_allow_decode(md) if router.image_only else None
         win = self._scan_window(md) if img is not None else None
-        return route_decode_triton(
+        return route_decode(
             idx_q=idx_q,
             k_bar=k_bar,
             block_table=md.block_table,
@@ -1361,7 +1353,7 @@ class UnlimitedOCRV2AttnBackend(AttentionBackend):
                 device=self.device,
                 out=row2req_out,
             )
-        kbar_refresh_tail_triton(
+        kbar_refresh_tail(
             kv_cache=kv,
             k_bar=k_bar,
             block_table=md.block_table,
@@ -1371,7 +1363,7 @@ class UnlimitedOCRV2AttnBackend(AttentionBackend):
             plan=md.kbar_plan,
         )
         img = self._image_allow_prefill(md) if router.image_only else None
-        width, _, _ = route_prefill_triton(
+        width, _, _ = route_prefill(
             idx_q=idx_q,
             k_bar=k_bar,
             block_table=md.block_table,
