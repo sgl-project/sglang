@@ -875,7 +875,6 @@ Notes:
 - It currently **does not support** DP attention (`--attn-dp-size` > 1).
 - It disables the overlap scheduler and mixed chunked prefill.
 - If `--speculative-ngram-max-bfs-breadth > 1` (thus `speculative_eagle_topk > 1`) and `page_size > 1`, use `--attention-backend flashinfer`; otherwise the server will error.
-- Optional: set `SGLANG_NGRAM_FORCE_GREEDY_VERIFY=True` to force greedy verification.
 
 ```bash Command
 python3 -m sglang.launch_server \
@@ -1095,30 +1094,6 @@ Below is a comprehensive list of all speculative decoding parameters available i
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>int</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>10,000,000</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Cache capacity</td>
-    </tr>
-  </tbody>
-</table>
-
-### Environment variables
-
-<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
-  <colgroup>
-    <col style={{width: "33.33%"}} />
-    <col style={{width: "33.33%"}} />
-    <col style={{width: "33.33%"}} />
-  </colgroup>
-  <thead>
-    <tr style={{borderBottom: "2px solid #d55816"}}>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Variable</th>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Default</th>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Description</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_NGRAM_FORCE_GREEDY_VERIFY</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>False</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Force greedy verification for ngram decoding</td>
     </tr>
   </tbody>
 </table>
