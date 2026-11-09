@@ -116,6 +116,7 @@ def torch_build_configuration(
         "torch_cuda": getattr(torch_module.version, "cuda", None),
         "torch_hip": getattr(torch_module.version, "hip", None),
         "include_absolute_rpath": include_absolute_rpath,
+        "cxxflags": environment["CXXFLAGS"],
         "compat_header_sha256": (
             hashlib.sha256(compat_header.read_bytes()).hexdigest()
             if compat_header.is_file()
