@@ -89,7 +89,7 @@ jobs:
             git config --global --add safe.directory /workspace/source
             ulimit -l unlimited
             ulimit -s 65536
-            export CUDA_VISIBLE_DEVICES
+            export CUDA_VISIBLE_DEVICES="${NVIDIA_VISIBLE_DEVICES:?Assigned devices are unavailable}"
             bash scripts/ci/warm_page_cache.sh \
               /nas_aisw/datasets/checkpoints/LLM/Llama/v3.1/Llama-3.1-8B-Instruct \
               /nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-30B-A3B \
@@ -148,7 +148,7 @@ jobs:
             git config --global --add safe.directory /workspace/source
             ulimit -l unlimited
             ulimit -s 65536
-            export CUDA_VISIBLE_DEVICES
+            export CUDA_VISIBLE_DEVICES="${NVIDIA_VISIBLE_DEVICES:?Assigned devices are unavailable}"
             bash scripts/ci/warm_page_cache.sh \
               /nas_aisw/datasets/checkpoints/LLM/Llama/v3.1/Llama-3.1-8B-Instruct \
               /nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-30B-A3B \
@@ -208,7 +208,7 @@ jobs:
             git config --global --add safe.directory /workspace/source
             ulimit -l unlimited
             ulimit -s 65536
-            export CUDA_VISIBLE_DEVICES
+            export CUDA_VISIBLE_DEVICES="${NVIDIA_VISIBLE_DEVICES:?Assigned devices are unavailable}"
             bash scripts/ci/warm_page_cache.sh \
               /nas_aisw/datasets/checkpoints/LLM/Llama/v3.1/Llama-3.1-8B-Instruct \
               /nas_aisw/datasets/checkpoints/LLM/Llama/v3.2/Llama-3.2-1B-Instruct
@@ -256,7 +256,7 @@ jobs:
             git config --global --add safe.directory /workspace/source
             ulimit -l unlimited
             ulimit -s 65536
-            export CUDA_VISIBLE_DEVICES
+            export CUDA_VISIBLE_DEVICES="${NVIDIA_VISIBLE_DEVICES:?Assigned devices are unavailable}"
             bash scripts/ci/warm_page_cache.sh \
               /nas_aisw/datasets/checkpoints/LLM/Llama/v3.2/Llama-3.2-1B-Instruct
             bash scripts/ci/ppu/ppu_install_dependency.sh
