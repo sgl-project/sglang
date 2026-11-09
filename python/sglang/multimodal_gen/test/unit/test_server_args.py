@@ -3048,19 +3048,29 @@ class TestOffloadDefaults(_CudaPlatformTestCase):
         self.assertFalse(args.vae_cpu_offload)
 
     def test_auto_multi_gpu_qwen_uses_selected_gpu_min_available_memory(self):
-        args = self._from_dict_with_pipeline_config(
-            QwenImagePipelineConfig(),
-            available_memory_gb={1: 50, 2: 80},
-            kwargs={
-                "model_path": "Qwen/Qwen-Image",
-                "base_gpu_id": 1,
-                "num_gpus": 2,
-                "performance_mode": "auto",
-            },
-        )
+        # num_gpus counts every node, but each node probes only its own GPUs;
+        # probing past them fails with an invalid device id on node rank > 0.
+        multi_node = {
+            "num_gpus": 4,
+            "nnodes": 2,
+            "node_rank": 1,
+            "dist_init_addr": "127.0.0.1:5000",
+        }
+        for nodes_kwargs in ({"num_gpus": 2}, multi_node):
+            with self.subTest(**nodes_kwargs):
+                args = self._from_dict_with_pipeline_config(
+                    QwenImagePipelineConfig(),
+                    available_memory_gb={1: 50, 2: 80},
+                    kwargs={
+                        "model_path": "Qwen/Qwen-Image",
+                        "base_gpu_id": 1,
+                        "performance_mode": "auto",
+                        **nodes_kwargs,
+                    },
+                )
 
-        self.assertFalse(args.use_fsdp_inference)
-        self.assertTrue(args.enable_cfg_parallel)
+                self.assertFalse(args.use_fsdp_inference)
+                self.assertTrue(args.enable_cfg_parallel)
 
     def test_auto_multi_gpu_qwen_keeps_vae_resident_with_headroom(self):
         args = self._from_dict_with_pipeline_config(
