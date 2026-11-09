@@ -7,6 +7,7 @@ import torch
 from sglang.srt.layers.attention.triton_backend import (
     ForwardMetadata,
     TritonAttnBackend,
+    WindowRail,
 )
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
@@ -73,11 +74,14 @@ def _make_backend(batch_size, capture_width=7):
     backend.max_context_len = 128
     backend.qo_indptr = torch.zeros(batch_size + 1, dtype=torch.int32)
     backend.kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int32)
-    backend.window_kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int32)
+    backend.window_lengths = {}
+    backend.window_write_sub_pools = ()
+    backend.window_kv_indptr = {}
     backend.mask_indptr = torch.zeros(batch_size + 1, dtype=torch.int64)
     backend.cuda_graph_kv_indices = torch.zeros(256, dtype=torch.int64)
     backend.runner_ids = _RunnerIds()
     backend.sliding_window_size = None
+    backend.verify_reads_window_kv_only = False
     backend.use_sliding_window_kv_pool = False
     backend._verify_mask = None
     return backend
@@ -169,11 +173,16 @@ def test_unified_target_verify_uses_resolved_metadata(with_spec_info):
     backend.allow_bidirectional_attention_in_extend = False
     backend.page_size = 1
     backend.use_sliding_window_kv_pool = False
+    backend.window_write_sub_pools = ()
     layer_kv = SimpleNamespace(
         key=lambda: torch.zeros((1, 1, 4)), value=lambda: torch.zeros((1, 1, 4))
     )
+    # The window layer's KV lives in the full sub-pool; its one rail reads it.
     backend.token_to_kv_pool = SimpleNamespace(
-        layer_router=SimpleNamespace(read=lambda _layer_id: layer_kv)
+        layer_router=SimpleNamespace(
+            read=lambda _layer_id: layer_kv,
+            route=lambda _layer_id: SimpleNamespace(sub_pool="full"),
+        )
     )
     backend.forward_metadata = ForwardMetadata(
         attn_logits=None,
@@ -185,10 +194,12 @@ def test_unified_target_verify_uses_resolved_metadata(with_spec_info):
         qo_indptr=torch.tensor([0, 7, 14], dtype=torch.int32),
         custom_mask=None,
         mask_indptr=None,
-        window_kv_indptr=torch.tensor([0, 8, 20], dtype=torch.int32),
-        window_kv_indices=torch.zeros(20, dtype=torch.int64),
-        window_num_kv_splits=None,
-        window_kv_offsets=None,
+        windows={
+            "full": WindowRail(
+                kv_indptr=torch.tensor([0, 8, 20], dtype=torch.int32),
+                kv_indices=torch.zeros(20, dtype=torch.int64),
+            )
+        },
     )
     layer = SimpleNamespace(
         layer_id=0,
@@ -269,6 +280,7 @@ def test_replicated_draft_metadata_and_writes_share_physical_ids():
     runner_ids.page_size = 4
     runner_ids.device = "cpu"
     runner_ids._spaces = {IdSpaceKind.FULL: replicated.space(IdSpaceKind.FULL)}
+    runner_ids._role_sub_pools = {}
     runner_ids.is_translating = True
     runner_ids.defer_read_translate = False
     plan = runner_ids.plan(

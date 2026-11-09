@@ -875,3 +875,19 @@ def fused_qk_gemma_rmsnorm_with_gate(
 
 # Register the inplace op
 fused_inplace_qknorm = register_custom_op(fused_inplace_qknorm, mutates_args=["q", "k"])
+
+
+def is_non_idle_and_non_empty(forward_mode, hidden_states):
+    return (
+        (forward_mode is not None)
+        and not forward_mode.is_idle()
+        and hidden_states.shape[0] > 0
+    )
+
+
+def bind_or_assign(target, source):
+    if target is not None:
+        target.copy_(source)
+        return target
+    else:
+        return source

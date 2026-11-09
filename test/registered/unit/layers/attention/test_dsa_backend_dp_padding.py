@@ -8,8 +8,10 @@ from sglang.srt.layers.attention import graph_utils
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
 from sglang.srt.layers.attention.dsa_backend import (
     DeepseekSparseAttnBackend,
-    _restore_trtllm_decode_dp_padding,
-    _trim_trtllm_decode_dp_padding,
+    _apply_q_row_plan,
+    _plan_live_rows,
+    _restore_live_rows,
+    _RowPlan,
 )
 from sglang.srt.layers.dp_attention import DpPaddingMode
 from sglang.srt.layers.moe.utils import MoeA2ABackend
@@ -47,25 +49,58 @@ class TestDSABackendDPPadding(CustomTestCase):
             )
         self.assertEqual(mode, DpPaddingMode.MAX_LEN)
 
+    def test_plan_live_rows(self):
+        cases = (
+            # (q rows, metadata rows, metadata may be padded, expected plan)
+            (4, 4, False, _RowPlan(4, 0, 0)),
+            (8, 6, False, _RowPlan(6, 2, 0)),  # DP / MLP-sync padding of q
+            (2, 4, True, _RowPlan(2, 0, 2)),  # CP physical-row metadata padding
+        )
+        for q_rows, meta_rows, padded, expected in cases:
+            with (
+                self.subTest(q_rows=q_rows, meta_rows=meta_rows),
+                patch(
+                    "sglang.srt.layers.attention.dsa_backend."
+                    "dsa_cache_seqlens_may_be_padded",
+                    return_value=padded,
+                ),
+            ):
+                self.assertEqual(
+                    _plan_live_rows(q_rows, meta_rows, SimpleNamespace()), expected
+                )
+
     def test_trim_and_restore_active_eager_decode_padding(self):
         q_all = torch.arange(8 * 2 * 3).view(8, 2, 3)
         topk_indices = torch.arange(8 * 4, dtype=torch.int32).view(8, 4)
+        plan = _RowPlan(6, 2, 0)
 
-        real_q, real_topk, num_padding_rows = _trim_trtllm_decode_dp_padding(
-            q_all,
-            topk_indices,
-            real_batch_size=6,
-        )
+        real_q, real_topk = _apply_q_row_plan(plan, q_all, topk_indices)
 
         self.assertTrue(torch.equal(real_q, q_all[:6]))
         self.assertTrue(torch.equal(real_topk, topk_indices[:6]))
-        self.assertEqual(num_padding_rows, 2)
 
         real_output = torch.ones((6, 1, 2, 5), dtype=torch.bfloat16)
-        output = _restore_trtllm_decode_dp_padding(real_output, num_padding_rows)
+        output = _restore_live_rows(real_output, plan)
         self.assertEqual(output.shape, (8, 1, 2, 5))
         self.assertTrue(torch.equal(output[:6], real_output))
         self.assertTrue(torch.all(output[6:] == 0))
+
+    def test_pad_and_trim_metadata_padding(self):
+        """FlashMLA takes one q row per metadata row: CP metadata padding is
+        fed as zero queries with -1 indices and trimmed from the output."""
+        q = torch.ones(2, 1, 2, 3)
+        indices = torch.arange(2 * 1 * 4, dtype=torch.int32).view(2, 1, 4)
+        plan = _RowPlan(2, 0, 3)
+
+        padded_q, padded_indices = _apply_q_row_plan(plan, q, indices)
+
+        self.assertEqual(padded_q.shape, (5, 1, 2, 3))
+        self.assertTrue(torch.equal(padded_q[:2], q))
+        self.assertTrue(torch.all(padded_q[2:] == 0))
+        self.assertTrue(torch.equal(padded_indices[:2], indices))
+        self.assertTrue(torch.all(padded_indices[2:] == -1))
+        output = _restore_live_rows(torch.ones(5, 1, 2, 2), plan)
+        self.assertEqual(output.shape, (2, 1, 2, 2))
 
     def test_sparse_prefill_restores_tp_padding(self):
         """Sparse prefill must preserve real rows and zero-pad to the TP extent."""
@@ -118,6 +153,8 @@ class TestDSABackendDPPadding(CustomTestCase):
             fake_sparse_fwd,
         )
         backend = DeepseekSparseAttnBackend.__new__(DeepseekSparseAttnBackend)
+        backend.dsa_shards_index_k = False
+        backend.attn_dcp_size, backend.attn_dcp_rank = 1, 0
         backend.__dict__.update(
             dsa_prefill_impl=implementation,
             use_mha=False,
@@ -166,14 +203,36 @@ class TestDSABackendDPPadding(CustomTestCase):
         self.assertEqual(batch.out_cache_loc.shape[0], rows)
 
     def test_rejects_metadata_larger_than_physical_batch(self):
-        with self.assertRaisesRegex(
-            AssertionError, "metadata batch size \\(3\\) exceeds q batch size \\(2\\)"
+        with (
+            patch(
+                "sglang.srt.layers.attention.dsa_backend."
+                "dsa_cache_seqlens_may_be_padded",
+                return_value=False,
+            ),
+            self.assertRaisesRegex(
+                AssertionError, "metadata rows \\(3\\) exceed q rows \\(2\\)"
+            ),
         ):
-            _trim_trtllm_decode_dp_padding(
-                torch.empty((2, 2, 3)),
-                torch.empty((2, 8), dtype=torch.int32),
-                real_batch_size=3,
-            )
+            _plan_live_rows(2, 3, SimpleNamespace())
+
+    def test_accepts_metadata_padding_inside_breakable_graph(self):
+        # The replay view lacks global_num_tokens_cpu; the bridge narrowed q.
+        with (
+            patch(
+                "sglang.srt.layers.attention.dsa_backend."
+                "dsa_cache_seqlens_may_be_padded",
+                return_value=False,
+            ),
+            patch(
+                "sglang.srt.model_executor.runner_backend_utils."
+                "breakable_cuda_graph.context._in_breakable_cuda_graph",
+                True,
+            ),
+        ):
+            plan = _plan_live_rows(34, 48, SimpleNamespace())
+        self.assertEqual(
+            (plan.live_rows, plan.q_pad_rows, plan.meta_pad_rows), (34, 0, 14)
+        )
 
     def test_trtllm_decode_runs_real_rows_then_restores_physical_batch(self):
         self._check_trtllm_padding(is_prefill=False)
@@ -181,7 +240,12 @@ class TestDSABackendDPPadding(CustomTestCase):
     def test_trtllm_prefill_narrows_metadata_to_live_cp_queries(self):
         self._check_trtllm_padding(is_prefill=True)
 
-    def _check_trtllm_padding(self, *, is_prefill):
+    def test_trtllm_prefill_plans_on_per_token_seq_lens(self):
+        # One request of four tokens: cache_seqlens_int32 has one row, but the
+        # prefill caller passes dsa_cache_seqlens_int32 with one row per token.
+        self._check_trtllm_padding(is_prefill=True, per_token_seq_lens=True)
+
+    def _check_trtllm_padding(self, *, is_prefill, per_token_seq_lens=False):
         metadata = SimpleNamespace(
             cache_seqlens_int32=torch.tensor([8, 12], dtype=torch.int32),
             page_table_1=torch.zeros((2, 12), dtype=torch.int32),
@@ -205,7 +269,8 @@ class TestDSABackendDPPadding(CustomTestCase):
             device="cpu",
             num_q_heads=2,
             num_dcp_q_heads=2,
-            dcp_size=1,
+            attn_dcp_size=1,
+            dsa_shards_index_k=False,
         )
         backend._pad_topk_indices = MethodType(
             DeepseekSparseAttnBackend._pad_topk_indices, backend
@@ -227,7 +292,13 @@ class TestDSABackendDPPadding(CustomTestCase):
         forward_batch = SimpleNamespace()
         q = torch.arange(4 * 2 * 3, dtype=torch.float32).view(4, 2, 3)
         topk_indices = torch.arange(4 * 2, dtype=torch.int32).view(4, 2)
-        if is_prefill:
+        seq_lens = None
+        if per_token_seq_lens:
+            metadata.cache_seqlens_int32 = torch.tensor([12], dtype=torch.int32)
+            seq_lens = torch.tensor([9, 10, 11, 12], dtype=torch.int32)
+            backend.use_fused_topk = True
+            backend._get_fused_topk_page_table = lambda indices: indices
+        elif is_prefill:
             # The CP graph bridge has removed padded Q rows; metadata was
             # planned for the physical shard before entering the eager break.
             q = q[:2]
@@ -244,7 +315,8 @@ class TestDSABackendDPPadding(CustomTestCase):
 
         def fake_decode(**kwargs):
             captured.update(kwargs)
-            return torch.ones((2, 1, 2, 2), dtype=torch.bfloat16)
+            rows = kwargs["query"].shape[0]
+            return torch.ones((rows, 1, 2, 2), dtype=torch.bfloat16)
 
         flashinfer_decode.trtllm_batch_decode_with_kv_cache_mla = fake_decode
         flashinfer.decode = flashinfer_decode
@@ -275,6 +347,11 @@ class TestDSABackendDPPadding(CustomTestCase):
                 "sglang.srt.layers.attention.dsa_backend.grow_multi_ctas_kv_counter_buffer_if_needed",
                 return_value=None,
             ),
+            patch(
+                "sglang.srt.layers.attention.dsa_backend."
+                "dsa_cache_seqlens_may_be_padded",
+                return_value=is_prefill and not per_token_seq_lens,
+            ),
         ):
             output = DeepseekSparseAttnBackend._forward_trtllm(
                 backend,
@@ -283,12 +360,20 @@ class TestDSABackendDPPadding(CustomTestCase):
                 v=torch.empty((4, 1, 2)),
                 layer=layer,
                 forward_batch=forward_batch,
-                seq_lens=metadata.cache_seqlens_int32,
+                seq_lens=(
+                    metadata.cache_seqlens_int32 if seq_lens is None else seq_lens
+                ),
                 save_kv_cache=False,
                 topk_indices=topk_indices,
                 is_prefill=is_prefill,
             )
 
+        if per_token_seq_lens:
+            self.assertEqual(captured["query"].shape, (4, 1, 2, 3))
+            self.assertEqual(captured["seq_lens"].tolist(), [9, 10, 11, 12])
+            self.assertEqual(output.shape, (4, 1, 2, 2))
+            self.assertTrue(torch.all(output == 1))
+            return
         self.assertEqual(captured["query"].shape, (2, 1, 2, 3))
         self.assertEqual(captured["seq_lens"].tolist(), [8, 12])
         self.assertEqual(output.shape, (2 if is_prefill else 4, 1, 2, 2))

@@ -16,6 +16,7 @@ from sglang.srt.entrypoints.engine import node_hosts_rust_server
 from sglang.srt.environ import envs
 from sglang.srt.managers import disagg_service
 from sglang.srt.managers.load_snapshot import create_load_snapshot_writer, shm_path_for
+from sglang.srt.managers.scheduler_components.pause_state import PauseState
 from sglang.srt.runtime_context import (
     derive_attention_ranks,
     get_context,
@@ -103,6 +104,8 @@ def _reported_deployment_info() -> api_types.DeploymentInfo:
             "default_priority_value",
             5,
         ),
+        ({"api_key": "sk-api"}, "api_key", "sk-api"),
+        ({"admin_api_key": "sk-admin"}, "admin_api_key", "sk-admin"),
         ({}, "limit_mm_data_per_request", []),
         (
             {"limit_mm_data_per_request": {"video": 1, "image": 2}},
@@ -125,6 +128,8 @@ def _reported_deployment_info() -> api_types.DeploymentInfo:
         "grpc-response-timeout",
         "priority-off",
         "priority-on",
+        "api-key",
+        "admin-api-key",
         "mm-limits-unset",
         "mm-limits-keep-order",
         "loaded-tokenizer",
@@ -315,13 +320,15 @@ def test_dp_leaders_reuse_node_local_ports(
         patch.object(rust_extensions, "load_rust_extension") as extension,
         patch.object(rust_server, "_partition_cores", return_value=(None, None)),
         patch.object(rust_server, "_build_server_args"),
+        # A mock server would report a startup failure and signal the parent.
+        patch.object(rust_server.RustServer, "_watch_startup_failure"),
     ):
         parallel = get_parallel()
         ports = []
         for dp_rank, tp_rank in enumerate(ranks):
             scheduler = SimpleNamespace(
                 server_args=SimpleNamespace(),
-                model_config=SimpleNamespace(is_multimodal=False),
+                model_config=SimpleNamespace(is_multimodal=False, is_generation=True),
             )
             with parallel.override(
                 tp_rank=tp_rank,
@@ -347,10 +354,12 @@ def test_plain_dp_replicas_bind_their_own_ports():
         patch.object(rust_extensions, "load_rust_extension") as extension,
         patch.object(rust_server, "_partition_cores", return_value=(None, None)),
         patch.object(rust_server, "_build_server_args"),
+        # A mock server would report a startup failure and signal the parent.
+        patch.object(rust_server.RustServer, "_watch_startup_failure"),
     ):
         scheduler = SimpleNamespace(
             server_args=SimpleNamespace(),
-            model_config=SimpleNamespace(is_multimodal=False),
+            model_config=SimpleNamespace(is_multimodal=False, is_generation=True),
         )
         ports = []
         for dp_rank in range(2):
@@ -407,6 +416,8 @@ def test_node_listeners_name_every_listener_on_the_node(server_args, leaders):
         patch.object(rust_extensions, "load_rust_extension") as extension,
         patch.object(rust_server, "_partition_cores", return_value=(None, None)),
         patch.object(rust_server, "_build_server_args"),
+        # A mock server would report a startup failure and signal the parent.
+        patch.object(rust_server.RustServer, "_watch_startup_failure"),
     ):
         parallel = get_parallel()
         reported = []
@@ -426,7 +437,9 @@ def test_node_listeners_name_every_listener_on_the_node(server_args, leaders):
                 rust_server.RustServer.launch(
                     SimpleNamespace(
                         server_args=SimpleNamespace(),
-                        model_config=SimpleNamespace(is_multimodal=False),
+                        model_config=SimpleNamespace(
+                            is_multimodal=False, is_generation=True
+                        ),
                     )
                 )
                 reported.append(_reported_deployment_info())
@@ -442,6 +455,57 @@ def test_node_listeners_name_every_listener_on_the_node(server_args, leaders):
         for c, info in zip(calls, reported)
     ]
     assert [info.node_listeners for info in reported] == [table] * len(leaders)
+
+
+@pytest.mark.parametrize(
+    "server_args,listeners_by_node",
+    [
+        ({"tp_size": 2}, [[(0, None)]]),
+        ({"tp_size": 2, "dp_size": 2}, [[(0, 0), (0, 1)]]),
+        ({"tp_size": 4, "attn_dp_size": 2}, [[(0, None), (2, None)]]),
+        (
+            {"nnodes": 2, "tp_size": 8, "attn_dp_size": 4},
+            [[(0, None), (2, None)], [(4, None), (6, None)]],
+        ),
+        ({"nnodes": 2, "tp_size": 4, "dp_size": 2}, [[(0, 0), (0, 1)], []]),
+    ],
+    ids=["plain", "dp", "attention-dp", "multi-node-attention-dp", "dp-spans-nodes"],
+)
+def test_node_listener_ports_match_what_each_listener_binds(
+    server_args, listeners_by_node
+):
+    # `listeners_by_node[node]`: the (TP rank, plain-DP rank) of each
+    # scheduler on that node that hosts a listener.
+    with (
+        patch.object(rust_extensions, "load_rust_extension"),
+        patch.object(rust_server, "_partition_cores", return_value=(None, None)),
+        patch.object(rust_server, "_build_server_args"),
+        # A mock server would report a startup failure and signal the parent.
+        patch.object(rust_server.RustServer, "_watch_startup_failure"),
+    ):
+        for node_rank, listeners in enumerate(listeners_by_node):
+            with get_context().override_server_args(
+                **server_args, node_rank=node_rank, host="0.0.0.0", port=30000
+            ):
+                parallel = get_parallel()
+                bound = []
+                for tp_rank, dp_rank in listeners:
+                    scheduler = SimpleNamespace(
+                        server_args=SimpleNamespace(),
+                        model_config=SimpleNamespace(
+                            is_multimodal=False, is_generation=True
+                        ),
+                    )
+                    with parallel.override(
+                        tp_rank=tp_rank,
+                        attn_tp_rank=tp_rank % parallel.attn_tp_size,
+                        attn_cp_rank=0,
+                        attn_dp_rank=tp_rank // parallel.attn_tp_size,
+                        dp_rank=dp_rank,
+                    ):
+                        bound.append(rust_server.RustServer.launch(scheduler).http_port)
+                assert rust_server.node_listener_ports() == bound
+                assert bound == list(range(30000, 30000 + len(listeners)))
 
 
 @pytest.mark.parametrize(
@@ -616,8 +680,9 @@ def test_listener_rank_installs_the_sigterm_drain(hosts):
     server_class.gather_frontend_cpu_share.return_value = (1, 2)
     scheduler = SimpleNamespace(
         _hosts_rust_server=lambda: hosts,
+        _holds_rust_drain_end=lambda: False,
         get_rust_server_class=lambda: server_class,
-        _engine_paused=False,
+        pause_state=PauseState(),
     )
     with (
         envs.SGLANG_RUST_SERVER.override(True),
@@ -635,7 +700,8 @@ def test_listener_rank_installs_the_sigterm_drain(hosts):
             scheduler, frontend_cpu_share=(1, 2)
         )
         server.install_sigterm_drain.assert_called_once_with(
-            notify=rust_server.drain_notify_name("dp-ports-test")
+            notify=rust_server.drain_notify_name("dp-ports-test"),
+            hold_drain_end=False,
         )
     assert scheduler.rust_server is (server if hosts else None)
 
