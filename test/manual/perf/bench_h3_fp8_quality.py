@@ -3,6 +3,8 @@
 
 Run once without --fp8, then with --fp8 and the same --output directory.
 Frames are compared before lossy file encoding; timings include quantization.
+Audio allows only FP32 roundoff (1e-7 absolute): the unquantized cold/warm
+B300 baseline itself differs by up to 2.8e-8. Video equality remains bit-exact.
 Requires a CUDA SM100+ GPU with room for the unquantized resident pipeline.
 """
 
@@ -89,6 +91,9 @@ def main():
                         "save_output": True,
                         "output_path": str(args.output),
                         "output_file_name": f"{label}-{index}-{iteration}.mp4",
+                        "perf_dump_path": str(
+                            args.output / f"metrics-{label}-{index}-{iteration}.json"
+                        ),
                         "return_file_paths_only": False,
                     }
                 )
@@ -123,7 +128,7 @@ def main():
                         np.max(np.abs(audio - reference["audio"]))
                     )
                     row["frames_equal"] = np.array_equal(frames, expected)
-                    if row["audio_max_abs"] or (
+                    if row["audio_max_abs"] > 1e-7 or (
                         quality != "high" and not row["frames_equal"]
                     ):
                         np.savez(
@@ -132,7 +137,9 @@ def main():
                             audio=audio,
                         )
                         print(json.dumps(row), flush=True)
-                    np.testing.assert_array_equal(audio, reference["audio"])
+                    np.testing.assert_allclose(
+                        audio, reference["audio"], rtol=0, atol=1e-7, equal_nan=False
+                    )
                     if quality != "high":
                         np.testing.assert_array_equal(frames, expected)
                     else:
