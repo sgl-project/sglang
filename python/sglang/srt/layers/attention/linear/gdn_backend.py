@@ -15,6 +15,7 @@ from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_update,
 )
 from sglang.kernels.ops.mamba.gdn_prefill_track import (
+    TRACK_CHUNK_STATE,
     gdn_track_conv_window,
     gdn_track_ssm_state,
 )
@@ -1187,6 +1188,21 @@ class GDNAttnBackend(MambaAttnBackendBase):
         ).transpose(0, 1)
         query, key, value = self._split_prefill_qkv(layer, mixed_qkv)
         g, beta = self._prefill_gates(layer, a, b)
+        track_state = track_chunk_idx = None
+        if (
+            meta.track
+            and self.kernel_dispatcher.extend_kernel.supports_track_state_snapshot
+        ):
+            track_state = torch.empty(
+                (meta.max_seqs, *ssm_states.shape[1:]),
+                dtype=torch.float32,
+                device=ssm_states.device,
+            )
+            track_chunk_idx = torch.where(
+                meta.track_mode == TRACK_CHUNK_STATE,
+                meta.track_h_row - meta.chunk_offsets[:-1],
+                -1,
+            )
         core_attn_out, _, h = self.kernel_dispatcher.extend(
             q=query,
             k=key,
@@ -1198,13 +1214,19 @@ class GDNAttnBackend(MambaAttnBackendBase):
             query_start_loc=meta.cu_seqlens,
             chunk_indices=meta.chunk_indices,
             chunk_offsets=meta.chunk_offsets,
+            track_state=track_state,
+            track_chunk_idx=track_chunk_idx,
         )
         if meta.track:
             gdn_track_ssm_state(
                 ssm_pool=ssm_states,
-                h=h,
+                h=h if track_state is None else track_state.unsqueeze(0),
                 track_mode=meta.track_mode,
-                track_h_row=meta.track_h_row,
+                track_h_row=(
+                    meta.track_h_row
+                    if track_state is None
+                    else torch.arange(meta.max_seqs, device=ssm_states.device)
+                ),
                 track_dst=meta.track_dst,
                 cache_indices=meta.cache_indices,
             )

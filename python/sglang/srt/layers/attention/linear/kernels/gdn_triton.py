@@ -42,6 +42,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
 
     supports_packed_decode: bool = not is_cpu() and not is_npu()
     supports_strided_target_verify_qkv: bool = True
+    supports_track_state_snapshot: bool = not is_cpu() and not is_npu()
 
     def packed_decode(
         self,
@@ -207,6 +208,11 @@ class TritonGDNKernel(LinearAttnKernelBase):
             # control. Its existing behavior is equivalent to True.
             inplace_update_args = {}
 
+        if self.supports_track_state_snapshot:
+            graph_table_args.update(
+                track_state=kwargs.get("track_state"),
+                track_chunk_idx=kwargs.get("track_chunk_idx"),
+            )
         return chunk_gated_delta_rule(
             q=q,
             k=k,
