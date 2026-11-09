@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Callable, Optional
+from typing import Optional
 
 
 class DraftMeshMessageType(str, Enum):
@@ -21,23 +21,6 @@ class DraftReqKey:
 
     src_verifier_rank: int
     request_id: str
-
-
-def build_draft_scheduler_rid(draft_key: DraftReqKey) -> str:
-    return f"draft:{int(draft_key.src_verifier_rank)}:{draft_key.request_id}"
-
-
-def parse_draft_scheduler_rid(rid: str) -> DraftReqKey:
-    if rid.startswith("draft:"):
-        encoded = rid[len("draft:") :]
-        rank_text, sep, request_id = encoded.partition(":")
-        if sep and request_id:
-            return DraftReqKey(
-                src_verifier_rank=int(rank_text),
-                request_id=request_id,
-            )
-
-    raise ValueError(f"Invalid decoupled draft scheduler rid: {rid}")
 
 
 @dataclass
@@ -244,114 +227,6 @@ class VerifierCommitSegment:
         self.pre_verify_committed_len = int(self.pre_verify_committed_len) + num_tokens
         self.committed_tokens = remaining_tokens
         return prefix_segment
-
-
-@dataclass
-class DraftControlInbox:
-    """Drafter-side inbox for verifier control messages.
-
-    The TokenSync thread temporarily stores incoming control messages here.
-    The drafter scheduler extracts and consumes them each time it finishes a decoding step.
-    """
-
-    sync_messages: list[DraftSync] = field(default_factory=list)
-    verifier_commit_segments: dict[DraftReqKey, VerifierCommitSegment] = field(
-        default_factory=dict
-    )
-    close_keys: set[DraftReqKey] = field(default_factory=set)
-
-    def is_empty(self) -> bool:
-        return (
-            not self.sync_messages
-            and not self.verifier_commit_segments
-            and not self.close_keys
-        )
-
-    def pending_control_count(self) -> int:
-        return (
-            len(self.sync_messages)
-            + len(self.verifier_commit_segments)
-            + len(self.close_keys)
-        )
-
-    def add_control_batch_locked(self, batch: DraftControlBatch) -> None:
-        for message in batch.close_messages:
-            self.add_close_key_locked(message.draft_key)
-        for message in batch.sync_messages:
-            if message.draft_key not in self.close_keys:
-                self.sync_messages.append(message)
-        for message in batch.verify_commit_messages:
-            self.add_verify_commit_locked(message)
-
-    def add_close_key_locked(self, draft_key: DraftReqKey) -> None:
-        self.close_keys.add(draft_key)
-        self.verifier_commit_segments.pop(draft_key, None)
-        self.sync_messages = [
-            message for message in self.sync_messages if message.draft_key != draft_key
-        ]
-
-    def add_verify_commit_locked(self, message: VerifyCommit) -> None:
-        if message.draft_key in self.close_keys:
-            return
-        segment = self.verifier_commit_segments.get(message.draft_key)
-        if segment is None:
-            segment = VerifierCommitSegment(
-                draft_key=message.draft_key,
-                dst_drafter_rank=int(message.dst_drafter_rank),
-                pre_verify_committed_len=int(message.pre_verify_committed_len),
-            )
-            segment.append_message(message)
-            self.verifier_commit_segments[message.draft_key] = segment
-            return
-        segment.append_message(message)
-
-    def extract_ready_controls_locked(
-        self,
-        consumable_commit_len: Callable[[VerifierCommitSegment], int],
-    ) -> ReadyDraftControls:
-        ready_controls = ReadyDraftControls()
-
-        if self.close_keys:
-            ready_controls.close_keys = self.close_keys
-            self.close_keys = set()
-
-        if self.sync_messages:
-            ready_controls.sync_messages = self.sync_messages
-            self.sync_messages = []
-
-        for draft_key, segment in list(self.verifier_commit_segments.items()):
-            consumable_len = consumable_commit_len(segment)
-            if consumable_len <= 0:
-                continue
-
-            ready_controls.ready_commit_segments.append(
-                segment.extract_prefix(consumable_len)
-            )
-            if not segment.committed_tokens:
-                self.verifier_commit_segments.pop(draft_key, None)
-
-        return ready_controls
-
-
-@dataclass
-class ReadyDraftControls:
-    sync_messages: list[DraftSync] = field(default_factory=list)
-    close_keys: set[DraftReqKey] = field(default_factory=set)
-    ready_commit_segments: list[VerifierCommitSegment] = field(default_factory=list)
-
-    def is_empty(self) -> bool:
-        return (
-            not self.sync_messages
-            and not self.close_keys
-            and not self.ready_commit_segments
-        )
-
-    def extracted_control_count(self) -> int:
-        return (
-            len(self.sync_messages)
-            + len(self.close_keys)
-            + len(self.ready_commit_segments)
-        )
 
 
 @dataclass

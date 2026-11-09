@@ -11,6 +11,7 @@ This skill launches an SGLang server, validates it with a quick accuracy test, g
 
 - A working SGLang installation (`pip install -e .` or equivalent)
 - At least one available CUDA GPU
+- The `sgl-eval` CLI, installed in its own virtualenv as described in `.claude/rules/prefer-sgl-eval.md`, not in the server's env
 
 ## Step-by-step Workflow
 
@@ -49,7 +50,7 @@ Typical startup time: 30-90 seconds depending on model size and whether CUDA gra
 sgl-eval run gsm8k --base-url http://127.0.0.1:<port>/v1 --num-examples 20
 ```
 
-- Expected accuracy: **> 0.8** for capable models (Qwen3-8B, Llama-3.1-8B-Instruct, etc.)
+- Expected `score`: **> 80%** for capable models (Qwen3-8B, Llama-3.1-8B-Instruct, etc.)
 - This is a quick sanity check, not a rigorous benchmark.
 - If accuracy is unexpectedly low, something is wrong — do not proceed to profiling.
 
@@ -108,8 +109,8 @@ for i in $(seq 1 120); do
 done
 
 # 3. Accuracy check
-python3 -m sglang.test.run_eval --host 127.0.0.1 --port 30000 --eval-name gsm8k --num-examples 20
-# Expected: Accuracy > 0.8
+sgl-eval run gsm8k --base-url http://127.0.0.1:30000/v1 --num-examples 20
+# Expected: score > 80%
 
 # 4. Profile
 python3 -m sglang.test.send_one --profile

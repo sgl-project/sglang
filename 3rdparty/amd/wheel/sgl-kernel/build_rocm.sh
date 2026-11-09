@@ -56,6 +56,19 @@ if [[ "${ROCM_VERSION}" == "1000" ]]; then
   WHEEL_ROCM_VERSION="1000"
 fi
 
+# The build reuses the CUDA pyproject.toml, which requires Python 3.11 and tags
+# its wheel cp311-abi3. The ROCm 7.2.0 image and amd-sglang still run on Python
+# 3.10, so the ROCm wheels keep the Python 3.10 floor and the cp310-abi3 tag.
+sed -i \
+  -e 's/^requires-python = ">=3.11"$/requires-python = ">=3.10"/' \
+  -e 's/^wheel.py-api = "cp311"$/wheel.py-api = "cp310"/' \
+  pyproject.toml
+if ! grep -qx 'requires-python = ">=3.10"' pyproject.toml \
+  || ! grep -qx 'wheel.py-api = "cp310"' pyproject.toml; then
+  echo "ERROR: could not set the ROCm Python 3.10 / cp310 metadata in pyproject.toml." >&2
+  exit 1
+fi
+
 # Pull and run the latest image
 echo "Pulling Docker image: ${IMAGE}"
 docker pull "${IMAGE}"
@@ -86,5 +99,6 @@ ${ROCM_SETUP}
   rm -rf CMakeLists.txt && mv CMakeLists_rocm.txt CMakeLists.txt && \
   ${PYTHON_ROOT_PATH}/python rocm_hipify.py && \
   ${PYTHON_ROOT_PATH}/python -m uv build --wheel -Cbuild-dir=build . --color=always --no-build-isolation && \
-  ./rename_wheels_rocm.sh ${WHEEL_ROCM_VERSION}
+  ./rename_wheels_rocm.sh ${WHEEL_ROCM_VERSION} && \
+  ${PYTHON_ROOT_PATH}/pip install --dry-run --no-deps dist/*.whl
 "

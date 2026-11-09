@@ -7,6 +7,7 @@ import triton.language as tl
 
 from sglang.kernels.ops.speculative.cache_locs import assign_extend_cache_locs_func
 from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_cuda
+from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import swa_ring_rows
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 from sglang.srt.utils import (
@@ -20,6 +21,9 @@ class RaggedVerifyWindow(msgspec.Struct, frozen=True):
     positions: torch.Tensor
     verify_cache_loc: torch.Tensor
     verify_ids: torch.Tensor
+    # Each packed lane's flat position in the `[bs, verify_num_draft_tokens]`
+    # verify window, -1 on a padded lane.
+    window_index: torch.Tensor
 
 
 class BuildRaggedVerifyWindow:
@@ -129,36 +133,91 @@ def build_ragged_verify_window(
         positions=positions,
         verify_cache_loc=verify_cache_loc,
         verify_ids=verify_ids,
+        window_index=torch.where(
+            valid, safe_req.to(torch.int64) * verify_num_draft_tokens + within, -1
+        ),
     )
 
 
-@triton.jit
-def _ragged_finalize_kernel(
-    req_ptr,
-    within_ptr,
-    prefix_ptr,
-    cache_ptr,
-    pos_out_ptr,
-    cache_out_ptr,
+@triton.jit(
+    do_not_specialize=[
+        "req_to_token_stride",
+        "draft_block_ids_stride",
+        "draft_tokens_stride",
+        "num_rows",
+        "bs",
+        "n",
+        "width",
+    ]
+)
+def _ragged_verify_window_kernel(
+    verify_lens_ptr,
+    prefix_lens_ptr,
+    req_pool_indices_ptr,
+    req_to_token_ptr,
+    req_to_token_stride,
+    draft_block_ids_ptr,
+    draft_block_ids_stride,
+    draft_tokens_ptr,
+    draft_tokens_stride,
+    positions_ptr,
+    cache_loc_ptr,
+    verify_ids_ptr,
+    window_index_ptr,
+    num_rows,
     bs,
     n,
-    real_len,
-    BLOCK: tl.constexpr,
+    width,
+    BLOCK_T: tl.constexpr,
+    BLOCK_BS: tl.constexpr,
 ):
-    pid = tl.program_id(0)
-    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    offs = tl.program_id(0) * BLOCK_T + tl.arange(0, BLOCK_T)
     mask = offs < n
-    req = tl.load(req_ptr + offs, mask=mask, other=0)
-    within = tl.load(within_ptr + offs, mask=mask, other=0)
-    valid = req < bs
+    req = tl.zeros([BLOCK_T], dtype=tl.int32)
+    start = tl.zeros([BLOCK_T], dtype=tl.int32)
+    total = 0
+    for row0 in range(0, num_rows, BLOCK_BS):
+        rows = row0 + tl.arange(0, BLOCK_BS)
+        lens = tl.load(verify_lens_ptr + rows, mask=rows < num_rows, other=0)
+        lens = lens.to(tl.int32)
+        incl = total + tl.cumsum(lens, axis=0)
+        before = incl[None, :] <= offs[:, None]
+        req += tl.sum(before.to(tl.int32), axis=1)
+        start += tl.sum(tl.where(before, lens[None, :], 0), axis=1)
+        total += tl.sum(lens, axis=0)
+    valid = mask & (offs < total)
     safe_req = tl.minimum(req, bs - 1)
-    prefix = tl.load(prefix_ptr + safe_req, mask=mask, other=0)
-    pos = tl.where(valid, prefix + within, 0)
-    lmask = mask & (offs < real_len)
-    cl = tl.load(cache_ptr + offs, mask=lmask, other=0)
-    cl = tl.where(valid, cl, 0)
-    tl.store(pos_out_ptr + offs, pos, mask=mask)
-    tl.store(cache_out_ptr + offs, cl, mask=mask)
+    within = tl.where(valid, offs - start, 0)
+    prefix = tl.load(prefix_lens_ptr + safe_req, mask=mask, other=0).to(tl.int64)
+    pool_row = tl.load(req_pool_indices_ptr + safe_req, mask=mask, other=0).to(tl.int64)
+    cache_loc = tl.load(
+        req_to_token_ptr + pool_row * req_to_token_stride + prefix + within,
+        mask=valid,
+        other=0,
+    )
+    anchor = tl.load(
+        draft_block_ids_ptr + safe_req.to(tl.int64) * draft_block_ids_stride,
+        mask=mask,
+        other=0,
+    )
+    draft = tl.load(
+        draft_tokens_ptr
+        + safe_req.to(tl.int64) * draft_tokens_stride
+        + tl.maximum(within - 1, 0),
+        mask=mask,
+        other=0,
+    )
+    verify_id = tl.where(within == 0, anchor.to(tl.int64), draft.to(tl.int64))
+    tl.store(positions_ptr + offs, tl.where(valid, prefix + within, 0), mask=mask)
+    tl.store(
+        cache_loc_ptr + offs, tl.where(valid, cache_loc.to(tl.int64), 0), mask=mask
+    )
+    tl.store(verify_ids_ptr + offs, tl.where(valid, verify_id, 0), mask=mask)
+    tl.store(
+        window_index_ptr + offs,
+        tl.where(valid, safe_req.to(tl.int64) * width + within, -1),
+        mask=mask,
+    )
 
 
 def build_ragged_verify_window_triton(
@@ -172,134 +231,42 @@ def build_ragged_verify_window_triton(
     verify_num_draft_tokens: int,
     model_runner,
 ) -> RaggedVerifyWindow:
-    prefix_lens = batch.seq_lens
-    verify_lens = layout.verify_lens.to(device=device, dtype=torch.int32)
+    req_to_token = model_runner.req_to_token_pool.req_to_token
+    verify_lens = layout.verify_lens.contiguous()
+    num_rows = verify_lens.shape[0]
     padded_total = layout.graph_num_tokens
-
-    req_id, within, _valid = compact_row_index_triton(
-        verify_lens=verify_lens, padded_total=padded_total, device=device
-    )
-    real_cache_loc = assign_extend_cache_locs_func(
-        req_pool_indices=batch.req_pool_indices,
-        req_to_token=model_runner.req_to_token_pool.req_to_token,
-        start_offset=prefix_lens,
-        end_offset=prefix_lens + verify_lens.to(prefix_lens.dtype),
-        batch_size=bs,
-        draft_token_num=verify_num_draft_tokens,
-        device=device,
-    )
-    prefix_i64 = prefix_lens.to(device=device, dtype=torch.int64).contiguous()
+    assert num_rows == bs and draft_tokens.stride(1) == 1
     positions = torch.empty(padded_total, dtype=torch.int64, device=device)
-    verify_cache_loc = torch.empty(
-        padded_total, dtype=real_cache_loc.dtype, device=device
-    )
-    BLOCK = 256
-    grid = (triton.cdiv(padded_total, BLOCK),)
-    _ragged_finalize_kernel[grid](
-        req_id,
-        within,
-        prefix_i64,
-        real_cache_loc,
+    verify_cache_loc = torch.empty_like(positions)
+    verify_ids = torch.empty_like(positions)
+    window_index = torch.empty_like(positions)
+    _ragged_verify_window_kernel[(triton.cdiv(padded_total, 32),)](
+        verify_lens,
+        batch.seq_lens,
+        batch.req_pool_indices,
+        req_to_token,
+        req_to_token.stride(0),
+        draft_block_ids,
+        draft_block_ids.stride(0),
+        draft_tokens,
+        draft_tokens.stride(0),
         positions,
         verify_cache_loc,
+        verify_ids,
+        window_index,
+        num_rows,
         bs,
         padded_total,
-        real_cache_loc.shape[0],
-        BLOCK=BLOCK,
-    )
-
-    verify_ids = compact_verify_ids_triton(
-        draft_block_ids=draft_block_ids,
-        draft_tokens=draft_tokens,
-        layout=layout,
-        device=device,
+        verify_num_draft_tokens,
+        BLOCK_T=32,
+        BLOCK_BS=256,
     )
     return RaggedVerifyWindow(
         positions=positions,
         verify_cache_loc=verify_cache_loc,
         verify_ids=verify_ids,
+        window_index=window_index,
     )
-
-
-_SEARCH_NBITS = 11
-
-
-class CompactRowIndex:
-    @classmethod
-    def execute(
-        cls, *args, **kwargs
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if inputs_on_cuda(*args, **kwargs):
-            return cls.triton(*args, **kwargs)
-        return cls.torch(*args, **kwargs)
-
-    @classmethod
-    def torch(
-        cls,
-        *,
-        verify_lens: torch.Tensor,
-        padded_total: int,
-        device,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        return compact_row_index(
-            verify_lens=verify_lens,
-            padded_total=padded_total,
-            device=device,
-        )
-
-    @classmethod
-    def triton(
-        cls,
-        *,
-        verify_lens: torch.Tensor,
-        padded_total: int,
-        device,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        return compact_row_index_triton(
-            verify_lens=verify_lens,
-            padded_total=padded_total,
-            device=device,
-        )
-
-
-class CompactVerifyIds:
-    @classmethod
-    def execute(cls, *args, **kwargs) -> torch.Tensor:
-        if inputs_on_cuda(*args, **kwargs):
-            return cls.triton(*args, **kwargs)
-        return cls.torch(*args, **kwargs)
-
-    @classmethod
-    def torch(
-        cls,
-        *,
-        draft_block_ids: torch.Tensor,
-        draft_tokens: torch.Tensor,
-        layout: RaggedVerifyLayout,
-        device: str,
-    ) -> torch.Tensor:
-        return compact_verify_ids(
-            draft_block_ids=draft_block_ids,
-            draft_tokens=draft_tokens,
-            layout=layout,
-            device=device,
-        )
-
-    @classmethod
-    def triton(
-        cls,
-        *,
-        draft_block_ids: torch.Tensor,
-        draft_tokens: torch.Tensor,
-        layout: RaggedVerifyLayout,
-        device: str,
-    ) -> torch.Tensor:
-        return compact_verify_ids_triton(
-            draft_block_ids=draft_block_ids,
-            draft_tokens=draft_tokens,
-            layout=layout,
-            device=device,
-        )
 
 
 def compact_verify_ids(
@@ -342,120 +309,6 @@ def compact_row_index(
         valid, row - start[req_id.clamp(max=bs - 1)], torch.zeros_like(row)
     )
     return req_id, within, valid
-
-
-@triton.jit
-def _compact_row_index_kernel(
-    incl_ptr,
-    req_out_ptr,
-    within_out_ptr,
-    valid_out_ptr,
-    bs,
-    n,
-    BLOCK: tl.constexpr,
-    NBITS: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    offs = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offs < n
-    row = offs.to(tl.int64)
-    real_total = tl.load(incl_ptr + (bs - 1))
-    lo = tl.zeros([BLOCK], dtype=tl.int32)
-    hi = tl.full([BLOCK], bs, dtype=tl.int32)
-    for _ in range(NBITS):
-        mid = (lo + hi) // 2
-        active = lo < hi
-        val = tl.load(incl_ptr + tl.minimum(mid, bs - 1), mask=mask, other=0)
-        go_right = val <= row
-        lo = tl.where(active & go_right, mid + 1, lo)
-        hi = tl.where(active & (~go_right), mid, hi)
-    req = lo
-    gidx = tl.maximum(req - 1, 0)
-    start = tl.load(incl_ptr + gidx, mask=mask, other=0)
-    start = tl.where(req > 0, start, 0)
-    valid = row < real_total
-    within = tl.where(valid, row - start, 0)
-    req_final = tl.where(valid, req.to(tl.int64), bs)
-    tl.store(req_out_ptr + offs, req_final, mask=mask)
-    tl.store(within_out_ptr + offs, within, mask=mask)
-    tl.store(valid_out_ptr + offs, valid, mask=mask)
-
-
-def compact_row_index_triton(
-    *,
-    verify_lens: torch.Tensor,
-    padded_total: int,
-    device,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    verify_lens = verify_lens.to(device=device, dtype=torch.int64).contiguous()
-    bs = verify_lens.shape[0]
-    # The search converges only for bs <= 2**(NBITS-1); beyond it silently mismaps.
-    assert bs <= 1 << (_SEARCH_NBITS - 1), (
-        f"bs={bs} exceeds row-index search capacity {1 << (_SEARCH_NBITS - 1)}"
-    )
-    incl = torch.cumsum(verify_lens, dim=0).contiguous()
-    req = torch.empty(padded_total, dtype=torch.int64, device=device)
-    within = torch.empty(padded_total, dtype=torch.int64, device=device)
-    valid = torch.empty(padded_total, dtype=torch.bool, device=device)
-    BLOCK = 256
-    grid = (triton.cdiv(padded_total, BLOCK),)
-    _compact_row_index_kernel[grid](
-        incl, req, within, valid, bs, padded_total, BLOCK=BLOCK, NBITS=_SEARCH_NBITS
-    )
-    return req, within, valid
-
-
-@triton.jit
-def _compact_verify_ids_gather_kernel(
-    req_ptr,
-    within_ptr,
-    draft_block_ids_ptr,
-    draft_tokens_ptr,
-    out_ptr,
-    bs,
-    gamma,
-    n,
-    BLOCK: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    offs = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offs < n
-    req = tl.load(req_ptr + offs, mask=mask, other=0)
-    within = tl.load(within_ptr + offs, mask=mask, other=0)
-    valid = req < bs
-    safe_req = tl.minimum(req, bs - 1)
-    anchor = tl.load(draft_block_ids_ptr + safe_req * gamma, mask=mask, other=0)
-    wcol = tl.maximum(within - 1, 0)
-    draft = tl.load(draft_tokens_ptr + safe_req * gamma + wcol, mask=mask, other=0)
-    v = tl.where(within == 0, anchor, draft)
-    v = tl.where(valid, v, 0)
-    tl.store(out_ptr + offs, v.to(tl.int64), mask=mask)
-
-
-def compact_verify_ids_triton(
-    *,
-    draft_block_ids: torch.Tensor,
-    draft_tokens: torch.Tensor,
-    layout: RaggedVerifyLayout,
-    device: str,
-) -> torch.Tensor:
-    req, within, _valid = compact_row_index_triton(
-        verify_lens=layout.verify_lens,
-        padded_total=layout.graph_num_tokens,
-        device=device,
-    )
-    bs = layout.verify_lens.shape[0]
-    gamma = draft_tokens.shape[1]
-    draft_block_ids = draft_block_ids.to(device=device, dtype=torch.int64).contiguous()
-    draft_tokens = draft_tokens.to(device=device, dtype=torch.int64).contiguous()
-    n = layout.graph_num_tokens
-    out = torch.empty(n, dtype=torch.int64, device=device)
-    BLOCK = 256
-    grid = (triton.cdiv(n, BLOCK),)
-    _compact_verify_ids_gather_kernel[grid](
-        req, within, draft_block_ids, draft_tokens, out, bs, gamma, n, BLOCK=BLOCK
-    )
-    return out
 
 
 class ScatterCompactToStrided:
@@ -609,7 +462,7 @@ class CommitInjectLayoutResult(msgspec.Struct):
     positions: torch.Tensor
 
 
-def build_unified_commit_inject_layout(
+def build_ring_commit_inject_layout(
     *,
     req_pool_indices: torch.Tensor,
     prefix_lens: torch.Tensor,
@@ -618,13 +471,13 @@ def build_unified_commit_inject_layout(
     stride: int,
     ring_stride: int,
 ) -> CommitInjectLayoutResult:
-    """unified_kv counterpart of build_commit_inject_layout.
+    """Per-request SWA ring counterpart of build_commit_inject_layout.
 
-    Non-unified injection translates the verify tokens' full cache locs through
-    ``full_to_swa_mapping``; under unified_kv the SWA K lives in a ring addressed
-    directly by ``state_slot * ring_stride + pos % ring_stride``, so compute the
-    ring row here instead. Uncommitted tokens (col >= commit_len) get loc = -1 and
-    are skipped by the scatter. All ops are static-shape (CUDA-graph safe).
+    Paged injection translates the verify tokens' full cache locs through
+    ``full_to_swa_mapping``; a per-request ring is addressed directly by
+    `swa_ring_rows`, so compute the ring row here instead. Uncommitted tokens
+    (col >= commit_len) get loc = -1 and are skipped by the scatter. All ops are
+    static-shape (CUDA-graph safe).
     """
     bs = req_pool_indices.shape[0]
     device = req_pool_indices.device
@@ -633,7 +486,7 @@ def build_unified_commit_inject_layout(
     state_slot = (
         req_pool_indices.to(torch.int64).view(-1, 1).expand(bs, stride).reshape(-1)
     )
-    loc = state_slot * ring_stride + positions % ring_stride
+    loc = swa_ring_rows(state_slot, positions, ring_stride)
     col = torch.arange(stride, device=device).view(1, -1)
     committed = (col < commit_lens.to(torch.long).view(-1, 1)).reshape(-1)
     swa_loc = torch.where(committed, loc, torch.full_like(loc, -1)).to(torch.int32)
@@ -702,32 +555,20 @@ def build_commit_inject_layout(
     commit_lens: torch.Tensor,
     stride: int,
 ) -> CommitInjectLayoutResult:
-    from sglang.kernels.ops.speculative.cache_locs import (
-        assign_extend_cache_locs_func,
-    )
-
     bs = req_pool_indices.shape[0]
     device = req_pool_indices.device
-
     positions_2d = prefix_lens.unsqueeze(1) + block_pos_offsets[:stride]
     positions = positions_2d.reshape(-1).to(dtype=torch.int64)
-
-    cache_loc = assign_extend_cache_locs_func(
-        req_pool_indices=req_pool_indices,
-        req_to_token=req_to_token,
-        start_offset=prefix_lens,
-        end_offset=prefix_lens + stride,
-        batch_size=bs,
-        draft_token_num=stride,
-        device=device,
-    ).to(dtype=torch.int64)
-    swa_loc = full_to_swa_mapping[cache_loc].to(torch.int32)
-
     col = torch.arange(stride, device=device).view(1, -1)
-    committed = (col < commit_lens.to(torch.long).view(-1, 1)).reshape(-1)
-    swa_loc = torch.where(committed, swa_loc, torch.full_like(swa_loc, -1))
-
-    return CommitInjectLayoutResult(swa_loc=swa_loc, positions=positions)
+    committed = col < commit_lens.to(torch.long).view(-1, 1)
+    req_rows = req_pool_indices.to(torch.long).view(-1, 1).expand(bs, stride)
+    rows = torch.where(committed, req_rows, 0)
+    cols = torch.where(committed, positions_2d.long(), 0)
+    cache_loc = torch.where(committed, req_to_token[rows, cols].long(), 0)
+    swa_loc = torch.where(committed, full_to_swa_mapping[cache_loc], -1)
+    return CommitInjectLayoutResult(
+        swa_loc=swa_loc.to(torch.int32).reshape(-1), positions=positions
+    )
 
 
 @triton.jit
@@ -753,13 +594,16 @@ def _commit_inject_layout_kernel(
     prefix = tl.load(prefix_lens_ptr + r, mask=mask, other=0).to(tl.int64)
     pos_off = tl.load(block_pos_offsets_ptr + c, mask=mask, other=0).to(tl.int64)
     rp = tl.load(req_pool_ptr + r, mask=mask, other=0).to(tl.int64)
-    full_loc = tl.load(
-        req_to_token_ptr + rp * rt_stride + prefix + pos_off, mask=mask, other=0
-    ).to(tl.int64)
-    swa = tl.load(full_to_swa_ptr + full_loc, mask=mask, other=-1).to(tl.int32)
-
+    # Padded/uncommitted slots need no cache lookup. Their request-table
+    # entries may be stale or uninitialized, so mask before dereferencing them.
     commit_len = tl.load(commit_lens_ptr + r, mask=mask, other=0).to(tl.int64)
-    swa = tl.where(c.to(tl.int64) < commit_len, swa, -1)
+    committed = mask & (c.to(tl.int64) < commit_len)
+    full_loc = tl.load(
+        req_to_token_ptr + rp * rt_stride + prefix + pos_off,
+        mask=committed,
+        other=0,
+    ).to(tl.int64)
+    swa = tl.load(full_to_swa_ptr + full_loc, mask=committed, other=-1).to(tl.int32)
 
     tl.store(swa_loc_ptr + offs, swa, mask=mask)
     tl.store(positions_ptr + offs, prefix + pos_off, mask=mask)
@@ -802,7 +646,7 @@ def build_commit_inject_layout_triton(
 class BuildOutTokens:
     @classmethod
     def execute(cls, *args, **kwargs) -> torch.Tensor:
-        if inputs_on_cuda(*args, **kwargs) and not _is_npu:
+        if inputs_on_cuda(*args, **kwargs):
             return cls.triton(*args, **kwargs)
         return cls.torch(*args, **kwargs)
 
@@ -834,6 +678,18 @@ class BuildOutTokens:
         verify_num_draft_tokens: int,
         gamma: int,
     ) -> torch.Tensor:
+        if _is_npu:
+            from sgl_kernel_npu.operators.sample import (
+                build_out_tokens_triton as npu_build_out_tokens_triton,
+            )
+
+            return npu_build_out_tokens_triton(
+                draft_tokens=draft_tokens,
+                correct_len=correct_len,
+                bonus=bonus,
+                verify_num_draft_tokens=verify_num_draft_tokens,
+                gamma=gamma,
+            )
         return build_out_tokens_triton(
             draft_tokens=draft_tokens,
             correct_len=correct_len,

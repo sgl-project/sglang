@@ -15,6 +15,7 @@ import triton
 import triton.language as tl
 from einops import rearrange
 
+from sglang.kernels.fused_op import BaseFusedOp
 from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.model_executor.cuda_graph_config import (
@@ -26,16 +27,50 @@ from sglang.srt.utils import (
     cdiv,
     cpu_has_amx_support,
     device_context,
-    is_cpu,
     is_npu,
     next_power_of_2,
 )
 
 _is_npu = is_npu()
-_use_cpu = is_cpu() and cpu_has_amx_support()
 
 # Maximum rows per Triton block for layernorm gated kernel
 MAX_ROWS_PER_BLOCK = 4
+
+_GATE_ACTIVATION_FNS = {
+    "swish": F.silu,
+    "silu": F.silu,
+    "sigmoid": torch.sigmoid,
+}
+
+
+def _apply_gate(x, z, activation):
+    activation_fn = _GATE_ACTIVATION_FNS.get(activation)
+    if activation_fn is None:
+        raise ValueError(f"Unsupported gated RMSNorm activation: {activation}")
+    return x * activation_fn(z)
+
+
+def _reshape_native_input_for_gate(x, z):
+    if z is None:
+        return x, None
+    if x.ndim == z.ndim:
+        for x_size, z_size in zip(x.shape, z.shape):
+            torch._check(
+                x_size == z_size,
+                lambda: "Gated RMSNorm inputs must have matching shapes",
+            )
+        return x, None
+    if x.ndim != 2 or z.ndim != 3:
+        raise ValueError(f"Unsupported gated RMSNorm shapes: x={x.shape}, z={z.shape}")
+    torch._check(
+        z.shape[0] * z.shape[1] == x.shape[0],
+        lambda: "Gated RMSNorm gate rows must match the flattened input",
+    )
+    torch._check(
+        z.shape[2] == x.shape[1],
+        lambda: "Gated RMSNorm inputs must have the same hidden dimension",
+    )
+    return x.reshape(z.shape), x.shape
 
 
 def rms_norm_ref(
@@ -47,6 +82,7 @@ def rms_norm_ref(
     group_size=None,
     norm_before_gate=True,
     upcast=True,
+    activation="swish",
 ):
     dtype = x.dtype
     N = x.shape[-1]
@@ -56,7 +92,7 @@ def rms_norm_ref(
         x = x.float()
         z = z.float() if z is not None else z
     if z is not None and not norm_before_gate:
-        x = x * F.silu(z)
+        x = _apply_gate(x, z, activation)
     if group_size is None:
         rstd = 1 / torch.sqrt((x.square()).mean(dim=-1, keepdim=True) + eps)
         out = (x * rstd * weight) + bias if bias is not None else (x * rstd * weight)
@@ -67,7 +103,7 @@ def rms_norm_ref(
         if bias is not None:
             out = out + bias
     if z is not None and norm_before_gate:
-        out *= F.silu(z)
+        out = _apply_gate(out, z, activation)
     return out.to(dtype)
 
 
@@ -98,6 +134,9 @@ def _layer_norm_fwd_1pass_kernel(
     IS_RMS_NORM: tl.constexpr,
     ACTIVATION: tl.constexpr,
     USE_GDC: tl.constexpr = False,
+    Q=None,
+    S=None,
+    QUANT: tl.constexpr = False,
 ):
     if USE_GDC:
         tl.extra.cuda.gdc_wait()
@@ -192,8 +231,15 @@ def _layer_norm_fwd_1pass_kernel(
         elif ACTIVATION == "sigmoid":
             y *= tl.sigmoid(z)
 
-    # Write output
-    tl.store(Y_base, y, mask=mask)
+    if QUANT:  # the block is one token: per-token FP8 as _per_token_group_quant_8bit
+        y = tl.where(mask, y.to(Y.dtype.element_ty).to(tl.float32), 0.0)
+        y_s = tl.maximum(tl.max(tl.abs(y)), 1e-10) / 448.0
+        y_q = tl.clamp(y * (1.0 / y_s), -448.0, 448.0).to(Q.dtype.element_ty)
+        tl.store(Q + rows[:, None] * N + col_offsets, y_q, mask=mask)
+        tl.store(S + tl.program_id(0), y_s)
+    else:
+        # Write output
+        tl.store(Y_base, y, mask=mask)
 
     if USE_GDC:
         tl.extra.cuda.gdc_launch_dependents()
@@ -232,6 +278,7 @@ def _layer_norm_fwd(
     norm_before_gate=True,
     is_rms_norm=False,
     activation: str = "swish",
+    quant_heads: int = 0,
 ):
     M, N = x.shape
     if group_size is None:
@@ -273,6 +320,20 @@ def _layer_norm_fwd(
     num_warps = min(max(BLOCK_N // 256, 1), 8)
     # Calculate rows per block based on SM count
     rows_per_block = calc_rows_per_block(M, x.device)
+    quant = {}
+    # quant_heads: one block per token, same per-warp row split (rows round identically), FP8 (q, scale) out
+    if quant_heads:
+        assert ngroups == 1 and M % quant_heads == 0
+        # at most 1024 threads (16 wave64s) per block; each row still reduces inside one warp
+        num_warps = min(num_warps * quant_heads // rows_per_block, 16)
+        rows_per_block = quant_heads
+        q = torch.empty(
+            (M // quant_heads, quant_heads * N),
+            dtype=torch.float8_e4m3fn,
+            device=x.device,
+        )
+        s = torch.empty((M // quant_heads, 1), dtype=torch.float32, device=x.device)
+        quant = {"Q": q, "S": s, "QUANT": True}
     # Update grid to use rows_per_block
     grid = (cdiv(M, rows_per_block), ngroups)
     pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
@@ -318,8 +379,9 @@ def _layer_norm_fwd(
             num_warps=num_warps,
             ACTIVATION=activation,
             **pdl_kwargs,
+            **quant,
         )
-    return out, mean, rstd
+    return ((q, s) if quant_heads else out), mean, rstd
 
 
 if _is_npu:
@@ -459,7 +521,7 @@ class LayerNorm(torch.nn.Module):
         )
 
 
-class RMSNorm(torch.nn.Module):
+class RMSNorm(BaseFusedOp):
     def __init__(
         self,
         hidden_size,
@@ -486,28 +548,60 @@ class RMSNorm(torch.nn.Module):
     def reset_parameters(self):
         torch.nn.init.ones_(self.weight)
 
-    def forward(self, x, z=None):
-        """If z is not None, we do norm(x) * silu(z) if norm_before_gate, else norm(x * silu(z))"""
-        if _use_cpu:
-            assert (
-                self.norm_before_gate
-                and self.group_size is None
-                and self.activation == "swish"
-            ), (
-                "CPU rmsnorm_gated currently only supports norm before gate without group size or activation other than swish"
-            )
-            return torch.ops.sgl_kernel.fused_rmsnorm_gated_cpu(
-                x, self.weight, z, self.eps
-            )
-        else:
-            return layernorm_fn(
-                x,
-                self.weight,
-                self.bias,
-                z=z,
-                eps=self.eps,
-                group_size=self.group_size,
-                norm_before_gate=self.norm_before_gate,
-                is_rms_norm=True,
-                activation=self.activation,
-            )
+    def forward_native(self, x, z=None):
+        x, output_shape = _reshape_native_input_for_gate(x, z)
+
+        out = rms_norm_ref(
+            x,
+            self.weight,
+            self.bias,
+            z=z,
+            eps=self.eps,
+            group_size=self.group_size,
+            norm_before_gate=self.norm_before_gate,
+            activation=self.activation,
+        )
+        return out.reshape(output_shape) if output_shape is not None else out
+
+    def _torch_compile_forward(self, num_tokens: int) -> None:
+        return None
+
+    def forward_cpu(self, x, z=None):
+        if not cpu_has_amx_support():
+            return self.forward_native(x, z)
+        assert (
+            self.norm_before_gate
+            and self.group_size is None
+            and self.activation == "swish"
+        ), (
+            "CPU rmsnorm_gated currently only supports norm before gate without group size or activation other than swish"
+        )
+        return torch.ops.sgl_kernel.fused_rmsnorm_gated_cpu(x, self.weight, z, self.eps)
+
+    def forward_triton(self, x, z=None):
+        return layernorm_fn(
+            x,
+            self.weight,
+            self.bias,
+            z=z,
+            eps=self.eps,
+            group_size=self.group_size,
+            norm_before_gate=self.norm_before_gate,
+            is_rms_norm=True,
+            activation=self.activation,
+        )
+
+    def forward_cuda(self, x, z=None):
+        return self.forward_triton(x, z)
+
+    def forward_hip(self, x, z=None):
+        return self.forward_triton(x, z)
+
+    def forward_npu(self, x, z=None):
+        return self.forward_triton(x, z)
+
+    def forward_xpu(self, x, z=None):
+        return self.forward_triton(x, z)
+
+    def forward_musa(self, x, z=None):
+        return self.forward_triton(x, z)

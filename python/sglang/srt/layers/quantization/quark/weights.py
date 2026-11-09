@@ -5,7 +5,6 @@ import re
 
 import torch
 
-from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_cuda
 
 _is_cuda = is_cuda()
@@ -61,32 +60,11 @@ def _load_gptoss_quark_expert_weights(model, weights, quark_expert_pat):
     loaded_params: set[str] = set()
     mxfp4_block = 32
 
-    moe_tp_rank = get_parallel().moe_tp_rank
-    moe_tp_size = get_parallel().moe_tp_size
-    moe_ep_rank = get_parallel().moe_ep_rank
-    moe_ep_size = get_parallel().moe_ep_size
-
     intermediate_size = model.config.intermediate_size
     assert intermediate_size % mxfp4_block == 0, (
         f"{intermediate_size=} must be divisible by {mxfp4_block=}"
     )
     intermediate_size_block = intermediate_size // mxfp4_block
-
-    per_rank_intermediate_size_block = math.ceil(intermediate_size_block / moe_tp_size)
-
-    per_rank_intermediate_size = per_rank_intermediate_size_block * mxfp4_block
-
-    # Calculate common slicing bounds for current rank
-    assert model.config.num_local_experts % moe_ep_size == 0
-    moe_num_local_experts = model.config.num_local_experts // moe_ep_size
-
-    moe_tp_rank_start = moe_tp_rank * per_rank_intermediate_size
-    moe_tp_rank_end = min(
-        (moe_tp_rank + 1) * per_rank_intermediate_size, intermediate_size
-    )
-
-    moe_ep_rank_start = moe_ep_rank * moe_num_local_experts
-    moe_ep_rank_end = (moe_ep_rank + 1) * moe_num_local_experts
 
     for name, weight in weights:
         # Quark stores experts separately as
@@ -96,6 +74,30 @@ def _load_gptoss_quark_expert_weights(model, weights, quark_expert_pat):
         if m is None:
             continue
         prefix, expert_str, proj, suffix = m.groups()
+        experts = model.get_submodule(prefix)
+        moe_tp_rank = experts.moe_tp_rank
+        moe_tp_size = experts.moe_tp_size
+        moe_ep_rank = experts.moe_ep_rank
+        moe_ep_size = experts.moe_ep_size
+
+        per_rank_intermediate_size_block = math.ceil(
+            intermediate_size_block / moe_tp_size
+        )
+
+        per_rank_intermediate_size = per_rank_intermediate_size_block * mxfp4_block
+
+        # Calculate common slicing bounds for current rank
+        assert model.config.num_local_experts % moe_ep_size == 0
+        moe_num_local_experts = model.config.num_local_experts // moe_ep_size
+
+        moe_tp_rank_start = moe_tp_rank * per_rank_intermediate_size
+        moe_tp_rank_end = min(
+            (moe_tp_rank + 1) * per_rank_intermediate_size, intermediate_size
+        )
+
+        moe_ep_rank_start = moe_ep_rank * moe_num_local_experts
+        moe_ep_rank_end = (moe_ep_rank + 1) * moe_num_local_experts
+
         global_expert_id = int(expert_str)
         if global_expert_id < moe_ep_rank_start or global_expert_id >= moe_ep_rank_end:
             continue
