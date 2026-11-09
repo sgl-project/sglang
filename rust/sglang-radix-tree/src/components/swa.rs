@@ -12,7 +12,7 @@ use crate::cache_action::{
     SwaRebuild,
 };
 use crate::components::TreeComponent;
-use crate::components::{ComponentType, FULL, SWA};
+use crate::components::{ComponentType, FULL, Family, SWA};
 use crate::node::ChildKeyType;
 use crate::node::Node;
 use crate::node::{NodeId, NodeIdx_, TreeCoreRuntimeError, ValueSlotIdx};
@@ -169,7 +169,12 @@ impl SwaComponent {
         let mut cur_id = node_id;
         while covered_tokens < self.sliding_window_size {
             let cur = tree_core.arena.node(cur_id);
-            if cur.is_root() || cur.write_through_pending_id.is_some() {
+            // A copy in the same write-back batch already committed this SWA
+            // host value.
+            if cur.is_root()
+                || (cur.write_through_pending_id.is_some()
+                    && !tree_core.is_round_write_pending_(cur))
+            {
                 break;
             }
             let (on_device, on_host) = (cur.has_device_value(SWA), cur.has_host_value(SWA));
@@ -337,6 +342,10 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
 
     fn component_type(&self) -> ComponentType {
         SWA
+    }
+
+    fn family(&self) -> Family {
+        Family::Window
     }
 
     fn refresh_lru(

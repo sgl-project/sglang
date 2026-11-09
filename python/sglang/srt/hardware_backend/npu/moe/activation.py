@@ -46,6 +46,19 @@ def _supports_swiglu_int8(device: torch.device, dtype: torch.dtype, width: int) 
         return False
 
 
+class NPUSwigluWithLimit(BaseActivation):
+    """Clip gate/up before SiLU, keeping the floating output dtype."""
+
+    def __init__(self, limit: float):
+        self.limit = float(limit)
+
+    def _apply_activation(self, hidden_states: torch.Tensor):
+        gate, up = hidden_states.float().chunk(2, dim=-1)
+        gate = gate.clamp(max=self.limit)
+        up = up.clamp(min=-self.limit, max=self.limit)
+        return (F.silu(gate) * up).to(hidden_states.dtype), None
+
+
 class NPUSwigluQuant(BaseActivation):
     @classmethod
     def apply(cls, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor] | None:
@@ -182,7 +195,7 @@ class NPUSitu(BaseActivation):
 
 
 class NPUSituMXFP8Quant(BaseActivation):
-    """A5 AscendC grouped SiTU with valid-row MXFP8 quantization."""
+    """Ascend 950 AscendC grouped SiTU with valid-row MXFP8 quantization."""
 
     def __init__(self, *, beta: float = 4.0, linear_beta: float = 25.0):
         from sgl_kernel_npu.activation.situ_mxfp8_quant import situ_mxfp8_quant

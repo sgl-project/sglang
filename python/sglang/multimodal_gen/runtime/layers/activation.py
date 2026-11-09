@@ -62,7 +62,7 @@ class SiluAndMul(CustomOp):
             getattr(linear, "quant_method", None), "accepts_mxfp8_input", None
         )
         if accepts_mxfp8 is not None and accepts_mxfp8(linear):
-            from sglang.kernels.ops.diffusion import (
+            from sglang.kernels.ops.activation.swiglu_mxfp8_swizzled import (
                 can_use_silu_mul_mxfp8,
                 silu_mul_mxfp8,
             )
