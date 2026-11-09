@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Online W8A8 FP8 for plain ``nn.Linear`` modules of diffusers-native components.
 
-``OnlineFP8Linear.from_linear`` replaces a prepared fp16/bf16 ``nn.Linear`` at
-load with per-output-channel e4m3 weights (the recipe of ``Fp8LinearMethod``'s
+``OnlineFP8Linear.from_linear`` converts a prepared fp16/bf16 ``nn.Linear`` to
+per-output-channel e4m3 weights (the recipe of ``Fp8LinearMethod``'s
 online path), dynamic per-token activation scales and the shared
 ``apply_fp8_linear`` dispatch. ``forward_quantized`` takes rows a fused producer
 already quantized. Inference only.
