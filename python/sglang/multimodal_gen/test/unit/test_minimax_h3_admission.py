@@ -394,11 +394,16 @@ def test_video_adapter_does_not_override_default_reference_resize_mode():
     assert "reference_resize_mode" not in lowered
 
 
-def test_sampling_params_normalizes_reference_resize_mode_and_defaults_to_diffusers():
-    assert MiniMaxH3SamplingParams().reference_resize_mode == "diffusers"
+def test_sampling_params_normalizes_reference_resize_mode():
     assert (
         MiniMaxH3SamplingParams(reference_resize_mode=" MATCH ").reference_resize_mode
         == "match"
+    )
+    assert (
+        MiniMaxH3SamplingParams(
+            reference_resize_mode=" DIFFUSERS "
+        ).reference_resize_mode
+        == "diffusers"
     )
 
 
@@ -412,7 +417,8 @@ def test_sampling_params_rejects_invalid_reference_resize_mode(bad_mode):
     ("sampling_params", "expected_mode"),
     [
         (SimpleNamespace(reference_resize_mode="match"), "match"),
-        (SimpleNamespace(), "diffusers"),
+        (SimpleNamespace(reference_resize_mode="diffusers"), "diffusers"),
+        (SimpleNamespace(), "max"),
     ],
 )
 def test_prequeue_forwards_reference_resize_mode_and_target_canvas(
