@@ -53,6 +53,7 @@ PLE_OFFLOAD_BACKENDS = ("pinned", "file")
 
 # cudaDeviceAttr enum values (cuda_runtime_api.h).
 _CUDA_DEV_ATTR_PAGEABLE_MEMORY_ACCESS = 88
+_CUDA_DEV_ATTR_PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES = 100
 _MADV_RANDOM = 1
 _MADV_DONTNEED = 4
 _PAGE_SHIFT = 12
@@ -372,6 +373,24 @@ def device_reads_pageable_memory(device_index: int = 0) -> Optional[bool]:
 
     Returns None when the CUDA runtime library cannot be queried.
     """
+    value = _device_attribute(_CUDA_DEV_ATTR_PAGEABLE_MEMORY_ACCESS, device_index)
+    return None if value is None else bool(value)
+
+
+def device_faults_pageable_pages(device_index: int = 0) -> bool:
+    """Whether the GPU reaches pageable host memory through page faults the driver
+    serves (HMM on a discrete GPU), rather than through the host's page tables (ATS, as
+    on GB10). False when either attribute cannot be queried."""
+    reads = _device_attribute(_CUDA_DEV_ATTR_PAGEABLE_MEMORY_ACCESS, device_index)
+    host_tables = _device_attribute(
+        _CUDA_DEV_ATTR_PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES, device_index
+    )
+    return reads == 1 and host_tables == 0
+
+
+def _device_attribute(attribute: int, device_index: int) -> Optional[int]:
+    """``cudaDeviceGetAttribute`` through the CUDA runtime library; None when it
+    cannot be queried."""
     candidates = [ctypes.util.find_library("cudart")]
     torch_lib = os.path.join(os.path.dirname(torch.__file__), "lib")
     if os.path.isdir(torch_lib):
@@ -398,11 +417,11 @@ def device_reads_pageable_memory(device_index: int = 0) -> Optional[bool]:
             value = ctypes.c_int()
             rc = cudart.cudaDeviceGetAttribute(
                 ctypes.byref(value),
-                ctypes.c_int(_CUDA_DEV_ATTR_PAGEABLE_MEMORY_ACCESS),
+                ctypes.c_int(attribute),
                 ctypes.c_int(device_index),
             )
             if rc == 0:
-                return bool(value.value)
+                return value.value
         except OSError:
             continue
     return None

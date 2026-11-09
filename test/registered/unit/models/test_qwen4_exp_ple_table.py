@@ -29,6 +29,7 @@ from sglang.srt.models.qwen4_exp_ple_table import (
     allocate_ple_host_table,
     check_file_backend_supported,
     default_ple_table_dir,
+    device_faults_pageable_pages,
     device_reads_pageable_memory,
     make_ple_file_prefetcher,
     make_ple_file_rss_trimmer,
@@ -333,6 +334,31 @@ class TestFileBackendDeviceCheck(CustomTestCase):
     def test_no_pageable_access_refused(self):
         with self.assertRaisesRegex(ValueError, "--ple-offload-backend pinned"):
             self._check({self.PAGEABLE: 0, self.USES_HOST_PAGE_TABLES: 0})
+
+    def _faults(self, attributes=None, error=None):
+        cdll = (
+            mock.patch("ctypes.CDLL", side_effect=error)
+            if error
+            else mock.patch("ctypes.CDLL", return_value=_FakeCudart(attributes))
+        )
+        with mock.patch("ctypes.util.find_library", return_value="libcudart.so"), cdll:
+            return device_faults_pageable_pages(0)
+
+    def test_faults_pageable_pages_only_without_host_page_tables(self):
+        cases = {
+            "HMM": ({self.PAGEABLE: 1, self.USES_HOST_PAGE_TABLES: 0}, True),
+            "GB10": ({self.PAGEABLE: 1, self.USES_HOST_PAGE_TABLES: 1}, False),
+            "no pageable access": (
+                {self.PAGEABLE: 0, self.USES_HOST_PAGE_TABLES: 0},
+                False,
+            ),
+        }
+        for name, (attributes, expected) in cases.items():
+            with self.subTest(name):
+                self.assertIs(self._faults(attributes), expected)
+
+    def test_unqueryable_device_does_not_fault(self):
+        self.assertIs(self._faults(error=OSError("no libcudart")), False)
 
 
 @unittest.skipUnless(
