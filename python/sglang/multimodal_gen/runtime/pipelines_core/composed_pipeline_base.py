@@ -9,6 +9,7 @@ This module defines the base class for pipelines that are composed of multiple s
 
 import os
 from abc import ABC, abstractmethod
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, ClassVar, Iterator, Literal, cast
 
 import torch
@@ -30,6 +31,7 @@ from sglang.multimodal_gen.runtime.loader.utils import _normalize_component_type
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_loading_order import (
     ComponentLoadSpec,
     order_component_load_specs,
+    partition_component_load_specs,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentResidencyManager,
@@ -624,55 +626,41 @@ class ComposedPipelineBase(ABC):
             )
 
         # reorder loading order to avoid OOM
-        component_load_specs: ComponentLoadSpec = order_component_load_specs(
-            component_load_specs
-        )
+        component_load_specs = order_component_load_specs(component_load_specs)
         logger.info(
             "Memory-aware component load order: %s",
             [spec.module_name for spec in component_load_specs],
         )
 
-        for spec in tqdm(
-            iterable=component_load_specs, desc="Loading required modules"
-        ):
-            module_name: str = spec.module_name
-            load_module_name: str = spec.load_module_name
-            transformers_or_diffusers: str = spec.transformers_or_diffusers
-            architecture: str = spec.architecture
-            component_model_path: str = spec.component_model_path
-
-            attn_backend, matched_backend_key = (
-                server_args.resolve_component_attention_backend(
-                    module_name, load_module_name
-                )
-            )
-            backend_by_role = server_args.resolve_component_backend_by_role(
-                module_name, load_module_name
-            )
-            if attn_backend is not None:
-                logger.info(
-                    "Using %s backend for component: %s",
-                    attn_backend.name.lower(),
-                    matched_backend_key,
-                )
-            module, memory_usage = PipelineComponentLoader.load_component(
-                component_name=module_name,
-                component_type=load_module_name,
-                loader_cls=self.component_loaders.get(module_name),
-                component_model_path=component_model_path,
-                transformers_or_diffusers=transformers_or_diffusers,
-                server_args=server_args,
-                component_architecture=architecture,
-                component_attn_backend=attn_backend,
-                component_attn_name=matched_backend_key or module_name,
-                component_backend_by_role=backend_by_role,
+        # Overlap the cold-start bottleneck (DiT + text encoder weight I/O).
+        # Small helpers stay serial. See issue #19092.
+        parallel_specs, serial_specs = partition_component_load_specs(
+            component_load_specs
+        )
+        if parallel_specs:
+            logger.info(
+                "Parallel-load candidates (%d): %s; serial (%d): %s",
+                len(parallel_specs),
+                [spec.module_name for spec in parallel_specs],
+                len(serial_specs),
+                [spec.module_name for spec in serial_specs],
             )
 
-            self.memory_usages[module_name] = memory_usage
-
-            if module_name in loaded_components:
-                logger.warning("Overwriting module %s", module_name)
-            loaded_components[module_name] = module
+        # Heavy modules first (matches memory-aware order), then cheap helpers.
+        self._load_component_specs(
+            parallel_specs,
+            server_args,
+            loaded_components,
+            parallel=len(parallel_specs) >= 2,
+            desc="Loading heavy components",
+        )
+        self._load_component_specs(
+            serial_specs,
+            server_args,
+            loaded_components,
+            parallel=False,
+            desc="Loading small components",
+        )
 
         # Check if all required modules were loaded
         for module_name in required_modules:
@@ -707,6 +695,116 @@ class ComposedPipelineBase(ABC):
         )
 
         return loaded_components
+
+    @staticmethod
+    def _pin_loader_thread_device() -> None:
+        """Pin the platform device for this thread.
+
+        CUDA/ROCm/NPU current-device state is thread-local; ThreadPool workers
+        do not inherit the main thread's selection, so weight `.to(device)` in
+        a worker can land on the wrong GPU without an explicit pin.
+        """
+        try:
+            device = current_platform.get_local_torch_device()
+        except NotImplementedError:
+            return
+        try:
+            current_platform.set_device(device)
+        except Exception:
+            # CPU / platforms without a settable current device.
+            return
+
+    def _load_one_component_from_spec(
+        self,
+        spec: ComponentLoadSpec,
+        server_args: ServerArgs,
+    ) -> tuple[str, Any, float]:
+        """Resolve loader args and load one component. Safe for worker threads."""
+        self._pin_loader_thread_device()
+
+        module_name = spec.module_name
+        load_module_name = spec.load_module_name
+        attn_backend, matched_backend_key = (
+            server_args.resolve_component_attention_backend(
+                module_name, load_module_name
+            )
+        )
+        backend_by_role = server_args.resolve_component_backend_by_role(
+            module_name, load_module_name
+        )
+        if attn_backend is not None:
+            logger.info(
+                "Using %s backend for component: %s",
+                attn_backend.name.lower(),
+                matched_backend_key,
+            )
+        module, memory_usage = PipelineComponentLoader.load_component(
+            component_name=module_name,
+            component_type=load_module_name,
+            loader_cls=self.component_loaders.get(module_name),
+            component_model_path=spec.component_model_path,
+            transformers_or_diffusers=spec.transformers_or_diffusers,
+            server_args=server_args,
+            component_architecture=spec.architecture,
+            component_attn_backend=attn_backend,
+            component_attn_name=matched_backend_key or module_name,
+            component_backend_by_role=backend_by_role,
+        )
+        return module_name, module, memory_usage
+
+    def _store_loaded_component(
+        self,
+        loaded_components: dict[str, Any],
+        module_name: str,
+        module: Any,
+        memory_usage: float,
+    ) -> None:
+        self.memory_usages[module_name] = memory_usage
+        if module_name in loaded_components:
+            logger.warning("Overwriting module %s", module_name)
+        loaded_components[module_name] = module
+
+    def _load_component_specs(
+        self,
+        specs: list[ComponentLoadSpec],
+        server_args: ServerArgs,
+        loaded_components: dict[str, Any],
+        *,
+        parallel: bool,
+        desc: str,
+    ) -> None:
+        if not specs:
+            return
+
+        if not parallel or len(specs) < 2:
+            for spec in tqdm(iterable=specs, desc=desc):
+                module_name, module, memory_usage = self._load_one_component_from_spec(
+                    spec, server_args
+                )
+                self._store_loaded_component(
+                    loaded_components, module_name, module, memory_usage
+                )
+            return
+
+        # Cap concurrency at 2: enough to overlap text_encoder + transformer I/O
+        # without stacking every heavy shard onto the GPU at once.
+        max_workers = min(2, len(specs))
+        logger.info(
+            "Loading %d heavy components in parallel (max_workers=%d): %s",
+            len(specs),
+            max_workers,
+            [spec.module_name for spec in specs],
+        )
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = [
+                pool.submit(self._load_one_component_from_spec, spec, server_args)
+                for spec in specs
+            ]
+            for future in tqdm(futures, desc=f"{desc} (parallel)"):
+                module_name, module, memory_usage = future.result()
+                self._store_loaded_component(
+                    loaded_components, module_name, module, memory_usage
+                )
 
     @staticmethod
     def _infer_stage_name(stage: PipelineStage) -> str:
