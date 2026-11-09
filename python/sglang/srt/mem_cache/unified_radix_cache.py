@@ -2227,30 +2227,35 @@ class UnifiedRadixCache(BasePrefixCache):
 
         host_anchor_params = self.inc_host_lock_ref(node_id).to_dec_params()
 
-        # Lock the path before building transfers (the aux build can evict).
-        result = self.inc_lock_ref(node_id)
-        ancestor_lock_params = result.to_dec_params()
-
-        # Let each component pre-allocate per-request state for the load-back;
-        # the finally below lets components recover it unless the load succeeds.
-        preps: dict[ComponentType, PrepareLoadBackResult] = {
-            comp.component_type: comp.prepare_load_back(node_id, req=req)
-            for comp in self._components_tuple
-        }
+        # Keep the admission pin until the asynchronous receipt takes over.
+        result = None
+        preps: dict[ComponentType, PrepareLoadBackResult] = {}
         success = False
         try:
+            result = self.inc_lock_ref(node_id)
+            for comp in self._components_tuple:
+                preps[comp.component_type] = comp.prepare_load_back(node_id, req=req)
             success = self._load_back_transfers(
                 node_id=node_id,
                 mem_quota=mem_quota,
                 req=req,
                 result=result,
-                ancestor_lock_params=ancestor_lock_params,
                 host_anchor_params=host_anchor_params,
             )
             return success
         finally:
-            for comp in self._components_tuple:
-                comp.finalize_load_back(req, preps[comp.component_type], success)
+            try:
+                for comp in self._components_tuple:
+                    prep = preps.get(comp.component_type)
+                    if prep is not None:
+                        comp.finalize_load_back(req, prep, success)
+            finally:
+                try:
+                    if result is not None:
+                        self.dec_lock_ref(node_id, result.to_dec_params())
+                finally:
+                    if not success:
+                        self.dec_host_lock_ref(node_id, host_anchor_params)
 
     def _load_back_transfers(
         self,
@@ -2259,7 +2264,6 @@ class UnifiedRadixCache(BasePrefixCache):
         mem_quota: Optional[int],
         req,
         result: IncLockRefResult,
-        ancestor_lock_params: DecLockRefParams,
         host_anchor_params: DecLockRefParams,
     ) -> bool:
         # Build the KV + per-component aux transfers.
@@ -2277,8 +2281,6 @@ class UnifiedRadixCache(BasePrefixCache):
         if (kv_tokens < max(1, self.load_back_threshold) and not comp_xfers) or (
             mem_quota is not None and kv_tokens + result.delta > mem_quota
         ):
-            self.dec_lock_ref(node_id, ancestor_lock_params)
-            self.dec_host_lock_ref(node_id, host_anchor_params)
             return False
 
         c128_allocator = getattr(
@@ -2292,8 +2294,6 @@ class UnifiedRadixCache(BasePrefixCache):
             if not self.token_to_kv_pool_allocator.ensure_c128_capacity(
                 self, c128_num_pages
             ):
-                self.dec_lock_ref(node_id, ancestor_lock_params)
-                self.dec_host_lock_ref(node_id, host_anchor_params)
                 return False
 
         avail = self._component_available_size(self.slot_id(TREE_TOKEN))
@@ -2301,8 +2301,6 @@ class UnifiedRadixCache(BasePrefixCache):
             needed = kv_tokens - avail
             self.evict_for_alloc(EvictParams(num_tokens=needed))
             if self._component_available_size(self.slot_id(TREE_TOKEN)) < kv_tokens:
-                self.dec_lock_ref(node_id, ancestor_lock_params)
-                self.dec_host_lock_ref(node_id, host_anchor_params)
                 return False
 
         # Load H→D
@@ -2314,9 +2312,7 @@ class UnifiedRadixCache(BasePrefixCache):
             extra_pools=aux_xfers or None,
         )
 
-        self.dec_lock_ref(node_id, ancestor_lock_params)
         if device_indices is None:
-            self.dec_host_lock_ref(node_id, host_anchor_params)
             return False
 
         # Commit the loaded KV back onto the node + apply its emitted actions.
