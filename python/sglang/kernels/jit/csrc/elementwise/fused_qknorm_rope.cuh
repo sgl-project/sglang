@@ -262,7 +262,7 @@ void fused_qk_norm_rope(
     int rotary_dim) {
   using namespace host;
 
-  RuntimeCheck(qkv.device().device_type == kDLCUDA, "qkv must be a CUDA tensor");
+  RuntimeCheck(qkv.device().device_type == kDLGPU, "qkv must be a CUDA tensor");
   RuntimeCheck(qkv.is_contiguous(), "qkv must be contiguous");
   RuntimeCheck(qkv.dtype().code == kDLBfloat && qkv.dtype().bits == 16, "qkv must be bfloat16");
   RuntimeCheck(qkv.ndim() == 2, "qkv must be 2D: [num_tokens, (nq+nk+nv)*head_dim]");
@@ -277,7 +277,7 @@ void fused_qk_norm_rope(
   RuntimeCheck(
       k_weight.ndim() == 1 && static_cast<int>(k_weight.size(0)) == head_dim, "k_weight must be 1D of size head_dim");
 
-  RuntimeCheck(position_ids.device().device_type == kDLCUDA, "position_ids must be a CUDA tensor");
+  RuntimeCheck(position_ids.device().device_type == kDLGPU, "position_ids must be a CUDA tensor");
   RuntimeCheck(position_ids.is_contiguous(), "position_ids must be contiguous");
   RuntimeCheck(position_ids.dtype().code == kDLInt && position_ids.dtype().bits == 32, "position_ids must be int32");
   RuntimeCheck(position_ids.ndim() == 1, "position_ids must be 1D: [num_tokens]");

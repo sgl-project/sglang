@@ -27,6 +27,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pointer_head import PointerPooler
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils import PPMissingLayer
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -34,7 +35,7 @@ from sglang.srt.models import qwen3_5
 from sglang.srt.models.qwen2_moe import Qwen2MoeSparseMoeBlock
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_model, get_parallel
-from sglang.srt.utils import LazyValue, add_prefix
+from sglang.srt.utils import LazyValue
 
 logger = logging.getLogger(__name__)
 

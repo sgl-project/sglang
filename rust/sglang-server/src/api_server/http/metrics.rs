@@ -86,9 +86,12 @@ mod tests {
                     startup_ready: true,
                     is_disaggregation: false,
                     mm_limits: Default::default(),
+                    multimodal: false,
                     peer_endpoints: Vec::new(),
                     metadata: Default::default(),
                     metrics: frontend,
+                    request_log: None,
+                    generate_validator: None,
                 },
             ),
             generation_policy: crate::message::request::GenerationPolicy::from(

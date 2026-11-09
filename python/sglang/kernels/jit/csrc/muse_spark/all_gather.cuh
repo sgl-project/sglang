@@ -134,7 +134,7 @@ struct MuseSparkAllGather {
 
     auto M = SymbolicSize{"num_tokens"};
     auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
     TensorMatcher({M, kNLocal}).with_dtype<bf16_t>().with_device(device).verify(local);
     if (b.has_value()) TensorMatcher({M, N}).with_dtype<bf16_t>().with_device(device).verify(b.value());
     if (c.has_value()) TensorMatcher({M, N}).with_dtype<bf16_t>().with_device(device).verify(c.value());
