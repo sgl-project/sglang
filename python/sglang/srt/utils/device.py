@@ -115,6 +115,7 @@ __all__ = [
     "is_gfx115_supported",
     "use_gfx115_kernels",
     "is_gfx1250_supported",
+    "is_gfx1151_supported",
     "get_hip_version",
     "get_nvidia_driver_version",
     "get_nvidia_driver_version_str",
