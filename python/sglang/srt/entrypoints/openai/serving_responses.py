@@ -99,7 +99,7 @@ from sglang.srt.entrypoints.openai.serving_chat import (
 )
 from sglang.srt.entrypoints.openai.tool_server import MCPToolServer, ToolServer
 from sglang.srt.entrypoints.openai.utils import to_openai_style_logprobs
-from sglang.srt.function_call.core_types import ToolCallItem
+from sglang.srt.function_call.core_types import ToolCallItem, ToolCallParseError
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.managers.io_struct import GenerateReqInput
@@ -895,24 +895,29 @@ class OpenAIServingResponses(OpenAIServingChat):
                 if request.is_include_output_logprobs() and isinstance(meta_info, dict)
                 else None
             )
-            output = self._make_response_output_items(
-                request,
-                self._settle_response_template_stop(
-                    final_res["text"],
-                    (
-                        meta_info.get("finish_reason")
-                        if isinstance(meta_info, dict)
-                        else None
-                    ),
+            try:
+                output = self._make_response_output_items(
                     request,
-                    final_res["text"],
-                ),
-                tokenizer,
-                output_logprobs=output_logprobs,
-                require_reasoning=require_reasoning,
-                output_ids=final_res.get("output_ids"),
-                finish_reason=meta_info.get("finish_reason") if meta_info else None,
-            )
+                    self._settle_response_template_stop(
+                        final_res["text"],
+                        (
+                            meta_info.get("finish_reason")
+                            if isinstance(meta_info, dict)
+                            else None
+                        ),
+                        request,
+                        final_res["text"],
+                    ),
+                    tokenizer,
+                    output_logprobs=output_logprobs,
+                    require_reasoning=require_reasoning,
+                    output_ids=final_res.get("output_ids"),
+                    finish_reason=meta_info.get("finish_reason") if meta_info else None,
+                )
+            except ToolCallParseError as e:
+                return self.create_error_response(
+                    str(e), err_type="server_error", status_code=500
+                )
 
             if meta_info is not None:
                 num_prompt_tokens = meta_info.get("prompt_tokens", 0)
@@ -1224,6 +1229,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                     )
                     incomplete_calls = _incomplete_tool_call_indices(parser)
                     parsed_via_native = bool(calls)
+                except ToolCallParseError:
+                    raise
                 except Exception as e:
                     logger.error("Tool call parsing error: %s", e)
 

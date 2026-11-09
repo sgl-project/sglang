@@ -101,7 +101,7 @@ from sglang.srt.entrypoints.openai.utils import (
 )
 from sglang.srt.entrypoints.request_headers import apply_header_overrides
 from sglang.srt.environ import envs
-from sglang.srt.function_call.core_types import ToolCallItem
+from sglang.srt.function_call.core_types import ToolCallItem, ToolCallParseError
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.glm47_moe_detector import Glm47MoeDetector
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
@@ -2520,6 +2520,10 @@ class OpenAIServingChat(OpenAIServingBase):
         # a proper HTTP 400 error response instead of streaming it as SSE payload.
         try:
             first_chunk = await generator.__anext__()
+        except ToolCallParseError as e:
+            return self.create_error_response(
+                str(e), err_type="InternalServerError", status_code=500
+            )
         except ValueError as e:
             return self.create_error_response(str(e))
 
@@ -2894,6 +2898,14 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
                 yield f"data: {usage_chunk.model_dump_json()}\n\n"
 
+        except ToolCallParseError as e:
+            if not stream_started:
+                raise
+            error = self.create_streaming_error_response(
+                str(e), err_type="InternalServerError", status_code=500
+            )
+            yield f"data: {error}\n\n"
+
         except ValueError as e:
             if not stream_started:
                 raise
@@ -2923,11 +2935,16 @@ class OpenAIServingChat(OpenAIServingBase):
         if not isinstance(ret, list):
             ret = [ret]
 
-        response = self._build_chat_response(
-            request,
-            ret,
-            int(time.time()),
-        )
+        try:
+            response = self._build_chat_response(
+                request,
+                ret,
+                int(time.time()),
+            )
+        except ToolCallParseError as e:
+            return self.create_error_response(
+                str(e), err_type="InternalServerError", status_code=500
+            )
 
         return response
 
@@ -3313,6 +3330,8 @@ class OpenAIServingChat(OpenAIServingBase):
                         finish_reason["type"] = "tool_calls"
                         finish_reason["matched"] = None
                     return ToolCallProcessingResult(tool_calls, text, finish_reason)
+                except ToolCallParseError:
+                    raise
                 except Exception as e:
                     logger.error(f"Tool call parsing error: {e}")
                     return ToolCallProcessingResult(None, text, finish_reason)
