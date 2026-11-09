@@ -391,6 +391,15 @@ class HiSparseSpecSwapManager:
     def _backup_device_locs_to_host(
         self, host_locs: torch.Tensor, device_locs: torch.Tensor
     ) -> None:
+        """Asynchronously copy accepted/rejected KV from device to the host pool.
+
+        This does NOT wait for the copy to complete. The copy runs on
+        ``decode_backup_stream`` and is guarded by ``_backup_done_event``.
+        Any subsequent read of the host pool (``swap_in_selected_pages`` /
+        ``swap_in_selected_blocks``) calls ``wait_for_pending_backup`` to
+        synchronize before accessing host data, and the next backup call
+        waits for the previous one to finish before issuing new work.
+        """
         if host_locs.numel() == 0:
             return
         coordinator = self._coordinator
@@ -415,7 +424,6 @@ class HiSparseSpecSwapManager:
                 device_locs.record_stream(coordinator.decode_backup_stream)
             coordinator._backup_done_event.record()
         coordinator._has_pending_backup = True
-        coordinator.wait_for_pending_backup()
 
     def commit_accept_tokens(
         self, batch: ScheduleBatch, accept_indices: torch.Tensor
@@ -1550,6 +1558,10 @@ class HiSparseCoordinator:
         sparse_block_size: int,
     ) -> torch.Tensor:
         assert self.is_m3_hisparse
+        # The async backup (_backup_device_locs_to_host / backup_new_tokens)
+        # may still be writing to the host pool on decode_backup_stream.
+        # Make the current stream wait for it before reading host data.
+        self.wait_for_pending_backup()
         num_reqs = req_pool_indices.size(0)
         num_selected_tokens = top_k_blocks.size(1) * sparse_block_size
         assert num_selected_tokens <= self.device_buffer_size, (
@@ -1609,6 +1621,10 @@ class HiSparseCoordinator:
         With prefetch enabled, anchors swap in synchronously (recording the miss
         plan) and prefetch their skip layers' copies; skip layers just wait.
         """
+        # The async backup (_backup_device_locs_to_host / backup_new_tokens)
+        # may still be writing to the host pool on decode_backup_stream.
+        # Make the current stream wait for it before reading host data.
+        self.wait_for_pending_backup()
         if not self.enable_prefetch:
             return self._run_swap_in_kernel(
                 req_pool_indices,
