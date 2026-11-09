@@ -3267,6 +3267,7 @@ class Scheduler(
                 kv_hints=recv_req.kv_hints,
                 vocab_size=self.model_config.vocab_size,
                 priority=recv_req.priority,
+                cache_retention_ttl_s=recv_req.cache_retention_ttl_s,
                 metrics_collector=(
                     self.metrics_collector
                     if self.metrics_reporter.enable_metrics

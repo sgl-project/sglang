@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 import unicodedata
 import uuid
@@ -393,6 +394,33 @@ class PDRoutingFields(BaseModel):
         return {name: getattr(self, name) for name in PDRoutingFields.model_fields}
 
 
+_CACHE_TTL_RE = re.compile(r"^([1-9][0-9]*)(s|m|h)$")
+
+
+class PromptCacheOptions(BaseModel):
+    """Prompt-cache hints. ``ttl`` asks storage backends that support
+    retention (``HiCacheStorage.batch_touch``) to keep this request's prefix
+    for at least that long, e.g. ``"5m"``, ``"1h"``, ``"90s"``."""
+
+    mode: Optional[str] = None
+    ttl: Optional[str] = None
+
+    @field_validator("ttl")
+    @classmethod
+    def _check_ttl(cls, v):
+        if v is not None and not _CACHE_TTL_RE.match(v):
+            raise ValueError(
+                "prompt_cache_options.ttl must look like '90s', '5m' or '1h'"
+            )
+        return v
+
+    def ttl_seconds(self) -> Optional[int]:
+        if self.ttl is None:
+            return None
+        m = _CACHE_TTL_RE.match(self.ttl)
+        return int(m.group(1)) * {"s": 1, "m": 60, "h": 3600}[m.group(2)]
+
+
 class CompletionRequest(PDRoutingFields):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/completions/create
@@ -440,6 +468,7 @@ class CompletionRequest(PDRoutingFields):
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
     session_id: Optional[str] = None
     session_params: Optional[Dict] = None
+    prompt_cache_options: Optional[PromptCacheOptions] = None
     response_format: Optional[Union[ResponseFormat, StructuralTagResponseFormat]] = None
     custom_params: Optional[Dict] = None
     custom_logit_processor: Optional[str] = None
@@ -1109,6 +1138,8 @@ class ChatCompletionRequest(PDRoutingFields):
     extra_key: Optional[Union[List[str], str]] = None
     # Cache salt for request caching
     cache_salt: Optional[Union[List[str], str]] = None
+    # Prompt-cache retention hint (see PromptCacheOptions)
+    prompt_cache_options: Optional[PromptCacheOptions] = None
     # Priority for the request
     priority: Optional[int] = None
 

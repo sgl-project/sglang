@@ -14,6 +14,7 @@ limitations under the License.
 """
 
 
+import concurrent.futures
 import logging
 import threading
 import time
@@ -383,6 +384,7 @@ class HiCacheController:
         self.enable_storage = False
         self.storage_backend = None
         self.storage_backend_type = None
+        self._touch_executor = None
         self.enable_storage_metrics = enable_storage_metrics
         # Buffer mode: wired by the tree cache after attach; the load rate
         # limiter subtracts write staging from actual pool usage.
@@ -1533,6 +1535,28 @@ class HiCacheController:
     def extend_storage_prefix(self, prefix_keys: Any, hash_values: List[str]) -> Any:
         """Advance the backend's prefix context past omitted pages."""
         return prefix_keys + hash_values if prefix_keys is not None else None
+
+    def touch_storage(self, hash_values: List[str], ttl_s: int = 0) -> None:
+        """Tell the storage backend a request just used ``hash_values`` (its
+        whole page-hash chain); see ``HiCacheStorage.batch_touch``. Runs off
+        the scheduler thread; failures only log."""
+        if not self.enable_storage or self.backup_skip or not hash_values:
+            return
+        if self._touch_executor is None:
+            self._touch_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="hicache-touch"
+            )
+        extra_info = HiCacheStorageExtraInfo(
+            extra_info={"retain_ttl_s": ttl_s} if ttl_s else None
+        )
+
+        def run():
+            try:
+                self.storage_backend.batch_touch(hash_values, extra_info)
+            except Exception as e:
+                logger.warning(f"HiCache storage touch failed: {e}")
+
+        self._touch_executor.submit(run)
 
     def write_storage(
         self,

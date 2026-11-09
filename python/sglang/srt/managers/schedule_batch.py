@@ -465,6 +465,7 @@ class Req(ReqDllmMixin):
         kv_hints: Optional[KvHintsEnvelope] = None,
         vocab_size: Optional[int] = None,
         priority: Optional[int] = None,
+        cache_retention_ttl_s: Optional[int] = None,
         metrics_collector: Optional[SchedulerMetricsCollector] = None,
         extra_key: Optional[str] = None,
         routing_key: Optional[str] = None,
@@ -599,6 +600,7 @@ class Req(ReqDllmMixin):
         self.eos_token_ids = eos_token_ids
         self.vocab_size = vocab_size
         self.priority = priority
+        self.cache_retention_ttl_s = cache_retention_ttl_s
 
         # For multimodal inputs
         self.multimodal_inputs: Optional[MultimodalInputs] = None
