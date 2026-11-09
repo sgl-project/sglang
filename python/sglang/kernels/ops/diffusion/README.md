@@ -87,6 +87,12 @@ SANA-Video's quality-gated linear-attention site keeps BF16 inputs for the
 first GEMM while requesting FP32 accumulation/output, then runs the second
 GEMM in FP32. The default path still promotes Q/K/V before both GEMMs.
 
+SANA-Video 2.0's quality-gated softmax-attention site hands the anchor layers'
+BF16-valued Q/K/V to SDPA without the FP32 upcast, so flash attention is
+eligible instead of the FP32 memory-efficient kernel. Accumulation stays FP32
+inside the kernel; the probabilities round to BF16 before the PV GEMM. The
+default path still promotes Q/K/V to FP32.
+
 ## Entry-point protocol
 
 Keep backend selection separate from input validation.

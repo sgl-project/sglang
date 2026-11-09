@@ -10,6 +10,10 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from sglang.kernels.ops.diffusion import (
+    SANA_VIDEO2_SOFTMAX_ATTENTION,
+    try_sana_video2_softmax_attention,
+)
 from sglang.multimodal_gen.configs.models.dits.sana_video2 import SanaVideo2Config
 from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
 from sglang.multimodal_gen.runtime.models.dits.sana_wm_components import (
@@ -95,6 +99,7 @@ class GatedSoftmaxAttention(nn.Module):
         self.q_norm = _RMSNorm(dim, eps=1e-5) if qk_norm else nn.Identity()
         self.k_norm = _RMSNorm(dim, eps=1e-5) if qk_norm else nn.Identity()
         self.output_gate = nn.Linear(dim, dim)
+        SANA_VIDEO2_SOFTMAX_ATTENTION.mark(self)
 
     def forward(self, x, rotary_emb=None):
         batch, tokens, channels = x.shape
@@ -105,9 +110,11 @@ class GatedSoftmaxAttention(nn.Module):
         v = v.reshape(batch, tokens, self.heads, self.dim).transpose(1, 2)
         if rotary_emb is not None:
             q, k = _apply_rope(q, rotary_emb), _apply_rope(k, rotary_emb)
-        if self.fp32_attention:
-            q, k, v = q.float(), k.float(), v.float()
-        out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0)
+        out = try_sana_video2_softmax_attention(self, q, k, v)
+        if out is None:
+            if self.fp32_attention:
+                q, k, v = q.float(), k.float(), v.float()
+            out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0)
         out = out.transpose(1, 2).reshape(batch, tokens, channels).to(dtype)
         return self.proj(out * self.output_gate(x).sigmoid())
 

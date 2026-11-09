@@ -16,7 +16,7 @@ Multi-step denoising amplifies a per-step rounding difference into visible quali
 
 **Same math, different rounding — request-gated at `lossless`.** These keep the reference function and the precision of every operand and accumulator; only the place or the order of the rounding moves, so the result is within rounding error of the reference rather than equal to it. They are mounted for `quality="lossless"` (the default) and `quality="high"` requests, at batch boundaries, all-or-nothing per transformer. `quality="exact"` runs the unmodified reference chain instead.
 
-**Approximate — request-gated at `high`.** A fusion that quantizes, lowers an operand or accumulator precision, or sits upstream of a quantizer or threshold is no longer a rounding difference, so it needs model-level quality evaluation and is mounted only for `quality="high"`. Today that is the FLUX.2 NVFP4 FC1+SwiGLU+quant path (it quantizes FC2's input before the reference BF16 intermediate exists), Ideogram's BF16-native gate RMSNorm (the reference keeps the norm statistics in fp32), and SANA-Video's BF16-input linear attention (the reference promotes those inputs to FP32).
+**Approximate — request-gated at `high`.** A fusion that quantizes, lowers an operand or accumulator precision, or sits upstream of a quantizer or threshold is no longer a rounding difference, so it needs model-level quality evaluation and is mounted only for `quality="high"`. Today that is the FLUX.2 NVFP4 FC1+SwiGLU+quant path (it quantizes FC2's input before the reference BF16 intermediate exists), Ideogram's BF16-native gate RMSNorm (the reference keeps the norm statistics in fp32), SANA-Video's BF16-input linear attention (the reference promotes those inputs to FP32), and SANA-Video 2.0's BF16-input softmax attention in its anchor layers (the reference promotes Q/K/V to FP32, which also forces the FP32 memory-efficient SDPA kernel).
 
 **Model/checkpoint-native.** Generic close-contract kernels, sparse operators, and FP8/NVFP4 producers can be part of a model implementation or a separately selected deployment path. They are documented in the inventory, but `quality` does not select or undo those choices.
 
@@ -100,6 +100,7 @@ These fusion families mount under both `quality="lossless"` and
 | LingBot Video fused RMSNorm | Replaces the handwritten cast, square, mean, rsqrt, and multiply chain with existing Triton RMSNorm kernels |
 | LingBot Video per-token gated residual + RMSNorm modulate | Folds `residual + gate * update` (per-token `[B, S, 1]` gate) and the `rmsnorm(x) * (1 + scale) + shift` adaLN chain (strided `[B, S, 6D]` chunk views) into single kernels |
 | SANA-Video BF16-input linear attention | Keeps the first linear-attention GEMM's inputs in BF16 with FP32 accumulation/output; the second GEMM remains FP32 |
+| SANA-Video 2.0 BF16-input softmax attention | Hands the anchor layers' BF16-valued Q/K/V to SDPA without the FP32 upcast, so flash attention is eligible; QK^T, softmax and PV still accumulate in FP32, and only the probabilities round to BF16 before the PV GEMM |
 | Dynamic LoRA delta | An unmerged adapter's scaled update accumulated onto the base output by its second GEMM (`addmm`, one rounding), and a row-parallel layer's bias added in the base GEMM's epilogue, instead of materializing the `[tokens, out]` delta and scaling and adding it in separate passes |
 | FLUX-family VAE fast paths | Channels-last decode, GroupNorm(+SiLU), upsample, and attention replacements for FLUX.2 and AutoencoderKL-based FLUX.1, Z-Image, and SD3 pipelines |
 | Wan VAE RMSNorm + SiLU | Replaces the channel-first RMSNorm/SiLU chain while keeping the decode in `channels_last_3d` |
@@ -253,6 +254,7 @@ Kernels are written against a specific eager chain in a specific model, so cover
 | LingBot Video MoE | Default-on group-limited top-k expert selection; fused RMSNorm, per-token gated residual, and fused RMSNorm+modulate at `quality=lossless` or `quality=high` |
 | Sana | LN+modulate, GLUMB bias+SiLU / bias+GLU, residual-gate add |
 | SANA-Video | Packed QKV/KV; paired fp64 interleaved RoPE; GLUMB bias+SiLU / bias+GLU in eager and BCG; LN+modulate and residual-gate add during BCG; BF16-input linear attention at `quality=lossless` or `quality=high` |
+| SANA-Video 2.0 | BF16-input softmax attention in the anchor layers at `quality=high` |
 | Sana-WM | bidirectional gated delta-net, fused QK inverse-RMS |
 | Wan / LongLive 2 VAE | temb table slices (Wan); VAE cat+pad and DupUp3D add; lossless FP32 normalization post-ops; full `channels_last_3d` RMSNorm+SiLU at `quality=lossless` or `quality=high` |
 | Cosmos3 | QK-norm + RoPE + KV packing; rounded T2I fusion also supports Hopper TP2/SP1 Super-Text2Image with the 5120-wide SwiGLU architecture |

@@ -30,8 +30,8 @@ import sglang.kernels.ops.diffusion.sites.fused_gate_rmsnorm_site as gate_rmsnor
 import sglang.kernels.ops.diffusion.sites.fused_linear_gelu_site as linear_gelu
 import sglang.kernels.ops.diffusion.sites.lingbot_video_rmsnorm_site as lingbot_video_rmsnorm
 import sglang.kernels.ops.diffusion.sites.qwen_image_added_qkv_site as qwen_image_added_qkv
-import sglang.kernels.ops.diffusion.sites.sana_video_linear_attention_site as sana_video_linear_attention
 import sglang.kernels.ops.diffusion.sites.sana_video2_softmax_attention_site as sana_video2_softmax_attention
+import sglang.kernels.ops.diffusion.sites.sana_video_linear_attention_site as sana_video_linear_attention
 from sglang.kernels.ops.diffusion import (
     FLUX2_NVFP4_SWIGLU_QUANT,
     FUSED_LN_MODULATE,
@@ -597,7 +597,9 @@ def test_sana_video2_softmax_attention_quality_path_and_guards():
         site, query, key, value
     )
     assert output.dtype == torch.bfloat16
-    reference = F.scaled_dot_product_attention(query.float(), key.float(), value.float())
+    reference = F.scaled_dot_product_attention(
+        query.float(), key.float(), value.float()
+    )
     torch.testing.assert_close(output.float(), reference, atol=2e-2, rtol=2e-2)
 
     assert (
