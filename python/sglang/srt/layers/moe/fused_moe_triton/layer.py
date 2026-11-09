@@ -70,6 +70,7 @@ from sglang.srt.layers.quantization.fp8_utils import quantize_block_fp8_weight_t
 from sglang.srt.layers.quantization.minimax_m3_nvfp4 import MiniMaxM3Nvfp4MoE
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptNvFp4FusedMoEMethod
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
+from sglang.srt.layers.utils.pinned_weight_staging import staged_copy_
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     get_tc_piecewise_forward_context,
     is_in_tc_piecewise_cuda_graph,
@@ -942,9 +943,9 @@ class FusedMoE(torch.nn.Module):
             expert_data.narrow(
                 shard_dim, loaded_size, expert_data.shape[shard_dim] - loaded_size
             ).zero_()
-            expert_data.narrow(shard_dim, 0, loaded_size).copy_(loaded_weight)
+            staged_copy_(expert_data.narrow(shard_dim, 0, loaded_size), loaded_weight)
         else:
-            expert_data.copy_(loaded_weight)
+            staged_copy_(expert_data, loaded_weight)
 
     def _load_w2(
         self,
@@ -1034,9 +1035,9 @@ class FusedMoE(torch.nn.Module):
             expert_data.narrow(
                 shard_dim, loaded_size, expert_data.shape[shard_dim] - loaded_size
             ).zero_()
-            expert_data.narrow(shard_dim, 0, loaded_size).copy_(loaded_weight)
+            staged_copy_(expert_data.narrow(shard_dim, 0, loaded_size), loaded_weight)
         else:
-            expert_data.copy_(loaded_weight)
+            staged_copy_(expert_data, loaded_weight)
 
     def _maybe_load_bf16_shared_expert_as_fp4(
         self,

@@ -42,6 +42,7 @@ from sglang.srt.layers.parameter import (
 )
 from sglang.srt.layers.utils import pad_or_narrow_weight
 from sglang.srt.layers.utils.common import set_weight_attrs
+from sglang.srt.layers.utils.pinned_weight_staging import staged_copy_
 from sglang.srt.runtime_context import get_exec, get_forward, get_parallel
 from sglang.srt.utils import get_bool_env_var, is_cpu, is_hip, is_npu
 
@@ -377,7 +378,7 @@ class ReplicatedLinear(LinearBase):
         assert param.size() == loaded_weight.size(), (
             f"{param.shape=} {param.dtype=} {loaded_weight.shape=} {loaded_weight.dtype=}"
         )
-        param.data.copy_(loaded_weight)
+        staged_copy_(param.data, loaded_weight)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         bias = self.bias if not self.skip_bias_add else None
@@ -580,7 +581,7 @@ class ColumnParallelLinear(LinearBase):
         assert param_data.shape == loaded_weight.shape, (
             f"param_data.shape={param_data.shape} != loaded_weight.shape={loaded_weight.shape}"
         )
-        param_data.copy_(loaded_weight)
+        staged_copy_(param_data, loaded_weight)
 
     def weight_loader_v2(self, param: Parameter, loaded_weight: torch.Tensor):
         # Special case for loading scales off disk, which often do not
@@ -895,7 +896,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                 )
 
         assert param_data.shape == loaded_weight.shape
-        param_data.copy_(loaded_weight)
+        staged_copy_(param_data, loaded_weight)
 
     def _load_fused_module_from_checkpoint(
         self,
@@ -1550,7 +1551,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         assert param_data.shape == loaded_weight.shape, (
             f"{param_data.shape=} {loaded_weight.shape=}"
         )
-        param_data.copy_(loaded_weight)
+        staged_copy_(param_data, loaded_weight)
 
 
 class RowParallelLinear(LinearBase):
@@ -1713,7 +1714,7 @@ class RowParallelLinear(LinearBase):
         assert param_data.shape == loaded_weight.shape, (
             f"{param_data.shape=} {loaded_weight.shape=}"
         )
-        param_data.copy_(loaded_weight)
+        staged_copy_(param_data, loaded_weight)
 
     def weight_loader_v2(self, param: BasevLLMParameter, loaded_weight: torch.Tensor):
 

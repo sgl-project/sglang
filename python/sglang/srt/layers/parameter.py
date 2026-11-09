@@ -11,6 +11,7 @@ from torch.nn import Parameter
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.utils import pad_or_narrow_weight
+from sglang.srt.layers.utils.pinned_weight_staging import staged_copy_
 from sglang.srt.utils import is_cpu
 
 __all__ = [
@@ -59,7 +60,7 @@ def copy_with_check(target: torch.Tensor, loaded_weight: torch.Tensor):
     )
 
     if target.dtype == loaded_weight.dtype:
-        target.copy_(loaded_weight)
+        staged_copy_(target, loaded_weight)
         return
 
     target_rank = _dtype_rank(target.dtype)
@@ -76,7 +77,7 @@ def copy_with_check(target: torch.Tensor, loaded_weight: torch.Tensor):
     if loaded_rank == torch.float8_e8m0fnu:
         assert target_rank in {torch.float8_e8m0fnu, torch.float32}
 
-    target.copy_(loaded_weight)
+    staged_copy_(target, loaded_weight)
 
 
 class BasevLLMParameter(Parameter):
@@ -108,7 +109,7 @@ class BasevLLMParameter(Parameter):
 
     def _assert_and_load(self, loaded_weight: torch.Tensor):
         assert self.data.shape == loaded_weight.shape
-        self.data.copy_(loaded_weight)
+        staged_copy_(self.data, loaded_weight)
 
     def load_column_parallel_weight(self, loaded_weight: torch.Tensor):
         self._assert_and_load(loaded_weight)
@@ -165,7 +166,7 @@ class _ColumnvLLMParameter(BasevLLMParameter):
                     shard_size,
                 )
                 assert param_data.shape == loaded_weight.shape
-                param_data.copy_(loaded_weight)
+                staged_copy_(param_data, loaded_weight)
                 return
             else:
                 loaded_weight = loaded_weight.narrow(
@@ -221,7 +222,7 @@ class _ColumnvLLMParameter(BasevLLMParameter):
                     )
 
         assert param_data.shape == loaded_weight.shape
-        param_data.copy_(loaded_weight)
+        staged_copy_(param_data, loaded_weight)
 
     def load_qkv_weight(
         self,
@@ -271,7 +272,7 @@ class _ColumnvLLMParameter(BasevLLMParameter):
         assert param_data.shape == loaded_weight.shape, (
             f"{param_data.shape=}, {loaded_weight.shape=}"
         )
-        param_data.copy_(loaded_weight)
+        staged_copy_(param_data, loaded_weight)
 
 
 class RowvLLMParameter(BasevLLMParameter):
@@ -314,7 +315,7 @@ class RowvLLMParameter(BasevLLMParameter):
                 )
 
                 assert param_data.shape == loaded_weight.shape
-                param_data.copy_(loaded_weight)
+                staged_copy_(param_data, loaded_weight)
 
                 return
             else:
@@ -334,7 +335,7 @@ class RowvLLMParameter(BasevLLMParameter):
             loaded_weight = loaded_weight.reshape(1)
 
         assert self.data.shape == loaded_weight.shape
-        self.data.copy_(loaded_weight)
+        staged_copy_(self.data, loaded_weight)
 
 
 class ModelWeightParameter(_ColumnvLLMParameter, RowvLLMParameter):
