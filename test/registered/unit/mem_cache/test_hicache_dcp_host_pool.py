@@ -312,6 +312,7 @@ class TestHostPoolSizingUnderDcp(CustomTestCase):
                                 cc._start_storage_threads = mock.Mock()
                                 cc._create_sync_groups = mock.Mock(return_value=[])
                                 cc._generate_storage_config = mock.Mock()
+                                cc.l2_transfer_engine = mock.Mock()
                                 with mock.patch(
                                     "sglang.srt.mem_cache.storage.StorageBackendFactory.create_backend"
                                 ) as factory:

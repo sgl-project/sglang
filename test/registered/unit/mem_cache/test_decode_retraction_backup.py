@@ -539,6 +539,7 @@ class TestDecodeRetractionBackup(CustomTestCase):
         self._receive_queue(env)
         self.assertIsNone(engine._verifier)
 
+    @patch("torch.distributed.get_world_size", return_value=1)
     def test_host_receive_restore_with_a_widened_window_slot(self, _world_size):
         """A window tail widened by a reader reaching further back (a fused
         draft's front rows) is received, bound and restored whole, row by row."""
