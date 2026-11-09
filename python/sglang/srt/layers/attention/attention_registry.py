@@ -661,3 +661,14 @@ def create_intel_xpu_backend(runner):
     from sglang.srt.layers.attention.xpu_backend import XPUAttentionBackend
 
     return XPUAttentionBackend(runner)
+
+
+@register_attention_backend("mlu")
+def create_mlu_backend(runner):
+    if runner.use_mla_backend:
+        raise NotImplementedError(
+            "The MLU attention backend supports dense GQA models."
+        )
+    from sglang.srt.hardware_backend.mlu.attention.mlu_backend import MLUAttnBackend
+
+    return MLUAttnBackend(runner)
