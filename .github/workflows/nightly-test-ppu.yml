@@ -47,7 +47,7 @@ jobs:
           if [[ "$REQUESTED_REF" =~ ^[0-9a-fA-F]{40}$ ]]; then
             :
           elif [[ "$REQUESTED_REF" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] &&
-            git check-ref-format --allow-onecase "$REQUESTED_REF" >/dev/null; then
+            git check-ref-format --allow-onelevel "$REQUESTED_REF" >/dev/null; then
             :
           else
             echo 'ref must be a full commit SHA or a valid branch/tag ref' >&2
@@ -58,7 +58,6 @@ jobs:
   # Keep separate jobs rather than a matrix: cluster-task derives its staging
   # directory and K8s Job name from GITHUB_JOB, which concurrent matrix legs share.
   nightly-1a-ppu:
-    name: Nightly 1-PPU A (890P K8s)
     needs: [prepare]
     runs-on: k8s-runner-group-cpu-flytiger
     container:
@@ -82,7 +81,7 @@ jobs:
           namespace: ppu-sched
           job_suffix: ${{ github.job }}
           host_volumes: "/wl_nas/cache/sglang-jit-ci:/root/.cache/tvm-ffi,/wl_nas/cache/sglang-dg-cache:/root/.cache/sglang/deep_gemm,/wl_nas/cache/sglang-jit:/root/.cache/sglang/jit"
-          extra_env: "PPU_EXPECTED_DEVICES=1,SGLANG_IS_IN_CI=true,SGL_KERNEL_WHEEL_CACHE_DIR=/nas_aisw/cache/sgl-kernel-wheels,PPU_BASE_IMAGE_REF=${{ env.PPU_BASE_IMAGE_REF || env.PPU_BASE_IMAGE }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_SDK_VERSION=${{ env.PPU_SDK_VERSION }},SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1,SGLANG_SAIL_PLA_CUDA=0,CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include,HF_HUB_OFFLINE=1,HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_SUPPORTS_FP8=0,PIP_INDEX_URL=https://pypi.org/simple"
+          extra_env: "PPU_EXPECTED_DEVICES=1,SGLANG_IS_IN_CI=true,SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1,SGL_KERNEL_WHEEL_CACHE_DIR=/nas_aisw/cache/sgl-kernel-wheels,PPU_BASE_IMAGE_REF=${{ env.PPU_BASE_IMAGE_REF || env.PPU_BASE_IMAGE }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_SDK_VERSION=${{ env.PPU_SDK_VERSION }},SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1,SGLANG_SAIL_PLA_CUDA=0,CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include,HF_HUB_OFFLINE=1,HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_SUPPORTS_FP8=0,PIP_INDEX_URL=https://pypi.org/simple"
           command: |
             set -euo pipefail
             cd /workspace/source
@@ -90,19 +89,7 @@ jobs:
             git config --global --add safe.directory /workspace/source
             ulimit -l unlimited
             ulimit -s 65536
-            # extra_env is comma-separated, so build multi-device lists inside the pod.
             export CUDA_VISIBLE_DEVICES
-            CUDA_VISIBLE_DEVICES=$(python3 -c 'import os; print(",".join(str(i) for i in range(int(os.environ["PPU_EXPECTED_DEVICES"]))))')
-            python3 - <<'PY'
-            import os
-            import torch
-
-            expected = int(os.environ['PPU_EXPECTED_DEVICES'])
-            names = [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())]
-            if len(names) != expected or not all('890' in name.upper() for name in names):
-                raise RuntimeError(f'Unexpected PPU allocation: expected={expected}, devices={names}')
-            print(f'PPU allocation verified: requested={expected}, visible={len(names)}, devices={names}')
-            PY
             bash scripts/ci/warm_page_cache.sh \
               /nas_aisw/datasets/checkpoints/LLM/Llama/v3.1/Llama-3.1-8B-Instruct \
               /nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-30B-A3B \
@@ -127,7 +114,6 @@ jobs:
           cleanup_policy: always
 
   nightly-1b-ppu:
-    name: Nightly 1-PPU B (890P K8s)
     needs: [prepare, nightly-1a-ppu]
     if: ${{ always() && needs.prepare.result == 'success' }}
     runs-on: k8s-runner-group-cpu-flytiger
@@ -154,7 +140,7 @@ jobs:
           namespace: ppu-sched
           job_suffix: ${{ github.job }}
           host_volumes: "/wl_nas/cache/sglang-jit-ci:/root/.cache/tvm-ffi,/wl_nas/cache/sglang-dg-cache:/root/.cache/sglang/deep_gemm,/wl_nas/cache/sglang-jit:/root/.cache/sglang/jit"
-          extra_env: "PPU_EXPECTED_DEVICES=1,SGLANG_IS_IN_CI=true,SGL_KERNEL_WHEEL_CACHE_DIR=/nas_aisw/cache/sgl-kernel-wheels,PPU_BASE_IMAGE_REF=${{ env.PPU_BASE_IMAGE_REF || env.PPU_BASE_IMAGE }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_SDK_VERSION=${{ env.PPU_SDK_VERSION }},SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1,SGLANG_SAIL_PLA_CUDA=0,CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include,HF_HUB_OFFLINE=1,HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_SUPPORTS_FP8=0,PIP_INDEX_URL=https://pypi.org/simple"
+          extra_env: "PPU_EXPECTED_DEVICES=1,SGLANG_IS_IN_CI=true,SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1,SGL_KERNEL_WHEEL_CACHE_DIR=/nas_aisw/cache/sgl-kernel-wheels,PPU_BASE_IMAGE_REF=${{ env.PPU_BASE_IMAGE_REF || env.PPU_BASE_IMAGE }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_SDK_VERSION=${{ env.PPU_SDK_VERSION }},SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1,SGLANG_SAIL_PLA_CUDA=0,CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include,HF_HUB_OFFLINE=1,HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_SUPPORTS_FP8=0,PIP_INDEX_URL=https://pypi.org/simple"
           command: |
             set -euo pipefail
             cd /workspace/source
@@ -162,19 +148,7 @@ jobs:
             git config --global --add safe.directory /workspace/source
             ulimit -l unlimited
             ulimit -s 65536
-            # extra_env is comma-separated, so build multi-device lists inside the pod.
             export CUDA_VISIBLE_DEVICES
-            CUDA_VISIBLE_DEVICES=$(python3 -c 'import os; print(",".join(str(i) for i in range(int(os.environ["PPU_EXPECTED_DEVICES"]))))')
-            python3 - <<'PY'
-            import os
-            import torch
-
-            expected = int(os.environ['PPU_EXPECTED_DEVICES'])
-            names = [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())]
-            if len(names) != expected or not all('890' in name.upper() for name in names):
-                raise RuntimeError(f'Unexpected PPU allocation: expected={expected}, devices={names}')
-            print(f'PPU allocation verified: requested={expected}, visible={len(names)}, devices={names}')
-            PY
             bash scripts/ci/warm_page_cache.sh \
               /nas_aisw/datasets/checkpoints/LLM/Llama/v3.1/Llama-3.1-8B-Instruct \
               /nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-30B-A3B \
@@ -202,7 +176,6 @@ jobs:
           cleanup_policy: always
 
   nightly-2-ppu:
-    name: Nightly 2-PPU (890P K8s)
     needs: [prepare, nightly-1b-ppu]
     if: ${{ always() && needs.prepare.result == 'success' }}
     runs-on: k8s-runner-group-cpu-flytiger
@@ -227,7 +200,7 @@ jobs:
           namespace: ppu-sched
           job_suffix: ${{ github.job }}
           host_volumes: "/wl_nas/cache/sglang-jit-ci:/root/.cache/tvm-ffi,/wl_nas/cache/sglang-dg-cache:/root/.cache/sglang/deep_gemm,/wl_nas/cache/sglang-jit:/root/.cache/sglang/jit"
-          extra_env: "PPU_EXPECTED_DEVICES=2,SGLANG_IS_IN_CI=true,SGL_KERNEL_WHEEL_CACHE_DIR=/nas_aisw/cache/sgl-kernel-wheels,PPU_BASE_IMAGE_REF=${{ env.PPU_BASE_IMAGE_REF || env.PPU_BASE_IMAGE }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_SDK_VERSION=${{ env.PPU_SDK_VERSION }},SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1,SGLANG_SAIL_PLA_CUDA=0,CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include,HF_HUB_OFFLINE=1,HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_SUPPORTS_FP8=0,PIP_INDEX_URL=https://pypi.org/simple"
+          extra_env: "PPU_EXPECTED_DEVICES=2,SGLANG_IS_IN_CI=true,SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1,SGL_KERNEL_WHEEL_CACHE_DIR=/nas_aisw/cache/sgl-kernel-wheels,PPU_BASE_IMAGE_REF=${{ env.PPU_BASE_IMAGE_REF || env.PPU_BASE_IMAGE }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_SDK_VERSION=${{ env.PPU_SDK_VERSION }},SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1,SGLANG_SAIL_PLA_CUDA=0,CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include,HF_HUB_OFFLINE=1,HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_SUPPORTS_FP8=0,PIP_INDEX_URL=https://pypi.org/simple"
           command: |
             set -euo pipefail
             cd /workspace/source
@@ -235,19 +208,7 @@ jobs:
             git config --global --add safe.directory /workspace/source
             ulimit -l unlimited
             ulimit -s 65536
-            # extra_env is comma-separated, so build multi-device lists inside the pod.
             export CUDA_VISIBLE_DEVICES
-            CUDA_VISIBLE_DEVICES=$(python3 -c 'import os; print(",".join(str(i) for i in range(int(os.environ["PPU_EXPECTED_DEVICES"]))))')
-            python3 - <<'PY'
-            import os
-            import torch
-
-            expected = int(os.environ['PPU_EXPECTED_DEVICES'])
-            names = [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())]
-            if len(names) != expected or not all('890' in name.upper() for name in names):
-                raise RuntimeError(f'Unexpected PPU allocation: expected={expected}, devices={names}')
-            print(f'PPU allocation verified: requested={expected}, visible={len(names)}, devices={names}')
-            PY
             bash scripts/ci/warm_page_cache.sh \
               /nas_aisw/datasets/checkpoints/LLM/Llama/v3.1/Llama-3.1-8B-Instruct \
               /nas_aisw/datasets/checkpoints/LLM/Llama/v3.2/Llama-3.2-1B-Instruct
@@ -263,7 +224,6 @@ jobs:
           cleanup_policy: always
 
   nightly-4-ppu:
-    name: Nightly 4-PPU (890P K8s)
     needs: [prepare, nightly-2-ppu]
     if: ${{ always() && needs.prepare.result == 'success' }}
     runs-on: k8s-runner-group-cpu-flytiger
@@ -288,7 +248,7 @@ jobs:
           namespace: ppu-sched
           job_suffix: ${{ github.job }}
           host_volumes: "/wl_nas/cache/sglang-jit-ci:/root/.cache/tvm-ffi,/wl_nas/cache/sglang-dg-cache:/root/.cache/sglang/deep_gemm,/wl_nas/cache/sglang-jit:/root/.cache/sglang/jit"
-          extra_env: "PPU_EXPECTED_DEVICES=4,SGLANG_IS_IN_CI=true,SGL_KERNEL_WHEEL_CACHE_DIR=/nas_aisw/cache/sgl-kernel-wheels,PPU_BASE_IMAGE_REF=${{ env.PPU_BASE_IMAGE_REF || env.PPU_BASE_IMAGE }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_SDK_VERSION=${{ env.PPU_SDK_VERSION }},SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1,SGLANG_SAIL_PLA_CUDA=0,CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include,HF_HUB_OFFLINE=1,HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_SUPPORTS_FP8=0,PIP_INDEX_URL=https://pypi.org/simple"
+          extra_env: "PPU_EXPECTED_DEVICES=4,SGLANG_IS_IN_CI=true,SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1,SGL_KERNEL_WHEEL_CACHE_DIR=/nas_aisw/cache/sgl-kernel-wheels,PPU_BASE_IMAGE_REF=${{ env.PPU_BASE_IMAGE_REF || env.PPU_BASE_IMAGE }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_SDK_VERSION=${{ env.PPU_SDK_VERSION }},SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1,SGLANG_SAIL_PLA_CUDA=0,CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include,HF_HUB_OFFLINE=1,HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_SUPPORTS_FP8=0,PIP_INDEX_URL=https://pypi.org/simple"
           command: |
             set -euo pipefail
             cd /workspace/source
@@ -296,19 +256,7 @@ jobs:
             git config --global --add safe.directory /workspace/source
             ulimit -l unlimited
             ulimit -s 65536
-            # extra_env is comma-separated, so build multi-device lists inside the pod.
             export CUDA_VISIBLE_DEVICES
-            CUDA_VISIBLE_DEVICES=$(python3 -c 'import os; print(",".join(str(i) for i in range(int(os.environ["PPU_EXPECTED_DEVICES"]))))')
-            python3 - <<'PY'
-            import os
-            import torch
-
-            expected = int(os.environ['PPU_EXPECTED_DEVICES'])
-            names = [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())]
-            if len(names) != expected or not all('890' in name.upper() for name in names):
-                raise RuntimeError(f'Unexpected PPU allocation: expected={expected}, devices={names}')
-            print(f'PPU allocation verified: requested={expected}, visible={len(names)}, devices={names}')
-            PY
             bash scripts/ci/warm_page_cache.sh \
               /nas_aisw/datasets/checkpoints/LLM/Llama/v3.2/Llama-3.2-1B-Instruct
             bash scripts/ci/ppu/ppu_install_dependency.sh
