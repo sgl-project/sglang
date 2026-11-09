@@ -98,22 +98,26 @@ def resolved_w4a16_modes() -> Tuple[bool, bool]:
 def deepgemm_moe_runner_backend_enabled() -> bool:
     """Only select SAIL FP4xFP4; the NVIDIA W4A8 backend is left unchanged."""
     moe_runner_backend = get_moe_runner_backend()
-    available = deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and get_device_sm() >= 89
+    sm_supported = get_device_sm() >= 89
     if moe_runner_backend.is_deep_gemm():
-        if not available:
+        if not (sm_supported and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM):
             raise RuntimeError(
                 "SAIL MXFP4 MoE requires SM89+ and an available DeepGEMM."
             )
         return True
-    return (
-        moe_runner_backend.is_auto()
-        and available
-        and (
-            get_moe_a2a_backend().is_deepep()
-            or get_moe_a2a_backend().is_mooncake()
-            or envs.SGLANG_SAIL_DEEPGEMM_MOE.get()
-        )
+    if not (moe_runner_backend.is_auto() and sm_supported):
+        return False
+
+    # Which layers the DeepGEMM engines take -- the DeepEP-family rule and the
+    # opt-in one -- is their own knowledge. Imported here rather than at module
+    # scope so the argument hook, which imports this module to validate the
+    # W4A16 flags, stays off the engine path.
+    from sglang.srt.hardware_backend.sail.moe.deepgemm_moe import (
+        deepgemm_moe_selected_for_a2a,
+        deepgemm_moe_selected_for_auto,
     )
+
+    return deepgemm_moe_selected_for_a2a() or deepgemm_moe_selected_for_auto()
 
 
 class Mxfp4LinearMethod(LinearMethodBase):

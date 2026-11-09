@@ -218,7 +218,9 @@ pass_configs = {
 
 def _use_deep_gemm_hc_prenorm() -> bool:
     # SAIL dense/MoE support does not imply TF32 MHC split-k support; keep the
-    # existing fallback path.
+    # existing fallback path. On the server path platform_hook pins
+    # SGLANG_OPT_DEEPGEMM_HC_PRENORM off, but kernels can be called without that
+    # hook (unit tests do), so the platform check here is the load-bearing one.
     if (
         get_platform().is_sail
         or is_hip()
