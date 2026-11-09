@@ -20,7 +20,7 @@ from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.scheduler_test_utils import release_only_retirer
+from sglang.test.scheduler_test_utils import FakeReq, release_only_retirer
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -40,8 +40,6 @@ def _make_processor(case, server_mode: str = "full") -> SchedulerBatchResultProc
     return SchedulerBatchResultProcessor(
         is_generation=True,
         disaggregation_mode=None,
-        enable_overlap=False,
-        enable_overlap_mlx=False,
         model_config=SimpleNamespace(
             think_end_ids=None, self_opened_think_start_ids=None
         ),
@@ -60,6 +58,7 @@ def _make_processor(case, server_mode: str = "full") -> SchedulerBatchResultProc
         beam_coordinator=Mock(),
         request_retirer=release_only_retirer(),
         abort_request=lambda *args, **kwargs: None,
+        still_in_batch=lambda req: True,
     )
 
 
@@ -78,6 +77,7 @@ class TestPrefillEmbeddingResults(CustomTestCase):
                 time_stats=Mock(),
                 update_finish_state=Mock(),
                 finished_reason=None,
+                exit_via=None,
                 finished=lambda: True,
                 kv=SimpleNamespace(
                     holds_kv=True, holds_mamba=False, retraction_backup=None
@@ -226,7 +226,7 @@ class TestSamplingMaskMaterialization(CustomTestCase):
         self.assertIsNone(output.sampling_mask_output)
 
 
-class _PrefillReq:
+class _PrefillReq(FakeReq):
     def __init__(self, *, rid: str, return_hidden_states):
         self.rid = rid
         self.return_hidden_states = return_hidden_states
@@ -250,7 +250,7 @@ class _PrefillReq:
         return None
 
 
-class _DecodeReq:
+class _DecodeReq(FakeReq):
     request_finish = Req.request_finish
 
     def __init__(self):
@@ -342,6 +342,132 @@ class TestPrefillHiddenStateOffsets(CustomTestCase):
 
                 self.assertEqual(middle.hidden_states, [])
                 self.assertEqual(last.hidden_states, [[22.0]])
+
+
+class TestRowsStillInBatch(CustomTestCase):
+    def test_only_rows_still_in_batch_commit(self):
+        """A request that left the batch after launch gets no token, hidden state,
+        logprob or streamed row, yet the row still in the batch reads its own slice
+        of the step's result."""
+        self._check_prefill()
+        self._check_decode()
+
+    def _check_prefill(self):
+        cases = (
+            (
+                "full",
+                CaptureHiddenMode.FULL,
+                torch.tensor([[10.0], [11.0], [20.0], [21.0], [22.0]]),
+            ),
+            ("last", CaptureHiddenMode.LAST, torch.tensor([[11.0], [22.0]])),
+        )
+
+        for server_mode, capture_mode, hidden_states in cases:
+            with self.subTest(server_mode=server_mode):
+                left = _PrefillReq(rid="left", return_hidden_states="last")
+                kept = _PrefillReq(rid="kept", return_hidden_states="last")
+                batch = SimpleNamespace(
+                    reqs=[left, kept],
+                    chunked_req=None,
+                    decoding_reqs=[],
+                    return_logprob=False,
+                    return_hidden_states=True,
+                    return_hidden_states_mode=capture_mode,
+                    spec_info=None,
+                    prefill_stats=None,
+                    dp_cooperation_info=None,
+                )
+                result = SimpleNamespace(
+                    copy_done=None,
+                    auxiliary_host_output=None,
+                    routed_experts_output=None,
+                    indexer_topk_output=None,
+                    kv_weight_version_record=None,
+                    logits_output=SimpleNamespace(
+                        hidden_states=hidden_states,
+                        customized_info=None,
+                        sampling_mask_output=None,
+                    ),
+                    next_token_ids=torch.tensor([7, 8]),
+                    extend_input_len_per_req=[2, 3],
+                    extend_logprob_start_len_per_req=None,
+                    grammar_advanced=False,
+                    can_run_cuda_graph=False,
+                    skipped_output_comm=False,
+                )
+                processor = replace(
+                    _make_processor(self, server_mode),
+                    still_in_batch=lambda req, kept=kept: req is kept,
+                )
+
+                with (
+                    patch(
+                        "sglang.srt.managers.scheduler_components."
+                        "batch_result_processor.checkpoint_kv_cache"
+                    ),
+                    patch(
+                        "sglang.srt.managers.scheduler_components."
+                        "batch_result_processor.get_memory",
+                        return_value=SimpleNamespace(enable_hisparse=False),
+                    ),
+                ):
+                    processor.process_batch_result_prefill(batch, result)
+
+                self.assertEqual(left.output_ids, [])
+                self.assertEqual(left.hidden_states, [])
+                self.assertEqual(kept.output_ids, [8])
+                self.assertEqual(kept.hidden_states, [[22.0]])
+                processor.output_streamer.stream_output.assert_called_once_with(
+                    [kept], False, None
+                )
+
+    def _check_decode(self):
+        left = _DecodeReq()
+        kept = _DecodeReq()
+        for req in (left, kept):
+            req.return_hidden_states = False
+            req.return_logprob = True
+        batch = SimpleNamespace(
+            reqs=[left, kept],
+            return_logprob=True,
+            spec_algorithm=SimpleNamespace(is_none=lambda: True),
+            batch_size=lambda: 2,
+            forward_iter=1,
+        )
+        result = GenerationBatchResult(
+            logits_output=LogitsProcessorOutput(
+                next_token_logits=None,
+                next_token_logprobs=torch.tensor([-1.0, -2.0]),
+            ),
+            next_token_ids=torch.tensor([7, 8]),
+        )
+        processor = replace(
+            _make_processor(self),
+            still_in_batch=lambda req: req is kept,
+            logprob_result_processor=Mock(),
+        )
+
+        with (
+            patch.object(
+                SchedulerBatchResultProcessor, "_maybe_update_reasoning_tokens"
+            ),
+            patch.object(
+                SchedulerBatchResultProcessor, "_handle_finish_state_updated_req"
+            ),
+        ):
+            processor.process_batch_result_decode(batch, result)
+
+        self.assertEqual(left.output_ids, [])
+        self.assertEqual(kept.output_ids, [8])
+        append = processor.logprob_result_processor.append_output_token_logprobs
+        append.assert_called_once()
+        args, kwargs = append.call_args
+        self.assertEqual(args, (kept, 8, -2.0))
+        self.assertEqual(kwargs["row"], 1)
+        processor.beam_coordinator.commit_decode.assert_called_once_with(
+            [kept], batch.forward_iter
+        )
+        processor.output_streamer.stream_output.assert_called_once_with([kept], True)
 
 
 class TestPrefillSkippedOutput(CustomTestCase):
@@ -495,6 +621,7 @@ class TestSamplingMaskStatusErrors(CustomTestCase):
             return_logprob=False,
             spec_algorithm=SimpleNamespace(is_none=lambda: True),
             batch_size=lambda: 1,
+            forward_iter=1,
         )
         result = GenerationBatchResult(
             logits_output=LogitsProcessorOutput(

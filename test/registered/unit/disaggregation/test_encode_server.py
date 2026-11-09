@@ -604,6 +604,7 @@ class TestMooncakeRegistration(CustomTestCase):
     def setUp(self):
         self.engine = MooncakeTransferEngine.__new__(MooncakeTransferEngine)
         self.engine.engine = unittest.mock.Mock()
+        self.engine.ib_device = "mlx5_0"
 
     def test_register_raises_on_nonzero_status(self):
         self.engine.engine.register_memory.return_value = -1
@@ -619,6 +620,18 @@ class TestMooncakeRegistration(CustomTestCase):
             self.engine.deregister(1234)
 
         self.assertIs(ctx.exception.__cause__, backend_error)
+
+    def test_batch_register_raises_on_nonzero_status(self):
+        self.engine.engine.batch_register_memory.return_value = -202
+
+        with self.assertRaises(RuntimeError):
+            self.engine.batch_register([0x10000], [0x1000])
+
+    def test_batch_register_tolerates_already_registered(self):
+        self.engine.engine.batch_register_memory.return_value = -7
+
+        with self.assertLogs(level="ERROR"):
+            self.engine.batch_register([0x10000], [0x1000])
 
 
 if __name__ == "__main__":

@@ -37,6 +37,7 @@ from typing import Iterable, List, Optional, Tuple
 import torch
 from torch import nn
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.gemm.bf16_fp32 import (
     linear_bf16_fp32,
     mark_hpc_bf16xfp32_gemm_enabled,
@@ -764,7 +765,7 @@ class LongcatFlashForCausalLM(nn.Module):
                         ):
                             if (
                                 deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-                                and not deep_gemm_wrapper.DEEPGEMM_BLACKWELL
+                                and current_arch().is_sm(9)
                                 and envs.SGLANG_USE_DEEPGEMM_BMM.get()
                             ):
                                 block_scale = weight_scale
