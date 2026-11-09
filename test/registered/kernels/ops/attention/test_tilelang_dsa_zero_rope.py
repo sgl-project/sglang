@@ -68,15 +68,13 @@ class TestPackedRowInference(CustomTestCase):
         self.assertTrue(
             can_use_glm53_triton_sparse_attention(**base, num_tokens=None, num_heads=16)
         )
-        for q_dtype in (torch.bfloat16, torch.float8_e4m3fn):
-            with self.subTest(q_dtype=q_dtype, kv_dtype=torch.float8_e4m3fn):
-                self.assertTrue(
-                    can_use_glm53_triton_sparse_attention(
-                        **base | dict(q_dtype=q_dtype, kv_dtype=torch.float8_e4m3fn),
-                        num_tokens=None,
-                        num_heads=16,
-                    )
-                )
+        self.assertTrue(
+            can_use_glm53_triton_sparse_attention(
+                **base | dict(kv_dtype=torch.float8_e4m3fn),
+                num_tokens=None,
+                num_heads=16,
+            )
+        )
 
         for override in (
             dict(num_tokens=65537, num_heads=16),
@@ -84,6 +82,12 @@ class TestPackedRowInference(CustomTestCase):
             dict(num_tokens=8192, num_heads=16, topk_width=2048),
             dict(num_tokens=8192, num_heads=16, q_dtype=torch.float32),
             dict(num_tokens=8192, num_heads=16, q_dtype=torch.float8_e4m3fn),
+            dict(
+                num_tokens=8192,
+                num_heads=16,
+                q_dtype=torch.float8_e4m3fn,
+                kv_dtype=torch.float8_e4m3fn,
+            ),
             dict(num_tokens=8192, num_heads=16, kv_dtype=torch.float8_e4m3fnuz),
             dict(num_tokens=8192, num_heads=16, kv_dtype=torch.float32),
             dict(num_tokens=8192, num_heads=16, q_rope_dim=64),
@@ -100,34 +104,33 @@ class TestPackedRowInference(CustomTestCase):
     def test_glm53_fp8_prefill_tuning_covers_measured_rows(self):
         from sglang.kernels.ops.attention.dsa import triton_sparse_mla
 
+        rows_tuned = triton_sparse_mla._glm53_fp8_rows_tuned
+        for heads, rows in ((16, 128), (16, 512), (8, 128), (8, 32768), (8, 131072)):
+            with self.subTest(heads=heads, rows=rows):
+                self.assertTrue(rows_tuned(heads, rows))
+        for heads, rows in ((16, 127), (16, 513), (8, 64), (8, 131073), (4, 256)):
+            with self.subTest(heads=heads, rows=rows):
+                self.assertFalse(rows_tuned(heads, rows))
+
         gate = triton_sparse_mla._is_gfx950_sparse_mla_fp8
-        fp8 = torch.float8_e4m3fn
         with patch.object(triton_sparse_mla, "is_gfx95_supported", return_value=True):
-            for heads, seq in ((16, 128), (16, 512), (8, 128), (8, 32768)):
-                with self.subTest(heads=heads, seq=seq):
-                    self.assertTrue(gate(fp8, heads, 512, 0, 512, seq))
-            for args in (
-                (fp8, 16, 512, 0, 512, 127),
-                (fp8, 16, 512, 0, 512, 513),
-                (fp8, 8, 512, 0, 512, 64),
-                (fp8, 8, 512, 0, 512, None),
-                (torch.float8_e4m3fnuz, 8, 512, 0, 512, 1024),
-                (torch.bfloat16, 8, 512, 0, 512, 1024),
-            ):
-                with self.subTest(args=args):
-                    self.assertFalse(gate(*args))
-            self.assertTrue(gate(fp8, 16, 512, 64, 576))
-            self.assertTrue(gate(fp8, 16, 512, 64, 576, 65536))
+            self.assertTrue(gate(torch.float8_e4m3fn, 16, 512, 64, 576))
+            self.assertFalse(gate(torch.float8_e4m3fn, 16, 512, 0, 512))
 
     def test_glm53_2051_prune_selects_the_measured_config(self):
         from sglang.kernels.ops.attention.dsa import triton_sparse_mla
 
-        named_args = {
-            "topk": 2048 + 4 - 1,
-            "q_nope_ptr": torch.empty(1, 16, 512, device="meta"),
-            "kv_ptr": torch.empty(1, 1, 512, device="meta"),
-        }
-        for use_fp8_dot in (False, True):
+        for use_fp8_dot, kv_dtype in (
+            (False, torch.bfloat16),
+            (True, torch.float8_e4m3fn),
+        ):
+            named_args = {
+                "topk": 2048 + 4 - 1,
+                "q_nope_ptr": torch.empty(
+                    1, 16, 512, device="meta", dtype=torch.bfloat16
+                ),
+                "kv_ptr": torch.empty(1, 1, 512, device="meta", dtype=kv_dtype),
+            }
             with self.subTest(use_fp8_dot=use_fp8_dot):
                 with patch.object(triton_sparse_mla, "_IS_GFX95", True):
                     configs = triton_sparse_mla._prune_configs(

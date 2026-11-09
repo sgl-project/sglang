@@ -756,15 +756,6 @@ class DeepseekSparseAttnBackend(
             self.device_capability = torch.cuda.get_device_capability()
         self.device_sm_major = self.device_capability[0]
         self.kv_cache_dtype = model_runner.kv_cache_dtype
-        if (
-            "aiter_sparse_mla" in (self.dsa_prefill_impl, self.dsa_decode_impl)
-            and self.kv_cache_dtype != torch.bfloat16
-        ):
-            raise ValueError(
-                "aiter_sparse_mla requires a bfloat16 KV cache; got "
-                f"kv_cache_dtype={self.kv_cache_dtype}. Use the triton DSA "
-                "backends for an fp8_e4m3 KV cache."
-            )
         self._triton_kpool_tail_supported = False
         if self.dsa_index_kpool > 1 and (
             self.dsa_prefill_impl in ("triton", "aiter_sparse_mla")
@@ -788,7 +779,10 @@ class DeepseekSparseAttnBackend(
                 dsa_index_topk=self.dsa_index_topk,
                 dsa_index_kpool=self.dsa_index_kpool,
             )
-            if not self._triton_kpool_tail_supported:
+            if not self._triton_kpool_tail_supported and "triton" in (
+                self.dsa_prefill_impl,
+                self.dsa_decode_impl,
+            ):
                 raise ValueError(
                     "Triton with index_kpool > 1 is only validated for GLM-5.3 "
                     "on gfx950 with BF16 queries, a BF16 or FP8 E4M3 KV cache, "
@@ -803,14 +797,15 @@ class DeepseekSparseAttnBackend(
                     f"index_topk={self.dsa_index_topk}, "
                     f"index_kpool={self.dsa_index_kpool}."
                 )
-        if (
-            "aiter_sparse_mla" in (self.dsa_prefill_impl, self.dsa_decode_impl)
-            and not self._triton_kpool_tail_supported
+        if "aiter_sparse_mla" in (self.dsa_prefill_impl, self.dsa_decode_impl) and (
+            not self._triton_kpool_tail_supported
+            or self.kv_cache_dtype != torch.bfloat16
         ):
             raise ValueError(
                 "aiter_sparse_mla is only validated for GLM-5.3 on gfx950 with "
                 "BF16 Q/KV, 8 or 16 query heads, zero-width RoPE, 512-wide "
-                "Q/KV/output, index_topk=2048, and index_kpool=4."
+                "Q/KV/output, index_topk=2048, and index_kpool=4; use the triton "
+                "DSA backends for an fp8_e4m3 KV cache."
             )
 
         # Unsupported flashmla_sparse_q8 configs must fail at launch, not mid-forward.

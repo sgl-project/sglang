@@ -35,6 +35,9 @@ _IS_GFX95 = is_gfx95_supported()
 _GLM53_DSA_INDEX_TOPK = 2048
 _GLM53_DSA_INDEX_KPOOL = 4
 GLM53_MAX_TOKENS_BY_HEADS = {8: 131072, 16: 65536}
+# Rows where the gfx950 FP8 tuning beats the untuned path for a GLM-5.3 FP8 KV cache.
+_GLM53_FP8_TUNED_MIN_ROWS = 128
+_GLM53_FP8_TUNED_MAX_ROWS_BY_HEADS = {8: GLM53_MAX_TOKENS_BY_HEADS[8], 16: 512}
 
 _SUPPORTED_INPUT_DTYPES = (
     torch.bfloat16,
@@ -64,7 +67,7 @@ def can_use_glm53_triton_sparse_attention(
     return (
         (_IS_GFX95 if is_gfx95 is None else is_gfx95)
         and kv_dtype in (torch.bfloat16, torch.float8_e4m3fn)
-        and q_dtype in (torch.bfloat16, kv_dtype)
+        and q_dtype == torch.bfloat16
         and max_tokens is not None
         and (num_tokens is None or 0 < num_tokens <= max_tokens)
         and q_nope_dim == 512
@@ -305,26 +308,22 @@ def _is_gfx950_sparse_mla_fp8(
     d_v: int,
     d_tail: int,
     kv_dim: int,
-    seq: int | None = None,
 ) -> bool:
-    """Gate for gfx950 FP8 prefill tuning in the TP4/TP8 DSA shapes.
-
-    GLM-5.3's zero-RoPE FP8 E4M3 prefill (``seq`` given) only beats the
-    untuned path from 128 rows, and with 16 heads only up to 512 rows.
-    """
-    if kv_dtype == torch.bfloat16 or H not in (8, 16) or d_v != 512:
-        return False
-    if d_tail == 64 and kv_dim == 576:
-        return is_gfx95_supported()
+    """Gate for gfx950 FP8 prefill tuning in the TP4/TP8 DSA shapes."""
     return (
-        seq is not None
-        and kv_dtype == torch.float8_e4m3fn
-        and d_tail == 0
-        and kv_dim == 512
-        and 128 <= seq
-        and (H == 8 or seq <= 512)
+        kv_dtype != torch.bfloat16
+        and H in (8, 16)
+        and d_v == 512
+        and d_tail == 64
+        and kv_dim == 576
         and is_gfx95_supported()
     )
+
+
+def _glm53_fp8_rows_tuned(H: int, rows: int) -> bool:
+    """Whether GLM-5.3 FP8 KV prefill or MTP verify rows take the gfx950 FP8 tuning."""
+    max_rows = _GLM53_FP8_TUNED_MAX_ROWS_BY_HEADS.get(H)
+    return max_rows is not None and _GLM53_FP8_TUNED_MIN_ROWS <= rows <= max_rows
 
 
 # Tuning constants below were measured on MI355X (TP4/EP4, GLM-5.2, FP8 KV).
@@ -380,10 +379,9 @@ def _row_strides(x: torch.Tensor) -> tuple[torch.Tensor, int, int]:
 def _prune_configs(configs, named_args, **kwargs):
     """Drop wasteful configs and retain the established FP8 search space."""
     topk = named_args["topk"]
-    # The GLM-5.3 config is also the measured best for an FP8 E4M3 KV cache.
     if can_use_glm53_triton_sparse_attention(
-        q_dtype=torch.bfloat16,
-        kv_dtype=torch.bfloat16,
+        q_dtype=named_args["q_nope_ptr"].dtype,
+        kv_dtype=named_args["kv_ptr"].dtype,
         num_tokens=named_args["q_nope_ptr"].shape[0],
         num_heads=kwargs["H"],
         q_nope_dim=kwargs["D_V"],
@@ -1196,6 +1194,7 @@ def _triton_sparse_mla_fwd_splitk(
     kv_splits: int,
     topk_length: torch.Tensor | None = None,
     use_topk_length: bool = False,
+    optimize_gfx950_fp8: bool | None = None,
 ) -> torch.Tensor:
     """Split-K path for short sequences."""
     kv, kv_scaled = _as_scaled_fp8_kv(kv, d_v, q_rope.shape[-1])
@@ -1225,9 +1224,10 @@ def _triton_sparse_mla_fwd_splitk(
     h_padded = n_head_blocks * BLOCK_H
     num_cu = _cu_count(q_nope.device)
     base_ctas = seq * n_head_blocks
-    optimize_gfx950_fp8 = _is_gfx950_sparse_mla_fp8(
-        kv.dtype, H, d_v, d_tail, kv_dim, seq
-    )
+    if optimize_gfx950_fp8 is None:
+        optimize_gfx950_fp8 = _is_gfx950_sparse_mla_fp8(
+            kv.dtype, H, d_v, d_tail, kv_dim
+        )
 
     num_groups = d_v // 128
     assert num_groups <= 4, (
@@ -1379,8 +1379,17 @@ def triton_sparse_mla_fwd(
     max_kv_splits = max(1, topk // _PREFERRED_BLOCK_K)
     head_blocks = max(1, (H + BLOCK_H - 1) // BLOCK_H)
     base_ctas = seq * head_blocks
+    d_tail = q_rope.shape[-1]
+    kv_dim = kv.shape[-1]
     optimize_gfx950_fp8 = _is_gfx950_sparse_mla_fp8(
-        kv.dtype, H, d_v, q_rope.shape[-1], kv.shape[-1], seq
+        kv.dtype, H, d_v, d_tail, kv_dim
+    ) or (
+        _IS_GFX95
+        and kv.dtype == torch.float8_e4m3fn
+        and d_v == 512
+        and d_tail == 0
+        and kv_dim == 512
+        and _glm53_fp8_rows_tuned(H, seq)
     )
     use_topk_length = (
         optimize_gfx950_fp8
@@ -1406,12 +1415,20 @@ def triton_sparse_mla_fwd(
                 kv_splits=1,
                 topk_length=topk_length,
                 use_topk_length=True,
+                optimize_gfx950_fp8=optimize_gfx950_fp8,
             )
     if base_ctas > num_cu:
         if optimize_gfx950_fp8:
             with _no_async_copy():
                 return _triton_sparse_mla_fwd_splitk(
-                    q_nope, q_rope, kv, indices, sm_scale, d_v, kv_splits=1
+                    q_nope,
+                    q_rope,
+                    kv,
+                    indices,
+                    sm_scale,
+                    d_v,
+                    kv_splits=1,
+                    optimize_gfx950_fp8=optimize_gfx950_fp8,
                 )
         return _triton_sparse_mla_fwd_single(q_nope, q_rope, kv, indices, sm_scale, d_v)
     kv_splits = min(
@@ -1430,5 +1447,12 @@ def triton_sparse_mla_fwd(
             max_kv_splits,
         )
     return _triton_sparse_mla_fwd_splitk(
-        q_nope, q_rope, kv, indices, sm_scale, d_v, kv_splits
+        q_nope,
+        q_rope,
+        kv,
+        indices,
+        sm_scale,
+        d_v,
+        kv_splits,
+        optimize_gfx950_fp8=optimize_gfx950_fp8,
     )
