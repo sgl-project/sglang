@@ -386,19 +386,27 @@ class SchedulerDllmMixin:
 
     def _process_dllm_batches_mixed(
         self: Scheduler, adder: PrefillAdder, running_batch: ScheduleBatch
-    ) -> None:
+    ) -> AddReqResult:
         """Build one mixed round from all phases: staging rows first (they
         already hold KV/slots and must keep progressing), then incoming rows
         up to the allocatable-request cap. Per-request treatment is identical
         to the either/or path; only the round composition changes.
+
+        Returns the refusal signal the same way the either/or path's
+        `_process_batch_by_phase` reports it: the staging pass's non-CONTINUE
+        result, and NO_TOKEN when the incoming gate refused a row for lack of
+        capacity. A mixed round must not swallow that signal — a caller that
+        watches for capacity-refused zero-admission rounds has to see them
+        whichever round shape was built.
         """
         reqs = self.dllm_manager.waiting_queue
 
+        staging_result = AddReqResult.CONTINUE
         staging_reqs = [req for req in reqs if req.dllm_phase in _DLLM_STAGING_PHASES]
         if staging_reqs:
             staging_result = self.process_dllm_staging_reqs(adder, staging_reqs)
             if staging_result != AddReqResult.CONTINUE:
-                return
+                return staging_result
 
         incoming_reqs = [req for req in reqs if req.dllm_phase in _DLLM_INCOMING_PHASES]
         if incoming_reqs:
@@ -407,9 +415,14 @@ class SchedulerDllmMixin:
             # rows carried here do not starve the incoming ones. Its preemption
             # branch is unreachable: _should_mix_dllm_batches keeps every round
             # with priority preemption on the either/or path.
-            self.process_dllm_incoming_reqs(
+            incoming_result = self.process_dllm_incoming_reqs(
                 adder, incoming_reqs, running_batch=running_batch
             )
+            if incoming_result == AddReqResult.NO_TOKEN:
+                # A capacity-refused incoming row stalls the same way a
+                # refused staging row does; report it identically.
+                staging_result = incoming_result
+        return staging_result
 
     def _process_batch_by_phase(
         self,
