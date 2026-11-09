@@ -6,7 +6,7 @@ import logging
 import threading
 import time
 from array import array
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from dataclasses import replace
 from http import HTTPStatus
 from queue import Queue
@@ -73,7 +73,12 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     PrefetchOperation,
 )
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
-from sglang.srt.mem_cache.kv.plan import TREE_BLOCK, TREE_STATE, TREE_TOKEN, TREE_WINDOW
+from sglang.srt.mem_cache.kv.plan import (
+    TREE_BLOCK,
+    TREE_STATE,
+    TREE_TOKEN,
+    TREE_WINDOW,
+)
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
@@ -86,6 +91,7 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeDeviceKVFullOnly,
     UpdatePendingBackupOnNodeSplit,
 )
+from sglang.srt.mem_cache.unified_cache.component_type import tree_slot_ids
 from sglang.srt.mem_cache.unified_cache.components import (
     BASE_COMPONENT_TYPE,
     CacheTransferPhase,
@@ -240,10 +246,11 @@ class UnifiedRadixCache(BasePrefixCache):
                 **params.component_registry_override,
             }
         self.components: dict[ComponentType, TreeComponent] = {}
+        slot_ids = tree_slot_ids(params.tree_slots)
         for slot in params.tree_slots:
             component = component_registry[slot.family](self, params, slot)
             # The family gives the behavior; the slot gives the id it goes by.
-            component.component_type = ComponentType[slot.component]
+            component.component_type = slot_ids[slot.component]
             self.components[component.component_type] = component
         self._components_tuple: tuple[TreeComponent, ...] = tuple(
             self.components.values()
@@ -265,18 +272,7 @@ class UnifiedRadixCache(BasePrefixCache):
         self.enable_mamba_extra_buffer = (
             params.enable_mamba_extra_buffer if self.is_mamba_enabled else False
         )
-        # Required cache history, shared by retention, budgeting and transfers:
-        # the window slot's.
-        self._sliding_window_size = next(
-            (
-                slot.window
-                for slot in params.tree_slots
-                if ComponentType[slot.component] == self.slot_id(TREE_WINDOW)
-            ),
-            None,
-        )
         self.decoder_swa_bounded_replay = params.decoder_swa_bounded_replay
-        self.draft_window_reaches = params.draft_window_reaches
         # The TreeCore owns the tree member-var state (structure, LRUs, sizes,
         # evictable leaves) and drives the components' tree-level hooks.
         self._tree_core_backend = select_tree_core_backend(params)
@@ -527,16 +523,11 @@ class UnifiedRadixCache(BasePrefixCache):
         """Initialize HiCache infrastructure."""
         self.host_memory_mode = get_memory().hicache_host_memory_mode
         if self.host_memory_mode == "buffer_only":
-            supported = {
-                ComponentType.FULL,
-                ComponentType.SWA,
-                ComponentType.AUXILIARY_SWA,
-                ComponentType.MAMBA,
-            }
+            supported = {ComponentType.FULL, ComponentType.MAMBA, *self.window_slots()}
             if not set(self.tree_components) <= supported:
                 raise ValueError(
                     "--hicache-host-memory-mode buffer_only supports only "
-                    "FULL/SWA/AUXILIARY_SWA/MAMBA unified trees; got components "
+                    "FULL, window and MAMBA components; got components "
                     f"{sorted(ct.name for ct in self.tree_components)}."
                 )
         from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
@@ -595,18 +586,20 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.host_memory_mode == "buffer_only":
             self.tree_core.set_host_memory_buffer_only()
             swa = self.component_of(TREE_WINDOW)
-            auxiliary_swa = self.components.get(ComponentType.AUXILIARY_SWA)
+            further_windows = tuple(
+                self.components[ct] for ct in self.window_slots()[1:]
+            )
             validate_buffer_only_stack(
                 sidecar_pool_specs=self.sidecar_pool_specs,
                 host_pool_group=self.host_pool_group,
                 swa_component=swa,
-                auxiliary_swa_component=auxiliary_swa,
+                further_window_components=further_windows,
                 storage_prefetch_threshold=storage_prefetch_threshold,
             )
             self.buffer_pipeline = self.component_of(TREE_TOKEN).create_buffer_pipeline(
                 max_context_len=get_model().context_length or 0,
                 swa_component=swa,
-                auxiliary_swa_component=auxiliary_swa,
+                further_window_components=further_windows,
                 # Leak backstop only: the queue is charged once per unique node
                 # span across pools; a cap binding on live content would
                 # drop-newest and punch storage holes.
@@ -677,7 +670,10 @@ class UnifiedRadixCache(BasePrefixCache):
 
     @rank_consensus(
         same_params=["params"],
-        same_results=["result.full_kv_hit_length", "result.swa_host_hit_length"],
+        same_results=[
+            "result.full_kv_hit_length",
+            "sorted(result.window_host_hit_lengths.items())",
+        ],
     )
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         result = self.session.try_match_prefix(params)
@@ -701,6 +697,8 @@ class UnifiedRadixCache(BasePrefixCache):
             result = component.finalize_match_result_in_cache(params, result)
         # Finalizers must not emit actions; the walk's were applied above.
         assert not result.cache_actions
+        # Outside the tree a window's host hit goes by its sub-pool's name.
+        result = result.with_window_hits_by_sub_pool(self.window_sub_pool_of_slot)
         # PD decode has no linker load-back path, so it only offloads.
         if (
             self.linker is not None
@@ -819,7 +817,7 @@ class UnifiedRadixCache(BasePrefixCache):
             )
             initial_params = EvictParams(
                 num_tokens=params.num_tokens,
-                swa_num_tokens=params.swa_num_tokens,
+                window_num_tokens=dict(params.window_num_tokens),
                 mamba_num=mamba_id_shortfall,
             )
         result = self._evict(initial_params, available_size_targets)
@@ -838,9 +836,7 @@ class UnifiedRadixCache(BasePrefixCache):
                         EvictParams(num_tokens=full_evictable),
                         {self.slot_id(TREE_TOKEN): mamba_target},
                     )
-                    result.num_tokens_evicted += donor_result.num_tokens_evicted
-                    result.swa_num_tokens_evicted += donor_result.swa_num_tokens_evicted
-                    result.mamba_num_evicted += donor_result.mamba_num_evicted
+                    result.add(donor_result)
 
                 # Preserve Mamba-victim recovery if Full cannot fund the target.
                 if (
@@ -853,23 +849,20 @@ class UnifiedRadixCache(BasePrefixCache):
                             EvictParams(mamba_num=mamba_evictable),
                             {self.slot_id(TREE_STATE): mamba_target},
                         )
-                        result.num_tokens_evicted += fallback_result.num_tokens_evicted
-                        result.swa_num_tokens_evicted += (
-                            fallback_result.swa_num_tokens_evicted
-                        )
-                        result.mamba_num_evicted += fallback_result.mamba_num_evicted
+                        result.add(fallback_result)
 
         return result
 
-    @staticmethod
-    def _evict_request_by_type(params: EvictParams) -> dict[ComponentType, int]:
-        return {
-            ComponentType.FULL: params.num_tokens,
-            ComponentType.SWA: params.swa_num_tokens,
-            ComponentType.AUXILIARY_SWA: params.auxiliary_swa_num_tokens,
-            ComponentType.MAMBA: params.mamba_num,
-            ComponentType.C128: 0,
-        }
+    def _evict_request_by_type(self, params: EvictParams) -> dict[ComponentType, int]:
+        """Per tree component, what ``params`` asks of it."""
+        request = {ct: 0 for ct in self.tree_components}
+        request[BASE_COMPONENT_TYPE] = params.num_tokens
+        state = self.slot_id(TREE_STATE)
+        if state is not None:
+            request[state] = params.mamba_num
+        for name, tokens in params.window_num_tokens.items():
+            request[self.window_slot_of(name)] = tokens
+        return request
 
     def _component_available_size(self, component_type: ComponentType) -> int:
         """Return capacity usable by the component's next allocation.
@@ -881,15 +874,14 @@ class UnifiedRadixCache(BasePrefixCache):
             if self.supports_swa():
                 return self.token_to_kv_pool_allocator.full_available_size()
             return self.token_to_kv_pool_allocator.available_size()
-        if component_type == self.slot_id(TREE_WINDOW):
-            return self.token_to_kv_pool_allocator.swa_available_size()
+        if component_type in self.window_slots():
+            return self.window_available_size(
+                self.window_sub_pool_of_slot(component_type)
+            )
         if component_type == self.slot_id(TREE_STATE):
             return (
                 self.token_to_kv_pool_allocator.state_slots.schedulable_available_size()
             )
-        if component_type == ComponentType.AUXILIARY_SWA:
-            storage, sub_pool = self.components[component_type].storage_and_sub_pool()
-            return storage.device_room(sub_pool)
         raise ValueError(f"Unsupported cache component: {component_type}")
 
     def _evict(
@@ -935,11 +927,11 @@ class UnifiedRadixCache(BasePrefixCache):
         self.update_eviction_metrics(tracker[BASE_COMPONENT_TYPE], start_time)
         return EvictResult(
             num_tokens_evicted=tracker[BASE_COMPONENT_TYPE],
-            swa_num_tokens_evicted=tracker.get(self.slot_id(TREE_WINDOW), 0),
             mamba_num_evicted=tracker.get(self.slot_id(TREE_STATE), 0),
-            auxiliary_swa_num_tokens_evicted=tracker.get(
-                ComponentType.AUXILIARY_SWA, 0
-            ),
+            window_num_tokens_evicted={
+                name: tracker.get(ct, 0)
+                for ct, name in self._window_sub_pools_by_slot().items()
+            },
         )
 
     def _free_values(
@@ -1268,11 +1260,12 @@ class UnifiedRadixCache(BasePrefixCache):
         *,
         allocation_reclaim_satisfied: Optional[Callable[[], bool]] = None,
     ) -> None:
-        """Evict the oldest Full leaves and SWA entries until the freed bytes,
-        cascades included, reach the requested quotas' bytes, or until
+        """Evict the oldest token leaves and window entries until the freed
+        bytes, cascades included, reach the requested quotas' bytes, or until
         ``allocation_reclaim_satisfied`` holds. Compaction can run, so bytes
         freed on either side serve the other side's allocation."""
         allocator = self.token_to_kv_pool_allocator
+        window = self.tree_core.joint_window_type
 
         def satisfied() -> bool:
             return (
@@ -1280,15 +1273,16 @@ class UnifiedRadixCache(BasePrefixCache):
                 and allocation_reclaim_satisfied()
             )
 
-        target = allocator.shared_bytes(params.num_tokens, params.swa_num_tokens)
+        # The tree's one window: whatever window the request names is it.
+        target = allocator.shared_bytes(
+            params.num_tokens, sum(params.window_num_tokens.values())
+        )
         if target <= 0 or satisfied():
             return
         self.tree_core.start_joint_eviction()
         try:
             while (
-                allocator.shared_bytes(
-                    tracker[BASE_COMPONENT_TYPE], tracker[ComponentType.SWA]
-                )
+                allocator.shared_bytes(tracker[BASE_COMPONENT_TYPE], tracker[window])
                 < target
                 and not satisfied()
             ):
@@ -1389,7 +1383,7 @@ class UnifiedRadixCache(BasePrefixCache):
         """The request's window has moved past its prefix: leave the prefix's
         SWA evictable. A session turn releases its slot's lock, once per session."""
         lock = (self.session.borrowed_slot(req) or req).lock
-        if self.supports_auxiliary_swa():
+        if len(self.window_slots()) > 1:
             if self.disable or lock is None:
                 return
             for ct, component in self.components.items():
@@ -1403,16 +1397,27 @@ class UnifiedRadixCache(BasePrefixCache):
                     or ct not in lock.receipt.component_lock_uuids
                 ):
                     continue
-                if ct == self.slot_id(TREE_WINDOW):
-                    self.release_swa(lock)
-                else:
-                    result = self.tree_core.dec_window_lock_only(
-                        lock.node, ct, lock.receipt
-                    )
-                    self._apply_eviction_result(result)
-                    # The receipt already tracks individually relinquished locks
-                    # (including state COW sources). Final unlock skips exactly these.
-                    lock.receipt.skipped_lock_components += (ct,)
+                result = self.tree_core.dec_window_lock_only(
+                    lock.node, ct, lock.receipt
+                )
+                self._apply_eviction_result(result)
+                # The receipt already tracks individually relinquished locks
+                # (including state COW sources). Final unlock skips exactly these.
+                lock.receipt.skipped_lock_components += (ct,)
+            # The lower locks on the node (e.g. Mamba's) go once every window
+            # has gone, as a single window's early release takes them with it.
+            receipt = lock.receipt
+            windows = self.window_slots()
+            if any(ct in receipt.component_lock_uuids for ct in windows) and all(
+                ct in receipt.skipped_lock_components
+                or ct not in receipt.component_lock_uuids
+                for ct in windows
+            ):
+                result, released = self.tree_core.dec_locks_below_windows(
+                    lock.node, receipt
+                )
+                self._apply_eviction_result(result)
+                receipt.skipped_lock_components += released
             return
         if (
             lock is not None
@@ -1440,7 +1445,7 @@ class UnifiedRadixCache(BasePrefixCache):
         # A restore's host-to-device copy may still be writing this row's
         # pages; they must not return to the allocator before it finishes.
         self._finish_restore(kv)
-        if self.supports_auxiliary_swa():
+        if len(self.window_slots()) > 1:
             self.kv_storage().free_row(kv, ranges)
         else:
             super().free_kv_row(kv, ranges)
@@ -1853,6 +1858,10 @@ class UnifiedRadixCache(BasePrefixCache):
                 (swa_indices > 0).all(),
                 f"unmapped {component.pool_name} window positions for request {req.rid}",
             )
+            if self.token_to_kv_pool_allocator.hands_out_virtual_ids:
+                # The unified pool's window rows go by the owner's ids; the
+                # copy translates them when it is submitted.
+                swa_indices = window_indices
             component_transfers[component.component_type] = [
                 PoolTransfer(
                     name=component.pool_name,
@@ -1950,12 +1959,23 @@ class UnifiedRadixCache(BasePrefixCache):
         # the scheduler on it: the forward is ordered behind this stream.
         device_module.current_stream().wait_event(req.kv.restore_done_event)
 
-    def start_restore_kv_cache(self, req: Req, backup: RetractionBackup) -> None:
+    def start_restore_kv_cache(
+        self,
+        req: Req,
+        backup: RetractionBackup,
+        *,
+        copy_stream: Optional[torch.cuda.Stream] = None,
+    ) -> None:
         """Start copying ``backup`` into ``req``'s row without ordering later
         work after the copy; the row may be read once ``req.kv.restore_done_event``
         has completed. Page moves and frees wait for the copy as for a HiCache
         load; the host slots stay reserved until finish_restore_kv_cache, or
-        freeing the row (free_kv_row), returns them after the copy."""
+        freeing the row (free_kv_row), returns them after the copy.
+
+        The copy's ids are built, and the copy is recorded, on the current
+        stream, the one page moves read the record on. With ``copy_stream``,
+        only the copy, its index preparation included, runs there, ordered
+        after the current stream's work so far."""
         device_indices, current_transfers = self._retraction_device_transfers(req)
         assert len(backup.host_indices) == len(device_indices), (
             f"Host backup has {len(backup.host_indices)} slots, but restore has "
@@ -1993,14 +2013,21 @@ class UnifiedRadixCache(BasePrefixCache):
         load_host, load_device, load_pools = self.cache_controller._move_op_indices(
             operation
         )
-        completion = self.cache_controller.l2_transfer_engine.submit_host_to_device(
-            self.cache_controller._l2_load_transfers(
-                load_host, load_device, load_pools
-            ),
-            transfer_layer_id_max=self.cache_controller.transfer_layer_id_max,
+        transfers = self.cache_controller._l2_load_transfers(
+            load_host, load_device, load_pools
         )
-        self.token_to_kv_pool_allocator.set_hicache_transfer_done_event(
-            (id(self), "restore"), completion.finish_event
+        engine = self.cache_controller.l2_transfer_engine
+        with ExitStack() as placement:
+            if copy_stream is not None:
+                copy_stream.wait_stream(device_module.current_stream())
+                placement.enter_context(device_module.stream(copy_stream))
+                placement.enter_context(engine.on_current_stream())
+            completion = engine.submit_host_to_device(
+                transfers,
+                transfer_layer_id_max=self.cache_controller.transfer_layer_id_max,
+            )
+        self.kv_storage().record_host_transfer(
+            completion.finish_event, transfers, writes=True
         )
         req.kv.restore_done_event = completion.finish_event
         self._pending_restore_backups.append((completion.finish_event, backup))
@@ -2298,6 +2325,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 node_id, device_indices, kv_xfer, comp_xfers
             )
         )
+        self.name_loaded_window_rows_by_owner(aux_xfers)
 
         receipt = _OngoingLoadBack(
             node_id,
@@ -2316,6 +2344,32 @@ class UnifiedRadixCache(BasePrefixCache):
             self.ongoing_load_back[node_id] = receipt
 
         return True
+
+    def name_loaded_window_rows_by_owner(self, transfers) -> None:
+        """A queued host load reserved window rows and the tree has bound them
+        to owner ids: from now on its transfer names them by those ids, which
+        the copy translates at submission, after any page move."""
+        if not self.token_to_kv_pool_allocator.hands_out_virtual_ids:
+            return
+        windows = {
+            component.pool_name: component
+            for component in self._components_tuple
+            if component.slot.family == TREE_WINDOW
+        }
+        for transfer in transfers or ():
+            component = windows.get(transfer.name)
+            if (
+                component is None
+                or transfer.indices_from_pool is not None
+                or transfer.device_indices is None
+                or transfer.device_indices.numel() == 0
+            ):
+                continue
+            storage, sub_pool = component.storage_and_sub_pool()
+            transfer.device_indices = storage.owner_ids_of_window_rows(
+                sub_pool, transfer.device_indices
+            )
+            storage.end_load_reservation(sub_pool)
 
     def _build_sidecar_transfers(
         self,
@@ -4028,9 +4082,8 @@ class UnifiedRadixCache(BasePrefixCache):
             or (
                 req is not None
                 and (
-                    req.swa_host_hit_length > 0
-                    or req.mamba_host_hit_length > 0
-                    or req.auxiliary_swa_host_hit_length > 0
+                    req.mamba_host_hit_length > 0
+                    or any(req.window_host_hit_lengths.values())
                 )
             )
         ):
@@ -4179,11 +4232,18 @@ class UnifiedRadixCache(BasePrefixCache):
 
     @property
     def sliding_window_size(self):
-        return self._sliding_window_size
+        """The history the tree retains for its first window, the target's;
+        None without a window. A tree keeping several windows retains each
+        one's own (`window_retain_size`)."""
+        windows = self.window_slots()
+        if not windows:
+            return None
+        return self.components[windows[0]].sliding_window_size
 
-    def swa_reprefill_tail_tokens(self, req=None) -> int:
-        """Tokens at the end of a matched prefix to re-prefill because their SWA
-        cannot be reused as is.
+    def window_reprefill_tail_tokens(self, req=None) -> int:
+        """Tokens at the end of a matched prefix to re-prefill because a window's
+        rows cannot be reused as is: the longest such window's, since one key
+        limit serves every window.
 
         unified_kv keeps SWA in a per-request ring (state_slot/pos) the tree never
         stores, so a reused window would read another request's stale slots; a
@@ -4195,28 +4255,32 @@ class UnifiedRadixCache(BasePrefixCache):
             is_unified_kv_triton,
         )
 
-        swa = self.component_of(TREE_WINDOW)
-        if swa is None or not swa.sliding_window_size:
+        window = max(
+            (
+                self.components[slot].sliding_window_size or 0
+                for slot in self.window_slots()
+            ),
+            default=0,
+        )
+        if not window:
             return 0
         if self.decoder_swa_bounded_replay and not self.session.will_lend_record(req):
-            return swa.sliding_window_size
+            return window
         if not is_unified_kv_triton():
             return 0
         if self.tree_core.has_swa_host_pool:
             return 0
-        return swa.sliding_window_size
+        return window
 
-    def window_retain_size(self, component: str) -> int:
-        """Resolved retained history used by this window's readers and cache."""
-        return self.components[ComponentType[component]].sliding_window_size
-
-    def swa_retain_floor(self, req, *, window=None) -> int | None:
-        if not self.is_mamba_enabled or self._sliding_window_size is None:
+    def swa_retain_floor(self, req, *, window: int) -> int | None:
+        """The lowest position ``window``'s retirement must keep for the
+        request's latest state checkpoint."""
+        if not self.is_mamba_enabled:
             return None
         checkpoint = req.kv.mamba_last_track_seqlen
         if checkpoint is None:
             return None
-        return checkpoint - (self._sliding_window_size if window is None else window)
+        return checkpoint - window
 
     def kv_storage(self):
         """The storage the tree's values are rows of, and its effects go to."""
@@ -4228,10 +4292,21 @@ class UnifiedRadixCache(BasePrefixCache):
         """Each family's slot id: the tree names a slot by its family, never by
         a kind (one slot per family; several windows would list more)."""
         self._family_slot_ids: dict[str, ComponentType] = {}
+        slot_ids = tree_slot_ids(tree_slots)
         for slot in tree_slots:
-            self._family_slot_ids.setdefault(slot.family, ComponentType[slot.component])
-            if slot.component == "SWA":
-                self._family_slot_ids[slot.family] = ComponentType.SWA
+            self._family_slot_ids.setdefault(slot.family, slot_ids[slot.component])
+        # The window slots, the first (the window role's) first.
+        self._window_slots: tuple[ComponentType, ...] = tuple(
+            slot_ids[slot.component]
+            for slot in tree_slots
+            if slot.family == TREE_WINDOW
+        )
+        # Each window slot's name, which the storage knows it by.
+        self._window_slot_names: dict[ComponentType, str] = {
+            slot_ids[slot.component]: slot.component
+            for slot in tree_slots
+            if slot.family == TREE_WINDOW
+        }
 
     def slot_id(self, family: str) -> Optional[ComponentType]:
         """The id of the tree's slot of ``family``; None when it has none."""
@@ -4245,18 +4320,50 @@ class UnifiedRadixCache(BasePrefixCache):
     def supports_swa(self) -> bool:
         return self.is_swa_enabled
 
-    def supports_auxiliary_swa(self) -> bool:
-        return ComponentType.AUXILIARY_SWA in self.components
+    def window_slots(self) -> tuple[ComponentType, ...]:
+        return self._window_slots
+
+    def _window_sub_pools_by_slot(self) -> dict[ComponentType, str]:
+        """Each window slot's sub-pool, as the storage names it."""
+        names = self.__dict__.get("_window_slot_sub_pools")
+        if names is None:
+            storage = self.kv_storage()
+            names = {
+                slot: storage.tree_sub_pool(
+                    self._window_slot_names[slot], family=TREE_WINDOW
+                )
+                for slot in self._window_slots
+            }
+            self.__dict__["_window_slot_sub_pools"] = names
+        return names
+
+    def window_slot_of(self, sub_pool: str) -> ComponentType:
+        for slot, name in self._window_sub_pools_by_slot().items():
+            if name == sub_pool:
+                return slot
+        raise KeyError(f"no window slot keeps sub-pool {sub_pool!r}")
+
+    def window_sub_pool_of_slot(self, slot: ComponentType) -> str:
+        return self._window_sub_pools_by_slot()[slot]
+
+    def window_sub_pools(self) -> tuple[tuple[str, int], ...]:
+        """This tree keeps a slot for every window it retains."""
+        return self.window_lengths()
+
+    def window_retain_size(self, sub_pool: str) -> int:
+        """The tail a running request keeps of ``sub_pool`` (`window_lengths`)."""
+        return dict(self.window_lengths())[sub_pool]
+
+    def window_lengths(self) -> tuple[tuple[str, int], ...]:
+        return tuple(
+            (name, self.components[slot].sliding_window_size)
+            for slot, name in self._window_sub_pools_by_slot().items()
+        )
 
     def window_retention(self, req):
         return tuple(
-            (
-                slot,
-                component.sliding_window_size,
-                self.swa_retain_floor(req, window=component.sliding_window_size),
-            )
-            for slot, component in self.components.items()
-            if isinstance(component, SWAComponent)
+            (sub_pool, window, self.swa_retain_floor(req, window=window))
+            for sub_pool, window in self.window_lengths()
         )
 
     def supports_mamba(self) -> bool:
@@ -4308,20 +4415,25 @@ class UnifiedRadixCache(BasePrefixCache):
             self.linker.prefetch_size(PoolName.KV) if self.linker is not None else 0
         )
 
-    def swa_evictable_size(self) -> int:
-        return self.tree_core.swa_evictable_size()
-
-    def auxiliary_swa_evictable_size(self) -> int:
-        if ComponentType.AUXILIARY_SWA not in self.components:
+    def window_evictable_size(self, sub_pool: str) -> int:
+        try:
+            component = self.window_slot_of(sub_pool)
+        except KeyError:
             return 0
-        return self.tree_core.component_evictable_size(ComponentType.AUXILIARY_SWA)
+        return self.tree_core.component_evictable_size(component)
 
     def mamba_evictable_size(self) -> int:
         return self.tree_core.mamba_evictable_size()
 
-    def swa_protected_size(self) -> int:
-        return self.tree_core.swa_protected_size() + (
-            self.linker.prefetch_size(PoolName.SWA) if self.linker is not None else 0
+    def window_protected_size(self, sub_pool: str) -> int:
+        try:
+            component = self.window_slot_of(sub_pool)
+        except KeyError:
+            return 0
+        return self.tree_core.component_protected_size(component) + (
+            self.linker.prefetch_size(self.components[component].pool_name)
+            if self.linker is not None
+            else 0
         )
 
     def mamba_protected_size(self) -> int:
@@ -4352,8 +4464,10 @@ class UnifiedRadixCache(BasePrefixCache):
         for ct in self.tree_components:
             if ct == BASE_COMPONENT_TYPE:
                 continue
-            if ct.is_swa:
-                available_size = self.token_to_kv_pool_allocator.swa_available_size()
+            if ct in self.window_slots():
+                available_size = self.window_available_size(
+                    self.window_sub_pool_of_slot(ct)
+                )
             elif ct.is_mamba:
                 available_size = (
                     self.token_to_kv_pool_allocator.state_slots.available_size()

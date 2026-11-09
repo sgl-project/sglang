@@ -65,7 +65,7 @@ class TestKimiK3MoEPresortLifetime(CustomTestCase):
         fused_moe consumed must not outlive the layer, whichever path routed it."""
         registrations = []
 
-        def route_without_fused_moe(hidden_states, *, prefix_sum):
+        def route_without_fused_moe(hidden_states, *, prefix_sum, valid_token_count):
             registrations.append({"M": hidden_states.shape[0]})
             return hidden_states
 

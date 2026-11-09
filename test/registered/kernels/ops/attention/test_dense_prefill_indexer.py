@@ -1,8 +1,19 @@
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
+    candidate_topk,
+    topk_among_blocks,
+)
+from sglang.kernels.ops.attention.dsv4.candidate_scores import (
+    _candidate_matmul,
+    can_use_candidate_scores,
+    candidate_scores,
+)
+from sglang.kernels.ops.attention.dsv4.candidate_table import CANDIDATE_BLOCK_SIZE
+from sglang.kernels.ops.quantization.fp4_fake_quant import fake_quant_fp4
 from sglang.kernels.ops.quantization.fp4_indexer_quant import (
     quantize_fp4_indexer_tensor,
 )
@@ -11,6 +22,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 
 def make_inputs(request_lengths, ratio=1, zero_queries=False, seed=17):
@@ -375,6 +387,239 @@ class TestDensePrefillIndexer(CustomTestCase):
                     torch.cuda.synchronize()
                     self.assertEqual(torch.cuda.memory_allocated(), baseline)
                 del inputs, candidates
+
+
+@unittest.skipUnless(
+    torch.cuda.is_available() and torch.version.hip is None, "requires NVIDIA CUDA"
+)
+class TestCandidateScores(CustomTestCase):
+    def make_case(self, heads=32, visible=129, *, fp4=False, seed=17):
+        gen = torch.Generator(device="cuda").manual_seed(seed)
+        padded = -(-visible // 64) * 64
+        if fp4:
+            q = fake_quant_fp4(
+                torch.randn(
+                    5, heads, 128, device="cuda", dtype=torch.bfloat16, generator=gen
+                )
+            )
+            k = fake_quant_fp4(
+                torch.randn(
+                    padded, 128, device="cuda", dtype=torch.bfloat16, generator=gen
+                )
+            )
+        else:
+            q = torch.randint(
+                -2, 3, (5, heads, 128), device="cuda", generator=gen
+            ).bfloat16()
+            k = torch.randint(
+                -2, 3, (padded, 128), device="cuda", generator=gen
+            ).bfloat16()
+        k[visible:] = 1024
+        weights = (
+            torch.randint(-2, 3, (5, heads), device="cuda", generator=gen).bfloat16()
+            / 4
+        )
+        newest = (visible - 1) // CANDIDATE_BLOCK_SIZE
+        blocks = torch.tensor(
+            [
+                [-1, -1, -1],
+                [0, -1, -1],
+                [0, 1, -1],
+                [0, 4, newest],
+                [newest, max(0, newest - 1), -1],
+            ],
+            device="cuda",
+            dtype=torch.int32,
+        )
+        lens = torch.tensor(
+            [0, min(1, visible), min(11, visible), visible, visible],
+            device="cuda",
+            dtype=torch.int32,
+        )
+        return q, k, weights, blocks, lens
+
+    def compact_reference(self, q, k, weights, blocks, lens, visible):
+        per_head = torch.einsum("bhd,nd->bhn", q, k)
+        full = (per_head.relu() * weights.unsqueeze(-1)).sum(1).float()[:, :visible]
+        positions = (
+            blocks.long()[:, :, None] * CANDIDATE_BLOCK_SIZE
+            + torch.arange(CANDIDATE_BLOCK_SIZE, device="cuda")
+        ).flatten(1)
+        valid = (positions >= 0) & (positions < lens[:, None]) & (positions < visible)
+        if visible:
+            compact = full.gather(1, positions.clamp(0, visible - 1))
+            compact = compact.masked_fill(~valid, -torch.inf)
+        else:
+            compact = torch.full(positions.shape, -torch.inf, device="cuda")
+        return full, compact
+
+    def check_pipeline(self, inputs, visible, topk):
+        q, k, weights, blocks, lens = inputs
+        full, expected_scores = self.compact_reference(*inputs, visible)
+        with patch.object(_candidate_matmul, "run", wraps=_candidate_matmul.run) as run:
+            compact = candidate_scores(q, k, weights, blocks, lens)
+        self.assertEqual(run.call_count, int(q.shape[0] > 0 and blocks.shape[1] > 0))
+        self.assertEqual(compact.dtype, torch.float32)
+        self.assertTrue(torch.equal(compact, expected_scores))
+        actual = candidate_topk(compact, blocks, topk)
+        expected = topk_among_blocks(full, lens, blocks, topk, CANDIDATE_BLOCK_SIZE)
+        self.assertTrue(torch.equal(actual, expected))
+        self.assertEqual(actual.shape, (q.shape[0], topk))
+        self.assertTrue(
+            torch.equal(
+                (actual >= 0).sum(1), torch.isfinite(compact).sum(1).clamp_max(topk)
+            )
+        )
+        return compact
+
+    def test_candidate_pipeline_parity(self):
+        for heads in (16, 32, 64):
+            for visible in (129, 1025):
+                inputs = self.make_case(heads, visible)
+                for topk in (0, 7, 32):
+                    with self.subTest(heads=heads, visible=visible, topk=topk):
+                        self.check_pipeline(inputs, visible, topk)
+
+    def test_small_heads(self):
+        for heads in (1, 2, 4, 8, 9):
+            with self.subTest(heads=heads):
+                self.check_pipeline(self.make_case(heads), 129, 32)
+
+    def test_fp4_operands(self):
+        for visible in (129, 1025):
+            for seed in (0, 42, 123):
+                with self.subTest(visible=visible, seed=seed):
+                    self.check_pipeline(
+                        self.make_case(visible=visible, fp4=True, seed=seed), visible, 7
+                    )
+
+    def test_noncontiguous_operands(self):
+        inputs = []
+        for value in self.make_case():
+            if value.ndim == 1:
+                inputs.append(value)
+            else:
+                backing = torch.empty(
+                    (*value.shape[:-1], value.shape[-1] * 2),
+                    device=value.device,
+                    dtype=value.dtype,
+                )
+                view = backing[..., ::2]
+                view.copy_(value)
+                self.assertFalse(view.is_contiguous())
+                inputs.append(view)
+        self.check_pipeline(tuple(inputs), 129, 32)
+
+    def test_empty_inputs(self):
+        inputs = self.make_case()
+        q, k, weights, blocks, lens = inputs
+        cases = [
+            (q[:0], k, weights[:0], blocks[:0], lens[:0]),
+            (q, k, weights, blocks[:, :0], lens),
+            (q, k[:0], weights, blocks, torch.zeros_like(lens)),
+        ]
+        for case in cases:
+            visible = 129 if case[1].shape[0] else 0
+            with self.subTest(
+                rows=case[0].shape[0], blocks=case[3].shape[1], visible=visible
+            ):
+                self.check_pipeline(case, visible, 32)
+
+    def test_eligibility(self):
+        q, k, weights, _, _ = self.make_case()
+        self.assertTrue(can_use_candidate_scores(q, k, weights, 24, 129))
+        self.assertFalse(can_use_candidate_scores(q, k, weights, 24, 47))
+        self.assertFalse(can_use_candidate_scores(q, k, weights, 0, 129))
+        self.assertFalse(can_use_candidate_scores(q.float(), k, weights, 24, 129))
+        self.assertFalse(
+            can_use_candidate_scores(q.cpu(), k.cpu(), weights.cpu(), 24, 129)
+        )
+        with patch(
+            "sglang.kernels.ops.attention.dsv4.candidate_scores.is_cuda",
+            return_value=False,
+        ):
+            self.assertFalse(can_use_candidate_scores(q, k, weights, 24, 129))
+
+    def test_candidate_chunking(self):
+        inputs = self.make_case()
+        q, k, weights, blocks, lens = inputs
+        full, expected = self.compact_reference(*inputs, 129)
+        tok = torch.tensor([4, 0, 3, 1, 2], device="cuda")
+        request = scoring.RequestScores(
+            lc=129,
+            k=7,
+            columns=torch.arange(129, device="cuda"),
+            tok=tok,
+            lens=lens[tok],
+            slots=torch.arange(129, device="cuda"),
+        )
+        indexer = Mock()
+        indexer.scores.side_effect = AssertionError("full scoring was used")
+        budget = 2 * q.shape[1] * blocks.shape[1] * CANDIDATE_BLOCK_SIZE * 2
+        with patch.object(scoring, "_TORCH_SCORE_BUDGET_BYTES", budget):
+            chunks = list(
+                scoring._score_chunks(
+                    indexer=indexer,
+                    q=q,
+                    weights=weights,
+                    index_k=k,
+                    request=request,
+                    candidate_blocks=blocks,
+                )
+            )
+        self.assertEqual([chunk.tok.numel() for chunk in chunks], [2, 2, 1])
+        for chunk in chunks:
+            self.assertTrue(chunk.candidate_only)
+            self.assertTrue(torch.equal(chunk.scores, expected[chunk.tok]))
+            actual = candidate_topk(chunk.scores, blocks[chunk.tok], request.k)
+            reference = topk_among_blocks(
+                full[chunk.tok],
+                lens[chunk.tok],
+                blocks[chunk.tok],
+                request.k,
+                CANDIDATE_BLOCK_SIZE,
+            )
+            self.assertTrue(torch.equal(actual, reference))
+
+    def test_full_score_fallback(self):
+        q, k, weights, blocks, lens = self.make_case()
+        request = scoring.RequestScores(
+            lc=129,
+            k=7,
+            columns=torch.arange(129, device="cuda"),
+            tok=torch.arange(5, device="cuda"),
+            lens=lens,
+            slots=torch.arange(129, device="cuda"),
+        )
+
+        def full_scores(q, k, weights):
+            s = torch.einsum("bhd,nd->bhn", q, k)
+            return (s.relu() * weights.unsqueeze(-1)).sum(1).float()
+
+        indexer = Mock()
+        indexer.scores.side_effect = full_scores
+        too_wide = blocks.repeat(1, 4)
+        with patch.object(
+            _candidate_matmul, "run", side_effect=AssertionError("candidate launch")
+        ):
+            chunks = list(
+                scoring._score_chunks(
+                    indexer=indexer,
+                    q=q,
+                    weights=weights,
+                    index_k=k,
+                    request=request,
+                    candidate_blocks=too_wide,
+                )
+            )
+        self.assertTrue(indexer.scores.called)
+        expected = full_scores(q, k, weights)[:, :129]
+        expected = expected.masked_fill(
+            torch.arange(129, device="cuda")[None, :] >= lens[:, None], -torch.inf
+        )
+        for chunk in chunks:
+            self.assertFalse(chunk.candidate_only)
+            self.assertTrue(torch.equal(chunk.scores, expected[chunk.tok]))
 
 
 if __name__ == "__main__":

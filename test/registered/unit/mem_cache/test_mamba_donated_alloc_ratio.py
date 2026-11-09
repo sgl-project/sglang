@@ -249,7 +249,7 @@ class TestMambaRatioEnvGate(CustomTestCase):
             def quantizes_checkpoints(self, sub_pool):
                 return False
 
-            def tree_sub_pool(self, name):
+            def tree_sub_pool(self, name, family=None):
                 return name
 
             def release_state(self, sub_pool, req, keep=None):

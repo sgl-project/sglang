@@ -166,7 +166,7 @@ class TestUnifiedSWATailAllocation(CustomTestCase):
                         full_tokens=192,
                         swa_tokens=48,
                         state_slots=8,
-                        lazy=False,
+                        lazy=True,
                         fused_draft=placement,
                         device="cuda",
                     )
@@ -177,10 +177,10 @@ class TestUnifiedSWATailAllocation(CustomTestCase):
                 storage = kv_storage_of(bundle.req_to_token_pool, allocator)
                 self.assertEqual(
                     storage.stated_window_lengths()["draft_swa"],
-                    (draft_window, "AUXILIARY_SWA"),
+                    (draft_window, "DRAFT_SWA"),
                 )
                 windows = {w.sub_pool_name: w for w in allocator._windows}
-                self.assertEqual(set(windows), {"swa", "draft_swa"})
+                self.assertEqual(set(windows), {"window_16", "draft_swa"})
                 zero = torch.tensor([0], dtype=torch.int64)
                 seq = torch.tensor([seq_len], dtype=torch.int64)
                 target_tail, draft_tail = 16, draft_window
@@ -195,7 +195,7 @@ class TestUnifiedSWATailAllocation(CustomTestCase):
                     window_tail_lens={"draft_swa": draft_tail},
                 )
                 self.assertIsNotNone(out)
-                self.assertEqual(windows["swa"].allocated_count(), target_tail)
+                self.assertEqual(windows["window_16"].allocated_count(), target_tail)
                 self.assertEqual(
                     windows["draft_swa"].allocated_count(),
                     -(-draft_tail // page_size) * page_size,
