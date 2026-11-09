@@ -23,8 +23,8 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.fixture(autouse=True)
 def uncached_tma_gate(monkeypatch):
-    # Production fixes this flag for a process. These tests switch it in one
-    # process to exercise the real environment gate and both transfer paths.
+    # Production caches this gate for a process. These tests mock the TMA module
+    # and switch the gate in one process to exercise both transfer paths.
     monkeypatch.setattr(
         hicache, "use_hicache_tma_kernel", hicache.use_hicache_tma_kernel.__wrapped__
     )
@@ -165,7 +165,7 @@ def test_page_unified_tma_and_register_parity(
                 contextlib.nullcontext()
                 if enabled
                 else mock.patch.object(
-                    hicache, "_use_page_unified_tma_kernel", return_value=False
+                    hicache, "use_hicache_tma_kernel", return_value=False
                 )
             )
             with gate:
