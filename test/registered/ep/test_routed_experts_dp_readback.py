@@ -1,7 +1,6 @@
 """DP>1 routed-expert readback parity for A2A backends."""
 
 import concurrent.futures
-import importlib.util
 import json
 import os
 import unittest
@@ -42,6 +41,16 @@ def _deep_ep_has(attr: str) -> bool:
     except ImportError:
         return False
     return hasattr(deep_ep, attr)
+
+
+def _nixl_ep_importable() -> bool:
+    # find_spec is not enough: a wheel built against another torch is found
+    # but fails to import.
+    try:
+        import nixl_ep  # noqa: F401
+    except ImportError:
+        return False
+    return True
 
 
 def _deep_ep_nccl_compatible() -> bool:
@@ -191,7 +200,7 @@ class TestRoutedExpertsReadbackDeepEPv2(_ReadbackMixin, CustomTestCase):
     ]
 
 
-@unittest.skipUnless(importlib.util.find_spec("nixl_ep"), "NIXL EP not installed")
+@unittest.skipUnless(_nixl_ep_importable(), "NIXL EP not importable")
 class TestRoutedExpertsReadbackNixl(_ReadbackMixin, CustomTestCase):
     backend_args = [
         "--moe-a2a-backend",
