@@ -5,7 +5,6 @@ from functools import partial
 import msgspec
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
 from sglang.srt.layers.layer_boundary.contracts import BatchVariant, ReadoutFusion
 from sglang.srt.layers.layer_boundary.factories import declare_attn, declare_ffn
@@ -225,7 +224,6 @@ class HcReadCall(HcRead):
             if (
                 self.attention
                 and stream is not None
-                and envs.SGLANG_OPT_DSV41_HC_ATTN_FORK_AT_CORE.get()
                 and getattr(layer.self_attn, "use_mega_attention", False)
             ):
                 mhc.defer_attn_stats_fork(stream)
