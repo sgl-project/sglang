@@ -46,6 +46,8 @@ from sglang.kernels.ops.attention.dsv4.decode_attention_sm100 import (
 )
 from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
     dequantize_k_cache_paged_dsv4,
+    fp8_dtype,
+    gather_dequant_requant_fp8_paged_dsv4,
 )
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
@@ -54,7 +56,10 @@ from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
 from sglang.kernels.ops.attention.dsv4.opus_sparse_prefill_hip import (
     Csr,
     combined_to_csr,
+    opus_fp8_available,
     opus_sparse_prefill,
+    opus_sparse_prefill_fp8,
+    quantize_q_opus_fp8,
 )
 from sglang.kernels.ops.attention.dsv4.swapab_gluon_hip import swapab_attention
 from sglang.kernels.plugin_kernels.amd.spec import StepMetadata
@@ -3193,35 +3198,95 @@ class DeepseekV4HipRadixBackend(
             state = self._opus_prefill_state = _OpusPrefillState(cache, swa_csr)
         cache = state.cache
         num_swa_rows = cache.swa_token_ids.shape[0]
-        swa_rows = self.opus_prefill_workspace.get(num_swa_rows)
-        dequantize_k_cache_paged_dsv4(
+        fp8 = self._opus_fp8_applies(q, layer_id, compress_ratio)
+        swa_rows = self.opus_prefill_workspace.get(
+            num_swa_rows, dtype=fp8_dtype if fp8 else torch.bfloat16
+        )
+        self._gather_opus_rows(
             pool.get_swa_key_buffer_radix(layer_id),
             cache.swa_token_ids,
-            page_size=cache.swa_page_size,
-            out=swa_rows,
-            layout=pool.get_swa_key_layout(),
+            cache.swa_page_size,
+            swa_rows,
+            pool.get_swa_key_layout(),
+            fp8,
         )
         swa_kv = swa_rows.view(num_swa_rows, -1)
+        if fp8:
+            q_nope, q_rope = quantize_q_opus_fp8(q)
         if compress_ratio == 0:
-            out = opus_sparse_prefill(
-                q, swa_kv, state.swa_csr, attn_sink, self.softmax_scale
-            )
+            if fp8:
+                out = opus_sparse_prefill_fp8(
+                    q_nope, q_rope, swa_kv, state.swa_csr, attn_sink, self.softmax_scale
+                )
+            else:
+                out = opus_sparse_prefill(
+                    q, swa_kv, state.swa_csr, attn_sink, self.softmax_scale
+                )
         else:
             compressed_kv, topk_csr = self._opus_compressed_inputs(
-                state, layer_id, compress_ratio, core_attn_metadata
+                state, layer_id, compress_ratio, core_attn_metadata, fp8
             )
-            out = opus_sparse_prefill(
-                q,
-                compressed_kv,
-                topk_csr,
-                attn_sink,
-                self.softmax_scale,
-                extend_kv=swa_kv,
-                extend_csr=state.swa_csr,
-            )
+            if fp8:
+                out = opus_sparse_prefill_fp8(
+                    q_nope,
+                    q_rope,
+                    compressed_kv,
+                    topk_csr,
+                    attn_sink,
+                    self.softmax_scale,
+                    extend_kv=swa_kv,
+                    extend_csr=state.swa_csr,
+                )
+            else:
+                out = opus_sparse_prefill(
+                    q,
+                    compressed_kv,
+                    topk_csr,
+                    attn_sink,
+                    self.softmax_scale,
+                    extend_kv=swa_kv,
+                    extend_csr=state.swa_csr,
+                )
         if inv_rope is not None:
             _apply_inverse_rope(out, inv_rope)
         return out
+
+    def _opus_fp8_applies(
+        self, q: torch.Tensor, layer_id: int, compress_ratio: int
+    ) -> bool:
+        """Whether this OPUS layer runs the fp8 kernel: the V4 caches the fp8 gather
+        reads, and at most the 32 heads that kernel takes."""
+        if not envs.SGLANG_OPT_HIP_OPUS_FP8_PREFILL.get() or q.shape[1] > 32:
+            return False
+        pool = self.token_to_kv_pool
+        if pool.get_swa_key_layout() is not KVLayout.V4:
+            return False
+        if (
+            compress_ratio != 0
+            and pool.get_extra_key_layout(layer_id) is not KVLayout.V4
+        ):
+            return False
+        return opus_fp8_available()
+
+    @staticmethod
+    def _gather_opus_rows(
+        k_cache: torch.Tensor,
+        token_ids: torch.Tensor,
+        page_size: int,
+        out: torch.Tensor,
+        layout: KVLayout,
+        fp8: bool,
+    ) -> None:
+        """The cache rows OPUS reads, as unit-scale fp8 in aiter's DMA layout (448 NoPE
+        then 64 RoPE) for the fp8 kernel, else as bf16."""
+        if fp8:
+            gather_dequant_requant_fp8_paged_dsv4(
+                k_cache, token_ids, page_size=page_size, out=out
+            )
+        else:
+            dequantize_k_cache_paged_dsv4(
+                k_cache, token_ids, page_size=page_size, out=out, layout=layout
+            )
 
     def _opus_compressed_inputs(
         self,
@@ -3229,26 +3294,31 @@ class DeepseekV4HipRadixBackend(
         layer_id: int,
         compress_ratio: int,
         core_attn_metadata: DSV4AttnMetadata,
+        fp8: bool = False,
     ) -> Tuple[torch.Tensor, Csr]:
-        """The bf16 compressed history of the layer's kv_source and the CSR of the
-        ratio's current top-k into it."""
+        """The compressed history of the layer's kv_source (fp8 rows for the fp8
+        kernel, else bf16) and the CSR of the ratio's current top-k into it."""
         pool = self.token_to_kv_pool
         cache = state.cache
         c_cache = pool.get_extra_key_buffer(layer_id)
+        dtype = fp8_dtype if fp8 else torch.bfloat16
         entry = state.compressed_kv.get(compress_ratio)
-        if entry is None or entry[0] != c_cache.data_ptr():
+        if entry is None or entry[0] != c_cache.data_ptr() or entry[1].dtype != dtype:
             c_page_size = pool.get_extra_key_page_size(layer_id)
             gather = cache.ensure_compressed(
                 compress_ratio, core_attn_metadata.page_table, c_page_size
             )
             num_rows = gather.flat_token_ids.shape[0]
-            rows = self.opus_compressed_workspaces[compress_ratio].get(num_rows)
-            dequantize_k_cache_paged_dsv4(
+            rows = self.opus_compressed_workspaces[compress_ratio].get(
+                num_rows, dtype=dtype
+            )
+            self._gather_opus_rows(
                 c_cache,
                 gather.flat_token_ids,
-                page_size=c_page_size,
-                out=rows,
-                layout=pool.get_extra_key_layout(layer_id),
+                c_page_size,
+                rows,
+                pool.get_extra_key_layout(layer_id),
+                fp8,
             )
             entry = (c_cache.data_ptr(), rows.view(num_rows, -1))
             state.compressed_kv[compress_ratio] = entry
