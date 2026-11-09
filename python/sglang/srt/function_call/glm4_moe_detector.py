@@ -954,14 +954,16 @@ def _glm_has_complete_properties(schema: Any) -> bool:
         for keyword in ("allOf", "anyOf", "oneOf")
         for branch in schema.get(keyword, [])
     ]
+    closed = (
+        schema.get("additionalProperties") is False
+        or schema.get("unevaluatedProperties") is False
+    )
     properties = schema.get("properties")
     if isinstance(properties, dict):
-        return not branches and (
-            bool(properties) or schema.get("additionalProperties") is False
-        )
+        return not branches and (bool(properties) or closed)
     if branches:
         return all(_glm_has_complete_properties(branch) for branch in branches)
-    return schema.get("additionalProperties") is False
+    return closed
 
 
 def _glm_build_tool_call_rules(

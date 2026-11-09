@@ -3798,7 +3798,7 @@ class TestGlm47MoeDetector(unittest.TestCase):
             _glm47_native_structural_tag_available.cache_clear()
 
 
-class TestGlm47FullAssistantGrammar(unittest.TestCase):
+class TestGlm47FullAssistantGrammar(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.compiler = xgr.GrammarCompiler(
@@ -4007,19 +4007,26 @@ class TestGlm47FullAssistantGrammar(unittest.TestCase):
                     with self.subTest(backend=backend, text=text):
                         self.assertEqual(accepts(text), expected)
 
-    def test_closed_zero_key_schemas_reject_argument_pairs(self):
-        """A closed no-argument tool must not accept argument pairs."""
+    def test_zero_key_schemas(self):
+        """Only a closed no-argument tool rules out arbitrary argument pairs."""
         pair = "<arg_key>unknown</arg_key><arg_value>v</arg_value>"
-        for schema in (
-            {"properties": {}, "additionalProperties": False},
-            {"additionalProperties": False},
+        for schema, allows_pair in (
+            ({"properties": {}, "additionalProperties": False}, False),
+            ({"additionalProperties": False}, False),
+            ({"properties": {}, "unevaluatedProperties": False}, False),
+            ({"unevaluatedProperties": False}, False),
+            ({"properties": {}}, True),
+            ({"patternProperties": {".*": {}}, "unevaluatedProperties": False}, True),
         ):
-            with self.subTest(schema=schema):
-                grammar = self._compile(schema)
-                self.assertTrue(self._accepts(grammar, "<tool_call>alpha</tool_call>"))
-                self.assertFalse(
-                    self._accepts(grammar, f"<tool_call>alpha{pair}</tool_call>")
-                )
+            ebnf = self._ebnf(schema)
+            grammar = self.compiler.compile_grammar(xgr.Grammar.from_ebnf(ebnf))
+            for arguments, accepted in (("", True), (pair, allows_pair)):
+                text = f"<tool_call>alpha{arguments}</tool_call>"
+                with self.subTest(schema=schema, arguments=arguments):
+                    self.assertEqual(self._accepts(grammar, text), accepted, "xgrammar")
+                    self.assertEqual(
+                        self._llguidance_accepts(ebnf, text), accepted, "llguidance"
+                    )
 
 
 class TestLing3Detector(unittest.TestCase):
