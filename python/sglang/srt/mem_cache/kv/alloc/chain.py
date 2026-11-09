@@ -10,6 +10,7 @@ What still differs between chain shapes is the interim capacity policy in
 
 from __future__ import annotations
 
+import functools
 import logging
 from contextlib import contextmanager
 from typing import (
@@ -28,26 +29,33 @@ import msgspec
 import torch
 from torch.profiler import record_function
 
-from sglang.kernels.ops.memory.allocator import alloc_decode_kernel, alloc_extend_kernel
+from sglang.kernels.ops.memory.allocator import (
+    alloc_decode_kernel,
+    alloc_extend_kernel,
+)
 from sglang.srt.environ import InvariantCheckLevel
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-from sglang.srt.mem_cache.allocator.swa import (
-    UNIFIED_SWA_SEGMENT_BOUND,
-    UNIFIED_SWA_SEGMENT_RELEASED,
-)
 from sglang.srt.mem_cache.kv.alloc.band import (
     Band,
     FloatBand,
+    allocator_operation,
     chain_byte_accounting_violations,
     flush_deferred_free_group,
     full_tokens_before_mamba_recheck,
     relieve_for_alloc,
+    settle_pending_for_recovery,
 )
+from sglang.srt.mem_cache.kv.alloc.forward_steps import ForwardSteps
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace
 from sglang.srt.mem_cache.kv.alloc.interim import (
     ChainAdmissionRules,
     interim_policy_for,
 )
+from sglang.srt.mem_cache.kv.alloc.invariants import (
+    WINDOW_SEGMENT_BOUND,
+    WINDOW_SEGMENT_RELEASED,
+)
+from sglang.srt.mem_cache.kv.alloc.page_usage import Consumer
 from sglang.srt.mem_cache.kv.alloc.pricing import (
     ChainSnapshot,
     no_relief_plan,
@@ -57,9 +65,22 @@ from sglang.srt.mem_cache.kv.memory.arena import KVArena
 from sglang.srt.mem_cache.utils import get_num_new_pages
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.invariants import expect, resolve_level
-from sglang.srt.utils.triton_utils import next_power_of_2
 
 logger = logging.getLogger(__name__)
+
+
+def _one_operation(method):
+    """Run a chain allocation as one allocator operation over every member
+    (`band.py::allocator_operation`): its host reads come before its first
+    stream wait, whichever band waits first."""
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        chain = getattr(self, "allocator", self)
+        with allocator_operation(chain.members):
+            return method(self, *args, **kwargs)
+
+    return wrapper
 
 
 class _ScopedPhysicalTakes:
@@ -82,7 +103,8 @@ class _ScopedPhysicalTakes:
             )
         self.applying = False
 
-    def take(self, band, pages):
+    @_one_operation
+    def take(self, band, pages, consumer=Consumer.FORWARD):
         snapshot = self.allocator.pricing_snapshot()
         remaining = {
             current.name: self.demands.get(current.name, 0)
@@ -99,7 +121,7 @@ class _ScopedPhysicalTakes:
         )
         self.applying = True
         try:
-            return band.take_planned_physical_pages(take)
+            return band.take_planned_physical_pages(take, consumer)
         finally:
             self.applying = False
 
@@ -197,7 +219,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         page_size: int = 1,
         need_sort: bool = False,
         forward_stream: Optional[torch.cuda.Stream] = None,
-        lazy_compaction: bool = False,
+        lazy_compaction: bool = True,
         full_cap_tokens: Optional[int] = None,
         full_max_total_num_tokens: Optional[int] = None,
         swa_max_total_num_tokens: Optional[int] = None,
@@ -219,6 +241,9 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         self.roles = roles
         # Views used by each band's move, zero and copy operations.
         self.views = dict(views)
+        # The ends compact lazily, behind the forwards that may still read the
+        # pages they move: unified memory has no eager compaction.
+        assert lazy_compaction, "the unified pool's ends compact lazily"
         self.lazy_compaction = lazy_compaction
         band = dict(
             arena=arena,
@@ -274,6 +299,11 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                 self.mamba_allocator,
             )
             if b is not None
+        )
+        # A lazy chain hands a freed page out again from the schedule stream
+        # (zeroing, compaction), so its freed pages wait for the steps in flight.
+        self.forward_steps: Optional[ForwardSteps] = (
+            ForwardSteps(self.members) if lazy_compaction else None
         )
         by_name = {band.sub_pool_name: band for band in self.members}
         self.bands = tuple(by_name[band.name] for band in arena.bands)
@@ -382,6 +412,19 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
 
     def swa_available_size(self) -> int:
         return self._policy.swa_available_size(self)
+
+    def window_pool_names(self) -> Tuple[str, ...]:
+        return tuple(window.sub_pool_name for window in self._windows)
+
+    def window_available_size(self, sub_pool: str) -> int:
+        """What a take from window sub-pool ``sub_pool`` can serve now: the
+        target window's as the chain's policy answers it, another window's
+        from its own band."""
+        if sub_pool not in self.window_pool_names():
+            raise KeyError(f"no window sub-pool {sub_pool!r}")
+        if sub_pool == self.roles.window:
+            return self.swa_available_size()
+        return self.window_allocators[sub_pool].schedulable_available_size()
 
     def conserve_full_available_size(self) -> int:
         return self._policy.conserve_full_available_size(self)
@@ -521,7 +564,11 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         ):
             raise RuntimeError("the arena must be backed before allocator.resize")
         for band in self.members:
-            if band.allocated_count() or band._pending_reuse:
+            if (
+                band.allocated_count()
+                or band.usage.has_pending()
+                or band._pending_until_retire
+            ):
                 raise RuntimeError(
                     f"cannot resize non-empty band {band.sub_pool_name!r}"
                 )
@@ -744,18 +791,28 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         a DMA initiator whose queues outlive an iteration, registered once. A
         transfer that reaches every sub-pool names every one: a band it leaves
         out would relocate its own pages under the same in-flight copy."""
-        assert self.lazy_compaction, (
-            "Pin sources (PD disaggregation, HiCache) with the unified memory "
-            "pool require lazy compaction (eager free-path compaction moves "
-            "pages under in-flight transfers)."
-        )
         for name in sub_pools:
             self.bands[self._band_positions[name]].add_pin_source(busy)
 
-    def set_hicache_transfer_done_event(self, transfer_key: Hashable, event) -> None:
-        # Every member a pin covers must also order its moves after the copy.
+    def fix_pages(self, sub_pool: str, key: Hashable, pages: Sequence[int]) -> None:
+        """Keep these physical pages of ``sub_pool`` where they are, under
+        ``key``, until `unfix_pages`: a transfer that holds their physical ids,
+        or a page that must not be touched. Moves go around them, and every
+        plan keeps them inside their band."""
+        self.bands[self._band_positions[sub_pool]].fix_pages(key, pages)
+
+    def unfix_pages(
+        self, sub_pool: str, key: Hashable, pages: Optional[Sequence[int]] = None
+    ) -> None:
+        """Release the pages of ``sub_pool`` fixed under ``key``: every one, or
+        ``pages``."""
+        self.bands[self._band_positions[sub_pool]].unfix_pages(key, pages)
+
+    def end_load_reservations(self) -> None:
+        """Submitted host loads order moves of the rows they write through
+        their recorded copies: no member keeps rows reserved for a load."""
         for member in self.members:
-            member.set_hicache_transfer_done_event(transfer_key, event)
+            member.end_load_reservation()
 
     def prewarm_compaction(self) -> None:
         """Prewarm the page-move path of every member that compacts."""
@@ -764,8 +821,8 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
 
     def compaction_can_run(self) -> bool:
         """Whether bytes freed on either side can serve the other side's next
-        allocation now: compaction is eager, or its moves are unblocked."""
-        return not self.lazy_compaction or all(
+        allocation now: its moves are unblocked."""
+        return all(
             not band.moves_blocked()
             for band in (self.full_attn_allocator, *self._windows)
         )
@@ -790,22 +847,44 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         self,
         forward_done: torch.cuda.Event,
         out_cache_loc_virtual: Optional[torch.Tensor],
+        state_slots_virtual: Optional[torch.Tensor] = None,
+        *,
+        token_writes_unknown: bool = False,
+        state_writes_unknown: bool = False,
     ) -> None:
         """Hand the forward's metadata to every member; token bands translate the
-        write set through their own v2p, and the state band, written by state
-        kernels rather than through `out_cache_loc`, gets None."""
+        write set through their own v2p. The state band, written in place by
+        state kernels rather than through `out_cache_loc`, takes the virtual
+        state slots the forward writes. ``token_writes_unknown`` /
+        ``state_writes_unknown``: the token / state bands cannot read this
+        forward's write ids before it ends."""
         with record_function("ChainAllocator.set_inflight_forward"):
             for member in self.members:
+                is_state = member is self.mamba_allocator
                 member.set_inflight_forward(
                     forward_done,
-                    None if member is self.mamba_allocator else out_cache_loc_virtual,
+                    state_slots_virtual if is_state else out_cache_loc_virtual,
+                    writes_unknown=(
+                        state_writes_unknown if is_state else token_writes_unknown
+                    ),
                 )
+
+    def settle_pending_for_recovery(self, bands=None):
+        """The entry of an urgent recovery over ``bands`` (every member by
+        default): one host read ahead, then every pending page of those bands
+        settles (`band.py::settle_pending_for_recovery`)."""
+        return settle_pending_for_recovery(self.members if bands is None else bands)
+
+    def retire_forward(self, forward_done: torch.cuda.Event) -> None:
+        """The scheduler processed this forward's result; see `Band.retire_forward`."""
+        for member in self.members:
+            member.retire_forward(forward_done)
 
     def flush_opportunistic(self) -> int:
         """Non-urgent flush of every member, ends before floats; sync-free."""
         with record_function("ChainAllocator.flush_opportunistic"):
             if all(
-                m._free_phys_pages.numel() == 0 and not m._pending_reuse
+                m._free_phys_pages.numel() == 0 and not m.usage.has_pending()
                 for m in self.members
             ):
                 return 0
@@ -821,6 +900,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
 
     # -- alloc --
 
+    @_one_operation
     def _allocate(
         self,
         *,
@@ -933,6 +1013,8 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                 "live_page_count",
                 "_free_phys_pages",
                 "_free_phys_sorted",
+                "_pending_until_retire",
+                "_pending_host",
             ]
             if isinstance(band, FloatBand):
                 fields += ["low_wm_page", "high_wm_page", "_next_hole_end"]
@@ -1021,7 +1103,6 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                     last_loc,
                     free_pages,
                     out_indices,
-                    next_power_of_2(bs),
                     self.full_attn_allocator.page_size,
                 )
             return out_indices
@@ -1034,6 +1115,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             physical_pages=physical,
         )
 
+    @_one_operation
     def alloc_extend(
         self,
         prefix_lens: torch.Tensor,
@@ -1081,6 +1163,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                 ),
             )
 
+    @_one_operation
     def alloc_extend_swa_tail(
         self,
         prefix_lens: torch.Tensor,
@@ -1163,6 +1246,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                 window_tail_pages=window_tail_pages,
             )
 
+    @_one_operation
     def alloc_decode(
         self,
         seq_lens: torch.Tensor,
@@ -1185,7 +1269,6 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                         last_loc,
                         free_pages,
                         out_indices,
-                        next_power_of_2(bs),
                         self.full_attn_allocator.page_size,
                     )
                 return out_indices
@@ -1204,10 +1287,13 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                 ),
             )
 
+    @_one_operation
     def alloc_state_slots(self, need_size: int) -> Optional[torch.Tensor]:
         """Per-request state slots: the state band prices and relieves its own
-        shortfall (VIRTUAL slot ids)."""
-        return self.mamba_allocator.alloc(need_size)
+        shortfall (VIRTUAL slot ids). A new slot may be written on the schedule
+        stream (a state copy into it) before any forward runs, so it is
+        acquired as a schedule-stream copy's."""
+        return self.mamba_allocator.alloc(need_size, Consumer.SCHEDULE_COPY)
 
     def is_slot_allocated(self, slot: int) -> bool:
         """Token-slot surface = the owner (which owns the virtual ids)."""
@@ -1268,12 +1354,12 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         window.clear_inverse_history()
 
     def _free_window_page_reps(self, window: Band, reps: torch.Tensor) -> None:
-        v_pages = reps // self.page_size
+        v_pages = window.virtual_pages_of(reps)
         # Signal-only invariant: avoid launching its lookup and comparison
         # when detection is disabled. This invariant has no recovery action.
         if resolve_level() >= InvariantCheckLevel.WARN:
             expect(
-                UNIFIED_SWA_SEGMENT_BOUND,
+                WINDOW_SEGMENT_BOUND,
                 window.ids.virtual_to_physical[v_pages] > 0,
                 msg="caller wants free_full_segment",
             )
@@ -1313,10 +1399,11 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         # Signal-only invariant: avoid launching its lookup and comparison
         # when detection is disabled. This invariant has no recovery action.
         if resolve_level() >= InvariantCheckLevel.WARN:
+            pages = reps // self.page_size
             for window in self._windows:
                 expect(
-                    UNIFIED_SWA_SEGMENT_RELEASED,
-                    window.ids.virtual_to_physical[reps // self.page_size] <= 0,
+                    WINDOW_SEGMENT_RELEASED,
+                    window.ids.virtual_to_physical[pages] <= 0,
                     msg="caller wants free_segment",
                 )
         if self.free_page_reps_group is None:
@@ -1332,7 +1419,8 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         assert full_indices.numel() == swa_indices.numel()
         full_pages = full_indices.to(torch.int64) // self.page_size
         swa_pages = swa_indices.to(torch.int64) // self.page_size
-        self.swa_attn_allocator.ids.bind(full_pages, swa_pages)
+        window = self.swa_attn_allocator
+        window.ids.bind(full_pages, swa_pages)
 
     def clear_full_to_swa_mapping(self, full_indices: torch.Tensor) -> None:
         # Paired with set_full_to_swa_mapping: a shared id space has no mapping tensor.
@@ -1384,7 +1472,9 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             window_reps = both[0] if len(both) == 1 else torch.cat(tuple(both))
             for window in self._windows:
                 self._free_window_page_reps(window, window_reps)
-        self.full_attn_allocator.free(reps, _pages=reps // self.page_size)
+        self.full_attn_allocator.free(
+            reps, _pages=self.full_attn_allocator.virtual_pages_of(reps)
+        )
         self._clear_inverse_history()
 
     def clear(self) -> None:
