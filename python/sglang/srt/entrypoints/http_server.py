@@ -22,6 +22,7 @@ import dataclasses
 import errno
 import logging
 import os
+import signal
 import socket
 import ssl
 import tempfile
@@ -2687,7 +2688,28 @@ def _wait_weights_ready():
     )
 
 
-class _ReusePortMultiprocess(Multiprocess):
+class _SigquitForwardingMultiprocess(Multiprocess):
+    """uvicorn supervisor that keeps SIGQUIT meaning "a child failed".
+
+    ``Multiprocess.__init__`` replaces the SIGQUIT handler with a queue that has
+    no ``handle_quit``, so a scheduler's SIGQUIT to this process is dropped and
+    the server outlives its schedulers. The handler installed before uvicorn
+    took over is called from the supervisor loop instead.
+    """
+
+    def __init__(self, config: uvicorn.Config, sockets: List[socket.socket]):
+        self._sigquit_handler = signal.getsignal(signal.SIGQUIT)
+        super().__init__(config, sockets=sockets)
+
+    def handle_quit(self) -> None:
+        if callable(self._sigquit_handler):
+            self._sigquit_handler(signal.SIGQUIT, None)
+        else:
+            logger.error("Received SIGQUIT from a child process; exiting.")
+            kill_process_tree(os.getpid())
+
+
+class _ReusePortMultiprocess(_SigquitForwardingMultiprocess):
     """Give each uvicorn worker a private SO_REUSEPORT listener.
 
     uvicorn's supervisor reads ``self.sockets`` once per worker it spawns, so a
@@ -2835,8 +2857,6 @@ def _run_granian_server(
     The event loop is uvloop. The default backlog and backpressure values are set
     exactly like uvicorn's defaults.
     """
-    import signal
-
     from granian import Granian
     from granian.constants import HTTPModes, Interfaces, Loops
     from granian.http import HTTP2Settings
@@ -3131,7 +3151,11 @@ def _setup_and_run_http_server(
                     )
                     supervisor.run()
                 else:
-                    uvicorn.run(app_path, **uvicorn_options)
+                    # What uvicorn.run() does for workers > 1, minus its SIGQUIT trap.
+                    config = uvicorn.Config(app_path, **uvicorn_options)
+                    _SigquitForwardingMultiprocess(
+                        config, sockets=[config.bind_socket()]
+                    ).run()
     finally:
         if get_serving().tokenizer_worker_num > 1:
             if multi_tokenizer_args_shm is not None:
