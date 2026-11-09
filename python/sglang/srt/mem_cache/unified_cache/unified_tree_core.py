@@ -2839,9 +2839,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def build_storage_backup_spec(
         self, node_id: NodeId, pass_prefix_keys: bool
     ) -> Optional[StorageBackupSpec]:
-        """Gather a node's device->storage backup spec; None if the node is not backuped."""
+        """Gather a storage backup spec only after the node's D2H copy is ready."""
         node = self.node_by_id(node_id)
-        if not node.backuped:
+        # Host indices are published before the asynchronous D2H copy completes.
+        # The pending mark follows splits and component backups covering this node.
+        if not node.backuped or node.write_through_pending_id is not None:
             return None
         prefix_keys = None
         if pass_prefix_keys:

@@ -41,6 +41,7 @@ from sglang.test.kits.unified_radix_cache.fixtures import (
     node_parent,
     node_token_ids,
     selected_tree_core_test_backend,
+    write_backup,
 )
 from sglang.test.kits.unified_radix_cache.hicache import (
     UnifiedRadixCacheHiCacheFixtures,
@@ -51,6 +52,38 @@ register_amd_ci(est_time=12, suite="stage-b-test-1-gpu-small-amd")
 
 
 class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
+    @requires(
+        lambda cfg: cfg.components == (ComponentType.FULL,) and cfg.page_size == 1
+    )
+    def test_storage_backup_waits_for_d2h_after_split(self):
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self._init_hicache(cache)
+        seq = [1, 2, 3, 4]
+        self._insert(cache, allocator, req_to_token_pool, seq)
+        leaf = match_prefix(cache, seq).last_device_node
+
+        # Allocate host slots while leaving D2H queued, before its completion ack.
+        self.assertGreater(write_backup(cache, leaf, write_back=True), 0)
+        self.assertTrue(cache.tree_core.is_backuped(leaf))
+        self.assertIsNone(cache.tree_core.build_storage_backup_spec(leaf, False))
+
+        # A matching request splits the pending node. Both pieces must stay
+        # unavailable to storage until the original transfer is acknowledged.
+        prefix = match_prefix(cache, seq[:2]).last_device_node
+        self.assertNotEqual(prefix, leaf)
+        for node in (prefix, leaf):
+            self.assertIsNone(cache.tree_core.build_storage_backup_spec(node, False))
+
+        cache.writing_check(write_back=True)
+        for node, tokens in ((prefix, seq[:2]), (leaf, seq[2:])):
+            spec = cache.tree_core.build_storage_backup_spec(node, False)
+            self.assertIsNotNone(spec)
+            self.assertEqual(list(spec.token_ids), tokens)
+            self.assertTrue(
+                spec.host_value.equal(node_host_value(cache, node, ComponentType.FULL))
+            )
+        cache.sanity_check()
+
     @requires_swa_and_mamba
     def test_dec_swa_lock_only_hicache_child_on_host_treated_as_device_leaf(self):
 

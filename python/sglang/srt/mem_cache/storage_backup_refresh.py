@@ -25,6 +25,8 @@ class StorageBackupRefresh:
         self._now = 0
         # Last page hash -> stamp; insertion order is stamp order.
         self._stamps: OrderedDict[str, int] = OrderedDict()
+        # Age new writes from the next agreed clock, never the previous sample.
+        self._pending_stamps: set[str] = set()
 
     def step(self) -> None:
         due = self._steps % self._CLOCK_SYNC_STEPS == 0
@@ -37,10 +39,13 @@ class StorageBackupRefresh:
         expiry = self._now - self._interval_s
         while self._stamps and next(iter(self._stamps.values())) <= expiry:
             self._stamps.popitem(last=False)
+        for key in self._pending_stamps:
+            self._stamps[key] = self._now
+        self._pending_stamps.clear()
 
     def is_fresh(self, key: str) -> bool:
-        return key in self._stamps
+        return key in self._pending_stamps or key in self._stamps
 
     def stamp(self, key: str) -> None:
-        self._stamps[key] = self._now
-        self._stamps.move_to_end(key)
+        self._stamps.pop(key, None)
+        self._pending_stamps.add(key)
