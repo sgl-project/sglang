@@ -115,6 +115,7 @@ def test_installer_shares_one_gate_between_attention_and_batched_decode(monkeypa
     gate = vae._sgl_gate
     assert isinstance(gate, VaeFastPathGate) and not gate.enabled
     assert all(block.attn._sgl_gate is gate for block in vae.decoder.transformer_blocks)
+    assert vae.decoder._sgl_gate is gate
     with use_vae_fast_path(vae, True):
         assert gate.enabled and vae._batch_caps() == (0, 1)
     assert not gate.enabled
@@ -158,7 +159,7 @@ def _candidate_on_cpu(value, gate, sig=None):
     """Stand in for the device check so the gate logic runs on CPU tensors."""
     if sig is None:
         return gate.can_attempt_once() and not torch.is_grad_enabled()
-    return klvae._gate_admits(gate, sig) and not torch.is_grad_enabled()
+    return gate.can_attempt(sig) and not torch.is_grad_enabled()
 
 
 @pytest.mark.parametrize("bit_exact", [True, False])

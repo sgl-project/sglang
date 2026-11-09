@@ -490,8 +490,9 @@ def test_kimi_k3_encoder_dp_defers_feature_materialization(monkeypatch):
     the requested images on the owner rank with the tower dtype."""
     from unittest.mock import patch as mock_patch
 
-    from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+    from sglang.srt.managers.req_types import MultimodalDataItem
     from sglang.srt.models.kimi_k3 import KimiK3ForConditionalGeneration
+    from sglang.srt.multimodal.modality import Modality
 
     model = KimiK3ForConditionalGeneration.__new__(KimiK3ForConditionalGeneration)
     torch.nn.Module.__init__(model)
@@ -559,12 +560,13 @@ def test_kimi_k3_preprocesses_only_dp_owner_images(monkeypatch):
     """A vision-DP owner uses each assigned image's grid when preprocessing."""
     from unittest.mock import patch as mock_patch
 
-    from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+    from sglang.srt.managers.req_types import MultimodalDataItem
     from sglang.srt.models.kimi_k3 import KimiK3ForConditionalGeneration
     from sglang.srt.multimodal.kimi_k3_image_processing import (
         DEFERRED_PREPROCESSING_KEY,
         KimiK3DeferredPreprocessing,
     )
+    from sglang.srt.multimodal.modality import Modality
 
     model = KimiK3ForConditionalGeneration.__new__(KimiK3ForConditionalGeneration)
     torch.nn.Module.__init__(model)
@@ -647,8 +649,9 @@ def test_kimi_k3_rejects_aggregated_items():
     """One item must carry exactly one logical image: the DP owner
     assignment and the bounded CUDA-IPC lease accounting are per-item, so
     aggregated encoder inputs must be split upstream (EPD encode server)."""
-    from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+    from sglang.srt.managers.req_types import MultimodalDataItem
     from sglang.srt.models.kimi_k3 import KimiK3ForConditionalGeneration
+    from sglang.srt.multimodal.modality import Modality
 
     model = KimiK3ForConditionalGeneration.__new__(KimiK3ForConditionalGeneration)
     torch.nn.Module.__init__(model)
