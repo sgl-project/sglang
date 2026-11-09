@@ -37,14 +37,21 @@ Extra-config keys (``--hicache-storage-backend-extra-config``):
   evict_batch_size       files removed per background batch (128)
   stale_temp_age_s       age before abandoned temp files are removed at
                          startup, 0 = keep them (3600)
+  o_direct               open page files with O_DIRECT for pools whose page
+                         segments meet the filesystem's direct-I/O alignment;
+                         other pools, the staged path and filesystems that
+                         reject the flag use buffered I/O (default false)
 
-Locking, eviction accounting and the metadata cache are process-local, and
-buffered write completion means close plus rename rather than ``fsync``.
+Locking, eviction accounting and the metadata cache are process-local. Write
+completion means close plus rename rather than ``fsync``; ``o_direct`` moves
+the page bytes past the page cache but changes neither that nor the file
+format, so buffered and O_DIRECT processes can share a namespace.
 """
 
 from __future__ import annotations
 
 import ctypes
+import errno
 import hashlib
 import logging
 import os
@@ -52,6 +59,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from typing import TYPE_CHECKING, Any, Callable, List, Optional
 
 import torch
@@ -64,6 +72,10 @@ from sglang.srt.mem_cache.hicache_storage import (
     MetadataCache,
     PoolName,
     PoolTransfer,
+)
+from sglang.srt.mem_cache.storage.fast_file.direct_io import (
+    O_DIRECT,
+    probe_direct_io_alignment,
 )
 from sglang.srt.mem_cache.storage.fast_file.lru_file_evictor import (
     LRUFileEvictor,
@@ -124,6 +136,17 @@ class HiCacheFastFile(HiCacheFile):
             raise ValueError(
                 f"HiCacheFastFile read_workers must be at least 1, got {self.read_workers}."
             )
+        self.o_direct = bool(setting(extra_config, "o_direct", False))
+        # 0 disables O_DIRECT: the knob is off, or the filesystem rejected the probe.
+        self._o_direct_alignment = (
+            probe_direct_io_alignment(self.file_path) if self.o_direct else 0
+        )
+        if self.o_direct and not self._o_direct_alignment:
+            logger.warning(
+                "HiCacheFastFile o_direct is set but O_DIRECT is unsupported under %s; "
+                "using buffered I/O.",
+                self.file_path,
+            )
         self.enable_metadata_cache = bool(
             setting(extra_config, "enable_metadata_cache", False)
         )
@@ -141,6 +164,7 @@ class HiCacheFastFile(HiCacheFile):
             threading.Lock() for _ in range(self._WRITE_LOCK_STRIPES)
         )
         self._pool_direct_io: dict[str, bool] = {}
+        self._pool_o_direct: dict[str, bool] = {}
         self._warned_partial_eviction = False
         self._metrics_lock = threading.Lock()
         self._prefetch_pgs: list[int] = []
@@ -171,9 +195,10 @@ class HiCacheFastFile(HiCacheFile):
                 "HiCacheFastFile vectored I/O is unavailable; using staged copies."
             )
         logger.info(
-            "HiCacheFastFile namespace=%s read_workers=%d",
+            "HiCacheFastFile namespace=%s read_workers=%d o_direct_alignment=%d",
             self.file_path,
             self.read_workers,
+            self._o_direct_alignment,
         )
 
     @classmethod
@@ -224,23 +249,31 @@ class HiCacheFastFile(HiCacheFile):
         super().register_mem_pool_host(mem_pool_host)
         super().register_mem_host_pool_v2(mem_pool_host, PoolName.KV)
         self._pool_direct_io[PoolName.KV] = self._supports_direct_io(mem_pool_host)
+        self._pool_o_direct[PoolName.KV] = self._o_direct_eligible(
+            mem_pool_host, zero_copy=self._pool_direct_io[PoolName.KV]
+        )
         logger.info(
-            "HiCacheFastFile registered KV host pool layout=%s direct_io=%s",
+            "HiCacheFastFile registered KV host pool layout=%s direct_io=%s o_direct=%s",
             mem_pool_host.layout,
             self._pool_direct_io[PoolName.KV],
+            self._pool_o_direct[PoolName.KV],
         )
 
     def register_mem_host_pool_v2(self, host_pool: HostKVCache, host_pool_name) -> None:
         self._check_side_pool(host_pool, host_pool_name)
         super().register_mem_host_pool_v2(host_pool, host_pool_name)
         self._pool_direct_io[host_pool_name] = self._supports_direct_io(host_pool)
+        self._pool_o_direct[host_pool_name] = self._o_direct_eligible(
+            host_pool, zero_copy=self._pool_direct_io[host_pool_name]
+        )
         if host_pool_name == PoolName.KV:
             self.mem_pool_host = host_pool
         logger.info(
-            "HiCacheFastFile registered host pool=%s layout=%s direct_io=%s",
+            "HiCacheFastFile registered host pool=%s layout=%s direct_io=%s o_direct=%s",
             host_pool_name,
             host_pool.layout,
             self._pool_direct_io[host_pool_name],
+            self._pool_o_direct[host_pool_name],
         )
 
     def _check_side_pool(self, host_pool: HostKVCache, host_pool_name) -> None:
@@ -275,6 +308,30 @@ class HiCacheFastFile(HiCacheFile):
             return False
         probe = torch.arange(host_pool.page_size, dtype=torch.int64)
         return host_pool.get_page_buffer_meta(probe) is not None
+
+    def _o_direct_eligible(self, host_pool: HostKVCache, *, zero_copy: bool) -> bool:
+        alignment = self._o_direct_alignment
+        if not alignment or not zero_copy:
+            return False
+        # Pages 0 and 1 expose the buffer base, the K/V split and the page
+        # stride; every other page address is the base plus a multiple of it.
+        pages = 2 if host_pool.size >= 2 * host_pool.page_size else 1
+        ptrs, sizes = host_pool.get_page_buffer_meta(
+            torch.arange(pages * host_pool.page_size, dtype=torch.int64)
+        )
+        return all(int(ptr) % alignment == 0 for ptr in ptrs) and all(
+            int(size) % alignment == 0 for size in sizes
+        )
+
+    def _disable_o_direct(self, pool_name: str, exc: OSError) -> None:
+        if self._pool_o_direct[pool_name]:
+            self._pool_o_direct[pool_name] = False
+            logger.warning(
+                "HiCacheFastFile O_DIRECT rejected for pool %s (%s); "
+                "using buffered I/O for it.",
+                pool_name,
+                exc,
+            )
 
     # ----- buffers and vectored I/O ------------------------------------------
 
@@ -386,12 +443,17 @@ class HiCacheFastFile(HiCacheFile):
     def _write_lock_for(self, suffixed_key: str) -> threading.Lock:
         return self._write_locks[hash(suffixed_key) % len(self._write_locks)]
 
-    def _read_page_buffers(self, key: str, buffers: list[memoryview]) -> bool:
+    def _read_page_buffers(
+        self, key: str, buffers: list[memoryview], *, pool_name: Optional[str] = None
+    ) -> bool:
         suffixed = self._get_suffixed_key(key)
         tensor_path = self._page_path(suffixed)
         expected = sum(len(buffer) for buffer in buffers)
+        # Only pool-owned buffers are known to be aligned; tensors passed to
+        # get() and the staged path stay buffered.
+        direct = pool_name is not None and self._pool_o_direct[pool_name]
         try:
-            fd = os.open(tensor_path, os.O_RDONLY)
+            fd = os.open(tensor_path, os.O_RDONLY | (O_DIRECT if direct else 0))
             try:
                 actual = os.fstat(fd).st_size
                 if actual != expected:
@@ -412,6 +474,9 @@ class HiCacheFastFile(HiCacheFile):
             logger.warning("Discarded corrupt HiCacheFastFile page %s: %s", key, exc)
             return False
         except OSError as exc:
+            if direct and exc.errno == errno.EINVAL:
+                self._disable_o_direct(pool_name, exc)
+                return self._read_page_buffers(key, buffers, pool_name=pool_name)
             if self.metadata_cache is not None:
                 self.metadata_cache.remove(suffixed)
             logger.warning("Failed to read HiCacheFastFile page %s: %s", key, exc)
@@ -447,7 +512,7 @@ class HiCacheFastFile(HiCacheFile):
             self._evictor.forget(suffixed)
 
     def _write_page_buffers(
-        self, key: str, buffers: list[memoryview]
+        self, key: str, buffers: list[memoryview], *, pool_name: Optional[str] = None
     ) -> tuple[bool, int]:
         """Publish a page; returns (ok, bytes written). A duplicate writes 0."""
         suffixed = self._get_suffixed_key(key)
@@ -477,12 +542,21 @@ class HiCacheFastFile(HiCacheFile):
                     value_bytes,
                     actual_bytes,
                 )
-            return self._publish_page_locked(key, suffixed, tensor_path, buffers)
+            return self._publish_page_locked(
+                key, suffixed, tensor_path, buffers, pool_name=pool_name
+            )
 
     def _publish_page_locked(
-        self, key: str, suffixed: str, tensor_path: str, buffers: list[memoryview]
+        self,
+        key: str,
+        suffixed: str,
+        tensor_path: str,
+        buffers: list[memoryview],
+        *,
+        pool_name: Optional[str] = None,
     ) -> tuple[bool, int]:
         value_bytes = sum(len(buffer) for buffer in buffers)
+        direct = pool_name is not None and self._pool_o_direct[pool_name]
         tmp_path = f"{tensor_path}.tmp.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}"
         reserved = False
         fd = -1
@@ -490,7 +564,11 @@ class HiCacheFastFile(HiCacheFile):
             if not self._evictor.reserve(suffixed, value_bytes, key=key):
                 return False, 0
             reserved = True
-            fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            fd = os.open(
+                tmp_path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | (O_DIRECT if direct else 0),
+                0o600,
+            )
             try:
                 self._writev_exact(fd, buffers)
             finally:
@@ -504,7 +582,6 @@ class HiCacheFastFile(HiCacheFile):
             self._evictor.commit(suffixed)
             return True, value_bytes
         except Exception as exc:
-            logger.error("Failed to save tensor %s: %s", key, exc)
             if reserved:
                 self._evictor.abort(suffixed)
             if fd != -1:
@@ -515,6 +592,12 @@ class HiCacheFastFile(HiCacheFile):
                 pass
             if self.metadata_cache is not None:
                 self.metadata_cache.remove(suffixed)
+            if direct and isinstance(exc, OSError) and exc.errno == errno.EINVAL:
+                self._disable_o_direct(pool_name, exc)
+                return self._publish_page_locked(
+                    key, suffixed, tensor_path, buffers, pool_name=pool_name
+                )
+            logger.error("Failed to save tensor %s: %s", key, exc)
             return False, 0
 
     # ----- staged (tensor copy) transfers for pools without direct I/O ------
@@ -572,7 +655,9 @@ class HiCacheFastFile(HiCacheFile):
                 return [False] * len(keys), 0, 0
             if read:
                 results = self._parallel_map(
-                    self._read_page_buffers, storage_keys, page_buffers
+                    partial(self._read_page_buffers, pool_name=pool_name),
+                    storage_keys,
+                    page_buffers,
                 )
                 num_bytes = sum(
                     sum(len(buffer) for buffer in buffers)
@@ -581,7 +666,7 @@ class HiCacheFastFile(HiCacheFile):
                 )
                 return results, sum(results), num_bytes
             sized = [
-                self._write_page_buffers(storage_key, buffers)
+                self._write_page_buffers(storage_key, buffers, pool_name=pool_name)
                 for storage_key, buffers in zip(storage_keys, page_buffers)
             ]
         else:

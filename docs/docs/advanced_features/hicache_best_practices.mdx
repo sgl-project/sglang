@@ -173,7 +173,12 @@ directory keeps its pages apart from `file` pages in the same root.
 namespace and rank 0 owns eviction); `min_free_space` is a floor for the whole
 filesystem. Both are optional. Eviction state and the optional
 `enable_metadata_cache` are process-local, and a completed write means close
-plus rename rather than `fsync`. The module docstring of
+plus rename rather than `fsync`. On a local NVMe tier, `"o_direct": true`
+opens page files with `O_DIRECT` for every pool whose page segments meet the
+filesystem's direct-I/O alignment, which keeps KV pages out of the page cache;
+pools that do not qualify, the staged path, and filesystems that reject the
+flag stay on buffered I/O. The page files are the same raw bytes in both modes,
+so processes with and without `o_direct` can share a namespace. The module docstring of
 `sglang/srt/mem_cache/storage/fast_file/fast_file_store.py` lists every
 extra-config key.
 

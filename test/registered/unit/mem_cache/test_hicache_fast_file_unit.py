@@ -9,6 +9,8 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
+import errno
+import mmap
 import os
 import shutil
 import tempfile
@@ -28,6 +30,9 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 from sglang.srt.mem_cache.memory_pool_host import LogicalHostPool
 from sglang.srt.mem_cache.storage import StorageBackendFactory
+from sglang.srt.mem_cache.storage.fast_file.direct_io import (
+    probe_direct_io_alignment,
+)
 from sglang.srt.mem_cache.storage.fast_file.fast_file_store import HiCacheFastFile
 from sglang.srt.mem_cache.storage.fast_file.lru_file_evictor import (
     LRUFileEvictor,
@@ -132,6 +137,7 @@ class _BackendBuilder:
         metadata_ttl=None,
         enable_metadata_cache=None,
         stale_temp_age_s=None,
+        o_direct=None,
         tp_rank=0,
         tp_size=1,
         is_mla=False,
@@ -159,6 +165,7 @@ class _BackendBuilder:
                 "metadata_ttl": metadata_ttl,
                 "enable_metadata_cache": enable_metadata_cache,
                 "stale_temp_age_s": stale_temp_age_s,
+                "o_direct": o_direct,
             },
         )
         backend = HiCacheFastFile(cfg, file_path=directory)
@@ -1109,6 +1116,260 @@ class TestMetadataCacheIntegration(FastFileTestBase):
             self.assertEqual(b.batch_exists_v2(["k3"]).kv_hit_pages, 1)
             mock_scandir.assert_not_called()
             mock_exists.assert_called_once()
+
+
+class _AlignedPageFirstPool(_FakePageFirstPool):
+    """Page-first stand-in on page-aligned memory, as pinned host pools are."""
+
+    def __init__(
+        self, *, size: int = 8, page_size: int = 2, size_per_token: int = 4096
+    ):
+        super().__init__(size=size, page_size=page_size)
+        self.size_per_token = size_per_token
+        self._mapping = mmap.mmap(-1, 2 * size * size_per_token)
+        self.kv_buffer = torch.frombuffer(self._mapping, dtype=torch.uint8).reshape(
+            2, size, size_per_token
+        )
+
+
+_PROBE_PATCH = (
+    "sglang.srt.mem_cache.storage.fast_file.fast_file_store.probe_direct_io_alignment"
+)
+
+
+def _spy_open(flags_seen: list, *, strip_direct=False, reject_direct=False):
+    """Record os.open flags; optionally strip or reject the O_DIRECT bit."""
+    real_open = os.open
+
+    def fake_open(path, flags, *args, **kwargs):
+        flags_seen.append(flags)
+        if flags & os.O_DIRECT:
+            if reject_direct:
+                raise OSError(errno.EINVAL, "Invalid argument")
+            if strip_direct:
+                flags &= ~os.O_DIRECT
+        return real_open(path, flags, *args, **kwargs)
+
+    return mock.patch("os.open", side_effect=fake_open)
+
+
+@unittest.skipUnless(hasattr(os, "O_DIRECT"), "O_DIRECT is Linux-only")
+class TestODirect(FastFileTestBase):
+    def test_off_by_default_and_when_the_probe_fails(self):
+        """A pool that would qualify must stay buffered without the knob, and
+        with the knob on a filesystem that rejects O_DIRECT."""
+        pool = _AlignedPageFirstPool()
+        default_backend = self.make_backend()
+        self.assertEqual(default_backend._o_direct_alignment, 0)
+        with (
+            mock.patch(_PROBE_PATCH, return_value=0),
+            self.assertLogs(STORE_LOGGER, level="WARNING"),
+        ):
+            probe_failed_backend = self.make_backend(o_direct=True)
+        for backend in (default_backend, probe_failed_backend):
+            backend.register_mem_pool_host(pool)
+            self.assertFalse(backend._pool_o_direct[PoolName.KV])
+            flags = []
+            with _spy_open(flags):
+                self.assertEqual(
+                    backend.batch_set_v1(["a"], torch.tensor([0, 1])), [True]
+                )
+            self.assertTrue(flags)
+            self.assertFalse(any(f & os.O_DIRECT for f in flags))
+
+    def test_aligned_pool_pages_open_with_the_flag(self):
+        with mock.patch(_PROBE_PATCH, return_value=512):
+            b = self.make_backend(o_direct=True)
+        self.assertEqual(b._o_direct_alignment, 512)
+        pool = _AlignedPageFirstPool()
+        b.register_mem_pool_host(pool)
+        self.assertTrue(b._pool_o_direct[PoolName.KV])
+
+        indices = torch.tensor([0, 1, 4, 5])
+        pool.kv_buffer[:, 0:2] = 7
+        pool.kv_buffer[:, 4:6] = 9
+        expected = pool.kv_buffer.clone()
+        flags = []
+        # The real filesystem may be tmpfs: assert the flag, strip it before the call.
+        with _spy_open(flags, strip_direct=True):
+            self.assertEqual(b.batch_set_v1(["a", "b"], indices), [True, True])
+            pool.kv_buffer.zero_()
+            self.assertEqual(b.batch_get_v1(["a", "b"], indices), [True, True])
+        self.assertEqual(len(flags), 4)
+        self.assertTrue(all(f & os.O_DIRECT for f in flags))
+        self.assertTrue(torch.equal(pool.kv_buffer, expected))
+
+    def test_unaligned_page_segments_keep_buffered_io(self):
+        """A 2000-byte segment is not a multiple of the 512-byte alignment, so
+        that pool must not qualify even though its buffer base is page-aligned."""
+        with mock.patch(_PROBE_PATCH, return_value=512):
+            b = self.make_backend(o_direct=True)
+        b.register_mem_pool_host(_AlignedPageFirstPool())
+        side_pool = _AlignedPageFirstPool(size_per_token=1000)
+        b.register_mem_host_pool_v2(side_pool, PoolName.SWA)
+        self.assertTrue(b._pool_o_direct[PoolName.KV])
+        self.assertFalse(b._pool_o_direct[PoolName.SWA])
+        flags = []
+        with _spy_open(flags):
+            results = b.batch_set_v2(
+                [
+                    PoolTransfer(
+                        name=PoolName.SWA, keys=["a"], host_indices=torch.tensor([0, 1])
+                    )
+                ]
+            )
+        self.assertEqual(results, {PoolName.SWA: [True]})
+        self.assertTrue(flags)
+        self.assertFalse(any(f & os.O_DIRECT for f in flags))
+
+    def test_einval_falls_back_to_buffered_and_disables_the_pool(self):
+        """A kernel that rejects O_DIRECT at open must cost one retry per pool,
+        not a failed page: the write lands buffered and the pool stays buffered."""
+        with mock.patch(_PROBE_PATCH, return_value=512):
+            b = self.make_backend(o_direct=True)
+        pool = _AlignedPageFirstPool()
+        b.register_mem_pool_host(pool)
+        indices = torch.tensor([0, 1])
+        pool.kv_buffer[:, 0:2] = 3
+        expected = pool.kv_buffer[:, 0:2].clone()
+
+        flags = []
+        with (
+            _spy_open(flags, reject_direct=True),
+            self.assertLogs(STORE_LOGGER, level="WARNING") as logs,
+        ):
+            self.assertEqual(b.batch_set_v1(["a"], indices), [True])
+        self.assertFalse(b._pool_o_direct[PoolName.KV])
+        self.assertEqual(sum("O_DIRECT rejected" in m for m in logs.output), 1)
+        self.assertEqual([bool(f & os.O_DIRECT) for f in flags], [True, False])
+        with open(b._page_path(b._get_suffixed_key("a")), "rb") as file:
+            self.assertEqual(file.read(), expected.flatten().numpy().tobytes())
+
+        # The read side takes the same fallback once the flag is re-armed.
+        b._pool_o_direct[PoolName.KV] = True
+        pool.kv_buffer.zero_()
+        flags.clear()
+        with (
+            _spy_open(flags, reject_direct=True),
+            self.assertLogs(STORE_LOGGER, level="WARNING"),
+        ):
+            self.assertEqual(b.batch_get_v1(["a"], indices), [True])
+        self.assertFalse(b._pool_o_direct[PoolName.KV])
+        self.assertEqual([bool(f & os.O_DIRECT) for f in flags], [True, False])
+        self.assertTrue(torch.equal(pool.kv_buffer[:, 0:2], expected))
+
+    def test_buffered_and_o_direct_backends_share_pages(self):
+        """A page published in either mode must read back through the other:
+        O_DIRECT changes how the bytes move, not the file format, so a
+        namespace can be shared by processes with and without the knob."""
+        alignment = probe_direct_io_alignment(self.tmpdir)
+        if alignment == 0:
+            self.skipTest("the test filesystem rejects O_DIRECT")
+        direct = self.make_backend(o_direct=True, subdir="shared")
+        buffered = self.make_backend(subdir="shared")
+        self.assertEqual(direct.file_path, buffered.file_path)
+        direct_pool = _AlignedPageFirstPool(size_per_token=max(alignment, 4096))
+        buffered_pool = _AlignedPageFirstPool(size_per_token=max(alignment, 4096))
+        direct.register_mem_pool_host(direct_pool)
+        buffered.register_mem_pool_host(buffered_pool)
+        self.assertTrue(direct._pool_o_direct[PoolName.KV])
+        self.assertFalse(buffered._pool_o_direct[PoolName.KV])
+
+        indices = torch.tensor([0, 1])
+        for writer, w_pool, reader, r_pool, fill in (
+            (direct, direct_pool, buffered, buffered_pool, 11),
+            (buffered, buffered_pool, direct, direct_pool, 12),
+        ):
+            w_pool.kv_buffer[:, 0:2] = fill
+            self.assertEqual(writer.batch_set_v1([f"k{fill}"], indices), [True])
+            r_pool.kv_buffer.zero_()
+            self.assertEqual(reader.batch_get_v1([f"k{fill}"], indices), [True])
+            self.assertTrue(
+                torch.equal(r_pool.kv_buffer[:, 0:2], w_pool.kv_buffer[:, 0:2])
+            )
+
+    def test_probe_leaves_no_file_behind(self):
+        """Probe files must not accumulate in the namespace directory."""
+        directory = os.path.join(self.tmpdir, "probe")
+        os.makedirs(directory)
+        probe_direct_io_alignment(directory)
+        self.assertEqual(os.listdir(directory), [])
+
+    def test_real_o_direct_roundtrip_when_the_filesystem_allows_it(self):
+        alignment = probe_direct_io_alignment(self.tmpdir)
+        if alignment == 0:
+            self.skipTest("the test filesystem rejects O_DIRECT")
+        b = self.make_backend(o_direct=True)
+        self.assertEqual(b._o_direct_alignment, alignment)
+        pool = _AlignedPageFirstPool(size_per_token=max(alignment, 4096))
+        b.register_mem_pool_host(pool)
+        self.assertTrue(b._pool_o_direct[PoolName.KV])
+
+        indices = torch.tensor([0, 1, 4, 5])
+        pool.kv_buffer[:, 0:2] = 5
+        pool.kv_buffer[:, 4:6] = 6
+        expected = pool.kv_buffer.clone()
+        flags = []
+        with _spy_open(flags):
+            self.assertEqual(b.batch_set_v1(["a", "b"], indices), [True, True])
+            pool.kv_buffer.zero_()
+            self.assertEqual(b.batch_get_v1(["a", "b"], indices), [True, True])
+        self.assertTrue(all(f & os.O_DIRECT for f in flags))
+        self.assertTrue(b._pool_o_direct[PoolName.KV])
+        self.assertTrue(torch.equal(pool.kv_buffer, expected))
+
+
+@unittest.skipUnless(hasattr(os, "O_DIRECT"), "O_DIRECT is Linux-only")
+class TestDirectIOProbe(CustomTestCase):
+    """The probe enables O_DIRECT only after a real write and read-back."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp(prefix="hicache_direct_io_probe_")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_filesystem_rejecting_the_flag_disables_direct_io(self):
+        """tmpfs before Linux 6.6 fails every O_DIRECT open with EINVAL; the probe
+        must report 0 and leave no file behind."""
+        real_open = os.open
+
+        def reject_direct(path, flags, *args, **kwargs):
+            if flags & os.O_DIRECT:
+                raise OSError(errno.EINVAL, "Invalid argument")
+            return real_open(path, flags, *args, **kwargs)
+
+        with mock.patch("os.open", side_effect=reject_direct):
+            self.assertEqual(probe_direct_io_alignment(self.tmpdir), 0)
+        self.assertEqual(os.listdir(self.tmpdir), [])
+
+    def test_write_failure_after_a_successful_open_disables_direct_io(self):
+        """Accepting the flag at open is not enough: a filesystem that fails the
+        direct write itself must leave the mode off."""
+        with mock.patch(
+            "os.pwrite", side_effect=OSError(errno.EINVAL, "Invalid argument")
+        ):
+            self.assertEqual(probe_direct_io_alignment(self.tmpdir), 0)
+        self.assertEqual(os.listdir(self.tmpdir), [])
+
+    def test_probe_reports_the_smallest_granularity_the_kernel_accepts(self):
+        """The first granularity a direct read accepts is the alignment, and a
+        device that only takes whole 4 KiB blocks ends at 4096."""
+        if probe_direct_io_alignment(self.tmpdir) == 0:
+            self.skipTest("the test filesystem rejects O_DIRECT")
+        real_preadv = os.preadv
+
+        def reject_below(limit):
+            def fake_preadv(fd, buffers, offset):
+                if sum(len(b) for b in buffers) < limit:
+                    raise OSError(errno.EINVAL, "Invalid argument")
+                return real_preadv(fd, buffers, offset)
+
+            return fake_preadv
+
+        for limit, expected in ((2048, 2048), (4096, 4096)):
+            with mock.patch("os.preadv", side_effect=reject_below(limit)):
+                self.assertEqual(probe_direct_io_alignment(self.tmpdir), expected)
 
 
 if __name__ == "__main__":
