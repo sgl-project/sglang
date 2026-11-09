@@ -13,6 +13,8 @@ from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.srt.hardware_backend.npu.moe.paged_experts import AscendRunnerContract
+from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.moe.paged_experts import (
     PagedExpertsMoEMethod,
     disk_tier,
@@ -53,6 +55,7 @@ from sglang.srt.layers.moe.paged_experts.runners import (
     RunnerContract,
     TritonContract,
     contract_for,
+    run_on_slots,
 )
 from sglang.srt.layers.moe.paged_experts.store import (
     ExpertLoads,
@@ -155,6 +158,47 @@ class _SkippingContract(TritonContract):
 CONTRACTS = (_CompactingContract(), _SkippingContract())
 
 
+class _CombiningMoE(_LinearMoE):
+    """Stand-in for the Ascend runner: apply returns the weighted top-k sum,
+    ``[tokens, hidden]`` (what its finalize op produces), so every wave computes the
+    whole batch and counts on its router weights to zero the routes it does not serve."""
+
+    def apply(self, layer, dispatch_output):
+        topk = dispatch_output.topk_output
+        ids, w = topk.topk_ids.long(), topk.topk_weights
+        valid = ids >= 0
+        self.rows += int(valid.sum())
+        ids = ids.clamp(min=0)
+        y = torch.einsum(
+            "th,tjhi->tji", dispatch_output.hidden_states, layer.w13_weight[ids]
+        )
+        y = torch.einsum("tji,tjio->tjo", y, layer.w2_weight[ids])
+        return SimpleNamespace(hidden_states=((w * valid).unsqueeze(-1) * y).sum(1))
+
+
+class _ReplacingContract(AscendRunnerContract):
+    """Mutant: a later wave's output replaces the earlier waves' instead of adding."""
+
+    def run_wave(
+        self, base_method, layer, dispatch_output, slots, merged, num_entries=None
+    ):
+        return run_on_slots(base_method, layer, dispatch_output, slots)
+
+
+class _UnscaledContract(AscendRunnerContract):
+    """Mutant: the routed scaling factor never reaches the output."""
+
+    def finish(self, merged, hidden_states, routed_scaling_factor):
+        return super().finish(merged, hidden_states, 1.0)
+
+
+class _DoubleScaledContract(AscendRunnerContract):
+    """Mutant: the routed scaling factor applied a second time."""
+
+    def finish(self, merged, hidden_states, routed_scaling_factor):
+        return super().finish(merged, hidden_states, routed_scaling_factor**2)
+
+
 def _reference(full, dispatch_output):
     return _LinearMoE().apply(full, dispatch_output).hidden_states.sum(1)
 
@@ -179,15 +223,18 @@ _METHOD = "sglang.srt.layers.moe.paged_experts.method."
 _EXPERT_CACHE = "sglang.srt.layers.moe.paged_experts.expert_cache."
 
 
-def _create(method, layer, contract):
+def _create(method, layer, contract, moe_runner_config=None):
     """Create the base method's expert tensors and runner as FusedMoE does, with
-    ``contract`` for the runner and loads that wait (a mapped safetensors checkpoint)."""
+    ``contract`` for the runner and loads that wait (a mapped safetensors checkpoint).
+    ``moe_runner_config`` is the layer's config (a namespace with no scaling by default);
+    a real config lets the contract's own ``runner_config`` run, as on a server."""
     with (
         patch(_METHOD + "_loads_mapped_files", return_value=True),
         patch(_METHOD + "runner_config", side_effect=lambda config, num_slots: config),
         patch(_METHOD + "contract_for", return_value=contract),
         patch(_METHOD + "host_rows", side_effect=lambda rows, e, *a, **k: e),
         patch(_METHOD + "get_exec", return_value=_exec()),
+        patch.object(contract, "validate", lambda: None),
     ):
         method.create_weights(
             layer=layer,
@@ -196,7 +243,10 @@ def _create(method, layer, contract):
             intermediate_size_per_partition=H,
             params_dtype=torch.float32,
         )
-        method.create_moe_runner(layer, SimpleNamespace(routed_scaling_factor=None))
+        method.create_moe_runner(
+            layer,
+            moe_runner_config or SimpleNamespace(routed_scaling_factor=None),
+        )
 
 
 def _exec(enable_disk=False):
@@ -237,18 +287,23 @@ def _paged_layer(
     auto_size=False,
     top_k=None,
     seed=0,
+    moe_runner_config=None,
+    combining=False,
 ):
     """A paged method over random experts, its layer created through the base method;
     ``load`` loads the experts and runs the post-load step (host store on the CPU).
     ``auto_size`` builds it with K = ``num_resident`` slots that sizing then grows, as for
-    --paged-experts-num-resident auto; ``top_k`` sets the layer's router top-k."""
+    --paged-experts-num-resident auto; ``top_k`` sets the layer's router top-k. With
+    ``combining`` the base method returns the weighted top-k sum (the Ascend runner),
+    else the per-expert entries (triton, Marlin)."""
     torch.manual_seed(seed)
     full = {
         name: torch.randn(E, H, H)
         for name in ("w13_weight", "w2_weight", *extra_params)
     }
+    base = _CombiningMoE if combining else _LinearMoE
 
-    class _Base(_LinearMoE):
+    class _Base(base):
         def create_weights(self, layer, num_experts, **kwargs):
             for name in ("w13_weight", "w2_weight", *extra_params, *global_params):
                 param = torch.nn.Parameter(
@@ -272,7 +327,7 @@ def _paged_layer(
     layer.weight_load_method = None
     layer.top_k = top_k
     layer.quant_method = method  # as FusedMoE holds it
-    _create(method, layer, contract)
+    _create(method, layer, contract, moe_runner_config)
     if load:
         for name_, t in full.items():
             method.loads.table[name_].copy_(t)
@@ -448,6 +503,99 @@ class TestPagedForward(CustomTestCase):
         (replay,) = callbacks
         replay()
         torch.testing.assert_close(out, _reference(full, d))
+
+
+class TestAscendContract(CustomTestCase):
+    """The Ascend contract serves a runner that combines the top-k outputs itself: a
+    wave returns the layer output for the whole batch, so waves must add their
+    ``[tokens, hidden]`` partials and the routed scaling factor must land exactly once
+    on the combined output (the runner applies the router weights, never the factor)."""
+
+    SCALING = 2.5
+
+    def _combining_layer(self, contract, seed=0):
+        return _paged_layer(
+            contract,
+            seed=seed,
+            moe_runner_config=MoeRunnerConfig(routed_scaling_factor=self.SCALING),
+            combining=True,
+        )
+
+    def test_matches_unpaged_combined_output(self):
+        """Consecutive steps (reuse and eviction), one wave (1, 2 tokens) or several
+        (64), with and without padding: each output equals the unpaged layer's weighted
+        top-k sum times the factor, and the slots hold the resident experts."""
+        for num_tokens, padded in ((1, False), (2, False), (64, False), (3, True)):
+            with self.subTest(num_tokens=num_tokens, padded=padded):
+                method, layer, full = self._combining_layer(AscendRunnerContract())
+                for _ in range(8):
+                    d = _step(num_tokens, padded=padded)
+                    out = method.apply(layer=layer, dispatch_output=d).hidden_states
+                    torch.testing.assert_close(out, _reference(full, d) * self.SCALING)
+                    for name, host in method.store.host.items():
+                        for expert, slot in method.policy.resident.items():
+                            torch.testing.assert_close(
+                                getattr(layer, name)[slot], host[expert]
+                            )
+
+    def test_a_unit_scaling_factor_is_a_no_op(self):
+        method, layer, full = _paged_layer(
+            AscendRunnerContract(),
+            moe_runner_config=MoeRunnerConfig(routed_scaling_factor=1.0),
+            combining=True,
+        )
+        d = _step(64)
+        out = method.apply(layer=layer, dispatch_output=d).hidden_states
+        torch.testing.assert_close(out, _reference(full, d))
+
+    def test_waves_add_not_replace(self):
+        """Replacing the merged output with a later wave's drops that wave's routes:
+        invisible on one wave (the executor's single-wave path never merges), wrong on
+        several waves."""
+        for num_tokens, wrong in ((1, False), (64, True)):
+            with self.subTest(num_tokens=num_tokens):
+                method, layer, full = self._combining_layer(_ReplacingContract())
+                d = _step(num_tokens)
+                method.base_method.rows = 0
+                out = method.apply(layer=layer, dispatch_output=d).hidden_states
+                same = torch.allclose(out, _reference(full, d) * self.SCALING)
+                self.assertEqual(same, not wrong)
+                entries = d.topk_output.topk_ids.numel()
+                if wrong:
+                    self.assertGreater(method.base_method.rows, entries)
+                else:
+                    self.assertEqual(method.base_method.rows, entries)
+
+    def test_scaling_lands_exactly_once(self):
+        d = _step(64)
+        for contract, wrong in (
+            (_UnscaledContract(), True),
+            (_DoubleScaledContract(), True),
+            (AscendRunnerContract(), False),
+        ):
+            with self.subTest(contract=type(contract).__name__):
+                method, layer, full = self._combining_layer(contract)
+                out = method.apply(layer=layer, dispatch_output=d).hidden_states
+                same = torch.allclose(out, _reference(full, d) * self.SCALING)
+                self.assertEqual(same, not wrong)
+
+    def test_rejects_graphs_and_nz_weights_at_startup(self):
+        """The contract refuses, before the checkpoint loads, what the MVP cannot serve:
+        CUDA graphs (no device-side wave planning) and NZ weights (the host store must
+        equal the GPU rows verbatim)."""
+        module = "sglang.srt.hardware_backend.npu.moe.paged_experts."
+        with patch(module + "cuda_graph_fully_disabled", return_value=False):
+            with self.assertRaisesRegex(RuntimeError, "--disable-cuda-graph"):
+                AscendRunnerContract().validate()
+        with patch(module + "cuda_graph_fully_disabled", return_value=True):
+            with patch.dict(os.environ):
+                os.environ.pop("SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT", None)
+                with self.assertRaisesRegex(
+                    RuntimeError, "SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT"
+                ):
+                    AscendRunnerContract().validate()
+            with patch.dict(os.environ, {"SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT": "1"}):
+                AscendRunnerContract().validate()  # accepted: eager, ND weights
 
 
 class TestLoading(CustomTestCase):
@@ -1154,6 +1302,9 @@ class TestFormats(CustomTestCase):
                 self.assertFalse(fmt.supports(object(), None))
 
     def test_contract_follows_the_runner(self):
+        from sglang.srt.hardware_backend.npu.moe.paged_experts import (
+            AscendRunnerContract,
+        )
         from sglang.srt.layers.moe.utils import MoeRunnerBackend
 
         def runner(backend):
@@ -1161,6 +1312,11 @@ class TestFormats(CustomTestCase):
 
         self.assertIs(contract_for(runner(MoeRunnerBackend.TRITON)), TRITON)
         self.assertIs(contract_for(runner(MoeRunnerBackend.MARLIN)), MARLIN)
+        # Registered by the Ascend runner module's import; without this the layer is
+        # refused as "requires the triton or Marlin MoE runner".
+        self.assertIsInstance(
+            contract_for(runner(MoeRunnerBackend.ASCEND)), AscendRunnerContract
+        )
         # This sums the top-k outputs inside the kernel, so waves cannot be exact.
         backend = MoeRunnerBackend.FLASHINFER_CUTLASS
         with self.assertRaisesRegex(RuntimeError, backend.value):

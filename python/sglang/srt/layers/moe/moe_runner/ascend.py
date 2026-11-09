@@ -679,3 +679,7 @@ def post_permute_ascend_to_deepep_ll(
         topk_ids=running_state["topk_ids"],
         topk_weights=running_state["topk_weights"],
     )
+
+
+# Registers this runner's paged-experts contract (import side effect).
+from sglang.srt.hardware_backend.npu.moe import paged_experts  # noqa: F401,E402

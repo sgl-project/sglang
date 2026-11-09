@@ -5,7 +5,8 @@ returns every routed (token, expert) output already multiplied by its router wei
 (``no_combine``); the contract runs each wave over only the entries whose expert it holds,
 writes them into one merged buffer, and performs the top-k sum the runner would have performed
 itself. The contract follows from the runner the base method builds (``contract_for``);
-supporting a new backend means adding a contract here.
+supporting a new backend means adding a contract here, or registering one from the backend's
+own module (``register_runner_contract``).
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ from __future__ import annotations
 import contextlib
 import weakref
 from dataclasses import replace
+from typing import Callable, Dict, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -52,6 +54,20 @@ class RunnerContract:
     #: Whether the runner reads a layout the base method's post-load step repacks the
     #: experts into; the step then runs over the host store K experts at a time.
     repacks: bool = False
+    #: Host allocator for the expert store, ``(shape, dtype) -> pinned CPU tensor``; None
+    #: lets the store use its default (memfd + cudaHostRegister).
+    host_alloc: Optional[Callable[[Tuple[int, ...], torch.dtype], torch.Tensor]] = None
+
+    def runner_config(self, moe_runner_config, num_slots: int):
+        """The config to build this contract's runner with, when it differs from the
+        shared paged config (K local experts, per-expert uncombined entries); None keeps
+        the shared config."""
+        return None
+
+    def validate(self) -> None:
+        """Run before the checkpoint loads; raise on a server config this contract
+        cannot serve (the default serves everything the shared checks admit)."""
+        return None
 
     def run_wave(
         self, base_method, layer, dispatch_output, slots, merged, num_entries=None
@@ -285,6 +301,19 @@ class MarlinContract(RunnerContract):
 TRITON = TritonContract()
 MARLIN = MarlinContract()
 
+# Contracts of backends owned elsewhere (e.g. Ascend): registered when the backend's
+# runner module is imported, so shared code stays free of their imports.
+_REGISTERED_CONTRACTS: Dict[str, RunnerContract] = {}
+
+
+def register_runner_contract(backend_name: str, contract: RunnerContract) -> None:
+    """The paged-experts contract of a runner backend, by its ``MoeRunnerBackend`` value."""
+    if backend_name in _REGISTERED_CONTRACTS:
+        raise ValueError(
+            f"Paged experts: runner contract for {backend_name!r} is already registered"
+        )
+    _REGISTERED_CONTRACTS[backend_name] = contract
+
 
 def runner_of(base_method, layer):
     """The runner the base method built: its own, or its scheme's (or the scheme kernel's)."""
@@ -307,6 +336,10 @@ def contract_for(runner) -> RunnerContract:
         and not backend.is_experimental_sgl_marlin()
     ):
         return MARLIN
+    if backend is not None:
+        contract = _REGISTERED_CONTRACTS.get(getattr(backend, "value", None))
+        if contract is not None:
+            return contract
     raise RuntimeError(
         "Paged experts: requires the triton or Marlin MoE runner, the layer's method uses "
         f"{getattr(backend, 'value', None)}; select one with --moe-runner-backend if its "

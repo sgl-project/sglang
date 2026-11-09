@@ -187,8 +187,13 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
 
     def create_moe_runner(self, layer, moe_runner_config):
         self.moe_runner_config = moe_runner_config  # rebuilt with the final K
-        self._create_runner(layer)
+        self._create_runner(layer)  # provisional: the shared paged config
         self.contract = contract_for(self.runner)
+        self.contract.validate()
+        if self._runner_config() != runner_config(moe_runner_config, self.num_resident):
+            # The contract configures the runner differently (e.g. its slot ids are the
+            # expert ids, so its tables are K wide): rebuild with that config.
+            self._create_runner(layer)
         self.routed_scaling_factor = moe_runner_config.routed_scaling_factor or 1.0
         # Loads wait as views of the mapped checkpoint: the post-load step replays them K
         # experts at a time.
@@ -296,10 +301,22 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
         layer.num_local_experts = num_slots
         layer._num_local_routed = layer._num_global_routed = num_slots
 
+    def _runner_config(self):
+        """The runner config for the selected contract: its own when it has one, else the
+        shared paged config."""
+        config = (
+            self.contract.runner_config(self.moe_runner_config, self.num_resident)
+            if self.contract is not None
+            else None
+        )
+        if config is None:
+            config = runner_config(self.moe_runner_config, self.num_resident)
+        return config
+
     def _create_runner(self, layer) -> None:
         self.base_method.create_moe_runner(
             layer=layer,
-            moe_runner_config=runner_config(self.moe_runner_config, self.num_resident),
+            moe_runner_config=self._runner_config(),
         )
         self.runner = runner_of(self.base_method, layer)
 
