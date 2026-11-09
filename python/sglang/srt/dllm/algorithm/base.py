@@ -103,7 +103,12 @@ class DllmAlgorithm:
     def fdfo_batched_step(
         self, forward_batch: ForwardBatch, full_logits: torch.Tensor, ctx: Any
     ) -> None:
-        """One denoise step on the batched context. Must not sync the host."""
+        """One denoise step on the batched context. Must not sync the host.
+
+        ``prepare_inputs`` runs only before the round's first forward; an
+        algorithm whose inputs need per-forward preparation must do it here
+        (the per-step ``step`` loop calls ``prepare_inputs`` every forward).
+        """
         raise NotImplementedError
 
     def fdfo_batched_all_finished(self, ctx: Any) -> bool:
