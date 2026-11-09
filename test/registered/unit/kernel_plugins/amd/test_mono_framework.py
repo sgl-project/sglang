@@ -117,7 +117,7 @@ def batch(mode, bs, rows):
     )
 
 
-def install(*, archs, lookups=None, is_load_observed=False):
+def install(*, archs, lookups=None, is_load_observed=False, backend=BACKEND):
     """install_monokernel_forward on an Lm, as rank 0 of two whose gathered lookups
     are lookups, or as the only rank."""
     lm = Lm()
@@ -126,7 +126,7 @@ def install(*, archs, lookups=None, is_load_observed=False):
     gather = {"return_value": lookups} if lookups else {"side_effect": lambda x: [x]}
     gpu = SimpleNamespace(multi_processor_count=256)
     with (
-        patch.object(binding, "_backend", return_value=BACKEND),
+        patch.object(binding, "_backend", return_value=backend),
         patch.object(binding, "device_isa", return_value="gfx950"),
         patch.object(binding, "_gather_tp", **gather),
         patch.object(torch.cuda, "current_device", return_value=0),
@@ -387,6 +387,45 @@ class TestMonokernelFramework(CustomTestCase):
             lm(torch.zeros(1), None, batch("target_verify", 2, 2)), "normal"
         )
 
+    def test_a_chain_draft_serves_draft_extend_steps_on_xpu_only(self):
+        # the draft extend step (the verified positions, draft-width rows a request)
+        # routes on a backend whose plugin runs it; elsewhere it keeps the model's
+        # forward, as before
+        publish(
+            ServerArgs(
+                model_path="dummy",
+                enable_amd_monokernel=True,
+                speculative_algorithm="EAGLE",
+                speculative_num_steps=3,
+                speculative_eagle_topk=1,
+                speculative_num_draft_tokens=4,
+                disable_cuda_graph=True,
+            ),
+            role="test",
+        )
+        self.addCleanup(reset_context)
+        for backend, want in ((BACKEND, "normal"), ("xpu", "mono")):
+            with self.subTest(backend=backend):
+                registry.register(
+                    backend=backend,
+                    architecture="Draft",
+                    path=f"{__name__}:ONE_TOKEN_DRAFT",
+                )
+                lm = install(archs=["Draft"], is_load_observed=True, backend=backend)
+                # widths (1, 2, 4, 6, 12): 4 rows is 1 request, 12 rows is 3
+                for bs, rows, route in ((1, 4, want), (3, 12, want), (2, 8, "normal")):
+                    step = batch("draft_extend_v2", bs, rows)
+                    self.assertEqual(lm(torch.zeros(1), None, step), route, (bs, rows))
+                self.assertEqual(
+                    lm(torch.zeros(1), None, batch("decode", 2, 2)), "mono"
+                )
+        # the draft's keys: a verify width other than the extend's is no key
+        keys = binding._draft_extend_keys(backend="xpu", widths=WIDTHS, sizes={1, 2})
+        self.assertEqual(
+            sorted((k.forward_mode, k.batch_size, k.tokens_per_request) for k in keys),
+            [("draft_extend", 1, 4)],
+        )
+
     def test_every_rank_takes_the_same_lookup_branch(self):
         # every rank refuses together: one returning alone would hang its peers
         ours = (True, True, "", (SPEC.name, SPEC.api_version))
@@ -464,6 +503,47 @@ class TestMonokernelFramework(CustomTestCase):
         # the largest graph of its mode runs eagerly
         eager = binding._eager_keys(served=served, captured=check.captured.values())
         self.assertEqual([k.batch_size for k in eager], [8])
+
+    def test_draft_extend_graphs_are_checked_apart_from_the_decode_graphs(self):
+        # one hook sees the draft runner's decode and draft extend captures: the
+        # extend sizes must not complete (or refuse) the decode check
+        served = frozenset(
+            [
+                ShapeKey(forward_mode="decode", batch_size=bs, tokens_per_request=1)
+                for bs in (2, 4)
+            ]
+            + [
+                ShapeKey(
+                    forward_mode="draft_extend", batch_size=2, tokens_per_request=2
+                )
+            ]
+        )
+        check = binding._CaptureCheck(spec=SPEC, isa="gfx950", served=served)
+        with patch.object(torch.cuda, "is_current_stream_capturing", return_value=True):
+            for bs in (2, 4):
+                check(
+                    runner(capture_bs=[2, 4]),
+                    None,
+                    batch("draft_extend_v2", bs, 2 * bs),
+                    bs,
+                )
+            self.assertTrue(check.is_extend_done)
+            self.assertFalse(check.is_done)
+            self.assertEqual(sorted(check.captured), [])
+            for bs in (2, 4):
+                check(runner(capture_bs=[2, 4]), None, batch("decode", bs, bs), bs)
+        self.assertTrue(check.is_done)
+        # draft extend keys are no eager decode keys
+        eager = binding._eager_keys(
+            served=frozenset(k for k in served if k.forward_mode == "decode"),
+            captured=check.captured.values(),
+        )
+        self.assertEqual(eager, [])
+        # a runner whose extend graphs route nothing is only logged, not refused
+        check = binding._CaptureCheck(spec=SPEC, isa="gfx950", served=frozenset())
+        with patch.object(torch.cuda, "is_current_stream_capturing", return_value=True):
+            check(runner(capture_bs=[2]), None, batch("draft_extend_v2", 2, 4), 4)
+        self.assertTrue(check.is_extend_done)
 
     def test_the_runtime_reads_the_published_config(self):
         graphs = with_phase(default_cuda_graph_config(), Phase.DECODE, bs=[1, 2, 8])

@@ -369,13 +369,23 @@ def monokernel_weights_iterator(
     return watched()
 
 
+# Backends whose drafter plugins also run the draft extend step (a verify-shaped
+# step of the draft model: its rows are the target's verified positions).
+_DRAFT_EXTEND_BACKENDS = frozenset({"xpu"})
+
+
 def shape_key(forward_batch: ForwardBatch) -> Optional[ShapeKey]:
-    """The graph key of a DECODE or TARGET_VERIFY step, else None."""
+    """The graph key of a DECODE, TARGET_VERIFY or DRAFT_EXTEND_V2 step, else None.
+
+    Only a backend in ``_DRAFT_EXTEND_BACKENDS`` serves the draft extend keys.
+    """
     mode = forward_batch.forward_mode
     if mode.is_decode():
         name = "decode"
     elif mode.is_target_verify():
         name = "target_verify"
+    elif mode.is_draft_extend_v2():
+        name = "draft_extend"
     else:
         return None
     bs, rows = int(forward_batch.batch_size), int(forward_batch.input_ids.shape[0])
@@ -479,6 +489,12 @@ def install_monokernel_forward(
         if w % tokens == 0 and (not capture_keys or w in capture_rows)
     )
     served = _served_keys(mode=mode, widths=widths, tokens=tokens)
+    if mode == "decode" and tokens == 1 and _chain_draft():
+        served |= _draft_extend_keys(
+            backend=backend,
+            widths=spec.widths(isa),
+            sizes={k.batch_size for k in capture_keys},
+        )
     # Different routes would leave ranks waiting in incompatible collectives.
     if any(other != served for other in _gather_tp(served)):
         raise RuntimeError(f"{_flag()}: the ranks route different graph keys")
@@ -525,16 +541,19 @@ def install_monokernel_forward(
 
 
 class _CaptureCheck:
-    """Check the captured decode graphs, not the configured sizes, once all are in.
+    """Check the captured graphs, not the configured sizes, once all are in.
 
     Logs the steps that run the monokernels, captured and eager, and refuses a
-    runner none of whose graphs run them.
+    runner none of whose decode graphs run them. A draft extend runner's graphs
+    are checked apart: one that routes none falls back to the model's forward.
     """
 
     def __init__(self, *, spec: MonoSpec, isa: str, served: frozenset):
         self.spec, self.isa, self.served = spec, isa, served
         self.captured: dict[int, Optional[ShapeKey]] = {}
+        self.extend_captured: dict[int, Optional[ShapeKey]] = {}
         self.is_done = False
+        self.is_extend_done = False
 
     def __call__(
         self,
@@ -543,20 +562,40 @@ class _CaptureCheck:
         forward_batch: ForwardBatch,
         num_tokens: int,
     ) -> None:
-        if self.is_done or not _device_module().is_current_stream_capturing():
+        if not _device_module().is_current_stream_capturing():
             return  # the runner's warmup runs, and any recapture
-        self.captured[int(forward_batch.batch_size)] = shape_key(forward_batch)
-        if not set(runner.capture_bs) <= set(self.captured):
+        is_extend = forward_batch.forward_mode.is_draft_extend_v2()
+        if self.is_extend_done if is_extend else self.is_done:
+            return
+        captured = self.extend_captured if is_extend else self.captured
+        captured[int(forward_batch.batch_size)] = shape_key(forward_batch)
+        if not set(runner.capture_bs) <= set(captured):
+            return
+        routed = [k for k in captured.values() if k in self.served]
+        if is_extend:
+            self.is_extend_done = True
+            logger.info(
+                "monokernel %s on %s runs %s (%d of %d captured draft extend graphs)",
+                self.spec.name,
+                self.isa,
+                _format_steps(routed) if routed else "no draft extend step",
+                len(routed),
+                len(captured),
+            )
             return
         self.is_done = True
-        routed = [k for k in self.captured.values() if k in self.served]
         if not routed:
             raise ValueError(
                 f"{_flag()}: none of the "
-                f"{len(self.captured)} captured decode graphs (batch sizes "
-                f"{sorted(self.captured)}) runs {self.spec.name}'s monokernels"
+                f"{len(captured)} captured decode graphs (batch sizes "
+                f"{sorted(captured)}) runs {self.spec.name}'s monokernels"
             )
-        eager = _eager_keys(served=self.served, captured=self.captured.values())
+        eager = _eager_keys(
+            served=frozenset(
+                k for k in self.served if k.forward_mode != "draft_extend"
+            ),
+            captured=captured.values(),
+        )
         logger.info(
             "monokernel %s on %s runs %s (%d of %d captured decode graphs)%s; every "
             "other step runs the standard path",
@@ -564,7 +603,7 @@ class _CaptureCheck:
             self.isa,
             _format_steps(routed),
             len(routed),
-            len(self.captured),
+            len(captured),
             f", and eagerly {_format_steps(eager)}" if eager else "",
         )
 
@@ -594,6 +633,25 @@ def _served_keys(
         ShapeKey(forward_mode=mode, batch_size=w // tokens, tokens_per_request=tokens)
         for w in widths
         if w % tokens == 0
+    )
+
+
+def _draft_extend_keys(
+    *, backend: str, widths: tuple[int, ...], sizes: set[int]
+) -> frozenset[ShapeKey]:
+    """The graph keys of a chain draft's draft extend steps: every request holds the
+    verify width's tokens. ``sizes`` are the captured batch sizes (empty without graphs)."""
+    tokens = int(get_spec().speculative_num_draft_tokens or 0)
+    if backend not in _DRAFT_EXTEND_BACKENDS or tokens < 2:
+        return frozenset()
+    return frozenset(
+        ShapeKey(
+            forward_mode="draft_extend",
+            batch_size=w // tokens,
+            tokens_per_request=tokens,
+        )
+        for w in widths
+        if w % tokens == 0 and (not sizes or w // tokens in sizes)
     )
 
 
