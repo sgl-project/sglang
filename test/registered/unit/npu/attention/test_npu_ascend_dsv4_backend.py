@@ -23,6 +23,8 @@ for mod in (
     "sgl_kernel_npu",
     "sgl_kernel_npu.attention",
     "sgl_kernel_npu.attention.sinks_attention",
+    "sgl_kernel_npu.operators",
+    "sgl_kernel_npu.operators.attention",
     "sgl_kernel_npu.norm",
     "sgl_kernel_npu.norm.add_rmsnorm_bias",
     "sglang.srt.speculative",
@@ -702,18 +704,23 @@ class TestCompressorStateTableABI(unittest.TestCase):
             ),
             patch.object(torch.ops, "custom", MagicMock(), create=True) as custom_ops,
             patch.object(torch.ops, "npu", MagicMock(), create=True) as npu_ops,
+            patch("sgl_kernel_npu.operators.attention.compressor") as compressor_op,
         ):
-            custom_ops.compressor.return_value = torch.empty((0, 1))
+            compressor_op.return_value = torch.empty((0, 1))
             backend.forward_compress(compressor, torch.empty((2, 1)), forward_batch)
             backend.forward_compress(compressor, torch.empty((2, 1)), forward_batch)
 
         self.assertEqual(npu_ops.compressor.call_count, 0)
+        self.assertEqual(custom_ops.compressor.call_count, 0)
+        self.assertEqual(compressor_op.call_count, 2)
         self.assertIs(
-            custom_ops.compressor.call_args_list[0].kwargs["state_block_table"], table
+            compressor_op.call_args_list[0].kwargs["state_block_table"], table
         )
         self.assertIs(
-            custom_ops.compressor.call_args_list[1].kwargs["state_block_table"], table
+            compressor_op.call_args_list[1].kwargs["state_block_table"], table
         )
+        for call in compressor_op.call_args_list:
+            self.assertEqual(call.kwargs["impl"], "auto")
 
 
 class TestArch35SparseAttentionDispatch(unittest.TestCase):

@@ -482,6 +482,7 @@ class CompressorAscendBackendMixin:
         x: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> None:
+        from sgl_kernel_npu.operators.attention import compressor as npu_compressor
 
         ratio = compressor.ratio
         coff = 1 + int(compressor.overlap)
@@ -524,11 +525,7 @@ class CompressorAscendBackendMixin:
             allow_build=False,
         )
 
-        # TODO: torch.ops.npu.compressor does not support Ascend 950 yet.
-        compressor_op = (
-            torch.ops.custom.compressor if is_npu_arch35() else torch.ops.npu.compressor
-        )
-        cmp_kv = compressor_op(
+        cmp_kv = npu_compressor(
             x,
             compressor._fused_wkv_w,
             compressor._fused_wgate_w,
@@ -547,6 +544,7 @@ class CompressorAscendBackendMixin:
             norm_eps=compressor.norm.variance_epsilon,
             rotary_mode=2,
             cache_mode=2,
+            impl="auto",
         )
 
         # prefill output may be padded; trim to loc length

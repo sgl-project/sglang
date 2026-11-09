@@ -492,9 +492,8 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
 
     def get_state_cache(self, layer_id: int, from_indexer: bool) -> torch.Tensor:
         """FP32 ``[block_num, ring_size, 2*coff*D]`` view of this layer's
-        kv+score buffer — the fused compressor op
-        (``torch.ops.custom.compressor`` on Ascend 950 and ``torch.ops.npu.compressor``
-        elsewhere)'s ``state_cache`` argument."""
+        kv+score buffer — the ``state_cache`` argument to
+        ``sgl_kernel_npu.operators.attention.compressor`` on A3 and A5."""
         return self._get_state_pool(layer_id, from_indexer).state_cache_3d
 
     # ------------------------------------------------------------------
