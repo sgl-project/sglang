@@ -92,6 +92,8 @@ on:
           - nightly-8-gpu
           # 8-GPU Kimi-K3.1-Pro (MI35x only - native MXFP4 needs gfx95x)
           - nightly-8-gpu-mi35x-kimi-k31-pro
+          # 8-GPU Muse Spark Open MXFP4 (MI35x only - native MXFP4 needs gfx95x)
+          - nightly-8-gpu-mi35x-muse-spark
           # 8-GPU Qwen3.8-MXFP4 (MI35x only - MXFP4 needs gfx95x)
           - nightly-8-gpu-mi35x-qwen38-mxfp4
           # 8-GPU Qwen 3.5 (MI30x + MI35x)
@@ -1852,6 +1854,52 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   # ==============================================================================
+  # 8-GPU Muse Spark Open MXFP4 (MI35x only - native MXFP4 needs gfx95x)
+  # ==============================================================================
+
+  nightly-8-gpu-mi35x-muse-spark:
+    name: ${{ format('nightly-8-gpu-mi35x-muse-spark ({0}, linux-mi35x-gpu-8)', matrix.rocm_version) }}
+    strategy:
+      fail-fast: false
+      matrix:
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || github.event.schedule == '0 16 * * *' && '["rocm10"]' || github.event.schedule == '0 21 2-30/2 * *' && '["rocm724"]' || github.event.schedule == '0 21 1-31/2 * *' && '["rocm720"]' || '["rocm10", "rocm724", "rocm720"]') }}
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-muse-spark,'))
+    runs-on: linux-mi35x-gpu-8
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
+      - name: Setup docker (${{ matrix.rocm_version }})
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ matrix.rocm_version }}
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+          ENABLE_CACHE_HOST: "1"
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
+          # Install tabulate for run_suite.py (missing in MI35x container)
+          bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
+
+      # The MXFP4 checkpoint is ~470 GB plus the ~10 GB DFlash2 draft.
+      - name: Accuracy Test MI35x ROCm (8-GPU Muse Spark Open MXFP4)
+        timeout-minutes: 240
+        run: |
+          > github_summary.md  # Clear summary file
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-mi35x-muse-spark --nightly --timeout-per-file 14400 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+  # ==============================================================================
   # 8-GPU Qwen 3.5 (MI30x + MI35x)
   # ==============================================================================
 
@@ -2501,6 +2549,8 @@ jobs:
       - nightly-8-gpu
       # 8-GPU Kimi-K3.1-Pro (MI35x only - native MXFP4 needs gfx95x)
       - nightly-8-gpu-mi35x-kimi-k31-pro
+      # 8-GPU Muse Spark Open MXFP4 (MI35x only - native MXFP4 needs gfx95x)
+      - nightly-8-gpu-mi35x-muse-spark
       # 8-GPU Qwen3.8-MXFP4 (MI35x only - MXFP4 needs gfx95x)
       - nightly-8-gpu-mi35x-qwen38-mxfp4
       # 8-GPU Qwen 3.5 (MI30x + MI35x)

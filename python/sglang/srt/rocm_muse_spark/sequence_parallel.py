@@ -31,7 +31,8 @@ from sglang.kernels.ops.gemm.fp8_prefill_gemm import (
 from sglang.kernels.ops.gemm.fp8w_small_m_gemm import quantize_weight
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.environ import envs
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import ForwardMode
 
 SP_MIN_TOKENS = 2048
 # Pipelined Ulysses row chunks, measured on MI355X per layer (check_ulysses_pipeline.py): shards from
