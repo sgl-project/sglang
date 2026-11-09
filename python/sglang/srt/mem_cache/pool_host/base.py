@@ -623,6 +623,20 @@ class HostKVCache(abc.ABC):
         """Page size in that same logical space (the widened DCP page)."""
         return self.page_size * self.dcp_size
 
+    def _storage_page_index(self, index: int) -> int:
+        """Physical slot of the page an L3 key covers; storage backends address
+        pages by logical (widened) slot, one physical page per rank under DCP."""
+        index = int(index)
+        if self.dcp_size == 1:
+            return index
+        if index < 0 or index % self.logical_page_size != 0:
+            raise ValueError(
+                "DCP L3 page start must be a nonnegative logical page boundary."
+            )
+        if index + self.logical_page_size > self.logical_size:
+            raise IndexError("DCP L3 page is outside the host pool.")
+        return index // self.dcp_size
+
     @synchronized
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
         assert need_size % self.logical_page_size == 0, (
