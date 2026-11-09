@@ -188,8 +188,9 @@ class SiluAndMul(BaseFusedOp):
         return self._musa_swish_glu(x)
 
     def forward_mlu(self, x: torch.Tensor) -> torch.Tensor:
-        out = torch_mlu_ops.active(input=x, act_mode="silu", is_gated=True)
-        return out
+        if not x.is_contiguous():
+            return self.forward_native(x)
+        return torch_mlu_ops.active(input=x, act_mode="silu", is_gated=True)
 
 
 class SituAndMul(BaseFusedOp):
@@ -230,7 +231,7 @@ class SituAndMul(BaseFusedOp):
     def forward_mlu(self, x: torch.Tensor) -> torch.Tensor:
         if (
             x.numel() > 0
-            and x.stride(-1) == 1
+            and x.is_contiguous()
             and x.shape[-1] % 2 == 0
             and x.dtype in (torch.float16, torch.bfloat16)
         ):
@@ -294,7 +295,7 @@ class GeluAndMul(BaseFusedOp):
     def forward_mlu(self, x: torch.Tensor) -> torch.Tensor:
         if (
             x.numel() > 0
-            and x.stride(-1) == 1
+            and x.is_contiguous()
             and x.shape[-1] % 2 == 0
             and x.dtype in (torch.float16, torch.bfloat16, torch.float32)
             and self.approximate in ("none", "tanh")
@@ -322,7 +323,7 @@ class NewGELU(BaseFusedOp):
     def forward_mlu(self, x: torch.Tensor) -> torch.Tensor:
         if (
             x.numel() > 0
-            and x.stride(-1) == 1
+            and x.is_contiguous()
             and x.dtype in (torch.float16, torch.bfloat16, torch.float32)
         ):
             return torch_mlu_ops.active(
@@ -371,7 +372,7 @@ class QuickGELU(BaseFusedOp):
     def forward_mlu(self, x: torch.Tensor) -> torch.Tensor:
         if (
             x.numel() > 0
-            and x.stride(-1) == 1
+            and x.is_contiguous()
             and x.dtype in (torch.float16, torch.bfloat16)
         ):
             return torch_mlu_ops.active(input=x, act_mode="quick_gelu", is_gated=False)
