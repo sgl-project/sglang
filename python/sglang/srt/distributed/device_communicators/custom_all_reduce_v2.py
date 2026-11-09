@@ -448,7 +448,9 @@ class CustomAllReduceV2:
             p = pair.index(self.rank)
             cross = [ranks[p] for ranks in self._dpx_pairs]
             # one u64 phase word (EpochCounter) per sub-plane: pair, cross
-            self._hier_counters = torch.zeros((2, 2), dtype=torch.uint32, device=self.device)
+            self._hier_counters = torch.zeros(
+                (2, 2), dtype=torch.uint32, device=self.device
+            )
 
             def sub_communicator(ranks, offset, slot_bytes, counter):
                 # 2 phases x len(ranks) peers, like the full push plane
