@@ -4,6 +4,7 @@ import torch
 import torch_npu
 from sgl_kernel_npu.operators.matmul import batch_matmul_transpose
 from sgl_kernel_npu.operators.norm import fused_split_qk_norm
+from sgl_kernel_npu.operators.utils.generation import Generation, get_hardware
 
 import sglang.srt.layers.dcp.comm as dcp_comm
 import sglang.srt.layers.dcp.layout as dcp_layout
@@ -19,7 +20,6 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_fia_nz,
     is_mla_preprocess_enabled,
 )
-from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.attention.dsa.dsa_npu_indexer import scattered_to_tp_attn_full
 from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
@@ -37,7 +37,7 @@ if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
     from sglang.srt.utils import BumpAllocator
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
-_is_npu_arch35 = is_npu_arch35()
+_is_npu_arch22 = get_hardware().generation is Generation.ARCH22
 
 
 def init_modelslim_mla_kv(m: "DeepseekV2AttentionMLA", prefix: str):
@@ -362,12 +362,19 @@ def forward_mla_core_npu(
     )
 
     attn_output = attn_output.contiguous()
-    # A5 supports the fused transpose matmul beyond the A2/A3 shape guard.
-    if _is_npu_arch35 or (
-        attn_output.shape[0] < 65536
-        and attn_output.shape[-1] * attn_output.shape[-2] < 65536
-        and m.w_vc.shape[-1] < 65536
+    # Use the arch22 kernel for shapes outside the A2/A3 transpose matmul guard.
+    if _is_npu_arch22 and (
+        attn_output.shape[0] >= 65536
+        or attn_output.shape[-1] * attn_output.shape[-2] >= 65536
+        or m.w_vc.shape[-1] >= 65536
     ):
+        attn_bmm_output = torch.empty(
+            (attn_output.shape[0], m.num_local_heads, m.v_head_dim),
+            dtype=attn_output.dtype,
+            device=attn_output.device,
+        )
+        batch_matmul_transpose(attn_output, m.w_vc, attn_bmm_output)
+    else:
         attn_bmm_output = torch_npu.npu_transpose_batchmatmul(
             attn_output,
             m.w_vc,
@@ -375,13 +382,6 @@ def forward_mla_core_npu(
             perm_x2=(0, 1, 2),
             perm_y=(1, 0, 2),
         )
-    else:
-        attn_bmm_output = torch.empty(
-            (attn_output.shape[0], m.num_local_heads, m.v_head_dim),
-            dtype=attn_output.dtype,
-            device=attn_output.device,
-        )
-        batch_matmul_transpose(attn_output, m.w_vc, attn_bmm_output)
 
     attn_bmm_output = attn_bmm_output.reshape(-1, m.num_local_heads * m.v_head_dim)
     if gate is not None:
@@ -603,19 +603,11 @@ def forward_dsa_core_npu(
         topk_indices=topk_indices,
     )
 
-    if _is_npu_arch35 or (
+    if _is_npu_arch22 and not (
         forward_batch.forward_mode.is_extend()
         and not forward_batch.forward_mode.is_draft_extend_v2()
         and not forward_batch.forward_mode.is_target_verify()
     ):
-        attn_bmm_output = torch_npu.npu_transpose_batchmatmul(
-            attn_output,
-            m.w_vc,
-            perm_x1=(1, 0, 2),
-            perm_x2=(0, 1, 2),
-            perm_y=(1, 0, 2),
-        )
-    else:
         attn_bmm_output = torch.empty(
             (attn_output.shape[0], m.num_local_heads, m.v_head_dim),
             dtype=attn_output.dtype,
@@ -623,6 +615,14 @@ def forward_dsa_core_npu(
         )
         attn_output = attn_output.contiguous()
         batch_matmul_transpose(attn_output, m.w_vc, attn_bmm_output)
+    else:
+        attn_bmm_output = torch_npu.npu_transpose_batchmatmul(
+            attn_output,
+            m.w_vc,
+            perm_x1=(1, 0, 2),
+            perm_x2=(0, 1, 2),
+            perm_y=(1, 0, 2),
+        )
 
     attn_bmm_output = attn_bmm_output.reshape(-1, m.num_local_heads * m.v_head_dim)
 
