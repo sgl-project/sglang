@@ -145,6 +145,39 @@ loading those kernels. An attempted native kernel execution raises an error;
 these hooks do not provide real CPU or Metal inference. The runtime remains
 single-worker even when the predictor models a larger deployment.
 
+For a fresh Apple Silicon development environment, run the following from the
+repository root with Python 3.12 and `uv` installed. This uses the non-CUDA
+runtime dependency lists from `pyproject_other.toml` without replacing the
+repository's `pyproject.toml`. MLX is installed because the macOS scheduler
+imports its mixin, even though simulation uses the CPU engine.
+
+```bash
+uv venv --python 3.12 /tmp/sglang-sim-macos
+source /tmp/sglang-sim-macos/bin/activate
+python - <<'PYREQ'
+import tomllib
+from pathlib import Path
+
+project = tomllib.loads(Path("python/pyproject_other.toml").read_text())["project"]
+extras = project["optional-dependencies"]
+requirements = project["dependencies"] + extras["runtime_base"]
+requirements += [r for r in extras["runtime_common"] if not r.startswith("sglang[")]
+requirements += [
+    "torch==2.13.0", "torchvision==0.28.0", "mlx>=0.32.4", "mlx-lm",
+    "pytest", "scikit-learn", "joblib",
+]
+Path("/tmp/sglang-sim-macos/requirements.txt").write_text(
+    "\n".join(sorted(set(requirements))) + "\n"
+)
+PYREQ
+uv pip install -r /tmp/sglang-sim-macos/requirements.txt
+SGLANG_BUILD_RUST_EXTS=none uv pip install --no-deps -e python -e tools/sglang-simulator
+```
+
+The explicit dependency installation above is for simulation only; `--no-deps`
+avoids the default package's CUDA dependencies, and native Rust extensions are
+not built. It does not constitute a complete real-inference installation.
+
 For Replay without AISimulate, pass `--max-total-tokens` explicitly. With the
 matching SGLang source and Python dependencies available, validate the local
 HTTP path from the repository root:

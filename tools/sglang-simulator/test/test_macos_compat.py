@@ -29,16 +29,22 @@ def test_macos_kernel_imports_fail_on_execution():
         install_load_utils_stub()
         import sgl_kernel
         from sgl_kernel import copy_all_layer_kv_cache_cpu
+        from sglang_simulator.simulation.sglang.sgl_kernel_hook import _MACOS_IMPORT_ONLY_KERNELS
         assert sgl_kernel.__spec__.submodule_search_locations is not None
         assert not hasattr(sgl_kernel, "__file__")
+        assert not hasattr(sgl_kernel, "unknown_kernel")
+        assert not hasattr(sgl_kernel, "metal")
+        assert not hasattr(sgl_kernel, "__getattr__")
+        assert sgl_kernel.copy_all_layer_kv_cache_cpu is copy_all_layer_kv_cache_cpu
         install_load_utils_stub()
         assert sys.modules["sgl_kernel"] is sgl_kernel
-        try:
-            copy_all_layer_kv_cache_cpu()
-        except RuntimeError as exc:
-            assert "copy_all_layer_kv_cache_cpu" in str(exc)
-        else:
-            raise AssertionError("Native kernel execution must not silently succeed")
+        for name in _MACOS_IMPORT_ONLY_KERNELS:
+            try:
+                getattr(sgl_kernel, name)()
+            except RuntimeError as exc:
+                assert name in str(exc)
+            else:
+                raise AssertionError("Native kernel execution must not silently succeed")
         """
     )
 

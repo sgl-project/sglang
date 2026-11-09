@@ -33,9 +33,9 @@ def install_macos_cpu_compat():
         return
 
     from sglang.srt.distributed import bootstrap
-    from sglang.srt.utils import common, numa_utils
+    from sglang.srt.utils import device, numa_utils
 
-    common.get_physical_cpus_by_numa = _host_cpu_ids_by_node
-    common.get_cpu_ids_by_node.cache_clear()
+    device.get_physical_cpus_by_numa_or_block = _host_cpu_ids_by_node
+    device.get_cpu_ids_by_node.cache_clear()
     numa_utils.init_threads_binding = _skip_thread_binding
     bootstrap._init_cpu_threads_env = _skip_native_cpu_threads_env

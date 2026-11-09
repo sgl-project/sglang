@@ -3,11 +3,21 @@ import os
 import sys
 import types
 
+# Imported by the CPU allocation and speculative-decoding modules while the
+# scheduler loads. No native implementation is executed by simulation.
+_MACOS_IMPORT_ONLY_KERNELS = (
+    "assign_draft_cache_locs_contiguous_cpu",
+    "assign_extend_cache_locs_cpu",
+    "assign_req_to_token_pool_cpu",
+    "build_tree_kernel_efficient_cpu",
+    "copy_all_layer_kv_cache_cpu",
+    "fill_accept_out_cache_loc_cpu",
+    "fill_bonus_tokens_cpu",
+    "verify_tree_greedy_cpu",
+)
+
 
 def _get_unavailable_kernel(name):
-    if name.startswith("__"):
-        raise AttributeError(name)
-
     def unavailable(*args, **kwargs):
         raise RuntimeError(
             f"SGLang Simulator attempted to execute native kernel sgl_kernel.{name}. "
@@ -32,7 +42,8 @@ def install_load_utils_stub() -> None:
         package.__spec__ = importlib.util.spec_from_loader(
             "sgl_kernel", loader=None, is_package=True
         )
-        package.__getattr__ = _get_unavailable_kernel
+        for name in _MACOS_IMPORT_ONLY_KERNELS:
+            setattr(package, name, _get_unavailable_kernel(name))
         sys.modules["sgl_kernel"] = package
 
     module_name = "sgl_kernel.load_utils"
