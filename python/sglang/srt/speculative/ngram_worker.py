@@ -1,6 +1,4 @@
-import itertools
 import logging
-from collections import deque
 from typing import List, Optional
 
 import numpy as np
@@ -47,36 +45,6 @@ logger = logging.getLogger(__name__)
 USE_FULL_MASK = True
 # Tail of each request's context inserted into the trie once its prefill ends.
 NGRAM_EXTEND_PROMPT_WINDOW = 1024
-# External corpora are mirrored into the trie up to this share of its capacity
-# (each token adds up to max_trie_depth nodes), so request n-grams keep room.
-NGRAM_CORPUS_TRIE_CAPACITY_FRACTION = 0.5
-# Corpus tokens inserted per forward while serving. The next draft lookup waits
-# for pending inserts, so a bounded slice stays hidden behind the GPU step.
-NGRAM_CORPUS_TRIE_TOKENS_PER_STEP = 512
-
-
-def _split_corpus_documents(
-    token_chunks: list[list[int]], max_tokens: int
-) -> list[list[int]]:
-    """Leading documents of a chunked corpus stream, up to max_tokens in total.
-
-    Documents are joined by negative separator tokens and may span chunks.
-    Splitting there keeps one document's end from forming n-grams with the next.
-    """
-    docs, cur = [], []
-    for token in itertools.chain.from_iterable(token_chunks):
-        if max_tokens <= 0:
-            break
-        if token < 0:
-            if cur:
-                docs.append(cur)
-            cur = []
-        else:
-            cur.append(token)
-            max_tokens -= 1
-    if cur:
-        docs.append(cur)
-    return docs
 
 
 def _derive_tree_links(
@@ -139,20 +107,6 @@ class NGRAMWorker(BaseSpecWorker):
         self.device = get_device().device
 
         self.adaptive_controller = None
-        # corpus_id -> documents mirrored into the trie, so remove_external_corpus
-        # and clear_cache_pool can rebuild the trie from the corpora still loaded.
-        self._corpus_trie_docs: dict[str, list[list[int]]] = {}
-        self._staged_corpus_trie_docs: dict[str, list[list[int]]] = {}
-        # Plain int so the background loader can read it without iterating
-        # dicts the scheduler thread may be mutating.
-        self._corpus_trie_tokens = 0
-        self._corpus_trie_token_budget = int(
-            get_spec().speculative_ngram_capacity
-            * NGRAM_CORPUS_TRIE_CAPACITY_FRACTION
-            // get_spec().speculative_ngram_max_trie_depth
-        )
-        # Corpus slices still to insert, fed by _feed_corpus_trie.
-        self._corpus_trie_backlog: deque[list[int]] = deque()
         # rids of the last decode batch; used to erase corpus match state for
         # requests that left the batch (see forward_batch_generation).
         self._prev_decode_rids: set = set()
@@ -183,10 +137,6 @@ class NGRAMWorker(BaseSpecWorker):
             )
             loaded = self.add_external_corpus(corpus_path, chunks)
             self.commit_corpus_load(corpus_path, loaded)
-            # Nothing is serving yet, so fill the trie copy before the first request.
-            while self._corpus_trie_backlog:
-                self._feed_corpus_trie()
-            self.ngram_corpus.synchronize()
             logger.info(
                 "Loaded external ngram corpus '%s' (%d tokens).",
                 corpus_path,
@@ -203,51 +153,15 @@ class NGRAMWorker(BaseSpecWorker):
         self.ngram_corpus.synchronize()
         self.ngram_corpus.reset()
         self._prev_decode_rids = set()
-        # Loaded corpora outlive a flush; re-insert them a slice per step.
-        self._corpus_trie_backlog.clear()
-        for docs in self._corpus_trie_docs.values():
-            self._queue_corpus_trie_docs(docs)
 
     def add_external_corpus(self, corpus_id: str, token_chunks: list[list[int]]) -> int:
-        loaded = self.ngram_corpus.load_external_corpus_named(corpus_id, token_chunks)
-        # May run on the background loader thread, so only stage the trie copy;
-        # commit_corpus_load queues it on the scheduler thread.
-        self._staged_corpus_trie_docs[corpus_id] = _split_corpus_documents(
-            token_chunks, self._corpus_trie_token_budget - self._corpus_trie_tokens
-        )
-        return loaded
+        return self.ngram_corpus.load_external_corpus_named(corpus_id, token_chunks)
 
     def commit_corpus_load(self, corpus_id: str, loaded_token_count: int) -> None:
         self.ngram_corpus.commit_external_corpus_load(corpus_id, loaded_token_count)
-        docs = self._staged_corpus_trie_docs.pop(corpus_id, [])
-        if docs:
-            self._corpus_trie_docs[corpus_id] = docs
-            self._corpus_trie_tokens += sum(map(len, docs))
-            self._queue_corpus_trie_docs(docs)
 
     def remove_external_corpus(self, corpus_id: str) -> None:
         self.ngram_corpus.remove_external_corpus(corpus_id)
-        docs = self._corpus_trie_docs.pop(corpus_id, None)
-        if docs is not None:
-            self._corpus_trie_tokens -= sum(map(len, docs))
-            # Trie paths cannot be deleted one by one, so rebuild without this
-            # corpus. This also drops n-grams learned from requests.
-            self.clear_cache_pool()
-
-    def _queue_corpus_trie_docs(self, docs: list[list[int]]) -> None:
-        # Slices overlap so n-grams that cross a cut are still inserted whole.
-        step, overlap = NGRAM_CORPUS_TRIE_TOKENS_PER_STEP, self.max_trie_depth - 1
-        for doc in docs:
-            for start in range(0, max(len(doc) - overlap, 1), step):
-                self._corpus_trie_backlog.append(doc[start : start + step + overlap])
-
-    def _feed_corpus_trie(self) -> None:
-        budget, pieces = NGRAM_CORPUS_TRIE_TOKENS_PER_STEP, []
-        while budget > 0 and self._corpus_trie_backlog:
-            pieces.append(self._corpus_trie_backlog.popleft())
-            budget -= len(pieces[-1])
-        if pieces:
-            self.ngram_corpus.batch_put(pieces)
 
     def list_external_corpora(self) -> dict[str, int]:
         return self.ngram_corpus.list_external_corpora()
@@ -652,9 +566,6 @@ class NGRAMWorker(BaseSpecWorker):
 
             if on_publish is not None:
                 on_publish(new_seq_lens)
-
-        # Inserted after the forward launch so it overlaps the GPU step.
-        self._feed_corpus_trie()
 
         # Construct the next draft input
         next_draft_input = NgramVerifyInput(
