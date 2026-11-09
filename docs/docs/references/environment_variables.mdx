@@ -1908,7 +1908,7 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>auto</code></td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_OPT_HIP_K3_KDA_FUSED_VERIFY</code></td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_OPT_HIP_K3_KDA_FLYDSL_VERIFY</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Run Kimi-K3 KDA target verify on ROCm as one AITER FlyDSL kernel (<code>flydsl_kda_verify_with_f_b</code>: <code>f_b</code>, convolution, gate, recurrence, gated RMSNorm). Arms only after the <code>SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND=aiter</code> fused decode arms, and only when the installed AITER ships the verify kernel for the pool's state dtype and draft token count. Covers the dense chain verify at the configured draft token count only: tree speculative decoding (<code>--speculative-eagle-topk</code> above 1) does not arm it, and ragged layouts, tree verify, a request-indexed ReplaySSM ring, or another draft token count keep the unfused path.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>

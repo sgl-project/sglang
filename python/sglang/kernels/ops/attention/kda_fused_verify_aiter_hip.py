@@ -47,7 +47,7 @@ def available(
     *, device: torch.device, state_dtype: torch.dtype, num_draft_tokens: int
 ) -> bool:
     """Whether the kernel runs a ``num_draft_tokens`` verify over a ``state_dtype`` pool."""
-    if not is_hip() or not envs.SGLANG_OPT_HIP_K3_KDA_FUSED_VERIFY.get():
+    if not is_hip() or not envs.SGLANG_OPT_HIP_K3_KDA_FLYDSL_VERIFY.get():
         return False
     op = _op()
     if op is None:
