@@ -490,6 +490,10 @@ class QwenImageEditPipelineConfig(QwenImagePipelineConfig):
         default_factory=lambda: (qwen_image_edit_postprocess_text,)
     )
 
+    def supports_sequential_multi_output_inference(self):
+        # The edit stages handle one sample per forward; n > 1 runs the outputs one by one.
+        return True
+
     def _prepare_edit_cond_kwargs(
         self, batch, prompt_embeds, rotary_emb, device, dtype, *, negative=False
     ):
