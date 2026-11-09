@@ -868,6 +868,7 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
     def test_mla_mamba_maps_kv_pages_and_state_slots(self):
         from sglang.srt.mem_cache.hybrid_cache import linker_pool_assembler
         from sglang.srt.mem_cache.memory_pool import (
+            DSATokenToKVPool,
             HybridLinearKVPool,
             MHATokenToKVPool,
             MLATokenToKVPool,
@@ -933,6 +934,24 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         self.assertEqual(mamba.prepare_locations(torch.tensor([3])), [3])
         self.assertEqual(group.sources[PoolName.DRAFT], PoolName.KV)
         self.assertEqual(group.entry_map[PoolName.DRAFT].layer_mapping, {0: (0, 1)})
+        self.assertNotIn(PoolName.INDEXER, group.entry_map)
+
+        mla = kvcache.full_kv_pool
+        dsa = DSATokenToKVPool.__new__(DSATokenToKVPool)
+        dsa.kv_buffer = mla.kv_buffer
+        dsa.index_key_cache = SimpleNamespace(
+            buffer=[
+                torch.zeros((0, 3), dtype=torch.uint8),
+                torch.zeros((4, 3), dtype=torch.uint8),
+            ]
+        )
+        kvcache.full_kv_pool = dsa
+        group = resolve()
+        indexer = group.entry_map[PoolName.INDEXER]
+        self.assertEqual(group.sources[PoolName.INDEXER], PoolName.KV)
+        self.assertEqual(indexer.layer_mapping, {3: 0})
+        self.assertEqual(indexer.prepare_locations(torch.tensor([2, 3])), [1])
+        kvcache.full_kv_pool = mla
 
         with self.assertRaisesRegex(ValueError, "plain MLA"):
             resolve(dcp_size=2)

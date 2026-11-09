@@ -542,6 +542,7 @@ def _build_mamba_device_pool_group(
         _stage_local_layer_mapping,
     )
     from sglang.srt.mem_cache.memory_pool import (
+        DSATokenToKVPool,
         HybridLinearKVPool,
         MLATokenToKVPool,
     )
@@ -550,24 +551,25 @@ def _build_mamba_device_pool_group(
     full_kv_pool = kvcache.full_kv_pool
     if (
         type(kvcache) is not HybridLinearKVPool
-        or type(full_kv_pool) is not MLATokenToKVPool
+        or type(full_kv_pool) not in (MLATokenToKVPool, DSATokenToKVPool)
         or get_parallel().attn_dcp_size > 1
         or params.mtp_draft_device_pools
     ):
         raise ValueError(
             "The direct external linker supports FULL + MAMBA models only with a "
-            "plain MLA pool, without DCP or packed draft KV."
+            "plain MLA or DSA pool, without DCP or packed draft KV."
         )
 
+    full_mapping = _stage_local_layer_mapping(
+        kvcache.full_attention_layer_id_mapping, kvcache.start_layer
+    )
     entries = [
         DevicePoolEntry(
             name=PoolName.KV,
             indices_from_pool=PoolName.KV,
             device_pool=full_kv_pool,
             components=[full_kv_pool.kv_buffer],
-            layer_mapping=_stage_local_layer_mapping(
-                kvcache.full_attention_layer_id_mapping, kvcache.start_layer
-            ),
+            layer_mapping=full_mapping,
             page_size=page_size,
             rows_are_pages=False,
         ),
@@ -575,6 +577,32 @@ def _build_mamba_device_pool_group(
             params.token_to_kv_pool_allocator.state, kvcache.start_layer
         ),
     ]
+    if type(full_kv_pool) is DSATokenToKVPool:
+        # One indexer row per KV page; shared-topk layers keep zero-row
+        # placeholders, so only the owning layers are transferred.
+        buffers = full_kv_pool.index_k_with_scale_buffer
+        active = {
+            layer: i
+            for i, layer in enumerate(
+                layer for layer, buffer in enumerate(buffers) if buffer.numel()
+            )
+        }
+        if active:
+            entries.append(
+                DevicePoolEntry(
+                    name=PoolName.INDEXER,
+                    indices_from_pool=PoolName.KV,
+                    device_pool=full_kv_pool,
+                    components=[[buffers[layer] for layer in active]],
+                    layer_mapping={
+                        layer: active[index]
+                        for layer, index in full_mapping.items()
+                        if index in active
+                    },
+                    page_size=page_size,
+                    rows_are_pages=True,
+                )
+            )
     entries.extend(_sidecar_draft_entries(params, page_size))
     num_layers = max(layer for entry in entries for layer in entry.layer_mapping)
     # Not rank_replicated: the Mamba state is TP-sharded.
