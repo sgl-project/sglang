@@ -32,8 +32,7 @@ from sglang.srt.layers.attention.dsa.dsa_dcp import (
 )
 from sglang.srt.layers.attention.dsa.dsa_dcp_sharded import (
     dcp_gather_request_rows,
-    dcp_global_topk,
-    dcp_select_all_slots,
+    dcp_local_topk,
 )
 from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import (
     BaseIndexerMetadata,
@@ -956,6 +955,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         # Decode/idle.
         if fb.forward_mode.is_decode_or_idle():
+            if dsa_shards_index_k():
+                # the sharded indexer's global top-k handles short rows itself
+                return False
             if get_is_capture_mode():
                 # Graph replay freezes this branch; use the capture variant,
                 # not capture-time sequence lengths.
@@ -1609,7 +1611,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             )
 
         if dcp_size > 1:
-            topk_result = dcp_global_topk(
+            # attention reads local KV slots and their counts
+            topk_result = dcp_local_topk(
                 logits[:q_offset],
                 seqlens_32_2d.view(-1)[:q_offset],
                 seqlens_32.view(-1)[:q_offset],
@@ -1617,6 +1620,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 self.index_topk,
                 page_size,
                 metadata.attn_metadata.topk_v2_plan,
+                metadata.attn_metadata.dcp_topk_length,
             )
         else:
             # NOTE(dark): logits should be cleaned in topk_transform
@@ -2058,24 +2062,14 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         # MLA: use dummy logits with topk kernel's fast path to generate indices
         # When length <= 2048, naive_topk_cuda directly generates [0,1,...,length-1,-1,...]
         seq_lens_expanded = metadata.get_seqlens_expanded()
-        if dsa_shards_index_k() and (
-            forward_batch.forward_mode.is_decode_or_idle()
-            or forward_batch.forward_mode.is_target_verify()
-        ):
-            raw_topk_result = dcp_select_all_slots(
-                seq_lens_expanded,
-                metadata.get_page_table_64(),
-                self.index_topk,
-                get_token_to_kv_pool().page_size,
-            )
-        else:
-            dummy_logits = torch.zeros(
-                seq_lens_expanded.shape[0],
-                self.index_topk,
-                dtype=torch.float32,
-                device=x_meta.device,
-            )
-            raw_topk_result = metadata.topk_transform(dummy_logits, self.index_topk)
+        # TODO(dark): replace the stupid transform with 1 kernel launch here
+        dummy_logits = torch.zeros(
+            seq_lens_expanded.shape[0],
+            self.index_topk,
+            dtype=torch.float32,
+            device=x_meta.device,
+        )
+        raw_topk_result = metadata.topk_transform(dummy_logits, self.index_topk)
         if topk_result is not None:
             # PCG/BCG: fill the valid prefix of the padded static buffer and
             # leave padded rows at the -1 sentinel.

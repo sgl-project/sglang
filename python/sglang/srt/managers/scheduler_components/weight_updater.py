@@ -466,7 +466,7 @@ class SchedulerWeightUpdaterManager:
     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
         scheduler = self.scheduler
         if not self.is_fully_idle(
-            ignore_waiting=scheduler is not None and scheduler._engine_paused
+            ignore_waiting=scheduler is not None and scheduler.pause_state.paused
         ):
             return ReleaseMemoryOccupationReqOutput(
                 success=False,

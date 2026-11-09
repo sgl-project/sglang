@@ -15,7 +15,6 @@ from sglang.srt.managers.scheduler_components.metrics_reporter import (
 )
 from sglang.srt.managers.scheduler_components.pool_stats_observer import PoolStats
 from sglang.srt.managers.scheduler_components.request_list import ListKind
-from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.observability.metrics_collector import (
     SchedulerMetricsCollector,
     SchedulerStats,
@@ -34,7 +33,7 @@ def _transfer_req(fill_len, *, swa_tail_len=None, host_staged=False):
     # a tail-preallocating SWA pool the head [0, fill - tail) already evicted.
     kv = ReqKvInfo(kv_allocated_len=fill_len, kv_committed_len=fill_len)
     if swa_tail_len is not None:
-        kv.set_evicted_seqlen(ComponentType.SWA, fill_len - swa_tail_len)
+        kv.set_evicted_seqlen("swa", fill_len - swa_tail_len)
     return SimpleNamespace(req=FakeReq(kv=kv), host_staged=host_staged)
 
 

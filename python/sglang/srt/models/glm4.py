@@ -120,7 +120,6 @@ class Glm4Attention(nn.Module):
         rope_scaling: Optional[Dict[str, Any]] = None,
         max_position_embeddings: int = 131072,
         quant_config: Optional[QuantizationConfig] = None,
-        dual_chunk_attention_config: Optional[dict[str, Any]] = None,
         partial_rotary_factor: float = 0.5,
         bias: bool = True,
         prefix: str = "",
@@ -176,7 +175,6 @@ class Glm4Attention(nn.Module):
             max_position=max_position_embeddings,
             base=rope_theta,
             rope_scaling=rope_scaling,
-            dual_chunk_attention_config=dual_chunk_attention_config,
             partial_rotary_factor=partial_rotary_factor,
             is_neox_style=False,
         )
@@ -228,9 +226,6 @@ class Glm4DecoderLayer(nn.Module):
         bias = getattr(config, "attention_bias", True)
         max_position_embeddings = getattr(config, "max_position_embeddings", 32768)
         head_dim = getattr(config, "head_dim", None)
-        dual_chunk_attention_config = getattr(
-            config, "dual_chunk_attention_config", None
-        )
         self.self_attn = Glm4Attention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
@@ -241,7 +236,6 @@ class Glm4DecoderLayer(nn.Module):
             rope_scaling=rope_scaling,
             max_position_embeddings=max_position_embeddings,
             quant_config=quant_config,
-            dual_chunk_attention_config=dual_chunk_attention_config,
             partial_rotary_factor=partial_rotary_factor,
             bias=bias,
             prefix=add_prefix("self_attn", prefix),
