@@ -237,7 +237,7 @@ class TestForwardBatchPrefillCompletion(CustomTestCase):
                         capture_hidden_mode=CaptureHiddenMode.NULL,
                         return_hidden_states_before_norm=False,
                     )
-                self.assertEqual(forward.mixed_prefill_count, expected)
+                self.assertEqual(forward.mixed_prefill_reqs, expected)
 
     def test_first_commit_or_zero_token_completion_keeps_gate_open(self):
         runner = self._make_runner()

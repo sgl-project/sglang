@@ -602,7 +602,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For MLU mixed batches: number of leading prefill requests, derived from
     # scheduler identity rather than query lengths. None on other platforms
     # and for non-mixed batches.
-    mixed_prefill_count: Optional[int] = None
+    mixed_prefill_reqs: Optional[int] = None
 
     # For DP attention (MLP sync sizes)
     original_global_num_tokens_cpu: Optional[List[int]] = None
@@ -993,7 +993,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             out_cache_loc=batch.out_cache_loc,
             seq_lens_sum=batch.seq_lens_sum,
             # MLU mixed request boundary derived from scheduler identity
-            mixed_prefill_count=(
+            mixed_prefill_reqs=(
                 len(batch.reqs) - len(batch.decoding_reqs or ())
                 if is_mlu() and batch.forward_mode.is_mixed()
                 else None
