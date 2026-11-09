@@ -19,6 +19,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Mooncake's ERR_ADDRESS_OVERLAPPED: the region is already registered.
+_ERR_ADDRESS_OVERLAPPED = -7
+
 # Module-level shared engine instance, set by init_mooncake_transfer_engine().
 _mooncake_transfer_engine: Optional[MooncakeTransferEngine] = None
 
@@ -163,22 +166,35 @@ class MooncakeTransferEngine:
                 f"Mooncake memory deregistration failed (ret={ret_value})"
             )
 
-    def batch_register(self, ptrs: List[int], lengths: List[int]) -> int:
+    def batch_register(self, ptrs: List[int], lengths: List[int]) -> None:
         """Batch register multiple memory regions."""
+        if not hasattr(self.engine, "batch_register_memory"):
+            raise RuntimeError(
+                "Mooncake's batch register requires a newer version of "
+                "mooncake-transfer-engine. Please upgrade Mooncake."
+            )
+
+        start = min(ptrs)
+        end = max(ptr + length for ptr, length in zip(ptrs, lengths))
+        what = (
+            f"{len(ptrs)} memory regions ({sum(lengths)} bytes in "
+            f"[{start:#x}, {end:#x})) on device {self.ib_device!r}"
+        )
         try:
             ret_value = self.engine.batch_register_memory(ptrs, lengths)
-        except Exception:
-            # Mark batch register as failed
-            ret_value = -1
-            if not hasattr(self.engine, "batch_register_memory"):
-                raise RuntimeError(
-                    "Mooncake's batch register requires a newer version of "
-                    "mooncake-transfer-engine. Please upgrade Mooncake."
-                )
+        except Exception as exc:
+            raise RuntimeError(f"Mooncake failed to register {what}") from exc
 
-        if ret_value != 0:
-            logger.debug("Mooncake batch memory registration failed.")
-        return ret_value
+        if ret_value == _ERR_ADDRESS_OVERLAPPED:
+            # A resume after a failed deregister re-registers live regions; not fatal.
+            logger.error(
+                f"Mooncake reports {what} already registered (ret={ret_value})"
+            )
+        elif ret_value != 0:
+            raise RuntimeError(
+                f"Mooncake failed to register {what} (ret={ret_value}); "
+                "see the Mooncake log above for the cause"
+            )
 
     def batch_deregister(self, ptrs: List[int]) -> int:
         """Batch deregister multiple memory regions."""
