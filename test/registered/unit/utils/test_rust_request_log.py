@@ -295,8 +295,8 @@ _OPENAI_CASES = [
         "headers": {"x-smg-routing-key": "conv'1"},
     },
     {
-        # Level 2 cuts the long prompt list and, in the JSON format, the
-        # long string inside a list.
+        # Level 2 cuts the long prompt list and, in both formats, the long
+        # string inside a list.
         "name": "completion_long_prompt",
         "request": "completion",
         "body": {

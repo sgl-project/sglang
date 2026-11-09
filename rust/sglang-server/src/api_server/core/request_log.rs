@@ -1538,12 +1538,16 @@ fn write_truncated(out: &mut String, value: &Value, max_length: usize, in_waterm
         }
         Value::Array(items) if items.len() > max_length => {
             let (head, tail) = halves(items.len(), max_length);
-            write_list(out, &items[..head], in_watermark);
+            write_list(out, &items[..head], max_length, in_watermark);
             out.push_str(" ... ");
-            write_list(out, &items[tail..], in_watermark);
+            write_list(out, &items[tail..], max_length, in_watermark);
         }
+        Value::Array(items) => write_list(out, items, max_length, in_watermark),
         Value::Object(map) => write_dict(out, map.iter(), max_length, in_watermark),
-        _ => write_repr(out, value, in_watermark),
+        Value::Null => out.push_str("None"),
+        Value::Bool(true) => out.push_str("True"),
+        Value::Bool(false) => out.push_str("False"),
+        Value::Number(n) => write_number(out, n),
     }
 }
 
@@ -1575,52 +1579,32 @@ fn write_dict<'a>(
     out.push('}');
 }
 
-fn write_list(out: &mut String, items: &[Value], in_watermark: bool) {
+/// `_sequence_to_string_truncated`: each item as [`write_truncated`] prints it,
+/// so a long string or list inside a list is cut as well. Python prints a list
+/// of only numbers, bools and `None` with `str(list)`, which is the same text.
+fn write_list(out: &mut String, items: &[Value], max_length: usize, in_watermark: bool) {
     out.push('[');
     for (i, item) in items.iter().enumerate() {
         if i > 0 {
             out.push_str(", ");
         }
-        write_repr(out, item, in_watermark);
+        write_truncated(out, item, max_length, in_watermark);
     }
     out.push(']');
 }
 
-/// Python `repr` of the object `json.loads` makes of `value`, watermark
-/// secrets redacted as [`write_field`] does.
-fn write_repr(out: &mut String, value: &Value, in_watermark: bool) {
-    match value {
-        Value::Null => out.push_str("None"),
-        Value::Bool(true) => out.push_str("True"),
-        Value::Bool(false) => out.push_str("False"),
-        Value::Number(n) => match (n.as_i64(), n.as_u64(), n.as_f64()) {
-            (Some(i), _, _) => {
-                let _ = write!(out, "{i}");
-            }
-            (None, Some(u), _) => {
-                let _ = write!(out, "{u}");
-            }
-            (None, None, Some(f)) => write_float(out, f),
-            (None, None, None) => unreachable!("a JSON number is an integer or a float"),
-        },
-        Value::String(s) => write_str_repr(out, s),
-        Value::Array(items) => write_list(out, items, in_watermark),
-        Value::Object(map) => {
-            out.push('{');
-            for (i, (name, value)) in map.iter().enumerate() {
-                if i > 0 {
-                    out.push_str(", ");
-                }
-                write_str_repr(out, name);
-                out.push_str(": ");
-                if is_watermark_secret(name, in_watermark) {
-                    out.push_str("'<redacted>'");
-                } else {
-                    write_repr(out, value, in_watermark || name == "watermark");
-                }
-            }
-            out.push('}');
+/// Python `repr` of the `int` or `float` `json.loads` makes of `n`, except
+/// that serde_json reads `-0` and integers outside `i64`/`u64` as floats.
+fn write_number(out: &mut String, n: &serde_json::Number) {
+    match (n.as_i64(), n.as_u64(), n.as_f64()) {
+        (Some(i), _, _) => {
+            let _ = write!(out, "{i}");
         }
+        (None, Some(u), _) => {
+            let _ = write!(out, "{u}");
+        }
+        (None, None, Some(f)) => write_float(out, f),
+        (None, None, None) => unreachable!("a JSON number is an integer or a float"),
     }
 }
 
