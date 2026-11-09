@@ -19,7 +19,7 @@ register_mlu_ci(est_time=60, suite="pr-test-1-mlu")
 
 
 class TestAttentionMLU(CustomTestCase):
-    def _fixture(self, mode, qlens, mixed_prefill_count=None):
+    def _fixture(self, mode, qlens, mixed_prefill_reqs=None):
         torch.manual_seed(42)
         pool = MLUMHATokenToKVPool(
             size=256,
@@ -78,7 +78,7 @@ class TestAttentionMLU(CustomTestCase):
             extend_seq_lens=torch.tensor(qlens, device="mlu"),
             extend_seq_lens_cpu=qlens,
             extend_prefix_lens_cpu=[n - m for n, m in zip(lens, qlens)],
-            mixed_prefill_count=mixed_prefill_count,
+            mixed_prefill_reqs=mixed_prefill_reqs,
             forward_mode=mode,
             out_cache_loc=loc,
         )
@@ -100,8 +100,8 @@ class TestAttentionMLU(CustomTestCase):
             fn=fn,
         )
 
-    def _check(self, mode, qlens, mixed_prefill_count, window=-1):
-        f = self._fixture(mode, qlens, mixed_prefill_count)
+    def _check(self, mode, qlens, mixed_prefill_reqs, window=-1):
+        f = self._fixture(mode, qlens, mixed_prefill_reqs)
         f.layer.sliding_window_size = window
         with (
             patch.object(
@@ -118,10 +118,10 @@ class TestAttentionMLU(CustomTestCase):
             )
         if mode.is_mixed():
             # Request identity, not query length, selects the prefill path.
-            self.assertEqual(prefill.called, mixed_prefill_count > 0)
-            self.assertEqual(decode.called, mixed_prefill_count < f.fb.batch_size)
-            if 0 < mixed_prefill_count < f.fb.batch_size:
-                split = sum(qlens[:mixed_prefill_count])
+            self.assertEqual(prefill.called, mixed_prefill_reqs > 0)
+            self.assertEqual(decode.called, mixed_prefill_reqs < f.fb.batch_size)
+            if 0 < mixed_prefill_reqs < f.fb.batch_size:
+                split = sum(qlens[:mixed_prefill_reqs])
                 self.assertEqual(
                     prefill.call_args.kwargs["out"].data_ptr(), actual.data_ptr()
                 )
@@ -129,7 +129,7 @@ class TestAttentionMLU(CustomTestCase):
                     decode.call_args.kwargs["out"].data_ptr(), actual[split:].data_ptr()
                 )
         if prefill.called:
-            count = mixed_prefill_count if mode.is_mixed() else f.fb.batch_size
+            count = mixed_prefill_reqs if mode.is_mixed() else f.fb.batch_size
             if not any(f.fb.extend_prefix_lens_cpu[:count]):
                 self.assertIsNone(prefill.call_args.kwargs["block_tables"])
                 self.assertEqual(
@@ -188,10 +188,10 @@ class TestAttentionMLU(CustomTestCase):
         f = self._fixture(ForwardMode.MIXED, [2, 1], 1)
         for count in (None, -1, 3):
             with self.subTest(count=count):
-                f.fb.mixed_prefill_count = count
-                with self.assertRaisesRegex(ValueError, "mixed_prefill_count"):
+                f.fb.mixed_prefill_reqs = count
+                with self.assertRaisesRegex(ValueError, "mixed_prefill_reqs"):
                     f.backend.init_forward_metadata(f.fb)
-        f.fb.mixed_prefill_count = 1
+        f.fb.mixed_prefill_reqs = 1
         f.fb.extend_seq_lens_cpu = [2, 2]
         with self.assertRaisesRegex(NotImplementedError, "one query token per decode"):
             f.backend.init_forward_metadata(f.fb)

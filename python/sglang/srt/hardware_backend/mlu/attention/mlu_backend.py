@@ -50,7 +50,7 @@ class ForwardMetadata:
     # Whether the prefill requests can read the current K/V directly.
     is_uncached_prefill: bool = False
 
-    mixed_prefill_count: int = -1
+    mixed_prefill_reqs: int = -1
     mixed_prefill_tokens: int = 0
 
 
@@ -82,10 +82,10 @@ class MLUAttnBackend(AttentionBackend):
         elif fb.forward_mode == ForwardMode.EXTEND or fb.forward_mode.is_mixed():
             prefill_count = fb.batch_size
             if fb.forward_mode.is_mixed():
-                prefill_count = fb.mixed_prefill_count
+                prefill_count = fb.mixed_prefill_reqs
                 if prefill_count is None or not 0 <= prefill_count <= fb.batch_size:
                     raise ValueError(
-                        "MLU mixed attention requires a valid mixed_prefill_count."
+                        "MLU mixed attention requires a valid mixed_prefill_reqs."
                     )
                 if any(n != 1 for n in fb.extend_seq_lens_cpu[prefill_count:]):
                     raise NotImplementedError(
@@ -110,7 +110,7 @@ class MLUAttnBackend(AttentionBackend):
                 is_uncached_prefill=not any(fb.extend_prefix_lens_cpu[:prefill_count]),
             )
             if fb.forward_mode.is_mixed():
-                meta.mixed_prefill_count = prefill_count
+                meta.mixed_prefill_reqs = prefill_count
                 meta.mixed_prefill_tokens = sum(query_lens)
         else:
             raise NotImplementedError(
@@ -150,9 +150,9 @@ class MLUAttnBackend(AttentionBackend):
                 k.view(-1, layer.tp_k_head_num, layer.qk_head_dim),
                 v.view(-1, layer.tp_v_head_num, layer.v_head_dim),
             )
-        if meta.mixed_prefill_count == 0:
+        if meta.mixed_prefill_reqs == 0:
             return self._forward_decode(q, layer, meta)
-        if 0 < meta.mixed_prefill_count < forward_batch.batch_size:
+        if 0 < meta.mixed_prefill_reqs < forward_batch.batch_size:
             out = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
             split = meta.mixed_prefill_tokens
             self._forward_prefill(
@@ -167,7 +167,7 @@ class MLUAttnBackend(AttentionBackend):
                 q[split:],
                 layer,
                 meta,
-                meta.mixed_prefill_count,
+                meta.mixed_prefill_reqs,
                 out=out[split:],
             )
             return out
@@ -181,7 +181,7 @@ class MLUAttnBackend(AttentionBackend):
         else:
             k = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
             v = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
-            count = meta.mixed_prefill_count
+            count = meta.mixed_prefill_reqs
             block_tables = (
                 meta.block_tables[:count] if count >= 0 else meta.block_tables
             )
