@@ -35,6 +35,11 @@ def _override_cfg(**kw):
     return SimpleNamespace(**base)
 
 
+def _platform(*, is_hip: bool, is_npu: bool = False) -> SimpleNamespace:
+    """The platform fields _dsa_dcp_overrides reads, so a new one fails loudly."""
+    return SimpleNamespace(is_hip=is_hip, is_npu=is_npu)
+
+
 def _server_args(speculative_algorithm="EAGLE", hf_config=_DSA, **kw):
     base = dict(
         dcp_size=4,
@@ -53,16 +58,16 @@ def _server_args(speculative_algorithm="EAGLE", hf_config=_DSA, **kw):
 
 class TestDsaDcpHiCacheOverride(CustomTestCase):
     def test_non_hip_rejects_hicache(self):
-        with patch(_OVERRIDE_PLATFORM, return_value=SimpleNamespace(is_hip=False)):
+        with patch(_OVERRIDE_PLATFORM, return_value=_platform(is_hip=False)):
             with self.assertRaisesRegex(ValueError, "HiCache only on ROCm"):
                 _dsa_dcp_overrides(_override_cfg())
 
     def test_hip_accepts_hicache(self):
-        with patch(_OVERRIDE_PLATFORM, return_value=SimpleNamespace(is_hip=True)):
+        with patch(_OVERRIDE_PLATFORM, return_value=_platform(is_hip=True)):
             _dsa_dcp_overrides(_override_cfg())
 
     def test_hisparse_is_still_rejected_on_hip(self):
-        with patch(_OVERRIDE_PLATFORM, return_value=SimpleNamespace(is_hip=True)):
+        with patch(_OVERRIDE_PLATFORM, return_value=_platform(is_hip=True)):
             with self.assertRaisesRegex(ValueError, "HiSparse"):
                 _dsa_dcp_overrides(_override_cfg(enable_hisparse=True))
 
