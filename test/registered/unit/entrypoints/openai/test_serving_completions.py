@@ -95,6 +95,18 @@ class ServingCompletionTestCase(unittest.TestCase):
         internal, _ = self.sc._convert_to_internal_request(req)
         self.assertEqual(internal.input_ids, [1, 2, 3, 4])
 
+    def test_validate_request_bounds_n(self):
+        """n outside [1, --max-parallel-sample-num] must be a 400 before the
+        request fans out into one scheduler request per sample."""
+        for n, ok in ((0, False), (1025, False), (56_442_861, False), (1024, True)):
+            with self.subTest(n=n):
+                req = CompletionRequest(model="x", prompt="Hi", n=n)
+                error = self.sc._validate_request(req)
+                if ok:
+                    self.assertIsNone(error)
+                else:
+                    self.assertRegex(error, r"n must be an integer in \[1, 1024\]")
+
     def test_cache_salt_and_extra_key_remain_distinct(self):
         req = CompletionRequest(
             model="x",

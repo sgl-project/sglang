@@ -961,6 +961,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     ):
         self.auto_create_handle_loop()
 
+        if isinstance(obj, GenerateReqInput):
+            obj.validate_parallel_sample_num(get_serving().max_parallel_sample_num)
         # Normalize the request
         obj.normalize_batch_and_arguments()
         self._set_default_priority(obj)

@@ -531,6 +531,19 @@ class GenerateReqInput:
             return 1
         return self.parallel_sample_num
 
+    def validate_parallel_sample_num(self, max_n: int) -> None:
+        """Reject an oversized `n` before normalization fans it out per sample."""
+        params = (
+            [self.sampling_params]
+            if isinstance(self.sampling_params, dict)
+            else self.sampling_params or []
+        )
+        for sampling_params in params:
+            if isinstance(sampling_params, dict):
+                error = parallel_sample_num_error(sampling_params.get("n"), max_n)
+                if error is not None:
+                    raise ValueError(error)
+
     def _handle_parallel_sampling(self):
         """Handle parallel sampling parameters and adjust batch size if needed."""
         # Determine parallel sample count
@@ -1649,6 +1662,18 @@ class RequestOutputStats(
     video_tokens: int
     # None when metrics are off, for embedding, or when the request's own are off.
     time_stats: Optional[SchedulerOutputTimeStats]
+
+
+def parallel_sample_num_error(n: Any, max_n: int) -> Optional[str]:
+    """The error for a request asking for `n` parallel samples, or None."""
+    if n is None:
+        return None
+    if isinstance(n, bool) or not isinstance(n, int) or not 1 <= n <= max_n:
+        return (
+            f"n must be an integer in [1, {max_n}], got {n!r}. "
+            "Raise the limit with --max-parallel-sample-num."
+        )
+    return None
 
 
 def flat_top_logprobs_layout(
