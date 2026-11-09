@@ -33,6 +33,10 @@ def _mixed_precision_moe_quant_algos(hf_config: Any) -> set:
     "Qwen3_5MoeForConditionalGeneration",
     "InternS2PreviewForConditionalGeneration",
     "Qwen3_5ForConditionalGeneration",
+    # Text-only entries of the same stack (models/qwen3_5_text.py);
+    # Qwen3.8-2.4T-A95B ships as Qwen3_5MoeForCausalLM.
+    "Qwen3_5MoeForCausalLM",
+    "Qwen3_5ForCausalLM",
     "Qwen4ExpForConditionalGeneration",
 )
 def _qwen3_moe_family_overrides(server_args: Any, hf_config: Any) -> dict:
