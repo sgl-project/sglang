@@ -329,6 +329,9 @@ def test_strided_bias_falls_back(config: str) -> None:
     bias = full[::2]
     assert not route_warp_module.bias_layout_ok(bias)
     assert not route_warp_module.bias_layout_ok(full[1 : num_experts + 1])
+    cpu_bias = torch.zeros(num_experts, dtype=bias.dtype)
+    assert cpu_bias.is_contiguous() and cpu_bias.data_ptr() % 16 == 0
+    assert not route_warp_module.bias_layout_ok(cpu_bias)
     kwargs = _kwargs(config)
     w, i = moe_fused_gate(scores, bias, **kwargs)
     _assert_matches(w, i, _reference(scores, bias, **kwargs), kwargs["topk"])
