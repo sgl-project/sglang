@@ -4,6 +4,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
+import fnmatch
 import importlib
 import os
 import sys
@@ -268,6 +269,82 @@ class TestParseNvfp4Excludes(CustomTestCase):
         self.assertFalse(
             check_equal_or_regex_match("model.layers.0.mlp.experts", excludes)
         )
+
+
+class TestLayerQuantConfigGlobMatching(CustomTestCase):
+    """`_find_matched_config` must pick the entry `fnmatch.fnmatch` picks."""
+
+    _GLOBAL = {"global": True}
+
+    def _config_with(self, patterns):
+        quark_config = _bare_config()
+        quark_config.quant_config = {
+            # one distinct dict per pattern, so identity names the matched entry
+            "layer_quant_config": {
+                pattern: {"pattern": pattern} for pattern in patterns
+            },
+            "layer_type_quant_config": {},
+            "global_quant_config": self._GLOBAL,
+        }
+        quark_config.packed_modules_mapping = {}
+        return quark_config
+
+    @staticmethod
+    def _fnmatch_reference(quark_config, layer_name):
+        layer_quant_config = quark_config.quant_config["layer_quant_config"]
+        for pattern, cfg in layer_quant_config.items():
+            if fnmatch.fnmatch(layer_name, pattern):
+                return cfg
+        return quark_config.quant_config["global_quant_config"]
+
+    def test_first_match_agrees_with_fnmatch(self):
+        quark_config = self._config_with(
+            [
+                "*.layers.[0-2].self_attn.*",
+                "*.layers.?.mlp.gate",
+                # a glob ahead of an exact key that it also matches wins
+                "*.layers.4.mlp.*",
+                "model.layers.4.mlp.down_proj",
+                "model.layers.5.mlp.down_proj",
+                "*.layers.[!0-9]*",
+                "lm_head",
+            ]
+        )
+        layer_names = [
+            "model.layers.1.self_attn.q_proj",
+            "model.layers.3.self_attn.q_proj",
+            "model.layers.7.mlp.gate",
+            "model.layers.17.mlp.gate",
+            "model.layers.4.mlp.down_proj",
+            "model.layers.5.mlp.down_proj",
+            "model.layers.x.mlp",
+            "lm_head",
+            "model.lm_head",
+        ]
+        for layer_name in layer_names:
+            with self.subTest(layer_name=layer_name):
+                self.assertIs(
+                    quark_config._find_matched_config(layer_name, torch.nn.Module()),
+                    self._fnmatch_reference(quark_config, layer_name),
+                )
+
+    def test_walk_over_many_patterns_compiles_each_once(self):
+        # more entries than fnmatch's 256-pattern cache on Python 3.10
+        num_patterns = 600
+        quark_config = self._config_with(
+            [f"model.layers.{i}.mlp.experts" for i in range(num_patterns)]
+        )
+        matcher = quark_config_mod._glob_matcher
+        matcher.cache_clear()
+        layer_name = "model.layers.0.self_attn.o_proj"  # matches no entry
+        for _ in range(2):
+            self.assertIs(
+                quark_config._find_matched_config(layer_name, torch.nn.Module()),
+                self._GLOBAL,
+            )
+        info = matcher.cache_info()
+        self.assertEqual(info.misses, num_patterns)
+        self.assertEqual(info.hits, num_patterns)
 
 
 class TestQuarkPerLayerBlockFp8(CustomTestCase):
