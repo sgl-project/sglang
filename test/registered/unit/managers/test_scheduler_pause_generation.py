@@ -23,6 +23,7 @@ from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.dllm.mixin.req import DllmReqPhase
 from sglang.srt.dllm.mixin.scheduler import DllmManager
 from sglang.srt.managers.cache_controller import HiCacheAck
+from sglang.srt.managers.hisparse_coordinator import HiSparseAct, HiSparseCoordinator
 from sglang.srt.managers.io_struct import (
     AbortReq,
     ContinueGenerationReqInput,
@@ -55,7 +56,6 @@ from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.test.scheduler_test_utils import staging_hisparse_coordinator
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 register_cpu_ci(est_time=8, suite="stage-b-test-cpu-intel")
@@ -520,10 +520,26 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         # copy; `newer` is the last prefill batch, staged too.
         older = self._make_req("older")
         newer = self._make_req("newer")
+        coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
+        coordinator.ack_staging_queue = IndexedReqList(
+            ListKind.HISPARSE_STAGING, req_of=lambda act: act.req
+        )
+        coordinator.write_staging_stream = MagicMock()
+        coordinator.req_to_token_pool = SimpleNamespace(
+            req_to_token=torch.zeros((2, 8), dtype=torch.int64)
+        )
+        coordinator.token_to_kv_pool_allocator = MagicMock()
+        coordinator.mem_pool_host = MagicMock()
+        coordinator.mem_pool_host.allocated_host_indices.return_value = torch.empty(0)
+        coordinator.req_to_host_pool = torch.full((2, 8), -1, dtype=torch.int64)
+        coordinator.req_to_host_pool_allocated_len = torch.zeros(2, dtype=torch.int64)
+        coordinator._skip_first_backup = {}
+        coordinator.spec_swap = MagicMock()
         for slot, req in enumerate((older, newer)):
             req.kv.req_pool_idx = slot
             req.extend_end = 3
-        coordinator = staging_hisparse_coordinator(2, [older, newer])
+            req.hisparse_staging = True
+            coordinator.ack_staging_queue.join([HiSparseAct(None, MagicMock(), req)])
         scheduler.hisparse_coordinator = coordinator
         scheduler.init_request_retirer()
         scheduler.running_batch = ScheduleBatch(reqs=[], batch_is_full=True)
@@ -1046,65 +1062,40 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         self.assertEqual([mb.reqs for mb in scheduler.running_mbs], [[], []])
         self.assertEqual(len(scheduler.running_reqs), 0)
 
-    def test_dllm_retract_moves_requests_out_of_the_dllm_lists(self):
+    def test_pp_retract_takes_a_request_in_two_sources_once(self):
         scheduler = self._new_scheduler()
-        dllm_config = DllmConfig(
-            algorithm="LowConfidence",
-            algorithm_config={},
-            block_size=4,
-            mask_id=99,
-            max_running_requests=4,
-        )
-        scheduler.dllm_config = dllm_config
-        scheduler.dllm_manager = DllmManager(dllm_config=dllm_config, abort=MagicMock())
-        scheduler.grammar_manager = SimpleNamespace(
-            grammar_queue=IndexedReqList(ListKind.GRAMMAR)
-        )
-        scheduler.deferred_responses = None
-        scheduler._add_request_to_queue = lambda req: scheduler.waiting_queue.join(
-            [req]
-        )
-        # Mid-decode after one round: in both dLLM lists with an unresolved FDFO
-        # block; last_batch is that round's DLLM_EXTEND batch, never merged.
-        reqs = []
-        for slot, rid in enumerate(("a", "b")):
-            req = Req(
-                rid=rid,
-                origin_input_text="",
-                origin_input_ids=array("q", [1, 2, 3, 4, 5]),
-                sampling_params=SamplingParams(),
-                dllm_config=dllm_config,
-            )
-            req.kv.req_pool_idx = slot
-            req.dllm_initialized = True
-            req.dllm_phase = DllmReqPhase.STAGING_DECODE
-            req.dllm_incomplete_ids = array("q", [7, 99, 99, 99])
-            req.dllm_algo_state = object()
-            reqs.append(req)
-        scheduler.dllm_manager.waiting_queue.join(reqs)
-        scheduler.dllm_manager.add_staging_reqs(reqs)
-        scheduler.running_batch = self._make_batch(scheduler, [])
-        scheduler.last_batch = self._make_batch(
-            scheduler, list(reqs), forward_mode=ForwardMode.DLLM_EXTEND
-        )
+        running = self._make_req("running")
+        chunked = self._make_req("chunked")
+        chunked.kv.req_pool_idx = 0
+        # The chunked request's last chunk ran in the second micro-batch.
+        scheduler.chunked_req = chunked
+        scheduler.pp_loop_size = 2
+        scheduler.running_mbs = [
+            self._make_batch(
+                scheduler, [running], forward_mode=ForwardMode.DECODE, with_tensors=True
+            ),
+            ScheduleBatch(reqs=[]),
+        ]
+        scheduler.last_mbs = [
+            None,
+            self._make_batch(
+                scheduler, [chunked], forward_mode=ForwardMode.EXTEND, with_tensors=True
+            ),
+        ]
+        scheduler.running_reqs.join([running])
+        requeue_log = self._spy_requeue(scheduler)
 
         with patch(
             "sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache",
             side_effect=lambda req, *_, **__: setattr(req.kv, "req_pool_idx", None),
         ):
-            scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
+            scheduler._pp_retract_microbatches()
 
-        lists = scheduler.request_lists()
-        for req in reqs:
-            owners = [kind for kind, lst in lists.items() if req in lst]
-            self.assertEqual(owners, [ListKind.WAITING])
-            self.assertEqual(req.dllm_phase, DllmReqPhase.INCOMING_PREFILL)
-            self.assertFalse(req.dllm_initialized)
-            self.assertEqual(len(req.dllm_incomplete_ids), 0)
-            self.assertIsNone(req.dllm_algo_state)
-        self.assertEqual(scheduler.dllm_manager.staging_queue, [])
+        self.assertEqual([entry["req"] for entry in requeue_log], [running, chunked])
+        self.assertEqual(chunked.retraction_count, 1)
+        self.assertIsNone(scheduler.chunked_req)
 
-    def test_dllm_retract_takes_requests_left_out_of_the_last_round(self):
+    def test_dllm_retract_takes_every_row_holder_and_restarts_it(self):
         scheduler = self._new_scheduler()
         dllm_config = DllmConfig(
             algorithm="LowConfidence",
@@ -1128,9 +1119,12 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         # A prompt shorter than a block, with output past it.
         decoding.origin_input_ids = array("q", [1, 2])
         decoding.output_ids = array("q", [3, 4, 5])
+        # Left out of the last round, mid-decode with an unresolved FDFO block.
         decoding.kv.req_pool_idx = 0
         decoding.dllm_initialized = True
         decoding.dllm_phase = DllmReqPhase.STAGING_DECODE
+        decoding.dllm_incomplete_ids = array("q", [7, 99, 99, 99])
+        decoding.dllm_algo_state = object()
         prefilling.kv.req_pool_idx = 1
         prefilling.dllm_phase = DllmReqPhase.STAGING_PREFILL
         # Finished and released by the last round's result.
@@ -1157,6 +1151,9 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         self.assertFalse(scheduler.dllm_manager.any_staging_reqs())
         self.assertFalse(decoding.kv.holds_kv)
         self.assertEqual(decoding.dllm_phase, DllmReqPhase.INCOMING_PREFILL)
+        self.assertFalse(decoding.dllm_initialized)
+        self.assertEqual(len(decoding.dllm_incomplete_ids), 0)
+        self.assertIsNone(decoding.dllm_algo_state)
 
 
 if __name__ == "__main__":

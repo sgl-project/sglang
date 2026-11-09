@@ -1507,7 +1507,6 @@ class Req(ReqDllmMixin):
         self.lock = None
         self.swa_branching_seqlen = None
         self.extend_end = None
-        self.reset_dllm_progress()
         self.is_retracted = True
         self.retracted_stain = True
         self.input_token_logprobs = None
@@ -1532,6 +1531,8 @@ class Req(ReqDllmMixin):
             self.weight_version_events = truncate_weight_version_events(
                 self.weight_version_events, num_kept_tokens=self.send_token_offset
             )
+        # Reads output_ids, which input_embeds discards above.
+        self.reset_dllm_progress()
 
     def _mamba_pool_needing_backup(self, req_to_token_pool, allocator):
         if allocator.cpu_copy_carries_mamba:
