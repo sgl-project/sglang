@@ -103,9 +103,7 @@ class TestGDNMISMetadata(CustomTestCase):
             conv = torch.full((5, 12, 3), 5.0)
             ssm = torch.full((5, 2, 4, 4), 5.0)
             expected_output = torch.zeros(1, 23, 2, 4)
-            expected_output[
-                :, [0, 1, 2, 4, 6, 7, 8, 9, 10, 12, 14, 15, 16, 17, 18]
-            ] = 7
+            expected_output[:, [0, 1, 2, 4, 6, 7, 8, 9, 10, 12, 14, 15, 16, 17, 18]] = 7
             with (
                 patch.object(backend, "_forward_mis_segments", side_effect=segments),
                 patch.object(
