@@ -25,6 +25,7 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 class TestModelSlimMapping(CustomTestCase):
     def make_linear(self, config, prefix):
+        """Build a small CPU layer: input width 4, output width 6."""
         with torch.device("cpu"):
             return ReplicatedLinear(
                 4,
@@ -36,7 +37,7 @@ class TestModelSlimMapping(CustomTestCase):
             )
 
     def test_qwen_qkvz_uses_model_mapping_and_creates_int8_weights(self):
-        # Qwen3.5-family GDN stores qkv and z separately, unlike ordinary Q/K/V.
+        """Use qkv + z descriptions to create an INT8 qkvz weight."""
         parent = "model.layers.0.linear_attn."
         mapping = {"in_proj_qkvz": ["in_proj_qkv", "in_proj_z"]}
         config = ModelSlimConfig(
@@ -53,6 +54,7 @@ class TestModelSlimMapping(CustomTestCase):
         )
 
     def test_qkv_and_gate_up_defaults_work_for_target_and_draft(self):
+        """Under model/mtp/decoder/stages, QKV and gate/up use INT8 or BF16."""
         for parent in (
             "model.layers.0.",
             "mtp.layers.0.",
@@ -76,6 +78,7 @@ class TestModelSlimMapping(CustomTestCase):
                         self.assertEqual(config.packed_modules_mapping, {})
 
     def test_model_rules_override_defaults_and_accept_kimi_group(self):
+        """Use flat or Kimi 'model' rules first; [] disables a fusion rule."""
         for mapping in ({"qkv_proj": ["packed"]}, {"model": {"qkv_proj": ["packed"]}}):
             with self.subTest(mapping=mapping):
                 config = ModelSlimConfig({"model.attn.packed.weight": "W8A8"})
@@ -94,11 +97,13 @@ class TestModelSlimMapping(CustomTestCase):
             config._resolve_linear_quant_prefixes("model.attn.qkv_proj"),
             ["model.attn.qkv_proj"],
         )
+        # Other nested groups, e.g. 'visual', must raise instead of being ignored.
         config.update_packed_modules_mapping({"visual": {"qkv_proj": ["qkv"]}})
         with self.assertRaisesRegex(ValueError, "supports flat packed mappings"):
             config._resolve_linear_quant_prefixes("visual.attn.qkv_proj")
 
     def test_mla_fallback_does_not_change_model_table(self):
+        """Fuse q_a_proj + kv_a_proj_with_mqa without editing the model's table."""
         parent = "model.layers.0.self_attn."
         parts = ("q_a_proj", "kv_a_proj_with_mqa")
         shared = {}
@@ -113,6 +118,7 @@ class TestModelSlimMapping(CustomTestCase):
         self.assertEqual(shared, {})
 
     def test_legacy_vision_names_do_not_change_text_scheme(self):
+        """Resolve vision names, e.g. qkv_proj -> qkv, while text stays BF16."""
         cases = (
             ("model.visual.blocks.0.attn.qkv_proj", "model.visual.blocks.0.attn.qkv"),
             (
@@ -142,6 +148,10 @@ class TestModelSlimMapping(CustomTestCase):
                 )
 
     def test_vision_alias_requires_path_boundaries_and_existing_description(self):
+        """Match whole path parts: visual must not match visualizer.
+
+        Also reject self_attn.proj, attn.projection, and missing descriptions.
+        """
         for runtime, checkpoint in (
             ("model.attn.qkv_proj", "model.attn.qkv"),
             ("visualizer.attn.qkv_proj", "visualizer.attn.qkv"),
@@ -160,6 +170,10 @@ class TestModelSlimMapping(CustomTestCase):
         )
 
     def test_mapper_preserves_auxiliary_entries_and_is_repeatable(self):
+        """Rename qkv.weight, qkv.weight_scale and qkv.weight_offset together.
+
+        Keep global settings; repeating the mapper must change nothing.
+        """
         fields = {
             "weight": "W8A8_DYNAMIC",
             "weight_scale": "FLOAT",
@@ -198,6 +212,7 @@ class TestModelSlimMapping(CustomTestCase):
         self.assertTrue(hasattr(layer, "weight_scale"))
 
     def test_full_key_suffix_precedes_layer_suffix_and_none_adds_no_alias(self):
+        """Try .qkv.weight before .qkv; None adds no alias and keeps the original."""
         for full_suffix, expected in (
             (".packed_weight", {"mapped.attn.packed_weight": "W8A8"}),
             (None, {}),
@@ -217,6 +232,7 @@ class TestModelSlimMapping(CustomTestCase):
                 self.assertEqual(config.quant_description, {**original, **expected})
 
     def test_mapper_conflict_leaves_description_unchanged(self):
+        """If qkv -> qkv_proj would mix W8A8 and FLOAT, raise and keep the config."""
         config = ModelSlimConfig(
             {"attn.qkv.weight": "W8A8", "attn.qkv_proj.weight": "FLOAT"}
         )
@@ -228,6 +244,10 @@ class TestModelSlimMapping(CustomTestCase):
         self.assertEqual(config.quant_description, before)
 
     def test_vision_copy_does_not_change_language_config(self):
+        """Renaming a vision copy twice adds only qkv_proj, not qkv_proj_proj.
+
+        The text config must stay unchanged.
+        """
         config = ModelSlimConfig({"model.visual.attn.qkv.weight": "W8A8"})
         before = deepcopy(config.quant_description)
         vision = copy(config)
@@ -248,6 +268,7 @@ class TestModelSlimMapping(CustomTestCase):
         self.assertEqual(config.quant_description, before)
 
     def test_update_replaces_nested_group_without_mutating_inputs(self):
+        """Replace the 'model' group; adding 'v' must not change either input table."""
         original = {
             "packed_modules_mapping": {"flat": ["keep"], "model": {"old": ["a"]}},
             "model.block_sparse_moe.experts.0.gate_proj.weight": "FLOAT",
@@ -264,6 +285,7 @@ class TestModelSlimMapping(CustomTestCase):
         self.assertEqual(incoming, before_incoming)
 
     def test_incomplete_mixed_and_ambiguous_layouts_raise(self):
+        """Require all q/k/v parts with one scheme; reject whole + split layouts."""
         parts = {
             "visual.attn." + part + ".weight": "W8A8"
             for part in ("q_proj", "k_proj", "v_proj")
@@ -285,6 +307,7 @@ class TestModelSlimMapping(CustomTestCase):
                 self.make_linear(ModelSlimConfig(entries), "visual.attn.qkv_proj")
 
     def test_zero_width_components_are_optional_only_with_matching_sizes(self):
+        """Allow missing V for sizes [8, 4, 0], but not for a shorter size list."""
         parent = "model.layers.0.self_attn."
         config = ModelSlimConfig(
             {
@@ -305,6 +328,7 @@ class TestModelSlimMapping(CustomTestCase):
             )
 
     def test_float_missing_and_unsupported_descriptions_are_distinct(self):
+        """FLOAT stays BF16; missing names warn; unsupported W16A16S raises."""
         config = ModelSlimConfig(
             {"model.float.weight": "FLOAT", "model.unsupported.weight": "W16A16S"}
         )
@@ -325,6 +349,7 @@ class TestModelSlimMapping(CustomTestCase):
             self.make_linear(config, "model.unsupported")
 
     def test_loader_keeps_model_mapping_clean_and_applies_draft_mapper(self):
+        """Map layers.45 -> decoder in the real loader; leave model rules alone."""
         from sglang.srt.model_loader import loader
 
         mapping = {"in_proj_qkvz": ["in_proj_qkv", "in_proj_z"]}
@@ -336,7 +361,7 @@ class TestModelSlimMapping(CustomTestCase):
             ),
         )
 
-        # Replace config-file I/O; run the actual loader-to-ModelSlim handoff.
+        # Supply a small config instead of reading a file; keep the real loader.
         def read_config(model_config, load_config, packed, remap):
             return ModelSlimConfig(
                 {
@@ -383,6 +408,7 @@ class TestModelSlimMapping(CustomTestCase):
             self.assertEqual(mapping, before)
 
     def test_qwen_vision_constructor_passes_isolated_modelslim_config(self):
+        """Give Qwen vision its own ModelSlim config; other configs keep BF16."""
         from sglang.srt.models import qwen3_vl
 
         def small_vision(vision_config, *, quant_config, prefix, **kwargs):

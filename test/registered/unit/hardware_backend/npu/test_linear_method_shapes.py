@@ -38,7 +38,7 @@ class TestNpuLinearShapes(CustomTestCase):
 
     def setUp(self):
         super().setUp()
-        # Different input/output widths catch reshaping back to the input shape.
+        # Use width 4 -> 6 so restoring the input shape would fail.
         self.layer = SimpleNamespace(
             weight=(torch.arange(24).reshape(4, 6) % 3).to(torch.int8),
             weight_scale=torch.ones(6),
@@ -59,6 +59,7 @@ class TestNpuLinearShapes(CustomTestCase):
             )
 
     def test_static_and_dynamic_restore_leading_dimensions(self):
+        """Keep leading dimensions, e.g. (3, 2, 4) -> (3, 2, 6), and dtype."""
         for method in (NPUW8A8Int8LinearMethod(), NPUW8A8Int8DynamicLinearMethod()):
             for shape in ((3, 4), (2, 3, 4), (2, 1, 3, 4)):
                 with self.subTest(method=type(method).__name__, shape=shape):
@@ -74,6 +75,7 @@ class TestNpuLinearShapes(CustomTestCase):
                     torch.testing.assert_close(result, expected)
 
     def test_prequantized_inputs_keep_existing_paths(self):
+        """INT8 or (INT8, scale) inputs must not be quantized again."""
         x = torch.ones(2, 3, 4, dtype=torch.int8)
         result = NPUW8A8Int8LinearMethod().apply(self.layer, x)
         torch.testing.assert_close(
