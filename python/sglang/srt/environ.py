@@ -1130,7 +1130,10 @@ class Envs:
     # output columns ride along nearly free.
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ = EnvBool(True)
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS = EnvInt(256)
-    SGLANG_K3_TARGET_DENSE_FP8 = EnvStr("off")
+    # Kimi-K3 ROCm static FP8 dense linears: auto (wide on gfx95 without
+    # --enable-amd-monokernel, else off) | off | front | wide.
+    # See layers/quantization/k3_rocm_dense_fp8.py.
+    SGLANG_K3_TARGET_DENSE_FP8 = EnvStr("auto")
     SGLANG_DRAFT_FP8_ACTIVATION_SCHEME = EnvStr("dynamic")
     # Kimi-K3 fused KDA decode on ROCm: "gfx950" (in-tree kernel) or "aiter";
     # any other value keeps the unfused decode.
