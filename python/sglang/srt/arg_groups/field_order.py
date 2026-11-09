@@ -559,5 +559,7 @@ POSITIONAL_FIELD_ORDER = (
     "uocr_doc_split",
     "uocr_doc_page_window",
     "uocr_max_page_tokens",
+    "enable_fp4_indexer",
+    "paged_experts_enable_disk",
 )
 # fmt: on

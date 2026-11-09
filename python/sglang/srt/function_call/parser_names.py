@@ -17,6 +17,7 @@ TOOL_CALL_PARSER_NAMES = [
     "deepseekv4",
     "deepseekv41",
     "dots",
+    "ernie55",
     "glm",
     "glm45",
     "glm47",
