@@ -9,13 +9,14 @@ import torch
 from sglang.srt.layers.attention import qwen_sparse_attn_backend as backend_module
 from sglang.srt.layers.attention.qsa import kernel
 from sglang.srt.layers.attention.qwen_sparse_attn_backend import QwenSparseAttnBackend
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.mem_cache.kv.router import PlainPoolRouter
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.utils import is_npu
 from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(est_time=60, suite="base-b-test-1-npu-a3")
 pytestmark = pytest.mark.skipif(not is_npu(), reason="NPU is required")
-impl = importlib.import_module("sgl_kernel_npu.qwen3_8_flash_next.qsa_sparse_attention")
+impl = importlib.import_module("sgl_kernel_npu.operators.attention")
 
 
 def inputs(heads=3, kv_heads=1, rows=4):
@@ -37,23 +38,20 @@ def test_dispatch_graph(heads, kv_heads, layout, rows, monkeypatch):
         k, v = k.reshape(4, 16, kv_heads, 256), v.reshape(4, 16, kv_heads, 256)
     elif layout == "fia":
         k, v = k.unsqueeze(1), v.unsqueeze(1)
-    raw = impl.sparse_attention
+    raw = impl.qsa_sparse_attention
     cpu_reference = kernel.qsa_sparse_attention_reference
     calls = []
 
     def traced(*args):
         assert args[1].data_ptr() == k.data_ptr()
         assert args[2].data_ptr() == v.data_ptr()
-        if heads == 3:
-            expected_path = "grouped_direct" if rows >= 32 else "grouped_split"
-            assert impl.dispatch_info(*args[:4])["path"] == expected_path
         calls.append((args[1].shape, args[2].shape))
         return raw(*args)
 
     def forbidden(*args, **kwargs):
         raise AssertionError("NPU production must not call the Torch reference")
 
-    monkeypatch.setattr(impl, "sparse_attention", traced)
+    monkeypatch.setattr(impl, "qsa_sparse_attention", traced)
     monkeypatch.setattr(kernel, "qsa_sparse_attention_reference", forbidden)
 
     def forward():
@@ -131,7 +129,7 @@ def test_cache_adapter_rejects_implicit_copy(cache_name, monkeypatch):
     def forbidden(*args, **kwargs):
         raise AssertionError("invalid KV layout must fail before computation")
 
-    monkeypatch.setattr(impl, "sparse_attention", forbidden)
+    monkeypatch.setattr(impl, "qsa_sparse_attention", forbidden)
     monkeypatch.setattr(backend_module, "qsa_sparse_attention", forbidden)
     monkeypatch.setattr(kernel, "qsa_sparse_attention_reference", forbidden)
     if cache_name == "k":
@@ -146,7 +144,7 @@ def test_kernel_errors_propagate(monkeypatch):
     def fail(*args, **kwargs):
         raise RuntimeError("intentional sparse attention failure")
 
-    monkeypatch.setattr(impl, "sparse_attention", fail)
+    monkeypatch.setattr(impl, "qsa_sparse_attention", fail)
     q, k, v, slots = inputs()
     with pytest.raises(RuntimeError, match="intentional"):
         backend_module._npu_sparse_attention(q, k.unsqueeze(1), v.unsqueeze(1), slots)
@@ -164,6 +162,12 @@ def test_backend_kv_write_mapping_and_output_padding(mode, width, monkeypatch):
     q, k, v, _ = inputs()
 
     class Pool:
+        start_layer = 0
+        layer_transfer_counter = None
+
+        def __init__(self):
+            self.layer_router = PlainPoolRouter(self, "full")
+
         def set_kv_buffer(self, layer, loc, keys, values):
             k[loc.long()] = keys
             v[loc.long()] = values

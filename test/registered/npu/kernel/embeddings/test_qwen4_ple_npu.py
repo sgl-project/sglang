@@ -5,7 +5,7 @@ import torch
 from torch import nn
 
 from sglang.kernels.ops.mamba import qwen4_short_conv
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.models import qwen4_exp as model
 from sglang.test.ci.ci_register import register_npu_ci
 
@@ -44,8 +44,15 @@ def _make_case(
     intermediate = state.new_zeros(pool_size + 1, width, channels, state_len)
     pool = SimpleNamespace(
         size=pool_size,
-        short_conv_layer_cache=lambda _: state,
-        short_conv_layer_intermediate_cache=lambda _: intermediate,
+        layer_router=SimpleNamespace(
+            read=lambda layer_id, part: SimpleNamespace(
+                view_layer_id=layer_id,
+                view=SimpleNamespace(
+                    layer_cache=lambda _: state,
+                    layer_intermediate_cache=lambda _: intermediate,
+                ),
+            ),
+        ),
     )
     x = random_tensor(2 * width, channels)
     lengths = torch.tensor([width, width], device=device)
@@ -93,9 +100,20 @@ def _make_case(
     )
 
 
+def _bind_context(case, monkeypatch):
+    monkeypatch.setattr(model, "get_req_to_token_pool", lambda: case.pool)
+    monkeypatch.setattr(model, "get_token_to_kv_pool", lambda: case.pool)
+    backend = SimpleNamespace(
+        linear_attn_backend=SimpleNamespace(
+            state_tracking_indices=case.forward_batch.mamba_track_indices
+        )
+    )
+    monkeypatch.setattr(model, "get_attn_backend", lambda: backend)
+
+
 def _run(case, monkeypatch, *, npu):
     monkeypatch.setattr(model, "_is_npu", npu)
-    monkeypatch.setattr(model, "get_req_to_token_pool", lambda: case.pool)
+    _bind_context(case, monkeypatch)
     return case.layer._short_conv(case.x, case.forward_batch, case.batch)
 
 
@@ -156,7 +174,7 @@ def test_ple_short_conv_npu(
         torch.npu.synchronize()
         graph = torch.npu.NPUGraph()
         monkeypatch.setattr(model, "_is_npu", True)
-        monkeypatch.setattr(model, "get_req_to_token_pool", lambda: case.pool)
+        _bind_context(case, monkeypatch)
         with torch.npu.graph(graph):
             actual = case.layer._short_conv(case.x, case.forward_batch, case.batch)
 
@@ -212,7 +230,7 @@ def test_ple_short_conv_empty(monkeypatch):
     def unexpected_pool():
         raise AssertionError("Empty input must not access state or launch convolution")
 
-    monkeypatch.setattr(model, "get_req_to_token_pool", unexpected_pool)
+    monkeypatch.setattr(model, "get_token_to_kv_pool", unexpected_pool)
     x = torch.empty(0, 10240)
     assert layer._short_conv(x, None, None) is x
 

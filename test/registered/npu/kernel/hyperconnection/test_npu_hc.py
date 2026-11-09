@@ -2,7 +2,7 @@
 
 import pytest
 import torch
-from sgl_kernel_npu.qwen3_8_flash_next import hc
+from sgl_kernel_npu.operators import hyper_conn, norm
 
 from sglang.srt.layers import hyperconnection
 from sglang.srt.utils import is_npu
@@ -10,6 +10,13 @@ from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(est_time=120, suite="base-b-test-1-npu-a3")
 pytestmark = pytest.mark.skipif(not is_npu(), reason="NPU is required")
+
+
+PUBLIC_APIS = {
+    "grouped_norm": (norm, "grouped_gemma_rmsnorm"),
+    "mix": (hyper_conn, "hc_mix"),
+    "combine": (hyper_conn, "hc_combine"),
+}
 
 
 def make_module(monkeypatch, *, model=True, per_branch=True, use_combine=True):
@@ -33,13 +40,14 @@ def test_model_public_routing(monkeypatch, rows):
     x = torch.zeros(rows, 10240, device="npu", dtype=torch.bfloat16)
     calls = []
     for name in ("grouped_norm", "mix", "combine"):
-        original = getattr(hc, name)
+        owner, api = PUBLIC_APIS[name]
+        original = getattr(owner, api)
 
         def counted(*args, _name=name, _fn=original):
             calls.append(_name)
             return _fn(*args)
 
-        monkeypatch.setattr(hc, name, counted)
+        monkeypatch.setattr(owner, api, counted)
     # This GPU path must remain disabled even with transfer_to_npu's is_cuda shim.
     assert not hyperconnection.fused_hc_mix_supported(
         x, module.input_mix_weight_down.weight, module.input_mix_weight_up.weight
@@ -73,7 +81,7 @@ def test_kernel_errors_are_not_swallowed(monkeypatch, op):
     def fail(*args):
         raise ValueError("HC test sentinel")
 
-    monkeypatch.setattr(hc, op, fail)
+    monkeypatch.setattr(*PUBLIC_APIS[op], fail)
     with pytest.raises(ValueError, match="HC test sentinel"):
         mixed, residuals = module.mix(x)
         module.combine(mixed, residuals)
@@ -111,8 +119,8 @@ def test_final_mixer_without_combine(monkeypatch):
     module = make_module(monkeypatch, use_combine=False)
     x = torch.randn(33, 10240, device="npu", dtype=torch.bfloat16)
     actual, residuals = module.mix(x)
-    expected = hc.mix(
-        hc.grouped_norm(x, module.hc_norm.weight, 2560, 1e-6),
+    expected = hyper_conn.hc_mix(
+        norm.grouped_gemma_rmsnorm(x, module.hc_norm.weight, 2560, 1e-6),
         module.input_mix_weight_down.weight,
         module.input_mix_weight_up.weight,
         4,

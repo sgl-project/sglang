@@ -58,9 +58,9 @@ class GroupedGemmaRMSNorm(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if _is_npu:
-            from sgl_kernel_npu.qwen3_8_flash_next import hc as npu_hc
+            from sgl_kernel_npu.operators.norm import grouped_gemma_rmsnorm
 
-            return npu_hc.grouped_norm(
+            return grouped_gemma_rmsnorm(
                 x, self.weight, self.group_size, self.variance_epsilon
             )
         if (
@@ -290,9 +290,9 @@ class GatedResidual(HyperConnectionBase):
                 hyper_input.unflatten(-1, (self.hc_count, self.hidden_size))
             ).flatten(-2)
         if _is_npu:
-            from sgl_kernel_npu.qwen3_8_flash_next import hc as npu_hc
+            from sgl_kernel_npu.operators.hyper_conn import hc_mix
 
-            mixed_input = npu_hc.mix(
+            mixed_input = hc_mix(
                 hyper_input_normed,
                 self.input_mix_weight_down.weight,
                 self.input_mix_weight_up.weight,
@@ -427,9 +427,9 @@ class GatedResidual(HyperConnectionBase):
             return hyper_input.to(self.params_dtype)
 
         if _is_npu:
-            from sgl_kernel_npu.qwen3_8_flash_next import hc as npu_hc
+            from sgl_kernel_npu.operators.hyper_conn import hc_combine
 
-            return npu_hc.combine(
+            return hc_combine(
                 block_output,
                 hyper_input,
                 hyper_input_normed,
@@ -447,9 +447,7 @@ class GatedResidual(HyperConnectionBase):
             and self.block_inject_weight.weight.dtype == block_output.dtype
         ):
             if self._split_combine_ok and block_output.shape[0] <= 32:
-                from sglang.kernels.ops.elementwise.hc_combine import (
-                    hc_combine_split,
-                )
+                from sglang.kernels.ops.elementwise.hc_combine import hc_combine_split
 
                 return hc_combine_split(
                     block_output,

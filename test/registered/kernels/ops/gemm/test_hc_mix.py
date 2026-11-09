@@ -112,8 +112,8 @@ def test_grouped_norm_cuda_jit_dispatch(
         # Routing-only test: do not import the actual NPU package on CUDA CI.
         monkeypatch.setitem(
             sys.modules,
-            "sgl_kernel_npu.qwen3_8_flash_next",
-            SimpleNamespace(hc=SimpleNamespace(grouped_norm=fake_npu_kernel)),
+            "sgl_kernel_npu.operators.norm",
+            SimpleNamespace(grouped_gemma_rmsnorm=fake_npu_kernel),
         )
     actual = norm(x)
     if npu_platform and not ple_norm:

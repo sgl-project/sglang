@@ -145,10 +145,18 @@ def test_npu_graph_cleanup_stops_update_worker(make_backend):
 def test_npu_graph_qwen_qsa_replay_dispatch(
     runner_kind, architecture, qsa, dsa, skip_update
 ):
-    from sglang.srt.layers.attention.qwen_sparse_attn_backend import QwenSparseAttnBackend
-    from sglang.srt.model_executor.runner.decode_cuda_graph_runner import DecodeCudaGraphRunner
-    from sglang.srt.speculative.eagle_draft_cuda_graph_runner import EAGLEDraftCudaGraphRunner
-    from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import EAGLEDraftExtendCudaGraphRunner
+    from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
+        QwenSparseAttnBackend,
+    )
+    from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+        DecodeCudaGraphRunner,
+    )
+    from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
+        EAGLEDraftCudaGraphRunner,
+    )
+    from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
+        EAGLEDraftExtendCudaGraphRunner,
+    )
 
     runner_type = {
         "target_decode": DecodeCudaGraphRunner,
@@ -158,17 +166,25 @@ def test_npu_graph_qwen_qsa_replay_dispatch(
     }[runner_kind]
     runner = object.__new__(runner_type)
     runner.model_runner = SimpleNamespace(
-        model_config=SimpleNamespace(hf_config=SimpleNamespace(
-            architectures=[architecture], index_topk=2048 if dsa else None,
-        )),
-        spec_algorithm=SimpleNamespace(is_dflash=lambda: False, is_dflash_family=lambda: False),
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(
+                architectures=[architecture],
+                index_topk=2048 if dsa else None,
+            )
+        ),
+        spec_algorithm=SimpleNamespace(
+            is_dflash=lambda: False, is_dflash_family=lambda: False
+        ),
     )
     # The merged backend uses the attention capability, replacing the deleted
     # NPU runner subclasses. Use the actual QSA declaration for this model.
-    runner.attn_backend = SimpleNamespace(needs_cpu_seq_lens=(
-        QwenSparseAttnBackend.needs_cpu_seq_lens
-        if architecture.startswith("Qwen4Exp") and qsa else True
-    ))
+    runner.attn_backend = SimpleNamespace(
+        needs_cpu_seq_lens=(
+            QwenSparseAttnBackend.needs_cpu_seq_lens
+            if architecture.startswith("Qwen4Exp") and qsa
+            else True
+        )
+    )
     runner.bs, runner.raw_bs = 2, 1
     runner.captured_req_width = 4
     runner.speculative_num_steps = 3
@@ -183,8 +199,11 @@ def test_npu_graph_qwen_qsa_replay_dispatch(
         lengths = Mock()
         lengths.tolist.side_effect = AssertionError("Unexpected CPU length preparation")
     batch = SimpleNamespace(
-        seq_lens=lengths, seq_lens_cpu=lengths,
-        forward_mode=SimpleNamespace(is_target_verify=lambda: runner_kind == "target_verify"),
+        seq_lens=lengths,
+        seq_lens_cpu=lengths,
+        forward_mode=SimpleNamespace(
+            is_target_verify=lambda: runner_kind == "target_verify"
+        ),
     )
     assert backend.replay(2, batch) is output
     if skip_update:
@@ -210,7 +229,8 @@ def test_npu_graph_qwen_qsa_replay_dispatch(
         else:
             assert update.call_args.kwargs == {
                 "seq_lens": [11, 0] if runner_kind == "target_verify" else [7, 0],
-                "attr_name": "actual_seq_lengths_kv", "attr_type": [],
+                "attr_name": "actual_seq_lengths_kv",
+                "attr_type": [],
             }
 
 

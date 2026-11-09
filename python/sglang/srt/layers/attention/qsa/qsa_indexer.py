@@ -250,9 +250,7 @@ class QSAIndexer(MultiPlatformOp):
     ) -> None:
         """Fused mean -> gemma norm -> MRoPE -> compressed-cache store;
         a None source_keys/source_rope reads the members from the pending ring."""
-        from sglang.kernels.ops.attention.qsa_indexer import (
-            qsa_index_k_compress_store,
-        )
+        from sglang.kernels.ops.attention.qsa_indexer import qsa_index_k_compress_store
 
         if source_keys is None:
             source_keys = pool.get_qsa_key_state_buffer(self.layer_id)
@@ -481,7 +479,11 @@ class QSAIndexer(MultiPlatformOp):
             return output
 
         relative = (
-            max_row_keys is not None and max_row_keys > 0 and q.is_cuda and HAS_TILELANG
+            not _is_npu
+            and max_row_keys is not None
+            and max_row_keys > 0
+            and q.is_cuda
+            and HAS_TILELANG
         )
         row_chunk_size = _qsa_prefill_row_chunk_size(
             rows,

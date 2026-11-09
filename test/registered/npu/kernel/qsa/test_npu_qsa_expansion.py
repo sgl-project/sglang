@@ -8,7 +8,8 @@ import torch
 from sglang.srt.layers.attention.qsa import kernel, mqa
 from sglang.srt.layers.attention.qsa.metadata import build_qsa_row_ranges
 from sglang.srt.layers.attention.qwen_sparse_attn_backend import QwenSparseAttnBackend
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.mem_cache.kv.router import PlainPoolRouter
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_npu
@@ -207,6 +208,9 @@ def test_backend_graph_metadata_current_topk_expansion(
         get_key_buffer=lambda layer_id: attention_k.reshape(-1, 64, 1, 256),
         get_value_buffer=lambda layer_id: attention_v.reshape(-1, 64, 1, 256),
     )
+    pool.start_layer = 0
+    pool.layer_transfer_counter = None
+    pool.layer_router = PlainPoolRouter(pool, "full")
     layer = SimpleNamespace(layer_id=0, scaling=1 / 16)
     req_to_token = torch.arange(
         requests * raw_width, device="npu", dtype=torch.int32
@@ -321,18 +325,15 @@ def test_backend_graph_metadata_current_topk_expansion(
 
 @pytest.mark.parametrize("k", [512, 2048])
 @pytest.mark.parametrize(
-    "rows,width,path",
+    "rows,width",
     [
-        (4, 256, "shortcut"),
-        (4, 8193, "tiled"),
-        (4, 262145, "hybrid"),
-        (129, 262145, "hybrid"),
+        (4, 256),
+        (4, 8193),
+        (4, 262145),
+        (129, 262145),
     ],
 )
-def test_final_topk_expansion_all_paths_graph(k, rows, width, path):
-    from sgl_kernel_npu.qwen3_8_flash_next.qsa_topk import select_implementation
-
-    assert select_implementation(rows, width, k) == path
+def test_final_topk_expansion_graph(k, rows, width):
     logits = torch.randn(rows, width, device="npu", dtype=torch.float32)
     starts = (torch.arange(rows, device="npu") % 8).int()
     lengths = torch.full_like(starts, width - 16)
@@ -380,7 +381,7 @@ def test_final_topk_expansion_all_paths_graph(k, rows, width, path):
 
 
 def test_topk_dispatch_errors_are_not_hidden(monkeypatch):
-    from sgl_kernel_npu.qwen3_8_flash_next import qsa_topk
+    from sgl_kernel_npu.operators import indexer
 
     logits = torch.zeros(2, 4096, device="npu")
     starts = torch.zeros(2, dtype=torch.int32, device="npu")
@@ -393,7 +394,7 @@ def test_topk_dispatch_errors_are_not_hidden(monkeypatch):
     def fail(*args, **kwargs):
         raise RuntimeError("intentional Top-K failure")
 
-    monkeypatch.setattr(qsa_topk, "fast_topk", fail)
+    monkeypatch.setattr(indexer, "qsa_topk", fail)
     with pytest.raises(RuntimeError, match="intentional Top-K failure"):
         kernel.qsa_fast_topk(logits, starts, ends, 512)
 

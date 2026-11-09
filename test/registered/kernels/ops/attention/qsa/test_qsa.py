@@ -22,10 +22,7 @@ from sglang.srt.layers.attention.qsa.metadata import (
     QSAIndexerMetadata,
     build_qsa_row_ranges,
 )
-from sglang.srt.layers.attention.qsa.mqa import (
-    qsa_mqa_decode,
-    qsa_mqa_prefill,
-)
+from sglang.srt.layers.attention.qsa.mqa import qsa_mqa_decode, qsa_mqa_prefill
 from sglang.srt.layers.attention.qsa.qsa_indexer import QSAIndexer
 from sglang.srt.layers.attention.qsa.sparse_attn import (
     pack_qsa_prefill_kv,
@@ -267,10 +264,7 @@ def _compressed_config_namespace(**overrides):
 
 
 def test_qsa_profile_parses_compressed_qwen4_exp_schema():
-    from sglang.srt.layers.attention.qsa.config import (
-        is_qwen_qsa,
-        parse_qsa_profile,
-    )
+    from sglang.srt.layers.attention.qsa.config import is_qwen_qsa, parse_qsa_profile
 
     wrapped = Qwen4ExpConfig(
         text_config={
@@ -1412,28 +1406,17 @@ def test_qsa_npu_dispatch_excludes_cuda_kernels(monkeypatch):
     monkeypatch.setattr(qsa_kernel_module, "triton_expand_qsa_block_indices", cuda_only)
     # This CPU routing test also runs in GPU CI, without the NPU package.
     # Mock only its import boundary; real NPU execution is tested separately.
-    expansion_module = ModuleType("sgl_kernel_npu.qwen3_8_flash_next.qsa_expansion")
-    expansion_calls = []
+    npu_indexer = ModuleType("sgl_kernel_npu.operators.indexer")
+    expansion_calls, topk_calls, mqa_calls = [], [], []
 
     def npu_expansion(*args):
         expansion_calls.append(args)
         return torch_expand_qsa_block_indices(*args)
 
-    expansion_module.expand_blocks = npu_expansion
-    monkeypatch.setitem(sys.modules, expansion_module.__name__, expansion_module)
-    topk_module = ModuleType("sgl_kernel_npu.qwen3_8_flash_next.qsa_topk")
-    topk_calls = []
-
     def npu_topk(logits, lengths, topk, starts):
         topk_calls.append((logits, lengths, topk, starts))
-        # This routing fixture has four equal-score blocks, all selected.
         ranks = torch.arange(topk).expand(logits.shape[0], -1)
         return torch.where(ranks < lengths[:, None], ranks, -1).int()
-
-    topk_module.fast_topk = npu_topk
-    monkeypatch.setitem(sys.modules, topk_module.__name__, topk_module)
-    mqa_module = ModuleType("sgl_kernel_npu.qwen3_8_flash_next.qsa_mqa")
-    mqa_calls = []
 
     def npu_packed(*args):
         mqa_calls.append("packed")
@@ -1443,15 +1426,11 @@ def test_qsa_npu_dispatch_excludes_cuda_kernels(monkeypatch):
         mqa_calls.append("paged")
         return qsa_mqa_module.torch_qsa_mqa_decode(*args)
 
-    mqa_module.packed, mqa_module.paged = npu_packed, npu_paged
-    monkeypatch.setitem(sys.modules, mqa_module.__name__, mqa_module)
-    # Module-style imports resolve the parent's attribute when already loaded.
-    package_name = "sgl_kernel_npu.qwen3_8_flash_next"
-    package = sys.modules.get(package_name)
-    if package is None:
-        package = ModuleType(package_name)
-        monkeypatch.setitem(sys.modules, package_name, package)
-    monkeypatch.setattr(package, "qsa_mqa", mqa_module, raising=False)
+    npu_indexer.expand_qsa_blocks = npu_expansion
+    npu_indexer.qsa_topk = npu_topk
+    npu_indexer.qsa_mqa_packed = npu_packed
+    npu_indexer.qsa_mqa_paged = npu_paged
+    monkeypatch.setitem(sys.modules, npu_indexer.__name__, npu_indexer)
     # The platform guard must short-circuit before inspecting rotary fields.
     assert not QSAIndexer._use_fused_prep(SimpleNamespace(), torch.zeros(1, 128))
     assert not QwenSparseAttnBackend._can_replay_with_gpu_kernels(
@@ -1473,6 +1452,23 @@ def test_qsa_npu_dispatch_excludes_cuda_kernels(monkeypatch):
         q, torch.ones(1, 16, 1, 128, dtype=q.dtype), starts[:, None], lengths, 16
     )
     assert mqa_calls == ["packed", "paged"]
+
+    # The relative-prefill optimization is also CUDA-only, including when the
+    # NPU compatibility shim advertises is_cuda and TileLang is installed.
+    monkeypatch.setattr(qsa_indexer_module, "HAS_TILELANG", True)
+    monkeypatch.setattr(qsa_indexer_module, "qsa_mqa_prefill_relative", cuda_only)
+    prefill = QSAIndexer.select_prefill_tokens(
+        SimpleNamespace(token_topk=2048, block_topk=512, compress_ratio=4),
+        q,
+        torch.ones(4, 1, 128, dtype=q.dtype),
+        starts,
+        lengths,
+        raw_lengths - 1,
+        raw_lengths,
+        max_row_keys=4,
+    )
+    torch.testing.assert_close(prefill, selected)
+    assert mqa_calls == ["packed", "paged", "packed"]
 
 
 @pytest.mark.parametrize(

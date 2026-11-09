@@ -17,10 +17,7 @@ import torch
 import torch.nn.functional as F
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.qsa.config import (
-    is_qwen_qsa,
-    parse_qsa_profile,
-)
+from sglang.srt.layers.attention.qsa.config import is_qwen_qsa, parse_qsa_profile
 from sglang.srt.layers.attention.qsa.fused_kv import fused_kv_prepare
 from sglang.srt.layers.attention.qsa.kernel import (
     expand_qsa_block_indices,
@@ -87,7 +84,9 @@ def _npu_sparse_attention(
     softmax_scale: Optional[float] = None,
 ) -> torch.Tensor:
     """Adapt NPU KV pools and call the model-contract sparse attention kernel."""
-    from sgl_kernel_npu.qwen3_8_flash_next.qsa_sparse_attention import sparse_attention
+    from sgl_kernel_npu.operators.attention import (
+        qsa_sparse_attention as sparse_attention,
+    )
 
     k_cache = _flatten_qsa_kv_cache(k_cache, "k_cache")
     v_cache = _flatten_qsa_kv_cache(v_cache, "v_cache")
@@ -115,9 +114,7 @@ def _resolve_flash_attn_varlen_func():
     from sglang.srt.utils import is_hip, is_sm121
 
     if is_sm121():
-        from sglang.kernels.ops.attention import (
-            qwen38_qsa_sm121_varlen,
-        )
+        from sglang.kernels.ops.attention import qwen38_qsa_sm121_varlen
 
         return qwen38_qsa_sm121_varlen
     if is_hip():
@@ -1146,9 +1143,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         """Sync-free replay refresh: nothing here may read back to the host,
         since launch_graph_metadata rebuilds every per-row graph buffer on device."""
 
-        from sglang.srt.layers.attention.qsa.graph_metadata import (
-            launch_graph_metadata,
-        )
+        from sglang.srt.layers.attention.qsa.graph_metadata import launch_graph_metadata
 
         indexer = metadata.indexer_metadata
         pool = indexer.token_to_kv_pool

@@ -6,7 +6,7 @@ The kernel package carries independent FP64 and larger-shape regressions.
 
 import pytest
 import torch
-from sgl_kernel_npu.qwen3_8_flash_next import qsa_mqa as npu_mqa
+from sgl_kernel_npu.operators import indexer as npu_mqa
 
 from sglang.srt.layers.attention.qsa import mqa
 from sglang.srt.utils import is_npu
@@ -42,7 +42,7 @@ def test_mqa_dispatch_and_graph_updates(kind, monkeypatch):
     fn, reference = functions(kind)
     args = make_inputs(kind)
     calls = []
-    raw = getattr(npu_mqa, kind)
+    raw = getattr(npu_mqa, "qsa_mqa_" + kind)
 
     def traced(*inputs):
         calls.append(kind)
@@ -51,7 +51,7 @@ def test_mqa_dispatch_and_graph_updates(kind, monkeypatch):
     def forbidden(*args, **kwargs):
         raise AssertionError("NPU MQA must not call Torch reference or TileLang")
 
-    monkeypatch.setattr(npu_mqa, kind, traced)
+    monkeypatch.setattr(npu_mqa, "qsa_mqa_" + kind, traced)
     for name in (
         "torch_qsa_mqa_prefill",
         "torch_qsa_mqa_decode",
@@ -162,7 +162,7 @@ def test_mqa_kernel_errors_propagate(kind, monkeypatch):
     def fail(*args, **kwargs):
         raise RuntimeError("intentional MQA failure")
 
-    monkeypatch.setattr(npu_mqa, kind, fail)
+    monkeypatch.setattr(npu_mqa, "qsa_mqa_" + kind, fail)
     with pytest.raises(RuntimeError, match="intentional MQA failure"):
         functions(kind)[0](*make_inputs(kind))
 
