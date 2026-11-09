@@ -2090,17 +2090,11 @@ class KVCacheConfigurator:
         )
         dsa_pool_kwargs = {}
         if is_dsa_model:
-            # The indexer and KV pool must use the same KPool/compression
-            # configuration. Otherwise, the indexer may call
-            # get_compress_tail_buffers when the pool has no compression tail
-            # allocated, triggering an assertion.
             hf_config = self.model_config.hf_config
             dsa_pool_kwargs = {
                 "index_kpool": get_dsa_index_kpool(hf_config),
                 "index_kpool_compress": get_dsa_index_kpool_compress(hf_config),
                 "tail_extra_slots": (max_speculative_num_draft_tokens() or 0),
-                # Tail buffers are indexed by request slot, so their capacity
-                # must cover all concurrent requests.
                 "max_running_requests": max_running_requests,
                 "skip_topk_layers": (
                     None
