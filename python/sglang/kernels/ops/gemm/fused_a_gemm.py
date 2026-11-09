@@ -15,7 +15,7 @@ from enum import Enum
 
 import torch
 
-from sglang.srt.utils.common import get_device_sm, is_cuda, is_sm120_supported
+from sglang.srt.utils.device import get_device_sm, is_cuda, is_sm120_supported
 
 
 class FusedAGemmBackend(str, Enum):

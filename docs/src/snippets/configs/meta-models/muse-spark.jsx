@@ -7,9 +7,11 @@
 // SP/MegaMoE (SM100-only kernels).
 export const config = {
   modelName: "Muse Spark Open",
-  supportedHardware: ["b300", "gb300", "b200", "h200", "mi355x", "xeon"],
+  supportedHardware: ["b300", "gb300", "b200", "h200", "mi355x", "xeon", "tpu7x"],
   hardware: [
     { id: "xeon", label: "Xeon", vendor: "cpu", vram: "CPU" },
+    // SGLang-TorchTPU on one host: 4 chips (8 TensorCores) at --tp-size 8.
+    { id: "tpu7x", label: "TPU v7", vendor: "tpu", vram: "192GB" },
   ],
   showPlaygroundLink: false,
 
@@ -58,6 +60,7 @@ export const config = {
     h200: "lmsysorg/sglang:latest",
     mi355x: "lmsysorg/sglang-rocm:muse-spark-open",
     xeon: "lmsysorg/sglang:muse-spark-1.2-xeon",
+    tpu7x: "<public sglang-torchtpu image: TBD>",
   },
   dockerHostNetworkWhen: (s) => ["prefill", "decode"].includes(s.pdMode),
   placeholders: {
@@ -601,6 +604,77 @@ export const config = {
         ...cell.flags.filter((flag) => !flag.startsWith("--speculative-")),
         ...(["b300", "gb300", "b200", "h200"].includes(cell.match.hw)
           ? ["--enable-unified-memory"] : []),
+      ],
+    },
+  ]).concat([
+    // TPU v7 (SGLang-TorchTPU, one host). Both cells run the decode megakernel over
+    // fp8 KV in the SEQ_ALONG_LANE layout (batched-RPA attention, 256-token pages),
+    // with host-side prefill padding and compiled batch/prefill buckets. Low Latency
+    // keeps DFlash; High Throughput runs 64 requests without speculative decoding,
+    // the megakernel taking decode steps of up to 64 rows.
+    {
+      match: { hw: "tpu7x", quant: "nvfp4", strategy: "low-latency" },
+      verificationStatus: "in-progress",
+      nnodes: 1,
+      env: [
+        "SGLANG_TPU_HOST_PADDING=1",
+        "SGLANG_TPU_USE_SEQ_ALONG_LANE_KV=1",
+        "SGLANG_TPU_MUSE_MEGAKERNEL=1",
+        "SGLANG_TPU_ALLOW_SPEC_RECOMPILE=1",
+      ],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp-size 8",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+        "--moe-runner-backend pallas_tpu_fused_rs",
+        "--attention-backend pallas_tpu_rpa_batched",
+        "--page-size 256",
+        "--kv-cache-dtype fp8_e4m3",
+        "--max-running-requests 2",
+        "--chunked-prefill-size 4096",
+        "--max-prefill-tokens 4096",
+        "--enable-torch-compile",
+        "--torch-compile-max-bs 2",
+        "--tpu-compile-bs 1 2",
+        "--tpu-compile-tokens 1024 2048 4096",
+        "--speculative-algorithm DFLASH",
+        "--speculative-draft-model-path {{DRAFT_MODEL_ID}}",
+        "--speculative-draft-attention-backend pallas_tpu_rpa_v3",
+        "--speculative-num-draft-tokens 8",
+        "--reasoning-parser muse",
+        "--tool-call-parser muse",
+      ],
+    },
+    {
+      match: { hw: "tpu7x", quant: "nvfp4", strategy: "high-throughput" },
+      verificationStatus: "in-progress",
+      nnodes: 1,
+      env: [
+        "SGLANG_TPU_HOST_PADDING=1",
+        "SGLANG_TPU_USE_SEQ_ALONG_LANE_KV=1",
+        "SGLANG_TPU_MUSE_MEGAKERNEL=1",
+        "SGLANG_TPU_MUSE_MK_MAX_ROWS=64",
+        "SGLANG_TPU_MUSE_MK_EXPERT_SPLIT=4",
+      ],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp-size 8",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+        "--moe-runner-backend pallas_tpu_fused_rs",
+        "--attention-backend pallas_tpu_rpa_batched",
+        "--page-size 256",
+        "--kv-cache-dtype fp8_e4m3",
+        "--max-running-requests 64",
+        "--chunked-prefill-size 4096",
+        "--max-prefill-tokens 4096",
+        "--enable-torch-compile",
+        "--torch-compile-max-bs 64",
+        "--tpu-compile-bs 1 2 4 8 16 32 48 64",
+        "--tpu-compile-tokens 4096",
+        "--reasoning-parser muse",
+        "--tool-call-parser muse",
       ],
     },
   ]),
