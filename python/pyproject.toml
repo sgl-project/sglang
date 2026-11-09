@@ -38,7 +38,7 @@ dependencies = [
   "easydict",  # Required by remote model code (e.g. DeepSeek-OCR) loaded via trust_remote_code; validated by transformers 5.4+ check_imports
   "einops",
   "fastapi",
-  "flashinfer_python[cu13]==0.7.2", # keep it aligned with jit-cache version in Dockerfile
+  "flashinfer_python[cu13]==0.7.3", # keep it aligned with jit-cache version in Dockerfile
   "gguf",
   "humming-kernels[cu13]==0.1.18",
   "interegular",
@@ -60,7 +60,8 @@ dependencies = [
   "outlines==0.1.11",
   "packaging",
   "partial_json_parser",
-  "pillow",
+  # The Rust image pipeline (dynamo-multimodal) reproduces Pillow 12.x bicubic.
+  "pillow<13",
   "prometheus-client>=0.20.0",
   "psutil",
   "py-spy",
@@ -218,6 +219,7 @@ killall_sglang = "sglang.cli.killall:main"
 
 [tool.setuptools.package-data]
 "sglang" = [
+  "cli/_commands/*.json",
   "srt/**/*",
   "kernels/**/*",
   "multimodal_gen/apps/realtime_webui/**/*"

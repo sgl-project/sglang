@@ -117,6 +117,8 @@ logger = logging.getLogger(__name__)
 _MAMBA_DEBUG_ASSERTS = os.environ.get("SGLANG_MAMBA_DEBUG_ASSERTS", "0") == "1"
 
 GB = 1024 * 1024 * 1024
+# Arbitrary; no evidence this is the best chunk size for temporal state copies.
+_MAMBA_TEMPORAL_COPY_CHUNK_BYTES = 64 * 1024 * 1024
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_cpu = is_cpu()
@@ -1183,6 +1185,30 @@ class MambaPool:
         if temporal.numel() > 0:
             temporal.index_fill_(1, idx64, 0)
 
+    def _copy_temporal_slots(
+        self, *, src_indices: torch.Tensor, dst_indices: torch.Tensor
+    ) -> None:
+        temporal = self.mamba_cache.temporal
+        if temporal.numel() == 0:
+            return
+        num_slots = dst_indices.shape[0]
+        slot_bytes = temporal.element_size() * (temporal.numel() // temporal.shape[1])
+        step = max(1, _MAMBA_TEMPORAL_COPY_CHUNK_BYTES // slot_bytes)
+        if num_slots <= step:
+            temporal[:, dst_indices] = temporal[:, src_indices]
+            return
+        # A batched gather allocates num_slots * slot_bytes at once and can OOM
+        # under admission bursts; chunking requires disjoint src/dst slots.
+        if envs.SGLANG_DEBUG_MEMORY_POOL.get():
+            overlap = set(src_indices.tolist()) & set(dst_indices.tolist())
+            assert not overlap, (
+                "chunked temporal copy requires disjoint src/dst slots; "
+                f"overlap={sorted(overlap)}"
+            )
+        for start in range(0, num_slots, step):
+            chunk = slice(start, start + step)
+            temporal[:, dst_indices[chunk]] = temporal[:, src_indices[chunk]]
+
     def copy_from(self, src_indices: torch.Tensor, dst_indices: torch.Tensor):
         """Clone mamba state (conv + temporal) from src slots into dst slots.
 
@@ -1212,17 +1238,13 @@ class MambaPool:
                     f"overlap={sorted(overlap)}"
                 )
             fused_copy_conv_slots(self._conv_slot_desc, src_indices, dst_indices)
-            temporal = self.mamba_cache.temporal
-            if temporal.numel() > 0:
-                temporal[:, dst_indices] = temporal[:, src_indices]
+            self._copy_temporal_slots(src_indices=src_indices, dst_indices=dst_indices)
         else:
             for i in range(len(self.mamba_cache.conv)):
                 self.mamba_cache.conv[i][:, dst_indices] = self.mamba_cache.conv[i][
                     :, src_indices
                 ]
-            self.mamba_cache.temporal[:, dst_indices] = self.mamba_cache.temporal[
-                :, src_indices
-            ]
+            self._copy_temporal_slots(src_indices=src_indices, dst_indices=dst_indices)
         if self.replayssm_write_pos is not None:
             self.replayssm_write_pos[dst_indices] = 0
         for sibling in self._slot_siblings:
@@ -1857,6 +1879,7 @@ class KvBufferDesc:
 class KVCache(abc.ABC):
     layer_shard_enabled: bool = False
     post_capture_active: bool = False
+    rows_are_dcp_collapsed: bool = False
 
     @property
     def backing_owner(self):
@@ -2921,6 +2944,31 @@ class MHATokenToKVPool(KVCache, MHAKVView):
                 cache_v,
                 k_scale,
                 v_scale,
+            )
+            return
+
+        if (
+            self.kv_cache_layout == "vectorized_5d"
+            and not self.use_hnd
+            and dcp_kv_mask is None
+            and cache_k.dtype != self.dtype
+            and self.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+        ):
+            # The 5D writer divides by the scales, saturates and casts as it
+            # writes, in place of the two divisions and two casts below.
+            from sglang.kernels.ops.kvcache.shuffle_5d_cache import (
+                launch_reshape_and_cache_shuffle_5d,
+            )
+
+            layer_idx = layer_id - self.start_layer
+            launch_reshape_and_cache_shuffle_5d(
+                cache_k,
+                cache_v,
+                self.k_buffer[layer_idx].view(self.dtype),
+                self.v_buffer[layer_idx].view(self.dtype),
+                loc,
+                k_scale=k_scale,
+                v_scale=v_scale,
             )
             return
 
@@ -4156,6 +4204,7 @@ class HybridLinearKVPool(KVCache):
         full_kv_pool: Optional[KVCache] = None,
         post_capture_active: bool = False,
         use_fp4_indexer: bool = False,
+        use_combined_kv_buffer: bool = False,
     ):
         self.size = size
         self.dtype = dtype
@@ -4245,6 +4294,7 @@ class HybridLinearKVPool(KVCache):
                 kv_lora_rank=kv_lora_rank,
                 qk_rope_head_dim=qk_rope_head_dim,
                 enable_memory_saver=enable_memory_saver,
+                **({"use_combined_kv_buffer": True} if use_combined_kv_buffer else {}),
             )
         if isinstance(self.full_kv_pool, MHATokenToKVPool):
             # Only the hybrid root knows the model IDs of its compact child.
@@ -4376,6 +4426,12 @@ class HybridLinearKVPool(KVCache):
     def _wait_for_layer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+
+    def get_combined_kv_buffer(self, layer_id: int):
+        self._wait_for_layer(layer_id)
+        return self.full_kv_pool.get_combined_kv_buffer(
+            self._transfer_full_attention_id(layer_id)
+        )
 
     def _build_layer_router(self) -> KVLayerRouter:
         # Only the full-attention layers hold KV here; the KV cache
@@ -4863,6 +4919,10 @@ class MLATokenToKVPool(KVCache, MLAKVView):
     # the plan's write translation (`translate_write_loc`) and flips this.
     write_loc_is_dcp_resolved = False
     dcp_replicated = False
+
+    @property
+    def rows_are_dcp_collapsed(self) -> bool:
+        return get_parallel().dcp_enabled and not self.dcp_replicated
 
     @property
     def _write_loc_dcp_span(self) -> int:
