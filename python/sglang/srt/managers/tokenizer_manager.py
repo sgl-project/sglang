@@ -1505,6 +1505,30 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         sampling_params = self.sampling_params_class(**sampling_kwargs)
         sampling_params.normalize(self.tokenizer)
         sampling_params.verify(self.model_config.vocab_size)
+        if sampling_params.array_output_logprobs:
+            if not isinstance(obj, GenerateReqInput) or not (
+                obj.return_logprob
+                and obj.return_flat_raw_output_top_logprobs
+                and obj.return_flat_raw_top_logprobs_b64
+                and not obj.stream
+                and obj.logprob_start_len == -1
+                and obj.top_logprobs_num > 0
+                and sampling_params.max_new_tokens > 0
+            ):
+                raise ValueError(
+                    "Array scores require nonstreaming generated-only flat base64 logprobs"
+                )
+            if (
+                self.server_args.speculative_algorithm
+                or sampling_params.beam_width is not None
+            ):
+                raise ValueError(
+                    "Array scores do not yet support speculative decoding or beam search"
+                )
+            if sampling_params.score_centering_samples and obj.top_logprobs_num != 32:
+                raise ValueError(
+                    "MC32 requires top_logprobs_num=32 (payload width, not top-k extraction)"
+                )
 
         # Build return object
         if isinstance(obj, GenerateReqInput):
@@ -2889,6 +2913,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         )
                     )
                 meta_info["input_top_logprobs"] = state.input_top_logprobs
+            if state.obj.sampling_params.get("score_centering_samples", 0) == 32:
+                meta_info["output_score_mode"] = "mc32"
+            elif state.obj.sampling_params.get("array_output_logprobs", False):
+                meta_info["output_score_mode"] = "topk"
             use_flat_output = state.obj.return_flat_raw_output_top_logprobs
             # Built once on the finished response; streaming is rejected and
             # only that response reaches a non-streaming client.
@@ -3011,6 +3039,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     recv_obj.input_top_logprobs_val_flat[recv_obj_index],
                     recv_obj.input_top_logprobs_idx_flat[recv_obj_index],
                     recv_obj.input_top_logprobs_flat_null_prefix[recv_obj_index],
+                )
+            if (
+                recv_obj.output_top_logprobs_val_array is not None
+                and recv_obj.output_top_logprobs_val_array[recv_obj_index] is not None
+            ):
+                state.output_top_logprobs_val.extend(
+                    recv_obj.output_top_logprobs_val_array[recv_obj_index]
+                )
+                state.output_top_logprobs_idx.extend(
+                    recv_obj.output_top_logprobs_idx_array[recv_obj_index]
                 )
             if recv_obj.output_top_logprobs_val is not None:
                 state.output_top_logprobs_val.extend(

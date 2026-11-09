@@ -11,6 +11,7 @@ from typing import (
     Optional,
 )
 
+import numpy as np
 import torch
 import zmq
 
@@ -375,6 +376,8 @@ class _GenerationStreamAccumulator:
     input_top_logprobs_idx_flat: Optional[list] = None
     input_top_logprobs_flat_null_prefix: Optional[list] = None
     has_input_top_logprobs_flat: bool = False
+    output_top_logprobs_val_array: list = field(default_factory=list)
+    output_top_logprobs_idx_array: list = field(default_factory=list)
     output_top_logprobs_val: Optional[list] = None
     output_top_logprobs_idx: Optional[list] = None
     input_token_ids_logprobs_val: Optional[list] = None
@@ -600,15 +603,31 @@ class _GenerationStreamAccumulator:
                         send_output_token_logprobs_offset:logprob_end
                     ]
                 )
+                rows = req.logprob.output_top_logprobs_val[
+                    send_output_token_logprobs_offset:logprob_end
+                ]
                 self.output_top_logprobs_val.append(
-                    req.logprob.output_top_logprobs_val[
-                        send_output_token_logprobs_offset:logprob_end
-                    ]
+                    [] if req.sampling_params.array_output_logprobs else rows
                 )
+                self.output_top_logprobs_val_array.append(
+                    np.asarray(rows, dtype=np.float32).reshape(
+                        -1, req.logprob.top_logprobs_num
+                    )
+                    if req.sampling_params.array_output_logprobs
+                    else None
+                )
+                rows = req.logprob.output_top_logprobs_idx[
+                    send_output_token_logprobs_offset:logprob_end
+                ]
                 self.output_top_logprobs_idx.append(
-                    req.logprob.output_top_logprobs_idx[
-                        send_output_token_logprobs_offset:logprob_end
-                    ]
+                    [] if req.sampling_params.array_output_logprobs else rows
+                )
+                self.output_top_logprobs_idx_array.append(
+                    np.asarray(rows, dtype=np.int32).reshape(
+                        -1, req.logprob.top_logprobs_num
+                    )
+                    if req.sampling_params.array_output_logprobs
+                    else None
                 )
                 self.output_token_ids_logprobs_val.append(
                     req.logprob.output_token_ids_logprobs_val[
@@ -625,7 +644,9 @@ class _GenerationStreamAccumulator:
                 self.output_token_logprobs_val.append([])
                 self.output_token_logprobs_idx.append([])
                 self.output_top_logprobs_val.append([])
+                self.output_top_logprobs_val_array.append(None)
                 self.output_top_logprobs_idx.append([])
+                self.output_top_logprobs_idx_array.append(None)
                 self.output_token_ids_logprobs_val.append([])
                 self.output_token_ids_logprobs_idx.append([])
 
@@ -744,7 +765,9 @@ class _GenerationStreamAccumulator:
                 else None
             ),
             output_top_logprobs_val=self.output_top_logprobs_val,
+            output_top_logprobs_val_array=self.output_top_logprobs_val_array or None,
             output_top_logprobs_idx=self.output_top_logprobs_idx,
+            output_top_logprobs_idx_array=self.output_top_logprobs_idx_array or None,
             input_token_ids_logprobs_val=self.input_token_ids_logprobs_val,
             input_token_ids_logprobs_idx=self.input_token_ids_logprobs_idx,
             output_token_ids_logprobs_val=self.output_token_ids_logprobs_val,

@@ -92,6 +92,10 @@ class SamplingBatchInfo:
     # Used for deterministic sampling
     sampling_seed: Optional[torch.Tensor] = None
 
+    mc32_flags: Optional[List[bool]] = None
+    array_logprob_flags: Optional[List[bool]] = None
+    probe_seeds: Optional[torch.Tensor] = None
+
     # CPU request flags and their derived device indices. The flags make batch
     # filtering cheap; the indices keep sampler work limited to opted-in rows.
     return_sampling_masks: Optional[List[bool]] = None
@@ -250,6 +254,13 @@ class SamplingBatchInfo:
             top_ks=top_ks,
             min_ps=min_ps,
             sampling_seed=sampling_seed,
+            mc32_flags=[r.sampling_params.score_centering_samples == 32 for r in reqs],
+            array_logprob_flags=[r.sampling_params.array_output_logprobs for r in reqs],
+            probe_seeds=torch.tensor(
+                [r.sampling_params.sampling_seed or 0 for r in reqs],
+                dtype=torch.int64,
+                pin_memory=_pin,
+            ).to(device, non_blocking=True),
             is_all_greedy=all(r.sampling_params.top_k <= 1 for r in reqs),
             is_any_greedy=any(r.sampling_params.top_k <= 1 for r in reqs),
             need_top_p_sampling=any(r.sampling_params.top_p != 1.0 for r in reqs),
@@ -424,11 +435,16 @@ class SamplingBatchInfo:
             "top_ks",
             "min_ps",
             "sampling_seed",
+            "probe_seeds",
         ]:
             value = getattr(self, item, None)
             if value is not None:
                 setattr(self, item, value[keep_indices_device])
 
+        for name in ("mc32_flags", "array_logprob_flags"):
+            flags = getattr(self, name)
+            if flags is not None:
+                setattr(self, name, [flags[i] for i in keep_indices])
         if self.logit_bias is not None:
             self.logit_bias = self.logit_bias[keep_indices_device]
         if self.return_sampling_masks is not None:
@@ -538,6 +554,14 @@ class SamplingBatchInfo:
                 )
             )
 
+        for name in ("mc32_flags", "array_logprob_flags"):
+            setattr(
+                self,
+                name,
+                (getattr(self, name) or [False] * len(self))
+                + (getattr(other, name) or [False] * len(other)),
+            )
+
         # Note: because the __len()__ operator is defined on the temperatures tensor,
         # please make sure any merge operation with len(self) or len(other) is done before
         # the merge operation of the temperatures tensor below.
@@ -547,6 +571,7 @@ class SamplingBatchInfo:
             "top_ks",
             "min_ps",
             "sampling_seed",
+            "probe_seeds",
         ]:
             self_val = getattr(self, item, None)
             other_val = getattr(other, item, None)
