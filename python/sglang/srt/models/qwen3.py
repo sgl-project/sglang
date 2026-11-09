@@ -122,8 +122,9 @@ def aiter_fused_qk_norm_rope_set_kv(
 
     ``qkv`` is the (num_tokens, (num_heads + 2 * num_kv_heads) * head_dim) QKV
     projection; ``k_cache`` / ``v_cache`` are the NHD (slots, num_kv_heads,
-    head_dim) pool buffers, in ``qkv``'s dtype or ``aiter.dtypes.fp8``. An fp8
-    cache stores k / k_scale and v / v_scale; other caches ignore the scales.
+    head_dim) pool buffers, or the vectorized_5d ones, which are aiter's shuffle
+    layout, in ``qkv``'s dtype or ``aiter.dtypes.fp8``. An fp8 cache stores
+    k / k_scale and v / v_scale; other caches ignore the scales.
     ``k_scale`` / ``v_scale`` must be CPU tensors: the kernel reads them on the
     host. Returns q as (num_tokens, num_heads * head_dim).
     """
@@ -131,6 +132,8 @@ def aiter_fused_qk_norm_rope_set_kv(
     q_out = torch.empty(
         num_tokens, num_heads, head_dim, dtype=qkv.dtype, device=qkv.device
     )
+    # A vectorized_5d K buffer is (blocks, heads, head_dim // x, block_size, x).
+    shuffle = k_cache.dim() == 5
     kernel_kwargs = dict(
         qkv=qkv.view(num_tokens, -1, head_dim),
         qw=q_norm.weight,
@@ -147,17 +150,17 @@ def aiter_fused_qk_norm_rope_set_kv(
         q_out=q_out,
         # The kernel reads cache strides as (block, token, head); an NHD buffer
         # is one-slot blocks addressed with block_size=0.
-        k_cache=k_cache.unsqueeze(1),
-        v_cache=v_cache.unsqueeze(1),
+        k_cache=k_cache if shuffle else k_cache.unsqueeze(1),
+        v_cache=v_cache if shuffle else v_cache.unsqueeze(1),
         slot_mapping=out_cache_loc,
         per_tensor_k_scale=k_scale,
         per_tensor_v_scale=v_scale,
         k_out=None,
         v_out=None,
         return_kv=False,
-        use_shuffle_layout=False,
-        block_size=0,
-        x=0,
+        use_shuffle_layout=shuffle,
+        block_size=k_cache.shape[3] if shuffle else 0,
+        x=k_cache.shape[4] if shuffle else 0,
     )
     if isinstance(rotary_emb, MRotaryEmbedding):
         fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
@@ -477,15 +480,15 @@ class Qwen3Attention(nn.Module):
         )
         if can_try_aiter_fused:
             k_cache, v_cache = get_kv_layers().read(self.attn.layer_id).kv()
-            # The fused write targets the NHD layout, in the activation dtype or
-            # the one fp8 dtype the kernel quantizes to. A fused-norm (fp8,
-            # scale) input still yields a bf16 qkv.
+            # The fused write targets the NHD layout or the vectorized_5d one, in
+            # the activation dtype or the one fp8 dtype the kernel quantizes to.
+            # A fused-norm (fp8, scale) input still yields a bf16 qkv.
             act_dtype = (
                 torch.bfloat16
                 if isinstance(hidden_states, tuple)
                 else hidden_states.dtype
             )
-            use_aiter_fused = k_cache.dim() == 3 and (
+            use_aiter_fused = k_cache.dim() in (3, 5) and (
                 k_cache.dtype in (act_dtype, aiter_dtypes.fp8)
             )
 
