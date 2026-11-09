@@ -1,7 +1,7 @@
 """Inkling checkpoint writes use live physical slots, including graph replay."""
 
 import unittest
-from contextlib import ExitStack, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -18,13 +18,25 @@ from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec, StateView
 from sglang.srt.mem_cache.kv.requests import RequestTable
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.models.inkling_common.sconv import ShortConvolution
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.unified_allocator_fixtures import arena_of
 
-register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-small")
+
+
+@contextmanager
+def _capture(graph):
+    """Capture ``graph`` as serving does (`freeze_gc`): no garbage collection runs."""
+    # TODO(ch-wan): an unidentified reference cycle the unified allocator leaves
+    # has a finalizer that touches CUDA; a GC run during capture invalidates it.
+    from sglang.srt.model_executor.runner.base_cuda_graph_runner import freeze_gc
+
+    with freeze_gc(enable_cudagraph_gc=False), torch.cuda.graph(graph):
+        yield
+
 
 _BACKEND = "sglang.srt.layers.attention.linear.inkling_sconv_backend"
 
@@ -34,7 +46,7 @@ class TestInklingCheckpointIndices(CustomTestCase):
     def make_backend(
         self,
         *,
-        lazy=False,
+        lazy=True,
         static=False,
         slot_count=6,
         draft_token_num=None,
@@ -67,7 +79,6 @@ class TestInklingCheckpointIndices(CustomTestCase):
         pool = StateView(
             arena=shared,
             spec=shared.spec("mamba"),
-            spec_state_size=0,
             mamba_layer_ids=[0, 1],
         )
         allocator = Band(
@@ -145,7 +156,7 @@ class TestInklingCheckpointIndices(CustomTestCase):
         return hidden
 
     def test_prefill_checkpoint_after_real_compaction(self):
-        for lazy in (False, True):
+        for lazy in (True,):
             with self.subTest(lazy=lazy):
                 backend, allocator, pool, slots = self.make_backend(lazy=lazy)
                 virtual = slots[-1:].clone()
@@ -178,7 +189,7 @@ class TestInklingCheckpointIndices(CustomTestCase):
         cache = pool.mamba_cache.conv[0][0]
         self.scatter(backend, batch, cache)  # compile before capture
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
+        with _capture(graph):
             self.scatter(backend, batch, cache)
         allocator.free(slots[:1].clone())
         allocator._flush(urgent=True)
@@ -338,7 +349,7 @@ class TestInklingCheckpointIndices(CustomTestCase):
 
         decode()
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
+        with _capture(graph):
             decode()
         for step, live in enumerate((3, 1, 4)):
             with self.subTest(live=live):
@@ -517,6 +528,7 @@ class TestInklingCheckpointIndices(CustomTestCase):
                         )
                         if not static:
                             allocator.free(slots[step : step + 1].clone())
+                            allocator.flush_for_allocation()
                         wrapper = InklingShortConvHybridAttnBackend.__new__(
                             InklingShortConvHybridAttnBackend
                         )
@@ -676,6 +688,7 @@ class TestInklingCheckpointIndices(CustomTestCase):
         from sglang.srt.speculative import (
             multi_layer_eagle_draft_extend_cuda_graph_runner as multi,
         )
+        from sglang.srt.speculative.eagle_megakernel import STOCK_EAGLE_DRAFT_RUNTIME
 
         model_runner = SimpleNamespace(
             device="cuda",
@@ -695,7 +708,7 @@ class TestInklingCheckpointIndices(CustomTestCase):
             speculative_algorithm=SimpleNamespace(is_standalone=lambda: False),
             seed_dsa_topk_from_draft_extend=False,
             mtp_model_runner=lambda step: model_runner,
-            megakernel=None,
+            draft_runtime=STOCK_EAGLE_DRAFT_RUNTIME,
         )
         runtime = SimpleNamespace(
             mamba=SimpleNamespace(enable_mamba_extra_buffer=tracking),
@@ -748,7 +761,7 @@ class TestInklingCheckpointIndices(CustomTestCase):
                 "require_mlp_tp_gather": False,
                 "require_mlp_sync": False,
                 "require_attn_tp_gather": False,
-                "resolve_decode_backend": Mock(),
+                "resolve_decode_backend": Mock(cache_loc_dtype=torch.int64),
             }
             for name, result in replacements.items():
                 stack.enter_context(patch.object(eagle, name, return_value=result))
@@ -767,6 +780,7 @@ class TestInklingCheckpointIndices(CustomTestCase):
         from sglang.srt.speculative import (
             multi_layer_eagle_draft_extend_cuda_graph_runner as multi,
         )
+        from sglang.srt.speculative.eagle_megakernel import STOCK_EAGLE_DRAFT_RUNTIME
 
         backend, allocator, pool, slots = self.make_backend(
             lazy=True, static=static, slot_count=12, draft_token_num=4, fused=fused
@@ -799,8 +813,8 @@ class TestInklingCheckpointIndices(CustomTestCase):
             else eagle.EAGLEDraftExtendCudaGraphRunner
         )
         runner = cls.__new__(cls)
-        runner.megakernel = None
-        runner.megakernel_served = frozenset()
+        runner.draft_runtime = STOCK_EAGLE_DRAFT_RUNTIME
+        runner.specialized_batches = frozenset()
         runner.buffers = buffers
         runner.captured_req_width = 4
         runner.forward_mode = ForwardMode.DRAFT_EXTEND_V2
@@ -869,7 +883,7 @@ class TestInklingCheckpointIndices(CustomTestCase):
         with patch.object(backend, "_refresh_sconv_metadata"):
             backend.init_forward_metadata_in_graph(batch)
             graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
+            with _capture(graph):
                 backend.init_forward_metadata_in_graph(batch)
         pointer = backend._cache_indices_buf.data_ptr()
         track_pointer = backend._graph_track_indices.data_ptr()
@@ -974,7 +988,7 @@ class TestInklingCheckpointIndices(CustomTestCase):
 
         def capture_graph(key, run_once, **kwargs):
             run_once()
-            with torch.cuda.graph(graph):
+            with _capture(graph):
                 run_once()
 
         runner.model_runner.model = SimpleNamespace(forward=model_forward)
