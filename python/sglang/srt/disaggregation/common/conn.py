@@ -711,6 +711,30 @@ class CommonKVManager(BaseKVManager):
                 self._deferred_ack_targets.pop(bootstrap_room, None)
                 self._deferred_ack_poisoned_rooms.discard(bootstrap_room)
                 self._staging_outstanding.pop(bootstrap_room, None)
+                transfer_infos = getattr(self, "transfer_infos", None)
+                parked_infos = (
+                    transfer_infos.pop(~bootstrap_room, None)
+                    if transfer_infos is not None
+                    else None
+                )
+                if parked_infos:
+                    infos = transfer_infos.setdefault(bootstrap_room, {})
+                    infos.update(parked_infos)
+                    first_info = next(iter(infos.values()), None)
+                    if (
+                        first_info is not None
+                        and len(infos) == first_info.required_dst_info_num
+                    ):
+                        self.resolve_kv_replica_factor(infos)
+                        self.req_to_decode_prefix_len[bootstrap_room] = next(
+                            (
+                                info.decode_prefix_len
+                                for info in infos.values()
+                                if info.decode_prefix_len is not None
+                            ),
+                            0,
+                        )
+                        status = KVPoll.WaitingForInput
                 self.request_status[bootstrap_room] = status
             return
         if status == KVPoll.Failed:
@@ -3011,8 +3035,7 @@ class CommonKVReceiver(BaseKVReceiver):
         self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].discard(
             self.bootstrap_room
         )
-        if self.kv_mgr.defer_decode_allocation:
-            self._owns_bootstrap_room = False
+        self._owns_bootstrap_room = False
 
     def failure_exception(self):
         self.conclude_state = KVPoll.Failed

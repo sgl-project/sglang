@@ -3300,12 +3300,19 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 else:
                     required_dst_info_num = int(waiting_req_bytes[7].decode("ascii"))
                     room = int(room)
+                    transfer_info = TransferInfo.from_zmq(waiting_req_bytes)
+                    if self.request_status.get(room) == KVPoll.Success:
+                        self.transfer_infos.setdefault(~room, {})[
+                            mooncake_session_id
+                        ] = transfer_info
+                        continue
                     if room not in self.transfer_infos:
                         self.transfer_infos[room] = {}
+                    parked_infos = self.transfer_infos.pop(~room, None)
+                    if parked_infos:
+                        self.transfer_infos[room].update(parked_infos)
 
-                    self.transfer_infos[room][mooncake_session_id] = (
-                        TransferInfo.from_zmq(waiting_req_bytes)
-                    )
+                    self.transfer_infos[room][mooncake_session_id] = transfer_info
                     # NOTE: after bootstrapping we can mark the req as waiting for input
                     if len(self.transfer_infos[room]) == required_dst_info_num:
                         self.resolve_kv_replica_factor(self.transfer_infos[room])
