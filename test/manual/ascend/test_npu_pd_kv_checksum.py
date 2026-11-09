@@ -117,9 +117,7 @@ class _NpuPdKvChecksumBase(PDDisaggregationServerBase):
             "PYTHONPATH": os.pathsep.join(p for p in python_path if p)
         }
 
-        # The base class picks mooncake plus RDMA devices from the CI
-        # environment; NPU transfers go over the ascend backend instead.
-        cls.transfer_backend = ["--disaggregation-transfer-backend", "ascend"]
+        # Use the shared PD fixture backend, which defaults to Mooncake.
         cls.rdma_devices = []
 
         common_args = [
@@ -255,8 +253,7 @@ class TestNpuPdKvChecksum(_NpuPdKvChecksumBase):
         self.assertTrue(self.send_request(self.gen_prompt(300))["text"])
 
     def test_requests_across_page_counts(self):
-        # The longest prompt spans more than 64 pages, so each checksum program
-        # walks several pages, and prefill sends its KV in more than one chunk.
+        # The longest prompt spans more than 64 pages and multiple prefill chunks.
         for token_num in (1, 17, 300, 800, 2000, 10000):
             with self.subTest(token_num=token_num):
                 response = self.send_request(self.gen_prompt(token_num))
