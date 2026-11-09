@@ -427,8 +427,12 @@ class SessionController:
                 self.sessions[sid].close_on_finish = False
                 self._close(sid)
 
+            # A deferred close is already pending; closing it again each
+            # second would only repeat its log lines.
             timed_out = [
-                sid for sid, session in self.sessions.items() if session.is_timed_out()
+                sid
+                for sid, session in self.sessions.items()
+                if session.is_timed_out() and not session.close_on_finish
             ]
             for sid in timed_out:
                 log_info_on_rank0(logger, f"Session {sid} timed out, closing.")
