@@ -12,14 +12,16 @@ from transformers import (
     Gemma2Config,
     Gemma3TextConfig,
     LlamaConfig,
+    PretrainedConfig,
     Qwen3_5Config,
 )
 
-from sglang.srt.arg_groups.overrides import model_config_of
+from sglang.srt.arg_groups.model_override_base import model_config_of
 from sglang.srt.configs.model_config import (
     ModelConfig,
     get_hybrid_layer_ids,
     is_embedding_gemma,
+    is_embedding_nemotron3,
     is_hybrid_swa_model,
     is_layer_types_hybrid_swa_model,
     is_multimodal_model,
@@ -133,6 +135,28 @@ class TestEmbeddingGemmaConfig(CustomTestCase):
             model_type="gemma3_text", use_bidirectional_attention=False
         )
         self.assertFalse(is_embedding_gemma(config))
+
+
+class TestEmbeddingNemotron3Config(CustomTestCase):
+    def test_detects_bidirectional_mean_pooled_ministral3(self):
+        config = PretrainedConfig(
+            architectures=["Ministral3Model"], is_causal=False, pooling="avg"
+        )
+        self.assertTrue(is_embedding_nemotron3(config))
+
+    def test_does_not_misclassify_other_ministral3_checkpoints(self):
+        for fields in (
+            {"architectures": ["Ministral3Model"]},
+            {"architectures": ["Ministral3Model"], "is_causal": False},
+            {"architectures": ["Ministral3Model"], "pooling": "avg"},
+            {
+                "architectures": ["Ministral3ForCausalLM"],
+                "is_causal": False,
+                "pooling": "avg",
+            },
+        ):
+            with self.subTest(fields=fields):
+                self.assertFalse(is_embedding_nemotron3(PretrainedConfig(**fields)))
 
 
 class TestDraftModelConfig(CustomTestCase):
@@ -363,6 +387,41 @@ class TestDecisionCheckpointConfig(CustomTestCase):
                 self._checkpoint(checkpoint, **decision)
                 with self.assertRaisesRegex(ValueError, "is not supported"):
                     load_decision_config(checkpoint, None)
+
+
+class TestAudioUnderstandableFlag(CustomTestCase):
+    """is_audio_understandable_model must key on the value, not attribute
+    presence. Non-audio variants of multimodal families ship audio_config:
+    null in config.json; a presence check (hasattr) reads that as
+    audio-capable and /model_info misreports has_audio_understanding. The
+    flag must be True only when an audio config value is present.
+    """
+
+    def _build(self, **config_kwargs):
+        with TemporaryDirectory() as checkpoint:
+            LlamaConfig(
+                architectures=["LlamaForCausalLM"],
+                hidden_size=16,
+                intermediate_size=32,
+                num_attention_heads=2,
+                num_hidden_layers=2,
+                vocab_size=128,
+                **config_kwargs,
+            ).save_pretrained(checkpoint)
+            return ModelConfig.from_server_args(ServerArgs(model_path=checkpoint))
+
+    def test_missing_audio_config_is_not_understandable(self):
+        self.assertFalse(self._build().is_audio_understandable_model)
+
+    def test_null_audio_config_is_not_understandable(self):
+        self.assertFalse(self._build(audio_config=None).is_audio_understandable_model)
+
+    def test_present_audio_config_is_understandable(self):
+        self.assertTrue(
+            self._build(
+                audio_config={"num_mel_bins": 128}
+            ).is_audio_understandable_model
+        )
 
 
 class TestDefaultContextLength(CustomTestCase):

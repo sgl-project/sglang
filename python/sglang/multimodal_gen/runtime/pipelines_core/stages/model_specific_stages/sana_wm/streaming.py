@@ -26,7 +26,7 @@ from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_c
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
-from sglang.multimodal_gen.runtime.models.dits.sana_wm import (
+from sglang.multimodal_gen.runtime.models.dits.sana_wm_components import (
     _NUM_STREAM_CACHE_SLOTS,
 )
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (

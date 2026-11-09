@@ -205,6 +205,7 @@ KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS: Dict[str, str] = {
     "fal/ideogram-v4-fast": "Ideogram4FastPipeline",
     "fal/ideogram-v4-instant": "Ideogram4InstantPipeline",
     "comfy-org/ideogram-4": "Ideogram4Nvfp4Pipeline",
+    "hidream-ai/hidream-o1-image": "HiDreamO1ImagePipeline",
 }
 
 
@@ -715,10 +716,6 @@ def get_model_info(
 
 
 _discover_and_register_configs()
-
-
-def is_known_non_diffusers_multimodal_model(model_path: str) -> bool:
-    return get_non_diffusers_pipeline_name(model_path) is not None
 
 
 def get_non_diffusers_pipeline_name(model_path: str) -> Optional[str]:

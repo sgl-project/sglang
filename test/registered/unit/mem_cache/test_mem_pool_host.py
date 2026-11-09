@@ -273,7 +273,10 @@ class TestHostKVCache(CustomTestCase):
             enable_memory_saver=False,
         )
         index_host = MHATokenToKOnlyPoolHost(
-            index_pool, self.host_pool, "layer_first", pin_memory=False
+            buffer_info=index_pool.get_device_pool_infos()[0].buffer_info,
+            anchor_host=self.host_pool,
+            layout="layer_first",
+            pin_memory=False,
         )
         group = HostPoolGroup(
             [
@@ -612,16 +615,14 @@ class TestLazyHostPoolRelease(CustomTestCase):
         pool._slot_siblings = []
         (info,) = pool.get_device_pool_infos()
         info.buffer_info.validate(layer_ids=info.layer_ids)
-        # CPU buffers: keep the XPU refusal off when this runs on an XPU host.
-        with unittest.mock.patch.object(mamba_pool_host, "_is_xpu", False):
-            host = MambaPoolHost(
-                info.buffer_info,
-                host_to_device_ratio=2,
-                host_size=0,
-                device_capacity=4,
-                layout="page_first",
-                pin_memory=False,
-            )
+        host = MambaPoolHost(
+            info.buffer_info,
+            host_to_device_ratio=2,
+            host_size=0,
+            device_capacity=4,
+            layout="page_first",
+            pin_memory=False,
+        )
         try:
             self.assertEqual(info.layer_ids, ())
             self.assertEqual(host.num_mamba_layers, 0)
@@ -819,6 +820,141 @@ class TestHostPoolGroup(CustomTestCase):
         self.assertEqual(group.available_size(PoolName.SWA), 1)
         self.assertEqual(group.available_size(PoolName.MAMBA), 2)
 
+    def test_reclaim_exception_rolls_back_side_allocations(self):
+        group = self._group(kv=4, draft=2, mamba=2, swa=1)
+        existing = group.alloc(2, pool=PoolName.DRAFT)
+        transfers = [
+            PoolTransfer(
+                name=PoolName.DRAFT,
+                device_indices=torch.arange(2),
+                host_indices=existing,
+            ),
+            PoolTransfer(name=PoolName.MAMBA, device_indices=torch.arange(2)),
+            PoolTransfer(name=PoolName.SWA, device_indices=torch.arange(2)),
+        ]
+        failure = RuntimeError("host reclaim failed")
+        group.get_entry(PoolName.SWA).host_evict_fn = unittest.mock.Mock(
+            side_effect=failure
+        )
+
+        with self.assertRaises(RuntimeError) as caught:
+            group.resolve_host_transfers(transfers)
+
+        self.assertIs(caught.exception, failure)
+        self.assertIs(transfers[0].host_indices, existing)
+        self.assertTrue(all(t.host_indices is None for t in transfers[1:]))
+        self.assertEqual(group.available_size(PoolName.DRAFT), 0)
+        self.assertEqual(group.available_size(PoolName.MAMBA), 2)
+        self.assertEqual(group.available_size(PoolName.SWA), 1)
+
+    def test_rollback_drains_allocations_when_free_raises(self):
+        group = self._group(kv=4, draft=2, mamba=2, swa=2)
+        transfers = [
+            PoolTransfer(name=name, device_indices=torch.arange(2))
+            for name in (PoolName.DRAFT, PoolName.MAMBA, PoolName.SWA)
+        ]
+        failure = RuntimeError("host allocation failed")
+        cleanup_failure = RuntimeError("host free failed")
+        original_free = group.free
+
+        def free(indices, *, pool=None):
+            if pool == PoolName.MAMBA:
+                raise cleanup_failure
+            return original_free(indices, pool=pool)
+
+        with (
+            unittest.mock.patch.object(
+                group.get_pool(PoolName.SWA), "alloc", side_effect=failure
+            ),
+            unittest.mock.patch.object(group, "free", side_effect=free) as freed,
+            self.assertRaises(RuntimeError) as caught,
+        ):
+            group.resolve_host_transfers(transfers)
+
+        self.assertIs(caught.exception, failure)
+        self.assertIs(caught.exception.__cause__, cleanup_failure)
+        self.assertEqual(
+            [call.kwargs["pool"] for call in freed.call_args_list],
+            [PoolName.MAMBA, PoolName.DRAFT],
+        )
+        self.assertTrue(all(t.host_indices is None for t in transfers))
+        self.assertEqual(group.available_size(PoolName.DRAFT), 2)
+        self.assertEqual(group.available_size(PoolName.MAMBA), 0)
+
+    def test_write_rolls_back_unsubmitted_pools_on_side_allocation_failure(self):
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+            HybridCacheController,
+        )
+
+        for raises in (False, True):
+            with self.subTest(raises=raises):
+                group = self._group(kv=4, mamba=2, swa=2)
+                controller = HybridCacheController.__new__(HybridCacheController)
+                controller.mem_pool_host = group
+                controller.write_queue = []
+                transfers = [
+                    PoolTransfer(name=PoolName.MAMBA, device_indices=torch.arange(2)),
+                    PoolTransfer(name=PoolName.SWA, device_indices=torch.arange(2)),
+                ]
+                failure = RuntimeError("host side-pool allocation failed")
+                with (
+                    unittest.mock.patch.object(
+                        group.get_pool(PoolName.SWA),
+                        "alloc",
+                        **(
+                            {"side_effect": failure}
+                            if raises
+                            else {"return_value": None}
+                        ),
+                    ),
+                    unittest.mock.patch.object(group, "free", wraps=group.free) as free,
+                ):
+                    if raises:
+                        with self.assertRaises(RuntimeError) as caught:
+                            controller.write(torch.arange(2), extra_pools=transfers)
+                        self.assertIs(caught.exception, failure)
+                    else:
+                        self.assertIsNone(
+                            controller.write(torch.arange(2), extra_pools=transfers)
+                        )
+                    self.assertEqual(free.call_count, 2)
+                    self.assertEqual(
+                        [
+                            call.kwargs.get("pool", PoolName.KV)
+                            for call in free.call_args_list
+                        ],
+                        [PoolName.MAMBA, PoolName.KV],
+                    )
+                self.assertEqual(controller.write_queue, [])
+                self.assertTrue(all(t.host_indices is None for t in transfers))
+                for name, expected in (
+                    (PoolName.KV, 4),
+                    (PoolName.MAMBA, 2),
+                    (PoolName.SWA, 2),
+                ):
+                    self.assertEqual(group.available_size(name), expected)
+
+    def test_write_keeps_allocations_after_queue_submission(self):
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+            HybridCacheController,
+        )
+
+        group = self._group(kv=4, mamba=2)
+        controller = HybridCacheController.__new__(HybridCacheController)
+        controller.mem_pool_host = group
+        controller.write_queue = []
+        transfers = [PoolTransfer(name=PoolName.MAMBA, device_indices=torch.arange(2))]
+        with unittest.mock.patch.object(group, "free", wraps=group.free) as free:
+            primary = controller.write(
+                torch.arange(2), extra_pools=transfers, flush=False
+            )
+            free.assert_not_called()
+        self.assertEqual(len(controller.write_queue), 1)
+        self.assertIs(controller.write_queue[0].host_indices, primary)
+        self.assertIs(controller.write_queue[0].pool_transfers[0], transfers[0])
+        self.assertEqual(group.available_size(PoolName.KV), 2)
+        self.assertEqual(group.available_size(PoolName.MAMBA), 0)
+
 
 def _make_indexer_host(pool, anchor, *, packed_draft_device_pools=(), **kwargs):
     from sglang.srt.mem_cache.hybrid_cache.host_pool_config import (
@@ -934,7 +1070,6 @@ class TestDSAIndexerPoolInfo(CustomTestCase):
     def test_host_bytes_match_observed_allocation(self):
         info = self._stub().get_device_pool_infos()[1].buffer_info
         self.assertEqual(info.page_bytes, 8448)
-        self.assertEqual(284256 * 5 * info.page_bytes, 12006973440)
 
     def test_sharded_rank_without_index_buffers_keeps_remote_callbacks(self):
         from sglang.srt.mem_cache.hybrid_cache.host_pool_config import (
@@ -1004,23 +1139,119 @@ class TestDSAIndexerPoolInfo(CustomTestCase):
         self.assertEqual(packed.get_size_per_token(), 132 * 3)
 
 
-class TestMambaHostPoolOnXpu(CustomTestCase):
-    def test_refused_at_construction(self):
-        state = MambaStateBufferInfo(
-            temporal=torch.zeros(1, 4, 2, 2), conv=(torch.zeros(1, 4, 3, 2),)
+class TestStridedStateDetection(CustomTestCase):
+    def test_contiguous_slots_are_not_strided(self):
+        for shape in ((8, 4), (8, 4, 3), (1, 5)):
+            with self.subTest(shape=shape):
+                self.assertFalse(
+                    MambaPoolHost._slots_are_strided(torch.zeros(shape)),
+                    "a contiguous slot array must take the direct path",
+                )
+
+    def test_envelope_strided_slots_are_detected(self):
+        num_slots, per_slot, envelope = 6, 4, 10
+        raw = torch.zeros(num_slots * envelope)
+        view = torch.as_strided(raw, size=(num_slots, per_slot), stride=(envelope, 1))
+        self.assertTrue(MambaPoolHost._slots_are_strided(view))
+
+    def test_empty_tensor_is_not_strided(self):
+        self.assertFalse(MambaPoolHost._slots_are_strided(torch.zeros((0, 4))))
+
+
+def _mamba_state(layers, slots, strided=False):
+    if strided:
+        # Slot views into a wider envelope, as unified memory lays them out.
+        return MambaStateBufferInfo(
+            temporal=torch.randn(layers, slots, 2, 6)[..., :3],
+            conv=(torch.randn(layers, slots, 4, 10)[..., :5],),
         )
+    return MambaStateBufferInfo(
+        temporal=torch.randn(layers, slots, 2, 3),
+        conv=(torch.randn(layers, slots, 4, 5),),
+    )
+
+
+class TestMambaXpuBackupDispatch(CustomTestCase):
+    """On XPU, transfer_kv_mamba_lf_pf takes one layer-first source tensor."""
+
+    SLOTS = 6
+
+    def _backup(self, mtp_draft_buffer_infos, strided=False, chunk_bytes=None):
+        target = _mamba_state(layers=2, slots=self.SLOTS, strided=strided)
+        host = MambaPoolHost(
+            target,
+            host_to_device_ratio=2,
+            host_size=0,
+            device_capacity=self.SLOTS,
+            layout="page_first",
+            pin_memory=False,
+            mtp_draft_buffer_infos=mtp_draft_buffer_infos,
+        )
+        sources = []
+
+        def lf_pf(*, src_layers, dst, src_indices, dst_indices, **_):
+            # Reference semantics: dst[dst_i, layer, 0] = src_layers[layer][src_i].
+            self.assertIsInstance(src_layers, torch.Tensor)
+            sources.append(src_layers)
+            for layer in range(src_layers.shape[0]):
+                dst[dst_indices, layer, 0] = src_layers[layer][src_indices]
+
+        device_indices = torch.tensor([4, 1, 3])
+        host_indices = torch.tensor([0, 5, 2])
         with (
-            unittest.mock.patch.object(mamba_pool_host, "_is_xpu", True),
-            self.assertRaisesRegex(ValueError, "hybrid Mamba models on XPU"),
+            unittest.mock.patch.object(mamba_pool_host, "_use_xpu_mamba_ops", True),
+            unittest.mock.patch.object(
+                mamba_pool_host,
+                "_XPU_STACK_CHUNK_BYTES",
+                chunk_bytes or mamba_pool_host._XPU_STACK_CHUNK_BYTES,
+            ),
+            unittest.mock.patch.object(
+                mamba_pool_host, "transfer_kv_mamba_lf_pf", lf_pf, create=True
+            ),
         ):
-            MambaPoolHost(
-                state,
-                host_to_device_ratio=2,
-                host_size=0,
-                device_capacity=4,
-                layout="page_first",
-                pin_memory=False,
+            host.backup_from_device_all_layer(
+                None, host_indices, device_indices, "kernel"
             )
+        try:
+            layers = (target, *mtp_draft_buffer_infos)
+            device_temporal = torch.cat([info.temporal for info in layers])
+            device_conv = torch.cat([info.conv[0] for info in layers])
+            for host_buf, device_buf in (
+                (host.temporal_buffer, device_temporal),
+                (host.conv_buffer[0], device_conv),
+            ):
+                for layer in range(device_buf.shape[0]):
+                    torch.testing.assert_close(
+                        host_buf[host_indices, layer, 0],
+                        device_buf[layer][device_indices],
+                    )
+        finally:
+            host.destroy()
+        return target, sources
+
+    def test_target_only_passes_the_device_tensor(self):
+        target, sources = self._backup(())
+        self.assertIs(sources[0], target.temporal)
+        self.assertIs(sources[1], target.conv[0])
+
+    def test_mtp_draft_layers_are_stacked(self):
+        # Draft layers are separate allocations, so src_layers arrives as a list.
+        _, sources = self._backup((_mamba_state(layers=1, slots=self.SLOTS),))
+        self.assertEqual([tuple(s.shape[:2]) for s in sources], [(3, 3), (3, 3)])
+
+    def test_mtp_draft_layers_with_strided_slots(self):
+        # The strided-slot fallback reads `src_layers.device`, so the draft list
+        # must already be one tensor when it runs.
+        draft = _mamba_state(layers=1, slots=self.SLOTS, strided=True)
+        _, sources = self._backup((draft,), strided=True)
+        self.assertEqual([tuple(s.shape[:2]) for s in sources], [(3, 3), (3, 3)])
+
+    def test_each_chunk_keeps_its_src_and_dst_slots_paired(self):
+        # A 1-byte cap gives one slot per chunk, so a src/dst slice mismatch
+        # across chunks lands state in the wrong host slot.
+        draft = _mamba_state(layers=1, slots=self.SLOTS)
+        _, sources = self._backup((draft,), chunk_bytes=1)
+        self.assertEqual([tuple(s.shape[:2]) for s in sources], [(3, 1)] * 6)
 
 
 if __name__ == "__main__":

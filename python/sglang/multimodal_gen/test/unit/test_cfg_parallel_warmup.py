@@ -21,7 +21,6 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.configs.pipeline_configs.flux3_image import (
     Flux3ImageSamplingParams,
 )
@@ -34,6 +33,10 @@ from sglang.multimodal_gen.configs.pipeline_configs.longlive2 import (
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2_5 import LTX25PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.sana_wm import SanaWMPipelineConfig
 from sglang.multimodal_gen.configs.sample.longlive2 import LongLive2SamplingParams
+from sglang.multimodal_gen.configs.sample.ltx_2 import (
+    LTX2SamplingParams,
+    LTX23HQSamplingParams,
+)
 from sglang.multimodal_gen.configs.sample.ltx_2_5 import LTX25SamplingParams
 from sglang.multimodal_gen.configs.sample.minimax_h3 import MiniMaxH3SamplingParams
 from sglang.multimodal_gen.configs.sample.sampling_params import (
@@ -41,6 +44,7 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
     normalize_quality,
 )
 from sglang.multimodal_gen.configs.sample.sana_wm import SanaWMSamplingParams
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
     SetLoraReq,
     UnmergeLoraWeightsReq,
@@ -56,6 +60,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.image_encoding import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.input_validation import (
     InputValidationStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ltx_2.upsampling import (
+    LTX2HalveResolutionStage,
 )
 from sglang.multimodal_gen.runtime.server_warmup import (
     format_warmup_req,
@@ -857,6 +864,41 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
             ),
             (1280, 720),
         )
+
+    def test_bcg_default_resolution_of_two_stage_is_the_output_resolution(self):
+        def resolve(pipeline_class_name, sampling_defaults):
+            server_args = SimpleNamespace(
+                pipeline_config=LTX25PipelineConfig(),
+                pipeline_class_name=pipeline_class_name,
+                enable_breakable_cuda_graph=True,
+            )
+            width, height = _resolve_default_warmup_resolution(
+                server_args, sampling_defaults, server_based_warmup=True
+            )
+            if pipeline_class_name != "LTX2Pipeline":
+                # warmup output must be accepted by the actual stage-1 consumer
+                stage = object.__new__(LTX2HalveResolutionStage)
+                req = stage.forward(Req(width=width, height=height), server_args)
+                self.assertEqual((req.width, req.height), (width // 2, height // 2))
+            return width, height
+
+        # 960x544 is LTX-2.5's stage-1 size; the halving stage rejects it as a request
+        self.assertEqual(
+            resolve("LTX2TwoStagePipeline", LTX25SamplingParams()), (1920, 1088)
+        )
+        self.assertEqual(
+            resolve("LTX2TwoStagePipeline", LTX2SamplingParams()), (768, 512)
+        )
+        self.assertEqual(
+            resolve("LTX2TwoStageHQPipeline", LTX23HQSamplingParams()), (1920, 1088)
+        )
+        # an unservable default falls back to an aligned warmup resolution
+        self.assertEqual(
+            resolve("LTX2TwoStagePipeline", SamplingParams(width=1000, height=600)),
+            (768, 448),
+        )
+        # one-stage runs the default resolution as is
+        self.assertEqual(resolve("LTX2Pipeline", LTX25SamplingParams()), (960, 544))
 
     def test_ltx2_two_stage_warmup_uses_pipeline_alignment(self):
         server_args = MagicMock()
