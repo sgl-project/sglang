@@ -185,7 +185,6 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_cuda,
     _is_hip,
     _is_npu,
-    _is_sail,
     _is_xpu,
     _use_aiter_bpreshuffle_gfx95,
     is_wint4afp8_or_wint4a16_config,
@@ -3383,7 +3382,6 @@ class DeepseekV4DecoderLayerBase(nn.Module):
         self._hc_attn_bf16_parts = self._hc_ffn_bf16_parts = None
         if (
             self.hc_pre_from_prev_sublayer
-            and not _is_sail
             and (
                 get_platform().is_sm100
                 or get_platform().is_sm90
@@ -3515,7 +3513,7 @@ class DeepseekV4DecoderLayerBase(nn.Module):
             )
             return y, post, comb, norm is not None
 
-        if envs.SGLANG_OPT_USE_FLASHINFER_MHC.get() and not _is_sail:
+        if envs.SGLANG_OPT_USE_FLASHINFER_MHC.get():
             y, post, comb = _flashinfer_hc_pre(
                 x,
                 hc_fn,

@@ -353,6 +353,9 @@ class TestSailMxfp4W4a16(CustomTestCase):
 
     def test_dispatcher_dtype_matches_activation_not_packed_weights(self):
         """Both W4A16 modes use BF16 dispatch; only W4A4 may use uint8 dispatch."""
+        from sglang.srt.hardware_backend.sail.moe.dispatcher_quant import (
+            build_early_dispatcher_quant_config,
+        )
         from sglang.srt.layers.moe.fused_moe_triton import layer as layer_module
 
         layer = object.__new__(layer_module.FusedMoE)
@@ -365,12 +368,9 @@ class TestSailMxfp4W4a16(CustomTestCase):
             method = self._method(mma=mma)
             method.use_deepgemm_mxfp4_w4a16_valu = valu
             layer.quant_method = method
-            with (
-                self.subTest(valu=valu, mma=mma),
-                patch.object(layer_module, "_is_sail", True),
-            ):
+            with self.subTest(valu=valu, mma=mma):
                 self.assertEqual(
-                    layer._build_dispatcher_quant_config(),
+                    build_early_dispatcher_quant_config(layer),
                     {"dispatcher_output_dtype": expected, "is_channel_quant": False},
                 )
 

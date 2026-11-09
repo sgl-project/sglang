@@ -1,12 +1,14 @@
 """SAIL gather-read grouped GEMM; routing metadata is built once and reused by GEMM1.
 
 This is the torch-custom-op surface over :mod:`entrypoint`, so it lives beside it
-rather than under ``sglang.kernels.ops``: the five fused entry points are SAIL
+rather than under ``sglang.kernels.ops``: the fused entry points are SAIL
 exclusive and are imported directly by the SAIL MoE runners instead of being
-looked up through the kernel registry.
+looked up through the kernel registry. The two dense GEMM wrappers at the end
+are the same kind of surface for the SAIL quant methods, which import them on
+SAIL only, so no shared quantization module has to load this one.
 """
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 
@@ -174,3 +176,47 @@ def grouped_gemm_nt_bf16bf16bf16_fused(
         A, B, C, rows, experts, tokens, blocks, config
     )
     return rows, inv_perm, expert_ids
+
+
+def gemm_nt_f4f4bf16_fake(
+    A: torch.Tensor,
+    As: torch.Tensor,
+    B: torch.Tensor,
+    Bs: torch.Tensor,
+    C: Optional[torch.Tensor],  # bias
+    D: torch.Tensor,  # out
+) -> None:
+    return
+
+
+@register_custom_op(mutates_args=["D"], fake_impl=gemm_nt_f4f4bf16_fake)
+def gemm_nt_f4f4bf16(
+    A: torch.Tensor,
+    As: torch.Tensor,
+    B: torch.Tensor,
+    Bs: torch.Tensor,
+    C: Optional[torch.Tensor],  # bias
+    D: torch.Tensor,  # out
+) -> None:
+    sail_entrypoint.gemm_nt_f4f4bf16((A, As), (B, Bs), C, D)
+
+
+def gemm_nt_i8i8bf16_fake(
+    A: torch.Tensor,
+    As: torch.Tensor,
+    B: torch.Tensor,
+    Bs: torch.Tensor,
+    C: torch.Tensor,
+) -> None:
+    return
+
+
+@register_custom_op(mutates_args=["C"], fake_impl=gemm_nt_i8i8bf16_fake)
+def gemm_nt_i8i8bf16(
+    A: torch.Tensor,
+    As: torch.Tensor,
+    B: torch.Tensor,
+    Bs: torch.Tensor,
+    C: torch.Tensor,
+) -> None:
+    sail_entrypoint.gemm_nt_i8i8bf16((A, As), (B, Bs), C)

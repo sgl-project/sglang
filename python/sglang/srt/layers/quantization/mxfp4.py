@@ -30,7 +30,6 @@ from torch.nn.parameter import Parameter
 # setdefault preserves any explicit user override.
 os.environ.setdefault("TLLM_LOG_LEVEL", "INFO")
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.sail.deep_gemm import entrypoint as sail_entrypoint
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.amx_utils import (
     CPUQuantMethod,
@@ -168,29 +167,6 @@ def _aiter_situ_uses_a8w4() -> bool:
     """Match AITER's SiTU activation-mode precedence: A8W4 wins over A4W4, and
     gfx1250 overrides it with fp4 activations."""
     return is_gfx95_supported() and get_bool_env_var("AITER_SITUV2_A8W4", "false")
-
-
-def gemm_nt_f4f4bf16_fake(
-    A: torch.Tensor,
-    As: torch.Tensor,
-    B: torch.Tensor,
-    Bs: torch.Tensor,
-    C: Optional[torch.Tensor],  # bias
-    D: torch.Tensor,  # out
-) -> None:
-    return
-
-
-@register_custom_op(mutates_args=["D"], fake_impl=gemm_nt_f4f4bf16_fake)
-def gemm_nt_f4f4bf16(
-    A: torch.Tensor,
-    As: torch.Tensor,
-    B: torch.Tensor,
-    Bs: torch.Tensor,
-    C: Optional[torch.Tensor],  # bias
-    D: torch.Tensor,  # out
-) -> None:
-    sail_entrypoint.gemm_nt_f4f4bf16((A, As), (B, Bs), C, D)
 
 
 def _get_flashinfer_mxfp4_device_permute_indices(
@@ -531,6 +507,9 @@ class Mxfp4LinearMethod(LinearMethodBase):
         bias: Optional[torch.Tensor] = None,
     ):
         from sglang.kernels.ops.quantization.sail_mxfp4 import downcast_to_mxfp4
+        from sglang.srt.hardware_backend.sail.deep_gemm.sail_fused_deepgemm_ops import (
+            gemm_nt_f4f4bf16,
+        )
 
         output_shape = (*x.shape[:-1], layer.weight.shape[1])
         x_flat = x.reshape(-1, x.shape[-1])

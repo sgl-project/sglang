@@ -54,7 +54,6 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsW8A8Fp8,
     CompressedTensorsW8A8Fp8MoE,
     CompressedTensorsW8A8Int8,
-    CompressedTensorsW8A8Int8MoE,
     CompressedTensorsW8A8MXFp8,
     CompressedTensorsW8A16Fp8,
     CompressedTensorsWNA16,
@@ -1109,6 +1108,11 @@ class CompressedTensorsConfig(QuantizationConfig):
             elif _is_sail:
                 # SAIL uses the generic Triton/DeepGEMM W8A8 INT8 MoE scheme (the
                 # weight layout matches the NPU scheme, only the runner differs).
+                # Imported here so that no other platform loads the SAIL package.
+                from sglang.srt.hardware_backend.sail.quantization.compressed_tensors_w8a8_int8 import (
+                    CompressedTensorsW8A8Int8MoE,
+                )
+
                 logger.info_once("Using CompressedTensorsW8A8Int8MoE (SAIL)")
                 return CompressedTensorsW8A8Int8MoE(weight_quant, input_quant)
             else:
