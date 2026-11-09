@@ -111,6 +111,11 @@ class SeaweedFSStore(HiCacheStorage):
         self.config = SeaweedFSConfig.from_extra_config(storage_config.extra_config)
         scope = [self.config.prefix.strip("/")] if self.config.prefix else []
         self.key_prefix = "/".join(scope + key_scope(storage_config))
+        self._mamba_rank_tag = (
+            f".tp{storage_config.tp_rank}of{storage_config.tp_size}"
+            if storage_config.is_mla_model
+            else ""
+        )
         self._s3 = _make_s3_client(self.config)
         self._executor = ThreadPoolExecutor(max_workers=self.config.max_workers)
         self._ensure_bucket()
@@ -301,7 +306,12 @@ class SeaweedFSStore(HiCacheStorage):
 
     def _component_key(self, key: str, pool_name) -> str:
         name = getattr(pool_name, "value", pool_name)
-        return key if name == PoolName.KV.value else f"{key}.{name}"
+        if name == PoolName.KV.value:
+            return key
+        # Mamba state is TP-sharded even when the model's MLA KV is replicated.
+        if name == PoolName.MAMBA.value:
+            return f"{key}.{name}{self._mamba_rank_tag}"
+        return f"{key}.{name}"
 
     def batch_exists_v2(
         self,

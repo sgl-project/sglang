@@ -16,6 +16,7 @@ runs:
         SKIP_PR_TEST_HEALTH_CHECK: ${{ env.SKIP_PR_TEST_HEALTH_CHECK }}
       with:
         github-token: ${{ inputs.github-token }}
+        retries: 3
         script: |
           core.info(`[health-check] START -- event=${context.eventName}, runId=${context.runId}`);
 
@@ -82,7 +83,10 @@ runs:
             // match so we cover both inline + reusable forms without confusing
             // 'h20' with the 'h200' prefix.
             const baseName = j.name.split(/[ /]/)[0];
-            if (baseName === 'base-c-test-8-gpu-h20') {
+            if (
+              baseName === 'base-c-test-8-gpu-h20' ||
+              baseName === 'extra-b-test-8-gpu-h20'
+            ) {
               core.info(`[health-check] Filtered out h20 job: ${j.name}`);
               return false;
             }

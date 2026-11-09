@@ -175,21 +175,20 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
         tokens -- those collapse into the consumer's ghost slot. Real tokens
         map identically under both variants."""
         from sglang.kernels.ops.speculative.ragged_verify_kernels import (
-            PaddedToBucket,
+            PadVerifyLayout,
         )
 
-        padded = PaddedToBucket.execute(
+        padded = PadVerifyLayout.execute(
             verify_lens=self.verify_lens,
             graph_num_tokens=self.graph_num_tokens,
-            bs=self.bs,
             padded_bs=padded_bs,
+            cap=cap,
         )
-        if cap is not None:
-            padded = torch.clamp(padded, max=cap)
-
-        return RaggedVerifyLayout._assemble_device(
-            verify_lens=padded,
+        return RaggedVerifyLayout(
+            verify_lens=padded.verify_lens,
             graph_num_tokens=self.graph_num_tokens,
+            extend_start_loc=padded.extend_start_loc,
+            qo_indptr_device=padded.qo_indptr,
             total_verify_tokens=None if cap is not None else self.graph_num_tokens,
             cap=cap,
         )
@@ -216,13 +215,17 @@ def build_capture_verify_lens(
     return [base + 1] * rem + [base] * (num_slots - rem)
 
 
-def resolve_ragged_verify_layout(forward_batch) -> Optional[RaggedVerifyLayout]:
-    """Layout riding the batch's spec input, or None. Tolerates the runner's
-    ad-hoc replay batch views, which may not carry spec_info at all."""
-    spec_info = getattr(forward_batch, "spec_info", None)
-    if spec_info is None:
-        return None
-    return spec_info.ragged_verify_layout
+def ragged_verify_token_rows(
+    layout: RaggedVerifyLayout, num_tokens: int
+) -> torch.Tensor:
+    """Request row of each of ``num_tokens`` packed verify tokens.
+
+    Fixed-size, so it is CUDA-graph safe. Empty rows own no tokens, and graph
+    padding past ``qo_indptr[-1]`` maps to row ``bs``.
+    """
+    qo_indptr = layout.qo_indptr_device
+    tokens = torch.arange(num_tokens, dtype=qo_indptr.dtype, device=qo_indptr.device)
+    return torch.searchsorted(qo_indptr[1:], tokens, right=True)
 
 
 class RaggedTargetVerifyGeometry(msgspec.Struct):
@@ -278,7 +281,7 @@ def compute_target_verify_graph_key(
 
 class VerifyExtendLengths(msgspec.Struct, frozen=True):
     seq_lens_extended: torch.Tensor
-    seq_lens_cpu_extended: List[int]
+    seq_lens_cpu_extended: Optional[List[int]]
     extend_seq_lens_cpu: List[int]
     num_tokens: int
     extend_start_loc: Optional[torch.Tensor]
@@ -287,12 +290,14 @@ class VerifyExtendLengths(msgspec.Struct, frozen=True):
 def compute_uniform_extend_lengths(
     *,
     seq_lens: torch.Tensor,
-    seq_lens_cpu: List[int],
+    seq_lens_cpu: Optional[List[int]],
     extend_len: int,
 ) -> VerifyExtendLengths:
-    batch_size = len(seq_lens_cpu)
+    batch_size = seq_lens.shape[0]
     seq_lens_extended = seq_lens + extend_len
-    seq_lens_cpu_extended = [x + extend_len for x in seq_lens_cpu]
+    seq_lens_cpu_extended = (
+        None if seq_lens_cpu is None else [x + extend_len for x in seq_lens_cpu]
+    )
     extend_seq_lens_cpu = [extend_len] * batch_size
     num_tokens = extend_len * batch_size
     return VerifyExtendLengths(
@@ -301,26 +306,4 @@ def compute_uniform_extend_lengths(
         extend_seq_lens_cpu=extend_seq_lens_cpu,
         num_tokens=num_tokens,
         extend_start_loc=None,
-    )
-
-
-def compute_ragged_extend_lengths(
-    *,
-    seq_lens: torch.Tensor,
-    seq_lens_cpu: List[int],
-    ragged_layout: RaggedVerifyLayout,
-) -> VerifyExtendLengths:
-    extend_seq_lens_cpu = list(ragged_layout.verify_lens_cpu)
-    seq_lens_extended = seq_lens + ragged_layout.verify_lens
-    seq_lens_cpu_extended = [
-        raw + length for raw, length in zip(seq_lens_cpu, extend_seq_lens_cpu)
-    ]
-    num_tokens = ragged_layout.total_verify_tokens
-    extend_start_loc = ragged_layout.extend_start_loc
-    return VerifyExtendLengths(
-        seq_lens_extended=seq_lens_extended,
-        seq_lens_cpu_extended=seq_lens_cpu_extended,
-        extend_seq_lens_cpu=extend_seq_lens_cpu,
-        num_tokens=num_tokens,
-        extend_start_loc=extend_start_loc,
     )

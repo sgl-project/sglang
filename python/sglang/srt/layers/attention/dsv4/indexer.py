@@ -45,7 +45,8 @@ from sglang.srt.layers.attention.mqa_logits_utils import (
     mqa_logits_rows_per_chunk,
 )
 from sglang.srt.layers.linear import ReplicatedLinear
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
 )
@@ -58,11 +59,11 @@ from sglang.srt.runtime_context import (
     get_platform,
 )
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
-from sglang.srt.utils import add_prefix, is_cuda, is_hip, is_xpu
+from sglang.srt.utils import is_cuda, is_hip, is_xpu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-    from sglang.srt.layers.attention.dsv4.compressor import (
+    from sglang.srt.layers.attention.dsv4.compressor_v2 import (
         CompressorBackendMixin,
     )
     from sglang.srt.layers.quantization import QuantizationConfig
@@ -581,12 +582,13 @@ class C4IndexerBackendMixin:
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         skip_compressor: bool = False,
+        q_lora_quant=None,
     ) -> Tuple[IndexerQuery, torch.Tensor]:
         if TYPE_CHECKING:
             assert isinstance(self, CompressorBackendMixin)
 
         weights = c4_indexer.compute_weights(x, skip_scale=True)
-        q, weights = c4_indexer.compute_q(q_lora, positions, weights)
+        q, weights = c4_indexer.compute_q(q_lora, positions, weights, q_lora_quant)
         if not skip_compressor:
             self.forward_indexer_compressor(
                 x=x,
@@ -622,7 +624,6 @@ class C4IndexerBackendMixin:
         if (
             c4_indexer.use_fp4_indexer
             or envs.SGLANG_OPT_USE_TILELANG_INDEXER.get()
-            or envs.SGLANG_OPT_USE_AITER_INDEXER.get()
             or envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
         ):
             return False
@@ -780,6 +781,7 @@ class C4IndexerBackendMixin:
         enable_multi_stream: bool = False,
         q_lora_ready: Optional[torch.cuda.Event] = None,
         skip_compressor: bool = False,
+        q_lora_quant=None,
     ) -> None:
         if forward_batch.forward_mode.is_idle():
             return
@@ -806,6 +808,7 @@ class C4IndexerBackendMixin:
             x = x[:num_queries]
         if q_lora.shape[0] != num_queries:
             q_lora = q_lora[:num_queries]
+            q_lora_quant = None
         if positions.shape[0] != num_queries:
             positions = positions[:num_queries]
 
@@ -828,6 +831,7 @@ class C4IndexerBackendMixin:
                 positions=positions,
                 forward_batch=forward_batch,
                 skip_compressor=skip_compressor,
+                q_lora_quant=q_lora_quant,
             )
 
         use_fp4_indexer = c4_indexer.use_fp4_indexer
@@ -859,7 +863,7 @@ class C4IndexerBackendMixin:
             from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
                 tilelang_fp8_paged_mqa_logits as fn,
             )
-        elif envs.SGLANG_OPT_USE_AITER_INDEXER.get():
+        elif is_hip():
             fn = _aiter_fp8_paged_mqa_logits
         elif envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
             if get_platform().is_sm120:
@@ -896,7 +900,7 @@ class C4IndexerBackendMixin:
         _use_tilelang = (
             envs.SGLANG_OPT_USE_TILELANG_INDEXER.get() and not use_fp4_indexer
         )
-        _use_aiter = envs.SGLANG_OPT_USE_AITER_INDEXER.get() and not use_fp4_indexer
+        _use_aiter = is_hip() and not use_fp4_indexer
         _use_torch_fn = (
             envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get() and not use_fp4_indexer
         )
@@ -1218,8 +1222,10 @@ class C4Indexer(nn.Module):
         q_lora: torch.Tensor,
         positions: torch.Tensor,
         weight: torch.Tensor,
+        q_lora_quant=None,
     ) -> Tuple[IndexerQuery, torch.Tensor]:
-        q, _ = self.wq_b(q_lora)
+        # q_lora_quant: fp8 group quant of this q_lora already made for the attention wq_b.
+        q, _ = self.wq_b(q_lora if q_lora_quant is None else q_lora_quant)
         q = q.view(-1, self.n_local_heads, self.head_dim)
         if self.use_fp4_indexer and is_hip():
             q_fp4, q_scale = aiter_q_indexer_fp4(
@@ -1252,7 +1258,11 @@ class C4Indexer(nn.Module):
         enable_multi_stream: bool = False,
         q_lora_ready: Optional[torch.cuda.Event] = None,
         skip_compressor: bool = False,
+        q_lora_quant=None,
     ) -> None:
+        backend_kwargs = {}
+        if q_lora_quant is not None:
+            backend_kwargs["q_lora_quant"] = q_lora_quant
         return attn_backend.forward_c4_indexer(
             x=x,
             q_lora=q_lora,
@@ -1262,4 +1272,5 @@ class C4Indexer(nn.Module):
             enable_multi_stream=enable_multi_stream,
             q_lora_ready=q_lora_ready,
             skip_compressor=skip_compressor,
+            **backend_kwargs,
         )
