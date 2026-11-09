@@ -213,10 +213,14 @@ class MiniMaxM3Nvfp4IndexKPoolHost(HostKVCache):
             and host_indices.is_cuda
             and host_indices.device == device_indices.device
         ):
-            from sglang.kernels.ops.kvcache.page_row import prepare_nvfp4_pages
+            from sglang.kernels.ops.kvcache.page_row import prepare_page_ids
 
-            return prepare_nvfp4_pages(
-                host_indices, device_indices, self.size, self.device_slots
+            return prepare_page_ids(
+                host_indices,
+                device_indices,
+                self.size,
+                self.device_slots,
+                page_size=self.page_size,
             )
         if (
             host_indices.ndim != 1
