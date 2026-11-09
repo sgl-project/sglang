@@ -16,6 +16,7 @@ from sglang.srt.layers.attention.linear.gdn_backend import (
     validate_gdn_mis_backend,
 )
 from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
+    FlashInferGDNKernel,
     maybe_build_flashinfer_checkpoint_plan,
 )
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
@@ -88,16 +89,21 @@ def make_runner(
 
 class TestGDNPrefillGraphExtend(CustomTestCase):
     @contextmanager
-    def _setup(self, *, cuda=True, enable_mis=False, draft=False):
+    def _setup(self, *, cuda=True, enable_mis=False, draft=False, extend="triton"):
         """A target's GDN backend on a setup the graph-safe chain supports, unless
-        cuda, enable_mis or draft say otherwise."""
+        cuda, enable_mis, draft or the extend kernel say otherwise. ``extend`` is
+        "triton", "flashinfer", or "flashinfer_unqualified" (no graph support on
+        this GPU)."""
         backend = GDNAttnBackend.__new__(GDNAttnBackend)
         backend.is_draft_worker = draft
         backend.enable_mis = enable_mis
         backend._mamba_chunk_size = 64
-        backend.kernel_dispatcher = SimpleNamespace(
-            extend_kernel=TritonGDNKernel.__new__(TritonGDNKernel)
-        )
+        if extend == "triton":
+            extend_kernel = TritonGDNKernel.__new__(TritonGDNKernel)
+        else:
+            extend_kernel = FlashInferGDNKernel.__new__(FlashInferGDNKernel)
+            extend_kernel.supports_prefill_graph = extend == "flashinfer"
+        backend.kernel_dispatcher = SimpleNamespace(extend_kernel=extend_kernel)
         cache = SimpleNamespace(conv=[torch.zeros(2, 3)], temporal=torch.zeros(2, 3))
         backend.state_pool = SimpleNamespace(mamba_cache=cache)
         graph = SimpleNamespace(
@@ -123,10 +129,15 @@ class TestGDNPrefillGraphExtend(CustomTestCase):
     def test_the_switch_captures_the_extend_only_where_the_setup_supports_it(self):
         """Off, the default, breakable prefill graphs keep breaking at every GDN
         layer; on, they capture the target's extend only where this setup supports
-        the graph-safe chain, and a draft's prefill graphs keep their eager path."""
+        the graph-safe chain, and a draft's prefill graphs keep their eager path.
+        The switch alone is enough with the FlashInfer prefill kernel (the
+        SM90 / SM100 default), not only with Triton."""
         for switch, setup, captured in (
             (False, {}, False),
             (True, {}, True),
+            (False, dict(extend="flashinfer"), False),
+            (True, dict(extend="flashinfer"), True),
+            (True, dict(extend="flashinfer_unqualified"), False),
             (True, dict(cuda=False), False),
             (True, dict(enable_mis=True), False),
             (True, dict(draft=True), False),

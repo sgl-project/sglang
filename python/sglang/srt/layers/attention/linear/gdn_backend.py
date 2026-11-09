@@ -22,6 +22,7 @@ from sglang.srt.configs.hybrid_arch import hybrid_gdn_config
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
 from sglang.srt.layers.attention.linear.gdn_prefill_graph import (
+    GDN_CHUNK_SIZE,
     GDNPrefillGraphMetadata,
     buckets_keep_chunk_o_block_size,
 )
@@ -661,7 +662,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
         capture_tokens = get_exec().graph.cuda_graph_config.prefill.bs or []
         supported = (
             is_cuda()
-            and isinstance(self.kernel_dispatcher.extend_kernel, TritonGDNKernel)
+            and (
+                isinstance(self.kernel_dispatcher.extend_kernel, TritonGDNKernel)
+                or self._prefill_graph_runs_flashinfer()
+            )
             and not self.enable_mis
             # The track plan's h rows assume the delta-rule chunk size.
             and self.mamba_chunk_size == FLA_CHUNK_SIZE
@@ -676,6 +680,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
             + ("on" if supported else "unsupported here, layers keep breaking")
         )
         return supported
+
+    def _prefill_graph_runs_flashinfer(self) -> bool:
+        from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
+            FlashInferGDNKernel,
+        )
+
+        kernel = self.kernel_dispatcher.extend_kernel
+        return isinstance(kernel, FlashInferGDNKernel) and kernel.supports_prefill_graph
 
     def prefill_graph_extend_active(self) -> bool:
         return self.prefill_graph_metadata is not None
@@ -692,6 +704,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             track=get_exec().mamba.enable_mamba_extra_buffer,
             cache_index_dtype=cache_indices.dtype,
             device=self.device,
+            flashinfer=self._prefill_graph_runs_flashinfer(),
         )
         self._fill_prefill_graph_metadata(
             meta=meta, forward_batch=forward_batch, cache_indices=cache_indices
@@ -1218,7 +1231,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
     ) -> torch.Tensor:
         """forward_extend's plain-extend chain on a captured bucket's static
         tables, so every launch grid depends only on the bucket. Rows past the
-        batch belong to no sequence; chunk_fwd_o leaves them zero."""
+        batch belong to no sequence and come out zero."""
         meta = self.prefill_graph_metadata
         layer_cache = self.state_layer_cache(layer.layer_id)
         conv_states = layer_cache.conv[0]
@@ -1247,6 +1260,17 @@ class GDNAttnBackend(MambaAttnBackendBase):
         ).transpose(0, 1)
         query, key, value = self._split_prefill_qkv(layer, mixed_qkv)
         g, beta = self._prefill_gates(layer, a, b)
+        flashinfer_args = {}
+        if meta.flashinfer:
+            flashinfer_args["state_pool_in_place"] = True
+            if meta.track:
+                flashinfer_args.update(
+                    state_checkpoint_cu_starts=meta.checkpoint_cu_starts,
+                    # One snapshot row per sequence (meta.checkpoint_indices).
+                    num_state_checkpoints=meta.max_seqs,
+                    state_checkpoint_every_n_tokens=GDN_CHUNK_SIZE,
+                    state_checkpoint_indices=meta.checkpoint_indices,
+                )
         core_attn_out, _, h = self.kernel_dispatcher.extend(
             q=query,
             k=key,
@@ -1258,6 +1282,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             query_start_loc=meta.cu_seqlens,
             chunk_indices=meta.chunk_indices,
             chunk_offsets=meta.chunk_offsets,
+            **flashinfer_args,
         )
         if meta.track:
             gdn_track_ssm_state(
@@ -1267,6 +1292,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 track_h_row=meta.track_h_row,
                 track_dst=meta.track_dst,
                 cache_indices=meta.cache_indices,
+            )
+        if meta.flashinfer:
+            # Rows past the batch were never written; keep the layer's padded
+            # output finite for the MoE and the collectives.
+            core_attn_out.masked_fill_(
+                (meta.token_index >= meta.num_logical_tokens).view(1, -1, 1, 1), 0
             )
         return core_attn_out
 

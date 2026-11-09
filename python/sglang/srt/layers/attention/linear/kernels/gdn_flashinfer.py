@@ -213,6 +213,9 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         # states; SM100 accepts the state-pool dtype directly.
         self._prefill_needs_fp32_state = sm_major >= 12
         self.supports_target_verify = sm_major in (9, 10)
+        # extend(state_pool_in_place=True), the captured prefill-graph path, is
+        # only qualified on the SM90 / SM100 kernels.
+        self.supports_prefill_graph = sm_major in (9, 10)
         self._aligned_input_buffers: dict[tuple, torch.Tensor] = {}
         self._aligned_parameter_cache: dict[
             tuple, tuple[torch.Tensor, torch.Tensor]
@@ -499,6 +502,8 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         state_checkpoint_cu_starts: Optional[torch.Tensor] = None,
         num_state_checkpoints: int = 0,
         state_checkpoint_every_n_tokens: int = 0,
+        state_checkpoint_indices: Optional[torch.Tensor] = None,
+        state_pool_in_place: bool = False,
         **kwargs,
     ) -> tuple:
         from sglang.kernels.ops.attention.fla.l2norm import (
@@ -538,6 +543,23 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         # g (alpha) and beta: [1, seq, HV] -> [seq, HV], float32 for FlashInfer
         alpha_fi = torch.exp(g[0].to(torch.float32))
         beta_fi = beta[0].to(torch.float32)
+
+        if state_pool_in_place:
+            return self._extend_in_pool(
+                q=q_fi,
+                k=k_fi,
+                v=v_fi,
+                alpha=alpha_fi,
+                beta=beta_fi,
+                output=output_fi,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices,
+                cu_seqlens=query_start_loc,
+                checkpoint_cu_starts=state_checkpoint_cu_starts,
+                num_checkpoints=num_state_checkpoints,
+                checkpoint_every_n_tokens=state_checkpoint_every_n_tokens,
+                checkpoint_indices=state_checkpoint_indices,
+            )
 
         ssm_cache_indices, live_rows, initial_state_fi = gather_pool_states(
             ssm_states, cache_indices
@@ -582,6 +604,64 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         # Match Triton's [1, checkpoints, H, V, K] intermediate-state layout.
         h = state_checkpoints.unsqueeze(0) if state_checkpoints is not None else None
         return core_attn_out, None, h
+
+    def _extend_in_pool(
+        self,
+        *,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        alpha: torch.Tensor,
+        beta: torch.Tensor,
+        output: Optional[torch.Tensor],
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        checkpoint_cu_starts: Optional[torch.Tensor],
+        num_checkpoints: int,
+        checkpoint_every_n_tokens: int,
+        checkpoint_indices: Optional[torch.Tensor],
+    ) -> tuple:
+        """Prefill reading and writing the state pool rows in place, for a
+        captured prefill graph: a PAD_SLOT_ID (-1) row starts from the zero
+        state and skips its write-back, so padded sequences move no state.
+        Checkpoint e lands in row ``checkpoint_indices[e]`` (-1 skips it)."""
+        checkpoints = (
+            ssm_states.new_empty((num_checkpoints, *ssm_states.shape[1:]))
+            if num_checkpoints > 0
+            else None
+        )
+        output, _ = self._prefill_fn(
+            q=q,
+            k=k,
+            v=v,
+            g=alpha,
+            beta=beta,
+            scale=None,
+            initial_state=ssm_states,
+            output_final_state=True,
+            # Same integer widths as the eager path; the graph tables are int32.
+            cu_seqlens=cu_seqlens.to(torch.int64),
+            use_qk_l2norm_in_kernel=False,
+            output=output,
+            output_state=ssm_states,
+            state_indices=cache_indices,
+            output_state_indices=cache_indices,
+            state_checkpoints=checkpoints,
+            checkpoint_cu_starts=(
+                checkpoint_cu_starts.to(torch.int64)
+                if checkpoints is not None
+                else None
+            ),
+            checkpoint_every_n_tokens=(
+                checkpoint_every_n_tokens if checkpoints is not None else 0
+            ),
+            checkpoint_state_indices=(
+                checkpoint_indices if checkpoints is not None else None
+            ),
+        )
+        h = checkpoints.unsqueeze(0) if checkpoints is not None else None
+        return output.unsqueeze(0), None, h
 
     # ---- target_verify (MTP) ----
 

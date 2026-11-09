@@ -5,7 +5,11 @@ One bucket is captured once, then replayed for batches of different shapes:
 several sequences, cached prefixes, padding past the batch, chunk-aligned and
 unaligned prefix-cache snapshots, and a batch without tracking. Each replay must
 match the eager path bit for bit on the output, the conv / SSM state pools and
-the track slots, for FP32 and BF16 SSM states.
+the track slots, for FP32 and BF16 SSM states. The FlashInfer prefill kernel
+(SM90 / SM100) runs the same cases against its own eager path; its captured
+call reads and writes the pool in place and may pick another kernel schedule,
+so its output, request slots and track slots compare numerically while every
+other slot must stay bitwise untouched.
 """
 
 import unittest
@@ -26,10 +30,14 @@ from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace
 from sglang.srt.mem_cache.kv.decl import STATE_PART
 from sglang.srt.mem_cache.kv.router import KVLayerRouter
 from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.utils import is_flashinfer_available
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="1-gpu-small")
+# FlashInfer GDN prefill: SM90 (Hopper) and SM100.
+register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 HEADS, V_HEADS, HEAD_DIM, CONV = 2, 4, 128, 4
 DIM = (2 * HEADS + V_HEADS) * HEAD_DIM
@@ -63,7 +71,7 @@ def _layer():
     )
 
 
-def _backend(conv_pool, ssm_pool):
+def _backend(conv_pool, ssm_pool, prefill_backend=LinearAttnKernelBackend.TRITON):
     """The production backend on test pools: slot of request i is i + 1."""
     backend = GDNAttnBackend.__new__(GDNAttnBackend)
     backend.state_pool = None
@@ -90,7 +98,7 @@ def _backend(conv_pool, ssm_pool):
     backend.prefill_graph_metadata = None
     backend.kernel_dispatcher = GDNKernelDispatcher(
         LinearAttnKernelBackend.TRITON,
-        LinearAttnKernelBackend.TRITON,
+        prefill_backend,
         LinearAttnKernelBackend.TRITON,
     )
     return backend
@@ -143,6 +151,8 @@ def _batch(extend_lens, prefix_lens, track=None):
 
 @unittest.skipUnless(torch.cuda.is_available(), "needs a GPU")
 class TestGDNPrefillGraph(CustomTestCase):
+    prefill_backend = LinearAttnKernelBackend.TRITON
+
     def _setup(self, ssm_dtype):
         self.layer = _layer()
         g = torch.Generator(device="cuda").manual_seed(11)
@@ -155,7 +165,7 @@ class TestGDNPrefillGraph(CustomTestCase):
             )
             * 0.05
         ).to(ssm_dtype)
-        self.backend = _backend(self.conv_pool, self.ssm_pool)
+        self.backend = _backend(self.conv_pool, self.ssm_pool, self.prefill_backend)
         # Static inputs the captured graph reads.
         self.mixed = torch.zeros(BUCKET, DIM, device="cuda", dtype=torch.bfloat16)
         self.a = torch.zeros(BUCKET, V_HEADS, device="cuda", dtype=torch.bfloat16)
@@ -190,6 +200,7 @@ class TestGDNPrefillGraph(CustomTestCase):
             track=True,
             cache_index_dtype=torch.int32,
             device=torch.device("cuda"),
+            flashinfer=self.prefill_backend.is_flashinfer(),
         )
         capture_batch = _batch([BUCKET], [0])
         self._fill(meta, capture_batch)
@@ -229,9 +240,14 @@ class TestGDNPrefillGraph(CustomTestCase):
 
         # Eager reference on cloned pools.
         ref_conv, ref_ssm = self.conv_pool.clone(), self.ssm_pool.clone()
-        ref_backend = _backend(ref_conv, ref_ssm)
+        ref_backend = _backend(ref_conv, ref_ssm, self.prefill_backend)
         ref_batch = _batch(lens, prefixes, track=track)
-        ref_backend.init_forward_metadata(ref_batch)
+        with patch(
+            "sglang.srt.layers.attention.linear.kernels.gdn_flashinfer."
+            "mamba_cache_chunk_size",
+            return_value=CHUNK,
+        ):
+            ref_backend.init_forward_metadata(ref_batch)
         ref_out = ref_backend.forward_extend(
             self.layer,
             ref_batch,
@@ -244,10 +260,25 @@ class TestGDNPrefillGraph(CustomTestCase):
         graph.replay()
         torch.cuda.synchronize()
 
-        self.assertTrue(torch.equal(out[:, :total], ref_out[:, :total]))
+        if self.prefill_backend.is_flashinfer():
+            torch.testing.assert_close(
+                out[:, :total], ref_out[:, :total], rtol=1e-2, atol=1e-3
+            )
+            touched = list(range(1, len(lens) + 1))
+            touched += [NUM_SLOTS // 2 + row for row in (track or {})]
+            untouched = [slot for slot in range(NUM_SLOTS) if slot not in touched]
+            torch.testing.assert_close(
+                self.ssm_pool[touched], ref_ssm[touched], rtol=1e-2, atol=1e-3
+            )
+            self.assertTrue(
+                torch.equal(self.ssm_pool[untouched], ref_ssm[untouched]),
+                "untouched ssm slots differ",
+            )
+        else:
+            self.assertTrue(torch.equal(out[:, :total], ref_out[:, :total]))
+            self.assertTrue(torch.equal(self.ssm_pool, ref_ssm), "ssm pool differs")
         self.assertTrue(bool((out[:, total:] == 0).all()), "padded rows not zeroed")
         self.assertTrue(torch.equal(self.conv_pool, ref_conv), "conv pool differs")
-        self.assertTrue(torch.equal(self.ssm_pool, ref_ssm), "ssm pool differs")
 
     def test_replays_match_eager(self):
         cases = [
@@ -278,6 +309,20 @@ class TestGDNPrefillGraph(CustomTestCase):
                         track=track,
                         seed=100 + i,
                     )
+
+
+class TestFlashInferGDNPrefillGraph(TestGDNPrefillGraph):
+    prefill_backend = LinearAttnKernelBackend.FLASHINFER
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        if not torch.cuda.is_available() or not is_flashinfer_available():
+            raise unittest.SkipTest("needs a GPU and FlashInfer")
+        major = torch.cuda.get_device_capability()[0]
+        cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
+        if not (major == 9 or (major == 10 and cuda_major >= 13)):
+            raise unittest.SkipTest("FlashInfer GDN prefill graph needs SM90 or SM100")
 
 
 if __name__ == "__main__":

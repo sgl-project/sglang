@@ -69,6 +69,9 @@ class GDNPrefillGraphMetadata(msgspec.Struct, frozen=True):
     max_conv_blocks: int
     # Allocates and records the prefix-cache snapshot copies.
     track: bool
+    # The extend runs FlashInfer: snapshots come from its per-request
+    # checkpoint rows instead of the per-chunk states h.
+    flashinfer: bool
 
     # One int32 device buffer, refreshed by a single copy, and its views.
     packed: torch.Tensor
@@ -80,12 +83,18 @@ class GDNPrefillGraphMetadata(msgspec.Struct, frozen=True):
     track_h_row: torch.Tensor  # [max_seqs] row of the per-chunk states h
     track_conv_start: torch.Tensor  # [max_seqs]
     num_logical_tokens: torch.Tensor  # [1]
+    # FlashInfer only (empty otherwise): first checkpoint of each sequence, and
+    # the snapshot row each checkpoint is written to (-1 skips it).
+    checkpoint_cu_starts: torch.Tensor  # [max_seqs + 1]
+    checkpoint_indices: torch.Tensor  # [max(1, num_tokens // 64)]
     host: np.ndarray  # int32 staging for `packed`
 
     # Filled on the device from the batch.
     cache_indices: torch.Tensor  # [max_seqs], PAD_SLOT_ID past the batch
     has_initial_state: torch.Tensor  # [max_seqs] bool
     track_dst: torch.Tensor  # [max_seqs] int64
+    # FlashInfer only: [num_tokens] arange, to zero the rows past the batch.
+    token_index: Optional[torch.Tensor]
 
     @classmethod
     def allocate(
@@ -96,10 +105,13 @@ class GDNPrefillGraphMetadata(msgspec.Struct, frozen=True):
         track: bool,
         cache_index_dtype: torch.dtype,
         device: torch.device,
+        flashinfer: bool = False,
     ) -> GDNPrefillGraphMetadata:
         max_seqs = max(1, min(num_tokens, max_seqs_cap))
         max_chunks = triton.cdiv(num_tokens, GDN_CHUNK_SIZE) + max_seqs
         max_conv_blocks = triton.cdiv(num_tokens, CAUSAL_CONV1D_FWD_BLOCK_M) + max_seqs
+        # A sequence of n tokens has n // 64 checkpoints.
+        max_checkpoints = max(1, num_tokens // GDN_CHUNK_SIZE)
         sizes = [
             max_seqs + 1,  # cu_seqlens
             2 * max_chunks,  # chunk_indices
@@ -109,6 +121,8 @@ class GDNPrefillGraphMetadata(msgspec.Struct, frozen=True):
             max_seqs,  # track_h_row
             max_seqs,  # track_conv_start
             1,  # num_logical_tokens
+            max_seqs + 1 if flashinfer else 0,  # checkpoint_cu_starts
+            max_checkpoints if flashinfer else 0,  # checkpoint_indices
         ]
         packed = torch.zeros(sum(sizes), dtype=torch.int32, device=device)
         views = torch.split(packed, sizes)
@@ -118,6 +132,7 @@ class GDNPrefillGraphMetadata(msgspec.Struct, frozen=True):
             max_chunks=max_chunks,
             max_conv_blocks=max_conv_blocks,
             track=track,
+            flashinfer=flashinfer,
             packed=packed,
             cu_seqlens=views[0],
             chunk_indices=views[1].view(max_chunks, 2),
@@ -127,12 +142,19 @@ class GDNPrefillGraphMetadata(msgspec.Struct, frozen=True):
             track_h_row=views[5],
             track_conv_start=views[6],
             num_logical_tokens=views[7],
+            checkpoint_cu_starts=views[8],
+            checkpoint_indices=views[9],
             host=np.zeros(sum(sizes), dtype=np.int32),
             cache_indices=torch.full(
                 (max_seqs,), PAD_SLOT_ID, dtype=cache_index_dtype, device=device
             ),
             has_initial_state=torch.zeros(max_seqs, dtype=torch.bool, device=device),
             track_dst=torch.zeros(max_seqs, dtype=torch.int64, device=device),
+            token_index=(
+                torch.arange(num_tokens, dtype=torch.int32, device=device)
+                if flashinfer
+                else None
+            ),
         )
 
     def can_fit(self, extend_seq_lens: list[int]) -> bool:
@@ -205,10 +227,29 @@ class GDNPrefillGraphMetadata(msgspec.Struct, frozen=True):
         track_mode = np.zeros(self.max_seqs, dtype=np.int64)
         track_h_row = np.zeros(self.max_seqs, dtype=np.int64)
         track_conv_start = np.zeros(self.max_seqs, dtype=np.int64)
+        if self.flashinfer:
+            checkpoint_starts = np.empty(self.max_seqs + 1, dtype=np.int64)
+            checkpoint_starts[0] = 0
+            np.cumsum(lens // GDN_CHUNK_SIZE, out=checkpoint_starts[1 : bs + 1])
+            checkpoint_starts[bs + 1 :] = checkpoint_starts[bs]
+            checkpoint_indices = np.full(
+                self.checkpoint_indices.shape[0], -1, dtype=np.int64
+            )
         if track_rows is not None:
-            # Same source rows as the eager plan: h_offsets[row] + chunk.
             for row, chunk in track_rows.chunk_rows:
-                track_h_row[row] = offsets[row] + chunk
+                if self.flashinfer:
+                    # h[chunk] is the state before that chunk; FlashInfer's
+                    # checkpoint chunk - 1 is the same state, written to row.
+                    if chunk < 1:
+                        raise ValueError(
+                            "Tracked GDN state precedes the first FlashInfer "
+                            "checkpoint."
+                        )
+                    checkpoint_indices[checkpoint_starts[row] + chunk - 1] = row
+                    track_h_row[row] = row
+                else:
+                    # Same source rows as the eager plan: h_offsets[row] + chunk.
+                    track_h_row[row] = offsets[row] + chunk
                 track_mode[row] = TRACK_CHUNK_STATE
             for row in track_rows.final_rows:
                 track_mode[row] = TRACK_FINAL_STATE
@@ -218,6 +259,9 @@ class GDNPrefillGraphMetadata(msgspec.Struct, frozen=True):
         o = self._write(o=o, values=track_h_row)
         o = self._write(o=o, values=track_conv_start)
         o = self._write(o=o, values=np.array([total]))
+        if self.flashinfer:
+            o = self._write(o=o, values=checkpoint_starts)
+            o = self._write(o=o, values=checkpoint_indices)
         assert o == self.host.shape[0]
 
     def _write(self, *, o: int, values: np.ndarray) -> int:
