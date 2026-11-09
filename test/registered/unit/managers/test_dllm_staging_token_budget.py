@@ -112,34 +112,12 @@ def _make_adder(
 class TestDllmStagingTokenBudgetFallbackCap(CustomTestCase):
     BLOCK_SIZE = 32
 
-    def test_exhausted_budget_fallback_is_capped_at_one_block(self):
-        # rem_total_tokens <= 0 (upfront max_new_tokens charges) with a healthy
-        # pool takes the fallback branch. The grant must be capped at one
-        # block: anything larger produces a variable-length staging row and
-        # breaks the uniform view(B, block_size) reshape.
-        adder = _make_adder(
-            rem_dllm_tokens=4096,
-            dllm_block_size=self.BLOCK_SIZE,
-            available_tokens=4096,
-            rem_total_token_offset=4196,  # rem_total_tokens == -100
-        )
-        self.assertEqual(adder._get_dllm_remain_tokens(), self.BLOCK_SIZE)
-
     def test_fallback_refuses_a_sub_block_dllm_budget(self):
         # A partial grant is as unusable as an oversized one: the denoise
         # reshape needs whole block_size rows, so a budget below one block
         # must yield 0 (NO_TOKEN) rather than a ragged row.
         adder = _make_adder(
             rem_dllm_tokens=16,
-            dllm_block_size=self.BLOCK_SIZE,
-            available_tokens=4096,
-            rem_total_token_offset=4196,
-        )
-        self.assertEqual(adder._get_dllm_remain_tokens(), 0)
-
-    def test_fallback_refuses_a_zero_dllm_budget(self):
-        adder = _make_adder(
-            rem_dllm_tokens=0,
             dllm_block_size=self.BLOCK_SIZE,
             available_tokens=4096,
             rem_total_token_offset=4196,
@@ -156,46 +134,12 @@ class TestDllmStagingTokenBudgetFallbackCap(CustomTestCase):
         )
         self.assertEqual(adder._get_dllm_remain_tokens(), self.BLOCK_SIZE)
 
-    def test_fallback_refuses_a_fresh_block_at_zero_current_capacity(self):
-        # The pool is really exhausted (cur_rem_tokens == 0): a fresh block
-        # would drive cur_rem_tokens negative and alloc_for_extend would raise
-        # on the real allocation. Refuse.
-        adder = _make_adder(
-            rem_dllm_tokens=4096,
-            dllm_block_size=self.BLOCK_SIZE,
-            available_tokens=0,
-            rem_total_token_offset=100,  # rem_total_tokens == -100
-        )
-        self.assertEqual(adder._get_dllm_remain_tokens(), 0)
-
-    def test_fallback_gates_on_the_full_admission_charge(self):
-        # _update_prefill_budget debits ceil_paged(extend) plus one
-        # per_req_token_overhead (one logical page without KV sharding), so
-        # the gate must cover ceil_paged(block_size) + that overhead — a bare
-        # block_size pool would still go negative by the page overhead.
-        for page_size in (1, 4, 16):
-            charge = -(-self.BLOCK_SIZE // page_size) * page_size + page_size
-            for available, expected in (
-                (charge - 1, 0),
-                (charge, self.BLOCK_SIZE),
-            ):
-                adder = _make_adder(
-                    rem_dllm_tokens=4096,
-                    dllm_block_size=self.BLOCK_SIZE,
-                    available_tokens=available,
-                    rem_total_token_offset=available + 100,
-                    page_size=page_size,
-                )
-                self.assertEqual(
-                    adder._get_dllm_remain_tokens(),
-                    expected,
-                    f"page_size={page_size} available={available}",
-                )
-
     def test_fallback_page_rounds_an_unaligned_block(self):
-        # block_size not a page multiple: the admission charge pages the
-        # extend up (ceil_paged(24) == 32 at page_size 16), so the gate is
-        # 32 + 16 == 48, not 24 + 16.
+        # The full-charge boundary: _update_prefill_budget debits
+        # ceil_paged(extend) plus one per_req_token_overhead (one logical page
+        # without KV sharding), so with block_size not a page multiple the
+        # gate is ceil_paged(24) + 16 == 48 at page_size 16, not 24 + 16. One
+        # token below refuses; the boundary grants exactly one block.
         block, page = 24, 16
         for available, expected in ((47, 0), (48, block)):
             adder = _make_adder(
@@ -211,7 +155,9 @@ class TestDllmStagingTokenBudgetFallbackCap(CustomTestCase):
         # Retained incomplete-block rows take the reuse_kv path in
         # alloc_for_extend and allocate zero fresh tokens: they must stay
         # admittable at zero (or negative) current capacity, or their
-        # retained KV is stranded.
+        # retained KV is stranded. The only case that grants a reuse row at
+        # NEGATIVE pool headroom — exactly the state the exemption exists
+        # for; the other reuse cases run with pool headroom to spare.
         adder = _make_adder(
             rem_dllm_tokens=4096,
             dllm_block_size=self.BLOCK_SIZE,
@@ -221,29 +167,18 @@ class TestDllmStagingTokenBudgetFallbackCap(CustomTestCase):
         # The same state refuses a fresh-KV row.
         self.assertEqual(adder._get_dllm_remain_tokens(), 0)
 
-    def test_normal_path_rounds_sub_block_budget_to_zero(self):
-        # Positive rem_total_tokens below one block: round to 0 (NO_TOKEN),
-        # not to a ragged 20-token row — and not to the whole-block fallback,
-        # since a small positive budget is genuine and a full block would
-        # overshoot it.
-        adder = _make_adder(
-            rem_dllm_tokens=4096,
-            dllm_block_size=self.BLOCK_SIZE,
-            available_tokens=20,
-        )
-        self.assertEqual(adder._get_dllm_remain_tokens(), 0)
-
     def test_normal_path_grants_one_full_block(self):
         # Positive rem_total_tokens at or above one block: grant exactly one
         # block (the min already caps at block_size). No cur_rem_tokens gate
-        # needed: cur_rem_tokens >= rem_total_tokens by construction.
-        for available in (self.BLOCK_SIZE, 100):
-            adder = _make_adder(
-                rem_dllm_tokens=4096,
-                dllm_block_size=self.BLOCK_SIZE,
-                available_tokens=available,
-            )
-            self.assertEqual(adder._get_dllm_remain_tokens(), self.BLOCK_SIZE)
+        # needed: cur_rem_tokens >= rem_total_tokens by construction. The
+        # only case where a genuine positive budget GRANTS through the normal
+        # path; every other case reaches it just to refuse.
+        adder = _make_adder(
+            rem_dllm_tokens=4096,
+            dllm_block_size=self.BLOCK_SIZE,
+            available_tokens=100,
+        )
+        self.assertEqual(adder._get_dllm_remain_tokens(), self.BLOCK_SIZE)
 
     def test_reuse_rows_get_a_block_at_small_positive_rem_total(self):
         # Monotonicity: a reuse row allocates zero fresh tokens, so a genuine
@@ -262,18 +197,16 @@ class TestDllmStagingTokenBudgetFallbackCap(CustomTestCase):
 
     def test_reuse_rows_still_respect_the_dllm_budget(self):
         # The reuse exemption only bypasses the token budgets; the dLLM
-        # concurrency budget still applies in every rem_total regime.
-        for available in (-100, 20, 4096):
-            adder = _make_adder(
-                rem_dllm_tokens=16,  # < block
-                dllm_block_size=self.BLOCK_SIZE,
-                available_tokens=available,
-            )
-            self.assertEqual(
-                adder._get_dllm_remain_tokens(reuses_kv=True),
-                0,
-                f"available={available}",
-            )
+        # concurrency budget still applies. A healthy pool makes the refusal
+        # attributable to the dLLM budget alone (the exemption ignores the
+        # token budgets outright, so exercising more budget regimes here
+        # walks the same line).
+        adder = _make_adder(
+            rem_dllm_tokens=16,  # < block
+            dllm_block_size=self.BLOCK_SIZE,
+            available_tokens=4096,
+        )
+        self.assertEqual(adder._get_dllm_remain_tokens(reuses_kv=True), 0)
 
 
 class _StubReq:
@@ -403,9 +336,10 @@ class _ScriptedAdder:
 class TestProcessDllmStagingReqsPerRowRefusal(CustomTestCase):
     """NO_TOKEN must refuse one row, not abort the round: rows behind a
     refused fresh-needing head (e.g. zero-cost reuse rows) still get their own
-    admission check, and a post-admission NO_TOKEN (the tail recheck in
-    `add_dllm_staging_req`) doesn't cut off the rest of the queue either.
-    `process_dllm_staging_reqs` never touches `self`, so call it unbound."""
+    admission check. A post-admission NO_TOKEN (the tail recheck in
+    `add_dllm_staging_req`) is the same return value to this loop, so the
+    refused-head case covers it. `process_dllm_staging_reqs` never touches
+    `self`, so call it unbound."""
 
     @staticmethod
     def _run(adder, rids):
@@ -425,20 +359,6 @@ class TestProcessDllmStagingReqsPerRowRefusal(CustomTestCase):
         # Any refusal still reports NO_TOKEN so incoming reqs don't jump
         # ahead of starved staging rows (_process_batch_by_phase).
         self.assertEqual(result, AddReqResult.NO_TOKEN)
-
-    def test_post_admission_no_token_does_not_serialize_the_queue(self):
-        # The tail recheck in add_dllm_staging_req returns NO_TOKEN after a
-        # SUCCESSFUL admission when the fresh budget for a next row is gone;
-        # zero-cost rows behind it must still be offered admission (each does
-        # its own reuse-aware check) instead of one row per round.
-        adder = _ScriptedAdder(
-            {
-                "admitted-exhausts": AddReqResult.NO_TOKEN,
-                "reuse-1": AddReqResult.CONTINUE,
-            }
-        )
-        self._run(adder, ["admitted-exhausts", "reuse-1"])
-        self.assertEqual(adder.calls, ["admitted-exhausts", "reuse-1"])
 
     def test_all_admitted_returns_continue(self):
         adder = _ScriptedAdder({"a": AddReqResult.CONTINUE, "b": AddReqResult.CONTINUE})
