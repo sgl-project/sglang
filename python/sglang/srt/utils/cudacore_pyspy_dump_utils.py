@@ -36,16 +36,7 @@ _PR_SET_PTRACER_ANY = ctypes.c_ulong(-1)
 
 
 def allow_pyspy_attach() -> None:
-    """Let a py-spy started by this process or a sibling attach to this process.
-
-    Under Yama ``ptrace_scope=1`` (the Ubuntu default), a process may only
-    ptrace its descendants unless it has ``CAP_SYS_PTRACE``, which Docker drops
-    by default. The watchdog runs py-spy as a child of the process it dumps,
-    and the crash dump runs it as a sibling of the schedulers, so both are
-    refused with "Permission denied (os error 13)". ``PR_SET_PTRACER_ANY`` opts
-    this process in. It has no effect under ``ptrace_scope`` 2 or 3, and prctl
-    fails harmlessly with EINVAL when Yama isn't enabled.
-    """
+    """Let any same-user process ptrace this one under Yama ptrace_scope=1."""
     if sys.platform != "linux":
         return
     try:

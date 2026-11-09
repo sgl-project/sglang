@@ -122,10 +122,7 @@ class WatchdogRaw:
         self.dump_info = dump_info
 
         self.parent_process = psutil.Process().parent()
-        # On timeout this process py-spy dumps itself, and a scheduler is also
-        # dumped by TokenizerManager on crash. Without this, both are refused on
-        # CI runners (Yama ptrace_scope=1, no CAP_SYS_PTRACE). Kept to CI so
-        # deployments keep their ptrace restrictions.
+        # CI containers lack CAP_SYS_PTRACE, so py-spy cannot attach without this.
         if envs.SGLANG_IS_IN_CI.get():
             allow_pyspy_attach()
         t = threading.Thread(target=self._watchdog_thread, daemon=True)

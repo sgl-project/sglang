@@ -1,4 +1,4 @@
-"""Tests that py-spy can dump a process that called allow_pyspy_attach()."""
+"""Tests that py-spy can dump a process whose watchdog opted it in under CI."""
 
 import os
 import shutil
@@ -7,7 +7,8 @@ import sys
 import unittest
 from pathlib import Path
 
-from sglang.srt.utils.cudacore_pyspy_dump_utils import allow_pyspy_attach
+from sglang.srt.environ import envs
+from sglang.srt.utils.watchdog import WatchdogRaw
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -33,9 +34,15 @@ class TestAllowPyspyAttach(CustomTestCase):
         if scope is not None and scope >= 2:
             self.skipTest(f"Yama ptrace_scope={scope} needs CAP_SYS_PTRACE")
 
-        allow_pyspy_attach()
-        # Same relationship as the watchdog: py-spy runs as a child of the
-        # process it dumps.
+        # Opt in through the watchdog so the test also covers its CI wiring.
+        with envs.SGLANG_IS_IN_CI.override(True):
+            WatchdogRaw(
+                debug_name="test",
+                get_counter=lambda: 0,
+                is_active=lambda: False,
+                watchdog_timeout=3600,
+            )
+        # py-spy runs as a child of the process it dumps, like the watchdog's.
         result = subprocess.run(
             ["py-spy", "dump", "--pid", str(os.getpid())],
             capture_output=True,
