@@ -35,7 +35,8 @@ Hardenings on top:
   can otherwise create: retained rows that all need a fresh block can hold the
   whole pool, so every round refuses every row, admits nothing, and nothing
   ever resolves or frees KV. A zero-admission round with a capacity refusal
-  (and no in-flight batch) retracts one retained row to fund the next round.
+  (and no in-flight batch) retracts one retained row — picked by the standard
+  decode-retraction order — to fund the next round.
 
 The capped fallback and whole-block rounding only apply to the classic dLLM
 staging path; separate-context-encoding models keep upstream's fallback, whose
@@ -416,11 +417,12 @@ class _StubStallReq:
 
     owner_list = None
 
-    def __init__(self, *, rid, holds_kv, origin_len=64):
+    def __init__(self, *, rid, holds_kv, origin_len=64, output_len=0, priority=None):
         self.rid = rid
         self.kv = SimpleNamespace(holds_kv=holds_kv)
         self.origin_input_ids = list(range(origin_len))
-        self.output_ids = []
+        self.output_ids = list(range(output_len))
+        self.priority = priority
         self.dllm_config = SimpleNamespace(
             requires_separate_context_encoding=False, block_size=32
         )
@@ -470,6 +472,15 @@ class TestDllmStagingStallBreaker(CustomTestCase):
 
     BLOCK_SIZE = 32
 
+    def setUp(self):
+        from sglang.srt.runtime_context import get_context
+
+        # Victim selection reads get_schedule().retraction_policy and the
+        # unresumable branch words its abort by disaggregation mode.
+        override = get_context().override_server_args()
+        override.install()
+        self.addCleanup(override.restore)
+
     @staticmethod
     def _scheduler(reqs, *, resumable=True):
         return SimpleNamespace(
@@ -487,10 +498,10 @@ class TestDllmStagingStallBreaker(CustomTestCase):
             scheduler, staging_result, SimpleNamespace(reqs=list(running_reqs))
         )
 
-    def test_stuck_round_retracts_the_newest_retained_row(self):
+    def test_stuck_round_retracts_the_newest_retained_row_on_ties(self):
         # Oldest first in the waiting queue; the fresh row holds no KV and is
-        # not a candidate. The newest retained row has the least committed
-        # work to recompute, so it is the victim.
+        # not a candidate. With equal committed work the retraction order is
+        # stable, so the tie falls to the newest retained row.
         old = _StubStallReq(rid="old", holds_kv=True)
         new = _StubStallReq(rid="new", holds_kv=True)
         fresh = _StubStallReq(rid="fresh", holds_kv=False)
@@ -509,6 +520,44 @@ class TestDllmStagingStallBreaker(CustomTestCase):
         # No one else was touched.
         self.assertEqual(old.reset_calls, 0)
         self.assertEqual(fresh.reset_calls, 0)
+
+    def test_victim_is_the_least_committed_retained_row(self):
+        # The breaker reuses ScheduleBatch._get_decode_retraction_order: the
+        # default length policy retracts the fewest committed output tokens
+        # first (the least work to recompute), not simply the newest row.
+        old_bare = _StubStallReq(rid="old-bare", holds_kv=True, output_len=0)
+        new_rich = _StubStallReq(rid="new-rich", holds_kv=True, output_len=16)
+        scheduler = self._scheduler([old_bare, new_rich])
+
+        self._fire(scheduler)
+
+        self.assertEqual(scheduler.request_retirer.retracted, [old_bare])
+        self.assertEqual(new_rich.reset_calls, 0)
+
+    def test_priority_retraction_policy_picks_the_lowest_priority_victim(self):
+        from sglang.srt.runtime_context import get_context
+
+        # Under retraction_policy="priority" the shared order ranks by
+        # request priority before committed length, so the breaker cannot
+        # invert priority scheduling by retracting a high-priority row.
+        override = get_context().override_server_args(
+            enable_priority_scheduling=True, retraction_policy="priority"
+        )
+        override.install()
+        self.addCleanup(override.restore)
+
+        important = _StubStallReq(
+            rid="important", holds_kv=True, output_len=0, priority=10
+        )
+        expendable = _StubStallReq(
+            rid="expendable", holds_kv=True, output_len=16, priority=1
+        )
+        scheduler = self._scheduler([important, expendable])
+
+        self._fire(scheduler)
+
+        self.assertEqual(scheduler.request_retirer.retracted, [expendable])
+        self.assertEqual(important.reset_calls, 0)
 
     def test_short_prompt_victim_rejoins_as_incoming_decode(self):
         # Mirrors Req.reset_dllm_progress: a committed length shorter than one
@@ -544,13 +593,6 @@ class TestDllmStagingStallBreaker(CustomTestCase):
         self.assertEqual(scheduler.request_retirer.aborted, [])
 
     def test_unresumable_victim_is_aborted_and_dequeued(self):
-        from sglang.srt.runtime_context import get_context
-
-        # unresumable_abort_message() words the abort by disaggregation mode.
-        override = get_context().override_server_args()
-        override.install()
-        self.addCleanup(override.restore)
-
         victim = _StubStallReq(rid="unresumable", holds_kv=True)
         scheduler = self._scheduler([victim], resumable=False)
 
@@ -561,6 +603,40 @@ class TestDllmStagingStallBreaker(CustomTestCase):
             scheduler.request_retirer.aborted, [(victim, victim.to_finish)]
         )
         self.assertNotIn(victim, list(scheduler.dllm_manager.waiting_queue))
+
+    def test_retraction_funds_the_next_rounds_admission(self):
+        # The loop the breaker exists to close, at unit scope: the stalled
+        # round's gate refuses a fresh block at zero pool headroom; the
+        # breaker retracts the retained row; with that row's tokens back in
+        # the pool the same gate grants, so the next round can admit.
+        block_charge = self.BLOCK_SIZE + 1  # ceil_paged(block) + overhead, page 1
+        pool = {"free": 0}
+
+        def gate():
+            adder = _make_adder(
+                rem_dllm_tokens=4096,
+                dllm_block_size=self.BLOCK_SIZE,
+                available_tokens=pool["free"],
+                rem_total_token_offset=pool["free"] + 100,
+            )
+            return adder._get_dllm_remain_tokens()
+
+        self.assertEqual(gate(), 0)
+
+        victim = _StubStallReq(rid="held", holds_kv=True)
+        scheduler = self._scheduler([victim])
+        retirer = scheduler.request_retirer
+        real_retract = retirer.retract
+
+        def retract_frees_the_row(req, *, offload_kv):
+            pool["free"] += block_charge
+            return real_retract(req, offload_kv=offload_kv)
+
+        retirer.retract = retract_frees_the_row
+        self._fire(scheduler)
+
+        self.assertEqual(retirer.retracted, [victim])
+        self.assertEqual(gate(), self.BLOCK_SIZE)
 
 
 if __name__ == "__main__":

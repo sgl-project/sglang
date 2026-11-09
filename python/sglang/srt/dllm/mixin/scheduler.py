@@ -378,18 +378,22 @@ class SchedulerDllmMixin:
         row makes progress that frees KV eventually, so the breaker never
         fires while progress is possible.
 
-        Retract one retained row — the newest, which has the least committed
-        work to recompute — releasing its KV uncheckpointed and requeueing it
-        as an incoming request to re-prefill once the stall clears. One victim
-        per stalled round: if its KV does not unstick the next round, that
-        round fires again.
+        Retract one retained row in the standard decode-retraction order
+        (`ScheduleBatch._get_decode_retraction_order`: the configured
+        retraction_policy, by default the fewest committed output tokens —
+        the least work to recompute — with queue-order ties falling to the
+        newest row), releasing its KV uncheckpointed and requeueing it as an
+        incoming request to re-prefill once the stall clears. One victim per
+        stalled round: if its KV does not unstick the next round, that round
+        fires again.
         """
         if staging_result != AddReqResult.NO_TOKEN or running_batch.reqs:
             return
         victims = [req for req in self.dllm_manager.waiting_queue if req.kv.holds_kv]
         if not victims:
             return
-        victim = victims[-1]
+        order = ScheduleBatch._get_decode_retraction_order(victims)
+        victim = victims[order[-1]]
         # The retraction resets the request's dLLM progress
         # (`Req.reset_dllm_progress`): the unresolved block, re-stageable only
         # on top of the KV released here, is dropped and redone after the
