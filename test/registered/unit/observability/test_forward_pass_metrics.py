@@ -479,7 +479,9 @@ class _NamedVerifyCompleteWorker:
 class _NamedNoResourceFinishSink(SchedulerBatchResultProcessor):
     # External resource/streaming boundaries stay named sinks. This subclass
     # still runs real host settlement and Req.finish, not physical KV release.
-    def _handle_finish_state_updated_req(self, req, batch, result, i, logits_output):
+    def _handle_finish_state_updated_req(
+        self, req, batch, result, i, logits_output, new_accept_len=None
+    ):
         return
 
 
