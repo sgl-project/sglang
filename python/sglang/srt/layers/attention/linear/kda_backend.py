@@ -528,7 +528,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         )
         self._fused_chain_verify_fn = None
         if (
-            envs.SGLANG_OPT_FUSED_KDA_VERIFY.get()
+            envs.SGLANG_OPT_KDA_TRITON_CHAIN_VERIFY.get()
             and verify_backend.is_triton()
             and self.kernel_dispatcher.verify_kernel.supports_fused_chain_verify
         ):

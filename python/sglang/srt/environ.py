@@ -1738,7 +1738,11 @@ class Envs:
     # avoiding a second blocking readback after generating the same indptr.
     SGLANG_OPT_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)
     SGLANG_OPT_FLASHINFER_VERIFY_HOST_PLAN = EnvBool(False)
-    SGLANG_OPT_FUSED_KDA_VERIFY = EnvBool(False)
+    # KDA chain (topk 1) target verify on the Triton backend: conv + gated delta rule
+    # in one launch (fused_kda_conv_recurrent_verify.py).
+    SGLANG_OPT_KDA_TRITON_CHAIN_VERIFY = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_OPT_FUSED_KDA_VERIFY"
+    )
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
     SGLANG_ENABLE_LILICORR_SAMPLING = EnvBool(False)
