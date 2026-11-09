@@ -122,8 +122,6 @@ class ForwardMetadata:
     flash_mla_metadata: Optional[torch.Tensor] = None
     dcp_mtp_attn_mask: Optional[torch.Tensor] = None
 
-    # Device cumulative Q lengths, including the leading zero.
-    cu_seqlens_q: Optional[torch.Tensor] = None
     # Per-request Q length for uniform batches; None for variable-length prefill.
     uniform_query_len: Optional[int] = None
     # Flash attention scheduling plan.
@@ -357,8 +355,6 @@ class AscendAttnBackend(AttentionBackend):
             modelslim_cache_layout is not None
             and modelslim_cache_layout.layout == "gqa_mxfp8"
         )
-        # Device metadata preparation replaces out-of-graph host updates.
-        self.use_in_graph_metadata = self.use_quant_flash_attn
         if self.use_quant_flash_attn:
             from sgl_kernel_npu.operators.attention import (
                 quant_flash_attn,
@@ -370,9 +366,6 @@ class AscendAttnBackend(AttentionBackend):
             )
 
             self.needs_cpu_seq_lens = False
-            # Either target or draft QFA may read the shared request table
-            # asynchronously; enable the scheduler's existing WAR barrier.
-            envs.SGLANG_ENABLE_WAR_BARRIER.set(True)
             self.quant_flash_attn = quant_flash_attn
             self.quant_flash_attn_metadata = quant_flash_attn_metadata
             self.modelslim_cache_layout = modelslim_cache_layout
@@ -516,7 +509,9 @@ class AscendAttnBackend(AttentionBackend):
         if not envs.SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS.get():
             # FIA host IntArrays consume the CPU mirror; keep it on instead of
             # crashing later. Hybrid SWA is allowed through for dsv4 experiments.
-            if self.use_fia and not (self.use_quant_flash_attn or self.use_flash_mla or self.use_paged_mtp):
+            if self.use_fia and not (
+                self.use_quant_flash_attn or self.use_flash_mla or self.use_paged_mtp
+            ):
                 logger.warning(
                     "SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS=0 is ignored: "
                     "host-bound attention paths present; keeping the mirror."
@@ -621,11 +616,6 @@ class AscendAttnBackend(AttentionBackend):
                 forward_batch.seq_lens,
                 forward_batch.out_cache_loc,
             )
-        if self.use_in_graph_metadata:
-            # Select this graph bucket; its device metadata is refreshed in graph.
-            self.forward_metadata = self.graph_metadata[bs]
-            self.graph_mode = True
-            return
         if self.needs_cpu_seq_lens:
             seq_lens_cpu = (
                 forward_batch.seq_lens.cpu()
@@ -649,26 +639,6 @@ class AscendAttnBackend(AttentionBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
         self.forward_metadata = ForwardMetadata()
-        if self.use_quant_flash_attn:
-            metadata = self.forward_metadata
-            # Eager MTP trims DP padding from Q; use the same request extent here.
-            bs = forward_batch.seq_lens[: forward_batch._original_batch_size].numel()
-            max_pages = (
-                self.req_to_token.shape[1] + self.page_size - 1
-            ) // self.page_size
-            metadata.block_tables = torch.empty(
-                (bs, max_pages), dtype=torch.int32, device=self.device
-            )
-            if forward_batch.forward_mode.is_decode_or_idle():
-                query_len = 1
-            elif forward_batch.forward_mode.is_target_verify():
-                query_len = int(forward_batch.spec_info.draft_token_num)
-            else:
-                query_len = None
-            self._init_flash_attn_metadata_buffers(metadata, query_len)
-            self.graph_mode = False
-            self.init_forward_metadata_in_graph(forward_batch)
-            return
         dense_mla_dcp_partial = self.dense_mla_dcp_target and (
             forward_batch.forward_mode.is_decode()
             or forward_batch.forward_mode.is_target_verify()
@@ -677,7 +647,12 @@ class AscendAttnBackend(AttentionBackend):
         # Data-driven branch: take the CPU-mirror path whenever the mirror is
         # present, instead of statically gating on needs_cpu_seq_lens. When the
         # mirror is absent (true mirrorless), fall through to the else branch.
-        if forward_batch.seq_lens_cpu is not None and not dense_mla_dcp_partial:
+        # QFA uses device lengths even when the hybrid linear backend needs a CPU mirror.
+        if (
+            forward_batch.seq_lens_cpu is not None
+            and not dense_mla_dcp_partial
+            and not self.use_quant_flash_attn
+        ):
             seq_lens_max = forward_batch.seq_lens.max()
             if forward_batch.forward_mode.is_target_verify():
                 if (
@@ -731,6 +706,26 @@ class AscendAttnBackend(AttentionBackend):
                 ]
                 // self.page_size
             )
+        if self.use_quant_flash_attn:
+            metadata = self.forward_metadata
+            # Match QFA's query extent before DP padding; skip FIA's host metadata.
+            seq_lens = forward_batch.seq_lens[: forward_batch._original_batch_size]
+            metadata.block_tables = metadata.block_tables[: seq_lens.shape[0]]
+            if forward_batch.forward_mode.is_decode_or_idle():
+                metadata.uniform_query_len = 1
+            elif forward_batch.forward_mode.is_target_verify():
+                metadata.uniform_query_len = int(
+                    forward_batch.spec_info.draft_token_num
+                )
+            self.graph_mode = False
+            self._prepare_quant_flash_attn_metadata(
+                metadata,
+                seq_lens,
+                forward_batch.forward_mode,
+                spec_info=forward_batch.spec_info,
+                extend_seq_lens=forward_batch.extend_seq_lens,
+            )
+            return
         if forward_batch.extend_seq_lens is not None:
             self.forward_metadata.extend_seq_lens = forward_batch.extend_seq_lens
             self.forward_metadata.extend_seq_lens_cpu_int = (
@@ -945,85 +940,73 @@ class AscendAttnBackend(AttentionBackend):
             )
         self.graph_mode = False
 
-    def _init_flash_attn_metadata_buffers(self, metadata, query_len):
-        """Allocate buffers and fix layouts per eager batch or captured bucket."""
-        bs = metadata.block_tables.shape[0]
-        metadata.uniform_query_len = query_len
-        groups = self.fa_num_heads // self.modelslim_cache_layout.local_kv_heads
-        metadata.fa_layout_q_descale = (
-            "N2TGD" if query_len is not None and groups * query_len <= 80 else "TND"
-        )
-        if query_len is None:
-            metadata.cu_seqlens_q = torch.zeros(
-                bs + 1, dtype=torch.int32, device=self.device
+    def _prepare_quant_flash_attn_metadata(
+        self,
+        metadata: ForwardMetadata,
+        seq_lens: torch.Tensor,
+        forward_mode: ForwardMode,
+        *,
+        spec_info: Optional[SpecInput] = None,
+        extend_seq_lens: Optional[torch.Tensor] = None,
+    ):
+        """Prepare QFA on device outside capture, preserving graph-bound addresses."""
+        bs = seq_lens.shape[0]
+        if metadata.seq_lens is None:
+            metadata.seq_lens = torch.empty_like(seq_lens, dtype=torch.int32)
+        query_len = metadata.uniform_query_len
+        if metadata.cu_seqlens_q is None:
+            groups = self.fa_num_heads // self.modelslim_cache_layout.local_kv_heads
+            metadata.fa_layout_q_descale = (
+                "N2TGD" if query_len is not None and groups * query_len <= 80 else "TND"
             )
-        else:
-            metadata.cu_seqlens_q = torch.arange(
-                0,
-                (bs + 1) * query_len,
-                query_len,
-                dtype=torch.int32,
-                device=self.device,
-            )
-        # Each speculative step owns its lengths; never offset shared runner inputs.
-        metadata.actual_seq_lengths_kv = torch.empty(
-            bs, dtype=torch.int32, device=self.device
-        )
-
-    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
-        """Dispatch device metadata preparation for eager execution or graph capture."""
-        if self.use_quant_flash_attn:
-            self._init_quant_flash_attn_metadata(forward_batch)
-
-    def _init_quant_flash_attn_metadata(self, forward_batch: ForwardBatch):
-        """Refresh device metadata eagerly or as part of the captured graph."""
-        metadata = self.forward_metadata
-        bs = metadata.block_tables.shape[0]
+            if query_len is None:
+                metadata.cu_seqlens_q = torch.zeros(
+                    bs + 1, dtype=torch.int32, device=self.device
+                )
+            else:
+                metadata.cu_seqlens_q = torch.arange(
+                    0,
+                    (bs + 1) * query_len,
+                    query_len,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
         if bs == 0:
             return
-        seq_lens = forward_batch.seq_lens[:bs]
         offset = 0
-        if forward_batch.forward_mode.is_target_verify():
-            offset = metadata.uniform_query_len
-        elif (
-            forward_batch.forward_mode.is_decode_or_idle()
-            and forward_batch.spec_info is not None
-        ):
+        if forward_mode.is_target_verify():
+            offset = query_len
+        elif forward_mode.is_decode_or_idle() and spec_info is not None:
             offset = self.speculative_step_id + 1
-        torch.add(seq_lens, offset, out=metadata.actual_seq_lengths_kv)
+        # Each step owns its lengths; never offset the shared runner inputs.
+        torch.add(seq_lens, offset, out=metadata.seq_lens)
         if self.graph_mode and offset:
-            # Zero is the existing graph-padding sentinel, not a real KV prefix.
-            metadata.actual_seq_lengths_kv.masked_fill_(seq_lens == 0, 0)
-        # Use a fixed page-table width; QFA bounds KV reads with seqused_kv.
-        num_pages = metadata.block_tables.shape[1]
-        metadata.block_tables.copy_(
-            self.req_to_token[
-                forward_batch.req_pool_indices[:bs],
-                0 : num_pages * self.page_size : self.page_size,
-            ]
-            // self.page_size
-        )
-        if metadata.uniform_query_len is None:
+            metadata.seq_lens.masked_fill_(seq_lens == 0, 0)
+        if query_len is None:
             torch.cumsum(
-                forward_batch.extend_seq_lens[:bs],
+                extend_seq_lens[:bs],
                 dim=0,
                 dtype=torch.int32,
                 out=metadata.cu_seqlens_q[1:],
             )
-        metadata.fa_metadata = self.quant_flash_attn_metadata(
+        schedule = self.quant_flash_attn_metadata(
             self.fa_num_heads,
             self.modelslim_cache_layout.local_kv_heads,
             self.modelslim_cache_layout.key_head_dim,
             1,
             cu_seqlens_q=metadata.cu_seqlens_q,
-            seqused_kv=metadata.actual_seq_lengths_kv,
-            max_seqlen_q=metadata.uniform_query_len or -1,
-            mask_mode=0 if forward_batch.forward_mode.is_decode_or_idle() else 3,
+            seqused_kv=metadata.seq_lens,
+            max_seqlen_q=query_len or -1,
+            mask_mode=0 if forward_mode.is_decode_or_idle() else 3,
             layout_q="TND",
             layout_q_descale=metadata.fa_layout_q_descale,
             layout_kv="PA_BBND",
             layout_out="TND",
         )
+        # Like FlashMLA, replay consumes the buffers bound during capture.
+        if metadata.fa_metadata is None:
+            metadata.fa_metadata = torch.empty_like(schedule)
+        metadata.fa_metadata.copy_(schedule)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         total_context_len = self.max_context_len + self.page_size - 1
@@ -1168,20 +1151,17 @@ class AscendAttnBackend(AttentionBackend):
         if self.use_sliding_window_kv_pool and out_cache_loc is not None:
             num_tokens = out_cache_loc.shape[0]
             metadata.swa_out_cache_loc = self.cuda_graph_swa_out_cache_loc[:num_tokens]
-        # Initialize QFA's fixed metadata buffers and skip FIA-specific initialization.
         if self.use_quant_flash_attn:
+            # Fix the query width from capture, not the live replay token count.
             if forward_mode.is_draft_extend_v2():
-                query_len = out_cache_loc.shape[0] // bs
+                metadata.uniform_query_len = out_cache_loc.shape[0] // bs
             elif forward_mode.is_target_verify():
-                query_len = self.speculative_num_draft_tokens
+                metadata.uniform_query_len = self.speculative_num_draft_tokens
             else:
-                query_len = 1
-            self._init_flash_attn_metadata_buffers(metadata, query_len)
-            self.graph_metadata[bs] = metadata
-            return metadata
+                metadata.uniform_query_len = 1
         if self.needs_cpu_seq_lens and not self.dense_mla_dcp_target:
             metadata.seq_lens_cpu_list = seq_lens.cpu().int().tolist()
-        if self.use_flash_mla or self.use_paged_mtp:
+        if self.use_flash_mla or self.use_paged_mtp or self.use_quant_flash_attn:
             metadata.seq_lens = torch.empty_like(seq_lens, dtype=torch.int32)
         else:
             metadata.seq_lens = seq_lens
@@ -1421,13 +1401,17 @@ class AscendAttnBackend(AttentionBackend):
                 metadata.dcp_block_tables[:bs, dcp_pages:].fill_(0)
         metadata.block_tables[bs:, :].fill_(0)
 
-        if self.use_flash_mla or self.use_paged_mtp:
-            if self.use_flash_mla:
+        if self.use_flash_mla or self.use_paged_mtp or self.use_quant_flash_attn:
+            self.graph_mode = True
+            if self.use_quant_flash_attn:
+                self._prepare_quant_flash_attn_metadata(
+                    metadata, seq_lens[:bs], forward_mode, spec_info=spec_info
+                )
+            elif self.use_flash_mla:
                 self._prepare_flash_mla_metadata(metadata, seq_lens[:bs])
             else:
                 self._prepare_paged_mtp_metadata(metadata, seq_lens[:bs])
             self.forward_metadata = metadata
-            self.graph_mode = True
             return
 
         # Device-derived KV lengths drive query visibility independently of the
@@ -2302,7 +2286,7 @@ class AscendAttnBackend(AttentionBackend):
                         1,
                         block_table=self.forward_metadata.block_tables,
                         cu_seqlens_q=self.forward_metadata.cu_seqlens_q,
-                        seqused_kv=self.forward_metadata.actual_seq_lengths_kv,
+                        seqused_kv=self.forward_metadata.seq_lens,
                         metadata=self.forward_metadata.fa_metadata,
                         attn_mask=self.mix_mask,
                         mask_mode=3,
@@ -3231,7 +3215,7 @@ class AscendAttnBackend(AttentionBackend):
                         1,
                         block_table=self.forward_metadata.block_tables,
                         cu_seqlens_q=self.forward_metadata.cu_seqlens_q,
-                        seqused_kv=self.forward_metadata.actual_seq_lengths_kv,
+                        seqused_kv=self.forward_metadata.seq_lens,
                         metadata=self.forward_metadata.fa_metadata,
                         attn_mask=self.mix_mask,
                         mask_mode=3,
@@ -3746,7 +3730,7 @@ class AscendAttnBackend(AttentionBackend):
                 1,
                 block_table=self.forward_metadata.block_tables,
                 cu_seqlens_q=self.forward_metadata.cu_seqlens_q,
-                seqused_kv=self.forward_metadata.actual_seq_lengths_kv,
+                seqused_kv=self.forward_metadata.seq_lens,
                 metadata=self.forward_metadata.fa_metadata,
                 attn_mask=None,
                 mask_mode=0,
@@ -4158,7 +4142,7 @@ class AscendAttnBackend(AttentionBackend):
                         1,
                         block_table=self.forward_metadata.block_tables,
                         cu_seqlens_q=self.forward_metadata.cu_seqlens_q,
-                        seqused_kv=self.forward_metadata.actual_seq_lengths_kv,
+                        seqused_kv=self.forward_metadata.seq_lens,
                         metadata=self.forward_metadata.fa_metadata,
                         attn_mask=None,
                         mask_mode=0,
@@ -4527,9 +4511,6 @@ class AscendAttnMultiStepDraftBackend:
                 AscendAttnBackend(model_runner, speculative_step_id=step_id)
             )
         self.needs_cpu_seq_lens = any(b.needs_cpu_seq_lens for b in self.attn_backends)
-        self.use_in_graph_metadata = all(
-            b.use_in_graph_metadata for b in self.attn_backends
-        )
 
     def common_template(self, forward_batch: ForwardBatch, call_fn: int):
         assert forward_batch.spec_info is not None
