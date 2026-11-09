@@ -45,7 +45,7 @@ from sglang.srt.layers.dp_attention import get_cuda_graph_max_batch_size
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     KVCacheAttentionAccessKind,
 )
-from sglang.srt.layers.radix_attention import AttentionType
+from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.mem_cache.kv.alloc.id_space import (
     IdSpace,
     IdSpaceKind,
@@ -75,7 +75,6 @@ from sglang.srt.speculative.spec_utils import (
 from sglang.srt.utils import get_int_env_var, is_flashinfer_available, next_power_of_2
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.mem_cache.kv.alloc.iteration_ids import IterationIds
     from sglang.srt.model_executor.model_runner import ModelRunner
 
@@ -207,6 +206,7 @@ def fast_prefill_plan(
     custom_mask: Optional[torch.Tensor] = None,
     causal: bool = False,
     window_left: int = -1,
+    logits_soft_cap: Optional[float] = None,
     q_data_type: Union[str, torch.dtype] = "float16",
     kv_data_type: Optional[Union[str, torch.dtype]] = None,
     o_data_type: Optional[Union[str, torch.dtype]] = None,
@@ -306,6 +306,7 @@ def fast_prefill_plan(
         kv_data_type if kv_data_type is not None else q_data_type
     )
     self._cached_o_data_type = o_data_type
+    self._logits_soft_cap = logits_soft_cap
     self._block_tables = None
     # FlashInfer's plan() clears this on every call and may set it again for its
     # SM90 fp8-KV verify kernel. This plan never takes that route, so clear it
@@ -336,6 +337,38 @@ def fast_prefill_plan(
         False,  # fixed_uniform_q_len
     ]
     self._plan_info = self._cached_module.plan(*args)
+
+
+def _model_logits_soft_cap(model: torch.nn.Module) -> float:
+    """Return the logit cap shared by the model's attention layers, or 0.0.
+
+    FlashInfer bakes ``use_logits_soft_cap`` into the kernel module at
+    plan()/begin_forward() time; the per-layer value handed to the deprecated
+    per-call forward() is silently ignored unless plan() selected the soft-cap
+    module. The cap is declared per layer while planning happens once per
+    forward batch, so plan with the single cap the layers share (gemma-2: 50.0,
+    grok: 30.0; every capped in-tree model uses one value for all layers).
+    """
+    # A null cap (gemma-2 configs may set ``attn_logit_softcapping: null``)
+    # means uncapped, like 0.0.
+    caps = {
+        module.logit_cap or 0.0
+        for module in model.modules()
+        if isinstance(module, RadixAttention)
+    }
+    nonzero_caps = {cap for cap in caps if cap > 0.0}
+    if not nonzero_caps:
+        return 0.0
+    if len(caps) > 1:
+        # Mixed cap values (or capped and uncapped layers) cannot be planned
+        # with one module per wrapper; refuse loudly instead of applying a
+        # wrong cap to some layers.
+        raise ValueError(
+            "The flashinfer attention backend plans logits_soft_cap once per "
+            f"forward batch and cannot apply distinct per-layer logit caps "
+            f"{sorted(caps)}; use the triton attention backend for this model."
+        )
+    return nonzero_caps.pop()
 
 
 class FlashInferAttnBackend(AttentionBackend):
@@ -425,6 +458,10 @@ class FlashInferAttnBackend(AttentionBackend):
             ),
         )
         self.max_context_len = model_runner.model_config.context_len
+        # Plan-time state: the indices updaters must request soft capping at
+        # plan()/begin_forward() for it to be compiled into the kernel module
+        # (see _model_logits_soft_cap).
+        self.logits_soft_cap = _model_logits_soft_cap(model_runner.model)
         self.page_size = model_runner.page_size
         self.skip_prefill = skip_prefill
         self.is_multimodal = model_runner.model_config.is_multimodal
@@ -705,6 +742,8 @@ class FlashInferAttnBackend(AttentionBackend):
             causal=True,
             q_data_type=updater.q_data_type,
             kv_data_type=updater.data_type,
+            # plan-time: selects the module with soft capping compiled in
+            logits_soft_cap=updater.logits_soft_cap,
             non_blocking=True,
             fixed_split_size=self.prefill_split_tile_size,
         )
@@ -1782,6 +1821,7 @@ class FlashInferIndicesUpdaterDecode:
         self.data_type = attn_backend.flashinfer_kv_cache_dtype
         self.q_data_type = model_runner.dtype
         self.sliding_window_size = model_runner.sliding_window_size
+        self.logits_soft_cap = attn_backend.logits_soft_cap
         self.attn_backend = attn_backend
 
         # Buffers and wrappers
@@ -2038,6 +2078,8 @@ class FlashInferIndicesUpdaterDecode:
                 1,
                 data_type=self.data_type,
                 q_data_type=self.q_data_type,
+                # plan-time: selects the module with soft capping compiled in
+                logits_soft_cap=self.logits_soft_cap,
                 non_blocking=True,
                 fixed_split_size=fixed_split_size,
                 disable_split_kv=(
@@ -2061,6 +2103,8 @@ class FlashInferIndicesUpdaterDecode:
                 1,
                 data_type=self.data_type,
                 q_data_type=self.q_data_type,
+                # plan-time: selects the module with soft capping compiled in
+                logits_soft_cap=self.logits_soft_cap,
                 non_blocking=True,
                 fixed_split_size=fixed_split_size,
                 disable_split_kv=(
@@ -2089,6 +2133,7 @@ class FlashInferIndicesUpdaterPrefill:
         self.data_type = attn_backend.flashinfer_kv_cache_dtype
         self.q_data_type = model_runner.dtype
         self.sliding_window_size = model_runner.sliding_window_size
+        self.logits_soft_cap = attn_backend.logits_soft_cap
         self.attn_backend = attn_backend
         # Buffers and wrappers
         self.kv_indptr = attn_backend.kv_indptr
@@ -2481,6 +2526,8 @@ class FlashInferIndicesUpdaterPrefill:
                 # window.window_left is the paged pass's: -1 on this prefix read,
                 # which its custom mask keeps to the window.
                 window_left=window.window if window is not None else -1,
+                # plan-time: selects the module with soft capping compiled in
+                logits_soft_cap=self.logits_soft_cap,
             )
 
         if use_sliding_window_kv_pool and not use_swa_source:
@@ -2590,6 +2637,8 @@ class FlashInferIndicesUpdaterPrefill:
             q_data_type=self.q_data_type,
             kv_data_type=self.data_type,
             custom_mask=use_custom_mask,
+            # plan-time: selects the module with soft capping compiled in
+            logits_soft_cap=self.logits_soft_cap,
             non_blocking=True,
             fixed_split_size=fixed_split_size,
             prefix_len_ptr=prefix_len_ptr,
