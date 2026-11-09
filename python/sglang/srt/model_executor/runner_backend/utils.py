@@ -25,7 +25,7 @@ import logging
 from typing import TYPE_CHECKING
 
 from sglang.srt.model_executor.cuda_graph_config import Backend
-from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
+from sglang.srt.model_executor.runner_backend.base_graph_backend import (
     BaseGraphBackend,
 )
 from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (

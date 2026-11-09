@@ -28,7 +28,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
-from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
+from sglang.srt.model_executor.runner_backend.base_graph_backend import (
     BaseGraphBackend,
 )
 from sglang.srt.model_executor.runner_backend.cuda_graph_dedup_mixin import (

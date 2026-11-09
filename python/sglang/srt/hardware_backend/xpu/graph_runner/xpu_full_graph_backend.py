@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 import torch
 from torch.profiler import ProfilerActivity, profile
 
-from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
+from sglang.srt.model_executor.runner_backend.base_graph_backend import (
     BaseGraphBackend,
 )
 from sglang.srt.model_executor.runner_utils.pool import (

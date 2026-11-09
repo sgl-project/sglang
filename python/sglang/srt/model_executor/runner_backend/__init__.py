@@ -13,7 +13,7 @@ Public API:
     capture; FX-splits the model at attention layers.
 """
 
-from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (  # noqa: F401
+from sglang.srt.model_executor.runner_backend.base_graph_backend import (  # noqa: F401
     BaseGraphBackend,
 )
 from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (  # noqa: F401

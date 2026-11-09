@@ -27,7 +27,7 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
-from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
+from sglang.srt.model_executor.runner_backend.base_graph_backend import (
     BaseGraphBackend,
 )
 from sglang.srt.model_executor.runner_utils.pool import (

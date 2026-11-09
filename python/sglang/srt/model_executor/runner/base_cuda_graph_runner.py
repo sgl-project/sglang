@@ -36,7 +36,7 @@ from sglang.srt.utils import ceil_align
 if TYPE_CHECKING:
     from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
     from sglang.srt.model_executor.model_runner import ModelRunner
-    from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
+    from sglang.srt.model_executor.runner_backend.base_graph_backend import (
         BaseGraphBackend,
     )
 
