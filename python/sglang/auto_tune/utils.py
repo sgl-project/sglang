@@ -3,12 +3,8 @@ from typing import Dict, List, Optional
 
 import torch
 
-from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import get_config_dtype_str
-from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config import (
-    get_config_file_name,
-)
 from sglang.srt.utils import get_device_name, is_hip
-from sglang.srt.utils.hf_transformers import get_config
+from sglang.srt.hf_transformers import get_config
 
 
 def get_model_config(model_path: str, tp_size: int, ep_size: int = 1) -> Dict:
@@ -171,6 +167,11 @@ def sort_config(config: Dict) -> Dict:
 
 
 def get_config_filename(num_experts: int, shard_intermediate_size: int, hidden_size: int, topk: int, dtype: torch.dtype, use_fp8_w8a8=False, use_int8_w8a8=False, use_int8_w8a16=False, use_int4_w4a16=False, per_channel_quant=False, block_shape=None) -> str:
+    from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import get_config_dtype_str
+    from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config import (
+        get_config_file_name,
+    )
+
     dtype_str = get_config_dtype_str(dtype, use_int8_w8a16=use_int8_w8a16, use_fp8_w8a8=use_fp8_w8a8, use_int8_w8a8=use_int8_w8a8, use_int4_w4a16=use_int4_w4a16)
     N = shard_intermediate_size // 2
     if use_int4_w4a16:

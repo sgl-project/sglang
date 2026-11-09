@@ -4,7 +4,6 @@ import time
 from typing import Optional
 
 from sglang.auto_tune.utils import get_model_config
-from sglang.auto_tune.moe_tuner import run_moe_tuning
 from sglang.auto_tune.allreduce_tuner import run_allreduce_tuning, print_allreduce_summary
 
 
@@ -55,6 +54,8 @@ def auto_tune(args: argparse.Namespace, extra_argv: Optional[list] = None):
         best_configs = {}
     else:
         print("\n[Step 2/3] Tuning kernels...")
+        from sglang.auto_tune.moe_tuner import run_moe_tuning
+
         moe_start = time.perf_counter()
         best_configs = run_moe_tuning(
             model_config, tp_size=args.tp_size, ep_size=args.ep_size,

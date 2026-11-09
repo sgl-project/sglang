@@ -1,3 +1,1 @@
-from sglang.auto_tune.main import main as auto_tune_main
-
-__all__ = [auto_tune_main]
+# Import submodules directly. Importing this package must not load the MoE tuner.
