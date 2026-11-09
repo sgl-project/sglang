@@ -18,7 +18,7 @@ import torch
 from torch.profiler import ProfilerActivity, profile
 
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
-    BaseCudaGraphBackend,
+    BaseGraphBackend,
 )
 from sglang.srt.model_executor.runner_utils.pool import (
     get_or_create_global_graph_memory_pool,
@@ -65,7 +65,7 @@ def _copy_output_to_buffer(
 logger = logging.getLogger(__name__)
 
 
-class FullXPUGraphBackend(BaseCudaGraphBackend):
+class FullXPUGraphBackend(BaseGraphBackend):
     """One torch.xpu.XPUGraph per shape for Intel XPU devices."""
 
     def __init__(

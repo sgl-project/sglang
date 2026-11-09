@@ -28,7 +28,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
-    BaseCudaGraphBackend,
+    BaseGraphBackend,
 )
 from sglang.srt.model_executor.runner_utils.pool import (
     GraphPoolPrecarve,
@@ -96,7 +96,7 @@ def _copy_output_to_buffer(output: Any, output_buffer: Any) -> Optional[Any]:
     return None
 
 
-class FullCudaGraphBackend(BaseCudaGraphBackend):
+class FullCudaGraphBackend(BaseGraphBackend):
     """One torch.cuda.CUDAGraph per shape; attention metadata is
     captured inside the graph. Memory-saver-aware.
     """

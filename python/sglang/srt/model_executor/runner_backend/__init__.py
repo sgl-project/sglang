@@ -5,7 +5,7 @@ one shape; it is phase-agnostic. Runners (cuda_graph_runner/) own
 *what* data flows in and out.
 
 Public API:
-  - BaseCudaGraphBackend — abstract interface.
+  - BaseGraphBackend — abstract interface.
   - FullCudaGraphBackend — single torch.cuda.CUDAGraph per shape.
   - BreakableCudaGraphBackend — segmented capture with eager break
     markers; no torch.compile.
@@ -14,7 +14,7 @@ Public API:
 """
 
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (  # noqa: F401
-    BaseCudaGraphBackend,
+    BaseGraphBackend,
 )
 from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (  # noqa: F401
     BreakableCudaGraphBackend,
