@@ -302,15 +302,19 @@ class Qwen3GatedDeltaNet(nn.Module):
             dt_bias=self.dt_bias,
         )
 
-        # Static half of the fused-decode gate: platform, opt-in and the model
-        # shape the AITER kernel hard-codes. The per-call tensor contract is
-        # checked in the backend, which falls back rather than raising.
+        # Static half of the fused-decode gate: platform, opt-in, and the model
+        # shape and output gate the AITER kernel hard-codes. The per-call tensor
+        # contract is checked in the backend, which falls back rather than
+        # raising.
         self._gdn_fused_decode_ready = (
             _use_aiter
             and gdn_fused_decode_aiter.available()
             and self.num_v_heads == 2 * self.num_k_heads
             and self.head_k_dim == self.head_v_dim == 128
             and self.conv_kernel_size == 4
+            and gdn_fused_decode_aiter.output_gate_supported(
+                self.output_gate_type, self.activation
+            )
         )
         self._gdn_fused_norm_weight = None
         self._gdn_fused_conv_bias = None

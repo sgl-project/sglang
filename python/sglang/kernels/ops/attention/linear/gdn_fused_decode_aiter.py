@@ -31,6 +31,8 @@ logger = logging.getLogger(__name__)
 
 _HEAD_DIM = 128
 _CONV_WIDTH = 4
+# The kernel fuses SiLU twice: after the depthwise conv and in the output gate.
+_SILU = ("silu", "swish")
 
 
 def enabled() -> bool:
@@ -78,6 +80,19 @@ def available() -> bool:
     return True
 
 
+def output_gate_supported(
+    output_gate_type: Optional[str], hidden_act: Optional[str]
+) -> bool:
+    """Whether the layer's gated-RMSNorm output gate is the SiLU the kernel fuses.
+
+    Checks the effective gate, not the field alone: an unset
+    ``output_gate_type`` resolves to ``hidden_act`` in FusedRMSNormGated. The
+    GDN shape alone is not enough -- GigaChat 3.5 reuses Qwen3GatedDeltaNet with
+    the same head shape and a sigmoid output gate.
+    """
+    return (output_gate_type or hidden_act) in _SILU
+
+
 def covered(
     projected_qkvz: torch.Tensor,
     projected_ba: torch.Tensor,
@@ -95,11 +110,12 @@ def covered(
     """Per-call contract check. Returns ``(covered, reason)``.
 
     Delegates the tensor contract to AITER's own predicate so the two cannot
-    drift, and adds the one thing AITER cannot see: the model's output-gate
-    activation, which the kernel hard-codes to SiLU.
+    drift, and adds what AITER cannot see: ``activation`` is the layer's conv
+    activation, which the kernel hard-codes to SiLU. The output gate is checked
+    once, statically, by :func:`output_gate_supported`.
     """
-    if activation not in ("silu", "swish"):
-        return False, f"kernel fuses a SiLU output gate, model uses {activation!r}"
+    if activation not in _SILU:
+        return False, f"kernel fuses a SiLU conv activation, model uses {activation!r}"
     if conv_bias is None:
         return False, "conv bias is required"
     _, supported = _ops()

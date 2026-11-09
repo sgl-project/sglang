@@ -88,10 +88,10 @@ class TestGdnFusedDecodeAiterCoverage(CustomTestCase):
         return base
 
     def test_declines_non_silu_activation(self):
-        """The kernel folds a SiLU output gate; anything else is wrong numerics.
+        """The kernel fuses a SiLU conv activation; anything else is wrong numerics.
 
-        This is the one condition AITER's predicate cannot see, so it must be
-        checked on the SGLang side.
+        AITER's predicate cannot see the activation, so it must be checked on
+        the SGLang side.
         """
         for activation in ("gelu", "relu", None):
             ok, reason = adapter.covered(**self._args(activation=activation))
@@ -114,6 +114,27 @@ class TestGdnFusedDecodeAiterCoverage(CustomTestCase):
         ok, reason = adapter.covered(**self._args(activation="gelu"))
         self.assertFalse(ok)
         self.assertTrue(reason.strip())
+
+
+class TestGdnFusedDecodeAiterOutputGate(CustomTestCase):
+    """The static gate must reject any output gate other than SiLU.
+
+    Shape alone is not enough: GigaChat 3.5 reuses Qwen3GatedDeltaNet with the
+    Qwen3-Next GDN shape and a sigmoid output gate.
+    """
+
+    def test_accepts_silu_gate(self):
+        for gate, act in (("silu", "silu"), ("swish", "silu"), (None, "silu")):
+            self.assertTrue(adapter.output_gate_supported(gate, act), f"gate={gate!r}")
+
+    def test_declines_sigmoid_gate(self):
+        # GigaChat 3.5's default; the shape checks would let it through.
+        self.assertFalse(adapter.output_gate_supported("sigmoid", "silu"))
+
+    def test_unset_gate_resolves_to_hidden_act(self):
+        """FusedRMSNormGated falls back to hidden_act when the gate is unset."""
+        self.assertFalse(adapter.output_gate_supported(None, "gelu"))
+        self.assertFalse(adapter.output_gate_supported(None, None))
 
 
 @unittest.skipUnless(
