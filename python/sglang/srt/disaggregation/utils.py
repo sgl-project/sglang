@@ -1210,24 +1210,14 @@ def build_kv_layer_ids(
 
     Returns [] for pools that cannot report ids, leaving the peers on positional
     pairing: only a pool wrapping one token KV view (its other layers hold
-    state), an NPU MLA pool (whose plain router reports no ids), or one whose
-    main page rows pair by layer id, reports them.
+    state), or one whose main page rows pair by layer id, reports them.
     """
-    from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
-
     # The owner region reports the ids its entries pair by. A unified pool's
     # owner region is one whole-envelope entry with none, yet a pool wrapping
     # one token KV view still pairs its draft's entries by id.
     layer_ids = list(storage.regions(storage.owner).layer_ids)
-    if not layer_ids:
-        # NPU MLA registers separate K/V (packed FP8 skips the V group) and
-        # index groups, and its plain layer router reports no ids. A PP-local
-        # slice must pair each group by global layer id rather than by a flat
-        # offset, so the two PD peers agree on the same mapping.
-        if isinstance(token_to_kv_pool, NPUMLATokenToKVPool):
-            layer_ids = list(token_to_kv_pool.get_kv_layer_ids())
-        elif token_to_kv_pool.layer_router.wrapped_view() is None:
-            return []
+    if not layer_ids and token_to_kv_pool.layer_router.wrapped_view() is None:
+        return []
     if draft_token_to_kv_pool is None:
         return layer_ids
 
@@ -1245,11 +1235,7 @@ def remap_draft_layer_ids(layer_ids: List[int], num_hidden_layers: int) -> List[
 
 
 def _draft_entry_layer_ids(*, pool, num_entries: int) -> List[int]:
-    from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
-
-    if isinstance(pool, NPUMLATokenToKVPool) or (
-        pool.layer_router.wrapped_view() is not None
-    ):
+    if pool.layer_router.wrapped_view() is not None:
         ids = pool.get_kv_layer_ids()
     else:
         # Pools register k0..k(L-1) then v0..v(L-1), so ids repeat once per
