@@ -287,7 +287,7 @@ class QuickAllReduce:
         if inp.dtype not in self._SUPPORTED_DTYPES:
             return False
         # the JIT build behind SGLANG_ROCM_QUICK_ALL_REDUCE_JIT reduces bf16 only
-        if not ops.qr_supports(self._ptr, inp.dtype):
+        if self._flydsl_int4 is None and not ops.qr_supports(self._ptr, inp.dtype):
             return False
         inp_size = inp.numel() * inp.element_size()
         # custom quick allreduce requires input byte size to be
