@@ -16,6 +16,7 @@ from sglang.srt.layers.dcp import (
     all_gather_kv_cache_for_mha_extend,
     filter_dcp_local_kv_indices,
 )
+from sglang.srt.layers.dcp.layout import dsa_shards_index_k
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -661,7 +662,7 @@ class DeepseekMHAForwardMixin:
             "page_table_1_flattened should have been generated for FP8 MHA path"
         )
 
-        if _use_aiter_gfx95:
+        if _use_aiter_gfx95 and not get_token_to_kv_pool().dsa_kv_cache_store_fp8:
             # ROCm (gfx950) stores the FP8 MLA KV in the raw
             # (kv_lora_rank + qk_rope_head_dim) layout, not the scaled 656-byte
             # layout that dequantize_k_cache_paged_dsa expects (it asserts dim==656).
@@ -688,6 +689,13 @@ class DeepseekMHAForwardMixin:
             return kv_a, k_pe
 
         kv_cache_fp8 = get_kv_layers().read(self.attn_mha.layer_id).key()
+        if dsa_shards_index_k():
+            kv_cache_fp8 = backend.dcp_gather_kv_cache(
+                kv_cache_fp8, forward_batch, backend.forward_metadata
+            )
+            kv_indices = torch.arange(
+                kv_indices.shape[0], dtype=kv_indices.dtype, device=kv_indices.device
+            )
 
         kv_latent_bf16 = dequantize_k_cache_paged_dsa(kv_cache_fp8, kv_indices)
 

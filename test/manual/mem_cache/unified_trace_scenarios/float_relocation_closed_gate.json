@@ -1,4 +1,4 @@
-{"name": "float_relocation_closed_gate", "chain": "tri", "page_size": 16, "lazy": true, "ops": [
+{"name": "float_relocation_closed_gate", "chain": "tri", "page_size": 16, "ops": [
   {"op": "extend", "req": 0, "n": 96},
   {"op": "extend", "req": 1, "n": 96},
   {"op": "extend", "req": 2, "n": 96},
