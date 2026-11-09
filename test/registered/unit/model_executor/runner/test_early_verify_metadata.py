@@ -110,15 +110,11 @@ def test_runner_stages_only_captured_unpadded_early_variant_keys():
     assert stage(2, max_seq_len=None)  # unknown length: the filtered fallback
     assert stage(2, max_seq_len=13)
     mode = str(ForwardMode.TARGET_VERIFY)
-    filtered = runner._glue_key(2, mode, DSV41_CANDIDATE_FILTERED)
-    unfiltered = runner._glue_key(2, mode, DSV41_CANDIDATE_UNFILTERED)
-    assert filtered[-1] == DSV41_CANDIDATE_FILTERED
-    assert unfiltered[-1] == DSV41_CANDIDATE_UNFILTERED
-    assert calls == [("discard", None)] * 2 + [
-        ("stage", filtered, HEAD),
-        ("stage", filtered, HEAD),
-        ("stage", unfiltered, HEAD),
-    ]
+    key = runner._glue_key(2, mode, DSV41_CANDIDATE_FILTERED)
+    # Both early variants install the same metadata, so they share one glue graph.
+    assert runner._glue_key(2, mode, DSV41_CANDIDATE_UNFILTERED) == key
+    assert runner._glue_key(2, mode, "candidate_all") != key
+    assert calls == [("discard", None)] * 2 + [("stage", key, HEAD)] * 3
 
 
 def test_runner_takes_only_an_unpadded_captured_replay():
