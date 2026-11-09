@@ -413,7 +413,16 @@ __device__ __forceinline__ bool try_get_extra_page_device_loc(
 
 // Flatten all speculative steps. Each lane resolves one occurrence; the warp
 // cooperatively copies only lanes that won a unique-miss claim.
-template <int BLOCK_SIZE, int NUM_TOP_K, int HOT_BUFFER_SIZE, int ITEM_SIZE_BYTES, int NUM_STEPS, bool RecordMissPlan>
+template <
+    int BLOCK_SIZE,
+    int NUM_TOP_K,
+    int HOT_BUFFER_SIZE,
+    int ITEM_SIZE_BYTES,
+    int NUM_STEPS,
+    bool RecordMissPlan,
+    bool PassThroughDeviceLocs,
+    bool LateBoundHostBase,
+    int WORKSPACE_CAPACITY>
 __global__ void load_cache_to_device_buffer_spec_gather_kernel(
     const int32_t* __restrict__ top_k_tokens,
     int32_t* __restrict__ device_buffer_tokens,
@@ -424,6 +433,9 @@ __global__ void load_cache_to_device_buffer_spec_gather_kernel(
     int32_t* __restrict__ top_k_device_locs,
     const int64_t* __restrict__ req_pool_indices,
     const int32_t* __restrict__ seq_lens,
+    const int32_t* __restrict__ device_locs,
+    int64_t device_locs_stride,
+    const int64_t* __restrict__ host_binding,
     SpecCacheState cache_state,
     SpecMissWorkspace miss_workspace,
     const int32_t* __restrict__ num_real_reqs,
@@ -447,7 +459,7 @@ __global__ void load_cache_to_device_buffer_spec_gather_kernel(
       }
     }
     for (int64_t i = tid; i < total_occurrences; i += BLOCK_SIZE)
-      req_top_k_device_locs[i] = 0;
+      req_top_k_device_locs[i] = PassThroughDeviceLocs ? -1 : 0;
     return;
   }
 
@@ -463,14 +475,20 @@ __global__ void load_cache_to_device_buffer_spec_gather_kernel(
   int32_t* req_device_buffer_tokens = device_buffer_tokens + buffer_offset;
   int32_t* req_device_buffer_locs = device_buffer_locs + buffer_offset;
   const int64_t* req_host_cache_locs = host_cache_locs + rid * host_stride;
+  const char* host_base = static_cast<const char*>(host_cache_k);
+  int64_t host_row_bytes = ITEM_SIZE_BYTES;
+  if constexpr (LateBoundHostBase) {
+    host_base = reinterpret_cast<const char*>(host_binding[0]);
+    host_row_bytes = host_binding[1];
+  }
   int64_t* req_ring_hash_keys = cache_state.hash_primary + rid * cache_state.hash_stride;
   int64_t* req_ring_hash_vals = cache_state.hash_secondary + rid * cache_state.hash_stride;
   int32_t* req_cache_ref_bits = cache_state.ref_epochs + rid * cache_state.ref_epoch_stride;
   int32_t* req_scratch_locs = miss_workspace.locs + rid * miss_workspace.loc_stride;
   int32_t* req_scratch_tokens = miss_workspace.metadata + rid * miss_workspace.metadata_stride;
   auto* req_scratch_table = reinterpret_cast<unsigned long long*>(req_scratch_tokens);
-  auto* req_scratch_indices = req_scratch_table + total_occurrences;
-  int32_t* req_compact_hash_positions = req_scratch_tokens + 4 * total_occurrences;
+  auto* req_scratch_indices = req_scratch_table + WORKSPACE_CAPACITY;
+  int32_t* req_compact_hash_positions = req_scratch_tokens + 4 * WORKSPACE_CAPACITY;
   int32_t* req_work_count = miss_workspace.counters + miss_workspace.counter_capacity + rid;
   int32_t* req_union_hit_count = miss_workspace.counters + 2 * miss_workspace.counter_capacity + rid;
   int32_t* req_scratch_generation = miss_workspace.counters + 3 * miss_workspace.counter_capacity + rid;
@@ -496,11 +514,20 @@ __global__ void load_cache_to_device_buffer_spec_gather_kernel(
     const int64_t seq_len = static_cast<int64_t>(seq_lens[bid * NUM_STEPS + step]);
     if (token >= 0 && token < seq_len) {
       int32_t direct_loc = -1;
-      if (try_get_extra_page_device_loc<HOT_BUFFER_SIZE>(
-              token, seq_len, req_device_buffer_tokens, req_device_buffer_locs, page_size, &direct_loc)) {
-        loc = direct_loc;
+      if constexpr (PassThroughDeviceLocs) {
+        direct_loc = device_locs[rid * device_locs_stride + token];
+        if (direct_loc >= 0) {
+          loc = direct_loc;
+        } else {
+          needs_cache_lookup = true;
+        }
       } else {
-        needs_cache_lookup = true;
+        if (try_get_extra_page_device_loc<HOT_BUFFER_SIZE>(
+                token, seq_len, req_device_buffer_tokens, req_device_buffer_locs, page_size, &direct_loc)) {
+          loc = direct_loc;
+        } else {
+          needs_cache_lookup = true;
+        }
       }
     }
   }
@@ -528,11 +555,11 @@ __global__ void load_cache_to_device_buffer_spec_gather_kernel(
     } else {
       src_loc = req_host_cache_locs[token];
       if (src_loc >= 0) {
-        int32_t hash_pos = hash_slot(token, static_cast<int>(total_occurrences));
+        int32_t hash_pos = hash_slot(token, WORKSPACE_CAPACITY);
         const auto epoch_bits = static_cast<unsigned long long>(static_cast<uint32_t>(scratch_epoch)) << 32;
         const auto token_bits = static_cast<uint32_t>(token);
         const auto packed = epoch_bits | token_bits;
-        for (int64_t attempt = 0; attempt < total_occurrences; ++attempt) {
+        for (int64_t attempt = 0; attempt < WORKSPACE_CAPACITY; ++attempt) {
           auto old = atomicCAS(req_scratch_table + hash_pos, 0ull, 0ull);
           if (static_cast<uint32_t>(old >> 32) != static_cast<uint32_t>(scratch_epoch)) {
             const auto claimed = atomicCAS(req_scratch_table + hash_pos, old, packed);
@@ -563,7 +590,7 @@ __global__ void load_cache_to_device_buffer_spec_gather_kernel(
             }
             break;
           }
-          hash_pos = next_hash_slot(hash_pos, static_cast<int>(total_occurrences));
+          hash_pos = next_hash_slot(hash_pos, WORKSPACE_CAPACITY);
         }
       }
     }
@@ -598,7 +625,7 @@ __global__ void load_cache_to_device_buffer_spec_gather_kernel(
           miss_dst_out[bid * plan_stride + copy_miss_idx] = copy_loc;
         }
       }
-      const auto src_k = static_cast<const char*>(host_cache_k) + copy_src_loc * ITEM_SIZE_BYTES;
+      const auto src_k = host_base + copy_src_loc * host_row_bytes;
       auto dst_k = static_cast<char*>(device_buffer_k) + static_cast<int64_t>(copy_loc) * ITEM_SIZE_BYTES;
       transfer_item_warp<ITEM_SIZE_BYTES>(lane_id, src_k, dst_k);
     }
@@ -606,7 +633,15 @@ __global__ void load_cache_to_device_buffer_spec_gather_kernel(
   }
 }
 
-template <int NUM_TOP_K, int HOT_BUFFER_SIZE, int ITEM_SIZE_BYTES, int NUM_STEPS, bool RecordMissPlan, bool USE_PDL>
+template <
+    int NUM_TOP_K,
+    int HOT_BUFFER_SIZE,
+    int ITEM_SIZE_BYTES,
+    int NUM_STEPS,
+    bool RecordMissPlan,
+    bool USE_PDL,
+    bool LateBoundHostBase,
+    int WORKSPACE_CAPACITY>
 __global__ void load_cache_to_device_buffer_spec_commit_kernel(
     const int32_t* __restrict__ top_k_tokens,
     int32_t* __restrict__ top_k_device_locs,
@@ -616,6 +651,8 @@ __global__ void load_cache_to_device_buffer_spec_commit_kernel(
     const void* __restrict__ host_cache_k,
     void* __restrict__ device_buffer_k,
     const int64_t* __restrict__ req_pool_indices,
+    const int32_t* __restrict__ seq_lens,
+    const int64_t* __restrict__ host_binding,
     SpecCacheState cache_state,
     SpecMissWorkspace miss_workspace,
     const int32_t* __restrict__ num_real_reqs,
@@ -647,9 +684,15 @@ __global__ void load_cache_to_device_buffer_spec_commit_kernel(
   int32_t* req_scratch_locs = miss_workspace.locs + rid * miss_workspace.loc_stride;
   int32_t* req_scratch_tokens = miss_workspace.metadata + rid * miss_workspace.metadata_stride;
   const auto* req_scratch_table = reinterpret_cast<const unsigned long long*>(req_scratch_tokens);
-  auto* req_scratch_indices = reinterpret_cast<unsigned long long*>(req_scratch_tokens) + total_occurrences;
-  int32_t* req_compact_hash_positions = req_scratch_tokens + 4 * total_occurrences;
+  auto* req_scratch_indices = reinterpret_cast<unsigned long long*>(req_scratch_tokens) + WORKSPACE_CAPACITY;
+  int32_t* req_compact_hash_positions = req_scratch_tokens + 4 * WORKSPACE_CAPACITY;
   const int64_t* req_host_cache_locs = host_cache_locs + rid * host_stride;
+  const char* host_base = static_cast<const char*>(host_cache_k);
+  int64_t host_row_bytes = ITEM_SIZE_BYTES;
+  if constexpr (LateBoundHostBase) {
+    host_base = reinterpret_cast<const char*>(host_binding[0]);
+    host_row_bytes = host_binding[1];
+  }
   const int32_t* req_top_k_tokens = top_k_tokens + bid * top_k_tokens_stride;
   int32_t* req_top_k_device_locs = top_k_device_locs + bid * top_k_device_locs_stride;
   int32_t* req_work_count = miss_workspace.counters + miss_workspace.counter_capacity + rid;
@@ -716,11 +759,7 @@ __global__ void load_cache_to_device_buffer_spec_commit_kernel(
         continue;
       }
       const int32_t unique_idx = scratch_union_lookup(
-          req_scratch_table,
-          req_scratch_indices,
-          static_cast<int32_t>(total_occurrences),
-          static_cast<uint32_t>(scratch_epoch),
-          token);
+          req_scratch_table, req_scratch_indices, WORKSPACE_CAPACITY, static_cast<uint32_t>(scratch_epoch), token);
       if (unique_idx >= 0 && unique_idx < miss_workspace.loc_stride) {
         const int32_t old_metadata = atomicOr(req_compact_hash_positions + unique_idx, COMPACT_APPROX_CLAIM_FLAG);
         if ((old_metadata & COMPACT_APPROX_CLAIM_FLAG) == 0) {
@@ -872,7 +911,7 @@ __global__ void load_cache_to_device_buffer_spec_commit_kernel(
             miss_dst_out[bid * plan_stride + miss_idx] = dst_loc;
           }
         }
-        const auto src_k = static_cast<const char*>(host_cache_k) + src_loc * ITEM_SIZE_BYTES;
+        const auto src_k = host_base + src_loc * host_row_bytes;
         auto dst_k = static_cast<char*>(device_buffer_k) + static_cast<int64_t>(dst_loc) * ITEM_SIZE_BYTES;
         transfer_item_warp<ITEM_SIZE_BYTES>(lane_id, src_k, dst_k);
       }
@@ -887,12 +926,12 @@ __global__ void load_cache_to_device_buffer_spec_commit_kernel(
         continue;
       }
       const int32_t token = req_top_k_tokens[occ];
-      if (token < 0) {
+      if (token < 0 || token >= seq_lens[bid * NUM_STEPS + occ / NUM_TOP_K]) {
         continue;
       }
 
-      int32_t hash_pos = hash_slot(token, static_cast<int>(total_occurrences));
-      for (int64_t attempt = 0; attempt < total_occurrences; ++attempt) {
+      int32_t hash_pos = hash_slot(token, WORKSPACE_CAPACITY);
+      for (int64_t attempt = 0; attempt < WORKSPACE_CAPACITY; ++attempt) {
         const auto packed = req_scratch_table[hash_pos];
         if (static_cast<uint32_t>(packed >> 32) != static_cast<uint32_t>(scratch_epoch)) {
           break;
@@ -907,7 +946,7 @@ __global__ void load_cache_to_device_buffer_spec_commit_kernel(
           }
           break;
         }
-        hash_pos = next_hash_slot(hash_pos, static_cast<int>(total_occurrences));
+        hash_pos = next_hash_slot(hash_pos, WORKSPACE_CAPACITY);
       }
     }
   }
@@ -935,7 +974,10 @@ template <
     int ITEM_SIZE_BYTES,
     int NUM_STEPS,
     bool RecordMissPlan,
-    bool USE_PDL>
+    bool USE_PDL,
+    bool PassThroughDeviceLocs = false,
+    bool LateBoundHostBase = false,
+    int WORKSPACE_CAPACITY = NUM_STEPS * NUM_TOP_K>
 void load_cache_to_device_buffer_spec(
     tvm::ffi::TensorView top_k_tokens,
     tvm::ffi::TensorView device_buffer_tokens,
@@ -954,13 +996,21 @@ void load_cache_to_device_buffer_spec(
     int64_t page_size,
     tvm::ffi::TensorView miss_src_out,
     tvm::ffi::TensorView miss_dst_out,
-    tvm::ffi::TensorView miss_count_out) {
+    tvm::ffi::TensorView miss_count_out,
+    tvm::ffi::TensorView device_locs,
+    tvm::ffi::TensorView host_binding) {
   using namespace host;
 
-  static_assert(NUM_STEPS > 1 && NUM_STEPS <= 4, "HiSparse speculative swap requires 2-4 steps.");
+  static_assert(NUM_STEPS >= 1 && NUM_STEPS <= 4, "HiSparse speculative swap requires 1-4 steps.");
   static_assert(NUM_TOP_K >= 1024, "HiSparse speculative swap requires top_k >= 1024.");
   static_assert(NUM_STEPS * NUM_TOP_K <= 8192, "HiSparse speculative swap supports at most 8192 occurrences.");
+  static_assert(
+      WORKSPACE_CAPACITY >= NUM_STEPS * NUM_TOP_K && WORKSPACE_CAPACITY <= 8192,
+      "HiSparse speculative metadata must cover every occurrence and fit the compact hash index.");
 
+  const auto* device_locs_ptr = PassThroughDeviceLocs ? static_cast<const int32_t*>(device_locs.data_ptr()) : nullptr;
+  const int64_t device_locs_stride = PassThroughDeviceLocs ? device_locs.strides()[0] : 0;
+  const auto* host_binding_ptr = LateBoundHostBase ? static_cast<const int64_t*>(host_binding.data_ptr()) : nullptr;
   const int64_t bs = top_k_tokens.shape()[0];
   constexpr int64_t total_occurrences = NUM_STEPS * NUM_TOP_K;
   RuntimeCheck(top_k_tokens.ndim() == 3, "speculative top_k_tokens must have shape [batch, steps, top_k].");
@@ -986,7 +1036,7 @@ void load_cache_to_device_buffer_spec(
       "speculative cache_policy must contain one CLOCK control row and one reference-epoch row per request.");
   RuntimeCheck(
       scratch_state.ndim() == 2 && scratch_state.shape()[0] >= num_request_slots + 1 &&
-          scratch_state.shape()[1] >= 4 * num_request_slots && scratch_state.shape()[1] >= 5 * total_occurrences,
+          scratch_state.shape()[1] >= 4 * num_request_slots && scratch_state.shape()[1] >= 5 * WORKSPACE_CAPACITY,
       "speculative scratch_state must contain one counter row and one miss-metadata row per request.");
   RuntimeCheck(scratch_state.strides()[0] % 2 == 0, "speculative scratch metadata stride must be 64-bit aligned.");
 
@@ -1057,7 +1107,10 @@ void load_cache_to_device_buffer_spec(
           HOT_BUFFER_SIZE,
           ITEM_SIZE_BYTES,
           NUM_STEPS,
-          RecordMissPlan>,
+          RecordMissPlan,
+          PassThroughDeviceLocs,
+          LateBoundHostBase,
+          WORKSPACE_CAPACITY>,
       static_cast<const int32_t*>(top_k_tokens.data_ptr()),
       static_cast<int32_t*>(device_buffer_tokens.data_ptr()),
       static_cast<const int64_t*>(host_cache_locs.data_ptr()),
@@ -1067,6 +1120,9 @@ void load_cache_to_device_buffer_spec(
       static_cast<int32_t*>(top_k_device_locs.data_ptr()),
       static_cast<const int64_t*>(req_pool_indices.data_ptr()),
       static_cast<const int32_t*>(seq_lens.data_ptr()),
+      device_locs_ptr,
+      device_locs_stride,
+      host_binding_ptr,
       cache_state,
       miss_workspace,
       static_cast<const int32_t*>(num_real_reqs.data_ptr()),
@@ -1088,7 +1144,9 @@ void load_cache_to_device_buffer_spec(
               ITEM_SIZE_BYTES,
               NUM_STEPS,
               RecordMissPlan,
-              USE_PDL>,
+              USE_PDL,
+              LateBoundHostBase,
+              WORKSPACE_CAPACITY>,
           static_cast<const int32_t*>(top_k_tokens.data_ptr()),
           static_cast<int32_t*>(top_k_device_locs.data_ptr()),
           static_cast<int32_t*>(device_buffer_tokens.data_ptr()),
@@ -1097,6 +1155,8 @@ void load_cache_to_device_buffer_spec(
           host_cache_k.data_ptr(),
           device_buffer_k.data_ptr(),
           static_cast<const int64_t*>(req_pool_indices.data_ptr()),
+          static_cast<const int32_t*>(seq_lens.data_ptr()),
+          host_binding_ptr,
           cache_state,
           miss_workspace,
           static_cast<const int32_t*>(num_real_reqs.data_ptr()),
