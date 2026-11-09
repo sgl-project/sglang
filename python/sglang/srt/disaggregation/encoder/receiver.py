@@ -27,14 +27,19 @@ from transformers import PretrainedConfig
 
 from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
 from sglang.srt.environ import envs
+from sglang.srt.hf_transformers import (
+    get_processor,
+    resolve_image_processor_backend,
+)
 from sglang.srt.managers.io_struct import (
     EncoderDispatchErrorReq,
     GenerateReqInput,
     TokenizedGenerateReqInput,
 )
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
-from sglang.srt.managers.schedule_batch import Modality, Req
 from sglang.srt.multimodal.cache import media_preprocess_kwargs
+from sglang.srt.multimodal.media_io import ImageData, VideoData
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.transport import determine_tensor_transport_mode
 from sglang.srt.observability.trace import fastapi_telemetry_disabled_kwargs
 from sglang.srt.runtime_context import (
@@ -47,17 +52,12 @@ from sglang.srt.runtime_context import (
     get_serving,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import ImageData
-from sglang.srt.utils.common import safe_pickle_loads
-from sglang.srt.utils.hf_transformers_utils import (
-    get_processor,
-    resolve_image_processor_backend,
-)
 from sglang.srt.utils.network import (
     NetworkAddress,
     get_local_ip_auto,
     get_zmq_socket_on_host,
 )
+from sglang.srt.utils.serialization import safe_pickle_loads
 
 logger = logging.getLogger(__name__)
 
@@ -787,9 +787,12 @@ class WaitingMMRequestStatus(IntEnum):
 
 def _select_mm_processor_prompt(recv_req, mm_processor):
     """Mirror tokenizer-side prompt selection for scheduler-side EPD rebuilds."""
-    if mm_processor.prefer_tokenized_input and recv_req.input_ids is not None:
-        return list(recv_req.input_ids)
-    return recv_req.input_text or recv_req.input_ids
+    # The scheduler holds input_ids as array("q"); processors accept str or
+    # list[int], not array.
+    input_ids = None if recv_req.input_ids is None else list(recv_req.input_ids)
+    if mm_processor.prefer_tokenized_input and input_ids is not None:
+        return input_ids
+    return recv_req.input_text or input_ids
 
 
 def create_part_req_id(original_req_id: str, part_idx: int) -> str:
@@ -2038,7 +2041,7 @@ class MMReceiverBase(ABC):
         existing FAIL channel. AbortReq is broadcast, so every TP rank does
         this and the status all-reduce stays consistent."""
         for waiting_req in self.waiting_list:
-            if not (recv_req.abort_all or waiting_req.rid.startswith(recv_req.rid)):
+            if not recv_req.matches(waiting_req.rid):
                 continue
             if waiting_req.status in (
                 WaitingMMRequestStatus.PENDING,
@@ -2513,6 +2516,8 @@ class MMReceiverBase(ABC):
             on_dispatch_error(dispatch_error)
 
     def create_req(self, recv_req: TokenizedGenerateReqInput):
+        from sglang.srt.managers.schedule_batch import Req
+
         req = Req(
             recv_req.rid,
             recv_req.input_text,
@@ -2611,7 +2616,7 @@ class MMReceiverBase(ABC):
             return flat
 
         def to_raw_url(mm_item):
-            if isinstance(mm_item, ImageData):
+            if isinstance(mm_item, (ImageData, VideoData)):
                 return mm_item.url
             if isinstance(mm_item, dict):
                 # tolerate {"url": ...} shaped payloads

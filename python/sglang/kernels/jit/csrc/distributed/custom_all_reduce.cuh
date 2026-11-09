@@ -39,6 +39,13 @@
 #include <cstring>
 #include <string>
 
+// Kept out of sgl_kernel/utils.cuh: every JIT build's cache key covers that
+// header's contents, so an edit there rebuilds every CUDA kernel.
+#ifdef USE_ROCM
+#define cudaMemcpyDeviceToDevice hipMemcpyDeviceToDevice
+#define cudaGetDevice hipGetDevice
+#endif
+
 namespace sglang {
 
 using device::distributed::PullWorkSpace, device::distributed::PushWorkSpace;
@@ -378,6 +385,11 @@ ALL_REDUCE_KERNEL void all_reduce_2shot_pull_kernel(const __grid_constant__ AllR
   }
 
   PDLTriggerSecondary<kUsePDL>();
+#ifdef USE_ROCM
+  // s_barrier does not drain a wave's outstanding stores and the signalling
+  // thread's release covers only its own wave, so each wave publishes its own.
+  ptx::fence_release_sys();
+#endif
   __syncthreads();
   barrier.arrive_rel_acq(/*n=*/1);
 }
@@ -408,6 +420,19 @@ inline auto choose_block_size(uint32_t num_threads) -> uint32_t {
   return 1024u;
 }
 
+#ifdef USE_ROCM
+inline bool is_gfx1250() {
+  static const bool kIsGfx1250 = [] {
+    int device = 0;
+    CHECK_CUDA(cudaGetDevice(&device));
+    hipDeviceProp_t prop;
+    CHECK_CUDA(hipGetDeviceProperties(&prop, device));
+    return std::strncmp(prop.gcnArchName, "gfx1250", 7) == 0;
+  }();
+  return kIsGfx1250;
+}
+#endif
+
 template <typename T, uint32_t kWorldSize, bool kUsePDL>
 struct AllReduceKernel {
  private:
@@ -428,7 +453,7 @@ struct AllReduceKernel {
     const auto& comm = *comm_ref.get();
     CHECK_HOST(algo == "1shot_pull" || algo == "2shot_pull" || algo == "1shot_push" || algo == "2shot_push") << algo;
     CHECK_HOST(comm.get_world_size() == kWorldSize) << comm.get_world_size();
-    CHECK_HOST(in.IsContiguous() && is_type<T>(in.dtype()) && in.device().device_type == kDLCUDA);
+    CHECK_HOST(in.IsContiguous() && is_type<T>(in.dtype()) && in.device().device_type == kDLGPU);
     const auto num_elems_int64 = in.numel();
     const auto num_elems = static_cast<uint32_t>(num_elems_int64);
     const auto nbytes = static_cast<int64_t>(num_elems_int64 * sizeof(T));
@@ -455,6 +480,15 @@ struct AllReduceKernel {
                                    : all_reduce_1shot_push_kernel<T, kWorldSize, kUsePDL>;
       // the grid is bound to the counter array and must stay constant
       auto block_size = choose_block_size(num_vecs);
+#ifdef USE_ROCM
+      // MI350X: from 128 KB a full block per CU beats the narrower pick for
+      // 1shot_push (TP4/6 -4..-8%, TP8 up to -22%); 2shot_push does not gain
+      if (!two_shot && num_vecs >= 8192) block_size = 1024u;
+      // MI450 (TP8, 64-block grid): from 512 KB the rule picks 512-1024 threads for
+      // 2shot_push; with ranks arriving skewed 256 is up to 40% faster up to 4 MB.
+      // Larger sizes keep the rule.
+      if (two_shot && is_gfx1250() && nbytes <= int64_t{4} << 20) block_size = 256u;
+#endif
       if (two_shot) {
         // at least `kWorldSize - 1` warps in all, 1 for each peer
         block_size = std::max(block_size, 32u * div_ceil(kWorldSize - 1, push.num_blocks));

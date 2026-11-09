@@ -1,11 +1,8 @@
-from typing import TYPE_CHECKING, Optional
+from typing import Optional
 
 import torch
 import triton
 import triton.language as tl
-
-if TYPE_CHECKING:
-    from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
 
 @triton.jit
@@ -19,6 +16,7 @@ def get_num_kv_splits_triton(
     max_kv_splits,
     device_core_count,
     MAX_NUM_SEQ: tl.constexpr,
+    uneven_batch_ptr=None,
 ):
     # TODO: this method is tunable, we need more online serving data to tune it
     offs_seq = tl.arange(0, MAX_NUM_SEQ)
@@ -30,6 +28,8 @@ def get_num_kv_splits_triton(
     min_seq_len = tl.min(seq_lens)
     if max_seq_len * 8 < min_seq_len * 10:
         min_seq_len = max_seq_len
+    if uneven_batch_ptr is not None:
+        tl.store(uneven_batch_ptr, (min_seq_len < max_seq_len).to(tl.int32))
     max_kv_splits_1 = tl.minimum(tl.cdiv(max_seq_len, min_seq_len), max_kv_splits)
     kv_chunk_size_1 = tl.cdiv(max_seq_len, max_kv_splits_1)
 
@@ -163,8 +163,36 @@ def prepare_swa_spec_page_table_triton(
 
 
 @triton.jit
-def _fused_metadata_kernel_general(
-    # Input tensors
+def _resolve_metadata_page_ids(
+    token_ids,
+    mask,
+    PAGE_SIZE: tl.constexpr,
+    page_mapping,
+    page_mapping_stride,
+    token_mapping=None,
+    token_mapping_stride=0,
+):
+    # Static SWA maps token slots; unified pools map pages. Callers supply
+    # the appropriate mapping, and absent mappings compile to an identity.
+    if token_mapping is not None:
+        token_ids = tl.load(
+            token_mapping + token_ids * token_mapping_stride, mask=mask, other=0
+        )
+    page_ids = token_ids // PAGE_SIZE
+    if page_mapping is not None:
+        page_ids = tl.maximum(
+            tl.load(
+                page_mapping + tl.maximum(page_ids, 0) * page_mapping_stride,
+                mask=mask,
+                other=0,
+            ),
+            0,
+        )
+    return page_ids
+
+
+@triton.jit
+def _fused_decode_metadata_kernel(
     seq_lens,
     seq_lens_stride_0,
     req_to_token,
@@ -172,7 +200,6 @@ def _fused_metadata_kernel_general(
     req_to_token_stride_1,
     req_pool_indices,
     req_pool_indices_stride_0,
-    # Output buffers
     cache_seqlens_int32,
     cache_seqlens_int32_stride_0,
     cu_seqlens_k,
@@ -183,168 +210,86 @@ def _fused_metadata_kernel_general(
     swa_page_table,
     swa_page_table_stride_0,
     swa_page_table_stride_1,
-    full_to_swa_mapping,
+    full_to_swa_index_mapping,
     full_to_swa_mapping_stride_0,
-    # Scalar parameters
+    full_v2p,
+    full_v2p_stride_0,
+    swa_v2p,
+    swa_v2p_stride_0,
     B,
     max_seq_pages,
-    page_size: tl.constexpr,
-    seq_len_delta: tl.constexpr,
-    use_swa: tl.constexpr,
-    SHIFT: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    SEQ_LEN_DELTA: tl.constexpr,
     BLOCK_COLS: tl.constexpr,
-    SKIP_PAGE_TABLE: tl.constexpr = 0,
+    SKIP_PAGE_TABLE: tl.constexpr,
+    ZERO_TAIL: tl.constexpr,
 ):
-    pid_b = tl.program_id(0)  # batch index
-    pid_c = tl.program_id(1)  # column chunk index
+    pid_b = tl.program_id(0)
+    pid_c = tl.program_id(1)
 
-    # 1. Prefix sum (only one block does it)
+    # One block computes the sequence lengths and prefix sum.
     if pid_b == 0 and pid_c == 0:
         acc = 0
         for idx in range(B):
             seq = tl.load(seq_lens + idx * seq_lens_stride_0)
-            val = (seq + seq_len_delta).to(tl.int32)
+            val = (seq + SEQ_LEN_DELTA).to(tl.int32)
             tl.store(cache_seqlens_int32 + idx * cache_seqlens_int32_stride_0, val)
             tl.store(cu_seqlens_k + idx * cu_seqlens_k_stride_0, acc)
             acc += val
         tl.store(cu_seqlens_k + B * cu_seqlens_k_stride_0, acc)
 
-    # 2. Gather for this batch and column chunk
     if SKIP_PAGE_TABLE:
         return
     if max_seq_pages == 0:
         return
 
-    i = pid_b
-    # Self-guard on the device-side seq_len: skip column chunks past the
-    # request's live pages (tails keep stale values the attention kernels
-    # never read past cache_seqlens).
-    seq_len = tl.load(seq_lens + i * seq_lens_stride_0).to(tl.int32)
-    if page_size == 1:
-        num_live_pages = seq_len + seq_len_delta
-    else:
-        num_live_pages = (seq_len + seq_len_delta + (1 << SHIFT) - 1) >> SHIFT
-    num_live_pages = tl.minimum(num_live_pages, max_seq_pages)
+    seq_len = tl.load(seq_lens + pid_b * seq_lens_stride_0).to(tl.int32)
+    num_live_pages = tl.minimum(
+        tl.cdiv(seq_len + SEQ_LEN_DELTA, PAGE_SIZE), max_seq_pages
+    )
     col_start = pid_c * BLOCK_COLS
-    if col_start >= num_live_pages:
+    if not ZERO_TAIL and col_start >= num_live_pages:
         return
 
-    # Load row index for this batch (all threads in block have same i)
-    row_idx = tl.load(req_pool_indices + i * req_pool_indices_stride_0)
-    row_offset = row_idx * req_to_token_stride_0
-
-    col_offsets = col_start + tl.arange(0, BLOCK_COLS)
-    mask = col_offsets < num_live_pages
-
-    # Compute column indices in the source tensor
-    if page_size == 1:
-        col_idx = col_offsets
-    else:
-        col_idx = col_offsets << SHIFT  # faster than multiplication for power-of-two
-
-    # Load page indices from req_to_token
-    rt_offsets = row_offset + col_idx * req_to_token_stride_1
-    page_index = tl.load(
-        req_to_token + rt_offsets, mask=mask, other=0, cache_modifier=".cg"
+    row_idx = tl.load(req_pool_indices + pid_b * req_pool_indices_stride_0)
+    cols = col_start + tl.arange(0, BLOCK_COLS)
+    live_mask = cols < num_live_pages
+    token_ids = tl.load(
+        req_to_token
+        + row_idx * req_to_token_stride_0
+        + cols * PAGE_SIZE * req_to_token_stride_1,
+        mask=live_mask,
+        other=0,
+        cache_modifier=".cg",
     )
-
-    # Compute page_table
-    if page_size == 1:
-        page_table_val = page_index
-    else:
-        page_table_val = page_index >> SHIFT
-
-    # Store to page_table
-    pt_offsets = i * page_table_stride_0 + col_offsets * page_table_stride_1
-    tl.store(page_table + pt_offsets, page_table_val, mask=mask, cache_modifier=".cg")
-
-    if use_swa:
-        swa_slot = tl.load(
-            full_to_swa_mapping + page_index * full_to_swa_mapping_stride_0,
-            mask=mask,
-            other=0,
+    store_mask = cols < max_seq_pages if ZERO_TAIL else live_mask
+    full_pages = _resolve_metadata_page_ids(
+        token_ids, live_mask, PAGE_SIZE, full_v2p, full_v2p_stride_0
+    )
+    tl.store(
+        page_table + pid_b * page_table_stride_0 + cols * page_table_stride_1,
+        full_pages,
+        mask=store_mask,
+        cache_modifier=".cg",
+    )
+    if swa_page_table is not None:
+        swa_pages = _resolve_metadata_page_ids(
+            token_ids,
+            live_mask,
+            PAGE_SIZE,
+            swa_v2p,
+            swa_v2p_stride_0,
+            full_to_swa_index_mapping,
+            full_to_swa_mapping_stride_0,
+        )
+        tl.store(
+            swa_page_table
+            + pid_b * swa_page_table_stride_0
+            + cols * swa_page_table_stride_1,
+            swa_pages,
+            mask=store_mask,
             cache_modifier=".cg",
         )
-        if page_size == 1:
-            swa_val = swa_slot
-        else:
-            swa_val = swa_slot >> SHIFT
-        swa_offsets = (
-            i * swa_page_table_stride_0 + col_offsets * swa_page_table_stride_1
-        )
-        tl.store(swa_page_table + swa_offsets, swa_val, mask=mask, cache_modifier=".cg")
-
-
-@triton.jit
-def _fused_metadata_kernel_ps1_no_swa(
-    # Input tensors
-    seq_lens,
-    seq_lens_stride_0,
-    req_to_token,
-    req_to_token_stride_0,
-    req_to_token_stride_1,
-    req_pool_indices,
-    req_pool_indices_stride_0,
-    # Output buffers
-    cache_seqlens_int32,
-    cache_seqlens_int32_stride_0,
-    cu_seqlens_k,
-    cu_seqlens_k_stride_0,
-    page_table,
-    page_table_stride_0,
-    page_table_stride_1,
-    # Scalar parameters
-    B,
-    max_seq_pages,
-    seq_len_delta: tl.constexpr,
-    BLOCK_COLS: tl.constexpr,
-    SKIP_PAGE_TABLE: tl.constexpr = 0,
-):
-    pid_b = tl.program_id(0)  # batch index
-    pid_c = tl.program_id(1)  # column chunk index
-
-    # 1. Prefix sum (only one block does it)
-    if pid_b == 0 and pid_c == 0:
-        acc = 0
-        for idx in range(B):
-            seq = tl.load(seq_lens + idx * seq_lens_stride_0)
-            val = (seq + seq_len_delta).to(tl.int32)
-            tl.store(cache_seqlens_int32 + idx * cache_seqlens_int32_stride_0, val)
-            tl.store(cu_seqlens_k + idx * cu_seqlens_k_stride_0, acc)
-            acc += val
-        tl.store(cu_seqlens_k + B * cu_seqlens_k_stride_0, acc)
-
-    # 2. Gather for this batch and column chunk
-    if SKIP_PAGE_TABLE:
-        return
-    if max_seq_pages == 0:
-        return
-
-    i = pid_b
-    # Self-guard on the device-side seq_len: skip column chunks past the
-    # request's live pages (tails keep stale values the attention kernels
-    # never read past cache_seqlens).
-    seq_len = tl.load(seq_lens + i * seq_lens_stride_0).to(tl.int32)
-    num_live_pages = tl.minimum(seq_len + seq_len_delta, max_seq_pages)
-    col_start = pid_c * BLOCK_COLS
-    if col_start >= num_live_pages:
-        return
-
-    # Load row index for this batch (all threads in block have same i)
-    row_idx = tl.load(req_pool_indices + i * req_pool_indices_stride_0)
-    row_offset = row_idx * req_to_token_stride_0
-
-    col_offsets = col_start + tl.arange(0, BLOCK_COLS)
-    mask = col_offsets < num_live_pages
-
-    # page_size = 1: col_idx = col_offsets
-    rt_offsets = row_offset + col_offsets * req_to_token_stride_1
-    page_index = tl.load(
-        req_to_token + rt_offsets, mask=mask, other=0, cache_modifier=".cg"
-    )
-
-    pt_offsets = i * page_table_stride_0 + col_offsets * page_table_stride_1
-    tl.store(page_table + pt_offsets, page_index, mask=mask, cache_modifier=".cg")
 
 
 @triton.jit
@@ -563,188 +508,133 @@ def normal_decode_set_metadata(
     page_table: torch.Tensor,
     req_to_token: torch.Tensor,
     req_pool_indices: torch.Tensor,
-    max_seq_pages: torch.Tensor,
+    max_seq_pages: int,
     seq_lens: torch.Tensor,
     seq_len_delta: int,
     page_size: int,
     swa_page_table: Optional[torch.Tensor] = None,
-    token_to_kv_pool: Optional["SWAKVPool"] = None,
+    full_to_swa_index_mapping: Optional[torch.Tensor] = None,
     skip_page_table: bool = False,
+    full_v2p: Optional[torch.Tensor] = None,
+    swa_v2p: Optional[torch.Tensor] = None,
+    zero_tail: bool = False,
 ):
-    """
-    Fused Triton implementation that replaces 4-5 sequential CUDA kernels with 1-2 kernels:
-      1. cache_seqlens = seq_lens + seq_len_delta (int64->int32 cast)
-      2. cu_seqlens_k = cumsum(cache_seqlens) (prefix-sum)
-      3. page_indices = req_to_token[pool_idx, stride_idx] (2-D gather)
-      4. page_table = page_indices // page_size (floor-divide)
-      5. (optional) swa_page_table for sliding window attention
+    """Fill sequence lengths, their prefix sum and page tables in one launch.
 
-    Unified pool (``skip_page_table=True``): the translator has already filled
-    the page tables in place, so only steps 1-2 run.
+    ``req_to_token`` contains token slots. ``full_v2p`` / ``swa_v2p`` map
+    virtual pages to physical pages; an unbound (-1) page maps to the sink.
+    Static SWA instead uses ``full_to_swa_index_mapping`` to map token slots.
+    Supply exactly one SWA mapping when writing ``swa_page_table``. Mappings
+    are read on device on every invocation, including CUDA graph replay.
 
-    Achieves ~5.2x speedup on H200 hardware for typical decode workloads.
-
-    Contract: only the live prefix (cdiv(cache_seqlens, page_size) pages) of each
-    page_table / swa_page_table row is (re)written; the tail keeps stale values
-    across CUDA-graph replays, so consumers must bound reads by cache_seqlens.
+    Only the live prefix (ceil((seq_len + delta) / page_size)) is rewritten
+    by default; consumers must bound reads by ``cache_seqlens_int32``.
+    ``zero_tail=True`` also clears columns up to ``max_seq_pages`` to zero,
+    independently of address translation. ``skip_page_table=True`` leaves
+    both page tables untouched and computes only lengths and the prefix sum.
     """
     assert page_size > 0 and (page_size & (page_size - 1)) == 0, (
         f"page_size must be a power of two, got {page_size}"
     )
+    if swa_page_table is not None and not skip_page_table:
+        assert (full_to_swa_index_mapping is None) != (swa_v2p is None), (
+            "SWA output requires exactly one token-slot or page mapping"
+        )
 
     batch_size = cache_seqlens_int32.shape[0]
-    device = seq_lens.device
+    # Lengths-only/unmapped token gathers use 256 columns, other gathers 128.
+    block_cols = (
+        256
+        if skip_page_table
+        or (page_size == 1 and swa_page_table is None and full_v2p is None)
+        else 128
+    )
+    grid = (
+        (1, 1)
+        if skip_page_table or max_seq_pages == 0
+        else (batch_size, triton.cdiv(max_seq_pages, block_cols))
+    )
+    _fused_decode_metadata_kernel[grid](
+        seq_lens,
+        seq_lens.stride(0),
+        req_to_token,
+        req_to_token.stride(0),
+        req_to_token.stride(1),
+        req_pool_indices,
+        req_pool_indices.stride(0),
+        cache_seqlens_int32,
+        cache_seqlens_int32.stride(0),
+        cu_seqlens_k,
+        cu_seqlens_k.stride(0),
+        page_table,
+        page_table.stride(0),
+        page_table.stride(1),
+        swa_page_table,
+        swa_page_table.stride(0) if swa_page_table is not None else 0,
+        swa_page_table.stride(1) if swa_page_table is not None else 0,
+        full_to_swa_index_mapping,
+        full_to_swa_index_mapping.stride(0)
+        if full_to_swa_index_mapping is not None
+        else 0,
+        full_v2p,
+        full_v2p.stride(0) if full_v2p is not None else 0,
+        swa_v2p,
+        swa_v2p.stride(0) if swa_v2p is not None else 0,
+        batch_size,
+        max_seq_pages,
+        PAGE_SIZE=page_size,
+        SEQ_LEN_DELTA=seq_len_delta,
+        BLOCK_COLS=block_cols,
+        SKIP_PAGE_TABLE=skip_page_table,
+        ZERO_TAIL=zero_tail,
+        num_warps=block_cols // 32,
+        num_stages=3,
+    )
 
-    # Ensure contiguous memory layout for efficient Triton access
-    seq_lens = seq_lens.contiguous()
-    req_to_token = req_to_token.contiguous()
-    req_pool_indices = req_pool_indices.contiguous()
 
-    # Prepare tensor strides
-    seq_lens_stride_0 = seq_lens.stride(0)
-    req_to_token_stride_0 = req_to_token.stride(0)
-    req_to_token_stride_1 = req_to_token.stride(1)
-    req_pool_indices_stride_0 = req_pool_indices.stride(0)
-    cache_seqlens_int32_stride_0 = cache_seqlens_int32.stride(0)
-    cu_seqlens_k_stride_0 = cu_seqlens_k.stride(0)
-    page_table_stride_0 = page_table.stride(0)
-    page_table_stride_1 = page_table.stride(1)
+@triton.jit
+def q8kv8_topk_length_backscan_kernel(
+    indices_ptr,
+    out_ptr,
+    stride_row,
+    topk,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    base = indices_ptr + row * stride_row
+    off = topk
+    length = 1
+    found = 0
+    while (found == 0) & (off > 0):
+        off -= BLOCK
+        idx = off + tl.arange(0, BLOCK)
+        vals = tl.load(base + idx)
+        pos = tl.max(tl.where(vals >= 0, idx, -1), axis=0)
+        found = tl.where(pos >= 0, 1, found)
+        length = tl.where(pos >= 0, pos + 1, length)
+    tl.store(out_ptr + row, length)
 
-    if skip_page_table:
-        # One block does the prefix sum, so one block is the whole grid.
-        _fused_metadata_kernel_ps1_no_swa[(1, 1)](
-            seq_lens,
-            seq_lens_stride_0,
-            page_table,
-            page_table_stride_0,
-            page_table_stride_1,
-            req_pool_indices,
-            req_pool_indices_stride_0,
-            cache_seqlens_int32,
-            cache_seqlens_int32_stride_0,
-            cu_seqlens_k,
-            cu_seqlens_k_stride_0,
-            page_table,
-            page_table_stride_0,
-            page_table_stride_1,
-            batch_size,
-            0,
-            seq_len_delta,
-            BLOCK_COLS=256,
-            SKIP_PAGE_TABLE=1,
-            num_warps=8,
-            num_stages=3,
-        )
-        return
 
-    use_swa = swa_page_table is not None and token_to_kv_pool is not None
+def q8kv8_topk_length_from_indices(indices: torch.Tensor) -> torch.Tensor:
+    """Per-row valid-topk count = last non-negative position + 1 (min 1).
 
-    # Unified SWA uses an independent SWA v2p table.
-    swa_v2p_page_table = None
-    if use_swa and token_to_kv_pool.full_to_swa_index_mapping is None:
-        from sglang.srt.mem_cache.unified_memory_pool import UnifiedSWAKVPool
-
-        assert isinstance(token_to_kv_pool, UnifiedSWAKVPool)
-        assert token_to_kv_pool._swa_allocator is not None
-        swa_v2p_page_table = token_to_kv_pool._swa_allocator.virtual_to_physical
-
-    # Check if we should use the specialized fast path for page_size=1, no SWA
-    swa_uses_v2p = swa_v2p_page_table is not None
-
-    if page_size == 1 and not use_swa:
-        # Specialized kernel for the common case (page_size=1, no SWA)
-        BLOCK_COLS = 256
-        if max_seq_pages == 0:
-            grid = (1, 1)
-        else:
-            num_blocks_j = triton.cdiv(max_seq_pages, BLOCK_COLS)
-            grid = (batch_size, num_blocks_j)
-
-        _fused_metadata_kernel_ps1_no_swa[grid](
-            seq_lens,
-            seq_lens_stride_0,
-            req_to_token,
-            req_to_token_stride_0,
-            req_to_token_stride_1,
-            req_pool_indices,
-            req_pool_indices_stride_0,
-            cache_seqlens_int32,
-            cache_seqlens_int32_stride_0,
-            cu_seqlens_k,
-            cu_seqlens_k_stride_0,
-            page_table,
-            page_table_stride_0,
-            page_table_stride_1,
-            batch_size,
-            max_seq_pages,
-            seq_len_delta,
-            BLOCK_COLS=BLOCK_COLS,
-            num_warps=8,
-            num_stages=3,
-        )
-    else:
-        # General kernel for page_size > 1 or SWA cases
-        # SWA parameters
-        if use_swa:
-            from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
-
-            swa_page_table = swa_page_table.contiguous()
-            swa_page_table_stride_0 = swa_page_table.stride(0)
-            swa_page_table_stride_1 = swa_page_table.stride(1)
-            if swa_uses_v2p:
-                full_to_swa_mapping = swa_v2p_page_table.contiguous()
-                full_to_swa_mapping_stride_0 = 0
-            else:
-                assert isinstance(token_to_kv_pool, SWAKVPool)
-                full_to_swa_mapping = (
-                    token_to_kv_pool.full_to_swa_index_mapping.contiguous()
-                )
-                full_to_swa_mapping_stride_0 = full_to_swa_mapping.stride(0)
-        else:
-            # Dummy tensors (not used)
-            swa_page_table = torch.empty(0, dtype=torch.int32, device=device)
-            swa_page_table_stride_0 = 0
-            swa_page_table_stride_1 = 0
-            full_to_swa_mapping = torch.empty(0, dtype=torch.int32, device=device)
-            full_to_swa_mapping_stride_0 = 0
-
-        # Kernel configuration
-        BLOCK_COLS = 128
-        shift = (page_size).bit_length() - 1 if page_size > 1 else 0
-
-        if max_seq_pages == 0:
-            grid = (1, 1)
-        else:
-            num_blocks_j = triton.cdiv(max_seq_pages, BLOCK_COLS)
-            grid = (batch_size, num_blocks_j)
-
-        _fused_metadata_kernel_general[grid](
-            seq_lens,
-            seq_lens_stride_0,
-            req_to_token,
-            req_to_token_stride_0,
-            req_to_token_stride_1,
-            req_pool_indices,
-            req_pool_indices_stride_0,
-            cache_seqlens_int32,
-            cache_seqlens_int32_stride_0,
-            cu_seqlens_k,
-            cu_seqlens_k_stride_0,
-            page_table,
-            page_table_stride_0,
-            page_table_stride_1,
-            swa_page_table,
-            swa_page_table_stride_0,
-            swa_page_table_stride_1,
-            full_to_swa_mapping,
-            full_to_swa_mapping_stride_0,
-            batch_size,
-            max_seq_pages,
-            page_size,
-            seq_len_delta,
-            use_swa,
-            shift,
-            BLOCK_COLS=BLOCK_COLS,
-            num_warps=4,
-            num_stages=3,
-        )
+    ``indices``: [s_q, topk] int32 topk output whose pad slots are -1.
+    Backward block scan per row: the loop exits at the first block holding a
+    valid entry, so the cost is proportional to the trailing pad run — one
+    block (~topk/4 elements) for rows with a full topk, which dominate long
+    contexts. Semantics match the unfused ``(indices >= 0) * ramp).amax``
+    derivation exactly, including all-pad rows (length 1: one pad-only block
+    keeps the kernel on its clamp+mask path, contributing zero).
+    """
+    s_q, topk = indices.shape
+    assert indices.dtype == torch.int32 and indices.stride(1) == 1
+    out = torch.empty(s_q, dtype=torch.int32, device=indices.device)
+    block = 512 if topk % 512 == 0 else (256 if topk % 256 == 0 else 128)
+    q8kv8_topk_length_backscan_kernel[(s_q,)](
+        indices,
+        out,
+        indices.stride(0),
+        topk,
+        BLOCK=block,
+    )
+    return out

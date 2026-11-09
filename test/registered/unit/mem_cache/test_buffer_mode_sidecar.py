@@ -31,9 +31,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     PrefetchOperation,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.unified_cache.components.base import (
-    ComponentType,
-)
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     BufferBackupSnapshot,
     BufferBackupState,
@@ -45,7 +43,7 @@ from sglang.srt.mem_cache.unified_radix_cache import (
 from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+register_cpu_ci(est_time=18, suite="base-a-test-cpu")
 
 
 class TestBufferModeSidecar(unittest.TestCase):
@@ -456,7 +454,7 @@ class TestBufferModeSidecar(unittest.TestCase):
             component_type=ComponentType.SWA,
             full_window_pages=1,
         )
-        pipeline._auxiliary_swa_component = None
+        pipeline._further_window_components = ()
         pipeline.write_backlog_cap = 8
         pipeline.reset()
         pipeline._build_backup_transfers = lambda node_id, *, kv_only=False: (

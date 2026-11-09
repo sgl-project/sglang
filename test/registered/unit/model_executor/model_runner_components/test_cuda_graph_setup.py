@@ -12,7 +12,82 @@ from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+
+@pytest.mark.parametrize("width", [1, 6])
+@pytest.mark.parametrize("gathered_buffer_required", [False, True])
+@pytest.mark.parametrize(
+    "cp_size,dispatch,overrides,model_overrides,expected",
+    [
+        (1, False, {}, {}, {1: [1, 2, 4, 8], 6: [1, 2, 4, 8]}),
+        (8, False, {}, {}, {1: [8], 6: [4, 8]}),
+        (8, True, {}, {}, {1: [1, 2, 4, 8], 6: [1, 2, 4, 8]}),
+        (4, True, {}, {}, {1: [4, 8], 6: [2, 4, 8]}),
+        (8, True, {"enable_lora": True}, {}, {1: [8], 6: [4, 8]}),
+        (8, True, {"enable_layernorm_sp": True}, {}, {1: [8], 6: [4, 8]}),
+        (8, True, {"enable_quant_communications": True}, {}, {1: [8], 6: [4, 8]}),
+        (8, True, {}, {"q_lora_rank": None}, {1: [8], 6: [4, 8]}),
+        (8, True, {}, {"index_topk": None}, {1: [8], 6: [4, 8]}),
+    ],
+)
+def test_cp_decode_dispatch_capture_buckets(
+    width,
+    gathered_buffer_required,
+    cp_size,
+    dispatch,
+    overrides,
+    model_overrides,
+    expected,
+):
+    from sglang.srt.layers.dp_attention import get_cuda_graph_batch_size_alignment
+    from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
+        get_batch_sizes_to_capture,
+    )
+    from sglang.srt.runtime_context import get_context
+
+    hf_config = SimpleNamespace(
+        **{
+            "architectures": ["GlmMoeDsaForCausalLM"],
+            "index_topk": 2048,
+            "q_lora_rank": 2048,
+            **model_overrides,
+        }
+    )
+    model_runner = SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=hf_config),
+        req_to_token_pool=SimpleNamespace(size=8),
+        server_args=SimpleNamespace(dllm_algorithm=None),
+    )
+    with get_context().override_server_args(
+        tp_size=8,
+        attn_cp_size=cp_size,
+        enable_prefill_cp=cp_size > 1,
+        enable_cp_decode_attn_tp=dispatch,
+        cp_strategy="interleave",
+        device="cuda",
+        enable_torch_compile=False,
+        enable_two_batch_overlap=False,
+        cuda_graph_config=SimpleNamespace(
+            decode=SimpleNamespace(backend="default", bs=[1, 2, 4, 8])
+        ),
+        **overrides,
+    ):
+        capture_bs, compile_bs = get_batch_sizes_to_capture(
+            model_runner, width, gathered_buffer_required=gathered_buffer_required
+        )
+        # A gather has its own row-alignment contract. Dispatch must not
+        # relax it, even when attention alone could run an unpadded graph.
+        assert capture_bs == (
+            {1: [8], 6: [4, 8]}[width] if gathered_buffer_required else expected[width]
+        )
+        assert compile_bs == []
+        # Only the decode bucket builder opts out. Other users, including
+        # startup capacity alignment, retain the original CP requirement.
+        assert (
+            get_cuda_graph_batch_size_alignment(gathered_buffer_required=False)
+            == cp_size
+        )
 
 
 def test_standard_gqa_gate_uses_pipeline_local_layer_range():
@@ -69,11 +144,11 @@ def test_reuse_tables_pass_through_but_distinct_duplicates_raise():
 
 def test_draft_startup_preserves_runner_local_capture_sizes(monkeypatch, caplog):
     """Startup must not reject local draft buckets using global TP alignment."""
+    from sglang.srt.layers import dp_attention
     from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
         get_batch_sizes_to_capture,
     )
     from sglang.srt.runtime_context import get_context
-    from sglang.srt.utils import common
 
     capture_bs = [1, 2, 3, 4, 8]
     # The capture decision reads the graph configuration and the MoE backends
@@ -100,7 +175,7 @@ def test_draft_startup_preserves_runner_local_capture_sizes(monkeypatch, caplog)
         gpu_id = 0
         is_draft_worker = True
         spec_algorithm = SimpleNamespace(is_speculative=lambda: True)
-        server_args = SimpleNamespace(model_impl="auto")
+        server_args = SimpleNamespace(model_impl="auto", dllm_algorithm=None)
         req_to_token_pool = SimpleNamespace(size=32)
 
         def decode_num_tokens_per_req(self):
@@ -112,9 +187,11 @@ def test_draft_startup_preserves_runner_local_capture_sizes(monkeypatch, caplog)
     model_runner = TestModelRunner()
     monkeypatch.setattr(cuda_graph_setup, "check_cuda_graph_backend", lambda *_: False)
     monkeypatch.setattr(cuda_graph_setup, "get_available_gpu_memory", lambda *_: 10.0)
-    monkeypatch.setattr(common, "require_gathered_buffer", lambda: True)
+    monkeypatch.setattr(dp_attention, "require_gathered_buffer", lambda: True)
     monkeypatch.setattr(
-        common, "get_parallel", lambda: SimpleNamespace(attn_tp_size=16, attn_cp_size=1)
+        dp_attention,
+        "get_parallel",
+        lambda: SimpleNamespace(attn_tp_size=16, attn_cp_size=1),
     )
     monkeypatch.setattr(
         cuda_graph_setup.current_platform, "is_out_of_tree", lambda: False
