@@ -39,18 +39,6 @@ def _launch_dequant(weight, scales, output):
         )
 
 
-@register_custom_op(op_name="groupwise_int8_dequant_validated", mutates_args=["output"])
-def _dequant_into_validated(
-    weight: torch.Tensor, scales: torch.Tensor, output: torch.Tensor
-) -> None:
-    """Internal path: admitted weights, BF16 output, all on the current GPU.
-
-    The caller must validate the fixed weight metadata after loading and keep
-    it unchanged across forwards. Component device moves may change storage.
-    """
-    _launch_dequant(weight, scales, output)
-
-
 @register_custom_op(op_name="groupwise_int8_dequant", mutates_args=["output"])
 def _dequant_into(
     weight: torch.Tensor, scales: torch.Tensor, output: torch.Tensor

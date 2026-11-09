@@ -1367,19 +1367,18 @@ def test_int8_group_boundary_and_partial_final_group(int8_layer):
 
 
 def test_int8_loading_rejects_invalid_group_metadata(int8_layer):
-    """A malformed scale tensor must fail before admission to the unchecked kernel."""
+    """Reject malformed groupwise scales during weight loading."""
     int8_layer.quant_method.process_weights_after_loading(int8_layer)
     int8_layer.weight_scale = torch.nn.Parameter(
         torch.ones((2, 1), dtype=torch.float32), requires_grad=False
     )
     with pytest.raises(ValueError, match="groupwise shape"):
         int8_layer.quant_method.process_weights_after_loading(int8_layer)
-    assert not int8_layer._quanto_int8_group128_validated
 
 
 @torch.inference_mode()
-def test_int8_admitted_path_survives_device_moves_and_compile(int8_layer):
-    """Admission validates metadata, without retaining addresses across offloads."""
+def test_int8_dequant_survives_device_moves_and_compile(int8_layer):
+    """Fused dequantization supports component offload and compiled inference."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     inputs = torch.ones(2, 130, dtype=torch.bfloat16)
