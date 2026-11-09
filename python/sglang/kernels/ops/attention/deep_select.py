@@ -79,7 +79,7 @@ _NORMAL_CONFIGS: Dict[Tuple[torch.dtype, int], Tuple[_Config, ...]] = {
     (torch.float32, 1024): (_Config(1024, 512, 1, 8192, 4096, 3),),
     (torch.float32, 4096): (_Config(4096, 256, 1, 4096, 4096, 3),),
 }
-SUPPORTED_CUDA_ARCHS = ((9, 0), (10, 0), (10, 3))
+SUPPORTED_CUDA_ARCHS = ((9, 0), (10, 0), (10, 3), (10, 7))
 
 
 # (max rows, cluster size), widest first: the most rows each cluster size runs in one wave
@@ -131,7 +131,7 @@ def _jit_deep_select_module(
     if cluster_size == 1:
         configs = _NORMAL_CONFIGS[(value_dtype, max_topk)]
         host_dispatch = "TopkNormal"
-        if page_transform and (value_dtype, max_topk) == (torch.bfloat16, 512):
+        if not sorted_index and (value_dtype, max_topk) == (torch.bfloat16, 512):
             configs = (*configs, _Config(512, 256, 3, 4096, 2048, 2))
     else:
         # Upstream tunes the cluster kernel for bf16 at max_topk 1024 alone, so
