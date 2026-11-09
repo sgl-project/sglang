@@ -83,6 +83,11 @@ _LOAD_LOOP = re.compile(
     r"\[Foundry\] SGLang (\w+) capture loop on LOAD: ([0-9.]+)s \((\d+) shapes, "
     r"restore ([0-9.]+)s, per-shape prep ([0-9.]+)s\)"
 )
+# The decode-type batch sizes SGLang captured (rank 0 prints the list; the EP
+# and attention-TP layouts clamp or align the requested list).
+_CAPTURED_BS = re.compile(
+    r"Capture target (?:decode|verify) CUDA graph end\. bs=\[([0-9, ]*)\]"
+)
 _PREFILL_PASSES = re.compile(
     r'^sglang:cuda_graph_passes_total\{[^}]*mode="prefill_cuda_graph"[^}]*\}'
     r"\s+([0-9.eE+-]+)$",
@@ -132,6 +137,14 @@ class TestFoundryGraphPersistence(CustomTestCase):
     extra_server_args = []
     # Environment of every engine; the nightly comparison runs without the pins.
     engine_env = _ENGINE_ENV
+    # Added to engine_env (subclasses: the EP rows' NVSHMEM / single-node pins).
+    extra_env = {}
+    # Batched outputs are compared with native unless a subclass says otherwise
+    # (DP attention composes batches per rank, which differs run to run natively).
+    compare_batched = True
+    # A layout whose native engine cannot start on this machine (DeepEP without
+    # a usable NVSHMEM transport) is skipped instead of failed.
+    native_failure_skips = False
     process = None
     tmp = None
 
@@ -171,7 +184,22 @@ class TestFoundryGraphPersistence(CustomTestCase):
         cls.server_args += cls.extra_server_args
         # Native first: it also fills the JIT caches, which SAVE must not compile
         # inside its capture window.
-        cls.runs = {"native": cls._run_engine("native", mode=None)}
+        try:
+            cls.runs = {"native": cls._run_engine("native", mode=None)}
+        except Exception as e:
+            if not cls.native_failure_skips:
+                raise
+            # setUpClass raised: unittest skips tearDownClass, so clean up here.
+            tail = ""
+            err_path = os.path.join(cls.tmp, "native.err")
+            if os.path.exists(err_path):
+                with open(err_path) as f:
+                    tail = "".join(f.readlines()[-8:])
+            cls.tearDownClass()
+            raise unittest.SkipTest(
+                f"{cls.__name__}: the native engine of this layout does not start "
+                f"here ({e}); log tail:\n{tail}"
+            ) from e
         cls.runs["save"] = cls._run_engine("save", mode="save")
         cls.runs["load"] = cls._run_engine("load", mode="load")
 
@@ -195,7 +223,7 @@ class TestFoundryGraphPersistence(CustomTestCase):
                 cls.base_url,
                 timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
                 other_args=cls.server_args + cls._persistence_args(mode),
-                env=cls.engine_env,
+                env={**cls.engine_env, **cls.extra_env},
                 return_stdout_stderr=(out, err),
             )
             result["ready_s"] = time.perf_counter() - t_launch
@@ -249,6 +277,14 @@ class TestFoundryGraphPersistence(CustomTestCase):
             cls.toml,
         ]
 
+    def _captured_decode_bs(self):
+        """The batch sizes the native engine captured, or the requested list
+        when the log has no such line."""
+        match = _CAPTURED_BS.search(self.runs["native"]["log"])
+        if match is None:
+            return list(self.decode_bs)
+        return [int(b) for b in match.group(1).split(",") if b.strip()]
+
     def _archived_decode_graphs(self, kind):
         pattern = (
             "graph_*_FULL_t*.json" if kind is None else f"graph_*_DECODE-{kind}_t*.json"
@@ -262,10 +298,16 @@ class TestFoundryGraphPersistence(CustomTestCase):
         allocation error all pass the output comparison."""
         rank_dir = os.path.join(self.workspace, "rank_0")
         archived_prefill = glob.glob(os.path.join(rank_dir, "graph_*_PREFILL_t*.json"))
+        # SGLang clamps the requested decode batch sizes (DP attention divides
+        # --max-running-requests by the DP size, attention TP aligns them), so the
+        # archive must hold what native captured, one graph per kind and size.
+        captured_bs = self._captured_decode_bs()
         for kind in self.decode_kinds:
             with self.subTest(archived_kind=kind):
                 decode = self._archived_decode_graphs(kind)
-                self.assertEqual(len(decode), len(self.decode_bs), sorted(decode))
+                self.assertEqual(
+                    len(decode), len(captured_bs), (captured_bs, sorted(decode))
+                )
         if self.prefill_bs:
             self.assertGreaterEqual(
                 len(archived_prefill), len(self.prefill_bs), sorted(archived_prefill)
@@ -275,11 +317,10 @@ class TestFoundryGraphPersistence(CustomTestCase):
 
         log = self.runs["load"]["log"]
         decode = {kind or None: int(n) for n, kind, _ in _DECODE_LOADED.findall(log)}
-        prefill = [int(n) for n, _ in _PREFILL_LOADED.findall(log)]
+        # One Loaded line per rank: the set of counts.
+        prefill = sorted({int(n) for n, _ in _PREFILL_LOADED.findall(log)})
         # One Loaded line per decode-type kind, each with every archived graph.
-        self.assertEqual(
-            decode, {kind: len(self.decode_bs) for kind in self.decode_kinds}
-        )
+        self.assertEqual(decode, {kind: len(captured_bs) for kind in self.decode_kinds})
         if self.prefill_bs:
             self.assertEqual(prefill, [len(archived_prefill)])
             # A restored prefill graph that the runner never selects would pass the
@@ -312,7 +353,10 @@ class TestFoundryGraphPersistence(CustomTestCase):
 
     def test_greedy_output_matches_native(self):
         for engine in ("save", "load"):
-            for kind in ("sequential", "batched"):
+            kinds = (
+                ("sequential", "batched") if self.compare_batched else ("sequential",)
+            )
+            for kind in kinds:
                 with self.subTest(engine=engine, kind=kind):
                     self.assertEqual(self.runs[engine][kind], self.runs["native"][kind])
 
