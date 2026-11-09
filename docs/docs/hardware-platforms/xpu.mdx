@@ -310,8 +310,8 @@ via `--cuda-graph-backend-prefill` or `--cuda-graph-config`.
 
 | Feature | Status |
 |---|---|
+| In-graph event synchronization | Not supported (use `SGLANG_ENABLE_WAR_BARRIER=1` and `SGLANG_FORCE_COARSE_WAR_BARRIER=1` for stream-level sync) |
 | Two-batch overlap (`--enable-two-batch-overlap`) | Not yet supported |
-| Speculative decoding | Supported |
 | Decode breakable graph (`--cuda-graph-backend-decode breakable`) | Not yet supported |
 
 ## Decode Context Parallel (DCP) on Intel XPU [Experimental]
