@@ -157,13 +157,14 @@ def _server_args_for_transformer_component(
 
 
 class TransformerLoader(OnlineQuantizationComponentLoader):
-    """Shared loader for (video/audio) DiT transformers."""
+    """Shared loader for (video/audio) DiT transformers and UNet denoisers."""
 
     component_names = [
         "transformer",
         "unconditional_transformer",
         "audio_dit",
         "video_dit",
+        "unet",
     ]
     expected_library = "diffusers"
 
@@ -289,6 +290,7 @@ class TransformerLoader(OnlineQuantizationComponentLoader):
             "transformer",
             "unconditional_transformer",
             "video_dit",
+            "unet",
         ):
             pipeline_dit_config_attr = "dit_config"
         elif component_type == "audio_dit":

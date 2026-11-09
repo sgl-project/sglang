@@ -97,6 +97,11 @@ export const DiffusionModelCatalog = ({ category }) => {
       ],
     },
     {
+      name: "Stable Diffusion XL",
+      modelIds: ["stabilityai/stable-diffusion-xl-base-1.0"],
+      cookbook: "/cookbook/diffusion/StabilityAI/Stable-Diffusion-XL",
+    },
+    {
       name: "SANA",
       modelIds: [
         "Efficient-Large-Model/SANA1.5_1.6B_1024px_diffusers",

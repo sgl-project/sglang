@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Native Stable Diffusion 2.1 UNet blocks used by Hunyuan3D texture models."""
+"""Native Stable Diffusion UNet blocks shared by Hunyuan3D (SD2.1) and SDXL."""
 
 from __future__ import annotations
 
@@ -13,6 +13,11 @@ from torch import nn
 
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
+)
+
+_SDXL_BLOCK_LAYOUT = (
+    ("DownBlock2D", "CrossAttnDownBlock2D", "CrossAttnDownBlock2D"),
+    ("CrossAttnUpBlock2D", "CrossAttnUpBlock2D", "UpBlock2D"),
 )
 
 
@@ -33,9 +38,14 @@ class StableDiffusionUNetConfig:
     norm_num_groups: int
     norm_eps: float
     cross_attention_dim: int
+    # Diffusers names the per-level head count `attention_head_dim`.
     attention_head_dim: tuple[int, ...]
-    transformer_layers_per_block: int
+    transformer_layers_per_block: int | list[int]
     use_linear_projection: bool
+    # SDXL "text_time": pooled text embeds plus size/crop ids added to the time embedding.
+    addition_embed_type: str | None
+    addition_time_embed_dim: int | None
+    projection_class_embeddings_input_dim: int | None
 
     @classmethod
     def from_dict(cls, config: dict[str, Any]) -> StableDiffusionUNetConfig:
@@ -63,15 +73,21 @@ class StableDiffusionUNetConfig:
             norm_eps=float(config["norm_eps"]),
             cross_attention_dim=int(config["cross_attention_dim"]),
             attention_head_dim=attention_head_dim,
-            transformer_layers_per_block=int(
-                config.get("transformer_layers_per_block", 1)
-            ),
+            transformer_layers_per_block=config.get("transformer_layers_per_block", 1),
             use_linear_projection=bool(config.get("use_linear_projection", False)),
+            addition_embed_type=config.get("addition_embed_type"),
+            addition_time_embed_dim=config.get("addition_time_embed_dim"),
+            projection_class_embeddings_input_dim=config.get(
+                "projection_class_embeddings_input_dim"
+            ),
         )
         parsed.validate()
         return parsed
 
     def validate(self) -> None:
+        # SDXL layout mistakes surface as strict weight-loading errors.
+        if (self.down_block_types, self.up_block_types) == _SDXL_BLOCK_LAYOUT:
+            return
         expected_down = (
             "CrossAttnDownBlock2D",
             "CrossAttnDownBlock2D",
@@ -275,13 +291,20 @@ class Transformer2DModel(nn.Module):
         num_heads: int,
         cross_attention_dim: int,
         norm_num_groups: int,
+        *,
+        num_layers: int,
     ) -> None:
         super().__init__()
         head_dim = channels // num_heads
         self.norm = nn.GroupNorm(norm_num_groups, channels, eps=1e-6, affine=True)
         self.proj_in = nn.Linear(channels, channels)
         self.transformer_blocks = nn.ModuleList(
-            [BasicTransformerBlock(channels, num_heads, head_dim, cross_attention_dim)]
+            [
+                BasicTransformerBlock(
+                    channels, num_heads, head_dim, cross_attention_dim
+                )
+                for _ in range(num_layers)
+            ]
         )
         self.proj_out = nn.Linear(channels, channels)
 
@@ -446,6 +469,7 @@ class CrossAttnDownBlock2D(nn.Module):
         dropout: float,
         add_downsample: bool,
         downsample_padding: int,
+        transformer_layers: int,
     ) -> None:
         super().__init__()
         self.resnets = nn.ModuleList(
@@ -468,6 +492,7 @@ class CrossAttnDownBlock2D(nn.Module):
                     num_heads,
                     cross_attention_dim,
                     norm_num_groups,
+                    num_layers=transformer_layers,
                 )
                 for _ in range(2)
             ]
@@ -514,6 +539,7 @@ class UNetMidBlock2DCrossAttn(nn.Module):
         norm_num_groups: int,
         norm_eps: float,
         dropout: float,
+        transformer_layers: int,
     ) -> None:
         super().__init__()
         self.resnets = nn.ModuleList(
@@ -536,6 +562,7 @@ class UNetMidBlock2DCrossAttn(nn.Module):
                     num_heads,
                     cross_attention_dim,
                     norm_num_groups,
+                    num_layers=transformer_layers,
                 )
             ]
         )
@@ -623,6 +650,7 @@ class CrossAttnUpBlock2D(nn.Module):
         norm_eps: float,
         dropout: float,
         add_upsample: bool,
+        transformer_layers: int,
     ) -> None:
         super().__init__()
         resnets = []
@@ -647,6 +675,7 @@ class CrossAttnUpBlock2D(nn.Module):
                     num_heads,
                     cross_attention_dim,
                     norm_num_groups,
+                    num_layers=transformer_layers,
                 )
                 for _ in range(3)
             ]
@@ -689,7 +718,7 @@ UpBlock = UpBlock2D | CrossAttnUpBlock2D
 
 
 class StableDiffusionUNet2DConditionModel(nn.Module, LayerwiseOffloadableModuleMixin):
-    """Native SD2.1 UNet with Diffusers-compatible parameter names."""
+    """Native SD2.1 / SDXL UNet with Diffusers-compatible parameter names."""
 
     layer_names = ["down_blocks", "up_blocks"]
     layerwise_offload_dit_group_enabled = True
@@ -698,10 +727,20 @@ class StableDiffusionUNet2DConditionModel(nn.Module, LayerwiseOffloadableModuleM
         super().__init__()
         self.config = config
         channels = config.block_out_channels
+        layers = config.transformer_layers_per_block
+        if isinstance(layers, int):
+            layers = [layers] * len(channels)
         time_embedding_dim = channels[0] * 4
         self.conv_in = nn.Conv2d(config.in_channels, channels[0], 3, padding=1)
         self.time_embedding = TimestepEmbedding(channels[0], time_embedding_dim)
         self.class_embedding: nn.Embedding | None = None
+        self.add_embedding = (
+            TimestepEmbedding(
+                config.projection_class_embeddings_input_dim, time_embedding_dim
+            )
+            if config.addition_embed_type == "text_time"
+            else None
+        )
 
         down_blocks: list[DownBlock] = []
         output_channels = channels[0]
@@ -724,6 +763,7 @@ class StableDiffusionUNet2DConditionModel(nn.Module, LayerwiseOffloadableModuleM
                         **common,
                         num_heads=config.attention_head_dim[index],
                         cross_attention_dim=config.cross_attention_dim,
+                        transformer_layers=layers[index],
                     )
                 )
             else:
@@ -738,10 +778,12 @@ class StableDiffusionUNet2DConditionModel(nn.Module, LayerwiseOffloadableModuleM
             config.norm_num_groups,
             config.norm_eps,
             config.dropout,
+            transformer_layers=layers[-1],
         )
 
         reversed_channels = tuple(reversed(channels))
         reversed_heads = tuple(reversed(config.attention_head_dim))
+        reversed_layers = tuple(reversed(layers))
         up_blocks: list[UpBlock] = []
         output_channels = reversed_channels[0]
         for index, block_type in enumerate(config.up_block_types):
@@ -764,6 +806,7 @@ class StableDiffusionUNet2DConditionModel(nn.Module, LayerwiseOffloadableModuleM
                         **common,
                         num_heads=reversed_heads[index],
                         cross_attention_dim=config.cross_attention_dim,
+                        transformer_layers=reversed_layers[index],
                     )
                 )
             else:
@@ -797,6 +840,20 @@ class StableDiffusionUNet2DConditionModel(nn.Module, LayerwiseOffloadableModuleM
         ).to(dtype=sample.dtype)
         return self.time_embedding(projected)
 
+    def _text_time_embedding(
+        self, added_cond_kwargs: dict[str, torch.Tensor], dtype: torch.dtype
+    ) -> torch.Tensor:
+        text_embeds = added_cond_kwargs["text_embeds"]
+        time_ids = added_cond_kwargs["time_ids"]
+        time_embeds = timestep_embedding(
+            time_ids.flatten(),
+            self.config.addition_time_embed_dim,
+            flip_sin_to_cos=self.config.flip_sin_to_cos,
+            downscale_freq_shift=self.config.freq_shift,
+        ).reshape(text_embeds.shape[0], -1)
+        add_embeds = torch.cat([text_embeds, time_embeds], dim=-1).to(dtype)
+        return self.add_embedding(add_embeds)
+
     @staticmethod
     def _attention_bias(
         mask: torch.Tensor | None, dtype: torch.dtype
@@ -823,8 +880,13 @@ class StableDiffusionUNet2DConditionModel(nn.Module, LayerwiseOffloadableModuleM
         encoder_attention_mask: torch.Tensor | None = None,
         return_dict: bool = True,
     ) -> StableDiffusionUNetOutput | tuple[torch.Tensor]:
-        if timestep_cond is not None or added_cond_kwargs is not None:
-            raise ValueError("The Hunyuan3D SD2.1 UNet has no added conditioning.")
+        if timestep_cond is not None:
+            raise ValueError("The native SD UNet has no timestep_cond projection.")
+        if (added_cond_kwargs is not None) != (self.add_embedding is not None):
+            raise ValueError(
+                "added_cond_kwargs must be given exactly when the UNet has a "
+                "text_time add embedding."
+            )
         if down_intrablock_additional_residuals is not None:
             raise ValueError("T2I adapter residuals are not supported by Hunyuan3D.")
         if (down_block_additional_residuals is None) != (
@@ -847,6 +909,10 @@ class StableDiffusionUNet2DConditionModel(nn.Module, LayerwiseOffloadableModuleM
                 raise ValueError("class_labels are required by this UNet.")
             time_embedding = time_embedding + self.class_embedding(class_labels).to(
                 sample.dtype
+            )
+        if self.add_embedding is not None:
+            time_embedding = time_embedding + self._text_time_embedding(
+                added_cond_kwargs, time_embedding.dtype
             )
 
         forward_upsample_size = any(
