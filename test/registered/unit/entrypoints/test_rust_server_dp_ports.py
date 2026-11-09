@@ -16,6 +16,7 @@ from sglang.srt.entrypoints.engine import node_hosts_rust_server
 from sglang.srt.environ import envs
 from sglang.srt.managers import disagg_service
 from sglang.srt.managers.load_snapshot import create_load_snapshot_writer, shm_path_for
+from sglang.srt.managers.scheduler_components.pause_state import PauseState
 from sglang.srt.runtime_context import (
     derive_attention_ranks,
     get_context,
@@ -681,7 +682,7 @@ def test_listener_rank_installs_the_sigterm_drain(hosts):
         _hosts_rust_server=lambda: hosts,
         _holds_rust_drain_end=lambda: False,
         get_rust_server_class=lambda: server_class,
-        _engine_paused=False,
+        pause_state=PauseState(),
     )
     with (
         envs.SGLANG_RUST_SERVER.override(True),

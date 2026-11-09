@@ -188,14 +188,15 @@ def _kimi_k31_overrides(server_args: Any, hf_config: Any) -> dict:
         raise ValueError("Kimi-K3.1 does not support --enable-unified-memory yet.")
     overrides = {}
     if cfg.dcp_size > 1:
-        if (
-            cfg.speculative_algorithm not in (None, "DSPARK", "DFLASH")
-            or cfg.disaggregation_mode != "null"
-        ):
+        if cfg.speculative_algorithm not in (None, "DSPARK", "DFLASH"):
             raise ValueError(
-                "Kimi-K3.1 DCP supports only DSPARK and DFLASH speculative "
-                "decoding, and not PD disaggregation yet."
+                "Kimi-K3.1 DCP supports only DSPARK and DFLASH speculative decoding."
             )
+        if (
+            cfg.disaggregation_mode != "null"
+            and cfg.disaggregation_transfer_backend != "mooncake"
+        ):
+            raise ValueError("Kimi-K3.1 DCP supports PD only over Mooncake.")
         if cfg.speculative_algorithm == "DSPARK":
             from sglang.srt.speculative.ragged_verify import (
                 RaggedVerifyMode,

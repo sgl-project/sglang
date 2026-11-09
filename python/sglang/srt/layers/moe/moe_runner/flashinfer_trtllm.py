@@ -12,7 +12,7 @@ from torch.nn import Module
 from torch.nn.parameter import Parameter
 
 from sglang.kernels.arch import current_arch
-from sglang.kernels.ops.moe import k31_decode_moe as k31
+from sglang.kernels.ops.moe import mxfp4_decode_moe
 from sglang.kernels.ops.moe.moe_finalize_fuse_shared import moe_finalize_fuse_shared
 from sglang.kernels.ops.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
@@ -357,8 +357,8 @@ def select_trtllm_routed_body(
         and method.hidden_size == x.shape[-1]
     ) or _flashinfer_lacks_sm107_moe_fixes(x.device):
         return None
-    # The Kimi-K3.1 decode MoE kernels route from the packed top-k themselves.
-    if getattr(layer, "k31_decode_moe", False) and x.shape[0] <= k31.MAX_TOKENS:
+    # The CUDA MXFP4 decode MoE kernels route from the packed top-k themselves.
+    if layer.use_cuda_mxfp4_decode_moe and x.shape[0] <= mxfp4_decode_moe.MAX_TOKENS:
         return None
     try:
         from flashinfer.autotuner import AutoTuner
@@ -1410,93 +1410,146 @@ class FlashInferTrtllmGenMxfp4MoeQuantInfo(MoeQuantInfo):
     hidden_size: int
     flashinfer_mxfp4_moe_precision: str
     routing_bias: Optional[torch.Tensor] = None
-    # Kimi-K3.1 decode MoE kernels usable for this layer (k31_decode_moe_supported)
-    k31_decode_moe: bool = False
+    # CUDA MXFP4 decode MoE kernels usable for this layer (cuda_mxfp4_decode_moe_supported)
+    use_cuda_mxfp4_decode_moe: bool = False
 
 
-def _k31_decode_moe_mismatch(
+def _cuda_mxfp4_decode_moe_mismatch(
     layer: torch.nn.Module,
+    activation: str,
     intermediate_size: int,
     hidden_size: int,
     with_bias: bool,
     precision: str,
 ) -> Optional[str]:
-    """The first requirement of the Kimi-K3.1 decode MoE kernels that the layer
-    misses, or None; the shapes and SiTU constants are compiled into them."""
+    """The first requirement of the CUDA MXFP4 decode MoE kernels that the layer
+    misses, or None. `activation` is the one the caller's flashinfer call applies."""
     cfg = layer.moe_runner_config
-    if cfg.activation != "situ":
-        return f"activation {cfg.activation}, not situ"
-    situ = (cfg.gemm1_alpha, cfg.gemm1_clamp_limit)
-    if situ != (k31.SITU_BETA, k31.SITU_LINEAR_BETA):
-        return f"SiTU constants {situ}, not (4.0, 25.0)"
+    if activation == "situ":
+        # beta = gemm1_alpha, linear_beta = gemm1_clamp_limit (flashinfer's SiTU)
+        if (
+            cfg.activation != "situ"
+            or cfg.gemm1_alpha is None
+            or cfg.gemm1_clamp_limit is None
+        ):
+            return f"activation {cfg.activation}, SiTU constants ({cfg.gemm1_alpha}, {cfg.gemm1_clamp_limit})"
+    elif (
+        cfg.activation != "silu"
+        or cfg.swiglu_limit is None
+        or cfg.gemm1_alpha is not None
+        or cfg.gemm1_beta is not None
+    ):
+        return f"activation {cfg.activation}, swiglu_limit {cfg.swiglu_limit}"
     if with_bias:
         return "expert bias"
     if precision != "default":
         return f"{precision} activations, not MXFP8"
-    if not layer.num_experts == layer.num_local_experts == k31.NUM_EXPERTS:
-        return f"{layer.num_local_experts} of {layer.num_experts} local experts"
-    if (intermediate_size, hidden_size) != (k31.INTER, k31.HIDDEN):
-        return f"intermediate {intermediate_size}, hidden {hidden_size}"
+    if not mxfp4_decode_moe.is_supported_shape(
+        layer.num_local_experts, cfg.top_k, hidden_size, intermediate_size
+    ):
+        return "shape not supported"
     arch = current_arch()
     if not (arch.is_sm(10, 0) or arch.is_sm(10, 3)):
         return "not SM100 / SM103"
     return None
 
 
-def k31_decode_moe_supported(
+def cuda_mxfp4_decode_moe_supported(
     layer: torch.nn.Module,
+    activation: str,
     intermediate_size: int,
     hidden_size: int,
     with_bias: bool,
     precision: str,
 ) -> bool:
-    """Whether this layer runs the Kimi-K3.1 decode MoE kernels
-    (SGLANG_K31_DECODE_MOE); decided once, after the flashinfer_mxfp4 weights
-    are prepared."""
-    if not envs.SGLANG_K31_DECODE_MOE.get():
+    """Whether this layer runs the CUDA MXFP4 decode MoE kernels
+    (SGLANG_USE_CUDA_MXFP4_DECODE_MOE); decided once, after the flashinfer_mxfp4
+    weights are prepared."""
+    if not envs.SGLANG_USE_CUDA_MXFP4_DECODE_MOE.get():
         return False
-    mismatch = _k31_decode_moe_mismatch(
-        layer, intermediate_size, hidden_size, with_bias, precision
+    mismatch = _cuda_mxfp4_decode_moe_mismatch(
+        layer, activation, intermediate_size, hidden_size, with_bias, precision
     )
     if mismatch is not None:
-        print_info_once(f"SGLANG_K31_DECODE_MOE: not used ({mismatch})")
+        print_info_once(f"SGLANG_USE_CUDA_MXFP4_DECODE_MOE: not used ({mismatch})")
     return mismatch is None
 
 
-def _k31_decode_moe(
+def run_cuda_mxfp4_decode_moe(
     x_quant: torch.Tensor,
     x_scale: torch.Tensor,
-    packed_topk: Optional[torch.Tensor],
-    topk_output,
-    quant_info: FlashInferTrtllmGenMxfp4MoeQuantInfo,
+    topk_ids: torch.Tensor,
+    topk_weights: Optional[torch.Tensor],
+    w13: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w2: torch.Tensor,
+    w2_scale: torch.Tensor,
+    *,
+    activation: str,
+    activation_constants: tuple[float, ...],
+    expert_offset: int,
     out: Optional[torch.Tensor],
 ) -> Optional[FlashInferTrtllmDeferredFinalizeOutput]:
-    """With `out`, finalizes into it (as flashinfer's do_finalize with
+    """The flashinfer trtllm MXFP4 MoE contract on the CUDA decode kernels. With
+    `topk_weights` None, `topk_ids` is the packed (id << 16) | bf16(weight) form.
+    With `out`, finalizes into it (as flashinfer's do_finalize with
     routed_scaling_factor None) and returns None; else returns the deferred output."""
-    packed = packed_topk is not None
-    gemm2_out, expanded_idx, packed_weights = k31.k31_moe_mxfp4(
+    packed = topk_weights is None
+    top_k = topk_ids.shape[1]
+    gemm2_out, expanded_idx, packed_weights = mxfp4_decode_moe.mxfp4_decode_moe(
         x_quant,
-        # the handoff's [T, 28] int32 and per_token_group_quant's packed UE8M0 are both
-        # the linear [T, 112] E8M0 bytes the kernel reads
+        # the linear [T, H / 32] E8M0 bytes, whatever dtype the quant produced them in
         x_scale.view(torch.uint8).view(x_quant.shape[0], -1),
-        packed_topk if packed else topk_output.topk_ids,
-        quant_info.w13_weight,
-        quant_info.w13_weight_scale,
-        quant_info.w2_weight,
-        quant_info.w2_weight_scale,
+        topk_ids,
+        w13,
+        w13_scale,
+        w2,
+        w2_scale,
+        activation=activation,
+        activation_constants=activation_constants,
+        expert_offset=expert_offset,
         packed=packed,
     )
-    weights = packed_weights if packed else topk_output.topk_weights
+    weights = packed_weights if packed else topk_weights
     if out is not None:
         moe_finalize_fuse_shared(
-            gemm2_out, expanded_idx, weights, None, k31.TOP_K, enable_pdl=True, out=out
+            gemm2_out, expanded_idx, weights, None, top_k, enable_pdl=True, out=out
         )
         return None
     return FlashInferTrtllmDeferredFinalizeOutput(
         gemm2_out=gemm2_out,
         expert_weights=weights,
         expanded_idx_to_permuted_idx=expanded_idx,
-        top_k=k31.TOP_K,
+        top_k=top_k,
+    )
+
+
+def _run_cuda_mxfp4_decode_moe(
+    x_quant: torch.Tensor,
+    x_scale: torch.Tensor,
+    packed_topk: Optional[torch.Tensor],
+    topk_output,
+    quant_info: FlashInferTrtllmGenMxfp4MoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    out: Optional[torch.Tensor],
+) -> Optional[FlashInferTrtllmDeferredFinalizeOutput]:
+    packed = packed_topk is not None
+    return run_cuda_mxfp4_decode_moe(
+        x_quant,
+        x_scale,
+        packed_topk if packed else topk_output.topk_ids,
+        None if packed else topk_output.topk_weights,
+        quant_info.w13_weight,
+        quant_info.w13_weight_scale,
+        quant_info.w2_weight,
+        quant_info.w2_weight_scale,
+        activation="situ",
+        activation_constants=(
+            runner_config.gemm1_alpha,
+            runner_config.gemm1_clamp_limit,
+        ),
+        expert_offset=quant_info.local_expert_offset,
+        out=out,
     )
 
 
@@ -1556,18 +1609,26 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
         top_k = topk_output.topk_config.top_k
         router_logits = topk_output.router_logits
 
-    use_k31 = (
-        quant_info.k31_decode_moe and is_standard and x_quant.shape[0] <= k31.MAX_TOKENS
+    use_cuda_decode_moe = (
+        quant_info.use_cuda_mxfp4_decode_moe
+        and is_standard
+        and x_quant.shape[0] <= mxfp4_decode_moe.MAX_TOKENS
     )
-    if quant_info.k31_decode_moe and not use_k31:
+    if quant_info.use_cuda_mxfp4_decode_moe and not use_cuda_decode_moe:
         print_info_once(
-            "SGLANG_K31_DECODE_MOE: calls with a non-standard top-k or more than "
-            "256 tokens fall back to flashinfer"
+            "SGLANG_USE_CUDA_MXFP4_DECODE_MOE: calls with a non-standard top-k or "
+            "more than 256 tokens fall back to flashinfer"
         )
-    if use_k31 and _deferred_finalize_enabled.get():
+    if use_cuda_decode_moe and _deferred_finalize_enabled.get():
         return StandardCombineInput(
-            hidden_states=_k31_decode_moe(
-                x_quant, x_scale, prepared_packed_topk, topk_output, quant_info, None
+            hidden_states=_run_cuda_mxfp4_decode_moe(
+                x_quant,
+                x_scale,
+                prepared_packed_topk,
+                topk_output,
+                quant_info,
+                runner_config,
+                None,
             )
         )
 
@@ -1590,9 +1651,15 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
                 device=x_quant.device,
             )
 
-    if use_k31:
-        _k31_decode_moe(
-            x_quant, x_scale, prepared_packed_topk, topk_output, quant_info, symm_output
+    if use_cuda_decode_moe:
+        _run_cuda_mxfp4_decode_moe(
+            x_quant,
+            x_scale,
+            prepared_packed_topk,
+            topk_output,
+            quant_info,
+            runner_config,
+            symm_output,
         )
         return StandardCombineInput(hidden_states=symm_output)
 
