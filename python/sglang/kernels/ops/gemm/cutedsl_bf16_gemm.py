@@ -39,18 +39,15 @@ from cutlass.cute import experimental as cute_ext
 from cutlass.cute.nvgpu import tcgen05
 from cutlass.cute.runtime import from_dlpack, make_fake_stream
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.kernel_api_logging import debug_kernel_api
 from sglang.kernels.ops.gemm.tiny_gemm import (
     _get_num_sm,
     can_use_tiny_gemm,
     tiny_gemm_bf16,
 )
-from sglang.srt.utils import (
-    get_device_core_count,
-    get_device_sm,
-    is_sm100_supported,
-)
-from sglang.srt.utils.common import direct_register_custom_op
+from sglang.srt.utils import get_device_sm, is_sm100_supported
+from sglang.srt.utils.custom_op import direct_register_custom_op
 
 # Tuple format: (cta_m, cta_n, num_ab_stage, use_2cta); cta_k is fixed at
 # 128. Sorted within each use_2cta block by (cta_m, cta_n, num_ab_stage).
@@ -1324,7 +1321,7 @@ def _grid_ctas(m: int, n: int, cta_m: int, cta_n: int, num_mma_ctas: int) -> int
 
 def _pick_tactic(m: int, n: int, k: int) -> int:
     """Pick the first ladder tactic whose grid fits one wave of the SMs."""
-    num_sms = get_device_core_count(torch.cuda.current_device())
+    num_sms = current_arch().num_sms
     best, best_ctas = None, None
     for tactic, cta_m, cta_n, num_mma_ctas in _TGV_TACTIC_LADDER:
         ctas = _grid_ctas(m, n, cta_m, cta_n, num_mma_ctas)
@@ -1376,6 +1373,9 @@ _MUSE_SPARK_TGV_M_RANGES = {
     (8192, 1024): (1, 64),  # TP8 o_proj
     (512, 8192): (256, 512),  # TP8 pooler slice
     (1024, 4096): (1, 512),  # TP8 unpooler slice
+    (14336, 8192): (24, 32),  # hidden 8192 / inter 28672 TP4 gate_up (DFLASH draft)
+    (50512, 8192): (17, 32),  # DFLASH draft TP4 candidate head
+    (7168, 8192): (24, 32),  # hidden 8192 / inter 28672 TP8 gate_up (DFLASH draft)
 }
 
 
@@ -1396,7 +1396,7 @@ def use_cutedsl_bf16_gemm(m: int, n: int, k: int) -> bool:
     if _use_tiny_gemm(m, n, k):
         return True
     if (
-        get_device_sm() == 107
+        current_arch().is_sm(10, 7)
         and m in _K3_FRONT_WARP_SPLITK
         and (n, k)
         == (
@@ -1475,7 +1475,7 @@ def _tgv_bf16_gemm_out_run(
     if _try_tiny_gemm(x, weight, out, bias):
         return None
     if (
-        get_device_sm() == 107
+        current_arch().is_sm(10, 7)
         and x.shape[0] in _K3_FRONT_WARP_SPLITK
         and x.shape[1] == 7168
         and weight.shape == (6016, 7168)

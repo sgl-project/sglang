@@ -6,8 +6,17 @@ on:
   pull_request:
     branches: [ main ]
   workflow_dispatch:
+    inputs:
+      extra_only:
+        description: "Run only the extra Intel CPU suite"
+        type: boolean
+        default: false
   workflow_call:
     inputs:
+      extra_only:
+        description: "Run only the extra Intel CPU suite"
+        type: boolean
+        default: false
       ref:
         description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the default branch.'
         required: false
@@ -20,7 +29,7 @@ on:
         default: false
 
 concurrency:
-  group: pr-test-xeon-${{ inputs.ref || github.ref }}
+  group: pr-test-xeon-${{ inputs.extra_only && 'extra' || 'base' }}-${{ inputs.ref || github.ref }}
   cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
 
 jobs:
@@ -68,6 +77,7 @@ jobs:
               - "test/**/!(*.md)"
               - "python/sglang/kernels/aot/**/!(*.md|THIRDPARTYNOTICES.txt|LICENSE)"
               - ".github/workflows/pr-test-xeon.yml"
+              - ".github/workflows/pr-test-extra.yml"
               - "docker/xeon.Dockerfile"
 
   # ==================== PR Gate ==================== #
@@ -75,6 +85,9 @@ jobs:
     needs: check-changes
     if: needs.check-changes.outputs.main_package == 'true'
     uses: ./.github/workflows/pr-gate.yml
+    with:
+      # Extra is called by the NVIDIA/shared Extra workflow; Base is unchanged.
+      require-label: ${{ inputs.extra_only == true && 'run-ci-nv-extra' || '' }}
     secrets: inherit
 
   build-test:
@@ -85,35 +98,14 @@ jobs:
     strategy:
       fail-fast: true
       matrix:
-        include:
-          # GNR runs only the TP suite (needs >=6 NUMA nodes for --tp 6),
-          # full machine, no partitioning. 4 files: 3 TP + autoround.
-          - runner: xeon-gnr
-            role: gnr
-            suite: "stage-a-tp-test-cpu-intel"
-            name: gnr
-
-          # Each SPR box (2 sockets / 2 NUMA, 32 physical cores each) runs TWO
-          # socket-pinned containers in parallel, each taking one partition of a
-          # 4-way split over the merged non-TP pool. Each container is capped
-          # with --memory so sglang (which reads cgroup memory.max, PR #38260 +
-          # the empty-NUMA-node fix) sizes its KV pool against one socket's
-          # budget, not the whole host -- so two parallel servers no longer
-          # exhaust host RAM. 2 boxes x 2 sockets = 4 partitions.
-          - runner: xeon-spr
-            role: spr
-            suite: "stage-a-test-cpu-intel,stage-b-test-cpu-intel"
-            name: spr1
-            part_lo: 0
-            part_hi: 1
-            part_size: 4
-          - runner: xeon-spr
-            role: spr
-            suite: "stage-a-test-cpu-intel,stage-b-test-cpu-intel"
-            name: spr2
-            part_lo: 2
-            part_hi: 3
-            part_size: 4
+        # Extra runs only on SPR; GNR remains dedicated to the base TP suite.
+        # Base uses two SPR jobs (four partitions); extra uses one (two partitions).
+        include: >-
+          ${{ fromJSON(inputs.extra_only &&
+          '[{"runner":"xeon-spr","role":"spr","suite":"extra-test-cpu-intel","name":"spr1","part_lo":0,"part_hi":1,"part_size":2}]' ||
+          '[{"runner":"xeon-gnr","role":"gnr","suite":"stage-a-tp-test-cpu-intel","name":"gnr"},
+          {"runner":"xeon-spr","role":"spr","suite":"stage-a-test-cpu-intel,stage-b-test-cpu-intel","name":"spr1","part_lo":0,"part_hi":1,"part_size":4},
+          {"runner":"xeon-spr","role":"spr","suite":"stage-a-test-cpu-intel,stage-b-test-cpu-intel","name":"spr2","part_lo":2,"part_hi":3,"part_size":4}]') }}
     steps:
       - name: Cleanup workspace
         run: |
@@ -126,19 +118,60 @@ jobs:
           clean: false
           ref: ${{ inputs.ref || github.ref }}
 
+      - name: Check disk space
+        timeout-minutes: 10
+        run: |
+          # Docker state persists on the box across jobs. A build writes a new
+          # multi-GB image (CPU torch, diffusion extras, the CPU kernel build)
+          # while the previous one still exists, and the HF cache shares the
+          # disk; 30 GB covers both with headroom. A full disk otherwise kills
+          # the build (and the runner) with "No space left on device".
+          MIN_FREE_GB=30
+          DOCKER_ROOT=$(docker info -f '{{.DockerRootDir}}' 2>/dev/null) || true
+          [ -d "$DOCKER_ROOT" ] || DOCKER_ROOT=/
+          free_gb () { df --output=avail -BG "$1" | tail -1 | tr -dc '0-9'; }
+
+          # Dangling images only: tagged images and images used by containers
+          # of concurrent jobs on this box are kept.
+          docker image prune -f
+          docker builder prune -f --filter until=24h
+          if [ "$(free_gb "$DOCKER_ROOT")" -lt "$MIN_FREE_GB" ]; then
+            # This workflow builds with --no-cache, so it never reuses build
+            # cache; drop all of it that no running build holds.
+            docker builder prune -af
+          fi
+
+          df -h "$DOCKER_ROOT" "$GITHUB_WORKSPACE"
+          # Warn rather than fail: the threshold is an estimate, and a build
+          # that fits should still run.
+          for path in "$DOCKER_ROOT" "$GITHUB_WORKSPACE"; do
+            avail=$(free_gb "$path")
+            if [ "$avail" -lt "$MIN_FREE_GB" ]; then
+              echo "::warning::Only ${avail} GB free on ${path} after pruning docker (want ${MIN_FREE_GB} GB); the build may run out of disk."
+            fi
+          done
+
       - name: Build image
         run: |
-          # Fixed tag (no SHA): a new build overwrites the previous image so a
-          # self-hosted box does not accumulate multi-GB images across PRs.
+          set -euo pipefail
+          # Fixed tag (no SHA): a new build moves the tag, and the previous
+          # image becomes dangling; the prune steps before and after the job
+          # remove it so the self-hosted box does not fill up across PRs.
           # --no-cache keeps the CPU image clean (past sgl-eval/accelerate gaps
           # came from stale layers). One build per job, one container per box.
-          PR_REPO=${{ github.event.pull_request.head.repo.clone_url }}
-          PR_HEAD_REF=${{ github.head_ref }}
+          CHECKOUT_SHA=$(git rev-parse HEAD)
+          echo "Building Xeon image from checkout ${CHECKOUT_SHA}"
 
           docker build \
-            ${PR_REPO:+--build-arg SGLANG_REPO=$PR_REPO} \
-            ${PR_HEAD_REF:+--build-arg VER_SGLANG=$PR_HEAD_REF} \
+            --build-arg "SGLANG_REPO=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git" \
+            --build-arg "VER_SGLANG=${CHECKOUT_SHA}" \
             . -f docker/xeon.Dockerfile  -t sglang_xeon --no-cache
+
+          IMAGE_SHA=$(docker run --rm --entrypoint git sglang_xeon rev-parse HEAD)
+          if [[ "$IMAGE_SHA" != "$CHECKOUT_SHA" ]]; then
+            echo "::error::Xeon image source ${IMAGE_SHA} does not match checkout ${CHECKOUT_SHA}"
+            exit 1
+          fi
 
       # ==================== GNR: full machine, TP suite ==================== #
       - name: Run container (GNR)
@@ -232,3 +265,8 @@ jobs:
           for c in ci_sglang_${{ matrix.name }} ci_sglang_${{ matrix.name }}_s0 ci_sglang_${{ matrix.name }}_s1; do
             docker rm -f "$c" || true
           done
+          # Dangling images and old build cache only, so a concurrent job's
+          # tagged image and running containers stay intact.
+          docker image prune -f || true
+          docker builder prune -f --filter until=24h || true
+          df -h "$(docker info -f '{{.DockerRootDir}}' 2>/dev/null || echo /)" || true
