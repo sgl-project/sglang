@@ -12,12 +12,28 @@ use std::convert::Infallible;
 
 use axum::{
     Json,
-    http::StatusCode,
+    http::{HeaderValue, StatusCode, header::CONTENT_TYPE},
     response::{
         IntoResponse, Response,
         sse::{Event, Sse},
     },
 };
+use futures::Stream;
+
+/// The streaming content type Python's `StreamingResponse` sends: a `text/*`
+/// media type gets its charset, so clients decode the frames as UTF-8.
+pub const SSE_CONTENT_TYPE: &str = "text/event-stream; charset=utf-8";
+
+/// An SSE response over `events`, with Python's content type.
+pub fn sse_response(
+    events: impl Stream<Item = Result<Event, Infallible>> + Send + 'static,
+) -> Response {
+    let mut response = Sse::new(events).into_response();
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static(SSE_CONTENT_TYPE));
+    response
+}
 
 /// The native error body — the same `{"error": {...}}` object every native
 /// path emits, not bare text, which a client parsing JSON chokes on.
@@ -48,10 +64,9 @@ pub fn error_response(code: StatusCode, body: serde_json::Value, stream: bool) -
 /// frontend's `openai_error_response`.
 pub fn sse_error_response(body: serde_json::Value) -> Response {
     let frames = [body.to_string(), "[DONE]".to_string()];
-    Sse::new(futures::stream::iter(
+    sse_response(futures::stream::iter(
         frames.map(|data| Ok::<_, Infallible>(Event::default().data(data))),
     ))
-    .into_response()
 }
 
 #[cfg(test)]

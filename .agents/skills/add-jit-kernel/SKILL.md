@@ -76,6 +76,7 @@ These hold for every step below.
 - **`device::kWarpThreads`** — Constant `32` (the codebase's *logical* warp width). `kWarpSize` is an alias. Note this is a group size, not the hardware wave: on gfx950 `warpSize` is 64, and `warp::kFullWidth` reflects that.
 - **`device::get_lane_id<kNumThreads = kWarpThreads>()`** — this thread's index within its logical group. **Prefer it over `threadIdx.x % kNumThreads` whenever the value feeds an address.** On CUDA the lane register is one read that folds into the address computation, whereas the modulo is a derived value the compiler re-materialises at *every* address scale — 8 instructions and 2 registers on a two-tile warp copy, measured on sm_100a. It picks the cheaper form per platform, so callers never need to care. Only equals the true in-warp lane when `blockDim.x` is a multiple of `kNumThreads`.
 - **`device::load_as<T>(ptr, offset)`** / **`device::store_as<T>(ptr, val, offset)`** — Type-safe loads/stores from `void*`.
+- **`device::assume_global(ptr)`** / **`device::assume_shared(ptr)`** — return `ptr` and tell the compiler which address space it points to (no-ops on ROCm). After an asm with a `"memory"` clobber such as `PDLWaitPrimary`, loads through `__grid_constant__` pointer fields become generic `LD.E` (a 32-byte access splits in two); wrap the pointer right before the access. nvcc 13.4 honors the hint on sm_100+ and ignores it on sm_90a.
 - **`device::pointer::offset(ptr, offsets...)`** — Pointer arithmetic on device.
 - **`device::enable_smem_spilling()`** — emits the CUDA 13 `enable_smem_spilling` pragma, so register spills go to shared memory instead of local memory. Spills then no longer show up as stack bytes in the resource log, so check the shared-memory size too.
 - **`device::get_tmem_cols(n)`** — rounds a TMEM column count up to a legal allocation size (32..512, power of two).
@@ -205,10 +206,18 @@ For a **2D tile**, either flatten `(row, col)` into a linear tile index first, o
 
 - `device::math::max/min<T>(a, b)` — type-dispatched binary math via `DTypeTrait`
 - `device::math::abs/sqrt/rsqrt/exp/sin/cos<T>(x)` — type-dispatched unary math via `DTypeTrait`
-- `device::math::sigmoid_fast/silu_fast/softplus_fast(x)` — fp32 activations on `__expf`; approximate, so they belong in kernels whose reference is approximate too (e.g. built with `--use_fast_math`).
 - `device::math::fma_f32_bf16(a, b, acc)` — bf16 x bf16 (or bf16 x fp32) -> fp32 FMA. On Blackwell it is one `fma.rn.f32.bf16` with no explicit converts; elsewhere a bit-identical fallback. Use it for mixed-precision dot products so every kernel rounds the same way.
 - `device::math::fma_f32x2/mul_f32x2/add_f32x2(a, b[, c])` — packed fp32 ops (`FFMA2` / `FMUL2` / `FADD2` on SM100+, bit-identical fallback elsewhere). They halve the issue slots, not the FMA throughput, so they help only issue-bound code.
 - **`device::math::fast_mod_div_u32_t`** — division and modulo by a divisor fixed at launch time (a runtime value passed into the kernel, e.g. a head count), via a multiply-high and a shift instead of a software division. Build it on the host (`fast_mod_div_u32_t{d}`) and pass it by value; then `n / d`, `n % d` or `math::div(n, d)` for both. Only exact for divisors below 2^31 and unsigned dividends of at most 32 bits.
+
+### `activation.cuh` — FP32 activations (`device::activation::`)
+
+```cpp
+#include <sgl_kernel/activation.cuh>
+```
+
+- `sigmoid/silu/gelu/gelu_tanh/softplus/sqrt_softplus/relu2<kFastMath = true>(x)` — one implementation per activation, independent of `--use_fast_math`. `kFastMath = true` is approximate PTX without slow-path branches (sigmoid / SiLU as `rcp.approx(1 + ex2.approx(...))`, relative error around 1e-6); `kFastMath = false` reproduces eager PyTorch (ATen formula and order, libdevice transcendentals, IEEE division). Use the precise mode where a test compares against torch bit for bit.
+- The fast `gelu_tanh` uses one `tanh.approx`; `1 + tanh` cancels for negative x, so its relative error grows there. Use it only for outputs stored in bf16 / fp8.
 
 ### `warp.cuh` — Warp-level primitives
 
@@ -580,13 +589,15 @@ if not current_arch().is_sm_at_least(9):
 
 Query the GPU through `sglang.kernels.arch.current_arch()` (`.is_sm(...)`, `.is_sm_at_least(...)`, `.num_sms`, `.supports_pdl`, `.smem_per_block_optin`, and `.cuda` / `.hip` to narrow by platform), not `torch.cuda.get_device_*` directly. Call it at call time, not import time.
 
+Name the family the kernel was built for. `is_sm_at_least(10)` also admits SM120/SM121, which have no tcgen05/TMEM, so an SM100-only kernel gates on `is_sm(10)`; an SM120 kernel on `is_sm(12)` (SM121 included). Use `is_sm_at_least` only when every later architecture really supports the path.
+
 ---
 
 ## Step 4: Write tests (required)
 
 JIT kernel correctness tests and benchmarks live under `test/registered/kernels/ops/<group>/` and `test/registered/kernels/benchmark/<group>/`, mirroring the wrapper's group under `python/sglang/kernels/ops/` (NOT inside the `sglang` package -- a `register_*_ci(...)` call anywhere under `python/sglang/` is rejected by the `check-no-registered-tests-in-package` pre-commit hook). Only their test-only helpers (e.g. `benchmark/marker.py`) stay alongside the kernel source under `python/sglang/kernels/jit/` and are imported by absolute path. **CI does not run `pytest` in those directories directly.** The unified runner `test/run_suite.py` discovers every `test_*.py` and `bench_*.py` under `test/registered/`, collects `register_*_ci(...)` calls by **statically parsing each file's AST**, and executes the selected suite. Every test file must register at least one CUDA entry or the collector fails its sanity check.
 
-- **PR / per-commit CUDA suites** (see `test/run_suite.py` → `PER_COMMIT_SUITES`): JIT unit tests use `base-b-kernel-unit-test-1-gpu-large` on H100 and `base-b-kernel-unit-test-4-gpu-b200` on B200/SM100 paths (see `.github/workflows/pr-test-jit-kernel.yml`). Multi-GPU JIT tests use `base-b-kernel-unit-test-8-gpu-h200`.
+- **PR / per-commit CUDA suites** (see `test/run_suite.py` → `PER_COMMIT_SUITES`): JIT unit tests use `base-b-kernel-unit-test-1-gpu-large` on H100 and `base-b-kernel-unit-test-4-gpu-b200` on B200/SM100 paths (see `.github/workflows/pr-test-jit-kernel.yml`).
 - **Nightly kernel suite**: register with `stage="nightly"` plus the `runner_config` of the machine it needs (e.g. `1-gpu-large`), giving the `nightly-test-1-gpu-large` suite. `.github/workflows/nightly-test-nvidia.yml` sets `SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1` for the whole nightly run, so the expanded parameter grids apply automatically (see `python/sglang/kernels/jit/utils/common.py` → `should_run_full_tests` / `get_ci_test_range`). There is no separate kernel-only nightly job: every nightly test on one machine type shares that machine's suite.
 
 Registration pattern (module level, **literal** `est_time`, `stage`, and `runner_config` values — required for AST parsing):
