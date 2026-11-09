@@ -9,7 +9,8 @@ import unittest
 import torch
 
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
-from sglang.srt.mem_cache.kv.router import STATE_PART, KVLayerRouter
+from sglang.srt.mem_cache.kv.decl import STATE_PART
+from sglang.srt.mem_cache.kv.router import KVLayerRouter
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.mem_cache.ple_state_pool import NGRAM_PART
 from sglang.test.test_utils import CustomTestCase
@@ -61,6 +62,16 @@ class _StageWithoutStateLayers:
         self.start_layer = 47
         self.layer_transfer_counter = None
         self.router = KVLayerRouter.from_layer_maps(self, [("full", object(), {47: 0})])
+
+
+class _PoolWithoutTokenKV:
+    """A pool that holds only recurrent state: no token KV sub-pool, so its
+    router is built from no layer maps and the state part is bound to it."""
+
+    def __init__(self):
+        self.start_layer = 0
+        self.layer_transfer_counter = None
+        self.router = KVLayerRouter.from_layer_maps(self, ())
 
 
 class TestKVLayerRouterParts(CustomTestCase):
@@ -167,6 +178,27 @@ class TestKVLayerRouterParts(CustomTestCase):
             pool.router.layer(6)
         with self.assertRaises(KeyError):
             pool.router.layer(7, STATE_PART)
+
+    def test_a_router_without_token_kv_routes_its_bound_parts(self):
+        """A router built from no layer maps lists no token KV sub-pools, and a
+        part bound to it routes each layer to the index it was bound at."""
+        pool = _PoolWithoutTokenKV()
+        state_view = object()
+        pool.router.bind_part(
+            sub_pool="mamba", part=STATE_PART, view=state_view, indices={2: 1, 3: 0}
+        )
+        self.assertEqual(pool.router.sub_pools(), ())
+        self.assertEqual(pool.router.layer_ids(), ())
+        self.assertIsNone(pool.router.wrapped_view())
+        self.assertEqual(pool.router.part_indices(STATE_PART), {2: 1, 3: 0})
+        state = pool.router.read(2, STATE_PART)
+        self.assertIs(state.view, state_view)
+        self.assertEqual(
+            (state.route.sub_pool, state.route.index, state.view_layer_id),
+            ("mamba", 1, 1),
+        )
+        with self.assertRaises(KeyError):
+            pool.router.layer(2)
 
 
 if __name__ == "__main__":

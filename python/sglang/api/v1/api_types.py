@@ -377,6 +377,8 @@ class GenerateMetaInfo(msgspec.Struct, kw_only=True, frozen=True):
     image_tokens: Optional[int] = None
     audio_tokens: Optional[int] = None
     video_tokens: Optional[int] = None
+    cached_tokens_details: Optional[CachedTokensDetails] = None
+    dp_rank: Optional[int] = None
 
     @classmethod
     def from_json_value(cls, value: Any) -> "GenerateMetaInfo":
@@ -403,6 +405,24 @@ class WeightVersionSpan(msgspec.Struct, kw_only=True, frozen=True):
     def to_json_value(self) -> Dict[str, Any]:
         """Encode to a JSON-ready value (json.dumps-compatible)."""
         return encode_WeightVersionSpan(self)
+
+
+class CachedTokensDetails(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.CachedTokensDetails: JSON object (unknown keys ignored)."""
+
+    device: int = 0
+    host: int = 0
+    storage: Optional[int] = None
+    storage_backend: Optional[str] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "CachedTokensDetails":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_CachedTokensDetails(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_CachedTokensDetails(self)
 
 
 class GenerateResponse(msgspec.Struct, kw_only=True, frozen=True):
@@ -792,6 +812,7 @@ class DeploymentInfo(msgspec.Struct, kw_only=True, frozen=True):
     hicache_write_policy: Optional[str] = None
     hicache_host_total_tokens: Optional[int] = None
     kv_event_sources: List[KvEventSource] = []
+    node_listeners: List[NodeRustListener] = []
 
     @classmethod
     def from_json_value(cls, value: Any) -> "DeploymentInfo":
@@ -801,6 +822,24 @@ class DeploymentInfo(msgspec.Struct, kw_only=True, frozen=True):
     def to_json_value(self) -> Dict[str, Any]:
         """Encode to a JSON-ready value (json.dumps-compatible)."""
         return encode_DeploymentInfo(self)
+
+
+class NodeRustListener(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.NodeRustListener: JSON object (unknown keys ignored)."""
+
+    port_offset: int = 0
+    dp_rank: int = 0
+    http_port: int = 0
+    grpc_port: Optional[int] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "NodeRustListener":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_NodeRustListener(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_NodeRustListener(self)
 
 
 class KvEventSource(msgspec.Struct, kw_only=True, frozen=True):
@@ -1785,6 +1824,10 @@ def decode_GenerateMetaInfo(value: Any) -> GenerateMetaInfo:
             kw["audio_tokens"] = None if x is None else _expect_uint(x, expected="u32")
         elif key == "video_tokens":
             kw["video_tokens"] = None if x is None else _expect_uint(x, expected="u32")
+        elif key == "cached_tokens_details":
+            kw["cached_tokens_details"] = None if x is None else decode_CachedTokensDetails(x)
+        elif key == "dp_rank":
+            kw["dp_rank"] = None if x is None else _expect_uint(x, expected="u32")
     return GenerateMetaInfo(**kw)
 
 
@@ -1824,6 +1867,8 @@ def encode_GenerateMetaInfo(v: GenerateMetaInfo) -> Dict[str, Any]:
         d["audio_tokens"] = v.audio_tokens
     if v.video_tokens is not None:
         d["video_tokens"] = v.video_tokens
+    d["cached_tokens_details"] = None if v.cached_tokens_details is None else encode_CachedTokensDetails(v.cached_tokens_details)
+    d["dp_rank"] = v.dp_rank
     return d
 
 
@@ -1845,6 +1890,32 @@ def encode_WeightVersionSpan(v: WeightVersionSpan) -> Dict[str, Any]:
     d["version"] = v.version
     d["start"] = v.start
     d["end"] = v.end
+    return d
+
+
+def decode_CachedTokensDetails(value: Any) -> CachedTokensDetails:
+    m = _expect_map(value, expected="struct CachedTokensDetails")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "device":
+            kw["device"] = _expect_uint(x, expected="u32")
+        elif key == "host":
+            kw["host"] = _expect_uint(x, expected="u32")
+        elif key == "storage":
+            kw["storage"] = None if x is None else _expect_uint(x, expected="u32")
+        elif key == "storage_backend":
+            kw["storage_backend"] = None if x is None else _expect_str(x, expected="a string")
+    return CachedTokensDetails(**kw)
+
+
+def encode_CachedTokensDetails(v: CachedTokensDetails) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["device"] = v.device
+    d["host"] = v.host
+    if v.storage is not None:
+        d["storage"] = v.storage
+    if v.storage_backend is not None:
+        d["storage_backend"] = v.storage_backend
     return d
 
 
@@ -2445,6 +2516,8 @@ def decode_DeploymentInfo(value: Any) -> DeploymentInfo:
             kw["hicache_host_total_tokens"] = None if x is None else _expect_uint(x, expected="u64")
         elif key == "kv_event_sources":
             kw["kv_event_sources"] = [] if x is None else [decode_KvEventSource(e) for e in _expect_seq(x, expected="a sequence")]
+        elif key == "node_listeners":
+            kw["node_listeners"] = [] if x is None else [decode_NodeRustListener(e) for e in _expect_seq(x, expected="a sequence")]
     return DeploymentInfo(**kw)
 
 
@@ -2479,6 +2552,33 @@ def encode_DeploymentInfo(v: DeploymentInfo) -> Dict[str, Any]:
         d["hicache_host_total_tokens"] = v.hicache_host_total_tokens
     if v.kv_event_sources:
         d["kv_event_sources"] = [encode_KvEventSource(e) for e in v.kv_event_sources]
+    if v.node_listeners:
+        d["node_listeners"] = [encode_NodeRustListener(e) for e in v.node_listeners]
+    return d
+
+
+def decode_NodeRustListener(value: Any) -> NodeRustListener:
+    m = _expect_map(value, expected="struct NodeRustListener")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "port_offset":
+            kw["port_offset"] = _expect_uint(x, expected="u32")
+        elif key == "dp_rank":
+            kw["dp_rank"] = _expect_uint(x, expected="u32")
+        elif key == "http_port":
+            kw["http_port"] = _expect_uint(x, expected="u32")
+        elif key == "grpc_port":
+            kw["grpc_port"] = None if x is None else _expect_uint(x, expected="u32")
+    return NodeRustListener(**kw)
+
+
+def encode_NodeRustListener(v: NodeRustListener) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["port_offset"] = v.port_offset
+    d["dp_rank"] = v.dp_rank
+    d["http_port"] = v.http_port
+    if v.grpc_port is not None:
+        d["grpc_port"] = v.grpc_port
     return d
 
 

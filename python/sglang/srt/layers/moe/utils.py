@@ -29,7 +29,7 @@ from sglang.srt.utils import is_cuda, is_npu
 
 _is_npu = is_npu()
 
-from sglang.srt.utils.common import log_info_on_rank0
+from sglang.srt.utils.log_utils import log_info_on_rank0
 
 logger = logging.getLogger(__name__)
 
@@ -268,6 +268,9 @@ class _MoeRunnerBackendPredicates:
     def is_intel_xpu(self):
         return self.value == MoeRunnerBackend.INTEL_XPU.value
 
+    def is_gluon(self):
+        return self.value == MoeRunnerBackend.GLUON.value
+
 
 class MoeRunnerBackend(_MoeRunnerBackendPredicates, Enum):
     AUTO = "auto"
@@ -292,6 +295,7 @@ class MoeRunnerBackend(_MoeRunnerBackendPredicates, Enum):
     AITER = "aiter"
     HPC_OPS = "hpc_ops"
     INTEL_XPU = "intel_xpu"
+    GLUON = "gluon"
 
 
 @dataclass(frozen=True)
@@ -1171,3 +1175,11 @@ def get_moe_weight_sizes(inter_dim, is_concat, is_packed, is_aiter_moe):
             w13_up_dim *= 2
 
     return (w13_up_dim, w2_down_dim, False if not is_aiter_moe else is_padded)
+
+
+def route_dropped_experts_to_local(
+    topk_weights: torch.Tensor, topk_ids: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Map -1 ids (EP-dropped, padded) to expert 0 at weight 0 for sgl-kernel-xpu."""
+    dropped = topk_ids < 0
+    return topk_weights.masked_fill(dropped, 0), topk_ids.masked_fill(dropped, 0)

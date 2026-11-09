@@ -5,10 +5,17 @@ from dataclasses import dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING, ClassVar, List, Optional, Tuple
 
+import msgspec
 import torch
 
+from sglang.kernels.ops.kvcache.mla_buffer import (
+    get_mla_kv_buffer_triton,
+    set_mla_kv_buffer_triton,
+)
+from sglang.srt.mem_cache.device_pool_info import MLABufferInfo
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
 from sglang.srt.mem_cache.kv.layout.base import (
+    HostPoolOptions,
     SubPoolSpec,
     _check_row_alignment,
     _store_dtype_for,
@@ -17,18 +24,19 @@ from sglang.srt.mem_cache.kv.layout.base import (
 )
 from sglang.srt.mem_cache.kv.memory.views import MLAKVView
 from sglang.srt.mem_cache.kv.router import KVLayerRouter, PlainPoolRouter
-from sglang.srt.mem_cache.layout.fused_draft import DenseDraftRegion
+from sglang.srt.mem_cache.layout.fused_draft import DenseDraftRegion, MLADraftRegion
 from sglang.srt.mem_cache.layout.token_major import (
     DenseEntryLayout,
     DensePart,
     align_entry_bytes,
     align_part_offset,
     build_dense_views,
+    replicated_token_layout,
 )
-from sglang.srt.mem_cache.memory_pool import unwrap_write_loc, write_loc_is_physical
-from sglang.srt.mem_cache.utils import (
-    get_mla_kv_buffer_triton,
-    set_mla_kv_buffer_triton,
+from sglang.srt.mem_cache.memory_pool import (
+    _prefix_valid_mla_write_loc,
+    unwrap_write_loc,
+    write_loc_is_physical,
 )
 from sglang.srt.platforms import current_platform
 from sglang.srt.utils.async_probe import maybe_detect_oob
@@ -65,7 +73,7 @@ class MLASubPoolSpec(SubPoolSpec):
             f"qk_rope_head_dim must be positive; got {self.qk_rope_head_dim}"
         )
         if self.draft_region is not None:
-            assert isinstance(self.draft_region, DenseDraftRegion), (
+            assert isinstance(self.draft_region, (DenseDraftRegion, MLADraftRegion)), (
                 "dense entries carry dense draft K/V rows, never a state region"
             )
             self.draft_region.validate()
@@ -87,13 +95,17 @@ class MLASubPoolSpec(SubPoolSpec):
         return align_part_offset(self.host_entry_bytes())
 
     def entry_bytes(self) -> int:
+        if self.draft_region is not None and self.draft_region.token_replicas > 1:
+            return replicated_token_layout(self._target_parts(), self.draft_region)[
+                0
+            ].entry_bytes
         if self.draft_region is None:
             return align_entry_bytes(self.host_entry_bytes())
         return align_entry_bytes(
             self.draft_offset_in_entry() + self.draft_region.entry_bytes()
         )
 
-    def layout(self) -> DenseEntryLayout:
+    def _target_parts(self):
         _check_row_alignment(self.name, latent=self.row_bytes())
         parts = (
             DensePart(
@@ -105,7 +117,13 @@ class MLASubPoolSpec(SubPoolSpec):
                 dtype=self.store_dtype,
             ),
         )
+        return parts
+
+    def layout(self) -> DenseEntryLayout:
+        parts = self._target_parts()
         if self.draft_region is not None:
+            if self.draft_region.token_replicas > 1:
+                return replicated_token_layout(parts, self.draft_region)[0]
             parts += self.draft_region.parts(self.draft_offset_in_entry())
         return DenseEntryLayout(entry_bytes=self.entry_bytes(), parts=parts)
 
@@ -125,11 +143,19 @@ class MLASubPoolSpec(SubPoolSpec):
             f"sub-pool {self.name!r} carries no fused draft region"
         )
         rows = dense_rows(arena, self.name)
+        layout = (
+            self.layout()
+            if self.draft_region.token_replicas == 1
+            else replicated_token_layout(self._target_parts(), self.draft_region)[1]
+        )
+        rows *= self.draft_region.token_replicas
         return tuple(
-            build_dense_views(
-                arena.raw, layout=self.layout(), part_name=part, num_slots=rows
+            build_dense_views(arena.raw, layout=layout, part_name=part, num_slots=rows)
+            for part in (
+                ("draft_kv",)
+                if isinstance(self.draft_region, MLADraftRegion)
+                else ("draft_k", "draft_v")
             )
-            for part in ("draft_k", "draft_v")
         )
 
     def get_dtype(self) -> torch.dtype:
@@ -158,9 +184,14 @@ class MLAView(MLAKVView):
     kv_scale_buffer = None
     cpu_copy_carries_mamba = False
     layer_shard_enabled = False
+    hicache_write_back_staging = None
     post_capture_active = False
     host_capacity_tokens: Optional[int] = None
     host_capacity_bytes: Optional[int] = None
+    # Set by HiCache when it stages write-backs for this view.
+    hicache_write_back_staging: Optional[
+        torch.Tensor | Tuple[torch.Tensor, torch.Tensor]
+    ] = None
     enable_custom_mem_pool = False
     custom_mem_pool = None
     allocation_label = None
@@ -174,10 +205,16 @@ class MLAView(MLAKVView):
         spec: MLASubPoolSpec,
         kv_cache_dtype: torch.dtype,
         page_size: int,
+        model_layer_ids: Optional[Tuple[int, ...]] = None,
     ):
         assert spec.store_dtype == _store_dtype_for(kv_cache_dtype), (
             f"sub-pool {spec.name!r} store dtype {spec.store_dtype} does not "
             f"match kv cache dtype {kv_cache_dtype}"
+        )
+        self._has_draft_parts = spec.draft_region is not None
+        # An MLA latent is replicated, but a fused MHA draft carries rank-local heads.
+        self.storage_rank_replicated = spec.draft_region is None or isinstance(
+            spec.draft_region, MLADraftRegion
         )
         self._arena = arena
         self._sub_pool_name = spec.name
@@ -197,7 +234,9 @@ class MLAView(MLAKVView):
         # Addressed by the 0..N-1 index of its layers.
         self.start_layer = 0
         self.end_layer = spec.layer_num - 1
-        self.model_layer_ids = tuple(range(spec.layer_num))
+        self.model_layer_ids = (
+            tuple(range(spec.layer_num)) if model_layer_ids is None else model_layer_ids
+        )
         self.layer_transfer_counter: Optional[LayerDoneCounter] = None
         self.data_ptrs = torch.tensor(
             [x.data_ptr() for x in self.kv_buffer],
@@ -344,6 +383,23 @@ class MLAView(MLAKVView):
             self.kv_buffer[layer_id], loc, cache_k_nope, cache_k_rope
         )
 
+    def set_mla_kv_buffer_prefix_valid(
+        self,
+        layer,
+        loc_2d,
+        commit_lens,
+        cache_k_nope,
+        cache_k_rope,
+        layer_id_override=None,
+    ):
+        self.set_mla_kv_buffer(
+            layer,
+            _prefix_valid_mla_write_loc(loc_2d, commit_lens, cache_k_nope),
+            cache_k_nope,
+            cache_k_rope,
+            layer_id_override=layer_id_override,
+        )
+
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         raise NotImplementedError(
             "a unified pool moves whole units in its arena; a per-slot move "
@@ -351,6 +407,29 @@ class MLAView(MLAKVView):
         )
 
     # -- host transfer and PD --
+
+    def host_layout(self):
+        from sglang.srt.mem_cache.kv.layout.page import page_envelope_host_layout
+
+        if self._has_draft_parts:
+            return page_envelope_host_layout(
+                self._arena,
+                self._sub_pool_name,
+                self.size
+                if self.host_capacity_tokens is None
+                else self.host_capacity_tokens,
+                self.page_size,
+            )
+        (info,) = self.get_device_pool_infos()
+        return MLAHostLayout(
+            buffer_info=info.buffer_info,
+            capacity=self.size
+            if self.host_capacity_tokens is None
+            else self.host_capacity_tokens,
+            start_layer=self.start_layer,
+            end_layer=self.end_layer,
+            write_back_staging=self.hicache_write_back_staging,
+        )
 
     def get_device_pool_infos(self) -> "tuple[DevicePoolInfo, ...]":
         """The view's buffers, as host assembly reads them."""
@@ -380,19 +459,13 @@ class MLAView(MLAKVView):
             ),
         )
 
-    def host_pool_decls(self):
-        """The host pool HiCache keeps for this view's buffers."""
-        from sglang.srt.mem_cache.pool_host.host_pool_decl import make_kv_pool_decl
-
-        return (make_kv_pool_decl(self),)
-
     def get_contiguous_buf_infos(self):
         """PD registration: one entry, the raw arena, addressed as
         ``raw_ptr + physical_page_id * page_bytes``. The layers interleave in
         each slot's entry, so the transfer item is a whole page envelope and both
         sides must build the pool with identical specs."""
         raw = self._arena.raw
-        return [raw.data_ptr()], [raw.numel()], [self.page_bytes]
+        return [raw.data_ptr()], [self._arena.accessible_bytes], [self.page_bytes]
 
     # -- retraction copies, at physical ids --
 
@@ -428,3 +501,96 @@ class MLAView(MLAKVView):
                     self.kv_buffer[0].device, non_blocking=True
                 )
         current_platform.synchronize()
+
+
+class DraftMLAView(MLAView):
+    """Latent views of a draft's lanes; the host owns their allocation and IO."""
+
+    def __init__(self, *, arena, host_spec, layer_lanes, page_size):
+        region = host_spec.draft_region
+        assert isinstance(region, MLADraftRegion)
+        self.token_replicas = region.token_replicas
+        layer_ids = sorted(layer_lanes)
+        assert layer_ids == list(range(len(layer_ids)))
+        lanes = [layer_lanes[i] for i in layer_ids]
+        assert len(set(lanes)) == len(lanes)
+        assert all(0 <= lane < region.lane_num for lane in lanes)
+        (views,) = host_spec.draft_views(arena)
+        self._has_draft_parts = True
+        self._arena = arena
+        self._sub_pool_name = host_spec.name
+        self.layer_lanes = dict(layer_lanes)
+        self.kv_buffer = [views[lane] for lane in lanes]
+        self.page_size = page_size
+        self.size = self.kv_buffer[0].shape[0] - page_size
+        self.num_pages = (self.size + page_size) // page_size
+        self.page_bytes = page_size * host_spec.entry_bytes() // region.token_replicas
+        self.dtype = region.resolved_kv_dtype()
+        self.store_dtype = region.store_dtype
+        self.device = arena.device
+        self.kv_lora_rank = region.kv_lora_rank
+        self.qk_rope_head_dim = region.qk_rope_head_dim
+        self.kv_cache_dim = self.kv_lora_rank + self.qk_rope_head_dim
+        self.head_num = 1
+        self.head_dim = self.kv_cache_dim
+        self.layer_num = len(lanes)
+        self.start_layer = 0
+        self.end_layer = self.layer_num - 1
+        self.model_layer_ids = tuple(layer_ids)
+        self.layer_transfer_counter = None
+        self.data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.kv_buffer],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+
+
+class MLAHostLayout(msgspec.Struct, frozen=True, kw_only=True):
+    """Latent host rows, including the physical page width under DCP."""
+
+    buffer_info: MLABufferInfo
+    capacity: int
+    start_layer: int
+    end_layer: int
+    write_back_staging: object = None
+
+    @property
+    def device_layer_num(self) -> int:
+        return self.buffer_info.device_layer_num
+
+    def build(self, options: HostPoolOptions, *, draft_buffer_infos=()):
+        from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+        from sglang.srt.mem_cache.pool_host.page_unified import PageUnifiedLayout
+
+        info = self.buffer_info
+        page_layout = None
+        if options.layout == "page_unified":
+            page_layout = PageUnifiedLayout(
+                page_size=options.page_size // options.dcp_size,
+                layer_num=self.device_layer_num + len(draft_buffer_infos),
+                head_num=1,
+                head_group_num=1,
+                head_dim=info.kv_cache_dim,
+                itemsize=info.dtype.itemsize,
+                is_mla=True,
+            )
+        return MLATokenToKVPoolHost(
+            info,
+            options.ratio,
+            options.size,
+            options.page_size,
+            options.layout,
+            pin_memory=options.pin_memory,
+            allocator_type=options.allocator_type,
+            pool_label=options.pool_label,
+            device_capacity_tokens=self.capacity,
+            start_layer=self.start_layer,
+            end_layer=self.end_layer,
+            target_layer_num=self.device_layer_num,
+            override_kv_cache_dim=info.kv_cache_dim,
+            draft_buffer_infos=draft_buffer_infos,
+            write_back_staging=self.write_back_staging,
+            page_unified_layout=page_layout,
+            dcp_size=options.dcp_size,
+            dcp_rank=options.dcp_rank,
+        )

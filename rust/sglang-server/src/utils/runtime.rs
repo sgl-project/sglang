@@ -1,19 +1,21 @@
-//! Runtime bootstrap: wires channels, pins CPU-bound pools, starts the tokio
-//! API server, and returns a handle the Python boundary uses for
+//! Runtime bootstrap: wires channels, pins the frontend threads, starts the
+//! tokio API server, and returns a handle the Python boundary uses for
 //! `recv_requests` and `push_decode_result_batch`.
 //!
-//! Thread layout:
-//!   * API transports — one tokio multi-thread runtime (I/O bound), pinned core set A
-//!   * Tokenizer      — N pinned OS threads (CPU bound), core set B
-//!   * Detokenizer    — M pinned OS threads (CPU bound), core set C
-//!   * To_scheduler   — 1 thread driving the FSM
-//!   * From_scheduler — 1 thread draining the scheduler → detok shards
+//! Thread layout (every pinned thread shares one CPU set, see
+//! [`frontend_cpu_set`]):
+//!   * API transports — one tokio multi-thread runtime (I/O bound), pinned
+//!   * Tokenizer      — N pinned OS threads (CPU bound)
+//!   * Detokenizer    — M pinned OS threads (CPU bound)
+//!   * To_scheduler   — 1 pinned thread driving the FSM
+//!   * From_scheduler — 1 pinned thread draining the scheduler → detok shards
 //!   * MM workers     — K unpinned OS threads, spawned late via
 //!     [`Runtime::start_mm_workers`] (multimodal models only)
 //!
 //! Keeping CPU-bound tokenize/detokenize off the async executor avoids stalling
 //! the HTTP/gRPC worker threads.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
@@ -21,7 +23,7 @@ use crate::HttpLayer;
 use crate::message::config::RuntimeConfig;
 use crate::message::detok::DetokMsg;
 
-use super::threads::{join_all_with_timeout, plan_cores, spawn_pool};
+use super::threads::{frontend_cpu_set, join_all_with_timeout, pin_current, spawn_pool};
 use crate::tokenizer_manager::channel::{
     FromSchedulerRx, FromSchedulerTx, ToSchedulerRx, ToSchedulerTx, from_scheduler, to_scheduler,
 };
@@ -50,6 +52,58 @@ pub struct Runtime {
     threads: Mutex<Vec<JoinHandle<()>>>,
     /// The single shutdown sender.
     shutdown_tx: Mutex<Option<flume::Sender<()>>>,
+    /// Disconnects with `shutdown_tx`, ending a [`Runtime::wait_startup_failure`].
+    shutdown_rx: flume::Receiver<()>,
+    /// The error of a failed startup warmup, sent at most once.
+    startup_failure_rx: flume::Receiver<String>,
+    /// Set once the API listeners have closed and the drain's end is no
+    /// longer held (see [`Runtime::hold_drain_end`]).
+    listeners_closed: Arc<AtomicBool>,
+    /// Set once the API listeners have stopped serving and closed, held or not.
+    own_listeners_closed: Arc<AtomicBool>,
+    drain_end_gate: Arc<DrainEndGate>,
+    /// Where to report a drain's listeners closing (see
+    /// [`Runtime::drain_signal_fd`]).
+    drain_notify: Arc<std::sync::OnceLock<String>>,
+}
+
+/// [`Runtime::drain_state`] bit: a drain has begun.
+pub const DRAIN_DRAINING: u8 = 1;
+/// [`Runtime::drain_state`] bit: the drain was begun forced
+/// (`SGLANG_FORCE_SHUTDOWN`); a failed health probe does not set it.
+pub const DRAIN_FORCE_REQUESTED: u8 = 2;
+/// [`Runtime::drain_state`] bit: this runtime's own listeners have closed,
+/// whether or not the drain's end is held.
+pub const DRAIN_CLOSED: u8 = 4;
+
+/// Holds a drain's end past the listeners' close until released (see
+/// [`Runtime::hold_drain_end`]).
+#[derive(Default)]
+struct DrainEndGate {
+    held: AtomicBool,
+    released: AtomicBool,
+    changed: tokio::sync::Notify,
+}
+
+impl DrainEndGate {
+    fn release(&self) {
+        self.released.store(true, Ordering::SeqCst);
+        self.changed.notify_waiters();
+    }
+
+    async fn released(&self) {
+        loop {
+            // Register before checking, so a release between the check and
+            // the await still wakes this waiter.
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.released.load(Ordering::SeqCst) {
+                return;
+            }
+            notified.await;
+        }
+    }
 }
 
 /// Deadline for joining worker threads on shutdown. Past it we abandon the join
@@ -57,6 +111,11 @@ pub struct Runtime {
 const SHUTDOWN_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl Runtime {
+    /// The crash dump's requests (`None` without `--crash-dump-folder`).
+    pub fn crash_dump_snapshot(&self) -> Option<Vec<u8>> {
+        self.core.crash_dump_snapshot()
+    }
+
     /// Build the family context from `spec` and spawn `workers`
     /// `mm-worker-{i}` threads into the shutdown join set — late, once Python
     /// has built the mm spec (`Server.start_mm_workers`).
@@ -109,6 +168,127 @@ impl Runtime {
         });
     }
 
+    /// Block until the startup warmup fails, returning its error, or until
+    /// the runtime shuts down (`None`, whether the warmup succeeded, was
+    /// skipped, or never finished). The launching process takes the server
+    /// down on a failure, as Python's server does.
+    pub fn wait_startup_failure(&self) -> Option<String> {
+        flume::Selector::new()
+            .recv(&self.startup_failure_rx, |failure| failure.ok())
+            .recv(&self.shutdown_rx, |_| None)
+            .wait()
+    }
+
+    /// Begin the graceful drain (see `CoreHandle::begin_drain`): health
+    /// answers 503, requests are still admitted, and the listeners close once
+    /// none is left in flight. `force` closes them without waiting.
+    pub fn begin_drain(&self, force: bool) {
+        self.core.begin_drain(force);
+    }
+
+    /// Whether a drain has begun and every listener has since closed, its
+    /// end released if held: the scheduler may stop. The other stages keep
+    /// running until [`Runtime::request_shutdown`].
+    pub fn drain_complete(&self) -> bool {
+        self.core.is_draining() && self.listeners_closed.load(Ordering::SeqCst)
+    }
+
+    /// The drain's progress as `DRAIN_*` bits, for the caller to share with
+    /// the runtimes of the other attention-DP ranks.
+    pub fn drain_state(&self) -> u8 {
+        let mut state = 0;
+        if self.core.is_draining() {
+            state |= DRAIN_DRAINING;
+        }
+        if self.core.is_drain_forced() {
+            state |= DRAIN_FORCE_REQUESTED;
+        }
+        if self.own_listeners_closed.load(Ordering::SeqCst) {
+            state |= DRAIN_CLOSED;
+        }
+        state
+    }
+
+    /// Hold the end of every later graceful drain until
+    /// [`Runtime::release_drain_end`]: the listeners still close once their
+    /// requests drained, but [`Runtime::drain_complete`], the scheduler
+    /// wake-up and the drain-ended datagram wait for the release. For DP rank
+    /// 0, whose drain end stops the schedulers of every DP rank, so that the
+    /// other DP ranks' listeners finish their requests first. A forced drain
+    /// (or a failed health probe), even one forced mid-hold, does not wait,
+    /// as Python's does not. While held, connections left open past the
+    /// graceful-close timeout stay open until the release. Must be called
+    /// before any drain begins.
+    pub fn hold_drain_end(&self) -> Result<(), String> {
+        if self.core.is_draining() {
+            return Err("a drain has already begun".into());
+        }
+        self.drain_end_gate.held.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Release a held drain end (see [`Runtime::hold_drain_end`]); latched,
+    /// so a release before the listeners closed ends the drain as they close.
+    /// Ignored, returning `false`, unless a drain has begun, so it can never
+    /// pre-release a later drain.
+    pub fn release_drain_end(&self) -> bool {
+        if !self.core.is_draining() {
+            return false;
+        }
+        self.drain_end_gate.release();
+        true
+    }
+
+    /// A pipe whose write end the caller installs as its signal wakeup fd
+    /// (Python's `signal.set_wakeup_fd`, which writes each caught signal's
+    /// number as one byte): `signum` begins the drain from a thread of this
+    /// runtime, so a scheduler thread blocked in a GPU call or collective
+    /// cannot delay it. Returns the write end, which stays open for the life
+    /// of the process; the watcher thread is detached, since it may block
+    /// until then.
+    ///
+    /// When the drain's listeners have closed, a datagram goes to the
+    /// abstract Unix socket `notify`, if given: the launching process's
+    /// positive signal that the drain ended, even while the scheduler thread
+    /// is wedged.
+    pub fn drain_signal_fd(
+        &self,
+        signum: u8,
+        force: bool,
+        notify: Option<String>,
+    ) -> std::io::Result<std::os::fd::OwnedFd> {
+        use std::io::Read;
+
+        if let Some(notify) = notify {
+            let _ = self.drain_notify.set(notify);
+        }
+        let (read, write) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC)?;
+        // Python requires a non-blocking wakeup fd.
+        rustix::fs::fcntl_setfl(&write, rustix::fs::OFlags::NONBLOCK)?;
+        let core = self.core.clone();
+        std::thread::Builder::new()
+            .name("drain-signal".into())
+            .spawn(move || {
+                let mut read = std::fs::File::from(read);
+                let mut buf = [0u8; 64];
+                loop {
+                    match read.read(&mut buf) {
+                        Ok(0) => return, // every write end closed
+                        Ok(n) if buf[..n].contains(&signum) => core.begin_drain(force),
+                        Ok(_) => {}
+                        // Python's signal handlers are installed without
+                        // SA_RESTART, so any caught signal can interrupt this.
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                        Err(e) => {
+                            tracing::error!(error = %e, "drain signal watcher stopped");
+                            return;
+                        }
+                    }
+                }
+            })?;
+        Ok(write)
+    }
+
     /// Stop the runtime and join every worker thread (with a bounded wait).
     pub fn request_shutdown(&self) {
         drop(self.shutdown_tx.lock().unwrap().take());
@@ -119,6 +299,7 @@ impl Runtime {
                 "shutdown: workers did not exit within {SHUTDOWN_JOIN_TIMEOUT:?}; abandoning join"
             );
         }
+        crate::api_server::core::flush_request_log();
     }
 }
 
@@ -128,13 +309,32 @@ impl Drop for Runtime {
     }
 }
 
+/// Send the drain-ended datagram to the abstract Unix socket `name`; best
+/// effort, since the launching process falls back to scheduler exits.
+fn notify_drained(name: &str) {
+    use std::os::linux::net::SocketAddrExt;
+    use std::os::unix::net::{SocketAddr, UnixDatagram};
+
+    // Non-blocking: a full receive queue (EAGAIN) loses only this report.
+    let sent = SocketAddr::from_abstract_name(name).and_then(|addr| {
+        let socket = UnixDatagram::unbound()?;
+        socket.set_nonblocking(true)?;
+        socket.send_to_addr(b"drained", &addr)
+    });
+    if let Err(error) = sent {
+        tracing::warn!(%error, name, "could not report the drain's end");
+    }
+}
+
 /// Boot the whole frontend, `http_layer` wrapping the HTTP app (see
 /// [`HttpLayer`]). Returns once threads are spawned (non-blocking).
 /// `Err` on a startup misconfiguration (e.g. no tokenizer for a non-skip server).
 pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtime, String> {
+    crate::message::info::InternalState::check_registered_keys(&cfg.server_info_state_keys)?;
     let (shutdown_tx, shutdown_rx) = flume::unbounded::<()>();
+    let (startup_failure_tx, startup_failure_rx) = flume::bounded::<String>(1);
     let mut threads = Vec::new();
-    let plan = plan_cores(&cfg);
+    let cpus = frontend_cpu_set(&cfg);
     // Validated before anything is spawned, so a bad bucket list fails startup
     // cleanly.
     let metrics = match &cfg.server_args.metrics {
@@ -221,12 +421,11 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
             Some(t) => detokenizer::DetokenizerBackend::Dynamo(t.clone()),
             None => detokenizer::DetokenizerBackend::Skip,
         };
-        let detok_cores = plan.as_ref().map(|p| p.detok.clone());
         // Each shard owns its receiver outright (one consumer per shard), so the
         // owned `detok_rx` Vec is moved out element-by-element via the iterator.
         let count = detokenizer_rx.len();
         let mut detokenizer_rxs = detokenizer_rx.into_iter();
-        spawn_pool("detokenizer", detok_cores, count, &mut threads, |i| {
+        spawn_pool("detokenizer", cpus, count, &mut threads, |i| {
             detokenizer::DetokenizerWorker::new(
                 i,
                 detokenizer_rxs.next().unwrap(),
@@ -242,12 +441,11 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
     if let Some(tokenizer) = &tokenizer {
         // Reuse the single loaded tokenizer (shared with the detok shards).
         let tokenizer = tokenizer.clone();
-        let tok_cores = plan.as_ref().map(|p| p.tok.clone());
         // Workers share the MPMC inbox (`tok_rx`) and the read-only backend, so
         // each gets a cheap clone of both.
         spawn_pool(
             "tokenizer",
-            tok_cores,
+            cpus,
             cfg.server_args.tokenizer_worker_num,
             &mut threads,
             |_i| {
@@ -266,17 +464,13 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
 
     // --- Response dispatcher: drains from_scheduler channel → routes chunks to shards ---
     {
-        // First TM core; from_scheduler is the hotter router (every output token). One
-        // worker today via `spawn_pool`, so sharding by `Rid::shard` later (see
-        // `TM_CORES`) is just a larger count + per-shard receivers.
-        let cores = plan
-            .as_ref()
-            .and_then(|p| p.tm.first().copied())
-            .map(|c| vec![c]);
+        // The hotter router (every output token). One worker today via
+        // `spawn_pool`, so sharding by `Rid::shard` later is just a larger
+        // count + per-shard receivers.
         let mut from_scheduler_rx = Some(from_scheduler_rx); // moved into the single worker
         let activity = response_activity.clone();
         let shutdown_rx = shutdown_rx.clone();
-        spawn_pool("from-scheduler", cores, 1, &mut threads, |_| {
+        spawn_pool("from-scheduler", cpus, 1, &mut threads, |_| {
             tokenizer_manager::from_scheduler::Dispatcher::new(
                 from_scheduler_rx.take().unwrap(),
                 senders.clone(),
@@ -288,12 +482,14 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
 
     // --- TokenizerManager to_scheduler loop ---
     {
-        // Second TM core when present, else share the first (1-core / API-set
-        // fallback) — still off the CPU-bound pool cores either way.
-        let cores = plan
-            .as_ref()
-            .and_then(|p| p.tm.get(1).or_else(|| p.tm.first()).copied())
-            .map(|c| vec![c]);
+        // TODO(tm-scaling): this thread and `from-scheduler` are single-consumer
+        // serialization points, each with its own ceiling. to-scheduler runs
+        // validate + `normalize_sampling_params` for *every* request before
+        // fanning out to the (pooled) tokenizer workers, so a high
+        // request-arrival / short-request workload is bounded by this one
+        // thread's per-request cost (kept O(fields), see
+        // `sampling::normalize_sampling_params`). Sharding it by rid — like the
+        // tokenizer/detok pools — lifts that ceiling.
         let limits = tokenizer_manager::to_scheduler::Limits::from(&*cfg.server_args);
         let mm = tokenizer_manager::to_scheduler::MmDispatch {
             enabled: cfg.server_args.model_is_multimodal(),
@@ -301,7 +497,7 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
         };
         let mut parts = Some((tok_manager_rx, to_scheduler_tx)); // moved into the single worker
         let shutdown_rx = shutdown_rx.clone();
-        spawn_pool("to-scheduler", cores, 1, &mut threads, |_| {
+        spawn_pool("to-scheduler", cpus, 1, &mut threads, |_| {
             let (tok_manager_rx, to_scheduler_tx) = parts.take().unwrap();
             tokenizer_manager::to_scheduler::Intake::new(
                 tok_manager_rx,
@@ -326,21 +522,37 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
             startup_ready: cfg.server_args.skip_server_warmup,
             is_disaggregation: cfg.server_args.is_disaggregation(),
             mm_limits: cfg.server_args.limit_mm_data_per_request.clone(),
+            multimodal: cfg.server_args.model_is_multimodal(),
             peer_endpoints: crate::api_server::core::peer_endpoints(
                 &cfg.server_args.deployment_info,
                 cfg.server_args.deployment_info.dp_rank.unwrap_or(0),
+                &cfg.server_args.api_keys,
             )?,
-            metadata: crate::api_server::handlers::CoreMetadata::from(cfg.server_args.as_ref()),
+            metadata: crate::api_server::handlers::CoreMetadata::from(cfg.server_args.as_ref())
+                .with_server_info_state_keys(cfg.server_info_state_keys.clone()),
             metrics,
+            request_log: crate::api_server::core::RequestLog::from_server_args(&cfg.server_args)?,
+            generate_validator: cfg.generate_validator.clone(),
         },
     );
+    core.set_graceful_close_timeout(cfg.rust_server_args.graceful_close_timeout);
 
     // --- HTTP + optional gRPC adapters (one tokio runtime, I/O bound) ---
+    let listeners_closed = Arc::new(AtomicBool::new(false));
+    let own_listeners_closed = Arc::new(AtomicBool::new(false));
+    let drain_end_gate = Arc::new(DrainEndGate::default());
+    let drain_notify = Arc::new(std::sync::OnceLock::<String>::new());
     {
         let cfg = cfg.clone();
-        let api_cores = plan.as_ref().map(|p| p.api.clone());
         let shutdown_rx = shutdown_rx.clone();
+        let shutdown_for_gate = shutdown_rx.clone();
         let core = core.clone();
+        let listeners_closed = listeners_closed.clone();
+        let own_listeners_closed = own_listeners_closed.clone();
+        let drain_end_gate = drain_end_gate.clone();
+        let drain_notify = drain_notify.clone();
+        let waker = to_scheduler_rx.waker();
+        let core_for_close = core.clone();
         let hicache_manager = Arc::new(api_server::handlers::HiCacheManager::new(
             core.clone(),
             &cfg.server_args,
@@ -356,41 +568,66 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
         let handle = std::thread::Builder::new()
             .name("api-runtime".into())
             .spawn(move || {
+                // This thread runs `block_on` (the listeners' accept loops);
+                // the runtime's worker and blocking threads pin on start.
+                pin_current(cpus.as_ref());
                 let mut builder = tokio::runtime::Builder::new_multi_thread();
                 builder
                     .worker_threads(cfg.rust_server_args.http_api_worker_num)
-                    .enable_all();
-                if let Some(cores) = api_cores {
-                    let next = std::sync::atomic::AtomicUsize::new(0);
-                    builder.on_thread_start(move || {
-                        let idx = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        if let Some(c) = cores.get(idx % cores.len()) {
-                            core_affinity::set_for_current(*c);
-                        }
-                    });
-                }
+                    .enable_all()
+                    .on_thread_start(move || pin_current(cpus.as_ref()));
                 let rt = builder.build().expect("build api runtime");
                 rt.block_on(async move {
                     let http = api_server::http::app::serve(
                         http_listener,
-                        core,
+                        core.clone(),
                         cfg.server_args.clone(),
                         cfg.rust_server_args.metrics_listener,
                         http_layer,
                         cfg.generate_hook.clone(),
                         shutdown_rx.clone(),
+                        startup_failure_tx,
                         hicache_manager,
                         tokenizer.clone(),
                     );
                     if let Some((listener, service)) = grpc_server {
                         tokio::join!(
                             http,
-                            api_server::grpc::app::serve(listener, service, shutdown_rx)
+                            api_server::grpc::app::serve(listener, service, core, shutdown_rx)
                         );
                     } else {
                         http.await;
                     }
-                })
+                });
+                own_listeners_closed.store(true, Ordering::SeqCst);
+                if drain_end_gate.held.load(Ordering::SeqCst)
+                    && core_for_close.is_draining()
+                    && core_for_close.drain_force_reason().is_none()
+                {
+                    tracing::info!(
+                        "drain: listeners closed; holding the drain's end until released"
+                    );
+                    rt.block_on(async {
+                        tokio::select! {
+                            () = drain_end_gate.released() => {}
+                            () = core_for_close.drain_forced() => {}
+                            _ = shutdown_for_gate.recv_async() => {}
+                        }
+                    });
+                }
+                // Every listener is closed: report it before dropping the
+                // runtime, whose drop waits for blocking tasks (media fetches)
+                // and ends the connections still open.
+                listeners_closed.store(true, Ordering::SeqCst);
+                if core_for_close.is_draining() {
+                    // The scheduler stops at once rather than at its next idle
+                    // wake-up, and the launching process learns the drain ended.
+                    let _ = waker.send(());
+                    if let Some(name) = drain_notify.get() {
+                        notify_drained(name);
+                    }
+                }
+                drop(rt);
             })
             .expect("spawn api runtime");
         threads.push(handle);
@@ -407,6 +644,12 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
         core,
         threads: Mutex::new(threads),
         shutdown_tx: Mutex::new(Some(shutdown_tx)),
+        shutdown_rx,
+        startup_failure_rx,
+        listeners_closed,
+        own_listeners_closed,
+        drain_end_gate,
+        drain_notify,
     })
 }
 
@@ -441,6 +684,32 @@ mod tests {
             },
             server_args: Arc::new(test_server_args()),
             generate_hook: None,
+            generate_validator: None,
+            server_info_state_keys: Vec::new(),
+        }
+    }
+
+    /// A registered `/server_info` state key that names a field it already
+    /// reports, or one registered twice, fails startup before anything runs.
+    #[test]
+    fn start_rejects_colliding_server_info_state_keys() {
+        for (keys, problem) in [
+            (
+                ["package_state", "memory_usage"],
+                r#""memory_usage" names a field /server_info already reports"#,
+            ),
+            (
+                ["package_state", "package_state"],
+                r#""package_state" is registered twice"#,
+            ),
+        ] {
+            let (http_addr, _) = free_loopback_addrs();
+            let cfg = RuntimeConfig {
+                server_info_state_keys: keys.map(String::from).to_vec(),
+                ..test_config(http_addr, None)
+            };
+            let error = start(cfg, None).err().expect("startup must fail");
+            assert!(error.contains(problem), "{error}");
         }
     }
 
@@ -479,11 +748,17 @@ mod tests {
     }
 
     fn terminal_token_frame(rid: String, output_ids: &[i64]) -> bytes::Bytes {
+        token_frame(rid, output_ids, true)
+    }
+
+    /// One scheduler output frame for `rid`, final when `finished`.
+    fn token_frame(rid: String, output_ids: &[i64], finished: bool) -> bytes::Bytes {
         let header = BatchHeader {
             rids: vec![rid],
-            finish_reasons: vec![Some(
-                serde_json::from_value(serde_json::json!({"type": "stop"})).unwrap(),
-            )],
+            finish_reasons: vec![
+                finished
+                    .then(|| serde_json::from_value(serde_json::json!({"type": "stop"})).unwrap()),
+            ],
             prompt_tokens: vec![3],
             tok_lens: vec![output_ids.len() as u32],
             cached_tokens: vec![0],
@@ -498,6 +773,19 @@ mod tests {
         frame_decode_batch_cols(&header, &[&data])
     }
 
+    /// Take the post-startup `FreezeGCReq`, the first message on the scheduler
+    /// ring when the startup warmup is skipped, so a test sees its own
+    /// requests next.
+    fn take_startup_freeze_gc(rt: &Runtime) {
+        assert!(
+            rt.to_scheduler_rx.wait(std::time::Duration::from_secs(5)),
+            "no FreezeGCReq after startup"
+        );
+        let first = rt.to_scheduler_rx.drain(1);
+        let header = rmpv::decode::read_value(&mut &first[0].header[..]).unwrap();
+        assert_eq!(header[0].as_str(), Some("FreezeGCReq"));
+    }
+
     /// Minimal boot config: no tokenizer load, complete `model_config` (from
     /// `Default`), unified role.
     fn test_server_args() -> ServerArgs {
@@ -508,6 +796,410 @@ mod tests {
             skip_server_warmup: true,
             ..Default::default()
         }
+    }
+
+    /// Write an HTTP/1.1 request on a fresh connection (closed after the
+    /// response), for the caller to read the response from.
+    fn send_http(
+        addr: std::net::SocketAddr,
+        method: &str,
+        path: &str,
+        body: &str,
+    ) -> std::net::TcpStream {
+        use std::io::Write;
+        let mut conn = std::net::TcpStream::connect(addr).expect("connect");
+        conn.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        write!(
+            conn,
+            "{method} {path} HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        conn
+    }
+
+    fn read_response(mut conn: std::net::TcpStream) -> String {
+        use std::io::Read;
+        let mut response = String::new();
+        conn.read_to_string(&mut response).expect("read response");
+        response
+    }
+
+    /// Wait for the next request on the scheduler ring and return its rid.
+    fn next_scheduler_rid(rt: &Runtime) -> String {
+        assert!(
+            rt.to_scheduler_rx.wait(std::time::Duration::from_secs(5)),
+            "no request reached the scheduler ring"
+        );
+        let requests = rt.to_scheduler_rx.drain(1);
+        assert_eq!(requests.len(), 1);
+        scheduler_rid(&requests[0].header)
+    }
+
+    fn wait_drain_complete(rt: &Runtime) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !rt.drain_complete() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "drain did not complete"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// The graceful drain, as Python's SIGTERM handling: health answers 503
+    /// at once without probing the scheduler, an in-flight stream runs to its
+    /// `[DONE]`, a request arriving during the drain is still admitted and
+    /// served, and the listener closes only once both finished.
+    #[test]
+    fn drain_answers_503_and_serves_in_flight_requests_before_closing() {
+        let (addr, _) = free_loopback_addrs();
+        let rt = start(test_config(addr, None), None).expect("start runtime");
+        take_startup_freeze_gc(&rt);
+
+        let streaming = send_http(
+            addr,
+            "POST",
+            "/generate",
+            r#"{"input_ids":[1,2,3],"stream":true,"sampling_params":{"max_new_tokens":8}}"#,
+        );
+        let streaming_rid = next_scheduler_rid(&rt);
+        assert!(
+            rt.from_scheduler_tx
+                .push(token_frame(streaming_rid.clone(), &[7], false))
+        );
+
+        // A router's idle keep-alive connection: answered, left open.
+        let mut keep_alive = std::net::TcpStream::connect(addr).expect("connect");
+        keep_alive
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        std::io::Write::write_all(
+            &mut keep_alive,
+            b"GET /model_info HTTP/1.1\r\nHost: t\r\n\r\n",
+        )
+        .unwrap();
+
+        rt.begin_drain(false);
+        for path in ["/health", "/health_generate"] {
+            let response = read_response(send_http(addr, "GET", path, ""));
+            assert!(response.starts_with("HTTP/1.1 503"), "{path}: {response}");
+        }
+        assert!(
+            !rt.to_scheduler_rx
+                .wait(std::time::Duration::from_millis(200)),
+            "a draining server must not send a health probe"
+        );
+
+        // Admitted during the drain, as Python admits it.
+        let late = send_http(
+            addr,
+            "POST",
+            "/generate",
+            r#"{"input_ids":[4,5],"sampling_params":{"max_new_tokens":8}}"#,
+        );
+        let late_rid = next_scheduler_rid(&rt);
+
+        assert!(
+            rt.from_scheduler_tx
+                .push(terminal_token_frame(streaming_rid, &[8]))
+        );
+        let stream = read_response(streaming);
+        assert!(stream.starts_with("HTTP/1.1 200"), "{stream}");
+        assert!(stream.contains("data: [DONE]"), "stream cut: {stream}");
+
+        // The late request still holds the drain open.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(!rt.drain_complete());
+        assert!(std::net::TcpStream::connect(addr).is_ok());
+
+        assert!(
+            rt.from_scheduler_tx
+                .push(terminal_token_frame(late_rid, &[9]))
+        );
+        let response = read_response(late);
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.contains("[9]"), "{response}");
+
+        wait_drain_complete(&rt);
+        assert!(
+            std::net::TcpStream::connect(addr).is_err(),
+            "listener still open after the drain completed"
+        );
+        // The idle keep-alive connection did not hold the close open.
+        let keep_alive = read_response(keep_alive);
+        assert!(keep_alive.starts_with("HTTP/1.1 200"), "{keep_alive}");
+        rt.request_shutdown();
+    }
+
+    /// A forced drain (`SGLANG_FORCE_SHUTDOWN`, or a failed last health probe)
+    /// does not wait: the listener closes with a request still in flight, and
+    /// that request is cut.
+    #[test]
+    fn forced_drain_closes_without_waiting() {
+        let (addr, _) = free_loopback_addrs();
+        let rt = start(test_config(addr, None), None).expect("start runtime");
+        take_startup_freeze_gc(&rt);
+        let in_flight = send_http(
+            addr,
+            "POST",
+            "/generate",
+            r#"{"input_ids":[1,2,3],"stream":true,"sampling_params":{"max_new_tokens":8}}"#,
+        );
+        next_scheduler_rid(&rt);
+
+        rt.begin_drain(true);
+        wait_drain_complete(&rt);
+        assert!(std::net::TcpStream::connect(addr).is_err());
+        assert!(!read_response(in_flight).contains("[DONE]"));
+        rt.request_shutdown();
+    }
+
+    /// The signal wakeup fd begins the drain from a runtime thread: only the
+    /// drain signal's byte counts, as a wakeup fd carries every caught signal.
+    /// Once the listeners have closed, the scheduler's parked wait ends and
+    /// the launching process gets its datagram.
+    #[test]
+    fn drain_signal_fd_begins_the_drain_and_reports_its_end() {
+        use std::io::Write;
+        use std::os::linux::net::SocketAddrExt;
+        use std::os::unix::net::{SocketAddr, UnixDatagram};
+
+        let name = format!("sglang-drain-test-{}", std::process::id());
+        let launcher =
+            UnixDatagram::bind_addr(&SocketAddr::from_abstract_name(&name).unwrap()).unwrap();
+        launcher
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let (addr, _) = free_loopback_addrs();
+        let rt = start(test_config(addr, None), None).expect("start runtime");
+        take_startup_freeze_gc(&rt);
+        let mut wakeup = std::fs::File::from(rt.drain_signal_fd(15, false, Some(name)).unwrap());
+        wakeup.write_all(&[2]).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(!rt.core.is_draining(), "another signal began the drain");
+
+        let parked = std::time::Instant::now();
+        wakeup.write_all(&[15]).unwrap();
+        assert!(rt.to_scheduler_rx.wait(std::time::Duration::from_secs(5)));
+        assert!(
+            parked.elapsed() < std::time::Duration::from_secs(4),
+            "the scheduler's wait was not woken"
+        );
+        assert!(rt.drain_complete());
+        let mut buf = [0u8; 16];
+        let n = launcher.recv(&mut buf).expect("no drain-ended datagram");
+        assert_eq!(&buf[..n], b"drained");
+        rt.request_shutdown();
+    }
+
+    fn wait_drain_state(rt: &Runtime, state: u8) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while rt.drain_state() != state {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "drain state {} never became {state}",
+                rt.drain_state()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// A held drain end: the listener closes once its requests drained, but
+    /// the drain completes, and the launching process hears of it, only on
+    /// the release. A release before any drain began is ignored, and the
+    /// hold cannot be taken once a drain began.
+    #[test]
+    fn held_drain_end_waits_for_the_release() {
+        use std::os::linux::net::SocketAddrExt;
+        use std::os::unix::net::{SocketAddr, UnixDatagram};
+
+        let name = format!("sglang-drain-hold-test-{}", std::process::id());
+        let launcher =
+            UnixDatagram::bind_addr(&SocketAddr::from_abstract_name(&name).unwrap()).unwrap();
+        launcher.set_nonblocking(true).unwrap();
+        let (addr, _) = free_loopback_addrs();
+        let rt = start(test_config(addr, None), None).expect("start runtime");
+        drop(rt.drain_signal_fd(15, false, Some(name)).unwrap());
+        rt.hold_drain_end().unwrap();
+        assert!(!rt.release_drain_end(), "released with no drain under way");
+        assert_eq!(rt.drain_state(), 0);
+
+        rt.begin_drain(false);
+        wait_drain_state(&rt, DRAIN_DRAINING | DRAIN_CLOSED);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(std::net::TcpStream::connect(addr).is_err());
+        assert!(!rt.drain_complete(), "the early release was latched");
+        let mut buf = [0u8; 16];
+        assert!(launcher.recv(&mut buf).is_err(), "drain end reported early");
+        assert!(rt.hold_drain_end().is_err());
+
+        assert!(rt.release_drain_end());
+        wait_drain_complete(&rt);
+        launcher.set_nonblocking(false).unwrap();
+        launcher
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let n = launcher.recv(&mut buf).expect("no drain-ended datagram");
+        assert_eq!(&buf[..n], b"drained");
+        rt.request_shutdown();
+    }
+
+    /// A release that arrives while the listener is still finishing a
+    /// request is latched: the drain completes as the listener closes.
+    #[test]
+    fn drain_end_release_is_latched() {
+        let (addr, _) = free_loopback_addrs();
+        let rt = start(test_config(addr, None), None).expect("start runtime");
+        take_startup_freeze_gc(&rt);
+        rt.hold_drain_end().unwrap();
+        let streaming = send_http(
+            addr,
+            "POST",
+            "/generate",
+            r#"{"input_ids":[1,2,3],"stream":true,"sampling_params":{"max_new_tokens":8}}"#,
+        );
+        let rid = next_scheduler_rid(&rt);
+        rt.begin_drain(false);
+        assert!(rt.release_drain_end());
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert_eq!(rt.drain_state(), DRAIN_DRAINING);
+        assert!(rt.from_scheduler_tx.push(terminal_token_frame(rid, &[8])));
+        assert!(read_response(streaming).contains("data: [DONE]"));
+        wait_drain_complete(&rt);
+        rt.request_shutdown();
+    }
+
+    /// A forced drain does not wait for the release, whether forced from the
+    /// start or mid-hold, and a shutdown mid-hold still stops the runtime.
+    #[test]
+    fn forced_drain_or_shutdown_ends_a_held_drain() {
+        use std::time::{Duration, Instant};
+
+        for case in ["forced", "forced mid-hold", "shutdown mid-hold"] {
+            let (addr, _) = free_loopback_addrs();
+            let rt = start(test_config(addr, None), None).expect("start runtime");
+            rt.hold_drain_end().unwrap();
+            if case == "forced" {
+                rt.begin_drain(true);
+                wait_drain_complete(&rt);
+                assert_eq!(
+                    rt.drain_state(),
+                    DRAIN_DRAINING | DRAIN_FORCE_REQUESTED | DRAIN_CLOSED
+                );
+                rt.request_shutdown();
+                continue;
+            }
+            rt.begin_drain(false);
+            wait_drain_state(&rt, DRAIN_DRAINING | DRAIN_CLOSED);
+            if case == "forced mid-hold" {
+                rt.begin_drain(true);
+                wait_drain_complete(&rt);
+                rt.request_shutdown();
+            } else {
+                let started = Instant::now();
+                rt.request_shutdown();
+                assert!(
+                    started.elapsed() < Duration::from_secs(3),
+                    "the held drain kept the runtime from stopping"
+                );
+            }
+        }
+    }
+
+    /// A response that never finishes (here a control request no scheduler
+    /// answers, which the drain does not count) holds the graceful close
+    /// only for the graceful-close timeout, so the scheduler's shutdown still
+    /// goes out.
+    #[test]
+    fn graceful_close_is_bounded() {
+        use std::time::{Duration, Instant};
+
+        let timeout = Duration::from_millis(500);
+        let (addr, _) = free_loopback_addrs();
+        let mut cfg = test_config(addr, None);
+        cfg.rust_server_args.graceful_close_timeout = timeout;
+        let rt = start(cfg, None).expect("start runtime");
+        take_startup_freeze_gc(&rt);
+        let stuck = send_http(addr, "GET", "/server_info", "");
+        assert!(rt.to_scheduler_rx.wait(Duration::from_secs(5)));
+
+        let begun = Instant::now();
+        rt.begin_drain(false);
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            !rt.drain_complete(),
+            "the open connection was not waited for"
+        );
+        while !rt.drain_complete() {
+            assert!(
+                begun.elapsed() < timeout + Duration::from_secs(3),
+                "the graceful close was not bounded"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        rt.request_shutdown();
+        drop(stuck);
+    }
+
+    /// gRPC drains with HTTP: `HealthCheck` is UNAVAILABLE, an in-flight
+    /// `Generate` stream completes, and both listeners close afterwards.
+    #[test]
+    fn grpc_drains_with_http() {
+        use std::time::Duration;
+
+        let (http_addr, grpc_addr) = free_loopback_addrs();
+        let rt = start(test_config(http_addr, Some(grpc_addr)), None).expect("start runtime");
+        take_startup_freeze_gc(&rt);
+        let client_runtime = // Multi-threaded, so the client's connection task keeps answering
+        // the server's HTTP/2 shutdown handshake between `block_on`s.
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (mut client, mut stream) = client_runtime.block_on(async {
+            let mut client = connect_grpc(grpc_addr).await;
+            let stream = client
+                .generate(grpc_ids_request(&[1, 2, 3], "draining"))
+                .await
+                .expect("Generate RPC")
+                .into_inner();
+            (client, stream)
+        });
+        let rid = next_scheduler_rid(&rt);
+
+        rt.begin_drain(false);
+        let health = client_runtime
+            .block_on(client.health_check(proto::HealthCheckRequest {}))
+            .expect_err("a draining server must not report healthy");
+        assert_eq!(health.code(), tonic::Code::Unavailable);
+        assert!(!rt.drain_complete());
+
+        assert!(
+            rt.from_scheduler_tx
+                .push(terminal_token_frame(rid, &[9, 10]))
+        );
+        let item = client_runtime
+            .block_on(async {
+                tokio::time::timeout(Duration::from_secs(5), stream.message()).await
+            })
+            .expect("timed out waiting for the gRPC response")
+            .expect("gRPC stream error")
+            .expect("gRPC stream ended without a response");
+        assert!(matches!(
+            item.item,
+            Some(proto::generate_stream_item::Item::Frame(_))
+        ));
+        // The client keeps its connection open: the graceful close must not
+        // wait for an idle HTTP/2 connection.
+        wait_drain_complete(&rt);
+        assert!(std::net::TcpStream::connect(http_addr).is_err());
+        assert!(std::net::TcpStream::connect(grpc_addr).is_err());
+        drop((client, stream));
+        rt.request_shutdown();
     }
 
     /// Regression: `request_shutdown` must actually stop the API server — it joins
@@ -530,6 +1222,8 @@ mod tests {
             },
             server_args: Arc::new(server_args),
             generate_hook: None,
+            generate_validator: None,
+            server_info_state_keys: Vec::new(),
         };
         // Bind is synchronous in `start`, so the port is already accepting.
         let rt = start(cfg, None).expect("start runtime");
@@ -541,6 +1235,117 @@ mod tests {
         // Joins the api thread; the listener is closed by the time it returns.
         rt.request_shutdown();
 
+        assert!(
+            std::net::TcpStream::connect(addr).is_err(),
+            "port still accepting connections after shutdown",
+        );
+    }
+
+    /// A multimodal model admits no generation until its MM pool's processor
+    /// is installed, because admission runs the processor's media hooks; a
+    /// request sent earlier waits and is admitted once the pool starts. The
+    /// control routes serve from the start: `/health` answers 503, and the PD
+    /// bootstrap registry accepts a rank's registration, so other ranks can
+    /// register while the processor is still being built. A text model admits
+    /// at once, and a runtime shut down with a request still waiting exits.
+    #[test]
+    fn multimodal_admission_waits_for_the_mm_pool() {
+        use crate::message::config::DisaggregationMode;
+        use std::io::{Read, Write};
+        use std::time::{Duration, Instant};
+
+        struct NoMedia;
+        impl crate::multi_modality::worker::MmProcessor for NoMedia {
+            fn process(
+                &self,
+                _input_ids: crate::message::types::TokenIds,
+                _mm: crate::message::request::MmData,
+            ) -> Result<
+                crate::multi_modality::worker::MmProcessOutput,
+                crate::multi_modality::worker::MediaError,
+            > {
+                unreachable!("no request carries media")
+            }
+        }
+        let start_prefill = |is_multimodal: bool| {
+            let (addr, _) = free_loopback_addrs();
+            let mut cfg = test_config(addr, None);
+            cfg.server_args = Arc::new(ServerArgs {
+                disaggregation_mode: DisaggregationMode::Prefill,
+                model_config: crate::message::config::ModelConfig {
+                    is_multimodal,
+                    ..Default::default()
+                },
+                ..test_server_args()
+            });
+            let rt = start(cfg, None).expect("start runtime");
+            take_startup_freeze_gc(&rt);
+            (rt, addr)
+        };
+        let send = |addr, method: &str, path: &str, body: &str| {
+            let mut conn = std::net::TcpStream::connect(addr).expect("connect");
+            write!(
+                conn,
+                "{method} {path} HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+            conn
+        };
+        let response = |mut conn: std::net::TcpStream| {
+            conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut response = String::new();
+            conn.read_to_string(&mut response).unwrap();
+            response
+        };
+        let generate = r#"{"input_ids":[1,2,3],"sampling_params":{"max_new_tokens":8}}"#;
+        let registration = serde_json::json!({
+            "attn_tp_size": 2, "attn_tp_rank": 1,
+            "attn_cp_size": 1, "attn_cp_rank": 0,
+            "attn_dp_size": 1, "attn_dp_rank": 0,
+            "pp_size": 1, "pp_rank": 0,
+            "system_dp_size": 1, "system_dp_rank": 0,
+            "rank_ip": "10.0.0.1", "rank_port": 17000, "page_size": 64,
+        })
+        .to_string();
+
+        let (rt, addr) = start_prefill(false);
+        let _waiting = send(addr, "POST", "/generate", generate);
+        assert!(
+            rt.to_scheduler_rx.wait(Duration::from_secs(2)),
+            "a text model did not admit the request",
+        );
+        rt.request_shutdown();
+
+        let (rt, addr) = start_prefill(true);
+        let waiting = send(addr, "POST", "/generate", generate);
+        let registered = response(send(addr, "PUT", "/route", &registration));
+        assert!(registered.starts_with("HTTP/1.1 200"), "{registered}");
+        let health = response(send(addr, "GET", "/health", ""));
+        assert!(health.starts_with("HTTP/1.1 503"), "{health}");
+        assert!(
+            !rt.to_scheduler_rx.wait(Duration::from_millis(300)),
+            "admitted before the MM pool ran",
+        );
+        rt.start_mm_workers_with_processor(Arc::new(NoMedia), 1, false);
+        assert!(
+            rt.to_scheduler_rx.wait(Duration::from_secs(2)),
+            "not admitted once the MM pool ran",
+        );
+        rt.request_shutdown();
+        drop(waiting);
+
+        let (rt, addr) = start_prefill(true);
+        let _waiting = send(addr, "POST", "/generate", generate);
+        std::thread::sleep(Duration::from_millis(300));
+        let started = Instant::now();
+        rt.request_shutdown();
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "shutdown took {:?} with a request waiting for the MM pool",
+            started.elapsed(),
+        );
         assert!(
             std::net::TcpStream::connect(addr).is_err(),
             "port still accepting connections after shutdown",
@@ -567,6 +1372,8 @@ mod tests {
             },
             server_args: Arc::new(server_args),
             generate_hook: None,
+            generate_validator: None,
+            server_info_state_keys: Vec::new(),
         };
         let rt = start(cfg, None).expect("start runtime");
 
@@ -642,6 +1449,8 @@ mod tests {
             },
             server_args: Arc::new(server_args),
             generate_hook: None,
+            generate_validator: None,
+            server_info_state_keys: Vec::new(),
         };
         let rt = start(cfg, None).expect("start runtime");
 
@@ -755,7 +1564,10 @@ mod tests {
     }
 
     /// An embedding package's `http_layer` wraps the served app: its own route
-    /// serves, and its middleware sees the built-in routes' responses.
+    /// serves, and its middleware sees the built-in routes' responses. With an
+    /// API key, its route needs the key as the built-in ones do, and so does
+    /// an unknown path; the PD bootstrap registry of a prefill server stays
+    /// open, as Python serves it on its own server.
     #[test]
     fn http_layer_wraps_the_served_app() {
         use std::io::{Read, Write};
@@ -774,25 +1586,257 @@ mod tests {
                     },
                 ))
         });
-        let rt = start(test_config(addr, None), Some(layer)).expect("start runtime");
-        let get = |path: &str| {
+        let mut cfg = test_config(addr, None);
+        cfg.server_args = Arc::new(ServerArgs {
+            api_keys: crate::message::config::ApiKeys::new(Some("sk-test".into()), None),
+            disaggregation_mode: crate::message::config::DisaggregationMode::Prefill,
+            ..test_server_args()
+        });
+        let rt = start(cfg, Some(layer)).expect("start runtime");
+        let get = |path: &str, key: Option<&str>| {
             let mut conn = std::net::TcpStream::connect(addr).expect("connect");
+            let authorization = key.map_or(String::new(), |key| {
+                format!("Authorization: Bearer {key}\r\n")
+            });
             write!(
                 conn,
-                "GET {path} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n"
+                "GET {path} HTTP/1.1\r\nHost: t\r\n{authorization}Connection: close\r\n\r\n"
             )
             .unwrap();
             let mut response = String::new();
             conn.read_to_string(&mut response).unwrap();
             response
         };
-        let model_info = get("/model_info");
+        let key = Some("sk-test");
+        let model_info = get("/model_info", key);
         assert!(model_info.starts_with("HTTP/1.1 200"), "{model_info}");
         assert!(model_info.contains("x-embedder: 1"), "{model_info}");
-        let embedded = get("/embedder");
+        let embedded = get("/embedder", key);
         assert!(embedded.starts_with("HTTP/1.1 200"), "{embedded}");
         assert!(embedded.ends_with("\r\n\r\nembedded"), "{embedded}");
 
+        for path in ["/model_info", "/embedder", "/no_such_route"] {
+            let response = get(path, None);
+            assert!(response.starts_with("HTTP/1.1 401"), "{path}: {response}");
+        }
+        let unknown = get("/no_such_route", key);
+        assert!(unknown.starts_with("HTTP/1.1 404"), "{unknown}");
+        let bootstrap = get("/route", None);
+        assert!(!bootstrap.starts_with("HTTP/1.1 401"), "{bootstrap}");
+
+        rt.request_shutdown();
+    }
+
+    /// `SGLANG_ENABLE_REQUEST_DECOMPRESSION` answers as Python's middleware
+    /// does. A body tagged `x-body-compressed: zstd` reaches an embedding
+    /// package's layer and every route decompressed, with the header dropped
+    /// and the content length fixed, and without a size cap; multiple frames
+    /// decode as one body, and an empty body stays empty. An unknown method, a corrupt payload or a frame
+    /// needing a window over libzstd's 128 MiB default is a plain-text 400
+    /// that reaches neither the layer nor the scheduler. Turned off, the
+    /// header is ignored.
+    #[test]
+    fn compressed_request_bodies_match_python_decompression() {
+        use std::io::{Read, Write};
+        use std::sync::Mutex;
+        use std::time::Duration;
+
+        fn http_request(
+            addr: std::net::SocketAddr,
+            path: &str,
+            compression: Option<&str>,
+            body: &[u8],
+        ) -> String {
+            let mut conn = std::net::TcpStream::connect(addr).expect("connect");
+            conn.set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let compression = compression
+                .map(|method| format!("x-body-compressed: {method}\r\n"))
+                .unwrap_or_default();
+            write!(
+                conn,
+                "POST {path} HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\n\
+                 {compression}Content-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            conn.write_all(body).unwrap();
+            let mut response = String::new();
+            conn.read_to_string(&mut response).unwrap();
+            response
+        }
+        // The status line and body: the `date` header can differ between two
+        // otherwise identical responses.
+        fn status_and_body(response: &str) -> (&str, &str) {
+            let (head, body) = response.split_once("\r\n\r\n").expect("response head");
+            (head.lines().next().unwrap_or_default(), body)
+        }
+        fn zstd_frames(body: &[u8], frames: usize, window_log: u32) -> Vec<u8> {
+            body.chunks(body.len().div_ceil(frames))
+                .flat_map(|chunk| {
+                    let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 3).unwrap();
+                    encoder
+                        .set_parameter(zstd::zstd_safe::CParameter::WindowLog(window_log))
+                        .unwrap();
+                    encoder.write_all(chunk).unwrap();
+                    encoder.finish().unwrap()
+                })
+                .collect()
+        }
+        let zstd = |body: &[u8]| zstd_frames(body, 1, 20);
+
+        // What the embedding package's layer read: path, whether the
+        // compression header was still set, content length, body.
+        type Seen = (String, bool, Option<String>, Vec<u8>);
+        let seen = Arc::new(Mutex::new(Vec::<Seen>::new()));
+        let recorder = seen.clone();
+        let layer: HttpLayer = Arc::new(move |app: axum::Router| {
+            let recorder = recorder.clone();
+            app.layer(axum::middleware::from_fn(
+                move |request: axum::extract::Request, next: axum::middleware::Next| {
+                    let recorder = recorder.clone();
+                    async move {
+                        let (parts, body) = request.into_parts();
+                        let body = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+                        recorder.lock().unwrap().push((
+                            parts.uri.path().to_owned(),
+                            parts.headers.contains_key("x-body-compressed"),
+                            parts
+                                .headers
+                                .get("content-length")
+                                .map(|value| value.to_str().unwrap().to_owned()),
+                            body.to_vec(),
+                        ));
+                        let request =
+                            axum::extract::Request::from_parts(parts, axum::body::Body::from(body));
+                        next.run(request).await
+                    }
+                },
+            ))
+        });
+        let (addr, _) = free_loopback_addrs();
+        let mut cfg = test_config(addr, None);
+        cfg.server_args = Arc::new(ServerArgs {
+            enable_request_decompression: true,
+            ..test_server_args()
+        });
+        let rt = start(cfg, Some(layer)).expect("start runtime");
+        take_startup_freeze_gc(&rt);
+
+        let generate =
+            br#"{"input_ids":[1,2,3],"stream":false,"sampling_params":{"max_new_tokens":8}}"#;
+        let compressed = zstd(generate);
+        let request =
+            std::thread::spawn(move || http_request(addr, "/generate", Some("zstd"), &compressed));
+        assert!(
+            rt.to_scheduler_rx.wait(Duration::from_secs(5)),
+            "the compressed request did not reach the scheduler ring"
+        );
+        let requests = rt.to_scheduler_rx.drain(1);
+        let input = requests[0]
+            .buffers
+            .iter()
+            .find(|buffer| buffer.name == "input_ids")
+            .expect("input token buffer");
+        assert_eq!(input.shape, vec![3]);
+        let rid = scheduler_rid(&requests[0].header);
+        assert!(
+            rt.from_scheduler_tx
+                .push(terminal_token_frame(rid, &[9, 10]))
+        );
+        let response = request.join().unwrap();
+        let (status, body) = status_and_body(&response);
+        assert_eq!(status, "HTTP/1.1 200 OK", "{response}");
+        assert!(body.contains(r#""output_ids":[9,10]"#), "{response}");
+        assert_eq!(
+            seen.lock().unwrap().pop(),
+            Some((
+                "/generate".to_owned(),
+                false,
+                Some(generate.len().to_string()),
+                generate.to_vec()
+            ))
+        );
+
+        // Each route answers a compressed body as it answers the plain one;
+        // the padded body inflates ~16 MiB from a few KiB.
+        let padded = format!(r#"{{"input_ids":[1],"text":"x"{}}}"#, " ".repeat(16 << 20));
+        for (path, plain) in [
+            ("/generate", br#"{"input_ids":[1],"text":"x"}"#.to_vec()),
+            ("/generate", padded.into_bytes()),
+            ("/v1/completions", b"{}".to_vec()),
+            ("/v1/chat/completions", b"{}".to_vec()),
+        ] {
+            let expected = http_request(addr, path, None, &plain);
+            assert!(
+                status_and_body(&expected).0.starts_with("HTTP/1.1 400"),
+                "{expected}"
+            );
+            for compressed in [zstd(&plain), zstd_frames(&plain, 2, 20)] {
+                let response = http_request(addr, path, Some("zstd"), &compressed);
+                assert_eq!(status_and_body(&response), status_and_body(&expected));
+                let (seen_path, still_compressed, _, seen_body) =
+                    seen.lock().unwrap().pop().unwrap();
+                assert_eq!(seen_path, path);
+                assert!(!still_compressed);
+                assert!(seen_body == plain, "{path}: the layer saw another body");
+            }
+        }
+        let empty = http_request(addr, "/generate", None, b"");
+        assert!(
+            status_and_body(&empty).0.starts_with("HTTP/1.1 400"),
+            "{empty}"
+        );
+        let tagged_empty = http_request(addr, "/generate", Some("zstd"), b"");
+        assert_eq!(status_and_body(&tagged_empty), status_and_body(&empty));
+
+        seen.lock().unwrap().clear();
+        let unsupported =
+            |method: &str| format!("unsupported x-body-compressed '{method}'; supported: ['zstd']");
+        for (method, body, message) in [
+            ("gzip", zstd(generate), unsupported("gzip")),
+            ("ZSTD", zstd(generate), unsupported("ZSTD")),
+            (
+                "zstd",
+                b"not-zstd-data".to_vec(),
+                "decompress failed".to_owned(),
+            ),
+            (
+                "zstd",
+                [zstd(generate), b"garbage".to_vec()].concat(),
+                "decompress failed".to_owned(),
+            ),
+            (
+                "zstd",
+                zstd_frames(generate, 1, 28),
+                "decompress failed".to_owned(),
+            ),
+        ] {
+            let response = http_request(addr, "/generate", Some(method), &body);
+            let (head, body) = response.split_once("\r\n\r\n").unwrap();
+            assert!(head.starts_with("HTTP/1.1 400"), "{response}");
+            assert!(
+                !head.to_ascii_lowercase().contains("content-type"),
+                "{response}"
+            );
+            assert_eq!(body, message);
+        }
+        assert!(seen.lock().unwrap().is_empty());
+        assert!(!rt.to_scheduler_rx.wait(Duration::from_millis(200)));
+        rt.request_shutdown();
+
+        let (addr, _) = free_loopback_addrs();
+        let rt = start(test_config(addr, None), None).expect("start runtime");
+        take_startup_freeze_gc(&rt);
+        let compressed = zstd(generate);
+        let tagged = http_request(addr, "/generate", Some("zstd"), &compressed);
+        let untagged = http_request(addr, "/generate", None, &compressed);
+        assert!(
+            status_and_body(&untagged).0.starts_with("HTTP/1.1 400"),
+            "{untagged}"
+        );
+        assert_eq!(status_and_body(&tagged), status_and_body(&untagged));
+        assert!(!rt.to_scheduler_rx.wait(Duration::from_millis(200)));
         rt.request_shutdown();
     }
 
@@ -813,6 +1857,8 @@ mod tests {
             },
             server_args: Arc::new(server_args),
             generate_hook: None,
+            generate_validator: None,
+            server_info_state_keys: Vec::new(),
         };
         let err = match start(cfg, None) {
             Ok(_) => panic!("bind conflict must fail startup, got Ok"),
@@ -846,6 +1892,71 @@ mod tests {
         drop(rebound);
     }
 
+    /// Answer the startup warmup request with a scheduler error.
+    fn fail_warmup(rt: &Runtime) {
+        assert!(
+            rt.to_scheduler_rx.wait(std::time::Duration::from_secs(5)),
+            "the startup warmup did not reach the scheduler ring"
+        );
+        let requests = rt.to_scheduler_rx.drain(1);
+        let rid = scheduler_rid(&requests[0].header);
+        assert!(
+            rt.from_scheduler_tx
+                .push(crate::message::response::frame_error(&rid, "warmup boom"))
+        );
+    }
+
+    /// A startup warmup the scheduler fails reaches `wait_startup_failure`,
+    /// which the launching process turns into Python's teardown; the health
+    /// endpoint never reports the server ready.
+    #[test]
+    fn failed_startup_warmup_is_reported() {
+        let (http_addr, _) = free_loopback_addrs();
+        let mut cfg = test_config(http_addr, None);
+        cfg.server_args = Arc::new(ServerArgs {
+            skip_server_warmup: false,
+            ..test_server_args()
+        });
+        let rt = start(cfg, None).expect("start runtime");
+        fail_warmup(&rt);
+        let failure = std::thread::scope(|scope| {
+            let waiter = scope.spawn(|| rt.wait_startup_failure());
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !waiter.is_finished() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            // Unblocks the wait if nothing was reported.
+            rt.request_shutdown();
+            waiter.join().unwrap()
+        });
+        let failure = failure.expect("a reported failure");
+        assert!(failure.contains("warmup boom"), "{failure}");
+        assert!(!rt.core.is_ready());
+    }
+
+    /// In PD mode a warmup the scheduler answers with an error leaves the
+    /// server up for the health probe to judge, as Python's does for a
+    /// non-200 warmup; nothing is reported, and shutdown ends the wait.
+    #[test]
+    fn failed_pd_startup_warmup_leaves_health_to_the_probe() {
+        let (http_addr, _) = free_loopback_addrs();
+        let mut cfg = test_config(http_addr, None);
+        cfg.server_args = Arc::new(ServerArgs {
+            skip_server_warmup: false,
+            disaggregation_mode: crate::message::config::DisaggregationMode::Decode,
+            ..test_server_args()
+        });
+        let rt = start(cfg, None).expect("start runtime");
+        fail_warmup(&rt);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !rt.core.is_ready() {
+            assert!(std::time::Instant::now() < deadline, "warmup never settled");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        rt.request_shutdown();
+        assert_eq!(rt.wait_startup_failure(), None);
+    }
+
     /// End to end over the configured socket: the generated api.v1 client
     /// reaches the existing scheduler ring, and an existing scheduler frame is
     /// translated back into a protobuf frame. Shutdown then closes both
@@ -856,6 +1967,7 @@ mod tests {
 
         let (http_addr, grpc_addr) = free_loopback_addrs();
         let rt = start(test_config(http_addr, Some(grpc_addr)), None).expect("start runtime");
+        take_startup_freeze_gc(&rt);
         assert!(std::net::TcpStream::connect(http_addr).is_ok());
 
         let client_runtime = tokio::runtime::Builder::new_current_thread()
@@ -921,14 +2033,21 @@ mod tests {
         use std::time::Duration;
 
         let (http_addr, grpc_addr) = free_loopback_addrs();
-        let rt = start(test_config(http_addr, Some(grpc_addr)), None).expect("start runtime");
+        // Attach needs a configured admin key.
+        let mut cfg = test_config(http_addr, Some(grpc_addr));
+        cfg.server_args = Arc::new(ServerArgs {
+            api_keys: crate::message::config::ApiKeys::new(None, Some("sk-admin".into())),
+            ..test_server_args()
+        });
+        let rt = start(cfg, None).expect("start runtime");
+        take_startup_freeze_gc(&rt);
         let request = std::thread::spawn(move || {
             let mut conn = std::net::TcpStream::connect(http_addr).unwrap();
             conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
             let body =
                 r#"{"hicache_storage_backend":"file","hicache_write_policy":"write_through"}"#;
             write!(conn,
-                "PUT /hicache/storage-backend HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()
+                "PUT /hicache/storage-backend HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer sk-admin\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()
             ).unwrap();
             let mut response = String::new();
             conn.read_to_string(&mut response).unwrap();
@@ -1032,6 +2151,7 @@ mod tests {
 
         let (http_addr, grpc_addr) = free_loopback_addrs();
         let rt = start(test_config(http_addr, Some(grpc_addr)), None).expect("start runtime");
+        take_startup_freeze_gc(&rt);
         let client_runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_all()

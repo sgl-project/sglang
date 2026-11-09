@@ -71,7 +71,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 register_cuda_ci(est_time=80, stage="base-b", runner_config="1-gpu-small")
 ```
 
-Parameters: `est_time` (seconds), `stage` + `runner_config` (target stage and runner pool from `scripts/ci/runner_configs.yml`), `nightly=True` (nightly-only), `disabled="reason"` (temporarily disable).
+Parameters: `est_time` (seconds), `stage` + `runner_config` (target stage and runner pool from `scripts/ci/runner_configs.yml`), `disabled="reason"` (temporarily disable).
 
 Keep `est_time`, `stage`, `runner_config` as **literal values** — `run_suite.py` collects them by AST parsing.
 
@@ -108,7 +108,7 @@ Use the lightest suite that meets your test's needs. Full suite tables are in th
 | JIT kernel correctness | `base-b-kernel-unit-test-1-gpu-large` |
 | JIT kernel benchmarks | `base-b-kernel-benchmark-test-1-gpu-large` |
 | Multi-GPU (2/4/8) | `base-b-test-2-gpu-large`, `base-c-test-*` |
-| Long-running or experimental | `nightly-*` suites |
+| Off the core default path | `extra-*`, `nightly-*`, or `weekly-*` suites; see [Choosing a Tier](../.claude/skills/write-sglang-test/SKILL.md#choosing-a-tier) |
 
 ## Steps for Adding a Test
 
@@ -139,7 +139,7 @@ This README mostly describes the NVIDIA GPU CI pipeline. Other hardware backends
 - Use as few GPUs as possible. Prefer 1-GPU runners.
 - Each test file should take < 500 seconds; split if longer.
 - Each GitHub Actions job should take < 30 minutes; split if longer.
-- If tests are too slow for per-commit, consider nightly suites.
+- If tests are too slow for per-commit, move them to a later tier ([Choosing a Tier](../.claude/skills/write-sglang-test/SKILL.md#choosing-a-tier)); `/rerun-test` still runs them on a PR.
 - New GSM8K or MMLU accuracy checks should use sgl-eval (`sglang.test.sgl_eval_utils.run_sgl_eval` or `sgl-eval run`) instead of adding another dataset or evaluator copy.
 
 ## Other Notes
