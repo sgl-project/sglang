@@ -9,8 +9,8 @@ import torch
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
 from sglang.srt.layers.attention.linear import gdn_backend
 from sglang.srt.layers.attention.linear.gdn_backend import build_gdn_mis_metadata
-from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.layers.pooler import pool_at_delimiter_positions
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
