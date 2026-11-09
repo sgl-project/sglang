@@ -521,6 +521,12 @@ class Envs:
     # Timing probe: run the swap-in fully but skip the host->device KV bytes,
     # measuring the "IO is free" floor. GARBAGE OUTPUT -- benchmarking only.
     SGLANG_DEBUG_HISPARSE_SKIP_IO = EnvBool(False)
+    # Keep the full GPU K/V pool next to the QSA K/V offload and compare the
+    # offloaded K/V every attention reads with the pool's, bit for bit.
+    SGLANG_DEBUG_QSA_KV_OFFLOAD_VERIFY = EnvBool(False)
+    # Use the eager torch reference resolve of the QSA K/V offload instead of
+    # the fused one (A/B and debugging; needs --disable-cuda-graph).
+    SGLANG_USE_QSA_KV_OFFLOAD_TORCH_RESOLVE = EnvBool(False)
     # Master switch for all async-asserted invariant probes (NaN, Inf, OOB,
     # page alignment). Off in prod; tests turn it on to fail-fast on
     # numerical / index violations instead of getting silent NaN cascades.

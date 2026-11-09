@@ -376,6 +376,61 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     draft_cell_size_per_token=_dflash_draft_cell_size(kvc) or None,
                 )
 
+        self._qsa_kv_offload = None
+        if get_memory().enable_qsa_kv_offload and not kvc.is_draft_worker:
+            self._qsa_kv_offload = self._qsa_kv_offload_budget(kvc, num_layers)
+
+    @staticmethod
+    def _qsa_kv_offload_budget(kvc: KVCacheConfigurator, num_layers: int):
+        """GPU and host cost model of the QSA K/V offload of this worker."""
+        from sglang.srt.mem_cache.qsa_kv_offload import (
+            QSAKVOffloadBudget,
+            offload_layout_from_config,
+            offload_table_bytes_per_slot,
+        )
+
+        model_config = kvc.model_config
+        kv_heads = model_config.get_num_kv_heads(
+            get_parallel().attn_tp_size, get_parallel().attn_dcp_size
+        )
+        page_size = get_schedule().page_size
+        layout = offload_layout_from_config(
+            hf_config=model_config.hf_config, num_request_slots=1, page_size=page_size
+        )
+        return QSAKVOffloadBudget(
+            offloaded_bytes_per_token=kv_heads
+            * (model_config.head_dim + model_config.v_head_dim)
+            * num_layers
+            * torch._utils._element_size(kvc.kv_cache_dtype),
+            region_rows=layout.region_rows,
+            fixed_rows=layout.scratch_rows + page_size,
+            table_bytes_per_slot=offload_table_bytes_per_slot(
+                num_layers=num_layers,
+                hot_blocks=layout.hot_blocks,
+                compress_ratio=layout.compress_ratio,
+                context_len=model_config.context_len + page_size,
+            ),
+            host_size_gb=get_memory().qsa_kv_offload_host_size,
+            page_size=page_size,
+            verify=envs.SGLANG_DEBUG_QSA_KV_OFFLOAD_VERIFY.get(),
+        )
+
+    def finalize_with_max_running_requests(
+        self, config: MemoryPoolConfig
+    ) -> MemoryPoolConfig:
+        if self._qsa_kv_offload is None or config.max_running_requests is None:
+            return config
+        # Sized for --max-running-requests; the request pool may get fewer
+        # slots (e.g. the mamba state cap), whose hot rows then hold tokens.
+        unused = get_schedule().max_running_requests - config.max_running_requests
+        if unused > 0 and get_schedule().max_total_tokens is None:
+            config.max_total_num_tokens = self._qsa_kv_offload.tokens_with_unused_slots(
+                max_total_tokens=config.max_total_num_tokens,
+                cell_bytes=self._cell_size,
+                unused_slots=unused,
+            )
+        return config
+
     def _compute_cell_size(
         self,
         kvc: KVCacheConfigurator,
@@ -711,6 +766,14 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
         available_bytes = max(available_bytes - self._fixed_overhead_bytes, 0)
+        if self._qsa_kv_offload is not None:
+            return MemoryPoolConfig(
+                max_total_num_tokens=self._qsa_kv_offload.max_total_tokens(
+                    available_bytes=available_bytes,
+                    cell_bytes=self._cell_size,
+                    num_request_slots=get_schedule().max_running_requests + 1,
+                )
+            )
         max_total_num_tokens = (
             available_bytes // self._cell_size
             if self._cell_size

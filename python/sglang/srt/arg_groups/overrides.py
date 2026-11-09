@@ -1394,6 +1394,15 @@ def _hisparse_validation(view: Any) -> dict:
 
 
 @register_post_process
+def _qsa_kv_offload_validation(view: Any) -> dict:
+    """Read-only validation pass: --enable-qsa-kv-offload constraints."""
+    from sglang.srt.arg_groups.qsa_kv_offload_hook import validate_qsa_kv_offload
+
+    validate_qsa_kv_offload(view)
+    return {}
+
+
+@register_post_process
 def _cutedsl_prefill_backend_fill(view: Any) -> dict:
     """Validate decode-only CuteDSL MLA and default its prefill backend to trtllm_mla."""
     if not (
