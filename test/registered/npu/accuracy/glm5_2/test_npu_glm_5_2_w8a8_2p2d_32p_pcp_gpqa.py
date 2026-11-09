@@ -143,7 +143,7 @@ GLM_5_2_PCP_PD_SEP_DECODE_ARGS = [
     "--mem-fraction-static",
     0.88,
     "--max-running-requests",
-    32,
+    48,
     "--attention-backend",
     "ascend",
     "--device",
@@ -162,7 +162,7 @@ GLM_5_2_PCP_PD_SEP_DECODE_ARGS = [
     "--deepep-mode",
     "low_latency",
     "--cuda-graph-max-bs-decode",
-    4,
+    8,
     "--disaggregation-transfer-backend",
     "ascend",
     "--watchdog-timeout",
@@ -223,7 +223,7 @@ class TestNPUGLM5_2_W8A8_2P2D_PCP_GPQA(TestNpuAccuracyMultiNodePdSepTestCaseBase
             "system_prompt": "Your response should be in the following format:\nExplanation: {your explanation for your final answer}\nExact Answer: {your succinct, final answer}\nConfidence: {your confidence score between 0% and 100% for your answer}.",
         }
     }
-    eval_batch_size = 32
+    eval_batch_size = 48
     generation_config = {
         "max_tokens": 131072,
         "temperature": 1.0,
