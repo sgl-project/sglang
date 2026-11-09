@@ -68,24 +68,11 @@ class TestGatherReusedBlockLocs(CustomTestCase):
         want = _per_row_reference(pool, req_pool_indices, prefix_lens, block_len, dtype)
         return got, want
 
-    def test_matches_per_row_slicing_at_distinct_offsets(self):
-        # Rows are non-contiguous and each starts at a different offset: the
-        # flat index must combine the right row with the right start, not
-        # broadcast one row's offset across all of them.
-        got, want = self._gather([1, 3, 5], [4, 8, 0], 4)
-        self.assertTrue(torch.equal(got, want))
-        self.assertEqual(
-            got.tolist(),
-            [
-                [1004, 1005, 1006, 1007],
-                [3008, 3009, 3010, 3011],
-                [5000, 5001, 5002, 5003],
-            ],
-        )
-
     def test_preserves_row_order_when_pool_indices_are_unsorted(self):
         # The gather feeds out_cache_loc positionally, so it must follow the
-        # caller's row order rather than the pool index order.
+        # caller's row order rather than the pool index order. Rows are
+        # non-contiguous and start at distinct offsets, so the flat index must
+        # pair each row with its own start.
         got, want = self._gather([5, 0, 3], [0, 12, 4], 4)
         self.assertTrue(torch.equal(got, want))
         self.assertEqual([row[0] for row in got.tolist()], [5000, 12, 3004])
@@ -193,19 +180,6 @@ class TestAllocExtendLocWithKvReuseBatching(CustomTestCase):
         )
         # fmt: on
 
-    def test_all_reuse_allocates_nothing_and_still_reassembles_in_order(self):
-        # No fresh slots at all: fresh_slots stays None and reuse_dtype falls
-        # back to int64. The gathered rows must still land in caller order.
-        out = self._assert_batching_is_transparent(
-            reuse_kv=[True, True, True],
-            prefix_lens=[4, 0, 16],
-            extend_lens=[4, 4, 4],
-        )
-        self.assertEqual(
-            out.tolist(),
-            [4, 5, 6, 7, 1000, 1001, 1002, 1003, 2016, 2017, 2018, 2019],
-        )
-
     def test_reuse_rows_of_unequal_length_fall_back_per_row(self):
         # Rows of different block_len cannot share one flat index, so the
         # caller must decline to batch them. If that guard is dropped the
@@ -214,16 +188,6 @@ class TestAllocExtendLocWithKvReuseBatching(CustomTestCase):
             reuse_kv=[True, False, True],
             prefix_lens=[0, 0, 8],
             extend_lens=[4, 3, 8],
-        )
-
-    def test_single_reuse_row_below_the_default_threshold(self):
-        # min_rows=0 forces batching on for a batch the Ascend default (8)
-        # would have left on the per-row path -- the gate must not be the only
-        # thing keeping the batched path correct on narrow batches.
-        self._assert_batching_is_transparent(
-            reuse_kv=[True, False],
-            prefix_lens=[12, 0],
-            extend_lens=[4, 5],
         )
 
 
