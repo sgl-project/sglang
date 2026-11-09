@@ -100,6 +100,19 @@ def wait_landed() -> None:
         _PENDING.pop(key, None)
 
 
+def order_current_stream_after_pending() -> None:
+    """wait_landed's device-side twin, for a device read of host rows: the current stream waits on
+    every copy acknowledged on submit that has not landed; the host never waits."""
+    if not _PENDING:
+        return
+    stream = torch.cuda.current_stream()
+    for key, event in list(_PENDING.items()):
+        if event.query():
+            _PENDING.pop(key, None)
+        else:
+            stream.wait_event(event)
+
+
 def pin_indices(host_indices: torch.Tensor) -> torch.Tensor:
     """Pageable CPU host indices staged through pinned memory, so their copy to the device is
     only enqueued (a pageable one waits for the stream, which is fenced on the forward)."""

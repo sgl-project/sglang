@@ -56,6 +56,21 @@ if TYPE_CHECKING:
     from sglang.srt.layers.attention.verify_mask import VerifyMask
 
 logger = logging.getLogger(__name__)
+
+_device_track_bound_logged = False
+
+
+def _log_device_track_bound_once(rows: int) -> None:
+    global _device_track_bound_logged
+    if not _device_track_bound_logged:
+        _device_track_bound_logged = True
+        logger.info(
+            "Prefill conv-state track indices: bounded on the device, no host read "
+            "(first tracked extend: %d rows)",
+            rows,
+        )
+# SGLANG_GDN_PREFILL_SYNC_FREE_METADATA (default off): the track bound above, on the device.
+_sync_free_prefill_metadata = envs.SGLANG_GDN_PREFILL_SYNC_FREE_METADATA.get()
 _validate_mamba_replay_state_indices = (
     envs.SGLANG_VALIDATE_MAMBA_REPLAY_STATE_INDICES.get()
 )
@@ -462,6 +477,11 @@ class MambaAttnBackendBase(AttentionBackend):
             dtype=start_indices.dtype,
         )
 
+        if _sync_free_prefill_metadata:
+            # clamp(0, <0-d CUDA tensor>) resolves to the Scalar overload, a D2H read and stream sync;
+            # min(max(x, 0), total - 1) is clamp's own definition, computed on the device.
+            _log_device_track_bound_once(rows=indices.shape[0])
+            return torch.minimum(indices.clamp_(min=0), query_start_loc[-1] - 1)
         return indices.clamp(0, query_start_loc[-1] - 1)
 
     def _init_track_ssm_indices(

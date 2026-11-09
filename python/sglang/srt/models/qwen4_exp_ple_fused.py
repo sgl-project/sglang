@@ -19,6 +19,17 @@ whose padded stock input is not 32-bit indexable keeps the stock code (stock F.c
 hands that shape to cuDNN), as does every non-EXTEND/MIXED pass, stream capture,
 non-CUDA tensors and host lengths that disagree with the pass.
 
+``SGLANG_PLE_FUSED_EXTEND_CONV_CUDNN_SHAPES=1`` (default off; only with the switch above):
+the fused conv also takes those cuDNN-shape passes when they hold at most 16 sequences and
+the longest is at most 32768 tokens. Stock there materializes the padded input three times
+(``new_zeros`` [B, W, C], the ``cat`` [B, C, S + W] and the conv output [B, C, W]: 22.8 GiB
+for 15 sequences with a 26,606-token longest at C 10240), which is the prefill OOM this
+removes; the fused path needs the [T, C] rows. Over that envelope, cuDNN's conv
+(``conv2d_grouped_direct_kernel``, torch 2.15.0+cu134 / cuDNN 9.26) was measured byte-equal
+to the native kernel's forward tap order on crafted tap-order, random, signed-zero and
+subnormal data, and this kernel computes that order, so the outputs are stock's bytes.
+Passes outside the envelope keep the stock code, as without the switch.
+
 It logs one INFO line the first time it engages (logger
 ``sglang.srt.models.qwen4_exp_ple_fused``) and one per decline reason.
 """
@@ -42,13 +53,23 @@ def _flag(name: str) -> bool:
 
 CONV_ENV = "SGLANG_PLE_FUSED_EXTEND_CONV"
 CONV_ENABLED = _flag(CONV_ENV)
+CUDNN_SHAPES_ENV = "SGLANG_PLE_FUSED_EXTEND_CONV_CUDNN_SHAPES"
+CUDNN_SHAPES_ENABLED = _flag(CUDNN_SHAPES_ENV)
 
 
 # ATen canUse32BitIndexMath on a contiguous tensor: numel < INT32_MAX.
 _INT32_MAX = 2**31 - 1
 _MAX_STATE_LEN = 16
+# The cuDNN-shape envelope whose stock bytes were measured equal to the forward tap order.
+_CUDNN_SHAPES_MAX_SEQS = 16
+_CUDNN_SHAPES_MAX_ROW = 32768
 
-STATS = {"conv_fused": 0, "conv_declined": 0, "conv_stock_cudnn_shape": 0}
+STATS = {
+    "conv_fused": 0,
+    "conv_declined": 0,
+    "conv_stock_cudnn_shape": 0,
+    "conv_fused_cudnn_shape": 0,
+}
 _noted = set()
 
 
@@ -130,14 +151,38 @@ def conv_engages(
         )
         return False
     if not native_depthwise(num_seqs, channels, state_len + batch.row_width):
-        STATS["conv_stock_cudnn_shape"] += 1
+        if not CUDNN_SHAPES_ENABLED:
+            STATS["conv_stock_cudnn_shape"] += 1
+            _note_once(
+                "conv-cudnn",
+                "%s: kept stock for a pass stock F.conv1d hands to cuDNN "
+                "(seqs=%d tokens=%d longest=%d); later such passes are counted only",
+                CONV_ENV, num_seqs, tokens, batch.row_width,
+            )
+            return False
+        if (
+            num_seqs > _CUDNN_SHAPES_MAX_SEQS
+            or batch.row_width > _CUDNN_SHAPES_MAX_ROW
+        ):
+            STATS["conv_stock_cudnn_shape"] += 1
+            _note_once(
+                "conv-cudnn-outside",
+                "%s: kept stock for a pass stock F.conv1d hands to cuDNN outside the "
+                "envelope (seqs=%d tokens=%d longest=%d; envelope seqs <= %d, longest "
+                "<= %d); later such passes are counted only",
+                CUDNN_SHAPES_ENV, num_seqs, tokens, batch.row_width,
+                _CUDNN_SHAPES_MAX_SEQS, _CUDNN_SHAPES_MAX_ROW,
+            )
+            return False
+        STATS["conv_fused_cudnn_shape"] += 1
         _note_once(
-            "conv-cudnn",
-            "%s: kept stock for a pass stock F.conv1d hands to cuDNN "
-            "(seqs=%d tokens=%d longest=%d); later such passes are counted only",
-            CONV_ENV, num_seqs, tokens, batch.row_width,
+            "conv-cudnn-fused",
+            "%s: fused a pass stock F.conv1d hands to cuDNN (seqs=%d tokens=%d "
+            "longest=%d; stock's padded temporaries about %.2f GiB); later such passes "
+            "are counted only",
+            CUDNN_SHAPES_ENV, num_seqs, tokens, batch.row_width,
+            num_seqs * (3 * batch.row_width + state_len) * channels * 2 / 2**30,
         )
-        return False
     STATS["conv_fused"] += 1
     _note_once(
         "conv-on",

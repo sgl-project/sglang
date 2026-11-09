@@ -1402,6 +1402,9 @@ class FlashInferTrtllmFp4MoeQuantInfo(MoeQuantInfo):
     gemm1_alpha: Optional[torch.Tensor] = None
     gemm1_beta: Optional[torch.Tensor] = None
     gemm1_clamp_limit: Optional[torch.Tensor] = None
+    # nvfp4_cute_prefill.CutePrefillWeights when the layer's experts are in the CuTe-DSL layout
+    # (SGLANG_QWEN_MOE_PREFILL_CUTE_RUBIN); the trtllm-gen fields then hold no trtllm-gen weights.
+    cute_prefill: Optional[NamedTuple] = None
 
 
 def quantize_hidden_states_fp4(
@@ -1488,6 +1491,15 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         f"Only {_SUPPORTED_FP4_ACTIVATIONS} are supported for FP4 MoE, "
         f"got '{runner_config.activation}'."
     )
+
+    if quant_info.cute_prefill is not None:
+        from sglang.srt.layers.moe.moe_runner.nvfp4_cute_prefill import (
+            run_routed_experts,
+        )
+
+        return StandardCombineInput(
+            hidden_states=run_routed_experts(dispatch_output, quant_info)
+        )
 
     hidden_states = dispatch_output.hidden_states
     topk_output = dispatch_output.topk_output
