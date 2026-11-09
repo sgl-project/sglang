@@ -234,6 +234,55 @@ class TestPagedAttentionOutputGateFallback(CustomTestCase):
                 )
             )
 
+    def _aiter_backend_stub(self, *, page_table: bool, kv_indices_dim: int):
+        """An AiterAttnBackend that reaches the metadata checks.
+
+        Built without __init__, which needs a live ModelRunner. Only the fields
+        the op reads before its metadata checks are set; anything later would
+        raise, so a test that passes proves the op declined before them.
+        """
+        from types import SimpleNamespace
+
+        from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
+
+        backend = AiterAttnBackend.__new__(AiterAttnBackend)
+        backend.page_size = 1
+        backend.use_mla = False
+        backend.decode_uses_page_table = page_table
+        shape = (4,) if kv_indices_dim == 1 else (2, 4)
+        backend.forward_metadata = SimpleNamespace(
+            kv_indptr=torch.zeros(3, dtype=torch.int32),
+            kv_indices=torch.zeros(shape, dtype=torch.int32),
+        )
+        return backend
+
+    def _decline_with(self, backend):
+        from sglang.srt.model_executor.forward_context import (
+            ForwardContext,
+            forward_context,
+        )
+
+        with forward_context(ForwardContext(attn_backend=backend)):
+            return fused_gated_decode_attention(
+                None, None, None, None, torch.zeros(1, 1024), _ForwardBatch()
+            )
+
+    @unittest.skipUnless(_have_op(), "needs the aiter op and the ROCm backend")
+    def test_page_table_decode(self):
+        """Unified attention and the 5D pool fill kv_indptr but hand decode a
+        2-D (bs, max_kv_len) page table. Reading that as a flat slot list gives
+        wrong attention for every row after the first, so the op must decline
+        and leave those modes on their own decode kernel."""
+        backend = self._aiter_backend_stub(page_table=True, kv_indices_dim=2)
+        self.assertIsNone(self._decline_with(backend))
+
+    @unittest.skipUnless(_have_op(), "needs the aiter op and the ROCm backend")
+    def test_non_flat_kv_indices(self):
+        """Second line of defence: a 2-D kv_indices declines even if a future
+        mode builds one without setting decode_uses_page_table."""
+        backend = self._aiter_backend_stub(page_table=False, kv_indices_dim=2)
+        self.assertIsNone(self._decline_with(backend))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -27,8 +27,9 @@ Scope and non-scope
 
 Availability
 ------------
-The op is newer than the aiter versions SGLang currently pins, so it is
-imported lazily and its absence is a fallback, not an error. The op also
+The op landed in aiter via ROCm/aiter#5715. It is still imported lazily, so an
+aiter build without it -- an older pin, or a custom image -- falls back to the
+stock path instead of failing to import. The op also
 self-describes what it can handle via
 ``paged_attention_output_gate_supported``; anything it declines takes the stock
 path. Both the bind and the decline are logged once, because a fused path that
@@ -169,8 +170,23 @@ def fused_gated_decode_attention(
             f"use_mla={backend.use_mla}; keeping the unfused decode path",
         )
         return None
+    # unified_attention and the SHUFFLE 5D pool build decode kv_indices as a
+    # 2-D (bs, max_kv_len) page table while still filling kv_indptr. The op
+    # reads kv_indices as the flat per-token list addressed through kv_indptr,
+    # so it must not engage there: it would read the wrong slots for every row
+    # after the first. Those modes also select a different decode kernel on
+    # purpose, which this keeps.
+    if getattr(backend, "decode_uses_page_table", False):
+        _log_once(
+            "page_table",
+            "paged_attention_output_gate: decode uses a page table "
+            "(unified attention or 5D KV pool); keeping that decode path",
+        )
+        return None
     metadata = backend.forward_metadata
     if metadata.kv_indptr is None or metadata.kv_indices is None:
+        return None
+    if metadata.kv_indices.dim() != 1:
         return None
 
     pool = backend.token_to_kv_pool
@@ -205,7 +221,12 @@ def fused_gated_decode_attention(
     )
 
     # 1. What RadixAttention.forward would have done for us.
-    backend.save_kv_cache(layer, forward_batch, k, v)
+    backend.save_kv_cache(
+        layer,
+        forward_batch,
+        k.view(-1, layer.tp_k_head_num, layer.qk_head_dim),
+        v.view(-1, layer.tp_v_head_num, layer.v_head_dim),
+    )
 
     # 2. Attention + sigmoid gate, fused.
     #    max_context is the deployment's real context limit, not a bucket: the
