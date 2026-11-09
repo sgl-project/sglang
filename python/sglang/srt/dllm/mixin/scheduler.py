@@ -398,6 +398,16 @@ class SchedulerDllmMixin:
         capacity. A mixed round must not swallow that signal — a caller that
         watches for capacity-refused zero-admission rounds has to see them
         whichever round shape was built.
+
+        ``dllm_num_mixed_rounds`` is counted here, at composition, because
+        only this composer can put both phases in one round on purpose. An
+        either/or round can also end up two-phased — ``determine_dllm_phase``
+        flips an incoming prefill row to STAGING_DECODE during admission when
+        the cached prefix covers its first blocks — but that is cache luck,
+        not scheduling, so counting by phases at ``_update_state_for_batch``
+        made the flags-off counter flaky. Counting here keeps the flags-off
+        counter structurally zero and the flags-on counter a statement about
+        what this composer built.
         """
         reqs = self.dllm_manager.waiting_queue
 
@@ -405,11 +415,12 @@ class SchedulerDllmMixin:
         staging_reqs = [req for req in reqs if req.dllm_phase in _DLLM_STAGING_PHASES]
         if staging_reqs:
             staging_result = self.process_dllm_staging_reqs(adder, staging_reqs)
-            if staging_result != AddReqResult.CONTINUE:
-                return staging_result
 
+        # A refused staging row stalls the round shape: skip the incoming pass
+        # (as the either/or path does), but still count what was admitted — a
+        # staging-only round can already carry both phases.
         incoming_reqs = [req for req in reqs if req.dllm_phase in _DLLM_INCOMING_PHASES]
-        if incoming_reqs:
+        if staging_result == AddReqResult.CONTINUE and incoming_reqs:
             # The sibling admission gate charges can_run_list against the free
             # slot pool plus the rows its requests already hold, so the staging
             # rows carried here do not starve the incoming ones. Its preemption
@@ -422,6 +433,13 @@ class SchedulerDllmMixin:
                 # A capacity-refused incoming row stalls the same way a
                 # refused staging row does; report it identically.
                 staging_result = incoming_result
+
+        # Phases are final once admission ends (nothing re-derives them before
+        # the forward), so this sees exactly the round that will run. An empty
+        # or single-phase admission counts nothing.
+        num_prefill_rows = sum(req.is_dllm_prefill() for req in adder.can_run_list)
+        if 0 < num_prefill_rows < len(adder.can_run_list):
+            self.dllm_num_mixed_rounds += 1
         return staging_result
 
     def _process_batch_by_phase(
@@ -456,9 +474,10 @@ class SchedulerDllmMixin:
 
         if can_run_list:
             self.dllm_num_rounds += 1
-            num_prefill_rows = sum(req.is_dllm_prefill() for req in can_run_list)
-            if 0 < num_prefill_rows < len(can_run_list):
-                self.dllm_num_mixed_rounds += 1
+            # dllm_num_mixed_rounds is counted in _process_dllm_batches_mixed,
+            # at composition: an either/or round can carry a phase-flipped row
+            # (cached prefix turned an incoming prefill into STAGING_DECODE),
+            # which is not a round the mixed scheduler composed.
 
     def _create_dllm_batch(
         self: Scheduler,

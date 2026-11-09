@@ -36,7 +36,10 @@ def assert_mixed_rounds(test, expected: bool):
     ``dllm_mixed_batch_enabled`` is a startup constant: a server that resolved
     it to True but never put a prefill row and a decode row in the same round
     would satisfy it identically. ``dllm_num_mixed_rounds`` counts the rounds
-    whose can_run_list held both phases, so it separates the two. Call this
+    the mixed composer (``_process_dllm_batches_mixed``) built with both
+    phases admitted, so it separates the two -- and it is structurally zero
+    with the flag off, where only the either/or path composes rounds (a
+    cache-hit phase flip inside an either/or round does not count). Call this
     after traffic has flowed -- on an idle server every counter is 0.
     """
     states = requests.get(test.base_url + "/server_info").json()["internal_states"]
