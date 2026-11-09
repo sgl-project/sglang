@@ -1,7 +1,9 @@
 import unittest
+from unittest import mock
 
 import torch
 
+from sglang.kernels.ops.attention import triton_gdn_fused_proj
 from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
     can_use_fused_qkvzba_causal_conv1d_update_contiguous,
     fused_qkvzba_causal_conv1d_update_contiguous,
@@ -12,9 +14,10 @@ from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
 # CUDA; the presence of the optional sgl_kernel AOT extension does not reroute
 # GDN decode through srt.layers.attention.mamba.causal_conv1d.
 from sglang.kernels.ops.mamba.causal_conv1d_triton import causal_conv1d_update
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=7, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_amd_ci(est_time=30, stage="jit-kernel-unit", runner_config="amd")
 
 
 def _reference(
