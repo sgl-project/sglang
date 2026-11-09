@@ -6263,9 +6263,10 @@ class Scheduler(
         self, running_batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
     ) -> None:
         """Retract the requests of `running_batch`, of `last_batch` when it is a
-        prefill not merged into it yet, and the chunked request, none of them in
-        flight. PD decode also retracts the waiting requests that hold KV; PD
-        prefill keeps the chunked request and a prefill already handed to transfer."""
+        prefill not merged into it yet, the chunked request, and the queued
+        requests that hold KV (HiSparse staging, dLLM), none of them in flight.
+        PD decode also retracts the waiting requests that hold KV; PD prefill
+        keeps the chunked request and a prefill already handed to transfer."""
         retract_reqs = [r for r in running_batch.reqs if not r.finished()]
         if (
             last_batch is not None
@@ -6279,7 +6280,13 @@ class Scheduler(
             # calls update_running_batch to clean them up.
             and self.disaggregation_mode != DisaggregationMode.PREFILL
         ):
-            retract_reqs += [r for r in last_batch.reqs if not r.finished()]
+            retract_reqs += [
+                r
+                for r in last_batch.reqs
+                # Under PP an earlier micro-batch's retract may have taken it,
+                # as the chunked or a staged request.
+                if not r.finished() and not r.is_retracted
+            ]
 
         if (
             self.chunked_req is not None
@@ -6288,6 +6295,24 @@ class Scheduler(
             and self.disaggregation_mode != DisaggregationMode.PREFILL
         ):
             retract_reqs.append(self.chunked_req)
+
+        if self.hisparse_coordinator is not None:
+            # A prefilled request waits in staging for its host copy, and only a
+            # running loop moves it on. Take the whole queue so TP ranks agree.
+            retract_reqs += [
+                r
+                for r in self.hisparse_coordinator.ack_staging_queue
+                if r not in retract_reqs
+            ]
+
+        if self.dllm_config is not None:
+            # A dLLM request keeps its row between rounds, also one left out of
+            # the last round.
+            retract_reqs += [
+                r
+                for r in self.dllm_manager.waiting_queue
+                if not r.finished() and r.kv.holds_kv and r not in retract_reqs
+            ]
 
         if self.disaggregation_mode == DisaggregationMode.DECODE:
             # Transferred requests wait for a slot holding their row and KV;
@@ -6313,6 +6338,9 @@ class Scheduler(
         # Under PP the other micro-batches keep running.
         self.running_reqs.leave(retract_reqs)
         self.prefill_launched_reqs.leave(retract_reqs)
+        if self.dllm_config is not None:
+            # Retracted dLLM requests are still queued in the dLLM lists.
+            self.dllm_manager.leave(retract_reqs)
         for req in retract_reqs:
             if req in reqs_to_abort:
                 # retract_all recorded the reason and freed any member rows.
@@ -6490,6 +6518,10 @@ class Scheduler(
     ) -> UnloadLoRAAdapterReqOutput:
         """Unload the lora adapter."""
 
+        if self.enable_overlap or get_parallel().pp_size > 1:
+            # The unload zeroes the adapter's pool slot on this stream; a step
+            # launched before this request may still run that adapter.
+            self.schedule_stream.wait_stream(self.forward_stream)
         result = self.tp_worker.unload_lora_adapter(recv_req)
         return result
 

@@ -1510,11 +1510,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
             if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
-                if not getattr(decode_req.req, "finished_output", False):
-                    self.scheduler.output_streamer.stream_output(
-                        [decode_req.req],
-                        decode_req.req.return_logprob,
-                    )
+                self.scheduler.output_streamer.stream_output(
+                    [decode_req.req],
+                    decode_req.req.return_logprob,
+                )
                 decode_req.kv_receiver.clear()
                 decode_req.kv_receiver = None
                 failed_reqs.append(decode_req)

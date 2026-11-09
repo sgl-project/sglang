@@ -103,7 +103,7 @@ class RequestRetirer:
     def retract(self, req: Req, *, offload_kv: bool) -> bool:
         """Release a retracted request's memory uncheckpointed; return whether it can resume."""
         if req.kv.holds_kv and self.hisparse_coordinator is not None:
-            self.hisparse_coordinator.retract_req(req)
+            self.hisparse_coordinator.request_finished(req)
 
         # PD decode backs the KV up to host to restore it without recompute; a caller
         # that will rebootstrap passes offload_kv=False to skip the copy.

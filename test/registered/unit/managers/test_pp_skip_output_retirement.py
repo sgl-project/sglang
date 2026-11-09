@@ -6,7 +6,9 @@ done event (the scheduler's current stream does not follow the local forward),
 and a prebuilt step's inner idle forward.
 """
 
+import contextlib
 import unittest
+from collections import deque
 from types import SimpleNamespace
 from unittest import mock
 
@@ -15,6 +17,7 @@ from sglang.srt.managers.scheduler_pp_mixin import PPBatchMetadata, SchedulerPPM
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.kv.alloc.forward_steps import ForwardLaunch
 from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -54,6 +57,14 @@ class _Device:
     def current_stream(self):
         return self.current
 
+    @contextlib.contextmanager
+    def stream(self, stream):
+        outer, self.current = self.current, stream
+        try:
+            yield
+        finally:
+            self.current = outer
+
 
 class _Stage(SchedulerPPMixin):
     def __init__(self):
@@ -65,15 +76,41 @@ def _batch():
     return SimpleNamespace(reqs=[object(), object()])
 
 
+def _launch(stage, forward_result):
+    """Launch one microbatch on a forward stream and return its metadata."""
+    forward_stream = _Stream("forward")
+    stage.forward_stream_ctx = stage.device_module.stream(forward_stream)
+    stage._pp_wait_forward_dependencies = lambda: None
+    stage.run_batch = lambda batch, pp_proxy_tensors: forward_result
+    stage.pp_group = SimpleNamespace(is_last_rank=False)
+    batch = SimpleNamespace(reqs=[], spec_algorithm=SpeculativeAlgorithm.NONE)
+    mb_metadata = [None]
+    stage._pp_launch_batch(0, batch, None, mb_metadata, deque())
+    return forward_stream, mb_metadata[0]
+
+
+def _forward_result(unified_forward_done=None):
+    return SimpleNamespace(
+        can_run_cuda_graph=False,
+        spec_verify_out_cache_loc=None,
+        fpm_timing=None,
+        forward_launch=None,
+        unified_forward_done=unified_forward_done,
+    )
+
+
 class TestSkippedOutputRetirement(CustomTestCase):
     def test_completion_follows_the_local_forward(self):
         stage = _Stage()
+        unified_forward_done = object()
         forward_done = object()
         meta = PPBatchMetadata(
-            can_run_cuda_graph=False, unified_forward_done=forward_done
+            can_run_cuda_graph=False,
+            unified_forward_done=unified_forward_done,
+            forward_done=forward_done,
         )
         _, result, completion = stage._pp_make_skip_output_result(_batch(), meta)
-        self.assertIs(result.unified_forward_done, forward_done)
+        self.assertIs(result.unified_forward_done, unified_forward_done)
         self.assertIsNot(completion.stream, stage.device_module.current)
         self.assertEqual(completion.stream.waited, [forward_done])
         # The scheduler's own stream takes no dependency on the forward.
@@ -83,16 +120,18 @@ class TestSkippedOutputRetirement(CustomTestCase):
         self.assertIs(again.stream, completion.stream)
         self.assertEqual(len(stage.device_module.made), 1)
 
-    def test_without_the_unified_pool_nothing_changes(self):
+    def test_completion_follows_the_forward_without_the_unified_pool(self):
+        """The launch records the microbatch's forward end whatever the pool, so
+        the skipped output's completion follows that forward, not the current
+        stream."""
         stage = _Stage()
-        for meta in (PPBatchMetadata(can_run_cuda_graph=False), None):
-            with self.subTest(meta=meta):
-                _, result, completion = stage._pp_make_skip_output_result(
-                    _batch(), meta
-                )
-                self.assertIsNone(result.unified_forward_done)
-                self.assertIs(completion.stream, stage.device_module.current)
-                self.assertEqual(stage.device_module.made, [])
+        forward_stream, meta = _launch(stage, _forward_result())
+        _, result, completion = stage._pp_make_skip_output_result(_batch(), meta)
+        self.assertIsNone(result.unified_forward_done)
+        self.assertIsNot(completion.stream, stage.device_module.current)
+        (forward_done,) = completion.stream.waited
+        self.assertIs(forward_done.stream, forward_stream)
+        self.assertEqual(stage.device_module.current.waited, [])
 
 
 class TestPrebuiltInnerForward(CustomTestCase):

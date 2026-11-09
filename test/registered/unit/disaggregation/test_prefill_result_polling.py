@@ -187,6 +187,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         )
         self.chunked_req = None
         self.decode_offload_manager = None
+        self.hisparse_coordinator = None
         self.running_batch = ScheduleBatch(reqs=[])
         self.running_reqs = KeyedReqList(ListKind.DECODING)
         self.prefill_launched_reqs = KeyedReqList(ListKind.PREFILL_LAUNCHED)

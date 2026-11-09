@@ -1406,13 +1406,13 @@ class HiSparseCoordinator:
         self.spec_swap.free_unrotated_scratch(req.kv.req_pool_idx)
         req.hisparse_staging = False
 
-    def retract_req(self, req: Req) -> None:
+    def request_finished(self, req: Req):
+        """Free what a request holds here, whether it finished, aborted or was
+        retracted."""
         if req.hisparse_staging:
             self.abort_staging_request(req)
-        else:
-            self.request_finished(req)
+            return
 
-    def request_finished(self, req: Req):
         # release resources only after the execution of a potential overlapped batch
         if self.decode_producer_stream is not None:
             device_module.current_stream().wait_stream(self.decode_producer_stream)

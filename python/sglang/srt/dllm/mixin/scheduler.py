@@ -495,10 +495,15 @@ class DllmManager:
         self.waiting_queue.take(lambda req: req.finished())
         self.staging_queue = [req for req in self.staging_queue if not req.finished()]
 
+    def leave(self, reqs: List[Req]) -> None:
+        """Drop the given requests from both queues; ones not in are ignored."""
+        self.waiting_queue.leave(reqs)
+        leaving = set(reqs)
+        self.staging_queue = [req for req in self.staging_queue if req not in leaving]
+
     def _abort(self, recv_req: AbortReq) -> None:
-        aborted_reqs = self.waiting_queue.take(lambda req: recv_req.matches(req.rid))
-        aborted = set(aborted_reqs)
-        self.staging_queue = [req for req in self.staging_queue if req not in aborted]
+        aborted_reqs = [req for req in self.waiting_queue if recv_req.matches(req.rid)]
+        self.leave(aborted_reqs)
         for req in aborted_reqs:
             self._abort_one(req)
 
