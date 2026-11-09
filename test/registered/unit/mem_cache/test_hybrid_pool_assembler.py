@@ -57,6 +57,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MambaPool,
     MHATokenToKVPool,
     MiniMaxSparseKVPool,
+    MLATokenToKVPool,
 )
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.pool_host import dsa as pool_host_dsa
@@ -537,6 +538,61 @@ class TestDraftSidecarPoolDispatch(CustomTestCase):
         self.assertEqual(len(specs), 1)
         self.assertIs(entries[0].host_pool, draft_host_pool)
 
+    def test_full_builder_translates_dcp_sharded_mla_draft(self):
+        from sglang.srt.runtime_context import publish, reset_context
+        from sglang.srt.server_args import ServerArgs
+
+        publish(
+            ServerArgs(model_path="dummy", hicache_mem_layout="page_first"),
+            role="scheduler",
+        )
+        self.addCleanup(reset_context)
+        tree_cache = SimpleNamespace(
+            cache_controller=SimpleNamespace(
+                mem_pool_host=SimpleNamespace(size=200, logical_size=800),
+                page_size=512,
+                transfer_layer_id_max=1,
+            )
+        )
+        parallel = SimpleNamespace(dcp_enabled=True, attn_dcp_size=4, attn_dcp_rank=1)
+        for replicated, expected in (
+            (False, dict(host_to_device_ratio=2.0, dcp_size=4, dcp_rank=1)),
+            (True, dict(host_to_device_ratio=8.0, host_token_capacity=800)),
+        ):
+            pool = object.__new__(MLATokenToKVPool)
+            pool.layer_num = 1
+            pool.size = 100
+            pool.start_layer = 0
+            pool.layer_shard_enabled = False
+            pool.dcp_replicated = replicated
+            pool.get_device_pool_infos = lambda: (
+                SimpleNamespace(
+                    pool_name=PoolName.KV,
+                    indices_from_pool=PoolName.KV,
+                    buffer_info=object(),
+                ),
+            )
+            pool.layer_router = PlainPoolRouter(pool, IdSpaceKind.FULL)
+            with (
+                self.subTest(replicated=replicated),
+                patch.object(
+                    hybrid_pool_assembler, "get_parallel", return_value=parallel
+                ),
+                patch.object(
+                    hybrid_pool_assembler,
+                    "_build_mha_mla_host_pool",
+                    return_value=SimpleNamespace(layer_num=1),
+                ) as build_host_pool,
+                patch.object(
+                    hybrid_pool_assembler,
+                    "_get_allocator_type",
+                    return_value="default",
+                ),
+            ):
+                build_full_draft_pools(draft_kv_pool=pool, tree_cache=tree_cache)
+                kwargs = build_host_pool.call_args.kwargs
+                self.assertEqual({key: kwargs.get(key) for key in expected}, expected)
+
     def test_full_builder_registers_separate_dsa_draft_indexer(self):
         """Separate draft indexers retain their own buffers and target KV indices."""
         draft_kv_pool = object.__new__(DSATokenToKVPool)
@@ -658,6 +714,11 @@ class TestDraftSidecarPoolDispatch(CustomTestCase):
                         hybrid_pool_assembler,
                         "get_memory",
                         return_value=SimpleNamespace(hicache_mem_layout="page_first"),
+                    ),
+                    patch.object(
+                        hybrid_pool_assembler,
+                        "get_parallel",
+                        return_value=SimpleNamespace(dcp_enabled=False),
                     ),
                     patch.object(
                         hybrid_pool_assembler,
