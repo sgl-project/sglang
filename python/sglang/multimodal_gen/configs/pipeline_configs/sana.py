@@ -28,9 +28,9 @@ from sglang.multimodal_gen.configs.models.encoders.base import EncoderConfig
 from sglang.multimodal_gen.configs.models.encoders.gemma2 import Gemma2Config
 from sglang.multimodal_gen.configs.models.vaes.sana import SanaVAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
-    ModelTaskType,
     SpatialImagePipelineConfig,
 )
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 
 
 def sana_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.Tensor:

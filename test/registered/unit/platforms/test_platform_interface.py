@@ -21,6 +21,7 @@ from sglang.srt.platforms.device_mixin import (
     PlatformEnum,
 )
 from sglang.srt.platforms.interface import SRTPlatform
+from sglang.srt.platforms.mlu import MluSRTPlatform
 from sglang.srt.platforms.mps import MpsSRTPlatform
 from sglang.srt.platforms.npu import NPUSRTPlatform
 from sglang.srt.platforms.rocm import RocmSRTPlatform
@@ -95,6 +96,7 @@ _PLATFORM_IDENTITY = [
     (PlatformEnum.XPU, "xpu", "xpu", "is_xpu"),
     (PlatformEnum.MUSA, "musa", "musa", "is_musa"),
     (PlatformEnum.NPU, "npu", "npu", "is_npu"),
+    (PlatformEnum.MLU, "mlu", "mlu", "is_mlu"),
     (PlatformEnum.TPU, "tpu", "tpu", "is_tpu"),
     (PlatformEnum.MPS, "mps", "mps", "is_mps"),
 ]
@@ -104,6 +106,7 @@ _CUDA_ALIKE = [
     (PlatformEnum.CUDA, "cuda", "cuda", True),
     (PlatformEnum.ROCM, "rocm", "hip", True),
     (PlatformEnum.MUSA, "musa", "musa", True),
+    (PlatformEnum.MLU, "mlu", "mlu", False),
     (PlatformEnum.CPU, "cpu", "cpu", False),
     (PlatformEnum.NPU, "npu", "npu", False),
 ]
@@ -523,24 +526,25 @@ class TestMpsDeviceMixin(CustomTestCase):
         self, mock_recommended, mock_driver
     ):
         """Handle MPS directly instead of using OOT dispatch."""
-        from sglang.srt.utils import common
+        from sglang.srt.utils import device as device_utils
 
         mock_recommended.return_value = 8 << 30
         mock_driver.return_value = 5 << 30
 
         with (
-            patch.object(common, "is_mps", return_value=True),
-            patch.object(common, "is_cuda", return_value=False),
-            patch.object(common, "is_hip", return_value=False),
-            patch.object(common, "is_cpu", return_value=False),
-            patch.object(common, "is_npu", return_value=False),
-            patch.object(common, "is_musa", return_value=False),
-            patch.object(common, "is_habana_available", return_value=False),
+            patch.object(device_utils, "is_mps", return_value=True),
+            patch.object(device_utils, "is_mlu", return_value=False),
+            patch.object(device_utils, "is_cuda", return_value=False),
+            patch.object(device_utils, "is_hip", return_value=False),
+            patch.object(device_utils, "is_cpu", return_value=False),
+            patch.object(device_utils, "is_npu", return_value=False),
+            patch.object(device_utils, "is_musa", return_value=False),
+            patch.object(device_utils, "is_habana_available", return_value=False),
             patch.object(torch.cuda, "is_available", return_value=False),
             patch.object(torch.xpu, "is_available", return_value=False),
             patch.object(torch.mps, "is_available", return_value=True),
             patch.object(torch.mps, "device_count", return_value=1),
-            patch.object(common, "empty_device_cache"),
+            patch.object(device_utils, "empty_device_cache"),
             # The Linux CPU suite has no MPS device name.
             patch("torch.backends.mps.get_name", return_value="Apple M-series"),
             patch(
@@ -548,36 +552,42 @@ class TestMpsDeviceMixin(CustomTestCase):
                 return_value=False,
             ),
         ):
-            common.get_device_count.cache_clear()
-            common.get_device.cache_clear()
+            device_utils.get_device_count.cache_clear()
+            device_utils.get_device.cache_clear()
             try:
-                self.assertEqual(common.get_device_memory_capacity("mps"), 8192)
-                self.assertEqual(common.get_device_name(), "Apple M-series")
-                self.assertEqual(common.get_device_count(), 1)
-                self.assertEqual(common.get_device(), "mps")
-                self.assertEqual(common.get_device(0), "mps:0")
-                self.assertEqual(common.get_compiler_backend(), "eager")
+                self.assertEqual(device_utils.get_device_memory_capacity("mps"), 8192)
+                self.assertEqual(device_utils.get_device_name(), "Apple M-series")
+                self.assertEqual(device_utils.get_device_count(), 1)
+                self.assertEqual(device_utils.get_device(), "mps")
+                self.assertEqual(device_utils.get_device(0), "mps:0")
+                self.assertEqual(device_utils.get_compiler_backend(), "eager")
 
                 # Metal headroom is the tighter limit.
-                with patch.object(common.psutil, "virtual_memory") as mock_vm:
+                with patch.object(device_utils.psutil, "virtual_memory") as mock_vm:
                     mock_vm.return_value.available = 6 << 30
-                    self.assertEqual(common.get_available_gpu_memory("mps", 0), 3.0)
+                    self.assertEqual(
+                        device_utils.get_available_gpu_memory("mps", 0), 3.0
+                    )
 
                     # Host memory can be the tighter limit.
                     mock_vm.return_value.available = 1 << 30
-                    self.assertEqual(common.get_available_gpu_memory("mps", 0), 1.0)
+                    self.assertEqual(
+                        device_utils.get_available_gpu_memory("mps", 0), 1.0
+                    )
 
                     # Clamp negative Metal headroom.
                     mock_driver.return_value = 9 << 30
-                    self.assertEqual(common.get_available_gpu_memory("mps", 0), 0.0)
+                    self.assertEqual(
+                        device_utils.get_available_gpu_memory("mps", 0), 0.0
+                    )
             finally:
-                common.get_device_count.cache_clear()
-                common.get_device.cache_clear()
+                device_utils.get_device_count.cache_clear()
+                device_utils.get_device.cache_clear()
 
 
 class TestMusaAvailableMemory(CustomTestCase):
     def test_integrated_and_discrete_memory_sources(self):
-        from sglang.srt.utils import common
+        from sglang.srt.utils import device as device_utils
 
         gpu_id = 3
         for integrated in (True, False):
@@ -590,12 +600,14 @@ class TestMusaAvailableMemory(CustomTestCase):
                     musa.mem_get_info.return_value = (2 << 30, 16 << 30)
                     with (
                         patch.object(torch, "musa", musa, create=True),
-                        patch.object(common.psutil, "virtual_memory") as host_memory,
-                        patch.object(common, "empty_device_cache") as clear_cache,
+                        patch.object(
+                            device_utils.psutil, "virtual_memory"
+                        ) as host_memory,
+                        patch.object(device_utils, "empty_device_cache") as clear_cache,
                     ):
                         host_memory.return_value.available = 6 << 30
                         self.assertEqual(
-                            common.get_available_gpu_memory(
+                            device_utils.get_available_gpu_memory(
                                 "musa", gpu_id, empty_cache=empty_cache
                             ),
                             6.0 if integrated else 2.0,
@@ -609,6 +621,21 @@ class TestMusaAvailableMemory(CustomTestCase):
                             clear_cache.assert_called_once_with(musa)
                         else:
                             clear_cache.assert_not_called()
+
+
+class TestMluSRTPlatform(CustomTestCase):
+    """Tests for MLU platform defaults that do not require MLU hardware."""
+
+    def test_mlu_platform_backend_defaults(self):
+        base = MluSRTPlatform()
+        self.assertEqual(base.get_dispatch_key_name(), "mlu")
+        self.assertEqual(base.get_torch_distributed_backend_str(), "cncl")
+
+    def test_mlu_pin_memory_available_for_mlu_targets(self):
+        base = MluSRTPlatform()
+        self.assertTrue(base.is_pin_memory_available())
+        self.assertTrue(base.is_pin_memory_available(device="mlu"))
+        self.assertFalse(base.is_pin_memory_available(device="cpu"))
 
 
 class TestPinMemoryAvailability(CustomTestCase):
@@ -635,7 +662,7 @@ class TestPinMemoryAvailability(CustomTestCase):
         self.assertTrue(P().is_pin_memory_available(device="custom"))
 
     def test_common_wrapper_dispatches_to_current_platform_with_device(self):
-        from sglang.srt.utils import common
+        from sglang.srt.utils import device as device_utils
 
         class P(SRTPlatform):
             _enum = PlatformEnum.OOT
@@ -651,13 +678,13 @@ class TestPinMemoryAvailability(CustomTestCase):
 
         platform = P()
         device = torch.device("cuda", 0)
-        with patch.object(common, "current_platform", platform):
-            self.assertTrue(common.is_pin_memory_available(device))
+        with patch.object(device_utils, "current_platform", platform):
+            self.assertTrue(device_utils.is_pin_memory_available(device))
 
         self.assertEqual(platform.calls, [device])
 
     def test_common_wrapper_dispatches_to_current_platform_without_device(self):
-        from sglang.srt.utils import common
+        from sglang.srt.utils import device as device_utils
 
         class P(SRTPlatform):
             _enum = PlatformEnum.OOT
@@ -672,13 +699,13 @@ class TestPinMemoryAvailability(CustomTestCase):
                 return True
 
         platform = P()
-        with patch.object(common, "current_platform", platform):
-            self.assertTrue(common.is_pin_memory_available())
+        with patch.object(device_utils, "current_platform", platform):
+            self.assertTrue(device_utils.is_pin_memory_available())
 
         self.assertEqual(platform.calls, [None])
 
     def test_oot_platform_without_override_uses_conservative_default(self):
-        from sglang.srt.utils import common
+        from sglang.srt.utils import device as device_utils
 
         class P(SRTPlatform):
             _enum = PlatformEnum.OOT
@@ -686,10 +713,10 @@ class TestPinMemoryAvailability(CustomTestCase):
             device_type = "custom"
 
         with (
-            patch.object(common, "current_platform", P()),
+            patch.object(device_utils, "current_platform", P()),
             patch("torch.cuda.is_available", return_value=True) as mock_cuda_available,
         ):
-            self.assertFalse(common.is_pin_memory_available())
+            self.assertFalse(device_utils.is_pin_memory_available())
 
         mock_cuda_available.assert_not_called()
 
