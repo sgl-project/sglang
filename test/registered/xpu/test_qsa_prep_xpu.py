@@ -241,3 +241,23 @@ def test_xpu_fp8_prep_and_compress_dispatch_to_native(monkeypatch):
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+@pytest.mark.parametrize("keep_fp32", [True, False])
+def test_mrope_forward_xpu_cache_dtype(keep_fp32):
+    rope = MRotaryEmbedding(
+        head_size=HEAD_DIM,
+        rotary_dim=HEAD_DIM,
+        max_position_embeddings=256,
+        base=10000,
+        is_neox_style=True,
+        dtype=torch.float32,
+        mrope_section=[16, 24, 24],
+    ).to("xpu")
+    rope.keep_cos_sin_cache_fp32 = keep_fp32
+    query = torch.randn(3, HEADS * HEAD_DIM, dtype=torch.bfloat16, device="xpu")
+    key = torch.randn_like(query)
+    positions = torch.arange(3, device="xpu").repeat(3, 1)
+    rope.forward_xpu(positions, query, key)
+    expected = torch.float32 if keep_fp32 else torch.bfloat16
+    assert rope.cos_sin_cache.dtype == expected
