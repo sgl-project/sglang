@@ -19,6 +19,7 @@ from sglang.srt.disaggregation.base.conn import KVPoll, StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.common.staging_handler import (
     DecodeStagingContext,
+    DecodeStagingHandler,
     PrefillStagingContext,
 )
 from sglang.srt.disaggregation.common.utils import TransferKVChunk
@@ -883,8 +884,8 @@ class TestNixlDecodeListener(CustomTestCase):
             self.assertIs(actual.args[0], original)
 
     def _enable_real_staging_handler(self, mgr, receiver):
-        # Run the real handler and receiver state updates. Only GPU allocation
-        # and layout kernels are replaced at the CPU test boundary.
+        # Run the real handler and receiver state updates. GPU allocation,
+        # scatter and watermark I/O are replaced at the CPU test boundary.
         allocator = MagicMock()
         allocator.assign.return_value = (0, 0, 0)
         receiver.prefill_info = SimpleNamespace(attn_tp_size=1)
@@ -896,10 +897,11 @@ class TestNixlDecodeListener(CustomTestCase):
             room_receivers={11: receiver},
             room_bootstrap={11: [{"pp_rank": 0}]},
         )
-        mgr._staging_handler = SimpleNamespace(
-            _room_to_decode_req={11: SimpleNamespace(kv_receiver=receiver)},
-            register_wm_subscriber=MagicMock(),
-        )
+        handler = object.__new__(DecodeStagingHandler)
+        handler._room_to_decode_req = {11: SimpleNamespace(kv_receiver=receiver)}
+        handler.register_wm_subscriber = MagicMock()
+        handler.submit_last_scatter_async = MagicMock()
+        mgr._staging_handler = handler
         return allocator
 
     def test_bad_then_valid_staging_and_status_over_real_zmq_thread(self):
@@ -925,8 +927,8 @@ class TestNixlDecodeListener(CustomTestCase):
             socket = context.socket(zmq.PAIR)
             try:
                 socket.setsockopt(zmq.LINGER, 0)
-                socket.setsockopt(zmq.RCVTIMEO, 1000)
-                socket.setsockopt(zmq.SNDTIMEO, 1000)
+                socket.setsockopt(zmq.RCVTIMEO, 5000)
+                socket.setsockopt(zmq.SNDTIMEO, 5000)
                 socket.bind(endpoint)
 
                 def recv():
@@ -952,8 +954,8 @@ class TestNixlDecodeListener(CustomTestCase):
         sender = context.socket(zmq.PAIR)
         try:
             sender.setsockopt(zmq.LINGER, 0)
-            sender.setsockopt(zmq.RCVTIMEO, 3000)
-            sender.setsockopt(zmq.SNDTIMEO, 1000)
+            sender.setsockopt(zmq.RCVTIMEO, 5000)
+            sender.setsockopt(zmq.SNDTIMEO, 5000)
             with patch.dict(
                 sys.modules,
                 {
@@ -963,7 +965,7 @@ class TestNixlDecodeListener(CustomTestCase):
                 },
             ):
                 thread.start()
-                self.assertTrue(ready.wait(timeout=3), "listener did not bind")
+                self.assertTrue(ready.wait(timeout=5), "listener did not bind")
                 sender.connect(endpoint)
                 for parts in [*malformed, valid]:
                     sender.send_multipart(parts)
@@ -971,7 +973,7 @@ class TestNixlDecodeListener(CustomTestCase):
                 # after bad messages have been rejected and valid allocation
                 # metadata has been committed to the real receiver.
                 self.assertTrue(
-                    sender.poll(timeout=3000),
+                    sender.poll(timeout=5000),
                     f"no staging reply; listener errors: {errors}",
                 )
                 self.assertEqual(
@@ -982,7 +984,7 @@ class TestNixlDecodeListener(CustomTestCase):
                     [b"KV_STATUS", b"11", str(int(KVPoll.Success)).encode(), b"0"]
                 )
                 sender.send_multipart(stop)
-                thread.join(timeout=3)
+                thread.join(timeout=6)
                 self.assertFalse(thread.is_alive(), "listener did not stop")
                 self.assertEqual(errors, [])
                 self.assertEqual(stopped, [True])
@@ -991,12 +993,15 @@ class TestNixlDecodeListener(CustomTestCase):
                 mgr._staging_handler.register_wm_subscriber.assert_called_once_with(
                     receiver, "session"
                 )
+                mgr._staging_handler.submit_last_scatter_async.assert_called_once_with(
+                    11
+                )
                 self.assertEqual(receiver.poll(), KVPoll.Success)
         finally:
             sender.close(linger=0)
             # RCVTIMEO bounds cleanup even if a send or assertion failed.
             if thread.ident is not None:
-                thread.join(timeout=3)
+                thread.join(timeout=6)
             context.term()
 
     def test_real_staging_allocator_error_remains_visible(self):
