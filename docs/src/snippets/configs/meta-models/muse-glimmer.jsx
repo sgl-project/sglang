@@ -64,7 +64,7 @@ export const config = {
   modelNames: {
     "default|bf16": "meta-models/Muse-Glimmer-30B",
     "default|gguf": "meta-models/Muse-Glimmer-30B-GGUF/Muse-Glimmer-30B-KQuant-17GB-Q4_K_M.gguf",
-    "default|nvfp4": "RadixArk/Muse-Glimmer-NVFP4",
+    "default|nvfp4": "nvidia/Muse-Glimmer-30B-NVFP4",
     "default|mlx-q4": "RadixArk/Muse-Glimmer-q4-MLX",
     "default|mlx-q4km": "RadixArk/Muse-Glimmer-q4km-gs128-MLX",
     "default|mlx-q4k-dyn": "RadixArk/Muse-Glimmer-q4k-dynamic-MLX",
@@ -75,7 +75,7 @@ export const config = {
     PORT:       { target: "command", label: "Bind port",         default: "30000" },
     HF_TOKEN:   { target: "command", label: "HF token (Docker)", default: "<your-hf-token>" },
     DRAFT_PATH: { target: "command", label: "DFlash draft checkpoint", default: "meta-models/Muse-Glimmer-30B-assistant" },
-    QUANT_PATH: { target: "command", label: "NVFP4 checkpoint", default: "RadixArk/Muse-Glimmer-NVFP4" },
+    QUANT_PATH: { target: "command", label: "NVFP4 checkpoint", default: "nvidia/Muse-Glimmer-30B-NVFP4" },
     CURL_HOST:  { target: "curl",    label: "Server host",       default: "localhost" },
     CURL_PORT:  { target: "curl",    label: "Server port",       default: "30000" },
   },
