@@ -41,11 +41,7 @@ from cutlass.cute.runtime import from_dlpack, make_fake_stream
 
 from sglang.kernels.arch import current_arch
 from sglang.kernels.kernel_api_logging import debug_kernel_api
-from sglang.kernels.ops.gemm.tiny_gemm import (
-    _get_num_sm,
-    can_use_tiny_gemm,
-    tiny_gemm_bf16,
-)
+from sglang.kernels.ops.gemm.tiny_gemm import can_use_tiny_gemm, tiny_gemm_bf16
 from sglang.srt.utils import get_device_sm, is_sm100_supported
 from sglang.srt.utils.custom_op import direct_register_custom_op
 
@@ -1517,33 +1513,24 @@ def _tgv_bf16_gemm_out_run(
 
 @functools.cache
 def _use_tiny_gemm(m: int, n: int, k: int) -> bool:
-    """CUDA-core tiny GEMM beats TGV while ``m * n <= 8192`` (SM107, cold L2,
-    CUDA graph; n in [576, 6144], k = 7168, m <= 8)."""
+    """tiny_gemm beats TGV while ``m * n <= 8192`` (SM107, cold L2, CUDA graph;
+    n in [576, 6144], k = 7168, m <= 8). tiny_gemm picks its own kernel per
+    (m, n, k) (SIMT at m = 1, MMA from its cost model above that)."""
     # ponytail: measured on SM107 only; sweep other SM10x before widening.
     return (
         get_device_sm() == 107
         and m <= 8
         and m * n <= 8192
         and k > n
-        and can_use_tiny_gemm(n, k, m)
+        and can_use_tiny_gemm(n, k)
     )
-
-
-@functools.cache
-def _tiny_gemm_n_split(n: int) -> int:
-    """Fewest rows per block (<= 8) that fits one wave, else 4 rows per block."""
-    divisors = [d for d in range(1, 9) if n % d == 0]
-    for d in divisors:
-        if n // d <= _get_num_sm():
-            return d
-    return 4 if 4 in divisors else divisors[-1]
 
 
 def _try_tiny_gemm(x, weight, out, bias) -> bool:
     m, (n, k) = x.shape[0], weight.shape
     if bias is not None or not weight.is_contiguous() or not _use_tiny_gemm(m, n, k):
         return False
-    tiny_gemm_bf16(x, weight, out, max_m=m, n_split=_tiny_gemm_n_split(n))
+    tiny_gemm_bf16(x, weight, out)
     return True
 
 
