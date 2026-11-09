@@ -610,21 +610,34 @@ def _build_mamba_device_pool_group(
 
 
 def _sidecar_draft_entries(params: Any, page_size: int) -> list[DevicePoolEntry]:
+    from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+
     entries = []
     for draft_pool in params.sidecar_draft_device_pools:
         if draft_pool.page_size != page_size:
             raise ValueError("Draft KV page size must match the tree page size.")
         # Draft layer i rides transfer layer i; the draft reads it only after
         # the batch's loads finish.
-        entries.append(
-            _mha_device_pool_entry(
+        layer_mapping = {layer: layer for layer in range(draft_pool.layer_num)}
+        if type(draft_pool) is MLATokenToKVPool:
+            entry = DevicePoolEntry(
+                name=PoolName.DRAFT,
+                indices_from_pool=PoolName.KV,
+                device_pool=draft_pool,
+                components=[draft_pool.kv_buffer],
+                layer_mapping=layer_mapping,
+                page_size=page_size,
+                rows_are_pages=False,
+            )
+        else:
+            entry = _mha_device_pool_entry(
                 PoolName.DRAFT,
                 draft_pool,
-                {layer: layer for layer in range(draft_pool.layer_num)},
+                layer_mapping,
                 page_size,
                 indices_from_pool=PoolName.KV,
             )
-        )
+        entries.append(entry)
     return entries
 
 

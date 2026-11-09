@@ -953,6 +953,17 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         self.assertEqual(indexer.prepare_locations(torch.tensor([2, 3])), [1])
         kvcache.full_kv_pool = mla
 
+        mla_draft = MLATokenToKVPool.__new__(MLATokenToKVPool)
+        mla_draft.page_size, mla_draft.layer_num = 2, 2
+        mla_draft.kv_buffer = [
+            torch.zeros((8, 1, 5), dtype=torch.uint8) for _ in range(2)
+        ]
+        params.sidecar_draft_device_pools = (mla_draft,)
+        draft_entry = resolve().entry_map[PoolName.DRAFT]
+        self.assertEqual(draft_entry.layer_mapping, {0: 0, 1: 1})
+        self.assertEqual(draft_entry.prepare_locations(torch.tensor([2, 3])), [2])
+        params.sidecar_draft_device_pools = (draft,)
+
         with self.assertRaisesRegex(ValueError, "plain MLA"):
             resolve(dcp_size=2)
         params.mtp_draft_device_pools = (object(),)
