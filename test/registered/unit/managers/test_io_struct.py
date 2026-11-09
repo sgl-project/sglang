@@ -9,6 +9,7 @@ from unittest.mock import patch
 import msgspec
 import numpy as np
 import torch
+from pydantic import TypeAdapter, ValidationError
 
 from sglang.srt.managers import io_struct
 from sglang.srt.managers.io_struct import (
@@ -1347,6 +1348,45 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         req.normalize_batch_and_arguments()
         self.assertEqual(req[0].routed_dp_rank, 3)
         self.assertEqual(req[1].routed_dp_rank, 3)
+
+
+class TestGenerateReqInputBodyBinding(CustomTestCase):
+    """TypeAdapter matches FastAPI binding; direct dataclass construction skips validation."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.adapter = TypeAdapter(GenerateReqInput)
+
+    def _bind(self, input_embeds):
+        return self.adapter.validate_python({"input_embeds": input_embeds})
+
+    def test_input_embeds_preserves_shape_and_coerces_ints(self):
+        """Normalization distinguishes single from batch by the bound float type."""
+        single = self._bind([[0, 1], [2.5, 3]])
+        self.assertEqual(single.input_embeds, [[0.0, 1.0], [2.5, 3.0]])
+        self.assertIsInstance(single.input_embeds[0][0], float)
+
+        batch = self._bind([[[0, 1]], [[2, 3.5]]])
+        self.assertEqual(batch.input_embeds, [[[0.0, 1.0]], [[2.0, 3.5]]])
+        self.assertIsInstance(batch.input_embeds[0][0][0], float)
+
+    def test_input_embeds_rejects_malformed_shapes(self):
+        for malformed in ([[0.5], [[1.5]]], [[[0.5]], [1.5]], [1.0, 2.0], "abc"):
+            with self.subTest(malformed=malformed), self.assertRaises(ValidationError):
+                self._bind(malformed)
+
+    def test_input_embeds_null_binds(self):
+        """Optional must wrap the discriminator so null bypasses tag selection."""
+        self.assertIsNone(self._bind(None).input_embeds)
+
+    def test_input_embeds_bad_value_collects_one_error(self):
+        """A bad value must not collect errors from both union members."""
+        for body in ([[0.5, 1.5], [2.5, "x"]], [[[0.5, 1.5]], [[2.5, "x"]]]):
+            with self.subTest(body=body):
+                with self.assertRaises(ValidationError) as caught:
+                    self._bind(body)
+                self.assertEqual(caught.exception.error_count(), 1)
 
 
 class TestKvHintsTransport(CustomTestCase):

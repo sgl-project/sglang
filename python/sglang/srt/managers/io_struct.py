@@ -50,7 +50,7 @@ import numpy as np
 import torch
 import zmq
 import zmq.asyncio
-from pydantic import PlainValidator
+from pydantic import Discriminator, PlainValidator, Tag
 
 from sglang.srt.beam_search.types import BeamSearchSequence
 from sglang.srt.environ import envs
@@ -70,7 +70,10 @@ from sglang.srt.multimodal.modality import Modality
 from sglang.srt.observability.req_time_stats import SchedulerOutputTimeStats
 from sglang.srt.sampling.sampling_mask import SamplingMaskChunk
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.utils.field_validators import validate_optional_list_i64_1d_2d
+from sglang.srt.utils.field_validators import (
+    input_embeds_union_tag,
+    validate_optional_list_i64_1d_2d,
+)
 from sglang.srt.utils.msgpack_utils import (
     dec_hook,
     enc_hook,
@@ -198,7 +201,15 @@ class GenerateReqInput:
         PlainValidator(validate_optional_list_i64_1d_2d),
     ] = None
     # The embeddings for input_ids; one can specify either text or input_ids or input_embeds.
-    input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
+    input_embeds: Optional[
+        Annotated[
+            Union[
+                Annotated[List[List[float]], Tag("single")],
+                Annotated[List[List[List[float]]], Tag("batch")],
+            ],
+            Discriminator(input_embeds_union_tag),
+        ]
+    ] = None
     # The image input. It can be an image instance, file name, URL, or base64 encoded string.
     # Can be formatted as:
     # - Single image for a single request
