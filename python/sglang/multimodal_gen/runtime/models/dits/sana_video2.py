@@ -33,8 +33,9 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 _is_cuda = current_platform.is_cuda()
-# Per-signature: the linear (head_dim 128) and softmax (head_dim 256) blocks and
-# every token count are verified against the eager chain independently.
+# Per-signature: each (q shape, q/k strides, device, table instance) is verified
+# against the eager chain on its own, so the linear and softmax layouts and every
+# rebuilt table set pay their own first-sight check.
 _SANA_VIDEO2_ROPE = BitExactFusionGate("SANA-Video 2.0 fused RoPE", per_signature=True)
 
 
@@ -44,10 +45,10 @@ def _apply_rope(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
 
 
 def _rope_tables(freqs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """fp64 cos/sin tables for the fused kernel, [1, S, 1, D] repeat-interleaved,
-    from the complex128 frequencies [1, 1, S, D / 2]."""
     parts = torch.view_as_real(freqs)
     tokens = freqs.shape[-2]
+    # fused_interleaved_rope_fp64 contract: fp64 [1, S, 1, D] tables holding each
+    # pair's value twice; it reads cos at even and sin at odd columns.
     cos = parts[..., 0].repeat_interleave(2, dim=-1).reshape(1, tokens, 1, -1)
     sin = parts[..., 1].repeat_interleave(2, dim=-1).reshape(1, tokens, 1, -1)
     return cos.contiguous(), sin.contiguous()
@@ -58,15 +59,14 @@ def _apply_rope_pair(
     k: torch.Tensor,
     rope: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Rotate q and k [B, H, S, D] in one launch when both are bf16 CUDA views of
-    contiguous [B, S, H, D] tensors; the fused kernel keeps the fp64 multiply,
-    add and fp64 -> fp32 -> bf16 roundings of the eager complex128 chain and is
-    verified against it on first sight."""
     freqs, cos, sin = rope
 
     def reference():
         return _apply_rope(q, freqs), _apply_rope(k, freqs)
 
+    # The fused kernel wants contiguous [B, S, H, D] bf16 CUDA inputs; the eager
+    # chain stays for every other case. Its fp64 multiply/add and the
+    # fp64 -> fp32 -> bf16 store reproduce the eager roundings bit for bit.
     q_bshd, k_bshd = q.transpose(1, 2), k.transpose(1, 2)
     if not (
         _is_cuda
@@ -83,7 +83,13 @@ def _apply_rope_pair(
         q_out, k_out = fused_interleaved_rope_fp64(q_bshd, k_bshd, cos, sin)
         return q_out.transpose(1, 2), k_out.transpose(1, 2)
 
-    sig = (tuple(q.shape), tuple(q.stride()), tuple(k.stride()), q.device.index)
+    sig = (
+        tuple(q.shape),
+        tuple(q.stride()),
+        tuple(k.stride()),
+        q.device.index,
+        cos.data_ptr(),
+    )
     return _SANA_VIDEO2_ROPE.run(
         fused, reference, sig=sig, equal=tensors_equal, logger=logger
     )
@@ -134,7 +140,7 @@ class GatedLinearAttention(nn.Module):
         v = v.transpose(-1, -2).reshape(batch, self.heads, self.dim, tokens)
         if rotary_emb is not None:
             q, k = _apply_rope_pair(
-                q.transpose(-1, -2), k.transpose(-1, -2), rotary_emb
+                q=q.transpose(-1, -2), k=k.transpose(-1, -2), rope=rotary_emb
             )
             q, k = q.transpose(-1, -2), k.transpose(-1, -2)
         beta = self.beta_proj(x).sigmoid().transpose(1, 2).unsqueeze(2)
@@ -167,7 +173,7 @@ class GatedSoftmaxAttention(nn.Module):
         k = self.k_norm(k).reshape(batch, tokens, self.heads, self.dim).transpose(1, 2)
         v = v.reshape(batch, tokens, self.heads, self.dim).transpose(1, 2)
         if rotary_emb is not None:
-            q, k = _apply_rope_pair(q, k, rotary_emb)
+            q, k = _apply_rope_pair(q=q, k=k, rope=rotary_emb)
         if self.fp32_attention:
             q, k, v = q.float(), k.float(), v.float()
         out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0)

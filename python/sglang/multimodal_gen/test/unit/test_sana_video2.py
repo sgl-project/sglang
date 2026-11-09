@@ -151,10 +151,10 @@ class TestSanaVideo2(unittest.TestCase):
             rebuilt = model(x, t * 2, y, mask)
         torch.testing.assert_close(steps, [first, rebuilt], rtol=0, atol=0)
 
-    def test_fused_rope_tables_match_complex_rotation(self):
-        """The fp64 cos/sin tables derived from the complex128 frequencies rotate
-        interleaved (even, odd) pairs exactly like the complex multiply; the fused
-        kernel reads cos at even and sin at odd columns of a [1, S, 1, D] table."""
+    def test_fused_rope_tables_follow_kernel_layout(self):
+        """The fp64 tables hand the kernel each pair's cosine at even and sine at
+        odd columns of a [1, S, 1, D] table, in token order of the complex128
+        frequencies; off the fused path the pair helper is the eager rotation."""
         from sglang.multimodal_gen.runtime.models.dits.sana_video2 import (
             _apply_rope,
             _apply_rope_pair,
@@ -168,15 +168,13 @@ class TestSanaVideo2(unittest.TestCase):
             cos, sin = _rope_tables(freqs)
             self.assertEqual(tuple(cos.shape), (1, 8, 1, head_dim))
             self.assertEqual((cos.dtype, sin.dtype), (torch.float64, torch.float64))
+            self.assertTrue(cos.is_contiguous() and sin.is_contiguous())
+            parts = torch.view_as_real(freqs)[0, 0]
+            for column in (0, 1):
+                self.assertTrue(torch.equal(cos[0, :, 0, column::2], parts[..., 0]))
+                self.assertTrue(torch.equal(sin[0, :, 0, column::2], parts[..., 1]))
             x = torch.randn(1, 2, 8, head_dim).to(torch.bfloat16)
-            x64 = x.to(torch.float64)
-            x1, x2 = x64[..., 0::2], x64[..., 1::2]
-            c, s = cos[0, :, 0, 0::2], sin[0, :, 0, 1::2]
-            from_tables = torch.stack((x1 * c - x2 * s, x1 * s + x2 * c), -1)
-            self.assertTrue(
-                torch.equal(_apply_rope(x, freqs), from_tables.flatten(-2).to(x.dtype))
-            )
-            q, k = _apply_rope_pair(x, x.flip(1), (freqs, cos, sin))
+            q, k = _apply_rope_pair(q=x, k=x.flip(1), rope=(freqs, cos, sin))
             self.assertTrue(torch.equal(q, _apply_rope(x, freqs)))
             self.assertTrue(torch.equal(k, _apply_rope(x.flip(1), freqs)))
 

@@ -1009,7 +1009,7 @@ def test_sana_video2_rope_pair_is_bit_exact(heads, head_dim):
     q = x.reshape(batch, tokens, heads, head_dim).transpose(1, 2)
     k = x.flip(1).reshape(batch, tokens, heads, head_dim).transpose(1, 2)
     with torch.no_grad():
-        q_out, k_out = sana_video2._apply_rope_pair(q, k, tables)
+        q_out, k_out = sana_video2._apply_rope_pair(q=q, k=k, rope=tables)
         q_ref, k_ref = (
             sana_video2._apply_rope(q, freqs),
             sana_video2._apply_rope(k, freqs),
@@ -1018,8 +1018,7 @@ def test_sana_video2_rope_pair_is_bit_exact(heads, head_dim):
     assert torch.equal(k_out, k_ref)
     assert q_out.stride() == q_ref.stride()
     assert k_out.stride() == k_ref.stride()
-    sig = (tuple(q.shape), tuple(q.stride()), tuple(k.stride()), q.device.index)
-    assert gate.is_verified(sig)
+    assert len(gate.verified_sigs) == 1
     assert not gate.disabled
     # a different token count is a new signature: unverified until it runs
     freqs2 = rope((frames + 1, height, width), torch.device("cuda"))
@@ -1028,14 +1027,44 @@ def test_sana_video2_rope_pair_is_bit_exact(heads, head_dim):
         batch, tokens2, heads * head_dim, device="cuda", dtype=torch.bfloat16
     )
     q2 = x2.reshape(batch, tokens2, heads, head_dim).transpose(1, 2)
-    sig2 = (tuple(q2.shape), tuple(q2.stride()), tuple(q2.stride()), q2.device.index)
-    assert not gate.is_verified(sig2)
     with torch.no_grad():
         q2_out, _ = sana_video2._apply_rope_pair(
-            q2, q2, (freqs2, *sana_video2._rope_tables(freqs2))
+            q=q2, k=q2, rope=(freqs2, *sana_video2._rope_tables(freqs2))
         )
     assert torch.equal(q2_out, sana_video2._apply_rope(q2, freqs2))
-    assert gate.is_verified(sig2)
+    assert len(gate.verified_sigs) == 2
+    assert not gate.disabled
+    # off-contract inputs take the eager chain without touching the kernel or the
+    # gate: a strided packed-qkv view (the qk_norm=False layout), an fp32 tensor,
+    # and grad mode
+    packed = torch.randn(
+        batch, tokens, 3 * heads * head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    q_strided = (
+        packed.reshape(batch, tokens, 3, heads * head_dim)
+        .unbind(2)[0]
+        .reshape(batch, tokens, heads, head_dim)
+        .transpose(1, 2)
+    )
+    assert not q_strided.transpose(1, 2).is_contiguous()
+    cases = [
+        (q_strided, q_strided, torch.no_grad()),
+        (q.float(), k.float(), torch.no_grad()),
+        (q, k, torch.enable_grad()),
+    ]
+    for q_case, k_case, mode in cases:
+        with (
+            mode,
+            patch.object(
+                sana_video2, "fused_interleaved_rope_fp64", side_effect=AssertionError
+            ),
+        ):
+            q_case_out, k_case_out = sana_video2._apply_rope_pair(
+                q=q_case, k=k_case, rope=tables
+            )
+        assert torch.equal(q_case_out, sana_video2._apply_rope(q_case, freqs))
+        assert torch.equal(k_case_out, sana_video2._apply_rope(k_case, freqs))
+    assert len(gate.verified_sigs) == 2
     assert not gate.disabled
 
 
