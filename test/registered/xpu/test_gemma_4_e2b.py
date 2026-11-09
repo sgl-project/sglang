@@ -19,16 +19,15 @@ Server is started with ``sglang serve`` (``--model-impl sglang``).
 
 from __future__ import annotations
 
-import os
 import unittest
 
 import openai
 import torch
 
-from sglang.srt.utils.common import is_xpu
-from sglang.test.test_utils import CustomTestCase
-from sglang.test.vlm_utils import (
+from sglang.srt.utils.device import is_xpu
+from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
     popen_launch_server,
     terminate_and_kill_process_tree,
 )
@@ -83,7 +82,6 @@ class TestGemma4E2BXPU(CustomTestCase):
         cls.model = MODEL
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
-        os.environ["SGLANG_USE_SGL_XPU"] = "1"
 
         _empty_xpu_cache()
         cls.process = popen_launch_server(
@@ -132,8 +130,13 @@ from sglang.test.ci.ci_register import register_xpu_ci
 # Single e2e test: boot + a short Q&A.
 register_xpu_ci(
     est_time=240,
-    suite="stage-b-test-1-gpu-xpu",
-    disabled="OOM on stage-b XPU runner (server launch fails with --mem-fraction-static)",
+    suite="nightly-xpu-kernel-main-1-gpu",
+    nightly=True,
+)
+register_xpu_ci(
+    est_time=240,
+    suite="nightly-xpu-kernel-wheel-1-gpu",
+    nightly=True,
 )
 
 if __name__ == "__main__":

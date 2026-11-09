@@ -3,11 +3,11 @@
 import threading
 import unittest
 from queue import Queue
-from unittest.mock import MagicMock
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.mem_cache.embedding_cache_controller import (
     EmbeddingCacheController,
     EmbeddingCacheEntry,
@@ -16,11 +16,14 @@ from sglang.srt.mem_cache.embedding_cache_controller import (
     EvictableLRU,
     PageRun,
     RangePageAllocator,
-    build_transfer_buffers,
+    _build_host_device_transfer_plan,
+    _build_storage_transfer_buffers,
 )
+from sglang.srt.multimodal.modality import Modality
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def _make_pool(num_pages=16, dim=4, page_size=2, modality="vision"):
@@ -78,6 +81,98 @@ def _make_controller(num_pages=16, dim=4, page_size=2, enable_eviction=True):
     ctrl.prefetch_tp_group = None
     ctrl._copy_streams = {}
     return ctrl
+
+
+class TestControllerInitialization(CustomTestCase):
+    def test_only_all_rank_get_creates_a_collective_group(self):
+        for tp_size, tp_rank, all_rank_get in (
+            (1, 0, False),
+            (1, 0, True),
+            (2, 0, False),
+            (2, 1, False),
+            (2, 0, True),
+            (2, 1, True),
+        ):
+            with self.subTest(
+                tp_size=tp_size, tp_rank=tp_rank, all_rank_get=all_rank_get
+            ):
+                cpu_group = object()
+                parallel = SimpleNamespace(
+                    tp_size=tp_size,
+                    tp_rank=tp_rank,
+                    tp_group=SimpleNamespace(cpu_group=cpu_group),
+                )
+                pools = (_make_pool(), _make_pool(modality="audio"))
+                store = MagicMock()
+                with (
+                    patch(
+                        "sglang.srt.mem_cache.embedding_cache_controller.get_parallel",
+                        return_value=parallel,
+                    ),
+                    patch.object(
+                        EmbeddingCacheController, "_create_pools", return_value=pools
+                    ) as create_pools,
+                    patch(
+                        "sglang.srt.mem_cache.embedding_cache_controller.threading.Thread"
+                    ) as thread,
+                    patch.object(
+                        torch.distributed,
+                        "get_process_group_ranks",
+                        return_value=list(range(tp_size)),
+                    ) as get_ranks,
+                    patch(
+                        "sglang.srt.distributed.parallel_state.create_custom_parallel_group"
+                    ) as create_group,
+                ):
+                    ctrl = EmbeddingCacheController(
+                        embedding_store=store, all_rank_get=all_rank_get
+                    )
+
+                create_pools.assert_called_once_with(pin_memory=True)
+                self.assertEqual(store.register_buffer.call_count, 2)
+                self.assertIs(
+                    store.register_buffer.call_args_list[0].args[0], pools[0].tensor
+                )
+                self.assertIs(
+                    store.register_buffer.call_args_list[1].args[0], pools[1].tensor
+                )
+                thread.return_value.start.assert_called_once_with()
+                if all_rank_get and tp_size > 1:
+                    get_ranks.assert_called_once_with(cpu_group)
+                    create_group.assert_called_once_with(
+                        group_ranks=list(range(tp_size)), backend="gloo"
+                    )
+                    self.assertIs(ctrl.prefetch_tp_group, create_group.return_value)
+                else:
+                    get_ranks.assert_not_called()
+                    create_group.assert_not_called()
+                    self.assertIsNone(ctrl.prefetch_tp_group)
+
+    def test_prefetch_progress_collective_is_opt_in(self):
+        for all_rank_get in (False, True):
+            with self.subTest(all_rank_get=all_rank_get):
+                ctrl = _make_controller()
+                ctrl.tp_world_size = 2
+                ctrl.all_rank_get = all_rank_get
+                ctrl.prefetch_tp_group = object()
+                with patch.object(
+                    torch.distributed,
+                    "all_reduce",
+                    side_effect=lambda tensor, **kwargs: tensor.zero_(),
+                ) as all_reduce:
+                    ready = ctrl.check_prefetch_progress("req")
+                self.assertEqual(ready, not all_rank_get)
+                if all_rank_get:
+                    all_reduce.assert_called_once()
+                    self.assertIs(
+                        all_reduce.call_args.kwargs["group"], ctrl.prefetch_tp_group
+                    )
+                    self.assertEqual(
+                        all_reduce.call_args.kwargs["op"],
+                        torch.distributed.ReduceOp.MIN,
+                    )
+                else:
+                    all_reduce.assert_not_called()
 
 
 class TestRangePageAllocator(unittest.TestCase):
@@ -249,6 +344,35 @@ class TestStoreToPool(unittest.TestCase):
         with self.assertRaises(ValueError):
             ctrl.store_to_pool_async(["h"], [tensor], Modality.IMAGE)
 
+    def test_wait_store_isolates_failed_copy_and_waits_for_the_rest(self):
+        ctrl = _make_controller(num_pages=4, dim=4, page_size=2)
+        entries = []
+        for mm_hash in ("first", "failed", "last"):
+            page_runs = ctrl.vision_pool.allocator.allocate(2, 2)
+            entry = EmbeddingCacheEntry(
+                hash=mm_hash,
+                modality=Modality.IMAGE,
+                num_tokens=2,
+                dim=4,
+                page_runs=page_runs,
+                state=EntryState.FILLING,
+            )
+            ctrl.entries[mm_hash] = entry
+            entries.append(entry)
+
+        handles = [MagicMock(), MagicMock(), MagicMock()]
+        handles[1].wait.side_effect = RuntimeError("D2H copy failed")
+
+        with self.assertRaisesRegex(RuntimeError, "D2H copy failed"):
+            ctrl.wait_store_to_pool(list(zip(entries, handles)))
+
+        for handle in handles:
+            handle.wait.assert_called_once_with()
+        self.assertEqual(ctrl.entries["first"].state, EntryState.READY)
+        self.assertNotIn("failed", ctrl.entries)
+        self.assertEqual(ctrl.entries["last"].state, EntryState.READY)
+        self.assertEqual(ctrl.vision_pool.allocator.free_pages, 2)
+
 
 def _insert_ready_entry(ctrl, mm_hash, tensor, modality=Modality.IMAGE):
     """Manually write tensor into pool pages and create a READY entry."""
@@ -361,7 +485,7 @@ class TestTransferBuffers(unittest.TestCase):
             state=EntryState.READY,
         )
 
-        ptrs, sizes = build_transfer_buffers(entry, pool)
+        ptrs, sizes = _build_storage_transfer_buffers(entry, pool)
 
         self.assertEqual(ptrs, [pool.tensor[4].data_ptr()])
         self.assertEqual(sizes, [5 * 4 * torch.float32.itemsize])
@@ -377,7 +501,7 @@ class TestTransferBuffers(unittest.TestCase):
             state=EntryState.READY,
         )
 
-        ptrs, sizes = build_transfer_buffers(entry, pool)
+        ptrs, sizes = _build_storage_transfer_buffers(entry, pool)
 
         self.assertEqual(ptrs, [pool.tensor[0].data_ptr(), pool.tensor[6].data_ptr()])
         self.assertEqual(
@@ -387,6 +511,38 @@ class TestTransferBuffers(unittest.TestCase):
                 3 * 4 * torch.float32.itemsize,
             ],
         )
+
+    def test_build_h2d_copy_plan_for_fragmented_entry(self):
+        pool = _make_pool(num_pages=10, dim=4, page_size=2)
+        entry = EmbeddingCacheEntry(
+            hash="h",
+            modality=Modality.IMAGE,
+            num_tokens=5,
+            dim=4,
+            page_runs=[PageRun(2, 1), PageRun(7, 2)],
+            state=EntryState.READY,
+        )
+
+        plan = _build_host_device_transfer_plan(
+            entry, pool, src_is_pool=True, dst_token_offset=3
+        )
+
+        self.assertEqual(plan, ([4, 14], [3, 5], [2, 3]))
+
+    def test_build_d2h_copy_plan_for_fragmented_entry(self):
+        pool = _make_pool(num_pages=10, dim=4, page_size=2)
+        entry = EmbeddingCacheEntry(
+            hash="h",
+            modality=Modality.IMAGE,
+            num_tokens=5,
+            dim=4,
+            page_runs=[PageRun(2, 1), PageRun(7, 2)],
+            state=EntryState.READY,
+        )
+
+        plan = _build_host_device_transfer_plan(entry, pool, src_is_pool=False)
+
+        self.assertEqual(plan, ([0, 2], [4, 14], [2, 3]))
 
 
 class TestMooncakeEmbeddingStoreWrappers(unittest.TestCase):

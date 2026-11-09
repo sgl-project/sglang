@@ -5,13 +5,20 @@ from typing import TYPE_CHECKING, Dict, Optional
 import torch
 
 from sglang.srt.model_executor.cuda_graph_config import Backend
+from sglang.srt.runtime_context import (
+    get_exec,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 
 class GraphSharedOutput:
-    """``(max_rows, vocab)`` logits buffer, shared by every cuda-graph runner."""
+    """Persistent ``(max_rows, vocab)`` output shared by graph runners.
+
+    The producer need not be captured in a CUDA graph. A runner may capture only
+    the transformer body and reuse this buffer for an eager logits tail.
+    """
 
     _process_shared: Optional[GraphSharedOutput] = None
 
@@ -29,14 +36,14 @@ class GraphSharedOutput:
     def create_for_model_runner(
         cls, model_runner: ModelRunner
     ) -> Optional[GraphSharedOutput]:
-        cuda_graph_config = model_runner.server_args.cuda_graph_config
+        cuda_graph_config = get_exec().graph.cuda_graph_config
         if cuda_graph_config is None:
             return None
 
         max_rows = 0
         decode = cuda_graph_config.decode
         if decode.backend != Backend.DISABLED and decode.bs:
-            max_rows = max(max_rows, model_runner.max_decode_logits_rows())
+            max_rows = max(max_rows, model_runner.max_shared_logits_buffer_rows())
 
         if max_rows <= 0:
             return None

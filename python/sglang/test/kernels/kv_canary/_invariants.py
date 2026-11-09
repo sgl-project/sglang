@@ -76,9 +76,9 @@ class PlanInvariants:
             raise AssertionError(f"write_num_valid_reqs negative: {n_active}")
         offsets = write_plan.write_offsets[: n_active + 1].detach().cpu().tolist()
         for i in range(len(offsets) - 1):
-            assert (
-                offsets[i] <= offsets[i + 1]
-            ), f"write_offsets non-monotone at {i}: {offsets[i]} > {offsets[i + 1]}"
+            assert offsets[i] <= offsets[i + 1], (
+                f"write_offsets non-monotone at {i}: {offsets[i]} > {offsets[i + 1]}"
+            )
 
     @staticmethod
     def _assert_write_offsets_total_matches_active_extend_sum(
@@ -92,9 +92,9 @@ class PlanInvariants:
         rpi_cpu = req_pool_indices.detach().cpu().tolist()
         ext_cpu = extend_seq_lens.detach().cpu().tolist()
         expected_total = sum(ext for rpi, ext in zip(rpi_cpu, ext_cpu) if rpi != 0)
-        assert (
-            total == expected_total
-        ), f"write_offsets total {total} != active extend sum {expected_total}"
+        assert total == expected_total, (
+            f"write_offsets total {total} != active extend sum {expected_total}"
+        )
 
     @staticmethod
     def _assert_extras_land_at_tail(
@@ -111,9 +111,9 @@ class PlanInvariants:
         tail_start = derived_verify_count
         tail_end = derived_verify_count + extras_count
         n_valid = int(verify_plan.verify_num_valid[0].item())
-        assert (
-            tail_end <= n_valid
-        ), f"extras tail {tail_end} exceeds verify_num_valid {n_valid}"
+        assert tail_end <= n_valid, (
+            f"extras tail {tail_end} exceeds verify_num_valid {n_valid}"
+        )
         plan_slots = verify_plan.verify_slot_indices[tail_start:tail_end]
         plan_positions = verify_plan.verify_expected_positions[tail_start:tail_end]
         plan_prevs = verify_plan.verify_prev_slot_indices[tail_start:tail_end]
@@ -136,9 +136,9 @@ class PlanInvariants:
         )
         for r in range(min(n_active, len(rpi_cpu))):
             if rpi_cpu[r] == 0:
-                assert (
-                    seeds_cpu[r] == -1
-                ), f"padding row {r} has seed {seeds_cpu[r]} != -1"
+                assert seeds_cpu[r] == -1, (
+                    f"padding row {r} has seed {seeds_cpu[r]} != -1"
+                )
 
     @staticmethod
     def _assert_prev_slot_minus_one_iff_chain_head(
@@ -163,14 +163,14 @@ class PlanInvariants:
         )
         for i, (pos, prev) in enumerate(zip(positions_cpu, prevs_cpu)):
             if pos == 0:
-                assert (
-                    prev == -1
-                ), f"entry {i} at position 0 must have prev=-1, got {prev}"
+                assert prev == -1, (
+                    f"entry {i} at position 0 must have prev=-1, got {prev}"
+                )
             else:
                 if swa_window_size == 0:
-                    assert (
-                        prev != -1
-                    ), f"FULL entry {i} at position {pos} must have prev != -1, got {prev}"
+                    assert prev != -1, (
+                        f"FULL entry {i} at position {pos} must have prev != -1, got {prev}"
+                    )
 
     @staticmethod
     def _assert_verify_num_valid_equals_derived_plus_extras(
@@ -251,9 +251,9 @@ class VerifyInvariants:
         canary_buf_before: torch.Tensor,
         canary_buf_after: torch.Tensor,
     ) -> None:
-        assert torch.equal(
-            canary_buf_before, canary_buf_after
-        ), "verify kernel mutated canary_buf (must be read-only)"
+        assert torch.equal(canary_buf_before, canary_buf_after), (
+            "verify kernel mutated canary_buf (must be read-only)"
+        )
 
     @staticmethod
     def _assert_violation_count_le_active_entries(
@@ -266,9 +266,9 @@ class VerifyInvariants:
             log_before.write_index[0].item()
         )
         n_active = int(plan.verify_num_valid[0].item())
-        assert (
-            0 <= delta <= n_active
-        ), f"violation_write_index delta {delta} out of [0, {n_active}]"
+        assert 0 <= delta <= n_active, (
+            f"violation_write_index delta {delta} out of [0, {n_active}]"
+        )
 
     @staticmethod
     def _assert_violation_rows_have_valid_slot_and_kernel_kind(
@@ -292,13 +292,13 @@ class VerifyInvariants:
         rows = log_after.ring[visible_start:visible_end].detach().cpu()
         for i in range(rows.shape[0]):
             kind = int(rows[i, consts.VIOLATION_FIELD_KERNEL_KIND].item())
-            assert kind == int(
-                kernel_kind
-            ), f"row {visible_start + i} kernel_kind {kind} != expected {int(kernel_kind)}"
+            assert kind == int(kernel_kind), (
+                f"row {visible_start + i} kernel_kind {kind} != expected {int(kernel_kind)}"
+            )
             slot = int(rows[i, consts.VIOLATION_FIELD_SLOT_IDX].item())
-            assert (
-                slot in plan_slots
-            ), f"row {visible_start + i} slot {slot} not in plan_slots"
+            assert slot in plan_slots, (
+                f"row {visible_start + i} slot {slot} not in plan_slots"
+            )
 
     @staticmethod
     def _assert_slot_run_counter_incremented_by_active_entries(
@@ -311,9 +311,9 @@ class VerifyInvariants:
         delta = int(log_after.slot_run_counter[0].item()) - int(
             log_before.slot_run_counter[0].item()
         )
-        assert (
-            delta == n_active
-        ), f"slot_run_counter delta {delta} != active entries {n_active}"
+        assert delta == n_active, (
+            f"slot_run_counter delta {delta} != active entries {n_active}"
+        )
 
     @staticmethod
     def _assert_kernel_run_counter_incremented_by_one(
@@ -401,12 +401,12 @@ class WriteInvariants:
                 continue
             stored_token = int(view[slot, 0].item())
             stored_position = int(view[slot, 1].item())
-            assert (
-                stored_token == tokens_cpu[i]
-            ), f"slot {slot}: stored token {stored_token} != input {tokens_cpu[i]}"
-            assert (
-                stored_position == pos_cpu[i]
-            ), f"slot {slot}: stored position {stored_position} != input {pos_cpu[i]}"
+            assert stored_token == tokens_cpu[i], (
+                f"slot {slot}: stored token {stored_token} != input {tokens_cpu[i]}"
+            )
+            assert stored_position == pos_cpu[i], (
+                f"slot {slot}: stored position {stored_position} != input {pos_cpu[i]}"
+            )
 
     @staticmethod
     def _assert_slot_minus_one_skipped(
@@ -428,9 +428,9 @@ class WriteInvariants:
         for slot in range(num_slots):
             if slot in written_slots:
                 continue
-            assert torch.equal(
-                view_before[slot], view_after[slot]
-            ), f"slot {slot} not in out_cache_loc but canary_buf changed"
+            assert torch.equal(view_before[slot], view_after[slot]), (
+                f"slot {slot} not in out_cache_loc but canary_buf changed"
+            )
 
     @staticmethod
     def _assert_pseudo_violation_only_on_mismatch(
@@ -449,9 +449,9 @@ class WriteInvariants:
             log_before.write_index[0].item()
         )
         if not enable_write_verify_inputs:
-            assert (
-                delta == 0
-            ), f"enable_write_verify_inputs=OFF must produce no violations, got {delta}"
+            assert delta == 0, (
+                f"enable_write_verify_inputs=OFF must produce no violations, got {delta}"
+            )
             return
         if expected_input_tokens is None or expected_input_positions is None:
             return
@@ -472,13 +472,13 @@ class WriteInvariants:
         )
         no_mismatch = mismatch_entries == 0
         if no_mismatch:
-            assert (
-                delta == 0
-            ), f"enable_write_verify_inputs=ON with no mismatch produced {delta} violations"
+            assert delta == 0, (
+                f"enable_write_verify_inputs=ON with no mismatch produced {delta} violations"
+            )
         else:
-            assert (
-                delta == mismatch_entries
-            ), f"write input mismatch count {mismatch_entries} produced {delta} violations"
+            assert delta == mismatch_entries, (
+                f"write input mismatch count {mismatch_entries} produced {delta} violations"
+            )
 
     @staticmethod
     def _assert_write_slot_run_counter_incremented(

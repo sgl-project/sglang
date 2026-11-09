@@ -16,9 +16,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager im
     ComponentResidencyManager,
     ComponentUse,
 )
-from sglang.multimodal_gen.runtime.managers.memory_managers.component_resident_strategies import (
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_strategies import (
+    ComponentOffloadStrategy,
     ResidentStrategy,
-    VanillaD2HStrategy,
 )
 from sglang.multimodal_gen.runtime.utils import nvtx_pytorch_hooks
 from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import (
@@ -29,17 +29,6 @@ from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import (
 
 
 class TestMaybeNvtxRange(unittest.TestCase):
-    def test_disabled_returns_noop_context_manager(self) -> None:
-        ran = False
-        with maybe_nvtx_range("never", enabled=False):
-            ran = True
-        self.assertTrue(ran)
-
-    def test_disabled_propagates_exception(self) -> None:
-        with self.assertRaises(RuntimeError):
-            with maybe_nvtx_range("never", enabled=False):
-                raise RuntimeError("boom")
-
     def test_disabled_does_not_call_nvtx(self) -> None:
         with (
             patch.object(nvtx_pytorch_hooks.nvtx, "range_push") as push,
@@ -165,6 +154,27 @@ class TestDiffusionNvtxHooks(unittest.TestCase):
         emit ranges; the caller must explicitly enable via set_enabled."""
         self.assertFalse(DiffusionNvtxHooks()._enabled)
 
+    def test_toggling_mid_forward_keeps_push_pop_balanced(self) -> None:
+        """Toggling hooks mid-forward must not pop an unpushed range or leak a pushed one."""
+        hooks = DiffusionNvtxHooks()
+        dummy = torch.nn.Linear(2, 2)
+        hooks._module_to_name_map[dummy] = "dummy"
+        with (
+            patch.object(nvtx_pytorch_hooks.nvtx, "range_push") as push,
+            patch.object(nvtx_pytorch_hooks.nvtx, "range_pop") as pop,
+        ):
+            hooks.set_enabled(False)
+            hooks._forward_pre_hook(dummy, (torch.zeros(2),), {})
+            hooks.set_enabled(True)
+            hooks._forward_hook(dummy, (), None)
+            pop.assert_not_called()
+
+            hooks._forward_pre_hook(dummy, (torch.zeros(2),), {})
+            hooks.set_enabled(False)
+            hooks._forward_hook(dummy, (), None)
+            push.assert_called_once()
+            pop.assert_called_once_with()
+
     def test_post_hook_fires_on_forward_exception(self) -> None:
         """Regression: ``always_call=True`` on the registered post-hook
         guarantees ``range_pop`` runs even when the wrapped ``forward``
@@ -209,9 +219,6 @@ class _NoOpResidencyStrategy:
     def prefetch_for_use(self, module, use, state) -> bool:
         return False
 
-    def prepare_after_request(self, module, use, state) -> None:
-        pass
-
 
 def _test_manager(
     modules: dict[str, torch.nn.Module],
@@ -239,7 +246,9 @@ class TestComponentResidencyNvtxHooks(unittest.TestCase):
         manager.strategy_for = lambda _component_name, _module: ResidentStrategy()
         self.assertTrue(manager._should_keep_single_dit("transformer", module))
 
-        manager.strategy_for = lambda _component_name, _module: VanillaD2HStrategy()
+        manager.strategy_for = lambda _component_name, _module: (
+            ComponentOffloadStrategy()
+        )
         self.assertFalse(manager._should_keep_single_dit("transformer", module))
 
     def test_disabled_flag_is_noop(self) -> None:

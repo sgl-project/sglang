@@ -23,7 +23,9 @@ from sglang.test.test_utils import (
 )
 
 register_amd_ci(
-    est_time=5400, suite="nightly-amd-8-gpu-mi35x-deepseek-v4-pro", nightly=True
+    est_time=5400,
+    suite="nightly-amd-8-gpu-mi35x-deepseek-v4-pro",
+    nightly=True,
 )
 
 DEEPSEEK_V4_PRO_FP4_MODEL_PATH = os.environ.get(

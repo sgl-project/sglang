@@ -15,12 +15,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "bench"))
 from bench_parity import make_photo_like
 
 from sglang.srt.managers.mm_utils import data_hash, hash_feature
-from sglang.srt.multimodal._core import common as _rs_common
 from sglang.srt.multimodal.inkling import InklingProcessor
 from sglang.srt.multimodal.inkling.image_processing_rust import (
     InklingRustImageProcessor,
 )
 from sglang.srt.multimodal.processors import inkling as prc
+from sglang.srt.rust_extensions._multimodal import common as _rs_common
 
 
 def png_bytes(arr):

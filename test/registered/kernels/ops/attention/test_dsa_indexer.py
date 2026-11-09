@@ -1,4 +1,5 @@
 import unittest
+from itertools import product
 from typing import List, Optional, Tuple
 from unittest.mock import MagicMock, patch
 
@@ -20,19 +21,27 @@ from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import (
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
     DSATopKBackend,
     TopkTransformMethod,
+    _topk_transform_v2_packed,
+)
+from sglang.srt.layers.attention.dsa.utils import (
+    _fp8_mqa_logits_torch,
+    _fp8_paged_mqa_logits_torch,
 )
 from sglang.srt.layers.attention.dsa_backend import (
     DeepseekSparseAttnBackend,
     DSAMetadata,
 )
+from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
 from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.linear import LinearBase
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=18, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=17, stage="base-b", runner_config="1-gpu-large")
 
 # Global configuration for all indexer tests
 DEFAULT_CONFIG = {
@@ -180,6 +189,7 @@ class MockModelRunner:
         self.config = {**DEFAULT_CONFIG, **(config or {})}
         self.dtype = self.config["dtype"]
         self.kv_cache_dtype = self.config["kv_cache_dtype"]
+        self.is_draft_worker = False
         self.is_hybrid_swa = False
 
         # Model configuration
@@ -216,6 +226,7 @@ class MockModelRunner:
 
         self.sliding_window_size = None
         self.page_size = self.config["page_size"]
+        self.max_running_requests = max_batch_size
 
         # Create req_to_token_pool
         self.req_to_token_pool = type(
@@ -245,6 +256,7 @@ class MockModelRunner:
             index_head_dim=self.config["index_head_dim"],
             enable_memory_saver=False,
             kv_cache_dim=self.config["kv_lora_rank"] + self.config["qk_rope_head_dim"],
+            use_fp4_indexer=self.config.get("use_fp4_indexer", False),
         )
 
         # Required by backend with DSA-specific attributes
@@ -273,7 +285,6 @@ class TestDSAIndexer(CustomTestCase):
     def setUpClass(cls):
         """Set up global server args for testing."""
         server_args = ServerArgs(model_path="dummy")
-        server_args.enable_dp_attention = False
         server_args.dsa_prefill_backend = "flashmla_sparse"
         server_args.dsa_decode_backend = "flashmla_sparse"
         set_global_server_args_for_scheduler(server_args)
@@ -449,6 +460,151 @@ class TestDSAIndexer(CustomTestCase):
             index=perm,
         )
 
+    def _assert_dsv4_compact_topk_result(
+        self,
+        scores: torch.Tensor,
+        seq_lens: torch.Tensor,
+        page_table: torch.Tensor,
+        out_page_indices: torch.Tensor,
+        out_raw_indices: Optional[torch.Tensor],
+        page_size: int,
+    ) -> None:
+        topk = out_page_indices.shape[1]
+        for row in range(scores.shape[0]):
+            seq_len = int(seq_lens[row].item())
+            expected_count = min(seq_len, topk)
+            if seq_len <= topk:
+                expected_raw = torch.arange(
+                    seq_len, dtype=torch.int32, device=scores.device
+                )
+            else:
+                expected_raw = torch.topk(
+                    scores[row, :seq_len], topk, sorted=False
+                ).indices.to(torch.int32)
+            expected_page_indices = (
+                page_table[row, expected_raw.long() // page_size] * page_size
+                + expected_raw % page_size
+            )
+
+            actual_page_indices = out_page_indices[row]
+            actual_page_prefix = actual_page_indices[:expected_count]
+            self.assertTrue(
+                torch.equal(
+                    torch.sort(actual_page_prefix).values,
+                    torch.sort(expected_page_indices).values,
+                )
+            )
+            self.assertTrue(torch.all(actual_page_indices[expected_count:] == -1))
+
+            if out_raw_indices is not None:
+                actual_raw = out_raw_indices[row]
+                actual_raw_prefix = actual_raw[:expected_count]
+                self.assertTrue(
+                    torch.equal(
+                        torch.sort(actual_raw_prefix).values,
+                        torch.sort(expected_raw).values,
+                    )
+                )
+                self.assertTrue(torch.all(actual_raw[expected_count:] == -1))
+                translated_raw = (
+                    page_table[row, actual_raw_prefix.long() // page_size] * page_size
+                    + actual_raw_prefix % page_size
+                )
+                self.assertTrue(torch.equal(actual_page_prefix, translated_raw))
+
+    def test_dsv4_flashinfer_compact_topk_cuda_graph(self):
+        num_rows, max_len, page_size = 4, 2048, 64
+        score_storage = torch.empty(
+            (num_rows, max_len + 16), dtype=torch.float32, device=self.device
+        )
+        scores = score_storage[:, 1 : max_len + 1]
+        self.assertFalse(scores.is_contiguous())
+
+        page_table = 17 + torch.arange(
+            num_rows * (max_len // page_size),
+            dtype=torch.int32,
+            device=self.device,
+        ).reshape(num_rows, max_len // page_size)
+
+        for fuse_topk, topk, with_raw_output in product(
+            (False, True), (512, 1024), (False, True)
+        ):
+            with self.subTest(
+                fuse_topk=fuse_topk,
+                topk=topk,
+                with_raw_output=with_raw_output,
+            ):
+                scores.copy_(
+                    torch.arange(max_len, dtype=torch.float32, device=self.device)
+                    .unsqueeze(0)
+                    .expand(num_rows, -1)
+                )
+                seq_lens = torch.full(
+                    (num_rows,), max_len, dtype=torch.int32, device=self.device
+                )
+                out_page_indices = torch.empty(
+                    (num_rows, topk), dtype=torch.int32, device=self.device
+                )
+                out_raw_indices = (
+                    torch.empty_like(out_page_indices) if with_raw_output else None
+                )
+
+                # Capture with every output slot valid so shrinking lengths on
+                # replay leaves meaningful stale values in any unwritten suffix.
+                with (
+                    envs.SGLANG_DSA_FUSE_TOPK.override(fuse_topk),
+                    envs.SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC.override(True),
+                    envs.SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK.override("small"),
+                ):
+                    backend = C4IndexerBackendMixin()
+                    backend.flashinfer_topk_transform(
+                        scores,
+                        seq_lens,
+                        page_table,
+                        out_page_indices,
+                        page_size,
+                        out_raw_indices,
+                    )
+                    torch.cuda.synchronize()
+
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
+                        backend.flashinfer_topk_transform(
+                            scores,
+                            seq_lens,
+                            page_table,
+                            out_page_indices,
+                            page_size,
+                            out_raw_indices,
+                        )
+
+                    scores.copy_(
+                        torch.arange(
+                            max_len, 0, -1, dtype=torch.float32, device=self.device
+                        )
+                        .unsqueeze(0)
+                        .expand(num_rows, -1)
+                    )
+                    page_table.add_(100)
+                    seq_lens.copy_(
+                        torch.tensor(
+                            [0, topk - 1, topk + 73, max_len],
+                            dtype=torch.int32,
+                            device=self.device,
+                        )
+                    )
+                    graph.replay()
+                    torch.cuda.synchronize()
+
+                self._assert_dsv4_compact_topk_result(
+                    scores,
+                    seq_lens,
+                    page_table,
+                    out_page_indices,
+                    out_raw_indices,
+                    page_size,
+                )
+
     def _run_unfused_topk_backend_validity_test(
         self,
         batch_size: int,
@@ -570,25 +726,55 @@ class TestDSAIndexer(CustomTestCase):
         query_lens: Optional[List[int]] = None,
     ):
         num_rows = sum(query_lens) if query_lens is not None else batch_size
+        # Shifted PAGED rows use global score offsets and request-local page tables.
+        # Give each packed row more than topk entries to exercise actual selection.
+        if with_row_starts and topk_transform_method == TopkTransformMethod.PAGED:
+            max_score_len = max(max_score_len, batch_size * (topk + 1))
         logits = self._make_tie_free_logits(num_rows, max_score_len)
 
         if with_row_starts:
-            row_starts = torch.randint(
-                0,
-                max_score_len - 1,
-                (num_rows,),
-                dtype=torch.int32,
-                device=self.device,
-            )
-            max_lengths = max_score_len - row_starts
-            random_lengths = torch.randint(
-                1,
-                max_score_len,
-                (num_rows,),
-                dtype=torch.int32,
-                device=self.device,
-            )
-            seq_lens_expanded = torch.minimum(max_lengths, random_lengths)
+            if topk_transform_method == TopkTransformMethod.PAGED:
+                packed_row_size = max_score_len // batch_size
+                self.assertGreaterEqual(packed_row_size, topk)
+                cu_seqlens_k = (
+                    torch.arange(batch_size + 1, dtype=torch.int32, device=self.device)
+                    * packed_row_size
+                )
+                if query_lens is None:
+                    row_to_batch = torch.arange(
+                        batch_size, dtype=torch.int32, device=self.device
+                    )
+                else:
+                    row_to_batch = torch.repeat_interleave(
+                        torch.arange(batch_size, dtype=torch.int32, device=self.device),
+                        torch.tensor(query_lens, dtype=torch.int32, device=self.device),
+                        output_size=num_rows,
+                    )
+                row_starts = cu_seqlens_k[:-1][row_to_batch]
+                seq_lens_expanded = torch.randint(
+                    topk + 1,
+                    packed_row_size + 1,
+                    (num_rows,),
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+            else:
+                row_starts = torch.randint(
+                    0,
+                    max_score_len - 1,
+                    (num_rows,),
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                max_lengths = max_score_len - row_starts
+                random_lengths = torch.randint(
+                    1,
+                    max_score_len,
+                    (num_rows,),
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                seq_lens_expanded = torch.minimum(max_lengths, random_lengths)
         else:
             row_starts = None
             seq_lens_expanded = torch.randint(
@@ -616,9 +802,10 @@ class TestDSAIndexer(CustomTestCase):
             )
             cu_seqlens_q[1:] = torch.cumsum(q_lens, dim=0)
             batch_idx_list = list(range(batch_size))
-        cu_seqlens_k = torch.zeros(
-            batch_size + 1, dtype=torch.int32, device=self.device
-        )
+        if not (with_row_starts and topk_transform_method == TopkTransformMethod.PAGED):
+            cu_seqlens_k = torch.zeros(
+                batch_size + 1, dtype=torch.int32, device=self.device
+            )
         dsa_cu_seqlens_k = torch.zeros(
             num_rows + 1, dtype=torch.int32, device=self.device
         )
@@ -677,13 +864,21 @@ class TestDSAIndexer(CustomTestCase):
             topk_backend=DSATopKBackend.FLASHINFER,
         )
 
+        import flashinfer
+
         repeat_interleave = torch.repeat_interleave
+        top_k_page_table_transform = flashinfer.top_k_page_table_transform
         with (
             envs.SGLANG_DSA_FUSE_TOPK.override(True),
             patch(
                 "sglang.srt.layers.attention.dsa_backend.torch.repeat_interleave",
                 wraps=repeat_interleave,
             ) as mock_repeat_interleave,
+            patch.object(
+                flashinfer,
+                "top_k_page_table_transform",
+                wraps=top_k_page_table_transform,
+            ) as mock_top_k_page_table_transform,
         ):
             out_sgl = metadata_sgl.topk_transform(
                 logits,
@@ -699,6 +894,25 @@ class TestDSAIndexer(CustomTestCase):
                 cu_seqlens_q=q_lens,
                 batch_idx_list=batch_idx_list,
             )
+
+        if topk_transform_method == TopkTransformMethod.PAGED:
+            mock_top_k_page_table_transform.assert_called_once()
+            call_kwargs = mock_top_k_page_table_transform.call_args.kwargs
+            if row_starts is None:
+                self.assertIsNone(call_kwargs["row_starts"])
+                self.assertIsNone(call_kwargs["page_table_row_starts"])
+            else:
+                self.assertTrue(torch.equal(call_kwargs["row_starts"], row_starts))
+                self.assertIsNotNone(call_kwargs["row_to_batch"])
+                expected_page_table_row_starts = (
+                    row_starts - cu_seqlens_k[:-1][call_kwargs["row_to_batch"]]
+                )
+                self.assertTrue(
+                    torch.equal(
+                        call_kwargs["page_table_row_starts"],
+                        expected_page_table_row_starts,
+                    )
+                )
 
         if query_lens is not None:
             self.assertTrue(mock_repeat_interleave.call_args_list)
@@ -720,10 +934,10 @@ class TestDSAIndexer(CustomTestCase):
             )
         )
 
-    @patch("sglang.srt.layers.attention.dsa.dsa_indexer.deep_gemm")
-    def test_indexer_basic_creation(self, mock_deep_gemm):
+    @patch("sglang.srt.layers.attention.dsa.dsa_indexer.resolve_num_sms")
+    def test_indexer_basic_creation(self, mock_resolve_num_sms):
         """Test basic indexer creation and initialization."""
-        mock_deep_gemm.get_num_sms.return_value = 132
+        mock_resolve_num_sms.return_value = 132
 
         indexer = self._create_indexer()
 
@@ -734,16 +948,30 @@ class TestDSAIndexer(CustomTestCase):
         self.assertEqual(indexer.index_topk, self.config["index_topk"])
         self.assertEqual(indexer.layer_id, self.config["layer_id"])
 
-    @patch("sglang.srt.layers.attention.dsa.dsa_indexer.deep_gemm")
-    @patch("sglang.kernels.ops.attention.dsa.triton_kernel.act_quant")
-    def test_forward_extend_mode(self, mock_act_quant, mock_deep_gemm):
+    @patch("sglang.srt.layers.attention.dsa.dsa_indexer.resolve_num_sms")
+    @patch(
+        "sglang.srt.layers.attention.dsa.dsa_indexer.resolve_fp8_paged_mqa_logits_fn"
+    )
+    @patch("sglang.srt.layers.attention.dsa.dsa_indexer.resolve_fp8_mqa_logits_fn")
+    @patch(
+        "sglang.srt.layers.attention.dsa.dsa_indexer.resolve_paged_mqa_logits_metadata_fn"
+    )
+    @patch("sglang.kernels.ops.quantization.act_quant_triton.act_quant")
+    def test_forward_extend_mode(
+        self,
+        mock_act_quant,
+        mock_resolve_metadata,
+        mock_resolve_mqa_logits,
+        mock_resolve_paged_mqa_logits,
+        mock_resolve_num_sms,
+    ):
         """Test indexer forward pass in extend mode."""
         if not self.supports_fp8:
             self.skipTest("FP8 requires Hopper GPU or newer")
 
         # Setup mocks
-        mock_deep_gemm.get_num_sms.return_value = 132
-        mock_deep_gemm.get_paged_mqa_logits_metadata.return_value = MagicMock()
+        mock_resolve_num_sms.return_value = 132
+        mock_resolve_metadata.return_value = MagicMock(return_value=MagicMock())
 
         def mock_quant(x, *args, **kwargs):
             # Return FP8 tensor and scale
@@ -764,7 +992,7 @@ class TestDSAIndexer(CustomTestCase):
                 num_queries, max_kv_len, dtype=torch.float32, device="cuda"
             )
 
-        mock_deep_gemm.fp8_mqa_logits.side_effect = mock_mqa_logits
+        mock_resolve_mqa_logits.return_value = mock_mqa_logits
 
         # Also mock the paged version for completeness
         def mock_paged_mqa_logits(q, kv, weights, *args, **kwargs):
@@ -772,7 +1000,7 @@ class TestDSAIndexer(CustomTestCase):
             seq_len = 128
             return torch.randn(batch_size, seq_len, dtype=torch.float32, device="cuda")
 
-        mock_deep_gemm.fp8_paged_mqa_logits.side_effect = mock_paged_mqa_logits
+        mock_resolve_paged_mqa_logits.return_value = mock_paged_mqa_logits
 
         self._init_model_runner()
 
@@ -816,16 +1044,28 @@ class TestDSAIndexer(CustomTestCase):
             topk_indices, self.batch_size, self.seq_len, self.config["index_topk"]
         )
 
-    @patch("sglang.srt.layers.attention.dsa.dsa_indexer.deep_gemm")
-    @patch("sglang.kernels.ops.attention.dsa.triton_kernel.act_quant")
-    def test_forward_decode_mode(self, mock_act_quant, mock_deep_gemm):
+    @patch("sglang.srt.layers.attention.dsa.dsa_indexer.resolve_num_sms")
+    @patch(
+        "sglang.srt.layers.attention.dsa.dsa_indexer.resolve_fp8_paged_mqa_logits_fn"
+    )
+    @patch(
+        "sglang.srt.layers.attention.dsa.dsa_indexer.resolve_paged_mqa_logits_metadata_fn"
+    )
+    @patch("sglang.kernels.ops.quantization.act_quant_triton.act_quant")
+    def test_forward_decode_mode(
+        self,
+        mock_act_quant,
+        mock_resolve_metadata,
+        mock_resolve_paged_mqa_logits,
+        mock_resolve_num_sms,
+    ):
         """Test indexer forward pass in decode mode."""
         if not self.supports_fp8:
             self.skipTest("FP8 requires Hopper GPU or newer")
 
         # Setup mocks
-        mock_deep_gemm.get_num_sms.return_value = 132
-        mock_deep_gemm.get_paged_mqa_logits_metadata.return_value = MagicMock()
+        mock_resolve_num_sms.return_value = 132
+        mock_resolve_metadata.return_value = MagicMock(return_value=MagicMock())
 
         def mock_quant(x, *args, **kwargs):
             return x.to(torch.float8_e4m3fn), torch.ones(
@@ -835,11 +1075,16 @@ class TestDSAIndexer(CustomTestCase):
         mock_act_quant.side_effect = mock_quant
 
         def mock_paged_mqa_logits(q, kv, weights, *args, **kwargs):
-            batch_size = q.shape[0]
-            seq_len = 128
-            return torch.randn(batch_size, seq_len, dtype=torch.float32, device="cuda")
+            # In decode mode: q is (batch_size, 1) or (batch_size,)
+            # Return logits with shape (batch_size, seq_len) for scoring against cached keys
+            batch_size = q.shape[0] if len(q.shape) > 1 else q.shape[0]
+            seq_len = 128  # Context length from self.seq_len
+            logits = torch.randn(
+                batch_size, seq_len, dtype=torch.float32, device="cuda"
+            )
+            return logits
 
-        mock_deep_gemm.fp8_paged_mqa_logits.side_effect = mock_paged_mqa_logits
+        mock_resolve_paged_mqa_logits.return_value = mock_paged_mqa_logits
 
         self._init_model_runner()
 
@@ -881,6 +1126,127 @@ class TestDSAIndexer(CustomTestCase):
         self._verify_topk_output(
             topk_indices, self.batch_size, 1, self.config["index_topk"]
         )
+
+    def test_fp8_mqa_logits_torch_matches_reference(self):
+        """Test pure-torch prefill MQA logits fallback against a direct reference."""
+        if not self.supports_fp8:
+            self.skipTest("FP8 requires Hopper GPU or newer")
+
+        num_q, num_kv, num_heads, head_dim = 7, 11, 3, 16
+        q_fp8 = torch.randn(
+            num_q, num_heads, head_dim, dtype=torch.bfloat16, device=self.device
+        ).to(torch.float8_e4m3fn)
+        k_fp8 = torch.randn(
+            num_kv, head_dim, dtype=torch.bfloat16, device=self.device
+        ).to(torch.float8_e4m3fn)
+        k_scale = torch.rand(num_kv, dtype=torch.float32, device=self.device) + 0.5
+        weights = torch.rand(num_q, num_heads, dtype=torch.float32, device=self.device)
+        ks = torch.tensor([0, 1, 2, 0, 4, 3, 5], dtype=torch.int32, device=self.device)
+        ke = torch.tensor(
+            [num_kv, 9, 7, 5, num_kv, 8, 10], dtype=torch.int32, device=self.device
+        )
+
+        actual = _fp8_mqa_logits_torch(q_fp8, (k_fp8, k_scale), weights, ks, ke)
+
+        q = q_fp8.to(torch.bfloat16)
+        k_t = k_fp8.to(torch.bfloat16).t()
+        expected = torch.zeros(num_q, num_kv, dtype=torch.float32, device=self.device)
+        for h in range(num_heads):
+            expected.addcmul_(
+                torch.relu(torch.mm(q[:, h], k_t)).float(), weights[:, h : h + 1]
+            )
+        expected *= k_scale.reshape(1, num_kv).float()
+        positions = torch.arange(num_kv, device=self.device).unsqueeze(0)
+        expected.masked_fill_(
+            ~((positions >= ks.unsqueeze(1)) & (positions < ke.unsqueeze(1))), 0.0
+        )
+
+        torch.testing.assert_close(actual, expected, rtol=1e-3, atol=1e-3)
+
+        # topk_v2 needs a row stride that is a multiple of 4.
+        self.assertEqual(actual.stride(1), 1)
+        self.assertEqual(actual.stride(0) % 4, 0)
+
+    def test_fp8_paged_mqa_logits_torch_matches_reference(self):
+        """Test paged pure-torch MQA logits fallback against a direct reference."""
+        if not self.supports_fp8:
+            self.skipTest("FP8 requires Hopper GPU or newer")
+
+        batch_size, num_heads, head_dim = 3, 2, 128
+        block_size, num_blocks, max_pages = 64, 5, 3
+        max_seq_len = 160
+        q_fp8 = torch.randn(
+            batch_size,
+            1,
+            num_heads,
+            head_dim,
+            dtype=torch.bfloat16,
+            device=self.device,
+        ).to(torch.float8_e4m3fn)
+        kv_values_fp8 = torch.randn(
+            num_blocks, block_size, head_dim, dtype=torch.bfloat16, device=self.device
+        ).to(torch.float8_e4m3fn)
+        kv_scales = (
+            torch.rand(num_blocks, block_size, dtype=torch.float32, device=self.device)
+            + 0.5
+        )
+        # Page-blocked layout (as written by SetKAndS and read by DeepGEMM): each
+        # page holds all block_size * head_dim value bytes, then all block_size * 4
+        # scale bytes -- not per-token [value, scale] pairs.
+        kv_pages = torch.zeros(
+            num_blocks,
+            block_size * (head_dim + 4),
+            dtype=torch.uint8,
+            device=self.device,
+        )
+        kv_pages[:, : block_size * head_dim] = kv_values_fp8.view(torch.uint8).reshape(
+            num_blocks, block_size * head_dim
+        )
+        kv_pages[:, block_size * head_dim :] = (
+            kv_scales.contiguous().view(torch.uint8).reshape(num_blocks, block_size * 4)
+        )
+        kv_cache_fp8 = kv_pages.view(num_blocks, block_size, 1, head_dim + 4)
+
+        weights = torch.rand(
+            batch_size, num_heads, dtype=torch.float32, device=self.device
+        )
+        context_lens = torch.tensor(
+            [70, 129, 150], dtype=torch.int32, device=self.device
+        )
+        block_table = torch.tensor(
+            [[0, 1, 2], [2, 3, 4], [4, 1, 0]], dtype=torch.int32, device=self.device
+        )
+
+        actual = _fp8_paged_mqa_logits_torch(
+            q_fp8,
+            kv_cache_fp8,
+            weights,
+            context_lens,
+            block_table,
+            None,
+            max_seq_len,
+            clean_logits=False,
+        )
+
+        q = q_fp8[:, 0].to(torch.bfloat16)
+        expected = torch.zeros(
+            batch_size, max_seq_len, dtype=torch.float32, device=self.device
+        )
+        kv_values = kv_values_fp8.to(torch.bfloat16)
+        for b in range(batch_size):
+            pages = block_table[b]
+            k = kv_values[pages].reshape(max_pages * block_size, head_dim)
+            scale = kv_scales[pages].reshape(max_pages * block_size)
+            scores = torch.zeros(
+                max_pages * block_size, dtype=torch.float32, device=self.device
+            )
+            for h in range(num_heads):
+                scores += torch.relu(torch.mv(k, q[b, h])).float() * weights[b, h]
+            scores *= scale
+            scores[int(context_lens[b].item()) :] = 0.0
+            expected[b, :max_seq_len] = scores[:max_seq_len]
+
+        torch.testing.assert_close(actual, expected, rtol=1e-3, atol=1e-3)
 
     def test_rotate_activation(self):
         """Test the Hadamard transform (rotate_activation) function."""
@@ -1017,6 +1383,193 @@ class TestDSAIndexer(CustomTestCase):
                         query_lens=[1, 2, 3, 1, 2, 1, 3, 2],
                     )
 
+    def _assert_paged_topk_exact(
+        self,
+        out: torch.Tensor,
+        scores: torch.Tensor,
+        row_starts: torch.Tensor,
+        lengths: torch.Tensor,
+        row_to_req: torch.Tensor,
+        page_table_1: torch.Tensor,
+        topk: int,
+    ):
+        for row in range(out.shape[0]):
+            start, length = int(row_starts[row]), int(lengths[row])
+            num_valid = min(topk, length)
+            self.assertTrue(torch.all(out[row, num_valid:] == -1))
+            # Each request's slot table is injective, so sorting it inverts it;
+            # a slot outside the row's window has no preimage there.
+            req_slots = page_table_1[int(row_to_req[row]), :length].to(torch.int64)
+            sorted_slots, slot_positions = torch.sort(req_slots)
+            slots = out[row, :num_valid].to(torch.int64)
+            idx = torch.searchsorted(sorted_slots, slots).clamp(max=length - 1)
+            self.assertTrue(torch.equal(sorted_slots[idx], slots))
+            positions = slot_positions[idx]
+            self.assertEqual(torch.unique(positions).numel(), num_valid)
+            window = scores[row, start : start + length]
+            self.assertTrue(
+                torch.equal(
+                    torch.sort(window[positions]).values,
+                    torch.sort(torch.topk(window, num_valid).values).values,
+                )
+            )
+
+    def test_packed_paged_extend_dispatch(self):
+        """PAGED extend top-k with row starts runs the packed v2 kernel, exactly.
+
+        That holds for a whole-forward call and for the indexer's row chunks.
+        Without packed_extend_topk, a prefill-CP rank's token shard stays on
+        legacy for both calls.
+        """
+        import sgl_kernel
+
+        topk, page_size = 2048, 64
+        # (key-axis base, keys, row windows) per request; base 3203 is unaligned and
+        # the windows reach the trivial, Register2, Register4 and Streaming paths.
+        requests = [
+            (0, 3203, [1500, 3203]),
+            (3203, 40960, [1500, 6000, 12000, 40960]),
+        ]
+        num_cols = sum(keys for _, keys, _ in requests)
+        # DeepGEMM pads the logits row stride to 256 columns.
+        row_stride = -(-num_cols // 256) * 256
+        i32 = dict(dtype=torch.int32, device=self.device)
+        row_starts = torch.tensor([b for b, _, ws in requests for _ in ws], **i32)
+        lengths = torch.tensor([w for _, _, ws in requests for w in ws], **i32)
+        token_to_batch_idx = torch.tensor(
+            [q for q, (_, _, ws) in enumerate(requests) for _ in ws], **i32
+        )
+        keys = torch.tensor([n for _, n, _ in requests], **i32)
+        num_rows = lengths.shape[0]
+
+        # Requests own disjoint pages of a permuted pool, so a wrong page size
+        # or page-table row maps a selection outside its request's slots.
+        num_pages = [-(-n // page_size) for _, n, _ in requests]
+        pool = torch.randperm(2 * sum(num_pages), device=self.device).to(torch.int32)
+        real_page_table = torch.full((len(requests), max(num_pages)), -1, **i32)
+        page_table_1 = torch.full((len(requests), int(keys.max())), -1, **i32)
+        used = 0
+        for q, (_, n, _) in enumerate(requests):
+            real_page_table[q, : num_pages[q]] = pool[used : used + num_pages[q]]
+            used += num_pages[q]
+            pos = torch.arange(n, **i32)
+            page_table_1[q, :n] = (
+                real_page_table[q, pos // page_size] * page_size + pos % page_size
+            )
+
+        def cumsum(x):
+            return torch.nn.functional.pad(
+                torch.cumsum(x, 0, dtype=torch.int32), (1, 0)
+            )
+
+        def make_metadata(rows, prefill_cp_sharded=False):
+            row_lengths = lengths[rows]
+            row_batch = token_to_batch_idx[rows]
+            q_lens = torch.bincount(row_batch, minlength=len(requests)).to(torch.int32)
+            clipped = torch.clamp(row_lengths, max=topk)
+            return DSAIndexerMetadata(
+                attn_metadata=DSAMetadata(
+                    page_size=page_size,
+                    cache_seqlens_int32=keys,
+                    max_seq_len_q=int(q_lens.max()),
+                    max_seq_len_k=int(keys.max()),
+                    cu_seqlens_q=cumsum(q_lens),
+                    cu_seqlens_k=cumsum(keys),
+                    page_table_1=page_table_1,
+                    real_page_table=real_page_table,
+                    dsa_cache_seqlens_int32=clipped,
+                    dsa_cu_seqlens_q=torch.arange(row_lengths.shape[0] + 1, **i32),
+                    dsa_cu_seqlens_k=cumsum(clipped),
+                    dsa_extend_seq_lens_list=q_lens.tolist(),
+                    dsa_seqlens_expanded=row_lengths,
+                    token_to_batch_idx=row_batch,
+                    prefill_cp_sharded=prefill_cp_sharded,
+                ),
+                topk_transform_method=TopkTransformMethod.PAGED,
+                topk_backend=DSATopKBackend.SGL_KERNEL,
+            )
+
+        def chunk_kwargs(rows):
+            return dict(
+                cu_seqlens_q=torch.ones(lengths[rows].shape[0], **i32),
+                ke_offset=lengths[rows],
+                batch_idx_list=token_to_batch_idx[rows],
+            )
+
+        whole = make_metadata(slice(None))
+        # Interleaved prefill CP, rank 1 of 2: every second token of the batch.
+        # Both requests keep tokens here, so their indices and key bases hold.
+        cp_rows = torch.arange(1, num_rows, 2, device=self.device)
+        cp_shard = make_metadata(cp_rows, prefill_cp_sharded=True)
+        chunk = slice(1, 5)  # crosses the request boundary
+        cp_chunk = cp_rows[:2]  # crosses it on the CP rank
+        # (call, metadata, rows of the unsharded batch, kwargs, (packed, legacy) calls)
+        cases = [
+            ("whole forward", whole, slice(None), {}, (1, 0)),
+            ("indexer row chunk", whole, chunk, chunk_kwargs(chunk), (1, 0)),
+            ("prefill-CP whole forward", cp_shard, cp_rows, {}, (0, 1)),
+            (
+                "prefill-CP row chunk",
+                cp_shard,
+                cp_chunk,
+                chunk_kwargs(cp_chunk),
+                (0, 1),
+            ),
+        ]
+        scores = self._make_tie_free_logits(num_rows, row_stride)
+        for name, metadata, rows, kwargs, want_calls in cases:
+            with self.subTest(call=name):
+                # Row-gather first, then cut the columns: the logits keep
+                # DeepGEMM's padded row stride, as the packed path requires.
+                with (
+                    envs.SGLANG_DSA_FUSE_TOPK.override(True),
+                    envs.SGLANG_OPT_USE_TOPK_V2.override(True),
+                    patch(
+                        "sglang.srt.layers.attention.dsa.dsa_topk_backend."
+                        "_topk_transform_v2_packed",
+                        wraps=_topk_transform_v2_packed,
+                    ) as packed,
+                    patch(
+                        "sgl_kernel.fast_topk_transform_fused",
+                        wraps=sgl_kernel.fast_topk_transform_fused,
+                    ) as legacy,
+                ):
+                    out = metadata.topk_transform(
+                        scores[rows].clone()[:, :num_cols],
+                        topk,
+                        ks=row_starts[rows],
+                        **kwargs,
+                    )
+                self.assertEqual(
+                    (packed.call_count, legacy.call_count),
+                    want_calls,
+                    "(packed, legacy) calls",
+                )
+                with (
+                    envs.SGLANG_DSA_FUSE_TOPK.override(True),
+                    envs.SGLANG_OPT_USE_TOPK_V2.override(False),
+                ):
+                    ref = metadata.topk_transform(
+                        scores[rows].clone()[:, :num_cols],
+                        topk,
+                        ks=row_starts[rows],
+                        **kwargs,
+                    )
+                self.assertTrue(
+                    torch.equal(
+                        torch.sort(out, dim=-1).values, torch.sort(ref, dim=-1).values
+                    )
+                )
+                self._assert_paged_topk_exact(
+                    out,
+                    scores[rows],
+                    row_starts[rows],
+                    lengths[rows],
+                    token_to_batch_idx[rows],
+                    page_table_1,
+                    topk,
+                )
+
     def test_topk_v2_respects_topk_backend(self):
         seq_lens = torch.tensor([2048, 4096], dtype=torch.int32, device=self.device)
         expected_plan = torch.empty(3, dtype=torch.int32, device=self.device)
@@ -1028,13 +1581,20 @@ class TestDSAIndexer(CustomTestCase):
             with self.subTest(topk_backend=topk_backend.value):
                 backend = object.__new__(DeepseekSparseAttnBackend)
                 backend.device = self.device
-                backend.real_page_size = 64
+                backend.physical_page_size = 64
+                backend.real_page_span = 64
+                backend.attn_dcp_size, backend.attn_dcp_rank = 1, 0
+                backend.dsa_shards_index_k = False
                 backend.hisparse_coordinator = None
                 backend.speculative_num_draft_tokens = 0
                 backend.use_fused_topk = True
                 backend.dsa_topk_backend = topk_backend
                 backend.dsa_index_topk = 2048
+                backend.dsa_index_kpool = 1
                 backend.dsa_decode_impl = "fa3"
+                backend._memory_saver_adapter = TorchMemorySaverAdapter.create(
+                    enable=False
+                )
                 backend.req_to_token = torch.empty(
                     2, 4096, dtype=torch.int32, device=self.device
                 )
@@ -1078,20 +1638,20 @@ class TestDSAIndexer(CustomTestCase):
     #             indexer = self._create_indexer(index_topk=topk)
     #             self.assertEqual(indexer.index_topk, topk)
 
-    @patch("sglang.srt.layers.attention.dsa.dsa_indexer.deep_gemm")
-    def test_indexer_with_fused_wk(self, mock_deep_gemm):
+    @patch("sglang.srt.layers.attention.dsa.dsa_indexer.resolve_num_sms")
+    def test_indexer_with_fused_wk(self, mock_resolve_num_sms):
         """Test indexer creation with fused wk and weights projection."""
-        mock_deep_gemm.get_num_sms.return_value = 132
+        mock_resolve_num_sms.return_value = 132
 
         # Note: fuse_wk_and_weights_proj feature is not currently implemented
         # This test verifies basic indexer creation still works
         indexer = self._create_indexer()
         self.assertIsNotNone(indexer)
 
-    @patch("sglang.srt.layers.attention.dsa.dsa_indexer.deep_gemm")
-    def test_indexer_with_alt_stream(self, mock_deep_gemm):
+    @patch("sglang.srt.layers.attention.dsa.dsa_indexer.resolve_num_sms")
+    def test_indexer_with_alt_stream(self, mock_resolve_num_sms):
         """Test indexer creation with alternative CUDA stream."""
-        mock_deep_gemm.get_num_sms.return_value = 132
+        mock_resolve_num_sms.return_value = 132
 
         alt_stream = torch.cuda.Stream()
         indexer = self._create_indexer(alt_stream=alt_stream)

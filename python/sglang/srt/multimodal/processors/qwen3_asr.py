@@ -3,8 +3,9 @@ from typing import Union
 
 import torch
 
-from sglang.srt.managers.schedule_batch import Modality, MultimodalProcessorOutput
+from sglang.srt.managers.req_types import MultimodalProcessorOutput
 from sglang.srt.models.qwen3_asr import Qwen3ASRForConditionalGeneration
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
@@ -13,10 +14,7 @@ from sglang.srt.multimodal.processors.base_processor import (
 AUDIO_PLACEHOLDER = "<|audio_start|><|audio_pad|><|audio_end|>"
 
 DEFAULT_ASR_PROMPT = (
-    f"<|im_start|>user\n"
-    f"{AUDIO_PLACEHOLDER}"
-    f"<|im_end|>\n"
-    f"<|im_start|>assistant\n"
+    f"<|im_start|>user\n{AUDIO_PLACEHOLDER}<|im_end|>\n<|im_start|>assistant\n"
 )
 
 
@@ -79,7 +77,7 @@ class Qwen3ASRMultimodalProcessor(BaseMultimodalProcessor):
         if base_output is None:
             return None
 
-        mm_items, input_ids, ret = self.process_and_combine_mm_data(
+        mm_items, input_ids, ret = await self.process_and_combine_mm_data_async(
             base_output, self.mm_tokens
         )
 

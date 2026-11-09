@@ -1,17 +1,22 @@
 from __future__ import annotations
 
+from typing import NamedTuple, Sequence
+
 import torch
 
 from sglang.kernels.ops.kv_canary import consts
-from sglang.kernels.ops.kv_canary.consts import splitmix64, splitmix64_mix3
+from sglang.kernels.ops.kv_canary.consts import (
+    U64_MASK,
+    canary_chain_extend_hash,
+    canary_chain_initial_hash,
+    splitmix64,
+    to_signed_int64,
+)
 from sglang.kernels.ops.kv_canary.verify import (
     RealKvSource,
     VerifyOrWriteContext,
     VerifyPlan,
 )
-
-_U64_MASK: int = (1 << 64) - 1
-_I64_SIGN_BIT: int = 1 << 63
 
 
 def launch_canary_verify_kernel_torch_reference(
@@ -93,6 +98,13 @@ def launch_canary_verify_kernel_torch_reference(
             f"kv-canary: canary_buf slot stride must hold at least 4 int64 fields, got {slot_stride_i64}"
         )
 
+    host_real_kv_sources = materialize_real_kv_sources(
+        real_kv_sources=real_kv_sources,
+        real_kv_hash_mode=real_kv_hash_mode,
+        slot_indices=slot_indices_list,
+        work_device=work_device,
+    )
+
     violation_rows: list[list[int]] = []
 
     for k in range(active):
@@ -110,19 +122,15 @@ def launch_canary_verify_kernel_torch_reference(
 
         prev_reachable = prev_slot != consts.TOKEN_TO_KV_SLOT_PADDING
         if prev_reachable:
-            expected_chain_hash = _to_signed_int64(
-                compute_slot_hash(buf_i64, prev_slot)
-            )
+            expected_chain_hash = to_signed_int64(compute_slot_hash(buf_i64, prev_slot))
         else:
             expected_chain_hash = stored_chain_hash
 
         expected_real_kv_hash_u64 = _compute_real_kv_hash_scalar(
             slot_idx=slot_idx,
-            real_kv_sources=real_kv_sources,
-            real_kv_hash_mode=real_kv_hash_mode,
-            work_device=work_device,
+            host_sources=host_real_kv_sources,
         )
-        expected_real_kv_hash = _to_signed_int64(expected_real_kv_hash_u64)
+        expected_real_kv_hash = to_signed_int64(expected_real_kv_hash_u64)
 
         fail_reason = consts.FailReason(0)
         if prev_reachable and stored_chain_hash != expected_chain_hash:
@@ -174,53 +182,93 @@ def launch_canary_verify_kernel_torch_reference(
     violation_write_index[0] = violation_write_index[0] + num_new_violations
 
 
-def _to_signed_int64(value: int) -> int:
-    value &= _U64_MASK
-    if value >= _I64_SIGN_BIT:
-        value -= 1 << 64
-    return value
-
-
 def compute_slot_hash(buf_i64: torch.Tensor, source_slot_idx: int) -> int:
     if source_slot_idx < 0:
-        return splitmix64(consts.CANARY_CHAIN_ANCHOR)
+        return canary_chain_initial_hash()
     token = int(buf_i64[source_slot_idx, consts.CANARY_FIELD_TOKEN].item())
     position = int(buf_i64[source_slot_idx, consts.CANARY_FIELD_POSITION].item())
     prev_hash = int(buf_i64[source_slot_idx, consts.CANARY_FIELD_PREV_HASH].item())
-    return splitmix64_mix3(prev_hash, token, position)
+    return canary_chain_extend_hash(prev_hash, token, position)
+
+
+class _MaterializedRealKvSource(NamedTuple):
+    """A ``RealKvSource`` narrowed to the rows one launch reads, on ``work_device``.
+
+    ``row_lookup`` maps a source row (``slot_idx // page_size``) to its index in
+    ``tensor_u8``, which holds only the gathered rows.
+    """
+
+    tensor_u8: torch.Tensor
+    row_lookup: dict[int, int]
+    page_size: int
+    num_bytes_per_token: int
+    effective_read_bytes: int
+
+
+def materialize_real_kv_sources(
+    *,
+    real_kv_sources: tuple[RealKvSource, ...],
+    real_kv_hash_mode: consts.RealKvHashMode,
+    slot_indices: Sequence[int],
+    work_device: torch.device,
+) -> tuple[_MaterializedRealKvSource, ...]:
+    """Gather each source's read rows onto ``work_device`` once per launch.
+
+    An empty tuple means nothing to hash; callers skip the per-slot fold."""
+    mode = int(real_kv_hash_mode)
+    if (
+        mode == int(consts.RealKvHashMode.NONE)
+        or len(real_kv_sources) == 0
+        or len(slot_indices) == 0
+    ):
+        return ()
+
+    materialized: list[_MaterializedRealKvSource] = []
+    for source in real_kv_sources:
+        # Gather on device first: copying the whole source is a KV-layer-sized transfer
+        # (one row per token of the pool) on every launch.
+        rows = sorted({slot_idx // source.page_size for slot_idx in slot_indices})
+        row_index = torch.tensor(rows, dtype=torch.int64, device=source.tensor.device)
+        tensor_u8 = (
+            source.tensor.detach()
+            .index_select(0, row_index)
+            .to(device=work_device)
+            .contiguous()
+            .view(torch.uint8)
+        )
+        effective_read_bytes = (
+            16 if mode == int(consts.RealKvHashMode.PARTIAL) else source.read_bytes
+        )
+        materialized.append(
+            _MaterializedRealKvSource(
+                tensor_u8=tensor_u8,
+                row_lookup={row: i for i, row in enumerate(rows)},
+                page_size=source.page_size,
+                num_bytes_per_token=source.num_bytes_per_token,
+                effective_read_bytes=effective_read_bytes,
+            )
+        )
+    return tuple(materialized)
 
 
 def _compute_real_kv_hash_scalar(
     *,
     slot_idx: int,
-    real_kv_sources: tuple[RealKvSource, ...],
-    real_kv_hash_mode: consts.RealKvHashMode,
-    work_device: torch.device,
+    host_sources: tuple[_MaterializedRealKvSource, ...],
 ) -> int:
-    mode = int(real_kv_hash_mode)
-    if mode == int(consts.RealKvHashMode.NONE) or len(real_kv_sources) == 0:
+    if len(host_sources) == 0:
         return 0
 
     acc: int = 0
 
-    for source in real_kv_sources:
-        page_size = source.page_size
-        num_bytes_per_token = source.num_bytes_per_token
-        read_bytes = source.read_bytes
-        tensor_u8 = (
-            source.tensor.detach().to(device=work_device).contiguous().view(torch.uint8)
-        )
+    for source in host_sources:
+        row = source.row_lookup[slot_idx // source.page_size]
+        col_within_page = slot_idx % source.page_size
+        col_start = col_within_page * source.num_bytes_per_token
 
-        row = slot_idx // page_size
-        col_within_page = slot_idx % page_size
-        col_start = col_within_page * num_bytes_per_token
-
-        effective_read_bytes = (
-            16 if mode == int(consts.RealKvHashMode.PARTIAL) else read_bytes
-        )
-        raw_bytes: list[int] = []
-        for b in range(effective_read_bytes):
-            raw_bytes.append(int(tensor_u8[row, col_start + b].item()))
+        raw_bytes = source.tensor_u8[
+            row, col_start : col_start + source.effective_read_bytes
+        ].tolist()
 
         source_hash = _splitmix64_fold_bytes_scalar(raw_bytes=raw_bytes)
 
@@ -241,7 +289,7 @@ def _splitmix64_fold_bytes_scalar(*, raw_bytes: list[int]) -> int:
         word: int = 0
         for k in range(8):
             word |= padded[w * 8 + k] << (8 * k)
-        word &= _U64_MASK
+        word &= U64_MASK
         acc = splitmix64(acc ^ word)
 
     return acc

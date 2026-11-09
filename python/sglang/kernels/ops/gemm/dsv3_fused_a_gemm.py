@@ -11,14 +11,14 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.kernel_api_logging import debug_kernel_api
 from sglang.kernels.jit.utils import (
     cache_once,
     is_arch_support_pdl,
     load_jit,
     make_cpp_args,
 )
-from sglang.srt.utils.common import direct_register_custom_op
+from sglang.kernels.kernel_api_logging import debug_kernel_api
+from sglang.srt.utils.custom_op import direct_register_custom_op
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module

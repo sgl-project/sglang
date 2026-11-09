@@ -3,6 +3,14 @@
 # SPDX-License-Identifier: Apache-2.0
 from diffusers.image_processor import VaeImageProcessor
 
+from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
+    QwenImageEditPlusPipelineConfig,
+    QwenImagePipelineConfig,
+)
+from sglang.multimodal_gen.configs.sample.qwenimage import (
+    QwenImageEditPlusSamplingParams,
+    QwenImageSamplingParams,
+)
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.pipelines_core import LoRAPipeline
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
@@ -19,7 +27,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.
     QwenImageProgressiveDenoisingStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
+from sglang.multimodal_gen.runtime.utils.precision_types import PRECISION_TO_TYPE
 
 
 def prepare_mu(batch: Req, server_args: ServerArgs):
@@ -38,6 +46,11 @@ def prepare_mu(batch: Req, server_args: ServerArgs):
 
 class QwenImagePipeline(LoRAPipeline, ComposedPipelineBase):
     pipeline_name = "QwenImagePipeline"
+
+    # Used when the checkpoint is a single safetensors file with no
+    # model_index.json to derive these from.
+    pipeline_config_cls = QwenImagePipelineConfig
+    sampling_params_cls = QwenImageSamplingParams
 
     _required_config_modules = [
         "text_encoder",
@@ -84,6 +97,11 @@ class QwenImageEditPipeline(LoRAPipeline, ComposedPipelineBase):
 class QwenImageEditPlusPipeline(QwenImageEditPipeline):
     pipeline_name = "QwenImageEditPlusPipeline"
 
+    # Used when the checkpoint is a single safetensors file with no
+    # model_index.json to derive these from.
+    pipeline_config_cls = QwenImageEditPlusPipelineConfig
+    sampling_params_cls = QwenImageEditPlusSamplingParams
+
 
 def prepare_mu_layered(batch: Req, server_args: ServerArgs):
     base_seqlen = 256 * 256 / 16 / 16
@@ -95,6 +113,7 @@ class QwenImageLayeredPipeline(QwenImageEditPipeline):
     pipeline_name = "QwenImageLayeredPipeline"
 
     _required_config_modules = [
+        "text_encoder",
         "vae",
         "tokenizer",
         "processor",
@@ -104,19 +123,19 @@ class QwenImageLayeredPipeline(QwenImageEditPipeline):
 
     def create_pipeline_stages(self, server_args: ServerArgs):
         def create_before_denoising_stage():
-            return QwenImageLayeredBeforeDenoisingStage(
+            stage = QwenImageLayeredBeforeDenoisingStage(
                 vae=self.get_module("vae"),
-                text_encoder=None,
+                text_encoder=self.get_module("text_encoder"),
                 tokenizer=self.get_module("tokenizer"),
                 processor=self.get_module("processor"),
                 transformer=self.get_module("transformer"),
                 scheduler=self.get_module("scheduler"),
-                model_path=self.model_path,
                 vae_dtype=PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision],
                 text_encoder_dtype=PRECISION_TO_TYPE[
                     server_args.pipeline_config.text_encoder_precisions[0]
                 ],
             )
+            return stage
 
         self.add_stage_factory(
             RoleType.ENCODER,

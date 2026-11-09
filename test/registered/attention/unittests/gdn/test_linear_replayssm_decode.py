@@ -1,6 +1,6 @@
 """Correctness test for the buffered output-only linear-attention decode kernel
 (ReplaySSM Part A), implemented in
-``python/sglang/srt/layers/attention/fla/fused_recurrent_linear_replayssm.py``.
+``python/sglang/kernels/ops/attention/linear/fused_recurrent_linear_replayssm.py``.
 
 One kernel, two gate granularities (selected by ``is_kda``):
   * GDN (``is_kda=False``): per-head SCALAR gate. Ground truth =
@@ -33,23 +33,19 @@ L sweep:
 Runnable as ``pytest`` and as ``__main__``.
 """
 
-import sys
 import unittest
-from pathlib import Path
 
 import torch
-
-from sglang.test.test_utils import CustomTestCase
 
 # Mirror sibling GDN unittests: register for CUDA/AMD CI. This is a kernel-math
 # unit test; it lives with the other linear-attention kernel correctness tests.
 # The registry calls MUST be module-level (the CI collector / check-registered-
 # tests hook parses them statically via AST and only scans top-level statements
 # -- a try/except wrapper hides them and fails the hook).
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=20, suite="stage-b-test-1-gpu-large-amd")
 
 
@@ -97,12 +93,14 @@ class TestLinearReplaySSMDecode(CustomTestCase):
     NUM_STEPS = 40  # > 16 -> multiple flush cycles for L in {4,8,16}
     L_SWEEP = (1, 4, 8, 16)
 
-    def _run_one(self, cfg, L, dtype, force_flush_steps=(), is_kda=False):
+    def _run_one(
+        self, cfg, L, dtype, force_flush_steps=(), is_kda=False, packed_state=False
+    ):
         from sglang.kernels.ops.attention.fla.fused_recurrent import (
             fused_recurrent_gated_delta_rule_packed_decode,
             fused_recurrent_kda_packed_decode,
         )
-        from sglang.kernels.ops.attention.fla.fused_recurrent_linear_replayssm import (
+        from sglang.kernels.ops.attention.linear.fused_recurrent_linear_replayssm import (
             fused_recurrent_linear_replayssm_decode,
         )
 
@@ -144,6 +142,27 @@ class TestLinearReplaySSMDecode(CustomTestCase):
             )
         else:
             g_cache = torch.zeros(num_slots, HV, L, device=device, dtype=torch.float32)
+        if packed_state:
+            from sglang.srt.mem_cache.kv.decl import TensorPartDecl
+            from sglang.srt.mem_cache.kv.layout.parts import TensorEntryLayout
+
+            tensors = dict(state=rep_state, d=d_cache, k=k_cache, g=g_cache)
+            layout = TensorEntryLayout(
+                tuple(
+                    TensorPartDecl(
+                        name=name, shape=tuple(tensor.shape[1:]), dtype=tensor.dtype
+                    )
+                    for name, tensor in tensors.items()
+                )
+            )
+            raw = torch.zeros(
+                num_slots * layout.entry_bytes, dtype=torch.uint8, device=device
+            )
+            views = layout.views(raw, num_slots)
+            for name, tensor in tensors.items():
+                views[name].copy_(tensor)
+            rep_state, d_cache, k_cache, g_cache = (views[name] for name in tensors)
+
         write_pos = torch.zeros(B, device=device, dtype=torch.int32)
 
         tols = _tols(dtype)
@@ -286,6 +305,19 @@ class TestLinearReplaySSMDecode(CustomTestCase):
         # Explicit wrap/flush boundary must have been exercised for L>1; for
         # L=1 every step is a flush.
         self.assertTrue(flush_step_seen, f"flush boundary never hit for L={L}")
+
+    def test_interleaved_state_parts_match_reference(self):
+        for is_kda in (False, True):
+            for dtype in (torch.float32, torch.bfloat16):
+                with self.subTest(is_kda=is_kda, dtype=dtype):
+                    self._run_one(
+                        self.CONFIGS[0],
+                        8,
+                        dtype,
+                        force_flush_steps=(2, 19),
+                        is_kda=is_kda,
+                        packed_state=True,
+                    )
 
     # ---- GDN (scalar gate) ----
     def test_replayssm_matches_gdn_packed_decode_fp32(self):

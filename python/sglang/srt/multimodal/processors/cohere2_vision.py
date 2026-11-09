@@ -4,12 +4,14 @@
 
 from typing import Dict, List, Union
 
-from sglang.srt.managers.multimodal_processor import (
+from sglang.srt.managers.req_types import MultimodalProcessorOutput
+from sglang.srt.models.cohere2_vision import Cohere2VisionForConditionalGeneration
+from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
-from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
-from sglang.srt.models.cohere2_vision import Cohere2VisionForConditionalGeneration
-from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
+from sglang.srt.multimodal.processors.base_processor import (
+    MultimodalSpecialTokens,
+)
 
 
 class Cohere2VisionSGLangImageProcessor(SGLangBaseProcessor):
@@ -57,7 +59,7 @@ class Cohere2VisionSGLangImageProcessor(SGLangBaseProcessor):
             discard_alpha_channel=True,
         )
 
-        mm_items, input_ids, _ = self.process_and_combine_mm_data(
+        mm_items, input_ids, _ = await self.process_and_combine_mm_data_async(
             base_output, self.mm_tokens
         )
         return MultimodalProcessorOutput(

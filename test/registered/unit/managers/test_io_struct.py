@@ -1,7 +1,39 @@
 import copy
+import re
 import unittest
+import weakref
+from array import array
+from pathlib import Path
+from unittest.mock import patch
 
-from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
+import msgspec
+import numpy as np
+import torch
+
+from sglang.srt.managers import io_struct
+from sglang.srt.managers.io_struct import (
+    EmbeddingReqInput,
+    GenerateReqInput,
+    TokenizedEmbeddingReqInput,
+    TokenizedGenerateReqInput,
+    msgpack_decode,
+    msgpack_encode,
+)
+from sglang.srt.managers.kv_hints import (
+    KvHintAction,
+    KvHintsEnvelope,
+    decode_kv_hints_envelope,
+)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
+from sglang.srt.multimodal.kimi_k3_image_processing import KimiK3DeferredPreprocessing
+from sglang.srt.multimodal.modality import Modality, MultimodalInputFormat
+from sglang.srt.multimodal.transport.cuda_vmm import (
+    CudaVmmPackedTensorTransportProxy,
+    _CudaVmmPackedTensorLayout,
+    _CudaVmmPackedTransportOwner,
+)
+from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.utils.msgpack_utils import _restore_torch_tensor, enc_hook, ext_hook
 from sglang.test.ci.ci_register import (
     register_amd_ci,
     register_cpu_ci,
@@ -13,9 +45,377 @@ from sglang.test.test_utils import (
     CustomTestCase,
 )
 
-register_cuda_ci(est_time=8, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=8, suite="stage-b-test-1-gpu-small-amd")
-register_cpu_ci(est_time=8, suite="base-c-test-cpu")
+register_cpu_ci(est_time=6, suite="stage-b-test-cpu-intel")
+
+
+class TestTokenizedReqInputMsgpack(unittest.TestCase):
+    _RUST_IO_STRUCT = (
+        Path(__file__).resolve().parents[4]
+        / "rust/sglang-server/src/message/io_struct.rs"
+    )
+
+    @staticmethod
+    def _rust_fields(body: str) -> tuple:
+        # `wire_struct!` emits `rid` and `http_worker_ipc` (the `BaseReq`
+        # header) before the declared fields.
+        return (
+            "rid",
+            "http_worker_ipc",
+            *re.findall(r"^\s*([a-z][a-z0-9_]*):", body, re.MULTILINE),
+        )
+
+    def _assert_lockstep(self, python_cls, rust_fields):
+        """The Rust struct encodes positionally: its fields must be a prefix of
+        the Python schema, and Python must default every field Rust omits."""
+        python_fields = python_cls.__struct_fields__
+        self.assertEqual(
+            python_fields[: len(rust_fields)], rust_fields, python_cls.__name__
+        )
+        self.assertTrue(
+            all(
+                default is not msgspec.NODEFAULT
+                for default in python_cls.__struct_defaults__[len(rust_fields) :]
+            ),
+            f"{python_cls.__name__}: Rust may omit only a defaulted suffix of "
+            "the Python wire schema",
+        )
+
+    def test_rust_tokenized_generate_schema_stays_in_lockstep(self):
+        """Compare the Rust wire declaration with the imported Python schema."""
+        source = self._RUST_IO_STRUCT.read_text()
+        start = source.index("pub(super) TokenizedGenerateReqInput<'a> {")
+        end = source.index("\n    }\n}", start)
+        self._assert_lockstep(
+            TokenizedGenerateReqInput, self._rust_fields(source[start:end])
+        )
+
+    def test_rust_control_messages_stay_in_lockstep(self):
+        """Every control message the Rust frontend sends (the
+        `control_messages!` block) must decode into its Python namesake."""
+        source = self._RUST_IO_STRUCT.read_text()
+        start = source.index("control_messages! {")
+        block = source[start : source.index("\n}\n", start)]
+        messages = re.findall(
+            # A field-less `Name {}` opens and closes on one line.
+            r"^    ([A-Z][A-Za-z0-9]*) \{(\}|.*?^    \})",
+            block,
+            re.MULTILINE | re.DOTALL,
+        )
+        # Every declaration in the block must be parsed (a drifted layout
+        # would otherwise escape the check), and the set is pinned so adding
+        # a message means extending this test.
+        declared = re.findall(r"^    ([A-Z][A-Za-z0-9]*)\b", block, re.MULTILINE)
+        names = [name for name, _ in messages]
+        self.assertEqual(names, declared)
+        self.assertEqual(
+            set(names),
+            {
+                "AbortReq",
+                "GetInternalStateReq",
+                "FlushCacheReqInput",
+                "CheckWeightsReqInput",
+                "ClearHiCacheReqInput",
+                "DetachHiCacheStorageReqInput",
+                "AttachHiCacheStorageReqInput",
+                "ProfileReq",
+                "FreezeGCReq",
+            },
+        )
+        for name, body in messages:
+            self._assert_lockstep(getattr(io_struct, name), self._rust_fields(body))
+
+    def _make_mm_inputs(self, device="cpu"):
+        return MultimodalProcessorOutput(
+            mm_items=[
+                MultimodalDataItem(
+                    modality=Modality.IMAGE,
+                    offsets=[(0, 1)],
+                    format=MultimodalInputFormat.NORMAL,
+                    feature=torch.tensor(
+                        [[1.0, 2.0]], dtype=torch.float32, device=device
+                    ),
+                    model_specific_data={
+                        "image_grid_thw": torch.tensor(
+                            [[1, 1, 2]], dtype=torch.int64, device=device
+                        ),
+                        "patch_counts": np.array([2], dtype=np.int32),
+                        "names": ["image0"],
+                        "count": np.int64(2),
+                        "enabled": np.bool_(True),
+                        "size": (336, 336),
+                    },
+                )
+            ],
+            input_ids=[1, 2],
+            padded_input_ids=[10, 10],
+            im_token_id=10,
+            mrope_positions=torch.tensor([[0, 1]], dtype=torch.int64, device=device),
+            token_type_ids=torch.tensor([0, 0], dtype=torch.int64, device=device),
+        )
+
+    def _round_trip(self, req):
+        with patch.object(io_struct, "_USE_PICKLE_IPC", False):
+            req.wrap_pickle_fields()
+            # The DP controller re-sends the decoded request before it is unwrapped.
+            forwarded = msgpack_decode(msgpack_encode(req))
+            decoded = msgpack_decode(msgpack_encode(forwarded))
+            decoded.unwrap_pickle_fields()
+        return decoded
+
+    def _round_trip_mm_inputs(self, mm_inputs):
+        decoded = self._round_trip(
+            TokenizedGenerateReqInput(
+                input_text="",
+                input_ids=array("q", [1, 2]),
+                input_embeds=None,
+                mm_inputs=mm_inputs,
+                token_type_ids=[0, 0],
+                sampling_params=SamplingParams(),
+                return_logprob=False,
+                logprob_start_len=0,
+                top_logprobs_num=0,
+                token_ids_logprob=None,
+                stream=False,
+            )
+        )
+        return decoded.mm_inputs
+
+    def test_generate_mm_inputs_round_trip_without_pickle_wrapper(self):
+        decoded = self._round_trip(
+            TokenizedGenerateReqInput(
+                input_text="",
+                input_ids=array("q", [1, 2]),
+                input_embeds=None,
+                mm_inputs=self._make_mm_inputs(),
+                token_type_ids=[0, 0],
+                sampling_params=SamplingParams(),
+                return_logprob=False,
+                logprob_start_len=0,
+                top_logprobs_num=0,
+                token_ids_logprob=None,
+                stream=False,
+            )
+        )
+
+        self.assertIsInstance(decoded.mm_inputs, MultimodalProcessorOutput)
+        item = decoded.mm_inputs.mm_items[0]
+        self.assertIsInstance(item, MultimodalDataItem)
+        self.assertEqual(item.modality, Modality.IMAGE)
+        self.assertEqual(item.offsets, [(0, 1)])
+        self.assertTrue(
+            torch.equal(item.feature, torch.tensor([[1.0, 2.0]], device="cpu"))
+        )
+        self.assertTrue(
+            torch.equal(
+                item.model_specific_data["image_grid_thw"],
+                torch.tensor([[1, 1, 2]], dtype=torch.int64, device="cpu"),
+            )
+        )
+        np.testing.assert_array_equal(
+            item.model_specific_data["patch_counts"],
+            np.array([2], dtype=np.int32),
+        )
+        self.assertEqual(item.model_specific_data["count"], np.int64(2))
+        self.assertIsInstance(item.model_specific_data["enabled"], np.bool_)
+        self.assertEqual(item.model_specific_data["size"], (336, 336))
+        self.assertTrue(
+            torch.equal(
+                decoded.mm_inputs.mrope_positions,
+                torch.tensor([[0, 1]], dtype=torch.int64, device="cpu"),
+            )
+        )
+        self.assertTrue(
+            torch.equal(decoded.mm_inputs.token_type_ids, torch.tensor([0, 0]))
+        )
+
+    def test_dynamic_model_specific_attribute_round_trip(self):
+        mm_inputs = self._make_mm_inputs()
+        mm_inputs.mm_items[0].audio_feature_lens = torch.tensor([2])
+
+        decoded = self._round_trip_mm_inputs(mm_inputs)
+
+        self.assertTrue(
+            torch.equal(decoded.mm_items[0].audio_feature_lens, torch.tensor([2]))
+        )
+        self.assertIn("audio_feature_lens", decoded.mm_items[0].model_specific_data)
+
+    def test_multimodal_hash_is_normalized_to_uint64(self):
+        mm_inputs = self._make_mm_inputs()
+        mm_inputs.mm_items[0].hash = (1 << 256) - 1
+        constructed = MultimodalDataItem(modality=Modality.IMAGE, hash=(1 << 128) - 1)
+
+        decoded = self._round_trip_mm_inputs(mm_inputs)
+
+        self.assertEqual(decoded.mm_items[0].hash, (1 << 64) - 1)
+        self.assertEqual(constructed.hash, (1 << 64) - 1)
+
+    def test_multimodal_processor_output_supports_weakrefs(self):
+        mm_inputs = self._make_mm_inputs()
+
+        ref = weakref.ref(mm_inputs)
+
+        self.assertIs(ref(), mm_inputs)
+
+    def test_unknown_ext_payload_is_preserved_without_decoding(self):
+        ext = msgspec.msgpack.Ext(99, b"not msgpack")
+
+        decoded = msgspec.msgpack.decode(msgspec.msgpack.encode(ext), ext_hook=ext_hook)
+
+        self.assertEqual(decoded, ext)
+
+    def test_malformed_known_buffer_ext_is_rejected(self):
+        with self.assertRaisesRegex(msgspec.DecodeError, "missing metadata"):
+            ext_hook(3, memoryview(b"bad"))
+
+    def test_embedding_mm_inputs_round_trip_without_pickle_wrapper(self):
+        decoded = self._round_trip(
+            TokenizedEmbeddingReqInput(
+                input_text="",
+                input_ids=array("q", [1, 2]),
+                mm_inputs=self._make_mm_inputs(),
+                token_type_ids=[0, 0],
+                sampling_params=SamplingParams(),
+            )
+        )
+
+        self.assertIsInstance(decoded.mm_inputs, MultimodalProcessorOutput)
+        self.assertTrue(
+            torch.equal(
+                decoded.mm_inputs.mm_items[0].feature,
+                torch.tensor([[1.0, 2.0]], device="cpu"),
+            )
+        )
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is not available")
+    def test_generate_mm_inputs_round_trip_preserves_cuda_tensor_device(self):
+        decoded = self._round_trip(
+            TokenizedGenerateReqInput(
+                input_text="",
+                input_ids=array("q", [1, 2]),
+                input_embeds=None,
+                mm_inputs=self._make_mm_inputs(device="cuda:0"),
+                token_type_ids=[0, 0],
+                sampling_params=SamplingParams(),
+                return_logprob=False,
+                logprob_start_len=0,
+                top_logprobs_num=0,
+                token_ids_logprob=None,
+                stream=False,
+            )
+        )
+
+        item = decoded.mm_inputs.mm_items[0]
+        self.assertEqual(item.feature.device.type, "cuda")
+        self.assertEqual(item.model_specific_data["image_grid_thw"].device.type, "cuda")
+        self.assertEqual(decoded.mm_inputs.mrope_positions.device.type, "cuda")
+
+    def test_packed_proxies_keep_one_owner(self):
+        # Reconstructing one packed child copies and acknowledges the shared
+        # chunk; a per-proxy owner copy would read it again after the release.
+        owner = _CudaVmmPackedTransportOwner(
+            fabric_handle=None,
+            posix_socket_path="\0sgl_mm_vmm_test",
+            allocation_size=1 << 21,
+            data_offset=1024,
+            data_nbytes=512,
+            control_offset=768,
+            consumer_count=2,
+        )
+        mm_inputs = MultimodalProcessorOutput(
+            mm_items=[
+                MultimodalDataItem(
+                    modality=Modality.IMAGE,
+                    feature=CudaVmmPackedTensorTransportProxy(
+                        owner=owner,
+                        layout=_CudaVmmPackedTensorLayout(
+                            relative_offset=offset,
+                            data_nbytes=8,
+                            shape=torch.Size([2]),
+                            dtype=torch.int32,
+                        ),
+                    ),
+                )
+                for offset in (0, 256)
+            ]
+        )
+
+        first, second = self._round_trip_mm_inputs(mm_inputs).mm_items
+
+        self.assertIs(type(first.feature), CudaVmmPackedTensorTransportProxy)
+        self.assertIs(first.feature._packed_owner, second.feature._packed_owner)
+
+    def test_object_fields_round_trip_like_pickle(self):
+        mm_inputs = self._make_mm_inputs()
+        item = mm_inputs.mm_items[0]
+        item.feature = (torch.ones(2), torch.zeros(3))
+        config = KimiK3DeferredPreprocessing(
+            backend="gpu",
+            image_mean=[0.5, 0.5, 0.5],
+            image_std=[0.25, 0.25, 0.25],
+            transparent_bg_config=None,
+            resize_config={"num_tokens": 4},
+        )
+        item.model_specific_data.update(
+            {"kimi_k3_deferred_preprocessing": config, "dtype": torch.bfloat16}
+        )
+
+        decoded_item = self._round_trip_mm_inputs(mm_inputs).mm_items[0]
+
+        self.assertEqual(decoded_item.kimi_k3_deferred_preprocessing, config)
+        self.assertIs(decoded_item.dtype, torch.bfloat16)
+        self.assertIsInstance(decoded_item.feature, tuple)
+        self.assertTrue(torch.equal(decoded_item.feature[1], torch.zeros(3)))
+
+    def test_evs_model_specific_data_round_trip(self):
+        mm_inputs = self._make_mm_inputs()
+        item = mm_inputs.mm_items[0]
+        item.modality = Modality.VIDEO
+        item.model_specific_data.update(
+            {
+                "thw_grids": [(2, 3, 4)],
+                "pre_chunked_input_ids": [1, 2, 3],
+            }
+        )
+        decoded = self._round_trip(
+            TokenizedGenerateReqInput(
+                input_text="",
+                input_ids=array("q", [1, 2]),
+                input_embeds=None,
+                mm_inputs=mm_inputs,
+                token_type_ids=[0, 0],
+                sampling_params=SamplingParams(),
+                return_logprob=False,
+                logprob_start_len=0,
+                top_logprobs_num=0,
+                token_ids_logprob=None,
+                stream=False,
+            )
+        )
+
+        decoded_item = decoded.mm_inputs.mm_items[0]
+        self.assertEqual(decoded_item.thw_grids, [(2, 3, 4)])
+        self.assertEqual(decoded_item.pre_chunked_input_ids, [1, 2, 3])
+
+    def test_torch_tensor_ext_wire_format(self):
+        ext = enc_hook(torch.tensor([1, 2], dtype=torch.int16, device="cpu"))
+        self.assertIsInstance(ext, msgspec.msgpack.Ext)
+        self.assertEqual(ext.code, 2)
+        self.assertEqual(
+            bytes(ext.data).hex(),
+            "0000000d939102a5696e743136a363707501000200",
+        )
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is not available")
+    def test_empty_cpu_tensor_restore_ignores_default_device(self):
+        previous_device = torch.get_default_device()
+        try:
+            torch.set_default_device("cuda")
+            tensor = _restore_torch_tensor((0,), "float32", b"", "cpu")
+            self.assertEqual(tensor.device.type, "cpu")
+        finally:
+            torch.set_default_device(previous_device)
 
 
 class TestGenerateReqInputNormalization(CustomTestCase):
@@ -33,6 +433,88 @@ class TestGenerateReqInputNormalization(CustomTestCase):
             sampling_params=[{}, {}],
             rid=["id1", "id2"],
         )
+
+    def test_sampling_params_are_owned_by_each_request(self):
+        """Adjusting one request's token budget must preserve peers and caller defaults."""
+        for n in (1, 2):
+            shared = {"max_new_tokens": 20, "n": n}
+            cases = (None,) if n == 1 else ()
+            cases += (
+                shared,
+                [shared, shared],
+                [shared.copy(), {"max_new_tokens": 30, "n": n}],
+            )
+            for params in cases:
+                params = copy.deepcopy(params)
+                with self.subTest(n=n, params=params):
+                    original = copy.deepcopy(params)
+                    req = GenerateReqInput(
+                        text=["Hello", "World"], sampling_params=params
+                    )
+                    req.normalize_batch_and_arguments()
+                    expected = [dict(item) for item in req.sampling_params]
+                    for i in range(len(req.sampling_params)):
+                        req[i].sampling_params["max_new_tokens"] = 5 + i
+                        expected[i]["max_new_tokens"] = 5 + i
+                        self.assertEqual(req.sampling_params, expected)
+                        self.assertEqual(
+                            req[i].sampling_params["max_new_tokens"], 5 + i
+                        )
+                        self.assertEqual(params, original)
+
+    def test_single_request_preserves_caller_sampling_params(self):
+        """Reusing defaults after a per-request adjustment must keep the original budget."""
+        params = {"max_new_tokens": 20}
+        req = GenerateReqInput(text="Hello", sampling_params=params)
+        req.normalize_batch_and_arguments()
+        req.sampling_params["max_new_tokens"] = 5
+
+        next_req = GenerateReqInput(text="World", sampling_params=params)
+        next_req.normalize_batch_and_arguments()
+        self.assertEqual(next_req.sampling_params["max_new_tokens"], 20)
+
+    def test_single_prompt_parallel_samples_preserve_caller_budget(self):
+        """Fan-out from one prompt must not share mutable completion budgets."""
+        for per_prompt in (False, True):
+            with self.subTest(per_prompt=per_prompt):
+                params = {"max_new_tokens": 20, "n": 2}
+                req = GenerateReqInput(
+                    text="Hello", sampling_params=[params] if per_prompt else params
+                )
+                req.normalize_batch_and_arguments()
+                req[0].sampling_params["max_new_tokens"] = 5
+                self.assertEqual(req[1].sampling_params["max_new_tokens"], 20)
+                self.assertEqual(params, {"max_new_tokens": 20, "n": 2})
+
+    def test_renormalization_refreshes_cached_sampling_params(self):
+        """A cached subrequest must use the batch's current token budget after normalization."""
+        req = GenerateReqInput(
+            text=["Hello", "World"], sampling_params={"max_new_tokens": 20}
+        )
+        req.normalize_batch_and_arguments()
+        req[0]
+        req.normalize_batch_and_arguments()
+        req[0].sampling_params["max_new_tokens"] = 5
+        self.assertEqual(req.sampling_params[0]["max_new_tokens"], 5)
+        self.assertEqual(req[1].sampling_params["max_new_tokens"], 20)
+
+    def test_sampling_logprobs_mode_normalization(self):
+        default_req = copy.deepcopy(self.base_req)
+        default_req.normalize_batch_and_arguments()
+        self.assertEqual(default_req.sampling_logprobs_mode, [None, None])
+
+        req = copy.deepcopy(self.base_req)
+        req.return_sampling_mask = [True, True]
+        req.sampling_logprobs_mode = ["selected", "support"]
+
+        req.normalize_batch_and_arguments()
+
+        self.assertEqual(
+            req.sampling_logprobs_mode,
+            ["selected", "support"],
+        )
+        self.assertEqual(req[0].sampling_logprobs_mode, "selected")
+        self.assertEqual(req[1].sampling_logprobs_mode, "support")
 
     def test_single_image_to_list_of_lists(self):
         """Test that a single image is converted to a list of single-image lists."""
@@ -132,6 +614,60 @@ class TestGenerateReqInputNormalization(CustomTestCase):
 
         # Ensure that text items are properly duplicated too
         self.assertEqual(req.text, expected_text)
+
+    def test_parallel_sampling_with_empty_media(self):
+        """Empty media must yield one empty entry per sample, not a zero-size batch."""
+        for prompt in (
+            {"text": "hello"},
+            {"input_ids": [1, 2]},
+            {"input_embeds": [[0.1, 0.2]]},
+        ):
+            for n in (2, 3):
+                with self.subTest(prompt=prompt, n=n):
+                    req = GenerateReqInput(
+                        **prompt,
+                        image_data=[],
+                        video_data=[],
+                        audio_data=[],
+                        mm_hashes=[],
+                        mm_content_hashes=[],
+                        sampling_params={"n": n},
+                    )
+                    req.normalize_batch_and_arguments()
+                    for index in range(n):
+                        sample = req[index]
+                        self.assertEqual(sample.image_data, [])
+                        self.assertEqual(sample.video_data, [])
+                        self.assertEqual(sample.audio_data, [])
+                        self.assertEqual(sample.mm_hashes, [])
+                        self.assertEqual(sample.mm_content_hashes, [])
+
+    def test_batched_empty_video_and_audio(self):
+        """Absent video/audio lists must not raise IndexError when splitting a batch."""
+        for n in (1, 2):
+            with self.subTest(n=n):
+                req = GenerateReqInput(
+                    text=["first", "second"],
+                    video_data=[],
+                    audio_data=[],
+                    sampling_params={"n": n},
+                )
+                req.normalize_batch_and_arguments()
+                for index in range(2 * n):
+                    self.assertIsNone(req[index].video_data)
+                    self.assertIsNone(req[index].audio_data)
+
+    def test_parallel_sampling_empty_hashes_still_require_empty_images(self):
+        for hashes in ({"mm_hashes": []}, {"mm_content_hashes": []}):
+            with self.subTest(hashes=hashes):
+                req = GenerateReqInput(
+                    text="hello",
+                    image_data=["a.png", "b.png"],
+                    sampling_params={"n": 2},
+                    **hashes,
+                )
+                with self.assertRaisesRegex(ValueError, "0 entries for 2 images"):
+                    req.normalize_batch_and_arguments()
 
     def test_specific_parallel_n_per_sample(self):
         """Test parallel expansion when different samples have different n values."""
@@ -304,6 +840,51 @@ class TestGenerateReqInputNormalization(CustomTestCase):
 
         # Modalities should be set for all 3 examples
         self.assertEqual(req.modalities, ["image", "image", "image"])
+
+    def test_parallel_sampling_keeps_every_media_item_of_a_single_request(self):
+        """With n > 1, each sample of a multi-image/video/audio request gets all of its media."""
+        for field_name in ("image_data", "video_data", "audio_data"):
+            with self.subTest(field_name=field_name):
+                req = GenerateReqInput(
+                    text="Compare these",
+                    sampling_params={"n": 2},
+                    **{field_name: ["m1", "m2"]},
+                )
+                req.normalize_batch_and_arguments()
+                self.assertEqual(getattr(req[0], field_name), ["m1", "m2"])
+
+        req = GenerateReqInput(
+            text="Compare these",
+            image_data=["i1", "i2"],
+            mm_hashes=["h1", "h2"],
+            sampling_params={"n": 2},
+        )
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req[0].image_data, ["i1", "i2"])
+        self.assertEqual(req[0].mm_hashes, ["h1", "h2"])
+        self.assertEqual(req[0].modalities, "multi-images")
+
+    def test_parallel_sampling_keeps_media_already_nested_per_request(self):
+        """With n > 1, media already given as one list per request must not gain another level."""
+        for field_name in ("image_data", "video_data", "audio_data"):
+            with self.subTest(field_name=field_name):
+                req = GenerateReqInput(
+                    text="Compare these",
+                    sampling_params={"n": 2},
+                    **{field_name: [["m1", "m2"]]},
+                )
+                req.normalize_batch_and_arguments()
+                self.assertEqual(getattr(req[0], field_name), ["m1", "m2"])
+
+        req = GenerateReqInput(
+            text="Compare these",
+            image_data=[["i1", "i2"]],
+            mm_hashes=[["h1", "h2"]],
+            sampling_params={"n": 2},
+        )
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req[0].image_data, ["i1", "i2"])
+        self.assertEqual(req[0].mm_hashes, ["h1", "h2"])
 
     def test_parallel_sampling_preserves_reasoning_controls(self):
         single = GenerateReqInput(
@@ -519,6 +1100,53 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         req.normalize_batch_and_arguments()
         self.assertEqual(req.extra_key, "solo")
 
+    def test_cache_salt_normalization(self):
+        req = GenerateReqInput(
+            text=["Hello", "World"],
+            cache_salt=["tenant-A", ""],
+            sampling_params=[{}, {}],
+        )
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req.cache_salt, ["tenant-A", None])
+        self.assertEqual(req[0].cache_salt, "tenant-A")
+        self.assertIsNone(req[1].cache_salt)
+
+        req = GenerateReqInput(
+            text=["Hello", "World"],
+            cache_salt="shared",
+            sampling_params={"n": 2},
+        )
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req.cache_salt, ["shared", "shared"] * 2)
+
+        req = GenerateReqInput(text="Hello", cache_salt="")
+        req.normalize_batch_and_arguments()
+        self.assertIsNone(req.cache_salt)
+
+        req = GenerateReqInput(
+            text=["Hello", "World"],
+            cache_salt=["only-one"],
+            sampling_params=[{}, {}],
+        )
+        with self.assertRaisesRegex(ValueError, "batch size"):
+            req.normalize_batch_and_arguments()
+
+    def test_cache_key_normalization_rejects_invalid_types(self):
+        for field_name in ("extra_key", "cache_salt"):
+            with self.subTest(field_name=field_name, mode="single"):
+                req = GenerateReqInput(text="Hello", **{field_name: ["value"]})
+                with self.assertRaisesRegex(ValueError, "single request"):
+                    req.normalize_batch_and_arguments()
+
+            with self.subTest(field_name=field_name, mode="batch"):
+                req = GenerateReqInput(
+                    text=["Hello", "World"],
+                    sampling_params=[{}, {}],
+                    **{field_name: ["value", 1]},
+                )
+                with self.assertRaisesRegex(ValueError, "should be a string"):
+                    req.normalize_batch_and_arguments()
+
     def test_logprob_parameters_normalization(self):
         """Test normalization of logprob-related parameters."""
         # Test single example
@@ -721,8 +1349,194 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         self.assertEqual(req[1].routed_dp_rank, 3)
 
 
+class TestKvHintsTransport(CustomTestCase):
+    """The kv_hints envelope must survive every hop from HTTP to the scheduler."""
+
+    ENVELOPE = {
+        "protocol_version": "0.1",
+        "message_id": "msg-1",
+        "actions": [
+            {
+                "action_id": "a-1",
+                "action_type": "kv.example",
+                "action_version": "1.0",
+                # An action payload is opaque to the transport; a consumer that
+                # implements the type validates it.
+                "payload": {"endpoint": "tcp://10.0.0.2:7000", "hashes": [7]},
+            }
+        ],
+    }
+
+    def test_single_request_decodes_dict_into_typed_envelope(self):
+        req = GenerateReqInput(text="Hello", kv_hints=copy.deepcopy(self.ENVELOPE))
+        req.normalize_batch_and_arguments()
+
+        self.assertIsInstance(req.kv_hints, KvHintsEnvelope)
+        self.assertEqual(req.kv_hints.protocol_version, "0.1")
+        (action,) = req.kv_hints.actions
+        self.assertIsInstance(action, KvHintAction)
+        self.assertEqual(action.action_type, "kv.example")
+        self.assertEqual(
+            action.payload, {"endpoint": "tcp://10.0.0.2:7000", "hashes": [7]}
+        )
+
+    def test_unknown_action_type_is_carried_not_rejected(self):
+        """A consumer must be able to ignore a neighboring action it does not
+        implement, so the transport cannot reject one."""
+        envelope = copy.deepcopy(self.ENVELOPE)
+        envelope["actions"].append(
+            {
+                "action_id": "a-2",
+                "action_type": "some.future.action",
+                "action_version": "9.9",
+                "payload": {"anything": True},
+            }
+        )
+        req = GenerateReqInput(text="Hello", kv_hints=envelope)
+        req.normalize_batch_and_arguments()
+
+        self.assertEqual(
+            [action.action_type for action in req.kv_hints.actions],
+            ["kv.example", "some.future.action"],
+        )
+
+    def test_malformed_envelope_is_rejected(self):
+        for bad in (
+            {"message_id": "msg-1"},  # missing protocol_version
+            {"protocol_version": "0.1", "message_id": "msg-1", "actions": [{}]},
+            {"protocol_version": 1, "message_id": "msg-1"},
+            [{"protocol_version": "0.1", "message_id": "msg-1"}],
+        ):
+            with self.subTest(bad=bad):
+                req = GenerateReqInput(text="Hello", kv_hints=bad)
+                with self.assertRaises(ValueError):
+                    req.normalize_batch_and_arguments()
+
+    def test_single_envelope_broadcasts_to_every_batch_item(self):
+        req = GenerateReqInput(
+            text=["Hello", "World"], kv_hints=copy.deepcopy(self.ENVELOPE)
+        )
+        req.normalize_batch_and_arguments()
+
+        self.assertEqual(
+            [req[i].kv_hints.message_id for i in range(2)], ["msg-1", "msg-1"]
+        )
+
+    def test_per_item_envelopes_stay_with_their_item(self):
+        second = copy.deepcopy(self.ENVELOPE)
+        second["message_id"] = "msg-2"
+        req = GenerateReqInput(
+            text=["Hello", "World"],
+            kv_hints=[copy.deepcopy(self.ENVELOPE), second],
+        )
+        req.normalize_batch_and_arguments()
+
+        self.assertEqual(
+            [req[i].kv_hints.message_id for i in range(2)], ["msg-1", "msg-2"]
+        )
+
+    def test_per_item_envelopes_may_be_none(self):
+        """A router hints only the requests it has a decision for."""
+        req = GenerateReqInput(
+            text=["Hello", "World"], kv_hints=[None, copy.deepcopy(self.ENVELOPE)]
+        )
+        req.normalize_batch_and_arguments()
+
+        self.assertIsNone(req[0].kv_hints)
+        self.assertEqual(req[1].kv_hints.message_id, "msg-1")
+
+    def test_partial_kv_hints_list_is_rejected(self):
+        req = GenerateReqInput(
+            text=["Hello", "World"], kv_hints=[copy.deepcopy(self.ENVELOPE)]
+        )
+        with self.assertRaisesRegex(ValueError, "equal to the batch size"):
+            req.normalize_batch_and_arguments()
+
+    def test_parallel_samples_each_carry_the_envelope(self):
+        req = GenerateReqInput(
+            text=["Hello", "World"],
+            kv_hints=copy.deepcopy(self.ENVELOPE),
+            sampling_params={"n": 2},
+        )
+        req.normalize_batch_and_arguments()
+
+        self.assertEqual([req[i].kv_hints.message_id for i in range(4)], ["msg-1"] * 4)
+
+    def test_envelope_survives_the_msgpack_ipc_hop(self):
+        """The tokenizer-to-scheduler hop is msgpack, not pickle."""
+        tokenized = TokenizedGenerateReqInput(
+            input_text="",
+            input_ids=array("q", [1, 2]),
+            input_embeds=None,
+            mm_inputs=None,
+            token_type_ids=None,
+            sampling_params=SamplingParams(),
+            return_logprob=False,
+            logprob_start_len=0,
+            top_logprobs_num=0,
+            token_ids_logprob=None,
+            stream=False,
+            kv_hints=decode_kv_hints_envelope(copy.deepcopy(self.ENVELOPE)),
+        )
+        tokenized.wrap_pickle_fields()
+        decoded = msgpack_decode(msgpack_encode(tokenized))
+        decoded.unwrap_pickle_fields()
+
+        self.assertEqual(decoded.kv_hints, tokenized.kv_hints)
+
+
 class TestEmbeddingReqInputGetItem(CustomTestCase):
     """Test EmbeddingReqInput.__getitem__."""
+
+    def test_renormalization_refreshes_cached_sampling_params(self):
+        """Cached embeddings must use the batch's current sampling settings."""
+        cases = (
+            (["Hello", "World"], False),
+            ([["query 1", "doc 1"], ["query 2", "doc 2"]], True),
+        )
+        for text, is_cross_encoder in cases:
+            with self.subTest(cross_encoder=is_cross_encoder):
+                req = EmbeddingReqInput(
+                    text=text,
+                    is_cross_encoder_request=is_cross_encoder,
+                    sampling_params={"temperature": 0.7},
+                )
+                req.normalize_batch_and_arguments()
+                req[0]
+                req.normalize_batch_and_arguments()
+                req[0].sampling_params["temperature"] = 0.2
+                self.assertEqual(req.sampling_params[0]["temperature"], 0.2)
+                self.assertEqual(req[1].sampling_params["temperature"], 0.7)
+
+    def test_embedding_sampling_params_preserve_generation_defaults(self):
+        """Embedding normalization must not zero a caller's generation token budget."""
+        for text in ("Hello", ["Hello", "World"]):
+            shared = {"max_new_tokens": 20, "temperature": 0.7}
+            cases = (None, shared)
+            if isinstance(text, list):
+                cases += ([shared, shared], [shared.copy(), shared.copy()])
+            for params in cases:
+                params = copy.deepcopy(params)
+                with self.subTest(text=text, params=params):
+                    original = copy.deepcopy(params)
+                    req = EmbeddingReqInput(text=text, sampling_params=params)
+                    req.normalize_batch_and_arguments()
+                    self.assertEqual(params, original)
+                    if req.is_single:
+                        self.assertEqual(req.sampling_params["max_new_tokens"], 0)
+                    else:
+                        self.assertEqual(
+                            [
+                                req[i].sampling_params["max_new_tokens"]
+                                for i in range(2)
+                            ],
+                            [0, 0],
+                        )
+                        req[0].sampling_params["temperature"] = 0.2
+                        self.assertEqual(
+                            req[1].sampling_params.get("temperature"),
+                            None if params is None else 0.7,
+                        )
 
     def test_priority_is_preserved(self):
         """Priority must survive the batch split, in both __getitem__ branches."""
@@ -771,6 +1585,39 @@ class TestEmbeddingReqInputGetItem(CustomTestCase):
             text=["first", "second"], lora_path=["only-one-adapter"]
         )
         with self.assertRaisesRegex(ValueError, "must match batch size"):
+            req.normalize_batch_and_arguments()
+
+    def test_media_only_flat_list_is_one_request(self):
+        """Without text, a flat media list is one request with all items, as in HF."""
+        req = EmbeddingReqInput(image_data=["a.jpg", "b.jpg"])
+        req.normalize_batch_and_arguments()
+        self.assertTrue(req.is_single)
+        self.assertEqual(req.image_data, ["a.jpg", "b.jpg"])
+
+    def test_media_only_nested_list_is_a_batch(self):
+        """A list of per-request media lists is the explicit batch form."""
+        req = EmbeddingReqInput(image_data=[["a.jpg"], ["b.jpg", "c.jpg"]])
+        req.normalize_batch_and_arguments()
+        self.assertFalse(req.is_single)
+        self.assertEqual(
+            [req[0].image_data, req[1].image_data], [["a.jpg"], ["b.jpg", "c.jpg"]]
+        )
+
+    def test_media_list_pairs_with_text_batch(self):
+        """A media list pairs by position; a scalar item broadcasts to every request."""
+        req = EmbeddingReqInput(
+            text=["t0", "t1"], image_data=["a.jpg", None], audio_data="s.wav"
+        )
+        req.normalize_batch_and_arguments()
+        self.assertEqual(
+            [(req[i].image_data, req[i].audio_data) for i in range(2)],
+            [("a.jpg", "s.wav"), (None, "s.wav")],
+        )
+
+    def test_media_list_length_must_match_batch(self):
+        """A short media list must not be re-attached to the remaining requests."""
+        req = EmbeddingReqInput(text=["t0", "t1", "t2"], image_data=["a.jpg"])
+        with self.assertRaisesRegex(ValueError, "image_data has 1 entries"):
             req.normalize_batch_and_arguments()
 
 

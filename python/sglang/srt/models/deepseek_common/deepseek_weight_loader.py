@@ -14,6 +14,7 @@
 
 import concurrent.futures
 import logging
+import re
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -22,6 +23,7 @@ import torch.nn as nn
 import tqdm
 from transformers import PretrainedConfig
 
+from sglang.kernels.arch import current_arch
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
@@ -31,6 +33,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     block_quant_dequant,
     block_quant_to_tensor_quant,
     channel_quant_to_tensor_quant,
+    input_to_float8,
     inverse_transform_scale_ue8m0,
     normalize_e4m3fn_to_e4m3fnuz,
     quant_weight_ue8m0,
@@ -47,6 +50,7 @@ from sglang.srt.model_loader.utils import (
 from sglang.srt.model_loader.weight_utils import (
     RUNAI_STREAMER_TENSOR_ATTR,
     default_weight_loader,
+    maybe_remap_kv_scale_name,
 )
 from sglang.srt.models.deepseek_common.utils import (
     _is_cuda,
@@ -54,18 +58,50 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_hip,
     _is_musa,
     _is_npu,
+    _is_sail,
     _is_xpu,
     _use_aiter_gfx95,
     awq_dequantize_func,
     enable_nextn_moe_bf16_cast_to_fp8,
     is_wint4afp8_or_wint4a16_config,
 )
-from sglang.srt.utils import bind_or_assign, get_bool_env_var, log_info_on_rank0
+from sglang.srt.models.utils import bind_or_assign
+from sglang.srt.utils import log_info_on_rank0
 
 if _use_aiter_gfx95:
     from sglang.srt.layers.quantization.quark.utils import quark_post_load_weights
 
 logger = logging.getLogger(__name__)
+
+_EXPERT_INPUT_SCALE_RE = re.compile(r"(?:^|\.)experts\.\d+\.w[123]\.input_scale$")
+
+
+def has_expert_input_scale_checkpoint(
+    quant_config: Optional[QuantizationConfig],
+) -> bool:
+    if is_wint4afp8_or_wint4a16_config(quant_config):
+        return True
+
+    from sglang.srt.layers.quantization.humming import HummingConfig
+
+    # Humming preserves the checkpoint quantization in full_config.
+    return (
+        isinstance(quant_config, HummingConfig)
+        and quant_config.full_config.get("quant_method") == "w4afp8"
+    )
+
+
+def expert_input_scale_has_destination(
+    quant_config: Optional[QuantizationConfig],
+    params_dict: Dict[str, torch.nn.Parameter],
+) -> bool:
+    """Load expert activation scales only when the quant method registered them."""
+    if not has_expert_input_scale_checkpoint(quant_config):
+        return False
+    return any(
+        name.endswith(("w13_input_scale", "w2_input_scale")) for name in params_dict
+    )
+
 
 # Optional quantization for DeepSeek nvfp4 checkpoint
 NVFP4_CKPT_FP8_ATTN_QUANT_MODULES = ["q_b_proj"]
@@ -75,6 +111,40 @@ def _clone_if_runai_streamed_tensor(tensor: torch.Tensor) -> torch.Tensor:
     if getattr(tensor, RUNAI_STREAMER_TENSOR_ATTR, False):
         return tensor.clone().detach()
     return tensor
+
+
+def _get_indexer_weight_block_size(
+    quant_config: Optional[QuantizationConfig],
+) -> List[int]:
+    if quant_config is not None and quant_config.weight_block_size is not None:
+        return quant_config.weight_block_size
+    return [128, 128]
+
+
+def _resolve_quark_fp8_block_scale_name(
+    name: str, params_dict: Dict[str, torch.Tensor]
+) -> str:
+    """Map Quark block-FP8 scale names to the shared FP8 parameter name."""
+    if name.endswith("weight_scale") and name not in params_dict:
+        candidate = name.removesuffix("weight_scale") + "weight_scale_inv"
+        if candidate in params_dict:
+            return candidate
+    return name
+
+
+def _resolve_layer_weight_block_size(
+    layer: nn.Module,
+    quant_config: Optional[QuantizationConfig],
+) -> Optional[List[int]]:
+    """Return the resolved layer's block size, with legacy config fallback."""
+    quant_method = getattr(layer, "quant_method", None)
+    if quant_method is not None and hasattr(quant_method, "weight_block_size"):
+        return quant_method.weight_block_size
+
+    selected_quant_config = getattr(quant_config, "linear_fp8_config", None)
+    if selected_quant_config is None:
+        selected_quant_config = quant_config
+    return getattr(selected_quant_config, "weight_block_size", None)
 
 
 def _load_fused_indexer_wk(
@@ -98,12 +168,27 @@ def _load_fused_indexer_wk(
         return False
 
     if ".indexer.weights_proj." in name:
-        w = _clone_if_runai_streamed_tensor(loaded_weight)
-        fused_param.data[-w.shape[0] :].copy_(w)
+        is_scale = name.endswith((".weight_scale_inv", ".weight_scale"))
+        if not is_scale and loaded_weight.dtype != torch.float8_e4m3fn:
+            w = _clone_if_runai_streamed_tensor(loaded_weight)
+            fused_param.data[-w.shape[0] :].copy_(w)
+            return True
+
+        entry = pending.setdefault(fused_name + ".weights_proj", {})
+        entry["scale" if is_scale else "weight"] = _clone_if_runai_streamed_tensor(
+            loaded_weight
+        )
+        if "weight" in entry and "scale" in entry:
+            pending.pop(fused_name + ".weights_proj")
+            block_size = _get_indexer_weight_block_size(quant_config)
+            weights_bf16 = block_quant_dequant(
+                entry["weight"], entry["scale"], block_size, torch.bfloat16
+            )
+            fused_param.data[-weights_bf16.shape[0] :].copy_(weights_bf16)
         return True
 
     # wk: a bf16 checkpoint copies straight in; block-fp8 needs weight + scale.
-    is_scale = name.endswith(".weight_scale_inv")
+    is_scale = name.endswith((".weight_scale_inv", ".weight_scale"))
     if not is_scale and loaded_weight.dtype != torch.float8_e4m3fn:
         w = _clone_if_runai_streamed_tensor(loaded_weight)
         fused_param.data[: w.shape[0]].copy_(w)
@@ -115,12 +200,50 @@ def _load_fused_indexer_wk(
     )
     if "weight" in entry and "scale" in entry:
         pending.pop(fused_name)
-        block_size = getattr(quant_config, "weight_block_size", None) or [128, 128]
+        block_size = _get_indexer_weight_block_size(quant_config)
         wk_bf16 = block_quant_dequant(
             entry["weight"], entry["scale"], block_size, torch.bfloat16
         )
         fused_param.data[: wk_bf16.shape[0]].copy_(wk_bf16)
     return True
+
+
+def _load_fused_expert_tensor(
+    name: str,
+    loaded_weight: torch.Tensor,
+    params_dict: Dict[str, torch.Tensor],
+) -> bool:
+    mappings = (
+        (".experts.gate_up_proj_scale", ".experts.w13_weight_scale_inv", "w13"),
+        (".experts.down_proj_scale", ".experts.w2_weight_scale_inv", "w2"),
+        (".experts.gate_up_proj", ".experts.w13_weight", "w13"),
+        (".experts.down_proj", ".experts.w2_weight", "w2"),
+    )
+    for source, target, shard_id in mappings:
+        if not name.endswith(source):
+            continue
+        param_name = name[: -len(source)] + target
+        param = params_dict.get(param_name)
+        if param is None:
+            return False
+        weight_loader = param.weight_loader
+        for expert_id, expert_weight in enumerate(loaded_weight):
+            if shard_id == "w13":
+                gate, up = expert_weight.chunk(2, dim=0)
+                weight_loader(
+                    param, gate, param_name, shard_id="w1", expert_id=expert_id
+                )
+                weight_loader(param, up, param_name, shard_id="w3", expert_id=expert_id)
+            else:
+                weight_loader(
+                    param,
+                    expert_weight,
+                    param_name,
+                    shard_id="w2",
+                    expert_id=expert_id,
+                )
+        return True
+    return False
 
 
 @dataclass(frozen=True)
@@ -180,14 +303,6 @@ class DeepseekV2WeightLoaderMixin:
             ckpt_up_proj_name="up_proj",
             num_experts=self.config.n_routed_experts + self.num_fused_shared_experts,
         )
-        # Params for special naming rules in mixed-precision models, for example:
-        # model.layers.xx.mlp.experts.xx.w1.input_scale. For details,
-        # see https://huggingface.co/Barrrrry/DeepSeek-R1-W4AFP8/blob/main.
-        if is_wint4afp8_or_wint4a16_config(self.quant_config):
-            expert_params_mapping += FusedMoE.make_expert_input_scale_params_mapping(
-                num_experts=self.config.n_routed_experts
-            )
-
         # Fuse q_a_proj and kv_a_proj_with_mqa along output dimension when q_lora_rank is not None
         fuse_qkv_a_proj = hasattr(self.config, "q_lora_rank") and (
             self.config.q_lora_rank is not None
@@ -203,9 +318,27 @@ class DeepseekV2WeightLoaderMixin:
         with concurrent.futures.ThreadPoolExecutor() as executor:
             futures = []
             params_dict = dict(self.named_parameters())
+            if expert_input_scale_has_destination(self.quant_config, params_dict):
+                expert_params_mapping += (
+                    FusedMoE.make_expert_input_scale_params_mapping(
+                        num_experts=self.config.n_routed_experts
+                    )
+                )
+                expert_input_scale_unused = False
+            else:
+                expert_input_scale_unused = has_expert_input_scale_checkpoint(
+                    self.quant_config
+                )
+            indexer_present_prefixes = {
+                n.rsplit(".indexer.", 1)[0] for n in params_dict if ".indexer." in n
+            }
             weight_names = []
 
+            num_unused_expert_input_scale = 0
             for name, loaded_weight in weights:
+                if expert_input_scale_unused and _EXPERT_INPUT_SCALE_RE.search(name):
+                    num_unused_expert_input_scale += 1
+                    continue
                 use_async_loading = should_async_load(loaded_weight)
                 layer_id = get_layer_id(name)
                 if (
@@ -254,7 +387,25 @@ class DeepseekV2WeightLoaderMixin:
                                 ):
                                     continue
 
+                if (
+                    _is_npu
+                    and self.quant_config is not None
+                    and self.quant_config.get_name() == "modelslim"
+                    and name.endswith((".scale", ".offset"))
+                ):
+                    name = maybe_remap_kv_scale_name(name, params_dict)
+                    if name is None:
+                        continue
+
+                if _load_fused_expert_tensor(name, loaded_weight, params_dict):
+                    continue
+
                 if "rotary_emb.inv_freq" in name:
+                    continue
+
+                if ".indexer." in name and (
+                    name.rsplit(".indexer.", 1)[0] not in indexer_present_prefixes
+                ):
                     continue
 
                 # CUDA fuses wk + weights_proj into one bf16 wk_weights_proj; the
@@ -330,8 +481,8 @@ class DeepseekV2WeightLoaderMixin:
                         # Skip loading extra bias for GPTQ models.
                         if name.endswith(".bias") and name not in params_dict:
                             continue
-                        # Skip loading embed_tokens if not first rank in pipeline parallelism
-                        if ".embed_tokens." in name and not self.pp_group.is_first_rank:
+                        # The last PP stage also owns an embedding for its NextN draft.
+                        if ".embed_tokens." in name and name not in params_dict:
                             continue
                         # Skip loading norm if not last rank in pipeline parallelism
                         if ".norm." in name and not self.pp_group.is_last_rank:
@@ -388,6 +539,16 @@ class DeepseekV2WeightLoaderMixin:
                                         "fused_qkv_a_proj_with_mqa",
                                     )
                                 )
+                                param_name = _resolve_quark_fp8_block_scale_name(
+                                    param_name, params_dict
+                                )
+                                if param_name not in params_dict:
+                                    logger.warning(
+                                        f"{param_name} not found in params_dict."
+                                    )
+                                    cached_a_proj.pop(q_a_proj_name, None)
+                                    cached_a_proj.pop(kv_a_proj_name, None)
+                                    continue
                                 param = params_dict[param_name]
 
                                 weight_loader = getattr(
@@ -413,6 +574,9 @@ class DeepseekV2WeightLoaderMixin:
                                             f"{scale[0]}_proj", "attn_mqa"
                                         )
                                         break
+                            name = _resolve_quark_fp8_block_scale_name(
+                                name, params_dict
+                            )
                             if name not in params_dict:
                                 # modelopt ckpt contains not needed weights for MTP module:
                                 # model.decoder.self_attn.attn_mqa.v_scale and
@@ -430,6 +594,13 @@ class DeepseekV2WeightLoaderMixin:
                                 func=weight_loader,
                                 func_args=(param, loaded_weight),
                             )
+
+            if num_unused_expert_input_scale:
+                log_info_on_rank0(
+                    logger,
+                    f"Skipped {num_unused_expert_input_scale} expert input_scale "
+                    "tensors with no registered destination.",
+                )
 
             # Wait for all tasks to complete and raise any exceptions.
             for future in concurrent.futures.as_completed(futures):
@@ -497,7 +668,7 @@ class DeepseekV2WeightLoaderMixin:
                 for name in weight_names:
                     if "kv_b_proj" in name:
                         layer_id = int(name.split(".")[2])
-                        if layer_id < self.config.num_hidden_layers:
+                        if self.model.start_layer <= layer_id < self.model.end_layer:
                             layer_ids.add(layer_id)
 
         for layer_id in layer_ids:
@@ -506,6 +677,9 @@ class DeepseekV2WeightLoaderMixin:
                 if not is_nextn
                 else self.model.decoder.self_attn
             )
+
+            if not hasattr(self_attn, "kv_b_proj"):
+                continue
 
             if hasattr(self_attn.kv_b_proj, "qweight"):
                 # awq compatible, dequantize the weight if supported
@@ -532,14 +706,9 @@ class DeepseekV2WeightLoaderMixin:
                 torch.float8_e4m3fn,
                 torch.float8_e4m3fnuz,
             ):
-                # For mixed quantization (experts int4, linear fp8), use linear_fp8_config
-                selected_quant_config = getattr(
-                    self.quant_config, "linear_fp8_config", None
-                )
-                if selected_quant_config is None:
-                    selected_quant_config = self.quant_config
-                weight_block_size = getattr(
-                    selected_quant_config, "weight_block_size", None
+                weight_block_size = _resolve_layer_weight_block_size(
+                    self_attn.kv_b_proj,
+                    self.quant_config,
                 )
                 if weight_block_size is not None:
                     assert hasattr(self_attn.kv_b_proj, "weight_scale_inv") or hasattr(
@@ -550,7 +719,9 @@ class DeepseekV2WeightLoaderMixin:
                         if hasattr(self_attn.kv_b_proj, "weight_scale")
                         else self_attn.kv_b_proj.weight_scale_inv
                     )
-                    if _is_fp8_fnuz:
+                    format_ue8m0 = getattr(weight_scale, "format_ue8m0", False)
+                    is_ue8m0_uint8 = format_ue8m0 and weight_scale.dtype == torch.uint8
+                    if _is_fp8_fnuz and not is_ue8m0_uint8:
                         weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
                             weight=w,
                             weight_scale=weight_scale,
@@ -560,13 +731,15 @@ class DeepseekV2WeightLoaderMixin:
                         weight = w
 
                     # In multiple weight loading scenarios (e.g. RL), we need to inverse the scale of the weights after the requantization happened at the first loading.
-                    if (
-                        should_deepgemm_weight_requant_ue8m0(
-                            weight_block_size=getattr(
-                                self.quant_config, "weight_block_size", None
-                            )
+                    if is_ue8m0_uint8:
+                        weight_scale = (weight_scale.to(torch.int32) << 23).view(
+                            torch.float32
                         )
-                        and weight_scale.format_ue8m0
+                    elif (
+                        should_deepgemm_weight_requant_ue8m0(
+                            weight_block_size=weight_block_size
+                        )
+                        and format_ue8m0
                     ):
                         weight_scale = inverse_transform_scale_ue8m0(
                             weight_scale, mn=weight.shape[-2]
@@ -579,8 +752,8 @@ class DeepseekV2WeightLoaderMixin:
                     ):
                         if (
                             deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-                            and not deep_gemm_wrapper.DEEPGEMM_BLACKWELL
-                            and get_bool_env_var("SGL_USE_DEEPGEMM_BMM", "false")
+                            and (_is_musa or current_arch().is_sm(9))
+                            and envs.SGLANG_USE_DEEPGEMM_BMM.get()
                         ):
                             block_scale = weight_scale
                             use_deep_gemm_bmm = True
@@ -611,25 +784,42 @@ class DeepseekV2WeightLoaderMixin:
                         if weight_scale.dim() == 1:
                             weight_scale = weight_scale.view(-1, 1)
 
-                    w, scale = channel_quant_to_tensor_quant(weight, weight_scale)
-                    self_attn.w_scale = scale
+                    if _is_sail:
+                        # dequant channel-wise fp8 to bf16
+                        w = w.to(torch.bfloat16) * weight_scale.to(torch.bfloat16)
+                    else:
+                        w, scale = channel_quant_to_tensor_quant(weight, weight_scale)
+                        self_attn.w_scale = scale
 
             if w.dtype == torch.int8:
-                if hasattr(self.quant_config, "weight_block_size"):
+                weight_block_size = (
+                    self.quant_config.weight_block_size
+                    if self.quant_config is not None
+                    else None
+                )
+                if weight_block_size is not None:
                     # block-wise int8 need it
-                    weight_block_size = self.quant_config.weight_block_size
-                    if weight_block_size is not None:
-                        assert hasattr(self_attn.kv_b_proj, "weight_scale_inv")
-                        weight = w
-                        weight_scale = self_attn.kv_b_proj.weight_scale_inv
-                        w = int8_block_dequant(
-                            weight, weight_scale, weight_block_size
-                        ).to(torch.bfloat16)
+                    assert hasattr(self_attn.kv_b_proj, "weight_scale_inv")
+                    weight = w
+                    weight_scale = self_attn.kv_b_proj.weight_scale_inv
+                    w = int8_block_dequant(weight, weight_scale, weight_block_size).to(
+                        torch.bfloat16
+                    )
                 else:
                     # channel-wise int8 need it
                     w = w.to(torch.bfloat16) * self_attn.kv_b_proj.weight_scale.to(
                         torch.bfloat16
                     )
+
+            # GLM ships kv_b_proj as bf16, which falls back to torch.bmm. Quantize to
+            # per-tensor e4m3fn (not fnuz) to match forward_mla_rocm's dtype gate.
+            if (
+                _use_aiter_gfx95
+                and self.config.architectures
+                and self.config.architectures[0] == "GlmMoeDsaForCausalLM"
+                and w.dtype == torch.bfloat16
+            ):
+                w, self_attn.w_scale = input_to_float8(w, dtype=torch.float8_e4m3fn)
 
             w_kc, w_vc = w.unflatten(
                 0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)

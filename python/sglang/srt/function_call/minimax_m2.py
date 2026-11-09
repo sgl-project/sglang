@@ -10,6 +10,7 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
+from sglang.srt.function_call.utils import get_schema_properties
 
 logger = logging.getLogger(__name__)
 
@@ -47,9 +48,9 @@ class MinimaxM2Detector(BaseFormatDetector):
         # Streaming state variables
         self._current_function_name: str = ""
         self._current_parameters: Dict[str, Any] = {}
-        self._streamed_parameters: Dict[str, str] = (
-            {}
-        )  # Track what parameter content we've streamed
+        self._streamed_parameters: Dict[
+            str, str
+        ] = {}  # Track what parameter content we've streamed
         self._in_tool_call: bool = False
         self._function_name_sent: bool = False
 
@@ -508,8 +509,8 @@ class MinimaxM2Detector(BaseFormatDetector):
         for tool in tools:
             if tool.function.name == fname and tool.function.parameters is not None:
                 parameters = tool.function.parameters
-                if isinstance(parameters, dict) and "properties" in parameters:
-                    param_config = parameters["properties"]
+                if isinstance(parameters, dict):
+                    param_config = get_schema_properties(parameters)
                     break
 
         param_type = self._get_param_types_from_config(pname, param_config)

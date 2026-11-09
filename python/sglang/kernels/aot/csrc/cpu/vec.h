@@ -16,6 +16,17 @@ inline Vectorized<scalar_t> convert_from_float_ext(const Vectorized<float>& a, c
   return at::vec::convert_from_float<scalar_t>(a, b);
 }
 
+// Inverse of load_float_vec2: stores 2 * Vectorized<float>::size() elements.
+template <typename scalar_t, typename std::enable_if_t<is_reduced_floating_point_v<scalar_t>, int> = 0>
+inline void store_float_vec2(scalar_t* __restrict__ out, const Vectorized<float>& a, const Vectorized<float>& b) {
+  convert_from_float_ext<scalar_t>(a, b).store(out);
+}
+
+inline void store_float_vec2(float* __restrict__ out, const Vectorized<float>& a, const Vectorized<float>& b) {
+  a.store(out);
+  b.store(out + Vectorized<float>::size());
+}
+
 template <typename scalar_t>
 inline void store_from_float_ext(scalar_t* out, const Vectorized<float>& a) {
   float out_buffer[Vectorized<float>::size()];
@@ -610,6 +621,14 @@ inline at::vec::Vectorized<float> fast_silu(const at::vec::Vectorized<float>& x)
 #else
   return x * fast_sigmoid(x);
 #endif
+}
+
+// exact (erf) gelu, matching torch.nn.functional.gelu(approximate="none")
+inline at::vec::Vectorized<float> fast_gelu(const at::vec::Vectorized<float>& x) {
+  const auto half = at::vec::Vectorized<float>(0.5f);
+  const auto one = at::vec::Vectorized<float>(1.f);
+  const auto inv_sqrt2 = at::vec::Vectorized<float>(0.70710678118654752440f);
+  return half * x * (one + (x * inv_sqrt2).erf());
 }
 
 inline at::vec::Vectorized<float>

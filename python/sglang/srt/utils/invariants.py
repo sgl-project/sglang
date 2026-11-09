@@ -226,6 +226,31 @@ def _signal(ok: torch.Tensor, *, inv: Invariant, level: InvariantCheckLevel, msg
     _reporter.record(f"{inv.name}@rank{_get_rank()}", inv.bucket, (~ok).sum(), msg)
 
 
+def expect_host(
+    inv: Invariant,
+    ok: bool,
+    *,
+    msg: str = "",
+    level: Optional[InvariantCheckLevel] = None,
+) -> None:
+    """Check a host-side condition per the (bucket x level) matrix, as `expect`
+    does for a tensor: raise where the bucket crashes at the current level,
+    count and log otherwise, nothing at OFF. ``level`` defaults to
+    `resolve_level()`."""
+    if level is None:
+        level = resolve_level()
+    if ok or level < InvariantCheckLevel.WARN:
+        return
+    if _crashes(inv.bucket, level):
+        raise AssertionError(f"invariant-check FAILED [{inv.name}]: {msg}")
+    _reporter.record(
+        f"{inv.name}@rank{_get_rank()}",
+        inv.bucket,
+        torch.ones(1, dtype=torch.int64),
+        msg,
+    )
+
+
 def expect(
     inv: Invariant,
     value: Optional[torch.Tensor],
@@ -236,6 +261,8 @@ def expect(
     (`inv.recover`) is applied unconditionally; only detection is gated. Returns
     the recovered value."""
     level = resolve_level()
+    if isinstance(inv.prop, NotNaN) and envs.SGLANG_ENABLE_NAN_LOGITS_CHECK.get():
+        level = InvariantCheckLevel.STRICT
     if level >= InvariantCheckLevel.WARN and value is not None and value.numel() > 0:
         detail = f"{inv.prop.name}: {msg}" if msg else inv.prop.name
         _signal(inv.prop.ok(value), inv=inv, level=level, msg=detail)

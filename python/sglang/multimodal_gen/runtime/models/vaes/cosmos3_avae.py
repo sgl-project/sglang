@@ -10,6 +10,10 @@ import torch
 from torch import nn
 from torch.nn.utils import weight_norm
 
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
+
 
 class Snake1d(nn.Module):
     def __init__(self, hidden_dim: int, logscale: bool = True) -> None:
@@ -128,8 +132,11 @@ def _cfg(config: dict[str, Any], *keys: str, default: Any = None) -> Any:
     return default
 
 
-class Cosmos3AVAEAudioTokenizer(nn.Module):
+class Cosmos3AVAEAudioTokenizer(nn.Module, LayerwiseOffloadableModuleMixin):
     """Cosmos3 audio tokenizer: latents → waveform via an Oobleck decoder stack."""
+
+    layerwise_offload_dit_group_enabled = False
+    layer_names = ["decoder.block"]
 
     def __init__(self, config: dict[str, Any]) -> None:
         super().__init__()
@@ -185,12 +192,6 @@ class Cosmos3AVAEAudioTokenizer(nn.Module):
     @property
     def temporal_compression_factor(self) -> int:
         return self.hop_size
-
-    def get_latent_num_samples(self, num_audio_samples: int) -> int:
-        return int(num_audio_samples) // self.hop_size
-
-    def get_audio_num_samples(self, num_latent_samples: int) -> int:
-        return int(num_latent_samples) * self.hop_size
 
     def _denormalize_latent(self, latent: torch.Tensor) -> torch.Tensor:
         if self.normalization_type == "tanh":

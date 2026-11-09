@@ -63,7 +63,7 @@ export const config = {
 
   modelNames: {
     "default|bf16": "meta-models/Muse-Glimmer-30B",
-    "default|gguf": "meta-models/Muse-Glimmer-30B-GGUF/muse-glimmer-30B-kquant-17gb.gguf",
+    "default|gguf": "meta-models/Muse-Glimmer-30B-GGUF/Muse-Glimmer-30B-KQuant-17GB-Q4_K_M.gguf",
     "default|nvfp4": "RadixArk/Muse-Glimmer-NVFP4",
     "default|mlx-q4": "RadixArk/Muse-Glimmer-q4-MLX",
     "default|mlx-q4km": "RadixArk/Muse-Glimmer-q4km-gs128-MLX",
@@ -86,7 +86,7 @@ export const config = {
 
   benchmarkCommands: {
     speed:
-`python3 -m sglang.bench_serving \\
+`python3 -m sglang.benchmark.serving \\
   --backend sglang \\
   --host {{CURL_HOST}} --port {{CURL_PORT}} \\
   --model {{MODEL_NAME}} \\

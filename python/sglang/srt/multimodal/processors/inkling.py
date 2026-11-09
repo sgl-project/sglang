@@ -24,24 +24,24 @@ from __future__ import annotations
 
 import base64
 import logging
-import urllib.request
 from collections.abc import Mapping
 from typing import Any, Dict, List, Optional, Tuple, Type, Union
 
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalProcessorOutput,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
 from sglang.srt.models.inkling import InklingForConditionalGeneration
 from sglang.srt.multimodal.inkling import (
     InklingAudioFeatureExtractor,
     InklingImageProcessor,
     InklingProcessor,
 )
+from sglang.srt.multimodal.media_io import (
+    CLIENT_MEDIA_EXCEPTIONS,
+    download_remote_media,
+)
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
@@ -78,12 +78,21 @@ def _resolve_media_item(item):
         url = getattr(item, "url")
     if not isinstance(url, str):
         return item
-    if url.startswith("data:"):
-        header, _, payload = url.partition(",")
-        return base64.b64decode(payload) if ";base64" in header else payload.encode()
-    if url.startswith(("http://", "https://")):
-        with urllib.request.urlopen(url, timeout=30) as resp:
-            return resp.read()
+    if not url.strip():
+        raise ValueError("empty media URL")
+    try:
+        if url.startswith("data:"):
+            header, _, payload = url.partition(",")
+            return (
+                base64.b64decode(payload) if ";base64" in header else payload.encode()
+            )
+        if url.startswith(("http://", "https://")):
+            return download_remote_media(url, timeout=30)
+    except CLIENT_MEDIA_EXCEPTIONS as e:
+        url_str = url
+        if len(url_str) > 100:
+            url_str = url_str[:100] + "..."
+        raise ValueError(f"Error while resolving media {url_str}: {e}") from e
     return url  # plain path / file:// -> handled by the per-modality byte loader
 
 
@@ -134,7 +143,8 @@ class InklingMultimodalProcessor(SGLangBaseProcessor):
                 logger.info("Using Rust-accelerated Inkling image processor")
             except ImportError:
                 logger.warning(
-                    "SGLANG_INKLING_RS_MM_PREPROCESS=1 but sglang.srt.multimodal._core is not available; "
+                    "SGLANG_INKLING_RS_MM_PREPROCESS=1 but "
+                    "sglang.srt.rust_extensions._multimodal is not available; "
                     "falling back to the default image processor."
                 )
                 image_processor = InklingImageProcessor(patch_size=patch_size)

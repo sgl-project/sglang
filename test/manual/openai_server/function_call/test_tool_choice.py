@@ -12,8 +12,8 @@ import unittest
 
 import openai
 
+from sglang.srt.hf_transformers import get_tokenizer
 from sglang.srt.utils import kill_process_tree
-from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -23,7 +23,6 @@ from sglang.test.test_utils import (
 
 
 class TestToolChoiceLlama32(CustomTestCase):
-
     @classmethod
     def setUpClass(cls):
         # Mark flaky tests for this model
@@ -379,15 +378,15 @@ class TestToolChoiceLlama32(CustomTestCase):
 
                     # Update function name if present (first chunk)
                     if tool_call_delta.function and tool_call_delta.function.name:
-                        tool_calls_by_index[tool_index]["function"][
-                            "name"
-                        ] = tool_call_delta.function.name
+                        tool_calls_by_index[tool_index]["function"]["name"] = (
+                            tool_call_delta.function.name
+                        )
 
                     # Accumulate arguments (all chunks)
                     if tool_call_delta.function and tool_call_delta.function.arguments:
-                        tool_calls_by_index[tool_index]["function"][
-                            "arguments"
-                        ] += tool_call_delta.function.arguments
+                        tool_calls_by_index[tool_index]["function"]["arguments"] += (
+                            tool_call_delta.function.arguments
+                        )
 
         self.assertGreater(len(tool_calls_by_index), 0)
 

@@ -1,0 +1,183 @@
+from unittest.mock import Mock
+
+import pytest
+import torch
+
+from sglang.srt.distributed.device_communicators import (
+    custom_all_reduce_utils,
+    custom_all_reduce_v2,
+)
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=6, suite="base-a-test-cpu")
+
+
+def _patch_group(monkeypatch, *, world_size, same_node):
+    group = object()
+    device = object()
+    monkeypatch.setattr(
+        custom_all_reduce_v2.dist,
+        "get_world_size",
+        lambda group: world_size,
+    )
+    monkeypatch.setattr(
+        custom_all_reduce_v2,
+        "get_supported_world_sizes",
+        lambda: (world_size,),
+    )
+    monkeypatch.setattr(
+        custom_all_reduce_v2,
+        "in_the_same_node_as",
+        lambda group, source_rank: [same_node] * world_size,
+    )
+    return group, device
+
+
+@pytest.mark.parametrize(
+    ("same_node", "has_fabric_clique", "expected"),
+    [
+        (False, True, True),
+        (False, False, False),
+        (True, None, True),
+    ],
+)
+def test_topology_capability(monkeypatch, same_node, has_fabric_clique, expected):
+    monkeypatch.setattr(custom_all_reduce_v2, "_is_hip", False)
+    world_size = 8 if same_node else 16
+    group, device = _patch_group(
+        monkeypatch,
+        world_size=world_size,
+        same_node=same_node,
+    )
+
+    def is_one_clique(group, device):
+        if same_node:
+            pytest.fail("intra-node groups do not need a fabric clique")
+        return has_fabric_clique
+
+    intra_node_capability = Mock(return_value=True)
+
+    monkeypatch.setattr(
+        custom_all_reduce_v2,
+        "is_one_nvlink_clique",
+        is_one_clique,
+    )
+    monkeypatch.setattr(
+        custom_all_reduce_v2,
+        "can_use_custom_all_reduce_with_nvlink",
+        intra_node_capability,
+    )
+
+    assert custom_all_reduce_v2.can_use_custom_all_reduce_v2(group, device) is expected
+    if same_node:
+        intra_node_capability.assert_called_once_with(
+            group=group,
+            device=device,
+            supported_world_size=[world_size],
+            cls_name="CustomAllReduceV2",
+        )
+    else:
+        intra_node_capability.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("hip_version", "expected"),
+    [((7, 0, 51831), False), ((7, 1, 0), False), ((7, 2, 0), True), ((7, 17, 0), True)],
+)
+def test_rocm_runtime_gate(monkeypatch, hip_version, expected):
+    """On ROCm a HIP runtime older than MIN_HIP_VERSION disables v2 up front."""
+    from sglang.srt.utils import hip_vmm_utils
+
+    group, device = _patch_group(monkeypatch, world_size=8, same_node=True)
+    monkeypatch.setattr(custom_all_reduce_v2, "_is_hip", True)
+    monkeypatch.setattr(hip_vmm_utils, "hip_runtime_version", lambda: hip_version)
+    topology_check = Mock(return_value=True)
+    monkeypatch.setattr(
+        custom_all_reduce_v2,
+        "can_use_custom_all_reduce_with_nvlink",
+        topology_check,
+    )
+
+    assert custom_all_reduce_v2.can_use_custom_all_reduce_v2(group, device) is expected
+    assert topology_check.called is expected
+
+
+@pytest.mark.parametrize("in_clique", [True, False])
+def test_rocm_multinode_uses_fabric_clique(monkeypatch, in_clique):
+    """A multi-node ROCm group is admitted only by the gfx1250 fabric probe."""
+    from sglang.srt.utils import hip_vmm_utils
+
+    group, device = _patch_group(monkeypatch, world_size=16, same_node=False)
+    monkeypatch.setattr(custom_all_reduce_v2, "_is_hip", True)
+    monkeypatch.setattr(hip_vmm_utils, "hip_runtime_version", lambda: (7, 17, 0))
+    monkeypatch.setattr(
+        custom_all_reduce_v2,
+        "is_one_nvlink_clique",
+        lambda group, device: pytest.fail("ROCm has no NVLink clique to query"),
+    )
+    from sglang.srt.distributed.device_communicators import gfx1250_fabric
+
+    probe = Mock(return_value=in_clique)
+    monkeypatch.setattr(gfx1250_fabric, "probe_fabric_clique", probe)
+
+    assert custom_all_reduce_v2.can_use_custom_all_reduce_v2(group, device) is in_clique
+    probe.assert_called_once_with(group, device)
+
+
+@pytest.mark.parametrize(
+    ("disabled", "has_multicast", "nbytes", "num_blocks", "expected"),
+    [
+        (False, True, 1024, 4, True),
+        (False, True, 1025, 4, False),
+        (False, True, 1024, 5, False),
+        (False, True, 0, 1, False),
+        (False, False, 1024, 4, True),
+        (True, None, 1024, 4, False),
+    ],
+)
+def test_supports_push(disabled, has_multicast, nbytes, num_blocks, expected):
+    """Push is offered within the plane's inclusive capacity, with or without multicast."""
+    comm = object.__new__(custom_all_reduce_v2.CustomAllReduceV2)
+    comm.disabled = disabled
+    # A disabled communicator never builds its planes, so these stay unset.
+    if not disabled:
+        comm.has_multicast = has_multicast
+        comm.max_push_size = 1024
+        comm._push_counter = torch.zeros(4)
+    assert comm.supports_push(nbytes=nbytes, num_blocks=num_blocks) is expected
+
+
+@pytest.mark.parametrize(
+    ("cluster_uuid", "peer_host", "expected"),
+    [
+        # HGX baseboards report a zero cluster UUID and clique 0 on every node.
+        (bytes(16), "node-a", True),
+        (bytes(16), "node-b", False),
+        # An NVL72 rack shares one nonzero cluster UUID across its nodes.
+        (b"\x01" * 16, "node-b", True),
+    ],
+)
+def test_zero_cluster_uuid_clique_ends_at_its_node(
+    monkeypatch, cluster_uuid, peer_host, expected
+):
+    monkeypatch.setattr(custom_all_reduce_utils, "_is_hip", False)
+    monkeypatch.setattr(
+        custom_all_reduce_utils, "_gpu_fabric_clique", lambda device: (cluster_uuid, 0)
+    )
+    monkeypatch.setattr(custom_all_reduce_utils.dist, "get_world_size", lambda group: 2)
+    monkeypatch.setattr(custom_all_reduce_utils.socket, "gethostname", lambda: "node-a")
+
+    def all_gather_object(gathered, clique, group):
+        peer = clique if len(clique) == 2 else (*clique[:2], peer_host)
+        gathered[:] = [clique, peer]
+
+    monkeypatch.setattr(
+        custom_all_reduce_utils.dist, "all_gather_object", all_gather_object
+    )
+    # The undecorated function: the CPU runner has no NVML to initialize.
+    is_one_nvlink_clique = custom_all_reduce_utils.is_one_nvlink_clique.__wrapped__
+    assert is_one_nvlink_clique(object(), object()) is expected
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

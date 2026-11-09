@@ -13,7 +13,6 @@ so the chunked-MHA path never runs.
 """
 
 import unittest
-from pathlib import Path
 from types import SimpleNamespace
 
 import torch
@@ -21,7 +20,7 @@ import torch
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.attention_unittest.attention_methods.mla_attention import (
     DEFAULT_KV_LORA_RANK,
@@ -33,7 +32,7 @@ from sglang.test.kits.attention_unittest.attention_methods.mla_attention import 
 )
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-small")
 
 
 _KV_LORA_RANK = DEFAULT_KV_LORA_RANK
@@ -143,8 +142,4 @@ class TestHybridLinearChunkMetadataDelegation(CustomTestCase):
 
 
 if __name__ == "__main__":
-    sys_path_parent = str(Path(__file__).resolve().parents[1])
-    import sys
-
-    sys.path.insert(0, sys_path_parent)
     unittest.main()

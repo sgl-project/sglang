@@ -23,9 +23,15 @@ import torch
 from sglang.multimodal_gen.configs.models.vaes.minimax_h3_video import (
     MiniMaxH3VideoVAEArchConfig,
 )
+from sglang.multimodal_gen.runtime.cache.conditioning import cached_vae_call
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_replica_group,
+    model_parallel_is_initialized,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.packed_tokens import (
     minimax_h3_patchify_video_latent,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 
 MINIMAX_H3_KEYFRAME_ENCODE_SEED = 42
 MINIMAX_H3_KEYFRAME_PATCH_SIZE = (1, 2, 2)
@@ -37,16 +43,38 @@ def minimax_h3_scoped_encode_rng(seed: int, device: torch.device | None = None):
 
     The encode recipes seed the default torch generators right before a
     posterior-sampled VAE encode. Forking restores the process-global CPU and
-    CUDA generators after the encode while preserving the exact sampled result.
+    device generators after the encode while preserving the exact sampled
+    result.
     """
     devices: list[torch.device] = []
-    if device is not None and device.type == "cuda" and torch.cuda.is_available():
-        devices = [device]
-    with torch.random.fork_rng(devices=devices):
+    device_module = None
+    device_type = None
+    is_supported_backend = (
+        current_platform.is_cuda()
+        or current_platform.is_rocm()
+        or current_platform.is_npu()
+        or current_platform.is_xpu()
+    )
+    if (
+        device is not None
+        and is_supported_backend
+        and device.type == current_platform.device_type
+    ):
+        device_module = torch.get_device_module(device)
+        if device_module.is_available():
+            devices = [device]
+            device_type = current_platform.device_type
+    fork_rng_context = (
+        torch.random.fork_rng(devices=devices)
+        if device_type is None
+        else torch.random.fork_rng(devices=devices, device_type=device_type)
+    )
+    with fork_rng_context:
         torch.default_generator.manual_seed(int(seed))
         for forked_device in devices:
-            with torch.cuda.device(forked_device):
-                torch.cuda.manual_seed(int(seed))
+            assert device_module is not None
+            with device_module.device(forked_device):
+                device_module.manual_seed(int(seed))
         yield
 
 
@@ -96,8 +124,32 @@ def minimax_h3_encode_keyframe_cond_rows(
 ) -> torch.Tensor:
     """Encode a target-canvas PIL image into packed imgvid cond rows.
 
-    Returns [n_rows, 24 * patch_h * patch_w] fp32 on CPU.
+    Returns [n_rows, 24 * patch_h * patch_w] fp32 on CPU. The rows are cached
+    per image: the fixed encode seed makes them a function of the image alone.
     """
+    world = get_replica_group().world_size if model_parallel_is_initialized() else 1
+    return cached_vae_call(
+        video_vae,
+        "minimax_h3_keyframe_cond_rows",
+        (
+            image,
+            MINIMAX_H3_KEYFRAME_ENCODE_SEED,
+            arch_config.latent_channels,
+            tuple(arch_config.latents_mean),
+            tuple(arch_config.latents_std),
+        ),
+        lambda: _encode_keyframe_cond_rows(video_vae, image, arch_config),
+        # Parallel tiling all-gathers inside every replica rank's encode;
+        # otherwise only rank 0 encodes and broadcasts the rows.
+        group=get_replica_group() if world > 1 and video_vae.parallel_tiling else None,
+    )
+
+
+def _encode_keyframe_cond_rows(
+    video_vae: Any,
+    image: Any,
+    arch_config: MiniMaxH3VideoVAEArchConfig,
+) -> torch.Tensor:
     seed = MINIMAX_H3_KEYFRAME_ENCODE_SEED
     # The encode recipe runs on fp32 weights. Normal H3 residency already keeps
     # the shared video VAE in fp32; retain the scoped cast for standalone use.

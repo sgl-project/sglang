@@ -44,7 +44,7 @@ class TranscriptionAdapter(ABC):
 
     @staticmethod
     def parse_fused_output(
-        text: str, *, ts_variant: bool = False
+        text: str, *, ts_variant: bool = False, strip: bool = True
     ) -> tuple[Optional[str], Optional[str]]:
         """Parse the fused output into ``(language_code, user_visible_text)``.
 
@@ -75,6 +75,17 @@ class TranscriptionAdapter(ABC):
         should override to strip their special-token syntax.
         """
         return text
+
+    @property
+    def max_audio_clip_s(self) -> Optional[float]:
+        """Maximum audio duration (seconds) the model can ingest per request.
+
+        Audio longer than this is split at low-energy points into
+        contiguous chunks (see ``audio_chunking.split_audio_energy_aware``),
+        transcribed as independent requests, and stitched back in order.
+        ``None`` disables chunking.
+        """
+        return None
 
     @property
     def supports_chunked_streaming(self) -> bool:
@@ -124,6 +135,31 @@ class TranscriptionAdapter(ABC):
         usage: TranscriptionUsage,
     ) -> TranscriptionVerboseResponse:
         """Build a ``verbose_json`` response with segments / timestamps."""
+
+    def build_verbose_response_chunked(
+        self,
+        request: TranscriptionRequest,
+        text: str,
+        rets: List[dict],
+        chunk_offsets_s: List[float],
+        tokenizer,
+        usage: TranscriptionUsage,
+    ) -> TranscriptionVerboseResponse:
+        """Build a ``verbose_json`` response from multiple chunk results.
+
+        Called instead of ``build_verbose_response`` when the audio was
+        longer than ``max_audio_clip_s`` and split into chunks;
+        ``chunk_offsets_s[i]`` is chunk *i*'s start time in the original
+        audio. The default implementation returns the stitched text with
+        no segment timing.
+        """
+        return TranscriptionVerboseResponse(
+            language=request.language,
+            duration=round(request.audio_duration_s, 2),
+            text=text,
+            segments=[],
+            usage=usage,
+        )
 
 
 _ADAPTER_REGISTRY: dict[str, type[TranscriptionAdapter]] = {}

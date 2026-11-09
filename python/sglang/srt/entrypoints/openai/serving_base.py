@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import uuid
@@ -14,6 +15,7 @@ from sglang.srt.entrypoints.openai.encoding_dsv32 import DS32EncodingError
 from sglang.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingRequest
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.observability.req_time_stats import monotonic_time
+from sglang.srt.runtime_context import get_observability
 from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
@@ -29,28 +31,33 @@ class OpenAIServingBase(ABC):
     def __init__(self, tokenizer_manager: TokenizerManager):
         self.tokenizer_manager = tokenizer_manager
         self.allowed_custom_labels = (
-            set(
-                self.tokenizer_manager.server_args.tokenizer_metrics_allowed_custom_labels
-            )
+            set(get_observability().tokenizer_metrics_allowed_custom_labels)
             if isinstance(self.tokenizer_manager.server_args, ServerArgs)
-            and self.tokenizer_manager.server_args.tokenizer_metrics_allowed_custom_labels
+            and get_observability().tokenizer_metrics_allowed_custom_labels
             else None
         )
 
     def _parse_model_parameter(self, model: str) -> Tuple[str, Optional[str]]:
         """Parse 'base-model:adapter-name' syntax to extract LoRA adapter.
 
-        Returns (base_model, adapter_name) or (model, None) if no colon present.
+        Returns (base_model, adapter_name), preserving an exact served model
+        name even when it contains colons (e.g. an object-storage URI).
         """
         if ":" not in model:
             return model, None
 
-        # Split on first colon only to handle model paths with multiple colons
-        parts = model.split(":", 1)
-        base_model = parts[0].strip()
-        adapter_name = parts[1].strip() or None
+        served_model_name = self.tokenizer_manager.served_model_name
+        if model == served_model_name:
+            return model, None
 
-        return base_model, adapter_name
+        # Match the full served name before splitting URI schemes like s3://.
+        if model.startswith(f"{served_model_name}:"):
+            base_model = served_model_name
+            adapter_name = model[len(served_model_name) + 1 :]
+        else:
+            base_model, adapter_name = model.split(":", 1)
+
+        return base_model.strip(), adapter_name.strip() or None
 
     def _resolve_lora_path(
         self,
@@ -89,9 +96,11 @@ class OpenAIServingBase(ABC):
             if request_logger.log_requests and request_logger.log_requests_level >= 2:
                 request_logger.log_openai_received_request(request, request=raw_request)
 
-            # Convert to internal format
-            adapted_request, processed_request = self._convert_to_internal_request(
-                request, raw_request
+            # Convert off-loop: jinja render + full-prompt tokenization blocks
+            # the loop on long prompts, and the rust tokenizer releases the GIL.
+            loop = asyncio.get_running_loop()
+            adapted_request, processed_request = await loop.run_in_executor(
+                None, self._convert_to_internal_request, request, raw_request
             )
 
             if isinstance(adapted_request, (GenerateReqInput, EmbeddingReqInput)):
@@ -147,19 +156,6 @@ class OpenAIServingBase(ABC):
             return rid
 
         return f"{self._request_id_prefix()}{uuid.uuid4().hex}"
-
-    def _compute_extra_key(self, request: OpenAIServingRequest) -> Optional[str]:
-        """Compute the final extra_key by concatenating cache_salt and extra_key if both are provided."""
-        parts = []
-        for key in ["cache_salt", "extra_key"]:
-            value = getattr(request, key, None)
-            if value:
-                if not isinstance(value, str):
-                    raise TypeError(
-                        f"Value of {key} must be a string, but got {type(value).__name__}"
-                    )
-                parts.append(value)
-        return "".join(parts) if parts else None
 
     @abstractmethod
     def _convert_to_internal_request(
@@ -243,14 +239,12 @@ class OpenAIServingBase(ABC):
     def extract_custom_labels(self, raw_request):
         if (
             not self.allowed_custom_labels
-            or not self.tokenizer_manager.server_args.tokenizer_metrics_custom_labels_header
+            or not get_observability().tokenizer_metrics_custom_labels_header
         ):
             return None
 
         custom_labels = None
-        header = (
-            self.tokenizer_manager.server_args.tokenizer_metrics_custom_labels_header
-        )
+        header = get_observability().tokenizer_metrics_custom_labels_header
         try:
             raw_labels = (
                 orjson.loads(raw_request.headers.get(header))

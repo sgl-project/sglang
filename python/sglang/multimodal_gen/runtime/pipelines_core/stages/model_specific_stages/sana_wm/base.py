@@ -47,7 +47,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
+from sglang.multimodal_gen.runtime.utils.precision_types import PRECISION_TO_TYPE
 
 logger = init_logger(__name__)
 
@@ -637,6 +637,8 @@ class SanaWMTextEncodingStage(TextEncodingStage):
     model-specific prompt-window contract.
     """
 
+    deduplicated_output_fields = ()
+
     @staticmethod
     def _text_encoder_max_length(server_args: ServerArgs) -> int:
         encoder_cfg = server_args.pipeline_config.text_encoder_configs[0]
@@ -1021,6 +1023,7 @@ class SanaWMDenoisingStage(DenoisingStage):
                 if latents.dtype != latents_dtype:
                     latents = latents.to(latents_dtype)
 
+                self.check_cancelled(batch)
                 if sana_wm_diagnostics_enabled() and (
                     step_idx == 0 or step_idx == len(timesteps) - 1
                 ):

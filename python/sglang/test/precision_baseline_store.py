@@ -40,6 +40,7 @@ def _store_token() -> Optional[str]:
 class HfStoreConfig:
     repo: str
     revision: str = "main"
+    read_only: bool = False
 
     @classmethod
     def from_env(cls) -> HfStoreConfig:
@@ -51,7 +52,8 @@ class HfStoreConfig:
                 "and SGLANG_PRECISION_HF_TOKEN."
             )
         revision = os.environ.get("SGLANG_PRECISION_HF_REVISION", "main")
-        return cls(repo=repo, revision=revision)
+        read_only = os.environ.get("SGLANG_PRECISION_HF_READ_ONLY", "0") == "1"
+        return cls(repo=repo, revision=revision, read_only=read_only)
 
 
 def _sanitize_model_name(model: str) -> str:
@@ -150,6 +152,7 @@ def fetch_latest_baseline(
         rows, model=model, capture_signature=capture_signature
     )
     if run_path is None:
+        shutil.rmtree(target_tensors_dir, ignore_errors=True)
         return None
 
     snapshot_root = _with_retries(
@@ -164,12 +167,15 @@ def fetch_latest_baseline(
     )
     src = Path(snapshot_root) / run_path / "tensors"
     if not src.exists():
+        shutil.rmtree(target_tensors_dir, ignore_errors=True)
         return None
 
-    target_tensors_dir.mkdir(parents=True, exist_ok=True)
-    for fp in src.iterdir():
-        if fp.is_file():
-            shutil.copy2(fp, target_tensors_dir / fp.name)
+    target_tensors_dir.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=target_tensors_dir.parent) as staging_root:
+        staged_tensors = Path(staging_root) / "tensors"
+        shutil.copytree(src, staged_tensors)
+        shutil.rmtree(target_tensors_dir, ignore_errors=True)
+        staged_tensors.rename(target_tensors_dir)
     return run_path
 
 
@@ -211,6 +217,7 @@ _MANIFEST_PROMOTE_KEYS = (
     "num_layers_failed",
     "max_rel_diff",
     "ci_run_id",
+    "ci_runner",
 )
 
 
@@ -224,9 +231,12 @@ def push_run(
     comparator_report: Optional[Path] = None,
     force: bool = False,
 ) -> str:
-    # Dedup: same model+date+sha → skip tensor upload but still refresh meta
-    # + comparator_report + append a new manifest row, so pass-1 baseline and
-    # pass-2 stats both land. force=True re-uploads tensors too.
+    if config.read_only:
+        raise PermissionError("precision baseline store is read-only")
+
+    # Dedup: same model+date+sha -> a failed push skips the tensor upload but
+    # still refreshes meta + comparator_report and appends a manifest row.
+    # force=True re-uploads tensors too.
     api = HfApi(token=_store_token())
     date_str, date_path = _today_path()
     model_sanitized = _sanitize_model_name(model)
@@ -237,7 +247,12 @@ def push_run(
 
     existing_rows, existing_text = _read_manifest(config)
     tensors_already_present = any(r.get("run_path") == run_path for r in existing_rows)
-    skip_tensors = tensors_already_present and not force
+    # fetch serves a non-failed row's tensors as the next baseline, so such a
+    # push must upload its own; reusing tensors an earlier failed push left
+    # at this path would promote them to the baseline under a passed label.
+    skip_tensors = (
+        tensors_already_present and not force and meta["pass_label"] == "failed"
+    )
 
     with tempfile.TemporaryDirectory() as stage_dir:
         stage = Path(stage_dir)

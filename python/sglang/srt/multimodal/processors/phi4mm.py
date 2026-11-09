@@ -3,7 +3,7 @@ from typing import List, Union
 
 from transformers.processing_utils import ProcessorMixin
 
-from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
+from sglang.srt.managers.req_types import MultimodalProcessorOutput
 from sglang.srt.models.phi4mm import Phi4MMForCausalLM
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
@@ -89,7 +89,7 @@ class Phi4MMMultimodalProcessor(BaseMultimodalProcessor):
                 (audio, self.AUDIO_SAMPLE_RATE) for audio in base_output.audios
             ]
 
-        mm_items, input_ids, _ = self.process_and_combine_mm_data(
+        mm_items, input_ids, _ = await self.process_and_combine_mm_data_async(
             base_output, self.mm_tokens
         )
 

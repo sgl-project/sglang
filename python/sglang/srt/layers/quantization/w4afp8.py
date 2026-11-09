@@ -15,7 +15,7 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import is_layer_skipped
-from sglang.srt.utils import set_weight_attrs
+from sglang.srt.layers.utils.common import set_weight_attrs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe import MoeRunnerConfig
@@ -342,7 +342,9 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         layer: DeepEPMoE,
         dispatch_output: DeepEPLLDispatchOutput,
     ) -> torch.Tensor:
-        hidden_states, hidden_scales, topk_ids, _, masked_m, _ = dispatch_output
+        hidden_states, hidden_scales, topk_ids, _, masked_m, expected_m = (
+            dispatch_output
+        )
 
         if hidden_scales is None:
             raise RuntimeError(
@@ -376,6 +378,7 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
             layer.quant_method.problem_sizes2,
             layer.w13_input_scale,
             layer.w2_input_scale,
+            expected_m=expected_m,
         )
 
         return output

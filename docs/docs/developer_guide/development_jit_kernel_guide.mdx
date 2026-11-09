@@ -168,7 +168,7 @@ def add_constant(src: torch.Tensor, c: int):
 
 ### STEP 1: Write the C++ kernel
 
-Write your CUDA kernel in [kernels/jit/csrc/add_constant.cuh](https://github.com/sgl-project/sglang/blob/main/python/sglang/kernels/jit/csrc/add_constant.cuh). For demonstration purposes, we pass the constant value as a template parameter.
+Write your CUDA kernel in [kernels/jit/csrc/elementwise/add_constant.cuh](https://github.com/sgl-project/sglang/blob/main/python/sglang/kernels/jit/csrc/elementwise/add_constant.cuh). For demonstration purposes, we pass the constant value as a template parameter.
 
 ```cpp Example
 #include <sgl_kernel/tensor.h>   // For TensorMatcher, SymbolicSize, SymbolicDevice
@@ -231,7 +231,7 @@ void add_constant(tvm::ffi::TensorView dst, tvm::ffi::TensorView src) {
 ### STEP 2: Create Python Interfaces
 
 Next, expose the kernel through a Python wrapper.
-Create a new file at [kernels/ops/attention/add_constant.py](https://github.com/sgl-project/sglang/blob/main/python/sglang/kernels/ops/attention/add_constant.py) and expose the needed interfaces.
+Create a new file at [kernels/ops/elementwise/add_constant.py](https://github.com/sgl-project/sglang/blob/main/python/sglang/kernels/ops/elementwise/add_constant.py) and expose the needed interfaces.
 
 ```python Example
 from __future__ import annotations
@@ -251,7 +251,7 @@ def _jit_add_constant_module(constant: int) -> Module:
     return load_jit(
         "add_constant",
         *args,
-        cuda_files=["add_constant.cuh"],
+        cuda_files=["elementwise/add_constant.cuh"],
         cuda_wrappers=[("add_constant", f"add_constant<{args}>")],
     )
 
@@ -275,10 +275,10 @@ Keep the Python wrapper thin, but still validate the basic invariants such as de
 Finally, import and use the kernel like a regular Python function:
 
 ```python Example
-from sglang.kernels.jit.add_constant import add_constant
+from sglang.kernels.ops.elementwise.add_constant import add_constant
 ```
 
-For a complete, runnable example, refer to [test_add_constant.py](https://github.com/sgl-project/sglang/blob/main/test/registered/jit/test_add_constant.py).
+For a complete, runnable example, refer to [test_add_constant.py](https://github.com/sgl-project/sglang/blob/main/test/registered/kernels/ops/elementwise/test_add_constant.py).
 
 ## C++ Include Library Reference
 

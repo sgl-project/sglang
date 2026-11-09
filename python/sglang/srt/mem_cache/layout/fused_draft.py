@@ -1,0 +1,777 @@
+"""Draft-model regions nested inside unified sub-pools' slot entries.
+
+The nesting, outermost first:
+
+  sub-pool  a named pool inside the unified pool ("full", "window_4096",
+            "mamba"), with its own grow direction and frontier. HOST is the
+            role it plays when its entries also carry draft bytes.
+  slot      one token entry of that sub-pool. The draft's KV is extra parts of
+            every slot, after the host's own parts, so ONE slot id per token
+            covers target and draft: one allocation, one free, one whole-page
+            relocation carry both.
+  region    the draft geometry inside one host's entries. A region is not a
+            `SubPoolSpec`: no grow direction, no frontier logic, only geometry.
+  lane      one position in the region's layer dimension -- one draft layer of
+            one runner, present in every slot.
+  range     the contiguous lanes one runner owns in one host.
+
+A lane is not a layer. Runners are the draft's execution copies: a
+replicated head gives EVERY runner all the draft's layers, on lanes of its own
+so runners do not clobber each other's KV (3 runners x 2 layers = 6 lanes),
+while a per-depth head (one block per predicted position) gives each runner
+ONE depth (8 layers across 2 runners = 2 lanes). The runners' ranges tile
+each region in runner order, with no gap and no overlap.
+
+A draft LAYER kind (`LAYER_*`) is what the draft checkpoint has; a HOST kind
+(`HostKind`, keyed by sub-pool name) is what a sub-pool can carry in its
+entries. `place_fused_draft` consults the `HOST_KINDS` registry, and the draft
+worker binds each host through its family's binder
+(`unified_draft_pool.DRAFT_BINDERS`). A matching lifetime shares the host's
+entries; an unmatched lifetime owns a separately priced band.
+"""
+
+import math
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
+
+import msgspec
+import torch
+
+from sglang.srt.mem_cache.kv.decl import window_sub_pool_name
+from sglang.srt.mem_cache.layout.token_major import DensePart, align_part_offset
+
+LAYER_FULL = "full"
+LAYER_WINDOW = "window"
+LAYER_STATE = "state"
+
+_LAYER_KIND_NOUN = {
+    LAYER_FULL: "full-attention",
+    LAYER_WINDOW: "sliding-window",
+    LAYER_STATE: "recurrent-state",
+}
+
+
+class DenseDraftRegion(msgspec.Struct, frozen=True, kw_only=True):
+    """Geometry of the DRAFT model's K/V rows fused into every slot of a host
+    sub-pool. The draft is a separate checkpoint, so its head geometry and
+    layer count can differ from the host's; its K and V rows are two more parts
+    of the host entry, indexed by the host's physical token id."""
+
+    lane_num: int
+    head_num: int
+    head_dim: int
+    store_dtype: torch.dtype
+    v_head_dim: Optional[int] = None
+    # The KV cache dtype the rows hold, where it differs from how they are
+    # stored: fp8 rows are stored as uint8.
+    kv_dtype: Optional[torch.dtype] = None
+    token_replicas: int = 1
+
+    def validate(self) -> None:
+        assert self.token_replicas >= 1
+        assert self.lane_num > 0, f"lane_num must be positive; got {self.lane_num}"
+        assert self.head_num > 0, f"head_num must be positive; got {self.head_num}"
+        assert self.head_dim > 0, f"head_dim must be positive; got {self.head_dim}"
+        v = self.resolved_v_head_dim()
+        assert v > 0, f"v_head_dim must be positive; got {v}"
+
+    def resolved_v_head_dim(self) -> int:
+        return self.head_dim if self.v_head_dim is None else self.v_head_dim
+
+    def resolved_kv_dtype(self) -> torch.dtype:
+        return self.store_dtype if self.kv_dtype is None else self.kv_dtype
+
+    def k_row_bytes(self) -> int:
+        return self.head_num * self.head_dim * self.store_dtype.itemsize
+
+    def v_row_bytes(self) -> int:
+        return self.head_num * self.resolved_v_head_dim() * self.store_dtype.itemsize
+
+    def entry_bytes(self) -> int:
+        """Draft bytes per slot, before the host entry's alignment."""
+        return self.lane_num * (
+            align_part_offset(self.k_row_bytes())
+            + align_part_offset(self.v_row_bytes())
+        )
+
+    def parts(self, offset_bytes: int) -> Tuple[DensePart, DensePart]:
+        """The draft's K and V parts, laid out from ``offset_bytes`` inside
+        the host entry."""
+        layer_stride = align_part_offset(self.k_row_bytes()) + align_part_offset(
+            self.v_row_bytes()
+        )
+        return (
+            DensePart(
+                name="draft_k",
+                offset_bytes=offset_bytes,
+                layer_stride_bytes=layer_stride,
+                layer_num=self.lane_num,
+                row_shape=(self.head_num, self.head_dim),
+                dtype=self.store_dtype,
+            ),
+            DensePart(
+                name="draft_v",
+                offset_bytes=offset_bytes + align_part_offset(self.k_row_bytes()),
+                layer_stride_bytes=layer_stride,
+                layer_num=self.lane_num,
+                row_shape=(self.head_num, self.resolved_v_head_dim()),
+                dtype=self.store_dtype,
+            ),
+        )
+
+
+class MLADraftRegion(msgspec.Struct, frozen=True, kw_only=True):
+    """A draft latent row, including its RoPE suffix, in each token entry."""
+
+    lane_num: int
+    kv_lora_rank: int
+    qk_rope_head_dim: int
+    store_dtype: torch.dtype
+    kv_dtype: Optional[torch.dtype] = None
+    token_replicas: int = 1
+
+    def validate(self):
+        assert self.lane_num > 0 and self.token_replicas > 0
+        assert self.kv_lora_rank > 0 and self.qk_rope_head_dim > 0
+
+    def resolved_kv_dtype(self):
+        return self.store_dtype if self.kv_dtype is None else self.kv_dtype
+
+    def entry_bytes(self):
+        return self.lane_num * align_part_offset(
+            (self.kv_lora_rank + self.qk_rope_head_dim) * self.store_dtype.itemsize
+        )
+
+    def parts(self, offset_bytes):
+        width = self.kv_lora_rank + self.qk_rope_head_dim
+        return (
+            DensePart(
+                name="draft_kv",
+                offset_bytes=offset_bytes,
+                layer_stride_bytes=align_part_offset(width * self.store_dtype.itemsize),
+                layer_num=self.lane_num,
+                row_shape=(1, width),
+                dtype=self.store_dtype,
+            ),
+        )
+
+
+class DraftMLAGeometry(msgspec.Struct, frozen=True, kw_only=True):
+    kv_lora_rank: int
+    qk_rope_head_dim: int
+
+
+class DraftKVGeometry(msgspec.Struct, frozen=True, kw_only=True):
+    """Per-GPU K/V row geometry of one kind of draft attention layer."""
+
+    head_num: int
+    head_dim: int
+    v_head_dim: int
+
+
+class DraftStateGeometry(msgspec.Struct, frozen=True, kw_only=True):
+    """Per-GPU shapes of one recurrent-state layer of the draft: one conv
+    tensor per stream plus the temporal state, as `MambaPool.State` lays them
+    out. Every stream is carried, even ones a depth never touches, because
+    the backend indexes ``conv[stream]`` by absolute stream number."""
+
+    conv_state_shapes: Tuple[Tuple[int, ...], ...]
+    conv_dtype: torch.dtype
+    temporal_state_shape: Tuple[int, ...]
+    temporal_dtype: torch.dtype
+
+    def conv_row_bytes(self, idx: int) -> int:
+        return math.prod(self.conv_state_shapes[idx]) * self.conv_dtype.itemsize
+
+    def temporal_row_bytes(self) -> int:
+        return math.prod(self.temporal_state_shape) * self.temporal_dtype.itemsize
+
+    def layer_bytes(self) -> int:
+        conv = sum(self.conv_row_bytes(i) for i in range(len(self.conv_state_shapes)))
+        return conv + self.temporal_row_bytes()
+
+
+class DraftStateRegion(msgspec.Struct, frozen=True, kw_only=True):
+    """The draft's recurrent state fused into every slot of a host state
+    sub-pool: one block per fused (runner, layer), laid out stream-major like
+    the host's own block, after it. The host's whole-entry clear and copy then
+    carry the draft's state with the target's."""
+
+    lane_num: int
+    state: DraftStateGeometry
+
+    def validate(self) -> None:
+        assert self.lane_num > 0, f"lane_num must be positive; got {self.lane_num}"
+        assert len(self.state.conv_state_shapes) > 0, (
+            "conv_state_shapes must be non-empty"
+        )
+
+    def entry_bytes(self) -> int:
+        """Draft state bytes per slot, before the host entry's alignment."""
+        return self.entry_layout().entry_bytes
+
+    def entry_layout(self):
+        from sglang.srt.mem_cache.kv.decl import TensorPartDecl
+        from sglang.srt.mem_cache.kv.layout.state import state_entry_layout
+
+        layers = tuple(range(self.lane_num))
+        return state_entry_layout(
+            (
+                *(
+                    TensorPartDecl(
+                        name=f"conv.{i}",
+                        shape=shape,
+                        dtype=self.state.conv_dtype,
+                        layer_ids=layers,
+                    )
+                    for i, shape in enumerate(self.state.conv_state_shapes)
+                ),
+                TensorPartDecl(
+                    name="temporal",
+                    shape=self.state.temporal_state_shape,
+                    dtype=self.state.temporal_dtype,
+                    layer_ids=layers,
+                ),
+            )
+        )
+
+
+DraftRegion = Union[DenseDraftRegion, MLADraftRegion, DraftStateRegion]
+
+
+class DraftLayerSet(msgspec.Struct, frozen=True, kw_only=True):
+    """The draft's layers of one kind: layer ids for a replicated head, depth
+    ids for a per-depth head, with the per-GPU geometry they share."""
+
+    layer_ids: Tuple[int, ...]
+    geometry: Any
+    # LAYER_WINDOW only: how many tokens back the layers read.
+    window: Optional[int] = None
+    # Resolved by the attention implementation, before storage is planned.
+    dcp_size: int = 1
+
+
+class DraftKVProfile(msgspec.Struct, frozen=True, kw_only=True):
+    """What the draft checkpoint asks of the host sub-pools, by layer kind.
+
+    ``num_depths`` > 1 marks a per-depth head (one transformer block per MTP
+    depth, served by one runner each under multi-layer EAGLE), whose layer
+    ids are depth ids; otherwise every runner serves all ``num_layers``
+    layers. A kind is present only when the draft has layers of it.
+    """
+
+    num_layers: int
+    num_depths: int = 1
+    kinds: Dict[str, DraftLayerSet] = {}
+
+
+class PlacementContext(msgspec.Struct, frozen=True, kw_only=True):
+    """Target-side facts a host kind consults when placing a layer set: the
+    sub-pools the host builds and the target's window. No attention backend
+    is among them: a fused draft's layers are parts of the host sub-pools,
+    read through the same views and id spaces as the target's."""
+
+    host_names: Tuple[str, ...]
+    target_window: Optional[int] = None
+    # The sub-pool the target's window layers store in, by name.
+    target_window_sub_pool: Optional[str] = None
+    dcp_size: int = 1
+
+
+class HostKind(msgspec.Struct, frozen=True, kw_only=True):
+    """A unified sub-pool that carries one kind of draft layer in its entries.
+
+    ``serves`` is the layer kind this host is the first choice for and
+    ``family`` picks the draft worker's binder. Geometry describes the parts;
+    lifetime decides whether those parts share an existing band.
+    """
+
+    name: str
+    serves: str
+    family: str
+
+    def admits(self, *, layers: DraftLayerSet, ctx: PlacementContext) -> Optional[str]:
+        """None when this host's entries can carry ``layers``, else why not."""
+        if self.host_name(layers=layers, ctx=ctx) not in ctx.host_names:
+            return (
+                f"the host has no {self.host_name(layers=layers, ctx=ctx)!r} sub-pool"
+            )
+        return None
+
+    def host_name(self, *, layers: DraftLayerSet, ctx: PlacementContext) -> str:
+        """The target sub-pool whose entries carry ``layers``."""
+        return self.name
+
+    def region_for(
+        self,
+        *,
+        layers: DraftLayerSet,
+        lane_num: int,
+        store_dtype: torch.dtype,
+        kv_dtype: Optional[torch.dtype],
+    ) -> DraftRegion:
+        raise NotImplementedError
+
+    def describe(self, *, region: DraftRegion, lanes: Sequence[Tuple[int, ...]]) -> str:
+        """The boot-log line for ``region`` and each runner's lanes in it."""
+        raise NotImplementedError
+
+
+class DenseHostKind(HostKind):
+    """A host whose entries take the draft's K/V rows as two more dense parts."""
+
+    def region_for(
+        self,
+        *,
+        layers: DraftLayerSet,
+        lane_num: int,
+        store_dtype: torch.dtype,
+        kv_dtype: Optional[torch.dtype],
+    ) -> DenseDraftRegion:
+        geometry = layers.geometry
+        if isinstance(geometry, DraftMLAGeometry):
+            return MLADraftRegion(
+                lane_num=lane_num,
+                kv_lora_rank=geometry.kv_lora_rank,
+                qk_rope_head_dim=geometry.qk_rope_head_dim,
+                store_dtype=store_dtype,
+                kv_dtype=kv_dtype,
+            )
+        assert isinstance(geometry, DraftKVGeometry), geometry
+        return DenseDraftRegion(
+            lane_num=lane_num,
+            head_num=geometry.head_num,
+            head_dim=geometry.head_dim,
+            v_head_dim=geometry.v_head_dim,
+            store_dtype=store_dtype,
+            kv_dtype=kv_dtype,
+        )
+
+    def describe(self, *, region: DraftRegion, lanes: Sequence[Tuple[int, ...]]) -> str:
+        if isinstance(region, MLADraftRegion):
+            return (
+                f"fused draft latent region in {self.name!r}: {region.lane_num} lanes "
+                f"of {region.kv_lora_rank}+{region.qk_rope_head_dim} elements "
+                f"@ {region.resolved_kv_dtype()}; {region.entry_bytes()} B/token"
+            )
+        kv_dtype = region.resolved_kv_dtype()
+        stored = (
+            kv_dtype
+            if kv_dtype == region.store_dtype
+            else f"{kv_dtype} (stored as {region.store_dtype})"
+        )
+        return (
+            f"fused draft region in {self.name!r}: {region.lane_num} lane(s) x "
+            f"{region.head_num} kv head(s) x {region.head_dim}/"
+            f"{region.resolved_v_head_dim()} k/v head_dim @ {stored} "
+            f"= {region.entry_bytes()} B/token; runner lanes {list(lanes)}"
+        )
+
+
+# Registration order is the order placements report their hosts in.
+HOST_KINDS: Dict[str, HostKind] = {}
+
+
+def host_for(layer_kind: str) -> Optional[HostKind]:
+    """The registered host that serves ``layer_kind`` first, if any."""
+    for kind in HOST_KINDS.values():
+        if kind.serves == layer_kind:
+            return kind
+    return None
+
+
+def register_host_kind(kind: HostKind) -> HostKind:
+    assert kind.name not in HOST_KINDS, f"host kind {kind.name!r} is already registered"
+    primary = host_for(kind.serves)
+    assert primary is None, (
+        f"layer kind {kind.serves!r} is already served by host {primary.name!r}"
+    )
+    HOST_KINDS[kind.name] = kind
+    return kind
+
+
+FULL_HOST = register_host_kind(
+    DenseHostKind(name="full", serves=LAYER_FULL, family="dense")
+)
+
+
+class WindowHostKind(DenseHostKind):
+    """The target's window sub-pool: a draft window layer rides there when its
+    window fits the target's; eviction keeps any further reach the draft worker
+    declares."""
+
+    def admits(self, *, layers: DraftLayerSet, ctx: PlacementContext) -> Optional[str]:
+        if layers.window is None:
+            return "the draft declares no sliding window size"
+        if ctx.target_window is None:
+            return "the target declares no sliding window size"
+        if layers.window != ctx.target_window:
+            return f"its window {layers.window} differs from the target's window {ctx.target_window}"
+        return super().admits(layers=layers, ctx=ctx)
+
+    def host_name(self, *, layers: DraftLayerSet, ctx: PlacementContext) -> str:
+        if ctx.target_window_sub_pool is not None:
+            return ctx.target_window_sub_pool
+        return window_sub_pool_name(layers.window)
+
+
+SWA_HOST = register_host_kind(
+    WindowHostKind(name="swa", serves=LAYER_WINDOW, family="dense")
+)
+
+
+class StateHostKind(HostKind):
+    """The mamba sub-pool: its entries take the draft's recurrent-state block
+    after the host's streams, so the slot that is the request's carries both."""
+
+    def region_for(
+        self,
+        *,
+        layers: DraftLayerSet,
+        lane_num: int,
+        store_dtype: torch.dtype,
+        kv_dtype: Optional[torch.dtype],
+    ) -> DraftStateRegion:
+        geometry = layers.geometry
+        assert isinstance(geometry, DraftStateGeometry), geometry
+        return DraftStateRegion(lane_num=lane_num, state=geometry)
+
+    def describe(self, *, region: DraftRegion, lanes: Sequence[Tuple[int, ...]]) -> str:
+        state = region.state
+        return (
+            f"fused draft state in {self.name!r}: {region.lane_num} lane(s) x "
+            f"{len(state.conv_state_shapes)} conv stream(s) @ {state.conv_dtype} + "
+            f"temporal {tuple(state.temporal_state_shape)} @ {state.temporal_dtype} "
+            f"= {region.entry_bytes()} B/slot; runner lanes {list(lanes)}"
+        )
+
+
+MAMBA_HOST = register_host_kind(
+    StateHostKind(name="mamba", serves=LAYER_STATE, family="state")
+)
+
+
+class RunnerLanes(msgspec.Struct, frozen=True, kw_only=True):
+    """One draft runner's lanes inside each host region: host -> (start, count)."""
+
+    ranges: Dict[str, Tuple[int, int]] = {}
+
+    def range_for(self, host: str) -> range:
+        start, count = self.ranges.get(host, (0, 0))
+        return range(start, start + count)
+
+
+class DraftBand(msgspec.Struct, frozen=True, kw_only=True):
+    """A draft lifetime with no matching target band."""
+
+    kind: str
+    window: Optional[int] = None
+
+
+class FusedDraftPlacement(msgspec.Struct, frozen=True, kw_only=True):
+    """Where every draft runner's layers live inside the host sub-pools.
+
+    One region per host sub-pool that carries draft lanes plus each runner's
+    lane range into it. Built once on the target, stored on its KV storage
+    plan, and read back by each draft runner, so the two sides
+    cannot disagree on a lane.
+    """
+
+    runners: Tuple[RunnerLanes, ...]
+    regions: Dict[str, DraftRegion] = {}
+    new_bands: Dict[str, DraftBand] = {}
+    # Target sub-pools that carry draft lanes under a name other than their
+    # host kind's (a window named by its length), by host kind.
+    hosted: Dict[str, str] = {}
+    source: Optional[Tuple[str, Optional[str]]] = None
+
+    def host_kind(self, name: str) -> HostKind:
+        declared = self.new_bands.get(name)
+        if declared is not None:
+            return host_for(declared.kind)
+        return HOST_KINDS[self.hosted.get(name, name)]
+
+    def __post_init__(self):
+        assert len(self.runners) > 0, "a placement needs at least one draft runner"
+        hosts = set(self.regions).union(*(r.ranges for r in self.runners))
+        for host in sorted(hosts):
+            assert (
+                host in HOST_KINDS or host in self.new_bands or host in self.hosted
+            ), f"no layout family is declared for sub-pool {host!r}"
+            region = self.regions.get(host)
+            lanes = [s for r in self.runners for s in r.range_for(host)]
+            if region is None:
+                assert not lanes, f"host {host!r} has draft lanes but no region"
+                continue
+            assert lanes == list(range(region.lane_num)), (
+                f"host {host!r}: runner lane ranges {lanes} must tile "
+                f"range({region.lane_num}) in runner order"
+            )
+
+    def region(self, host: str) -> Optional[DraftRegion]:
+        return self.regions.get(host)
+
+    def hosts(self) -> Tuple[str, ...]:
+        """The hosts carrying draft lanes: the registered host kinds that
+        carry lanes under their own names, in registry order; then the target
+        sub-pools that carry lanes under another name (`hosted`), in placement
+        order; then the draft's own bands."""
+        return (
+            tuple(h for h in HOST_KINDS if h in self.regions)
+            + tuple(h for h in self.hosted if h in self.regions)
+            + tuple(
+                h for h in self.new_bands if h not in HOST_KINDS and h in self.regions
+            )
+        )
+
+    def lanes_for(self, runner: int, host: str) -> range:
+        return self.runners[runner].range_for(host)
+
+    @classmethod
+    def from_counts(
+        cls,
+        *,
+        counts: Mapping[str, Sequence[int]],
+        regions: Mapping[str, DraftRegion],
+        new_bands: Optional[Mapping[str, DraftBand]] = None,
+        hosted: Optional[Mapping[str, str]] = None,
+    ) -> "FusedDraftPlacement":
+        """Tile each host's region with the runners' layer counts, in runner order."""
+        num_runners = {len(per_runner) for per_runner in counts.values()}
+        assert len(num_runners) == 1, (
+            f"every host needs one layer count per runner; got {dict(counts)}"
+        )
+        ranges: List[Dict[str, Tuple[int, int]]] = [
+            {} for _ in range(num_runners.pop())
+        ]
+        for host, per_runner in counts.items():
+            assert host in regions, f"host {host!r} has layer counts but no region"
+            start = 0
+            for runner, count in enumerate(per_runner):
+                if count:
+                    ranges[runner][host] = (start, count)
+                start += count
+        return cls(
+            runners=tuple(RunnerLanes(ranges=r) for r in ranges),
+            regions=dict(regions),
+            new_bands={} if new_bands is None else dict(new_bands),
+            hosted={} if hosted is None else dict(hosted),
+        )
+
+
+def draft_swa_layer_ids(draft_model_config) -> Tuple[int, ...]:
+    """The draft layer ids a hybrid-SWA pool routes to its swa side. This is
+    the pool-routing convention (`SWAKVPool.layers_mapping`), not a per-layer
+    kernel window: an attention-only draft window stays full-kind."""
+    mc = draft_model_config
+    if mc.is_hybrid_swa and not mc.is_compressed_kv_arch:
+        return tuple(int(i) for i in mc.swa_attention_layer_ids)
+    return ()
+
+
+def draft_state_layer_ids(draft_model_config, *, num_depths: int) -> Tuple[int, ...]:
+    """The draft depth ids that own a recurrent-state block of their own.
+
+    Only a per-depth conv-chain MTP head carries state: the baseline serves
+    it with a state cache cloned beside the target's. A plain NEXTN head of
+    a linear-attention trunk inherits the trunk's mamba-ish config class but
+    is a full-attention block; its config lists the TRUNK's state layers,
+    and the head carries none.
+    """
+    from sglang.srt.configs.hybrid_arch import mambaish_config
+
+    mc = draft_model_config
+    if mambaish_config(mc) is None or mc.num_nextn_predict_layers is None:
+        return ()
+    if getattr(mc.hf_text_config, "mtp_local_layer_ids", None) is None:
+        return ()
+    return tuple(range(num_depths))
+
+
+def draft_kv_profile(
+    draft_model_config,
+    *,
+    num_layers: int,
+    attn_tp_size: int,
+    dcp_size: int = 1,
+    num_depths: Optional[int] = None,
+) -> DraftKVProfile:
+    """The draft's layer geometry and execution width, before storage placement.
+
+    ``dcp_size`` is the resolved attention execution width.
+    ``num_depths`` overrides the checkpoint depth.
+    """
+    from sglang.srt.configs.hybrid_arch import mambaish_config
+    from sglang.srt.configs.model_config import AttentionArch
+
+    mc = draft_model_config
+    if num_depths is None:
+        num_depths = mc.num_nextn_predict_layers
+    num_depths = 1 if num_depths is None else int(num_depths)
+    num_layers = int(num_layers)
+    window_ids = draft_swa_layer_ids(mc)
+    assert set(window_ids) <= set(range(num_layers)), (
+        f"draft window layer ids {window_ids} outside range({num_layers})"
+    )
+    kinds: Dict[str, DraftLayerSet] = {}
+    full_ids = tuple(i for i in range(num_layers) if i not in window_ids)
+    if full_ids:
+        kinds[LAYER_FULL] = DraftLayerSet(
+            layer_ids=full_ids,
+            dcp_size=dcp_size,
+            geometry=DraftMLAGeometry(
+                kv_lora_rank=int(mc.kv_lora_rank),
+                qk_rope_head_dim=int(mc.qk_rope_head_dim),
+            )
+            if mc.attention_arch == AttentionArch.MLA
+            else DraftKVGeometry(
+                head_num=int(mc.get_num_kv_heads(attn_tp_size)),
+                head_dim=int(mc.head_dim),
+                v_head_dim=int(mc.v_head_dim),
+            ),
+        )
+    if window_ids:
+        kinds[LAYER_WINDOW] = DraftLayerSet(
+            layer_ids=window_ids,
+            dcp_size=dcp_size,
+            geometry=DraftMLAGeometry(
+                kv_lora_rank=int(mc.kv_lora_rank),
+                qk_rope_head_dim=int(mc.qk_rope_head_dim),
+            )
+            if mc.attention_arch == AttentionArch.MLA
+            else DraftKVGeometry(
+                head_num=int(mc.get_swa_num_kv_heads(attn_tp_size)),
+                head_dim=int(mc.swa_head_dim),
+                v_head_dim=int(mc.swa_v_head_dim),
+            ),
+            window=(
+                None if mc.sliding_window_size is None else int(mc.sliding_window_size)
+            ),
+        )
+    state_ids = draft_state_layer_ids(mc, num_depths=num_depths)
+    if state_ids:
+        cp = mambaish_config(mc).mamba2_cache_params
+        kinds[LAYER_STATE] = DraftLayerSet(
+            layer_ids=state_ids,
+            geometry=DraftStateGeometry(
+                conv_state_shapes=tuple(
+                    tuple(int(x) for x in s) for s in cp.shape.conv
+                ),
+                conv_dtype=cp.dtype.conv,
+                temporal_state_shape=tuple(int(x) for x in cp.shape.temporal),
+                temporal_dtype=cp.dtype.temporal,
+            ),
+        )
+    return DraftKVProfile(num_layers=num_layers, num_depths=num_depths, kinds=kinds)
+
+
+class FusedDraftDecision(msgspec.Struct, frozen=True, kw_only=True):
+    """`place_fused_draft`'s answer: the placement, or why the draft cannot
+    fuse. Neither means fusion does not apply. ``note`` says why a placed
+    layer kind did not get its first-choice host."""
+
+    placement: Optional[FusedDraftPlacement] = None
+    declined: Optional[str] = None
+    note: Optional[str] = None
+
+
+def _runner_layer_counts(
+    profile: DraftKVProfile, num_runners: int
+) -> Tuple[Optional[Dict[str, List[int]]], Optional[str]]:
+    """Per layer kind, each runner's layer count; or why no runner layout exists."""
+    if profile.num_depths <= 1:
+        return {
+            kind: [len(layers.layer_ids)] * num_runners
+            for kind, layers in profile.kinds.items()
+        }, None
+    if num_runners == 1:
+        return None, (
+            f"a per-depth draft head ({profile.num_depths} depths) needs one "
+            "runner per depth (multi-layer EAGLE)"
+        )
+    if num_runners > profile.num_depths:
+        return None, (
+            f"{num_runners} draft runners exceed the head's {profile.num_depths} depths"
+        )
+    return {
+        kind: [1 if r in layers.layer_ids else 0 for r in range(num_runners)]
+        for kind, layers in profile.kinds.items()
+    }, None
+
+
+def place_fused_draft(
+    *,
+    profile: DraftKVProfile,
+    num_runners: int,
+    ctx: PlacementContext,
+    store_dtype: torch.dtype,
+    kv_dtype: Optional[torch.dtype] = None,
+) -> FusedDraftDecision:
+    """Assign every draft layer of every runner to a host sub-pool through the
+    registry: equal lifetimes share an entry; an unmatched lifetime gets
+    its own planned band. Dense parts reserve padding between row payloads."""
+    counts, reason = _runner_layer_counts(profile, num_runners)
+    if counts is None:
+        return FusedDraftDecision(declined=reason)
+    for kind, layers in profile.kinds.items():
+        if not any(counts[kind]):
+            continue
+        if kind == LAYER_WINDOW and (layers.window is None or layers.window <= 0):
+            raise ValueError("draft window layers require a positive window length")
+        what = f"the draft's {len(layers.layer_ids)} {_LAYER_KIND_NOUN[kind]} layer(s)"
+        host = host_for(kind)
+        if host is None:
+            return FusedDraftDecision(declined=f"{what}: no host kind serves them")
+        if kind == LAYER_STATE and host.name not in ctx.host_names:
+            return FusedDraftDecision(
+                declined=(
+                    "recurrent draft layers require a target recurrent-state band "
+                    "with a checkpoint policy; use a target with recurrent state "
+                    "or a stateless draft"
+                )
+            )
+
+    host_counts: Dict[str, List[int]] = {}
+    regions = {}
+    new_bands = {}
+    hosted = {}
+    for kind, layers in profile.kinds.items():
+        if not any(counts[kind]):
+            continue
+        host = host_for(kind)
+        if host.admits(layers=layers, ctx=ctx) is None:
+            name = host.host_name(layers=layers, ctx=ctx)
+            if name != host.name:
+                hosted[name] = host.name
+        else:
+            # Distinct lifetimes retain and retire independently, even when
+            # their row geometry happens to match: a band of its own, named by
+            # its lifetime as the plan names a target's.
+            if kind == LAYER_WINDOW:
+                name = window_sub_pool_name(layers.window)
+            else:
+                name = (
+                    f"draft_{host.name}" if host.name in ctx.host_names else host.name
+                )
+            new_bands[name] = DraftBand(kind=kind, window=layers.window)
+        per_runner = counts[kind]
+        host_counts[name] = per_runner
+        regions[name] = host.region_for(
+            layers=layers,
+            lane_num=sum(per_runner),
+            store_dtype=store_dtype,
+            kv_dtype=kv_dtype,
+        )
+        if kind in (LAYER_FULL, LAYER_WINDOW):
+            if layers.dcp_size not in (1, ctx.dcp_size):
+                raise ValueError(
+                    f"draft DCP width {layers.dcp_size} must be one or match "
+                    f"the owner DCP width {ctx.dcp_size}"
+                )
+            regions[name] = msgspec.structs.replace(
+                regions[name], token_replicas=ctx.dcp_size // layers.dcp_size
+            )
+    return FusedDraftDecision(
+        placement=FusedDraftPlacement.from_counts(
+            counts=host_counts, regions=regions, new_bands=new_bands, hosted=hosted
+        ),
+    )

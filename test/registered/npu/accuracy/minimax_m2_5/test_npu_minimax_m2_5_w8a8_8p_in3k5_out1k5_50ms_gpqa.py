@@ -11,10 +11,9 @@ from sglang.test.ascend.e2e.test_npu_performance_utils import (
 from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(
-    est_time=3600,
-    suite="full-16-npu-a3",
+    est_time=4800,
+    suite="full-acc-16-npu-a3",
     nightly=True,
-    disabled="accuracy testcase",
 )
 
 MINIMAX_M2_5_HIGH_THROUGHPUT_ENVS = {
@@ -35,8 +34,7 @@ MINIMAX_M2_5_HIGH_THROUGHPUT_ENVS = {
 MINIMAX_M2_5_HIGH_THROUGHPUT_OTHER_ARGS = [
     "--tp-size",
     16,
-    "--enable-dp-attention",
-    "--dp-size",
+    "--attn-dp-size",
     16,
     "--mem-fraction-static",
     0.75,
@@ -54,7 +52,7 @@ MINIMAX_M2_5_HIGH_THROUGHPUT_OTHER_ARGS = [
     196608,
     "--max-prefill-token",
     8192,
-    "--cuda-graph-bs",
+    "--cuda-graph-bs-decode",
     1,
     2,
     4,

@@ -6,7 +6,7 @@ from transformers.processing_utils import ProcessorMixin
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from sglang.srt.managers.io_struct import GenerateReqInput
-from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
+from sglang.srt.managers.req_types import MultimodalProcessorOutput
 from sglang.srt.models.jet_vlm import JetVLMForConditionalGeneration
 from sglang.srt.models.nvila import NVILAForConditionalGeneration
 from sglang.srt.models.nvila_lite import NVILALiteForConditionalGeneration
@@ -65,7 +65,7 @@ class NVILAMultimodalProcessor(BaseMultimodalProcessor):
         for i, video in enumerate(base_output.videos):  # type: ignore
             base_output.videos[i] = [x.asnumpy() for x in video]  # type: ignore
 
-        mm_items, input_ids, _ = self.process_and_combine_mm_data(
+        mm_items, input_ids, _ = await self.process_and_combine_mm_data_async(
             base_output,
             self.mm_tokens,
             do_sample_frames=True,
