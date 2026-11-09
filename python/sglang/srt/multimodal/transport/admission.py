@@ -26,8 +26,10 @@ class FeaturePublicationAdmission:
     """Bound pending GPU payloads until publication actually finishes.
 
     Only the FIFO head attempts an atomic pool reservation. Waiting owns no
-    pool slices, and an admitted ticket remains charged until its native copy
-    finishes, even if the request coroutine has been cancelled.
+    pool slices, and an admitted ticket remains charged until the native
+    publication task returns, even if the request coroutine is cancelled.
+    Async copies may still be running then; the pool retains their source
+    owners until readiness and their slices until all consumers acknowledge.
     """
 
     def __init__(self, capacity_bytes: int, timeout_ms: int, max_pending: int = 64):
