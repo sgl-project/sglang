@@ -21,15 +21,25 @@ expires is killed mid-release; with several nodes, the other nodes' ranks can
 then hang in a collective until the orchestrator kills them.
 
 With attention DP, the launcher of every node relays SIGTERM to the listeners
-on its node, so each DP listener drains on its own. TODO(attention DP): rank
-0 broadcasts the ``ShutdownReq`` once its own listener closed, so the other DP
-listeners' last requests may be cut. Rust mode also forces
+on its node. The MLP-sync gather of every step carries each DP listener's
+drain state (``DPDrainColumn``), so a drain begun on any listener begins on
+all of them, and rank 0 broadcasts the ``ShutdownReq`` only once every DP
+listener has closed (``RustServer.on_drain_rows``). Rust mode also forces
 ``enable_dp_attention_local_control_broadcast`` on, which keeps the
-``ShutdownReq`` in DP group 0; it must reach every DP group, through the
-control fan-out across DP listeners. Without a local listener-hosting
-scheduler (elastic EP joiners and plain data parallelism, whose schedulers
-the DP controller starts) the main process keeps its previous SIGTERM
-behavior.
+``ShutdownReq`` in DP group 0; the MLP-sync gather of that step carries it to
+the other DP groups (``DPShutdownVote``), so every rank on every node leaves
+the event loop at the same step.
+
+A launcher that got no SIGTERM (another node's, or one scheduler's own, began
+the drain) treats its first scheduler exiting 0 as that gang shutdown: it
+stops its subprocess watchdog and bounds the other schedulers by the same
+exit bound. A crashed scheduler also exits 0, but only after sending SIGQUIT
+to this process, whose handler kills the process tree; with a
+``--custom-sigquit-handler`` that does not, the other schedulers are killed
+once the bound expires and the launcher returns. Without a local
+listener-hosting scheduler (elastic EP joiners and plain data parallelism,
+whose schedulers the DP controller starts) the main process keeps its previous
+SIGTERM behavior.
 """
 
 from __future__ import annotations
@@ -79,15 +89,18 @@ class RustServerSigtermDrain:
         if self._sigterm_received:
             return
         self._sigterm_received = True
-        # Child exits are expected from now on, not crashes.
-        if self._subprocess_watchdog is not None:
-            self._subprocess_watchdog.stop()
+        self._stop_watchdog()
         for proc in self._listener_procs:
             if proc.exitcode is None:
                 try:
                     os.kill(proc.pid, signal.SIGTERM)
                 except ProcessLookupError:
                     pass
+
+    def _stop_watchdog(self) -> None:
+        # Child exits are expected from now on, not crashes.
+        if self._subprocess_watchdog is not None:
+            self._subprocess_watchdog.stop()
 
     def _poll_notify(self) -> None:
         # The abstract socket has no permissions: any local process can send
@@ -100,8 +113,9 @@ class RustServerSigtermDrain:
             pass
 
     def wait(self) -> None:
-        """Block until every scheduler exited, or, once draining, until
-        Python's scheduler-exit bound expires; the schedulers still alive then
+        """Block until every scheduler exited, or, once draining (or once a
+        scheduler exited 0 without a SIGTERM here), until Python's
+        scheduler-exit bound expires; the schedulers still alive then
         are killed and reaped, as Python's drain does, so a caller without the
         CLI's process-tree cleanup (a multiprocessing target) does not wait on
         them at exit. As in Python, a scheduler not reaped within
@@ -123,6 +137,19 @@ class RustServerSigtermDrain:
                 and (len(alive) < len(procs) or self._drain_ended)
             ):
                 exit_deadline = time.monotonic() + _SCHEDULER_EXIT_TIMEOUT_SECS
+            elif (
+                exit_deadline is None
+                and not self._sigterm_received
+                and any(proc.exitcode == 0 for proc in procs)
+            ):
+                # Killing the stragglers must not read as a crash.
+                self._stop_watchdog()
+                exit_deadline = time.monotonic() + _SCHEDULER_EXIT_TIMEOUT_SECS
+                logger.warning(
+                    "Scheduler exited without SIGTERM; treating it as a gang "
+                    "shutdown, bounding the others by "
+                    f"{_SCHEDULER_EXIT_TIMEOUT_SECS}s"
+                )
             if exit_deadline is not None and time.monotonic() >= exit_deadline:
                 logger.warning(
                     f"Schedulers still alive {_SCHEDULER_EXIT_TIMEOUT_SECS}s "

@@ -543,6 +543,7 @@ class TestNixlTransferWorker(CustomTestCase):
                 dst_dcp_rank=dcp_rank,
                 dcp_dst_region_indices=[0],
                 dcp_token_item_lens=[4],
+                dst_draft_rows_dcp_collapsed=False,
             )
             for i, (agent, dcp_rank) in enumerate(zip(agents, dcp_ranks))
         }
