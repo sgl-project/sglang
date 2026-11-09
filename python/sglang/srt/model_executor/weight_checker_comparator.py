@@ -42,7 +42,13 @@ class ComparableWeight:
         binade = binade.masked_fill(x < finfo.smallest_normal, finfo.smallest_normal)
         return binade * finfo.eps
 
-    def iter_chunks(self) -> Iterable[Tuple[torch.Tensor, Optional[torch.Tensor]]]:
+    @property
+    def device(self) -> torch.device:
+        raise NotImplementedError
+
+    def iter_chunks(
+        self, device: torch.device
+    ) -> Iterable[Tuple[torch.Tensor, Optional[torch.Tensor]]]:
         raise NotImplementedError
 
     def dequantize(self, dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
@@ -99,10 +105,14 @@ class Fp8BlockComparable(ComparableWeight):
         s = self._normalize_scale(self.w_q, self.w_s)
         return s, self._infer_block_size(self.w_q, s)
 
-    def iter_chunks(self):
+    @property
+    def device(self) -> torch.device:
+        return self.w_q.device
+
+    def iter_chunks(self, device: torch.device):
         s, block_size = self._scale_and_block_size()
         for q, s_chunk in self._iter_quant_chunks(self.w_q, s, block_size[0]):
-            q, s_chunk = q.cuda(), s_chunk.cuda()
+            q, s_chunk = q.to(device), s_chunk.to(device)
             if self.is_shuffled:
                 q = unshuffle_fp8_weight(q)
             yield (
@@ -129,10 +139,14 @@ class RawComparable(ComparableWeight):
     def __repr__(self) -> str:
         return f"raw(shape={tuple(self.tensor.shape)} dtype={self.tensor.dtype})"
 
-    def iter_chunks(self):
+    @property
+    def device(self) -> torch.device:
+        return self.tensor.device
+
+    def iter_chunks(self, device: torch.device):
         flat = self.tensor.reshape(-1)
         for start in range(0, flat.numel(), CHUNK_NUMEL):
-            yield flat[start : start + CHUNK_NUMEL].cuda(), None
+            yield flat[start : start + CHUNK_NUMEL].to(device), None
 
     def dequantize(self, dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
         return self.tensor
@@ -143,17 +157,20 @@ def compare_weights(
 ) -> CompareResult:
     """Chunked element-wise compare in ComparableWeight space."""
     equal = True
-    max_abs_err = torch.zeros((), dtype=torch.float32)
-    sum_abs_err = 0.0
-    num_exceed = 0
+    device = actual.device
+    max_abs_err = torch.zeros((), dtype=torch.float32, device=device)
+    sum_abs_err = torch.zeros((), dtype=torch.float64, device=device)
+    num_exceed = torch.zeros((), dtype=torch.int64, device=device)
     numel = 0
     for (expect_dq, expect_tol), (actual_dq, actual_tol) in zip(
-        expect.iter_chunks(), actual.iter_chunks(), strict=True
+        expect.iter_chunks(device), actual.iter_chunks(device), strict=True
     ):
         assert expect_dq.shape == actual_dq.shape, (
             f"{expect_dq.shape=} {actual_dq.shape=}"
         )
         numel += expect_dq.numel()
+        if torch.equal(expect_dq, actual_dq) and torch.isfinite(expect_dq).all():
+            continue
         abs_diff = (actual_dq.float() - expect_dq.float()).abs()
         if torch.all(abs_diff == 0):
             continue
@@ -162,12 +179,17 @@ def compare_weights(
         tol = (
             0.0 if expect_tol is None or actual_tol is None else expect_tol + actual_tol
         )
-        max_abs_err = torch.maximum(max_abs_err, abs_diff.max().cpu())
-        sum_abs_err += abs_diff.sum().item()
+        max_abs_err = torch.maximum(max_abs_err, abs_diff.max())
+        sum_abs_err += abs_diff.sum(dtype=torch.float64)
         # `~(diff <= tol)` instead of `diff > tol` so NaN counts as exceeding.
-        num_exceed += int((~(abs_diff <= tol)).sum())
+        num_exceed += (~(abs_diff <= tol)).sum(dtype=torch.int64)
+    if equal:
+        return CompareResult(True, 0.0, 0.0, 0)
     return CompareResult(
-        equal, max_abs_err.item(), sum_abs_err / max(numel, 1), num_exceed
+        equal,
+        max_abs_err.item(),
+        sum_abs_err.item() / max(numel, 1),
+        int(num_exceed.item()),
     )
 
 
