@@ -24,7 +24,7 @@ from sglang.srt.utils.watchdog import SubprocessWatchdog
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=14, suite="base-a-test-cpu")
+register_cpu_ci(est_time=13, suite="base-a-test-cpu")
 register_cpu_ci(est_time=8, suite="stage-b-test-cpu-intel")
 
 
@@ -133,6 +133,40 @@ class TestSubprocessWatchdog(CustomTestCase):
             self.sigquit_triggered.is_set(),
             "SIGQUIT should not be triggered for normal exit (exitcode=0)",
         )
+
+    def test_stop_from_any_thread(self):
+        """The main thread, Rust mode's crash-dump grace and the monitor thread
+        itself may all stop the watchdog; none of them raises."""
+        proc = self._spawn(healthy_worker)
+        errors = []
+        monitor_threads = []
+        stopped_inside = threading.Event()
+        monitor = SubprocessWatchdog(processes=[proc], interval=0.05)
+
+        def check_and_stop():
+            monitor_threads.append(threading.current_thread())
+            try:
+                monitor.stop()
+            except Exception as e:
+                errors.append(e)
+            stopped_inside.set()
+            return False
+
+        monitor._check_processes = check_and_stop
+        self._monitor = monitor
+        thread_started = monitor._thread
+        monitor.start()
+        self.assertIsNone(thread_started)
+        self.assertTrue(stopped_inside.wait(5))
+        (thread,) = monitor_threads
+        outside = [threading.Thread(target=monitor.stop) for _ in range(3)]
+        for stopper in outside:
+            stopper.start()
+        for stopper in outside:
+            stopper.join(timeout=5)
+        thread.join(timeout=5)
+        self.assertEqual(errors, [])
+        self.assertFalse(thread.is_alive())
 
 
 if __name__ == "__main__":

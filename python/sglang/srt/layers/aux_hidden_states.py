@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, List, Optional, Union
+from typing import TYPE_CHECKING, Iterable, List, Optional, Union
 
 import torch
 
@@ -49,21 +49,30 @@ class AuxHiddenStatePacker:
     ) -> AuxHiddenStatePacker:
         return cls(num_captures, out=forward_batch.aux_hidden_states_buffer)
 
-    def append(self, hidden: torch.Tensor) -> None:
-        feature_size = int(hidden.shape[-1])
+    def slot(self, like: torch.Tensor) -> torch.Tensor:
+        """Take the next capture's view of the packed buffer, shaped like ``like``,
+        for a producer that writes it in place."""
+        feature_size = int(like.shape[-1])
         if self._feature_size is None:
             self._feature_size = feature_size
-            shape = (*hidden.shape[:-1], feature_size * self._num_captures)
+            shape = (*like.shape[:-1], feature_size * self._num_captures)
             if self._buffer is None:
-                self._buffer = hidden.new_empty(shape)
-            elif self._buffer.shape != shape or self._buffer.dtype != hidden.dtype:
+                self._buffer = like.new_empty(shape)
+            elif self._buffer.shape != shape or self._buffer.dtype != like.dtype:
                 raise ValueError(
                     f"aux hidden output buffer is {tuple(self._buffer.shape)} "
-                    f"{self._buffer.dtype}, captures need {shape} {hidden.dtype}"
+                    f"{self._buffer.dtype}, captures need {shape} {like.dtype}"
                 )
         start = self._idx * self._feature_size
-        self._buffer[..., start : start + self._feature_size].copy_(hidden)
         self._idx += 1
+        return self._buffer[..., start : start + self._feature_size]
+
+    def append(self, hidden: torch.Tensor) -> None:
+        self.slot(hidden).copy_(hidden)
+
+    def extend(self, hiddens: Iterable[torch.Tensor]) -> None:
+        for hidden in hiddens:
+            self.append(hidden)
 
     def capture(self, hidden: torch.Tensor, *, owned: bool = False) -> None:
         """Write directly to the final packed buffer, without an intermediate copy."""

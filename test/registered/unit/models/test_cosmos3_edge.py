@@ -15,7 +15,7 @@
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=7, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 import asyncio
 import unittest
@@ -25,12 +25,9 @@ import torch
 
 from sglang.srt.configs.cosmos3 import Cosmos3EdgeConfig
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalInputFormat,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem
 from sglang.srt.models.cosmos3_edge import Cosmos3EdgeForConditionalGeneration
+from sglang.srt.multimodal.modality import Modality, MultimodalInputFormat
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultiModalProcessorOutput,
     MultimodalSpecialTokens,
@@ -245,6 +242,7 @@ class TestCosmos3EdgePromptExpansion(CustomTestCase):
 
 def _processed_input_processor():
     processor = object.__new__(Cosmos3EdgeProcessor)
+    processor.processor_fingerprint = "sha256:" + "cd" * 32
     processor.IMAGE_TOKEN_ID = 19
     processor.VIDEO_TOKEN_ID = 18
     processor.IM_START_TOKEN_ID = 20

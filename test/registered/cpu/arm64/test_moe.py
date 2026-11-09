@@ -14,6 +14,7 @@ import math
 import platform
 import unittest
 
+import sgl_kernel  # noqa: F401
 import torch
 
 from sglang.srt.layers.amx_utils import CPUQuantMethod
