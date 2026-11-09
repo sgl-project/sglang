@@ -52,6 +52,10 @@ pub struct Runtime {
     threads: Mutex<Vec<JoinHandle<()>>>,
     /// The single shutdown sender.
     shutdown_tx: Mutex<Option<flume::Sender<()>>>,
+    /// Disconnects with `shutdown_tx`, ending a [`Runtime::wait_startup_failure`].
+    shutdown_rx: flume::Receiver<()>,
+    /// The error of a failed startup warmup, sent at most once.
+    startup_failure_rx: flume::Receiver<String>,
     /// Set once the API listeners have closed and the drain's end is no
     /// longer held (see [`Runtime::hold_drain_end`]).
     listeners_closed: Arc<AtomicBool>,
@@ -107,6 +111,11 @@ impl DrainEndGate {
 const SHUTDOWN_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl Runtime {
+    /// The crash dump's requests (`None` without `--crash-dump-folder`).
+    pub fn crash_dump_snapshot(&self) -> Option<Vec<u8>> {
+        self.core.crash_dump_snapshot()
+    }
+
     /// Build the family context from `spec` and spawn `workers`
     /// `mm-worker-{i}` threads into the shutdown join set — late, once Python
     /// has built the mm spec (`Server.start_mm_workers`).
@@ -157,6 +166,17 @@ impl Runtime {
                 ctx.clone(),
             )
         });
+    }
+
+    /// Block until the startup warmup fails, returning its error, or until
+    /// the runtime shuts down (`None`, whether the warmup succeeded, was
+    /// skipped, or never finished). The launching process takes the server
+    /// down on a failure, as Python's server does.
+    pub fn wait_startup_failure(&self) -> Option<String> {
+        flume::Selector::new()
+            .recv(&self.startup_failure_rx, |failure| failure.ok())
+            .recv(&self.shutdown_rx, |_| None)
+            .wait()
     }
 
     /// Begin the graceful drain (see `CoreHandle::begin_drain`): health
@@ -279,6 +299,7 @@ impl Runtime {
                 "shutdown: workers did not exit within {SHUTDOWN_JOIN_TIMEOUT:?}; abandoning join"
             );
         }
+        crate::api_server::core::flush_request_log();
     }
 }
 
@@ -309,7 +330,9 @@ fn notify_drained(name: &str) {
 /// [`HttpLayer`]). Returns once threads are spawned (non-blocking).
 /// `Err` on a startup misconfiguration (e.g. no tokenizer for a non-skip server).
 pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtime, String> {
+    crate::message::info::InternalState::check_registered_keys(&cfg.server_info_state_keys)?;
     let (shutdown_tx, shutdown_rx) = flume::unbounded::<()>();
+    let (startup_failure_tx, startup_failure_rx) = flume::bounded::<String>(1);
     let mut threads = Vec::new();
     let cpus = frontend_cpu_set(&cfg);
     // Validated before anything is spawned, so a bad bucket list fails startup
@@ -503,9 +526,13 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
             peer_endpoints: crate::api_server::core::peer_endpoints(
                 &cfg.server_args.deployment_info,
                 cfg.server_args.deployment_info.dp_rank.unwrap_or(0),
+                &cfg.server_args.api_keys,
             )?,
-            metadata: crate::api_server::handlers::CoreMetadata::from(cfg.server_args.as_ref()),
+            metadata: crate::api_server::handlers::CoreMetadata::from(cfg.server_args.as_ref())
+                .with_server_info_state_keys(cfg.server_info_state_keys.clone()),
             metrics,
+            request_log: crate::api_server::core::RequestLog::from_server_args(&cfg.server_args)?,
+            generate_validator: cfg.generate_validator.clone(),
         },
     );
     core.set_graceful_close_timeout(cfg.rust_server_args.graceful_close_timeout);
@@ -559,6 +586,7 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
                         http_layer,
                         cfg.generate_hook.clone(),
                         shutdown_rx.clone(),
+                        startup_failure_tx,
                         hicache_manager,
                         tokenizer.clone(),
                     );
@@ -616,6 +644,8 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
         core,
         threads: Mutex::new(threads),
         shutdown_tx: Mutex::new(Some(shutdown_tx)),
+        shutdown_rx,
+        startup_failure_rx,
         listeners_closed,
         own_listeners_closed,
         drain_end_gate,
@@ -654,6 +684,32 @@ mod tests {
             },
             server_args: Arc::new(test_server_args()),
             generate_hook: None,
+            generate_validator: None,
+            server_info_state_keys: Vec::new(),
+        }
+    }
+
+    /// A registered `/server_info` state key that names a field it already
+    /// reports, or one registered twice, fails startup before anything runs.
+    #[test]
+    fn start_rejects_colliding_server_info_state_keys() {
+        for (keys, problem) in [
+            (
+                ["package_state", "memory_usage"],
+                r#""memory_usage" names a field /server_info already reports"#,
+            ),
+            (
+                ["package_state", "package_state"],
+                r#""package_state" is registered twice"#,
+            ),
+        ] {
+            let (http_addr, _) = free_loopback_addrs();
+            let cfg = RuntimeConfig {
+                server_info_state_keys: keys.map(String::from).to_vec(),
+                ..test_config(http_addr, None)
+            };
+            let error = start(cfg, None).err().expect("startup must fail");
+            assert!(error.contains(problem), "{error}");
         }
     }
 
@@ -715,6 +771,19 @@ mod tests {
             .flat_map(|token| token.to_le_bytes())
             .collect::<Vec<_>>();
         frame_decode_batch_cols(&header, &[&data])
+    }
+
+    /// Take the post-startup `FreezeGCReq`, the first message on the scheduler
+    /// ring when the startup warmup is skipped, so a test sees its own
+    /// requests next.
+    fn take_startup_freeze_gc(rt: &Runtime) {
+        assert!(
+            rt.to_scheduler_rx.wait(std::time::Duration::from_secs(5)),
+            "no FreezeGCReq after startup"
+        );
+        let first = rt.to_scheduler_rx.drain(1);
+        let header = rmpv::decode::read_value(&mut &first[0].header[..]).unwrap();
+        assert_eq!(header[0].as_str(), Some("FreezeGCReq"));
     }
 
     /// Minimal boot config: no tokenizer load, complete `model_config` (from
@@ -788,6 +857,7 @@ mod tests {
     fn drain_answers_503_and_serves_in_flight_requests_before_closing() {
         let (addr, _) = free_loopback_addrs();
         let rt = start(test_config(addr, None), None).expect("start runtime");
+        take_startup_freeze_gc(&rt);
 
         let streaming = send_http(
             addr,
@@ -871,6 +941,7 @@ mod tests {
     fn forced_drain_closes_without_waiting() {
         let (addr, _) = free_loopback_addrs();
         let rt = start(test_config(addr, None), None).expect("start runtime");
+        take_startup_freeze_gc(&rt);
         let in_flight = send_http(
             addr,
             "POST",
@@ -904,6 +975,7 @@ mod tests {
             .unwrap();
         let (addr, _) = free_loopback_addrs();
         let rt = start(test_config(addr, None), None).expect("start runtime");
+        take_startup_freeze_gc(&rt);
         let mut wakeup = std::fs::File::from(rt.drain_signal_fd(15, false, Some(name)).unwrap());
         wakeup.write_all(&[2]).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(200));
@@ -981,6 +1053,7 @@ mod tests {
     fn drain_end_release_is_latched() {
         let (addr, _) = free_loopback_addrs();
         let rt = start(test_config(addr, None), None).expect("start runtime");
+        take_startup_freeze_gc(&rt);
         rt.hold_drain_end().unwrap();
         let streaming = send_http(
             addr,
@@ -1049,6 +1122,7 @@ mod tests {
         let mut cfg = test_config(addr, None);
         cfg.rust_server_args.graceful_close_timeout = timeout;
         let rt = start(cfg, None).expect("start runtime");
+        take_startup_freeze_gc(&rt);
         let stuck = send_http(addr, "GET", "/server_info", "");
         assert!(rt.to_scheduler_rx.wait(Duration::from_secs(5)));
 
@@ -1078,6 +1152,7 @@ mod tests {
 
         let (http_addr, grpc_addr) = free_loopback_addrs();
         let rt = start(test_config(http_addr, Some(grpc_addr)), None).expect("start runtime");
+        take_startup_freeze_gc(&rt);
         let client_runtime = // Multi-threaded, so the client's connection task keeps answering
         // the server's HTTP/2 shutdown handshake between `block_on`s.
         tokio::runtime::Builder::new_multi_thread()
@@ -1147,6 +1222,8 @@ mod tests {
             },
             server_args: Arc::new(server_args),
             generate_hook: None,
+            generate_validator: None,
+            server_info_state_keys: Vec::new(),
         };
         // Bind is synchronous in `start`, so the port is already accepting.
         let rt = start(cfg, None).expect("start runtime");
@@ -1201,7 +1278,9 @@ mod tests {
                 },
                 ..test_server_args()
             });
-            (start(cfg, None).expect("start runtime"), addr)
+            let rt = start(cfg, None).expect("start runtime");
+            take_startup_freeze_gc(&rt);
+            (rt, addr)
         };
         let send = |addr, method: &str, path: &str, body: &str| {
             let mut conn = std::net::TcpStream::connect(addr).expect("connect");
@@ -1293,6 +1372,8 @@ mod tests {
             },
             server_args: Arc::new(server_args),
             generate_hook: None,
+            generate_validator: None,
+            server_info_state_keys: Vec::new(),
         };
         let rt = start(cfg, None).expect("start runtime");
 
@@ -1368,6 +1449,8 @@ mod tests {
             },
             server_args: Arc::new(server_args),
             generate_hook: None,
+            generate_validator: None,
+            server_info_state_keys: Vec::new(),
         };
         let rt = start(cfg, None).expect("start runtime");
 
@@ -1481,7 +1564,10 @@ mod tests {
     }
 
     /// An embedding package's `http_layer` wraps the served app: its own route
-    /// serves, and its middleware sees the built-in routes' responses.
+    /// serves, and its middleware sees the built-in routes' responses. With an
+    /// API key, its route needs the key as the built-in ones do, and so does
+    /// an unknown path; the PD bootstrap registry of a prefill server stays
+    /// open, as Python serves it on its own server.
     #[test]
     fn http_layer_wraps_the_served_app() {
         use std::io::{Read, Write};
@@ -1500,25 +1586,257 @@ mod tests {
                     },
                 ))
         });
-        let rt = start(test_config(addr, None), Some(layer)).expect("start runtime");
-        let get = |path: &str| {
+        let mut cfg = test_config(addr, None);
+        cfg.server_args = Arc::new(ServerArgs {
+            api_keys: crate::message::config::ApiKeys::new(Some("sk-test".into()), None),
+            disaggregation_mode: crate::message::config::DisaggregationMode::Prefill,
+            ..test_server_args()
+        });
+        let rt = start(cfg, Some(layer)).expect("start runtime");
+        let get = |path: &str, key: Option<&str>| {
             let mut conn = std::net::TcpStream::connect(addr).expect("connect");
+            let authorization = key.map_or(String::new(), |key| {
+                format!("Authorization: Bearer {key}\r\n")
+            });
             write!(
                 conn,
-                "GET {path} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n"
+                "GET {path} HTTP/1.1\r\nHost: t\r\n{authorization}Connection: close\r\n\r\n"
             )
             .unwrap();
             let mut response = String::new();
             conn.read_to_string(&mut response).unwrap();
             response
         };
-        let model_info = get("/model_info");
+        let key = Some("sk-test");
+        let model_info = get("/model_info", key);
         assert!(model_info.starts_with("HTTP/1.1 200"), "{model_info}");
         assert!(model_info.contains("x-embedder: 1"), "{model_info}");
-        let embedded = get("/embedder");
+        let embedded = get("/embedder", key);
         assert!(embedded.starts_with("HTTP/1.1 200"), "{embedded}");
         assert!(embedded.ends_with("\r\n\r\nembedded"), "{embedded}");
 
+        for path in ["/model_info", "/embedder", "/no_such_route"] {
+            let response = get(path, None);
+            assert!(response.starts_with("HTTP/1.1 401"), "{path}: {response}");
+        }
+        let unknown = get("/no_such_route", key);
+        assert!(unknown.starts_with("HTTP/1.1 404"), "{unknown}");
+        let bootstrap = get("/route", None);
+        assert!(!bootstrap.starts_with("HTTP/1.1 401"), "{bootstrap}");
+
+        rt.request_shutdown();
+    }
+
+    /// `SGLANG_ENABLE_REQUEST_DECOMPRESSION` answers as Python's middleware
+    /// does. A body tagged `x-body-compressed: zstd` reaches an embedding
+    /// package's layer and every route decompressed, with the header dropped
+    /// and the content length fixed, and without a size cap; multiple frames
+    /// decode as one body, and an empty body stays empty. An unknown method, a corrupt payload or a frame
+    /// needing a window over libzstd's 128 MiB default is a plain-text 400
+    /// that reaches neither the layer nor the scheduler. Turned off, the
+    /// header is ignored.
+    #[test]
+    fn compressed_request_bodies_match_python_decompression() {
+        use std::io::{Read, Write};
+        use std::sync::Mutex;
+        use std::time::Duration;
+
+        fn http_request(
+            addr: std::net::SocketAddr,
+            path: &str,
+            compression: Option<&str>,
+            body: &[u8],
+        ) -> String {
+            let mut conn = std::net::TcpStream::connect(addr).expect("connect");
+            conn.set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let compression = compression
+                .map(|method| format!("x-body-compressed: {method}\r\n"))
+                .unwrap_or_default();
+            write!(
+                conn,
+                "POST {path} HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\n\
+                 {compression}Content-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            conn.write_all(body).unwrap();
+            let mut response = String::new();
+            conn.read_to_string(&mut response).unwrap();
+            response
+        }
+        // The status line and body: the `date` header can differ between two
+        // otherwise identical responses.
+        fn status_and_body(response: &str) -> (&str, &str) {
+            let (head, body) = response.split_once("\r\n\r\n").expect("response head");
+            (head.lines().next().unwrap_or_default(), body)
+        }
+        fn zstd_frames(body: &[u8], frames: usize, window_log: u32) -> Vec<u8> {
+            body.chunks(body.len().div_ceil(frames))
+                .flat_map(|chunk| {
+                    let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 3).unwrap();
+                    encoder
+                        .set_parameter(zstd::zstd_safe::CParameter::WindowLog(window_log))
+                        .unwrap();
+                    encoder.write_all(chunk).unwrap();
+                    encoder.finish().unwrap()
+                })
+                .collect()
+        }
+        let zstd = |body: &[u8]| zstd_frames(body, 1, 20);
+
+        // What the embedding package's layer read: path, whether the
+        // compression header was still set, content length, body.
+        type Seen = (String, bool, Option<String>, Vec<u8>);
+        let seen = Arc::new(Mutex::new(Vec::<Seen>::new()));
+        let recorder = seen.clone();
+        let layer: HttpLayer = Arc::new(move |app: axum::Router| {
+            let recorder = recorder.clone();
+            app.layer(axum::middleware::from_fn(
+                move |request: axum::extract::Request, next: axum::middleware::Next| {
+                    let recorder = recorder.clone();
+                    async move {
+                        let (parts, body) = request.into_parts();
+                        let body = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+                        recorder.lock().unwrap().push((
+                            parts.uri.path().to_owned(),
+                            parts.headers.contains_key("x-body-compressed"),
+                            parts
+                                .headers
+                                .get("content-length")
+                                .map(|value| value.to_str().unwrap().to_owned()),
+                            body.to_vec(),
+                        ));
+                        let request =
+                            axum::extract::Request::from_parts(parts, axum::body::Body::from(body));
+                        next.run(request).await
+                    }
+                },
+            ))
+        });
+        let (addr, _) = free_loopback_addrs();
+        let mut cfg = test_config(addr, None);
+        cfg.server_args = Arc::new(ServerArgs {
+            enable_request_decompression: true,
+            ..test_server_args()
+        });
+        let rt = start(cfg, Some(layer)).expect("start runtime");
+        take_startup_freeze_gc(&rt);
+
+        let generate =
+            br#"{"input_ids":[1,2,3],"stream":false,"sampling_params":{"max_new_tokens":8}}"#;
+        let compressed = zstd(generate);
+        let request =
+            std::thread::spawn(move || http_request(addr, "/generate", Some("zstd"), &compressed));
+        assert!(
+            rt.to_scheduler_rx.wait(Duration::from_secs(5)),
+            "the compressed request did not reach the scheduler ring"
+        );
+        let requests = rt.to_scheduler_rx.drain(1);
+        let input = requests[0]
+            .buffers
+            .iter()
+            .find(|buffer| buffer.name == "input_ids")
+            .expect("input token buffer");
+        assert_eq!(input.shape, vec![3]);
+        let rid = scheduler_rid(&requests[0].header);
+        assert!(
+            rt.from_scheduler_tx
+                .push(terminal_token_frame(rid, &[9, 10]))
+        );
+        let response = request.join().unwrap();
+        let (status, body) = status_and_body(&response);
+        assert_eq!(status, "HTTP/1.1 200 OK", "{response}");
+        assert!(body.contains(r#""output_ids":[9,10]"#), "{response}");
+        assert_eq!(
+            seen.lock().unwrap().pop(),
+            Some((
+                "/generate".to_owned(),
+                false,
+                Some(generate.len().to_string()),
+                generate.to_vec()
+            ))
+        );
+
+        // Each route answers a compressed body as it answers the plain one;
+        // the padded body inflates ~16 MiB from a few KiB.
+        let padded = format!(r#"{{"input_ids":[1],"text":"x"{}}}"#, " ".repeat(16 << 20));
+        for (path, plain) in [
+            ("/generate", br#"{"input_ids":[1],"text":"x"}"#.to_vec()),
+            ("/generate", padded.into_bytes()),
+            ("/v1/completions", b"{}".to_vec()),
+            ("/v1/chat/completions", b"{}".to_vec()),
+        ] {
+            let expected = http_request(addr, path, None, &plain);
+            assert!(
+                status_and_body(&expected).0.starts_with("HTTP/1.1 400"),
+                "{expected}"
+            );
+            for compressed in [zstd(&plain), zstd_frames(&plain, 2, 20)] {
+                let response = http_request(addr, path, Some("zstd"), &compressed);
+                assert_eq!(status_and_body(&response), status_and_body(&expected));
+                let (seen_path, still_compressed, _, seen_body) =
+                    seen.lock().unwrap().pop().unwrap();
+                assert_eq!(seen_path, path);
+                assert!(!still_compressed);
+                assert!(seen_body == plain, "{path}: the layer saw another body");
+            }
+        }
+        let empty = http_request(addr, "/generate", None, b"");
+        assert!(
+            status_and_body(&empty).0.starts_with("HTTP/1.1 400"),
+            "{empty}"
+        );
+        let tagged_empty = http_request(addr, "/generate", Some("zstd"), b"");
+        assert_eq!(status_and_body(&tagged_empty), status_and_body(&empty));
+
+        seen.lock().unwrap().clear();
+        let unsupported =
+            |method: &str| format!("unsupported x-body-compressed '{method}'; supported: ['zstd']");
+        for (method, body, message) in [
+            ("gzip", zstd(generate), unsupported("gzip")),
+            ("ZSTD", zstd(generate), unsupported("ZSTD")),
+            (
+                "zstd",
+                b"not-zstd-data".to_vec(),
+                "decompress failed".to_owned(),
+            ),
+            (
+                "zstd",
+                [zstd(generate), b"garbage".to_vec()].concat(),
+                "decompress failed".to_owned(),
+            ),
+            (
+                "zstd",
+                zstd_frames(generate, 1, 28),
+                "decompress failed".to_owned(),
+            ),
+        ] {
+            let response = http_request(addr, "/generate", Some(method), &body);
+            let (head, body) = response.split_once("\r\n\r\n").unwrap();
+            assert!(head.starts_with("HTTP/1.1 400"), "{response}");
+            assert!(
+                !head.to_ascii_lowercase().contains("content-type"),
+                "{response}"
+            );
+            assert_eq!(body, message);
+        }
+        assert!(seen.lock().unwrap().is_empty());
+        assert!(!rt.to_scheduler_rx.wait(Duration::from_millis(200)));
+        rt.request_shutdown();
+
+        let (addr, _) = free_loopback_addrs();
+        let rt = start(test_config(addr, None), None).expect("start runtime");
+        take_startup_freeze_gc(&rt);
+        let compressed = zstd(generate);
+        let tagged = http_request(addr, "/generate", Some("zstd"), &compressed);
+        let untagged = http_request(addr, "/generate", None, &compressed);
+        assert!(
+            status_and_body(&untagged).0.starts_with("HTTP/1.1 400"),
+            "{untagged}"
+        );
+        assert_eq!(status_and_body(&tagged), status_and_body(&untagged));
+        assert!(!rt.to_scheduler_rx.wait(Duration::from_millis(200)));
         rt.request_shutdown();
     }
 
@@ -1539,6 +1857,8 @@ mod tests {
             },
             server_args: Arc::new(server_args),
             generate_hook: None,
+            generate_validator: None,
+            server_info_state_keys: Vec::new(),
         };
         let err = match start(cfg, None) {
             Ok(_) => panic!("bind conflict must fail startup, got Ok"),
@@ -1572,6 +1892,71 @@ mod tests {
         drop(rebound);
     }
 
+    /// Answer the startup warmup request with a scheduler error.
+    fn fail_warmup(rt: &Runtime) {
+        assert!(
+            rt.to_scheduler_rx.wait(std::time::Duration::from_secs(5)),
+            "the startup warmup did not reach the scheduler ring"
+        );
+        let requests = rt.to_scheduler_rx.drain(1);
+        let rid = scheduler_rid(&requests[0].header);
+        assert!(
+            rt.from_scheduler_tx
+                .push(crate::message::response::frame_error(&rid, "warmup boom"))
+        );
+    }
+
+    /// A startup warmup the scheduler fails reaches `wait_startup_failure`,
+    /// which the launching process turns into Python's teardown; the health
+    /// endpoint never reports the server ready.
+    #[test]
+    fn failed_startup_warmup_is_reported() {
+        let (http_addr, _) = free_loopback_addrs();
+        let mut cfg = test_config(http_addr, None);
+        cfg.server_args = Arc::new(ServerArgs {
+            skip_server_warmup: false,
+            ..test_server_args()
+        });
+        let rt = start(cfg, None).expect("start runtime");
+        fail_warmup(&rt);
+        let failure = std::thread::scope(|scope| {
+            let waiter = scope.spawn(|| rt.wait_startup_failure());
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !waiter.is_finished() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            // Unblocks the wait if nothing was reported.
+            rt.request_shutdown();
+            waiter.join().unwrap()
+        });
+        let failure = failure.expect("a reported failure");
+        assert!(failure.contains("warmup boom"), "{failure}");
+        assert!(!rt.core.is_ready());
+    }
+
+    /// In PD mode a warmup the scheduler answers with an error leaves the
+    /// server up for the health probe to judge, as Python's does for a
+    /// non-200 warmup; nothing is reported, and shutdown ends the wait.
+    #[test]
+    fn failed_pd_startup_warmup_leaves_health_to_the_probe() {
+        let (http_addr, _) = free_loopback_addrs();
+        let mut cfg = test_config(http_addr, None);
+        cfg.server_args = Arc::new(ServerArgs {
+            skip_server_warmup: false,
+            disaggregation_mode: crate::message::config::DisaggregationMode::Decode,
+            ..test_server_args()
+        });
+        let rt = start(cfg, None).expect("start runtime");
+        fail_warmup(&rt);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !rt.core.is_ready() {
+            assert!(std::time::Instant::now() < deadline, "warmup never settled");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        rt.request_shutdown();
+        assert_eq!(rt.wait_startup_failure(), None);
+    }
+
     /// End to end over the configured socket: the generated api.v1 client
     /// reaches the existing scheduler ring, and an existing scheduler frame is
     /// translated back into a protobuf frame. Shutdown then closes both
@@ -1582,6 +1967,7 @@ mod tests {
 
         let (http_addr, grpc_addr) = free_loopback_addrs();
         let rt = start(test_config(http_addr, Some(grpc_addr)), None).expect("start runtime");
+        take_startup_freeze_gc(&rt);
         assert!(std::net::TcpStream::connect(http_addr).is_ok());
 
         let client_runtime = tokio::runtime::Builder::new_current_thread()
@@ -1647,14 +2033,21 @@ mod tests {
         use std::time::Duration;
 
         let (http_addr, grpc_addr) = free_loopback_addrs();
-        let rt = start(test_config(http_addr, Some(grpc_addr)), None).expect("start runtime");
+        // Attach needs a configured admin key.
+        let mut cfg = test_config(http_addr, Some(grpc_addr));
+        cfg.server_args = Arc::new(ServerArgs {
+            api_keys: crate::message::config::ApiKeys::new(None, Some("sk-admin".into())),
+            ..test_server_args()
+        });
+        let rt = start(cfg, None).expect("start runtime");
+        take_startup_freeze_gc(&rt);
         let request = std::thread::spawn(move || {
             let mut conn = std::net::TcpStream::connect(http_addr).unwrap();
             conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
             let body =
                 r#"{"hicache_storage_backend":"file","hicache_write_policy":"write_through"}"#;
             write!(conn,
-                "PUT /hicache/storage-backend HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()
+                "PUT /hicache/storage-backend HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer sk-admin\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()
             ).unwrap();
             let mut response = String::new();
             conn.read_to_string(&mut response).unwrap();
@@ -1758,6 +2151,7 @@ mod tests {
 
         let (http_addr, grpc_addr) = free_loopback_addrs();
         let rt = start(test_config(http_addr, Some(grpc_addr)), None).expect("start runtime");
+        take_startup_freeze_gc(&rt);
         let client_runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_all()
