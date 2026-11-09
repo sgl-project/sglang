@@ -468,5 +468,32 @@ def test_engram_dp_shard_reconstruction(group, scatter):
         )
 
 
+@pytest.mark.parametrize("tokens", [1, 4099], ids=["1", "4099"])
+def test_engram_all_gather_matches_all_reduce(group, tokens):
+    """Eager prefill's all-gather of each rank's own hash columns, sent as fp8, must
+    rebuild the all-reduce's rows bit for bit."""
+    from sglang.srt.model_executor.forward_mode import ForwardMode
+
+    per_column, columns = 50, 24
+    bounds = tuple(range(0, per_column * columns + 1, per_column))
+    torch.manual_seed(1399)
+    weight = (torch.randn(bounds[-1], 256) * 4).to(torch.float8_e4m3fn)
+    weight.view(torch.uint8)[:, ::7] = 0x80
+    scale = torch.randint(100, 160, (bounds[-1], 8), dtype=torch.uint8)
+    scale[::5, 0] = 0
+    with torch.device("cuda"), envs.SGLANG_OPT_HIP_ENGRAM_ALL_GATHER.override(True):
+        embed = EngramEmbedding(bounds[-1], 256, layer_id=1, column_bounds=bounds)
+    assert embed._all_gather_columns
+    embed.weight.weight_loader(embed.weight, weight)
+    embed.scale.weight_loader(embed.scale, scale.view(torch.float8_e8m0fnu))
+    embed.finish_load(label="test")
+    # each column's ids inside its own segment, as the hash makes them
+    ids = torch.tensor(bounds[:-1]) + torch.randint(0, per_column, (tokens, columns))
+    ids = ids.cuda()
+    reduced = embed._lookup(ids)
+    gathered = embed(ids, SimpleNamespace(forward_mode=ForwardMode.EXTEND))
+    assert torch.equal(gathered.view(torch.int16), reduced.view(torch.int16))
+
+
 if __name__ == "__main__":
     multigpu_pytest_main(__name__, __file__, num_gpus=(4,))
