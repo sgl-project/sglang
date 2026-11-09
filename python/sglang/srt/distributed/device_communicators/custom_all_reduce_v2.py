@@ -413,14 +413,14 @@ class CustomAllReduceV2:
             return multicast_ptr + offset if self.has_multicast else None
 
         # one u64 phase word shared by every push kernel (EpochCounter)
-        self._push_counter = torch.zeros((2,), dtype=torch.uint32, device=self.device)
+        self._push_counter = torch.zeros((1,), dtype=torch.int64, device=self.device)
         self._push_workspaces = slice_all([push_num_slots, self.max_push_size], 0)
         self._push_multicast_ptr = mc_at(0)
         push_plane = PushPlane(
             self.rank,
             self.world_size,
             workspaces=self._push_workspaces,
-            counter=self._push_counter.view(torch.uint8),
+            counter=self._push_counter,
             default_blocks=cfg.num_push_blocks,
             mc_workspace=mc_at(0),
         )
@@ -447,9 +447,9 @@ class CustomAllReduceV2:
             pair = next(ranks for ranks in self._dpx_pairs if self.rank in ranks)
             p = pair.index(self.rank)
             cross = [ranks[p] for ranks in self._dpx_pairs]
-            # one u64 phase word (EpochCounter) per sub-plane: pair, cross
+            # one EpochCounter per sub-plane: pair, cross
             self._hier_counters = torch.zeros(
-                (2, 2), dtype=torch.uint32, device=self.device
+                (2,), dtype=torch.int64, device=self.device
             )
 
             def sub_communicator(ranks, offset, slot_bytes, counter):
@@ -465,16 +465,16 @@ class CustomAllReduceV2:
                         ranks.index(self.rank),
                         len(ranks),
                         workspaces=workspaces,
-                        counter=counter.view(torch.uint8),
+                        counter=counter,
                         default_blocks=cfg.num_push_blocks,
                     )
                 )
 
             self._pair_obj = sub_communicator(
-                pair, pair_offset, pair_slot, self._hier_counters[0]
+                pair, pair_offset, pair_slot, self._hier_counters[0:1]
             )
             self._cross_obj = sub_communicator(
-                cross, cross_offset, cross_slot, self._hier_counters[1]
+                cross, cross_offset, cross_slot, self._hier_counters[1:2]
             )
 
         self.obj = Communicator(push=push_plane, pull=pull_plane)

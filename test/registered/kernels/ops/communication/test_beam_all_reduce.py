@@ -86,7 +86,7 @@ class TestBeamAllReduce(CustomTestCase):
                 cls.comm.rank,
                 cls.comm.world_size,
                 workspaces=cls.comm._push_workspaces,
-                counter=cls.comm._push_counter.view(torch.uint8),
+                counter=cls.comm._push_counter,
                 default_blocks=cls.comm.config.num_push_blocks,
             ),
             pull=cls.comm.obj.pull,

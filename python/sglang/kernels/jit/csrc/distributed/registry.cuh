@@ -18,7 +18,7 @@ PushPlaneObj::PushPlaneObj(
     uint32_t rank,
     uint32_t world_size,
     std::vector<TensorView> workspaces,  // world_size * [2 * world_size][slot_bytes]
-    TensorView counter,                  // [sizeof(EpochCounter)]
+    TensorView counter,                  // [1] int64: one EpochCounter
     intptr_t mc_workspace_ptr,
     uint32_t default_blocks)
     : BasePlane(rank, world_size),  //
@@ -39,8 +39,9 @@ PushPlaneObj::PushPlaneObj(
         .with_device(device_sym)
         .verify(workspaces[i]);
   }
-  TensorMatcher({static_cast<int64_t>(sizeof(EpochCounter))})  //
-      .with_dtype<uint8_t>()
+  static_assert(sizeof(EpochCounter) == sizeof(int64_t));
+  TensorMatcher({1})  //
+      .with_dtype<int64_t>()
       .with_device(device_sym)
       .verify(counter);
   CHECK_HOST(N.unwrap() > 0) << "A push plane needs a non-empty workspace";

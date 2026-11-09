@@ -93,7 +93,7 @@ class PushPlane(tvm_ffi.Object):
                            views of symmetric memory. The local rank's view
                            MUST be zero-filled before first use -- the
                            kernels poll for a pos-zero marker.
-        :param counter: local ``[8]`` uint8 tensor (one u64 phase word), zero-filled.
+        :param counter: local ``[1]`` int64 tensor (one ``EpochCounter``), zero-filled.
         :param default_blocks: launch width for kernels that do not pick their own.
         :param mc_workspace: multicast VA of the local workspace, or None.
         """
