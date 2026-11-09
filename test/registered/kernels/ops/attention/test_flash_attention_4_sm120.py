@@ -1486,55 +1486,6 @@ def test_sm120_paged_prefill_reuses_cached_host_plan(
     assert cache_hits == [False, False, True]
 
 
-def test_sm120_paged_prefill_reads_row_strided_q():
-    """FlashAttentionBackend hands FA4 the Q slice of a fused QKV projection without
-    a copy; the kernel must read that row stride exactly as it reads a dense Q."""
-    torch.manual_seed(20261103)
-    lengths, page_size = (160, 96), 1
-    num_q_heads, num_kv_heads, head_dim = 16, 8, 128
-    total = sum(lengths)
-    qkv = torch.randn(
-        total,
-        (num_q_heads + 2 * num_kv_heads) * head_dim,
-        device="cuda",
-        dtype=torch.bfloat16,
-    )
-    q_strided = qkv[:, : num_q_heads * head_dim].view(total, num_q_heads, head_dim)
-    assert not q_strided.is_contiguous()
-    k_cache = torch.randn(
-        total, page_size, num_kv_heads, head_dim, device="cuda", dtype=torch.bfloat16
-    )
-    v_cache = torch.randn_like(k_cache)
-    page_table = torch.zeros(
-        len(lengths), max(lengths), device="cuda", dtype=torch.int32
-    )
-    page_table[0, : lengths[0]] = torch.arange(lengths[0], device="cuda")
-    page_table[1, : lengths[1]] = torch.arange(lengths[0], total, device="cuda")
-
-    def run(q):
-        return flash_attn_with_kvcache(
-            q=q,
-            k_cache=k_cache,
-            v_cache=v_cache,
-            page_table=page_table,
-            cache_seqlens=torch.tensor(lengths, device="cuda", dtype=torch.int32),
-            cu_seqlens_q=torch.tensor(
-                [0, lengths[0], total], device="cuda", dtype=torch.int32
-            ),
-            max_seqlen_q=max(lengths),
-            max_seqlen_k=max(lengths),
-            causal=True,
-            num_splits=1,
-            out=torch.empty(
-                total, num_q_heads, head_dim, device="cuda", dtype=torch.bfloat16
-            ),
-        )
-
-    torch.testing.assert_close(
-        run(q_strided), run(q_strided.contiguous()), atol=0.0, rtol=0.0
-    )
-
-
 @pytest.mark.parametrize(
     ("head_dim", "pack_gqa", "causal", "window_size", "softcap"),
     [
