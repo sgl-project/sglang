@@ -1132,7 +1132,7 @@ class PrefillAdder:
             else AddReqResult.CONTINUE
         )
 
-    def add_chunked_req(self, req: Req):
+    def add_chunked_req(self, req: Req, truncation_align_size: Optional[int] = None):
         if self.dllm_config is not None:
             _rem_tokens = self._get_dllm_remain_tokens(req)
         else:
@@ -1163,7 +1163,15 @@ class PrefillAdder:
 
         if self.chunked_req_limit is not None:
             assert self.chunked_req_limit > 0
-            _rem_tokens = min(_rem_tokens, self.chunked_req_limit)
+            chunk_limit = self.chunked_req_limit
+            if truncation_align_size is not None:
+                # Fairness may reserve tokens for waiting requests, but a
+                # continuation needs enough room to reach its next scan boundary.
+                chunk_limit = max(
+                    chunk_limit,
+                    truncation_align_size - req.prefix_len % truncation_align_size,
+                )
+            _rem_tokens = min(_rem_tokens, chunk_limit)
 
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - req.prefix_len
         prefix_tokens = 0
@@ -1179,9 +1187,16 @@ class PrefillAdder:
         if _rem_tokens is None:
             return req
         truncated = cand_extend_input_len > _rem_tokens
-        new_len = self.floor_chunked_tokens(
-            min(cand_extend_input_len, _rem_tokens), cand_extend_input_len
-        )
+        new_len = min(cand_extend_input_len, _rem_tokens)
+        if truncated and truncation_align_size is not None:
+            aligned_len = (
+                req.prefix_len + new_len
+            ) // truncation_align_size * truncation_align_size - req.prefix_len
+            if aligned_len <= 0:
+                return req
+            new_len = aligned_len
+        else:
+            new_len = self.floor_chunked_tokens(new_len, cand_extend_input_len)
         request_slot_reserve = self._request_slot_reserve_for_req(
             req, extend_input_len=new_len
         )
@@ -1241,7 +1256,9 @@ class PrefillAdder:
             if host_lock_params is not None:
                 self.tree_cache.dec_host_lock_ref(last_node, host_lock_params)
 
-    def add_one_req_ignore_eos(self, req: Req):
+    def add_one_req_ignore_eos(
+        self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
+    ):
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - req.prefix_len
         if is_cp_sharded_padded():
             # One physical page on each rank reserves a complete logical group.
@@ -1356,13 +1373,17 @@ class PrefillAdder:
                 request_slot_reserve=self._request_slot_reserve_for_req(req),
             )
         else:
-            if self.rem_chunk_tokens <= 0:
+            if self.rem_chunk_tokens <= 0 or has_chunked_req:
                 return AddReqResult.OTHER
 
             # Chunked prefill
             trunc_len = self.floor_chunked_tokens(
                 self.rem_chunk_tokens, cand_extend_input_len
             )
+            if truncation_align_size is not None:
+                trunc_len = trunc_len // truncation_align_size * truncation_align_size
+                if trunc_len <= 0:
+                    return AddReqResult.OTHER
 
             if (tile_stop := self._check_prefill_tile_budget(trunc_len)) is not None:
                 return tile_stop
@@ -1421,7 +1442,9 @@ class PrefillAdder:
             return AddReqResult.OTHER
 
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
-            return self.add_one_req_ignore_eos(req)
+            return self.add_one_req_ignore_eos(
+                req, has_chunked_req, truncation_align_size
+            )
 
         # Reserve page_size for page-alignment overhead: the paged allocator may
         # consume one extra page per request (see alloc_extend), which
@@ -1683,16 +1706,13 @@ class PrefillAdder:
                 # limit rather than rem_chunk_tokens so an SWA-capped chunk stays
                 # capped.
                 extend_len = chunk_tokens_limit
-                if truncation_align_size is not None:
-                    extend_len = (
-                        extend_len // truncation_align_size * truncation_align_size
-                    )
             else:
                 extend_len = chunk_tokens_limit // self.page_size * self.page_size
-                if truncation_align_size is not None:
-                    extend_len = (
-                        extend_len // truncation_align_size * truncation_align_size
-                    )
+            if truncation_align_size is not None:
+                extend_len = (
+                    prefix_len + extend_len
+                ) // truncation_align_size * truncation_align_size - prefix_len
+            if not self.exact_chunk_fill:
                 end = (prefix_len + extend_len) // self.page_size * self.page_size
                 extend_len = end - prefix_len
             if extend_len <= 0:

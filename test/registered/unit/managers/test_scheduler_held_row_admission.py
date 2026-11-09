@@ -44,7 +44,7 @@ class _Adder(PrefillAdder):
         self.new_chunked_req = None
         self.rem_chunk_tokens = 0
 
-    def add_chunked_req(self, req):
+    def add_chunked_req(self, req, truncation_align_size=None):
         self.can_run_list.append(req)
         return None
 
@@ -145,6 +145,42 @@ class TestHeldRowAdmission(CustomTestCase):
                 can_run_list, batch_is_full, final_chunk, waiting = self._admitted(mode)
                 self.assertEqual(can_run_list, [final_chunk, waiting])
                 self.assertFalse(batch_is_full)
+
+    def test_dynamic_chunk_reaches_the_next_absolute_boundary(self):
+        for history, predicted, alignment, expected in (
+            (256, 64, 256, 256),
+            (256, 128, 256, 256),
+            (320, 64, 256, 192),
+            (1000, 64, 256, 64),
+            (256, 64, None, 64),
+            (256, 512, 256, 512),
+        ):
+            with self.subTest(
+                history=history, predicted=predicted, alignment=alignment
+            ):
+                running = [_Req(holds_row=True)]
+                final_chunk = _Req(holds_row=True)
+                final_chunk.prefix_len = history
+                s = self._scheduler(DisaggregationMode.NULL, running, final_chunk, [])
+                s.truncation_align_size = alignment
+                s.dynamic_chunk_sizer = Mock(predict=Mock(return_value=predicted))
+
+                def capture(*args, **kwargs):
+                    raise _BatchBuilt(args[6])
+
+                s.get_prefill_adder_class = lambda: capture
+                with (
+                    get_context().override_server_args(
+                        pp_max_micro_batch_size=NUM_ROWS
+                    ),
+                    self.assertRaises(_BatchBuilt) as built,
+                ):
+                    s._get_new_batch_prefill_raw(
+                        prefill_delayer_single_pass=None,
+                        running_batch=ScheduleBatch(reqs=running),
+                    )
+                self.assertEqual(built.exception.args[0], expected)
+                s.dynamic_chunk_sizer.predict.assert_called_once_with(history)
 
 
 if __name__ == "__main__":

@@ -361,10 +361,13 @@ class TestMambaPrefillTrackMetadata(unittest.TestCase):
                 snapshot = batch.copy()
                 if verify:
                     settings = SimpleNamespace(
+                        deterministic=SimpleNamespace(
+                            enable_deterministic_inference=False
+                        ),
                         mamba=SimpleNamespace(
                             enable_mamba_extra_buffer=True,
                             enable_mamba_extra_buffer_lazy=False,
-                        )
+                        ),
                     )
                     with (
                         patch.object(spec_utils, "get_exec", return_value=settings),
@@ -495,9 +498,10 @@ class TestVerifyTrackIndexReuse(unittest.TestCase):
 
     def _prepare(self, batch, reuse, lazy=False):
         settings = SimpleNamespace(
+            deterministic=SimpleNamespace(enable_deterministic_inference=False),
             mamba=SimpleNamespace(
                 enable_mamba_extra_buffer=True, enable_mamba_extra_buffer_lazy=lazy
-            )
+            ),
         )
         # reuse: the process's indices under SGLANG_OPT_SPEC_VERIFY_REUSE_STAGED_INPUTS, None without it
         with (

@@ -82,6 +82,7 @@ from sglang.srt.beam_search.batch_tail import (
     strip_beam_tail,
 )
 from sglang.srt.beam_search.fork import free_member_rows
+from sglang.srt.configs.hybrid_arch import mamba2_scan_config
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.disaggregation.base import BaseKVSender
 from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
@@ -3264,8 +3265,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         if get_exec().mamba.enable_mamba_extra_buffer:
             mamba_track_interval = mamba_track_grid(self.tree_cache.page_size)
+            # Token-wise decode and chunked scans use different reductions.
+            # Deterministic requests may only reuse prefill checkpoints.
+            track_decode = not (
+                get_exec().deterministic.enable_deterministic_inference
+                and mamba2_scan_config(self.model_config) is not None
+            )
             track_remainders_cpu = self.seq_lens_cpu % mamba_track_interval
-            track_mask_cpu = track_remainders_cpu == 0
+            track_mask_cpu = (track_remainders_cpu == 0) & track_decode
 
             if len(self.reqs) == 0:
                 self.mamba_track_indices = torch.empty(
@@ -3273,7 +3280,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 )
                 self.mamba_track_buffer_indices = []
             else:
-                if get_exec().mamba.enable_mamba_extra_buffer_lazy:
+                if get_exec().mamba.enable_mamba_extra_buffer_lazy and track_decode:
                     track_mask_cpu = self.mamba_lazy_prealloc_at_boundary(
                         track_mask_cpu
                     )
@@ -3281,7 +3288,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
             self.mamba_track_mask_cpu = track_mask_cpu.tolist()
             self.mamba_track_mask_next_cpu = (
-                (track_remainders_cpu == mamba_track_interval - 1).tolist()
+                (
+                    (track_remainders_cpu == mamba_track_interval - 1) & track_decode
+                ).tolist()
                 if self.enable_overlap
                 else None
             )
