@@ -39,7 +39,9 @@ from sglang.srt.mem_cache.hicache_storage import (
 from sglang.srt.mem_cache import write_back_order as _write_back_order
 from sglang.srt.mem_cache.l2_transfer import L2Transfer
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
+from sglang.srt.mem_cache.pool_host import slot_state_copy as _slot_state_copy
 from sglang.srt.mem_cache.pool_host.base import uses_shared_host_layout
+from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.page_interleave import PageInterleaveHostPool
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
@@ -276,6 +278,25 @@ class HybridCacheController(BaseHiCacheController):
                 storage_backend_extra_config=storage_backend_extra_config,
                 host_pools=getattr(mem_pool_host, "entries", None),
             )
+        if _slot_state_copy.LOAD_ENABLED:
+            self._bind_slot_state_load_on_stream()
+
+    def _bind_slot_state_load_on_stream(self) -> None:
+        """SGLANG_HICACHE_LOAD_BACK_DEVICE_ORDERED: the Mamba side-state rows ride on the pool's first
+        layer call, so they may load on stream only when that is transfer layer 0, queued before
+        every completion event a reader of a restored slot waits on."""
+        entry = self.mem_pool_host.entry_map.get(PoolName.MAMBA)
+        if entry is None or not isinstance(entry.host_pool, MambaPoolHost):
+            return
+        if not entry.host_pool.slot_state_device_tensors:
+            return
+        if entry.layer_mapper(0) != 0:
+            logger.warning(
+                "Mamba slot-state load-back: kept the blocking copy "
+                "(SGLANG_HICACHE_LOAD_BACK_DEVICE_ORDERED: the first Mamba layer is not transfer layer 0)"
+            )
+            return
+        entry.host_pool.slot_state_load_on_stream = True
 
     def _start_storage_threads(self):
         super()._start_storage_threads()

@@ -2686,6 +2686,10 @@ class Envs:
     # Eager GDN prefill: the prefix-cache track copies (conv window before the conv; checkpoint
     # and final states after the chunked kernel) as one copy launch each (same results).
     SGLANG_ENABLE_GDN_PREFILL_FUSED_TRACK = EnvBool(False)
+    # Hybrid-model prefill metadata without host reads (H639 part a): the conv-state track indices are
+    # bounded on the device (clamp's own min(max(x, 0), total - 1)), and the FlashInfer GDN checkpoint
+    # plan is built from the batch's host lists when it carries them. Same values; no stream sync.
+    SGLANG_GDN_PREFILL_SYNC_FREE_METADATA = EnvBool(False)
     # Largest target-verify batch (requests) the SGLANG_GDN_FUSED_VERIFY_GLUE kernel serves.
     SGLANG_GDN_FUSED_VERIFY_GLUE_MAX_BS = EnvInt(4)
 

@@ -631,6 +631,16 @@ class GDNAttnBackend(MambaAttnBackendBase):
     # Set while a breakable prefill CUDA graph captures or replays a bucket:
     # forward_extend then runs the graph-safe chain on these static tables.
     prefill_graph_metadata: Optional[GDNPrefillGraphMetadata] = None
+    # SGLANG_ENABLE_GDN_PREFILL_CP_SPLIT: (forward metadata it was planned for,
+    # GDNPrefillCPSplit); class defaults keep stub-built backends on the stock call.
+    _cp_split_enabled: bool = False
+    _cp_split_args: Optional[tuple] = None
+    _cp_split_passes: int = 0
+    # SGLANG_ENABLE_GDN_PREFILL_SPARSE_CHECKPOINTS: (forward metadata,
+    # GDNPrefillSparseCheckpoints), as the CP split's.
+    _sparse_ckpt_enabled: bool = False
+    _sparse_ckpt_args: Optional[tuple] = None
+    _sparse_ckpt_passes: int = 0
 
     def __init__(self, model_runner: ModelRunner):
         _validate_gdn_linear_attn_backends(model_runner.linear_attn_backends)
@@ -655,6 +665,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
         self.kernel_dispatcher = GDNKernelDispatcher(
             backends.decode, backends.prefill, backends.verify
         )
+        self._cp_split_enabled = self._prefill_cp_split_supported()
+        self._sparse_ckpt_enabled = self._prefill_sparse_checkpoints_supported()
+        if self._cp_split_enabled or self._sparse_ckpt_enabled:
+            # The non-CP kernel runs one CTA per (sequence, value head).
+            self._cp_split_heads = self.state_pool.mamba_cache.temporal.shape[-3]
+            self._cp_split_sms = torch.cuda.get_device_properties(
+                model_runner.device
+            ).multi_processor_count
         # Sized past the pool for attn_tp-padded warmup/MLP-sync batches (see helper).
         self.verify_intermediate_state_indices = (
             build_verify_intermediate_state_indices(
@@ -1180,6 +1198,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             if not self.enable_mis:
                 raise ValueError("GDN MIS metadata requires --enable-mis")
             self.mis_metadata = build_gdn_mis_metadata(forward_batch)
+        stock_src_host = None
         if self.forward_metadata.has_mamba_track_mask:
             if getattr(self.forward_metadata, "mamba_track_mask_indices", None) is None:
                 self.forward_metadata.mamba_track_mask_indices = (
@@ -1195,10 +1214,230 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     maybe_build_flashinfer_checkpoint_plan,
                 )
 
-                maybe_build_flashinfer_checkpoint_plan(
+                stock_src_host = maybe_build_flashinfer_checkpoint_plan(
                     forward_batch, self.forward_metadata, self.device
                 )
         self._init_prefill_conv_block_table(forward_batch)
+        self._cp_split_args = None
+        self._sparse_ckpt_args = None
+        targets = (
+            self._sparse_checkpoint_targets(forward_batch, stock_src_host)
+            if self._sparse_ckpt_enabled
+            else None
+        )
+        if self._cp_split_enabled:
+            self._plan_prefill_cp_split(forward_batch, sparse_targets=targets)
+        if targets is not None:
+            self._plan_sparse_checkpoints(forward_batch, targets)
+
+    def _prefill_cp_split_supported(self) -> bool:
+        from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
+            GDN_PREFILL_CP_SPLIT,
+            GDN_PREFILL_CP_SPLIT_MIN_LEN,
+            GDN_PREFILL_CP_SPLIT_MODEL,
+            FlashInferGDNKernel,
+        )
+
+        if not GDN_PREFILL_CP_SPLIT or self.is_draft_worker:
+            return False
+        extend_kernel = self.kernel_dispatcher.extend_kernel
+        if not isinstance(extend_kernel, FlashInferGDNKernel):
+            logger.warning(
+                "SGLANG_ENABLE_GDN_PREFILL_CP_SPLIT not taken: extend kernel %s",
+                type(extend_kernel).__name__,
+            )
+            return False
+        logger.info(
+            "SGLANG_ENABLE_GDN_PREFILL_CP_SPLIT on: eager prefills of several sequences "
+            "run sequences of >= %d tokens as one-sequence FlashInfer CP calls (%s), "
+            "the others as one non-CP call per contiguous run",
+            GDN_PREFILL_CP_SPLIT_MIN_LEN,
+            "the longest, when the cost model gains"
+            if GDN_PREFILL_CP_SPLIT_MODEL
+            else "all of them, unmodeled",
+        )
+        return True
+
+    def _plannable_prefill_lens(self, forward_batch: ForwardBatch) -> Optional[list]:
+        """Host extend lengths of an eager plain prefill whose calls may be planned."""
+        meta = self.forward_metadata
+        lens = forward_batch.extend_seq_lens_cpu
+        if (
+            forward_batch.forward_mode not in (ForwardMode.EXTEND, ForwardMode.MIXED)
+            or self.mis_metadata is not None
+            or forward_batch.tbo_parent_token_range is not None
+            or lens is None
+            or len(lens) != forward_batch.batch_size
+            or meta.query_start_loc is None
+            or meta.query_start_loc.numel() != len(lens) + 1
+        ):
+            return None
+        return lens
+
+    def _plan_prefill_cp_split(
+        self, forward_batch: ForwardBatch, *, sparse_targets: Optional[tuple] = None
+    ) -> None:
+        from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
+            build_gdn_prefill_cp_split,
+        )
+
+        meta = self.forward_metadata
+        lens = self._plannable_prefill_lens(forward_batch)
+        if lens is None:
+            return
+        plan = build_gdn_prefill_cp_split(
+            lens,
+            # Sparse checkpoints leave non-CP walks at no-checkpoint cost; a CP call
+            # still pays for checkpoints when its sequence is tracked.
+            checkpoints=meta.num_state_checkpoints > 0 and sparse_targets is None,
+            cp_checkpoints=(
+                tuple(bool(t) for t in sparse_targets)
+                if sparse_targets is not None
+                else None
+            ),
+            heads=self._cp_split_heads,
+            sms=self._cp_split_sms,
+            device=self.device,
+        )
+        if plan is None:
+            return
+        self._cp_split_args = (meta, plan)
+        self._cp_split_passes += 1
+        n = self._cp_split_passes
+        if n & (n - 1) == 0 or n % 1000 == 0:
+            cp_calls = [c for c in plan.calls if c[0]]
+            logger.info(
+                "SGLANG_ENABLE_GDN_PREFILL_CP_SPLIT pass %d: lens %s -> %d CP calls "
+                "(%d tokens) + %d non-CP call(s); modeled %.0f -> %.0f us per layer",
+                n,
+                list(plan.lens),
+                len(cp_calls),
+                sum(c[4] - c[3] for c in cp_calls),
+                len(plan.calls) - len(cp_calls),
+                plan.modeled_stock_us,
+                plan.modeled_split_us,
+            )
+
+    @property
+    def _prefill_cp_split(self):
+        args = self._cp_split_args
+        if args is None or args[0] is not self.forward_metadata:
+            return None
+        return args[1]
+
+    def _prefill_sparse_checkpoints_supported(self) -> bool:
+        from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
+            GDN_PREFILL_SPARSE_CHECKPOINTS,
+            FlashInferGDNKernel,
+        )
+
+        if not GDN_PREFILL_SPARSE_CHECKPOINTS or self.is_draft_worker:
+            return False
+        extend_kernel = self.kernel_dispatcher.extend_kernel
+        reason = None
+        if not isinstance(extend_kernel, FlashInferGDNKernel):
+            reason = f"extend kernel {type(extend_kernel).__name__}"
+        elif not extend_kernel.use_state_pool or extend_kernel._prefill_needs_fp32_state:
+            reason = "needs the SM100 state-pool prefill"
+        else:
+            try:
+                import sglang.kernels.ops.mamba.gdn_prefill_ckpt_targets  # noqa: F401
+            except ImportError as e:
+                reason = f"checkpoint-targets kernel unavailable ({e})"
+        if reason is not None:
+            logger.warning(
+                "SGLANG_ENABLE_GDN_PREFILL_SPARSE_CHECKPOINTS not taken: %s", reason
+            )
+            return False
+        logger.info(
+            "SGLANG_ENABLE_GDN_PREFILL_SPARSE_CHECKPOINTS on: GDN prefills store only the "
+            "state checkpoints prefix-cache tracking reads"
+        )
+        return True
+
+    def _sparse_checkpoint_targets(
+        self, forward_batch: ForwardBatch, stock_src_host: Optional[torch.Tensor] = None
+    ) -> Optional[tuple]:
+        """Per sequence, the token whose checkpoint tracking reads (0: none), from the
+        host track metadata; None when this forward keeps the stock checkpoints.
+        stock_src_host: the stock rows, when the checkpoint plan was built from the
+        same host lists; each target must name exactly its stock row."""
+        from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
+            gdn_prefill_checkpoint_targets,
+        )
+
+        meta = self.forward_metadata
+        if (
+            meta.num_state_checkpoints <= 0
+            or meta.track_ssm_h_src is None
+            or not self._has_cpu_prefill_track_metadata(forward_batch)
+        ):
+            return None
+        lens = self._plannable_prefill_lens(forward_batch)
+        if lens is None:
+            return None
+        targets = gdn_prefill_checkpoint_targets(
+            track_mask=forward_batch.mamba_prefill_track_mask_cpu,
+            track_seqlens=forward_batch.mamba_track_seqlens_cpu,
+            prefix_lens=forward_batch.extend_prefix_lens_cpu,
+            every=meta.state_checkpoint_every_n_tokens,
+        )
+        if sum(1 for t in targets if t) != meta.track_ssm_h_src.numel() or any(
+            t > n for t, n in zip(targets, lens)
+        ):
+            return None
+        if stock_src_host is not None:
+            every = meta.state_checkpoint_every_n_tokens
+            rows, start = [], 0
+            for n, t in zip(lens, targets):
+                if t:
+                    rows.append(start + t // every - 1)
+                start += n // every
+            if rows != stock_src_host.tolist():
+                return None
+        # FlashInfer runs CP for a batch this small; the targets kernel is its non-CP.
+        if 2 <= len(lens) and len(lens) * 4 * self._cp_split_heads < self._cp_split_sms:
+            return None
+        return targets
+
+    def _plan_sparse_checkpoints(self, forward_batch: ForwardBatch, targets) -> None:
+        from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
+            build_gdn_prefill_sparse_checkpoints,
+        )
+
+        meta = self.forward_metadata
+        plan = build_gdn_prefill_sparse_checkpoints(
+            forward_batch.extend_seq_lens_cpu,
+            targets,
+            cp_split=self._prefill_cp_split,
+            stock_src=meta.track_ssm_h_src,
+            stock_every=meta.state_checkpoint_every_n_tokens,
+            stock_num=meta.num_state_checkpoints,
+            device=self.device,
+        )
+        self._sparse_ckpt_args = (meta, plan)
+        n = self._sparse_ckpt_passes = self._sparse_ckpt_passes + 1
+        if n & (n - 1) == 0 or n % 1000 == 0:
+            logger.info(
+                "SGLANG_ENABLE_GDN_PREFILL_SPARSE_CHECKPOINTS pass %d: %d of %d checkpoint "
+                "rows stored per GDN layer (%d sequences, %d tracked, calls %s)",
+                n,
+                plan.num_rows,
+                plan.stock_num,
+                len(plan.lens),
+                plan.src.numel(),
+                [c[6] for c in plan.calls],
+            )
+        # Tracking reads plan.src of the plan's rows; the extend allocates num_rows.
+        meta.track_ssm_h_src = plan.src
+        meta.num_state_checkpoints = plan.num_rows
+
+    @property
+    def _prefill_sparse_ckpt(self):
+        args = self._sparse_ckpt_args
+        if args is None or args[0] is not self.forward_metadata:
+            return None
+        return args[1]
 
     def _init_prefill_conv_block_table(self, forward_batch: ForwardBatch) -> None:
         metadata = self.forward_metadata
@@ -2271,6 +2510,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
                         dtype=torch.float32,
                         device=ssm_states.device,
                     )
+                cp_split = self._prefill_cp_split
+                sparse_ckpt = self._prefill_sparse_ckpt
                 core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
                     q=query,
                     k=key,
@@ -2303,6 +2544,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
                         and not needs_state_gather
                         else {}
                     ),
+                    **({"cp_split": cp_split} if cp_split is not None else {}),
+                    **({"sparse_ckpt": sparse_ckpt} if sparse_ckpt is not None else {}),
                 )
 
                 if is_npu() and last_recurrent_state is not None:
@@ -2636,6 +2879,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
                         dtype=torch.float32,
                         device=ssm_states.device,
                     )
+                cp_split = self._prefill_cp_split
+                sparse_ckpt = self._prefill_sparse_ckpt
                 core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
                     q=query,
                     k=key,
@@ -2667,6 +2912,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
                         and not needs_state_gather
                         else {}
                     ),
+                    **({"cp_split": cp_split} if cp_split is not None else {}),
+                    **({"sparse_ckpt": sparse_ckpt} if sparse_ckpt is not None else {}),
                 )
 
                 if is_npu() and last_recurrent_state is not None:

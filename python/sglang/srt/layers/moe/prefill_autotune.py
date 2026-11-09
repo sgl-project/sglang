@@ -77,8 +77,16 @@ def wants_qwen_moe_prefill_autotune(model) -> bool:
     if not get_moe_a2a_backend().is_none() or is_dp_attention_enabled():
         _log_inert_once("needs no MoE all-to-all and no DP attention")
         return False
-    if _eligible_block(model) is None:
+    block = _eligible_block(model)
+    if block is None:
         _log_inert_once("no NVFP4 TRT-LLM MoE block on the TP1/EP1 path")
+        return False
+    if getattr(block.experts, "_nvfp4_cute_prefill", None) is not None:
+        # No trtllm-gen MoE runs on this worker, so its tactic table (pins included) does not apply.
+        logger.info(
+            "Qwen MoE prefill autotune skipped: the routed experts run the CuTe-DSL path "
+            "(SGLANG_QWEN_MOE_PREFILL_CUTE_RUBIN); the MoE tactic table is not used"
+        )
         return False
     return True
 

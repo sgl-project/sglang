@@ -83,6 +83,9 @@ class MambaPoolHost(HostKVCache):
     # skip __init__, still read an empty pair rather than raising.
     slot_state_device_tensors: tuple = ()
     slot_state_buffers: tuple = ()
+    # Set by the cache controller (SGLANG_HICACHE_LOAD_BACK_DEVICE_ORDERED) when this pool's first
+    # layer is transfer layer 0, so the side-state load is queued before every load event.
+    slot_state_load_on_stream: bool = False
 
     def __init__(
         self,
@@ -343,6 +346,7 @@ class MambaPoolHost(HostKVCache):
             for state in self.slot_state_device_tensors
         ]
         slot_state_copy.warm(self.slot_state_device_tensors, self.slot_state_buffers)
+        slot_state_copy.warm_load(self.slot_state_device_tensors, self.slot_state_buffers)
         # destroy() unregisters via kv_buffer; without this list the pinned
         # registrations leak past the buffers' mmap. 0-element buffers
         # (conv-only models' temporal state) were never registered.
@@ -864,6 +868,22 @@ class MambaPoolHost(HostKVCache):
         than the microseconds."""
         if not self.slot_state_device_tensors:
             return
+        if (
+            to_device
+            and self.slot_state_load_on_stream
+            and slot_state_copy.load_applies(
+                self.slot_state_device_tensors, self.slot_state_buffers
+            )
+        ):
+            # Read on this stream: it waits on any device-ordered write-back still copying.
+            write_back_order.order_current_stream_after_pending()
+            if slot_state_copy.load_rows_device_ordered(
+                self.slot_state_device_tensors,
+                self.slot_state_buffers,
+                device_indices=device_indices,
+                host_indices=host_indices,
+            ):
+                return
         if to_device:
             # The CPU reads below see a device-ordered write-back's rows only once it lands.
             write_back_order.wait_landed()
