@@ -35,6 +35,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
     get_serving,
+    should_use_elastic_mooncake_ep,
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
@@ -316,6 +317,11 @@ def _init_parallel_groups(
         rank_offset + tp_size * pp_size if is_scale_joiner else tp_size * pp_size
     )
     rank = rank_offset + tp_size * pp_rank + tp_rank
+    elastic_mooncake_ep_enabled = should_use_elastic_mooncake_ep(
+        max_ep_size=parallel.max_ep_size,
+        elastic_ep_initial_size=parallel.elastic_ep_initial_size,
+        tp_size=tp_size,
+    )
 
     init_distributed_environment(
         backend=backend,
@@ -327,6 +333,7 @@ def _init_parallel_groups(
         moe_a2a_backend=get_exec().moe.moe_a2a_backend,
         recovered_rank=is_ep_joiner,
         max_world_size=get_parallel().max_ep_size,
+        elastic_mooncake_ep_enabled=elastic_mooncake_ep_enabled,
     )
     initialize_model_parallel(
         enable_symm_mem=get_exec().comm.enable_symm_mem,

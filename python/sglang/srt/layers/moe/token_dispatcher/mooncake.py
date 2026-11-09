@@ -21,7 +21,11 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
 )
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import DeepEPMode
-from sglang.srt.runtime_context import get_parallel, get_resources
+from sglang.srt.runtime_context import (
+    get_parallel,
+    get_resources,
+    should_use_elastic_mooncake_ep,
+)
 from sglang.srt.utils import get_int_env_var
 
 logger = logging.getLogger(__name__)
@@ -89,8 +93,12 @@ class EPBuffer:
 
     @staticmethod
     def is_elastic_ep_enabled() -> bool:
-        # Change this to False to use the legacy Buffer implementation for debugging.
-        return True
+        parallel = get_parallel()
+        return should_use_elastic_mooncake_ep(
+            max_ep_size=parallel.max_ep_size,
+            elastic_ep_initial_size=parallel.elastic_ep_initial_size,
+            tp_size=parallel.tp_size,
+        )
 
     @classmethod
     def on_scale(cls, from_ep_size: int, to_ep_size: int) -> None:

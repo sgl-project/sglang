@@ -183,6 +183,18 @@ def max_world_size_of(cfg: Any):
     return cfg.max_ep_size or launch_world_size_of(cfg)
 
 
+def should_use_elastic_mooncake_ep(
+    *,
+    max_ep_size: Optional[int],
+    elastic_ep_initial_size: Optional[int],
+    tp_size: int,
+) -> bool:
+    """Whether Mooncake EP uses its elastic Buffer for configured expansion."""
+    return max_ep_size is not None and max_ep_size > (
+        elastic_ep_initial_size or tp_size
+    )
+
+
 def attn_tp_size_of(cfg: Any):
     """`attn_tp_size`, computed at publish. See `parallel_widths_of`."""
     return parallel_widths_of(cfg)["attn_tp_size"]
