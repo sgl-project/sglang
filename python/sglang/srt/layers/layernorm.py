@@ -42,6 +42,7 @@ from sglang.srt.utils import (
     is_flashinfer_available,
     is_gfx1250_supported,
     is_hip,
+    is_mlu,
     is_musa,
     is_npu,
     is_sm100_supported,
@@ -53,6 +54,7 @@ _is_flashinfer_available = is_flashinfer_available()
 _is_hip = is_hip()
 _is_musa = is_musa()
 _is_npu = is_npu()
+_is_mlu = is_mlu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
@@ -191,6 +193,9 @@ if _is_npu:
         # unchanged. On Ascend 950 the operator is unregistered and the first Gemma
         # forward fails loudly, same as before this indirection existed.
         npu_gemma_rms_norm = torch_npu.npu_gemma_rms_norm
+
+if _is_mlu:
+    import torch_mlu_ops
 
 
 @lru_cache(maxsize=1)
@@ -711,6 +716,75 @@ class RMSNorm(BaseFusedOp):
             return out, residual_out
         return torch_npu.npu_rms_norm(x, self.weight.data, self.variance_epsilon)[0]
 
+    def forward_mlu(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+        post_residual_addition: Optional[torch.Tensor] = None,
+        quant_linear: Optional[nn.Module] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        # TODO: Add and validate deterministic RMSNorm support on MLU.
+        if (
+            envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
+            or is_batch_invariant_mode_enabled()
+        ):
+            raise NotImplementedError(
+                "Deterministic inference is not supported for MLU RMSNorm yet."
+            )
+        # Fall back for options, dtypes, and layouts unsupported by the fused kernel.
+        if (
+            self.variance_size_override is not None
+            or self.fp32_residual
+            or self.cast_x_before_out_mul
+            or self.override_orig_dtype is not None
+            or self.weight.dtype != x.dtype
+            or (residual is not None and residual.dtype != x.dtype)
+            or (
+                residual is not None
+                and post_residual_addition is not None
+                and post_residual_addition.dtype != x.dtype
+            )
+            or x.stride(-1) != 1
+            or (residual is not None and residual.stride(-1) != 1)
+        ):
+            return self.forward_native(
+                x, residual, post_residual_addition, quant_linear
+            )
+        if x.numel() == 0:
+            if residual is not None:
+                if post_residual_addition is not None:
+                    residual = residual + post_residual_addition
+                return x, residual
+            return x
+        # The MLU kernel requires at least two dimensions and flattenable
+        # leading strides. reshape also handles noncontiguous leading dimensions.
+        original_shape = x.shape
+        x = x.reshape(-1, original_shape[-1])
+        if residual is not None:
+            if post_residual_addition is not None:
+                residual = residual + post_residual_addition
+            residual = residual.reshape(-1, original_shape[-1])
+            out, residual_out = torch_mlu_ops.fused_rms_norm(
+                x,
+                residual,
+                self.weight.data,
+                None,
+                None,
+                self.variance_epsilon,
+                True,
+            )
+            return out.reshape(original_shape), residual_out.reshape(original_shape)
+        out = torch_mlu_ops.fused_rms_norm(
+            x,
+            None,
+            self.weight.data,
+            None,
+            None,
+            self.variance_epsilon,
+            False,
+        )
+        return out.reshape(original_shape)
+
     def forward_aiter(
         self,
         x: torch.Tensor,
@@ -1105,6 +1179,12 @@ class RMSNorm(BaseFusedOp):
         return out, scale, orig_dtype
 
 
+def exact_rms_norm(x: torch.Tensor, norm: RMSNorm) -> torch.Tensor:
+    """``norm`` through torch's rms_norm, which, unlike the fused kernel, matches
+    a trainer that uses it bit for bit."""
+    return F.rms_norm(x, (x.shape[-1],), norm.weight, norm.variance_epsilon)
+
+
 class LayerNorm(BaseFusedOp):
     def __init__(
         self,
@@ -1284,6 +1364,21 @@ class GemmaRMSNorm(BaseFusedOp):
             return rocm_triton_gemma_rmsnorm(x, self.weight.data, self.variance_epsilon)
 
         if not _has_vllm_rms_norm:
+            if _has_rocm_triton_gemma_rms_norm and x.dim() == 2:
+                # one kernel instead of forward_native's op chain, same rounding points
+                if residual is not None:
+                    if post_residual_addition is not None:
+                        residual = residual + post_residual_addition
+                    return rocm_triton_gemma_fused_add_rmsnorm(
+                        x,
+                        residual,
+                        self.weight.data,
+                        self.variance_epsilon,
+                        round_sum=True,
+                    )
+                return rocm_triton_gemma_rmsnorm(
+                    x, self.weight.data, self.variance_epsilon
+                )
             return self.forward_native(x, residual, post_residual_addition)
 
         if _use_aiter:
@@ -1439,7 +1534,12 @@ class Gemma3RMSNorm(BaseFusedOp):
             return x, residual
         if x.dim() == 2:
             return gemma_rmsnorm(x, self.weight.data, self.eps)
-        return self.forward_native(x)
+        if x.numel() == 0:
+            return x
+        # q_norm and k_norm get [tokens, heads, head_dim]. The norm reduces over
+        # the last dim only, so flatten the leading dims for the fused kernel.
+        flat = x.contiguous().view(-1, x.shape[-1])
+        return gemma_rmsnorm(flat, self.weight.data, self.eps).view(x.shape)
 
     def forward_xpu(self, x, residual: Optional[torch.Tensor] = None):
         if residual is not None and x.dim() == 2:

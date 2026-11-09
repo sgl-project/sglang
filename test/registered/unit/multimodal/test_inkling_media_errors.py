@@ -90,7 +90,7 @@ class TestResolveMediaItemIsClientError(CustomTestCase):
         ):
             with self.subTest(exc=type(exc).__name__):
                 with patch(
-                    "sglang.srt.utils.common.get_mm_http_session",
+                    "sglang.srt.multimodal.media_io.get_mm_http_session",
                     return_value=_session_raising(exc),
                 ):
                     with self.assertRaises(ValueError) as ctx:
@@ -109,7 +109,7 @@ class TestResolveMediaItemIsClientError(CustomTestCase):
         # base64 (a long run of "A"s decodes cleanly and wouldn't raise).
         huge_url = "https://media.host/" + ("a" * 1_000_000)
         with patch(
-            "sglang.srt.utils.common.get_mm_http_session",
+            "sglang.srt.multimodal.media_io.get_mm_http_session",
             return_value=_session_raising(requests.exceptions.ConnectionError("x")),
         ):
             with self.assertRaises(ValueError) as ctx:

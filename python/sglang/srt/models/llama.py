@@ -19,6 +19,7 @@
 """Inference-only LLaMA model compatible with HuggingFace weights."""
 
 import logging
+import traceback
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -53,6 +54,8 @@ from sglang.srt.layers.quantization.fp8_activation import DenseSiluAndMulQuant
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -65,13 +68,7 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import (
-    add_prefix,
-    is_npu,
-    is_xpu,
-    make_pp_layers,
-)
-from sglang.utils import get_exception_traceback
+from sglang.srt.utils import is_npu, is_xpu
 
 _is_xpu = is_xpu()
 
@@ -845,7 +842,7 @@ class LlamaForCausalLM(nn.Module):
 
         except Exception:
             logger.error(
-                f"Error getting weights by name {name} in LlamaForCausalLM: {get_exception_traceback()}"
+                f"Error getting weights by name {name} in LlamaForCausalLM: {traceback.format_exc()}"
             )
             return None
 
