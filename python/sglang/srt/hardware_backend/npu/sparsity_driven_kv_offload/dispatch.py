@@ -15,7 +15,7 @@ def create_sparse_kv_manager(
         SparseKVCacheManager,
     )
 
-    return SparseKVCacheManager(req_pool, allocator, sparse_context_len, **options)
+    return SparseKVCacheManager(req_pool, allocator, sparse_context_len)
 
 
 def get_sparse_kv_attention(*, fused):

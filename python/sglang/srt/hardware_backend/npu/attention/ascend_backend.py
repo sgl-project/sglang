@@ -49,7 +49,6 @@ from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import (
-    get_exec,
     get_flags,
     get_parallel,
     get_spec,
@@ -407,7 +406,7 @@ class AscendAttnBackend(AttentionBackend):
         )
         self.sparse_kv_manager = (
             getattr(self.token_to_kv_pool, "sparse_kv_manager", None)
-            if self.enable_sparsity_driven_kv_offload
+            if self.use_fused_sparse_kv
             else None
         )
         if self.enable_sparsity_driven_kv_offload and self.sparse_kv_manager is None:
@@ -424,20 +423,6 @@ class AscendAttnBackend(AttentionBackend):
                 sparse_options["copy_sfa_padded_query_heads"] = (
                     plan.copy_sfa_query_heads
                 )
-            else:
-                from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
-                    get_batch_sizes_to_capture,
-                )
-
-                graph = get_exec().graph
-                config = graph.cuda_graph_config
-                if (
-                    not graph.disable_cuda_graph
-                    and config is not None
-                    and config.decode.bs
-                ):
-                    capture_bs, _ = get_batch_sizes_to_capture(model_runner)
-                    sparse_options["graph_batch_capacity"] = max(capture_bs)
             self.sparse_kv_manager = create_sparse_kv_manager(
                 model_runner.req_to_token_pool,
                 model_runner.token_to_kv_pool_allocator,

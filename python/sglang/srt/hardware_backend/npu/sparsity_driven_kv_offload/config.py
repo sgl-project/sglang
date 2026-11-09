@@ -45,9 +45,9 @@ def is_sparsity_driven_kv_offload_enabled(
     use_mla_backend: bool,
     is_draft_worker: bool = False,
 ) -> bool:
-    # Offload is a target-model policy. Draft attention keeps its native KV
+    # Fused offload is a target-model policy. Draft attention keeps its native KV
     # pool even though the process inherits the target's environment flags.
-    if is_draft_worker:
+    if use_fused_sparse_kv_offload() and is_draft_worker:
         return False
     if not envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get():
         return False
@@ -132,6 +132,29 @@ def get_sparsity_driven_kv_offload_cell_size(
     indexer_layer_ids: Optional[Sequence[int]] = None,
     kv_cache_dtype: Optional[torch.dtype] = None,
 ) -> Optional[int]:
+    if not use_fused_sparse_kv_offload():
+        if not is_sparsity_driven_kv_offload_enabled(
+            model_config=model_config,
+            use_mla_backend=use_mla_backend,
+        ):
+            return None
+
+        index_head_dim = get_sparsity_driven_kv_offload_index_head_dim(
+            model_config=model_config
+        )
+        from sglang.srt.mem_cache.kv_cache_configurator import (
+            _should_elide_dsa_index_k,
+        )
+
+        if _should_elide_dsa_index_k(is_draft_worker=is_draft_worker):
+            num_indexer_layers = sum(
+                not dsa_layer_skips_topk(model_config.hf_config, layer_id)
+                for layer_id in range(start_layer, start_layer + num_layers)
+            )
+        else:
+            num_indexer_layers = num_layers
+        return index_head_dim * num_indexer_layers * element_size
+
     if not is_sparsity_driven_kv_offload_enabled(
         model_config=model_config,
         use_mla_backend=use_mla_backend,

@@ -376,6 +376,13 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     # address space that KVCacheConfigurator allocates below.
                     draft_loc_space_scale = parse_hisparse_config().host_to_device_ratio
                 if is_deepseek_dsa(kvc.model_config.hf_config):
+                    target_indexer_size = self._compute_dsa_indexer_cell_size(
+                        kvc=kvc,
+                        num_layers=num_layers,
+                    )
+                    if not dsa_shards_index_k():
+                        target_indexer_size *= dcp_size
+                    target_kv_size = self._cell_size - target_indexer_size
                     from sglang.srt.layers.cp.utils import (
                         get_glm_dsa_layer_split_effective_num_layers,
                     )
@@ -383,7 +390,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     target_kv_num_layers = get_glm_dsa_layer_split_effective_num_layers(
                         kvc, num_layers
                     )
-                    if envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get():
+                    if self._sparse_budget is not None:
                         from sglang.srt.mem_cache.kv_cache_configurator import (
                             calculate_mla_kv_cache_dim,
                         )
@@ -397,14 +404,6 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                             * torch._utils._element_size(kvc.kv_cache_dtype)
                             * target_kv_num_layers
                         )
-                    else:
-                        target_indexer_size = self._compute_dsa_indexer_cell_size(
-                            kvc=kvc,
-                            num_layers=num_layers,
-                        )
-                        if not dsa_shards_index_k():
-                            target_indexer_size *= dcp_size
-                        target_kv_size = self._cell_size - target_indexer_size
                     draft_kv_size = (
                         int(target_kv_size * draft_num_layers / target_kv_num_layers)
                         * draft_loc_space_scale
@@ -502,13 +501,14 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     is_draft_worker=kvc.is_draft_worker,
                     indexer_layer_ids=(
                         kvc.get_dsa_indexer_layer_ids()
-                        if is_deepseek_dsa(model_config.hf_config)
+                        if envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.get()
+                        and is_deepseek_dsa(model_config.hf_config)
                         else None
                     ),
                     kv_cache_dtype=kv_cache_dtype,
                 )
                 if offload_cell_size is not None:
-                    return offload_cell_size * dcp_size
+                    return offload_cell_size
 
             from sglang.srt.mem_cache.kv_cache_configurator import (
                 calculate_mla_kv_cache_dim,

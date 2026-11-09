@@ -58,7 +58,7 @@ def test_manager_and_attention_follow_one_switch(monkeypatch, fused):
         (
             fused,
             ("pool", "allocator", 2048),
-            {"graph_batch_capacity": 4},
+            {"graph_batch_capacity": 4} if fused else {},
         )
     ]
     assert dispatch.get_sparse_kv_attention(fused=fused) is expected[fused]
@@ -107,6 +107,34 @@ def test_fused_budget_keeps_its_constraints(monkeypatch):
                 kv_bytes_per_token=1152,
                 graph_batch_capacity=4,
             )
+
+
+@pytest.mark.parametrize("fused", [False, True])
+@pytest.mark.parametrize("draft", [False, True])
+def test_draft_policy_is_private_to_fused_mode(monkeypatch, fused, draft):
+    monkeypatch.setattr(config, "is_npu", lambda: True)
+    monkeypatch.setattr(config, "is_deepseek_dsa", lambda _: True)
+    monkeypatch.setattr(config, "get_dsa_index_topk", lambda _: 2048)
+    monkeypatch.setattr(config, "attention_backends", lambda: ("ascend", "ascend"))
+    monkeypatch.setattr(
+        config,
+        "get_schedule",
+        lambda: SimpleNamespace(max_running_requests=4, page_size=128),
+    )
+    monkeypatch.setattr(
+        config, "get_parallel", lambda: SimpleNamespace(pp_size=1, dcp_enabled=False)
+    )
+    monkeypatch.setattr(
+        config, "get_spec", lambda: SimpleNamespace(speculative_algorithm="NONE")
+    )
+    with (
+        envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.override(True),
+        envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.override(fused),
+    ):
+        enabled = config.is_sparsity_driven_kv_offload_enabled(
+            model_config=MODEL_CONFIG, use_mla_backend=True, is_draft_worker=draft
+        )
+    assert enabled is not (fused and draft)
 
 
 if __name__ == "__main__":

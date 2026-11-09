@@ -7,7 +7,12 @@ from types import SimpleNamespace
 
 import torch
 import torch_npu  # noqa: F401
-from sgl_kernel_npu.sparsity_driven_kv_offload import create_shm_tensor, free_shm
+from sgl_kernel_npu.sparsity_driven_kv_offload.fused_shm import (
+    create_fused_shm_tensor as create_shm_tensor,
+)
+from sgl_kernel_npu.sparsity_driven_kv_offload.fused_shm import (
+    free_fused_shm as free_shm,
+)
 
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_manager import (
     SparseKVCacheManager,

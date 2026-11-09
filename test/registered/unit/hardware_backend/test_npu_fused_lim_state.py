@@ -308,7 +308,8 @@ class TestLIMState(CustomTestCase):
         native_package = ModuleType("sgl_kernel_npu")
         native_package.__path__ = []
         native_api = ModuleType("sgl_kernel_npu.sparsity_driven_kv_offload")
-        native_api.create_shm_tensor = Mock()
+        native_fused = ModuleType("sgl_kernel_npu.sparsity_driven_kv_offload.fused_shm")
+        native_fused.create_fused_shm_tensor = Mock()
         native_api.unidex_copy_inplace = Mock()
         module_name = (
             "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_manager"
@@ -318,6 +319,7 @@ class TestLIMState(CustomTestCase):
             {
                 "sgl_kernel_npu": native_package,
                 "sgl_kernel_npu.sparsity_driven_kv_offload": native_api,
+                native_fused.__name__: native_fused,
             },
         ):
             fused_manager = importlib.import_module(module_name)

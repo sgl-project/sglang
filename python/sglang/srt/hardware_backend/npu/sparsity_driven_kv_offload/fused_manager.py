@@ -7,8 +7,10 @@ from typing import TYPE_CHECKING, List, Optional, Union
 
 import torch
 from sgl_kernel_npu.sparsity_driven_kv_offload import (
-    create_shm_tensor,
     unidex_copy_inplace,
+)
+from sgl_kernel_npu.sparsity_driven_kv_offload.fused_shm import (
+    create_fused_shm_tensor as create_shm_tensor,
 )
 
 from sglang.kernels.ops.attention.npu_copy_sfa import (

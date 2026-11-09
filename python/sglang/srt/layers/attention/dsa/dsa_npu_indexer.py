@@ -269,9 +269,8 @@ class DSANPUIndexerMixin:
                         device=k.device,
                     )
                 else:
-                    actual_seq_lengths_q = torch.arange(
-                        1,
-                        bs + 1,
+                    actual_seq_lengths_q = torch.tensor(
+                        [1 + i * 1 for i in range(bs)],
                         dtype=torch.int32,
                         device=k.device,
                     )

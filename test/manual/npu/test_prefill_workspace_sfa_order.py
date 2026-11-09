@@ -11,7 +11,9 @@ from types import SimpleNamespace
 
 import torch
 import torch_npu
-from sgl_kernel_npu.sparsity_driven_kv_offload import free_shm
+from sgl_kernel_npu.sparsity_driven_kv_offload.fused_shm import (
+    free_fused_shm as free_shm,
+)
 from test_prefill_gather_device import make_manager, oracle
 
 from sglang.srt.model_executor.forward_mode import ForwardMode
