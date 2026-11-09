@@ -44,6 +44,11 @@ class SessionSlot:
     # Until the first turn finishes or is retracted, its checkpoints publish
     # the prompt into the tree and move the lock onto the deepest published node.
     publishes_prompt: bool = False
+    # Prefix-cache namespace the row was allocated under. A later turn that
+    # carries a different pair must not borrow the row: an abort would insert
+    # these slots again under the new key.
+    extra_key: Optional[str] = None
+    cache_salt: Optional[str] = None
 
 
 def is_virtual_node(node: Any) -> bool:
@@ -97,7 +102,9 @@ class StreamingSession:
         if not _is_streaming(req) or req.to_finish is not None:
             return False
         slot = self.slots.get(req.session.session_id)
-        return slot is not None and slot.kv.holds_kv
+        return (
+            slot is not None and slot.kv.holds_kv and self._namespace_matches(slot, req)
+        )
 
     def try_match_prefix(self, params: MatchPrefixParams) -> Optional[MatchResult]:
         """Returns a MatchResult iff the request hits an active session slot;
@@ -111,6 +118,9 @@ class StreamingSession:
             return None
 
         req = params.req
+        if not self._namespace_matches(slot, req):
+            self._reject_foreign_namespace(req)
+            return None
 
         # [NPU] Below one aligned page, drop the slot's KV and fully prefill.
         if is_npu() and self.cache.page_size > 1:
@@ -166,7 +176,9 @@ class StreamingSession:
         """Keeps a finished or retracted turn's record in the session slot.
         An aborted turn gets the record and the tree lock back and is released
         like any request (returns False); the session re-prefills from its
-        last finished request next turn."""
+        last finished request next turn. An abort whose namespace differs from
+        the slot's keeps the row: releasing it would insert those slots under
+        the new key while the original node still maps them."""
         if (
             self.uocr_doc_reuse is not None
             and self.uocr_doc_reuse.on_cache_finished_req(req)
@@ -180,6 +192,15 @@ class StreamingSession:
         slot = self.borrowed_slot(req)
         assert slot is not None, f"streaming {req.rid=} does not run on its slot"
         if isinstance(req.finished_reason, FINISH_ABORT):
+            if not self._namespace_matches(slot, req):
+                # The protected prefix stays on the slot. The tail is this
+                # turn's and is not published under its key.
+                self._free_tail(slot.kv, slot.kv.cache_protected_len)
+                req.detach_kv()
+                req.lock = None
+                req.release_mm_inputs_on_abort()
+                req.session.abort_req()
+                return True
             # Hand the record and the tree lock back; the caller releases them.
             del self.slots[req.session.session_id]
             req.lock, slot.lock = slot.lock, None
@@ -227,7 +248,12 @@ class StreamingSession:
             return
         session_id = req.session.session_id
         assert session_id not in self.slots, f"{session_id=} already has a slot"
-        slot = SessionSlot(kv=req.kv, publishes_prompt=True)
+        slot = SessionSlot(
+            kv=req.kv,
+            publishes_prompt=True,
+            extra_key=req.extra_key,
+            cache_salt=req.cache_salt or None,
+        )
         self._lock_to_slot(req, slot)
         self.slots[session_id] = slot
 
@@ -281,6 +307,22 @@ class StreamingSession:
             slot.kv.mamba_ping_pong_empty = None
 
     # -- Internal helpers (streaming body bits) --
+
+    def _namespace_matches(self, slot: SessionSlot, req: Req) -> bool:
+        # Empty salt is stored as unset, matching RadixKey.
+        return (slot.extra_key, slot.cache_salt) == (
+            req.extra_key,
+            req.cache_salt or None,
+        )
+
+    def _reject_foreign_namespace(self, req: Req) -> None:
+        # Keep the slot. Lending the row would let this turn's abort insert
+        # its slots under the new key, beside the node that already owns them.
+        req.set_finish_with_abort(
+            "Streaming session cache namespace does not match the session."
+        )
+        req.session.abort_req()
+        req.session = None
 
     def _lock_to_slot(self, req: Req, slot: SessionSlot) -> None:
         slot.lock, req.lock = req.lock, None
