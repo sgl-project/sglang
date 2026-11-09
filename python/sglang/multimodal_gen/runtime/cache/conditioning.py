@@ -688,31 +688,48 @@ def cached_vae_encode(fn):
         cache = _inference_cache(self)
         if cache is None or (model_parallel_is_initialized() and get_world_size() > 1):
             return fn(self, *args, **kwargs)
-        # Tiling and slicing can change numerical results without changing x.
-        settings = {
-            name: value
-            for name, value in vars(self).items()
-            if name.startswith(
-                (
-                    "use_",
-                    "tile_",
-                    "blend_",
-                    "parallel_",
-                    "spatial_compression",
-                    "temporal_compression",
-                )
-            )
-            and type(value) in (int, float, bool, str, type(None))
-        }
         return cache.run(
             self,
             fn.__name__,
-            (args, settings),
+            (args, _vae_numeric_settings(self)),
             kwargs,
             lambda: fn(self, *args, **kwargs),
         )
 
     return wrapped
+
+
+def _vae_numeric_settings(vae):
+    # Tiling and slicing can change numerical results without changing x.
+    return {
+        name: value
+        for name, value in vars(vae).items()
+        if name.startswith(
+            (
+                "use_",
+                "tile_",
+                "blend_",
+                "parallel_",
+                "spatial_compression",
+                "temporal_compression",
+            )
+        )
+        and type(value) in (int, float, bool, str, type(None))
+    }
+
+
+def cached_vae_call(vae, method, args, compute, *, group=None):
+    """Cache a deterministic result derived from ``vae`` across requests.
+
+    When ``compute`` issues collectives, ``group`` must hold every rank that
+    runs it, so those ranks agree on hit or miss.
+    """
+    cache = _inference_cache(vae)
+    if cache is None:
+        return compute()
+    return cache.run(
+        vae, method, (args, _vae_numeric_settings(vae)), {}, compute, group
+    )
 
 
 class ConditioningEncoderMixin:

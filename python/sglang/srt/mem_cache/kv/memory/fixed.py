@@ -7,7 +7,7 @@ from typing import Sequence
 import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
-from sglang.srt.mem_cache.kv.decl import TensorPartDecl
+from sglang.srt.mem_cache.kv.decl import Region, TensorPartDecl
 from sglang.srt.mem_cache.utils import maybe_init_custom_mem_pool
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
@@ -71,7 +71,6 @@ class FixedMemory:
 
     def regions(self, parts: Sequence[TensorPartDecl]):
         """Contiguous fixed rows in stable part-major, then layer order."""
-        from sglang.srt.mem_cache.kv.storage import Region
 
         ptrs, lens, items, dims, outer, layers = [], [], [], [], [], []
         for part in parts:
