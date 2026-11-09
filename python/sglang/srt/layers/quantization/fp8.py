@@ -2052,10 +2052,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 padded_inter = (
                     (inter_per_part + fp4_k_align - 1) // fp4_k_align * fp4_k_align
                 )
-                # Record the padding so fused_moe is told the real intermediate size
-                # (aiter fused_moe needs intermediate_pad = padded - real; ATOM passes
-                # 128, SGLang previously defaulted to 0 -> computed the padded region).
-                layer.intermediate_pad = padded_inter - inter_per_part
+                # Compute the zero-padded region; declaring it leaves AITER scratch
+                # unwritten while some stage-2 kernels still read those columns.
+                layer.intermediate_pad = 0
                 layer.hidden_pad = 0
                 if padded_inter != inter_per_part:
                     pad_amount = padded_inter - inter_per_part

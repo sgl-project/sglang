@@ -12,6 +12,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -87,6 +88,108 @@ class TestFp8MoEWeightGating(CustomTestCase):
         # One shard means one scale per expert; nothing to fuse afterwards.
         params = _create_weights(is_gated=False, block_quant=False)
         self.assertEqual(params["w13_weight_scale"].shape, (NUM_EXPERTS, 1))
+
+
+class TestAiterFp4Padding(CustomTestCase):
+    def test_zero_padded_experts_do_not_declare_intermediate_pad(self):
+        """AITER must compute every zero-padded column before stage 2 reads it."""
+        from sglang.srt.layers.quantization import fp8 as fp8_quant
+
+        experts, logical_inter, hidden_packed = 2, 576, 8
+        layer = SimpleNamespace(
+            w13_weight=torch.nn.Parameter(
+                torch.ones(
+                    experts,
+                    2 * logical_inter,
+                    hidden_packed,
+                    dtype=torch.uint8,
+                ),
+                requires_grad=False,
+            ),
+            w2_weight=torch.nn.Parameter(
+                torch.ones(
+                    experts,
+                    16,
+                    logical_inter // 2,
+                    dtype=torch.uint8,
+                ),
+                requires_grad=False,
+            ),
+            w13_weight_scale_inv=torch.nn.Parameter(
+                torch.ones(
+                    experts,
+                    2 * logical_inter,
+                    hidden_packed // 4,
+                    dtype=torch.uint8,
+                ),
+                requires_grad=False,
+            ),
+            w2_weight_scale_inv=torch.nn.Parameter(
+                torch.ones(
+                    experts,
+                    16,
+                    logical_inter // 32,
+                    dtype=torch.uint8,
+                ),
+                requires_grad=False,
+            ),
+        )
+        quant_config = MagicMock(
+            use_mxfp8=False,
+            weight_block_size=[32, 32],
+            convert_mxfp8_to_block_fp8=False,
+            is_fp4_experts=True,
+            dequant_fp4_to_fp8=False,
+        )
+        runner_backend = MagicMock()
+        runner_backend.is_cutlass.return_value = False
+        a2a_backend = MagicMock()
+        a2a_backend.is_megamoe.return_value = False
+
+        with (
+            patch.object(
+                fp8_quant,
+                "get_moe_runner_backend",
+                return_value=runner_backend,
+            ),
+            patch.object(
+                fp8_quant,
+                "get_moe_a2a_backend",
+                return_value=a2a_backend,
+            ),
+            patch.object(fp8_quant, "_use_aiter", True),
+            patch.object(fp8_quant, "_require_fp4_dtype", return_value=torch.uint8),
+            patch.object(fp8_quant, "_is_gfx1250_supported", False),
+            patch.object(fp8_quant, "_is_shuffle_moe_mxfp4", False),
+            patch.object(
+                fp8_quant,
+                "shuffle_scale",
+                side_effect=lambda scale, *_args, **_kwargs: scale,
+                create=True,
+            ),
+        ):
+            method = fp8_quant.Fp8MoEMethod(quant_config)
+            method.process_weights_after_loading_block_quant(layer)
+
+        self.assertEqual(layer.intermediate_pad, 0)
+        self.assertEqual(layer.w13_weight.shape[1], 2 * INTERMEDIATE)
+        self.assertEqual(layer.w2_weight.shape[2], INTERMEDIATE // 2)
+        self.assertEqual(
+            torch.count_nonzero(layer.w13_weight[:, logical_inter:INTERMEDIATE]).item(),
+            0,
+        )
+        self.assertEqual(
+            torch.count_nonzero(
+                layer.w13_weight[:, INTERMEDIATE + logical_inter : 2 * INTERMEDIATE]
+            ).item(),
+            0,
+        )
+        self.assertEqual(
+            torch.count_nonzero(
+                layer.w2_weight[:, :, logical_inter // 2 : INTERMEDIATE // 2]
+            ).item(),
+            0,
+        )
 
 
 class TestFallbackWeightPadding(CustomTestCase):
