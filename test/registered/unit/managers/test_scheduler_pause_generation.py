@@ -149,6 +149,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.invariant_checker = MagicMock()
         scheduler.kv_events_publisher = MagicMock()
         scheduler.beam_coordinator = MagicMock()
+        scheduler.output_streamer = MagicMock()
         scheduler.send_abort_output = MagicMock()
         scheduler.init_request_retirer()
         return scheduler
@@ -282,6 +283,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         )
         batch.spec_algorithm = SpeculativeAlgorithm.NONE
         scheduler.token_to_kv_pool_allocator.page_size = 1
+        scheduler.token_to_kv_pool_allocator.pools_share_memory = False
         scheduler.token_to_kv_pool_allocator.check_decode_capacity.return_value = False
         scheduler.tree_cache.req_to_token_pool.mamba_allocator = None
         scheduler.new_token_ratio_tracker = SimpleNamespace(current=1.0)

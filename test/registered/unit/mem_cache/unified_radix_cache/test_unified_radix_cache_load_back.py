@@ -19,6 +19,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
 )
+from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.cache_action import (
@@ -1003,7 +1004,7 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
             ) as evict_for_alloc,
         ):
             prep = comp.prepare_load_back(leaf, req=req)
-        evict_for_alloc.assert_called_once_with(EvictParams(num_tokens=0, mamba_num=1))
+        evict_for_alloc.assert_called_once_with(KVDemand(state_slots=1))
         self.assertIs(prep.allocated_mamba_slot, retry_slot)
         self.assertEqual(int(req.kv.mamba_pool_idx), int(retry_slot[0]))
 
@@ -1183,6 +1184,8 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
             ComponentType.FULL, leaf, CacheTransferPhase.LOAD_BACK
         )[0]
         self.assertEqual(int(kv_xfer.host_indices.numel()), kv_tokens)
+        # Admission sizes a load-back by the rows this transfer copies.
+        self.assertEqual(cache.full_load_back_tokens(leaf), kv_tokens)
 
         swa_xfer = cache.tree_core.build_hicache_transfers(
             ComponentType.SWA, leaf, CacheTransferPhase.LOAD_BACK
@@ -1226,7 +1229,7 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
         full_pre_evict_calls = [
             call
             for call in evict_for_alloc_mock.call_args_list
-            if call.args and call.args[0].num_tokens > 0
+            if call.args and call.args[0].full_tokens > 0
         ]
         self.assertEqual(full_pre_evict_calls, [])
 
@@ -1234,8 +1237,8 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
         self.assertTrue(
             any(
                 call.args
-                and call.args[0].num_tokens == 0
-                and sum(call.args[0].window_num_tokens.values()) > 0
+                and call.args[0].full_tokens == 0
+                and sum(call.args[0].window_tokens.values()) > 0
                 for call in evict_for_alloc_mock.call_args_list
             )
         )
