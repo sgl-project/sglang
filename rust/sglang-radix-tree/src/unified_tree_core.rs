@@ -197,6 +197,11 @@ pub struct InsertParams<'k, K: ChildKeyType> {
     pub swa_branching_seqlen: Option<usize>,
     /// The donated mamba slot for the insert target leaf; None on non-mamba trees.
     pub mamba_value: Option<Tensor>,
+    /// Host-pool index for a checkpoint that keeps no GPU slot. Mutually
+    /// exclusive with `mamba_value`.
+    pub mamba_host_value: Option<Tensor>,
+    /// Both mamba values stay empty and the leaf already holds the checkpoint.
+    pub allow_missing_mamba: bool,
     /// The inserting request already inserted [0, here); only the nodes past it
     /// count a hit (and get threshold-checked), so a request counts each node once.
     pub inserted_len: usize,
@@ -299,6 +304,8 @@ pub(crate) struct InsertWalkState<K: ChildKeyType> {
     swa_evicted_seqlen: usize,
     swa_branching_seqlen: Option<usize>,
     mamba_value: Option<Tensor>,
+    mamba_host_value: Option<Tensor>,
+    allow_missing_mamba: bool,
     inserted_len: usize,
     priority: i64,
     track_adopted_ranges: bool,
@@ -554,6 +561,9 @@ pub struct CacheInitParams {
     pub mamba_cache_chunk_size: Option<usize>,
     /// Per-root-path cap on cached Mamba states; None means unlimited.
     pub mamba_max_states_per_path: Option<usize>,
+    /// Host-only mamba checkpoints never occupy a GPU slot. A host value then
+    /// still counts as a device-prefix match so Full KV indices stay reachable.
+    pub mamba_host_only_checkpoint: bool,
 }
 
 impl Default for CacheInitParams {
@@ -575,8 +585,38 @@ impl Default for CacheInitParams {
             dynamo_kv_event_format: false,
             mamba_cache_chunk_size: None,
             mamba_max_states_per_path: None,
+            mamba_host_only_checkpoint: false,
         }
     }
+}
+
+/// Cache-residency switches the controller sets after construction; all off
+/// by default, which keeps every eviction and demotion decision unchanged.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CacheResidencyOptions {
+    /// Under write_back, back up a device-only Mamba state before its device
+    /// slot is dropped even when the node's Full KV already has a host copy.
+    pub keep_backed_mamba_states: bool,
+    /// Rank nodes marked by `mark_host_evict_first` ahead of every other
+    /// host-eviction candidate (Full host leaves and the Mamba host LRU).
+    pub host_evict_first: bool,
+}
+
+/// Cumulative counts of the residency switches' decisions, for engagement logs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CacheResidencyStats {
+    /// Internal Mamba states on backed-up nodes sent to the controller for a
+    /// host backup instead of a device tombstone.
+    pub backed_node_state_backups: u64,
+    /// Device leaves with Full KV on host whose Mamba state needed a host copy
+    /// before the demote.
+    pub state_backups_before_demote: u64,
+    /// Nodes newly marked host evict-first.
+    pub host_evict_first_marked: u64,
+    /// Full host tokens evicted from nodes still marked evict-first.
+    pub host_evict_first_full_tokens: u64,
+    /// Mamba host states evicted from nodes still marked evict-first.
+    pub host_evict_first_mamba_states: u64,
 }
 
 /// Radix tree of cached token prefixes; each node carries its KV per component.
@@ -620,6 +660,7 @@ pub struct UnifiedTreeCore<K: ChildKeyType> {
     /// Full has no device LRU; track host/device duplicates in insertion order.
     pub(crate) full_coexisting_host_nodes: NodeSet,
     pub(crate) write_back_coexist_reclaim_digest: i64,
+    write_back_queued_count: usize,
     /// Present only during a device-eviction step, including its cascades.
     tracked_unbacked_tokens: Option<usize>,
     /// Per-slot LRU lists, indexed by `ValueSlotIdx::idx`.
@@ -664,6 +705,10 @@ pub struct UnifiedTreeCore<K: ChildKeyType> {
     pub(crate) empty_device_indices: Tensor,
     /// The single in-flight resumable insert, if suspended at a barrier.
     ongoing_insert_walk_state: Option<InsertWalkState<K>>,
+    /// Controller-set residency switches; survive `reset()`.
+    pub(crate) residency: CacheResidencyOptions,
+    /// Cumulative residency counters; survive `reset()`.
+    pub(crate) residency_stats: CacheResidencyStats,
 }
 
 impl<K: ChildKeyType> UnifiedTreeCore<K> {
@@ -997,6 +1042,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             evictable_host_leaves: NodeSet::new(),
             full_coexisting_host_nodes: NodeSet::new(),
             write_back_coexist_reclaim_digest: 0,
+            write_back_queued_count: 0,
             tracked_unbacked_tokens: None,
             // Disabled components keep harmless empty lists, like component_states.
             lru_lists: Self::new_lru_lists(),
@@ -1024,6 +1070,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             device: params.device,
             empty_device_indices: Tensor::empty([0], (Kind::Int64, params.device)),
             ongoing_insert_walk_state: None,
+            residency: CacheResidencyOptions::default(),
+            residency_stats: CacheResidencyStats::default(),
         };
         for component in components {
             tree_core.register_component_(component);
@@ -1040,6 +1088,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         self.evictable_host_leaves = NodeSet::new();
         self.full_coexisting_host_nodes = NodeSet::new();
         self.write_back_coexist_reclaim_digest = 0;
+        self.write_back_queued_count = 0;
         self.tracked_unbacked_tokens = None;
         self.lru_lists = Self::new_lru_lists();
         self.full_evict_device_heap.clear();
@@ -1600,6 +1649,58 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         )
     }
 
+    fn device_prefix_covered_by_match_(
+        &self,
+        best_match_node_id: NodeIdx_,
+    ) -> Option<(NodeIdx_, usize)> {
+        let host_only = self
+            .components
+            .iter()
+            .any(|component| component.host_only_checkpoint_counts_as_device());
+        if !self.enable_hicache || !host_only || self.arena.node(best_match_node_id).is_root() {
+            return None;
+        }
+        let mut path = Vec::new();
+        let mut cur = best_match_node_id;
+        loop {
+            let node = self.arena.node(cur);
+            if node.is_root() {
+                break;
+            }
+            path.push(cur);
+            cur = node.parent();
+        }
+        path.reverse();
+
+        let mut validators = Vec::new();
+        for i in 0..self.components.len() {
+            if self.components[i].component_type() == MAMBA {
+                continue;
+            }
+            let component = Arc::clone(&self.components[i]);
+            validators.push(component.create_match_validator(self, /* match_device_only = */ true));
+        }
+
+        let mut device_node = self.arena.root();
+        let mut device_len = 0usize;
+        let mut running_len = 0usize;
+        for id in path {
+            let node = self.arena.node(id);
+            if node.evicted() || !node.has_device_value(FULL) {
+                break;
+            }
+            running_len += node.device_value_len(FULL);
+            let ok = validators
+                .iter_mut()
+                .fold(true, |acc, validator| validator(self, id) && acc);
+            if ok {
+                device_node = id;
+                device_len = running_len;
+            }
+        }
+        Some((device_node, device_len))
+    }
+
     /// Assemble the MatchResult from the walk outputs.
     pub fn match_post_processor_(
         &mut self,
@@ -1646,10 +1747,19 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             best_match_device_node_id
         };
 
-        let device_prefix_len = value[..best_match_device_value_len]
+        let walk_device_prefix_len = value[..best_match_device_value_len]
             .iter()
             .map(|chunk| chunk.size()[0] as usize)
             .sum();
+        // The mamba state at best_match covers the whole prefix ending there.
+        // GPU Full pages in front of that checkpoint are device hits even when
+        // those nodes do not hold their own mamba value. The anchor still stops
+        // at the first evicted page, so backed-up pages stay a host hit.
+        let (best_match_device_node_id, device_prefix_len) =
+            match self.device_prefix_covered_by_match_(best_match_node_id) {
+                Some((node_id, len)) if len > walk_device_prefix_len => (node_id, len),
+                _ => (best_match_device_node_id, walk_device_prefix_len),
+            };
         let mut result = MatchResult {
             device_prefix_len,
             last_device_node_id: self.arena.node(best_match_device_node_id).id,
@@ -1883,6 +1993,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             swa_evicted_seqlen: params.swa_evicted_seqlen,
             swa_branching_seqlen: params.swa_branching_seqlen,
             mamba_value: params.mamba_value.as_ref().map(Tensor::shallow_clone),
+            mamba_host_value: params.mamba_host_value.as_ref().map(Tensor::shallow_clone),
+            allow_missing_mamba: params.allow_missing_mamba,
             inserted_len: params.inserted_len,
             priority: params.priority,
             track_adopted_ranges: params.track_adopted_ranges,
@@ -2049,6 +2161,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             swa_evicted_seqlen: state.swa_evicted_seqlen,
             swa_branching_seqlen: state.swa_branching_seqlen,
             mamba_value: state.mamba_value.as_ref().map(Tensor::shallow_clone),
+            mamba_host_value: state.mamba_host_value.as_ref().map(Tensor::shallow_clone),
+            allow_missing_mamba: state.allow_missing_mamba,
             inserted_len: state.inserted_len,
             priority: state.priority,
             track_adopted_ranges: state.track_adopted_ranges,
@@ -2105,6 +2219,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             swa_evicted_seqlen: state.swa_evicted_seqlen,
             swa_branching_seqlen: state.swa_branching_seqlen,
             mamba_value: state.mamba_value.as_ref().map(Tensor::shallow_clone),
+            mamba_host_value: state.mamba_host_value.as_ref().map(Tensor::shallow_clone),
+            allow_missing_mamba: state.allow_missing_mamba,
             inserted_len: state.inserted_len,
             priority: state.priority,
             track_adopted_ranges: state.track_adopted_ranges,
@@ -2241,6 +2357,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             swa_evicted_seqlen: state.swa_evicted_seqlen,
             swa_branching_seqlen: state.swa_branching_seqlen,
             mamba_value: state.mamba_value.as_ref().map(Tensor::shallow_clone),
+            mamba_host_value: state.mamba_host_value.as_ref().map(Tensor::shallow_clone),
+            allow_missing_mamba: state.allow_missing_mamba,
             inserted_len: state.inserted_len,
             priority: state.priority,
             track_adopted_ranges: state.track_adopted_ranges,
@@ -2568,8 +2686,15 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         !node.is_root()
             && node.has_device_value(FULL)
             && node.has_host_value(FULL)
-            && node.write_through_pending_id.is_none()
+            && self.is_full_host_value_settled_(node)
             && !node.is_load_back_pending()
+    }
+
+    /// No in-flight copy writes the node's Full host value (a queued SWA
+    /// window backup marks ancestors but writes only their SWA slots).
+    fn is_full_host_value_settled_(&self, node: &Node<K>) -> bool {
+        !node.write_back_queued
+            && (node.write_through_pending_id.is_none() || self.is_round_write_pending_(node))
     }
 
     /// Apply lru_op to each aux component's LRU that has data on this node.
@@ -2808,8 +2933,164 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
 
     /// Finish a component's device-eviction walk.
     pub fn evict_device_end(&mut self, component_type: ComponentType) {
+        assert_eq!(
+            self.write_back_queued_count, 0,
+            "a device-eviction walk ended with queued write-back victims not demoted"
+        );
         self.component_by_type_(component_type)
             .evict_device_end(self);
+    }
+
+    /// See `UnifiedTreeCoreInterface.mark_write_back_queued`.
+    pub fn mark_write_back_queued(
+        &mut self,
+        node_id: NodeId,
+        copied: Vec<NodeId>,
+    ) -> Result<usize, NodeAccessError> {
+        let node_idx = self.arena.resolve(node_id)?;
+        let copied = copied
+            .into_iter()
+            .map(|copied_id| self.arena.resolve(copied_id))
+            .collect::<Result<Vec<_>, _>>()?;
+        let node = self.arena.node_mut(node_idx);
+        assert!(
+            !node.write_back_queued && node.has_device_value(FULL),
+            "node {node_id} is not a device-resident victim to queue"
+        );
+        node.write_back_queued = true;
+        self.write_back_queued_count += 1;
+        let device_len = node.device_reclaimable_value_len(FULL);
+        if !copied.is_empty() {
+            for covered in copied.into_iter().filter(|&covered| covered != node_idx) {
+                self.update_full_coexisting_host_tracking_(covered);
+            }
+            self.full_coexisting_host_nodes.add(node_idx);
+        }
+        Ok(device_len)
+    }
+
+    // ==== Cache-residency switches ====
+
+    /// Set the residency switches; see `CacheResidencyOptions`.
+    pub fn configure_cache_residency(&mut self, options: CacheResidencyOptions) {
+        self.residency = options;
+    }
+
+    pub fn cache_residency_options(&self) -> CacheResidencyOptions {
+        self.residency
+    }
+
+    pub fn cache_residency_stats(&self) -> CacheResidencyStats {
+        self.residency_stats
+    }
+
+    /// Whether a backed-up device leaf still holds its only copy of a Mamba
+    /// state, which its demote would drop; the controller copies it first.
+    pub fn needs_state_backup_before_demote(
+        &mut self,
+        node_id: NodeId,
+    ) -> Result<bool, NodeAccessError> {
+        let node_idx = self.arena.resolve(node_id)?;
+        if !(self.residency.keep_backed_mamba_states && self.enable_hicache && self.is_write_back) {
+            return Ok(false);
+        }
+        let Some(state) = self.slot_of_family(Family::State) else {
+            return Ok(false);
+        };
+        let node = self.arena.node(node_idx);
+        let needs = !node.is_root()
+            && !node.evicted()
+            && node.backuped()
+            && node.has_device_value(state)
+            && !node.has_host_value(state);
+        if needs {
+            self.residency_stats.state_backups_before_demote += 1;
+        }
+        Ok(needs)
+    }
+
+    /// The mark holds until the node's next access re-stamps its tick.
+    pub(crate) fn is_host_evict_first_(&self, node: &Node<K>) -> bool {
+        self.residency.host_evict_first
+            && node.host_evict_first_at == Some(node.last_access_counter)
+    }
+
+    /// Host-eviction rank: marked nodes before every unmarked one.
+    pub(crate) fn host_eviction_priority_(&self, node: &Node<K>) -> PriorityKey {
+        if self.is_host_evict_first_(node) {
+            PriorityKey(i64::MIN, node.last_access_counter)
+        } else {
+            self.eviction_strategy.get_priority(node)
+        }
+    }
+
+    /// Move a marked node's host-only Mamba state to its host LRU's eviction end.
+    pub(crate) fn place_host_evict_first_state_(&mut self, node_id: NodeIdx_) {
+        if !self.is_host_evict_first_(self.arena.node(node_id)) {
+            return;
+        }
+        let Some(state) = self.slot_of_family(Family::State) else {
+            return;
+        };
+        let lru = self.host_lru_list_mut(state);
+        if lru.in_list(Some(node_id)) {
+            lru.move_to_lru(node_id);
+        }
+    }
+
+    /// Mark finished nodes host evict-first: each given node, then each
+    /// ancestor whose children are all marked, stopping at a locked node or the
+    /// root; a node with an unmarked child is left alone. Stale ids are skipped.
+    /// Only the host-eviction order changes: nothing is freed here, and a device
+    /// node is still written back before its demote. Returns the nodes newly marked.
+    pub fn mark_host_evict_first(&mut self, node_ids: Vec<NodeId>) -> usize {
+        if !self.residency.host_evict_first {
+            return 0;
+        }
+        let mut marked = 0;
+        for node_id in node_ids {
+            let Ok(mut cur) = self.arena.resolve(node_id) else {
+                continue;
+            };
+            loop {
+                let node = self.arena.node(cur);
+                if node.is_root() || node.is_device_locked() || node.is_host_locked() {
+                    break;
+                }
+                if !node
+                    .children
+                    .values()
+                    .all(|&child| self.is_host_evict_first_(self.arena.node(child)))
+                {
+                    break;
+                }
+                if !self.is_host_evict_first_(node) {
+                    let tick = node.last_access_counter;
+                    self.arena.node_mut(cur).host_evict_first_at = Some(tick);
+                    self.place_host_evict_first_state_(cur);
+                    marked += 1;
+                }
+                cur = self.arena.node(cur).parent();
+            }
+        }
+        self.residency_stats.host_evict_first_marked += marked as u64;
+        marked
+    }
+
+    pub(crate) fn note_backed_node_state_backup_(&mut self) {
+        self.residency_stats.backed_node_state_backups += 1;
+    }
+
+    pub(crate) fn note_host_evict_first_eviction_(
+        &mut self,
+        component_type: ComponentType,
+        amount: usize,
+    ) {
+        if component_type == FULL {
+            self.residency_stats.host_evict_first_full_tokens += amount as u64;
+        } else {
+            self.residency_stats.host_evict_first_mamba_states += amount as u64;
+        }
     }
 
     /// Evict one device leaf (demote if backuped, delete if write-through);
@@ -2825,8 +3106,19 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         {
             let node = self.arena.node(node_id);
             assert!(
-                self.is_evictable_device_leaf_(node),
+                self.is_evictable_device_leaf_(node)
+                    || self.is_evictable_after_queued_children_(node),
                 "node {node_id} is not a D-leaf"
+            );
+            // Only the running walk's own copies may be in flight; a covered
+            // node joins with a copy of its own, since demoting it would free
+            // slots the pending copy reads.
+            assert!(
+                node.write_through_pending_id.is_none()
+                    || (self.is_round_write_pending_(node) && !node.backuped()),
+                "D-leaf {} has write {:?} in flight",
+                node.id,
+                node.write_through_pending_id
             );
         }
         assert!(self.tracked_unbacked_tokens.is_none());
@@ -3046,7 +3338,11 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         !node.is_root()
             && node.has_device_value(component_type)
             && node.has_host_value(component_type)
-            && node.write_through_pending_id.is_none()
+            && if component_type == FULL {
+                self.is_full_host_value_settled_(node)
+            } else {
+                node.write_through_pending_id.is_none()
+            }
             && !node.is_load_back_pending()
             && node.host_lock_ref(component_type) == 0
     }
@@ -3168,6 +3464,16 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         {
             let node = self.arena.node(node_id);
             assert!(!node.evicted() && node.backuped());
+            assert!(
+                node.write_through_pending_id.is_none(),
+                "demoting node {} while write {:?} still reads its device slots",
+                node.id,
+                node.write_through_pending_id
+            );
+        }
+        if self.arena.node(node_id).write_back_queued {
+            self.arena.node_mut(node_id).write_back_queued = false;
+            self.write_back_queued_count -= 1;
         }
         self.evict_component_and_detach_lru_(
             node_id,
@@ -3319,6 +3625,10 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
 
     /// Unlink a leaf from its parent.
     pub fn remove_leaf_from_parent_(&mut self, node_id: NodeIdx_) {
+        assert!(
+            !self.arena.node(node_id).write_back_queued,
+            "deleting node {node_id} while it is queued for a write-back demote"
+        );
         let node_handle = self.arena.node(node_id).id;
         // Arena slots are reused, so discard tracking before freeing the node.
         self.full_coexisting_host_nodes.discard(node_id);
@@ -3481,6 +3791,44 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             return false;
         }
         true
+    }
+
+    /// The node's pending write belongs to the running walk's batch.
+    pub(crate) fn is_round_write_pending_(&self, node: &Node<K>) -> bool {
+        node.write_through_pending_id.is_some_and(|ack_id| {
+            self.arena
+                .resolve(ack_id)
+                .is_ok_and(|ack_idx| self.arena.node(ack_idx).write_back_queued)
+        })
+    }
+
+    /// D-leaf once the queued victims below it are demoted.
+    pub(crate) fn is_evictable_after_queued_children_(&self, node: &Node<K>) -> bool {
+        if node.is_root()
+            || node.evicted()
+            || node.is_device_locked()
+            || node.is_load_back_pending()
+            || node.write_back_queued
+            || (node.write_through_pending_id.is_some() && !self.is_round_write_pending_(node))
+        {
+            return false;
+        }
+        node.children.values().all(|&child_id| {
+            let child = self.arena.node(child_id);
+            !child.has_device_value(FULL) || child.write_back_queued
+        })
+    }
+
+    /// The Full device walk may take the node: an unqueued D-leaf, or under
+    /// write_back a parent whose device children are all queued. The walk's
+    /// heap may hold a node freed since it was pushed.
+    pub(crate) fn is_device_walk_candidate_(&self, node_id: NodeIdx_) -> bool {
+        if self.evictable_device_leaves.contains(node_id) {
+            return !self.arena.node(node_id).write_back_queued;
+        }
+        self.is_write_back
+            && self.arena.is_allocated(node_id)
+            && self.is_evictable_after_queued_children_(self.arena.node(node_id))
     }
 
     /// Whether the node is an evictable Full host leaf.
@@ -4651,14 +4999,17 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         let mut marked: Vec<(usize, NodeId)> = Vec::with_capacity(node_indices.len());
         for (node_id, node_idx) in node_indices {
             let depth = self.depth_from_root_(node_idx);
-            let node = self.arena.node_mut(node_idx);
-            assert!(
-                node.write_through_pending_id.is_none()
-                    || node.write_through_pending_id == Some(ack_id),
-                "node {} is already pending under a different write-through ack",
-                node.id
-            );
-            node.write_through_pending_id = Some(ack_id);
+            let node = self.arena.node(node_idx);
+            match node.write_through_pending_id {
+                None => self.arena.node_mut(node_idx).write_through_pending_id = Some(ack_id),
+                Some(pending_id) if pending_id == ack_id => {}
+                // An earlier copy in the same batch covers the node.
+                Some(_) => assert!(
+                    self.is_round_write_pending_(node),
+                    "node {} is already pending under a different write-through ack",
+                    node.id
+                ),
+            }
             marked.push((depth, node_id));
         }
         marked.sort_unstable();
@@ -4783,13 +5134,28 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             .into_iter()
             .map(|node_id| self.arena.resolve(node_id))
             .collect::<Result<Vec<_>, _>>()?;
+        // mark_write_back_queued already registered a batch's copies.
+        let queued_copy = self
+            .arena
+            .resolve(ack_id)
+            .is_ok_and(|ack_idx| self.arena.node(ack_idx).write_back_queued);
         for node_idx in node_indices {
             let node = self.arena.node_mut(node_idx);
             if node.write_through_pending_id == Some(ack_id) {
                 node.write_through_pending_id = None;
-                self.update_full_coexisting_host_tracking_(node_idx);
+                if !queued_copy {
+                    self.update_full_coexisting_host_tracking_(node_idx);
+                }
             }
-            self.record_store_event_(node_idx, StorageMedium::Cpu, /* session_id = */ None);
+            // A queued SWA backup can cover an ancestor whose settled Full
+            // host copy was reclaimed before this ack. Do not republish it.
+            if self.arena.node(node_idx).has_host_value(FULL) {
+                self.record_store_event_(
+                    node_idx,
+                    StorageMedium::Cpu,
+                    /* session_id = */ None,
+                );
+            }
         }
         Ok(())
     }
@@ -5231,7 +5597,11 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                     ));
                 }
                 // Auxiliary host data may outlive Full host data under write-back.
-                if node.has_host_value(ct) && !full_hst && !(self.is_write_back && full_dev) {
+                // Host-only mamba keeps Full on device and the checkpoint on host.
+                let host_only_ok =
+                    full_dev && self.components[i].host_only_checkpoint_counts_as_device();
+                let excused = host_only_ok || (self.is_write_back && full_dev);
+                if node.has_host_value(ct) && !full_hst && !excused {
                     errors.push(format!(
                         "node {node_id} {ct:?} host present but Full.host_value=None"
                     ));
