@@ -3,12 +3,14 @@
 import unittest
 from array import array
 from contextlib import ExitStack
+from copy import deepcopy
 from types import SimpleNamespace as NS
 from unittest.mock import Mock, patch
 
 import torch
 
 from sglang.srt.managers.schedule_batch import ReqKvInfo
+from sglang.srt.mem_cache import allocation
 from sglang.srt.mem_cache import gdn_kv_reuse as reuse
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -69,6 +71,7 @@ class TestGdnKVReuse(CustomTestCase):
             rid="test",
         )
         self.batch = NS(
+            device="cpu",
             tree_cache=self.cache,
             reqs=[self.req],
             enable_overlap=False,
@@ -79,6 +82,7 @@ class TestGdnKVReuse(CustomTestCase):
             ),
             spec_algorithm=NS(is_none=lambda: True),
             full_kv_replay=False,
+            full_kv_fresh_token_indices=None,
         )
 
     def assert_fallback(self):
@@ -89,7 +93,7 @@ class TestGdnKVReuse(CustomTestCase):
         self.cache.tree_core.inc_full_pin.assert_not_called()
 
     def test_borrows_only_current_chunk_and_preserves_compute_prefix(self):
-        out = reuse.try_borrow_full_kv(self.batch)
+        out = reuse.try_borrow_full_kv(self.batch)[0]
         self.assertTrue(torch.equal(out, self.indices[4096:8192]))
         self.assertEqual(
             out.untyped_storage().data_ptr(), self.indices.untyped_storage().data_ptr()
@@ -147,9 +151,158 @@ class TestGdnKVReuse(CustomTestCase):
         self.req.mamba_branching_seqlen = 8448
         self.assert_fallback()
 
-    def test_multi_request_batch_falls_back(self):
-        self.batch.reqs.append(self.req)
-        self.assert_fallback()
+    def test_eight_requests_share_cached_slots_with_independent_pins(self):
+        self.batch.reqs = [deepcopy(self.req) for _ in range(8)]
+        borrowed = reuse.try_borrow_full_kv(self.batch)
+        self.assertEqual(len(borrowed), 8)
+        for req, indices in zip(self.batch.reqs, borrowed):
+            self.assertTrue(torch.equal(indices, self.indices[4096:8192]))
+            self.assertEqual(req.prefix_len, 4096)
+            self.assertEqual(req.kv.cache_protected_len, 8192)
+            reuse.release_full_kv_pin(self.cache, req)
+            reuse.release_full_kv_pin(self.cache, req)
+        self.assertEqual(self.cache.tree_core.inc_full_pin.call_count, 8)
+        self.assertEqual(self.cache.tree_core.dec_full_pin.call_count, 8)
+        self.assertIsNone(self.batch.full_kv_fresh_token_indices)
+
+    def test_mixed_batch_selects_only_fresh_tokens_in_request_order(self):
+        fresh = deepcopy(self.req)
+        fresh.extend_end = 4352
+        fresh.mamba_branching_seqlen = 4352
+        fresh.skip_radix_cache_insert = True
+        other = deepcopy(self.req)
+        self.batch.reqs = [fresh, self.req, other]
+        borrowed = reuse.try_borrow_full_kv(self.batch)
+        self.assertIsNone(borrowed[0])
+        self.assertEqual(fresh.kv.cache_protected_len, 4096)
+        self.assertIsNone(fresh.full_kv_replay_node)
+        self.assertTrue(
+            torch.equal(self.batch.full_kv_fresh_token_indices, torch.arange(256))
+        )
+        self.assertTrue(self.batch.full_kv_replay)
+        self.assertEqual(self.cache.tree_core.inc_full_pin.call_count, 2)
+
+    def test_failed_later_request_rolls_back_earlier_borrow(self):
+        second = deepcopy(self.req)
+        self.batch.reqs.append(second)
+        self.cache.path_device_indices.side_effect = [
+            self.indices,
+            RuntimeError("failed collection"),
+        ]
+        with self.assertRaisesRegex(RuntimeError, "failed collection"):
+            reuse.try_borrow_full_kv(self.batch)
+        for req in self.batch.reqs:
+            self.assertEqual(req.kv.cache_protected_len, 4096)
+            self.assertIsNone(req.full_kv_replay_node)
+        self.assertEqual(self.cache.tree_core.inc_full_pin.call_count, 2)
+        self.assertEqual(self.cache.tree_core.dec_full_pin.call_count, 2)
+        self.assertFalse(self.batch.full_kv_replay)
+
+    def test_mixed_allocation_only_allocates_fresh_request_slots(self):
+        fresh = deepcopy(self.req)
+        fresh.extend_end = 4608
+        fresh.skip_radix_cache_insert = True
+        self.batch.reqs = [self.req, fresh]
+        self.batch.seq_lens_cpu = torch.tensor([8192, 4608])
+        self.batch.req_to_token_pool = NS(req_to_token=torch.empty((2, 8192)))
+        borrowed = reuse.try_borrow_full_kv(self.batch)
+        fresh_slots = torch.arange(20000, 20512)
+        with patch.object(
+            allocation, "alloc_paged_token_slots_extend", return_value=fresh_slots
+        ) as allocate:
+            loc = allocation._alloc_extend_loc_with_kv_reuse(
+                self.batch,
+                [True, False],
+                [self.indices[:4096], self.indices[:4096]],
+                torch.tensor([0, 1]),
+                torch.tensor([4096, 4096]),
+                torch.tensor([4096, 512]),
+                torch.tensor([0, 1]),
+                256,
+                borrowed_kv=borrowed,
+            )
+        self.assertTrue(torch.equal(loc[:4096], self.indices[4096:8192]))
+        self.assertTrue(torch.equal(loc[4096:], fresh_slots))
+        self.assertEqual(allocate.call_args.kwargs["extend_num_tokens"], 512)
+        self.assertEqual(
+            allocate.call_args.kwargs["seq_lens_cpu"].tolist(), [4096, 4608]
+        )
+        self.assertEqual(self.req.kv.cache_protected_len, 8192)
+        self.assertEqual(fresh.kv.cache_protected_len, 4096)
+
+    def _check_allocation_failure(self, stage):
+        fresh = deepcopy(self.req)
+        fresh.extend_end = 4352
+        fresh.skip_radix_cache_insert = True
+        self.batch.reqs.append(fresh)
+        self.batch.maybe_evict_swa = Mock()
+        self.batch.is_dllm = lambda: False
+        self.batch.hisparse_coordinator = None
+        self.batch.token_to_kv_pool_allocator = NS(state=None)
+        self.batch.prefix_lens = [4096, 4096]
+        self.batch.extend_lens = [4096, 256]
+        self.batch.seq_lens = self.batch.seq_lens_cpu = torch.tensor([8192, 4352])
+        self.batch.req_to_token_pool = Mock()
+        fresh_slots = torch.arange(20000, 20256)
+        all_slots = torch.cat([self.indices[4096:8192], fresh_slots])
+        storage = Mock()
+        error = RuntimeError("allocation failed")
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch.object(allocation, "kv_storage_of", return_value=storage)
+            )
+            stack.enter_context(
+                patch.object(
+                    allocation, "_prefix_kv_indices", return_value=self.indices[:4096]
+                )
+            )
+            stack.enter_context(
+                patch.object(allocation, "alloc_req_slots", return_value=[0, 1])
+            )
+            stack.enter_context(
+                patch.object(allocation, "_alloc_page_size", return_value=256)
+            )
+            stack.enter_context(
+                patch.object(allocation, "is_cp_sharded_padded", return_value=False)
+            )
+            allocate = stack.enter_context(
+                patch.object(
+                    allocation,
+                    "_alloc_extend_loc_with_kv_reuse",
+                    return_value=all_slots,
+                )
+            )
+            write = stack.enter_context(patch.object(allocation, "write_cache_indices"))
+            if stage == "slots":
+                allocate.side_effect = error
+            elif stage == "write":
+                write.side_effect = error
+            else:
+                self.batch.req_to_token_pool.alloc_aux_to_lengths.side_effect = error
+            with self.assertRaisesRegex(RuntimeError, "allocation failed"):
+                allocation.alloc_for_extend(self.batch)
+        if stage == "slots":
+            storage.free_tokens.assert_not_called()
+        else:
+            storage.free_tokens.assert_called_once()
+            self.assertTrue(
+                torch.equal(storage.free_tokens.call_args.args[0], fresh_slots)
+            )
+        for req in self.batch.reqs:
+            self.assertEqual(req.kv.cache_protected_len, 4096)
+            self.assertIsNone(req.full_kv_replay_node)
+        self.cache.tree_core.dec_full_pin.assert_called_once_with(17)
+        self.assertFalse(self.batch.full_kv_replay)
+        self.assertIsNone(self.batch.full_kv_fresh_token_indices)
+
+    def test_fresh_allocation_failure_releases_borrowed_pins(self):
+        self._check_allocation_failure("slots")
+
+    def test_request_table_failure_frees_only_fresh_slots(self):
+        self._check_allocation_failure("write")
+
+    def test_auxiliary_allocation_failure_frees_only_fresh_slots(self):
+        self._check_allocation_failure("aux")
 
     def test_unaligned_chunk_falls_back(self):
         self.req.extend_end = 8191

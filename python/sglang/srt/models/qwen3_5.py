@@ -1656,7 +1656,32 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 ),
             )
             gate = gate.view(q_gate.shape[0], -1)
-            attn_output = self.attn(q, None, None, forward_batch, save_kv_cache=False)
+            fresh = forward_batch.full_kv_fresh_token_indices
+            k = v = None
+            if fresh is not None:
+                kv = torch.nn.functional.linear(
+                    hidden_states.index_select(0, fresh),
+                    self.qkv_proj.weight[2 * self.q_size :],
+                )
+                k, v = kv.split(self.kv_size, dim=-1)
+                _, k, _ = fused_qk_gemma_rmsnorm_rope_gate(
+                    k.new_empty((k.shape[0], 0)),
+                    k,
+                    self.q_norm.weight.data,
+                    self.k_norm.weight.data,
+                    self.rotary_emb.cos_sin_cache,
+                    positions.index_select(-1, fresh),
+                    self.q_norm.variance_epsilon,
+                    0,
+                    self.num_kv_heads,
+                    self.head_dim,
+                    self.rotary_emb.rotary_dim,
+                    has_gate=False,
+                    mrope_axis_map=(
+                        self.rotary_emb.axis_map if positions.dim() == 2 else None
+                    ),
+                )
+            attn_output = self.attn(q, k, v, forward_batch, save_kv_cache=k is not None)
         else:
             q, k, v, gate = self._prepare_qkv_gate(
                 positions=positions,

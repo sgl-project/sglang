@@ -88,9 +88,10 @@ on 128/512-token prompts with eight greedy output tokens: token IDs matched,
 with maximum selected-token logprob differences below 8e-5. This is not full
 vocabulary or internal-state equality.
 
-## Results
+## Recorded single-request results
 
-The current-fork comparison and per-block samples are recorded in `results.json`.
+The single-request snapshot at `b5f213ae3` and its per-block samples are recorded
+in `results.json`.
 The PR description reports the three models on this common source base. Treat
 sub-percent differences cautiously when between-block variation is comparable to
 the measured saving. No Nsight trace or kernel-level attribution is claimed.
@@ -114,3 +115,107 @@ Qwen gains remain below 1%; the per-block samples in `results.json` expose the
 variation rather than establishing a universal speedup. Olmo is experimental
 adapter coverage; its absolute performance and fusion level differ from native
 Qwen implementations.
+
+## Multiple requests and eight-concurrent benchmark
+
+Replay eligibility is checked per request. A batch can contain both reusable
+chunks and ordinary chunks: reused requests borrow and pin their cached Full KV,
+while other requests allocate fresh slots. Q and any attention gate are computed
+for all tokens; K/V are computed and written only for ordinary chunks. The
+single-request restrictions above still apply to each reusable chunk, including
+alignment and the requirement that the entire chunk is cached. Overlap,
+prefill graphs, quantization, and TP/PP greater than one remain unsupported.
+
+Start a server with enough KV capacity for eight distinct cached continuations:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 MAX_RUNNING_REQUESTS=8 MAX_TOTAL_TOKENS=98304 \
+  MAMBA_SSM_DTYPE=float32 MEM_FRACTION_STATIC=0.9 \
+  bash benchmark/gdn_kv_reuse/launch_server.sh /path/to/Qwen3.5-4B 0 30000
+```
+
+Run eight server requests together through the batched generation API:
+
+```bash
+python benchmark/gdn_kv_reuse/bench_concurrent.py \
+  --model-path /path/to/Qwen3.5-4B --output-dir base-eight-correctness \
+  --new-tokens 32
+python benchmark/gdn_kv_reuse/bench_concurrent.py \
+  --model-path /path/to/Qwen3.5-4B --output-dir base-eight-warmup \
+  --new-tokens 1 --repeats 2 --rid-prefix warmup-
+python benchmark/gdn_kv_reuse/bench_concurrent.py \
+  --model-path /path/to/Qwen3.5-4B --output-dir base-eight-timing \
+  --new-tokens 1 --repeats 9 --rid-prefix timing-
+```
+
+The eight seeds share their first 4096 tokens and diverge at the next token.
+Each target has its own continuation with `C=4096`, `H=8192`, and `D=4096`,
+so completing one target cannot warm another's GDN replay path. A round flushes
+and seeds the cache before submitting its eight targets; preparation is excluded
+from `wave_ms`. This is a repeated burst test, not steady-state serving under a
+continuous stream of arrivals. `wave_ms` measures the client time to complete
+all eight requests. Request throughput is eight divided by mean wave time.
+
+Keep chunk size 4096. This is the scheduler's aggregate prefill token budget,
+so eight concurrent long requests do not form one eight-request replay batch.
+Scheduling can split the replay into smaller chunks and mix a cached chunk with
+another request's uncached tail. Such mixed batches are supported, while an
+individual chunk containing both cached and uncached tokens still falls back.
+Record `GDN_KV_REUSE_BATCH` and per-request `GDN_KV_REUSE` logs to check actual
+batch sizes and reuse coverage.
+
+Two additional checks fit eight requests into that same 4096-token budget:
+
+```bash
+python benchmark/gdn_kv_reuse/bench_concurrent.py \
+  --model-path /path/to/Qwen3.5-4B --output-dir eight-shared \
+  --small-batch-check all-reuse --new-tokens 32
+python benchmark/gdn_kv_reuse/bench_concurrent.py \
+  --model-path /path/to/Qwen3.5-4B --output-dir eight-mixed \
+  --small-batch-check mixed --new-tokens 32
+```
+
+These use `C=256`, `H=512`, and `D=256`. The first submits eight identical
+cached continuations to exercise shared slots and independent pins. The second
+mixes four such requests with four ordinary chunks containing a new suffix.
+Expected optimized logs include `size=8 reused=8 fresh_tokens=0` and
+`size=8 reused=4 fresh_tokens=1060`, respectively. These checks validate the
+multi-request path; their latency is not part of the long-replay timing table.
+
+Repeat on the same GPU with flag order **0/1/1/0** for all three models. Discard
+the first timing wave per block, retaining 16 waves (128 requests) per mode.
+Compare generated token IDs, and record logprob differences separately rather
+than assuming bitwise equality across different batch/chunk shapes.
+
+## Precision and correctness checks
+
+Use FP32 SSM state for the new concurrent checks. The historical single-request
+measurements explicitly used BF16 state; that setting rounds recurrent
+checkpoints and is not an oracle for exact equality across replay partitions.
+
+The Triton GDN path now preserves the FP32 accumulator when snapshotting an
+interior prefill checkpoint. Previously it restored that checkpoint through
+BF16 intermediate `h`, even with a FP32 state pool. The snapshot is now passed
+through the existing low-level kernel, with the same behavior in eager and
+captured prefill. The new `test_gdn_track_state.py` compares against an exact
+FP32 truncated-prefix reference and verifies unchanged outputs/final states.
+
+For a controlled Base/reuse equivalence check, prepend `BATCH_INVARIANT_MM=1`
+to **both** server launches, along with `MAMBA_SSM_DTYPE=float32`. This loads the
+explicit correctness-only `batch_invariant_mm` fixture, overriding only CUDA
+`aten::mm` with SGLang's existing fixed-order Triton matrix multiplication.
+Real cache matching, scheduling, KV borrowing, and attention remain enabled.
+The fixture also loads the Olmo registration when needed. It is outside the
+production path and must be disabled for ordinary latency measurements.
+
+Different GEMM shapes can round differently in the ordinary CUDA path; a close
+greedy decision can change despite mathematically equivalent operations.
+Record those differences rather than claiming default-path bitwise equality.
+The global `--enable-deterministic-inference` flag cannot serve as this oracle:
+it automatically disables radix caching with FlashInfer in this source base.
+
+Compare Base and reuse targets, and separately compare their warm controls.
+A cold-versus-warm comparison within either mode changes the cache partition
+and is an additional backend diagnostic, not an interchangeable Base/reuse
+comparison. Keep such differences visible; task-level accuracy, cancellation,
+OOM/eviction pressure, and Rust TreeCore validation remain separate work.

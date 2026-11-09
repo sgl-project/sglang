@@ -590,6 +590,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For extend
     full_kv_replay: bool = False
+    full_kv_fresh_token_indices: Optional[torch.Tensor] = None
     extend_num_tokens: Optional[int] = None
     extend_seq_lens: Optional[torch.Tensor] = None
     extend_prefix_lens: Optional[torch.Tensor] = None
@@ -1204,6 +1205,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 ret.extend_seq_lens = extend_seq_lens
                 ret.extend_prefix_lens = extend_prefix_lens
             ret.full_kv_replay = batch.full_kv_replay
+            ret.full_kv_fresh_token_indices = batch.full_kv_fresh_token_indices
             ret.extend_num_tokens = batch.extend_num_tokens
             if extend_position_info is None:
                 positions, ret.extend_start_loc = compute_position(

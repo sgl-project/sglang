@@ -33,7 +33,12 @@ class Attention(hf.OlmoHybridAttention):
     def forward(self, x, forward_batch):
         q = self.q_norm(self.q_proj(x))
         if forward_batch.full_kv_replay:
-            y = self.attn(q, None, None, forward_batch, save_kv_cache=False)
+            fresh = forward_batch.full_kv_fresh_token_indices
+            k = v = None
+            if fresh is not None:
+                fresh_x = x.index_select(0, fresh)
+                k, v = self.k_norm(self.k_proj(fresh_x)), self.v_proj(fresh_x)
+            y = self.attn(q, k, v, forward_batch, save_kv_cache=k is not None)
         else:
             k, v = self.k_norm(self.k_proj(x)), self.v_proj(x)
             y = self.attn(q, k, v, forward_batch)

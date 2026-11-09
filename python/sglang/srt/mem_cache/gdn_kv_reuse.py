@@ -1,4 +1,4 @@
-"""Borrow an entirely cached Full-Attention chunk while replaying GDN state."""
+"""Borrow cached Full-Attention chunks while replaying GDN state."""
 
 import logging
 
@@ -21,11 +21,10 @@ logger = logging.getLogger(__name__)
 
 
 def try_borrow_full_kv(batch):
-    """Return existing extend slots, or None without changing the request.
+    """Return per-request borrowed slots, or None if no request can reuse KV.
 
-    Admission still charges the ordinary extend budget. This first path only
-    handles a single, page/checkpoint-aligned, entirely cached prefill chunk.
-    In particular it never splits a chunk or lets a mixed batch write borrowed KV.
+    Admission still charges the ordinary extend budget. Each reusable request
+    must have a page/checkpoint-aligned, entirely cached prefill chunk.
     """
     if not envs.SGLANG_ENABLE_GDN_KV_REUSE.get():
         return None
@@ -55,7 +54,6 @@ def try_borrow_full_kv(batch):
         )
         or config.quantization is not None
         or config.dtype != torch.bfloat16
-        or len(batch.reqs) != 1
         or batch.enable_overlap
         or not batch.spec_algorithm.is_none()
         or get_schedule().enable_mixed_chunk
@@ -68,7 +66,43 @@ def try_borrow_full_kv(batch):
         or get_exec().graph.cuda_graph_backend_prefill != "disabled"
     ):
         return None
-    req = batch.reqs[0]
+    borrowed = []
+    try:
+        for req in batch.reqs:
+            borrowed.append(_try_borrow_request(cache, req))
+    except Exception:
+        for req, indices in zip(batch.reqs, borrowed):
+            if indices is not None:
+                req.kv.protect_prefix(req.prefix_len)
+                release_full_kv_pin(cache, req)
+        raise
+    if all(indices is None for indices in borrowed):
+        return None
+    batch.full_kv_replay = True
+    # Compact K/V are produced only for fresh tokens in a mixed batch. The
+    # backend uses these same token indices to select physical write locations.
+    fresh_tokens = []
+    offset = 0
+    for req, indices in zip(batch.reqs, borrowed):
+        length = req.extend_end - req.prefix_len
+        if indices is None:
+            fresh_tokens.extend(range(offset, offset + length))
+        offset += length
+    batch.full_kv_fresh_token_indices = (
+        torch.tensor(fresh_tokens, dtype=torch.int64, device=batch.device)
+        if fresh_tokens
+        else None
+    )
+    logger.debug(
+        "GDN_KV_REUSE_BATCH size=%s reused=%s fresh_tokens=%s",
+        len(batch.reqs),
+        sum(indices is not None for indices in borrowed),
+        len(fresh_tokens),
+    )
+    return borrowed
+
+
+def _try_borrow_request(cache, req):
     start, end = req.prefix_len, req.extend_end
     grid = mamba_checkpoint_grid(cache.page_size)
     if (
@@ -108,7 +142,6 @@ def try_borrow_full_kv(batch):
         raise
     req.full_kv_replay_node = node
     req.kv.protect_prefix(end)
-    batch.full_kv_replay = True
     logger.debug(
         "GDN_KV_REUSE rid=%s C=%s H=%s tokens=%s", req.rid, start, end, end - start
     )

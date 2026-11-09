@@ -1576,13 +1576,22 @@ class FlashInferAttnBackend(AttentionBackend):
         if not self.forward_metadata.use_ragged:
             if k is not None and save_kv_cache:
                 assert v is not None
+                write_loc = KVWriteLoc.for_layer(
+                    forward_batch,
+                    layer,
+                    swa_loc=self.forward_metadata.swa_out_cache_loc,
+                )
+                if forward_batch.full_kv_replay:
+                    fresh = forward_batch.full_kv_fresh_token_indices
+                    assert fresh is not None
+                    # Compact K/V must never overwrite borrowed tree-owned slots.
+                    write_loc = KVWriteLoc(
+                        write_loc.loc.index_select(0, fresh),
+                        physical=write_loc.physical,
+                    )
                 self.kv_layers.layer(layer.layer_id).store(
                     layer,
-                    KVWriteLoc.for_layer(
-                        forward_batch,
-                        layer,
-                        swa_loc=self.forward_metadata.swa_out_cache_loc,
-                    ),
+                    write_loc,
                     k,
                     v,
                     *self._kv_write_scales(layer),

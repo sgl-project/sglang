@@ -2074,6 +2074,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # The sum of all sequence lengths
     seq_lens_sum: int = None
     full_kv_replay: bool = False
+    full_kv_fresh_token_indices: Optional[torch.Tensor] = None
     extend_num_tokens: Optional[int] = None
 
     # Diffusion LLM
@@ -2309,6 +2310,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def prepare_for_extend(self):
         self.full_kv_replay = False
+        self.full_kv_fresh_token_indices = None
         self.forward_mode = ForwardMode.EXTEND
 
         if self.is_dllm():

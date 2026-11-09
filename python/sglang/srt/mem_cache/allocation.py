@@ -395,7 +395,26 @@ def alloc_for_extend(
     alloc_page_size = _alloc_page_size(batch)
     replay_indices = try_borrow_full_kv(batch)
     if replay_indices is not None:
-        out_cache_loc = replay_indices
+        try:
+            out_cache_loc = _alloc_extend_loc_with_kv_reuse(
+                batch,
+                [indices is not None for indices in replay_indices],
+                prefix_tensors,
+                req_pool_indices_cpu,
+                prefix_lens_cpu,
+                extend_lens_cpu,
+                req_pool_indices_device,
+                alloc_page_size,
+                borrowed_kv=replay_indices,
+            )
+        except Exception:
+            for req, indices in zip(batch.reqs, replay_indices):
+                if indices is not None:
+                    req.kv.protect_prefix(req.prefix_len)
+                    release_full_kv_pin(batch.tree_cache, req)
+            batch.full_kv_replay = False
+            batch.full_kv_fresh_token_indices = None
+            raise
     elif reuse_kv is not None and any(reuse_kv):
         out_cache_loc = _alloc_extend_loc_with_kv_reuse(
             batch,
@@ -507,30 +526,34 @@ def alloc_for_extend(
                 )
             offset += local_count
         out_cache_loc = torch.cat(outputs) if outputs else out_cache_loc.new_empty((0,))
-    write_cache_indices(
-        out_cache_loc,
-        req_pool_indices_device,
-        req_pool_indices_cpu,
-        prefix_lens_device,
-        prefix_lens_cpu,
-        batch.seq_lens,
-        batch.seq_lens_cpu,
-        extend_lens_device,
-        extend_lens_cpu,
-        prefix_tensors,
-        batch.req_to_token_pool,
-    )
     try:
+        write_cache_indices(
+            out_cache_loc,
+            req_pool_indices_device,
+            req_pool_indices_cpu,
+            prefix_lens_device,
+            prefix_lens_cpu,
+            batch.seq_lens,
+            batch.seq_lens_cpu,
+            extend_lens_device,
+            extend_lens_cpu,
+            prefix_tensors,
+            batch.req_to_token_pool,
+        )
         batch.req_to_token_pool.alloc_aux_to_lengths(
             req_pool_indices_cpu=req_pool_indices_cpu,
             target_seq_lens_cpu=batch.seq_lens_cpu,
         )
     except Exception:
         if replay_indices is not None:
-            req = batch.reqs[0]
-            req.kv.protect_prefix(batch.prefix_lens[0])
-            release_full_kv_pin(batch.tree_cache, req)
+            if batch.full_kv_fresh_token_indices is not None:
+                storage.free_tokens(out_cache_loc[batch.full_kv_fresh_token_indices])
+            for req, indices in zip(batch.reqs, replay_indices):
+                if indices is not None:
+                    req.kv.protect_prefix(req.prefix_len)
+                    release_full_kv_pin(batch.tree_cache, req)
             batch.full_kv_replay = False
+            batch.full_kv_fresh_token_indices = None
         else:
             if is_cp_sharded_padded():
                 out_cache_loc = physical_out_cache_loc
@@ -562,12 +585,13 @@ def _alloc_extend_loc_with_kv_reuse(
     extend_lens_cpu: torch.Tensor,
     req_pool_indices_device: torch.Tensor,
     alloc_page_size: int,
+    borrowed_kv: Optional[list[Optional[torch.Tensor]]] = None,
 ) -> torch.Tensor:
     device = batch.device
     req_to_token = batch.req_to_token_pool.req_to_token
 
     for i, req in enumerate(batch.reqs):
-        if not reuse_kv[i]:
+        if not reuse_kv[i] or borrowed_kv is not None:
             continue
         prefix_len = int(prefix_lens_cpu[i])
         extend_len = int(extend_lens_cpu[i])
@@ -621,12 +645,15 @@ def _alloc_extend_loc_with_kv_reuse(
         prefix_len = int(prefix_lens_cpu[i])
         extend_len = int(extend_lens_cpu[i])
         if reuse_kv[i]:
-            req_idx = int(req_pool_indices_cpu[i])
-            parts.append(
-                req_to_token[req_idx, prefix_len : prefix_len + extend_len].to(
-                    reuse_dtype
+            if borrowed_kv is not None:
+                parts.append(borrowed_kv[i].to(reuse_dtype))
+            else:
+                req_idx = int(req_pool_indices_cpu[i])
+                parts.append(
+                    req_to_token[req_idx, prefix_len : prefix_len + extend_len].to(
+                        reuse_dtype
+                    )
                 )
-            )
         else:
             parts.append(fresh_slots[fresh_ptr : fresh_ptr + extend_len])
             fresh_ptr += extend_len
