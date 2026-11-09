@@ -1813,7 +1813,7 @@ class Envs:
     # mamba pool ratio accordingly. Frees one resident slot per running request,
     # raising max_running_requests. Off = original locking + ratio (escape hatch).
     SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK = EnvBool(False)
-    # Experimental BF16 Qwen3.5 replay-only chunks; unsupported modes fall back.
+    # Experimental BF16 hybrid replay-only chunks; unsupported modes fall back.
     SGLANG_ENABLE_GDN_KV_REUSE = EnvBool(False)
     # Opt-in: store radix mamba checkpoints only in the hicache host pool.
     # Matched prefixes and donated checkpoints then occupy no GPU mamba slot,

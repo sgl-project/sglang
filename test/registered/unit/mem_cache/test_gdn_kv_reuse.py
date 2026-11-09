@@ -124,6 +124,18 @@ class TestGdnKVReuse(unittest.TestCase):
         UnifiedRadixCache.on_release(self.cache, self.req, checkpointed=True)
         self.cache.tree_core.dec_full_pin.assert_called_once_with(17)
 
+    def test_experimental_olmo_adapter_can_borrow(self):
+        config = self.batch.model_config.hf_text_config
+        config.model_type = "olmo_hybrid"
+        config.attn_output_gate = False
+        config.sglang_olmo_hybrid_adapter = True
+        self.assertIsNotNone(reuse.try_borrow_full_kv(self.batch))
+        reuse.release_full_kv_pin(self.cache, self.req)
+
+    def test_unregistered_olmo_falls_back(self):
+        self.batch.model_config.hf_text_config.model_type = "olmo_hybrid"
+        self.assert_fallback()
+
     def test_partial_device_hit_falls_back(self):
         self.cache.tree_core.match_full_device_prefix.return_value = (7936, 17, 8192)
         self.assert_fallback()

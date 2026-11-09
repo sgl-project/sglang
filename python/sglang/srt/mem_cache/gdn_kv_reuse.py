@@ -43,8 +43,16 @@ def try_borrow_full_kv(batch):
         or get_memory().enable_hierarchical_cache
         or get_memory().enable_session_radix_cache
         or get_disagg().disaggregation_mode != "null"
-        or config.hf_text_config.model_type != "qwen3_5_text"
-        or not getattr(config.hf_text_config, "attn_output_gate", False)
+        or not (
+            (
+                config.hf_text_config.model_type == "qwen3_5_text"
+                and getattr(config.hf_text_config, "attn_output_gate", False)
+            )
+            or (
+                config.hf_text_config.model_type == "olmo_hybrid"
+                and getattr(config.hf_text_config, "sglang_olmo_hybrid_adapter", False)
+            )
+        )
         or config.quantization is not None
         or config.dtype != torch.bfloat16
         or len(batch.reqs) != 1
