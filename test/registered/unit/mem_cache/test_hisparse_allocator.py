@@ -11,7 +11,7 @@ from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
     HiSparseTokenToKVPoolAllocator,
 )
-from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -216,7 +216,7 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
             full_available_size=MagicMock(return_value=512),
         )
         queue.token_to_kv_pool_allocator = SimpleNamespace(
-            logical_attn_allocator=logical_allocator
+            logical_attn_allocator=logical_allocator, storage=None
         )
         queue.scheduler = SimpleNamespace(enable_hisparse=True, last_batch=None)
         queue.retracted_queue = []
@@ -263,12 +263,19 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
 
         req_to_token_pool = ReqToTokenPool()
         allocator = SimpleNamespace(
+            state=None,
+            storage=None,
             device=torch.device("cpu"),
             page_size=256,
             available_size=MagicMock(return_value=fill_len),
             swa_available_size=MagicMock(return_value=swa_tail_len),
             alloc_extend_swa_tail=MagicMock(return_value=kv_loc),
             alloc_logical_only=MagicMock(return_value=kv_loc),
+            window_pool_names=lambda: ("swa",),
+        )
+        # The window pool keeps the scheduler's window.
+        kv_storage_of(req_to_token_pool, allocator).bind_window_retention(
+            sliding_window_size, None
         )
         regular_host_alloc = MagicMock(return_value=host_indices)
         coordinator = SimpleNamespace(
@@ -301,9 +308,7 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         _, kwargs = allocator.alloc_extend_swa_tail.call_args
         self.assertEqual(kwargs["extend_num_tokens"], fill_len)
         self.assertEqual(kwargs["swa_tail_len"], swa_tail_len)
-        self.assertEqual(
-            req.kv.get_evicted_seqlen(ComponentType.SWA), fill_len - swa_tail_len
-        )
+        self.assertEqual(req.kv.get_evicted_seqlen("swa"), fill_len - swa_tail_len)
         self.assertEqual(req.kv.kv_allocated_len, fill_len)
         self.assertEqual(req.kv.kv_committed_len, fill_len)
         self.assertEqual(req.extend_end, fill_len)

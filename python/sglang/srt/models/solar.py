@@ -8,6 +8,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.srt.hf_transformers import get_rope_config
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -21,6 +22,8 @@ from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     DEFAULT_VOCAB_PADDING_SIZE,
     ParallelLMHead,
@@ -55,8 +58,6 @@ from sglang.srt.model_loader.weight_utils import (
 # limitations under the License.
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/solar.py
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix, make_pp_layers
-from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 
 class SolarMLP(nn.Module):

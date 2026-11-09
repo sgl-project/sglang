@@ -42,6 +42,7 @@ class AttentionBackendEnum(enum.Enum):
     VMOBA_ATTN = enum.auto()
     AITER = enum.auto()
     AITER_SAGE = enum.auto()
+    AITER_QUANT = enum.auto()
     SLA_ATTN = enum.auto()
     SAGE_SLA_ATTN = enum.auto()
     LASER_ATTN = enum.auto()
@@ -52,6 +53,7 @@ class AttentionBackendEnum(enum.Enum):
     CUBE_SPARSE_ATTN = enum.auto()
     FP8_FA_SM120 = enum.auto()
     NO_ATTENTION = enum.auto()
+    AMX_ATTN = enum.auto()
 
     def __str__(self):
         return self.name.lower()
@@ -301,6 +303,16 @@ class Platform:
     @classmethod
     def set_device(cls, device: torch.device) -> None:
         torch.get_device_module(device).set_device(device)
+
+    @classmethod
+    def synchronize(cls) -> None:
+        """Synchronize pending device work for the current platform."""
+        torch.get_device_module().synchronize()
+
+    @classmethod
+    def empty_cache(cls) -> None:
+        """Release cached device memory for the current platform."""
+        torch.get_device_module().empty_cache()
 
     @classmethod
     def get_attn_backend_cls_str(
