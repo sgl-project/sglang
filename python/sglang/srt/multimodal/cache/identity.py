@@ -134,7 +134,7 @@ def _read_media_bytes(media: str | bytes) -> bytes:
     if isinstance(media, bytes):
         return bytes(media)
 
-    from sglang.srt.utils import get_image_bytes, image_extension_names
+    from sglang.srt.multimodal.media_io import get_image_bytes, image_extension_names
 
     if media.startswith("file://"):
         media = unquote(urlparse(media).path)
@@ -153,7 +153,7 @@ def snapshot_media(media: Any) -> MediaSnapshot:
     Paths and URLs are deliberately not identities. They are resolved to bytes
     on every untrusted lookup, so changing their contents produces a cache miss.
     """
-    from sglang.srt.utils import ImageData
+    from sglang.srt.multimodal.media_io import ImageData
 
     if isinstance(media, ImageData):
         media = media.url

@@ -15,6 +15,7 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.schedule_batch import NextBatchPlan
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.pause_state import PauseState
 from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     KeyedReqList,
@@ -104,6 +105,8 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
         s = self.scheduler
         s.init_pp_loop_state = Mock()
         s.pp_loop_size = 1
+        s.pause_state = PauseState()
+        s.mbs = [None]
         enter_scope(self, published_topology(pp_size=2))
         s.pp_group = SimpleNamespace(is_last_rank=True)
         s.running_mbs = [self.running_batch]

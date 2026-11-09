@@ -33,7 +33,7 @@ def _resolve(draft_config: PretrainedConfig, **overrides):
     with (
         override_platform(is_xpu=True),
         patch(
-            "sglang.srt.utils.hf_transformers.config.get_config",
+            "sglang.srt.hf_transformers.config.get_config",
             return_value=draft_config,
         ),
     ):
