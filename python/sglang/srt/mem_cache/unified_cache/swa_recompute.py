@@ -3,7 +3,7 @@ prefix that outlived its window, for the worker's replay to fill."""
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Mapping, Optional
 
 import msgspec
 import torch
@@ -70,6 +70,21 @@ def _recomputable_full_len(
     return full_len, node_id
 
 
+def _window_sub_pool(cache: UnifiedRadixCache) -> str:
+    return cache.window_sub_pool_of_slot(cache.slot_id(TREE_WINDOW))
+
+
+def replay_window_host_hits(
+    cache: UnifiedRadixCache, window_host_hit_lengths: Mapping[str, int]
+) -> dict[str, int]:
+    """Window host hits plus the replayed span, which needs window rows too."""
+    sub_pool = _window_sub_pool(cache)
+    return {
+        **window_host_hit_lengths,
+        sub_pool: window_host_hit_lengths.get(sub_pool, 0) + cache.swa_recompute_len,
+    }
+
+
 def swa_recompute_hit_length(
     cache: UnifiedRadixCache, key: RadixKey, matched_len: int, full_kv_hit_length: int
 ) -> int:
@@ -99,7 +114,9 @@ def init_swa_recompute(
     try:
         shortfall = replay_len - allocator.swa_available_size()
         if shortfall > 0:
-            cache.evict_for_alloc(EvictParams(swa_num_tokens=shortfall))
+            cache.evict_for_alloc(
+                EvictParams(window_num_tokens={_window_sub_pool(cache): shortfall})
+            )
         if allocator.swa_available_size() < replay_len:
             return None
         gained = tree_core.collect_full_device_indices(node_id, req.last_node)[
