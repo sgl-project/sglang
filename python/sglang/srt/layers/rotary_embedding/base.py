@@ -21,6 +21,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_hip,
+    is_mlu,
     is_mps,
     is_musa,
     is_npu,
@@ -36,6 +37,7 @@ logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_is_mlu = is_mlu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -129,6 +131,7 @@ class RotaryEmbedding(BaseFusedOp):
             and not (_is_npu)
             and not (_is_musa)
             and not (_is_mps)
+            and not (_is_mlu)
             and not (current_platform.is_out_of_tree())
         ):
             # rotary_embedding from sglang.kernels.ops.attention.rope and vllm._custom_ops has the same implementation.
@@ -599,6 +602,55 @@ class RotaryEmbedding(BaseFusedOp):
             if k_2d:
                 k_out = k_out.view(k_out.shape[0], -1)
             return q_out, k_out
+
+    def forward_mlu(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        offsets: Optional[torch.Tensor] = None,
+        fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Apply MLU RoPE directly from the shared compact cache."""
+        import torch_mlu_ops
+
+        if fused_set_kv_buffer_arg is not None:
+            raise NotImplementedError(
+                "fused_set_kv_buffer_arg is not supported for mlu implementation"
+            )
+
+        if self.cos_sin_cache.dtype != query.dtype or (
+            self.cos_sin_cache.dtype != key.dtype
+        ):
+            return self.forward_native(positions, query, key, offsets)
+
+        if offsets is not None:
+            positions = positions + offsets
+        positions = positions.to(torch.int32)
+
+        cos, sin = self.cos_sin_cache.chunk(2, dim=-1)
+        num_tokens = positions.shape[-1]
+        for x in (query, key):
+            # Vendor interface uses [batch, tokens, heads, head_size].
+            # These views write through to the original query/key tensors.
+            x = x.view(num_tokens, -1, self.head_size).unsqueeze(0)
+            x_rot = x[..., : self.rotary_dim]
+
+            torch_mlu_ops.apply_rotary(
+                input=x_rot,
+                sin_cache=sin,
+                cos_cache=cos,
+                position_ids=positions,
+                cu_seqlens=None,
+                interleaved=not self.is_neox_style,
+                discrete=True,
+                dynamic_ntk=False,
+                max_seqlen=x_rot.shape[1],
+                output=x_rot,
+                compressed_cache=True,
+            )
+
+        return query, key
 
 
 class LinearScalingRotaryEmbedding(RotaryEmbedding):

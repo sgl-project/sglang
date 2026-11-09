@@ -178,8 +178,8 @@ srt_sail = [
 # Keep vendor pins in sync with scripts/ci/mlu/component_versions.properties.
 srt_mlu = [
   "sglang[runtime_common]",
-  "torch-mlu==1.34.1+torch2.13.0",
-  "torch-mlu-ops==1.13.0+torch2.13.0",
+  "torch-mlu==1.35.0+torch2.13.0",
+  "torch-mlu-ops==1.14.1+torch2.13.0",
   "triton==3.4.0+mlu2.1.3",
 ]
 
