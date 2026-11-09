@@ -20,6 +20,7 @@ from sglang.srt.hardware_backend.sail.deep_gemm.sail_fused_deepgemm_ops import (
     grouped_gemm_nt_f8f8bf16_fused,
     grouped_gemm_nt_i8i8bf16_fused,
 )
+from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeRunnerConfig,
     register_fused_func,
@@ -32,6 +33,7 @@ from sglang.srt.layers.moe.token_dispatcher.standard import (
     StandardCombineInput,
     StandardDispatchOutput,
 )
+from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.utils import get_device_sm
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -52,6 +54,23 @@ def sail_deepgemm_moe_unsupported_reason(
         f"activation={config.activation!r} with is_gated={config.is_gated}; the "
         "SAIL DeepGEMM MoE kernels only implement gated SiLU and SiTU"
     )
+
+
+def deepgemm_moe_selected_for_a2a() -> bool:
+    """Whether a DeepEP-family dispatcher hands the layer to these engines.
+
+    The dispatcher has already paid for the permute, so DeepGEMM is the runner
+    that reuses it.
+    """
+    a2a = get_moe_a2a_backend()
+    return deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and (
+        a2a.is_deepep() or a2a.is_mooncake()
+    )
+
+
+def deepgemm_moe_selected_for_auto() -> bool:
+    """Whether ``--moe-runner-backend auto`` opts a layer in on this platform."""
+    return envs.SGLANG_SAIL_DEEPGEMM_MOE.get() and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
 
 
 @torch.compile
