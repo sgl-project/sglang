@@ -9,6 +9,7 @@ from sglang.kernels.ops.layernorm.mhc import mhc_fused_post_pre, mhc_post, mhc_p
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=15, stage="base-b", runner_config="4-gpu-b200")
 
 
 @pytest.fixture
