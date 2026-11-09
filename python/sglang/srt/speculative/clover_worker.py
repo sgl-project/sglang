@@ -169,7 +169,6 @@ class CloverWorker(BaseSpecWorker):
                 )
         # Own the candidate storage: verify reuses shared graph buffers.
         logits = output.full_logits.view(fb.batch_size, self.block_size, -1)
-        logits[..., self.mask_id] = float("-inf")
         apply_clover_penalties(
             logits,
             reqs,
@@ -328,7 +327,6 @@ class CloverWorker(BaseSpecWorker):
         if result.can_run_cuda_graph and self.verify_graph_replay_ct == 1:
             logger.info("CLOVER verify CUDA graph replay active")
         logits = result.logits_output.next_token_logits.view(bs, width, -1)
-        logits[..., self.mask_id] = float("-inf")
         apply_clover_penalties(
             logits,
             batch.reqs,
