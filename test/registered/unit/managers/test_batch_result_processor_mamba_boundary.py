@@ -17,10 +17,12 @@ from sglang.srt.managers.scheduler_components.batch_result_processor import (
 from sglang.srt.managers.scheduler_components.pause_state import PauseState
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.kv.advance import advance_tracking
+from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.scheduler_test_utils import release_only_retirer
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
@@ -103,7 +105,72 @@ def _make_result():
     )
 
 
-class TestMambaBoundaryMaskReuse(unittest.TestCase):
+class TestMambaBoundaryMaskReuse(CustomTestCase):
+    def test_completed_checkpoint_survives_next_boundary_write(self):
+        """Later forwards must preserve completed checkpoints after a prefill gap,
+        even if overlap has already advanced the request's write destination.
+        """
+        completed_len = 2 * TRACK_INTERVAL
+        for lookahead, already_rotated in ((1, False), (1, True), (0, False)):
+            for completed_idx in (0, 1):
+                with self.subTest(
+                    lookahead=lookahead,
+                    already_rotated=already_rotated,
+                    completed_idx=completed_idx,
+                ):
+                    req, batch = _make_batch()
+                    req.output_ids.extend(
+                        [4] * (completed_len - req.kv.kv_committed_len)
+                    )
+                    req.decode_batch_idx = 1 + lookahead
+                    req.kv.kv_committed_len = completed_len + lookahead
+                    req.kv.mamba_ping_pong_track_buffer = torch.tensor([10, 11])
+                    req.kv.mamba_last_track_idx = 1 - completed_idx
+                    req.kv.mamba_last_track_seqlen = TRACK_INTERVAL
+                    req.kv.mamba_next_track_idx = (
+                        1 - completed_idx if already_rotated else completed_idx
+                    )
+
+                    pool = HybridReqToTokenPool.__new__(HybridReqToTokenPool)
+                    pool.mamba_ping_pong_track_buffer_size = 2
+                    pool.req_index_to_mamba_ping_pong_track_buffer_mapping = (
+                        req.kv.mamba_ping_pong_track_buffer.unsqueeze(0)
+                    )
+                    batch.req_to_token_pool = pool
+                    batch.req_pool_indices = torch.tensor([0])
+                    batch.mamba_track_mask_cpu = [True]
+                    batch.mamba_track_mask_next_cpu = [False]
+                    batch.mamba_decode_batch_idx_cpu = [1]
+                    batch.mamba_track_buffer_indices = [completed_idx]
+                    processor = _make_processor()
+                    result = _make_result()
+                    saved_slot = int(req.kv.mamba_ping_pong_track_buffer[completed_idx])
+                    checkpoint_lengths = {saved_slot: completed_len}
+
+                    with get_context().override_server_args(
+                        mamba_radix_cache_strategy="extra_buffer",
+                        mamba_track_interval=TRACK_INTERVAL,
+                        _mamba_cache_chunk_size=TRACK_INTERVAL,
+                    ):
+                        processor._handle_finish_state_updated_req(
+                            req, batch, result, 0, result.logits_output
+                        )
+                        set_mamba_track_indices_from_reqs(batch)
+
+                    # A later boundary writes before its result is consumed.
+                    # The last completed checkpoint must survive that write.
+                    checkpoint_lengths[int(batch.mamba_track_indices[0])] = (
+                        completed_len + TRACK_INTERVAL
+                    )
+                    keep_slot = int(
+                        req.kv.mamba_ping_pong_track_buffer[
+                            pool.get_mamba_ping_pong_keep_idx(req)
+                        ]
+                    )
+                    self.assertEqual(req.kv.mamba_prev_track_seqlen, TRACK_INTERVAL)
+                    self.assertEqual(req.kv.mamba_last_track_seqlen, completed_len)
+                    self.assertEqual(checkpoint_lengths[keep_slot], completed_len)
+
     def test_overlap_scheduler_handles_zero_and_one_batch_lookahead(self):
         for schedule_next_decode, expected_lookahead in ((False, 0), (True, 1)):
             with self.subTest(schedule_next_decode=schedule_next_decode):
