@@ -15,7 +15,7 @@
         "calibration_policy": "At least five comparable main CI runs per metric; timing references are the observed maximum plus 5%, allocated-memory references plus 1%. Existing tolerances remain unchanged."
     },
     "runner_overrides": {
-        "h100-computable-d": {
+        "h100-computable-d-": {
             "cosmos3_nano_t2i": {
                 "expected_e2e_ms": 959.42,
                 "expected_load_ms": 44247.08
@@ -92,7 +92,29 @@
                 "expected_load_ms": 46366.03
             },
             "ltx_2_3_hq_pipeline": {
-                "expected_e2e_ms": 23628.47
+                "expected_e2e_ms": 23628.47,
+                "expected_avg_denoise_ms": 1183.33,
+                "expected_median_denoise_ms": 1215.23,
+                "denoise_step_ms": {
+                    "0": 1312.84,
+                    "1": 1242.89,
+                    "2": 1230.69,
+                    "3": 1215.74,
+                    "4": 1223.12,
+                    "5": 1231.47,
+                    "6": 1228.81,
+                    "7": 1224.18,
+                    "8": 1215.61,
+                    "9": 1213.17,
+                    "10": 1208.16,
+                    "11": 1173.48,
+                    "12": 1194.32,
+                    "13": 1199.17,
+                    "14": 590.15
+                },
+                "stages_ms": {
+                    "LTX2AVDenoisingStage": 17725.42
+                }
             },
             "pi05_action_http": {
                 "expected_e2e_ms": 23.68,
@@ -186,7 +208,7 @@
                 "expected_load_ms": 53127.26
             }
         },
-        "h100-computable-e": {
+        "h100-computable-e-": {
             "cosmos3_nano_t2i": {
                 "expected_load_ms": 36827.71
             },
@@ -250,6 +272,30 @@
             },
             "longlive2_t2v": {
                 "expected_load_ms": 40069.0
+            },
+            "ltx_2_3_hq_pipeline": {
+                "expected_avg_denoise_ms": 996.29,
+                "expected_median_denoise_ms": 1004.68,
+                "denoise_step_ms": {
+                    "0": 1085.91,
+                    "1": 1034.19,
+                    "2": 1007.06,
+                    "3": 1027.9,
+                    "4": 1002.79,
+                    "5": 1000.46,
+                    "6": 999.71,
+                    "7": 1001.65,
+                    "8": 1000.56,
+                    "9": 997.52,
+                    "10": 997.7,
+                    "11": 990.77,
+                    "12": 1017.15,
+                    "13": 997.97,
+                    "14": 499.28
+                },
+                "stages_ms": {
+                    "LTX2AVDenoisingStage": 14783.94
+                }
             },
             "pi05_action_http": {
                 "expected_e2e_ms": 24.36,

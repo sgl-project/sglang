@@ -165,7 +165,9 @@ limits). Under the pool rule above it reuses the `4-4567` references: 1471.19 /
 `h100-computable-e-*` hosts instead of `h100-novita-*`. Those hosts start
 servers and load weights more slowly, so the loading guard fails there for most
 cases, on `main` as well as on PRs. Its `runner_overrides` give each of the two
-pools its own loading and E2E references. Other runners keep the defaults.
+pools its own loading and E2E references, keyed `h100-computable-d-` and
+`h100-computable-e-` so that a future `h100-computable-dx` pool does not match.
+Other runners keep the defaults.
 Stage/step and memory references and all tolerances are unchanged.
 
 Scheduled PR Test Base runs, 2026-10-18 to 2026-11-06 (127 jobs; one `computable-d` job was still running):
@@ -207,6 +209,17 @@ Leaving out one scheduled run at a time, calibrating on the rest and checking
 the left-out jobs against the loading and E2E guards (with in-job retries): 11
 of 12 `computable-d` jobs and 15 of 15 `computable-e` jobs pass, against 0 of
 12 and 8 of 15 with the defaults.
+
+`ltx_2_3_hq_pipeline` also gets per-pool denoise references (average, median,
+steps 0-14 and `LTX2AVDenoisingStage`) by the same rule, from the same runs.
+Its denoise is slower on both pools (minimum average 1183 ms on `computable-d`
+and 996 ms on `computable-e`, against the 914 ms default), so after the E2E
+override every `computable-d` attempt failed the denoise guard instead. Checked
+against all guards on the 2026-11-07 to 11-09 PR runs, which are not in the
+calibration set, 10 of 10 `computable-d` and 11 of 11 `computable-e` jobs pass,
+against 0 of 10 and 10 of 11 without these references. Override maps such as
+`stages_ms` and `denoise_step_ms` merge into the defaults, so unlisted stages
+and steps keep their default references.
 
 These references describe slower hosts, not slower code. On these pools a
 loading regression must exceed the host's own minimum by 40% before it fails.
