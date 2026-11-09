@@ -117,9 +117,10 @@ def _ensure_dsv41_static_verify_mode() -> None:
 
 @functools.cache
 def _ds41_ops():
-    """Resolve seven migrated DSL functions and the existing AscendC compressor."""
-    import cann_ops_transformer.ops.ds41  # noqa: F401 - registers torch.ops ds41
+    """Resolve seven migrated DSL functions and the ops-transformer compressor
+    wrapper (whose CANN backend is the vendored ds41 compressor)."""
     from sgl_kernel_npu.operators.attention import (
+        compressor_v2,
         mixed_quant_sparse_flash_mla,
         mixed_quant_sparse_flash_mla_metadata,
     )
@@ -132,7 +133,7 @@ def _ds41_ops():
     )
 
     return SimpleNamespace(
-        compressor=torch.ops.cann_ops_transformer.ds41.compressor,
+        compressor=compressor_v2,
         indexer_prologue_k=indexer_prologue_k,
         mixed_quant_sparse_flash_mla=mixed_quant_sparse_flash_mla,
         mixed_quant_sparse_flash_mla_metadata=mixed_quant_sparse_flash_mla_metadata,

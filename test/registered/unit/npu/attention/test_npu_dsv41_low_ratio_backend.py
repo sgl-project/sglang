@@ -2323,11 +2323,12 @@ class TestVerifyGraphRefresh(unittest.TestCase):
 
 
 class TestDs41OperatorResolver(unittest.TestCase):
-    """The seven kernel routes retain the AscendC compressor and caching."""
+    """The seven kernel routes retain the compressor wrapper and caching."""
 
     def test_resolver_uses_public_kernel_apis(self):
         operator_groups = {
             "sgl_kernel_npu.operators.attention": (
+                "compressor_v2",
                 "mixed_quant_sparse_flash_mla",
                 "mixed_quant_sparse_flash_mla_metadata",
             ),
@@ -2347,22 +2348,9 @@ class TestDs41OperatorResolver(unittest.TestCase):
                 expected_entries[name] = object()
                 setattr(module, name, expected_entries[name])
             stub_modules[module_name] = module
-        for name in (
-            "cann_ops_transformer",
-            "cann_ops_transformer.ops",
-            "cann_ops_transformer.ops.ds41",
-        ):
-            stub_modules[name] = ModuleType(name)
-        expected_entries["compressor"] = object()
-        stub_torch_ops = SimpleNamespace(
-            cann_ops_transformer=SimpleNamespace(
-                ds41=SimpleNamespace(compressor=expected_entries["compressor"])
-            )
-        )
-        with (
-            patch.dict(sys.modules, stub_modules),
-            patch.object(dsv4_backend.torch, "ops", stub_torch_ops),
-        ):
+        # The namespace exposes the wrapper under its role, not its module name.
+        expected_entries["compressor"] = expected_entries.pop("compressor_v2")
+        with patch.dict(sys.modules, stub_modules):
             _real_ds41_ops.cache_clear()
             try:
                 resolved_entries = _real_ds41_ops()
