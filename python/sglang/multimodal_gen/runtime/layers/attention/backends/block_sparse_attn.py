@@ -3,6 +3,7 @@ from typing import Any
 
 import attentions  # noqa: F401
 import torch
+from sgl_kernel_npu.operators.attention import sparse_block_estimate
 
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionBackend,
@@ -153,7 +154,7 @@ class BlockSparseAttentionImpl(AttentionImpl):
         key: torch.Tensor,
         sparsity: float,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        return torch.ops.attentions.sparse_block_estimate(
+        return sparse_block_estimate(
             query=query,
             key=key,
             actual_seq_lengths=None,

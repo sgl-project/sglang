@@ -130,11 +130,11 @@ def _supports_triton_prologue(
 
 
 if _is_npu:
-    from sgl_kernel_npu.fla.utils import (
-        fused_qkvzba_split_reshape_cat as fused_qkvzba_split_reshape_cat_npu,
-    )
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import (
         split_qkvgate_gemma_rmsnorm_rope,
+    )
+    from sgl_kernel_npu.operators.attention.gdn import (
+        fused_qkvzba_split_reshape_cat as fused_qkvzba_split_reshape_cat_npu,
     )
 
     fused_qkvzba_split_reshape_cat = fused_qkvzba_split_reshape_cat_npu
