@@ -17,11 +17,10 @@ from sglang.srt.environ import envs
 from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
     ForwardBatch,
-    ForwardMode,
     enable_num_token_non_padded,
 )
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.draft_parallel import resolve_draft_parallel_layout
 from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
@@ -32,7 +31,7 @@ from sglang.srt.speculative.spec_info import (
 )
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.srt.speculative.spec_utils import draft_tp_context
-from sglang.srt.utils.common import is_pin_memory_available
+from sglang.srt.utils.device import is_pin_memory_available
 from sglang.srt.utils.invariants import Bucket, Invariant, NotNaN, expect
 
 if TYPE_CHECKING:

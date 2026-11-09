@@ -25,9 +25,11 @@ from sglang.srt.layers.attention.linear.utils import (
     build_verify_intermediate_state_indices,
     select_verify_intermediate_state_indices,
 )
+from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu
-from sglang.srt.utils.common import is_gfx95_supported, rank0_log
+from sglang.srt.utils.device import is_gfx95_supported
+from sglang.srt.utils.log_utils import rank0_log
 
 # KDA always uses the triton causal_conv1d_fn (no CUDA override).
 # Only causal_conv1d_update needs platform-specific overrides for decode.
@@ -484,6 +486,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
     # forward_extend then runs the graph-safe chain on these static tables.
     prefill_graph_metadata: Optional[KDAPrefillGraphMetadata] = None
 
+    def _create_kernel_dispatcher(self, backends):
+        return KDAKernelDispatcher(backends.decode, backends.prefill, backends.verify)
+
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
         self.prefill_graph_max_seqs = envs.SGLANG_KDA_PREFILL_GRAPH_MAX_SEQS.get()
@@ -508,9 +513,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 "KDA FlashInfer speculative decoding only supports topk=1 "
                 "(EAGLE tree verify / retrieve_parent_token is unsupported)."
             )
-        self.kernel_dispatcher = KDAKernelDispatcher(
-            decode_backend, prefill_backend, verify_backend
-        )
+        self.kernel_dispatcher = self._create_kernel_dispatcher(backends)
         if prefill_backend.is_flashinfer():
             _validate_flashinfer_kda_prefill(
                 chunk_size=self.mamba_chunk_size,
@@ -705,7 +708,18 @@ class KDAAttnBackend(MambaAttnBackendBase):
             extend_prefix_lens=forward_batch.extend_prefix_lens,
             track_rows=track_rows,
         )
+        if track_rows is None and forward_batch.mamba_track_indices is not None:
+            meta.track_dst[: forward_batch.batch_size].copy_(
+                forward_batch.mamba_track_indices
+            )
         self.prefill_graph_metadata = meta
+        self.forward_metadata = ForwardMetadata(
+            query_start_loc=meta.cu_seqlens,
+            mamba_cache_indices=meta.cache_indices,
+            mamba_track_indices=None
+            if forward_batch.mamba_track_indices is None
+            else meta.track_dst[: forward_batch.batch_size],
+        )
 
     def _prefill_graph_track_rows(
         self, forward_batch: ForwardBatch

@@ -822,6 +822,141 @@ class TestHostPoolGroup(CustomTestCase):
         self.assertEqual(group.available_size(PoolName.SWA), 1)
         self.assertEqual(group.available_size(PoolName.MAMBA), 2)
 
+    def test_reclaim_exception_rolls_back_side_allocations(self):
+        group = self._group(kv=4, draft=2, mamba=2, swa=1)
+        existing = group.alloc(2, pool=PoolName.DRAFT)
+        transfers = [
+            PoolTransfer(
+                name=PoolName.DRAFT,
+                device_indices=torch.arange(2),
+                host_indices=existing,
+            ),
+            PoolTransfer(name=PoolName.MAMBA, device_indices=torch.arange(2)),
+            PoolTransfer(name=PoolName.SWA, device_indices=torch.arange(2)),
+        ]
+        failure = RuntimeError("host reclaim failed")
+        group.get_entry(PoolName.SWA).host_evict_fn = unittest.mock.Mock(
+            side_effect=failure
+        )
+
+        with self.assertRaises(RuntimeError) as caught:
+            group.resolve_host_transfers(transfers)
+
+        self.assertIs(caught.exception, failure)
+        self.assertIs(transfers[0].host_indices, existing)
+        self.assertTrue(all(t.host_indices is None for t in transfers[1:]))
+        self.assertEqual(group.available_size(PoolName.DRAFT), 0)
+        self.assertEqual(group.available_size(PoolName.MAMBA), 2)
+        self.assertEqual(group.available_size(PoolName.SWA), 1)
+
+    def test_rollback_drains_allocations_when_free_raises(self):
+        group = self._group(kv=4, draft=2, mamba=2, swa=2)
+        transfers = [
+            PoolTransfer(name=name, device_indices=torch.arange(2))
+            for name in (PoolName.DRAFT, PoolName.MAMBA, PoolName.SWA)
+        ]
+        failure = RuntimeError("host allocation failed")
+        cleanup_failure = RuntimeError("host free failed")
+        original_free = group.free
+
+        def free(indices, *, pool=None):
+            if pool == PoolName.MAMBA:
+                raise cleanup_failure
+            return original_free(indices, pool=pool)
+
+        with (
+            unittest.mock.patch.object(
+                group.get_pool(PoolName.SWA), "alloc", side_effect=failure
+            ),
+            unittest.mock.patch.object(group, "free", side_effect=free) as freed,
+            self.assertRaises(RuntimeError) as caught,
+        ):
+            group.resolve_host_transfers(transfers)
+
+        self.assertIs(caught.exception, failure)
+        self.assertIs(caught.exception.__cause__, cleanup_failure)
+        self.assertEqual(
+            [call.kwargs["pool"] for call in freed.call_args_list],
+            [PoolName.MAMBA, PoolName.DRAFT],
+        )
+        self.assertTrue(all(t.host_indices is None for t in transfers))
+        self.assertEqual(group.available_size(PoolName.DRAFT), 2)
+        self.assertEqual(group.available_size(PoolName.MAMBA), 0)
+
+    def test_write_rolls_back_unsubmitted_pools_on_side_allocation_failure(self):
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+            HybridCacheController,
+        )
+
+        for raises in (False, True):
+            with self.subTest(raises=raises):
+                group = self._group(kv=4, mamba=2, swa=2)
+                controller = HybridCacheController.__new__(HybridCacheController)
+                controller.mem_pool_host = group
+                controller.write_queue = []
+                transfers = [
+                    PoolTransfer(name=PoolName.MAMBA, device_indices=torch.arange(2)),
+                    PoolTransfer(name=PoolName.SWA, device_indices=torch.arange(2)),
+                ]
+                failure = RuntimeError("host side-pool allocation failed")
+                with (
+                    unittest.mock.patch.object(
+                        group.get_pool(PoolName.SWA),
+                        "alloc",
+                        **(
+                            {"side_effect": failure}
+                            if raises
+                            else {"return_value": None}
+                        ),
+                    ),
+                    unittest.mock.patch.object(group, "free", wraps=group.free) as free,
+                ):
+                    if raises:
+                        with self.assertRaises(RuntimeError) as caught:
+                            controller.write(torch.arange(2), extra_pools=transfers)
+                        self.assertIs(caught.exception, failure)
+                    else:
+                        self.assertIsNone(
+                            controller.write(torch.arange(2), extra_pools=transfers)
+                        )
+                    self.assertEqual(free.call_count, 2)
+                    self.assertEqual(
+                        [
+                            call.kwargs.get("pool", PoolName.KV)
+                            for call in free.call_args_list
+                        ],
+                        [PoolName.MAMBA, PoolName.KV],
+                    )
+                self.assertEqual(controller.write_queue, [])
+                self.assertTrue(all(t.host_indices is None for t in transfers))
+                for name, expected in (
+                    (PoolName.KV, 4),
+                    (PoolName.MAMBA, 2),
+                    (PoolName.SWA, 2),
+                ):
+                    self.assertEqual(group.available_size(name), expected)
+
+    def test_write_keeps_allocations_after_queue_submission(self):
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+            HybridCacheController,
+        )
+
+        group = self._group(kv=4, mamba=2)
+        controller = HybridCacheController.__new__(HybridCacheController)
+        controller.mem_pool_host = group
+        controller.write_queue = []
+        transfers = [PoolTransfer(name=PoolName.MAMBA, device_indices=torch.arange(2))]
+        with unittest.mock.patch.object(group, "free", wraps=group.free) as free:
+            primary = controller.write(
+                torch.arange(2), extra_pools=transfers, flush=False
+            )
+            free.assert_not_called()
+        self.assertEqual(len(controller.write_queue), 1)
+        self.assertIs(controller.write_queue[0].host_indices, primary)
+        self.assertIs(controller.write_queue[0].pool_transfers[0], transfers[0])
+        self.assertEqual(group.available_size(PoolName.KV), 2)
+        self.assertEqual(group.available_size(PoolName.MAMBA), 0)
+
 
 def _make_indexer_host(pool, anchor, *, packed_draft_device_pools=(), **kwargs):
     from sglang.srt.mem_cache.hybrid_cache.host_pool_config import (
@@ -937,7 +1072,6 @@ class TestDSAIndexerPoolInfo(CustomTestCase):
     def test_host_bytes_match_observed_allocation(self):
         info = self._stub().get_device_pool_infos()[1].buffer_info
         self.assertEqual(info.page_bytes, 8448)
-        self.assertEqual(284256 * 5 * info.page_bytes, 12006973440)
 
     def test_sharded_rank_without_index_buffers_keeps_remote_callbacks(self):
         from sglang.srt.mem_cache.hybrid_cache.host_pool_config import (
@@ -1005,6 +1139,25 @@ class TestDSAIndexerPoolInfo(CustomTestCase):
         )
         self.assertEqual(packed._draft_host_layer(5), 2)
         self.assertEqual(packed.get_size_per_token(), 132 * 3)
+
+
+class TestStridedStateDetection(CustomTestCase):
+    def test_contiguous_slots_are_not_strided(self):
+        for shape in ((8, 4), (8, 4, 3), (1, 5)):
+            with self.subTest(shape=shape):
+                self.assertFalse(
+                    MambaPoolHost._slots_are_strided(torch.zeros(shape)),
+                    "a contiguous slot array must take the direct path",
+                )
+
+    def test_envelope_strided_slots_are_detected(self):
+        num_slots, per_slot, envelope = 6, 4, 10
+        raw = torch.zeros(num_slots * envelope)
+        view = torch.as_strided(raw, size=(num_slots, per_slot), stride=(envelope, 1))
+        self.assertTrue(MambaPoolHost._slots_are_strided(view))
+
+    def test_empty_tensor_is_not_strided(self):
+        self.assertFalse(MambaPoolHost._slots_are_strided(torch.zeros((0, 4))))
 
 
 class TestMambaHostPoolOnXpu(CustomTestCase):

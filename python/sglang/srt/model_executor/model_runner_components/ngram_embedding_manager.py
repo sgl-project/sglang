@@ -8,19 +8,18 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.managers.schedule_batch import ForwardMode
+from sglang.srt.layers.dp_attention import (
+    get_cuda_graph_max_batch_size,
+    get_eager_max_batch_size,
+)
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import (
     get_schedule,
     get_spec,
     max_speculative_num_draft_tokens,
 )
-from sglang.srt.utils.common import (
-    async_h2d,
-    get_cuda_graph_max_batch_size,
-    get_eager_max_batch_size,
-    is_npu,
-)
+from sglang.srt.utils.device import async_h2d, is_npu
 
 _is_npu = is_npu()
 
@@ -51,7 +50,14 @@ def _update_token_table(tokens, ne_token_table, row_indices, column_starts, req_
             oe_token_table=ne_token_table,
         )
     else:
-        update_token_table(tokens, ne_token_table, row_indices, column_starts, req_lens)
+        update_token_table(
+            tokens=tokens,
+            ne_token_table=ne_token_table,
+            row_indices=row_indices,
+            column_starts=column_starts,
+            req_lens=req_lens,
+            ignore_tokens=None,
+        )
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

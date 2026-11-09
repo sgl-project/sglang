@@ -16,6 +16,8 @@ import unittest
 from array import array
 from types import SimpleNamespace
 
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.session.session_controller import Session
 from sglang.test.test_utils import CustomTestCase
@@ -83,6 +85,32 @@ class TestSessionTokenShare(CustomTestCase):
         req.output_ids.extend(output[baked:])
         self.session.finish_req(req)
 
+    def test_full_media_namespace_survives_text_only_turns(self):
+        first = self._create("first", [1, 2, 3])
+        first.extend_image_inputs(
+            MultimodalInputs(
+                mm_items=[
+                    MultimodalDataItem(modality=Modality.IMAGE, identity=b"A" * 32)
+                ]
+            )
+        )
+        first_salt = first.cache_salt
+        self._decode_and_finish(first, [4])
+        second = self._create("second", [5])
+        self.assertEqual(second.cache_salt, first_salt)
+        second.extend_image_inputs(
+            MultimodalInputs(
+                mm_items=[
+                    MultimodalDataItem(modality=Modality.IMAGE, identity=b"B" * 32)
+                ]
+            )
+        )
+        self.assertNotEqual(second.cache_salt, first_salt)
+        self.assertEqual(first.cache_salt, first_salt)
+        self._decode_and_finish(second, [6])
+        third = self._create("third", [7])
+        self.assertEqual(third.cache_salt, second.cache_salt)
+
     def test_normal_multi_turn_share_and_carry(self):
         in1, out1 = list(range(100, 110)), [1, 2, 3]
         r1 = self._create("r1", in1)
@@ -126,7 +154,7 @@ class TestSessionTokenShare(CustomTestCase):
         self._decode_and_finish(r1, out1)
 
         # Turn 2 extends the shared arrays, decodes a bit, then aborts:
-        # finish_req never runs, req_nodes still points at r1.
+        # finish_req never runs, turns still points at r1.
         r2 = self._create("r2", [50, 51])
         self.assertEqual(list(r2.origin_input_ids), in1 + out1 + [50, 51])
         r2.output_ids.extend([6, 7])

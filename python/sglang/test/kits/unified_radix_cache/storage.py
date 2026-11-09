@@ -23,11 +23,11 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 from sglang.srt.mem_cache.pool_host import PoolEntry
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.unified_cache.components.base import (
+from sglang.srt.mem_cache.unified_cache.component_type import (
     BASE_COMPONENT_TYPE,
-    CacheTransferPhase,
     ComponentType,
 )
+from sglang.srt.mem_cache.unified_cache.components.base import CacheTransferPhase
 from sglang.srt.mem_cache.unified_cache.components.full import FullComponent
 from sglang.srt.server_args import (
     ServerArgs,
