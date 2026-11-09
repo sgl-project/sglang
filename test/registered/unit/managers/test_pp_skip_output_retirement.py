@@ -1,9 +1,8 @@
 """A step's processing releases what its forward used (in the unified pool, the
-pages pending on it), so the host must have seen that forward end by then,
-including for the two results that carry no output of their own: a pipeline
-stage's skipped output, whose completion must be ordered after the forward's
-done event (the scheduler's current stream does not follow the local forward),
-and a prebuilt step's inner idle forward.
+pages pending on it), so the host must have seen that forward end by then: a
+pipeline stage's received or skipped output, whose completion must be ordered
+after the local forward's done event (neither the scheduler's current stream nor
+the received outputs follow it), and a prebuilt step's inner idle forward.
 """
 
 import contextlib
@@ -12,6 +11,7 @@ from collections import deque
 from types import SimpleNamespace
 from unittest import mock
 
+from sglang.srt.managers import scheduler_pp_mixin
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_pp_mixin import PPBatchMetadata, SchedulerPPMixin
 from sglang.srt.managers.utils import GenerationBatchResult
@@ -127,6 +127,41 @@ class TestSkippedOutputRetirement(CustomTestCase):
         self.assertIsNot(completion.stream, stage.device_module.current)
         (forward_done,) = completion.stream.waited
         self.assertIs(forward_done.stream, forward_stream)
+        self.assertEqual(stage.device_module.current.waited, [])
+
+
+class TestReceivedOutputRetirement(CustomTestCase):
+    def test_completion_follows_the_local_forward(self):
+        stage = _Stage()
+        copy_stream = _Stream("copy")
+        copy_stream.wait_stream = lambda stream: None
+        stage.copy_stream = copy_stream
+        stage.copy_stream_ctx = stage.device_module.stream(copy_stream)
+        stage.schedule_stream = _Stream("schedule")
+        stage._pp_send_output_to_next_stage = lambda *args: []
+        stage._pp_recv_dict_from_prev_stage = lambda: ({}, None)
+        stage._pp_prep_batch_result = lambda batch, meta, outputs: SimpleNamespace(
+            logits_output=None
+        )
+        forward_done = object()
+        meta = PPBatchMetadata(can_run_cuda_graph=False, forward_done=forward_done)
+        target = SimpleNamespace(forward_mode=ForwardMode.DECODE)
+        with (
+            mock.patch.object(
+                scheduler_pp_mixin,
+                "get_parallel",
+                return_value=SimpleNamespace(pp_rank=0, pp_size=2),
+            ),
+            mock.patch.object(scheduler_pp_mixin, "_is_npu", False),
+            mock.patch.object(
+                scheduler_pp_mixin, "_pp_can_skip_output_comm", return_value=False
+            ),
+        ):
+            _, _, completion, _ = stage._pp_send_recv_and_preprocess_output_tensors(
+                0, 0, [target], [meta], deque(), None
+            )
+        self.assertIs(completion.stream, copy_stream)
+        self.assertEqual(copy_stream.waited, [forward_done])
         self.assertEqual(stage.device_module.current.waited, [])
 
 

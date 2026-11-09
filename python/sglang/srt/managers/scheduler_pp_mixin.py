@@ -1044,6 +1044,16 @@ class SchedulerPPMixin:
             d2h_event.record(stream)
         return None, batch_result, d2h_event
 
+    def _pp_follow_local_forward(
+        self: Scheduler, mb_metadata: Optional[PPBatchMetadata]
+    ) -> None:
+        """Order what the current (copy) stream records next after this rank's
+        forward of the micro-batch: processing its result retires that forward,
+        which the received outputs follow only through the other ranks."""
+        forward_done = mb_metadata.forward_done if mb_metadata else None
+        if forward_done is not None:
+            self.device_module.current_stream().wait_event(forward_done)
+
     def _pp_prep_batch_result(
         self: Scheduler,
         batch: ScheduleBatch,
@@ -1594,6 +1604,7 @@ class SchedulerPPMixin:
                 batch_result = self._pp_prep_batch_result(
                     target, mb_metadata[next_mb_id], next_pp_outputs
                 )
+                self._pp_follow_local_forward(mb_metadata[next_mb_id])
                 d2h_event = self.device_module.Event()
                 if (
                     batch_result.logits_output is not None
@@ -1700,6 +1711,7 @@ class SchedulerPPMixin:
                     batch_result = self._pp_prep_batch_result(
                         target_recv, mb_metadata[next_mb_id], next_pp_outputs
                     )
+                    self._pp_follow_local_forward(mb_metadata[next_mb_id])
                     d2h_event = self.device_module.Event()
                     d2h_event.record(self.device_module.current_stream())
 
