@@ -198,12 +198,12 @@ from sglang.srt.sampling.custom_logit_processor import (
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.sampling.watermarking.core import (
-    redact_watermark_secrets,
     resolve_watermark_request,
 )
 from sglang.srt.server_args import (
     PortArgs,
     ServerArgs,
+    redact_server_args_secrets,
 )
 from sglang.srt.speculative.spec_decoding_metrics import (
     populate_spec_info,
@@ -2200,6 +2200,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 yield out
                 break
 
+            if (
+                request is not None
+                and not obj.background
+                and await request.is_disconnected()
+            ):
+                # Abort the request for disconnected requests (running)
+                self.abort_request(obj.rid)
+                # Use exception to kill the whole call stack and asyncio task
+                raise ValueError(
+                    f"Request is disconnected from the client side (type 3). Abort request {obj.rid=}"
+                )
+
             if is_stream:
                 # Record response sent time right before we send response.
                 if not state.time_stats.response_sent_to_client_time:
@@ -2208,18 +2220,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         state.time_stats.get_response_sent_to_client_realtime()
                     )
                 yield out
-            else:
-                if (
-                    request is not None
-                    and not obj.background
-                    and await request.is_disconnected()
-                ):
-                    # Abort the request for disconnected requests (non-streaming, running)
-                    self.abort_request(obj.rid)
-                    # Use exception to kill the whole call stack and asyncio task
-                    raise ValueError(
-                        f"Request is disconnected from the client side (type 3). Abort request {obj.rid=}"
-                    )
 
     async def _handle_batch_request(
         self,
@@ -2542,7 +2542,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         part that cannot be reconstructed afterwards.
         """
         try:
-            return redact_watermark_secrets(
+            return redact_server_args_secrets(
                 self.resolved_config_dict(self.server_args.resolved_dict())
             )
         except Exception as e:
@@ -2551,9 +2551,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
     def _server_args_for_dump(self) -> Optional[Dict[str, Any]]:
         # Redact even with watermarking off: the Python API accepts a server
-        # key without --enable-watermark.
+        # key without --enable-watermark. The request dump pickles this as is;
+        # `write_crash_dump` redacts again on its own.
         try:
-            return redact_watermark_secrets(self.server_args.resolved_dict())
+            return redact_server_args_secrets(self.server_args.resolved_dict())
         except Exception as e:
             logger.error(f"Failed to snapshot server_args for the dump: {e!r}")
             return None

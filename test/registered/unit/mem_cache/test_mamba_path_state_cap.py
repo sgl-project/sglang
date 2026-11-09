@@ -50,6 +50,9 @@ class _FakeTreeCore:
         }
         self.evicted = []
         self.cascaded = []
+        # No joint token/window LRU: this tree keeps no window.
+        self.joint_lru = None
+        self.joint_window_type = None
         # The real eviction helper reports unbacked FULL evictions to the
         # write-through drop counter; this fake never tracks a walk.
         self._is_tracking_unbacked_tokens = False
