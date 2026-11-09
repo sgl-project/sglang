@@ -16,6 +16,7 @@ runs:
         SKIP_PR_TEST_HEALTH_CHECK: ${{ env.SKIP_PR_TEST_HEALTH_CHECK }}
       with:
         github-token: ${{ inputs.github-token }}
+        retries: 3
         script: |
           core.info(`[health-check] START -- event=${context.eventName}, runId=${context.runId}`);
 
@@ -92,6 +93,11 @@ runs:
             // multimodal-gen NPU tests should not cascade fail-fast to perf/accuracy stages.
             if (baseName === 'multimodal-gen-test-1-npu-a3' || baseName === 'multimodal-gen-test-2-npu-a3') {
               core.info(`[health-check] Filtered out multimodal-gen NPU job: ${j.name}`);
+              return false;
+            }
+            // coverage is a downstream summary; its prior failure must not block producer retries
+            if (j.name.split(' / ').pop() === 'diffusion-coverage-check') {
+              core.info(`[health-check] Filtered out coverage summary: ${j.name}`);
               return false;
             }
             // If the failing step is the health check, it's a cascade -- skip it
