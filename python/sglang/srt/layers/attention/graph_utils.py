@@ -21,6 +21,9 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.model_executor.forward_context import get_attn_backend
+from sglang.srt.model_executor.runner_utils.prefill_graph import (
+    should_zero_prefill_padding,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -28,7 +31,7 @@ if TYPE_CHECKING:
 
 
 def _zero_padded_tokens(output, actual_tokens):
-    if actual_tokens is not None:
+    if actual_tokens is not None and should_zero_prefill_padding():
         output[actual_tokens:].zero_()
 
 
@@ -43,6 +46,20 @@ def attention_output_tokens(forward_batch, tokens):
     from sglang.srt.layers.cp.padding import attention_output_tokens as cp_output_tokens
 
     return cp_output_tokens(forward_batch, tokens)
+
+
+@contextmanager
+def real_rows_scope(forward_batch: ForwardBatch, real_num_tokens: int):
+    out_cache_loc = forward_batch.out_cache_loc
+    positions = forward_batch.positions
+    forward_batch.out_cache_loc = out_cache_loc[:real_num_tokens]
+    if positions is not None:
+        forward_batch.positions = positions[:real_num_tokens]
+    try:
+        yield
+    finally:
+        forward_batch.out_cache_loc = out_cache_loc
+        forward_batch.positions = positions
 
 
 @contextmanager
@@ -69,18 +86,14 @@ def attention_input_scope(
         kwargs["aux_tensors"] = [
             tensor[:query_tokens] for tensor in kwargs["aux_tensors"]
         ]
-    cache_loc, positions = forward_batch.out_cache_loc, forward_batch.positions
     previous_output = forward_batch._attn_output
     if cache_tokens is None:
         cache_tokens = query_tokens
-    forward_batch.out_cache_loc = cache_loc[:cache_tokens]
-    if positions is not None:
-        forward_batch.positions = positions[:cache_tokens]
     forward_batch._attn_output = output[:query_tokens]
     try:
-        yield kwargs
+        with real_rows_scope(forward_batch, cache_tokens):
+            yield kwargs
     finally:
-        forward_batch.out_cache_loc, forward_batch.positions = cache_loc, positions
         forward_batch._attn_output = previous_output
 
 
@@ -144,18 +157,26 @@ _KEY_ROW_KWARGS = frozenset({"k_rope", "k_descale", "v_descale", "idx_k", "idx_v
 
 
 def padded_extend_real_tokens(
-    q: torch.Tensor, forward_batch: ForwardBatch
+    num_tokens: int, forward_batch: ForwardBatch
 ) -> Optional[int]:
-    """The number of real rows of an extend batch that MLP sync padded to a multiple of
-    attention TP, whose attention metadata covers only those rows; None for a
-    batch without such padding. Target verify plans its padded rows itself."""
+    """The number of real rows of an extend batch of num_tokens rows that MLP sync
+    padded to a multiple of attention TP, whose attention metadata covers only
+    those rows; None for a batch without such padding. Target verify plans its
+    padded rows itself."""
     mode = forward_batch.forward_mode
     if not mode.is_extend() or mode.is_target_verify():
         return None
     real_num_tokens = forward_batch.global_num_token_non_padded_cpu
-    if real_num_tokens is None or not 0 < real_num_tokens < q.shape[0]:
+    if real_num_tokens is None or not 0 < real_num_tokens < num_tokens:
         return None
     return real_num_tokens
+
+
+def pad_with_zero_rows(t: torch.Tensor, num_tokens: int) -> torch.Tensor:
+    full = t.new_empty((num_tokens, *t.shape[1:]))
+    full[: t.shape[0]].copy_(t)
+    full[t.shape[0] :].zero_()
+    return full
 
 
 def _attention_on_real_rows(
@@ -214,36 +235,27 @@ def _attention_on_real_rows(
         or kwargs.get("idx_q") is not None
         else _new_attention_output(layer, q, v)
     )
-    out_cache_loc = forward_batch.out_cache_loc
-    positions = forward_batch.positions
     attn_output = forward_batch._attn_output
-    forward_batch.out_cache_loc = out_cache_loc[:real_num_tokens]
-    if positions is not None:
-        forward_batch.positions = positions[:real_num_tokens]
     if output is not None:
         forward_batch._attn_output = output[:real_num_tokens]
     try:
-        ret = get_attn_backend().forward(
-            queries(q),
-            keys(k),
-            keys(v),
-            layer,
-            forward_batch,
-            save_kv_cache,
-            **kwargs,
-        )
+        with real_rows_scope(forward_batch, real_num_tokens):
+            ret = get_attn_backend().forward(
+                queries(q),
+                keys(k),
+                keys(v),
+                layer,
+                forward_batch,
+                save_kv_cache,
+                **kwargs,
+            )
     finally:
-        forward_batch.out_cache_loc = out_cache_loc
-        forward_batch.positions = positions
         forward_batch._attn_output = attn_output
 
     def padded(t):
         if not isinstance(t, torch.Tensor) or t.shape[0] != real_num_tokens:
             return t
-        full = t.new_empty((num_tokens, *t.shape[1:]))
-        full[:real_num_tokens].copy_(t)
-        full[real_num_tokens:].zero_()
-        return full
+        return pad_with_zero_rows(t, num_tokens)
 
     if isinstance(ret, tuple):
         return tuple(padded(t) for t in ret)

@@ -14,6 +14,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from sglang.srt.disaggregation.decode import DecodePreallocQueue
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_context
@@ -111,24 +112,29 @@ def _make_prealloc_queue(
     )
     # Disable the SWA-tail branch; this test only exercises the pool-length gate.
     queue._uses_swa_tail_prealloc = MagicMock(return_value=False)
+    # A request table without state slots: the ceiling prices tokens alone.
+    queue.req_to_token_pool = SimpleNamespace(holds_state_slots=False)
 
     model_runner = SimpleNamespace(max_token_pool_size=max_token_pool_size)
     tp_worker = SimpleNamespace(model_runner=model_runner)
     queue.scheduler = SimpleNamespace(
         enable_hisparse=enable_hisparse,
         tp_worker=tp_worker,
-        output_streamer=MagicMock(),
+        request_retirer=SimpleNamespace(retire_unadmitted=MagicMock()),
     )
     return queue
 
 
+class _Req(SimpleNamespace):
+    finish_outside_step = Req.finish_outside_step
+
+
 def _make_req(rid: str, prompt_len: int):
-    return SimpleNamespace(
+    return _Req(
         rid=rid,
         origin_input_ids=[0] * prompt_len,
         output_ids=[],
         return_logprob=False,
-        pd_rebootstrap_in_progress=False,
         finished_reason=None,
     )
 
@@ -150,7 +156,7 @@ class TestCheckIfReqExceedKvCapacity(CustomTestCase):
         req = _make_req("hisparse-long", prompt_len=2048)
 
         self.assertFalse(queue._check_if_req_exceed_kv_capacity(req))
-        queue.scheduler.output_streamer.stream_output.assert_not_called()
+        queue.scheduler.request_retirer.retire_unadmitted.assert_not_called()
 
     def test_hisparse_rejects_beyond_host_backed_size(self):
         """Requests longer than host-backed capacity are still aborted."""
@@ -162,9 +168,7 @@ class TestCheckIfReqExceedKvCapacity(CustomTestCase):
         req = _make_req("hisparse-too-long", prompt_len=5000)
 
         self.assertTrue(queue._check_if_req_exceed_kv_capacity(req))
-        queue.scheduler.output_streamer.stream_output.assert_called_once_with(
-            [req], req.return_logprob
-        )
+        queue.scheduler.request_retirer.retire_unadmitted.assert_called_once_with(req)
         # prepare_abort sets finished_reason to a BAD_REQUEST FINISH_ABORT.
         self.assertIsNotNone(req.finished_reason)
 
@@ -179,25 +183,22 @@ class TestCheckIfReqExceedKvCapacity(CustomTestCase):
         req = _make_req("non-hisparse-too-long", prompt_len=2048)
 
         self.assertTrue(queue._check_if_req_exceed_kv_capacity(req))
-        queue.scheduler.output_streamer.stream_output.assert_called_once_with(
-            [req], req.return_logprob
-        )
+        queue.scheduler.request_retirer.retire_unadmitted.assert_called_once_with(req)
 
     def test_rebootstrap_input_len_used_for_capacity(self):
         """Rebootstrap requests carry both prompt and emitted output_ids; the
-        admission gate must use the rebootstrap-aware length (prompt + output)
+        admission gate must use the pre-alloc fill length (prompt + output - 1)
         rather than just the prompt length."""
         queue = _make_prealloc_queue(
             enable_hisparse=True,
             max_token_pool_size=100,
             max_total_num_tokens=100,
         )
-        req = SimpleNamespace(
+        req = _Req(
             rid="rebootstrap",
             origin_input_ids=[0] * 60,
-            output_ids=[0] * 60,  # 60 + 60 = 120 > 100
+            output_ids=[0] * 60,  # 60 + 59 = 119 > 100
             return_logprob=False,
-            pd_rebootstrap_in_progress=True,
             finished_reason=None,
         )
         self.assertTrue(queue._check_if_req_exceed_kv_capacity(req))
