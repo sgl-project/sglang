@@ -252,6 +252,14 @@ def _prepare_ple_batch(
 ) -> Optional[_PLEBatch]:
     """Prepare the token layout and the shared N-gram history once per forward."""
 
+    # FIXME: this runs inside the model forward and reads the request pool's
+    # Mamba indices and the state slots' virtual-to-physical map after the
+    # decode graph's declared shared-read end (`in_graph_metadata_prep_done`).
+    # The scheduler's write-after-read barrier releases the schedule stream at
+    # that end, so a request row or state slot reused while this forward runs
+    # can be rewritten before it is read here. Declare a later read end, or move
+    # these reads into metadata preparation.
+
     if forward_batch.tbo_parent_token_range is not None:
         raise NotImplementedError("Qwen4 PLE is not compatible with two-batch overlap")
     spec_algorithm = forward_batch.spec_algorithm
@@ -2705,6 +2713,12 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 module.finalize_fused_in_proj()
 
         return loaded_params
+
+    def precompile_kernels_after_loading(self) -> None:
+        from sglang.srt.layers.quantization.unquant import precompile_splitk_tactics
+
+        if precompile_splitk_tactics():
+            logger.info("Precompiled BF16 split-K GEMM tactics for Qwen4-Exp")
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):

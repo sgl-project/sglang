@@ -38,7 +38,6 @@ from .common import (
     get_generation_config,
     get_hf_text_config,
     get_rope_config,
-    get_sparse_attention_config,
     get_tokenizer_from_processor,
     resolve_hf_gguf_reference,
 )
@@ -66,7 +65,6 @@ __all__ = [
     "get_processor",
     "resolve_image_processor_backend",
     "get_rope_config",
-    "get_sparse_attention_config",
     "get_tokenizer",
     "get_tokenizer_from_processor",
     "normalize_rope_scaling_compat",
