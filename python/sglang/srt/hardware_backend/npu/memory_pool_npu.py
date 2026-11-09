@@ -13,7 +13,7 @@ from sglang.srt.mem_cache.memory_pool import (
     get_tensor_size_bytes,
     unwrap_write_loc,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_disagg, get_parallel
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.async_probe import maybe_detect_oob
 from sglang.srt.utils.device import is_npu
@@ -675,6 +675,28 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get()
             and not (is_draft_worker and envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.get())
         )
+        if (
+            not is_draft_worker
+            and envs.SGLANG_NPU_ENABLE_PD_SPLIT_KV.get()
+            and self.enable_sparsity_driven_kv_offload
+        ):
+            from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
+                use_pd_split_kv,
+            )
+
+            if use_pd_split_kv():
+                if (
+                    (kv_lora_rank, qk_rope_head_dim, page_size) != (512, 64, 128)
+                    or dtype != torch.bfloat16
+                    or modelslim_cache_layout is not None
+                    or self.use_fia_nz
+                ):
+                    raise ValueError(
+                        "Ascend PD split KV requires row-major BF16 MLA with "
+                        "512/64 features and page size 128."
+                    )
+                if get_disagg().disaggregation_mode == "prefill":
+                    self.enable_sparsity_driven_kv_offload = False
         if self.enable_sparsity_driven_kv_offload and self.index_head_dim is None:
             raise ValueError("Sparsity-driven KV offload requires an index KV cache.")
         if index_head_dim is None:
@@ -956,13 +978,23 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             scale.view(-1, 1),
         )
 
+    def _get_pd_split_host_pool(self):
+        return getattr(getattr(self, "sparse_kv_manager", None), "host_pool", None)
+
     def _get_disagg_buffer_entries(self):
         """Return (buffer, uses_global_slots) entries in PD transfer order."""
-        self._raise_if_native_kv_cache_disabled()
-        global_kv = self.is_draft_worker
-        entries = [(buffer, global_kv) for buffer in self.k_buffer]
-        if not getattr(self, "dsa_kv_cache_store_fp8", False):
-            entries += [(buffer, global_kv) for buffer in self.v_buffer]
+        host_pool = self._get_pd_split_host_pool()
+        if host_pool is not None:
+            # Match native prefill's CKV layers, then KPE layers, then indexer.
+            entries = [
+                (buf, True) for component in host_pool.buffers for buf in component
+            ]
+        else:
+            self._raise_if_native_kv_cache_disabled()
+            global_kv = self.is_draft_worker
+            entries = [(buffer, global_kv) for buffer in self.k_buffer]
+            if not getattr(self, "dsa_kv_cache_store_fp8", False):
+                entries += [(buffer, global_kv) for buffer in self.v_buffer]
         if self.index_head_dim is not None:
             entries += [(buffer, True) for buffer in self.index_k_buffer]
             if self.index_k_scale_buffer is not None:
@@ -1164,10 +1196,17 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
 
     def _get_cpu_offload_layer_buffers(self, local_layer_id):
         # flatten(page, slot) also works for the zero-width packed V placeholder.
-        buffers = [
-            self.k_buffer[local_layer_id].flatten(0, 1),
-            self.v_buffer[local_layer_id].flatten(0, 1),
-        ]
+        host_pool = self._get_pd_split_host_pool()
+        if host_pool is not None:
+            buffers = [
+                component[local_layer_id].flatten(0, 1)
+                for component in host_pool.buffers
+            ]
+        else:
+            buffers = [
+                self.k_buffer[local_layer_id].flatten(0, 1),
+                self.v_buffer[local_layer_id].flatten(0, 1),
+            ]
         slot = self.indexer_layer_id_to_slot.get(local_layer_id + self.start_layer)
         if slot is not None:
             buffers.append(self.index_k_buffer[slot].flatten(0, 1))
@@ -1187,6 +1226,12 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         buf_of_layers = [
             self._get_cpu_offload_layer_buffers(i) for i in range(self.layer_num)
         ]
+        host_pool = self._get_pd_split_host_pool()
+        if host_pool is not None:
+            kv_cache_cpu = self._snapshot_pd_split_kv(host_pool, buf_of_layers, indices)
+            torch.npu.synchronize()
+            return kv_cache_cpu
+
         uses_global_slots_per_layer = []
         for buffers in buf_of_layers:
             # MLA K/V is rank-local under DCP. The replicated
@@ -1202,10 +1247,43 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         torch.npu.synchronize()
         return kv_cache_cpu
 
+    def _snapshot_pd_split_kv(self, host_pool, buf_of_layers, indices):
+        snapshots = []
+        chunk_size = self.cpu_offloading_chunk_size
+        for kv_k, kv_v, *index_buffers in buf_of_layers:
+            chunks = []
+            for slots in indices.split(chunk_size):
+                if slots.numel() == 0:
+                    continue
+                slots = slots.to(self.device, dtype=torch.int64)
+                rows = torch.arange(slots.numel(), device=self.device)
+                scratch = [
+                    torch.empty(
+                        (slots.numel(), *buf.shape[1:]),
+                        dtype=buf.dtype,
+                        device=self.device,
+                    )
+                    for buf in (kv_k, kv_v)
+                ]
+                # MF-backed host storage is accessed through its device mapping.
+                host_pool.copy_rows((kv_k, kv_v), scratch, slots, rows, rows >= 0)
+                chunks.append(
+                    [buf.to("cpu", copy=True) for buf in scratch]
+                    + [buf[slots].to("cpu", non_blocking=True) for buf in index_buffers]
+                )
+            snapshots.append(chunks)
+        return snapshots
+
     def load_cpu_copy(
         self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
     ):
         torch.npu.synchronize()
+        host_pool = self._get_pd_split_host_pool()
+        if host_pool is not None:
+            self._restore_pd_split_kv(host_pool, kv_cache_cpu, indices, req_pool_index)
+            torch.npu.synchronize()
+            return
+
         chunk_size = self.cpu_offloading_chunk_size
         for local_layer_id in range(self.layer_num):
             buffers = self._get_cpu_offload_layer_buffers(local_layer_id)
@@ -1229,3 +1307,21 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                     assert cpu.shape[0] == len(target_indices)
                     buffer[target_indices] = cpu.to(buffer.device, non_blocking=True)
         torch.npu.synchronize()
+
+    def _restore_pd_split_kv(self, host_pool, snapshots, indices, req_pool_index):
+        chunks = (
+            indices.split(self.cpu_offloading_chunk_size) if indices.numel() else ()
+        )
+        for layer, layer_snapshots in enumerate(snapshots):
+            kv_k, kv_v, *index_buffers = self._get_cpu_offload_layer_buffers(layer)
+            for slots, snapshot in zip(chunks, layer_snapshots, strict=True):
+                slots = slots.to(self.device, dtype=torch.int64)
+                if host_pool.rank == 0:
+                    rows = torch.arange(slots.numel(), device=self.device)
+                    source = [tensor.to(self.device) for tensor in snapshot[:2]]
+                    host_pool.copy_rows(source, (kv_k, kv_v), rows, slots, rows >= 0)
+                for buf, cpu in zip(index_buffers, snapshot[2:], strict=True):
+                    buf[slots] = cpu.to(self.device, non_blocking=True)
+        host_pool.publish()
+        if req_pool_index is not None:
+            self.sparse_kv_manager.reset_requests([int(req_pool_index)])

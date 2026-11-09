@@ -1223,6 +1223,8 @@ class Envs:
     # Per-rank persistent manager allocations, in MiB; 0 leaves the cap unset.
     SGLANG_NPU_SPARSE_KV_HBM_BUDGET_MB = EnvInt(0)
     SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA = EnvBool(False)
+    # Use paged, MemFabric-backed split K/V for fused Ascend PD decode.
+    SGLANG_NPU_ENABLE_PD_SPLIT_KV = EnvBool(False)
     # Use FIAS V2 for DSpark MLA target verify and MHA draft paths. Graph
     # replay requires torch_npu's V2 handler to update actual_seq_kvlen.
     SGLANG_NPU_USE_FIAS_V2_BSND = EnvBool(False)

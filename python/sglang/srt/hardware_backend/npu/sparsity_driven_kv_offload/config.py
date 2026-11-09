@@ -25,6 +25,7 @@ from sglang.srt.runtime_context import (
     attention_backends,
     get_disagg,
     get_exec,
+    get_memory,
     get_parallel,
     get_schedule,
     get_spec,
@@ -37,6 +38,39 @@ if TYPE_CHECKING:
 
 def use_fused_sparse_kv_offload() -> bool:
     return envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.get()
+
+
+def use_pd_split_kv() -> bool:
+    """Select split host storage only for explicitly enabled Ascend PD roles."""
+    if not (
+        envs.SGLANG_NPU_ENABLE_PD_SPLIT_KV.get()
+        and use_fused_sparse_kv_offload()
+        and envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get()
+    ):
+        return False
+    disagg = get_disagg()
+    if disagg.disaggregation_mode not in ("prefill", "decode"):
+        return False
+    prefill_backend, decode_backend = attention_backends()
+    if not is_npu() or (prefill_backend, decode_backend) != ("ascend", "ascend"):
+        raise ValueError("PD split KV requires the Ascend attention backend.")
+    if get_schedule().page_size != 128:
+        raise ValueError("PD split KV requires page size 128.")
+    parallel = get_parallel()
+    if parallel.pp_size != 1 or parallel.attn_cp_size != 1 or parallel.dcp_enabled:
+        raise ValueError("PD split KV requires PP=1 and context parallelism disabled.")
+    if disagg.enable_pd_role_switch:
+        raise ValueError("PD split KV does not support PD role switching.")
+    if disagg.disaggregation_transfer_backend != "ascend":
+        raise ValueError("PD split KV requires the Ascend transfer backend.")
+    if disagg.disaggregation_decode_host_receive_threshold < 1:
+        raise ValueError("PD split KV requires host receive threshold 1.")
+    memory = get_memory()
+    if memory.enable_hisparse or memory.enable_hierarchical_cache:
+        raise ValueError("PD split KV cannot share MF with HiSparse or HiCache.")
+    if parallel.nnodes != 1 or parallel.dp_size != 1 or parallel.attn_dp_size != 1:
+        raise ValueError("PD split KV requires single-node TP without DP.")
+    return True
 
 
 def is_sparsity_driven_kv_offload_enabled(
@@ -73,6 +107,9 @@ def is_sparsity_driven_kv_offload_enabled(
         )
     if not use_fused_sparse_kv_offload():
         return True
+    if use_pd_split_kv() and get_disagg().disaggregation_mode == "prefill":
+        # Publish the same native split page layout that decode registers.
+        return False
     if int(get_dsa_index_topk(model_config.hf_config)) != 2048:
         raise ValueError("Native LIM integration requires model index_topk=2048.")
     if get_schedule().page_size != 128:

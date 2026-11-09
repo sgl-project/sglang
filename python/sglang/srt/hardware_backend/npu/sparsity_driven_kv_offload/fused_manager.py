@@ -23,6 +23,9 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.block_tables imp
     make_fused_prefill_plan,
     prepare_prefill_gather_rows,
 )
+from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
+    use_pd_split_kv,
+)
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.mtp import (
     prepare_mtp_rows,
 )
@@ -32,11 +35,15 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.runtime_context import get_disagg, get_parallel
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:
     import torch.npu
 
+    from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.memfabric_pool import (
+        MemFabricKVPool,
+    )
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.managers.schedule_batch import Req
 
@@ -44,6 +51,8 @@ logger = logging.getLogger(__name__)
 
 
 class SparseKVCacheManager:
+    host_pool: Optional[MemFabricKVPool] = None
+
     def __init__(
         self,
         req_to_token_pool: ReqToTokenPool,
@@ -128,6 +137,12 @@ class SparseKVCacheManager:
         )
         self.cache_capacity = self.device_cache_size
         self._copy_sfa_operator = load_copy_sfa_operator()
+        split_host = use_pd_split_kv() and get_disagg().disaggregation_mode == "decode"
+        if split_host and not any(
+            argument.name == "dram_rope_dev_ptr"
+            for argument in self._copy_sfa_operator._schema.arguments
+        ):
+            raise RuntimeError("PD split KV requires a split-host CopySFA wheel.")
 
         # Allocate exactly the persistent shapes reserved by the plan.
         try:
@@ -164,24 +179,41 @@ class SparseKVCacheManager:
         logger.info("Sparse KV host buffer shape: %s", host_kv_shape)
         device_id = torch.npu.current_device()
 
-        try:
-            for layer_idx in range(self.layer_num):
-                shm_cpu_tensor, host_ptr, dev_ptr = create_shm_tensor(
-                    shape=host_kv_shape,
-                    dtype=self.store_dtype,
-                    device_id=device_id,
-                    name=f"host_kv_pool_{id(paged_kv_cache)}_layer_{layer_idx}_rank_{device_id}",
-                )
-                self.host_kv_buffer.append(shm_cpu_tensor)
-                self.host_ptr_list.append(host_ptr)
-                self.dev_ptr_list.append(dev_ptr)
-        except Exception as e:
-            self._raise_buffer_allocation_error("host_kv_buffer", e)
+        if split_host:
+            from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.memfabric_pool import (
+                MemFabricKVPool,
+            )
+
+            self.host_pool = MemFabricKVPool(
+                tokens=self.host_token_capacity,
+                layers=self.layer_num,
+                widths=(self.kv_lora_rank, self.qk_rope_head_dim),
+                dtype=self.store_dtype,
+                device=self.device,
+                group=get_parallel().attn_tp_group,
+            )
+            self.host_k_buffer, self.host_v_buffer = self.host_pool.buffers
+            self.dev_ptr_list = [x.data_ptr() for x in self.host_k_buffer]
+        else:
+            try:
+                for layer_idx in range(self.layer_num):
+                    shm_cpu_tensor, host_ptr, dev_ptr = create_shm_tensor(
+                        shape=host_kv_shape,
+                        dtype=self.store_dtype,
+                        device_id=device_id,
+                        name=f"host_kv_pool_{id(paged_kv_cache)}_layer_{layer_idx}_rank_{device_id}",
+                    )
+                    self.host_kv_buffer.append(shm_cpu_tensor)
+                    self.host_ptr_list.append(host_ptr)
+                    self.dev_ptr_list.append(dev_ptr)
+            except Exception as e:
+                self._raise_buffer_allocation_error("host_kv_buffer", e)
         from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_lim import (
             LIMDecodeAdapter,
         )
 
-        self.budget.host_kv_spec.validate(self.host_kv_buffer, "host_kv_buffer")
+        if self.host_pool is None:
+            self.budget.host_kv_spec.validate(self.host_kv_buffer, "host_kv_buffer")
         self.budget.validate_buffers(self, self.budget.manager_buffers)
         self.lim_adapter = LIMDecodeAdapter(self)
 
@@ -212,6 +244,25 @@ class SparseKVCacheManager:
     def move_host_kv(self, target, source):
         """Mirror accepted-token compaction before native physical IDs recycle."""
         if source.numel() == 0:
+            return
+        if self.host_pool is not None:
+            if self.host_pool.rank == 0:
+                rows = torch.arange(
+                    source.numel(), device=self.device, dtype=torch.long
+                )
+                valid = torch.ones_like(source, dtype=torch.bool)
+                for k, v in zip(self.host_k_buffer, self.host_v_buffer):
+                    scratch = [
+                        torch.empty(
+                            (source.numel(), 1, width),
+                            dtype=self.store_dtype,
+                            device=self.device,
+                        )
+                        for width in (self.kv_lora_rank, self.qk_rope_head_dim)
+                    ]
+                    self.host_pool.copy_rows((k, v), scratch, source, rows, valid)
+                    self.host_pool.copy_rows(scratch, (k, v), rows, target, valid)
+            self.host_pool.publish()
             return
         count = source.numel()
         scratch = torch.empty(
@@ -313,6 +364,11 @@ class SparseKVCacheManager:
                 "resident_begin": self.resident_begin[layer_idx],
                 "resident_end": self.resident_end[layer_idx],
                 "host_token_capacity": self.host_token_capacity,
+                **(
+                    {"dram_rope_dev_ptr": self.host_v_buffer[layer_idx].data_ptr()}
+                    if self.host_pool is not None
+                    else {}
+                ),
             },
         )
         valid = (
@@ -356,7 +412,7 @@ class SparseKVCacheManager:
         # k_rope:    [num_new_tokens, nhead, qk_rope_head_dim]
         # kv_device: [num_new_tokens, nhead, kv_lora_rank + qk_rope_head_dim]
         src_tensor = torch.cat([k, k_rope], dim=-1).contiguous()
-        dst_tensor = self.host_kv_buffer[layer_idx]
+        dst_tensor = self.host_kv_buffer[layer_idx] if self.host_pool is None else None
         src_index = torch.arange(src_tensor.shape[0], device=device, dtype=torch.long)
         num_src_kvs = int(src_tensor.shape[0])
 
@@ -494,22 +550,34 @@ class SparseKVCacheManager:
         valid_mask = (
             valid_mask & (dst_index >= 0) & (dst_index < self.host_token_capacity)
         )
-        assert src_tensor.shape[1:] == dst_tensor.shape[2:]
+        if dst_tensor is not None:
+            assert src_tensor.shape[1:] == dst_tensor.shape[2:]
         assert src_index.shape == dst_index.shape == valid_mask.shape
 
         actual_stream = stream if stream is not None else torch.npu.current_stream()
         with torch.npu.stream(actual_stream):
-            unidex_copy_inplace(
-                src_tensor,
-                dst_tensor,
-                src_index,
-                dst_index,
-                valid_mask,
-                1,  # src_tensor: [num_new_tokens, nhead, head_dim]
-                2,  # dst_tensor: [num_req, max_context_len, nhead, head_dim]
-                block_dim=48,
-                dst_ptr=self.dev_ptr_list[layer_idx],
-            )
+            if self.host_pool is not None:
+                if self.host_pool.rank == 0:
+                    self.host_pool.copy_rows(
+                        (k.contiguous(), k_rope.contiguous()),
+                        (self.host_k_buffer[layer_idx], self.host_v_buffer[layer_idx]),
+                        src_index,
+                        dst_index,
+                        valid_mask,
+                    )
+                self.host_pool.publish()
+            else:
+                unidex_copy_inplace(
+                    src_tensor,
+                    dst_tensor,
+                    src_index,
+                    dst_index,
+                    valid_mask,
+                    1,  # src_tensor: [num_new_tokens, nhead, head_dim]
+                    2,  # dst_tensor: [num_req, max_context_len, nhead, head_dim]
+                    block_dim=48,
+                    dst_ptr=self.dev_ptr_list[layer_idx],
+                )
 
             if forward_batch.forward_mode.is_extend_without_speculative():
                 # A prefill can rewrite an existing request's host prefix.
@@ -603,6 +671,33 @@ class SparseKVCacheManager:
                 mapping = plan.current_mapping
             host_mask = plan.valid if mapping is None else mapping[3]
             with torch.npu.stream(actual_stream):
+                if self.host_pool is not None:
+                    self.host_pool.copy_rows(
+                        (self.host_k_buffer[layer_idx], self.host_v_buffer[layer_idx]),
+                        (nope, rope),
+                        plan.source,
+                        plan.destination,
+                        host_mask,
+                    )
+                    if mapping is not None:
+                        src, dst, valid, _ = mapping
+                        for component, output in zip(
+                            current_payload.split(
+                                (self.kv_lora_rank, self.qk_rope_head_dim), dim=-1
+                            ),
+                            (nope, rope),
+                        ):
+                            unidex_copy_inplace(
+                                component.contiguous(),
+                                output,
+                                src,
+                                dst,
+                                valid,
+                                1,
+                                1,
+                                block_dim=48,
+                            )
+                    return nope, rope
                 unidex_copy_inplace(
                     self.host_kv_buffer[layer_idx],
                     packed,
@@ -661,12 +756,6 @@ class SparseKVCacheManager:
             req_ids = req_ids.index_select(0, keep)
             seq_lens = seq_lens.index_select(0, keep)
 
-        kv_cat = torch.empty(
-            (total_tokens, self.head_num, self.head_dim),
-            dtype=self.store_dtype,
-            device=device,
-        )
-
         seq_starts = torch.cumsum(seq_lens, dim=0) - seq_lens
         src_req_ids = torch.repeat_interleave(
             req_ids, seq_lens, output_size=total_tokens
@@ -683,6 +772,28 @@ class SparseKVCacheManager:
 
         actual_stream = stream if stream is not None else torch.npu.current_stream()
         with torch.npu.stream(actual_stream):
+            if self.host_pool is not None:
+                outputs = [
+                    torch.empty(
+                        (total_tokens, self.head_num, width),
+                        dtype=self.store_dtype,
+                        device=device,
+                    )
+                    for width in (self.kv_lora_rank, self.qk_rope_head_dim)
+                ]
+                self.host_pool.copy_rows(
+                    (self.host_k_buffer[layer_idx], self.host_v_buffer[layer_idx]),
+                    outputs,
+                    src_index,
+                    dst_index,
+                    valid_mask,
+                )
+                return tuple(outputs)
+            kv_cat = torch.empty(
+                (total_tokens, self.head_num, self.head_dim),
+                dtype=self.store_dtype,
+                device=device,
+            )
             unidex_copy_inplace(
                 self.host_kv_buffer[layer_idx],
                 kv_cat,

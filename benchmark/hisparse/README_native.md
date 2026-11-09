@@ -36,6 +36,26 @@ prefix hits. Request reuse invalidates the extents; rollback from sparse to
 dense rehydrates the missing dense range. Long full-visible rows retain the
 resident-refresh CopySFA optimization.
 
+## Ascend PD split K/V
+
+Set the following on the Ascend Prefill and Decode workers when using
+`--disaggregation-transfer-backend ascend`:
+
+```bash
+export SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD=1
+export SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA=1
+export SGLANG_NPU_ENABLE_PD_SPLIT_KV=1
+```
+
+Prefill allocates native HBM KV. Decode registers separate MemFabric DRAM
+CKV and KPE buffers in the same page order and keeps indexer and draft KV in
+HBM. Use BF16 KV, `--page-size 128`, and one TP group per worker with PP=1
+and no data or context parallelism. Use the same model on both workers.
+Decode requires the split-host CopySFA support from
+[sgl-kernel-npu #909](https://github.com/sgl-project/sgl-kernel-npu/pull/909)
+and a MemFabric installation with shared AccOffload and Ascend transfer
+support. The default flag value is `0`.
+
 ## Component checks
 
 Initialize Ascend/ATB and select the matching framework and kernel packages,
