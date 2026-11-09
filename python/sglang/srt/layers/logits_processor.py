@@ -68,6 +68,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.utils.device import (
     async_d2h,
+    async_h2d,
     is_cpu,
     is_gfx1250_supported,
     is_hip,
@@ -310,13 +311,14 @@ class LogitsProcessorOutput:
     input_top_logprobs_val: Optional[List] = None
     input_top_logprobs_idx: Optional[List] = None
     # The logprobs and ids of the requested token ids in input positions. shape: [#seq, n] (n is the number of requested token ids)
-    # Can contain either lists or GPU tensors (for delayed GPU-to-CPU transfer optimization)
+    # Can contain either lists or GPU tensors (for delayed GPU-to-CPU transfer optimization),
+    # or pinned CPU spans pending on input_logprobs_copy_done.
     input_token_ids_logprobs_val: Optional[List[Union[List[float], torch.Tensor]]] = (
         None
     )
     input_token_ids_logprobs_idx: Optional[List] = None
 
-    # Completion of input-logprob copies from borrowed graph storage.
+    # Completion of input-logprob copies from borrowed graph storage or the multi-item scoring readback.
     input_logprobs_copy_done: Optional[torch.cuda.Event] = None
 
     ## Part 4: Diffusion LLM only.
@@ -363,8 +365,7 @@ class LogitsProcessorOutput:
             return
         self.input_logprobs_copy_done.synchronize()
         self.input_logprobs_copy_done = None
-        # Only borrowed results contain spans within each sequence. Other
-        # producers (including multi-item scoring) keep their existing layout.
+        # Only borrowed graph results and multi-item scoring hand over spans per sequence.
         for sequences in (
             self.input_top_logprobs_val,
             self.input_top_logprobs_idx,
@@ -532,6 +533,57 @@ class LogitsMetadata:
             dtype=dtype,
             device=device,
         )
+
+
+def _multi_item_token_ids_logprobs_to_host(
+    logprobs: torch.Tensor,
+    token_ids_logprobs: List[Optional[List[int]]],
+    rows_per_seq: List[int],
+) -> Tuple[List[List[torch.Tensor]], List[List[List[int]]], torch.cuda.Event]:
+    """Gather the requested token-id logprobs of a multi-item scoring batch into
+    pinned host spans (read by ``LogitsProcessorOutput.finalize_input_logprobs``
+    after the returned event). One gather and copy when all scored sequences ask
+    for the same ids, one copy when only the count matches, else one per sequence.
+    """
+    device = logprobs.device
+    vals: List[List[torch.Tensor]] = [[] for _ in rows_per_seq]
+    idxs: List[List[List[int]]] = [[] for _ in rows_per_seq]
+    requested = []  # (sequence, first row, rows, token ids)
+    start = 0
+    for i, (ids, n) in enumerate(zip(token_ids_logprobs, rows_per_seq)):
+        if ids is not None and n > 0:
+            requested.append((i, start, n, ids))
+            idxs[i] = [list(ids) for _ in range(n)]
+        start += n
+
+    shared = (
+        requested
+        and len(requested) == sum(n > 0 for n in rows_per_seq)
+        and all(ids == requested[0][3] for *_, ids in requested)
+    )
+    if shared:
+        ids_tensor = async_h2d(requested[0][3], dtype=torch.long, device=device)
+        host = async_d2h(logprobs[:, ids_tensor])
+        for i, first, n, _ in requested:
+            vals[i] = [host[first : first + n]]
+    else:
+        gathered = [
+            logprobs[first : first + n, async_h2d(ids, dtype=torch.long, device=device)]
+            for _, first, n, ids in requested
+        ]
+        if gathered and len({g.shape[1] for g in gathered}) == 1:
+            host = async_d2h(torch.cat(gathered, dim=0))
+            pt = 0
+            for i, _, n, _ in requested:
+                vals[i] = [host[pt : pt + n]]
+                pt += n
+        else:
+            for (i, *_), g in zip(requested, gathered):
+                vals[i] = [async_d2h(g)]
+
+    copy_done = torch.cuda.Event()
+    copy_done.record(torch.cuda.current_stream(device))
+    return vals, idxs, copy_done
 
 
 class LogitsProcessor(nn.Module):
@@ -1648,7 +1700,12 @@ class LogitsProcessor(nn.Module):
                 offset += req_seq_len
         else:
             all_tensors.append(multi_item_delimiter_indices[0] - 1)
-        multi_item_indices = torch.cat(all_tensors).to(device, non_blocking=True)
+        multi_item_indices = torch.cat(all_tensors)
+        # Pageable copies block the scheduler until the producing forward finishes.
+        pin = is_pin_memory_available(device)
+        if pin:
+            multi_item_indices = multi_item_indices.pin_memory()
+        multi_item_indices = multi_item_indices.to(device, non_blocking=pin)
 
         # Extract hidden states at delimiter positions for multi-item scoring
         sliced_hidden = hidden_states[multi_item_indices]
@@ -1672,17 +1729,33 @@ class LogitsProcessor(nn.Module):
             ]
 
         # Get the logprobs of specified token ids
+        input_logprobs_copy_done = None
         if logits_metadata.extend_token_ids_logprob:
-            (
-                input_token_ids_logprobs_val,
-                input_token_ids_logprobs_idx,
-            ) = get_token_ids_logprobs_raw(
-                sliced_logprobs,
-                logits_metadata.token_ids_logprobs,
-                stage=LogprobStage.PREFILL,
-                extend_logprob_pruned_lens_cpu=logits_metadata.extend_logprob_pruned_lens_cpu,
-                no_copy_to_cpu=True,
-            )
+            if (
+                pin
+                and sliced_logprobs.is_cuda
+                and not logits_metadata.extend_return_top_logprob
+            ):
+                (
+                    input_token_ids_logprobs_val,
+                    input_token_ids_logprobs_idx,
+                    input_logprobs_copy_done,
+                ) = _multi_item_token_ids_logprobs_to_host(
+                    sliced_logprobs,
+                    logits_metadata.token_ids_logprobs,
+                    [len(t) for t in multi_item_delimiter_indices],
+                )
+            else:
+                (
+                    input_token_ids_logprobs_val,
+                    input_token_ids_logprobs_idx,
+                ) = get_token_ids_logprobs_raw(
+                    sliced_logprobs,
+                    logits_metadata.token_ids_logprobs,
+                    stage=LogprobStage.PREFILL,
+                    extend_logprob_pruned_lens_cpu=logits_metadata.extend_logprob_pruned_lens_cpu,
+                    no_copy_to_cpu=True,
+                )
 
         # Get the logprob of top-k tokens
         if logits_metadata.extend_return_top_logprob:
@@ -1712,6 +1785,7 @@ class LogitsProcessor(nn.Module):
             input_top_logprobs_idx=input_top_logprobs_idx,
             input_token_ids_logprobs_val=input_token_ids_logprobs_val,
             input_token_ids_logprobs_idx=input_token_ids_logprobs_idx,
+            input_logprobs_copy_done=input_logprobs_copy_done,
             mm_input_embeds=logits_metadata.mm_input_embeds,
         )
 
