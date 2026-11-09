@@ -26,6 +26,7 @@ from sglang.srt.arg_groups.overrides import (
     _deterministic_rocm_rccl_check,
     _deterministic_sampling_backend,
     _fa4_page_constraint,
+    _hybrid_kda_fa4_backend_constraint,
     _hybrid_swa_memory_backend_disable,
     _intel_xpu_page_constraint,
     _mla_backend_page_constraints,
@@ -248,6 +249,8 @@ def handle_attention_backend_compatibility(server_args: Any):
     run_post_process_pass(server_args, _attention_backend_fa3_fp8_fallback)
 
     run_post_process_pass(server_args, _fa4_page_constraint)
+
+    run_post_process_pass(server_args, _hybrid_kda_fa4_backend_constraint)
 
     # AMD platforms backends
     if resolved_view(server_args).attention_backend == "aiter":
