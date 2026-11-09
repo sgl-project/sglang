@@ -183,7 +183,7 @@ def _build_explicit_state_block_table(
     seqused: torch.Tensor,
     max_input_capacity: int,
 ) -> torch.Tensor:
-    """Adapt GPU-style state locations to the A3 cache_mode=2 table ABI."""
+    """Adapt GPU-style state locations to the arch22 cache_mode=2 table ABI."""
     req_pool_indices = req_pool_indices.to(torch.int64)
     capacities = cu_seqlens[1:] - cu_seqlens[:-1]
     history_size = coff * compress_ratio
@@ -215,7 +215,7 @@ def _build_cycle_state_block_table(req_pool_indices: torch.Tensor) -> torch.Tens
     """Build the Ascend 950 cache_mode=2 request-bank table.
 
     Ascend 950 interprets this input as one bank id per request and computes the
-    in-bank ring offset itself.  It must never receive the A3 explicit
+    in-bank ring offset itself.  It must never receive the arch22 explicit
     per-token location table.
     """
     if req_pool_indices.ndim != 1:
@@ -556,7 +556,7 @@ class CompressorAscendBackendMixin:
         if is_npu_arch35():
             # Ascend 950 cache_mode=2 is CYCLE: one request bank per row.  The
             # compressor derives the in-bank offset from start_pos; passing
-            # the A3 explicit [B, width] table here would be an ABI violation.
+            # the arch22 explicit [B, width] table here would be an ABI violation.
             state_block_table = fm.dsv4_cycle_state_block_table
         else:
             table_cache = fm.dsv4_explicit_state_block_tables
@@ -1089,8 +1089,8 @@ class LowRatioCompressAscendBackendMixin:
             kv, _ = compressor.project(x)
         else:
             assert is_npu_arch35(), (
-                "the fused DeepSeek-V4.1 compressor needs Atlas A5 "
-                "(kv_compress_epilog_v2 packing); A3 is not supported."
+                "the fused DeepSeek-V4.1 compressor needs arch35 "
+                "(kv_compress_epilog_v2 packing); arch22 is not supported."
             )
             # NPU needs the two separate projections below; fail here rather
             # than with an AttributeError deep inside the forward.
@@ -1100,7 +1100,7 @@ class LowRatioCompressAscendBackendMixin:
             )
             ds41 = _ds41_ops()
             pool = self.token_to_kv_pool
-            # A5 cache_mode=2 (CYCLE): one request bank per row, the in-bank
+            # arch35 cache_mode=2 (CYCLE): one request bank per row, the in-bank
             # offset comes from start_pos. Second arg False: the attention
             # state pool, never the nested c4-indexer one.
             state_pool = pool._get_state_pool(layer.layer_id, False)
@@ -2901,7 +2901,7 @@ class DeepseekV4AscendAttnBackend(
             metadata.dsv4_cycle_state_block_table = torch.zeros(
                 bs, dtype=torch.int32, device=device
             )
-            # A5 addresses state by request bank (CYCLE), so the explicit
+            # arch35 addresses state by request bank (CYCLE), so the explicit
             # per-ratio location tables are never read; leave them empty (the
             # ratio-2 pair pool is a plain CompressStatePool with no
             # ``dummy_state_loc`` sentinel to seed them with).

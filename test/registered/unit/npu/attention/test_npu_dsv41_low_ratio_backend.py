@@ -303,11 +303,11 @@ class TestPoolFactory(unittest.TestCase):
         out, calls = self._make(
             page_size=128,
             global_page_size=128,
-            kv_layout=NPUDSV4KVLayout.A5_FP8,
+            kv_layout=NPUDSV4KVLayout.V4_FP8,
         )
         self.assertEqual(out, "NPUDeepSeekV4SingleKVPool")
         self.assertIs(
-            calls["NPUDeepSeekV4SingleKVPool"]["layout"], NPUDSV4KVLayout.A5_FP8
+            calls["NPUDeepSeekV4SingleKVPool"]["layout"], NPUDSV4KVLayout.V4_FP8
         )
         self.assertEqual(calls["NPUDeepSeekV4SingleKVPool"]["kernel_page_size"], 128)
 
@@ -315,7 +315,7 @@ class TestPoolFactory(unittest.TestCase):
         out, calls = self._make(
             page_size=32,
             global_page_size=128,
-            kv_layout=NPUDSV4KVLayout.A5_FP8,
+            kv_layout=NPUDSV4KVLayout.V4_FP8,
         )
         self.assertEqual(out, "NPUDeepSeekV4SingleKVPool")
         self.assertNotIn("DSV41NPUSingleKVPool", calls)
@@ -337,12 +337,12 @@ class TestPoolFactory(unittest.TestCase):
         with patch.object(dsv4_memory_pool, "is_npu_arch35", return_value=True):
             self.assertIs(
                 DSV4NPUTokenToKVPool._window_kv_layout(fake_v4),
-                NPUDSV4KVLayout.A5_FP8,
+                NPUDSV4KVLayout.V4_FP8,
             )
         with patch.object(dsv4_memory_pool, "is_npu_arch35", return_value=False):
             self.assertIs(
                 DSV4NPUTokenToKVPool._window_kv_layout(fake_v4),
-                NPUDSV4KVLayout.A3_BF16,
+                NPUDSV4KVLayout.V4_BF16,
             )
 
     def test_compressed_kv_layout_tags_every_ratio(self):
@@ -363,12 +363,12 @@ class TestPoolFactory(unittest.TestCase):
         with patch.object(dsv4_memory_pool, "is_npu_arch35", return_value=True):
             self.assertIs(
                 DSV4NPUTokenToKVPool.compressed_kv_layout(fake_v4, 4),
-                NPUDSV4KVLayout.A5_FP8,
+                NPUDSV4KVLayout.V4_FP8,
             )
         with patch.object(dsv4_memory_pool, "is_npu_arch35", return_value=False):
             self.assertIs(
                 DSV4NPUTokenToKVPool.compressed_kv_layout(fake_v4, 128),
-                NPUDSV4KVLayout.A3_BF16,
+                NPUDSV4KVLayout.V4_BF16,
             )
 
 

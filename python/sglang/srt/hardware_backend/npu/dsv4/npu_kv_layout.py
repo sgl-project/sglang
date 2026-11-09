@@ -1,12 +1,13 @@
 """Row formats of the NPU DeepSeek-V4-family single-KV / indexer-K pools.
 
 One member per physical row shape, one per (generation, pool role). The shared
-kernels ``KVLayout`` is the CUDA/TMA kernel contract and carries no A3/A5 row
+kernels ``KVLayout`` is the CUDA/TMA kernel contract and carries no arch22/arch35 row
 shapes, so the NPU pools resolve their format into this enum at construction
 time: ``_window_kv_layout()`` tags the non-compressed pools and
 ``compressed_kv_layout()`` the compressed ones, so ``_make_kv_pool`` only ever
-sees members of this enum. The V4.1 value strings keep the shared enum's
-spellings for PD negotiation; the V4 members are NPU-only row shapes.
+sees members of this enum. The ``v41_fp4`` value keeps the shared enum's
+spelling (the only one an external consumer could match); the other values
+are NPU-only spellings — members are consumed by identity, never by value.
 """
 
 import enum
@@ -15,9 +16,9 @@ import torch
 
 
 class NPUDSV4KVLayout(str, enum.Enum):
-    A3_BF16 = "v4_a3"
-    A5_FP8 = "v4_a5"
-    V41_SWA_FP8 = "v41"
+    V4_BF16 = "v4_bf16"
+    V4_FP8 = "v4_fp8"
+    V41_SWA_FP8 = "v41_fp8"
     V41_CMP_FP4 = "v41_fp4"
 
     @property
@@ -30,8 +31,8 @@ class NPUDSV4KVLayout(str, enum.Enum):
     def quant_group(self) -> int:
         """Values sharing one quant scale; None rows are written unquantized."""
         return {
-            NPUDSV4KVLayout.A3_BF16: None,
-            NPUDSV4KVLayout.A5_FP8: 64,
+            NPUDSV4KVLayout.V4_BF16: None,
+            NPUDSV4KVLayout.V4_FP8: 64,
             NPUDSV4KVLayout.V41_SWA_FP8: 32,
             NPUDSV4KVLayout.V41_CMP_FP4: 16,
         }[self]
@@ -39,12 +40,12 @@ class NPUDSV4KVLayout(str, enum.Enum):
     @property
     def quant_mode(self):
         """Quant mode of the epilog write op: int for kv_compress_epilog
-        (A5 window rows), str for kv_compress_epilog_v2 (V4.1 rows)."""
+        (arch35 window rows), str for kv_compress_epilog_v2 (V4.1 rows)."""
         return {
-            NPUDSV4KVLayout.A3_BF16: None,
+            NPUDSV4KVLayout.V4_BF16: None,
             # epilog v1 mode; the deployed wheel's encoding, not the one in
             # the current ops-transformer source (which also dropped layout=1).
-            NPUDSV4KVLayout.A5_FP8: 2,
+            NPUDSV4KVLayout.V4_FP8: 2,
             NPUDSV4KVLayout.V41_SWA_FP8: "mxfp8_bf16",
             NPUDSV4KVLayout.V41_CMP_FP4: "mxfp4_bf16",
         }[self]
@@ -57,8 +58,8 @@ class NPUDSV4KVLayout(str, enum.Enum):
     @property
     def row_alignment(self) -> int:
         return {
-            NPUDSV4KVLayout.A3_BF16: None,
-            NPUDSV4KVLayout.A5_FP8: 128,
+            NPUDSV4KVLayout.V4_BF16: None,
+            NPUDSV4KVLayout.V4_FP8: 128,
             NPUDSV4KVLayout.V41_SWA_FP8: 32,
             NPUDSV4KVLayout.V41_CMP_FP4: 32,
         }[self]
@@ -67,14 +68,14 @@ class NPUDSV4KVLayout(str, enum.Enum):
         """(kv_dim, kv_dtype) of the single-KV PA_ND buffer: last-dim size in
         store-dtype elements plus the store dtype.
 
-        A5 packs nope as fp8 with one scale per quant_group and keeps the rope
+        Arch35 packs nope as fp8 with one scale per quant_group and keeps the rope
         tail in bf16. V4.1 rows are fully quantized by kv_compress_epilog_v2
         (no bf16 tail): dataCol = head_dim (mxfp8) or head_dim // 2 (packed
         mxfp4, two e2m1 per byte), scales are G * bf16.
         """
-        if self is NPUDSV4KVLayout.A3_BF16:
+        if self is NPUDSV4KVLayout.V4_BF16:
             return nope_dim + rope_dim, torch.bfloat16
-        if self is NPUDSV4KVLayout.A5_FP8:
+        if self is NPUDSV4KVLayout.V4_FP8:
             raw = nope_dim + rope_dim * 2 + -(-nope_dim // self.quant_group)
             align = self.row_alignment
             return -(-raw // align) * align, torch.float8_e4m3fn
@@ -99,7 +100,7 @@ class NPUDSV4KVLayout(str, enum.Enum):
         if self in (NPUDSV4KVLayout.V41_SWA_FP8, NPUDSV4KVLayout.V41_CMP_FP4):
             assert head_dim % 32 == 0, head_dim
             return head_dim // 2, head_dim // 32, torch.uint8, torch.uint8
-        if self is NPUDSV4KVLayout.A5_FP8:
+        if self is NPUDSV4KVLayout.V4_FP8:
             return head_dim, 1, torch.float8_e4m3fn, torch.float32
         return head_dim, 1, torch.int8, torch.float16
 

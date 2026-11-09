@@ -1962,7 +1962,7 @@ class KVCacheConfigurator:
         # NPU keeps its PA_ND KV-pool subclass, while Compressor state sizing
         # follows the same fixed ring ownership as GPU. Do not replace the
         # configurator's C4-SWA/C128-request budgets with a paged allocator
-        # estimate: Atlas A3 cache_mode=2 consumes explicit flat state_locs.
+        # estimate: arch22 cache_mode=2 consumes explicit flat state_locs.
         if _is_npu:
             from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
                 DSV4NPUTokenToKVPool,
