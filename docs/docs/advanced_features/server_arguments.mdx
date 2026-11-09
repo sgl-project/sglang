@@ -2188,9 +2188,9 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--hicache-io-backend`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The IO backend for KV cache transfer between CPU and GPU</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The IO backend for KV cache transfer between CPU and GPU. 'direct' moves page_first_direct pages with copy engines; 'direct_kernel' moves the same layout with SM copy kernels driven by GPU-side indices (CUDA; MLA KV and DSA indexer pools only; pre-Blackwell PCIe hosts should keep 'direct').</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`kernel`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>direct</code>, <code>kernel</code>, <code>kernel_ascend</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>direct</code>, <code>direct_kernel</code>, <code>kernel</code>, <code>kernel_ascend</code></td>
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--hicache-mem-layout`</td>
