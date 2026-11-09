@@ -2354,7 +2354,13 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         cons, req_id, seq_a, _ = self._stage_buffer_mid_tree_hit(
             self._make_storage_dir(), sw_pages - 1
         )
-        cons.evict(EvictParams(num_tokens=0, swa_num_tokens=len(seq_a)))
+        cons.evict(
+            EvictParams(
+                window_num_tokens={
+                    cons.window_sub_pool_of_slot(ComponentType.SWA): len(seq_a)
+                }
+            )
+        )
         staged = cons.buffer_pipeline.staged_prefetches[req_id]
         req = self._make_req(cons.req_to_token_pool)
         req.rid = req_id.rid
