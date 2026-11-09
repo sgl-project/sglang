@@ -69,6 +69,7 @@ class TestDecodeHiCacheTreeCore(CustomTestCase):
             tree_core=SimpleNamespace(is_eagle=False),
             match_prefix=Mock(return_value=rematch),
             init_load_back=Mock(side_effect=init_load_back),
+            finish_storage_prefetch_admission=Mock(),
             path_device_indices=Mock(return_value=restored_path),
             lock=Mock(return_value="restore-lock"),
         )

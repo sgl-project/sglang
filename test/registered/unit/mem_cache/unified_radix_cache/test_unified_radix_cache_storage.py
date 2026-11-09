@@ -4,6 +4,7 @@ import os
 import time
 import unittest
 from array import array
+from collections import deque
 from contextlib import ExitStack
 from queue import Queue
 from types import SimpleNamespace
@@ -34,6 +35,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransferResult,
     SidecarPoolSpec,
 )
+from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import PrefetchOperation
 from sglang.srt.mem_cache.pool_host import PoolEntry
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.radix_cache import RadixKey
@@ -2586,6 +2588,24 @@ class TestUnifiedTreeCoreSWAPrefetchBackends(UnifiedRadixCacheFixtures, CustomTe
         self.assertEqual(actions, [])
 
 
+class TestCacheAdmissionLookup(UnifiedRadixCacheStorageFixtures, CustomTestCase):
+    cfg = CacheConfig(page_size=16, kv_size=256)
+
+    def test_wait_complete_preserves_lookup_under_prefetch_pressure(self):
+        """A waiting-policy request must still recover a real L3 hit when
+        speculative demand has reached the old query-time rate limit."""
+        storage_dir = self._make_storage_dir()
+        seq = self._make_seq(1, 4)
+        self._l3_produce(storage_dir, seq, marker=7)
+        cache, _, _ = self._l3_consumer(storage_dir)
+        cache.cache_controller.prefetch_capacity_limit = 0
+        handle = CacheRequestHandle("lookup-under-pressure", 0)
+        self._consume_prefetch(cache, seq, handle)
+        self.assertEqual(match_prefix(cache, seq).host_hit_length, len(seq))
+        cache.finish_storage_prefetch_admission(handle, len(seq), None)
+        cache.sanity_check()
+
+
 class TestPrefetchCommitOrdering(CustomTestCase):
     """The prefetch commit's action ordering (mock-based)."""
 
@@ -2601,6 +2621,9 @@ class TestPrefetchCommitOrdering(CustomTestCase):
             with self.subTest(component=component):
                 cache = mock.MagicMock()
                 cache.host_memory_mode = "cache"
+                cache.pending_cache_hit_allocs = deque()
+                cache.prefetch_admission_locks = {}
+                cache.ongoing_load_back = {}
                 cache.page_size = 4
                 cache.prefetch_threshold = 4
                 cc = cache.cache_controller
@@ -2745,6 +2768,349 @@ class TestUnifiedRadixPrefetchCorruption(
         kv_size=4096,
         max_context_len=4096,
     )
+
+    def _completed_host_prefetch(self, cache, handle):
+        key = RadixKey(array("q", range(1000, 1000 + 4 * self.ps)))
+        indices = cache.cache_controller.mem_pool_host.alloc(len(key))
+        self.assertIsNotNone(indices)
+        root = cache.root_node_handle()
+        operation = SimpleNamespace(
+            handle=handle,
+            completed_tokens=len(key),
+            hash_value=[f"h{i}" for i in range(4)],
+            pool_transfers=[],
+            pool_storage_result=PoolTransferResult.empty(),
+            storage_start=0,
+            deadline_expired=False,
+        )
+        cache.ongoing_prefetch[handle] = _OngoingPrefetch(
+            root,
+            key,
+            indices,
+            operation,
+            cache.inc_host_lock_ref(root).to_dec_params(),
+            {},
+        )
+        cache.cache_controller.prefetch_tokens_occupied = len(key)
+        cache._handle_prefetch_result(operation)
+        return key
+
+    def test_completed_prefetch_survives_eviction_until_admission(self):
+        """Another allocation between the IO ACK and admission must not
+        destroy the successfully fetched prefix, even after a radix split."""
+        cache, _, _ = build_fixture(self.cfg)
+        self._init_hicache(cache)
+        handle = CacheRequestHandle("waiting", 0)
+        key = self._completed_host_prefetch(cache, handle)
+        cache.match_prefix(MatchPrefixParams(key=key[: 2 * self.ps]))
+        cache.evict_host(len(key))
+        result = cache.match_prefix(MatchPrefixParams(key=key))
+        self.assertEqual(result.host_hit_length, len(key))
+
+        cache.finish_storage_prefetch_admission(handle, len(key), None)
+        cache.finish_storage_prefetch_admission(handle, len(key), None)
+        cache.evict_host(len(key))
+        self.assertEqual(
+            cache.match_prefix(MatchPrefixParams(key=key)).host_hit_length, 0
+        )
+        cache.sanity_check()
+
+    def test_prefetch_handoff_preserves_independent_host_pin(self):
+        """Admission may release its hold only after a consumer has its own."""
+        cache, _, _ = build_fixture(self.cfg)
+        self._init_hicache(cache)
+        handle = CacheRequestHandle("decode-handoff", 0)
+        key = self._completed_host_prefetch(cache, handle)
+        matched = cache.match_prefix(MatchPrefixParams(key=key))
+        receipt = cache.inc_host_lock_ref(matched.last_host_node).to_dec_params()
+
+        cache.finish_storage_prefetch_admission(handle, len(key), None)
+        cache.evict_host(len(key))
+        self.assertEqual(
+            cache.match_prefix(MatchPrefixParams(key=key)).host_hit_length, len(key)
+        )
+        cache.dec_host_lock_ref(matched.last_host_node, receipt)
+        cache.evict_host(len(key))
+        self.assertEqual(
+            cache.match_prefix(MatchPrefixParams(key=key)).host_hit_length, 0
+        )
+        cache.sanity_check()
+
+    def test_pd_completed_prefetch_transfers_hold_to_consumer(self):
+        from sglang.srt.disaggregation import decode_hicache_mixin
+
+        finish = decode_hicache_mixin._finish_decode_storage_admission
+
+        cache, _, _ = build_fixture(self.cfg)
+        self._init_hicache(cache)
+        handle = CacheRequestHandle("pd-handoff", 0)
+        key = self._completed_host_prefetch(cache, handle)
+        match = cache.match_prefix(MatchPrefixParams(key=key))
+        receipt = cache.inc_host_lock_ref(match.last_host_node).to_dec_params()
+        req = SimpleNamespace(
+            cache_request_handle=handle,
+            storage_hit_start=0,
+            storage_hit_length=len(key),
+        )
+        dr = SimpleNamespace(req=req, hicache_prefetch_done=True)
+        finish(cache, dr, len(key))
+        self.assertFalse(dr.hicache_prefetch_done)
+        self.assertNotIn(handle, cache.prefetch_admission_locks)
+        cache.evict_host(len(key))
+        self.assertEqual(
+            cache.match_prefix(MatchPrefixParams(key=key)).host_hit_length, len(key)
+        )
+        cache.dec_host_lock_ref(match.last_host_node, receipt)
+        cache.evict_host(len(key))
+        self.assertEqual(
+            cache.match_prefix(MatchPrefixParams(key=key)).host_hit_length, 0
+        )
+        cache.sanity_check()
+
+    def test_pd_cancel_after_prefetch_releases_hold(self):
+        from sglang.srt.disaggregation.decode_hicache_mixin import (
+            DecodeHiCachePreallocMixin,
+        )
+
+        cache, _, _ = build_fixture(self.cfg)
+        self._init_hicache(cache)
+        handle = CacheRequestHandle("pd-cancel", 0)
+        key = self._completed_host_prefetch(cache, handle)
+        dr = SimpleNamespace(
+            req=SimpleNamespace(cache_request_handle=handle, lock=None),
+            hicache_prefetch_pending=False,
+            hicache_prefetch_done=True,
+            prefix_match=None,
+        )
+        DecodeHiCachePreallocMixin._cancel_hicache_admission(
+            SimpleNamespace(tree_cache=cache), dr
+        )
+        self.assertFalse(dr.hicache_prefetch_done)
+        self.assertNotIn(handle, cache.prefetch_admission_locks)
+        cache.evict_host(len(key))
+        self.assertEqual(
+            cache.match_prefix(MatchPrefixParams(key=key)).host_hit_length, 0
+        )
+        cache.sanity_check()
+
+    def test_pd_partial_handoff_accounts_unfulfilled_storage(self):
+        from sglang.srt.disaggregation import decode_hicache_mixin
+
+        cache, _, _ = build_fixture(self.cfg)
+        self._init_hicache(cache)
+        handle = CacheRequestHandle("pd-partial", 0)
+        key = self._completed_host_prefetch(cache, handle)
+        cache._storage_prefetch_hit_remaining_by_reqid[handle] = len(key)
+        cache.storage_metrics_collector = mock.MagicMock()
+        req = SimpleNamespace(
+            cache_request_handle=handle,
+            storage_hit_start=0,
+            storage_hit_length=len(key),
+        )
+        dr = SimpleNamespace(req=req, hicache_prefetch_done=True)
+        decode_hicache_mixin._finish_decode_storage_admission(
+            cache, dr, len(key) // 2, "cache_admission_shortfall"
+        )
+        collector = cache.storage_metrics_collector
+        collector.log_storage_prefetch_unfulfilled_tokens.assert_called_once_with(
+            len(key) // 2, "cache_admission_shortfall"
+        )
+        self.assertNotIn(handle, cache.prefetch_admission_locks)
+        cache.evict_host(len(key))
+        self.assertEqual(
+            cache.match_prefix(MatchPrefixParams(key=key)).host_hit_length, 0
+        )
+        cache.sanity_check()
+
+    def test_aborted_completed_prefetch_releases_host_capacity(self):
+        """A queued request cancelled after its ACK must not strand L2 slots."""
+        cache, _, _ = build_fixture(self.cfg)
+        self._init_hicache(cache)
+        pool = cache.cache_controller.mem_pool_host
+        available = pool.available_size()
+        handle = CacheRequestHandle("aborted", 0)
+        key = self._completed_host_prefetch(cache, handle)
+        cache._abandon_attempt(handle)
+        cache._abandon_attempt(handle)
+        cache.evict_host(len(key))
+        self.assertEqual(pool.available_size(), available)
+        cache.sanity_check()
+
+    def test_decode_load_transfers_admission_hold_to_h2d(self):
+        """Decode has no prefill-admission callback; its successful restore
+        must release the waiting hold without waiting for generation to end."""
+        from sglang.srt.disaggregation.decode_hicache_mixin import (
+            DecodeHiCacheTransferMixin,
+            DecodePrefixMatch,
+        )
+
+        cache, _, _ = build_fixture(self.cfg)
+        self._init_hicache(cache)
+        handle = CacheRequestHandle("decode-load", 0)
+        key = self._completed_host_prefetch(cache, handle)
+        req = Req(
+            rid=handle.rid,
+            origin_input_text="",
+            origin_input_ids=array("q", key.token_ids),
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+        )
+        req.cache_request_handle = handle
+        req.last_node = cache.root_node_handle()
+        decode_req = SimpleNamespace(
+            req=req,
+            prefix_match=DecodePrefixMatch(
+                prefix_indices=torch.empty(0, dtype=torch.int64),
+                l2_host_hit_length=0,
+                l3_storage_hit_length=len(key),
+                last_device_node=cache.root_node_handle(),
+            ),
+        )
+        queue = SimpleNamespace(tree_cache=cache)
+        self.assertTrue(
+            DecodeHiCacheTransferMixin._try_hicache_queue_load_back(queue, decode_req)
+        )
+        self.assertEqual(len(decode_req.hicache_restored_kv_indices), len(key))
+        self.assertNotIn(handle, cache.prefetch_admission_locks)
+        self.assertTrue(cache.ongoing_load_back)
+        UnifiedRadixCacheFixtures._finish_pending_loads(self, cache)
+        cache.unlock(decode_req.hicache_restore_lock)
+        # A sibling may have materialized the prefix before decode rematches.
+        sibling = CacheRequestHandle("decode-already-resident", 0)
+        self._completed_host_prefetch(cache, sibling)
+        req.cache_request_handle = sibling
+        self.assertTrue(
+            DecodeHiCacheTransferMixin._try_hicache_queue_load_back(queue, decode_req)
+        )
+        self.assertNotIn(sibling, cache.prefetch_admission_locks)
+        cache.unlock(decode_req.hicache_restore_lock)
+        cache.sanity_check()
+
+    def test_hit_waits_for_completed_prefetch_to_be_consumed(self):
+        """Under real host-pool pressure, retain a confirmed hit and launch
+        its read after admission frees the earlier prefix's eviction hold."""
+        self._check_capacity_wait(abort=False)
+
+    def test_aborted_parked_hit_never_launches(self):
+        """Cancelling a capacity waiter cannot later launch its stale IO."""
+        self._check_capacity_wait(abort=True)
+
+    def test_retired_parked_hit_preserves_replacement_prefetch(self):
+        """A best-effort stop followed by a same-handle re-query must not let
+        the old waiter revoke the new attempt when the queue drains."""
+        self._check_capacity_wait(abort=False, retry=True)
+
+    def test_prefetch_does_not_wait_for_its_own_admission_hold(self):
+        """A suffix lookup cannot wait on admission of the same request:
+        admission itself is waiting for that lookup to finish."""
+        self._check_capacity_wait(abort=False, own_hold=True)
+
+    def _check_capacity_wait(self, *, abort, own_hold=False, retry=False):
+        cache, _, _ = build_fixture(self.cfg)
+        self._init_hicache(cache)
+        first = CacheRequestHandle("first", 0)
+        key = self._completed_host_prefetch(cache, first)
+        cc = cache.cache_controller
+        pool = cc.mem_pool_host
+        filler = pool.alloc(pool.available_size())
+        self.addCleanup(pool.free, filler)
+        cache.prefetch_threshold = self.ps
+        for name in (
+            "prefetch_hit_queue",
+            "prefetch_buffer",
+            "ack_prefetch_queue",
+            "ack_backup_queue",
+            "host_mem_release_queue",
+        ):
+            setattr(cc, name, Queue())
+        second = first if own_hold else CacheRequestHandle("second", 0)
+        operation = PrefetchOperation(second, list(key.token_ids))
+        operation.storage_hit_count = len(key)
+        operation.hash_value = [f"second-{i}" for i in range(4)]
+        root = cache.root_node_handle()
+        cache.ongoing_prefetch[second] = _OngoingPrefetch(
+            root,
+            key,
+            None,
+            operation,
+            cache.inc_host_lock_ref(root).to_dec_params(),
+            {},
+        )
+        cc.prefetch_tokens_occupied += len(key)
+        cache.pending_cache_hit_allocs.append(operation)
+
+        def drain():
+            cache._drain_storage_control_queues_impl(
+                n_storage_hit=cc.prefetch_hit_queue.qsize(),
+                n_ack_prefetch=0,
+                n_backup=0,
+                n_release=cc.host_mem_release_queue.qsize(),
+                extra_release_counts=None,
+                log_metrics=False,
+            )
+
+        drain()
+        if own_hold:
+            self.assertNotIn(second, cache.ongoing_prefetch)
+            self.assertFalse(cache.pending_cache_hit_allocs)
+            self.assertTrue(cc.prefetch_buffer.empty())
+            cache.finish_storage_prefetch_admission(first, len(key), None)
+            cache.evict_host(len(key))
+            self.assertEqual(pool.available_size(), len(key))
+            cache.sanity_check()
+            return
+        self.assertIsNone(operation.host_indices)
+        self.assertTrue(cc.prefetch_buffer.empty())
+        self.assertEqual(len(cache.pending_cache_hit_allocs), 1)
+        self.assertEqual(
+            cache.match_prefix(MatchPrefixParams(key=key)).host_hit_length, len(key)
+        )
+
+        if abort:
+            cache._abandon_attempt(second)
+            drain()
+            self.assertFalse(cache.pending_cache_hit_allocs)
+            self.assertNotIn(second, cache.ongoing_prefetch)
+            self.assertTrue(cc.prefetch_buffer.empty())
+            cache.finish_storage_prefetch_admission(first, len(key), None)
+            cache.evict_host(len(key))
+            self.assertEqual(pool.available_size(), len(key))
+            cache.sanity_check()
+            return
+
+        if retry:
+            previous = cache.ongoing_prefetch[second]
+            cache.prefetch_stop_policy = "best_effort"
+            self.assertTrue(cache.check_prefetch_progress(second))
+            self.assertTrue(operation.is_terminated())
+            self.assertNotIn(second, cache.ongoing_prefetch)
+            self.assertIn(operation, cache.pending_cache_hit_allocs)
+
+            replacement = PrefetchOperation(second, list(key.token_ids))
+            replacement.storage_hit_count = len(key)
+            replacement.hash_value = list(operation.hash_value)
+            cache.ongoing_prefetch[second] = previous._replace(
+                operation=replacement,
+                anchor_lock_params=cache.inc_host_lock_ref(root).to_dec_params(),
+            )
+            cc.prefetch_tokens_occupied += len(key)
+            # A device-hit-loss re-query can replace the attempt before the
+            # scheduler next drains the old capacity waiter.
+            drain()
+            self.assertIs(cache.ongoing_prefetch[second].operation, replacement)
+            self.assertFalse(cache.pending_cache_hit_allocs)
+            self.assertTrue(cc.prefetch_buffer.empty())
+            self.assertIsNone(operation.host_indices)
+            cc.prefetch_hit_queue.put(replacement)
+            operation = replacement
+
+        cache.finish_storage_prefetch_admission(first, len(key), None)
+        drain()
+        self.assertIs(cc.prefetch_buffer.get_nowait(), operation)
+        self.assertEqual(len(operation.host_indices), len(key))
+        self.assertFalse(cache.pending_cache_hit_allocs)
+        cache._retire_ongoing_prefetch(second, operation.host_indices, None)
+        drain()
+        cache.sanity_check()
 
     def test_prefetch_refill_under_unbacked_parent_is_dropped(self):
         cache, allocator, _ = build_fixture(self.cfg)

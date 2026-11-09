@@ -7,6 +7,7 @@ import threading
 import time
 import zlib
 from array import array
+from collections import deque
 from contextlib import ExitStack, nullcontext
 from dataclasses import replace
 from http import HTTPStatus
@@ -503,6 +504,10 @@ class UnifiedRadixCache(BasePrefixCache):
         ] = {}
         self.enable_storage = False
         self.prefetch_loaded_tokens_by_reqid: dict[CacheRequestHandle, int] = {}
+        self.prefetch_admission_locks: dict[
+            CacheRequestHandle, tuple[NodeId, DecLockRefParams]
+        ] = {}
+        self.pending_cache_hit_allocs: deque[PrefetchOperation] = deque()
         self.prefetch_loaded_storage_start_by_reqid: dict[CacheRequestHandle, int] = {}
         self.ongoing_prefetch: dict[CacheRequestHandle, _OngoingPrefetch] = {}
         self._storage_prefetch_wait: dict[CacheRequestHandle, _StoragePrefetchWait] = {}
@@ -2654,11 +2659,19 @@ class UnifiedRadixCache(BasePrefixCache):
             # spend the re-issue budget the admission-time device-hit-loss
             # re-query needs once the device match evicts while queued.
             return
-        if not buffer_mode and self.cache_controller.prefetch_rate_limited():
+        if (
+            not buffer_mode
+            and self.prefetch_stop_policy == "best_effort"
+            and self.cache_controller.prefetch_rate_limited()
+        ):
             stats["declined_rate_limited"] += 1
             # Paced: the limiter clears as transfers finish, not on the next pass.
             self.storage_prefetch_retries.poll_miss(req_id, storage_hit_end)
             return
+
+        # Waiting policies must retain their lookup even under pressure.
+        # Apply backpressure at hit allocation, where the real footprint is
+        # known, rather than admitting an unqueried request as a cache miss.
 
         # Buffer mode holds no tree state during the fetch: buffers are
         # operation-owned, so the anchor needs no pin.
@@ -3051,6 +3064,14 @@ class UnifiedRadixCache(BasePrefixCache):
             # The commit emits via commit_actions only; the walk's were applied above.
             assert not insert_result.cache_actions
 
+            # An ACK can graft this prefix long before admission. Keep the
+            # completed read alive until load-back takes ownership of it.
+            if completed_tokens and insert_result.inserted_host_node is not None:
+                node_id = insert_result.inserted_host_node
+                lock_params = self.inc_host_lock_ref(node_id).to_dec_params()
+                self._release_prefetch_admission_lock(request)
+                self.prefetch_admission_locks[request] = (node_id, lock_params)
+
             self.cache_controller.mem_pool_host.free(
                 host_indices[: insert_result.prefix_len]
             )
@@ -3279,10 +3300,18 @@ class UnifiedRadixCache(BasePrefixCache):
 
         Buffer mode resolves at the H2D completion ack instead, because its
         host allocation is transport staging rather than a resident L2 hit.
+        A consumer must acquire its own host reference before calling this;
+        duplicate completion or subsequent cancellation is safe.
         """
         self._storage_prefetch_wait.pop(request, None)
         if self.host_memory_mode == "cache":
+            self._release_prefetch_admission_lock(request)
             self._finish_storage_prefetch(request, fulfilled_tokens, reason)
+
+    def _release_prefetch_admission_lock(self, request: CacheRequestHandle) -> None:
+        entry = self.prefetch_admission_locks.pop(request, None)
+        if entry is not None:
+            self.dec_host_lock_ref(*entry)
 
     def discard_storage_prefetch_accounting(self, request: CacheRequestHandle) -> None:
         """Drop lifecycle state for cases intentionally excluded from metrics."""
@@ -3317,6 +3346,7 @@ class UnifiedRadixCache(BasePrefixCache):
     @rank_consensus(same_params=True)
     def _abandon_attempt(self, request: CacheRequestHandle) -> None:
         rid = request.rid
+        self._release_prefetch_admission_lock(request)
         self._storage_prefetch_wait.pop(request, None)
         if self.linker is not None:
             self.linker.release_request(request)
@@ -3592,15 +3622,33 @@ class UnifiedRadixCache(BasePrefixCache):
 
         buffer_mode = self.host_memory_mode == "buffer_only"
 
+        def _cache_capacity_will_drain(operation, hit_tokens):
+            # Wait only for owners that can make progress independently of
+            # this allocation. Anchor-only waiters must not wait on each
+            # other, and a hit larger than an empty pool must fall back.
+            return cc.can_fit_prefetch_host_buffers(operation, hit_tokens) and (
+                any(
+                    handle != operation.handle and handle not in self.ongoing_prefetch
+                    for handle in self.prefetch_admission_locks
+                )
+                or bool(self.ongoing_load_back)
+                or any(
+                    info.host_indices is not None
+                    for info in self.ongoing_prefetch.values()
+                )
+            )
+
         def _try_alloc_storage_hit(operation) -> bool:
             """Allocate the hit-sized bounce and launch the transfer.
-            Returns False when staging pressure defers the allocation
-            (buffer mode parks and retries; cache mode revokes)."""
+            Returns False on transient staging pressure. Cache mode only
+            revokes when no independent owner can release the capacity."""
             request = operation.handle
             info = self.ongoing_prefetch.get(request)
             hit_tokens = operation.storage_hit_count
-            if info is None:
-                return True  # aborted/cleaned; nothing to retry
+            if info is None or info.operation is not operation:
+                # A retired waiter may outlive a re-query for the same handle.
+                # Discard it without revoking or allocating for its replacement.
+                return True
             if operation.is_terminated():
                 if operation.deadline_expired:
                     # Cut by the tick vote while parked: same reason as the poll.
@@ -3674,6 +3722,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 evict_host=self.evict_host,
             )
             if host_indices is None:
+                if _cache_capacity_will_drain(operation, hit_tokens):
+                    return False
                 self._finish_storage_prefetch(
                     request, fulfilled_tokens=0, reason="host_capacity"
                 )
@@ -3688,6 +3738,8 @@ class UnifiedRadixCache(BasePrefixCache):
             if not self._alloc_prefetch_aux_staging(info, aux_hit_tokens):
                 # Same outcome as a KV shortfall: nothing stays staged.
                 cc.append_host_mem_release(host_indices=host_indices)
+                if _cache_capacity_will_drain(operation, hit_tokens):
+                    return False
                 self._finish_storage_prefetch(
                     request, fulfilled_tokens=0, reason="host_capacity"
                 )
@@ -3711,13 +3763,17 @@ class UnifiedRadixCache(BasePrefixCache):
             return True
 
         def _drain_and_alloc_storage_hit():
-            # Parked hits first (FIFO fairness with retries; buffer only).
-            if buffer_mode:
-                parked = self.buffer_pipeline.pending_hit_allocs
-                while parked:
-                    if not _try_alloc_storage_hit(parked[0]):
-                        break
-                    parked.popleft()
+            # Keep confirmed hits during transient capacity pressure. Their
+            # storage lookup is still valid; do not turn pressure into a miss.
+            parked = (
+                self.buffer_pipeline.pending_hit_allocs
+                if buffer_mode
+                else self.pending_cache_hit_allocs
+            )
+            while parked:
+                if not _try_alloc_storage_hit(parked[0]):
+                    break
+                parked.popleft()
             for operation in _drain_queue(cc.prefetch_hit_queue, n_storage_hit):
                 self._invalidate_absent_from_hit_query(operation)
                 request = operation.handle
@@ -3759,13 +3815,11 @@ class UnifiedRadixCache(BasePrefixCache):
                 self._account_prefetch_outcome(operation, revoked=False)
                 # A parked hit keeps its turn: a newer hit must not take the
                 # staging or anchor budget the parked head is waiting for.
-                parked_ahead = buffer_mode and bool(
-                    self.buffer_pipeline.pending_hit_allocs
-                )
+                parked_ahead = bool(parked)
                 if parked_ahead or not _try_alloc_storage_hit(operation):
                     # Counted once at first parking, not per retry tick.
                     self._prefetch_outcome_stats["declined_rate_limited"] += 1
-                    self.buffer_pipeline.pending_hit_allocs.append(operation)
+                    parked.append(operation)
 
         def _drain_ack_prefetch():
             for ack in _drain_queue(cc.ack_prefetch_queue, n_ack_prefetch):
