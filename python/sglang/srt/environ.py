@@ -25,6 +25,17 @@ def _default_hip() -> bool:
         return False
 
 
+@functools.lru_cache(maxsize=1)
+def _default_mlu() -> bool:
+    """Resolve the MLU default lazily, keeping environ imports stdlib-only."""
+    try:
+        import torch
+
+        return hasattr(torch, "mlu") and torch.mlu.is_available()
+    except Exception:
+        return False
+
+
 _NON_UTF8_PREFIX = "base64:"
 
 
@@ -648,7 +659,7 @@ class Envs:
     SGLANG_COMPACTION_MAX_PAGES_PER_MOVE = EnvInt(4096)
     # HND KV layout folds (page, head) into one paged index for per-kv-head sparse
     # page tables (DP attn); paged backends like trtllm_mha consume it directly.
-    SGLANG_USE_HND_KVCACHE = EnvBool(False)
+    SGLANG_USE_HND_KVCACHE = EnvBool(_default_mlu)
     # --enable-kv-cache-sharding: allocate single-node prefix gather scratch
     # with PyTorch symmetric memory and gather it on copy engines through its
     # CUDA multicast mapping (MulticastAllGather). Without multicast the
