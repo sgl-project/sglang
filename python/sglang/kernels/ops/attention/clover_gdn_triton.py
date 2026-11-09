@@ -57,7 +57,6 @@ def _clover_local_memory_kernel(
     query_ptr,
     key_ptr,
     value_ptr,
-    g_ptr,
     clean_state_ptr,
     cache_indices_ptr,
     active_valid_ptr,
@@ -74,8 +73,6 @@ def _clover_local_memory_kernel(
     value_stride_t,
     value_stride_h,
     value_stride_v,
-    g_stride_t,
-    g_stride_h,
     state_stride_slot,
     state_stride_h,
     state_stride_v,
@@ -99,7 +96,7 @@ def _clover_local_memory_kernel(
 ):
     """Compute the read-only BD-GDN preview output for one fixed-size block.
 
-    Block-local softmax includes the gate-decayed clean readout as one
+    Block-local softmax includes the clean history readout as one
     history bucket. Its logit is history_bias plus
     history_c * log(valid_block_size / reference_block_size).
 
@@ -185,10 +182,6 @@ def _clover_local_memory_kernel(
         other=0.0,
     )
 
-    scalar_offsets = token_indices * g_stride_t + value_head * g_stride_h
-    g = tl.load(g_ptr + scalar_offsets, mask=token_mask & request_active, other=0.0).to(
-        tl.float32
-    )
     local_active = (
         tl.load(
             active_valid_ptr + request_idx * BLOCK_SIZE + local_key_offsets,
@@ -214,7 +207,7 @@ def _clover_local_memory_kernel(
     local_weights = exp_local / denominator[:, None]
     history_weight = exp_history / denominator
     local = tl.dot(local_weights.to(values.dtype), values)
-    output = history * (scale * tl.exp(g) * history_weight)[:, None] + local
+    output = history * (scale * history_weight)[:, None] + local
     output = tl.where(active[:, None], output, 0.0)
 
     output_offsets = (
@@ -348,7 +341,6 @@ def clover_local_memory_triton(
         query,
         key,
         value,
-        g,
         clean_ssm_states,
         cache_indices,
         active_valid_mask,
@@ -365,8 +357,6 @@ def clover_local_memory_triton(
         value.stride(1),
         value.stride(2),
         value.stride(3),
-        g.stride(1),
-        g.stride(2),
         clean_ssm_states.stride(0),
         clean_ssm_states.stride(1),
         clean_ssm_states.stride(2),

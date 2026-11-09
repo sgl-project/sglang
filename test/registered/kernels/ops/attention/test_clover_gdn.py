@@ -47,13 +47,14 @@ def test_preview_kernel_parity_readonly_and_graph(block_size):
     weights = torch.cat((local_logits, history_logits), dim=-1).softmax(-1)
     local = torch.einsum("hls,shv->lhv", weights[..., :-1], v[0, :block_size].float())
     history = torch.einsum("lhk,hvk->lhv", qf * 128**-0.5, state[1])
-    history = history * g[0, :block_size].exp()[..., None]
     expected = torch.zeros_like(v)
     expected[0, :block_size] = (local + weights[..., -1].T[..., None] * history).to(
         v.dtype
     )
     actual = clover_local_memory_triton(q, k, v, g, **kw)
     torch.testing.assert_close(actual.float(), expected.float(), atol=0.04, rtol=0.04)
+    changed_decay = clover_local_memory_triton(q, k, v, g - 5, **kw)
+    torch.testing.assert_close(actual, changed_decay, atol=0, rtol=0)
     # Reduced-precision and non-contiguous scalar views must match FP32 inputs.
     for dtype in (torch.bfloat16, torch.float16):
         for name in (
