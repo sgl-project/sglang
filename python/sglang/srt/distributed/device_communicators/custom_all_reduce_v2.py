@@ -44,9 +44,9 @@ from sglang.kernels.ops.communication.all_reduce import (
     PullPlane,
     PushPlane,
     custom_all_reduce,
-    custom_pair_stage,
     get_all_reduce_module,
 )
+from sglang.kernels.ops.communication.dpx_pair_push import custom_pair_stage
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
@@ -170,6 +170,9 @@ class AllReduceConfig(NamedTuple):
     algo: AllReduceAlgo
     use_graph: bool = False
     use_multicast: bool = False
+    # hier_2shot_push (ROCm gfx1250 DPX): a 2shot_push split into pair and cross
+    # stages; ``algo`` is TWO_SHOT_PUSH
+    use_hier: bool = False
 
 
 class CustomAllReduceV2:
@@ -535,7 +538,7 @@ class CustomAllReduceV2:
             return AllReduceConfig(AllReduceAlgo.ONE_SHOT_PUSH)
         # the pair halves must stay whole 16 B vectors
         if nbytes % 32 == 0 and heuristic.hier_2shot_push.contains(nbytes):
-            return AllReduceConfig(AllReduceAlgo.HIER_2SHOT_PUSH)
+            return AllReduceConfig(AllReduceAlgo.TWO_SHOT_PUSH, use_hier=True)
         if nbytes <= heuristic.two_shot_push_threshold:
             return AllReduceConfig(AllReduceAlgo.TWO_SHOT_PUSH)
         if nbytes <= heuristic.one_shot_pull_threshold:
@@ -559,8 +562,6 @@ class CustomAllReduceV2:
         if not is_weak_contiguous(inp):
             return False
         if self.override_algo is not None:
-            if self.override_algo == AllReduceAlgo.HIER_2SHOT_PUSH:
-                return inp_size % 32 == 0 and inp_size <= self.hier_max_size
             return inp_size <= self.max_size
         if not self._graph_mode_allowed:
             return self._eager_plan(inp_size, inp.dtype) is not None
@@ -575,9 +576,9 @@ class CustomAllReduceV2:
             config = self._pick_config(nbytes, False)
             if config is None:
                 self._eager_plans[key] = None
-            elif config.algo == AllReduceAlgo.HIER_2SHOT_PUSH:
+            elif config.use_hier:
                 # runs over the pair and cross planes, not one module
-                self._eager_plans[key] = (None, config.algo.algo_name, False)
+                self._eager_plans[key] = (None, "hier_2shot_push", False)
             else:
                 self._eager_plans[key] = (
                     get_all_reduce_module(dtype, self.world_size),
@@ -625,12 +626,12 @@ class CustomAllReduceV2:
             # TODO: enhance this override pattern
             algo = self.override_algo
             use_graph = self._can_use_graph() and not algo.is_push()
-            use_multicast = False
+            use_multicast = use_hier = False
         else:
             config = self._pick_config(nbytes, self._can_use_graph())
             assert config is not None, f"No config for {nbytes = }"
-            algo, use_graph, use_multicast = config
-        if algo == AllReduceAlgo.HIER_2SHOT_PUSH:
+            algo, use_graph, use_multicast, use_hier = config
+        if use_hier:
             return self._hier_all_reduce(input)
         graph_params = self._allocate_graph_row(input, nbytes) if use_graph else None
         return custom_all_reduce(
