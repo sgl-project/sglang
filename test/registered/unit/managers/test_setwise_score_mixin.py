@@ -12,15 +12,18 @@ grouping, validation, anchor bucketing, and the serialization round-trip on CPU.
 import math
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
 from sglang.srt.managers.io_struct import RequestOutputStats
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.tokenizer_manager_score_mixin import (
     ScoreResult,
     TokenizerManagerScoreMixin,
 )
 from sglang.srt.runtime_context import get_context
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -701,6 +704,20 @@ class TestSetwisePooledHiddenStatesRoundTrip(CustomTestCase):
         self.assertEqual(len(res.pooled_hidden_states[0]), 3)
         for i in range(3):
             torch.testing.assert_close(res.pooled_hidden_states[0][i], phs[i])
+
+
+class TestSetwiseAbort(CustomTestCase):
+    def test_abort_clears_pooling_positions(self):
+        """Aborting a setwise request (e.g. over-length) shrinks its prompt to one
+        token; keeping its pooling positions made the logits processor gather out
+        of range and crash the scheduler."""
+        req = Req("over-length", "", [1, 9, 2, 9], SamplingParams())
+        req.token_indices_to_pool = [1, 3]
+        with mock.patch("sglang.srt.managers.schedule_batch.get_parallel") as gp:
+            gp().tp_rank = 0
+            req.set_finish_with_abort("too long")
+        self.assertEqual(list(req.origin_input_ids), [0])
+        self.assertIsNone(req.token_indices_to_pool)
 
 
 if __name__ == "__main__":

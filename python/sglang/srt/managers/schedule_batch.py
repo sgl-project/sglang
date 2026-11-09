@@ -1662,6 +1662,7 @@ class Req(ReqDllmMixin):
         self.origin_input_ids = array(
             "q", [0]
         )  # set it to one token to skip the long prefill
+        self.token_indices_to_pool = None
         self.return_logprob = False
         self.logprob_start_len = -1
         self.request_finish(FINISH_ABORT(error_msg, status_code, err_type))
