@@ -1651,11 +1651,13 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     # leading-null count (see build_flat_top_logprobs_arrays). For such
     # requests the nested input_top_logprobs_val/idx entry is empty. None when
     # no request in the batch uses the flat format.
-    output_top_logprobs_val_array: Optional[List[Optional[np.ndarray]]] = None
-    output_top_logprobs_idx_array: Optional[List[Optional[np.ndarray]]] = None
     input_top_logprobs_val_flat: Optional[List[Optional[np.ndarray]]] = None
     input_top_logprobs_idx_flat: Optional[List[Optional[np.ndarray]]] = None
     input_top_logprobs_flat_null_prefix: Optional[List[Optional[int]]] = None
+
+    # Binary generated-token score chunks, with duplicates preserved for MC32.
+    output_top_logprobs_val_array: Optional[List[Optional[np.ndarray]]] = None
+    output_top_logprobs_idx_array: Optional[List[Optional[np.ndarray]]] = None
 
 
 class BatchStrOutput(BaseBatchReq, kw_only=True):
@@ -1748,11 +1750,13 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
 
     # Detokenizer pass-through for the scheduler-side flat prompt top logprob
     # arrays; see BatchTokenIDOutput.input_top_logprobs_val_flat.
-    output_top_logprobs_val_array: Optional[List[Optional[np.ndarray]]] = None
-    output_top_logprobs_idx_array: Optional[List[Optional[np.ndarray]]] = None
     input_top_logprobs_val_flat: Optional[List[Optional[np.ndarray]]] = None
     input_top_logprobs_idx_flat: Optional[List[Optional[np.ndarray]]] = None
     input_top_logprobs_flat_null_prefix: Optional[List[Optional[int]]] = None
+
+    # Binary generated-token score chunks, with duplicates preserved for MC32.
+    output_top_logprobs_val_array: Optional[List[Optional[np.ndarray]]] = None
+    output_top_logprobs_idx_array: Optional[List[Optional[np.ndarray]]] = None
 
 
 class BatchEmbeddingOutput(BaseBatchReq, kw_only=True):

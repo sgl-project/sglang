@@ -241,6 +241,11 @@ pub struct SamplingParams {
     /// strip that wrapper from its own grammar, so it is a pipeline output only.
     #[serde(skip_deserializing)]
     pub ebnf_full_assistant: bool,
+    /// Python-only generated-token auxiliary scores; keep positional IPC aligned.
+    #[serde(default)]
+    pub score_centering_samples: i64,
+    #[serde(default)]
+    pub array_output_logprobs: bool,
     /// API fields present in the request object. Serde defaults erase this
     /// distinction, but preferred sampling parameters must not overwrite an
     /// explicit request value, including an explicit default or null.
@@ -387,6 +392,8 @@ impl Default for SamplingParams {
             stop_regex_max_len: 0,
             is_normalized: false,
             ebnf_full_assistant: false,
+            score_centering_samples: 0,
+            array_output_logprobs: false,
             explicit_fields: BTreeSet::new(),
         }
     }
@@ -512,6 +519,11 @@ impl SamplingParams {
     /// Python `verify(vocab_size)` — the same ranges, messages and mutual
     /// exclusions, plus the rust-server `n == 1` restriction.
     fn verify(&self, vocab_size: u64) -> Result<(), Error> {
+        if self.score_centering_samples != 0 || self.array_output_logprobs {
+            return Err(bad(
+                "array output scores and MC32 currently require the Python server".to_owned(),
+            ));
+        }
         if let Some(beam_width) = self.beam_width
             && beam_width < 1
         {
@@ -839,6 +851,8 @@ mod tests {
         "stop_regex_max_len",
         "is_normalized",
         "ebnf_full_assistant",
+        "score_centering_samples",
+        "array_output_logprobs",
     ];
 
     /// Every field reaches the wire, at the position Python expects.

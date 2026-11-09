@@ -153,10 +153,6 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
     sampling_seed: Optional[int] = None
     custom_params: Optional[Dict[str, CustomParamValue]] = None
 
-    # Generated-token auxiliary scores. MC draws preserve duplicates.
-    score_centering_samples: int = 0
-    array_output_logprobs: bool = False
-
     # --- Internal fields (populated by __post_init__ or normalize(), not API-facing) ---
     stop_strs: Optional[Union[str, List[str]]] = None  # from stop
     stop_regex_strs: Optional[Union[str, List[str]]] = None  # from stop_regex
@@ -164,6 +160,10 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
     stop_regex_max_len: int = 0  # set by normalize()
     is_normalized: bool = False  # set by normalize()
     ebnf_full_assistant: bool = False
+
+    # Generated-token auxiliary scores. MC draws preserve duplicates.
+    score_centering_samples: int = 0
+    array_output_logprobs: bool = False
 
     def __post_init__(self):
         # For non-optional params, treat None as "use default" so that callers

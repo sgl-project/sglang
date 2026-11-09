@@ -698,6 +698,7 @@ class TestTokenizerManagerLogprobs(CustomTestCase):
             output_token_logprobs_val=None,
             input_top_logprobs_val=None,
             input_top_logprobs_val_flat=None,
+            output_top_logprobs_val_array=None,
             output_top_logprobs_val=None,
             input_token_ids_logprobs_val=None,
             output_token_ids_logprobs_val=None,

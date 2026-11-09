@@ -16,7 +16,6 @@ from sglang.srt.layers.logits_processor import (
     SamplingMaskOutput,
     SamplingMaskStatus,
 )
-from sglang.srt.layers.mc_logprobs import compute_mc_scores
 from sglang.srt.layers.logprob_processor import (
     OutputLogprobProcessor,
 )
@@ -36,6 +35,8 @@ from sglang.srt.utils.common import (
 )
 
 if is_cuda():
+    from sglang.srt.layers.mc_logprobs import compute_mc_scores
+
     from flashinfer.sampling import (
         min_p_sampling_from_probs,
         top_k_top_p_sampling_from_probs,
