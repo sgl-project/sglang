@@ -100,21 +100,11 @@ class TestArgmaxAndSoftmaxProb(CustomTestCase):
         self.assertEqual(ids.tolist(), want_ids.tolist())
         torch.testing.assert_close(prob, want_prob.float(), rtol=1e-6, atol=1e-7)
 
-    def test_low_precision_input_does_not_flip_unmask_decisions(self):
-        # The chunked path is what lets a caller keep logits in lm_head dtype.
-        # The confidence is compared against a threshold (0.5 by default in
-        # JointThreshold), so what has to survive the precision loss is the
-        # side of the threshold each position lands on, not the exact value.
-        logits = self._logits(64, 4099)
-        _, want_prob = _reference(logits)
-        ids, prob = argmax_and_softmax_prob(logits.bfloat16())
-        self.assertTrue(torch.equal(ids, torch.argmax(logits, dim=-1)))
-        self.assertEqual(((prob > 0.5) != (want_prob > 0.5)).sum().item(), 0)
-
     def test_bf16_input_decides_the_threshold_correctly_at_the_boundary(self):
-        # Randomly drawn logits almost never land near 0.5, so the threshold
-        # check above cannot see rounding. Build rows whose top two logits are
-        # nearly tied, which puts the argmax probability just above 0.5, and
+        # The confidence is compared against a threshold (0.5 by default in
+        # JointThreshold), and randomly drawn logits almost never land near it,
+        # so rounding is invisible on random input. Build rows whose top two
+        # logits are nearly tied, which puts the argmax probability near 0.5, and
         # require every decision to match the exact fp32 answer. Exponentiating
         # in bf16 instead of fp32 flips a measurable fraction of them.
         rows, vocab = 512, 8192
