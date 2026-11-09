@@ -1,5 +1,8 @@
-import copy
-import os
+"""
+Usage:
+python3 -m unittest test_cpu_graph.TestCPUGraph.test_mmlu_torch_compile_cpu
+"""
+
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -44,6 +47,7 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    get_tp_cpu_bind,
     intel_amx_benchmark,
     is_in_ci,
     popen_launch_server,
@@ -1145,10 +1149,14 @@ class TestCPUGraph(CustomTestCase):
     def test_mmlu_torch_compile_cpu(self):
         model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         base_url = DEFAULT_URL_FOR_TEST
-        cpu_ids_by_node = get_cpu_ids_by_node()
-        n_numa_node = len(cpu_ids_by_node)
-        env = copy.deepcopy(os.environ)
-        env["SGLANG_CPU_OMP_THREADS_BIND"] = "all"
+        # Confine to an already-set SGLANG_CPU_OMP_THREADS_BIND; otherwise
+        # fall back to the original one-rank-per-numa-node default.
+        tp_size = 6
+        bind = get_tp_cpu_bind(tp_size)
+        if bind is None:
+            tp_size = len(get_cpu_ids_by_node())
+        else:
+            tp_size = len(bind.split("|"))
         process = popen_launch_server(
             model,
             base_url,
@@ -1171,9 +1179,9 @@ class TestCPUGraph(CustomTestCase):
                 "128",
                 "256",
                 "--tp",
-                f"{n_numa_node}",
+                f"{tp_size}",
             ],
-            env=env,
+            env={"SGLANG_CPU_OMP_THREADS_BIND": bind if bind is not None else "all"},
         )
 
         try:

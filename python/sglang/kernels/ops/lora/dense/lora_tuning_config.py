@@ -36,6 +36,7 @@ from typing import Any, Dict, Optional
 
 import triton
 
+from sglang.srt.environ import envs
 from sglang.srt.utils import get_device_name
 
 logger = logging.getLogger(__name__)
@@ -73,8 +74,8 @@ def get_lora_configs(
     """
     json_file_name = get_lora_config_file_name(kernel, K, R, S)
 
-    config_dir = os.environ.get(
-        "SGLANG_LORA_CONFIG_DIR", os.path.dirname(os.path.realpath(__file__))
+    config_dir = envs.SGLANG_LORA_CONFIG_DIR.get() or os.path.dirname(
+        os.path.realpath(__file__)
     )
     configs_root = os.path.join(config_dir, "csgmv_configs")
 

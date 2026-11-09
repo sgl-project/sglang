@@ -326,7 +326,12 @@ class TargetVerifyExecutor:
         batch.out_cache_loc = verify_cache_loc
         seq_lens_cpu_backup = batch.seq_lens_cpu
         seq_lens_sum_backup = batch.seq_lens_sum
-        if not self._verify_backend_self_adds_seq_lens():
+        if (
+            getattr(
+                self.target_worker.model_runner.attn_backend, "needs_cpu_seq_lens", True
+            )
+            and not self._verify_backend_self_adds_seq_lens()
+        ):
             if seq_lens_cpu_backup is not None:
                 batch.seq_lens_cpu = seq_lens_cpu_backup + verify_w
                 batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
@@ -772,7 +777,10 @@ class DsparkVerifyEpilogue:
         state_slot = None
         if self.commit_ctx.kv_injector.swa_ring_size is not None:
             state_slot = (
-                io.req_pool_indices.view(-1, 1).expand(bs, self.stride).reshape(-1)
+                io.req_pool_indices.view(-1, 1)
+                .expand(bs, self.stride)
+                .reshape(-1)
+                .contiguous()
             )
         commit = self.deferred_commit
         if commit is not None and (kv_projected or commit.join_projection()):

@@ -36,8 +36,9 @@ def apply_rotary_pos_emb_cpu(
     key: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
+    unsqueeze_dim: int = 1,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    torch.ops.sgl_kernel.apply_rotary_pos_emb_cpu(query, key, cos, sin)
+    torch.ops.sgl_kernel.apply_rotary_pos_emb_cpu(query, key, cos, sin, unsqueeze_dim)
     return query, key
 
 
