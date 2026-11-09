@@ -61,7 +61,7 @@ from sglang.srt.utils import (
 )
 
 if TYPE_CHECKING:
-    from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.lim import (
+    from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_lim import (
         LIMSelection,
     )
     from sglang.srt.layers.radix_attention import RadixAttention

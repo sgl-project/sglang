@@ -22,10 +22,6 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.block_tables imp
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.copy_sfa_buffers import (
     copy_sfa_host_row_stride,
 )
-from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.mtp import (
-    is_sparse_mtp_batch,
-    prepare_mtp_rows,
-)
 from sglang.srt.layers.dp_attention import get_eager_max_batch_size
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import (
@@ -141,12 +137,7 @@ class SparseKVCacheManager:
         self.store_dtype = self.paged_kv_cache.store_dtype
         self.layer_num = self.paged_kv_cache.layer_num
         self.device_cache_size = self.sparse_context_len
-        self.indexer_impl = "legacy"
-        self._slot_map_width = (
-            (self.max_context_len + 127) // 128 * 128
-            if self.indexer_impl == "lim"
-            else (self.max_context_len // 8 + 1) * 8
-        )
+        self._slot_map_width = (self.max_context_len // 8 + 1) * 8
         logger.info(
             "Sparse KV per rank: K=%d C=%d",
             self.sparse_context_len,
@@ -355,14 +346,6 @@ class SparseKVCacheManager:
         self._device_cache_slot_ids = torch.arange(
             self.sparse_context_len, dtype=torch.long, device=self.device
         )
-        self.lim_adapter = None
-        if self.indexer_impl != "legacy":
-            from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.lim import (
-                LIMDecodeAdapter,
-            )
-
-            self.lim_adapter = LIMDecodeAdapter(self)
-
         self._install_req_alloc_hook(req_to_token_pool)
 
     def _raise_buffer_allocation_error(
@@ -402,18 +385,6 @@ class SparseKVCacheManager:
             self.device_slot_map[layer_idx].index_fill_(0, req_ids_tensor, -1)
             if self.copy_sfa_enabled:
                 self.device_slot_owner[layer_idx].index_fill_(0, req_ids_tensor, -1)
-        if self.lim_adapter is not None:
-            self.lim_adapter.reset_requests(req_ids_tensor)
-
-    def invalidate_mtp_cache(self, layer, request_slots):
-        """Discard residency before publishing a potentially rewritten draft."""
-        layer_index = layer.layer_id - self.start_layer
-        slots = request_slots.long().clamp(0, self.size - 1)
-        self.device_slot_map[layer_index].index_fill_(0, slots, -1)
-        if self.copy_sfa_enabled:
-            self.device_slot_owner[layer_index].index_fill_(0, slots, -1)
-        if self.lim_adapter is not None:
-            self.lim_adapter.last_prefix[layer_index].index_fill_(0, slots, -1)
 
     def _install_req_alloc_hook(self, req_to_token_pool: ReqToTokenPool) -> None:
         # Preserve the target manager's hook when adding the draft manager.
@@ -578,17 +549,7 @@ class SparseKVCacheManager:
         src_index = torch.arange(src_tensor.shape[0], device=device, dtype=torch.long)
         num_src_rows = int(src_tensor.shape[0])
 
-        if is_sparse_mtp_batch(forward_batch):
-            req_ids, token_pos, valid_mask = prepare_mtp_rows(
-                forward_batch, num_src_rows, self.size, self.logical_max_context_len
-            )
-            dst_index = (req_ids * self.max_context_len + token_pos).reshape(-1)
-            valid_mask = valid_mask.reshape(-1).contiguous()
-            # TP token padding is a suffix, independent of the request window.
-            padding = num_src_rows - dst_index.numel()
-            dst_index = torch.nn.functional.pad(dst_index, (0, padding), value=0)
-            valid_mask = torch.nn.functional.pad(valid_mask, (0, padding), value=False)
-        elif forward_batch.forward_mode.is_decode():
+        if forward_batch.forward_mode.is_decode():
             req_ids = forward_batch.req_pool_indices.to(torch.long)
             token_pos = (forward_batch.seq_lens - 1).to(torch.long)
             cache_loc = forward_batch.out_cache_loc.to(torch.long)

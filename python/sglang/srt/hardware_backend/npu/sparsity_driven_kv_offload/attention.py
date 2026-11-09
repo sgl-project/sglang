@@ -6,18 +6,10 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 import torch_npu
-from sgl_kernel_npu.sparsity_driven_kv_offload import unidex_copy_inplace
 
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.manager import (
     _wait_stream_event,
     normalize_batch_topk_indices,
-)
-from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.mtp import (
-    is_sparse_mtp_batch,
-    mtp_compact_topk,
-    mtp_selected_kv_view,
-    mtp_topk_rows,
-    prepare_mtp_rows,
 )
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 
@@ -42,88 +34,6 @@ def _expand_dsa_sparse_indices(topk_indices: torch.Tensor) -> torch.Tensor:
     if topk_indices.dim() == 2:
         return topk_indices.unsqueeze(-2)
     return topk_indices
-
-
-def _forward_sparse_mtp(backend, q, q_rope, layer, forward_batch, topk_indices):
-    """Consume chain queries with ordinary SFA and bounded KV scratch."""
-    manager = _get_sparse_kv_manager(backend)
-    batch = forward_batch.batch_size
-    num_tokens = q.shape[0]
-    requests, positions, live = prepare_mtp_rows(
-        forward_batch, q.shape[0], manager.size, manager.logical_max_context_len
-    )
-    width = positions.shape[1]
-    logical_tokens = batch * width
-    source_rows = mtp_topk_rows(normalize_batch_topk_indices(topk_indices), num_tokens)
-    sources = source_rows[:logical_tokens].view(batch, width, source_rows.shape[-1])
-    top_k = sources.shape[-1]
-    if top_k > manager.sparse_context_len:
-        raise ValueError("Sparse MTP top-k exceeds the selected KV workspace")
-    q = q[:logical_tokens].view(batch, width, -1, backend.kv_lora_rank)
-    q_rope = q_rope[:logical_tokens].view(batch, width, -1, backend.qk_rope_head_dim)
-    output = q.new_empty((batch, width, layer.tp_q_head_num * backend.kv_lora_rank))
-    # A rejected draft may already have populated a resident slot. Rewriting
-    # host KV at that absolute position must not leave a hit on the old value.
-    manager.invalidate_mtp_cache(layer, forward_batch.req_pool_indices)
-    manager.last_decode_path = "mtp_reference"
-    forward_batch.sparse_kv_decode_path = manager.last_decode_path
-    for column in range(width):
-        source = sources[:, column].contiguous()
-        # SFA expects valid sparse entries before its -1 suffix. IndexShare
-        # can put future entries anywhere; retain the vendor's valid KV order.
-        source = mtp_compact_topk(source, positions[:, column], live[:, column])
-        valid = source >= 0
-        selected = mtp_selected_kv_view(manager.selected_kv_buffer, batch, top_k)
-        selected.zero_()
-        safe_requests = requests[:, column].clamp(0, manager.size - 1)
-        layer_index = layer.layer_id - manager.start_layer
-        unidex_copy_inplace(
-            manager.host_kv_buffer[layer_index],
-            selected,
-            (safe_requests[:, None] * manager.max_context_len + source)
-            .reshape(-1)
-            .contiguous(),
-            torch.arange(batch * top_k, device=q.device),
-            valid.reshape(-1).contiguous(),
-            2,
-            2,
-            block_dim=24,
-            src_ptr=manager.dev_ptr_list[layer_index],
-        )
-        compact = torch.arange(top_k, device=q.device, dtype=torch.int32)
-        indices = compact[None].expand(batch, -1).masked_fill(~valid, -1)
-        nonempty = valid.any(dim=1)
-        # The SFA ABI needs a dummy KV on empty/padded query rows.
-        indices[:, 0] = torch.where(nonempty, indices[:, 0], 0)
-        k_nope, k_rope = selected.split(
-            [backend.kv_lora_rank, backend.qk_rope_head_dim], dim=-1
-        )
-        ret = torch_npu.npu_sparse_flash_attention(
-            q[:, column : column + 1].contiguous(),
-            k_nope.contiguous(),
-            k_nope.contiguous(),
-            indices[:, None, None].contiguous(),
-            layer.scaling,
-            actual_seq_lengths_query=torch.ones(
-                batch, dtype=torch.int32, device=q.device
-            ),
-            actual_seq_lengths_kv=valid.sum(dim=1).clamp(min=1).int(),
-            query_rope=q_rope[:, column : column + 1].contiguous(),
-            key_rope=k_rope.contiguous(),
-            sparse_block_size=1,
-            layout_query="BSND",
-            layout_kv="BSND",
-            sparse_mode=0,
-            attention_mode=2,
-            return_softmax_lse=False,
-        )
-        result = ret[0] if isinstance(ret, (tuple, list)) else ret
-        result = result[:, :, : layer.tp_q_head_num].reshape(batch, -1)
-        result = result.masked_fill(~valid.any(dim=1, keepdim=True), 0)
-        output[:, column].copy_(result)
-    return torch.nn.functional.pad(
-        output.view(logical_tokens, -1), (0, 0, 0, num_tokens - logical_tokens)
-    )
 
 
 def forward_sparsity_driven_kv_offload(
@@ -155,11 +65,6 @@ def forward_sparsity_driven_kv_offload(
 
     if save_kv_cache:
         sparse_kv_manager.offload_v2(k_nope, k_pe, layer, forward_batch, stream)
-
-    if is_sparse_mtp_batch(forward_batch):
-        return _forward_sparse_mtp(
-            backend, q_nope, q_pe, layer, forward_batch, topk_indices
-        )
 
     if is_prefill:
         if backend.forward_metadata.actual_seq_lengths_q is not None:
@@ -257,54 +162,10 @@ def forward_sparsity_driven_kv_offload(
         # directly.
         selected_kv_buffer = sparse_kv_manager.selected_kv_buffer[:batch_size]
         selected_kv_buffer.zero_()
-        adapter = sparse_kv_manager.lim_adapter
-        if adapter is not None and adapter.full_visible:
-            plan = backend.forward_metadata.sparse_kv_lim_plan
-            if plan is None:
-                raise RuntimeError(
-                    "Full-visible LIM attention requires an indexer plan."
-                )
-            adapter.gather_full_visible(
-                sparse_kv_manager,
-                plan,
-                layer.layer_id - sparse_kv_manager.start_layer,
-                selected_kv_buffer,
-                copy=unidex_copy_inplace,
-            )
-        elif adapter is not None:
-            plan = backend.forward_metadata.sparse_kv_lim_plan
-            if plan is None:
-                raise RuntimeError(
-                    "LIM attention has no anchor plan; an indexer must precede IndexShare layers."
-                )
-            adapter.materialize(
-                sparse_kv_manager,
-                plan,
-                layer.layer_id - sparse_kv_manager.start_layer,
-                selected_kv_buffer,
-                stream,
-                copy=unidex_copy_inplace,
-            )
-        else:
-            sparse_kv_manager.materialize_selected_kv(
-                layer, forward_batch, topk_2d, selected_kv_buffer, stream
-            )
-
+        sparse_kv_manager.materialize_selected_kv(
+            layer, forward_batch, topk_2d, selected_kv_buffer, stream
+        )
         _wait_stream_event(stream, sparse_kv_manager.miss_done)
-        if adapter is not None and not adapter.full_visible:
-            plan = backend.forward_metadata.sparse_kv_lim_plan
-            if plan is None:
-                raise RuntimeError(
-                    "Experimental prefix/tail attention requires an indexer plan."
-                )
-            selected_kv_buffer, topk_2d = adapter.append_tail(
-                sparse_kv_manager,
-                plan,
-                layer.layer_id - sparse_kv_manager.start_layer,
-                selected_kv_buffer,
-                copy=unidex_copy_inplace,
-            )
-            selected_kv_length = adapter.width
 
         selected_k_nope, selected_k_rope = selected_kv_buffer.split(
             [nope_head_dim, rope_head_dim], dim=-1
@@ -408,7 +269,7 @@ def forward_sparsity_driven_kv_offload(
         )
 
         _wait_stream_event(stream, sparse_kv_manager.refill_done)
-        if sparse_kv_manager.copy_sfa_enabled and adapter is None:
+        if sparse_kv_manager.copy_sfa_enabled:
             # The materialization fallback rewrites payload residency without
             # maintaining the native planner's inverse map. Reenter Copy-SFA
             # with a cold cache instead of publishing stale hits.

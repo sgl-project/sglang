@@ -9,7 +9,6 @@ import ast
 import importlib.util
 import logging
 import random
-import sys
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
@@ -22,19 +21,6 @@ import torch
 
 ROOT = Path(__file__).resolve().parents[3]
 SOURCE = ROOT / "python/sglang/srt/hardware_backend/npu/sparsity_driven_kv_offload"
-
-
-def load_source(name):
-    spec = importlib.util.spec_from_file_location(
-        f"sparse_kv_test_{name}", SOURCE / f"{name}.py"
-    )
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-mtp_module = load_source("mtp")
 
 
 class FakeStream:
@@ -126,8 +112,6 @@ class TestSparseKVManager(unittest.TestCase):
             logger=logging.getLogger(__name__),
             slot_map_lookup=self.lookup,
             unidex_copy_inplace=self.copy,
-            is_sparse_mtp_batch=mtp_module.is_sparse_mtp_batch,
-            prepare_mtp_rows=mtp_module.prepare_mtp_rows,
         )
         exec(
             compile(
@@ -196,7 +180,6 @@ class TestSparseKVManager(unittest.TestCase):
 
     def manager(self):
         m = self.Manager.__new__(self.Manager)
-        m.lim_adapter = None
         m.copy_sfa_enabled = False
         m.size, m.max_context_len, m.sparse_context_len = 4, 64, 2
         m.device_cache_size = 2
@@ -216,65 +199,6 @@ class TestSparseKVManager(unittest.TestCase):
             object(),
         )
         return m
-
-    def test_mtp_offload_rewrites_rejects_without_publishing_extend_padding(self):
-        manager = self.manager()
-        manager.logical_max_context_len = 64
-        batch = SimpleNamespace(
-            forward_mode=SimpleNamespace(
-                is_target_verify=lambda: True,
-                is_draft_extend_v2=lambda: False,
-            ),
-            req_pool_indices=torch.tensor([2, 0, 1]),
-            seq_lens=torch.tensor([10, 0, 20]),
-            positions=torch.tensor([10, 11, 12, 0, 0, 0, 20, 21, 22]),
-            out_cache_loc=torch.arange(9),
-            spec_info=SimpleNamespace(num_accept_tokens=torch.tensor([1, 0, 2])),
-        )
-        kv = torch.arange(27).float().view(9, 1, 3)
-        layer = SimpleNamespace(layer_id=0)
-        original_padding = manager.host_kv_buffer[0][0].clone()
-        manager.offload_v2(kv[..., :2], kv[..., 2:], layer, batch, self.main)
-        torch.testing.assert_close(manager.host_kv_buffer[0][2, 10:13], kv[:3])
-        torch.testing.assert_close(manager.host_kv_buffer[0][1, 20:23], kv[6:])
-        torch.testing.assert_close(manager.host_kv_buffer[0][0], original_padding)
-        # Reject all but the first token, then publish a different continuation.
-        # Padded columns still have real positions but must leave old KV alone.
-        before = manager.host_kv_buffer[0].clone()
-        batch.forward_mode.is_target_verify = lambda: False
-        batch.forward_mode.is_draft_extend_v2 = lambda: True
-        kv += 100
-        manager.offload_v2(kv[..., :2], kv[..., 2:], layer, batch, self.main)
-        torch.testing.assert_close(manager.host_kv_buffer[0][2, 10], kv[0])
-        torch.testing.assert_close(
-            manager.host_kv_buffer[0][2, 11:13], before[2, 11:13]
-        )
-        torch.testing.assert_close(manager.host_kv_buffer[0][1, 20:22], kv[6:8])
-        torch.testing.assert_close(manager.host_kv_buffer[0][1, 22], before[1, 22])
-        manager.device_slot_map[0][2].fill_(7)
-        manager.invalidate_mtp_cache(layer, batch.req_pool_indices)
-        self.assertTrue(torch.all(manager.device_slot_map[0][2] == -1))
-
-    def test_mtp_tp_suffix_cannot_overwrite_committed_position_zero(self):
-        manager = self.manager()
-        manager.logical_max_context_len = 64
-        batch = SimpleNamespace(
-            forward_mode=SimpleNamespace(
-                is_target_verify=lambda: True, is_draft_extend_v2=lambda: False
-            ),
-            req_pool_indices=torch.tensor([2, 0]),
-            seq_lens=torch.tensor([33, 0]),
-            positions=torch.tensor([33, 34, 35, 0, 0, 0, 0, 0]),
-            out_cache_loc=torch.arange(8),
-            spec_info=SimpleNamespace(num_tokens_per_req=3),
-        )
-        prefix = manager.host_kv_buffer[0][2, :33].clone()
-        kv = torch.arange(24).float().view(8, 1, 3)
-        manager.offload_v2(
-            kv[..., :2], kv[..., 2:], SimpleNamespace(layer_id=0), batch, self.main
-        )
-        torch.testing.assert_close(manager.host_kv_buffer[0][2, :33], prefix)
-        torch.testing.assert_close(manager.host_kv_buffer[0][2, 33:36], kv[:3])
 
     def test_request_reuse_resets_both_target_and_draft_managers(self):
         target, draft = self.manager(), self.manager()
@@ -370,7 +294,6 @@ class TestSparseKVManager(unittest.TestCase):
             torch=torch,
             torch_npu=SimpleNamespace(npu_sparse_flash_attention=sparse_attention),
             _get_sparse_kv_manager=lambda backend: backend.sparse_kv_manager,
-            is_sparse_mtp_batch=mtp_module.is_sparse_mtp_batch,
             normalize_batch_topk_indices=self.manager_scope[
                 "normalize_batch_topk_indices"
             ],
