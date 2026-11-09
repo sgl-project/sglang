@@ -2377,8 +2377,6 @@ class Envs:
     # Read by the NVIDIA megakernel plugin, not by SGLang: a comma-separated
     # slot list that replaces the plugin's default. Empty runs the stock paths.
     SGLANG_NVIDIA_MEGAKERNEL_SLOTS = EnvTuple(())
-    # Prepare Kimi q6 graph widths only; other widths retain stock execution.
-    SGLANG_KIMI_K3_MEGAKERNEL_CAPTURE_ONLY = EnvBool(False)
 
     # ===================================================================
     # KV-Canary and Token-Oracle (testing only)
