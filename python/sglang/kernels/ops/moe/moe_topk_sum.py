@@ -36,8 +36,9 @@ def moe_topk_sum(
 ) -> torch.Tensor:
     """out[M, K] = x[M, topk, K].sum(dim=1) * scale for contiguous bf16 tensors.
 
-    ``threads`` sets the block width; the grid is ``(ceil(K / 8 / threads), M)``, so a narrow block
-    buys CTAs at decode (K=2560, M=8: 32 threads turns 16 CTAs into 80).
+    ``threads`` sets the block width; the grid is ``(ceil(K / 8 / threads), M)``. More CTAs stop
+    paying well before the SM count: at decode ([8, 10, 2560], one A100) 16 CTAs (256 threads) take
+    3.45 us, 24 (128) 3.14, 40 (64) 3.02 and 80 (32) 3.06, so the Marlin runner keeps 64.
     """
     _jit_topk_sum_module(threads).run(x, out, scale)
     return out

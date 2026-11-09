@@ -3,6 +3,8 @@
 // Replaces sgl_kernel's moe_sum_reduce_kernel_general (~5.7us at decode
 // shapes [1, 16, 3584]) with a straightforward vectorized pass (~1.5us):
 // one thread per 8-element vector of K, looping the topk rows in fp32.
+// At [8, 10, 2560] a block of 64 threads (40 CTAs) is the sweet spot; 32 (80
+// CTAs) is no faster and 128/256 are slower.
 
 #include <sgl_kernel/tensor.h>  // For TensorMatcher, SymbolicSize, SymbolicDevice
 #include <sgl_kernel/utils.h>   // For RuntimeCheck
