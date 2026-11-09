@@ -18,8 +18,6 @@ import torch
 from huggingface_hub import model_info
 from skimage.metrics import structural_similarity
 
-from sglang.multimodal_gen.runtime.entrypoints.diffusion_generator import DiffGenerator
-
 PROMPTS = (
     "A quiet sunlit kitchen, detailed wooden furniture, slow camera pan, birdsong outside.",
     "A cyclist rides through a busy rainy city street at night, reflections and traffic sounds.",
@@ -28,11 +26,17 @@ PROMPTS = (
 
 
 def main():
+    # Spawned workers must initialize their platform before importing the runtime.
+    from sglang.multimodal_gen.runtime.entrypoints.diffusion_generator import (
+        DiffGenerator,
+    )
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--fp8", action="store_true")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--steps", type=int, default=5)
     parser.add_argument("--short-edge", type=int, default=768)
+    parser.add_argument("--prompt-count", type=int, choices=(1, 2, 3), default=3)
     parser.add_argument("--revision", default=None)
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
@@ -61,7 +65,7 @@ def main():
         component_quantizations={"video_vae": "fp8"} if args.fp8 else {},
     )
     try:
-        for index, prompt in enumerate(PROMPTS):
+        for index, prompt in enumerate(PROMPTS[: args.prompt_count]):
             order = (
                 ("exact", "lossless", "high", "lossless", "high", "exact")
                 if args.fp8
@@ -103,6 +107,7 @@ def main():
                     "prompt": index,
                     "quality": quality,
                     "iteration": iteration,
+                    "frame_shape": list(frames.shape),
                     "wall_s": elapsed,
                     "generation_s": result.generation_time,
                     "peak_memory_mb": result.peak_memory_mb,
