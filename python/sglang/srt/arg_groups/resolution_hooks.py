@@ -15,6 +15,7 @@ _OVERRIDABLE_HOOKS: FrozenSet[str] = frozenset(
     {
         "handle_deprecated_dp_attention",
         "handle_mega_moe",
+        "validate_rust_server_unsupported_args",
         "handle_return_hidden_states_mode",
         "handle_media_url_security",
         "handle_watermark_config",
