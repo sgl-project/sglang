@@ -26,11 +26,14 @@ from typing import TYPE_CHECKING, Callable, NamedTuple
 import torch
 import torch.distributed as dist
 
-from sglang.srt.eplb.expert_distribution import _ExpertDistributionRecorderReal
 from sglang.srt.runtime_context import get_device, get_exec, get_parallel, get_resources
 
 if TYPE_CHECKING:
+    from sglang.srt.eplb.expert_distribution import _ExpertDistributionRecorderReal
     from sglang.srt.eplb.expert_location import ExpertLocationMetadata
+
+# copy_memory_ uses a signed 32-bit element count.
+_MAX_COPY_ELEMENTS = 2**31 - 1
 
 # ACL format IDs, kept here so importing this module does not load torch_npu.
 _FORMAT_NCHW = 0
@@ -46,7 +49,7 @@ _NZ_FORMATS = (
 )
 
 
-def get_eplb_group() -> dist.ProcessGroup | None:
+def _get_eplb_group() -> dist.ProcessGroup | None:
     """Return a compatible TP device group, or None to select default WORLD."""
     if not dist.is_initialized():
         return None
@@ -88,18 +91,18 @@ def _warmup_eplb_communication(group: dist.ProcessGroup | None) -> None:
     resources.npu_eplb_warmed_group = group
 
 
-class NpuExpertDistributionRecorder(_ExpertDistributionRecorderReal):
-    """Configure statistics communication and warm a reused TP group for migration."""
+def create_eplb_recorder(
+    expert_location_metadata: ExpertLocationMetadata, rank: int
+) -> _ExpertDistributionRecorderReal:
+    """Use the common recorder with NPU communication setup."""
+    from sglang.srt.eplb.expert_distribution import _ExpertDistributionRecorderReal
 
-    def __init__(
-        self, expert_location_metadata: ExpertLocationMetadata, rank: int
-    ) -> None:
-        super().__init__(expert_location_metadata, rank)
-        group = get_eplb_group()
-        if get_exec().moe.enable_eplb:
-            _warmup_eplb_communication(group)
-        # Reuse the existing accumulator; only its communication group changes.
-        self._accumulator._communication_group = group
+    recorder = _ExpertDistributionRecorderReal(expert_location_metadata, rank)
+    group = _get_eplb_group()
+    if get_exec().moe.enable_eplb:
+        _warmup_eplb_communication(group)
+    recorder._accumulator._communication_group = group
+    return recorder
 
 
 def update_expert_weights_with_staging(
@@ -122,7 +125,7 @@ def update_expert_weights_with_staging(
     from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 
     _validate_migration_topology()
-    group = get_eplb_group()
+    group = _get_eplb_group()
     # Both Ascend 950PR and 950DT use ARCH35. Their NZ copy/cast paths do not
     # accept the transposed expert views used by MXFP4/MXFP8 inference.
     staging_type = (
@@ -364,15 +367,17 @@ def _expert_storage_layout(weight: torch.Tensor) -> _ExpertStorageLayout:
         raise ValueError("A5 EPLB requires 3D batched NZ expert weights.")
     # copy_memory_ copies destination-sized storage without checking source
     # capacity and uses signed int element counts. Validate before any transfer.
+    storage_bytes = storage_elements * owner.element_size()
+    allocated_bytes = owner.untyped_storage().nbytes()
     if (
-        not 0 < storage_elements <= 2**31 - 1
+        not 0 < storage_elements <= _MAX_COPY_ELEMENTS
         or storage_elements < owner.numel()
-        or storage_elements * owner.element_size() > owner.untyped_storage().nbytes()
+        or storage_bytes > allocated_bytes
     ):
         raise ValueError(
             f"A5 EPLB has invalid storage capacity: {storage_elements} elements "
             f"for shape {tuple(owner.shape)} and "
-            f"{owner.untyped_storage().nbytes()} allocated bytes."
+            f"{allocated_bytes} allocated bytes."
         )
     if storage_elements % owner.shape[0]:
         raise ValueError(
@@ -408,6 +413,7 @@ class _PhysicalExpertWeightStaging(_ExpertWeightStaging):
     ):
         super().__init__(weights_by_layer, layer_ids, rank)
         self._layouts: list[_ExpertStorageLayout] = []
+        self._storage_snapshots: list[tuple[torch.Tensor, torch.Tensor]] = []
         for layer_index, layer in enumerate(layer_ids):
             for weight_index, weight in enumerate(weights_by_layer[layer]):
                 try:
@@ -439,28 +445,25 @@ class _PhysicalExpertWeightStaging(_ExpertWeightStaging):
 
     def load(self, weights: list[torch.Tensor]) -> list[torch.Tensor]:
         self._begin_layer()
-        self._storage_snapshots: list[tuple[torch.Tensor, torch.Tensor]] = []
+        self._storage_snapshots.clear()
         migration_weights = []
-        for weight, layout, needs_staging in zip(
+        for weight, layout, needs_snapshot in zip(
             weights, self._layouts, self._needs_staging, strict=True
         ):
-            if not needs_staging:
-                # Keep byte transport for FP8 scales, without copying ND storage.
-                migration_weights.append(
-                    weight.view(torch.uint8).view(layout.expert_byte_shape(weight))
+            storage = weight
+            if needs_snapshot:
+                # Preserve the full parameter, including its shared-expert suffix.
+                owner = weight if weight._base is None else weight._base
+                storage = torch.empty(
+                    layout.storage_elements, dtype=weight.dtype, device=weight.device
                 )
-                continue
-            # Snapshot the full backing tensor: [routed experts | shared experts].
-            # Only the routed rows below are passed to the migration algorithm.
-            owner = weight if weight._base is None else weight._base
-            snapshot = torch.empty(
-                layout.storage_elements, dtype=weight.dtype, device=weight.device
-            )
-            torch.ops.npu.copy_memory_(snapshot, owner, non_blocking=True)
-            self._storage_snapshots.append((owner, snapshot))
+                torch.ops.npu.copy_memory_(storage, owner, non_blocking=True)
+                self._storage_snapshots.append((owner, storage))
             # Reinterpret bytes; a dtype conversion would alter FP4/FP8 values.
-            expert_bytes = snapshot.view(torch.uint8).view(layout.total_experts, -1)
-            migration_weights.append(expert_bytes[: weight.shape[0]])
+            # Contiguous ND aliases model storage; only routed rows are moved.
+            routed_experts, bytes_per_expert = layout.expert_byte_shape(weight)
+            expert_bytes = storage.view(torch.uint8).view(-1, bytes_per_expert)
+            migration_weights.append(expert_bytes[:routed_experts])
         return migration_weights
 
     def store(

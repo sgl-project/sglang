@@ -147,10 +147,10 @@ class ExpertDistributionRecorder(ABC):
             "recording. Try setting `get_model_config_for_expert_location` in your model."
             if get_platform().is_npu:
                 from sglang.srt.hardware_backend.npu.eplb import (
-                    NpuExpertDistributionRecorder,
+                    create_eplb_recorder,
                 )
 
-                return NpuExpertDistributionRecorder(expert_location_metadata, rank)
+                return create_eplb_recorder(expert_location_metadata, rank)
             return _ExpertDistributionRecorderReal(expert_location_metadata, rank)
         else:
             return _ExpertDistributionRecorderNoop()
