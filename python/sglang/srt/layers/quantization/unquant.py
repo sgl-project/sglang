@@ -1411,39 +1411,35 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         self.moe_runner_config = moe_runner_config
         # SAIL's DeepGEMM MoE engines only implement gated SiLU and SiTU. A gelu
         # or ungated checkpoint routed there trips the runner's assertion during
-        # construction, far from the cause, so decide that here instead.
-        sail_deep_gemm_reason = None
+        # construction, far from the cause, so decide that here instead; which
+        # layers the engines take -- the DeepEP-family rule and the opt-in one --
+        # is their own knowledge and stays in the SAIL package.
+        use_sail_deepgemm_for_a2a = False
+        use_sail_deepgemm_for_auto = False
         if is_sail() and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
             from sglang.srt.hardware_backend.sail.moe.deepgemm_moe import (
+                deepgemm_moe_selected_for_a2a,
+                deepgemm_moe_selected_for_auto,
                 sail_deepgemm_moe_unsupported_reason,
             )
 
-            sail_deep_gemm_reason = sail_deepgemm_moe_unsupported_reason(
-                moe_runner_config
-            )
-        sail_deep_gemm_ok = sail_deep_gemm_reason is None
-        if not sail_deep_gemm_ok:
-            message = (
-                f"SAIL DeepGEMM MoE cannot run this layer: {sail_deep_gemm_reason}"
-            )
-            if (
-                get_moe_runner_backend().is_deep_gemm()
-                or get_moe_a2a_backend().is_deepep()
-                or get_moe_a2a_backend().is_mooncake()
-            ):
-                raise ValueError(
-                    f"{message}; use --moe-runner-backend triton or a gated "
-                    "SiLU/SiTU checkpoint."
-                )
-            logger.warning_once(f"{message}; using the triton MoE runner.")
-        if (
-            deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-            and is_sail()
-            and sail_deep_gemm_ok
-            and (
-                get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake()
-            )
-        ):
+            reason = sail_deepgemm_moe_unsupported_reason(moe_runner_config)
+            if reason is None:
+                use_sail_deepgemm_for_a2a = deepgemm_moe_selected_for_a2a()
+                use_sail_deepgemm_for_auto = deepgemm_moe_selected_for_auto()
+            else:
+                message = f"SAIL DeepGEMM MoE cannot run this layer: {reason}"
+                if (
+                    get_moe_runner_backend().is_deep_gemm()
+                    or get_moe_a2a_backend().is_deepep()
+                    or get_moe_a2a_backend().is_mooncake()
+                ):
+                    raise ValueError(
+                        f"{message}; use --moe-runner-backend triton or a gated "
+                        "SiLU/SiTU checkpoint."
+                    )
+                logger.warning_once(f"{message}; using the triton MoE runner.")
+        if use_sail_deepgemm_for_a2a:
             backend = MoeRunnerBackend.DEEP_GEMM
         elif self.use_flashinfer_trtllm_moe:
             backend = (
@@ -1464,13 +1460,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             layer.w2_kernel = NPUUnquantMoEMethod()
             moe_runner_config.layer = layer
             backend = MoeRunnerBackend.ASCEND
-        elif (
-            is_sail()
-            and get_moe_runner_backend().is_auto()
-            and envs.SGLANG_SAIL_DEEPGEMM_MOE.get()
-            and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-            and sail_deep_gemm_ok
-        ):
+        elif use_sail_deepgemm_for_auto and get_moe_runner_backend().is_auto():
             backend = MoeRunnerBackend.DEEP_GEMM
         else:
             backend = MoeRunnerBackend.TRITON

@@ -111,7 +111,6 @@ from sglang.srt.layers.moe.utils import (
     MoeRunnerBackendLike,
     RoutingMethodType,
     has_per_rank_fused_shared_slots,
-    is_deepep_class_backend,
 )
 from sglang.srt.model_executor.forward_context import (
     get_forward_context,
@@ -2043,22 +2042,29 @@ def _zero_topk_weights_padded_region(
     topk_weights[_padded_row_mask(topk_weights, num_token_non_padded), :] = 0.0
 
 
+def _sail_topk_ids_need_int64_masking(topk_ids: torch.Tensor) -> bool:
+    """Whether SAIL's DeepEP-family dispatch left int32 ids to widen and mask.
+
+    Only call this on SAIL: it imports the platform package.
+    """
+    from sglang.srt.hardware_backend.sail.moe.topk_ids import need_int64_masking
+
+    return need_int64_masking(topk_ids)
+
+
 def _mask_topk_ids_padded_region_to_int64(
     topk_ids: torch.Tensor,
     num_token_non_padded: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Return masked int64 IDs; int32 inputs on SAIL use the fused kernel."""
-    if (
-        num_token_non_padded is not None
-        and _is_sail
-        and topk_ids.is_cuda
-        and topk_ids.dtype == torch.int32
-        and topk_ids.shape[1] <= 32
-        and topk_ids.is_contiguous()
-    ):
-        from sglang.kernels.ops.moe.dsv4 import mask_topk_ids_to_int64
+    if num_token_non_padded is not None and _is_sail:
+        from sglang.srt.hardware_backend.sail.moe.topk_ids import (
+            mask_padded_region_to_int64,
+        )
 
-        return mask_topk_ids_to_int64(topk_ids, num_token_non_padded)
+        masked = mask_padded_region_to_int64(topk_ids, num_token_non_padded)
+        if masked is not None:
+            return masked
     topk_ids = topk_ids.to(torch.int64)
     _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
     return topk_ids
@@ -2750,9 +2756,7 @@ def _post_process_topk_ids(
             # ExpertDistributionRecorder tracks only EPLB physical routed experts.
             recorder_topk_ids = routed_cols
         else:
-            cast_to_int64 = (
-                _is_sail and topk_ids.dtype == torch.int32 and is_deepep_class_backend()
-            )
+            cast_to_int64 = _is_sail and _sail_topk_ids_need_int64_masking(topk_ids)
             fused_topk_ids = None
             recorder = get_global_expert_distribution_recorder()
             load_buffer = recorder.get_current_pass_count_buffer()

@@ -7,13 +7,13 @@ import torch
 from compressed_tensors.quantization import QuantizationStrategy
 
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz, scaled_fp8_quant
-from sglang.srt.environ import envs
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
     FlashInferTrtllmFp8MoeQuantInfo,
 )
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.moe.utils import (
+    get_moe_a2a_backend,
     get_moe_runner_backend,
     get_moe_weight_sizes,
 )
@@ -346,18 +346,22 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
-        from sglang.srt.layers import deep_gemm_wrapper
-        from sglang.srt.layers.moe.utils import get_moe_a2a_backend
-
         self.moe_runner_config = moe_runner_config
         moe_runner_backend = get_moe_runner_backend()
-        if (
-            deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-            and is_sail()
-            and (
-                get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake()
+        # The SAIL engines' selection rules (DeepEP-family, opt-in) live with
+        # them in the SAIL package; this chain only places the result.
+        use_sail_deepgemm_for_a2a = False
+        use_sail_deepgemm_for_auto = False
+        if is_sail():
+            from sglang.srt.hardware_backend.sail.moe.deepgemm_moe import (
+                deepgemm_moe_selected_for_a2a,
+                deepgemm_moe_selected_for_auto,
             )
-        ):
+
+            use_sail_deepgemm_for_a2a = deepgemm_moe_selected_for_a2a()
+            use_sail_deepgemm_for_auto = deepgemm_moe_selected_for_auto()
+
+        if use_sail_deepgemm_for_a2a:
             moe_runner_backend = MoeRunnerBackend.DEEP_GEMM
         elif moe_runner_backend.is_auto():
             if (
@@ -367,10 +371,8 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
             ):
                 moe_runner_backend = MoeRunnerBackend.AITER
             elif (
-                is_sail()
-                and envs.SGLANG_SAIL_DEEPGEMM_MOE.get()
+                use_sail_deepgemm_for_auto
                 and self.weight_quant.strategy == QuantizationStrategy.CHANNEL
-                and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
             ):
                 moe_runner_backend = MoeRunnerBackend.DEEP_GEMM
             else:
