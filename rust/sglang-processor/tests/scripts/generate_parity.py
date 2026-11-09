@@ -5,7 +5,8 @@ Each fixture names a checkpoint (`model`, `revision`, optionally the server's
 `default_chat_template_kwargs`. This validates and renders every case with
 `OpenAIServingChat` on that checkpoint and records the prompt and its token ids,
 or the error SGLang raises, plus the `config.json` fields the processor reads
-and the Jinja template a checkpoint renders with.
+and the Jinja template a checkpoint renders with, with the special tokens its
+context carries. The tokenizer comes from SGLang's `get_tokenizer`.
 
 MiniMax cases may also supply `chat_template` for a server-side template override.
 

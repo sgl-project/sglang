@@ -226,14 +226,15 @@ fn processor_fixture_parity() {
         let fixture: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(entry.path()).unwrap()).unwrap();
         let model = fixture["model"].as_str().unwrap();
-        let Some(tokenizer_path) = hub_cache()
-            .map(|hub| {
-                hub.join(format!("models--{}", model.replace('/', "--")))
-                    .join("snapshots")
-                    .join(fixture["revision"].as_str().unwrap())
-                    .join("tokenizer.json")
-            })
-            .filter(|path| path.is_file())
+        let snapshot = hub_cache().map(|hub| {
+            hub.join(format!("models--{}", model.replace('/', "--")))
+                .join("snapshots")
+                .join(fixture["revision"].as_str().unwrap())
+        });
+        let Some(tokenizer_path) = ["tokenizer.json", "tiktoken.model"]
+            .iter()
+            .filter_map(|file| Some(snapshot.as_ref()?.join(file)))
+            .find(|path| path.is_file())
         else {
             eprintln!("skip {model}: pinned snapshot not cached");
             continue;

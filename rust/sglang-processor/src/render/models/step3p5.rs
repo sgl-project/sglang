@@ -13,6 +13,7 @@ use super::pydantic_dump::{
 };
 use super::qwen38::{template_args, template_tools};
 use super::template_context::PreservedRequest;
+use crate::py::py_truthy;
 use crate::render::RenderError;
 use crate::render::reasoning::requested_effort;
 
@@ -20,6 +21,22 @@ use crate::render::reasoning::requested_effort;
 const EFFORT_TIERS: &[&str] = &[
     "none", "minimal", "low", "medium", "high", "xhigh", "ultra", "max",
 ];
+
+/// `apply_chat_template` arguments SGLang passes itself, which fail its call as
+/// kwargs. A falsy `continue_final_message` or `return_assistant_tokens_mask` is
+/// that argument's default and a `chat_template` renders another template; the
+/// engine renders those.
+const FAILING_KWARGS: &[&str] = &[
+    "add_generation_prompt",
+    "conversation",
+    "messages",
+    "return_dict",
+    "tokenize",
+    "tools",
+];
+
+/// `apply_chat_template` flags that fail its call only when truthy.
+const DEFAULT_FALSE_KWARGS: &[&str] = &["continue_final_message", "return_assistant_tokens_mask"];
 
 /// Dynamo's own template context, which `chat_template_kwargs` cannot override
 /// as they override `apply_chat_template`'s special tokens in Python.
@@ -65,6 +82,7 @@ pub(crate) fn render(
     }
     validate_tool_choice(&request, &messages)?;
     coerce_effort(&mut request)?;
+    failing_kwargs(&request, defaults)?;
     let mut args = template_args(&request, defaults)?;
     if let Some(key) = CONTEXT_TOKENS.iter().find(|key| args.contains_key(**key)) {
         return Err(RenderError::Declined(format!("chat_template_kwargs.{key}")));
@@ -93,11 +111,7 @@ pub(crate) fn render(
     let PromptFormatter::OAI(formatter) = formatter;
     args.insert(message_context.into(), Value::Array(messages));
     let prompt = formatter
-        .render(&PreservedRequest {
-            tools,
-            args,
-            message_context,
-        })
+        .render(&PreservedRequest { tools, args })
         .map_err(|error| format!("{error:#}"))?;
     Ok((prompt, prefix))
 }
@@ -146,6 +160,24 @@ fn validate_tool_choice(request: &Value, messages: &[Value]) -> Result<(), Strin
     Ok(())
 }
 
+/// The request's kwargs over the server's defaults that `apply_chat_template`
+/// rejects, a 400 in Python rather than a different render.
+fn failing_kwargs(request: &Value, defaults: &HashMap<String, Value>) -> Result<(), String> {
+    let own = request["chat_template_kwargs"].as_object();
+    let kwarg = |key: &&str| {
+        own.and_then(|kwargs| kwargs.get(*key))
+            .or_else(|| defaults.get(*key))
+    };
+    let failing = FAILING_KWARGS.iter().find(|key| kwarg(key).is_some());
+    let truthy = DEFAULT_FALSE_KWARGS
+        .iter()
+        .find(|key| kwarg(key).is_some_and(py_truthy));
+    match failing.or(truthy) {
+        Some(key) => Err(format!("chat_template_kwargs.{key}")),
+        None => Ok(()),
+    }
+}
+
 /// pydantic's `ReasoningEffortType` on the request's own effort (`reasoning`'s
 /// first, as `normalize_reasoning_inputs` reads it): a tier, or a float in
 /// [0, 0.99], numeric strings included. The float reaches the template, which
@@ -175,7 +207,7 @@ fn coerce_effort(request: &mut Value) -> Result<(), String> {
 /// `normalize_tool_content` leave it.
 fn template_message(mut message: Value, content_parts: Option<bool>) -> Result<Value, RenderError> {
     if let Some(fields) = message.as_object_mut() {
-        // Only request tools reach the template; Dynamo rejects message-level ones.
+        // StepFun's templates read only the request's tools.
         fields.remove("tools");
     }
     let Some(parts) = message["content"].as_array() else {
@@ -326,6 +358,55 @@ mod tests {
             {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
         ]}]});
         assert!(declined(render(&checkpoint, media)));
+        // orjson parses nesting serde_json's recursion limit rejects.
+        let nested = format!("{{\"a\": {}{}}}", "[".repeat(200), "]".repeat(200));
+        let deep = json!({"messages": [
+            {"role": "user", "content": "Hi"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "a", "type": "function", "function": {"name": "f", "arguments": nested}},
+            ]},
+            {"role": "tool", "tool_call_id": "a", "content": "r"},
+        ]});
+        assert!(declined(render(&checkpoint, deep)));
+    }
+
+    /// Kwargs that fail Python's `apply_chat_template` fail here too, rather than
+    /// falling back to a template render a host could serve.
+    #[test]
+    fn apply_chat_template_kwargs_fail() {
+        let checkpoint = formatter(&format!("{MARKERS}{{{{ messages[0].content }}}}"));
+        let request = |kwargs: Value| {
+            json!({
+                "messages": [{"role": "user", "content": "Hi"}],
+                "chat_template_kwargs": kwargs,
+            })
+        };
+        for kwargs in [
+            json!({"tokenize": false}),
+            json!({"tools": []}),
+            json!({"continue_final_message": true}),
+        ] {
+            assert!(
+                matches!(
+                    render(&checkpoint, request(kwargs.clone())),
+                    Err(TemplateError::Renderer { .. })
+                ),
+                "{kwargs}"
+            );
+        }
+        let defaults = HashMap::from([("return_dict".to_owned(), json!(false))]);
+        assert!(matches!(
+            checkpoint.render_request(request(json!({})), &defaults),
+            Err(TemplateError::Renderer { .. })
+        ));
+        // A falsy flag is `apply_chat_template`'s default: left to the engine.
+        assert!(matches!(
+            render(
+                &checkpoint,
+                request(json!({"continue_final_message": false}))
+            ),
+            Err(TemplateError::NeedsRenderFallback { .. })
+        ));
     }
 
     /// pydantic reads a numeric-string effort as a float, which a kwargs effort can

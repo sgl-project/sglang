@@ -38,20 +38,20 @@ pub(crate) fn preserve_messages(config: &mut Value, name: &str) -> String {
 }
 
 /// The template context SGLang builds, as the request Dynamo renders: the
-/// messages travel in `args` under the [`preserve_messages`] key.
-pub(crate) struct PreservedRequest<'a> {
+/// messages travel in `args` under the [`preserve_messages`] key, so Dynamo's
+/// own `messages`, which the wrapped template replaces, stay empty.
+pub(crate) struct PreservedRequest {
     pub tools: Option<Vec<Value>>,
     pub args: HashMap<String, Value>,
-    pub message_context: &'a str,
 }
 
-impl OAIChatLikeRequest for PreservedRequest<'_> {
+impl OAIChatLikeRequest for PreservedRequest {
     fn model(&self) -> String {
         String::new()
     }
 
     fn messages(&self) -> minijinja::Value {
-        minijinja::Value::from_serialize(&self.args[self.message_context])
+        minijinja::Value::from(Vec::<minijinja::Value>::new())
     }
 
     fn tools(&self) -> Option<minijinja::Value> {

@@ -115,11 +115,7 @@ pub(crate) fn render(
     let PromptFormatter::OAI(formatter) = formatter;
     args.insert(message_context.into(), Value::Array(messages));
     let prompt = formatter
-        .render(&PreservedRequest {
-            tools,
-            args,
-            message_context,
-        })
+        .render(&PreservedRequest { tools, args })
         .map_err(|error| format!("{error:#}"))?;
     Ok((prompt, prefix))
 }
@@ -385,7 +381,7 @@ fn canonical_tool_order(messages: Vec<Value>) -> Vec<Value> {
 /// `normalize_tool_content` leave it.
 fn template_message(mut message: Value, content_parts: Option<bool>) -> Result<Value, RenderError> {
     if let Some(fields) = message.as_object_mut() {
-        // Only request tools reach the template; Dynamo rejects message-level ones.
+        // M3's templates read only the request's tools.
         fields.remove("tools");
     }
     let Some(parts) = message["content"].as_array() else {
