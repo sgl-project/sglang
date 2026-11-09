@@ -335,7 +335,9 @@ def test_pipeline_uses_generic_component_loaders(tmp_path, monkeypatch, library)
     )
     pipeline = object.__new__(MOSSImagePipeline)
     pipeline.model_path = str(tmp_path)
-    pipeline.server_args = SimpleNamespace(model_subfolder=None, revision=None)
+    pipeline.server_args = SimpleNamespace(
+        model_subfolder=None, revision=None, model_checksum=None
+    )
     config = pipeline._load_config()
     expected_library = "diffusers" if library == "pipeline_moss_image" else library
     assert not MOSSImagePipeline.component_loaders

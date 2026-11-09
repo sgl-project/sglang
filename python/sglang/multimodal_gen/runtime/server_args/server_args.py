@@ -342,6 +342,7 @@ class ServerArgs(DisaggServerArgsMixin):
     # HuggingFace specific parameters
     trust_remote_code: bool = False
     revision: str | None = None
+    model_checksum: str | None = None
 
     # Parallelism
     num_gpus: int = 1
@@ -2415,6 +2416,19 @@ class ServerArgs(DisaggServerArgsMixin):
             type=str,
             default=ServerArgs.revision,
             help="The specific model version to use (can be a branch name, tag name, or commit id)",
+        )
+        parser.add_argument(
+            "--model-checksum",
+            type=str,
+            nargs="?",
+            const="",
+            default=ServerArgs.model_checksum,
+            help=(
+                "Verify model file integrity (SHA256) before loading. If provided without a value, "
+                "uses the model path as the Hugging Face repo ID. Otherwise, provide a checksums JSON "
+                "file or a Hugging Face repo ID. Generate a manifest with "
+                "`python -m sglang.srt.utils.model_file_verifier generate --recursive`."
+            ),
         )
 
         parser.add_argument(

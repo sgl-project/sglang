@@ -251,6 +251,7 @@ def test_checkpoint_sigma_grid_reaches_request_scheduler(
         pipeline_config=config,
         model_subfolder=None,
         revision=None,
+        model_checksum=None,
         enable_cfg_parallel=False,
     )
     pipeline = object.__new__(QwenImage21Pipeline)

@@ -206,12 +206,29 @@ class ComposedPipelineBase(ABC):
         ):
             model_subfolder = self.default_model_subfolder
 
+        model_checksum = self.server_args.model_checksum
+        if model_checksum is not None and (
+            model_subfolder is not None or is_model_overlay(self.model_path)
+        ):
+            raise ValueError(
+                "--model-checksum does not support --model-subfolder, model "
+                "variants with a subfolder, or overlay models yet."
+            )
+
         if model_subfolder is None:
             model_path = maybe_download_model(
                 self.model_path,
                 force_diffusers_model=True,
                 revision=self.server_args.revision,
             )
+            if model_checksum is not None:
+                from sglang.srt.utils.model_file_verifier import verify
+
+                verify(
+                    model_path=model_path,
+                    checksums_source=model_checksum or self.model_path,
+                    recursive=True,
+                )
         else:
             model_subfolder = os.path.normpath(model_subfolder)
             if (

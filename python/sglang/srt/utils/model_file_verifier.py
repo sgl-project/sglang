@@ -8,6 +8,9 @@ Example commands:
     # Verify using locally generated checksum
     python -m sglang.srt.utils.model_file_verifier generate --model-path <hf-id-or-model-path> --model-checksum checksums.json
     python -m sglang.srt.utils.model_file_verifier verify --model-path /path/to/model --model-checksum checksums.json
+
+    # Models with files in subfolders (e.g. Diffusion): generate with --recursive
+    python -m sglang.srt.utils.model_file_verifier generate --model-path <hf-id-or-model-path> --model-checksum checksums.json --recursive
 """
 
 import argparse
@@ -71,9 +74,15 @@ IGNORE_PATTERNS = [
 # ======== Verify ========
 
 
-def verify(*, model_path: str, checksums_source: str, max_workers: int = 4) -> None:
+def verify(
+    *,
+    model_path: str,
+    checksums_source: str,
+    max_workers: int = 4,
+    recursive: bool = False,
+) -> None:
     model_path = Path(model_path).resolve()
-    expected = _load_checksums(checksums_source)
+    expected = _load_checksums(checksums_source, recursive=recursive)
     actual = _compute_manifest_from_folder(
         model_path=model_path,
         filenames=list(expected.files.keys()),
@@ -102,18 +111,24 @@ def _compare_manifests(*, expected: Manifest, actual: Manifest) -> None:
 
 
 def generate_checksums(
-    *, source: str, output_path: str, max_workers: int = 4
+    *,
+    source: str,
+    output_path: str,
+    max_workers: int = 4,
+    recursive: bool = False,
 ) -> Manifest:
     if Path(source).is_dir():
         model_path = Path(source).resolve()
-        files = _discover_files(model_path)
+        files = _discover_files(model_path, recursive=recursive)
         if not files:
             raise IntegrityError(f"No model files found in {model_path}")
         manifest = _compute_manifest_from_folder(
             model_path=model_path, filenames=files, max_workers=max_workers
         )
     else:
-        manifest = Manifest(files=_load_file_infos_from_hf(repo_id=source))
+        manifest = Manifest(
+            files=_load_file_infos_from_hf(repo_id=source, recursive=recursive)
+        )
 
     Path(output_path).write_text(
         json.dumps(manifest.to_dict(), indent=2, sort_keys=True)
@@ -125,34 +140,47 @@ def generate_checksums(
     return manifest
 
 
-def _discover_files(model_path: Path) -> List[str]:
+def _discover_files(model_path: Path, *, recursive: bool = False) -> List[str]:
+    entries = model_path.rglob("*") if recursive else model_path.iterdir()
+    relative_paths = (e.relative_to(model_path) for e in entries if e.is_file())
     return sorted(
-        e.name
-        for e in model_path.iterdir()
-        if e.is_file()
-        and not e.name.startswith(".")
-        and not any(fnmatch.fnmatch(e.name, p) for p in IGNORE_PATTERNS)
+        r.as_posix()
+        for r in relative_paths
+        if not any(part.startswith(".") for part in r.parts)
+        and not any(fnmatch.fnmatch(r.name, p) for p in IGNORE_PATTERNS)
     )
 
 
 # ======== Load Checksums ========
 
 
-def _load_checksums(source: str) -> Manifest:
+def _load_checksums(source: str, *, recursive: bool = False) -> Manifest:
     if Path(source).is_file():
         data = json.loads(Path(source).read_text())
         return Manifest.from_dict(data)
-    return Manifest(files=_load_file_infos_from_hf(repo_id=source))
+    return Manifest(files=_load_file_infos_from_hf(repo_id=source, recursive=recursive))
 
 
-def _load_file_infos_from_hf(*, repo_id: str) -> Dict[str, FileInfo]:
+def _load_file_infos_from_hf(
+    *, repo_id: str, recursive: bool = False
+) -> Dict[str, FileInfo]:
     from huggingface_hub import HfFileSystem
 
     fs = HfFileSystem()
-    files = fs.ls(repo_id, detail=True)
+    if recursive:
+        files = list(fs.find(repo_id, detail=True).values())
+    else:
+        files = fs.ls(repo_id, detail=True)
 
     file_infos = dict(
-        r for r in map(lambda f: _get_filename_and_info_from_hf_file(fs, f), files) if r
+        r
+        for r in (
+            _get_filename_and_info_from_hf_file(
+                fs, f, repo_id=repo_id, recursive=recursive
+            )
+            for f in files
+        )
+        if r
     )
     if not file_infos:
         raise IntegrityError(f"No files found in HF repo {repo_id}.")
@@ -161,14 +189,21 @@ def _load_file_infos_from_hf(*, repo_id: str) -> Dict[str, FileInfo]:
 
 
 def _get_filename_and_info_from_hf_file(
-    fs, file_info
+    fs, file_info, *, repo_id: str = "", recursive: bool = False
 ) -> Optional[Tuple[str, FileInfo]]:
     if file_info.get("type") != "file":
         return None
 
-    filename = Path(file_info.get("name", "")).name
-    if any(fnmatch.fnmatch(filename, pat) for pat in IGNORE_PATTERNS):
+    full_name = file_info.get("name", "")
+    if any(fnmatch.fnmatch(Path(full_name).name, pat) for pat in IGNORE_PATTERNS):
         return None
+    if recursive:
+        # HfFileSystem names are "<repo_id>/<path in repo>"; keep the repo-relative path.
+        filename = full_name[len(repo_id) :].lstrip("/")
+        if any(part.startswith(".") for part in Path(filename).parts):
+            return None
+    else:
+        filename = Path(full_name).name
 
     size = file_info.get("size", -1)
     lfs_info = file_info.get("lfs")
@@ -244,6 +279,11 @@ def _add_common_args(parser):
     parser.add_argument(
         "--workers", type=int, default=4, help="Number of parallel workers"
     )
+    parser.add_argument(
+        "--recursive",
+        action="store_true",
+        help="Include files in subfolders (needed for Diffusion models)",
+    )
 
 
 def main():
@@ -261,6 +301,7 @@ def main():
             source=args.model_path,
             output_path=args.model_checksum,
             max_workers=args.workers,
+            recursive=args.recursive,
         )
     )
 
@@ -273,6 +314,7 @@ def main():
             model_path=args.model_path,
             checksums_source=args.model_checksum,
             max_workers=args.workers,
+            recursive=args.recursive,
         )
     )
 
