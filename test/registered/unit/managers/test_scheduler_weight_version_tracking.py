@@ -387,6 +387,32 @@ class TestRecordWeightVersionAfterUpdate(_WeightUpdaterManagerTestBase):
         self.assertFalse(output.success)
         self.assertEqual(self.recorded, [])
 
+    def test_distributed_draft_failure_flushes_the_updated_target(self):
+        for flush_requested, flush_allowed in (
+            (True, True),
+            (True, False),
+            (False, True),
+        ):
+            with self.subTest(
+                flush_requested=flush_requested, flush_allowed=flush_allowed
+            ):
+                manager = self._manager(_runner(), _runner((False, "draft boom")))
+                manager.flush_cache = Mock(return_value=flush_allowed)
+
+                output = manager.update_weights_from_distributed(
+                    _request(flush_cache=flush_requested)
+                )
+
+                self.assertFalse(output.success)
+                self.assertIn("draft boom", output.message)
+                self.assertEqual(self.recorded, [])
+                if flush_requested:
+                    manager.flush_cache.assert_called_once_with(empty_cache=False)
+                    if not flush_allowed:
+                        self.assertIn("the cache was not flushed", output.message)
+                else:
+                    manager.flush_cache.assert_not_called()
+
     def test_successful_tensor_update_records_the_version(self):
         """The tensor refit records the version once the load reports success."""
         updater = self._manager(_runner())

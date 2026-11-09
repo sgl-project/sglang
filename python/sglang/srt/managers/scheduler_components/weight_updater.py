@@ -225,6 +225,7 @@ class SchedulerWeightUpdaterManager:
                 "begin_weight_update() and end_weight_update()",
             )
         with self._observe_weight_load("distributed"):
+            target_updated = False
             # only the target runner joined the update group; drafts load its receive
             target = self.tp_worker.model_runner.weight_updater
             try:
@@ -239,7 +240,7 @@ class SchedulerWeightUpdaterManager:
                 success, message = False, f"Failed to receive weights: {e}"
                 logger.error(message)
             else:
-                success, message = self._load_into_selected_runners(
+                success, message, target_updated = self._load_into_selected_runners(
                     weights, recv_req.selector
                 )
             if success:
@@ -247,25 +248,32 @@ class SchedulerWeightUpdaterManager:
                     self._session, loaded_weights=True
                 )
                 self.record_weight_version_after_update(recv_req.weight_version)
+            # The served weights changed even if a draft runner failed afterwards.
+            if success or target_updated:
+                load_success, load_message = success, message
                 success, message = self.flush_cache_after_weight_update(
                     recv_req, success, message
                 )
+                if not load_success and message != load_message:
+                    message = f"{load_message}; {message}"
             return UpdateWeightsFromDistributedReqOutput(
                 success=success, message=message
             )
 
     def _load_into_selected_runners(
         self, weights: List[Tuple[str, torch.Tensor]], selector: str
-    ) -> Tuple[bool, str]:
-        """Load tensors the target runner received into every selected runner."""
+    ) -> Tuple[bool, str, bool]:
+        """Load the received tensors and report whether the target was updated."""
         success, message = True, "Succeeded to update parameter online."
-        for _, runner in self._select_runners(selector):
+        target_updated = False
+        for role, runner in self._select_runners(selector):
             success, message = runner.weight_updater.load_weights_from_distributed(
                 weights
             )
             if not success:
                 break
-        return success, message
+            target_updated |= role == "target"
+        return success, message, target_updated
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         """Update the online model parameter from tensors on the selected runners."""
@@ -421,7 +429,7 @@ class SchedulerWeightUpdaterManager:
                 logger.exception("weight transport failed on this TP rank")
                 weights, error = [], f"TP rank {context.tp_rank}: {e}"
             if error is None and weights:
-                loaded, message = self._load_into_selected_runners(
+                loaded, message, _ = self._load_into_selected_runners(
                     weights, recv_req.selector
                 )
                 if not loaded:
