@@ -425,6 +425,7 @@ class TestSpanlessAbortPaths(CustomTestCase):
         scheduler.abort_on_priority_when_disabled = True
         scheduler.send_abort_output = lambda obj, req_arg: sent.append(obj)
         scheduler.tree_cache = scheduler.beam_coordinator = MagicMock()
+        scheduler.output_streamer = MagicMock()
         scheduler.hisparse_coordinator = None
         scheduler.init_request_retirer()
 

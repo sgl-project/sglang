@@ -1879,6 +1879,7 @@ class KvBufferDesc:
 class KVCache(abc.ABC):
     layer_shard_enabled: bool = False
     post_capture_active: bool = False
+    rows_are_dcp_collapsed: bool = False
 
     @property
     def backing_owner(self):
@@ -4893,6 +4894,10 @@ class MLATokenToKVPool(KVCache, MLAKVView):
     # the plan's write translation (`translate_write_loc`) and flips this.
     write_loc_is_dcp_resolved = False
     dcp_replicated = False
+
+    @property
+    def rows_are_dcp_collapsed(self) -> bool:
+        return get_parallel().dcp_enabled and not self.dcp_replicated
 
     @property
     def _write_loc_dcp_span(self) -> int:

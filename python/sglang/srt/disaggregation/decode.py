@@ -90,6 +90,7 @@ from sglang.srt.disaggregation.utils import (
     wire_sub_pool,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.dcp.layout import dsa_index_k_page_tokens
 from sglang.srt.managers.req_types import FINISH_ABORT
 from sglang.srt.managers.schedule_batch import NextBatchPlan, ScheduleBatch
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
@@ -754,6 +755,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
         kv_args.num_draft_entries = num_draft_entries
+        kv_args.draft_rows_dcp_collapsed = (
+            self.draft_token_to_kv_pool is not None
+            and self.draft_token_to_kv_pool.rows_are_dcp_collapsed
+        )
         kv_args.kv_layer_ids = build_kv_layer_ids(
             token_to_kv_pool=self.token_to_kv_pool,
             draft_token_to_kv_pool=self.draft_token_to_kv_pool,
@@ -934,7 +939,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # this point carries none of the markers `is_unadmitted_reject` reads,
         # so take the caller's word for it rather than sniffing.
         if not is_retracted and not is_rebootstrap and is_unadmitted_reject(req):
-            self.scheduler.retire_unadmitted_request(req)
+            self.scheduler.request_retirer.retire_unadmitted(req)
             return
         if is_retracted and dsv4_needs_rebootstrap(self.token_to_kv_pool_allocator):
             req.time_stats.set_retract_time()
@@ -1078,7 +1083,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if message is not None:
             logger.error(message)
             prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)
-            self.scheduler.output_streamer.stream_output([req], req.return_logprob)
+            self.scheduler.request_retirer.retire_unadmitted(req)
             return True
         return False
 
@@ -1949,7 +1954,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 decode_req.req.kv.req_pool_idx,
                 total_prefix_len,
                 seq_len,
-                self.token_to_kv_pool.page_size,
+                dsa_index_k_page_tokens(self.token_to_kv_pool.page_size),
             )
 
         def _dsa_tail_payload():
