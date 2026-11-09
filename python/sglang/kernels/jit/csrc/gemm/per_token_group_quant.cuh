@@ -1,6 +1,7 @@
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
+#include <sgl_kernel/activation.cuh>
 #include <sgl_kernel/math.cuh>
 #include <sgl_kernel/type.cuh>
 #include <sgl_kernel/utils.cuh>
@@ -29,16 +30,6 @@ SGL_DEVICE float silu(const float val) {
   return half * (1.0f + __tanhf(half));
 #else
   return val * __frcp_rn(1.0f + __expf(-val));
-#endif
-}
-
-SGL_DEVICE float2 mul2(const float2 a, const float2 b) {
-  // Packed fp32x2 multiply: one FMUL2 on SM100+ (nvcc does not auto-vectorize
-  // the scalar form). Same round-to-nearest results as two scalar FMULs.
-#if SGL_ARCH_BLACKWELL_OR_GREATER
-  return __fmul2_rn(a, b);
-#else
-  return float2{a.x * b.x, a.y * b.y};
 #endif
 }
 
@@ -298,7 +289,7 @@ struct QuantTrait {
     constexpr float kMaxValue = WTrait::kMaxValue;
     constexpr float kMaxValueInv = 1.f / kMaxValue;
 
-    const T* token_in = params.input.get<const T>(expert_idx, token_idx);
+    const T* token_in = assume_global(params.input.get<const T>(expert_idx, token_idx));
     const uint32_t group_offset = group_idx * kGroupSize;
 
     // PDL wait/trigger is owned by the launching kernel (once around all work),
@@ -314,8 +305,7 @@ struct QuantTrait {
         if constexpr (kDenseSiluAndMul) {
           // Match dense activation.cuh: round the product, not SiLU, to T.
           const auto up_f32 = cast<float2>(up[i]);
-          in[i] = cast<T2>(
-              float2{(gate.x / (1.0f + expf(-gate.x))) * up_f32.x, (gate.y / (1.0f + expf(-gate.y))) * up_f32.y});
+          in[i] = cast<T2>(float2{activation::silu(gate.x) * up_f32.x, activation::silu(gate.y) * up_f32.y});
         } else {
           const auto act = cast<T2>(float2{detail::silu(gate.x), detail::silu(gate.y)});
           in[i] = __hmul2(act, up[i]);
@@ -365,7 +355,7 @@ struct QuantTrait {
       const float2 quant_scale2 = {quant_scale, quant_scale};
 #pragma unroll
       for (uint32_t i = 0; i < kVecSize / 2; ++i) {
-        const auto scaled = detail::mul2(cast<float2>(in[i]), quant_scale2);
+        const auto scaled = math::mul_f32x2(cast<float2>(in[i]), quant_scale2);
         if constexpr (std::is_same_v<T, bf16_t> && std::is_same_v<Q, fp8_e4m3_t>) {
           out[i] = Q2{scaled};
         } else {
@@ -397,7 +387,7 @@ struct QuantTrait {
     constexpr float kMaxValue = WTrait::kMaxValue;
     constexpr float kMaxValueInv = 1.f / kMaxValue;
 
-    const fp32_t* token_in = params.input.get<const fp32_t>(expert_idx, token_idx);
+    const fp32_t* token_in = assume_global(params.input.get<const fp32_t>(expert_idx, token_idx));
     const uint32_t group_offset = group_idx * kGroupSize;
 
     in_vec_t in_vecs[kNumSubVecs];
@@ -434,7 +424,7 @@ struct QuantTrait {
     const float2 quant_scale2 = {quant_scale, quant_scale};
 #pragma unroll
     for (uint32_t i = 0; i < kVecSize / 2; ++i) {
-      out[i] = WTrait::quant(detail::mul2(float2{in(2 * i), in(2 * i + 1)}, quant_scale2));
+      out[i] = WTrait::quant(math::mul_f32x2(float2{in(2 * i), in(2 * i + 1)}, quant_scale2));
     }
 
     out.store(params.output.get<Q>(expert_idx, token_idx) + group_offset, lane_id);

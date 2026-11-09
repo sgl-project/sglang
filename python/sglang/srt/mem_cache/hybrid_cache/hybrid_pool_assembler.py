@@ -2599,7 +2599,8 @@ def _nvfp4_main_host_size(
 ) -> float:
     """The --hicache-size share of NVFP4 main KV once index and drafts are paid."""
     from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
-    from sglang.srt.mem_cache.pool_host.base import host_memory_budget_bytes
+    from sglang.srt.mem_cache.pool_host.base import host_memory_preflight
+    from sglang.srt.mem_cache.pool_host.common import get_allocator_class_from_storage
 
     memory = get_memory()
     if memory.hicache_io_backend not in ("kernel", "direct"):
@@ -2612,7 +2613,7 @@ def _nvfp4_main_host_size(
         raise ValueError("Unsupported M3.1 NVFP4 HiCache memory layout")
     main_bytes = sum(main_pool.get_kv_size_bytes()) / main_pool.total_slots
     index_bytes = sum(index_pool.get_kv_size_bytes()) / index_pool.total_slots
-    draft_bytes = 0
+    draft_byte_rates = []
     for draft_pool in params.sidecar_draft_device_pools:
         if (
             type(draft_pool) is not MHATokenToKVPool
@@ -2625,10 +2626,11 @@ def _nvfp4_main_host_size(
                 "M3.1 NVFP4 HiCache requires a dense MHA draft with matching "
                 "token capacity/page size and at most as many layers as the target"
             )
-        draft_bytes += sum(draft_pool.get_kv_size_bytes()) / (
-            draft_pool.size + draft_pool.page_size
+        draft_byte_rates.append(
+            sum(draft_pool.get_kv_size_bytes())
+            / (draft_pool.size + draft_pool.page_size)
         )
-    total_bytes = main_bytes + index_bytes + draft_bytes
+    total_bytes = main_bytes + index_bytes + sum(draft_byte_rates)
     # --hicache-size covers main KV, index payload/scales and draft sidecars.
     host_size = memory.hicache_size * main_bytes / total_bytes
     slots = (
@@ -2637,7 +2639,17 @@ def _nvfp4_main_host_size(
         else int(main_pool.size * memory.hicache_ratio)
     )
     slots = (slots // params.page_size + 1) * params.page_size
-    if slots * total_bytes > host_memory_budget_bytes():
+    device = main_pool.get_device_pool_infos()[0].buffer_info.slab.device
+    allocator = get_allocator_class_from_storage(_get_allocator_type())
+    mapping_lengths = [
+        int(slots * rate) for rate in (main_bytes, index_bytes, *draft_byte_rates)
+    ]
+    # Peek only: the pools bill their own mappings at construction, so booking
+    # the aggregate here would charge the shared scope twice.
+    allocation_bytes, available_bytes = host_memory_preflight(
+        mapping_lengths, allocator, device, book=False
+    )
+    if allocation_bytes > available_bytes:
         raise ValueError(
             "Not enough host memory for M3.1 NVFP4 KV, index and draft caches"
         )
