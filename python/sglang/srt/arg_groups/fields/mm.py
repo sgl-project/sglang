@@ -69,9 +69,12 @@ class Mm(msgspec.Struct):
     mm_process_config: A[
         Optional[Dict[str, Any]],
         Arg(
-            help="Multimodal preprocessing config, a json config contains keys: `image`, `video`, `audio`, "
-            "and `video_preprocessing_device`, the device the token-space processor decodes and preprocesses "
-            'a video request on (e.g. `{"video_preprocessing_device": "cpu"}`)',
+            help="Multimodal preprocessing config, a json config with keys `image`, `video` and `audio` "
+            "(kwargs for the HuggingFace processor), `video_preprocessing_device` (the device the token-space "
+            'processor decodes and preprocesses a video request on, e.g. `{"video_preprocessing_device": "cpu"}`), '
+            "`image_decoder` (`pil`, `nvjpeg` or `nvjpeg_fancy`: the JPEG decoder) and `image_rgb_conversion` "
+            "(`convert`, `white` or `smart`: how an image with alpha becomes RGB), both read by the token-space "
+            "processor only and defaulting to the model's strategy",
             type_parser=json.loads,
         ),
     ] = None
@@ -122,6 +125,32 @@ class Mm(msgspec.Struct):
         "skip reading media on a hot metadata-cache hit; only enable it when "
         "the caller guarantees that hashes identify immutable media bytes.",
     ] = False
+    token_space_preprocess_cache_trust_url: A[
+        bool,
+        "Let the token-space preprocess cache key each media by its URL, path or "
+        "inline data instead of its content, so a hit skips the download. Only set "
+        "it when URLs name immutable media.",
+    ] = False
+    enable_token_space_preprocess_cache: A[
+        bool,
+        "Cache the token-space processor's features per media, keyed by its source: "
+        "in memory within --mm-preprocess-cache-size-mb, or in "
+        "--token-space-preprocess-cache-dir. Requires --token-space-preprocess-cache-trust-url.",
+    ] = False
+    token_space_preprocess_cache_dir: A[
+        Optional[str],
+        "Directory for the token-space preprocess cache instead of memory, shared by "
+        "every process that sees it, e.g. an RL job's engines and trainers. Nothing "
+        "in it is deleted, so give each job a fresh directory and remove it with the "
+        "job. Values are unpickled on read, so only trusted processes may write it. "
+        "Requires --enable-token-space-preprocess-cache.",
+    ] = None
+    token_space_preprocess_cache_check_rate: A[
+        Optional[float],
+        "Share of token-space preprocess cache hits, between 0 and 1, that are computed "
+        "again and compared with the cached features; a mismatch fails the request. "
+        "Unset or 0 turns the check off. Requires --enable-token-space-preprocess-cache.",
+    ] = None
     limit_mm_data_per_request: A[
         Optional[Union[str, Dict[str, int]]],
         Arg(

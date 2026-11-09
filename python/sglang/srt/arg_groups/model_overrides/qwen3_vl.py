@@ -99,9 +99,10 @@ def _qwen3vl_hopper_serving_overrides(server_args: Any, hf_config: Any) -> dict:
     if preprocess_cache_size_mb is None:
         preprocess_cache_size_mb = 0
         updates["mm_preprocess_cache_size_mb"] = 0
+    # A disk preprocess cache keeps file copies, so it retains no IPC feature tensors.
     cache_retention_enabled = (
-        preprocess_cache_size_mb > 0 or envs.SGLANG_VLM_CACHE_SIZE_MB.get() > 0
-    )
+        preprocess_cache_size_mb > 0 and cfg.token_space_preprocess_cache_dir is None
+    ) or envs.SGLANG_VLM_CACHE_SIZE_MB.get() > 0
     if (
         cfg.mm_feature_transport is None
         and cfg.nnodes == 1

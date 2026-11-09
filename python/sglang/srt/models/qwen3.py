@@ -361,7 +361,9 @@ class Qwen3Attention(nn.Module):
                 forward_batch=forward_batch,
             )
 
-        if should_force_bfloat16_dense_tensor_math() or q.dtype != v.dtype:
+        if v is not None and (
+            should_force_bfloat16_dense_tensor_math() or q.dtype != v.dtype
+        ):
             q = q.to(v.dtype)
             k = k.to(v.dtype)
 

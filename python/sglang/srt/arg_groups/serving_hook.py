@@ -24,6 +24,8 @@ from sglang.srt.utils.common import (
     get_device,
     is_gfx95_supported,
     is_mnnvl_fabric_device,
+    resolve_gpu_image_decode,
+    resolve_rgb_conversion,
 )
 from sglang.utils import is_in_ci
 
@@ -143,6 +145,37 @@ def handle_multimodal(server_args: Any):
         and cfg.mm_preprocess_cache_size_mb < 0
     ):
         raise ValueError("mm_preprocess_cache_size_mb must be non-negative")
+    if cfg.enable_token_space_preprocess_cache:
+        if not cfg.enable_token_space_processor:
+            raise ValueError(
+                "--enable-token-space-preprocess-cache requires "
+                "--enable-token-space-processor"
+            )
+        if not cfg.token_space_preprocess_cache_trust_url:
+            raise ValueError(
+                "--enable-token-space-preprocess-cache requires "
+                "--token-space-preprocess-cache-trust-url"
+            )
+        if (
+            cfg.token_space_preprocess_cache_dir is None
+            and not cfg.mm_preprocess_cache_size_mb
+        ):
+            raise ValueError(
+                "--enable-token-space-preprocess-cache in memory requires a positive "
+                "--mm-preprocess-cache-size-mb"
+            )
+    elif cfg.token_space_preprocess_cache_dir is not None:
+        raise ValueError(
+            "--token-space-preprocess-cache-dir requires --enable-token-space-preprocess-cache"
+        )
+    check_rate = cfg.token_space_preprocess_cache_check_rate
+    if check_rate is not None and not 0 <= check_rate <= 1:
+        raise ValueError("--token-space-preprocess-cache-check-rate must be in [0, 1]")
+    if check_rate and not cfg.enable_token_space_preprocess_cache:
+        raise ValueError(
+            "--token-space-preprocess-cache-check-rate requires "
+            "--enable-token-space-preprocess-cache"
+        )
     if cfg.mm_process_config is not None:
         if not isinstance(cfg.mm_process_config, dict):
             raise TypeError(
@@ -157,6 +190,17 @@ def handle_multimodal(server_args: Any):
                     f"mm_process_config['{key}'] must be a dict, "
                     f"but got {type(cfg.mm_process_config[key])}"
                 )
+        if cfg.enable_token_space_processor:
+            # A bad value fails here, at argument resolution, not when the processor is built.
+            resolve_gpu_image_decode(cfg.mm_process_config, True)
+            resolve_rgb_conversion(cfg.mm_process_config, "convert")
+        else:
+            for key in ("image_decoder", "image_rgb_conversion"):
+                if key in cfg.mm_process_config:
+                    raise ValueError(
+                        f"mm_process_config['{key}'] is read by the token-space processor only; "
+                        "it requires --enable-token-space-processor"
+                    )
 
 
 def handle_crash_dump_env(server_args: Any):
