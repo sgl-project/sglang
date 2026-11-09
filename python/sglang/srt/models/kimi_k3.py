@@ -4183,6 +4183,14 @@ class KimiK3ForConditionalGeneration(nn.Module):
         if self.use_data_parallel:
             from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 
+            parallel = get_parallel()
+            # Before token sharding, CP peers own the same images. Share ViT
+            # work across them without changing the language-model TP groups.
+            vision_dp_group = (
+                parallel.tp_group
+                if parallel.attn_cp_size > 1 and parallel.attn_dp_size == 1
+                else None
+            )
             image_embeds = run_dp_sharded_mrope_vision_model(
                 self.vision_tower,
                 None,
@@ -4196,6 +4204,7 @@ class KimiK3ForConditionalGeneration(nn.Module):
                 load_local_pixel_values=materialize_item_features,
                 pixel_values_device=device,
                 pixel_values_dtype=target_dtype,
+                parallel_group=vision_dp_group,
             )
             return self.mm_projector(image_embeds)
 

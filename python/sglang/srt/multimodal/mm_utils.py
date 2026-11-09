@@ -570,6 +570,7 @@ def run_dp_sharded_mrope_vision_model(
     pixel_values_device: Optional[torch.device] = None,
     pixel_values_dtype: Optional[torch.dtype] = None,
     pass_grid_thw_list: bool = False,
+    parallel_group=None,
 ):
     """Run a vision model with data parallelism (DP) sharding.
     The function will shard the input image tensor on the
@@ -591,6 +592,7 @@ def run_dp_sharded_mrope_vision_model(
                    the spatial merge area instead of t * h * w divided by it.
         pass_grid_thw_list: Forward the existing host grid list to the vision
             model so graph-aware towers do not materialize it from a CUDA tensor.
+        parallel_group: Image-DP group; defaults to the attention-TP group.
     Returns:
         torch.Tensor: Output image embeddings
 
@@ -617,7 +619,11 @@ def run_dp_sharded_mrope_vision_model(
             "pixel_values_device and pixel_values_dtype are required with a local loader"
         )
 
-    tp_size = get_parallel().attn_tp_size
+    tp_size = (
+        get_parallel().attn_tp_size
+        if parallel_group is None
+        else parallel_group.world_size
+    )
     if tp_size == 1:
         if pixel_values is None:
             pixel_values = load_local_pixel_values(list(range(len(grid_thw_list))))
@@ -651,7 +657,13 @@ def run_dp_sharded_mrope_vision_model(
 
     # GPU_0 tp_rank_local = 0
     # GPU_1 tp_rank_local = 1
-    tp_rank_local = get_parallel().attn_tp_rank
+    tp_rank_local = (
+        get_parallel().attn_tp_rank
+        if parallel_group is None
+        else parallel_group.rank_in_group
+    )
+    if parallel_group is None:
+        parallel_group = get_parallel().attn_tp_group
 
     # patches_per_image = [1000, 100, 200, 50]
     patches_per_image = [math.prod(grid_thw) for grid_thw in grid_thw_list]
@@ -786,7 +798,7 @@ def run_dp_sharded_mrope_vision_model(
                 dtype=input_dtype,
                 device=input_device,
             )
-        get_parallel().attn_tp_group.broadcast(out_embeddings, src=owner_local)
+        parallel_group.broadcast(out_embeddings, src=owner_local)
         return out_embeddings
 
     # The TP all-gather needs a common first dimension. Allocate that final
@@ -796,9 +808,7 @@ def run_dp_sharded_mrope_vision_model(
     )
 
     # Do all_gather to collect embeddings from all ranks
-    gathered_embeds = get_parallel().attn_tp_group.all_gather(
-        image_embeds_local_padded, dim=0
-    )
+    gathered_embeds = parallel_group.all_gather(image_embeds_local_padded, dim=0)
 
     # Remove padding and reconstruct per-rank embeddings
     rank_embeddings = list[torch.Tensor]()
