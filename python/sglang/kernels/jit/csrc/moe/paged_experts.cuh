@@ -242,8 +242,13 @@ __global__ void paged_experts_tiered_update_kernel(
     volatile int32_t* publish_row,   // null, or the layer's mailbox row, UVA
     volatile int32_t* publish_flag,  // ... and its flag
     int row_len) {                   // the state row: doorbell [3K] first, the clock last
+  // The step's stamp, read once: with more than one warp, a thread reading ``clock`` after thread 0
+  // advanced it would stamp its rows one ahead of the published clock.
+  __shared__ int step_stamp;
+  if (threadIdx.x == 0) step_stamp = *clock + 1;
+  __syncthreads();
   const int n = *count;
-  const int stamp = *clock + 1;
+  const int stamp = step_stamp;
   int e = -1, s = 0, r = -1;
   const int i = threadIdx.x;
   if (i < K) {

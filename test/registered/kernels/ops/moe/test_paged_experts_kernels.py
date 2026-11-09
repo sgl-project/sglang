@@ -523,6 +523,60 @@ class TestPublish(CustomTestCase):
                 3 * k - 1,
             )
 
+    def test_every_warp_stamps_the_published_clock(self):
+        """With more than 32 planned loads the update kernel runs several warps: every host-row
+        hit must carry the clock the step publishes, over consecutive miss-free replays (the
+        host protects exactly the rows stamped with the published clock)."""
+        from sglang.kernels.ops.moe.paged_experts import paged_experts_tiered_plan
+
+        i32 = dict(dtype=torch.int32, device="cuda")
+        for k in (64, 1024):
+            with self.subTest(k=k):
+                e = r = k
+                state = torch.zeros(3 * k + e + 2 * r + 1, **i32)
+                doorbell, expert_row, row_expert, row_stamp, clock = state.split(
+                    [3 * k, e, r, r, 1]
+                )
+                perm = torch.randperm(e, generator=torch.Generator().manual_seed(k))
+                row_expert.copy_(perm.to(torch.int32))
+                expert_row[perm.cuda()] = torch.arange(r, **i32)
+                src = torch.arange(k, **i32)  # every expert planned, all in host rows
+                dst = torch.arange(k, **i32)
+                count = torch.tensor([k], **i32)
+                rows_out = torch.full((k,), -1, **i32)
+                host = torch.zeros(state.numel(), dtype=torch.int32, pin_memory=True)
+                flags = torch.zeros(1, dtype=torch.int32, pin_memory=True)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    paged_experts_tiered_plan(
+                        src,
+                        dst,
+                        count,
+                        expert_row,
+                        row_expert,
+                        row_stamp,
+                        clock,
+                        doorbell.view(3, k),
+                        rows_out,
+                        paged_experts_host_device_pointer(host),
+                        paged_experts_host_device_pointer(flags),
+                        state.numel(),
+                    )
+                for step in range(1, 201):
+                    graph.replay()
+                    torch.cuda.synchronize()
+                    self.assertEqual(int(flags[0]), step)
+                    self.assertEqual(int(clock), step)
+                    stamps = row_stamp.cpu()
+                    self.assertTrue(
+                        bool((stamps == step).all()),
+                        f"step {step}: stamps {sorted(set(stamps.tolist()))}",
+                    )
+                    self.assertTrue(
+                        bool((host[3 * k + e + r : 3 * k + e + 2 * r] == step).all())
+                    )
+                    self.assertEqual(int(doorbell[:k].sum()), 0)  # miss-free
+
 
 class TestPooledSlotTables(CustomTestCase):
     def test_a_pooled_table_returns_its_memory_once_dropped(self):
