@@ -15,6 +15,7 @@ from collections import defaultdict
 from multiprocessing import shared_memory
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+import msgspec
 import numpy as np
 import torch
 from torch import nn
@@ -1482,6 +1483,36 @@ def _model_specific_shm_values(item):
             yield key, value
 
 
+def _compact_inline_tensors(value, memo=None):
+    """Keep pickle from serializing a CPU view's entire backing storage.
+
+    Per-image slices can share the storage of a whole image batch. PyTorch's
+    pickle reducer serializes that storage for each distinct Tensor, even when
+    the slice is contiguous. Only compact oversized CPU storage at the inline
+    transport boundary; SHM and GPU transport features need no such copy.
+    """
+    if memo is None:
+        memo = {}
+    if isinstance(value, torch.Tensor):
+        if (
+            value.is_cpu
+            and value.layout == torch.strided
+            and value.untyped_storage().nbytes() > value.numel() * value.element_size()
+        ):
+            key = id(value)
+            if key not in memo:
+                memo[key] = value.clone(memory_format=torch.contiguous_format)
+            return memo[key]
+        return value
+    if isinstance(value, list):
+        return [_compact_inline_tensors(item, memo) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_compact_inline_tensors(item, memo) for item in value)
+    if isinstance(value, dict):
+        return {key: _compact_inline_tensors(item, memo) for key, item in value.items()}
+    return value
+
+
 def _wrap_shm_or_inline(tensor: torch.Tensor, precomputed_hash: Optional[int] = None):
     """Wrap a tensor in ShmPointerMMData, falling back to inline (pickled)
     transport when shared memory cannot be allocated, e.g. /dev/shm is full
@@ -1494,7 +1525,7 @@ def _wrap_shm_or_inline(tensor: torch.Tensor, precomputed_hash: Optional[int] = 
             f"({e}); falling back to inline transport. "
             f"Consider increasing /dev/shm size."
         )
-        return tensor
+        return _compact_inline_tensors(tensor)
 
 
 def _wrap_tensor_or_list(value, precomputed_hash: Optional[int] = None):
@@ -1573,28 +1604,42 @@ def _wrap_model_specific_data(item) -> None:
 
 def wrap_shm_features(obj):
     """
-    Scan the object for multimodal tensors and wrap them in SHM pointers.
+    Wrap multimodal features in SHM pointers, or compact inline CPU storage.
     """
-    if _get_is_default_transport() or get_serving().skip_tokenizer_init:
-        return obj
+    use_shm = not (_get_is_default_transport() or get_serving().skip_tokenizer_init)
 
     if obj.mm_inputs:
+        inline_memo = {}
         wrap_model_data = (
-            obj.mm_inputs.shm_model_specific_data
+            use_shm
+            and obj.mm_inputs.shm_model_specific_data
             and envs.SGLANG_ENABLE_UOCR_SHM_WRAP_MODEL_DATA.get()
         )
         for item in obj.mm_inputs.mm_items:
             item_hash = item.hash
             if item.feature is not None:
-                item.feature = _wrap_tensor_or_list(
-                    item.feature, precomputed_hash=item_hash
+                item.feature = (
+                    _wrap_tensor_or_list(item.feature, precomputed_hash=item_hash)
+                    if use_shm
+                    else _compact_inline_tensors(item.feature, inline_memo)
                 )
             if item.precomputed_embeddings is not None:
-                item.precomputed_embeddings = _wrap_tensor_or_list(
-                    item.precomputed_embeddings, precomputed_hash=item_hash
+                item.precomputed_embeddings = (
+                    _wrap_tensor_or_list(
+                        item.precomputed_embeddings, precomputed_hash=item_hash
+                    )
+                    if use_shm
+                    else _compact_inline_tensors(
+                        item.precomputed_embeddings, inline_memo
+                    )
                 )
             if wrap_model_data:
                 _wrap_model_specific_data(item)
+            # Compact remaining inline tensors after the optional SHM wrapping.
+            # SHM pointers and shape-only placeholder crops stay unchanged.
+            item.model_specific_data = _compact_inline_tensors(
+                item.model_specific_data, inline_memo
+            )
     return obj
 
 
@@ -1654,6 +1699,36 @@ def discard_shm_features(obj) -> None:
         # leaks a multi-megabyte /dev/shm allocation.
         for _key, value in _model_specific_shm_values(item):
             value.close_and_unlink()
+
+
+def strip_mm_features_for_pp_relay(reqs: List) -> List:
+    """Copy requests for the next PP stage without raw multimodal features.
+
+    Only the first PP rank embeds multimodal inputs; later ranks need just the pad
+    values, which come from the item hash, so hashed items drop their feature tensor.
+    """
+    return [_strip_mm_features(req) for req in reqs]
+
+
+def _strip_mm_features(req):
+    if isinstance(req, BaseBatchReq):
+        return msgspec.structs.replace(
+            req, batch=[_strip_mm_features(sub_req) for sub_req in req.batch]
+        )
+    if not isinstance(req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)):
+        return req
+    if not isinstance(req.mm_inputs, MultimodalProcessorOutput):
+        return req
+    items = req.mm_inputs.mm_items
+    if not any(item.hash is not None and item.feature is not None for item in items):
+        return req
+    # An unhashed item keeps its feature: the next stage hashes it to derive the pad value.
+    stripped_items = [
+        msgspec.structs.replace(item, feature=None) if item.hash is not None else item
+        for item in items
+    ]
+    stripped_mm_inputs = msgspec.structs.replace(req.mm_inputs, mm_items=stripped_items)
+    return msgspec.structs.replace(req, mm_inputs=stripped_mm_inputs)
 
 
 def _unwrap_tensor_or_list(value):

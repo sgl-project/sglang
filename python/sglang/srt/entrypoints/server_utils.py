@@ -29,6 +29,7 @@ from starlette.routing import Mount
 from sglang.srt.environ import envs
 from sglang.srt.observability.func_timer import enable_func_timer
 from sglang.srt.runtime_context import describe_kv_events_publisher, get_serving
+from sglang.srt.server_args import redact_server_args_secrets
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 
 logger = logging.getLogger(__name__)
@@ -207,7 +208,7 @@ def build_server_info(server_args, scheduler_info: Dict[str, Any]) -> Dict[str, 
 
     Callers add transport-specific fields and serialize the result.
     """
-    result = server_args.resolved_dict()
+    result = redact_server_args_secrets(server_args.resolved_dict())
     result["launch_command"] = server_args.launch_command
     result.update(scheduler_info)
     result["kv_events"] = describe_kv_events_publisher(server_args)

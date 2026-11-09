@@ -724,11 +724,14 @@ class Sampler(nn.Module):
             # sampling_renorm.py). Enable this when TP ranks still desynchronize. Grammar
             # always syncs: xgrammar makes it likely.
 
-            torch.distributed.all_reduce(
-                batch_next_token_ids,
-                op=dist.ReduceOp.MIN,
-                group=self.tp_sync_group,
-            )
+            # A 1-rank all-reduce is the identity, but its first call lazily creates
+            # the communicator, which stalls the first grammar batch after startup.
+            if dist.get_world_size(self.tp_sync_group) > 1:
+                torch.distributed.all_reduce(
+                    batch_next_token_ids,
+                    op=dist.ReduceOp.MIN,
+                    group=self.tp_sync_group,
+                )
 
     def compute_logprobs_only(
         self,
