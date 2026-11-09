@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from array import array
-from typing import TYPE_CHECKING, Any, Callable, NamedTuple, Optional, cast
+from typing import TYPE_CHECKING, Any, NamedTuple, Optional, cast
 
 import numpy as np
 import torch
@@ -14,7 +14,6 @@ from sglang.kernels.ops.memory.common import get_last_loc_kernel as get_last_loc
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.base import is_cp_sharded_padded
 from sglang.srt.layers.cp.utils import (
-    from_cp_sharded,
     get_cp_sharded_padded,
     get_cp_sharded_padded_cache_indices,
 )
@@ -31,7 +30,6 @@ from sglang.srt.mem_cache.hicache_storage import PoolTransfer
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
-from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.runtime_context import get_serving, get_spec
 from sglang.srt.utils.common import ceil_align
 
@@ -90,103 +88,16 @@ def page_align_floor(length: int, page_size: int) -> int:
     return (length // page_size) * page_size
 
 
-def free_swa_out_of_window_slots(
-    req: Req,
-    pre_len: int,
-    *,
-    sliding_window_size: int,
-    page_size: int,
-    req_to_token_pool: ReqToTokenPool,
-    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
-    supports_prefix_sharing: bool = True,
-    retain_floor: int | None = None,
-    component_type: ComponentType = ComponentType.SWA,
-    free_segment: Callable[..., None] | None = None,
-    eviction_interval: int = 1,
-) -> None:
-    if not req.kv.holds_kv:
-        return
-
-    # For SWA-capable tree caches, we need to evict the tokens that are not in the tree cache and also not in the sliding window
-    assert req.kv.cache_protected_len % page_size == 0, (
-        "cache_protected_len must be page aligned"
-    )
-    # Protected rows limit what can be freed, not where the interval starts.
-    evicted_seqlen = req.kv.get_evicted_seqlen(component_type)
-    if pre_len - sliding_window_size < evicted_seqlen + eviction_interval:
-        return
-    swa_page_size = page_size
-    if component_type == ComponentType.SWA and is_cp_sharded_padded():
-        swa_page_size = from_cp_sharded(swa_page_size)
-    dead_lo = (
-        req.kv.swa_dead_lo(swa_page_size)
-        if component_type == ComponentType.SWA
-        else req.kv.cache_protected_len
-    )
-    evicted_seqlen = max(evicted_seqlen, dead_lo)
-    req.kv.set_evicted_seqlen(component_type, evicted_seqlen)
-
-    if not supports_prefix_sharing:
-        # Nothing is inserted into a tree, so no tombstone-leaf concern; evict
-        # up to the window boundary (the trailing floor keeps it page-aligned).
-        evict_threshold = pre_len - sliding_window_size
-    else:
-        # Prefix-sharing cache: keep max(window, page) rounded up to whole pages, so
-        # a key that ends at page_floor(pre_len) still has a full window of live SWA,
-        # and the last leaf, below page_floor(seq_len), is never all-tombstone.
-        evict_threshold = pre_len - ceil_align(
-            max(sliding_window_size, page_size), page_size
-        )
-    if retain_floor is not None and supports_prefix_sharing:
-        # The caller owns where the floor is (see BasePrefixCache.swa_retain_floor);
-        # this only promises not to free past it. Without prefix sharing a retained
-        # checkpoint could never be matched, so holding it is pure cost.
-        evict_threshold = min(evict_threshold, retain_floor)
-
-    new_evicted_seqlen = max(evicted_seqlen, evict_threshold)
-
-    if page_size > 1:
-        new_evicted_seqlen = (new_evicted_seqlen // page_size) * page_size
-    if is_cp_sharded_padded():
-        # Release complete logical groups so every rank frees the same span.
-        group_size = from_cp_sharded(page_size)
-        new_evicted_seqlen = (new_evicted_seqlen // group_size) * group_size
-
-    if new_evicted_seqlen > evicted_seqlen:
-        free_slots = req_to_token_pool.req_to_token[
-            req.kv.req_pool_idx, evicted_seqlen:new_evicted_seqlen
-        ]
-        if free_segment is None:
-            assert component_type == ComponentType.SWA
-            free_segment = token_to_kv_pool_allocator.free_swa_segment
-        if is_cp_sharded_padded():
-            free_slots = get_cp_sharded_padded_cache_indices(free_slots)
-            evicted_seqlen = get_cp_sharded_padded(evicted_seqlen)
-        free_segment(free_slots, start_pos=evicted_seqlen)
-        req.kv.set_evicted_seqlen(component_type, new_evicted_seqlen)
-
-
-def coalesce_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
-    """Merge adjacent half-open ranges so a split that falls mid-page frees that page once."""
-    merged: list[tuple[int, int]] = []
-    for start, end in ranges:
-        if merged and start == merged[-1][1]:
-            merged[-1] = (merged[-1][0], end)
-        else:
-            merged.append((start, end))
-    return merged
-
-
 def free_kv_row_segments(
     allocator: BaseTokenToKVPoolAllocator,
     segments: list[tuple[torch.Tensor, int]],
     *,
-    swa_evicted_seqlen: int,
-    swa_dead_lo: int = 0,
+    window_evicted_seqlen: int,
+    window_dead_lo: int = 0,
 ) -> None:
     """Free ascending disjoint ``(kv_indices, start_pos)`` segments of one
-    request's kv row; ``[swa_dead_lo, swa_evicted_seqlen)`` goes back full-side only."""
-    dead_lo, dead_hi = swa_dead_lo, max(swa_evicted_seqlen, swa_dead_lo)
+    request's kv row; ``[window_dead_lo, window_evicted_seqlen)`` goes back full-side only."""
+    dead_lo, dead_hi = window_dead_lo, max(window_evicted_seqlen, window_dead_lo)
     swa_dead: list[tuple[torch.Tensor, int]] = []
     swa_alive: list[tuple[torch.Tensor, int]] = []
     for kv_indices, start_pos in segments:
@@ -208,8 +119,8 @@ def free_kv_row_segments(
     if swa_dead and swa_alive:
         # The two sides are separate calls, so neither one's page-disjointness
         # check sees a boundary that splits a page between them.
-        assert swa_evicted_seqlen % allocator.page_size == 0, (
-            f"SWA eviction cursor {swa_evicted_seqlen} splits a page "
+        assert window_evicted_seqlen % allocator.page_size == 0, (
+            f"SWA eviction cursor {window_evicted_seqlen} splits a page "
             f"(page_size {allocator.page_size})"
         )
     if swa_dead:
@@ -230,7 +141,7 @@ def _req_radix_key(
 ) -> RadixKey:
     # A reused prefix may carry stale or unwritten SWA (the unified_kv ring, decoder
     # bounded replay); cap the match so the window is re-prefilled.
-    reprefill_tail = tree_cache.swa_reprefill_tail_tokens(req)
+    reprefill_tail = tree_cache.window_reprefill_tail_tokens(req)
     key_limit = max(0, len(token_ids) - reprefill_tail) if reprefill_tail else None
     if max_prefix_len is not None:
         key_limit = (
@@ -242,6 +153,26 @@ def _req_radix_key(
         limit=key_limit,
         cache_salt=req.cache_salt,
     )
+
+
+def storage_prefetch_end(
+    tree_cache: BasePrefixCache,
+    req: Req,
+    max_prefix_len: int,
+) -> int:
+    """Raw-token end of the L3 prefetch span for ``req`` (before page alignment).
+
+    The span must stop where the match key stops. :func:`_req_radix_key` caps
+    the key at ``len - swa_reprefill_tail_tokens()``: a prefetch commits its
+    only SWA host window to the span's last page, so a span reaching past that
+    cap puts the window beyond the boundary the matcher may consume. The
+    boundary node then carries no SWA host value and admission drops the whole
+    transfer, after the L3 read has already been paid for.
+
+    ``prefetch_from_storage`` still floors the result to ``page_size``.
+    """
+    token_ids = req.full_untruncated_fill_ids
+    return len(_req_radix_key(tree_cache, req, token_ids, max_prefix_len))
 
 
 def touch_waiting_prefix(req: Req, tree_cache: BasePrefixCache) -> None:
@@ -279,16 +210,15 @@ def match_kv_cache(
         req.last_host_node,
         req.best_match_node,
         req.host_hit_length,
-        req.swa_host_hit_length,
         req.mamba_host_hit_length,
     ) = (
         match_result.last_device_node,
         match_result.last_host_node,
         match_result.best_match_node,
         match_result.host_hit_length,
-        match_result.swa_host_hit_length,
         match_result.mamba_host_hit_length,
     )
+    req.matched_window_host_hit_lengths = dict(match_result.window_host_hit_lengths)
     max_len = req._compute_max_prefix_len(len(token_ids))
     req.num_matched_prefix_tokens = min(req.prefix_len + req.host_hit_length, max_len)
     req.swa_branching_seqlen = match_result.swa_branching_seqlen
@@ -343,9 +273,7 @@ def _evict_until_allocatable(
         result = tree_cache.evict(
             EvictParams(num_tokens=max(shortfall, allocator.page_size))
         )
-        total.num_tokens_evicted += result.num_tokens_evicted
-        total.swa_num_tokens_evicted += result.swa_num_tokens_evicted
-        total.mamba_num_evicted += result.mamba_num_evicted
+        total.add(result)
         if result.num_tokens_evicted == 0:
             return total
 
@@ -412,15 +340,21 @@ def restore_kv_cache(
     req.kv.retraction_backup = None
 
 
-def start_restore_kv_cache(req: Req, tree_cache: BasePrefixCache) -> None:
+def start_restore_kv_cache(
+    req: Req, tree_cache: BasePrefixCache, *, copy_stream=None
+) -> None:
     """``restore_kv_cache`` from the host pool without ordering later work after
-    the copy: ``req`` may run once ``req.kv.restore_done_event`` has completed."""
+    the copy: ``req`` may run once ``req.kv.restore_done_event`` has completed.
+    The copy alone runs on ``copy_stream`` when given (see
+    `UnifiedRadixCache.start_restore_kv_cache`)."""
     if req.seqlen <= 1:
         return
 
     unified_cache = cast("UnifiedRadixCache", tree_cache)
     assert req.kv.retraction_backup is not None
-    unified_cache.start_restore_kv_cache(req, req.kv.retraction_backup)
+    unified_cache.start_restore_kv_cache(
+        req, req.kv.retraction_backup, copy_stream=copy_stream
+    )
     req.kv.retraction_backup = None
 
 
@@ -430,19 +364,13 @@ def finish_restore_kv_cache(req: Req, tree_cache: BasePrefixCache) -> None:
     unified_cache.finish_restore_kv_cache(req)
 
 
-def discard_kv_cache_backup(
-    req: Req, tree_cache: BasePrefixCache, backend: str
-) -> None:
-    if backend == "cpu_tensor":
-        req.kv.retraction_backup = None
+def discard_kv_cache_backup(req: Req, tree_cache: BasePrefixCache) -> None:
+    backup = req.kv.retraction_backup
+    if backup is None:
         return
-    if backend != "host_pool":
-        raise ValueError(f"Unknown retraction backup backend: {backend}")
-    if req.kv.retraction_backup is None:
-        return
-
-    unified_cache = cast("UnifiedRadixCache", tree_cache)
-    unified_cache.discard_kv_cache_backup(req.kv.retraction_backup)
+    # A host-pool backup holds host pages; a cpu_tensor one only CPU tensors.
+    if backup.host_indices is not None:
+        cast("UnifiedRadixCache", tree_cache).discard_kv_cache_backup(backup)
     req.kv.retraction_backup = None
 
 
@@ -487,9 +415,7 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, *, checkpoint: bool)
     tree_cache.on_release(req, checkpointed=checkpoint)
 
     kv_storage_of(
-        tree_cache.req_to_token_pool,
-        tree_cache.token_to_kv_pool_allocator,
-        tree_cache=tree_cache,
+        tree_cache.req_to_token_pool, tree_cache.token_to_kv_pool_allocator
     ).release_row(req)
     req.kv.mark_kv_released()
 

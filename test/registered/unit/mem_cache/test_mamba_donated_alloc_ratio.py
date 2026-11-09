@@ -29,10 +29,12 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 from sglang.srt.mem_cache.kv.plan import TREE_STATE, TREE_TOKEN, TREE_WINDOW
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.static_kv_storage import acquire_rows, kv_storage_of
-from sglang.srt.mem_cache.unified_cache.components.base import ComponentType
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.components.mamba import MambaComponent
-from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
-from sglang.srt.mem_cache.unified_radix_cache import UnifiedTreeNode
+from sglang.srt.mem_cache.unified_cache.unified_tree_core import (
+    UnifiedTreeCore,
+    UnifiedTreeNode,
+)
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.kits.unified_radix_cache.config import CacheConfig
@@ -247,7 +249,7 @@ class TestMambaRatioEnvGate(CustomTestCase):
             def quantizes_checkpoints(self, sub_pool):
                 return False
 
-            def tree_sub_pool(self, name):
+            def tree_sub_pool(self, name, family=None):
                 return name
 
             def release_state(self, sub_pool, req, keep=None):

@@ -128,6 +128,8 @@ class _StageExecutor:
         self._child_ctx = replace(
             child_ctx if child_ctx is not None else get_forward_context(),
             moe_num_token_non_padded=forward_batch.moe_num_token_non_padded,
+            tbo_parent_token_range=forward_batch.tbo_parent_token_range,
+            tbo_parent_dp_offset=forward_batch.tbo_parent_dp_offset,
             # Only a TBO child carries its range in the parent batch.
             is_micro_batch=forward_batch.tbo_parent_token_range is not None,
             dp_global_num_tokens_bound=forward_batch.tbo_dp_global_num_tokens_bound,

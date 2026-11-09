@@ -180,10 +180,7 @@ def disagg_transfers_in_flight(scheduler):
         if scheduler.disaggregation_mode == DisaggregationMode.DECODE:
             decode_offload_manager = scheduler.decode_offload_manager
             return bool(
-                any(
-                    not decode_req.host_staged
-                    for decode_req in scheduler.disagg_decode_transfer_queue.queue
-                )
+                scheduler.disagg_decode_prealloc_queue.has_device_destinations
                 or scheduler.disagg_decode_prealloc_queue.has_published_destinations
                 or (
                     decode_offload_manager is not None
@@ -221,6 +218,14 @@ def _poll_with_failure_injection_pp(pollers) -> List[int]:
             for poller in pollers
         ]
     return [int(poller.poll_pp_consensus()) for poller in pollers]
+
+
+def decode_offloads_kvcache() -> bool:
+    """Whether this PD decode server offloads a finished request's KV to host."""
+    return (
+        get_disagg().disaggregation_mode == "decode"
+        and get_disagg().disaggregation_decode_enable_offload_kvcache
+    )
 
 
 def _is_fake_transfer(req: Req) -> bool:
@@ -1553,6 +1558,15 @@ def _wire_state_type(state_type) -> Enum:
     return state_type if isinstance(state_type, Enum) else StateType(state_type)
 
 
+def wire_sub_pool(storage, state_type) -> str:
+    """The sub-pool a storage transfers as ``state_type``."""
+    return next(
+        entry.sub_pool
+        for entry in storage.wire_entries()
+        if _wire_state_type(entry.state_type) == state_type
+    )
+
+
 def setup_state_kv_args(
     kv_args: KVArgs,
     storage: KVStorage | StaticKVStorage,
@@ -1564,8 +1578,10 @@ def setup_state_kv_args(
     from sglang.srt.disaggregation.base.conn import StateType
     from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+    from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 
     kv_args.state_types = []
+    kv_args.dsa_index_k_token_bytes = None
     kv_args.state_data_ptrs = []
     kv_args.state_data_lens = []
     kv_args.state_item_lens = []
@@ -1582,7 +1598,7 @@ def setup_state_kv_args(
         else None
     )
     for entry in storage.wire_entries():
-        region = storage.regions(entry.sub_pool)
+        region = storage.regions(entry.sub_pool, part=entry.part)
         state_type = _wire_state_type(entry.state_type)
         append_state_component(
             kv_args,
@@ -1597,6 +1613,16 @@ def setup_state_kv_args(
         )
         if state_type == StateType.SWA:
             kv_args.swa_kv_cache_layout = region.kv_layout
+    if (
+        StateType.DSA in kv_args.state_types
+        and isinstance(owner_view, DSATokenToKVPool)
+        and owner_view.index_kpool == 1
+    ):
+        key_bytes = owner_view.index_key_bytes_per_token
+        kv_args.dsa_index_k_token_bytes = (
+            key_bytes,
+            owner_view.index_bytes_per_token - key_bytes,
+        )
     # MLA token KV beside recurrent state.
     kv_args.is_hybrid_mla_backend = (
         is_mla_backend(owner_view) and StateType.MAMBA in kv_args.state_types
@@ -1641,6 +1667,23 @@ def get_dsv41_spec_layout(kv_args: KVArgs) -> Optional[dict]:
     }
 
 
+def get_spec_kv_layout(kv_args: KVArgs) -> Optional[dict]:
+    """{} without injected draft KV; None when this rank has no draft KV entries."""
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+    spec = get_spec()
+    algorithm = SpeculativeAlgorithm.from_string(spec.speculative_algorithm)
+    if not algorithm.is_dflash_family():
+        return {}
+    if not kv_args.num_draft_entries:
+        return None
+    # No block size: prefill writes draft KV per token, unlike DSV4.1's SWA ring.
+    return {
+        "algorithm": algorithm.name,
+        "num_draft_entries": kv_args.num_draft_entries,
+    }
+
+
 def get_pd_kv_layout(token_to_kv_pool) -> Optional[str]:
     """The KV byte layout both PD roles must share, for pools that have more than one."""
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
@@ -1651,7 +1694,7 @@ def get_pd_kv_layout(token_to_kv_pool) -> Optional[str]:
 
 
 def prepare_abort(req: Req, error_message: str, status_code=None):
-    from sglang.srt.managers.schedule_batch import FINISH_ABORT
+    from sglang.srt.managers.req_types import FINISH_ABORT
 
     # populate finish metadata and stream output
     req.finish_outside_step(FINISH_ABORT(error_message, status_code))
@@ -1695,7 +1738,7 @@ def is_unadmitted_reject(req: Req) -> bool:
 
 
 def is_aborted(req: Req) -> bool:
-    from sglang.srt.managers.schedule_batch import FINISH_ABORT
+    from sglang.srt.managers.req_types import FINISH_ABORT
 
     return isinstance(req.to_finish, FINISH_ABORT) or isinstance(
         req.finished_reason, FINISH_ABORT

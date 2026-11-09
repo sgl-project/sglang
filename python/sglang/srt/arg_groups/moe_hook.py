@@ -7,6 +7,11 @@ import logging
 import os
 from typing import Any
 
+from sglang.srt.arg_groups.model_override_base import (
+    model_config_of,
+    resolved_view,
+    resolving_view,
+)
 from sglang.srt.arg_groups.overrides import (
     _a2a_backend_overrides,
     _a2a_ep_size,
@@ -17,9 +22,6 @@ from sglang.srt.arg_groups.overrides import (
     flashinfer_a2a_max_dispatch_tokens_per_rank,
     max_prefill_buffer_tokens,
     max_speculative_num_draft_tokens,
-    model_config_of,
-    resolved_view,
-    resolving_view,
     run_post_process_pass,
 )
 from sglang.srt.configs.moe_model_registry import (
@@ -31,12 +33,8 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.moe.utils import AscendOpsConfig
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
-from sglang.srt.utils.common import (
-    get_bool_env_var,
-    is_gfx1250_supported,
-    is_sm100_supported,
-    parse_connector_type,
-)
+from sglang.srt.utils.common import get_bool_env_var, parse_connector_type
+from sglang.srt.utils.device import is_gfx1250_supported, is_sm100_supported
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +72,11 @@ def handle_moe_kernel_config(server_args: Any):
     # the compatibility asserts and fusion writes stay below.
 
     cfg = resolving_view(server_args)
+
+    if cfg.paged_experts_enable_disk and not cfg.enable_paged_experts:
+        raise ValueError(
+            "The argument paged-experts-enable-disk requires --enable-paged-experts."
+        )
 
     run_post_process_pass(server_args, _moe_runner_backend_quant_constraints)
 

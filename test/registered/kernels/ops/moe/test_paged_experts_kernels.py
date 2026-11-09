@@ -11,7 +11,7 @@ from sglang.kernels.ops.moe.paged_experts import (
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 E, K = 64, 16
 
@@ -151,12 +151,10 @@ class TestPagedExpertsKernels(CustomTestCase):
     def test_store_pins_its_exact_size_and_the_gather_reads_it(self):
         """The host store pins exactly its size (torch's pinned allocator rounds up to a power
         of two), and the gather kernel reads it through the GPU."""
-        from types import SimpleNamespace
-
         from sglang.srt.layers.moe.paged_experts.store import HostExpertStore
 
         gpu = torch.zeros(K, 3, 1000, dtype=torch.bfloat16, device="cuda")
-        host = HostExpertStore(SimpleNamespace(w=gpu), ["w"], num_experts=E).host["w"]
+        host = HostExpertStore({"w": ((3, 1000), torch.bfloat16)}, E).host["w"]
         host.copy_(torch.randn(E, 3, 1000, dtype=torch.bfloat16))
         self.assertTrue(host.is_pinned())
         self.assertEqual(host.untyped_storage().nbytes(), E * 3 * 1000 * 2)
@@ -172,15 +170,10 @@ class TestPagedExpertsKernels(CustomTestCase):
     def test_store_is_on_the_host_under_a_default_cuda_device(self):
         """Models are constructed under ``torch.device("cuda")``; a store created there (by
         a format that pages its loaded rows as they are) is still pinned host memory."""
-        from types import SimpleNamespace
-
         from sglang.srt.layers.moe.paged_experts.store import HostExpertStore
 
-        gpu = torch.zeros(K, 3, 1000, dtype=torch.bfloat16, device="cuda")
         with torch.device("cuda"):
-            host = HostExpertStore(SimpleNamespace(w=gpu), ["w"], num_experts=E).host[
-                "w"
-            ]
+            host = HostExpertStore({"w": ((3, 1000), torch.bfloat16)}, E).host["w"]
         self.assertEqual(host.device.type, "cpu")
         self.assertTrue(host.is_pinned())
 
@@ -188,12 +181,11 @@ class TestPagedExpertsKernels(CustomTestCase):
         """The pinned pages stay registered while any tensor on them lives (here a slice that
         outlives the store and its tensor), and are unregistered once the last one is freed."""
         import gc
-        from types import SimpleNamespace
 
         from sglang.srt.layers.moe.paged_experts.store import HostExpertStore
 
         gpu = torch.zeros(K, 3, 1000, dtype=torch.bfloat16, device="cuda")
-        store = HostExpertStore(SimpleNamespace(w=gpu), ["w"], num_experts=E)
+        store = HostExpertStore({"w": ((3, 1000), torch.bfloat16)}, E)
         ptr = store.host["w"].data_ptr()
         expert = store.host["w"][5]
         gpu[0].copy_(expert, non_blocking=True)  # a read still queued when it is freed
@@ -211,6 +203,68 @@ class TestPagedExpertsKernels(CustomTestCase):
         thread.start()
         thread.join()
         self.assertNotEqual(rc[0], 0)
+
+    def test_expert_cache_reads_into_the_pinned_store_byte_for_byte(self):
+        """The expert cache reads with direct I/O straight into the pinned store's rows of
+        whole pages and through its bounce buffer for the others, byte for byte. Negative
+        control: a byte changed in the file shows in that expert's row, and only there."""
+        import mmap
+        import os
+        import tempfile
+        from unittest.mock import patch
+
+        from sglang.srt.layers.moe.paged_experts import expert_cache
+        from sglang.srt.layers.moe.paged_experts.store import (
+            HostExpertStore,
+            same_bytes,
+        )
+
+        rows = {"w13": ((2, 2048), torch.bfloat16), "scales": ((3, 5), torch.float32)}
+        source = {
+            "w13": torch.randn(E, 2, 2048).bfloat16(),
+            "scales": torch.randn(E, 3, 5),
+        }
+        opened = []
+        open_direct = expert_cache._open_direct
+
+        def recorded(*args):
+            fd, direct, result = open_direct(*args)
+            opened.append(direct)
+            return fd, direct, result
+
+        expert_cache._write_failed = False
+        with (
+            tempfile.TemporaryDirectory() as folder,
+            patch.object(expert_cache, "_FREE_MARGIN_BYTES", 0),
+            patch.object(expert_cache, "_open_direct", recorded),
+        ):
+            entry = expert_cache.ExpertCache(
+                os.path.join(folder, "layer-0.experts"), {"key": "k"}
+            )
+            entry.write(source)
+            store = HostExpertStore(rows, E)
+            self.assertTrue(entry.read(store.host))
+            host = store.host["w13"]
+            self.assertTrue(host.is_pinned())
+            self.assertEqual(host[1].data_ptr() % mmap.PAGESIZE, 0)  # read straight
+            for name in rows:
+                self.assertTrue(same_bytes(store.host[name], source[name]), name)
+
+            layout = expert_cache.ObjectLayout.of_host(source)
+            with open(entry.path, "r+b") as f:
+                f.seek(expert_cache._HEADER_BYTES + 3 * layout.object_bytes)
+                f.write(b"\x7f\x7f")
+            again = HostExpertStore(rows, E)
+            self.assertTrue(entry.read(again.host))
+            others = [e for e in range(E) if e != 3]
+            self.assertFalse(same_bytes(again.host["w13"][3], source["w13"][3]))
+            self.assertTrue(
+                same_bytes(again.host["w13"][others], source["w13"][others])
+            )
+        if not all(opened):
+            self.skipTest(
+                f"{tempfile.gettempdir()} refuses O_DIRECT: read through the page cache"
+            )
 
     def test_graph_replays_decide_on_new_routing(self):
         """A captured decide + gather plans and pages each replay's routing, not the routing
