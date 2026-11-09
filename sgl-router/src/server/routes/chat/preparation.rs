@@ -11,7 +11,7 @@ use crate::policies::{has_caller_input_ids, request_tokens_for, RequestTokens};
 use crate::proxy::grpc::{sampling_value, RoutingView};
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
-use crate::server::metrics::{InputIdsForwarding, MetricsRegistry};
+use crate::server::metrics::{InputIdsForwarding, MediaCounts, MetricsRegistry};
 use crate::state::kv_events::CacheNamespace;
 use crate::tokenizer::ForwardingScope;
 use axum::http::HeaderMap;
@@ -104,6 +104,8 @@ pub(super) struct PreparedRequest {
     pub(super) expected_peak_sequence_tokens: Option<u64>,
     pub(super) caller_set_rid: bool,
     pub(super) fans_out: bool,
+    /// Media items of chat `messages` or `/generate` media fields, for the access log.
+    pub(super) media: MediaCounts,
     /// Whether chat forwards `tokens` as `input_ids`; `None` for `/generate`,
     /// embeddings, classify and rerank, which prepare their own body.
     input_ids_forwarding: Option<InputIdsForwarding>,
@@ -213,6 +215,7 @@ impl PreparedRequest {
             }
             return Ok(Self {
                 responder: Some(responder),
+                media: fields.media,
                 ..Self::generate_value(ctx, model, generate, None)?
             });
         }
@@ -256,6 +259,7 @@ impl PreparedRequest {
             caller_set_rid: fields.caller_set_rid,
             fans_out: requests_multiple_samples(&fields, &sampling_defaults)
                 || (path == COMPLETIONS_PATH && fields.prompt_batch),
+            media: fields.media,
             input_ids_forwarding: forwarding,
             forwarding_booked: false,
             parsed_body,
@@ -316,6 +320,7 @@ impl PreparedRequest {
                 .map(|output| (sequence_tokens as u64).saturating_add(output)),
             caller_set_rid: fields.caller_set_rid,
             fans_out: batch.is_some() || requests_multiple_samples(&fields, &sampling_defaults),
+            media: MediaCounts::default(),
             input_ids_forwarding: None,
             forwarding_booked: false,
             responder: None,
@@ -410,6 +415,7 @@ impl PreparedRequest {
             cache_namespace: cache_namespace(GENERATE_PATH, &value),
             caller_set_rid: !value["rid"].is_null(),
             fans_out,
+            media: generate_media(&value),
             input_ids_forwarding: None,
             forwarding_booked: false,
             parsed_body: Some(value),
@@ -530,6 +536,7 @@ impl PreparedRequest {
                 .map(|output| (input as u64).saturating_add(output)),
             caller_set_rid,
             fans_out,
+            media: MediaCounts::default(),
             input_ids_forwarding: None,
             forwarding_booked: false,
             responder: None,
@@ -564,6 +571,7 @@ impl PreparedRequest {
             cache_namespace: CacheNamespace::default(),
             caller_set_rid: false,
             fans_out: false,
+            media: MediaCounts::default(),
             input_ids_forwarding: None,
             forwarding_booked: false,
             parsed_body: None,
@@ -882,6 +890,8 @@ pub(super) struct RoutingFields {
     caller_set_rid: bool,
     /// A completions `prompt` listing several prompts, as strings or id lists.
     prompt_batch: bool,
+    /// Media content parts of chat `messages`, counted without retaining them.
+    media: MediaCounts,
 }
 
 impl RoutingFields {
@@ -1034,6 +1044,7 @@ enum RequestKey {
     Sampling(SamplingField),
     Rid,
     Prompt,
+    Messages,
     Other,
 }
 
@@ -1055,6 +1066,7 @@ impl<'de> Deserialize<'de> for RequestKey {
                     "max_completion_tokens" => RequestKey::Routing(RoutingKey::MaxCompletionTokens),
                     "rid" => RequestKey::Rid,
                     "prompt" => RequestKey::Prompt,
+                    "messages" => RequestKey::Messages,
                     other => match SamplingField::from_wire_name(other) {
                         Some(field) => RequestKey::Sampling(field),
                         None => RequestKey::Other,
@@ -1119,6 +1131,9 @@ impl<'de> serde::de::Visitor<'de> for RoutingFieldsVisitor {
                     let prompt = map.next_value::<Value>()?;
                     fields.prompt_batch =
                         prompt.get(0).is_some_and(|p| p.is_string() || p.is_array());
+                }
+                RequestKey::Messages => {
+                    fields.media = map.next_value::<MessagesMedia>()?.0;
                 }
                 RequestKey::Other => {
                     // Validate unrelated JSON without retaining its contents.
@@ -1500,6 +1515,221 @@ fn request_has_multimodal_content(value: &Value) -> bool {
                     })
             })
         })
+}
+
+/// Media items of `/generate`'s `image_data`, `video_data` and `audio_data`:
+/// one item, a list of items, or a batch's list of per-request lists.
+fn generate_media(value: &Value) -> MediaCounts {
+    fn items(field: &Value) -> u32 {
+        let count = match field {
+            Value::Null => 0,
+            Value::Array(items) => items
+                .iter()
+                .map(|item| match item {
+                    Value::Null => 0,
+                    Value::Array(nested) => nested.iter().filter(|i| !i.is_null()).count(),
+                    _ => 1,
+                })
+                .sum(),
+            _ => 1,
+        };
+        u32::try_from(count).unwrap_or(u32::MAX)
+    }
+    MediaCounts {
+        images: items(&value["image_data"]),
+        videos: items(&value["video_data"]),
+        audios: items(&value["audio_data"]),
+    }
+}
+
+/// Media content parts of chat `messages`, counted as they deserialize so the
+/// router never holds them. Shapes the engine rejects count nothing rather than
+/// failing the parse, so the engine's own error still reaches the client.
+#[derive(Default)]
+struct MessagesMedia(MediaCounts);
+
+/// A chat message's media parts.
+#[derive(Default)]
+struct MessageMedia(MediaCounts);
+
+/// A message `content` value's media parts; string content has none.
+#[derive(Default)]
+struct ContentMedia(MediaCounts);
+
+/// One content part, counted by its `type`.
+#[derive(Default)]
+struct PartMedia(MediaCounts);
+
+/// JSON of another type than the visitor expects counts nothing.
+macro_rules! lenient_json_scalars {
+    () => {
+        fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<Self::Value, E> {
+            Ok(Self::Value::default())
+        }
+        fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<Self::Value, E> {
+            Ok(Self::Value::default())
+        }
+        fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<Self::Value, E> {
+            Ok(Self::Value::default())
+        }
+        fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<Self::Value, E> {
+            Ok(Self::Value::default())
+        }
+        fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<Self::Value, E> {
+            Ok(Self::Value::default())
+        }
+        fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(Self::Value::default())
+        }
+    };
+}
+
+impl<'de> Deserialize<'de> for MessagesMedia {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = MessagesMedia;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("chat messages")
+            }
+
+            lenient_json_scalars!();
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut counts = MediaCounts::default();
+                while let Some(MessageMedia(message)) = seq.next_element()? {
+                    counts.add(message);
+                }
+                Ok(MessagesMedia(counts))
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> Result<Self::Value, A::Error> {
+                serde::de::Visitor::visit_map(IgnoredAny, map).map(|_| Self::Value::default())
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+impl<'de> Deserialize<'de> for MessageMedia {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = MessageMedia;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a chat message")
+            }
+
+            lenient_json_scalars!();
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                serde::de::Visitor::visit_seq(IgnoredAny, seq).map(|_| Self::Value::default())
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut counts = MediaCounts::default();
+                while let Some(key) = map.next_key::<String>()? {
+                    if key == "content" {
+                        counts = map.next_value::<ContentMedia>()?.0;
+                    } else {
+                        map.next_value::<IgnoredAny>()?;
+                    }
+                }
+                Ok(MessageMedia(counts))
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+impl<'de> Deserialize<'de> for ContentMedia {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = ContentMedia;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("message content")
+            }
+
+            lenient_json_scalars!();
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut counts = MediaCounts::default();
+                while let Some(PartMedia(part)) = seq.next_element()? {
+                    counts.add(part);
+                }
+                Ok(ContentMedia(counts))
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> Result<Self::Value, A::Error> {
+                serde::de::Visitor::visit_map(IgnoredAny, map).map(|_| Self::Value::default())
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+impl<'de> Deserialize<'de> for PartMedia {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = PartMedia;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a content part")
+            }
+
+            lenient_json_scalars!();
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                serde::de::Visitor::visit_seq(IgnoredAny, seq).map(|_| Self::Value::default())
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut counts = MediaCounts::default();
+                while let Some(key) = map.next_key::<String>()? {
+                    if key == "type" {
+                        // Last `type` wins, as it does for the engine's parser.
+                        counts = MediaCounts::default();
+                        if let Some(part_type) = map.next_value::<Value>()?.as_str() {
+                            counts.add_part(part_type);
+                        }
+                    } else {
+                        map.next_value::<IgnoredAny>()?;
+                    }
+                }
+                Ok(PartMedia(counts))
+            }
+        }
+        d.deserialize_any(V)
+    }
 }
 
 /// Validate supplied values and return exact defaults for missing or null parameters.
@@ -2219,6 +2449,71 @@ mod tests {
         let fields = fields_of(r#"{"model":"tiny","messages":[]}"#);
         assert_eq!(fields.stream, None);
         assert_eq!(fields.model.as_deref(), Some("tiny"));
+    }
+
+    #[test]
+    fn routing_fields_count_media_parts_without_rejecting_odd_shapes() {
+        let fields = fields_of(
+            r#"{"model":"tiny","messages":[
+                {"role":"system","content":"text only"},
+                {"role":"user","content":[
+                    {"type":"text","text":"what is this?"},
+                    {"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}},
+                    {"type":"image_url","image_url":"https://x/y.png"},
+                    {"type":"input_audio","input_audio":{"data":"BBBB","format":"wav"}},
+                    {"type":"video_url","video_url":{"url":"https://x/v.mp4"}},
+                    {"type":"audio_url","audio_url":{"url":"https://x/a.wav"}}
+                ]}
+            ]}"#,
+        );
+        assert_eq!(
+            fields.media,
+            MediaCounts {
+                images: 2,
+                videos: 1,
+                audios: 2
+            }
+        );
+        assert_eq!(
+            fields_of(r#"{"model":"tiny","messages":[]}"#).media,
+            MediaCounts::default()
+        );
+        // The engine rejects these; the router still forwards them, counting nothing.
+        for body in [
+            r#"{"model":"tiny","messages":"hi"}"#,
+            r#"{"model":"tiny","messages":[1,"x",null,[{"type":"image_url"}]]}"#,
+            r#"{"model":"tiny","messages":[{"role":"user","content":[1,"x",[],{"type":7}]}]}"#,
+            r#"{"model":"tiny","messages":{"type":"image_url"}}"#,
+        ] {
+            assert_eq!(fields_of(body).media, MediaCounts::default(), "{body}");
+        }
+    }
+
+    #[test]
+    fn generate_media_counts_single_list_and_batch_fields() {
+        let single = json!({"text":"a","image_data":"x","audio_data":"data:audio/wav;base64,BB"});
+        assert_eq!(
+            generate_media(&single),
+            MediaCounts {
+                images: 1,
+                videos: 0,
+                audios: 1
+            }
+        );
+        let batch = json!({
+            "text":["a","b","c"],
+            "image_data":[["x","y"],null,"z"],
+            "video_data":["v1","v2","v3"]
+        });
+        assert_eq!(
+            generate_media(&batch),
+            MediaCounts {
+                images: 3,
+                videos: 3,
+                audios: 0
+            }
+        );
+        assert_eq!(generate_media(&json!({"text":"a"})), MediaCounts::default());
     }
 
     #[test]
