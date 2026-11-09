@@ -154,7 +154,7 @@ class TestSessionTokenShare(CustomTestCase):
         self._decode_and_finish(r1, out1)
 
         # Turn 2 extends the shared arrays, decodes a bit, then aborts:
-        # finish_req never runs, req_nodes still points at r1.
+        # finish_req never runs, turns still points at r1.
         r2 = self._create("r2", [50, 51])
         self.assertEqual(list(r2.origin_input_ids), in1 + out1 + [50, 51])
         r2.output_ids.extend([6, 7])
