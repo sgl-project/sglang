@@ -115,9 +115,8 @@ def _plain_greedy(info):
 
 
 class _ExportAttention(AttentionBackend):
-    def __init__(self, *, cache, req_pool, kv_pool, layers, prefill=False):
+    def __init__(self, *, cache, kv_pool, layers, prefill=False):
         self.cache = cache
-        self.req_to_token_pool = req_pool
         self.token_to_kv_pool = kv_pool
         self.keys = []
         self.values = []
@@ -180,7 +179,6 @@ class _DecodeModule(torch.nn.Module):
                 self.cache.register_buffer(f"v_{layer.layer_id}", v)
         self.attention = _ExportAttention(
             cache=self.cache,
-            req_pool=req_pool,
             kv_pool=kv_pool,
             layers=region.layers,
             prefill=prefill,
@@ -522,8 +520,6 @@ class CompiledMlxRunner(BaseRunner):
                 wrapper.attention.values.clear()
             elapsed = time.perf_counter() - start
             self.compile_seconds += elapsed
-            if self._prefill and len(self._graphs) == 4:
-                self._graphs.pop(next(iter(self._graphs))).close()
             self._graphs[key] = graph
             logger.info(
                 "%s %s graph ready: size=%d, page_size=%d, export=%.3fs",

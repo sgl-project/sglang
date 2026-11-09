@@ -36,7 +36,13 @@ class TestMPSPagedAllocator(CustomTestCase):
 
     def test_partial_pages_exhaustion_and_reuse(self):
         from sglang.srt.platforms.mps import MpsSRTPlatform
+        from sglang.srt.runtime_context import get_context
 
+        self.enterContext(
+            get_context().override_server_args(
+                device="mps", mps_execution_backend="mlx-compiled"
+            )
+        )
         allocator_cls = MpsSRTPlatform().get_paged_allocator_cls()
         for page_size in (16, 32, 64):
             for need_sort in (False, True):

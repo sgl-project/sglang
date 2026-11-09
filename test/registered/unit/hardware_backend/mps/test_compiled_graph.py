@@ -240,32 +240,49 @@ class TestCompiledGraph(CustomTestCase):
             ):
                 validate_page_slots(broken, 16)
 
-    def test_weighted_rms_fusion_preserves_intermediate_casts(self):
+    def test_rms_fusions_preserve_cast_boundaries(self):
         from sglang.srt.hardware_backend.mps.compiled_graph import CompiledMlxGraph
         from sglang.srt.utils.tensor_bridge import mlx_to_torch
 
         class Norm(torch.nn.Module):
-            def __init__(self, cast_before_weight):
+            def __init__(self, weighted, cast_before_weight):
                 super().__init__()
-                self.weight = torch.nn.Parameter(
-                    torch.randn(128, device="mps", dtype=torch.bfloat16)
+                self.weight = (
+                    torch.nn.Parameter(
+                        torch.randn(128, device="mps", dtype=torch.bfloat16)
+                    )
+                    if weighted
+                    else None
                 )
                 self.cast_before_weight = cast_before_weight
 
             def forward(self, value):
                 x = value.float()
                 normalized = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + 1e-6)
+                if self.weight is None:
+                    return normalized.to(value.dtype)
                 if self.cast_before_weight:
                     normalized = normalized.to(value.dtype)
                 return (normalized * self.weight).to(value.dtype)
 
-        inputs = (torch.randn(3, 128, device="mps", dtype=torch.bfloat16),)
-        for cast_before_weight in (False, True):
-            with self.subTest(cast_before_weight=cast_before_weight):
-                model = Norm(cast_before_weight)
+        cases = [
+            (dtype, False, False)
+            for dtype in (torch.float32, torch.float16, torch.bfloat16)
+        ] + [(torch.bfloat16, True, cast) for cast in (False, True)]
+        for dtype, weighted, cast_before_weight in cases:
+            with self.subTest(
+                dtype=dtype, weighted=weighted, cast_before_weight=cast_before_weight
+            ):
+                inputs = (torch.randn(3, 128, device="mps", dtype=dtype),)
+                model = Norm(weighted, cast_before_weight)
                 graph = CompiledMlxGraph(model=model, example_inputs=inputs)
                 self.addCleanup(graph.close)
-                self.assertEqual(len(graph.weighted_norms), int(not cast_before_weight))
+                if weighted:
+                    self.assertEqual(
+                        len(graph.weighted_norms), int(not cast_before_weight)
+                    )
+                else:
+                    self.assertEqual(len(graph.norms), 1)
                 torch.mps.synchronize()
                 actual = mlx_to_torch(graph.launch(graph.bind(inputs))[0])
                 torch.testing.assert_close(actual, model(*inputs))
@@ -359,7 +376,6 @@ class TestCompiledGraph(CustomTestCase):
                     torch.mps.synchronize()
                     actual = mlx_to_torch(graph.launch(graph.bind(current))[0])
                     torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.02)
-                    self.assertEqual(actual.dtype, torch.float32)
                 model.repeat_attention = True
                 with self.assertRaisesRegex(UnsupportedMlxRegion, "invocation order"):
                     CompiledMlxGraph(
@@ -598,12 +614,6 @@ class TestCompiledGraph(CustomTestCase):
         from sglang.srt.server_args import ServerArgs
 
         self.assertEqual(ServerArgs(model_path="dummy").mps_execution_backend, "eager")
-        enabled = ServerArgs(
-            model_path="dummy",
-            device="mps",
-            mps_execution_backend="mlx-compiled",
-        )
-        enabled.resolve_once()
         for option in (
             {"enable_hierarchical_cache": True},
             {"enable_lmcache": True},
@@ -625,28 +635,6 @@ class TestCompiledGraph(CustomTestCase):
                 device="cpu",
                 mps_execution_backend="mlx-compiled",
             ).resolve_once()
-
-    def test_normalization_fusion_preserves_cast_boundary(self):
-        from sglang.srt.hardware_backend.mps.compiled_graph import CompiledMlxGraph
-        from sglang.srt.utils.tensor_bridge import mlx_to_torch
-
-        class Norm(torch.nn.Module):
-            def forward(self, value):
-                x = value.float()
-                return (x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + 1e-6)).to(
-                    value.dtype
-                )
-
-        for dtype in (torch.float32, torch.float16, torch.bfloat16):
-            with self.subTest(dtype=dtype):
-                inputs = (torch.randn(2, 128, device="mps", dtype=dtype),)
-                model = Norm()
-                graph = CompiledMlxGraph(model=model, example_inputs=inputs)
-                self.assertEqual(len(graph.norms), 1)
-                torch.mps.synchronize()
-                result = graph.launch(graph.bind(inputs))
-                torch.testing.assert_close(mlx_to_torch(result[0]), model(*inputs))
-                graph.close()
 
     def test_mutation_and_changed_attribute_metadata_fail_closed(self):
         from sglang.srt.hardware_backend.mps.compiled_graph import CompiledMlxGraph

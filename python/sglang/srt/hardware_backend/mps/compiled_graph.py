@@ -222,7 +222,6 @@ class CompiledMlxGraph:
                 for tail in (False, True)
             }
         )
-        self.execution_count = 0
 
     def _function(self, tail):
         def forward(*flat):
@@ -347,7 +346,6 @@ class CompiledMlxGraph:
                 )
         outputs = self.compiled[key](*arrays, *(tails or ()))
         mx.async_eval(*outputs)
-        self.execution_count += 1
         return outputs
 
     def close(self):

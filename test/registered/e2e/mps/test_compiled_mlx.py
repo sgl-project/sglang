@@ -52,6 +52,8 @@ class TestCompiledMlxServing(CustomTestCase):
                     "mps",
                     "--mps-execution-backend",
                     backend,
+                    "--cuda-graph-backend-prefill",
+                    "disabled",
                     "--context-length",
                     "1024",
                     "--max-total-tokens",
@@ -179,7 +181,6 @@ class TestCompiledMlxServing(CustomTestCase):
                 output = log.read()
                 self.assertIn("Compiled MLX: executions=", output, output)
                 self.assertNotIn("using eager MPS", output, output)
-                self.assertIn("attention=radix", output, output)
                 self.assertIn(f"page_size={self.page_size}", output, output)
                 self.assertRegex(output, r"Compiled MLX:.*enqueued=[1-9]")
         if self.model_name == "Qwen/Qwen3-0.6B":

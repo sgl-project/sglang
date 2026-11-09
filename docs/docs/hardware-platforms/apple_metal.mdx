@@ -10,7 +10,7 @@ PyTorch MPS instead; see its [installation guide](/docs/sglang-diffusion/install
 If you encounter issues or have questions, please [open an issue](https://github.com/sgl-project/sglang/issues).
 
 You can also keep the standard PyTorch MPS model loader and opt into
-[direct compiled MLX execution](#experimental-direct-compiled-mlx-execution).
+[direct compiled MLX decode](#experimental-direct-compiled-mlx-decode).
 This is separate from native MLX; neither existing path is replaced.
 
 ## Prerequisites
@@ -104,13 +104,13 @@ The MLX backend supports two quantization paths on Apple Silicon:
    ```
    The MLX backend silently ignores `--quantization mlx_q4` when the model is already quantized in its HF config (path 1), so the same flag is safe to pass either way.
 
-## Experimental direct compiled MLX execution
+## Experimental direct compiled MLX decode
 
 Use `--mps-execution-backend mlx-compiled` to run an exported Torch model's decode
 graph through `mx.compile` with AOT Metal radix attention. Torch retains model
-loading, weight/KV ownership and sampling. Complete uncached batch-1 prefill also
-uses MLX; other prefill stays eager MPS. Native MLX is unchanged. This path uses
-`torch.export`, not ExecuTorch.
+loading, weight/KV ownership and sampling. Prefill stays eager MPS by default;
+the additional opt-in below compiles eligible uncached prefill. Native MLX is
+unchanged. This path uses `torch.export`, not ExecuTorch.
 
 Install the `srt_mps` extra and build the Metal extension in the same environment.
 The build requires full Xcode and its Metal compiler (see prerequisites above).
@@ -139,9 +139,8 @@ decode throughput. AOT applies to the radix shaders, not the entire model.
 - Standard Torch-owned MHA KV pools and local radix caching. Keep page size 1
   by default. Sizes 16, 32 and 64 are supported, but larger pages reduce prefix
   sharing granularity and may waste partially filled slots.
-- Uncached B1 prefill through 32768 tokens uses compiled MLX. Cached prefixes,
-  multi-request prefill and unsupported model regions use eager MPS with
-  a fallback log. Unexpected execution errors are not silently retried.
+- Default prefill, ineligible batches and unsupported model regions use eager
+  MPS with a fallback log. Unexpected execution errors are not silently retried.
 - LoRA, speculative decoding, MoE/recurrent models, distributed execution,
   memory saver, alternate KV layouts and external/disaggregated caches are
   unsupported.
@@ -151,17 +150,9 @@ Torch sampling remains authoritative, and only accepted tokens are committed
 to the KV pool. Grammar, bias and penalty processing disable lookahead, not
 ordinary compiled decode. Standalone one-batch execution is synchronous.
 
-Prefill reuses the exported Torch model and logits processor, with MLX causal
-SDPA and Torch-owned K/V commits. One bounded dynamic-token Torch export is
-prepared at startup, adding several seconds to initialization without executing
-the model. Up to four MLX prompt-shape specializations are cached; a new or evicted
-length needs MLX compilation, not another Torch export. Single-token prefill uses
-a separate lazy export.
-Use `--cuda-graph-backend-prefill disabled` to keep eager prefill. To deliver an
-uncached 32K prompt in one forward, use `--chunked-prefill-size 32768
---max-prefill-tokens 32768`, with context/KV capacity for prompt plus generation.
-
-Native MLX is unchanged. See
+With default eager prefill, native MLX remains faster for the measured batch-1 workloads, including
+8192-token input. This is not a single-user agentic-coding performance upgrade;
+the measured throughput gains are at larger batches. See
 [`benchmark/mps/README.md`](https://github.com/sgl-project/sglang/blob/main/benchmark/mps/README.md)
 for results and reproduction commands; standalone timings do not represent
 HTTP-serving performance.
