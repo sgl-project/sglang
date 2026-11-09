@@ -1,6 +1,6 @@
 # Muse Spark 1.2 on MI355X
 
-This directory carries the aiter-side patches and measured evidence for the
+This directory carries the aiter-side patches for the
 ROCm implementation under `sglang.srt.rocm_muse_spark`. On HIP,
 `sglang.srt.models.muse_spark` dispatches to that implementation; CUDA keeps
 the repository's existing FlashInfer/JIT model unchanged.
@@ -49,30 +49,3 @@ scripts/serve_muse_spark_rocm.sh
 
 The BF16 checkpoint lives at `/data/Muse-Spark-1.2-816B-A42B-open` and
 runs through the same script via `MODEL`.
-
-Acceptance gates:
-
-1. Operator parity for BF16 and Quark MXFP4, including HIP graph replay.
-2. `few_shot_gsm8k`: 1319 questions, 5-shot, 2048 max tokens; accuracy at
-   least 0.955 and zero invalid answers.
-3. Canonical serving workload: IL8192/OL1024, TP8/EP8, random range ratio 0.8,
-   ignore EOS, four warmup and four measured requests per concurrency slot.
-4. Compare against `muse_moe_flydsl_20260910_results.json`; require completed
-   request counts and no more than 3% regression in throughput or TPOT.
-
-Local branch validation (`jacky-v0.5.19-rocm720-mi35x-muse-spark-day0-test`,
-2026-09-10):
-
-- GSM8K: accuracy `0.955`, invalid `0`, 1319/1319 completed.
-- Final `amd-support` rebase: Plan B/FlyDSL and opt-in Plan C both generated
-  `Paris` correctly; matched c4 IL8192/OL1024 reached `303.82` output tok/s
-  and `12.16 ms` median TPOT.
-- IL8192/OL1024 c4: `303.94` output tok/s, `12.17 ms` median TPOT.
-- IL8192/OL1024 c8: `474.98` output tok/s, `15.65 ms` median TPOT.
-- IL8192/OL1024 c16: `712.28` output tok/s, `20.86 ms` median TPOT.
-- IL8192/OL1024 c32: `1008.08` output tok/s, `29.88 ms` median TPOT.
-- c4/c8/c16 throughput deltas versus the recorded FlyDSL run are `-0.66%`,
-  `-1.77%`, and `-0.19%`, all inside the 3% gate.
-
-See `muse_spark_aiter_attention_repro.md` and
-`muse_moe_flydsl_perf_plan.md` for exact commands and known limitations.
