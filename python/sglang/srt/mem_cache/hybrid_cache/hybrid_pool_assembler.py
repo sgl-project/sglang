@@ -1697,6 +1697,8 @@ def _build_mha_mla_host_pool(
     allocator_type: str,
     pool_label: str,
     host_token_capacity: int | None = None,
+    dcp_size: int = 1,
+    dcp_rank: int = 0,
 ):
     is_mha = isinstance(buffer_info, MHABufferInfo)
     # The global layout is page_first_kv_split only when the target model
@@ -1724,6 +1726,8 @@ def _build_mha_mla_host_pool(
         end_layer=pool.end_layer,
         target_layer_num=pool.layer_num,
         override_kv_cache_dim=pool.kv_cache_dim,
+        dcp_size=dcp_size,
+        dcp_rank=dcp_rank,
         write_back_staging=pool.hicache_write_back_staging,
         **kwargs,
     )
@@ -1735,6 +1739,8 @@ def build_full_draft_pools(
     tree_cache: Any,
 ) -> tuple[list[SidecarPoolSpec], list[PoolEntry]]:
     """Build draft KV and its sidecars, whose indices follow target full KV."""
+    from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+
     pool = draft_kv_pool
     inner = pool.layer_router.wrapped_view()
     if inner is not None:
@@ -1761,18 +1767,37 @@ def build_full_draft_pools(
         )
     buffer_info = config.pool_infos[PoolName.KV].buffer_info
 
-    # Note(kpham-sgl): DCP x DSpark draft KV is replicated and spans the virtual
-    # loc space, so match the target host's logical_size instead of physical size.
-    draft_host_pool = _build_mha_mla_host_pool(
-        pool=pool,
-        buffer_info=buffer_info,
-        host_to_device_ratio=host_pool_group.logical_size / pool.size,
-        page_size=controller.page_size,
-        layout=get_memory().hicache_mem_layout,
-        allocator_type=_get_allocator_type(),
-        pool_label="draft",
-        host_token_capacity=host_pool_group.logical_size,
-    )
+    if (
+        isinstance(pool, MLATokenToKVPool)
+        and not pool.dcp_replicated
+        and get_parallel().dcp_enabled
+    ):
+        # A DCP-sharded MLA draft holds only its own rows, like the target.
+        parallel = get_parallel()
+        draft_host_pool = _build_mha_mla_host_pool(
+            pool=pool,
+            buffer_info=buffer_info,
+            host_to_device_ratio=host_pool_group.size / pool.size,
+            page_size=controller.page_size,
+            layout=get_memory().hicache_mem_layout,
+            allocator_type=_get_allocator_type(),
+            pool_label="draft",
+            dcp_size=parallel.attn_dcp_size,
+            dcp_rank=parallel.attn_dcp_rank,
+        )
+    else:
+        # Note(kpham-sgl): DCP x DSpark draft KV is replicated and spans the
+        # virtual loc space, so match the target host's logical_size.
+        draft_host_pool = _build_mha_mla_host_pool(
+            pool=pool,
+            buffer_info=buffer_info,
+            host_to_device_ratio=host_pool_group.logical_size / pool.size,
+            page_size=controller.page_size,
+            layout=get_memory().hicache_mem_layout,
+            allocator_type=_get_allocator_type(),
+            pool_label="draft",
+            host_token_capacity=host_pool_group.logical_size,
+        )
 
     specs = [
         SidecarPoolSpec(
@@ -2574,7 +2599,8 @@ def _nvfp4_main_host_size(
 ) -> float:
     """The --hicache-size share of NVFP4 main KV once index and drafts are paid."""
     from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
-    from sglang.srt.mem_cache.pool_host.base import host_memory_budget_bytes
+    from sglang.srt.mem_cache.pool_host.base import host_memory_preflight
+    from sglang.srt.mem_cache.pool_host.common import get_allocator_class_from_storage
 
     memory = get_memory()
     if memory.hicache_io_backend not in ("kernel", "direct"):
@@ -2587,7 +2613,7 @@ def _nvfp4_main_host_size(
         raise ValueError("Unsupported M3.1 NVFP4 HiCache memory layout")
     main_bytes = sum(main_pool.get_kv_size_bytes()) / main_pool.total_slots
     index_bytes = sum(index_pool.get_kv_size_bytes()) / index_pool.total_slots
-    draft_bytes = 0
+    draft_byte_rates = []
     for draft_pool in params.sidecar_draft_device_pools:
         if (
             type(draft_pool) is not MHATokenToKVPool
@@ -2600,10 +2626,11 @@ def _nvfp4_main_host_size(
                 "M3.1 NVFP4 HiCache requires a dense MHA draft with matching "
                 "token capacity/page size and at most as many layers as the target"
             )
-        draft_bytes += sum(draft_pool.get_kv_size_bytes()) / (
-            draft_pool.size + draft_pool.page_size
+        draft_byte_rates.append(
+            sum(draft_pool.get_kv_size_bytes())
+            / (draft_pool.size + draft_pool.page_size)
         )
-    total_bytes = main_bytes + index_bytes + draft_bytes
+    total_bytes = main_bytes + index_bytes + sum(draft_byte_rates)
     # --hicache-size covers main KV, index payload/scales and draft sidecars.
     host_size = memory.hicache_size * main_bytes / total_bytes
     slots = (
@@ -2612,7 +2639,17 @@ def _nvfp4_main_host_size(
         else int(main_pool.size * memory.hicache_ratio)
     )
     slots = (slots // params.page_size + 1) * params.page_size
-    if slots * total_bytes > host_memory_budget_bytes():
+    device = main_pool.get_device_pool_infos()[0].buffer_info.slab.device
+    allocator = get_allocator_class_from_storage(_get_allocator_type())
+    mapping_lengths = [
+        int(slots * rate) for rate in (main_bytes, index_bytes, *draft_byte_rates)
+    ]
+    # Peek only: the pools bill their own mappings at construction, so booking
+    # the aggregate here would charge the shared scope twice.
+    allocation_bytes, available_bytes = host_memory_preflight(
+        mapping_lengths, allocator, device, book=False
+    )
+    if allocation_bytes > available_bytes:
         raise ValueError(
             "Not enough host memory for M3.1 NVFP4 KV, index and draft caches"
         )

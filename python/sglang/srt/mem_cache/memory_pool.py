@@ -1879,6 +1879,7 @@ class KvBufferDesc:
 class KVCache(abc.ABC):
     layer_shard_enabled: bool = False
     post_capture_active: bool = False
+    rows_are_dcp_collapsed: bool = False
 
     @property
     def backing_owner(self):
@@ -2943,6 +2944,31 @@ class MHATokenToKVPool(KVCache, MHAKVView):
                 cache_v,
                 k_scale,
                 v_scale,
+            )
+            return
+
+        if (
+            self.kv_cache_layout == "vectorized_5d"
+            and not self.use_hnd
+            and dcp_kv_mask is None
+            and cache_k.dtype != self.dtype
+            and self.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+        ):
+            # The 5D writer divides by the scales, saturates and casts as it
+            # writes, in place of the two divisions and two casts below.
+            from sglang.kernels.ops.kvcache.shuffle_5d_cache import (
+                launch_reshape_and_cache_shuffle_5d,
+            )
+
+            layer_idx = layer_id - self.start_layer
+            launch_reshape_and_cache_shuffle_5d(
+                cache_k,
+                cache_v,
+                self.k_buffer[layer_idx].view(self.dtype),
+                self.v_buffer[layer_idx].view(self.dtype),
+                loc,
+                k_scale=k_scale,
+                v_scale=v_scale,
             )
             return
 
@@ -4893,6 +4919,10 @@ class MLATokenToKVPool(KVCache, MLAKVView):
     # the plan's write translation (`translate_write_loc`) and flips this.
     write_loc_is_dcp_resolved = False
     dcp_replicated = False
+
+    @property
+    def rows_are_dcp_collapsed(self) -> bool:
+        return get_parallel().dcp_enabled and not self.dcp_replicated
 
     @property
     def _write_loc_dcp_span(self) -> int:

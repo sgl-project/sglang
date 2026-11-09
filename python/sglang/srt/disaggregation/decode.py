@@ -90,6 +90,7 @@ from sglang.srt.disaggregation.utils import (
     wire_sub_pool,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.dcp.layout import dsa_index_k_page_tokens
 from sglang.srt.managers.req_types import FINISH_ABORT
 from sglang.srt.managers.schedule_batch import NextBatchPlan, ScheduleBatch
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
@@ -754,6 +755,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
         kv_args.num_draft_entries = num_draft_entries
+        kv_args.draft_rows_dcp_collapsed = (
+            self.draft_token_to_kv_pool is not None
+            and self.draft_token_to_kv_pool.rows_are_dcp_collapsed
+        )
         kv_args.kv_layer_ids = build_kv_layer_ids(
             token_to_kv_pool=self.token_to_kv_pool,
             draft_token_to_kv_pool=self.draft_token_to_kv_pool,
@@ -934,7 +939,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # this point carries none of the markers `is_unadmitted_reject` reads,
         # so take the caller's word for it rather than sniffing.
         if not is_retracted and not is_rebootstrap and is_unadmitted_reject(req):
-            self.scheduler.retire_unadmitted_request(req)
+            self.scheduler.request_retirer.retire_unadmitted(req)
             return
         if is_retracted and dsv4_needs_rebootstrap(self.token_to_kv_pool_allocator):
             req.time_stats.set_retract_time()
@@ -1078,7 +1083,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if message is not None:
             logger.error(message)
             prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)
-            self.scheduler.output_streamer.stream_output([req], req.return_logprob)
+            self.scheduler.request_retirer.retire_unadmitted(req)
             return True
         return False
 
@@ -1949,7 +1954,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 decode_req.req.kv.req_pool_idx,
                 total_prefix_len,
                 seq_len,
-                self.token_to_kv_pool.page_size,
+                dsa_index_k_page_tokens(self.token_to_kv_pool.page_size),
             )
 
         def _dsa_tail_payload():
@@ -3487,6 +3492,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 # FIXME: without deferred release, a failed receive's device
                 # destination is released at once, with no proof that the
                 # remote writer stopped; a late write can land in reused pages.
+                # Unregister first: a chunk scattered for a room still registered
+                # would index the row the release clears, i.e. other requests' KV.
+                self._unregister_staging_room(decode_req.req.bootstrap_room)
                 self.scheduler.request_retirer.release(decode_req.req, checkpoint=False)
                 receiver = decode_req.kv_receiver
                 receiver.clear()
@@ -3504,10 +3512,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             if i in deferred_indices:
                 # Held for deferred release; metadata buffer freed at resolve time.
                 continue
-            if self.enable_staging and self.staging_handler.is_staging_room(
-                queue[i].req.bootstrap_room
-            ):
-                self.staging_handler.unregister_decode_req(queue[i].req.bootstrap_room)
+            self._unregister_staging_room(queue[i].req.bootstrap_room)
             idx = queue[i].metadata_buffer_index
             assert idx != -1
             # Reset so the next owner sees actual_room == 0 ("not yet written")
@@ -3555,10 +3560,13 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             ]
         )
 
-    def _do_release(self, decode_req: DecodeRequest, idx: int) -> None:
-        room = decode_req.req.bootstrap_room
+    def _unregister_staging_room(self, room: int) -> None:
         if self.enable_staging and self.staging_handler.is_staging_room(room):
             self.staging_handler.unregister_decode_req(room)
+
+    def _do_release(self, decode_req: DecodeRequest, idx: int) -> None:
+        room = decode_req.req.bootstrap_room
+        self._unregister_staging_room(room)
         # release pre-allocated kv cache, but don't insert into the tree since it's failed
         self.scheduler.request_retirer.release(decode_req.req, checkpoint=False)
         self.metadata_buffers.clear_slot(idx)
