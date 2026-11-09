@@ -330,6 +330,13 @@ class MRotaryEmbedding(RotaryEmbedding):
         fused_set_kv_buffer_arg=None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         assert positions.ndim in (1, 2)
+        if positions.ndim == 1:
+            return super().forward_xpu(
+                positions=positions,
+                query=query,
+                key=key,
+                fused_set_kv_buffer_arg=fused_set_kv_buffer_arg,
+            )
         self._match_cos_sin_cache_dtype(query)
         if (
             multimodal_rotary_embedding is not None
