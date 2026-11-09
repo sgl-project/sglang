@@ -2,11 +2,13 @@
 """Small, checkpoint-free numerical contracts against the Cosmos reference."""
 
 import sys
+from unittest.mock import patch
 
 import pytest
 import torch
 from diffusers.models.transformers.transformer_cosmos import CosmosTransformer3DModel
 
+import sglang.multimodal_gen.runtime.models.dits.anima as anima
 from sglang.multimodal_gen.configs.models.adapter.anima import (
     AnimaTextConditionerArchConfig,
     AnimaTextConditionerConfig,
@@ -23,6 +25,9 @@ from sglang.multimodal_gen.runtime.models.dits.anima import AnimaTransformer3DMo
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, server_args
 from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import (
     ensure_distributed_env_defaults,
+)
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    enable_breakable_cuda_graph,
 )
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -76,8 +81,21 @@ def test_transformer_matches_cosmos(dtype, batch_size, monkeypatch):
     t = torch.linspace(600, 900, batch_size, device="cuda")
     padding = torch.zeros(1, 1, 8, 12, device="cuda", dtype=dtype)
     expected = reference(x, t.to(dtype) / 1000, context, padding_mask=padding).sample
-    with set_forward_context(current_timestep=0, attn_metadata=None):
+    with (
+        set_forward_context(current_timestep=0, attn_metadata=None),
+        patch.object(
+            anima, "residual_gate_add", wraps=anima.residual_gate_add
+        ) as fused,
+    ):
         actual = model(x, context, t)
+        assert fused.call_count == 0
+        with enable_breakable_cuda_graph():
+            graph_path = model(x, context, t)
+        assert fused.call_count == 3 * kwargs["num_layers"]
+        after_graph = model(x, context, t)
+        assert fused.call_count == 3 * kwargs["num_layers"]
+    torch.testing.assert_close(graph_path, actual, atol=0, rtol=0)
+    torch.testing.assert_close(after_graph, actual, atol=0, rtol=0)
     tolerance = 2e-5 if dtype == torch.float32 else 2e-2
     torch.testing.assert_close(actual, expected, atol=tolerance, rtol=tolerance)
 
