@@ -13,6 +13,7 @@ import datetime
 import tempfile
 import threading
 import unittest
+from collections import defaultdict
 from pathlib import Path
 from types import SimpleNamespace
 from typing import NamedTuple
@@ -1154,6 +1155,69 @@ class TestBackendOptIn(CustomTestCase):
         # drain ack itself before it may opt in.
         self.assertFalse(BaseKVManager.supports_deferred_decode_kv_release)
         self.assertFalse(CommonKVManager.supports_deferred_decode_kv_release)
+
+
+class TestReopenRoomPreservesInFlightStagingCount(CustomTestCase):
+    """When a bootstrap_room is reopened while a counted chunk from the previous
+    lifecycle has not yet executed its finally decrement, update_status() must
+    not pop the positive _staging_outstanding count. Otherwise the previous
+    chunk's decrement drives the defaultdict counter to -1, the new lifecycle's
+    in-flight chunk increments it to 0, and an ABORT on the new lifecycle fires
+    an immediate ABORT_ACK while its transfer is still writing."""
+
+    def test_reopen_while_previous_chunk_draining_does_not_underflow_counter(self):
+        mgr = _make_prefill_manager()
+        mgr._staging_outstanding = defaultdict(int)
+        room = 88
+        mgr.update_status(room, KVPoll.WaitingForInput)
+
+        # Lifecycle 1: worker dequeues and counts a chunk (+1), then the sender
+        # concludes/clears before the worker's finally block decrements it.
+        mgr._staging_outstanding[room] += 1
+        s1 = _TestSender.__new__(_TestSender)
+        s1.kv_mgr = mgr
+        s1.bootstrap_room = room
+        s1.conclude_state = None
+        s1.clear()
+        self.assertNotIn(room, mgr.request_status)
+
+        # Lifecycle 2 reopens the same bootstrap_room while lifecycle 1's chunk
+        # is still in flight before its finally decrement.
+        mgr.update_status(room, KVPoll.Bootstrapping)
+        self.assertEqual(mgr._staging_outstanding[room], 1)
+
+        # Lifecycle 1's chunk finishes and runs its finally decrement (-> 0, not -1).
+        mgr._staging_outstanding[room] -= 1
+        mgr._maybe_ack_drained_abort(room)
+        self.assertEqual(mgr._staging_outstanding[room], 0)
+
+        # Lifecycle 2's chunk is dequeued and counted (+1 -> 1, not 0).
+        mgr._staging_outstanding[room] += 1
+        target = AckTarget("10.0.0.1", 5000, ABORT_GENERATION)
+        claimed = mgr._handle_abort_notification(
+            AbortNotification(room, target.ip, target.port, target.generation).to_zmq()
+        )
+        self.assertTrue(claimed)
+        # Must NOT send ABORT_ACK while lifecycle 2's chunk is still in flight.
+        self.assertEqual(mgr._sent, [])
+
+        # Once lifecycle 2's chunk drains, the deferred ABORT_ACK is sent.
+        mgr._staging_outstanding[room] -= 1
+        mgr._maybe_ack_drained_abort(room)
+        self.assertEqual(mgr._sent, [(room, target)])
+
+    def test_reopen_after_poison_still_resets_stuck_counter(self):
+        mgr = _make_prefill_manager()
+        mgr._staging_outstanding = defaultdict(int)
+        room = 89
+        mgr.update_status(room, KVPoll.WaitingForInput)
+        mgr._staging_outstanding[room] += 1
+        mgr.poison_deferred_ack_room(room)
+        mgr.request_status.pop(room, None)
+
+        mgr.update_status(room, KVPoll.Bootstrapping)
+        self.assertEqual(mgr._staging_outstanding.get(room, 0), 0)
+        self.assertNotIn(room, mgr._deferred_ack_poisoned_rooms)
 
 
 if __name__ == "__main__":
