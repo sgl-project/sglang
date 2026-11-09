@@ -37,6 +37,8 @@ DllmRunOutput = Tuple[
 
 def argmax_and_softmax_prob(
     full_logits_2d: torch.Tensor,
+    # 16384: 910B3-measured optimum at 2048 rows x 157k-vocab bf16; >=32768
+    # re-enters memory pressure (+55%), smaller is launch-bound (3.4x at 4096).
     vocab_chunk: int = 16384,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Per-row argmax and its exact softmax probability.
