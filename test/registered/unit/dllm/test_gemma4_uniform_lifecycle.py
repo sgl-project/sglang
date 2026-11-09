@@ -118,6 +118,9 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
     def test_scheduler_uses_standard_extend_for_context_only(self):
         scheduler = SimpleNamespace(
             dllm_config=SimpleNamespace(requires_separate_context_encoding=True),
+            # What init_diffusion_llm resolves for a separate-context-encoding
+            # algorithm: the mixed-round gate is downgraded off.
+            dllm_mixed_batch_enabled=False,
             dllm_manager=SimpleNamespace(
                 get_prefill_requests=Mock(return_value=[object()]),
                 get_decode_requests=Mock(return_value=[]),
