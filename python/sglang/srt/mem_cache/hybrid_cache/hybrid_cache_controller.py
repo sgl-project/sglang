@@ -150,6 +150,12 @@ class PPPrefetchState:
     release_requested: bool = False
     ready_event: threading.Event = field(default_factory=threading.Event, repr=False)
     consumed: bool = False
+    # Set by the worker once the rank-agreed hit is known; staging is then
+    # allocated on the scheduler thread at a PP0-decided step.
+    queried_event: threading.Event = field(default_factory=threading.Event, repr=False)
+    io_started: bool = False
+    # Occupancy already returned on the scheduler; the buffers free later.
+    occupancy_released: bool = False
 
 
 def _trailing_chain_groups(
@@ -1313,8 +1319,8 @@ class HybridCacheController(BaseHiCacheController):
             pool_transfers=pool_transfers,
         )
 
-        # Every rank queries and allocates in ticket order on the worker.
-        # Admission waits for the normal completion ACK, including misses.
+        # Every rank queries in ticket order on the worker; staging for a hit
+        # is allocated on the scheduler thread at a PP0-decided step.
         operation.is_pp_broadcast = True
         state = PPPrefetchState(ticket=ticket, operation=operation)
         with self.pp_prefetch_state_lock:
@@ -1397,14 +1403,101 @@ class HybridCacheController(BaseHiCacheController):
 
     def _free_pp_prefetch_state(self, state: PPPrefetchState) -> None:
         operation = state.operation
-        if operation.host_indices is not None:
+        if operation.host_indices is not None and operation.host_indices.numel():
             self.mem_pool_host.free(operation.host_indices, pool=PoolName.KV)
-            self.prefetch_tokens_occupied -= len(operation.host_indices)
+            if not state.occupancy_released:
+                self.prefetch_tokens_occupied -= len(operation.host_indices)
             operation.host_indices = None
+        state.occupancy_released = True
         for transfer in operation.pool_transfers or []:
             if transfer.indices_from_pool is None and transfer.host_indices is not None:
                 self.mem_pool_host.free(transfer.host_indices, pool=transfer.name)
                 transfer.host_indices = None
+
+    def _defer_free_pp_prefetch_state(self, state: PPPrefetchState) -> None:
+        """Off the scheduler thread: hand the buffers to the release queues,
+        which every rank drains at the same step, so host availability never
+        depends on when an I/O thread finished."""
+        operation = state.operation
+        owned = [
+            transfer
+            for transfer in operation.pool_transfers or []
+            if transfer.indices_from_pool is None and transfer.host_indices is not None
+        ]
+        self.append_host_mem_release(operation.host_indices, extra_pools=owned)
+        operation.host_indices = None
+        for transfer in owned:
+            transfer.host_indices = None
+
+    def pp_prefetch_phase(self, rid: str) -> int:
+        """PP0's view of a ticket for the scheduler's agreed step:
+        0 pending, 1 queried hit awaiting staging, 2 ready to consume."""
+        with self.pp_prefetch_state_lock:
+            state = self.pp_prefetch_states.get(rid)
+            thread = self.pp_prefetch_command_thread
+            if thread is not None and not thread.is_alive():
+                raise RuntimeError(f"PP HiCache ticket thread exited: req={rid}")
+            if state is None or state.consumed:
+                return 0
+            if state.ready_event.is_set():
+                return 2
+            if not state.io_started and state.queried_event.is_set():
+                return 1
+            return 0
+
+    def allocate_pp_prefetch(self, rid: str) -> bool:
+        """Scheduler thread, at PP0's agreed step: stage the agreed hit."""
+        with self.pp_prefetch_state_lock:
+            state = self.pp_prefetch_states.get(rid)
+        if state is None:
+            raise RuntimeError(f"PP prefetch staging requested without a ticket: {rid}")
+        state.queried_event.wait()
+        try:
+            return self._allocate_pp_prefetch_buffers(state.ticket, state.operation)
+        except Exception:
+            # Votes zero in the agreed MIN like an exhausted pool.
+            logger.exception("PP HiCache staging allocation failed for req=%s.", rid)
+            return False
+
+    def start_pp_prefetch_io(self, rid: str, agreed: bool, allocated: bool) -> None:
+        """Launch the agreed hit's GET, or turn it into a miss on every rank."""
+        with self.pp_prefetch_state_lock:
+            state = self.pp_prefetch_states[rid]
+        operation = state.operation
+        if agreed and not allocated:
+            raise RuntimeError(
+                f"PP prefetch staging diverged: req={rid} PP0 staged "
+                f"{operation.storage_hit_count} tokens, this rank could not. "
+                "Host staging state differs across ranks."
+            )
+        state.io_started = True
+        if agreed:
+            if operation.pool_transfers:
+                self._resolve_sidecar_kv_derived_pool_transfers(operation)
+            self.prefetch_buffer.put(operation)
+            return
+        if allocated:
+            self._free_pp_prefetch_state(state)
+        self._complete_pp_prefetch_miss(state)
+
+    def _complete_pp_prefetch_miss(self, state: PPPrefetchState) -> None:
+        operation = state.operation
+        operation.host_indices = torch.empty(0, dtype=torch.int64)
+        operation.hash_value = []
+        operation.storage_hit_count = 0
+        operation.completed_tokens = 0
+        operation.mark_terminate()
+        with self.pp_prefetch_state_lock:
+            state.ready_event.set()
+            if state.release_requested:
+                # Borrowed sidecar buffers leave through the release queues.
+                self._defer_free_pp_prefetch_state(state)
+                self._drop_pp_prefetch_state(state)
+
+    def _drop_pp_prefetch_state(self, state: PPPrefetchState) -> None:
+        rid = state.ticket.handle.rid
+        if self.pp_prefetch_states.get(rid) is state:
+            self.pp_prefetch_states.pop(rid)
 
     def is_pp_prefetch_ready(self, rid: str) -> bool:
         with self.pp_prefetch_state_lock:
@@ -1453,6 +1546,16 @@ class HybridCacheController(BaseHiCacheController):
             if state.ready_event.is_set():
                 self._free_pp_prefetch_state(state)
                 self.pp_prefetch_states.pop(rid, None)
+            elif state.io_started:
+                # The GET still writes the buffers; they free from the release
+                # queues on completion, the occupancy returns now.
+                if state.operation.host_indices is not None:
+                    self.prefetch_tokens_occupied -= len(state.operation.host_indices)
+                state.occupancy_released = True
+            else:
+                # Only borrowed sidecar buffers exist before the agreed step.
+                self._free_pp_prefetch_state(state)
+                self.pp_prefetch_states.pop(rid, None)
             return True
 
     def pp_prefetch_command_thread_func(self) -> None:
@@ -1486,7 +1589,6 @@ class HybridCacheController(BaseHiCacheController):
                             ticket.prefetch_key,
                             ticket.last_hash,
                             prefix_keys=ticket.prefix_keys,
-                            # Keep sidecar ACKs aligned even if allocation fails.
                             pool_transfers=[
                                 PoolTransfer(
                                     name=spec.name,
@@ -1509,48 +1611,38 @@ class HybridCacheController(BaseHiCacheController):
 
                 try:
                     hash_value, storage_hit_count = self._storage_hit_query(operation)
+                    # A read-only cap: staging itself is allocated later on the
+                    # scheduler thread, so this worker never changes host state.
                     storage_hit_count = min(
                         storage_hit_count,
                         self.mem_pool_host.available_size(pool=PoolName.KV),
                     )
                     storage_hit_count -= storage_hit_count % self.page_size
-                    operation.storage_hit_count = storage_hit_count
-                    if (
-                        storage_hit_count == 0
-                        or storage_hit_count < self.prefetch_threshold
-                        or not self._allocate_pp_prefetch_buffers(ticket, operation)
-                    ):
+                    if storage_hit_count < self.prefetch_threshold:
                         storage_hit_count = 0
                 except Exception:
-                    logger.exception(
-                        "PP HiCache query or allocation failed for req=%s.", rid
-                    )
+                    logger.exception("PP HiCache query failed for req=%s.", rid)
                     operation.query_pool_hit_pages = {}
                     hash_value, storage_hit_count = [], 0
 
-                # A failed query/allocation votes zero in the same MIN as hits.
+                # A failed query votes zero in the same MIN as hits.
                 storage_hit_count = self._sync_prefetch_hit_query(
                     operation, storage_hit_count
                 )
-                if operation.host_indices is not None:
-                    tail = operation.host_indices[storage_hit_count:]
-                    if tail.numel():
-                        self.mem_pool_host.free(tail, pool=PoolName.KV)
-                        self.prefetch_tokens_occupied -= len(tail)
-                        operation.host_indices = operation.host_indices[
-                            :storage_hit_count
-                        ]
                 operation.hash_value = hash_value[: storage_hit_count // self.page_size]
                 operation.storage_hit_count = storage_hit_count
                 operation.storage_start = len(ticket.matched_prefix_tokens)
                 operation.pool_storage_result = PoolTransferResult.empty()
                 if storage_hit_count == 0:
-                    if operation.host_indices is None:
-                        operation.host_indices = torch.empty(0, dtype=torch.int64)
-                    operation.mark_terminate()
-                if operation.pool_transfers:
-                    self._resolve_sidecar_kv_derived_pool_transfers(operation)
-                self.prefetch_buffer.put(operation)
+                    # Agreed on every rank: no staging, no GET, ready now.
+                    state.io_started = True
+                    self._complete_pp_prefetch_miss(state)
+                elif state.release_requested:
+                    with self.pp_prefetch_state_lock:
+                        self._defer_free_pp_prefetch_state(state)
+                        self._drop_pp_prefetch_state(state)
+                else:
+                    state.queried_event.set()
             except Exception:
                 logger.exception("PP HiCache ticket processing failed.")
                 # Query/allocation failures already follow the agreed ACK path.
@@ -2198,7 +2290,7 @@ class HybridCacheController(BaseHiCacheController):
                     operation.storage_hit_count = operation.completed_tokens
                     state.ready_event.set()
                     if state.release_requested:
-                        self._free_pp_prefetch_state(state)
-                        self.pp_prefetch_states.pop(operation.request_id, None)
+                        self._defer_free_pp_prefetch_state(state)
+                        self._drop_pp_prefetch_state(state)
             except Empty:
                 continue

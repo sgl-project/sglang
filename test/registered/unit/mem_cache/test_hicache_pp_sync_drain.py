@@ -74,13 +74,17 @@ class TestUnifiedPPSyncBatching(unittest.TestCase):
         follower.writing_check.assert_called_once_with(finish_count=1)
         follower.loading_check.assert_called_once_with(finish_count=1)
 
-    def test_buffer_mode_follower_drains_rank_local_completions(self):
+    def test_buffer_mode_follower_drains_pp0_counts(self):
+        """Stage-local counts let each stage free staging and device locks at
+        its own step, so admission diverged (two stages built 16,300- and
+        16,384-row batches for one microbatch); buffer mode follows PP0."""
         cache = self._make_cache(1, [True, False], [True, True])
         cache.host_memory_mode = "buffer_only"
         cache.tree_core.enable_storage = True
         cache._all_reduce_attn_groups = MagicMock()
         cache._drain_storage_control_queues_impl = MagicMock()
         cc = cache.cache_controller
+        cc.extra_host_mem_release_queues = {}
         for size, name in enumerate(
             (
                 "prefetch_hit_queue",
@@ -95,17 +99,23 @@ class TestUnifiedPPSyncBatching(unittest.TestCase):
                 queue.put(object())
             setattr(cc, name, queue)
 
+        def from_pp0(counts, _):
+            # The follower contributes zeros and takes PP0's counts.
+            self.assertEqual(counts[:6].tolist(), [0] * 6)
+            counts[:6] = torch.tensor([0, 1, 0, 1, 2, 0])
+
+        cache._all_reduce.side_effect = from_pp0
         cache.check_hicache_events()
 
-        cache._all_reduce.assert_not_called()
-        cache._all_reduce_attn_groups.assert_called_once()
-        cache.writing_check.assert_called_once_with(finish_count=1)
-        cache.loading_check.assert_called_once_with(finish_count=2)
+        cache._all_reduce.assert_called_once()
+        cache._all_reduce_attn_groups.assert_not_called()
+        cache.writing_check.assert_called_once_with(finish_count=0)
+        cache.loading_check.assert_called_once_with(finish_count=1)
         cache._drain_storage_control_queues_impl.assert_called_once_with(
-            n_storage_hit=1,
-            n_ack_prefetch=2,
-            n_backup=3,
-            n_release=4,
+            n_storage_hit=0,
+            n_ack_prefetch=1,
+            n_backup=2,
+            n_release=0,
             extra_release_counts={},
             log_metrics=True,
         )

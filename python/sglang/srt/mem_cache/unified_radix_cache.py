@@ -9,7 +9,7 @@ from array import array
 from contextlib import ExitStack, nullcontext
 from dataclasses import replace
 from http import HTTPStatus
-from queue import Queue
+from queue import Empty, Queue
 from typing import (
     TYPE_CHECKING,
     Callable,
@@ -2747,13 +2747,25 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def _check_pp_prefetch_progress(self, request: CacheRequestHandle) -> bool:
         req_id = request.rid
-        ready = self.pp_rank == 0 and self.cache_controller.is_pp_prefetch_ready(req_id)
-        ready_tensor = torch.tensor(int(ready), dtype=torch.int, device="cpu")
-        self._all_reduce(ready_tensor, torch.distributed.ReduceOp.MAX)
-        if ready_tensor.item() == 0:
+        cc = self.cache_controller
+        # PP0 picks the phase and the PP sync hands it down, so every rank
+        # stages and consumes a ticket at the same scheduler step.
+        phase = cc.pp_prefetch_phase(req_id) if self.pp_rank == 0 else 0
+        phase_tensor = torch.tensor(phase, dtype=torch.int, device="cpu")
+        self._all_reduce(phase_tensor, torch.distributed.ReduceOp.MAX)
+        phase = int(phase_tensor.item())
+        if phase == 0:
+            return False
+        if phase == 1:
+            # Host staging changes only here, on the scheduler thread, so
+            # admission reads the same host state on every rank.
+            allocated = cc.allocate_pp_prefetch(req_id)
+            agreed = torch.tensor(int(allocated), dtype=torch.int, device="cpu")
+            self._all_reduce(agreed, torch.distributed.ReduceOp.MIN)
+            cc.start_pp_prefetch_io(req_id, bool(agreed.item()), allocated)
             return False
 
-        state = self.cache_controller.take_ready_pp_prefetch(req_id)
+        state = cc.take_ready_pp_prefetch(req_id)
         if state is None:
             raise RuntimeError(
                 f"PP prefetch became ready before local state existed: {req_id}"
@@ -3460,10 +3472,26 @@ class UnifiedRadixCache(BasePrefixCache):
                     item = q.get()
                     yield item
             else:
-                for _ in range(n):
+                for i in range(n):
                     # Block when there are not enough elements.
                     # All TP/PP ranks must consume the same number of elements.
-                    item = q.get()
+                    waited = 0
+                    while True:
+                        try:
+                            item = q.get(timeout=60)
+                            break
+                        except Empty:
+                            waited += 60
+                            # A PP>0 rank waits for its own copy of an item PP0
+                            # counted; a long wait means the stages diverged.
+                            logger.warning(
+                                "HiCache drain waited %ds for item %d/%d on "
+                                "pp_rank=%d; queues may have diverged across ranks",
+                                waited,
+                                i + 1,
+                                n,
+                                self.pp_rank,
+                            )
                     yield item
 
         buffer_mode = self.host_memory_mode == "buffer_only"
@@ -3834,6 +3862,15 @@ class UnifiedRadixCache(BasePrefixCache):
 
     # ---- HiCache: Async Event Management ----
 
+    def _check_ack_backlog(self, ack_queue, finish_count: int, kind: str) -> None:
+        # The scheduler thread alone appends these acks, so a shortfall
+        # cannot fill by waiting: this rank launched different transfers.
+        if finish_count > len(ack_queue):
+            raise RuntimeError(
+                f"HiCache {kind} acks diverged across ranks: pp_rank={self.pp_rank} "
+                f"must finish {finish_count} but holds {len(ack_queue)}."
+            )
+
     def _count_ready_acks(self, ack_queue) -> int:
         ready_count = 0
         for ack in ack_queue:
@@ -3848,7 +3885,10 @@ class UnifiedRadixCache(BasePrefixCache):
         cc = self.cache_controller
         extra_release_queues = getattr(cc, "extra_host_mem_release_queues", {})
         extra_pool_names = tuple(extra_release_queues) if self.enable_storage else ()
-        if cc is None or (self.pp_rank > 0 and self.host_memory_mode != "buffer_only"):
+        # PP0 counts and the PP sync hands its counts down, in buffer mode too:
+        # stage-local counts let each stage free staging and device locks at
+        # its own step, and its admission then builds a different batch.
+        if cc is None or self.pp_rank > 0:
             write_acks = 0
             load_acks = 0
             # Zero placeholders shaped like PP0's slots: _pp_sync hands the
@@ -3898,10 +3938,7 @@ class UnifiedRadixCache(BasePrefixCache):
             dtype=torch.int64,
             device="cpu",
         )
-        if self.host_memory_mode == "buffer_only" and self.pp_size > 1:
-            self._all_reduce_attn_groups(ready_counts, torch.distributed.ReduceOp.MIN)
-        else:
-            self._all_reduce(ready_counts, torch.distributed.ReduceOp.MIN)
+        self._all_reduce(ready_counts, torch.distributed.ReduceOp.MIN)
 
         count_values = list(map(int, ready_counts.tolist()))
         assert digest == count_values[-2] and digest == -count_values[-1], (
@@ -3967,6 +4004,7 @@ class UnifiedRadixCache(BasePrefixCache):
             finish_count = finish_count_tensor.item()
 
         # Process completed acks
+        self._check_ack_backlog(cc.ack_write_queue, finish_count, "write")
         while finish_count > 0:
             ack = cc.ack_write_queue.pop(0)
             ack.finish_event.synchronize()
@@ -4013,6 +4051,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 "write_back duplicate-reclaim victims diverged across TP ranks"
             )
 
+        self._check_ack_backlog(cc.ack_load_queue, finish_count, "load")
         while finish_count > 0:
             ack = cc.ack_load_queue.pop(0)
             ack.finish_event.synchronize()

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import zlib
 from collections import defaultdict, deque
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -56,6 +57,16 @@ def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
         and len(batch.reqs) == 1
         and not batch.contains_last_prefill_chunk
         and not batch.return_logprob
+    )
+
+
+def _pp_batch_fingerprint(batch: ScheduleBatch) -> tuple[int, int, int, int]:
+    rids = "\0".join(req.rid for req in batch.reqs)
+    return (
+        len(batch.reqs),
+        batch.extend_num_tokens or 0,
+        sum(batch.prefix_lens or ()),
+        zlib.crc32(rids.encode()),
     )
 
 
@@ -1746,7 +1757,32 @@ class SchedulerPPMixin:
                     for tensor in pp_proxy_tensors.tensors.values():
                         if isinstance(tensor, torch.Tensor) and not tensor.is_cpu:
                             tensor.record_stream(self.forward_stream)
+                fingerprint = _pp_batch_fingerprint(cur_batch)
+                incoming_fingerprint = (
+                    pp_proxy_tensors.tensors.pop("__pp_batch_fingerprint__", None)
+                    if pp_proxy_tensors is not None
+                    else None
+                )
+                if (
+                    incoming_fingerprint is not None
+                    and incoming_fingerprint != fingerprint
+                ):
+                    # Every stage replays the same scheduling; a different
+                    # batch here would run on rows built for another one.
+                    raise RuntimeError(
+                        f"PP stages built different batches: pp_rank="
+                        f"{self.pp_group.rank_in_group} mb_id={mb_id} received "
+                        f"{incoming_fingerprint}, local {fingerprint} "
+                        "(reqs, new tokens, prefix tokens, rid crc32)"
+                    )
                 result = self.run_batch(cur_batch, pp_proxy_tensors)
+                if (
+                    not self.pp_group.is_last_rank
+                    and result.pp_hidden_states_proxy_tensors is not None
+                ):
+                    result.pp_hidden_states_proxy_tensors.tensors[
+                        "__pp_batch_fingerprint__"
+                    ] = fingerprint
                 set_time_batch(
                     cur_batch.reqs,
                     "set_run_batch_cpu_end_time",
