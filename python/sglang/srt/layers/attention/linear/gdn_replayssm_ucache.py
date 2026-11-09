@@ -533,9 +533,10 @@ class GdnUcacheTrackMaterializer:
 
 def _load_flush_kernel(device: torch.device) -> Callable:
     capability = torch.cuda.get_device_capability(device)
-    if capability not in ((10, 0), (10, 7)):
+    # SM103 shares SM100's tcgen05 path and runs the SM100 build.
+    if capability not in ((10, 0), (10, 3), (10, 7)):
         raise RuntimeError(
-            f"GDN u-cache verify needs SM100 or SM107, got SM{capability[0]}{capability[1]}"
+            f"GDN u-cache verify needs SM100, SM103 or SM107, got SM{capability[0]}{capability[1]}"
         )
     if capability == (10, 7):
         try:

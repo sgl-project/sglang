@@ -26,10 +26,11 @@ register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="4-gpu-
 
 if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
     (10, 0),
+    (10, 3),
     (10, 7),
 ):
     pytest.skip(
-        "FlashInfer u-cache verify requires SM100/SM107", allow_module_level=True
+        "FlashInfer u-cache verify requires SM100/SM103/SM107", allow_module_level=True
     )
 pytest.importorskip("flashinfer.gdn_kernels.gdn_replay_mtp_umma")
 
@@ -78,13 +79,21 @@ def _fp32_window(state, q, k, v, a, b, A_log, dt_bias):
 
 class TestGdnReplaySsmUcache(CustomTestCase):
     def test_multistep_random_accept_matches_fp32_recurrence(self):
+        self._check_random_accept(max_num_draft_tokens=NUM_DRAFT_TOKENS, widths=[4])
+
+    def test_adaptive_widths_share_one_pool(self):
+        """Adaptive tiers verify 1..8 tokens per step against one pool whose fold
+        threshold comes from the widest tier; every width, including steps that
+        switch width mid-window, must match the recurrence."""
+        self._check_random_accept(max_num_draft_tokens=8, widths=[1, 2, 4, 6, 8])
+
+    def _check_random_accept(self, *, max_num_draft_tokens, widths):
         device = torch.device("cuda")
         gen = torch.Generator(device=device).manual_seed(0)
 
         def randn(*shape, scale=1.0):
             return torch.randn(*shape, generator=gen, device=device) * scale
 
-        T = NUM_DRAFT_TOKENS
         buffers = allocate_gdn_ucache(
             num_layers=1,
             num_slots=NUM_SLOTS,
@@ -92,7 +101,7 @@ class TestGdnReplaySsmUcache(CustomTestCase):
             num_v_heads=HV,
             head_k_dim=K,
             head_v_dim=V,
-            max_num_draft_tokens=T,
+            max_num_draft_tokens=max_num_draft_tokens,
             device="cuda",
         )
         # Poisoned rings: a record read outside the live window turns into NaN.
@@ -105,11 +114,18 @@ class TestGdnReplaySsmUcache(CustomTestCase):
         cache_indices = torch.tensor(CACHE_INDICES, dtype=torch.int32, device=device)
         rows = [r for r, slot in enumerate(CACHE_INDICES) if slot > 0]
         batch = len(CACHE_INDICES)
-        verifier = GdnUcacheVerifier(device=device, first_layer_id=0)
+        # One verifier per width, as each adaptive tier builds its own backend.
+        verifiers = {
+            T: GdnUcacheVerifier(device=device, first_layer_id=0) for T in widths
+        }
 
         worst = worst_first = ref_max = 0.0
         folds = {r: 0 for r in rows}
         for step in range(NUM_STEPS):
+            T = widths[0]
+            if len(widths) > 1:
+                pick = torch.randint(len(widths), (1,), generator=gen, device=device)
+                T = widths[int(pick)]
             if step == DT_BIAS_UPDATE_STEP:
                 dt_bias.copy_(randn(HV, scale=0.5))
             # q/k/v are views into one packed [q | k | v] row per token, as in
@@ -131,23 +147,27 @@ class TestGdnReplaySsmUcache(CustomTestCase):
             a, b = randn(batch * T, HV, scale=0.5), randn(batch * T, HV)
             a, b = a.to(torch.bfloat16), b.to(torch.bfloat16)
             hist_before = buffers.hist_len.clone()
-            output = verifier.target_verify(
-                layer_id=0,
-                query=q,
-                key=k,
-                value=v,
-                a=a,
-                b=b,
-                A_log=A_log,
-                dt_bias=dt_bias,
-                state=state,
-                k_ring=buffers.k_ring[0],
-                u_ring=buffers.u_ring[0],
-                g_ring=buffers.g_ring[0],
-                buffers=buffers,
-                cache_indices=cache_indices,
-                num_draft_tokens=T,
-            ).view(batch, T, HV, V)
+            output = (
+                verifiers[T]
+                .target_verify(
+                    layer_id=0,
+                    query=q,
+                    key=k,
+                    value=v,
+                    a=a,
+                    b=b,
+                    A_log=A_log,
+                    dt_bias=dt_bias,
+                    state=state,
+                    k_ring=buffers.k_ring[0],
+                    u_ring=buffers.u_ring[0],
+                    g_ring=buffers.g_ring[0],
+                    buffers=buffers,
+                    cache_indices=cache_indices,
+                    num_draft_tokens=T,
+                )
+                .view(batch, T, HV, V)
+            )
             num_accept = torch.randint(
                 1, T + 1, (batch,), generator=gen, device=device, dtype=torch.int32
             )

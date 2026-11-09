@@ -23,6 +23,7 @@ from sglang.srt.arg_groups.overrides import (
     attention_backends_of,
     declare_resolution,
     mamba_extra_buffer_of,
+    max_speculative_num_draft_tokens,
     model_config_of,
     resolved_view,
     resolving_view,
@@ -585,9 +586,10 @@ def _check_gdn_replayssm_ucache_model(server_args: Any, *, flag: str) -> None:
         raise ValueError(f"{flag} requires a GDN hybrid linear-attention model.")
     if not get_platform().is_cuda or torch.cuda.get_device_capability() not in (
         (10, 0),
+        (10, 3),
         (10, 7),
     ):
-        raise ValueError(f"{flag} requires an SM100 or SM107 CUDA GPU.")
+        raise ValueError(f"{flag} requires an SM100, SM103 or SM107 CUDA GPU.")
 
 
 def _check_gdn_replayssm_ucache_spec(cfg: Any, *, flag: str) -> None:
@@ -708,6 +710,15 @@ def handle_gdn_replayssm_ucache_spec_shape(server_args: Any) -> None:
         raise ValueError(
             f"{flag} supports 1 to 8 draft tokens per verify; got "
             f"--speculative-num-draft-tokens={num_draft_tokens}."
+        )
+    # Adaptive tiers verify up to max candidate step + 1 tokens; the pool sizes
+    # the window fold threshold from this width, and the kernel takes T <= 8.
+    max_num_draft_tokens = max_speculative_num_draft_tokens(server_args)
+    if max_num_draft_tokens > 8:
+        raise ValueError(
+            f"{flag} supports 1 to 8 draft tokens per verify; the "
+            f"--speculative-adaptive candidate steps reach {max_num_draft_tokens} "
+            "(largest candidate step + 1)."
         )
 
 

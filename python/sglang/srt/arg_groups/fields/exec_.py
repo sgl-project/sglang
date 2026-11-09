@@ -599,13 +599,14 @@ class ExecMamba(msgspec.Struct):
     enable_gdn_replayssm_ucache: A[
         bool,
         "Enable the deferred-fold GDN ReplaySSM target verify on FlashInfer's "
-        "u-cache kernels (gated_delta_rule_mtp_ucache_flush_umma, SM100; the Rubin "
-        "build on SM107). Each verify reads the fp16 checkpoint plus a per-slot "
+        "u-cache kernels (gated_delta_rule_mtp_ucache_flush_umma, SM100 and SM103; "
+        "the Rubin build on SM107). Each verify reads the fp16 checkpoint plus a per-slot "
         "window of up to 16 committed (k, u, g) records and folds a full window "
         "into the checkpoint inside the same launch, so the state is written "
         "about once every 4 verifies instead of every step. Numerics differ from "
         "the per-step fold (16-bit ring records, one rounding per fold). Requires "
-        "a GDN hybrid model, a linear draft chain with at most 8 draft tokens, "
+        "a GDN hybrid model, a linear draft chain with at most 8 draft tokens "
+        "(in every --speculative-adaptive tier), "
         "--mamba-ssm-dtype float16. With the radix cache, decode-time states "
         "are cached through --mamba-radix-cache-strategy extra_buffer or "
         "extra_buffer_lazy (each crossing writes FlashInfer's "

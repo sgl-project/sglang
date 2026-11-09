@@ -24,6 +24,7 @@ from sglang.srt.arg_groups.attention_hook import (
     _check_gdn_replayssm_ucache_cache,
     _pin_gdn_ucache_state_dtype_env,
     handle_attention_backend_compatibility,
+    handle_gdn_replayssm_ucache_spec_shape,
     handle_deterministic_inference,
 )
 from sglang.srt.arg_groups.cuda_graph_hook import (
@@ -1197,6 +1198,29 @@ class TestGdnReplaySsmUcacheRadixGuard(unittest.TestCase):
         ):
             with self.assertRaisesRegex(ValueError, "--enable-hierarchical-cache"):
                 self._check(mamba_radix_cache_strategy="extra_buffer_lazy", **kwargs)
+
+    def _check_adaptive_shape(self, candidate_steps):
+        with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
+            json.dump({"1": {"candidate_steps": candidate_steps}}, f)
+            f.flush()
+            handle_gdn_replayssm_ucache_spec_shape(
+                ServerArgs(
+                    model_path="dummy",
+                    enable_gdn_replayssm_ucache=True,
+                    speculative_algorithm="EAGLE",
+                    speculative_eagle_topk=1,
+                    speculative_num_steps=3,
+                    speculative_num_draft_tokens=4,
+                    speculative_adaptive=True,
+                    speculative_adaptive_config=f.name,
+                )
+            )
+
+    def test_adaptive_tiers_are_bounded_by_the_widest_candidate(self):
+        """The initial tier (4 tokens) passes alone; a step-8 candidate verifies 9."""
+        self._check_adaptive_shape([0, 1, 3, 7])
+        with self.assertRaisesRegex(ValueError, "candidate steps reach 9"):
+            self._check_adaptive_shape([1, 3, 8])
 
     def test_int8_checkpoint_is_rejected_with_radix(self):
         with self.assertRaisesRegex(ValueError, "--enable-int8-mamba-checkpoint"):
