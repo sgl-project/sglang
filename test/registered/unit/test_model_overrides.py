@@ -4484,5 +4484,41 @@ class TestDeterministicAttentionBackendOnXpu(unittest.TestCase):
         self.assertEqual(updates, {})
 
 
+class TestUnlimitedOCRAscendOverrides(CustomTestCase):
+    def test_npu_declarations_pass_publish_gate_without_mutating_inputs(self):
+        from sglang.srt.arg_groups.model_overrides import unlimited_ocr
+        from sglang.srt.server_args import ServerArgs
+
+        args = ServerArgs(model_path="dummy")
+        hf_config = SimpleNamespace(architectures=["UnlimitedOCRForCausalLM"])
+        for is_npu in (False, True):
+            with (
+                self.subTest(is_npu=is_npu),
+                patch.object(
+                    unlimited_ocr,
+                    "get_platform",
+                    return_value=SimpleNamespace(is_npu=is_npu),
+                ),
+            ):
+                declarations = collect_model_override_declarations(
+                    "UnlimitedOCRForCausalLM", args, hf_config
+                )
+                # Returning a computed graph config here previously rejected
+                # every startup before the model could load its weights.
+                validate_declarations(args, declarations)
+                updates = dict(
+                    field
+                    for _, declaration in declarations
+                    for field in declaration.items()
+                )
+                if is_npu:
+                    self.assertTrue(updates["disable_hybrid_swa_memory"])
+                    self.assertTrue(updates["disable_radix_cache"])
+                else:
+                    self.assertEqual(updates, {})
+        self.assertFalse(args.disable_hybrid_swa_memory)
+        self.assertFalse(args.disable_radix_cache)
+
+
 if __name__ == "__main__":
     unittest.main()
