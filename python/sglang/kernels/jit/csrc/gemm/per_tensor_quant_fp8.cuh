@@ -105,7 +105,7 @@ void per_tensor_quant_fp8_impl(
 
   auto device = SymbolicDevice{};
   auto N = SymbolicSize{"num_elements"};
-  device.set_options<kDLCUDA>();
+  device.set_options<kDLGPU>();
 
   TensorMatcher({N})  //
       .with_dtype<DType>()
