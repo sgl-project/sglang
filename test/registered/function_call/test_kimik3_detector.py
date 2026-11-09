@@ -60,6 +60,20 @@ def _stream(
     return text, calls
 
 
+def _assemble(calls: list[ToolCallItem]) -> dict[int, dict]:
+    """Reassemble incremental streaming deltas per tool call.
+
+    Returns {tool_index: {"name": ..., "parameters": <concatenated deltas>}}.
+    """
+    by_id: dict[int, dict] = {}
+    for call in calls:
+        entry = by_id.setdefault(call.tool_index, {"name": None, "parameters": ""})
+        if call.name:
+            entry["name"] = call.name
+        entry["parameters"] += call.parameters
+    return by_id
+
+
 def test_detect_and_parse_single_call() -> None:
     detector = KimiK3Detector()
     tools = [_make_tool("python")]
@@ -162,9 +176,13 @@ def test_streaming_split_markers(chunk_size: int) -> None:
     )
     normal_text, calls = _stream(detector, _chunks(text, chunk_size), tools)
     assert normal_text == "Hello!"
-    assert len(calls) == 1
-    assert calls[0].name == "python"
-    assert json.loads(calls[0].parameters) == {"code": "print(2)"}
+    assembled = _assemble(calls)
+    assert list(assembled) == [0]
+    assert assembled[0]["name"] == "python"
+    # Concatenated deltas must be byte-identical to the non-streaming output.
+    assert assembled[0]["parameters"] == json.dumps(
+        {"code": "print(2)"}, ensure_ascii=False
+    )
 
 
 def test_streaming_two_calls() -> None:
@@ -177,10 +195,11 @@ def test_streaming_two_calls() -> None:
         + TOOLS_CLOSE
     )
     _, calls = _stream(detector, _chunks(text, 7), tools)
-    assert [call.tool_index for call in calls] == [0, 1]
-    assert [json.loads(call.parameters) for call in calls] == [
-        {"code": "a"},
-        {"code": "b"},
+    assembled = _assemble(calls)
+    assert sorted(assembled) == [0, 1]
+    assert [assembled[i]["parameters"] for i in (0, 1)] == [
+        json.dumps({"code": "a"}, ensure_ascii=False),
+        json.dumps({"code": "b"}, ensure_ascii=False),
     ]
 
 
@@ -208,6 +227,126 @@ def test_streaming_bookkeeping_for_serving_layer() -> None:
     assert json.loads(detector.streamed_args_for_tool[0]) == {"code": "a"}
 
 
+def test_streaming_name_emitted_at_call_open() -> None:
+    """The tool name must be emitted as soon as the call open tag completes,
+    before any argument bytes arrive."""
+    detector = KimiK3Detector()
+    tools = [_make_tool("python")]
+    open_tag = '<|open|>call tool="python" index="1"<|sep|>'
+    text, calls = _stream(detector, _chunks(TOOLS_OPEN + open_tag, 7), tools)
+    assert text == ""
+    assert len(calls) == 1
+    assert calls[0].tool_index == 0
+    assert calls[0].name == "python"
+    assert calls[0].parameters == ""
+
+
+def test_streaming_arguments_flow_before_call_close() -> None:
+    """Regression test for the buffered-until-close bug: argument deltas must
+    arrive while the call is still open, not only after <|close|>call."""
+    detector = KimiK3Detector()
+    tools = [_make_tool("write_file")]
+    body = "x" * 500  # long enough that several chunks carry argument text
+    block = _call_block("write_file", 1, {"content": ("string", body)})
+    call_close = "<|close|>call<|sep|>"
+    head, _ = block.split(call_close)
+    # Stream everything except the final <|close|>call<|sep|>.
+    text, calls = _stream(detector, _chunks(TOOLS_OPEN + head, 11), tools)
+    assert text == ""
+    streamed_params = "".join(call.parameters for call in calls)
+    assert streamed_params != "", "no argument deltas arrived before call close"
+    assert streamed_params.startswith('{"content": "')
+    # Now close the call and check final assembly.
+    _, tail_calls = _stream(detector, [call_close, TOOLS_CLOSE], tools)
+    calls.extend(tail_calls)
+    assembled = _assemble(calls)
+    assert assembled[0]["name"] == "write_file"
+    assert assembled[0]["parameters"] == json.dumps(
+        {"content": body}, ensure_ascii=False
+    )
+
+
+@pytest.mark.parametrize("chunk_size", [1, 7, 23])
+def test_streaming_deltas_byte_identical_with_tricky_content(
+    chunk_size: int,
+) -> None:
+    """Concatenated deltas must equal json.dumps(arguments) exactly, even with
+    quotes, newlines, unicode, and text that looks like a partial marker."""
+    detector = KimiK3Detector()
+    tools = [_make_tool("python")]
+    args = {
+        "code": 'print("héllo\\nworld") 😀',
+        "tricky": "ends with partial <|close|>argument plus more",
+        "n": ("number", "42"),
+        "flag": ("boolean", "true"),
+        "obj": ("object", '{"a": [1, 2]}'),
+        "bad": ("object", "{not json"),
+    }
+    block = _call_block(
+        "python",
+        1,
+        {
+            "code": ("string", args["code"]),
+            "tricky": ("string", args["tricky"]),
+            "n": args["n"],
+            "flag": args["flag"],
+            "obj": args["obj"],
+            "bad": args["bad"],
+        },
+    )
+    expected = {
+        "code": args["code"],
+        "tricky": args["tricky"],
+        "n": 42,
+        "flag": True,
+        "obj": {"a": [1, 2]},
+        "bad": "{not json",
+    }
+    text = TOOLS_OPEN + block + TOOLS_CLOSE
+    _, calls = _stream(detector, _chunks(text, chunk_size), tools)
+    assembled = _assemble(calls)
+    assert assembled[0]["parameters"] == json.dumps(expected, ensure_ascii=False)
+    # ... and it matches the non-streaming path exactly.
+    non_streaming = KimiK3Detector().detect_and_parse(text, tools)
+    assert assembled[0]["parameters"] == non_streaming.calls[0].parameters
+
+
+def test_streaming_non_string_arg_buffered_until_close() -> None:
+    """Non-string argument values are decoded at their close tag; the value
+    must not be streamed before it."""
+    detector = KimiK3Detector()
+    tools = [_make_tool("python")]
+    block = _call_block("python", 1, {"code": ("string", "a"), "n": ("number", "42")})
+    arg_close = "<|close|>argument<|sep|>"
+    parts = block.split(arg_close)
+    assert len(parts) == 3  # two arguments, each with a close tag
+    head = parts[0] + arg_close + parts[1]  # up to, excluding, n's close tag
+    tail = arg_close + parts[2]
+    # Stream up to (excluding) the number argument's close tag.
+    _, calls = _stream(detector, _chunks(TOOLS_OPEN + head, 9), tools)
+    assembled = _assemble(calls)
+    assert assembled[0]["parameters"].endswith(', "n": ')
+    # After the close tag the decoded value streams as one delta.
+    _, tail_calls = _stream(detector, [arg_close + tail], tools)
+    calls.extend(tail_calls)
+    assembled = _assemble(calls)
+    assert json.loads(assembled[0]["parameters"]) == {"code": "a", "n": 42}
+
+
+def test_streaming_zero_arg_call() -> None:
+    detector = KimiK3Detector()
+    tools = [_make_tool("ping")]
+    text = (
+        TOOLS_OPEN
+        + '<|open|>call tool="ping" index="1"<|sep|><|close|>call<|sep|>'
+        + TOOLS_CLOSE
+    )
+    _, calls = _stream(detector, _chunks(text, 5), tools)
+    assembled = _assemble(calls)
+    assert assembled[0]["name"] == "ping"
+    assert assembled[0]["parameters"] == "{}"
+
+
 def test_stream_end_reports_truncated_tools_section(caplog) -> None:
     """A tools section cut off before its closing tag used to vanish at
     end-of-stream: no call, no text, no log. It must at least be reported."""
@@ -215,7 +354,10 @@ def test_stream_end_reports_truncated_tools_section(caplog) -> None:
     tools = [_make_tool("python")]
     truncated = TOOLS_OPEN + '<|open|>call tool="python" index="1"<|sep|>'
     text, calls = _stream(detector, _chunks(truncated, 7), tools)
-    assert calls == []
+    # The name is emitted as soon as the call open tag completes, even though
+    # the call itself never completes.
+    assert [call.name for call in calls] == ["python"]
+    assert [call.parameters for call in calls] == [""]
     with caplog.at_level("WARNING", logger="sglang.srt.function_call.kimik3_detector"):
         result = detector.finish(tools)
     assert result.calls == []
