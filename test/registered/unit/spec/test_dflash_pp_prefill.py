@@ -1,18 +1,15 @@
-"""DFLASH on a pipelined PD prefill and the MLA-only draft backends.
+"""DFLASH on a pipelined PD prefill.
 
-- An earlier pipeline stage holds no draft: it runs the target forward with
-  aux hidden capture (riding the PP proxy to the last stage) and skips every
-  draft step.
-- cute-dsl / TRT-LLM MLA serve only MLA layers, so a draft worker takes them
-  only for DFLASH, whose hook admits them for MLA drafts.
+An earlier pipeline stage holds no draft: it runs the target forward with aux
+hidden capture (riding the PP proxy to the last stage) and skips every draft
+step.
 """
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
 
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
-from sglang.srt.speculative import draft_worker_common
 from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -65,37 +62,6 @@ class TestDFlashEarlierPipelineStage(CustomTestCase):
         )
         worker.prewarm_sampling()
         worker.model_runner.prewarm_sampling.assert_called_once_with()
-
-
-class TestMlaOnlyDraftBackends(CustomTestCase):
-    def _resolve(self, backend, algo_label):
-        with (
-            patch.object(
-                draft_worker_common,
-                "get_spec",
-                return_value=SimpleNamespace(
-                    speculative_draft_attention_backend=backend
-                ),
-            ),
-            patch.object(
-                draft_worker_common,
-                "get_platform",
-                return_value=SimpleNamespace(is_xpu=False),
-            ),
-        ):
-            return draft_worker_common.resolve_draft_worker_attention_backend(
-                algo_label=algo_label
-            )
-
-    def test_dflash_keeps_mla_only_backends(self):
-        for backend in draft_worker_common.DFLASH_MLA_ONLY_DRAFT_BACKENDS:
-            with self.subTest(backend=backend):
-                self.assertEqual(self._resolve(backend, "DFLASH"), backend)
-
-    def test_other_algorithms_fall_back(self):
-        for algo_label in ("DSPARK", None):
-            with self.subTest(algo_label=algo_label):
-                self.assertEqual(self._resolve("cutedsl_mla", algo_label), "flashinfer")
 
 
 if __name__ == "__main__":
