@@ -6,6 +6,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
+from sglang._lazy_import import LazyImport
 from sglang.kernels.ops.sampling import argmax as sampler_argmax
 from sglang.kernels.ops.sampling import softmax as sampler_softmax
 from sglang.kernels.ops.sampling.murmur_hash import murmur_hash32
@@ -26,8 +27,8 @@ from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.utils.async_probe import maybe_detect_nan, sanitize_nan_logits
-from sglang.srt.utils.common import (
-    get_bool_env_var,
+from sglang.srt.utils.common import get_bool_env_var
+from sglang.srt.utils.device import (
     is_cuda,
     is_gfx1250_supported,
     is_hip,
@@ -35,7 +36,6 @@ from sglang.srt.utils.common import (
     is_npu,
     is_xpu,
 )
-from sglang.utils import LazyImport
 
 if is_cuda():
     from sglang.srt.layers.sampling_renorm import (
@@ -82,7 +82,7 @@ if is_npu():
 
 logger = logging.getLogger(__name__)
 
-SYNC_TOKEN_IDS_ACROSS_TP = get_bool_env_var("SYNC_TOKEN_IDS_ACROSS_TP")
+SYNC_TOKEN_IDS_ACROSS_TP = envs.SGLANG_SYNC_TOKEN_IDS_ACROSS_TP.get()
 SGLANG_RETURN_ORIGINAL_LOGPROB = get_bool_env_var("SGLANG_RETURN_ORIGINAL_LOGPROB")
 _CUSTOM_SAMPLER_FACTORIES: Dict[str, Callable[[], "Sampler"]] = {}
 
@@ -724,11 +724,14 @@ class Sampler(nn.Module):
             # sampling_renorm.py). Enable this when TP ranks still desynchronize. Grammar
             # always syncs: xgrammar makes it likely.
 
-            torch.distributed.all_reduce(
-                batch_next_token_ids,
-                op=dist.ReduceOp.MIN,
-                group=self.tp_sync_group,
-            )
+            # A 1-rank all-reduce is the identity, but its first call lazily creates
+            # the communicator, which stalls the first grammar batch after startup.
+            if dist.get_world_size(self.tp_sync_group) > 1:
+                torch.distributed.all_reduce(
+                    batch_next_token_ids,
+                    op=dist.ReduceOp.MIN,
+                    group=self.tp_sync_group,
+                )
 
     def compute_logprobs_only(
         self,

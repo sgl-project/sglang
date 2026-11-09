@@ -45,6 +45,12 @@ For how to launch the image, see [Install → Method 3: Using Docker](/docs/get-
 
 Pick your hardware to generate the launch command. SGLang selects the `unlimited_ocr_v2` attention backend, the page size the checkpoint requires and a disabled radix cache on its own, so the recipe only carries the serving options: the `unlimited-ocr` chat template, explicit page-window processing with `--uocr-doc-split`, a per-page output budget, and decode CUDA graphs, which are off by default for this model. The built-in page guard runs automatically; `--enable-custom-logit-processor` is only needed for an external custom processor.
 
+The command panel provides Python and Docker recipes for **L20, H100, H200, B200, B300, GB200 and GB300**. These recipes target **Linux with NVIDIA GPUs and CUDA 13**; Docker also requires a CUDA 13-compatible driver and NVIDIA Container Toolkit. Each recipe starts with one GPU on one node, including on GB200/GB300 systems.
+
+<Note>
+The additional platforms are starting recipes marked **Not Verified**. H200 TP1 and B200 TP1/TP2 have passed service checks with a smaller per-page output budget and bounded concurrency/CUDA-graph sizes; these exact 8,000-token/page recipes remain unverified. H100, B300, GB200 and GB300 have not been tested for this model here.
+</Note>
+
 import { Deployment } from "/src/snippets/_deployment.jsx";
 import { config } from "/src/snippets/configs/baidu/unlimited-ocr-2.jsx";
 
@@ -52,7 +58,7 @@ import { config } from "/src/snippets/configs/baidu/unlimited-ocr-2.jsx";
 
 ## Playground
 
-Use the Playground to adjust tensor parallelism on top of the selected deployment cell.
+Use the Playground to adjust tensor parallelism on top of the selected deployment cell. TP2 requires two visible GPUs on the same node; it does not enable multi-node serving. The platform badge describes the base recipe, not every Playground override.
 
 import { Playground } from "/src/snippets/_playground.jsx";
 
@@ -70,6 +76,8 @@ The checkpoint has about 3.3B parameters in BF16 (a DeepSeek-style MoE language 
 
 ## 2. Configuration Tips
 
+- **GPU memory:** for an out-of-memory error, first reduce `--max-running-requests` and `--cuda-graph-max-bs-decode` together, for example to 4. The recipes keep BF16 weights and the checkpoint's KV-cache precision. Reduce the per-page budget only when shorter output is acceptable; it can truncate a page.
+- **Attention backend:** keep the model-selected `unlimited_ocr_v2` backend on every platform, including Blackwell, because the model requires DASH attention.
 - **Prompt layout**: list the page images first, then one text part holding `<PAGE><image>` once per page followed by the instruction, for example `"<PAGE><image>" * num_pages + "Multi page parsing."`.
 - **Whole-document processing is the default.** Omit `--uocr-doc-split` to process the document together, within the configured context length.
 - **Page-window processing is opt-in.** The deployment recipe enables `--uocr-doc-split` for long documents. `--uocr-doc-page-window N` sets the maximum pages each window transcribes in every image mode (default 1). Later windows reuse the preceding window's KV tail. This changes the available context and is approximate; it is not a lossless replacement for whole-document inference. The client still sends one request and receives one response or stream, with `metadata.doc_split_*` describing the processing.
