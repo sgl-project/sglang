@@ -488,7 +488,7 @@ def initialize_bf16_gemm_config() -> None:
             from flashinfer.gemm import mm_bf16
 
             _mm_bf16 = mm_bf16
-            _flashinfer_autotuner = AutoTuner
+            _flashinfer_autotuner = AutoTuner.get()
 
     _BF16_GEMM_BACKEND = backend
 
@@ -560,12 +560,16 @@ def _bf16_low_m_autotune(
 ) -> Optional[torch.Tensor]:
     """Run bias-free M <= 16 through FlashInfer's autotuned CuTe DSL kernels; None if not taken.
 
-    Inside FlashInfer autotune, every other eligible call profiles the M <= 16 buckets
-    bias-free instead, so TP ranks make the same tuning calls wherever the bias lives.
+    Under FlashInfer autotune, every other eligible call profiles M <= 16 bias-free.
     """
+    if _mm_bf16 is None:
+        return None
+    m = x.numel() // x.shape[-1]
+    taken = bias is None and 0 < m <= _BF16_LOW_M_AUTOTUNE_MAX_M
+    if not (taken or (m > 0 and _flashinfer_autotuner.is_tuning_mode)):
+        return None
     if not (
-        _mm_bf16 is not None
-        and x.is_cuda
+        x.is_cuda
         and x.dtype == torch.bfloat16
         and weight.dtype == torch.bfloat16
         and x.is_contiguous()
@@ -574,20 +578,15 @@ def _bf16_low_m_autotune(
         and not weight.requires_grad
     ):
         return None
-    x_2d = x.view(-1, x.shape[-1])
-    m = x_2d.shape[0]
-    if bias is None and 0 < m <= _BF16_LOW_M_AUTOTUNE_MAX_M:
-        output = _mm_bf16(x_2d, weight.T, None, pdl=True, out=out, backend="cute-dsl")
-        return output.view(*x.shape[:-1], weight.shape[0])
-    if m > 0 and _flashinfer_autotuner.get().is_tuning_mode:
-        _mm_bf16(
-            x_2d[:_BF16_LOW_M_AUTOTUNE_MAX_M],
-            weight.T,
-            None,
-            pdl=True,
-            backend="cute-dsl",
-        )
-    return None
+    output = _mm_bf16(
+        x.view(-1, x.shape[-1])[:_BF16_LOW_M_AUTOTUNE_MAX_M],
+        weight.T,
+        None,
+        pdl=True,
+        out=out if taken else None,
+        backend="cute-dsl",
+    )
+    return output.view(*x.shape[:-1], weight.shape[0]) if taken else None
 
 
 def _bf16_gemm_dispatch_impl(
@@ -675,7 +674,7 @@ def _can_accumulate_into_addend(
 
 
 def bf16_gemm_needs_autotune() -> bool:
-    return get_bf16_gemm_backend().is_cutedsl() and get_platform().device_sm != 107
+    return _mm_bf16 is not None
 
 
 def get_bf16_gemm_backend() -> Bf16GemmBackend:

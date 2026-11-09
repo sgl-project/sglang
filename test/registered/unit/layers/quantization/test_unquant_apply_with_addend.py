@@ -12,6 +12,7 @@ register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-small")
 
 import unittest
 from contextlib import ExitStack
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -209,27 +210,16 @@ class TestApplyWithAddend(CustomTestCase):
             self.assertEqual(kernel_calls, [route])
 
 
-class _TuningAutoTuner:
-    class _Tuner:
-        is_tuning_mode = True
-
-    @staticmethod
-    def get():
-        return _TuningAutoTuner._Tuner()
-
-
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
 class TestLowMAutotuneRankSymmetry(CustomTestCase):
     @torch.no_grad()
     def test_bias_only_on_one_rank_makes_the_same_tuning_calls(self):
         """FlashInfer syncs each tuning call across TP ranks, and RowParallelLinear
         passes its bias on rank 0 only; differing calls deadlock server startup."""
-        weight = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
         projection = ReplicatedLinear(
             128, 128, bias=False, params_dtype=torch.bfloat16
         ).cuda()
         projection.weight.requires_grad_(False)
-        projection.weight.copy_(weight)
         rank0_bias = torch.nn.Parameter(
             torch.randn(128, device="cuda", dtype=torch.bfloat16)
         )
@@ -247,7 +237,11 @@ class TestLowMAutotuneRankSymmetry(CustomTestCase):
                     unquant, "_BF16_GEMM_BACKEND", unquant.Bf16GemmBackend.CUTEDSL
                 ),
                 patch.object(unquant, "_mm_bf16", fake_mm_bf16),
-                patch.object(unquant, "_flashinfer_autotuner", _TuningAutoTuner),
+                patch.object(
+                    unquant,
+                    "_flashinfer_autotuner",
+                    SimpleNamespace(is_tuning_mode=True),
+                ),
             ):
                 projection.quant_method.apply(projection, x, bias)
             return calls
