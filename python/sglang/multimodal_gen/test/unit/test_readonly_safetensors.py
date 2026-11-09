@@ -7,7 +7,6 @@ from safetensors.torch import load_file, save_file
 from sglang.multimodal_gen.runtime.loader.readonly_safetensors import (
     iter_safetensors_readonly,
     load_safetensors_readonly,
-    safetensors_keys,
 )
 
 
@@ -33,7 +32,6 @@ def test_readonly_load_matches_safetensors(tmp_path):
         assert ours[name].dtype == theirs[name].dtype
         assert ours[name].shape == theirs[name].shape
         assert torch.equal(ours[name], theirs[name])
-    assert safetensors_keys(str(path)) == list(theirs)
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="/proc/self/maps")

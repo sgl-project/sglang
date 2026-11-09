@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import logging
 from array import array
 from typing import Iterable, List, Optional, Tuple, Union
 
@@ -27,14 +28,10 @@ from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternTokenPairs,
     general_mm_embed_routine,
+    pad_mm_token_pairs,
 )
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalInputs,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_janus_pro import DropPath
@@ -47,9 +44,11 @@ from sglang.srt.multimodal.internvl_vit_cuda_graph_runner import (
     InternViTCudaGraphRunner,
 )
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_vision_model
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.runtime_context import get_mm
 from sglang.srt.utils import is_cuda
-from sglang.utils import logger
+
+logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
 
@@ -678,9 +677,10 @@ class InternVLChatModel(nn.Module):
         im_end_id: int = mm_inputs.im_end_id
 
         media_token_pairs = [(im_start_id, im_end_id)]
-        helper = MultiModalityDataPaddingPatternTokenPairs(media_token_pairs)
 
-        return helper.pad_input_tokens(input_ids, mm_inputs)
+        return pad_mm_token_pairs(
+            input_ids, mm_inputs, data_token_pairs=media_token_pairs
+        )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         expert_params_mapping = []
