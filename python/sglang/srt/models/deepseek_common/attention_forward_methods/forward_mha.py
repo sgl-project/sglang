@@ -690,6 +690,13 @@ class DeepseekMHAForwardMixin:
             kv_a = kv_a.squeeze(1).contiguous()
             return kv_a, k_pe
 
+        if (
+            _is_cuda
+            and self.dcp_size == 1
+            and not getattr(get_token_to_kv_pool(), "dsa_kv_cache_store_fp8", True)
+        ):
+            return self._get_mla_kv_buffer(kv_indices, torch.bfloat16, forward_batch)
+
         kv_cache_fp8 = get_kv_layers().read(self.attn_mha.layer_id).key()
 
         kv_latent_bf16 = dequantize_k_cache_paged_dsa(kv_cache_fp8, kv_indices)
