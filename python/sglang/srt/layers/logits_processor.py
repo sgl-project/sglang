@@ -109,7 +109,10 @@ _autotune_run_lm_head: Optional[bool] = None
 
 
 def _runtime_optimized_vocab_shards_enabled() -> bool:
-    return envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
+    return (
+        envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
+        or envs.SGLANG_ENABLE_SHARDED_VERIFY.get()
+    )
 
 
 # Target-verify logits formats a graph runner captures for a sharded-verify processor.
@@ -580,10 +583,13 @@ class LogitsProcessor(nn.Module):
         )
         # A speculative worker must explicitly opt in after establishing that
         # its verify consumer understands ``next_token_logits_vocab_shard``.
-        # UNO, DSpark, and out-of-tree consumers otherwise retain the stock
-        # full-vocabulary gather even when the runtime master switch is on.
+        # UNO and out-of-tree consumers otherwise retain the stock full-vocabulary
+        # gather even when the runtime master switch is on; DSpark opts in only
+        # under SGLANG_ENABLE_SHARDED_VERIFY.
         self.sharded_verify = False
         self._sharded_verify_temperature_keys = False
+        # Target-verify logits formats a graph runner captures once opted in.
+        self.verify_logits_variants = VERIFY_LOGITS_VARIANTS
         self.final_logit_softcapping = getattr(
             self.config, "final_logit_softcapping", None
         )
@@ -630,14 +636,22 @@ class LogitsProcessor(nn.Module):
             self.vocab_size, chunking_group=chunking_group
         )
 
-    def enable_sharded_verify(self, *, temperature_keys: bool = False) -> None:
+    def enable_sharded_verify(
+        self, *, temperature_keys: bool = False, full_logits_graphs: bool = True
+    ) -> None:
         """Opt in a verify consumer that understands vocab-shard outputs.
 
         temperature_keys: the bound local key policy may serve temperature rows;
         the stock policy serves greedy rows only.
+        full_logits_graphs: graph runners also capture a full-logits verify graph
+        per batch size. Without it every verify graph keeps the shards, and the
+        consumer gathers the rows of a batch that needs the whole vocabulary.
         """
         self.sharded_verify = self._sharded_verify_eligible
         self._sharded_verify_temperature_keys = temperature_keys
+        self.verify_logits_variants = (
+            VERIFY_LOGITS_VARIANTS if full_logits_graphs else (VERIFY_VOCAB_SHARDS,)
+        )
 
     def verify_uses_vocab_shards(self, forward_batch: ForwardBatch) -> bool:
         """Whether this target verify keeps its logits as vocabulary shards.

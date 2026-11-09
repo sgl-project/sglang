@@ -602,12 +602,14 @@ class AcceptGreedy:
         target_logits: torch.Tensor,
         verify_num_draft_tokens: int,
         cutoff_verify_lens: Optional[torch.Tensor] = None,
+        target_predict: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return accept_greedy(
             candidates=candidates,
             target_logits=target_logits,
             verify_num_draft_tokens=verify_num_draft_tokens,
             cutoff_verify_lens=cutoff_verify_lens,
+            target_predict=target_predict,
         )
 
     @classmethod
@@ -618,13 +620,28 @@ class AcceptGreedy:
         target_logits: torch.Tensor,
         verify_num_draft_tokens: int,
         cutoff_verify_lens: Optional[torch.Tensor] = None,
+        target_predict: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return accept_greedy_triton(
             candidates=candidates,
             target_logits=target_logits,
             verify_num_draft_tokens=verify_num_draft_tokens,
             cutoff_verify_lens=cutoff_verify_lens,
+            target_predict=target_predict,
         )
+
+
+def _greedy_target_predict(
+    target_logits: torch.Tensor,
+    target_predict: Optional[torch.Tensor],
+    bs: int,
+    verify_num_draft_tokens: int,
+) -> torch.Tensor:
+    """The target's greedy token per verify row: ``target_predict`` when the caller
+    already picked it (e.g. from vocabulary-sharded logits), else the row argmax."""
+    if target_predict is None:
+        target_predict = sampling_argmax(target_logits)
+    return target_predict.view(bs, verify_num_draft_tokens)
 
 
 def accept_greedy(
@@ -633,9 +650,12 @@ def accept_greedy(
     target_logits: torch.Tensor,
     verify_num_draft_tokens: int,
     cutoff_verify_lens: Optional[torch.Tensor] = None,
+    target_predict: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     bs = candidates.shape[0]
-    target_predict = sampling_argmax(target_logits).view(bs, verify_num_draft_tokens)
+    target_predict = _greedy_target_predict(
+        target_logits, target_predict, bs, verify_num_draft_tokens
+    )
     correct_len, bonus = compute_dflash_correct_drafts_and_bonus(
         candidates=candidates,
         target_predict=target_predict,
@@ -683,9 +703,12 @@ def accept_greedy_triton(
     target_logits: torch.Tensor,
     verify_num_draft_tokens: int,
     cutoff_verify_lens: Optional[torch.Tensor] = None,
+    target_predict: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     bs = candidates.shape[0]
-    target_predict = sampling_argmax(target_logits).view(bs, verify_num_draft_tokens)
+    target_predict = _greedy_target_predict(
+        target_logits, target_predict, bs, verify_num_draft_tokens
+    )
     correct_len, bonus = compute_dflash_correct_drafts_and_bonus(
         candidates=candidates,
         target_predict=target_predict,

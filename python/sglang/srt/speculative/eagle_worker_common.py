@@ -38,7 +38,7 @@ from sglang.srt.speculative.spec_utils import (
     record_stream_each,
     record_stream_for_v2_verify,
 )
-from sglang.srt.utils import is_cpu
+from sglang.srt.utils import is_cpu, is_cuda
 from sglang.srt.utils.async_probe import (
     maybe_detect_inf,
     maybe_detect_nan,
@@ -146,6 +146,9 @@ def bind_eagle_runtime_hooks(
     ]
     if (
         supports_sharded_verify
+        # eagle_sample reads the shards on CUDA only; elsewhere it would gather
+        # every verify after capturing a second logits format for nothing.
+        and is_cuda()
         and type(model).__name__ in _SHARDED_VERIFY_TARGET_MODEL_CLASSES
         and len(processors) == 1
     ):

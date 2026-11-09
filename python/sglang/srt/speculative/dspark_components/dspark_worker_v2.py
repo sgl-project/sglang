@@ -9,7 +9,9 @@ from sglang.kernels.ops.speculative.dspark.blockwise_rejection import (
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_dp_tp_group
+from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
+from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -79,8 +81,14 @@ from sglang.srt.speculative.dspark_components.dspark_verify import (
     CommitInjectCtx,
     DsparkVerifyEpilogue,
     TargetVerifyExecutor,
+    _accepts_on_shards,
     target_model_type,
     verify_logits_adjustments_are_noop,
+)
+from sglang.srt.speculative.sharded_verify import (
+    VocabShard,
+    sampling_allows_vocab_shards,
+    spec_allows_vocab_shards,
 )
 from sglang.srt.speculative.spec_sampling_mask import (
     SpeculativeSamplingMaskCapture,
@@ -152,11 +160,43 @@ def sim_draw_ahead_enabled(simulated_correct_len: Optional[torch.Tensor]) -> boo
     )
 
 
+# Targets whose DSpark verify was validated on vocabulary-sharded logits.
+_SHARDED_VERIFY_DSPARK_TARGETS = frozenset({"deepseek_v41"})
+
+
+def target_vocab_shards_refusal(
+    *,
+    tp_size: int,
+    model_type: Optional[str],
+    processors: list[LogitsProcessor],
+    simulate_acc_len: float,
+    observers_read_logits: bool,
+) -> Optional[str]:
+    """Why DSpark verify must keep the stock gathered target logits, or None."""
+    if tp_size <= 1:
+        return "TP 1 has no target gather"
+    if model_type not in _SHARDED_VERIFY_DSPARK_TARGETS:
+        return f"target {model_type} is not validated"
+    if len(processors) != 1:
+        return f"the target has {len(processors)} logits processors"
+    if processors[0].final_logit_softcapping is not None:
+        return "final logit softcapping needs the gathered rows"
+    if simulate_acc_len > 0:
+        return "SGLANG_SIMULATE_ACC_LEN reads the gathered rows"
+    if observers_read_logits:
+        return "a verify observer reads the gathered rows"
+    return None
+
+
 class DSparkWorkerV2(BaseSpecWorker):
     """Non-last PP stages run only the target; draft state belongs to the last stage."""
 
     _sampling_accept_graph = None
     _rejection_noise = None
+    # SGLANG_ENABLE_SHARDED_VERIFY: the target LM head's vocabulary shard when the
+    # verify keeps its logits there, and whether sampled rows may use it.
+    _target_vocab_shard: Optional[VocabShard] = None
+    _target_temperature_keys = False
     _sim_draw_ahead = False
     num_sim_draws_ahead = 0
     _prepare_inputs_once = False
@@ -516,9 +556,98 @@ class DSparkWorkerV2(BaseSpecWorker):
             device=self.device,
             simulate_acc_len=self._simulate_acc_len,
         )
+        self._target_vocab_shard = self._enable_target_vocab_shards()
 
         if self._is_pd_prefill and not self._draft_is_moe:
             self.draft_model.prune_to_ctx_kv_injection()
+
+    def _enable_target_vocab_shards(self) -> Optional[VocabShard]:
+        """SGLANG_ENABLE_SHARDED_VERIFY; must run before the target's verify graphs
+        are captured, which then all keep this rank's vocabulary shard."""
+        if not envs.SGLANG_ENABLE_SHARDED_VERIFY.get():
+            return None
+        model = self.target_worker.model_runner.model
+        processors = [m for m in model.modules() if isinstance(m, LogitsProcessor)]
+        refusal = target_vocab_shards_refusal(
+            tp_size=get_parallel().tp_size,
+            model_type=target_model_type(self.target_worker),
+            processors=processors,
+            simulate_acc_len=self._simulate_acc_len,
+            observers_read_logits=self._observers.reads_target_logits,
+        )
+        if refusal is None and not (
+            isinstance(model.lm_head, VocabParallelEmbedding)
+            and not model.lm_head.shard_indices.num_added_elements_padded
+        ):
+            refusal = "the LM head has no plain vocabulary shard"
+        if refusal is None:
+            indices = model.lm_head.shard_indices
+            shard = VocabShard(
+                start=indices.org_vocab_start_index,
+                valid=indices.num_org_elements,
+                vocab_size=processors[0].vocab_size,
+            )
+            draft_shard = None
+            if self._sharded_accept:
+                draft_shard = self.draft_model.markov_head.vocab_shard
+            # Sampled rows run the sharded chain rule straight on the target shard.
+            self._target_temperature_keys = (
+                draft_shard is not None
+                and (draft_shard.start, draft_shard.width) == (shard.start, shard.valid)
+                and not get_spec().speculative_use_block_verification
+                and self._rejection_noise is None
+            )
+            processors[0].enable_sharded_verify(
+                temperature_keys=self._target_temperature_keys,
+                full_logits_graphs=False,
+            )
+            if not processors[0].sharded_verify:
+                refusal = "the target gathers its logits through another group"
+        if refusal is not None:
+            self._target_temperature_keys = False
+            if self._target_tp_rank == 0:
+                logger.warning("DSpark target vocab shards off: %s.", refusal)
+            return None
+        # The sampling-accept region replays an accept that reads full rows.
+        self._sampling_accept_graph = None
+        if self._target_tp_rank == 0:
+            logger.info(
+                "DSpark verify keeps the target logits on the vocab shards "
+                "(sampled rows too: %s): %s",
+                self._target_temperature_keys,
+                shard,
+            )
+        return shard
+
+    def _keeps_target_vocab_shards(self, *, batch, sampling_info, draft_block) -> bool:
+        """Whether this step consumes the target logits on the vocabulary shards;
+        every TP rank must decide alike, so only batch-uniform inputs are read."""
+        if self._target_vocab_shard is None:
+            return False
+        if batch.has_grammar or batch.return_logprob:
+            return False
+        if sampling_info is None:
+            return True
+        if (
+            sampling_info.has_watermark_candidates
+            or sampling_info.sampling_mask_batch_indices is not None
+            or not verify_logits_adjustments_are_noop(sampling_info)
+        ):
+            return False
+        spec = get_spec()
+        temperature_keys = (
+            self._target_temperature_keys
+            # request seeds stay on the gathered path, as in the logits processor
+            and sampling_info.sampling_seed is None
+            and _accepts_on_shards(
+                draft_block=draft_block,
+                sampling_info=sampling_info,
+                block_verification=spec.speculative_use_block_verification,
+            )
+        )
+        return sampling_allows_vocab_shards(
+            sampling_info, return_logprob=False, has_local_keys=temperature_keys
+        ) and spec_allows_vocab_shards(spec)
 
     def _resolve_target_embed_tokens(self, target_model):
         if hasattr(target_model, "get_input_embeddings"):
@@ -1155,6 +1284,11 @@ class DSparkWorkerV2(BaseSpecWorker):
                         else simulate_bonus_sampling_info.temperatures[:bs]
                     ),
                 )
+        # A batch that needs full target rows gathers them right after the forward,
+        # before any logit adjustment reads them.
+        keep_target_shards = self._keeps_target_vocab_shards(
+            batch=batch, sampling_info=sampling_info, draft_block=draft_block
+        )
         with self._observers.segment(InfoSegment.TARGET_VERIFY):
             if run_compact:
                 target_verify, hidden_strided = self._verify_executor.run_compact(
@@ -1167,6 +1301,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                     sampling_info=sampling_info,
                     verify_window=verify_window,
                     inject_gate=fold_eligible,
+                    keep_target_shards=keep_target_shards,
                 )
             else:
                 if (
@@ -1180,6 +1315,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                     verify_ids_2d=verify_ids_2d,
                     verify_window=verify_window,
                     sampling_info=sampling_info,
+                    keep_target_shards=keep_target_shards,
                 )
                 hidden_strided = None
         logits_output = target_verify.logits_output
@@ -1248,6 +1384,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 prefix_lens=prefix_lens,
                 draft_tokens=draft_tokens,
                 simulate_bonus_sampling_info=simulate_bonus_sampling_info,
+                target_shard=logits_output.next_token_logits_vocab_shard,
             )
         if watermark_rows is not None:
             self.target_worker.model_runner.watermark_state.commit_speculative_chain(

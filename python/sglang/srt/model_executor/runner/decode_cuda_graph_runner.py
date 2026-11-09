@@ -61,7 +61,6 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.logits_processor import (
     VERIFY_FULL_LOGITS,
-    VERIFY_LOGITS_VARIANTS,
     VERIFY_VOCAB_SHARDS,
     LogitsProcessor,
     LogitsProcessorOutput,
@@ -437,7 +436,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     tokens_per_request=self.captured_req_width,
                 )
             )
-        # A sharded-verify target captures both logits formats; each batch picks one.
+        # A sharded-verify target captures the logits formats its consumer asked for
+        # (both by default); each batch picks one.
         self._verify_logits_processor = (
             _sharded_verify_logits_processor(model_runner.model)
             if self.capture_forward_mode == ForwardMode.TARGET_VERIFY
@@ -445,7 +445,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             else None
         )
         self.logits_graph_variants = (
-            VERIFY_LOGITS_VARIANTS
+            self._verify_logits_processor.verify_logits_variants
             if self._verify_logits_processor is not None
             else (None,)
         )
@@ -797,7 +797,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             return None
         # The full-logits graph gathers the vocabulary of every padding row too;
         # a padded replay keeps shards so the consumer gathers only real rows.
-        if padded or processor.verify_uses_vocab_shards(forward_batch):
+        if (
+            padded
+            or VERIFY_FULL_LOGITS not in self.logits_graph_variants
+            or processor.verify_uses_vocab_shards(forward_batch)
+        ):
             return VERIFY_VOCAB_SHARDS
         return VERIFY_FULL_LOGITS
 

@@ -284,6 +284,10 @@ class Envs:
     SGLANG_ENABLE_TORCH_INFERENCE_MODE = EnvBool(False)
     # Explicit child values override this default for megakernel runtime optimizations.
     SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION = EnvBool(False)
+    # Target verify keeps its logits on the vocabulary shards (sharded_verify.py)
+    # without the rest of the runtime master above. A verify consumer still opts
+    # in: EAGLE on CUDA, and DSpark only under this switch.
+    SGLANG_ENABLE_SHARDED_VERIFY = EnvBool(False)
 
     # ===================================================================
     # Model configuration, discovery, and weight loading
