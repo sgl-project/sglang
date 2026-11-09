@@ -21,7 +21,7 @@ from sglang.test.kernels.deepseek_v4.k_cache_reference import (
 )
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 # (num_tokens, page_size): tails of 0/1/3 modulo the kernel's 4 tokens per
 # program, both cache page sizes the pool uses, and a many-page gather.

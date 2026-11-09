@@ -12,6 +12,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
+from sglang._lazy_import import LazyImport
 from sglang.kernels.ops.layernorm.norm import (
     can_use_fused_inplace_qknorm as can_use_jit_qk_norm,
 )
@@ -40,7 +41,6 @@ from sglang.srt.utils.multi_stream_utils import (
     maybe_execute_in_parallel,
     with_multi_stream,
 )
-from sglang.utils import LazyImport
 
 _is_cpu = is_cpu()
 _is_cuda = is_cuda()
@@ -98,7 +98,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import apply_rotary_pos_emb
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_pos_emb_native_eager
-from sglang.srt.utils import add_prefix
+from sglang.srt.layers.utils.common import add_prefix
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
@@ -147,6 +147,11 @@ class VisionAttentionMetadata:
     seq_lens: torch.Tensor
     max_seqlen: int
 
+    # Cumulative sequence ends for Ascend FIA; excludes the leading zero.
+    # Read-only by convention; prepared once per vision forward on the CPU
+    # so per-block NPU->CPU copies of the same metadata can be skipped.
+    actual_seq_lengths_cpu: Optional[list[int]] = None
+
     # flashinfer_cudnn specific (optional)
     packed_indptrs: Optional[torch.Tensor] = None
     sequence_lengths: Optional[torch.Tensor] = None
@@ -158,6 +163,7 @@ def prepare_vision_attention_metadata(
     device: torch.device,
     *,
     max_seqlen: Optional[int] = None,
+    actual_seq_lengths_cpu: Optional[list[int]] = None,
     packed_indptrs: Optional[torch.Tensor] = None,
     sequence_lengths: Optional[torch.Tensor] = None,
     flashinfer_max_seqlen: Optional[int] = None,
@@ -172,6 +178,7 @@ def prepare_vision_attention_metadata(
         cu_seqlens=cu_seqlens,
         seq_lens=seq_lens,
         max_seqlen=max_seqlen,
+        actual_seq_lengths_cpu=actual_seq_lengths_cpu,
         packed_indptrs=packed_indptrs,
         sequence_lengths=sequence_lengths,
         flashinfer_max_seqlen=flashinfer_max_seqlen,
@@ -922,9 +929,14 @@ class VisionAscendAttention(nn.Module):
         if forward_metadata is not None:
             # TND fused attention expects cumulative seqlens (cu_seqlens[1:]),
             # not per-sequence lengths in forward_metadata.seq_lens.
-            cu = forward_metadata.cu_seqlens.to("cpu")
             output = torch.empty_like(q)
-            seq_len_arg = cu[1:].to(torch.int32)
+            if forward_metadata.actual_seq_lengths_cpu is not None:
+                # Prepared once per vision forward on the CPU; reuse it in
+                # every block instead of copying cu_seqlens back per block.
+                seq_len_arg = forward_metadata.actual_seq_lengths_cpu
+            else:
+                cu = forward_metadata.cu_seqlens.to("cpu")
+                seq_len_arg = cu[1:].to(torch.int32)
         elif envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
             if "output_ws" not in kwargs:
                 raise RuntimeError("output_ws should be prepared for npu-graph mode")
@@ -940,7 +952,8 @@ class VisionAscendAttention(nn.Module):
 
         scale_value = softmax_scale if softmax_scale is not None else head_size**-0.5
 
-        seq_len_arg = seq_len_arg.tolist()
+        if isinstance(seq_len_arg, torch.Tensor):
+            seq_len_arg = seq_len_arg.tolist()
 
         total_tokens = int(seq_len_arg[-1])
 
@@ -1019,6 +1032,7 @@ class VisionAMXAttention(nn.Module):
         cu_seqlens: torch.Tensor | SingletonCache | None,
         bsz: int,
         seq_len: int,
+        softmax_scale: Optional[float] = None,
         **kwargs,
     ) -> torch.Tensor:
         r"""
@@ -1049,6 +1063,7 @@ class VisionAMXAttention(nn.Module):
             max_seqlen_q=max_seqlen,
             max_seqlen_k=max_seqlen,
             causal=False,
+            sm_scale=softmax_scale,
         )
 
         return output

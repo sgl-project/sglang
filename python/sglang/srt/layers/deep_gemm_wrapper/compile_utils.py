@@ -22,7 +22,7 @@ from sglang.srt.layers.deep_gemm_wrapper.configurer import (
     DEEPGEMM_SCALE_UE8M0,
     ENABLE_JIT_DEEPGEMM,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import (
     get_device,
     get_disagg,
@@ -550,7 +550,7 @@ def pp_parallel_deep_gemm_warmup(runner) -> None:
     # an unaligned bs makes DSA's padded num_splits longer than the q tokens
     # and trips FlashMLA's "num_splits must have shape (b+1)" check.
     from sglang.srt.layers.cp.padding import get_cp_padding_align_size
-    from sglang.srt.utils.common import require_mlp_sync
+    from sglang.srt.layers.dp_attention import require_mlp_sync
 
     n_sms = torch.cuda.get_device_properties(model_runner.device).multi_processor_count
     block_m = 64
