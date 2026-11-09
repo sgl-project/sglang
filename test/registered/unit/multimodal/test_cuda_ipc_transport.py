@@ -121,10 +121,14 @@ class TestCudaIpcTransport(CustomTestCase):
         data = torch.arange(1024, device="cuda", dtype=torch.float32).reshape(32, 32)
         source = torch.from_dlpack(data.T if noncontiguous else data)
         del data
-        source_ref = weakref.ref(source)
         expected = source.cpu()
         copy_stream = torch.cuda.Stream()
         delay_done = torch.cuda.Event()
+        released_before_ready = []
+        source_ref = weakref.ref(
+            source,
+            lambda _: released_before_ready.append(not delay_done.query()),
+        )
         torch.cuda.synchronize()
         leases = pool.try_reserve_batch([source.numel() * source.element_size()])
         published = threading.Event()
@@ -153,6 +157,11 @@ class TestCudaIpcTransport(CustomTestCase):
                 worker.join(5)
                 self.assertFalse(worker.is_alive())
                 self.assertEqual(failures, [])
+                self.assertEqual(
+                    released_before_ready,
+                    [],
+                    "source owner released before copy readiness",
+                )
                 self.assertFalse(
                     delay_done.query(), "publication waited for device work"
                 )
@@ -173,6 +182,7 @@ class TestCudaIpcTransport(CustomTestCase):
             while source_ref() is not None and time.monotonic() < deadline:
                 time.sleep(0.01)
             self.assertIsNone(source_ref(), "finished copies retained their sources")
+            self.assertEqual(released_before_ready, [False])
             self.assertEqual(pool.active_lease_count, 1)
         finally:
             for proxy in proxies:
