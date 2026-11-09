@@ -1023,6 +1023,24 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         self._staging_ctx.room_bootstrap[room] = bootstrap_infos
         self._staging_ctx.room_receivers[room] = receiver
 
+    @staticmethod
+    def _is_valid_staging_req(msg: List[bytes]) -> bool:
+        # Preflight only the fields consumed by the current staging handlers.
+        # Keep the original frames and virtual dispatch for alternate handlers.
+        if len(msg) < 5:
+            logger.warning("Dropping malformed STAGING_REQ with %d frames", len(msg))
+            return False
+        try:
+            for index in (1, 2, 3):
+                int(msg[index].decode("ascii"))
+            msg[4].decode("ascii")
+            if len(msg) > 5:
+                int(msg[5].decode("ascii"))
+        except (ValueError, UnicodeDecodeError):
+            logger.warning("Dropping STAGING_REQ with invalid integer or ASCII fields")
+            return False
+        return True
+
     def _start_decode_listener_thread(self):
         """Decode-side ZMQ listener for KV_STATUS, CHUNK_READY, STAGING_REQ and
         ABORT_ACK.
@@ -1033,10 +1051,13 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         def decode_listener_thread():
             while True:
                 msg = self.server_socket.recv_multipart()
+                if not msg:
+                    logger.warning("Dropping empty decode control message")
+                    continue
                 if self.handle_chunk_ready(msg):
                     continue
                 if msg[0] == b"STAGING_REQ":
-                    if self.enable_staging:
+                    if self.enable_staging and self._is_valid_staging_req(msg):
                         self._handle_staging_req(msg)
                     continue
                 if self.handle_abort_ack_message(msg):

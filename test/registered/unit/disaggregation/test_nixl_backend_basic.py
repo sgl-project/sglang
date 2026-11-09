@@ -788,7 +788,7 @@ class TestNixlTransferWorker(CustomTestCase):
 
 
 class TestNixlDecodeListener(CustomTestCase):
-    def test_decode_listener_receives_zmq_chunk_and_success(self):
+    def _make_manager(self):
         mgr = object.__new__(NixlKVManager)
         mgr.request_status = {}
         mgr.failure_records = {}
@@ -804,19 +804,130 @@ class TestNixlDecodeListener(CustomTestCase):
         receiver = NixlKVReceiver(mgr, "prefill:8998", 11)
         mgr.update_status(11, KVPoll.WaitingForInput)
         mgr.server_socket = MagicMock()
-        mgr.server_socket.recv_multipart.side_effect = [
-            [b"CHUNK_READY", b"11", b"0", b"0", b"2", b"decode_agent", b"0"],
-            [b"KV_STATUS", b"11", str(int(KVPoll.Success)).encode(), b"0", b""],
-            SystemExit(),
-        ]
+        mgr.enable_deferred_decode_kv_release = False
+        return mgr, receiver
+
+    def _listener_target(self, mgr):
         with patch("sglang.srt.disaggregation.nixl.conn.threading.Thread") as thread:
             mgr._start_decode_listener_thread()
-            with self.assertRaises(SystemExit):
-                thread.call_args.kwargs["target"]()
+        return thread.call_args.kwargs["target"]
+
+    def _run_messages(self, mgr, messages):
+        # The real listener loop runs synchronously; no daemon thread is leaked.
+        mgr.server_socket.recv_multipart.side_effect = [*messages, SystemExit()]
+        with self.assertRaises(SystemExit):
+            self._listener_target(mgr)()
+        self.assertEqual(mgr.server_socket.recv_multipart.call_count, len(messages) + 1)
+
+    def test_decode_listener_receives_zmq_chunk_and_success(self):
+        mgr, receiver = self._make_manager()
+        self._run_messages(
+            mgr,
+            [
+                [b"CHUNK_READY", b"11", b"0", b"0", b"2", b"decode_agent", b"0"],
+                [b"KV_STATUS", b"11", str(int(KVPoll.Success)).encode(), b"0", b""],
+            ],
+        )
         mgr._staging_handler.handle_chunk_arrived.assert_called_once_with(
             11, 0, 0, 2, "decode_agent"
         )
         self.assertEqual(receiver.poll(), KVPoll.Success)
+
+    def test_malformed_staging_request_does_not_block_later_control_messages(self):
+        valid = [b"STAGING_REQ", b"11", b"0", b"2", b"session"]
+        malformed = [valid[:length] for length in range(1, 5)]
+        for index in (1, 2, 3, 4, 5):
+            for value in ([b"bad-int", b"\xff"] if index != 4 else [b"\xff"]):
+                parts = [*valid, b"0"]
+                parts[index] = value
+                malformed.append(parts)
+        for parts in malformed:
+            with self.subTest(parts=parts):
+                mgr, receiver = self._make_manager()
+                mgr.enable_staging = True
+                mgr._handle_staging_req = MagicMock()
+                mgr.enable_deferred_decode_kv_release = True
+                mgr.note_abort_ack = MagicMock()
+                self._run_messages(
+                    mgr,
+                    [
+                        parts,
+                        valid,
+                        [b"CHUNK_READY", b"11", b"0", b"0", b"2", b"decode_agent"],
+                        [b"ABORT_ACK", b"11", b"0", b"7"],
+                        [b"KV_STATUS", b"11", str(int(KVPoll.Success)).encode(), b"0"],
+                    ],
+                )
+                mgr._handle_staging_req.assert_called_once_with(valid)
+                mgr._staging_handler.handle_chunk_arrived.assert_called_once_with(
+                    11, 0, 0, 2, "decode_agent"
+                )
+                mgr.note_abort_ack.assert_called_once_with(11, 0, 7)
+                self.assertEqual(receiver.poll(), KVPoll.Success)
+
+    def test_valid_staging_frames_reach_the_handler_unchanged(self):
+        legacy = [b"STAGING_REQ", b"11", b"0", b"2", b"session"]
+        messages = [legacy, [*legacy, b"0"], [*legacy, b"1", b"future-field"]]
+        mgr, _ = self._make_manager()
+        mgr.enable_staging = True
+        # An instance override stands in for alternate staging implementations.
+        mgr._handle_staging_req = MagicMock()
+        self._run_messages(mgr, messages)
+        self.assertEqual(mgr._handle_staging_req.call_count, len(messages))
+        for actual, original in zip(mgr._handle_staging_req.call_args_list, messages):
+            self.assertIs(actual.args[0], original)
+
+    def test_empty_control_input_is_dropped_defensively(self):
+        # Synthetic fixture: a ZMQ multipart normally contains at least one frame.
+        mgr, receiver = self._make_manager()
+        self._run_messages(
+            mgr,
+            [[], [b"KV_STATUS", b"11", str(int(KVPoll.Success)).encode(), b"0"]],
+        )
+        self.assertEqual(receiver.poll(), KVPoll.Success)
+
+    def test_staging_disabled_does_not_dispatch_requests(self):
+        mgr, receiver = self._make_manager()
+        mgr._handle_staging_req = MagicMock()
+        self._run_messages(
+            mgr,
+            [
+                [b"STAGING_REQ"],
+                [b"STAGING_REQ", b"11", b"0", b"2", b"session"],
+                [b"KV_STATUS", b"11", str(int(KVPoll.Success)).encode(), b"0"],
+            ],
+        )
+        mgr._handle_staging_req.assert_not_called()
+        self.assertEqual(receiver.poll(), KVPoll.Success)
+
+    def test_application_errors_are_not_treated_as_bad_messages(self):
+        errors = [
+            ValueError("allocator failure"),
+            IndexError("handler failure"),
+            UnicodeDecodeError("ascii", b"\xff", 0, 1, "handler failure"),
+            RuntimeError("staging failure"),
+            AssertionError("staging handler not initialized"),
+        ]
+        valid = [b"STAGING_REQ", b"11", b"0", b"2", b"session"]
+        for error in errors:
+            with self.subTest(error=type(error).__name__):
+                mgr, _ = self._make_manager()
+                mgr.enable_staging = True
+                mgr._handle_staging_req = MagicMock(side_effect=error)
+                mgr.server_socket.recv_multipart.side_effect = [valid, SystemExit()]
+                with self.assertRaises(type(error)) as caught:
+                    self._listener_target(mgr)()
+                self.assertIs(caught.exception, error)
+                mgr._handle_staging_req.assert_called_once_with(valid)
+                self.assertEqual(mgr.server_socket.recv_multipart.call_count, 1)
+
+    def test_socket_errors_remain_visible(self):
+        mgr, _ = self._make_manager()
+        error = RuntimeError("socket failure")
+        mgr.server_socket.recv_multipart.side_effect = error
+        with self.assertRaises(RuntimeError) as caught:
+            self._listener_target(mgr)()
+        self.assertIs(caught.exception, error)
 
 
 class TestNixlEarlySendWaitEvent(CustomTestCase):
