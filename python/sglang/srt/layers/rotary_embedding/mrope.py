@@ -24,6 +24,7 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cuda,
     is_hip,
+    is_mlu,
     is_npu,
     is_xpu,
     support_triton,
@@ -31,6 +32,7 @@ from sglang.srt.utils import (
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_is_mlu = is_mlu()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -350,6 +352,23 @@ class MRotaryEmbedding(RotaryEmbedding):
                 self._legacy_axis_map,
             )
             return query, key
+        return self.forward_native(positions, query, key, fused_set_kv_buffer_arg)
+
+    def forward_mlu(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        fused_set_kv_buffer_arg=None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if positions.ndim == 1:
+            return RotaryEmbedding.forward_mlu(
+                self,
+                positions,
+                query,
+                key,
+                fused_set_kv_buffer_arg=fused_set_kv_buffer_arg,
+            )
         return self.forward_native(positions, query, key, fused_set_kv_buffer_arg)
 
     @staticmethod
@@ -680,4 +699,10 @@ class Ernie4_5_VLRotaryEmbedding(MRotaryEmbedding):
         assert positions.ndim == 1 or positions.ndim == 2
         if _is_xpu:
             return self.forward_xpu(positions, query, key)
+        if _is_mlu:
+            if fused_set_kv_buffer_arg is not None:
+                raise NotImplementedError(
+                    "fused_set_kv_buffer_arg is not supported for Ernie MRoPE"
+                )
+            return self.forward_native(positions, query, key)
         return self.forward_cuda(positions, query, key)
