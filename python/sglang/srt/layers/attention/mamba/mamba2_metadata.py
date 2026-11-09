@@ -18,7 +18,7 @@
 
 import math
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 
@@ -86,6 +86,12 @@ class ForwardMetadata:
     has_mamba_track_mask: bool = False
     mamba_track_mask_indices: Optional[torch.Tensor] = None
     conv_states_mask_indices: Optional[torch.Tensor] = None
+    # extend_seq_lens_cpu mirrors this extend (one entry per request, no TBO
+    # split), so logical_num_tokens and host-built tables can rely on it.
+    host_extend_lens_trusted: bool = False
+    # GDN eager Triton extend: FLA (chunk_indices, chunk_offsets) built once from
+    # the host lengths and shared by every GDN layer of the forward.
+    extend_chunk_tables: Optional[Tuple[Optional[torch.Tensor], ...]] = None
 
 
 @dataclass(kw_only=True)

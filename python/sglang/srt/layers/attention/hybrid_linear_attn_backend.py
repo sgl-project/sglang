@@ -215,6 +215,7 @@ class MambaAttnBackendBase(AttentionBackend):
         track_ssm_end_locs = None
         track_ssm_recompute_dst = None
         logical_num_tokens = None
+        host_extend_lens_trusted = False
         track_mask_indices = None
 
         # Padded rows carry req-pool row 0, which maps to the reserved mamba
@@ -356,11 +357,15 @@ class MambaAttnBackendBase(AttentionBackend):
                     and forward_batch.tbo_parent_token_range is None
                 ):
                     logical_num_tokens = sum(forward_batch.extend_seq_lens_cpu)
+                    host_extend_lens_trusted = True
                 else:
                     logical_num_tokens = int(query_start_loc[-1])
                 if has_mamba_track_mask:
                     track_conv_indices = self._init_track_conv_indices(
-                        query_start_loc, forward_batch, track_mask_indices
+                        query_start_loc,
+                        forward_batch,
+                        num_tokens=logical_num_tokens,
+                        track_mask_indices=track_mask_indices,
                     )
 
                     (
@@ -380,6 +385,7 @@ class MambaAttnBackendBase(AttentionBackend):
         return ForwardMetadata(
             query_start_loc=query_start_loc,
             logical_num_tokens=logical_num_tokens,
+            host_extend_lens_trusted=host_extend_lens_trusted,
             mamba_track_mask_indices=track_mask_indices,
             mamba_cache_indices=mamba_cache_indices,
             replayssm_ring_indices=replayssm_ring_indices,
@@ -454,6 +460,7 @@ class MambaAttnBackendBase(AttentionBackend):
         self,
         query_start_loc: torch.Tensor,
         forward_batch: ForwardBatch,
+        num_tokens: int,
         track_mask_indices: Optional[torch.Tensor] = None,
     ):
         """Flattened input positions of conv states to track during extend (up to
@@ -480,7 +487,7 @@ class MambaAttnBackendBase(AttentionBackend):
             dtype=start_indices.dtype,
         )
 
-        return indices.clamp(0, query_start_loc[-1] - 1)
+        return indices.clamp(0, num_tokens - 1)
 
     def _init_track_ssm_indices(
         self, mamba_cache_indices: torch.Tensor, forward_batch: ForwardBatch

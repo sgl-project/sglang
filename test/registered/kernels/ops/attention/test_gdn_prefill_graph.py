@@ -17,6 +17,7 @@ import torch
 from sglang.srt.layers.attention.linear.gdn_backend import (
     GDNAttnBackend,
     GDNKernelDispatcher,
+    _uses_host_chunk_tables,
 )
 from sglang.srt.layers.attention.linear.gdn_prefill_graph import (
     GDNPrefillGraphMetadata,
@@ -92,6 +93,10 @@ def _backend(conv_pool, ssm_pool):
         LinearAttnKernelBackend.TRITON,
         LinearAttnKernelBackend.TRITON,
         LinearAttnKernelBackend.TRITON,
+    )
+    # The eager reference takes host-built FLA chunk tables, as in serving.
+    backend._host_chunk_tables = _uses_host_chunk_tables(
+        backend.kernel_dispatcher.extend_kernel
     )
     return backend
 
