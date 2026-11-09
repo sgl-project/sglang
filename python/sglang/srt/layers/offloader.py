@@ -99,7 +99,7 @@ def _get_resident_parameter_ids(module: torch.nn.Module):
     # tensors held as ordinary attributes need their backing weights to stay put.
     resident = set()
     cached_storages = set()
-    for owner in module.modules():
+    for name, owner in module.named_modules():
         for value in vars(owner).values():
             if (
                 isinstance(value, torch.Tensor)
@@ -117,6 +117,10 @@ def _get_resident_parameter_ids(module: torch.nn.Module):
             and hasattr(owner, "w_vc")
         ):
             resident.update(id(parameter) for parameter in projection.parameters())
+        # DSA indexer runs as an eager break in breakable prefill CUDA graph.
+        # Keep its parameters resident on device across replay outside functional_call.
+        if name.rpartition(".")[2] == "indexer":
+            resident.update(id(parameter) for parameter in owner.parameters())
     for parameter in module.parameters():
         if (
             not parameter.is_meta
