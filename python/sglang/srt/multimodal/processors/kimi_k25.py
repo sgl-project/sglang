@@ -281,16 +281,18 @@ _GPU_PREPROCESS_RELEASE_BYTES = 2 * _GPU_PREPROCESS_CHUNK_BYTES
 
 
 def _release_preprocess_cache() -> None:
-    if torch.cuda.memory_reserved() > _GPU_PREPROCESS_RELEASE_BYTES:
+    # empty_cache() can only return blocks with no live tensor in them.
+    cached = torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+    if cached > _GPU_PREPROCESS_RELEASE_BYTES:
         torch.cuda.empty_cache()
 
 
 def _gpu_preprocess_bytes(
     image: Union[torch.Tensor, Image.Image], padded_pixels: int
 ) -> int:
-    """Transient GPU bytes for one image in a batched chunk: the uint8 source,
-    its copy in the joined source batch and its fp32 resize input, plus the
-    fp32 RGBA output."""
+    """Estimated transient GPU bytes for one image in a batched chunk, exact for
+    RGB inputs: the uint8 source, its copy in the joined source batch and its
+    fp32 resize input, plus the fp32 RGBA output."""
     if isinstance(image, Image.Image):
         source = 3 * image.width * image.height
     else:

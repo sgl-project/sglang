@@ -626,6 +626,9 @@ class KimiK3ImageProcessor(
                     grid_thw=grid,
                     feature=feature,
                 )
+            # the artifacts hold CPU copies; free the GPU features first
+            del features, feature
+            _release_preprocess_cache()
 
         # 3. return artifacts in the original processor-input order
         if any(artifact is None for artifact in artifacts):

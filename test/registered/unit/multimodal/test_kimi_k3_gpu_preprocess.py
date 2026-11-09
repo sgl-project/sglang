@@ -236,21 +236,11 @@ def test_prepare_image_features_falls_back_to_cpu_on_gpu_oom(monkeypatch):
     assert len(features) == len(grids) == 2
 
 
-def test_k3_tokenizer_entry_points_pass_resize_cap(monkeypatch):
-    """Both tokenizer-side K3 GPU paths cap source size; only model-side
-    deferred preprocessing keeps every resize on the GPU."""
-    images = [Image.fromarray(_natural_image(56, 84))] * 2
-    scale, bias = _norm_tensors()
-    caps = []
-
-    def record(imgs, *args, max_gpu_resize_pixels, **kwargs):
-        caps.append(max_gpu_resize_pixels)
-        return torch.zeros(0, 3, 14, 14), torch.zeros(len(imgs), 3, dtype=torch.int64)
-
-    fake = SimpleNamespace(
+def _fake_k3_processor(scale, bias, **overrides):
+    fields = dict(
         _patch_size=14,
         _merge_kernel_size=2,
-        _in_patch_limit=16384,
+        _in_patch_limit=16,
         _patch_limit_on_one_side=512,
         _fixed_output_tokens=None,
         _transparent_bg_config=None,
@@ -258,13 +248,28 @@ def test_k3_tokenizer_entry_points_pass_resize_cap(monkeypatch):
         _get_gpu_norm_tensors=lambda: (scale, bias),
         _prepare_input_ids=lambda *args: torch.zeros(1, dtype=torch.int64),
     )
-    monkeypatch.setattr(kimi_k3, "_gpu_preprocess_images", record)
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
+
+
+def test_k3_tokenizer_entry_points_resize_on_cpu_above_cap(monkeypatch):
+    """Both tokenizer-side K3 GPU paths apply the resize cap: with the cap at 0,
+    every resize in the real preprocessing runs on the CPU."""
+    images = [Image.fromarray(_natural_image(280, 420))] * 2
+    scale, bias = _norm_tensors()
+    fake = _fake_k3_processor(scale, bias)
+    monkeypatch.setattr(kimi_k3, "_k3_to_cuda_chw", _cpu_chw)
+    monkeypatch.setattr(kimi_k3, "_MAX_GPU_RESIZE_PIXELS", 0)
+    monkeypatch.setattr(kimi_k3, "_release_preprocess_cache", lambda: None)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    moved = _spy_cpu_moves(monkeypatch)
 
     kimi_k3.KimiK3GPUProcessorWrapper._gpu_call(fake, "<image><image>", images)
+    from_gpu_call = len(moved)
     kimi_k3.KimiK3GPUProcessorWrapper.prepare_image_features(fake, images)
 
-    assert caps == [kimi_k25._MAX_GPU_RESIZE_PIXELS] * 2
+    assert from_gpu_call > 0
+    assert len(moved) > from_gpu_call
 
 
 if __name__ == "__main__":
