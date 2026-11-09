@@ -414,6 +414,56 @@ def test_decode_attend(decode_query_len, local_blocks, shared, impl):
     torch.testing.assert_close(out.float().cpu(), ref, atol=2e-2, rtol=2e-2)
 
 
+@pytest.mark.parametrize("prefill", [True, False])
+def test_attend_float32_out(prefill):
+    """A float32 ``out`` takes the torch path; the bf16 kernel would fill half of it."""
+    gen = torch.Generator().manual_seed(3)
+    k, v = _cache(gen)
+    seq, q_lens = [2 * BS, 300], ([3, BS + 1] if prefill else [1, 1])
+    prefix = [s - n for s, n in zip(seq, q_lens)]
+    bt = torch.stack([torch.randperm(47, generator=gen)[:12] + 1 for _ in seq])
+    query_pos = [p + j for p, n in zip(prefix, q_lens) for j in range(n)]
+    row_req = [r for r, n in enumerate(q_lens) for _ in range(n)]
+    # Shared selection is the layout the Metal kernel accepts.
+    idx = _select(query_pos, 1, gen)[:1].expand(NUM_KV_HEADS, -1, -1)
+    bias = (torch.randn(idx.shape[1:], generator=gen) * (idx[0] >= 0)).expand_as(idx)
+    q = torch.randn(len(query_pos), NUM_HEADS, HEAD_DIM, generator=gen).to(
+        torch.bfloat16
+    )
+    out = torch.full(q.shape, float("nan"), device=DEV)
+    common = (q.to(DEV), k.to(DEV), v.to(DEV), _to_dev(idx), _to_dev(bias))
+    common += (bt.to(torch.int32).to(DEV),)
+    seq_t = torch.tensor(seq, dtype=torch.int32, device=DEV)
+    if prefill:
+        cu = torch.tensor([0] + q_lens).cumsum(0).to(torch.int32).to(DEV)
+        prefix_t = torch.tensor(prefix, dtype=torch.int32, device=DEV)
+        dash_sparse_attn(
+            *common,
+            cu,
+            seq_t,
+            prefix_t,
+            max(q_lens),
+            NUM_KV_HEADS,
+            HEAD_DIM**-0.5,
+            out,
+            local_blocks=1,
+            sparse_block_size=BS,
+        )
+    else:
+        dash_sparse_attn_decode(
+            *common,
+            seq_t,
+            NUM_KV_HEADS,
+            HEAD_DIM**-0.5,
+            out,
+            1,
+            local_blocks=1,
+            sparse_block_size=BS,
+        )
+    ref = _reference(q, k, v, idx, bias, bt, query_pos, row_req, 1)
+    torch.testing.assert_close(out.cpu(), ref, atol=2e-2, rtol=2e-2)
+
+
 IMG, PAGE, MM_PAD, META_BLOCKS, META_WIDTH = 99, 7, 1_000_000, 64, 12
 
 
@@ -455,12 +505,14 @@ def _prefilled_meta_state(prompts, with_marker):
     return page_state, coord_state, bt, lens
 
 
+@pytest.mark.parametrize("table_dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("with_marker", [True, False])
-def test_decode_meta_matches_torch_path(with_marker):
+def test_decode_meta_matches_torch_path(with_marker, table_dtype):
     """The Metal decode-metadata kernels advance the same state as the torch path."""
     prompts = [_meta_prompt(2, 60, with_marker), _meta_prompt(3, 40, with_marker)]
     prompts += [[1] * (2 * BS - 1), _meta_prompt(1, 121, with_marker)]
     fused_page, fused_coord, bt, seq = _prefilled_meta_state(prompts, with_marker)
+    bt = bt.to(table_dtype)
     torch_page, torch_coord = copy.deepcopy(fused_page), copy.deepcopy(fused_coord)
     gen = torch.Generator().manual_seed(int(with_marker))
     num_slots = META_BLOCKS * BS
@@ -515,6 +567,12 @@ def test_decode_meta_matches_torch_path(with_marker):
                 getattr(fused_coord, name)[live].cpu(),
                 getattr(torch_coord, name)[live].cpu(),
             )
+
+
+def test_decode_meta_rejects_table_outside_int32():
+    bt = torch.tensor([[1, 2**31]], dtype=torch.int64, device=DEV)
+    with pytest.raises(ValueError, match="int32"):
+        metal._int32_table(bt)
 
 
 @pytest.mark.parametrize(

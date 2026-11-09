@@ -91,6 +91,21 @@ def _row_major(t: torch.Tensor) -> bool:
     return t.dim() == 2 and t.stride(1) == 1
 
 
+def _int32_table(t: torch.Tensor) -> torch.Tensor:
+    """``t`` as the row-major int32 table the metadata kernels read.
+
+    Wider tables are narrowed after a range check rather than reinterpreted.
+    """
+    if t.dtype == torch.int32 and _row_major(t):
+        return t
+    if t.dtype != torch.int32 and t.numel():
+        lo, hi = (v.item() for v in torch.aminmax(t))
+        info = torch.iinfo(torch.int32)
+        if lo < info.min or hi > info.max:
+            raise ValueError(f"block table values [{lo}, {hi}] do not fit in int32")
+    return t.to(torch.int32).contiguous()
+
+
 def _prefill_rows(rows, like):
     """``(row2req, cu_seqlens_q, context_lens)`` for the kernels, or dummies."""
     if rows is None:
@@ -127,7 +142,10 @@ def sparse_attend(
         or head_dim > 256
         or q.dtype != torch.bfloat16
         or k_cache.dtype != torch.bfloat16
+        or v_cache.dtype != torch.bfloat16
+        or out.dtype != torch.bfloat16
         or idx.dtype != torch.int32
+        or (bias is not None and bias.dtype != torch.float32)
         or block_table.dtype != torch.int32
         or not (q.is_contiguous() and out.is_contiguous())
         or not (k_cache.is_contiguous() and v_cache.is_contiguous())
@@ -201,7 +219,13 @@ def route(
         or not k_bar.is_contiguous()
         or block_table.dtype != torch.int32
         or not _row_major(block_table)
+        or out_idx.dtype != torch.int32
+        or out_bias.dtype != torch.float32
         or not (_row_major(out_idx) and _row_major(out_bias))
+        or (
+            image_allow is not None
+            and image_allow.dtype not in (torch.bool, torch.int8)
+        )
         or (image_allow is not None and not _row_major(image_allow))
     ):
         return False
@@ -298,6 +322,7 @@ def decode_meta(
 ) -> None:
     """Metal ``dash_decode_meta``; every state table is updated in place."""
     num_reqs = int(seq_lens.shape[0])
+    block_table = _int32_table(block_table)
     c_mark, c_pp, c_cnt = coord_tables
     _decode_meta_lib(block_size).dash_decode_meta(
         input_ids.to(torch.int64),
@@ -340,6 +365,7 @@ def decode_allow(
 ) -> None:
     """Metal ``dash_decode_allow`` into the ``[R, max_block]`` int8 view ``out``."""
     num_reqs = int(q_page.shape[0])
+    block_table = _int32_table(block_table)
     _decode_meta_lib(block_size).dash_decode_allow(
         block_table,
         slot_img_page,
