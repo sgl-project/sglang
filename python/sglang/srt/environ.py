@@ -162,7 +162,7 @@ class EnvInt(EnvField):
 
 class _DeprecatedEnvFallback:
     """Mixin for EnvField subclasses: if the canonical env var is not set,
-    check *deprecated_name* and emit DeprecationWarning before reading it.
+    check *deprecated_name* and emit a FutureWarning before reading it.
 
     Usage:
         SGLANG_NEW_NAME = EnvBoolWithAlias(True, deprecated_name="SGLANG_OLD_NAME")
@@ -180,7 +180,9 @@ class _DeprecatedEnvFallback:
                     f"Environment variable '{self.deprecated_name}' is deprecated; "
                     f"use '{self.name}' instead. "
                     "The alias will be removed in a future release.",
-                    DeprecationWarning,
+                    # FutureWarning is shown by default; a DeprecationWarning
+                    # raised from library code is hidden from users.
+                    FutureWarning,
                     stacklevel=2,
                 )
                 os.environ[self.name] = fallback
@@ -621,9 +623,8 @@ class Envs:
     # Memory pools and KV-cache sizing
     # ===================================================================
     SGLANG_NATIVE_MOVE_KV_CACHE = EnvBool(False)
-    # Disable lazy compaction in the unified memory pool allocator and
-    # fall back to the per-free eager compaction. Used for production
-    # A/B and quick rollback. Default False (lazy compaction on).
+    # Must stay unset: the unified memory pool compacts only lazily, and
+    # startup refuses --enable-unified-memory with it set.
     SGLANG_DISABLE_LAZY_COMPACTION = EnvBool(False)
     # Periodically log lazy-compaction stats per sub-pool (observability only).
     SGLANG_LOG_LAZY_COMPACTION_STATS = EnvBool(False)
@@ -1004,6 +1005,13 @@ class Envs:
     SGLANG_OPT_MXFP4_DEFERRED_FINALIZED_SHAPE = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # MXFP4 trtllm-gen MoE on SM100 / SM103: calls with <= 256 tokens run the JIT
+    # routing + persistent FC1 / FC2 kernels (kernels/ops/moe/mxfp4_decode_moe.py) on
+    # every layer whose shape, activation (SiTU, or SwiGLU with a limit) and MXFP8
+    # activations they cover; anything else runs flashinfer.
+    SGLANG_USE_CUDA_MXFP4_DECODE_MOE = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_K31_DECODE_MOE"
+    )
     # Manual MoE input row limit (EPv1 and EPv2); 0 leaves it to SGLANG_MORI_RECV_BOUND.
     SGLANG_MORI_MOE_MAX_INPUT_TOKENS = EnvInt(0)
 
@@ -1033,6 +1041,9 @@ class Envs:
     # Enabled by default for supported configurations; set to 0 to disable.
     SGLANG_M3_USE_AITER_FUSED_QKNORM = EnvBool(True)
     SGLANG_USE_AITER_AG = EnvBool(True)
+    # Run the gfx950 TP4 quick all-reduce on the JIT build (quick_all_reduce_hip) instead of
+    # sgl-kernel's; off by default, MiniMax-M3.1 turns it on at TP4 under INT4 or INT8.
+    SGLANG_ROCM_QUICK_ALL_REDUCE_JIT = EnvBool(False)
     # Under CUDA-graph capture, stage the aiter custom all-gather / reduce-scatter
     # inputs through the pre-registered IPC pool instead of registering the
     # graph-pool tensors, which lets peers read stale data on replay (NaN in
@@ -2240,6 +2251,13 @@ class Envs:
     # Run the sparse prefill main attention through AITER's Gluon paged attention
     # instead of the Triton kernel. Unsupported cases fall back to Triton.
     SGLANG_OPT_USE_MINIMAX_GLUON_PREFILL = EnvBool(True)
+    # gfx950 M3.1 main K/V and index-K cache layout: auto (the packed NVFP4 MSA-v1 pool
+    # under DSPARK, fp8 otherwise) or fp8 (e4m3) everywhere
+    SGLANG_MINIMAX_M3_AMD_KV_FORMAT = EnvStr("auto")
+    # gfx950 M3.1 at TP4 sets ROCM_QUICK_REDUCE_QUANTIZATION=INT4 when it is unset, measured
+    # faster at equal GSM8K; a level already set (the ROCm images export INT8) stays, and 0
+    # leaves an unset level unset
+    SGLANG_ENABLE_MINIMAX_M3_AMD_QUICK_REDUCE_INT4 = EnvBool(True)
     # MiniMax M3 NPU prefill MAIN-attention: route the sparse main attention through
     # the native Ascend FA op `torch.ops.npu.npu_fused_infer_attention_score` (FIA)
     # with a per-query CUSTOM block_table
@@ -2252,9 +2270,11 @@ class Envs:
     # cached block_table override.
     SGLANG_MINIMAX_NPU_NATIVE_ATTN = EnvBool(False)
     # MiniMax-M3 on ROCm force-disables custom all-reduce in its model override
-    # (arg_groups/overrides.py) when aiter all-reduce fusion is off. Set this to
-    # opt back in and keep custom/quick all-reduce enabled -- e.g. to run the
-    # INT4 quick-reduce path via ROCM_QUICK_REDUCE_QUANTIZATION={INT4,INT6,INT8}.
+    # when aiter all-reduce fusion is off, except for the checkpoints measured
+    # faster with it on gfx950 (quark_mxfp4, the M3.1 NVFP4 and Quark exports; see
+    # model_overrides/minimax_m3_hip.py). Set this to opt back in and keep
+    # custom/quick all-reduce enabled -- e.g. to run the INT4 quick-reduce path
+    # via ROCM_QUICK_REDUCE_QUANTIZATION={INT4,INT6,INT8}.
     SGLANG_M3_ALLOW_CUSTOM_AR = EnvBool(False)
 
     # ===================================================================
@@ -2307,11 +2327,6 @@ class Envs:
     SGLANG_K3_SHARDED_MOE = EnvBool(True)
     # Use the ROCm radix-4 router for covered K3 top-k workloads.
     SGLANG_K3_RADIX4_TOPK = EnvBool(False)
-    # Kimi-K3.1 decode routed MoE on SM100/SM103: replace flashinfer's deferred-finalize
-    # trtllm-gen MXFP4 call with the JIT routing + persistent FC1/FC2 kernels
-    # (kernels/ops/moe/k31_decode_moe.py) for covered TP-MoE shapes (896 local
-    # experts, intermediate 384, top-16, <= 256 tokens); anything else runs flashinfer.
-    SGLANG_K31_DECODE_MOE = EnvBool(False)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MIN_HITS = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MAX_SEQLEN = EnvInt(6144)
@@ -2494,6 +2509,10 @@ _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
     ),
     "SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK": _DeprecatedEnv(
         note="Please use '--prefill-delayer-token-usage-low-watermark' instead."
+    ),
+    "SGLANG_USE_SGL_XPU": _DeprecatedEnv(
+        note="Intel XPU always uses the sgl-kernel MoE kernels; pass "
+        "'--moe-runner-backend triton' for the Triton path."
     ),
 }
 

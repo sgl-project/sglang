@@ -95,7 +95,8 @@ def _select_local_dcp_heads_for_autotune(
 
 def is_mla_dcp_lse_base_on_e(attention_backend: Optional[str]) -> bool:
     if attention_backend == "dsa":
-        return dsa_shards_index_k()
+        # trtllm-gen partials carry a base-2 LSE.
+        return dsa_shards_index_k() and get_exec().kernel.dsa_decode_backend != "trtllm"
     return attention_backend in {"flashmla", "cutedsl_mla", "aiter"}
 
 
