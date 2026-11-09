@@ -67,8 +67,9 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix, get_device
+from sglang.srt.utils import get_device
 
 _MAX_INFERENCE_POS_EMB_CACHE_ENTRIES = 256
 
