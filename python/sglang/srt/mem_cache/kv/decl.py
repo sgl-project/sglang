@@ -6,7 +6,7 @@ lifetime and allocation unit share one sub-pool.
 """
 
 import math
-from typing import ClassVar, Optional, Sequence, Tuple, Union
+from typing import Any, ClassVar, Iterable, Optional, Sequence, Tuple, Union
 
 import msgspec
 import torch
@@ -126,6 +126,22 @@ class KVPartDecl(msgspec.Struct, frozen=True, kw_only=True):
 class KVLayerDecl(msgspec.Struct, frozen=True, kw_only=True):
     layer_id: int
     parts: Tuple[KVPartDecl, ...]
+
+
+def window_sub_pool_name(window: Optional[int]) -> str:
+    """The sub-pool name of a window, from its own length alone: a window the
+    model does not state the length of is ``window``."""
+    return "window" if window is None else f"window_{window}"
+
+
+def primary_window(windows: Iterable[Optional[int]]) -> Optional[int]:
+    """Of the window lengths the target's layers declare, the one a
+    single-window reader sizes and retains by: the longest (a window that
+    states no length counts as longest). None without windows."""
+    windows = list(windows)
+    if not windows:
+        return None
+    return max(windows, key=lambda w: WindowLifetime(window=w).retention())
 
 
 def kv_layer_decls(
@@ -387,3 +403,25 @@ def with_state_ple(
         extra_parts=(*geometry.extra_parts, *parts),
         scratch_parts=(*geometry.scratch_parts, *scratch),
     )
+
+
+# The part every token KV view holds; derived parts get their own names.
+KV_PART = "kv"
+# A request's recurrent state, one slot per request, in the state sub-pool.
+STATE_PART = "state"
+
+
+class Region(msgspec.Struct, frozen=True, kw_only=True):
+    """A sub-pool's device memory as a PD peer registers it: one entry per
+    buffer, and per entry the slices a peer of another TP size reads. A whole
+    page envelope has no slices: both peers must lay it out identically."""
+
+    ptrs: Tuple[int, ...]
+    lens: Tuple[int, ...]
+    item_lens: Tuple[int, ...]
+    dim_per_tensor: Tuple[int, ...] = ()
+    conv_shard_groups: Tuple[Any, ...] = ()
+    slice_outer_counts: Tuple[int, ...] = ()
+    layer_ids: Tuple[int, ...] = ()
+    # The token KV byte layout both peers must share, for views that have one.
+    kv_layout: Optional[str] = None

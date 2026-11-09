@@ -1,6 +1,7 @@
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
+#include <sgl_kernel/activation.cuh>
 #include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/type.cuh>
 #include <sgl_kernel/utils.cuh>
@@ -8,7 +9,6 @@
 
 #include <tvm/ffi/container/tensor.h>
 
-#include <cmath>
 #include <cstdint>
 #include <limits>
 #include <string>
@@ -22,21 +22,16 @@ enum class ActivationKind : uint32_t {
   kReLU2,
 };
 
-template <ActivationKind kAct>
+template <ActivationKind kAct, bool kFastMath>
 SGL_DEVICE float apply_activation_f32(float x_f32) {
   if constexpr (kAct == ActivationKind::kSiLU) {
-    return x_f32 / (1.0f + expf(-x_f32));
+    return device::activation::silu<kFastMath>(x_f32);
   } else if constexpr (kAct == ActivationKind::kGELU) {
-    constexpr auto kSqrt1Over2 = 0.7071067811865475f;
-    return x_f32 * (0.5f * (1.0f + erff(x_f32 * kSqrt1Over2)));
+    return device::activation::gelu<kFastMath>(x_f32);
   } else if constexpr (kAct == ActivationKind::kGELUTanh) {
-    constexpr auto kGeluTanhAlpha = 0.044715f;
-    constexpr auto kGeluTanhBeta = 0.7978845608028654f;
-    const float cdf = 0.5f * (1.0f + tanhf(kGeluTanhBeta * (x_f32 + kGeluTanhAlpha * x_f32 * x_f32 * x_f32)));
-    return x_f32 * cdf;
+    return device::activation::gelu_tanh<kFastMath>(x_f32);
   } else if constexpr (kAct == ActivationKind::kReLU2) {
-    const float relu = x_f32 > 0.0f ? x_f32 : 0.0f;
-    return relu * relu;
+    return device::activation::relu2<kFastMath>(x_f32);
   } else {
     static_assert(host::dependent_false_v<decltype(kAct)>, "unsupported activation kind");
     return 0.0f;
@@ -66,6 +61,7 @@ template <
     typename T,
     ActivationKind kAct,
     bool kUsePDL,
+    bool kFastMath,
     bool kFilterExpert,
     bool kRoundActivation = false,
     bool kReuseInput = false,
@@ -96,8 +92,10 @@ __global__ void act_and_mul_kernel(const __grid_constant__ ActivationParams para
   const auto input_offset = token_id * (num_vecs * 2) + offset;
   const auto output_offset = kReuseInput ? input_offset : tid;
   PDLWaitPrimary<kUsePDL>();
-  const auto gate = device::load_as<vec_t>(params.input, input_offset);
-  const auto up = device::load_as<vec_t>(params.input, input_offset + num_vecs);
+  const auto input = assume_global(const_cast<void*>(params.input));
+  vec_t gate, up;
+  gate.load(input, input_offset);
+  up.load(input, input_offset + num_vecs);
   const float limit = device::cast<fp32_t>(device::cast<T>(params.clamp_limit));
   vec_t out;
 #pragma unroll
@@ -110,16 +108,16 @@ __global__ void act_and_mul_kernel(const __grid_constant__ ActivationParams para
       up_f32 = up_f32 > limit ? limit : (up_f32 < -limit ? -limit : up_f32);
     }
     if constexpr (kRoundActivation) {
-      const T activated = device::cast<T>(apply_activation_f32<kAct>(gate_f32));
+      const T activated = device::cast<T>(apply_activation_f32<kAct, kFastMath>(gate_f32));
       out[i] = device::cast<T>(device::cast<fp32_t>(activated) * up_f32);
     } else {
-      out[i] = device::cast<T>(apply_activation_f32<kAct>(gate_f32) * up_f32);
+      out[i] = device::cast<T>(apply_activation_f32<kAct, kFastMath>(gate_f32) * up_f32);
     }
   }
   if constexpr (kReuseInput) {
-    device::store_as<vec_t>(const_cast<void*>(params.input), out, output_offset);
+    out.store(input, output_offset);
   } else {
-    device::store_as<vec_t>(params.out, out, output_offset);
+    out.store(params.out, output_offset);
   }
   PDLTriggerSecondary<kUsePDL>();
 }
@@ -130,7 +128,7 @@ struct UnaryActivationParams {
   uint32_t num_vecs;
 };
 
-template <typename T, ActivationKind kAct, bool kUsePDL>
+template <typename T, ActivationKind kAct, bool kUsePDL, bool kFastMath>
 __global__ void act_kernel(const __grid_constant__ UnaryActivationParams params) {
   using namespace device;
   constexpr auto kVecSize = kMaxVecBytes / sizeof(T);
@@ -138,23 +136,25 @@ __global__ void act_kernel(const __grid_constant__ UnaryActivationParams params)
   const auto vec_id = blockIdx.x * blockDim.x + threadIdx.x;
   if (vec_id >= params.num_vecs) return;
   PDLWaitPrimary<kUsePDL>();
-  const auto in = device::load_as<vec_t>(params.input, vec_id);
+  vec_t in;
+  in.load(assume_global(params.input), vec_id);
   vec_t out;
 #pragma unroll
   for (int i = 0; i < kVecSize; ++i) {
-    out[i] = device::cast<T>(apply_activation_f32<kAct>(device::cast<fp32_t>(in[i])));
+    out[i] = device::cast<T>(apply_activation_f32<kAct, kFastMath>(device::cast<fp32_t>(in[i])));
   }
-  device::store_as<vec_t>(params.out, out, vec_id);
+  out.store(params.out, vec_id);
   PDLTriggerSecondary<kUsePDL>();
 }
 
-template <typename T, bool kUsePDL>
+// kFastMath = false reproduces eager PyTorch's activations.
+template <typename T, bool kUsePDL, bool kFastMath>
 struct ActivationKernel {
   static constexpr auto kVecSize = device::kMaxVecBytes / sizeof(T);
   static constexpr auto kBlockSize = 256u;
 
-  using kernel_fn_t = decltype(&act_and_mul_kernel<T, ActivationKind::kSiLU, kUsePDL, false>);
-  using unary_kernel_fn_t = decltype(&act_kernel<T, ActivationKind::kReLU2, kUsePDL>);
+  using kernel_fn_t = decltype(&act_and_mul_kernel<T, ActivationKind::kSiLU, kUsePDL, kFastMath, false>);
+  using unary_kernel_fn_t = decltype(&act_kernel<T, ActivationKind::kReLU2, kUsePDL, kFastMath>);
 
   template <
       ActivationKind kAct,
@@ -162,8 +162,16 @@ struct ActivationKernel {
       bool kRoundActivation = false,
       bool kReuseInput = false,
       bool kFilterSorted = false>
-  static constexpr kernel_fn_t activation_kernel =
-      act_and_mul_kernel<T, kAct, kUsePDL, kFilterExpert, kRoundActivation, kReuseInput, false, kFilterSorted>;
+  static constexpr kernel_fn_t activation_kernel = act_and_mul_kernel<
+      T,
+      kAct,
+      kUsePDL,
+      kFastMath,
+      kFilterExpert,
+      kRoundActivation,
+      kReuseInput,
+      false,
+      kFilterSorted>;
 
   static_assert(device::kMaxVecBytes % sizeof(T) == 0, "unsupported data type");
 
@@ -239,7 +247,7 @@ struct ActivationKernel {
     if constexpr (kClamp) {
       RuntimeCheck(type == "silu" && expert_ids == nullptr, "clamping requires unfiltered SiLU");
       const auto kernel =
-          act_and_mul_kernel<T, ActivationKind::kSiLU, kUsePDL, false, kRoundActivation, kReuseInput, true>;
+          act_and_mul_kernel<T, ActivationKind::kSiLU, kUsePDL, kFastMath, false, kRoundActivation, kReuseInput, true>;
       LaunchKernel(num_blocks, kBlockSize, device).enable_pdl(kUsePDL)(kernel, params);
     } else if (sorted_token_ids != nullptr) {
       // Only the plain (non-rounding, out-of-place) path takes the sorted
@@ -326,7 +334,7 @@ struct ActivationKernel {
   }
 
   template <ActivationKind kAct>
-  static constexpr auto unary_kernel = act_kernel<T, kAct, kUsePDL>;
+  static constexpr auto unary_kernel = act_kernel<T, kAct, kUsePDL, kFastMath>;
 
   // Use the explicit non-const function-pointer type (mirrors select_kernel's
   // kernel_fn_t) rather than a trailing `decltype(unary_kernel<...>)` return,

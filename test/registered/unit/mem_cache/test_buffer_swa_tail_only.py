@@ -60,8 +60,10 @@ def _pipeline(*, tail_only: bool, window: int = 2, swa_page_size: int = 2):
             swa_component=SimpleNamespace(
                 pool_name=PoolName.SWA, full_window_pages=window
             ),
-            auxiliary_swa_component=SimpleNamespace(
-                pool_name=PoolName.AUXILIARY_SWA, full_window_pages=window + 1
+            further_window_components=(
+                SimpleNamespace(
+                    pool_name=PoolName.AUXILIARY_SWA, full_window_pages=window + 1
+                ),
             ),
             write_backlog_cap=128,
         )

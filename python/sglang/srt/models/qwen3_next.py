@@ -9,6 +9,7 @@ from torch import nn
 
 from sglang.kernels.ops.attention.fla.fused_norm_gate import FusedRMSNormGated
 from sglang.kernels.ops.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
+from sglang.kernels.ops.attention.qk_gemma_norm_rope import qk_gemma_norm_rope
 from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
     fused_qkvzba_split_reshape_cat,
 )
@@ -42,7 +43,7 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
-from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.rotary_embedding import RotaryEmbedding, get_rope
 from sglang.srt.layers.utils.common import add_prefix, set_weight_attrs
 from sglang.srt.layers.utils.layer_list import make_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -81,8 +82,10 @@ _is_npu = is_npu()
 _is_cpu = is_cpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 # The fused attention prologue is a gfx950-only aiter op; gate the arch here so
-# other HIP devices never take the fused path (and never pay a double qkv_proj).
+# other HIP devices never take the fused path.
 _use_fused_prologue = _use_aiter and is_gfx95_supported()
+# The Triton prologue (qk_gemma_norm_rope) is validated on gfx950 only.
+_use_triton_prologue = _is_hip and is_gfx95_supported()
 _is_amx_available = cpu_has_amx_support()
 
 
@@ -103,6 +106,27 @@ def _fused_attention_prologue():
     except ImportError:
         return None
     return fused_attention_qk_norm_rope, fused_attention_qk_norm_rope_supported
+
+
+def _supports_triton_prologue(
+    *, rope: nn.Module, head_dim: int, attn_output_gate: bool
+) -> bool:
+    # The Triton prologue follows the native split + GemmaRMSNorm + neox RoPE
+    # (fallback kernel, fp32 cos/sin cache) rounding; it needs power-of-two
+    # head_dim and rotary_dim / 2.
+    return (
+        _use_triton_prologue
+        and attn_output_gate
+        and type(rope) is RotaryEmbedding
+        and rope.use_fallback_kernel
+        # RL on-policy forces the native RoPE to match the trainer bitwise.
+        and not rope._force_native
+        and rope.is_neox_style
+        and rope.cos_sin_cache.dtype == torch.float32
+        and rope.rotary_dim % 2 == 0
+        and (rope.rotary_dim // 2) & (rope.rotary_dim // 2 - 1) == 0
+        and head_dim & (head_dim - 1) == 0
+    )
 
 
 if _is_npu:
@@ -740,6 +764,11 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         )
 
         self.alt_stream = alt_stream
+        self.use_triton_prologue = _supports_triton_prologue(
+            rope=self.rotary_emb,
+            head_dim=self.head_dim,
+            attn_output_gate=self.attn_output_gate,
+        )
 
     def _apply_qk_norm(
         self, q: torch.Tensor, k: torch.Tensor
@@ -763,7 +792,7 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         k = k_by_head.view(k.shape)
         return q, k
 
-    def forward_prepare_fused(self, positions, hidden_states):
+    def forward_prepare_fused(self, positions, qkv):
         # gfx950 single-launch prologue: [Q||gate] split + Q/K GemmaRMSNorm +
         # partial RoPE. Returns None when unavailable or unsupported so the
         # caller falls back to the native prologue.
@@ -771,7 +800,6 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         if ops is None:
             return None
         fused_prologue, prologue_supported = ops
-        qkv, _ = self.qkv_proj(hidden_states)
         cos_sin_cache = self.rotary_emb.cos_sin_cache
         ok, _ = prologue_supported(
             qkv, self.q_norm.weight, self.k_norm.weight, positions, cos_sin_cache
@@ -788,8 +816,24 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
             gate.reshape(-1, self.q_size),
         )
 
-    def forward_prepare_native(self, positions, hidden_states):
-        qkv, _ = self.qkv_proj(hidden_states)
+    def forward_prepare_triton(self, positions, qkv):
+        rope = self.rotary_emb
+        if rope.cos_sin_cache.device != qkv.device:
+            rope.cos_sin_cache = rope.cos_sin_cache.to(qkv.device)
+        return qk_gemma_norm_rope(
+            qkv,
+            positions,
+            rope.cos_sin_cache,
+            self.q_norm.weight,
+            self.k_norm.weight,
+            self.q_norm.variance_epsilon,
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            rope.rotary_dim,
+        )
+
+    def forward_prepare_native(self, positions, qkv):
         if self.attn_output_gate:
             q_gate, k, v = qkv.split(
                 [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
@@ -807,8 +851,7 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         q, k = self.rotary_emb(positions, q, k)
         return q, k, v, gate
 
-    def forward_prepare_npu(self, positions, hidden_states, forward_batch):
-        qkv, _ = self.qkv_proj(hidden_states)
+    def forward_prepare_npu(self, positions, qkv, forward_batch):
         # Calculate first full attention layer ID based on config
         if self.attn.layer_id == (self.config.full_attention_interval - 1):
             self.rotary_emb.get_cos_sin_with_position(positions)
@@ -834,24 +877,26 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         """Full attention forward pass."""
+        # Computed once: a fused prologue that turns out unsupported falls back
+        # to the next one on the same qkv.
+        qkv, _ = self.qkv_proj(hidden_states)
         fused = None
         if _use_fused_prologue and self.attn_output_gate:
-            fused = self.forward_prepare_fused(positions, hidden_states)
+            fused = self.forward_prepare_fused(positions, qkv)
         if fused is not None:
             q, k, v, gate = fused
+        elif self.use_triton_prologue:
+            q, k, v, gate = self.forward_prepare_triton(positions, qkv)
         elif (
             not _is_npu
             or forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
             or not self.attn_output_gate
         ):
-            q, k, v, gate = self.forward_prepare_native(
-                positions=positions,
-                hidden_states=hidden_states,
-            )
+            q, k, v, gate = self.forward_prepare_native(positions=positions, qkv=qkv)
         else:
             q, k, v, gate = self.forward_prepare_npu(
                 positions=positions,
-                hidden_states=hidden_states,
+                qkv=qkv,
                 forward_batch=forward_batch,
             )
 

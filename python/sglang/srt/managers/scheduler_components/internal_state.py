@@ -18,7 +18,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.scheduler_components.memory_usage import build_memory_usage
 from sglang.srt.runtime_context import get_context, get_exec, get_parallel
-from sglang.srt.server_args import compute_world_size
+from sglang.srt.server_args import compute_world_size, redact_server_args_secrets
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 
 if TYPE_CHECKING:
@@ -44,7 +44,9 @@ class SchedulerInternalStateController:
     def get_internal_state(self, recv_req: GetInternalStateReq):
         # Resolved config (pristine server_args + post-publish overrides) so a
         # readback reflects values changed via /set_internal_state, not startup.
-        state = get_context().resolved_server_args_dict()
+        # Every reader reports it (`internal_states` in `/server_info` and
+        # `Engine.get_server_info`), so the credentials stay out.
+        state = redact_server_args_secrets(get_context().resolved_server_args_dict())
         for contribute in (
             self._add_topology,
             self._add_memory_usage,

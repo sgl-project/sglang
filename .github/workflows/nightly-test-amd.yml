@@ -90,8 +90,8 @@ on:
           - nightly-8-gpu-kimi-k26
           # 8-GPU MI30x tests moved out of PR CI (Kimi-K2, MoRI EP extra configs)
           - nightly-8-gpu
-          # 8-GPU Kimi-K3 (MI35x only - native MXFP4 needs gfx95x)
-          - nightly-8-gpu-mi35x-kimi-k3
+          # 8-GPU Kimi-K3.1-Pro (MI35x only - native MXFP4 needs gfx95x)
+          - nightly-8-gpu-mi35x-kimi-k31-pro
           # 8-GPU Qwen3.8-MXFP4 (MI35x only - MXFP4 needs gfx95x)
           - nightly-8-gpu-mi35x-qwen38-mxfp4
           # 8-GPU Qwen 3.5 (MI30x + MI35x)
@@ -1698,8 +1698,8 @@ jobs:
   # ==============================================================================
   # 8-GPU Kimi-K2.6 (MI30x)
   #
-  # Kept on MI30x: Kimi-K3 needs gfx95x for its native MXFP4 weights, so it
-  # cannot take over here the way it does on MI35x.
+  # Kept on MI30x: Kimi-K3.1-Pro needs gfx95x for its native MXFP4 weights, so
+  # it cannot take over here the way it does on MI35x.
   # ==============================================================================
 
   nightly-8-gpu-kimi-k26:
@@ -1785,16 +1785,16 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   # ==============================================================================
-  # 8-GPU Kimi-K3 (MI35x only - native MXFP4 needs gfx95x)
+  # 8-GPU Kimi-K3.1-Pro (MI35x only - native MXFP4 needs gfx95x)
   # ==============================================================================
 
-  nightly-8-gpu-mi35x-kimi-k3:
-    name: ${{ format('nightly-8-gpu-mi35x-kimi-k3 ({0}, linux-mi35x-gpu-8)', matrix.rocm_version) }}
+  nightly-8-gpu-mi35x-kimi-k31-pro:
+    name: ${{ format('nightly-8-gpu-mi35x-kimi-k31-pro ({0}, linux-mi35x-gpu-8)', matrix.rocm_version) }}
     strategy:
       fail-fast: false
       matrix:
         rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || github.event.schedule == '0 16 * * *' && '["rocm10"]' || github.event.schedule == '0 21 2-30/2 * *' && '["rocm724"]' || github.event.schedule == '0 21 1-31/2 * *' && '["rocm720"]' || '["rocm10", "rocm724", "rocm720"]') }}
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-kimi-k3,'))
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-kimi-k31-pro,'))
     runs-on: linux-mi35x-gpu-8
     steps:
       - name: Checkout code
@@ -1819,16 +1819,16 @@ jobs:
           # Install tabulate for run_suite.py (missing in MI35x container)
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
 
-      # The 2.8T MXFP4 checkpoint is ~1.56 TB, so weight download and load
+      # The 2.8T MXFP4 checkpoint is ~1.5 TB, so weight download and load
       # dominate wall time well before the eval itself starts.
-      - name: Accuracy Test MI35x ROCm (8-GPU Kimi-K3)
+      - name: Accuracy Test MI35x ROCm (8-GPU Kimi-K3.1-Pro)
         timeout-minutes: 300
         run: |
           > github_summary.md  # Clear summary file
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
             -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
-            python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-mi35x-kimi-k3 --nightly --timeout-per-file 14400 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
+            python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-mi35x-kimi-k31-pro --nightly --timeout-per-file 14400 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
@@ -1838,7 +1838,7 @@ jobs:
       # throughput is never measured on a build that got the tokens wrong.
       # continue-on-error matches every other combined accuracy + perf job here,
       # so a perf hiccup cannot turn the accuracy result red.
-      - name: Performance Test MI35x ROCm (8-GPU Kimi-K3)
+      - name: Performance Test MI35x ROCm (8-GPU Kimi-K3.1-Pro)
         if: ${{ !cancelled() }}
         timeout-minutes: 300
         continue-on-error: true
@@ -1847,7 +1847,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
             -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
-            python3 registered/amd/perf/mi35x/test_kimi_k3_perf_mi35x.py || TEST_EXIT_CODE=$?
+            python3 registered/amd/perf/mi35x/test_kimi_k31_pro_perf_mi35x.py || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
@@ -2499,8 +2499,8 @@ jobs:
       # 8-GPU Kimi-K2.6 (MI30x)
       - nightly-8-gpu-kimi-k26
       - nightly-8-gpu
-      # 8-GPU Kimi-K3 (MI35x only - native MXFP4 needs gfx95x)
-      - nightly-8-gpu-mi35x-kimi-k3
+      # 8-GPU Kimi-K3.1-Pro (MI35x only - native MXFP4 needs gfx95x)
+      - nightly-8-gpu-mi35x-kimi-k31-pro
       # 8-GPU Qwen3.8-MXFP4 (MI35x only - MXFP4 needs gfx95x)
       - nightly-8-gpu-mi35x-qwen38-mxfp4
       # 8-GPU Qwen 3.5 (MI30x + MI35x)

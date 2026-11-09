@@ -139,33 +139,85 @@ def build_ragged_verify_window(
     )
 
 
-@triton.jit
-def _ragged_finalize_kernel(
-    req_ptr,
-    within_ptr,
-    prefix_ptr,
-    cache_ptr,
-    pos_out_ptr,
-    cache_out_ptr,
+@triton.jit(
+    do_not_specialize=[
+        "req_to_token_stride",
+        "draft_block_ids_stride",
+        "draft_tokens_stride",
+        "num_rows",
+        "bs",
+        "n",
+        "width",
+    ]
+)
+def _ragged_verify_window_kernel(
+    verify_lens_ptr,
+    prefix_lens_ptr,
+    req_pool_indices_ptr,
+    req_to_token_ptr,
+    req_to_token_stride,
+    draft_block_ids_ptr,
+    draft_block_ids_stride,
+    draft_tokens_ptr,
+    draft_tokens_stride,
+    positions_ptr,
+    cache_loc_ptr,
+    verify_ids_ptr,
+    window_index_ptr,
+    num_rows,
     bs,
     n,
-    real_len,
-    BLOCK: tl.constexpr,
+    width,
+    BLOCK_T: tl.constexpr,
+    BLOCK_BS: tl.constexpr,
 ):
-    pid = tl.program_id(0)
-    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    offs = tl.program_id(0) * BLOCK_T + tl.arange(0, BLOCK_T)
     mask = offs < n
-    req = tl.load(req_ptr + offs, mask=mask, other=0)
-    within = tl.load(within_ptr + offs, mask=mask, other=0)
-    valid = req < bs
+    req = tl.zeros([BLOCK_T], dtype=tl.int32)
+    start = tl.zeros([BLOCK_T], dtype=tl.int32)
+    total = 0
+    for row0 in range(0, num_rows, BLOCK_BS):
+        rows = row0 + tl.arange(0, BLOCK_BS)
+        lens = tl.load(verify_lens_ptr + rows, mask=rows < num_rows, other=0)
+        lens = lens.to(tl.int32)
+        incl = total + tl.cumsum(lens, axis=0)
+        before = incl[None, :] <= offs[:, None]
+        req += tl.sum(before.to(tl.int32), axis=1)
+        start += tl.sum(tl.where(before, lens[None, :], 0), axis=1)
+        total += tl.sum(lens, axis=0)
+    valid = mask & (offs < total)
     safe_req = tl.minimum(req, bs - 1)
-    prefix = tl.load(prefix_ptr + safe_req, mask=mask, other=0)
-    pos = tl.where(valid, prefix + within, 0)
-    lmask = mask & (offs < real_len)
-    cl = tl.load(cache_ptr + offs, mask=lmask, other=0)
-    cl = tl.where(valid, cl, 0)
-    tl.store(pos_out_ptr + offs, pos, mask=mask)
-    tl.store(cache_out_ptr + offs, cl, mask=mask)
+    within = tl.where(valid, offs - start, 0)
+    prefix = tl.load(prefix_lens_ptr + safe_req, mask=mask, other=0).to(tl.int64)
+    pool_row = tl.load(req_pool_indices_ptr + safe_req, mask=mask, other=0).to(tl.int64)
+    cache_loc = tl.load(
+        req_to_token_ptr + pool_row * req_to_token_stride + prefix + within,
+        mask=valid,
+        other=0,
+    )
+    anchor = tl.load(
+        draft_block_ids_ptr + safe_req.to(tl.int64) * draft_block_ids_stride,
+        mask=mask,
+        other=0,
+    )
+    draft = tl.load(
+        draft_tokens_ptr
+        + safe_req.to(tl.int64) * draft_tokens_stride
+        + tl.maximum(within - 1, 0),
+        mask=mask,
+        other=0,
+    )
+    verify_id = tl.where(within == 0, anchor.to(tl.int64), draft.to(tl.int64))
+    tl.store(positions_ptr + offs, tl.where(valid, prefix + within, 0), mask=mask)
+    tl.store(
+        cache_loc_ptr + offs, tl.where(valid, cache_loc.to(tl.int64), 0), mask=mask
+    )
+    tl.store(verify_ids_ptr + offs, tl.where(valid, verify_id, 0), mask=mask)
+    tl.store(
+        window_index_ptr + offs,
+        tl.where(valid, safe_req.to(tl.int64) * width + within, -1),
+        mask=mask,
+    )
 
 
 def build_ragged_verify_window_triton(
@@ -179,61 +231,42 @@ def build_ragged_verify_window_triton(
     verify_num_draft_tokens: int,
     model_runner,
 ) -> RaggedVerifyWindow:
-    prefix_lens = batch.seq_lens
-    verify_lens = layout.verify_lens.to(device=device, dtype=torch.int32)
+    req_to_token = model_runner.req_to_token_pool.req_to_token
+    verify_lens = layout.verify_lens.contiguous()
+    num_rows = verify_lens.shape[0]
     padded_total = layout.graph_num_tokens
-
-    req_id, within, valid = compact_row_index_triton(
-        verify_lens=verify_lens, padded_total=padded_total, device=device
-    )
-    real_cache_loc = assign_extend_cache_locs_func(
-        req_pool_indices=batch.req_pool_indices,
-        req_to_token=model_runner.req_to_token_pool.req_to_token,
-        start_offset=prefix_lens,
-        end_offset=prefix_lens + verify_lens.to(prefix_lens.dtype),
-        batch_size=bs,
-        draft_token_num=verify_num_draft_tokens,
-        device=device,
-    )
-    prefix_i64 = prefix_lens.to(device=device, dtype=torch.int64).contiguous()
+    assert num_rows == bs and draft_tokens.stride(1) == 1
     positions = torch.empty(padded_total, dtype=torch.int64, device=device)
-    verify_cache_loc = torch.empty(
-        padded_total, dtype=real_cache_loc.dtype, device=device
-    )
-    BLOCK = 256
-    grid = (triton.cdiv(padded_total, BLOCK),)
-    _ragged_finalize_kernel[grid](
-        req_id,
-        within,
-        prefix_i64,
-        real_cache_loc,
+    verify_cache_loc = torch.empty_like(positions)
+    verify_ids = torch.empty_like(positions)
+    window_index = torch.empty_like(positions)
+    _ragged_verify_window_kernel[(triton.cdiv(padded_total, 32),)](
+        verify_lens,
+        batch.seq_lens,
+        batch.req_pool_indices,
+        req_to_token,
+        req_to_token.stride(0),
+        draft_block_ids,
+        draft_block_ids.stride(0),
+        draft_tokens,
+        draft_tokens.stride(0),
         positions,
         verify_cache_loc,
+        verify_ids,
+        window_index,
+        num_rows,
         bs,
         padded_total,
-        real_cache_loc.shape[0],
-        BLOCK=BLOCK,
-    )
-
-    verify_ids = compact_verify_ids_triton(
-        draft_block_ids=draft_block_ids,
-        draft_tokens=draft_tokens,
-        layout=layout,
-        device=device,
+        verify_num_draft_tokens,
+        BLOCK_T=32,
+        BLOCK_BS=256,
     )
     return RaggedVerifyWindow(
         positions=positions,
         verify_cache_loc=verify_cache_loc,
         verify_ids=verify_ids,
-        window_index=torch.where(
-            valid,
-            req_id.clamp(max=bs - 1).to(torch.int64) * verify_num_draft_tokens + within,
-            -1,
-        ),
+        window_index=window_index,
     )
-
-
-_SEARCH_NBITS = 11
 
 
 def compact_verify_ids(
@@ -276,120 +309,6 @@ def compact_row_index(
         valid, row - start[req_id.clamp(max=bs - 1)], torch.zeros_like(row)
     )
     return req_id, within, valid
-
-
-@triton.jit
-def _compact_row_index_kernel(
-    incl_ptr,
-    req_out_ptr,
-    within_out_ptr,
-    valid_out_ptr,
-    bs,
-    n,
-    BLOCK: tl.constexpr,
-    NBITS: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    offs = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offs < n
-    row = offs.to(tl.int64)
-    real_total = tl.load(incl_ptr + (bs - 1))
-    lo = tl.zeros([BLOCK], dtype=tl.int32)
-    hi = tl.full([BLOCK], bs, dtype=tl.int32)
-    for _ in range(NBITS):
-        mid = (lo + hi) // 2
-        active = lo < hi
-        val = tl.load(incl_ptr + tl.minimum(mid, bs - 1), mask=mask, other=0)
-        go_right = val <= row
-        lo = tl.where(active & go_right, mid + 1, lo)
-        hi = tl.where(active & (~go_right), mid, hi)
-    req = lo
-    gidx = tl.maximum(req - 1, 0)
-    start = tl.load(incl_ptr + gidx, mask=mask, other=0)
-    start = tl.where(req > 0, start, 0)
-    valid = row < real_total
-    within = tl.where(valid, row - start, 0)
-    req_final = tl.where(valid, req.to(tl.int64), bs)
-    tl.store(req_out_ptr + offs, req_final, mask=mask)
-    tl.store(within_out_ptr + offs, within, mask=mask)
-    tl.store(valid_out_ptr + offs, valid, mask=mask)
-
-
-def compact_row_index_triton(
-    *,
-    verify_lens: torch.Tensor,
-    padded_total: int,
-    device,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    verify_lens = verify_lens.to(device=device, dtype=torch.int64).contiguous()
-    bs = verify_lens.shape[0]
-    # The search converges only for bs <= 2**(NBITS-1); beyond it silently mismaps.
-    assert bs <= 1 << (_SEARCH_NBITS - 1), (
-        f"bs={bs} exceeds row-index search capacity {1 << (_SEARCH_NBITS - 1)}"
-    )
-    incl = torch.cumsum(verify_lens, dim=0).contiguous()
-    req = torch.empty(padded_total, dtype=torch.int64, device=device)
-    within = torch.empty(padded_total, dtype=torch.int64, device=device)
-    valid = torch.empty(padded_total, dtype=torch.bool, device=device)
-    BLOCK = 256
-    grid = (triton.cdiv(padded_total, BLOCK),)
-    _compact_row_index_kernel[grid](
-        incl, req, within, valid, bs, padded_total, BLOCK=BLOCK, NBITS=_SEARCH_NBITS
-    )
-    return req, within, valid
-
-
-@triton.jit
-def _compact_verify_ids_gather_kernel(
-    req_ptr,
-    within_ptr,
-    draft_block_ids_ptr,
-    draft_tokens_ptr,
-    out_ptr,
-    bs,
-    gamma,
-    n,
-    BLOCK: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    offs = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offs < n
-    req = tl.load(req_ptr + offs, mask=mask, other=0)
-    within = tl.load(within_ptr + offs, mask=mask, other=0)
-    valid = req < bs
-    safe_req = tl.minimum(req, bs - 1)
-    anchor = tl.load(draft_block_ids_ptr + safe_req * gamma, mask=mask, other=0)
-    wcol = tl.maximum(within - 1, 0)
-    draft = tl.load(draft_tokens_ptr + safe_req * gamma + wcol, mask=mask, other=0)
-    v = tl.where(within == 0, anchor, draft)
-    v = tl.where(valid, v, 0)
-    tl.store(out_ptr + offs, v.to(tl.int64), mask=mask)
-
-
-def compact_verify_ids_triton(
-    *,
-    draft_block_ids: torch.Tensor,
-    draft_tokens: torch.Tensor,
-    layout: RaggedVerifyLayout,
-    device: str,
-) -> torch.Tensor:
-    req, within, _valid = compact_row_index_triton(
-        verify_lens=layout.verify_lens,
-        padded_total=layout.graph_num_tokens,
-        device=device,
-    )
-    bs = layout.verify_lens.shape[0]
-    gamma = draft_tokens.shape[1]
-    draft_block_ids = draft_block_ids.to(device=device, dtype=torch.int64).contiguous()
-    draft_tokens = draft_tokens.to(device=device, dtype=torch.int64).contiguous()
-    n = layout.graph_num_tokens
-    out = torch.empty(n, dtype=torch.int64, device=device)
-    BLOCK = 256
-    grid = (triton.cdiv(n, BLOCK),)
-    _compact_verify_ids_gather_kernel[grid](
-        req, within, draft_block_ids, draft_tokens, out, bs, gamma, n, BLOCK=BLOCK
-    )
-    return out
 
 
 class ScatterCompactToStrided:

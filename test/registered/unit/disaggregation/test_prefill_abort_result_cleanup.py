@@ -20,13 +20,13 @@ from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.scheduler_test_utils import release_only_retirer
+from sglang.test.scheduler_test_utils import FakeReq, release_only_retirer
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
-class _Req:
+class _Req(FakeReq):
     def __init__(self, *, allocated: bool = True):
         self.rid = "aborted-prefill"
         self.cache_request_handle = CacheRequestHandle(self.rid, 0)

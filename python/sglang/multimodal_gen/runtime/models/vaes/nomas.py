@@ -26,7 +26,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_decode_parallel_world_size,
     model_parallel_is_initialized,
 )
-from sglang.multimodal_gen.runtime.models.dits.nomas_kv_cache import (
+from sglang.multimodal_gen.runtime.layers.kvcache.nomas_segment_cache import (
     _block_mask_builder,
     _flex_kernel,
 )

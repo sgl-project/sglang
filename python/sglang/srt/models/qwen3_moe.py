@@ -495,7 +495,6 @@ class Qwen3MoeAttention(nn.Module):
         config: Optional[TConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-        dual_chunk_attention_config: Optional[dict[str, Any]] = None,
         alt_stream: Optional[torch.cuda.Stream] = None,
         sliding_window_size: int = -1,
     ) -> None:
@@ -553,7 +552,6 @@ class Qwen3MoeAttention(nn.Module):
             max_position=max_position_embeddings,
             base=rope_theta,
             rope_scaling=rope_scaling,
-            dual_chunk_attention_config=dual_chunk_attention_config,
         )
         self.compatible_with_fused_kv_buffer = (
             False if isinstance(self.rotary_emb, MRotaryEmbedding) else True
@@ -821,9 +819,6 @@ class Qwen3MoeDecoderLayer(nn.Module):
         )
         rms_norm_eps = config.rms_norm_eps
         attention_bias = config.attention_bias
-        dual_chunk_attention_config = getattr(
-            config, "dual_chunk_attention_config", None
-        )
         self.self_attn = self._make_attention(
             config,
             layer_id,
@@ -839,7 +834,6 @@ class Qwen3MoeDecoderLayer(nn.Module):
             attention_bias=attention_bias,
             quant_config=quant_config,
             prefix=add_prefix("self_attn", prefix),
-            dual_chunk_attention_config=dual_chunk_attention_config,
             alt_stream=alt_stream,
         )
 

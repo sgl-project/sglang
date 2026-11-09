@@ -9,12 +9,13 @@ from typing import Optional
 import torch
 
 from sglang.srt.configs.load_config import LoadFormat
+from sglang.srt.layers.moe.paged_experts import expert_cache
 from sglang.srt.layers.moe.paged_experts.executor import DeviceExecutor, EagerExecutor
+from sglang.srt.layers.moe.paged_experts.expert_cache import ExpertCache, fill_store
 from sglang.srt.layers.moe.paged_experts.formats import (
     FORMATS,
     ExpertFormat,
     PostLoad,
-    build_store,
     expert_params,
     format_for,
 )
@@ -177,6 +178,25 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
             wait=_loads_mapped_files(),
         )
 
+    def _expert_cache(self, layer) -> Optional[ExpertCache]:
+        """The layer's expert cache entry, once its checkpoint files are loaded: for a layer
+        of more than K experts, with --paged-experts-enable-disk."""
+        if self.num_experts <= self.num_resident:
+            return None
+        rows = self.loads.rows_like
+        if not get_exec().moe.paged_experts_enable_disk:
+            expert_cache.hint_disk(layer, rows, self.num_experts, self.contract.repacks)
+            return None
+        return ExpertCache.for_layer(
+            layer,
+            self.format,
+            self.runner,
+            self.base_method,
+            rows,
+            self.num_experts,
+            self.contract.repacks,
+        )
+
     def process_weights_after_loading(self, layer):
         step = PostLoad(
             layer,
@@ -185,7 +205,8 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
             self.contract.repacks,
             self.format.unpaged,
         )
-        self.store = build_store(step)
+        width = _router_top_k(layer)
+        self.store = fill_store(step, self._expert_cache(layer), width)
         step.finish(self.store)
         self.loads.drop()  # the checkpoint views the loads held
         self.loads = None

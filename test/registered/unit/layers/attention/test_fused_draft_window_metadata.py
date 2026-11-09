@@ -20,7 +20,11 @@ from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
 from sglang.srt.mem_cache.kv.build import UnifiedBuildContext, build_kv_storage
-from sglang.srt.mem_cache.kv.decl import MHAGeometry, kv_layer_decls
+from sglang.srt.mem_cache.kv.decl import (
+    MHAGeometry,
+    kv_layer_decls,
+    window_sub_pool_name,
+)
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec, MHAView
 from sglang.srt.mem_cache.kv.plan import plan_kv_storage
 from sglang.srt.mem_cache.kv.routed_cache import RoutedKVCache
@@ -68,7 +72,11 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
             ),
             num_runners=1,
             ctx=PlacementContext(
-                host_names=("full", "swa") if target_window else ("full",),
+                host_names=(
+                    ("full", window_sub_pool_name(target_window))
+                    if target_window
+                    else ("full",)
+                ),
                 target_window=target_window,
             ),
             store_dtype=torch.bfloat16,
@@ -76,9 +84,9 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
         self.assertIsNotNone(decision.placement, decision.declined)
         placement = decision.placement
         # A draft window rides in the target window of its length; any other
-        # draft window gets a band of its own.
+        # draft window gets a band of its own, named by its length.
         fused = window == target_window
-        host = "swa" if fused or not target_window else "draft_swa"
+        host = window_sub_pool_name(window)
         self.assertEqual(placement.hosts(), (host,))
         self.assertEqual(host in placement.new_bands, not fused, placement.new_bands)
         # The target: a full layer and, when it has one, a window layer.
@@ -115,7 +123,7 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
                 need_sort=False,
                 max_num_reqs=2,
                 model_context_len=1024,
-                lazy_compaction=False,
+                lazy_compaction=True,
             ),
         )
         allocator = storage.allocator
@@ -219,7 +227,9 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
         if target_window and not fused:
             # A draft band of its own: reading the target's window would be a
             # wrong route, and observable.
-            target = allocator.id_spaces()["swa"].ids(virtual)
+            target = allocator.id_spaces()[window_sub_pool_name(target_window)].ids(
+                virtual
+            )
             self.assertFalse(torch.equal(target, draft_window))
         return backend, batch, draft_window, host
 
@@ -301,7 +311,7 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
         updater.kv_last_page_len = torch.ones(1, dtype=torch.int32, device="cuda")
         updater._swa_kv_pool = self.bound_pool
         updater._swa_space = reader.space(IdSpaceKind.SLIDING_WINDOW)
-        updater.prefill_wrapper_ragged = None
+        updater.prefill_wrappers_ragged = [None, None]
         planned = []
 
         def begin_forward(qo_indptr, kv_indptr, kv_indices, *args, **kwargs):

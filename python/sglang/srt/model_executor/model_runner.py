@@ -106,7 +106,7 @@ from sglang.srt.managers.schedule_batch import sanity_check_mm_pad_shift_value
 from sglang.srt.mem_cache import kv_cache_dtype
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
-from sglang.srt.mem_cache.kv.router import STATE_PART
+from sglang.srt.mem_cache.kv.decl import STATE_PART
 from sglang.srt.mem_cache.kv_cache_configurator import (
     KVCacheConfigurator,
 )
@@ -255,6 +255,7 @@ from sglang.srt.utils import (
     set_cuda_arch,
     slow_rank_detector,
 )
+from sglang.srt.utils.aiter_tuned_tables import install_aiter_tuned_tables
 from sglang.srt.utils.device_timer import device_timer_ctx
 from sglang.srt.utils.nvtx_pytorch_hooks import PytHooks
 from sglang.srt.utils.nvtx_utils import profile_range
@@ -1352,6 +1353,8 @@ class ModelRunner:
             maybe_downgrade_dtype_for_legacy_gpu(model_config=self.model_config)
 
         set_cuda_arch()
+        # before the model looks up an aiter GEMM or fused-MoE config
+        install_aiter_tuned_tables()
 
         draft_load_format = self.draft_load_format
         self.load_config = build_load_config(
@@ -1379,15 +1382,21 @@ class ModelRunner:
             load_format=draft_load_format,
         )
 
-        with self._load_format_scope(draft_load_format):
-            loaded = load_model_with_memory_saver(
-                model_config=self.model_config,
-                load_config=self.load_config,
-                device=self.device,
-                gpu_id=self.gpu_id,
-                memory_saver_adapter=self.memory_saver_adapter,
-                is_draft_worker=self.is_draft_worker,
-            )
+        try:
+            with self._load_format_scope(draft_load_format):
+                loaded = load_model_with_memory_saver(
+                    model_config=self.model_config,
+                    load_config=self.load_config,
+                    device=self.device,
+                    gpu_id=self.gpu_id,
+                    memory_saver_adapter=self.memory_saver_adapter,
+                    is_draft_worker=self.is_draft_worker,
+                )
+        finally:
+            if get_exec().moe.enable_paged_experts:
+                from sglang.srt.layers.moe.paged_experts import expert_cache
+
+                expert_cache.loading_done()
         self.loader = loaded.loader
         self.model = loaded.model
         current_platform.post_load_model(self.model)

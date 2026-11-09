@@ -378,6 +378,7 @@ class GenerateMetaInfo(msgspec.Struct, kw_only=True, frozen=True):
     audio_tokens: Optional[int] = None
     video_tokens: Optional[int] = None
     cached_tokens_details: Optional[CachedTokensDetails] = None
+    dp_rank: Optional[int] = None
 
     @classmethod
     def from_json_value(cls, value: Any) -> "GenerateMetaInfo":
@@ -1825,6 +1826,8 @@ def decode_GenerateMetaInfo(value: Any) -> GenerateMetaInfo:
             kw["video_tokens"] = None if x is None else _expect_uint(x, expected="u32")
         elif key == "cached_tokens_details":
             kw["cached_tokens_details"] = None if x is None else decode_CachedTokensDetails(x)
+        elif key == "dp_rank":
+            kw["dp_rank"] = None if x is None else _expect_uint(x, expected="u32")
     return GenerateMetaInfo(**kw)
 
 
@@ -1865,6 +1868,7 @@ def encode_GenerateMetaInfo(v: GenerateMetaInfo) -> Dict[str, Any]:
     if v.video_tokens is not None:
         d["video_tokens"] = v.video_tokens
     d["cached_tokens_details"] = None if v.cached_tokens_details is None else encode_CachedTokensDetails(v.cached_tokens_details)
+    d["dp_rank"] = v.dp_rank
     return d
 
 

@@ -45,6 +45,24 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator
 
 
+def _window_evictable(tree_cache, c: ChainAllocator) -> int:
+    """Evictable tokens of the chain's target window."""
+    return tree_cache.window_evictable_size(c.roles.window)
+
+
+def _auxiliary_windows(c: ChainAllocator) -> List[str]:
+    """The chain's window sub-pools beside the target's (a draft's own)."""
+    return [b.sub_pool_name for b in c._windows if b is not c.swa_attn_allocator]
+
+
+def _auxiliary_evictable(tree_cache, c: ChainAllocator) -> int:
+    return sum(tree_cache.window_evictable_size(n) for n in _auxiliary_windows(c))
+
+
+def _window_evicted(result) -> bool:
+    return any(result.window_num_tokens_evicted.values())
+
+
 class ChainAdmissionRules(msgspec.Struct, frozen=True, kw_only=True):
     """Which admission rule a unified chain uses.
 
@@ -445,7 +463,7 @@ class _TokenEndsPolicy(_WindowPolicy):
         models, so the tree's `full_*` accounting is the full-attention one.
         """
         full_evictable_tokens = tree_cache.full_evictable_size()
-        swa_evictable_tokens = tree_cache.swa_evictable_size()
+        swa_evictable_tokens = _window_evictable(tree_cache, c)
         full_tokens += (
             c.full_available_size() + full_evictable_tokens - full_budget_tokens
         )
@@ -526,11 +544,12 @@ class _TokenEndsPolicy(_WindowPolicy):
         )
         if not realization.flush_ends:
             return realization.fits
-        c.full_attn_allocator.flush_for_allocation()
-        c.swa_attn_allocator.flush_for_allocation()
-        return ends_fit(
-            _snapshot(c), ends, num_full_pages, num_swa_pages, compacted=False
-        )
+        with c.settle_pending_for_recovery():
+            c.full_attn_allocator.flush_for_allocation()
+            c.swa_attn_allocator.flush_for_allocation()
+            return ends_fit(
+                _snapshot(c), ends, num_full_pages, num_swa_pages, compacted=False
+            )
 
     def admission_rules(self, c: ChainAllocator) -> ChainAdmissionRules:
         return ChainAdmissionRules(window="joint")
@@ -626,7 +645,7 @@ class _TokenEndsPolicy(_WindowPolicy):
             num_tokens,
             required_swa,
             full_evictable_tokens=tree_cache.full_evictable_size(),
-            swa_evictable_tokens=tree_cache.swa_evictable_size(),
+            swa_evictable_tokens=_window_evictable(tree_cache, c),
             prefer_swa=prefer_swa,
         )
         if reclaim_plan is None:
@@ -634,7 +653,10 @@ class _TokenEndsPolicy(_WindowPolicy):
         full_reclaim, swa_reclaim = reclaim_plan
         if full_reclaim or swa_reclaim:
             tree_cache.evict_for_alloc(
-                EvictParams(num_tokens=full_reclaim, swa_num_tokens=swa_reclaim),
+                EvictParams(
+                    num_tokens=full_reclaim,
+                    window_num_tokens={c.roles.window: swa_reclaim},
+                ),
                 allocation_reclaim_satisfied=lambda: (
                     c.reclaim_plan(num_tokens, required_swa) == (0, 0)
                 ),
@@ -740,7 +762,7 @@ class _FloatChainPolicy(_WindowPolicy):
         available = c.swa_available_size()
         if available < swa_tokens:
             tree_cache.evict_for_alloc(
-                EvictParams(swa_num_tokens=swa_tokens - available)
+                EvictParams(window_num_tokens={c.roles.window: swa_tokens - available})
             )
             available = c.swa_available_size()
         if available < swa_tokens:
@@ -754,6 +776,14 @@ class _FloatChainPolicy(_WindowPolicy):
     ) -> bool:
         if full_tokens < 0 or swa_tokens < 0:
             return False
+        if c.can_reserve(full_tokens, swa_tokens):
+            return True
+        with c.settle_pending_for_recovery():
+            return self._recover_capacity(c, full_tokens, swa_tokens)
+
+    def _recover_capacity(
+        self, c: ChainAllocator, full_tokens: int, swa_tokens: int
+    ) -> bool:
         if c.can_reserve(full_tokens, swa_tokens):
             return True
         if full_tokens != swa_tokens:
@@ -846,8 +876,9 @@ class _FloatChainPolicy(_WindowPolicy):
         c.flush_deferred_full_frees()
         if target_size <= c.mamba_allocator.available_size():
             return
-        c.full_attn_allocator.flush_for_allocation()
-        relieve_for_alloc(c.mamba_allocator, target_size)
+        with c.settle_pending_for_recovery():
+            c.full_attn_allocator.flush_for_allocation()
+            relieve_for_alloc(c.mamba_allocator, target_size)
 
     def admission_rules(self, c: ChainAllocator) -> ChainAdmissionRules:
         # State competes for the shared gap too; keep the split token admission
@@ -902,7 +933,7 @@ class _FloatChainPolicy(_WindowPolicy):
         full_reclaim = tree_cache.full_evictable_size()
         if c._full_cap_reclaim(num_tokens) > full_reclaim:
             return False
-        swa_reclaim = tree_cache.swa_evictable_size()
+        swa_reclaim = _window_evictable(tree_cache, c)
         state_reclaim = tree_cache.mamba_evictable_size()
         fa, sa, ma = (
             c.full_attn_allocator,
@@ -936,7 +967,10 @@ class _FloatChainPolicy(_WindowPolicy):
         state_freed = 0
         if full_reclaim or swa_reclaim:
             result = tree_cache.evict_for_alloc(
-                EvictParams(num_tokens=num_tokens, swa_num_tokens=num_tokens),
+                EvictParams(
+                    num_tokens=num_tokens,
+                    window_num_tokens={c.roles.window: num_tokens},
+                ),
                 allocation_reclaim_satisfied=lambda: (
                     not c._full_cap_reclaim(num_tokens)
                     and float_reclaim_satisfied(_snapshot(c), chain, num_tokens)
@@ -944,9 +978,7 @@ class _FloatChainPolicy(_WindowPolicy):
             )
             state_freed = result.mamba_num_evicted
             if (
-                result.num_tokens_evicted
-                or result.swa_num_tokens_evicted
-                or state_freed
+                result.num_tokens_evicted or _window_evicted(result) or state_freed
             ) and c.ensure_capacity(num_tokens, num_tokens):
                 return True
 
@@ -966,7 +998,7 @@ class _FloatChainPolicy(_WindowPolicy):
             )
             if (
                 result.num_tokens_evicted
-                or result.swa_num_tokens_evicted
+                or _window_evicted(result)
                 or result.mamba_num_evicted
             ):
                 return c.ensure_capacity(num_tokens, num_tokens)
@@ -1108,34 +1140,35 @@ class _MultiWindowPolicy(_WindowPolicy):
             state_slots=state_slots,
         ):
             return True
-        for band in self.flush_targets(c):
-            band.flush_for_allocation()
-        if self.can_reserve(
-            c,
-            full_tokens,
-            swa_tokens,
-            auxiliary_swa_tokens=auxiliary_swa_tokens,
-            state_slots=state_slots,
-        ):
-            return True
-        demand = {
-            next(b for b in c.bands if b.sub_pool_name == name): n
-            for name, n in self._demands(
-                c, full_tokens, swa_tokens, auxiliary_swa_tokens, state_slots
-            )
-        }
-        for band in c.bands:
-            if isinstance(band, FloatBand):
-                _float_open_short_side(band, demand)
-                if self.can_reserve(
-                    c,
-                    full_tokens,
-                    swa_tokens,
-                    auxiliary_swa_tokens=auxiliary_swa_tokens,
-                    state_slots=state_slots,
-                ):
-                    return True
-        return False
+        with c.settle_pending_for_recovery():
+            for band in self.flush_targets(c):
+                band.flush_for_allocation()
+            if self.can_reserve(
+                c,
+                full_tokens,
+                swa_tokens,
+                auxiliary_swa_tokens=auxiliary_swa_tokens,
+                state_slots=state_slots,
+            ):
+                return True
+            demand = {
+                next(b for b in c.bands if b.sub_pool_name == name): n
+                for name, n in self._demands(
+                    c, full_tokens, swa_tokens, auxiliary_swa_tokens, state_slots
+                )
+            }
+            for band in c.bands:
+                if isinstance(band, FloatBand):
+                    _float_open_short_side(band, demand)
+                    if self.can_reserve(
+                        c,
+                        full_tokens,
+                        swa_tokens,
+                        auxiliary_swa_tokens=auxiliary_swa_tokens,
+                        state_slots=state_slots,
+                    ):
+                        return True
+            return False
 
     def flush_targets(self, c):
         return tuple(sorted(c.bands, key=lambda b: b.grow_direction != "float"))
@@ -1184,7 +1217,7 @@ class _MultiWindowPolicy(_WindowPolicy):
         ):
             return False
         full_evictable = tree_cache.full_evictable_size()
-        swa_evictable = tree_cache.swa_evictable_size()
+        swa_evictable = _window_evictable(tree_cache, c)
         # Budgets already subtract pending requests and decode headroom. Price
         # those reservations together with this request in the shared envelope.
         full_tokens += max(
@@ -1199,7 +1232,7 @@ class _MultiWindowPolicy(_WindowPolicy):
             swa_tokens,
             full_evictable_tokens=full_evictable,
             swa_evictable_tokens=swa_evictable,
-            auxiliary_swa_evictable_tokens=tree_cache.auxiliary_swa_evictable_size(),
+            auxiliary_swa_evictable_tokens=_auxiliary_evictable(tree_cache, c),
             state_evictable_slots=(
                 tree_cache.mamba_evictable_size() if c.roles.state is not None else 0
             ),
@@ -1281,13 +1314,18 @@ class _MultiWindowPolicy(_WindowPolicy):
                     num_tokens=min(
                         quotas[c.roles.owner], tree_cache.full_evictable_size()
                     ),
-                    swa_num_tokens=min(
-                        quotas[c.swa_attn_allocator.sub_pool_name],
-                        tree_cache.swa_evictable_size(),
-                    ),
-                    auxiliary_swa_num_tokens=min(
-                        auxiliary_quota, tree_cache.auxiliary_swa_evictable_size()
-                    ),
+                    window_num_tokens={
+                        c.roles.window: min(
+                            quotas[c.swa_attn_allocator.sub_pool_name],
+                            _window_evictable(tree_cache, c),
+                        ),
+                        **{
+                            name: min(
+                                auxiliary_quota, tree_cache.window_evictable_size(name)
+                            )
+                            for name in _auxiliary_windows(c)
+                        },
+                    },
                 ),
                 allocation_reclaim_satisfied=lambda: c.can_reserve(
                     num_tokens,
@@ -1304,11 +1342,7 @@ class _MultiWindowPolicy(_WindowPolicy):
                 state_slots=state_slots,
             ):
                 return True
-            if not (
-                result.num_tokens_evicted
-                or result.swa_num_tokens_evicted
-                or result.auxiliary_swa_num_tokens_evicted
-            ):
+            if not (result.num_tokens_evicted or _window_evicted(result)):
                 break
         state = c.mamba_allocator
         if state is None or not tree_cache.mamba_evictable_size():

@@ -767,7 +767,7 @@ jobs:
 
       - name: Recommend tests for current PR
         continue-on-error: true
-        uses: lb-actions/precision-test@v1.0.8
+        uses: lb-actions/precision-test@v1.0.9
         with:
           repo: sglang
           github-pr: ${{ github.repository }}#${{ github.event.pull_request.number }}
@@ -962,7 +962,7 @@ jobs:
           echo "map-file=${MAP_FILE}"           >> "$GITHUB_OUTPUT"
 
       - name: Build test case map
-        uses: lb-actions/precision-test@v1.0.8
+        uses: lb-actions/precision-test@v1.0.9
         with:
           repo: sglang
           build-map: true

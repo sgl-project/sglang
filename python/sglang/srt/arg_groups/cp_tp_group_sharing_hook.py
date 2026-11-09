@@ -18,6 +18,12 @@ from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_pha
 _SUPPORTED_MODELS: set[str] = {
     "Glm5NextForConditionalGeneration",
     "Qwen4ExpForConditionalGeneration",
+    "KimiK31ForConditionalGeneration",
+}
+# Models whose DSA layers run interleave CP; the others use zigzag.
+_INTERLEAVE_MODELS: set[str] = {
+    "Glm5NextForConditionalGeneration",
+    "KimiK31ForConditionalGeneration",
 }
 
 
@@ -37,22 +43,29 @@ def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
         )
     strategy = (
         "interleave"
-        if model.hf_config.architectures[0] == "Glm5NextForConditionalGeneration"
+        if model.hf_config.architectures[0] in _INTERLEAVE_MODELS
         else "zigzag"
     )
     if cfg.cp_strategy != strategy:
         raise ValueError(f"CP-TP group sharing requires --cp-strategy {strategy}.")
 
+    arch = model.hf_config.architectures[0]
     # This hook runs before speculative defaults and NEXTN alias resolution.
     # Native MTP keeps the target's CP/TP placement. DFLASH consumes the
     # target's gathered hidden states and runs its draft with ordinary TP.
-    # Only GLM-5.3-Flash has these speculative paths ported.
+    # Both integrated and PD prefill consume the CP-gathered target states.
     if cfg.speculative_algorithm is not None:
-        if model.hf_config.architectures[0] != "Glm5NextForConditionalGeneration":
+        if arch == "KimiK31ForConditionalGeneration":
+            if cfg.speculative_algorithm.upper() != "DFLASH":
+                raise ValueError(
+                    "Kimi-K3.1 CP-TP group sharing only supports "
+                    "--speculative-algorithm DFLASH."
+                )
+        elif arch != "Glm5NextForConditionalGeneration":
             raise ValueError(
                 "--speculative-algorithm is not supported with CP-TP group sharing."
             )
-        if cfg.speculative_algorithm != "DFLASH" and (
+        elif cfg.speculative_algorithm != "DFLASH" and (
             cfg.speculative_algorithm.upper() not in ("EAGLE", "NEXTN")
             or cfg.speculative_draft_model_path not in (None, cfg.model_path)
             or cfg.speculative_eagle_topk not in (None, 1)
@@ -67,7 +80,7 @@ def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
         "enable-mixed-chunk": cfg.enable_mixed_chunk,
         "moe-dp-size > 1": cfg.moe_dp_size > 1,
     }
-    if model.hf_config.architectures[0] == "Qwen4ExpForConditionalGeneration":
+    if arch == "Qwen4ExpForConditionalGeneration":
         unsupported |= {
             # The MoE runs TP experts on rows gathered over the TP group.
             # Waterfill turns on DeepEP and EP after this hook.
@@ -78,7 +91,7 @@ def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
             # Prefill only: a decode node serves plain TP.
             "disaggregation-mode decode": cfg.disaggregation_mode == "decode",
         }
-    elif model.hf_config.architectures[0] == "Glm5NextForConditionalGeneration":
+    elif arch == "Glm5NextForConditionalGeneration":
         if cfg.disaggregation_mode != "null":
             unsupported |= {
                 "disaggregation-mode decode": cfg.disaggregation_mode == "decode",
@@ -91,6 +104,9 @@ def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
                 "dp-size > 1": cfg.dp_size > 1,
                 "ep-size > 1": view.ep_size > 1,
             }
+    elif arch == "KimiK31ForConditionalGeneration":
+        # Prefill only: the decode node serves TP (+ DCP).
+        unsupported["disaggregation-mode decode"] = cfg.disaggregation_mode == "decode"
     for flag, enabled in unsupported.items():
         if enabled:
             raise ValueError(f"--{flag} is not supported with CP-TP group sharing.")

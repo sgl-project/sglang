@@ -21,12 +21,12 @@ from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
 from sglang.srt.managers.scheduler_components import (  # noqa: E402
     request_retirer as retirer_mod,
 )
-from sglang.test.scheduler_test_utils import empty_request_lists  # noqa: E402
+from sglang.test.scheduler_test_utils import FakeReq, empty_request_lists  # noqa: E402
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
-class _FakeReq:
+class _FakeReq(FakeReq):
     """Minimal stand-in for Req: only the fields the abort paths touch."""
 
     request_finish = Req.request_finish

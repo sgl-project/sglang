@@ -88,6 +88,9 @@ from sglang.kernels.ops.attention.dcp_kernels import (
 from sglang.kernels.ops.attention.merge_state import merge_state_triton
 from sglang.kernels.ops.attention.pad import pad_sequence_with_mask
 from sglang.kernels.ops.kvcache.cache_ops import launch_reshape_and_cache_flash
+from sglang.kernels.ops.kvcache.shuffle_5d_cache import (
+    launch_gather_shuffle_5d_to_linear,
+)
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, scaled_fp8_quant
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.environ import envs
@@ -856,6 +859,27 @@ class AiterAttnBackend(AttentionBackend):
             q.reshape(q.shape[0], -1).contiguous(), self.q_scale
         )
         return q_fp8.view(q.shape), self.q_scale
+
+    def _written_kv_fp8(
+        self, layer: RadixAttention, loc: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The fp8 K and V this forward wrote at ``loc``, read back from the
+        layer's cache as ``(tokens, heads, head_dim)``, in either layout."""
+        if self.kv_cache_is_vectorized_5d:
+            kv = self.kv_layers.layer(layer.layer_id)
+            index = kv.view_layer_id - kv.view.start_layer
+            k, v = launch_gather_shuffle_5d_to_linear(
+                kv.view.k_buffer[index], kv.view.v_buffer[index], loc
+            )
+            return k.view(fp8_dtype), v.view(fp8_dtype)
+        k_cache, v_cache = self.kv_layers.read(layer.layer_id).kv()
+        # uint8 view: index_select is not implemented for fp8.
+        k = k_cache.view(torch.uint8).index_select(0, loc).view(fp8_dtype)
+        v = v_cache.view(torch.uint8).index_select(0, loc).view(fp8_dtype)
+        return (
+            k.view(-1, layer.tp_k_head_num, layer.qk_head_dim),
+            v.view(-1, layer.tp_v_head_num, layer.v_head_dim),
+        )
 
     def _use_mla_decode_persist_metadata(self) -> bool:
         """Persist MLA metadata for non-DCP PS decode, or DCP ASM decode.
@@ -4657,16 +4681,12 @@ class AiterAttnBackend(AttentionBackend):
                         .view(v_cache.dtype)
                         .view(-1, layer.tp_v_head_num, layer.v_head_dim)
                     )
-                    fp8_q_descale = (
-                        layer.k_scale if layer.k_scale is not None else self.k_scale
-                    )
+                    q_fp8, q_scale = self._quantize_q_fp8(q)
                     o = flash_attn_varlen_fp8_pertensor_func(
-                        q.contiguous()
-                        .view(-1, layer.tp_q_head_num, layer.qk_head_dim)
-                        .to(fp8_dtype),
+                        q_fp8.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                         k_gather,
                         v_gather,
-                        fp8_q_descale.reshape(1),
+                        q_scale.reshape(1),
                         k_descale.reshape(1),
                         v_descale.reshape(1),
                         self.forward_metadata.qo_indptr[:bs0],
@@ -4695,17 +4715,17 @@ class AiterAttnBackend(AttentionBackend):
                     layer.tp_q_head_num, layer.tp_k_head_num
                 )
             ):
-                q_c = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
-                k_c = k.contiguous().view(-1, layer.tp_k_head_num, layer.head_dim)
-                v_c = v.contiguous().view(-1, layer.tp_v_head_num, layer.v_head_dim)
-                fp8_q_descale = (
-                    layer.k_scale if layer.k_scale is not None else self.k_scale
-                )
+                # Read K and V back from the cache, as the head-dim-128 branch
+                # above does: they reach here as their cache writer left them,
+                # divided by their scales in place or not, so casting them would
+                # skip or repeat their KV scaling.
+                k_fp8, v_fp8 = self._written_kv_fp8(layer, cache_loc)
+                q_fp8, q_scale = self._quantize_q_fp8(q)
                 o = flash_attn_varlen_fp8_pertensor_func(
-                    q_c.to(fp8_dtype),
-                    k_c.to(fp8_dtype),
-                    v_c.to(fp8_dtype),
-                    fp8_q_descale.reshape(1),
+                    q_fp8.view(-1, layer.tp_q_head_num, layer.head_dim),
+                    k_fp8,
+                    v_fp8,
+                    q_scale.reshape(1),
                     k_descale.reshape(1),
                     v_descale.reshape(1),
                     self.forward_metadata.qo_indptr[:bs0],

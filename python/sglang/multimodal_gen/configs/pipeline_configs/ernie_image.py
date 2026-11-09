@@ -131,6 +131,10 @@ class ErnieImagePipelineConfig(ImagePipelineConfig):
         shape = (batch_size, num_channels, latent_h, latent_w)
         return shape
 
+    def shard_latents_for_sp(self, batch, latents):
+        # The DiT shards tokens after embedding the spatial latent tensor.
+        return latents, False
+
     def maybe_pack_latents(self, latents, batch_size, batch):
         return latents
 

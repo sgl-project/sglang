@@ -521,6 +521,12 @@ def handle_unified_memory_pool(server_args: Any) -> None:
     cfg = resolving_view(server_args)
     if not cfg.enable_unified_memory:
         return
+    # The pool's ends compact lazily, behind the forwards and transfers that
+    # may still touch the pages they move; there is no eager compaction.
+    assert not envs.SGLANG_DISABLE_LAZY_COMPACTION.get(), (
+        "--enable-unified-memory requires lazy compaction; unset "
+        "SGLANG_DISABLE_LAZY_COMPACTION."
+    )
     if cfg.disaggregation_mode != "null":
         # Constraints of the whole-envelope transfer; see the unified MHA and
         # MLA pool get_contiguous_buf_infos implementations.
@@ -541,10 +547,6 @@ def handle_unified_memory_pool(server_args: Any) -> None:
         ), (
             "--enable-unified-memory with PD disaggregation does not support "
             "speculative decoding with the Mooncake transfer backend."
-        )
-        assert not envs.SGLANG_DISABLE_LAZY_COMPACTION.get(), (
-            "--enable-unified-memory with PD disaggregation requires lazy "
-            "compaction; unset SGLANG_DISABLE_LAZY_COMPACTION."
         )
         assert not cfg.enable_hisparse, (
             "--enable-unified-memory with PD disaggregation is not compatible "

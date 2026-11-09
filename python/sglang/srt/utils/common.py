@@ -806,16 +806,6 @@ def calc_diff(x, y):
     return 1 - sim
 
 
-def raise_error_or_warn(obj, strict, counter_name, message, log_interval=1000):
-    if strict:
-        raise ValueError(message)
-    else:
-        count = getattr(obj, counter_name, 0)
-        if count % log_interval == 0:
-            logger.warning(message)
-        setattr(obj, counter_name, count + 1)
-
-
 def get_or_create_event_loop():
     """Gets the running event loop or creates a new one if it doesn't exist."""
     try:

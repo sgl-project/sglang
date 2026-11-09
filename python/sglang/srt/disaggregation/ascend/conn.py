@@ -169,10 +169,17 @@ class AscendKVManager(MooncakeKVManager):
         return layout
 
     def prepare_dcp_token_item_lens(
-        self, dst_page_item_lens: List[Optional[int]], dst_dcp_size: int
+        self,
+        dst_page_item_lens: List[Optional[int]],
+        dst_dcp_size: int,
+        draft_rows_collapsed: bool = False,
     ) -> List[int]:
         if not self._uses_page_interleaved_dcp():
-            return super().prepare_dcp_token_item_lens(dst_page_item_lens, dst_dcp_size)
+            return super().prepare_dcp_token_item_lens(
+                dst_page_item_lens,
+                dst_dcp_size,
+                draft_rows_collapsed=draft_rows_collapsed,
+            )
         if not self.is_hybrid_mla_backend or StateType.DSA in self.kv_args.state_types:
             self._get_dcp_remote_decode_layout()
         page_size = self.kv_args.page_size
@@ -433,6 +440,8 @@ class AscendKVManager(MooncakeKVManager):
         dst_kv_item_lens: Optional[List[int]] = None,
         dst_tp_rank: int = 0,
         dst_attn_tp_size: Optional[int] = None,
+        draft_rows_collapsed: bool = False,
+        dsa_index_k: Optional[Tuple[List[int], List[int], int]] = None,
     ) -> int:
         if not self._uses_page_interleaved_dcp():
             return super().send_kvcache_dcp(
@@ -452,6 +461,8 @@ class AscendKVManager(MooncakeKVManager):
                 dst_kv_item_lens=dst_kv_item_lens,
                 dst_tp_rank=dst_tp_rank,
                 dst_attn_tp_size=dst_attn_tp_size,
+                draft_rows_collapsed=draft_rows_collapsed,
+                dsa_index_k=dsa_index_k,
             )
 
         src_kv_ptrs = self.kv_args.kv_data_ptrs

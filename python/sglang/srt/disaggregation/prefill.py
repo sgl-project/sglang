@@ -66,6 +66,7 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce_prefill_pp,
     prepare_abort,
     setup_state_kv_args,
+    wire_sub_pool,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.base import is_cp_sharded_padded
@@ -78,7 +79,11 @@ from sglang.srt.managers.scheduler_components.request_list import (
     ReqList,
     move,
 )
-from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
+from sglang.srt.managers.scheduler_components.state_check import CheckPhase
+from sglang.srt.mem_cache.base_prefix_cache import (
+    CacheRequestOutcome,
+    window_sub_pool_of,
+)
 from sglang.srt.mem_cache.common import (
     checkpoint_kv_cache,
     kv_to_page_indices,
@@ -488,7 +493,7 @@ class PrefillBootstrapQueue:
         # for a one-token stub. Bootstrapping it costs a handshake, a metadata
         # buffer and a forward pass before anything unwinds it.
         if is_unadmitted_reject(req):
-            self.scheduler.retire_unadmitted_request(req)
+            self.scheduler.request_retirer.retire_unadmitted(req)
             return
         if not self.create_sender(req, num_kv_heads):
             return
@@ -511,9 +516,8 @@ class PrefillBootstrapQueue:
         if len(req.origin_input_ids) > self.max_input_len:
             message = f"Request {req.rid} exceeds the maximum number of tokens: {len(req.origin_input_ids)} > {self.max_input_len}"
             logger.error(message)
-            req.time_stats.trace_ctx.abort(abort_info={"reason": message})
             prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)
-            self.scheduler.output_streamer.stream_output([req], req.return_logprob)
+            self.scheduler.request_retirer.retire_unadmitted(req)
             return True
         return False
 
@@ -642,8 +646,8 @@ class SchedulerDisaggregationPrefillMixin:
         self: Scheduler, req: Req, *, abort_sender: bool
     ) -> None:
         """Release a retiring request's KV send: its pending chunk entry and
-        metadata buffer. ``abort_sender`` stops a live sender; a failed one
-        already concluded through ``failure_exception``."""
+        metadata buffer. ``abort_sender`` aborts a live sender and clears its
+        room; a failed one already concluded through ``failure_exception``."""
         self.clear_pending_chunk_send(req)
         if abort_sender and req.disagg_kv_sender is not None:
             try:
@@ -652,6 +656,10 @@ class SchedulerDisaggregationPrefillMixin:
                 # Transport notification is best effort; local ownership must
                 # still be released or the next idle invariant check will fail.
                 logger.exception("Failed to notify KV sender of abort for %s", req.rid)
+            try:
+                req.disagg_kv_sender.clear()
+            except Exception:
+                logger.exception("Failed to clear KV sender for %s", req.rid)
         maybe_release_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
         req.pending_bootstrap = False
 
@@ -740,7 +748,7 @@ class SchedulerDisaggregationPrefillMixin:
 
             # Receive requests
             self.ingest_requests()
-            if self._engine_paused:
+            if self.pause_state.paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
             self.waiting_queue.join(
@@ -772,6 +780,7 @@ class SchedulerDisaggregationPrefillMixin:
 
             # Update last_batch
             self.last_batch = batch
+            self.invariant_checker.run(CheckPhase.BUSY, batch)
 
     def _supports_result_wait_polling(self: Scheduler) -> bool:
         """Whether the overlap loop can wait for a result without blocking.
@@ -878,7 +887,7 @@ class SchedulerDisaggregationPrefillMixin:
             received_inputs = should_ingest_requests and self.ingest_requests(
                 stop_at_pause=waiting_for_batch_result
             )
-            if self._engine_paused:
+            if self.pause_state.paused:
                 self._record_scheduler_state_for_paused_engine()
                 self._yield_gil_if_needed()
                 continue
@@ -902,7 +911,7 @@ class SchedulerDisaggregationPrefillMixin:
                     not self.gracefully_exit
                     or self.dp_attn_adapter.shutdown_vote_pending()
                 )
-                and not self._deferred_input_requests
+                and self.pause_state.may_launch()
                 and not skip_batch_creation
             ):
                 # Get the next batch to run
@@ -996,6 +1005,7 @@ class SchedulerDisaggregationPrefillMixin:
             self._sched_idled = batch is None
             self.last_batch = batch
             waiting_for_batch_result = False
+            self.invariant_checker.run(CheckPhase.BUSY, batch)
 
     def is_disagg_prefill_batch_result_ready(
         self: Scheduler,
@@ -1752,13 +1762,15 @@ class SchedulerDisaggregationPrefillMixin:
                     .numpy()
                 ]
 
-            def _swa_payload(sub_pool="swa", window=_SCHEDULER_WINDOW):
+            def _swa_payload(sub_pool=None, window=_SCHEDULER_WINDOW):
                 if window is _SCHEDULER_WINDOW:
                     # Read only when a window entry is sent.
                     window = self.sliding_window_size
                 storage = kv_storage_of(
                     self.req_to_token_pool, self.token_to_kv_pool_allocator
                 )
+                if sub_pool is None:
+                    sub_pool = window_sub_pool_of(self.token_to_kv_pool_allocator)
                 resume = storage.resume_units(
                     sub_pool,
                     req,
@@ -1839,7 +1851,15 @@ class SchedulerDisaggregationPrefillMixin:
                 StateType.QSA_PENDING: _qsa_pending_payload,
                 StateType.QSA_COMPRESSED: _full_kv_pages_payload,
                 StateType.SWA: _swa_payload,
-                StateType.AUXILIARY_SWA: lambda: _swa_payload("draft_swa", None),
+                StateType.AUXILIARY_SWA: lambda: _swa_payload(
+                    wire_sub_pool(
+                        kv_storage_of(
+                            self.req_to_token_pool, self.token_to_kv_pool_allocator
+                        ),
+                        StateType.AUXILIARY_SWA,
+                    ),
+                    None,
+                ),
                 StateType.DSA: _dsa_pages_payload,
                 StateType.DSA_TAIL: _dsa_tail_payload,
                 StateType.MINIMAX_INDEX_K: _minimax_payload,

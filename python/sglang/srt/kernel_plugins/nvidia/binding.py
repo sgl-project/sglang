@@ -386,6 +386,10 @@ class MegakernelBinding:
         )
         return view
 
+    def prefill_view(self) -> ForwardView:
+        """The view for an eager prefill step, without graph-static decode metadata."""
+        return self.forward_view(forward_batch=None)
+
     def seal_capture_view(self, forward_batch: ForwardBatch, view: ForwardView) -> None:
         """Seal graph-static step tensors for this mode and batch-size bucket."""
         if view.hybrid is None:
@@ -1511,9 +1515,12 @@ class _Dispatch:
                     input_ids, positions, forward_batch, *args, **kwargs
                 )
             if isinstance(self.binding, MegakernelBinding):
-                view = self.binding.forward_view(forward_batch)
-                if capturing:
-                    self.binding.seal_capture_view(forward_batch, view)
+                if step.mode == "prefill":
+                    view = self.binding.prefill_view()
+                else:
+                    view = self.binding.forward_view(forward_batch)
+                    if capturing:
+                        self.binding.seal_capture_view(forward_batch, view)
             else:
                 view = (
                     self.binding.prefill_view()

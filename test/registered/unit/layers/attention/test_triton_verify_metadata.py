@@ -78,6 +78,7 @@ def _make_backend(batch_size, capture_width=7):
     backend.cuda_graph_kv_indices = torch.zeros(256, dtype=torch.int64)
     backend.runner_ids = _RunnerIds()
     backend.sliding_window_size = None
+    backend.verify_reads_window_kv_only = False
     backend.use_sliding_window_kv_pool = False
     backend._verify_mask = None
     return backend
@@ -269,6 +270,7 @@ def test_replicated_draft_metadata_and_writes_share_physical_ids():
     runner_ids.page_size = 4
     runner_ids.device = "cpu"
     runner_ids._spaces = {IdSpaceKind.FULL: replicated.space(IdSpaceKind.FULL)}
+    runner_ids._role_sub_pools = {}
     runner_ids.is_translating = True
     runner_ids.defer_read_translate = False
     plan = runner_ids.plan(

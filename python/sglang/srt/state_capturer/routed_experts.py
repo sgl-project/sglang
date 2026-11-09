@@ -8,11 +8,17 @@ import torch.nn.functional as F
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather_into_tensor,
+    dp_slot_in,
+    get_dp_global_num_tokens,
     get_dp_local_slice_cpu,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_context import (
+    get_forward_context,
+    has_forward_context,
+)
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
@@ -133,7 +139,21 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
         if self.device_cache is None:
             # Joined the all-gather; the output rank keeps the rows.
             return
-        super().capture(layer_id, topk_indices)
+        context = get_forward_context() if has_forward_context() else None
+        if context is None or context.tbo_parent_token_range is None:
+            super().capture(layer_id, topk_indices)
+            return
+        # TBO children share this buffer and are padded to a common length.
+        start, end = context.tbo_parent_token_range
+        source, target = 0, 0
+        if context.tbo_parent_dp_offset is not None:
+            # Non-EP MoE sees every DP rank's padded rows; readback uses parent offsets.
+            child_sizes = get_dp_global_num_tokens()
+            source = sum(child_sizes[: dp_slot_in(child_sizes)])
+            target = context.tbo_parent_dp_offset
+        self.device_cache.buffer[target + start : target + end, layer_id] = (
+            topk_indices[source : source + end - start]
+        )
 
     def _get_local_slice(
         self,

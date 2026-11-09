@@ -88,6 +88,7 @@ class InstantWriteBackController:
 
     write_policy = "write_back"
     enable_storage = False
+    kv_storage = None
     write = HybridCacheController.write
     allocate_host_transfers = HybridCacheController.allocate_host_transfers
     _uses_shared_host_domain = HybridCacheController._uses_shared_host_domain

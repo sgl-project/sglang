@@ -71,7 +71,7 @@ def state_indices_for_request(
             req.kv.req_pool_idx, window_start:seq_len
         ]
         window_swa = scheduler.token_to_kv_pool_allocator.id_spaces()[
-            IdSpaceKind.SLIDING_WINDOW
+            router.sub_pool(IdSpaceKind.SLIDING_WINDOW).name
         ].ids(window_full)
         return _to_page_indices_gpu(window_swa, page_size)
     if isinstance(pool, (DSATokenToKVPool, MiniMaxSparseKVPool)):

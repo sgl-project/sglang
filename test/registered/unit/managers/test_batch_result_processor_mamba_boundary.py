@@ -14,6 +14,7 @@ from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
+from sglang.srt.managers.scheduler_components.pause_state import PauseState
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.kv.advance import advance_tracking
 from sglang.srt.runtime_context import get_context
@@ -68,8 +69,6 @@ def _make_processor() -> SchedulerBatchResultProcessor:
     return SchedulerBatchResultProcessor(
         is_generation=True,
         disaggregation_mode=None,
-        enable_overlap=True,
-        enable_overlap_mlx=False,
         model_config=SimpleNamespace(
             think_end_ids=None, self_opened_think_start_ids=None
         ),
@@ -90,6 +89,7 @@ def _make_processor() -> SchedulerBatchResultProcessor:
         logprob_result_processor=None,
         output_streamer=MagicMock(),
         abort_request=lambda *args, **kwargs: None,
+        still_in_batch=lambda req: True,
     )
 
 
@@ -117,7 +117,7 @@ class TestMambaBoundaryMaskReuse(unittest.TestCase):
                     side_effect=[[], [], StopIteration]
                 )
                 scheduler.process_input_requests = MagicMock()
-                scheduler._engine_paused = False
+                scheduler.pause_state = PauseState()
                 scheduler.running_batch = batch
                 scheduler.should_process_last_batch_early = MagicMock(
                     return_value=False
@@ -126,6 +126,7 @@ class TestMambaBoundaryMaskReuse(unittest.TestCase):
                 scheduler._apply_war_barrier = MagicMock()
                 scheduler.is_generation = False
                 scheduler.last_batch = None
+                scheduler.invariant_checker = MagicMock()
 
                 plan_count = 0
 

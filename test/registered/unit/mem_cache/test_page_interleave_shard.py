@@ -1947,8 +1947,8 @@ def _host_pool(shard_rank, device_pages=32):
     # These tiny CPU fixtures test ownership, not the machine's free-RAM budget.
     with (
         unittest.mock.patch(
-            "sglang.srt.mem_cache.pool_host.base.host_memory_budget_bytes",
-            side_effect=lambda requested: requested,
+            "sglang.srt.mem_cache.pool_host.base.host_memory_preflight",
+            side_effect=lambda lengths, *args: (sum(lengths), sum(lengths)),
         ),
         unittest.mock.patch(
             "sglang.srt.mem_cache.pool_host.common.alloc_mmap",

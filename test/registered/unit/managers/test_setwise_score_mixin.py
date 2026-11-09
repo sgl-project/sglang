@@ -622,12 +622,13 @@ class TestSetwisePooledHiddenStatesRoundTrip(CustomTestCase):
         from sglang.srt.managers.scheduler_components.output_streamer import (
             SchedulerOutputStreamer,
         )
+        from sglang.test.scheduler_test_utils import FakeReq
 
         captured = []
         reqs = []
         for idx, phs in enumerate(phs_per_req):
             reqs.append(
-                SimpleNamespace(
+                FakeReq(
                     finished=lambda: True,
                     rid=f"rid-{idx}",
                     http_worker_ipc=None,

@@ -11,8 +11,10 @@
 #include <tvm/ffi/container/tensor.h>
 #include <tvm/ffi/extra/stl.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <utility>
 
@@ -21,10 +23,12 @@ namespace sglang {
 namespace gemm_ag {
 
 using device::distributed::Counter;
+// 16B vector = 4 packed bf16 pairs; +0.0 in a pair word is the "not arrived" marker
+using Lamport = device::distributed::LamportTrait<bf16_t, 16 / sizeof(bf16_t), /*kAtom=*/4>;
 
-constexpr uint32_t kWorld = 8;                      // TP world size
 constexpr uint32_t kVecSize = 32 / sizeof(bf16_t);  // 16 bf16 per 32B vector
-constexpr uint32_t kSpinBlock = 128;                // consumer threads per block
+constexpr uint32_t kSpinBlock = 128;                // min consumer threads per block
+constexpr uint32_t kMaxSpinBlock = 1024;            // max consumer threads per block
 constexpr uint32_t kSpinVec = 16 / sizeof(bf16_t);  // 8 bf16 (16B) per consumer thread
 
 // Producer: per-rank column-slice GEMV, multicast store with Lamport markers.
@@ -36,7 +40,7 @@ struct ProducerParams {
   uint32_t rank;
 };
 
-template <uint32_t K, uint32_t N, uint32_t M, uint32_t N_SPLIT, bool kUsePDL>
+template <uint32_t K, uint32_t N, uint32_t kWorld, uint32_t M, uint32_t N_SPLIT, bool kUsePDL>
 __global__ __launch_bounds__(K / kVecSize) void gemm_ag_gemv_kernel(
     const __grid_constant__ ProducerParams params,
     const bf16_t* __restrict__ x,         // [M, K]
@@ -120,7 +124,7 @@ __global__ __launch_bounds__(K / kVecSize) void gemm_ag_gemv_kernel(
   PDLTriggerSecondary<kUsePDL>();
 }
 
-// Consumer: Lamport spin + add3, one 16B vector (8 bf16) per thread.
+// Consumer: Lamport spin + add3, one 16B vector (8 bf16) per thread per step.
 
 struct ConsumerParams {
   uint8_t* ws_local;      // LOCAL VA of the push workspace base (poll + reset)
@@ -133,17 +137,51 @@ struct ConsumerParams {
   uint32_t num_rows;      // M
 };
 
-template <uint32_t N, bool kHasC, bool kUsePDL>
-__global__ void spin_add3_kernel(const __grid_constant__ ConsumerParams params) {
+// out[elem : elem + 8] = gathered + b (+ c); waits for the vector's 4 packed
+// pairs to land, then restores the +0.0 marker for the next round.
+template <uint32_t N, uint32_t kWorld, bool kHasC>
+SGL_DEVICE void spin_add3_vec(const ConsumerParams& params, uint8_t* half, uint32_t elem) {
   using namespace device;
   using vec_t = AlignedVector<bf16x2_t, kSpinVec / 2>;  // 8 bf16 as 4 pairs
   constexpr uint32_t kNLocal = N / kWorld;
+  const auto row = elem / N;
+  const auto col = elem % N;
+  // out[row, col] lives at half[col / kNLocal][row][col % kNLocal] of the
+  // dense [world][M][N / world] prefix of the current phase half
+  const auto base = reinterpret_cast<bf16_t*>(half);
+  const auto src = base + ((col / kNLocal) * params.num_rows + row) * kNLocal + col % kNLocal;
+  vec_t b_vec, c_vec;
+  b_vec.load(params.b + elem);
+  if constexpr (kHasC) c_vec.load(params.c + elem);
+  // spin until all 4 packed pairs of the vector have landed
+  uint4 raw;
+  do {
+    ptx::ld_relaxed_16B(raw, src, 0);
+  } while (Lamport::has_pos_zero(&raw));
+  const auto& gathered = *reinterpret_cast<const vec_t*>(&raw);
+  vec_t out_vec;
+#pragma unroll
+  for (uint32_t j = 0; j < kSpinVec / 2; ++j) {
+    using Trait = DTypeTrait<bf16x2_t>;
+    out_vec[j] = Trait::add(gathered[j], b_vec[j]);
+    if constexpr (kHasC) out_vec[j] = Trait::add(out_vec[j], c_vec[j]);
+  }
+  out_vec.store(params.out + elem);
+  AlignedVector<uint32_t, 4> zero;
+  zero.fill(0);
+  zero.store(src);
+}
+
+// The grid is bound to the counter array (one work block per counter slot plus
+// the cleanup block), so larger batches widen the block (host side) and then
+// stride over the output.
+template <uint32_t N, uint32_t kWorld, bool kHasC, bool kUsePDL>
+__global__ __launch_bounds__(kMaxSpinBlock) void spin_add3_kernel(const __grid_constant__ ConsumerParams params) {
+  using namespace device;
   static_assert(N % kSpinVec == 0, "rows must stay 16B aligned");
-  static_assert(kNLocal % kSpinVec == 0, "a vector must never cross a rank block");
+  static_assert((N / kWorld) % kSpinVec == 0, "a vector must never cross a rank block");
   const auto bx = blockIdx.x;
   const auto tx = threadIdx.x;
-  const uint32_t tid = bx * kSpinBlock + tx;
-  const uint32_t elem = tid * kSpinVec;  // first bf16 of this thread's vector
   const uint32_t phase = params.counter[bx].get() & 1;
 
   PDLTriggerSecondary<kUsePDL>();
@@ -153,54 +191,87 @@ __global__ void spin_add3_kernel(const __grid_constant__ ConsumerParams params) 
   if (const auto num_blocks = gridDim.x; bx == num_blocks - 1) {
     [[unlikely]];
     __syncthreads();  // ensure phase is ready for all threads
-    for (uint32_t i = num_blocks - 1 + tx; i < params.num_counters; i += kSpinBlock) {
+    for (uint32_t i = num_blocks - 1 + tx; i < params.num_counters; i += blockDim.x) {
       params.counter[i].set(phase ^ 1);
     }
     return void();  // this block is done, no output to write
   }
 
   // Deliberately NO PDLWaitPrimary: the dependency is carried through data
-  if (elem < params.num_rows * N) {
-    const auto row = elem / N;
-    const auto col = elem % N;
-    // out[row, col] lives at half[col / kNLocal][row][col % kNLocal] of the
-    // dense [world][M][N / world] prefix of the current phase half
-    const auto base = reinterpret_cast<bf16_t*>(params.ws_local + phase * params.half_bytes);
-    const auto src = base + ((col / kNLocal) * params.num_rows + row) * kNLocal + col % kNLocal;
-    vec_t b_vec, c_vec;
-    b_vec.load(params.b + elem);
-    if constexpr (kHasC) c_vec.load(params.c + elem);
-    // spin until all 4 packed pairs of the vector have landed
-    uint4 raw;
-    do {
-      ptx::ld_relaxed_16B(raw, src, 0);
-    } while (raw.x == 0 || raw.y == 0 || raw.z == 0 || raw.w == 0);
-    const auto& gathered = *reinterpret_cast<const vec_t*>(&raw);
-    vec_t out_vec;
-#pragma unroll
-    for (uint32_t j = 0; j < kSpinVec / 2; ++j) {
-      using Trait = DTypeTrait<bf16x2_t>;
-      out_vec[j] = Trait::add(gathered[j], b_vec[j]);
-      if constexpr (kHasC) out_vec[j] = Trait::add(out_vec[j], c_vec[j]);
-    }
-    out_vec.store(params.out + elem);
-    AlignedVector<uint32_t, 4> zero;
-    zero.fill(0);
-    zero.store(src);
+  const auto half = params.ws_local + phase * params.half_bytes;
+  const uint32_t stride = (gridDim.x - 1) * blockDim.x * kSpinVec;
+  for (uint32_t elem = (bx * blockDim.x + tx) * kSpinVec; elem < params.num_rows * N; elem += stride) {
+    spin_add3_vec<N, kWorld, kHasC>(params, half, elem);
   }
   __syncthreads();
   if (tx == 0) params.counter[bx].set(phase ^ 1);
 }
 
+// Gather of a precomputed column slice (the GEMM path for larger M): every
+// block multicast-stores its share of this rank's [M, N / world] slice into
+// the same dense layout the GEMV producer writes, then runs the consumer above
+// over its share of the output. One kernel; the slice GEMM is its PDL primary.
+
+struct GatherParams {
+  ConsumerParams consumer;
+  uint8_t* ws_mc;  // multicast VA of the push workspace base
+  uint32_t rank;
+  const bf16_t* local;  // [M, N / world], this rank's slice of x @ weight.T
+};
+
+template <uint32_t N, uint32_t kWorld, bool kHasC, bool kUsePDL>
+__global__ __launch_bounds__(kMaxSpinBlock) void gather_add3_kernel(const __grid_constant__ GatherParams params) {
+  using namespace device;
+  constexpr uint32_t kNLocal = N / kWorld;
+  static_assert(N % kSpinVec == 0, "rows must stay 16B aligned");
+  static_assert(kNLocal % kSpinVec == 0, "a vector must never cross a rank block");
+  const auto& consumer = params.consumer;
+  const auto bx = blockIdx.x;
+  const auto tx = threadIdx.x;
+
+  PDLWaitPrimary<kUsePDL>();  // the slice GEMM (and the previous push-plane round)
+  const uint32_t phase = consumer.counter[bx].get() & 1;
+
+  if (const auto num_blocks = gridDim.x; bx == num_blocks - 1) {
+    [[unlikely]];
+    PDLTriggerSecondary<kUsePDL>();
+    __syncthreads();
+    for (uint32_t i = num_blocks - 1 + tx; i < consumer.num_counters; i += blockDim.x) {
+      consumer.counter[i].set(phase ^ 1);
+    }
+    return void();
+  }
+
+  const uint32_t stride = (gridDim.x - 1) * blockDim.x * kSpinVec;
+  const uint32_t first = (bx * blockDim.x + tx) * kSpinVec;
+  // this rank's block of the phase half's dense [world][M][N / world] prefix
+  const auto dst = params.ws_mc + phase * consumer.half_bytes +
+                   static_cast<size_t>(params.rank) * consumer.num_rows * kNLocal * sizeof(bf16_t);
+  for (uint32_t local_elem = first; local_elem < consumer.num_rows * kNLocal; local_elem += stride) {
+    uint4 raw = *reinterpret_cast<const uint4*>(params.local + local_elem);
+    Lamport::clear_pos_zero(&raw);  // -0.0 in the first element: never all-zero
+    ptx::st_multimem_16B(raw, dst + local_elem * sizeof(bf16_t), 0);
+  }
+  PDLTriggerSecondary<kUsePDL>();
+
+  // every block finishes its own pushes before it polls, so no block waits on
+  // a push that cannot be issued
+  const auto half = consumer.ws_local + phase * consumer.half_bytes;
+  for (uint32_t elem = first; elem < consumer.num_rows * N; elem += stride) {
+    spin_add3_vec<N, kWorld, kHasC>(consumer, half, elem);
+  }
+  __syncthreads();
+  if (tx == 0) consumer.counter[bx].set(phase ^ 1);
+}
+
 }  // namespace gemm_ag
 using host::distributed::CommunicatorRef;
 
-// Host entry point (tiny_gemm style: one GEMV instantiation per M in
-// [1, kMaxM] selected through a constexpr function-pointer table, then the
-// spin consumer launched with PDL right behind it). Any (K, N) that passes
-// the kernels' static_asserts works; Kimi-K3 uses (3584, 7168).
+// Host entry points. ``run``: one GEMV instantiation per M in [1, kMaxM]
+// (constexpr function-pointer table), then the spin consumer via PDL.
+// ``gather``: push and assemble a slice an external GEMM computed.
 
-template <uint32_t K, uint32_t N, uint32_t kMaxM, bool kUsePDL>
+template <uint32_t K, uint32_t N, uint32_t kWorld, uint32_t kMaxM, bool kUsePDL>
 struct GEMMAGKernel {
   using TensorView = tvm::ffi::TensorView;
 
@@ -214,18 +285,61 @@ struct GEMMAGKernel {
   // a single phase counter, so the grid is free and 112 blocks did not even
   // fill one per SM.
   static constexpr uint32_t N_SPLIT = 2;
-  static constexpr uint32_t kNLocal = N / gemm_ag::kWorld;
+  static constexpr uint32_t kNLocal = N / kWorld;
   static constexpr uint32_t kGemvBlock = K / gemm_ag::kVecSize;
   static constexpr uint32_t kNumProducerBlocks = kNLocal / N_SPLIT;
-  static_assert(kNLocal % N_SPLIT == 0);
+  static_assert(N % kWorld == 0 && kNLocal % N_SPLIT == 0);
 
   using GemvFn = void (*)(gemm_ag::ProducerParams, const bf16_t*, const bf16_t*);
 
   template <std::size_t... I>
   static constexpr auto make_table(std::index_sequence<I...>) {
-    return std::array<GemvFn, kMaxM + 1>{nullptr, gemm_ag::gemm_ag_gemv_kernel<K, N, I + 1, N_SPLIT, kUsePDL>...};
+    return std::array<GemvFn, kMaxM + 1>{
+        nullptr, gemm_ag::gemm_ag_gemv_kernel<K, N, kWorld, I + 1, N_SPLIT, kUsePDL>...};
   }
   static constexpr auto kGemvTable = make_table(std::make_index_sequence<kMaxM>{});
+
+  // Checks shared by both paths; returns the consumer half of the params.
+  static gemm_ag::ConsumerParams consumer_params(
+      const host::distributed::PushPlaneObj& push,
+      uint32_t num_tokens,
+      TensorView b,
+      std::optional<TensorView> c,
+      TensorView out) {
+    using namespace host;
+    CHECK_HOST(push.world_size == kWorld) << "the kernel is compiled for TP" << kWorld;
+    CHECK_HOST(push.mc_workspace != nullptr) << "requires a multicast-capable push plane";
+    // the dense [world][M][N / world] staging prefix must fit one phase half
+    CHECK_HOST(int64_t(num_tokens) * kNLocal * 2 <= push.slot_bytes)
+        << "staging slice exceeds the push slot size " << push.slot_bytes;
+    CHECK_HOST(2 * kWorld * push.slot_bytes <= std::numeric_limits<uint32_t>::max())
+        << "push plane exceeds the 32-bit offset range";
+    // one work block per counter slot at most, plus the cleanup block
+    CHECK_HOST(push.num_blocks >= 2) << "needs a work block and a counter-update block";
+    return gemm_ag::ConsumerParams{
+        .ws_local = push.workspaces[push.rank],
+        .counter = push.counter,
+        .num_counters = push.num_blocks,
+        .half_bytes = static_cast<uint32_t>(push.slot_bytes * push.world_size),
+        .b = static_cast<const bf16_t*>(b.data_ptr()),
+        .c = c.has_value() ? static_cast<const bf16_t*>(c.value().data_ptr()) : nullptr,
+        .out = static_cast<bf16_t*>(out.data_ptr()),
+        .num_rows = num_tokens,
+    };
+  }
+
+  // {grid, block}: at most one work block per counter slot plus the cleanup
+  // block; widen the block before striding, as each stride is a serial spin.
+  static std::pair<uint32_t, uint32_t>
+  consumer_shape(const host::distributed::PushPlaneObj& push, uint32_t num_tokens) {
+    const uint32_t num_vecs = num_tokens * N / gemm_ag::kSpinVec;
+    const uint32_t max_work_blocks = push.num_blocks - 1;
+    uint32_t block = gemm_ag::kSpinBlock;
+    while (block < gemm_ag::kMaxSpinBlock && host::div_ceil(num_vecs, block) > max_work_blocks) {
+      block *= 2;
+    }
+    return {std::min<uint32_t>(host::div_ceil(num_vecs, block), max_work_blocks) + 1, block};
+  }
 
   static void
   run(CommunicatorRef ref, TensorView x, TensorView weight, TensorView b, std::optional<TensorView> c, TensorView out) {
@@ -244,18 +358,13 @@ struct GEMMAGKernel {
     TensorMatcher({M, N}).with_dtype<bf16_t>().with_device(device).verify(out);
     const auto num_tokens = static_cast<uint32_t>(M.unwrap());
     CHECK_HOST(num_tokens >= 1 && num_tokens <= kMaxM);
-    CHECK_HOST(push.world_size == gemm_ag::kWorld) << "the kernel is compiled for TP" << gemm_ag::kWorld;
-    CHECK_HOST(push.mc_workspace != nullptr) << "requires a multicast-capable push plane";
-    CHECK_HOST(int64_t(num_tokens) * kNLocal * 2 <= push.slot_bytes)
-        << "staging slice exceeds the push slot size " << push.slot_bytes;
-    // The producer grid is no longer bound to the counter array: it reads only
-    // counter[0] (see gemm_ag_gemv_kernel). The consumer grid still is.
-    CHECK_HOST(push.num_blocks > 0) << "no push blocks available";
-    // producer: GEMV
+    const auto params = consumer_params(push, num_tokens, b, c, out);
+    // producer: GEMV. Its grid is not bound to the counter array: it reads only
+    // counter[0] (see gemm_ag_gemv_kernel).
     const auto producer_params = gemm_ag::ProducerParams{
         .ws_mc = push.mc_workspace,
         .counter = push.counter,
-        .half_bytes = static_cast<uint32_t>(push.slot_bytes * push.world_size),
+        .half_bytes = params.half_bytes,
         .rank = push.rank,
     };
     LaunchKernel(kNumProducerBlocks, kGemvBlock, device.unwrap())
@@ -266,25 +375,40 @@ struct GEMMAGKernel {
             static_cast<const bf16_t*>(weight.data_ptr()));
 
     // consumer: spin + add3
-    const auto consumer_params = gemm_ag::ConsumerParams{
-        .ws_local = push.workspaces[push.rank],
-        .counter = push.counter,
-        .num_counters = push.num_blocks,
-        .half_bytes = static_cast<uint32_t>(push.slot_bytes * push.world_size),
-        .b = static_cast<const bf16_t*>(b.data_ptr()),
-        .c = c.has_value() ? static_cast<const bf16_t*>(c.value().data_ptr()) : nullptr,
-        .out = static_cast<bf16_t*>(out.data_ptr()),
-        .num_rows = num_tokens,
-    };
-    const auto num_vecs = num_tokens * N / gemm_ag::kSpinVec;
-    const auto num_consumers = host::div_ceil(num_vecs, gemm_ag::kSpinBlock);
-    CHECK_HOST(num_consumers + 1 <= push.num_blocks);
-    // use last block to clean up the counter
-    const auto num_consumer_blocks = num_consumers + 1;
     using gemm_ag::spin_add3_kernel;
-    const auto kernel = c.has_value() ? spin_add3_kernel<N, 1, kUsePDL> : spin_add3_kernel<N, 0, kUsePDL>;
-    host::LaunchKernel(num_consumer_blocks, gemm_ag::kSpinBlock, device.unwrap())
-        .enable_pdl(kUsePDL)(kernel, consumer_params);
+    const auto kernel =
+        c.has_value() ? spin_add3_kernel<N, kWorld, 1, kUsePDL> : spin_add3_kernel<N, kWorld, 0, kUsePDL>;
+    const auto [grid, block] = consumer_shape(push, num_tokens);
+    LaunchKernel(grid, block, device.unwrap()).enable_pdl(kUsePDL)(kernel, params);
+  }
+
+  static void gather(CommunicatorRef ref, TensorView local, TensorView b, std::optional<TensorView> c, TensorView out) {
+    using namespace host;
+    const auto& push = ref.get()->get_push_obj();
+
+    auto M = SymbolicSize{"num_tokens"};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLGPU>();
+    TensorMatcher({M, kNLocal}).with_dtype<bf16_t>().with_device(device).verify(local);
+    TensorMatcher({M, N}).with_dtype<bf16_t>().with_device(device).verify(b);
+    if (c.has_value()) {
+      TensorMatcher({M, N}).with_dtype<bf16_t>().with_device(device).verify(c.value());
+    }
+    TensorMatcher({M, N}).with_dtype<bf16_t>().with_device(device).verify(out);
+    const auto num_tokens = static_cast<uint32_t>(M.unwrap());
+    CHECK_HOST(num_tokens >= 1);
+    CHECK_HOST(reinterpret_cast<uintptr_t>(local.data_ptr()) % 16 == 0) << "the slice is read in 16B vectors";
+    const auto params = gemm_ag::GatherParams{
+        .consumer = consumer_params(push, num_tokens, b, c, out),
+        .ws_mc = push.mc_workspace,
+        .rank = push.rank,
+        .local = static_cast<const bf16_t*>(local.data_ptr()),
+    };
+    using gemm_ag::gather_add3_kernel;
+    const auto kernel =
+        c.has_value() ? gather_add3_kernel<N, kWorld, 1, kUsePDL> : gather_add3_kernel<N, kWorld, 0, kUsePDL>;
+    const auto [grid, block] = consumer_shape(push, num_tokens);
+    LaunchKernel(grid, block, device.unwrap()).enable_pdl(kUsePDL)(kernel, params);
   }
 };
 

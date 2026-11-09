@@ -123,6 +123,7 @@ from sglang.srt.observability.metrics_collector import (
     resolve_collector_class,
     tokenizer_metric_labels,
 )
+from sglang.srt.observability.request_dump import CrashDumpGrace
 from sglang.srt.observability.startup_time import build_engine_startup_time
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.parser.template_detection import resolve_auto_parsers
@@ -142,7 +143,7 @@ from sglang.srt.runtime_context import (
     snapshot_context,
 )
 from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
-from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.server_args import PortArgs, ServerArgs, redact_server_args_secrets
 from sglang.srt.utils import (
     MultiprocessingSerializer,
     SerializedTensorPayload,
@@ -181,7 +182,7 @@ _is_cuda = is_cuda()
 
 
 def _server_args_for_logging(server_args: ServerArgs) -> Dict[str, Any]:
-    return redact_watermark_secrets(server_args.resolved_dict())
+    return redact_server_args_secrets(server_args.resolved_dict())
 
 
 @dataclasses.dataclass
@@ -319,7 +320,7 @@ class Engine(EngineScoreMixin, EngineBase):
                 "_launch_command",
                 "Engine("
                 + ", ".join(
-                    f"{k}={v!r}" for k, v in redact_watermark_secrets(kwargs).items()
+                    f"{k}={v!r}" for k, v in redact_server_args_secrets(kwargs).items()
                 )
                 + ")",
             )
@@ -1063,6 +1064,39 @@ class Engine(EngineScoreMixin, EngineBase):
             scheduler_procs,
         )
 
+    @staticmethod
+    def _wait_for_rust_crash_dumps_on_sigquit(
+        server_args: ServerArgs,
+        scheduler_init_result: SchedulerInitResult,
+        subprocess_watchdog: SubprocessWatchdog,
+    ) -> None:
+        """With ``--crash-dump-folder`` set, give the schedulers that embed the
+        Rust server time to write their crash dumps before a child's
+        ``SIGQUIT`` kills the process tree (see ``CrashDumpGrace``), which
+        the launch-phase handler then does as before."""
+        folder = get_observability().crash_dump_folder
+        if (
+            not folder
+            or resolving_view(server_args).custom_sigquit_handler is not None
+            or threading.current_thread() is not threading.main_thread()
+        ):
+            return
+        previous = signal.getsignal(signal.SIGQUIT)
+        if not callable(previous):
+            previous = lambda signum, frame: kill_process_tree(os.getpid())  # noqa: E731
+        grace = CrashDumpGrace(
+            folder,
+            # Absent in DP-controller layouts, which then are not waited for.
+            writer_pids=[
+                info["rust_server_pid"]
+                for info in scheduler_init_result.scheduler_infos
+                if "rust_server_pid" in info
+            ],
+            previous=previous,
+            before_wait=subprocess_watchdog.stop,
+        )
+        signal.signal(signal.SIGQUIT, grace.handle_sigquit)
+
     @classmethod
     def _launch_detokenizer_subprocesses(
         cls,
@@ -1352,6 +1386,9 @@ class Engine(EngineScoreMixin, EngineBase):
                 processes=processes, process_names=names
             )
             subprocess_watchdog.start()
+            cls._wait_for_rust_crash_dumps_on_sigquit(
+                server_args, scheduler_init_result, subprocess_watchdog
+            )
 
             return (
                 None,
@@ -1614,7 +1651,9 @@ class Engine(EngineScoreMixin, EngineBase):
         return msgspec_to_builtins(
             redact_watermark_secrets(
                 {
-                    **self.tokenizer_manager.server_args.resolved_dict(),
+                    **redact_server_args_secrets(
+                        self.tokenizer_manager.server_args.resolved_dict()
+                    ),
                     "launch_command": self.tokenizer_manager.server_args.launch_command,
                     **self._scheduler_init_result.scheduler_infos[0],
                     "startup_time": self.tokenizer_manager.startup_time,
@@ -1994,7 +2033,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         ):
             assert_pkg_version(
                 "flashinfer_python",
-                "0.7.2",
+                "0.7.3",
                 "Please uninstall the old version and "
                 "reinstall the latest version by following the instructions "
                 "at https://docs.flashinfer.ai/installation.html.",
@@ -2142,8 +2181,11 @@ def _block_until_follower_schedulers_exit(
     backstop. Rust listeners on this node (one per attention DP group whose
     first rank is here) still drain as node 0's do: SIGTERM is relayed to them
     (``RustServerSigtermDrain``), so their health answers 503 and their
-    in-flight requests finish before they close; their schedulers then exit on
-    rank 0's ShutdownReq. Without a local listener, the caller has already
+    in-flight requests finish before they close; rank 0's drain waits for them
+    (the MLP-sync gather carries every DP listener's drain state, and a drain
+    on any listener begins on all of them), and their schedulers then exit on
+    rank 0's ShutdownReq. Without a SIGTERM here, the first scheduler exiting
+    0 bounds the others. Without a local listener, the caller has already
     routed SIGTERM to ``Engine._handle_follower_sigterm``.
     """
     on_main_thread = threading.current_thread() is threading.main_thread()
@@ -2192,13 +2234,6 @@ def _rust_server_startup_time_sink() -> Callable[[Dict[str, Any]], None]:
 
 def node_hosts_rust_server() -> bool:
     """Whether this node contains a Rust listener rank, assuming Rust mode."""
-    parallel = get_parallel()
-    pp_rank_range, tp_rank_range, _, _ = _calculate_rank_ranges(parallel.node_rank)
-    if 0 not in pp_rank_range:
-        return False
+    from sglang.srt.rust_server.server import node_listener_ports
 
-    if get_exec().moe.is_ep_scale_joiner:
-        # Scale joiners launch the full local TP group, including its first rank.
-        return True
-
-    return any(_rank_hosts_rust_listener(0, tp_rank) for tp_rank in tp_rank_range)
+    return bool(node_listener_ports())

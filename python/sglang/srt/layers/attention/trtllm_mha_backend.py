@@ -684,9 +684,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         )
 
     def _is_window_layer(self, layer: RadixAttention) -> bool:
-        return (
-            self._swa_kv_pool.layer_router.route(layer.layer_id).sub_pool
-            == IdSpaceKind.SLIDING_WINDOW
+        return self._swa_kv_pool.layer_router.plays(
+            layer.layer_id, IdSpaceKind.SLIDING_WINDOW
         )
 
     def _get_layer_cache_loc(

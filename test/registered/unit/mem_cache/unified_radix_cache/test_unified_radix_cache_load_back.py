@@ -57,6 +57,7 @@ from sglang.test.kits.unified_radix_cache.load_back import (
     UnifiedTreeCoreLoadBackPendingFixtures,
 )
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.tree_slots import window_evictable
 
 register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=11, suite="stage-b-test-1-gpu-small-amd")
@@ -353,7 +354,7 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
         req = self._make_req(req_to_token_pool)
         req.swa_branching_seqlen = 8
         req.kv.cache_protected_len = 4
-        req.kv.set_evicted_seqlen(ComponentType.SWA, 3)
+        req.kv.set_evicted_seqlen(cache.window_sub_pools()[0][0], 3)
 
         for is_finished in (False, True):
             params = InsertParams(component_evicted_seqlens={ComponentType.MAMBA: 6})
@@ -1191,7 +1192,7 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
         # Leave tree-owned SWA available for controller-side SWA eviction.
         unrelated_seq = self._make_seq(100_000, sw)
         self._insert(cache, allocator, req_to_token_pool, unrelated_seq)
-        self.assertGreaterEqual(cache.swa_evictable_size(), sw)
+        self.assertGreaterEqual(window_evictable(cache), sw)
 
         # Make raw SWA availability smaller than both load-back transfers.
         target_swa_avail = sw - 1
@@ -1234,7 +1235,7 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
             any(
                 call.args
                 and call.args[0].num_tokens == 0
-                and call.args[0].swa_num_tokens > 0
+                and sum(call.args[0].window_num_tokens.values()) > 0
                 for call in evict_for_alloc_mock.call_args_list
             )
         )

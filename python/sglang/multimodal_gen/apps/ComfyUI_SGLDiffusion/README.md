@@ -49,6 +49,27 @@ decode on the worker).
 3. **Sample**: Connect the loaded model to standard ComfyUI samplers. Each step is packed by a model adapter and sent to the SGLang scheduler.
 4. **LoRA Support**: Use the `SGLDiffusion LoRA Loader` for native LoRA integration.
 
+The LoRA loader's `merge_mode` defaults to `auto`, including workflows saved
+before this option existed. Chain loader nodes to combine adapters; each keeps
+its own strength and training alpha/rank. All loaders chained on one MODEL must
+use the same mode. Separate MODEL branches can use different modes: immediately
+before sampling, the shared worker switches to that branch's adapters and mode.
+Sampling the original model disables the previous branch's LoRAs.
+
+- `auto`: a single LoRA is merged into the base weights, unless the weights
+  cannot be merged or a BF16 merge would round away most of its update (common
+  for distilled Turbo LoRAs), in which case it stays dynamic. A chain of LoRAs
+  runs dynamically: re-merging the whole combination whenever it changes costs
+  more than the per-step adapter work it saves.
+- `dynamic`: leaves base weights unchanged and computes each adapter's update
+  during every forward. This avoids BF16 weight-merge rounding and suits
+  workflows that switch adapters, at the cost of per-step adapter work.
+- `merge`: folds the combination into base weights before sampling, saving the
+  per-step adapter computation. Switching restores the original weights first.
+  Merging into BF16 can round away small updates, so it need not produce the
+  same output as dynamic. Quantized weights that cannot be merged require dynamic.
+
+
 ### Options
 
 `SGLDiffusion Options` keeps `model_type` and `num_gpus` on

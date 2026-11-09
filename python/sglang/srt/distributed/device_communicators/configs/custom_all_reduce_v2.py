@@ -321,10 +321,62 @@ def _sm90_configs(num_sm: int) -> dict[int, AllReduceConfig]:
     }
 
 
+# ROCm (MI350X / gfx950). Block counts tuned at TP2/4/6/8; the thresholds are
+# still the conservative default.
+@cache
+def _rocm_configs(num_sm: int) -> dict[int, AllReduceConfig]:
+    default = AllReduceConfig(
+        graph=Heuristic(1 * MB, 1 * MB, 16 * MB),
+        eager=Heuristic(1 * MB, 1 * MB, 16 * MB),
+        num_push_blocks=num_sm,
+        # each pull block runs its own cross-GPU barrier: 32 blocks are 40-65%
+        # faster than one per CU at TP8 from 1 MB, and within a few % of the
+        # best grid at TP2/4/6
+        num_pull_blocks=32,
+        num_mc_blocks=None,
+    )
+    return {world_size: default for world_size in range(2, 9)}
+
+
+# ROCm (MI450 / gfx1250, 96 CUs). Tuned at TP8, also with one rank arriving late
+# and a GEMM before each all-reduce (the serving decode pattern). A grid of one
+# block per CU loses the most under skew; 2shot_push beats 1shot_push from
+# 128 KB and the pull algos at every size; above 8 MB RCCL is faster than a
+# 64-block 2shot_push.
+@cache
+def _rocm_gfx1250_configs(num_sm: int) -> dict[int, AllReduceConfig]:
+    heuristic = Heuristic(64 * KB, 0, 0, two_shot_push_threshold=8 * MB)
+    default = AllReduceConfig(
+        graph=heuristic,
+        eager=heuristic,
+        num_push_blocks=min(num_sm, 64),
+        num_pull_blocks=32,
+        num_mc_blocks=None,
+    )
+    configs = {world_size: default for world_size in range(2, 9)}
+    # 16 ranks span two DPX hosts in one UALink fabric clique. Tuned there with
+    # and without a late rank: across hosts 2shot_push pays two fabric hops, so
+    # 1shot_push wins to 256 KB, and a block per CU keeps 2shot_push ahead of
+    # RCCL to 64 MB.
+    tp16 = heuristic._replace(
+        one_shot_push_threshold=256 * KB, two_shot_push_threshold=64 * MB
+    )
+    configs[16] = default._replace(
+        graph=tp16, eager=tp16, num_push_blocks=min(num_sm, 96)
+    )
+    return configs
+
+
 @cache
 def _get_all_reduce_configs() -> dict[int, AllReduceConfig]:
+    props = torch.cuda.get_device_properties()
+    num_sm = props.multi_processor_count
+    if torch.version.hip:
+        # ROCm reports gfx9xx as capability 9.x: never fall into the SM90 table
+        if props.gcnArchName.startswith("gfx1250"):
+            return _rocm_gfx1250_configs(num_sm)
+        return _rocm_configs(num_sm)
     cuda_major, cuda_minor = torch.cuda.get_device_capability()
-    num_sm = torch.cuda.get_device_properties().multi_processor_count
     if cuda_major == 9:
         return _sm90_configs(num_sm)
     if cuda_major == 10:

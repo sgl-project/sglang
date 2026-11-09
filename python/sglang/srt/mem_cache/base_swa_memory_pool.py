@@ -20,6 +20,10 @@ class BaseSWAKVPool(KVCache):
     handle SWA state separately from the full KV state.
     """
 
+    # The name these pools' one sliding-window sub-pool goes by: in their id
+    # spaces, eviction counts and the storage view over them.
+    WINDOW_SUB_POOL = "swa"
+
     swa_kv_pool: KVCache
     # Set when SWA KV is a per-request ring of this many tokens (addressed by
     # req_pool_idx) rather than a paged token pool; SWA is then not budgeted per token.

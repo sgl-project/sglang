@@ -34,7 +34,7 @@ class TestInklingCheckpointIndices(CustomTestCase):
     def make_backend(
         self,
         *,
-        lazy=False,
+        lazy=True,
         static=False,
         slot_count=6,
         draft_token_num=None,
@@ -144,7 +144,7 @@ class TestInklingCheckpointIndices(CustomTestCase):
         return hidden
 
     def test_prefill_checkpoint_after_real_compaction(self):
-        for lazy in (False, True):
+        for lazy in (True,):
             with self.subTest(lazy=lazy):
                 backend, allocator, pool, slots = self.make_backend(lazy=lazy)
                 virtual = slots[-1:].clone()
@@ -516,6 +516,7 @@ class TestInklingCheckpointIndices(CustomTestCase):
                         )
                         if not static:
                             allocator.free(slots[step : step + 1].clone())
+                            allocator.flush_for_allocation()
                         wrapper = InklingShortConvHybridAttnBackend.__new__(
                             InklingShortConvHybridAttnBackend
                         )

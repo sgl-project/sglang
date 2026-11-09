@@ -18,7 +18,10 @@ from sglang.srt.mem_cache.kv.layout.state import StateHostLayout
 from sglang.srt.mem_cache.kv.state_storage import StateSlotsExhausted, StateStorage
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.mem_cache.static_kv_storage import acquire_rows
-from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.mem_cache.unified_cache.component_type import (
+    ComponentType,
+    tree_slot_ids,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.unified_allocator_fixtures import (
@@ -47,11 +50,6 @@ CHAINS = {
         state_layer_ids=(0, 2),
         **_P16,
     ),
-}
-_COMPONENTS = {
-    "swa": {ComponentType.FULL, ComponentType.SWA},
-    "mamba": {ComponentType.FULL, ComponentType.MAMBA},
-    "tri": {ComponentType.FULL, ComponentType.SWA, ComponentType.MAMBA},
 }
 
 
@@ -90,20 +88,20 @@ class TestPlanNames(CustomTestCase):
 
     def test_sub_pools_and_wire_entries_per_chain(self):
         expected = {
-            "swa": (("full", "kv", "FULL"), ("swa", "swa", "SWA")),
+            "swa": (("full", "kv", "FULL"), ("window_32", "swa", "WINDOW_32")),
             "mamba": (("full", "kv", "FULL"), ("mamba", "mamba", "MAMBA")),
             "tri": (
                 ("full", "kv", "FULL"),
-                ("swa", "swa", "SWA"),
+                ("window_32", "swa", "WINDOW_32"),
                 ("mamba", "mamba", "MAMBA"),
             ),
         }
         wires = {
-            "swa": [("swa", "kv", "swa")],
+            "swa": [("window_32", "kv", "swa")],
             "mamba": [("mamba", "state", "mamba")],
-            "tri": [("swa", "kv", "swa"), ("mamba", "state", "mamba")],
+            "tri": [("window_32", "kv", "swa"), ("mamba", "state", "mamba")],
         }
-        envelopes = {"swa": ("full", "swa"), "mamba": None, "tri": None}
+        envelopes = {"swa": ("full", "window_32"), "mamba": None, "tri": None}
         for name in ("swa", "mamba", "tri"):
             with self.subTest(chain=name):
                 storage = _bundle(name).token_to_kv_pool_allocator.storage
@@ -129,9 +127,9 @@ class TestPlanNames(CustomTestCase):
         # each with its sub-pool's family, in the order it drives their eviction
         # (owner, window, state).
         expected = {
-            "swa": (("FULL", "token"), ("SWA", "window")),
+            "swa": (("FULL", "token"), ("WINDOW_32", "window")),
             "mamba": (("FULL", "token"), ("MAMBA", "state")),
-            "tri": (("FULL", "token"), ("SWA", "window"), ("MAMBA", "state")),
+            "tri": (("FULL", "token"), ("WINDOW_32", "window"), ("MAMBA", "state")),
         }
         for name, slots in expected.items():
             with self.subTest(chain=name):
@@ -166,6 +164,62 @@ class TestPlanNames(CustomTestCase):
                     tuple((s.component, s.family) for s in storage.tree_slots()),
                     slots,
                 )
+
+    def test_a_later_shape_keeps_the_tree_fields_it_leaves_out(self):
+        """The prefix tree binds its window and checkpoint interval, the
+        scheduler the capacities afterwards: the tree's slots stay."""
+        from sglang.srt.mem_cache.static_kv_storage import (
+            StaticKVStorage,
+            StaticPoolShape,
+        )
+
+        storage = StaticKVStorage(None, None)
+        storage.bind_shape(
+            StaticPoolShape(
+                has_window=True,
+                has_state=True,
+                token_capacity=8,
+                window=128,
+                checkpoint_interval=64,
+            )
+        )
+        tree = storage.tree_slots()
+        storage.bind_shape(
+            StaticPoolShape(
+                has_window=True,
+                has_state=True,
+                token_capacity=16,
+                full_tokens_per_layer=16,
+                swa_tokens_per_layer=4,
+            )
+        )
+        self.assertEqual(storage.tree_slots(), tree)
+        self.assertEqual(tree[1].window, 128)
+        self.assertEqual(tree[2].checkpoint_interval, 64)
+        self.assertEqual(storage._shape.token_capacity, 16)
+        self.assertEqual(storage._shape.swa_tokens_per_layer, 4)
+
+    def test_static_tree_components_map_to_their_sub_pools(self):
+        from sglang.srt.mem_cache.static_kv_storage import (
+            StaticKVStorage,
+            StaticPoolShape,
+        )
+
+        storage = StaticKVStorage(
+            None,
+            None,
+            shape=StaticPoolShape(has_window=True, has_state=True, token_capacity=1),
+        )
+        self.assertEqual(storage.tree_sub_pool("FULL"), "kv")
+        self.assertEqual(storage.tree_sub_pool("SWA"), "swa")
+        self.assertEqual(storage.tree_sub_pool("MAMBA"), "mamba")
+        # A window slot under another name holds the one window's rows; a
+        # slot of no family the storage keeps has no sub-pool.
+        self.assertEqual(storage.tree_sub_pool("CUSTOM_WINDOW", family="window"), "swa")
+        with self.assertRaises(KeyError):
+            storage.tree_sub_pool("CUSTOM_WINDOW")
+        with self.assertRaises(KeyError):
+            storage.tree_sub_pool("C128", family="block")
 
     def test_layer_indices_follow_the_pool_routes(self):
         for name in CHAINS:
@@ -259,8 +313,10 @@ class TestHostStack(CustomTestCase):
     def _build(self, name, *, backend):
         bundle = _bundle(name)
         allocator = bundle.token_to_kv_pool_allocator
-        chain = CHAINS[name].chain
-        cache = _RecordingCache(bundle, _COMPONENTS[chain])
+        # The tree's components, numbered as the storage's slots number them.
+        cache = _RecordingCache(
+            bundle, tree_slot_ids(allocator.storage.tree_slots()).values()
+        )
         params = SimpleNamespace(
             token_to_kv_pool_allocator=allocator,
             req_to_token_pool=getattr(bundle, "req_to_token_pool", None),
@@ -315,12 +371,13 @@ class TestHostStack(CustomTestCase):
         storage = cache.token_to_kv_pool_allocator.storage
         kv, swa = result.host_pool_group.entry_map.values()
         self.assertEqual((kv.name, swa.name), (PoolName.KV, PoolName.SWA))
-        for entry, sub_pool in ((kv, "full"), (swa, "swa")):
+        for entry, sub_pool in ((kv, "full"), (swa, "window_32")):
             self.assertEqual(entry.host_pool.kind, "envelope")
             self.assertEqual(entry.host_pool.name, sub_pool)
             self.assertIs(entry.host_pool.device_pool, storage.view(sub_pool))
         # Each side's host pressure evicts its own tree component.
-        for entry, component in ((kv, ComponentType.FULL), (swa, ComponentType.SWA)):
+        window = tree_slot_ids(storage.tree_slots())["WINDOW_32"]
+        for entry, component in ((kv, ComponentType.FULL), (swa, window)):
             cache.calls.clear()
             entry.host_evict_fn(3)
             self.assertEqual(cache.calls, [("host", 3, component)])
@@ -329,14 +386,14 @@ class TestHostStack(CustomTestCase):
         swa.device_evict_fn(1 << 30)
         ((kind, params),) = cache.calls
         self.assertEqual(kind, "device")
-        self.assertGreater(params.swa_num_tokens, 0)
+        self.assertGreater(sum(params.window_num_tokens.values()), 0)
         self.assertEqual(controller["transfer_layer_id_max"], 4)
 
     def test_host_transfers_translate_through_the_storage(self):
         """A host copy maps the controller's ids to rows through the storage's
         id spaces, carried on its entry: the owner's and the state's ids are
-        virtual, a window's host loads bind physical pages. The views hold no
-        allocator callable."""
+        virtual, and a window's are the owner's token ids, so every copy
+        translates when it is submitted. The views hold no allocator callable."""
         for name in ("swa", "mamba", "tri"):
             with self.subTest(chain=name):
                 result, _, cache = self._build(name, backend=None)
@@ -344,11 +401,11 @@ class TestHostStack(CustomTestCase):
                 storage = allocator.storage
                 expected = {
                     storage.owner: allocator.full_attn_allocator.ids.translate,
-                    "swa": None,
                     "mamba": None
                     if allocator.state is None
                     else allocator.state.slots.translate,
                 }
+                owner_ids = allocator.alloc(2 * allocator.page_size)
                 by_view = {
                     id(storage.view(s.name)): s.name for s in storage.sub_pools()
                 }
@@ -356,6 +413,14 @@ class TestHostStack(CustomTestCase):
                 for entry in result.host_pool_group.entry_map.values():
                     sub_pool = by_view[id(entry.device_pool)]
                     seen.add(sub_pool)
+                    if sub_pool == "window_32":
+                        self.assertTrue(
+                            torch.equal(
+                                entry.device_translate(owner_ids),
+                                storage.window_ids("window_32", owner_ids),
+                            )
+                        )
+                        continue
                     self.assertEqual(entry.device_translate, expected[sub_pool])
                     self.assertEqual(entry.device_translate, storage.host_ids(sub_pool))
                 self.assertEqual(seen, set(storage.sub_pool_names()))

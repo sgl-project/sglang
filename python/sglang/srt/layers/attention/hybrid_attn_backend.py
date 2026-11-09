@@ -98,12 +98,10 @@ class HybridAttnBackend(AttentionBackend):
         )
 
     def _snapshot_prefill_shared_reads(
-        self, forward_batch: ForwardBatch, *, num_qo_tokens: int
+        self, forward_batch: ForwardBatch
     ) -> SharedReadEnds:
         backend = self._select_backend(forward_batch.forward_mode)
-        return backend._snapshot_prefill_shared_reads(
-            forward_batch, num_qo_tokens=num_qo_tokens
-        )
+        return backend._snapshot_prefill_shared_reads(forward_batch)
 
     def get_fused_kv_write_buffers(self, layer, forward_batch):
         return self._select_backend(

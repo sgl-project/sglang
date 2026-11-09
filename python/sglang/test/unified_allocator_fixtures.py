@@ -40,7 +40,7 @@ from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import mamba_cache_chunk_size, publish, reset_context
 from sglang.srt.server_args import ServerArgs
-from sglang.test.tree_slots import tree_slots_of
+from sglang.test.tree_slots import storage_tree_slots, tree_slots_of
 
 
 def chain_snapshot(allocator) -> ChainSnapshot:
@@ -67,6 +67,22 @@ def pin_every_band(allocator, busy) -> None:
     """Register ``busy`` as a pin source over every band of a chain allocator,
     as PD and HiCache register theirs over every sub-pool."""
     allocator.add_pin_source(tuple(m.sub_pool_name for m in allocator.members), busy)
+
+
+HOLD = "test-hold"
+
+
+def hold_band(band, key=HOLD) -> None:
+    """Keep a band's live pages where they are: none of them moves, and the
+    band's extent keeps covering them, though it still reuses holes and
+    extends."""
+    first, end = band._span_range()
+    p2v = band.ids.physical_to_virtual[first:end].tolist()
+    band.fix_pages(key, [first + i for i, v in enumerate(p2v) if v >= 0])
+
+
+def release_band(band, key=HOLD) -> None:
+    band.unfix_pages(key)
 
 
 def setup_allocator_context():
@@ -190,6 +206,15 @@ class FakeUnifiedSWAKVPool:
         self.full_kv_pool = FakeKVCache(arena, "full")
         self.swa_kv_pool = FakeKVCache(arena, "swa")
         self.full_to_swa_index_mapping = None
+
+    @property
+    def layer_router(self):
+        # Its sub-pools by name; no sub-pool plays a role under another name.
+        from sglang.srt.mem_cache.kv.router import KVLayerRouter
+
+        return KVLayerRouter.from_layer_maps(
+            self, [("full", self.full_kv_pool, {}), ("swa", self.swa_kv_pool, {})]
+        )
 
 
 class SpecArena(KVArena):
@@ -437,7 +462,7 @@ def tri_sub_pool_specs(
 def build_swa_cache(
     *,
     occupancy=96,
-    lazy=False,
+    lazy=True,
     page_size=1,
     ratio=(1, 1),
     total_bytes=None,
@@ -465,8 +490,8 @@ def build_swa_cache(
             token_to_kv_pool_allocator=allocator,
             page_size=page_size,
             sliding_window_size=128 * page_size if window is None else window,
-            tree_slots=tree_slots_of(
-                (ComponentType.FULL, ComponentType.SWA),
+            tree_slots=storage_tree_slots(
+                allocator.storage,
                 window=128 * page_size if window is None else window,
             ),
         )
@@ -507,13 +532,14 @@ def build_tri_cache(
             token_to_kv_pool_allocator=a,
             page_size=page_size,
             sliding_window_size=128 * page_size,
-            tree_slots=tree_slots_of(
-                (
+            tree_slots=storage_tree_slots(
+                a.storage,
+                window=128 * page_size,
+                components=(
                     (ComponentType.FULL, ComponentType.SWA, ComponentType.MAMBA)
                     if state_cache
                     else (ComponentType.FULL, ComponentType.SWA)
                 ),
-                window=128 * page_size,
             ),
             enable_session_radix_cache=sessions,
         )
@@ -617,7 +643,7 @@ def build_test_unified_pools(
     post_capture_active=False,
     need_sort=False,
     forward_stream=None,
-    lazy_compaction=False,
+    lazy_compaction=True,
     is_draft_worker=False,
     enable_mamba_extra_buffer=False,
     enable_mamba_extra_buffer_lazy=False,

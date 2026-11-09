@@ -12,7 +12,7 @@ from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.pure_swa_radix_cache import PureSWARadixCache
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -32,6 +32,12 @@ class _FakeAllocator:
 
     device = "cpu"
     storage = None
+
+    def window_pool_names(self):
+        return ("swa",)
+
+    def get_kvcache(self):
+        return SimpleNamespace(request_window=None)
 
     def __init__(self, page_size=1):
         self.page_size = page_size
@@ -55,13 +61,18 @@ class _FakeAllocator:
 
 
 def _make_cache(*, disable, num_tokens, page_size=1):
+    req_to_token_pool = _FakeReqToTokenPool(
+        torch.arange(num_tokens, dtype=torch.int64).unsqueeze(0)
+    )
+    allocator = _FakeAllocator(page_size)
+    # The one window pool keeps the cache's 4-token window, as the cache
+    # builder binds it.
+    kv_storage_of(req_to_token_pool, allocator).bind_window_retention(4, None)
     return PureSWARadixCache(
         CacheInitParams(
             disable=disable,
-            req_to_token_pool=_FakeReqToTokenPool(
-                torch.arange(num_tokens, dtype=torch.int64).unsqueeze(0)
-            ),
-            token_to_kv_pool_allocator=_FakeAllocator(page_size),
+            req_to_token_pool=req_to_token_pool,
+            token_to_kv_pool_allocator=allocator,
             page_size=page_size,
             sliding_window_size=4,
         )
@@ -84,8 +95,8 @@ class TestPureSWARadixCache(CustomTestCase):
             priority=0,
             kv=ReqKvInfo(
                 req_pool_idx=0,
-                swa_evict_floor=4,
-                component_evicted_seqlens={ComponentType.SWA: 6},
+                window_evict_floor=4,
+                window_evicted_seqlens={"swa": 6},
             ),
         )
 
@@ -118,8 +129,8 @@ class TestDisabledPureSWARadixCache(CustomTestCase):
             kv=ReqKvInfo(
                 req_pool_idx=0,
                 cache_protected_len=2,
-                swa_evict_floor=3,
-                component_evicted_seqlens={ComponentType.SWA: 6},
+                window_evict_floor=3,
+                window_evicted_seqlens={"swa": 6},
             ),
         )
 
@@ -142,7 +153,7 @@ class TestDisabledPureSWARadixCache(CustomTestCase):
         # pre_len 20 - window 4 = 16, page-aligned: [0, 16) slides out. A
         # prefix-sharing cache would keep max(window, page) and stop at 8.
         self.assertEqual(cache.token_to_kv_pool_allocator.window_freed, list(range(16)))
-        self.assertEqual(req.kv.get_evicted_seqlen(ComponentType.SWA), 16)
+        self.assertEqual(req.kv.get_evicted_seqlen("swa"), 16)
 
 
 if __name__ == "__main__":

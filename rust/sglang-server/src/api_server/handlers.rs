@@ -17,4 +17,4 @@ pub(crate) use control::ProfileOutcome;
 pub use generate::{AbortEnding, Aborted};
 pub(crate) use generate::{CoreCall, PendingGeneration, recv_indexed};
 pub(crate) use handle::{CoreConfig, CoreHandle, CoreMetadata, GRACEFUL_CLOSE_TIMEOUT};
-pub(crate) use hicache::HiCacheManager;
+pub(crate) use hicache::{ADMIN_KEY_MISSING, HiCacheError, HiCacheManager};

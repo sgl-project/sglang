@@ -204,6 +204,68 @@ class TestPagedExpertsKernels(CustomTestCase):
         thread.join()
         self.assertNotEqual(rc[0], 0)
 
+    def test_expert_cache_reads_into_the_pinned_store_byte_for_byte(self):
+        """The expert cache reads with direct I/O straight into the pinned store's rows of
+        whole pages and through its bounce buffer for the others, byte for byte. Negative
+        control: a byte changed in the file shows in that expert's row, and only there."""
+        import mmap
+        import os
+        import tempfile
+        from unittest.mock import patch
+
+        from sglang.srt.layers.moe.paged_experts import expert_cache
+        from sglang.srt.layers.moe.paged_experts.store import (
+            HostExpertStore,
+            same_bytes,
+        )
+
+        rows = {"w13": ((2, 2048), torch.bfloat16), "scales": ((3, 5), torch.float32)}
+        source = {
+            "w13": torch.randn(E, 2, 2048).bfloat16(),
+            "scales": torch.randn(E, 3, 5),
+        }
+        opened = []
+        open_direct = expert_cache._open_direct
+
+        def recorded(*args):
+            fd, direct, result = open_direct(*args)
+            opened.append(direct)
+            return fd, direct, result
+
+        expert_cache._write_failed = False
+        with (
+            tempfile.TemporaryDirectory() as folder,
+            patch.object(expert_cache, "_FREE_MARGIN_BYTES", 0),
+            patch.object(expert_cache, "_open_direct", recorded),
+        ):
+            entry = expert_cache.ExpertCache(
+                os.path.join(folder, "layer-0.experts"), {"key": "k"}
+            )
+            entry.write(source)
+            store = HostExpertStore(rows, E)
+            self.assertTrue(entry.read(store.host))
+            host = store.host["w13"]
+            self.assertTrue(host.is_pinned())
+            self.assertEqual(host[1].data_ptr() % mmap.PAGESIZE, 0)  # read straight
+            for name in rows:
+                self.assertTrue(same_bytes(store.host[name], source[name]), name)
+
+            layout = expert_cache.ObjectLayout.of_host(source)
+            with open(entry.path, "r+b") as f:
+                f.seek(expert_cache._HEADER_BYTES + 3 * layout.object_bytes)
+                f.write(b"\x7f\x7f")
+            again = HostExpertStore(rows, E)
+            self.assertTrue(entry.read(again.host))
+            others = [e for e in range(E) if e != 3]
+            self.assertFalse(same_bytes(again.host["w13"][3], source["w13"][3]))
+            self.assertTrue(
+                same_bytes(again.host["w13"][others], source["w13"][others])
+            )
+        if not all(opened):
+            self.skipTest(
+                f"{tempfile.gettempdir()} refuses O_DIRECT: read through the page cache"
+            )
+
     def test_graph_replays_decide_on_new_routing(self):
         """A captured decide + gather plans and pages each replay's routing, not the routing
         seen at capture."""

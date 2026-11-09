@@ -159,8 +159,9 @@ class IntelAMXAttnBackend(AttentionBackend):
     def _is_swa_layer(self, layer_id: int) -> bool:
         return (
             self.use_sliding_window_kv_pool
-            and self.token_to_kv_pool.layer_router.route(layer_id).sub_pool
-            == IdSpaceKind.SLIDING_WINDOW
+            and self.token_to_kv_pool.layer_router.plays(
+                layer_id, IdSpaceKind.SLIDING_WINDOW
+            )
         )
 
     def _swa_kv_indices(

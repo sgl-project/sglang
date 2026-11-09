@@ -331,14 +331,6 @@ register_kernel(
 
 register_kernel(
     KernelSpec(
-        op="moe.bailing_moe_biased_grouped_topk",
-        backend=KernelBackend.JIT,
-        target="sglang.kernels.ops.moe.bailing_moe_topk:bailing_moe_biased_grouped_topk",
-        capabilities=CUDA_ONLY,
-    )
-)
-register_kernel(
-    KernelSpec(
         op="moe.multi_router_topk",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.moe.multi_router:multi_router_topk",

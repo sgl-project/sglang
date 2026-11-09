@@ -138,7 +138,7 @@ class StreamingSession:
         prefix_len = min(req.kv.kv_committed_len, len(params.key))
 
         # Streaming sessions are append-only (session_controller rollback
-        # ensures req_nodes always points to the last successful req).
+        # ensures turns always points to the last successful req).
         assert prefix_len >= slot.kv.cache_protected_len, (
             f"streaming session prefix shrank: {prefix_len=} < "
             f"{slot.kv.cache_protected_len=}"
@@ -201,7 +201,7 @@ class StreamingSession:
         # by ~1 under overlap); clamp so committed <= allocated.
         slot.kv.commit_finished(target)
 
-        # Update req_nodes to this successfully finished request.
+        # Update turns to this successfully finished request.
         req.session.finish_req(req)
 
         return True
@@ -258,9 +258,7 @@ class StreamingSession:
         if slot.kv.holds_kv:
             self.cache.free_kv_row(slot.kv, [(protected_len, slot.kv.kv_allocated_len)])
             kv_storage_of(
-                self.cache.req_to_token_pool,
-                self.cache.token_to_kv_pool_allocator,
-                tree_cache=self.cache,
+                self.cache.req_to_token_pool, self.cache.token_to_kv_pool_allocator
             ).release_row(slot)
 
         self._free_slot_mamba(slot)

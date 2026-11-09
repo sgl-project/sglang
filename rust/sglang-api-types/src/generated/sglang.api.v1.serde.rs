@@ -2638,6 +2638,7 @@ impl ::serde::Serialize for GenerateMetaInfo {
             "cached_tokens_details",
             &self.cached_tokens_details,
         )?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "dp_rank", &self.dp_rank)?;
         ::serde::ser::SerializeMap::end(map)
     }
 }
@@ -2675,6 +2676,7 @@ impl<'de> ::serde::Deserialize<'de> for GenerateMetaInfo {
                 let mut f_audio_tokens = None;
                 let mut f_video_tokens = None;
                 let mut f_cached_tokens_details = None;
+                let mut f_dp_rank = None;
                 while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
                     match key.as_ref() {
                         "id" => {
@@ -2845,6 +2847,12 @@ impl<'de> ::serde::Deserialize<'de> for GenerateMetaInfo {
                             f_cached_tokens_details =
                                 Some(map.next_value::<Option<CachedTokensDetails>>()?);
                         }
+                        "dp_rank" => {
+                            if f_dp_rank.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("dp_rank"));
+                            }
+                            f_dp_rank = Some(map.next_value::<Option<u32>>()?);
+                        }
                         _ => {
                             map.next_value::<::serde::de::IgnoredAny>()?;
                         }
@@ -2872,6 +2880,7 @@ impl<'de> ::serde::Deserialize<'de> for GenerateMetaInfo {
                     audio_tokens: f_audio_tokens.flatten(),
                     video_tokens: f_video_tokens.flatten(),
                     cached_tokens_details: f_cached_tokens_details.flatten(),
+                    dp_rank: f_dp_rank.flatten(),
                 })
             }
         }

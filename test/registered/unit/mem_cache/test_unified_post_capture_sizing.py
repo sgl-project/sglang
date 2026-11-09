@@ -138,7 +138,7 @@ def _capacities(bundle) -> dict:
         ("full", allocator.full_attn_allocator, kvcache.layer_router.view("full")),
         ("swa", allocator.swa_attn_allocator, kvcache.layer_router.view("swa")),
     ):
-        out[f"{name}.max_slots"] = shared.num_entries(name)
+        out[f"{name}.max_slots"] = shared.num_entries(sub.sub_pool_name)
         out[f"{name}.sub.max_slots"] = sub.max_slots
         out[f"{name}.sub.num_pages"] = sub.num_pages
         out[f"{name}.sub.ids.num_virtual_ids"] = sub.ids.num_virtual_ids
@@ -207,7 +207,7 @@ def _mla_draft_bundle(
         max_num_reqs=2,
         model_context_len=512,
         fused_draft=placement,
-        lazy_compaction=False,
+        lazy_compaction=True,
         post_capture_active=post_capture_active,
     )
 
@@ -558,6 +558,7 @@ class TestUnifiedPostCaptureSizing(CustomTestCase):
                         write_and_read()
                     before = runner.ids_in("full", live)[rank].item()
                     alloc.free(first)
+                    alloc.full_attn_allocator.flush_for_allocation()
                     k.add_(7)
                     graph.replay()
                     torch.cuda.synchronize()
@@ -659,7 +660,7 @@ class TestUnifiedPostCaptureSizing(CustomTestCase):
                 cache.restore_kv_cache(req, backup)
                 cache._finish_restore(req.kv)
                 for band in a.members:
-                    window = {"full": 132, "swa": 64, "draft_swa": draft_window}[
+                    window = {"full": 132, "window_64": 64, "draft_swa": draft_window}[
                         band.sub_pool_name
                     ]
                     start = max(0, 129 - window) // 4 * 4
@@ -687,7 +688,6 @@ class TestUnifiedPostCaptureSizing(CustomTestCase):
 
         from sglang.srt.mem_cache.cache_init_params import CacheInitParams
         from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler as host
-        from sglang.srt.mem_cache.unified_cache.components import ComponentType
         from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
         from sglang.srt.runtime_context import get_memory
 
@@ -728,18 +728,17 @@ class TestUnifiedPostCaptureSizing(CustomTestCase):
             host.attach_hybrid_pool_to_unified_cache(
                 cache, params, None, load_cache_event=None
             )
+        target, draft = cache.window_slots()
         pools = (
             cache.full_kv_pool_host,
-            cache.swa_kv_pool_host,
-            cache.auxiliary_swa_kv_pool_host,
+            cache.components[target]._swa_kv_pool_host,
+            cache.components[draft]._swa_kv_pool_host,
         )
         for pool in pools:
             self.addCleanup(pool.destroy)
         self.assertIsNot(pools[1], pools[2])
-        self.assertIs(cache.components[ComponentType.SWA]._swa_kv_pool_host, pools[1])
-        self.assertIs(
-            cache.components[ComponentType.AUXILIARY_SWA]._swa_kv_pool_host, pools[2]
-        )
+        self.assertIsNotNone(pools[1])
+        self.assertIsNotNone(pools[2])
         ids = pools[2].alloc(4)
         self.assertIsNotNone(ids)
         pools[2].free(ids)
@@ -913,6 +912,7 @@ class TestUnifiedPostCaptureSizing(CustomTestCase):
                         )
                     before = reader.translate_dcp_read_ids(table[1, :1]).clone()
                     alloc.free(gap)
+                    alloc.full_attn_allocator.flush_for_allocation()
                     self.assertFalse(
                         torch.equal(before, reader.translate_dcp_read_ids(table[1, :1]))
                     )
@@ -1426,6 +1426,7 @@ class TestUnifiedPostCaptureSizing(CustomTestCase):
                 pointer = space.read_v2p.data_ptr()
                 before = coords.write(live).clone()
                 alloc.free(first)
+                alloc.full_attn_allocator.flush_for_allocation()
                 k.add_(7)
                 v.add_(11)
                 graph.replay()

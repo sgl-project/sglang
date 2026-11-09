@@ -194,12 +194,16 @@ _is_xpu = is_xpu()
 # Head-group ratios (num_v_heads // num_k_heads) served by the fused
 # split/reshape/cat Triton kernel. On AMD/aiter the ratio-8 layout is also
 # covered by the fused kernel, which removes the two `.contiguous()` copies
-# plus the `torch.cat` of the unfused fallback. On CUDA and AMD/aiter, ratio-3
+# plus the `torch.cat` of the unfused fallback. On CUDA and HIP, ratio-3
 # layouts are handled by the Triton kernel's per-head walk (the CPU fused op
 # still requires a power-of-two group). Other backends keep the original
 # tuple so their control flow is unchanged.
 _GDN_FUSED_QKVZBA_RATIOS = (
-    (1, 2, 3, 4, 8) if _use_aiter else (1, 2, 3, 4) if _is_cuda else (1, 2, 4)
+    (1, 2, 3, 4, 8)
+    if _use_aiter
+    else (1, 2, 3, 4)
+    if (_is_cuda or _is_hip)
+    else (1, 2, 4)
 )
 
 cached_get_processor = lru_cache(get_processor)
@@ -571,6 +575,15 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             # One logical scale per logical shard.
             return [1 for _ in loaded_shard_id]
 
+        packed_dim = getattr(param, "packed_dim", None)
+        if packed_dim is not None and packed_dim == getattr(param, "output_dim", None):
+            # INT4 checkpoints pack several output values into each int32, so
+            # checkpoint-side split sizes must be expressed in packed units.
+            packed_factor = param.packed_factor
+            return [
+                module.output_sizes[idx] // packed_factor for idx in loaded_shard_id
+            ]
+
         # Normal weight / non-block quant tensor
         return [module.output_sizes[idx] for idx in loaded_shard_id]
 
@@ -717,6 +730,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             and qkvz.bias is None
             and ba.bias is None
         ):
+            return
+        if qkvz.weight.device.type == "cpu" or ba.weight.device.type == "cpu":
+            # CPU offload stages registered parameters, but this derived cache
+            # would remain on the host. Keep the separate-projection path.
             return
         fused = torch.cat([qkvz.weight.data, ba.weight.data], dim=0).contiguous()
         self._fused_in_proj_qkvz_width = qkvz.weight.shape[0]

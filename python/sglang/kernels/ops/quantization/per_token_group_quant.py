@@ -28,6 +28,7 @@ def _jit_module(
     out_dtype: torch.dtype,
     group_size: int,
     scale_ue8m0: bool,
+    scale_packed: bool,
     row_major: bool,
     aligned: bool,
     fuse_silu_and_mul: bool,
@@ -59,6 +60,7 @@ def _jit_module(
         out_dtype,
         group_size,
         scale_ue8m0,
+        scale_packed,
         row_major,
         aligned,
         fuse_silu_and_mul,
@@ -95,8 +97,6 @@ def _infer_scale_layout(
         aligned = num_groups % 4 == 0
         return row_major, aligned
     if output_s.dtype == torch.float32:
-        if scale_ue8m0:
-            raise ValueError("scale_ue8m0=True requires an int32-packed output_s")
         return row_major, True
     raise ValueError(f"Unsupported output_s dtype {output_s.dtype}")
 
@@ -119,6 +119,38 @@ def _per_token_group_quant_custom_op(
     num_valid_tokens: int = 0,
     silu_and_mul_mode: str = "legacy",
 ) -> None:
+    if (
+        scale_ue8m0
+        and output_s.dtype == torch.float32
+        and output_s.ndim == 2
+        and output_s.is_contiguous()
+        and not fuse_silu_and_mul
+        and masked_m is None
+        and sorted_token_ids is None
+    ):
+        # Contiguity ignores singleton strides. Give both launchers a row-major
+        # view of the same FP32 storage so v2 cannot mistake it for packed scales.
+        scale_strides = (max(output_s.shape[1], 1), 1)
+        if output_s.stride() != scale_strides:
+            output_s = output_s.as_strided(output_s.shape, scale_strides)
+        # Query the input device at execution time: no import-time CUDA/NVML
+        # dependency and no device/pointer introspection in Dynamo tracing.
+        if (
+            torch.cuda.get_device_capability(input.device)[0] != 9
+            or input.data_ptr() % 32
+        ):
+            from sglang.kernels.ops.quantization.per_token_group_quant_8bit_v2 import (
+                per_token_group_quant_8bit_v2,
+            )
+
+            per_token_group_quant_8bit_v2(
+                input,
+                output_q,
+                output_s,
+                group_size,
+                scale_ue8m0=True,
+            )
+            return
     num_groups = output_q.shape[-1] // group_size
     row_major, aligned = _infer_scale_layout(output_s, scale_ue8m0, num_groups)
     module = _jit_module(
@@ -126,6 +158,7 @@ def _per_token_group_quant_custom_op(
         output_q.dtype,
         int(group_size),
         bool(scale_ue8m0),
+        output_s.dtype == torch.int32,
         row_major,
         aligned,
         bool(fuse_silu_and_mul),
@@ -228,7 +261,16 @@ def per_token_group_quant(
       float32 transposed  -> col-major fp32 scales (TMA-aligned view)
       int32 transposed    -> col-major UE8M0 bytes packed 4-per-int32
       int32 contiguous    -> row-major UE8M0 bytes packed 4-per-int32
-    The packed layouts require ``scale_ue8m0=True``.
+    The packed layouts require ``scale_ue8m0=True``. With a supplied contiguous
+    float32 buffer, this flag instead stores the power-of-two scales as FP32.
+    Input and FP32 scales must be contiguous. Output rows need unit inner
+    stride and 16B alignment; v2 additionally requires contiguous output.
+    All buffers must be non-overlapping CUDA tensors. The public
+    FP8 dispatch selects this specialization for flat BF16 group32 inputs on
+    Hopper with 32B alignment; other architectures and 16B-aligned input views
+    use v2. FP16 stays on v2 because the trait kernel's FP16 quantization
+    multiplier can overflow. Automatic allocation with ``scale_ue8m0=True``
+    continues to produce packed scales.
 
     With ``fuse_silu_and_mul=True``, ``silu_and_mul_mode="dense"`` matches the
     dense CUDA activation: FP32 SiLU and multiply, then one source-dtype round

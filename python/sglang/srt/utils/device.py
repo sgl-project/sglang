@@ -113,6 +113,7 @@ __all__ = [
     "is_gfx95_supported",
     "is_gfx942_supported",
     "is_gfx115_supported",
+    "use_gfx115_kernels",
     "is_gfx1250_supported",
     "get_hip_version",
     "get_nvidia_driver_version",
@@ -1322,6 +1323,15 @@ def is_gfx115_supported():
         return gcn_arch.startswith("gfx115")
     else:
         return False
+
+
+@lru_cache(maxsize=1)
+def use_gfx115_kernels() -> bool:
+    """gfx115x and the gfx115x kernels not turned off (``SGLANG_DISABLE_GFX115_KERNELS``);
+    read once."""
+    from sglang.srt.environ import envs
+
+    return is_gfx115_supported() and not envs.SGLANG_DISABLE_GFX115_KERNELS.get()
 
 
 @lru_cache(maxsize=1)

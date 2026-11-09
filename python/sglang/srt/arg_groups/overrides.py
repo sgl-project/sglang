@@ -62,6 +62,7 @@ from sglang.srt.runtime_context import (
     num_dp_ranks_of,
 )
 from sglang.srt.utils.device import (
+    is_confidential_compute,
     is_fi_a2a_supported,
     is_gfx95_supported,
     xpu_has_xmx_support,
@@ -813,10 +814,6 @@ def _kimi_k31_dsa_backends(view: Any) -> dict:
         )
     backend = chosen.pop() if chosen else _KIMI_K31_DSA_BACKEND
     if backend == "trtllm":
-        if (getattr(view, "dcp_size", 1) or 1) > 1:
-            raise ValueError(
-                "Kimi-K3.1 trtllm DSA does not support --dcp-size > 1; use flashmla_kv."
-            )
         logger.warning(
             "Kimi-K3.1 trtllm DSA uses FP8 q and an unscaled FP8 KV cache, not "
             "the reference fp8_ds_mla numerics. PD prefill and decode must both "
@@ -1085,7 +1082,14 @@ def _flashinfer_allreduce_fusion_auto_enable(view: Any) -> dict:
         and (view.nnodes == 1 or get_platform().is_sm100)
         and view.moe_a2a_backend == "none"
     ):
-        backend = "cutedsl" if is_mimo else "auto"
+        if is_confidential_compute():
+            # mnnvl, cutedsl and multi-node fusion need NVLink multicast, which
+            # Confidential Computing does not provide.
+            if is_mimo or view.nnodes > 1:
+                return {}
+            backend = "trtllm"
+        else:
+            backend = "cutedsl" if is_mimo else "auto"
         logger.info(
             "Auto-enabling FlashInfer AllReduce Fusion (%s) for %s", backend, model_arch
         )

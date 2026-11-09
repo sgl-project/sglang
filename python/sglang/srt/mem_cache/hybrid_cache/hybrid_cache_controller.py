@@ -26,6 +26,9 @@ from sglang.srt.managers.cache_controller import (
 from sglang.srt.managers.cache_controller import (
     StorageOperation as BaseStorageOperation,
 )
+from sglang.srt.managers.cache_controller import (
+    check_dcp_l3_extra_pool,
+)
 from sglang.srt.mem_cache.allocator.page_interleave import PageInterleavePoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.srt.mem_cache.hicache_storage import (
@@ -54,6 +57,7 @@ from sglang.srt.observability.trace import (
 )
 
 if TYPE_CHECKING:
+    from sglang.srt.mem_cache.kv.storage import KVStorage
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 
 from sglang.srt.mem_cache.utils import get_storage_hash_str
@@ -349,6 +353,7 @@ class HybridCacheController(BaseHiCacheController):
         transfer_layer_id_max: Optional[int] = None,
         enable_storage_metrics: bool = False,
         host_memory_mode: str = "cache",
+        kv_storage: Optional[KVStorage] = None,
     ):
         startup_storage_backend = storage_backend
         self.is_kv_sharded = isinstance(
@@ -378,6 +383,7 @@ class HybridCacheController(BaseHiCacheController):
             storage_backend_extra_config=storage_backend_extra_config,
             enable_storage_metrics=enable_storage_metrics,
             host_memory_mode=host_memory_mode,
+            kv_storage=kv_storage,
         )
         # Hybrid transfer IDs span every component pool, including holes for
         # uncached layers that the anchor pool alone cannot describe.
@@ -503,10 +509,15 @@ class HybridCacheController(BaseHiCacheController):
     def register_host_pool_entry(self, entry: PoolEntry) -> None:
         if not isinstance(self.mem_pool_host, HostPoolGroup):
             raise TypeError("Dynamic HiCache sidecars require HostPoolGroup.")
+        storage_attached = self.enable_storage and self.storage_backend is not None
+        if storage_attached and getattr(self.storage_host_pool, "dcp_size", 1) > 1:
+            # Sidecars added after attach (e.g. the DFLASH draft) miss the
+            # attach-time DCP check.
+            check_dcp_l3_extra_pool(entry, self.storage_host_pool)
         self.mem_pool_host.add_entry(entry)
         if not entry.is_primary_index_anchor:
             self.extra_host_mem_release_queues.setdefault(entry.name, Queue())
-        if self.enable_storage and self.storage_backend is not None:
+        if storage_attached:
             self.storage_backend.register_mem_host_pool_v2(entry.host_pool, entry.name)
 
     @staticmethod

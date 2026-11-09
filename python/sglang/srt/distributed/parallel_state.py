@@ -3330,6 +3330,27 @@ def destroy_distributed_environment():
         torch.distributed.destroy_process_group()
 
 
+def close_custom_all_reduce() -> None:
+    """Release ROCm carv2 multi-node workspaces while the groups still exist.
+
+    Graceful shutdown aborts the process groups instead of destroying them, and
+    carv2 frees a FABRIC workspace collectively on its group.
+    """
+    if not is_hip():
+        return
+    for name in sorted(_groups):
+        group = _groups[name]()
+        if group is None or not getattr(group.ca_comm, "_is_multinode", False):
+            continue
+        try:
+            group.ca_comm.close()
+        except Exception as e:
+            logger.warning(
+                f"Custom all-reduce close on shutdown failed, {type(e).__name__}: {e}"
+            )
+        group.ca_comm = None
+
+
 def abort_distributed_environment() -> None:
     """Drop this rank's communicators locally.
 

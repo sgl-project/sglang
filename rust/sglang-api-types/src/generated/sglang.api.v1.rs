@@ -601,6 +601,10 @@ pub struct GenerateMetaInfo {
     /// tokens.
     #[prost(message, optional, tag = "21")]
     pub cached_tokens_details: ::core::option::Option<CachedTokensDetails>,
+    /// The data-parallel rank whose scheduler served the request, on every
+    /// frame; null when the server runs without data parallelism.
+    #[prost(uint32, optional, tag = "22")]
+    pub dp_rank: ::core::option::Option<u32>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct WeightVersionSpan {

@@ -382,7 +382,6 @@ jobs:
       needs.check-changes.outputs.multimodal_gen == 'true'
     uses: ./.github/workflows/pr-test-multimodal-gen.yml
     with:
-      runner_config: 4-gpu-b200
       runs_on_map: ${{ needs.check-changes.outputs.runs_on_map }}
       multimodal_gen: ${{ needs.check-changes.outputs.multimodal_gen }}
       sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}

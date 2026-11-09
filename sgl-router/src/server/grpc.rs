@@ -107,6 +107,9 @@ fn log_call(
             .unwrap_or(""),
         model = log_context.map(|c| c.model_id.as_str()).unwrap_or(""),
         stream = log_context.is_some_and(|c| c.streaming),
+        images = log_context.map_or(0, |c| c.media.images),
+        videos = log_context.map_or(0, |c| c.media.videos),
+        audios = log_context.map_or(0, |c| c.media.audios),
         latency_ms = started.elapsed().as_millis() as u64,
         "grpc_request",
     );

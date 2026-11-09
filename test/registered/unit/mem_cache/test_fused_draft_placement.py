@@ -58,8 +58,11 @@ from sglang.test.test_utils import CustomTestCase, published_topology
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
-_HOSTS = ("full", "swa")
-_HOSTS_TRI = ("full", "swa", "mamba")
+# The target's sub-pools; TARGET_WINDOW stands for its window sub-pool, named by the
+# target window `_place` is given.
+TARGET_WINDOW = object()
+_HOSTS = ("full", TARGET_WINDOW)
+_HOSTS_TRI = ("full", TARGET_WINDOW, "mamba")
 _DTYPE = torch.bfloat16
 _WINDOW = DraftKVGeometry(head_num=2, head_dim=64, v_head_dim=64)
 _STATE = DraftStateGeometry(
@@ -101,10 +104,16 @@ def _profile(
 
 
 def _place(profile, num_runners=1, host_names=_HOSTS, target_window=None):
+    from sglang.srt.mem_cache.kv.decl import window_sub_pool_name
+
+    window = window_sub_pool_name(target_window)
     return place_fused_draft(
         profile=profile,
         num_runners=num_runners,
-        ctx=PlacementContext(host_names=host_names, target_window=target_window),
+        ctx=PlacementContext(
+            host_names=tuple(window if h is TARGET_WINDOW else h for h in host_names),
+            target_window=target_window,
+        ),
         store_dtype=_DTYPE,
     )
 
@@ -122,7 +131,7 @@ class TestPlaceFusedDraft(CustomTestCase):
         self.assertEqual(placement.hosts(), ("full",))
         for r in range(3):
             self.assertEqual(placement.lanes_for(r, "full"), range(2 * r, 2 * r + 2))
-            self.assertEqual(placement.lanes_for(r, "swa"), range(0))
+            self.assertEqual(placement.lanes_for(r, "window"), range(0))
 
     def test_per_depth_head_serves_one_depth_per_runner(self):
         decision = _place(_profile(num_layers=8, num_depths=8), num_runners=2)
@@ -132,7 +141,7 @@ class TestPlaceFusedDraft(CustomTestCase):
         self.assertEqual(placement.lanes_for(1, "full"), range(1, 2))
 
     def test_a_tri_pool_host_fuses_a_full_only_draft(self):
-        decision = _place(_profile(), host_names=("full", "swa", "mamba"))
+        decision = _place(_profile(), host_names=_HOSTS_TRI)
         self.assertIsNotNone(decision.placement, decision.declined)
         self.assertEqual(decision.placement.hosts(), ("full",))
 
@@ -146,13 +155,33 @@ class TestPlaceFusedDraft(CustomTestCase):
         placement = decision.placement
         self.assertIsNotNone(placement, decision.declined)
         self.assertIsNone(decision.note)
-        self.assertEqual(placement.hosts(), ("swa",))
+        self.assertEqual(placement.hosts(), ("window_128",))
         self.assertIsNone(placement.region("full"))
-        self.assertEqual(placement.region("swa").lane_num, 3)
-        self.assertEqual(placement.region("swa").head_num, _WINDOW.head_num)
+        self.assertEqual(placement.region("window_128").lane_num, 3)
+        self.assertEqual(placement.region("window_128").head_num, _WINDOW.head_num)
         for r in range(3):
-            self.assertEqual(placement.lanes_for(r, "swa"), range(r, r + 1))
+            self.assertEqual(placement.lanes_for(r, "window_128"), range(r, r + 1))
             self.assertEqual(placement.lanes_for(r, "full"), range(0))
+
+    def test_window_layers_ride_in_the_target_window_sub_pool_by_its_name(self):
+        # The target's window sub-pool is named by the window its layers attend
+        # over (here one less than the configured window both models state):
+        # the draft rides in it under that name.
+        decision = place_fused_draft(
+            profile=_profile(window_layer_ids=(0,), window=128),
+            num_runners=1,
+            ctx=PlacementContext(
+                host_names=("full", "window_127"),
+                target_window=128,
+                target_window_sub_pool="window_127",
+            ),
+            store_dtype=_DTYPE,
+        )
+        placement = decision.placement
+        self.assertIsNotNone(placement, decision.declined)
+        self.assertEqual(placement.hosts(), ("window_127",))
+        self.assertEqual(placement.new_bands, {})
+        self.assertEqual(placement.host_kind("window_127").serves, LAYER_WINDOW)
 
     def test_per_depth_head_places_each_depth_by_its_kind(self):
         # Inkling shape: depth 1 is a local (window) block, depths 0 and 2 full.
@@ -164,9 +193,9 @@ class TestPlaceFusedDraft(CustomTestCase):
         placement = decision.placement
         self.assertIsNotNone(placement, decision.declined)
         self.assertEqual(placement.region("full").lane_num, 2)
-        self.assertEqual(placement.region("draft_swa").lane_num, 1)
+        self.assertEqual(placement.region("window_64").lane_num, 1)
         self.assertEqual(placement.lanes_for(0, "full"), range(0, 1))
-        self.assertEqual(placement.lanes_for(1, "draft_swa"), range(0, 1))
+        self.assertEqual(placement.lanes_for(1, "window_64"), range(0, 1))
         self.assertEqual(placement.lanes_for(1, "full"), range(0))
         self.assertEqual(placement.lanes_for(2, "full"), range(1, 2))
 
@@ -196,13 +225,15 @@ class TestPlaceFusedDraft(CustomTestCase):
         )
         self.assertEqual(placement.hosts(), ("full",))
         self.assertEqual(placement.new_bands, {})
-        self.assertEqual({s.name for s in plan.sub_pools}, {"full", "swa"})
+        self.assertEqual({s.name for s in plan.sub_pools}, {"full", "window_128"})
 
     def test_unmatched_windows_get_independent_bands(self):
+        # A window the target does not declare gets a band named by its own
+        # length.
         for window, hosts, name in (
-            (256, _HOSTS, "draft_swa"),
-            (64, _HOSTS, "draft_swa"),
-            (64, ("full", "mamba"), "swa"),
+            (256, _HOSTS, "window_256"),
+            (64, _HOSTS, "window_64"),
+            (64, ("full", "mamba"), "window_64"),
         ):
             decision = _place(
                 _profile(window_layer_ids=(0,), window=window),
@@ -223,10 +254,10 @@ class TestPlaceFusedDraft(CustomTestCase):
             target_window=128,
         )
         self.assertIsNotNone(decision.placement, decision.declined)
-        self.assertEqual(decision.placement.hosts(), ("full", "draft_swa"))
+        self.assertEqual(decision.placement.hosts(), ("full", "window_256"))
         self.assertNotEqual(
             decision.placement.region("full").head_num,
-            decision.placement.region("draft_swa").head_num,
+            decision.placement.region("window_256").head_num,
         )
 
     def test_per_depth_head_needs_one_runner_per_depth(self):
@@ -350,7 +381,7 @@ class TestDraftKVProfile(CustomTestCase):
         with patch("sglang.srt.configs.hybrid_arch.mambaish_config", return_value=None):
             profile = draft_kv_profile(config, num_layers=2, attn_tp_size=1)
         placement = _place(profile, target_window=16).placement
-        for kind, host in ((LAYER_FULL, "full"), (LAYER_WINDOW, "draft_swa")):
+        for kind, host in ((LAYER_FULL, "full"), (LAYER_WINDOW, "window_128")):
             self.assertIsInstance(profile.kinds[kind].geometry, DraftMLAGeometry)
             self.assertIsInstance(placement.region(host), MLADraftRegion)
 
@@ -671,10 +702,11 @@ class TestUnifiedSWAHeadGeometry(CustomTestCase):
             spec, entry_bytes = _fused_plan(
                 self._configurator(),
                 FusedDraftPlacement(
-                    runners=(RunnerLanes(ranges={"swa": (0, 1)}),),
-                    regions={"swa": region},
+                    runners=(RunnerLanes(ranges={"window_128": (0, 1)}),),
+                    regions={"window_128": region},
+                    hosted={"window_128": "swa"},
                 ),
-                "swa",
+                "window_128",
             )
         self.assertEqual(
             (spec.layer_num, spec.head_num, spec.head_dim, spec.v_head_dim),

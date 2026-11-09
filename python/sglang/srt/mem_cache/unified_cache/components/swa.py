@@ -20,6 +20,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PoolTransferResult,
 )
+from sglang.srt.mem_cache.kv.plan import TREE_WINDOW
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeComponentDeviceSlot,
     FreeComponentHostSlot,
@@ -43,6 +44,7 @@ from sglang.srt.mem_cache.unified_cache.components.base import (
     PreparePrefetchResult,
     TreeComponent,
     next_component_uuid,
+    windows_stand_alone,
 )
 
 if TYPE_CHECKING:
@@ -68,6 +70,18 @@ class SWAComponent(TreeComponent):
     value stays intact.
     """
 
+    family = TREE_WINDOW
+
+    @property
+    def window_sub_pool(self) -> str:
+        """The window sub-pool this slot keeps: the name a request's cursor
+        for this window goes by."""
+        name = self.__dict__.get("_window_sub_pool")
+        if name is None:
+            name = self.storage_and_sub_pool()[1]
+            self.__dict__["_window_sub_pool"] = name
+        return name
+
     def __init__(
         self, cache: UnifiedRadixCache, params: CacheInitParams, slot: TreeSlot
     ):
@@ -81,14 +95,12 @@ class SWAComponent(TreeComponent):
             raise ValueError("SWAComponent requires a positive window in its slot")
 
         super().__init__(cache, params, slot)
+        # The host pool of the slot's HiCache copies: the one its window slot
+        # names under unified memory, else the window host pool.
         self.pool_name = (
-            PoolName.AUXILIARY_SWA
-            if self.component_type == ComponentType.AUXILIARY_SWA
-            else PoolName.SWA
+            PoolName.SWA if slot.host_pool is None else PoolName(slot.host_pool)
         )
-        self._independent = (
-            sum(slot.family == "window" for slot in params.tree_slots) > 1
-        )
+        self._independent = windows_stand_alone(params.tree_slots)
         self._session_leaf_covered_len: dict[str, dict[UnifiedTreeNode, int]] = {}
         # The history a prefix keeps, which every reader of the window needs
         # (a fused draft's reads included); not the model's attention window.
@@ -291,7 +303,7 @@ class SWAComponent(TreeComponent):
                     on_refresh=(
                         joint_lru.window_stamper()
                         if joint_lru is not None
-                        and self.component_type == ComponentType.SWA
+                        and self.component_type == self.tree_core.joint_window_type
                         else None
                     ),
                 )
@@ -360,10 +372,11 @@ class SWAComponent(TreeComponent):
                 break
             node = node.parent
 
-        if ct == ComponentType.AUXILIARY_SWA:
-            return result._replace(auxiliary_swa_host_hit_length=swa_host_hit)
+        window_host_hit_lengths = {**result.window_host_hit_lengths, ct: swa_host_hit}
+        # The branch point reads only the match's joint lengths, which no
+        # window's finalizer changes, so every window gives the same one.
         return result._replace(
-            swa_host_hit_length=swa_host_hit,
+            window_host_hit_lengths=window_host_hit_lengths,
             swa_branching_seqlen=branching_seqlen,
         )
 
@@ -802,10 +815,12 @@ class SWAComponent(TreeComponent):
                 for node in self._collect_unbacked_swa_nodes(x)
             )
             if needed:
-                if ct == ComponentType.SWA:
+                if not self._independent and ct == self.tree_core.slot_id(TREE_WINDOW):
+                    # The tree's one window defers its backup to the controller
+                    # and resumes the tombstone after it, as the native core
+                    # does.
                     return InternalStateBackup(node_id=x.id, num_tokens=needed)
-                # Custom SWA component types use Python's inherited inline
-                # path; the shared finish hook is for built-in SWA only.
+                # Stand-alone windows back up inline, each alike.
                 if (
                     self._swa_kv_pool_host is not None
                     and self._swa_kv_pool_host.available_size() < needed
@@ -1000,7 +1015,7 @@ class SWAComponent(TreeComponent):
         # Unfinished requests can already have an SWA-evicted prefix; preserve
         # that boundary so insertion creates a tombstone instead of live SWA KV.
         insert_params.set_evicted_seqlen(
-            self.component_type, req.kv.get_evicted_seqlen(self.component_type)
+            self.component_type, req.kv.get_evicted_seqlen(self.window_sub_pool)
         )
 
         # A recurrent checkpoint must stay attached to its exact token prefix.
@@ -1031,7 +1046,7 @@ class SWAComponent(TreeComponent):
             retain_floor=self.cache.swa_retain_floor(
                 req, window=self.sliding_window_size
             ),
-            component_type=self.component_type,
+            window_sub_pool=self.window_sub_pool,
             shares_prefixes=True,
         )
 
@@ -1040,7 +1055,7 @@ class SWAComponent(TreeComponent):
     ) -> None:
         self._free_out_of_window_slots(req, pre_len)
         insert_params.set_evicted_seqlen(
-            self.component_type, req.kv.get_evicted_seqlen(self.component_type)
+            self.component_type, req.kv.get_evicted_seqlen(self.window_sub_pool)
         )
 
     def cleanup_after_caching_req(
@@ -1141,22 +1156,16 @@ class SWAComponent(TreeComponent):
             if not unbacked_swa_nodes:
                 return None
             unbacked_swa_nodes.reverse()
+            # The unified pool names window rows by the owner's token ids; the
+            # transfer translates them when it is submitted, after any move.
+            value_type = (
+                BASE_COMPONENT_TYPE if self._unified_allocator() is not None else ct
+            )
             return [
                 PoolTransfer(
                     name=self.pool_name,
-                    device_indices=(
-                        self._translate_full_to_swa(
-                            torch.cat(
-                                [
-                                    n.component_data[BASE_COMPONENT_TYPE].value
-                                    for n in unbacked_swa_nodes
-                                ]
-                            )
-                        )
-                        if self._unified_allocator() is not None
-                        else torch.cat(
-                            [n.component_data[ct].value for n in unbacked_swa_nodes]
-                        )
+                    device_indices=torch.cat(
+                        [n.component_data[value_type].value for n in unbacked_swa_nodes]
                     ).to(torch.int64),
                     nodes_to_load=[n.id for n in unbacked_swa_nodes],
                 )
@@ -1274,7 +1283,7 @@ class SWAComponent(TreeComponent):
             storage, sub_pool = self.storage_and_sub_pool()
             shortfall = max(0, num_tokens - storage.available_units(sub_pool))
             if shortfall:
-                self.cache.evict(EvictParams(swa_num_tokens=shortfall))
+                self.cache.evict(EvictParams(window_num_tokens={sub_pool: shortfall}))
             transfer.device_indices = storage.take_units(sub_pool, num_tokens)
             if transfer.device_indices is None:
                 return None
@@ -1305,8 +1314,8 @@ class SWAComponent(TreeComponent):
             window = ((self.sliding_window_size + page - 1) // page) * page
             boundary = max(0, prefix_len - window)
             req.kv.set_evicted_seqlen(
-                self.component_type,
-                max(req.kv.get_evicted_seqlen(self.component_type), boundary),
+                self.window_sub_pool,
+                max(req.kv.get_evicted_seqlen(self.window_sub_pool), boundary),
             )
         return transfer
 

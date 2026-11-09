@@ -176,6 +176,7 @@ class TestReceiverControlMessages(CustomTestCase):
             state_layer_ids=[[7]],
             engine_rank=0,
             gpu_id=0,
+            draft_rows_dcp_collapsed=True,
         )
         manager.agent = SimpleNamespace(
             name="nixl-peer", get_agent_metadata=lambda: b"agent-desc"
@@ -235,6 +236,7 @@ class TestReceiverControlMessages(CustomTestCase):
                 b"0",
                 b"",
                 struct.pack("Q", 16),
+                b"1",
             ],
             "nixl": [
                 b"NixlMsgGuard",
@@ -262,6 +264,7 @@ class TestReceiverControlMessages(CustomTestCase):
                 b"1",
                 b"0",
                 struct.pack("<IIQ", 1, 8, 512),
+                b"1",
             ],
             "mori": [
                 b"MoriMsgGuard",
@@ -311,6 +314,7 @@ class TestReceiverControlMessages(CustomTestCase):
                 self.assertEqual(info.dst_aux_item_lens, [64] if enabled else None)
                 self.assertEqual(info.dst_kv_item_lens, [16])
                 self.assertEqual(info.dst_state_item_lens, [[32]])
+                self.assertTrue(info.dst_draft_rows_dcp_collapsed)
                 if backend == "nixl":
                     self.assertEqual(info.dst_state_data_lens, [[512]])
 

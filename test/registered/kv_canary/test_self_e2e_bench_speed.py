@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import os
+import statistics
 import unittest
 from pathlib import Path
 from typing import ClassVar, Optional
@@ -20,7 +21,7 @@ from sglang.test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER
 # CUDA-only: this self-bench asserts a 1.0% kv_canary overhead budget tuned on
 # the CUDA (H100) runner. On ROCm the measured overhead is ~1.26%, so the
 # benchmark is not portable as-is; keep it off AMD CI rather than register-and-skip.
-register_cuda_ci(est_time=335, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=480, stage="extra-a", runner_config="1-gpu-large")
 
 
 _QWEN3_MODEL = "Qwen/Qwen3-30B-A3B"
@@ -32,6 +33,8 @@ _PROFILE_NO_GRAPH_OUTPUT_LEN = 3
 # start_profile blocks until num_steps server steps complete, so it must be <= actual decode steps.
 _PROFILE_NO_GRAPH_STEPS = 3
 
+_NUM_MEASURED_RUNS = 3
+
 
 def _make_server_args(
     *, canary_on: bool, disable_cuda_graph: bool = False
@@ -41,6 +44,8 @@ def _make_server_args(
         "--model-path",
         _QWEN3_MODEL,
         "--cuda-graph-backend-prefill=disabled",
+        "--gc-warning-threshold-secs",
+        "0.5",
     ]
     if disable_cuda_graph:
         extra.append("--disable-cuda-graph")
@@ -54,14 +59,22 @@ def _make_server_args(
     return ServerArgs.from_cli_args(namespace)
 
 
-def _make_bench_args(*, batch_size: int, input_len: int, output_len: int) -> BenchArgs:
+def _make_bench_args(
+    *,
+    batch_size: int,
+    input_len: int,
+    output_len: int,
+    num_runs: int,
+    skip_warmup: bool,
+) -> BenchArgs:
     return BenchArgs(
         run_name=f"canary_self_bench_bs{batch_size}_isl{input_len}_osl{output_len}",
-        batch_size=(batch_size,),
+        # run_benchmark_internal runs one case per batch_size entry.
+        batch_size=(batch_size,) * num_runs,
         input_len=(input_len,),
         output_len=(output_len,),
         temperature=0.0,
-        skip_warmup=False,
+        skip_warmup=skip_warmup,
         show_report=True,
         dataset_name="random",
         seed=42,
@@ -77,12 +90,18 @@ def _run_one_canary_setting(
     disable_cuda_graph: bool = False,
     profile_output_dir: Optional[Path] = None,
     profile_steps: int = _PROFILE_STEPS,
-) -> BenchOneCaseResult:
+    num_runs: int = 1,
+    skip_warmup: bool = False,
+) -> list[BenchOneCaseResult]:
     server_args = _make_server_args(
         canary_on=canary_on, disable_cuda_graph=disable_cuda_graph
     )
     bench_args = _make_bench_args(
-        batch_size=batch_size, input_len=input_len, output_len=output_len
+        batch_size=batch_size,
+        input_len=input_len,
+        output_len=output_len,
+        num_runs=num_runs,
+        skip_warmup=skip_warmup,
     )
     if profile_output_dir is not None:
         profile_output_dir.mkdir(parents=True, exist_ok=True)
@@ -110,7 +129,7 @@ def _run_one_canary_setting(
             f"bs={batch_size}, isl={input_len}, osl={output_len}); the runner's "
             f"KV cache is too small to fit this configuration -- nothing to measure."
         )
-    return results[0]
+    return results
 
 
 def _make_scenario_key(*, batch_size: int, input_len: int, output_len: int) -> str:
@@ -151,7 +170,7 @@ class TestCanarySelfBenchSpeed(unittest.TestCase):
             output_len=output_len,
             profile_output_dir=graph_dir,
             profile_steps=graph_profile_steps,
-        )
+        )[0]
         print(
             f"[canary self-bench] {scenario_key} profile cuda_graph: "
             f"on={graph_run.latency:.4f}s (trace under {graph_dir})",
@@ -167,7 +186,7 @@ class TestCanarySelfBenchSpeed(unittest.TestCase):
             disable_cuda_graph=True,
             profile_output_dir=no_graph_dir,
             profile_steps=_PROFILE_NO_GRAPH_STEPS,
-        )
+        )[0]
         print(
             f"[canary self-bench] {scenario_key} profile no_cuda_graph_osl3: "
             f"on={no_graph_run.latency:.4f}s (trace under {no_graph_dir}); "
@@ -198,28 +217,37 @@ class TestCanarySelfBenchSpeed(unittest.TestCase):
             )
             return
 
-        off = _run_one_canary_setting(
-            canary_on=False,
-            batch_size=batch_size,
-            input_len=input_len,
-            output_len=output_len,
-        )
-        on = _run_one_canary_setting(
-            canary_on=True,
-            batch_size=batch_size,
-            input_len=input_len,
-            output_len=output_len,
-        )
-        overhead_pct = ((on.latency - off.latency) / off.latency) * 100.0
-        summary = (
-            f"[canary self-bench] {scenario_key}: "
-            f"off={off.latency:.4f}s on={on.latency:.4f}s overhead={overhead_pct:.2f}%"
-        )
+        cost_name = "e2e" if output_len == 1 else "decode"
+        lines = [f"[canary self-bench] {scenario_key}, median {cost_name} time:"]
+        medians = {}
+        for canary_on in (False, True):
+            # The first run warms up the server with the measured shape.
+            runs = _run_one_canary_setting(
+                canary_on=canary_on,
+                batch_size=batch_size,
+                input_len=input_len,
+                output_len=output_len,
+                num_runs=1 + _NUM_MEASURED_RUNS,
+                skip_warmup=True,
+            )[1:]
+            # Decode time excludes TTFT, which absorbs one-off stalls before the first prefill.
+            costs = [
+                r.latency if output_len == 1 else r.latency - r.last_ttft for r in runs
+            ]
+            medians[canary_on] = statistics.median(costs)
+            lines.append(
+                f"  {'on ' if canary_on else 'off'}: {medians[canary_on]:.4f}s "
+                f"of [{', '.join(f'{c:.4f}' for c in costs)}]s, "
+                f"ttft [{', '.join(f'{r.last_ttft:.4f}' for r in runs)}]s"
+            )
+        overhead_pct = (medians[True] - medians[False]) / medians[False] * 100.0
+        lines.append(f"  overhead={overhead_pct:.2f}%")
+        summary = "\n".join(lines)
         print(summary, flush=True)
         self.assertLess(
             overhead_pct,
             max_overhead_pct,
-            msg=(f"{summary} — exceeds {max_overhead_pct:.1f}% budget"),
+            msg=(f"{summary}\nexceeds {max_overhead_pct:.1f}% budget"),
         )
 
     def test_qwen3_prefill_overhead_bs32_isl16384_osl1(self) -> None:
