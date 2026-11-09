@@ -93,7 +93,7 @@ struct AgOneBarrier {
     auto R = SymbolicSize{"rows"};
     auto L = SymbolicSize{"ld"};
     auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU, kDLROCM>();
     TensorMatcher({R, L}).with_dtype<bf16_t>().with_device(device).verify(y);
     const int64_t rows = R.unwrap(), ld = L.unwrap();
     TensorMatcher({rows, ld * kNG}).with_dtype<bf16_t>().with_device(device).verify(output).verify(add_b);

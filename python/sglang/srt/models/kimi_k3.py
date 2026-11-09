@@ -2044,10 +2044,11 @@ class KimiK3MoE(nn.Module):
             if out is not None:
                 return out
         if (
-            getattr(ca, "_IS_CAPTURING", False)
+            get_parallel().tp_group.world_size == 8
+            and getattr(ca, "_IS_CAPTURING", False)
             and torch.cuda.is_current_stream_capturing()
         ):
-            # same kernel minus its trailing barrier; y is kept alive past the
+            # TP8 only (eight shards); same kernel minus its trailing barrier; y is kept alive past the
             # next collective instead (graph capture only)
             from sglang.kernels.ops.communication.k3_ag_one_barrier_hip import (
                 all_gather_lastdim_add_1sync,

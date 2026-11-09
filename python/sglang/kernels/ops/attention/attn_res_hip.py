@@ -187,7 +187,7 @@ def _agg_stream_kernel(
     online softmax so the bank is read once with a small register tile (the
     full [next_pow2(NVB), 8192] tile costs occupancy at large T). Outputs match
     _agg_kernel up to rare 1-ulp bf16 flips from the running-max rescale."""
-    t = tl.program_id(0)
+    t = tl.program_id(0).to(tl.int64)  # t * stride overflows int32 at large T
     offs = tl.arange(0, BLOCK_H)
     mask = offs < H
 

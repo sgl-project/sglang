@@ -92,13 +92,22 @@ def fused_max_t() -> int:
     return 64 if is_hip() else 0
 
 
-def use_hip_smallm(num_tokens: int, hidden_size: int, nvb: int) -> bool:
-    """Whether an aggregation point of this shape takes attn_res_smallm_hip."""
-    return (
-        0 < num_tokens <= smallm_max_t()
+def use_hip_smallm(
+    num_tokens: int, hidden_size: int, nvb: int, dtype: torch.dtype
+) -> bool:
+    """Whether an aggregation point of this shape and dtype takes
+    attn_res_smallm_hip: the inputs that kernel accepts, so a declined point
+    falls back before launch or deferred capture."""
+    if not (
+        dtype == torch.bfloat16
+        and 0 < num_tokens <= smallm_max_t()
         and nvb >= 1
         and _use_hip_fused(hidden_size, nvb)
-    )
+    ):
+        return False
+    from sglang.kernels.ops.attention.attn_res_smallm_hip import supported
+
+    return supported(hidden_size, nvb)
 
 
 def get_cw(
@@ -353,7 +362,7 @@ def _aggregate_hip(
     )
     kernel = attn_res_hip
     extra = {}
-    if use_hip_smallm(prefix_sum.shape[0], prefix_sum.shape[1], nvb):
+    if use_hip_smallm(prefix_sum.shape[0], prefix_sum.shape[1], nvb, prefix_sum.dtype):
         from sglang.kernels.ops.attention.attn_res_smallm_hip import (
             attn_res_smallm_hip,
         )
@@ -558,7 +567,7 @@ class AttnResidual:
         """Whether a dspark capture of the stream value over `nvb` rows can
         ride the next aggregation of the same rows (small-M ROCm kernel)."""
         return nvb == self.num_valid_blocks and use_hip_smallm(
-            hidden_states.shape[0], hidden_states.shape[1], nvb
+            hidden_states.shape[0], hidden_states.shape[1], nvb, hidden_states.dtype
         )
 
     def defer_stream(
@@ -740,7 +749,12 @@ class AttnResidual:
                 and nvb == p_nvb
                 and score_proj is p_proj
                 and score_norm is p_norm
-                and use_hip_smallm(hidden_states.shape[0], hidden_states.shape[1], nvb)
+                and use_hip_smallm(
+                    hidden_states.shape[0],
+                    hidden_states.shape[1],
+                    nvb,
+                    hidden_states.dtype,
+                )
             ):
                 stream_out = slot
                 self._stream_pending = None

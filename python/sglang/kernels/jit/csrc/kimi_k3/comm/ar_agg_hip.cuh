@@ -222,9 +222,7 @@ __global__ void __launch_bounds__(kThreads) ar_agg_kernel(const Params __grid_co
     }
     // kAR: post this rank's start flag now, wait after the local loads were
     // issued (the bank / cw / prefix loads above overlap the barrier)
-    uint32_t sflag = 0;
-    if constexpr (kMode == kAR) sflag = start_arrive(p, t);
-    if constexpr (kMode == kAR) start_wait(p, t, sflag);
+    if constexpr (kMode == kAR) start_wait(p, t, start_arrive(p, t));
     // kAR: issue the peer loads first; the bank statistics below overlap them
     OP xin[kNG];
     int flat = 0;
