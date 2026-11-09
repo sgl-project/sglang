@@ -52,6 +52,8 @@ from sglang.multimodal_gen.runtime.layers.layernorm import (
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     RowParallelLinear,
+    pack_rows_into_one_buffer,
+    rows_of_one_buffer,
 )
 from sglang.multimodal_gen.runtime.layers.lora.linear import BaseLayerWithLoRA
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
@@ -74,7 +76,10 @@ from sglang.multimodal_gen.runtime.layers.visual_embedding import (
     PatchEmbed,
     WanCamControlPatchEmbedding,
 )
-from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
+from sglang.multimodal_gen.runtime.managers.forward_context import (
+    get_forward_context,
+    request_allows_lossless,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
@@ -106,7 +111,7 @@ from sglang.multimodal_gen.runtime.realtime.states import (
     get_realtime_causal_dit_state,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.srt.utils import add_prefix
+from sglang.srt.layers.utils.common import add_prefix
 
 logger = init_logger(__name__)
 
@@ -156,19 +161,6 @@ def _check_sequence_split_strategy(strategy: str, seq_splits: list[int]) -> None
         raise NotImplementedError(
             f"LingBot sequence strategy {strategy!r} requires uniform sequence splits, got {seq_splits}."
         )
-
-
-def _share_rows_into_packed(layers, name: str) -> torch.Tensor:
-    # Pack the layers' `name` tensors along dim 0 and re-point each layer at its
-    # row slice of the packed buffer, so the copy is freed and updates alias it.
-    params = [getattr(layer, name) for layer in layers]
-    packed = torch.cat([param.data for param in params], dim=0)
-    offset = 0
-    for param in params:
-        rows = param.shape[0]
-        param.data = packed[offset : offset + rows]
-        offset += rows
-    return packed
 
 
 def _sequence_shard_tensor(
@@ -1284,44 +1276,21 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
         # No reference to the packed tensor is kept; the layer views own its
         # storage, so layerwise offload's release_layer() frees it.
         layers = (self.to_q, self.to_k, self.to_v)
-        with torch.no_grad():
-            _share_rows_into_packed(layers, "weight")
-            if all(layer.bias is not None for layer in layers):
-                _share_rows_into_packed(layers, "bias")
+        pack_rows_into_one_buffer([layer.weight for layer in layers])
+        if all(layer.bias is not None for layer in layers):
+            pack_rows_into_one_buffer([layer.bias for layer in layers])
         self._qkv_fused = True
 
-    def _packed_qkv(self, name: str) -> torch.Tensor | None:
-        # Rebuild the packed view from the layers when they are still adjacent
-        # rows of one buffer. .to(dtype/device), loaders and offload prefetch
-        # give each layer a new tensor, which breaks adjacency.
-        params = [
-            getattr(layer, name).data for layer in (self.to_q, self.to_k, self.to_v)
-        ]
-        first = params[0]
-        offset = first.storage_offset()
-        storage = first.untyped_storage().data_ptr()
-        for param in params:
-            if (
-                not param.is_contiguous()
-                or param.untyped_storage().data_ptr() != storage
-                or param.storage_offset() != offset
-                or param.dtype != first.dtype
-                or param.shape[1:] != first.shape[1:]
-            ):
-                return None
-            offset += param.numel()
-        rows = sum(param.shape[0] for param in params)
-        return first.as_strided(
-            (rows, *first.shape[1:]), first.stride(), first.storage_offset()
-        )
-
     def _packed_qkv_params(self) -> tuple[torch.Tensor, torch.Tensor | None] | None:
-        weight = self._packed_qkv("weight")
+        # .to(dtype/device), loaders and offload prefetch give each layer a new
+        # tensor, which breaks the shared rows
+        layers = (self.to_q, self.to_k, self.to_v)
+        weight = rows_of_one_buffer([layer.weight.data for layer in layers])
         if weight is None:
             return None
         if self.to_q.bias is None:
             return weight, None
-        bias = self._packed_qkv("bias")
+        bias = rows_of_one_buffer([layer.bias.data for layer in layers])
         return None if bias is None else (weight, bias)
 
     def _project_qkv(
@@ -1334,7 +1303,9 @@ class CausalLingBotWorldTransformerBlock(CausalWanTransformerBlock):
             isinstance(layer, BaseLayerWithLoRA) and layer.lora_active
             for layer in layers
         )
-        if not lora_active and self.fuse_qkv_projection():
+        # one GEMM over the packed rows rounds apart from the three projections
+        # at some shapes (cuBLAS split-K at small token counts)
+        if not lora_active and request_allows_lossless() and self.fuse_qkv_projection():
             packed = self._packed_qkv_params()
             if packed is None:
                 self.repack_qkv_projection()

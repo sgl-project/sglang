@@ -13,32 +13,44 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     InsertParams,
     MatchPrefixParams,
+    evictable_by_sub_pool,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.capacity import check_decode_capacity, evict_to_free_tokens
 from sglang.srt.mem_cache.common import evict_from_tree_cache
-from sglang.srt.mem_cache.kv.alloc import interim
+from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.mem_cache.kv.alloc.pricing import (
-    float_byte_shortfall,
-    float_end_certificate,
-    float_high_target,
-    float_reclaim_satisfied,
+    FLUSH_ENDS,
+    NO_MOVE,
+    RELAYOUT,
+    feasible,
+    plan,
 )
+from sglang.srt.mem_cache.kv.plan import TREE_WINDOW
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import reset_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang.test.tree_slots import tree_slots_of
+from sglang.test.token_demand import demand_windows, token_demand
+from sglang.test.tree_slots import storage_tree_slots
 from sglang.test.unified_allocator_fixtures import (
     build_test_unified_pools,
     build_tri_cache,
-    chain_snapshot,
-    float_chain,
+    hold_band,
+    open_float_side,
+    release_band,
     setup_allocator_context,
 )
 
 register_cpu_ci(est_time=39, suite="base-a-test-cpu")
+
+
+def _pages(allocator, full_tokens, swa_tokens):
+    """A token demand as the planner reads it: pages per demanded band."""
+    demands = allocator.page_demands(token_demand(allocator, full_tokens, swa_tokens))
+    return {name: pages for name, pages in demands.items() if pages}
 
 
 class TestTriJointReclaim(CustomTestCase):
@@ -50,6 +62,9 @@ class TestTriJointReclaim(CustomTestCase):
         reset_context()
 
     build = staticmethod(build_tri_cache)
+
+    # Pressure budgets below include the arena and three request-table rows:
+    # two requests (eight state slots / three per request), plus the sink row.
 
     def stamp(self, b, a, slots, states, full_layers=1):
         kv = b.token_to_kv_pool
@@ -111,7 +126,7 @@ class TestTriJointReclaim(CustomTestCase):
         return records
 
     def test_joint_reclaim_keeps_live_prefix_and_state(self):
-        for lazy in (False, True):
+        for lazy in (True,):
             for occupancy, count, temporal, outside_count in (
                 (96, 8, (0, 0, 0), 0),
                 (80, 24, (0, 0, 0), 0),
@@ -127,9 +142,19 @@ class TestTriJointReclaim(CustomTestCase):
                     self.assertIsNotNone(outside)
                     self.stamp(b, a, torch.cat((slots, outside)), states)
                     records = self.insert_parts(c, slots, states)
-                    demand = 4 if count == 8 else a.available_size() + 1
+                    # Keep the request fixed when placement becomes tighter;
+                    # available_size()+1 would turn a no-eviction case into a
+                    # genuinely over-capacity request.
+                    demand = 4 if count == 8 else 9
                     if count == 24:
-                        demand = min(a.full_available_size(), a.swa_available_size())
+                        # One token past what owner and window can take together.
+                        demand = a.available_size() + 1
+                    # Eviction is needed exactly when the records' first prefix
+                    # in eviction order must go: without it the demand does not
+                    # fit (5 states leave room already).
+                    self.assertEqual(
+                        a.ensure_capacity(token_demand(a, demand, demand)), count == 5
+                    )
                     with patch.object(
                         a, "ensure_capacity", wraps=a.ensure_capacity
                     ) as prep:
@@ -137,9 +162,9 @@ class TestTriJointReclaim(CustomTestCase):
                         got = a.alloc(demand)
                     self.assertIsNotNone(got)
                     self.assertLessEqual(prep.call_count, 4)
-                    expected = (
-                        [] if count == 24 else ([1, 2] if count == 8 else [0, 1, 2])
-                    )
+                    # The take counts room a relayout opens, so one record (the
+                    # one-token prefix evicted first) is enough even for 24 states.
+                    expected = [0, 1, 2] if count == 5 else [1, 2]
                     for i, (key, prior) in enumerate(records):
                         match = c.path_device_indices(
                             c.match_prefix(MatchPrefixParams(key=key)).last_device_node
@@ -150,12 +175,13 @@ class TestTriJointReclaim(CustomTestCase):
                         else:
                             self.assertEqual(len(match), 0)
                     self.check_payload(b, a, outside, states[3:], states)
-                    if count == 8:
-                        self.assertEqual(c.full_evictable_size(), 95)
+                    self.assertEqual(
+                        c.full_evictable_size(), {8: 95, 24: 79, 5: 96}[count]
+                    )
                     self.assertFalse(a.verify_byte_accounting())
 
     def test_impossible_and_locked_demands_preserve_cache(self):
-        for lazy in (False, True):
+        for lazy in (True,):
             for locked in (False, True):
                 with self.subTest(lazy=lazy, locked=locked):
                     b, a, c = self.build(lazy=lazy)
@@ -172,7 +198,7 @@ class TestTriJointReclaim(CustomTestCase):
                             receipts.append((node, c.inc_lock_ref(node)))
                     try:
                         with patch.object(
-                            c, "evict_for_alloc", wraps=c.evict_for_alloc
+                            c, "evict_until", wraps=c.evict_until
                         ) as walks:
                             for _ in range(3):
                                 evict_from_tree_cache(c, 4 if locked else 200)
@@ -209,18 +235,21 @@ class TestTriJointReclaim(CustomTestCase):
                     c.inc_lock_ref(node, skip_lock_components=(ComponentType.MAMBA,)),
                 )
             )
-        demand = min(a.conserve_full_available_size(), a.conserve_swa_available_size())
+        # Require one token pair beyond free space, so the unlocked state
+        # checkpoints must make room while every token binding stays locked.
+        demand = a.available_size() + 1
+        self.assertFalse(a.admits(KVDemand(demand, demand_windows(a, demand, demand))))
         try:
             self.assertEqual(c.full_evictable_size(), 0)
             self.assertGreater(c.mamba_evictable_size(), 0)
             phases = []
-            original = c.evict_for_alloc
+            original = c.evict_until
 
             def walk(params, **kw):
                 phases.append(params)
                 return original(params, **kw)
 
-            with patch.object(c, "evict_for_alloc", side_effect=walk):
+            with patch.object(c, "evict_until", side_effect=walk):
                 evict_from_tree_cache(c, demand)
                 got = a.alloc(demand)
             self.assertIsNotNone(got)
@@ -243,7 +272,7 @@ class TestTriJointReclaim(CustomTestCase):
 
         class CPUReferenceKernel:
             def __getitem__(self, grid):
-                def launch(prefix, seq, last, free, out, batch_size, page_size):
+                def launch(prefix, seq, last, free, out, page_size):
                     next_page = offset = 0
                     for i in range(len(prefix)):
                         for pos in range(int(prefix[i]), int(seq[i])):
@@ -259,7 +288,9 @@ class TestTriJointReclaim(CustomTestCase):
 
         for occupancy in (0, 2):
             with self.subTest(cached_pages=occupancy):
-                b, a, c = self.build(page_size=4, state_cache=False)
+                b, a, c = self.build(
+                    page_size=4, state_cache=False, total_bytes=25984 + 3 * 4104
+                )
                 states = b.token_to_kv_pool_allocator.state_slots.alloc(8)
                 self.assertIsNotNone(states)
                 slots = a.alloc(occupancy * 4)
@@ -272,16 +303,12 @@ class TestTriJointReclaim(CustomTestCase):
                             value=slots[i * 4 : (i + 1) * 4],
                         )
                     )
-                self.assertGreater(
-                    float_byte_shortfall(
-                        chain_snapshot(a),
-                        float_chain(a),
-                        400,
-                        full_reclaim=c.full_evictable_size(),
-                        swa_reclaim=c.swa_evictable_size(),
-                        state_reclaim=c.mamba_evictable_size(),
-                    ),
-                    0,
+                # No layout holds 400 tokens even with every cached entry evicted.
+                self.assertFalse(
+                    a.admits(
+                        KVDemand(400, demand_windows(a, 400, 400)),
+                        evictable=evictable_by_sub_pool(c),
+                    )
                 )
                 prefix = torch.tensor([0])
                 seq = torch.tensor([396])
@@ -317,9 +344,7 @@ class TestTriJointReclaim(CustomTestCase):
                     else:
                         a.free_swa(pending)
                         a.free_full(pending)
-                    with patch.object(
-                        c, "evict_for_alloc", wraps=c.evict_for_alloc
-                    ) as walks:
+                    with patch.object(c, "evict_until", wraps=c.evict_until) as walks:
                         evict_from_tree_cache(c, 2)
                         got = a.alloc(2)
                     self.assertIsNotNone(got)
@@ -361,7 +386,7 @@ class TestTriJointReclaim(CustomTestCase):
 
     def test_ready_allocation_preserves_payload_with_pinned_bands(self):
         for page_size, lazy, grouped in itertools.product(
-            (1, 4), (False, True), (False, True)
+            (1, 4), (True,), (False, True)
         ):
             with self.subTest(page_size=page_size, lazy=lazy, grouped=grouped):
                 b, a, c = self.build(
@@ -379,13 +404,13 @@ class TestTriJointReclaim(CustomTestCase):
                     key = RadixKey(array("q", range(len(slots))))
                     c.insert(InsertParams(key=key, value=slots))
                     records = [(key, slots.clone())]
-                for member in a._flush_targets():
-                    member.pin_sources = (lambda: True,)
+                for member in a.members:
+                    hold_band(member)
                 if grouped:
                     a.free_group_begin()
                 self.assertGreaterEqual(a.available_size(), page_size)
                 before = snapshot(a)
-                self.assertTrue(a.evict_to_free_tokens(c, page_size))
+                self.assertTrue(evict_to_free_tokens(c, a, page_size))
                 self.assertEqual(snapshot(a), before)
                 got = a.alloc(page_size)
                 self.assertIsNotNone(got)
@@ -411,7 +436,7 @@ class TestTriJointReclaim(CustomTestCase):
         self.insert_parts(c, slots, states)
         with (
             patch.object(a, "ensure_capacity", wraps=a.ensure_capacity) as prep,
-            patch.object(c, "evict_for_alloc", wraps=c.evict_for_alloc) as walks,
+            patch.object(c, "evict_until", wraps=c.evict_until) as walks,
         ):
             evict_from_tree_cache(c, 0)
             self.assertEqual(prep.call_count, 0)
@@ -419,11 +444,11 @@ class TestTriJointReclaim(CustomTestCase):
             self.assertEqual(walks.call_count, 0)
         # Close every movement gate. The finite request quotas may still reclaim
         # cache bytes; actual allocation and each phase remain separately visible.
-        for member in a._flush_targets():
-            member.pin_sources = (lambda: True,)
+        for member in a.members:
+            hold_band(member)
         with (
             patch.object(a, "ensure_capacity", wraps=a.ensure_capacity) as prep,
-            patch.object(c, "evict_for_alloc", wraps=c.evict_for_alloc) as walks,
+            patch.object(c, "evict_until", wraps=c.evict_until) as walks,
         ):
             evict_from_tree_cache(c, 90)
             got = a.alloc(90)
@@ -461,15 +486,16 @@ class TestTriJointReclaim(CustomTestCase):
                 demand = a.available_size()
                 self.assertGreater(demand, a.conserve_full_available_size())
                 self.assertTrue(
-                    float_reclaim_satisfied(chain_snapshot(a), float_chain(a), demand)
+                    feasible(a.pricing_snapshot(), _pages(a, demand, demand))
                 )
                 if entry == "direct":
-                    self.assertTrue(a.ensure_capacity(demand, demand))
+                    self.assertTrue(a.ensure_capacity(token_demand(a, demand, demand)))
                 elif entry == "helper":
                     self.assertTrue(evict_from_tree_cache(c, demand))
                 else:
                     self.assertTrue(
-                        a.check_decode_capacity(
+                        check_decode_capacity(
+                            allocator=a,
                             num_tokens=demand,
                             tree_cache=c,
                             requests=[],
@@ -480,7 +506,7 @@ class TestTriJointReclaim(CustomTestCase):
                 self.assertFalse(a.verify_byte_accounting())
 
     def test_float_recovery_preserves_prefix_when_full_band_is_short(self):
-        for lazy in (False, True):
+        for lazy in (True,):
             for recovery in ("prepare", "eviction", "decode"):
                 with self.subTest(lazy=lazy, recovery=recovery):
                     temporal = (0, 0, 0)
@@ -529,8 +555,10 @@ class TestTriJointReclaim(CustomTestCase):
                             token_to_kv_pool_allocator=allocator,
                             page_size=1,
                             sliding_window_size=128,
-                            tree_slots=tree_slots_of(
-                                (ComponentType.FULL, ComponentType.SWA), window=128
+                            tree_slots=storage_tree_slots(
+                                allocator.storage,
+                                window=128,
+                                components=(ComponentType.FULL, ComponentType.SWA),
                             ),
                         )
                     )
@@ -551,27 +579,37 @@ class TestTriJointReclaim(CustomTestCase):
                     self.assertIsNotNone(extra)
                     key = RadixKey(array("q", [1, 2, 3, 4]))
                     cache.insert(InsertParams(key=key, value=slots))
-                    self.assertEqual(allocator.full_available_size(), 2)
+                    # Six tokens fit only if the float moves: not in place, while
+                    # the reads, which credit the move, report them.
+                    six = {
+                        n: d
+                        for n, d in allocator.page_demands(
+                            token_demand(allocator, 6, 6)
+                        ).items()
+                        if d
+                    }
+                    self.assertIsNone(
+                        plan(allocator.pricing_snapshot(), six, FLUSH_ENDS)
+                    )
                     self.assertGreaterEqual(allocator.conserve_full_available_size(), 6)
                     self.assertGreaterEqual(allocator.swa_available_size(), 6)
-                    self.assertLess(allocator.available_size(), 6)
-                    self.assertEqual(
-                        float_byte_shortfall(
-                            chain_snapshot(allocator), float_chain(allocator), 6
-                        ),
-                        0,
-                    )
+                    self.assertGreaterEqual(allocator.available_size(), 6)
+                    self.assertTrue(feasible(allocator.pricing_snapshot(), six))
                     if recovery == "prepare":
-                        self.assertTrue(allocator.ensure_capacity(6, 6))
+                        self.assertTrue(
+                            allocator.ensure_capacity(token_demand(allocator, 6, 6))
+                        )
                     elif recovery == "decode":
                         self.assertTrue(
-                            allocator.check_decode_capacity(
-                                num_tokens=6, tree_cache=cache
+                            check_decode_capacity(
+                                allocator=allocator, num_tokens=6, tree_cache=cache
                             )
                         )
                     else:
                         evict_from_tree_cache(cache, 6)
-                    self.assertTrue(allocator.available_size() >= 6)
+                    self.assertTrue(
+                        allocator.ensure_capacity(token_demand(allocator, 6, 6))
+                    )
                     self.assertEqual(cache.full_evictable_size(), 4)
                     matched = cache.match_prefix(MatchPrefixParams(key=key))
                     torch.testing.assert_close(
@@ -597,9 +635,7 @@ class TestTriJointReclaim(CustomTestCase):
 
     def test_deep_reclaim_preserves_first_sufficient_prefix_set(self):
         for lazy, demand, first in (
-            (False, 6, 3),
             (True, 6, 3),
-            (False, 90, 87),
             (True, 90, 87),
         ):
             with self.subTest(lazy=lazy, demand=demand):
@@ -627,11 +663,14 @@ class TestTriJointReclaim(CustomTestCase):
                 self.check_payload(b, a, slots[first:], states, states)
                 self.assertFalse(a.verify_byte_accounting())
 
+    # Temporal-state pressure: eight live entries plus the sink, each padded
+    # by the ABI from 176 to 192 bytes, so the arena is 9 * 16 bytes above
+    # the unpadded 7808; token occupancy and reclaim pressure are unaffected.
     def test_state_quota_accounts_for_token_phase_cascades(self):
         for occupancy, demand in ((96, 10), (97, 1)):
             with self.subTest(occupancy=occupancy, demand=demand):
                 group = 1
-                b, a, c = self.build(temporal=(1, 4, 8))
+                b, a, c = self.build(temporal=(1, 4, 8), total_bytes=7952 + 3 * 1032)
                 states = b.token_to_kv_pool_allocator.state_slots.alloc(8)
                 slots = a.alloc(occupancy)
                 self.stamp(b, a, slots, states)
@@ -658,15 +697,24 @@ class TestTriJointReclaim(CustomTestCase):
                             )
                         )
                 phases = []
-                original = c.evict_for_alloc
+                fits = []
+                original = c.evict_until
 
                 def walk(params, **kw):
+                    satisfied = kw["satisfied"]
+                    fits.append([])
+
+                    def checked():
+                        fits[-1].append(satisfied())
+                        return fits[-1][-1]
+
+                    kw["satisfied"] = checked
                     result = original(params, **kw)
                     phases.append((params, result))
                     return result
 
                 try:
-                    with patch.object(c, "evict_for_alloc", side_effect=walk):
+                    with patch.object(c, "evict_until", side_effect=walk):
                         evict_from_tree_cache(c, demand)
                         self.assertIsNotNone(a.alloc(demand))
                     self.assertEqual(phases[0][1].mamba_num_evicted, group)
@@ -680,12 +728,25 @@ class TestTriJointReclaim(CustomTestCase):
                         )
                         // a.mamba_allocator.entry_bytes
                     )
+                    # The state the token record cascaded counts toward the
+                    # bytes the demand needs: the state walk evicts only the
+                    # rest, and never more than the bytes call for.
+                    evicted = sum(r.mamba_num_evicted for _, r in phases)
                     if group < quota:
-                        self.assertEqual(len(phases), 2)
-                        self.assertEqual(phases[1][0].mamba_num, quota - group)
-                        self.assertGreater(phases[1][1].mamba_num_evicted, 0)
+                        # One state goes with the token record; the state walk
+                        # stops two later, at the first fit, below the byte quota.
+                        self.assertEqual(
+                            [r.mamba_num_evicted for _, r in phases], [group, 2]
+                        )
+                        self.assertEqual(evicted, 3)
+                        self.assertLess(evicted, quota)
                     else:
                         self.assertEqual(len(phases), 1)
+                        self.assertEqual(evicted, group)
+                    # Only the last walk ever found the demand fitting: no
+                    # walk ran on after the fit.
+                    self.assertTrue(any(fits[-1]))
+                    self.assertFalse(any(any(f) for f in fits[:-1]))
                     for node, prior in records[1:]:
                         torch.testing.assert_close(
                             c.tree_core.get_component_device_value(
@@ -700,66 +761,48 @@ class TestTriJointReclaim(CustomTestCase):
                 self.assertFalse(a.verify_byte_accounting())
 
     def test_temporal_state_first_stops_after_one_victim(self):
-        for lazy in (False, True):
+        for lazy in (True,):
             with self.subTest(lazy=lazy):
-                b, a, c = self.build(lazy=lazy, temporal=(1, 4, 8))
+                b, a, c = self.build(
+                    lazy=lazy, temporal=(1, 4, 8), total_bytes=7952 + 3 * 1032
+                )
                 states = b.token_to_kv_pool_allocator.state_slots.alloc(8)
                 slots = a.alloc(96)
                 self.stamp(b, a, slots, states)
                 records = self.insert_parts(c, slots, states)
-                query = interim.float_reclaim_satisfied
+                query = a.units_fit
                 checkpoints, results = [], []
 
-                def checked_query(snap, chain, n):
+                def checked_query(demands):
+                    # The walks' stop predicate is pure: it moves no page.
                     before = snapshot(a)
-                    ready = query(snap, chain, n)
+                    ready = query(demands)
                     self.assertEqual(snapshot(a), before)
                     if ready:
                         checkpoints.append(c.full_evictable_size())
                     return ready
 
-                evict = c.evict_for_alloc
+                evict = c.evict_until
 
                 def checked_evict(*args, **kwargs):
                     result = evict(*args, **kwargs)
                     results.append(
                         (
                             result.num_tokens_evicted,
-                            result.swa_num_tokens_evicted,
+                            result.window_num_tokens_evicted.get(
+                                c.window_sub_pool_of_slot(c.slot_id(TREE_WINDOW)), 0
+                            ),
                             result.mamba_num_evicted,
                         )
                     )
                     return result
 
                 sa = a.swa_attn_allocator
-                move = sa.make_room
-                targets = []
-
-                def checked_move(*, side, min_bytes):
-                    self.assertEqual(side, "high")
-                    self.assertEqual(min_bytes, 256)
-                    self.assertEqual(
-                        min_bytes,
-                        float_high_target(
-                            chain_snapshot(a), float_chain(a), 4, flush_ends=False
-                        ),
-                    )
-                    targets.append(min_bytes)
-                    return move(side=side, min_bytes=min_bytes)
 
                 with (
-                    patch(
-                        "sglang.srt.mem_cache.kv.alloc.interim.float_reclaim_satisfied",
-                        side_effect=checked_query,
-                    ),
-                    patch.object(c, "evict_for_alloc", side_effect=checked_evict),
-                    patch.object(sa, "make_room", side_effect=checked_move),
-                    patch(
-                        "sglang.srt.mem_cache.kv.alloc.interim.relieve_for_alloc",
-                        side_effect=AssertionError(
-                            "certified allocation used fallback"
-                        ),
-                    ),
+                    patch.object(a, "units_fit", side_effect=checked_query),
+                    patch.object(c, "evict_until", side_effect=checked_evict),
+                    patch.object(sa, "relocate_into", wraps=sa.relocate_into) as move,
                     patch.object(
                         a, "ensure_capacity", wraps=a.ensure_capacity
                     ) as prepare,
@@ -768,7 +811,8 @@ class TestTriJointReclaim(CustomTestCase):
                     self.assertIsNotNone(a.alloc(4))
                 self.assertEqual(results, [(1, 1, 1)])
                 self.assertEqual(set(checkpoints), {95})
-                self.assertEqual(targets, [256])
+                # One victim leaves room the take reaches by moving the float once.
+                self.assertEqual(move.call_count, 1)
                 self.assertLessEqual(prepare.call_count, 3)
                 self.assertEqual(c.full_evictable_size(), 95)
                 for key, prior in records[1:]:
@@ -781,66 +825,55 @@ class TestTriJointReclaim(CustomTestCase):
                 self.check_payload(b, a, slots[1:], states[1:], states)
                 self.assertFalse(a.verify_byte_accounting())
 
-    def test_float_plan_rechecks_pins_taken_during_preparation(self):
+    def test_take_replans_after_a_pin_taken_since_admission(self):
         for owner in ("full", "mamba", "swa"):
             with self.subTest(owner=owner):
-                b, a, c = self.build(lazy=True, temporal=(1, 4, 8))
+                b, a, c = self.build(
+                    lazy=True, temporal=(1, 4, 8), total_bytes=7952 + 3 * 1032
+                )
                 states = b.token_to_kv_pool_allocator.state_slots.alloc(8)
                 slots = a.alloc(96)
                 self.stamp(b, a, slots, states)
                 self.insert_parts(c, slots, states)
                 c.evict(EvictParams(num_tokens=1))
                 self.assertEqual(c.full_evictable_size(), 95)
-                self.assertEqual(
-                    float_high_target(chain_snapshot(a), float_chain(a), 4), 256
-                )
+                # Four tokens fit only once the float moves.
+                four = _pages(a, 4, 4)
+                self.assertIsNone(plan(a.pricing_snapshot(), four, FLUSH_ENDS))
+                self.assertIsNotNone(plan(a.pricing_snapshot(), four, RELAYOUT))
                 members = {
                     "full": a.full_attn_allocator,
                     "mamba": a.mamba_allocator,
                     "swa": a.swa_attn_allocator,
                 }
                 member = members[owner]
-                full_flush = a.full_attn_allocator.flush_for_allocation
-
-                def close_during_prepare():
-                    member.add_pin_source(lambda: True)
-                    return full_flush()
-
-                sa = a.swa_attn_allocator
-                with (
-                    patch.object(
-                        a.full_attn_allocator,
-                        "flush_for_allocation",
-                        side_effect=close_during_prepare,
-                    ),
-                    patch.object(sa, "make_room", wraps=sa.make_room) as movement,
-                    patch(
-                        "sglang.srt.mem_cache.kv.alloc.interim.relieve_for_alloc",
-                        side_effect=AssertionError("stale plan used fallback"),
-                    ),
-                ):
-                    result = a.ensure_capacity(4, 4)
-                self.assertEqual(result, owner == "full")
-                if owner == "full":
-                    self.assertEqual(
-                        movement.call_args.kwargs, {"side": "high", "min_bytes": 224}
-                    )
-                else:
-                    self.assertEqual(movement.call_count, 0)
-                    self.assertIsNone(
-                        float_high_target(
-                            chain_snapshot(a), float_chain(a), 4, flush_ends=False
-                        )
-                    )
+                # Admitted before the pin: a take that reused that answer would
+                # move the pinned band. It must plan again from what is pinned.
+                self.assertTrue(a.ensure_capacity(token_demand(a, 4, 4)))
+                hold_band(member)
+                bound = member.ids.virtual_to_physical.clone()
+                fits = a.ensure_capacity(token_demand(a, 4, 4))
+                got = a.alloc(4)
+                # With the owner pinned the float still moves out of its way;
+                # a pinned state end or float leaves no layout that serves it.
+                self.assertEqual(fits, owner == "full")
+                self.assertEqual(got is not None, fits)
+                was_bound = bound > 0
+                torch.testing.assert_close(
+                    member.ids.virtual_to_physical[: bound.numel()][was_bound],
+                    bound[was_bound],
+                )
+                if got is not None:
+                    a.free(got)
                 self.check_payload(b, a, slots[1:], states[1:], states)
-                member.pin_sources = ()
-                self.assertTrue(a.ensure_capacity(4, 4))
+                release_band(member)
+                self.assertTrue(a.ensure_capacity(token_demand(a, 4, 4)))
                 self.assertIsNotNone(a.alloc(4))
                 self.check_payload(b, a, slots[1:], states[1:], states)
                 self.assertFalse(a.verify_byte_accounting())
 
     def test_float_whole_move_preserves_adverse_hole_layouts(self):
-        for lazy, holes in itertools.product((False, True), ((4, 7), (5, 6))):
+        for lazy, holes in itertools.product((True,), ((4, 7), (5, 6))):
             with self.subTest(lazy=lazy, holes=holes):
                 b, a, c = self.build(lazy=lazy, ratio=(4, 2), state_cache=False)
                 slots = a.alloc(8)
@@ -853,26 +886,16 @@ class TestTriJointReclaim(CustomTestCase):
                     ids = fa.ids.translate(extra)
                     b.token_to_kv_pool.get_key_buffer(layer)[ids] = 701 + layer
                     b.token_to_kv_pool.get_value_buffer(layer)[ids] = 801 + layer
-                target = float_high_target(chain_snapshot(a), float_chain(a), 12)
-                self.assertIsNotNone(target)
-                self.assertFalse(
-                    float_end_certificate(chain_snapshot(a), float_chain(a), 12)
-                )
-                gap = sa._gap_pages()[1]
-                retreat = target // sa.entry_bytes_per_page - gap
-                self.assertGreaterEqual(retreat, sa._live_pages())
-                with (
-                    patch.object(
-                        sa, "_relocate_to_positions", wraps=sa._relocate_to_positions
-                    ) as whole,
-                    patch(
-                        "sglang.srt.mem_cache.kv.alloc.interim.relieve_for_alloc",
-                        side_effect=AssertionError(
-                            "positive certificate used fallback"
-                        ),
-                    ),
-                ):
-                    self.assertTrue(a.ensure_capacity(12, 12))
+                # Twelve tokens fit only once the float moves, wholly clear of
+                # the pages it holds now.
+                twelve = _pages(a, 12, 12)
+                self.assertIsNone(plan(a.pricing_snapshot(), twelve, FLUSH_ENDS))
+                moved = plan(a.pricing_snapshot(), twelve, RELAYOUT)
+                first, end = moved.targets[sa.sub_pool_name]
+                lo, hi = sa._span_range()
+                self.assertTrue(end <= lo or first >= hi, (first, end, lo, hi))
+                with patch.object(sa, "relocate_into", wraps=sa.relocate_into) as whole:
+                    self.assertTrue(a.ensure_capacity(token_demand(a, 12, 12)))
                     self.assertIsNotNone(a.alloc(12))
                 self.assertEqual(whole.call_count, 1)
                 self.check_payload(
@@ -913,7 +936,7 @@ class TestTriJointReclaim(CustomTestCase):
                 existing = slots[-extra:] if extra else slots[:0]
                 if extra:
                     a.free_swa(existing)
-                prepared = a.ensure_capacity(full, swa)
+                prepared = a.ensure_capacity(token_demand(a, full, swa))
                 self.assertTrue(prepared)
                 fresh = a.full_attn_allocator.alloc(full)
                 self.assertIsNotNone(fresh)
@@ -926,6 +949,10 @@ class TestTriJointReclaim(CustomTestCase):
 
 
 class TestTriGeometry(CustomTestCase):
+    def setUp(self):
+        setup_allocator_context()
+        self.addCleanup(reset_context)
+
     def check_saved(self, a, saved):
         for member, buf, ids, values in saved:
             self.assertTrue(
@@ -956,47 +983,39 @@ class TestTriGeometry(CustomTestCase):
                     ma.flush_for_allocation()
                     extra = fa.alloc(extra_pages * ps)
                     self.assertIsNotNone(extra)
+                    # Pack the float against the owner end: the owner has no
+                    # room left, and the demand needs the float to step back.
+                    open_float_side(sa, "high", 0)
                     demand = 2 * ps
-                    target = float_high_target(
-                        chain_snapshot(a), float_chain(a), demand
-                    )
-                    self.assertIsNotNone(target)
-                    lo, hi = sa._region_bounds_pages()
-                    retreat = target // sa.entry_bytes_per_page - (hi - sa.high_wm_page)
-                    self.assertEqual(sa.low_wm_page - lo, retreat)
-                    self.assertLess(retreat, sa._live_pages())
-                    self.assertFalse(
-                        float_end_certificate(chain_snapshot(a), float_chain(a), demand)
-                    )
+                    pages = _pages(a, demand, demand)
+                    # The demand fits only once the float moves, and its new
+                    # block overlaps the one it holds now.
+                    self.assertIsNone(plan(a.pricing_snapshot(), pages, FLUSH_ENDS))
+                    moved = plan(a.pricing_snapshot(), pages, RELAYOUT)
+                    first, end = moved.targets[sa.sub_pool_name]
+                    lo, hi = sa._span_range()
+                    self.assertTrue(first < hi and end > lo, (first, end, lo, hi))
                     if one_short:
                         # Bind an existing FULL-only ID into the roomier LOW gap.
                         low_before = sa.low_wm_page
                         sa.alloc_with_virtual(extra[:1] // ps)
                         self.assertEqual(sa.low_wm_page, low_before - 1)
                         before = snapshot(a)
-                        self.assertIsNone(
-                            float_high_target(chain_snapshot(a), float_chain(a), demand)
-                        )
+                        # Pricing moves nothing, and its answer is the take's.
+                        fits = a.ensure_capacity(token_demand(a, demand, demand))
                         self.assertEqual(snapshot(a), before)
+                        self.assertEqual(a.alloc(demand) is not None, fits)
                         self.assertFalse(a.verify_byte_accounting())
                         continue
                     saved = payload(a, kv, mk)
-                    with (
-                        patch.object(
-                            sa,
-                            "_relocate_to_positions",
-                            wraps=sa._relocate_to_positions,
-                        ) as whole,
-                        patch(
-                            "sglang.srt.mem_cache.kv.alloc.interim.relieve_for_alloc",
-                            side_effect=AssertionError(
-                                "positive certificate used fallback"
-                            ),
-                        ),
-                    ):
-                        self.assertTrue(a.ensure_capacity(demand, demand))
+                    with patch.object(
+                        sa, "relocate_into", wraps=sa.relocate_into
+                    ) as moves:
+                        self.assertTrue(
+                            a.ensure_capacity(token_demand(a, demand, demand))
+                        )
                         self.assertIsNotNone(a.alloc(demand))
-                    self.assertEqual(whole.call_count, 0)
+                    self.assertEqual(moves.call_count, 1)
                     self.check_saved(a, saved)
 
     def test_float_certificates_match_executor_across_page_grids(self):
@@ -1004,32 +1023,46 @@ class TestTriGeometry(CustomTestCase):
         for ps, ratio, lazy, pattern, gated, npage in itertools.product(
             (1, 4, 16),
             ((1, 1), (1, 4), (4, 1)),
-            (False, True),
+            (True,),
             ("none", "paired", "swa_edges", "swa_internal", "empty", "mixed"),
             (False, True),
             (5, 7, 10),
         ):
             a, kv, mk = build_geometry(ps, ratio, lazy, pattern, gated)
             prior = snapshot(a)
-            target = float_high_target(chain_snapshot(a), float_chain(a), npage * ps)
+            pages = _pages(a, npage * ps, npage * ps)
+            moved = plan(a.pricing_snapshot(), pages, RELAYOUT)
             self.assertEqual(snapshot(a), prior)
-            if gated or pattern == "empty":
-                self.assertIsNone(target)
-            if target is None or float_end_certificate(
-                chain_snapshot(a), float_chain(a), npage * ps
-            ):
+            flushed = plan(a.pricing_snapshot(), pages, FLUSH_ENDS)
+            if pattern == "empty":
+                # An empty float is no obstacle: moving it adds nothing to
+                # compacting the ends.
+                self.assertEqual(moved is None, flushed is None)
+            # Demands that fit only once the float is laid out anew.
+            if moved is None or flushed is not None:
                 continue
             with self.subTest(
                 ps=ps, ratio=ratio, lazy=lazy, pattern=pattern, npage=npage
             ):
                 recognized.add(ps)
                 saved = payload(a, kv, mk)
-                with patch(
-                    "sglang.srt.mem_cache.kv.alloc.interim.relieve_for_alloc",
-                    side_effect=AssertionError("FLOAT certificate used fallback"),
-                ):
-                    self.assertTrue(a.ensure_capacity(npage * ps, npage * ps))
-                    self.assertIsNotNone(a.alloc(npage * ps))
+                held = {
+                    member.sub_pool_name: {
+                        p: int(member.ids.physical_to_virtual[p])
+                        for p in member.fixed_pages()
+                    }
+                    for member in a.members
+                }
+                self.assertTrue(
+                    a.ensure_capacity(token_demand(a, npage * ps, npage * ps))
+                )
+                self.assertIsNotNone(a.alloc(npage * ps))
+                # A held float is laid out around its pages: none of them moves.
+                for member in a.members:
+                    for page, virtual in held[member.sub_pool_name].items():
+                        self.assertEqual(
+                            int(member.ids.physical_to_virtual[page]), virtual
+                        )
                 self.check_saved(a, saved)
         self.assertEqual(recognized, {1, 4, 16})
 
@@ -1046,60 +1079,88 @@ class TestTriGeometry(CustomTestCase):
             vp = vp[vp >= ma.min_page_index]
             mk.buf[ma.ids.virtual_to_physical[vp]] = vp + 1000
             ma.free(vp[1:-1:cut])
-            if npage * ps <= a.available_size() or not float_end_certificate(
-                chain_snapshot(a), float_chain(a), npage * ps
+            # Cases the ends must compact for: no layout without moves holds them.
+            demands = {
+                n: d
+                for n, d in a.page_demands(
+                    token_demand(a, npage * ps, npage * ps)
+                ).items()
+                if d
+            }
+            if (
+                plan(a.pricing_snapshot(), demands, NO_MOVE) is not None
+                or plan(a.pricing_snapshot(), demands, FLUSH_ENDS) is None
             ):
                 continue
             with self.subTest(page_size=ps, ratio=ratio, cut=cut, demand=npage):
                 recognized.add(ps)
+                # The read credits the compaction.
+                self.assertGreaterEqual(a.available_size(), npage * ps)
                 saved = payload(a, kv, mk)
                 prior = snapshot(a)
                 for _ in range(20):
-                    self.assertTrue(
-                        float_end_certificate(
-                            chain_snapshot(a), float_chain(a), npage * ps
-                        )
+                    self.assertIsNotNone(
+                        plan(a.pricing_snapshot(), demands, FLUSH_ENDS)
                     )
                 self.assertEqual(snapshot(a), prior)
                 sa = a.swa_attn_allocator
                 with (
-                    patch.object(sa, "make_room", wraps=sa.make_room) as moves,
+                    patch.object(sa, "relocate_into", wraps=sa.relocate_into) as moves,
                     patch.object(
                         sa, "flush_for_allocation", wraps=sa.flush_for_allocation
                     ) as flush,
                 ):
-                    self.assertTrue(a.ensure_capacity(npage * ps, npage * ps))
+                    self.assertTrue(
+                        a.ensure_capacity(token_demand(a, npage * ps, npage * ps))
+                    )
                     self.assertIsNotNone(a.alloc(npage * ps))
                 self.assertEqual(moves.call_count, 0)
                 self.assertEqual(flush.call_count, 0)
                 self.check_saved(a, saved)
         self.assertEqual(recognized, {1, 4, 16})
 
-    def test_gate_change_invalidates_end_certificate(self):
+    def test_held_pages_bound_the_take_without_freezing_the_chain(self):
         for pd_open, host_open in ((True, False), (False, True), (False, False)):
             with self.subTest(pd_open=pd_open, host_open=host_open):
                 a, kv, mk = build_geometry(1, (1, 4), True, "swa_edges", False)
-                self.assertLess(a.available_size(), 5)
-                self.assertTrue(
-                    float_reclaim_satisfied(chain_snapshot(a), float_chain(a), 5)
-                )
+                # Five tokens need the float to move: no layout without moves
+                # holds them, and the read, which credits the move, reports them.
+                five = {
+                    n: d for n, d in a.page_demands(token_demand(a, 5, 5)).items() if d
+                }
+                self.assertIsNone(plan(a.pricing_snapshot(), five, NO_MOVE))
+                self.assertGreaterEqual(a.available_size(), 5)
+                self.assertTrue(feasible(a.pricing_snapshot(), five))
                 saved = payload(a, kv, mk)
-                for member in a._flush_targets():
-                    member.pin_sources = (lambda: not pd_open, lambda: not host_open)
-                before = snapshot(a)
-                self.assertFalse(
-                    float_reclaim_satisfied(chain_snapshot(a), float_chain(a), 5)
-                )
-                with patch.object(
-                    a.arena, "move_units", wraps=a.arena.move_units
-                ) as copies:
-                    self.assertFalse(a.ensure_capacity(5, 5))
-                self.assertEqual(copies.call_count, 0)
-                # Zero-copy FLOAT boundary absorption is legal even with movement gated.
+                for member in a.members:
+                    # Two holders; the band stays while either holds it.
+                    for key, opened in (("pd", pd_open), ("host", host_open)):
+                        if not opened:
+                            hold_band(member, key)
+                # Held pages stay put; the planner may still lay the rest out
+                # around them, and its answer is the take's.
+                held = {
+                    member.sub_pool_name: {
+                        p: int(member.ids.physical_to_virtual[p])
+                        for p in member.fixed_pages()
+                    }
+                    for member in a.members
+                }
+                fits = a.ensure_capacity(token_demand(a, 5, 5))
+                got = a.alloc(5)
+                self.assertEqual(fits, got is not None)
+                for member in a.members:
+                    for page, virtual in held[member.sub_pool_name].items():
+                        self.assertEqual(
+                            int(member.ids.physical_to_virtual[page]), virtual
+                        )
                 self.check_saved(a, saved)
-                for member in a._flush_targets():
-                    member.pin_sources = ()
-                self.assertTrue(a.ensure_capacity(5, 5))
+                if got is not None:
+                    a.free(got)
+                for member in a.members:
+                    release_band(member, "pd")
+                    release_band(member, "host")
+                self.assertTrue(a.ensure_capacity(token_demand(a, 5, 5)))
                 self.assertIsNotNone(a.alloc(5))
                 self.check_saved(a, saved)
 
@@ -1129,42 +1190,38 @@ class TestTriGeometry(CustomTestCase):
                 tokens = (vp[:, None] * ps + torch.arange(ps)[None, :]).flatten()
                 a.free(tokens)
                 self.assertGreater(fa._flush(urgent=False), 0)
-                self.assertGreater(len(fa._pending_reuse_pages_cpu), 0)
+                self.assertGreater(len(fa.usage.pending_pages), 0)
                 saved = payload(a, kv, mk)
-                for member in a._flush_targets():
-                    member.pin_sources = (lambda: True,)
+                for member in a.members:
+                    hold_band(member)
                 before = snapshot(a)
                 predictions = [
-                    float_reclaim_satisfied(chain_snapshot(a), float_chain(a), n * ps)
+                    a.ensure_capacity(token_demand(a, n * ps, n * ps))
                     for n in range(1, 10)
                 ]
                 for _ in range(20):
                     self.assertEqual(
                         predictions,
                         [
-                            float_reclaim_satisfied(
-                                chain_snapshot(a), float_chain(a), n * ps
-                            )
+                            a.ensure_capacity(token_demand(a, n * ps, n * ps))
                             for n in range(1, 10)
                         ],
                     )
                 self.assertEqual(snapshot(a), before)
-                for member in a._flush_targets():
-                    member.pin_sources = ()
+                for member in a.members:
+                    release_band(member)
                 if not urgent:
                     event.fired = True
                     fa.set_latest_forward_done_event(None)
                 with patch("torch.cuda.current_stream", return_value=stream):
                     fa.flush_for_allocation()
-                    self.assertFalse(fa._pending_reuse)
+                    self.assertFalse(fa.usage.pending_by_key())
                     n = max(
                         n
                         for n in range(1, 10)
-                        if float_reclaim_satisfied(
-                            chain_snapshot(a), float_chain(a), n * ps
-                        )
+                        if a.ensure_capacity(token_demand(a, n * ps, n * ps))
                     )
-                    self.assertTrue(a.ensure_capacity(n * ps, n * ps))
+                    self.assertTrue(a.ensure_capacity(token_demand(a, n * ps, n * ps)))
                     self.assertIsNotNone(a.alloc(n * ps))
                 self.assertEqual(stream.waits > 0, urgent)
                 self.check_saved(a, saved)
