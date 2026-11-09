@@ -113,6 +113,38 @@ class TestSamplingMaskValidation(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "does not support streaming"):
             self.manager._validate_one_request(req, req.input_ids)
 
+    def test_replay_layer_splits_must_be_layers_the_store_can_cut_at(self):
+        """A split SGLang cannot honor fails the request, instead of storing blocks
+        that no trainer stage asks for."""
+        self.manager.output_store = object()
+        self.manager.model_config = SimpleNamespace(
+            joint_head_config=None,
+            pointer_head=None,
+            hf_text_config=SimpleNamespace(
+                architectures=["Qwen3MoeForCausalLM"], num_hidden_layers=4
+            ),
+        )
+
+        def validate(splits, *, via_store=True, indexer_topk=False):
+            req = GenerateReqInput(
+                input_ids=[1, 2, 3],
+                sampling_params={},
+                return_outputs_via_store=via_store,
+                return_indexer_topk=indexer_topk,
+                replay_layer_splits=splits,
+            )
+            self.manager._validate_one_request(req, req.input_ids)
+
+        validate([1, 3])
+        for splits in ([0], [4], [2, 2], [3, 1]):
+            with self.subTest(splits=splits):
+                with self.assertRaisesRegex(ValueError, "strictly increasing"):
+                    validate(splits)
+        with self.assertRaisesRegex(ValueError, "requires return_outputs_via_store"):
+            validate([1], via_store=False)
+        with self.assertRaisesRegex(ValueError, "cannot be split by layer"):
+            validate([1], indexer_topk=True)
+
     def test_output_store_opt_in_rejects_batch_and_parallel_sampling(self):
         """When one sub-request of a batch or n>1 request fails, nothing deletes the
         objects its siblings stored, so only one output sequence may use the store."""

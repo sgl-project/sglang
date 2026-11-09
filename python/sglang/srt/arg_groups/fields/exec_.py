@@ -156,11 +156,14 @@ class ExecFeatures(msgspec.Struct):
         "EAGLE3 defaults to the model's EAGLE3 layers.",
     ] = None
     enable_return_routed_experts: A[
-        bool, "Enable returning routed experts of each layer with responses."
+        bool,
+        "Enable returning routed experts of each layer with responses. Not "
+        "supported with pipeline parallelism.",
     ] = False
     enable_return_indexer_topk: A[
         bool,
-        "Enable returning indexer topk indices of layers with indexer with responses.",
+        "Enable returning indexer topk indices of layers with indexer with "
+        "responses. Not supported with pipeline parallelism.",
     ] = False
     enable_encoder_swa_bounded_replay: A[
         bool,

@@ -13,6 +13,8 @@ from sglang.srt.arg_groups.overrides import model_config_of
 from sglang.srt.configs.model_config import (
     ModelConfig,
     get_hybrid_layer_ids,
+    get_num_indexer_layers,
+    indexer_slots_at,
     is_embedding_gemma,
     is_multimodal_model,
     load_decision_config,
@@ -20,6 +22,7 @@ from sglang.srt.configs.model_config import (
     resolve_spec_hidden_size,
 )
 from sglang.srt.configs.qwen4_exp import Qwen4ExpTextConfig
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -50,6 +53,39 @@ class TestHybridLayerIds(CustomTestCase):
                     get_hybrid_layer_ids([architecture], config),
                     ([0, 2], [1, 3]),
                 )
+
+
+class TestIndexerSlotsAt(CustomTestCase):
+    def test_deepseek_v4_slots_are_the_kv_pool_compress_layer_ids(self):
+        """The capturer writes a C4 layer's top-k at the compress_layer_id the KV pool
+        gives it; splitting at a layer must cut the slot axis at that same slot."""
+        ratios = [0, 4, 128, 4, 4, 128, 0, 4]
+        pool = DeepSeekV4TokenToKVPool.__new__(DeepSeekV4TokenToKVPool)
+        pool.kv_pools = {4: None, 128: None}
+        pool.compression_ratios = ratios
+        pool._stage_start, pool._stage_end = 0, len(ratios)
+        pool._init_compressed_layer_mapping()
+        config = SimpleNamespace(
+            architectures=["DeepseekV4ForCausalLM"], compress_ratios=ratios
+        )
+
+        c4_layers = [layer for layer, ratio in enumerate(ratios) if ratio == 4]
+        self.assertEqual(
+            indexer_slots_at(config, c4_layers),
+            [pool.layer_mapping[layer].compress_layer_id for layer in c4_layers],
+        )
+        self.assertEqual(
+            indexer_slots_at(config, [len(ratios)]), [get_num_indexer_layers(config)]
+        )
+
+    def test_dsa_slots_are_layer_ids_and_other_models_are_refused(self):
+        dsa = SimpleNamespace(architectures=["DeepseekV32ForCausalLM"], index_topk=8)
+        self.assertEqual(indexer_slots_at(dsa, [16, 31]), [16, 31])
+        other = SimpleNamespace(
+            architectures=["Qwen3MoeForCausalLM"], num_indexer_layers=4
+        )
+        with self.assertRaisesRegex(ValueError, "cannot be split by layer"):
+            indexer_slots_at(other, [2])
 
 
 class TestEmbeddingGemmaConfig(CustomTestCase):
