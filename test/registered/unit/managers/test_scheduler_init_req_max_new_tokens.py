@@ -209,6 +209,19 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
             widened_capacity,
         )
 
+    def test_hisparse_budget_uses_host_backed_pool(self):
+        with envs.SGLANG_MAX_NEW_TOKENS_LIMIT.override(None):
+            scheduler = self._new_scheduler(max_req_len=4096, max_total_num_tokens=1024)
+            scheduler.enable_hisparse = True
+            scheduler.tp_worker = SimpleNamespace(
+                model_runner=SimpleNamespace(max_token_pool_size=4096)
+            )
+            req = self._new_req(max_new_tokens=64, input_len=2000)
+
+            scheduler.init_req_max_new_tokens(req)
+
+            self.assertEqual(req.sampling_params.max_new_tokens, 64)
+
     def test_min_new_tokens_clamped_to_limit(self):
         with envs.SGLANG_MAX_NEW_TOKENS_LIMIT.override(16):
             scheduler = self._new_scheduler()

@@ -2970,22 +2970,31 @@ class Scheduler(
                 self.max_req_len - input_len - 1,
             ),
         )
-        # PrefillAdder reserves one page per shard; the allocator reserves one.
-        # Subtract the other N - 1 pages to keep queue admission schedulable.
-        token_capacity = (
-            self.max_total_num_tokens * self.kv_shard_widening
-            - self.page_size * (self.kv_shard_widening - 1)
-        )
-        if is_cp_sharded_padded():
-            token_capacity = from_cp_sharded(token_capacity)
-            # (-input_len) % size is padding to the next multiple of size.
-            # Replace physical-page padding and decode headroom with a CP group.
-            group_size = self.logical_page_size
-            group_padding = (-input_len) % group_size
-            page_padding = (-input_len) % self.page_size
-            extra_padding = group_padding - page_padding
-            extra_headroom = group_size - self.page_size
-            token_capacity -= extra_padding + extra_headroom
+        if getattr(self, "enable_hisparse", False):
+            # HiSparse admits against its host-backed logical pool, so the
+            # generation budget must use the same capacity as admission.
+            # Using the device-only pool here would admit a long prompt
+            # and then clamp its generation budget to zero.
+            token_capacity = self.tp_worker.model_runner.max_token_pool_size
+        else:
+            # PrefillAdder reserves one page per shard; the allocator reserves
+            # one. Subtract the other N - 1 pages to keep queue admission
+            # schedulable.
+            token_capacity = (
+                self.max_total_num_tokens * self.kv_shard_widening
+                - self.page_size * (self.kv_shard_widening - 1)
+            )
+            if is_cp_sharded_padded():
+                token_capacity = from_cp_sharded(token_capacity)
+                # (-input_len) % size is padding to the next multiple of size.
+                # Replace physical-page padding and decode headroom with a CP
+                # group.
+                group_size = self.logical_page_size
+                group_padding = (-input_len) % group_size
+                page_padding = (-input_len) % self.page_size
+                extra_padding = group_padding - page_padding
+                extra_headroom = group_size - self.page_size
+                token_capacity -= extra_padding + extra_headroom
         retirement = window_retirement(
             shares_prefixes=self.tree_cache.supports_prefix_sharing()
         )
