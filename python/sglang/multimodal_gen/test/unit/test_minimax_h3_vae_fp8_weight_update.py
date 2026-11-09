@@ -1,11 +1,4 @@
-"""An online-FP8 MiniMax-H3 video VAE refuses runtime weight updates.
-
-The updater copies checkpoint tensors into parameters. The FP8 block linears
-hold rounded payloads next to per-channel scales, so such a copy would serve a
-decoder whose scales no longer match its weights: the VAE rejects the update
-before any weight is written, through the same hook the DiT uses, while a
-decoder without the FP8 install keeps taking updates.
-"""
+"""Reject weight updates during FP8 decode; allow them between requests."""
 
 from types import SimpleNamespace
 

@@ -253,13 +253,14 @@ def test_quality_switch_restores_modules_outputs_and_live_memory(stub_server_arg
                 assert parameter is originals[name]
                 assert parameter.data_ptr() == pointers[name]
 
-        with pytest.raises(RuntimeError, match="decode failed"):
-            with use_fp8_decoder(decoder, True):
-                raise RuntimeError("decode failed")
-        assert not decoder.fp8_installed
-        torch.testing.assert_close(
-            decoder._run_blocks(value, rope), expected, rtol=0, atol=0
-        )
+        for error in (RuntimeError, KeyboardInterrupt):
+            with pytest.raises(error, match="decode failed"):
+                with use_fp8_decoder(decoder, True):
+                    raise error("decode failed")
+            assert not decoder.fp8_installed
+            torch.testing.assert_close(
+                decoder._run_blocks(value, rope), expected, rtol=0, atol=0
+            )
 
     # a failed conversion must restore even the modules already swapped
     convert = OnlineFP8Linear.from_linear

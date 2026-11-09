@@ -15,6 +15,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from huggingface_hub import model_info
 from skimage.metrics import structural_similarity
 
 from sglang.multimodal_gen.runtime.entrypoints.diffusion_generator import DiffGenerator
@@ -32,9 +33,11 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--steps", type=int, default=5)
     parser.add_argument("--short-edge", type=int, default=768)
+    parser.add_argument("--revision", default=None)
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     label = "fp8" if args.fp8 else "baseline"
+    revision = model_info("MiniMaxAI/MiniMax-H3", revision=args.revision).sha
     report = {
         "commit": subprocess.check_output(
             ["git", "rev-parse", "HEAD"], text=True
@@ -44,11 +47,13 @@ def main():
         "cuda": torch.version.cuda,
         "steps": args.steps,
         "short_edge": args.short_edge,
+        "model_revision": revision,
         "requests": [],
     }
     generator = DiffGenerator.from_pretrained(
         model_path="MiniMaxAI/MiniMax-H3",
         model_variant="fl2va",
+        revision=revision,
         num_gpus=1,
         performance_mode="speed",
         enable_torch_compile=False,
@@ -85,6 +90,7 @@ def main():
                 if result is None:
                     raise RuntimeError(f"generation failed: {index}/{quality}")
                 frames = np.stack(result.frames)
+                assert frames.dtype == np.uint8 and result.audio is not None
                 audio_hash = hashlib.sha256(
                     np.asarray(result.audio).tobytes()
                 ).hexdigest()

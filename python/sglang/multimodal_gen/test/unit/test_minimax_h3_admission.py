@@ -608,11 +608,17 @@ def test_admission_rejects_steps_exceeding_online_adaln_gpu_plans():
         assert stage.forward(batch, server_args) is batch
 
 
-@pytest.mark.parametrize("quality", ["exact", "lossless", "high"])
-@pytest.mark.parametrize("fp8", [False, True])
+@pytest.mark.parametrize(
+    ("quality", "fp8"),
+    [
+        ("exact", False),
+        ("lossless", False),
+        ("exact", True),
+        ("lossless", True),
+        ("high", True),
+    ],
+)
 def test_non_cache_quality_does_not_enable_h3_cache_dit(quality, fp8):
-    if quality == "high" and not fp8:
-        pytest.skip("the existing high profile deliberately enables Cache-DiT")
     stage = MiniMaxH3DenoisingStage.__new__(MiniMaxH3DenoisingStage)
     stage.server_args = SimpleNamespace(
         enable_breakable_cuda_graph=False,
