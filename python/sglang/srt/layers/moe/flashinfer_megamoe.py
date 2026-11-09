@@ -420,7 +420,8 @@ def ensure_nvfp4_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
         megakernel_config=megakernel_config,
         w13_scale=layer.w13_weight_scale,
         w2_scale=layer.w2_weight_scale,
-        # The decode workspace is measured only on ModelOpt NVFP4 MoE.
+        # Only ModelOptNvFp4FusedMoEMethod (and its nvfp4_online subclass) gets
+        # the decode workspace; MXFP8 and FP4-expert layers never request it.
         with_decode_workspace=True,
     )
 
