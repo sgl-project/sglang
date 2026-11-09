@@ -4,9 +4,6 @@ import logging
 
 import torch
 
-from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
-    DecodeCudaGraphRunner,
-)
 from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
     BreakableCudaGraphBackend,
 )
@@ -15,11 +12,6 @@ from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
 )
 
 logger = logging.getLogger(__name__)
-
-
-class DecodeMluGraphRunner(DecodeCudaGraphRunner):
-    def _cache_loc_dtype(self):
-        return torch.int32
 
 
 class MluGraphProfilingMixin:
@@ -50,6 +42,10 @@ class MluGraphProfilingMixin:
 
 
 class FullMluGraphBackend(MluGraphProfilingMixin, FullCudaGraphBackend):
+    @property
+    def cache_loc_dtype(self) -> torch.dtype:
+        return torch.int32
+
     def __init__(self, runner, *, enable_memory_saver=False, reuse_output_buffer=False):
         if enable_memory_saver:
             raise ValueError("MLU graph execution does not support memory saver.")
@@ -63,6 +59,10 @@ class FullMluGraphBackend(MluGraphProfilingMixin, FullCudaGraphBackend):
 
 
 class BreakableMluGraphBackend(MluGraphProfilingMixin, BreakableCudaGraphBackend):
+    @property
+    def cache_loc_dtype(self) -> torch.dtype:
+        return torch.int32
+
     def __init__(self, runner, *, enable_memory_saver=False, debug_eager=False):
         if enable_memory_saver:
             raise ValueError("MLU graph execution does not support memory saver.")

@@ -115,11 +115,6 @@ class MluSRTPlatform(MluDeviceMixin, SRTPlatform):
             return MLUMHATokenToKVPool
         return None
 
-    def get_graph_runner_cls(self):
-        from sglang.srt.hardware_backend.mlu.graph import DecodeMluGraphRunner
-
-        return DecodeMluGraphRunner
-
     def get_full_graph_backend_cls(self):
         from sglang.srt.hardware_backend.mlu.graph import FullMluGraphBackend
 
