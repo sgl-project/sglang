@@ -82,7 +82,9 @@ def main():
                         "num_inference_steps": args.steps,
                         "seed": 1101 + index,
                         "quality": quality,
-                        "save_output": False,
+                        "save_output": True,
+                        "output_path": str(args.output),
+                        "output_file_name": f"{label}-{index}-{iteration}.mp4",
                         "return_file_paths_only": False,
                     }
                 )

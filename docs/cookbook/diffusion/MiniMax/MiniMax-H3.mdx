@@ -428,7 +428,7 @@ rejects everything else (tensor updates, and directories without those
 tensors) before a single weight is written. A sidecar is built offline and
 cannot be regenerated in the server, so weight updates are rejected outright;
 rebuild the sidecar against the new weights and restart. The online FP8 video
-VAE decoder adds a constraint of its own; see "Advanced: online FP8 video VAE decoder" below.
+VAE decoder has separate requirements; see "Advanced: FP8 video VAE decoder for high quality" below.
 
 ### Advanced: FP8 video VAE decoder for high quality
 
@@ -453,8 +453,9 @@ each high decode, including errors and cancellation. Weight updates between
 requests remain supported; the next high request quantizes the updated weights.
 
 No FP8 weights are allocated at startup or retained between requests. High
-temporarily holds both the original and quantized decoder weights, increasing
-its peak GPU memory by approximately 2.25 GiB plus quantization workspace.
+temporarily holds both the original and quantized decoder weights, adding
+approximately 2.25 GiB of weights plus quantization workspace. Total peak
+memory also depends on the activations and other pipeline stages.
 Per-request quantization time is part of high latency. PyTorch may retain freed
 blocks in its allocator cache; this is not a persistent FP8 weight cache.
 
@@ -1212,11 +1213,12 @@ levels:
   every op, and VAE decode fuses the ViT decoder's per-head QK RMSNorm and
   RoPE into one launch, runs its attention on cuDNN SDPA and, on CUDA, decodes
   several spatial tiles per decoder forward (rounding-level differences only).
-- `"high"`: the audited accelerated path. Quality is guaranteed (the audited
-  Cache-DiT configuration measures SSIM 0.931 / PSNR 28.16 dB against
-  `exact`), but output is no longer bit-identical to the reference.
+- `"high"`: a lossy accelerated profile. The H200 Cache-DiT configuration
+  measured SSIM 0.931 / PSNR 28.16 dB against `exact` on its audited workload.
+  The optional FP8 profile quantizes only the video decoder instead. Neither
+  measurement is a quality guarantee for arbitrary workloads.
 
-One resident server serves all three levels; a `quality: "high"` request
+With the H200 profile, one resident server serves all three levels; a `quality: "high"` request
 mounts its audited Cache-DiT policy at the batch boundary, and a later
 `quality: "exact"` or `quality: "lossless"` request removes the hooks
 before denoising.
