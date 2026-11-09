@@ -18,6 +18,7 @@ the pre-existing behaviour, so agreement is the regression signal.
 
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
@@ -109,6 +110,9 @@ class _FakeStorage:
         start = self.base + self.cursor
         self.cursor += num_tokens
         return torch.arange(start, start + num_tokens, dtype=torch.int64)
+
+    def take_extend(self, *, num_tokens, **_kwargs) -> torch.Tensor:
+        return self.take_tokens(num_tokens)
 
 
 class _FakeTreeCache:
@@ -221,6 +225,74 @@ class TestAllocExtendLocWithKvReuseBatching(CustomTestCase):
             prefix_lens=[12, 0],
             extend_lens=[4, 5],
         )
+
+
+class TestPagedEmptyPrefixFiller(CustomTestCase):
+    """The paged branch's last_loc filler: one shared [-1] tensor, created only
+    when a row with an empty prefix actually needs it."""
+
+    def _run_paged(self, *, reuse_kv, prefix_lens, extend_lens, prefix_tensors):
+        batch = _make_batch(
+            reuse_kv=reuse_kv, prefix_lens=prefix_lens, extend_lens=extend_lens
+        )
+        batch.seq_lens_cpu = torch.tensor(
+            [p + e for p, e in zip(prefix_lens, extend_lens)], dtype=torch.int64
+        )
+        with envs.SGLANG_DLLM_BATCHED_GATHER_MIN_ROWS.override(-1):
+            return _alloc_extend_loc_with_kv_reuse(
+                batch,
+                reuse_kv,
+                prefix_tensors,
+                torch.tensor(list(range(len(reuse_kv))), dtype=torch.int64),
+                torch.tensor(prefix_lens, dtype=torch.int64),
+                torch.tensor(extend_lens, dtype=torch.int64),
+                torch.tensor(list(range(len(reuse_kv))), dtype=torch.int64),
+                4,
+            )
+
+    def _filler_creations(self, fn):
+        real_tensor = torch.tensor
+        created = []
+
+        def spy(data, *args, **kwargs):
+            if isinstance(data, list) and data == [-1]:
+                created.append(1)
+            return real_tensor(data, *args, **kwargs)
+
+        with mock.patch.object(torch, "tensor", new=spy):
+            out = fn()
+        return len(created), out
+
+    def test_no_empty_prefix_creates_no_filler(self):
+        creations, out = self._filler_creations(
+            lambda: self._run_paged(
+                reuse_kv=[True, False],
+                prefix_lens=[8, 4],
+                extend_lens=[4, 3],
+                prefix_tensors=[
+                    torch.arange(8, dtype=torch.int64),
+                    torch.arange(4, dtype=torch.int64),
+                ],
+            )
+        )
+        self.assertEqual(creations, 0)
+        self.assertEqual(out.shape[0], 7)
+
+    def test_empty_prefixes_share_one_filler(self):
+        creations, out = self._filler_creations(
+            lambda: self._run_paged(
+                reuse_kv=[False, False, True],
+                prefix_lens=[0, 0, 8],
+                extend_lens=[3, 2, 4],
+                prefix_tensors=[
+                    torch.empty(0, dtype=torch.int64),
+                    torch.empty(0, dtype=torch.int64),
+                    torch.arange(8, dtype=torch.int64),
+                ],
+            )
+        )
+        self.assertEqual(creations, 1)
+        self.assertEqual(out.shape[0], 9)
 
 
 if __name__ == "__main__":

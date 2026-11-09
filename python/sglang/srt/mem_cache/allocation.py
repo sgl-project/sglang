@@ -646,8 +646,16 @@ def _alloc_extend_loc_with_kv_reuse(
                 ],
                 dtype=torch.int64,
             )
-            neg_one = torch.tensor([-1], device=device)
-            last_loc = [(t[-1:] if len(t) > 0 else neg_one) for t in prefix_tensors]
+            # One shared [-1] filler, created only when an empty prefix needs it.
+            neg_one = None
+            last_loc = []
+            for t in prefix_tensors:
+                if len(t) > 0:
+                    last_loc.append(t[-1:])
+                else:
+                    if neg_one is None:
+                        neg_one = torch.tensor([-1], device=device)
+                    last_loc.append(neg_one)
             fresh_slots = alloc_paged_token_slots_extend(
                 tree_cache=batch.tree_cache,
                 prefix_lens=prefix_lens_cpu.to(device, non_blocking=True),
