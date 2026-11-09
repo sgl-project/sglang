@@ -505,21 +505,23 @@ class TestPrepareServerArgs(CustomTestCase):
                 )
 
     def test_ple_embedding_offload_rejects_generic_weight_offload(self):
-        for generic_offload in (
-            {"cpu_offload_gb": 1},
-            {"offload_group_size": 1},
-        ):
-            with (
-                self.subTest(generic_offload=generic_offload),
-                self.assertRaisesRegex(
-                    ValueError, "ple-offload-embedding cannot be combined"
-                ),
+        for flag in ("ple_offload_embedding", "ple_offload_token_embedding"):
+            for generic_offload in (
+                {"cpu_offload_gb": 1},
+                {"offload_group_size": 1},
             ):
-                ServerArgs(
-                    model_path="dummy",
-                    ple_offload_embedding=True,
-                    **generic_offload,
-                ).resolve_once()
+                with (
+                    self.subTest(flag=flag, generic_offload=generic_offload),
+                    self.assertRaisesRegex(
+                        ValueError,
+                        f"{flag.replace('_', '-')} cannot be combined",
+                    ),
+                ):
+                    ServerArgs(
+                        model_path="dummy",
+                        **{flag: True},
+                        **generic_offload,
+                    ).resolve_once()
 
     def test_weight_cache_daemon_allows_static_eplb(self):
         args = ServerArgs(

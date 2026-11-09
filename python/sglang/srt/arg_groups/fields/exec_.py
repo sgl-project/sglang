@@ -1166,6 +1166,15 @@ class ExecOffload(msgspec.Struct):
             "local storage (NVMe).",
         ),
     ] = None
+    ple_offload_token_embedding: A[
+        bool,
+        "Keep the Qwen4 token embedding table (vocab x hidden) in page-locked "
+        "host memory, whatever --ple-offload-backend is, and gather its rows "
+        "with the PLE offload kernel, leaving its device memory to the KV cache. "
+        "An MTP draft model gathers from the same host table. Not supported "
+        "with tied word embeddings. Frees nothing on unified-memory devices "
+        "(e.g. GB10), where host and device memory are one pool.",
+    ] = False
     engram_config: A[
         Optional[Dict[str, Any]],
         Arg(

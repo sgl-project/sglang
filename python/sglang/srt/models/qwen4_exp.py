@@ -676,6 +676,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                 ngram_embedding,
                 backend=getattr(config, "ple_offload_backend", "pinned"),
                 table_dir=getattr(config, "ple_offload_dir", None),
+                weight_scale=ngram_embedding.weight_scale,
             )
         self.ngram_embedding = ngram_embedding
 
@@ -956,6 +957,8 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         *,
         backend: str = "pinned",
         table_dir: Optional[str] = None,
+        host_table: Optional[torch.Tensor] = None,
+        weight_scale: Optional[torch.Tensor] = None,
     ) -> None:
         nn.Module.__init__(self)
         if not isinstance(embedding.quant_method, UnquantizedEmbeddingMethod):
@@ -978,17 +981,26 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         self.quant_method = None
 
         source_weight = embedding.weight
-        host_table = allocate_ple_host_table(
-            shape=source_weight.shape,
-            dtype=source_weight.dtype,
-            backend=backend,
-            table_dir=table_dir,
-            # Each TP rank holds a different vocabulary shard of the same shape.
-            tag=(
-                f"rows{self.shard_indices.org_vocab_start_index}"
-                f"-{self.shard_indices.org_vocab_end_index}"
-            ),
-        )
+        if host_table is None:
+            host_table = allocate_ple_host_table(
+                shape=source_weight.shape,
+                dtype=source_weight.dtype,
+                backend=backend,
+                table_dir=table_dir,
+                # Each TP rank holds a different vocabulary shard of the same shape.
+                tag=(
+                    f"rows{self.shard_indices.org_vocab_start_index}"
+                    f"-{self.shard_indices.org_vocab_end_index}"
+                ),
+            )
+        elif not host_table.is_pinned() or (host_table.shape, host_table.dtype) != (
+            source_weight.shape,
+            source_weight.dtype,
+        ):
+            raise ValueError(
+                "a shared host embedding table must be pinned and match the "
+                "embedding's shape and dtype"
+            )
         # Only the file backend has anything to prefetch (rows live on storage).
         self._file_prefetcher = make_ple_file_prefetcher(host_table)
         # ... and only it needs its resident set bounded: a fault maps a whole
@@ -1000,8 +1012,8 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         cpu_weight.weight_loader = self.weight_loader
         self.register_parameter("weight", cpu_weight)
         # The scale is tiny; keep it with the model instead of offloading it
-        # with the table.
-        self.register_buffer("weight_scale", embedding.weight_scale, persistent=True)
+        # with the table. Only the n-gram table has one.
+        self.register_buffer("weight_scale", weight_scale, persistent=True)
         del embedding.weight
         self._block_d = triton.next_power_of_2(self.embedding_dim)
 
@@ -1056,7 +1068,13 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         return output
 
     def reduce(self, output: torch.Tensor) -> torch.Tensor:
-        if self.tp_size > 1 and not get_attn_tp_context().input_scattered:
+        # As in VocabParallelEmbedding.forward: every attention-TP peer of an
+        # empty idle batch is empty too, so all of them skip the collective.
+        if (
+            output.numel() > 0
+            and self.tp_size > 1
+            and not get_attn_tp_context().input_scattered
+        ):
             if self.use_attn_tp_group:
                 return attn_tp_all_reduce(output)
             return tensor_model_parallel_all_reduce(output)
@@ -2044,12 +2062,24 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
     def _build_embed_tokens(self, config: Qwen4ExpTextConfig) -> nn.Module:
         if not self.pp_group.is_first_rank:
             return PPMissingLayer()
-        return VocabParallelEmbedding(
-            config.vocab_size,
-            config.hidden_size,
-            org_num_embeddings=config.vocab_size,
-            use_attn_tp_group=is_dp_attention_enabled(),
-        )
+        offload = config.ple_offload_token_embedding
+        if offload and config.tie_word_embeddings:
+            raise ValueError(
+                "--ple-offload-token-embedding needs untied word embeddings: "
+                "the lm_head reads the same table on the device"
+            )
+        # Offload only needs the embedding's metadata: build it on meta so the
+        # table is never allocated on the device.
+        with torch.device("meta") if offload else nullcontext():
+            embed_tokens = VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+                org_num_embeddings=config.vocab_size,
+                use_attn_tp_group=is_dp_attention_enabled(),
+            )
+        if offload:
+            embed_tokens = Qwen4ExpPinnedHostEmbedding(embed_tokens)
+        return embed_tokens
 
     def __init__(
         self,

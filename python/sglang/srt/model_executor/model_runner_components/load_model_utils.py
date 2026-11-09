@@ -372,8 +372,16 @@ def load_model_with_memory_saver(
             raise ValueError(
                 "--ple-offload-embedding only supports Qwen4ExpForConditionalGeneration"
             )
+        if get_exec().offload.ple_offload_token_embedding and not is_qwen4_exp:
+            raise ValueError(
+                "--ple-offload-token-embedding only supports "
+                "Qwen4ExpForConditionalGeneration"
+            )
         if is_qwen4_exp:
             model_config.hf_text_config.ple_offload_embedding = ple_offload_embedding
+            model_config.hf_text_config.ple_offload_token_embedding = (
+                get_exec().offload.ple_offload_token_embedding
+            )
             model_config.hf_text_config.ple_offload_backend = (
                 get_exec().offload.ple_offload_backend
             )
