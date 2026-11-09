@@ -1462,6 +1462,46 @@ def _fa4_page_constraint(view: Any) -> dict:
 
 
 @register_post_process
+def _hybrid_kda_fa4_backend_constraint(view: Any) -> dict:
+    # The whitelist that already keeps fa4 off consumer Blackwell lives in the
+    # hybrid-GDN arm of attention_registry.py: on `is_sm120` it allows
+    # {"triton", "trtllm_mha", "flashinfer"} and asserts on anything else. The
+    # sibling arms that build a KDA hybrid (KimiLinear, Bailing with use_kda,
+    # GLM-5-Next) pick KDAAttnBackend without that check, so fa4 stays
+    # selectable, and the launch then dies at the first decode graph capture:
+    # the hybrid backend hands the full-attention layers the linear layers'
+    # empty extend axis, and the FA4 path that compute capability 12 routes to
+    # flash_attention_v4_sm120 reshapes against it instead of short-circuiting
+    # -- "RuntimeError: shape '[-1, 64, 8, 0]' is invalid for input of size
+    # 753975296", reported for GLM-5.3-Flash TP8 on 8x SM120 (#42012). The
+    # routing keys on the major, so SM121 is refused by the same rule. This
+    # moves the failure to argument resolution, before anything is allocated;
+    # teaching fa4 to survive graph capture here is a separate fix.
+    from sglang.srt.configs.hybrid_arch import hybrid_kda_config
+
+    prefill_backend, decode_backend = attention_backends_of(view)
+    if "fa4" not in (prefill_backend, decode_backend):
+        return {}
+    if not get_platform().is_sm120:
+        return {}
+    model_config = model_config_of(view)
+    if hybrid_kda_config(model_config) is None:
+        return {}
+    arch = (getattr(model_config.hf_config, "architectures", None) or ["this model"])[0]
+    raise ValueError(
+        f"{arch} is a KDA hybrid model, and on this device it resolves its "
+        f"full-attention layers to fa4 (prefill={prefill_backend}, "
+        f"decode={decode_backend}). The compute-capability-12 FA4 path cannot "
+        "run one under CUDA graph capture: the run loads the weights and then "
+        "dies at the first capture instead of being refused here. Set "
+        "--attention-backend triton (or the split flags); it is the backend "
+        "these models have been served with on this device. trtllm_mha and "
+        "flashinfer, which the hybrid-GDN whitelist allows here, were not "
+        "validated for KDA hybrids and this check says nothing about them."
+    )
+
+
+@register_post_process
 def _attention_backend_platform_fallbacks(view: Any) -> dict:
     if (
         view.attention_backend == "intel_amx"
