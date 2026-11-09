@@ -10,11 +10,13 @@ variable-length row that crashes the denoise algorithms' uniform-block reshape
 
 Bug 2: the fallback must only override an exhausted ``rem_total_tokens``, not
 real pool exhaustion. A fresh block still charges
-``ceil_paged(block_size) + page_size`` against ``cur_rem_tokens`` (see
-``_update_prefill_budget``), so granting one at zero current capacity drives
-the budget negative and ``alloc_for_extend`` raises on the real allocation.
-Rows reusing retained FDFO KV (``reuses_kv=True``) allocate zero fresh
-tokens and must stay admittable regardless of current capacity.
+``ceil_paged(block_size) + per_req_token_overhead`` against ``cur_rem_tokens``
+(``_update_prefill_budget`` reserves the page-ceiled extend plus the
+per-request allocation rounding through ``PrefillBudget.reserve``), so
+granting one at zero current capacity drives the budget negative and
+``alloc_for_extend`` raises on the real allocation. Rows reusing retained
+FDFO KV (``reuses_kv=True``) allocate zero fresh tokens and must stay
+admittable regardless of current capacity.
 
 Hardenings on top:
 
@@ -25,13 +27,14 @@ Hardenings on top:
 - The reuse grant is uniform across budget regimes (only the dLLM concurrency
   budget applies), fixing an inversion where a reuse row was refused at
   small-positive ``rem_total_tokens`` yet admitted at negative.
-- The fallback gate charges ``fresh_extra_charge`` (the mamba gap reserve that
-  ``_update_prefill_budget`` also debits) on top of
-  ``ceil_paged(block_size) + page_size``.
 - ``process_dllm_staging_reqs`` treats NO_TOKEN as a per-row refusal: a
   fresh-needing row at the head no longer starves zero-cost reuse rows behind
   it, and one budget-exhausting admission per round no longer serializes the
   rest of the queue.
+
+The capped fallback and whole-block rounding only apply to the classic dLLM
+staging path; separate-context-encoding models keep upstream's fallback, whose
+``cur_rem_tokens - page_size`` cap already protects the pool.
 """
 
 import unittest
@@ -72,6 +75,12 @@ def _make_adder(
     adder.rem_dllm_tokens = rem_dllm_tokens
     adder.dllm_block_size = dllm_block_size
     adder.page_size = page_size
+    # No CP sharding and no KV sharding in these tests: the logical page is
+    # the page, and the per-request allocation-rounding overhead is one
+    # logical page (see PrefillAdder.__init__).
+    adder.logical_page_size = page_size
+    adder.per_req_token_overhead = page_size
+    adder.dllm_config = SimpleNamespace(requires_separate_context_encoding=False)
     adder.token_to_kv_pool_allocator = SimpleNamespace(
         available_size=lambda: available_tokens, page_size=page_size
     )
@@ -145,8 +154,9 @@ class TestDllmStagingTokenBudgetFallbackCap(CustomTestCase):
         self.assertEqual(adder._get_dllm_remain_tokens(), 0)
 
     def test_fallback_gates_on_the_full_admission_charge(self):
-        # _update_prefill_budget debits ceil_paged(extend) + page_size, so the
-        # gate must cover ceil_paged(block_size) + page_size — a bare
+        # _update_prefill_budget debits ceil_paged(extend) plus one
+        # per_req_token_overhead (one logical page without KV sharding), so
+        # the gate must cover ceil_paged(block_size) + that overhead — a bare
         # block_size pool would still go negative by the page overhead.
         for page_size in (1, 4, 16):
             charge = -(-self.BLOCK_SIZE // page_size) * page_size + page_size
@@ -250,27 +260,6 @@ class TestDllmStagingTokenBudgetFallbackCap(CustomTestCase):
                 f"available={available}",
             )
 
-    def test_fallback_gate_includes_the_fresh_extra_charge(self):
-        # On a unified Mamba pool the real admission debit also includes the
-        # mamba gap reserve (`_update_prefill_budget(...,
-        # mamba_gap_reserve=...)`); the gate receives it as
-        # `fresh_extra_charge` and must refuse when the pool covers the block
-        # charge but not the extra.
-        extra = 8
-        charge = self.BLOCK_SIZE + 1 + extra  # ceil_paged(32) + page 1 + extra
-        for available, expected in ((charge - 1, 0), (charge, self.BLOCK_SIZE)):
-            adder = _make_adder(
-                rem_dllm_tokens=4096,
-                dllm_block_size=self.BLOCK_SIZE,
-                available_tokens=available,
-                rem_total_token_offset=available + 100,
-            )
-            self.assertEqual(
-                adder._get_dllm_remain_tokens(fresh_extra_charge=extra),
-                expected,
-                f"available={available}",
-            )
-
 
 class _StubReq:
     """Just enough of Req for `add_dllm_staging_req`."""
@@ -278,10 +267,11 @@ class _StubReq:
     def __init__(self, *, rid, fill_len, incomplete_len, req_pool_idx):
         self.rid = rid
         self.full_untruncated_fill_ids = list(range(fill_len))
-        self.prefix_indices = []
+        self.prefix_len = 0
         self.dllm_incomplete_ids = list(range(incomplete_len))
         # holds_kv mirrors ReqKvInfo's property (req_pool_idx is not None);
-        # holds_mamba is irrelevant here (_mamba_slot_cost == 0 below).
+        # holds_mamba is irrelevant here (the plain PrefillBudget has no
+        # state slots).
         self.kv = SimpleNamespace(
             req_pool_idx=req_pool_idx,
             holds_kv=req_pool_idx is not None,
@@ -289,22 +279,27 @@ class _StubReq:
         )
         self.retracted_stain = False
         self.sampling_params = SimpleNamespace(max_new_tokens=64)
-        self.extend_range = None
+        self.extend_end = None
 
-    def set_extend_range(self, start, end):
-        self.extend_range = SimpleNamespace(start=start, end=end, length=end - start)
+    def is_dllm_prefill(self):
+        return False
+
+    @property
+    def extend_len(self):
+        return self.extend_end - self.prefix_len
 
 
 def _arm_admission(adder: PrefillAdder) -> PrefillAdder:
     """Add the state `add_dllm_staging_req` needs beyond the budget getter."""
-    adder.dllm_config = SimpleNamespace()
     adder.can_run_list = []
-    adder._mamba_slot_cost = 0  # non-Mamba: gap reserve is 0
-    adder.rem_mamba_slots = None
+    adder.exact_chunk_fill = False
     adder.rem_input_tokens = 1 << 30
     adder.rem_chunk_tokens = None
     adder.log_hit_tokens = 0
     adder.log_input_tokens = 0
+    adder.log_replay_tokens = 0
+    adder.reprocessed_log_hit_tokens = 0
+    adder.reprocessed_log_input_tokens = 0
     return adder
 
 
