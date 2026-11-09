@@ -151,19 +151,24 @@ class NgramEmbedding(torch.nn.Module):
             self.exclusive_req_len_sums[1 : batch_size + 1], offsets, right=True
         )
         valid = requests < batch_size
-        requests = requests.clamp_max(batch_size - 1)
-        positions = (
-            info.column_starts[requests]
-            + offsets
-            - self.exclusive_req_len_sums[requests]
-        )
+        requests.clamp_max_(batch_size - 1)
+        positions = forward_batch.positions
         rows = forward_batch.req_pool_indices[requests]
         lookback = torch.arange(1 - self.over_embedding_n, 1, device=input_ids.device)
-        # The existing NPU operator stops at negative tokens, without an EOS
-        # argument. Give each query a short window with previous EOS masked.
-        # Bound the synthetic request batch: its metadata is staged in UB.
-        for start in range(0, len(input_ids), 1024):
-            end = min(start + 1024, len(input_ids))
+        # The native op stops at negative tokens but has no EOS boundary check.
+        # Match the GPU rule with a separate N-token history for each query:
+        # keep the current token, even if it is EOS, and mask historical EOS to
+        # -1. A shared EOS mask would also discard the current EOS's own n-gram.
+        # Each history row is a temporary request that computes only its last
+        # token; the original request's token table is not modified.
+        #
+        # 8192 limits the number of temporary requests per call, not the history
+        # length. Each core stages all request metadata in UB: 4-byte lengths,
+        # 8-byte row indices, and 4-byte column starts per request. For LongCat-2.0
+        # (N=5, K=4), the other buffers use 512 bytes after 32-byte alignment.
+        # 8192 requests therefore use 128.5 KiB, leaving 63.5 KiB of a 192 KiB UB.
+        for start in range(0, len(input_ids), 8192):
+            end = min(start + 8192, len(input_ids))
             size = end - start
             chunk_positions = torch.where(valid[start:end], positions[start:end], 0)
             cols = chunk_positions[:, None] + lookback
@@ -190,8 +195,7 @@ class NgramEmbedding(torch.nn.Module):
                 oe_k=self.over_embedding_k,
                 max_context_len=self.over_embedding_n,
             )
-            # Graph-padding rows use a deterministic embedding index.
-            output[start:end].copy_(result.masked_fill(~valid[start:end, None], 0))
+            output[start:end].copy_(result)
 
     def forward(self, input_ids: torch.Tensor, forward_batch: ForwardBatch):
         if (
