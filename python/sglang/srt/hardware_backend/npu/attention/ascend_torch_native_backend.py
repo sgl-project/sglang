@@ -230,6 +230,7 @@ class AscendTorchNativeAttnBackend:
         full_to_swa_mapping: Optional[torch.Tensor] = None,
         logit_cap: float = 0.0,
         logit_capping_method: str = "tanh",
+        reference_lens: Optional[torch.Tensor] = None,
     ):
         """Run the decode forward by using torch native sdpa op.
 
@@ -287,6 +288,18 @@ class AscendTorchNativeAttnBackend:
             # index for each token in the sequence.
             req_pool_idx = req_pool_indices[seq_idx]
             per_req_tokens = req_to_token[req_pool_idx, atten_start_kv:atten_end_kv]
+            if reference_lens is not None:
+                # R-SWA keeps the entire prompt, then the latest W generated
+                # tokens (including the current query). Do not duplicate the
+                # prompt when the generated suffix is shorter than W.
+                reference_len = int(reference_lens[seq_idx].item())
+                window_start = max(reference_len, seq_len_kv - sliding_window_size)
+                per_req_tokens = torch.cat(
+                    (
+                        req_to_token[req_pool_idx, :reference_len],
+                        req_to_token[req_pool_idx, window_start:seq_len_kv],
+                    )
+                )
             # For SWA layers, k_cache/v_cache are from the SWA pool but
             # req_to_token stores full pool indices. Translate before indexing.
             if full_to_swa_mapping is not None:
