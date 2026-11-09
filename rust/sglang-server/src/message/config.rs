@@ -99,6 +99,22 @@ impl Default for RuntimeConfig {
     }
 }
 
+impl RuntimeConfig {
+    /// Tokenizer pool threads: half the shared frontend core set, or
+    /// `--tokenizer-worker-num` when larger or when the pool runs unpinned.
+    /// The flag defaults to 1, which in Python still encodes on a thread pool;
+    /// here one thread would render and encode every request, and long prompts
+    /// (~40 ms CPU per 16k-token prompt) saturate it during bursts.
+    pub fn tokenizer_thread_num(&self) -> usize {
+        let cores = self
+            .rust_server_args
+            .cores
+            .as_deref()
+            .map_or(0, <[usize]>::len);
+        self.server_args.tokenizer_worker_num.max(cores / 2)
+    }
+}
+
 /// The scheduler's launch-time handoff (`RustServer._build_server_args`):
 /// the `server_args` fields the rust server reads, the resolved
 /// [`ModelConfig`], and launch-time stamps. Values are post-`__post_init__`
@@ -1172,14 +1188,6 @@ impl ServerArgs {
         4.max(self.tokenizer_worker_num)
             .max(self.detokenizer_worker_num)
     }
-
-    /// Pinned tokenizer threads. Python's `--tokenizer-worker-num` defaults to
-    /// 1, which there still parallelizes encoding over a thread pool; here it
-    /// would leave one thread to render and encode every request, and long
-    /// prompts saturate it (~40 ms CPU per 16k-token prompt). Floored at 4.
-    pub fn tokenizer_thread_num(&self) -> usize {
-        4.max(self.tokenizer_worker_num)
-    }
 }
 
 #[cfg(test)]
@@ -1187,16 +1195,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tokenizer_threads_floor_at_four_and_honor_larger_counts() {
-        let threads = |n| {
-            ServerArgs {
-                tokenizer_worker_num: n,
+    fn tokenizer_threads_follow_half_the_frontend_cores_unless_the_flag_is_larger() {
+        let threads = |cores: Option<Vec<usize>>, flag| {
+            RuntimeConfig {
+                rust_server_args: RustServerServerArgs {
+                    cores,
+                    ..Default::default()
+                },
+                server_args: Arc::new(ServerArgs {
+                    tokenizer_worker_num: flag,
+                    ..Default::default()
+                }),
                 ..Default::default()
             }
             .tokenizer_thread_num()
         };
-        assert_eq!(threads(1), 4);
-        assert_eq!(threads(8), 8);
+        assert_eq!(threads(Some((2..10).collect()), 1), 4);
+        assert_eq!(threads(Some((2..10).collect()), 8), 8);
+        assert_eq!(threads(None, 1), 1);
+        assert_eq!(threads(Some(vec![2]), 1), 1);
     }
 
     #[test]
