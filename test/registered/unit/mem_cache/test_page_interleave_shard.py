@@ -41,10 +41,11 @@ Pins the pure arithmetic that rotated owner-classed allocation hangs on:
    owner-classed host slots, the per-rank narrowing of a transfer, an N-rank
    backup -> evict -> load-back round trip, and the layer-load waits.
 
-The real NCCL MLA/MHA/MTP gathers, zero-SM gather correctness and release,
-and symmetric buffer lifetime tests live in
-``test_page_interleave_gather_multi_gpu.py``. DSA indexer and attention
-coverage lives in ``test_page_sharded_dsa_attention.py``.
+The real NCCL MLA/MHA/MTP gathers and symmetric buffer lifetime tests live in
+``test_page_interleave_gather_multi_gpu.py``; the zero-SM gathers, which need
+a newer NCCL than CI has, live in
+``test/manual/mem_cache/test_page_interleave_zero_sm_gather.py``. DSA indexer
+and attention coverage lives in ``test_page_sharded_dsa_attention.py``.
 """
 
 import ctypes
@@ -87,6 +88,7 @@ from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
+from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
@@ -312,6 +314,34 @@ class TestZeroSmScratchLayout(CustomTestCase):
                 if version < _NCCL_SYMMETRIC_SCRATCH_MIN_VERSION:
                     same_node.assert_not_called()
 
+    def test_cross_node_group_keeps_sm_gather(self):
+        with (
+            envs.SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER.override(True),
+            unittest.mock.patch(
+                "sglang.srt.mem_cache.page_interleave_pool.is_cuda",
+                return_value=True,
+            ),
+            unittest.mock.patch(
+                "sglang.srt.mem_cache.page_interleave_pool.NCCLLibrary"
+            ) as library,
+            unittest.mock.patch(
+                "sglang.srt.mem_cache.page_interleave_pool.in_the_same_node_as",
+                return_value=[True, False],
+            ) as same_node,
+        ):
+            library.return_value.ncclGetRawVersion.return_value = (
+                _NCCL_SYMMETRIC_SCRATCH_MIN_VERSION
+            )
+            cpu_group = object()
+            self.assertFalse(
+                _symmetric_scratch_supported(
+                    memory_saver_enabled=False,
+                    custom_mem_pool=None,
+                    shard_group=SimpleNamespace(cpu_group=cpu_group),
+                )
+            )
+            same_node.assert_called_once_with(cpu_group, source_rank=0)
+
     def test_slot_tensors_are_window_aligned_and_disjoint(self):
         """Both slots share one symmetric window: every tensor must start on
         NCCL's 4 KiB window alignment and no two tensors may overlap."""
@@ -460,11 +490,13 @@ def _make_mtp_configurator(use_mla=True):
     return kvc, target
 
 
-def _build_mtp_pool(kvc, *, capacity=128, is_dsa_model=False, is_dsv4_model=False):
+def _build_mtp_pool(
+    kvc, *, capacity=128, is_dsa_model=False, is_compressed_kv_model=False
+):
     return kvc._build_token_to_kv_pool(
         sizes=SimpleNamespace(max_total_num_tokens=capacity),
         is_dsa_model=is_dsa_model,
-        is_dsv4_model=is_dsv4_model,
+        is_compressed_kv_model=is_compressed_kv_model,
         req_to_token_pool=None,
     )
 
@@ -524,7 +556,7 @@ class TestMTPKVShardConfig(CustomTestCase):
                     kvc._build_token_to_kv_pool_allocator(
                         sizes=SimpleNamespace(max_total_num_tokens=128),
                         token_to_kv_pool=pool,
-                        is_dsv4_model=False,
+                        is_compressed_kv_model=False,
                         req_to_token_pool=None,
                         token_to_kv_pool_allocator=allocator,
                     ),
@@ -641,7 +673,7 @@ class TestMTPKVShardConfig(CustomTestCase):
                 _build_mtp_pool(kvc)
         for options, message in (
             ({"is_dsa_model": True}, "same DSA indexer layout"),
-            ({"is_dsv4_model": True}, "MLA, DSA and MHA"),
+            ({"is_compressed_kv_model": True}, "MLA, DSA and MHA"),
         ):
             with (
                 self.subTest(options=options),
@@ -1096,9 +1128,9 @@ class TestShardedAllocationEviction(CustomTestCase):
         initial_available = allocator.available_size()
         self.assertEqual(initial_available, GS)
 
-        # The shortfall is smaller than the initial free capacity: treating
-        # it as the absolute target would incorrectly skip eviction.
-        result = tree.evict_for_alloc(EvictParams(num_tokens=PS))
+        # A demand one page past the free capacity: the min-class capacity
+        # rises only once the tight class gets a page back.
+        result = tree.evict_for_alloc(KVDemand(full_tokens=initial_available + PS))
 
         self.assertGreaterEqual(allocator.available_size(), initial_available + PS)
         self.assertEqual(allocator.class_free_page_counts(), [2, 3, 4, 4])
@@ -1108,7 +1140,9 @@ class TestShardedAllocationEviction(CustomTestCase):
     def test_allocation_eviction_stops_when_tight_class_cannot_be_reclaimed(self):
         tree, allocator = self._cache_with_imbalanced_classes(cache_tight_page=False)
 
-        result = tree.evict_for_alloc(EvictParams(num_tokens=PS))
+        result = tree.evict_for_alloc(
+            KVDemand(full_tokens=allocator.available_size() + PS)
+        )
 
         self.assertEqual(allocator.available_size(), GS)
         self.assertEqual(allocator.class_free_page_counts(), [1, 3, 4, 4])
@@ -1916,8 +1950,8 @@ def _host_pool(shard_rank, device_pages=32):
     # These tiny CPU fixtures test ownership, not the machine's free-RAM budget.
     with (
         unittest.mock.patch(
-            "sglang.srt.mem_cache.pool_host.base.host_memory_budget_bytes",
-            side_effect=lambda requested: requested,
+            "sglang.srt.mem_cache.pool_host.base.host_memory_preflight",
+            side_effect=lambda lengths, *args: (sum(lengths), sum(lengths)),
         ),
         unittest.mock.patch(
             "sglang.srt.mem_cache.pool_host.common.alloc_mmap",
@@ -2127,6 +2161,7 @@ class TestOwnerMatchedLoadBack(CustomTestCase):
         host = _host_pool(0).alloc(5 * PS, start_owner=2)
         controller = SimpleNamespace(
             mem_pool_device_allocator=_make_allocator(),
+            kv_storage=None,
             device="cpu",
             load_queue=[],
             _resolve_device_transfers=lambda *args, **kwargs: None,
