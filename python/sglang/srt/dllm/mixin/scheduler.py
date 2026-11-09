@@ -386,6 +386,13 @@ class SchedulerDllmMixin:
         incoming request to re-prefill once the stall clears. One victim per
         stalled round: if its KV does not unstick the next round, that round
         fires again.
+
+        A victim that holds the pool alone and stalls again with no committed
+        progress since its previous stall retraction can never fit: the
+        admission budgets already count evictable cache, so the retraction
+        replays to the identical refusal. Abort it (mirroring retract_decode's
+        even-the-last-request-cannot-fit abort) instead of retracting and
+        re-prefilling it forever.
         """
         if staging_result != AddReqResult.NO_TOKEN or running_batch.reqs:
             return
@@ -394,34 +401,49 @@ class SchedulerDllmMixin:
             return
         order = ScheduleBatch._get_decode_retraction_order(victims)
         victim = victims[order[-1]]
+        committed_len = len(victim.origin_input_ids) + len(victim.output_ids)
+        repeat_stall = (
+            len(victims) == 1 and victim.dllm_stall_retract_committed == committed_len
+        )
         # The retraction resets the request's dLLM progress
         # (`Req.reset_dllm_progress`): the unresolved block, re-stageable only
         # on top of the KV released here, is dropped and redone after the
         # re-prefill, and the phase goes back to incoming, so the request
-        # re-matches the cache and re-initializes its fill ids. It stays in
-        # the dLLM waiting queue.
-        if release_req(
+        # re-matches the cache and re-initializes its fill ids. A requeued
+        # victim stays in the dLLM waiting queue.
+        resumable = release_req(
             req=victim,
             remaing_req_count=1,
             tree_cache=self.tree_cache,
             request_retirer=self.request_retirer,
-        ):
+        )
+        if resumable and not repeat_stall:
+            victim.dllm_stall_retract_committed = committed_len
             logger.warning(
                 "dLLM staging stalled: retained rows hold the KV pool and no "
                 f"row could be admitted. Retracted {victim.rid} to free its KV."
             )
         else:
-            victim.request_finish(
-                FINISH_ABORT(
+            if repeat_stall:
+                reason = FINISH_ABORT(
+                    "Out of memory: the request stalled the dLLM staging gate "
+                    "again with the KV pool to itself, so it cannot fit even "
+                    "alone. Aborting the request.",
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+                detail = "stalled again holding the pool alone"
+            else:
+                reason = FINISH_ABORT(
                     unresumable_abort_message(),
                     status_code=HTTPStatus.SERVICE_UNAVAILABLE,
                 )
-            )
-            # Leaves the dLLM waiting queue there.
+                detail = "cannot be resumed"
+            victim.request_finish(reason)
+            # Takes the victim out of the dLLM waiting queue.
             self.request_retirer.abort_retracted(victim, reason=victim.to_finish)
             logger.warning(
-                "dLLM staging stalled and the retained request cannot be "
-                f"resumed. Aborted {victim.rid} to free its KV."
+                "dLLM staging stalled and the retained request "
+                f"{detail}. Aborted {victim.rid} to free its KV."
             )
 
     def _update_state_for_batch(

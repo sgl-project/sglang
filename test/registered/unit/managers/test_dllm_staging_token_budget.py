@@ -36,7 +36,9 @@ Hardenings on top:
   whole pool, so every round refuses every row, admits nothing, and nothing
   ever resolves or frees KV. A zero-admission round with a capacity refusal
   (and no in-flight batch) retracts one retained row — picked by the standard
-  decode-retraction order — to fund the next round.
+  decode-retraction order — to fund the next round. A sole holder that stalls
+  again without committed progress can never fit and is aborted instead of
+  thrashing through retract/re-prefill forever.
 
 The capped fallback and whole-block rounding only apply to the classic dLLM
 staging path; separate-context-encoding models keep upstream's fallback, whose
@@ -429,6 +431,7 @@ class _StubStallReq:
         self.dllm_incomplete_ids = array("q", [7] * 4)
         self.dllm_algo_state = object()
         self.dllm_phase = DllmReqPhase.STAGING_DECODE
+        self.dllm_stall_retract_committed = None
         self.reset_calls = 0
         self.to_finish = None
 
@@ -603,6 +606,61 @@ class TestDllmStagingStallBreaker(CustomTestCase):
             scheduler.request_retirer.aborted, [(victim, victim.to_finish)]
         )
         self.assertNotIn(victim, list(scheduler.dllm_manager.waiting_queue))
+
+    def test_sole_holder_aborts_after_a_no_progress_repeat_stall(self):
+        from http import HTTPStatus
+
+        # A sole holder that stalls again with no committed progress since its
+        # previous stall retraction can never fit (the admission budgets
+        # already count evictable cache), so the second firing aborts it
+        # instead of looping retract/re-prefill forever.
+        victim = _StubStallReq(rid="oversized", holds_kv=True, output_len=4)
+        scheduler = self._scheduler([victim])
+
+        self._fire(scheduler)
+        self.assertEqual(scheduler.request_retirer.retracted, [victim])
+        self.assertEqual(scheduler.request_retirer.aborted, [])
+
+        # Re-admitted, re-prefilled to the same point, stalled again.
+        victim.kv.holds_kv = True
+        self._fire(scheduler)
+
+        self.assertIsNotNone(victim.to_finish)
+        self.assertEqual(victim.to_finish.status_code, HTTPStatus.INTERNAL_SERVER_ERROR)
+        self.assertEqual(
+            scheduler.request_retirer.aborted, [(victim, victim.to_finish)]
+        )
+        self.assertNotIn(victim, list(scheduler.dllm_manager.waiting_queue))
+
+    def test_sole_holder_with_progress_is_retracted_again(self):
+        # Committed progress between the two stalls proves the loop
+        # terminates (each resolved block commits tokens until max_new_tokens
+        # or finish), so the breaker keeps retracting instead of aborting.
+        victim = _StubStallReq(rid="slow", holds_kv=True, output_len=4)
+        scheduler = self._scheduler([victim])
+
+        self._fire(scheduler)
+        victim.kv.holds_kv = True
+        victim.output_ids.extend(range(8))
+        self._fire(scheduler)
+
+        self.assertEqual(scheduler.request_retirer.retracted, [victim, victim])
+        self.assertEqual(scheduler.request_retirer.aborted, [])
+
+    def test_repeat_stall_keeps_retracting_while_other_holders_remain(self):
+        # With more than one holder the stall is not self-inflicted: freeing
+        # the other rows can still unstick the victim, so an unchanged
+        # committed length is no proof it cannot fit.
+        victim = _StubStallReq(rid="small", holds_kv=True, output_len=0)
+        other = _StubStallReq(rid="big", holds_kv=True, output_len=16)
+        scheduler = self._scheduler([victim, other])
+
+        self._fire(scheduler)
+        victim.kv.holds_kv = True
+        self._fire(scheduler)
+
+        self.assertEqual(scheduler.request_retirer.retracted, [victim, victim])
+        self.assertEqual(scheduler.request_retirer.aborted, [])
 
     def test_retraction_funds_the_next_rounds_admission(self):
         # The loop the breaker exists to close, at unit scope: the stalled
