@@ -73,6 +73,7 @@ def _make_experts(seed: int):
         num_experts=NUM_EXPERTS,
         num_local_experts=NUM_LOCAL,
         moe_ep_rank=FIRST_EXPERT // NUM_LOCAL,
+        use_cuda_mxfp4_decode_moe=False,
     )
     quant_info = flashinfer_trtllm.FlashInferTrtllmGenMxfp4MoeQuantInfo(
         w13_weight=w13,

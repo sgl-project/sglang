@@ -28,6 +28,10 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.models.deepseek_common.utils import quant_blocks_shared_experts_fusion
+from sglang.srt.models.minimax_common.minimax_weight_loader import (
+    mxfp8_linear_scale_alias,
+    remap_llm_compressor_nvfp4_expert,
+)
 from sglang.srt.models.minimax_m3 import (
     MiniMaxM3Model,
     MiniMaxM3SparseForCausalLM,
@@ -428,6 +432,16 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
         ):
             return
 
+        # minimax_m3_nvfp4 reads weight_global_scale itself; remapping it inverts the scale twice.
+        # The Quark remap and scale alias are ROCm-only, like Quark's MXFP8 loading.
+        if (
+            _is_hip
+            and self.quant_config is not None
+            and self.quant_config.get_name() == "quark"
+            and "mlp.experts." in name
+        ):
+            name, loaded_weight = remap_llm_compressor_nvfp4_expert(name, loaded_weight)
+
         for param_name, weight_name, shard_id in llm_stacked_params_mapping:
             if weight_name not in name:
                 continue
@@ -436,6 +450,8 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
             new_name = name.replace(weight_name, param_name)
             if new_name.endswith(".bias") and new_name not in params_dict:
                 continue
+            if _is_hip:
+                new_name = mxfp8_linear_scale_alias(new_name, params_dict)
             if new_name not in params_dict:
                 continue
             param = params_dict[new_name]
@@ -468,6 +484,8 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
         remapped = maybe_remap_kv_scale_name(name, params_dict)
         if remapped is None:
             return
+        if _is_hip:
+            remapped = mxfp8_linear_scale_alias(remapped, params_dict)
         if remapped not in params_dict:
             logger.warning(f"Parameter {remapped} not found in params_dict")
             return

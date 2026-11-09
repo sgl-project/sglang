@@ -265,6 +265,35 @@ SGL_DEVICE void store_as(void* ptr, std::type_identity_t<T> val, int64_t offset 
   static_cast<T*>(ptr)[offset] = val;
 }
 
+/**
+ * \brief Assert that `ptr` points to global memory and return it.
+ * \note After inline asm with a memory clobber (e.g. the PDL wait), nvcc 13.x loses
+ * the global address space of `__grid_constant__` pointer fields and lowers their loads
+ * to generic `LD.E` (a 32-byte load splits into two `LD.E.128`). Call this on the
+ * pointer right before the access, after the asm. nvcc 13.4 honors the hint on sm_100+
+ * and ignores it on sm_90a.
+ */
+template <typename T>
+SGL_DEVICE T* assume_global(T* ptr) {
+#ifndef USE_ROCM
+  __builtin_assume(__isGlobal(ptr));
+#endif
+  return ptr;
+}
+
+/**
+ * \brief Assert that `ptr` points to shared memory and return it.
+ * \note The shared-memory counterpart of `assume_global`, e.g. for a shared pointer
+ * routed through a shuffle; same arch support (nvcc 13.4: sm_100+ only).
+ */
+template <typename T>
+SGL_DEVICE T* assume_shared(T* ptr) {
+#ifndef USE_ROCM
+  __builtin_assume(__isShared(ptr));
+#endif
+  return ptr;
+}
+
 /// \brief Safe void-pointer arithmetic (byte-level by default).
 namespace pointer {
 
