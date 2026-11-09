@@ -16,7 +16,7 @@ register_npu_ci(
     disabled="accuracy testcase",
 )
 
-GLM_5_3_PCP_EPLB_PD_SEP_PREFILL_ENVS = {
+GLM_5_3_PCP_PD_SEP_PREFILL_ENVS = {
     "ASCEND_MF_TRANSFER_PROTOCOL": "sdma",
     "SGLANG_SET_CPU_AFFINITY": "1",
     "TRANSFORMERS_VERBOSITY": "error",
@@ -28,7 +28,7 @@ GLM_5_3_PCP_EPLB_PD_SEP_PREFILL_ENVS = {
     "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
     "TASK_QUEUE_ENABLE": "2",
     "ENABLE_PROFILING": "0",
-    "DEEPEP_HCCL_BUFFSIZE": "2500",
+    # "DEEPEP_HCCL_BUFFSIZE": "2500",
     "SGLANG_PP_LAYER_PARTITION": "18,20,24,16",
     # "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "128",
     # "SGLANG_ENABLE_SPEC_V2": "1",
@@ -39,7 +39,7 @@ GLM_5_3_PCP_EPLB_PD_SEP_PREFILL_ENVS = {
     "GLOO_SOCKET_IFNAME": NIC_NAME,
 }
 
-GLM_5_3_PCP_EPLB_PD_SEP_DECODE_ENVS = {
+GLM_5_3_PCP_PD_SEP_DECODE_ENVS = {
     "ASCEND_MF_TRANSFER_PROTOCOL": "sdma",
     "SGLANG_SET_CPU_AFFINITY": "1",
     "TRANSFORMERS_VERBOSITY": "error",
@@ -51,7 +51,7 @@ GLM_5_3_PCP_EPLB_PD_SEP_DECODE_ENVS = {
     # "SGLANG_SPEC_ENABLE_OVERLAP_REFLOW": "1",
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
     "SGLANG_ENABLE_SPEC_V2": "1",
-    "DEEPEP_HCCL_BUFFSIZE": "1600",
+    # "DEEPEP_HCCL_BUFFSIZE": "1600",
     "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "16",
     "TASK_QUEUE_ENABLE": "0",
     # "SGLANG_NPU_USE_MULTI_STREAM": "1",
@@ -59,7 +59,7 @@ GLM_5_3_PCP_EPLB_PD_SEP_DECODE_ENVS = {
     "GLOO_SOCKET_IFNAME": NIC_NAME,
 }
 
-GLM_5_3_PCP_EPLB_PD_SEP_PREFILL_ARGS = [
+GLM_5_3_PCP_PD_SEP_PREFILL_ARGS = [
     "--disaggregation-mode",
     "prefill",
     "--nnodes",
@@ -98,9 +98,9 @@ GLM_5_3_PCP_EPLB_PD_SEP_PREFILL_ARGS = [
     "--context-length",
     220000,
     "--moe-a2a-backend",
-    "deepep",
-    "--deepep-mode",
-    "normal",
+    "ascend_ops",
+    "--moe-ascend-ops-config",
+    '{"prefill": "alltoallv", "decode": "low_latency"}',
     "--disable-shared-experts-fusion",
     "--disable-cuda-graph",
     "--dtype",
@@ -131,12 +131,12 @@ GLM_5_3_PCP_EPLB_PD_SEP_PREFILL_ARGS = [
     "--ep-num-redundant-experts",
     16,
     "--eplb-rebalance-num-iterations",
-    10000,
+    100000,
     "--expert-distribution-recorder-buffer-size",
     50,
 ]
 
-GLM_5_3_PCP_EPLB_PD_SEP_DECODE_ARGS = [
+GLM_5_3_PCP_PD_SEP_DECODE_ARGS = [
     "--disaggregation-mode",
     "decode",
     "--nnodes",
@@ -166,9 +166,9 @@ GLM_5_3_PCP_EPLB_PD_SEP_DECODE_ARGS = [
     "glm47",
     "--enable-metrics",
     "--moe-a2a-backend",
-    "deepep",
-    "--deepep-mode",
-    "low_latency",
+    "ascend_ops",
+    "--moe-ascend-ops-config",
+    '{"prefill": "alltoallv", "decode": "low_latency"}',
     "--cuda-graph-max-bs-decode",
     8,
     "--disaggregation-transfer-backend",
@@ -205,12 +205,12 @@ GLM_5_3_PCP_EPLB_PD_SEP_DECODE_ARGS = [
     1000,
 ]
 
-GLM_5_3_PCP_EPLB_PD_SEP_MODEL_CONFIG = {
+GLM_5_3_PCP_PD_SEP_MODEL_CONFIG = {
     "model_path": GLM_5_3_W8A8_MODEL_PATH,
-    "prefill_args": GLM_5_3_PCP_EPLB_PD_SEP_PREFILL_ARGS,
-    "decode_args": GLM_5_3_PCP_EPLB_PD_SEP_DECODE_ARGS,
-    "prefill_envs": GLM_5_3_PCP_EPLB_PD_SEP_PREFILL_ENVS,
-    "decode_envs": GLM_5_3_PCP_EPLB_PD_SEP_DECODE_ENVS,
+    "prefill_args": GLM_5_3_PCP_PD_SEP_PREFILL_ARGS,
+    "decode_args": GLM_5_3_PCP_PD_SEP_DECODE_ARGS,
+    "prefill_envs": GLM_5_3_PCP_PD_SEP_PREFILL_ENVS,
+    "decode_envs": GLM_5_3_PCP_PD_SEP_DECODE_ENVS,
     "router_args": [
         "--policy",
         "round_robin",
@@ -226,11 +226,11 @@ GLM_5_3_PCP_EPLB_PD_SEP_MODEL_CONFIG = {
 # PCP variant with EPLB
 # 4-node PD separation, prefill tp8 + attn-cp8 (interleave) + pp4,
 # decode tp32/dp32/ep32, EPLB enabled on both P and D with GLM-5.3-w8a8
-# MoE A2A backend: deepep (prefill=normal, decode=low_latency) on both P and D
-class TestNPUGLM5_3_W8A8_2P2D_PCP_EPLB_GPQA(TestNpuAccuracyMultiNodePdSepTestCaseBase):
+# MoE A2A backend: ascend_ops (prefill=alltoallv, decode=low_latency) on both P and D
+class TestNPUGLM5_3_W8A8_2P2D_PCP_GPQA(TestNpuAccuracyMultiNodePdSepTestCaseBase):
     """Test NPU accuracy for GLM-5.3-w8a8 PD separation 2p2d with PCP and EPLB on gpqa_diamond"""
 
-    model_config = GLM_5_3_PCP_EPLB_PD_SEP_MODEL_CONFIG
+    model_config = GLM_5_3_PCP_PD_SEP_MODEL_CONFIG
     # Run evalscope only once (no retry on accuracy miss)
     max_retries = 1
     accuracy = 0.912
@@ -248,7 +248,7 @@ class TestNPUGLM5_3_W8A8_2P2D_PCP_EPLB_GPQA(TestNpuAccuracyMultiNodePdSepTestCas
         "top_p": 0.95,
     }
 
-    def test_npu_glm_5_3_w8a8_2p2d_pcp_eplb_gpqa(self):
+    def test_npu_glm_5_3_w8a8_2p2d_pcp_gpqa(self):
         """Run NPU accuracy test for GLM-5.3-w8a8 PD separation 2p2d with PCP and EPLB on gpqa_diamond"""
         self.run_accuracy()
 
