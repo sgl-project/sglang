@@ -325,3 +325,18 @@ Runtime changes should also be validated in a matching official SGLang image
 with both `OFFLINE` and `BLOCKING` modes. Predictor changes should report
 step-level error, and scheduler or cache changes should compare request latency,
 throughput, and prefix-cache reuse against measured traces.
+
+### Explicit CPU bootstrap
+
+CPU compatibility is active only when both `SGLANG_SIMULATOR_BOOTSTRAP=1`
+and `SGLANG_USE_CPU_ENGINE=1` are set by the simulator worker entry point.
+It keeps native quantization configuration validation, while avoiding physical
+accelerator discovery and import-time AITER loading for dummy model execution.
+Without both flags, the CPU bootstrap wrappers remain inactive. The separate
+Quark change defers its optional AITER import until the quantization call in all
+execution modes; that call keeps its original arguments, result and dependency
+error. This changes import timing without replacing the quantizer.
+
+The CPU pool plumbing translates an explicit logical token capacity to the
+native pool byte budget. Its bounded search rejects unreachable layouts rather
+than spinning indefinitely, preserving native sizing and rounding.
