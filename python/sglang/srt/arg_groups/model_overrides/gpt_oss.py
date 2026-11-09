@@ -11,12 +11,8 @@ from sglang.srt.arg_groups.model_override_base import (
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils.common import (
-    get_nvidia_driver_version,
-    is_cpu,
-    is_mps,
-    is_triton_kernels_available,
-)
+from sglang.srt.utils.device import get_nvidia_driver_version, is_cpu, is_mps
+from sglang.srt.utils.triton_utils import is_triton_kernels_available
 
 logger = logging.getLogger(__name__)
 

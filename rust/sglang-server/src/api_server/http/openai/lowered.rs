@@ -19,11 +19,12 @@ use sglang_processor::openai::{
 };
 use sglang_processor::{DynamoTokenizer, TemplateArgs, TemplateError};
 
+use super::super::dp_relay::HintRoute;
 use super::super::request_headers::apply_header_overrides;
 use super::chat::ChatBody;
 use super::template::RenderedChat;
 use super::{AppState, ChatFormatter};
-use crate::api_server::core::CoreError;
+use crate::api_server::core::{CoreError, OpenAiRequest, ReceivedAs};
 use crate::api_server::http::native_api::{
     GenerateItem, RequestState, RequestTiming, drain_unary_frame, generate_requests,
     generation_event_stream_with,
@@ -102,6 +103,7 @@ impl OpenAiChat {
                         .map(|(k, v)| (k.clone(), v.clone()))
                         .collect(),
                 ),
+                enable_cache_report: server_args.enable_cache_report,
                 incremental_streaming_output: server_args.incremental_streaming_output,
                 reasoning_parser: server_args.reasoning_parser.clone(),
                 served_model_name: Some(server_args.served_model_name.clone()),
@@ -164,6 +166,10 @@ pub(super) async fn chat(
         .into_iter()
         .any(|name| header(name).as_deref() == Some("1"));
     let (mut generate, mut responder) = lower(state, body.clone(), routing_key, sglext_ids).await?;
+    // Python logs the request once it validates, before adapting it.
+    state
+        .core
+        .log_openai_request(OpenAiRequest::ChatCompletion, body, headers);
 
     let stream = generate["stream"] == true;
     if let Err(error) = copy_prompt_per_choice(&mut generate) {
@@ -176,6 +182,16 @@ pub(super) async fn chat(
         // `apply_header_overrides` raises `HTTPException(400)`, typed by its status.
         return Some(typed_error_response(StatusCode::BAD_REQUEST, "400", &error));
     }
+    // Below the override header, `X-Data-Parallel-Rank` names the DP rank.
+    match HintRoute::ChatCompletions
+        .header_rank(headers, state.server_args.enable_request_header_overrides)
+    {
+        Ok(Some(rank)) => generate["routed_dp_rank"] = rank.into(),
+        Ok(None) => {}
+        Err(error) => {
+            return Some(typed_error_response(StatusCode::BAD_REQUEST, "400", &error));
+        }
+    }
     // Failures before the first frame answer unary even for a stream: Python
     // awaits the first chunk before it starts the stream.
     let (requests, is_batch) = match generate_requests(state, generate) {
@@ -185,9 +201,10 @@ pub(super) async fn chat(
     let timing = RequestTiming::new();
     let request_states: Vec<RequestState> = requests
         .iter()
-        .map(|request| RequestState::new(state, request, timing.clone()))
+        .map(|request| RequestState::new(state, request, headers, None, timing.clone()))
         .collect();
-    let calls: Vec<_> = match state.core.generate_batch(requests).await {
+    let received = ReceivedAs::Typed(state.core.logged_headers(headers));
+    let calls: Vec<_> = match state.core.generate_batch(requests, received).await {
         Ok(calls) => calls.into_iter().zip(request_states).collect(),
         Err(error) => return Some(error_response(error.http_status(), &error.to_string())),
     };
@@ -457,7 +474,7 @@ mod tests {
 
     use super::super::test_utils::{
         answering_app_state_with, answering_app_state_with_item, body_json, checkpoint_formatter,
-        chunk, oneshot, post_json,
+        chunk, oneshot, post_json, with_cached_tokens,
     };
     use super::*;
     use crate::message::response::{ChunkExtras, ResponseItem};
@@ -785,6 +802,52 @@ mod tests {
                 .unwrap();
             let text = String::from_utf8(bytes.to_vec()).unwrap();
             assert!(text.contains(r#""logprob":-0.5"#), "{text}");
+        }
+    }
+
+    /// `--enable-cache-report` reports the prompt's cached tokens, unary and
+    /// streamed, and a zero count rather than none, as Python does.
+    #[tokio::test]
+    async fn cache_report_reports_cached_tokens() {
+        let messages = json!([{"role": "user", "content": "hi"}]);
+        for enable_cache_report in [false, true] {
+            for cached in [0, 3] {
+                let args = ServerArgs {
+                    enable_cache_report,
+                    ..Default::default()
+                };
+                let app = lowered_state_with(args, move |rid| {
+                    with_cached_tokens(chunk(rid, "ok", true), cached)
+                });
+                let expected = enable_cache_report.then(|| json!({"cached_tokens": cached}));
+                let body = json!({"model": "model", "messages": messages});
+                let value =
+                    body_json(post_json(app.clone(), "/v1/chat/completions", body).await).await;
+                let details = Some(value["usage"]["prompt_tokens_details"].clone())
+                    .filter(|details| !details.is_null());
+                assert_eq!(details, expected, "unary: {value}");
+
+                let body = json!({
+                    "model": "model",
+                    "messages": messages,
+                    "stream": true,
+                    "stream_options": {"include_usage": true},
+                });
+                let response = post_json(app, "/v1/chat/completions", body).await;
+                let bytes = axum::body::to_bytes(response.into_body(), 1 << 16)
+                    .await
+                    .unwrap();
+                let text = String::from_utf8(bytes.to_vec()).unwrap();
+                let usage = text
+                    .split("\n\n")
+                    .filter_map(|event| event.strip_prefix("data: "))
+                    .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+                    .find_map(|chunk| chunk.get("usage").filter(|u| !u.is_null()).cloned())
+                    .unwrap_or_else(|| panic!("no usage chunk: {text}"));
+                let details = Some(usage["prompt_tokens_details"].clone())
+                    .filter(|details| !details.is_null());
+                assert_eq!(details, expected, "streamed: {text}");
+            }
         }
     }
 

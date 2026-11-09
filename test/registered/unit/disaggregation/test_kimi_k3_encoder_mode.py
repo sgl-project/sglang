@@ -20,10 +20,10 @@ from sglang.srt.disaggregation.encoder.receiver import (
     WaitingZmqRequest,
 )
 from sglang.srt.disaggregation.encoder.server import MMEncoder
-from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.managers.tokenizer_manager import (
     _reject_missing_dispatched_encoder_embedding,
 )
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.test.ci.ci_register import register_cpu_ci
 

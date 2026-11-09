@@ -7,11 +7,7 @@ from functools import partial
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalProcessorOutput,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
 from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
 from sglang.srt.multimodal.deepseek_v41_image_processing import (
     GPU_PLAN_KEY,
@@ -20,6 +16,7 @@ from sglang.srt.multimodal.deepseek_v41_image_processing import (
     patchify_image_rust,
     prepare_image_gpu,
 )
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,

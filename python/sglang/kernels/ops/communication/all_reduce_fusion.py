@@ -26,11 +26,10 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils import (
     cache_once,
-    get_jit_cuda_arch,
     is_arch_support_pdl,
-    is_hip_runtime,
     load_jit,
     make_cpp_args,
 )
@@ -122,7 +121,7 @@ def fits_push_slot(max_push_size: int, num_tokens: int, hidden_dim: int) -> bool
 
 
 def require_cluster_launch_arch() -> None:
-    if is_hip_runtime() or get_jit_cuda_arch().major < 9:
+    if not current_arch().is_sm_at_least(9):
         raise RuntimeError(
             "fused all-reduce cluster kernels require CUDA SM90 or newer"
         )

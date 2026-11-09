@@ -11,6 +11,10 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
+    ListKind,
+)
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -24,8 +28,9 @@ class TestEmptyBatchFullLatch(CustomTestCase):
         s = Scheduler.__new__(Scheduler)
         s.grammar_manager = SimpleNamespace(has_waiting_grammars=lambda: False)
         s.enable_priority_preemption = False
-        s.waiting_queue = [SimpleNamespace(rid="req-0")]
-        s.chunked_req = None
+        s.waiting_queue = IndexedReqList(ListKind.WAITING)
+        s.waiting_queue.join([SimpleNamespace(rid="req-0")])
+        s.chunked_reqs = IndexedReqList(ListKind.CHUNKED)
         s.min_free_slots_delayer = None
         s.get_num_allocatable_reqs = Mock(return_value=8)
         s.processed_tokens_counter = 0
