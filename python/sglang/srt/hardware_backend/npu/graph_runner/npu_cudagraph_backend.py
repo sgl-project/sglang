@@ -109,6 +109,12 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
             MultiLayerEagleDraftExtendCudaGraphRunner,
         )
 
+        if (
+            self._decode_runner.model_runner.kv_cache_configurator.modelslim_cache_layout
+            is not None
+        ):
+            return "actual_seq_kvlen"
+
         # FIA V1 uses actual_seq_lengths_kv; FIA V2 uses actual_seq_kvlen.
         # Check specialized runners before their common decode base class.
         runner_update_attrs = (
@@ -473,10 +479,14 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
                     "CPU sequence lengths."
                 )
             hf_config = runner.model_runner.model_config.hf_config
+            needs_cpu_seq_lens = getattr(
+                getattr(runner, "attn_backend", None), "needs_cpu_seq_lens", True
+            )
             # The old multi-layer runner always updated Host lengths. Preserve
             # that contract independently of the generic DSA/V4 opt-out.
-            if is_multi_layer_draft_extend or not (
-                is_deepseek_dsa(hf_config) or is_deepseek_v4(hf_config)
+            if is_multi_layer_draft_extend or (
+                needs_cpu_seq_lens
+                and not (is_deepseek_dsa(hf_config) or is_deepseek_v4(hf_config))
             ):
                 # The EAGLE draft check must precede the decode fallback:
                 # EAGLEDraftCudaGraphRunner also subclasses

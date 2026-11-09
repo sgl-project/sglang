@@ -1,4 +1,4 @@
-{"name": "float_park_and_recentre", "chain": "tri", "page_size": 16, "lazy": true, "ops": [
+{"name": "float_park_and_recentre", "chain": "tri", "page_size": 16, "ops": [
   {"op": "extend", "req": 0, "n": 64},
   {"op": "extend", "req": 1, "n": 64},
   {"op": "extend", "req": 2, "n": 64},

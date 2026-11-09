@@ -2,7 +2,15 @@ from __future__ import annotations
 
 import logging
 import weakref
-from typing import TYPE_CHECKING, Dict, List, NamedTuple, Optional, Tuple, Union
+from typing import (
+    TYPE_CHECKING,
+    Dict,
+    List,
+    NamedTuple,
+    Optional,
+    Tuple,
+    Union,
+)
 
 import torch
 
@@ -39,7 +47,11 @@ else:
 from sglang.srt.configs.model_config import dsa_layer_skips_topk, is_deepseek_dsa
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.managers.scheduler_components.request_list import ListKind
+from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
+    ListKind,
+    ReqList,
+)
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
     HiSparseTokenToKVPoolAllocator,
@@ -666,7 +678,9 @@ class HiSparseCoordinator:
 
         self.write_staging_stream = device_module.Stream()
         self.decode_backup_stream = device_module.Stream()
-        self.ack_staging_queue: List[HiSparseAct] = []
+        self.ack_staging_queue = IndexedReqList(
+            ListKind.HISPARSE_STAGING, req_of=lambda x: x.req
+        )
         self.decode_producer_stream = None
         self._backup_done_event = device_module.Event()
         self._has_pending_backup = False
@@ -874,7 +888,7 @@ class HiSparseCoordinator:
             if device_indices.is_cuda:
                 device_indices.record_stream(self.write_staging_stream)
 
-        self.ack_staging_queue.append(HiSparseAct(start_event, finish_event, req))
+        self.ack_staging_queue.join([HiSparseAct(start_event, finish_event, req)])
 
     def admit_request_direct(self, req: Req) -> None:
         """Direct-to-host path: KV data already resides in host pool via RDMA.
@@ -1058,19 +1072,17 @@ class HiSparseCoordinator:
         reserved_positions = (seq_lens - 1).clamp(max=self.device_buffer_size)
         return self.req_to_device_buffer[req_pool_indices, reserved_positions]
 
-    def request_lists(self) -> Dict[ListKind, List[Req]]:
-        return {ListKind.HISPARSE_STAGING: [act.req for act in self.ack_staging_queue]}
-
-    def has_ongoing_staging(self) -> bool:
-        return len(self.ack_staging_queue) > 0
+    def request_lists(self) -> Dict[ListKind, ReqList]:
+        return {ListKind.HISPARSE_STAGING: self.ack_staging_queue}
 
     def collect_ready_reqs(self) -> List[Req]:
         ready_reqs: List[Req] = []
         if len(self.ack_staging_queue) == 0:
             return ready_reqs
 
+        staged = list(self.ack_staging_queue.items())
         finish_count = 0
-        for _, finish_event, _ in self.ack_staging_queue:
+        for _, finish_event, _ in staged:
             if not finish_event.query():
                 break
             finish_count += 1
@@ -1083,13 +1095,12 @@ class HiSparseCoordinator:
                 group=self.tp_group,
             )
         finish_count = int(queue_size.item())
-        while finish_count > 0:
-            _, _, req = self.ack_staging_queue.pop(0)
+        for _, _, req in staged[:finish_count]:
+            self.ack_staging_queue.leave([req])
             # prepare device buffer and update req
             self.alloc_device_buffer(req)
             self._skip_first_backup[req.kv.req_pool_idx] = True
             req.hisparse_staging = False
-            finish_count -= 1
             ready_reqs.append(req)
         return ready_reqs
 
@@ -1364,16 +1375,10 @@ class HiSparseCoordinator:
 
         return top_k_indices
 
-    def abort_staging_request(self, req: Req) -> None:
-        """Remove a request from the staging queue and free its host + device resources.
-
-        Must be called when aborting a request that has been admitted into staging
-        but has not yet completed (i.e. req.hisparse_staging is True).
-        """
+    def _release_staging(self, req: Req) -> None:
+        """Remove a request from the staging queue and free its host + device resources."""
         # Remove from staging queue
-        self.ack_staging_queue = [
-            act for act in self.ack_staging_queue if act.req is not req
-        ]
+        self.ack_staging_queue.leave([req])
         # Wait for any in-flight staging DMA to complete before freeing
         self.write_staging_stream.synchronize()
 
@@ -1397,13 +1402,12 @@ class HiSparseCoordinator:
         self.spec_swap.free_unrotated_scratch(req.kv.req_pool_idx)
         req.hisparse_staging = False
 
-    def retract_req(self, req: Req) -> None:
+    def release_request(self, req: Req):
+        """Free what a request holds here, whether finished, aborted or retracted."""
         if req.hisparse_staging:
-            self.abort_staging_request(req)
-        else:
-            self.request_finished(req)
+            self._release_staging(req)
+            return
 
-    def request_finished(self, req: Req):
         # release resources only after the execution of a potential overlapped batch
         if self.decode_producer_stream is not None:
             device_module.current_stream().wait_stream(self.decode_producer_stream)
