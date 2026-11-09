@@ -2691,5 +2691,37 @@ def test_wan_text_kv_lives_for_one_loop_of_one_request():
         assert gone() is None
 
 
+@torch.inference_mode()
+def test_flux2_reference_kv_isolation_and_reuse():
+    """Cached reference rows must match full attention with an isolation mask."""
+    torch.manual_seed(73)
+    q, k, v = [torch.randn(1, 9, 2, 32, device="cuda") for _ in range(3)]
+    num_ref = 3
+
+    def attention(q, k, v, **kwargs):
+        return F.scaled_dot_product_attention(
+            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), **kwargs
+        ).transpose(1, 2)
+
+    mask = torch.ones(9, 9, device="cuda", dtype=torch.bool)
+    mask[-num_ref:, :-num_ref] = False
+    expected = attention(q, k, v, attn_mask=mask)
+    cache = {}
+    actual = flux2._flux2_reference_attention(attention, q, k, v, num_ref, cache, 0)
+    torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-5)
+
+    # A later step changes the current tokens; references remain independent.
+    q2, k2, v2 = [torch.randn_like(x[:, :-num_ref]) for x in (q, k, v)]
+    full = attention(
+        torch.cat([q2, q[:, -num_ref:]], dim=1),
+        torch.cat([k2, k[:, -num_ref:]], dim=1),
+        torch.cat([v2, v[:, -num_ref:]], dim=1),
+        attn_mask=mask,
+    )
+    reused = flux2._flux2_reference_attention(attention, q2, k2, v2, 0, cache, 0)
+    torch.testing.assert_close(reused, full[:, :-num_ref], atol=1e-6, rtol=1e-5)
+    torch.testing.assert_close(full[:, -num_ref:], expected[:, -num_ref:])
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

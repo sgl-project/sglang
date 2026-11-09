@@ -25,8 +25,12 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
 from sglang.multimodal_gen.configs.pipeline_configs.hunyuan import (
     clip_postprocess_text,
 )
+from sglang.multimodal_gen.configs.sample.sampling_params import quality_allows
 from sglang.multimodal_gen.configs.task_type import ModelTaskType
-from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.distributed import (
+    get_local_torch_device,
+    get_sp_world_size,
+)
 from sglang.multimodal_gen.runtime.utils.vision import preprocess_image
 
 
@@ -876,6 +880,30 @@ class Flux2KleinPipelineConfig(Flux2PipelineConfig):
 
 
 @dataclass
+class Flux2KleinKVCachePipelineConfig(Flux2KleinPipelineConfig):
+    """Klein KV checkpoint: fixed-timestep, isolated reference-image tokens."""
+
+    def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
+        kwargs = super().prepare_pos_cond_kwargs(batch, device, rotary_emb, dtype)
+        if batch.image_latent is not None:
+            if get_sp_world_size() != 1:
+                raise ValueError("FLUX.2 Klein KV image editing requires SP degree 1")
+            kwargs["num_ref_tokens"] = batch.image_latent.shape[1]
+            # Owned by this denoising loop, including its exception/abort path.
+            kwargs["reference_kv_cache"] = (
+                {}
+                if quality_allows(batch.sampling_params.quality, "lossless")
+                else None
+            )
+        return kwargs
+
+    def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
+        # Klein's positive and negative text streams both use 512 positions.
+        # Each CFG branch must own its cache.
+        return self.prepare_pos_cond_kwargs(batch, device, rotary_emb, dtype)
+
+
+@dataclass
 class Flux2KleinBasePipelineConfig(Flux2KleinPipelineConfig):
     # Undistilled Klein base model, with guidance embeddings
     should_use_guidance: bool = True
@@ -916,6 +944,11 @@ def register():
             "black-forest-labs/FLUX.1-dev",
         ],
         model_detectors=[lambda hf_id: "flux.1" in hf_id.lower()],
+    )
+    register_configs(
+        sampling_param_cls=Flux2KleinSamplingParams,
+        pipeline_config_cls=Flux2KleinKVCachePipelineConfig,
+        hf_model_paths=["black-forest-labs/FLUX.2-klein-9b-kv"],
     )
     register_configs(
         sampling_param_cls=Flux2KleinSamplingParams,
