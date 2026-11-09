@@ -42,6 +42,7 @@ def _patch_group(monkeypatch, *, world_size, same_node):
     ],
 )
 def test_topology_capability(monkeypatch, same_node, has_fabric_clique, expected):
+    monkeypatch.setattr(custom_all_reduce_v2, "_is_hip", False)
     world_size = 8 if same_node else 16
     group, device = _patch_group(
         monkeypatch,
@@ -101,6 +102,28 @@ def test_rocm_runtime_gate(monkeypatch, hip_version, expected):
     assert topology_check.called is expected
 
 
+@pytest.mark.parametrize("in_clique", [True, False])
+def test_rocm_multinode_uses_fabric_clique(monkeypatch, in_clique):
+    """A multi-node ROCm group is admitted only by the gfx1250 fabric probe."""
+    from sglang.srt.utils import hip_vmm_utils
+
+    group, device = _patch_group(monkeypatch, world_size=16, same_node=False)
+    monkeypatch.setattr(custom_all_reduce_v2, "_is_hip", True)
+    monkeypatch.setattr(hip_vmm_utils, "hip_runtime_version", lambda: (7, 17, 0))
+    monkeypatch.setattr(
+        custom_all_reduce_v2,
+        "is_one_nvlink_clique",
+        lambda group, device: pytest.fail("ROCm has no NVLink clique to query"),
+    )
+    from sglang.srt.distributed.device_communicators import gfx1250_fabric
+
+    probe = Mock(return_value=in_clique)
+    monkeypatch.setattr(gfx1250_fabric, "probe_fabric_clique", probe)
+
+    assert custom_all_reduce_v2.can_use_custom_all_reduce_v2(group, device) is in_clique
+    probe.assert_called_once_with(group, device)
+
+
 @pytest.mark.parametrize(
     ("disabled", "has_multicast", "nbytes", "num_blocks", "expected"),
     [
@@ -137,6 +160,7 @@ def test_supports_push(disabled, has_multicast, nbytes, num_blocks, expected):
 def test_zero_cluster_uuid_clique_ends_at_its_node(
     monkeypatch, cluster_uuid, peer_host, expected
 ):
+    monkeypatch.setattr(custom_all_reduce_utils, "_is_hip", False)
     monkeypatch.setattr(
         custom_all_reduce_utils, "_gpu_fabric_clique", lambda device: (cluster_uuid, 0)
     )
