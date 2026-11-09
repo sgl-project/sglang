@@ -16,6 +16,9 @@ from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
     DSAPagedMQALogitsBackend,
 )
 from sglang.srt.runtime_context import get_exec
+from sglang.srt.utils import is_npu
+
+_is_npu = is_npu()
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
@@ -45,13 +48,13 @@ class Fp4Indexer(Indexer):
     def _quantize_query(self, query: torch.Tensor, act_quant):
         return query, None
 
-    @torch.compile(dynamic=True)
+    @torch.compile(dynamic=True, disable=_is_npu)
     def _get_logits_head_gate_fp32(self, x, q_scale):
         weights = self._project_head_gates(x)
         weights = weights * self.n_heads**-0.5
         return weights.unsqueeze(-1).float() * self.softmax_scale
 
-    @torch.compile(dynamic=True)
+    @torch.compile(dynamic=True, disable=_is_npu)
     def _apply_q_scale_and_softmax_scale(self, weights: torch.Tensor, q_scale):
         return weights.unsqueeze(-1).float() * self.softmax_scale
 

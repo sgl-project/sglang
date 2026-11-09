@@ -125,12 +125,14 @@ from sglang.srt.utils import (
     is_cuda,
     is_gfx95_supported,
     is_hip,
+    is_npu,
     is_xpu,
     print_warning_once,
 )
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 _IS_GFX95 = is_gfx95_supported()
+_is_npu = is_npu()
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -398,7 +400,7 @@ class DSAMetadata:
     kpool_write_plan: Optional[KPoolWritePlan] = None
 
 
-@torch.compile
+@torch.compile(disable=_is_npu)
 def _compiled_cat(tensors: list[torch.Tensor], dim: int = -1) -> torch.Tensor:
     return torch.cat(tensors, dim=dim)
 
