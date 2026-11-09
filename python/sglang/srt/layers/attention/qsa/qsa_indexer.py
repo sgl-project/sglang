@@ -250,7 +250,11 @@ class QSAIndexer(MultiPlatformOp):
             and compressed_dtype == pool.qsa_compressed_dtype
             and (
                 not state.is_xpu
-                or compressed_dtype in (torch.bfloat16, torch.float8_e4m3fn)
+                or (
+                    compressed_dtype in (torch.bfloat16, torch.float8_e4m3fn)
+                    # The XPU kernel needs a BF16 norm weight like the BF16 ring.
+                    and self.k_layernorm.weight.dtype == torch.bfloat16
+                )
             )
         )
 

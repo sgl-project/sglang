@@ -261,3 +261,11 @@ def test_mrope_forward_xpu_cache_dtype(keep_fp32):
     rope.forward_xpu(positions, query, key)
     expected = torch.float32 if keep_fp32 else torch.bfloat16
     assert rope.cos_sin_cache.dtype == expected
+
+
+def test_fp16_norm_weight_keeps_the_unfused_compression():
+    indexer = make_indexer(interleaved=False)
+    pool = Pool()
+    assert indexer._use_fused_compress(pool)
+    indexer.k_layernorm.weight.data = indexer.k_layernorm.weight.data.half()
+    assert not indexer._use_fused_compress(pool)

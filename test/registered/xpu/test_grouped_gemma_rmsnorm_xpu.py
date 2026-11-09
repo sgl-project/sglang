@@ -19,7 +19,9 @@ _TOLERANCES = {
 
 
 def _reference(x, weight, group_size, eps):
-    x = x.to(torch.float64)
+    # fp64 is not available on every XPU, so the reference runs on the CPU.
+    x = x.cpu().to(torch.float64)
+    weight = weight.cpu()
     hidden = x.shape[-1]
     grouped = x.reshape(*x.shape[:-1], hidden // group_size, group_size)
     variance = grouped.pow(2).mean(dim=-1, keepdim=True)
@@ -37,7 +39,7 @@ def test_matches_reference(dtype, num_tokens, hidden_size, group_size):
     x = torch.randn(num_tokens, hidden_size, dtype=dtype, device="xpu")
     weight = torch.randn(hidden_size, dtype=dtype, device="xpu") * 0.2
     out = grouped_gemma_rmsnorm(x, weight, group_size, 1e-6)
-    expected = _reference(x, weight, group_size, 1e-6).to(dtype)
+    expected = _reference(x, weight, group_size, 1e-6).to(dtype).to("xpu")
     torch.testing.assert_close(out, expected, **_TOLERANCES[dtype])
 
 
@@ -49,7 +51,7 @@ def test_non_contiguous_input(dtype):
     assert not x.is_contiguous()
     weight = torch.randn(10240, dtype=dtype, device="xpu") * 0.2
     out = grouped_gemma_rmsnorm(x, weight, 2560, 1e-6)
-    expected = _reference(x, weight, 2560, 1e-6).to(dtype)
+    expected = _reference(x, weight, 2560, 1e-6).to(dtype).to("xpu")
     torch.testing.assert_close(out, expected, **_TOLERANCES[dtype])
 
 
@@ -62,7 +64,7 @@ def test_out_buffer_is_written_in_place(shape):
     result = grouped_gemma_rmsnorm(x, weight, 2560, 1e-6, out=out)
     assert result.shape == x.shape
     assert result.data_ptr() == out.data_ptr()
-    expected = _reference(x, weight, 2560, 1e-6).to(x.dtype)
+    expected = _reference(x, weight, 2560, 1e-6).to(x.dtype).to("xpu")
     torch.testing.assert_close(out, expected, **_TOLERANCES[x.dtype])
 
 
