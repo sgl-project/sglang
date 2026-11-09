@@ -1,12 +1,12 @@
 """Gate-routing tests for EAGLE verify: sampling vs. greedy (argmax).
 
-Guards the correctness contract of the ROCm fix in
-``eagle_utils._verify_uses_greedy``: on every non-HIP platform the gate must
-reduce byte-for-byte to the pre-patch predicate
-(``is_all_greedy or is_cpu or is_hip or is_xpu``), and HIP may take the
-sampling path only when rejection sampling is on and the batch isn't all-greedy.
-A regression that forced greedy on CUDA, or that let HIP sample without rejection
-sampling, would turn a case here red. Pure-boolean logic, so it runs on CPU CI.
+Guards the correctness contract of ``eagle_utils._verify_uses_greedy``: on CUDA,
+CPU and NPU the gate must reduce byte-for-byte to the original predicate
+(``is_all_greedy or is_cpu or is_hip or is_xpu``); HIP may take the sampling path
+only when rejection sampling is on; XPU only for a top-1 chain (its target-only
+sampler) or with rejection sampling. A regression that forced greedy on CUDA, or
+let HIP/XPU sample through a path they cannot run, would turn a case here red.
+Pure-boolean logic, so it runs on CPU CI.
 """
 
 import itertools
@@ -38,7 +38,7 @@ _PLATFORMS = {
 
 
 class TestEagleGateRouting(CustomTestCase):
-    def _gate(self, is_all_greedy, platform, use_rej):
+    def _gate(self, is_all_greedy, platform, use_rej, tree_topk=1):
         is_cpu, _, is_hip, is_xpu = _PLATFORMS[platform]
         return _verify_uses_greedy(
             is_all_greedy=is_all_greedy,
@@ -46,16 +46,17 @@ class TestEagleGateRouting(CustomTestCase):
             is_hip=is_hip,
             is_xpu=is_xpu,
             use_rejection_sampling=use_rej,
+            tree_topk=tree_topk,
         )
 
     def test_non_hip_is_byte_identical_to_pre_patch(self):
-        for platform, is_all_greedy, use_rej in itertools.product(
-            _PLATFORMS, (False, True), (False, True)
+        for platform, is_all_greedy, use_rej, tree_topk in itertools.product(
+            _PLATFORMS, (False, True), (False, True), (1, 4)
         ):
             is_cpu, _, is_hip, is_xpu = _PLATFORMS[platform]
-            if is_hip:
+            if is_hip or is_xpu:
                 continue
-            got = self._gate(is_all_greedy, platform, use_rej)
+            got = self._gate(is_all_greedy, platform, use_rej, tree_topk)
             expected = _pre_patch_gate(is_all_greedy, is_cpu, is_hip, is_xpu)
             self.assertEqual(
                 got,
@@ -71,6 +72,16 @@ class TestEagleGateRouting(CustomTestCase):
         self.assertTrue(self._gate(True, "hip", True))
         self.assertTrue(self._gate(True, "hip", False))
         self.assertTrue(self._gate(False, "hip", False))
+
+    def test_xpu_samples_top1_chains_or_with_rejection(self):
+        # Target-only Triton chain sampler: top-1 chains sample without rejection sampling.
+        self.assertFalse(self._gate(False, "xpu", False, tree_topk=1))
+        self.assertFalse(self._gate(False, "xpu", True, tree_topk=1))
+        # Tree drafts have no XPU target-only kernel; only rejection sampling samples.
+        self.assertTrue(self._gate(False, "xpu", False, tree_topk=4))
+        self.assertFalse(self._gate(False, "xpu", True, tree_topk=4))
+        for use_rej, tree_topk in itertools.product((False, True), (1, 4)):
+            self.assertTrue(self._gate(True, "xpu", use_rej, tree_topk))
 
     def test_cuda_and_npu_keyed_on_all_greedy_only(self):
         # Both sample whenever the batch isn't all-greedy, regardless of the flag.
