@@ -1101,7 +1101,11 @@ class VisionIntelXPUAttention(nn.Module):
         cu_seqlens_source = cu_seqlens
         cu_seqlens = resolve_seqlens(cu_seqlens_source, bsz, seq_len, device=q.device)
         cu_seqlens = cu_seqlens.to(dtype=torch.int32).to(q.device)
-        max_seqlen = resolve_max_seqlen(cu_seqlens_source, cu_seqlens)
+        max_seqlen = kwargs.get("max_seqlen")
+        if max_seqlen is None:
+            max_seqlen = resolve_max_seqlen(cu_seqlens_source, cu_seqlens)
+        else:
+            max_seqlen = resolve_precomputed_max_seqlen(cu_seqlens, max_seqlen)
 
         fa_kwargs = dict(
             cu_seqlens_q=cu_seqlens,

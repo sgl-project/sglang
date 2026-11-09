@@ -127,6 +127,7 @@ class Qwen3OmniMoeAudioEncoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor,
+        max_seqlen: Optional[int] = None,
         **kwargs,
     ) -> torch.Tensor:
         """
@@ -143,6 +144,7 @@ class Qwen3OmniMoeAudioEncoderLayer(nn.Module):
         hidden_states = self.self_attn(
             x=hidden_states,
             cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
         )
         hidden_states = residual + hidden_states
         residual = hidden_states
@@ -348,6 +350,7 @@ class Qwen3OmniMoeAudioEncoder(PreTrainedModel):
         cu_seqlens = torch.tensor(cu_chunk_lens, device=aftercnn_lens.device).cumsum(
             -1, dtype=torch.int32
         )
+        max_seqlen = max(cu_chunk_lens)
         # cu_seqlens must be on cpu because of npu_flash_attention_unpad operator restriction
         if is_npu():
             cu_seqlens = cu_seqlens.to("cpu")
@@ -356,6 +359,7 @@ class Qwen3OmniMoeAudioEncoder(PreTrainedModel):
             layer_outputs = encoder_layer(
                 hidden_states,
                 cu_seqlens,
+                max_seqlen=max_seqlen,
             )
 
             hidden_states = layer_outputs[0]
