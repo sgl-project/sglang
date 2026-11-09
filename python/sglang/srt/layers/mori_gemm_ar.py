@@ -1084,7 +1084,7 @@ def fused_wo_b_available() -> bool:
     if _disabled:
         return False
     if _switch_on is None:
-        from sglang.srt.utils.common import is_gfx95_supported
+        from sglang.srt.utils.device import is_gfx95_supported
 
         # Stated rather than left to the mxfp8 markers, which only the gfx950
         # routes set today: mori's kernel and its tuning are gfx950's.

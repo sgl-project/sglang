@@ -525,7 +525,7 @@ class TestPlatformGate(CustomTestCase):
             patch.object(mg, "_disabled", False),
             patch.object(mg, "_mori_has_gemm_ar", return_value=True),
             envs.SGLANG_OPT_FUSED_WO_B_AR.override(True),
-            patch("sglang.srt.utils.common.is_gfx95_supported", return_value=False),
+            patch("sglang.srt.utils.device.is_gfx95_supported", return_value=False),
         ):
             self.assertFalse(mg.fused_wo_b_available())
 
