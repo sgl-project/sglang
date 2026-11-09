@@ -11,6 +11,7 @@ import torch
 from flashinfer.prims_ts import gemm as prims_ts_gemm
 from flashinfer.prims_ts.gemm import PrimsTsGemmConfig
 
+from sglang.kernels.arch import current_arch
 from sglang.srt.environ import envs
 
 # (format, epilogue, K, packed N, M bucket) ->
@@ -143,12 +144,13 @@ def flux3_prims_ts_config(
     qkv_scale: bool = False,
 ) -> PrimsTsGemmConfig | None:
     """Return a pinned tactic, or leave selection to FlashInfer autotuning."""
+    cuda = current_arch().cuda
     if x.device.type != "cuda" or envs.SGLANG_ENABLE_FLUX3_PRIMS_TS_AUTOTUNE.get():
         return None
     m = x.numel() // x.shape[-1] if m is None else m
     bucket = next((b for b in (1024, 8192, 10240, 32768, 40960) if m <= b), 40960)
     return _tuned_config(
-        arch=_device_arch(x.device),
+        arch=cuda.sm_version,
         operand_format=operand_format,
         output_format=output_format,
         epilogue=epilogue,
@@ -158,12 +160,6 @@ def flux3_prims_ts_config(
         head_dim=head_dim,
         qkv_scale=qkv_scale,
     )
-
-
-@functools.cache
-def _device_arch(device: torch.device) -> int:
-    major, minor = torch.cuda.get_device_capability(device)
-    return major * 10 + minor
 
 
 # Runs for every GEMM launch: one cached config per shape keeps the host cost to a

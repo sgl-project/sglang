@@ -4,10 +4,12 @@ import dataclasses
 import time
 from abc import ABC, abstractmethod
 from enum import Enum, auto
+from types import MappingProxyType
 from typing import (
     TYPE_CHECKING,
     Any,
     Callable,
+    Mapping,
     NamedTuple,
     Optional,
     Protocol,
@@ -18,6 +20,8 @@ from typing import (
 
 import torch
 
+from sglang.srt.layers.cp.base import is_cp_sharded_padded
+from sglang.srt.layers.cp.utils import from_cp_sharded
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.events import KVCacheEventRecorder
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -58,6 +62,7 @@ class PrefixCacheTrait(Protocol):
     req_to_token_pool: ReqToTokenPool
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
     page_size: int
+    logical_page_size: int
     disable: bool
 
 
@@ -81,6 +86,15 @@ class InsertParams:
 
     # Mamba specific
     mamba_value: Optional[torch.Tensor] = None
+    # Host-only checkpoint: hicache host-pool index. The radix node keeps this
+    # and no GPU slot. Mutually exclusive with mamba_value.
+    mamba_host_value: Optional[torch.Tensor] = None
+    # GPU slot to copy into the host pool. Set by prepare; the copy itself
+    # waits until the insert key is known, so a leaf that already has mamba
+    # never pays the D2H.
+    mamba_host_src: Optional[torch.Tensor] = None
+    # Both mamba values stay empty and the leaf already holds the checkpoint.
+    allow_missing_mamba: bool = False
     # The ping-pong slot prepare picked; cleanup keeps that same slot.
     mamba_keep_idx: Optional[int] = None
 
@@ -151,22 +165,56 @@ class InsertResult:
             ranges.append((start, end))
 
 
+def retained_target_window(
+    req_to_token_pool, allocator, sliding_window_size: Optional[int]
+) -> Optional[int]:
+    """The tail a running request keeps of the target's window (the storage's
+    retained length), or None for a model without a sliding window."""
+    if sliding_window_size is None:
+        return None
+    from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
+
+    return (
+        kv_storage_of(req_to_token_pool, allocator)
+        .retained_window_lengths()
+        .get(window_sub_pool_of(allocator), sliding_window_size)
+    )
+
+
+def window_sub_pool_of(allocator) -> str:
+    """The sub-pool the model's sliding-window layers write: a unified
+    pool's target window, else the static pools' window pool."""
+    storage = getattr(allocator, "storage", None)
+    window = None if storage is None else storage.plan.primary_window()
+    return "swa" if window is None else window.name
+
+
 @dataclasses.dataclass
 class EvictParams:
-    """Unified parameters for evict across different cache types"""
+    """How much to evict: tokens of the token sub-pool, tokens of each window
+    sub-pool by its name, and state entries."""
 
     num_tokens: int = 0
-    swa_num_tokens: int = 0
     mamba_num: int = 0
+    window_num_tokens: dict[str, int] = dataclasses.field(default_factory=dict)
 
 
 @dataclasses.dataclass
 class EvictResult:
-    """Result of an evict operation"""
+    """What an eviction freed: tokens of the token sub-pool, tokens of each
+    window sub-pool by its name, and state entries."""
 
     num_tokens_evicted: int = 0
-    swa_num_tokens_evicted: int = 0
     mamba_num_evicted: int = 0
+    window_num_tokens_evicted: dict[str, int] = dataclasses.field(default_factory=dict)
+
+    def add(self, other: EvictResult) -> None:
+        self.num_tokens_evicted += other.num_tokens_evicted
+        self.mamba_num_evicted += other.mamba_num_evicted
+        for name, tokens in other.window_num_tokens_evicted.items():
+            self.window_num_tokens_evicted[name] = (
+                self.window_num_tokens_evicted.get(name, 0) + tokens
+            )
 
 
 @dataclasses.dataclass
@@ -219,6 +267,8 @@ class DecLockRefParams:
     A segment release requires its component's boundary entry; a missing
     entry must not be treated as a lock reaching the root. ``node_id`` is
     ``None`` only for legacy caches; the unified tree rejects such a receipt.
+    ``skipped_lock_components`` also records components released individually
+    before the remaining receipt is unlocked.
     """
 
     node_id: Optional[int] = None
@@ -288,8 +338,6 @@ class MatchResult(NamedTuple):
                             equal to `last_host_node`.
         host_hit_length :   Number of Full-KV tokens that hit on host (CPU) and need to be
                             loaded back to device. Pure-KV cache semantics;
-        swa_host_hit_length  :   Number of SWA tokens that hit on host (within the sliding
-                            window) and will be load-back into the SWA device pool.
         swa_branching_seqlen: The SWA radix cache branching point, which is the longest
                               page-aligned position that could've been cache hit if there
                               exists an SWA window.
@@ -307,7 +355,6 @@ class MatchResult(NamedTuple):
     last_host_node: Any
     best_match_node: Any
     host_hit_length: int = 0
-    swa_host_hit_length: int = 0
     swa_branching_seqlen: Optional[int] = None
     mamba_host_hit_length: int = 0
     mamba_branching_seqlen: Optional[int] = None
@@ -315,6 +362,29 @@ class MatchResult(NamedTuple):
     full_kv_hit_length: int = 0
     # Actions the Controller applies: CacheActions itself, ComponentActions routed to the owning component.
     cache_actions: Sequence[CacheAction | ComponentAction] = ()
+    # Deepest non-root node visited, including nodes rejected by validators.
+    last_visited_node_id: Optional[int] = None
+    # Reusable prefix length in FULL's device-value scan, before node-boundary
+    # or auxiliary constraints. None means no shorter prefix was reported.
+    full_device_match_len: Optional[int] = None
+    # Host hit tokens per window (within its window), to be loaded back into
+    # its device pool: by tree slot id inside the tree, by sub-pool name once
+    # the cache hands the match out (`with_window_hits_by_sub_pool`).
+    window_host_hit_lengths: Mapping[ComponentType | str, int] = MappingProxyType({})
+
+    def with_window_hits_by_sub_pool(
+        self, sub_pool_of_slot: Callable[[ComponentType], str]
+    ) -> MatchResult:
+        """This match with each window's host hit keyed by its sub-pool's name
+        instead of its tree slot id, as the cache hands a match out."""
+        if not self.window_host_hit_lengths:
+            return self
+        return self._replace(
+            window_host_hit_lengths={
+                sub_pool_of_slot(slot): n
+                for slot, n in self.window_host_hit_lengths.items()
+            }
+        )
 
 
 def zero_match_result(
@@ -330,10 +400,12 @@ def zero_match_result(
         last_host_node=root,
         best_match_node=root,
         host_hit_length=0,
-        swa_host_hit_length=0,
+        window_host_hit_lengths=MappingProxyType({}),
         swa_branching_seqlen=None,
         mamba_host_hit_length=0,
         full_kv_hit_length=0,
+        last_visited_node_id=None,
+        full_device_match_len=None,
     )
 
 
@@ -391,9 +463,6 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     storage_prefetch_retries: Optional[StoragePrefetchRetries] = None
     # Set by caches that publish KV placement events; None means they don't.
     kv_events: Optional[KVCacheEventRecorder] = None
-    # Tokens back from the committed length a fused draft reads in the swa
-    # sub-pool (CacheInitParams.draft_swa_window); 0 when it reads none.
-    draft_swa_window: int = 0
 
     def init_metrics_collector(self):
         from sglang.srt.layers.dp_attention import is_dp_attention_enabled
@@ -423,13 +492,13 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         tens of seconds (see HostKVCache.destroy). Idempotent.
         """
 
-    def release_aborted_request(self, handle: CacheRequestHandle) -> None:
+    def _abandon_attempt(self, handle: CacheRequestHandle) -> None:
         """Release attempt state; caches without prefetch state have nothing to drop."""
 
     def finish(self, handle: CacheRequestHandle, outcome: CacheRequestOutcome) -> None:
         """Finish an attempt without cancelling successful asynchronous cache work."""
         if outcome != CacheRequestOutcome.SUCCESS:
-            self.release_aborted_request(handle)
+            self._abandon_attempt(handle)
 
     @abstractmethod
     def reset(self):
@@ -491,17 +560,19 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """Give back ascending, disjoint, half-open row-position ranges
         of the ``kv`` record's row; one call keeps a shared page freed once.
         """
-        from sglang.srt.mem_cache.common import coalesce_ranges, free_kv_row_segments
+        from sglang.srt.mem_cache.common import free_kv_row_segments
+        from sglang.srt.mem_cache.kv.advance import coalesce_ranges
 
         allocator = self.token_to_kv_pool_allocator
         row = self.req_to_token_pool.req_to_token[kv.req_pool_idx]
         # Adjacent pieces whose seam falls inside one (DCP-widened) page would
         # free that page twice; the allocator rejects that, so merge them first.
+        global_page_size = self.logical_page_size
         free_kv_row_segments(
             allocator,
             [(row[start:end], start) for start, end in coalesce_ranges(ranges)],
-            swa_evicted_seqlen=kv.get_evicted_seqlen(ComponentType.SWA),
-            swa_dead_lo=kv.swa_dead_lo(allocator.page_size),
+            window_evicted_seqlen=kv.get_evicted_seqlen(window_sub_pool_of(allocator)),
+            window_dead_lo=kv.window_dead_lo(global_page_size),
         )
 
     @abstractmethod
@@ -529,6 +600,23 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         if allocation_reclaim_satisfied is not None:
             raise NotImplementedError("This cache does not support joint reclaim")
         return self.evict(params)
+
+    def window_available_size(self, sub_pool: str) -> int:
+        """What window sub-pool ``sub_pool`` can serve now."""
+        return self.token_to_kv_pool_allocator.window_available_size(sub_pool)
+
+    def window_slot_of(self, sub_pool: str) -> ComponentType:
+        """The tree slot keeping window sub-pool ``sub_pool``."""
+        raise KeyError(f"this cache keeps no window slot for {sub_pool!r}")
+
+    def window_sub_pool_of_slot(self, slot: ComponentType) -> str:
+        """The window sub-pool whose rows tree slot ``slot`` keeps."""
+        raise KeyError(f"this cache keeps no window slot {slot}")
+
+    def window_sub_pools(self) -> tuple[tuple[str, int], ...]:
+        """Each window sub-pool this cache keeps a slot for, with the history
+        it retains (what a request is charged at most in it)."""
+        return ()
 
     @abstractmethod
     def inc_lock_ref(self, node: Any) -> IncLockRefResult:
@@ -579,7 +667,8 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def full_evictable_size(self):
         return 0
 
-    def swa_evictable_size(self):
+    def window_evictable_size(self, sub_pool: str) -> int:
+        """Evictable tokens of one window sub-pool."""
         return 0
 
     def protected_size(self):
@@ -588,11 +677,8 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def full_protected_size(self):
         return 0
 
-    def swa_protected_size(self):
-        return 0
-
-    def swa_transient_size(self):
-        """Allocated SWA tokens owned outside the request and tree views."""
+    def window_protected_size(self, sub_pool: str) -> int:
+        """Locked tokens of one window sub-pool."""
         return 0
 
     def total_size(self):
@@ -669,33 +755,19 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def supports_swa(self) -> bool:
         return False
 
-    def supports_auxiliary_swa(self) -> bool:
-        return False
+    def window_slots(self) -> tuple[ComponentType, ...]:
+        """The tree's window slot ids, the first window first; a tree keeping
+        several windows tracks each one's cursors and prefix locks."""
+        return ()
 
     @property
     def swa_retain_window(self) -> Optional[int]:
         # What the frees and unlocks of a running request's SWA keep behind it;
         # every other SWA rule uses sliding_window_size.
-        if self.sliding_window_size is None:
-            return None
-        return max(self.sliding_window_size, self.draft_swa_window)
-
-    def evict_sliding_windows(
-        self, req: Req, pre_len: int, *, eviction_interval: int = 1
-    ) -> None:
-        """Slide request-owned windows at the scheduler's safe eviction frontier."""
-        from sglang.srt.mem_cache.common import free_swa_out_of_window_slots
-
-        free_swa_out_of_window_slots(
-            req,
-            pre_len,
-            sliding_window_size=self.swa_retain_window,
-            page_size=self.page_size,
-            req_to_token_pool=self.req_to_token_pool,
-            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-            supports_prefix_sharing=self.supports_prefix_sharing(),
-            retain_floor=self.swa_retain_floor(req),
-            eviction_interval=eviction_interval,
+        return retained_target_window(
+            self.req_to_token_pool,
+            self.token_to_kv_pool_allocator,
+            self.sliding_window_size,
         )
 
     def swa_retain_floor(self, req) -> int | None:
@@ -705,8 +777,33 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         # nothing deeper than the tail to protect.
         return None
 
-    def swa_reprefill_tail_tokens(self, req=None) -> int:
-        # Caches whose matched SWA is not reusable as is override this.
+    def window_lengths(self) -> tuple[tuple[str, int], ...]:
+        """Each window sub-pool and the history a running request keeps
+        behind its frontier in it."""
+        return (
+            (
+                window_sub_pool_of(self.token_to_kv_pool_allocator),
+                self.swa_retain_window,
+            ),
+        )
+
+    def window_retention(self, req):
+        """Running-request window sub-pools, retention lengths and prefix floors."""
+        return tuple(
+            (sub_pool, window, self.swa_retain_floor(req))
+            for sub_pool, window in self.window_lengths()
+        )
+
+    def insert_window_cursors(self, kv: Any) -> dict[ComponentType, int]:
+        """A request's window cursors as the tree's insert takes them, by
+        tree slot."""
+        return {
+            self.window_slot_of(sub_pool): seqlen
+            for sub_pool, seqlen in kv.evicted_seqlens().items()
+        }
+
+    def window_reprefill_tail_tokens(self, req=None) -> int:
+        # Caches whose matched window rows are not reusable as is override this.
         return 0
 
     def supports_mamba(self) -> bool:
@@ -717,6 +814,14 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
 
     def release_radix_session(self, session_id: str) -> None:
         pass
+
+    def retained_window_tokens(self) -> int:
+        """KV tokens held outside the prefix tree and streaming-session records"""
+        return 0
+
+    def retained_window_req_count(self) -> int:
+        """request rows retained outside streaming-session records"""
+        return 0
 
     def session_records(self) -> dict[str, ReqKvInfo]:
         """The KV records sessions own, by session id. Pool accounting counts them
@@ -730,5 +835,7 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
 
     def available_and_evictable_str(self) -> str:
         available_size = self.token_to_kv_pool_allocator.available_size()
+        if is_cp_sharded_padded():
+            available_size = from_cp_sharded(available_size)
         evictable_size = self.evictable_size()
         return f"Available tokens: {available_size + evictable_size} ({available_size=} + {evictable_size=})\n"

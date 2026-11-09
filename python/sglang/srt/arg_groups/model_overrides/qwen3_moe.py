@@ -7,12 +7,12 @@ from sglang.srt.arg_groups.model_override_base import (
     _register_for,
     resolving_view,
 )
-from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils.common import (
+from sglang.srt.configs.quant_utils import (
     get_mixed_precision_moe_quant_algos,
     get_quantization_config,
 )
+from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_platform
 
 logger = logging.getLogger(__name__)
 
