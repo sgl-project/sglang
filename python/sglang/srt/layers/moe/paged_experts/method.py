@@ -109,6 +109,10 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
         # The GPU table has K rows. The loader below sends all E experts to the host store,
         # so the native expert-id remap never sees ids >= K.
         self._set_num_slots(layer, self.num_resident)
+        # What a step's working memory follows from (``RunnerContract.prefill_bytes``).
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size_per_partition
+        self.params_dtype = params_dtype
         self.native_loader = extra.get("weight_loader")
         self.base_method.create_weights(
             layer=layer,

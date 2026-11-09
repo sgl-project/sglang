@@ -645,5 +645,141 @@ def _gather_args(hosts, gpus):
     ]
 
 
+class TestCompactedTritonCalls(CustomTestCase):
+    """The triton runner's no-combine output of a step, computed as the paged triton waves
+    compute it: each wave's entries as top-k 1 rows in calls of a few rows, inside the config
+    lookup of the step's full call (tokens x top-k)."""
+
+    @classmethod
+    def setUpClass(cls):
+        # fused_experts reads the server args and allocates under the TP group.
+        from sglang.srt.distributed.parallel_state import (
+            init_distributed_environment,
+            initialize_model_parallel,
+            model_parallel_is_initialized,
+        )
+        from sglang.srt.server_args import (
+            ServerArgs,
+            set_global_server_args_for_scheduler,
+        )
+        from sglang.test.test_utils import publish_build_topology
+
+        set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
+        for key, value in (
+            ("MASTER_ADDR", "127.0.0.1"),
+            ("MASTER_PORT", "29653"),
+            ("RANK", "0"),
+            ("WORLD_SIZE", "1"),
+            ("LOCAL_RANK", "0"),
+        ):
+            os.environ.setdefault(key, value)
+        if not torch.distributed.is_initialized():
+            init_distributed_environment(
+                world_size=1, rank=0, local_rank=0, backend="gloo"
+            )
+        if not model_parallel_is_initialized():
+            publish_build_topology(tp_size=1, ep_size=1, pp_size=1)
+            initialize_model_parallel(backend="gloo")
+
+    @staticmethod
+    def _fp8_blocks(w):
+        """Block-wise FP8 [128, 128] weights and their float32 scales, as checkpoints keep them."""
+        e, n, k = w.shape
+        blocks = w.view(e, n // 128, 128, k // 128, 128)
+        scale = blocks.abs().amax(dim=(2, 4)).clamp(min=1e-6) / 448.0
+        q = (blocks / scale[:, :, None, :, None]).to(torch.float8_e4m3fn)
+        return q.view(e, n, k), scale.float()
+
+    def _run(self, x, w1, w2, ids, weights, quant):
+        from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+        from sglang.srt.layers.moe.moe_runner.triton_utils import fused_experts
+        from sglang.srt.layers.moe.topk import StandardTopKOutput
+
+        e = w1.shape[0]
+        config = MoeRunnerConfig(
+            num_experts=e,
+            num_local_experts=e,
+            top_k=ids.shape[1],
+            hidden_size=x.shape[1],
+            intermediate_size_per_partition=w2.shape[2],
+            params_dtype=x.dtype,
+            activation="silu",
+            inplace=False,
+            no_combine=True,
+            no_combine_keep_router_weight=True,
+        )
+        topk = StandardTopKOutput(
+            topk_weights=weights, topk_ids=ids, router_logits=None
+        )
+        return fused_experts(x, w1, w2, topk, config, **quant)
+
+    def test_compacted_calls_equal_the_full_call_bitwise(self):
+        """bf16 and block-wise FP8 experts, 300 tokens x top-4 over 8 experts: the entries of
+        experts 0-3 (one wave), run in calls of at most 6 rows inside
+        ``override_config_lookup(300, 4)``, give the full call's outputs bit for bit. Control:
+        without the lookup the 6-row calls would look up another config than the full call in
+        at least one case (so the lookup, not luck, keeps the numerics; block-wise FP8's
+        default config does not depend on the rows on every GPU, bf16's does)."""
+        from sglang.srt.layers.moe.moe_runner.triton_utils import (
+            override_config_lookup,
+            try_get_optimal_moe_config,
+        )
+
+        torch.manual_seed(0)
+        e, top_k, tokens, hidden, inter = 8, 4, 300, 256, 256
+        x = torch.randn(tokens, hidden, device="cuda", dtype=torch.bfloat16)
+        w1 = torch.randn(e, 2 * inter, hidden, device="cuda", dtype=torch.bfloat16) / 16
+        w2 = torch.randn(e, hidden, inter, device="cuda", dtype=torch.bfloat16) / 16
+        ids = torch.stack([torch.randperm(e)[:top_k] for _ in range(tokens)])
+        ids = ids.to(device="cuda", dtype=torch.int32)
+        weights = torch.rand(tokens, top_k, device="cuda", dtype=torch.float32)
+        q1, s1 = self._fp8_blocks(w1)
+        q2, s2 = self._fp8_blocks(w2)
+        cases = {
+            "bf16": (w1, w2, {}, None),
+            "fp8-block": (
+                q1,
+                q2,
+                dict(
+                    use_fp8_w8a8=True, w1_scale=s1, w2_scale=s2, block_shape=[128, 128]
+                ),
+                "fp8_w8a8",
+            ),
+        }
+        # Experts 0-3: one wave of 4 slots.
+        wave = (ids < 4).flatten().nonzero().squeeze(1)
+        lookup_matters = []
+        for name, (a, b, quant, dtype) in cases.items():
+            with self.subTest(experts=name):
+                full = self._run(x, a, b, ids, weights, quant)
+                got = torch.zeros_like(full).view(-1, hidden)
+                with override_config_lookup(tokens, top_k):
+                    for part in wave.split(6):
+                        rows = part // top_k
+                        out = self._run(
+                            x[rows],
+                            a,
+                            b,
+                            ids.flatten()[part].unsqueeze(1),
+                            weights.flatten()[part].unsqueeze(1),
+                            quant,
+                        )
+                        got[part] = out.view(-1, hidden)
+                want = full.view(-1, hidden)[wave]
+                mismatch = (got[wave].view(torch.int16) != want.view(torch.int16)).sum()
+                self.assertEqual(int(mismatch), 0)
+
+                block = quant.get("block_shape")
+                shapes = (a.shape, (b.shape[0], b.shape[1], b.shape[2]))
+                full_config = try_get_optimal_moe_config(
+                    *shapes, top_k, dtype, tokens, block_shape=block
+                )
+                row_config = try_get_optimal_moe_config(
+                    *shapes, 1, dtype, 6, block_shape=block
+                )
+                lookup_matters.append(full_config != row_config)
+        self.assertTrue(any(lookup_matters))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -18,6 +18,7 @@ from sglang.srt.layers.moe.paged_experts import (
     disk_tier,
     expert_cache,
     formats,
+    runners,
     sizing,
 )
 from sglang.srt.layers.moe.paged_experts import store as store_module
@@ -49,6 +50,7 @@ from sglang.srt.layers.moe.paged_experts.runners import (
     MARLIN,
     TRITON,
     MarlinContract,
+    RunnerContract,
     TritonContract,
     contract_for,
 )
@@ -91,15 +93,30 @@ class _LinearMoE:
     zero entries."""
 
     runner = SimpleNamespace(config=SimpleNamespace(num_experts=E, num_local_experts=K))
+    # What the triton runner's quantization does to a row: nothing here, so a row's output
+    # does not depend on the other rows of its call.
+    quant_info = SimpleNamespace(
+        use_fp8_w8a8=False,
+        use_int8_w8a8=False,
+        block_shape=None,
+        per_channel_quant=False,
+        a13_scale=None,
+        a2_scale=None,
+    )
 
     def __init__(self):
         self.rows = 0
+        self.calls = []  # (rows, top_k) of each call
+
+    def get_triton_quant_info(self, layer):
+        return self.quant_info
 
     def apply(self, layer, dispatch_output):
         topk = dispatch_output.topk_output
         ids, w = topk.topk_ids.long(), topk.topk_weights
         valid = ids >= 0
         self.rows += int(valid.sum())
+        self.calls.append(tuple(ids.shape))
         ids = ids.clamp(min=0)
         y = torch.einsum(
             "th,tjhi->tji", dispatch_output.hidden_states, layer.w13_weight[ids]
@@ -320,6 +337,80 @@ class TestPagedForward(CustomTestCase):
             d = _step(num_tokens)
             out = method.apply(layer=layer, dispatch_output=d).hidden_states
             torch.testing.assert_close(out, _reference(full, d))
+
+    def test_triton_waves_run_only_their_rows_with_the_full_calls_configs(self):
+        """With row-local quantization (none, or FP8 per-tensor with both scales static),
+        each triton wave runs only its entries (top-k 1 rows), inside a config lookup for the
+        step's full call (tokens x top-k), so the runner keeps that call's kernel configs.
+        Control: a dynamic per-tensor scale for either GEMM's input (a max over all rows)
+        keeps every wave at the full call, outside any lookup."""
+        lookups = []
+
+        @contextlib.contextmanager
+        def lookup(num_tokens, top_k):
+            lookups.append((num_tokens, top_k))
+            yield
+
+        static = torch.ones(1)
+        cases = {  # name: (a13_scale, a2_scale, quantized), dynamic = not row-local
+            "unquantized": (None, None, False),
+            "fp8-static": (static, static, True),
+            "fp8-dynamic-input": (None, static, True),
+            "fp8-dynamic-intermediate": (static, None, True),
+        }
+        for name, (a13, a2, quantized) in cases.items():
+            dynamic = quantized and (a13 is None or a2 is None)
+            with self.subTest(quantization=name):
+                method, layer, full = _paged_layer(CONTRACTS[1])
+                method.base_method.quant_info = SimpleNamespace(
+                    use_fp8_w8a8=quantized,
+                    use_int8_w8a8=False,
+                    block_shape=None,
+                    per_channel_quant=False,
+                    a13_scale=a13,
+                    a2_scale=a2,
+                )
+                lookups.clear()
+                d = _step(64)
+                method.base_method.calls.clear()
+                with patch.object(runners, "_config_lookup", lookup):
+                    out = method.apply(layer=layer, dispatch_output=d).hidden_states
+                torch.testing.assert_close(out, _reference(full, d))
+                calls = method.base_method.calls
+                self.assertGreater(len(calls), 1)  # several waves
+                if dynamic:
+                    self.assertEqual(lookups, [])
+                    self.assertEqual(set(calls), {(64, TOP_K)})
+                else:
+                    self.assertEqual(set(lookups), {(64, TOP_K)})
+                    self.assertTrue(all(k == 1 for _, k in calls))
+                    self.assertLess(sum(r for r, _ in calls), 2 * 64 * TOP_K)
+
+    def test_no_runner_call_exceeds_the_compacted_rows(self):
+        """A step whose entries exceed one compacted call (``COMPACT_ROWS``, here 8) runs in
+        calls of at most that many rows (padded to the next batch size), also when one wave
+        holds every expert it routes to, and matches unpaged. Control: with the default cap
+        the one-wave step is one full call."""
+        for contract in CONTRACTS:
+            for cap, one_call in ((8, False), (runners.COMPACT_ROWS, True)):
+                with self.subTest(contract=type(contract).__name__, cap=cap):
+                    method, layer, full = _paged_layer(contract)
+                    d = _step(64)
+                    d.topk_output.topk_ids.copy_(  # experts 0-3: one wave of K = 4
+                        torch.stack(
+                            [torch.randperm(K)[:TOP_K] for _ in range(64)]
+                        ).int()
+                    )
+                    method.base_method.calls.clear()
+                    with patch.object(runners, "COMPACT_ROWS", cap):
+                        out = method.apply(layer=layer, dispatch_output=d).hidden_states
+                    torch.testing.assert_close(out, _reference(full, d))
+                    calls = method.base_method.calls
+                    if one_call and isinstance(contract, TritonContract):
+                        self.assertEqual(calls, [(64, TOP_K)])
+                    elif not one_call:
+                        self.assertGreater(len(calls), 1)
+                        self.assertTrue(all(r <= 16 and k == 1 for r, k in calls))
 
     def test_capture_skips_the_waves_and_replay_runs_them(self):
         """Breakable capture runs the break once, before any captured kernel has run, on
@@ -1206,6 +1297,8 @@ class TestSizing(CustomTestCase):
                 "max_mamba_cache_size": None,
                 "mamba_full_memory_ratio": 0.9,
                 "page_size": 1,
+                "chunked_prefill_size": 4096,
+                "max_prefill_tokens": 16384,
                 **over,
             }
         )
@@ -1299,11 +1392,13 @@ class TestSizing(CustomTestCase):
         top_ks=(TOP_K, TOP_K),
         context_length=None,
         refuse=False,
+        reserve_slots=0,
         **schedule,
     ):
         """Two layers built with K = top_k, sized through ``ExpertSlotSizing`` against a static
-        budget of ``budget_slots`` slots per layer (each layer's slot bytes). Returns K per
-        layer, the layers, the decode caps applied and the overrides made."""
+        budget of ``budget_slots`` slots per layer (each layer's slot bytes), of which a
+        prefill step's working memory takes ``reserve_slots`` slots of one layer. Returns K
+        per layer, the layers, the decode caps applied and the overrides made."""
         built = [
             _paged_layer(seed=seed, num_resident=top_k, top_k=top_k, auto_size=True)
             for seed, top_k in enumerate(top_ks)
@@ -1323,6 +1418,9 @@ class TestSizing(CustomTestCase):
             ),
             patch(_METHOD + "runner_of", return_value=_LinearMoE.runner),
             patch(_METHOD + "_cap_decode_capture_batch_sizes", side_effect=caps.append),
+            patch.object(
+                RunnerContract, "prefill_bytes", return_value=reserve_slots * row
+            ),
         ):
             model = torch.nn.ModuleList(layers)
             slots = sizing.ExpertSlotSizing.for_model(model, kvc, 0)
@@ -1396,6 +1494,47 @@ class TestSizing(CustomTestCase):
             same = torch.allclose(out, _reference(full, step), atol=1e-4)
             self.assertEqual(same, not corrupt)
             self.assertEqual(paged, [])  # served from the grown slots: nothing paged in
+
+    def test_slots_leave_a_prefill_step_its_working_memory(self):
+        """A step reserve of 2 slots' bytes takes one round of growth (one slot in each of the
+        two layers): K = 3 instead of 4. Control: no reserve, K = 4."""
+        for reserve, k in ((0, K), (2, K - 1)):
+            with self.subTest(reserve_slots=reserve):
+                ks, _, _, _ = self._sized(budget_slots=4, reserve_slots=reserve)
+                self.assertEqual(ks, [k, k])
+
+    def test_a_step_reserve_the_smallest_slots_leave_no_room_for_warns(self):
+        """Slots stay at K = top_k and the log names the flags; control: a reserve that fits
+        logs no warning."""
+        with self.assertLogs(sizing.logger, "WARNING") as logs:
+            ks, _, _, _ = self._sized(budget_slots=TOP_K, reserve_slots=3)
+        self.assertEqual(ks, [TOP_K, TOP_K])
+        self.assertIn("--chunked-prefill-size", logs.output[0])
+        with self.assertNoLogs(sizing.logger, "WARNING"):
+            self._sized(budget_slots=4, reserve_slots=2)
+
+    def test_the_step_reserve_follows_the_chunk_and_the_layer(self):
+        """The reserve is the merged [tokens, top_k, hidden] entries plus one compacted call
+        of ``COMPACT_ROWS`` rows: doubling the tokens adds one more merged buffer, and the
+        hidden width is padded as a runner may pad it. A step carries one prefill chunk, or
+        without chunking the larger of a prefill batch and one full request."""
+        c = RunnerContract()
+        one = c.prefill_bytes(100, 40, 1024, 4, torch.bfloat16)
+        two = c.prefill_bytes(100, 40, 2048, 4, torch.bfloat16)
+        self.assertEqual(two - one, 1024 * 4 * 256 * 2)
+        self.assertGreater(one, 1024 * 4 * 256 * 2)
+        for chunk, prefill, minimum, tokens in (
+            (4096, 16384, 4096, 4096),
+            (-1, 16384, 4096, 16384),
+            (None, 2048, 32768, 32768),
+        ):
+            with patch(
+                self._SIZING + "get_schedule",
+                return_value=SimpleNamespace(
+                    chunked_prefill_size=chunk, max_prefill_tokens=prefill
+                ),
+            ):
+                self.assertEqual(sizing._step_tokens(minimum), tokens)
 
     def test_the_decode_cap_holds_for_every_layer(self):
         """Layers with top_k 2 and 4 grow to K = 7 and 9: the cap is the smallest K // top_k

@@ -13,6 +13,7 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.layers.moe.paged_experts import runners
 from sglang.srt.layers.moe.paged_experts.residency import (
     DeviceResidency,
     LRUPolicy,
@@ -97,7 +98,8 @@ class EagerExecutor:
         for w, wave in enumerate(waves):
             self.store.page_in(layer=layer, loads=wave.loads)
             slots = to_slot[w][topk_ids]
-            if len(waves) == 1:  # only padding is outside the wave
+            if len(waves) == 1 and not self._bounded(layer, dispatch_output, slots):
+                # Only padding is outside the wave.
                 merged = run_on_slots(self.base_method, layer, dispatch_output, slots)
                 break
             merged = self.contract.run_wave(
@@ -108,7 +110,16 @@ class EagerExecutor:
                 merged=merged,
                 num_entries=sum(routed[e] for e in wave.experts),
             )
+        if merged is None:  # no routed entry in any wave: only padding
+            merged = run_on_slots(self.base_method, layer, dispatch_output, slots)
         return merged
+
+    def _bounded(self, layer, dispatch_output, slots) -> bool:
+        """Whether a one-wave step larger than one compacted call goes through the contract's
+        waves, which bound each runner call's rows (``runners.COMPACT_ROWS``)."""
+        return slots.numel() > runners.COMPACT_ROWS and self.contract.compacts(
+            self.base_method, layer, dispatch_output
+        )
 
 
 class DeviceExecutor:
