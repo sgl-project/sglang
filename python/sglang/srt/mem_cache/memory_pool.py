@@ -5965,8 +5965,9 @@ def move_kv_cache_native(
 ):
     """Move token-granular K/V rows from ``src_loc`` to ``tgt_loc``.
 
-    Buffers are the per-layer 3-D ``[max_slots, head_num, head_dim]`` pools;
-    direct advanced indexing on dim 0.
+    Per-layer buffers are 3-D ``[max_slots, head_num, head_dim]`` pools. A
+    page-major pool may expose 4-D ``[pages, page_size, head_num, head_dim]``;
+    flatten its page axis so ``loc`` still indexes tokens.
     """
     if tgt_loc.numel() == 0:
         return
@@ -5974,6 +5975,9 @@ def move_kv_cache_native(
     tgt_loc_flat = tgt_loc.view(-1).long()
     src_loc_flat = src_loc.view(-1).long()
     for k_cache, v_cache in zip(k_buffer, v_buffer):
+        if k_cache.dim() == 4:
+            k_cache = k_cache.view(-1, *k_cache.shape[-2:])
+            v_cache = v_cache.view(-1, *v_cache.shape[-2:])
         k_cache[tgt_loc_flat] = k_cache[src_loc_flat]
         v_cache[tgt_loc_flat] = v_cache[src_loc_flat]
 
