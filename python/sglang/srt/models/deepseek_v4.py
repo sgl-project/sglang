@@ -65,6 +65,7 @@ from sglang.srt.hardware_backend.npu.utils import (
     use_npu_arch35_mxfp8_wo_a,
 )
 from sglang.srt.hf_transformers import get_rope_config
+from sglang.srt.layers.attention.deepseek_v4_backend import DSV4Metadata
 from sglang.srt.layers.attention.dsa.utils import (
     is_dsa_enable_prefill_cp,
 )
@@ -74,9 +75,14 @@ from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
     DeepseekV41Indexer,
 )
 from sglang.srt.layers.attention.dsv4.indexer import C4Indexer
+from sglang.srt.layers.attention.graph_utils import (
+    pad_with_zero_rows,
+    real_rows_scope,
+)
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStatePacker
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
 from sglang.srt.layers.cp.utils import (
+    cp_gather_after_forward,
     cp_gather_full_sequence_states,
     cp_materialize_global_token_order,
     is_cp_active,
@@ -85,6 +91,7 @@ from sglang.srt.layers.deep_gemm_wrapper.configurer import DEEPGEMM_SCALE_UE8M0
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_reduce,
     dp_gather_replicate,
+    dp_slot_in,
     get_global_dp_buffer_len,
     is_allocation_symmetric,
     is_dp_attention_enabled,
@@ -418,26 +425,23 @@ if _use_aiter:
         from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
 
 
-def _wo_a_aiter_gemm_eligible(
-    flag: bool, use_aiter: bool, is_hip: bool, is_gfx95: bool
-) -> bool:
+def _wo_a_aiter_gemm_eligible(use_aiter: bool, is_hip: bool, is_gfx95: bool) -> bool:
     """Static eligibility for the aiter ``wo_a`` reroute.
 
-    Folds the opt-in flag, the global ``SGLANG_USE_AITER`` switch, and the
-    HIP/gfx95 platform gates into one predicate. Evaluated once at import (see
+    Folds the global ``SGLANG_USE_AITER`` switch and the HIP/gfx95 platform
+    gates into one predicate. Evaluated once at import (see
     ``_wo_a_aiter_batched_gemm_enabled``) so none of it runs on the per-token
     decode critical path.
     """
-    return bool(flag and use_aiter and is_hip and is_gfx95)
+    return bool(use_aiter and is_hip and is_gfx95)
 
 
-# Read the opt-in flag and import the aiter kernel ONCE at module import: the
+# Resolve eligibility and import the aiter kernel ONCE at module import: the
 # decode ``wo_a`` matmul runs per layer/token on the critical path, so it must
-# not pay an ``EnvBool.get()`` plus a function-local import on every call. If the
-# path is eligible but the kernel import fails, disable it here and fall back to
-# the einsum for the process (logged once) instead of retrying every step.
+# not pay a function-local import on every call. If the path is eligible but
+# the kernel import fails, disable it here and fall back to the einsum for the
+# process (logged once) instead of retrying every step.
 _wo_a_aiter_batched_gemm_enabled = _wo_a_aiter_gemm_eligible(
-    envs.SGLANG_OPT_USE_AITER_BATCHED_GEMM.get(),
     _use_aiter,
     _is_hip,
     _is_gfx95_supported,
@@ -484,12 +488,9 @@ if _is_hip:
     if is_wo_a_fp8_mxscale_supported():
         _wo_a_fp8_mxscale = apply_wo_a_fp8_mxscale
         _wo_a_weight_scale_to_e8m0 = wo_a_weight_scale_to_e8m0
-        # Opt-in fused inverse-RoPE + quant front end (env-gated for A/B). Only
-        # bind it when both the flatmm and the fused aiter op are available.
-        if (
-            envs.SGLANG_OPT_FP8_WO_A_FUSED_INVROPE.get()
-            and is_wo_a_fp8_fused_invrope_supported()
-        ):
+        # Fused inverse-RoPE + quant front end, bound when both the flatmm and
+        # the fused aiter op are available.
+        if is_wo_a_fp8_fused_invrope_supported():
             _wo_a_fp8_mxscale_fused_invrope = apply_wo_a_fp8_mxscale_fused_invrope
         _wo_a_fp8_mxscale_prequant = apply_wo_a_fp8_mxscale_prequant
 
@@ -1542,7 +1543,6 @@ class MQALayer(MqaAttentionBase):
         # in forward, after weights have loaded.
         self.use_fused_wo_a = (
             self.is_dsv41
-            and envs.SGLANG_DSV41_FUSED_WO_A.get()
             and _fused_wo_a_arch_supported()
             and not self.wo_a_fp8
             and not self.use_npu_arch35_mxfp8_wo_a
@@ -1639,7 +1639,10 @@ class MQALayer(MqaAttentionBase):
         if forward_batch.forward_mode.is_idle():
             return q.new_zeros(q.shape[0], self.n_local_groups, self.o_lora_rank)
         if not self.mega_wq_b_permuted:
-            q = pack_query(q, kernel_num_heads)
+            out = attn_backend.packed_query_buffer(
+                rows=q.shape[0], padded_heads=kernel_num_heads, dtype=q.dtype
+            )
+            q = pack_query(q, kernel_num_heads, out=out)
         if forward_batch.forward_mode.is_extend() and is_in_breakable_cuda_graph():
             rows = q.shape[0]
             if self._mega_mxfp8_output(rows):
@@ -2642,6 +2645,28 @@ class MQALayer(MqaAttentionBase):
 
         return q, kv
 
+    def _forward_real_rows(
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        *,
+        real_num_tokens: int,
+        defer_all_reduce: bool,
+    ) -> Union[torch.Tensor, mhc.AttnOutput]:
+        # x_quant is laid out for every row (MXFP8 scales are swizzled), so the
+        # real rows are quantized again inside attention.
+        with real_rows_scope(forward_batch, real_num_tokens):
+            out = self.forward(
+                x[:real_num_tokens],
+                positions[:real_num_tokens],
+                forward_batch,
+                defer_all_reduce=defer_all_reduce,
+            )
+        if isinstance(out, mhc.AttnOutput):
+            return mhc.AttnOutput(pad_with_zero_rows(out.partial, x.shape[0]))
+        return pad_with_zero_rows(out, x.shape[0])
+
     def forward(
         self,
         x: torch.Tensor,
@@ -2658,6 +2683,19 @@ class MQALayer(MqaAttentionBase):
             assert isinstance(
                 attn_backend,
                 (DeepseekV4AttnBackend, DeepseekV4HipRadixBackend),
+            )
+        metadata = attn_backend.forward_metadata
+        if (
+            isinstance(metadata, DSV4Metadata)
+            and metadata.real_num_tokens is not None
+            and x.shape[0] > metadata.real_num_tokens
+        ):
+            return self._forward_real_rows(
+                x,
+                positions,
+                forward_batch,
+                real_num_tokens=metadata.real_num_tokens,
+                defer_all_reduce=defer_all_reduce,
             )
 
         enable_multi_stream = (
@@ -2940,6 +2978,16 @@ class MQALayer(MqaAttentionBase):
                     **({} if inv_rope is None else {"inv_rope": inv_rope}),
                 )
             o = o[:, tp_slice, :]
+        o = self._project_wo_a(
+            o,
+            positions=positions,
+            forward_batch=forward_batch,
+            inv_rope=inv_rope,
+            wo_a_quant_freqs=wo_a_quant_freqs,
+        )
+        return self._project_wo_b(o, defer_all_reduce)
+
+    def _project_wo_a(self, o, *, positions, forward_batch, inv_rope, wo_a_quant_freqs):
         if wo_a_quant_freqs is not None:
             # the decode already returned the wo_a mxfp8 (codes, scales)
             G = self.n_local_groups
@@ -3112,7 +3160,7 @@ class MQALayer(MqaAttentionBase):
                         self.o_lora_rank,
                     )
 
-        return self._project_wo_b(o, defer_all_reduce)
+        return o
 
     def _project_wo_b(self, o, defer_all_reduce: bool = False):
         from sglang.srt.layers.moe.utils import should_skip_mlp_all_reduce
@@ -3335,7 +3383,11 @@ class DeepseekV4DecoderLayerBase(nn.Module):
         self._hc_attn_bf16_parts = self._hc_ffn_bf16_parts = None
         if (
             self.hc_pre_from_prev_sublayer
-            and (get_platform().is_sm100 or get_platform().is_sm90)
+            and (
+                get_platform().is_sm100
+                or get_platform().is_sm90
+                or get_platform().is_sm120
+            )
             and self.hc_attn_fn.shape == (24, 20480)
             and envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get()
             and getattr(self.config, "model_type", None) == "deepseek_v41"
@@ -3343,8 +3395,11 @@ class DeepseekV4DecoderLayerBase(nn.Module):
         ):
             from sglang.kernels.ops.layernorm.mhc import split_bf16_hc_weight
 
-            if get_platform().is_sm90:
+            if get_platform().is_sm90 or get_platform().is_sm120:
                 # Hopper's compensated projection does not require DeepGEMM.
+                # SM120 takes the same pure-Triton route: the tf32 branch below
+                # is less accurate on this card, and it builds parts at every
+                # row count.
                 self._hc_attn_bf16_parts = split_bf16_hc_weight(self.hc_attn_fn.data)
                 self._hc_ffn_bf16_parts = split_bf16_hc_weight(self.hc_ffn_fn.data)
             else:
@@ -3513,6 +3568,7 @@ class DeepseekV4DecoderLayerBase(nn.Module):
         # dispatch cost dominates at small M (decode): dispatch by token count.
         if (
             envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get()
+            and not _is_hip
             and x.shape[0] >= _HC_PRENORM_DEEPGEMM_MIN_TOKENS
         ):
             from sglang.srt.layers.deep_gemm_wrapper.entrypoint import (
@@ -3585,8 +3641,16 @@ def _gather_late_layer_ids(
     return gathered.squeeze(-1)
 
 
+def _needs_cp_tail_scatter(
+    tail: Optional[LateLayerTail], forward_batch: ForwardBatch
+) -> bool:
+    """CUDA prefill CP with a replay tail: the CP gather reads this rank's full
+    layout, so the tail rows go back even when DSpark captures."""
+    return _is_cuda and tail is not None and is_cp_active(forward_batch)
+
+
 def _scatter_tail_rows(
-    tail: LateLayerTail, rows: torch.Tensor, num_tokens: int
+    tail: LateLayerTail, rows: torch.Tensor, num_tokens: int, zero: bool = False
 ) -> torch.Tensor:
     # Rows outside the tail are never read (see _check_late_layer_tail_readers).
     if tail.scatter_indices is not None:
@@ -3595,12 +3659,37 @@ def _scatter_tail_rows(
         full = rows.new_zeros((num_tokens + 1, rows.shape[1]))
         full.index_copy_(0, tail.scatter_indices, rows)
         return full[:num_tokens]
-    full = rows.new_empty((num_tokens, rows.shape[1]))
+    # CP gathers this rank's whole layout. The rows outside the tail are never
+    # read (see _check_late_layer_tail_readers); zeroing is defensive so the
+    # all-gather buffer stays finite.
+    full = (
+        rows.new_zeros((num_tokens, rows.shape[1]))
+        if zero
+        else rows.new_empty((num_tokens, rows.shape[1]))
+    )
     if tail.contiguous_start is not None:
-        full[tail.contiguous_start :].copy_(rows)
+        full[tail.contiguous_start : tail.contiguous_start + rows.shape[0]].copy_(rows)
     else:
         full[tail.token_indices] = rows[: tail.token_indices.shape[0]]
     return full
+
+
+def _finalize_dspark_aux(
+    aux: AuxHiddenStatePacker,
+    tail: Optional[LateLayerTail],
+    num_tokens: int,
+    cuda_cp_tail: bool,
+) -> torch.Tensor:
+    """Finalize the packed DSpark captures, then move them with the tail rows.
+
+    The packer is not iterable: every capture lands in one
+    ``[tokens, K * hidden]`` buffer, so the CP scatter has to run on the
+    finalized payload instead of a per-capture list.
+    """
+    packed = aux.finalize()
+    if not cuda_cp_tail:
+        return packed
+    return _scatter_tail_rows(tail=tail, rows=packed, num_tokens=num_tokens, zero=True)
 
 
 class DeepseekV4CudaDecoderLayer(DeepseekV4DecoderLayerBase):
@@ -4400,6 +4489,8 @@ class DeepseekV4Model(nn.Module):
             gathered_cpu = gathered.tolist()
             dp_rank = get_parallel().attn_dp_rank
             attn_tp_rank = get_parallel().attn_tp_rank
+            parent_sizes = forward_batch.global_num_tokens_cpu
+            parent_dp_offset = sum(parent_sizes[: dp_slot_in(parent_sizes)])
             for idx, child in enumerate(children):
                 rank_sizes = [gathered_cpu[r][idx] for r in range(world)]
                 dp_sizes, tp_sizes = _tbo_collective_sizes(rank_sizes, attn_tp_size)
@@ -4407,6 +4498,7 @@ class DeepseekV4Model(nn.Module):
                 child.global_num_tokens_gpu = gathered[::attn_tp_size, idx].contiguous()
                 child.global_dp_buffer_len = sum(dp_sizes)
                 child._tbo_tp_sizes = tp_sizes
+                child.tbo_parent_dp_offset = parent_dp_offset
                 # Gather the ubatch's input_ids -> global ONCE here (cached on the
                 # child) instead of per-layer in op_gather_a. The hash MoE reads
                 # the SAME global ids every layer, so 61x2 per-layer all_gatherv of
@@ -4652,18 +4744,29 @@ class DeepseekV4Model(nn.Module):
             )
         hidden_states = self.norm(hidden_states)
 
-        if tail is not None and not capture_dspark:
+        # CUDA prefill CP: the runner gathers every output, DSpark captures
+        # included, by this rank's full shard layout, so the tail rows go back
+        # into that layout before the gather.
+        cuda_cp_tail = _needs_cp_tail_scatter(tail, forward_batch)
+        num_tokens = input_ids.shape[0]
+        if tail is not None and (not capture_dspark or cuda_cp_tail):
             # The logits processor indexes rows by the full extend layout.
-            num_tokens = input_ids.shape[0]
             hidden_states = _scatter_tail_rows(
-                tail=tail, rows=hidden_states, num_tokens=num_tokens
+                tail=tail,
+                rows=hidden_states,
+                num_tokens=num_tokens,
+                zero=cuda_cp_tail,
             )
             pre_hc_head = _scatter_tail_rows(
-                tail=tail, rows=pre_hc_head, num_tokens=num_tokens
+                tail=tail,
+                rows=pre_hc_head,
+                num_tokens=num_tokens,
+                zero=cuda_cp_tail,
             )
-
         if capture_dspark:
-            return (hidden_states, pre_hc_head), dspark_aux_hidden_states.finalize()
+            return (hidden_states, pre_hc_head), _finalize_dspark_aux(
+                dspark_aux_hidden_states, tail, num_tokens, cuda_cp_tail
+            )
 
         return hidden_states, pre_hc_head
 
@@ -5000,26 +5103,74 @@ class DeepseekV4ForCausalLM(nn.Module):
         if not self.pp_group.is_last_rank:
             return hidden_states
 
+        return self._postprocess_output(hidden_states, input_ids, forward_batch)
+
+    def _get_dspark_prefill_tail(self, forward_batch):
+        if (
+            self.capture_aux_hidden_states
+            and self.model.late_layer_start is not None
+            and forward_batch.forward_mode.is_extend_without_speculative()
+        ):
+            return get_attn_backend().tail_forward_metadata.late_layer_tail
+        return None
+
+    def postprocess_cp_output(self, hidden_states, forward_batch):
+        """Gather the model's output layout before logits and DSpark KV injection."""
+        tail = self._get_dspark_prefill_tail(forward_batch)
+        full_cp_metadata = forward_batch.attn_cp_metadata
+        if tail is not None:
+            if tail.cp_metadata is None or tail.global_token_indices is None:
+                raise RuntimeError(
+                    "CP bounded replay output is missing its tail layout"
+                )
+            forward_batch.attn_cp_metadata = tail.cp_metadata
+        try:
+            aux_hidden_states = None
+            if self.capture_aux_hidden_states:
+                hidden_states, aux_hidden_states = hidden_states
+            stream = torch.cuda.current_stream()
+            hidden_states = cp_gather_after_forward(
+                hidden_states, forward_batch, stream
+            )
+            if aux_hidden_states is not None:
+                aux_hidden_states = cp_gather_after_forward(
+                    aux_hidden_states, forward_batch, stream
+                )
+        finally:
+            forward_batch.attn_cp_metadata = full_cp_metadata
+        if self.capture_aux_hidden_states:
+            hidden_states = hidden_states, aux_hidden_states
+        return self._postprocess_output(
+            hidden_states, forward_batch.input_ids, forward_batch
+        )
+
+    def _postprocess_output(self, hidden_states, input_ids, forward_batch):
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
         hidden_states, pre_hc_head = hidden_states
 
         logits_metadata = forward_batch
-        tail = None
-        if (
-            self.capture_aux_hidden_states
-            and self.model.late_layer_start is not None
-            and forward_batch.forward_mode.is_extend_without_speculative()
-        ):
-            tail = get_attn_backend().tail_forward_metadata.late_layer_tail
-            input_ids = tail.rows(input_ids)
+        tail = self._get_dspark_prefill_tail(forward_batch)
+        token_indices = None
+        if tail is not None:
+            # CP output has been gathered into compact global request order.
+            # Ordinary prefill retains the rank-local/graph tail selector.
+            token_indices = tail.global_token_indices
+            input_ids = (
+                input_ids[token_indices]
+                if token_indices is not None
+                else tail.rows(input_ids)
+            )
+            if token_indices is None:
+                token_indices = tail.token_indices
             if tail.real_rows_count is not None:
                 # Fixed-capacity tail block from the prefill CUDA graph: drop padding.
                 n = tail.real_rows_count
                 input_ids = input_ids[:n]
                 hidden_states = hidden_states[:n]
                 pre_hc_head = pre_hc_head[:n]
+                token_indices = token_indices[:n]
                 if aux_hidden_states is not None:
                     aux_hidden_states = aux_hidden_states[:n]
             logits_metadata = LogitsMetadata.from_forward_batch(forward_batch)
@@ -5050,11 +5201,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             ),
         )
         if tail is not None:
-            output.hidden_states_token_indices = (
-                tail.token_indices[: tail.real_rows_count]
-                if tail.real_rows_count is not None
-                else tail.token_indices
-            )
+            output.hidden_states_token_indices = token_indices
         return output
 
     def _setup_fp8_wo_a_scales(self, is_nextn: bool) -> None:

@@ -44,7 +44,7 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import lru_cache
-from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Set, Union
+from typing import TYPE_CHECKING, Dict, Iterable, List, Mapping, Optional, Set, Union
 
 import torch
 
@@ -95,7 +95,7 @@ def _use_exact_chunk_fill() -> bool:
     on that kernel, against 1% for the hipBLASLt GEMMs that just run one extra
     partial tile.
     """
-    return envs.SGLANG_EXACT_CHUNK_FILL.get() and is_gfx95_supported()
+    return is_gfx95_supported()
 
 
 # Threshold for in-batch prefix cache.
@@ -632,6 +632,7 @@ class PrefillAdder:
         waiting_queue_len: int = 0,
         prefill_tile_block_m: int = 64,
         request_retirer: Optional[RequestRetirer] = None,
+        kv_awaiting_transfer: bool = False,
     ):
         self.page_size = page_size
         # DCP donates a checkpoint only on the kernel chunk grid. A cut off
@@ -647,6 +648,8 @@ class PrefillAdder:
             self.logical_page_size *= get_cp_strategy().cp_size
         self.running_batch = running_batch
         self.request_retirer = request_retirer
+        # Finished prefills hold KV until decode pulls it (PD prefill).
+        self.kv_awaiting_transfer = kv_awaiting_transfer
         self.new_token_ratio = new_token_ratio
         self.rem_input_tokens = rem_input_tokens - num_mixed_decode_tokens
         self.rem_chunk_tokens = rem_chunk_tokens
@@ -803,7 +806,7 @@ class PrefillAdder:
         extend_input_len: int,
         total_tokens: int,
         state_slots: int,
-        swa_host_hit_length: int,
+        window_host_hit_lengths: Mapping[str, int],
         chunk_limit: Optional[int],
     ) -> tuple[bool, Optional[int]]:
         return self.memory_budget.check_prefill(
@@ -812,9 +815,8 @@ class PrefillAdder:
             state_slots=state_slots,
             max_new_tokens=self._swa_new_tokens(req),
             input_tokens=len(req.full_untruncated_fill_ids),
-            swa_host_hit_length=swa_host_hit_length,
             chunk_limit=chunk_limit,
-            auxiliary_swa_host_hit_length=req.auxiliary_swa_host_hit_length,
+            window_host_hit_lengths=window_host_hit_lengths,
         )
 
     def _state_slots_for_req(self, req: Req, *, include_host_hit: bool = False) -> int:
@@ -1387,10 +1389,13 @@ class PrefillAdder:
         return self.budget_state()
 
     def _defer_staged_for_capacity_if_idle(self, req: Req, *, pool: str) -> None:
-        # Running work and admitted prefills (including continuing chunks) can
-        # release capacity. Only idle budget failures should force recomputation.
-        if self.can_run_list or (
-            self.running_batch is not None and self.running_batch.reqs
+        # Running work, admitted prefills (including continuing chunks) and KV
+        # awaiting a decode transfer can release capacity. Only idle budget
+        # failures should force recomputation.
+        if (
+            self.can_run_list
+            or (self.running_batch is not None and self.running_batch.reqs)
+            or self.kv_awaiting_transfer
         ):
             return
         if self.tree_cache.buffer_pipeline is not None:
@@ -1448,7 +1453,7 @@ class PrefillAdder:
                 total_tokens=total_tokens,
                 state_slots=state_slots,
                 host_hit_length=req.host_hit_length,
-                swa_host_hit_length=req.swa_host_hit_length,
+                window_host_hit_lengths=req.window_host_hit_lengths,
                 truncation_align_size=truncation_align_size,
                 has_chunked_req=has_chunked_req,
             )
@@ -1521,8 +1526,7 @@ class PrefillAdder:
                         ),
                         extend_input_len=admission.extend_len,
                         max_new_tokens=load_max_new,
-                        swa_host_hit_length=req.swa_host_hit_length,
-                        auxiliary_swa_host_hit_length=req.auxiliary_swa_host_hit_length,
+                        window_host_hit_lengths=req.window_host_hit_lengths,
                         chunk_limit=self.rem_chunk_tokens,
                     )
                     if not self.memory_budget.prepare_load_back(**load_budget):
@@ -1580,7 +1584,7 @@ class PrefillAdder:
                         total_tokens=total_tokens,
                         state_slots=state_slots,
                         host_hit_length=0,
-                        swa_host_hit_length=0,
+                        window_host_hit_lengths={},
                         truncation_align_size=truncation_align_size,
                         has_chunked_req=has_chunked_req,
                     )
@@ -1615,7 +1619,7 @@ class PrefillAdder:
         *,
         total_tokens: int,
         host_hit_length: int,
-        swa_host_hit_length: int,
+        window_host_hit_lengths: Mapping[str, int],
         truncation_align_size: Optional[int],
         has_chunked_req: bool = False,
         state_slots: int = 0,
@@ -1640,7 +1644,7 @@ class PrefillAdder:
             extend_input_len=extend_len,
             total_tokens=total_tokens,
             state_slots=state_slots,
-            swa_host_hit_length=swa_host_hit_length,
+            window_host_hit_lengths=window_host_hit_lengths,
             chunk_limit=chunk_limit,
         )
         if not can_admit:
@@ -1712,8 +1716,7 @@ class PrefillAdder:
                 max_new_tokens=0 if is_chunked else self._swa_new_tokens(req),
                 chunk_limit=chunk_limit,
                 state_slots=state_slots,
-                swa_host_hit_length=swa_host_hit_length,
-                auxiliary_swa_host_hit_length=req.auxiliary_swa_host_hit_length,
+                window_host_hit_lengths=window_host_hit_lengths,
             )
         ):
             return AddReqResult.NO_TOKEN
