@@ -1,44 +1,15 @@
-"""NPU release/resume of the device communication domains (``comm`` tag).
+"""NPU ``comm`` memory tag: release/resume of the device HCCL communication
+domains.
 
-Why this exists
----------------
-A sleeping NPU engine keeps every ``GroupCoordinator.device_group`` alive, and
-each HCCL communication domain behind those groups holds hundreds of MiB of
-device buffers.  They are not torch allocations, so neither
-``torch.npu.empty_cache()`` nor the torch-memory-saver tags can free them.
+Every ``GroupCoordinator.device_group`` holds an HCCL comm with hundreds of MiB
+of device buffers that are not torch allocations, so they are freed with
+``reinit_process_group(pg, rebuild_link=True)``: the comm dies, the
+ProcessGroup object stays alive (so cached ``device_group`` references remain
+valid) and resume rebuilds the comm eagerly.
 
-Why the ProcessGroup is not destroyed and rebuilt
-------------------------------------------------
-``torch_npu.distributed.reinit_process_group(pg, rebuild_link=True)`` destroys
-the HCCL comm behind a live ProcessGroup (``HcclCommDestroy`` after clearing
-the bootstrap store keys) and leaves the ProcessGroup object itself alive.  The
-comm is then rebuilt lazily by the next collective, or eagerly by
-``get_hccl_comm_name(rank, init_comm=True)``.
-
-That is the whole reason this backend is small: because the ProcessGroup object
-never changes identity, every place in the engine that cached
-``group.device_group`` (sampler sync groups, the prefill delayer's all-gather
-group, DeepEP dispatchers, MoE dispatchers, the Nemotron-H EP scalars, ...)
-keeps pointing at a live object.  A destroy + ``new_group`` rebuild would leave
-all of those dangling and force edits in every one of them.
-
-HCCL comm names are derived from the ProcessGroup's own group name
-(``ProcessGroupHCCL::createHcclCommConfigWithOptions`` copies
-``getGroupName()`` into ``hcclCommName``), so a rebuilt comm keeps the name the
-old one had.  Code that caches the *name* (the AscendOps EP comm name) therefore
-stays correct too.
-
-Ordering
---------
-Release: drop captured graphs, then destroy the comms.
-Resume: rebuild the comms, then recapture the graphs.
-
-The two must not be interleaved: a captured graph records the HCCL comm of the
-collective it captured, so the graph must be gone before that comm dies, and it
-may only be recaptured after a comm exists again.  Every step is collective
-(``HcclCommDestroy``, comm init, graph capture), so all ranks walk the same
-group list in the same order and synchronize on a gloo group around the device
-work.
+Ordering: release drops the captured graphs before destroying the comms, resume
+rebuilds the comms before recapturing the graphs.  Every step is collective, so
+all ranks walk the same groups in the same order.
 """
 
 from __future__ import annotations
@@ -82,19 +53,11 @@ _ADAPTIVE_STATE_GRAPH_ATTRS = (
 # Sort key for the default process group, which is not a GroupCoordinator.
 _DEFAULT_GROUP_NAME = "!default"
 
-# Names of the process groups whose comm this process actually destroyed.
-#
-# Restoring exactly this set matters: an HCCL comm is created lazily on the
-# first collective of a group, so a warmed-up engine usually has comms for the
-# groups it uses and none for the rest. Rebuilding "every group" would create
-# comms that never existed and cost hundreds of MiB each, so resume only
-# rebuilds what release destroyed and lets the rest stay lazy.
+# Names of the groups whose comm this process destroyed; resume rebuilds only
+# these and leaves every other group as lazy as it was before the sleep.
 _DESTROYED_GROUP_NAMES: List[str] = []
 
-# Whether this torch_npu build can answer "does this group have a comm
-# already?" without creating one. When it cannot, release still destroys (a
-# destroy of a missing comm is a no-op) but records nothing, so resume leaves
-# every group lazy instead of eagerly creating comms that never existed.
+# Whether this torch_npu can probe for an existing comm without creating one.
 _COMM_PROBE_SUPPORTED: bool = True
 
 
@@ -116,10 +79,7 @@ def _device_group_backend(pg: torch.distributed.ProcessGroup) -> Optional[Any]:
 def _comm_groups() -> List[Tuple[str, torch.distributed.ProcessGroup, Any, Any]]:
     """Every HCCL process group this process must release, sorted by name.
 
-    Sorted because HcclCommDestroy and comm init are entered by all ranks, so
-    every rank has to walk the same order. Each entry also carries the gloo
-    process group of the same ranks, which is used to keep the per-group
-    decisions identical on every member.
+    Sorted because all ranks must destroy/rebuild the comms in the same order.
     """
     from sglang.srt.distributed import parallel_state
 
@@ -158,9 +118,9 @@ def _default_group() -> Optional[torch.distributed.ProcessGroup]:
 
 
 def _world_cpu_group() -> torch.distributed.ProcessGroup:
-    from sglang.srt.distributed import parallel_state
+    from sglang.srt.runtime_context import get_parallel
 
-    return parallel_state.get_world_group().cpu_group
+    return get_parallel().world_group.cpu_group
 
 
 def _signature(
@@ -198,10 +158,7 @@ def _has_reinit_api() -> bool:
 def _has_live_comm(backend: Any, rank: int) -> bool:
     """Whether this rank already owns an HCCL comm for the group.
 
-    ``init_comm=False`` only reads the comm cache, so this never creates one.
-    Older torch_npu builds without that argument always initialize, in which
-    case the answer is "yes" and the group is destroyed; ``_COMM_PROBE_SUPPORTED``
-    then stays False so resume does not schedule an eager rebuild.
+    ``init_comm=False`` only reads the comm cache, so no comm is created.
     """
     global _COMM_PROBE_SUPPORTED
     try:
@@ -225,8 +182,7 @@ def _group_ranks(pg: torch.distributed.ProcessGroup) -> Optional[Tuple[int, ...]
 def _assert_group_members_agree(pg: torch.distributed.ProcessGroup, cpu_group) -> None:
     """Abort when the members of one group disagree about who is in it.
 
-    A (name, size) match is not enough: two ranks that disagree about the rank
-    list would enter the collective comm destroy/init with different members.
+    A (name, size) match is not enough: the rank lists must match too.
     """
     ours = _group_ranks(pg)
     if ours is None:
@@ -413,9 +369,7 @@ def _recapture_model_runner_graphs(model_runner: Any) -> bool:
     """Recapture prefill and decode graphs on the rebuilt comms."""
     if model_runner is None:
         return True
-    # init_*_cuda_graph() overwrites the runner attribute without cleaning the
-    # old one up, so drop anything still alive (a previous release may have
-    # failed) before capturing on top of it.
+    # init_*_cuda_graph() overwrites the runner attribute without cleanup.
     _drop_model_runner_graphs(model_runner)
     try:
         model_runner.init_prefill_cuda_graph()
@@ -448,12 +402,9 @@ def _recapture_spec_graphs(spec_worker: Any) -> bool:
 
 
 def _invalidate_cached_comm_names(model_runners: Sequence[Any]) -> None:
-    """Clear the EP comm name that the AscendOps MoE dispatcher caches.
+    """Clear the EP comm name cached by the AscendOps MoE dispatcher.
 
-    The rebuilt comm normally keeps the group-name-derived name, but torch_npu
-    clears its comm-name map on abort and HCCL may hand out a different string.
-    A dispatcher that caches the old name would then address a comm that no
-    longer exists, so make it re-fetch.
+    A rebuilt comm may get a different name, so the dispatcher must re-fetch it.
     """
     for model_runner in model_runners:
         model = getattr(model_runner, "model", None)
@@ -470,12 +421,7 @@ def _invalidate_cached_comm_names(model_runners: Sequence[Any]) -> None:
 
 
 def _invalidate_deepep_buffer() -> None:
-    """Drop DeepEP's cached buffer, which is bound to the old comm.
-
-    The next dispatch recreates it on the rebuilt comm. Guarded by getattr
-    because DeepEP is an optional, non-default MoE backend and its buffer state
-    is internal to that module.
-    """
+    """Drop DeepEP's cached buffer, which is bound to the old comm."""
     module = sys.modules.get("sglang.srt.layers.moe.token_dispatcher.deepep")
     buffer_cls = getattr(module, "DeepEPBuffer", None) if module is not None else None
     if buffer_cls is None:
@@ -517,13 +463,10 @@ class NPUSleepCommBackend(SleepCommBackend):
             get_parallel,
         )
 
-        # ModelImpl.MINDSPORE.value; compared as a string to keep this check
-        # free of the (heavy, cyclic) model_config import.
+        # Compared as a string to avoid importing model_config here.
         model_impl = getattr(get_model(), "model_impl", None)
         if str(getattr(model_impl, "value", model_impl) or "").lower() == "mindspore":
-            # MindSpore pins the torch HCCL comm handle into its own
-            # communication group (model_executor/mindspore_runner.py), so that
-            # handle would dangle as soon as the comm is rebuilt.
+            # MindSpore pins the torch HCCL comm handle into its own group.
             return (
                 "The 'comm' memory occupation tag is not supported with "
                 "model_impl=mindspore."
@@ -531,9 +474,7 @@ class NPUSleepCommBackend(SleepCommBackend):
 
         pp_size = getattr(get_parallel(), "pp_size", 1)
         if pp_size > 1:
-            # The control request only reaches the stages that share this
-            # scheduler's process set, so a world-group barrier around the comm
-            # rebuild would hang. Raise before anything is released.
+            # The request only reaches this process set, so a world barrier hangs.
             return (
                 "The 'comm' memory occupation tag is not supported with pipeline "
                 f"parallelism (pp_size={pp_size}); release the other tags without "
@@ -546,8 +487,7 @@ class NPUSleepCommBackend(SleepCommBackend):
             None,
             DisaggregationMode.NULL.value,
         ):
-            # The Ascend transfer engine is initialized against the live HCCL
-            # comm and keeps using that handle for KV transfer.
+            # The Ascend transfer engine keeps using the live HCCL comm handle.
             return (
                 "The 'comm' memory occupation tag is not supported with the "
                 "Ascend PD-disaggregation transfer backend."
@@ -560,9 +500,7 @@ class NPUSleepCommBackend(SleepCommBackend):
                 "does not provide."
             )
 
-        # The piecewise-compilation backend caches one NPUGraph per shape inside
-        # the compiled graph, and those graphs record the HCCL comm of the
-        # collectives they captured. Nothing here can drop them.
+        # Compiled piecewise graphs cache HCCL collectives nothing here can drop.
         flags = get_flags()
         if getattr(getattr(flags, "capture", None), "enable_torch_compile", False):
             return (
@@ -580,8 +518,7 @@ class NPUSleepCommBackend(SleepCommBackend):
             )
             has_comm_groups = False
         if not has_comm_groups:
-            # No HCCL process group in this process (for example the device
-            # backend is zbal), so there is no comm this backend can rebuild.
+            # No HCCL process group in this process (e.g. zbal device backend).
             return (
                 "The 'comm' memory occupation tag needs an HCCL device process "
                 "group, but this process has none."
@@ -625,9 +562,7 @@ class NPUSleepCommBackend(SleepCommBackend):
         failure: Optional[BaseException] = None
         for name, pg, backend, group_cpu_group in groups:
             _assert_group_members_agree(pg, group_cpu_group)
-            # Vote over the group's own ranks: the members must agree, or one
-            # rank would destroy a comm the others keep (and resume would then
-            # rebuild it on one rank only).
+            # Vote over the group's own ranks so they destroy the comm together.
             has_comm = _all_ranks_ok(_has_live_comm(backend, rank), group_cpu_group)
             if not has_comm:
                 logger.info(
@@ -635,8 +570,7 @@ class NPUSleepCommBackend(SleepCommBackend):
                 )
                 continue
             logger.info("[sleep-comm] destroying the comm of group '%s'", name)
-            # Recorded before the call so a failure part-way through this loop
-            # still tells resume which groups to rebuild.
+            # Recorded before the call so a partial failure still resumes it.
             if _COMM_PROBE_SUPPORTED:
                 _DESTROYED_GROUP_NAMES.append(name)
             try:
@@ -689,8 +623,7 @@ class NPUSleepCommBackend(SleepCommBackend):
         failure: Optional[BaseException] = None
         for name, pg, backend, group_cpu_group in groups:
             _assert_group_members_agree(pg, group_cpu_group)
-            # Same vote as release, so a rebuild never starts on one rank only
-            # (comm init is a collective and would hang).
+            # Same vote as release: comm init is collective and would hang.
             if not _all_ranks_ok(name in to_rebuild, group_cpu_group):
                 continue
             logger.info("[sleep-comm] rebuilding the comm of group '%s'", name)
@@ -717,10 +650,8 @@ class NPUSleepCommBackend(SleepCommBackend):
         _invalidate_cached_comm_names(model_runners)
         _invalidate_deepep_buffer()
 
-        # 3. Recapture the graphs. A rank that fails falls back to eager, which
-        #    changes its collective sequence, so every rank falls back together
-        #    when the vote is reachable (a rank that died inside a capture
-        #    collective cannot unblock its peers; that case needs a restart).
+        # 3. Recapture the graphs. Every rank falls back to eager together,
+        #    since eager changes its collective sequence.
         ok = True
         for model_runner in model_runners:
             ok = _recapture_model_runner_graphs(model_runner) and ok
@@ -743,11 +674,7 @@ class NPUSleepCommBackend(SleepCommBackend):
     def agree(self, proceed: bool) -> bool:
         """AND-reduce a local go/no-go decision over every rank.
 
-        The comm work is bracketed by world-group collectives, so a rank that
-        returns early on its own (for example because only its DP group is
-        busy) would leave the others waiting there for the whole gloo timeout.
-        Routing the decision through one collective keeps every rank on the
-        same side of that barrier.
+        A rank that returns early alone would leave the others in the barrier.
         """
         return _all_ranks_ok(proceed, _world_cpu_group())
 
@@ -767,12 +694,7 @@ class NPUSleepCommBackend(SleepCommBackend):
 
     @staticmethod
     def _init_comm(backend: Any, rank: int) -> None:
-        """Build the comm eagerly (equivalent to running a collective).
-
-        ``rank`` is advisory: torch_npu only uses it for a
-        ``rank % device_count == current_device`` warning and keys the comm by
-        the current device, so the process's global rank is the right value.
-        """
+        """Build the comm eagerly (equivalent to running a collective)."""
         try:
             backend.get_hccl_comm_name(rank, init_comm=True)
         except TypeError:

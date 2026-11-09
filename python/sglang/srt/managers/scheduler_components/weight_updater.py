@@ -500,13 +500,11 @@ class SchedulerWeightUpdaterManager:
             ignore_waiting=scheduler is not None and scheduler.pause_state.paused
         )
         proceed = error is None and idle
-        if backend is not None:
-            # The comm backend brackets its work with world-group collectives,
-            # and both idleness and the gate checks are decided per rank, so a
-            # rank that refuses on its own would leave the others waiting in
-            # that barrier.
+        if backend is not None and error is None and backend_tag in tags:
+            # Only the comm backend runs world-group collectives, so only this
+            # case joins a cross-rank vote.
             proceed = backend.agree(proceed)
-            if not proceed and error is None and idle:
+            if not proceed and idle:
                 error = (
                     "The release was refused on another rank of this process "
                     "set; see that rank's log."
@@ -520,15 +518,12 @@ class SchedulerWeightUpdaterManager:
                 )
             return ReleaseMemoryOccupationReqOutput(success=False, message=error)
 
-        # Idempotent: re-running an already released tag would touch unmapped
-        # memory on some platforms.
+        # Idempotent: skip tags that are already released.
         tags = [tag for tag in tags if tag not in self.offload_tags]
         if not tags:
             return ReleaseMemoryOccupationReqOutput(success=True, message="Success")
         comm_in_tags = backend_tag is not None and backend_tag in tags
-        # Claimed as each step completes, so a failure half way through still
-        # records what is actually offloaded (an unrecorded pause would make a
-        # later tag-less resume silently leave the memory unmapped).
+        # Claim each tag as its step completes, so a partial failure is recorded.
         applied = set()
         try:
             error = self._release_tags(
@@ -575,15 +570,13 @@ class SchedulerWeightUpdaterManager:
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_WEIGHTS)
             applied.add(GPU_MEMORY_TYPE_WEIGHTS)
 
-        # The comm backend owns the graph lifecycle: it drops the graphs and
-        # recaptures them, so the memory saver must not also pause this tag.
+        # The backend owns the graph lifecycle, so the memory saver must not
+        # also pause this tag.
         graph_tag_owned_by_backend = comm_in_tags and backend.handles_cuda_graph
         if GPU_MEMORY_TYPE_CUDA_GRAPH in tags:
             if graph_tag_owned_by_backend:
                 if GPU_MEMORY_TYPE_CUDA_GRAPH in self.offload_tags:
-                    # An earlier release already handed the graphs to the
-                    # memory saver; take them back before the backend destroys
-                    # them, or the tag stays paused for good.
+                    # Take the graphs back from the memory saver first.
                     self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_CUDA_GRAPH)
                 self.offload_tags.discard(GPU_MEMORY_TYPE_CUDA_GRAPH)
                 applied.add(GPU_MEMORY_TYPE_CUDA_GRAPH)
@@ -599,9 +592,7 @@ class SchedulerWeightUpdaterManager:
                     "Releasing the '%s' memory occupation tag failed.",
                     backend_tag,
                 )
-                # The comm domains may be half destroyed, so do not claim the
-                # tag: a retried release re-runs it, and the tags applied above
-                # are already recorded by the caller's finally block.
+                # Half destroyed: leave the tag unclaimed so a retry re-runs it.
                 return f"Releasing '{backend_tag}' failed: {e}"
             applied.add(backend_tag)
 
@@ -664,17 +655,13 @@ class SchedulerWeightUpdaterManager:
                     f"currently released: {not_released}"
                 )
         except ValueError as e:
-            if backend is not None:
-                # Keep the go/no-go decision uniform: this rank must not return
-                # while its peers walk into the world-group barrier.
-                backend.agree(False)
-            # There is no error channel on this output; the refusal and its
-            # reason go to the log, and the request can simply be retried.
+            # Request-local: no rank enters the backend, so do not join a world
+            # collective (that would hang under pp). Log-only, no error channel.
             logger.warning("Refusing the resume memory occupation request: %s", e)
             return ResumeMemoryOccupationReqOutput()
 
-        if backend is not None:
-            # Validation is rank-local but the backend is collective.
+        if comm_in_tags:
+            # Validation passed; align the go decision across the ranks.
             if not backend.agree(True):
                 logger.warning(
                     "The resume memory occupation request was refused on another "
@@ -682,11 +669,8 @@ class SchedulerWeightUpdaterManager:
                 )
                 return ResumeMemoryOccupationReqOutput()
 
-        # Claimed as each step completes: an unrecorded resume would make a
-        # later tag-less request act on a tag that is already mapped. The error
-        # string only gates the cuda_graph claim below; backend failures were
-        # already logged where they happened, and this output has no error
-        # channel to report them on.
+        # Claim each tag as its step completes; a backend failure (logged in
+        # place) only gates the cuda_graph claim below.
         applied = set()
         error = None
         try:
@@ -703,8 +687,7 @@ class SchedulerWeightUpdaterManager:
         self, tags, comm_in_tags, backend, backend_tag, applied
     ) -> Optional[str]:
         """Restore the tags, claiming each one in ``applied``; return an error."""
-        # Graphs are recaptured fresh by the backend, so there is nothing to
-        # hand back to the memory saver for this tag.
+        # The backend recaptures the graphs itself, so skip the memory saver.
         if GPU_MEMORY_TYPE_CUDA_GRAPH in tags and not (
             comm_in_tags and backend.handles_cuda_graph
         ):
@@ -748,8 +731,7 @@ class SchedulerWeightUpdaterManager:
                 logger.exception(
                     "Resuming the '%s' memory occupation tag failed.", backend_tag
                 )
-                # The comm domains may be half rebuilt, so do not claim the
-                # tag: a retried resume re-runs it.
+                # Half rebuilt: leave the tag unclaimed so a retry re-runs it.
                 return f"Resuming '{backend_tag}' failed: {e}"
             applied.add(backend_tag)
         return None

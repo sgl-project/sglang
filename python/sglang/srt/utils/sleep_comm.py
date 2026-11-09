@@ -1,20 +1,8 @@
 """Platform seam for the optional sleep-mode ``comm`` memory tag.
 
-The scheduler owns tag bookkeeping (`offload_tags`, the release/resume order,
-the request/response plumbing).  A platform that can release and rebuild its
-own device communication domains registers a ``SleepCommBackend`` here from its
-own initialization path; this module never imports a platform, so a platform
-that does not register keeps the historical tag set and behaviour unchanged.
-
-Registered backends add exactly one tag (``SleepCommBackend.tag``).  Where a
-tag is honored:
-
-* a tag-less release means ``GPU_MEMORY_ALL_TYPES`` plus the platform tags of
-  the *current* process, so NPU full sleep includes ``comm`` while CUDA full
-  sleep does not (a tag-less resume always means "whatever is released");
-* an explicit platform tag from a client that the current platform did not
-  register is dropped with a log line instead of failing the request, so one
-  client can send the same tag list to every platform.
+A platform registers a ``SleepCommBackend`` from its own init path, and a
+platform without one keeps the historical tags. An explicit tag of an
+unregistered platform is dropped with a log line instead of failing the request.
 """
 
 from __future__ import annotations
@@ -24,10 +12,7 @@ from typing import Any, ClassVar, FrozenSet, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-#: The memory-occupation tag served by platform sleep-comm backends. Defined
-#: here rather than in sglang.srt.constants so this bottom layer of
-#: sglang.srt.utils keeps its "no srt-domain module-level import" property
-#: (enforced by scripts/lint/check_srt_utils_imports.py).
+#: Tag served by platform sleep-comm backends; kept here to avoid an srt import.
 GPU_MEMORY_TYPE_COMM = "comm"
 
 #: Tags accepted only when the current process registered a backend for them.
@@ -39,19 +24,16 @@ _BACKEND_CLS: Optional[type] = None
 class SleepCommBackend:
     """Release/resume of the device communication domains for one tag.
 
-    An instance is created per request, so a backend must keep no state of its
-    own; process-wide state belongs in module scope.
+    Instances are created per request, so backends keep no state of their own.
     """
 
     #: The memory-occupation tag this backend serves.
     tag: ClassVar[str] = GPU_MEMORY_TYPE_COMM
 
-    #: The backend drops and recaptures graphs itself, so the scheduler must not
-    #: also hand the ``cuda_graph`` tag to the memory saver.
+    #: The backend owns the graph lifecycle, so the memory saver must skip it.
     handles_cuda_graph: ClassVar[bool] = False
 
-    #: Tags that must be resumed in the same request, because ``resume`` reads
-    #: them (recapturing a graph runs the model).
+    #: Tags that must be resumed in the same request, since ``resume`` reads them.
     resume_requires: ClassVar[FrozenSet[str]] = frozenset()
 
     def __init__(self, tp_worker: Any, draft_worker: Any, scheduler: Any) -> None:
@@ -65,8 +47,7 @@ class SleepCommBackend:
         return None
 
     def agree(self, proceed: bool) -> bool:
-        """AND-reduce a local go/no-go decision over every rank that this
-        backend's device work spans, or return ``proceed`` when it has none."""
+        """AND-reduce the go/no-go decision over the ranks this backend spans."""
         return proceed
 
     def release(self) -> None:
@@ -113,11 +94,7 @@ def default_release_tags() -> List[str]:
 
 
 def resolve_release_tags(raw_tags: Optional[List[str]]) -> List[str]:
-    """Resolve a request's tag list; raise ValueError on an unknown tag.
-
-    Kept free of side effects so a rejected request can be answered before any
-    resource is touched.
-    """
+    """Resolve a request's tag list; raise ValueError on an unknown tag."""
     if not raw_tags:
         return default_release_tags()
 

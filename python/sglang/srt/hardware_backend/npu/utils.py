@@ -228,10 +228,7 @@ def init_npu_backend():
         torch_npu.npu.config.allow_internal_format = True
     torch_npu.npu.set_compile_mode(jit_compile=False)
 
-    # Register the NPU executor for the sleep-mode `comm` tag so the scheduler
-    # can release/rebuild HCCL communication domains without knowing the
-    # platform. Nothing else in sglang registers a sleep-comm backend, so other
-    # platforms keep their tag set and behaviour unchanged.
+    # Enable the sleep-mode `comm` tag on NPU.
     from sglang.srt.hardware_backend.npu.sleep_comm import NPUSleepCommBackend
     from sglang.srt.utils.sleep_comm import register_sleep_comm_backend
 
