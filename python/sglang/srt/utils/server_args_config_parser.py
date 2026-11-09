@@ -11,8 +11,6 @@ from typing import Any, Dict, List
 
 import yaml
 
-from sglang.srt.arg_groups.argparse_actions import DeprecatedAction
-
 logger = logging.getLogger(__name__)
 
 
@@ -31,6 +29,8 @@ def _takes_one_value(action: argparse.Action) -> bool:
 
 
 def _is_boolean_flag(action: argparse.Action) -> bool:
+    from sglang.srt.arg_groups.argparse_actions import DeprecatedAction
+
     return isinstance(action, argparse._StoreTrueAction) or (
         isinstance(action, DeprecatedAction)
         and action.nargs == 0
