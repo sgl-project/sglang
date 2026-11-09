@@ -41,14 +41,36 @@ def keep_sana_video_prompt_shape(
     return call_kwargs
 
 
+def _resize_nested_prompt_dim(value: Any, source: int, target: int) -> Any:
+    if torch.is_tensor(value):
+        if value.ndim > 1 and value.shape[1] == source:
+            if target > source:
+                return bcg_utils.pad_tensor_dim(value, 1, target, value=0)
+            return value[:, :target]
+        return value
+    if isinstance(value, list):
+        return [_resize_nested_prompt_dim(item, source, target) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_resize_nested_prompt_dim(item, source, target) for item in value)
+    if isinstance(value, dict):
+        return {
+            key: _resize_nested_prompt_dim(item, source, target)
+            for key, item in value.items()
+        }
+    return value
+
+
 def sana_video_warmup_kwargs(call_kwargs: dict, _current_model: Any) -> dict | None:
-    """Add the 300-token capture input for a compact 64-token SANA prompt."""
+    """Return capture kwargs for the SANA width not present in this warmup."""
     embeddings = bcg_utils.first_tensor(call_kwargs.get("encoder_hidden_states"))
-    if (
-        not torch.is_tensor(embeddings)
-        or embeddings.ndim != 3
-        or embeddings.shape[1] != _COMPACT_PROMPT_LENGTH
-    ):
+    if not torch.is_tensor(embeddings) or embeddings.ndim != 3:
+        return None
+    source = embeddings.shape[1]
+    if source == _COMPACT_PROMPT_LENGTH:
+        target = _DEFAULT_PROMPT_LENGTH
+    elif source == _DEFAULT_PROMPT_LENGTH:
+        target = _COMPACT_PROMPT_LENGTH
+    else:
         return None
 
     out = dict(call_kwargs)
@@ -65,13 +87,7 @@ def sana_video_warmup_kwargs(call_kwargs: dict, _current_model: Any) -> dict | N
             or tensor.shape[:2] != embeddings.shape[:2]
         ):
             return None
-        out[key] = bcg_utils.pad_nested_dim(
-            value,
-            dim=1,
-            source=_COMPACT_PROMPT_LENGTH,
-            target=_DEFAULT_PROMPT_LENGTH,
-            value=0,
-        )
+        out[key] = _resize_nested_prompt_dim(value, source, target)
     return out
 
 
