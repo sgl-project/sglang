@@ -534,20 +534,27 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             _LARGE_INDEXER_QUERY_THRESHOLD,
         )
 
-        batch = SimpleNamespace(
-            forward_mode=ForwardMode.EXTEND,
-            _original_forward_mode=None,
-            tbo_parent_token_range=None,
-        )
-        for backend_choice, num_qo_tokens, builds in (
-            ("auto", _LARGE_INDEXER_QUERY_THRESHOLD, False),
-            ("auto", _LARGE_INDEXER_QUERY_THRESHOLD + 1, True),
-            ("cutedsl_h16", 1, False),
-            ("cutedsl_h16", _LARGE_INDEXER_QUERY_THRESHOLD, False),
-            ("cutedsl_h16", _LARGE_INDEXER_QUERY_THRESHOLD + 1, True),
+        # MLP sync padding: the batch carries 4 rows past the metadata's real rows.
+        for backend_choice, num_qo_tokens, padded, builds in (
+            ("auto", _LARGE_INDEXER_QUERY_THRESHOLD, False, False),
+            ("auto", _LARGE_INDEXER_QUERY_THRESHOLD + 1, False, True),
+            ("auto", _LARGE_INDEXER_QUERY_THRESHOLD, True, False),
+            ("cutedsl_h16", 1, False, False),
+            ("cutedsl_h16", _LARGE_INDEXER_QUERY_THRESHOLD, False, False),
+            ("cutedsl_h16", _LARGE_INDEXER_QUERY_THRESHOLD + 1, False, True),
         ):
-            with self.subTest(backend=backend_choice, num_qo_tokens=num_qo_tokens):
+            with self.subTest(
+                backend=backend_choice, num_qo_tokens=num_qo_tokens, padded=padded
+            ):
+                batch = SimpleNamespace(
+                    forward_mode=ForwardMode.EXTEND,
+                    _original_forward_mode=None,
+                    tbo_parent_token_range=None,
+                    positions=torch.zeros(num_qo_tokens + (4 if padded else 0)),
+                )
                 backend = self._make_prefill_backend()
+                if padded:
+                    backend.forward_metadata.real_num_tokens = num_qo_tokens
                 backend.dsv4_prefill_backend = backend_choice
                 build = backend._build_sparse_prefill_chunk_cache
 
@@ -558,10 +565,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
                         return_value=SimpleNamespace(is_sm120=False),
                     ),
                 ):
-                    shared_read_ends = backend.resolve_prefill_shared_read_ends(
-                        batch,
-                        num_qo_tokens=num_qo_tokens,
-                    )
+                    shared_read_ends = backend.resolve_prefill_shared_read_ends(batch)
 
                 metadata = backend.forward_metadata
                 if builds:
@@ -577,16 +581,11 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
 
     def test_prefill_snapshot_skips_layers_reading_live_tables(self):
         from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
-        from sglang.srt.layers.attention.dsv4.metadata import (
-            _LARGE_INDEXER_QUERY_THRESHOLD,
-        )
 
         batch = SimpleNamespace(forward_mode=ForwardMode.EXTEND)
         backend = self._make_prefill_backend(hisparse_coordinator=object())
 
-        shared_read_ends = backend.resolve_prefill_shared_read_ends(
-            batch, num_qo_tokens=_LARGE_INDEXER_QUERY_THRESHOLD + 1
-        )
+        shared_read_ends = backend.resolve_prefill_shared_read_ends(batch)
 
         self.assertIs(shared_read_ends, SharedReadEnds.UNKNOWN)
         backend._build_sparse_prefill_chunk_cache.assert_not_called()
