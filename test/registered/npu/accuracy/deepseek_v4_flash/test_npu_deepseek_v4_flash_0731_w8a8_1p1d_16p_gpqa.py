@@ -1,3 +1,4 @@
+import json
 import unittest
 
 from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
@@ -11,7 +12,7 @@ from sglang.test.ascend.e2e.test_npu_performance_utils import (
 from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(
-    est_time=3800,
+    est_time=3000,
     suite="",
     nightly=True,
 )
@@ -40,6 +41,7 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_COMMON_ENVS = {
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
     "USE_NPU_MOE_GATING_TOP_K": "1",
     "SGLANG_RAGGED_VERIFY_MODE": "static",
+    "SGLANG_DSPARK_FAST_KERNEL": "0",
     "SGLANG_DSPARK_FAST_SAMPLING": "0",
     "SGLANG_DSPARK_ENABLE_MULTI_STREAM": "0",
     "SGLANG_DSPARK_QUANT_AUDIT": "1",
@@ -78,6 +80,28 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_DECODE_ENVS = {
     "SGLANG_NPU_SPLIT_SHARED_EXPERT_OVERLAP": "1",
     "SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX": "1",
 }
+
+META_SERVICE_PORT = 5007
+CONFIG_STORE_PORT = 6007
+META_METRICS_PORT = 8007
+
+METASERVICE_CONFIG = {
+    "meta_service_url": f"tcp://127.0.0.1:{META_SERVICE_PORT}",
+    "config_store_url": f"tcp://127.0.0.1:{CONFIG_STORE_PORT}",
+    "metrics_url": f"http://127.0.0.1:{META_METRICS_PORT}",
+}
+
+
+HICACHE_STORAGE_EXTRA_CONFIG = json.dumps(
+    {
+        "meta_service_url": METASERVICE_CONFIG["meta_service_url"],
+        "config_store_url": METASERVICE_CONFIG["config_store_url"],
+        "log_level": "info",
+        "world_size": 16,
+        "protocol": "device_sdma",
+        "dram_size": "4GB",
+    }
+)
 
 # Prefill node launch arguments.
 DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS = [
@@ -139,6 +163,10 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS = [
     "--enable-cache-report",
     "--max-total-tokens",
     140000,
+    "--hicache-storage-backend",
+    "npu_memcache",
+    "--hicache-storage-backend-extra-config",
+    HICACHE_STORAGE_EXTRA_CONFIG,
 ]
 
 # Decode node launch arguments.
@@ -224,21 +252,28 @@ class TestNPUDeepSeekV4Flash0731W8A8PDSEPGPQAHigh(
     """Test NPU accuracy for DeepSeek-V4-Flash W8A8 16p 1P1D GPQA."""
 
     model_config = DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_MODEL_CONFIG
+    # Start the npu_memcache MetaService on the prefill node before the model
+    # server, as required by the L3 cache backend.
+    meta_service_config = METASERVICE_CONFIG
     # (reference: Flash W8A8 GPQA Diamond baseline is 0.874).
     accuracy = 0.874
     datasets = ["gpqa_diamond"]
     generation_config = DEEPSEEK_V4_FLASH_0731_W8A8_GENERATION_CONFIG_HIGH
-    eval_batch_size = 128
-    min_hit_rate_pcts = {"host": 0}  # percent: L2 host hit rate must exceed 0%
+    eval_batch_size = 64
+    min_hit_rate_pcts = {
+        "host": 0,  # L2 host hit rate baseline
+        "storage": 0,  # L3 storage hit rate baseline
+    }
 
     def test_npu_deepseek_v4_flash_0731_w8a8_pd_sep_gpqa_high(self):
         """Run NPU accuracy test for DSV4-Flash-0731 PD-Sep GPQA High mode."""
         self.run_accuracy()
 
-    def test_npu_deepseek_v4_flash_0731_w8a8_1p1d_16p_l2_host_hit_rate(self):
-        """Run the 32k GSP bench; assert_metrics checks the host hit rate"""
+    def test_npu_deepseek_v4_flash_0731_w8a8_1p1d_16p_l2_l3_hit_rate(self):
+        """Run the 32k GSP bench; assert_metrics checks the L2 and L3 hit rates"""
         # 3 groups x 32 prompts share a 28800-token system prompt (32k * 0.9)
-        # plus a 3200-token question, which exceeds L1 so evictions land in L2.
+        # plus a 3200-token question, which exceeds L1 so evictions land in L2
+        # and L3.
         metrics = run_bench_serving(
             host=self.host,
             port=self.port,
