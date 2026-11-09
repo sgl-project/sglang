@@ -39,13 +39,13 @@ concurrency:
 
 jobs:
   publish:
-    if: false
+    if: github.repository == 'sgl-project/sglang' && (github.event_name != 'workflow_dispatch' || inputs.job_select == 'all' || inputs.job_select == 'publish')
     runs-on: amd-docker-scale
     environment: 'prod'
     strategy:
       fail-fast: false
       matrix:
-        gpu_arch: ${{ fromJson((github.event_name == 'workflow_dispatch' && inputs.gpu_arch != 'all' && inputs.gpu_arch != '') && format('["{0}"]', inputs.gpu_arch) || '["gfx942-rocm1000", "gfx950-rocm1000"]') }}
+        gpu_arch: ['gfx950-rocm1000']
         build_type: ['all']
     steps:
       - name: Checkout repository
@@ -101,7 +101,7 @@ jobs:
               ;;
           esac
 
-          image_tag="v${VERSION}-${rocm_tag}-${DATE}_triton39_test"
+          image_tag="v${VERSION}-${rocm_tag}-${DATE}_triton39_utlx_test"
           echo "IMAGE_TAG=${image_tag}" >> "$GITHUB_ENV"
 
           docker build . \
@@ -109,6 +109,7 @@ jobs:
             --build-arg "SGL_BRANCH=${GITHUB_SHA}" \
             --build-arg "BUILD_TYPE=${BUILD_TYPE}" \
             --build-arg "GPU_ARCH=${GPU_ARCH}" \
+            --build-arg BUILD_UTLX=1 \
             --build-arg ENABLE_MORI=1 \
             --build-arg ENABLE_NIXL=1 \
             --build-arg "SETUPTOOLS_SCM_PRETEND_VERSION=${PRETEND_VERSION}" \
