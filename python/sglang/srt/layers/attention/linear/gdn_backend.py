@@ -56,11 +56,8 @@ from sglang.srt.runtime_context import (
     mamba_cache_chunk_size,
 )
 from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu, is_xpu
-from sglang.srt.utils.common import (
-    get_bool_env_var,
-    is_pin_memory_available,
-    rank0_log,
-)
+from sglang.srt.utils.device import is_pin_memory_available
+from sglang.srt.utils.log_utils import rank0_log
 
 logger = logging.getLogger(__name__)
 
@@ -300,10 +297,7 @@ def _aiter_gdn_prefill_conv():
     global _AITER_GDN_CONV_UNAVAILABLE
     if _AITER_GDN_CONV_UNAVAILABLE:
         return None
-    if not (
-        get_bool_env_var("SGLANG_USE_AITER")
-        and get_bool_env_var("SGLANG_AITER_GDN_CONV")
-    ):
+    if not (envs.SGLANG_USE_AITER.get() and envs.SGLANG_AITER_GDN_CONV.get()):
         _AITER_GDN_CONV_UNAVAILABLE = True
         return None
     try:
