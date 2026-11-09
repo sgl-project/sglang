@@ -10,6 +10,7 @@ import unittest
 
 import torch
 
+from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.build import UnifiedBuildContext, build_kv_storage
 from sglang.srt.mem_cache.kv.decl import (
@@ -67,7 +68,25 @@ def _draft_placement(decls, *, target_window, draft_window):
     ).placement
 
 
-def _storage(plan):
+def _storage(windows, *, device="cpu", lazy=True):
+    """A storage of the target's window ``windows[0]`` and, when given, a fused
+    draft's window ``windows[1]`` of another length."""
+    target, *drafts = windows
+    assert len(drafts) <= 1, "a draft adds at most one window"
+    decls = _decls(target)
+    placement = (
+        _draft_placement(decls, target_window=target, draft_window=drafts[0])
+        if drafts
+        else None
+    )
+    return _build(
+        plan_kv_storage(decls, page_size=4, fused_draft=placement),
+        device=device,
+        lazy=lazy,
+    )
+
+
+def _build(plan, *, device="cpu", lazy=True):
     setup_allocator_context()
     sized = size_plan(
         plan,
@@ -81,14 +100,14 @@ def _storage(plan):
         ),
     )
     ctx = UnifiedBuildContext(
-        device="cpu",
+        device=device,
         start_layer=0,
         end_layer=2,
         enable_memory_saver=False,
         need_sort=False,
         max_num_reqs=3,
         model_context_len=64,
-        lazy_compaction=True,
+        lazy_compaction=lazy,
     )
     return build_kv_storage(plan, sized, ctx)
 
@@ -206,7 +225,7 @@ class TestDraftWindowNames(CustomTestCase):
 
 class TestWindowRole(CustomTestCase):
     def test_the_sliding_window_role_finds_the_target_window(self):
-        storage = _storage(plan_kv_storage(_decls(16), page_size=4))
+        storage = _storage((16,))
         router = storage.allocator.get_kvcache().layer_router
         self.assertEqual(router.sub_pool(IdSpaceKind.SLIDING_WINDOW).name, "window_16")
         self.assertIs(router.view(IdSpaceKind.SLIDING_WINDOW), router.view("window_16"))
@@ -219,7 +238,7 @@ class TestWindowRole(CustomTestCase):
     def test_runner_ids_resolve_the_role_to_the_target_window(self):
         from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
 
-        storage = _storage(plan_kv_storage(_decls(16), page_size=4))
+        storage = _storage((16,))
         alloc = storage.allocator
         runner = RunnerIds(
             req_to_token=storage.requests.req_to_token,
@@ -254,7 +273,7 @@ class TestWindowRole(CustomTestCase):
                     decls, target_window=16, draft_window=draft_window
                 )
                 plan = plan_kv_storage(decls, page_size=4, fused_draft=placement)
-                storage = _storage(plan)
+                storage = _build(plan)
                 alloc = storage.allocator
                 pool = routed_draft_pool(
                     arena=alloc.arena,
@@ -286,6 +305,88 @@ class TestWindowRole(CustomTestCase):
                     runner.ids_in(IdSpaceKind.SLIDING_WINDOW, ids),
                     alloc.id_spaces()[host].ids(ids),
                 )
+
+
+class TestEveryWindowBudget(CustomTestCase):
+    """A decode preallocation is priced against every window's budget by name:
+    a further window that cannot hold its running growth refuses the request."""
+
+    def _allocator(self):
+        storage = _storage((16, 8))
+        return storage.allocator
+
+    def _fits(self, allocator, budgets):
+        page = allocator.page_size
+        names = allocator.window_pool_names()
+        demand = KVDemand(page, dict.fromkeys(names, page), 0)
+        return allocator.prealloc_fits(
+            demand,
+            evictable={},
+            full_budget_tokens=allocator.full_available_size(),
+            window_budget_tokens=budgets,
+        )
+
+    def test_a_further_window_holding_back_its_growth_refuses(self):
+        allocator = self._allocator()
+        target = allocator.target_window_pool()
+        (further,) = [n for n in allocator.window_pool_names() if n != target]
+        page = allocator.page_size
+        generous = {target: allocator.window_available_size(target)}
+        reachable = allocator.window_available_size(further)
+        # Holding nothing back, the further window admits the request ...
+        self.assertTrue(self._fits(allocator, generous))
+        self.assertTrue(self._fits(allocator, {**generous, further: reachable}))
+        # ... and holding all but this request's page back for running
+        # requests' growth refuses it, though the target's window could serve.
+        self.assertFalse(self._fits(allocator, {**generous, further: page}))
+        # A request beyond its window's budget is refused outright.
+        self.assertFalse(self._fits(allocator, {**generous, further: page - 1}))
+
+
+class TestSharedBytesServeEitherSide(CustomTestCase):
+    """Regression: with every row cached and nothing free, a decode preallocation
+    whose owner tokens need reclaimed window bytes must be admitted."""
+
+    def test_window_entries_make_owner_room(self):
+        from sglang.test.unified_allocator_fixtures import (
+            UnifiedGeometry,
+            build_unified_bundle,
+            setup_allocator_context,
+        )
+
+        setup_allocator_context()
+        allocator = build_unified_bundle(
+            UnifiedGeometry(
+                chain="swa",
+                full_layer_ids=(0,),
+                swa_layer_ids=(1,),
+                page_size=4,
+                full_tokens=256,
+                swa_tokens=256,
+                context_len=256,
+            )
+        ).token_to_kv_pool_allocator
+        (window,) = allocator.window_pool_names()
+        held = 0
+        while allocator.alloc(4) is not None:
+            held += 4
+        owner = allocator.full_attn_allocator.sub_pool_name
+        # Every row is a cached entry the prefix cache could evict.
+        evictable = {owner: held, window: held}
+        budget = allocator.full_available_size() + held
+        demand = KVDemand(budget + held // 2, {window: 4}, 0)
+        self.assertGreater(demand.full_tokens, budget)
+        self.assertTrue(allocator.admits(demand, evictable=evictable))
+        self.assertTrue(
+            allocator.prealloc_fits(
+                demand,
+                evictable=evictable,
+                full_budget_tokens=budget,
+                window_budget_tokens={
+                    window: allocator.window_available_size(window) + held
+                },
+            )
+        )
 
 
 if __name__ == "__main__":

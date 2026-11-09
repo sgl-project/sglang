@@ -13,7 +13,7 @@ from sglang.srt.runtime_context import (
     mamba_track_grid,
 )
 from sglang.srt.utils.common import ceil_align, flatten_arrays_to_pinned_cpu
-from sglang.srt.utils.device import async_h2d, is_hip, is_pin_memory_available
+from sglang.srt.utils.device import async_h2d, is_pin_memory_available
 from sglang.srt.utils.weight_versions import (
     WeightVersionEvent,
     WeightVersionSpans,
@@ -129,6 +129,7 @@ from sglang.srt.mem_cache.common import (
     match_kv_cache,
 )
 from sglang.srt.mem_cache.kv.advance import TrackingAdvance
+from sglang.srt.mem_cache.kv.alloc.demand import windows_retire_by_forward
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.srt.model_executor.encoder_swa_replay import resets_swa_window
@@ -168,8 +169,6 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
 logger = logging.getLogger(__name__)
-
-_is_hip = is_hip()
 
 
 def get_batch_return_hidden_states_mode(reqs: List[Req]) -> CaptureHiddenMode:
@@ -2935,9 +2934,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if selected_indices is None
             else [self.reqs[i] for i in selected_indices]
         )
-        return self.token_to_kv_pool_allocator.check_decode_capacity(
+        from sglang.srt.mem_cache.capacity import check_decode_capacity
+
+        return check_decode_capacity(
+            self.tree_cache,
+            self.token_to_kv_pool_allocator,
             num_tokens=num_tokens,
-            tree_cache=self.tree_cache,
             requests=requests,
             spec_algorithm=self.spec_algorithm,
         )
@@ -3554,12 +3556,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         per-request token gating synchronizes SWA pressure across DP ranks and
         triggers a retraction / re-prefill storm at high concurrency.
         """
-        if _is_hip:
-            from sglang.srt.layers.moe.utils import get_moe_a2a_backend
-
-            if get_moe_a2a_backend().is_megamoe():
-                due_this_forward = (self.forward_iter or 0) % eviction_interval == 0
-                return (lambda req: due_this_forward), 1
+        if windows_retire_by_forward():
+            due_this_forward = (self.forward_iter or 0) % eviction_interval == 0
+            return (lambda req: due_this_forward), 1
         windows = self.tree_cache.window_lengths()
         return (
             lambda req: any(

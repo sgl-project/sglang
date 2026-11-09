@@ -1193,6 +1193,11 @@ class HybridCacheController(BaseHiCacheController):
             assert len(device_indices) == len(host_indices)
         elif not need_load_kv:
             device_indices = torch.empty((0,), dtype=torch.int64, device=self.device)
+        elif self.kv_storage is not None:
+            take_owner_rows, _ = self.kv_storage.owner_load_alloc()
+            device_indices = take_owner_rows(len(host_indices))
+            if device_indices is None:
+                return None
         else:
             if isinstance(full_allocator, PageInterleavePoolAllocator):
                 # Loaded pages keep their host copies' owners; host slots share
@@ -1215,7 +1220,11 @@ class HybridCacheController(BaseHiCacheController):
         )
         if pool_transfers is None and extra_pools:
             if need_load_kv and not caller_owned:
-                full_allocator.free(device_indices)
+                if self.kv_storage is not None:
+                    _, give_back = self.kv_storage.owner_load_alloc()
+                    give_back(device_indices)
+                else:
+                    full_allocator.free(device_indices)
             return None
 
         self.load_queue.append(

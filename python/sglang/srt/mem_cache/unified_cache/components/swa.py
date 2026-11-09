@@ -7,7 +7,6 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
-    EvictParams,
     IncLockRefResult,
     InsertParams,
     InsertResult,
@@ -20,6 +19,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PoolTransferResult,
 )
+from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.mem_cache.kv.plan import TREE_WINDOW
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeComponentDeviceSlot,
@@ -1281,9 +1281,10 @@ class SWAComponent(TreeComponent):
         if phase == LinkerTransferPhase.LOAD:
             num_tokens = len(tail_keys) * page
             storage, sub_pool = self.storage_and_sub_pool()
-            shortfall = max(0, num_tokens - storage.available_units(sub_pool))
-            if shortfall:
-                self.cache.evict(EvictParams(window_num_tokens={sub_pool: shortfall}))
+            if storage.available_units(sub_pool) < num_tokens:
+                self.cache.evict_for_alloc(
+                    KVDemand(window_tokens={sub_pool: num_tokens})
+                )
             transfer.device_indices = storage.take_units(sub_pool, num_tokens)
             if transfer.device_indices is None:
                 return None

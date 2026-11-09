@@ -122,9 +122,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# The default window of a window payload: the scheduler's sliding window.
-_SCHEDULER_WINDOW = object()
-
 # TP=1 yield between polls of a pending result. An initial heuristic rather
 # than a tuned value: long enough that the bootstrap, transfer and cache
 # threads reliably win the GIL even when the input socket is empty, and far
@@ -1820,21 +1817,19 @@ class SchedulerDisaggregationPrefillMixin:
                     .numpy()
                 ]
 
-            def _swa_payload(sub_pool=None, window=_SCHEDULER_WINDOW):
-                if window is _SCHEDULER_WINDOW:
-                    # Read only when a window entry is sent.
-                    window = self.sliding_window_size
+            def _swa_payload(sub_pool=None):
                 storage = kv_storage_of(
                     self.req_to_token_pool, self.token_to_kv_pool_allocator
                 )
                 if sub_pool is None:
                     sub_pool = window_sub_pool_of(self.token_to_kv_pool_allocator)
+                # The whole tail the decode keeps, readers reaching further
+                # back than the window included.
                 resume = storage.resume_units(
                     sub_pool,
                     req,
                     token_start=req.disagg_decode_prefix_len,
                     token_boundary=seq_len,
-                    window=window,
                 )
                 units = resume.unit_ids
                 return _DeviceRows(units) if host_indices else units.cpu().numpy()
@@ -1913,8 +1908,7 @@ class SchedulerDisaggregationPrefillMixin:
                             self.req_to_token_pool, self.token_to_kv_pool_allocator
                         ),
                         StateType.AUXILIARY_SWA,
-                    ),
-                    None,
+                    )
                 ),
                 StateType.DSA: _dsa_pages_payload,
                 StateType.DSA_TAIL: _dsa_tail_payload,
