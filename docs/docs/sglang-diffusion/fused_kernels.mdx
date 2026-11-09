@@ -133,6 +133,7 @@ These fusion families mount under both `quality="lossless"` and
 | --- | --- | --- | --- |
 | `modulate_scale_shift` | JIT CUDA | bit-exact | `x * (1 + scale) + shift` |
 | `residual_gate_add` | KDA (JIT CUDA) | bit-exact | `residual + gate * update` |
+| `residual_gate_fp32` | Triton | bit-exact against the verified native `addcmul` dispatch | Joy Image Edit large BF16 residual updates on SM103; keeps the product in FP32 until the final cast |
 | `try_fused_scaled_residual_bf16` | Triton | bit-exact against the verified native dispatch | LingBot World causal BF16 residual with an FP32 per-frame gate; skips the unused normalized output before camera conditioning |
 | `timestep_embedding` | JIT CUDA | close | sinusoidal timestep embedding |
 | `temb_table_slices` | Triton | bit-exact | see note below |
@@ -143,6 +144,11 @@ affine row per token. The causal normalization and residual paths verify each
 new signature outside CUDA graph capture and fall back to their native chains
 on mismatch or unsupported layouts. These paths preserve `lossless` arithmetic;
 kernel replay support does not enable BCG for a model configuration that disables it.
+
+Joy uses `residual_gate_fp32` for contiguous BF16 residual updates with at least
+16,777,216 elements on SM103. Each new shape and gate-stride signature is
+verified against `torch.addcmul`. Small text updates, other layouts and
+architectures, gradient-enabled calls, and compilation retain the native path.
 
 <Tip>
 `temb_table_slices` is worth knowing about. The eager `(scale_shift_table + temb.float()).chunk(6, dim=2)` materializes roughly 8 GB of fp32 at 704p/121f *and* hands six **strided** slices downstream, whose `.contiguous()` calls then copy each one again. The fused kernel produces the six slices in one pass, each naturally contiguous, so the downstream copies become no-ops.
@@ -244,7 +250,7 @@ Kernels are written against a specific eager chain in a specific model, so cover
 | Qwen-Image | linear+GELU, select-0/1 LN modulation, added-QKV fusion, QK RMSNorm+RoPE+joint QKV writes, residual norm/modulate+NVFP4 producer |
 | GLM-Image | LN+modulate, per-head qk LN, residual-gate add, linear+GELU |
 | ERNIE-Image | RMSNorm+scale/shift, residual-gated variant, rotate-half RoPE, residual-gate add |
-| Joy Image Edit | Bitwise image/text QKV concatenation; strided image QK-Norm + RoPE on Hopper |
+| Joy Image Edit | Bitwise image/text QKV concatenation; strided image QK-Norm + RoPE on Hopper; FP32-intermediate BF16 image residual updates on SM103 |
 | Z-Image | BF16-native RMSNorm scale / tanh-residual, per-head QK RMSNorm |
 | Ideogram 4 | gate RMSNorm, SwiGLU, rotate-half RoPE, modulate, residual-gate add |
 | LTX-2 | QK-norm + split RoPE, ada-values split, RMSNorm+modulate, modulate, residual-gate add, linear+GELU |
