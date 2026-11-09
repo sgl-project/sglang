@@ -13,6 +13,7 @@
 # ==============================================================================
 
 import unittest
+from copy import deepcopy
 from types import SimpleNamespace
 from unittest import mock
 
@@ -23,6 +24,8 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.layers.linear import ReplicatedLinear
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.lora.eviction_policy import get_eviction_policy
 from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.lora.lora_manager import LoRAManager
@@ -148,8 +151,10 @@ class TestAllPPLoras(CustomTestCase):
             ),
             processed_tokens_counter=0,
             disagg_prefill_bootstrap_queue=None,
+            disagg_prefill_transfer_queue=None,
             get_num_allocatable_reqs=lambda *args, **kwargs: 1,
             get_prefill_adder_class=lambda: lambda *args, **kwargs: adder,
+            request_retirer=None,
             page_size=1,
             tree_cache=SimpleNamespace(buffer_pipeline=None),
             token_to_kv_pool_allocator=SimpleNamespace(state_slots=None),
@@ -284,6 +289,59 @@ def _load_into_mem_pool(pool, uid, adapter):
 
 
 class TestStagePool(CustomTestCase):
+    def test_hybrid_mlp_allocates_dense_and_expert_buffers_on_local_stage(self):
+        """A dense prefix needs 3D buffers even without shared experts; off-stage
+        layers must still be left unallocated."""
+        config = SimpleNamespace(
+            num_hidden_layers=3,
+            hidden_size=8,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            intermediate_size=16,
+            moe_intermediate_size=8,
+            num_experts=2,
+        )
+        model = torch.nn.Module()
+        model.config = config
+        model.register_parameter("anchor", torch.nn.Parameter(torch.empty(0)))
+        dense = torch.nn.Module()
+        dense.gate_up_proj = ReplicatedLinear(8, 32, bias=False)
+        dense.down_proj = ReplicatedLinear(16, 8, bias=False)
+        experts = FusedMoE.__new__(FusedMoE)
+        torch.nn.Module.__init__(experts)
+        model.layers = torch.nn.ModuleList([dense, experts, deepcopy(dense)])
+        for has_dense in (True, False):
+            if not has_dense:
+                model.layers[0] = torch.nn.Module()
+                model.layers[2] = torch.nn.Module()
+            with (
+                self.subTest(has_dense=has_dense),
+                get_parallel().override(tp_size=1, tp_rank=0, attn_tp_size=1),
+            ):
+                pool = LoRAMemoryPool(
+                    base_hf_config=config,
+                    max_loras_per_batch=1,
+                    dtype=torch.float32,
+                    max_lora_rank=2,
+                    target_modules={"gate_up_proj", "down_proj"},
+                    base_model=model,
+                    eviction_policy="lru",
+                    lora_added_tokens_size=0,
+                    lora_layer_ids=[0, 1],
+                    has_embed_tokens_lora=False,
+                    has_lm_head_lora=False,
+                )
+                for buffer in (pool.A_buffer, pool.B_buffer):
+                    for name in ("gate_up_proj", "down_proj"):
+                        self.assertEqual(name in buffer, has_dense)
+                        if has_dense:
+                            self.assertEqual(buffer[name][0].ndim, 3)
+                            self.assertIsNone(buffer[name][1])
+                            self.assertIsNone(buffer[name][2])
+                        self.assertEqual(buffer[name + "_moe"][0].ndim, 4)
+                        self.assertEqual(buffer[name + "_moe"][1].ndim, 4)
+                        self.assertIsNone(buffer[name + "_moe"][2])
+
     def test_each_stage_allocates_and_loads_only_its_part(self):
         first = _stage_pool(layers=[0, 1], embed_tokens=True)
         last = _stage_pool(layers=[2, 3], lm_head=True, added_tokens_size=1)

@@ -26,6 +26,10 @@ import torch
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
+    require_attn_tp_gather,
+    require_gathered_buffer,
+    require_mlp_sync,
+    require_mlp_tp_gather,
     set_dp_buffer_len,
     set_is_extend_in_batch,
 )
@@ -73,14 +77,7 @@ from sglang.srt.speculative.multi_layer_eagle_utils import (
     wide_row_softmax_triton,
 )
 from sglang.srt.speculative.spec_utils import fast_sample, resolve_num_tokens_per_req
-from sglang.srt.utils import (
-    get_available_gpu_memory,
-    is_npu,
-    require_attn_tp_gather,
-    require_gathered_buffer,
-    require_mlp_sync,
-    require_mlp_tp_gather,
-)
+from sglang.srt.utils import get_available_gpu_memory, is_npu
 from sglang.srt.utils.common import fast_topk
 from sglang.srt.utils.device_timer import device_timer_ctx
 

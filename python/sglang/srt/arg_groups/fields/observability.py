@@ -16,8 +16,8 @@ import msgspec
 from sglang.srt.arg_groups.arg_utils import (
     A,
     Arg,
+    json_list_type,
 )
-from sglang.srt.utils.common import json_list_type
 
 
 class Observability(msgspec.Struct):
