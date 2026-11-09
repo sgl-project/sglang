@@ -178,6 +178,11 @@ class TestKimiK3BfaOverlap(CustomTestCase):
             def _front_shard(self):
                 return None
 
+            # A [gate | down] EP pair without shared experts; ROCm reads it at merge.
+            @property
+            def _eligible_for_fused_front(self):
+                return False
+
         def module(rows):
             return SimpleNamespace(
                 weight=torch.ones(rows, 16, device="cuda", dtype=torch.bfloat16)
