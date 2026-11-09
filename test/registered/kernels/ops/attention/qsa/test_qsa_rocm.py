@@ -1,6 +1,6 @@
 """ROCm coverage for the QSA packed-varlen decode fallback.
 
-On HIP there is neither flash_attn (FA2) nor flash-attn-4, so
+On HIP there is neither flash_attn (FA2) nor the FA4 CuTe kernels, so
 ``_resolve_flash_attn_varlen_func`` resolves to aiter's FA2-compatible varlen
 kernel. The first two tests are device-independent (fake modules); the last one
 runs the real aiter kernel against a torch reference and only executes on ROCm.
