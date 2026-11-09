@@ -14,10 +14,13 @@ import torch
 from sglang.srt.arg_groups.kv_cache_hook import handle_cache_compatibility
 from sglang.srt.mem_cache.base_prefix_cache import InsertParams, MatchPrefixParams
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.unified_cache.components.base import ComponentType
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
-from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
-from sglang.srt.mem_cache.unified_radix_cache import UnifiedLRUList, UnifiedTreeNode
+from sglang.srt.mem_cache.unified_cache.unified_tree_core import (
+    UnifiedLRUList,
+    UnifiedTreeCore,
+    UnifiedTreeNode,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.test.kits.unified_radix_cache.config import CacheConfig
 from sglang.test.kits.unified_radix_cache.fixtures import build_fixture
@@ -43,6 +46,8 @@ class _FakeTreeCore:
             )
         }
         self.evicted = []
+        self.joint_lru = None
+        self.joint_window_type = None
         self._is_tracking_unbacked_tokens = False
         self._tracked_unbacked_tokens = 0
 
@@ -53,7 +58,7 @@ class _FakeTreeCore:
         )
 
     def _cascade_evict(
-        self, node, component, tracker, device_frees, host_frees, cache_actions
+        self, node, component, tracker, device_frees, host_frees, cache_actions, target
     ):
         pass
 

@@ -1,6 +1,8 @@
 import asyncio
 import pickle
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -10,7 +12,10 @@ import torch
 import sglang.srt.disaggregation.encoder.server as encoder_server
 from sglang.srt.disaggregation.encoder import http_server
 from sglang.srt.disaggregation.encoder import runtime as encoder_runtime
-from sglang.srt.disaggregation.encoder.preprocessor import EncoderPreprocessor
+from sglang.srt.disaggregation.encoder.preprocessor import (
+    EncoderPreprocessor,
+    EncoderPreprocessResult,
+)
 from sglang.srt.disaggregation.encoder.receiver import EmbeddingData
 from sglang.srt.disaggregation.encoder.runtime import (
     _DP_RELEASE_AFTER_ENCODE,
@@ -27,12 +32,13 @@ from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import
     MooncakeTransferEngine,
 )
 from sglang.srt.managers.io_struct import unwrap_from_pickle
-from sglang.srt.managers.schedule_batch import Modality
-from sglang.srt.utils.common import safe_pickle_loads
+from sglang.srt.multimodal.encoder_preprocessing import EncoderMediaProcessorConfig
+from sglang.srt.multimodal.modality import Modality
+from sglang.srt.utils.serialization import safe_pickle_loads
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class TestEncoderDPErrorHandling(CustomTestCase):
@@ -107,6 +113,38 @@ class TestEncoderDPErrorHandling(CustomTestCase):
             self.assertEqual(future.result(), valid)
 
         asyncio.run(run())
+
+
+class TestEncoderCacheIdentity(CustomTestCase):
+    def test_grid_content_and_namespace_identify_each_embedding(self):
+        encoder = MMEncoder.__new__(MMEncoder)
+        encoder.model_type = "qwen3_vl"
+        encoder.cache_namespace = "sha256:" + "12" * 32
+        encoder.preprocessor = EncoderPreprocessor.__new__(EncoderPreprocessor)
+        encoder.preprocessor.model_type = encoder.model_type
+        features = torch.zeros(16, 2)
+        grids = torch.tensor([[1, 2, 4], [1, 4, 2]])
+        result = EncoderPreprocessResult(
+            mm_inputs={"pixel_values": features, "image_grid_thw": grids},
+            grid_thw=grids,
+            token_counts=[2, 2],
+        )
+
+        def keys():
+            return encoder._calculate_hashes_from_features(
+                features, result, Modality.IMAGE
+            )
+
+        original = keys()
+        self.assertEqual([len(key) for key in original], [32, 32])
+        self.assertNotEqual(original[0], original[1])
+        self.assertEqual(original, keys())
+        features[-1] = 1
+        changed = keys()
+        self.assertEqual(original[0], changed[0])
+        self.assertNotEqual(original[1], changed[1])
+        encoder.cache_namespace = "sha256:" + "34" * 32
+        self.assertTrue(all(a != b for a, b in zip(changed, keys())))
 
 
 class TestEncoderMetaRegistry(CustomTestCase):
@@ -243,6 +281,77 @@ class TestEncoderMetaRegistry(CustomTestCase):
             note_send_done.assert_awaited_once_with("req", 2, "127.0.0.1:5000")
 
         asyncio.run(run())
+
+
+class TestEncoderPreprocessorOffEventLoop(CustomTestCase):
+    @staticmethod
+    def _make_preprocessor():
+        preprocessor = EncoderPreprocessor.__new__(EncoderPreprocessor)
+        preprocessor.model_type = "minimax_m3_vl"
+        preprocessor.image_processor = None
+        preprocessor.use_image_processor_gpu = False
+        preprocessor.vision_config = {"image": {}, "video": {}}
+        preprocessor.encoder_media_processor_config = EncoderMediaProcessorConfig(
+            preserve_media_metadata=True, preprocess_off_event_loop=True
+        )
+        preprocessor.io_executor = ThreadPoolExecutor(max_workers=2)
+        preprocessor.preproc_executor = ThreadPoolExecutor(max_workers=1)
+        return preprocessor
+
+    @staticmethod
+    def _run_with_loop_handshake(make_awaitable):
+        """The hook blocks until a coroutine on the event loop answers it, so a hook
+        that holds the loop thread starves that coroutine and times out."""
+        started, answered = threading.Event(), threading.Event()
+
+        def wait_for_loop():
+            started.set()
+            if not answered.wait(timeout=5):
+                raise TimeoutError("the preprocess hook blocked the event loop")
+
+        async def answer():
+            while not started.is_set():
+                await asyncio.sleep(0.001)
+            answered.set()
+
+        async def run():
+            responder = asyncio.create_task(answer())
+            result = await make_awaitable(wait_for_loop)
+            await asyncio.wait_for(responder, timeout=5)
+            return result
+
+        return asyncio.run(run())
+
+    def test_video_hook_runs_off_the_event_loop(self):
+        preprocessor = self._make_preprocessor()
+        preprocessor._load_single_item = lambda data, modality: "decoded"
+
+        def process(wait_for_loop):
+            def hook(videos, modality, config):
+                wait_for_loop()
+                return {"videos": videos}
+
+            return preprocessor._process_video_items([{"url": "a.mp4"}], hook)
+
+        output = self._run_with_loop_handshake(process)
+        self.assertEqual(output, {"videos": ["decoded"]})
+
+    def test_image_hook_runs_off_the_event_loop(self):
+        preprocessor = self._make_preprocessor()
+        preprocessor._flatten_and_load_images = AsyncMock(
+            return_value=[torch.zeros(3, 4, 4)]
+        )
+        grid = torch.tensor([[1, 2, 2]])
+
+        def process(wait_for_loop):
+            def hook(images, modality, config):
+                wait_for_loop()
+                return {"image_grid_thw": grid}
+
+            return preprocessor._process_image_items(["img"], hook)
+
+        output = self._run_with_loop_handshake(process)
+        self.assertIs(output["image_grid_thw"], grid)
 
 
 class TestEncoderPreprocessorKimiGrid(CustomTestCase):
@@ -495,6 +604,7 @@ class TestMooncakeRegistration(CustomTestCase):
     def setUp(self):
         self.engine = MooncakeTransferEngine.__new__(MooncakeTransferEngine)
         self.engine.engine = unittest.mock.Mock()
+        self.engine.ib_device = "mlx5_0"
 
     def test_register_raises_on_nonzero_status(self):
         self.engine.engine.register_memory.return_value = -1
@@ -510,6 +620,18 @@ class TestMooncakeRegistration(CustomTestCase):
             self.engine.deregister(1234)
 
         self.assertIs(ctx.exception.__cause__, backend_error)
+
+    def test_batch_register_raises_on_nonzero_status(self):
+        self.engine.engine.batch_register_memory.return_value = -202
+
+        with self.assertRaises(RuntimeError):
+            self.engine.batch_register([0x10000], [0x1000])
+
+    def test_batch_register_tolerates_already_registered(self):
+        self.engine.engine.batch_register_memory.return_value = -7
+
+        with self.assertLogs(level="ERROR"):
+            self.engine.batch_register([0x10000], [0x1000])
 
 
 if __name__ == "__main__":

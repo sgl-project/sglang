@@ -26,10 +26,8 @@ from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     BackupKV,
 )
-from sglang.srt.mem_cache.unified_cache.components.base import (
-    ComponentType,
-    TreeComponent,
-)
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.mem_cache.unified_cache.components.base import TreeComponent
 from sglang.srt.mem_cache.unified_cache.tree_core_registry import (
     _TREE_CORE_REGISTRY,
     resolve_tree_core_backend,
@@ -51,6 +49,7 @@ from sglang.test.kits.unified_radix_cache.unified_tree_core_inspection_interface
 from sglang.test.kits.unified_radix_cache.unified_tree_core_inspector import (
     UnifiedTreeCoreInspector,
 )
+from sglang.test.tree_slots import tree_slots_of
 
 # The Rust re-run overrides this; every cache built by build_fixture follows it.
 TREE_CORE_TEST_BACKEND: Optional[str] = "python"
@@ -242,6 +241,16 @@ def build_fixture(
             need_sort=False,
         )
 
+    if cfg.has_mamba:
+        # As the KV cache configurator does: the allocator carries the state.
+        allocator.state = req_to_token_pool.state
+
+    # As the cache builder does: the storage owns each window's kept tail.
+    from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
+
+    kv_storage_of(req_to_token_pool, allocator).bind_window_retention(
+        cfg.sliding_window_size, {"swa": cfg.draft_swa_window}
+    )
     cache_init_params = CacheInitParams(
         req_to_token_pool=req_to_token_pool,
         token_to_kv_pool_allocator=allocator,
@@ -249,9 +258,15 @@ def build_fixture(
         disable=False,
         sliding_window_size=cfg.sliding_window_size,
         swa_max_states_per_path=swa_max_states_per_path,
-        draft_swa_window=cfg.draft_swa_window,
         decoder_swa_bounded_replay=cfg.decoder_swa_bounded_replay,
-        tree_components=cfg.components,
+        tree_slots=tree_slots_of(
+            cfg.components,
+            window=(
+                None
+                if cfg.sliding_window_size is None
+                else max(cfg.sliding_window_size, cfg.draft_swa_window)
+            ),
+        ),
         enable_mamba_extra_buffer=cfg.enable_mamba_extra_buffer,
         enable_kv_cache_events=enable_kv_cache_events,
         dynamo_kv_event_format=dynamo_kv_event_format,
