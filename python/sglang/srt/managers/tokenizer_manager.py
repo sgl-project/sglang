@@ -1456,6 +1456,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Validate generation-specific fields
         if isinstance(obj, GenerateReqInput):
             self._validate_token_ids_logprob(obj)
+            self._validate_top_logprobs_num(obj)
             requested_hidden_mode = get_request_return_hidden_states_mode(
                 obj.return_hidden_states
             )
@@ -1595,6 +1596,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     f"token_ids_logprob contains out-of-vocabulary token id "
                     f"{token_id}; valid range is [0, {vocab_size})."
                 )
+
+    def _validate_top_logprobs_num(self, obj: GenerateReqInput) -> None:
+        # Feeds logprobs.topk(k) over [*, vocab_size]; an out-of-range k
+        # raises in the scheduler and takes the server down.
+        if not obj.top_logprobs_num:
+            return
+        vocab_size = self.model_config.vocab_size
+        if not 0 <= obj.top_logprobs_num <= vocab_size:
+            raise ValueError(
+                f"top_logprobs_num must be in [0, {vocab_size}], got "
+                f"{obj.top_logprobs_num}."
+            )
 
     def _create_tokenized_object(
         self,

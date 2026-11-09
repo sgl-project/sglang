@@ -1188,6 +1188,12 @@ class OpenAIServingChat(OpenAIServingBase):
         if request.return_sampling_mask and not request.return_meta_info:
             return "return_sampling_mask requires return_meta_info=true."
 
+        top_logprobs_error = self._top_logprobs_error(
+            "top_logprobs", request.top_logprobs
+        )
+        if top_logprobs_error:
+            return top_logprobs_error
+
         if self.is_minimax_m3:
             m3_error = _validate_minimax_m3_request(request)
             if m3_error:

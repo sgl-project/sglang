@@ -170,7 +170,7 @@ class _MockTokenizerManager:
     """Minimal mock that satisfies OpenAIServingChat."""
 
     def __init__(self):
-        self.model_config = Mock(is_multimodal=False)
+        self.model_config = Mock(is_multimodal=False, vocab_size=32000)
         self.server_args = Mock(
             model_path="deepseek-ai/DeepSeek-V4-Flash",
             revision=None,
@@ -1799,6 +1799,26 @@ class ServingChatTestCase(CustomTestCase):
             self.chat._validate_request(req),
             "return_sampling_mask requires return_meta_info=true.",
         )
+
+    def test_validate_request_bounds_top_logprobs_to_vocab(self):
+        """top_logprobs outside [0, vocab_size] must be a 400, not a topk that
+        kills the scheduler."""
+        for top_logprobs, ok in ((-1, False), (32001, False), (0, True), (32000, True)):
+            with self.subTest(top_logprobs=top_logprobs):
+                req = ChatCompletionRequest(
+                    model="x",
+                    messages=[{"role": "user", "content": "Hi?"}],
+                    logprobs=True,
+                    top_logprobs=top_logprobs,
+                )
+                error = self.chat._validate_request(req)
+                if ok:
+                    self.assertIsNone(error)
+                else:
+                    self.assertEqual(
+                        error,
+                        f"top_logprobs must be in [0, 32000], got {top_logprobs}.",
+                    )
 
     def test_validate_request_rejects_flat_output_top_logprobs_without_meta_info(
         self,
