@@ -29,6 +29,11 @@ class Mm(msgspec.Struct):
         Optional[bool],
         "Enable the multimodal functionality for the served model. If the model being served is not multimodal, nothing will happen",
     ] = None
+    disable_multimodal: A[
+        bool,
+        "Disable the multimodal functionality to serve a multimodal model as text-only. "
+        "Cannot be combined with --enable-multimodal.",
+    ] = False
     mm_attention_backend: A[
         Optional[str],
         Arg(

@@ -1082,7 +1082,9 @@ class ModelConfig:
             ),
             model_override_args=cfg.json_model_override_args,
             is_embedding=cfg.is_embedding,
-            enable_multimodal=cfg.enable_multimodal,
+            enable_multimodal=(
+                False if cfg.disable_multimodal else cfg.enable_multimodal
+            ),
             dtype=cfg.dtype,
             quantization=quantization,
             model_impl=cfg.model_impl,

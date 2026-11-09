@@ -324,6 +324,11 @@ def check_server_args(server_args: Any):
             "replica, or unset SGLANG_RUST_SERVER."
         )
 
+    if cfg.disable_multimodal and cfg.enable_multimodal:
+        raise ValueError(
+            "--disable-multimodal cannot be combined with --enable-multimodal"
+        )
+
     assert cfg.base_gpu_id >= 0, "base_gpu_id must be non-negative"
     assert cfg.gpu_id_step >= 1, "gpu_id_step must be positive"
 

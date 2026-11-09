@@ -570,6 +570,18 @@ class TestPrepareServerArgs(CustomTestCase):
                     chunked_prefill_size=-1,
                 ).check_server_args()
 
+    def test_disable_multimodal_rejects_enable_multimodal(self):
+        with self.assertRaisesRegex(
+            ValueError, "--disable-multimodal cannot be combined"
+        ):
+            ServerArgs(
+                model_path="dummy",
+                served_model_name="dummy",
+                enable_multimodal=True,
+                disable_multimodal=True,
+                chunked_prefill_size=-1,
+            ).check_server_args()
+
     def test_instanttensor_device_check_allows_cuda_and_other_loaders(self):
         for device, load_format in (
             ("cuda", "instanttensor"),

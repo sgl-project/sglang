@@ -295,7 +295,8 @@ class RustServer:
                 "SGLANG_RUST_SERVER=1: no Rust MM pipeline for "
                 f"model_type={scheduler.model_config.hf_config.model_type!r} "
                 f"(supported: {', '.join(supported)}; "
-                "images only). Unset SGLANG_RUST_SERVER to serve this model."
+                "images only). Pass --disable-multimodal to serve it text-only, "
+                "or unset SGLANG_RUST_SERVER."
             )
         return mm_spec
 
