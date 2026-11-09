@@ -137,24 +137,28 @@ def _amd_errors(
     return [f'{path}\n    suite="{r.suite}"  ->  {fix}']
 
 
+def _load_module(name: str, path: str):
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def main() -> int:
     # Import ci_register directly to avoid pulling in all of sglang
-    spec = importlib.util.spec_from_file_location(
+    ci_register = _load_module(
         "ci_register",
         os.path.join("python", "sglang", "test", "ci", "ci_register.py"),
     )
-    ci_register = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(ci_register)
     cuda = ci_register.HWBackend.CUDA
+    runner_configs = _load_module(
+        "runner_configs", os.path.join("scripts", "ci", "runner_configs.py")
+    )
+    known_runner_configs = set(runner_configs.load())
     # No CUDA/CPU workflow passes `run_suite.py --nightly`, so a nightly=True
     # registration on these backends is filtered out of every run.
     no_nightly_flag = (cuda, ci_register.HWBackend.CPU)
     amd = ci_register.HWBackend.AMD
-    spec = importlib.util.spec_from_file_location(
-        "runner_configs", os.path.join("scripts", "ci", "runner_configs.py")
-    )
-    runner_configs = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(runner_configs)
     amd_runner_configs = set(runner_configs.load_amd())
     amd_pr_suites = _amd_pr_suites()
 
@@ -171,6 +175,7 @@ def main() -> int:
     legacy_shape = []  # (file, suite, stage, runner_config) -- has a -test- split
     non_dispatchable = []  # (file, suite) -- legacy CUDA suite no workflow invokes
     nightly_flagged = []  # (file, backend, suite) -- nightly=True on CUDA/CPU
+    unknown_runner_config = []  # (file, runner_config) -- absent from runner_configs.yml
     dead_tests = []  # (file) -- TestCase classes that `python3 file.py` never runs
     taxonomy_violations = []
     amd_errors = []
@@ -192,6 +197,12 @@ def main() -> int:
         for r in registries:
             if r.nightly and r.backend in no_nightly_flag:
                 nightly_flagged.append((f, r.backend.name, r.effective_suite))
+            if (
+                r.backend == cuda
+                and r.runner_config is not None
+                and r.runner_config not in known_runner_configs
+            ):
+                unknown_runner_config.append((f, r.runner_config))
             if r.backend == amd:
                 amd_errors.extend(
                     _amd_errors(
@@ -261,6 +272,16 @@ def main() -> int:
         )
         for f, backend, suite in nightly_flagged:
             print(f'  {f}\n    {backend} suite="{suite}"')
+        print()
+        exit_code = 1
+    if unknown_runner_config:
+        print(
+            "ERROR: CUDA test(s) register a runner_config missing from "
+            "scripts/ci/runner_configs.yml, so /rerun-test cannot dispatch them. "
+            "Add the runner_config there or register on an existing one:\n"
+        )
+        for f, runner_config in unknown_runner_config:
+            print(f'  {f}\n    runner_config="{runner_config}"')
         print()
         exit_code = 1
     if amd_errors:

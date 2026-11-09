@@ -584,7 +584,13 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
         self._init_hicache(cache, write_policy="write_back")
         cache.evict(EvictParams(mamba_num=3))
         cache.evict_host(page, ComponentType.FULL)
-        cache.evict(EvictParams(swa_num_tokens=3 * page))
+        cache.evict(
+            EvictParams(
+                window_num_tokens={
+                    cache.window_sub_pool_of_slot(ComponentType.SWA): 3 * page
+                }
+            )
+        )
         cache.evict_host(3 * page, ComponentType.SWA)
 
         # The backed parent stops the Full backup chain, while the SWA window
@@ -640,8 +646,19 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
         )
         self.assertEqual(cache._tree_core_backend, selected_tree_core_test_backend())
 
-        result = cache.evict(EvictParams(num_tokens=0, swa_num_tokens=len(seq_b)))
-        self.assertGreaterEqual(result.swa_num_tokens_evicted, len(seq_a))
+        result = cache.evict(
+            EvictParams(
+                window_num_tokens={
+                    cache.window_sub_pool_of_slot(ComponentType.SWA): len(seq_b)
+                }
+            )
+        )
+        self.assertGreaterEqual(
+            result.window_num_tokens_evicted.get(
+                cache.window_sub_pool_of_slot(ComponentType.SWA), 0
+            ),
+            len(seq_a),
+        )
 
         m = match_prefix(cache, seq_a)
         node = m.best_match_node
@@ -664,7 +681,11 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
             "the full prefix stays servable",
         )
         self.assertGreaterEqual(
-            m.swa_host_hit_length, 1, "load-back armed for the host SWA KV"
+            m.window_host_hit_lengths.get(
+                cache.window_sub_pool_of_slot(ComponentType.SWA), 0
+            ),
+            1,
+            "load-back armed for the host SWA KV",
         )
 
         # Scheduler-side serve path: init_load_back revives the SWA KV and
@@ -774,7 +795,12 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
             result.device_prefix_len, len(tokens) - node_key_length(cache, leaf)
         )
         self.assertEqual(result.host_hit_length, node_key_length(cache, leaf))
-        self.assertEqual(result.swa_host_hit_length, node_key_length(cache, leaf))
+        self.assertEqual(
+            result.window_host_hit_lengths.get(
+                cache.window_sub_pool_of_slot(ComponentType.SWA), 0
+            ),
+            node_key_length(cache, leaf),
+        )
 
         cache, allocator, req_to_token_pool = self._build_hicache_fixture()
         chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
@@ -794,7 +820,12 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
             result.device_prefix_len, len(tokens) - node_key_length(cache, leaf)
         )
         self.assertEqual(result.host_hit_length, 0)
-        self.assertEqual(result.swa_host_hit_length, node_key_length(cache, leaf))
+        self.assertEqual(
+            result.window_host_hit_lengths.get(
+                cache.window_sub_pool_of_slot(ComponentType.SWA), 0
+            ),
+            node_key_length(cache, leaf),
+        )
 
     @requires_full_swa_ps1_window4
     def test_hicache_swa_backup_window_stops_at_pending_ancestor(self):
@@ -842,7 +873,7 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
         """A host-backed SWA tombstone inside the trailing sliding window stops
         the device match before it: the Full-backed tail from the tombstone on
         is a host hit, and the tombstone's own SWA counts in
-        ``swa_host_hit_length``."""
+        its window's ``window_host_hit_lengths`` entry."""
         ps = self.cfg.page_size
         window_pages = (self.cfg.sliding_window_size + ps - 1) // ps
         for name, victim in (
@@ -870,7 +901,12 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
                 result = match_prefix(cache, tokens)
                 self.assertEqual(result.device_prefix_len, len(tokens) - host_tail)
                 self.assertEqual(result.host_hit_length, host_tail)
-                self.assertEqual(result.swa_host_hit_length, swa_host)
+                self.assertEqual(
+                    result.window_host_hit_lengths.get(
+                        cache.window_sub_pool_of_slot(ComponentType.SWA), 0
+                    ),
+                    swa_host,
+                )
 
     def test_hicache_swa_finalize_anchored_on_best_match_node(self):
         cache, _, _, y, x, _ = self._swa_anchor_setup()
@@ -890,9 +926,13 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
             value_chunks=[],
             best_value_len=0,
         )
-        # SWA host hit goes to swa_host_hit_length; host_hit_length stays at 0.
+        # SWA host hit goes to its window's entry; host_hit_length stays at 0.
+        # The tree core files it by tree slot; the cache names it afterwards.
         self.assertEqual(result.host_hit_length, 0)
-        self.assertEqual(result.swa_host_hit_length, ps)
+        self.assertEqual(
+            result.window_host_hit_lengths.get(ComponentType.SWA, 0),
+            ps,
+        )
 
     @requires_swa
     @requires(
