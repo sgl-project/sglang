@@ -23,21 +23,25 @@ def _int_env(name: str, default: int) -> int:
     return int(raw) if raw is not None and raw != "" else default
 
 
+def _import_umbp():
+    """Import mori.umbp, UMBPHostTensorAllocator's third-party dependency."""
+    try:
+        import mori.umbp as umbp_mod
+    except ImportError as exc:
+        raise RuntimeError(
+            "mori.umbp is not available. Build mori with BUILD_UMBP=ON "
+            "or fall back to the default torch host allocator."
+        ) from exc
+    return umbp_mod
+
+
 class UMBPHostTensorAllocator(HostTensorAllocator):
     """Allocate the HiCache L2 host tensor from mori's UMBPHostMemAllocator."""
 
     def __init__(self) -> None:
         super().__init__()
-        try:
-            import mori.umbp as umbp_mod
-        except ImportError as exc:
-            raise RuntimeError(
-                "mori.umbp is not available. Build mori with BUILD_UMBP=ON "
-                "or fall back to the default torch host allocator."
-            ) from exc
-
-        self._mod = umbp_mod
-        self._allocator = umbp_mod.UMBPHostMemAllocator()
+        self._mod = _import_umbp()
+        self._allocator = self._mod.UMBPHostMemAllocator()
 
         self._use_hugepage = _bool_env("SGLANG_HICACHE_HOST_HUGEPAGE", True)
         self._hugepage_size = _int_env(

@@ -56,7 +56,7 @@ def _draft(*hosts: str) -> FusedDraftPlacement:
         counts={h: [1] for h in hosts},
         regions=regions,
         # The target's window sub-pool hosts as a window.
-        hosted={h: "swa" for h in hosts if h.startswith("window")},
+        hosted={h: "window" for h in hosts if h.startswith("window_")},
     )
 
 
