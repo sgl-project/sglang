@@ -72,6 +72,7 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
         scheduler._prefetch_kvcache = MagicMock()
         scheduler.tree_cache = MagicMock()
         scheduler._abort_on_queued_limit = MagicMock(return_value=False)
+        scheduler.invariant_checker = MagicMock()
         scheduler.model_config = SimpleNamespace(num_key_value_heads=8)
         scheduler.disagg_prefill_bootstrap_queue = MagicMock()
         scheduler.disagg_decode_prealloc_queue = MagicMock()
@@ -85,6 +86,7 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
 
     def _new_req(self, priority=None):
         req = MagicMock()
+        req.exit_via = req.send_via = None
         req.kv.holds_kv = req.kv.holds_mamba = False
         req.kv.retraction_backup = None
         req.finished_reason = None
@@ -247,7 +249,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         component.prepare_for_caching_req.return_value = None
         cache._components_tuple = (component,)
         cache.insert = MagicMock()
-        req = SimpleNamespace(
+        req = FakeReq(
             rid="req",
             get_fill_ids=lambda: [1, 2, 3, 4],
             kv=SimpleNamespace(
@@ -465,6 +467,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         empty_request_lists(scheduler)
         scheduler.mm_receiver = None
         req = MagicMock(rid="req", metadata_buffer_index=3, pending_bootstrap=True)
+        req.exit_via = req.send_via = None
         req.finished_reason = None
         req.finish_outside_step.side_effect = lambda reason: setattr(
             req, "finished_reason", reason

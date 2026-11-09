@@ -34,6 +34,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+    from sglang.srt.mem_cache.kv.storage import KVStorage
     from sglang.srt.mem_cache.memory_pool_host import LogicalHostPool
     from sglang.srt.mem_cache.pool_host import HostKVCache
 
@@ -298,6 +299,44 @@ class PrefetchOperation(StorageOperation):
             return self._terminated_flag
 
 
+def check_dcp_l3_extra_pool(entry: Any, anchor: Any) -> None:
+    """Reject a host pool that HiCache L3 cannot store under DCP.
+
+    The DCP L3 path stores one physical page per logical page on each rank, so
+    every pool besides the MLA anchor must be either per-slot state or sharded
+    by the same DCP rows as the anchor.
+    """
+    from sglang.srt.layers.dcp.layout import dsa_shards_index_k
+    from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerPoolHost
+    from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
+    from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+
+    pool = entry.host_pool
+    if pool is anchor:
+        return
+    if entry.name == PoolName.MAMBA and isinstance(pool, MambaPoolHost):
+        return  # KDA state: one slot per key
+    if (
+        entry.name == PoolName.INDEXER
+        and isinstance(pool, DSAIndexerPoolHost)
+        and dsa_shards_index_k()
+        and pool.dcp_size == anchor.dcp_size
+        and pool.size == anchor.size
+    ):
+        return  # index-K row-sharded like the MLA KV (Kimi-K3.1)
+    if (
+        entry.name == PoolName.DRAFT
+        and isinstance(pool, MLATokenToKVPoolHost)
+        and pool.kv_buffer is not None
+        and pool.dcp_size == anchor.dcp_size
+    ):
+        return
+    raise NotImplementedError(
+        f"HiCache L3 with DCP does not support the {entry.name} host pool "
+        f"({type(pool).__name__})."
+    )
+
+
 class HiCacheController:
     def __init__(
         self,
@@ -317,9 +356,13 @@ class HiCacheController:
         storage_backend_extra_config: Optional[dict] = None,
         enable_storage_metrics: bool = False,
         host_memory_mode: str = "cache",
+        kv_storage: Optional[KVStorage] = None,
     ):
         self.tp_group = tp_group
         self.host_memory_mode = host_memory_mode
+        # A unified pool's storage: copies are recorded on it, so a page move
+        # waits for the copies that touch its pages.
+        self.kv_storage = kv_storage
         self.attn_cp_group = attn_cp_group
         self.attn_tp_group = attn_tp_group
         self.pp_group = pp_group
@@ -570,7 +613,6 @@ class HiCacheController:
                 raise NotImplementedError(
                     "HiCache L3 with DCP does not support buffer_only host memory."
                 )
-            from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
             from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 
             if storage_backend not in ("file", "mooncake"):
@@ -584,17 +626,9 @@ class HiCacheController:
                 raise NotImplementedError(
                     "HiCache L3 with DCP requires a materialized MLA host pool."
                 )
-            if self.mem_pool_host is not self.storage_host_pool and any(
-                entry.host_pool is not self.storage_host_pool
-                and (
-                    entry.name != PoolName.MAMBA
-                    or not isinstance(entry.host_pool, MambaPoolHost)
-                )
-                for entry in self.mem_pool_host.entries
-            ):
-                raise NotImplementedError(
-                    "HiCache L3 with DCP supports only MLA KV and optional KDA state."
-                )
+            if self.mem_pool_host is not self.storage_host_pool:
+                for entry in self.mem_pool_host.entries:
+                    check_dcp_l3_extra_pool(entry, self.storage_host_pool)
             if self.storage_host_pool.layout not in (
                 "layer_first",
                 "page_first",
@@ -963,15 +997,6 @@ class HiCacheController:
             self.prefetch_sync_thread.start()
             self.backup_thread.start()
 
-    def has_inflight_device_transfers(self) -> bool:
-        """Whether queued or unacknowledged L2 transfers still use device rows."""
-        return bool(
-            self.write_queue
-            or self.load_queue
-            or self.ack_write_queue
-            or self.ack_load_queue
-        )
-
     def write(
         self,
         device_indices: torch.Tensor,
@@ -1010,13 +1035,13 @@ class HiCacheController:
                 self.write_fence_stream
             )
 
-        completion = self.l2_transfer_engine.submit_device_to_host(
-            self._l2_transfers(host_indices, device_indices, pool_transfers)
-        )
+        transfers = self._l2_transfers(host_indices, device_indices, pool_transfers)
+        completion = self.l2_transfer_engine.submit_device_to_host(transfers)
 
-        self.mem_pool_device_allocator.set_hicache_transfer_done_event(
-            (id(self), "write"), completion.finish_event
-        )
+        if self.kv_storage is not None:
+            self.kv_storage.record_host_transfer(
+                completion.finish_event, transfers, writes=False
+            )
 
         self.ack_write_queue.append(
             HiCacheAck(
@@ -1155,16 +1180,22 @@ class HiCacheController:
                 self.load_fence_stream
             )
 
+        transfers = self._l2_load_transfers(
+            host_indices, device_indices, pool_transfers
+        )
         completion = self.l2_transfer_engine.submit_host_to_device(
-            self._l2_load_transfers(host_indices, device_indices, pool_transfers),
+            transfers,
             start_event=producer_event.start_event,
             on_layer_done=producer_event.complete,
             transfer_layer_id_max=self.transfer_layer_id_max,
         )
 
-        self.mem_pool_device_allocator.set_hicache_transfer_done_event(
-            (id(self), "load"), completion.finish_event
-        )
+        if self.kv_storage is not None:
+            self.kv_storage.record_host_transfer(
+                completion.finish_event, transfers, writes=True
+            )
+            # The submitted copy now orders moves of the rows it loads into.
+            self.kv_storage.end_load_reservations()
 
         self.ack_load_queue.append(
             HiCacheAck(
