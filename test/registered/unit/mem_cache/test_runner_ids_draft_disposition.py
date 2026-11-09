@@ -31,7 +31,7 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
-from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
 from sglang.srt.mem_cache.kv.layout.mha import DraftMHAView, MHASubPoolSpec
 from sglang.srt.mem_cache.layout.fused_draft import (
@@ -46,6 +46,8 @@ from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.mem_cache_utils import routed
 from sglang.test.unified_allocator_fixtures import (
+    FakeKVCache,
+    FakeUnifiedSWAKVPool,
     arena_of,
     plan_stand_in,
     stand_in_views,
@@ -55,46 +57,6 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 _DEV = "cpu"
 _PS = 2
-
-
-class _FakeKVCache:
-    # A private pool, indexed by the allocator's ids as they are.
-    requires_physical_write_loc = False
-
-    def __init__(self, source, name=None):
-        # A bare size for a private pool; else the band of ``source`` (a test
-        # arena) whose unit moves this buffer follows.
-        size = source if name is None else source.num_entries(name)
-        if name is not None:
-            source.follow(name, self)
-        self.buf = torch.full((size,), -1, dtype=torch.int64)
-        self.allocator = None
-
-    def move_units(self, dst_pages, src_pages, page_size):
-        slots = torch.arange(page_size, device=dst_pages.device)
-        dst_loc = (dst_pages[:, None] * page_size + slots).flatten()
-        src_loc = (src_pages[:, None] * page_size + slots).flatten()
-        self.buf[dst_loc] = self.buf[src_loc].clone()
-
-    def id_spaces(self):
-        return {IdSpaceKind.FULL: IdSpace(key=(IdSpaceKind.FULL, None))}
-
-    def attach_allocator(self, allocator):
-        self.allocator = allocator
-
-    def move_kv_cache(self, dst_loc, src_loc):
-        self.buf[dst_loc] = self.buf[src_loc].clone()
-
-
-class _FakeUnifiedSWAKVPool:
-    def __init__(self, shared_pool):
-        self.full_kv_pool = _FakeKVCache(shared_pool, "full")
-        self.swa_kv_pool = _FakeKVCache(shared_pool, "swa")
-        self.full_to_swa_index_mapping = None
-
-    def attach_allocators(self, *, full_allocator, swa_allocator):
-        self._full_allocator = full_allocator
-        self._swa_allocator = swa_allocator
 
 
 def _build(n_full=32, n_swa=16, *, swa_region=None):
@@ -132,7 +94,7 @@ def _build(n_full=32, n_swa=16, *, swa_region=None):
         page_size=_PS,
         fused_draft=FusedDraftPlacement.from_counts(counts=counts, regions=regions),
     )
-    kvcache = _FakeUnifiedSWAKVPool(pool)
+    kvcache = FakeUnifiedSWAKVPool(pool)
     allocator = ChainAllocator(
         roles=ChainRoles(owner="full", window="swa"),
         arena=pool,
@@ -348,8 +310,10 @@ class TestRunnerIdsDraftDisposition(unittest.TestCase):
         draft_translator = _Shift()
         # The iteration's plan: physical ids for the fused draft's runner_ids.
         plan = SimpleNamespace(
-            write_ids=lambda reader, cols=None: (
-                physical.clone() if reader is draft_translator else virtual.clone()
+            write_ids=lambda reader, *, kind=IdSpaceKind.FULL, cols=None: (
+                (physical.clone() if reader is draft_translator else virtual.clone())
+                if kind == IdSpaceKind.FULL
+                else None
             )
         )
         hidden = torch.randn(4, 8)
@@ -394,6 +358,10 @@ class TestRunnerIdsDraftDisposition(unittest.TestCase):
         )
         worker._append_target_hidden_sequential = lambda **kw: (
             DFlashWorkerV2._append_target_hidden_sequential(worker, **kw)
+        )
+
+        self.assertIsNone(
+            DFlashWorkerV2._draft_write_ids(worker, plan, IdSpaceKind.SLIDING_WINDOW)
         )
 
         # Per-token writes (prefill).
@@ -462,7 +430,7 @@ class TestRunnerIdsDraftDisposition(unittest.TestCase):
         draft = _source(allocator, draft_pool)
         self.assertIs(draft.full_v2p_table, allocator.full_v2p_page_table)
 
-        passthrough = _source(allocator, _FakeKVCache(64))
+        passthrough = _source(allocator, FakeKVCache(64))
         self.assertIsNone(passthrough.full_v2p_table)
 
     def test_multi_step_containers_read_the_plans_table(self):
