@@ -9,9 +9,9 @@ from sglang.kernels.ops.moe.moe_align import moe_align_block_size
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.moe_align import ceil_div, moe_align_block_size_triton
 
-register_cuda_ci(est_time=28, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=28, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 # Nightly is not redundant here: it sets SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1 to expand get_ci_test_range sweeps.
-register_cuda_ci(est_time=50, stage="nightly", runner_config="1-gpu-large")
+register_cuda_ci(est_time=50, stage="nightly", runner_config="1-gpu-small")
 
 
 MOE_ALIGN_CASES = get_ci_test_range(

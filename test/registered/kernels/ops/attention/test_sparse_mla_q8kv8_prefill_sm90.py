@@ -192,8 +192,8 @@ def test_sparse_mla_q8kv8_prefill_corner_cases(
     _run_and_check(d_qk, with_sink, s_q=s_q, topk=topk, s_kv=s_kv)
 
 
-# topk_length WITHOUT attn_sink (the production early-exit path for
-# SGLANG_ENABLE_DSA_Q8KV8_TOPK_LENGTH): rows with a trailing -1 pad run must
+# topk_length WITHOUT attn_sink (the production early-exit path of the
+# flashmla_sparse_q8 backend): rows with a trailing -1 pad run must
 # be BITWISE identical to the full-topk dispatch that masks those pads, and
 # must match the fp32 reference on the truncated index range.
 @pytest.mark.skipif(

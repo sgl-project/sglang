@@ -6,6 +6,7 @@ import tilelang
 import tilelang.language as T
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.utils import is_gfx95_supported, is_hip
 
@@ -1198,7 +1199,7 @@ def tilelang_sparse_fwd(
                 q = q.to(kv.dtype)
             if not _is_hip:
                 block_I, threads, block_per_cu = 32, 128, 1
-                cu = torch.cuda.get_device_properties(q.device).multi_processor_count
+                cu = current_arch().num_sms
             elif _is_gfx95_supported:
                 block_I, threads, block_per_cu, cu = 64, 256, 2, 256
             else:
