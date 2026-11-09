@@ -7,6 +7,8 @@ race that only shows up over rounds.
 """
 
 import os
+import threading
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -27,6 +29,7 @@ from sglang.test.ascend.npu_rl_utils import (
     generate,
     load_checkpoint_tensor,
     npu_available,
+    npu_device_count,
     npu_server,
     pause_generation,
     update_weights_from_tensor,
@@ -36,7 +39,7 @@ from sglang.test.ascend.test_ascend_utils import QWEN3_0_6B_WEIGHTS_PATH
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_npu_ci(est_time=500, suite="nightly-1-npu-a3", nightly=True)
+register_npu_ci(est_time=700, suite="nightly-2-npu-a3", nightly=True)
 
 MODEL = QWEN3_0_6B_WEIGHTS_PATH
 PROMPT = "The capital of France is"
@@ -51,6 +54,14 @@ SERVER_ARGS = (
     "512",
     "--max-running-requests",
     "4",
+)
+DP_ARGS = SERVER_ARGS + (
+    "--dp-size",
+    "2",
+    "--tp-size",
+    "1",
+    "--load-balance-method",
+    "round_robin",
 )
 NORM_WEIGHT = "model.norm.weight"
 
@@ -160,6 +171,50 @@ class TestNpuDeviceBarrier(CustomTestCase):
         )
         # resume_memory_occupation has no device-wide synchronize today; this
         # test locks the barrier/restore ordering that the current code provides.
+
+    @unittest.skipUnless(
+        npu_available() and npu_device_count() >= 2,
+        "requires at least 2 Ascend NPUs",
+    )
+    @unittest.skipUnless(os.path.isdir(MODEL), f"model not found: {MODEL}")
+    def test_02_dp_pause_returns_after_all_ranks_drain(self):
+        warmup_npu()
+        with npu_server(MODEL, extra_args=DP_ARGS) as base_url:
+            results = {}
+
+            def _run(idx):
+                try:
+                    results[idx] = generate(
+                        base_url, PROMPT, max_new_tokens=384, timeout=300
+                    )
+                except Exception as exc:  # pragma: no cover - surfaced in test
+                    results[idx] = exc
+
+            threads = [
+                threading.Thread(target=_run, args=(idx,), daemon=True)
+                for idx in range(2)
+            ]
+            for thread in threads:
+                thread.start()
+            time.sleep(1.0)
+
+            pause_generation(base_url, mode="abort")
+            for thread in threads:
+                thread.join(timeout=60)
+
+            for idx in range(2):
+                self.assertNotIsInstance(results.get(idx), Exception)
+                response = results[idx]
+                finish_type = (
+                    response.get("meta_info", {}).get("finish_reason", {}).get("type")
+                )
+                self.assertTrue(
+                    finish_type == "abort" or len(response.get("output_ids", [])) < 384,
+                    f"DP rank {idx} was not drained by pause",
+                )
+
+            continue_generation(base_url)
+            self.assertTrue(generate(base_url, PROMPT, max_new_tokens=4))
 
     @unittest.skipUnless(npu_available(), "requires an Ascend NPU")
     @unittest.skipUnless(os.path.isdir(MODEL), f"model not found: {MODEL}")
