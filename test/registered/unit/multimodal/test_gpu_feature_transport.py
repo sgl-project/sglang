@@ -920,8 +920,14 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
     def test_engine_startup_failure_releases_parent_pool(self):
         from sglang.srt.entrypoints import engine as engine_module
         from sglang.srt.entrypoints.engine import Engine
+        from sglang.srt.environ import envs
         from sglang.srt.managers.tokenizer_manager import TokenizerManager
         from sglang.srt.multimodal.transport.cuda_vmm import CudaVmmFeatureTransport
+
+        # The pool is the Python server's TokenizerManager's, which Rust-server
+        # mode never starts, so pin the mode against an inherited
+        # SGLANG_RUST_SERVER=1.
+        self.enterContext(envs.SGLANG_RUST_SERVER.override(False))
 
         manager = object.__new__(TokenizerManager)
         transport = object.__new__(CudaVmmFeatureTransport)
