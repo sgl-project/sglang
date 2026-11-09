@@ -408,6 +408,24 @@ impl UnifiedLRUList {
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct PriorityKey(pub i64, pub i64);
 
+/// A GDS state priority; `total_cmp` gives it the total order a heap needs.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GdsPriority(pub f64);
+
+impl Eq for GdsPriority {}
+
+impl PartialOrd for GdsPriority {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for GdsPriority {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.total_cmp(&other.0)
+    }
+}
+
 /// Ranks nodes for eviction; lower priority evicts first.
 pub trait EvictionStrategy<K: ChildKeyType> {
     /// The node's eviction priority.
@@ -556,9 +574,11 @@ pub fn get_eviction_strategy<K: ChildKeyType>(
             tail_budget: tlru_tail_budget,
             float_config: tlru_float_config,
         }),
+        // GDS ranks Mamba states in the component; Full KV stays in recency order.
+        "gds" => Box::new(LruStrategy),
         other => panic!(
             "Unknown eviction policy: {other}. Supported policies: \
-             'lru', 'lfu', 'fifo', 'mru', 'filo', 'priority', 'slru', 'tlru'."
+             'lru', 'lfu', 'fifo', 'mru', 'filo', 'priority', 'slru', 'tlru', 'gds'."
         ),
     }
 }

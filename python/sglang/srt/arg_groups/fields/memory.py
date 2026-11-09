@@ -34,7 +34,9 @@ class Memory(msgspec.Struct):
                 "a conversation that cannot affect tail TTFT before falling back "
                 "to LRU. 'joint_lru' evicts full-attention and SWA KV in one "
                 "shared least-recently-used order on a full/SWA hybrid model with "
-                "--enable-unified-memory, and acts as 'lru' elsewhere. See "
+                "--enable-unified-memory, and acts as 'lru' elsewhere. 'gds' evicts "
+                "cached recurrent-state checkpoints on hybrid models by GreedyDual-Size "
+                "over the prefill each one saves, and acts as 'lru' on other models. See "
                 "https://docs.sglang.io/docs/advanced_features/radix_eviction_policy "
                 "for what each policy optimizes for."
             ),
@@ -54,7 +56,9 @@ class Memory(msgspec.Struct):
                 "protected_threshold (int, default 2), e.g. "
                 "'{\"protected_threshold\": 4}'; 'tlru' takes threshold and "
                 "next_prompt_estimate (ints, tokens), e.g. "
-                '\'{"threshold": 4096, "next_prompt_estimate": 512}\'. An '
+                '\'{"threshold": 4096, "next_prompt_estimate": 512}\'; "gds" takes '
+                "the prefill cost coefficients d and e (floats, only their ratio "
+                "matters). An "
                 "unrecognized key fails at startup, naming the key and the "
                 "policy. See "
                 "https://docs.sglang.io/docs/advanced_features/radix_eviction_policy#policy-parameters "

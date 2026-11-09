@@ -952,6 +952,67 @@ fn evict_component_all_frees_both_tiers_without_the_host_lru() {
     assert!(!tc.host_lru_list(MAMBA).in_list(Some(a)));
 }
 
+fn gds_core() -> UnifiedTreeCore<Vec<i64>> {
+    UnifiedTreeCore::new(
+        CacheInitParams {
+            page_size: 1,
+            mamba_cache_chunk_size: Some(256),
+            eviction_policy: "gds".to_string(),
+            gds_cost: Some((1.0, 0.0)),
+            ..CacheInitParams::default()
+        },
+        vec![FULL, MAMBA],
+    )
+}
+
+fn walk_gds(tc: &mut UnifiedTreeCore<Vec<i64>>, states: usize) {
+    let mut tracker = HashMap::from([(MAMBA, 0)]);
+    let (mut device_frees, mut host_frees) = (HashMap::new(), HashMap::new());
+    tc.evict_device_start(MAMBA, states);
+    while tracker[&MAMBA] < states {
+        let (leaf, step) = tc.evict_device_next_node(MAMBA, &tracker);
+        accumulate_step(step, &mut tracker, &mut device_frees, &mut host_frees);
+        if let Some(leaf) = leaf {
+            let (_, step) = tc.evict_device_leaf(leaf, false).unwrap();
+            accumulate_step(step, &mut tracker, &mut device_frees, &mut host_frees);
+        }
+    }
+    tc.evict_device_end(MAMBA);
+}
+
+fn resumes_at(tc: &mut UnifiedTreeCore<Vec<i64>>, key: &Vec<i64>) -> bool {
+    tc.match_prefix(&match_params(key)).device_prefix_len == key.len()
+}
+
+#[test]
+fn gds_evicts_the_cheapest_state_not_the_oldest() {
+    let mut tc = gds_core();
+    let deep = vec![100, 101, 102, 103];
+    tc.insert(&insert_params_mamba(&deep, &[1, 2, 3, 4], Some(1)));
+    tc.insert(&insert_params_mamba(&vec![1], &[10], Some(2)));
+    tc.insert(&insert_params_mamba(&vec![1, 2], &[10, 11], Some(3)));
+
+    walk_gds(&mut tc, /* states = */ 1);
+
+    assert!(resumes_at(&mut tc, &deep));
+    assert!(!resumes_at(&mut tc, &vec![1]));
+}
+
+#[test]
+fn gds_rechecks_a_state_whose_ancestor_left_during_the_walk() {
+    let mut tc = gds_core();
+    let lone = vec![100, 101, 102];
+    tc.insert(&insert_params_mamba(&vec![1, 2], &[10, 11], Some(1)));
+    tc.insert(&insert_params_mamba(&vec![1, 2, 3, 4], &[10, 11, 12, 13], Some(2)));
+    tc.insert(&insert_params_mamba(&lone, &[20, 21, 22], Some(3)));
+
+    walk_gds(&mut tc, /* states = */ 2);
+
+    assert!(!resumes_at(&mut tc, &vec![1, 2]));
+    assert!(!resumes_at(&mut tc, &lone));
+    assert!(resumes_at(&mut tc, &vec![1, 2, 3, 4]));
+}
+
 #[test]
 fn device_walk_advances_one_allocator_mutation_per_call() {
     let mut tc = mamba_core(/* page_size = */ 1);
