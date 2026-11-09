@@ -184,6 +184,10 @@ class Cosmos3Config(PipelineConfig):
             ) * vae_scale_factor_temporal + 1
         return num_frames
 
+    def supports_sequential_multi_output_inference(self):
+        # Other Cosmos 3 configs use pipelines without output expansion.
+        return type(self) is Cosmos3Config
+
     def supports_action_endpoint(self) -> bool:
         # The public Cosmos3 family shares one pipeline/config across visual-only
         # and action-capable checkpoints. The loaded transformer validates that
