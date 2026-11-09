@@ -78,7 +78,8 @@ def parse_tune_backend(backend: str) -> Optional[str]:
     """Map a tuner backend name to the dispatch method.
 
     ``None`` means the name is not a backend this table can select.
-    ``"nccl"`` means the in-place NCCL path. ``"qr:INT4"`` carries the codec.
+    ``"nccl"`` is the process-group all-reduce. On ROCm that group is RCCL.
+    ``"qr:INT4"`` carries the codec.
     """
     if backend == "custom_allreduce":
         return "ca"

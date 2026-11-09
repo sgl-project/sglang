@@ -1012,7 +1012,9 @@ class GroupCoordinator:
         if method is None:
             return _TUNE_NO_DECISION
         if method == "nccl":
-            return None
+            # The tuner's "nccl" row is the process-group all-reduce. PyTorch
+            # keeps that backend name on ROCm, where the library is RCCL.
+            return "nccl"
         if method == "ca":
             comm = self.ca_comm
             if (
@@ -1145,6 +1147,10 @@ class GroupCoordinator:
                     out = input_.clone()
                     self._all_reduce_in_place(out)
                     return out
+        if outplace_all_reduce_method == "nccl":
+            out = input_.clone()
+            torch.distributed.all_reduce(out, group=self.device_group)
+            return out
         ca_comm = self.ca_comm
         qr_comm = self.qr_comm
         pymscclpp_comm = self.pymscclpp_comm
