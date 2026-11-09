@@ -1482,12 +1482,25 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     "Please set `--enable-custom-logit-processor` to enable this feature."
                 )
             if obj.bidir_prefix_len is not None and obj.bidir_prefix_len >= 0:
-                if attention_backends()[0] != "triton":
+                if (
+                    attention_backends()[0] != "triton"
+                    or get_schedule().page_size != 1
+                    or get_exec().deterministic.enable_deterministic_inference
+                    or get_parallel().attn_dcp_size > 1
+                ):
                     raise ValueError(
-                        "bidir_prefix_len requires --attention-backend triton."
+                        "bidir_prefix_len requires --attention-backend triton with "
+                        "--page-size 1, without --enable-deterministic-inference "
+                        "or DCP."
+                    )
+                if obj.session_params is not None:
+                    # Legacy sessions prepend history, which would shift the
+                    # boundary; radix-native sessions (session_id) are fine.
+                    raise ValueError(
+                        "bidir_prefix_len cannot be combined with session_params."
                     )
                 prompt_len = len(input_ids) if input_ids is not None else 0
-                chunk = self.server_args.chunked_prefill_size
+                chunk = get_schedule().chunked_prefill_size
                 if obj.bidir_prefix_len > prompt_len or (
                     chunk is not None and 0 < chunk < input_token_num
                 ):

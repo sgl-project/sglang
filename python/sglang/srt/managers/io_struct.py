@@ -870,6 +870,11 @@ class GenerateReqInput:
             raise ValueError(
                 "Cannot use list bidir_prefix_len with parallel_sample_num > 1"
             )
+        elif len(self.bidir_prefix_len) != num:
+            raise ValueError(
+                f"bidir_prefix_len has {len(self.bidir_prefix_len)} entries "
+                f"for a batch of {num} prompts"
+            )
 
     def _normalize_custom_logit_processor(self, num):
         """Normalize custom logit processor for batch processing."""
@@ -1148,8 +1153,6 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # of `CustomLogitProcessor` in python/sglang/srt/sampling/custom_logit_processor.py
     # Use the processor's `to_str()` method to generate the serialized string.
     custom_logit_processor: Optional[str] = None
-    # Block-bidirectional attention boundary; -1 = causal.
-    bidir_prefix_len: int = -1
     # Embedding overrides to place at specific token positions.
     positional_embed_overrides: Optional[PositionalEmbeds] = None
 
@@ -1217,6 +1220,8 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     sampling_logprobs_mode: SamplingLogprobsMode = "selected"
     # LoRA adapter name; KV events namespace this request's blocks by it.
     lora_name: Optional[str] = None
+    # Block-bidirectional attention boundary; -1 = causal.
+    bidir_prefix_len: int = -1
 
     def wrap_pickle_fields(self):
         self.mm_inputs = wrap_object_fields_as_pickle(self.mm_inputs)

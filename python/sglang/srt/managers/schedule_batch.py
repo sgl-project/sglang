@@ -861,7 +861,10 @@ class Req(ReqDllmMixin):
             ) + lora_id  # lora_id is concatenated to the extra key
 
         if bidir_prefix_len >= 0:
-            extra_key = (extra_key or "") + f"|bidir{bidir_prefix_len}"
+            # Boundary and caller namespace as length-delimited components, so
+            # ("|bidir4", P=1) and ("", P=4) cannot share a cache subtree.
+            caller_key = extra_key or ""
+            extra_key = f"bidir{bidir_prefix_len}|{len(caller_key)}|{caller_key}"
 
         self.extra_key = extra_key
         self.cache_salt = cache_salt or None
