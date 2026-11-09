@@ -407,6 +407,23 @@ def moe_awq_to_marlin_zero_points(
     return output
 
 
+def moe_packed_to_marlin_zero_points(
+    q_zp_packed: torch.Tensor, size_k: int, size_n: int, num_bits: int
+):
+    # compressed-tensors zero-points use standard bit packing on the column dim,
+    # without AWQ's interleaving: unpack, then apply the Marlin permutation.
+    num_experts = q_zp_packed.shape[0]
+    output = torch.empty(
+        (num_experts, q_zp_packed.shape[1], q_zp_packed.shape[2]),
+        device=q_zp_packed.device,
+        dtype=q_zp_packed.dtype,
+    )
+    for e in range(num_experts):
+        q_zp = unpack_cols(q_zp_packed[e], num_bits, size_k, size_n)
+        output[e] = marlin_zero_points(q_zp, size_k, size_n, num_bits)
+    return output
+
+
 def maybe_warn_marlin_atomic_add(device, dtype):
     if torch.compiler.is_dynamo_compiling():
         return

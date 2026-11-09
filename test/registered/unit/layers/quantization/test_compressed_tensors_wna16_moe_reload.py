@@ -44,9 +44,21 @@ QUANT_CONFIG = {
     },
     "ignore": ["lm_head"],
 }
+ASYM_QUANT_CONFIG = {
+    **QUANT_CONFIG,
+    "config_groups": {
+        "group_0": {
+            **QUANT_CONFIG["config_groups"]["group_0"],
+            "weights": {
+                **QUANT_CONFIG["config_groups"]["group_0"]["weights"],
+                "symmetric": False,
+            },
+        }
+    },
+}
 
 
-def _random_checkpoint(seed):
+def _random_checkpoint(seed, asymmetric=False):
     gen = torch.Generator(device=DEVICE).manual_seed(seed)
     shards = {}
     for expert_id in range(E):
@@ -70,6 +82,16 @@ def _random_checkpoint(seed):
                     [rows, cols], dtype=torch.float32, device=DEVICE
                 ),
             }
+            if asymmetric:
+                # a packed checkpoint stores zero points on the output dim too
+                shards[expert_id, shard_id]["weight_zero_point"] = torch.randint(
+                    0,
+                    2**31 - 1,
+                    (rows // PACK_FACTOR, cols // GROUP_SIZE),
+                    dtype=torch.int32,
+                    device=DEVICE,
+                    generator=gen,
+                )
     return shards
 
 
@@ -109,20 +131,25 @@ class TestWNA16MoEMarlinReload(CustomTestCase):
         ):
             yield
 
-    def _fresh_model(self, shards):
+    def _fresh_layer(self, asymmetric=False):
         from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
-        model = torch.nn.Module()
-        model.experts = FusedMoE(
+        return FusedMoE(
             num_experts=E,
             hidden_size=H,
             intermediate_size=I,
             layer_id=0,
             top_k=TOPK,
             params_dtype=torch.bfloat16,
-            quant_config=CompressedTensorsConfig.from_config(QUANT_CONFIG),
+            quant_config=CompressedTensorsConfig.from_config(
+                ASYM_QUANT_CONFIG if asymmetric else QUANT_CONFIG
+            ),
             prefix="model.layers.0.mlp.experts",
         ).cuda()
+
+    def _fresh_model(self, shards, asymmetric=False):
+        model = torch.nn.Module()
+        model.experts = self._fresh_layer(asymmetric)
         _load(model.experts, shards)
         DefaultModelLoader.postprocess_weights(model, DEVICE)
         return model
@@ -180,6 +207,59 @@ class TestWNA16MoEMarlinReload(CustomTestCase):
             self.assertEqual(
                 {name: p.data_ptr() for name, p in model.named_parameters()}, ptrs
             )
+
+            torch.manual_seed(0)
+            x = torch.randn(M, H, dtype=torch.bfloat16) / 10
+            topk_output = select_experts(
+                hidden_states=x,
+                router_logits=torch.randn(M, E, dtype=torch.float32),
+                topk_config=TopKConfig(top_k=TOPK, renormalize=True),
+            )
+            out_a = self._forward(fresh_a, x, topk_output).float()
+            out_b = self._forward(fresh_b, x, topk_output).float()
+            assert_output_close(
+                self, self._forward(model, x, topk_output), out_a, cos_threshold=0.9999
+            )
+            cos_ab = torch.nn.functional.cosine_similarity(
+                out_a.flatten(), out_b.flatten(), dim=0
+            ).item()
+            self.assertLess(
+                cos_ab, 0.9, "the two checkpoints must give different outputs"
+            )
+
+    def test_asymmetric_checkpoint_loads_and_refits(self):
+        """A packed asymmetric checkpoint keeps zero points on the output dim; the loader must flip them."""
+        from sglang.srt.layers.moe.topk import TopKConfig, select_experts
+
+        with self._runtime():
+            ckpt_a = _random_checkpoint(3, asymmetric=True)
+            ckpt_b = _random_checkpoint(4, asymmetric=True)
+
+            # before the repack the scheme's zero-point buffers are [K / group, N / packed]
+            layer = self._fresh_layer(asymmetric=True)
+            _load(layer, ckpt_a)
+            for shard_id, offset in (
+                ("w1", 0),
+                ("w3", I // PACK_FACTOR),
+                ("w2", 0),
+            ):
+                prefix = "w2" if shard_id == "w2" else "w13"
+                got = getattr(layer, f"{prefix}_weight_zero_point")[0]
+                want = ckpt_a[0, shard_id]["weight_zero_point"].t()
+                self.assertTrue(
+                    torch.equal(got[:, offset : offset + want.shape[1]], want),
+                    f"{shard_id} zero points are not the flipped checkpoint",
+                )
+
+            fresh_a = self._fresh_model(ckpt_a, asymmetric=True)
+            fresh_b = self._fresh_model(ckpt_b, asymmetric=True)
+            model = self._fresh_model(ckpt_a, asymmetric=True)
+            self.assertIs(type(model.experts.scheme), CompressedTensorsWNA16MoE)
+
+            self._refit(model, ckpt_b)
+            self._assert_same_weights(model, fresh_b)
+            self._refit(model, ckpt_a)
+            self._assert_same_weights(model, fresh_a)
 
             torch.manual_seed(0)
             x = torch.randn(M, H, dtype=torch.bfloat16) / 10

@@ -23,7 +23,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
 from sglang.srt.layers.quantization.marlin_utils import (
     marlin_make_workspace,
     marlin_moe_permute_scales,
-    moe_awq_to_marlin_zero_points,
+    moe_packed_to_marlin_zero_points,
 )
 from sglang.srt.layers.quantization.utils import replace_parameter
 from sglang.srt.layers.utils.common import set_weight_attrs
@@ -386,7 +386,7 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
 
         # Repack zero
         if not self.sym:
-            marlin_w13_zp = moe_awq_to_marlin_zero_points(
+            marlin_w13_zp = moe_packed_to_marlin_zero_points(
                 layer.w13_weight_zero_point,
                 size_k=layer.w13_weight_zero_point.shape[1],
                 size_n=layer.w13_weight_zero_point.shape[2] * self.packed_factor,
@@ -394,7 +394,7 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
             )
             replace_tensor("w13_weight_zero_point", marlin_w13_zp)
 
-            marlin_w2_zp = moe_awq_to_marlin_zero_points(
+            marlin_w2_zp = moe_packed_to_marlin_zero_points(
                 layer.w2_weight_zero_point,
                 size_k=layer.w2_weight_zero_point.shape[1],
                 size_n=layer.w2_weight_zero_point.shape[2] * self.packed_factor,

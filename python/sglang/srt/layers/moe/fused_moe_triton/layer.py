@@ -1409,17 +1409,16 @@ class FusedMoE(torch.nn.Module):
 
             clear_mxfp8_shuffle_index_cache()
 
+        # Zero points are flipped like the weights: a packed checkpoint stores them
+        # [N / packed, K / group] and the scheme's buffers are [K / group, N / packed].
         loaded_weight = (
             loaded_weight.t().contiguous()
-            if (
-                method.__class__.__name__
-                in [
-                    "CompressedTensorsWNA16MarlinMoE",
-                    "CompressedTensorsWNA16MoE",
-                    "CompressedTensorsWNA16TritonMoE",
-                ]
-            )
-            and "zero" not in weight_name
+            if method.__class__.__name__
+            in [
+                "CompressedTensorsWNA16MarlinMoE",
+                "CompressedTensorsWNA16MoE",
+                "CompressedTensorsWNA16TritonMoE",
+            ]
             else loaded_weight
         )
 
@@ -1664,16 +1663,15 @@ class FusedMoE(torch.nn.Module):
             )
 
             clear_mxfp8_shuffle_index_cache()
+        # Zero points are flipped like the weights: a packed checkpoint stores them
+        # [N / packed, K / group] and the scheme's buffers are [K / group, N / packed].
         loaded_weight = (
             loaded_weight.t().contiguous()
-            if (
-                method.__class__.__name__
-                in [
-                    "CompressedTensorsWNA16MoE",
-                    "CompressedTensorsWNA16TritonMoE",
-                ]
-            )
-            and "zero" not in weight_name
+            if method.__class__.__name__
+            in [
+                "CompressedTensorsWNA16MoE",
+                "CompressedTensorsWNA16TritonMoE",
+            ]
             else loaded_weight
         )
 
