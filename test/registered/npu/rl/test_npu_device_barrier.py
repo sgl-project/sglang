@@ -32,6 +32,7 @@ from sglang.test.ascend.npu_rl_utils import (
     npu_device_count,
     npu_server,
     pause_generation,
+    stream_generate,
     update_weights_from_tensor,
     warmup_npu,
 )
@@ -133,10 +134,20 @@ class TestNpuDeviceBarrier(CustomTestCase):
             "pause", [kind for kind, _ in events], "weights were never released"
         )
 
+    @unittest.skipUnless(npu_available(), "requires an Ascend NPU")
     def test_resume_orders_restore_after_barrier(self):
+        torch.npu.set_device(0)
+        torch.npu.synchronize()
+
         events = []
         manager = _make_manager(events)
         manager.offload_tags = {"weights"}
+
+        _enqueue_npu_work()
+        self.assertFalse(
+            torch.npu.current_stream().query(),
+            "helper failed to leave NPU work in flight",
+        )
 
         with (
             patch.object(
@@ -156,6 +167,10 @@ class TestNpuDeviceBarrier(CustomTestCase):
         ):
             manager.resume_memory_occupation(SimpleNamespace(tags=["weights"]))
 
+        self.assertTrue(
+            torch.npu.current_stream().query(),
+            "resume returned while NPU work was still in flight",
+        )
         kinds = [kind for kind, _ in events]
         self.assertIn("barrier", kinds, "resume did not join the TP ranks")
         self.assertIn("import", kinds, "resume did not restore static state")
@@ -169,8 +184,9 @@ class TestNpuDeviceBarrier(CustomTestCase):
             kinds.index("import"),
             f"state restored before all ranks finished: {events}",
         )
-        # resume_memory_occupation has no device-wide synchronize today; this
-        # test locks the barrier/restore ordering that the current code provides.
+        # resume calls synchronize() before returning, like release; this case
+        # asserts both the physical device-idle contract and the barrier ->
+        # restore ordering.
 
     @unittest.skipUnless(
         npu_available() and npu_device_count() >= 2,
@@ -180,15 +196,15 @@ class TestNpuDeviceBarrier(CustomTestCase):
     def test_02_dp_pause_returns_after_all_ranks_drain(self):
         warmup_npu()
         with npu_server(MODEL, extra_args=DP_ARGS) as base_url:
-            results = {}
+            events = [[], []]
+            errors = [[], []]
 
             def _run(idx):
                 try:
-                    results[idx] = generate(
-                        base_url, PROMPT, max_new_tokens=384, timeout=300
-                    )
+                    for event in stream_generate(base_url, PROMPT, max_new_tokens=384):
+                        events[idx].append(event)
                 except Exception as exc:  # pragma: no cover - surfaced in test
-                    results[idx] = exc
+                    errors[idx].append(exc)
 
             threads = [
                 threading.Thread(target=_run, args=(idx,), daemon=True)
@@ -196,21 +212,53 @@ class TestNpuDeviceBarrier(CustomTestCase):
             ]
             for thread in threads:
                 thread.start()
-            time.sleep(1.0)
+
+            # Wait until both requests have decoded a token; aborting requests
+            # that are still queued would not drain either DP replica.
+            deadline = time.time() + 30
+            while (
+                any(not chunk for chunk in events)
+                and all(thread.is_alive() for thread in threads)
+                and time.time() < deadline
+            ):
+                time.sleep(0.02)
+
+            for idx in range(2):
+                self.assertTrue(events[idx], f"DP request {idx} never started decoding")
+                self.assertTrue(
+                    threads[idx].is_alive(), f"DP request {idx} finished early"
+                )
+            dp_ranks = {
+                events[idx][0].get("meta_info", {}).get("dp_rank") for idx in range(2)
+            }
+            self.assertEqual(
+                dp_ranks,
+                {0, 1},
+                f"requests did not cover both DP ranks: {dp_ranks}",
+            )
 
             pause_generation(base_url, mode="abort")
             for thread in threads:
                 thread.join(timeout=60)
 
             for idx in range(2):
-                self.assertNotIsInstance(results.get(idx), Exception)
-                response = results[idx]
-                finish_type = (
-                    response.get("meta_info", {}).get("finish_reason", {}).get("type")
+                self.assertFalse(errors[idx], f"DP stream {idx} failed: {errors[idx]}")
+                self.assertFalse(
+                    threads[idx].is_alive(), f"DP stream {idx} did not end"
                 )
-                self.assertTrue(
-                    finish_type == "abort" or len(response.get("output_ids", [])) < 384,
-                    f"DP rank {idx} was not drained by pause",
+                last = events[idx][-1]
+                finish_type = (
+                    last.get("meta_info", {}).get("finish_reason", {}).get("type")
+                )
+                self.assertEqual(
+                    finish_type,
+                    "abort",
+                    f"DP rank {idx} was not aborted by pause: {last}",
+                )
+                self.assertLess(
+                    len(last.get("output_ids", [])),
+                    384,
+                    f"DP rank {idx} produced the full completion",
                 )
 
             continue_generation(base_url)
