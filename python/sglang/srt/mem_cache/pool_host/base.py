@@ -622,6 +622,13 @@ class HostKVCache(abc.ABC):
         """Page size in that same logical space (the widened DCP page)."""
         return self.page_size * self.dcp_size
 
+    @property
+    def storage_page_span(self) -> int:
+        """Logical slots one L3 key covers. A pool that shards by DCP row backs
+        a widened page with one physical page per rank, so its key spans exactly
+        that widened page; a replicated pool overrides this."""
+        return self.logical_page_size
+
     def _storage_page_index(self, index: int) -> int:
         """Physical slot of the page an L3 key covers; storage backends address
         pages by logical (widened) slot, one physical page per rank under DCP."""

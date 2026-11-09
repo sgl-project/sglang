@@ -540,16 +540,23 @@ class TestDcpStoragePages(CustomTestCase):
             pool.get_page_buffer_meta(torch.arange(128))
 
 
-def _make_indexer_host(anchor: MLATokenToKVPoolHost, stride: int = 6):
+def _make_indexer_host(
+    anchor: MLATokenToKVPoolHost, stride: int = 6, *, replicated: bool = False
+):
     """CPU DSAIndexerPoolHost carrying only the storage-page state (the real
-    constructor needs a CUDA DSA device pool)."""
+    constructor needs a CUDA DSA device pool).
+
+    A replicated index-K mirrors every rank's slots, so it has no DCP
+    translation of its own and spends ``dcp_size`` of its pages per L3 key.
+    """
     pool = DSAIndexerPoolHost.__new__(DSAIndexerPoolHost)
     pool.page_size = anchor.page_size
-    pool.dcp_size = anchor.dcp_size
-    pool.dcp_rank = anchor.dcp_rank
+    pool.dcp_size = 1 if replicated else anchor.dcp_size
+    pool.dcp_rank = 0 if replicated else anchor.dcp_rank
+    pool.storage_pages_per_key = anchor.dcp_size if replicated else 1
     pool.layout = anchor.layout
-    pool.size = anchor.size
-    pool.page_num = anchor.page_num
+    pool.size = anchor.logical_size if replicated else anchor.size
+    pool.page_num = anchor.page_num * pool.storage_pages_per_key
     pool.layer_num = 2
     pool.indexer_dtype = torch.uint8
     pool.indexer_page_stride_size = stride
@@ -597,6 +604,45 @@ class TestDcpIndexerStoragePages(CustomTestCase):
                         int(self._page(source, 3).count_nonzero()),
                     )
 
+    def test_replicated_index_k_stores_every_rank_page_per_key(self):
+        """A replicated mirror holds all dcp_size pages of a widened page, so
+        one key must carry all of them, contiguously and in rank order."""
+        for dcp in (1, 2, 8):
+            for layout in ("layer_first", "page_first", "page_first_direct"):
+                with self.subTest(dcp=dcp, layout=layout):
+                    anchor = _make_host_pool(1, dcp_size=dcp, layout=layout)
+                    source = _make_indexer_host(anchor, replicated=True)
+                    target = _make_indexer_host(anchor, replicated=True)
+                    target.index_k_with_scale_buffer.zero_()
+                    span = l3_page_span(source)
+                    self.assertEqual(span, anchor.logical_page_size)
+                    covered = [3 * dcp + i for i in range(dcp)]
+                    payload = source.get_data_page(3 * span)
+                    self.assertEqual(
+                        payload.numel(),
+                        dcp * source.layer_num * source.indexer_page_stride_size,
+                    )
+                    target.set_from_flat_data_page(5 * span, payload)
+                    for i, page in enumerate(covered):
+                        torch.testing.assert_close(
+                            self._page(target, 5 * dcp + i), self._page(source, page)
+                        )
+                    self.assertEqual(
+                        int(target.index_k_with_scale_buffer.count_nonzero()),
+                        sum(
+                            int(self._page(source, p).count_nonzero()) for p in covered
+                        ),
+                    )
+
+    def test_replicated_index_k_rejects_unaligned_and_out_of_range(self):
+        anchor = _make_host_pool(1, dcp_size=2, layout="page_first")
+        pool = _make_indexer_host(anchor, replicated=True)
+        for index in (-128, 1, 64):
+            with self.subTest(index=index), self.assertRaises(ValueError):
+                pool.get_data_page(index)
+        with self.assertRaises(IndexError):
+            pool.get_data_page(anchor.logical_size)
+
     def test_zero_copy_uses_physical_pages(self):
         anchor = _make_host_pool(1, dcp_size=2, layout="page_first")
         pool = _make_indexer_host(anchor)
@@ -607,6 +653,17 @@ class TestDcpIndexerStoragePages(CustomTestCase):
             [pool.index_k_with_scale_buffer[p].data_ptr() for p in (3, 0)],
         )
         self.assertEqual(sizes, [2 * 6] * 2)
+
+    def test_zero_copy_spans_every_rank_page_when_replicated(self):
+        anchor = _make_host_pool(1, dcp_size=2, layout="page_first")
+        pool = _make_indexer_host(anchor, replicated=True)
+        indices = torch.cat([torch.arange(p * 128, (p + 1) * 128) for p in (3, 0)])
+        pointers, sizes = pool.get_page_buffer_meta(indices)
+        self.assertEqual(
+            pointers,
+            [pool.index_k_with_scale_buffer[p].data_ptr() for p in (6, 0)],
+        )
+        self.assertEqual(sizes, [2 * 2 * 6] * 2)
 
     def test_zero_copy_pointers_are_ints_without_dcp(self):
         anchor = _make_host_pool(0, dcp_size=1, layout="page_first")
@@ -645,6 +702,13 @@ class TestDcpL3PoolCheck(CustomTestCase):
             with self.subTest(name=name, pool=type(pool).__name__):
                 self._check(name, pool, anchor)
 
+    def test_replicated_indexer_allowed_when_widened(self):
+        """DeepSeek-V3.2 / GLM keep index-K replicated, so the mirror spans the
+        logical slot space and pages a whole widened page per key."""
+        anchor = _make_host_pool(1, dcp_size=2, layout="page_first")
+        pool = _make_indexer_host(anchor, replicated=True)
+        self._check(PoolName.INDEXER, pool, anchor, shards_index_k=False)
+
     def test_rejected_pools(self):
         anchor = _make_host_pool(1, dcp_size=2, layout="page_first")
         indexer = _make_indexer_host(anchor)
@@ -652,8 +716,16 @@ class TestDcpL3PoolCheck(CustomTestCase):
         dummy_draft = _make_host_pool(1, dcp_size=2, layout="page_first")
         dummy_draft.kv_buffer = None
         replicated_draft = _make_host_pool(0, dcp_size=1, layout="page_first")
+        narrow = _make_indexer_host(anchor, replicated=True)
+        narrow.storage_pages_per_key = 1
         for label, name, pool, shards in (
-            ("replicated index-K", PoolName.INDEXER, indexer, False),
+            (
+                "sharded mirror with a replicated index-K",
+                PoolName.INDEXER,
+                indexer,
+                False,
+            ),
+            ("replicated mirror that is not widened", PoolName.INDEXER, narrow, False),
             ("indexer size", PoolName.INDEXER, resized, True),
             ("draft indexer", PoolName.DRAFT_INDEXER, indexer, True),
             ("dummy draft", PoolName.DRAFT, dummy_draft, True),
@@ -823,6 +895,7 @@ class TestDsaIndexerHostUnderDcp(CustomTestCase):
             # transfer indices untranslated. This is what the assembler passes.
             num_host_pages=anchor.page_num * anchor.dcp_size,
             transfer_page_size=anchor.page_size,
+            storage_pages_per_key=anchor.dcp_size,
             layout=anchor.layout,
             buffer_device=device_pool.device,
             dtype=device_pool.store_dtype,
@@ -857,6 +930,16 @@ class TestDsaIndexerHostUnderDcp(CustomTestCase):
         torch.testing.assert_close(kernel.call_args.kwargs["src_indices"], pages)
         torch.testing.assert_close(kernel.call_args.kwargs["dst_indices"], pages)
         self.assertLess(int(pages.max()), host.indexer_page_num)
+
+    def test_one_l3_key_covers_the_whole_widened_page(self):
+        """The mirror is not row-sharded, so a widened page sits here as
+        dcp_size consecutive pages and an L3 key has to carry all of them."""
+        anchor, _, host = self._make()
+        self.assertEqual(l3_page_span(host), anchor.logical_page_size)
+        self.assertEqual(
+            host.get_data_page(WIDENED_PAGE).numel(),
+            host.get_dummy_flat_data_page().numel(),
+        )
 
     def test_packed_draft_adds_a_widened_tail_layer(self):
         draft = _fake_widened_index_pool(layer_num=1)

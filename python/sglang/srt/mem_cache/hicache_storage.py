@@ -253,7 +253,11 @@ class PoolTransferResult:
 def l3_page_span(host_pool: Any) -> int:
     """Logical slots one L3 key covers for this host pool. Under DCP a key is a
     widened (logical) page backed by one physical page on each rank; pools
-    without DCP (or with a page of 1, like KDA state) are unchanged."""
+    without DCP (or with a page of 1, like KDA state) are unchanged. A pool
+    whose physical layout is not row-sharded reports its own span."""
+    span = getattr(host_pool, "storage_page_span", None)
+    if span:
+        return int(span)
     page_size = getattr(host_pool, "page_size", 1) or 1
     return page_size * (getattr(host_pool, "dcp_size", 1) or 1)
 

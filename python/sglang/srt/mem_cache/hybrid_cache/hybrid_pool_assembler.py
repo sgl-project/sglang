@@ -1611,6 +1611,9 @@ def _build_sidecar_host_pool(
         layer_sharded=root.layer_shard_enabled,
         dcp_size=root_host_pool.dcp_size if dsa_shards_index_k() else 1,
         dcp_rank=root_host_pool.dcp_rank if dsa_shards_index_k() else 0,
+        # One L3 key covers the anchor's widened page either way: a sharded
+        # mirror spends one page per rank, a replicated one spends dcp_size.
+        storage_pages_per_key=(1 if dsa_shards_index_k() else root_host_pool.dcp_size),
         allocator_type=_get_allocator_type(),
     )
     host.start_layer, host.end_layer = root.start_layer, root.end_layer
