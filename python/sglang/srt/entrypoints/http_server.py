@@ -27,6 +27,7 @@ import ssl
 import tempfile
 import threading
 import time
+import traceback
 import uuid
 from contextlib import asynccontextmanager
 from functools import partial
@@ -47,6 +48,8 @@ import aiohttp
 import numpy as np
 import orjson
 import requests
+import setproctitle
+import torch
 import uvicorn
 import uvloop
 from fastapi import (
@@ -66,11 +69,12 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 from fastapi.routing import APIRoute
+from pydantic import ValidationError
 from uvicorn.supervisors.multiprocess import Multiprocess
 
 from sglang.srt.configs.model_config import load_joint_head_config, load_pointer_head
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
-from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
+from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.entrypoints.anthropic.protocol import (
     AnthropicCountTokensRequest,
     AnthropicMessagesRequest,
@@ -81,8 +85,6 @@ from sglang.srt.entrypoints.engine import (
     Engine,
     init_tokenizer_manager,
     node_hosts_rust_server,
-    run_detokenizer_process,
-    run_scheduler_process,
 )
 from sglang.srt.entrypoints.ollama.protocol import (
     OllamaChatRequest,
@@ -120,12 +122,19 @@ from sglang.srt.entrypoints.openai.serving_transcription import (
     OpenAIServingTranscription,
 )
 from sglang.srt.entrypoints.request_headers import apply_header_overrides
+from sglang.srt.entrypoints.server_utils import (
+    add_prometheus_middleware,
+    build_model_info_fields,
+    build_server_info,
+    set_uvicorn_logging_configs,
+)
 from sglang.srt.entrypoints.sidecar import rust_server_sidecar
 from sglang.srt.entrypoints.systemone.protocol import SystemOneRequest
 from sglang.srt.entrypoints.systemone.serving import SystemOneServing
 from sglang.srt.entrypoints.warmup import execute_warmups
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
+from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
 from sglang.srt.managers.io_struct import (
     AbortReq,
     AttachHiCacheStorageReqInput,
@@ -148,6 +157,7 @@ from sglang.srt.managers.io_struct import (
     ParseFunctionCallReq,
     PauseGenerationReqInput,
     PdRoleSwitchReqInput,
+    PluginWeightUpdateReqInput,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
@@ -165,13 +175,16 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.multi_tokenizer_mixin import (
     MultiTokenizerRouter,
-    TokenizerWorker,
     get_main_process_id,
-    get_tokenizer_worker_class,
     read_from_shared_memory,
     write_data_for_multi_tokenizer,
 )
-from sglang.srt.managers.tokenizer_manager import ServerStatus, TokenizerManager
+from sglang.srt.managers.scheduler import run_scheduler_process
+from sglang.srt.managers.tokenizer_manager import (
+    ServerStatus,
+    TokenizerManager,
+    get_tokenizer_worker_class,
+)
 from sglang.srt.observability.func_timer import enable_func_timer
 from sglang.srt.observability.http_request_metrics import (
     add_http_request_metrics_middleware,
@@ -188,15 +201,11 @@ from sglang.srt.parser.template_manager import TemplateManager
 from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
-    add_prometheus_middleware,
-    build_model_info_fields,
-    build_server_info,
     delete_directory,
     freeze_gc,
     get_bool_env_var,
     is_mps,
     kill_process_tree,
-    set_uvicorn_logging_configs,
 )
 from sglang.srt.utils.auth import AuthLevel, app_has_admin_force_endpoints, auth_level
 from sglang.srt.utils.json_response import (
@@ -207,7 +216,6 @@ from sglang.srt.utils.json_response import (
 )
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.watchdog import SubprocessWatchdog
-from sglang.utils import get_exception_traceback
 from sglang.version import __version__
 
 logger = logging.getLogger(__name__)
@@ -221,7 +229,7 @@ WAIT_WEIGHTS_READY_TIMEOUT = int(os.getenv("SGLANG_WAIT_WEIGHTS_READY_TIMEOUT", 
 # Store global states
 @dataclasses.dataclass
 class _GlobalState:
-    tokenizer_manager: Union[TokenizerManager, MultiTokenizerRouter, TokenizerWorker]
+    tokenizer_manager: Union[TokenizerManager, MultiTokenizerRouter]
     template_manager: TemplateManager
     scheduler_info: Dict
 
@@ -269,6 +277,8 @@ async def init_multi_tokenizer() -> ServerArgs:
     )
 
     # Launch multi-tokenizer manager process
+    setproctitle.setproctitle(f"sglang::tokenizer_worker:{os.getpid()}")
+    torch.set_num_threads(1)
     tokenizer_worker_class = get_tokenizer_worker_class(server_args)
     tokenizer_manager = tokenizer_worker_class(server_args, port_args)
     template_manager = TemplateManager()
@@ -305,7 +315,7 @@ async def lifespan(fast_api_app: FastAPI):
     else:
         # Initialize multi-tokenizer support for worker processes
         server_args = await init_multi_tokenizer()
-        worker_id = _global_state.tokenizer_manager.worker_id
+        worker_id = os.getpid()
         warmup_thread_kwargs = _multi_tokenizer_warmup_kwargs(server_args, worker_id)
         thread_label = f"MultiTokenizer-{worker_id}"
 
@@ -411,7 +421,7 @@ async def lifespan(fast_api_app: FastAPI):
             f"OpenAIServingResponses init failed ({type(e).__name__}: {e})"
         )
         logger.debug(
-            f"OpenAIServingResponses init traceback:\n{get_exception_traceback()}"
+            f"OpenAIServingResponses init traceback:\n{traceback.format_exc()}"
         )
 
     # Execute custom warmups
@@ -1475,6 +1485,24 @@ async def end_weight_update(
     )
 
 
+@app.post("/plugin_weight_update")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def plugin_weight_update(
+    obj: Annotated[PluginWeightUpdateReqInput, Body()], request: Request
+):
+    """Receive weights through a platform transport and load them, as /update_weights_from_distributed does."""
+    reply = await _global_state.tokenizer_manager.plugin_weight_update(obj, request)
+    content = {
+        "success": reply.success,
+        "message": reply.message,
+        "received_tensor_counts": reply.received_tensor_counts,
+    }
+    if reply.success:
+        return ORJSONResponse(content, status_code=200)
+    else:
+        return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+
+
 @app.post("/update_weights_from_distributed")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def update_weights_from_distributed(
@@ -1876,8 +1904,10 @@ async def openai_v1_chat_completions(
 )
 async def openai_v1_embeddings(request: EmbeddingRequest, raw_request: Request):
     """OpenAI-compatible embeddings endpoint."""
-    return await raw_request.app.state.openai_serving_embedding.handle_request(
-        request, raw_request
+    return model_json_response(
+        await raw_request.app.state.openai_serving_embedding.handle_request(
+            request, raw_request
+        )
     )
 
 
@@ -2189,16 +2219,52 @@ async def sagemaker_health() -> Response:
     return Response(status_code=status_code)
 
 
+# Checked in order, so a body with `messages` always reaches chat. Dispatch is by key
+# rather than by trying each model, because `input` is shared by
+# embeddings/classify/responses and ScoringRequest accepts any body.
+_SAGEMAKER_INVOCATION_ROUTES = (
+    ("messages", ChatCompletionRequest, openai_v1_chat_completions),
+    ("prompt", CompletionRequest, openai_v1_completions),
+    ("input", EmbeddingRequest, openai_v1_embeddings),
+)
+_SAGEMAKER_NO_MATCH_MSG = (
+    "Cannot determine the request type: expected one of 'messages' "
+    "(chat completions), 'prompt' (completions) or 'input' (embeddings)"
+)
+
+
 @app.post("/invocations")
-async def sagemaker_chat_completions(
-    request: ChatCompletionRequest, raw_request: Request
+async def sagemaker_invocations(
+    body: Annotated[Dict[str, Any], Body()], raw_request: Request
 ):
-    """OpenAI-compatible chat completion endpoint."""
-    return model_json_response(
-        await raw_request.app.state.openai_serving_chat.handle_request(
-            request, raw_request
+    """SageMaker's only inference route: dispatch by body key to the matching OpenAI route."""
+    for key, request_cls, route in _SAGEMAKER_INVOCATION_ROUTES:
+        if key in body:
+            break
+    else:
+        # The body is not echoed back: SageMaker request bodies can be up to 6 MB.
+        raise RequestValidationError(
+            errors=[
+                {
+                    "type": "value_error",
+                    "loc": ("body",),
+                    "msg": _SAGEMAKER_NO_MATCH_MSG,
+                }
+            ]
         )
-    )
+    try:
+        request = request_cls.model_validate(body)
+    except ValidationError as e:
+        raise RequestValidationError(
+            errors=[
+                {**err, "loc": ("body", *err["loc"])}
+                for err in e.errors(include_url=False)
+            ]
+        ) from e
+    # Route functions are called directly, so their route-level Depends (e.g.
+    # validate_json_request) and response_class do not apply; the wrapper replaces
+    # the ORJSONResponse that /v1/embeddings would otherwise get.
+    return model_json_response(await route(request, raw_request))
 
 
 ## Vertex AI API
@@ -2289,7 +2355,8 @@ def _get_vlm_warmup_image_base64(model_info: dict) -> str:
     architectures = model_info.get("architectures") or []
     if (
         "KimiK3ForConditionalGeneration" in architectures
-        or model_info.get("model_type") == "kimi_k3"
+        or "KimiK31ForConditionalGeneration" in architectures
+        or model_info.get("model_type") in ("kimi_k3", "kimi_k31")
     ):
         logger.info(
             "Using a 448x448 image for Kimi K3 VLM startup warmup to exercise "
@@ -2367,7 +2434,7 @@ def _execute_server_warmup(server_args: ServerArgs):
             success = True
             break
         except (AssertionError, requests.exceptions.RequestException):
-            last_traceback = get_exception_traceback()
+            last_traceback = traceback.format_exc()
             pass
 
     if not success:
@@ -2519,7 +2586,7 @@ def _execute_server_warmup(server_args: ServerArgs):
             )
 
     except Exception:
-        last_traceback = get_exception_traceback()
+        last_traceback = traceback.format_exc()
         logger.error(f"Initialization failed. warmup error: {last_traceback}")
         kill_process_tree(os.getpid())
         return False
@@ -3158,7 +3225,8 @@ def launch_server(
         # The Rust server serves api-server, tokenizer, and detokenizer, so the
         # main process has no Python HTTP server / tokenizer manager to run.
         # Each Rust listener runs its own startup warmup and keeps /health at
-        # 503 until it succeeds, so the main process does not warm up here.
+        # 503 until it succeeds, so the main process does not warm up here. A
+        # failed warmup signals this process as a crashed scheduler does.
         from sglang.srt.rust_server.server import drain_notify_name
         from sglang.srt.rust_server.shutdown import RustServerSigtermDrain
 

@@ -8,9 +8,10 @@ from unittest.mock import MagicMock, Mock, call, patch
 
 import pytest
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.io_struct import AbortReq
-from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req
+from sglang.srt.managers.req_types import FINISH_LENGTH
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.deferred_responses import (
     DeferredResponses,
@@ -18,6 +19,7 @@ from sglang.srt.managers.scheduler_components.deferred_responses import (
 from sglang.srt.managers.scheduler_components.output_streamer import (
     SchedulerOutputStreamer,
 )
+from sglang.srt.managers.scheduler_components.pause_state import PauseState
 from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
 )
@@ -28,6 +30,7 @@ from sglang.srt.utils.weight_versions import (
     compute_weight_version_spans,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_test_utils import empty_request_lists
 from sglang.test.test_utils import published_topology
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
@@ -49,9 +52,7 @@ def _req(rid, return_logprob=False):
 def _scheduler():
     scheduler = object.__new__(Scheduler)
     scheduler.disaggregation_mode = DisaggregationMode.NULL
-    scheduler.waiting_queue = []
-    scheduler.chunked_req = None
-    scheduler.hisparse_coordinator = None
+    empty_request_lists(scheduler)
     scheduler.collect_inflight_reqs = lambda: set()
     scheduler.ipc_channels = Mock()
     scheduler.rust_server = None
@@ -207,7 +208,7 @@ def test_held_responses_do_not_change_idle_state():
     # release must still see the same idle state on every rank.
     scheduler = _scheduler()
     scheduler.request_receiver = object.__new__(SchedulerRequestReceiver)
-    scheduler._engine_paused = False
+    scheduler.pause_state = PauseState()
     scheduler.enable_overlap = False
     scheduler.last_batch = None
     scheduler.running_batch = SimpleNamespace(is_empty=lambda: True)
@@ -216,6 +217,7 @@ def test_held_responses_do_not_change_idle_state():
     scheduler.grammar_manager = SimpleNamespace(grammar_queue=[])
     scheduler.enable_hierarchical_cache = False
     scheduler.enable_lmcache = False
+    scheduler.enable_unified_cache_external_linker = False
     scheduler.enable_hisparse = False
     scheduler.defer_response(_req("held"), Future())
 

@@ -10,20 +10,17 @@ from torch import Tensor
 from transformers.modeling_outputs import BaseModelOutputWithPooling
 from transformers.models.siglip import SiglipVisionModel
 
+import sglang.srt.layers.utils as utils
 import sglang.srt.managers.mm_utils as mm_utils
 import sglang.srt.model_loader.weight_utils as weight_utils
-import sglang.srt.utils as utils
 from sglang.srt.configs.jet_vlm import JetVLMConfig
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import pad_mm_tokens
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalInputs,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.jet_nemotron import JetNemotronForCausalLM
+from sglang.srt.multimodal.modality import Modality
 
 MM_HIDDEN_SIZE = 1152
 
