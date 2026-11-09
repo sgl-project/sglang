@@ -23,7 +23,13 @@ def make_sender(manager_type, room=42, *, sender_type=CommonKVSender):
     manager = object.__new__(manager_type)
     manager.disaggregation_mode = DisaggregationMode.PREFILL
     manager.request_status = {}
-    manager.transfer_infos = {room: {"127.0.0.1:1234": SimpleNamespace(dst_port=1234)}}
+    manager.transfer_infos = {
+        room: {
+            "127.0.0.1:1234": SimpleNamespace(
+                endpoint="127.0.0.1", dst_port=1234, is_dummy=False
+            )
+        }
+    }
     manager.is_dummy_cp_rank = False
     manager.enable_all_cp_ranks_for_transfer = False
     manager.attn_cp_size = 1
@@ -168,6 +174,7 @@ class TestCommonSenderLifecycle(unittest.TestCase):
                 manager.failure_lock = threading.Lock()
                 manager._staging_ctx = None
                 manager._maybe_ack_drained_abort = Mock()
+                manager.send_kv_status_message = Mock()
                 if abort_fails:
                     sender.abort = Mock(side_effect=RuntimeError("transport down"))
                 req = SimpleNamespace(
@@ -188,6 +195,13 @@ class TestCommonSenderLifecycle(unittest.TestCase):
                 self.assertNotIn(42, manager.req_to_decode_prefix_len)
                 self.assertNotIn(42, manager.failure_records)
                 manager._maybe_ack_drained_abort.assert_called_once_with(42)
+                if not abort_fails:
+                    manager.send_kv_status_message.assert_called_once_with(
+                        targets=[("127.0.0.1", 1234)],
+                        bootstrap_room=42,
+                        status=KVPoll.Failed,
+                        failure_reason=ANY,
+                    )
 
 
 if __name__ == "__main__":

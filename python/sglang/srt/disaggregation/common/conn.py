@@ -2629,6 +2629,13 @@ class CommonKVSender(BaseKVSender):
         self._retire_sends()
         self.trace_ctx.abort(abort_info={"reason": "Aborted"})
         self.trace_ctx.trace_req_finish()
+        # Decode otherwise waits for this room until its transfer timeout.
+        self.kv_mgr.send_kv_status_message(
+            targets=self.kv_mgr._room_notify_targets(self.bootstrap_room),
+            bootstrap_room=self.bootstrap_room,
+            status=KVPoll.Failed,
+            failure_reason="Aborted by prefill.",
+        )
 
 
 class CommonKVReceiver(BaseKVReceiver):
