@@ -103,6 +103,8 @@ class QwenVLVisionAttention(nn.Module):
                 # PyTorch's default CUDA SDPA order (cuDNN first on sm90+), i.e.
                 # the kernel the Transformers reference runs per image.
                 extra["allow_cudnn_sdp"] = True
+                # deterministic cuDNN plan (see cudnn_composite_sdpa.py)
+                extra["cudnn_composite_sdp"] = True
             self._attention_impl = backend.get_impl_cls()(
                 num_heads=self.num_heads,
                 head_size=self.head_dim,
