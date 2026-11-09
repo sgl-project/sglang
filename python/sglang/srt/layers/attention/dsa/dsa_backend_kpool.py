@@ -47,8 +47,8 @@ class DeepseekSparseAttnBackendKPoolMixin:
             return
         supported = kpool_tail_backends(
             phase,
-            bf16_kv=not self.dsa_kv_cache_store_fp8,
-            device_sm_major=self.device_sm_major,
+            bf16_kv=self.kv_cache_dtype == torch.bfloat16,
+            device_capability=self.device_capability,
         )
         if dsa_impl in supported:
             return
@@ -67,7 +67,7 @@ class DeepseekSparseAttnBackendKPoolMixin:
             return dsa_impl
         return resolve_kpool_tail_backend(
             dsa_impl,
-            self.device_sm_major,
+            self.device_capability,
             packed_fp8=self.dsa_kv_cache_store_fp8,
         )
 
