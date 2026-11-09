@@ -15,14 +15,18 @@ import numpy as np
 import torch
 
 from sglang.srt.mem_cache.device_pool_info import PageRowBufferInfo
-from sglang.srt.mem_cache.pool_host.base import HostKVCache, host_memory_budget_bytes
+from sglang.srt.mem_cache.pool_host.base import (
+    HostKVCache,
+    host_memory_preflight,
+)
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     get_allocator_from_storage,
 )
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cuda, is_hip
 
 _is_cuda = is_cuda()
+_is_hip = is_hip()
 if _is_cuda:
     from sgl_kernel.kvcacheio import transfer_embedding_ranges_direct
 
@@ -83,16 +87,17 @@ class MiniMaxM3Nvfp4IndexKPoolHost(HostKVCache):
         self.page_num = anchor_host.page_num
         self.size_per_token = self.get_size_per_token()
 
-        requested_bytes = self.page_num * self.layer_num * self.row_bytes
-        available_bytes = host_memory_budget_bytes(requested_bytes)
-        if requested_bytes > available_bytes:
+        allocation_bytes, available_bytes = host_memory_preflight(
+            self.get_mapping_lengths(), self.allocator, self._transfer_device
+        )
+        if allocation_bytes > available_bytes:
             raise ValueError(
                 "Not enough host memory for MiniMax NVFP4 index cache. "
-                f"Requesting {requested_bytes / 1e9:.2f} GB but only have "
+                f"Requesting {allocation_bytes / 1e9:.2f} GB but only have "
                 f"{available_bytes / 1e9:.2f} GB free."
             )
         logger.info(
-            f"Allocating {requested_bytes / 1e9:.2f} GB host memory for MiniMax "
+            f"Allocating {allocation_bytes / 1e9:.2f} GB host memory for MiniMax "
             f"NVFP4 index cache (layout={layout})."
         )
 
@@ -114,6 +119,9 @@ class MiniMaxM3Nvfp4IndexKPoolHost(HostKVCache):
         self.device_slab = buffer_info.slab
         self.device_num_pages = buffer_info.num_pages
         self.device_slots = buffer_info.num_pages * buffer_info.page_size
+        # The slab's device picks the ALLOC_MEMORY_FUNCS dispatch, so it is the
+        # device the host-memory budget and hugetlb credit key on.
+        self._transfer_device = self.device_slab.device
 
     @property
     def page_bytes(self) -> int:
@@ -161,7 +169,7 @@ class MiniMaxM3Nvfp4IndexKPoolHost(HostKVCache):
     def _init_page_row_transfer(self) -> None:
         self._page_row_tables = None
         device = self.device_rows[0].device
-        if not _is_cuda or device.type != "cuda" or not self.pin_memory:
+        if not (_is_cuda or _is_hip) or device.type != "cuda" or not self.pin_memory:
             return
         from sglang.kernels.ops.kvcache.nvfp4_hicache import warmup_page_row_transfer
 
@@ -200,7 +208,7 @@ class MiniMaxM3Nvfp4IndexKPoolHost(HostKVCache):
 
     def _page_indices(self, host_indices, device_indices):
         if (
-            _is_cuda
+            (_is_cuda or _is_hip)
             and self.page_size == 128
             and host_indices.is_cuda
             and host_indices.device == device_indices.device

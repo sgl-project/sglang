@@ -7,15 +7,20 @@ from typing import TYPE_CHECKING, Callable, Optional
 import torch
 
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
-from sglang.srt.kernel_plugins.nvidia.binding import megakernel_graph_variants
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     deployment_attn_dp_size,
+    require_attn_tp_gather,
+    require_gathered_buffer,
+    require_mlp_sync,
+    require_mlp_tp_gather,
     set_dp_buffer_len,
     set_is_extend_in_batch,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.managers.overlap_utils import spec_relay_bypass_enabled
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
@@ -45,12 +50,6 @@ from sglang.srt.speculative.draft_checkpoint import refresh_track_indices, track
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
 from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
-from sglang.srt.utils import (
-    require_attn_tp_gather,
-    require_gathered_buffer,
-    require_mlp_sync,
-    require_mlp_tp_gather,
-)
 from sglang.srt.utils.device_timer import device_timer_ctx
 
 if TYPE_CHECKING:
@@ -98,6 +97,13 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
     replay, can_run_graph for EAGLE-specific draft-extend semantics.
     """
 
+    # Set in __init__; the defaults keep a runner built without it on the stock path.
+    keep_hidden_in_place: bool = False
+    in_graph_metadata_prep_done: Optional[torch.cuda.Event] = None
+    _runtime_optimization: bool = False
+    kv_reuse_guard = None
+    _pd_reuse_needs_full_replay: bool = False
+
     def __init__(
         self,
         eagle_worker: EagleDraftWorker,
@@ -108,6 +114,9 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         # Parse args
         self.eagle_worker = eagle_worker
         self.model_runner = model_runner = eagle_worker.draft_runner
+        # An unchanged top-k-1 batch reads these rows before this runner's next
+        # replay, so the generic relay lease need not copy them out.
+        self.keep_hidden_in_place = spec_relay_bypass_enabled()
         self.forward_mode = ForwardMode.DRAFT_EXTEND_V2
 
         # Fields the parent's capture() reads:
@@ -293,18 +302,41 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         # shape [max_bs]. Sharing by field name and shape would alias those
         # width-specific indices and can make a narrower graph gather OOB.
         self.buffers.share_buffers(exclude={"select_index"})
-        # the batch sizes whose graphs run the draft megakernel's draft_extend,
-        # captured once per label of the graph variants it offers this runner
-        self.megakernel = self.eagle_worker.megakernel
-        self.megakernel_served = (
-            frozenset()
-            if self.megakernel is None
-            else self.megakernel.bind_extend_graphs(self)
+        # Resolve the always-present graph dispatch before capture. Specialized
+        # batch sizes are used only to select compatible graph variants.
+        self.draft_runtime = self.eagle_worker.draft_runtime
+        self.specialized_batches = self.draft_runtime.bind_extend_graphs(self)
+        self.attention_graph_variants = self.draft_runtime.graph_variants(
+            model_runner.model,
+            "draft_extend",
+            batch_sizes=self.specialized_batches,
         )
-        self.attention_graph_variants = megakernel_graph_variants(
-            model_runner.model, "draft_extend", batch_sizes=self.megakernel_served
+        self.attention_variant_sizes = self.specialized_batches
+
+        self.in_graph_metadata_prep_done: Optional[torch.cuda.Event] = None
+        self._runtime_optimization = (
+            envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
+            and envs.SGLANG_ENABLE_NV_MEGA_PDDEC_RUNTIME_OPTIMIZATION.get()
         )
-        self.attention_variant_sizes = self.megakernel_served
+        allocator = (
+            self.model_runner.token_to_kv_pool_allocator
+            if self._runtime_optimization
+            else None
+        )
+        # A PD transfer can overwrite a freed page before the replay's KV
+        # writes finish. Only expose an early read fence with guarded reuse.
+        self.kv_reuse_guard = (
+            allocator
+            if self._runtime_optimization
+            and allocator.need_sort
+            and allocator.supports_reuse_guard
+            else None
+        )
+        self._pd_reuse_needs_full_replay = (
+            self._runtime_optimization
+            and allocator.need_sort
+            and self.kv_reuse_guard is None
+        )
 
         try:
             with model_capture_mode():
@@ -317,6 +349,27 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
     def _replay_graph(self, shape_key, forward_batch):
         with self.model_context():
             return self.backend.replay(shape_key, forward_batch)
+
+    def _draft_extend_shared_read_ends(self) -> SharedReadEnds:
+        shared_read_ends = self._resolve_shared_read_ends(
+            self.draft_extend_attn_backend, self.forward_mode
+        )
+        if self._pd_reuse_needs_full_replay and shared_read_ends in (
+            SharedReadEnds.PRE_REPLAY,
+            SharedReadEnds.IN_REPLAY,
+        ):
+            return SharedReadEnds.POST_REPLAY
+        return shared_read_ends
+
+    def _kv_writes_done_event(self, shared_read_ends: SharedReadEnds):
+        if shared_read_ends not in (
+            SharedReadEnds.PRE_REPLAY,
+            SharedReadEnds.IN_REPLAY,
+        ):
+            return None
+        event = self.device_module.Event()
+        event.record()
+        return event
 
     def _cache_loc_dtype(self):
         return self.backend.cache_loc_dtype
@@ -469,25 +522,8 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             spec_info.dsa_seed_topk_capture = self.buffers.dsa_seed_topk_capture[
                 :num_tokens
             ]
-        served = bs in self.megakernel_served
 
-        def run_once():
-            self.draft_extend_attn_backend.init_forward_metadata_in_graph(forward_batch)
-
-            # Clean intermediate result cache for DP attention
-            forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
-            set_dp_buffer_len(
-                global_dp_buffer_len,
-                num_tokens,
-                forward_batch.dp_padding_mode.is_max_len(),
-                global_num_tokens_cpu,
-            )
-            set_is_extend_in_batch(False)
-            if served:
-                return self.megakernel.run_draft_extend(
-                    runner=self, forward_batch=forward_batch
-                )
-
+        def run_stock():
             output_cache_loc_backup = forward_batch.out_cache_loc
             hidden_states_backup = forward_batch.spec_info.hidden_states
 
@@ -500,6 +536,31 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             forward_batch.out_cache_loc = output_cache_loc_backup
             forward_batch.spec_info.hidden_states = hidden_states_backup
             return ret
+
+        def run_once():
+            self.draft_extend_attn_backend.init_forward_metadata_in_graph(forward_batch)
+            if (
+                self._runtime_optimization
+                and self.draft_extend_attn_backend.shared_read_ends(self.forward_mode)
+                is SharedReadEnds.IN_REPLAY
+                and not self._pd_reuse_needs_full_replay
+            ):
+                self._record_in_graph_metadata_prep_done()
+
+            # Clean intermediate result cache for DP attention
+            forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
+            set_dp_buffer_len(
+                global_dp_buffer_len,
+                num_tokens,
+                forward_batch.dp_padding_mode.is_max_len(),
+                global_num_tokens_cpu,
+            )
+            set_is_extend_in_batch(False)
+            return self.draft_runtime.run_draft_extend(
+                runner=self,
+                forward_batch=forward_batch,
+                stock=run_stock,
+            )
 
         with forward_context(
             ForwardContext(attn_backend=self.draft_extend_attn_backend),
@@ -687,9 +748,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         # Draft extend is the last shared reader. UNKNOWN must discard any
         # earlier phase's event so the scheduler uses its whole-forward fence.
         self.model_runner.shared_read_done_event = None
-        shared_read_ends = self.draft_extend_attn_backend.shared_read_ends(
-            self.forward_mode
-        )
+        shared_read_ends = self._draft_extend_shared_read_ends()
         if shared_read_ends is SharedReadEnds.PRE_REPLAY:
             self._publish_read_done(in_graph=False)
 
@@ -701,10 +760,16 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         with device_timer_ctx(self.model_runner.device_timer, "eagle_draft_extend"):
             out = self._replay_graph(shape_key, forward_batch)
 
-        # This runner has no in-graph read-done marker. A later event is safe;
-        # an event before replay cannot cover metadata reads inside the graph.
+        # The backend declaration covers every child, including hybrid linear
+        # attention. UNKNOWN keeps the scheduler's whole-forward fallback.
         if shared_read_ends in (SharedReadEnds.IN_REPLAY, SharedReadEnds.POST_REPLAY):
-            self._publish_read_done(in_graph=False)
+            self._publish_read_done(
+                in_graph=shared_read_ends is SharedReadEnds.IN_REPLAY
+            )
+        if self.kv_reuse_guard is not None:
+            self.kv_reuse_guard.set_reuse_guard_event(
+                self._kv_writes_done_event(shared_read_ends)
+            )
 
         out = LogitsProcessorOutput(
             # None when the megakernel's draft_extend kept the logits
@@ -713,8 +778,12 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                 if out.next_token_logits is None
                 else out.next_token_logits[:raw_bs]
             ),
-            # CUDA graph replay reuses its captured output storage. These states
-            # survive into the next draft step, so detach them from that buffer.
-            hidden_states=out.hidden_states[:raw_bs].clone(),
+            # The unchanged megakernel batch consumes the graph-owned rows before
+            # replay; every other path detaches the recurrent state from that buffer.
+            hidden_states=(
+                out.hidden_states[:raw_bs]
+                if self.keep_hidden_in_place
+                else out.hidden_states[:raw_bs].clone()
+            ),
         )
         return out
