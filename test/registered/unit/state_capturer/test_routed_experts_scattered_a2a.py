@@ -90,6 +90,7 @@ class TestCaptureRoutedIdsOnly(CustomTestCase):
         )
         cap.device_topk_size = self.TOPK_SIZE + 1
         cap.local_cache = None
+        cap._gathers_per_layer = False
         cap.gather_buffer = torch.empty((8, self.TOPK_SIZE + 1), dtype=torch.int32)
         return cap
 
@@ -224,13 +225,15 @@ class TestCapturerWidthFollowsTheInstalledCount(CustomTestCase):
         def record(self, model_config, **kwargs):
             seen.update(kwargs)
 
-        features = SimpleNamespace(
-            enable_return_routed_experts=True, enable_decoder_swa_bounded_replay=False
+        execution = SimpleNamespace(
+            features=SimpleNamespace(
+                enable_return_routed_experts=True,
+                enable_decoder_swa_bounded_replay=False,
+            ),
+            overlap=SimpleNamespace(enable_two_batch_overlap=False),
         )
         with (
-            mock.patch.object(
-                re_mod, "get_exec", return_value=SimpleNamespace(features=features)
-            ),
+            mock.patch.object(re_mod, "get_exec", return_value=execution),
             mock.patch.object(re_mod.RoutedExpertsCapturer, "__init__", record),
         ):
             re_mod.RoutedExpertsCapturer.create(
@@ -519,35 +522,95 @@ class TestLastLayerGather(CustomTestCase):
                 cap.capture(layer_id=0, topk_indices=local_topk[:, 0])
                 cap.capture(layer_id=1, topk_indices=local_topk[:2, 1])
 
-    def test_bounded_replay_keeps_per_layer_gathers(self):
-        """Bounded replay runs late layers on fewer rows than early ones."""
-        seen = {}
-        features = SimpleNamespace(
-            enable_return_routed_experts=True, enable_decoder_swa_bounded_replay=True
-        )
+    def test_bounded_replay_and_two_batch_overlap_keep_per_layer_gathers(self):
+        """Bounded replay runs late layers on fewer rows than early ones, and
+        two-batch overlap captures two sub-batches' layers interleaved."""
+        for bounded_replay, two_batch_overlap, expected in (
+            (False, False, []),
+            (True, False, None),
+            (False, True, None),
+        ):
+            seen = {}
+            execution = SimpleNamespace(
+                features=SimpleNamespace(
+                    enable_return_routed_experts=True,
+                    enable_decoder_swa_bounded_replay=bounded_replay,
+                ),
+                overlap=SimpleNamespace(enable_two_batch_overlap=two_batch_overlap),
+            )
+            with (
+                self.subTest(
+                    bounded_replay=bounded_replay, two_batch_overlap=two_batch_overlap
+                ),
+                mock.patch.object(re_mod, "get_exec", return_value=execution),
+                mock.patch.object(
+                    re_mod.RoutedExpertsCapturer,
+                    "__init__",
+                    lambda self, model_config, **kwargs: seen.update(kwargs),
+                ),
+            ):
+                re_mod.RoutedExpertsCapturer.create(
+                    model=SimpleNamespace(
+                        shared_experts_config=SharedExpertsConfig(
+                            num_fused_shared_experts=0
+                        ),
+                        modules=lambda: iter(()),
+                    ),
+                    model_config=SimpleNamespace(),
+                    num_tokens=8,
+                    max_running_requests=2,
+                    device="cpu",
+                )
+                self.assertEqual(seen["routed_layer_ids"], expected)
+
+    def test_two_batch_overlap_children_interleave_on_per_layer_gathers(self):
+        """TBO alternates two children with unequal shares; each child's
+        gathered rows land at its parent rows."""
+        parallel = self._parallel(0)
+        cap = self._capturer(parallel, routed_layer_ids=None)
+        # Children of 3 and 5 tokens, padded to 4 and 6: 2 and 3 rows per rank.
+        children = [((0, 3), 4), ((3, 8), 6)]
+        gathered = {
+            (child, layer_id): torch.randint(0, 64, (padded, self.K), dtype=torch.int32)
+            for child, (_, padded) in enumerate(children)
+            for layer_id in range(self.NUM_LAYERS)
+        }
+        order = [
+            (child, layer_id)
+            for layer_id in range(self.NUM_LAYERS)
+            for child in range(len(children))
+        ]
+        pending = iter(order)
         with (
+            get_parallel().override(**parallel),
             mock.patch.object(
-                re_mod, "get_exec", return_value=SimpleNamespace(features=features)
+                re_mod, "get_moe_a2a_backend", return_value=MoeA2ABackend("deepep")
             ),
             mock.patch.object(
-                re_mod.RoutedExpertsCapturer,
-                "__init__",
-                lambda self, model_config, **kwargs: seen.update(kwargs),
+                re_mod,
+                "attn_tp_all_gather_into_tensor",
+                side_effect=lambda output, input_: output.copy_(
+                    gathered[next(pending)]
+                ),
             ),
         ):
-            re_mod.RoutedExpertsCapturer.create(
-                model=SimpleNamespace(
-                    shared_experts_config=SharedExpertsConfig(
-                        num_fused_shared_experts=0
-                    ),
-                    modules=lambda: iter(()),
-                ),
-                model_config=SimpleNamespace(),
-                num_tokens=8,
-                max_running_requests=2,
-                device="cpu",
+            for child, layer_id in order:
+                token_range, padded = children[child]
+                with forward_context(
+                    ForwardContext(
+                        attn_backend=None, tbo_parent_token_range=token_range
+                    )
+                ):
+                    cap.capture(
+                        layer_id=layer_id,
+                        topk_indices=gathered[child, layer_id][: padded // 2],
+                    )
+
+        for layer_id in range(self.NUM_LAYERS):
+            expected = torch.cat([gathered[0, layer_id][:3], gathered[1, layer_id][:5]])
+            self.assertTrue(
+                torch.equal(cap.device_cache.buffer[:8, layer_id], expected)
             )
-        self.assertIsNone(seen["routed_layer_ids"])
 
     def test_unknown_last_layer_gathers_per_layer(self):
         parallel = self._parallel(1)

@@ -68,7 +68,8 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
         max_running_requests: int,
         device: str,
     ) -> Optional["RoutedExpertsCapturer"]:
-        features = get_exec().features
+        execution = get_exec()
+        features = execution.features
         if not features.enable_return_routed_experts:
             return None
         # The loader attaches this to every entry model, including wrappers.
@@ -80,10 +81,12 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
             max_running_requests=max_running_requests,
             num_fused_shared_experts=num_fused_shared_experts,
             device=device,
-            # Bounded replay runs late layers on fewer rows; keep per-layer gathers.
+            # Bounded replay runs late layers on fewer rows, and two-batch
+            # overlap interleaves two sub-batches' layers; keep per-layer gathers.
             routed_layer_ids=(
                 None
                 if features.enable_decoder_swa_bounded_replay
+                or execution.overlap.enable_two_batch_overlap
                 else _routed_layer_ids(model)
             ),
         )
