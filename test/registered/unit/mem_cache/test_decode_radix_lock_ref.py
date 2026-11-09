@@ -43,6 +43,10 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
     DecodePrefixMatch,
 )
 from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
+from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
+    ListKind,
+)
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     InsertParams,
@@ -53,6 +57,7 @@ from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.test.scheduler_test_utils import decode_queue
 from sglang.test.separate_buffer_allocator_double import (
     bind_separate_buffer_capacity,
 )
@@ -412,7 +417,6 @@ class TestDecodeLockRefScenarios(CustomTestCase):
             DecLockRefParams(component_lock_uuids={ComponentType.SWA: 123}),
         )
         req.lock = lock
-        req.pd_rebootstrap_in_progress = False
         req.sampling_params.max_new_tokens = 16
 
         decode_req = MagicMock()
@@ -423,17 +427,19 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         # `not decode_req.is_rebootstrap` gate in pop_preallocated).
         decode_req.is_rebootstrap = False
 
-        queue.queue = [decode_req]
+        queue.queue = decode_queue(ListKind.PD_PREALLOC, [decode_req])
         queue.pending_reqs = []
         queue.retracted_queue = []
         queue.num_reserved_decode_tokens = 0
         queue._resolve_pending_reqs = MagicMock()
         queue._update_handshake_waiters = MagicMock()
         queue._uses_swa_tail_prealloc = MagicMock(return_value=True)
-        queue._swa_tail_len = MagicMock(return_value=8)
-        queue._prealloc_required_tokens = MagicMock(return_value=(8, 8))
-        queue._swa_aware_allocatable_token_budgets = MagicMock(return_value=(8, 8))
-        queue._swa_tail_allocatable_token_budget = MagicMock(return_value=8)
+        queue._window_tails = MagicMock(return_value={"swa": 8})
+        queue._prealloc_required = MagicMock(return_value=(8, {"swa": 8}))
+        queue._window_aware_allocatable_token_budgets = MagicMock(
+            return_value=(8, {"swa": 8})
+        )
+        queue._window_allocatable_token_budgets = MagicMock(return_value={"swa": 8})
         queue._match_prefix_and_lock = MagicMock(
             return_value=DecodePrefixMatch(
                 prefix_indices=torch.arange(4, dtype=torch.int64),
@@ -458,6 +464,11 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         queue.req_to_metadata_buffer_idx_allocator.available_size.return_value = 1
         queue.token_to_kv_pool = MagicMock()
         queue.token_to_kv_pool_allocator = MagicMock()
+        queue.token_to_kv_pool_allocator.sub_pool_roles.return_value = (
+            "full",
+            (),
+            None,
+        )
         bind_separate_buffer_capacity(queue.token_to_kv_pool_allocator)
         queue.token_to_kv_pool_allocator.page_size = 4
 
@@ -499,7 +510,8 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         ]
         self.assertEqual(lock_calls, ["release_swa", "unlock"])
         self.assertIsNone(req.lock)
-        queue._swa_tail_len.assert_called_with(8)
+        # Each window's tail is sized from the post-lock fill length.
+        queue._window_tails.assert_called_with(8)
         queue._allocatable_token_budgets.assert_called_once()
 
     def test_hicache_restore_commit_hands_over_lock(self):
@@ -569,10 +581,12 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         req.kv.req_pool_idx = 0
         req.kv.kv_committed_len = 4
         req_to_token[0, :5] = torch.tensor([50, 51, 52, 53, 54], dtype=torch.int64)
+        waiting_queue = IndexedReqList(ListKind.WAITING)
+        waiting_queue.join([req])
 
         scheduler = SimpleNamespace(
             grammar_manager=SimpleNamespace(has_waiting_grammars=lambda: False),
-            waiting_queue=[req],
+            waiting_queue=waiting_queue,
             enable_priority_scheduling=False,
             req_to_token_pool=SimpleNamespace(size=4),
             max_running_requests=4,

@@ -36,7 +36,7 @@ from sglang.srt.layers.attention.flashattention_backend import (
 )
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
 from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -57,6 +57,7 @@ def _runner_ids(req_to_token, page_size, n_pages):
     v2p = torch.randperm(n_pages, generator=g).to(torch.int64)
     v2p[0] = 0  # page 0 is the reserved sink
     t = RunnerIds.__new__(RunnerIds)
+    t._role_sub_pools = {}
     t.req_to_token = req_to_token
     t.page_size = page_size
     t.device = _DEV
@@ -112,6 +113,7 @@ def _verify_plan(runner_ids, req_to_token, live, host_lens=None):
     return runner_ids.own_plan(
         SimpleNamespace(
             forward_mode=ForwardMode.TARGET_VERIFY,
+            ragged_verify_layout=None,
             spec_info=SimpleNamespace(draft_token_num=_NUM_DRAFT),
             batch_size=bs,
             req_pool_indices=rows,
@@ -182,8 +184,9 @@ class TestFa3VerifyReadsTheDraftTail(CustomTestCase):
                 live.to(_DEV),
                 None,
                 ForwardMode.TARGET_VERIFY,
-                SimpleNamespace(ragged_verify_layout=None),
+                SimpleNamespace(),
                 live,
+                ragged_verify_layout=None,
             )
             self.assertTrue(
                 torch.equal(
@@ -201,14 +204,15 @@ class TestFa3VerifyReadsTheDraftTail(CustomTestCase):
             b = _backend(runner_ids, req_to_token, page_size)
             bs = live.numel()
             for host_lens, spec_info in (
-                (live, SimpleNamespace(ragged_verify_layout=None)),
+                (live, SimpleNamespace()),
                 (
                     live + _NUM_DRAFT,
-                    SimpleNamespace(ragged_verify_layout=None, live_seq_lens_cpu=live),
+                    SimpleNamespace(live_seq_lens_cpu=live),
                 ),
             ):
                 fb = SimpleNamespace(
                     forward_mode=ForwardMode.TARGET_VERIFY,
+                    ragged_verify_layout=None,
                     batch_size=bs,
                     seq_lens=live.to(_DEV),
                     seq_lens_cpu=host_lens,

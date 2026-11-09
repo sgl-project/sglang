@@ -58,8 +58,6 @@ import torch
 import torch.nn as nn
 from transformers.activations import ACT2FN
 
-from sglang.multimodal_gen.runtime.cache.conditioning import cached_conditioning
-
 logger = logging.getLogger(__name__)
 
 from transformers.modeling_outputs import BaseModelOutputWithPast
@@ -877,7 +875,7 @@ class Qwen3VLModel(QwenVLModelBase):
         # Same implementation as for images
         return self.get_image_features(pixel_values_videos, video_grid_thw)
 
-    @cached_conditioning
+    # not cached across requests: hashing pixel_values to look them up costs more than the vision tower
     def _get_flat_visual_features(
         self,
         pixel_values: torch.FloatTensor,
