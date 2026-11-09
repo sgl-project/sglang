@@ -119,7 +119,6 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND: str | None = None
     SGLANG_DIFFUSION_ENABLE_W8A8_FP8_GEMM: bool = False
     SGLANG_ENABLE_FUSED_QKNORM_ROPE: bool = True
-    MINIMAX_H3_VAE_DECODER_FUSED_NORM: bool = True
     MINIMAX_H3_VAE_DECODER_VIT_FP32_NORM: bool = True
     MINIMAX_H3_VAE_DECODER_STREAM_TEMPORAL_CAT: bool = True
     SGLANG_DIFFUSION_MXFP8_FA_HEAD_CHUNK_SIZE: int = 4
@@ -487,12 +486,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_ENABLE_FUSED_QKNORM_ROPE": lambda: (
         os.getenv("SGLANG_ENABLE_FUSED_QKNORM_ROPE", "1").lower()
         not in {"0", "false", "off", "no"}
-    ),
-    # MiniMax-H3 VAE decoder: fused RMSNorm / QK RMSNorm+RoPE kernels in the
-    # ViT blocks (NVIDIA only). Only 1/true/yes/on keep it enabled.
-    "MINIMAX_H3_VAE_DECODER_FUSED_NORM": lambda: (
-        os.getenv("MINIMAX_H3_VAE_DECODER_FUSED_NORM", "1").strip().lower()
-        in ("1", "true", "yes", "on")
     ),
     # MiniMax-H3 VAE decoder: run the ViT norms in FP32 (the released recipe).
     # Only 1/true/yes/on keep it enabled.

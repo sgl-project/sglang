@@ -12,7 +12,8 @@ import torch
 
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
-from sglang.srt.mem_cache.kv.router import STATE_PART, KVLayerRouter
+from sglang.srt.mem_cache.kv.decl import STATE_PART
+from sglang.srt.mem_cache.kv.router import KVLayerRouter
 from sglang.srt.mem_cache.kv_cache_configurator import runner_state
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, MHATokenToKVPool
 from sglang.test.test_utils import CustomTestCase
