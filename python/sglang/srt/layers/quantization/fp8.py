@@ -140,6 +140,12 @@ _is_gfx95_supported = is_gfx95_supported()
 
 if _is_hip:
     from sglang.srt.layers.quantization import fp8_hip
+if _is_xpu:
+    from sglang.srt.hardware_backend.xpu.quantization.fp8_w8a16 import (
+        apply_xpu_fp8_w8a16_linear,
+        prepare_xpu_fp8_w8a16_layer,
+        xpu_fp8_w8a16_enabled,
+    )
 # gfx942 (MI300) has no MX matmul HW; MXFP8 checkpoints are converted to
 # block-fp8 [128,128] at load and run through the native block-fp8 kernels.
 # SGLANG_FORCE_MXFP8_BLOCK_CONVERT=1 opts into that same block-fp8 path on
@@ -408,14 +414,6 @@ class Fp8Config(QuantizationConfig):
                 )
 
                 return NPUMXFP8LinearMethod(self)
-            if _is_xpu:
-                from sglang.srt.hardware_backend.xpu.quantization.fp8_w8a16 import (
-                    XPUFp8W8A16LinearMethod,
-                    use_xpu_fp8_w8a16,
-                )
-
-                if use_xpu_fp8_w8a16(self):
-                    return XPUFp8W8A16LinearMethod(self)
             return Fp8LinearMethod(self)
         elif isinstance(layer, FusedMoE):
             if is_layer_skipped(
@@ -540,6 +538,10 @@ class Fp8LinearMethod(LinearMethodBase):
             force_marlin = get_bool_env_var("SGLANG_FORCE_FP8_MARLIN")
             auto_enable = can_auto_enable_marlin_fp8()
             self.use_marlin = force_marlin or auto_enable
+
+        # On XPU devices without an FP8 matrix engine, sgl-kernel-xpu runs the
+        # dense GEMM weight-only (W8A16), the XPU counterpart of Marlin.
+        self.use_xpu_w8a16 = _is_xpu and xpu_fp8_w8a16_enabled(self.quant_config)
 
         self.use_mxfp8 = getattr(self.quant_config, "use_mxfp8", False)
         self.block_quant = (
@@ -1382,6 +1384,9 @@ class Fp8LinearMethod(LinearMethodBase):
                 _amx_process_weight_after_loading(layer, ["weight"])
                 return
 
+        if self.use_xpu_w8a16:
+            prepare_xpu_fp8_w8a16_layer(layer, self.block_quant)
+
         if self.use_marlin:
             if self.block_quant:
                 layer.weight_block_size = self.quant_config.weight_block_size
@@ -1405,6 +1410,9 @@ class Fp8LinearMethod(LinearMethodBase):
                 size_k=layer.input_size_per_partition,
                 bias=bias,
             )
+
+        if self.use_xpu_w8a16 and layer.xpu_fp8_w8a16:
+            return apply_xpu_fp8_w8a16_linear(layer, x, bias, self.block_quant)
 
         if _is_hip and self.block_fp8_as_mxfp8 and self.mxfp8_dense_backend.is_gfx95():
             return fp8_hip.apply_dense(self, layer, x, bias)

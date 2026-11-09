@@ -1,5 +1,5 @@
-"""Weight-only FP8 (W8A16) dense linear on XPU (``XPUFp8W8A16LinearMethod`` ->
-``sgl_kernel.fp8_linear``): online quantization and pre-quantized 128x128 block-FP8
+"""Weight-only FP8 (W8A16) execution of FP8 dense layers on XPU: ``Fp8LinearMethod`` runs
+``sgl_kernel.fp8_linear`` for online quantization and pre-quantized 128x128 block-FP8
 checkpoints."""
 
 import unittest
@@ -53,13 +53,17 @@ def _make_block_checkpoint_layer(weight: torch.Tensor, logical_widths=None):
     return layer, (qweight.float() * expand[:, :k]).to(torch.bfloat16)
 
 
-def _online_method():
-    from sglang.srt.hardware_backend.xpu.quantization.fp8_w8a16 import (
-        XPUFp8W8A16LinearMethod,
-    )
-    from sglang.srt.layers.quantization.fp8 import Fp8Config
+def _method(config=None):
+    from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
 
-    return XPUFp8W8A16LinearMethod(Fp8Config())
+    return Fp8LinearMethod(config or Fp8Config())
+
+
+def _w8a8_method(config=None):
+    """Fp8LinearMethod with the W8A16 backend off: the existing W8A8 path."""
+    method = _method(config)
+    method.use_xpu_w8a16 = False
+    return method
 
 
 def _rel_err(out: torch.Tensor, ref: torch.Tensor) -> float:
@@ -68,13 +72,13 @@ def _rel_err(out: torch.Tensor, ref: torch.Tensor) -> float:
 
 @unittest.skipUnless(is_xpu(), "requires XPU")
 class TestXPUFp8W8A16Dispatch(CustomTestCase):
-    """Which method Fp8Config picks; sgl-kernel-xpu's answer is mocked, so every
-    case runs on any XPU runner."""
+    """Which execution backend Fp8LinearMethod picks; sgl-kernel-xpu's answer is
+    mocked, so every case runs on any XPU runner."""
 
-    def _methods(self, device_supported: bool):
+    def _backends(self, device_supported: bool):
         import sgl_kernel
 
-        from sglang.srt.layers.quantization.fp8 import Fp8Config
+        from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
 
         layer = _make_layer(torch.empty(64, 64, dtype=torch.bfloat16))
         configs = {
@@ -83,41 +87,33 @@ class TestXPUFp8W8A16Dispatch(CustomTestCase):
             "per_tensor_checkpoint": Fp8Config(is_checkpoint_fp8_serialized=True),
             "mxfp8": Fp8Config(use_mxfp8=True),
         }
+        backends = {}
         with mock.patch.object(
             sgl_kernel,
             "fp8_linear_supported",
             create=True,
             return_value=device_supported,
         ):
-            return {
-                name: config.get_quant_method(layer, prefix="")
-                for name, config in configs.items()
-            }
+            for name, config in configs.items():
+                method = config.get_quant_method(layer, prefix="")
+                # W8A16 is an execution backend of Fp8LinearMethod, not a new method.
+                self.assertIs(type(method), Fp8LinearMethod, name)
+                backends[name] = method.use_xpu_w8a16
+        return backends
 
     def test_supported_device(self):
-        from sglang.srt.hardware_backend.xpu.quantization.fp8_w8a16 import (
-            XPUFp8W8A16LinearMethod,
-        )
+        backends = self._backends(device_supported=True)
+        self.assertTrue(backends["online"])
+        self.assertTrue(backends["block"])
+        self.assertFalse(backends["per_tensor_checkpoint"])
+        self.assertFalse(backends["mxfp8"])
 
-        methods = self._methods(device_supported=True)
-        self.assertIsInstance(methods["online"], XPUFp8W8A16LinearMethod)
-        self.assertIsInstance(methods["block"], XPUFp8W8A16LinearMethod)
-        self.assertNotIsInstance(
-            methods["per_tensor_checkpoint"], XPUFp8W8A16LinearMethod
-        )
-        self.assertNotIsInstance(methods["mxfp8"], XPUFp8W8A16LinearMethod)
-
-    def test_other_devices_keep_fp8_linear_method(self):
-        # Devices the kernel does not take (CRI included) get Fp8LinearMethod
-        # itself, exactly as without this change.
-        from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
-
-        for name, method in self._methods(device_supported=False).items():
-            if name != "mxfp8":
-                self.assertIs(type(method), Fp8LinearMethod, name)
+    def test_other_devices_keep_w8a8(self):
+        # Devices the kernel does not take (CRI included) keep the W8A8 path.
+        self.assertFalse(any(self._backends(device_supported=False).values()))
 
     def test_kernel_without_fp8_linear(self):
-        # An sgl-kernel-xpu release without fp8_linear keeps Fp8LinearMethod.
+        # An sgl-kernel-xpu release without fp8_linear keeps the W8A8 path.
         import builtins
 
         from sglang.srt.hardware_backend.xpu.quantization import fp8_w8a16
@@ -154,11 +150,11 @@ class TestXPUFp8W8A16Linear(CustomTestCase):
         weight = torch.randn(n, k, dtype=torch.bfloat16, device=DEV) * 0.02
         bias = torch.randn(n, dtype=torch.bfloat16, device=DEV)
         layer = _make_layer(weight.clone())
-        method = _online_method()
+        method = _method()
         method.process_weights_after_loading(layer)
 
         # Fp8LinearMethod's online weight preparation: per-channel scales.
-        self.assertTrue(layer.use_fp8_w8a16)
+        self.assertTrue(layer.xpu_fp8_w8a16)
         self.assertEqual(layer.weight.dtype, torch.float8_e4m3fn)
         self.assertEqual(tuple(layer.weight.t().shape), (n, k))
         self.assertEqual(layer.weight_scale.numel(), n)
@@ -176,7 +172,7 @@ class TestXPUFp8W8A16Linear(CustomTestCase):
     def test_3d_input(self):
         weight = torch.randn(256, 256, dtype=torch.bfloat16, device=DEV) * 0.02
         layer = _make_layer(weight.clone())
-        method = _online_method()
+        method = _method()
         method.process_weights_after_loading(layer)
 
         x = torch.randn(2, 5, 256, dtype=torch.bfloat16, device=DEV)
@@ -185,24 +181,19 @@ class TestXPUFp8W8A16Linear(CustomTestCase):
         self.assertLess(_rel_err(out, F.linear(x, weight)), 0.05)
 
     def test_unsupported_layer_keeps_existing_path(self):
-        from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
-
         # Linear-attention gate projections (N = 32) do not fit the kernel.
         weight = torch.randn(32, 2048, dtype=torch.bfloat16, device=DEV) * 0.02
         layer = _make_layer(weight.clone())
-        method = _online_method()
+        method = _method()
         method.process_weights_after_loading(layer)
-        self.assertFalse(layer.use_fp8_w8a16)
+        self.assertFalse(layer.xpu_fp8_w8a16)
 
         x = torch.randn(4, 2048, dtype=torch.bfloat16, device=DEV)
         # Same weight preparation and GEMM as Fp8LinearMethod.
-        reference = Fp8LinearMethod(method.quant_config).apply(layer, x)
+        reference = _w8a8_method().apply(layer, x)
         torch.testing.assert_close(method.apply(layer, x), reference)
 
     def test_block_checkpoint_uses_stored_weights(self):
-        from sglang.srt.hardware_backend.xpu.quantization.fp8_w8a16 import (
-            XPUFp8W8A16LinearMethod,
-        )
 
         torch.manual_seed(0)
         n, k = 576, 2048
@@ -210,10 +201,10 @@ class TestXPUFp8W8A16Linear(CustomTestCase):
             torch.randn(n, k, dtype=torch.bfloat16, device=DEV) * 0.02
         )
         stored = layer.weight.data.clone()
-        method = XPUFp8W8A16LinearMethod(_block_config())
+        method = _method(_block_config())
         method.process_weights_after_loading(layer)
 
-        self.assertTrue(layer.use_fp8_w8a16)
+        self.assertTrue(layer.xpu_fp8_w8a16)
         # No requantization: the checkpoint's FP8 weight and block scales are used.
         self.assertTrue(
             torch.equal(layer.weight.data.view(torch.uint8), stored.view(torch.uint8))
@@ -226,11 +217,6 @@ class TestXPUFp8W8A16Linear(CustomTestCase):
             self.assertLess(_rel_err(out, F.linear(x, dequant, bias)), 0.02)
 
     def test_block_checkpoint_misaligned_partitions_keep_existing_path(self):
-        from sglang.srt.hardware_backend.xpu.quantization.fp8_w8a16 import (
-            XPUFp8W8A16LinearMethod,
-        )
-        from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
-
         # A fused layer whose first partition (96 rows) does not end on a block
         # boundary: its block scales do not tile the fused weight.
         weight = torch.randn(256, 1024, dtype=torch.bfloat16, device=DEV) * 0.02
@@ -238,12 +224,12 @@ class TestXPUFp8W8A16Linear(CustomTestCase):
         reference_layer, _ = _make_block_checkpoint_layer(
             weight, logical_widths=[96, 160]
         )
-        method = XPUFp8W8A16LinearMethod(_block_config())
+        method = _method(_block_config())
         method.process_weights_after_loading(layer)
-        self.assertFalse(layer.use_fp8_w8a16)
+        self.assertFalse(layer.xpu_fp8_w8a16)
 
-        # Same weights and scale layout as Fp8LinearMethod.
-        reference = Fp8LinearMethod(_block_config())
+        # Same weights, scale layout and output as the W8A8 path.
+        reference = _w8a8_method(_block_config())
         reference.process_weights_after_loading(reference_layer)
         self.assertEqual(
             layer.weight_scale_inv.stride(), reference_layer.weight_scale_inv.stride()
