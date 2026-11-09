@@ -325,3 +325,21 @@ Runtime changes should also be validated in a matching official SGLang image
 with both `OFFLINE` and `BLOCKING` modes. Predictor changes should report
 step-level error, and scheduler or cache changes should compare request latency,
 throughput, and prefix-cache reuse against measured traces.
+
+### Optional SimOpus model-forward provider
+
+Select `predictor.name: "simopus"` to estimate ordinary DeepSeek-R1 forwards
+through the public SimOpus SDK. Install a compatible SDK separately and use the
+[explicit R1 example](examples/sim_configs/simopus_deepseek_r1_mi355x_eager.json)
+with the complete matching systems data, model revision and SDK revision.
+
+The adapter snapshots CPU batch metadata before the runner mutates it, converts
+SDK milliseconds to simulator seconds, and preserves query failures and result
+provenance. Unselected providers do not import SimOpus. This route does not
+require a coordinator or automatic KV budgeting and does not implement native
+speculative stages.
+
+Contract checks run without model execution. The HTTP checks in
+`test/test_simopus_e2e.py` require Linux, SGLang, the real SDK,
+`SIMOPUS_E2E_SYSTEMS_ROOT` and `SIMOPUS_E2E_MODEL_PATH`; missing inputs are reported
+as skipped rather than presented as integration evidence.
