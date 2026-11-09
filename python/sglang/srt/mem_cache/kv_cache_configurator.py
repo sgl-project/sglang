@@ -41,6 +41,7 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.distributed.utils import get_pp_indices
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.npu.mc2_memory import mc2_scratch_reservation_gb
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     get_kv_cache_quant_method,
     resolve_kv_cache_quant,
@@ -3008,7 +3009,12 @@ class KVCacheConfigurator:
             is_multimodal=self.model_config.is_multimodal,
             mm_feature_transport=get_mm().mm_feature_transport,
         )
-        rest_memory = available_gpu_memory - slack_gb - mm_reservation_gb
+        mc2_reservation_gb = mc2_scratch_reservation_gb(
+            is_draft_worker=self.is_draft_worker
+        )
+        rest_memory = (
+            available_gpu_memory - slack_gb - mm_reservation_gb - mc2_reservation_gb
+        )
         if self.mambaish_config is not None and not get_memory().enable_unified_memory:
             rest_memory = self._handle_max_mamba_cache(rest_memory)
 

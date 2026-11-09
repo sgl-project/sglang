@@ -17,6 +17,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.distributed.utils import all_gather_single
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.npu.mc2_memory import preflight_check_mc2_scratch
 from sglang.srt.hardware_backend.xpu.graph_runner.xpu_graph_runner import XPUGraphRunner
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
@@ -439,6 +440,11 @@ def capture_cuda_graphs(
         capture_time=0,
     )
     if capture_decode_cuda_graph:
+        preflight_check_mc2_scratch(
+            device=model_runner.device,
+            gpu_id=model_runner.gpu_id,
+            is_draft_worker=model_runner.is_draft_worker,
+        )
         model_runner.maybe_init_uocr_greedy_graph()
         if current_platform.capabilities.graph_capture:
             decode = capture_decode_graph(

@@ -1247,6 +1247,15 @@ class Envs:
     SGLANG_NPU_USE_SCATTER_PA_KV_CACHE = EnvBool(False)
     # Use the graph-safe Triton-Ascend kernel for masked speculative KV commits.
     SGLANG_NPU_USE_TRITON_PREFIX_KV_CACHE_STORE = EnvBool(False)
+    # DeepEP MC2 scratch on A2 (allocated outside torch_npu on the first low-latency
+    # dispatch): fail fast before decode capture, or reserve it from the KV budget.
+    SGLANG_NPU_MC2_PREFLIGHT_CHECK = EnvBool(False)
+    SGLANG_NPU_RESERVE_MC2_SCRATCH = EnvBool(False)
+    SGLANG_NPU_MC2_SCRATCH_MARGIN_MB = EnvInt(64)
+    # Optional extra pre-flight requirement for the rest of the capture-time
+    # consumption (HCCL windows, graph buffers); checked, never reserved. Off by
+    # default since it depends on the deployment shape.
+    SGLANG_NPU_MC2_CAPTURE_HEADROOM_MB = EnvInt(0)
     # Quantize x to int8 in the dispatch operator (vendor alias consumed by the
     # Ascend DeepEP library; the MTP draft-build scopes override it to False).
     DEEP_NORMAL_MODE_USE_INT8_QUANT = EnvBool(False)
