@@ -54,7 +54,6 @@ BASE_ARGS = (
     "4",
 )
 LANE_ARGS = BASE_ARGS + ("--load-format", "dummy")
-SERVER_ENV = {"ASCEND_RT_VISIBLE_DEVICES": "0"}
 MASTER_ADDR = os.environ.get("SGLANG_TEST_HCCL_MASTER_ADDR", "127.0.0.1")
 NORM_WEIGHT = "model.norm.weight"
 
@@ -67,14 +66,14 @@ class TestNpuUpdateWeightsFromDistributed(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         warmup_npu(0)
-        with npu_server(MODEL, extra_args=BASE_ARGS, env=SERVER_ENV) as base_url:
+        with npu_server(MODEL, extra_args=BASE_ARGS) as base_url:
             cls.reference = generation_signature(base_url, PROMPTS)
         cls.manifest = checkpoint_manifest(MODEL)
         cls.tensor_index = checkpoint_tensor_index(MODEL)
         # Keep one lane server for the class: the trainer creates NPU tensors
         # in this process, and launching another server afterwards resets the
         # device on some CANN/driver combinations.
-        cls._lane_ctx = npu_server(MODEL, extra_args=LANE_ARGS, env=SERVER_ENV)
+        cls._lane_ctx = npu_server(MODEL, extra_args=LANE_ARGS)
         cls.lane_url = cls._lane_ctx.__enter__()
 
     @classmethod
