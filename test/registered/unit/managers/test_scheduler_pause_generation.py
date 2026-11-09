@@ -306,7 +306,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         return seen
 
     def test_retract_requeues_parked_dllm_requests_once_and_rebuilds_context(self):
-        """Retracted dLLM requests must be requeued once with fresh context state."""
+        """Retraction must preserve incoming requests and rebuild started contexts."""
         for separate_context in (False, True):
             with self.subTest(separate_context=separate_context):
                 scheduler = self._new_scheduler()
@@ -330,9 +330,14 @@ class TestSchedulerPauseGeneration(CustomTestCase):
                     req.dllm_phase = DllmReqPhase.STAGING_DECODE
                     req.dllm_algo_state = {"seed": 9}
                     req.dllm_incomplete_ids = array("q", [9, -1, -1, -1])
+                incoming = self._make_req("incoming")
+                incoming.origin_input_ids = array("q", [1, 2, 3, 4])
+                incoming.init_diffusion_llm(scheduler.dllm_config)
                 finished = self._make_req("finished", finished=True)
                 finished.init_diffusion_llm(scheduler.dllm_config)
-                scheduler.dllm_manager.add_waiting_reqs([staged, parked, finished])
+                scheduler.dllm_manager.add_waiting_reqs(
+                    [staged, parked, incoming, finished]
+                )
                 scheduler.dllm_manager.add_staging_reqs([staged])
                 scheduler.last_batch = self._make_batch(
                     scheduler, [staged], forward_mode=ForwardMode.EXTEND
@@ -342,7 +347,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
                 scheduler.pause_generation(PauseGenerationReqInput(mode="in_place"))
                 self.assertEqual(
                     list(scheduler.dllm_manager.waiting_queue),
-                    [staged, parked, finished],
+                    [staged, parked, incoming, finished],
                 )
                 self.assertEqual(scheduler.dllm_manager.staging_queue, [staged])
                 self.assertEqual(requeued, [])
@@ -352,7 +357,9 @@ class TestSchedulerPauseGeneration(CustomTestCase):
                 scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
 
                 self.assertEqual([entry["req"] for entry in requeued], [staged, parked])
-                self.assertEqual(list(scheduler.dllm_manager.waiting_queue), [])
+                self.assertEqual(list(scheduler.dllm_manager.waiting_queue), [incoming])
+                self.assertEqual(incoming.retraction_count, 0)
+                self.assertFalse(incoming.retracted_stain)
                 self.assertEqual(scheduler.dllm_manager.staging_queue, [])
                 for req in (staged, parked):
                     self.assertEqual(req.retraction_count, 1)

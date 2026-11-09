@@ -6145,10 +6145,11 @@ class Scheduler(
 
         if self.dllm_config is not None:
             # dLLM owns parked requests outside the running batch.
-            for req in self.dllm_manager.waiting_queue:
+            for req in self.dllm_manager.waiting_queue.take(
+                lambda req: req.finished() or req.dllm_initialized or req.kv.holds_kv
+            ):
                 if not req.finished() and req not in retract_reqs:
                     retract_reqs.append(req)
-            self.dllm_manager.waiting_queue.clear()
             self.dllm_manager.staging_queue.clear()
 
         if self.disaggregation_mode == DisaggregationMode.DECODE:
