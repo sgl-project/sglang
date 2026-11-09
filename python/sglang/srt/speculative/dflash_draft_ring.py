@@ -46,7 +46,7 @@ def draft_kv_ring_unsupported_reason(
         is_dflash_mla_draft_config,
     )
     from sglang.srt.speculative.draft_worker_common import (
-        DFLASH_MLA_ONLY_DRAFT_BACKENDS,
+        DFLASH_KV_RING_DRAFT_BACKENDS,
     )
 
     if not is_dflash_mla_draft_config(draft_hf_config):
@@ -54,7 +54,7 @@ def draft_kv_ring_unsupported_reason(
     layer_types = get_dflash_layer_types(draft_hf_config)
     if not layer_types or any(t != "sliding_attention" for t in layer_types):
         return f"not every draft layer is sliding_attention ({layer_types})"
-    if draft_backend not in DFLASH_MLA_ONLY_DRAFT_BACKENDS:
+    if draft_backend not in DFLASH_KV_RING_DRAFT_BACKENDS:
         return f"draft backend {draft_backend!r} has no window index path"
     if draft_window_size is not None:
         return "--speculative-draft-window-size keeps the compact draft table"

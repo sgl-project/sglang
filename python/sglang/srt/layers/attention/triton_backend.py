@@ -2884,13 +2884,46 @@ def update_sliding_window_buffer(
         seq_lens,
         torch.tensor(sliding_window_size),
     )
+    window_kv_start_idx = seq_lens - window_kv_lens
+    # Draft KV ring: the draft pool holds only rows_per_req rows per request, so
+    # the window ids must be ring rows, not the target-scale ids a req_to_token
+    # gather would produce.
+    from sglang.srt.speculative.dflash_draft_ring import get_draft_kv_ring
+
+    ring = get_draft_kv_ring()
+    if ring is not None:
+        # A ring materializes no prefix-cache hits. Match the ring-aware window
+        # kernels: never read a position before this request's materialization floor.
+        window_kv_start_idx = torch.maximum(
+            window_kv_start_idx,
+            ring.min_pos[req_pool_indices[:bs]].to(window_kv_start_idx.dtype),
+        )
+        window_kv_lens = seq_lens - window_kv_start_idx
     window_kv_indptr[1 : bs + 1] = torch.cumsum(window_kv_lens, dim=0)
     window_kv_indptr = window_kv_indptr[: bs + 1]
     if window_kv_indices is None:
         window_kv_indices = torch.empty(
             window_kv_indptr[-1], dtype=torch.int64, device=device
         )
-    window_kv_start_idx = seq_lens - window_kv_lens
+    if ring is not None:
+        lens = window_kv_lens.to(torch.int64)
+        starts = window_kv_start_idx.to(torch.int64)
+        total = int(window_kv_indptr[-1].item())
+        if total > 0:
+            req_of = torch.repeat_interleave(
+                torch.arange(bs, device=lens.device), lens, output_size=total
+            )
+            offs = torch.arange(total, device=lens.device) - window_kv_indptr[
+                req_of
+            ].to(torch.int64)
+            positions = starts[req_of] + offs
+            window_kv_indices[:total] = ring.locs(req_pool_indices[req_of], positions)
+        return (
+            window_kv_indptr,
+            window_kv_indices,
+            window_kv_lens,
+            window_kv_start_idx,
+        )
     token_mapping = (
         token_to_kv_pool.full_to_swa_index_mapping
         if token_to_kv_pool is not None

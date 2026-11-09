@@ -33,6 +33,11 @@ class DraftWorkerBundle(msgspec.Struct, frozen=True):
 # Draft backends that serve only MLA layers; DFLASH takes them for MLA drafts.
 DFLASH_MLA_ONLY_DRAFT_BACKENDS = ("cutedsl_mla", "trtllm_mla")
 
+# Backends whose window-index path supports DFlashDraftKVRing. Keep this
+# separate: triton has ring support but retains its normal draft-window-size
+# argument semantics, unlike the MLA-only backends above.
+DFLASH_KV_RING_DRAFT_BACKENDS = DFLASH_MLA_ONLY_DRAFT_BACKENDS + ("triton",)
+
 
 def resolve_draft_worker_attention_backend(*, algo_label: Optional[str] = None) -> str:
     """The attention backend `build_draft_tp_worker` gives a draft worker when

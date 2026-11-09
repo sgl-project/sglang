@@ -1805,6 +1805,11 @@ SGLang supports various environment variables that can be used to configure its 
   </thead>
   <tbody>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DFLASH_DRAFT_KV_RING</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use a bounded per-request KV ring for an all-sliding-window MLA DFLASH draft instead of allocating draft KV for every target slot. Supported with <code>cutedsl_mla</code>, <code>trtllm_mla</code>, and <code>triton</code> draft attention, including SM90 with Triton. The triton path computes ring rows directly and excludes prefix positions that were not materialized into the ring. Set to <code>0</code> to disable.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code> (for eligible drafts)</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ENABLE_OVERLAP_PLAN_STREAM</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Plan the next step on a separate stream to overlap with the current step (Overlap Spec V2).</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
