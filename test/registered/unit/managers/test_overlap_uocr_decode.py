@@ -11,6 +11,7 @@ from sglang.srt.managers.overlap_utils import FutureMap, resolve_forward_inputs
 from sglang.srt.managers.req_types import FINISH_ABORT
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.pause_state import PauseState
 from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     ListKind,
@@ -324,7 +325,7 @@ class TestFlushWithDocumentState(CustomTestCase):
         seen = []
         scheduler = object.__new__(Scheduler)
         scheduler.uocr_runtime = hooks
-        scheduler._engine_paused = False
+        scheduler.pause_state = PauseState()
         scheduler.is_fully_idle = lambda **kw: True
         scheduler.tree_cache = Mock()
         scheduler.tree_cache.reset.side_effect = lambda: seen.append(
@@ -335,6 +336,7 @@ class TestFlushWithDocumentState(CustomTestCase):
             "token_to_kv_pool_allocator",
             "grammar_manager",
             "metrics_reporter",
+            "invariant_checker",
         ):
             setattr(scheduler, name, Mock())
         scheduler.draft_worker = None
@@ -350,7 +352,12 @@ class TestFlushWithDocumentState(CustomTestCase):
         held = Req("w1", "", [1], SamplingParams())
         scheduler = object.__new__(Scheduler)
         scheduler.rust_server = Mock()
-        for name in ("tree_cache", "beam_coordinator", "uocr_runtime"):
+        for name in (
+            "tree_cache",
+            "beam_coordinator",
+            "uocr_runtime",
+            "output_streamer",
+        ):
             setattr(scheduler, name, Mock())
         scheduler.hisparse_coordinator = None
         scheduler.init_request_retirer()

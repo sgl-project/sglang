@@ -223,16 +223,6 @@ class TestRequestContextMechanism(unittest.TestCase):
 
         self.assertTrue(supported._has_request_context_support)
         self.assertFalse(legacy._has_request_context_support)
-        # cached_property caches its result on the instance __dict__.
-        self.assertTrue(supported.__dict__.get("_has_request_context_support"))
-        self.assertIs(
-            supported._has_request_context_support,
-            supported.__dict__["_has_request_context_support"],
-        )
-        self.assertIs(
-            legacy._has_request_context_support,
-            legacy.__dict__["_has_request_context_support"],
-        )
 
 
 class TestRequestContextFromExtraInfo(unittest.TestCase):

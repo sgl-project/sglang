@@ -52,14 +52,17 @@ class TestUniformExtendPlan(CustomTestCase):
             )
 
         source = RunnerIds.__new__(RunnerIds)
+        source._role_sub_pools = {}
         source.page_size = ps
         source.req_to_token = req_to_token
         source._spaces = {full_kind: space("full", full)}
         if swa_enabled:
             source._spaces[swa_kind] = space("swa", swa)
         fused = RunnerIds.__new__(RunnerIds)
+        fused._role_sub_pools = {}
         fused._spaces = {full_kind: source.space(full_kind)}
         private = RunnerIds.__new__(RunnerIds)
+        private._role_sub_pools = {}
         private._spaces = {full_kind: IdSpace(key="private")}
         rows = torch.tensor([2, 1, 0], device="cuda")
         lengths = torch.tensor([ps - 1, ps + 1, 0], device="cuda")
