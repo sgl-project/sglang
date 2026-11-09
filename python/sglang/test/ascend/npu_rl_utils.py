@@ -12,6 +12,9 @@ import contextlib
 import glob
 import json
 import os
+import re
+import shutil
+import subprocess
 import time
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
@@ -40,35 +43,47 @@ DEFAULT_TIMEOUT = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
 # ---------------------------------------------------------------------------
 
 
+def _npu_smi(*args: str) -> str:
+    return subprocess.check_output(
+        ["npu-smi", *args], text=True, stderr=subprocess.DEVNULL
+    )
+
+
 def npu_available() -> bool:
-    if _NPU_IMPORT_ERROR is not None:
-        return False
-    try:
-        return bool(torch.npu.is_available())
-    except Exception:
-        return False
+    return _NPU_IMPORT_ERROR is None and shutil.which("npu-smi") is not None
 
 
 def npu_device_count() -> int:
     if not npu_available():
         return 0
-    return int(torch.npu.device_count())
+    out = _npu_smi("info", "-l")
+    npus = int(re.search(r"Total Count\s*:\s*(\d+)", out).group(1))
+    chips = int(re.search(r"Chip Count\s*:\s*(\d+)", out).group(1))
+    return npus * chips
 
 
 def warmup_npu(device: int = 0) -> None:
-    """Initialize the test process's NPU context.
+    """No-op: the test process must not create an NPU context.
 
-    A cold ``torch_npu`` init while the server already holds most of the device
-    can be slow; call this before launching the server.
+    Starting a server after the parent has initialized an NPU context resets
+    the device and kills the parent on some CANN/driver combinations.
     """
-    if not npu_available():
-        return
-    torch.npu.set_device(device)
-    torch.npu.mem_get_info(device)
+
+
+def _hbm_capacity_and_rate(device: int = 0):
+    out = _npu_smi("info", "-t", "usages", "-i", str(device))
+    capacity = int(re.search(r"HBM Capacity\(MB\)\s*:\s*(\d+)", out).group(1))
+    rate = int(re.search(r"HBM Usage Rate\(%\)\s*:\s*(\d+)", out).group(1))
+    return capacity * 1024**2, rate
+
+
+def npu_total_bytes(device: int = 0) -> int:
+    return _hbm_capacity_and_rate(device)[0]
 
 
 def npu_free_bytes(device: int = 0) -> int:
-    return int(torch.npu.mem_get_info(device)[0])
+    total, rate = _hbm_capacity_and_rate(device)
+    return total - total * rate // 100
 
 
 def wait_for_free_memory(
@@ -111,8 +126,10 @@ def npu_server(
     port = port or find_available_port(30000)
     base_url = f"http://127.0.0.1:{port}"
     if npu_available():
-        with contextlib.suppress(RuntimeError):
-            wait_for_free_memory(0, 2 * 1024**3, timeout=30)
+        # The previous test's server may still be handing HBM back; a partial
+        # free is not enough for the next full KV-cache allocation. Fail instead
+        # of launching a second server on a device that is still occupied.
+        wait_for_free_memory(0, int(0.65 * npu_total_bytes(0)), timeout=300)
     process = popen_launch_server(
         model_path,
         base_url,
