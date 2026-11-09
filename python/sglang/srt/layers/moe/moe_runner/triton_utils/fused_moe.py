@@ -808,53 +808,35 @@ def _fused_moe_kernel_sequence(
                 intermediate_cache1.view(-1, N), gemm1_limit
             )
         elif swiglu_limit is not None:
-            # DeepSeek V4: swiglu clamp before silu_and_mul.
-            # Two paths gated by SGLANG_OPT_SWIGLU_CLAMP_FUSION:
-            #   fusion=True: clamp fused into act_and_mul_triton or silu_and_mul_clamp
-            #   fusion=False: explicit clamp_ on intermediate_cache1 (path checker)
+            # DeepSeek V4: clamp gate to the limit and up to ±limit before SiLU.
             assert swiglu_limit == 10
             assert intermediate_cache1.shape == (total_tokens, N)
             assert _is_cuda or _is_hip or _is_xpu, (
                 "DeepSeek V4 only supports CUDA/HIP/XPU downstream"
             )
 
-            swiglu_limit_for_triton: Optional[float] = None
-            swiglu_limit_for_silu_and_mul_clamp: Optional[float] = None
-
-            if filter_expert:
-                swiglu_limit_for_triton = swiglu_limit
-            elif _is_hip:
-                # No fused silu_and_mul_clamp on HIP. Clamp the scratch gate/up
-                # halves in place, then run the regular silu_and_mul below.
-                gate_up = intermediate_cache1.view(-1, N)
-                gate_up[:, : N // 2].clamp_(max=swiglu_limit)
-                gate_up[:, N // 2 :].clamp_(min=-swiglu_limit, max=swiglu_limit)
-            else:
-                swiglu_limit_for_silu_and_mul_clamp = swiglu_limit
-
-            if not filter_expert:
-                if swiglu_limit_for_silu_and_mul_clamp is not None:
-                    from sglang.kernels.ops.activation.silu_and_mul_clamp import (
-                        silu_and_mul_clamp,
-                    )
-
-                    silu_and_mul_clamp(
-                        intermediate_cache1.view(-1, N),
-                        intermediate_cache2,
-                        swiglu_limit_for_silu_and_mul_clamp,
-                    )
-                else:
-                    silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
-            else:
+            if filter_expert or _is_hip:
+                # HIP has no silu_and_mul_clamp. act_and_mul_triton applies the
+                # clamp itself, with or without an expert filter.
                 act_and_mul_triton(
                     intermediate_cache1.view(-1, N),
                     intermediate_cache2,
                     config,
-                    topk_ids,
-                    expert_ids,
+                    topk_ids if filter_expert else None,
+                    expert_ids if filter_expert else None,
                     down_moe_use_tma,
                     activation,
-                    swiglu_limit=swiglu_limit_for_triton,
+                    swiglu_limit=swiglu_limit,
+                )
+            else:
+                from sglang.kernels.ops.activation.silu_and_mul_clamp import (
+                    silu_and_mul_clamp,
+                )
+
+                silu_and_mul_clamp(
+                    intermediate_cache1.view(-1, N),
+                    intermediate_cache2,
+                    swiglu_limit,
                 )
         elif _is_cuda or _is_hip or _is_xpu:
             silu_and_mul(
