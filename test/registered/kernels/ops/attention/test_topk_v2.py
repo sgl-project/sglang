@@ -55,6 +55,9 @@ PAGE_SIZE = 64  # c4 page size = 256 // 4
 PAGE_BITS = PAGE_SIZE.bit_length() - 1
 PAGE_MASK = PAGE_SIZE - 1
 MAX_PERMIT_ERROR = 5
+# The default top-k mode is exact, so CUDA pins the packed kernel to exact
+# (ROCm keeps the default tolerance).
+PACKED_PERMIT_ERROR = MAX_PERMIT_ERROR if is_hip() else 0
 
 # (batch, seq) chosen to land on each template and each dispatch boundary.
 FIXED_CONFIGS = [
@@ -773,7 +776,15 @@ def test_topk_v2_packed_rows(extend_lens: list[int], k: int) -> None:
         window = scores_cpu[r, start : start + L]
         ref = torch.topk(window, k, sorted=False).indices.tolist()
         our = _invert(out_cpu[r], inv_cpu[req])
-        _assert_topk_close(window.unsqueeze(0), [ref], [our], 1, [L], k)
+        _assert_topk_close(
+            window.unsqueeze(0),
+            [ref],
+            [our],
+            1,
+            [L],
+            k,
+            max_permit_error=PACKED_PERMIT_ERROR,
+        )
 
 
 @pytest.mark.parametrize("residue", [1, 2, 3])
@@ -835,7 +846,15 @@ def test_topk_v2_packed_level_boundary(boundary: int, residue: int) -> None:
             assert all(v == -1 for v in out_cpu[r][L:]), f"row {r} padding wrong"
             continue
         ref = torch.topk(window, k, sorted=False).indices.tolist()
-        _assert_topk_close(window.unsqueeze(0), [ref], [our], 1, [L], k)
+        _assert_topk_close(
+            window.unsqueeze(0),
+            [ref],
+            [our],
+            1,
+            [L],
+            k,
+            max_permit_error=PACKED_PERMIT_ERROR,
+        )
 
 
 @pytest.mark.skipif(is_hip(), reason="ROCm split path keeps its own tie merge")
