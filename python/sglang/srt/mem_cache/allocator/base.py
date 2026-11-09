@@ -16,11 +16,12 @@ limitations under the License.
 from __future__ import annotations
 
 import abc
-from typing import TYPE_CHECKING, Dict, Hashable, Optional, Protocol
+from typing import TYPE_CHECKING, Dict, Optional, Protocol, Tuple
 
 import torch
 
 if TYPE_CHECKING:
+    from sglang.srt.mem_cache.kv.alloc.forward_steps import ForwardSteps
     from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace
     from sglang.srt.mem_cache.kv.state_storage import StateStorage
     from sglang.srt.mem_cache.kv.storage import KVStorage
@@ -50,6 +51,8 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     state: Optional[StateStorage] = None
     # A unified pool's sub-pools as host and peer transfers read them.
     storage: Optional[KVStorage] = None
+    # The steps a lazily compacting unified pool's freed pages wait for.
+    forward_steps: Optional[ForwardSteps] = None
 
     @property
     def state_slots(self):
@@ -90,6 +93,11 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         """Whether a sliding-window pool sits beside the full-attention one,
         with the window allocation surface (`free_swa`, `swa_available_size`, ...)."""
         return False
+
+    def window_pool_names(self) -> Tuple[str, ...]:
+        """The window pools this allocator keeps, by name; none for a pool
+        without windows."""
+        return ()
 
     def state_id_spaces(self) -> Dict[str, IdSpace]:
         """The id space of each recurrent-state sub-pool whose slots this
@@ -229,6 +237,11 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         violation strings, empty when healthy. Static pools have no byte model."""
         return []
 
+    def window_available_size(self, sub_pool: str) -> int:
+        """What a take from window pool ``sub_pool`` can serve now; a pool
+        keeping one window serves it under any name."""
+        return self.swa_available_size()
+
     def mamba_full_cache_donor(self) -> MambaFullCacheDonor | None:
         """Return the shared-pool donor capability, if this allocator has one."""
         return None
@@ -293,10 +306,6 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
     ):
         raise NotImplementedError()
-
-    def set_hicache_transfer_done_event(self, transfer_key: Hashable, event) -> None:
-        """Record an asynchronous HiCache transfer completion event if needed."""
-        return
 
     def alloc_extend(self, *args, **kwargs):
         raise NotImplementedError("alloc_extend is only for paged allocator")

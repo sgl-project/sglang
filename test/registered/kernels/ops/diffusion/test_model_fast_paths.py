@@ -1678,6 +1678,71 @@ requires_nvidia_jit = pytest.mark.skipif(
 )
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.version.hip is not None
+    or torch.cuda.get_device_capability() != (12, 0),
+    reason="Qwen-Image 2.1 BF16 MLP packing is enabled on SM120 only",
+)
+@torch.no_grad()
+@pytest.mark.parametrize("tokens", [1024, 4096])
+def test_qwen21_bf16_mlp_packing_restore_and_lora(tokens):
+    from sglang.multimodal_gen.runtime.layers.lora.linear import wrap_with_lora_layer
+
+    if not model_parallel_is_initialized():
+        ensure_distributed_env_defaults()
+        maybe_init_distributed_environment_and_model_parallel(tp_size=1, sp_size=1)
+    torch.manual_seed(42)
+    mlp = qwen_image21.QwenImage21FeedForward(4096, 3, None, "img_mlp").to(
+        device="cuda", dtype=torch.bfloat16
+    )
+    for parameter in mlp.parameters():
+        parameter.normal_(0, 0.01)
+    x = torch.randn(1, tokens, 4096, device="cuda", dtype=torch.bfloat16)
+    reference = mlp.out(F.silu(mlp.gate_layer(x)[0]) * mlp.proj(x)[0])[0]
+    mlp.pack_gate_up_weights()
+    assert set(mlp.state_dict()) == {"gate_layer.weight", "proj.weight", "out.weight"}
+    with patch.object(
+        qwen_image21,
+        "fused_packed_silu_mul_bitexact",
+        wraps=qwen_image21.fused_packed_silu_mul_bitexact,
+    ) as fused:
+        torch.testing.assert_close(
+            mlp(x, use_packed_bf16=True), reference, atol=2e-2, rtol=2e-2
+        )
+        assert fused.call_count == 1
+        assert torch.equal(mlp(x), reference)
+        prefix = x[:, :33].contiguous()
+        assert torch.equal(mlp(prefix, use_packed_bf16=True), mlp(prefix))
+        assert fused.call_count == 1
+
+        compiled = torch.compile(mlp, backend="eager", fullgraph=True)
+        assert torch.equal(compiled(x, use_packed_bf16=True), reference)
+        assert fused.call_count == 1
+
+        mlp.cpu().cuda()
+        torch.testing.assert_close(
+            mlp(x, use_packed_bf16=True), reference, atol=2e-2, rtol=2e-2
+        )
+        assert fused.call_count == 2
+        mlp.proj.weight.data = mlp.proj.weight.data.clone()
+        assert torch.equal(mlp(x, use_packed_bf16=True), reference)
+        assert fused.call_count == 2
+        mlp.pack_gate_up_weights()
+
+        wrapper = wrap_with_lora_layer(mlp.gate_layer, lora_rank=4, lora_alpha=4)
+        wrapper.set_lora_weights(
+            torch.randn(4, 4096, device=x.device, dtype=x.dtype) * 0.02,
+            torch.randn(12288, 4, device=x.device, dtype=x.dtype) * 0.02,
+            merge_weights=False,
+        )
+        mlp.gate_layer = wrapper
+        adapted = mlp(x)
+        assert not torch.equal(adapted, reference)
+        assert torch.equal(mlp(x, use_packed_bf16=True), adapted)
+        assert fused.call_count == 2
+
+
 def _qwen21_rope(tokens: int, device: torch.device) -> torch.Tensor:
     angles = torch.randn(tokens, 64, device=device, dtype=torch.float32)
     return torch.polar(torch.ones_like(angles), angles)
@@ -2624,6 +2689,73 @@ def test_wan_text_kv_lives_for_one_loop_of_one_request():
         del req
         gc.collect()
         assert gone() is None
+
+
+@torch.inference_mode()
+@pytest.mark.skipif(not is_cuda(), reason="Requires CUDA")
+@pytest.mark.parametrize("mode", ["fused", "strided", "fp32", "mismatch"])
+def test_hidream_rope_dispatch_and_fallback(monkeypatch, mode):
+    """Preserve GQA and batch-specific tables, including the native fallback."""
+    from types import SimpleNamespace
+
+    from sglang.multimodal_gen.runtime.models.dits import hidream_o1_image as hidream
+
+    gate = BitExactFusionGate("HiDream RoPE test")
+    monkeypatch.setattr(hidream, "_HIDREAM_ROPE", gate)
+    generator = torch.Generator(device="cuda").manual_seed(42)
+    dtype = torch.float32 if mode == "fp32" else torch.bfloat16
+    qkv = torch.randn(2, 17, 12 * 128, device="cuda", dtype=dtype, generator=generator)
+    angles = torch.randn(2, 17, 128, device="cuda", generator=generator)
+    cos, sin = angles.cos().to(dtype), angles.sin().to(dtype)
+    norm = (lambda x: x) if mode == "strided" else lambda x: x.contiguous()
+    captured = []
+
+    def attention(q, k, v, *, attn_mask):
+        captured.append((q, k, v))
+        return q
+
+    # Run the real attention forward; isolate its RoPE from projection weights
+    # and SDPA so a Q/K rounding mismatch cannot disappear in a later cast.
+    layer = SimpleNamespace(
+        num_heads=8,
+        num_kv_heads=2,
+        head_dim=128,
+        q_size=8 * 128,
+        kv_size=2 * 128,
+        qkv_proj=lambda x: (x, None),
+        q_norm=norm,
+        k_norm=norm,
+        attn=attention,
+        o_proj=lambda x: (x, None),
+    )
+    fused = MagicMock(
+        side_effect=(
+            (lambda x, cos, sin: torch.zeros_like(x))
+            if mode == "mismatch"
+            else hidream.fused_rope_rotate_half_bitexact
+        )
+    )
+    monkeypatch.setattr(hidream, "fused_rope_rotate_half_bitexact", fused)
+    mask = torch.zeros(1, 1, 17, 17, device="cuda", dtype=dtype)
+    for x in (qkv, qkv * 2):
+        original = x.clone()
+        q, k, v = x.split([8 * 128, 2 * 128, 2 * 128], dim=-1)
+        expected_q, expected_k = hidream.qwen3_apply_rotary_pos_emb(
+            norm(q.reshape(2, 17, 8, 128)),
+            norm(k.reshape(2, 17, 2, 128)),
+            cos.unsqueeze(2),
+            sin.unsqueeze(2),
+        )
+        hidream.HiDreamO1Attention.forward(layer, x, cos, sin, mask)
+        actual_q, actual_k, actual_v = captured[-1]
+        assert torch.equal(actual_q, expected_q) and torch.equal(actual_k, expected_k)
+        assert torch.equal(actual_v, v.reshape(2, 17, 2, 128))
+        assert torch.equal(x, original)
+    assert (
+        fused.call_count == {"fused": 4, "strided": 0, "fp32": 0, "mismatch": 2}[mode]
+    )
+    assert gate.verified == (mode == "fused")
+    assert gate.disabled == (mode == "mismatch")
 
 
 if __name__ == "__main__":
