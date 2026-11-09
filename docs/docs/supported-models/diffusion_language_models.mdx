@@ -148,6 +148,13 @@ The total is the sum of three counters:
   new positions counts wholly as recomputation; a denoising call counts wholly
   as generation. This is a classification of calls, not a token-weighted split.
 
+`recompute_forward_count` records replay work; it does not enable retraction.
+In the validated single-GPU SDAR setup without overlap or prefill/decode
+disaggregation, native decode-memory-pressure retraction does not select dLLM
+requests, and retracting pauses have queue-lifecycle limitations. Recompute
+accounting was tested with controlled synchronous replay using real KV release,
+reset, and requeue.
+
 `completion_tokens` matches the outer completion-token count after stop/length
 truncation. `tokens_per_forward` divides it by `generation_forward_count`, or
 returns `0.0` when `generation_forward_count` is zero. Prompt encoding and retraction
