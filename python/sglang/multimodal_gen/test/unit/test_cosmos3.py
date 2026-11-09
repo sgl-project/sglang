@@ -1826,9 +1826,7 @@ class TestCosmos3Transfer(unittest.TestCase):
                     self.assertEqual(seen[2], ["uncond"])
                     self.assertEqual(seen[3], pad_r3)
                     self.assertTrue(torch.allclose(parts[3], torch.zeros(1)))
-                    self.assertTrue(
-                        torch.allclose(sum(parts), torch.full((1,), 86.0))
-                    )
+                    self.assertTrue(torch.allclose(sum(parts), torch.full((1,), 86.0)))
 
     def test_single_hint_defaults_applied(self):
         sp = Cosmos3SamplingParams(
