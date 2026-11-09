@@ -360,3 +360,6 @@ HIP mHC boundary.
 
 Mega-mHC replaces the fused HIP mHC boundary on prefill steps only. Decode and
 verify steps keep the fused boundary, with or without `--enable-amd-monokernel`.
+To run Mega-mHC on the decode and verify steps that SGLang runs as well, also set
+`SGLANG_OPT_DSV41_MEGA_MHC_DECODE=1`; the steps the AMD monokernel serves do not
+change.

@@ -143,7 +143,7 @@ class NonCudaDecoderMixin:
         self._init_boundaries()
         local_boundary, next_boundary = (
             self._extend_boundaries
-            if mhc.is_local_extend(forward_batch)
+            if mhc.is_local_extend(forward_batch) or mhc.mega_mhc_on_decode()
             else (self.local_boundary, self.next_boundary)
         )
         stats_stream = None

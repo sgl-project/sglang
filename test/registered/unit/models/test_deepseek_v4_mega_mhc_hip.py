@@ -256,6 +256,8 @@ class TestHipBoundaryExtend(unittest.TestCase):
             ForwardMode.DECODE: False,
             ForwardMode.TARGET_VERIFY: False,
         }
+        # (HIP, decode env) -> whether decode / verify steps take the extend boundaries
+        switches = {(True, False): False, (True, True): True, (False, True): False}
         with (
             mock.patch.object(mhc, "make_boundary", side_effect=boundary),
             mock.patch.object(mhc, "use_stats_stream", return_value=False),
@@ -265,18 +267,24 @@ class TestHipBoundaryExtend(unittest.TestCase):
             mock.patch.object(mhc, "run_attn_post", side_effect=post),
             mock.patch.object(mhc, "run_moe_post", side_effect=post),
         ):
-            for mode, extend in modes.items():
-                with self.subTest(mode=mode.name):
-                    seen.clear()
-                    layer.forward_hc_pre_from_prev(
-                        None,
-                        mock.Mock(),
-                        None,
-                        types.SimpleNamespace(forward_mode=mode),
-                        None,
-                    )
-                    # the closed-seam check, the attention seam, then the MoE seam
-                    self.assertEqual(seen, [extend, extend, extend])
+            for (hip, mega_decode), decode_extends in switches.items():
+                for mode, extend in modes.items():
+                    with (
+                        self.subTest(hip=hip, mega_decode=mega_decode, mode=mode.name),
+                        mock.patch.object(mhc, "_is_hip", hip),
+                        envs.SGLANG_OPT_DSV41_MEGA_MHC_DECODE.override(mega_decode),
+                    ):
+                        seen.clear()
+                        layer.forward_hc_pre_from_prev(
+                            None,
+                            mock.Mock(),
+                            None,
+                            types.SimpleNamespace(forward_mode=mode),
+                            None,
+                        )
+                        expected = extend or decode_extends
+                        # the closed-seam check, the attention seam, then the MoE seam
+                        self.assertEqual(seen, [expected, expected, expected])
 
 
 class TestFusedBoundaryRouting(unittest.TestCase):
@@ -306,14 +314,22 @@ class TestFusedBoundaryRouting(unittest.TestCase):
             ForwardMode.TARGET_VERIFY,
             ForwardMode.DRAFT_EXTEND_V2,
         )
-        # mega -> whether prefill and decode steps take the fused boundary
-        cases = {False: (True, True), True: (False, True)}
-        for mega, (fused_prefill, fused_decode) in cases.items():
+        # (prefill env, decode env) -> (fused prefill, fused decode)
+        cases = {
+            (False, False): (True, True),
+            (False, True): (True, True),
+            (True, False): (False, True),
+            (True, True): (False, False),
+        }
+        for (mega, mega_decode), (fused_prefill, fused_decode) in cases.items():
             for modes, expected in ((prefill, fused_prefill), (decode, fused_decode)):
                 for mode in modes:
                     with (
-                        self.subTest(mega=mega, mode=mode.name),
+                        self.subTest(
+                            mega=mega, mega_decode=mega_decode, mode=mode.name
+                        ),
                         envs.SGLANG_OPT_DSV41_MEGA_MHC_PREFILL.override(mega),
+                        envs.SGLANG_OPT_DSV41_MEGA_MHC_DECODE.override(mega_decode),
                     ):
                         fused = deepseek_v4_hip.fused_boundary_this_step(
                             types.SimpleNamespace(forward_mode=mode)

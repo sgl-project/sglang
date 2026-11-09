@@ -274,6 +274,12 @@ def is_local_extend(forward_batch: Optional[ForwardBatch]) -> bool:
     return mode.is_extend() and not mode.is_target_verify()
 
 
+def mega_mhc_on_decode() -> bool:
+    """Whether the decode and verify steps take prefill's Mega-mHC boundaries: opt-in on
+    HIP, where _can_use_mega_mhc still gates each seam."""
+    return _is_hip and envs.SGLANG_OPT_DSV41_MEGA_MHC_DECODE.get()
+
+
 def is_deferred_finalize(routed) -> bool:
     """Whether a `MoEOutput` really carries an unfinalized handle for the post."""
     from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
@@ -735,9 +741,10 @@ def _hip_flydsl_mega_mhc(
 
 def mega_closed_seam(hc: HcSubLayer, state: HcState, extend: bool) -> HcState:
     """A closed seam (the first layer, an Engram layer), where no previous post folded
-    in this hyper-connection's combine, norm and triplet: on gfx950 prefill the no-post
-    Mega-mHC runs them in one launch, and `combine` and `_compute_triplet` take its
-    results. Consumes ``state``, as `combine` would."""
+    in this hyper-connection's combine, norm and triplet: on gfx950 prefill (and decode,
+    under mega_mhc_on_decode) the no-post Mega-mHC runs them in one launch, and
+    `combine` and `_compute_triplet` take its results. Consumes ``state``, as `combine`
+    would."""
     if (
         not _is_hip
         or not extend
