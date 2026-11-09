@@ -18,19 +18,6 @@ import torch
 import zmq
 import zmq.asyncio
 
-
-def _synchronize_device_stream(device: torch.device) -> None:
-    """Block the caller until the current stream of ``device`` drains.
-
-    ``torch.cuda`` is unavailable on Ascend/NPU builds, so resolve the device
-    module from the device type instead of hard-coding CUDA. Used by the
-    mm-global-cache assembly paths to ensure non-blocking device copies have
-    finished before the embedding buffers are read/staged.
-    """
-    device = torch.device(device)
-    torch.get_device_module(device).current_stream(device).synchronize()
-
-
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
@@ -77,6 +64,7 @@ from sglang.srt.multimodal.encoder_preprocessing import (
 from sglang.srt.multimodal.media_io import configure_media_url_security
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.observability.metrics_collector import EncoderMetricsCollector
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     assert_published,
     get_device,
@@ -412,9 +400,9 @@ class TensorWrapper:
     """Wrapper to keep tensor alive while exposing buffer for zero-copy."""
 
     def __init__(self, tensor):
-        # Ensure tensor is on CPU and contiguous (NPU tensors have device.type
-        # "npu", not "cuda", so dispatch on real device type rather than is_cuda).
-        if tensor.device.type != "cpu":
+        # Ensure tensor is on CPU and contiguous. Only CUDA/NPU tensors are
+        # moved; CPU tensors are left untouched.
+        if tensor.device.type in ("cuda", "npu"):
             tensor = tensor.cpu()
         if not tensor.is_contiguous():
             tensor = tensor.contiguous()
@@ -1598,7 +1586,7 @@ class MMEncoder:
                         copied += n
                 offset += num_tokens
 
-            _synchronize_device_stream(self.device)
+            current_platform.synchronize()
             return mm_embedding
         finally:
             if hit_view_hashes:
@@ -1648,7 +1636,7 @@ class MMEncoder:
             offset += num_tokens
 
         self.mm_global_cache.wait_load_to_device(copy_handles)
-        _synchronize_device_stream(mm_embedding.device)
+        current_platform.synchronize()
         return mm_embedding
 
     async def _compute_global_cache_embedding(
@@ -2220,7 +2208,7 @@ class MMEncoder:
             # transfer_sync bypasses CUDA streams, so GPU writes (forward and the
             # per-request clones) must land before /send reads the buffers.
             if keep_on_gpu and mm_embedding.device.type in ("cuda", "npu"):
-                _synchronize_device_stream(mm_embedding.device)
+                current_platform.synchronize()
             self._stage_embedding_batch(staged_embeddings)
             return results
         except BaseException:
