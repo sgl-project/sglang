@@ -1,13 +1,14 @@
 """Triton fused q/k RMSNorm for MLA attention.
 
-Drop-in replacement for aiter's ``fused_qk_rmsnorm`` on hardware where the aiter
-``module_fused_qk_norm_rope_cache_quant_shuffle`` kernel cannot be built (e.g.
-gfx1250, whose composable_kernel version is incompatible with the aiter fork's
-``rope_common.h`` / ``ck_tile/vec_convert.h``). Semantics match a plain
-RMSNorm (``sglang.srt.layers.layernorm.RMSNorm.forward_native``): compute the
-row variance in fp32, scale by ``rsqrt(var + eps)``, multiply by ``weight`` and
-cast back to the input dtype. No RoPE, no quantization -- this is only used on
-the ``quant_type=No`` path where the fused kernel is a pure RMSNorm.
+gfx1250 replacement for aiter's ``fused_qk_rmsnorm`` that does not depend on the
+aiter ``module_fused_qk_norm_rope_cache_quant_shuffle`` JIT build. Semantics match
+a plain RMSNorm (``sglang.srt.layers.layernorm.RMSNorm.forward_native``): compute
+the row variance in fp32, scale by ``rsqrt(var + eps)``, multiply by ``weight``
+and cast back to the input dtype. No RoPE, no quantization -- this is only used
+on the ``quant_type=No`` path where the fused kernel is a pure RMSNorm.
+
+``q`` and ``k`` are usually column slices of the fused_qkv_a output, so rows are
+read through their own stride and both norms run in one launch.
 """
 
 from typing import Tuple
@@ -18,57 +19,60 @@ import triton.language as tl
 
 
 # Not layernorm.rmsnorm_fp32: 1 / sqrt(var + eps) rounds differently from rsqrt.
+# Each branch keeps its own names: Triton needs matching shapes for a name
+# assigned in both arms of an if.
 @triton.jit
-def _rmsnorm_kernel(
-    x_ptr,
-    w_ptr,
-    out_ptr,
-    row_stride,
-    N,
-    eps,
-    BLOCK_SIZE: tl.constexpr,
+def _qk_rmsnorm_kernel(
+    q_ptr,
+    q_w_ptr,
+    q_out_ptr,
+    q_row_stride,
+    q_out_row_stride,
+    NQ,
+    q_eps,
+    k_ptr,
+    k_w_ptr,
+    k_out_ptr,
+    k_row_stride,
+    k_out_row_stride,
+    NK,
+    k_eps,
+    BLOCK_Q: tl.constexpr,
+    BLOCK_K: tl.constexpr,
 ):
     row = tl.program_id(0)
-    x_row = x_ptr + row * row_stride
-    out_row = out_ptr + row * row_stride
+    if tl.program_id(1) == 0:
+        q_cols = tl.arange(0, BLOCK_Q)
+        q_mask = q_cols < NQ
+        xq = tl.load(q_ptr + row * q_row_stride + q_cols, mask=q_mask, other=0.0).to(
+            tl.float32
+        )
+        rq = 1.0 / tl.sqrt(tl.sum(xq * xq, axis=0) / NQ + q_eps)
+        wq = tl.load(q_w_ptr + q_cols, mask=q_mask, other=0.0).to(tl.float32)
+        tl.store(
+            q_out_ptr + row * q_out_row_stride + q_cols,
+            (xq * rq * wq).to(q_out_ptr.dtype.element_ty),
+            mask=q_mask,
+        )
+    else:
+        k_cols = tl.arange(0, BLOCK_K)
+        k_mask = k_cols < NK
+        xk = tl.load(k_ptr + row * k_row_stride + k_cols, mask=k_mask, other=0.0).to(
+            tl.float32
+        )
+        rk = 1.0 / tl.sqrt(tl.sum(xk * xk, axis=0) / NK + k_eps)
+        wk = tl.load(k_w_ptr + k_cols, mask=k_mask, other=0.0).to(tl.float32)
+        tl.store(
+            k_out_ptr + row * k_out_row_stride + k_cols,
+            (xk * rk * wk).to(k_out_ptr.dtype.element_ty),
+            mask=k_mask,
+        )
 
-    cols = tl.arange(0, BLOCK_SIZE)
-    mask = cols < N
 
-    x = tl.load(x_row + cols, mask=mask, other=0.0).to(tl.float32)
-    var = tl.sum(x * x, axis=0) / N
-    rstd = 1.0 / tl.sqrt(var + eps)
-
-    w = tl.load(w_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-    y = x * rstd * w
-
-    tl.store(out_row + cols, y.to(out_row.dtype.element_ty), mask=mask)
-
-
-def _rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
-    orig_shape = x.shape
-    N = orig_shape[-1]
-    x2d = x.reshape(-1, N).contiguous()
-    out = torch.empty_like(x2d)
-
-    M = x2d.shape[0]
-    if M == 0:
-        return out.reshape(orig_shape)
-
-    BLOCK_SIZE = triton.next_power_of_2(N)
-    num_warps = min(max(BLOCK_SIZE // 256, 1), 16)
-
-    _rmsnorm_kernel[(M,)](
-        x2d,
-        weight,
-        out,
-        x2d.stride(0),
-        N,
-        float(eps),
-        BLOCK_SIZE=BLOCK_SIZE,
-        num_warps=num_warps,
-    )
-    return out.reshape(orig_shape)
+def _rows(x: torch.Tensor) -> torch.Tensor:
+    # The kernel reads each row with unit column stride and any row stride.
+    x2d = x if x.dim() == 2 else x.reshape(-1, x.shape[-1])
+    return x2d if x2d.stride(-1) == 1 else x2d.contiguous()
 
 
 def fused_qk_rmsnorm_triton(
@@ -83,9 +87,36 @@ def fused_qk_rmsnorm_triton(
     ``k_weight``/``k_eps``) independently. Matches the signature and return
     convention of the aiter ``fused_qk_rmsnorm`` shim used in ``forward_mla``.
     """
-    q_out = _rmsnorm(q, q_weight, q_eps)
-    k_out = _rmsnorm(k, k_weight, k_eps)
-    return q_out, k_out
+    q2d, k2d = _rows(q), _rows(k)
+    M, NQ, NK = q2d.shape[0], q2d.shape[1], k2d.shape[1]
+    assert k2d.shape[0] == M, f"q has {M} rows, k has {k2d.shape[0]}"
+    q_out = torch.empty((M, NQ), dtype=q.dtype, device=q.device)
+    k_out = torch.empty((M, NK), dtype=k.dtype, device=k.device)
+    if M:
+        block_q = triton.next_power_of_2(NQ)
+        block_k = triton.next_power_of_2(NK)
+        _qk_rmsnorm_kernel[(M, 2)](
+            q2d,
+            q_weight,
+            q_out,
+            q2d.stride(0),
+            q_out.stride(0),
+            NQ,
+            float(q_eps),
+            k2d,
+            k_weight,
+            k_out,
+            k2d.stride(0),
+            k_out.stride(0),
+            NK,
+            float(k_eps),
+            BLOCK_Q=block_q,
+            BLOCK_K=block_k,
+            # Sized by the smaller row: on gfx1250 K2 shapes (1536 / 512) this is
+            # the fastest choice for prefill rows and even for decode.
+            num_warps=min(max(min(block_q, block_k) // 256, 1), 16),
+        )
+    return q_out.reshape(q.shape), k_out.reshape(k.shape)
 
 
 def _rmsnorm_torch(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
