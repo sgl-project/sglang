@@ -419,13 +419,12 @@ class TestSpecDecodeLengthSnapshot(CustomTestCase):
                 processor = _NamedNoResourceFinishSink(
                     is_generation=True,
                     disaggregation_mode=DisaggregationMode.NULL,
-                    enable_overlap=True,
-                    enable_overlap_mlx=False,
                     model_config=model_config,
                     token_to_kv_pool_allocator=_NamedAllocatorBoundary(),
                     tree_cache=None,
                     hisparse_coordinator=None,
                     req_to_token_pool=None,
+                    kv_weight_version_tracker=None,
                     decode_offload_manager=None,
                     metrics_collector=None,
                     metrics_reporter=reporter,
@@ -434,7 +433,9 @@ class TestSpecDecodeLengthSnapshot(CustomTestCase):
                     logprob_result_processor=None,
                     output_streamer=_NamedStreamerBoundary(),
                     beam_coordinator=None,
+                    request_retirer=None,
                     abort_request=_named_abort_request,
+                    still_in_batch=lambda req: req in left.reqs,
                 )
                 processor.process_batch_result_decode(left, result)
                 metrics = reporter._build_scheduled_request_metrics(left, result)
