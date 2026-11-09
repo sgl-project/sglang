@@ -11,8 +11,8 @@ implementations of that pair and picks between them by input dtype:
   ``1 / sumexp``. This one never materializes ``[tokens, vocab]`` in fp32, and
   it relies on two things that a "looks equivalent" rewrite silently breaks:
   the argmax token's shifted exponent is exactly 1 (so its probability is the
-  reciprocal of the denominator), and the running max must be re-applied when
-  folding each chunk into the accumulator.
+  reciprocal of the denominator), and that holds only when the subtracted max
+  is the global row max, not a per-chunk one.
 """
 
 import unittest
@@ -89,9 +89,10 @@ class TestArgmaxAndSoftmaxProb(CustomTestCase):
                 )
 
     def test_chunked_path_survives_a_max_in_the_last_chunk(self):
-        # Folding a new chunk must rescale the accumulator by exp(old-new max).
-        # Dropping that rescale is invisible unless the running max actually
-        # grows late, so put the winner in the final (partial) chunk.
+        # The shift must be the full-row max: a rewrite that derives it from
+        # the first chunk, or per chunk (an online-softmax variant that drops
+        # the accumulator rescale), is invisible unless the max actually
+        # arrives late, so put the winner in the final (partial) chunk.
         logits = torch.zeros(1, 2500, dtype=torch.float64)
         logits[0, 2499] = 50.0
         ids, prob = argmax_and_softmax_prob(logits, vocab_chunk=1024)
