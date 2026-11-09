@@ -6,25 +6,21 @@ Opt-in with ``SGLANG_GEMMA4_AR_FUSION=1``. Extend batches of
 ``DEFAULT_MIN_TOKENS``) .. ``_MAX_TOKENS`` tokens run every
 TP all-reduce + RMSNorm -> residual add (x layer_scalar) -> RMSNorm -> per-128
 FP8 quant of the dense layer stack as one NVLS kernel each; everything else
-takes the regular path. Needs SM90 with NVLink multicast (CustomAllReduceV2
-with a multicast pull plane), TP > 1 on one node, and block-FP8 weights whose
+takes the regular path. Needs SM90 with NVLink multicast (the TP group's
+symmetric workspace, whose pull semaphores the barriers use), TP > 1 on one node,
+and block-FP8 weights whose
 linear takes pre-quantized ``(fp8, scales)`` input.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, NamedTuple, Optional, Tuple
+from typing import NamedTuple, Optional, Tuple
 
 import torch
 
 from sglang.kernels.jit.utils import cache_once
 from sglang.srt.environ import envs
-
-if TYPE_CHECKING:
-    from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
-        CustomAllReduceV2,
-    )
 
 logger = logging.getLogger(__name__)
 
@@ -42,13 +38,17 @@ def default_min_tokens(world_size: int) -> int:
 
 GROUP = 128
 
+# The fused sites' grid: the SM90 custom all-reduce v2 table's pull width, which
+# they were tuned with.
+_SM90_PULL_BLOCKS = 64
+
 
 def requested() -> bool:
     return bool(envs.SGLANG_GEMMA4_AR_FUSION.get())
 
 
 class _State(NamedTuple):
-    comm: CustomAllReduceV2
+    group: torch.distributed.ProcessGroup  # the TP CPU group
     world_size: int
     rank: int
     group_name: str
@@ -56,9 +56,10 @@ class _State(NamedTuple):
 
 @cache_once
 def _get_state() -> Optional[_State]:
-    """The TP group's CustomAllReduceV2 when it can carry the fused sites."""
-    from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
-        CustomAllReduceV2,
+    """The TP group's symmetric workspace when it can carry the fused sites."""
+    from sglang.srt.distributed.device_communicators.symm_workspace import (
+        WorkspaceRequest,
+        request_group_workspace,
     )
     from sglang.srt.runtime_context import get_parallel
     from sglang.srt.utils.device import get_device_sm
@@ -73,22 +74,23 @@ def _get_state() -> Optional[_State]:
         logger.warning("SGLANG_GEMMA4_AR_FUSION=1 ignored: no tensor parallel")
         return None
     group = get_parallel().tp_group
-    comm = group.ca_comm
-    if (
-        not isinstance(comm, CustomAllReduceV2)
-        or comm.disabled
-        or not comm.has_multicast
-        or not comm.pull_enabled
-    ):
+    # barriers only; any request gets at least one semaphore per SM
+    lease = request_group_workspace(
+        group, WorkspaceRequest(owner="gemma4_ar_fusion", semaphores=1)
+    )
+    if lease is None or not lease.has_multicast:
         logger.warning(
-            "SGLANG_GEMMA4_AR_FUSION=1 ignored: CustomAllReduceV2 with a "
-            "multicast pull plane is unavailable"
+            "SGLANG_GEMMA4_AR_FUSION=1 ignored: a multicast symmetric workspace "
+            "is unavailable"
         )
         return None
     from sglang.kernels.ops.communication import gemma4_ar_fusion as mod
 
-    mod.register_comm(comm.obj)
-    return _State(comm, comm.world_size, comm.rank, group.cpu_group.group_name)
+    mod.register_comm(
+        lambda: lease.get_communicator(pull_blocks=_SM90_PULL_BLOCKS),
+        world_size=lease.world_size,
+    )
+    return _State(lease.group, lease.world_size, lease.rank, group.cpu_group.group_name)
 
 
 class _Symm(NamedTuple):
@@ -145,7 +147,7 @@ class Gemma4ArFusion:
         self.one = torch.ones(1, dtype=torch.float32, device=dev)
         self.used = False
         torch.cuda.synchronize()
-        torch.distributed.barrier(state.comm.group)
+        torch.distributed.barrier(state.group)
         logger.info(
             "gemma4 all-reduce fusion: tp=%d, %d..%d tokens, %.0f MB symmetric memory",
             self.world_size,

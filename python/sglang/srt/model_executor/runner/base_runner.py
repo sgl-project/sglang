@@ -347,8 +347,8 @@ class BaseRunner(ABC):
         init_fi_a2a_workspace(get_parallel().dcp_group)
 
     def _pre_initialize_dcp_push_combine(self):
-        """Allocate the push plane of the DCP push-combine reduce; must run
-        before CG capture (IPC handle exchange across the DCP group)."""
+        """Declare and bind the DCP push-combine reduce's workspace; must run
+        before CG capture (the symmetric allocation is a DCP-group collective)."""
         parallel = get_parallel()
         if (
             not parallel.dcp_enabled

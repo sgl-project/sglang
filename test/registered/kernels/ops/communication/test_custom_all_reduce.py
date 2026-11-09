@@ -220,7 +220,7 @@ def _check_custom_all_reduce(
 ) -> None:
     nccl_group = _init_nccl_group_once()
     device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
-    comm.override_algo = algo
+    comm.forced_algo = algo
 
     if use_graph:
         graph = torch.cuda.CUDAGraph()
@@ -278,7 +278,7 @@ def test_custom_all_reduce_tuned_eager(size: int, dtype: torch.dtype) -> None:
     """Without an override, eager calls launch the tuned algorithm (cached per size)."""
     nccl_group = _init_nccl_group_once()
     comm = _init_comm_once()
-    comm.override_algo = None
+    comm.forced_algo = None
     device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
     inp = torch.randint(0, 16, (TEST_LAYERS, size), dtype=dtype, device=device)
     nbytes = inp[0].numel() * inp.element_size()
@@ -299,7 +299,7 @@ def test_custom_all_reduce_eager_plan_follows_config() -> None:
     """The cached eager launch is rebuilt when the config object is replaced."""
     nccl_group = _init_nccl_group_once()
     comm = _init_comm_once()
-    comm.override_algo = None
+    comm.forced_algo = None
     device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
     inp = torch.randint(0, 16, (TEST_LAYERS, 1024), dtype=torch.bfloat16, device=device)
     assert comm.should_custom_ar(inp[0])  # cached under the tuned config

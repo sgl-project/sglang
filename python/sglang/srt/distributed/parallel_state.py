@@ -3338,17 +3338,29 @@ def close_custom_all_reduce() -> None:
     """
     if not is_hip():
         return
+    from sglang.srt.distributed.device_communicators.symm_workspace import (
+        close_multinode_symm_workspaces,
+        is_multinode_symm_group,
+    )
+
     for name in sorted(_groups):
         group = _groups[name]()
-        if group is None or not getattr(group.ca_comm, "_is_multinode", False):
+        if group is None or not is_multinode_symm_group(group.cpu_group):
             continue
         try:
-            group.ca_comm.close()
+            if group.ca_comm is not None:
+                group.ca_comm.close()
         except Exception as e:
             logger.warning(
                 f"Custom all-reduce close on shutdown failed, {type(e).__name__}: {e}"
             )
         group.ca_comm = None
+    try:
+        close_multinode_symm_workspaces()
+    except Exception as e:
+        logger.warning(
+            f"Symmetric workspace close on shutdown failed, {type(e).__name__}: {e}"
+        )
 
 
 def abort_distributed_environment() -> None:

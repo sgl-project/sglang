@@ -124,29 +124,6 @@ def test_rocm_multinode_uses_fabric_clique(monkeypatch, in_clique):
     probe.assert_called_once_with(group, device)
 
 
-@pytest.mark.parametrize(
-    ("disabled", "has_multicast", "nbytes", "num_blocks", "expected"),
-    [
-        (False, True, 1024, 4, True),
-        (False, True, 1025, 4, False),
-        (False, True, 1024, 4096, True),
-        (False, True, 1024, 0, False),
-        (False, True, 0, 1, False),
-        (False, False, 1024, 4, True),
-        (True, None, 1024, 4, False),
-    ],
-)
-def test_supports_push(disabled, has_multicast, nbytes, num_blocks, expected):
-    """Push is offered within the inclusive slot capacity at any positive grid size."""
-    comm = object.__new__(custom_all_reduce_v2.CustomAllReduceV2)
-    comm.disabled = disabled
-    # A disabled communicator never builds its planes, so these stay unset.
-    if not disabled:
-        comm.has_multicast = has_multicast
-        comm.max_push_size = 1024
-    assert comm.supports_push(nbytes=nbytes, num_blocks=num_blocks) is expected
-
-
 _KB, _MB = 1024, 1024 * 1024
 
 
@@ -218,9 +195,10 @@ def test_pick_config_hier_at_default_cap(nbytes, expected):
         config, 16 * _MB, sizes_own_push=False
     )
     comm = object.__new__(custom_all_reduce_v2.CustomAllReduceV2)
+    comm._eager_plan_cache = {}  # the config setter clears it
     comm.disabled = True
     comm.config = dpx_hier_all_reduce._fit_hier(config, hier_max)
-    assert _choice_name(comm._pick_config(nbytes, False)) == expected
+    assert _choice_name(comm._choose_algo(nbytes, False)) == expected
 
 
 @pytest.mark.parametrize(
@@ -249,6 +227,7 @@ def test_pick_config_hier_2shot_push(nbytes, expected):
         hier_2shot_push=cfg.Range(256 * _KB, 64 * _MB),
     )
     comm = object.__new__(custom_all_reduce_v2.CustomAllReduceV2)
+    comm._eager_plan_cache = {}  # the config setter clears it
     # dispatch does not look at it; close() at teardown does
     comm.disabled = True
     comm.config = cfg.AllReduceConfig(
@@ -259,7 +238,7 @@ def test_pick_config_hier_2shot_push(nbytes, expected):
         num_mc_blocks=None,
     )
     for use_graph in (False, True):
-        assert _choice_name(comm._pick_config(nbytes, use_graph)) == expected
+        assert _choice_name(comm._choose_algo(nbytes, use_graph)) == expected
 
 
 @pytest.mark.parametrize(

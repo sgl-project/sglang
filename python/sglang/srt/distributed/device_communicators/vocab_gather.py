@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
+from functools import cached_property
 from typing import Optional, Tuple
 
 import torch
@@ -73,7 +74,7 @@ def _alloc_symm(
 
 
 class NVLinkVocabGather(VocabGather):
-    """The NVLink collectives on CustomAllReduceV2's multicast plane.
+    """The NVLink collectives on the group's multicast symmetric workspace.
 
     A slice that fits one slot of the push plane takes the push kernel into a
     fresh tensor; a larger one that fits ``pull_out`` takes the pull kernel into
@@ -87,20 +88,19 @@ class NVLinkVocabGather(VocabGather):
     def __init__(
         self,
         *,
-        ca_comm,
+        lease,
         group,
         local_width: int,
         dtype: torch.dtype,
         symm_rows: int,
         fallback: VocabGather,
     ) -> None:
-        self.comm = ca_comm.obj
+        self._lease = lease
         self.world_size = int(group.world_size)
-        self.slot_bytes = int(ca_comm.max_push_size)
         self.fallback = fallback
         self.pull_out: Optional[torch.Tensor] = None
         self.pull_mc_ptr = 0
-        if symm_rows > 0 and self.comm.pull is not None:
+        if symm_rows > 0:
             out, mc_ptr = _alloc_symm(
                 group, (self.world_size * symm_rows, local_width), dtype
             )
@@ -113,6 +113,15 @@ class NVLinkVocabGather(VocabGather):
                 )
             else:
                 logger.warning("NVLink vocab gather: no multicast alias, pull path off")
+
+    # the shared workspace is allocated on first use, not at construction
+    @cached_property
+    def comm(self):
+        return self._lease.get_communicator()
+
+    @property
+    def slot_bytes(self) -> int:
+        return self._lease.request.push_slot_bytes
 
     def __call__(self, local: torch.Tensor) -> torch.Tensor:
         rows = local.shape[0]
@@ -167,19 +176,28 @@ class NVLinkVocabGather(VocabGather):
         )
 
 
-def _nvlink_ca_comm(group, *, local_width: int, dtype: torch.dtype):
-    ca_comm = getattr(group, "ca_comm", None)
-    if ca_comm is None or getattr(ca_comm, "disabled", True):
-        return None
-    comm = getattr(ca_comm, "obj", None)
-    if comm is None or not getattr(ca_comm, "has_multicast", False):
-        return None
-    if comm.push is None or comm.world_size != group.world_size:
-        return None
+def _nvlink_lease(group, *, local_width: int, dtype: torch.dtype, symm_rows: int):
+    from sglang.srt.distributed.device_communicators.symm_workspace import (
+        V2_PUSH_SLOT,
+        WorkspaceRequest,
+        request_group_workspace,
+    )
+
     # the kernels move 16-byte vectors along the row
     if local_width % (128 // torch.finfo(dtype).bits) != 0:
         return None
-    return ca_comm
+    # the pull path needs semaphores; any request gets at least one per SM
+    lease = request_group_workspace(
+        group,
+        WorkspaceRequest(
+            owner="vocab_gather",
+            push_slot_bytes=V2_PUSH_SLOT,
+            semaphores=int(symm_rows > 0),
+        ),
+    )
+    if lease is None or not lease.has_multicast:
+        return None
+    return lease
 
 
 def _default_symm_rows() -> int:
@@ -204,7 +222,7 @@ def make_vocab_gather(
     symm_rows: Optional[int] = None,
 ) -> VocabGather:
     """The gather for ``group``: local for a group of one, NVLink when the
-    group's custom all-reduce has a multicast plane (and ``prefer_nvlink``),
+    group's symmetric workspace has multicast (and ``prefer_nvlink``),
     the NCCL ring otherwise. ``symm_rows`` is the row capacity of the NVLink
     gather's symmetric-memory output for slices past the push slot; None sizes
     it for the server's largest batch, 0 leaves those slices to NCCL."""
@@ -213,14 +231,18 @@ def make_vocab_gather(
     nccl = NcclVocabGather(group)
     if not prefer_nvlink:
         return nccl
-    ca_comm = _nvlink_ca_comm(group, local_width=local_width, dtype=dtype)
-    if ca_comm is None:
+    if symm_rows is None:
+        symm_rows = _default_symm_rows()
+    lease = _nvlink_lease(
+        group, local_width=local_width, dtype=dtype, symm_rows=symm_rows
+    )
+    if lease is None:
         return nccl
     return NVLinkVocabGather(
-        ca_comm=ca_comm,
+        lease=lease,
         group=group,
         local_width=local_width,
         dtype=dtype,
-        symm_rows=_default_symm_rows() if symm_rows is None else symm_rows,
+        symm_rows=symm_rows,
         fallback=nccl,
     )

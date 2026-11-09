@@ -2119,9 +2119,7 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
             )
 
             # Decode and verify batches up to 341 rows at hidden 6144.
-            register_fused_all_reduce_comm(
-                max_push_size=4 * 1024 * 1024, max_push_blocks=512
-            )
+            register_fused_all_reduce_comm(max_push_size=4 * 1024 * 1024)
 
     @torch.no_grad()
     def forward(

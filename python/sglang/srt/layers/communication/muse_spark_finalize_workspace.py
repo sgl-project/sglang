@@ -1,80 +1,114 @@
-"""Borrowed CustomAllReduceV2 push buffers for the fused Muse Spark MoE finalize + all-reduce.
+"""TP symmetric-workspace push slots for the fused Muse Spark MoE finalize + all-reduce.
 
 The kernel is ``FusedPostExpertNormWeightedSumTRTLLM`` in
 ``sglang.kernels.ops.communication.muse_spark_moe_finalize_all_reduce``.
 """
 
+from __future__ import annotations
+
+from functools import cached_property
+from typing import TYPE_CHECKING, Optional
+
 import torch
 import torch.distributed as dist
 
+if TYPE_CHECKING:
+    from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
+        CustomAllReduceV2,
+    )
+    from sglang.srt.distributed.device_communicators.symm_workspace import (
+        WorkspaceLease,
+    )
+
 
 class FinalizePushWorkspace:
-    """Borrow TP push buffers before capture; dependency-ordered launches only."""
+    """Push slots of the TP workspace; dependency-ordered launches only.
+
+    Storage comes from ``lease`` and is resolved on first use, after the workspace
+    is allocated; ``policy`` (the TP custom all-reduce) picks 1-shot vs 2-shot.
+    """
 
     def __init__(
         self,
-        communicator,
-        device_group: dist.ProcessGroup,
+        lease: WorkspaceLease,
+        policy: CustomAllReduceV2,
         hidden_dim=4096,
         *,
         multicast=False,
     ):
-        self.communicator = communicator  # Keep the allocation owner alive.
-        self.group = device_group
-        self.rank = communicator.rank
-        self.world_size = communicator.world_size
-        self.device = communicator.device
+        self.lease = lease
+        self.policy = policy
+        self.rank = lease.rank
+        self.world_size = lease.world_size
+        self.device = lease.device
         self.sm_count = torch.cuda.get_device_properties(
             self.device
         ).multi_processor_count
         self.hidden_dim = hidden_dim
-        self.slot_bytes = communicator.max_push_size
-        self.peers = communicator._push_workspaces
-        self.counter = communicator._push_counter
-        self.multicast = multicast
-        self.multicast_ptr = communicator._push_multicast_ptr
-        config = (
-            self.controller_count,
-            self.slot_bytes,
-            self.sm_count,
-            hidden_dim,
-            multicast,
-        )
+        self.wants_multicast = multicast
+        config = (self.controller_count, self.sm_count, hidden_dim, multicast)
         configs = [None] * self.world_size
-        dist.all_gather_object(configs, config, group=communicator.group)
+        dist.all_gather_object(configs, config, group=lease.group)
         if any(peer != config for peer in configs):
             raise ValueError(
                 "Finalize AR workspace configuration must match across ranks"
             )
-        if multicast and not communicator.has_multicast:
-            raise ValueError(
-                "Finalize multicast requires a multicast-capable push workspace"
-            )
-        if not 0 < self.controller_count <= self.sm_count:
-            raise ValueError("Unsupported finalize AR controller budget")
-        if hidden_dim <= 0 or hidden_dim % 256 or self.slot_bytes < hidden_dim * 2:
-            raise ValueError(
-                "Finalize push requires H divisible by 256 and sufficient buffer capacity"
-            )
-        self.one_shot_max_tokens = min(384, self.slot_bytes // (hidden_dim * 2))
-        # A 2shot_push slot holds a partial half and a reduced half of an M x H / world slice.
-        # 2-shot also needs every rank to own whole 8-column vectors of H.
-        self.two_shot_max_tokens = (
-            self.slot_bytes * self.world_size // (4 * hidden_dim)
-            if hidden_dim % (8 * self.world_size) == 0
-            else 0
-        )
-        self.max_tokens = max(self.one_shot_max_tokens, self.two_shot_max_tokens)
+        if hidden_dim <= 0 or hidden_dim % 256:
+            raise ValueError("Finalize push requires H divisible by 256")
+        if self.slot_bytes < hidden_dim * 2:
+            raise ValueError("Finalize push workspace holds less than one token")
         self.fallback_logged = False
         self.fusion_logged = False
 
+    @property
+    def slot_bytes(self) -> int:
+        """The slot this finalize may fill (its lease's), which bounds the token counts."""
+        return self.lease.request.push_slot_bytes
+
+    @cached_property
+    def _slot_stride_bytes(self) -> int:
+        # the kernel addresses peers' slots by the allocated stride, which may be larger
+        return self.lease.capacity.push_slot_bytes
+
+    @cached_property
+    def peers(self):
+        return self.lease.data.push_slots
+
+    @cached_property
+    def counter(self) -> torch.Tensor:
+        return self.lease.control.epoch
+
+    @cached_property
+    def multicast(self) -> bool:
+        return self.wants_multicast and self.lease.has_multicast
+
+    @cached_property
+    def multicast_ptr(self) -> Optional[int]:
+        return self.lease.data.push_mc
+
+    @cached_property
+    def one_shot_max_tokens(self) -> int:
+        return min(384, self.slot_bytes // (self.hidden_dim * 2))
+
+    @cached_property
+    def two_shot_max_tokens(self) -> int:
+        # A 2shot_push slot holds a partial half and a reduced half of an M x H / world slice.
+        # 2-shot also needs every rank to own whole 8-column vectors of H.
+        if self.hidden_dim % (8 * self.world_size):
+            return 0
+        return self.slot_bytes * self.world_size // (4 * self.hidden_dim)
+
+    @cached_property
+    def max_tokens(self) -> int:
+        return max(self.one_shot_max_tokens, self.two_shot_max_tokens)
+
     def uses_one_shot_push(self, num_tokens: int) -> bool:
-        return self.communicator.uses_one_shot_push(num_tokens * self.hidden_dim * 2)
+        return self.policy.uses_one_shot_push(num_tokens * self.hidden_dim * 2)
 
     def uses_two_shot_push(self, num_tokens: int) -> bool:
         """Fused 2-shot exactly where the standalone AR would pick 2shot_push."""
         return num_tokens <= self.two_shot_max_tokens and (
-            self.communicator.uses_two_shot_push(num_tokens * self.hidden_dim * 2)
+            self.policy.uses_two_shot_push(num_tokens * self.hidden_dim * 2)
         )
 
     def can_fuse(self, tp_group, num_tokens: int) -> bool:
@@ -84,8 +118,8 @@ class FinalizePushWorkspace:
         """
         if (
             torch.compiler.is_compiling()
-            or self.communicator is not tp_group.ca_comm
-            or self.communicator.disabled
+            or self.policy is not tp_group.ca_comm
+            or self.policy.disabled
             or num_tokens <= 0
         ):
             return False
@@ -107,8 +141,9 @@ class FinalizePushWorkspace:
 
     @property
     def controller_count(self) -> int:
-        # The finalize grid width; the phase is one shared word regardless.
-        return self.communicator.config.num_push_blocks
+        # The persistent grid's width: one co-resident CTA per SM. The phase is one
+        # shared word, so the grid is not bound to any counter array.
+        return self.sm_count
 
     def validate(self, output: torch.Tensor, cluster_size: int = 1) -> None:
         if (
@@ -144,7 +179,7 @@ class FinalizePushWorkspace:
             tuple(make_ptr(cutlass.Uint32, p.data_ptr()) for p in self.peers),
             make_ptr(cutlass.Uint32, self.counter.data_ptr()),
             cutlass.Int32(self.rank),
-            cutlass.Int32(self.slot_bytes // 4),
+            cutlass.Int32(self._slot_stride_bytes // 4),
             make_ptr(cutlass.Uint32, self.peers[self.rank].data_ptr()),
             make_ptr(
                 cutlass.Uint32, self.multicast_ptr or self.peers[self.rank].data_ptr()
