@@ -462,6 +462,8 @@ class HiCacheController:
         self.ack_write_queue: List[HiCacheAck] = []
 
         self.l2_transfer_engine = L2TransferEngine(io_backend)
+        if io_backend == "direct_kernel":
+            mem_pool_host.prepare_io_backend(io_backend)
 
         # If a storage backend is provided at startup, treat it as an implicit attach,
         # so init/runtime share the same lifecycle semantics and code paths.
@@ -1158,7 +1160,7 @@ class HiCacheController:
         self, host_indices: torch.Tensor, device_indices: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # move indices to GPU if using kernels, to host if using direct indexing
-        if self.io_backend == "kernel":
+        if self.io_backend in ("kernel", "direct_kernel"):
             if not host_indices.is_cuda:
                 host_indices = async_h2d_tensor(host_indices, device=self.device)
             return host_indices, device_indices

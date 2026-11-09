@@ -28,8 +28,8 @@ _BLOCK_QUOTA = 32 if is_hip_runtime() else 2
 
 
 @cache_once
-def _jit_page_row_module(*, load: bool) -> Module:
-    args = make_cpp_args(load, _VECS_PER_LANE, _BLOCK_SIZE, _BLOCK_QUOTA)
+def _jit_page_row_module(load: bool, block_quota: int) -> Module:
+    args = make_cpp_args(load, _VECS_PER_LANE, _BLOCK_SIZE, block_quota)
     return load_jit(
         "page_row",
         *args,
@@ -38,11 +38,11 @@ def _jit_page_row_module(*, load: bool) -> Module:
     )
 
 
-def warmup_page_row_transfer() -> None:
+def warmup_page_row_transfer(block_quota: int = _BLOCK_QUOTA) -> None:
     """Compile both directions before requests can submit transfers, so compile
     errors surface at pool construction rather than mid-serving."""
-    _jit_page_row_module(load=True)
-    _jit_page_row_module(load=False)
+    _jit_page_row_module(True, block_quota)
+    _jit_page_row_module(False, block_quota)
 
 
 def transfer_page_rows(
@@ -55,6 +55,7 @@ def transfer_page_rows(
     device_stride: int,
     row_bytes: int,
     load: bool,
+    block_quota: int = _BLOCK_QUOTA,
 ) -> None:
     """Copy ``row_bytes`` per (layer, page) on the current stream.
 
@@ -66,7 +67,8 @@ def transfer_page_rows(
     """
     if host_pages.numel() == 0 or host_ptrs.numel() == 0:
         return
-    _jit_page_row_module(load=load).run(
+    # Positional: kwargs make this per-launch cache lookup measurably slower.
+    _jit_page_row_module(load, block_quota).run(
         host_ptrs,
         device_ptrs,
         host_pages,
@@ -79,54 +81,53 @@ def transfer_page_rows(
 
 @triton.jit
 def _validate_pages(
-    HI, DI, HP, DP, VALID, N, HC, DC, HS: tl.constexpr, DS: tl.constexpr
+    HI, DI, HP, DP, OK, N, HC, DC, HS: tl.constexpr, DS: tl.constexpr, PS: tl.constexpr
 ):
     offset = tl.program_id(0) * 1024 + tl.arange(0, 1024)
     mask = offset < N
-    start = offset // 128 * 128
+    start = offset // PS * PS
     h = tl.load(HI + offset * HS, mask, 0).to(tl.int64)
     d = tl.load(DI + offset * DS, mask, 0).to(tl.int64)
     hs = tl.load(HI + start * HS, mask, 0).to(tl.int64)
     ds = tl.load(DI + start * DS, mask, 0).to(tl.int64)
     valid = (
-        (hs % 128 == 0)
-        & (ds % 128 == 0)
-        & (h == hs + offset % 128)
-        & (d == ds + offset % 128)
+        (hs % PS == 0)
+        & (ds % PS == 0)
+        & (h == hs + offset % PS)
+        & (d == ds + offset % PS)
         & (h >= 0)
         & (h < HC)
         & (d >= 0)
         & (d < DC)
     )
-    tl.store(VALID + tl.program_id(0), tl.sum((valid | ~mask).to(tl.int32), 0) == 1024)
-    first = mask & (offset % 128 == 0)
-    tl.store(HP + offset // 128, hs // 128, first)
-    tl.store(DP + offset // 128, ds // 128, first)
+    tl.store(OK + tl.program_id(0), tl.sum((valid | ~mask).to(tl.int32), 0) == 1024)
+    first = mask & (offset % PS == 0)
+    tl.store(HP + offset // PS, hs // PS, first)
+    tl.store(DP + offset // PS, ds // PS, first)
 
 
-def prepare_nvfp4_pages(host_indices, device_indices, host_capacity, device_capacity):
-    """Validate full 128-token pages on one CUDA device, then return their IDs."""
+def prepare_page_ids(
+    host_indices, device_indices, host_capacity, device_capacity, *, page_size
+):
+    """Validate full pages of token slots on one CUDA device, then return their IDs."""
     if (
         host_indices.ndim != 1
         or device_indices.ndim != 1
         or host_indices.numel() != device_indices.numel()
-        or host_indices.numel() % 128
+        or host_indices.numel() % page_size
     ):
-        raise ValueError(
-            "MiniMax NVFP4 HiCache transfers require equal, full-page index lists."
-        )
+        raise ValueError("Page-row transfers require equal, full-page index lists.")
     if any(
         x.dtype not in (torch.int32, torch.int64)
         for x in (host_indices, device_indices)
     ):
-        raise ValueError("MiniMax NVFP4 HiCache requires integer indices.")
+        raise ValueError("Page-row transfers require integer indices.")
     if not host_indices.is_cuda or host_indices.device != device_indices.device:
-        raise ValueError("NVFP4 page preparation requires same-device CUDA indices.")
+        raise ValueError("Page-id preparation requires same-device CUDA indices.")
     count = host_indices.numel()
-    h = torch.empty(count // 128, device=host_indices.device, dtype=host_indices.dtype)
-    d = torch.empty(
-        count // 128, device=device_indices.device, dtype=device_indices.dtype
-    )
+    pages = count // page_size
+    h = torch.empty(pages, device=host_indices.device, dtype=host_indices.dtype)
+    d = torch.empty(pages, device=device_indices.device, dtype=device_indices.dtype)
     if count:
         flags = torch.empty(
             triton.cdiv(count, 1024), device=host_indices.device, dtype=torch.bool
@@ -142,10 +143,11 @@ def prepare_nvfp4_pages(host_indices, device_indices, host_capacity, device_capa
             device_capacity,
             host_indices.stride(0),
             device_indices.stride(0),
+            page_size,
             num_warps=4,
         )
         torch._assert_async(
             flags.all(),
-            "MiniMax NVFP4 HiCache requires aligned, ordered, in-range full pages.",
+            "Page-row transfers require aligned, ordered, in-range full pages.",
         )
     return h, d
