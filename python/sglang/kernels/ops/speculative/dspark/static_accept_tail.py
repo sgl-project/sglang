@@ -2,13 +2,13 @@
 (SGLANG_DSPARK_FUSED_ACCEPT_TAIL), one program per request row.
 
 Per row, from the target's argmax ids: the leading draft matches and the bonus
-(AcceptGreedy; ``bonus_in`` replaces the bonus, ``bonus_parts`` replaces it with the
-in-graph simulated bonus's per-split maxima reduced here),
+(AcceptGreedy; ``bonus_parts`` replaces the bonus with the in-graph simulated
+bonus's per-split maxima reduced here),
 the simulated correct length override (build_accept_outs), commit / new seq lens and
 a zero cap trim (FinalizeAcceptLens), the output tokens (BuildOutTokens), and the
 gated commit lengths the static epilogue's draft-KV commit reads. Every output equals
-the separate ops' bit for bit. With a simulated length and a supplied bonus the argmax ids
-are not read (``target_predict`` may be None).
+the separate ops' bit for bit. With a simulated length and ``bonus_parts`` the argmax
+ids are not read.
 """
 
 from __future__ import annotations
@@ -33,7 +33,6 @@ def _static_accept_tail_kernel(
     verify_lens_ptr,
     gate_ptr,
     sim_ptr,
-    bonus_in_ptr,
     part_val_ptr,
     part_idx_ptr,
     correct_out_ptr,
@@ -50,7 +49,6 @@ def _static_accept_tail_kernel(
     BLOCK_T: tl.constexpr,
     NSPLIT: tl.constexpr,
     HAS_SIM: tl.constexpr,
-    HAS_BONUS_IN: tl.constexpr,
     HAS_PARTS: tl.constexpr,
     NEED_TARGET: tl.constexpr,
     HAS_GATED: tl.constexpr,
@@ -67,6 +65,10 @@ def _static_accept_tail_kernel(
         targets = tl.load(target_ptr + row * T + offs, mask=in_draft, other=-2)
         eq = (drafts == targets) & in_draft
         num_correct = tl.min(tl.where(eq, BLOCK_T, offs), 0)
+    if HAS_SIM:
+        correct = tl.load(sim_ptr).to(tl.int32)
+    else:
+        correct = num_correct.to(tl.int32)
     if HAS_PARTS:
         # _simulated_bonus_row_select_kernel's reduction.
         s = tl.arange(0, NSPLIT)
@@ -74,14 +76,8 @@ def _static_accept_tail_kernel(
         idx = tl.load(part_idx_ptr + row * NSPLIT + s)
         top = tl.max(val, axis=0)
         bonus = tl.min(tl.where(val == top, idx, vocab), axis=0).to(tl.int64)
-    elif HAS_BONUS_IN:
-        bonus = tl.load(bonus_in_ptr + row).to(tl.int64)
     else:
-        bonus = tl.load(target_ptr + row * T + num_correct).to(tl.int64)
-    if HAS_SIM:
-        correct = tl.load(sim_ptr).to(tl.int32)
-    else:
-        correct = num_correct.to(tl.int32)
+        bonus = tl.load(target_ptr + row * T + correct).to(tl.int64)
     commit = correct + 1
     new_seq = tl.load(seq_lens_ptr + row) + commit
     tl.store(correct_out_ptr + row, correct)
@@ -101,7 +97,7 @@ def _static_accept_tail_kernel(
 def static_accept_tail(
     *,
     candidates: torch.Tensor,
-    target_predict: Optional[torch.Tensor],
+    target_predict: torch.Tensor,
     seq_lens: torch.Tensor,
     verify_lens: torch.Tensor,
     gate: torch.Tensor,
@@ -112,17 +108,11 @@ def static_accept_tail(
     new_seq_lens_out: torch.Tensor,
     out_tokens_out: torch.Tensor,
     simulated_correct_len: Optional[torch.Tensor] = None,
-    bonus_in: Optional[torch.Tensor] = None,
     bonus_parts: Optional[tuple[torch.Tensor, torch.Tensor, int]] = None,
     gated_commit_lens_out: Optional[torch.Tensor] = None,
 ) -> None:
     """``candidates`` [bs, T] (anchor + drafts), ``target_predict`` [bs * T] argmax ids,
     ``bonus_parts`` (part_val [bs, NSPLIT], part_idx, vocab); outputs go to rows [:bs]."""
-    assert bonus_in is None or bonus_parts is None
-    assert target_predict is not None or (
-        simulated_correct_len is not None
-        and (bonus_in is not None or bonus_parts is not None)
-    )
     fn = (
         _static_accept_tail_triton
         if inputs_on_cuda(candidates)
@@ -141,7 +131,6 @@ def static_accept_tail(
         new_seq_lens_out=new_seq_lens_out,
         out_tokens_out=out_tokens_out,
         simulated_correct_len=simulated_correct_len,
-        bonus_in=bonus_in,
         bonus_parts=bonus_parts,
         gated_commit_lens_out=gated_commit_lens_out,
     )
@@ -152,21 +141,18 @@ def _static_accept_tail_triton(**kw) -> None:
     bs, T = candidates.shape
     assert candidates.stride(1) == 1 and kw["out_tokens_out"].stride(1) == 1
     dummy = kw["seq_lens"]
-    sim, bonus_in, parts, gated = (
+    sim, parts, gated = (
         kw["simulated_correct_len"],
-        kw["bonus_in"],
         kw["bonus_parts"],
         kw["gated_commit_lens_out"],
     )
-    target = kw["target_predict"]
     _static_accept_tail_kernel[(bs,)](
         candidates,
-        target if target is not None else dummy,
+        kw["target_predict"],
         kw["seq_lens"],
         kw["verify_lens"],
         kw["gate"],
         sim if sim is not None else dummy,
-        bonus_in if bonus_in is not None else dummy,
         parts[0] if parts is not None else dummy,
         parts[1] if parts is not None else dummy,
         kw["correct_len_out"],
@@ -183,10 +169,9 @@ def _static_accept_tail_triton(**kw) -> None:
         BLOCK_T=triton.next_power_of_2(T),
         NSPLIT=parts[0].shape[1] if parts is not None else 1,
         HAS_SIM=sim is not None,
-        HAS_BONUS_IN=bonus_in is not None,
         HAS_PARTS=parts is not None,
         # The argmax ids only decide a length or bonus nothing else supplies.
-        NEED_TARGET=sim is None or (bonus_in is None and parts is None),
+        NEED_TARGET=sim is None or parts is None,
         HAS_GATED=gated is not None,
         num_warps=4,
     )
@@ -195,7 +180,7 @@ def _static_accept_tail_triton(**kw) -> None:
 def static_accept_tail_torch(
     *,
     candidates: torch.Tensor,
-    target_predict: Optional[torch.Tensor],
+    target_predict: torch.Tensor,
     seq_lens: torch.Tensor,
     verify_lens: torch.Tensor,
     gate: torch.Tensor,
@@ -206,31 +191,27 @@ def static_accept_tail_torch(
     new_seq_lens_out: torch.Tensor,
     out_tokens_out: torch.Tensor,
     simulated_correct_len: Optional[torch.Tensor] = None,
-    bonus_in: Optional[torch.Tensor] = None,
     bonus_parts: Optional[tuple[torch.Tensor, torch.Tensor, int]] = None,
     gated_commit_lens_out: Optional[torch.Tensor] = None,
 ) -> None:
     """Reference: the same outputs from per-row torch ops (CPU or GPU)."""
     bs, T = candidates.shape
     gamma = T - 1
-    if target_predict is not None:
-        target = target_predict.view(bs, T)
-        matches = (candidates[:, 1:] == target[:, :gamma]).to(torch.int32)
-        num_correct = matches.cumprod(dim=1).sum(dim=1).to(torch.int32)
+    target = target_predict.view(bs, T)
+    matches = (candidates[:, 1:] == target[:, :gamma]).to(torch.int32)
+    num_correct = matches.cumprod(dim=1).sum(dim=1).to(torch.int32)
     rows = torch.arange(bs, device=candidates.device)
+    if simulated_correct_len is not None:
+        correct = simulated_correct_len.repeat(bs).to(torch.int32)
+    else:
+        correct = num_correct
     if bonus_parts is not None:
         part_val, part_idx, vocab = bonus_parts
         bonus = simulated_bonus_select_partials(
             part_val=part_val[:bs], part_idx=part_idx[:bs], vocab=vocab
         )
-    elif bonus_in is not None:
-        bonus = bonus_in[:bs].to(torch.int64)
     else:
-        bonus = target[rows, num_correct.long()].to(torch.int64)
-    if simulated_correct_len is not None:
-        correct = simulated_correct_len.repeat(bs).to(torch.int32)
-    else:
-        correct = num_correct
+        bonus = target[rows, correct.long()].to(torch.int64)
     commit = correct + 1
     new_seq = seq_lens[:bs] + commit.to(seq_lens.dtype)
     correct_len_out[:bs].copy_(correct)
