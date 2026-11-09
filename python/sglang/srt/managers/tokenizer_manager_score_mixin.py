@@ -51,6 +51,7 @@ class TokenizerManagerScoreMixin:
         temperature: float = 1.0,
         return_token_logprobs: bool = False,
         image_data: Optional[List[List[ImageData]]] = None,
+        rid: Optional[str] = None,
     ) -> ScoreResult:
         """
         Score probabilities of specified token IDs after each *full prompt*.
@@ -72,6 +73,7 @@ class TokenizerManagerScoreMixin:
                 temperature=temperature,
                 return_token_logprobs=return_token_logprobs,
                 image_data=image_data,
+                rid=rid,
             )
 
         # Tokenized prompts
@@ -86,6 +88,7 @@ class TokenizerManagerScoreMixin:
                 temperature=temperature,
                 return_token_logprobs=return_token_logprobs,
                 image_data=image_data,
+                rid=rid,
             )
 
         raise ValueError("Invalid prompts type for score_prompts.")
@@ -908,6 +911,7 @@ class TokenizerManagerScoreMixin:
         temperature: float = 1.0,
         return_token_logprobs: bool = False,
         image_data: Optional[List[List[ImageData]]] = None,
+        rid: Optional[str] = None,
     ) -> ScoreResult:
         """
         Score the probability of specified token IDs appearing after the given (query + item) pair.
@@ -1178,6 +1182,25 @@ class TokenizerManagerScoreMixin:
 
         # Create the appropriate request type
         mis_delimiter_indices = [delimiter_indices] if use_multi_item_scoring else None
+        # A caller-supplied rid reaches the internal request so a proxy can
+        # abort it with /abort_request (rid-prefix match). GenerateReqInput
+        # expands a scalar rid itself ("{rid}_{i}"); EmbeddingReqInput only
+        # accepts per-request rid lists, so expand it the same way here.
+        request_rids = None
+        if rid is not None:
+            if is_generation:
+                request_rids = rid
+            else:
+                num_requests = (
+                    1
+                    if use_multi_item_scoring
+                    else (
+                        len(text_prompts)
+                        if text_prompts is not None
+                        else len(input_ids)
+                    )
+                )
+                request_rids = [f"{rid}_{i}" for i in range(num_requests)]
         if is_generation:
             # packed MIS requests gather the union, then select per item
             request_labels = (
@@ -1205,6 +1228,7 @@ class TokenizerManagerScoreMixin:
                 positional_embed_overrides=positional_embed_overrides,
                 multi_item_delimiter_indices=mis_delimiter_indices,
                 token_indices_to_pool=token_indices_to_pool,
+                rid=request_rids,
             )
         else:
             batch_request = EmbeddingReqInput(
@@ -1214,6 +1238,7 @@ class TokenizerManagerScoreMixin:
                 return_pooled_hidden_states=return_pooled_hidden_states,
                 multi_item_delimiter_indices=mis_delimiter_indices,
                 token_indices_to_pool=token_indices_to_pool,
+                rid=request_rids,
             )
 
         results = await self.generate_request(batch_request, request).__anext__()
