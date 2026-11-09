@@ -45,15 +45,15 @@ class TestGDNMISMetadata(CustomTestCase):
                     self._batch(), cache_indices=slots
                 ).batch_tensors
                 for tensors, query, items in (
-                    (first, [1], [1, 1, 1, 3, 3, 3]),
-                    (second, [3], [3, 3, 3, 1, 1, 1]),
+                    (first, [1], [1, 1, 3, 3]),
+                    (second, [3], [3, 3, 1, 1]),
                 ):
                     self.assertEqual(tensors.query_cache_indices.tolist(), query)
                     self.assertEqual(tensors.item_ssm_indices.tolist(), items)
-                    self.assertEqual(tensors.item_conv_indices.tolist(), list(range(6)))
+                    self.assertEqual(tensors.item_conv_indices.tolist(), list(range(4)))
                     self.assertEqual(tensors.query_has_initial_states.tolist(), [False])
                     self.assertEqual(
-                        tensors.item_has_initial_states.tolist(), [True] * 6
+                        tensors.item_has_initial_states.tolist(), [True] * 4
                     )
                     self.assertEqual(tensors.item_ssm_indices.dtype, dtype)
                 self.assertNotEqual(
@@ -102,6 +102,10 @@ class TestGDNMISMetadata(CustomTestCase):
 
             conv = torch.full((5, 12, 3), 5.0)
             ssm = torch.full((5, 2, 4, 4), 5.0)
+            expected_output = torch.zeros(1, 23, 2, 4)
+            expected_output[
+                :, [0, 1, 2, 4, 6, 7, 8, 9, 10, 12, 14, 15, 16, 17, 18]
+            ] = 7
             with (
                 patch.object(backend, "_forward_mis_segments", side_effect=segments),
                 patch.object(
@@ -122,8 +126,7 @@ class TestGDNMISMetadata(CustomTestCase):
                         ssm_states=ssm,
                         cache_indices=slots,
                     )
-                    self.assertTrue(bool((output[:, :20] == 7).all()))
-                    self.assertTrue(bool((output[:, 20:] == 0).all()))
+                    torch.testing.assert_close(output, expected_output, rtol=0, atol=0)
                     self.assertTrue(bool((conv[slots] == 0).all()))
                     self.assertTrue(bool((ssm[slots] == 0).all()))
                     self.assertTrue(bool((conv[[0, 2, 4]] == 5).all()))
