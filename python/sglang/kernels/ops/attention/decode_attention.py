@@ -1359,7 +1359,19 @@ def _lean_lds_limit() -> int:
             ).shared_memory_per_block
         )
     except Exception:
-        return 64 * 1024
+        pass
+    # ROCm torch builds do not expose ``shared_memory_per_block``. Triton reads the
+    # same limit from the HIP runtime, so ask it before falling back to the 64 KiB
+    # floor, which would undersize the tile on parts with more LDS than that.
+    try:
+        limit = triton.runtime.driver.active.utils.get_device_properties(
+            torch.cuda.current_device()
+        ).get("max_shared_mem")
+        if limit:
+            return int(limit)
+    except Exception:
+        pass
+    return 64 * 1024
 
 
 def _lean_decode_block_n(Lk: int) -> int:

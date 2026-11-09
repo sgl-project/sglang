@@ -35,8 +35,10 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 # Shared memory per workgroup, in bytes, of the parts this budget has to cover.
-GFS1151_LDS = 64 * 1024  # gfx1151 / RDNA3.5: 66560 B tile does not fit
-MI300X_LDS = 160 * 1024  # CDNA3: holds the largest tile with room to spare
+GFX1151_LDS = 64 * 1024  # gfx1151 / RDNA3.5, also gfx942 / CDNA3
+# A budget large enough to hold the biggest tile with room to spare (gfx950 / CDNA4
+# is 160 KiB). Injected as a fixture rather than tied to one part.
+LARGE_LDS = 160 * 1024
 
 _STANDARD_HEAD_DIM = 128
 _MLA_HEAD_DIMS = (288, 576)
@@ -58,23 +60,30 @@ class TestLeanDecodeBlockN(unittest.TestCase):
 
     def test_head_dim_128_fits_a_64_kib_device(self):
         # 128 would ask for 65536 B; the slack leaves 64512, so the tile halves.
-        self.assertEqual(self._block_n(GFS1151_LDS, _STANDARD_HEAD_DIM), 64)
+        # Covers gfx1151 (RDNA3.5) and gfx942 / MI300X (CDNA3), both 64 KiB.
+        self.assertEqual(self._block_n(GFX1151_LDS, _STANDARD_HEAD_DIM), 64)
 
     def test_head_dim_128_keeps_the_large_tile_when_it_fits(self):
-        self.assertEqual(self._block_n(MI300X_LDS, _STANDARD_HEAD_DIM), 128)
+        self.assertEqual(self._block_n(LARGE_LDS, _STANDARD_HEAD_DIM), 128)
+
+    def test_lds_limit_falls_back_without_raising(self):
+        # No GPU attribute is required for the check to return a usable budget.
+        limit = da._lean_lds_limit()
+        self.assertIsInstance(limit, int)
+        self.assertGreater(limit, 0)
 
     def test_mla_head_dims_keep_their_small_tile(self):
         for head_dim in _MLA_HEAD_DIMS:
-            for lds in (GFS1151_LDS, MI300X_LDS):
+            for lds in (GFX1151_LDS, LARGE_LDS):
                 self.assertEqual(self._block_n(lds, head_dim), 16)
 
     def test_cuda_is_unchanged(self):
         self.assertEqual(
-            self._block_n(GFS1151_LDS, _STANDARD_HEAD_DIM, is_hip=False), 64
+            self._block_n(GFX1151_LDS, _STANDARD_HEAD_DIM, is_hip=False), 64
         )
 
     def test_every_choice_fits_the_budget(self):
-        for lds in (48 * 1024, GFS1151_LDS, 96 * 1024, MI300X_LDS):
+        for lds in (48 * 1024, GFX1151_LDS, 96 * 1024, LARGE_LDS):
             for head_dim in (64, 128, 192, 256):
                 block_n = self._block_n(lds, head_dim)
                 self.assertIn(block_n, (16, 32, 64, 128))
