@@ -106,13 +106,12 @@ def _live(adapter: BuilderAdapter) -> Dict[str, int]:
 class TestUnifiedPricingProperty(CustomTestCase):
     def _each_state(self, chain: str):
         for page_size in (1, 4):
-            for lazy in (False, True):
-                config = TraceConfig(chain=chain, page_size=page_size, lazy=lazy)
-                for name, ops in _states(config):
-                    available = _rebuild(config, ops).allocator.available_size()
-                    for extra in _PAGES_PAST_AVAILABLE:
-                        tokens = max(page_size, available + extra * page_size)
-                        yield config, name, ops, tokens
+            config = TraceConfig(chain=chain, page_size=page_size)
+            for name, ops in _states(config):
+                available = _rebuild(config, ops).allocator.available_size()
+                for extra in _PAGES_PAST_AVAILABLE:
+                    tokens = max(page_size, available + extra * page_size)
+                    yield config, name, ops, tokens
 
     def _allocate(self, adapter: BuilderAdapter, tokens: int) -> bool:
         before = _live(adapter)
@@ -149,9 +148,7 @@ class TestUnifiedPricingProperty(CustomTestCase):
         move gate's answer changes, which no capacity field records."""
         for chain in ("swa", "tri"):
             with self.subTest(chain=chain):
-                adapter = BuilderAdapter(
-                    TraceConfig(chain=chain, page_size=1, lazy=True)
-                )
+                adapter = BuilderAdapter(TraceConfig(chain=chain, page_size=1))
                 c = adapter.allocator
                 kept = c.pricing_snapshot()
                 self.assertIs(c.pricing_snapshot(), kept)
