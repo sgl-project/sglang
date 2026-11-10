@@ -86,14 +86,16 @@ class TestGLM52BF16SamplingMask(CustomTestCase):
         self.assertEqual(response.status_code, 200, response.text)
         return response.json()
 
-    def _check_output(self, body, mode, *, greedy=False):
+    def _check_output(self, body, mode, *, greedy=False, filters=None):
         meta = body["meta_info"]
         self.assertEqual(len(body["output_ids"]), 4)
-        for token, mask, actual in zip(
-            body["output_ids"],
-            meta["output_token_sampling_mask"],
-            meta["output_token_sampling_logprobs"],
-            strict=True,
+        for step, (token, mask, actual) in enumerate(
+            zip(
+                body["output_ids"],
+                meta["output_token_sampling_mask"],
+                meta["output_token_sampling_logprobs"],
+                strict=True,
+            )
         ):
             self.assertIn(token, mask)
             self.assertEqual(len(mask), len(set(mask)))
@@ -110,6 +112,34 @@ class TestGLM52BF16SamplingMask(CustomTestCase):
             if greedy:
                 self.assertEqual(mask, [token])
                 self.assertEqual(values, [0.0])
+            if filters is not None:
+                k, p = filters
+                ranked = sorted(
+                    meta["output_top_logprobs"][step],
+                    key=lambda item: item[0],
+                    reverse=True,
+                )
+                # Establish a complete, unambiguous top-k cutoff in the prefix.
+                self.assertGreater(len(ranked), k)
+                self.assertGreater(ranked[k - 1][0] - ranked[k][0], 1e-4)
+                expected = {}
+                mass = 0.0
+                for logprob, token_id, _ in ranked[:k]:
+                    if p < 1.0 and mass > p:
+                        break
+                    weight = math.exp(logprob)
+                    expected[int(token_id)] = weight
+                    mass += weight
+                self.assertEqual(set(mask), set(expected))
+                pairs = (
+                    zip(mask, actual, strict=True)
+                    if mode == "support"
+                    else [(token, actual)]
+                )
+                for token_id, value in pairs:
+                    self.assertAlmostEqual(
+                        value, math.log(expected[token_id] / mass), delta=1e-3
+                    )
 
     def test_single_request_sampling_masks(self):
         response = requests.get(self.base_url + "/server_info", timeout=30)
@@ -131,19 +161,32 @@ class TestGLM52BF16SamplingMask(CustomTestCase):
             ("topk", 10, 1.0),
             ("topp", 10, 0.8),
             ("fallback", 1025, 1.0),
+            ("fallback_topp", 1025, 0.8),
         ]
         for mode in ("support", "selected"):
             for name, k, p in cases:
                 with self.subTest(mode=mode, case=name):
+                    params = {
+                        "temperature": 0.0 if name == "greedy" else 1.0,
+                        "top_k": k,
+                        "top_p": p,
+                    }
+                    exact = name != "greedy"
+                    if exact:
+                        # Separate cutoff values after logprob rounding.
+                        spacing, count = (0.7, 16) if k <= 1024 else (0.005, 1100)
+                        params["logit_bias"] = {
+                            str(t): 40.0 - spacing * t for t in range(count)
+                        }
                     body = self._generate(
-                        {
-                            "temperature": 0.0 if name == "greedy" else 1.0,
-                            "top_k": k,
-                            "top_p": p,
-                        },
-                        mode,
+                        params, mode, return_logprob=True, top_logprobs_num=2048
                     )
-                    self._check_output(body, mode, greedy=name == "greedy")
+                    self._check_output(
+                        body,
+                        mode,
+                        greedy=name == "greedy",
+                        filters=(k, p) if exact else None,
+                    )
 
     def test_mixed_batch_modes(self):
         """Check mode, opt-in and request/token association independently."""
