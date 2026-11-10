@@ -36,6 +36,7 @@ from sglang.test.test_utils import (
 )
 
 DEFAULT_TIMEOUT = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
+NPU_RL_ENV = {"ASCEND_USE_FIA": "1"}
 
 
 # ---------------------------------------------------------------------------

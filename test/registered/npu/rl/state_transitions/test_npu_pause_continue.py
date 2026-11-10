@@ -13,6 +13,7 @@ import requests
 
 from sglang.test.ascend.test_ascend_utils import QWEN3_0_6B_WEIGHTS_PATH
 from sglang.test.ascend.test_npu_rl_utils import (
+    NPU_RL_ENV,
     begin_weight_update,
     checkpoint_tensor_index,
     continue_generation,
@@ -61,7 +62,7 @@ NORM_WEIGHT = "model.norm.weight"
 class TestNpuPauseContinue(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls._server = npu_server(MODEL, extra_args=SERVER_ARGS)
+        cls._server = npu_server(MODEL, extra_args=SERVER_ARGS, env=NPU_RL_ENV)
         cls.base_url = cls._server.__enter__()
         cls.baseline = generation_signature(cls.base_url, PROMPTS, max_new_tokens=16)
         cls.tensor_index = checkpoint_tensor_index(MODEL)
@@ -254,7 +255,7 @@ class TestNpuPauseContinueQueued(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls._server = npu_server(MODEL, extra_args=QUEUE_ARGS)
+        cls._server = npu_server(MODEL, extra_args=QUEUE_ARGS, env=NPU_RL_ENV)
         cls.base_url = cls._server.__enter__()
         cls.baseline = generation_signature(cls.base_url, PROMPTS, max_new_tokens=16)
 

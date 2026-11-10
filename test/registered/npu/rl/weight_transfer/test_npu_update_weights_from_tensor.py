@@ -13,6 +13,7 @@ import torch
 
 from sglang.test.ascend.test_ascend_utils import QWEN3_0_6B_WEIGHTS_PATH
 from sglang.test.ascend.test_npu_rl_utils import (
+    NPU_RL_ENV,
     begin_weight_update,
     checkpoint_tensor_index,
     end_weight_update,
@@ -60,12 +61,12 @@ TARGET_WEIGHT = "model.layers.0.mlp.down_proj.weight"
 class TestNpuUpdateWeightsFromTensor(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        with npu_server(MODEL, extra_args=BASE_ARGS) as base_url:
+        with npu_server(MODEL, extra_args=BASE_ARGS, env=NPU_RL_ENV) as base_url:
             cls.reference = generation_signature(base_url, PROMPTS)
         cls.tensor_index = checkpoint_tensor_index(MODEL)
         # Keep one lane server for the whole class: creating NPU tensors in the
         # test process and then launching another server resets the device.
-        cls._lane_ctx = npu_server(MODEL, extra_args=LANE_ARGS)
+        cls._lane_ctx = npu_server(MODEL, extra_args=LANE_ARGS, env=NPU_RL_ENV)
         cls.lane_url = cls._lane_ctx.__enter__()
 
     @classmethod
