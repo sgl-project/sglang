@@ -6,6 +6,7 @@ reference, then the reference VAE posterior samples; nothing touches the
 process-global RNG.
 """
 
+import pytest
 import torch
 from PIL import Image
 
@@ -108,6 +109,10 @@ def _denoise(req, server, monkeypatch):
     return captured["keyframe_cond_rows"]
 
 
+@pytest.mark.skipif(
+    torch.cuda.is_available(),
+    reason="CPU-only weight-free test; it mixes CPU and CUDA tensors on GPU hosts",
+)
 def test_draws_target_then_anchors_then_posteriors(server, monkeypatch):
     req = make_req(server, "edit")
     before = torch.random.get_rng_state().clone()
@@ -145,6 +150,10 @@ def test_noise_is_a_function_of_the_seed(server, monkeypatch):
     assert not torch.equal(anchors, other_anchors)
 
 
+@pytest.mark.skipif(
+    torch.cuda.is_available(),
+    reason="CPU-only weight-free test; it mixes CPU and CUDA tensors on GPU hosts",
+)
 def test_ranks_without_the_encode_draw_get_the_same_noise(server, monkeypatch):
     # Rank 0 draws in visual encoding; a receiving rank (or dedup sibling) only
     # sees the published rows and draws in latent preparation.

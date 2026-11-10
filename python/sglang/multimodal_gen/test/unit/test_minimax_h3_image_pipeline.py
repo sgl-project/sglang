@@ -136,6 +136,10 @@ class RecordingVAE:
         return torch.full((1, 3, x.shape[-2] * 16, x.shape[-1] * 16), 0.25)
 
 
+@pytest.mark.skipif(
+    torch.cuda.is_available(),
+    reason="CPU-only weight-free test; it mixes CPU and CUDA tensors on GPU hosts",
+)
 @pytest.mark.parametrize("task", ["t2i", "edit"])
 def test_real_denoise_loop_from_stage_state_to_rgb(server, task):
     req = make_req(server, task)
@@ -180,6 +184,10 @@ class PatternVAE:
         return _pattern(x.shape[-2], x.shape[-1])
 
 
+@pytest.mark.skipif(
+    torch.cuda.is_available(),
+    reason="CPU-only weight-free test; it mixes CPU and CUDA tensors on GPU hosts",
+)
 def test_min_generation_area_generates_the_canvas_and_delivers_the_request(server):
     # 40x20 is below the 2048-pixel area: generated as 64x32, delivered as 40x20.
     req = prepare_request(

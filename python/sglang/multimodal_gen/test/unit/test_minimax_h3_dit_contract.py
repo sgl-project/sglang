@@ -984,3 +984,91 @@ def test_compiled_attention_runs_its_fused_section_eager(compiling):
 
 def test_eager_attention_section_is_hidden_from_dynamo():
     assert MiniMaxH3Attention._attend_eager._torchdynamo_disable
+
+
+@pytest.mark.parametrize("name", ["video_out", "audio_out"])
+def test_pdd_graph_replay_uses_live_step_and_input(name):
+    """Replaying a graph must select the current PDD head, not the captured one."""
+    from sglang.multimodal_gen.runtime.breakable_cuda_graph.runner import (
+        BaseBreakableCudaGraphRunner,
+    )
+    from sglang.multimodal_gen.runtime.managers.forward_context import (
+        set_forward_context,
+    )
+    from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
+        MiniMaxH3FinalLayer,
+    )
+
+    class Projection(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            scales = torch.arange(1, 4, device="cuda", dtype=torch.float32)
+            self.register_buffer("weight", scales[:, None, None].expand(3, 2, 4))
+            self.register_buffer("bias", scales[:, None].expand(3, 2))
+            self._pdd_heads = {f"{name}.weight": self.weight, f"{name}.bias": self.bias}
+            self._pdd_device_heads = {}
+
+        def forward(self, h):
+            return MiniMaxH3FinalLayer._pdd_project(self, h, name)
+
+    runner = BaseBreakableCudaGraphRunner(Projection().eval(), torch.device("cuda"))
+    try:
+        with torch.inference_mode(), set_forward_context(0, None):
+            assert runner.capture(h=torch.ones(2, 4, device="cuda"))
+        for step, value in ((1, 2.0), (2, 3.0), (0, 4.0)):
+            with torch.inference_mode(), set_forward_context(step, None):
+                actual = runner(h=torch.full((2, 4), value, device="cuda"))
+            expected = torch.full_like(actual, (4 * value + 1) * (step + 1))
+            assert torch.equal(actual, expected)
+    finally:
+        runner.reset()
+
+
+@pytest.mark.parametrize("num_timesteps", [1, 2])
+def test_adaln_graph_replay_uses_live_plan_slot(num_timesteps):
+    """A device plan index must capture without a host sync and stay live on replay."""
+    from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
+        MiniMaxH3DiTArchConfig,
+    )
+    from sglang.multimodal_gen.runtime.breakable_cuda_graph.runner import (
+        BaseBreakableCudaGraphRunner,
+    )
+    from sglang.multimodal_gen.runtime.models.dits.minimax_h3_adaln_cache import (
+        MiniMaxH3AdalnCache,
+    )
+
+    class Plans(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.cache = MiniMaxH3AdalnCache(
+                MiniMaxH3DiTArchConfig(num_layers=2, hidden_size=4, time_embed_dim=3),
+                weight_files=["unused"],
+                max_plans=3,
+                max_plan_width=2,
+            )
+            self.cache.load(torch.device("cuda"))
+            for slab in (self.cache.block_params, self.cache.final_params):
+                slab.copy_(
+                    torch.arange(slab.numel(), device="cuda").reshape(slab.shape)
+                )
+
+        def forward(self, slot):
+            blocks = self.cache.block_all(
+                cache_plan_index=slot, num_timesteps=num_timesteps
+            )
+            final = self.cache.final(slot, num_timesteps)
+            return tuple(param for layer in blocks for param in layer) + final
+
+    model = Plans().eval()
+    runner = BaseBreakableCudaGraphRunner(model, torch.device("cuda"))
+    try:
+        with torch.inference_mode():
+            assert runner.capture(slot=torch.tensor(0, device="cuda"))
+            for slot in (1, 2, 0):
+                expected = model(slot=torch.tensor(slot, device="cuda"))
+                actual = runner(slot=torch.tensor(slot, device="cuda"))
+                assert all(
+                    torch.equal(got, want) for got, want in zip(actual, expected)
+                )
+    finally:
+        runner.reset()
