@@ -932,7 +932,7 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         self.assertEqual(kv.prepare_locations(torch.tensor([2, 3])), [2])
         self.assertEqual(mamba.prepare_locations(torch.tensor([3])), [3])
         self.assertEqual(group.sources[PoolName.DRAFT], PoolName.KV)
-        self.assertEqual(group.entry_map[PoolName.DRAFT].layer_mapping, {0: (0, 1)})
+        self.assertEqual(group.entry_map[PoolName.DRAFT].layer_mapping, {3: (0, 1)})
 
         with self.assertRaisesRegex(ValueError, "plain MLA"):
             resolve(dcp_size=2)
@@ -1001,7 +1001,7 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
             self.assertEqual(sizes, [[row_bytes]] * 2)
             self.assertEqual(offsets, [[row_bytes]] * 2)
         draft_entry = group.entry_map[PoolName.DRAFT]
-        self.assertEqual(draft_entry.layer_mapping, {0: (0, 1)})
+        self.assertEqual(draft_entry.layer_mapping, {1: (0, 1)})
         self.assertEqual(draft_entry.prepare_locations(indices), [2, 6])
 
         params.mtp_draft_device_pools = (object(),)
@@ -1011,6 +1011,134 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         kvcache.main_pool = page_rows(MHATokenToKVPool, 5)
         with self.assertRaisesRegex(ValueError, "M3.1 NVFP4"):
             resolve()
+
+    def _dspark_m31_nvfp4_group(self, *, target_layers, draft_layers):
+        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+        from sglang.srt.mem_cache.minimax_m3_nvfp4_pool import (
+            MiniMaxM3Nvfp4IndexKPool,
+            MiniMaxM3Nvfp4KVPool,
+            MiniMaxM3Nvfp4MainKVPool,
+        )
+
+        def page_rows(pool_cls):
+            pool = pool_cls.__new__(pool_cls)
+            pool.page_size, pool.layer_num = 2, target_layers
+            pool.rows = [
+                torch.zeros((4, 4), dtype=torch.uint8) for _ in range(target_layers)
+            ]
+            return pool
+
+        kvcache = MiniMaxM3Nvfp4KVPool.__new__(MiniMaxM3Nvfp4KVPool)
+        kvcache.start_layer, kvcache.layer_num = 0, target_layers
+        kvcache.main_pool = page_rows(MiniMaxM3Nvfp4MainKVPool)
+        kvcache.index_k_pool = page_rows(MiniMaxM3Nvfp4IndexKPool)
+        kvcache.index_k_layer_id_mapping = {i: i for i in range(target_layers)}
+        draft = MHATokenToKVPool.__new__(MHATokenToKVPool)
+        draft.page_size, draft.layer_num = 2, draft_layers
+        draft.k_scale_buffer = draft.native_k_scale_buffer = None
+        draft.k_buffer = [
+            torch.zeros((8, 3), dtype=torch.uint8) for _ in range(draft_layers)
+        ]
+        draft.v_buffer = [
+            torch.zeros((8, 3), dtype=torch.uint8) for _ in range(draft_layers)
+        ]
+        return resolve_hybrid_device_pool_group(
+            kvcache=kvcache,
+            page_size=2,
+            params=SimpleNamespace(
+                mtp_draft_device_pools=(), sidecar_draft_device_pools=(draft,)
+            ),
+            components={ComponentType.FULL},
+        )
+
+    def test_dspark_sidecar_loads_with_the_last_transfer_layer_groups(self):
+        from concurrent.futures import ThreadPoolExecutor
+
+        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
+            MooncakeDirectLinker,
+        )
+        from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
+            LayerWiseLoadCounter,
+        )
+
+        group = self._dspark_m31_nvfp4_group(target_layers=8, draft_layers=5)
+        calls = []
+
+        def get_ranges(keys, ptrs, sizes, offsets):
+            calls.append((keys[0], sum(map(sum, sizes))))
+            return [sum(item) for item in sizes]
+
+        linker = object.__new__(MooncakeDirectLinker)
+        linker.num_layers = group.num_layers
+        linker.load_layer_group, linker.load_threads = 3, 1
+        linker.load_io_executor = ThreadPoolExecutor(1)
+        self.addCleanup(linker.load_io_executor.shutdown)
+        linker.pools = group.entry_map
+        linker.storage = SimpleNamespace(
+            store=SimpleNamespace(
+                batch_get_session_start=lambda keys: [0] * len(keys),
+                batch_get_session_end=lambda keys: None,
+                batch_get_into_multi_buffer_ranges=get_ranges,
+            ),
+            _get_hybrid_page_component_keys=lambda keys, transfer: (keys, None),
+            _tag_keys=lambda keys: keys,
+        )
+        linker.layer_done_counter = LayerWiseLoadCounter(group.num_layers)
+        index = linker.layer_done_counter.update_producer()
+        linker.load_layer_wise(
+            index,
+            [
+                [
+                    PoolTransfer(
+                        name=name, keys=[name.value], host_indices=torch.arange(2, 4)
+                    )
+                    for name in (PoolName.KV, PoolName.INDEXER, PoolName.DRAFT)
+                ]
+            ],
+        )
+        self.assertTrue(linker.layer_done_counter.finish(index))
+
+        # One read per pool and group of 3 layers. Target layer 0 waits only on
+        # the first group, which carries no draft bytes; all draft KV (5 layers,
+        # K and V, one 2-token page of 3-byte rows) rides the last two groups.
+        kv, indexer, draft = (
+            PoolName.KV.value,
+            PoolName.INDEXER.value,
+            PoolName.DRAFT.value,
+        )
+        self.assertEqual(
+            calls,
+            [
+                (kv, 12),
+                (indexer, 12),
+                (kv, 12),
+                (indexer, 12),
+                (draft, 36),
+                (kv, 8),
+                (indexer, 8),
+                (draft, 24),
+            ],
+        )
+
+    def test_dspark_sidecar_waits_on_the_transfer_layer_carrying_it(self):
+        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
+            MooncakeDirectLinker,
+        )
+
+        group = self._dspark_m31_nvfp4_group(target_layers=8, draft_layers=5)
+        linker = object.__new__(MooncakeDirectLinker)
+        linker.pools = group.entry_map
+        waits = []
+        linker.layer_done_counter = SimpleNamespace(wait_until=waits.append)
+        draft_counter = linker.draft_layer_counter()
+        for depth in range(5):
+            draft_counter.wait_until(depth)
+        # Depth i waits on the transfer layer whose ranges hold its K buffer.
+        mapping = group.entry_map[PoolName.DRAFT].layer_mapping
+        self.assertEqual([mapping[layer][0] for layer in waits], list(range(5)))
+
+        with self.assertRaisesRegex(ValueError, "more layers than the target"):
+            self._dspark_m31_nvfp4_group(target_layers=4, draft_layers=5)
 
     def test_unsupported_strategy_fails_with_context(self):
         from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool

@@ -243,6 +243,10 @@ def create_unified_radix_cache(
         kvcache.register_layer_transfer_counter(counter)
         if PoolName.MAMBA in linker.pools:
             kvcache.layer_router.load_parts_layer_wise()
+        if PoolName.DRAFT in linker.pools:
+            draft_counter = linker.draft_layer_counter()
+            for draft_pool in params.sidecar_draft_device_pools:
+                draft_pool.register_layer_transfer_counter(draft_counter)
         ctx.tp_worker.register_hicache_layer_transfer_counter(counter)
     return cache
 
