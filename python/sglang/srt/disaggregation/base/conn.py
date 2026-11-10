@@ -110,6 +110,12 @@ class KVArgs:
     gpu_id: int
     kv_head_num: int
     total_kv_head_num: int
+    # Main KV is the MSA-v1 NVFP4 page-row layout: [K, K scale, V, V scale] per page,
+    # each component head-major.
+    main_kv_page_row: bool = False
+    main_kv_head_dim: int = 0
+    # Per-rank KV heads of the draft entries appended after the target entries.
+    draft_kv_head_num: int = 0
     page_size: int
     draft_rows_dcp_collapsed: bool = False
     # for system dp

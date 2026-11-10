@@ -904,6 +904,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
         if self.transfer_backend == TransferBackend.NIXL:
             kv_args.kv_data_mem_kinds = kv_data_mem_kinds
+        from sglang.srt.mem_cache.minimax_m3_nvfp4_pool import MiniMaxM3Nvfp4KVPool
+
+        kv_args.main_kv_page_row = isinstance(
+            self.token_to_kv_pool, MiniMaxM3Nvfp4KVPool
+        )
+        if kv_args.main_kv_page_row:
+            kv_args.main_kv_head_dim = self.token_to_kv_pool.head_dim
         kv_args.page_size = self.token_to_kv_pool.page_size
 
         kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (

@@ -446,6 +446,16 @@ class PrefillBootstrapQueue:
             kv_args.total_kv_head_num = (
                 self.scheduler.model_config.get_total_num_kv_heads()
             )
+        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+        from sglang.srt.mem_cache.minimax_m3_nvfp4_pool import MiniMaxM3Nvfp4KVPool
+
+        kv_args.main_kv_page_row = isinstance(
+            self.token_to_kv_pool, MiniMaxM3Nvfp4KVPool
+        )
+        if kv_args.main_kv_page_row:
+            kv_args.main_kv_head_dim = self.token_to_kv_pool.head_dim
+        if isinstance(draft_kv_pool, MHATokenToKVPool):
+            kv_args.draft_kv_head_num = draft_kv_pool.head_num
         kv_args.page_size = self.token_to_kv_pool.page_size
 
         kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
@@ -477,6 +487,14 @@ class PrefillBootstrapQueue:
             self.is_mla_backend,
             **kv_manager_kwargs,
         )
+        if (
+            kv_args.main_kv_page_row
+            and isinstance(draft_kv_pool, MHATokenToKVPool)
+            and self.transfer_backend == TransferBackend.MOONCAKE
+        ):
+            kv_manager.set_draft_kv_tensors(
+                draft_kv_pool.k_buffer + draft_kv_pool.v_buffer
+            )
         # Pass KV pool tensor refs to the manager for GPU gather (staging mode)
         if (
             envs.SGLANG_DISAGG_STAGING_BUFFER.get()
