@@ -184,10 +184,35 @@ def test_gfx1250_table_picks_measured_best(world_size, nbytes, expected):
     assert (None if picked is None else picked.algo.name) == expected
 
 
+@pytest.mark.parametrize(
+    ("world_size", "nbytes", "expected"),
+    [
+        (2, 2 * _MB, "ONE_SHOT_PUSH"),
+        (2, 2 * _MB + 16, "TWO_SHOT_PUSH"),
+        (2, 16 * _MB, "TWO_SHOT_PUSH"),
+        (2, 16 * _MB + 16, "RING_SIMPLE"),
+        (3, 64 * _KB + 16, "TWO_SHOT_PUSH"),
+        (3, 8 * _MB + 16, "RING_SIMPLE"),
+        (4, 2 * _MB, "ONE_SHOT_PUSH"),
+        (4, 2 * _MB + 16, "TWO_SHOT_PUSH"),
+        (4, 32 * _MB, "TWO_SHOT_PUSH"),
+        (4, 32 * _MB + 16, "RING_SIMPLE"),
+        (8, 768 * _KB, "ONE_SHOT_PUSH"),
+        (8, 768 * _KB + 16, "TWO_SHOT_PUSH"),
+        (8, 32 * _MB, "TWO_SHOT_PUSH"),
+        (8, 32 * _MB + 16, "RING_SIMPLE"),
+    ],
+)
+def test_gfx1250_dev_kernarg_table(world_size, nbytes, expected):
+    picked = _gfx1250_comm(world_size, dev_kernarg=True)._pick_config(nbytes, False)
+    assert (None if picked is None else picked.algo.name) == expected
+
+
+@pytest.mark.parametrize("dev_kernarg", [False, True])
 @pytest.mark.parametrize("world_size", range(2, 9))
-def test_gfx1250_table_has_no_rccl_gap(world_size):
+def test_gfx1250_table_has_no_rccl_gap(world_size, dev_kernarg):
     """Every 16 B multiple up to 4 GB picks a carv2 algo."""
-    comm = _gfx1250_comm(world_size)
+    comm = _gfx1250_comm(world_size, dev_kernarg)
     heuristic = comm.config.graph
     edges = {
         16,
@@ -202,14 +227,14 @@ def test_gfx1250_table_has_no_rccl_gap(world_size):
                 assert comm._pick_config(nbytes, False) is not None, nbytes
 
 
-def _gfx1250_comm(world_size):
+def _gfx1250_comm(world_size, dev_kernarg=False):
     from sglang.srt.distributed.device_communicators.configs import (
         custom_all_reduce_v2 as cfg,
     )
 
     comm = object.__new__(custom_all_reduce_v2.CustomAllReduceV2)
     comm.disabled = True
-    comm.config = cfg._rocm_gfx1250_configs.__wrapped__(96)[world_size]
+    comm.config = cfg._rocm_gfx1250_configs.__wrapped__(96, dev_kernarg)[world_size]
     return comm
 
 

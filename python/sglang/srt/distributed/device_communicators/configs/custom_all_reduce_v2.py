@@ -6,6 +6,7 @@ on the listed GPUs; ``get_all_reduce_config`` picks the table for the current
 arch and world size.
 """
 
+import os
 from functools import cache
 from typing import NamedTuple, Optional
 
@@ -359,7 +360,9 @@ def _rocm_configs(num_sm: int) -> dict[int, AllReduceConfig]:
 # DeepSeek-V4-Flash 18% of its C16 decode throughput. Pull stays off: it lost
 # at every measured size.
 @cache
-def _rocm_gfx1250_configs(num_sm: int) -> dict[int, AllReduceConfig]:
+def _rocm_gfx1250_configs(
+    num_sm: int, dev_kernarg: bool = False
+) -> dict[int, AllReduceConfig]:
     def config(one_shot: int, two_shot_push: int) -> AllReduceConfig:
         # 4 GB keeps every dtype's element count in 32 bits
         ring = Range(max(one_shot, two_shot_push) + 16, 4 * 1024 * MB)
@@ -389,6 +392,17 @@ def _rocm_gfx1250_configs(num_sm: int) -> dict[int, AllReduceConfig]:
         7: (64 * KB, 16 * MB),
         8: (64 * KB, 8 * MB),
     }
+    # That stall needs kernel arguments in host memory (the cookbook's
+    # HIP_FORCE_DEV_KERNARG=0). With HIP_FORCE_DEV_KERNARG=1 the kernels after
+    # a 2shot_push run at full speed, so TP2/4/8 take 2shot_push to the last
+    # size it wins back to back. 1shot_push also serves decode further, to the
+    # last size it wins in CUDA graphs with a late rank or a GEMM before it
+    # (768 KB at TP8, every decode size at TP2/4): DeepSeek-V4-Flash decode
+    # gains about 2-4% at TP4/TP8.
+    if dev_kernarg:
+        cutoffs.update(
+            {2: (2 * MB, 16 * MB), 4: (2 * MB, 32 * MB), 8: (768 * KB, 32 * MB)}
+        )
     configs = {ws: config(*cutoff) for ws, cutoff in cutoffs.items()}
     # 16 ranks span two DPX hosts in one UALink fabric clique. Tuned there with
     # and without a late rank: across hosts 2shot_push pays two fabric hops, so
@@ -419,7 +433,8 @@ def _get_all_reduce_configs() -> dict[int, AllReduceConfig]:
     if torch.version.hip:
         # ROCm reports gfx9xx as capability 9.x: never fall into the SM90 table
         if props.gcnArchName.startswith("gfx1250"):
-            return _rocm_gfx1250_configs(num_sm)
+            dev_kernarg = os.environ.get("HIP_FORCE_DEV_KERNARG") == "1"
+            return _rocm_gfx1250_configs(num_sm, dev_kernarg)
         return _rocm_configs(num_sm)
     cuda_major, cuda_minor = torch.cuda.get_device_capability()
     if cuda_major == 9:
