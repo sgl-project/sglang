@@ -68,14 +68,14 @@ def update_expert_weights_with_staging(
 
     from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 
-    _validate_migration_topology(group)
+    world_size = dist.get_world_size(group)
+    _validate_migration_topology(world_size)
     # Both Ascend 950PR and 950DT use ARCH35. Their NZ copy/cast paths do not
     # accept the transposed expert views used by MXFP4/MXFP8 inference.
     staging_type = (
         _PhysicalExpertWeightStaging if is_npu_arch35() else _ExpertWeightStaging
     )
     staging = staging_type(weights_by_layer, changed_layer_ids, rank)
-    world_size = dist.get_world_size(group)
     temp_buffers = []
     missing_experts_by_layer = {}
 
@@ -108,9 +108,8 @@ def update_expert_weights_with_staging(
     return missing_experts_by_layer
 
 
-def _validate_migration_topology(group: dist.ProcessGroup | None) -> None:
+def _validate_migration_topology(group_size: int) -> None:
     parallel = get_parallel()
-    group_size = dist.get_world_size(group)
     if parallel.tp_size != parallel.moe_ep_size or parallel.moe_ep_size != group_size:
         raise ValueError(
             "NPU EPLB migration requires TP size = EP size = EPLB group size."
@@ -118,7 +117,11 @@ def _validate_migration_topology(group: dist.ProcessGroup | None) -> None:
 
 
 def _select_expert_weight_updates(old_metadata, new_metadata, layer_ids, rank):
-    """Select globally updated layers and this rank's participating layers."""
+    """Return changed layers for validation and this rank's migration plan.
+
+    A sender-only layer participates in migration but needs no local writeback.
+    Validate every changed layer, even when this rank has no work in that layer.
+    """
     from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 
     old_placements = old_metadata.physical_to_logical_map_cpu

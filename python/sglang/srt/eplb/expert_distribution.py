@@ -789,7 +789,7 @@ class _Accumulator(ABC):
             else torch.distributed.get_global_rank(self._communication_group, 0)
         )
         self._is_communication_root = (
-            torch.distributed.get_rank(self._communication_group) == 0
+            torch.distributed.get_rank() == self._communication_root
         )
 
     def get_single_pass_gatherer_keys(self):
@@ -821,7 +821,20 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
         self._enable = reports_expert_balancedness()
 
         if self._enable:
-            self._is_pipeline_parallel = get_parallel().pp_size > 1
+            self._pipeline_layer_slice = None
+            parallel = get_parallel()
+            if parallel.pp_size > 1:
+                from sglang.srt.distributed import get_pp_indices
+
+                # Ownership is fixed for this recorder. Cache the range rather
+                # than parsing the pipeline partition on every recorded pass.
+                self._pipeline_layer_slice = slice(
+                    *get_pp_indices(
+                        self._expert_location_metadata.num_layers,
+                        parallel.pp_rank,
+                        parallel.pp_size,
+                    )
+                )
             self.window_sizes = EPLB_BALANCEDNESS_WINDOW_SIZES
             self._history = _DequeCollection(maxlens=self.window_sizes)
             self._reset_server_log_history = True
@@ -876,20 +889,12 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
             self._handle_metric_eplb_heatmap(gpu_physical_count)
 
             layer_utilization = compute_utilization_rate(gpu_physical_count)
-            if self._is_pipeline_parallel:
-                from sglang.srt.distributed import get_pp_indices
-
-                start_layer, end_layer = get_pp_indices(
-                    self._expert_location_metadata.num_layers,
-                    get_parallel().pp_rank,
-                    get_parallel().pp_size,
-                )
+            if self._pipeline_layer_slice is not None:
                 # Counts are reduced within this stage but indexed by global
                 # layer ID. Use ownership rather than observed traffic so a
                 # valid layer with zero sampled tokens is still included.
-                utilization_rate_gpu = layer_utilization[start_layer:end_layer].mean()
-            else:
-                utilization_rate_gpu = layer_utilization.mean()
+                layer_utilization = layer_utilization[self._pipeline_layer_slice]
+            utilization_rate_gpu = layer_utilization.mean()
             should_track_history = not math.isclose(
                 get_exec().moe.eplb_min_rebalancing_utilization_threshold, 1.0
             )
@@ -1060,26 +1065,25 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             average_utilization_rate_over_window=self._get_global_average_utilization_rate(),
         )
 
-        if output_mode == "file":
-            if self._is_communication_root:
-                parallel = get_parallel()
-                suffix = ""
-                if parallel.pp_size > 1:
-                    # The scheduler forwards this request after handling it.
-                    # Save each stage locally; a WORLD gather here would block
-                    # the request from reaching the next stage.
-                    suffix = f"_pp{parallel.pp_rank}"
-                    output.update(
-                        pipeline_parallel_rank=parallel.pp_rank,
-                        pipeline_parallel_size=parallel.pp_size,
-                    )
-                _dump_to_file(
-                    f"expert_distribution_recorder_{time.time()}{suffix}.pt", output
-                )
-        elif output_mode == "object":
+        if output_mode == "object":
             return output
-        else:
+        if output_mode != "file":
             raise NotImplementedError
+        if not self._is_communication_root:
+            return
+
+        parallel = get_parallel()
+        suffix = ""
+        if parallel.pp_size > 1:
+            # The scheduler forwards this request after handling it.
+            # Save each stage locally; a WORLD gather here would block
+            # the request from reaching the next stage.
+            suffix = f"_pp{parallel.pp_rank}"
+            output.update(
+                pipeline_parallel_rank=parallel.pp_rank,
+                pipeline_parallel_size=parallel.pp_size,
+            )
+        _dump_to_file(f"expert_distribution_recorder_{time.time()}{suffix}.pt", output)
 
     def _get_global_average_utilization_rate(self):
         if not self._enable or math.isclose(

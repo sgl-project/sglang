@@ -371,7 +371,8 @@ def _prewarm_eplb_p2p(device: str) -> None:
     tp_group = get_tp_group()
     group = tp_group.device_group
     # Query the selected backend so NPU startup does not depend on CUDA.
-    free_before, _ = torch.get_device_module(device).mem_get_info()
+    device_module = torch.get_device_module(device)
+    free_before, _ = device_module.mem_get_info()
     # Exercise bulk byte transfers to materialize the P2P buffers.
     bytes_per_peer = 4 << 20
     send = torch.empty(bytes_per_peer, dtype=torch.uint8, device=device)
@@ -393,7 +394,7 @@ def _prewarm_eplb_p2p(device: str) -> None:
     current_platform.synchronize()
     del ops, send, recv
     current_platform.empty_cache()
-    free_after, _ = torch.get_device_module(device).mem_get_info()
+    free_after, _ = device_module.mem_get_info()
     logger.info(
         "EPLB TP P2P and all-reduce warmup completed in %.3fs "
         "(tp_size=%d, free memory delta=%.2f MiB)",
