@@ -230,24 +230,23 @@ class TestUBTreeComponents(CustomTestCase):
             hidden, full_weight
         ).topk(3, dim=-1)
 
-        local_weight = full_weight[:4]
+        local_weight = full_weight[4:]
         remote_values, remote_ids = torch.nn.functional.linear(
-            hidden, full_weight[4:]
+            hidden, full_weight[:4]
         ).topk(3, dim=-1)
-        remote_ids += 4
 
         class FakeGroup:
             world_size = 2
 
             def all_gather_into_tensor(self, output, local):
                 remote = remote_values if output.dtype.is_floating_point else remote_ids
-                output.copy_(torch.cat([local, remote.reshape(-1)]))
+                output.copy_(torch.cat([remote.reshape(-1), local]))
 
         head = SimpleNamespace(
             weight=local_weight,
             shard_indices=SimpleNamespace(
                 num_org_elements=4,
-                org_vocab_start_index=0,
+                org_vocab_start_index=4,
             ),
         )
         values, ids = vocab_parallel_topk(
