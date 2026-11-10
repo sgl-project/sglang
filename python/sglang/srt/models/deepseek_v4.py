@@ -2569,7 +2569,9 @@ class MQALayer(MqaAttentionBase):
                     positions=global_positions,
                 )
                 kv = None
-            elif in_replay_tail_graph():
+            elif in_replay_tail_graph() and not _is_hip:
+                # HIP's store target in the tail layers is the backend's pinned tail
+                # buffer (prepare_decoder_tail_store), so its fused store stays captured.
                 assert not fuse_q_rope
                 bcg_tail_kv_store(self, x_linear, positions, qkv_a)
                 kv = None
