@@ -1615,7 +1615,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 written_by_forward=True,
             )
         # Tree holds no logical row
-        req.kv.cache_protected_len = 0
+        req.kv.protect_prefix(0)
         if req.lock is not None:
             self.unlock(req.lock)
         req.lock = None

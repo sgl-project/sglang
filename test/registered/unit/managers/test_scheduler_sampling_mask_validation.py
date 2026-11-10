@@ -50,6 +50,7 @@ class TestSchedulerSamplingMaskValidation(CustomTestCase):
                 scheduler.hisparse_coordinator = None
                 scheduler.uocr_runtime = None
                 scheduler.send_abort_output = MagicMock()
+                scheduler.enable_hisparse_host_radix = False
                 scheduler.init_request_retirer()
                 recv_req = MagicMock(
                     session_params=None,
@@ -105,6 +106,7 @@ class TestSchedulerSamplingMaskValidation(CustomTestCase):
                 scheduler.beam_coordinator = MagicMock()
                 scheduler.hisparse_coordinator = None
                 scheduler.uocr_runtime = None
+                scheduler.enable_hisparse_host_radix = False
                 scheduler.init_request_retirer()
                 scheduler.server_args = SimpleNamespace(sampling_mask_max_tokens=64)
                 scheduler._create_generation_req = lambda recv_req, **kw: Req(**kw)

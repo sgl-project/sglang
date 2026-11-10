@@ -461,6 +461,8 @@ class TestHiSparseMaxNewTokens(CustomTestCase):
             token_capacity=device_rows,
             sliding_window_size=None,
             chunk_size=None,
+            prefill_retire_lag=0,
+            eviction_interval=0,
         )
 
     def test_prompt_longer_than_device_rows_keeps_output(self):

@@ -147,15 +147,13 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         max_new_tokens: int,
         *,
         token_capacity: int,
-        sliding_window_size: int | None,
-        chunk_size: int | None,
+        **kwargs,
     ) -> int | None:
         return super().max_new_tokens_for_memory(
             input_tokens,
             max_new_tokens,
             token_capacity=max(token_capacity, self._size_full),
-            sliding_window_size=sliding_window_size,
-            chunk_size=chunk_size,
+            **kwargs,
         )
 
     @property
