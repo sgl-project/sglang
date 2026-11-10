@@ -4,6 +4,11 @@ The NPU test suites are plain ``unittest`` files executed as
 ``python3 <test_file> -f`` by ``test/run_suite.py``; there is no pytest
 collection, so this module (not a ``conftest.py``) is the place for common
 server, memory, and weight-signature helpers.
+
+Sibling suites import it by path, where the test file's directory is already
+on ``sys.path``. The deliberately specific module name avoids shadowing other
+suites' helpers. The disabled registration keeps ``run_suite.py`` from trying
+to execute this module as a test file.
 """
 
 from __future__ import annotations
@@ -28,11 +33,18 @@ try:
 except Exception as exc:  # pragma: no cover - exercised only off NPU hosts
     _NPU_IMPORT_ERROR = exc
 
+from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     find_available_port,
     popen_launch_server,
     terminate_and_kill_process_tree,
+)
+
+register_npu_ci(
+    est_time=0,
+    suite="base-b-test-1-npu-a3",
+    disabled="Shared NPU RLHF test helpers",
 )
 
 DEFAULT_TIMEOUT = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH

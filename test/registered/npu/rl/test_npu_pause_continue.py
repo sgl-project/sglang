@@ -10,8 +10,7 @@ import time
 import unittest
 
 import requests
-
-from sglang.test.ascend.npu_rl_utils import (
+from npu_rl_utils import (
     begin_weight_update,
     checkpoint_tensor_index,
     continue_generation,
@@ -26,6 +25,7 @@ from sglang.test.ascend.npu_rl_utils import (
     update_weights_from_tensor,
     warmup_npu,
 )
+
 from sglang.test.ascend.test_ascend_utils import QWEN3_0_6B_WEIGHTS_PATH
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import CustomTestCase
