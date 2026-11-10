@@ -1,0 +1,87 @@
+name: Release Docker Images Nightly (PPU)
+
+# Nightly build of the PPU image defined by docker/ppu.Dockerfile, using the
+# repository root as the build context, published to GitHub Packages (ghcr.io)
+# with the built-in GITHUB_TOKEN. Runs on a daily schedule and can also be
+# triggered manually. Images are pushed only to ghcr.io.
+on:
+  # Debug aid: build on every push to this feature branch. Remove this trigger
+  # once the nightly flow is validated on the default branch.
+  workflow_dispatch:
+    inputs:
+      push:
+        description: 'Push the built images to GitHub Packages (ghcr.io); disable for a build-only dry run'
+        required: false
+        type: boolean
+        default: true
+  schedule:
+    # 00:00 Beijing Time (UTC+8) every day.
+    - cron: '0 16 * * *'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.number || github.sha }}
+  cancel-in-progress: true
+
+# packages: write lets docker/login-action push the image to ghcr.io.
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    # GitHub-hosted runner: every address the Dockerfile reaches (PPU base
+    # image, PyPI index, source repo) is a public URL, so no self-hosted
+    # runner is required.
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Compute image metadata
+        id: meta
+        run: |
+          set -euo pipefail
+          # ghcr.io image paths must be lowercase.
+          owner_lc=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          date_tag=$(date -u +%Y%m%d)
+          short_sha="${GITHUB_SHA::7}"
+          # Docker tags forbid "/" and some git-allowed chars, so sanitize the
+          # branch name (e.g. feat/foo -> feat-foo) before embedding it.
+          branch=$(echo "${{ github.ref_name }}" | sed 's|/|-|g; s/[^A-Za-z0-9._-]/-/g')
+          echo "image=ghcr.io/${owner_lc}/sglang-ppu-nightly" >> "$GITHUB_OUTPUT"
+          echo "tag=${branch}-${date_tag}-cuda13.0.0-sdk2.2.0-${short_sha}" >> "$GITHUB_OUTPUT"
+          echo "rolling=nightly" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GitHub Packages
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/ppu.Dockerfile
+          platforms: linux/amd64
+          push: ${{ inputs.push || github.event_name != 'workflow_dispatch' }}
+          provenance: false
+          tags: |
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.rolling }}
+          build-args: |
+            SGLANG_BUILD_COMMIT=${{ github.sha }}
+            SGLANG_BUILD_URL=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            SGLANG_IMAGE_TAG=${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+
+      - name: Write image address to job summary
+        run: |
+          printf 'PPU image: `%s:%s` (rolling `%s:%s`)\n' \
+            "${{ steps.meta.outputs.image }}" "${{ steps.meta.outputs.tag }}" \
+            "${{ steps.meta.outputs.image }}" "${{ steps.meta.outputs.rolling }}" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
