@@ -1,12 +1,12 @@
-"""CPU contracts for selecting the NPU sparse-KV implementations."""
+"""CPU contracts for NPU sparse-KV configuration."""
 
 import sys
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 
 import pytest
 
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload import config, dispatch
+from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload import config
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, stage="base-a", runner_config="cpu")
@@ -23,45 +23,6 @@ MODEL_CONFIG = SimpleNamespace(
         index_topk=512,
     ),
 )
-
-
-@pytest.mark.parametrize("fused", [False, True])
-def test_manager_and_attention_follow_one_switch(monkeypatch, fused):
-    prefix = "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload."
-    calls = []
-    expected = {}
-    for mode, manager_name, attention_name in (
-        (False, "manager", "attention"),
-        (True, "fused_manager", "fused_attention"),
-    ):
-        manager_module = ModuleType(prefix + manager_name)
-        attention_module = ModuleType(prefix + attention_name)
-
-        def manager(*args, _mode=mode, **kwargs):
-            calls.append((_mode, args, kwargs))
-            return _mode
-
-        def attention(*args, _mode=mode):
-            return _mode
-
-        manager_module.SparseKVCacheManager = manager
-        attention_module.forward_sparsity_driven_kv_offload = attention
-        monkeypatch.setitem(sys.modules, manager_module.__name__, manager_module)
-        monkeypatch.setitem(sys.modules, attention_module.__name__, attention_module)
-        expected[mode] = attention
-
-    result = dispatch.create_sparse_kv_manager(
-        "pool", "allocator", 2048, fused=fused, options={"graph_batch_capacity": 4}
-    )
-    assert result is fused
-    assert calls == [
-        (
-            fused,
-            ("pool", "allocator", 2048),
-            {"graph_batch_capacity": 4} if fused else {},
-        )
-    ]
-    assert dispatch.get_sparse_kv_attention(fused=fused) is expected[fused]
 
 
 def test_legacy_budget_requires_fused_mode(monkeypatch):

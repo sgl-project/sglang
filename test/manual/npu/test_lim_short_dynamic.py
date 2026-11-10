@@ -12,13 +12,13 @@ from sgl_kernel_npu.sparsity_driven_kv_offload.fused_shm import (
 )
 
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_attention import (
-    forward_sparsity_driven_kv_offload,
+    forward_fused_sparse_kv_offload,
 )
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_budget import (
     resolve_sparse_kv_budget,
 )
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_manager import (
-    SparseKVCacheManager,
+    FusedSparseKVCacheManager,
 )
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool, ReqToTokenPool
 from sglang.srt.model_executor.forward_mode import ForwardMode
@@ -89,7 +89,7 @@ def test_prefill_attention_and_short_residency():
     manager = None
     with get_parallel().override(attn_cp_size=1):
         try:
-            manager = SparseKVCacheManager(
+            manager = FusedSparseKVCacheManager(
                 pool,
                 SimpleNamespace(get_kvcache=lambda: index_pool),
                 2048,
@@ -143,7 +143,7 @@ def test_prefill_attention_and_short_residency():
                     tp_q_head_num=heads,
                     scaling=576**-0.5,
                 )
-                output = forward_sparsity_driven_kv_offload(
+                output = forward_fused_sparse_kv_offload(
                     backend,
                     query,
                     fresh[..., :512].contiguous(),
@@ -228,7 +228,7 @@ def test_short_sparse_graph_lifecycle(
     manager = None
     with get_parallel().override(attn_cp_size=1):
         try:
-            manager = SparseKVCacheManager(
+            manager = FusedSparseKVCacheManager(
                 pool,
                 SimpleNamespace(get_kvcache=lambda: index_pool),
                 2048,
@@ -336,7 +336,7 @@ def test_short_sparse_graph_lifecycle(
                 outputs = []
                 for layer, value in zip(layers, fresh):
                     outputs.append(
-                        forward_sparsity_driven_kv_offload(
+                        forward_fused_sparse_kv_offload(
                             backend,
                             query,
                             value[..., :512].contiguous(),

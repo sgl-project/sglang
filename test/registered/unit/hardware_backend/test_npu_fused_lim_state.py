@@ -38,7 +38,7 @@ class TestLIMState(CustomTestCase):
                 with self.assertRaisesRegex(
                     ValueError, "publishing current KV to host"
                 ):
-                    attention.forward_sparsity_driven_kv_offload(
+                    attention.forward_fused_sparse_kv_offload(
                         backend, None, None, None, None, None, save_kv_cache=False
                     )
             cat.assert_not_called()
@@ -382,7 +382,7 @@ class TestLIMState(CustomTestCase):
                 },
             ),
         ):
-            manager = fused_manager.SparseKVCacheManager(
+            manager = fused_manager.FusedSparseKVCacheManager(
                 req_pool, None, 2048, graph_batch_capacity=8, paged_kv_cache=pool
             )
         self.assertIs(manager.budget, plan)

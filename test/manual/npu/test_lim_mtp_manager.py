@@ -15,13 +15,13 @@ from sgl_kernel_npu.sparsity_driven_kv_offload.fused_shm import (
 )
 
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_attention import (
-    forward_sparsity_driven_kv_offload,
+    forward_fused_sparse_kv_offload,
 )
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_budget import (
     resolve_sparse_kv_budget,
 )
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_manager import (
-    SparseKVCacheManager,
+    FusedSparseKVCacheManager,
 )
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool, ReqToTokenPool
 from sglang.srt.model_executor.forward_mode import ForwardMode
@@ -160,7 +160,7 @@ def test_real_manager_mtp_owner_share_lifecycle(graph, heads, query_width, capac
             stack.enter_context(
                 patch("sglang.srt.runtime_context.get_spec", return_value=spec)
             )
-            manager = SparseKVCacheManager(
+            manager = FusedSparseKVCacheManager(
                 pool,
                 SimpleNamespace(get_kvcache=lambda: index_pool),
                 K,
@@ -196,7 +196,7 @@ def test_real_manager_mtp_owner_share_lifecycle(graph, heads, query_width, capac
                 outputs = []
                 for i in range(2):
                     outputs.append(
-                        forward_sparsity_driven_kv_offload(
+                        forward_fused_sparse_kv_offload(
                             backend,
                             q,
                             fresh[i][..., :512].contiguous(),

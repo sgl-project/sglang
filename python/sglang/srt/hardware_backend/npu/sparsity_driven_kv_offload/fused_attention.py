@@ -11,7 +11,7 @@ from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.model_executor.forward_mode import ForwardMode
 
 
-def forward_sparsity_driven_kv_offload(
+def forward_fused_sparse_kv_offload(
     backend,
     q: torch.Tensor,
     k: torch.Tensor,

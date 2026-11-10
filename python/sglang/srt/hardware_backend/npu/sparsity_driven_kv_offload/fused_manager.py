@@ -50,7 +50,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-class SparseKVCacheManager:
+class FusedSparseKVCacheManager:
     host_pool: Optional[MemFabricKVPool] = None
 
     def __init__(
@@ -80,7 +80,7 @@ class SparseKVCacheManager:
             paged_kv_cache = token_to_kv_pool_allocator.get_kvcache()
         if not isinstance(paged_kv_cache, MLATokenToKVPool):
             raise TypeError(
-                "SparseKVCacheManager requires an MLATokenToKVPool, "
+                "FusedSparseKVCacheManager requires an MLATokenToKVPool, "
                 f"got {type(paged_kv_cache).__name__}"
             )
         self.paged_kv_cache = paged_kv_cache

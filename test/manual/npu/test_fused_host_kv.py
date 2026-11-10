@@ -8,7 +8,7 @@ from sgl_kernel_npu.sparsity_driven_kv_offload.fused_shm import (
 )
 
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_manager import (
-    SparseKVCacheManager,
+    FusedSparseKVCacheManager,
 )
 
 
@@ -20,7 +20,7 @@ def test_paged_host_overlap_move_real_npu():
     if not torch.npu.is_available():
         pytest.skip("NPU is required")
     device_id = torch.npu.current_device()
-    manager = SparseKVCacheManager.__new__(SparseKVCacheManager)
+    manager = FusedSparseKVCacheManager.__new__(FusedSparseKVCacheManager)
     manager.device = torch.device("npu", device_id)
     manager.head_num, manager.head_dim = 1, 576
     manager.store_dtype = torch.bfloat16
