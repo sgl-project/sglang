@@ -11,7 +11,7 @@ serving requests.
 from __future__ import annotations
 
 import functools
-from typing import Any, Callable
+from typing import Any
 
 import torch
 
@@ -92,23 +92,14 @@ def _build_scheduler_rollout_controller(
     return current_rollout_controller
 
 
-def prepare_rollout_if_enabled(
-    *,
-    batch: Req,
-    pipeline_config: Any,
-    build_controller: Callable[..., FlowRolloutController] = (
-        _build_scheduler_rollout_controller
-    ),
-) -> None:
+def prepare_rollout_if_enabled(*, batch: Req, pipeline_config: Any) -> None:
     """Create the rollout controller of the visual stream of this request.
 
     Must run before SP sharding so the controller records the full latent shape.
-    ``build_controller(batch=, pipeline_config=)`` returns it; a loop without a
-    scheduler passes its own.
     """
     if not batch.rollout:
         return
-    current_rollout_controller = build_controller(
+    current_rollout_controller = _build_scheduler_rollout_controller(
         batch=batch, pipeline_config=pipeline_config
     )
     batch.rollout_controllers = {VISUAL_STREAM: current_rollout_controller}
@@ -132,12 +123,13 @@ def init_rollout_env_if_enabled(
         return
 
     if collect_env:
+        # pos/neg_cond_kwargs are placeholders: finalize_rollout_if_enabled
+        # unconditionally overwrites them with the SP-gathered CPU copy, so
+        # copying them to CPU here would just be a wasted host sync.
         env = RolloutDenoisingEnv(
             image_kwargs=_kwargs_to_cpu(image_kwargs),
-            pos_cond_kwargs=_kwargs_to_cpu(pos_cond_kwargs),
-            neg_cond_kwargs=(
-                _kwargs_to_cpu(neg_cond_kwargs) if neg_cond_kwargs else None
-            ),
+            pos_cond_kwargs=pos_cond_kwargs,
+            neg_cond_kwargs=neg_cond_kwargs if neg_cond_kwargs else None,
             guidance=guidance.detach().cpu() if guidance is not None else None,
         )
         pos_src = pos_cond_kwargs

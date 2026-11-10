@@ -10,27 +10,55 @@ and delegates to it.
 
 from __future__ import annotations
 
+import dataclasses
 import ipaddress
+import json
 import logging
+import operator
 import os
+import signal
+import threading
 import time
 from array import array
 from itertools import chain
 from types import ModuleType
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import msgspec
 import orjson
 import psutil
 
 from sglang.srt.disaggregation.kv_events import select_kv_publisher_dp_rank
+from sglang.srt.environ import envs
+from sglang.srt.managers.io_struct import GenerateReqInput, ShutdownReq
+from sglang.srt.managers.scheduler_components.dp_attn import DRAIN_STATE_NO_LISTENER
 from sglang.srt.managers.utils import (
     MsgpackDecodeError,
     msgpack_decode_explained,
 )
+from sglang.srt.multimodal.cache.identity import build_processor_fingerprint
+from sglang.srt.observability.request_dump import (
+    CRASH_DUMP_GRACE_SECS,
+    crash_dump_hostname,
+    dumping,
+    write_crash_dump,
+)
 from sglang.srt.observability.startup_time import build_engine_startup_time
-from sglang.srt.runtime_context import get_exec, get_mm, get_parallel, get_serving
-from sglang.srt.rust_server.config import _build_server_args, _partition_cores
+from sglang.srt.runtime_context import (
+    get_context,
+    get_device,
+    get_exec,
+    get_mm,
+    get_observability,
+    get_parallel,
+    get_serving,
+)
+from sglang.srt.rust_server.config import (
+    _build_server_args,
+    _frontend_cpu_key,
+    _frontend_cpu_share,
+    _partition_cores,
+)
 from sglang.srt.rust_server.multimodal import (
     MM_TRANSPORT_STATS,
     RUST_MM_FAMILIES,
@@ -49,9 +77,11 @@ from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 
 if TYPE_CHECKING:
     from sglang.srt.managers.io_struct import AbortReq, BatchTokenIDOutput
-    from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput, Req
+    from sglang.srt.managers.req_types import MultimodalProcessorOutput
+    from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.managers.scheduler import Scheduler
     from sglang.srt.rust_extensions._server import MmSpec, Server
+    from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +89,11 @@ logger = logging.getLogger(__name__)
 # `hidden_poslens`). A frame without extras that sends a later column pads
 # them empty; `push_generation` asserts the count whenever it sends extras.
 _EXTRAS_HEADER_COLS = 12
+
+# `Server.drain_state()` bits (sglang-server `utils/runtime.rs`).
+DRAIN_DRAINING = 1
+DRAIN_FORCE_REQUESTED = 2
+DRAIN_CLOSED = 4
 
 
 def _is_loopback(host: str) -> bool:
@@ -80,6 +115,82 @@ def _rendezvous_is_loopback(dist_init_addr: Optional[str]) -> bool:
         return False
 
 
+def drain_notify_name(instance_id: str) -> str:
+    """The abstract Unix socket on which the launching process hears that the
+    rank-0 listener's drain ended (``Server.drain_signal_fd``'s ``notify``)."""
+    return f"sglang-rust-drain-{instance_id}"
+
+
+def claim_sigterm_before_compiles() -> None:
+    """Own SIGTERM in Python before this process can JIT-compile anything.
+
+    LLVM (inside Triton) registers its crash handlers on the first compile and,
+    when one of them fires (SIGUSR2, SIGHUP, SIGINT, ...), restores every
+    disposition it saw at registration. A SIGTERM still at SIG_DFL then would
+    silently revert the drain handler installed later; a Python handler is
+    restored as Python's own C handler, which then runs whichever Python
+    handler is current. Until ``install_sigterm_drain``, SIGTERM keeps its
+    default effect: the handler restores SIG_DFL and re-raises, so the process
+    dies of SIGTERM, once the main thread next runs Python code."""
+    if threading.current_thread() is not threading.main_thread():
+        return
+
+    def terminate(signum, frame):
+        signal.signal(signum, signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+
+    signal.signal(signal.SIGTERM, terminate)
+
+
+def _is_plain_dp() -> bool:
+    """DP over replicas, each its own TP group, rather than attention DP."""
+    parallel = get_parallel()
+    return not parallel.attn_dp_enabled and parallel.dp_size > 1
+
+
+def listener_port_offset(tp_rank: int, dp_rank: Optional[int]) -> int:
+    """The offset from ``--port`` of the listener that global TP rank
+    ``tp_rank`` (of replica ``dp_rank`` under plain DP) hosts: a node's
+    listeners bind consecutive ports, one per DP group led there."""
+    if _is_plain_dp():
+        # One TP group per replica, every leader on the same node.
+        return dp_rank
+    parallel = get_parallel()
+    if get_exec().moe.is_ep_scale_joiner:
+        # The joining TP group is entirely local to this node.
+        tp_size_per_node = parallel.tp_size
+    else:
+        nnodes_per_pp_rank = max(parallel.nnodes // parallel.pp_size, 1)
+        tp_size_per_node = parallel.tp_size // nnodes_per_pp_rank
+    dp_group_width = parallel.attn_tp_size * parallel.attn_cp_size
+    return (tp_rank % tp_size_per_node) // dp_group_width
+
+
+def node_listener_ports() -> List[int]:
+    """The ports this node's Rust listeners bind, ascending, assuming Rust
+    mode: one per DP group led on this node, none on a node that leads none.
+    Callable from the launching process, before any scheduler starts."""
+    from sglang.srt.entrypoints.engine import (
+        _calculate_rank_ranges,
+        _rank_hosts_rust_listener,
+    )
+
+    parallel = get_parallel()
+    pp_rank_range, tp_rank_range, _, _ = _calculate_rank_ranges(parallel.node_rank)
+    if 0 not in pp_rank_range:
+        return []
+    if get_exec().moe.is_ep_scale_joiner:
+        # Scale joiners launch their full TP group on this node.
+        tp_rank_range = range(parallel.tp_size)
+    dp_ranks = range(parallel.dp_size) if _is_plain_dp() else [None]
+    return sorted(
+        get_serving().port + listener_port_offset(tp_rank, dp_rank)
+        for tp_rank in tp_rank_range
+        if _rank_hosts_rust_listener(0, tp_rank)
+        for dp_rank in dp_ranks
+    )
+
+
 class RustServer:
     """Owns the embedded multi-threaded Rust server (``sglang_server.Server``).
 
@@ -98,13 +209,44 @@ class RustServer:
         self.http_port = http_port
         self.mm_spec = mm_spec
         self._multimodal_enabled = mm_spec is not None
+        self._mm_cache_namespace: Optional[str] = None
         self._max_per_poll = max_per_poll
         # The engine-level startup timings `/server_info` reports, set once
         # the scheduler finishes initializing (see `set_startup_time`).
         self.startup_time: Optional[Dict[str, Any]] = None
+        # Set by `launch`: the launch state a crash dump carries.
+        self.server_args: Optional[ServerArgs] = None
+        # Once per process: the exception path and a watchdog may both try.
+        self._crash_dump_lock = threading.Lock()
+        self._crash_dump_performed = False
+        # Whether this listener's rank broadcasts to every scheduler rank
+        # (global TP rank 0), and so stops them once its drain completes.
+        self._broadcasts_shutdown = False
+        self._shutdown_sent = False
+        self._force_shutdown = False
+        # Whether this listener holds its drain's end until every
+        # attention-DP listener closed (see `on_drain_rows`), how many listener
+        # rows the gather then carries, whether a gathered row set that does
+        # not match disabled that wait, and whether the end was released.
+        self._holds_drain_end = False
+        self._drain_rows = 0
+        self._drain_rows_mismatch = False
+        self._drain_end_released = False
         # Batches whose customized_info could not be sent (see
         # `_customized_info_json`).
         self._dropped_customized_info = 0
+
+    @classmethod
+    def _request_input_class(cls) -> type:
+        """The request class Python's ``/generate`` admits: the object the
+        request log prints and a crash dump holds for each request."""
+        return GenerateReqInput
+
+    @classmethod
+    def _server_added_custom_params(cls) -> Tuple[str, ...]:
+        """``sampling_params.custom_params`` keys this server adds to a request
+        itself, which the request log and crash dumps leave out."""
+        return ()
 
     @classmethod
     def _health_generate_headers(cls, scheduler: Scheduler) -> Dict[str, str]:
@@ -138,7 +280,8 @@ class RustServer:
         refuse a model it cannot serve. ``launch`` calls this before the
         listener binds, so a refused model never accepts a connection. A
         model package whose ``_start_multimodal`` starts its own pipeline
-        overrides this to return ``None``."""
+        overrides this to return ``None``; its server admits no generation
+        request until that pipeline starts."""
         mm_spec = RustMmProcessor(
             server_args=scheduler.server_args,
             model_config=scheduler.model_config,
@@ -171,36 +314,70 @@ class RustServer:
 
     @classmethod
     def _partition_cores(
-        cls, mm_workers: int = 0
+        cls, mm_workers: int = 0, cpu_share: Tuple[int, int] = (0, 1)
     ) -> tuple[Optional[List[int]], Optional[List[int]]]:
         return _partition_cores(
             mm_workers=mm_workers,
             server_core_budget=cls._server_core_budget,
+            cpu_share=cpu_share,
         )
+
+    @classmethod
+    def gather_frontend_cpu_share(cls, hosts_listener: bool) -> Tuple[int, int]:
+        """Collective: every rank calls once; returns this listener's
+        ``(index, count)`` among the listeners on its node with the same CPU
+        affinity mask, for ``_partition_cores``."""
+        if get_exec().moe.is_ep_joiner:
+            # Stays out for the reason `gather_server_endpoints` does: the
+            # serving ranks never enter this collective again. The joiner's
+            # listener partitions its whole mask, as before this split.
+            return 0, 1
+        world_group = get_parallel().world_group
+        cpu_keys = world_group.all_gather_object(
+            _frontend_cpu_key() if hosts_listener else None
+        )
+        return _frontend_cpu_share(cpu_keys, rank=world_group.rank_in_group)
 
     @classmethod
     def _port_offset(cls) -> int:
         """This listener's offset from the base port based on per-node DP rank."""
-        if get_exec().moe.is_ep_scale_joiner:
-            # The joining TP group is entirely local to this node.
-            tp_size_per_node = get_parallel().tp_size
-        else:
-            nnodes_per_pp_rank = max(get_parallel().nnodes // get_parallel().pp_size, 1)
-            tp_size_per_node = get_parallel().tp_size // nnodes_per_pp_rank
-        dp_group_width = get_parallel().attn_tp_size * get_parallel().attn_cp_size
-        if not get_parallel().attn_dp_enabled and get_parallel().dp_size > 1:
-            # Plain DP: one TP group per replica, every leader on this node.
-            return get_parallel().dp_rank
-        return (get_parallel().tp_rank % tp_size_per_node) // dp_group_width
+        dp_rank = get_parallel().dp_rank if _is_plain_dp() else None
+        return listener_port_offset(get_parallel().tp_rank, dp_rank)
+
+    @classmethod
+    def _advertised_host(cls) -> str:
+        """The host this rank's listener is published at: the bound host, else
+        the address the interfaces answer on. A deployment whose service
+        discovery publishes another of the node's addresses overrides this."""
+        host = get_serving().host
+        if host in ("", "0.0.0.0", "::"):
+            # An unspecified bind address is not reachable from another node.
+            detected = get_local_ip_auto(fallback="127.0.0.1")
+            if (
+                host == "0.0.0.0"
+                and NetworkAddress(detected, 0).is_ipv6
+                and _is_loopback(detected)
+            ):
+                # SGLANG_HOST_IP=::1 names this machine, which this IPv4
+                # listener serves at 127.0.0.1. It does not serve any other
+                # IPv6 address; gather_server_endpoints refuses those.
+                detected = "127.0.0.1"
+            host = detected
+        return host
 
     @classmethod
     def gather_server_endpoints(cls, hosts_listener: bool) -> List[Dict[str, Any]]:
         """Collective: every rank calls once; returns listener endpoints by DP rank."""
-        host = get_serving().host
-        if host in ("", "0.0.0.0", "::"):
-            # An unspecified bind address is not reachable from another
-            # node; advertise the address the interfaces answer on.
-            host = get_local_ip_auto(fallback="127.0.0.1")
+        if get_exec().moe.is_ep_joiner:
+            # An elastic-EP joiner stays out: the serving ranks gathered at
+            # their own startup and never enter this collective again, so a
+            # joiner's gather cannot meet them (a scale joiner's returns at
+            # once with unset slots, a recover joiner's waits on them; see
+            # #47505). With no endpoints the joiner's listener fans nothing
+            # out, and the serving ranks' table is untouched.
+            return []
+        bind_host = get_serving().host
+        host = cls._advertised_host()
         # Nodes that rendezvous on loopback share this machine, so a loopback
         # listener reaches them; otherwise it is a likely misconfiguration.
         if get_parallel().nnodes > 1 and _is_loopback(host):
@@ -217,28 +394,59 @@ class RustServer:
         config = None
         if hosts_listener:
             port = get_serving().port + cls._port_offset()
+            address = NetworkAddress(host, port)
             config = {
                 "dp_rank": select_kv_publisher_dp_rank(
                     get_parallel().attn_dp_size,
                     get_parallel().attn_dp_rank,
                     get_parallel().dp_rank,
                 ),
-                "endpoint": NetworkAddress(host, port).to_url(),
+                "endpoint": address.to_url(),
             }
+            if bind_host == "0.0.0.0" and address.is_ipv6:
+                config["address_error"] = (
+                    f"DP rank {config['dp_rank']} listens on IPv4 at {bind_host} "
+                    f"but advertises {address.to_url()}; set --host to :: or "
+                    "SGLANG_HOST_IP to an IPv4 address"
+                )
         gathered = get_parallel().world_group.all_gather_object(config)
-        return sorted(
+        table = sorted(
             (entry for entry in gathered if entry is not None),
             key=lambda entry: entry["dp_rank"],
         )
+        # Validate the collective result so every rank fails together, including
+        # ranks that host no listener, instead of leaving peers in the gather.
+        errors = [entry["address_error"] for entry in table if "address_error" in entry]
+        if errors:
+            raise ValueError("SGLANG_RUST_SERVER: " + "; ".join(errors))
+        attn_dp_size = get_parallel().attn_dp_size
+        if attn_dp_size > 1:
+            ranks = [entry["dp_rank"] for entry in table]
+            if ranks != list(range(attn_dp_size)):
+                raise ValueError(
+                    "SGLANG_RUST_SERVER: expected one Rust listener for each of "
+                    f"{attn_dp_size} attention-DP ranks, gathered {ranks}"
+                )
+        return table
 
     @classmethod
-    def launch(cls, scheduler: Scheduler) -> RustServer:
+    def launch(
+        cls, scheduler: Scheduler, frontend_cpu_share: Tuple[int, int] = (0, 1)
+    ) -> RustServer:
         """Start the embedded Rust server threads and bind the listen port.
 
         The caller gates this (``SGLANG_RUST_SERVER`` + rank 0); this always
         creates. A model the server cannot serve is refused before the port
         is bound.
         """
+        # The Rust server has generation routes only, and its /model_info
+        # reports every model as generative.
+        if not scheduler.model_config.is_generation:
+            raise RuntimeError(
+                "SGLANG_RUST_SERVER=1 serves generation models only; this is an "
+                "embedding or reward model. Unset SGLANG_RUST_SERVER to serve it."
+            )
+
         # Force turn off HF tokenizers rayon's unpinned global thread pool.
         os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
@@ -250,19 +458,33 @@ class RustServer:
         listen_port = get_serving().port + port_offset
         listen_addr = NetworkAddress(get_serving().host, listen_port).to_host_port_str()
 
-        launch_cores, server_cores = cls._partition_cores(
+        _, server_cores = cls._partition_cores(
             mm_workers=(
                 (get_mm().mm_processor_worker_num or RustMmProcessor.AUTO_MM_WORKERS)
                 if scheduler.model_config.is_multimodal
                 else 0
-            )
+            ),
+            cpu_share=frontend_cpu_share,
         )
 
         # Multimodal models must have a Rust pipeline — there is no Python
-        # fallback. The listener answers as soon as the server is constructed,
-        # so refuse a model without one first.
+        # fallback. The listener answers as soon as the server is constructed
+        # (a multimodal one admits generation requests once `_start_multimodal`
+        # starts its pool), so refuse a model without one first.
         mm_spec = (
             cls._resolve_multimodal(scheduler)
+            if scheduler.model_config.is_multimodal
+            else None
+        )
+        mm_cache_namespace = (
+            build_processor_fingerprint(
+                scheduler.processor,
+                scheduler.model_config.hf_config,
+                extra={
+                    "model_path": scheduler.model_config.model_path,
+                    "rust_spec": mm_spec.rust_json() if mm_spec is not None else None,
+                },
+            )
             if scheduler.model_config.is_multimodal
             else None
         )
@@ -274,6 +496,9 @@ class RustServer:
                 extension=extension,
                 health_generate_headers=cls._health_generate_headers(scheduler),
                 default_max_new_tokens=cls._default_max_new_tokens(scheduler),
+                request_class=cls._request_input_class(),
+                server_added_custom_params=cls._server_added_custom_params(),
+                port_offset=port_offset,
             ),
             # None runs unpinned; otherwise the list carries the pinning decision.
             cores=server_cores,
@@ -281,17 +506,26 @@ class RustServer:
             **cls._server_kwargs(scheduler),
         )
         instance = cls(server, http_port=listen_port)
+        instance._mm_cache_namespace = mm_cache_namespace
+        instance.server_args = scheduler.server_args
+        instance._broadcasts_shutdown = get_parallel().tp_rank == 0
 
         if scheduler.model_config.is_multimodal:
             # New threads inherit the spawning thread's affinity, and this launch
-            # thread still holds the full mask. Narrow it first so every MM thread
+            # thread holds the full mask. Narrow it while the MM threads are
             # created below (the Rust MM workers, and any a model package's
-            # `_start_multimodal` starts) stays off the scheduler's reserved
-            # cores, where MM preprocessing would preempt the scheduler loop and
-            # inflate inter-token latency.
+            # `_start_multimodal` starts) so they stay off the scheduler's
+            # reserved cores, where MM preprocessing would preempt the scheduler
+            # loop and inflate inter-token latency. Then give it back its own
+            # mask: the scheduler thread itself is not pinned, as in the Python
+            # frontend, so a busy neighbour on one core never holds it (and every
+            # TP rank waiting on it at the next collective) in that core's queue.
+            scheduler_cpus = None
             if server_cores is not None:
                 try:
+                    full_mask = os.sched_getaffinity(0)
                     os.sched_setaffinity(0, set(server_cores))
+                    scheduler_cpus = full_mask
                 except OSError as e:
                     logger.warning(
                         "rust server: cannot confine mm threads to server cores: %s", e
@@ -299,14 +533,8 @@ class RustServer:
             instance.mm_spec = mm_spec
             instance._start_multimodal(scheduler)
             instance._multimodal_enabled = True
-
-        # Narrow the scheduler thread only after the server threads are launched.
-        if launch_cores is not None:
-            try:
-                # pid 0 == this thread (the scheduler event-loop / launch thread).
-                os.sched_setaffinity(0, set(launch_cores))
-            except OSError as e:
-                logger.warning("rust server: cannot pin scheduler launch thread: %s", e)
+            if scheduler_cpus is not None:
+                os.sched_setaffinity(0, scheduler_cpus)
 
         # Under DP every rank runs its own server on its own port, so the rank is
         # what tells two otherwise identical startup lines apart.
@@ -321,7 +549,140 @@ class RustServer:
             dp_note,
         )
 
+        instance._watch_startup_failure()
         return instance
+
+    def _watch_startup_failure(self) -> threading.Thread:
+        """Take the server down when its startup warmup fails, as Python's
+        HTTP server does (``_execute_server_warmup``): signal the parent
+        process the way a crashed scheduler does (``run_scheduler_process``),
+        and the parent kills the process tree. A watcher thread, so a hung
+        scheduler loop cannot hold the server up."""
+        parent = psutil.Process().parent()
+
+        def watch() -> None:
+            error = self.server.wait_startup_failure()
+            if error is None:
+                # Shut down, after a warmup that succeeded, was skipped, or
+                # never finished.
+                return
+            logger.error("Rust server startup warmup failed: %s", error)
+            parent.send_signal(signal.SIGQUIT)
+
+        thread = threading.Thread(
+            target=watch, name="rust-server-startup-watch", daemon=True
+        )
+        thread.start()
+        return thread
+
+    def install_sigterm_drain(
+        self, notify: Optional[str] = None, hold_drain_end: bool = False
+    ) -> None:
+        """Drain this listener on SIGTERM, which the main process forwards
+        (``sglang.srt.rust_server.shutdown``), as Python mode's tokenizer
+        manager drains: health answers 503 at once, requests are still
+        admitted, the listener closes once none is left in flight, and then
+        :meth:`drain` stops the schedulers. ``SGLANG_FORCE_SHUTDOWN`` skips the
+        wait for requests, as in Python.
+
+        The drain begins from a Rust thread woken through the signal wakeup
+        fd, so it begins at once even while this scheduler thread is blocked
+        in a GPU call or collective; a wedged scheduler's listener still closes
+        when its last health probe failed. On the rank that stops the
+        schedulers, ``notify`` names the main process's socket
+        (``drain_notify_name``) that hears when the listener closed.
+
+        With ``hold_drain_end``, that rank's drain ends only once every
+        attention-DP listener has closed too (see :meth:`on_drain_rows`), since
+        the ``ShutdownReq`` stops every rank.
+        """
+        force = envs.SGLANG_FORCE_SHUTDOWN.get()
+        self._force_shutdown = force
+        if hold_drain_end:
+            self.server.hold_drain_end()
+            self._holds_drain_end = True
+            self._drain_rows = get_parallel().attn_dp_size
+        if threading.current_thread() is not threading.main_thread():
+            logger.warning(
+                "rust server: not on the main thread; SIGTERM will not drain"
+            )
+            return
+        if not self._broadcasts_shutdown:
+            notify = None
+
+        def on_sigterm(signum=None, frame=None):
+            # Already begun by the wakeup fd; repeated in case it was not.
+            self.server.begin_drain(force)
+
+        signal.signal(signal.SIGTERM, on_sigterm)
+        wakeup_fd = self.server.drain_signal_fd(signal.SIGTERM, force, notify)
+        previous = signal.set_wakeup_fd(wakeup_fd, warn_on_full_buffer=False)
+        if previous != -1:
+            logger.warning(
+                "rust server: replaced the signal wakeup fd %d to drain on SIGTERM",
+                previous,
+            )
+
+    def drain_state(self) -> int:
+        """This listener's ``DRAIN_*`` bits, which the MLP-sync gather shares
+        with the other attention-DP listeners."""
+        return self.server.drain_state()
+
+    def on_drain_rows(self, rows: List[int]) -> None:
+        """React to every attention-DP listener's drain state, one row per DP
+        group from the MLP-sync gather (``DPDrainColumn``). Runs on the
+        scheduler thread after each gather; idempotent, as a step can gather
+        twice.
+
+        A drain on any listener begins this one's, forced if any listener's
+        was, so a SIGTERM reaching one listener drains them all. A listener
+        holding its drain's end releases it once it is draining and every
+        listener row reports closed. A gathered row set that is not one
+        listener row per attention-DP group disables that wait, with an
+        error, rather than hold the drain forever: the end is then released
+        once this listener closed, as without the hold.
+        """
+        state = self.drain_state()
+        if any(row & DRAIN_DRAINING for row in rows):
+            force = any(row & DRAIN_FORCE_REQUESTED for row in rows)
+            if not state & DRAIN_DRAINING or (
+                force and not state & DRAIN_FORCE_REQUESTED
+            ):
+                logger.info(
+                    "rust server: a DP listener is draining; draining this one "
+                    "(forced=%s)",
+                    force or self._force_shutdown,
+                )
+                self.server.begin_drain(force or self._force_shutdown)
+                state = self.drain_state()
+        if (
+            not self._holds_drain_end
+            or self._drain_end_released
+            or self._shutdown_sent  # a forced drain skipped the hold
+        ):
+            return
+        if not self._drain_rows_mismatch and (
+            len(rows) != self._drain_rows
+            or any(row & DRAIN_STATE_NO_LISTENER for row in rows)
+        ):
+            logger.error(
+                "rust server: drain barrier disabled: row count/listener mismatch "
+                "(gathered %s for %d attention-DP listeners); the drain ends "
+                "once this listener closed, so the other DP listeners' last "
+                "requests may be cut",
+                rows,
+                self._drain_rows,
+            )
+            self._drain_rows_mismatch = True
+        if not state & DRAIN_DRAINING:
+            return
+        if self._drain_rows_mismatch:
+            closed = bool(state & DRAIN_CLOSED)
+        else:
+            closed = all(row & DRAIN_CLOSED for row in rows)
+        if closed and self.server.release_drain_end():
+            logger.info("rust server: every DP listener closed; ending the drain")
+            self._drain_end_released = True
 
     def _wrap_mm_result(self, buffers: dict) -> MultimodalProcessorOutput:
         """Wrap one request's ``mm.*`` buffers (``{name: numpy array |
@@ -345,6 +706,66 @@ class RustServer:
             tokenizer_e2e=time.time() - psutil.Process().create_time(),
         )
 
+    def dump_requests_before_crash(self) -> None:
+        """Write the ``--crash-dump-folder`` file ``TokenizerManager`` writes
+        before a crash: the finished requests of the last five minutes and the
+        unfinished ones, as the Rust server kept them. Once per process, and it
+        never raises: the scheduler calls it on its way down (an exception, a
+        watchdog timeout). It returns within ``CRASH_DUMP_GRACE_SECS`` even
+        if the dump stalls, so the caller's ``SIGQUIT`` still goes out; the
+        main process waits no longer than that for the dump anyway."""
+        folder = get_observability().crash_dump_folder
+        if not folder:
+            return
+        with self._crash_dump_lock:
+            if self._crash_dump_performed:
+                return
+            self._crash_dump_performed = True
+        dumper = threading.Thread(
+            target=self._dump_requests, args=(folder,), name="crash-dump", daemon=True
+        )
+        dumper.start()
+        dumper.join(CRASH_DUMP_GRACE_SECS)
+
+    def _dump_requests(self, folder: str) -> None:
+        try:
+            # The request lines logged so far reach stdout before the process dies.
+            self.server.flush_request_log()
+            with dumping(folder, crash_dump_hostname()):
+                self._write_crash_dump(folder)
+        except BaseException:  # a Rust panic is a BaseException
+            logger.exception("rust server: failed to write the crash dump")
+
+    def _write_crash_dump(self, folder: str) -> None:
+        logger.error(f"Dumping requests before crash. {folder=}")
+        snapshot = json.loads(self.server.crash_dump_snapshot())
+        rebuilt = _CrashDumpRequests(self._request_input_class(), snapshot["bodies"])
+        finished = [rebuilt.record(r, finished=True) for r in snapshot["finished"]]
+        unfinished = [rebuilt.record(r, finished=False) for r in snapshot["unfinished"]]
+        if not finished and not unfinished:
+            return
+        try:
+            resolved_config = get_context().resolved_server_args_dict(
+                self.server_args.resolved_dict()
+            )
+        except Exception as e:
+            logger.error(f"Failed to snapshot the resolved config for the dump: {e!r}")
+            resolved_config = None
+        filename = write_crash_dump(
+            folder,
+            crash_dump_hostname(),
+            finished + unfinished,
+            server_args=self.server_args,
+            resolved_config=resolved_config,
+            watermark_config=self.server_args.watermark_config,
+            # Every process that hosts a listener dumps its own requests.
+            filename_suffix=f"_{os.getpid()}",
+        )
+        logger.error(
+            f"Dumped {len(finished)} finished and {len(unfinished)} unfinished "
+            f"requests before crash to {filename}"
+        )
+
     def mm_transport_stats(self) -> Dict[str, int]:
         """Snapshot of the zero-copy accounting at the multimodal hand-off
         (see :class:`~sglang.srt.rust_server.multimodal.MmTransportStats`);
@@ -353,9 +774,13 @@ class RustServer:
 
     def wait_request(self, timeout_ms: int) -> None:
         """Block until a request is pushed into the in-process ring or the timeout
-        elapses.
+        elapses. Without --sleep-on-idle, return at once, so the idle loop
+        polls the ring without blocking as Python's polls its sockets: a parked
+        thread starts each request's step on a cold core. A subclass that
+        holds drained requests back still parks on those.
         """
-        self.server.wait_request(timeout_ms)
+        if get_device().sleep_on_idle:
+            self.server.wait_request(timeout_ms)
 
     def drain(self, max_recv: int) -> List[Any]:
         """Ingress: non-blocking drain of the in-process ring → list of decoded
@@ -392,7 +817,24 @@ class RustServer:
                 continue
             settle_shm_buffers(buffers, admitted=True)
             out.append(obj)
+        if (
+            self._broadcasts_shutdown
+            and not self._shutdown_sent
+            and self.server.drain_complete()
+        ):
+            # Rides the broadcast to every scheduler rank, as Python mode's
+            # `sigterm_watchdog` dispatches it once its requests drained. With
+            # a held drain end (`on_drain_rows`) every DP listener has closed.
+            logger.info("rust server: drain complete; stopping the schedulers")
+            self._shutdown_sent = True
+            self._before_shutdown_req()
+            out.append(ShutdownReq())
         return out
+
+    def _before_shutdown_req(self) -> None:
+        """Runs once, on the scheduler thread, just before :meth:`drain`
+        returns the ``ShutdownReq`` that stops the schedulers; a subclass stops
+        the helpers that must not outlive them here."""
 
     def _admit(self, header: bytes, buffers: dict):
         """Decode and attach one drained request, or report the rejection to
@@ -434,6 +876,20 @@ class RustServer:
             # step of the Rust path; a text-only request on a multimodal
             # model carries no `mm.*` buffers.
             obj.mm_inputs = self._wrap_mm_result(buffers)
+            if self._mm_cache_namespace is None:
+                raise RuntimeError("Rust multimodal cache namespace is not initialized")
+            for item in obj.mm_inputs.mm_items:
+                if item.identity is None or len(item.identity) != 32:
+                    raise ValueError(
+                        "Rust multimodal workers must return a full 32-byte identity"
+                    )
+                # Bind all wrappers, including external packages. Only the
+                # 32-byte worker digest is hashed on the scheduler thread.
+                item.bind_processor_fingerprint(self._mm_cache_namespace)
+            if obj.mm_inputs.padded_input_ids is not None:
+                obj.mm_inputs.padded_input_ids = obj.mm_inputs.build_padded_input_ids(
+                    obj.mm_inputs.input_ids, obj.mm_inputs.mm_items
+                )
 
     def push_control_output(self, recv_req, output) -> None:
         """Push a control-request response through the egress ring to the waiting
@@ -508,7 +964,12 @@ class RustServer:
         self.server.push_health_ack()
 
     def push_generation(
-        self, payload: BatchTokenIDOutput, decode_latencies: Dict[int, float]
+        self,
+        payload: BatchTokenIDOutput,
+        decode_latencies: Dict[int, float],
+        cached_tokens_split: Optional[List[Tuple[int, int, int]]] = None,
+        storage_backend: Optional[str] = None,
+        request_stats: Optional[Dict[int, Dict[str, Any]]] = None,
     ) -> None:
         """Egress redirect for generation output (replaces the zmq detokenizer).
 
@@ -524,10 +985,16 @@ class RustServer:
             and hidden ones), then the finished requests' weight-version
             spans, a multimodal model's media token counts,
             ``decode_latencies`` (by row: a finished non-streaming request's
-            decode latency in seconds), and the scheduler's
-            ``customized_info`` (per key, each request's values for its new
-            output tokens) as one JSON text, which the frontend accumulates
-            and reports in ``meta_info`` as Python's TokenizerManager does.
+            decode latency in seconds), the scheduler's ``customized_info``
+            (per key, each request's values for its new output tokens) as one
+            JSON text, which the frontend accumulates and reports in
+            ``meta_info`` as Python's TokenizerManager does,
+            ``cached_tokens_split`` (by row: the request's cached tokens per
+            cache tier, ``(device, host, storage)``, when the cache has more
+            tiers than the device), for the whole frame, the attached
+            ``storage_backend``, and ``request_stats`` (by row: a finished
+            request's ``meta_info`` keys from scheduler state, which the
+            frontend reports as they are).
           - ``data``: the raw little-endian numeric buffer: the token ids
             first, as the 8-byte ``array("q")`` bytes the scheduler already
             holds, then every logprob / hidden column as 4-byte elements
@@ -540,7 +1007,6 @@ class RustServer:
         buffers plus a per-position ``lens`` vector (0 = null position). Hidden
         states flatten to rows of floats (one row per output position).
         """
-        output_ids = payload.output_ids or []
         prompt_tokens = payload.prompt_tokens or []
 
         # Hot-path guard: almost no decode step wants logprobs / hidden states,
@@ -559,15 +1025,14 @@ class RustServer:
         # Python-level pass over the batch costs inter-token latency: `rids` are
         # the plain rid strings (hashed to a routing key on the Rust side with a
         # per-process seed, off the GIL — not parsed; a rid is any string),
-        # `finished_reasons` already `dict | None`, and `output_ids` entries are
-        # always `array("q")` slices of `Req.output_ids` (never None), so both
-        # `map`s stay in C and their bytes go out as-is: one memcpy per request,
-        # no per-element repack. Measured at 256 single-token requests: 10 us,
-        # against 18 us for `array("i", chain.from_iterable(...))`.
+        # `finished_reasons` already `dict | None`, and the token ids already
+        # one flat `array("q")`, whose bytes go out as-is in one copy, with
+        # `tok_lens` taken from its row offsets in a C-level `map`.
         rids = payload.rids
         finish_reasons = payload.finished_reasons
-        tok_lens = list(map(len, output_ids))
-        flat_ids = b"".join(map(array.tobytes, output_ids))
+        offsets = payload.output_ids_offsets
+        tok_lens = list(map(operator.sub, offsets[1:], offsets[:-1]))
+        flat_ids = payload.output_ids_flat.tobytes()
 
         # Column order here MUST match BatchHeader (header_cols) and
         # for_each_chunk's read order (data_cols); the extras contribution
@@ -631,11 +1096,16 @@ class RustServer:
                 ),
             )
 
-            # Every column is all-or-nothing per payload — which is also what makes
-            # a family's emptiness a reliable "nobody asked for this" signal.
-            active = []
+            # Each column has one cell per request or none at all. The
+            # accumulator gives a batch with any logprob request a cell per
+            # request in all twelve logprob columns, mostly empty, so `fill`
+            # visits only the rows whose cell carries data. A family with none
+            # stays empty, which the Rust decoder reads as absent (`per_req_ok`
+            # admits an empty column, `lens_i` reads 0 for every request), and
+            # the `header_cols`/`data_cols` loops below still walk all seven,
+            # so column ORDER and arity are unchanged. Visiting every row of
+            # every family added Python work on the scheduler thread with the GIL held.
             for extra in extras:
-                populated = False
                 for name, col in extra.columns():
                     assert len(col) in (
                         0,
@@ -643,27 +1113,7 @@ class RustServer:
                     ), (
                         f"extras column {name}: {len(col)} entries for a batch of {batch_size}"
                     )
-                    populated |= len(col) > 0
-                if populated:
-                    active.append(extra)
-
-            # Flatten only the families someone asked for. `has_extra` above is a
-            # per-FRAME guard, so one client enabling logprobs used to drag all
-            # seven families through the per-request loop: at B=4096 that is 28,672
-            # bound-method calls per decode step, materializing 12 columns of 4096
-            # zeros nobody reads. Measured 0.37 ms -> 7.90 ms GIL-held per step,
-            # i.e. 25-75% of a decode step added to the scheduler's critical path.
-            #
-            # Skipping `accept` leaves a family's buffers empty, which is exactly
-            # the wire form the Rust decoder already treats as absent (`per_req_ok`
-            # admits an empty column, `lens_i` reads 0 for every request). The
-            # `header_cols`/`data_cols` loops below still walk all seven, so column
-            # ORDER and arity are unchanged — an inactive family contributes empty
-            # columns in place rather than disappearing.
-            for extra in active:
-                accept = extra.accept  # hoisted: this is the hottest loop here
-                for i in range(batch_size):
-                    accept(i)
+                extra.fill(batch_size)
 
             extras_start = len(header_cols)
             for extra in extras:
@@ -676,15 +1126,21 @@ class RustServer:
 
         # After the extras: the finished requests' weight-version spans (None
         # for the others), a multimodal model's media token counts, the
-        # finished requests' decode latencies and the customized_info columns,
-        # each empty when nothing in the batch carries it. Only the latencies
-        # are built here, for finished rows; the header stops at its last
-        # non-empty column.
+        # finished requests' decode latencies, the customized_info columns and
+        # the cached tokens by tier, each empty when nothing in the batch
+        # carries it, then the frame's storage backend and the finished
+        # requests' stats. Only the latency and stats columns are built here,
+        # for finished rows; the header stops at its last non-empty column.
         latencies = []
         if decode_latencies:
             latencies = [None] * len(rids)
             for row, latency in decode_latencies.items():
                 latencies[row] = latency
+        stats = []
+        if request_stats:
+            stats = [None] * len(rids)
+            for row, row_stats in request_stats.items():
+                stats[row] = row_stats
         media = self._multimodal_enabled
         trailing = [
             payload.weight_versions or [],
@@ -694,6 +1150,9 @@ class RustServer:
             latencies,
             [],  # abort_outputs, push_abort's column
             self._customized_info_json(payload.customized_info),
+            cached_tokens_split or [],
+            storage_backend,
+            stats,
         ]
         while trailing and not trailing[-1]:
             trailing.pop()
@@ -759,4 +1218,62 @@ class RustServer:
             image_mean=spec.image_mean,
             image_std=spec.image_std,
             resample=resample,
+        )
+
+
+class _CrashDumpRequests:
+    """Rebuilds the request objects ``TokenizerManager`` would hold from the
+    Rust server's crash-dump snapshot (``Server.crash_dump_snapshot``): each
+    request JSON it received (``bodies``), normalized by Python's own code
+    once per body, then the batch item a request was and the rid its client
+    sees."""
+
+    def __init__(self, request_class: type, bodies: Dict[str, Dict[str, Any]]):
+        self.request_class = request_class
+        self.bodies = bodies
+        self.names = {f.name for f in dataclasses.fields(request_class) if f.init}
+        self.normalized: Dict[str, Any] = {}
+
+    def record(self, record: Dict[str, Any], finished: bool) -> tuple:
+        """One ``(request, out, created_time, finished_time)`` tuple."""
+        return (
+            self.request(
+                str(record["body"]), record["batch_index"], record["rid"], finished
+            ),
+            record["out"],
+            record["created_time"],
+            record["finished_time"],
+        )
+
+    def request(
+        self, body_id: str, batch_index: Optional[int], rid: str, finished: bool
+    ):
+        fields = self.bodies[body_id]
+        try:
+            if body_id not in self.normalized:
+                obj = self._construct(fields)
+                obj.normalize_batch_and_arguments()
+                self.normalized[body_id] = obj
+            obj = self.normalized[body_id]
+            if batch_index is not None:
+                obj = obj[batch_index]
+        except Exception as e:
+            logger.warning(f"crash dump: request {rid} kept as received: {e!r}")
+            try:
+                obj = self._construct(fields)
+            except Exception:
+                return dict(fields, rid=rid)
+        obj.rid = rid
+        if finished and isinstance(obj.input_ids, list):
+            # As `record_request_for_crash_dump` keeps a finished request's ids.
+            obj.input_ids = (
+                tuple(tuple(row) for row in obj.input_ids)
+                if obj.input_ids and isinstance(obj.input_ids[0], list)
+                else tuple(obj.input_ids)
+            )
+        return obj
+
+    def _construct(self, fields: Dict[str, Any]):
+        return self.request_class(
+            **{name: value for name, value in fields.items() if name in self.names}
         )
