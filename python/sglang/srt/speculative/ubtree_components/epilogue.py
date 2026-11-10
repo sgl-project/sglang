@@ -18,11 +18,7 @@ from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
     fused_commit_track_indices,
 )
 from sglang.kernels.ops.speculative.spec_tree import verify_tree_greedy_func
-from sglang.kernels.ops.speculative.ubtree import (
-    prepare_draft_commit_metadata,
-    prepare_target_kv_move_metadata,
-    prepare_unified_commit_metadata,
-)
+from sglang.kernels.ops.speculative.ubtree import prepare_unified_commit_metadata
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.ubtree_info import UBTreeVerifyInput
@@ -53,34 +49,22 @@ class UBTreeVerifyEpilogue:
         node_count: int,
         max_depth: int,
         device,
-        target_kvcache=None,
-        req_to_token: Optional[torch.Tensor] = None,
-        draft_commit=None,
-        draft_req_to_token: Optional[torch.Tensor] = None,
     ) -> None:
         self.max_bs = int(max_bs)
         self.node_count = int(node_count)
         # A root-inclusive accepted path cannot contain more rows than the
         # verify tree itself.
         self.max_depth = min(int(max_depth), self.node_count)
-        self.target_kvcache = target_kvcache
-        self.req_to_token = req_to_token
-        self.draft_commit = draft_commit
-        self.draft_req_to_token = draft_req_to_token
+        self.target_kvcache = None
+        self.req_to_token: Optional[torch.Tensor] = None
+        self.draft_commit = None
+        self.draft_req_to_token: Optional[torch.Tensor] = None
         self._get_draft_kv_workspace: Optional[
             Callable[[], tuple[torch.Tensor, ...]]
         ] = None
         self.kda_spec_state = None
         self.mamba_index_mapping: Optional[torch.Tensor] = None
         self.mamba_track_interval = 0
-        if (target_kvcache is None) != (req_to_token is None):
-            raise ValueError(
-                "target_kvcache and req_to_token must be configured together"
-            )
-        if (draft_commit is None) != (draft_req_to_token is None):
-            raise ValueError(
-                "draft_commit and draft_req_to_token must be configured together"
-            )
         if self.max_bs <= 0 or self.node_count <= 0 or self.max_depth <= 0:
             raise ValueError("UBTree epilogue dimensions must be positive")
 
@@ -294,29 +278,21 @@ class UBTreeVerifyEpilogue:
         )
         return self.compact_hidden_buf
 
-    def attach_target_kv_commit(
-        self, *, target_kvcache, req_to_token: torch.Tensor
-    ) -> None:
-        """Attach target KV storage after the worker allocates memory pools."""
-
-        if target_kvcache is None or req_to_token is None:
-            raise ValueError("target KV commit requires cache and req_to_token")
-        self.target_kvcache = target_kvcache
-        self.req_to_token = req_to_token
-
-    def attach_draft_kv_commit(
+    def attach_kv_commit(
         self,
         *,
+        target_kvcache,
+        target_req_to_token: torch.Tensor,
         draft_commit,
-        req_to_token: torch.Tensor,
+        draft_req_to_token: torch.Tensor,
         get_workspace_tensors: Optional[Callable[[], tuple[torch.Tensor, ...]]] = None,
     ) -> None:
-        """Attach a graph-safe draft hidden/KV writer after pool allocation."""
+        """Attach the target KV mover and draft writer after pool allocation."""
 
-        if draft_commit is None or req_to_token is None:
-            raise ValueError("draft KV commit requires writer and req_to_token")
+        self.target_kvcache = target_kvcache
+        self.req_to_token = target_req_to_token
         self.draft_commit = draft_commit
-        self.draft_req_to_token = req_to_token
+        self.draft_req_to_token = draft_req_to_token
         self._get_draft_kv_workspace = get_workspace_tensors
 
     def attach_kda_tree_commit(
@@ -342,12 +318,8 @@ class UBTreeVerifyEpilogue:
         self.mamba_track_interval = int(mamba_track_interval)
 
     @property
-    def folds_target_kv(self) -> bool:
+    def folds_kv(self) -> bool:
         return self.target_kvcache is not None
-
-    @property
-    def folds_draft_kv(self) -> bool:
-        return self.draft_commit is not None
 
     @property
     def folds_kda_commit(self) -> bool:
@@ -459,21 +431,21 @@ class UBTreeVerifyEpilogue:
             out=self.bonus_tokens_i32_buf[:bs],
         )
         self.bonus_tokens_buf[:bs].copy_(self.bonus_tokens_i32_buf[:bs].reshape(-1))
-        if self.folds_target_kv or self.folds_draft_kv or self.folds_kda_commit:
+        if self.folds_kv or self.folds_kda_commit:
             if req_pool_indices is None or seq_lens is None:
                 raise ValueError(
                     "folded KV commit requires graph-stable request metadata"
                 )
 
-        target_cache_loc_2d = self.target_cache_loc_buf[:bs]
-        source_cache_loc_2d = self.source_cache_loc_buf[:bs]
-        positions_2d = self.draft_positions_buf[:bs]
-        draft_cache_loc_2d = self.draft_cache_loc_buf[:bs]
-        if self.folds_target_kv and self.folds_draft_kv:
+        if self.folds_kv:
             if out_cache_loc is None:
                 raise ValueError(
                     "folded target KV commit requires graph-stable cache locations"
                 )
+            target_cache_loc_2d = self.target_cache_loc_buf[:bs]
+            source_cache_loc_2d = self.source_cache_loc_buf[:bs]
+            positions_2d = self.draft_positions_buf[:bs]
+            draft_cache_loc_2d = self.draft_cache_loc_buf[:bs]
             prepare_unified_commit_metadata(
                 req_pool_indices=req_pool_indices[:bs],
                 target_req_to_token=self.req_to_token,
@@ -487,38 +459,10 @@ class UBTreeVerifyEpilogue:
                 draft_positions_out=positions_2d,
                 draft_cache_loc_out=draft_cache_loc_2d,
             )
-        else:
-            if self.folds_target_kv:
-                if out_cache_loc is None:
-                    raise ValueError(
-                        "folded target KV commit requires graph-stable cache locations"
-                    )
-                prepare_target_kv_move_metadata(
-                    req_pool_indices=req_pool_indices[:bs],
-                    req_to_token=self.req_to_token,
-                    seq_lens=self.seq_lens_buf[:bs],
-                    accept_index=accept_index,
-                    accept_lens=commit_lens,
-                    out_cache_loc=out_cache_loc[:rows],
-                    target_cache_loc_out=target_cache_loc_2d.reshape(-1),
-                    source_cache_loc_out=source_cache_loc_2d.reshape(-1),
-                )
-            if self.folds_draft_kv:
-                prepare_draft_commit_metadata(
-                    seq_lens=self.seq_lens_buf[:bs],
-                    req_pool_indices=req_pool_indices[:bs],
-                    req_to_token=self.draft_req_to_token,
-                    positions_out=positions_2d,
-                    cache_loc_out=draft_cache_loc_2d,
-                )
-
-        if self.folds_target_kv:
             self.target_kvcache.move_kv_cache(
                 target_cache_loc_2d.reshape(-1),
                 source_cache_loc_2d.reshape(-1),
             )
-
-        if self.folds_draft_kv:
             self.draft_commit(
                 target_hidden=compact_hidden,
                 cache_loc=draft_cache_loc_2d.reshape(-1),

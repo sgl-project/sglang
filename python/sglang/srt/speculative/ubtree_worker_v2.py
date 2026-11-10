@@ -232,13 +232,11 @@ class UBTreeWorkerV2(DFlashWorkerV2):
                     "UBTREE requires fused draft KV materialization and factorized KDA state"
                 )
             epilogue = self._verify_epilogue
-            epilogue.attach_target_kv_commit(
+            epilogue.attach_kv_commit(
                 target_kvcache=target_kvcache,
-                req_to_token=req_to_token_pool.req_to_token,
-            )
-            epilogue.attach_draft_kv_commit(
+                target_req_to_token=req_to_token_pool.req_to_token,
                 draft_commit=self._append_target_hidden_to_draft_kv_by_loc,
-                req_to_token=req_to_token_pool.req_to_token,
+                draft_req_to_token=req_to_token_pool.req_to_token,
                 get_workspace_tensors=self._fused_kv_helper.get_workspace_tensors,
             )
             epilogue.attach_kda_tree_commit(

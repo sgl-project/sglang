@@ -349,7 +349,6 @@ def test_proposal_tail_replays_changing_inputs_exactly():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA Graph requires CUDA")
 def test_full_draft_graph_refreshes_replaced_request_tensors(monkeypatch):
-    from sglang.kernels.ops.speculative.ubtree import prepare_draft_commit_metadata
     from sglang.srt.speculative.ubtree_components import draft_graph
 
     # No collectives in this small backbone. Keep the real CUDA capture/replay
@@ -391,13 +390,11 @@ def test_full_draft_graph_refreshes_replaced_request_tensors(monkeypatch):
     tail_cache_locs = torch.empty_like(tail_positions)
 
     def tail(output, input_ids, batch):
-        prepare_draft_commit_metadata(
-            seq_lens=batch.seq_lens,
-            req_pool_indices=batch.req_pool_indices,
-            req_to_token=req_to_token,
-            positions_out=tail_positions,
-            cache_loc_out=tail_cache_locs,
+        torch.add(
+            batch.seq_lens[:, None], torch.arange(4, device="cuda"), out=tail_positions
         )
+        rows = batch.req_pool_indices[:, None].long()
+        tail_cache_locs.copy_(req_to_token[rows, tail_positions])
         return tail_positions, tail_cache_locs
 
     runner.attach_capture_tail(tail)
@@ -424,93 +421,6 @@ def test_full_draft_graph_refreshes_replaced_request_tensors(monkeypatch):
         torch.testing.assert_close(
             tail_cache_locs, req_to_token[req_index, positions][None, :]
         )
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_prepare_draft_commit_metadata_is_cuda_graph_replay_safe():
-    from sglang.kernels.ops.speculative.ubtree import prepare_draft_commit_metadata
-
-    device = torch.device("cuda")
-    req_to_token = torch.arange(4 * 64, dtype=torch.int64, device=device).view(4, 64)
-    seq_lens = torch.tensor([2, 9], dtype=torch.int32, device=device)
-    req_pool_indices = torch.tensor([3, 1], dtype=torch.int32, device=device)
-    positions = torch.empty((2, 16), dtype=torch.int64, device=device)
-    cache_locs = torch.empty_like(positions)
-
-    # Compile before capture; the replay itself must only use stable tensor addresses.
-    prepare_draft_commit_metadata(
-        seq_lens=seq_lens,
-        req_pool_indices=req_pool_indices,
-        req_to_token=req_to_token,
-        positions_out=positions,
-        cache_loc_out=cache_locs,
-    )
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        prepare_draft_commit_metadata(
-            seq_lens=seq_lens,
-            req_pool_indices=req_pool_indices,
-            req_to_token=req_to_token,
-            positions_out=positions,
-            cache_loc_out=cache_locs,
-        )
-
-    seq_lens.copy_(torch.tensor([5, 17], dtype=torch.int32, device=device))
-    req_pool_indices.copy_(torch.tensor([0, 2], dtype=torch.int32, device=device))
-    graph.replay()
-    torch.cuda.synchronize()
-
-    offsets = torch.arange(16, dtype=torch.int64, device=device)
-    expected_positions = seq_lens.to(torch.int64)[:, None] + offsets
-    expected_cache_locs = req_to_token[
-        req_pool_indices.to(torch.int64)[:, None], expected_positions
-    ]
-    assert torch.equal(positions, expected_positions)
-    assert torch.equal(cache_locs, expected_cache_locs)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_prepare_target_kv_move_metadata_is_cuda_graph_replay_safe():
-    from sglang.kernels.ops.speculative.ubtree import prepare_target_kv_move_metadata
-
-    device = torch.device("cuda")
-    req_to_token = torch.arange(4 * 64, dtype=torch.int64, device=device).view(4, 64)
-    req_pool_indices = torch.tensor([2, 0], dtype=torch.int32, device=device)
-    seq_lens = torch.tensor([3, 11], dtype=torch.int32, device=device)
-    accept_index = torch.tensor(
-        [[0, 2, 4, -1], [5, 6, -1, -1]], dtype=torch.int32, device=device
-    )
-    accept_lens = torch.tensor([3, 2], dtype=torch.int32, device=device)
-    out_cache_loc = torch.arange(10, dtype=torch.int64, device=device) + 1000
-    target = torch.empty((8,), dtype=torch.int64, device=device)
-    source = torch.empty_like(target)
-
-    kwargs = dict(
-        req_pool_indices=req_pool_indices,
-        req_to_token=req_to_token,
-        seq_lens=seq_lens,
-        accept_index=accept_index,
-        accept_lens=accept_lens,
-        out_cache_loc=out_cache_loc,
-        target_cache_loc_out=target,
-        source_cache_loc_out=source,
-    )
-    prepare_target_kv_move_metadata(**kwargs)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        prepare_target_kv_move_metadata(**kwargs)
-
-    seq_lens.copy_(torch.tensor([7, 13], dtype=torch.int32, device=device))
-    req_pool_indices.copy_(torch.tensor([1, 3], dtype=torch.int32, device=device))
-    accept_index.copy_(
-        torch.tensor([[1, -1, -1, -1], [3, 7, 8, -1]], dtype=torch.int32, device=device)
-    )
-    accept_lens.copy_(torch.tensor([1, 3], dtype=torch.int32, device=device))
-    graph.replay()
-    torch.cuda.synchronize()
-
-    assert torch.equal(target.cpu(), torch.tensor([71, 205, 206, 207, 0, 0, 0, 0]))
-    assert torch.equal(source.cpu(), torch.tensor([1001, 1003, 1007, 1008, 0, 0, 0, 0]))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -1229,9 +1139,12 @@ def test_verify_graphs_retain_materializer_workspace_after_prefill_growth(
         return tuple(weakref.ref(tensor) for tensor in helper.get_workspace_tensors())
 
     epilogue = UBTreeVerifyEpilogue(max_bs=1, node_count=3, max_depth=2, device="cuda")
-    epilogue.attach_draft_kv_commit(
+    req_to_token = torch.arange(512, device="cuda").view(1, -1)
+    epilogue.attach_kv_commit(
+        target_kvcache=SimpleNamespace(move_kv_cache=lambda target, source: None),
+        target_req_to_token=req_to_token,
         draft_commit=draft_commit,
-        req_to_token=torch.arange(512, device="cuda").view(1, -1),
+        draft_req_to_token=req_to_token,
         get_workspace_tensors=helper.get_workspace_tensors,
     )
     metadata = SimpleNamespace(
