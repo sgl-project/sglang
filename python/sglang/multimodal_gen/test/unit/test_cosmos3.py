@@ -1771,7 +1771,7 @@ class TestCosmos3Transfer(unittest.TestCase):
 
             return fake_run
 
-        def run(rank, world):
+        def run(rank, world, lockstep):
             stage._run_transformer = make_run(rank)
             branches = stage._control_cfg_branches(
                 torch.zeros(1),
@@ -1792,6 +1792,7 @@ class TestCosmos3Transfer(unittest.TestCase):
                 fps=24.0,
                 cfg_rank=rank,
                 cfg_world_size=world,
+                cfg_lockstep=lockstep,
             )
 
         target = (
@@ -1801,23 +1802,31 @@ class TestCosmos3Transfer(unittest.TestCase):
         # Stand in for the all-reduce with identity so each rank returns its own
         # partial; summing them mimics the cross-rank reduction.
         with mock.patch(target, side_effect=lambda x: x):
-            # 2 ranks: rank 0 runs the two control-in forwards (cond_full +
-            # uncond), rank 1 runs only the control-dropped cond_nc.
-            r0 = run(0, 2)
-            r1 = run(1, 2)
-            self.assertEqual(seen[0], ["cond", "uncond"])
-            self.assertEqual(seen[1], ["cond_nc"])
-            self.assertTrue(torch.allclose(r0 + r1, torch.full((1,), 86.0)))
+            # FSDP across CFG ranks needs equal forwards per rank: a rank with no
+            # branch left pads with a discarded forward. Replicated weights skip it.
+            for lockstep, pad_r1, pad_r3 in (
+                (True, ["uncond"], ["cond"]),
+                (False, [], []),
+            ):
+                with self.subTest(lockstep=lockstep):
+                    seen.clear()
+                    # 2 ranks: rank 0 runs the two control-in forwards (cond_full +
+                    # uncond), rank 1 runs cond_nc.
+                    r0 = run(0, 2, lockstep)
+                    r1 = run(1, 2, lockstep)
+                    self.assertEqual(seen[0], ["cond", "uncond"])
+                    self.assertEqual(seen[1], ["cond_nc"] + pad_r1)
+                    self.assertTrue(torch.allclose(r0 + r1, torch.full((1,), 86.0)))
 
-            seen.clear()
-            # 4 ranks for 3 branches: rank 3 is idle and contributes zeros.
-            parts = [run(r, 4) for r in range(4)]
-            self.assertEqual(seen[0], ["cond"])
-            self.assertEqual(seen[1], ["cond_nc"])
-            self.assertEqual(seen[2], ["uncond"])
-            self.assertEqual(seen[3], [])
-            self.assertTrue(torch.allclose(parts[3], torch.zeros(1)))
-            self.assertTrue(torch.allclose(sum(parts), torch.full((1,), 86.0)))
+                    seen.clear()
+                    # 4 ranks for 3 branches: rank 3 contributes zeros.
+                    parts = [run(r, 4, lockstep) for r in range(4)]
+                    self.assertEqual(seen[0], ["cond"])
+                    self.assertEqual(seen[1], ["cond_nc"])
+                    self.assertEqual(seen[2], ["uncond"])
+                    self.assertEqual(seen[3], pad_r3)
+                    self.assertTrue(torch.allclose(parts[3], torch.zeros(1)))
+                    self.assertTrue(torch.allclose(sum(parts), torch.full((1,), 86.0)))
 
     def test_single_hint_defaults_applied(self):
         sp = Cosmos3SamplingParams(
@@ -1882,6 +1891,136 @@ class TestCosmos3Transfer(unittest.TestCase):
             Cosmos3SamplingParams(
                 prompt="t", control_path="x.mp4", control_hint="bogus"
             )
+
+
+class TestCosmos3CfgParallelUndCache(unittest.TestCase):
+    """CFG ranks must miss the UND K/V cache in the same steps."""
+
+    _MODULE = (
+        "sglang.multimodal_gen.runtime.pipelines_core.stages."
+        "model_specific_stages.cosmos3"
+    )
+    # 6 steps; a [400, 1000] window (the T2I default) covers steps 0-3.
+    _TIMESTEPS = [999.0, 800.0, 600.0, 400.0, 200.0, 50.0]
+
+    def _und_cache_misses(
+        self,
+        *,
+        cfg_rank,
+        guidance_interval,
+        cfg_world_size=2,
+        control_guidance=1.0,
+        use_fsdp_inference=True,
+    ):
+        stage = Cosmos3DenoisingStage.__new__(Cosmos3DenoisingStage)
+        cache = set()
+        misses = []
+
+        def fake_run(*, latents, cache_key, current_timestep, **_):
+            if cache_key not in cache:
+                cache.add(cache_key)
+                misses.append(current_timestep)
+            return torch.zeros_like(latents)
+
+        stage.transformer = mock.Mock(reset_cache=mock.Mock(side_effect=cache.clear))
+        stage._run_transformer = fake_run
+        stage.scheduler = mock.Mock(step=lambda noise_pred, t, latents, **_: (latents,))
+        stage.progress_bar = lambda iterable, **_: iterable
+        stage.log_info = lambda *_: None
+        stage.check_cancelled = lambda _: None
+        stage._logged_parallel_config = True
+        stage._logged_cfg_split = True
+        stage._current_batch_is_warmup = False
+
+        text = torch.zeros(1, 4, dtype=torch.long)
+        batch = types.SimpleNamespace(
+            sampling_params=types.SimpleNamespace(
+                guidance_interval=guidance_interval,
+                control_guidance=control_guidance,
+            ),
+            extra={
+                "cond_text_ids": text,
+                "cond_text_mask": torch.ones_like(text),
+                "uncond_text_ids": text,
+                "uncond_text_mask": torch.ones_like(text),
+                "cond_text_seq_len": 4,
+                "uncond_text_seq_len": 4,
+                "video_shape": (1, 1, 1),
+                "control_latents": (
+                    [torch.zeros(1)] if control_guidance != 1.0 else None
+                ),
+            },
+            latents=torch.zeros(1, 1, 1, 1, 1),
+            audio_latents=None,
+            timesteps=torch.tensor(self._TIMESTEPS),
+            guidance_scale=4.0,
+            generator=None,
+            seed=None,
+            scheduler=None,
+            rollout=False,
+            profile=False,
+            is_warmup=False,
+        )
+        server_args = types.SimpleNamespace(
+            enable_cfg_parallel=True,
+            use_fsdp_inference=use_fsdp_inference,
+            pipeline_config=None,
+        )
+        patches = {
+            "get_classifier_free_guidance_rank": cfg_rank,
+            "get_classifier_free_guidance_world_size": cfg_world_size,
+            "get_sp_world_size": 1,
+            "rollout_step_kwargs": {},
+            "prepare_rollout_if_enabled": None,
+            "init_rollout_env_if_enabled": None,
+            "finalize_rollout_if_enabled": None,
+        }
+        with contextlib.ExitStack() as stack:
+            for name, value in patches.items():
+                stack.enter_context(
+                    mock.patch(f"{self._MODULE}.{name}", return_value=value)
+                )
+            stack.enter_context(
+                mock.patch(
+                    f"{self._MODULE}.cfg_model_parallel_all_reduce",
+                    side_effect=lambda x: x,
+                )
+            )
+            stage._denoise_once(batch, server_args)
+        return misses
+
+    def test_ranks_miss_und_cache_in_same_steps(self):
+        cases = {
+            # CFG on throughout (T2V/I2V): one UND pass per rank, no resets.
+            "always_on": (None, 2, 1.0, [0]),
+            # T2I default: CFG split ends at step 4, where every rank runs "cond".
+            # Rank 1 has only cached "uncond".
+            "window_ends": ((400.0, 1000.0), 2, 1.0, [0, 4]),
+            # CFG split starts at step 3, where rank 1 first needs "uncond".
+            "window_starts": ((0.0, 500.0), 2, 1.0, [0, 3]),
+            # Transfer on 3 CFG ranks: the control split stays on while the text
+            # window closes at step 4, dropping "uncond"; rank 2 then pads with "cond".
+            "control_text_window_ends": ((400.0, 1000.0), 3, 2.0, [0, 4]),
+        }
+        for name, (interval, world, control_g, expected) in cases.items():
+            with self.subTest(name):
+                per_rank = [
+                    self._und_cache_misses(
+                        cfg_rank=rank,
+                        guidance_interval=interval,
+                        cfg_world_size=world,
+                        control_guidance=control_g,
+                    )
+                    for rank in range(world)
+                ]
+                self.assertEqual(per_rank, [expected] * world)
+
+    def test_no_und_cache_reset_without_fsdp(self):
+        """Replicated weights keep CFG ranks in step, so no extra UND pass is paid."""
+        misses = self._und_cache_misses(
+            cfg_rank=0, guidance_interval=(400.0, 1000.0), use_fsdp_inference=False
+        )
+        self.assertEqual(misses, [0])
 
 
 class TestCosmos3DomainAwareLinear(unittest.TestCase):

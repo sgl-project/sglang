@@ -1735,6 +1735,9 @@ class Cosmos3DenoisingStage(PipelineStage):
         cfg_world_size = (
             get_classifier_free_guidance_world_size() if enable_cfg_parallel else 1
         )
+        # FSDP shards span the CFG ranks, so every CFG rank must issue the same
+        # all-gathers: the same number of forwards and the same UND cache misses.
+        cfg_lockstep = enable_cfg_parallel and bool(server_args.use_fsdp_inference)
 
         sp_size = get_sp_world_size()
         sp_rank = get_sp_parallel_rank() if sp_size > 1 else 0
@@ -1771,6 +1774,8 @@ class Cosmos3DenoisingStage(PipelineStage):
         # host copy for the per-step CFG window checks: a device read per step
         # would stall the host on every step's kernels
         timestep_values = timesteps.tolist()
+        # UND cache keys of the branches the previous step split across CFG ranks.
+        prev_step_cfg_split: tuple[str, ...] | None = None
 
         for i, t in progress_bar:
             # Precision is chosen once per step, before any transformer call,
@@ -1794,12 +1799,11 @@ class Cosmos3DenoisingStage(PipelineStage):
                 and control_guidance != 1.0
                 and self._cfg_active_at(timestep_values[i], control_guidance_interval)
             )
-
-            if control_cfg_active:
-                # Control-CFG owns the step: 2 branches (text guidance off) or 3
-                # (text guidance on), distributed across CFG ranks and reduced by
-                # ``_predict_noise_cfg`` (sequential per rank, no batching).
-                branches = self._control_cfg_branches(
+            # Control-CFG owns the step: 2 branches (text guidance off) or 3
+            # (text guidance on), distributed across CFG ranks and reduced by
+            # ``_predict_noise_cfg`` (sequential per rank, no batching).
+            control_branches = (
+                self._control_cfg_branches(
                     cond_text_ids,
                     cond_text_mask,
                     uncond_text_ids,
@@ -1810,14 +1814,33 @@ class Cosmos3DenoisingStage(PipelineStage):
                     text_guidance_scale=effective_scale,
                     control_guidance_scale=control_guidance,
                 )
+                if control_cfg_active
+                else None
+            )
+            if not cfg_lockstep:
+                step_cfg_split = None
+            elif control_branches is not None:
+                step_cfg_split = tuple(b["cache_key"] for b in control_branches)
+            elif do_cfg and effective_scale != 1.0:
+                step_cfg_split = ("cond", "uncond")
+            else:
+                step_cfg_split = None
+            if i > 0 and step_cfg_split != prev_step_cfg_split:
+                # Each rank caches only its share of the split branches; once that
+                # changes, a miss on one rank alone would issue unmatched all-gathers.
+                self.transformer.reset_cache()
+            prev_step_cfg_split = step_cfg_split
+
+            if control_branches is not None:
                 noise_pred = self._predict_noise_cfg(
-                    branches,
+                    control_branches,
                     latents=latents,
                     timestep=timestep,
                     video_shape=video_shape,
                     fps=fps,
                     cfg_rank=cfg_rank,
                     cfg_world_size=cfg_world_size,
+                    cfg_lockstep=cfg_lockstep,
                     noisy_frame_mask=velocity_mask,
                     current_timestep=i,
                     sound_latents=sound_latents,
@@ -1920,6 +1943,7 @@ class Cosmos3DenoisingStage(PipelineStage):
                         fps=fps,
                         cfg_rank=cfg_rank,
                         cfg_world_size=cfg_world_size,
+                        cfg_lockstep=cfg_lockstep,
                         noisy_frame_mask=velocity_mask,
                         current_timestep=i,
                         sound_latents=sound_latents,
@@ -2064,6 +2088,7 @@ class Cosmos3DenoisingStage(PipelineStage):
         fps: float,
         cfg_rank: int,
         cfg_world_size: int,
+        cfg_lockstep: bool = False,
         noisy_frame_mask: torch.Tensor | None = None,
         current_timestep: int | None = None,
         sound_latents: torch.Tensor | None = None,
@@ -2086,9 +2111,14 @@ class Cosmos3DenoisingStage(PipelineStage):
         branch's native length and bounds activation memory with control inputs.
         """
         acc = None
-        for i, branch in enumerate(branches):
-            if i % cfg_world_size != cfg_rank:
-                continue
+        for round_start in range(0, len(branches), cfg_world_size):
+            i = round_start + cfg_rank
+            # Under lockstep a rank with no branch left reruns the round's first one
+            # and discards it, so every rank runs the same number of forwards.
+            is_pad = i >= len(branches)
+            if is_pad and not cfg_lockstep:
+                break
+            branch = branches[round_start] if is_pad else branches[i]
             out = self._run_transformer(
                 latents=latents,
                 timestep=timestep,
@@ -2108,6 +2138,8 @@ class Cosmos3DenoisingStage(PipelineStage):
                 action_start_frame_offset=action_start_frame_offset,
                 control_latents=branch["control_latents"],
             )
+            if is_pad:
+                continue
             coeff = branch["coeff"]
             if isinstance(out, tuple):
                 scaled = tuple(coeff * prediction for prediction in out)
