@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
@@ -10,12 +11,21 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed.utils import all_gather_single
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.utils import get_cp_strategy
-from sglang.srt.layers.dp_attention import dp_gather_width, world_dp_gather_enabled
+from sglang.srt.layers.dp_attention import (
+    dp_gather_width,
+    require_mlp_tp_gather,
+    world_dp_gather_enabled,
+)
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.scheduler_components.metrics_reporter import (
+    _decode_total_seq_lens,
+    _prefill_attention_pairs,
+)
 from sglang.srt.managers.scheduler_components.recv_skipper import (
     SchedulerRecvSkipper,
 )
+from sglang.srt.managers.utils import is_health_check_generate_req
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.kv_cache_builder import uses_ssm_state
@@ -26,9 +36,13 @@ from sglang.srt.model_executor.cuda_graph_config import (
     check_cuda_graph_backend,
     cuda_graph_fully_disabled,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.encoder_swa_replay import folded_replay_rows
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.runner import PrefillCudaGraphRunner
-from sglang.srt.observability.metrics_collector import DPCooperationInfo
+from sglang.srt.observability.metrics_collector import (
+    DPBalanceStats,
+    DPCooperationInfo,
+)
 from sglang.srt.runtime_context import (
     get_exec,
     get_memory,
@@ -37,13 +51,43 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.utils.common import require_mlp_tp_gather
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 
 _ENABLE_METRICS_DP_ATTENTION = envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.get()
+
+# The MLP-sync gather carries each attention-DP group's listener drain state
+# (see DPDrainColumn).
+MLP_SYNC_CARRIES_DRAIN_STATE = True
+# The drain-state value of a gathered row with no listener behind it: an
+# inactive slot, or a rank that hosts no listener.
+DRAIN_STATE_NO_LISTENER = 8
+
+
+def exchange_sync_rows(
+    global_flat: torch.Tensor,
+    local_row: torch.Tensor,
+    group: torch.distributed.ProcessGroup,
+) -> None:
+    """Fill ``global_flat`` with every rank's ``local_row`` in group-rank order,
+    like ``all_gather_single``. On gloo the all-gather is a ring of world_size - 1
+    serial hops; gather + broadcast is one hop plus a log-depth tree. At two
+    ranks the ring is the single hop, so it stays."""
+    world_size = torch.distributed.get_world_size(group)
+    if local_row.device.type != "cpu" or world_size <= 2:
+        all_gather_single(global_flat, local_row, group=group)
+        return
+    root = torch.distributed.get_global_rank(group, 0)
+    rows = global_flat.view(world_size, local_row.numel())
+    if torch.distributed.get_rank(group) == 0:
+        torch.distributed.gather(
+            local_row, gather_list=list(rows.unbind(0)), dst=root, group=group
+        )
+    else:
+        torch.distributed.gather(local_row, dst=root, group=group)
+    torch.distributed.broadcast(global_flat, src=root, group=group)
 
 
 def _spec_input_cuda_graph_compatible(
@@ -80,24 +124,29 @@ def _resolve_elastic_world_num_dp_ranks(
     live_num_dp_ranks = dp_gather_width()
     effective_ep_size = ElasticEPStateManager.get_effective_ep_size()
     # Query live membership because elastic joins can expand WORLD.
+    from sglang.srt.elastic_ep.topology import attn_replica_size
+
+    replica_size = attn_replica_size()
     world_size = torch.distributed.get_world_size(group)
 
-    if live_num_dp_ranks != effective_ep_size:
+    if live_num_dp_ranks * replica_size != effective_ep_size:
         raise RuntimeError(
             "[Elastic EP] WORLD MLP sync num_dp_ranks is out of sync: "
             f"rank={torch.distributed.get_rank(group)} "
             f"live_num_dp_ranks={live_num_dp_ranks} "
             f"effective_ep_size={effective_ep_size} "
+            f"attn_replica_size={replica_size} "
             f"world_size={world_size} configured_num_dp_ranks={num_dp_ranks} "
             f"local_num_tokens={local_num_tokens} "
             f"local_forward_mode={local_forward_mode}"
         )
-    if live_num_dp_ranks > world_size:
+    if effective_ep_size > world_size:
         raise RuntimeError(
-            "[Elastic EP] WORLD MLP sync num_dp_ranks exceeds WORLD size: "
+            "[Elastic EP] WORLD MLP sync EP size exceeds WORLD size: "
             f"rank={torch.distributed.get_rank(group)} "
             f"live_num_dp_ranks={live_num_dp_ranks} world_size={world_size} "
-            f"effective_ep_size={effective_ep_size}"
+            f"effective_ep_size={effective_ep_size} "
+            f"attn_replica_size={replica_size}"
         )
 
     return live_num_dp_ranks
@@ -118,11 +167,23 @@ class MLPSyncBatchInfo:
     local_can_run_tbo: bool
     local_forward_mode: int
     prefill_cuda_graph_max_prefix_len: int = 0
+    # Every request in the local batch is a health-check probe.
+    is_health_check: bool = False
+    # Causal (query, key) pairs this rank attends this step.
+    attention_pairs: int = 0
+    # This rank honored a ShutdownReq and leaves the event loop after this step.
+    is_shutting_down: bool = False
+    # This rank's listener drain state (see DPDrainColumn).
+    drain_state: int = 0
 
     # some gathered elements
     tp0_info_cpu: torch.Tensor = None
+    any_health_check: bool = False
+    any_shutting_down: bool = False
+    sync_wait_seconds: float = 0.0
     global_num_tokens: list[int] = None
     global_num_tokens_for_logprob: list[int] = None
+    global_attention_pairs: list[int] = None
     tbo_split_seq_index: torch.Tensor = None
     global_forward_mode: int = None
     dp_cooperation_info: Optional[DPCooperationInfo] = None
@@ -139,6 +200,10 @@ class MLPSyncBatchInfo:
                 int(self.can_run_prefill_cuda_graph),
                 self.prefill_cuda_graph_max_prefix_len,
                 int(self.can_run_draft_cuda_graph),
+                int(self.is_health_check),
+                self.attention_pairs,
+                int(self.is_shutting_down),
+                self.drain_state,
             ],
             device=device,
             dtype=dtype,
@@ -156,6 +221,10 @@ class MLPSyncBatchInfo:
                 0,  # can_run_prefill_cuda_graph
                 0,  # prefill_cuda_graph_max_prefix_len
                 1,  # can_run_draft_cuda_graph
+                0,  # is_health_check
+                0,  # attention_pairs
+                0,  # is_shutting_down
+                DRAIN_STATE_NO_LISTENER,  # drain_state
             ],
             device=device,
             dtype=dtype,
@@ -166,6 +235,9 @@ class MLPSyncBatchInfo:
         self.tp0_info_cpu = self._get_local_tensor(device="cpu").view(1, -1)
         self.global_num_tokens = [self.num_tokens]
         self.global_num_tokens_for_logprob = [self.num_tokens_for_logprob]
+        self.global_attention_pairs = [self.attention_pairs]
+        self.any_health_check = self.is_health_check
+        self.any_shutting_down = self.is_shutting_down
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(
                 self.tp0_info_cpu[:, 5].tolist()
@@ -177,6 +249,7 @@ class MLPSyncBatchInfo:
         group: torch.distributed.ProcessGroup,
         use_all_reduce: bool = False,
     ):
+        sync_start = time.perf_counter()
         local_info_tensor = self._get_local_tensor(device=device)
         fallback_tensor = self._get_fallback_tensor(device=device)
         info_width = local_info_tensor.numel()
@@ -204,7 +277,7 @@ class MLPSyncBatchInfo:
             missing = flat_info.abs().sum(dim=1) == 0
             flat_info[missing] = fallback_tensor
         else:
-            all_gather_single(
+            exchange_sync_rows(
                 global_info_tensor.flatten(),
                 local_info_tensor,
                 group=group,
@@ -239,6 +312,10 @@ class MLPSyncBatchInfo:
         self.can_run_prefill_cuda_graph = bool(tp0_info_cpu[:, 6].min())
         self.prefill_cuda_graph_max_prefix_len = int(tp0_info_cpu[:, 7].max())
         self.can_run_draft_cuda_graph = bool(tp0_info_cpu[:, 8].min())
+        self.any_health_check = bool(tp0_info_cpu[:, 9].max())
+        self.global_attention_pairs = tp0_info_cpu[:, 10].tolist()
+        self.any_shutting_down = bool(tp0_info_cpu[:, 11].max())
+        self.sync_wait_seconds = time.perf_counter() - sync_start
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(
                 tp0_info_cpu[:, 5].tolist()
@@ -328,6 +405,7 @@ def _local_decode_cuda_graph_vote(
 def _local_prefill_cuda_graph_vote(
     *,
     local_batch: Optional[ScheduleBatch],
+    num_tokens: int,
     prefill_graph_runner,
     coordinated_prefill: bool,
     breakable_prefill: bool,
@@ -337,7 +415,9 @@ def _local_prefill_cuda_graph_vote(
     """This rank's vote for the prefill graph (min-reduced across dp
     ranks). Extend and mixed batches share the runner's rank-local replay
     policy. A decode batch eligible for the decode->extend conversion votes as
-    its 1-token-extend view, so the vote and post-sync conversion agree."""
+    its 1-token-extend view, so the vote and post-sync conversion agree.
+    num_tokens is the rows this rank gathers, encoder replay rows folded in,
+    which an extend replay runs."""
     if local_batch is None or local_batch.forward_mode.is_idle():
         return True
     if not coordinated_prefill:
@@ -345,7 +425,6 @@ def _local_prefill_cuda_graph_vote(
 
     mode = local_batch.forward_mode
     if mode in (ForwardMode.EXTEND, ForwardMode.MIXED):
-        num_tokens = local_batch.extend_num_tokens
         input_embeds = local_batch.input_embeds
         replace_embeds = local_batch.replace_embeds
         prefix_lens = local_batch.prefix_lens
@@ -388,6 +467,13 @@ def _local_prefill_cuda_graph_vote(
         return True
     if not isinstance(prefill_graph_runner, PrefillCudaGraphRunner):
         return False
+    backend_vote = prefill_graph_runner._backend_vote_prefill_cuda_graph
+    if (
+        mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
+        and backend_vote is not None
+        and not backend_vote(local_batch)
+    ):
+        return False
     return prefill_graph_runner.can_replay_locally(
         batch_size=local_batch.batch_size(),
         num_tokens=num_tokens,
@@ -405,12 +491,96 @@ def _local_prefill_cuda_graph_vote(
         is_mixed=mode == ForwardMode.MIXED,
         batch_max_context_len=(
             int(local_batch.seq_lens_cpu.max().item())
-            if prefill_graph_runner.max_context_size is not None
+            if (
+                prefill_graph_runner.max_context_size is not None
+                or prefill_graph_runner.max_seq_len is not None
+            )
             and local_batch.seq_lens_cpu is not None
             and local_batch.seq_lens_cpu.numel() > 0
             else None
         ),
     )
+
+
+def _local_attention_pairs(local_batch: Optional[ScheduleBatch]) -> int:
+    """Causal (query, key) pairs the batch attends, pricing every layer as full
+    attention: one query per decode row over its committed length (spec
+    batches have no CPU seq_lens at schedule time), the chunk formula for
+    prefill."""
+    if (
+        local_batch is None
+        or local_batch.forward_mode.is_prebuilt()
+        or local_batch.forward_mode.is_idle()
+    ):
+        return 0
+    if local_batch.forward_mode.is_decode():
+        return _decode_total_seq_lens(local_batch)
+    return _prefill_attention_pairs(local_batch)
+
+
+class DPSyncWaitCarry:
+    """MLP-sync wait of batch-less gathers, folded into the next recorded step.
+
+    One scheduler iteration can gather more than once (with speculative
+    decoding, get_next_batch_to_run gathers for the new prefill batch first,
+    then for the running batch); the first gather absorbs the cross-rank
+    arrival skew but yields no batch to record on. Only batch-less gathers carry: an iteration
+    that ends with no batch drops the carry in Scheduler.on_idle, and a step
+    that runs a batch without recording (prebuilt, health check) drops it too,
+    so an idle engine's gathers never pile onto the first busy step.
+    """
+
+    __slots__ = ("seconds",)
+
+    def __init__(self) -> None:
+        self.seconds = 0.0
+
+
+class DPShutdownVote:
+    """Carries a rank's ShutdownReq through the MLP-sync gather.
+
+    Every attention-DP rank gathers once per scheduler step, so a rank that
+    honored a ShutdownReq tells all the others in the same step, and every rank
+    leaves the event loop at the same step boundary. Without it, a ShutdownReq
+    that reaches one DP group only (local control broadcast, as the Rust
+    server's rank-0 listener sends it) stops that group, and the other groups'
+    next gather fails against the departed ranks. A paused engine runs no
+    gather, so a rank that honors a ShutdownReq while paused leaves without
+    voting; the other DP groups stop when their node's launcher stops them.
+    """
+
+    __slots__ = ("local", "any")
+
+    def __init__(self, local: bool) -> None:
+        self.local = local
+        self.any = local
+
+
+class DPDrainColumn:
+    """Carries each attention-DP group's listener drain state through the
+    MLP-sync gather.
+
+    With the Rust server, every DP group's leading rank hosts a listener that
+    drains on its own. ``local`` is this rank's ``Server.drain_state()`` bits
+    (``DRAIN_STATE_NO_LISTENER`` on a rank without a listener, 0 in Python
+    mode), and ``rows`` receives one value per DP group, from the group's
+    leading rank, whenever the gather produced metadata.
+    """
+
+    __slots__ = ("local", "rows")
+
+    def __init__(self, local: int) -> None:
+        self.local = local
+        self.rows: Optional[list[int]] = None
+
+
+class DPShutdownVoteSent:
+    """Whether a gather has carried this rank's own shutdown vote (the adapter is frozen)."""
+
+    __slots__ = ("value",)
+
+    def __init__(self) -> None:
+        self.value = False
 
 
 def prepare_mlp_sync_batch_raw(
@@ -423,6 +593,9 @@ def prepare_mlp_sync_batch_raw(
     offload_tags: set[str],
     draft_require_mlp_tp_gather: Optional[bool] = None,
     dwdp: bool = False,
+    sync_wait_carry: Optional[DPSyncWaitCarry] = None,
+    shutdown_vote: Optional[DPShutdownVote] = None,
+    drain_column: Optional[DPDrainColumn] = None,
 ):
     parallel = get_parallel()
     num_dp_ranks = parallel.num_dp_ranks
@@ -441,6 +614,11 @@ def prepare_mlp_sync_batch_raw(
         num_tokens_for_logprob = num_tokens
     else:
         num_tokens = local_batch.extend_num_tokens
+        if (
+            local_batch.encoder_swa_reset is not None
+            and model_runner.attn_backend.folds_encoder_swa_replay
+        ):
+            num_tokens += folded_replay_rows(local_batch)
         num_tokens_for_logprob = sum(
             # We should have at least 1 token for sample in every case.
             max(extend_len - logprob_start_len, 1)
@@ -473,6 +651,7 @@ def prepare_mlp_sync_batch_raw(
     )
     can_run_prefill_cuda_graph = _local_prefill_cuda_graph_vote(
         local_batch=local_batch,
+        num_tokens=num_tokens,
         prefill_graph_runner=prefill_graph_runner,
         coordinated_prefill=coordinated_prefill,
         breakable_prefill=breakable_prefill,
@@ -481,6 +660,11 @@ def prepare_mlp_sync_batch_raw(
     )
 
     is_extend_in_batch = local_batch.forward_mode.is_extend() if local_batch else False
+    is_health_check = bool(
+        local_batch is not None
+        and local_batch.reqs
+        and all(is_health_check_generate_req(req) for req in local_batch.reqs)
+    )
     if local_batch is not None:
         local_batch.is_extend_in_batch = is_extend_in_batch
 
@@ -523,6 +707,12 @@ def prepare_mlp_sync_batch_raw(
         local_can_run_tbo=local_can_run_tbo,
         local_forward_mode=local_forward_mode,
         prefill_cuda_graph_max_prefix_len=prefill_cuda_graph_max_prefix_len,
+        is_health_check=is_health_check,
+        # Gathered unconditionally like the other columns, so a per-process
+        # metrics flag cannot make ranks disagree on what the tensor holds.
+        attention_pairs=_local_attention_pairs(local_batch),
+        is_shutting_down=shutdown_vote is not None and shutdown_vote.local,
+        drain_state=drain_column.local if drain_column is not None else 0,
     )
 
     if num_dp_ranks == 1:
@@ -535,6 +725,10 @@ def prepare_mlp_sync_batch_raw(
         )
 
     metadata_ready = mlp_sync_info.tp0_info_cpu is not None
+    if shutdown_vote is not None and metadata_ready:
+        shutdown_vote.any = mlp_sync_info.any_shutting_down
+    if drain_column is not None and metadata_ready:
+        drain_column.rows = mlp_sync_info.tp0_info_cpu[:, 12].tolist()
     if metadata_ready:
         mlp_sync_info.tbo_split_seq_index, mlp_sync_info.global_forward_mode = (
             tbo_preparer.compute_output(
@@ -576,6 +770,25 @@ def prepare_mlp_sync_batch_raw(
 
     if _ENABLE_METRICS_DP_ATTENTION and local_batch is not None:
         local_batch.dp_cooperation_info = mlp_sync_info.dp_cooperation_info
+        local_batch.dp_balance_stats = None
+    if _ENABLE_METRICS_DP_ATTENTION and num_dp_ranks > 1 and not skip_all_gather:
+        sync_wait_seconds = mlp_sync_info.sync_wait_seconds
+        if sync_wait_carry is not None:
+            sync_wait_seconds += sync_wait_carry.seconds
+            sync_wait_carry.seconds = 0.0
+        # Health-check probes run on an otherwise idle engine; recording them
+        # would show maximal imbalance where there is no load.
+        if need_idle_batch and not mlp_sync_info.any_health_check:
+            local_batch.dp_balance_stats = DPBalanceStats.create(
+                local_tokens=num_tokens,
+                global_num_tokens=mlp_sync_info.global_num_tokens,
+                local_attention_pairs=mlp_sync_info.attention_pairs,
+                global_attention_pairs=mlp_sync_info.global_attention_pairs,
+                sync_wait_seconds=sync_wait_seconds,
+            )
+        elif local_batch is None and sync_wait_carry is not None:
+            # No batch yet: this iteration may gather again, or end in on_idle.
+            sync_wait_carry.seconds = sync_wait_seconds
 
     return local_batch
 
@@ -591,6 +804,39 @@ class SchedulerDPAttnAdapter:
     enable_overlap: bool
     spec_algorithm: SpeculativeAlgorithm
     get_require_mlp_sync: Callable[[], bool]
+    sync_wait_carry: DPSyncWaitCarry = field(default_factory=DPSyncWaitCarry)
+    # Whether this rank honored a ShutdownReq, and what to do when a peer DP
+    # rank did (see DPShutdownVote).
+    get_shutting_down: Callable[[], bool] = lambda: False
+    on_peer_shutdown: Optional[Callable[[], None]] = None
+    # This rank's listener drain state, and what to do with every DP group's
+    # after each gather that produced metadata, which can be twice an
+    # iteration (see DPDrainColumn).
+    get_drain_state: Callable[[], int] = lambda: 0
+    on_drain_rows: Optional[Callable[[list[int]], None]] = None
+    # Set once a gather carried this rank's own shutdown vote.
+    shutdown_vote_sent: DPShutdownVoteSent = field(
+        default_factory=DPShutdownVoteSent, init=False
+    )
+
+    def shutdown_vote_pending(self) -> bool:
+        """This rank honored a ShutdownReq that no MLP-sync gather has carried yet.
+
+        A loop that stops scheduling batches on shutdown still runs one batch
+        selection while this holds, so its gather tells the other DP ranks.
+        """
+        num_dp_ranks = get_parallel().num_dp_ranks
+        return (
+            self.get_shutting_down()
+            and not self.shutdown_vote_sent.value
+            and self.get_require_mlp_sync()
+            and num_dp_ranks > 1
+            and not should_skip_scheduler_all_gather(num_dp_ranks)
+        )
+
+    def drop_sync_wait_carry(self) -> None:
+        """The iteration produced no batch, so its gather waits have no step to land on."""
+        self.sync_wait_carry.seconds = 0.0
 
     def prepare_mlp_sync_batch(self, local_batch: ScheduleBatch):
         draft_require_mlp_tp_gather = None
@@ -602,7 +848,9 @@ class SchedulerDPAttnAdapter:
                 moe_a2a_backend=draft_moe_a2a_backend,
             )
 
-        return prepare_mlp_sync_batch_raw(
+        shutdown_vote = DPShutdownVote(self.get_shutting_down())
+        drain_column = DPDrainColumn(self.get_drain_state())
+        batch = prepare_mlp_sync_batch_raw(
             local_batch,
             model_runner=self.model_runner,
             get_idle_batch=self.get_idle_batch,
@@ -612,7 +860,21 @@ class SchedulerDPAttnAdapter:
             disable_overlap_schedule=get_schedule().disable_overlap_schedule,
             offload_tags=self.offload_tags,
             dwdp=get_parallel().dwdp_size > 1,
+            sync_wait_carry=self.sync_wait_carry,
+            shutdown_vote=shutdown_vote,
+            drain_column=drain_column,
         )
+        if drain_column.rows is not None and self.on_drain_rows is not None:
+            self.on_drain_rows(drain_column.rows)
+        if shutdown_vote.local:
+            self.shutdown_vote_sent.value = True
+        if (
+            shutdown_vote.any
+            and not shutdown_vote.local
+            and self.on_peer_shutdown is not None
+        ):
+            self.on_peer_shutdown()
+        return batch
 
     def maybe_prepare_mlp_sync_batch(
         self,

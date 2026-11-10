@@ -14,13 +14,11 @@ from sglang.multimodal_gen.configs.models.vaes.minimax_h3_audio import (
 from sglang.multimodal_gen.configs.models.vaes.minimax_h3_video import (
     MiniMaxH3VideoVAEConfig,
 )
-from sglang.multimodal_gen.configs.pipeline_configs.base import (
-    ModelTaskType,
-    PipelineConfig,
-)
+from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
     ModelDeploymentConfig,
 )
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
     LAYERWISE_OFFLOAD,
 )
@@ -28,6 +26,9 @@ from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
 
 
 @dataclass
@@ -57,6 +58,12 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
     vae_precision: str = "fp32"
     vae_decode_precision: str = "fp16"
     audio_vae_precision: str = "fp32"
+    # Default VSA-H3 sparsity, tile size and reference-video keep rate;
+    # --attention-backend-config VSA_sparsity / vsa_tile_size /
+    # vsa_ref_keep_rate override them.
+    vsa_sparsity: float = 0.9
+    vsa_tile_size: int = 64
+    vsa_ref_keep_rate: float | None = None
     text_encoder_configs: tuple[MiniMaxH3Qwen3VLConfig, ...] = field(
         default_factory=lambda: (MiniMaxH3Qwen3VLConfig(),)
     )
@@ -68,15 +75,8 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
     output_audio_channels: int | None = 2
     output_av_drift_tolerance_s: float | None = 0.25
 
-    def accepts_audio_input(self) -> bool:
-        return True
-
     def supports_disaggregation(self) -> bool:
         return False
-
-    @property
-    def requires_audio_output(self) -> bool:
-        return True
 
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
         return ModelDeploymentConfig(
@@ -160,6 +160,7 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
             "is_dit_layerwise_offload_selected": (
                 server_args.is_dit_layerwise_offload_selected
             ),
+            "lora_path": server_args.lora_path,
             "model_variant": model_variant,
             "num_gpus": server_args.num_gpus,
             "performance_mode": server_args.performance_mode,
@@ -170,6 +171,7 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
             "ring_degree": server_args.ring_degree,
             "sp_degree": server_args.sp_degree,
             "tp_size": server_args.tp_size,
+            "transformer_weights_path": server_args.transformer_weights_path,
             "ulysses_degree": server_args.ulysses_degree,
             "use_fsdp_inference": server_args.use_fsdp_inference,
         }
@@ -183,6 +185,7 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
             "enable_breakable_cuda_graph": False,
             "enable_torch_compile": False,
             "is_dit_layerwise_offload_selected": False,
+            "lora_path": None,
             "model_variant": "fl2va",
             "num_gpus": 4,
             "performance_mode": "speed",
@@ -193,6 +196,7 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
             "ring_degree": 1,
             "sp_degree": 4,
             "tp_size": 1,
+            "transformer_weights_path": None,
             "ulysses_degree": 4,
             "use_fsdp_inference": False,
         }
@@ -223,6 +227,11 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
     def validate_server_args(self, server_args) -> None:
         # Reject known-inexact VAE modes before any large component download.
         self.vae_config.resolved_parallel_decode_mode()
+        if server_args.performance_mode == "memory":
+            # Batched decoder tiles add activations on top of the resident
+            # decoder; memory mode keeps the one-tile recipe at every tier.
+            self.vae_config.decoder_tile_batch = 1
+            self.vae_config.window_batch = 1
         if current_platform.is_mps():
             required_components = (
                 "transformer",
@@ -331,18 +340,45 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
         return safetensors_list
 
 
+def vsa_h3_device_supported() -> bool:
+    """Whether this GPU runs the VSA-H3 kernels FastH3 was distilled with."""
+    if not current_platform.is_cuda():
+        return False
+    from sglang.multimodal_gen.runtime.platforms.cuda import VSA_H3_CAPABILITIES
+
+    capability = current_platform.get_device_capability()
+    return (
+        capability is not None
+        and (capability.major, capability.minor) in VSA_H3_CAPABILITIES
+    )
+
+
+def vsa_h3_execution_supported(
+    *, enable_torch_compile, enable_breakable_cuda_graph, ring_degree
+) -> bool:
+    """VSA-H3 does not serve torch.compile, the breakable CUDA graph or ring."""
+    return not (
+        enable_torch_compile or enable_breakable_cuda_graph or int(ring_degree or 1) > 1
+    )
+
+
 @dataclass
 class FastH3PipelineConfig(MiniMaxH3PipelineConfig):
-    """FastH3: 4-step VSA-distilled MiniMax-H3, t2va only."""
+    """FastH3 8-Step V2: VSA-distilled MiniMax-H3, t2va only."""
+
+    # The checkpoint's trained sparsity (fastvideo_inference.json).
+    vsa_sparsity: float = 0.8
 
     def __post_init__(self) -> None:
         self.dit_config.arch_config.has_gate_compress = True
+        # FastVideo's recipe decodes each rank's tiles in one call.
+        self.vae_config.decoder_tile_batch = 0
 
     def validate_quality_deployment(self, server_args) -> None:
         raise ValueError(
             'quality="high" is audited only for the base MiniMax-H3 50-step '
-            "4xH200 deployment; the FastH3 4-step distilled checkpoint has no "
-            'audited high-quality deployment. Use quality="lossless".'
+            "4xH200 deployment; FastH3 has no audited high-quality deployment. "
+            'Use quality="exact", or the default "lossless".'
         )
 
     def validate_server_args(self, server_args) -> None:
@@ -352,16 +388,95 @@ class FastH3PipelineConfig(MiniMaxH3PipelineConfig):
                 "--model-variant does not apply. FL2VA and Ref2VA tasks were "
                 "not distilled; use MiniMaxAI/MiniMax-H3 for those."
             )
+        self._default_to_trained_sparse_attention(server_args)
         super().validate_server_args(server_args)
 
+    def _default_to_trained_sparse_attention(self, server_args) -> None:
+        # The checkpoint was distilled with VSA-H3; dense attention skips its
+        # trained compression gate and runs slower.
+        if self.resolve_transformer_attention_backend(server_args) is not None:
+            return
+        if not vsa_h3_device_supported():
+            return
+        if not vsa_h3_execution_supported(
+            enable_torch_compile=server_args.enable_torch_compile,
+            enable_breakable_cuda_graph=server_args.enable_breakable_cuda_graph,
+            ring_degree=server_args.ring_degree,
+        ):
+            logger.info(
+                "FastH3 runs dense attention: VSA-H3 does not serve torch.compile, "
+                "the breakable CUDA graph or ring attention"
+            )
+            return
+        server_args.set_automatic_component_attention_backend(
+            "transformer", AttentionBackendEnum.VIDEO_SPARSE_ATTN_H3.name.lower()
+        )
+        logger.info(
+            "Automatically set video_sparse_attn_h3 for the FastH3 transformer, the "
+            "attention it was distilled with; --component-attention-backends "
+            "transformer=fa selects dense attention"
+        )
 
-__all__ = ["FastH3PipelineConfig", "MiniMaxH3PipelineConfig"]
+
+@dataclass
+class FastH3OmniPipelineConfig(FastH3PipelineConfig):
+    """FastH3 Omni 8-Step V1: PDD + VSA-distilled MiniMax-H3, ref2va only."""
+
+    # The checkpoint's trained VSA (fastvideo_inference.json).
+    vsa_sparsity: float = 0.9
+    vsa_tile_size: int = 128
+    vsa_ref_keep_rate: float | None = 0.1
+
+    def __post_init__(self) -> None:
+        self.dit_config.arch_config.has_gate_compress = True
+        # Omni also encodes reference videos. The encoder runs one tile per
+        # forward regardless, and the decoder keeps the base
+        # ``decoder_tile_batch`` cap instead of FastH3's all-tiles recipe.
+
+    def validate_server_args(self, server_args) -> None:
+        if server_args.model_variant is not None:
+            raise ValueError(
+                "FastH3 Omni ships one ref2va-distilled weight partition; "
+                "--model-variant does not apply."
+            )
+        self._default_to_trained_sparse_attention(server_args)
+        MiniMaxH3PipelineConfig.validate_server_args(self, server_args)
+
+
+@dataclass
+class PikaH3FlexPipelineConfig(MiniMaxH3PipelineConfig):
+    """Pika H3 Flex: base MiniMax-H3 with Pika's six-step LoRA adapters."""
+
+    def validate_server_args(self, server_args) -> None:
+        # A BF16 merge rounds away about a third of the adapters' update (by
+        # norm, under auto's 50% cutoff), so keep them unmerged like the
+        # reference unless a merge mode is chosen explicitly.
+        if not server_args.is_arg_explicitly_set("lora_merge_mode"):
+            server_args.lora_merge_mode = "dynamic"
+        super().validate_server_args(server_args)
+
+    def validate_quality_deployment(self, server_args) -> None:
+        raise ValueError(
+            'quality="high" is audited only for the base MiniMax-H3 50-step '
+            "4xH200 deployment; Pika H3 Flex has no audited high-quality "
+            'deployment. Use quality="exact", or the default "lossless".'
+        )
+
+
+__all__ = [
+    "FastH3OmniPipelineConfig",
+    "FastH3PipelineConfig",
+    "MiniMaxH3PipelineConfig",
+    "PikaH3FlexPipelineConfig",
+]
 
 
 def register():
     from sglang.multimodal_gen.configs.sample.minimax_h3 import (
+        FastH3OmniSamplingParams,
         FastH3SamplingParams,
         MiniMaxH3SamplingParams,
+        PikaH3FlexSamplingParams,
     )
     from sglang.multimodal_gen.registry import register_configs
 
@@ -383,11 +498,36 @@ def register():
         sampling_param_cls=FastH3SamplingParams,
         pipeline_config_cls=FastH3PipelineConfig,
         hf_model_paths=[
-            "FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree",
+            "FastVideo/FastVideo-FastH3-8-Step-V2",
         ],
         model_detectors=[
             lambda model_id: (
                 "fasth3" in model_id.lower().replace("-", "").replace("_", "")
+                and "omni" not in model_id.lower()
+            )
+        ],
+    )
+    register_configs(
+        sampling_param_cls=FastH3OmniSamplingParams,
+        pipeline_config_cls=FastH3OmniPipelineConfig,
+        hf_model_paths=[
+            "FastVideo/FastVideo-FastH3-Omni-8-Step-V1",
+        ],
+        model_detectors=[
+            lambda model_id: (
+                "fasth3omni" in model_id.lower().replace("-", "").replace("_", "")
+            )
+        ],
+    )
+    register_configs(
+        sampling_param_cls=PikaH3FlexSamplingParams,
+        pipeline_config_cls=PikaH3FlexPipelineConfig,
+        hf_model_paths=[
+            "Pika-Labs/Pika-H3-Flex",
+        ],
+        model_detectors=[
+            lambda model_id: (
+                "pikah3flex" in model_id.lower().replace("-", "").replace("_", "")
             )
         ],
     )

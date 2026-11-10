@@ -2,16 +2,16 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.ops.moe.dsv4 import (
-    silu_and_mul_clamp,
-    silu_and_mul_masked_post_quant,
-)
+from sglang.kernels.arch import current_arch
+from sglang.kernels.ops.activation.silu_and_mul_clamp import silu_and_mul_clamp
+from sglang.kernels.ops.moe.dsv4 import silu_and_mul_masked_post_quant
 from sglang.kernels.ops.moe.triton_pad_expert_counts import pad_expert_counts
 from sglang.kernels.ops.quantization.per_token_group_quant import per_token_group_quant
 
@@ -34,6 +34,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_pre_permute,
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend, get_moe_a2a_backend
+from sglang.srt.layers.offloader import get_offloader
 from sglang.srt.runtime_context import (
     get_exec,
     get_flags,
@@ -48,7 +49,6 @@ from sglang.srt.utils import (
     is_musa,
     is_npu,
 )
-from sglang.srt.utils.offloader import get_offloader
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher.deepep import (
@@ -86,8 +86,14 @@ else:
     _legacy_silu_and_mul = None
 
 
-_DEEPGEMM_ON_H20 = get_bool_env_var("SGLANG_DEEPGEMM_ON_H20")
 _masked_standard_layout_memory_budget_bytes: Optional[int] = None
+
+
+@lru_cache(maxsize=1)
+def _is_h20() -> bool:
+    # H20 and H20-3e are the only SM90 parts with 78 SMs.
+    arch = current_arch()
+    return arch.is_sm(9, 0) and arch.num_sms == 78
 
 
 # TODO(kaixih@nvidia): ideally we should merge this logic into
@@ -159,10 +165,15 @@ def _estimate_masked_standard_layout_peak_bytes(
         input_scale_row_bytes = ceil_div(hidden_size, block_k) * scale_item_bytes
         down_scale_row_bytes = ceil_div(gateup_size // 2, block_k) * scale_item_bytes
 
-    peak_row_bytes = max(
-        input_row_bytes + input_scale_row_bytes + gateup_row_bytes,
-        gateup_row_bytes + down_input_row_bytes + down_scale_row_bytes,
-        down_input_row_bytes + down_scale_row_bytes + down_output_row_bytes,
+    # Graph capture skips dispose_tensor, so the runner input remains live
+    # through activation and the down GEMM. Use the same bound during warmup
+    # and capture to keep layout selection consistent.
+    peak_row_bytes = (
+        input_row_bytes
+        + input_scale_row_bytes
+        + down_input_row_bytes
+        + down_scale_row_bytes
+        + max(gateup_row_bytes, down_output_row_bytes)
     )
     return runner_config.num_local_experts * padded_m * peak_row_bytes
 
@@ -397,7 +408,9 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         quant_info: DeepGemmMoeQuantInfo,
         running_state: dict,
     ) -> torch.Tensor:
-        from sglang.kernels.ops.moe.dsv4 import silu_and_mul_contig_post_quant
+        from sglang.kernels.ops.activation.silu_and_mul_clamp import (
+            silu_and_mul_contig_post_quant,
+        )
         from sglang.kernels.ops.moe.ep_moe_kernels import tma_align_input_scale
         from sglang.kernels.ops.quantization.fp8_kernel import (
             create_per_token_group_quant_fp8_output_scale,
@@ -876,9 +889,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             gemm_overlap_args_dict = {}
         else:
             down_gemm_overlap_args.start_event.record()
-            max_block_n = (
-                160 if (_DEEPGEMM_ON_H20 and runner_input.expected_m <= 64) else 256
-            )
+            max_block_n = 160 if (_is_h20() and runner_input.expected_m <= 64) else 256
             gemm_overlap_args_dict = {
                 "overlap_args": down_gemm_overlap_args,
                 "max_block_n": max_block_n,
@@ -1504,7 +1515,9 @@ def _varlen_deep_gemm_situ_mul_quant(
     linear_beta: float,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Fused SiTU activation + per-group fp8 quant via CUDA JIT kernel."""
-    from sglang.kernels.ops.moe import situ_and_mul_masked_post_quant
+    from sglang.kernels.ops.moe.kimi_k3_situ_and_mul_quant import (
+        situ_and_mul_masked_post_quant,
+    )
 
     E, N, D_2 = gateup_output.shape
     D = D_2 // 2
@@ -1680,10 +1693,14 @@ def _situ_mul_quant_contig_kernel(
     up_t = 2.0 * tl.sigmoid(2.0 * up / situ_linear_beta) - 1.0
     y = gate * situ_linear_beta * up_t
     amax = tl.clamp(tl.max(tl.abs(y), axis=1), min=1e-10, max=float("inf"))
-    q = (y * (448.0 / amax)[:, None]).to(tl.float8e4nv)
+    # Quantize with the power-of-two (UE8M0) scale the GEMM reads, not amax / 448.
+    bits = (amax / 448.0).to(tl.int32, bitcast=True)
+    exp = (bits >> 23) + ((bits & 0x7FFFFF) != 0).to(tl.int32)
+    scale = (exp << 23).to(tl.float32, bitcast=True)
+    q = (y / scale[:, None]).to(tl.float8e4nv)
     tl.store(q_ptr + row * N + offs, q, mask=mask)
     srow = tl.arange(0, KG_POW2)
-    tl.store(s_ptr + row * KG + srow, amax / 448.0, mask=srow < KG)
+    tl.store(s_ptr + row * KG + srow, scale, mask=srow < KG)
 
 
 def _apply_swiglu_limit(

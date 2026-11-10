@@ -6,6 +6,9 @@ PRECISION_TO_TYPE = {
     "fp32": torch.float32,
     "fp16": torch.float16,
     "bf16": torch.bfloat16,
+    "float32": torch.float32,
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16,
 }
 
 __all__ = ["PRECISION_TO_TYPE"]

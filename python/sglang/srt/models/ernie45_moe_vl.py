@@ -22,6 +22,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.srt.hf_transformers.common import get_rope_config
 from sglang.srt.layers.layer_boundary import (
     append_stages,
     declare_attn,
@@ -40,13 +41,13 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import Ernie4_5_VLRotaryEmbedding
 from sglang.srt.layers.utils import PPMissingLayer
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.models.deepseek_v2 import DeepseekV2MLP as Ernie4_5_VLMoeMLP
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix, make_pp_layers
-from sglang.srt.utils.hf_transformers.common import get_rope_config
 
 logger = logging.getLogger(__name__)
 
@@ -224,6 +225,7 @@ class Ernie4_5_VLMoeMoE(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("text_experts", prefix),
             )
+            self.text_experts_topk.bind_runner_backend(self.text_experts.runner_backend)
 
         assert vision_moe_layer_start_index <= vision_moe_layer_end_index
         if (
@@ -255,6 +257,9 @@ class Ernie4_5_VLMoeMoE(nn.Module):
                 layer_id=self.layer_id,
                 quant_config=quant_config,
                 prefix=add_prefix("vision_experts", prefix),
+            )
+            self.vision_experts_topk.bind_runner_backend(
+                self.vision_experts.runner_backend
             )
 
         if self.moe_num_shared_experts > 0:
@@ -412,8 +417,8 @@ class Ernie4_5_VLMoeDecoderLayer(nn.Module):
 
         # MoE
         # MLP
-        sparse = _is_moe_layer(config, layer_id)
-        if sparse:
+        attn, ffn = self.stage_facts(config, layer_id)
+        if ffn.sparse:
             self.mlp = Ernie4_5_VLMoeMoE(
                 config=config,
                 layer_id=layer_id,
@@ -435,15 +440,22 @@ class Ernie4_5_VLMoeDecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        self.attn_boundary, self.ffn_boundary = append_stages(
+            (attn, self.input_layernorm),
+            (ffn, self.post_attention_layernorm),
+        )
+
+    @staticmethod
+    def stage_facts(config: PretrainedConfig, layer_id: int):
+        """The stages the layer at ``layer_id`` declares, from the config: the
+        model's shared declaration function (see make_layers)."""
+        sparse = _is_moe_layer(config, layer_id)
         next_sparse = layer_id + 1 < config.num_hidden_layers and _is_moe_layer(
             config, layer_id + 1
         )
-        self.attn_boundary, self.ffn_boundary = append_stages(
-            (declare_attn(), self.input_layernorm),
-            (
-                declare_ffn(sparse=sparse, next_layer_sparse=next_sparse),
-                self.post_attention_layernorm,
-            ),
+        return (
+            declare_attn(),
+            declare_ffn(sparse=sparse, next_layer_sparse=next_sparse),
         )
 
     def forward(
@@ -502,6 +514,7 @@ class Ernie4_5_VLMoeModel(nn.Module):
                 prefix=prefix,
             ),
             prefix=add_prefix("layers", prefix),
+            stage_facts=lambda idx: Ernie4_5_VLMoeDecoderLayer.stage_facts(config, idx),
         )
         if self.pp_group.is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)

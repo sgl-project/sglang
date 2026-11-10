@@ -16,6 +16,14 @@ DATA_ALIGNMENT = 256
 DEFAULT_MAX_INFLIGHT_SLICES = 4096
 
 
+def get_mm_feature_consumer_count() -> int:
+    """Number of scheduler ranks receiving one routed multimodal request."""
+    parallel = get_parallel()
+    if parallel.attn_dp_enabled:
+        return parallel.tp_size // parallel.num_dp_ranks
+    return parallel.tp_size
+
+
 def align_up(value: int, alignment: int) -> int:
     return ((value + alignment - 1) // alignment) * alignment
 
@@ -59,9 +67,8 @@ def resolve_consumer_rank(
         return 0
     if consumer_rank is None:
         try:
-            # Use the global TP rank. An attention/DCP subgroup rank can alias
-            # another consumer's acknowledgement slot.
-            rank = int(get_parallel().tp_rank)
+            # DP groups are contiguous; attention/DCP subgroup ranks can alias
+            rank = int(get_parallel().tp_rank) % total_consumer_count
         except Exception as exc:
             raise RuntimeError(
                 f"Cannot resolve the {transport_name} consumer rank before "

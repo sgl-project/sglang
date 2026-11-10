@@ -1,12 +1,8 @@
 import re
 import sys
+import tomllib
 from pathlib import Path
 from typing import List, Tuple
-
-try:
-    import tomllib  # Python 3.11+
-except ImportError:
-    import tomli as tomllib  # Fallback for older Python versions
 
 
 def normalize_version(version: str) -> str:

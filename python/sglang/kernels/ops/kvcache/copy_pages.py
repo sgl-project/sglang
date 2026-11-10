@@ -7,7 +7,10 @@ import triton
 import triton.language as tl
 
 
-@triton.jit
+# Callers pass page-id slices at any element offset (compaction launches a long
+# move in chunks); each program loads only one scalar id, so specializing on
+# their alignment would only compile more variants, and those mid-serving.
+@triton.jit(do_not_specialize_on_alignment=["src_pages", "dst_pages"])
 def _copy_pages_kernel(
     buf,
     src_pages,

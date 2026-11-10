@@ -52,7 +52,7 @@ import torch.nn.functional as F
 from transformers.activations import ACT2FN
 from transformers.modeling_utils import PreTrainedModel
 
-from sglang.srt.configs import MoonViTConfig
+from sglang.srt.configs.kimi_vl_moonvit import MoonViTConfig
 from sglang.srt.layers.attention.vision import (
     VisionAttention,
     VisionAttentionMetadata,
@@ -67,8 +67,9 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix, get_device
+from sglang.srt.utils import get_device
 
 _MAX_INFERENCE_POS_EMB_CACHE_ENTRIES = 256
 
@@ -341,7 +342,6 @@ class MLP2(nn.Module):
         self.quant_config = quant_config
         use_tensor_parallel = use_tensor_parallel and not use_data_parallel
         tp_size = get_parallel().attn_tp_size if use_tensor_parallel else 1
-        tp_rank = get_parallel().attn_tp_rank if use_tensor_parallel else 0
         if isinstance(self.quant_config, ModelSlimConfig):
             self.fc0 = ReplicatedLinear(
                 dims[0],
@@ -373,16 +373,14 @@ class MLP2(nn.Module):
                 dims[1],
                 bias=bias,
                 prefix=add_prefix("fc0", prefix),
-                tp_rank=tp_rank,
-                tp_size=tp_size,
+                parallel_group="attn_tp",
             )
             self.fc1 = RowParallelLinear(
                 dims[1],
                 dims[2],
                 bias=bias,
                 prefix=add_prefix("fc1", prefix),
-                tp_rank=tp_rank,
-                tp_size=tp_size,
+                parallel_group="attn_tp",
             )
         else:
             self.fc0 = nn.Linear(dims[0], dims[1], bias=bias)

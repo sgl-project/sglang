@@ -13,28 +13,27 @@ from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.mem_cache.allocation import _alloc_extend_loc_with_kv_reuse
 from sglang.srt.mem_cache.prefill_budget import SWAPrefillBudget
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_test_utils import FakeReq, release_only_retirer
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
-class _Req:
+class _Req(FakeReq):
     def __init__(self, context_len=8, block_size=4, *, prefill=False):
         self.origin_input_ids = array("q", range(context_len))
         self.output_ids = array("q")
         self.full_untruncated_fill_ids = self.origin_input_ids + array(
             "q", [0] * block_size
         )
-        self.prefix_indices = torch.arange(context_len, dtype=torch.int64)
+        self.prefix_len = context_len
         self.dllm_block_offset = context_len
         self.dllm_incomplete_ids = array("q")
         self.dllm_algo_state = None
         self.dllm_phase_prefill = prefill
-        self.extend_range = SimpleNamespace(
-            start=context_len, end=context_len + block_size, length=block_size
-        )
+        self.extend_end = context_len + block_size
         self.kv = ReqKvInfo(
             req_pool_idx=1,
             kv_allocated_len=context_len + block_size,
@@ -50,11 +49,11 @@ class _Req:
     def seqlen(self):
         return len(self.origin_input_ids) + len(self.output_ids)
 
+    extend_len = Req.extend_len
+    finish_outside_step = Req.finish_outside_step
+
     def is_dllm_prefill(self):
         return self.dllm_phase_prefill
-
-    def set_extend_range(self, start, end):
-        self.extend_range = SimpleNamespace(start=start, end=end, length=end - start)
 
     def update_finish_state(self, new_accepted_len=1):
         if self.finish_on_update:
@@ -100,6 +99,7 @@ class _Scheduler(SchedulerDllmMixin):
             free_group_end=Mock(),
         )
         self.tree_cache = object()
+        self.request_retirer = release_only_retirer(tree_cache=self.tree_cache)
         self.output_streamer = SimpleNamespace(stream_output=Mock())
         self.model_config = SimpleNamespace(context_len=context_len)
 
@@ -163,7 +163,7 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
         )
         cache = SimpleNamespace(
             full_evictable_size=lambda: 0,
-            swa_evictable_size=lambda: 0,
+            window_evictable_size=lambda name: 0,
         )
         budget = SWAPrefillBudget(allocator, cache)
         adder = object.__new__(PrefillAdder)
@@ -189,7 +189,8 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
         adder.dllm_block_size = 256
         adder.rem_dllm_tokens = 1024
         adder.can_run_list = []
-        adder._mamba_gap_budget_for_req = lambda req: 0
+        adder._state_slots_for_req = lambda req: 0
+        adder._replay_len = lambda req, prefix_len: 0
         adder._update_prefill_budget = Mock()
         adder._account_prefill_cache_admission = Mock()
 
@@ -201,37 +202,38 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
         adder._check_prefill_tile_budget = Mock(return_value=None)
         req = _Req(context_len=300, block_size=256, prefill=True)
         req.host_hit_length = req.storage_hit_length = 0
-        req.prefix_indices = torch.empty(0, dtype=torch.int64)
+        req.prefix_len = 0
         admission = adder._select_prefill_admission(
             req,
             total_tokens=1024,
             host_hit_length=0,
-            swa_host_hit_length=0,
+            window_host_hit_lengths={},
             truncation_align_size=None,
         )
         self.assertEqual((admission.prefix_len, admission.extend_len), (0, 300))
-        PrefillAdder._add_dllm_req(adder, req, 0)
-        self.assertEqual((req.extend_range.start, req.extend_range.end), (0, 300))
+        PrefillAdder._add_dllm_req(adder, req)
+        self.assertEqual((req.prefix_len, req.extend_end), (0, 300))
 
         req.dllm_phase_prefill = False
-        PrefillAdder._add_dllm_req(adder, req, 300)
-        self.assertEqual((req.extend_range.start, req.extend_range.end), (300, 556))
+        req.prefix_len = 300
+        PrefillAdder._add_dllm_req(adder, req)
+        self.assertEqual((req.prefix_len, req.extend_end), (300, 556))
 
     def test_chunked_context_prefill_stops_at_context_boundary(self):
         adder = object.__new__(PrefillAdder)
         adder.dllm_config = SimpleNamespace(requires_separate_context_encoding=True)
         adder.can_run_list = []
         adder._get_dllm_remain_tokens = lambda req=None: 64
-        adder._mamba_gap_budget_for_req = lambda req: 0
+        adder._state_slots_for_req = lambda req: 0
         adder._update_prefill_budget = Mock()
 
         req = _Req(context_len=10, block_size=4, prefill=True)
-        req.prefix_indices = torch.arange(7)
+        req.prefix_len = 7
 
         result = PrefillAdder.add_dllm_staging_req(adder, req)
 
         self.assertEqual(result, AddReqResult.CONTINUE)
-        self.assertEqual((req.extend_range.start, req.extend_range.end), (7, 10))
+        self.assertEqual((req.prefix_len, req.extend_end), (7, 10))
         self.assertEqual(adder.can_run_list, [req])
 
     def test_completed_canvas_frees_only_decoder_pages_and_keeps_slot(self):
@@ -241,7 +243,7 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
         )
         req.full_untruncated_fill_ids.extend([0] * block_size)
         req.dllm_block_offset = context_len
-        req.set_extend_range(context_len, context_len + block_size)
+        req.extend_end = context_len + block_size
         req.kv.req_pool_idx = 3
         req.kv.kv_allocated_len = context_len + block_size
         req.kv.kv_committed_len = context_len + block_size
@@ -262,10 +264,7 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
         self.assertEqual(req.kv.req_pool_idx, 3)
         self.assertEqual(req.kv.kv_committed_len, context_len)
         self.assertEqual(req.kv.kv_allocated_len, context_len)
-        self.assertEqual(
-            (req.extend_range.start, req.extend_range.end),
-            (context_len, context_len),
-        )
+        self.assertEqual(req.extend_end, context_len)
         scheduler.stash_chunked_request.assert_called_once_with(req)
 
     def test_unresolved_fdfo_preserves_state_and_reuses_exact_slots(self):
@@ -276,7 +275,9 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
         state = {"step": 7}
         next_canvas = torch.tensor([9, 8, 7, 6])
 
-        with patch("sglang.srt.dllm.mixin.scheduler.release_kv_cache") as release:
+        with patch(
+            "sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache"
+        ) as release:
             SchedulerDllmMixin.process_batch_result_dllm(
                 scheduler,
                 _Batch([req]),
@@ -301,6 +302,7 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
         reused = _alloc_extend_loc_with_kv_reuse(
             alloc_batch,
             [True],
+            [req_to_token[slot, :context_len]],
             torch.tensor([slot]),
             torch.tensor([context_len]),
             torch.tensor([block_size]),
@@ -317,7 +319,9 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
         req.finish_on_update = True
         canvas = torch.tensor([3, 2, 1, 0])
 
-        with patch("sglang.srt.dllm.mixin.scheduler.release_kv_cache") as release:
+        with patch(
+            "sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache"
+        ) as release:
             SchedulerDllmMixin.process_batch_result_dllm(
                 scheduler, _Batch([req]), _result([canvas])
             )
@@ -338,7 +342,7 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
                 )
 
                 with patch(
-                    "sglang.srt.dllm.mixin.scheduler.release_kv_cache"
+                    "sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache"
                 ) as release:
                     SchedulerDllmMixin.process_batch_result_dllm(
                         scheduler, _Batch([req]), result
@@ -371,7 +375,7 @@ class TestGemma4RequestValidation(unittest.TestCase):
         return SchedulerDllmMixin.validate_dllm_request(scheduler, req)
 
     def test_logprob_rejection_never_enters_the_generation_queue(self):
-        from sglang.srt.disaggregation.utils import DisaggregationMode
+        from sglang.srt.disaggregation.mode import DisaggregationMode
         from sglang.srt.managers.io_struct import AbortReq
         from sglang.srt.managers.scheduler import Scheduler
         from sglang.srt.runtime_context import get_context, get_parallel
@@ -384,11 +388,18 @@ class TestGemma4RequestValidation(unittest.TestCase):
         scheduler.tokenizer = None
         scheduler.dllm_config = _Scheduler(fdfo=False).dllm_config
         scheduler._maybe_namespace_elastic_radix_cache = Mock()
+        scheduler._record_kv_event_lora_name = Mock()
         scheduler._add_request_to_queue = Mock()
         scheduler.init_req_max_new_tokens = Mock()
         scheduler.output_streamer = Mock()
         sender = Mock()
         scheduler.ipc_channels = SimpleNamespace(send_to_tokenizer=sender)
+        scheduler.rust_server = None
+        scheduler.tree_cache = Mock()
+        scheduler.beam_coordinator = Mock()
+        scheduler.hisparse_coordinator = None
+        scheduler.uocr_runtime = None
+        scheduler.init_request_retirer()
         recv_req = MagicMock(
             session_params=None,
             session_id=None,

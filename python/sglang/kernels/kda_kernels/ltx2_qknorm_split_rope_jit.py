@@ -4,7 +4,8 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.kernels.jit.utils import cache_once, get_jit_cuda_arch, load_jit
+from sglang.kernels.arch import current_arch
+from sglang.kernels.jit.utils import cache_once, load_jit
 from sglang.kernels.kda_kernels import _cuda_source
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -14,8 +15,7 @@ if TYPE_CHECKING:
 
 @cache_once
 def _jit_ltx2_qknorm_split_rope_module(round_intermediates: bool = False) -> Module:
-    arch = get_jit_cuda_arch()
-    sm90 = (arch.major, arch.minor) == (9, 0)
+    sm90 = current_arch().is_sm(9, 0)
     namespace = "ltx2_qknorm_split_rope_kda" if sm90 else "ltx2_qknorm_split_rope"
     return load_jit(
         "diffusion_ltx2_qknorm_split_rope",
@@ -144,12 +144,7 @@ def _is_sm100_or_newer(x: torch.Tensor) -> bool:
 
 
 def _is_sm90(x: torch.Tensor) -> bool:
-    if not x.is_cuda or torch.version.hip is not None:
-        return False
-    try:
-        return torch.cuda.get_device_capability(x.device) == (9, 0)
-    except RuntimeError:
-        return False
+    return x.is_cuda and current_arch().is_sm(9, 0)
 
 
 def can_use_ltx2_qknorm_split_rope_cuda(

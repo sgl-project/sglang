@@ -474,6 +474,52 @@ def _install_parallel_properties() -> None:
 _install_parallel_properties()
 
 
+def linear_attn_parallel_group() -> str:
+    """The group linear attention partitions its heads over: the attention-TP
+    group, or the TP group under CP-TP group sharing, where the attention-TP
+    group is one rank wide."""
+    return "tp" if get_parallel().enable_cp_tp_group_sharing else "attn_tp"
+
+
+def linear_attn_tp_size() -> int:
+    """The width of ``linear_attn_parallel_group()``."""
+    return getattr(get_parallel(), f"{linear_attn_parallel_group()}_size")
+
+
+def linear_attn_tp_rank() -> int:
+    """This rank's index in ``linear_attn_parallel_group()``."""
+    return getattr(get_parallel(), f"{linear_attn_parallel_group()}_rank")
+
+
+def draft_attn_parallel_group() -> str:
+    """The group an attention-owning draft uses, resolved in the target scope.
+
+    With CP and no attention DP, the draft runs on full TP without CP.
+    Otherwise it stays within attention TP, preserving independent DP drafts.
+    """
+    parallel = get_parallel()
+    return (
+        "tp" if parallel.attn_cp_size > 1 and parallel.attn_dp_size == 1 else "attn_tp"
+    )
+
+
+def draft_attn_tp_size() -> int:
+    """The width of ``draft_attn_parallel_group()`` in the target scope."""
+    return getattr(get_parallel(), f"{draft_attn_parallel_group()}_size")
+
+
+def is_scheduler_io_rank() -> bool:
+    """Whether this scheduler rank receives requests from the tokenizer and
+    sends outputs to the detokenizer: pipeline, attention-TP and attention-CP
+    rank 0, one per attention-DP group."""
+    parallel = get_parallel()
+    return (
+        parallel.pp_rank == 0
+        and parallel.attn_tp_rank == 0
+        and parallel.attn_cp_rank == 0
+    )
+
+
 class _FlagGroupBase(msgspec.Struct):
     """Shared flag-group behavior: typo-safe writes + transactional ``override()``.
 
@@ -540,24 +586,13 @@ class MoeFlags(_FlagGroupBase):
     speculative_a2a_backend: Any = None
     deepep_mode: Any = None
     deepep_config: str | None = None
+    moe_ascend_ops_config: Any = None
     tbo_enabled: bool | None = None
     sbo_enabled: bool | None = None
     tbo_token_distribution_threshold: float | None = None
     disable_fp4_allgather: bool | None = None
     quantization: str | None = None
-    # The shared-experts-fusion decision, per runner — the runner_backend /
-    # speculative_runner_backend shape. Both leaves are seeded from the config
-    # intent by ``initialize_moe_config``; each MoE model's gate
-    # (determine_num_fused_shared_experts) refines the ACTIVE leaf, both ways,
-    # before its layers build and read it. ``speculative_moe_backend_context``
-    # brackets a draft's build: on exit the draft's effective decision is
-    # persisted onto the speculative leaf (inspectable afterwards) and the
-    # target's ACTIVE value returns.
-    disable_shared_experts_fusion: bool | None = None
-    speculative_disable_shared_experts_fusion: bool | None = None
-    # Lifecycle marker (the capture.disable_dispose_tensor family): set while
-    # speculative_moe_backend_context is active, so a draft gate's write also
-    # lands on the speculative leaf.
+    # True while draft construction/backend scopes are active.
     in_speculative_scope: bool = False
     # Draft construction/execution uses a separate one-sided A2A workspace from
     # the target model's concurrently live CUDA graphs.
@@ -580,6 +615,9 @@ class DpFlags(_FlagGroupBase):
     # gather/scatter helpers, whose captured geometry needs one shared bucket.
     capturing_prefill_graph: bool = False
     prefill_graph_has_dp_gather: bool = False
+    # Set during prefill-graph capture by breaks that capture graphs of their own
+    # behind TP-group barriers; every DP rank must then take the same path.
+    prefill_graph_has_rank_barrier: bool = False
     # This process's slot in the target's DP sync while a draft scope narrows
     # attention; dp_gather_width() also reads it as the in-scope marker.
     scoped_gather_slot: Optional[int] = None
@@ -632,7 +670,6 @@ class Resources(_FlagGroupBase):
     # Persistent reusable CUDA events for non-EP DP TBO, keyed by
     # (kind, subbatch) — see dp_attention._tbo_event for why reuse matters.
     tbo_event_pool: dict = msgspec.field(default_factory=dict)
-    flashinfer_megamoe_workspaces: dict = msgspec.field(default_factory=dict)
     # State capturers (installed by their subsystems when capture is on).
     indexer_capturer: Any = None
     experts_capturer: Any = None
@@ -681,6 +718,10 @@ class ForwardFlags:
         "lora_batch_layout": LoRABatchLayout.DP_LOCAL,
         # LayerNorm sequence parallelism region; see layers/layernorm_sp.py.
         "sp_active": False,
+        # This forward's MoE runs on attention-TP-local token slices (the
+        # ForwardBatch.attn_tp_sequence_sharded decision, stamped by the model
+        # that slices); read by the benchmark routing override.
+        "attn_tp_sequence_sharded": False,
     }
 
     # Read/written inside compiled graphs (vocab embedding, layer boundaries,
@@ -697,6 +738,7 @@ class ForwardFlags:
             "defer_moe_finalize",
             "lora_batch_layout",
             "sp_active",
+            "attn_tp_sequence_sharded",
         }
     )
 
@@ -891,7 +933,7 @@ def _install_derived_leaves(tops: dict, server_args: Any) -> None:
     import importlib
 
     from sglang.srt.arg_groups.arg_utils import _NO_DEFAULT, Derived
-    from sglang.srt.arg_groups.overrides import resolved_view
+    from sglang.srt.arg_groups.model_override_base import resolved_view
 
     namespaces = getattr(type(server_args), "_NAMESPACES", None)
     if not namespaces:
@@ -1488,6 +1530,37 @@ def publish(
     (bags re-projected, provenance reset, role overwritten), which is what
     lets one process rebuild an engine after shutting the previous one down.
     """
+    return _configure_context(_CONTEXT, server_args, role=role, ranks=ranks)
+
+
+def create_context(
+    server_args, *, role: str, ranks: SpawnRanks | None = None
+) -> RuntimeContext:
+    """Build a model-owned context without replacing the active process config."""
+    context = RuntimeContext(parallel=ParallelContext())
+    return _configure_context(context, server_args, role=role, ranks=ranks)
+
+
+@contextmanager
+def use_context(context: RuntimeContext):
+    """Activate a model context for serialized embedded SRT work.
+
+    Like process group scopes, this changes process globals and requires the
+    caller to serialize model execution. It does not isolate concurrent threads.
+    The previous context is restored by identity without re-projecting its bags.
+    """
+    global _CONTEXT, _PARALLEL
+    previous_context, previous_parallel = _CONTEXT, _PARALLEL
+    _CONTEXT, _PARALLEL = context, context.parallel
+    try:
+        yield context
+    finally:
+        _CONTEXT, _PARALLEL = previous_context, previous_parallel
+
+
+def _configure_context(
+    context, server_args, *, role: str, ranks: SpawnRanks | None = None
+) -> RuntimeContext:
     if _ROLE_NS_MODE == "enforce" and role not in ROLE_NAMESPACE_SETS:
         # Fail closed at publish time, not at the first stray read.
         raise ValueError(
@@ -1495,8 +1568,8 @@ def publish(
             "its namespace set (None for the full tree)."
         )
     server_args.resolve_once()
-    discarded = _CONTEXT.overrides_log()
-    _CONTEXT.set_server_args(server_args)
+    discarded = context.overrides_log()
+    context.set_server_args(server_args)
     if discarded:
         logger.warning(
             "publish(role=%s) re-projected the config bags and dropped %d "
@@ -1507,16 +1580,16 @@ def publish(
                 f"{source}({', '.join(sorted(fields))})" for source, fields in discarded
             ),
         )
-    _CONTEXT._publish_role = role
+    context._publish_role = role
     # Disabled DCP has rank zero even in processes without a rank bundle.
-    if not _CONTEXT.parallel.dcp_enabled:
-        _CONTEXT.parallel.override_permanently(attn_dcp_rank=0)
+    if not context.parallel.dcp_enabled:
+        context.parallel.override_permanently(attn_dcp_rank=0)
     # The device is assigned by the launcher; it is not a config field.
-    _CONTEXT.config_bag("device")._set(
+    context.config_bag("device")._set(
         "gpu_id", ranks.gpu_id if ranks is not None else None
     )
     if ranks is not None:
-        parallel = _CONTEXT.parallel
+        parallel = context.parallel
         placement = derive_spawn_ranks(
             world_rank=ranks.world_rank,
             tp_size=parallel.tp_size,
@@ -1550,7 +1623,7 @@ def publish(
             file=sys.stderr,
             flush=True,
         )
-    return _CONTEXT
+    return context
 
 
 def _attention_ranks(parallel, tp_rank: int) -> dict:
@@ -1773,11 +1846,15 @@ _PLATFORM_PROBES: Dict[str, str] = {
     "is_xpu": "is_xpu",
     "is_musa": "is_musa",
     "is_mps": "is_mps",
+    "is_mlu": "is_mlu",
+    "is_sail": "is_sail",
     "is_sm90": "is_sm90_supported",
     "is_sm100": "is_sm100_supported",
     "is_sm100_or_sm110": "is_sm100_or_sm110_supported",
+    "is_sm110": "is_sm110_supported",
     "is_sm120": "is_sm120_supported",
     "is_blackwell": "is_blackwell_supported",
+    "is_gfx95": "is_gfx95_supported",
     "is_hopper_with_cuda_12_3": "is_hopper_with_cuda_12_3",
     "has_amx": "cpu_has_amx_support",
     "has_flashinfer": "is_flashinfer_available",
@@ -1793,7 +1870,7 @@ _PLATFORM_VALUES: Dict[str, str] = {
 class PlatformContext:
     """The machine's own facts, with one place to override them.
 
-    Every name maps to a probe in `utils.common`; the probes are
+    Every name maps to a probe in `utils.device`; the probes are
     `lru_cache`-d, so reading through here costs a call and a dict lookup
     (~26 ns) rather than a device query.
     """
@@ -1813,9 +1890,9 @@ class PlatformContext:
         overrides = object.__getattribute__(self, "_overrides")
         if name in overrides:
             return overrides[name]
-        from sglang.srt.utils import common as _common
+        from sglang.srt.utils import device as _device
 
-        return getattr(_common, probe)()
+        return getattr(_device, probe)()
 
     def __setattr__(self, name: str, value: Any) -> None:
         raise AttributeError(
@@ -1946,7 +2023,7 @@ def max_speculative_num_draft_tokens() -> int | None:
 
 def uses_mla_backend() -> bool:
     """Whether this process's model runs the MLA attention path."""
-    from sglang.srt.arg_groups.overrides import use_mla_backend
+    from sglang.srt.arg_groups.model_override_base import use_mla_backend
 
     return use_mla_backend(get_server_args())
 
@@ -1961,14 +2038,14 @@ def attention_backends() -> tuple:
     stamps its own resolved pair (``ModelRunner.prefill_attention_backend_str``);
     read that when there is a runner in hand.
     """
-    from sglang.srt.arg_groups.overrides import attention_backends_of
+    from sglang.srt.arg_groups.model_override_base import attention_backends_of
 
     return attention_backends_of(get_exec().kernel)
 
 
 def process_model_config():
     """The process's ``ModelConfig`` (built once from the published config)."""
-    from sglang.srt.arg_groups.overrides import model_config_of
+    from sglang.srt.arg_groups.model_override_base import model_config_of
 
     return model_config_of(get_server_args())
 
@@ -2087,7 +2164,8 @@ def describe_kv_events_publisher(server_args: Any) -> Optional[dict]:
     helpers the scheduler binds through — so the advertisement cannot
     drift from the sockets.
     """
-    from sglang.srt.arg_groups.overrides import kv_event_block_size_of, resolving_view
+    from sglang.srt.arg_groups.model_override_base import resolving_view
+    from sglang.srt.arg_groups.overrides import kv_event_block_size_of
 
     # Lazy import so loading server_args doesn't pull in
     # disaggregation / msgspec / zmq at module top level.

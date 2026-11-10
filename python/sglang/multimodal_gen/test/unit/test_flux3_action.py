@@ -37,6 +37,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.f
     targets_to_actions,
     text_ids,
 )
+from sglang.multimodal_gen.test.unit.host_sync_guard import SyncOnRead
 
 DROID_CONFIG = {
     "action_dim": 8,
@@ -317,6 +318,9 @@ def test_reference_dit_config_fields_are_translated():
     arch = config.dit_config.arch_config
     assert arch.num_attention_heads == 24
     assert "image" not in arch.in_channels
+    # Every stream keeps an output head and the latent is the video stream.
+    assert arch.out_modes is None
+    assert arch.num_channels_latents == 96
     with pytest.raises(NotImplementedError):
         config.load_policy_config(
             {**DROID_CONFIG, "dit_config": {"depth_late_blocks": 2}}
@@ -490,6 +494,35 @@ def test_cosmos_unipc_feeds_reference_ticks_and_reuses_the_scheduler():
         assert seen == [999, 937, 833, 624]
 
 
+class _DeviceTickScheduler(FlowUniPCMultistepScheduler):
+    def set_timesteps(self, *args, **kwargs):
+        super().set_timesteps(*args, **kwargs)
+        self.timesteps = self.timesteps.as_subclass(SyncOnRead)
+
+
+def test_cosmos_unipc_reads_ticks_on_the_host_once():
+    generator = torch.Generator().manual_seed(0)
+    start = {"a": torch.randn(1, 3, 2, generator=generator)}
+    velocity = {"a": torch.randn(1, 3, 2, generator=generator)}
+    results = []
+    for scheduler in (
+        _unipc_scheduler(),
+        _DeviceTickScheduler(**_unipc_scheduler().config),
+    ):
+        seen = []
+        result = cosmos_unipc(
+            dict(start),
+            lambda samples, t: (seen.append(t), velocity)[1],
+            scheduler=scheduler,
+            n_steps=4,
+            shift=5.0,
+        )
+        results.append((seen, result["a"].as_subclass(torch.Tensor)))
+    (seen, expected), (device_seen, actual) = results
+    assert device_seen == seen
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
 def test_cosmos_unipc_recovers_x0_on_a_straight_flow():
     """Exact velocities on a straight flow must land on x0 (solver bookkeeping is consistent)."""
     generator = torch.Generator().manual_seed(0)
@@ -513,20 +546,6 @@ def test_cosmos_unipc_recovers_x0_on_a_straight_flow():
 
 
 # ---------------------------------------------------------------- DiT
-def _init_single_process_parallel() -> None:
-    from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-        maybe_init_distributed_environment_and_model_parallel,
-        model_parallel_is_initialized,
-    )
-    from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import (
-        ensure_distributed_env_defaults,
-    )
-
-    if not model_parallel_is_initialized():
-        ensure_distributed_env_defaults()
-        maybe_init_distributed_environment_and_model_parallel(tp_size=1, sp_size=1)
-
-
 def _tiny_arch() -> Flux3ArchConfig:
     return Flux3ArchConfig(
         hidden_size=64,
@@ -542,12 +561,12 @@ def _tiny_arch() -> Flux3ArchConfig:
 @pytest.mark.skipif(
     not torch.cuda.is_available(), reason="needs the CUDA parallel runtime"
 )
-def test_dit_loads_released_checkpoint_names():
+def test_dit_loads_released_checkpoint_names(request):
     """Released checkpoints load by name; a renamed module or mapping breaks them."""
     from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
     from sglang.multimodal_gen.runtime.models.dits.flux3 import Flux3Transformer
 
-    _init_single_process_parallel()
+    request.getfixturevalue("single_process_model_parallel")
     with torch.device("meta"):
         model = Flux3Transformer(Flux3DiTConfig(arch_config=_tiny_arch()))
     params = set(model.state_dict())
@@ -594,14 +613,14 @@ def test_dit_loads_released_checkpoint_names():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA attention")
-def test_dit_cached_streams_match_full_forward():
+def test_dit_cached_streams_match_full_forward(request):
     """The pipeline's per-caption / per-request caching must not change predictions."""
     from sglang.multimodal_gen.runtime.managers.forward_context import (
         set_forward_context,
     )
     from sglang.multimodal_gen.runtime.models.dits.flux3 import Flux3Transformer
 
-    _init_single_process_parallel()
+    request.getfixturevalue("single_process_model_parallel")
     torch.manual_seed(0)
     model = Flux3Transformer(Flux3DiTConfig(arch_config=_tiny_arch())).cuda().bfloat16()
     for p in model.parameters():
@@ -648,7 +667,7 @@ def test_dit_cached_streams_match_full_forward():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA graphs")
-def test_cuda_graph_replays_match_eager_denoise_steps():
+def test_cuda_graph_replays_match_eager_denoise_steps(request):
     """Replays with fresh inputs must match eager steps bit for bit."""
     from sglang.multimodal_gen.runtime.managers.forward_context import (
         set_forward_context,
@@ -656,7 +675,7 @@ def test_cuda_graph_replays_match_eager_denoise_steps():
     from sglang.multimodal_gen.runtime.models.dits.flux3 import Flux3Transformer
     from sglang.multimodal_gen.runtime.vla.cuda_graph import VLATensorGraphRunner
 
-    _init_single_process_parallel()
+    request.getfixturevalue("single_process_model_parallel")
     torch.manual_seed(0)
     model = Flux3Transformer(Flux3DiTConfig(arch_config=_tiny_arch())).cuda().bfloat16()
     for p in model.parameters():
@@ -734,7 +753,7 @@ def test_fp8r_native_format_preserves_values(monkeypatch, fnuz, tuple_output):
     not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 9),
     reason="needs FP8 scaled_mm",
 )
-def test_fp8r_checkpoint_loads_fused_rowwise_linears():
+def test_fp8r_checkpoint_loads_fused_rowwise_linears(request):
     """Native FP8r payloads (E4M3 + per-row scales) must fuse and dequantize consistently."""
     from sglang.multimodal_gen.runtime.models.dits.flux3 import (
         Flux3Fp8RowwiseLinear,
@@ -743,7 +762,7 @@ def test_fp8r_checkpoint_loads_fused_rowwise_linears():
         quantize_fp8_rowwise,
     )
 
-    _init_single_process_parallel()
+    request.getfixturevalue("single_process_model_parallel")
     with torch.device("meta"):
         model = Flux3Transformer(Flux3DiTConfig(arch_config=_tiny_arch()))
     reference = {}

@@ -338,8 +338,12 @@ export const Qwen3Deployment = () => {
     }
 
     if (hardware === 'b300') {
-      cmd += ' \\\n  --attention-backend flashinfer';
       cmd += ' \\\n  --enforce-disable-flashinfer-allreduce-fusion';
+    }
+
+    if (hardware === 'arc_b') {
+      cmd += ' \\\n  --attention-backend intel_xpu \\\n  --page-size 64';
+      cmd += ' \\\n  --cuda-graph-backend-decode full \\\n  --cuda-graph-backend-prefill breakable';
     }
 
     return cmd;
