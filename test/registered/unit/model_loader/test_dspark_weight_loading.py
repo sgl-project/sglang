@@ -211,9 +211,8 @@ class TestDSparkWeightLoading(CustomTestCase):
         expected = hidden @ head_before.T
         torch.testing.assert_close(logits, expected[:, :32], rtol=0, atol=0)
         previous = torch.tensor([1, 3])
-        corrected = model.markov_head.apply_step_logits(
-            logits, token_ids=previous, hidden_states=None
-        )
+        bias, _ = model.markov_head.step_bias(previous, hidden_states=None, state=None)
+        corrected = logits + bias
         expected_bias = (
             self.weights["markov_head.markov_w1.weight"][previous]
             @ self.weights["markov_head.markov_w2.weight"].T

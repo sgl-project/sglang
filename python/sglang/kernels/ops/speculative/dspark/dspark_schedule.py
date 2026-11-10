@@ -22,11 +22,11 @@ if TYPE_CHECKING:
 class ScheduleVerifyLensTopk:
     @classmethod
     def execute(cls, *args, **kwargs) -> torch.Tensor:
-        # All NPU archs route to the bit-exact torch reference: the triton
-        # kernel body (2D broadcast compare + axis-1 reduce, loop-carried
-        # rank) is not legalizable by the triton-ascend TTIR->Linalg pass
-        # (ascend has no global sort; the O(n^2)-rank scheme relies on
-        # patterns the backend cannot lower). CUDA keeps the fused kernel.
+        # Route NPU tensors to triton(), which delegates to sgl-kernel-npu,
+        # regardless of whether this deployment aliases Tensor.is_cuda.
+        confidence = kwargs.get("confidence")
+        if confidence is not None and confidence.device.type == "npu":
+            return cls.triton(*args, **kwargs)
         if inputs_on_cuda(*args, **kwargs):
             return cls.triton(*args, **kwargs)
         return cls.torch(*args, **kwargs)

@@ -17,6 +17,7 @@ import torch
 import torch.multiprocessing as mp
 from transformers import Qwen3Config
 
+from sglang.srt.configs.draft_parallel import DraftParallelLayout
 from sglang.srt.distributed import (
     destroy_distributed_environment,
     destroy_model_parallel,
@@ -36,7 +37,7 @@ from sglang.srt.models.dspark import DSparkDraftModel
 from sglang.srt.runtime_context import get_context, get_flags, get_parallel
 from sglang.srt.speculative.spec_utils import draft_tp_context
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, publish_build_topology
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
@@ -74,7 +75,11 @@ def _check_vocab_case(rank, *, dp_enabled, replicate):
     original_tp_group = parallel.tp_group
     expected_tp = parallel.attn_tp_size if dp_enabled else parallel.tp_size
     context = (
-        draft_tp_context(parallel.attn_tp_group, owns_attention=True)
+        draft_tp_context(
+            DraftParallelLayout(
+                tp_group=parallel.attn_tp_group, attn_tp_size=parallel.attn_tp_size
+            )
+        )
         if dp_enabled
         else nullcontext()
     )
@@ -92,7 +97,9 @@ def _check_vocab_case(rank, *, dp_enabled, replicate):
         assert model._glm_dspark_quarot_config is plan
         assert model.uses_own_vocab_modules
         assert model.embed_tokens.tp_size == (1 if replicate else expected_tp)
-        assert model.embed_tokens.use_attn_tp_group == (dp_enabled and not replicate)
+        # The draft scope already narrows TP and clears target attention-DP.
+        # Both tables reduce in that narrowed group.
+        assert not model.embed_tokens.use_attn_tp_group
         assert model.lm_head.tp_size == expected_tp
         assert not model.lm_head.use_attn_tp_group
         assert parallel.tp_size == expected_tp
@@ -141,7 +148,8 @@ def _run_vocab_worker(rank, world_size, init_path):
                     speculative_algorithm="DSpark",
                     device="cpu",
                     tp_size=world_size,
-                    dp_size=dp_size,
+                    dp_size=1,
+                    attn_dp_size=dp_size,
                     enable_dp_attention=dp_enabled,
                 ),
                 get_flags().dp.override(enabled=dp_enabled),
@@ -150,6 +158,12 @@ def _run_vocab_worker(rank, world_size, init_path):
                 # shared-memory object-broadcast transport.
                 envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.override(False),
             ):
+                publish_build_topology(
+                    world_rank=rank,
+                    tp_size=world_size,
+                    attn_dp_size=dp_size,
+                    device="cpu",
+                )
                 initialize_model_parallel(backend="gloo")
                 try:
                     for replicate in (False, True):

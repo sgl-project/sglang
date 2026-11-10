@@ -1,4 +1,5 @@
 import logging
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, Callable, Optional, Protocol, runtime_checkable
 
 import torch
@@ -380,11 +381,24 @@ class DSparkWorkerV2(BaseSpecWorker):
             verify_num_draft_tokens=self.verify_num_draft_tokens,
             tp_sync=self._tp_sync,
         )
+        self._npu_glm_compact_dp = (
+            self._verify_planner._npu_glm_target
+            and get_parallel().attn_dp_enabled
+            and self._verify_planner.is_compact_mode
+        )
+        if self._npu_glm_compact_dp and get_parallel().tp_rank == 0:
+            logger.info(
+                "GLM DSpark compact attention DP enabled (attn_dp=%d, attn_tp=%d, "
+                "budget_sync=attention-tp, target_tier_sync=tp-cpu).",
+                get_parallel().attn_dp_size,
+                get_parallel().attn_tp_size,
+            )
         if (
             get_parallel().attn_dp_enabled
             and not self._draft_is_moe
             and self._verify_planner.is_compact_mode
             and self._decode_graph_allowed
+            and not self._npu_glm_compact_dp
         ):
             raise ValueError(
                 "DSpark dense-draft compact verify under attention DP does not "
@@ -986,8 +1000,17 @@ class DSparkWorkerV2(BaseSpecWorker):
                     coordination_plan.apply(
                         batch, "target", rank, local_only=target_local_only
                     )
+                idle_layout = self._idle_verify_ragged_layout(batch)
+                if self._npu_glm_compact_dp:
+                    from sglang.srt.hardware_backend.npu.dspark_dp import (
+                        coordinate_compact_dp_layout,
+                    )
+
+                    idle_layout = coordinate_compact_dp_layout(
+                        batch=batch, layout=None, model_runner=self.model_runner
+                    )
                 self._verify_executor.run_idle_participation(
-                    batch=batch, idle_layout=self._idle_verify_ragged_layout(batch)
+                    batch=batch, idle_layout=idle_layout
                 )
             return self._decode_idle_result(on_publish=on_publish)
 
@@ -1091,6 +1114,14 @@ class DSparkWorkerV2(BaseSpecWorker):
             global_num_reqs=global_num_reqs,
             dp_tier_num_tokens=self._dp_verify_tier_num_tokens(batch),
         )
+        if self._npu_glm_compact_dp:
+            from sglang.srt.hardware_backend.npu.dspark_dp import (
+                coordinate_compact_dp_layout,
+            )
+
+            layout = coordinate_compact_dp_layout(
+                batch=batch, layout=layout, model_runner=self.model_runner
+            )
         run_compact = self._verify_planner.should_run_compact(layout=layout)
 
         verify_ids_2d = proposal.verify_ids

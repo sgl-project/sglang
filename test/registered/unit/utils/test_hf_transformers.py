@@ -27,11 +27,6 @@ from sglang.srt.configs.longcat_flash import LongcatFlashConfig
 from sglang.srt.configs.speculators import (
     normalize_speculators_qwen3_dense_dspark_config,
 )
-from sglang.srt.speculative.dspark_components.dspark_config import (
-    parse_dspark_draft_config,
-    resolve_runtime_config,
-)
-from sglang.srt.utils import hf_transformers_patches
 from sglang.srt.hf_transformers.common import (
     _is_deepseek_ocr2_model,
     _is_deepseek_ocr_model,
@@ -49,6 +44,10 @@ from sglang.srt.hf_transformers.config import (
     get_config,
 )
 from sglang.srt.hf_transformers.tokenizer import _fix_special_tokens_pattern
+from sglang.srt.speculative.dspark_components.dspark_config import (
+    parse_dspark_draft_config,
+    resolve_runtime_config,
+)
 from sglang.srt.utils import hf_transformers_patches
 from sglang.srt.utils.hf_transformers_patches import normalize_rope_scaling_compat
 from sglang.test.ci.ci_register import register_cpu_ci

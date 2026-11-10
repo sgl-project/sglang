@@ -32,8 +32,7 @@ from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyMode,
     read_ragged_verify_mode,
 )
-from sglang.srt.utils.common import is_npu
-from sglang.srt.utils import is_gfx95_supported
+from sglang.srt.utils import is_gfx95_supported, is_npu
 from sglang.srt.utils.invariants import Bucket, InClosedRange, Invariant, expect
 
 if TYPE_CHECKING:

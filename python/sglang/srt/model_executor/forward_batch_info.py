@@ -600,6 +600,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For DP attention (MLP sync sizes)
     original_global_num_tokens_cpu: Optional[List[int]] = None
+    # NPU GLM compact DP publishes packed token widths independently of its
+    # local request rows. Set only by the NPU verify executor.
+    npu_dspark_compact_dp: bool = False
     _original_batch_size: Optional[int] = None
     _original_forward_mode: Optional[ForwardMode] = None
     _original_num_tokens: Optional[int] = None
@@ -1812,7 +1815,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         bs = self.batch_size
 
-        if (
+        if self.npu_dspark_compact_dp:
+            # Packed token counts do not encode a fixed number of tokens per
+            # request. Keep local request rows; pad only token-shaped inputs.
+            pass
+        elif (
             self.forward_mode.is_decode()
             or self.forward_mode.is_target_verify()
             or self.forward_mode.is_draft_extend_v2()
@@ -2164,7 +2171,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     ]
                 logits_output.hidden_states = logits_output.hidden_states[:num_tokens]
             elif self.forward_mode.is_target_verify():  # verify
-                num_tokens = bs * self.spec_info.num_tokens_per_req
+                num_tokens = (
+                    self.spec_info.ragged_verify_layout.graph_num_tokens
+                    if self.npu_dspark_compact_dp
+                    else bs * self.spec_info.num_tokens_per_req
+                )
                 if logits_output.next_token_logits is not None:
                     logits_output.next_token_logits = logits_output.next_token_logits[
                         :num_tokens

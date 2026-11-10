@@ -114,6 +114,7 @@ class TestDSparkQuaRotEmbeddingDispatch(CustomTestCase):
                 # the first layer instead of executing attention or graph replay.
                 model = DSparkDraftModel.__new__(DSparkDraftModel)
                 nn.Module.__init__(model)
+                model.draft_config = SimpleNamespace(is_mla=False)
                 model.embed_tokens = nn.Embedding(8, 4)
                 with torch.no_grad():
                     model.embed_tokens.weight.copy_(torch.arange(32).reshape(8, 4))
@@ -137,7 +138,9 @@ class TestDSparkQuaRotEmbeddingDispatch(CustomTestCase):
                 proposer.draft_model = model
                 proposer.draft_model_runner = SimpleNamespace(
                     device=torch.device("cpu"),
+                    runner_ids=Mock(),
                     decode_cuda_graph_runner=None,
+                    attn_backend=SimpleNamespace(needs_cpu_seq_lens=True),
                     forward=forward,
                 )
                 proposer.sample_from_anchor = True
@@ -160,9 +163,12 @@ class TestDSparkQuaRotEmbeddingDispatch(CustomTestCase):
                             seq_lens_cpu=torch.tensor([5, 9]),
                             req_pool_indices=torch.tensor([0, 1]),
                             can_run_decode_cuda_graph=False,
+                            is_extend_in_batch=False,
+                            dp_spec_prefill_coordination_applied=False,
                         ),
                         draft_input=SimpleNamespace(bonus_tokens=torch.tensor([1, 2])),
                         verify_window=SimpleNamespace(
+                            iteration_ids=Mock(),
                             positions_2d=torch.tensor([[5, 6, 7], [9, 10, 11]]),
                             verify_cache_loc_2d=torch.arange(6).reshape(2, 3),
                         ),

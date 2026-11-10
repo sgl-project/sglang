@@ -240,7 +240,7 @@ class ConfidenceRelay(msgspec.Struct):
         self.confidence_buf = torch.empty(
             (self.req_pool_size, gamma), dtype=torch.float32, device=self.device
         )
-        if _is_cuda:
+        if _is_cuda or _is_npu:
             depth = CONFIDENCE_RELAY_RING_DEPTH
             self.conf_ring = torch.empty(
                 (depth, self.req_pool_size, gamma),
@@ -255,6 +255,12 @@ class ConfidenceRelay(msgspec.Struct):
     def scatter(self, indices: torch.Tensor, confidence: torch.Tensor) -> None:
         if not self.initialized:
             self._lazy_init(confidence)
+        if _is_npu and self.ring_pos:
+            # The previous D2H read must finish before overwriting its source.
+            # This is a device-side wait, not a host synchronize.
+            torch.get_device_module(self.device).current_stream().wait_event(
+                self.copy_done[(self.ring_pos - 1) % CONFIDENCE_RELAY_RING_DEPTH]
+            )
         self.confidence_buf[indices] = confidence.to(self.confidence_buf.dtype)
 
     def issue_ring_copy(self, *, stream, publish_ready) -> None:
@@ -374,6 +380,11 @@ class FutureMap:
         # resolve; arm/consume strictly alternate across all batch interleavings.
         self._publish_fresh = False
 
+        self.npu_confidence_stream = (
+            torch.get_device_module(self.device).Stream()
+            if _is_npu and self.needs_confidence_relay
+            else None
+        )
         self.confidence_relay = ConfidenceRelay(
             device=self.device,
             req_pool_size=self.req_pool_size,
@@ -551,7 +562,7 @@ class FutureMap:
             return None
         return self.confidence_relay.resolve(
             batch,
-            stream=self.fwd_prepare_d2h_stream,
+            stream=(self.npu_confidence_stream or self.fwd_prepare_d2h_stream),
             publish_ready=self.publish_ready,
         )
 
@@ -768,7 +779,7 @@ class FutureMap:
             self._publish_fresh = True
         if publish_confidence:
             self.confidence_relay.issue_ring_copy(
-                stream=self.fwd_prepare_d2h_stream,
+                stream=(self.npu_confidence_stream or self.fwd_prepare_d2h_stream),
                 publish_ready=self.publish_ready,
             )
 
