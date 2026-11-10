@@ -14,14 +14,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
-
-from sglang.srt.managers.scheduler_components import (
-    weight_updater as weight_updater_module,
-)
-from sglang.srt.managers.scheduler_components.weight_updater import (
-    SchedulerWeightUpdaterManager,
-)
-from sglang.test.ascend.npu_rl_utils import (
+from npu_rl_utils import (
     begin_weight_update,
     checkpoint_tensor_index,
     continue_generation,
@@ -35,6 +28,13 @@ from sglang.test.ascend.npu_rl_utils import (
     stream_generate,
     update_weights_from_tensor,
     warmup_npu,
+)
+
+from sglang.srt.managers.scheduler_components import (
+    weight_updater as weight_updater_module,
+)
+from sglang.srt.managers.scheduler_components.weight_updater import (
+    SchedulerWeightUpdaterManager,
 )
 from sglang.test.ascend.test_ascend_utils import QWEN3_0_6B_WEIGHTS_PATH
 from sglang.test.ci.ci_register import register_npu_ci

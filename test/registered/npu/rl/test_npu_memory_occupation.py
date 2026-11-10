@@ -9,8 +9,7 @@ import os
 import unittest
 
 import requests
-
-from sglang.test.ascend.npu_rl_utils import (
+from npu_rl_utils import (
     checkpoint_weight_bytes,
     generate,
     generation_signature,
@@ -23,6 +22,7 @@ from sglang.test.ascend.npu_rl_utils import (
     resume_memory,
     warmup_npu,
 )
+
 from sglang.test.ascend.test_ascend_utils import QWEN3_0_6B_WEIGHTS_PATH
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import CustomTestCase
