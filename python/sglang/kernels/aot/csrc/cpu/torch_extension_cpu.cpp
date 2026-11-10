@@ -381,7 +381,12 @@ at::Tensor int8_scaled_mm_with_quant(
 #if !defined(SGLANG_CPU_ARM64_SKIP_X86_ONLY_OPS)
 // int4 gemm
 at::Tensor int4_scaled_mm_cpu(
-    at::Tensor& x, at::Tensor& w, at::Tensor& w_zeros, at::Tensor& w_scales, std::optional<at::Tensor> bias);
+    at::Tensor& x,
+    at::Tensor& w,
+    at::Tensor& w_zeros,
+    at::Tensor& w_scales,
+    std::optional<at::Tensor> bias,
+    std::optional<int64_t> out_features);
 
 // weight prepack for int4 weights
 std::tuple<at::Tensor, at::Tensor, at::Tensor> convert_weight_packed_scale_zp(
@@ -890,7 +895,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
 #if !defined(SGLANG_CPU_ARM64_SKIP_X86_ONLY_OPS)
   // int4 gemm
-  m.def("int4_scaled_mm_cpu(Tensor x, Tensor w, Tensor w_zeros, Tensor w_scales, Tensor? bias) -> Tensor");
+  m.def(
+      "int4_scaled_mm_cpu(Tensor x, Tensor w, Tensor w_zeros, Tensor w_scales, Tensor? bias, int? out_features=None) "
+      "-> Tensor");
   m.impl("int4_scaled_mm_cpu", torch::kCPU, &int4_scaled_mm_cpu);
 
   // weight prepack for int4 weights

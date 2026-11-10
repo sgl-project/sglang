@@ -920,9 +920,13 @@ def register_fake_ops(tp_size: int):
         return mat1.new_empty(sizes)
 
     @register_cpu_compile_fake("int4_scaled_mm_cpu")
-    def _(x, w, w_zeros, w_scales, bias):
+    def _(x, w, w_zeros, w_scales, bias, out_features=None):
         sizes = list(x.shape)
-        sizes[-1] = w_scales.shape[0] * w_scales.shape[-1]
+        sizes[-1] = (
+            out_features
+            if out_features is not None
+            else w_scales.shape[0] * w_scales.shape[-1]
+        )
         return x.new_empty(sizes)
 
     @register_cpu_compile_fake("fused_linear_sigmoid_mul")

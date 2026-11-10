@@ -292,7 +292,7 @@ class TestGemm(CustomTestCase):
     @parametrize(
         quant_method=["gptq", "awq"],
         output_channels=[24, 32, 40, 64],
-        batch_shape=[(1,), (2, 3)],
+        batch_shape=[(1,), (2, 3), (129,)],
         dtype=[torch.bfloat16, torch.float16],
         bias_mode=[None, "layer", "external"],
     )

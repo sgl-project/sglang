@@ -320,80 +320,62 @@ void _dequant_gemm_accum(
   }
 }
 
+// Only the first n of N columns are real output channels; the padded tail is zero-filled.
 template <int64_t N>
-inline void copy_bias(const float* bias_ptr, float* y_buf, int64_t m) {
-  if (bias_ptr) {
-    for (int i = 0; i < m; ++i) {
-      int j = 0;
+inline void copy_bias(const float* bias_ptr, float* y_buf, int64_t m, int64_t n) {
+  const int64_t n_bias = bias_ptr ? n : 0;
+  for (int i = 0; i < m; ++i) {
+    int64_t j = 0;
 #if defined(CPU_CAPABILITY_AVX512)
-#pragma GCC unroll 2
-      for (; j < N; j += 16) {
-        __m512 bias_vec = _mm512_loadu_ps(bias_ptr + j);
-        _mm512_storeu_ps(y_buf + i * N + j, bias_vec);
-      }
-#endif
-      for (; j < N; ++j) {
-        y_buf[i * N + j] = bias_ptr[j];
-      }
+    for (; j + 16 <= n_bias; j += 16) {
+      _mm512_storeu_ps(y_buf + i * N + j, _mm512_loadu_ps(bias_ptr + j));
     }
-  } else {  // initialize to zero
-    for (int i = 0; i < m; ++i) {
-      int j = 0;
-#if defined(CPU_CAPABILITY_AVX512)
-#pragma GCC unroll 2
-      for (; j < N; j += 16) {
-        __m512 zero_vec = _mm512_setzero_ps();
-        _mm512_storeu_ps(y_buf + i * N + j, zero_vec);
-      }
+    if (j < n_bias) {
+      const __mmask16 mask = (1u << (n_bias - j)) - 1;
+      _mm512_storeu_ps(y_buf + i * N + j, _mm512_maskz_loadu_ps(mask, bias_ptr + j));
+      j += 16;
+    }
+    for (; j < N; j += 16) {
+      _mm512_storeu_ps(y_buf + i * N + j, _mm512_setzero_ps());
+    }
 #endif
-      for (; j < N; ++j) {
-        y_buf[i * N + j] = 0;
-      }
+    for (; j < n_bias; ++j) {
+      y_buf[i * N + j] = bias_ptr[j];
+    }
+    for (; j < N; ++j) {
+      y_buf[i * N + j] = 0;
     }
   }
 }
 
+#if defined(CPU_CAPABILITY_AVX512)
+template <typename out_dtype>
+inline void store_16(out_dtype* out, __m512 y_vec, __mmask16 mask) {
+  if constexpr (std::is_same<out_dtype, float>::value) {
+    _mm512_mask_storeu_ps(out, mask, y_vec);
+  } else if constexpr (std::is_same<out_dtype, at::BFloat16>::value) {
+    _mm256_mask_storeu_epi16(out, mask, at::vec::cvtfp32_bf16(y_vec));
+  } else if constexpr (std::is_same<out_dtype, at::Half>::value) {
+    _mm256_mask_storeu_epi16(out, mask, at::vec::cvtfp32_fp16(y_vec));
+  } else {
+    TORCH_CHECK(false, "Unsupported output dtype");
+  }
+}
+#endif
+
+// Stores the first n of N buffered columns, so the last block can end mid-tile.
 template <typename out_dtype, int64_t N>
-inline void store_out(const float* y_buf, out_dtype* c_ptr, int64_t m, /* int64_t n, */ int64_t lda) {
+inline void store_out(const float* y_buf, out_dtype* c_ptr, int64_t m, int64_t n, int64_t lda) {
   for (int i = 0; i < m; ++i) {
-    int j = 0;
-    if constexpr (std::is_same<out_dtype, float>::value) {
+    int64_t j = 0;
 #if defined(CPU_CAPABILITY_AVX512)
-#pragma GCC unroll 2
-      for (; j < N; j += 16) {
-        __m512 y_vec = _mm512_loadu_ps(y_buf + i * N + j);
-        _mm512_storeu_ps(c_ptr + i * lda + j, y_vec);
-      }
+    for (; j < n; j += 16) {
+      const __mmask16 mask = n - j >= 16 ? __mmask16(0xFFFF) : __mmask16((1u << (n - j)) - 1);
+      store_16(c_ptr + i * lda + j, _mm512_loadu_ps(y_buf + i * N + j), mask);
+    }
 #endif
-      for (; j < N; ++j) {
-        c_ptr[i * lda + j] = y_buf[i * N + j];
-      }
-    } else if constexpr (std::is_same<out_dtype, at::BFloat16>::value) {
-#if defined(CPU_CAPABILITY_AVX512)
-#pragma GCC unroll 2
-      for (; j < N; j += 16) {
-        __m512 y_vec = _mm512_loadu_ps(y_buf + i * N + j);
-        __m256i y_bf16_vec = at::vec::cvtfp32_bf16(y_vec);
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(c_ptr + i * lda + j), y_bf16_vec);
-      }
-#endif
-      for (; j < N; ++j) {
-        c_ptr[i * lda + j] = at::BFloat16(y_buf[i * N + j]);
-      }
-    } else if constexpr (std::is_same<out_dtype, at::Half>::value) {
-#if defined(CPU_CAPABILITY_AVX512)
-#pragma GCC unroll 2
-      for (; j < N; j += 16) {
-        __m512 y_vec = _mm512_loadu_ps(y_buf + i * N + j);
-        __m256i y_fp16_vec = at::vec::cvtfp32_fp16(y_vec);
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(c_ptr + i * lda + j), y_fp16_vec);
-      }
-#endif
-      for (; j < N; ++j) {
-        c_ptr[i * lda + j] = at::Half(y_buf[i * N + j]);
-      }
-    } else {
-      TORCH_CHECK(false, "Unsupported output dtype");
+    for (; j < n; ++j) {
+      c_ptr[i * lda + j] = static_cast<out_dtype>(y_buf[i * N + j]);
     }
   }
 }
@@ -426,10 +408,12 @@ void _da8w4_linear_impl(
     int8_t* __restrict__ dequant_weight_temp,
     int64_t M,
     int64_t N,
+    int64_t N_out,
     int64_t K,
     int64_t num_groups) {
   // weight + compensation shape = [Nc, Kc, BLOCK_N * _block_k / 2 + BLOCK_N*sizeof(int32_t)]
   // scales/qzeros shape = [Nc, G, BLOCK_N]
+  // N is the packed (BLOCK_N aligned) width; output and bias hold only N_out columns.
   const bool use_brgemm = can_use_brgemm<int8_t>(M);
   int64_t block_m = [&]() -> long {
     if (M <= 48) {
@@ -459,12 +443,13 @@ void _da8w4_linear_impl(
       int64_t mc = parallel_on_M ? i / Nc : 0;
       int64_t nc = parallel_on_M ? i % Nc : i;
       int64_t mc_end = parallel_on_M ? mc + 1 : Mc;
+      int64_t n_size = std::min<int64_t>(BLOCK_N, N_out - nc * BLOCK_N);
 
       for (int mci = mc; mci < mc_end; ++mci) {
         int64_t m_size = mci * block_m + block_m > M ? M - mci * block_m : block_m;
         // copy bias to y_buf if bias is not None
         auto bias_data = bias ? bias + nc * BLOCK_N : nullptr;
-        copy_bias<BLOCK_N>(bias_data, C_tmp, m_size);
+        copy_bias<BLOCK_N>(bias_data, C_tmp, m_size, n_size);
         for (int kci = 0; kci < Kc; ++kci) {
           int32_t* compensation_ptr =
               sym_quant_act
@@ -488,7 +473,8 @@ void _da8w4_linear_impl(
               /*use_brgemm*/ use_brgemm);
         }
         // store y_buf to output with dtype conversion
-        store_out<out_dtype, BLOCK_N>(C_tmp, output + mci * block_m * N + nc * BLOCK_N, m_size, N /*lda*/);
+        store_out<out_dtype, BLOCK_N>(
+            C_tmp, output + mci * block_m * N_out + nc * BLOCK_N, m_size, n_size, N_out /*lda*/);
       }
     }
     if (use_brgemm) {
@@ -739,7 +725,8 @@ at::Tensor int4_scaled_mm_cpu_with_quant(
     const at::Tensor& weight_scales,
     const at::Tensor& weight_qzeros,
     const std::optional<at::Tensor>& bias,
-    at::ScalarType output_dtype) {
+    at::ScalarType output_dtype,
+    std::optional<int64_t> out_features) {
   int64_t M_a = input.size(0);
   int64_t K_a = input.size(1);
   int64_t lda = input.stride(0);
@@ -762,7 +749,16 @@ at::Tensor int4_scaled_mm_cpu_with_quant(
 
   auto out_sizes = input.sizes().vec();
   int64_t N = weight_scales.size(0) * weight_scales.size(-1);
-  out_sizes.back() = N;
+  int64_t N_out = out_features.value_or(N);
+  TORCH_CHECK(
+      N_out > N - BLOCK_N && N_out <= N,
+      "int4_scaled_mm_cpu: out_features must lie within the last packed block, got ",
+      N_out,
+      " for packed width ",
+      N);
+  TORCH_CHECK(
+      !bias.has_value() || bias.value().numel() >= N_out, "int4_scaled_mm_cpu: bias is smaller than out_features");
+  out_sizes.back() = N_out;
   auto output = at::empty(out_sizes, input.options());
   // weight + compensation shape = [Nc, Kc, BLOCK_N * _block_k / 2 + BLOCK_N*sizeof(int32_t)]
   // scales/qzeros shape = [Nc, G, BLOCK_N]
@@ -807,6 +803,7 @@ at::Tensor int4_scaled_mm_cpu_with_quant(
             dqB_temp_ptr,                                                                                  \
             M_a,                                                                                           \
             N,                                                                                             \
+            N_out,                                                                                         \
             K_a,                                                                                           \
             num_groups);                                                                                   \
       });
@@ -884,6 +881,11 @@ INSTANTIATE_TINYGEMM_TEMPLATE(at::Half);
 
 // int4 gemm dispatch api register
 at::Tensor int4_scaled_mm_cpu(
-    at::Tensor& x, at::Tensor& w, at::Tensor& w_zeros, at::Tensor& w_scales, std::optional<at::Tensor> bias) {
-  return int4_scaled_mm_cpu_with_quant(x, w, w_scales, w_zeros, bias, x.scalar_type());
+    at::Tensor& x,
+    at::Tensor& w,
+    at::Tensor& w_zeros,
+    at::Tensor& w_scales,
+    std::optional<at::Tensor> bias,
+    std::optional<int64_t> out_features) {
+  return int4_scaled_mm_cpu_with_quant(x, w, w_scales, w_zeros, bias, x.scalar_type(), out_features);
 }
