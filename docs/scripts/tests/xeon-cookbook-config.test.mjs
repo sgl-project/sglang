@@ -31,8 +31,9 @@ test(`${name} exposes only validated Python-only Xeon recipes`, () => {
   assert.deepEqual(modes("xeon"), ["python"]);
   if (vendor === "ibm-granite") assert.deepEqual(modes(gpu), ["python", "docker"]);
   const cells = config.cells.filter((cell) => cell.match.hw === "xeon");
-  assert.deepEqual(cells.map((cell) => cell.match.variant).sort(),
-    vendor === "IFM" ? ["0.9b", "3.7b"] : ["3b", "8b"]);
+  const expectedVariants = vendor === "IFM" ? ["0.9b", "3.7b"] : ["3b", "8b"];
+  if (name === "jais-3") expectedVariants.push("7b");
+  assert.deepEqual(cells.map((cell) => cell.match.variant).sort(), expectedVariants);
   const api = engine(config);
   const cell = cells.find((candidate) => candidate.match.variant === firstVariant);
   const command = api.renderCommand(cell, cell.match, {
@@ -77,6 +78,7 @@ test(`${name} hides unvalidated Playground axes and discards stale GPU overrides
 for (const [vendor, name, variant, checkpoint, revision] of [
   ["IFM", "k2-horizon", "3.7b", "K2-Horizon-3.7B", "4525090a8f0fce1026d861701b9bde2fb726b7a0"],
   ["IFM", "jais-3", "3.7b", "Jais-3-3.7B", "78d52c03900ef18ee3ebae631426556df6bd925a"],
+  ["IFM", "jais-3", "7b", "Jais-3-7B", "c7daf3c43355921602398a0d97bbeba05bfbe81b"],
   ["ibm-granite", "granite-4.2", "8b", "granite-4.2-8b", "a7042144125ce5ae64f89610e8289647fc000b9a"],
 ]) {
 test(`${checkpoint} emits its independently validated checkpoint and cache limit`, async () => {
