@@ -32,9 +32,15 @@ def draft_kv_ring_enabled() -> bool:
 
 
 def draft_kv_ring_unsupported_reason(
-    draft_hf_config, *, draft_backend: Optional[str], draft_window_size
+    draft_hf_config,
+    *,
+    draft_backend: Optional[str],
+    draft_window_size,
+    disaggregation_mode: str = "null",
 ) -> Optional[str]:
     """Why a draft KV ring cannot serve this DFLASH draft, or None if it can."""
+    if disaggregation_mode != "null":
+        return "PD disaggregation does not transfer the ring yet"
     from sglang.srt.speculative.dflash_utils import (
         get_dflash_layer_types,
         is_dflash_mla_draft_config,

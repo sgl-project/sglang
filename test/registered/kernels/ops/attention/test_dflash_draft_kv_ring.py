@@ -110,7 +110,11 @@ def test_unsupported_drafts():
     from sglang.srt.speculative import dflash_utils
 
     def reason(
-        mla=True, layers=("sliding_attention",) * 5, backend="trtllm_mla", window=None
+        mla=True,
+        layers=("sliding_attention",) * 5,
+        backend="trtllm_mla",
+        window=None,
+        disaggregation_mode="null",
     ):
         with (
             mock.patch.object(
@@ -121,7 +125,10 @@ def test_unsupported_drafts():
             ),
         ):
             return draft_kv_ring_unsupported_reason(
-                object(), draft_backend=backend, draft_window_size=window
+                object(),
+                draft_backend=backend,
+                draft_window_size=window,
+                disaggregation_mode=disaggregation_mode,
             )
 
     assert reason() is None
@@ -130,6 +137,8 @@ def test_unsupported_drafts():
     assert reason(layers=("sliding_attention", "full_attention")) is not None
     assert reason(backend="flashinfer") is not None
     assert reason(window=4096) is not None
+    assert reason(disaggregation_mode="prefill") is not None
+    assert reason(disaggregation_mode="decode") is not None
 
 
 if __name__ == "__main__":

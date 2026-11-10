@@ -1120,9 +1120,8 @@ def _resolve_dflash_mla_draft_window(server_args: ServerArgs) -> None:
 
 def _resolve_dflash_draft_kv_ring(server_args: ServerArgs) -> None:
     """Settle SGLANG_DFLASH_DRAFT_KV_RING once, before any worker starts, so
-    every process agrees, including PP stages that own no draft: they still
-    register the ring's PD state slots. Runs after the draft backend and the
-    compact window are final."""
+    every process agrees. Runs after the draft backend and the compact window
+    are final."""
     from sglang.srt.speculative.dflash_draft_ring import (
         draft_kv_ring_unsupported_reason,
     )
@@ -1135,6 +1134,7 @@ def _resolve_dflash_draft_kv_ring(server_args: ServerArgs) -> None:
         _load_draft_hf_config(cfg),
         draft_backend=cfg.speculative_draft_attention_backend,
         draft_window_size=cfg.speculative_draft_window_size,
+        disaggregation_mode=cfg.disaggregation_mode,
     )
     if reason is None:
         logger.info("DFLASH draft KV ring: on.")
