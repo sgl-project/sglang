@@ -463,11 +463,15 @@ class WanTransformerBlock(nn.Module):
         super().__init__()
 
         # 1. Self-attention
+        # FlyDSL lowers FP32 modulation operands to BF16, so the denoising
+        # stage enables these sites only for quality="high" requests.
+        # SGLANG_USE_ROCM_FLYDSL=1 opts in; the quality gate still applies.
         self.norm1 = LayerNormScaleShift(
             dim,
             eps=eps,
             elementwise_affine=False,
             dtype=torch.float32,
+            rocm_flydsl_high_only=True,
         )
         self.to_q = ColumnParallelLinear(
             dim,
@@ -589,6 +593,7 @@ class WanTransformerBlock(nn.Module):
             eps=eps,
             elementwise_affine=True,
             dtype=torch.float32,
+            rocm_flydsl_high_only=True,
         )
 
         # 2. Cross-attention
@@ -622,6 +627,7 @@ class WanTransformerBlock(nn.Module):
             eps=eps,
             elementwise_affine=False,
             dtype=torch.float32,
+            rocm_flydsl_high_only=True,
         )
 
         # 3. Feed-forward
@@ -638,6 +644,7 @@ class WanTransformerBlock(nn.Module):
             eps=eps,
             elementwise_affine=False,
             dtype=torch.float32,
+            rocm_flydsl_high_only=True,
         )
 
         self.scale_shift_table = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
@@ -1416,6 +1423,12 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             eps=config.eps,
             elementwise_affine=False,
             dtype=torch.float32,
+            # norm_out is shared with the VSA block, which has not been validated
+            # with FlyDSL; keep its previous default until that path is tested.
+            rocm_flydsl_high_only=(
+                (get_global_server_args().attention_backend or "").lower()
+                != "video_sparse_attn"
+            ),
         )
         self.proj_out = ColumnParallelLinear(
             inner_dim,
