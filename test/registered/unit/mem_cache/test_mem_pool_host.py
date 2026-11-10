@@ -1328,6 +1328,7 @@ class TestDSAIndexerPoolInfo(CustomTestCase):
             layer_num=5,
             device="cpu",
             layer_shard_enabled=False,
+            dtype=torch.bfloat16,
             store_dtype=torch.bfloat16,
             size=64 * 8,
             start_layer=0,

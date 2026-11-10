@@ -355,7 +355,7 @@ class TestControllerUnifiedKeys(CustomTestCase):
         self.assertEqual((config.tp_rank, config.tp_size, config.dp_rank), (0, 2, 1))
         self.assertEqual((config.attn_cp_rank, config.attn_cp_size), (1, 2))
         self.assertTrue(config.is_mla_model)
-        self.assertEqual(config.kv_cache_dtype, "float8_e4m3fn")
+        self.assertEqual(config.model_name, "org/model-dtype_float8_e4m3fn")
         self.assertEqual(config.unified_suffixes, ["shared"])
 
     def test_config_pairs_grid_keys_with_physical_page_spans(self):
@@ -421,7 +421,7 @@ class TestControllerUnifiedKeys(CustomTestCase):
                     config = controller._generate_storage_config("org/model")
 
                 namespace = derive_namespace(
-                    model_id="org/model",
+                    model_id="org/model-dtype_float8_e4m3fn",
                     dtype="float8_e4m3fn",
                     page_size=16,
                     rank_replicated=mla,

@@ -227,7 +227,10 @@ class TestDeclaredParts(CustomTestCase):
                 controller = HiCacheController.__new__(HiCacheController)
                 controller.mem_pool_device = view
                 controller.mem_pool_host = SimpleNamespace(layout="page_first")
-                controller.storage_host_pool = UnifiedPageEnvelopeHostPool
+                controller.storage_host_pool = UnifiedPageEnvelopeHostPool.__new__(
+                    UnifiedPageEnvelopeHostPool
+                )
+                controller.storage_host_pool.device_pool = view.host_layout()
                 controller.enable_storage_metrics = False
                 controller.page_size = 4
                 with (

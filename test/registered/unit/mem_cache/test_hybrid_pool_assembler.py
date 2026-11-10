@@ -609,7 +609,7 @@ class TestDraftSidecarPoolDispatch(CustomTestCase):
         draft_kv_pool.kv_lora_rank = 512
         draft_kv_pool.qk_rope_head_dim = 64
         draft_kv_pool.kv_cache_dim = 576
-        draft_kv_pool.store_dtype = torch.float32
+        draft_kv_pool.dtype = draft_kv_pool.store_dtype = torch.float32
         draft_kv_pool.kv_scale_buffer = None
         draft_kv_pool.dsa_kv_cache_store_fp8 = False
         draft_kv_pool.quant_block_size = 128
@@ -753,7 +753,7 @@ def _dsa_pool_stub(*, layer_num: int, size: int = 4096, shard: tuple | None = No
     pool.size = size
     pool.start_layer = 0
     pool.end_layer = layer_num - 1
-    pool.store_dtype = torch.bfloat16
+    pool.dtype = pool.store_dtype = torch.bfloat16
     pool.kv_lora_rank = 512
     pool.qk_rope_head_dim = 64
     pool.kv_cache_dim = 576
@@ -798,7 +798,7 @@ def _kv_pool_stub(*, layer_num: int, size: int = 4096):
     pool.size = size
     pool.start_layer = 0
     pool.end_layer = layer_num - 1
-    pool.store_dtype = torch.bfloat16
+    pool.dtype = pool.store_dtype = torch.bfloat16
     pool.kv_lora_rank = 512
     pool.qk_rope_head_dim = 64
     pool.kv_cache_dim = 576
@@ -1413,7 +1413,7 @@ class TestHostPoolPreflight(CustomTestCase):
                         pool.layer_shard_enabled = False
                         pool.head_num = 1
                         pool.head_dim = pool.v_head_dim = 128
-                        pool.store_dtype = torch.bfloat16
+                        pool.dtype = pool.store_dtype = torch.bfloat16
                         pools.append(pool)
                     target, draft = pools
                 wrapper = object.__new__(HybridLinearKVPool)

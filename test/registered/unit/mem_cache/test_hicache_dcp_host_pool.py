@@ -204,7 +204,7 @@ class TestHostPoolSizingUnderDcp(CustomTestCase):
                                 continue
                             config = controller._generate_storage_config()
                         self.assertEqual(config.is_mla_model, is_mla)
-                        self.assertEqual(config.kv_cache_dtype, "float16")
+                        self.assertEqual(config.model_name, "dtype_float16")
                         self.assertEqual(
                             config.is_storage_writer, not is_mla or tp_rank < dcp_size
                         )

@@ -41,8 +41,6 @@ class HiCacheStorageConfig:
     # with dp-attention, tp_rank is attention-group-local; dp_rank disambiguates
     dp_rank: int = 0
     extra_config: Optional[dict] = None
-    # Value dtype persisted by the host pool; raw FP8 buffers may use uint8.
-    kv_cache_dtype: Optional[str] = None
     # Unified key scheme: the topology-free chunk coordinates this rank owns,
     # layer-major / head-minor. When set, backends MUST key objects by these
     # instead of by the writer's rank.
@@ -881,8 +879,8 @@ class HiCacheFile(HiCacheStorage):
             if storage_config.is_rank_replicated
             else self.tp_config_suffix
         )
-        # TODO: Include KV dtype and stored layout in keys for both DCP and
-        # non-DCP caches; raw file payloads do not describe their format.
+        # The controller includes persisted KV dtype and any storage_format_tag
+        # in model_name. Other layout differences still need extra_backend_tag.
         if storage_config.dcp_size > 1:
             # Equivalent MLA shards in different DCP groups share a file.
             dcp_suffix = (

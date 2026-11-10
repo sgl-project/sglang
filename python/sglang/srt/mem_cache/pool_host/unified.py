@@ -137,7 +137,10 @@ class UnifiedPageEnvelopeHostPool(HostKVCache):
         if value_dtype is None:
             value_dtype = getattr(pool, "dtype", None)
         if store_dtype is None or value_dtype is None:
-            return self.dtype
+            raise ValueError(
+                "Page-envelope storage requires both store_dtype and value_dtype "
+                "to identify the persisted KV encoding."
+            )
         return resolve_storage_dtype(store_dtype, value_dtype)
 
     @classmethod
