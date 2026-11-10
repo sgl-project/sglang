@@ -97,10 +97,11 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
 
     if cfg.disaggregation_mode == "decode":
         if cfg.disaggregation_decode_enable_radix_cache:
-            if cfg.enable_hisparse:
+            if cfg.enable_hisparse and not cfg.enable_hierarchical_cache:
                 raise ValueError(
-                    "--disaggregation-decode-enable-radix-cache is incompatible "
-                    "with --enable-hisparse"
+                    "--disaggregation-decode-enable-radix-cache with --enable-hisparse "
+                    "requires --enable-hierarchical-cache: HiSparse keeps latent KV on "
+                    "the host, so only the L2 (host) tier of the radix tree is usable."
                 )
             if cfg.disaggregation_transfer_backend == "fake":
                 raise ValueError(

@@ -123,6 +123,7 @@ class TestQueuedLimitAbort(CustomTestCase):
         s.schedule_low_priority_values_first = False
         s.enable_hierarchical_cache = True
         s.tree_cache = MagicMock(spec=["finish"])
+        s.enable_hisparse_host_radix = False
         s.init_request_retirer()
 
         self.assertFalse(s._abort_on_queued_limit(incoming))
@@ -144,6 +145,7 @@ class TestQueuedLimitAbort(CustomTestCase):
         s.max_queued_requests = 1
         s.enable_priority_scheduling = True
         s.schedule_low_priority_values_first = False
+        s.enable_hisparse_host_radix = False
         s.init_request_retirer()
 
         with patch(
@@ -164,6 +166,7 @@ class TestQueuedLimitAbort(CustomTestCase):
         s.max_queued_requests = 1
         s.enable_priority_scheduling = True
         s.schedule_low_priority_values_first = False
+        s.enable_hisparse_host_radix = False
         s.init_request_retirer()
 
         self.assertTrue(s._abort_on_queued_limit(incoming))
@@ -218,6 +221,7 @@ class TestQueuedAbort(CustomTestCase):
         s.mm_receiver = None
         s.dllm_config = None
         s.grammar_manager = MagicMock()
+        s.enable_hisparse_host_radix = False
         s.init_request_retirer()
         s.request_retirer._detach = MagicMock()
 

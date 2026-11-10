@@ -774,6 +774,7 @@ class TestHiSparseUnit(unittest.TestCase):
         )
         queue.scheduler = SimpleNamespace(
             enable_hisparse=True,
+            enable_hisparse_host_radix=False,
             hisparse_coordinator=self.coordinator,
         )
 

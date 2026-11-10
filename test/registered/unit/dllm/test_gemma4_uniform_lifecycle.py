@@ -399,6 +399,7 @@ class TestGemma4RequestValidation(unittest.TestCase):
         scheduler.beam_coordinator = Mock()
         scheduler.hisparse_coordinator = None
         scheduler.uocr_runtime = None
+        scheduler.enable_hisparse_host_radix = False
         scheduler.init_request_retirer()
         recv_req = MagicMock(
             session_params=None,

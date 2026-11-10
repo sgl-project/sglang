@@ -39,6 +39,7 @@ class RequestRetirer:
         uocr_runtime: Optional[UocrSchedulerRuntime],
         send_abort_output: Callable[[AbortReq, Req], None],
         stream_output: Callable[..., None],
+        enable_hisparse_host_radix: bool = False,
     ):
         self.tree_cache = tree_cache
         self.beam_coordinator = beam_coordinator
@@ -46,6 +47,7 @@ class RequestRetirer:
         self.uocr_runtime = uocr_runtime
         self.send_abort_output = send_abort_output
         self.stream_output = stream_output
+        self.enable_hisparse_host_radix = enable_hisparse_host_radix
 
     def abort(
         self,
@@ -94,11 +96,21 @@ class RequestRetirer:
             # No-op once the group retired; member rows are not freed here.
             self.beam_coordinator.retire_group(req)
         discard_kv_cache_backup(req, self.tree_cache)
-        # HiSparse clears its mapping of the row before the row is freed.
+        # HiSparse clears its mapping of the row before the row is freed. Under
+        # host-radix the host half waits until the checkpoint insert has claimed
+        # the host slots the tree keeps.
+        hisparse_host_after = False
         if req.kv.holds_kv and self.hisparse_coordinator is not None:
-            self.hisparse_coordinator.release_request(req)
+            if self.enable_hisparse_host_radix:
+                hisparse_host_after = self.hisparse_coordinator.release_request_device(
+                    req
+                )
+            else:
+                self.hisparse_coordinator.release_request(req)
         if req.kv.holds_kv or req.kv.holds_mamba:
             release_kv_cache(req, self.tree_cache, checkpoint=checkpoint)
+        if hisparse_host_after:
+            self.hisparse_coordinator.release_host_after_insert(req)
 
     def retract(self, req: Req, *, offload_kv: bool) -> bool:
         """Release a retracted request's memory uncheckpointed; return whether it can resume."""

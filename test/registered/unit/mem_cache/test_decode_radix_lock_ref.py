@@ -520,6 +520,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         it a second time."""
         q = DecodeHiCacheTransferMixin.__new__(DecodeHiCacheTransferMixin)
         q.tree_cache = MagicMock()
+        q.scheduler = SimpleNamespace(enable_hisparse_host_radix=False)
 
         req = MagicMock()
         req.req_pool_idx = 0

@@ -61,11 +61,15 @@ class HiSparseHostPoolMixin:
         req_to_host_pool: torch.Tensor,
         req_pool_idx: int,
         allocated_len: int,
+        start: int = 0,
     ) -> torch.Tensor:
         allocated_len = int(allocated_len)
         host_len = min(
             self._round_up_to_page_size(allocated_len),
             req_to_host_pool.shape[1],
         )
-        host_indices = req_to_host_pool[req_pool_idx, :host_len]
+        start = max(int(start), 0)
+        if start >= host_len:
+            return req_to_host_pool[req_pool_idx, :0]
+        host_indices = req_to_host_pool[req_pool_idx, start:host_len]
         return host_indices[host_indices >= 0]

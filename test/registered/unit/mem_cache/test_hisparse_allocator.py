@@ -299,6 +299,7 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         )
         queue.scheduler = SimpleNamespace(
             enable_hisparse=True,
+            enable_hisparse_host_radix=False,
             hisparse_coordinator=coordinator,
             server_args=SimpleNamespace(disaggregation_decode_enable_radix_cache=False),
             sliding_window_size=sliding_window_size,

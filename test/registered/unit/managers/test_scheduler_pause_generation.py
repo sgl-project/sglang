@@ -155,6 +155,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.beam_coordinator = MagicMock()
         scheduler.output_streamer = MagicMock()
         scheduler.send_abort_output = MagicMock()
+        scheduler.enable_hisparse_host_radix = False
         scheduler.init_request_retirer()
         return scheduler
 
@@ -494,6 +495,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.hisparse_coordinator.ack_staging_queue = IndexedReqList(
             ListKind.HISPARSE_STAGING
         )
+        scheduler.enable_hisparse_host_radix = False
         scheduler.init_request_retirer()
         last_req = self._make_req("last")
         last_req.kv.req_pool_idx = 0
@@ -542,6 +544,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
             req.hisparse_staging = True
             coordinator.ack_staging_queue.join([HiSparseAct(None, MagicMock(), req)])
         scheduler.hisparse_coordinator = coordinator
+        scheduler.enable_hisparse_host_radix = False
         scheduler.init_request_retirer()
         scheduler.running_batch = ScheduleBatch(reqs=[], batch_is_full=True)
         prefill = self._make_batch(
@@ -916,6 +919,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.grammar_manager = MagicMock()
         scheduler.send_abort_output = MagicMock()
         scheduler.beam_coordinator = MagicMock()
+        scheduler.enable_hisparse_host_radix = False
         scheduler.init_request_retirer()
         scheduler.enable_continuous_input_polling = False
         scheduler.pause_state = PauseState()
@@ -944,6 +948,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler = self._new_scheduler()
         scheduler.send_abort_output = MagicMock()
         scheduler.beam_coordinator = MagicMock()
+        scheduler.enable_hisparse_host_radix = False
         scheduler.init_request_retirer()
         prealloc_queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
         prealloc_queue.scheduler = scheduler

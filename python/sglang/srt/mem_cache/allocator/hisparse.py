@@ -116,6 +116,55 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.hisparse_attn_allocator.available_size(),
         )
 
+    # Set by the scheduler when the HiSparse host pool can run out before the
+    # logical pool (host-radix or host_token_capacity); see check_decode_capacity.
+    _host_decode_capacity_fn = None
+
+    def set_host_decode_capacity_fn(self, fn) -> None:
+        self._host_decode_capacity_fn = fn
+
+    def check_decode_capacity(
+        self,
+        *,
+        num_tokens: int,
+        tree_cache,
+        requests=None,
+        spec_algorithm=None,
+    ) -> bool:
+        if not super().check_decode_capacity(
+            num_tokens=num_tokens,
+            tree_cache=tree_cache,
+            requests=requests,
+            spec_algorithm=spec_algorithm,
+        ):
+            return False
+        fn = self._host_decode_capacity_fn
+        return fn is None or requests is None or fn(requests)
+
+    def max_new_tokens_for_memory(
+        self,
+        input_tokens: int,
+        max_new_tokens: int,
+        *,
+        token_capacity: int,
+        **kwargs,
+    ) -> int | None:
+        return super().max_new_tokens_for_memory(
+            input_tokens,
+            max_new_tokens,
+            token_capacity=max(token_capacity, self._size_full),
+            **kwargs,
+        )
+
+    @property
+    def supports_deferred_release(self) -> bool:
+        return getattr(self.logical_attn_allocator, "supports_deferred_release", False)
+
+    def set_release_barrier(self, event) -> None:
+        # index-K lives in logical rows that are freed at request finish and overwritten
+        # by the next request's P->D RDMA while the index-K D2H may still be reading them.
+        self.logical_attn_allocator.set_release_barrier(event)
+
     def get_kvcache(self):
         return self._kvcache
 

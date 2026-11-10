@@ -855,6 +855,13 @@ class Req(ReqDllmMixin):
 
         # For hisparse
         self.hisparse_staging = False
+        # HiSparse x UnifiedRadixCache unify (Scheme 1): host slots adopted from a
+        # matched radix prefix. ``hisparse_borrowed_prefix_len`` = adopted host-slot
+        # length (0 = no reuse); ``hisparse_borrowed_host_node`` = NodeId the host
+        # lock was taken on, released at admission-reject or finish. Coordinator-side
+        # owned/discard bookkeeping lives on lazy ``_hisparse_host_*`` attrs.
+        self.hisparse_borrowed_prefix_len = 0
+        self.hisparse_borrowed_host_node = None
 
         # Snapshot of the scheduler prefill-token counter taken at waiting_queue entry; used by HRRN aging.
         self.arrival_processed_tokens: int = 0

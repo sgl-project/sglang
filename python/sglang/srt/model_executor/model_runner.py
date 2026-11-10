@@ -1097,6 +1097,7 @@ class ModelRunner:
             device=self.device,
             tp_group=get_dp_tp_group().cpu_group,
             host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
+            host_token_capacity=hisparse_cfg.host_token_capacity,
             swap_in_block_size=hisparse_cfg.swap_in_block_size,
             shared_index_layers=resolve_shared_index_layers(
                 hf_text_config=self.model_config.hf_text_config,

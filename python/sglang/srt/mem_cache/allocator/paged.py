@@ -137,6 +137,11 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     """
 
     supports_reuse_guard = True
+    # Deferred release: a barrier holds freed pages in quarantine until its event
+    # completes, so the HiSparse index-K D2H finishes reading a logical row before
+    # it returns to the free list (and is overwritten by an unordered P->D RDMA).
+    # Inert (None barrier) on every other path.
+    supports_deferred_release = True
 
     def __init__(
         self,
@@ -164,7 +169,13 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.clear()
 
     def available_size(self):
-        return (len(self.free_pages) + self.num_staged_pages) * self.page_size
+        # Quarantined pages count as available: every alloc block-drains them on a
+        # shortfall, and when a non-blocking drain returns them depends on per-rank
+        # event timing. Excluding them would let TP ranks make different admission
+        # decisions and diverge in the following collectives.
+        return (
+            len(self.free_pages) + self.num_staged_pages + self._quarantined_pages
+        ) * self.page_size
 
     def get_all_free_pages(self):
         return torch.cat((self.free_pages, *self.staged_pages))
@@ -189,6 +200,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def alloc(self, need_size: int):
         # page-aligned allocation, returning contiguous indices of pages
+        self._drain_quarantine()
         if self.debug_mode:
             assert need_size % self.page_size == 0, (
                 "The allocation size should be page-aligned"
@@ -196,6 +208,9 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         num_pages = need_size // self.page_size
         if num_pages > len(self.free_pages):
+            self.merge_and_sort_free()
+        if num_pages > len(self.free_pages) and self._quarantine:
+            self._drain_quarantine(block=True)
             self.merge_and_sort_free()
         if num_pages > len(self.free_pages):
             return None
@@ -225,11 +240,18 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 (last_loc + 1) % self.page_size == prefix_lens % self.page_size
             )
 
+        # Must precede the kernel: alloc_extend_kernel consumes self.free_pages
+        # directly, so pages already handed out can't be recovered. Block-drain
+        # only if still short.
+        self._drain_quarantine()
         bs = len(prefix_lens)
         # Strict upper bound on num_new_pages: one request's page count grows
         # by less than extend_len / page_size + 1, so the sum is below this.
         max_new_pages = extend_num_tokens // self.page_size + bs + 1
         if max_new_pages > len(self.free_pages):
+            self.merge_and_sort_free()
+        if max_new_pages > len(self.free_pages) and self._quarantine:
+            self._drain_quarantine(block=True)
             self.merge_and_sort_free()
 
         if max_new_pages > len(self.free_pages):
@@ -295,6 +317,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 (last_loc + 2) % self.page_size == seq_lens % self.page_size
             )
 
+        self._drain_quarantine()
         bs = len(seq_lens)
         if bs > len(self.free_pages):
             self.merge_and_sort_free()
@@ -304,6 +327,9 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             page_size=self.page_size,
             decode=True,
         )
+        if num_new_pages > len(self.free_pages) and self._quarantine:
+            self._drain_quarantine(block=True)
+            self.merge_and_sort_free()
         if num_new_pages > len(self.free_pages):
             return None
 
@@ -380,6 +406,17 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         assert len(torch.unique(pages)) == len(pages)
 
     def _release_page_ids(self, *page_ids: torch.Tensor):
+        # Single choke point for all release paths (free/free_segment/
+        # free_group_end), so the barrier check here makes them all defer.
+        barrier = self._release_barrier
+        if barrier is not None and not barrier.query():
+            pages = page_ids[0] if len(page_ids) == 1 else torch.cat(page_ids)
+            self._quarantine.append((pages, barrier))
+            self._quarantined_pages += pages.numel()
+            return
+        self._release_page_ids_now(*page_ids)
+
+    def _release_page_ids_now(self, *page_ids: torch.Tensor):
         if self.need_sort:
             self.staged_pages.extend(page_ids)
             self.num_staged_pages += sum(ids.numel() for ids in page_ids)
@@ -415,6 +452,34 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.num_staged_pages = 0
         self._reuse_guard_event = None
         self._staged_guard_event = None
+        # Deferred release (see supports_deferred_release). None => inert.
+        self._release_barrier = None
+        self._quarantine: list[tuple[torch.Tensor, object]] = []
+        self._quarantined_pages = 0
+
+    def set_release_barrier(self, event) -> None:
+        """Arm deferred release: pages freed from now on wait for ``event``. Re-recording
+        the same event is safe (it can only delay a release, never advance one)."""
+        self._release_barrier = event
+
+    def _drain_quarantine(self, *, block: bool = False) -> None:
+        """Return pages whose barrier event has completed to the free list.
+
+        Query-only by default; ``block=True`` waits, used on an alloc shortfall to
+        avoid a spurious OOM while a release is in flight.
+        """
+        if not self._quarantine:
+            return
+        still_pending: list[tuple[torch.Tensor, object]] = []
+        for pages, event in self._quarantine:
+            if not event.query():
+                if not block:
+                    still_pending.append((pages, event))
+                    continue
+                event.synchronize()
+            self._quarantined_pages -= pages.numel()
+            self._release_page_ids_now(pages)
+        self._quarantine = still_pending
 
     def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
         return self._kvcache.get_cpu_copy(

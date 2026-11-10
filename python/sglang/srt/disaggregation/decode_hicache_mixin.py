@@ -167,6 +167,9 @@ class DecodeHiCachePreallocMixin:
         """Total device tokens reserved for pending HiCache L2/L3 load_back."""
         if not self.scheduler.enable_decode_hicache:
             return 0
+        # Host-radix never loads latent back to device, so no landing zone is held.
+        if getattr(self.scheduler, "enable_hisparse_host_radix", False):
+            return 0
         return sum(
             dr.prefix_match.restore_token_count
             for dr in self.transfer_queue.queue.items()
@@ -287,6 +290,13 @@ class DecodeHiCacheTransferMixin:
         if not active:
             return
 
+        # Host-radix adopts the matched host prefix directly (index-K restored in
+        # admit, latent KV stays on host), so the device load-back path never fires.
+        if getattr(self.scheduler, "enable_hisparse_host_radix", False):
+            for dr in active:
+                dr.hicache_restore_status = HiCacheRestoreResult.READY
+            return
+
         # Poll each local event once; transfer polling synchronizes request readiness.
         done = {
             index: self.tree_cache.is_load_back_event_done(index)
@@ -328,6 +338,11 @@ class DecodeHiCacheTransferMixin:
     def _commit_hicache_local_restore_to_req(self, decode_req: DecodeRequest) -> None:
         prefix_match = decode_req.prefix_match
         if prefix_match is None or not prefix_match.needs_local_restore:
+            return
+
+        # Host-radix never queues a device load-back; the prefix is adopted in
+        # _pre_alloc and its index-K restored in admit, so there is no span to splice.
+        if getattr(self.scheduler, "enable_hisparse_host_radix", False):
             return
 
         req = decode_req.req

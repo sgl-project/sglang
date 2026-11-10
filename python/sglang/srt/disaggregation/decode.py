@@ -126,13 +126,14 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.common import (
     RetractionBackup,
+    _req_radix_key,
     discard_kv_cache_backup,
-    dsv4_needs_rebootstrap,
     finish_restore_kv_cache,
     kv_to_page_indices,
     match_kv_cache,
     page_align_floor,
     restore_kv_cache,
+    retraction_needs_rebootstrap,
     start_restore_kv_cache,
     suffix_page_indices,
 )
@@ -1111,7 +1112,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if not is_retracted and not is_rebootstrap and is_unadmitted_reject(req):
             self.scheduler.request_retirer.retire_unadmitted(req)
             return
-        if is_retracted and dsv4_needs_rebootstrap(self.token_to_kv_pool_allocator):
+        if is_retracted and retraction_needs_rebootstrap(
+            self.token_to_kv_pool_allocator
+        ):
             req.time_stats.set_retract_time()
             is_retracted = False
             is_rebootstrap = True
@@ -1159,6 +1162,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             max_prefix_len=max_prefix_len,
         )
         req.lock = self.tree_cache.lock(result.last_device_node)
+        # HiSparse host-radix: pin the matched host prefix so eviction cannot
+        if (
+            self._host_radix
+            and result.host_hit_length > 0
+            and result.best_match_node is not None
+        ):
+            self.tree_cache.borrow_host_prefix(req.rid, result.best_match_node)
+            req.hisparse_borrowed_host_node = result.best_match_node
         return self._build_decode_prefix_match(
             req, result, max_prefix_len=max_prefix_len
         )
@@ -1746,6 +1757,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             running_loras.update(req.lora_id for req in self.scheduler.waiting_queue)
 
         # Then, preallocate the remaining requests if possible
+        host_growth_reserved = None
         for i, decode_req in enumerate(queue):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
@@ -1890,6 +1902,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 if prefix_match is not None and prefix_match.l1_prefix_len > 0:
                     self.tree_cache.unlock(decode_req.req.lock)
                     decode_req.req.lock = None
+                self._release_host_prefix_ref(decode_req.req)
                 break
 
             if window_allocatable_tokens is not None:
@@ -1909,6 +1922,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     if prefix_match is not None and prefix_match.l1_prefix_len > 0:
                         self.tree_cache.unlock(decode_req.req.lock)
                         decode_req.req.lock = None
+                    self._release_host_prefix_ref(decode_req.req)
                     logger.error(reclaim_error)
                     prepare_abort(
                         decode_req.req,
@@ -1935,17 +1949,71 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 if prefill_info is not None and prefill_info.stores_to_linker
                 else 0
             )
+
+            # Host-pool admission gate
+            # Needed when host can run out before the logical budget above:
+            # host-radix (the L2 tree retains slots past a request) or a host pool
+            # sized below the logical pool (hisparse-config host_token_capacity).
+            # On shortfall it evicts the tree's host nodes first and defers only
+            # if that is still short.
+            host_gate = self._host_radix or (
+                self.scheduler.enable_hisparse
+                and self.scheduler.hisparse_coordinator.host_pool_decoupled
+            )
+            if host_gate:
+                coordinator = self.scheduler.hisparse_coordinator
+                host_pool = coordinator.mem_pool_host
+                if host_growth_reserved is None:
+                    host_growth_reserved = self._hisparse_host_growth_reserved()
+                # Host layer is 1:1 with tokens here (non-dsv4): this request's
+                # full output plus every active request's remaining one.
+                host_need = (
+                    self._hisparse_host_target(decode_req.req, fill_len)
+                    - total_prefix_len
+                    + host_growth_reserved
+                )
+                if self._host_radix and host_pool.available_size() < host_need:
+                    self.tree_cache.evict_host(host_need - host_pool.available_size())
+                if host_pool.available_size() < host_need:
+                    if prefix_match is not None and prefix_match.l1_prefix_len > 0:
+                        self.tree_cache.unlock(decode_req.req.lock)
+                        decode_req.req.lock = None
+                    self._release_host_prefix_ref(decode_req.req)
+                    # Retried every poll while the pool stays full; log once per req.
+                    if not getattr(decode_req, "_host_defer_logged", False):
+                        decode_req._host_defer_logged = True
+                        logger.warning(
+                            "hisparse prealloc deferred: rid=%s needs %d host slots, "
+                            "%d available; admission is host-capacity bound",
+                            decode_req.req.rid,
+                            host_need,
+                            host_pool.available_size(),
+                        )
+                    break
             dst_kv_indices = self._pre_alloc(
                 decode_req.req,
                 prefix_indices,
                 prefix_len,
                 total_prefix_len,
             )
+            if host_gate:
+                # The prompt is now allocated; its decode growth is still owed.
+                host_growth_reserved += max(
+                    0,
+                    self._hisparse_host_target(decode_req.req, fill_len)
+                    - int(
+                        coordinator.req_to_host_pool_allocated_len[
+                            decode_req.req.kv.req_pool_idx
+                        ]
+                    ),
+                )
             decode_req.prefix_match = prefix_match
             hisparse_req_budget -= 1
             # Recompute from actual pool state for the next queue entry.
             # This accounts for page rounding and newly locked evictable cache.
-            if prefix_match is not None:
+            # Host-radix keeps the latent prefix on host (no device load-back), so
+            # it reserves no restore landing zone; counting it would under-admit.
+            if prefix_match is not None and not self._host_radix:
                 reserved_restore_tokens += prefix_match.restore_token_count
             full_allocatable_tokens = self._allocatable_token_budgets(
                 retractable_tokens=retractable_tokens,
@@ -1960,7 +2028,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     count_retracted=True,
                     extra_reserved_reqs=num_device_preallocated + 1,
                 )
-            decode_req.req.kv.protect_prefix(total_prefix_len)
+            # A host-radix match is host-only: the tree owns no logical row of it.
+            decode_req.req.kv.protect_prefix(
+                prefix_len if self._host_radix else total_prefix_len
+            )
 
             if self._defer_publish:
                 decode_req.metadata_buffer_index = (
@@ -2103,7 +2174,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 kv_transfer_page_size = (
                     self.token_to_kv_pool_allocator.hisparse_page_size
                 )
-            kv_indices = dst_kv_indices[: fill_len - prefix_len]
+            # Host suffix only: dst_kv_indices[0] is the host slot at
+            # total_prefix_len (prefill skips that many). Without host-radix the
+            # two prefix lengths are equal.
+            kv_indices = dst_kv_indices[: fill_len - total_prefix_len]
         else:
             # Only send delta indices (beyond prefix) to prefill.
             kv_indices = (
@@ -2914,6 +2988,83 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # int32 for ZMQ serialization -- from_zmq reads np.int32.
         return kv_to_page_indices(kv_indices, page_size).astype(np.int32)
 
+    @property
+    def _host_radix(self) -> bool:
+        return self.scheduler.enable_hisparse_host_radix
+
+    def _hisparse_host_target(self, req: Req, fill_len: int) -> int:
+        """Host slots a request holds once its (clipped) output is generated.
+
+        ``fill_len`` is what pre-alloc fills: a re-bootstrapped request counts its
+        emitted tokens too, as _required_admission_tokens does.
+        """
+        return ceil_align(
+            fill_len + min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKEN),
+            self.scheduler.hisparse_coordinator.mem_pool_host.page_size,
+        )
+
+    def _hisparse_host_growth_reserved(self) -> int:
+        """Host slots admitted requests will still allocate while decoding."""
+        allocated = self.scheduler.hisparse_coordinator.req_to_host_pool_allocated_len
+        reqs = (
+            list(self.scheduler.running_batch.reqs)
+            + list(self.scheduler.waiting_queue)
+            + list(self.transfer_queue.queue)
+        )
+        reserved = 0
+        for req in reqs:
+            req_pool_idx = req.kv.req_pool_idx
+            if req_pool_idx is None or req.finished():
+                continue
+            # Admitted requests reserve against their prompt, as the logical
+            # budget does; growth past it is caught per step.
+            target = self._hisparse_host_target(req, len(req.origin_input_ids))
+            reserved += max(0, target - int(allocated[req_pool_idx]))
+        return reserved
+
+    def _release_host_prefix_ref(self, req: Req) -> None:
+        """Drop the match-time host-prefix borrow when it goes unused."""
+        if not self._host_radix:
+            return
+        release = getattr(self.tree_cache, "release_host_prefix", None)
+        if release is not None:
+            release(req.rid)
+        req.hisparse_borrowed_host_node = None
+
+    def _gather_hisparse_host_prefix(self, req: Req) -> Optional[torch.Tensor]:
+        """Host slot indices of the matched prefix this request will adopt.
+
+        Walks the borrowed best-match node's chain; None when nothing was borrowed.
+        """
+        node_id = getattr(req, "hisparse_borrowed_host_node", None)
+        if node_id is None:
+            return None
+        return self.tree_cache.get_host_prefix_indices(node_id)
+
+    def _adopt_hisparse_host_prefix(
+        self,
+        req: Req,
+        coordinator,
+        host_prefix_indices: Optional[torch.Tensor],
+        host_prefix_len: int,
+    ) -> int:
+        """Point this request's host table at the matched nodes' host slots."""
+        host_prefix_len = int(host_prefix_len)
+        assert host_prefix_len > 0
+        assert (
+            host_prefix_indices is not None
+            and len(host_prefix_indices) >= host_prefix_len
+        ), "decode_prefix_len promised to prefill exceeds the adoptable host prefix"
+
+        table = coordinator.req_to_host_pool
+        idx = req.kv.req_pool_idx
+        table[idx, :host_prefix_len] = host_prefix_indices[:host_prefix_len].to(
+            table.device, non_blocking=True
+        )
+        coordinator.req_to_host_pool_allocated_len[idx] = host_prefix_len
+        req.hisparse_borrowed_prefix_len = host_prefix_len
+        return host_prefix_len
+
     def _pre_alloc(
         self,
         req: Req,
@@ -3002,12 +3153,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 logger.warning("%s", reclaim_error)
 
         if self.scheduler.enable_hisparse:
-            # HiSparse is incompatible with decode-side L1 radix cache. Keep
-            # this path on the upstream full-allocation semantics.
+            # HiSparse host-only nodes carry no device value, so an L1 device hit
+            # is impossible here; reuse happens purely on the host side.
             assert prefix_len == 0
 
-            # Direct-to-host path: only allocate logical indices (no hisparse
-            # device indices) and allocate host indices for RDMA destination.
+            # Direct-to-host: alloc the full logical range, place the
+            # matched host prefix and alloc only the suffix delta for RDMA.
             coordinator = self.scheduler.hisparse_coordinator
             kv_loc = alloc_for_decode_prealloc_hisparse(
                 allocator,
@@ -3017,14 +3168,38 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 # HiSparse pools keep one window.
                 swa_tail_len=next(iter(window_tails.values()), fill_len),
             )
-            # Allocate host indices for the RDMA transfer target.
+            host_prefix_len = (
+                self._adopt_hisparse_host_prefix(
+                    req,
+                    coordinator,
+                    self._gather_hisparse_host_prefix(req),
+                    total_prefix_len,
+                )
+                if (self._host_radix and total_prefix_len)
+                else 0
+            )
+            # Only the suffix delta needs fresh host slots; the adopted prefix is
+            # already in place at [0, host_prefix_len).
+            rdma_suffix_host_len = (
+                coordinator.host_token_len(fill_len) - host_prefix_len
+            )
             host_indices = coordinator.mem_pool_host.alloc_paged_token_slots(
                 coordinator.req_to_host_pool,
                 coordinator.req_to_host_pool_allocated_len,
                 req.kv.req_pool_idx,
-                0,
-                coordinator.host_token_len(fill_len),
+                host_prefix_len,
+                rdma_suffix_host_len,
             )
+            if self._host_radix and host_prefix_len:
+                logger.info(
+                    "hisparse prealloc: rid=%s fill_len=%d host_prefix_len=%d "
+                    "rdma_suffix_host_len=%d total_prefix_len=%s",
+                    req.rid,
+                    fill_len,
+                    host_prefix_len,
+                    rdma_suffix_host_len,
+                    total_prefix_len,
+                )
         else:
             kv_loc = self._alloc_for_decode_prealloc(
                 allocator,
@@ -3052,6 +3227,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             f"req={req.rid}"
         )
 
+        # Host-radix reuses the prefix on host only and always allocs the full
+        # fill_len, so the logical range is contiguous from 0.
+        if self._host_radix:
+            total_prefix_len = 0
         self.req_to_token_pool.write(
             (
                 req.kv.req_pool_idx,
@@ -4032,6 +4211,68 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
 
 class SchedulerDisaggregationDecodeMixin:
+    @property
+    def _pending_host_radix_inserts(self: Scheduler) -> List[Req]:
+        pending = getattr(self, "_pending_host_radix_inserts_list", None)
+        if pending is None:
+            pending = []
+            self._pending_host_radix_inserts_list = pending
+        return pending
+
+    def flush_pending_host_radix_inserts(self: Scheduler) -> None:
+        """Publish landed prompts into the host radix tree, off the critical path.
+
+        Called just after launch so the CPU tree work overlaps the GPU forward.
+        """
+        pending = getattr(self, "_pending_host_radix_inserts_list", None)
+        if not pending:
+            return
+        for req in pending:
+            self._early_insert_prompt_host_prefix(req)
+        pending.clear()
+
+    def _early_insert_prompt_host_prefix(self: Scheduler, req: Req) -> None:
+        """Publish the just-landed prompt KV into the host radix tree.
+
+        Runs in the post-RDMA overlap window so a request queued behind can match
+        the prompt early.
+        """
+        token_ids = req.origin_input_ids
+        if not token_ids or req.kv.req_pool_idx is None:
+            return
+        page_size = self.tree_cache.page_size
+        radix_key = _req_radix_key(self.tree_cache, req, token_ids).page_aligned(
+            page_size
+        )
+        key_len = len(radix_key)
+        if key_len == 0:
+            return
+
+        coordinator = self.hisparse_coordinator
+        # Host layer is 1:1 with tokens on this path (host-radix is non-dsv4), so
+        # host slot == token.
+        allocated_host = int(
+            coordinator.req_to_host_pool_allocated_len[req.kv.req_pool_idx]
+        )
+        key_len = min(key_len, allocated_host)
+        key_len = key_len // page_size * page_size
+        if key_len == 0:
+            return
+
+        token_matched, _node = self.tree_cache.insert_host_prefix(
+            req.rid,
+            radix_key[:key_len],
+            coordinator.req_to_host_pool[req.kv.req_pool_idx, :key_len],
+        )
+        # record_host_insert accumulates (no clobber of the finish-time entry);
+        # also triggers the page-aligned index-K D2H.
+        coordinator.record_host_insert(
+            req,
+            matched_len=token_matched,
+            key_len=key_len,
+            written_by_forward=False,
+        )
+
     @torch.no_grad()
     def event_loop_normal_disagg_decode(self: Scheduler):
         """A normal scheduler loop for decode worker in disaggregation mode."""
@@ -4067,6 +4308,7 @@ class SchedulerDisaggregationDecodeMixin:
             # Launch the current batch
             if batch:
                 result = self.run_batch(batch)
+                self.flush_pending_host_radix_inserts()
                 self.process_batch_result(batch, result)
             else:
                 # When the server is idle, do self-check and re-init some states
@@ -4134,6 +4376,8 @@ class SchedulerDisaggregationDecodeMixin:
                     self._preallocate_new_requests()
                 self._apply_war_barrier()
                 self.result_queue.append((batch.copy(), batch_result))
+                # Overlaps the launched forward: CPU-only host radix bookkeeping.
+                self.flush_pending_host_radix_inserts()
             else:
                 if prealloc_deferred:
                     self._preallocate_new_requests()
@@ -4550,8 +4794,13 @@ class SchedulerDisaggregationDecodeMixin:
             )  # the requests which kv has arrived
             if self.enable_hisparse:
                 for req in transferred_reqs:
-                    # Direct-to-host: KV data already in host pool, skip staging
+                    # Forward-critical half of admit: device buffer alloc +
+                    # borrowed-prefix index-K H2D restore.
                     self.hisparse_coordinator.admit_request_direct(req)
+                    if self.enable_hisparse_host_radix:
+                        # Deferrable half: publishing the prompt into the host radix
+                        # tree only benefits other requests, so defer to post-launch overlap.
+                        self._pending_host_radix_inserts.append(req)
             self.waiting_queue.join(transferred_reqs)
             if get_disagg().disaggregation_decode_host_receive_threshold < 1:
                 # Give completed host transfers device space before new arrivals.

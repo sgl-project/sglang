@@ -81,6 +81,7 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
         scheduler.output_streamer = MagicMock()
         scheduler.beam_coordinator = MagicMock()
         scheduler.hisparse_coordinator = None
+        scheduler.enable_hisparse_host_radix = False
         scheduler.init_request_retirer()
         return scheduler
 
@@ -483,6 +484,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         scheduler.collect_inflight_reqs = MagicMock(return_value=set())
         scheduler.tree_cache = MagicMock()
         scheduler.hisparse_coordinator = None
+        scheduler.enable_hisparse_host_radix = False
         scheduler.init_request_retirer()
 
         with (
@@ -589,6 +591,7 @@ class TestDecodePreallocQueuePriority(CustomTestCase):
         scheduler.running_batch.reqs = []
         scheduler.server_args.disaggregation_decode_enable_radix_cache = False
         scheduler.enable_hisparse = False
+        scheduler.enable_hisparse_host_radix = False
         scheduler.enable_lora = False
         scheduler.waiting_queue = []
         scheduler.last_batch = None
@@ -613,6 +616,7 @@ class TestDecodePreallocQueuePriority(CustomTestCase):
                 queue.scheduler.hisparse_coordinator = SimpleNamespace(
                     padded_buffer_size=4160,
                     spec_swap=SimpleNamespace(scratch_capacity=1024),
+                    host_pool_decoupled=False,
                 )
                 queue.token_to_kv_pool_allocator.logical_attn_allocator = (
                     SimpleNamespace(available_size=lambda: 32768)

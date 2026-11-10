@@ -79,11 +79,20 @@ def _parse_sparse_config() -> SparseConfig:
     top_k = extra_config.pop("top_k", 2048)
     device_buffer_size = extra_config.pop("device_buffer_size", 2 * top_k)
     host_to_device_ratio = extra_config.pop("host_to_device_ratio", 2)
+    host_token_capacity = extra_config.pop("host_token_capacity", None)
     swap_in_block_size = extra_config.pop("swap_in_block_size", 960)
 
     if device_buffer_size < top_k:
         raise ValueError(
             f"device_buffer_size ({device_buffer_size}) must be no smaller than top_k ({top_k})"
+        )
+    if host_token_capacity is not None and (
+        not isinstance(host_token_capacity, int)
+        or isinstance(host_token_capacity, bool)
+        or host_token_capacity <= 0
+    ):
+        raise ValueError(
+            f"host_token_capacity must be a positive integer, got {host_token_capacity!r}"
         )
     if not isinstance(swap_in_block_size, int) or isinstance(swap_in_block_size, bool):
         raise ValueError(
@@ -103,6 +112,7 @@ def _parse_sparse_config() -> SparseConfig:
         top_k=top_k,
         device_buffer_size=device_buffer_size,
         host_to_device_ratio=host_to_device_ratio,
+        host_token_capacity=host_token_capacity,
         swap_in_block_size=swap_in_block_size,
         algorithm=algorithm,
         backend=backend,

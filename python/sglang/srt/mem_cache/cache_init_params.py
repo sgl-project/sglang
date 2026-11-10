@@ -71,6 +71,10 @@ class CacheInitParams:
     # Draft KV pools that share the target KV slots but are stored apart from it.
     sidecar_draft_device_pools: tuple[object, ...] = ()
     mtp_draft_mamba_pools: tuple[object, ...] = ()
+    # HiSparse host latent pool (the P->D RDMA landing target). When set, the DSA
+    # host stack anchors on it instead of building its own KV host pool, so tree
+    # host values and the INDEXER sidecar share req_to_host_pool's slot space.
+    hisparse_host_kv_pool: Optional[object] = None
 
     @property
     def tree_components(self) -> Optional[tuple[ComponentType, ...]]:
