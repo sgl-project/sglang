@@ -83,8 +83,10 @@ On Ascend NPU, traces use the native
 `*.trace.json.gz`. See [Ascend profiling](/docs/hardware-platforms/ascend-npus/optimization/profiling)
 for LLM serving, or [Diffusion profiling](/docs/sglang-diffusion/profiling#ascend-npu-traces)
 for image/video generation. Both parse captures automatically; daemon Diffusion
-workers wait for an independent parser when capture stops, which can pause the
-remaining generation when only part of denoising is profiled.
+workers submit a background parser when capture stops, without waiting for it.
+Generation completion does not imply that the trace is ready: check each
+capture's `sglang_analysis.json` and `sglang_analysis.log` for analysis results.
+Analysis failures are reported separately from the generation result.
 
 ### Profile a server with `sglang.benchmark.serving`
 

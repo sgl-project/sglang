@@ -169,7 +169,7 @@ class SGLDiffusionProfiler:
             return
         self.has_stopped = True
         logger.info("Stopping Profiler...")
-        sync_npu_errors = (
+        sync_npu_stop_errors = (
             export_trace
             and self._npu_trace_handler is not None
             and self._npu_trace_handler.npu_auto_analysis_in_daemon
@@ -183,43 +183,40 @@ class SGLDiffusionProfiler:
             if current_platform.is_npu():
                 torch.npu.synchronize()
             self.profiler.stop()
-
-            if export_trace and (
-                self._npu_trace_handler is not None
-                or dump_rank is None
-                or dump_rank == self.rank
-            ):
-                self._export_trace()
         except Exception as exc:
-            if not sync_npu_errors:
+            if not sync_npu_stop_errors:
                 raise
             error = f"rank {self.rank}: {exc}"
-            logger.error("NPU profiler analysis failed: %s", error)
+            logger.error("NPU profiler stop failed: %s", error)
         finally:
             SGLDiffusionProfiler._instance = None
 
-        if not sync_npu_errors:
-            return
-        errors = [error]
-        if model_parallel_is_initialized():
-            group = get_replica_group()
-            if group.world_size > 1:
-                # All ranks reach the same capture boundary before continuing
-                # generation. Include stop failures as well as parser failures.
-                errors = [None] * group.world_size
-                torch.distributed.all_gather_object(
-                    errors, error, group=group.cpu_group
+        if sync_npu_stop_errors:
+            errors = [error]
+            if model_parallel_is_initialized():
+                group = get_replica_group()
+                if group.world_size > 1:
+                    # Coordinate capture-stop failures only. Background analysis
+                    # status is rank-local and never gates continued generation.
+                    errors = [None] * group.world_size
+                    torch.distributed.all_gather_object(
+                        errors, error, group=group.cpu_group
+                    )
+            if any(errors):
+                raise RuntimeError(
+                    "NPU profiler stop failed: " + "; ".join(e for e in errors if e)
                 )
-        if any(errors):
-            raise RuntimeError(
-                "NPU profiler analysis failed: " + "; ".join(e for e in errors if e)
-            )
+
+        if export_trace and (
+            self._npu_trace_handler is not None
+            or dump_rank is None
+            or dump_rank == self.rank
+        ):
+            self._export_trace()
 
     def _export_trace(self):
         if self._npu_trace_handler is not None:
-            trace = self._npu_trace_handler.export(self.profiler)
-            if trace is not None:
-                logger.info("Saved NPU profiler trace to: %s", trace)
+            self._npu_trace_handler.export(self.profiler)
             return
 
         try:

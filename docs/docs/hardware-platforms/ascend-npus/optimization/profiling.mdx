@@ -21,10 +21,11 @@ see [SGLang Benchmark and Profiling](/docs/developer_guide/benchmark_and_profili
 This page describes LLM serving. For image and video generation, see
 [Diffusion profiling](/docs/sglang-diffusion/profiling#ascend-npu-traces).
 Both paths parse captures automatically: non-daemon LLM workers use the native
-NPU trace callback; daemon Diffusion workers save raw data and wait for an
-independent parser when capture stops. Partial denoising profiling can therefore
-pause the remaining generation while parsing runs. Diffusion uses per-request
-profiling controls, not the LLM `/start_profile` and `/stop_profile` endpoints.
+NPU trace callback; daemon Diffusion workers submit an independent background
+parser when capture stops, without waiting for it. Generation results and
+analysis status are reported separately, and analysis may finish after generation.
+Diffusion uses per-request profiling controls, not the LLM `/start_profile` and
+`/stop_profile` endpoints.
 
 ## Ascend PyTorch Profiler
 

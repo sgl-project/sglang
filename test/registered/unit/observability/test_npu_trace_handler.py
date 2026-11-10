@@ -44,8 +44,8 @@ class TestNPUTraceHandler(unittest.TestCase):
                 ),
                 patch.object(
                     profile_analysis_npu,
-                    "analyze_npu_profile",
-                    return_value=Path("trace_view.json"),
+                    "start_npu_profile_analysis",
+                    return_value=Path("sglang_analysis.json"),
                 ) as analyze,
             ):
                 handler = profile_analysis_npu.NPUTraceHandler("traces")
@@ -59,10 +59,27 @@ class TestNPUTraceHandler(unittest.TestCase):
                 trace = handler.export(profiler)
                 if daemon:
                     analyze.assert_called_once_with("rank1_ascend_pt")
-                    self.assertEqual(trace, Path("trace_view.json"))
+                    self.assertEqual(trace, Path("sglang_analysis.json"))
                 else:
                     analyze.assert_not_called()
                     self.assertIsNone(trace)
+
+    def test_background_launch_failure_is_logged_not_raised(self):
+        profiler = SimpleNamespace(prof_if=SimpleNamespace(prof_path="rank0_ascend_pt"))
+        handler = profile_analysis_npu.NPUTraceHandler.__new__(
+            profile_analysis_npu.NPUTraceHandler
+        )
+        handler.npu_auto_analysis_in_daemon = True
+        with (
+            patch.object(
+                profile_analysis_npu,
+                "start_npu_profile_analysis",
+                side_effect=OSError("cannot exec"),
+            ),
+            self.assertLogs(profile_analysis_npu.logger, level="ERROR") as logs,
+        ):
+            self.assertIsNone(handler.export(profiler))
+        self.assertIn("cannot exec", "\n".join(logs.output))
 
 
 class TestSRTNPUTraceHandler(unittest.TestCase):
@@ -139,8 +156,8 @@ class TestSRTNPUTraceHandler(unittest.TestCase):
         self.analyze = self.enterContext(
             patch.object(
                 profile_analysis_npu,
-                "analyze_npu_profile",
-                side_effect=lambda _: self.events.append("external analysis"),
+                "start_npu_profile_analysis",
+                side_effect=lambda _: self.events.append("submit analysis"),
             )
         )
 
@@ -210,7 +227,7 @@ class TestSRTNPUTraceHandler(unittest.TestCase):
                     str(Path(self.directory) / "rank0_ascend_pt")
                 )
                 self.native_analysis.assert_not_called()
-                self.assertEqual(self.events, ["external analysis", "barrier"])
+                self.assertEqual(self.events, ["submit analysis", "barrier"])
 
     def test_non_npu_srt_paths_keep_chrome_trace_export(self):
         with (

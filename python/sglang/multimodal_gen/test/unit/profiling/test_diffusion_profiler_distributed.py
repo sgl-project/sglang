@@ -14,6 +14,7 @@ import torch
 import torch.distributed as dist
 
 from sglang.multimodal_gen.runtime.utils import profiler as profiler_module
+from sglang.srt.observability import profile_analysis_npu
 
 
 def stop_worker(rank, root, failure):
@@ -30,17 +31,17 @@ def stop_worker(rank, root, failure):
         )
         profiler.rank = rank
         profiler.has_stopped = False
-        profiler.profiler = SimpleNamespace(stop=Mock())
-        profiler._npu_trace_handler = SimpleNamespace(
-            npu_auto_analysis_in_daemon=True,
-            export=Mock(return_value=Path(root) / f"rank{rank}.json"),
+        profiler.profiler = SimpleNamespace(
+            stop=Mock(), prof_if=SimpleNamespace(prof_path=f"rank{rank}_ascend_pt")
         )
+        handler = profile_analysis_npu.NPUTraceHandler.__new__(
+            profile_analysis_npu.NPUTraceHandler
+        )
+        handler.npu_auto_analysis_in_daemon = True
+        handler.export = Mock(wraps=handler.export)
+        profiler._npu_trace_handler = handler
         if rank == 1 and failure == "stop":
             profiler.profiler.stop.side_effect = RuntimeError("stop failed")
-        if rank == 1 and failure == "parser":
-            profiler._npu_trace_handler.export.side_effect = RuntimeError(
-                "parser failed"
-            )
         profiler_module.SGLDiffusionProfiler._instance = profiler
         group = SimpleNamespace(world_size=2, cpu_group=dist.group.WORLD)
         result = {"error": None, "continued": False}
@@ -54,6 +55,13 @@ def stop_worker(rank, root, failure):
                 profiler_module, "model_parallel_is_initialized", return_value=True
             ),
             patch.object(profiler_module, "get_replica_group", return_value=group),
+            patch.object(
+                profile_analysis_npu,
+                "start_npu_profile_analysis",
+                side_effect=OSError("parser launch failed")
+                if rank == 1 and failure == "parser"
+                else None,
+            ),
         ):
             try:
                 profiler.stop(dump_rank=0)
@@ -112,16 +120,19 @@ class TestDiffusionProfilerDistributed(unittest.TestCase):
             self.assertTrue(result["continued"])
             self.assertEqual(result["export_calls"], 1)
 
-    def test_non_driver_stop_or_parser_failure_reaches_every_rank(self):
-        for failure in ("stop", "parser"):
-            with self.subTest(failure=failure):
-                results = self.run_workers(failure)
-                self.assertEqual(results[0]["error"], results[1]["error"])
-                for result in results:
-                    self.assertIn(f"rank 1: {failure} failed", result["error"])
-                    self.assertFalse(result["continued"])
-                self.assertEqual(results[0]["export_calls"], 1)
-                self.assertEqual(results[1]["export_calls"], int(failure == "parser"))
+    def test_non_driver_stop_failure_reaches_every_rank(self):
+        results = self.run_workers("stop")
+        self.assertEqual(results[0]["error"], results[1]["error"])
+        for result in results:
+            self.assertIn("rank 1: stop failed", result["error"])
+            self.assertFalse(result["continued"])
+            self.assertEqual(result["export_calls"], 0)
+
+    def test_non_driver_parser_launch_failure_does_not_fail_generation(self):
+        for result in self.run_workers("parser"):
+            self.assertIsNone(result["error"])
+            self.assertTrue(result["continued"])
+            self.assertEqual(result["export_calls"], 1)
 
 
 if __name__ == "__main__":

@@ -101,29 +101,42 @@ NPU traces use the native Ascend directory layout rather than the
 <output_dir>/<hostname>_<pid>_<timestamp>_ascend_pt/
   ASCEND_PROFILER_OUTPUT/trace_view.json
   sglang_analysis.log
+  sglang_analysis.json
 ```
 
 Diffusion workers are daemon processes, where the native NPU analyzer cannot
 create its multiprocessing pool. SGLang saves the raw capture, then starts an
-independent parser immediately after profiling stops and waits for it to finish.
-The parser handles only that worker's capture directory. Each participating rank
-produces its own trace; check the `Saved NPU profiler trace to:` log for its path.
-Non-daemon callers keep native automatic parsing.
+independent parser immediately after profiling stops **without waiting**.
+Remaining generation and request completion do not wait for analysis. Each
+participating rank submits its own capture; the `NPU profile analysis submitted;
+status:` log identifies its status file, which may not exist until the new
+interpreter starts. Non-daemon callers keep native automatic parsing.
+
+The parser runs without a fixed timeout and can finish after the generation
+worker exits. It writes progress and results atomically to
+`sglang_analysis.json`:
+
+- `running`: analysis has started; a trace may not be ready yet.
+- `succeeded`: analysis finished and produced a nonempty `trace_view.json`.
+  `trace_path` identifies the artifact.
+- `failed`: analysis failed, or no nonempty trace was produced. Read `error` and
+  `sglang_analysis.log`. Parser launch failures are also reported separately.
+
+Analysis failures do not change a successful generation result. Raw data and
+logs remain for diagnosis or
+[optional re-parsing](/docs/hardware-platforms/ascend-npus/optimization/profiling#6-re-parsing-raw-data-optional).
+Wait for `succeeded` before opening the trace; completion of the generation
+command alone does not mean analysis is complete. If the parser is forcibly
+killed or its host shuts down, it may not write a final status. SGLang does not
+monitor or automatically retry these tasks.
 
 <Note>
-With partial denoising profiling, parsing temporarily pauses the remaining
-generation steps. With `--profile-all-stages`, parsing runs when pipeline
-profiling stops. These timings include profiling and parsing overhead; do not
-use them as an unprofiled latency benchmark.
+Background analysis still consumes CPU, memory, and I/O resources. Profiled
+latency is not an unprofiled benchmark. A nonempty trace proves an artifact was
+produced, not that all expected events are present; inspect native warnings and
+the trace itself. Stopping the generation worker does not cancel an already
+submitted parser; destroying its container or host can still terminate it.
 </Note>
-
-The independent parser has a 600-second timeout. Parser errors, timeouts, or a
-missing/empty `trace_view.json` fail the profiled request. Raw data and
-`sglang_analysis.log` remain in the capture directory for diagnosis or
-[optional re-parsing](/docs/hardware-platforms/ascend-npus/optimization/profiling#6-re-parsing-raw-data-optional).
-Cancellation or worker exit cleans up the independent parser and its process
-pool. A nonempty trace confirms an artifact was produced, not that every
-expected event is present; inspect the trace and any native profiler warnings.
 
 ### View Traces
 

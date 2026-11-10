@@ -40,9 +40,12 @@ class TestDiffusionProfilerContext(unittest.TestCase):
             self.profiler.stop.assert_not_called()
         self.profiler.stop.assert_called_once_with(dump_rank=0)
 
-    def test_analysis_failure_propagates(self):
-        self.profiler.stop.side_effect = RuntimeError("parser failed")
-        with self.assertRaisesRegex(RuntimeError, "parser failed"), self.context():
+    def test_capture_stop_failure_propagates(self):
+        self.profiler.stop.side_effect = RuntimeError("capture stop failed")
+        with (
+            self.assertRaisesRegex(RuntimeError, "capture stop failed"),
+            self.context(),
+        ):
             pass
 
     def test_inference_error_or_cancel_skips_analysis(self):

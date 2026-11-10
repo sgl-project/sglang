@@ -109,7 +109,7 @@ class TestDiffusionProfiler(unittest.TestCase):
         self.enterContext(patch("sglang.srt.utils.is_npu", return_value=True))
         self.profiler_utils = self.load_profiler_module(npu=True)
         self.analyze = self.enterContext(
-            patch.object(profile_analysis_npu, "analyze_npu_profile")
+            patch.object(profile_analysis_npu, "start_npu_profile_analysis")
         )
         self.parallel_initialized = self.enterContext(
             patch.object(
@@ -202,7 +202,7 @@ class TestDiffusionProfiler(unittest.TestCase):
                 )
                 wrapper.profiler.prof_if.analyse.assert_not_called()
 
-    def test_short_capture_is_parsed_before_generation_continues(self):
+    def test_short_capture_submits_analysis_then_continues_generation(self):
         self.process.return_value.daemon = True
         wrapper = self.make_profiler()
         events = []
@@ -241,16 +241,19 @@ class TestDiffusionProfiler(unittest.TestCase):
         self.assertTrue(wrapper.has_stopped)
         self.assertIsNone(self.profiler_utils.SGLDiffusionProfiler.get_instance())
 
-    def test_analysis_failure_is_not_hidden_by_native_callback(self):
+    def test_analysis_launch_failure_does_not_fail_generation(self):
         self.process.return_value.daemon = True
-        self.analyze.side_effect = RuntimeError("No parsed trace")
+        self.analyze.side_effect = OSError("cannot exec parser")
         wrapper = self.make_profiler(full=True)
         torch.ones(1).add_(1)
-        with self.assertRaisesRegex(RuntimeError, "No parsed trace"):
+        with self.assertLogs(profile_analysis_npu.logger, level="ERROR"):
             wrapper.stop()
         self.assertIsNone(self.profiler_utils.SGLDiffusionProfiler.get_instance())
+        self.analyze.assert_called_once()
+        wrapper.stop()
+        self.analyze.assert_called_once()
 
-    def test_stop_failure_uses_the_same_analysis_error_path(self):
+    def test_stop_failure_is_still_propagated_before_submitting_analysis(self):
         self.process.return_value.daemon = True
         self.parallel_initialized.return_value = True
         group = SimpleNamespace(world_size=2, cpu_group=object())
@@ -275,7 +278,7 @@ class TestDiffusionProfiler(unittest.TestCase):
         finally:
             wrapper.profiler.stop()  # Release the real CPU profiler after injected failure.
 
-    def test_analysis_failure_on_another_rank_is_reported(self):
+    def test_stop_failure_on_another_rank_skips_analysis_submission(self):
         self.process.return_value.daemon = True
         self.parallel_initialized.return_value = True
         group = SimpleNamespace(world_size=2, cpu_group=object())
@@ -284,12 +287,13 @@ class TestDiffusionProfiler(unittest.TestCase):
             patch.object(torch.distributed, "all_gather_object") as gather,
         ):
             gather.side_effect = lambda errors, local, group: errors.__setitem__(
-                slice(None), [local, "rank 1 parser failed"]
+                slice(None), [local, "rank 1 stop failed"]
             )
             wrapper = self.make_profiler(full=True)
             torch.ones(1).add_(1)
-            with self.assertRaisesRegex(RuntimeError, "rank 1 parser failed"):
+            with self.assertRaisesRegex(RuntimeError, "rank 1 stop failed"):
                 wrapper.stop()
+            self.analyze.assert_not_called()
             self.assertIs(gather.call_args.kwargs["group"], group.cpu_group)
 
     def test_non_npu_keeps_torch_profiler_and_chrome_export(self):
