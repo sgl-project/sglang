@@ -419,6 +419,21 @@ class TestCudaIpcTransport(CustomTestCase):
             processor.cudaipc_mmfeature_pool = pool
             executor = MultimodalProcessorExecutor(lambda: hf_processor, max_workers=1)
             processor.mm_processor_executor = executor
+            feature_threads = []
+            publish_threads = []
+            prepare_features = processor._precompute_hashes_before_cpu_transfer
+            publish_features = processor._prepare_mm_items_for_transport
+
+            def record_prepare(*args, **kwargs):
+                feature_threads.append(threading.get_ident())
+                return prepare_features(*args, **kwargs)
+
+            def record_publish(*args, **kwargs):
+                publish_threads.append(threading.get_ident())
+                return publish_features(*args, **kwargs)
+
+            processor._precompute_hashes_before_cpu_transfer = record_prepare
+            processor._prepare_mm_items_for_transport = record_publish
             task = asyncio.create_task(
                 processor.process_and_combine_mm_data_async(
                     BaseMultiModalProcessorOutput(
@@ -447,6 +462,11 @@ class TestCudaIpcTransport(CustomTestCase):
                 while pool.active_lease_count and time.monotonic() < deadline:
                     await asyncio.sleep(0.01)
                 self.assertEqual(pool.active_lease_count, 0)
+                self.assertEqual(len(feature_threads), 1)
+                self.assertNotEqual(feature_threads[0], threading.get_ident())
+                self.assertEqual(
+                    publish_threads, [] if cancel else [threading.get_ident()]
+                )
             finally:
                 resume.set()
                 await asyncio.to_thread(executor.shutdown)

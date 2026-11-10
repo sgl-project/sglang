@@ -1867,7 +1867,7 @@ class BaseMultimodalProcessor(ABC):
             base_output, mm_tokens, processor=processor, **kwargs
         )
         if items:
-            items = self._finalize_mm_items(items, images=base_output.images)
+            items = self._prepare_mm_items_for_transport(items)
         return items, input_ids, ret
 
     def _process_and_combine_mm_data(
@@ -2029,6 +2029,9 @@ class BaseMultimodalProcessor(ABC):
         from sglang.srt.managers.mm_utils import get_new_expanded_mm_items
 
         all_collected_items = get_new_expanded_mm_items(all_collected_items)
+        all_collected_items = self._prepare_mm_item_features(
+            all_collected_items, images=base_output.images
+        )
         return all_collected_items, input_ids, ret
 
     def _finalize_mm_items(
@@ -2037,6 +2040,17 @@ class BaseMultimodalProcessor(ABC):
         *,
         images: Optional[List[Any]],
     ) -> List[MultimodalDataItem]:
+        return self._prepare_mm_items_for_transport(
+            self._prepare_mm_item_features(mm_items, images=images)
+        )
+
+    def _prepare_mm_item_features(
+        self,
+        mm_items: List[MultimodalDataItem],
+        *,
+        images: Optional[List[Any]],
+    ) -> List[MultimodalDataItem]:
+        """finalize features and identity without publishing transport leases"""
         mm_items = self._postprocess_mm_items_before_transport(
             mm_items,
             images=images,
@@ -2050,7 +2064,7 @@ class BaseMultimodalProcessor(ABC):
                 item.set_pad_value()
 
         self._precompute_hashes_before_cpu_transfer(mm_items)
-        return self._prepare_mm_items_for_transport(mm_items)
+        return mm_items
 
     def _postprocess_mm_items_before_transport(
         self,
@@ -2146,5 +2160,5 @@ class BaseMultimodalProcessor(ABC):
         )
         # publish only after the await succeeds, so cancellation cannot orphan leases
         if items:
-            items = self._finalize_mm_items(items, images=base_output.images)
+            items = self._prepare_mm_items_for_transport(items)
         return items, input_ids, ret
