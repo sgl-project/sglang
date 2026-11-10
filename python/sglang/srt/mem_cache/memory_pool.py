@@ -31,7 +31,7 @@ import os
 import time
 from contextlib import contextmanager, nullcontext
 from dataclasses import KW_ONLY, dataclass, fields
-from functools import cached_property
+from functools import cached_property, lru_cache
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -43,6 +43,7 @@ from sglang.kernels.ops.kvcache.cache_move import (
     copy_all_layer_kv_cache_func,
     set_kv_buffer_prefix_valid_tiled,
     set_kv_buffer_prefix_valid_tiled_fp8,
+    set_kv_buffer_tiled_fp8,
 )
 from sglang.kernels.ops.kvcache.cache_ops import launch_reshape_and_cache_flash
 from sglang.kernels.ops.kvcache.kvcache import can_use_store_cache, store_cache
@@ -89,6 +90,7 @@ from sglang.srt.runtime_context import get_flags, get_parallel, get_platform
 from sglang.srt.utils import (
     ceil_align,
     cpu_has_amx_support,
+    get_device_sm,
     is_cpu,
     is_cuda,
     is_gfx95_supported,
@@ -349,6 +351,94 @@ def _set_kv_buffer_prefix_valid_impl_fp8(
         num_warps=num_warps,
         num_stages=2,
     )
+
+
+# (elements per tile, warps). Measured on SM120 with 1024-element rows: 64 and 128 are
+# 2.3x and 1.3x slower at 8192 rows, 512 and 1024 tie; re-tune for other widths.
+_FP8_STORE_TILE = (256, 4)
+
+
+@lru_cache(maxsize=1)
+def _triton_fp8_supported() -> bool:
+    # Triton lowers fp8e4nv only on SM89+; ROCm fp8 types are unaffected.
+    return _is_hip or get_device_sm() >= 89
+
+
+def _fp8_store_scale(scale, device: torch.device):
+    """(kernel argument, is a device pointer), or None for a scale the fused store declines."""
+    if scale is None:
+        return 1.0, False
+    if isinstance(scale, (float, int)):
+        return float(scale), False
+    if (
+        isinstance(scale, torch.Tensor)
+        and scale.ndim == 0
+        and scale.dtype == torch.float32
+        and scale.device == device
+    ):
+        return scale, True
+    return None
+
+
+def _dense_rows(x: torch.Tensor, row_dim: int) -> torch.Tensor:
+    # Rows may be strided (V is a slice of the QKV output); a row itself must be dense.
+    x = x.reshape(-1, row_dim)
+    return x if x.stride(1) == 1 else x.contiguous()
+
+
+def _try_set_kv_buffer_fp8(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    indices: torch.Tensor,
+    k_scale,
+    v_scale,
+    row_dim: int,
+    size_limit: int,
+) -> bool:
+    """Divides by the scales, saturates, casts and stores equal-width K/V rows in
+    one kernel, leaving ``k`` and ``v`` untouched. False means nothing was written."""
+    if not (k_cache.is_cuda and _triton_fp8_supported()):
+        return False
+    k_scale_arg = _fp8_store_scale(k_scale, k.device)
+    v_scale_arg = _fp8_store_scale(v_scale, v.device)
+    if k_scale_arg is None or v_scale_arg is None:
+        return False
+    if indices.numel() == 0:
+        return True
+    k = _dense_rows(k, row_dim)
+    v = _dense_rows(v, row_dim)
+    assert k.shape[0] == v.shape[0] == indices.numel(), (
+        k.shape,
+        v.shape,
+        indices.shape,
+    )
+    elems_per_tile, num_warps = _FP8_STORE_TILE
+    set_kv_buffer_tiled_fp8[(indices.numel(), triton.cdiv(row_dim, elems_per_tile))](
+        k,
+        v,
+        k_cache,
+        v_cache,
+        indices.contiguous(),
+        k_scale_arg[0],
+        v_scale_arg[0],
+        k.stride(0),
+        v.stride(0),
+        k_cache.stride(0),
+        v_cache.stride(0),
+        size_limit,
+        ROW_ELEMS=row_dim,
+        ELEMS_PER_TILE=elems_per_tile,
+        FP8_MAX=torch.finfo(k_cache.dtype).max,
+        K_SCALE_IS_PTR=k_scale_arg[1],
+        V_SCALE_IS_PTR=v_scale_arg[1],
+        num_warps=num_warps,
+        # Keeps the slot bound check that store_cache always asserts; it also turns on
+        # Triton's int32 overflow checks, and the measured timings include both.
+        debug=True,
+    )
+    return True
 
 
 def _resolve_fused_scale(
@@ -3023,6 +3113,27 @@ class MHATokenToKVPool(KVCache, MHAKVView):
                 v_scale=v_scale,
             )
             return
+
+        if (
+            self.kv_cache_layout == "nhd"
+            and dcp_kv_mask is None
+            and cache_k.dtype != self.dtype
+            and self.dtype == fp8_dtype
+            and self.v_row_dim == self.row_dim
+        ):
+            layer_idx = layer_id - self.start_layer
+            if _try_set_kv_buffer_fp8(
+                k=cache_k,
+                v=cache_v,
+                k_cache=self.k_buffer[layer_idx].view(self.dtype),
+                v_cache=self.v_buffer[layer_idx].view(self.dtype),
+                indices=loc,
+                k_scale=k_scale,
+                v_scale=v_scale,
+                row_dim=self.row_dim,
+                size_limit=self.size + self.page_size,
+            ):
+                return
 
         if cache_k.dtype != self.dtype:
             if k_scale is not None:
@@ -6326,7 +6437,7 @@ class MiniMaxSparseKVPool(KVCache):
         """Write main K/V at `loc`. Works for any layer (dense or sparse).
 
         Scale semantics follow MHATokenToKVPool: None means unit scale;
-        a non-None scale is applied with an in-place div_ before the fp8 cast.
+        a non-None scale divides K/V before the fp8 cast, in place on the eager path.
         """
         self._pool_for(layer.layer_id).set_kv_buffer(
             layer,

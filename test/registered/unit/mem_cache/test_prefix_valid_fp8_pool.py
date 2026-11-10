@@ -1,4 +1,4 @@
-"""Pool dispatch and real DFLASH initialization for FP8 prefix commits."""
+"""Pool dispatch for FP8 KV stores and prefix commits, and real DFLASH initialization."""
 
 import unittest
 from types import SimpleNamespace
@@ -7,12 +7,16 @@ from unittest.mock import patch
 import torch
 
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
-from sglang.srt.mem_cache.kv.layout.mha import DraftMHAView, MHASubPoolSpec
+from sglang.srt.mem_cache.kv.layout.mha import DraftMHAView, MHASubPoolSpec, MHAView
 from sglang.srt.mem_cache.layout.fused_draft import (
     DenseDraftRegion,
     FusedDraftPlacement,
 )
-from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, _resolve_fused_scale
+from sglang.srt.mem_cache.memory_pool import (
+    KVWriteLoc,
+    MHATokenToKVPool,
+    _resolve_fused_scale,
+)
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kernels.prefix_valid import (
     assert_bytes_equal,
@@ -22,10 +26,10 @@ from sglang.test.kernels.prefix_valid import (
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.unified_allocator_fixtures import arena_of
 
-# Preserve the original GPU lanes; the kernel file retains the other 25 seconds.
-register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-small")
+# Preserve the original GPU lanes; the kernel file holds the other 35 seconds.
+register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 # backend-specific: loaded FP8 scales are doubled for ROCm's E4M3FNUZ format.
-register_amd_ci(est_time=15, stage="jit-kernel-unit", runner_config="amd")
+register_amd_ci(est_time=20, stage="jit-kernel-unit", runner_config="amd")
 
 DEVICE = "cuda"
 
@@ -337,6 +341,87 @@ class TestPrefixValidFp8Pool(CustomTestCase):
             assert_bytes_equal(
                 buffer[untouched], original[untouched], f"{label} uncommitted slots"
             )
+
+
+def _make_store_pools(row_dim, v_row_dim):
+    plain = MHATokenToKVPool(
+        size=8,
+        page_size=1,
+        head_num=1,
+        head_dim=row_dim,
+        v_head_dim=v_row_dim,
+        dtype=fp8_dtype,
+        layer_num=1,
+        device=DEVICE,
+        enable_memory_saver=False,
+        kv_cache_layout="nhd",
+    )
+    # An arena needs one band growing from each end; the view writes to "full".
+    spec, peer = (
+        MHASubPoolSpec(
+            name=name,
+            layer_num=1,
+            head_num=1,
+            head_dim=row_dim,
+            v_head_dim=v_row_dim,
+            store_dtype=torch.uint8,
+            kv_cache_dtype=fp8_dtype,
+            grow_direction=grow,
+        )
+        for name, grow in (("full", "down"), ("swa", "up"))
+    )
+    arena = arena_of(
+        [spec, peer],
+        total_bytes=16 * (spec.entry_bytes() + peer.entry_bytes()),
+        device=DEVICE,
+        page_size=1,
+    )
+    view = MHAView(
+        arena=arena,
+        spec=arena.spec("full"),
+        page_size=1,
+        model_layer_ids=(0,),
+        enable_alt_stream=False,
+    )
+    return {"plain": plain, "view": view}
+
+
+class TestFp8StorePoolDispatch(CustomTestCase):
+    def test_store_routes_by_row_shape(self):
+        """Equal K/V rows take the fused store, which leaves the inputs as they
+        were; unequal rows keep the eager writer, which divides them in place."""
+        loc = torch.tensor([2, 5, 3], device=DEVICE)
+        lengths = torch.ones(3, dtype=torch.int32, device=DEVICE)
+        scales = (
+            torch.tensor(0.375, device=DEVICE),
+            torch.tensor(1.75, device=DEVICE),
+        )
+        for row_dim, v_row_dim, fused in ((128, 128, True), (128, 64, False)):
+            for name, pool in _make_store_pools(row_dim, v_row_dim).items():
+                with self.subTest(pool=name, v_row_dim=v_row_dim):
+                    k = torch.randn(
+                        (3, 1, row_dim), dtype=torch.bfloat16, device=DEVICE
+                    )
+                    v = torch.randn(
+                        (3, 1, v_row_dim), dtype=torch.bfloat16, device=DEVICE
+                    )
+                    with assert_prefix_commit(
+                        k,
+                        v,
+                        pool.k_buffer[0].view(fp8_dtype),
+                        pool.v_buffer[0].view(fp8_dtype),
+                        loc.view(-1, 1),
+                        lengths,
+                        *scales,
+                        inputs_mutated=not fused,
+                    ):
+                        pool.set_kv_buffer(
+                            SimpleNamespace(layer_id=0),
+                            KVWriteLoc(loc, physical=True),
+                            k,
+                            v,
+                            *scales,
+                        )
 
 
 class TestDflashFp8PrefixCommit(CustomTestCase):
