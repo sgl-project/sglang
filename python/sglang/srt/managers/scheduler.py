@@ -4709,20 +4709,19 @@ class Scheduler(
                     continue
                 break
 
-        if unschedulable:
-            self.waiting_queue.leave(unschedulable)
-            for req in unschedulable:
-                if self.disaggregation_mode == DisaggregationMode.PREFILL:
-                    # As a queued abort: the sender goes before the KV it reads.
-                    self.release_prefill_sender(req, abort_sender=True)
-                self._abort_unavailable(
-                    req,
-                    message=(
-                        "The request cannot be scheduled: it fits the KV memory "
-                        "pool only once memory held elsewhere is freed, and "
-                        "nothing that holds memory will free it."
-                    ),
-                )
+        for req in unschedulable:
+            if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                # As a queued abort: the sender goes before the KV it reads.
+                self.release_prefill_sender(req, abort_sender=True)
+            self._abort_unavailable(
+                req,
+                src=self.waiting_queue,
+                message=(
+                    "The request cannot be scheduled: it fits the KV memory "
+                    "pool only once memory held elsewhere is freed, and "
+                    "nothing that holds memory will free it."
+                ),
+            )
 
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_end()
