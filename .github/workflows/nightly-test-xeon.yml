@@ -42,9 +42,7 @@ concurrency:
 jobs:
   nightly-xeon:
     if: github.repository == 'sgl-project/sglang'
-    # DEBUG: label is 'nightly-gnr' so nightly does not contend for the
-    # upstream PR-test 'xeon-gnr' boxes. CHANGE BACK TO 'xeon-gnr' ONCE MERGED.
-    runs-on: nightly-gnr
+    runs-on: xeon-gnr
     strategy:
       fail-fast: false
       matrix:
