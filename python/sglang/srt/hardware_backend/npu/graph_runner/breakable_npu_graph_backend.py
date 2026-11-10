@@ -24,17 +24,18 @@ the eager break points, outside the captured segments.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
     BreakableCudaGraphBackend,
 )
-from sglang.srt.runtime_context import get_flags
+from sglang.srt.runtime_context import get_flags, get_forward
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
         BaseCudaGraphRunner,
     )
+    from sglang.srt.model_executor.runner.shape_key import ShapeKey
 
 
 class BreakableNPUGraphBackend(BreakableCudaGraphBackend):
@@ -58,3 +59,23 @@ class BreakableNPUGraphBackend(BreakableCudaGraphBackend):
             "breakable NPU prefill graph does not support torch.compile; "
             "disable --enable-torch-compile or prefill graph"
         )
+
+    def capture_one(
+        self,
+        shape_key: ShapeKey,
+        forward_fn: Callable[[], Any],
+        capture_inputs: Optional[Any] = None,
+        post_warmup_hook: Optional[Callable[[], None]] = None,
+    ) -> None:
+        # Every TP rank runs the capture bucket at the same width; publish that
+        # layout so ascend_ops skips the live row-count exchange, a host sync
+        # the captured graph cannot contain.
+        with get_forward().scoped(
+            ascend_allgather_row_sizes=[shape_key.size] * self._tp_group.world_size
+        ):
+            super().capture_one(
+                shape_key,
+                forward_fn,
+                capture_inputs=capture_inputs,
+                post_warmup_hook=post_warmup_hook,
+            )

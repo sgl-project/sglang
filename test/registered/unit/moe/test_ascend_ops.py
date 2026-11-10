@@ -370,19 +370,16 @@ class TestAscendOpsPrefillGraph(CustomTestCase):
     # Guards the capture path: prefill capture forces is_extend_in_batch False,
     # so the prefill-graph scope is what keeps dispatch on allgather instead of
     # falling into the decode MC2 path.
-    def test_prefill_capture_selects_capacity_allgather(self):
+    def test_prefill_capture_selects_allgather(self):
         dispatcher = AscendOpsDispatcher.__new__(AscendOpsDispatcher)
         dispatcher.tp_group = None
+        dispatcher.moe_ascend_ops_config = AscendOpsConfig(prefill="allgather")
         hidden_states = torch.zeros((8, 4))
         topk_weights, topk_ids, _ = self._topk_output(8)
 
         with (
             patch(
                 "sglang.srt.layers.moe.token_dispatcher.ascend_ops.is_in_prefill_graph_scope",
-                return_value=True,
-            ),
-            patch(
-                "sglang.srt.layers.moe.token_dispatcher.ascend_ops.get_is_capture_mode",
                 return_value=True,
             ),
             patch(
@@ -397,10 +394,35 @@ class TestAscendOpsPrefillGraph(CustomTestCase):
             result = dispatcher.dispatch(hidden_states, (topk_weights, topk_ids, None))
 
         self.assertEqual(result, "allgather")
-        allgather.assert_called_once_with(
-            hidden_states, topk_weights, topk_ids, None, capacity=hidden_states.shape[0]
-        )
+        allgather.assert_called_once_with(hidden_states, topk_weights, topk_ids, None)
         low_latency.assert_not_called()
+
+    # Guards the eager path: an extend batch outside a prefill graph still
+    # selects allgather rather than the decode MC2 path.
+    def test_eager_extend_selects_allgather(self):
+        dispatcher = AscendOpsDispatcher.__new__(AscendOpsDispatcher)
+        dispatcher.tp_group = None
+        dispatcher.moe_ascend_ops_config = AscendOpsConfig(prefill="allgather")
+        hidden_states = torch.zeros((8, 4))
+        topk_weights, topk_ids, _ = self._topk_output(8)
+
+        with (
+            patch(
+                "sglang.srt.layers.moe.token_dispatcher.ascend_ops.is_in_prefill_graph_scope",
+                return_value=False,
+            ),
+            patch(
+                "sglang.srt.layers.moe.token_dispatcher.ascend_ops.get_is_extend_in_batch",
+                return_value=True,
+            ),
+            patch.object(
+                dispatcher, "_dispatch_allgather", return_value="allgather"
+            ) as allgather,
+        ):
+            result = dispatcher.dispatch(hidden_states, (topk_weights, topk_ids, None))
+
+        self.assertEqual(result, "allgather")
+        allgather.assert_called_once_with(hidden_states, topk_weights, topk_ids, None)
 
     # Guards the decode graph: capture mode is also set while a decode graph is
     # captured, so the prefill scope is what keeps that on the MC2 path.
@@ -416,10 +438,6 @@ class TestAscendOpsPrefillGraph(CustomTestCase):
                 return_value=False,
             ),
             patch(
-                "sglang.srt.layers.moe.token_dispatcher.ascend_ops.get_is_capture_mode",
-                return_value=True,
-            ),
-            patch(
                 "sglang.srt.layers.moe.token_dispatcher.ascend_ops.get_is_extend_in_batch",
                 return_value=False,
             ),
@@ -433,45 +451,6 @@ class TestAscendOpsPrefillGraph(CustomTestCase):
         self.assertEqual(result, "mc2")
         low_latency.assert_called_once_with(hidden_states, topk_weights, topk_ids)
         allgather.assert_not_called()
-
-    # Guards the capture contract: capacity mode must not run the row-count
-    # exchange, which syncs the host and cannot execute inside a captured
-    # graph.  Every rank contributes the bucket width instead.
-    def test_capacity_allgather_uses_bucket_rows_without_exchange(self):
-        dispatcher = AscendOpsDispatcher.__new__(AscendOpsDispatcher)
-        dispatcher.quant_config = {}
-        capacity, world = 4, 2
-
-        def fake_all_gather(output, local_rows, group=None):
-            rows = local_rows.shape[0]
-            for rank in range(world):
-                output[rank * rows : (rank + 1) * rows].copy_(local_rows)
-
-        with (
-            patch(
-                "sglang.srt.layers.moe.token_dispatcher.ascend_ops.dist.get_world_size",
-                return_value=world,
-            ),
-            patch(
-                "sglang.srt.layers.moe.token_dispatcher.ascend_ops.dist.all_gather_into_tensor",
-                side_effect=fake_all_gather,
-            ),
-            patch.object(
-                AscendOpsDispatcher,
-                "_allgather_row_sizes",
-                side_effect=AssertionError("row exchange must not run"),
-            ),
-        ):
-            output = dispatcher._dispatch_allgather(
-                torch.zeros((capacity, 4)),
-                torch.ones((capacity, 2)),
-                torch.zeros((capacity, 2), dtype=torch.int32),
-                group=None,
-                capacity=capacity,
-            )
-
-        self.assertEqual(output.forward_state.row_sizes, [capacity] * world)
-        self.assertEqual(output.hidden_states.shape[0], world * capacity)
 
 
 if __name__ == "__main__":

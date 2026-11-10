@@ -21,7 +21,7 @@ from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend impor
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     breakable_cuda_graph as bcg,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_forward, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -70,6 +70,30 @@ class TestBreakableNPUGraphBackend(CustomTestCase):
         ):
             with self.assertRaisesRegex(AssertionError, "torch.compile"):
                 mod.BreakableNPUGraphBackend(runner)
+
+    def test_capture_publishes_allgather_row_sizes(self):
+        runner = _make_runner()
+        tp_group = SimpleNamespace(barrier=mock.Mock(), world_size=4)
+        seen = []
+
+        def fake_capture_one(
+            self, shape_key, forward_fn, capture_inputs=None, post_warmup_hook=None
+        ):
+            seen.append(get_forward().ascend_allgather_row_sizes)
+
+        with (
+            get_parallel().override(tp_group=tp_group),
+            mock.patch.object(mod, "get_flags", return_value=_flags()),
+            mock.patch.object(
+                BreakableCudaGraphBackend, "capture_one", fake_capture_one
+            ),
+        ):
+            backend = mod.BreakableNPUGraphBackend(runner)
+            backend.capture_one(SimpleNamespace(size=128), lambda: None)
+            restored = get_forward().ascend_allgather_row_sizes
+
+        self.assertEqual(seen, [[128, 128, 128, 128]])
+        self.assertIsNone(restored)
 
 
 class TestDeviceGraphCls(CustomTestCase):
