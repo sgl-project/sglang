@@ -442,6 +442,13 @@ event instead of a different HTTP status. Native Engine calls raise the correspo
 `MmMemoryRequestTooLarge` or `MmMemoryOverloaded` exception.
 Native gRPC maps these to `INVALID_ARGUMENT` and `RESOURCE_EXHAUSTED`, respectively.
 
+Cancelling while waiting removes the request from the admission queue. Once
+publication is submitted, cancellation cannot interrupt native work or in-flight
+CUDA copies. Pending accounting remains charged until native publication finishes;
+pool slices are reclaimed only after copy completion and consumer/abort cleanup
+make reuse safe. Reclaimed capacity is reused within the pool, so cancellation
+does not immediately reduce its reserved HBM.
+
 With `--enable-metrics`, inspect `sglang:mm_publication_requests_total`,
 `sglang:mm_publication_wait_seconds`, and `sglang:mm_publication_state` (pending
 count/bytes, occupied/free bytes, largest free range, and IPC free slots).
