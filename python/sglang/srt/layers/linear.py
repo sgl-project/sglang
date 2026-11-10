@@ -919,37 +919,32 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         for i, output_size in enumerate(output_sizes):
             shard_offsets.append((i, current_shard_offset, output_size))
             current_shard_offset += output_size
+        # Special case for Quantization.
+        # If quantized, we need to adjust the offset and size to account
+        # for the packing.
+        if (
+            isinstance(param, (PackedColumnParameter, PackedvLLMParameter))
+            and param.packed_dim == param.output_dim
+        ):
+            packed_shard_offsets = []
+            for shard_id, shard_offset, shard_size in shard_offsets:
+                shard_size, shard_offset = param.adjust_shard_indexes_for_packing(
+                    shard_size=shard_size, shard_offset=shard_offset
+                )
+                packed_shard_offsets.append((shard_id, shard_offset, shard_size))
+            shard_offsets = packed_shard_offsets
         if _is_cpu:
             from sglang.srt.model_loader.weight_utils import (
                 pad_loaded_weight,
             )
 
-            padding_output_sizes = output_sizes
-            if (
-                isinstance(param, (PackedColumnParameter, PackedvLLMParameter))
-                and param.packed_dim == param.output_dim
-            ):
-                padding_output_sizes = [
-                    param.adjust_shard_indexes_for_packing(
-                        shard_size=output_size, shard_offset=0
-                    )[0]
-                    for output_size in output_sizes
-                ]
             loaded_weight = pad_loaded_weight(
-                loaded_weight, param.output_dim, padding_output_sizes
+                loaded_weight,
+                param.output_dim,
+                [shard_size for _, _, shard_size in shard_offsets],
             )
 
         for shard_id, shard_offset, shard_size in shard_offsets:
-            # Special case for Quantization.
-            # If quantized, we need to adjust the offset and size to account
-            # for the packing.
-            if (
-                isinstance(param, (PackedColumnParameter, PackedvLLMParameter))
-                and param.packed_dim == param.output_dim
-            ):
-                shard_size, shard_offset = param.adjust_shard_indexes_for_packing(
-                    shard_size=shard_size, shard_offset=shard_offset
-                )
             loaded_weight_shard = loaded_weight.narrow(
                 param.output_dim, shard_offset, shard_size
             )

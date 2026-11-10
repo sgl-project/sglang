@@ -2115,7 +2115,7 @@ def pad_loaded_weight(loaded_weight, output_dim, output_sizes):
             pad_size = output_size - weight_split_size[i]
             target_pad_shape = list(loaded_weight.size())
             target_pad_shape[output_dim] = pad_size
-            pad_tensor = torch.zeros(target_pad_shape).to(loaded_weight.dtype)
+            pad_tensor = loaded_weight.new_zeros(target_pad_shape)
             loaded_weight_pad.append(
                 torch.cat([split_weight[i], pad_tensor], dim=output_dim)
             )

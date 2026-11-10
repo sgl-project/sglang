@@ -5,6 +5,10 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt.hardware_backend.cpu.quantization.int4_utils import (
+    apply_int4_linear,
+    process_int4_linear_weights,
+)
 from sglang.srt.layers.amx_utils import (
     CPUQuantMethod,
     _amx_process_weight_after_loading,
@@ -23,12 +27,7 @@ class AWQIntelAMXLinearKernel:
         self.quant_config = quant_config
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        _amx_process_weight_after_loading(
-            layer, ["qweight", "qzeros", "scales"], None, "awq"
-        )
-        layer.qweight = torch.nn.Parameter(layer.qweight.data, requires_grad=False)
-        layer.qzeros = torch.nn.Parameter(layer.qzeros.data, requires_grad=False)
-        layer.scales = torch.nn.Parameter(layer.scales.data, requires_grad=False)
+        process_int4_linear_weights(layer, "awq")
 
     def apply(
         self,
@@ -36,13 +35,7 @@ class AWQIntelAMXLinearKernel:
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        return torch.ops.sgl_kernel.int4_scaled_mm_cpu(
-            x,
-            layer.qweight,
-            layer.qzeros,
-            layer.scales,
-            bias,
-        )
+        return apply_int4_linear(layer, x, bias)
 
 
 class AWQIntelAMXMoEKernel:
