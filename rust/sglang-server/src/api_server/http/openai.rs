@@ -32,9 +32,100 @@ use crate::api_server::core::{CoreError, CoreEvent, CoreOutput, ReceivedAs};
 use crate::api_server::handlers::CoreCall;
 use crate::message::config::ServerArgs;
 use crate::message::request::GenerateRequest;
+use crate::message::sampling::SamplingParams;
+use crate::message::wire::merge_preferred_sampling;
 use crate::utils::response::error_response;
 
 const MAX_OPENAI_CHOICES: usize = 4096;
+
+fn fill_typed_sampling_defaults(
+    sampling: SamplingParams,
+    server_args: &ServerArgs,
+    is_chat: bool,
+) -> Result<SamplingParams, String> {
+    let Some(preferred) = &server_args.preferred_sampling_params else {
+        return Ok(sampling);
+    };
+    // Match the Python OpenAI adapters: emitted fields, including nulls,
+    // override launch-time preferences. The lowered chat route already
+    // applies this rule when it passes its JSON to generate_requests.
+    const ADAPTER_FIELDS: &[&str] = &[
+        "temperature",
+        "max_new_tokens",
+        "min_new_tokens",
+        "stop",
+        "stop_token_ids",
+        "stop_regex",
+        "top_p",
+        "top_k",
+        "min_p",
+        "presence_penalty",
+        "frequency_penalty",
+        "repetition_penalty",
+        "regex",
+        "ebnf",
+        "n",
+        "no_stop_trim",
+        "ignore_eos",
+        "skip_special_tokens",
+        "logit_bias",
+        "custom_params",
+        "sampling_seed",
+        "watermark",
+    ];
+    let has_schema = sampling.json_schema.is_some();
+    let mut fields = serde_json::to_value(sampling).map_err(|error| error.to_string())?;
+    fields
+        .as_object_mut()
+        .expect("sampling params serialize as an object")
+        .retain(|name, _| {
+            ADAPTER_FIELDS.contains(&name.as_str())
+                || (name == "json_schema" && (!is_chat || has_schema))
+                || (name == "spaces_between_special_tokens" && is_chat)
+        });
+    let mut body = serde_json::json!({"sampling_params": fields});
+    merge_preferred_sampling(&mut body, &preferred.0)?;
+    serde_json::from_value(body["sampling_params"].take()).map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod preferred_sampling_tests {
+    use super::*;
+    use crate::message::config::PreferredSamplingParams;
+    use serde_json::json;
+
+    #[test]
+    fn typed_openai_keeps_adapter_values_and_fills_missing_fields() {
+        let args = ServerArgs {
+            preferred_sampling_params: Some(PreferredSamplingParams(json!({
+                "temperature": 0.2,
+                "stop": ["preferred stop"],
+                "stream_interval": 7,
+                "spaces_between_special_tokens": false,
+                "json_schema": "{}",
+            }))),
+            ..Default::default()
+        };
+        for is_chat in [true, false] {
+            let sampling =
+                fill_typed_sampling_defaults(SamplingParams::default(), &args, is_chat).unwrap();
+            assert_eq!(sampling.temperature, 1.0);
+            assert_eq!(sampling.stop, None);
+            assert_eq!(sampling.stream_interval, Some(7));
+            assert_eq!(sampling.spaces_between_special_tokens, is_chat);
+            assert_eq!(sampling.json_schema.as_deref(), is_chat.then_some("{}"));
+        }
+        let sampling = SamplingParams {
+            json_schema: Some(r#"{"type":"object"}"#.into()),
+            ..Default::default()
+        };
+        let sampling = fill_typed_sampling_defaults(sampling, &args, true).unwrap();
+        assert_eq!(
+            sampling.json_schema.as_deref(),
+            Some(r#"{"type":"object"}"#)
+        );
+    }
+}
 
 /// The routes this module owns, mounted by `api_server::serve`.
 pub(super) fn routes() -> Router<Arc<AppState>> {

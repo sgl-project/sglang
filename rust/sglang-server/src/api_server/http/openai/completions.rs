@@ -138,7 +138,9 @@ async fn completions(
             return openai_error(StatusCode::BAD_REQUEST, &message, false);
         }
     };
-    let mut sampling = match completion_sampling_params(&request) {
+    let mut sampling = match completion_sampling_params(&request).and_then(|sampling| {
+        super::fill_typed_sampling_defaults(sampling, &state.server_args, false)
+    }) {
         Ok(sampling) => sampling,
         Err(message) => {
             return openai_error(StatusCode::BAD_REQUEST, &message, false);
