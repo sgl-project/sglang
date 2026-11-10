@@ -915,6 +915,45 @@ class ServingChatTestCase(CustomTestCase):
         )
         self.assertIsNone(self.chat._validate_request(multimodal_request))
 
+    def test_output_limit_precedence_preserves_zero_during_validation(self):
+        """A zero completion limit must not fall back during context validation."""
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.get_model",
+            return_value=Mock(context_length=4),
+        ):
+            zero_limit = ChatCompletionRequest(
+                messages=[{"role": "user", "content": "Hello"}],
+                max_completion_tokens=0,
+                max_tokens=5,
+            )
+            self.assertIsNone(self.chat._validate_request(zero_limit))
+
+            excessive_limit = ChatCompletionRequest(
+                messages=[{"role": "user", "content": "Hello"}],
+                max_completion_tokens=5,
+                max_tokens=0,
+            )
+            self.assertIn("too large", self.chat._validate_request(excessive_limit))
+
+    def test_output_limit_boundary_and_auto_truncate_during_validation(self):
+        """Only a limit above the context length is rejected, unless auto-truncating."""
+        messages = [{"role": "user", "content": "Hello"}]
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.get_model",
+            return_value=Mock(context_length=4),
+        ):
+            at_limit = ChatCompletionRequest(messages=messages, max_completion_tokens=4)
+            self.assertIsNone(self.chat._validate_request(at_limit))
+
+            above_limit = ChatCompletionRequest(
+                messages=messages, max_completion_tokens=5
+            )
+            with patch(
+                "sglang.srt.entrypoints.openai.serving_chat.get_serving",
+                return_value=Mock(allow_auto_truncate=True),
+            ):
+                self.assertIsNone(self.chat._validate_request(above_limit))
+
     # ------------- conversion tests -------------
     def test_convert_to_internal_request_single(self):
         with (
@@ -3144,7 +3183,7 @@ class ServingChatTestCase(CustomTestCase):
 
         # Mock FunctionCallParser with detector that has partial tool call data
         mock_parser = Mock()
-        mock_detector = Mock()
+        mock_detector = Mock(incomplete_tool_call_indices=set())
 
         # Simulate a tool call that was partially streamed
         mock_detector.prev_tool_call_arr = [
@@ -3197,12 +3236,40 @@ class ServingChatTestCase(CustomTestCase):
             "Should not include finish_reason in completion chunk",
         )
 
+    def test_unstreamed_tool_args_skip_a_call_that_never_closed(self):
+        mock_parser = Mock()
+        mock_parser.detector = Mock(
+            incomplete_tool_call_indices={0},
+            prev_tool_call_arr=[
+                {
+                    "name": "get_weather",
+                    "arguments": {"location": "San Francisco", "unit": "celsius"},
+                }
+            ],
+            streamed_args_for_tool=['{"location": "San Francisco"'],
+        )
+        request = ChatCompletionRequest(
+            model="test",
+            messages=[{"role": "user", "content": "What's the weather?"}],
+            tools=[{"type": "function", "function": {"name": "get_weather"}}],
+        )
+
+        result = self.chat._check_for_unstreamed_tool_args(
+            parser=mock_parser,
+            content={"meta_info": {"id": "chatcmpl-test123"}},
+            request=request,
+            index=0,
+            created=123,
+        )
+
+        self.assertIsNone(result)
+
     def test_unstreamed_tool_args_no_completion_needed(self):
         """Test that no completion chunk is sent when all arguments were already streamed."""
 
         # Mock FunctionCallParser with detector that has complete tool call data
         mock_parser = Mock()
-        mock_detector = Mock()
+        mock_detector = Mock(incomplete_tool_call_indices=set())
 
         # Simulate a tool call that was completely streamed
         mock_detector.prev_tool_call_arr = [
@@ -3241,7 +3308,7 @@ class ServingChatTestCase(CustomTestCase):
         """Test raw JSON string arguments are not JSON-encoded again at finish."""
 
         mock_parser = Mock()
-        mock_detector = Mock()
+        mock_detector = Mock(incomplete_tool_call_indices=set())
         mock_detector.prev_tool_call_arr = [
             {"name": "report_template_recognition_commit", "arguments": "{}"}
         ]
@@ -3279,7 +3346,7 @@ class ServingChatTestCase(CustomTestCase):
         """Test remaining raw JSON string arguments are sent at finish."""
 
         mock_parser = Mock()
-        mock_detector = Mock()
+        mock_detector = Mock(incomplete_tool_call_indices=set())
         mock_detector.prev_tool_call_arr = [
             {
                 "name": "get_weather",
@@ -3319,7 +3386,7 @@ class ServingChatTestCase(CustomTestCase):
 
         # Mock FunctionCallParser with empty detector
         mock_parser = Mock()
-        mock_detector = Mock()
+        mock_detector = Mock(incomplete_tool_call_indices=set())
         mock_detector.prev_tool_call_arr = []
         mock_detector.streamed_args_for_tool = []
         mock_parser.detector = mock_detector
@@ -6186,6 +6253,112 @@ class TestRequestChatTemplateTrustGate(CustomTestCase):
                         self._request(chat_template_kwargs=kwargs)
                     )
                 )
+
+
+class KimiK3ThinkingTestCase(unittest.TestCase):
+    MESSAGES = [{"role": "user", "content": "hi"}]
+
+    def setUp(self):
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(
+            ServerArgs(
+                model_path="dummy",
+                tool_call_parser="kimi_k3",
+                reasoning_parser="kimi_k3",
+                default_chat_template_kwargs=None,
+            ),
+            role="tokenizer",
+        )
+        self.tm = _MockTokenizerManager()
+        self.tm.server_args.tool_call_parser = "kimi_k3"
+        self.tm.server_args.reasoning_parser = "kimi_k3"
+        self.tm.chat_template_name = None
+        self.tm.tokenizer.apply_chat_template = Mock(return_value=[1, 2, 3])
+        template_manager = _MockTemplateManager()
+        template_manager.chat_template_name = None
+        template_manager.jinja_template_content_format = "string"
+        self.chat = OpenAIServingChat(self.tm, template_manager)
+        self.chat.chat_encoding_spec = "kimi_k3"
+        self.chat.tool_call_parser = "kimi_k3"
+
+    def _template_kwargs(self, **kwargs):
+        request = ChatCompletionRequest(model="x", messages=self.MESSAGES, **kwargs)
+        self.chat._process_messages(request, is_multimodal=False)
+        return self.tm.tokenizer.apply_chat_template.call_args.kwargs
+
+    def test_chat_template_kwargs_remains_the_top_override(self):
+        kwargs = self._template_kwargs(
+            thinking={"effort": "low"},
+            chat_template_kwargs={"thinking_effort": "max"},
+        )
+        self.assertEqual(kwargs["thinking_effort"], "max")
+
+    def test_openai_tiers_map_onto_the_three_k3_levels(self):
+        for requested, expected in (
+            ("minimal", "low"),
+            ("low", "low"),
+            ("medium", "high"),
+            ("high", "high"),
+            ("xhigh", "max"),
+            ("ultra", "max"),
+            ("max", "max"),
+        ):
+            with self.subTest(reasoning_effort=requested):
+                kwargs = self._template_kwargs(reasoning_effort=requested)
+                self.assertEqual(kwargs["thinking_effort"], expected)
+
+    def test_k31_keeps_medium_as_its_own_tier(self):
+        self.tm.model_config.hf_config.model_type = "kimi_k31"
+        for requested, expected in (
+            ("minimal", "low"),
+            ("medium", "medium"),
+            ("xhigh", "max"),
+        ):
+            with self.subTest(reasoning_effort=requested):
+                kwargs = self._template_kwargs(reasoning_effort=requested)
+                self.assertEqual(kwargs["thinking_effort"], expected)
+
+    def test_effort_none_leaves_the_kwarg_off(self):
+        self.assertNotIn(
+            "thinking_effort", self._template_kwargs(reasoning_effort="none")
+        )
+
+    def test_effort_not_forwarded_when_thinking_is_off(self):
+        kwargs = self._template_kwargs(thinking={"type": "disabled", "effort": "high"})
+        self.assertIs(kwargs["thinking"], False)
+        self.assertNotIn("thinking_effort", kwargs)
+
+    def test_unknown_template_thinking_effort_is_a_client_error(self):
+        with self.assertRaisesRegex(ValueError, "thinking_effort"):
+            self._template_kwargs(chat_template_kwargs={"thinking_effort": "xhigh"})
+
+    def test_template_kwargs_cannot_collide_with_encoder_arguments(self):
+        kwargs = self._template_kwargs(
+            chat_template_kwargs={"add_generation_prompt": False}
+        )
+        self.assertIs(kwargs["add_generation_prompt"], True)
+        for key in ("tools", "conversation"):
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, key):
+                self._template_kwargs(chat_template_kwargs={key: []})
+
+    def test_float_effort_is_a_client_error(self):
+        with self.assertRaises(ValueError):
+            self._template_kwargs(reasoning_effort=0.5)
+
+    def test_keep_is_accepted(self):
+        request = ChatCompletionRequest(
+            model="x", messages=self.MESSAGES, thinking={"keep": "none"}
+        )
+        self.assertIsNone(self.chat._validate_request(request))
+
+    def test_bad_thinking_is_a_client_error(self):
+        for thinking in (False, {"type": "bogus"}):
+            with self.subTest(thinking=thinking):
+                request = ChatCompletionRequest(
+                    model="x", messages=self.MESSAGES, thinking=thinking
+                )
+                self.assertIn("invalid thinking", self.chat._validate_request(request))
 
 
 if __name__ == "__main__":
