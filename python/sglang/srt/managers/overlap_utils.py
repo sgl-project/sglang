@@ -705,6 +705,21 @@ class FutureMap:
                 self.publish_ready.synchronize()
             else:
                 self.publish_ready.wait()
+        n = batch.num_prefill_rows
+        if batch.forward_mode.is_mixed() and n is not None:
+            # Verify-merged mixed step: only the running (tail) rows have a
+            # relayed length. Ascend attention and compressor metadata need
+            # exact CPU lengths, including accept counts from the in-flight
+            # verify. Prefill rows keep their scheduled lengths.
+            batch.seq_lens = torch.cat([batch.seq_lens[:n], self.new_seq_lens_buf[fi]])
+            head_cpu = torch.tensor(
+                [p + e for p, e in zip(batch.prefix_lens[:n], batch.extend_lens[:n])],
+                dtype=torch.int64,
+            )
+            tail_cpu = batch.seq_lens[n:].cpu().to(torch.int64)
+            batch.seq_lens_cpu = torch.cat([head_cpu, tail_cpu])
+            batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+            return
         batch.seq_lens = self.new_seq_lens_buf[fi]
 
         if not self.needs_cpu_seq_lens:

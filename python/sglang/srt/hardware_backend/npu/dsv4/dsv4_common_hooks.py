@@ -255,12 +255,16 @@ def maybe_build_dsv4_verify_bundle(
     draft_token_num: int,
     *,
     live_seq_lens_cpu: torch.Tensor | None = None,
+    query_lens_cpu: list[int] | None = None,
 ):
     """Build the DSV4 cache-location view for one target-verify pass.
 
     Spec-v2 reserves cache ahead of time, so target verify must select only the
     current draft interval from the per-request DSV4 tables instead of reusing
     the larger allocation bundle produced during decode preparation.
+
+    Mixed steps supply variable query lengths and use dense compressor output
+    locations, like eager prefill. CPU prefixes must be exact in this case.
     """
     pool = batch.req_to_token_pool
     if not hasattr(pool, "req_to_c128_sidecar"):
@@ -280,7 +284,9 @@ def maybe_build_dsv4_verify_bundle(
     ragged_layout = getattr(
         getattr(batch, "spec_info", None), "ragged_verify_layout", None
     )
-    if ragged_layout is None:
+    if query_lens_cpu is not None:
+        verify_lens = query_lens_cpu
+    elif ragged_layout is None:
         verify_lens = [int(draft_token_num)] * len(req_indices)
     elif ragged_layout.verify_lens_cpu is not None:
         verify_lens = [int(v) for v in ragged_layout.verify_lens_cpu]
@@ -311,6 +317,8 @@ def maybe_build_dsv4_verify_bundle(
     t = out_full_loc.numel()
     c4_upper = min(t, t // 4 + len(req_indices))
     out_c4_loc = _compact_c4_loc(out_full_loc, c4_upper)
+    if query_lens_cpu is not None:
+        out_c4_loc = out_c4_loc[out_c4_loc != 0]
     return type(reserve_bundle)(
         out_full_loc=out_full_loc,
         out_swa_loc=batch.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
