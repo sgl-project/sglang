@@ -108,74 +108,27 @@ def _tree_metadata(
     """Build visibility and linked-tree metadata in one CUDA kernel."""
 
     batch, nodes = parent_ids.shape
-    if parent_ids.is_cuda:
-        visibility = torch.empty(
-            (batch, nodes, nodes), dtype=torch.bool, device=parent_ids.device
-        )
-        retrieve_index = torch.empty_like(parent_ids)
-        next_token = torch.empty_like(parent_ids)
-        next_sibling = torch.empty_like(parent_ids)
-        block_size = triton.next_power_of_2(nodes)
-        _build_tree_metadata_kernel[(batch * nodes,)](
-            parent_ids,
-            visibility,
-            retrieve_index,
-            next_token,
-            next_sibling,
-            parent_stride_batch=parent_ids.stride(0),
-            visibility_stride_batch=visibility.stride(0),
-            visibility_stride_query=visibility.stride(1),
-            num_nodes=nodes,
-            max_depth=max_depth,
-            block_size=block_size,
-        )
-        return visibility, retrieve_index, next_token, next_sibling
-
-    visibility = _visibility(parent_ids)
-    retrieve_index, next_token, next_sibling = _retrieval_links(parent_ids)
-    return visibility, retrieve_index, next_token, next_sibling
-
-
-def _visibility(parent_ids: torch.Tensor) -> torch.Tensor:
-    batch, nodes = parent_ids.shape
-    result = torch.zeros(
+    visibility = torch.empty(
         (batch, nodes, nodes), dtype=torch.bool, device=parent_ids.device
     )
-    result[:, 0, 0] = True
-    for node in range(1, nodes):
-        parent = parent_ids[:, node]
-        parent_rows = result.gather(
-            1, parent[:, None, None].expand(batch, 1, nodes)
-        ).squeeze(1)
-        result[:, node].copy_(parent_rows)
-        result[:, node, node] = True
-    return result
-
-
-def _retrieval_links(parent_ids: torch.Tensor):
-    batch, nodes = parent_ids.shape
-    device = parent_ids.device
-    next_token = torch.full((batch, nodes), -1, dtype=torch.long, device=device)
-    next_sibling = torch.full_like(next_token, -1)
-    batch_index = torch.arange(batch, device=device)
-    retrieve_index = torch.arange(batch * nodes, dtype=torch.long, device=device).view(
-        batch, nodes
+    retrieve_index = torch.empty_like(parent_ids)
+    next_token = torch.empty_like(parent_ids)
+    next_sibling = torch.empty_like(parent_ids)
+    block_size = triton.next_power_of_2(nodes)
+    _build_tree_metadata_kernel[(batch * nodes,)](
+        parent_ids,
+        visibility,
+        retrieve_index,
+        next_token,
+        next_sibling,
+        parent_stride_batch=parent_ids.stride(0),
+        visibility_stride_batch=visibility.stride(0),
+        visibility_stride_query=visibility.stride(1),
+        num_nodes=nodes,
+        max_depth=max_depth,
+        block_size=block_size,
     )
-    local_node_ids = torch.arange(nodes, dtype=torch.long, device=device)
-    # Reverse insertion produces the same ascending sibling order as SGLang's
-    # EAGLE tree builder, while never copying parents or node ids from the host.
-    # ``scatter_`` is also CUDA Graph capture-safe; advanced-index assignment
-    # with the Python ``node`` integer is interpreted as a CPU-to-CUDA copy.
-    for node in range(nodes - 1, 0, -1):
-        parent = parent_ids[:, node]
-        old_first = next_token[batch_index, parent]
-        next_sibling[:, node].copy_(old_first)
-        next_token.scatter_(
-            1,
-            parent[:, None],
-            local_node_ids[node : node + 1].expand(batch, 1),
-        )
-    return retrieve_index, next_token, next_sibling
+    return visibility, retrieve_index, next_token, next_sibling
 
 
 @triton.jit
@@ -512,112 +465,6 @@ def _build_ubtree_batch_fused(
 
 
 @torch.inference_mode()
-def _build_ubtree_batch_torch(
-    *,
-    anchor_tokens: torch.Tensor,
-    candidate_ids: torch.Tensor,
-    edge_log_probs: torch.Tensor,
-    budget: int,
-    supertree_width: int,
-    depth_bonus: float = 0.0,
-) -> UBTreeBatch:
-    """Build one fixed-size prefix-closed irregular tree per request on device."""
-
-    if candidate_ids.ndim != 3 or edge_log_probs.ndim != 4:
-        raise ValueError("candidate_ids/edge_log_probs must be rank 3/4")
-    batch, depth_count, candidate_k = candidate_ids.shape
-    if tuple(edge_log_probs.shape) != (
-        batch,
-        depth_count,
-        candidate_k,
-        candidate_k,
-    ):
-        raise ValueError("edge_log_probs must have shape [batch, depth, K, K]")
-    if supertree_width <= 0 or supertree_width > candidate_k:
-        raise ValueError("supertree_width must be in [1, candidate_k]")
-    if budget <= 0 or budget > depth_count * supertree_width:
-        raise ValueError("budget must be in [1, depth * supertree_width]")
-    if depth_bonus > 0:
-        raise ValueError("depth_bonus must be non-positive for prefix closure")
-
-    device = candidate_ids.device
-    width = int(supertree_width)
-    max_nodes = 1 + depth_count * width
-    selected_nodes = int(budget) + 1
-    neg_inf = torch.finfo(torch.float32).min
-
-    tokens = torch.zeros((batch, max_nodes), dtype=torch.long, device=device)
-    parents = torch.full_like(tokens, -1)
-    depths = torch.zeros_like(tokens)
-    candidate_indices = torch.full_like(tokens, -1)
-    scores = torch.full((batch, max_nodes), neg_inf, dtype=torch.float32, device=device)
-    tokens[:, 0].copy_(anchor_tokens.reshape(batch))
-    scores[:, 0] = 0
-
-    frontier_nodes = torch.zeros((batch, width), dtype=torch.long, device=device)
-    frontier_candidates = torch.zeros_like(frontier_nodes)
-    frontier_scores = torch.full(
-        (batch, width), neg_inf, dtype=torch.float32, device=device
-    )
-    frontier_scores[:, 0] = 0
-
-    for depth in range(depth_count):
-        edge_rows = edge_log_probs[:, depth].gather(
-            1,
-            frontier_candidates[:, :, None].expand(batch, width, candidate_k),
-        )
-        expanded_scores = frontier_scores[:, :, None] + edge_rows
-        chosen_scores, chosen_flat = torch.topk(
-            expanded_scores.reshape(batch, -1), width, dim=-1, sorted=True
-        )
-        parent_slots = torch.div(chosen_flat, candidate_k, rounding_mode="floor")
-        successors = chosen_flat.remainder(candidate_k)
-        start = 1 + depth * width
-        stop = start + width
-        parents[:, start:stop].copy_(frontier_nodes.gather(1, parent_slots))
-        tokens[:, start:stop].copy_(candidate_ids[:, depth].gather(1, successors))
-        depths[:, start:stop] = depth + 1
-        candidate_indices[:, start:stop].copy_(successors)
-        scores[:, start:stop].copy_(chosen_scores)
-        frontier_nodes = torch.arange(start, stop, device=device).expand(batch, -1)
-        frontier_candidates = successors
-        frontier_scores = chosen_scores
-
-    adjusted = scores[:, 1:] + float(depth_bonus) * depths[:, 1:].float()
-    chosen_old = torch.argsort(adjusted, dim=-1, descending=True, stable=True)[
-        :, :budget
-    ].add(1)
-    chosen_old = torch.sort(chosen_old, dim=-1).values
-    old_nodes = torch.cat(
-        (torch.zeros((batch, 1), dtype=torch.long, device=device), chosen_old), dim=1
-    )
-    selected_tokens = tokens.gather(1, old_nodes)
-    selected_depths = depths.gather(1, old_nodes)
-    selected_scores = scores.gather(1, old_nodes)
-    selected_parent_old = parents.gather(1, old_nodes)
-
-    old_to_new = torch.full_like(tokens, -1)
-    new_ids = torch.arange(selected_nodes, device=device).expand(batch, -1)
-    old_to_new.scatter_(1, old_nodes, new_ids)
-    selected_parents = old_to_new.gather(1, selected_parent_old.clamp_min(0))
-    selected_parents[:, 0] = -1
-
-    visibility, retrieve_index, next_token, next_sibling = _tree_metadata(
-        selected_parents, max_depth=depth_count + 1
-    )
-    return UBTreeBatch(
-        tokens=selected_tokens,
-        parent_ids=selected_parents,
-        depths=selected_depths,
-        path_scores=selected_scores,
-        visibility=visibility,
-        retrieve_index=retrieve_index,
-        retrieve_next_token=next_token,
-        retrieve_next_sibling=next_sibling,
-    )
-
-
-@torch.inference_mode()
 def build_ubtree_batch(
     *,
     anchor_tokens: torch.Tensor,
@@ -645,16 +492,7 @@ def build_ubtree_batch(
         raise ValueError("budget must be in [1, depth * supertree_width]")
     if depth_bonus > 0:
         raise ValueError("depth_bonus must be non-positive for prefix closure")
-    if candidate_ids.is_cuda:
-        return _build_ubtree_batch_fused(
-            anchor_tokens=anchor_tokens,
-            candidate_ids=candidate_ids,
-            edge_log_probs=edge_log_probs,
-            budget=budget,
-            supertree_width=supertree_width,
-            depth_bonus=depth_bonus,
-        )
-    return _build_ubtree_batch_torch(
+    return _build_ubtree_batch_fused(
         anchor_tokens=anchor_tokens,
         candidate_ids=candidate_ids,
         edge_log_probs=edge_log_probs,

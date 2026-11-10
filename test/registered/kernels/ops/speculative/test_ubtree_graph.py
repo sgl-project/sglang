@@ -793,11 +793,92 @@ def test_worker_rejects_penalties_before_prefill():
         worker.forward_batch_generation(batch)
 
 
+def _reference_tree_metadata(parent_ids):
+    batch, nodes = parent_ids.shape
+    parents = parent_ids.tolist()
+    visibility = [[[False] * nodes for _ in range(nodes)] for _ in range(batch)]
+    next_token = [[-1] * nodes for _ in range(batch)]
+    next_sibling = [[-1] * nodes for _ in range(batch)]
+    for row in range(batch):
+        for node in range(nodes):
+            ancestor = node
+            while ancestor > 0:
+                visibility[row][node][ancestor] = True
+                ancestor = parents[row][ancestor]
+            visibility[row][node][0] = True
+        for node in range(nodes - 1, 0, -1):
+            parent = parents[row][node]
+            next_sibling[row][node] = next_token[row][parent]
+            next_token[row][parent] = node
+    retrieve_index = torch.arange(batch * nodes).view(batch, nodes)
+    return (
+        torch.tensor(visibility),
+        retrieve_index,
+        torch.tensor(next_token),
+        torch.tensor(next_sibling),
+    )
+
+
+def _reference_ubtree_batch(
+    *, anchor_tokens, candidate_ids, edge_log_probs, budget, supertree_width
+):
+    from sglang.srt.speculative.ubtree_components.tree import UBTreeBatch
+
+    batch, depth_count, candidate_k = candidate_ids.shape
+    width, device = supertree_width, candidate_ids.device
+    neg_inf = torch.finfo(torch.float32).min
+    tokens = torch.zeros((batch, 1 + depth_count * width), dtype=torch.long)
+    tokens = tokens.to(device)
+    parents = torch.full_like(tokens, -1)
+    depths = torch.zeros_like(tokens)
+    scores = torch.full(tokens.shape, neg_inf, device=device)
+    tokens[:, 0], scores[:, 0] = anchor_tokens, 0
+    frontier_nodes = torch.zeros((batch, width), dtype=torch.long, device=device)
+    frontier_candidates = torch.zeros_like(frontier_nodes)
+    frontier_scores = torch.full((batch, width), neg_inf, device=device)
+    frontier_scores[:, 0] = 0
+    for depth in range(depth_count):
+        edges = edge_log_probs[:, depth].gather(
+            1, frontier_candidates[:, :, None].expand(-1, -1, candidate_k)
+        )
+        expanded = (frontier_scores[:, :, None] + edges).reshape(batch, -1)
+        chosen_scores, chosen = expanded.topk(width, dim=-1)
+        slots, successors = chosen // candidate_k, chosen % candidate_k
+        rows = slice(1 + depth * width, 1 + (depth + 1) * width)
+        parents[:, rows] = frontier_nodes.gather(1, slots)
+        tokens[:, rows] = candidate_ids[:, depth].gather(1, successors)
+        depths[:, rows], scores[:, rows] = depth + 1, chosen_scores
+        frontier_nodes = torch.arange(rows.start, rows.stop, device=device)
+        frontier_nodes = frontier_nodes.expand(batch, -1)
+        frontier_candidates, frontier_scores = successors, chosen_scores
+    chosen = scores[:, 1:].argsort(dim=-1, descending=True, stable=True)[:, :budget]
+    old_nodes = torch.cat(
+        (torch.zeros_like(chosen[:, :1]), (chosen + 1).sort(dim=-1).values), dim=1
+    )
+    old_to_new = torch.full_like(tokens, -1)
+    new_ids = torch.arange(budget + 1, device=device).expand(batch, -1)
+    old_to_new.scatter_(1, old_nodes, new_ids)
+    parent_ids = old_to_new.gather(1, parents.gather(1, old_nodes).clamp_min(0))
+    parent_ids[:, 0] = -1
+    visibility, retrieve_index, next_token, next_sibling = (
+        value.to(device) for value in _reference_tree_metadata(parent_ids.cpu())
+    )
+    return UBTreeBatch(
+        tokens=tokens.gather(1, old_nodes),
+        parent_ids=parent_ids,
+        depths=depths.gather(1, old_nodes),
+        path_scores=scores.gather(1, old_nodes),
+        visibility=visibility,
+        retrieve_index=retrieve_index,
+        retrieve_next_token=next_token,
+        retrieve_next_sibling=next_sibling,
+    )
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA Graph requires CUDA")
 @pytest.mark.parametrize("width", range(2, 50))
 def test_tree_metadata_all_widths_matches_cpu_after_replay(width):
     from sglang.srt.speculative.ubtree_components.tree import (
-        _build_ubtree_batch_torch,
         _tree_metadata,
         build_ubtree_batch,
     )
@@ -813,21 +894,9 @@ def test_tree_metadata_all_widths_matches_cpu_after_replay(width):
         supertree_width=4,
     )
     proposal = build_ubtree_batch(**proposal_args)
-    reference = _build_ubtree_batch_torch(**proposal_args)
-    _assert_tree_batches_equal(proposal, reference)
+    _assert_tree_batches_equal(proposal, _reference_ubtree_batch(**proposal_args))
     assert torch.all(proposal.parent_ids[:, 1:] >= 0)
     assert torch.all(proposal.parent_ids[:, 1:] < torch.arange(1, width, device="cuda"))
-    expected_metadata = _tree_metadata(proposal.parent_ids.cpu(), max_depth=16)
-    for value, expected in zip(
-        (
-            proposal.visibility,
-            proposal.retrieve_index,
-            proposal.retrieve_next_token,
-            proposal.retrieve_next_sibling,
-        ),
-        expected_metadata,
-    ):
-        torch.testing.assert_close(value.cpu(), expected, rtol=0, atol=0)
 
     parent_values = [
         [-1] + [(node - 1) // 2 for node in range(1, width)],
@@ -838,7 +907,7 @@ def test_tree_metadata_all_widths_matches_cpu_after_replay(width):
     def build():
         return _tree_metadata(parents, max_depth=16)
 
-    expected = _tree_metadata(parents.cpu(), max_depth=16)
+    expected = _reference_tree_metadata(parents.cpu())
     actual = build()
     for value, reference in zip(actual, expected):
         torch.testing.assert_close(value.cpu(), reference, rtol=0, atol=0)
@@ -848,7 +917,7 @@ def test_tree_metadata_all_widths_matches_cpu_after_replay(width):
     # Change both ancestry and sibling links without changing storage.
     parents[:, 1:] = 0
     graph.replay()
-    expected = _tree_metadata(parents.cpu(), max_depth=16)
+    expected = _reference_tree_metadata(parents.cpu())
     for value, reference in zip(actual, expected):
         torch.testing.assert_close(value.cpu(), reference, rtol=0, atol=0)
 

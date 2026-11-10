@@ -24,7 +24,6 @@ from sglang.srt.speculative.ubtree_components.config import (
     validate_runtime_config,
 )
 from sglang.srt.speculative.ubtree_components.selector import UBTreeSelector
-from sglang.srt.speculative.ubtree_components.tree import build_ubtree_batch
 from sglang.srt.speculative.ubtree_components.validation import validate_ubtree_request
 from sglang.srt.speculative.ubtree_components.vocab import vocab_parallel_topk
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -298,32 +297,6 @@ class TestUBTreeComponents(CustomTestCase):
         )
         torch.testing.assert_close(values, expected_values)
         assert torch.equal(ids, expected_ids)
-
-    def test_batched_tree_is_prefix_closed_and_has_sglang_links(self):
-        torch.manual_seed(7)
-        candidates = torch.randint(0, 50, (2, 4, 5))
-        edges = torch.log_softmax(torch.randn(2, 4, 5, 5), dim=-1)
-        tree = build_ubtree_batch(
-            anchor_tokens=torch.tensor([8, 9]),
-            candidate_ids=candidates,
-            edge_log_probs=edges,
-            budget=7,
-            supertree_width=4,
-        )
-        assert tree.tokens.shape == (2, 8)
-        assert torch.all(tree.parent_ids[:, 1:] < torch.arange(1, 8))
-        assert torch.all(tree.visibility.diagonal(dim1=1, dim2=2))
-        assert tree.retrieve_index.tolist() == [list(range(8)), list(range(8, 16))]
-
-        for batch_index in range(2):
-            for node in range(1, tree.node_count):
-                parent = int(tree.parent_ids[batch_index, node])
-                child = int(tree.retrieve_next_token[batch_index, parent])
-                siblings = []
-                while child != -1:
-                    siblings.append(child)
-                    child = int(tree.retrieve_next_sibling[batch_index, child])
-                assert node in siblings
 
 
 class TestUBTreeRuntimeConfig(CustomTestCase):
