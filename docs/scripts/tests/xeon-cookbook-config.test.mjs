@@ -10,31 +10,36 @@ const setup = source.slice(
 const engine = (config) => new Function("config", `${setup}
 return { findCell, snapToValidCell, validateSelection, isOptionAvailable, renderCommand };
 `)(config);
-const load = async (name) => {
-  const text = readFileSync(new URL(`../../src/snippets/configs/IFM/${name}.jsx`, import.meta.url), "utf8");
+const load = async (name, vendor = "IFM") => {
+  const text = readFileSync(new URL(`../../src/snippets/configs/${vendor}/${name}.jsx`, import.meta.url), "utf8");
   return (await import("data:text/javascript," + encodeURIComponent(text))).config;
 };
 
-for (const [name, checkpoint, revision, cap, gpu] of [
-  ["k2-horizon", "K2-Horizon-0.9B", "d50881f4f8dc6923fb8f301e1c2313fe3a2b6c1d", 4096, "h200"],
-  ["jais-3", "Jais-3-0.9B", "ef8b0e93cae13e7fdb6c711770ab00e03616baac", 8192, "h100"],
+for (const [vendor, name, checkpoint, revision, cap, gpu] of [
+  ["IFM", "k2-horizon", "K2-Horizon-0.9B", "d50881f4f8dc6923fb8f301e1c2313fe3a2b6c1d", 4096, "h200"],
+  ["IFM", "jais-3", "Jais-3-0.9B", "ef8b0e93cae13e7fdb6c711770ab00e03616baac", 8192, "h100"],
+  ["ibm-granite", "granite-4.2", "granite-4.2-3b", "4e9c275e232f10211ec88644d106a1f6a1b60e06", 8192, "h200"],
 ]) {
-const config = await load(name);
+const config = await load(name, vendor);
+const firstVariant = vendor === "IFM" ? "0.9b" : "3b";
+const staleVariant = vendor === "IFM" ? "375b" : "30b";
 
 test(`${name} exposes only validated Python-only Xeon recipes`, () => {
   assert.ok(config.supportedHardware.includes("xeon"));
   assert.ok(config.hardware.some((hw) => hw.id === "xeon" && hw.vendor === "cpu"));
-  assert.deepEqual(config.runModes, ["python"]);
+  const modes = (hw) => typeof config.runModes === "function" ? config.runModes({ hw }) : config.runModes;
+  assert.deepEqual(modes("xeon"), ["python"]);
+  if (vendor === "ibm-granite") assert.deepEqual(modes(gpu), ["python", "docker"]);
   const cells = config.cells.filter((cell) => cell.match.hw === "xeon");
   assert.deepEqual(cells.map((cell) => cell.match.variant),
-    name === "k2-horizon" ? ["0.9b", "3.7b"] : ["0.9b"]);
+    name === "k2-horizon" ? ["0.9b", "3.7b"] : [firstVariant]);
   const api = engine(config);
   const cell = cells[0];
   const command = api.renderCommand(cell, cell.match, {
     HOST_IP: "127.0.0.1", PORT: "31000",
   });
   for (const flag of [
-    `--model IFM/${checkpoint}`, "--device cpu", "--disable-overlap-schedule",
+    `--model ${vendor}/${checkpoint}`, "--device cpu", "--disable-overlap-schedule",
     "--tp 6", "--dtype bfloat16", `--max-total-tokens ${cap}`, "--port 31000",
     `--revision ${revision}`,
   ]) assert.ok(command.includes(flag), flag);
@@ -44,19 +49,19 @@ test(`${name} exposes only validated Python-only Xeon recipes`, () => {
 
 test(`${name} hardware switches and stale URLs snap to a validated Xeon cell`, () => {
   const api = engine(config);
-  const stale = { hw: gpu, variant: "375b", quant: "bf16", strategy: "balanced", nodes: "single" };
+  const stale = { hw: gpu, variant: staleVariant, quant: "bf16", strategy: "balanced", nodes: "single" };
   const switched = api.snapToValidCell(config.cells, stale, "hw", "xeon");
-  assert.equal(switched.variant, "0.9b");
+  assert.equal(switched.variant, firstVariant);
   assert.ok(api.findCell(config.cells, switched));
-  assert.equal(api.isOptionAvailable(config.cells, switched, "variant", "375b"), false);
+  assert.equal(api.isOptionAvailable(config.cells, switched, "variant", staleVariant), false);
   const fromUrl = api.validateSelection(config.cells, { ...stale, hw: "xeon", nodes: "multi-2" });
-  assert.equal(fromUrl.variant, "0.9b");
+  assert.equal(fromUrl.variant, firstVariant);
   assert.equal(fromUrl.nodes, "single");
 });
 
 test(`${name} hides unvalidated Playground axes and discards stale GPU overrides`, () => {
   const features = config.playgroundFeatures;
-  for (const axis of ["attention", "moe", "parsers", "speculative", "pdDisagg", "hicache"]) {
+  for (const axis of Object.keys(features).filter((key) => key !== "normalizeDeltas")) {
     assert.equal(features[axis].showWhen({ hw: "xeon" }), false, axis);
     assert.equal(features[axis].showWhen({ hw: gpu }), true, axis);
   }
