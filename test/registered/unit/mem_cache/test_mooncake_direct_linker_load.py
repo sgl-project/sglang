@@ -162,7 +162,8 @@ class TestGroupedLoad(CustomTestCase):
 
     def test_failure_waits_for_inflight_reads_before_releasing_consumers(self):
         """Failed loads must stop writing before consumers can recycle their rows."""
-        for failure in ("read", "metadata", "submit"):
+        # Range-building failures happen before any read; see TestLoadFence.
+        for failure in ("read", "submit"):
             with self.subTest(failure=failure):
                 self._check_failure_drains_reads(failure)
 
@@ -189,20 +190,10 @@ class TestGroupedLoad(CustomTestCase):
                     keys, ptrs, sizes, offsets
                 )
 
-        class FailingPool(FakePool):
-            def get_prepared_layers_range_meta(self, locations, layers):
-                fail()
-
         store = BlockingStore()
         pools = {PoolName.KV: FakePool()}
         keys = ["bad", "slow"] if failure == "read" else ["slow", "bad"]
         transfers = [transfer(PoolName.KV, keys)]
-        if failure == "metadata":
-            pools[PoolName.INDEXER] = FailingPool()
-            transfers = [
-                transfer(PoolName.KV, ["slow"]),
-                transfer(PoolName.INDEXER, ["bad"]),
-            ]
         linker = make_linker(store, num_layers=1, layer_group=1, threads=2, pools=pools)
         self.addCleanup(linker.load_io_executor.shutdown)
         submit = linker.load_io_executor.submit
@@ -280,6 +271,68 @@ class TestLoadFence(CustomTestCase):
         self.assertEqual(order[:3], ["indices", "prepare", "prepare"])
         forward = order.index("forward")
         self.assertEqual(order[forward + 1 :], ["start"] + ["get"] * 4)
+
+    def test_range_building_finishes_before_the_forward_fence(self):
+        """Reads are built before the fence; a build failure reads nothing."""
+        for fail_layer in (None, 2):
+            with self.subTest(fail_layer=fail_layer):
+                events = []
+
+                class Event:
+                    def __init__(self, name):
+                        self.name = name
+
+                    def synchronize(self):
+                        events.append(self.name)
+
+                class Pool(FakePool):
+                    def get_prepared_layers_range_meta(self, locations, layers):
+                        events.append("build")
+                        if fail_layer in layers:
+                            raise RuntimeError("Injected range build failure")
+                        return super().get_prepared_layers_range_meta(locations, layers)
+
+                class Store(FakeStore):
+                    def batch_get_session_start(self, keys):
+                        events.append("start")
+                        return super().batch_get_session_start(keys)
+
+                    def batch_get_session_end(self, keys):
+                        events.append("end")
+                        super().batch_get_session_end(keys)
+
+                store = Store()
+                linker = make_linker(
+                    store,
+                    num_layers=3,
+                    layer_group=1,
+                    threads=2,
+                    pools={PoolName.KV: Pool()},
+                )
+                self.addCleanup(linker.load_io_executor.shutdown)
+                index = linker.layer_done_counter.update_producer()
+                linker.load_layer_wise(
+                    index,
+                    [[transfer(PoolName.KV, ["k0", "k1"])]],
+                    TransferReady(Event("indices"), Event("forward")),
+                )
+                landed = linker.layer_done_counter.finish(index)
+                if fail_layer is None:
+                    self.assertTrue(landed)
+                    # The fence waits on the indices again, then the forward.
+                    self.assertEqual(
+                        events,
+                        ["indices"]
+                        + ["build"] * 3
+                        + ["indices", "forward", "start", "end"],
+                    )
+                    self.assertEqual(len(store.calls), 6)
+                else:
+                    # Nothing was read or opened, and every layer is failed.
+                    self.assertFalse(landed)
+                    self.assertEqual(events, ["indices"] + ["build"] * 3)
+                    self.assertEqual(store.calls, [])
+                    self.assertEqual(linker.layer_done_counter.order, [])
 
 
 if __name__ == "__main__":
