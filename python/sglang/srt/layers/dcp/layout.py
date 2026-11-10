@@ -34,6 +34,12 @@ def dsa_shards_index_k() -> bool:
     return _dsa_shards_index_k and get_parallel().attn_dcp_size > 1
 
 
+def dsa_index_k_page_tokens(page_size: int) -> int:
+    if dsa_shards_index_k():
+        return page_size * get_parallel().attn_dcp_size
+    return page_size
+
+
 def get_dcp_lens(
     lens: torch.Tensor,
     dcp_size: int,

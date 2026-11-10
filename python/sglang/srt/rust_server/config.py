@@ -29,6 +29,7 @@ from sglang.srt.observability.request_logger import (
     WHITELISTED_HEADERS,
     RequestLogger,
     _dataclass_to_string_truncated,
+    _transform_data_for_logging,
 )
 from sglang.srt.observability.utils import generate_buckets
 from sglang.srt.runtime_context import (
@@ -65,6 +66,7 @@ def _build_server_args(
     default_max_new_tokens: Optional[int] = SamplingParams().max_new_tokens,
     request_class: Optional[type] = None,
     server_added_custom_params: Tuple[str, ...] = (),
+    port_offset: int = 0,
 ) -> ServerArgs:
     """The typed launch configuration for the scheduler's embedded Rust server:
     the ``server_args`` fields it reads, the already-resolved
@@ -159,6 +161,7 @@ def _build_server_args(
         tool_call_parser=get_serving().tool_call_parser,
         reasoning_parser=get_serving().reasoning_parser,
         stream_response_default_include_usage=get_serving().stream_response_default_include_usage,
+        enable_cache_report=get_serving().enable_cache_report,
         tokenizer_worker_num=get_serving().tokenizer_worker_num,
         detokenizer_worker_num=get_serving().detokenizer_worker_num,
         skip_tokenizer_init=get_serving().skip_tokenizer_init,
@@ -235,7 +238,12 @@ def _build_server_args(
         request_log=(
             ext.RequestLogConfig(
                 **request_log_settings(
-                    get_observability().log_requests_level, request_class
+                    get_observability().log_requests_level,
+                    request_class,
+                    get_observability().log_requests_format,
+                ),
+                **_request_log_targets(
+                    get_observability().log_requests_target, port_offset
                 ),
             )
             if get_observability().log_requests
@@ -246,18 +254,25 @@ def _build_server_args(
     )
 
 
-def request_log_settings(level: int, request_class: Optional[type]) -> Dict[str, Any]:
-    """``RequestLogger``'s settings for ``--log-requests-level`` ``level``, for
-    the Rust server to render the lines ``TokenizerManager`` logs: the level's
-    metadata, and ``request_class``'s fields in declaration order with each
-    default rendered as ``_dataclass_to_string_truncated`` renders a value."""
+def request_log_settings(
+    level: int, request_class: Optional[type], log_format: str = "text"
+) -> Dict[str, Any]:
+    """``RequestLogger``'s settings for ``--log-requests-level`` ``level`` and
+    ``--log-requests-format`` ``log_format``, for the Rust server to render the
+    lines Python logs: the level's metadata, ``request_class``'s fields in
+    declaration order with each default rendered as the format renders a
+    value, and from level 2 the OpenAI request models' fields."""
+    from sglang.srt.entrypoints.openai.protocol import (
+        ChatCompletionRequest,
+        CompletionRequest,
+    )
     from sglang.srt.managers.io_struct import GenerateReqInput
 
     request_class = request_class or GenerateReqInput
     logger = RequestLogger(
         log_requests=True,
         log_requests_level=level,
-        log_requests_format="text",
+        log_requests_format=log_format,
         log_requests_target=None,
     )
     max_length, skip_names, out_skip_names = logger.metadata
@@ -267,20 +282,78 @@ def request_log_settings(level: int, request_class: Optional[type]) -> Dict[str,
             return field.default
         return field.default_factory()
 
+    def render(value: Any) -> str:
+        if log_format == "json":
+            return json.dumps(
+                _transform_data_for_logging(value, max_length), ensure_ascii=False
+            )
+        return _dataclass_to_string_truncated(value, max_length)
+
+    openai_requests = level >= 2
     batch_item_fields, batch_shared_fields = _batch_item_fields(request_class)
     return dict(
         max_length=max_length,
         skip_names=sorted(skip_names or ()),
         out_skip_names=sorted(out_skip_names or ()),
+        json=log_format == "json",
         class_name=request_class.__name__,
         fields=[
-            (field.name, _dataclass_to_string_truncated(default(field), max_length))
+            (field.name, render(default(field)))
             for field in dataclasses.fields(request_class)
         ],
         batch_item_fields=batch_item_fields,
         batch_shared_fields=batch_shared_fields,
         headers=list(WHITELISTED_HEADERS),
         exceeded_ms=logger.log_exceeded_ms,
+        openai_requests=openai_requests,
+        chat_completion_fields=(
+            _openai_model_fields(ChatCompletionRequest) if openai_requests else []
+        ),
+        completion_fields=(
+            _openai_model_fields(CompletionRequest) if openai_requests else []
+        ),
+    )
+
+
+def _openai_model_fields(model: type) -> List[Tuple[str, Optional[str]]]:
+    """What ``model.model_dump(exclude_none=True)`` lists of a request: each
+    dumped field in declaration order, with its default as JSON (``None``
+    when it is required or ``None``)."""
+    from pydantic_core import to_jsonable_python
+
+    fields = []
+    for name, field in model.model_fields.items():
+        if field.exclude:
+            continue
+        default = (
+            None
+            if field.is_required()
+            else field.get_default(call_default_factory=True)
+        )
+        fields.append(
+            (name, None if default is None else json.dumps(to_jsonable_python(default)))
+        )
+    return fields
+
+
+def _request_log_targets(targets: Optional[List[str]], rank: int) -> Dict[str, Any]:
+    """``create_log_targets``' targets for the listener at node-local DP
+    offset ``rank``: stdout, and in each target directory (created here) the
+    file ``{hostname}_{rank}.log``, which the Rust server rotates hourly. A
+    directory listed twice gets one file: two rotators of one file would
+    rename it under each other."""
+    if not targets:
+        return dict(stdout=True, files=[])
+    files = {}
+    for directory in targets:
+        if directory.lower() == "stdout":
+            continue
+        os.makedirs(directory, exist_ok=True)
+        path = os.path.join(directory, f"{socket.gethostname()}_{rank}.log")
+        files.setdefault(os.path.realpath(path), path)
+    return dict(
+        stdout=any(target.lower() == "stdout" for target in targets),
+        files=list(files.values()),
     )
 
 

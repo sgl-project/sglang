@@ -43,6 +43,7 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.mem_cache.kv.alloc.forward_steps import ForwardLaunch
     from sglang.srt.observability.forward_pass_metrics import FpmTiming
 
 
@@ -93,6 +94,13 @@ class PPBatchMetadata:
     verify_out_cache_loc: Optional[torch.Tensor] = None
     # Rank-local; never sent over the wire.
     fpm_timing: Optional[FpmTiming] = None
+    # The step's launch record, which its processed result carries.
+    forward_launch: Optional[ForwardLaunch] = None
+    # Rank-local: the unified pool's record of this forward, retired when its
+    # result is processed.
+    unified_forward_done: Optional[torch.cuda.Event] = None
+    # Rank-local: recorded on the forward stream after this forward, any pool.
+    forward_done: Optional[torch.cuda.Event] = None
 
 
 class SchedulerPPMixin:
@@ -100,9 +108,17 @@ class SchedulerPPMixin:
     # ran init_pp_loop_state (plain TP, unit-test doubles) read False;
     # init_pp_loop_state overwrites it per instance.
     _pp_spec_relay: bool = False
+    # Records a skipped output's completion behind its microbatch's forward
+    # (`_pp_make_skip_output_result`); made on first use.
+    _pp_skip_output_stream = None
 
     @DynamicGradMode()
     def event_loop_pp(self: Scheduler):
+        # FIXME: this loop never applies the write-after-read barrier
+        # (`Scheduler._apply_war_barrier`). Unified memory frees ids and
+        # rewrites request rows on the schedule stream at once and relies on
+        # this barrier, so an in-flight microbatch can read unbound or rebound
+        # mappings.
         """
         A scheduler loop for pipeline parallelism.
         Notes:
@@ -145,7 +161,7 @@ class SchedulerPPMixin:
                         self.send_req_work = self._pp_send_reqs_to_next_stage(recv_reqs)
                 with torch.profiler.record_function("get_next_batch_to_run"):
                     batch = None
-                    if self._pp_may_launch():
+                    if self.pause_state.may_launch():
                         plan = self.get_next_batch_to_run(
                             running_batch=self.running_batch,
                             last_batch=self.last_batch,
@@ -294,7 +310,7 @@ class SchedulerPPMixin:
                 )
                 self._process_hicache_events()
                 batch = None
-                if self._pp_may_launch():
+                if self.pause_state.may_launch():
                     prefill_plan = self.get_new_batch_prefill(self.running_batch)
                     batch = prefill_plan.batch_to_run
                     self.running_batch = prefill_plan.running_batch
@@ -416,7 +432,7 @@ class SchedulerPPMixin:
                     self._pp_commit_comm_work(self.send_req_work)
 
                 # Paused: open no new queue consensus; every stage skips together.
-                may_launch = self._pp_may_launch()
+                may_launch = self.pause_state.may_launch()
                 retract_rids = prealloc_rids = transferred_rids = None
                 if may_launch:
                     # reaching consensus through PP ranks
@@ -536,8 +552,8 @@ class SchedulerPPMixin:
                             next_batch_result,
                         )
                     else:
-                        # No result to process, but its launch was counted.
-                        self._on_step_processed(self.mbs[next_mb_id])
+                        # No result to process; it launched no forward.
+                        self._on_step_processed(self.mbs[next_mb_id], None)
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
 
                 if not self.pp_group.is_last_rank:
@@ -587,19 +603,13 @@ class SchedulerPPMixin:
         has_unprocessed_mb = any(mb is not None for mb in self.mbs)
         return self.ingest_requests(stop_at_pause=has_unprocessed_mb)
 
-    def _pp_may_launch(self: Scheduler) -> bool:
-        """No new micro-batch once a pause is held or applied."""
-        return not (self._engine_paused or self._deferred_input_requests)
-
     def _pp_retract_microbatches(self: Scheduler) -> None:
         """Retract the requests of every micro-batch, none of them in flight."""
-        running_batch = self.running_batch
+        self._retract_batches(list(zip(self.running_mbs, self.last_mbs)))
         for mb_id in range(self.pp_loop_size):
-            self.running_batch = self.running_mbs[mb_id]
-            self.last_batch = self.last_mbs[mb_id]
-            self._retract_running_batch()
             self.last_mbs[mb_id] = None
-        self.running_batch = running_batch
+        self.last_batch = None
+        self.cur_batch_for_debug = None
 
     def init_pp_loop_state(self: Scheduler):
         self.pp_loop_size: int = (
@@ -1013,9 +1023,25 @@ class SchedulerPPMixin:
             ),
             skipped_output_comm=True,
             fpm_timing=mb_metadata.fpm_timing if mb_metadata else None,
+            forward_launch=mb_metadata.forward_launch if mb_metadata else None,
+            unified_forward_done=(
+                mb_metadata.unified_forward_done if mb_metadata else None
+            ),
         )
         d2h_event = self.device_module.Event()
-        d2h_event.record(self.device_module.current_stream())
+        forward_done = mb_metadata.forward_done if mb_metadata else None
+        if forward_done is None:
+            d2h_event.record(self.device_module.current_stream())
+        else:
+            # Processing this result retires the microbatch's forward, so the
+            # host must see that forward end first: record the event on a side
+            # stream that waits it, which the caller's synchronize then implies.
+            # The current stream gains no dependency on the forward.
+            stream = self._pp_skip_output_stream
+            if stream is None:
+                stream = self._pp_skip_output_stream = self.device_module.Stream()
+            stream.wait_event(forward_done)
+            d2h_event.record(stream)
         return None, batch_result, d2h_event
 
     def _pp_prep_batch_result(
@@ -1102,6 +1128,8 @@ class SchedulerPPMixin:
                 extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
                 can_run_cuda_graph=mb_metadata.can_run_cuda_graph,
                 fpm_timing=mb_metadata.fpm_timing,
+                forward_launch=mb_metadata.forward_launch,
+                unified_forward_done=mb_metadata.unified_forward_done,
             )
             return output_result
 
@@ -1190,6 +1218,8 @@ class SchedulerPPMixin:
             extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
             can_run_cuda_graph=mb_metadata.can_run_cuda_graph,
             fpm_timing=mb_metadata.fpm_timing,
+            forward_launch=mb_metadata.forward_launch,
+            unified_forward_done=mb_metadata.unified_forward_done,
         )
         output_result.copy_auxiliary_output_to_cpu()
         return output_result
@@ -1725,14 +1755,17 @@ class SchedulerPPMixin:
                     trace_only=True,
                     attrs={"pp_mb_id": mb_id},
                 )
+                event = self.device_module.Event()
+                event.record(self.device_module.current_stream())
                 mb_metadata[mb_id] = PPBatchMetadata(
                     can_run_cuda_graph=result.can_run_cuda_graph,
                     fwd_batch=_pp_snapshot_forward_batch(cur_batch),
                     verify_out_cache_loc=result.spec_verify_out_cache_loc,
                     fpm_timing=result.fpm_timing,
+                    forward_launch=result.forward_launch,
+                    unified_forward_done=result.unified_forward_done,
+                    forward_done=event,
                 )
-                event = self.device_module.Event()
-                event.record(self.device_module.current_stream())
                 if self.pp_group.is_last_rank:
                     # (last rank) buffer the outputs for async batch depth
                     last_rank_comm_queue.append(

@@ -6,7 +6,7 @@ lifetime and allocation unit share one sub-pool.
 """
 
 import math
-from typing import ClassVar, Optional, Sequence, Tuple, Union
+from typing import Any, ClassVar, Iterable, Optional, Sequence, Tuple, Union
 
 import msgspec
 import torch
@@ -128,32 +128,73 @@ class KVLayerDecl(msgspec.Struct, frozen=True, kw_only=True):
     parts: Tuple[KVPartDecl, ...]
 
 
+class WindowLayers(msgspec.Struct, frozen=True, kw_only=True):
+    """Layers that attend through one window: their ids, their row geometry and
+    the window (``None`` when the model does not state it)."""
+
+    layer_ids: Tuple[int, ...]
+    geometry: Union[MHAGeometry, MLAGeometry]
+    window: Optional[int] = None
+
+
+def window_sub_pool_name(window: Optional[int]) -> str:
+    """The sub-pool name of a window, from its own length alone: a window the
+    model does not state the length of is ``window``."""
+    return "window" if window is None else f"window_{window}"
+
+
+def primary_window(windows: Iterable[Optional[int]]) -> Optional[int]:
+    """Of the window lengths the target's layers declare, the one a
+    single-window reader sizes and retains by: the longest (a window that
+    states no length counts as longest). None without windows."""
+    windows = list(windows)
+    if not windows:
+        return None
+    return max(windows, key=lambda w: WindowLifetime(window=w).retention())
+
+
 def kv_layer_decls(
     *,
     full_layer_ids: Sequence[int],
     full_geometry: Union[MHAGeometry, MLAGeometry],
     window_layer_ids: Sequence[int] = (),
-    window_geometry: Optional[MHAGeometry] = None,
+    window_geometry: Optional[Union[MHAGeometry, MLAGeometry]] = None,
     window: Optional[int] = None,
+    windows: Sequence[WindowLayers] = (),
     state_layer_ids: Sequence[int] = (),
     state_geometry: Optional[StateGeometry] = None,
     checkpoint_interval: Optional[int] = None,
 ) -> Tuple[KVLayerDecl, ...]:
     """One declaration per layer that stores anything, in layer order. A layer
-    may hold an attention part and a state part at once."""
-    assert not set(full_layer_ids) & set(window_layer_ids), (
-        "a layer attends either fully or through a window, not both"
+    may hold an attention part and a state part at once. Window layers come as
+    ``windows``, one group per window length, or as one group through the
+    ``window_*`` arguments."""
+    windows = list(windows)
+    if window_layer_ids:
+        assert window_geometry is not None, "window layers need their geometry"
+        windows.append(
+            WindowLayers(
+                layer_ids=tuple(window_layer_ids),
+                geometry=window_geometry,
+                window=window,
+            )
+        )
+    attending = [set(full_layer_ids), *(set(w.layer_ids) for w in windows)]
+    assert sum(map(len, attending)) == len(set().union(*attending)), (
+        "a layer attends either fully or through one window"
+    )
+    assert len({w.window for w in windows}) == len(windows), (
+        "layers of one window length form one group"
     )
     parts = {}
     full = KVPartDecl(lifetime=FullLifetime(), geometry=full_geometry)
     for layer_id in full_layer_ids:
         parts.setdefault(layer_id, []).append(full)
-    if window_layer_ids:
-        assert window_geometry is not None, "window layers need their geometry"
+    for group in windows:
         part = KVPartDecl(
-            lifetime=WindowLifetime(window=window), geometry=window_geometry
+            lifetime=WindowLifetime(window=group.window), geometry=group.geometry
         )
-        for layer_id in window_layer_ids:
+        for layer_id in group.layer_ids:
             parts.setdefault(layer_id, []).append(part)
     if state_layer_ids:
         assert state_geometry is not None, "state layers need their geometry"
@@ -387,3 +428,25 @@ def with_state_ple(
         extra_parts=(*geometry.extra_parts, *parts),
         scratch_parts=(*geometry.scratch_parts, *scratch),
     )
+
+
+# The part every token KV view holds; derived parts get their own names.
+KV_PART = "kv"
+# A request's recurrent state, one slot per request, in the state sub-pool.
+STATE_PART = "state"
+
+
+class Region(msgspec.Struct, frozen=True, kw_only=True):
+    """A sub-pool's device memory as a PD peer registers it: one entry per
+    buffer, and per entry the slices a peer of another TP size reads. A whole
+    page envelope has no slices: both peers must lay it out identically."""
+
+    ptrs: Tuple[int, ...]
+    lens: Tuple[int, ...]
+    item_lens: Tuple[int, ...]
+    dim_per_tensor: Tuple[int, ...] = ()
+    conv_shard_groups: Tuple[Any, ...] = ()
+    slice_outer_counts: Tuple[int, ...] = ()
+    layer_ids: Tuple[int, ...] = ()
+    # The token KV byte layout both peers must share, for views that have one.
+    kv_layout: Optional[str] = None

@@ -26,7 +26,7 @@ def _jit_mask_topk_module():
 
 @cache_once
 def _jit_hash_topk_module():
-    args = make_cpp_args("act_sqrt_softplus", is_arch_support_pdl())
+    args = make_cpp_args(is_arch_support_pdl())
     return load_jit(
         make_name("hash_topk"),
         *args,
