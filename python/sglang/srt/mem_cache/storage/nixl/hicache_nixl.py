@@ -87,16 +87,6 @@ class HiCacheNixl(HiCacheStorage):
 
         use_direct_io = nixlconfig.get_use_direct_io()
 
-        # Might be better to be unified across HiCache backends and moved to HiCacheController
-        storage_dirs = _parse_storage_dirs(
-            envs.SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR.get() or file_path
-        )
-        self.file_manager = (
-            NixlFileManager(storage_dirs, use_direct_io=use_direct_io)
-            if plugin not in NixlBackendSelection.OBJ_PLUGINS
-            else None
-        )
-
         tp_rank, tp_size, model_name = (
             storage_config.tp_rank,
             storage_config.tp_size,
@@ -150,6 +140,16 @@ class HiCacheNixl(HiCacheStorage):
         self.backend_selector = NixlBackendSelection(plugin, nixlconfig)
         if not self.backend_selector.create_backend(self.agent):
             raise RuntimeError("Failed to create NIXL backend")
+
+        # Might be better to be unified across HiCache backends and moved to HiCacheController
+        storage_dirs = _parse_storage_dirs(
+            envs.SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR.get() or file_path
+        )
+        self.file_manager = (
+            NixlFileManager(storage_dirs, use_direct_io=use_direct_io)
+            if self.backend_selector.mem_type == "FILE"
+            else None
+        )
 
         convert_key = str(
             nixlconfig.get_backend_initparams(self.backend_selector.backend_name).get(
