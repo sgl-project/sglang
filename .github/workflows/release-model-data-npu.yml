@@ -12,17 +12,10 @@ name: Release Model Data (NPU)
 
 on:
   # TEMPORARY: run the pipeline on PRs that touch it, for validation.
-  # Remove this trigger before merging. The branch also temporarily carries
-  # PR #49031 (NPU disaggregation MLA KV layer mapping) to validate it end to
-  # end; drop that commit as well before merging.
+  # Remove this trigger before merging. 
   pull_request:
     paths:
       - ".github/workflows/release-model-data-npu.yml"
-      - ".github/workflows/nightly-test-npu-e2e-multi-node.yml"
-      - "scripts/ci/npu/**"
-      - "scripts/ci/utils/collect_npu_release_data.py"
-      - "test/registered/npu/accuracy/glm5_3/**"
-      - "python/sglang/test/ascend/e2e/**"
   workflow_dispatch:
     inputs:
       image:
@@ -118,9 +111,6 @@ jobs:
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
       - name: Download metrics artifacts
         # No artifacts exist if every collect job failed before running the
         # test; the consolidation step reports the empty result in that case.
@@ -131,15 +121,86 @@ jobs:
           path: release-data
 
       - name: Consolidate release data
+        env:
+          INPUT_DIR: release-data
+          OUTPUT_JSON: release-data.json
+          OUTPUT_MARKDOWN: release-data.md
+          RUN_ID: ${{ github.run_id }}
+          COMMIT_SHA: ${{ github.sha }}
+          BRANCH: ${{ github.ref_name }}
         run: |
-          python3 scripts/ci/utils/collect_npu_release_data.py \
-            --input-dir release-data \
-            --output-json release-data.json \
-            --output-markdown release-data.md \
-            --run-id "${{ github.run_id }}" \
-            --commit-sha "${{ github.sha }}" \
-            --branch "${{ github.ref_name }}"
-          cat release-data.md >> $GITHUB_STEP_SUMMARY
+          python3 - <<'PY'
+          import glob
+          import json
+          import os
+          from datetime import datetime, timezone
+
+          input_dir = os.environ["INPUT_DIR"]
+
+          # Merge the downloaded per-case metrics.json files, one entry per
+          # (test_case, test_type) so a re-run overwrites instead of duplicating.
+          cases = {}
+          for filepath in sorted(
+              glob.glob(os.path.join(input_dir, "**", "metrics.json"), recursive=True)
+          ):
+              try:
+                  with open(filepath, encoding="utf-8") as f:
+                      data = json.load(f)
+              except (json.JSONDecodeError, OSError) as e:
+                  print(f"Warning: failed to read {filepath}: {e}")
+                  continue
+              test_case = data.get("test_case")
+              if not test_case:
+                  print(f"Warning: {filepath} has no test_case, skipped")
+                  continue
+              test_type = data.get("test_type", "unknown")
+              if (test_case, test_type) in cases:
+                  print(f"Warning: duplicate metrics for {(test_case, test_type)}")
+              cases[(test_case, test_type)] = {
+                  "test_case": test_case,
+                  "test_type": test_type,
+                  "metrics": data.get("metrics") or {},
+                  "baselines": data.get("baselines") or {},
+              }
+
+          ordered = [cases[key] for key in sorted(cases)]
+          payload = {
+              "source": "npu-key-model-release",
+              "run_id": os.environ["RUN_ID"],
+              "commit_sha": os.environ["COMMIT_SHA"],
+              "branch": os.environ["BRANCH"],
+              "generated_at": datetime.now(timezone.utc).isoformat(),
+              "cases": ordered,
+          }
+          with open(os.environ["OUTPUT_JSON"], "w", encoding="utf-8") as f:
+              json.dump(payload, f, indent=2)
+
+          lines = ["# NPU Key Model Release Data", ""]
+          if not ordered:
+              lines.append("No metrics were collected.")
+          else:
+              lines.append("| Test case | Type | Metric | Value | Baseline |")
+              lines.append("| --- | --- | --- | --- | --- |")
+              for case in ordered:
+                  if not case["metrics"]:
+                      lines.append(
+                          f"| {case['test_case']} | {case['test_type']} | - | - | - |"
+                      )
+                      continue
+                  for name in sorted(case["metrics"]):
+                      baseline = case["baselines"].get(name, "-")
+                      lines.append(
+                          f"| {case['test_case']} | {case['test_type']} | "
+                          f"{name} | {case['metrics'][name]} | {baseline} |"
+                      )
+          markdown = "\n".join(lines) + "\n"
+          with open(os.environ["OUTPUT_MARKDOWN"], "w", encoding="utf-8") as f:
+              f.write(markdown)
+
+          print(f"Collected {len(ordered)} case(s) from {input_dir}")
+          print(markdown)
+          PY
+          cat release-data.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload release data
         uses: actions/upload-artifact@v4
