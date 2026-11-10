@@ -2124,9 +2124,15 @@ class MiniMaxH3FinalLayer(nn.Module):
         self._pdd_device_heads = {}
         logger.info("MiniMax-H3 PDD: %d fused output heads loaded from %s", steps, path)
 
+    def _new_pdd_output(self, h: torch.Tensor, name: str) -> torch.Tensor:
+        out_features = self._pdd_heads[f"{name}.weight"].shape[1]
+        return h.new_empty((*h.shape[:-1], out_features))
+
     # The PDD head follows the live denoising step in forward context.
-    @eager_on_graph(True)
-    def _pdd_project(self, h: torch.Tensor, name: str) -> torch.Tensor:
+    @eager_on_graph(output_factory=_new_pdd_output, pass_output=True)
+    def _pdd_project(
+        self, h: torch.Tensor, name: str, out: torch.Tensor | None = None
+    ) -> torch.Tensor:
         heads = self._pdd_heads
         step = int(get_forward_context().current_timestep)
         stack = heads[f"{name}.weight"]
@@ -2143,7 +2149,11 @@ class MiniMaxH3FinalLayer(nn.Module):
                 heads[f"{name}.bias"].to(device=h.device, dtype=h.dtype),
             )
         weight, bias = self._pdd_device_heads[key]
-        return torch.nn.functional.linear(h, weight[step], bias[step])
+        result = torch.nn.functional.linear(h, weight[step], bias[step])
+        if out is None:
+            return result
+        out.copy_(result)
+        return out
 
     def _project(self, h: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if self._pdd_heads is not None:
