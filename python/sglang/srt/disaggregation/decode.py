@@ -1402,11 +1402,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
     def _init_receiver(self, decode_req: DecodeRequest, prefill_dp_rank: int) -> None:
         decode_req.kv_receiver.init(prefill_dp_rank)
+        # Remember the bound rank: a rebootstrap must rebind to it and route its
+        # recompute there, whatever the prefill load balancer would pick.
+        decode_req.req.disagg_prefill_dp_rank = prefill_dp_rank
         if (
             get_disagg().disaggregation_decode_allocation_policy == "prefill_complete"
             and decode_req.kv_receiver.conclude_state != KVPoll.Failed
         ):
-            decode_req.req.disagg_prefill_dp_rank = prefill_dp_rank
             # Deferred allocation cannot precede the recompute that makes its
             # source ready. Keep the existing leader election and error path.
             if decode_req.is_rebootstrap:
