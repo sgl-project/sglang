@@ -99,30 +99,42 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue.retracted_queue = IndexedReqList(ListKind.PD_RETRACTED)
         queue.retracted_queue.join(reqs)
         queue.num_reserved_decode_tokens = 0
-        queue.req_to_token_pool = SimpleNamespace(available_size=lambda: len(reqs))
+        queue.req_to_token_pool = SimpleNamespace(
+            available_size=lambda: len(reqs), holds_state_slots=False
+        )
         queue.token_to_kv_pool_allocator = MagicMock(page_size=page_size)
         queue.token_to_kv_pool_allocator.prealloc_fits_assumes_reclaim = MagicMock(
             return_value=False
         )
+        queue.token_to_kv_pool_allocator.sub_pool_roles = MagicMock(
+            return_value=("full", {}, None)
+        )
         bind_separate_buffer_capacity(queue.token_to_kv_pool_allocator)
         queue.tree_cache = MagicMock()
+        queue.transfer_queue = SimpleNamespace(queue=SimpleNamespace(items=lambda: []))
         queue.scheduler = SimpleNamespace(
             sliding_window_size=2047,
             server_args=SimpleNamespace(disable_radix_cache=True),
             enable_overlap=False,
+            running_batch=SimpleNamespace(reqs=[]),
+            waiting_queue=[],
         )
         queue._uses_swa_reservation = MagicMock(return_value=True)
+        queue._uses_swa_tail_prealloc = MagicMock(return_value=False)
         queue._prealloc_required_tokens = MagicMock(
             return_value=(physical_tokens_per_req, physical_tokens_per_req)
         )
-        queue._prealloc_reservation_fits = MagicMock(
-            side_effect=lambda full, swa, *, full_allocatable_tokens, **_: (
-                full <= full_allocatable_tokens
-            )
+        queue._prealloc_required = MagicMock(
+            return_value=(physical_tokens_per_req, physical_tokens_per_req)
         )
+        queue._prealloc_reservation_fits = MagicMock(return_value=True)
         queue._swa_aware_allocatable_token_budgets = MagicMock(
             return_value=(physical_available, physical_available)
         )
+        queue._window_aware_allocatable_token_budgets = MagicMock(
+            return_value=(physical_available, physical_available)
+        )
+        queue._window_allocatable_token_budgets = MagicMock(return_value={})
         queue._allocatable_token_budgets = MagicMock(
             side_effect=lambda **_: physical_available
         )
@@ -135,6 +147,11 @@ class TestDecodeQueueCleanup(CustomTestCase):
             self.assertGreaterEqual(physical_available, physical_tokens_per_req)
             physical_available -= physical_tokens_per_req
 
+        queue._admit_preallocation = MagicMock(
+            side_effect=lambda _req, _admission, **_kwargs: (
+                physical_available >= physical_tokens_per_req
+            )
+        )
         queue._pre_alloc = MagicMock(side_effect=pre_alloc)
 
         with patch(
@@ -286,9 +303,15 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue._swa_aware_allocatable_token_budgets = MagicMock(
             return_value=(1024, 1024)
         )
+        queue._window_aware_allocatable_token_budgets = MagicMock(
+            return_value=(1024, 1024)
+        )
+        queue._prealloc_reservation_fits = MagicMock(return_value=True)
         queue._prealloc_required_tokens = MagicMock(return_value=(3, 3))
+        queue._prealloc_required = MagicMock(return_value=(3, {}))
         queue._prealloc_kv_lens = MagicMock(return_value=(3, 3))
-        queue._reclaim_swa_tail_capacity = MagicMock(
+        queue._window_tails = MagicMock(return_value={})
+        queue._reclaim_prealloc_capacity = MagicMock(
             return_value=(
                 "SWA eviction insufficient: needed=64, available=0, "
                 "req=swa-reclaim-failed"
@@ -298,8 +321,12 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue._pre_alloc = MagicMock()
         # SWA tail pre-allocation runs on a paged pool.
         queue.token_to_kv_pool_allocator = MagicMock(page_size=64)
+        queue.token_to_kv_pool_allocator.sub_pool_roles = MagicMock(
+            return_value=("full", {}, None)
+        )
         bind_separate_buffer_capacity(queue.token_to_kv_pool_allocator)
         queue.tree_cache = MagicMock()
+        queue.transfer_queue = SimpleNamespace(queue=SimpleNamespace(items=lambda: []))
         queue.req_to_token_pool = MagicMock()
         queue.req_to_token_pool.available_size.return_value = 1
         # Non-hybrid pools have no mamba allocator; MagicMock would otherwise
