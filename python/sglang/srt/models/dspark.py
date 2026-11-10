@@ -690,7 +690,7 @@ class DSparkDraftMixin:
             raise ValueError(
                 f"DSpark confidence head is enabled but the checkpoint is missing "
                 f"{sorted(missing)}. Provide a checkpoint with trained confidence weights, "
-                f"or set SGLANG_DSPARK_FORCE_ONLINE_ACCEPTANCE_ESTIMATOR=1."
+                f"or set SGLANG_DSPARK_USE_ONLINE_ESTIMATOR=1."
             )
 
     def _fused_kv_write_bundle(self, pool):

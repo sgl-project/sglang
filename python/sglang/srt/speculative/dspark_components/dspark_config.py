@@ -42,7 +42,7 @@ def builds_confidence_head(draft_hf_config: Any) -> bool:
     if read_ragged_verify_mode() is RaggedVerifyMode.STATIC:
         return False
     enabled = _cfg_get(draft_hf_config, "enable_confidence_head")
-    if enabled is False or envs.SGLANG_DSPARK_FORCE_ONLINE_ACCEPTANCE_ESTIMATOR.get():
+    if enabled is False or envs.SGLANG_DSPARK_USE_ONLINE_ESTIMATOR.get():
         return False
     if enabled is None:
         logger.warning(

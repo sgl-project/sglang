@@ -189,12 +189,12 @@ class TestDSparkObserve(CustomTestCase):
 
 
 class TestConfidenceSource(CustomTestCase):
-    def _builds(self, *, mode, enable_field, force_online=False):
+    def _builds(self, *, mode, enable_field, use_online=False):
         config = SimpleNamespace()
         if enable_field is not None:
             config.enable_confidence_head = enable_field
         with (
-            envs.SGLANG_DSPARK_FORCE_ONLINE_ACCEPTANCE_ESTIMATOR.override(force_online),
+            envs.SGLANG_DSPARK_USE_ONLINE_ESTIMATOR.override(use_online),
             mock.patch.object(
                 dspark_config, "read_ragged_verify_mode", return_value=mode
             ),
@@ -202,12 +202,12 @@ class TestConfidenceSource(CustomTestCase):
             return dspark_config.builds_confidence_head(config)
 
     def test_static_mode_builds_no_head(self):
-        for force_online in (False, True):
+        for use_online in (False, True):
             self.assertFalse(
                 self._builds(
                     mode=RaggedVerifyMode.STATIC,
                     enable_field=True,
-                    force_online=force_online,
+                    use_online=use_online,
                 )
             )
 
@@ -216,9 +216,7 @@ class TestConfidenceSource(CustomTestCase):
         self.assertTrue(self._builds(mode=compact, enable_field=True))
         self.assertTrue(self._builds(mode=compact, enable_field=None))
         self.assertFalse(self._builds(mode=compact, enable_field=False))
-        self.assertFalse(
-            self._builds(mode=compact, enable_field=True, force_online=True)
-        )
+        self.assertFalse(self._builds(mode=compact, enable_field=True, use_online=True))
 
 
 if __name__ == "__main__":

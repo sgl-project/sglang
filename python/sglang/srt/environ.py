@@ -565,7 +565,7 @@ class Envs:
     SGLANG_DSPARK_USE_GREEDY_DRAFT = EnvBool(False)
     # Ragged verify takes its confidences from the online acceptance estimator even
     # when the draft checkpoint has a confidence head.
-    SGLANG_DSPARK_FORCE_ONLINE_ACCEPTANCE_ESTIMATOR = EnvBool(False)
+    SGLANG_DSPARK_USE_ONLINE_ESTIMATOR = EnvBool(False)
     SGLANG_DSPARK_FOLDED_PROPOSAL = EnvBool(True)
     SGLANG_DSPARK_STACKED_CTX_KV = EnvBool(True)
     SGLANG_DSPARK_EMBED_IN_GRAPH = EnvBool(True)
