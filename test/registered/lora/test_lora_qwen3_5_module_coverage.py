@@ -14,7 +14,7 @@
 
 """Every LoRA target module type on Qwen3.5 must be applied, and match HF+PEFT.
 
-One random-init adapter per module type (full attention, GatedDeltaNet, MLP).
+One random-init adapter per module group (full attention, GatedDeltaNet, MLP).
 For each, the LoRA-minus-base shift in teacher-forced prompt logprobs from
 SGLang must match the shift from HF+PEFT. A module type that SGLang loads but
 never applies has a zero shift; one applied to the wrong output slice has a
@@ -36,17 +36,17 @@ from sglang.test.test_utils import CustomTestCase
 register_cuda_ci(est_time=150, stage="nightly", runner_config="1-gpu-small")
 
 BASE_MODEL = "Qwen/Qwen3.5-0.8B"
-# HF+PEFT target names in Qwen3.5's language model. Each becomes one adapter.
-MODULE_TYPES = (
-    "q_proj",
-    "k_proj",
-    "v_proj",
-    "o_proj",
-    "out_proj",
-    "gate_proj",
-    "up_proj",
-    "down_proj",
-)
+# HF+PEFT target names in Qwen3.5's language model, one adapter per group.
+# q/k/v share one adapter: main's qkv normalization requires q_proj and v_proj
+# together (single-branch adapters are sgl-project/sglang#28199).
+ADAPTER_TARGETS = {
+    "attn_qkv": ["q_proj", "k_proj", "v_proj"],
+    "o_proj": ["o_proj"],
+    "out_proj": ["out_proj"],
+    "gate_proj": ["gate_proj"],
+    "up_proj": ["up_proj"],
+    "down_proj": ["down_proj"],
+}
 LORA_RANK = 8
 # Picked so each adapter shifts logprobs well above the bf16 SGLang-vs-HF floor.
 LORA_B_STD = 0.02
@@ -68,13 +68,13 @@ def _load_hf_model():
     ).cuda()
 
 
-def _save_random_adapter(model, module_type: str, output_dir: str, seed: int):
+def _save_random_adapter(model, targets: list, output_dir: str, seed: int):
     from peft import LoraConfig, get_peft_model
 
     config = LoraConfig(
         r=LORA_RANK,
         lora_alpha=2 * LORA_RANK,
-        target_modules=[module_type],
+        target_modules=targets,
         lora_dropout=0.0,
         bias="none",
     )
@@ -108,13 +108,14 @@ def _hf_reference(prompt_ids, adapter_dirs):
     model.eval()
     base = [_hf_prompt_logprobs(model, ids) for ids in prompt_ids]
     lora = {}
-    for seed, module_type in enumerate(MODULE_TYPES):
-        peft_model = _save_random_adapter(
-            model, module_type, adapter_dirs[module_type], seed
-        )
-        if not any(module_type in n for n, _ in peft_model.named_parameters()):
-            raise AssertionError(f"PEFT wrapped no {module_type} module")
-        lora[module_type] = [_hf_prompt_logprobs(peft_model, ids) for ids in prompt_ids]
+    for seed, (name, targets) in enumerate(ADAPTER_TARGETS.items()):
+        peft_model = _save_random_adapter(model, targets, adapter_dirs[name], seed)
+        for target in targets:
+            if not any(
+                f"{target}.lora_A" in n for n, _ in peft_model.named_parameters()
+            ):
+                raise AssertionError(f"PEFT wrapped no {target} module")
+        lora[name] = [_hf_prompt_logprobs(peft_model, ids) for ids in prompt_ids]
         model = peft_model.unload()
     del model
     gc.collect()
@@ -127,7 +128,7 @@ def _srt_logprobs(prompt_ids, adapter_dirs):
         model_path=BASE_MODEL,
         enable_lora=True,
         max_lora_rank=LORA_RANK,
-        max_loras_per_batch=len(MODULE_TYPES),
+        max_loras_per_batch=len(ADAPTER_TARGETS),
         lora_paths=adapter_dirs,
         disable_radix_cache=True,
         mem_fraction_static=0.6,
@@ -137,11 +138,11 @@ def _srt_logprobs(prompt_ids, adapter_dirs):
             torch.tensor(get_prompt_logprobs(engine, ids, None)) for ids in prompt_ids
         ]
         lora = {
-            module_type: [
-                torch.tensor(get_prompt_logprobs(engine, ids, module_type))
+            name: [
+                torch.tensor(get_prompt_logprobs(engine, ids, name))
                 for ids in prompt_ids
             ]
-            for module_type in MODULE_TYPES
+            for name in ADAPTER_TARGETS
         }
     finally:
         engine.shutdown()
@@ -149,30 +150,30 @@ def _srt_logprobs(prompt_ids, adapter_dirs):
 
 
 class TestQwen3_5LoRAModuleCoverage(CustomTestCase):
-    def test_each_module_type_matches_hf(self):
+    def test_each_module_group_matches_hf(self):
         from transformers import AutoTokenizer
 
         tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL)
         prompt_ids = [tokenizer(p)["input_ids"] for p in PROMPTS]
 
         with tempfile.TemporaryDirectory() as tmp:
-            adapter_dirs = {m: f"{tmp}/{m}" for m in MODULE_TYPES}
+            adapter_dirs = {name: f"{tmp}/{name}" for name in ADAPTER_TARGETS}
             hf_base, hf_lora = _hf_reference(prompt_ids, adapter_dirs)
             srt_base, srt_lora = _srt_logprobs(prompt_ids, adapter_dirs)
 
         hf_base = torch.cat(hf_base).double()
         srt_base = torch.cat(srt_base).double()
         print(f"base |srt - hf| mean: {(srt_base - hf_base).abs().mean():.4f}")
-        for module_type in MODULE_TYPES:
-            with self.subTest(module_type=module_type):
-                hf_shift = torch.cat(hf_lora[module_type]).double() - hf_base
-                srt_shift = torch.cat(srt_lora[module_type]).double() - srt_base
+        for name in ADAPTER_TARGETS:
+            with self.subTest(adapter=name):
+                hf_shift = torch.cat(hf_lora[name]).double() - hf_base
+                srt_shift = torch.cat(srt_lora[name]).double() - srt_base
                 cosine = torch.nn.functional.cosine_similarity(
                     srt_shift, hf_shift, dim=0
                 ).item()
                 ratio = (srt_shift.norm() / hf_shift.norm()).item()
                 print(
-                    f"{module_type:>10}: hf shift {hf_shift.abs().mean():.4f}, "
+                    f"{name:>10}: hf shift {hf_shift.abs().mean():.4f}, "
                     f"srt shift {srt_shift.abs().mean():.4f}, "
                     f"cosine {cosine:.4f}, norm ratio {ratio:.4f}"
                 )
