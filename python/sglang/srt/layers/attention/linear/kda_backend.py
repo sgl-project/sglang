@@ -25,9 +25,11 @@ from sglang.srt.layers.attention.linear.utils import (
     build_verify_intermediate_state_indices,
     select_verify_intermediate_state_indices,
 )
+from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu
-from sglang.srt.utils.common import is_gfx95_supported, rank0_log
+from sglang.srt.utils.device import is_gfx95_supported
+from sglang.srt.utils.log_utils import rank0_log
 
 # KDA always uses the triton causal_conv1d_fn (no CUDA override).
 # Only causal_conv1d_update needs platform-specific overrides for decode.
@@ -706,7 +708,18 @@ class KDAAttnBackend(MambaAttnBackendBase):
             extend_prefix_lens=forward_batch.extend_prefix_lens,
             track_rows=track_rows,
         )
+        if track_rows is None and forward_batch.mamba_track_indices is not None:
+            meta.track_dst[: forward_batch.batch_size].copy_(
+                forward_batch.mamba_track_indices
+            )
         self.prefill_graph_metadata = meta
+        self.forward_metadata = ForwardMetadata(
+            query_start_loc=meta.cu_seqlens,
+            mamba_cache_indices=meta.cache_indices,
+            mamba_track_indices=None
+            if forward_batch.mamba_track_indices is None
+            else meta.track_dst[: forward_batch.batch_size],
+        )
 
     def _prefill_graph_track_rows(
         self, forward_batch: ForwardBatch
@@ -1816,9 +1829,16 @@ class KDAAttnBackend(MambaAttnBackendBase):
             return False
         if layer.conv_weights.dtype != torch.float32:
             return False
+        # fp32 or bf16 state (bf16 load/store, fp32 recurrence in-kernel).
+        if ssm_states.dtype == torch.float32:
+            state_align = 4
+        elif ssm_states.dtype == torch.bfloat16:
+            state_align = 8
+        else:
+            return False
+        # 16-byte cp.async of the state: slot pitch / offset in whole vectors.
         if (
-            ssm_states.dtype != torch.float32
-            or tuple(ssm_states.shape[-3:])
+            tuple(ssm_states.shape[-3:])
             != (layer.num_v_heads, layer.head_v_dim, layer.head_k_dim)
             or tuple(ssm_states.stride()[-3:])
             != (
@@ -1826,8 +1846,8 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 layer.head_k_dim,
                 1,
             )
-            or ssm_states.stride(0) % 4 != 0
-            or ssm_states.storage_offset() % 4 != 0
+            or ssm_states.stride(0) % state_align != 0
+            or ssm_states.storage_offset() % state_align != 0
         ):
             return False
         if conv_states.shape[-2] != 3 or intermediate_conv_window_cache.shape[-2] != 3:
@@ -1838,6 +1858,8 @@ class KDAAttnBackend(MambaAttnBackendBase):
             # no recurrent fallback without intermediate_ssm).
             return replayssm_rawv is not None
         if intermediate_state_cache.shape[1] < draft_token_num:
+            return False
+        if intermediate_state_cache.dtype != ssm_states.dtype:
             return False
         if tuple(intermediate_state_cache.shape[-3:]) != (
             layer.num_v_heads,

@@ -220,7 +220,9 @@ class TestTrackMambaStateDtype(CustomTestCase):
                     ssm_states = torch.zeros(16, 1, 2, 2)[::2]
                     cache = SimpleNamespace(conv=[conv_states], temporal=ssm_states)
                     backend.state_layer_cache = lambda _: cache
-                    expected_indices = torch.arange(2) if contiguous else indices
+                    # Staged copies keep the padding sink at row 0, so the
+                    # requests sit at rows 1..n.
+                    expected_indices = torch.arange(1, 3) if contiguous else indices
 
                     def convolve(_layer, _batch, x, states, slots):
                         torch.testing.assert_close(slots, expected_indices)
@@ -280,6 +282,99 @@ class TestTrackMambaStateDtype(CustomTestCase):
                     self.assertTrue(torch.all(ssm_states[[6, 2, 5]] == 5))
                     expected = DOUBLE_ROUND_PROBE if snapshot else 2.0
                     self.assertTrue(torch.all(ssm_states[4] == expected))
+
+
+class TestKdaCutedslVerifyStateDtypeGate(CustomTestCase):
+    """Which SSM-state pools may take the fused CuTe DSpARK verify.
+
+    The kernel cp.async's the state in 16-byte vectors: 4 fp32 or 8 bf16
+    elements, so a bf16 slot must start on an 8-element boundary while 4 is
+    enough for fp32. fp16 is rejected, and the per-step snapshot buffer must
+    share the state dtype because the kernel stores snapshots in it.
+    """
+
+    H = 2
+    K = 128
+    DRAFT = 5
+
+    def _layer(self):
+        dim = self.H * self.K
+        return SimpleNamespace(
+            bias=None,
+            lower_bound=-5.0,
+            head_q_dim=self.K,
+            head_k_dim=self.K,
+            head_v_dim=self.K,
+            num_q_heads=self.H,
+            num_k_heads=self.H,
+            num_v_heads=self.H,
+            q_dim=dim,
+            k_dim=dim,
+            v_dim=dim,
+            conv_weights=torch.zeros(3 * dim, 4, dtype=torch.float32),
+        )
+
+    def _states(self, dtype, offset=0, slots=3):
+        shape = (slots, self.H, self.K, self.K)
+        numel = slots * self.H * self.K * self.K
+        return torch.zeros(numel + offset, dtype=dtype)[offset:].view(shape)
+
+    def _can_run(self, ssm_states, snapshot_dtype=None):
+        layer = self._layer()
+        tokens = 2 * self.DRAFT
+        dim = 3 * layer.q_dim
+        backend = SimpleNamespace(
+            kernel_dispatcher=SimpleNamespace(
+                verify_backend=SimpleNamespace(is_nv_cutedsl=lambda: True)
+            ),
+            state_pool=None,
+        )
+        snapshot_dtype = snapshot_dtype or ssm_states.dtype
+        with (
+            patch.object(kda_backend, "is_cuda", return_value=True),
+            patch.object(
+                kda_backend.importlib.util, "find_spec", return_value=object()
+            ),
+            patch.object(torch.cuda, "get_device_capability", return_value=(10, 0)),
+        ):
+            return KDAAttnBackend._can_run_dspark_cutedsl_mtp(
+                backend,
+                layer=layer,
+                mixed_qkv=torch.zeros(tokens, dim, dtype=torch.bfloat16),
+                a=torch.zeros(tokens, self.H * self.K, dtype=torch.bfloat16),
+                b=torch.zeros(tokens, self.H, dtype=torch.bfloat16),
+                draft_token_num=self.DRAFT,
+                ragged_layout=None,
+                conv_states=torch.zeros(3, 3, dim, dtype=torch.bfloat16),
+                ssm_states=ssm_states,
+                intermediate_state_cache=torch.zeros(
+                    2, self.DRAFT, self.H, self.K, self.K, dtype=snapshot_dtype
+                ),
+                intermediate_conv_window_cache=torch.zeros(
+                    2, self.DRAFT, 3, dim, dtype=torch.bfloat16
+                ),
+                retrieve_parent_token=None,
+                replayssm_rawv=None,
+            )
+
+    def test_state_dtype_gate(self):
+        self.assertTrue(self._can_run(self._states(torch.float32)))
+        self.assertTrue(self._can_run(self._states(torch.bfloat16)))
+        self.assertFalse(self._can_run(self._states(torch.float16)))
+
+    def test_slot_alignment_follows_state_dtype(self):
+        # 4 elements = 16 bytes of fp32, but only 8 bytes of bf16.
+        self.assertTrue(self._can_run(self._states(torch.float32, offset=4)))
+        self.assertFalse(self._can_run(self._states(torch.bfloat16, offset=4)))
+        self.assertTrue(self._can_run(self._states(torch.bfloat16, offset=8)))
+
+    def test_snapshot_dtype_must_match_state(self):
+        self.assertFalse(
+            self._can_run(self._states(torch.bfloat16), snapshot_dtype=torch.float32)
+        )
+        self.assertFalse(
+            self._can_run(self._states(torch.float32), snapshot_dtype=torch.bfloat16)
+        )
 
 
 if __name__ == "__main__":

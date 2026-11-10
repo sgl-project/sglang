@@ -26,59 +26,13 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqOutput,
     TokenizedGenerateReqInput,
 )
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
-from sglang.srt.utils.common import log_info_on_rank0
+from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.utils.log_utils import log_info_on_rank0
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 
 logger = logging.getLogger(__name__)
-
-
-class SessionReqNode:
-    def __init__(
-        self,
-        req: Req,
-        parent: Optional[SessionReqNode] = None,
-        children=None,
-    ):
-        self.req = req
-        self.parent = parent
-        if parent is not None:
-            parent.children.append(self)
-        self.children = [] if not children else children
-
-    def clear_children(self, req_dict):
-        for req_node in self.children:
-            req_node.clear(req_dict)
-        self.children = []
-
-    def clear(self, req_dict):
-        for req_node in self.children:
-            req_node.clear(req_dict)
-
-        if self.req.finished_reason is None:
-            self.req.request_finish(FINISH_ABORT())
-        del req_dict[self.req.rid]
-
-    def abort(self):
-        if self.req.finished_reason is None:
-            self.req.request_finish(FINISH_ABORT())
-
-    def __str__(self):
-        return self._str_helper(self.req.rid)
-
-    def _str_helper(self, prefix=""):
-        if len(self.children) == 0:
-            return prefix + "\n"
-        else:
-            origin_prefix = prefix
-            prefix += " -- " + self.children[0].req.rid
-            ret = self.children[0]._str_helper(prefix)
-            for child in self.children[1:]:
-                prefix = " " * len(origin_prefix) + " \\- " + child.req.rid
-                ret += child._str_helper(prefix)
-            return ret
 
 
 class Session:
@@ -94,7 +48,8 @@ class Session:
         self.streaming = streaming
         self.timeout = timeout
         self.last_active_time: float = time.monotonic()
-        self.req_nodes: Dict[str, SessionReqNode] = {}
+        # rid -> that turn's request; a new turn may continue from any of them.
+        self.turns: Dict[str, Req] = {}
         self.close_on_finish: bool = False
         self._inflight: bool = False
         # Token-array lengths of last_req as of its finish_req. The share path
@@ -136,7 +91,7 @@ class Session:
 
         Trims each array back to its committed length first — an earlier turn
         may have appended its tokens and then aborted before finish_req, and
-        req_nodes still points at last_req, so anything beyond the committed
+        turns still points at last_req, so anything beyond the committed
         lengths is unconfirmed. Then extends with last turn's output and the
         new input. Returns (input_ids, input_ids_unpadded, carry_fill);
         carry_fill (== the new origin) spares the first fill_ids rebuild.
@@ -180,7 +135,7 @@ class Session:
     def _concat_token_arrays(
         last_req: Req, req: TokenizedGenerateReqInput, session_params
     ):
-        """Copy-based assembly for replace/offset/drop_previous_output turns."""
+        """Copy-based assembly for non-streaming turns."""
         out_tail = last_req.output_ids[: last_req.sampling_params.max_new_tokens]
 
         input_ids = last_req.origin_input_ids + out_tail
@@ -214,18 +169,20 @@ class Session:
         assert req.session_params is not None
         session_params = req.session_params
 
-        last_req_node = None
         last_req = None
         abort = False
         abort_message = ""
-        if self.streaming:
+        if session_params.replace:
+            abort = True
+            abort_message = (
+                "Session replace is not supported. To branch from a turn, append "
+                "with its rid; to stop a running turn first, abort it."
+            )
+        elif self.streaming:
             # Streaming sessions: only simple appends allowed; reject otherwise.
             if self._inflight:
                 abort = True
                 abort_message = "Streaming session already has an active request."
-            elif session_params.replace:
-                abort = True
-                abort_message = "Streaming sessions do not support replace."
             elif session_params.drop_previous_output:
                 abort = True
                 abort_message = (
@@ -234,33 +191,18 @@ class Session:
             elif session_params.offset and session_params.offset != 0:
                 abort = True
                 abort_message = "Streaming sessions do not support offset."
-            elif self.req_nodes:
-                assert len(self.req_nodes) == 1
-                # Peek (don't pop) the single req_node. req_nodes is updated
+            elif self.turns:
+                assert len(self.turns) == 1
+                # Peek (don't pop) the single turn. turns is updated
                 # only in finish_req after the request completes successfully.
-                [last_req_node] = self.req_nodes.values()
-                last_req = last_req_node.req
-        elif session_params.replace:
-            if session_params.rid is None:
-                for _, req_node in self.req_nodes.items():
-                    req_node.clear(self.req_nodes)
-            else:
-                if session_params.rid not in self.req_nodes:
-                    abort = True
-                    abort_message = "Invalid request session id"
-                else:
-                    last_req_node = self.req_nodes[session_params.rid]
-                    last_req_node.abort()
-                    last_req = last_req_node.req
-                    last_req_node.clear_children(self.req_nodes)
+                [last_req] = self.turns.values()
         else:
             if session_params.rid is not None:
-                if session_params.rid not in self.req_nodes:
+                if session_params.rid not in self.turns:
                     abort = True
                     abort_message = "Invalid request session id"
                 else:
-                    last_req_node = self.req_nodes[session_params.rid]
-                    last_req = last_req_node.req
+                    last_req = self.turns[session_params.rid]
                     if not last_req.finished():
                         abort = True
                         abort_message = "Session request is appending to a request that hasn't finished."
@@ -334,6 +276,7 @@ class Session:
         )
         if last_req is not None:
             new_req.multimodal_inputs = last_req.multimodal_inputs
+            new_req.bind_multimodal_cache_namespace()
             # An offset can truncate inherited media.
             if not abort and not session_params.offset:
                 new_req.inherit_mm_token_counts(last_req)
@@ -345,30 +288,29 @@ class Session:
             new_req.set_finish_with_abort(abort_message)
         elif self.streaming:
             self.last_active_time = time.monotonic()
-            # req_nodes is NOT updated here — finish_req() handles it.
+            # turns is NOT updated here; finish_req() handles it.
             self._inflight = True
         else:
             self.last_active_time = time.monotonic()
-            new_req_node = SessionReqNode(new_req, last_req_node)
-            self.req_nodes[req.rid] = new_req_node
+            self.turns[req.rid] = new_req
 
         return new_req
 
     def finish_req(self, req):
-        """Update req_nodes after a streaming request finishes successfully."""
+        """Update turns after a streaming request finishes successfully."""
         self._inflight = False
-        if self.req_nodes:
-            [prev_node] = self.req_nodes.values()
-            prev_node.req.session = None
-            self.req_nodes.clear()
-        self.req_nodes[req.rid] = SessionReqNode(req)
+        if self.turns:
+            [prev_req] = self.turns.values()
+            prev_req.session = None
+            self.turns.clear()
+        self.turns[req.rid] = req
         # Confirm this req's token arrays as the session's rollback point.
         self.committed_origin_len = len(req.origin_input_ids)
         self.committed_unpadded_len = len(req.origin_input_ids_unpadded)
         self.committed_fill_len = len(req.full_untruncated_fill_ids)
 
     def abort_req(self):
-        """Clear inflight flag on abort (req_nodes stays unchanged)."""
+        """Clear inflight flag on abort (turns stays unchanged)."""
         self._inflight = False
 
 
@@ -413,23 +355,13 @@ class SessionController:
 
     def _close(self, session_id: str):
         session = self.sessions[session_id]
-        req = None
-        has_unfinished_request = False
-        if session.streaming and session._inflight:
-            has_unfinished_request = True
-        elif session.streaming and session.req_nodes:
-            assert len(session.req_nodes) == 1
-            [last_node] = session.req_nodes.values()
-            req = last_node.req
-            if not req.finished():
-                has_unfinished_request = True
-
-        if has_unfinished_request:
-            # An in-flight request is still decoding on this session's KV
-            # memory. Freeing now would corrupt the scheduler. Mark the
-            # session for deferred cleanup: the request keeps its session
-            # reference so release_kv_cache takes the streaming path,
-            # and we schedule release_session for after it completes.
+        if self._has_live_readers(session):
+            # A request still reads what the close frees: a streaming turn
+            # decodes on the session's KV memory, or an unfinished turn holds
+            # the session's media. Mark the session for deferred cleanup: the
+            # request keeps its session reference so release_kv_cache takes
+            # the streaming path, and maybe_reap closes the session once no
+            # request reads it.
             session.close_on_finish = True
             logger.info(
                 "Deferring session close for %s (unfinished request)",
@@ -437,21 +369,21 @@ class SessionController:
             )
             return
 
-        # No owning request -- safe to release immediately.
-        if session.streaming and session.req_nodes:
-            req = next(iter(session.req_nodes.values())).req
+        # No reader left -- safe to release immediately.
+        if session.streaming and session.turns:
+            req = next(iter(session.turns.values()))
             req.session = None
 
         # Release multimodal features held by session requests.
         # Session reqs skip the normal mm cleanup path (scheduler and
         # output_processor) so features stay alive until the session closes.
         seen_mm = set()
-        for node in session.req_nodes.values():
-            mm = node.req.multimodal_inputs
+        for turn in session.turns.values():
+            mm = turn.multimodal_inputs
             if mm is not None and id(mm) not in seen_mm:
                 seen_mm.add(id(mm))
                 mm.release_features()
-            node.req.multimodal_inputs = None
+            turn.multimodal_inputs = None
 
         self.tree_cache.release_radix_session(session_id)
         self.tree_cache.release_session(session_id)
@@ -465,32 +397,37 @@ class SessionController:
         if now - self._last_reap_time > interval:
             self._last_reap_time = now
 
-            # Finish deferred closes for sessions whose requests completed.
+            # Finish deferred closes for sessions no request reads anymore.
             pending = [
                 sid
                 for sid, session in self.sessions.items()
-                if session.close_on_finish and self._all_requests_finished(session)
+                if session.close_on_finish and not self._has_live_readers(session)
             ]
             for sid in pending:
                 log_info_on_rank0(
                     logger, f"Deferred close ready for session {sid}, releasing."
                 )
-                # Reset close_on_finish so _close proceeds with the release.
-                self.sessions[sid].close_on_finish = False
                 self._close(sid)
 
+            # A deferred close is already pending; closing it again each
+            # second would only repeat its log lines.
             timed_out = [
-                sid for sid, session in self.sessions.items() if session.is_timed_out()
+                sid
+                for sid, session in self.sessions.items()
+                if session.is_timed_out() and not session.close_on_finish
             ]
             for sid in timed_out:
                 log_info_on_rank0(logger, f"Session {sid} timed out, closing.")
                 self._close(sid)
 
     @staticmethod
-    def _all_requests_finished(session: Session) -> bool:
-        if not session.req_nodes:
-            return True
-        return all(node.req.finished() for node in session.req_nodes.values())
+    def _has_live_readers(session: Session) -> bool:
+        """Whether a request still reads what closing `session` frees: the
+        streaming turn in flight, or an unfinished turn that holds media."""
+        return session._inflight or any(
+            not turn.finished() and turn.multimodal_inputs is not None
+            for turn in session.turns.values()
+        )
 
     @staticmethod
     def adjust_mm_offsets(recv_req: TokenizedGenerateReqInput, req: Req, image_inputs):

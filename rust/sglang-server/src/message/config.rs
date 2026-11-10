@@ -4,7 +4,7 @@
 //! [`RuntimeConfig`] pairing them for `runtime::start`, and the Rust MM
 //! pipeline handoff ([`MmSpec`]).
 //!
-//! [`ServerArgs`] / [`ModelConfig`] / [`MetricsConfig`] /
+//! [`ServerArgs`] / [`ModelConfig`] / [`MetricsConfig`] / [`RequestLogConfig`] /
 //! [`DefaultSamplingParams`] / [`DisaggregationMode`] / [`MmSpec`] /
 //! [`MmFamily`] / [`MmResample`] are
 //! also `#[pyclass]`es: the Python scheduler (`RustServer._build_server_args`
@@ -23,6 +23,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
+
+/// Python's `--grpc-response-timeout-secs` default.
+pub const DEFAULT_GRPC_RESPONSE_TIMEOUT_SECS: u64 = 300;
 
 /// Boot knobs specific to the embedded rust server — none of these exist in
 /// the Python-built [`ServerArgs`]; they arrive as explicit
@@ -75,6 +78,13 @@ pub struct RuntimeConfig {
     pub server_args: Arc<ServerArgs>,
     /// A model package's keys for native `/generate` frames.
     pub generate_hook: Option<Arc<dyn crate::GenerateHook>>,
+    /// A model package's admission check on every client generation.
+    pub generate_validator: Option<Arc<dyn crate::GenerateValidator>>,
+    /// A model package's own scheduler `internal_state` fields, which
+    /// `/server_info` reports by name after its typed ones. No other
+    /// scheduler field is reported: the state also carries the launch
+    /// arguments, credentials included.
+    pub server_info_state_keys: Vec<String>,
 }
 
 impl Default for RuntimeConfig {
@@ -83,6 +93,8 @@ impl Default for RuntimeConfig {
             rust_server_args: RustServerServerArgs::default(),
             server_args: Arc::new(ServerArgs::default()),
             generate_hook: None,
+            generate_validator: None,
+            server_info_state_keys: Vec::new(),
         }
     }
 }
@@ -134,6 +146,13 @@ pub struct ServerArgs {
     /// Optional gRPC base port. The same per-rank offset as HTTP is applied at
     /// the Python→Rust startup boundary; `None` keeps gRPC disabled.
     pub grpc_port: Option<u16>,
+    /// `--grpc-response-timeout-secs`: the longest a gRPC call waits for its
+    /// next response event before ending with DEADLINE_EXCEEDED. `0` keeps
+    /// the default, as the legacy gRPC bridge does.
+    pub grpc_response_timeout_secs: u64,
+    /// `--api-key` / `--admin-api-key`, enforced on the HTTP routes as
+    /// Python's `add_api_key_middleware` enforces them.
+    pub api_keys: ApiKeys,
     /// Log levels driving the access log — uvicorn runs at
     /// `log_level_http or log_level` (see [`Self::http_access_log_enabled`]).
     pub log_level: String,
@@ -151,6 +170,9 @@ pub struct ServerArgs {
     pub reasoning_parser: Option<String>,
     /// Python's global default for whether an SSE stream ends with a usage chunk.
     pub stream_response_default_include_usage: bool,
+    /// `--enable-cache-report`: OpenAI responses report the prompt's cached
+    /// tokens in `usage.prompt_tokens_details`.
+    pub enable_cache_report: bool,
     /// Pinned tokenizer threads / detok shards (Python asserts both ≥ 1).
     pub tokenizer_worker_num: usize,
     pub detokenizer_worker_num: usize,
@@ -160,6 +182,9 @@ pub struct ServerArgs {
     /// Start accepting health checks immediately instead of waiting for the
     /// main process's startup warmup request to finish.
     pub skip_server_warmup: bool,
+    /// `--gc-threshold`: the thresholds the scheduler ranks set when they
+    /// freeze their garbage collectors after startup; `None` keeps Python's.
+    pub gc_threshold: Option<Vec<i64>>,
     /// Extra headers on a successful `/health_generate` response, for a router
     /// that reads deployment metadata off the deep health probe.
     pub health_generate_headers: BTreeMap<String, String>,
@@ -169,6 +194,9 @@ pub struct ServerArgs {
     /// Apply the router's `x-override-*` headers to `/generate` bodies
     /// (`SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES`).
     pub enable_request_header_overrides: bool,
+    /// Decompress request bodies tagged with `x-body-compressed`
+    /// (`SGLANG_ENABLE_REQUEST_DECOMPRESSION`).
+    pub enable_request_decompression: bool,
     /// Streamed `/generate` frames carry per-step deltas instead of cumulative
     /// text. Matches the Python `TokenizerManager`.
     pub incremental_streaming_output: bool,
@@ -232,6 +260,14 @@ pub struct ServerArgs {
     pub num_accelerators: u32,
     /// Prometheus metrics (`--enable-metrics`); `None` serves no `/metrics`.
     pub metrics: Option<MetricsConfig>,
+    /// Request logging (`--log-requests`); `None` logs no requests.
+    pub request_log: Option<RequestLogConfig>,
+    /// `--crash-dump-folder` is set: keep the requests a crash dump writes
+    /// (Python owns the folder and the file; see `Server::crash_dump_snapshot`).
+    pub crash_dump: bool,
+    /// `sampling_params.custom_params` keys the server itself adds to a
+    /// request (none from a client); request logs and crash dumps leave them out.
+    pub server_added_custom_params: Vec<String>,
 }
 
 #[pyo3::pymethods]
@@ -252,6 +288,9 @@ impl ServerArgs {
         host,
         port,
         grpc_port,
+        grpc_response_timeout_secs,
+        api_key,
+        admin_api_key,
         log_level,
         log_level_http,
         chat_template,
@@ -259,13 +298,16 @@ impl ServerArgs {
         tool_call_parser,
         reasoning_parser,
         stream_response_default_include_usage,
+        enable_cache_report,
         tokenizer_worker_num,
         detokenizer_worker_num,
         skip_tokenizer_init,
         skip_server_warmup,
+        gc_threshold,
         health_generate_headers,
         default_priority_value,
         enable_request_header_overrides,
+        enable_request_decompression,
         incremental_streaming_output,
         disaggregation_mode,
         model_config,
@@ -289,6 +331,9 @@ impl ServerArgs {
         accelerator,
         num_accelerators,
         metrics,
+        request_log,
+        crash_dump,
+        server_added_custom_params,
     ))]
     // The parameter list IS the schema; one keyword per field, all required.
     #[allow(clippy::too_many_arguments)]
@@ -307,6 +352,9 @@ impl ServerArgs {
         host: String,
         port: u16,
         grpc_port: Option<u16>,
+        grpc_response_timeout_secs: u64,
+        api_key: Option<String>,
+        admin_api_key: Option<String>,
         log_level: String,
         log_level_http: Option<String>,
         chat_template: Option<String>,
@@ -314,13 +362,16 @@ impl ServerArgs {
         tool_call_parser: Option<String>,
         reasoning_parser: Option<String>,
         stream_response_default_include_usage: bool,
+        enable_cache_report: bool,
         tokenizer_worker_num: usize,
         detokenizer_worker_num: usize,
         skip_tokenizer_init: bool,
         skip_server_warmup: bool,
+        gc_threshold: Option<Vec<i64>>,
         health_generate_headers: BTreeMap<String, String>,
         default_priority_value: Option<i64>,
         enable_request_header_overrides: bool,
+        enable_request_decompression: bool,
         incremental_streaming_output: bool,
         disaggregation_mode: DisaggregationMode,
         model_config: ModelConfig,
@@ -344,6 +395,9 @@ impl ServerArgs {
         accelerator: Option<String>,
         num_accelerators: u32,
         metrics: Option<MetricsConfig>,
+        request_log: Option<RequestLogConfig>,
+        crash_dump: bool,
+        server_added_custom_params: Vec<String>,
     ) -> Self {
         Self {
             model_path,
@@ -360,6 +414,8 @@ impl ServerArgs {
             host,
             port,
             grpc_port,
+            grpc_response_timeout_secs,
+            api_keys: ApiKeys::new(api_key, admin_api_key),
             log_level,
             log_level_http,
             chat_template,
@@ -368,13 +424,16 @@ impl ServerArgs {
             tool_call_parser,
             reasoning_parser,
             stream_response_default_include_usage,
+            enable_cache_report,
             tokenizer_worker_num,
             detokenizer_worker_num,
             skip_tokenizer_init,
             skip_server_warmup,
+            gc_threshold,
             health_generate_headers,
             default_priority_value,
             enable_request_header_overrides,
+            enable_request_decompression,
             incremental_streaming_output,
             disaggregation_mode,
             model_config,
@@ -398,6 +457,9 @@ impl ServerArgs {
             accelerator,
             num_accelerators,
             metrics,
+            request_log,
+            crash_dump,
+            server_added_custom_params,
         }
     }
 }
@@ -422,6 +484,8 @@ impl Default for ServerArgs {
             host: "127.0.0.1".into(),
             port: 30000,
             grpc_port: None,
+            grpc_response_timeout_secs: DEFAULT_GRPC_RESPONSE_TIMEOUT_SECS,
+            api_keys: ApiKeys::default(),
             log_level: "info".into(),
             log_level_http: None,
             chat_template: None,
@@ -429,13 +493,16 @@ impl Default for ServerArgs {
             tool_call_parser: None,
             reasoning_parser: None,
             stream_response_default_include_usage: false,
+            enable_cache_report: false,
             tokenizer_worker_num: 1,
             detokenizer_worker_num: 1,
             skip_tokenizer_init: false,
             skip_server_warmup: false,
+            gc_threshold: None,
             health_generate_headers: BTreeMap::new(),
             default_priority_value: None,
             enable_request_header_overrides: false,
+            enable_request_decompression: false,
             incremental_streaming_output: false,
             disaggregation_mode: DisaggregationMode::Null,
             model_config: ModelConfig::default(),
@@ -459,7 +526,40 @@ impl Default for ServerArgs {
             accelerator: None,
             num_accelerators: 0,
             metrics: None,
+            request_log: None,
+            crash_dump: false,
+            server_added_custom_params: Vec::new(),
         }
+    }
+}
+
+/// The server's API keys. An empty key is no key, as in Python, whose checks
+/// test the keys' truthiness. `Debug` does not print them.
+#[derive(Clone, Default)]
+pub struct ApiKeys {
+    pub api_key: Option<String>,
+    pub admin_api_key: Option<String>,
+}
+
+impl ApiKeys {
+    pub fn new(api_key: Option<String>, admin_api_key: Option<String>) -> Self {
+        let non_empty = |key: Option<String>| key.filter(|key| !key.is_empty());
+        Self {
+            api_key: non_empty(api_key),
+            admin_api_key: non_empty(admin_api_key),
+        }
+    }
+}
+
+impl std::fmt::Debug for ApiKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ApiKeys")
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field(
+                "admin_api_key",
+                &self.admin_api_key.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
     }
 }
 
@@ -486,6 +586,8 @@ pub struct DeploymentInfo {
     pub hicache_host_total_tokens: Option<u64>,
     pub kv_event_sources: Vec<KvEventSource>,
     pub rust_server_endpoints: Vec<RustServerEndpoint>,
+    /// Every Rust listener of this launch on this node; the same table on each.
+    pub node_listeners: Vec<NodeRustListener>,
 }
 
 /// One DP rank's listener, as a base URL (`http://host:port`).
@@ -501,6 +603,14 @@ pub struct KvEventSource {
     pub endpoint: String,
     pub topic: String,
     pub block_size: u32,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct NodeRustListener {
+    pub port_offset: u16,
+    pub dp_rank: u32,
+    pub http_port: u16,
+    pub grpc_port: Option<u16>,
 }
 
 impl<'py> pyo3::FromPyObject<'_, 'py> for DeploymentInfo {
@@ -592,6 +702,110 @@ impl MetricsConfig {
     }
 }
 
+/// Python's `RequestLogger` settings for `--log-requests`. Every value comes
+/// from Python so the two servers render the same lines: the level's metadata
+/// (`RequestLogger._compute_metadata`), the format, the request class with its
+/// fields in order and each default as Python renders it, the OpenAI request
+/// models' fields, the header whitelist, `SGLANG_LOG_REQUEST_EXCEEDED_MS` and
+/// the targets (`--log-requests-target`).
+#[pyo3::pyclass(frozen, from_py_object, module = "sglang.srt.rust_extensions._server")]
+#[derive(Clone, Debug)]
+pub struct RequestLogConfig {
+    /// Strings and lists longer than this are cut to their two halves.
+    pub max_length: usize,
+    /// Request fields and output keys left out of the lines at this level.
+    pub skip_names: Vec<String>,
+    pub out_skip_names: Vec<String>,
+    /// `--log-requests-format json`: each line is the JSON object Python's
+    /// `log_json` writes; otherwise the text line.
+    pub json: bool,
+    /// The request class name and its `(field, rendered default)` pairs, in
+    /// declaration order; the default as the format renders a value (its
+    /// `repr`-style text, or its JSON).
+    pub class_name: String,
+    pub fields: Vec<(String, String)>,
+    /// The fields a batch item's object (Python `obj[i]`) takes from the
+    /// batch: its own entry of the per-item ones, the shared ones as they are;
+    /// the rest keep their defaults.
+    pub batch_item_fields: Vec<String>,
+    pub batch_shared_fields: Vec<String>,
+    /// Request headers a line carries when present, lowercase.
+    pub headers: Vec<String>,
+    /// A finished request faster than this (ms) is not logged; `<= 0` logs all.
+    pub exceeded_ms: i64,
+    /// Log each OpenAI request as received, before it is adapted (Python's
+    /// `log_openai_received_request`, from level 2).
+    pub openai_requests: bool,
+    /// `ChatCompletionRequest`'s and `CompletionRequest`'s fields in
+    /// declaration order, each with its default as JSON (`None` when it has
+    /// none or it is `None`), for the OpenAI line's `model_dump`.
+    pub chat_completion_fields: Vec<(String, Option<String>)>,
+    pub completion_fields: Vec<(String, Option<String>)>,
+    /// Write to stdout; and to each of `files`, an hourly-rotated
+    /// `{hostname}_{rank}.log` in a target directory (Python creates the
+    /// directory).
+    pub stdout: bool,
+    pub files: Vec<String>,
+}
+
+#[pyo3::pymethods]
+impl RequestLogConfig {
+    #[new]
+    #[pyo3(signature = (*,
+        max_length,
+        skip_names,
+        out_skip_names,
+        json = false,
+        class_name,
+        fields,
+        batch_item_fields,
+        batch_shared_fields,
+        headers,
+        exceeded_ms,
+        openai_requests = false,
+        chat_completion_fields = Vec::new(),
+        completion_fields = Vec::new(),
+        stdout = true,
+        files = Vec::new(),
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn py_new(
+        max_length: usize,
+        skip_names: Vec<String>,
+        out_skip_names: Vec<String>,
+        json: bool,
+        class_name: String,
+        fields: Vec<(String, String)>,
+        batch_item_fields: Vec<String>,
+        batch_shared_fields: Vec<String>,
+        headers: Vec<String>,
+        exceeded_ms: i64,
+        openai_requests: bool,
+        chat_completion_fields: Vec<(String, Option<String>)>,
+        completion_fields: Vec<(String, Option<String>)>,
+        stdout: bool,
+        files: Vec<String>,
+    ) -> Self {
+        Self {
+            max_length,
+            skip_names,
+            out_skip_names,
+            json,
+            class_name,
+            fields,
+            batch_item_fields,
+            batch_shared_fields,
+            headers,
+            exceeded_ms,
+            openai_requests,
+            chat_completion_fields,
+            completion_fields,
+            stdout,
+            files,
+        }
+    }
+}
+
 /// `--preferred-sampling-params`, carried verbatim: `/get_model_info` echoes
 /// whatever Python advertises, and the keys are whatever `SamplingParams`
 /// accepts, so there is no fixed field list to model as a `#[pyclass]`.
@@ -662,6 +876,8 @@ pub enum DisaggregationMode {
 pub struct ModelConfig {
     /// Authoritative HF model type, used to select a native chat formatter.
     pub model_type: Option<String>,
+    /// HF `architectures`, reported by model info.
+    pub architectures: Option<Vec<String>>,
     /// Resolved context length (`max_model_len` in `/v1/models`); the ceiling
     /// for input + `max_new_tokens`.
     pub context_len: u64,
@@ -684,13 +900,14 @@ pub struct ModelConfig {
 #[pyo3::pymethods]
 impl ModelConfig {
     #[new]
-    #[pyo3(signature = (*, context_len, vocab_size, is_multimodal, default_sampling_params, model_type))]
+    #[pyo3(signature = (*, context_len, vocab_size, is_multimodal, default_sampling_params, model_type, architectures))]
     fn py_new(
         context_len: u64,
         vocab_size: u64,
         is_multimodal: bool,
         default_sampling_params: DefaultSamplingParams,
         model_type: Option<String>,
+        architectures: Option<Vec<String>>,
     ) -> Self {
         Self {
             context_len,
@@ -698,6 +915,7 @@ impl ModelConfig {
             is_multimodal,
             default_sampling_params,
             model_type,
+            architectures,
         }
     }
 }
@@ -708,6 +926,7 @@ impl Default for ModelConfig {
         Self {
             context_len: 2048,
             model_type: None,
+            architectures: None,
             vocab_size: 1000,
             is_multimodal: false,
             default_sampling_params: DefaultSamplingParams::default(),
@@ -766,7 +985,7 @@ pub struct MmSpec {
     /// broadcasts across TP ranks and will unwrap `ShmPointerMMData`.
     pub feature_shm: bool,
     /// The family pipeline and its resolved processor parameters.
-    pub pipeline: sglang_mm::registry::PipelineSpec,
+    pub pipeline: sglang_processor::dynamo_multimodal::registry::ProcessorSpec,
 }
 
 #[pyo3::pymethods]
@@ -792,7 +1011,7 @@ impl MmSpec {
     fn py_new(
         family: MmFamily,
         feature_shm: bool,
-        image_token_id: i64,
+        image_token_id: i32,
         patch_size: usize,
         merge_size: usize,
         temporal_patch_size: usize,
@@ -802,9 +1021,10 @@ impl MmSpec {
         image_std: [f32; 3],
         resample: MmResample,
     ) -> Self {
-        use sglang_mm::registry::PipelineSpec;
+        use sglang_processor::dynamo_multimodal::models::qwen_vl::QwenVlSpec;
+        use sglang_processor::dynamo_multimodal::registry::ProcessorSpec;
         let pipeline = match family {
-            MmFamily::QwenVl => PipelineSpec::QwenVl(sglang_mm::qwen_vl::QwenVlSpec {
+            MmFamily::QwenVl => ProcessorSpec::QwenVl(QwenVlSpec {
                 image_token_id,
                 patch_size,
                 merge_size,
@@ -823,8 +1043,8 @@ impl MmSpec {
     }
 }
 
-/// Which `sglang_mm` family pipeline serves the model — one variant per
-/// [`sglang_mm::registry::PipelineSpec`] arm. Exposed to Python as an enum
+/// Which `dynamo-multimodal` family serves the model — one variant per
+/// `ProcessorSpec` arm. Exposed to Python as an enum
 /// (`MmFamily.QwenVl`); `RustMmFamily.name` maps onto it at handoff.
 #[pyo3::pyclass(
     eq,
@@ -838,7 +1058,7 @@ pub enum MmFamily {
 }
 
 /// The HF image processor the Rust resize must reproduce bit-exactly (see
-/// [`sglang_mm::qwen_vl::Resampler`]). Exposed to Python as an enum
+/// `dynamo-multimodal`'s `qwen_vl::Resampler`). Exposed to Python as an enum
 /// (`MmResample.AtenU8` / `.Pil`); `RustMmFamily.image_processors` maps each
 /// processor class onto it.
 #[pyo3::pyclass(
@@ -855,7 +1075,7 @@ pub enum MmResample {
     Pil,
 }
 
-impl From<MmResample> for sglang_mm::qwen_vl::Resampler {
+impl From<MmResample> for sglang_processor::dynamo_multimodal::models::qwen_vl::Resampler {
     fn from(r: MmResample) -> Self {
         match r {
             MmResample::AtenU8 => Self::AtenU8,

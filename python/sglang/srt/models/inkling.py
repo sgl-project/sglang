@@ -47,6 +47,8 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import get_moe_runner_backend
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils import get_layer_id
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -55,8 +57,7 @@ from sglang.srt.managers.mm_utils import (
     general_mm_embed_routine,
     pad_mm_tokens,
 )
-from sglang.srt.managers.req_types import MultimodalDataItem
-from sglang.srt.managers.schedule_batch import MultimodalInputs
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
@@ -107,7 +108,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
 )
-from sglang.srt.utils import add_prefix, is_cuda, make_layers
+from sglang.srt.utils import is_cuda
 
 logger = logging.getLogger(__name__)
 
@@ -1843,6 +1844,12 @@ class InklingForConditionalGenerationMTP(nn.Module):
             hidden_states_before_norm=hidden_states_before_norm,
         )
 
+    @staticmethod
+    def sliding_layer_window_size(config) -> Optional[int]:
+        """A banded depth's window, one less than its extent; only banded depths
+        (``mtp_local_layer_ids``) have window layers."""
+        return config.text_config.mtp_local_extent - 1
+
     def get_attention_sliding_window_size(self) -> Optional[int]:
         """The trunk's convention (`InklingForConditionalGeneration`): the
         backend window is one less than the extent, so the head reads back
@@ -1850,7 +1857,7 @@ class InklingForConditionalGenerationMTP(nn.Module):
         its own extent, every other depth at the trunk's window."""
         text_config = self.text_config
         if self.draft_model_idx in text_config.mtp_local_layer_ids:
-            return text_config.mtp_local_extent - 1
+            return self.sliding_layer_window_size(self.config)
         return text_config.sliding_window_size - 1
 
     def get_embed_and_head(self):

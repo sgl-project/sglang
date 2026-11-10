@@ -1,8 +1,9 @@
-"""Unit coverage for SWAKVPool.set_kv_buffer with a pre-translated swa_loc.
+"""Unit coverage for SWAKVPool.set_kv_buffer with a pre-translated window loc.
 
 The attention backend translates out_cache_loc once per forward and passes it
-in via a ``KVWriteLoc`` (loc + swa_loc) on the loc_info argument; set_kv_buffer
-uses swa_loc directly for SWA layers and asserts it is provided. The per-backend
+in via a ``KVWriteLoc`` (loc + its window sub-pool's ``window_locs`` entry) on
+the loc_info argument; set_kv_buffer uses that entry directly for SWA layers
+and asserts it is provided. The per-backend
 cuda-graph buffer plumbing is covered by the backend SWA integration tests.
 """
 
@@ -52,7 +53,7 @@ class TestSWAKVPoolSetKVBuffer(CustomTestCase):
         swa_loc = torch.tensor([7, 8])
         pool.set_kv_buffer(
             SimpleNamespace(layer_id=1),
-            KVWriteLoc(torch.tensor([3, 4]), swa_loc),
+            KVWriteLoc(torch.tensor([3, 4]), window_locs={"swa": swa_loc}),
             None,
             None,
         )
@@ -80,7 +81,7 @@ class TestSWAKVPoolSetKVBuffer(CustomTestCase):
         # Full layer: swa_loc supplied but ignored; loc is used.
         pool.set_kv_buffer(
             SimpleNamespace(layer_id=0),
-            KVWriteLoc(loc, torch.tensor([99, 99])),
+            KVWriteLoc(loc, window_locs={"swa": torch.tensor([99, 99])}),
             None,
             None,
         )
@@ -110,10 +111,16 @@ class TestSWAKVPoolSetKVBuffer(CustomTestCase):
         swa_loc = torch.tensor([7, 8])
 
         pool.set_kv_buffer(
-            SimpleNamespace(layer_id=7), KVWriteLoc(full_loc, swa_loc), None, None
+            SimpleNamespace(layer_id=7),
+            KVWriteLoc(full_loc, window_locs={"swa": swa_loc}),
+            None,
+            None,
         )
         pool.set_mla_kv_buffer(
-            SimpleNamespace(layer_id=8), KVWriteLoc(full_loc, swa_loc), None, None
+            SimpleNamespace(layer_id=8),
+            KVWriteLoc(full_loc, window_locs={"swa": swa_loc}),
+            None,
+            None,
         )
 
         full_layer, recorded_full_loc, full_layer_id = recorded["full_kv"]
