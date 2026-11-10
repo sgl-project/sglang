@@ -957,6 +957,13 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
         if backend in DFLASH_MLA_ONLY_DRAFT_BACKENDS:
             # These serve only MLA layers: a draft verify window through the
             # target's MLA decode kernels (DCP owner rows under DCP).
+            # trtllm_mla's decode kernel has no bidirectional mask, so a draft
+            # takes it only when it is named, not from the target.
+            if (
+                backend == "trtllm_mla"
+                and cfg.speculative_draft_attention_backend is None
+            ):
+                return False
             return is_dflash_mla_draft_config(_load_draft_hf_config(cfg))
         return backend in supported_draft_backends
 
