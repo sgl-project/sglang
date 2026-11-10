@@ -382,5 +382,46 @@ def test_dflash_family_accept_uses_block_verification(any_greedy):
     assert (token_correct_len[sampled] == 0).any()
 
 
+def _verify_draft_probabilities(draft_probs, target_prob, coin, block):
+    batch, steps = len(draft_probs), 2
+    target = torch.zeros(batch, steps + 1, 2)
+    target[..., 0] = target_prob
+    target[..., 1] = 1 - target_prob
+    draft = torch.zeros(batch, steps, 2)
+    draft[..., 0] = torch.tensor(draft_probs)[:, None]
+    candidates = torch.zeros(batch, steps + 1, dtype=torch.long)
+    coins = torch.full((batch, steps + 1), coin)
+    final_coins = torch.full((batch,), 0.25)
+    return _verify(
+        *(x.to(DEVICE) for x in (target, draft, candidates, coins, final_coins)),
+        block=block,
+    )
+
+
+@pytest.mark.parametrize("block", [False, True])
+def test_accepts_draft_probability_rounded_above_one(block):
+    lengths, output = _verify_draft_probabilities(
+        [1.0, 1 + 2**-23, 1 + 1e-5], 1.0, 0.5, block
+    )
+    assert lengths.tolist() == [2, 2, 2]
+    assert (output == output[:1]).all()
+
+
+@pytest.mark.parametrize("block", [False, True])
+def test_rejects_non_probability_draft(block):
+    invalid = [0.0, -0.5, 1.01, 2.0, float("nan"), float("inf"), -float("inf")]
+    lengths, _ = _verify_draft_probabilities(invalid, 1.0, 0.5, block)
+    assert lengths.tolist() == [0] * len(invalid)
+
+
+@pytest.mark.parametrize("block", [False, True])
+def test_residual_excludes_draft_rounded_above_one(block):
+    lengths, output = _verify_draft_probabilities(
+        [1.0, 1 + 2**-23, 1 + 1e-5], 0.5, 0.9, block
+    )
+    assert lengths.tolist() == [0, 0, 0]
+    assert output[:, 0].tolist() == [1, 1, 1]
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
