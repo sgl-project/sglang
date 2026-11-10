@@ -3899,6 +3899,8 @@ class OpenAIServingChat(OpenAIServingBase):
         tool_index = len(detector.prev_tool_call_arr) - 1
         if tool_index < 0 or tool_index >= len(detector.streamed_args_for_tool):
             return None
+        if tool_index in _incomplete_tool_call_indices(parser):
+            return None
 
         # Get expected vs actual arguments
         expected_args = detector.prev_tool_call_arr[tool_index].get("arguments", {})
