@@ -260,7 +260,7 @@ class BaseMultimodalProcessor(ABC):
     # Processors opt out only when their preprocessing is not thread-safe. The
     # worker pool gives each thread its own `copy.deepcopy` of the HF processor
     # and injects it, and the single function it runs --
-    # `process_and_combine_mm_data` -- resolves that clone instead of
+    # `_process_and_combine_mm_data` -- resolves that clone instead of
     # `self._processor`, so isolation does not depend on the subclass.
     supports_mm_processor_concurrency = True
     # Placeholder tokens that the loader matches per modality; a processor without
@@ -1862,12 +1862,26 @@ class BaseMultimodalProcessor(ABC):
         processor=None,
         **kwargs,
     ) -> Tuple[List[MultimodalDataItem], torch.Tensor, dict]:
-        """
-        Process multimodal data and return the combined multimodal items and input_ids.
-        Supports mixed modalities (images and audio in the same request).
+        """preprocess and publish features for synchronous callers"""
+        items, input_ids, ret = self._process_and_combine_mm_data(
+            base_output, mm_tokens, processor=processor, **kwargs
+        )
+        if items:
+            items = self._finalize_mm_items(items, images=base_output.images)
+        return items, input_ids, ret
 
-        Returns:
-            Tuple of (list of mm_items, input_ids)
+    def _process_and_combine_mm_data(
+        self,
+        base_output: BaseMultiModalProcessorOutput,
+        mm_tokens: MultimodalSpecialTokens,
+        processor=None,
+        **kwargs,
+    ) -> Tuple[List[MultimodalDataItem], torch.Tensor, dict]:
+        """
+        preprocess into request-owned tensors without publishing transport leases
+
+        a cancelled executor await may discard this result while the worker
+        finishes. IPC publication belongs to the receiving caller, not this worker.
         """
         processor_override = processor
         processor, tokenizer = self._resolve_processor(processor)
@@ -2015,11 +2029,6 @@ class BaseMultimodalProcessor(ABC):
         from sglang.srt.managers.mm_utils import get_new_expanded_mm_items
 
         all_collected_items = get_new_expanded_mm_items(all_collected_items)
-        all_collected_items = self._finalize_mm_items(
-            all_collected_items,
-            images=base_output.images,
-        )
-
         return all_collected_items, input_ids, ret
 
     def _finalize_mm_items(
@@ -2129,9 +2138,13 @@ class BaseMultimodalProcessor(ABC):
         if self.mm_processor_executor is None:
             return self.process_and_combine_mm_data(base_output, mm_tokens, **kwargs)
 
-        return await self.mm_processor_executor.run(
-            self.process_and_combine_mm_data,
+        items, input_ids, ret = await self.mm_processor_executor.run(
+            self._process_and_combine_mm_data,
             base_output,
             mm_tokens,
             **kwargs,
         )
+        # publish only after the await succeeds, so cancellation cannot orphan leases
+        if items:
+            items = self._finalize_mm_items(items, images=base_output.images)
+        return items, input_ids, ret

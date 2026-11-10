@@ -614,20 +614,24 @@ class TestMultimodalProcessorConcurrency(unittest.IsolatedAsyncioTestCase):
         processor.mm_processor_executor = MultimodalProcessorExecutor(
             lambda: hf_processor, max_workers=2
         )
-        processor.process_and_combine_mm_data = MagicMock(
-            side_effect=lambda *_args, **_kwargs: threading.current_thread().name
+        processor._process_and_combine_mm_data = MagicMock(
+            side_effect=lambda *_args, **_kwargs: (
+                [],
+                threading.current_thread().name,
+                {},
+            )
         )
         try:
-            thread_name = await processor.process_and_combine_mm_data_async(
+            _, thread_name, _ = await processor.process_and_combine_mm_data_async(
                 MagicMock(), MagicMock(), marker=True
             )
         finally:
             processor.mm_processor_executor.shutdown()
 
         self.assertTrue(thread_name.startswith("sglang-mm-processor"))
-        processor.process_and_combine_mm_data.assert_called_once()
+        processor._process_and_combine_mm_data.assert_called_once()
         self.assertTrue(
-            processor.process_and_combine_mm_data.call_args.kwargs["marker"]
+            processor._process_and_combine_mm_data.call_args.kwargs["marker"]
         )
 
     async def test_single_worker_preserves_synchronous_path(self):

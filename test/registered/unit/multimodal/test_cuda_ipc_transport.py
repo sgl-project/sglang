@@ -13,6 +13,7 @@ import threading
 import time
 import unittest
 import weakref
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
@@ -23,6 +24,12 @@ from sglang.srt.managers.req_types import (
     MultimodalProcessorOutput,
 )
 from sglang.srt.multimodal.modality import Modality
+from sglang.srt.multimodal.processors.base_processor import (
+    BaseMultimodalProcessor,
+    BaseMultiModalProcessorOutput,
+    MultimodalSpecialTokens,
+)
+from sglang.srt.multimodal.processors.executor import MultimodalProcessorExecutor
 from sglang.srt.multimodal.transport.admission import MmMemoryOverloaded
 from sglang.srt.multimodal.transport.cuda_ipc import (
     CudaIpcTensorTransportProxy,
@@ -34,6 +41,21 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=54, stage="base-b", runner_config="1-gpu-small")
+
+
+class _PausedHFProcessor:
+    """pause the external processor call while the real async caller cancels"""
+
+    def __init__(self, before_return):
+        self.before_return = before_return
+        self.tokenizer = SimpleNamespace(bos_token=None)
+
+    def __call__(self, **kwargs):
+        self.before_return()
+        return {
+            "input_ids": torch.tensor([[7, 99, 8]]),
+            "pixel_values": torch.ones(1, 4, device="cuda"),
+        }
 
 
 def _produce_pooled_tensor(proxy_queue, consumer_done, result_queue, guarded=False):
@@ -364,6 +386,75 @@ class TestCudaIpcTransport(CustomTestCase):
             complete.set()
             publisher.shutdown()
             pool.shutdown()
+
+    def test_cancelled_processor_worker_does_not_publish_an_orphaned_lease(self):
+        """cancelling the await cannot stop a running HF call; publish after receipt"""
+
+        async def run(cancel):
+            loop = asyncio.get_running_loop()
+            entered = asyncio.Event()
+            resume = threading.Event()
+
+            def pause():
+                loop.call_soon_threadsafe(entered.set)
+                if not resume.wait(timeout=10):
+                    raise TimeoutError("processor was not resumed")
+
+            hf_processor = _PausedHFProcessor(pause)
+            with patch.object(BaseMultimodalProcessor, "__abstractmethods__", set()):
+                processor = BaseMultimodalProcessor.__new__(BaseMultimodalProcessor)
+            processor._processor = hf_processor
+            processor._tokenizer = hf_processor.tokenizer
+            processor._tokenizer_auto_adds_specials = False
+            processor.image_config = {}
+            processor.video_config = {}
+            processor.audio_config = {}
+            processor.ATTR_NAME_TO_MODALITY = {"pixel_values": Modality.IMAGE}
+            processor.FEATURE_NAMES = ["pixel_values"]
+            processor.mm_feature_transport = "cuda_ipc"
+            processor.use_cuda_ipc = True
+            processor.use_ipc_pool_handle_cache = True
+            processor.processor_fingerprint = "sha256:" + "12" * 32
+            pool = MmItemMemoryPool(1 << 20, 0.01, 0, consumer_count=1)
+            processor.cudaipc_mmfeature_pool = pool
+            executor = MultimodalProcessorExecutor(lambda: hf_processor, max_workers=1)
+            processor.mm_processor_executor = executor
+            task = asyncio.create_task(
+                processor.process_and_combine_mm_data_async(
+                    BaseMultiModalProcessorOutput(
+                        input_text="image", images=[torch.zeros(3, 2, 2)]
+                    ),
+                    MultimodalSpecialTokens(image_token_id=99),
+                )
+            )
+            try:
+                await asyncio.wait_for(entered.wait(), timeout=10)
+                if cancel:
+                    task.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await task
+                resume.set()
+                if not cancel:
+                    items, input_ids, _ = await task
+                    self.assertEqual(input_ids.tolist(), [7, 99, 8])
+                    self.assertEqual(items[0].offsets, [(1, 1)])
+                    self.assertIsInstance(items[0].feature, CudaIpcTensorTransportProxy)
+                    self.assertEqual(pool.active_lease_count, 1)
+                    pool.cancel_proxy(items[0].feature)
+                await asyncio.to_thread(executor.shutdown)
+                torch.cuda.synchronize()
+                deadline = time.monotonic() + 5
+                while pool.active_lease_count and time.monotonic() < deadline:
+                    await asyncio.sleep(0.01)
+                self.assertEqual(pool.active_lease_count, 0)
+            finally:
+                resume.set()
+                await asyncio.to_thread(executor.shutdown)
+                pool.shutdown()
+
+        for cancel in (True, False):
+            with self.subTest(cancel=cancel):
+                asyncio.run(run(cancel))
 
     def test_pooled_tensor_reconstructs_in_spawned_process(self):
         self._run_spawned_round_trip(guarded=False)
