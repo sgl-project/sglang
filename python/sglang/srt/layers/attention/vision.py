@@ -1049,6 +1049,8 @@ class VisionAMXAttention(nn.Module):
         seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
         max_seqlen = seq_lens.max().item()
 
+        # Older sglang-kernel-cpu wheels have no sm_scale arg; omit it when unset.
+        scale_kwargs = {} if softmax_scale is None else {"sm_scale": softmax_scale}
         output = flash_attn_varlen_func(
             q,
             k,
@@ -1058,7 +1060,7 @@ class VisionAMXAttention(nn.Module):
             max_seqlen_q=max_seqlen,
             max_seqlen_k=max_seqlen,
             causal=False,
-            sm_scale=softmax_scale,
+            **scale_kwargs,
         )
 
         return output
