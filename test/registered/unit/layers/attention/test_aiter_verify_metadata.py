@@ -7,11 +7,11 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.layers.attention import aiter_backend
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 _BATCH_SIZE = 2
 _VERIFY_TOKENS_PER_REQ = 17
@@ -55,6 +55,8 @@ def _unified_verify_backend():
     backend.use_mla = False
     backend._use_unified_verify = True
     backend.use_sliding_window_kv_pool = False
+    backend.use_muse_attention_paths = False
+    backend.muse_reuse_verify_lengths = False
     backend.page_size = 1
     backend.max_context_len = 128
     backend.num_draft_tokens = _VERIFY_TOKENS_PER_REQ

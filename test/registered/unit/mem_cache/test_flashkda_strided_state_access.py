@@ -25,7 +25,7 @@ pattern (the code under test) executes.
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=6, suite="base-a-test-cpu")
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import sys
 import types
@@ -58,7 +58,7 @@ _SEQ_LEN = 128
 
 
 def _make_strided_temporal_views():
-    """Envelope-strided conv/temporal views, as UnifiedMambaPool / the
+    """Envelope-strided conv/temporal views, as the unified state view / the
     page-major MambaPool serve them ((num_layers, max_slots, *inner))."""
     entry = mamba_entry_bytes(
         layer_num=_LAYERS,

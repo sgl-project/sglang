@@ -18,11 +18,19 @@
 
 import math
 from dataclasses import dataclass
-from typing import Optional
+from typing import NamedTuple, Optional
 
 import torch
 
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+
+class ForwardStateSlots(NamedTuple):
+    """A forward's per-request state slots, resolved during its metadata preparation.
+    Work past its shared-read end uses these: the scheduler may rewrite the tables."""
+
+    working: torch.Tensor  # one slot per request
+    track: Optional[torch.Tensor] = None  # prefix-cache checkpoint slots
 
 
 @dataclass(kw_only=True)
@@ -47,6 +55,9 @@ class ForwardMetadata:
     # state. Fires on EXACTLY the rows the radix track snapshots, i.e. the same
     # condition the track uses: seq_lens_cpu % mamba_track_interval == 0.
     replayssm_force_flush: Optional[torch.Tensor] = None
+    # KDA host-only ReplaySSM: ring rows are live requests (req_pool_idx),
+    # not mamba slots. None keeps the ring indexed by mamba_cache_indices.
+    replayssm_ring_indices: Optional[torch.Tensor] = None
     # For topk > 1 eagle
     retrieve_next_token: Optional[torch.Tensor] = None
     retrieve_next_sibling: Optional[torch.Tensor] = None
