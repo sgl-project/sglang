@@ -30,6 +30,10 @@ import triton.language as tl
 
 from sglang.kernels.fused_op import BaseFusedOp
 from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.kernels.ops.moe.moe_route_warp import (
+    muse_spark_route_warp,
+    muse_spark_route_warp_covered,
+)
 from sglang.kernels.spec import CapabilityRequirement, KernelBackend
 from sglang.srt.environ import envs
 from sglang.srt.utils import fast_topk
@@ -754,12 +758,14 @@ class FusedMuseSparkRouting(BaseFusedOp):
             return False
         if backend is not KernelBackend.JIT:
             return True
-        # 128-bit row loads need num_experts % 4; the rest are static_asserts
-        # in routing.cuh that would otherwise fail at compile time.
+        # The warp router covers sigmoid scoring with num_experts a multiple of
+        # 32 (up to 512); softmax and other expert counts stay on Triton.
         return (
-            1 <= topk <= 32
-            and gating_output.shape[-1] % 4 == 0
-            and self.router_score_normalization in ("sigmoid", "softmax")
+            self.router_score_normalization == "sigmoid"
+            and gating_output.dtype == torch.float32
+            and muse_spark_route_warp_covered(
+                gating_output.shape[1], topk, gating_output.device.index
+            )
         )
 
     def forward_jit(
@@ -770,37 +776,39 @@ class FusedMuseSparkRouting(BaseFusedOp):
         renormalize: bool,
         want_packed: bool = False,
     ):
-        """Fused JIT CUDA kernel implementation."""
+        """One-warp-per-token CUDA router (``moe_route_warp``)."""
         assert renormalize, "MuseSpark routing requires renormalize=True"
-        from sglang.kernels.ops.moe.muse_spark_routing_jit import (
-            fused_muse_spark_routing_jit,
-        )
-
+        num_tokens = gating_output.shape[0]
         # See forward_triton: the SoL buffer is written by the router itself.
         cap = self.sol_topk_out
-        if cap is not None and gating_output.shape[0] > cap.shape[0]:
+        if cap is not None and num_tokens > cap.shape[0]:
             cap = None
-        gating = gating_output.float().contiguous()
+        cap_view = cap[:num_tokens, :topk] if cap is not None else None
+        topk_ids = (
+            cap_view if cap_view is not None and cap_view.is_contiguous() else None
+        )
         packed = (
             torch.empty(
-                (gating.shape[0], topk), dtype=torch.int32, device=gating.device
+                (num_tokens, topk), dtype=torch.int32, device=gating_output.device
             )
             if want_packed
             else None
         )
-        topk_weights, topk_ids, packed = fused_muse_spark_routing_jit(
-            gating,
+        topk_weights, topk_ids = muse_spark_route_warp(
+            gating_output,
             self.expert_bias,
             topk,
             self.route_scale,
             router_output_multiplier=self.router_output_multiplier,
-            router_score_normalization=self.router_score_normalization,
-            router_score_division_eps=self.router_score_division_eps,
-            topk_ids=cap,
+            division_eps=self.router_score_division_eps,
             local_expert_mapping=self.local_expert_mapping,
             num_valid_tokens=self.num_valid_tokens,
-            packed_topk_ids=packed,
+            topk_ids=topk_ids,
+            packed_out=packed,
         )
+        if cap_view is not None and topk_ids is not cap_view:
+            cap_view.copy_(topk_ids)
+            topk_ids = cap_view
         if want_packed:
             return topk_weights, topk_ids, packed
         return topk_weights, topk_ids

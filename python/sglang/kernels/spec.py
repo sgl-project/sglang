@@ -88,13 +88,28 @@ class PlatformInfo(msgspec.Struct, frozen=True):
     def is_cuda(self) -> bool:
         return self.device_type == "cuda"
 
+    @property
+    def is_hip(self) -> bool:
+        return self.device_type == "hip"
+
+    @property
+    def is_musa(self) -> bool:
+        return self.device_type == "musa"
+
     @classmethod
-    def detect(cls) -> PlatformInfo:
-        """Build a :class:`PlatformInfo` from the current process.
+    def detect(cls, *, use_cache: bool = True) -> PlatformInfo:
+        """The platform of the current process, probed once and then cached.
 
         Never raises: if no accelerator is visible the default CPU platform is
-        returned.
+        returned. Do not call at import time: probing initializes CUDA.
         """
+        global _DETECTED_PLATFORM
+        if _DETECTED_PLATFORM is None or not use_cache:
+            _DETECTED_PLATFORM = cls._probe()
+        return _DETECTED_PLATFORM
+
+    @classmethod
+    def _probe(cls) -> PlatformInfo:
         import torch
 
         try:
@@ -121,6 +136,9 @@ class PlatformInfo(msgspec.Struct, frozen=True):
         except Exception:
             pass
         return cls()
+
+
+_DETECTED_PLATFORM: Optional[PlatformInfo] = None
 
 
 class CapabilityRequirement(msgspec.Struct, frozen=True):

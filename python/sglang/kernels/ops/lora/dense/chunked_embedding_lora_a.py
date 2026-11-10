@@ -2,7 +2,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.lora.utils import LoRABatchInfo
+from sglang.srt.lora.utils import LoRABatchInfo, csgmv_segment_grid_size
 
 
 @triton.jit(do_not_specialize=["num_segments"])
@@ -109,12 +109,7 @@ def chunked_embedding_lora_a_forward(
 
     # Block size for rank dimension
     BLOCK_RANK = 128
-    num_segments = batch_info.num_segments
-    segment_grid = (
-        batch_info.weight_indices.shape[0]
-        if batch_info.use_cuda_graph
-        else num_segments
-    )
+    segment_grid = csgmv_segment_grid_size(batch_info, num_tokens=S)
     # 1D Grid: one program per chunk of embedding lookup work
     grid = (segment_grid,)
     output = torch.zeros((S, rank), device=input_ids.device, dtype=weights.dtype)

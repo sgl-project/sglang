@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from functools import lru_cache
-from typing import List, Optional
+from typing import List, NamedTuple, Optional
 
 import torch
 
@@ -15,11 +14,12 @@ from sglang.srt.layers.attention.dsa.dsa_token_shard_layout import (
 from sglang.srt.layers.cp.utils import cp_gather_full_sequence_states
 from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
     get_token_to_kv_pool,
 )
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_npu, print_info_once
 
@@ -87,8 +87,7 @@ def plan_indexer_query_shard(
     )
 
 
-@dataclass
-class _IndexerQueryShard:
+class _IndexerQueryShard(NamedTuple):
     """This rank's rows of an extend batch, and how to reassemble the top-k."""
 
     start: int
@@ -255,9 +254,7 @@ class DSANPUIndexerMixin:
         )
         shard = (
             _get_indexer_query_shard(forward_batch, bs)
-            if is_prefill
-            and envs.SGLANG_NPU_ENABLE_DSA_INDEXER_QUERY_SHARDING.get()
-            and not uses_prefill_cp
+            if is_prefill and not uses_prefill_cp
             else None
         )
         q_sliced_early = shard is not None and self.rotary_emb.is_neox_style

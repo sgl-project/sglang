@@ -15,11 +15,8 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalProcessorOutput,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.cuda_vmm_transport_utils import (
     CudaVmmFeatureTransport,

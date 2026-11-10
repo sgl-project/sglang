@@ -35,12 +35,14 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
     is_cpu,
     is_cuda,
+    is_hip,
     is_npu,
     is_xpu,
     set_weight_attrs,
 )
 
-if is_cuda():
+# ROCm uses the same imports: causal_conv1d.py falls back to the Triton kernels there.
+if is_cuda() or is_hip():
     from sglang.kernels.ops.mamba.causal_conv1d_triton import (
         causal_conv1d_fn as causal_conv1d_fn_triton,
     )

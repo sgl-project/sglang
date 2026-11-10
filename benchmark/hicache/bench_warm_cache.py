@@ -1,4 +1,4 @@
-# Adapted from benchmark/hicache/bench_serving.py and python/sglang/bench_serving.py
+# Adapted from benchmark/hicache/bench_serving.py and python/sglang/benchmark/serving.py
 
 """
 Benchmark warm-cache serving with exact shared-prefix control.

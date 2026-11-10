@@ -19,8 +19,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
 
-from sglang.srt.managers.schedule_batch import (
-    Modality,
+from sglang.srt.managers.req_types import (
     MultimodalDataItem,
     MultimodalInputs,
     MultimodalProcessorOutput,
@@ -47,6 +46,7 @@ from sglang.srt.multimodal.media_artifacts.kimi_k3 import (
     KimiK3ResizeConfig,
 )
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sglang.srt.multimodal.processors.kimi_common import (
     KimiGridMMDataMixin,
@@ -538,9 +538,12 @@ def test_kimi_lazy_ipc_feature_skips_scheduler_reconstruction():
         hash=123,
         pad_value=456,
         offsets=[(0, 1)],
-        feature=proxy,
+        feature=torch.zeros(1, 2),
         model_specific_data={DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY: True},
     )
+
+    item.set_pad_value()
+    item.feature = proxy
 
     with patch(
         "sglang.srt.managers.schedule_batch.torch.cuda.current_device", return_value=0
@@ -748,7 +751,7 @@ def test_kimi_k3_cpu_prompt_uses_the_same_media_contract():
 
 def test_kimi_k3_epd_rebuild_uses_the_same_media_contract():
     processor = object.__new__(KimiK3ImageProcessor)
-    processor.processor_fingerprint = "epd-test-config"
+    processor.processor_fingerprint = "sha256:" + "ef" * 32
     processor.hf_config = SimpleNamespace(
         vision_config=SimpleNamespace(merge_kernel_size=(2, 2))
     )
@@ -1136,7 +1139,7 @@ def test_kimi_k3_artifact_and_data_item_share_hash_resolution():
     composed_item = processor.compose_request([1, 99, 2], [artifact]).mm_items[0]
 
     expected_hash = resolve_multimodal_item_hash(
-        existing_hash=direct_item.hash,
+        feature=direct_item.feature,
         namespace=artifact.artifact_key,
     )
     assert artifact.feature_hash == expected_hash

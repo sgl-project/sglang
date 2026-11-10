@@ -20,9 +20,11 @@ from sglang.srt.disaggregation.decode import (
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
 from sglang.srt.disaggregation.utils import MetadataBuffers, kv_layout_signature
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
+from sglang.srt.mem_cache.kv.router import PlainPoolRouter
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 
 def _ref_strided_adler32(tensors, indices, strides) -> int:
@@ -237,15 +239,23 @@ class TestKvChecksumComputer(unittest.TestCase):
         self.assertEqual(value, expected)
 
 
+def _plain_kv_pool():
+    """A one-sub-pool KV pool: no window sub-pool, no wrapped view."""
+    pool = SimpleNamespace(start_layer=0, layer_num=1)
+    pool.layer_router = PlainPoolRouter(pool, IdSpaceKind.FULL)
+    return pool
+
+
 class _FakeScheduler(SchedulerDisaggregationDecodeMixin):
     def __init__(self, computer, req_to_token):
         self.kv_checksum_computer = computer
         self.waiting_queue = []
         self.token_to_kv_pool_allocator = SimpleNamespace(
-            page_size=1, get_kvcache=lambda: SimpleNamespace()
+            page_size=1, get_kvcache=_plain_kv_pool
         )
         self.req_to_token_pool = SimpleNamespace(req_to_token=req_to_token)
         self.tree_cache = None
+        self.enable_hisparse = False
         self.output_streamer = SimpleNamespace(stream_output=self.stream_output)
         self.metrics_reporter = SimpleNamespace(enable_metrics=True)
         self.metrics_collector = Mock()
@@ -568,6 +578,30 @@ class TestGetNewPrebuiltBatchChecksum(unittest.TestCase):
         self.assertEqual(batch.reqs, [skipped])
         self.assertEqual(sched.streamed_aborts, [aborted])
         mock_abort.assert_called_once()
+
+
+class TestKvChecksumMismatchHiSparse(unittest.TestCase):
+    def test_mismatch_releases_hisparse_before_kv(self):
+        # Transfer already admitted the request into HiSparse; the abort must
+        # free its host pages before the KV itself.
+        sched = _FakeScheduler(None, None)
+        sched.enable_hisparse = True
+        calls = []
+        sched.hisparse_coordinator = Mock()
+        sched.hisparse_coordinator.request_finished.side_effect = lambda req: (
+            calls.append(("hisparse", req))
+        )
+        req = _make_req(0xDEADBEEF, 4)
+        with (
+            envs.SGLANG_IS_IN_CI.override(False),
+            patch("sglang.srt.disaggregation.decode.prepare_abort"),
+            patch(
+                "sglang.srt.disaggregation.decode.release_kv_cache",
+                side_effect=lambda req, *a, **kw: calls.append(("kv", req)),
+            ),
+        ):
+            sched._handle_kv_checksum_mismatch(req, "KV checksum mismatch")
+        self.assertEqual(calls, [("hisparse", req), ("kv", req)])
 
 
 _SENTINEL = object()

@@ -6,7 +6,7 @@ Graph row capacity is fixed while live token counts and prefix state can change.
 
 import torch
 
-from sglang.srt.arg_groups.overrides import (
+from sglang.srt.arg_groups.model_override_base import (
     model_config_of,
     resolved_view,
     resolving_view,
@@ -55,12 +55,7 @@ def _indexer_with_kv(
     output[logical:].fill_(-1)
 
 
-def _capture_stub(indexer, x, q_lora, positions, output, layer_id, kv_local, kv_output):
-    output.fill_(-1)
-    kv_output.zero_()
-
-
-bcg_indexer_with_kv = eager_on_graph(True, capture_stub=_capture_stub)(_indexer_with_kv)
+bcg_indexer_with_kv = eager_on_graph(True)(_indexer_with_kv)
 
 
 class InterleaveCPBCGInput(PrefillCPBCGInput):

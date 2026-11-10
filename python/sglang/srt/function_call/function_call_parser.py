@@ -60,6 +60,7 @@ from sglang.srt.function_call.utils import (
     _get_tool_schema_defs,
     get_json_schema_constraint,
 )
+from sglang.srt.function_call.xing4_0_detector import Xing4_0Detector
 from sglang.srt.parser.response_template import ResponseTemplateToolDetector
 
 logger = logging.getLogger(__name__)
@@ -87,6 +88,7 @@ class FunctionCallParser:
         "glm": Glm4MoeDetector,
         "glm45": Glm4MoeDetector,
         "glm47": Glm47MoeDetector,
+        "flint": Glm47MoeDetector,
         "gpt-oss": GptOssDetector,
         "k2_horizon": K2V3Detector,
         "kimi_k2": KimiK2Detector,
@@ -106,6 +108,7 @@ class FunctionCallParser:
         "spark25": Spark25Detector,
         "step3": Step3Detector,
         "step3p5": Qwen3CoderDetector,
+        "xing4_0": Xing4_0Detector,
         "minimax-m2": MinimaxM2Detector,
         "minimax-m3": MinimaxM3Detector,
         "nanbeige": Qwen3CoderDetector,

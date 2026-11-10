@@ -267,6 +267,8 @@ class StagingAllocator:
 
     # Permanent alloc failure: chunk exceeds ring buffer total size.
     ALLOC_OVERSIZED = -2
+    # Chunk already scattered; a late duplicate STAGING_REQ must not reallocate.
+    CHUNK_SCATTERED = -3
 
     def __init__(
         self,

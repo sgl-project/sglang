@@ -16,10 +16,8 @@ import httpx
 from fastapi import HTTPException, UploadFile
 from pydantic import BaseModel
 
-from sglang.multimodal_gen.configs.sample.sampling_params import (
-    DataType,
-    SamplingParams,
-)
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.configs.task_type import DataType
 from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
     ListLorasReq,
     MergeLoraWeightsReq,
@@ -30,6 +28,9 @@ from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
     format_lora_message,
     save_outputs,
+)
+from sglang.multimodal_gen.runtime.managers.request_cancel_error import (
+    RequestCancelledError,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.scheduler_client import AsyncSchedulerClient
@@ -575,6 +576,8 @@ async def process_generation_batch(
             scheduler_batches if scheduler_batches is not None else [batch]
         )
 
+        if result.cancelled:
+            raise RequestCancelledError(batch.client_request_ids())
         # failed finalization can leave tensors or encoded files attached
         if result.error:
             raise RuntimeError(

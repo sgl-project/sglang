@@ -20,6 +20,7 @@ TOOL_CALL_PARSER_NAMES = [
     "glm",
     "glm45",
     "glm47",
+    "flint",
     "gpt-oss",
     "k2_horizon",
     "kimi_k2",
@@ -52,4 +53,5 @@ TOOL_CALL_PARSER_NAMES = [
     "inkling",
     "iquest_q1",
     "response_template",
+    "xing4_0",
 ]

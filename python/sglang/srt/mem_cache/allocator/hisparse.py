@@ -300,6 +300,11 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
 
 class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
+    @property
+    def has_window_pool(self) -> bool:
+        # Wraps an SWA allocator and exposes its full interface.
+        return True
+
     def __init__(
         self,
         logical_attn_allocator: BaseTokenToKVPoolAllocator,

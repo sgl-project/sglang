@@ -492,7 +492,7 @@ export const config = {
   // sweep is 8k-in / 1k-out random, num_prompts = 5 × concurrency, cache-cold.
   benchmarkCommands: {
     speed:
-`python3 -m sglang.bench_serving \\
+`python3 -m sglang.benchmark.serving \\
   --backend sglang \\
   --host {{CURL_HOST}} --port {{CURL_PORT}} \\
   --model {{MODEL_NAME}} \\

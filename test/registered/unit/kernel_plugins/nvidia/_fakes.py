@@ -29,6 +29,10 @@ class FakeBuilt:
     """Covers steps of 1-4 rows and records the steps it ran."""
 
     draft_sampler = None
+    draft_loop = None
+    draft_extend = None
+    begin_draft_round = None
+    graph_variants = None
 
     def __init__(self, widths):
         self.widths = tuple(w for w in widths if w <= 4)
@@ -68,7 +72,25 @@ DRAFT = replace(
     SPEC,
     max_rows=0,
     build=lambda model, hf, ctx: SimpleNamespace(
-        widths=(), summary=lambda: "draft sampler", draft_sampler=print
+        widths=(),
+        summary=lambda: "draft sampler",
+        draft_sampler=print,
+        draft_loop=None,
+        draft_extend=None,
+        begin_draft_round=None,
+        graph_variants=None,
+    ),
+)
+# a draft spec offering two of the EAGLE entries
+EAGLE_DRAFT = replace(
+    DRAFT,
+    build=lambda model, hf, ctx: SimpleNamespace(
+        widths=(),
+        draft_sampler=None,
+        draft_loop=print,
+        draft_extend=None,
+        begin_draft_round=repr,
+        graph_variants=None,
     ),
 )
 

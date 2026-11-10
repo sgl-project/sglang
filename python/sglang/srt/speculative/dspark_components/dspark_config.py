@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any, List, Optional
 
 import msgspec
 
-from sglang.srt.arg_groups.overrides import resolved_view
+from sglang.srt.arg_groups.model_override_base import resolved_view
 from sglang.srt.runtime_context import (
     get_model,
     get_spec,
@@ -33,7 +33,7 @@ def get_dspark_sample_from_anchor(draft_hf_config: Any) -> bool:
 
 def draft_is_deepseek_v4() -> bool:
     from sglang.srt.configs.model_config import is_deepseek_v4
-    from sglang.srt.utils.hf_transformers_utils import get_config
+    from sglang.srt.utils.hf_transformers import get_config
 
     draft_model_path = get_spec().speculative_draft_model_path
     if not draft_model_path:
@@ -67,6 +67,7 @@ class DSparkDraftConfig(msgspec.Struct, frozen=True):
     mask_token_id: Optional[int]
     markov_rank: int
     markov_head_type: Optional[str]
+    is_mla: bool = False
 
     def resolve_gamma(self, *, default: Optional[int] = None) -> Optional[int]:
         return self.gamma if self.gamma is not None else default
@@ -143,7 +144,7 @@ def read_draft_checkpoint_config(*, server_args: ServerArgs) -> DSparkDraftConfi
     silently drops the checkpoint's gamma and the cross-check with
     `--speculative-num-draft-tokens` along with it.
     """
-    from sglang.srt.utils.hf_transformers_utils import get_config
+    from sglang.srt.utils.hf_transformers import get_config
 
     resolving = resolved_view(server_args)
     draft_hf_config = get_config(
@@ -319,4 +320,5 @@ def parse_dspark_draft_config(*, draft_hf_config: Any) -> DSparkDraftConfig:
         mask_token_id=mask_token_id,
         markov_rank=markov_rank,
         markov_head_type=markov_head_type,
+        is_mla=base.is_mla,
     )

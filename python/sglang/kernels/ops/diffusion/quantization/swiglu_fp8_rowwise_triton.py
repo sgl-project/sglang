@@ -5,6 +5,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.numerics import round_bf16_to_fp32
 
 
@@ -108,7 +109,7 @@ def fused_packed_swiglu_fp8_rowwise(x: torch.Tensor, row_alignment: int = 16):
         and 0 < x.shape[-1] // 2 <= 16384
         and x.stride(1) >= x.shape[-1]
         and (x.shape[0] <= 1 or x.stride(0) == x.shape[1] * x.stride(1))
-        and torch.cuda.get_device_capability(x.device) >= (8, 9)
+        and current_arch().is_sm_at_least(8, 9)
     ):
         raise ValueError(
             "requires row-strided packed BF16 [B,T,2*K], K in [1,16384], on SM89+"
@@ -128,13 +129,13 @@ def fused_packed_swiglu_fp8_rowwise(x: torch.Tensor, row_alignment: int = 16):
         num_warps = 4 if hidden <= 4096 else 8
         # SM89 measurements: extra warps help underfilled grids; eight win
         # on the model's large 3072/9216-wide rows without register spills.
-        if torch.cuda.get_device_capability(x.device) == (8, 9) and hidden in (
+        if current_arch().is_sm(8, 9) and hidden in (
             3072,
             9216,
         ):
             num_warps = 16 if padded_rows <= 64 else 8
         with torch.cuda.device(x.device):
-            if torch.cuda.get_device_capability(x.device) == (8, 9) and hidden == 9216:
+            if current_arch().is_sm(8, 9) and hidden == 9216:
                 # Nine exact-width tiles instead of a 16384-wide row; measured
                 # on SM89, with unchanged BF16 and E4M3 rounding boundaries.
                 _swiglu_fp8_rowwise_tiled_kernel[(padded_rows,)](
