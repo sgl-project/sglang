@@ -1460,8 +1460,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             req_pool_indices=forward_batch.req_pool_indices,
             positions=forward_batch.positions,
             window_left=layer.sliding_window_size,
-            dcp_size=parallel.dcp_size if parallel.dcp_enabled else 1,
-            dcp_rank=parallel.dcp_rank if parallel.dcp_enabled else 0,
+            dcp_size=parallel.attn_dcp_size,
+            dcp_rank=parallel.attn_dcp_rank,
             page_size=self.page_size,
             v2p=self.runner_ids.full_v2p_table,
         )
