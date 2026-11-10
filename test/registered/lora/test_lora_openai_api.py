@@ -58,7 +58,7 @@ class TestLoRAModelParameter(CustomTestCase):
         # `isinstance` guard, and there is no bag to answer from otherwise.
         reset_context()
         self.addCleanup(reset_context)
-        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+        publish(ServerArgs(model_path="dummy", enable_lora=True), role="tokenizer")
         self.tokenizer_manager = MockTokenizerManager(enable_lora=True)
         self.serving = ConcreteServingBase(self.tokenizer_manager)
 
@@ -78,6 +78,13 @@ class TestLoRAModelParameter(CustomTestCase):
         self.assertEqual(
             self.serving._resolve_lora_path(LOADED_ADAPTER, "python-expert"),
             LOADED_ADAPTER,
+        )
+
+    def test_bare_adapter_name_is_ignored_without_lora(self):
+        reset_context()
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+        self.assertEqual(
+            self.serving._parse_model_parameter(LOADED_ADAPTER), (LOADED_ADAPTER, None)
         )
 
     def test_served_model_name_wins_over_a_same_named_adapter(self):
