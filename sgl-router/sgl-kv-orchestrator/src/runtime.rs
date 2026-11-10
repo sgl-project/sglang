@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -403,6 +403,7 @@ struct Actor {
     last_route: BTreeMap<SessionIdentity, (String, Instant)>,
     tick_cursor: usize,
     events: BTreeMap<DemandId, (String, Value)>,
+    event_expirations: VecDeque<(Instant, DemandId)>,
     feedback: FeedbackCache,
 }
 impl Actor {
@@ -430,6 +431,7 @@ impl Actor {
             last_route: BTreeMap::new(),
             tick_cursor: 0,
             events: BTreeMap::new(),
+            event_expirations: VecDeque::new(),
             feedback: FeedbackCache::new(
                 config.max_workers,
                 config.max_operations,
@@ -1001,22 +1003,34 @@ impl Actor {
         };
         Ok(self.index.resolve(selector))
     }
+    fn expire_event_receipts(&mut self, now: Instant) {
+        while let Some((expires, key)) = self.event_expirations.front() {
+            if *expires > now {
+                break;
+            }
+            self.events.remove(key);
+            self.event_expirations.pop_front();
+        }
+    }
     fn api(&mut self, value: Value) -> Value {
-        let event_key = if value["kind"] == "session_event" {
+        let event = if value["kind"] == "session_event" {
             task(value.get("task").unwrap_or(&value), &self.config.caller_id)
                 .ok()
                 .zip(value["event_id"].as_str())
-                .map(|(task, id)| DemandId {
-                    task,
-                    id: id.into(),
+                .map(|(task, id)| {
+                    let key = DemandId {
+                        task,
+                        id: id.into(),
+                    };
+                    (key, digest(&value))
                 })
         } else {
             None
         };
-        let fingerprint = digest(&value);
-        if let Some(key) = &event_key {
+        if let Some((key, fingerprint)) = &event {
+            self.expire_event_receipts(Instant::now());
             if let Some((old, receipt)) = self.events.get(key) {
-                return if old == &fingerprint {
+                return if old == fingerprint {
                     receipt.clone()
                 } else {
                     error("conflict", "event ID payload conflict")
@@ -1048,7 +1062,7 @@ impl Actor {
             ),
         };
         if result["success"] == true {
-            if let Some(key) = event_key {
+            if let Some((key, fingerprint)) = event {
                 if matches!(
                     value["event"].as_str(),
                     Some("tool_wait" | "prepare" | "resume")
@@ -1057,6 +1071,9 @@ impl Actor {
                         .index
                         .advance_revision(&key.task, value["revision"].as_u64().unwrap_or(0));
                 }
+                // Receipt expiry does not change session revisions or tombstones.
+                let expires = Instant::now() + Duration::from_millis(self.config.operation_ttl_ms);
+                self.event_expirations.push_back((expires, key.clone()));
                 self.events.insert(key, (fingerprint, result.clone()));
             }
         }
@@ -1550,6 +1567,7 @@ impl Actor {
     }
     fn pump(&mut self) {
         let now = Instant::now();
+        self.expire_event_receipts(now);
         let expired: Vec<_> = self
             .intents
             .iter()

@@ -390,6 +390,43 @@ async fn event(router: &TestRouter, id: &str, event: &str, revision: u64, event_
 async fn start(router: &TestRouter, id: &str) {
     event(router, id, "task_started", 0, &format!("start-{id}")).await;
 }
+
+#[tokio::test]
+async fn lifecycle_replay_budget_recovers_without_reopening_a_retired_task() {
+    let engine = Engine::start().await;
+    let mut cfg = orchestration();
+    cfg.max_operations = 2;
+    cfg.operation_ttl_ms = 1000;
+    let router = router_with(&[&engine], false, Some(cfg)).await;
+    start(&router, "old").await;
+    let finished = event(&router, "old", "task_finished", 1, "finish").await;
+    assert_eq!(
+        event(&router, "old", "task_finished", 1, "finish").await,
+        finished
+    );
+
+    let client = reqwest::Client::new();
+    let start_response = |name| {
+        client
+            .post(format!("{}/v1/kv/control", router.url))
+            .bearer_auth("test-control")
+            .json(
+                &json!({"kind":"session_event","event":"task_started","task":task(name),
+                "event_id":format!("start-{name}"),"revision":0}),
+            )
+            .send()
+    };
+    let before: Value = start_response("fresh").await.unwrap().json().await.unwrap();
+    assert_eq!(before["error"]["code"], "capacity");
+
+    // The bounded receipt cache expires; the retired incarnation is still fenced.
+    tokio::time::sleep(Duration::from_millis(1050)).await;
+    let retired: Value = start_response("old").await.unwrap().json().await.unwrap();
+    assert_eq!(retired["error"]["reason"], "RetiredIncarnation");
+    let after: Value = start_response("fresh").await.unwrap().json().await.unwrap();
+    assert_eq!(after["data"]["state"], "active");
+}
+
 async fn submit(
     router: &TestRouter,
     id: &str,
