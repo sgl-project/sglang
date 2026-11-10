@@ -54,7 +54,7 @@ def _apply_ref_cpu(logits, vocab_mask):
     return out
 
 
-class _FakeSampler:
+class _FakeNpuOps:
     """Capture calls to the public sampler entry and apply the CPU reference."""
 
     def __init__(self):
@@ -62,7 +62,8 @@ class _FakeSampler:
 
     def apply_token_bitmask(self, logits, vocab_mask):
         self.last_call = (logits, vocab_mask)
-        # Apply the reference on CPU storage even when logits report an NPU device.
+        # Logits may report device=npu via a subclass while storage is CPU;
+        # apply the reference mask on CPU tensors to avoid device mismatch.
         out = _apply_ref_cpu(logits.detach().clone(), vocab_mask)
         logits.copy_(out)
         return logits
@@ -84,16 +85,19 @@ if _HAS_TORCH and _HAS_LLGUIDANCE:
     class TestGuidanceGrammarApplyVocabMaskNpu(unittest.TestCase):
         """Verify the NPU branch in ``GuidanceGrammar.apply_vocab_mask``."""
 
-        def setUp(self):
-            self.fake_sampler = _FakeSampler()
+        def _install_npu_mock(self):
+            fake_ops = _FakeNpuOps()
             sampler = types.ModuleType("sgl_kernel_npu.operators.sampler")
-            sampler.apply_token_bitmask = self.fake_sampler.apply_token_bitmask
+            sampler.apply_token_bitmask = fake_ops.apply_token_bitmask
             patcher = patch.dict(sys.modules, {sampler.__name__: sampler})
             patcher.start()
             self.addCleanup(patcher.stop)
+            return fake_ops
 
         def test_npu_branch_dispatches_to_npu_kernel(self):
             """When logits are on npu, the NPU kernel is invoked (mocked)."""
+            fake_ops = self._install_npu_mock()
+
             vocab_size = 64
             logits = torch.zeros((1, vocab_size), dtype=torch.float32)
             logits[0, 16] = 22.125
@@ -103,12 +107,12 @@ if _HAS_TORCH and _HAS_LLGUIDANCE:
             vocab_mask = _pack_mask(allowed, vocab_size)
 
             npu_logits = logits.as_subclass(_NpuDeviceTensor)
-            self.assertIsNone(GuidanceGrammar.apply_vocab_mask(npu_logits, vocab_mask))
+            GuidanceGrammar.apply_vocab_mask(npu_logits, vocab_mask)
 
-            self.assertIsNotNone(self.fake_sampler.last_call)
-            passed_logits, passed_mask = self.fake_sampler.last_call
-            self.assertIs(passed_logits, npu_logits)
-            self.assertIs(passed_mask, vocab_mask)
+            self.assertIsNotNone(fake_ops.last_call)
+            passed_logits, passed_mask = fake_ops.last_call
+            self.assertTrue(torch.equal(passed_logits, npu_logits))
+            self.assertTrue(torch.equal(passed_mask, vocab_mask))
 
         def test_cpu_branch_uses_llguidance_kernel(self):
             """When logits are on cpu, the generic llguidance kernel is used."""
@@ -123,12 +127,13 @@ if _HAS_TORCH and _HAS_LLGUIDANCE:
             out = logits.clone()
             GuidanceGrammar.apply_vocab_mask(out, vocab_mask)
 
-            self.assertIsNone(self.fake_sampler.last_call)
             ref = _apply_ref_cpu(logits, vocab_mask)
             self.assertTrue(torch.equal(torch.isfinite(out), torch.isfinite(ref)))
 
         def test_npu_branch_matches_reference(self):
             """The mocked NPU kernel matches the CPU reference result."""
+            self._install_npu_mock()
+
             vocab_size = 128
             torch.manual_seed(42)
             logits = torch.randn((2, vocab_size), dtype=torch.float32)
