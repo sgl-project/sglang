@@ -23,7 +23,7 @@ Under PD disaggregation prefill sends a request's last window of ring rows
 """
 
 from contextlib import nullcontext
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -113,6 +113,16 @@ def draft_kv_ring_pool_rows(
 ) -> int:
     rows = 1 + req_pool_rows * rows_per_req
     return -(-rows // page_size) * page_size
+
+
+def draft_ring_row_pairs(
+    src_rows: Sequence[int], dst_rows: Sequence[int]
+) -> Tuple[List[int], List[int]]:
+    """The (prefill, decode) ring rows a DRAFT_RING transfer copies, from two
+    position-matched ``transfer_rows``: a position goes only where both ranks
+    own it (row 0 marks one a rank does not own under DCP)."""
+    pairs = [(a, b) for a, b in zip(src_rows, dst_rows) if a and b]
+    return [a for a, _ in pairs], [b for _, b in pairs]
 
 
 class DFlashDraftKVRing:

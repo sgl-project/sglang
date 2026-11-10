@@ -83,6 +83,7 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.dflash_draft_ring import draft_ring_row_pairs
 from sglang.srt.utils.network import NetworkAddress
 
 logger = logging.getLogger(__name__)
@@ -2441,16 +2442,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     else:
                         dst_indices_local = dst_indices_local[: len(src_indices)]
                 if st == StateType.DRAFT_RING:
-                    # Row 0 marks a position one side's DCP rank does not own.
-                    pairs = [
-                        (a, b)
-                        for a, b in zip(src_indices, dst_indices_local)
-                        if a and b
-                    ]
-                    if not pairs:
+                    src_indices, dst_indices_local = draft_ring_row_pairs(
+                        src_indices, dst_indices_local
+                    )
+                    if not src_indices:
                         continue
-                    src_indices = [a for a, _ in pairs]
-                    dst_indices_local = [b for _, b in pairs]
                 if slice_kv_heads:
                     rc = (
                         self._send_swa_state_slice(
