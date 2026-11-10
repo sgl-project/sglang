@@ -1462,13 +1462,13 @@ class CosmosDreamsRolloutStage(PipelineStage):
                     rows, frame_start=0, frame_end=1, context=context
                 )
                 if target_frame > 1:
-                    history = self._commit_clean_frame(
+                    history = self._commit_clean_chunk(
                         context,
                         history,
                         initial_latent,
                         frame_idx=0,
                         action=action,
-                        null_action=bool(null_indexes),
+                        null_indexes=null_indexes,
                         domain_ids=context.chunk_domain_ids(
                             0, 1, manifest.action_tokens_per_frame
                         ),
@@ -1510,43 +1510,68 @@ class CosmosDreamsRolloutStage(PipelineStage):
                     if selector is None
                     else selector.select(chunk_start, chunk_end)
                 )
+                read_history = _history_view(
+                    history, selected, context.tokens_per_frame
+                )
                 clean_chunk = self._denoise_chunk(
                     context,
                     noise,
                     seed=seed,
-                    history=_history_view(history, selected, context.tokens_per_frame),
+                    history=read_history,
                     frame_start=chunk_start,
                     action=action,
                     null_indexes=null_indexes,
                     domain_ids=chunk_domains,
                 )
-                for local_idx, frame_idx in iter_clean_commit_frames(
-                    chunk_start, chunk_end, target_frame=target_frame
-                ):
-                    # The framewise refresh also sees the chunk's already-committed frames.
-                    read_history = (
-                        None
-                        if selected is None
-                        else _history_view(
-                            history,
-                            selected + list(range(chunk_start, frame_idx)),
-                            context.tokens_per_frame,
-                        )
-                    )
-                    history = self._commit_clean_frame(
+                clean_count = max(0, min(chunk_end, target_frame - 1) - chunk_start)
+                if clean_count and not null_indexes:
+                    history = self._commit_clean_chunk(
                         context,
                         history,
-                        clean_chunk[:, :, local_idx : local_idx + 1],
-                        frame_idx=frame_idx,
-                        action=action[
-                            :, local_idx * action_count : (local_idx + 1) * action_count
-                        ],
-                        null_action=local_idx in null_indexes,
-                        domain_ids=frame_domain_ids(
-                            chunk_domains, local_idx, action_count
+                        clean_chunk[:, :, :clean_count],
+                        frame_idx=chunk_start,
+                        action=action[:, : clean_count * action_count],
+                        null_indexes=(),
+                        domain_ids=(
+                            chunk_domains
+                            if chunk_domains.ndim == 1
+                            else chunk_domains[:, : clean_count * action_count]
                         ),
-                        read_history=read_history,
+                        read_history=read_history if selected is not None else None,
                     )
+                else:
+                    # Null actions use the single-frame RoPE convention during
+                    # clean refresh, so these chunks still refresh framewise.
+                    for local_idx, frame_idx in iter_clean_commit_frames(
+                        chunk_start, chunk_end, target_frame=target_frame
+                    ):
+                        # The framewise refresh also sees the chunk's already-committed frames.
+                        read_history = (
+                            None
+                            if selected is None
+                            else _history_view(
+                                history,
+                                selected + list(range(chunk_start, frame_idx)),
+                                context.tokens_per_frame,
+                            )
+                        )
+                        history = self._commit_clean_chunk(
+                            context,
+                            history,
+                            clean_chunk[:, :, local_idx : local_idx + 1],
+                            frame_idx=frame_idx,
+                            action=action[
+                                :,
+                                local_idx * action_count : (local_idx + 1)
+                                * action_count,
+                            ],
+                            null_indexes=(0,) if local_idx in null_indexes else (),
+                            domain_ids=frame_domain_ids(
+                                chunk_domains, local_idx, action_count
+                            ),
+                            read_history=read_history,
+                        )
+                del read_history
                 latents.append(clean_chunk)
                 if decode_queue is not None:
                     decode_queue.submit(clean_chunk)
@@ -1613,7 +1638,7 @@ class CosmosDreamsRolloutStage(PipelineStage):
             null_action_frame_indexes=null_indexes,
         )
 
-    def _commit_clean_frame(
+    def _commit_clean_chunk(
         self,
         context: _RolloutContext,
         history: list[KVPair] | None,
@@ -1621,11 +1646,42 @@ class CosmosDreamsRolloutStage(PipelineStage):
         *,
         frame_idx: int,
         action: torch.Tensor,
-        null_action: bool,
+        null_indexes: tuple[int, ...],
         domain_ids: torch.Tensor | None = None,
-        read_history: HistoryKV | None = None,
+        read_history: SelectedHistory | None = None,
     ) -> list[KVPair]:
-        """Refresh one clean frame (timestep 0, no time embedding) and commit its K/V."""
+        """Batch clean projections while preserving per-frame attention and eviction."""
+        clean_frame_ranges = None
+        if latent.shape[2] > 1:
+            tokens = context.tokens_per_frame
+            text_tokens = context.text_kv[0][0].shape[1]
+            if read_history is None:
+                history_frames = (
+                    0 if history is None else history[0][0].shape[1] // tokens
+                )
+                sink, window = self.profile.sink_frames, self.profile.window_frames
+            else:
+                # Frustum selection is fixed for this chunk. Use its compact
+                # length without gathering K/V or evicting any selected frames.
+                history_frames = len(read_history.frame_ids)
+                sink, window = 0, None
+            ranges = []
+            for frame in range(latent.shape[2]):
+                past = history_frames + frame
+                sink_end = min(sink, past)
+                window_start = (
+                    max(sink_end, past - window) if window is not None else sink_end
+                )
+                # Token offsets in [text | history | current chunk]. The window
+                # advances per frame, exactly as in sequential clean commits.
+                ranges.append(
+                    (
+                        text_tokens + sink_end * tokens,
+                        text_tokens + window_start * tokens,
+                        text_tokens + (past + 1) * tokens,
+                    )
+                )
+            clean_frame_ranges = tuple(ranges)
         return commit_clean_kv(
             self.transformer,
             latent,
@@ -1640,5 +1696,6 @@ class CosmosDreamsRolloutStage(PipelineStage):
             fps=context.fps,
             action_latents=action,
             action_domain_ids=context.domain_ids if domain_ids is None else domain_ids,
-            null_action_frame_indexes=(0,) if null_action else (),
+            null_action_frame_indexes=null_indexes,
+            clean_frame_ranges=clean_frame_ranges,
         )

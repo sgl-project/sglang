@@ -204,6 +204,7 @@ def _joint_attention(
     cos_sin_cache: torch.Tensor,
     rope_positions: torch.Tensor,
     null_token_slices: list[slice],
+    clean_frame_ranges: tuple[tuple[int, int, int], ...] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """One softmax over ``[prefix (text + history) | current chunk]``.
 
@@ -233,9 +234,31 @@ def _joint_attention(
     v = v.contiguous()
     for null_slice in null_token_slices:
         v[:, null_slice] = 0.0
-    out = attention.attn(
-        q, torch.cat([prefix_k, k], dim=1), torch.cat([prefix_v, v], dim=1)
-    )
+    all_k = torch.cat([prefix_k, k], dim=1)
+    all_v = torch.cat([prefix_v, v], dim=1)
+    if clean_frame_ranges is not None:
+        # Batch the projections, but keep attention frame-causal. Each frame
+        # reads text + sinks and its own sliding window, including itself.
+        tokens = seq_len // len(clean_frame_ranges)
+        outputs = []
+        for frame, (sink_end, window_start, frame_end) in enumerate(clean_frame_ranges):
+            if window_start <= sink_end:
+                frame_k, frame_v = all_k[:, :frame_end], all_v[:, :frame_end]
+            else:
+                frame_k = torch.cat(
+                    [all_k[:, :sink_end], all_k[:, window_start:frame_end]], dim=1
+                )
+                frame_v = torch.cat(
+                    [all_v[:, :sink_end], all_v[:, window_start:frame_end]], dim=1
+                )
+            outputs.append(
+                attention.attn(
+                    q[:, frame * tokens : (frame + 1) * tokens], frame_k, frame_v
+                )
+            )
+        out = torch.cat(outputs, dim=1)
+    else:
+        out = attention.attn(q, all_k, all_v)
     out, _ = attention.to_out(out.reshape(batch_size, seq_len, -1))
     return out, k, v
 
@@ -410,6 +433,7 @@ class CosmosDreamsTransformer(Cosmos3OmniTransformer):
         action_domain_ids: torch.Tensor | None = None,
         history_kv: HistoryKV | None = None,
         condition_vision: bool = False,
+        clean_frame_ranges: tuple[tuple[int, int, int], ...] | None = None,
         null_action_frame_indexes: Sequence[int] = (),
     ) -> CosmosDreamsForwardOutput:
         """Denoise (``condition_vision=False``) or clean-refresh one current chunk.
@@ -421,6 +445,8 @@ class CosmosDreamsTransformer(Cosmos3OmniTransformer):
         embedding so the returned K/V are clean history; a control clip is
         committed with ``condition_vision=True`` exactly like a clean frame.
         """
+        if clean_frame_ranges is not None and not condition_vision:
+            raise ValueError("Frame-causal attention is only for clean refresh.")
         self._validate_forward_inputs(
             hidden_states, timestep, text_kv=text_kv, history_kv=history_kv
         )
@@ -479,6 +505,7 @@ class CosmosDreamsTransformer(Cosmos3OmniTransformer):
                 cos_sin_cache=cos_sin_cache,
                 rope_positions=rope_positions,
                 null_token_slices=null_slices,
+                clean_frame_ranges=clean_frame_ranges,
             )
             current_kv.append((k, v))
 

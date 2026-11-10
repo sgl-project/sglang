@@ -312,7 +312,7 @@ class CosmosDreamsRealtimeRolloutStage(CosmosDreamsRolloutStage):
             )
             # Every frame is committed: the next tick reads all of them.
             for local_idx, frame_idx in enumerate(range(chunk_start, chunk_end)):
-                state.history = self._commit_clean_frame(
+                state.history = self._commit_clean_chunk(
                     context,
                     state.history,
                     clean_chunk[:, :, local_idx : local_idx + 1],
@@ -320,7 +320,7 @@ class CosmosDreamsRealtimeRolloutStage(CosmosDreamsRolloutStage):
                     action=action[
                         :, local_idx * action_count : (local_idx + 1) * action_count
                     ],
-                    null_action=local_idx in null_indexes,
+                    null_indexes=(0,) if local_idx in null_indexes else (),
                 )
             outputs.append(clean_chunk)
             state.next_frame = chunk_end
@@ -345,13 +345,13 @@ class CosmosDreamsRealtimeRolloutStage(CosmosDreamsRolloutStage):
             device=context.device,
             dtype=context.dtype,
         )
-        state.history = self._commit_clean_frame(
+        state.history = self._commit_clean_chunk(
             context,
             state.history,
             latent,
             frame_idx=0,
             action=null_action,
-            null_action=True,
+            null_indexes=(0,),
         )
         state.pending_image_latent = None
         state.next_frame = 1
