@@ -2,6 +2,13 @@ name: Nightly Test (NPU)
 on:
   schedule:
     - cron: '0 16 * * *'  # Execute at 0:00 a.m. Beijing Time every day
+  # TEMP: trigger the nightly pipeline from a PR that modifies this workflow,
+  # to validate the 27B 1080p expandable_segments fix.
+  pull_request:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/nightly-test-npu.yml"
   workflow_dispatch:
     inputs:
       ref:
@@ -119,7 +126,7 @@ jobs:
 
   nightly-1-npu-a3:
     name: nightly-1-npu-a3
-    if: ${{ !cancelled() }}
+    if: false # TEMP: disabled to validate only the 27B 1080p expandable_segments fix
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -134,7 +141,7 @@ jobs:
 
   nightly-2-npu-a3:
     name: nightly-2-npu-a3
-    if: ${{ !cancelled() }}
+    if: false # TEMP: disabled to validate only the 27B 1080p expandable_segments fix
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -150,7 +157,7 @@ jobs:
   # The nightly-4-npu-a3 suite is split across 2 parallel partition jobs, mirroring base-b-test-4-npu-a3 in the PR pipeline.
   nightly-4-npu-a3:
     name: nightly-4-npu-a3
-    if: ${{ !cancelled() }}
+    if: false # TEMP: disabled to validate only the 27B 1080p expandable_segments fix
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -166,7 +173,7 @@ jobs:
 
   nightly-8-npu-a3:
     name: nightly-8-npu-a3
-    if: ${{ !cancelled() }}
+    if: false # TEMP: disabled to validate only the 27B 1080p expandable_segments fix
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -181,7 +188,7 @@ jobs:
 
   nightly-16-npu-a3:
     name: nightly-16-npu-a3
-    if: ${{ !cancelled() }}
+    if: false # TEMP: disabled to validate only the 27B 1080p expandable_segments fix
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -196,7 +203,7 @@ jobs:
 
   nightly-perf-2-npu-a3:
     name: nightly-perf-2-npu-a3
-    if: ${{ !cancelled() }}
+    if: false # TEMP: disabled to validate only the 27B 1080p expandable_segments fix
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -210,9 +217,27 @@ jobs:
       device_type_for_deps: 'a3'
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
 
+  # TEMP: dedicated job that runs only the 27B 1080p perf case with
+  # PYTORCH_NPU_ALLOC_CONF=expandable_segments:True, to validate the OOM fix.
+  # Remove together with the temporary suite registration after validation.
+  nightly-perf-2-npu-a3-temp-27b-1080p:
+    name: nightly-perf-2-npu-a3-temp-27b-1080p
+    needs: [set-image-config]
+    uses: ./.github/workflows/_npu-single-node-test-stage.yml
+    with:
+      runner: linux-aarch64-a3-800t-2
+      test_type: 'perf'
+      test_suite: nightly-perf-2-npu-a3-temp-27b-1080p
+      is_nightly_pipeline_job: true
+      skip_pr_test_health_check: 'true'
+      image: ${{ needs.set-image-config.outputs.image_a3 }}
+      install_sglang_deps: false
+      device_type_for_deps: 'a3'
+      run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
+
   nightly-perf-4-npu-a3:
     name: nightly-perf-4-npu-a3
-    if: ${{ !cancelled() }}
+    if: false # TEMP: disabled to validate only the 27B 1080p expandable_segments fix
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -228,7 +253,7 @@ jobs:
 
   nightly-perf-16-npu-a3:
     name: nightly-perf-16-npu-a3
-    if: ${{ !cancelled() }}
+    if: false # TEMP: disabled to validate only the 27B 1080p expandable_segments fix
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -246,7 +271,7 @@ jobs:
   # The acc-2 suite is split across 4 parallel partition jobs via the single `partitions` input.
   nightly-acc-2-npu-a3:
     name: nightly-acc-2-npu-a3
-    if: ${{ !cancelled() }}
+    if: false # TEMP: disabled to validate only the 27B 1080p expandable_segments fix
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -263,7 +288,7 @@ jobs:
 
   nightly-acc-16-npu-a3:
     name: nightly-acc-16-npu-a3
-    if: ${{ !cancelled() }}
+    if: false # TEMP: disabled to validate only the 27B 1080p expandable_segments fix
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -279,7 +304,7 @@ jobs:
 
   nightly-acc-4-npu-a5:
      name: nightly-acc-4-npu-a5
-     if: ${{ !cancelled() }}
+     if: false # TEMP: disabled to validate only the 27B 1080p expandable_segments fix
      needs: [set-image-config]
      uses: ./.github/workflows/_npu-single-node-test-stage.yml
      with:
@@ -294,7 +319,7 @@ jobs:
        run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
   nightly-poc-multi-node-tests:
     name: multi-node-poc
-    if: ${{ !cancelled() }}
+    if: false # TEMP: disabled to validate only the 27B 1080p expandable_segments fix
     needs: [set-image-config, nightly-perf-2-npu-a3, nightly-perf-4-npu-a3, nightly-perf-16-npu-a3, nightly-acc-2-npu-a3, nightly-acc-16-npu-a3]
     strategy:
       fail-fast: false
@@ -381,7 +406,7 @@ jobs:
 
   nightly-poc-multi-node-mix-tests:
     name: multi-node-mix-poc
-    if: ${{ !cancelled() }}
+    if: false # TEMP: disabled to validate only the 27B 1080p expandable_segments fix
     needs: [set-image-config, nightly-perf-2-npu-a3, nightly-perf-4-npu-a3, nightly-perf-16-npu-a3, nightly-acc-2-npu-a3, nightly-acc-16-npu-a3, nightly-poc-multi-node-tests]
     strategy:
       fail-fast: false
@@ -425,7 +450,7 @@ jobs:
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
 
   check-all-jobs:
-    if: ${{ !cancelled() }}
+    if: false # TEMP: disabled to validate only the 27B 1080p expandable_segments fix
     needs:
       - nightly-1-npu-a3
       - nightly-2-npu-a3

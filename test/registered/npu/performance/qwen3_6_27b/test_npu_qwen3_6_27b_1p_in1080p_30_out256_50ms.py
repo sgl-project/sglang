@@ -14,7 +14,17 @@ register_npu_ci(
     nightly=True,
 )
 
+# TEMP: isolated suite used only by the expandable_segments validation PR.
+register_npu_ci(
+    est_time=3600,
+    suite="nightly-perf-2-npu-a3-temp-27b-1080p",
+    nightly=True,
+)
+
 QWEN3_6_27B_1080P_ENVS = {
+    # Avoid the fragmentation-driven OOM when a 37-image 1080p ViT batch is
+    # captured by the ViT NPU graph runner (same setting as the 1024x1024 case).
+    "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
     "STREAMS_PER_DEVICE": "32",
     "HCCL_SOCKET_IFNAME": "lo",
     "GLOO_SOCKET_IFNAME": "lo",

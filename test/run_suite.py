@@ -205,6 +205,8 @@ NIGHTLY_SUITES = {
         "nightly-acc-16-npu-a3",
         "nightly-acc-4-npu-a5",
         "nightly-perf-2-npu-a3",
+        # TEMP: isolated suite for the 27B 1080p expandable_segments validation PR.
+        "nightly-perf-2-npu-a3-temp-27b-1080p",
         "nightly-perf-4-npu-a3",
         "nightly-perf-16-npu-a3",
         "nightly-perf-16-npu-a3-cann910",
