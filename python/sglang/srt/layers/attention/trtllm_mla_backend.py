@@ -211,10 +211,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     # [bs, draft_token_num] layout in forward_extend; metadata stays uniform.
     supports_ragged_verify_graph: bool = True
 
-    # Log base of the LSE the DCP merge expects from this backend's partials
-    # (is_mla_dcp_lse_base_on_e): trtllm-gen returns base 2.
-    dcp_lse_base_on_e: bool = False
-
     def update_verify_buffers_to_fill_after_draft(self, spec_info, cuda_graph_bs):
         pass
 
@@ -1520,6 +1516,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         from sglang.srt.layers.attention.dsa.dsa_dcp import (
             dcp_trtllm_sparse_attention,
         )
+        from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla import (
+            is_mla_dcp_lse_base_on_e,
+        )
 
         bs, q_len, heads, head_dim = q.shape
         rows = bs * q_len
@@ -1561,8 +1560,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         if not get_parallel().dcp_enabled:
             return out.reshape(rows, -1)
         lse = lse[:, :heads]
-        if self.dcp_lse_base_on_e:
-            lse = lse * math.log(2.0)  # -inf rows (no owned key) stay -inf
+        # trtllm-gen returns a base-2 LSE; the DCP merge reads the base from the
+        # backend name. -inf rows (no owned key) stay -inf.
+        if is_mla_dcp_lse_base_on_e(self.decode_attention_backend_str):
+            lse = lse * math.log(2.0)
         return out.contiguous().flatten(1), lse.contiguous()
 
     def forward_extend(
