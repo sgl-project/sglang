@@ -106,7 +106,7 @@ url = "https://pypi.org/simple"
 default = true
 
 [project.optional-dependencies]
-checkpoint-engine = ["checkpoint-engine==0.1.2"]
+checkpoint-engine = ["checkpoint-engine==0.4.0"]
 runai = ["runai-model-streamer[s3,gcs,azure]>=0.15.7"]
 diffusion = [
   "addict==2.4.0",

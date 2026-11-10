@@ -355,3 +355,27 @@ def resolve_language_model(model: nn.Module) -> nn.Module:
     if hasattr(model, "language_model"):
         return model.language_model
     return model.model
+
+
+def restore_weights_before_loading(model: nn.Module) -> None:
+    """Restore modules back to checkpoint-loading layout before online updates.
+
+    Some quantization schemes, such as compressed-tensors Marlin MoE, repack
+    weights into a runtime-optimized layout after loading. External update
+    paths must first restore those parameters to their checkpoint-loading
+    layout before calling `model.load_weights(...)` again.
+    """
+
+    for _, module in model.named_modules():
+        restorer = None
+
+        quant_method = getattr(module, "quant_method", None)
+        if quant_method is not None:
+            restorer = getattr(quant_method, "restore_weights_before_loading", None)
+
+        if restorer is None and hasattr(module, "scheme"):
+            restorer = getattr(module.scheme, "restore_weights_before_loading", None)
+
+        if callable(restorer):
+            restorer(module)
+
