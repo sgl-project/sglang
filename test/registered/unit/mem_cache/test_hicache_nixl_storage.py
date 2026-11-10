@@ -1122,6 +1122,52 @@ class TestDocaMemosNixl(unittest.TestCase):
         dummy.batch_get_v2([transfer])
         self.assertTrue(torch.all(host.conv_buffer[0][0] == 7))
 
+    def test_batch_set_get_v2_rejects_mismatched_indices_before_chunking(self):
+        from unittest.mock import patch
+
+        from sglang.srt.mem_cache.hicache_storage import STORAGE_BATCH_SIZE
+
+        page_count = STORAGE_BATCH_SIZE + 1
+        cases = (
+            ("none", None),
+            ("extra", torch.arange(page_count + 1, dtype=torch.int64)),
+            ("short", torch.arange(page_count - 1, dtype=torch.int64)),
+        )
+        for label, host_indices in cases:
+            with self.subTest(label=label):
+                dummy = self._make_registration_target()
+                host = MockHybridPool(num_pages=page_count, expose_zero_copy=True)
+                host.layout = "page_first"
+                with patch(
+                    "sglang.srt.mem_cache.storage.nixl.hicache_nixl.tensor_uses_hugepage",
+                    return_value=True,
+                ):
+                    dummy.register_mem_host_pool_v2(host, PoolName.MAMBA)
+                self.assertTrue(dummy._hybrid_pool_ctx[PoolName.MAMBA].is_zero_copy)
+
+                xfer_calls = []
+
+                def fake_xfer(keys, key_strs, host_buffers, direction):
+                    xfer_calls.append(direction)
+                    return [True] * len(key_strs)
+
+                dummy._batch_xfer = fake_xfer
+                transfer = PoolTransfer(
+                    name=PoolName.MAMBA,
+                    keys=[f"k{i}" for i in range(page_count)],
+                    host_indices=host_indices,
+                )
+                self.assertEqual(
+                    dummy.batch_set_v2([transfer]),
+                    {PoolName.MAMBA: [False] * page_count},
+                )
+                self.assertEqual(
+                    dummy.batch_get_v2([transfer]),
+                    {PoolName.MAMBA: [False] * page_count},
+                )
+                # No chunk may transfer when the full transfer is invalid.
+                self.assertEqual(xfer_calls, [])
+
     def test_asymmetric_kv_set_get(self):
         from unittest.mock import patch
 

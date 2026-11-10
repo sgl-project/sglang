@@ -760,6 +760,15 @@ class HiCacheNixl(HiCacheStorage):
             return
 
         page_size = getattr(ctx.host_pool, "page_size", 1) or 1
+        expected = len(keys) * page_size
+        if host_indices is None or host_indices.numel() != expected:
+            logger.error(
+                "HiCacheNixl: pool %s indices length mismatch: expected %s, got %s",
+                transfer.name,
+                expected,
+                host_indices.numel() if host_indices is not None else 0,
+            )
+            return
         for start in range(0, len(keys), STORAGE_BATCH_SIZE):
             end = min(start + STORAGE_BATCH_SIZE, len(keys))
             index_start = start * page_size
