@@ -7,7 +7,7 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.utils.device import is_hip
+from sglang.srt.utils.device import is_gfx95_supported, is_hip
 
 try:
     import flashinfer.comm  # noqa: F401
@@ -332,11 +332,10 @@ if HAS_TILELANG:
             Logits: T.Tensor([batch, max_model_len], T.float32),  # type: ignore
             Scale: T.float32,
         ):
-            # A fixed number of CTAs per row strides over that row's groups, so the
-            # grid no longer scales with the page-table width (the max context).
-            # With groups_per_cta > 0 (ROCm) each CTA scores that many consecutive
-            # groups instead and the grid spans the page table; CTAs past a row's
-            # context exit at once.
+            # groups_per_cta == 0: a fixed number of CTAs per row strides over that
+            # row's groups, so the grid does not scale with the page-table width.
+            # groups_per_cta > 0: each CTA scores that many consecutive groups and
+            # the grid spans the page table; CTAs past a row's context exit at once.
             grid_y = (
                 T.ceildiv(T.ceildiv(max_pages, sub_pages), groups_per_cta)
                 if groups_per_cta > 0
@@ -564,11 +563,11 @@ _DECODE_CTAS_PER_ROW_LEVELS = (1, 16, 256)
 # CUDA MMA accepts an eight-wide N dimension, while ROCm MFMA requires sixteen;
 # the indexer pads Q to this in its fused prep so the wrapper need not copy it.
 QSA_DECODE_HEAD_ALIGNMENT = 16 if is_hip() else 8
-# Four wavefronts per CTA on ROCm: about 1.5x faster than 128 threads on MI355X.
-_DECODE_THREADS = 256 if is_hip() else 128
-# ROCm: four consecutive groups per CTA over a page-table-wide grid is 1.2-1.7x
-# faster than the fixed CTAs per row on MI355X at 50k-200k context (bit-exact).
-_DECODE_GROUPS_PER_CTA = 4 if is_hip() else 0
+# Four wavefronts per CTA: about 1.5x faster than 128 threads on MI355X (gfx950).
+_DECODE_THREADS = 256 if is_gfx95_supported() else 128
+# Four consecutive groups per CTA over a page-table-wide grid: 1.2-1.7x faster than
+# the fixed CTAs per row on MI355X at 50k-200k context (bit-exact).
+_DECODE_GROUPS_PER_CTA = 4 if is_gfx95_supported() else 0
 
 
 @functools.lru_cache(maxsize=None)
@@ -621,7 +620,8 @@ def tilelang_qsa_mqa_decode(
             dtype=torch.float32,
             device=q.device,
         )
-    if not q.shape[0] or not max_model_len:
+    # An empty page table would give the page-table-wide grid zero CTAs.
+    if not q.shape[0] or not max_model_len or not page_table.shape[1]:
         return logits
     # Zero-padding preserves the weight-free head sum.
     query_heads, head_dim = q.shape[1:]
