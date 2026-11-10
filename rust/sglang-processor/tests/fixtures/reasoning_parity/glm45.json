@@ -1,0 +1,181 @@
+{
+  "parser": "glm45",
+  "inputs": [
+    {"chunks": ["The user", " greets me.", "</think>", "Hello!"]},
+    {"chunks": ["Let me think</th", "ink>Answer"]},
+    {"chunks": ["<think>", "reason", "</think>", "done"]},
+    {"chunks": ["I should call a tool", "<tool_", "call>get_weather</tool_call>"]},
+    {"chunks": ["mention <tool_call> inline", "</think>", "ans"]},
+    {"chunks": ["ends at <tool_"]}
+  ],
+  "cases": [
+    {
+      "input": 0,
+      "force": true,
+      "stream": true,
+      "steps": [["The user", ""], [" greets me.", ""], ["", ""], ["", "Hello!"], ["", ""]],
+      "unary": ["The user greets me.", "Hello!"]
+    },
+    {
+      "input": 0,
+      "force": true,
+      "stream": false,
+      "steps": [["", ""], ["", ""], ["The user greets me.", ""], ["", "Hello!"], ["", ""]],
+      "unary": ["The user greets me.", "Hello!"]
+    },
+    {
+      "input": 0,
+      "force": false,
+      "stream": true,
+      "steps": [["", "The user"], ["", " greets me."], ["", "</think>"], ["", "Hello!"], ["", ""]],
+      "unary": ["", "The user greets me.</think>Hello!"]
+    },
+    {
+      "input": 0,
+      "force": false,
+      "stream": false,
+      "steps": [["", "The user"], ["", " greets me."], ["", "</think>"], ["", "Hello!"], ["", ""]],
+      "unary": ["", "The user greets me.</think>Hello!"]
+    },
+    {
+      "input": 1,
+      "force": true,
+      "stream": true,
+      "steps": [["Let me think", ""], ["", "Answer"], ["", ""]],
+      "unary": ["Let me think", "Answer"]
+    },
+    {
+      "input": 1,
+      "force": true,
+      "stream": false,
+      "steps": [["", ""], ["Let me think", "Answer"], ["", ""]],
+      "unary": ["Let me think", "Answer"]
+    },
+    {
+      "input": 1,
+      "force": false,
+      "stream": true,
+      "steps": [["", "Let me think</th"], ["", "ink>Answer"], ["", ""]],
+      "unary": ["", "Let me think</think>Answer"]
+    },
+    {
+      "input": 1,
+      "force": false,
+      "stream": false,
+      "steps": [["", "Let me think</th"], ["", "ink>Answer"], ["", ""]],
+      "unary": ["", "Let me think</think>Answer"]
+    },
+    {
+      "input": 2,
+      "force": true,
+      "stream": true,
+      "steps": [["", ""], ["reason", ""], ["", ""], ["", "done"], ["", ""]],
+      "unary": ["reason", "done"]
+    },
+    {
+      "input": 2,
+      "force": true,
+      "stream": false,
+      "steps": [["", ""], ["", ""], ["reason", ""], ["", "done"], ["", ""]],
+      "unary": ["reason", "done"]
+    },
+    {
+      "input": 2,
+      "force": false,
+      "stream": true,
+      "steps": [["", ""], ["reason", ""], ["", ""], ["", "done"], ["", ""]],
+      "unary": ["reason", "done"]
+    },
+    {
+      "input": 2,
+      "force": false,
+      "stream": false,
+      "steps": [["", ""], ["", ""], ["reason", ""], ["", "done"], ["", ""]],
+      "unary": ["reason", "done"]
+    },
+    {
+      "input": 3,
+      "force": true,
+      "stream": true,
+      "steps": [["I should call a tool", ""], ["", ""], ["", "<tool_call>get_weather</tool_call>"], ["", ""]],
+      "unary": ["I should call a tool", "<tool_call>get_weather</tool_call>"]
+    },
+    {
+      "input": 3,
+      "force": true,
+      "stream": false,
+      "steps": [["", ""], ["", ""], ["I should call a tool", "<tool_call>get_weather</tool_call>"], ["", ""]],
+      "unary": ["I should call a tool", "<tool_call>get_weather</tool_call>"]
+    },
+    {
+      "input": 3,
+      "force": false,
+      "stream": true,
+      "steps": [["", "I should call a tool"], ["", ""], ["", "<tool_call>get_weather</tool_call>"], ["", ""]],
+      "unary": ["", "I should call a tool<tool_call>get_weather</tool_call>"]
+    },
+    {
+      "input": 3,
+      "force": false,
+      "stream": false,
+      "steps": [["", "I should call a tool"], ["", ""], ["", "<tool_call>get_weather</tool_call>"], ["", ""]],
+      "unary": ["", "I should call a tool<tool_call>get_weather</tool_call>"]
+    },
+    {
+      "input": 4,
+      "force": true,
+      "stream": true,
+      "steps": [["mention ", "<tool_call> inline"], ["", "</think>"], ["", "ans"], ["", ""]],
+      "unary": ["mention <tool_call> inline", "ans"]
+    },
+    {
+      "input": 4,
+      "force": true,
+      "stream": false,
+      "steps": [["mention ", "<tool_call> inline"], ["", "</think>"], ["", "ans"], ["", ""]],
+      "unary": ["mention <tool_call> inline", "ans"]
+    },
+    {
+      "input": 4,
+      "force": false,
+      "stream": true,
+      "steps": [["", "mention <tool_call> inline"], ["", "</think>"], ["", "ans"], ["", ""]],
+      "unary": ["", "mention <tool_call> inline</think>ans"]
+    },
+    {
+      "input": 4,
+      "force": false,
+      "stream": false,
+      "steps": [["", "mention <tool_call> inline"], ["", "</think>"], ["", "ans"], ["", ""]],
+      "unary": ["", "mention <tool_call> inline</think>ans"]
+    },
+    {
+      "input": 5,
+      "force": true,
+      "stream": true,
+      "steps": [["ends at ", ""], ["<tool_", ""]],
+      "unary": ["ends at <tool_", ""]
+    },
+    {
+      "input": 5,
+      "force": true,
+      "stream": false,
+      "steps": [["", ""], ["ends at <tool_", ""]],
+      "unary": ["ends at <tool_", ""]
+    },
+    {
+      "input": 5,
+      "force": false,
+      "stream": true,
+      "steps": [["", "ends at <tool_"], ["", ""]],
+      "unary": ["", "ends at <tool_"]
+    },
+    {
+      "input": 5,
+      "force": false,
+      "stream": false,
+      "steps": [["", "ends at <tool_"], ["", ""]],
+      "unary": ["", "ends at <tool_"]
+    }
+  ]
+}

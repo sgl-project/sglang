@@ -24,7 +24,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=446, stage="extra-b", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=396, stage="extra-b", runner_config="4-gpu-h100")
 
 # FP8 variant of Qwen3-30B-A3B: required because DeepEP normal/LL fast paths in
 # ep_moe/layer.py only run for {Fp8Config (via deep_gemm), W4AFp8Config, aiter,
@@ -44,8 +44,8 @@ class TestReturnRoutedExperts(CustomTestCase):
     under DeepEP a2a + attn_tp_size > 1, across overlap/cuda-graph/radix
     optimisations.
 
-    Both servers run ``--tp 4 --dp 2 --enable-dp-attention --moe-a2a-backend
-    deepep`` so attn_tp_size=2 and the all-gather hot path in
+    Both servers run ``--tp 4 --attn-dp-size 2 --moe-a2a-backend deepep``
+    so attn_tp_size=2 and the all-gather hot path in
     RoutedExpertsCapturer.capture is hit on every step. Baseline disables
     overlap/cuda-graph/radix to give a deterministic ground truth; reference
     leaves them on. If the gather were skipping a rank or racing against the
@@ -59,9 +59,8 @@ class TestReturnRoutedExperts(CustomTestCase):
             "--enable-deterministic-inference",
             "--tp",
             4,
-            "--dp",
+            "--attn-dp-size",
             2,
-            "--enable-dp-attention",
             "--moe-a2a-backend",
             "deepep",
             # Force normal-mode dispatch: deepep auto routes decode through
@@ -472,6 +471,23 @@ class TestRoutedExpertsStartLen(CustomTestCase):
             self._build_payload(routed_experts_start_len=prompt_tokens + 1)
         )
         self._assert_aborted(too_big, "is higher than the number of input tokens")
+
+    def test_negative_start_len_survives_intake_abort(self):
+        """A request rejected by an intake check that runs before the
+        routed-experts check (here an out-of-range logprob_start_len) keeps its
+        negative start; it must be aborted on its own and leave the server
+        serving."""
+        aborted = self._send(
+            self._build_payload(
+                routed_experts_start_len=-5,
+                return_logprob=True,
+                logprob_start_len=1_000_000,
+            )
+        )
+        self._assert_aborted(aborted, "is higher than the number of input tokens")
+
+        resp = self._send(self._build_payload())
+        self.assertEqual(resp.status_code, 200, resp.text)
 
     def test_start_len_with_cache_hit(self):
         """`start_len` must allow the radix prefix to extend past it. The

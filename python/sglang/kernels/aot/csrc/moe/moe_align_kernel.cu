@@ -73,10 +73,14 @@ __global__ void moe_align_block_size_kernel(
     if (pad_sorted_token_ids) {
       Vec fill_vec;
       fill_vec.x = fill_vec.y = fill_vec.z = fill_vec.w = numel;
-      int32_t total_vecs = (max_num_tokens_padded + VEC_SIZE - 1) / VEC_SIZE;
+      // Whole vectors only; a partial last vector would write past the buffer.
+      int32_t total_vecs = max_num_tokens_padded / VEC_SIZE;
       Vec* out_ptr = reinterpret_cast<Vec*>(sorted_token_ids);
       for (int32_t i = threadIdx.x; i < total_vecs; i += blockDim.x) {
         out_ptr[i] = fill_vec;
+      }
+      for (int32_t i = total_vecs * VEC_SIZE + threadIdx.x; i < max_num_tokens_padded; i += blockDim.x) {
+        sorted_token_ids[i] = numel;
       }
     }
     return;

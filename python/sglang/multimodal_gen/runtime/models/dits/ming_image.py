@@ -6,6 +6,12 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from sglang.kernels.ops.diffusion import (
+    BitExactFusionGate,
+    can_use_rmsnorm_cast_before_weight,
+    fused_packed_silu_mul_bitexact,
+    rmsnorm_cast_before_weight_bitexact,
+)
 from sglang.multimodal_gen.runtime.distributed import get_sp_world_size
 from sglang.multimodal_gen.runtime.distributed.sp_shard_utils import (
     gather_seq,
@@ -14,7 +20,20 @@ from sglang.multimodal_gen.runtime.distributed.sp_shard_utils import (
     tail_attn_meta,
 )
 from sglang.multimodal_gen.runtime.models.dits.zimage import ZImageTransformer2DModel
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.layers.layernorm import RMSNorm
+
+logger = init_logger(__name__)
+_MING_SWIGLU_FUSION = BitExactFusionGate(
+    "Ming-Image packed SiLU-mul", per_signature=True
+)
+
+_MING_RMSNORM_FUSION = BitExactFusionGate("Ming-Image RMSNorm", per_signature=True)
+
+
+def _eager_silu_and_mul(x: torch.Tensor) -> torch.Tensor:
+    gate, up = x.chunk(2, dim=-1)
+    return F.silu(gate) * up
 
 
 class MingRMSNorm(RMSNorm):
@@ -22,11 +41,75 @@ class MingRMSNorm(RMSNorm):
         # unlike Z-Image, Ming's reference accumulates the variance in fp32
         super().__init__(dim, eps=eps, cast_x_before_out_mul=True, force_native=True)
 
+    def forward_native(
+        self, x, residual=None, post_residual_addition=None, quant_linear=None
+    ):
+        native = super().forward_native
+        if (
+            torch.compiler.is_compiling()
+            or residual is not None
+            or x.shape[-1] != self.hidden_size
+            or self.weight.dtype != x.dtype
+            or not self.weight.is_contiguous()
+            or not can_use_rmsnorm_cast_before_weight(
+                device=x.device,
+                dtype=x.dtype,
+                contiguous=x.is_contiguous(),
+                eps=self.variance_epsilon,
+            )
+        ):
+            return native(x, residual, post_residual_addition, quant_linear)
+        return _MING_RMSNORM_FUSION.run(
+            lambda: rmsnorm_cast_before_weight_bitexact(
+                x, self.weight, self.variance_epsilon
+            ),
+            lambda: native(x),
+            sig=(
+                x.device.index,
+                x.dtype,
+                x.shape[-1],
+                x.numel() // x.shape[-1] >= 16,
+                x.numel() >= 2**29,
+                self.variance_epsilon,
+            ),
+            logger=logger,
+            reraise=(ValueError,),
+        )
+
 
 class MingSiluAndMul(nn.Module):
     def forward(self, x):
-        gate, up = x.chunk(2, dim=-1)
-        return F.silu(gate) * up
+        # Inductor can fuse the reference expression while tracing.
+        if torch.compiler.is_compiling():
+            return _eager_silu_and_mul(x)
+
+        can_fuse = (
+            x.is_cuda
+            and x.dtype is torch.bfloat16
+            and x.dim() == 3
+            and x.stride(-1) == 1
+            and x.stride(-2) >= x.shape[-1]
+            and x.stride(0) == x.shape[1] * x.stride(1)
+            and x.shape[-1] % 2 == 0
+            and x.numel() > 0
+        )
+        if not can_fuse:
+            return _eager_silu_and_mul(x)
+
+        # The first tensor of each layout is compared bit-for-bit against eager.
+        return _MING_SWIGLU_FUSION.run(
+            lambda: fused_packed_silu_mul_bitexact(x),
+            lambda: _eager_silu_and_mul(x),
+            sig=(
+                x.dtype,
+                x.device,
+                x.shape[0],
+                x.shape[-1],
+                x.stride(-2),
+                x.stride(-1),
+            ),
+            logger=logger,
+        )
 
 
 class MingImageTransformer2DModel(ZImageTransformer2DModel):

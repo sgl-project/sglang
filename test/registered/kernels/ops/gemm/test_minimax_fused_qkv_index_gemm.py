@@ -30,7 +30,7 @@ def _pack_weight_scale(scale_u8: torch.Tensor) -> torch.Tensor:
 @pytest.mark.parametrize("N1,N2,K", [(1280, 256, 6144), (1024, 128, 2048)])
 def test_fused_equals_separate(T, N1, N2, K):
     from sglang.srt.layers.quantization.fp8_utils import (
-        _deepgemm_w8a8_mxfp8_linear_with_fallback as mxfp8_linear,
+        deepgemm_w8a8_mxfp8_linear_with_fallback as mxfp8_linear,
     )
 
     torch.manual_seed(T * 7 + N1 + K)

@@ -11,17 +11,16 @@ in the stages from ``num_frames`` and ``image_path``; T2I overrides
 import functools
 import os
 from dataclasses import dataclass, field
+from typing import ClassVar
 
 from sglang.multimodal_gen.configs.models import DiTConfig, VAEConfig
 from sglang.multimodal_gen.configs.models.dits.cosmos3video import Cosmos3VideoConfig
 from sglang.multimodal_gen.configs.models.vaes import WanVAEConfig
-from sglang.multimodal_gen.configs.pipeline_configs.base import (
-    ModelTaskType,
-    PipelineConfig,
-)
+from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
     ModelDeploymentConfig,
 )
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 
 COSMOS3_EDGE_BACKBONE_TYPE = "cosmos3_edge_nemotron_dense"
 COSMOS3_NANO_ARCH_SIGNATURE = (4096, 36, 32)
@@ -109,6 +108,11 @@ class Cosmos3Config(PipelineConfig):
     # TI2V (text + image → video) so the request validator accepts ``image_path``
     # without requiring it. T2V ignores it; I2V uses it; T2I disregards it.
     task_type: ModelTaskType = ModelTaskType.TI2V
+    supported_task_types: ClassVar[tuple[ModelTaskType, ...]] = (
+        ModelTaskType.TI2V,
+        ModelTaskType.T2I,
+        ModelTaskType.V2V,
+    )
 
     dit_config: DiTConfig = field(default_factory=Cosmos3VideoConfig)
 

@@ -39,6 +39,7 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.hf_transformers import get_hf_text_config
 from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -58,17 +59,13 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
-)
-from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.utils import AutoWeightsLoader, WeightsMapper
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import get_device
-from sglang.srt.utils.common import direct_register_custom_op
-from sglang.srt.utils.hf_transformers_utils import get_hf_text_config
+from sglang.srt.utils.custom_op import direct_register_custom_op
 
 
 def can_enable_torch_compile(config: PretrainedConfig) -> bool:
@@ -238,6 +235,9 @@ def _normalize_tp_style(style: str) -> Style:
         "packed_rowwise": "rowwise",
         "local_rowwise": "rowwise",
         "local_packed_rowwise": "rowwise",
+        # transformers' tied-embedding `base_model_tp_plan`s give the embedding this
+        # style; `replace_vocab_embed_class` shards it instead.
+        "embedding_rowwise": "replicate",
         "isolated": "replicate",
         "local": "replicate",
         "replicated_with_grad_allreduce": "replicate",
@@ -1344,7 +1344,6 @@ class MultiModalMixin:
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._mm_padding_pattern = MultiModalityDataPaddingPatternMultimodalTokens()
 
         # transformers v5 flattened SigLIP/CLIP (dropped the "vision_model"
         # wrapper); older checkpoints still ship "vision_tower.vision_model.*"

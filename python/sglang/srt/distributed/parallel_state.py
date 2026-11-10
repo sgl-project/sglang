@@ -71,6 +71,7 @@ from sglang.srt.utils import (
     is_cuda_alike,
     is_gfx95_supported,
     is_hip,
+    is_mlu,
     is_musa,
     is_npu,
     is_shm_available,
@@ -84,6 +85,7 @@ _is_npu = is_npu()
 _is_cpu = is_cpu()
 _is_xpu = is_xpu()
 _is_musa = is_musa()
+_is_mlu = is_mlu()
 
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 
@@ -93,6 +95,12 @@ REDUCE_OP_SUM = int(torch.distributed.ReduceOp.SUM)
 # Reuse the user-provided distributed timeout for model-parallel subgroup
 # creation so runtime collectives do not silently fall back to backend defaults.
 _MODEL_PARALLEL_GROUP_TIMEOUT: Optional[timedelta] = None
+
+# AITER fused AR+RMSNorm 1-stage kernel: one block per token up to kMaxBlocks,
+# and every rank reads every peer, so its read volume is payload * world_size
+# (128 KiB of payload at world_size 8).
+_FUSED_AR_RMS_1STAGE_MAX_TOKENS = 80
+_FUSED_AR_RMS_1STAGE_MAX_READ_BYTES = 8 * 128 * 1024
 
 
 def get_torch_distributed_pg_options(group_name=None):
@@ -297,13 +305,13 @@ class GroupCoordinator:
         use_torch_symm_mem_all_reduce: bool,
         use_hpu_communicator: bool,
         use_xpu_communicator: bool,
-        use_npu_communicator: bool,
         use_message_queue_broadcaster: bool = False,
         group_name: Optional[str] = None,
         gloo_timeout: timedelta = timedelta(seconds=120 * 60),
         recovered_rank: bool = False,
         rank_offset: int = 0,
         max_world_size: Optional[int] = None,
+        use_quick_allreduce: Optional[bool] = None,
     ):
         # Set group info
         group_name = group_name or "anonymous"
@@ -326,19 +334,7 @@ class GroupCoordinator:
         # Scale cohorts create these groups without the serving ranks.
         use_local_synchronization = rank_offset > 0 and not recovered_rank
 
-        if is_cuda_alike():
-            device_id = (
-                0 if envs.SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS.get() else local_rank
-            )
-            self.device = torch.device(f"cuda:{device_id}")
-        elif _is_npu:
-            self.device = torch.device(f"npu:{local_rank}")
-        elif _is_xpu:
-            self.device = torch.device(f"xpu:{local_rank}")
-        elif _is_musa:
-            self.device = torch.device(f"musa:{local_rank}")
-        else:
-            self.device = torch.device("cpu")
+        self.device = _group_coordinator_device(local_rank)
         self.device_module = torch.get_device_module(self.device)
 
         for ranks in group_ranks:
@@ -431,10 +427,12 @@ class GroupCoordinator:
         self.use_pynccl = use_pynccl
         self.use_mscclpp = use_mscclpp
         self.use_custom_allreduce = use_custom_allreduce
+        self.use_quick_allreduce = (
+            use_custom_allreduce if use_quick_allreduce is None else use_quick_allreduce
+        )
         self.use_torch_symm_mem_all_reduce = use_torch_symm_mem_all_reduce
         self.use_hpu_communicator = use_hpu_communicator
         self.use_xpu_communicator = use_xpu_communicator
-        self.use_npu_communicator = use_npu_communicator
         self.use_message_queue_broadcaster = use_message_queue_broadcaster
 
         # Lazy import to avoid documentation build error
@@ -485,6 +483,28 @@ class GroupCoordinator:
 
         self.ca_comm: Optional[Any] = None
         self.qr_comm: Optional[QuickAllReduce] = None
+
+        self.pcie_ipc_comm: Optional[Any] = None
+        from sglang.srt.distributed.device_communicators.pcie_ipc_ar import (
+            PcieIpcCommunicator,
+            eligible_group,
+        )
+
+        if eligible_group(
+            group_name=group_name,
+            world_size=self.world_size,
+            deterministic=self._deterministic_collectives_enabled(),
+        ):
+            try:
+                # The IPC handshake needs the CUDA (NCCL) group, not the CPU one.
+                # Autotuning is the other way round: it rendezvouses on the host.
+                self.pcie_ipc_comm = PcieIpcCommunicator(
+                    group=self.device_group,
+                    device=self.device,
+                    cpu_group=self.cpu_group,
+                )
+            except Exception as e:
+                logger.warning(f"Setup FlashInfer PCIe-IPC allreduce failed with {e}.")
         if use_custom_allreduce and self.world_size > 1:
             # Initialize a custom fast all-reduce implementation.
             try:
@@ -502,7 +522,7 @@ class GroupCoordinator:
                     "warning, specify --disable-custom-all-reduce explicitly."
                 )
 
-            if is_hip():
+            if self.use_quick_allreduce and is_hip():
                 try:
                     # Initialize a custom quick all-reduce implementation for AMD
                     # when rocm >= gfx942. Quick reduce is designed as a
@@ -528,9 +548,6 @@ class GroupCoordinator:
         from sglang.srt.distributed.device_communicators.hpu_communicator import (
             HpuCommunicator,
         )
-        from sglang.srt.distributed.device_communicators.npu_communicator import (
-            NpuCommunicator,
-        )
         from sglang.srt.distributed.device_communicators.xpu_communicator import (
             XpuCommunicator,
         )
@@ -542,10 +559,6 @@ class GroupCoordinator:
         self.xpu_communicator: Optional[XpuCommunicator] = None
         if use_xpu_communicator and self.world_size > 1:
             self.xpu_communicator = XpuCommunicator(group=self.device_group)
-
-        self.npu_communicator: Optional[NpuCommunicator] = None
-        if use_npu_communicator and self.world_size > 1:
-            self.npu_communicator = NpuCommunicator(group=self.device_group)
 
         # Create message queue
         from sglang.srt.distributed.device_communicators.shm_broadcast import (
@@ -600,6 +613,22 @@ class GroupCoordinator:
         world_size = self.world_size
         return self.ranks[(rank_in_group - 1) % world_size]
 
+    def get_available_pynccl_comm(self) -> Optional[Any]:
+        """Return the PyNccl communicator only when it initialized successfully."""
+        pynccl_comm = self.pynccl_comm
+        if pynccl_comm is None or not pynccl_comm.available:
+            return None
+        return pynccl_comm
+
+    def require_pynccl_comm(self, operation: str) -> Any:
+        """Return an available PyNccl communicator or fail with context."""
+        pynccl_comm = self.get_available_pynccl_comm()
+        if pynccl_comm is None:
+            raise RuntimeError(
+                f"{operation} requires an available PyNccl communicator."
+            )
+        return pynccl_comm
+
     @contextmanager
     def graph_capture(
         self,
@@ -647,9 +676,9 @@ class GroupCoordinator:
             # In summary: We select the appropriate allreduce method for
             #  each mode based on the algorithm order in the table and
             #  their usage conditions.
-            pynccl_comm = self.pynccl_comm
+            pynccl_comm = self.get_available_pynccl_comm()
             maybe_pynccl_context: Any
-            if not pynccl_comm:
+            if pynccl_comm is None:
                 maybe_pynccl_context = nullcontext()
             else:
                 maybe_pynccl_context = pynccl_comm.change_state(enable=True)
@@ -706,9 +735,7 @@ class GroupCoordinator:
             inplace_all_reduce(input_, group_name=self.unique_name)
             return input_
 
-        if self.npu_communicator is not None and not self.npu_communicator.disabled:
-            return self.npu_communicator.all_reduce(input_)
-
+        pynccl_comm = self.get_available_pynccl_comm()
         if torch.compiler.is_compiling():
             if self._can_use_flashinfer_allreduce(input_):
                 return flashinfer_allreduce(input_, group_name=self.unique_name)
@@ -728,7 +755,7 @@ class GroupCoordinator:
                 and self.qr_comm is None
                 and self.pymscclpp_comm is None
                 and self.torch_symm_mem_comm is None
-                and self.pynccl_comm is None
+                and pynccl_comm is None
             ):
                 inplace_all_reduce(input_, group_name=self.unique_name)
                 return input_
@@ -748,14 +775,14 @@ class GroupCoordinator:
             and self.ca_comm.should_custom_ar(input_)
         )
         if (
-            self.pynccl_comm is not None
+            pynccl_comm is not None
             and self.is_symmetric_memory_enabled()
             and not should_use_pymscclpp_allreduce
             and not should_use_custom_allreduce
         ):
             self.debug_check_symmetric_mempool(self, {"input": input_}, "all_reduce")
-            with self.pynccl_comm.change_state(enable=True):
-                self.pynccl_comm.all_reduce(input_)
+            with pynccl_comm.change_state(enable=True):
+                pynccl_comm.all_reduce(input_)
                 return input_
 
         if self._can_use_flashinfer_allreduce(input_):
@@ -777,17 +804,32 @@ class GroupCoordinator:
 
     def quant_all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
         """
-        User-facing quant-all-reduce function similar to all-reduce. (NPU support only)
+        User-facing quant-all-reduce function similar to all-reduce. (called when enable_quant_communications on, which NPU support only)
         """
-        # Bypass the function if we are using only 1 GPU.
         if self.world_size == 1:
             return input_
 
-        if self.npu_communicator is not None and not self.npu_communicator.disabled:
-            return self.npu_communicator.quant_all_reduce(input_)
-        else:
+        try:
+            from torch_npu import npu_dynamic_quant
+        except ImportError:
             inplace_all_reduce(input_, group_name=self.unique_name)
             return input_
+
+        # All gather is performed in low precision, but reduce in full precision.
+        input_size = input_.size()
+        x_q, scale = npu_dynamic_quant(input_, dst_type=torch.int8)
+        output_size = (input_size[0] * self.world_size,) + input_size[1:]
+        output_tensor = torch.empty(output_size, dtype=x_q.dtype, device=input_.device)
+        output_scale = torch.empty(
+            output_size[:1], dtype=scale.dtype, device=scale.device
+        )
+        all_gather_single(output_tensor, x_q, group=self.device_group)
+        all_gather_single(output_scale, scale, group=self.device_group)
+
+        output_tensor = output_tensor.to(input_.dtype) * output_scale.unsqueeze(-1).to(
+            input_.dtype
+        )
+        return output_tensor.reshape((self.world_size,) + input_size).sum(dim=0)
 
     def fused_allreduce_rmsnorm(
         self,
@@ -814,17 +856,16 @@ class GroupCoordinator:
         if not hasattr(ca_comm, "custom_fused_ar_rms"):
             return None
 
-        # 1-stage vs 2-stage selection for fused AR+RMSNorm:
-        # The 1-stage kernel launches one block per token and is capped at
-        # 80 tokens (kMaxBlocks).  Guard with a byte threshold so large
-        # prefill batches fall through to the 2-stage kernel instead of
-        # hitting a runtime error.  AITER's C++ dispatch already gates
-        # which hidden_dims have valid 1-stage support.
+        # AITER's C++ dispatch further limits 1-stage to the hidden_dims it supports.
         if envs.SGLANG_USE_1STAGE_ALLREDUCE.is_set():
             use_1stage_ar = envs.SGLANG_USE_1STAGE_ALLREDUCE.get()
         else:
             total_bytes = input_.numel() * input_.element_size()
-            use_1stage_ar = total_bytes <= 128 * 1024
+            token_num = input_.numel() // input_.shape[-1]
+            use_1stage_ar = (
+                token_num <= _FUSED_AR_RMS_1STAGE_MAX_TOKENS
+                and total_bytes * self.world_size <= _FUSED_AR_RMS_1STAGE_MAX_READ_BYTES
+            )
 
         if (
             getattr(ca_comm, "_IS_CAPTURING", False)
@@ -944,6 +985,16 @@ class GroupCoordinator:
             and self.ca_comm.should_custom_ar(input_)
         ):
             return "ca"
+        # After ``ca``: the PCIe-IPC kernels are for hosts where no fabric-specific
+        # backend applies. They do not probe for NVLink, so on a host that has it
+        # this ordering is what keeps the faster backend in front of them.
+        if (
+            self.pcie_ipc_comm is not None
+            and not self.pcie_ipc_comm.disabled
+            and not should_use_pymscclpp_allreduce
+            and self.pcie_ipc_comm.should_pcie_ipc_ar(input_)
+        ):
+            return "pcie_ipc"
         if (
             self.qr_comm is not None
             and not self.qr_comm.disabled
@@ -958,7 +1009,10 @@ class GroupCoordinator:
             and self.torch_symm_mem_comm.should_torch_symm_mem_allreduce(input_)
         ):
             return "torch_symm_mem"
-        if is_in_tc_piecewise_cuda_graph() and self.pynccl_comm is not None:
+        if (
+            is_in_tc_piecewise_cuda_graph()
+            and self.get_available_pynccl_comm() is not None
+        ):
             # For piecewise cuda graph, we use pynccl outplace allreduce
             return "pynccl"
         return None
@@ -989,6 +1043,7 @@ class GroupCoordinator:
     def _all_reduce_out_place(
         self, input_: torch.Tensor, outplace_all_reduce_method: str
     ) -> torch.Tensor:
+        pynccl_comm = self.get_available_pynccl_comm()
         if outplace_all_reduce_method == "auto":
             outplace_all_reduce_method = self._resolve_outplace_all_reduce_method(
                 input_
@@ -1001,7 +1056,7 @@ class GroupCoordinator:
                 # Force pynccl over the in-place fallback: it is graph-capture
                 # safe and NCCL is natively out-of-place, avoiding the clone
                 # the in-place fallback needs.
-                if self.pynccl_comm is not None:
+                if pynccl_comm is not None:
                     outplace_all_reduce_method = "pynccl"
                 else:
                     out = input_.clone()
@@ -1011,7 +1066,6 @@ class GroupCoordinator:
         qr_comm = self.qr_comm
         pymscclpp_comm = self.pymscclpp_comm
         torch_symm_mem_comm = self.torch_symm_mem_comm
-        pynccl_comm = self.pynccl_comm
         assert any([qr_comm, ca_comm, pymscclpp_comm, torch_symm_mem_comm, pynccl_comm])
         if outplace_all_reduce_method == "ca":
             assert not ca_comm.disabled
@@ -1025,6 +1079,8 @@ class GroupCoordinator:
         elif outplace_all_reduce_method == "pymscclpp":
             assert not pymscclpp_comm.disabled
             out = pymscclpp_comm.all_reduce(input_)
+        elif outplace_all_reduce_method == "pcie_ipc":
+            return self.pcie_ipc_comm.pcie_ipc_all_reduce(input_)
         elif outplace_all_reduce_method == "pynccl":
             with pynccl_comm.change_state(enable=True):
                 out = pynccl_comm.outplace_all_reduce(input_)
@@ -1032,7 +1088,7 @@ class GroupCoordinator:
         return out
 
     def _all_reduce_in_place(self, input_: torch.Tensor) -> None:
-        pynccl_comm = self.pynccl_comm
+        pynccl_comm = self.get_available_pynccl_comm()
         torch_symm_mem_comm = self.torch_symm_mem_comm
         if pynccl_comm is not None and not pynccl_comm.disabled:
             pynccl_comm.all_reduce(input_)
@@ -1087,7 +1143,7 @@ class GroupCoordinator:
         output: torch.Tensor,
         input: torch.Tensor,
     ) -> torch.Tensor:
-        pynccl_comm = self.pynccl_comm
+        pynccl_comm = self.get_available_pynccl_comm()
         if pynccl_comm is not None and (
             not pynccl_comm.disabled or self.is_symmetric_memory_enabled()
         ):
@@ -1111,7 +1167,7 @@ class GroupCoordinator:
                 .narrow(0, self.rank_in_group * output.numel(), output.numel())
                 .view_as(output)
             )
-        elif _is_npu or _is_cpu:
+        elif _is_cpu:
             # TODO: add optimized reduce_scatter_tensor kernel for cpu
             self._reduce_scatter_tensor(output, input)
         elif self._maybe_aiter_reduce_scatter(output, input):
@@ -1156,7 +1212,10 @@ class GroupCoordinator:
             return False
         if getattr(ca_comm, "_IS_CAPTURING", False):
             if torch.cuda.is_current_stream_capturing():
-                if envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get():
+                if (
+                    envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
+                    or envs.SGLANG_AITER_CAPTURE_COPY_IN.get()
+                ):
                     ca_comm.reduce_scatter(input, output, registered=False)
                 else:
                     ca_comm.reduce_scatter(input, output, registered=True)
@@ -1171,7 +1230,7 @@ class GroupCoordinator:
 
     def _all_to_all_single(self, output: torch.Tensor, input: torch.Tensor) -> None:
         # pynccl path keeps the a2a exchange CUDA-graph-capturable (DCP a2a backend).
-        pynccl_comm = self.pynccl_comm
+        pynccl_comm = self.get_available_pynccl_comm()
         if pynccl_comm is not None and not pynccl_comm.disabled:
             pynccl_comm.all_to_all_single(output, input)
         else:
@@ -1226,16 +1285,12 @@ class GroupCoordinator:
         sizes: Optional[List[int]] = None,
     ) -> torch.Tensor:
         world_size = self.world_size
-        pynccl_comm = self.pynccl_comm
 
         if envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get():
             return self._deterministic_reduce_scatterv(input_, output, sizes)
 
+        pynccl_comm = self.require_pynccl_comm("reduce_scatterv")
         with pynccl_comm.change_state(enable=True):
-            assert pynccl_comm is not None and not pynccl_comm.disabled, (
-                "pynccl is required for reduce_scatterv"
-            )
-
             if sizes is not None:
                 assert len(sizes) == world_size
                 assert input_.shape[0] == sum(sizes)
@@ -1275,7 +1330,10 @@ class GroupCoordinator:
         ):
             if getattr(ca_comm, "_IS_CAPTURING", False):
                 if torch.cuda.is_current_stream_capturing():
-                    if envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get():
+                    if (
+                        envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
+                        or envs.SGLANG_AITER_CAPTURE_COPY_IN.get()
+                    ):
                         ca_comm.all_gather_unreg(input, out=output, dim=0)
                     else:
                         ca_comm.all_gather_reg(input, out=output, dim=0)
@@ -1296,7 +1354,7 @@ class GroupCoordinator:
             pymscclpp_comm.all_gather(output, input)
             return
 
-        pynccl_comm = self.pynccl_comm
+        pynccl_comm = self.get_available_pynccl_comm()
         if pynccl_comm is not None and (
             not pynccl_comm.disabled or self.is_symmetric_memory_enabled()
         ):
@@ -1327,12 +1385,12 @@ class GroupCoordinator:
         return envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
 
     def all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
-        if _is_npu or _is_cpu:
+        if _is_cpu:
             # TODO: add optimized all_gather_into_tensor kernel for cpu
             self._all_gather_into_tensor(output, input)
         else:
-            # XPU and CUDA both go through reg_all_gather_into_tensor (custom_op) to
-            # stay opaque to Dynamo. Calling torch.distributed.all_gather_into_tensor
+            # NPU, XPU, and CUDA all go through reg_all_gather_into_tensor (custom_op)
+            # to stay opaque to Dynamo. Calling torch.distributed.all_gather_into_tensor
             # directly causes Dynamo to rewrite it as _c10d_functional.all_gather_into_tensor
             # + wait_tensor, which invokes sycl_event.wait() and breaks XPU graph capture.
             reg_all_gather_into_tensor(output, input, group_name=self.unique_name)
@@ -1370,11 +1428,6 @@ class GroupCoordinator:
         hpu_comm = self.hpu_communicator
         if hpu_comm is not None and not hpu_comm.disabled:
             return hpu_comm.all_gather(input_, dim)
-
-        # For NPUs, use NPU communicator.
-        npu_comm = self.npu_communicator
-        if npu_comm is not None and not npu_comm.disabled:
-            return npu_comm.all_gather(input_, dim)
 
         if dim < 0:
             # Convert negative dim to positive.
@@ -1423,12 +1476,9 @@ class GroupCoordinator:
             extra output allocation + caller-side copy.
         """
         world_size = self.world_size
-        pynccl_comm = self.pynccl_comm
+        pynccl_comm = self.require_pynccl_comm("all_gatherv")
 
         with pynccl_comm.change_state(enable=True):
-            assert pynccl_comm is not None and not pynccl_comm.disabled, (
-                "pynccl is required for all_gatherv"
-            )
 
             def _all_gather_allocate_output(
                 input_: torch.Tensor,
@@ -1525,8 +1575,9 @@ class GroupCoordinator:
         if self.world_size == 1:
             return input_
 
-        if self.pynccl_comm is not None and not self.pynccl_comm.disabled:
-            self.pynccl_comm.broadcast(input_, src=src)
+        pynccl_comm = self.get_available_pynccl_comm()
+        if pynccl_comm is not None and not pynccl_comm.disabled:
+            pynccl_comm.broadcast(input_, src=src)
         else:
             # Broadcast.
             torch.distributed.broadcast(
@@ -2036,7 +2087,7 @@ class GroupCoordinator:
         if dst is None:
             dst = (self.rank_in_group + 1) % self.world_size
 
-        pynccl_comm = self.pynccl_comm
+        pynccl_comm = self.get_available_pynccl_comm()
         if pynccl_comm is not None and not pynccl_comm.disabled:
             pynccl_comm.send(tensor, dst)
         else:
@@ -2051,7 +2102,7 @@ class GroupCoordinator:
             src = (self.rank_in_group - 1) % self.world_size
 
         tensor = torch.empty(size, dtype=dtype, device=self.device)
-        pynccl_comm = self.pynccl_comm
+        pynccl_comm = self.get_available_pynccl_comm()
         if pynccl_comm is not None and not pynccl_comm.disabled:
             pynccl_comm.recv(tensor, src)
         else:
@@ -2059,6 +2110,11 @@ class GroupCoordinator:
         return tensor
 
     def destroy(self):
+        # Must precede destroy_process_group(): FlashInfer's workspace
+        # teardown collectives on the group it was built with.
+        if self.pcie_ipc_comm is not None:
+            self.pcie_ipc_comm.destroy()
+            self.pcie_ipc_comm = None
         if self.device_group is not None:
             torch.distributed.destroy_process_group(self.device_group)
             self.device_group = None
@@ -2073,6 +2129,26 @@ class GroupCoordinator:
             self.ca_comm = None
         if self.mq_broadcaster is not None:
             self.mq_broadcaster = None
+
+
+def _group_coordinator_device(local_rank: int) -> torch.device:
+    if is_cuda_alike():
+        device_id = (
+            0 if envs.SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS.get() else local_rank
+        )
+        return torch.device(f"cuda:{device_id}")
+    if _is_npu:
+        return torch.device(f"npu:{local_rank}")
+    if _is_xpu:
+        return torch.device(f"xpu:{local_rank}")
+    if _is_musa:
+        return torch.device(f"musa:{local_rank}")
+    if _is_mlu:
+        return torch.device(f"mlu:{local_rank}")
+    platform = platforms.current_platform
+    if platform.is_out_of_tree():
+        return platform.get_group_coordinator_device(local_rank)
+    return torch.device("cpu")
 
 
 _WORLD: Optional[GroupCoordinator] = None
@@ -2099,7 +2175,6 @@ def init_world_group(
         use_torch_symm_mem_all_reduce=False,
         use_hpu_communicator=False,
         use_xpu_communicator=False,
-        use_npu_communicator=False,
         group_name="world",
         recovered_rank=recovered_rank,
         max_world_size=max_world_size,
@@ -2112,6 +2187,7 @@ def init_model_parallel_group(
     backend: str,
     use_pynccl: Optional[bool] = None,
     use_custom_allreduce: Optional[bool] = None,
+    use_quick_allreduce: Optional[bool] = None,
     use_message_queue_broadcaster: bool = False,
     group_name: Optional[str] = None,
     use_mscclpp: Optional[bool] = None,
@@ -2126,21 +2202,23 @@ def init_model_parallel_group(
         use_mscclpp = _ENABLE_MSCCLPP
     if use_torch_symm_mem_allreduce is None:
         use_torch_symm_mem_allreduce = _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE
+    if use_pynccl is None:
+        platform = platforms.current_platform
+        if platform.is_out_of_tree() and not platform.capabilities.supports_pynccl:
+            use_pynccl = False
+        else:
+            use_pynccl = not (_is_npu or _is_xpu or _is_mlu or backend == "mooncake")
     return GroupCoordinator(
         group_ranks=group_ranks,
         local_rank=local_rank,
         torch_distributed_backend=backend,
-        use_pynccl=(
-            not (_is_npu or _is_xpu or backend == "mooncake")
-            if use_pynccl is None
-            else use_pynccl
-        ),
+        use_pynccl=use_pynccl,
         use_mscclpp=use_mscclpp,
         use_custom_allreduce=use_custom_allreduce,
+        use_quick_allreduce=use_quick_allreduce,
         use_torch_symm_mem_all_reduce=use_torch_symm_mem_allreduce,
         use_hpu_communicator=True,
         use_xpu_communicator=True,
-        use_npu_communicator=True,
         use_message_queue_broadcaster=use_message_queue_broadcaster,
         group_name=group_name,
         recovered_rank=recovered_rank,
@@ -2154,23 +2232,6 @@ _ATTN_TP: Optional[GroupCoordinator] = None
 _SHARED_EXPERTS_TP: Optional[GroupCoordinator] = None
 _ATTN_CP: Optional[GroupCoordinator] = None
 _DCP: Optional[GroupCoordinator] = None
-
-# duplicate GroupCoordinator for prefill in PD-Multiplexing
-_PDMUX_PREFILL_TP_GROUP: Optional[GroupCoordinator] = None
-
-
-@contextmanager
-def pdmux_prefill_tp_group():
-    """Use the duplicate TP communicator for the prefill stream.
-
-    PD multiplexing keeps prefill and decode on separate communicators with
-    the same ranks. Only the TP handle changes within this scope.
-    """
-    assert _PDMUX_PREFILL_TP_GROUP is not None, (
-        "tensor model parallel group for PD-Multiplexing Prefill is not initialized"
-    )
-    with get_parallel().override(tp_group=_PDMUX_PREFILL_TP_GROUP):
-        yield
 
 
 def get_tp_group() -> GroupCoordinator:
@@ -2338,8 +2399,9 @@ def get_default_distributed_backend(device: str) -> str:
     # ``from ... import current_platform``) so each call resolves through the
     # platforms package's lazy ``__getattr__`` and picks up runtime overrides
     # of ``_current_platform`` (e.g. in tests).
-    if device == platforms.current_platform.device_type:
-        return platforms.current_platform.get_torch_distributed_backend_str()
+    platform = platforms.current_platform
+    if device in (platform.device_type, platform.device_name):
+        return platform.get_torch_distributed_backend_str()
     return _DEVICE_TO_DISTRIBUTED_BACKEND.get(device, "gloo")
 
 
@@ -2512,7 +2574,6 @@ def init_distributed_environment(
 
 def initialize_model_parallel(
     backend: Optional[str] = None,
-    duplicate_tp_group: bool = False,
     enable_symm_mem: bool = False,
     recovered_rank: bool = False,
     rank_offset: int = 0,
@@ -2535,8 +2596,9 @@ def initialize_model_parallel(
             the KV cache across GPUs within each tensor-parallel group during
             decoding. Must be a divisor of `tp_size` and is currently only
             supported on the AMD HIP platform.
-        shared_experts_tp_size: optional shared-expert TP width. Must divide
-            attention TP; subgroups never cross attention replicas.
+        shared_experts_tp_size: optional shared-expert TP width. May span
+            interleave prefill CP within one attention replica; the validated
+            width divides attention TP x CP and never crosses DP or PP.
 
     Let's say we have a total of 8 GPUs denoted by g0 ... g7 and we
     use 2 GPUs to parallelize the model tensor, and 4 GPUs to parallelize
@@ -2600,12 +2662,14 @@ def initialize_model_parallel(
         raise RuntimeError(
             f"decode_context_parallel_size ({decode_context_parallel_size}) must be >= 1"
         )
-    if decode_context_parallel_size > 1 and not (is_hip() or is_cuda()):
+    if decode_context_parallel_size > 1 and not (
+        is_hip() or is_cuda() or _is_npu or _is_xpu
+    ):
         raise RuntimeError(
             "Decode context parallel (decode_context_parallel_size > 1) is "
-            "currently only supported on the AMD HIP platform or CUDA platform, but got "
-            f"decode_context_parallel_size ({decode_context_parallel_size}) "
-            "on a non-HIP or non-CUDA platform."
+            "currently only supported on the AMD HIP, CUDA, NPU, or Intel XPU "
+            "platform, but got decode_context_parallel_size "
+            f"({decode_context_parallel_size}) on an unsupported platform."
         )
     if tensor_model_parallel_size % decode_context_parallel_size != 0:
         raise RuntimeError(
@@ -2639,25 +2703,6 @@ def initialize_model_parallel(
         max_world_size=max_world_size,
     )
 
-    if duplicate_tp_group:
-        global _PDMUX_PREFILL_TP_GROUP
-        assert _PDMUX_PREFILL_TP_GROUP is None, (
-            "tensor model parallel group for PD-Multiplexing Prefill is already initialized"
-        )
-        _PDMUX_PREFILL_TP_GROUP = init_model_parallel_group(
-            group_ranks,
-            get_world_group().local_rank,
-            backend,
-            use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
-            group_name="pdmux_prefill_tp",
-            recovered_rank=recovered_rank,
-            rank_offset=rank_offset,
-            max_world_size=max_world_size,
-        )
-        if _TP.pynccl_comm:
-            _TP.pynccl_comm.disabled = False
-            _PDMUX_PREFILL_TP_GROUP.pynccl_comm.disabled = False
-
     # Build decode context-parallel groups inside each TP group only when DCP is enabled.
     global _DCP
     assert _DCP is None, "decode context parallel group is already initialized"
@@ -2672,6 +2717,10 @@ def initialize_model_parallel(
             dcp_group_ranks,
             get_world_group().local_rank,
             backend,
+            # Current DCP paths use all-gather/reduce-scatter, all-to-all, or
+            # FP32 all-reduce. QuickAllReduce does not serve these collectives,
+            # but its communicator reserves a large workspace on every rank.
+            use_quick_allreduce=False,
             use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
             group_name="dcp",
             recovered_rank=recovered_rank,
@@ -2760,7 +2809,10 @@ def initialize_model_parallel(
             get_world_group().local_rank,
             backend,
             use_pynccl=SYNC_TOKEN_IDS_ACROSS_TP or enable_symm_mem,
-            use_custom_allreduce=False,
+            # Attention TP can be a derived subgroup of the full TP group.
+            # Inherit the global policy and let per-group capability detection
+            # select a custom communicator or fall back.
+            use_custom_allreduce=None,
             use_torch_symm_mem_allreduce=False,
             use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
             group_name="attention_tp",
@@ -2778,8 +2830,9 @@ def initialize_model_parallel(
         if shared_experts_tensor_parallel_size == attn_tp_size:
             _SHARED_EXPERTS_TP = _ATTN_TP
         else:
-            # Attention TP groups are contiguous, and the requested width
-            # divides each one. These groups also stay inside their PP stage.
+            # Rank layout is [PP, attention DP, CP, attention TP]. The
+            # validated width divides attention TP x CP, so contiguous groups
+            # may span interleave PCP but never cross DP replicas or PP stages.
             shared_size = shared_experts_tensor_parallel_size
             shared_group_ranks = [
                 list(range(start, start + shared_size))
@@ -3266,11 +3319,6 @@ def destroy_model_parallel():
         _ATTN_TP.destroy()
     _ATTN_TP = None
 
-    global _PDMUX_PREFILL_TP_GROUP
-    if _PDMUX_PREFILL_TP_GROUP:  # type: ignore[union-attr]
-        _PDMUX_PREFILL_TP_GROUP.destroy()
-    _PDMUX_PREFILL_TP_GROUP = None
-
 
 def destroy_distributed_environment():
     global _WORLD, _MODEL_PARALLEL_GROUP_TIMEOUT
@@ -3280,6 +3328,27 @@ def destroy_distributed_environment():
     _MODEL_PARALLEL_GROUP_TIMEOUT = None
     if torch.distributed.is_initialized():
         torch.distributed.destroy_process_group()
+
+
+def close_custom_all_reduce() -> None:
+    """Release ROCm carv2 multi-node workspaces while the groups still exist.
+
+    Graceful shutdown aborts the process groups instead of destroying them, and
+    carv2 frees a FABRIC workspace collectively on its group.
+    """
+    if not is_hip():
+        return
+    for name in sorted(_groups):
+        group = _groups[name]()
+        if group is None or not getattr(group.ca_comm, "_is_multinode", False):
+            continue
+        try:
+            group.ca_comm.close()
+        except Exception as e:
+            logger.warning(
+                f"Custom all-reduce close on shutdown failed, {type(e).__name__}: {e}"
+            )
+        group.ca_comm = None
 
 
 def abort_distributed_environment() -> None:

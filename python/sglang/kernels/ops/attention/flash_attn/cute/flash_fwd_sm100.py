@@ -243,6 +243,7 @@ class FlashAttentionForwardSm100:
         q_sf_interleaved: bool = False,
         kv_sf_interleaved: bool = False,
         batch_invariant: bool = False,
+        tmem_load_red_max: bool = True,
     ):
         # MXFP8 block-scaled attention (see interface._flash_attn_fwd):
         #   qk_blockscaled: Q/K fp8 e4m3 + per-32 UE8M0 scales; QK^T runs as
@@ -365,6 +366,14 @@ class FlashAttentionForwardSm100:
         # despite the literal `is_sm103` name.
         is_sm103 = self.arch.is_family_of(Arch.sm_103f)
         self.is_sm103 = is_sm103
+        # sm_103 tcgen05.ld.red.max: the TMEM load of S also returns the row max of each
+        # 32-column chunk, replacing the FMNMX reduction in softmax. The hardware max is
+        # taken over the raw S, so it is only used on tiles that need no masking and when
+        # nothing rewrites S before the max (score_mod / bias); there it equals the
+        # software reduction exactly.
+        self.use_tmem_load_red_max = (
+            tmem_load_red_max and is_sm103 and score_mod is None and not has_bias
+        )
         # enable_ex2_emu is derived: True if tuning config has freq > 0, else fallback to default logic
         _default_enable_ex2_emu = (
             self.head_dim_padded <= 128
@@ -3796,6 +3805,18 @@ class FlashAttentionForwardSm100:
         )
         thr_tmem_load = tcgen05.make_tmem_copy(tmem_load_atom, tSAcc).get_slice(tidx)
         tStS_t2r = thr_tmem_load.partition_S(tSAcc)  # (((32,32),1),1,4)
+        if const_expr(self.use_tmem_load_red_max):
+            tmem_load_red_atom = cute.make_copy_atom(
+                tcgen05.copy.LdRed32x32bOp(
+                    tcgen05.copy.Repetition(32), redOp=tcgen05.TmemLoadRedOp.MAX
+                ),
+                self.qk_acc_dtype,
+            )
+            tiled_tmem_load_red = tcgen05.make_tmem_copy(tmem_load_red_atom, tSAcc)
+            tStS_t2r_red = tiled_tmem_load_red.get_slice(tidx).partition_S(tSAcc)
+        else:
+            tiled_tmem_load_red = None
+            tStS_t2r_red = None
 
         tmem_store_scale_atom = cute.make_copy_atom(
             tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(1)), Float32
@@ -3976,6 +3997,8 @@ class FlashAttentionForwardSm100:
                 tStScale_r2t=tStScale_r2t,
                 tStP_r2t=tStP_r2t,
                 sScale=sScale,
+                tiled_tmem_load_red=tiled_tmem_load_red,
+                tStS_t2r_red=tStS_t2r_red,
                 stage=stage,
                 batch_idx=batch_idx,
                 head_idx=head_idx,
@@ -4286,6 +4309,8 @@ class FlashAttentionForwardSm100:
         bias_emu_off: Optional[Boolean] = None,
         pipeline_bias: Optional[pipeline.PipelineAsync] = None,
         bias_si_consumer_state: Optional[pipeline.PipelineState] = None,
+        tiled_tmem_load_red: Optional[cute.TiledCopy] = None,
+        tStS_t2r_red: Optional[cute.Tensor] = None,
     ) -> Tuple[cute.Int32, cute.Int32, cute.Int32]:
         """Perform a single step of the softmax computation on a block of attention scores.
 
@@ -4319,7 +4344,23 @@ class FlashAttentionForwardSm100:
         tSrS_t2r = cute.make_rmem_tensor(
             thr_tmem_load.partition_D(tScS).shape, self.qk_acc_dtype
         )
-        cute.copy(thr_tmem_load, tStS_t2r, tSrS_t2r)
+        # Tiles without masking take the row max from the sm_103 reducing TMEM load.
+        use_red_max = const_expr(self.use_tmem_load_red_max and mask_fn is None)
+        tile_row_max = None
+        if const_expr(use_red_max):
+            num_t2r = cute.size(tStS_t2r_red, mode=[2])
+            tSrMax = cute.make_rmem_tensor(
+                cute.make_layout((1, num_t2r)), self.qk_acc_dtype
+            )
+            for i in cutlass.range_constexpr(num_t2r):
+                cute.copy_atom_call(
+                    tiled_tmem_load_red,
+                    tStS_t2r_red[None, 0, i],
+                    (tSrS_t2r[None, 0, i], tSrMax[None, i]),
+                )
+            tile_row_max = softmax._compute_row_max(tSrMax.load())
+        else:
+            cute.copy(thr_tmem_load, tStS_t2r, tSrS_t2r)
         # tSrS_t2r = copy_utils.load_t2r(thr_tmem_load, tScS_shape, tStS_t2r)
 
         if const_expr(self.has_bias and apply_bias):
@@ -4386,7 +4427,9 @@ class FlashAttentionForwardSm100:
 
         if const_expr(mask_fn is not None):
             mask_fn(tSrS_t2r, n_block=n_block)
-        row_max, acc_scale = softmax.update_row_max(tSrS_t2r.load(), is_first)
+        row_max, acc_scale = softmax.update_row_max(
+            tSrS_t2r.load(), is_first, tile_row_max=tile_row_max
+        )
 
         if const_expr(not is_first):
             # tSrScale_r2t = cute.make_rmem_tensor(thr_tmem_store_scale.partition_S(tScScale).shape, Float32)

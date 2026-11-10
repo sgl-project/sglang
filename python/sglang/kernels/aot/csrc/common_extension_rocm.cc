@@ -49,17 +49,8 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
 
   m.def(
       "deepseek_v4_topk_transform_512(Tensor scores, Tensor seq_lens, Tensor page_table, Tensor! "
-      "page_indices, int page_size, Tensor!? raw_indices) -> ()");
+      "page_indices, int page_size, Tensor!? raw_indices, bool sort_output=False) -> ()");
   m.impl("deepseek_v4_topk_transform_512", torch::kCUDA, &deepseek_v4_topk_transform_512);
-
-  m.def(
-      "dsv4_fused_q_norm_rope(Tensor q_input, Tensor! q_output, Tensor freqs_cis, Tensor positions, float eps) -> ()");
-  m.impl("dsv4_fused_q_norm_rope", torch::kCUDA, &dsv4_fused_q_norm_rope);
-
-  m.def(
-      "dsv4_fused_k_norm_rope_flashmla(Tensor kv, Tensor kv_weight, Tensor freqs_cis, Tensor positions, "
-      "Tensor out_loc, Tensor! kvcache, float eps, int page_size) -> ()");
-  m.impl("dsv4_fused_k_norm_rope_flashmla", torch::kCUDA, &dsv4_fused_k_norm_rope_flashmla);
 
   m.def(
       "dsv4_fused_q_indexer_rope_hadamard_quant(Tensor q_input, Tensor! q_fp8, Tensor weight, "

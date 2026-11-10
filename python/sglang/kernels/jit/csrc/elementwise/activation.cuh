@@ -1,6 +1,7 @@
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
+#include <sgl_kernel/activation.cuh>
 #include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/type.cuh>
 #include <sgl_kernel/utils.cuh>
@@ -8,7 +9,6 @@
 
 #include <tvm/ffi/container/tensor.h>
 
-#include <cmath>
 #include <cstdint>
 #include <limits>
 #include <string>
@@ -22,21 +22,16 @@ enum class ActivationKind : uint32_t {
   kReLU2,
 };
 
-template <ActivationKind kAct>
+template <ActivationKind kAct, bool kFastMath>
 SGL_DEVICE float apply_activation_f32(float x_f32) {
   if constexpr (kAct == ActivationKind::kSiLU) {
-    return x_f32 / (1.0f + expf(-x_f32));
+    return device::activation::silu<kFastMath>(x_f32);
   } else if constexpr (kAct == ActivationKind::kGELU) {
-    constexpr auto kSqrt1Over2 = 0.7071067811865475f;
-    return x_f32 * (0.5f * (1.0f + erff(x_f32 * kSqrt1Over2)));
+    return device::activation::gelu<kFastMath>(x_f32);
   } else if constexpr (kAct == ActivationKind::kGELUTanh) {
-    constexpr auto kGeluTanhAlpha = 0.044715f;
-    constexpr auto kGeluTanhBeta = 0.7978845608028654f;
-    const float cdf = 0.5f * (1.0f + tanhf(kGeluTanhBeta * (x_f32 + kGeluTanhAlpha * x_f32 * x_f32 * x_f32)));
-    return x_f32 * cdf;
+    return device::activation::gelu_tanh<kFastMath>(x_f32);
   } else if constexpr (kAct == ActivationKind::kReLU2) {
-    const float relu = x_f32 > 0.0f ? x_f32 : 0.0f;
-    return relu * relu;
+    return device::activation::relu2<kFastMath>(x_f32);
   } else {
     static_assert(host::dependent_false_v<decltype(kAct)>, "unsupported activation kind");
     return 0.0f;
@@ -53,15 +48,25 @@ struct ActivationParams {
   // for per-token routing and BLOCK_SIZE_M for sorted/TMA routing.
   const int32_t* __restrict__ expert_ids;
   uint32_t expert_step;
+  float clamp_limit;
+  // Optional sorted-layout filtering (MoE TMA down path): a row is skipped if it
+  // is at or past *num_tokens_post_padded or its sorted_token_ids entry is the
+  // padding sentinel (>= num_valid_tokens). Must match token_mask in fused_moe_kernel.
+  const int32_t* __restrict__ sorted_token_ids;
+  const int32_t* __restrict__ num_tokens_post_padded;
+  uint32_t num_valid_tokens;
 };
 
 template <
     typename T,
     ActivationKind kAct,
     bool kUsePDL,
+    bool kFastMath,
     bool kFilterExpert,
     bool kRoundActivation = false,
-    bool kReuseInput = false>
+    bool kReuseInput = false,
+    bool kClamp = false,
+    bool kFilterSorted = false>
 __global__ void act_and_mul_kernel(const __grid_constant__ ActivationParams params) {
   using namespace device;
   constexpr auto kVecSize = kMaxVecBytes / sizeof(T);
@@ -71,31 +76,48 @@ __global__ void act_and_mul_kernel(const __grid_constant__ ActivationParams para
   const auto token_id = tid / num_vecs;
 
   if (token_id >= params.num_tokens) return;
-  if constexpr (kFilterExpert) {
+  // Like expert_ids, these are moe_align_block_size outputs the up GEMM already
+  // waited on (gdc_wait) before triggering this launch, so they may be read before
+  // PDLWaitPrimary. The host checks that both arrays cover every row, so the three
+  // loads are issued together instead of one after another.
+  if constexpr (kFilterSorted) {
+    const auto num_post = static_cast<uint32_t>(*params.num_tokens_post_padded);
+    const auto sorted_id = static_cast<uint32_t>(params.sorted_token_ids[token_id]);
+    const auto expert_id = params.expert_ids[token_id / params.expert_step];
+    if (token_id >= num_post || sorted_id >= params.num_valid_tokens || expert_id == -1) return;
+  } else if constexpr (kFilterExpert) {
     if (params.expert_ids[token_id / params.expert_step] == -1) return;
   }
   const auto offset = tid % num_vecs;
   const auto input_offset = token_id * (num_vecs * 2) + offset;
   const auto output_offset = kReuseInput ? input_offset : tid;
   PDLWaitPrimary<kUsePDL>();
-  const auto gate = device::load_as<vec_t>(params.input, input_offset);
-  const auto up = device::load_as<vec_t>(params.input, input_offset + num_vecs);
+  const auto input = assume_global(const_cast<void*>(params.input));
+  vec_t gate, up;
+  gate.load(input, input_offset);
+  up.load(input, input_offset + num_vecs);
+  const float limit = device::cast<fp32_t>(device::cast<T>(params.clamp_limit));
   vec_t out;
 #pragma unroll
   for (int i = 0; i < kVecSize; ++i) {
-    const float gate_f32 = device::cast<fp32_t>(gate[i]);
-    const float up_f32 = device::cast<fp32_t>(up[i]);
+    float gate_f32 = device::cast<fp32_t>(gate[i]);
+    float up_f32 = device::cast<fp32_t>(up[i]);
+    if constexpr (kClamp) {
+      static_assert(kAct == ActivationKind::kSiLU);
+      gate_f32 = gate_f32 > limit ? limit : gate_f32;
+      up_f32 = up_f32 > limit ? limit : (up_f32 < -limit ? -limit : up_f32);
+    }
     if constexpr (kRoundActivation) {
-      const T activated = device::cast<T>(apply_activation_f32<kAct>(gate_f32));
+      const T activated = device::cast<T>(apply_activation_f32<kAct, kFastMath>(gate_f32));
       out[i] = device::cast<T>(device::cast<fp32_t>(activated) * up_f32);
     } else {
-      out[i] = device::cast<T>(apply_activation_f32<kAct>(gate_f32) * up_f32);
+      out[i] = device::cast<T>(apply_activation_f32<kAct, kFastMath>(gate_f32) * up_f32);
     }
   }
   if constexpr (kReuseInput) {
-    device::store_as<vec_t>(const_cast<void*>(params.input), out, output_offset);
+    out.store(input, output_offset);
   } else {
-    device::store_as<vec_t>(params.out, out, output_offset);
+    out.store(params.out, output_offset);
   }
   PDLTriggerSecondary<kUsePDL>();
 }
@@ -106,7 +128,7 @@ struct UnaryActivationParams {
   uint32_t num_vecs;
 };
 
-template <typename T, ActivationKind kAct, bool kUsePDL>
+template <typename T, ActivationKind kAct, bool kUsePDL, bool kFastMath>
 __global__ void act_kernel(const __grid_constant__ UnaryActivationParams params) {
   using namespace device;
   constexpr auto kVecSize = kMaxVecBytes / sizeof(T);
@@ -114,59 +136,78 @@ __global__ void act_kernel(const __grid_constant__ UnaryActivationParams params)
   const auto vec_id = blockIdx.x * blockDim.x + threadIdx.x;
   if (vec_id >= params.num_vecs) return;
   PDLWaitPrimary<kUsePDL>();
-  const auto in = device::load_as<vec_t>(params.input, vec_id);
+  vec_t in;
+  in.load(assume_global(params.input), vec_id);
   vec_t out;
 #pragma unroll
   for (int i = 0; i < kVecSize; ++i) {
-    out[i] = device::cast<T>(apply_activation_f32<kAct>(device::cast<fp32_t>(in[i])));
+    out[i] = device::cast<T>(apply_activation_f32<kAct, kFastMath>(device::cast<fp32_t>(in[i])));
   }
-  device::store_as<vec_t>(params.out, out, vec_id);
+  out.store(params.out, vec_id);
   PDLTriggerSecondary<kUsePDL>();
 }
 
-template <typename T, bool kUsePDL>
+// kFastMath = false reproduces eager PyTorch's activations.
+template <typename T, bool kUsePDL, bool kFastMath>
 struct ActivationKernel {
   static constexpr auto kVecSize = device::kMaxVecBytes / sizeof(T);
   static constexpr auto kBlockSize = 256u;
 
-  using kernel_fn_t = decltype(&act_and_mul_kernel<T, ActivationKind::kSiLU, kUsePDL, false>);
-  using unary_kernel_fn_t = decltype(&act_kernel<T, ActivationKind::kReLU2, kUsePDL>);
+  using kernel_fn_t = decltype(&act_and_mul_kernel<T, ActivationKind::kSiLU, kUsePDL, kFastMath, false>);
+  using unary_kernel_fn_t = decltype(&act_kernel<T, ActivationKind::kReLU2, kUsePDL, kFastMath>);
 
-  template <ActivationKind kAct, bool kFilterExpert, bool kRoundActivation = false, bool kReuseInput = false>
-  static constexpr kernel_fn_t activation_kernel =
-      act_and_mul_kernel<T, kAct, kUsePDL, kFilterExpert, kRoundActivation, kReuseInput>;
+  template <
+      ActivationKind kAct,
+      bool kFilterExpert,
+      bool kRoundActivation = false,
+      bool kReuseInput = false,
+      bool kFilterSorted = false>
+  static constexpr kernel_fn_t activation_kernel = act_and_mul_kernel<
+      T,
+      kAct,
+      kUsePDL,
+      kFastMath,
+      kFilterExpert,
+      kRoundActivation,
+      kReuseInput,
+      false,
+      kFilterSorted>;
 
   static_assert(device::kMaxVecBytes % sizeof(T) == 0, "unsupported data type");
 
-  template <bool kFilterExpert, bool kRoundActivation = false, bool kReuseInput = false>
+  template <bool kFilterExpert, bool kRoundActivation = false, bool kReuseInput = false, bool kFilterSorted = false>
   static kernel_fn_t select_kernel(const std::string& type) {
     using namespace host;
     if (type == "silu") {
-      return activation_kernel<ActivationKind::kSiLU, kFilterExpert, kRoundActivation, kReuseInput>;
+      return activation_kernel<ActivationKind::kSiLU, kFilterExpert, kRoundActivation, kReuseInput, kFilterSorted>;
     } else if (type == "gelu") {
-      return activation_kernel<ActivationKind::kGELU, kFilterExpert, kRoundActivation, kReuseInput>;
+      return activation_kernel<ActivationKind::kGELU, kFilterExpert, kRoundActivation, kReuseInput, kFilterSorted>;
     } else if (type == "gelu_tanh") {
-      return activation_kernel<ActivationKind::kGELUTanh, kFilterExpert, kRoundActivation, kReuseInput>;
+      return activation_kernel<ActivationKind::kGELUTanh, kFilterExpert, kRoundActivation, kReuseInput, kFilterSorted>;
     } else {
       Panic("unsupported activation type: ", type);
     }
     return nullptr;
   }
 
-  template <bool kRoundActivation = false, bool kReuseInput = false>
+  template <bool kRoundActivation = false, bool kReuseInput = false, bool kClamp = false>
   static void launch(
       const tvm::ffi::TensorView& input,
       const tvm::ffi::TensorView& out,
       const std::string& type,
       const int32_t* expert_ids,
-      uint32_t expert_step) {
+      uint32_t expert_step,
+      float clamp_limit = 0.0f,
+      const int32_t* sorted_token_ids = nullptr,
+      const int32_t* num_tokens_post_padded = nullptr,
+      uint32_t num_valid_tokens = 0) {
     using namespace host;
 
     auto N = SymbolicSize{"num_tokens"};
     auto D_in = SymbolicSize{"input_width"};
     auto D_out = SymbolicSize{"output_width"};
     auto device_ = SymbolicDevice{};
-    device_.set_options<kDLCUDA>();
+    device_.set_options<kDLGPU>();
 
     if constexpr (kReuseInput) {
       TensorMatcher({N, D_out}).with_strides({D_in, 1}).with_dtype<T>().with_device(device_).verify(out);
@@ -198,8 +239,26 @@ struct ActivationKernel {
         .num_tokens = num_tokens,
         .expert_ids = expert_ids,
         .expert_step = expert_step,
+        .clamp_limit = clamp_limit,
+        .sorted_token_ids = sorted_token_ids,
+        .num_tokens_post_padded = num_tokens_post_padded,
+        .num_valid_tokens = num_valid_tokens,
     };
-    if (expert_ids != nullptr) {
+    if constexpr (kClamp) {
+      RuntimeCheck(type == "silu" && expert_ids == nullptr, "clamping requires unfiltered SiLU");
+      const auto kernel =
+          act_and_mul_kernel<T, ActivationKind::kSiLU, kUsePDL, kFastMath, false, kRoundActivation, kReuseInput, true>;
+      LaunchKernel(num_blocks, kBlockSize, device).enable_pdl(kUsePDL)(kernel, params);
+    } else if (sorted_token_ids != nullptr) {
+      // Only the plain (non-rounding, out-of-place) path takes the sorted
+      // layout; the sorted layout always comes with block-level expert_ids.
+      if constexpr (kRoundActivation || kReuseInput) {
+        Panic("sorted filtering is not supported for this activation variant");
+      } else {
+        const auto kernel = select_kernel<true, false, false, true>(type);
+        LaunchKernel(num_blocks, kBlockSize, device).enable_pdl(kUsePDL)(kernel, params);
+      }
+    } else if (expert_ids != nullptr) {
       RuntimeCheck(expert_step > 0, "expert_step must be positive");
       const auto kernel = select_kernel<true, kRoundActivation, kReuseInput>(type);
       LaunchKernel(num_blocks, kBlockSize, device).enable_pdl(kUsePDL)(kernel, params);
@@ -213,9 +272,13 @@ struct ActivationKernel {
     launch(input, out, type, /*expert_ids=*/nullptr, /*expert_step=*/1);
   }
 
-  static void
-  run_activation_with_rounding(const tvm::ffi::TensorView input, const tvm::ffi::TensorView out, std::string type) {
-    launch<true>(input, out, type, /*expert_ids=*/nullptr, /*expert_step=*/1);
+  static void run_activation_with_rounding(
+      const tvm::ffi::TensorView input, const tvm::ffi::TensorView out, std::string type, double clamp_limit) {
+    if (clamp_limit > 0) {
+      launch<true, false, true>(input, out, type, /*expert_ids=*/nullptr, /*expert_step=*/1, clamp_limit);
+    } else {
+      launch<true>(input, out, type, /*expert_ids=*/nullptr, /*expert_step=*/1);
+    }
   }
 
   static void run_activation_with_rounding_input_inplace(
@@ -235,8 +298,43 @@ struct ActivationKernel {
     launch(input, out, type, static_cast<const int32_t*>(expert_ids.data_ptr()), static_cast<uint32_t>(expert_step));
   }
 
+  /// \brief Gated activation over the sorted, block-padded MoE layout.
+  /// \param expert_ids Per-block expert ids (-1 = non-local expert), one per expert_step rows.
+  /// \param sorted_token_ids moe_align_block_size output; entries >= num_valid_tokens are padding.
+  /// \param num_tokens_post_padded Device scalar; rows at or past it are padding.
+  /// Rows the MoE GEMM never reads are skipped and left unwritten in out.
+  static void run_activation_sorted_filtered(
+      const tvm::ffi::TensorView input,
+      const tvm::ffi::TensorView out,
+      const tvm::ffi::TensorView expert_ids,
+      int64_t expert_step,
+      const tvm::ffi::TensorView sorted_token_ids,
+      const tvm::ffi::TensorView num_tokens_post_padded,
+      int64_t num_valid_tokens,
+      std::string type) {
+    using namespace host;
+    CHECK_HOST(is_type<int32_t>(expert_ids.dtype())) << "expert_ids must have dtype int32";
+    CHECK_HOST(is_type<int32_t>(sorted_token_ids.dtype())) << "sorted_token_ids must have dtype int32";
+    CHECK_HOST(is_type<int32_t>(num_tokens_post_padded.dtype())) << "num_tokens_post_padded must have dtype int32";
+    CHECK_HOST(expert_step >= 1) << "expert_step must be positive, got " << expert_step;
+    CHECK_HOST(sorted_token_ids.numel() >= input.size(0)) << "sorted_token_ids must cover every row";
+    CHECK_HOST(expert_ids.numel() * expert_step >= input.size(0)) << "expert_ids must cover every row";
+    CHECK_HOST(0 <= num_valid_tokens && num_valid_tokens <= std::numeric_limits<int32_t>::max())
+        << "num_valid_tokens out of range: " << num_valid_tokens;
+    launch(
+        input,
+        out,
+        type,
+        static_cast<const int32_t*>(expert_ids.data_ptr()),
+        static_cast<uint32_t>(expert_step),
+        /*clamp_limit=*/0.0f,
+        static_cast<const int32_t*>(sorted_token_ids.data_ptr()),
+        static_cast<const int32_t*>(num_tokens_post_padded.data_ptr()),
+        static_cast<uint32_t>(num_valid_tokens));
+  }
+
   template <ActivationKind kAct>
-  static constexpr auto unary_kernel = act_kernel<T, kAct, kUsePDL>;
+  static constexpr auto unary_kernel = act_kernel<T, kAct, kUsePDL, kFastMath>;
 
   // Use the explicit non-const function-pointer type (mirrors select_kernel's
   // kernel_fn_t) rather than a trailing `decltype(unary_kernel<...>)` return,
@@ -259,7 +357,7 @@ struct ActivationKernel {
     auto N = SymbolicSize{"num_tokens"};
     auto D = SymbolicSize{"hidden"};
     auto device_ = SymbolicDevice{};
-    device_.set_options<kDLCUDA>();
+    device_.set_options<kDLGPU>();
 
     TensorMatcher({N, D})  //
         .with_dtype<T>()
