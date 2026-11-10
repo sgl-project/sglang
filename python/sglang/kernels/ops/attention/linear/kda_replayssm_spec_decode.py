@@ -503,14 +503,8 @@ def commit_kda_replayssm_tree_all_layers(
     mamba_track_indices: torch.Tensor | None = None,
     mamba_steps_to_track: torch.Tensor | None = None,
     null_block_id: int = -1,
-    block_value: int | None = None,
-    num_stages: int = 3,
 ) -> None:
-    """Commit sampled UBTree paths for every KDA layer in one launch.
-
-    ``block_value`` and ``num_stages`` are exposed for shape-specific tuning;
-    the defaults preserve the bit-exact production configuration.
-    """
+    """Commit sampled UBTree paths for every KDA layer in one launch."""
     num_layers, _, num_value_heads, value_dim, key_dim = checkpoint_state.shape
     num_key_heads = rawk_cache.shape[2]
     cache_tree_width = rawv_cache.shape[-2]
@@ -524,12 +518,9 @@ def commit_kda_replayssm_tree_all_layers(
         raise ValueError(
             f"factorized UBTree commit supports only BS=1, got {batch_size}"
         )
-    if block_value is None:
-        # The commit keeps a full [BK, BV] FP32 state tile live across the
-        # accept-path loop. BV=8 avoids register/occupancy pressure for V=128.
-        block_value = (
-            8 if value_dim == 128 else min(triton.next_power_of_2(value_dim), 32)
-        )
+    # The commit keeps a full [BK, BV] FP32 state tile live across the
+    # accept-path loop. BV=8 avoids register/occupancy pressure for V=128.
+    block_value = 8 if value_dim == 128 else min(triton.next_power_of_2(value_dim), 32)
     if block_value not in (8, 16, 32):
         raise ValueError(f"unsupported tree commit block_value={block_value}")
     has_track = mamba_track_indices is not None and mamba_steps_to_track is not None
@@ -577,7 +568,7 @@ def commit_kda_replayssm_tree_all_layers(
         NULL_BLOCK_ID=null_block_id,
         HAS_TRACK=has_track,
         num_warps=1,
-        num_stages=num_stages,
+        num_stages=3,
     )
 
 

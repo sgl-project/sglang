@@ -829,7 +829,6 @@ def fused_sigmoid_gating_delta_rule_tree_factor_verify_kernel(
     BT: tl.constexpr,
     BM: tl.constexpr,
     NM: tl.constexpr,
-    FACTORS_LOW_PRECISION: tl.constexpr,
     USE_GDC: tl.constexpr = False,
 ):
     """Recover every tree-node output from compact query/value factors."""
@@ -863,8 +862,6 @@ def fused_sigmoid_gating_delta_rule_tree_factor_verify_kernel(
         mask=mask_m[:, None] & mask_k[None, :],
         other=0.0,
     )
-    if not FACTORS_LOW_PRECISION:
-        b_query_factors = b_query_factors.to(tl.float32)
     state_ptr = (
         h0_source
         + state_idx * stride_h0_source
@@ -877,8 +874,6 @@ def fused_sigmoid_gating_delta_rule_tree_factor_verify_kernel(
         mask=(state_idx >= 0) & mask_k[:, None] & mask_v[None, :],
         other=0.0,
     ).to(tl.float32)
-    if FACTORS_LOW_PRECISION:
-        b_state = b_state.to(tl.bfloat16)
     b_o = tl.dot(b_query_factors, b_state, input_precision="ieee")
 
     value_factor_ptr = (
@@ -891,16 +886,12 @@ def fused_sigmoid_gating_delta_rule_tree_factor_verify_kernel(
         mask=mask_m[:, None] & mask_t[None, :],
         other=0.0,
     )
-    if not FACTORS_LOW_PRECISION:
-        b_value_factors = b_value_factors.to(tl.float32)
     value_ptr = v + (bos + o_t[:, None]) * stride_v + i_hv * V + o_v[None, :]
     b_values = tl.load(
         value_ptr,
         mask=mask_t[:, None] & mask_v[None, :],
         other=0.0,
     ).to(tl.float32)
-    if FACTORS_LOW_PRECISION:
-        b_values = b_values.to(tl.bfloat16)
     b_o += tl.dot(b_value_factors, b_values, input_precision="ieee")
 
     output_ptr = o + ((bos + o_m[:, None]) * HV + i_hv) * V + o_v[None, :]
@@ -957,12 +948,6 @@ def fused_sigmoid_gating_delta_rule_update(
     tree_value_factors: Optional[torch.Tensor] = None,
     force_factorized_tree: bool = False,
     factor_cache_indices: Optional[torch.Tensor] = None,
-    factor_num_warps: Optional[int] = None,
-    factor_num_stages: int = 2,
-    factor_verify_bv: Optional[int] = None,
-    factor_verify_bm: Optional[int] = None,
-    factor_verify_num_warps: Optional[int] = None,
-    factor_verify_num_stages: Optional[int] = None,
     tree_processed_k: Optional[torch.Tensor] = None,
     tree_processed_decay: Optional[torch.Tensor] = None,
     tree_processed_beta: Optional[torch.Tensor] = None,
@@ -1116,8 +1101,7 @@ def fused_sigmoid_gating_delta_rule_update(
         assert retrieve_parent_token.shape == (N, tree_width)
         assert tree_query_factors.shape == (N, HV, tree_width, K)
         assert tree_value_factors.shape == (N, HV, tree_width, tree_width)
-        assert tree_query_factors.dtype == tree_value_factors.dtype
-        assert tree_query_factors.dtype in (torch.float32, torch.bfloat16)
+        assert tree_query_factors.dtype == tree_value_factors.dtype == torch.float32
         assert tree_query_factors.is_contiguous()
         assert tree_value_factors.is_contiguous()
         assert tree_max_depth <= 16
@@ -1136,15 +1120,11 @@ def fused_sigmoid_gating_delta_rule_update(
             assert tree_processed_k.shape == (N, HV, tree_width, K)
             assert tree_processed_decay.shape == (N, HV, tree_width, K)
             assert tree_processed_beta.shape == (N, HV, tree_width)
-        if factor_num_warps is None:
-            factor_num_warps = 2
-        if factor_verify_bv is None:
-            # M=32 on Ling3-Flash TP4 is occupancy-limited at BV=16.  Splitting
-            # V into BV=8 tiles lowers the verify kernel register footprint and
-            # wins despite doubling the V-grid.  Other widths keep their
-            # previously validated tile.
-            factor_verify_bv = 8 if tree_width == 32 else 32
-        assert factor_verify_bv in (8, 16, 32)
+        # M=32 on Ling3-Flash TP4 is occupancy-limited at BV=16.  Splitting
+        # V into BV=8 tiles lowers the verify kernel register footprint and
+        # wins despite doubling the V-grid.  Other widths keep their
+        # previously validated tile.
+        factor_verify_bv = 8 if tree_width == 32 else 32
         cache_tree_factors = cache_ring
         if cache_tree_factors:
             assert V == K, "factorized tree raw cache currently requires V == K"
@@ -1203,20 +1183,14 @@ def fused_sigmoid_gating_delta_rule_update(
             CACHE_TREE_FACTORS=cache_tree_factors,
             USE_DYNAMIC_DEPTH=use_dynamic_depth,
             USE_PRECOMPUTED_TRANSFORMS=use_precomputed_transforms,
-            num_warps=factor_num_warps,
-            num_stages=factor_num_stages,
+            num_warps=2,
+            num_stages=2,
             **factor_pdl_kwargs,
         )
         factor_verify_nv = triton.cdiv(V, factor_verify_bv)
         # Keep the tuned 32-node schedule. The general schedule tiles the node
         # dimension in 64-row CTAs, including partial tiles and trees > 64 nodes.
-        if factor_verify_bm is None:
-            factor_verify_bm = 32 if tree_width == 32 else 64
-        assert factor_verify_bm in (16, 32, 64)
-        if factor_verify_num_warps is None:
-            factor_verify_num_warps = 2 if tree_width == 32 else 8
-        if factor_verify_num_stages is None:
-            factor_verify_num_stages = 1 if tree_width == 32 else 3
+        factor_verify_bm = 32 if tree_width == 32 else 64
         factor_verify_nm = triton.cdiv(tree_width, factor_verify_bm)
         factor_verify_grid = (factor_verify_nv, N * factor_verify_nm, HV)
         fused_sigmoid_gating_delta_rule_tree_factor_verify_kernel[factor_verify_grid](
@@ -1240,9 +1214,8 @@ def fused_sigmoid_gating_delta_rule_update(
             BT=max(16, triton.next_power_of_2(tree_width)),
             BM=factor_verify_bm,
             NM=factor_verify_nm,
-            FACTORS_LOW_PRECISION=tree_query_factors.dtype != torch.float32,
-            num_warps=factor_verify_num_warps,
-            num_stages=factor_verify_num_stages,
+            num_warps=2 if tree_width == 32 else 8,
+            num_stages=1 if tree_width == 32 else 3,
             **factor_pdl_kwargs,
         )
         return o.squeeze(0)

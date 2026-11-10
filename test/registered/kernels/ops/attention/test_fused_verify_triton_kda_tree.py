@@ -13,8 +13,7 @@ register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="1-gpu-
 
 @pytest.mark.parametrize("width", [2, 17, 32, 33, 49, 65])
 @pytest.mark.parametrize("lower_bound", [None, -5.0])
-@pytest.mark.parametrize("factor_dtype", [torch.float32, torch.bfloat16])
-def test_factorized_tree_matches_serial_model_shape(width, lower_bound, factor_dtype):
+def test_factorized_tree_matches_serial_model_shape(width, lower_bound):
     torch.manual_seed(4096)
     device = "cuda"
     batch_size = 1
@@ -64,7 +63,7 @@ def test_factorized_tree_matches_serial_model_shape(width, lower_bound, factor_d
         num_value_heads,
         width,
         key_dim,
-        dtype=factor_dtype,
+        dtype=torch.float32,
         device=device,
     )
     tree_value_factors = torch.empty(
@@ -72,7 +71,7 @@ def test_factorized_tree_matches_serial_model_shape(width, lower_bound, factor_d
         num_value_heads,
         width,
         width,
-        dtype=factor_dtype,
+        dtype=torch.float32,
         device=device,
     )
     common = dict(
