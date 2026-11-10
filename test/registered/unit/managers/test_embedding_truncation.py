@@ -1,10 +1,13 @@
 import unittest
-from types import SimpleNamespace
+
+import torch
 
 from sglang.srt.managers.embedding_truncation import (
     embedding_input_token_limit,
     truncate_embedding_input,
 )
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
+from sglang.srt.multimodal.modality import Modality
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -22,11 +25,14 @@ class TestEmbeddingTruncation(unittest.TestCase):
 
     @staticmethod
     def mm(ids, offsets, **kwargs):
-        return SimpleNamespace(
+        return MultimodalProcessorOutput(
             input_ids=list(ids),
             padded_input_ids=list(ids),
-            token_type_ids=[0] * len(ids),
-            mm_items=[SimpleNamespace(offsets=spans) for spans in offsets],
+            token_type_ids=torch.zeros(len(ids), dtype=torch.long),
+            mm_items=[
+                MultimodalDataItem(modality=Modality.IMAGE, offsets=spans)
+                for spans in offsets
+            ],
             **kwargs,
         )
 
@@ -74,6 +80,69 @@ class TestEmbeddingTruncation(unittest.TestCase):
         self.assertEqual(self.truncate(list(range(9)))[0], list(range(8)))
         with self.assertRaisesRegex(ValueError, "truncate=NONE"):
             self.truncate(list(range(9)), "NONE")
+
+    def test_special_token_mask_preserves_template_not_literal_special_ids(self):
+        # The second 99 is literal text, not a token added by the template.
+        ids = [98, 10, 99, 11, 12, 13, 99]
+        mask = [1, 0, 0, 0, 0, 0, 1]
+        for policy, positions in (("END", [0, 1, 2, 6]), ("START", [0, 4, 5, 6])):
+            with self.subTest(policy=policy):
+                result, types, _ = self.truncate(
+                    ids,
+                    policy,
+                    max_tokens=4,
+                    special_tokens_mask=mask,
+                    token_type_ids=list(range(len(ids))),
+                )
+                self.assertEqual(result, [ids[i] for i in positions])
+                self.assertEqual(types, positions)
+        self.assertEqual(ids, [98, 10, 99, 11, 12, 13, 99])
+        self.assertEqual(mask, [1, 0, 0, 0, 0, 0, 1])
+
+    def test_special_tokens_count_toward_the_entire_budget(self):
+        for policy in ("END", "START"):
+            with self.subTest(policy=policy):
+                self.assertEqual(
+                    self.truncate(
+                        [98, 10, 11, 99],
+                        policy,
+                        max_tokens=2,
+                        special_tokens_mask=[1, 0, 0, 1],
+                    )[0],
+                    [98, 99],
+                )
+                with self.assertRaisesRegex(ValueError, "required special tokens"):
+                    self.truncate(
+                        [98, 10, 11, 99],
+                        policy,
+                        max_tokens=1,
+                        special_tokens_mask=[1, 0, 0, 1],
+                    )
+        with self.assertRaisesRegex(ValueError, "truncate=NONE"):
+            self.truncate(
+                [98, 10, 11, 99], "NONE", max_tokens=3, special_tokens_mask=[1, 0, 0, 1]
+            )
+
+    def test_misaligned_special_token_mask_is_rejected(self):
+        for mask in ([1, 0], [1, 2, 0, 1]):
+            with self.subTest(mask=mask):
+                with self.assertRaisesRegex(ValueError, "special_tokens_mask"):
+                    self.truncate(
+                        [98, 10, 11, 99], max_tokens=3, special_tokens_mask=mask
+                    )
+
+    def test_special_token_selection_keeps_tensor_metadata_aligned(self):
+        types = torch.tensor([[0, 1, 2, 3, 4, 5]])
+        ids, selected, _ = self.truncate(
+            [98, 10, 11, 12, 13, 99],
+            "START",
+            max_tokens=4,
+            special_tokens_mask=[1, 0, 0, 0, 0, 1],
+            token_type_ids=types,
+        )
+        self.assertEqual(ids, [98, 12, 13, 99])
+        self.assertEqual(selected.tolist(), [[0, 3, 4, 5]])
+        self.assertEqual(types.tolist(), [[0, 1, 2, 3, 4, 5]])
 
     def test_none_checks_explicit_and_server_budgets(self):
         with self.assertRaisesRegex(ValueError, "budget of 3"):
@@ -137,12 +206,12 @@ class TestEmbeddingTruncation(unittest.TestCase):
         self.assertEqual(types, [1] * 10)
         self.assertEqual(updated.input_ids, result)
         self.assertEqual(updated.padded_input_ids, result)
-        self.assertEqual(updated.token_type_ids, [0] * 10)
+        self.assertEqual(updated.token_type_ids.tolist(), [0] * 10)
         self.assertIs(updated.mm_items, mm.mm_items)
         self.assertEqual(updated.mm_items[0].offsets, [(1, 2), (4, 5)])
         self.assertEqual(mm.input_ids, ids)
         self.assertEqual(mm.padded_input_ids, ids)
-        self.assertEqual(mm.token_type_ids, [0] * 14)
+        self.assertEqual(mm.token_type_ids.tolist(), [0] * 14)
         self.assertIsNot(updated, mm)
 
     def test_mm_rejects_cut_media_removed_media_and_closing_delimiter(self):
@@ -200,15 +269,64 @@ class TestEmbeddingTruncation(unittest.TestCase):
         ids = list(range(12))
         for name in ("mrope_positions", "mrope_position_delta", "vision_position_ids"):
             with self.subTest(name=name):
-                mm = self.mm(ids, [[(1, 2)]], **{name: [0]})
+                mm = self.mm(
+                    ids, [[(1, 2)]], **{name: torch.zeros(1, dtype=torch.long)}
+                )
                 with self.assertRaisesRegex(ValueError, name):
                     self.truncate(ids, mm_inputs=mm)
 
     def test_mm_boundary_tokens_cannot_be_removed(self):
         ids = list(range(12))
-        mm = self.mm(ids, [[(1, 2)]], im_end_id=10)
-        with self.assertRaisesRegex(ValueError, "boundary token"):
-            self.truncate(ids, mm_inputs=mm)
+        for name in (
+            "im_token_id",
+            "im_start_id",
+            "im_end_id",
+            "slice_start_id",
+            "slice_end_id",
+            "video_token_id",
+            "audio_token_id",
+            "audio_start_id",
+            "audio_end_id",
+        ):
+            with self.subTest(field=name):
+                mm = self.mm(ids, [[(1, 2)]], **{name: 10})
+                with self.assertRaisesRegex(ValueError, "boundary token"):
+                    self.truncate(ids, mm_inputs=mm)
+
+    def test_mm_optional_metadata_stays_none(self):
+        ids = list(range(12))
+        mm = MultimodalProcessorOutput(
+            input_ids=ids,
+            mm_items=[MultimodalDataItem(modality=Modality.IMAGE, offsets=[(1, 2)])],
+            im_end_id=3,
+            media_nums_per_sample=[1],
+        )
+        result, _, updated = self.truncate(ids, mm_inputs=mm)
+        self.assertEqual(result, ids[:8])
+        self.assertIsInstance(updated, MultimodalProcessorOutput)
+        self.assertIsNone(updated.padded_input_ids)
+        self.assertIsNone(updated.token_type_ids)
+        self.assertEqual(updated.im_end_id, 3)
+        self.assertEqual(updated.media_nums_per_sample, [1])
+        self.assertIs(updated.mm_items, mm.mm_items)
+        self.assertEqual(mm.input_ids, ids)
+
+    def test_mm_tensor_metadata_alignment_and_isolation(self):
+        ids = list(range(12))
+        mm = self.mm(ids, [[(1, 2)]])
+        original = torch.arange(24).reshape(2, 12)
+        mm.token_type_ids = original
+        _, _, updated = self.truncate(ids, mm_inputs=mm)
+        torch.testing.assert_close(updated.token_type_ids, original[:, :8])
+        self.assertIs(mm.token_type_ids, original)
+        self.assertEqual(mm.token_type_ids.shape, (2, 12))
+        for invalid in (torch.tensor(1), torch.arange(4)):
+            with self.subTest(shape=invalid.shape):
+                mm.token_type_ids = invalid
+                with self.assertRaisesRegex(ValueError, "misaligned"):
+                    self.truncate(ids, mm_inputs=mm)
+                self.assertIs(mm.token_type_ids, invalid)
+                self.assertEqual(mm.input_ids, ids)
 
     def test_misaligned_token_metadata_rejected(self):
         with self.assertRaisesRegex(ValueError, "misaligned token_type_ids"):

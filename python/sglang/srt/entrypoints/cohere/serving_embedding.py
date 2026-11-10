@@ -82,6 +82,9 @@ class CohereServingEmbedding(OpenAIServingBase):
     ):
         super().__init__(tokenizer_manager)
         self.template_manager = template_manager
+        self._task_instructions = _string_instructions(
+            tokenizer_manager.model_config.hf_config.to_dict().get("task_instructions")
+        )
 
     def _request_id_prefix(self) -> str:
         return "embd-"
@@ -116,11 +119,9 @@ class CohereServingEmbedding(OpenAIServingBase):
     def _task_instruction(self, input_type: Optional[str]) -> Optional[str]:
         if input_type is None:
             return None
-        config = self.tokenizer_manager.model_config
-        instructions = _string_instructions(
-            getattr(config.hf_config, "task_instructions", None)
-        )
+        instructions = self._task_instructions
         if not instructions:
+            config = self.tokenizer_manager.model_config
             instructions = _load_sentence_transformer_prompts(
                 config.model_path, config.revision
             )
@@ -135,7 +136,7 @@ class CohereServingEmbedding(OpenAIServingBase):
         return bool(
             self.template_manager.chat_template_name
             or self.template_manager.python_chat_template
-            or getattr(self.tokenizer_manager.tokenizer, "chat_template", None)
+            or self.tokenizer_manager.tokenizer.chat_template
         )
 
     def _render_content(self, content: list[dict], instruction: Optional[str]) -> str:
@@ -262,20 +263,13 @@ class CohereServingEmbedding(OpenAIServingBase):
         )
         return adapted, request
 
-    # The current /v2/embed implementation supports only non-streaming responses.
-    # CohereEmbedRequest follows vLLM v0.32.0 and has no `stream` field. If a
-    # client sends one, Pydantic ignores it as an extra field, so it cannot
-    # enable streaming. OpenAIServingBase.handle_request therefore selects
-    # this handler; we intentionally do not override _handle_streaming_request.
-    # The endpoint returns all embeddings together in one JSON response.
+    # /v2/embed has no stream field, so the base class always takes this path.
     async def _handle_non_streaming_request(
         self,
         adapted_request: EmbeddingReqInput,
         request: CohereEmbedRequest,
         raw_request: Request,
     ):
-        # Awaiting the internal async generator retrieves the embedding result;
-        # it does not stream partial HTTP responses to the client.
         result = await self.tokenizer_manager.generate_request(
             adapted_request, raw_request
         ).__anext__()

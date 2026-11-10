@@ -13,7 +13,7 @@ from unittest.mock import patch
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 from tokenizers import Tokenizer, models, pre_tokenizers, processors
-from transformers import PreTrainedTokenizerFast
+from transformers import PretrainedConfig, PreTrainedTokenizerFast
 
 from sglang.srt.entrypoints import http_server
 from sglang.srt.entrypoints.cohere.serving_embedding import (
@@ -68,7 +68,7 @@ class _InferenceDouble:
             is_matryoshka=True,
             matryoshka_dimensions=[8, 16],
             hidden_size=16,
-            hf_config=SimpleNamespace(
+            hf_config=PretrainedConfig(
                 task_instructions={"query": "query: ", "passage": "passage: "}
             ),
         )
@@ -149,6 +149,11 @@ class TestCohereEmbeddingHTTP(unittest.TestCase):
         self.addCleanup(self.client.close)
         self.addCleanup(_load_sentence_transformer_prompts.cache_clear)
 
+    def _set_task_instructions(self, instructions):
+        self.manager.model_config.hf_config.task_instructions = instructions
+        self.serving = CohereServingEmbedding(self.manager, self.templates)
+        self.app.state.cohere_serving_embedding = self.serving
+
     def post(self, **payload):
         return self.client.post("/v2/embed", json=payload)
 
@@ -215,7 +220,9 @@ class TestCohereEmbeddingHTTP(unittest.TestCase):
         self.assertEqual(self.manager.requests[-1].text, ["passage: |hello|"])
 
     def test_empty_task_instruction_uses_raw_text(self):
-        self.manager.model_config.hf_config.task_instructions["empty"] = ""
+        self._set_task_instructions(
+            {**self.manager.model_config.hf_config.task_instructions, "empty": ""}
+        )
         self.manager.tokenizer.chat_template = CHAT_TEMPLATE
         self.assertEqual(
             self.post(texts=["hello"], input_type="empty").status_code, 200
@@ -223,7 +230,7 @@ class TestCohereEmbeddingHTTP(unittest.TestCase):
         self.assertEqual(self.manager.requests[-1].text, ["hello"])
 
     def test_optional_sentence_transformer_prompts(self):
-        self.manager.model_config.hf_config.task_instructions = {"ignored": 123}
+        self._set_task_instructions({"ignored": 123})
         (self.model_dir / "config_sentence_transformers.json").write_text(
             json.dumps({"prompts": {"search_query": "search: "}})
         )
@@ -232,7 +239,7 @@ class TestCohereEmbeddingHTTP(unittest.TestCase):
         self.assertEqual(self.manager.requests[-1].text, ["search: hello"])
 
     def test_missing_malformed_and_nonobject_optional_metadata(self):
-        self.manager.model_config.hf_config.task_instructions = None
+        self._set_task_instructions(None)
         for contents in (None, "not json", "[]"):
             with self.subTest(contents=contents):
                 _load_sentence_transformer_prompts.cache_clear()

@@ -7,6 +7,7 @@ from transformers.models.pixtral.image_processing_pixtral import (
     _num_image_tokens as _get_pixtral_hf_num_image_tokens,
 )
 
+from sglang.srt.managers.io_struct import EmbeddingReqInput
 from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
 from sglang.srt.models.pixtral import (
     PixtralForConditionalGeneration,
@@ -81,7 +82,11 @@ class PixtralProcessor(BaseMultimodalProcessor):
             return_text=True,
         )
         processor_kwargs = {}
-        add_special_tokens = getattr(request_obj, "embedding_add_special_tokens", None)
+        add_special_tokens = (
+            request_obj.embedding_add_special_tokens
+            if isinstance(request_obj, EmbeddingReqInput)
+            else None
+        )
         if add_special_tokens is not None:
             processor_kwargs["add_special_tokens"] = add_special_tokens
         mm_items, input_ids, _ = await self.process_and_combine_mm_data_async(

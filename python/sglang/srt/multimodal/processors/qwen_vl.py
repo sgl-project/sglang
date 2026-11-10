@@ -16,6 +16,7 @@ from transformers import BaseImageProcessor
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
+from sglang.srt.managers.io_struct import EmbeddingReqInput
 from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
 from sglang.srt.models.cosmos3 import Cosmos3ForConditionalGeneration
 from sglang.srt.models.interns2_mobius import (
@@ -1046,7 +1047,11 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
         preprocess_time = time.perf_counter()
 
         processor_kwargs = {}
-        add_special_tokens = getattr(request_obj, "embedding_add_special_tokens", None)
+        add_special_tokens = (
+            request_obj.embedding_add_special_tokens
+            if isinstance(request_obj, EmbeddingReqInput)
+            else None
+        )
         if add_special_tokens is not None:
             processor_kwargs["add_special_tokens"] = add_special_tokens
         processor_video_config = _get_processor_video_config(
@@ -1222,8 +1227,10 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
         composed = self.compose_image_artifacts(
             input_text,
             artifacts,
-            add_special_tokens=getattr(
-                request_obj, "embedding_add_special_tokens", None
+            add_special_tokens=(
+                request_obj.embedding_add_special_tokens
+                if isinstance(request_obj, EmbeddingReqInput)
+                else None
             ),
         )
         if composed is not None:

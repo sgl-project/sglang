@@ -5,6 +5,7 @@ launches the full server and compares /v2/embed against /v1/embeddings.
 """
 
 import base64
+import copy
 import json
 import unittest
 
@@ -120,8 +121,11 @@ class TestCohereEmbedding(CustomTestCase):
         text = "The quick brown fox jumps over the lazy dog near the river."
         ids = self.tokenizer.encode(text)
         self.assertGreater(len(ids), 5)
-        for policy, selected in (("END", ids[:5]), ("START", ids[-5:])):
+        for policy, side in (("END", "right"), ("START", "left")):
             with self.subTest(policy=policy):
+                tokenizer = copy.deepcopy(self.tokenizer)
+                tokenizer.truncation_side = side
+                selected = tokenizer(text, truncation=True, max_length=5)["input_ids"]
                 actual = self.post(
                     "/v2/embed", {"texts": [text], "truncate": policy, "max_tokens": 5}
                 )
@@ -134,6 +138,13 @@ class TestCohereEmbedding(CustomTestCase):
                     batch_size=1,
                 )
                 self.assertEqual(actual["meta"]["billed_units"]["input_tokens"], 5)
+                if policy == "END":
+                    default = self.post("/v2/embed", {"texts": [text], "max_tokens": 5})
+                    self.assert_vectors_close(
+                        default["embeddings"]["float"],
+                        [item["embedding"] for item in expected["data"]],
+                        batch_size=1,
+                    )
         response = requests.post(
             self.base_url + "/v2/embed",
             json={"texts": [text], "truncate": "NONE", "max_tokens": 5},

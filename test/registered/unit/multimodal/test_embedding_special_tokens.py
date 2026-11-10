@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, Mock
 
 import torch
 
+from sglang.srt.managers.io_struct import EmbeddingReqInput
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
 from sglang.srt.multimodal.processors.pixtral import PixtralProcessor
@@ -53,7 +54,7 @@ class _HFProcessor:
 
 
 def _request(add_special_tokens=None):
-    return SimpleNamespace(
+    return EmbeddingReqInput(
         embedding_add_special_tokens=add_special_tokens,
         video_data=None,
         audio_data=None,
