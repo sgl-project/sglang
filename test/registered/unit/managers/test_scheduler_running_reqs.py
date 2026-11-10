@@ -31,6 +31,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     ListKind,
 )
+from sglang.srt.managers.scheduler_components.request_retirer import RequestRetirer
 from sglang.srt.managers.scheduler_components.state_check import CheckPhase
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -447,7 +448,7 @@ class TestRunningReqsHooks(CustomTestCase):
         s.enable_lmcache = False
         s.truncation_align_size = None
         s.uocr_runtime = None
-        s._set_or_validate_priority = lambda req: True
+        s._set_or_validate_priority = Mock(return_value=True)
         s._abort_on_queued_limit = Mock(return_value=False)
         s._prefetch_kvcache = Mock()
 
@@ -460,10 +461,22 @@ class TestRunningReqsHooks(CustomTestCase):
     def test_a_requeued_request_moves_and_a_refused_one_still_leaves(self):
         s = _scheduler()
         s.uocr_runtime = None
-        s._set_or_validate_priority = lambda req: req.rid != "refused"
+        # A priority on a server without priority scheduling is refused.
+        s.enable_priority_scheduling = False
+        s.abort_on_priority_when_disabled = True
+        s.request_retirer = RequestRetirer(
+            tree_cache=None,
+            beam_coordinator=None,
+            hisparse_coordinator=None,
+            uocr_runtime=None,
+            send_abort_output=Mock(),
+            stream_output=None,
+        )
+        s.request_retirer.release = Mock()
         s._abort_on_queued_limit = Mock(return_value=False)
         s._prefetch_kvcache = Mock()
         queued, refused = _req("queued"), _req("refused")
+        refused.priority = 1
         s.running_reqs.join([queued, refused])
 
         for req in (queued, refused):
@@ -471,6 +484,7 @@ class TestRunningReqsHooks(CustomTestCase):
 
         self.assertEqual(list(s.waiting_queue), [queued])
         self.assertEqual(list(s.running_reqs), [])
+        s.request_retirer.release.assert_called_once_with(refused, checkpoint=False)
 
     def test_launch_counts_in_flight_steps_and_processing_drops_them(self):
         s = _scheduler()

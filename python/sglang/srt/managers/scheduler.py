@@ -3779,18 +3779,14 @@ class Scheduler(
         # Every request the scheduler keeps owes its output from here; one rejected
         # at intake without being queued sends it in the call that built it.
         self.invariant_checker.expect_output(req)
-        if not self._set_or_validate_priority(req):
-            if src is not None:
-                src.leave([req])
+        if not self._set_or_validate_priority(req, src=src):
             return
         if is_retracted:
             req.storage_prefetch_retry_attempts = 0
             req.storage_prefetch_last_match_len = None
             req.staged_prefetch_plan = None
         if self.disaggregation_mode == DisaggregationMode.NULL:
-            if self._abort_on_queued_limit(req):
-                if src is not None:
-                    src.leave([req])
+            if self._abort_on_queued_limit(req, src=src):
                 return
             self._prefetch_kvcache(req)
             if self.uocr_runtime is None:
@@ -3826,8 +3822,11 @@ class Scheduler(
         prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
         self.request_retirer.retire_unadmitted(req)
 
-    def _set_or_validate_priority(self, req: Req) -> bool:
-        """Set the default priority value, or abort the request based on the priority scheduling mode."""
+    def _set_or_validate_priority(
+        self, req: Req, *, src: Optional[ReqList] = None
+    ) -> bool:
+        """Set the default priority value, or abort the request based on the
+        priority scheduling mode; an aborted one leaves `src`."""
         if self.enable_priority_scheduling and req.priority is None:
             if self.schedule_low_priority_values_first:
                 req.priority = sys.maxsize
@@ -3841,13 +3840,17 @@ class Scheduler(
             self._abort_unavailable(
                 req,
                 message="Using priority is disabled for this server. Please send a new request without a priority.",
+                src=src,
             )
             return False
         return True
 
-    def _abort_unavailable(self, req: Req, *, message: str) -> None:
+    def _abort_unavailable(
+        self, req: Req, *, message: str, src: Optional[ReqList] = None
+    ) -> None:
         self.request_retirer.abort(
             req,
+            src=src,
             reason=FINISH_ABORT(message, HTTPStatus.SERVICE_UNAVAILABLE),
             finished_reason={
                 "type": "abort",
@@ -3867,8 +3870,11 @@ class Scheduler(
         for req in reqs:
             self.request_retirer.abort(req, finished_reason=finished_reason)
 
-    def _abort_on_queued_limit(self, recv_req: Req) -> bool:
-        """Abort an incoming or existing request if the waiting queue is full. Returns True if the incoming request is aborted."""
+    def _abort_on_queued_limit(
+        self, recv_req: Req, *, src: Optional[ReqList] = None
+    ) -> bool:
+        """Abort an incoming or existing request if the waiting queue is full.
+        Returns True if the incoming request is aborted; it leaves `src`."""
         if (
             self.max_queued_requests is None
             or len(self.waiting_queue) + 1 <= self.max_queued_requests
@@ -3890,17 +3896,17 @@ class Scheduler(
                 direction * recv_req.priority < direction * candidate_req.priority
             )
             if abort_existing_req:
-                self.waiting_queue.leave([candidate_req])
                 self._abort_unavailable(
                     candidate_req,
                     message="The request is aborted by a higher priority request.",
+                    src=self.waiting_queue,
                 )
                 # An evicted request sharing the incoming rid refuses it too.
                 if candidate_req.rid != recv_req.rid:
                     return False
 
         # Reject the incoming request by default.
-        self._abort_unavailable(recv_req, message="The request queue is full.")
+        self._abort_unavailable(recv_req, message="The request queue is full.", src=src)
         return True
 
     def _poll_timeout_aborts(self) -> List[AbortReq]:
@@ -5041,7 +5047,6 @@ class Scheduler(
             retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode(
                 self.request_retirer
             )
-            self.running_reqs.leave(reqs_to_abort)
             new_available_tokens = self.token_to_kv_pool_allocator.available_size()
             new_token_gained = new_available_tokens - old_available_tokens
             mamba_num_gained = (
@@ -5064,7 +5069,9 @@ class Scheduler(
             self.new_token_ratio_tracker.current = new_token_ratio
             for req in reqs_to_abort:
                 # retract_decode recorded the reason and freed any member rows.
-                self.request_retirer.abort_retracted(req, reason=req.to_finish)
+                self.request_retirer.abort_retracted(
+                    req, reason=req.to_finish, src=self.running_reqs
+                )
 
             msg_prefix = (
                 "KV cache pool is full. Retract requests. "
@@ -6454,10 +6461,8 @@ class Scheduler(
         for req in retract_reqs:
             src = next((holder for holder in holders if req in holder), None)
             if req in reqs_to_abort:
-                if src is not None:
-                    src.leave([req])
                 # retract_all recorded the reason and freed any member rows.
-                self.request_retirer.abort_retracted(req, reason=req.to_finish)
+                self.request_retirer.abort_retracted(req, reason=req.to_finish, src=src)
             elif self.disaggregation_mode == DisaggregationMode.DECODE:
                 req.time_stats.set_retract_time()
                 self.disagg_decode_prealloc_queue.hold_rebootstrap(req, src=src)

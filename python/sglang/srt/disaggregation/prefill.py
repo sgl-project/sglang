@@ -493,12 +493,8 @@ class PrefillBootstrapQueue:
                 )
         return kv_manager
 
-    def create_sender(self, req: Req, num_kv_heads: int) -> bool:
-        """Create a KV sender for the request without enqueuing it.
-        Returns False if the request exceeds KV capacity."""
-        if self._check_if_req_exceed_kv_capacity(req):
-            return False
-
+    def create_sender(self, req: Req, num_kv_heads: int) -> None:
+        """Create a KV sender for the request without enqueuing it."""
         backend = (
             TransferBackend.FAKE
             if req.bootstrap_host == FAKE_BOOTSTRAP_HOST
@@ -514,7 +510,6 @@ class PrefillBootstrapQueue:
         )
         self._process_req(req)
         req.pending_bootstrap = True
-        return True
 
     def ensure_metadata_buffer(self, req: Req) -> bool:
         if req.metadata_buffer_index >= 0:
@@ -559,14 +554,11 @@ class PrefillBootstrapQueue:
         # for a one-token stub. Bootstrapping it costs a handshake, a metadata
         # buffer and a forward pass before anything unwinds it.
         if is_unadmitted_reject(req):
-            self.scheduler.request_retirer.retire_unadmitted(req)
-            if src is not None:
-                src.leave([req])
+            self.scheduler.request_retirer.retire_unadmitted(req, src=src)
             return
-        if not self.create_sender(req, num_kv_heads):
-            if src is not None:
-                src.leave([req])
+        if self._check_if_req_exceed_kv_capacity(req, src=src):
             return
+        self.create_sender(req, num_kv_heads)
         move([req], src, self.queue)
 
     def _abort(self, recv_req: AbortReq) -> None:
@@ -578,12 +570,14 @@ class PrefillBootstrapQueue:
                 if get_parallel().pp_size > 1:
                     prepare_abort(req, "Aborted by AbortReq.")
 
-    def _check_if_req_exceed_kv_capacity(self, req: Req) -> bool:
+    def _check_if_req_exceed_kv_capacity(
+        self, req: Req, *, src: Optional[ReqList] = None
+    ) -> bool:
         if len(req.origin_input_ids) > self.max_input_len:
             message = f"Request {req.rid} exceeds the maximum number of tokens: {len(req.origin_input_ids)} > {self.max_input_len}"
             logger.error(message)
             prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)
-            self.scheduler.request_retirer.retire_unadmitted(req)
+            self.scheduler.request_retirer.retire_unadmitted(req, src=src)
             return True
         return False
 

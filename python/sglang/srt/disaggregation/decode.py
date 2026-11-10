@@ -1116,18 +1116,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # this point carries none of the markers `is_unadmitted_reject` reads,
         # so take the caller's word for it rather than sniffing.
         if not is_retracted and not is_rebootstrap and is_unadmitted_reject(req):
-            self.scheduler.request_retirer.retire_unadmitted(req)
-            if src is not None:
-                src.leave([req])
+            self.scheduler.request_retirer.retire_unadmitted(req, src=src)
             return
         if is_retracted and dsv4_needs_rebootstrap(self.token_to_kv_pool_allocator):
             req.time_stats.set_retract_time()
             is_retracted = False
             is_rebootstrap = True
 
-        if self._check_if_req_exceed_kv_capacity(req):
-            if src is not None:
-                src.leave([req])
+        if self._check_if_req_exceed_kv_capacity(req, src=src):
             return
 
         if is_retracted:
@@ -1240,7 +1236,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         for req in list(held):
             self.add(req, is_rebootstrap=True, src=held)
 
-    def _check_if_req_exceed_kv_capacity(self, req: Req) -> bool:
+    def _check_if_req_exceed_kv_capacity(
+        self, req: Req, *, src: Optional[ReqList] = None
+    ) -> bool:
+        """Whether the request can never fit; one that cannot is finished and
+        leaves `src`."""
         message = None
         allocator = self.token_to_kv_pool_allocator
         full_required, _ = self._prealloc_required(req)
@@ -1282,7 +1282,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if message is not None:
             logger.error(message)
             prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)
-            self.scheduler.request_retirer.retire_unadmitted(req)
+            self.scheduler.request_retirer.retire_unadmitted(req, src=src)
             return True
         return False
 

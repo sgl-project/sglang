@@ -168,7 +168,9 @@ class TestCheckIfReqExceedKvCapacity(CustomTestCase):
         req = _make_req("hisparse-too-long", prompt_len=5000)
 
         self.assertTrue(queue._check_if_req_exceed_kv_capacity(req))
-        queue.scheduler.request_retirer.retire_unadmitted.assert_called_once_with(req)
+        queue.scheduler.request_retirer.retire_unadmitted.assert_called_once_with(
+            req, src=None
+        )
         # prepare_abort sets finished_reason to a BAD_REQUEST FINISH_ABORT.
         self.assertIsNotNone(req.finished_reason)
 
@@ -183,7 +185,9 @@ class TestCheckIfReqExceedKvCapacity(CustomTestCase):
         req = _make_req("non-hisparse-too-long", prompt_len=2048)
 
         self.assertTrue(queue._check_if_req_exceed_kv_capacity(req))
-        queue.scheduler.request_retirer.retire_unadmitted.assert_called_once_with(req)
+        queue.scheduler.request_retirer.retire_unadmitted.assert_called_once_with(
+            req, src=None
+        )
 
     def test_rebootstrap_input_len_used_for_capacity(self):
         """Rebootstrap requests carry both prompt and emitted output_ids; the
