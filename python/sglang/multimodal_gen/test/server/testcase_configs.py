@@ -1091,7 +1091,6 @@ def get_default_sampling_params_for_server_args(
     return get_default_sampling_params_for_model_task(task_type)
 
 
-MODELOPT_FLUX1_FP8_TRANSFORMER = "lmsys/flux1-dev-modelopt-fp8-sglang-transformer"
 MODELOPT_FLUX2_FP8_TRANSFORMER = "lmsys/flux2-dev-modelopt-fp8-sglang-transformer"
 MODELOPT_WAN22_FP8_MODEL = "nvidia/Wan2.2-T2V-A14B-Diffusers-FP8"
 MODELOPT_HUNYUANVIDEO_FP8_TRANSFORMER = (
@@ -1101,7 +1100,6 @@ MODELOPT_QWEN_IMAGE_FP8_TRANSFORMER = "lmsys/qwen-image-modelopt-fp8-sglang-tran
 MODELOPT_QWEN_IMAGE_EDIT_FP8_TRANSFORMER = (
     "lmsys/qwen-image-edit-modelopt-fp8-sglang-transformer"
 )
-MODELOPT_FLUX1_NVFP4_TRANSFORMER = "lmsys/flux1-dev-modelopt-nvfp4-sglang-transformer"
 MODELOPT_FLUX2_NVFP4_WEIGHTS = "black-forest-labs/FLUX.2-dev-NVFP4"
 MODELOPT_QWEN_IMAGE_2512_NVFP4_MODEL = "lmsys/qwen-image-2512-modelopt-nvfp4-sglang"
 MODELOPT_WAN22_NVFP4_MODEL = "nvidia/Wan2.2-T2V-A14B-Diffusers-NVFP4"

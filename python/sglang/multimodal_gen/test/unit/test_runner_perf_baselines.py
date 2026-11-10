@@ -19,7 +19,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
 def test_default_runner_baseline(monkeypatch, runner):
     monkeypatch.setenv("RUNNER_NAME", runner)
     config = BaselineConfig.load(get_perf_baseline_path("b200"))
-    assert config.scenarios["flux1_modelopt_nvfp4_t2i"].expected_e2e_ms == 836.71
+    assert config.scenarios["flux2_modelopt_nvfp4_t2i"].expected_e2e_ms == 1990.84
     assert (
         config.scenarios["qwen_image_2512_modelopt_nvfp4_t2i"].expected_e2e_ms
         == 9650.06
@@ -27,26 +27,25 @@ def test_default_runner_baseline(monkeypatch, runner):
 
 
 @pytest.mark.parametrize(
-    "runner,flux,qwen",
+    "runner,qwen",
     [
-        ("b200-di01-4567", 1334.16, 16126.87),
-        ("b200-cirrascale1-0123", 1574.32, 17742.04),
-        ("b200-cirrascale1-4567", 1574.32, 17742.04),
-        ("b200-cirrascale2", 1471.19, 17346.65),
-        ("b200-cirrascale3-0123", 1470.24, 17894.49),
-        ("b200-cirrascale3-4567", 1471.19, 17346.65),
-        ("b200-cirrascale4-0123", 1470.24, 17894.49),
-        ("b200-cirrascale4-4567", 1471.19, 17346.65),
+        ("b200-di01-4567", 16126.87),
+        ("b200-cirrascale1-0123", 17742.04),
+        ("b200-cirrascale1-4567", 17742.04),
+        ("b200-cirrascale2", 17346.65),
+        ("b200-cirrascale3-0123", 17894.49),
+        ("b200-cirrascale3-4567", 17346.65),
+        ("b200-cirrascale4-0123", 17894.49),
+        ("b200-cirrascale4-4567", 17346.65),
     ],
 )
-def test_runner_override_preserves_other_metrics(monkeypatch, runner, flux, qwen):
+def test_runner_override_preserves_other_metrics(monkeypatch, runner, qwen):
     monkeypatch.delenv("RUNNER_NAME", raising=False)
     default = BaselineConfig.load(get_perf_baseline_path("b200"))
     h100_default = BaselineConfig.load(get_perf_baseline_path("h100"))
     monkeypatch.setenv("RUNNER_NAME", runner)
     pool = BaselineConfig.load(get_perf_baseline_path("b200"))
     expected = {
-        "flux1_modelopt_nvfp4_t2i": flux,
         "qwen_image_2512_modelopt_nvfp4_t2i": qwen,
     }
     for name, scenario in default.scenarios.items():
@@ -78,7 +77,7 @@ def test_runner_baseline_enforces_e2e_boundary(monkeypatch, runner):
     monkeypatch.setenv("SGLANG_GEN_BASELINE", "0")
     monkeypatch.delenv("SGLANG_E2E_TOLERANCE", raising=False)
     config = BaselineConfig.load(get_perf_baseline_path("b200"))
-    for name in ("flux1_modelopt_nvfp4_t2i", "qwen_image_2512_modelopt_nvfp4_t2i"):
+    for name in ("flux2_modelopt_nvfp4_t2i", "qwen_image_2512_modelopt_nvfp4_t2i"):
         scenario = config.scenarios[name]
         validator = PerformanceValidator(
             scenario, config.tolerances, config.step_fractions
