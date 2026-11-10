@@ -10,7 +10,8 @@ def _stop_token_ids(req) -> set:
     if req.use_model_stop_tokens or req.grammar is not None:
         stop_ids |= req.eos_token_ids or set()
         stop_ids |= req.tokenizer.additional_stop_token_ids or set()
-        stop_ids.add(req.tokenizer.eos_token_id)
+        if req.tokenizer.eos_token_id is not None:
+            stop_ids.add(req.tokenizer.eos_token_id)
     return stop_ids
 
 
