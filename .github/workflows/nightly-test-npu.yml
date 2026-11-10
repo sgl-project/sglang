@@ -396,11 +396,11 @@ jobs:
           #   test_type: 'accuracy'
           #   prefill_decode_deployment: 'separation'
           # glm_5_3 accuracy tests (2 prefill + 2 decode nodes, with EPLB)
-          - name: glm_5_3_w8a8_2p2d_32p_pcp_gpqa
+          - name: glm_5_3_w8a8_1p1d_32p_pcp_gpqa
             prefill_size: 2
             decode_size: 2
             router_size: 1
-            test_case: test/registered/npu/accuracy/glm5_3/test_npu_glm_5_3_w8a8_2p2d_32p_pcp_gpqa.py
+            test_case: test/registered/npu/accuracy/glm5_3/test_npu_glm_5_3_w8a8_1p1d_32p_pcp_gpqa.py
             test_type: 'accuracy'
             prefill_decode_deployment: 'separation'
           # glm_5_3 performance tests (2 prefill + 2 decode nodes)
