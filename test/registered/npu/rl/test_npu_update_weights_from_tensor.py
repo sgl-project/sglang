@@ -23,7 +23,6 @@ from conftest import (
     update_full_checkpoint,
     update_weights_from_flattened_bucket,
     update_weights_from_tensor,
-    warmup_npu,
 )
 
 from sglang.test.ascend.test_ascend_utils import QWEN3_0_6B_WEIGHTS_PATH
@@ -61,7 +60,6 @@ TARGET_WEIGHT = "model.layers.0.mlp.down_proj.weight"
 class TestNpuUpdateWeightsFromTensor(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        warmup_npu()
         with npu_server(MODEL, extra_args=BASE_ARGS) as base_url:
             cls.reference = generation_signature(base_url, PROMPTS)
         cls.tensor_index = checkpoint_tensor_index(MODEL)

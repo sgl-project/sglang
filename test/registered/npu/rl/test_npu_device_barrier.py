@@ -27,7 +27,6 @@ from conftest import (
     pause_generation,
     stream_generate,
     update_weights_from_tensor,
-    warmup_npu,
 )
 
 from sglang.srt.managers.scheduler_components import (
@@ -195,7 +194,6 @@ class TestNpuDeviceBarrier(CustomTestCase):
     )
     @unittest.skipUnless(os.path.isdir(MODEL), f"model not found: {MODEL}")
     def test_02_dp_pause_returns_after_all_ranks_drain(self):
-        warmup_npu()
         with npu_server(MODEL, extra_args=DP_ARGS) as base_url:
             events = [[], []]
             errors = [[], []]
@@ -274,7 +272,6 @@ class TestNpuDeviceBarrier(CustomTestCase):
     @unittest.skipUnless(npu_available(), "requires an Ascend NPU")
     @unittest.skipUnless(os.path.isdir(MODEL), f"model not found: {MODEL}")
     def test_pause_update_continue_is_stable_over_rounds(self):
-        warmup_npu()
         tensor_index = checkpoint_tensor_index(MODEL)
         original = load_checkpoint_tensor(tensor_index, NORM_WEIGHT)
 

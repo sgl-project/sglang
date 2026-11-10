@@ -66,14 +66,6 @@ def npu_device_count() -> int:
     return npus * chips
 
 
-def warmup_npu(device: int = 0) -> None:
-    """No-op: the test process must not create an NPU context.
-
-    Starting a server after the parent has initialized an NPU context resets
-    the device and kills the parent on some CANN/driver combinations.
-    """
-
-
 def _physical_device_id(device: int) -> int:
     """Map a process-visible logical device index to the host device id."""
     visible_devices = os.environ.get("ASCEND_RT_VISIBLE_DEVICES")
