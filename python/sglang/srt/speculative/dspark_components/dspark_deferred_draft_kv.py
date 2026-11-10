@@ -21,6 +21,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.aux_hidden_states import pack_aux_hidden_states
+from sglang.srt.runtime_context import get_disagg, get_memory, get_parallel
 
 logger = logging.getLogger(__name__)
 
@@ -232,6 +233,28 @@ class DeferredDraftKVStore:
             self._staged_reqs = ()
             self.num_written_in_graph += 1
 
+    def attach_draft(self, draft_model_runner, proposer) -> None:
+        """Draft side: the draft graph forks the staged write at its head and its
+        first KV store joins it."""
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            DeepseekV4AttnBackend,
+            DeepseekV4MultiStepBackend,
+        )
+
+        proposer.deferred_draft_kv = self
+        draft_model_runner.capture_head_hooks.append(self.capture_head_hook)
+        backend = draft_model_runner.attn_backend
+        backends = [backend]
+        if isinstance(backend, DeepseekV4MultiStepBackend):
+            backends.extend(backend.attn_backends)
+        for b in backends:
+            if isinstance(b, DeepseekV4AttnBackend):
+                b.pre_kv_store_hook = self.join
+        logger.info(
+            "SGLANG_DSPARK_DEFER_CONTEXT_KV: the draft KV store runs at the "
+            "head of the next draft graph, joined at its first KV store."
+        )
+
     def capture_head_hook(self, graph_runner, forward_batch) -> None:
         """First inside each draft decode graph capture (and its warmups)."""
         if not forward_batch.forward_mode.is_target_verify():
@@ -275,6 +298,53 @@ class DeferredDraftKVStore:
 
 def _capturing() -> bool:
     return torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+
+
+def maybe_build_deferred_draft_kv(
+    *,
+    static_verify: bool,
+    draft_is_moe: bool,
+    max_bs: int,
+    stride: int,
+    device,
+    kv_injector,
+    target_model,
+) -> Optional[DeferredDraftKVStore]:
+    """SGLANG_DSPARK_DEFER_CONTEXT_KV: only where nothing moves or reads draft KV
+    between a verify and the next draft forward but this worker's forwards."""
+    if not envs.SGLANG_DSPARK_DEFER_CONTEXT_KV.get():
+        return None
+    from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
+        is_unified_kv_triton,
+    )
+
+    memory = get_memory()
+    refusal = defer_context_kv_refusal(
+        static_verify=static_verify,
+        draft_is_moe=draft_is_moe,
+        unified_kv=is_unified_kv_triton(),
+        unified_memory=memory.enable_unified_memory,
+        hicache=memory.enable_hierarchical_cache
+        or memory.hicache_storage_backend is not None,
+        disaggregated=get_disagg().disaggregation_mode != "null",
+        attn_dp=get_parallel().attn_dp_enabled,
+    )
+    if refusal:
+        logger.warning(
+            "SGLANG_DSPARK_DEFER_CONTEXT_KV refused, the draft KV store stays "
+            "in the verify graph: %s",
+            refusal,
+        )
+        return None
+    store = DeferredDraftKVStore(
+        max_bs=max_bs, stride=stride, device=device, kv_injector=kv_injector
+    )
+    # The target's logits processor: SGLang's forward and a megakernel's head
+    # both call it, with the DSpark hidden, once the hidden is final.
+    target_model.logits_processor.register_forward_pre_hook(
+        store.logits_pre_hook, with_kwargs=True
+    )
+    return store
 
 
 def defer_context_kv_refusal(
