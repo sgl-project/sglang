@@ -575,24 +575,33 @@ def _build_mamba_device_pool_group(
             params.token_to_kv_pool_allocator.state, kvcache.start_layer
         ),
     ]
-    entries.extend(_sidecar_draft_entries(params, page_size))
-    num_layers = max(layer for entry in entries for layer in entry.layer_mapping)
+    num_layers = 1 + max(layer for entry in entries for layer in entry.layer_mapping)
+    num_layers = max(
+        [num_layers, *(pool.layer_num for pool in params.sidecar_draft_device_pools)]
+    )
+    entries.extend(_sidecar_draft_entries(params, page_size, num_layers))
     # Not rank_replicated: the Mamba state is TP-sharded.
-    return DevicePoolGroup(entries, num_layers + 1, page_size)
+    return DevicePoolGroup(entries, num_layers, page_size)
 
 
-def _sidecar_draft_entries(params: Any, page_size: int) -> list[DevicePoolEntry]:
+def _sidecar_draft_entries(
+    params: Any, page_size: int, num_layers: int
+) -> list[DevicePoolEntry]:
     entries = []
     for draft_pool in params.sidecar_draft_device_pools:
         if draft_pool.page_size != page_size:
             raise ValueError("Draft KV page size must match the tree page size.")
-        # Draft layer i rides transfer layer i; the draft reads it only after
-        # the batch's loads finish.
+        if draft_pool.layer_num > num_layers:
+            raise ValueError("Draft KV has more layers than the target transfers.")
+        # The draft runs after the target forward, so its pages ride the last
+        # transfer layers and stay out of the group target layer 0 waits on.
+        # UnifiedCacheLinker.draft_layer_counter reads this offset back.
+        offset = num_layers - draft_pool.layer_num
         entries.append(
             _mha_device_pool_entry(
                 PoolName.DRAFT,
                 draft_pool,
-                {layer: layer for layer in range(draft_pool.layer_num)},
+                {offset + layer: layer for layer in range(draft_pool.layer_num)},
                 page_size,
                 indices_from_pool=PoolName.KV,
             )
@@ -649,7 +658,7 @@ def _build_minimax_m3_nvfp4_device_pool_group(
             page_size=page_size,
             rows_are_pages=True,
         ),
-        *_sidecar_draft_entries(params, page_size),
+        *_sidecar_draft_entries(params, page_size, main_pool.layer_num),
     ]
     # Not rank_replicated: the KV heads are TP-sharded.
     return DevicePoolGroup(entries, main_pool.layer_num, page_size)
