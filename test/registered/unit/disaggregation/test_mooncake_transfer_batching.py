@@ -590,6 +590,7 @@ class TestMooncakeEarlySend(CustomTestCase):
             dst_attn_tp_size=1,
             dst_aux_ptrs=[2000],
             dst_aux_item_lens=[16],
+            num_draft_entries=None,
         )
         manager = SimpleNamespace(
             enable_trace=False,

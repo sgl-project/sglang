@@ -296,6 +296,7 @@ class AscendKVManager(MooncakeKVManager):
         dst_device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
         dst_kv_item_len: Optional[int] = None,
         dst_attn_tp_size: Optional[int] = None,
+        dst_num_draft_entries: Optional[int] = None,
     ):
         if dst_device_kv_indices is not None:
             raise NotImplementedError(
