@@ -18,6 +18,8 @@ from __future__ import annotations
 import ctypes
 import itertools
 import logging
+import multiprocessing
+import multiprocessing.connection
 import os
 import resource
 import shutil
@@ -38,6 +40,8 @@ __all__ = [
     "delete_directory",
     "set_gpu_proc_affinity",
     "kill_itself_when_parent_died",
+    "resolve_failure_notification_parent",
+    "notify_parent_of_failure",
 ]
 
 
@@ -238,3 +242,77 @@ def kill_itself_when_parent_died():
         logger.warning(
             "kill_itself_when_parent_died is only supported on linux and macOS."
         )
+
+
+def _multiprocessing_parent_alive(mp_parent) -> bool:
+    """Whether the multiprocessing parent recorded at spawn time is alive.
+
+    The parent sentinel becomes readable when the launcher exits, so a
+    readable sentinel means the launcher is gone even if its PID has since
+    been reused by an unrelated process. `multiprocessing.connection.wait`
+    is the sanctioned way to poll a sentinel (see `Process.sentinel`).
+    """
+    sentinel = getattr(mp_parent, "sentinel", None)
+    if sentinel is None:
+        # No liveness channel for this start method: fall back to whether
+        # the recorded PID still exists.
+        try:
+            return psutil.Process(mp_parent.pid).is_running()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            return False
+    try:
+        return not multiprocessing.connection.wait([sentinel], timeout=0)
+    except Exception:
+        # Liveness cannot be determined; never signal a PID we cannot
+        # prove is the launcher.
+        return False
+
+
+def resolve_failure_notification_parent() -> Optional[psutil.Process]:
+    """Return the launcher to notify (SIGQUIT) when this worker fails.
+
+    Workers are spawned by the launcher via multiprocessing, so the true
+    supervisor is `multiprocessing.parent_process()`, which multiprocessing
+    records at spawn time. `psutil.Process().parent()` instead reflects the
+    *current* OS parent: if the launcher dies while the worker is still
+    importing modules, the kernel reparents the worker to PID 1 and the
+    failure notification would SIGQUIT init (see #41539).
+
+    Returns None when there is no live launcher to notify. Outside
+    multiprocessing, falls back to the OS parent, which also preserves
+    notifying a legitimate PID-1 launcher.
+    """
+    mp_parent = multiprocessing.parent_process()
+    if mp_parent is not None:
+        if not _multiprocessing_parent_alive(mp_parent):
+            return None
+        try:
+            return psutil.Process(mp_parent.pid)
+        except psutil.NoSuchProcess:
+            return None
+    try:
+        return psutil.Process().parent()
+    except psutil.NoSuchProcess:
+        return None
+
+
+def notify_parent_of_failure() -> bool:
+    """Send SIGQUIT to the launcher that spawned this worker, if it is alive.
+
+    Returns True when the signal was sent. Returns False (and sends nothing)
+    when the launcher is already gone, so an orphaned worker never signals
+    PID 1 (see #41539).
+    """
+    parent = resolve_failure_notification_parent()
+    if parent is None:
+        logger.warning(
+            "Skipping failure notification: launcher process is gone; "
+            "not signalling PID 1."
+        )
+        return False
+    try:
+        parent.send_signal(signal.SIGQUIT)
+    except psutil.NoSuchProcess:
+        # The launcher exited after the liveness check; nothing to notify.
+        return False
+    return True

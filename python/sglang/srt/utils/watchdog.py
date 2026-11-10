@@ -10,9 +10,8 @@ from contextlib import contextmanager
 from multiprocessing import Process
 from typing import Callable, List, Optional
 
-import psutil
-
 from sglang.srt.utils.cudacore_pyspy_dump_utils import pyspy_dump_schedulers
+from sglang.srt.utils.process import notify_parent_of_failure
 
 logger = logging.getLogger(__name__)
 
@@ -122,7 +121,6 @@ class WatchdogRaw:
         # blocked in C with the GIL released.
         self.before_crash = before_crash
 
-        self.parent_process = psutil.Process().parent()
         t = threading.Thread(target=self._watchdog_thread, daemon=True)
         t.start()
 
@@ -170,7 +168,7 @@ class WatchdogRaw:
                     logger.exception(f"{self.debug_name} watchdog: before_crash failed")
             # Wait for some time so that the parent process can print the error.
             time.sleep(5)
-            self.parent_process.send_signal(signal.SIGQUIT)
+            notify_parent_of_failure()
 
 
 class SubprocessWatchdog:
