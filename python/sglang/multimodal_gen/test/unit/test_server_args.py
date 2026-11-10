@@ -3523,6 +3523,33 @@ class TestKVGatherDegree(unittest.TestCase):
         self.assertFalse(args.sp_split_auto)
         self.assertEqual(args.ulysses_degree, 4)
 
+    def test_higher_sp_keeps_heads_whole_when_ulysses_cannot_split_them(self):
+        # Z-Image's 30 heads do not split over 4 or 8 Ulysses ranks
+        for num_gpus in (4, 8):
+            with self.subTest(num_gpus=num_gpus):
+                args = _from_dict_without_model_resolution(
+                    {
+                        "model_path": "/fake",
+                        "num_gpus": num_gpus,
+                        "performance_mode": "manual",
+                    },
+                    ZImagePipelineConfig(),
+                )
+
+                self.assertEqual(args.sp_degree, num_gpus)
+                self.assertEqual(args.kv_gather_degree, num_gpus)
+                self.assertTrue(args.sp_split_auto)
+                self.assertEqual(args.ring_degree, 1)
+
+    def test_higher_sp_keeps_ulysses_when_heads_divide(self):
+        args = _from_dict_without_model_resolution(
+            {"model_path": "/fake", "num_gpus": 3, "performance_mode": "manual"},
+            ZImagePipelineConfig(),
+        )
+
+        self.assertEqual(args.kv_gather_degree, 1)
+        self.assertEqual(args.ulysses_degree, 3)
+
     def test_explicit_ulysses_is_not_overridden(self):
         args = _from_dict_without_model_resolution(
             {
