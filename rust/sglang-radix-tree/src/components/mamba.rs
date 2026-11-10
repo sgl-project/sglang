@@ -68,6 +68,33 @@ impl MambaComponent {
         }
     }
 
+    /// A state set on `node_id` shortens the rebuild of the nearest states
+    /// below it; zeroing their cached gains seeds them at their stamp, a lower
+    /// bound, so the walk recomputes them before trusting the order.
+    fn gds_forget_descendant_gains_<K: ChildKeyType>(
+        &self,
+        tree_core: &mut UnifiedTreeCore<K>,
+        node_id: NodeIdx_,
+    ) {
+        if self.gds_cost.is_none() {
+            return;
+        }
+        let mut stack: Vec<NodeIdx_> = tree_core
+            .arena
+            .node(node_id)
+            .children
+            .values()
+            .copied()
+            .collect();
+        while let Some(x) = stack.pop() {
+            if tree_core.arena.has_device_value(x, MAMBA) {
+                tree_core.arena.node_mut(x).gds_gain = 0.0;
+            } else {
+                stack.extend(tree_core.arena.node(x).children.values().copied());
+            }
+        }
+    }
+
     /// A state's priority from its last known gain.
     fn gds_priority_<K: ChildKeyType>(
         &self,
@@ -433,6 +460,7 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
             let tick = tree_core.arena.get_and_bump_access_counter();
             tree_core.arena.node_mut(node_id).last_access_counter = tick;
             self.gds_mark_used_(tree_core, node_id);
+            self.gds_forget_descendant_gains_(tree_core, node_id);
             self.emit_excess_path_states_eviction_(tree_core.arena.node(node_id).id, cache_actions);
             return;
         }
@@ -926,6 +954,7 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
                     // including crediting protected when restored under lock.
                     tree_core.set_component_device_value_(node_id, MAMBA, device_indices.copy());
                     self.gds_mark_used_(tree_core, node_id);
+                    self.gds_forget_descendant_gains_(tree_core, node_id);
                 }
             }
             // The python elif chain has no BACKUP_STORAGE arm.

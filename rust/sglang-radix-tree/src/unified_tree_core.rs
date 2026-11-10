@@ -944,6 +944,9 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                  'lru', 'lfu', 'fifo', 'mru', 'filo', 'priority', 'slru', 'tlru', 'gds'."
             ));
         }
+        if eviction_policy == "gds" && params.gds_cost.is_none() {
+            return Err("eviction policy 'gds' requires gds_cost".to_owned());
+        }
         Ok(())
     }
 

@@ -410,6 +410,7 @@ class MambaComponent(TreeComponent):
             )
             node.last_access_time = get_and_increase_time_counter()
             self._gds_mark_used(node)
+            self._gds_forget_descendant_gains(node)
             self._emit_excess_path_states_eviction(node, cache_actions)
             return
         self.tree_core.lru_lists[self.component_type].reset_node_mru(node)
@@ -666,6 +667,22 @@ class MambaComponent(TreeComponent):
         if self.gds is not None:
             cd = node.component_data[self.component_type]
             cd.metadata["gds_stamp"] = self._gds_watermark
+
+    def _gds_forget_descendant_gains(self, node: UnifiedTreeNode) -> None:
+        """A state set on ``node`` shortens the rebuild of the nearest states
+        below it; dropping their cached gains seeds them at their stamp, a
+        lower bound, so the walk recomputes them before trusting the order."""
+        if self.gds is None:
+            return
+        ct = self.component_type
+        stack = list(node.children.values())
+        while stack:
+            x = stack.pop()
+            cd = x.component_data[ct]
+            if cd.value is not None:
+                cd.metadata.pop("gds_gain", None)
+            else:
+                stack.extend(x.children.values())
 
     def _gds_priority(self, node: UnifiedTreeNode) -> float:
         metadata = node.component_data[self.component_type].metadata
@@ -1299,6 +1316,7 @@ class MambaComponent(TreeComponent):
                     node.id, ct, transfer.device_indices.clone()
                 )
                 self._gds_mark_used(node)
+                self._gds_forget_descendant_gains(node)
 
         elif phase == CacheTransferPhase.PREFETCH:
             if not transfers:

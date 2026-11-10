@@ -25,7 +25,7 @@ Select one with `--radix-eviction-policy`. All of them fall back to least-recent
 | `slru` | Prefixes still in the probationary segment, then the least recent within a segment. | Like `lfu`, but you want a hard floor on how much a one-off prefix can displace a proven one. See [`slru` parameters](#slru-parameters). |
 | `priority` | The prefix belonging to the lowest-priority request, then the least recent. | You run [priority scheduling](/docs/advanced_features/server_arguments) and want cache retention to follow the same ranking as admission. |
 | `tlru` | The tail of a conversation beyond what its next prefill needs to meet the TTFT budget ("TEL-safe" tokens), then the least recent. | Agentic / multi-turn workloads where tail TTFT matters more than raw hit rate. See [`tlru` parameters](#tlru-parameters). Requires the unified radix cache (the default tree). |
-| `gds` | On hybrid recurrent models (linear attention or Mamba layers), the cached recurrent-state checkpoint with the lowest GreedyDual-Size priority: last use plus the prefill it would take to rebuild it. | Agentic workloads on hybrid models, where checkpoints leave the state pool while their KV stays cached. See [`gds` parameters](#gds-parameters). Full KV stays in recency order; on other models it acts as `lru`. Rejects `--enable-session-radix-cache`. |
+| `gds` | On hybrid recurrent models (linear attention or Mamba layers), the cached recurrent-state checkpoint with the lowest GreedyDual-Size priority: last use plus the prefill it would take to rebuild it. | Agentic workloads on hybrid models, where checkpoints leave the state pool while their KV stays cached. See [`gds` parameters](#gds-parameters). Full KV stays in recency order; on other models it acts as `lru`. Rejects `--enable-session-radix-cache` on hybrid models. |
 | `joint_lru` | The least recent of the full-attention and SWA KV, ranked in one shared order. | Full/SWA hybrid models with `--enable-unified-memory` on the unified radix cache (the default tree), where both kinds of KV share one byte buffer; there it rejects `--enable-session-radix-cache` and tree cores without the joint walk, such as the `rust` tree core. Elsewhere it acts as `lru`. |
 
 Notes on the scoring inputs:
@@ -68,7 +68,7 @@ Raising it makes promotion harder, so the protected set stays small and closer t
 
 #### `gds` parameters
 
-`gds` applies GreedyDual-Size to recurrent-state checkpoints, following [FlashState](https://www.alphaxiv.org/abs/2611.flashstate). A checkpoint's priority is the eviction watermark at its last use plus the prefill it saves: the cost of rebuilding it from the nearest shallower checkpoint, or from the start of the prompt when there is none. The lowest priority goes first, and the watermark rises to each victim's priority, so a checkpoint nobody resumes ages out.
+`gds` applies GreedyDual-Size to recurrent-state checkpoints, following [FlashState](https://flashstate.ai). A checkpoint's priority is the eviction watermark at its last use plus the prefill it saves: the cost of rebuilding it from the nearest shallower checkpoint, or from the start of the prompt when there is none. The lowest priority goes first, and the watermark rises to each victim's priority, so a checkpoint nobody resumes ages out.
 
 | Key | Default | Meaning |
 |---|---|---|

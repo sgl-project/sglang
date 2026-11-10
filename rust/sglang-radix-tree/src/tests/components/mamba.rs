@@ -984,13 +984,15 @@ fn resumes_at(tc: &mut UnifiedTreeCore<Vec<i64>>, key: &Vec<i64>) -> bool {
     tc.match_prefix(&match_params(key)).device_prefix_len == key.len()
 }
 
+// Each state's gain is the token gap to its nearest shallower state (d=1, e=0);
+// the depths keep every gain distinct so no order rests on a tie.
 #[test]
 fn gds_evicts_the_cheapest_state_not_the_oldest() {
     let mut tc = gds_core();
-    let deep = vec![100, 101, 102, 103];
-    tc.insert(&insert_params_mamba(&deep, &[1, 2, 3, 4], Some(1)));
+    let deep = vec![100, 101, 102, 103, 104, 105, 106];
+    tc.insert(&insert_params_mamba(&deep, &[1, 2, 3, 4, 5, 6, 7], Some(1)));
     tc.insert(&insert_params_mamba(&vec![1], &[10], Some(2)));
-    tc.insert(&insert_params_mamba(&vec![1, 2], &[10, 11], Some(3)));
+    tc.insert(&insert_params_mamba(&vec![1, 2, 3], &[10, 11, 12], Some(3)));
 
     walk_gds(&mut tc, /* states = */ 1);
 
@@ -999,18 +1001,34 @@ fn gds_evicts_the_cheapest_state_not_the_oldest() {
 }
 
 #[test]
+fn gds_counts_only_the_gap_to_the_nearest_shallower_state() {
+    let mut tc = gds_core();
+    let lone = vec![100, 101];
+    tc.insert(&insert_params_mamba(&vec![1, 2, 3], &[10, 11, 12], Some(1)));
+    tc.insert(&insert_params_mamba(&vec![1, 2, 3, 4], &[10, 11, 12, 13], Some(2)));
+    tc.insert(&insert_params_mamba(&lone, &[20, 21], Some(3)));
+
+    walk_gds(&mut tc, /* states = */ 1);
+
+    assert!(!resumes_at(&mut tc, &vec![1, 2, 3, 4]));
+    assert!(resumes_at(&mut tc, &vec![1, 2, 3]));
+    assert!(resumes_at(&mut tc, &lone));
+}
+
+#[test]
 fn gds_rechecks_a_state_whose_ancestor_left_during_the_walk() {
     let mut tc = gds_core();
-    let lone = vec![100, 101, 102];
+    let lone = vec![100, 101, 102, 103];
+    let child = vec![1, 2, 3, 4, 5];
     tc.insert(&insert_params_mamba(&vec![1, 2], &[10, 11], Some(1)));
-    tc.insert(&insert_params_mamba(&vec![1, 2, 3, 4], &[10, 11, 12, 13], Some(2)));
-    tc.insert(&insert_params_mamba(&lone, &[20, 21, 22], Some(3)));
+    tc.insert(&insert_params_mamba(&child, &[10, 11, 12, 13, 14], Some(2)));
+    tc.insert(&insert_params_mamba(&lone, &[20, 21, 22, 23], Some(3)));
 
     walk_gds(&mut tc, /* states = */ 2);
 
     assert!(!resumes_at(&mut tc, &vec![1, 2]));
     assert!(!resumes_at(&mut tc, &lone));
-    assert!(resumes_at(&mut tc, &vec![1, 2, 3, 4]));
+    assert!(resumes_at(&mut tc, &child));
 }
 
 #[test]

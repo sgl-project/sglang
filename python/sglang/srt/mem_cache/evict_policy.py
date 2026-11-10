@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Tuple, Union
 
@@ -83,7 +84,7 @@ class TLRUStrategy(EvictionStrategy):
 
 class GDSStrategy(EvictionStrategy):
     """GreedyDual-Size over recurrent-state checkpoints (FlashState,
-    https://www.alphaxiv.org/abs/2611.flashstate).
+    https://flashstate.ai).
 
     A checkpoint's priority is its stamp, the eviction watermark at its last use,
     plus the prefill it costs to rebuild from the nearest shallower checkpoint.
@@ -94,10 +95,10 @@ class GDSStrategy(EvictionStrategy):
     # Defaults are FlashState's GLM-5.3-Flash fit, in seconds; only the ratio
     # d/e affects the order, and other models may want their own.
     def __init__(self, d: float = 1.862e-5, e: float = 3.33e-6):
-        if d < 0 or e < 0 or (d == 0 and e == 0):
+        if not (math.isfinite(d) and math.isfinite(e)) or min(d, e) < 0 or d == e == 0:
             raise ValueError(
-                "--radix-eviction-policy gds requires non-negative 'd' and 'e' "
-                f"with at least one positive, got d={d}, e={e}."
+                "--radix-eviction-policy gds requires finite, non-negative 'd' and "
+                f"'e' with at least one positive, got d={d}, e={e}."
             )
         self.d = d
         self.e = e
