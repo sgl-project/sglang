@@ -11,6 +11,7 @@
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
+#include <sgl_kernel/activation.cuh>
 #include <sgl_kernel/algorithm.cuh>
 #include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/type.cuh>
@@ -31,18 +32,6 @@ namespace device::route_warp::ptx {
 SGL_DEVICE float ex2_approx_ftz(float x) {
   float y;
   asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
-  return y;
-}
-
-SGL_DEVICE float rcp_approx_ftz(float x) {
-  float y;
-  asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
-  return y;
-}
-
-SGL_DEVICE float sqrt_approx_ftz(float x) {
-  float y;
-  asm("sqrt.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
   return y;
 }
 
@@ -95,64 +84,9 @@ SGL_DEVICE float key_to_float(uint32_t k) {
 }
 
 inline constexpr float kLog2e = 1.4426950408889634f;
-inline constexpr float kLn2 = 0.6931471805599453f;
-
-// 1 + e >= 1: rcp.approx equals div.full, except a result below 2^-126 flushes to 0.
-SGL_DEVICE float sigmoid(float x) {
-  return ptx::rcp_approx_ftz(1.0f + ptx::ex2_approx_ftz(x * -kLog2e));
-}
 
 SGL_DEVICE float softmax_exp(float x, float mx) {
   return ptx::ex2_approx_ftz((x - mx) * kLog2e);
-}
-
-// sqrt(max(x, 0) + log1p(exp(-|x|))), branch-free: w = exp(-|x| / 2) = 2^n * 2^f with
-// a degree-7 polynomial for 2^f, z = w^2, log1p(z) = 2 atanh(z / (2 + z)) as an odd
-// series. For x <= 0 the result is w * sqrt(log1p(z) / z), which stays normal down to
-// x = -174 where z itself underflows; below about -176, where w underflows, it is 0.
-SGL_DEVICE float sqrtsoftplus(float x) {
-  constexpr float kHalfL2e = 0.5f * kLog2e;
-  constexpr float kHalfL2eLo = 0.5f * 1.925963033500011e-08f;  // (log2(e) - kLog2e) / 2
-  // Bounds n for the exponent add below (also maps -inf and NaN to finite values).
-  const auto nx = fmaxf(-fabsf(x), -500.0f);
-  // n = rint(nx * kHalfL2e) via 1.5 * 2^23, whose low mantissa bits then hold n.
-  const auto n_shift = nx * kHalfL2e + 12582912.0f;
-  const auto n = n_shift - 12582912.0f;
-  // f = nx * log2(e) / 2 - n: the fma rounds once, |f| <= 1/2.
-  const auto f = fmaf(nx, kHalfL2eLo, fmaf(nx, kHalfL2e, -n));
-  // 2^f = e^(f ln2), Taylor to degree 7 (error < 5e-9 for |f| <= 1/2).
-  auto e = 1.0f / 5040.0f;
-  e = fmaf(e, f * kLn2, 1.0f / 720.0f);
-  e = fmaf(e, f * kLn2, 1.0f / 120.0f);
-  e = fmaf(e, f * kLn2, 1.0f / 24.0f);
-  e = fmaf(e, f * kLn2, 1.0f / 6.0f);
-  e = fmaf(e, f * kLn2, 0.5f);
-  e = fmaf(e, f * kLn2, 1.0f);
-  e = fmaf(e, f * kLn2, 1.0f);
-  // w = e * 2^n by an exponent add (1.5 * 2^23 << 23 wraps to 0). When 2^n underflows
-  // (n >= -181 here), the exponent borrows into the sign: a negative value or NaN, which
-  // fmaxf turns into 0.
-  const auto w = fmaxf(__int_as_float(__float_as_int(e) + (__float_as_int(n_shift) << 23)), 0.0f);
-  const auto z = w * w;
-  // 1 / (2 + z): rcp.approx and one Newton step, ~0.5 ulp.
-  const auto d = 2.0f + z;
-  const auto inv0 = ptx::rcp_approx_ftz(d);
-  const auto inv = fmaf(inv0, fmaf(-d, inv0, 1.0f), inv0);
-  const auto s = z * inv;
-  const auto s2 = s * s;
-  auto poly = 1.0f / 13.0f;
-  poly = fmaf(poly, s2, 1.0f / 11.0f);
-  poly = fmaf(poly, s2, 1.0f / 9.0f);
-  poly = fmaf(poly, s2, 1.0f / 7.0f);
-  poly = fmaf(poly, s2, 1.0f / 5.0f);
-  poly = fmaf(poly, s2, 1.0f / 3.0f);
-  // r = log1p(z) / z = 2 / (2 + z) * (1 + s^2 poly).
-  const auto two_inv = 2.0f * inv;
-  const auto r = fmaf(two_inv * s2, poly, two_inv);
-  // NaN takes the x > 0 side and stays NaN. Selecting before the MUFU keeps it
-  // unconditional; a select after it makes nvcc branch around the MUFU.
-  const bool pos = !(x <= 0.0f);
-  return ptx::sqrt_approx_ftz(pos ? fmaf(z, r, x) : r) * (pos ? 1.0f : w);
 }
 
 enum class Scoring : uint32_t { SIGMOID = 0, SOFTMAX = 1, SQRTSOFTPLUS = 2 };
@@ -236,7 +170,8 @@ __global__ __launch_bounds__(kNumWarps * 32) void route_warp_kernel(const __grid
   }
 
   // ---- load and score ----
-  const auto row = static_cast<const T*>(p.logits) + static_cast<int64_t>(token) * p.logits_stride + base;
+  const auto row =
+      assume_global(static_cast<const T*>(p.logits) + static_cast<int64_t>(token) * p.logits_stride + base);
   AlignedVector<T, V> xv[L / V];
 #pragma unroll
   for (uint32_t i = 0; i < L / V; ++i) {
@@ -246,7 +181,7 @@ __global__ __launch_bounds__(kNumWarps * 32) void route_warp_kernel(const __grid
   if constexpr (kBias) {
 #pragma unroll
     for (uint32_t i = 0; i < L / VB; ++i) {
-      bv[i].load(bias + base, i);
+      bv[i].load(assume_global(bias + base), i);
     }
   }
 
@@ -262,7 +197,7 @@ __global__ __launch_bounds__(kNumWarps * 32) void route_warp_kernel(const __grid
       val[j] = kBias ? x + cast<float>(bv[j / VB][j % VB]) : x;
       biased[j] = val[j];
     } else {
-      val[j] = kScoring == Scoring::SIGMOID ? sigmoid(x) : sqrtsoftplus(x);
+      val[j] = kScoring == Scoring::SIGMOID ? activation::sigmoid(x) : activation::sqrt_softplus(x);
       biased[j] = val[j] + cast<float>(bv[j / VB][j % VB]);
     }
     // NaN ranks last (as DeepGEMM's mega-gate); + 0 turns -0 into +0.

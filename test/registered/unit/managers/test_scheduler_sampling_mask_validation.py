@@ -45,6 +45,12 @@ class TestSchedulerSamplingMaskValidation(CustomTestCase):
                 )
                 scheduler._add_request_to_queue = MagicMock()
                 scheduler.output_streamer = MagicMock()
+                scheduler.tree_cache = MagicMock()
+                scheduler.beam_coordinator = MagicMock()
+                scheduler.hisparse_coordinator = None
+                scheduler.uocr_runtime = None
+                scheduler.send_abort_output = MagicMock()
+                scheduler.init_request_retirer()
                 recv_req = MagicMock(
                     session_params=None,
                     session_id=None,
@@ -53,6 +59,8 @@ class TestSchedulerSamplingMaskValidation(CustomTestCase):
                     bootstrap_room=9,
                 )
                 req = MagicMock(return_sampling_mask=True, return_logprob=False)
+                req.exit_via = req.send_via = req.kv.retraction_backup = None
+                req.kv.holds_kv = req.kv.holds_mamba = False
                 with (
                     patch(
                         "sglang.srt.managers.scheduler.BeamCoordinator.request_beam_width",
@@ -93,6 +101,11 @@ class TestSchedulerSamplingMaskValidation(CustomTestCase):
                 )
                 scheduler.send_abort_output = MagicMock()
                 scheduler.output_streamer = MagicMock()
+                scheduler.tree_cache = MagicMock()
+                scheduler.beam_coordinator = MagicMock()
+                scheduler.hisparse_coordinator = None
+                scheduler.uocr_runtime = None
+                scheduler.init_request_retirer()
                 scheduler.server_args = SimpleNamespace(sampling_mask_max_tokens=64)
                 scheduler._create_generation_req = lambda recv_req, **kw: Req(**kw)
                 scheduler.session_controller = SessionController(MagicMock())
@@ -131,7 +144,9 @@ class TestSchedulerSamplingMaskValidation(CustomTestCase):
                         "sglang.srt.managers.scheduler.BeamCoordinator.request_beam_width",
                         return_value=1,
                     ),
-                    patch("sglang.srt.managers.scheduler.make_abort_req"),
+                    patch(
+                        "sglang.srt.managers.scheduler_components.request_retirer.make_abort_req"
+                    ),
                 ):
                     scheduler.handle_generate_request(recv_req)
                 self.assertFalse(session._inflight)
