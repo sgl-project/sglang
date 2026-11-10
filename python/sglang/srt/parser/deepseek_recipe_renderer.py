@@ -106,16 +106,6 @@ def _error_message(body: Any) -> str:
         return str(body)
 
 
-def _shown_tools(message: dict[str, Any], tool_choice: Any) -> list[dict[str, Any]]:
-    if tool_choice == "none" or message["role"] != "system":
-        return []
-    tools = message.get("tools") or []
-    if isinstance(tool_choice, dict):
-        name = tool_choice["function"]["name"]
-        return [tool for tool in tools if tool["function"]["name"] == name]
-    return tools
-
-
 def _take_message_tools(
     messages: list[dict[str, Any]], tool_choice: Any
 ) -> tuple[list[dict[str, Any]], list[tuple[str, str, list[dict[str, Any]]]]]:
@@ -124,8 +114,13 @@ def _take_message_tools(
     token = uuid.uuid4().hex
     rewritten, declarations = [], []
     for index, message in enumerate(messages):
-        tools = _shown_tools(message, tool_choice)
+        tools = message.get("tools") or []
         message = {key: value for key, value in message.items() if key != "tools"}
+        if tool_choice == "none" or message["role"] != "system":
+            tools = []
+        elif isinstance(tool_choice, dict):
+            name = tool_choice["function"]["name"]
+            tools = [tool for tool in tools if tool["function"]["name"] == name]
         if not tools:
             rewritten.append(message)
             continue
@@ -138,33 +133,6 @@ def _take_message_tools(
         ]
         declarations.append((opening, closing, tools))
     return rewritten, declarations
-
-
-def _marker_index(messages: list[Any], marker: str) -> int:
-    for index, message in enumerate(messages):
-        if message.role == "system" and message.content == marker:
-            return index
-    raise ValueError("deepseek-recipe dropped a message that declares tools")
-
-
-def _declaring_message(message: Optional[Any], tools: list[Any]) -> Any:
-    """`message` is None when conversion dropped it for its empty content."""
-    recipe = load_deepseek_recipe()
-    if message is None:
-        return recipe.SystemMessage("", tools=tools)
-    # The constructor re-derives image placeholders from the token's spellings.
-    if message.image_sources and message.content.count(IMAGE_TOKEN) != len(
-        message.image_sources
-    ):
-        raise ValueError(
-            f"a message that declares tools cannot spell {IMAGE_TOKEN} as text"
-        )
-    return recipe.SystemMessage(
-        message.content,
-        image_sources=message.image_sources,
-        tools=tools,
-        image_token=IMAGE_TOKEN,
-    )
 
 
 def _declare_message_tools(
@@ -193,13 +161,29 @@ def _declare_message_tools(
     by_name = {tool.name: tool for tool in tools}
     messages = list(conversation.messages)
     for opening, closing, declaration in declarations:
-        start = _marker_index(messages, opening)
-        end = _marker_index(messages, closing)
-        kept = messages[start + 1 : end]
+        bracket = [
+            index
+            for index, message in enumerate(messages)
+            if message.role == "system" and message.content in (opening, closing)
+        ]
+        if len(bracket) != 2:
+            raise ValueError("deepseek-recipe dropped a message that declares tools")
+        start, end = bracket
+        # Conversion drops a declaring message whose content is empty.
+        message = messages[start + 1] if end > start + 1 else recipe.SystemMessage("")
+        # The constructor re-derives image placeholders from the token's spellings.
+        if message.image_sources and message.content.count(IMAGE_TOKEN) != len(
+            message.image_sources
+        ):
+            raise ValueError(
+                f"a message that declares tools cannot spell {IMAGE_TOKEN} as text"
+            )
         messages[start : end + 1] = [
-            _declaring_message(
-                kept[0] if kept else None,
+            recipe.SystemMessage(
+                message.content,
+                image_sources=message.image_sources,
                 tools=[by_name[tool["function"]["name"]] for tool in declaration],
+                image_token=IMAGE_TOKEN,
             )
         ]
     response_format = conversation.response_format
