@@ -523,6 +523,8 @@ class ModelRunner:
 
         # For hisparse (must be set before initialize() so CUDA graph capture can see it)
         self.hisparse_coordinator = None
+        self.hisparse_hicache_backend = None
+        self.hisparse_hicache_buffer = None
 
         # The native overlap path replaces this during load_model(). Keep the
         # no-pending-work invariant for lightweight backends that override the
@@ -1083,6 +1085,25 @@ class ModelRunner:
         self.decode_cuda_graph_capture_bs: list[int] = []
 
     def maybe_init_hisparse_coordinator(self):
+        if get_memory().hisparse_backend == "hicache":
+            if self.is_draft_worker:
+                return
+            from sglang.srt.managers.hisparse_coordinator import (
+                HiSparseHiCacheBackend,
+                build_hisparse_hicache_buffer,
+            )
+
+            self.hisparse_hicache_buffer = build_hisparse_hicache_buffer(
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool=self.token_to_kv_pool,
+                model_config=self.model_config,
+                device=self.device,
+            )
+            self.hisparse_hicache_backend = HiSparseHiCacheBackend(
+                cache=self.hisparse_hicache_buffer,
+                allocator=self.token_to_kv_pool_allocator,
+            )
+            return
         if not self.enable_hisparse:
             return
         from sglang.srt.managers.hisparse_coordinator import (
@@ -1851,6 +1872,8 @@ class ModelRunner:
             )
 
         # Hisparse coordinator — backends now read it from self.model_runner.
+        if self.hisparse_hicache_buffer is not None:
+            self.hisparse_hicache_buffer.prepare_forward(forward_batch)
         if self.hisparse_coordinator is not None:
             self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
 
@@ -2098,6 +2121,8 @@ class ModelRunner:
                 and self.decode_cuda_graph_runner.can_run_graph(forward_batch)
             )
 
+            if self.hisparse_hicache_buffer is not None:
+                self.hisparse_hicache_buffer.prepare_forward(forward_batch)
             if (
                 forward_batch.forward_mode.is_decode()
                 and self.hisparse_coordinator is not None

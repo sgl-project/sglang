@@ -883,6 +883,7 @@ class PrefillAdder:
         prefill_tile_block_m: int = 64,
         request_retirer: Optional[RequestRetirer] = None,
         kv_awaiting_transfer: bool = False,
+        hisparse_hicache_backend=None,
     ):
         self.page_size = page_size
         # DCP donates a checkpoint only on the kernel chunk grid. A cut off
@@ -893,6 +894,7 @@ class PrefillAdder:
         # Whether every cut must land on that grid, never below it.
         self.strict_chunk_grid = windows_retire_behind_checkpoints(tree_cache)
         self.prefill_tile_block_m = prefill_tile_block_m
+        self.hisparse_hicache_backend = hisparse_hicache_backend
         self.tree_cache = tree_cache
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.logical_page_size = self.page_size
@@ -1885,6 +1887,14 @@ class PrefillAdder:
 
         max_new = self._swa_new_tokens(req)
         total_tokens, state_slots = self._prefill_charge(req)
+        hisparse_temp = (
+            self.hisparse_hicache_backend.temp_tokens_required(
+                req, max_new_tokens=max_new
+            )
+            if self.hisparse_hicache_backend is not None
+            else 0
+        )
+        total_tokens += hisparse_temp
         if not self.memory_budget.state_slots_fit(state_slots):
             if (
                 isinstance(self.tree_cache, UnifiedRadixCache)
@@ -1965,6 +1975,7 @@ class PrefillAdder:
                             + admission.extend_len
                             + load_max_new
                             + self.page_size
+                            + hisparse_temp
                         ),
                         extend_input_len=admission.extend_len,
                         max_new_tokens=load_max_new,
@@ -2051,6 +2062,13 @@ class PrefillAdder:
                 ):
                     return AddReqResult.OTHER
 
+            if (
+                self.hisparse_hicache_backend is not None
+                and not self.hisparse_hicache_backend.reserve_prefill(
+                    req, max_new_tokens=max_new
+                )
+            ):
+                return AddReqResult.NO_TOKEN
             self._commit_prefill_admission(req, admission, state_slots)
 
         # This verdict controls the next candidate, not the committed request.

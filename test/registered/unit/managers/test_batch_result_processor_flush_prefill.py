@@ -114,7 +114,7 @@ def _result(batch):
     )
 
 
-def _run(cls, *, hisparse=False):
+def _run(cls, *, hisparse=False, hicache=False):
     """One prefill result through ``cls``; returns the log of KV calls, free group
     and send."""
     log = []
@@ -137,6 +137,13 @@ def _run(cls, *, hisparse=False):
             lease_checkpoint_state_slots=lambda reqs: nullcontext()
         ),
         hisparse_coordinator=hisparse_coordinator,
+        hisparse_hicache_backend=(
+            SimpleNamespace(
+                admit_request=lambda req: log.append(("hicache_admit", req.rid))
+            )
+            if hicache
+            else None
+        ),
         request_retirer=release_only_retirer(
             tree_cache=Mock(), hisparse_coordinator=hisparse_coordinator
         ),
@@ -175,6 +182,21 @@ class TestFlushPrefill(CustomTestCase):
     def test_override_sends_before_the_kv_calls(self):
         log = _run(_StreamFirst)
         self.assertEqual(log, ["free_group_begin", SEND, *KV_CALLS, "free_group_end"])
+
+    def test_hicache_admits_only_after_the_tree_checkpoint(self):
+        """Sparse decode admission must see the completed prefix checkpoint."""
+        self.assertEqual(
+            _run(SchedulerBatchResultProcessor, hicache=True),
+            [
+                "free_group_begin",
+                KV_CALLS[0],
+                KV_CALLS[1],
+                ("hicache_admit", "r1"),
+                KV_CALLS[2],
+                "free_group_end",
+                SEND,
+            ],
+        )
 
     def test_hisparse_calls_are_queued_in_row_order(self):
         # The order the loop used to run them in, each release_request just before

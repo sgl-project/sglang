@@ -298,6 +298,31 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(adder.rem_chunk_tokens, 0)
         self.assertGreaterEqual(adder.rem_total_tokens, 0)
 
+    def test_hicache_hot_reservation_keeps_request_slot_charge(self):
+        """Admission must fit both hot KV and the allocator's request-slot reserve."""
+        self.mock_token_allocator.request_slot_reserve.return_value = 4
+        backend = SimpleNamespace(
+            temp_tokens_required=lambda req, *, max_new_tokens: 8,
+            reserve_prefill=lambda req, *, max_new_tokens: True,
+        )
+        for capacity, fits in ((28, False), (30, True)):
+            with self.subTest(capacity=capacity):
+                self.mock_token_allocator.available_size.return_value = capacity
+                adder = self.create_adder(
+                    self.create_running_batch(), hisparse_hicache_backend=backend
+                )
+                req = self.create_shared_req("hot")
+                result = adder.add_one_req(
+                    req, has_chunked_req=False, truncation_align_size=None
+                )
+                if fits:
+                    self.assertIn(req, adder.can_run_list)
+                    self.assertEqual(req.extend_len, 12)
+                else:
+                    self.assertIs(result, AddReqResult.NO_TOKEN)
+                    self.assertEqual(adder.can_run_list, [])
+                    self.assertIsNone(req.extend_end)
+
     def test_shortest_prefill_rejects_second_unfinished_chunk(self):
         adder = self.create_shortest_prefill_adder(chunk_tokens=512)
         req = self.create_shared_req("second-chunk")
