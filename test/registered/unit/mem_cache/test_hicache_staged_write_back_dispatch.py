@@ -256,6 +256,10 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         controller.l2_transfer_engine.submit_host_to_device.return_value = completion
         controller.transfer_layer_id_max = 2
         controller.ack_load_queue = []
+        controller.load_enqueue_queue = None
+        controller._submit_load_burst.side_effect = lambda **kwargs: (
+            HybridCacheController._submit_load_burst(controller, **kwargs)
+        )
 
         self.assertEqual(HybridCacheController.start_loading(controller), 0)
 

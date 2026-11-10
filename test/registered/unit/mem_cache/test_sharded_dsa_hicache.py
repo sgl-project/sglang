@@ -43,7 +43,9 @@ class TestShardedDSAHiCache(CustomTestCase):
         events = []
         start = Mock()
         start.record.side_effect = lambda: events.append("fence")
-        producer = SimpleNamespace(start_event=start, complete=Mock())
+        producer = SimpleNamespace(
+            start_event=start, complete=Mock(), mark_enqueue_done=Mock()
+        )
         indices = torch.arange(64)
         transfers = [object()]
         completion = SimpleNamespace(
@@ -80,6 +82,10 @@ class TestShardedDSAHiCache(CustomTestCase):
             kv_storage=None,
             _num_tokens_by_pool=lambda op: {"kv": 64},
             _transfer_num_bytes=lambda op: 0,
+            load_enqueue_queue=None,
+        )
+        cc._submit_load_burst = lambda **kwargs: HiCacheController._submit_load_burst(
+            cc, **kwargs
         )
         self.assertEqual(HiCacheController.start_loading(cc), 0)
         self.assertEqual(events, ["prepare", "fence", "describe", "submit"])

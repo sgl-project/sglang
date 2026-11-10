@@ -4302,15 +4302,14 @@ class UnifiedRadixCache(BasePrefixCache):
         if consumer_index < 0 or self.cache_controller is None:
             return True
 
-        finish_event = self.cache_controller.layer_done_counter.events[
-            consumer_index
-        ].finish_event
-        return finish_event.query()
+        event = self.cache_controller.layer_done_counter.events[consumer_index]
+        # A burst still queued for enqueue has not recorded finish_event yet.
+        return event.is_enqueue_done() and event.finish_event.query()
 
     def has_free_load_back_slot(self) -> bool:
         """Acks are reaped in lockstep, so every rank agrees on this."""
         cc = self.cache_controller
-        return len(cc.ack_load_queue) < cc.layer_done_counter.num_counters
+        return cc.num_unreaped_load_bursts() < cc.layer_done_counter.num_counters
 
     # ---- Query / Inspection APIs ----
     # These APIs exist for compatibility with other RadixTree implementations.
