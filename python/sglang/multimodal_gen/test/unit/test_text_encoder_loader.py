@@ -32,6 +32,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_w4a8_conf
 )
 from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8Config
 from sglang.multimodal_gen.runtime.layers.quantization.gguf import GGUFConfig
+from sglang.multimodal_gen.runtime.layers.quantization.mxfp8 import MXFP8Config
 from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
@@ -680,23 +681,36 @@ class TestTextEncoderQuantization(unittest.TestCase):
         self.assertIs(model_config.quant_config, self.serialized)
 
     def test_explicit_online_quantization_configures_native_encoder(self):
-        model_config = SimpleNamespace(quant_config=None)
         self.get_quant_config.return_value = None
-
-        _configure_encoder_quantization(
-            model_config,
-            TextEncoder,
-            {},
-            "/model/text_encoder",
-            "/model/text_encoder",
-            "text_encoder",
-            explicit_quantization="convrot_int8",
-            ignored_layers=["lm_head"],
-        )
-
-        self.assertIsInstance(model_config.quant_config, ConvRotInt8Config)
-        self.assertFalse(model_config.quant_config.is_checkpoint_int8_serialized)
-        self.assertEqual(model_config.quant_config.ignored_layers, ["lm_head"])
+        for method, config_cls in (
+            ("convrot_int8", ConvRotInt8Config),
+            ("fp8", Fp8Config),
+            ("mxfp8", MXFP8Config),
+        ):
+            with self.subTest(method=method):
+                model_config = SimpleNamespace(quant_config=None)
+                _configure_encoder_quantization(
+                    model_config,
+                    TextEncoder,
+                    {},
+                    "/model/text_encoder",
+                    "/model/text_encoder",
+                    "text_encoder",
+                    explicit_quantization=method,
+                    ignored_layers=["lm_head"],
+                )
+                self.assertIsInstance(model_config.quant_config, config_cls)
+                self.assertFalse(
+                    getattr(
+                        model_config.quant_config, "is_checkpoint_fp8_serialized", False
+                    )
+                    or getattr(
+                        model_config.quant_config,
+                        "is_checkpoint_int8_serialized",
+                        False,
+                    )
+                )
+                self.assertEqual(model_config.quant_config.ignored_layers, ["lm_head"])
 
     def test_weight_file_metadata_configures_native_encoder(self):
         model_config = SimpleNamespace(quant_config=None)

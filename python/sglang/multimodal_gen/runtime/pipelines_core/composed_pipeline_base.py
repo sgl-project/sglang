@@ -9,6 +9,8 @@ This module defines the base class for pipelines that are composed of multiple s
 
 import os
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
+from types import MappingProxyType
 from typing import Any, Callable, ClassVar, Iterator, Literal, cast
 
 import torch
@@ -66,6 +68,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
+    external_component_path,
     maybe_download_model,
     prepare_diffusers_component_path_for_loading,
     verify_model_config_and_directory,
@@ -90,6 +93,9 @@ class ComposedPipelineBase(ABC):
     _required_config_modules: list[str] = []
     _unfiltered_required_config_modules: tuple[str, ...] = ()
     _extra_config_module_map: dict[str, str] = {}
+    # model_index.json component name -> the other repository's component path
+    # it loads from (external_component_path); load_modules sets it.
+    _external_component_paths: Mapping[str, str] = MappingProxyType({})
     # Exact module keys; unspecified components retain the default loader dispatch.
     component_loaders: ClassVar[dict[str, type[ComponentLoader]]] = {}
     server_args: ServerArgs | None = None
@@ -422,9 +428,23 @@ class ComposedPipelineBase(ABC):
         self, server_args: ServerArgs, module_name: str, load_module_name: str
     ) -> str:
         override_path = server_args.component_paths.get(module_name)
+        external_path = self._external_component_paths.get(load_module_name)
         if override_path is not None:
             component_model_path = prepare_diffusers_component_path_for_loading(
                 override_path
+            )
+        elif external_path is not None:
+            local_path = os.path.join(self.model_path, load_module_name)
+            if os.path.exists(local_path):
+                raise ValueError(
+                    f"model_index.json loads {load_module_name!r} from "
+                    f"{external_path!r}, but the snapshot also has {local_path}"
+                )
+            logger.info(
+                "Loading %s from %s (model_index.json)", load_module_name, external_path
+            )
+            component_model_path = prepare_diffusers_component_path_for_loading(
+                external_path
             )
         else:
             component_model_path = os.path.join(self.model_path, load_module_name)
@@ -463,6 +483,13 @@ class ComposedPipelineBase(ABC):
 
         model_index = self._load_config()
         logger.info("Loading pipeline modules from config: %s", model_index)
+        external_paths = {}
+        for name, spec in model_index.items():
+            external_path = external_component_path(name, spec)
+            if external_path is not None:
+                external_paths[name] = external_path
+                model_index[name] = spec[:2]
+        self._external_component_paths = MappingProxyType(external_paths)
 
         # remove keys that are not pipeline modules
         model_index.pop("_class_name")

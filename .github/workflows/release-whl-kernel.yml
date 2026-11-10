@@ -134,10 +134,12 @@ jobs:
         run: |
           if [ -z "${{ inputs.tag_name }}" ]; then
             TAG_NAME="v$(cat python/sglang/kernels/aot/python/sgl_kernel/version.py | cut -d'"' -f2)"
-            echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
           else
-            echo "tag_name=${{ inputs.tag_name }}" >> $GITHUB_OUTPUT
+            TAG_NAME="${{ inputs.tag_name }}"
           fi
+          # Prefix with the package name so the release tag in sgl-project/whl
+          # does not collide with other packages that share the version number.
+          echo "tag_name=sglang-kernel-${TAG_NAME}" >> $GITHUB_OUTPUT
 
       - name: Release
         uses: softprops/action-gh-release@v2
@@ -237,10 +239,12 @@ jobs:
         run: |
           if [ -z "${{ inputs.tag_name }}" ]; then
             TAG_NAME="v$(cat python/sglang/kernels/aot/python/sgl_kernel/version.py | cut -d'"' -f2)"
-            echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
           else
-            echo "tag_name=${{ inputs.tag_name }}" >> $GITHUB_OUTPUT
+            TAG_NAME="${{ inputs.tag_name }}"
           fi
+          # Prefix with the package name so the release tag in sgl-project/whl
+          # does not collide with other packages that share the version number.
+          echo "tag_name=sglang-kernel-${TAG_NAME}" >> $GITHUB_OUTPUT
 
       - name: Release
         uses: softprops/action-gh-release@v2
@@ -289,10 +293,12 @@ jobs:
         run: |
           if [ -z "${{ inputs.tag_name }}" ]; then
             TAG_NAME="v$(cat python/sglang/kernels/aot/python/sgl_kernel/version.py | cut -d'"' -f2)"
-            echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
           else
-            echo "tag_name=${{ inputs.tag_name }}" >> $GITHUB_OUTPUT
+            TAG_NAME="${{ inputs.tag_name }}"
           fi
+          # Prefix with the package name so the release tag in sgl-project/whl
+          # does not collide with other packages that share the version number.
+          echo "tag_name=sglang-kernel-${TAG_NAME}" >> $GITHUB_OUTPUT
 
       - name: Release
         uses: softprops/action-gh-release@v2
@@ -389,10 +395,12 @@ jobs:
         run: |
           if [ -z "${{ inputs.tag_name }}" ]; then
             TAG_NAME="v$(cat python/sglang/kernels/aot/python/sgl_kernel/version.py | cut -d'"' -f2)"
-            echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
           else
-            echo "tag_name=${{ inputs.tag_name }}" >> $GITHUB_OUTPUT
+            TAG_NAME="${{ inputs.tag_name }}"
           fi
+          # Prefix with the package name so the release tag in sgl-project/whl
+          # does not collide with other packages that share the version number.
+          echo "tag_name=sglang-kernel-${TAG_NAME}" >> $GITHUB_OUTPUT
 
       - name: Release
         uses: softprops/action-gh-release@v2
