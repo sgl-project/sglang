@@ -2264,14 +2264,13 @@ class LowRatioCompressAscendBackendMixin:
                     slot_dst, slot_values, keep, fill=self._DSV41_SLOT_SKIP
                 )
 
-        self._refresh_graph_dsv41_index_page_tables(fm)
-
     def _refresh_graph_dsv41_index_page_tables(self, fm) -> None:
         """Re-derive the indexer-K page-table expansion into the captured buffers.
 
-        The parent refreshes the shared ``block_tables`` view in place before
-        this runs, so the expansion must follow on every replay (decode and
-        verify).
+        Driven from _apply_dsv4_graph_metadata next to the c4/c128 page-table
+        refresh, after the parent refreshes the shared ``block_tables`` view
+        in place; runs on every live replay regardless of mode. Idle replays
+        skip it -- the live mask gates all consumption there.
         """
         block_tables = getattr(fm, "block_tables", None)
         if block_tables is None:
@@ -2349,8 +2348,6 @@ class LowRatioCompressAscendBackendMixin:
                 self._dsv41_compact_1d(
                     slot_dst, slot_values, keep, fill=self._DSV41_SLOT_SKIP
                 )
-
-        self._refresh_graph_dsv41_index_page_tables(fm)
 
     def _clear_graph_dsv41_verify_metadata(self, ctx) -> None:
         """DP-idle verify replay: neutralize the V4.1 metadata.
@@ -3576,10 +3573,13 @@ class DeepseekV4AscendAttnBackend(
         self._refresh_graph_seq_metadata(ctx)
         self._refresh_graph_compress_page_tables_direct(ctx)
 
+        if self._dsv4_has_low_ratio and not ctx.is_idle_replay:
+            self._refresh_graph_dsv41_index_page_tables(ctx.fm)
+
         if ctx.graph_mode.is_decode():
             self._refresh_graph_decode_compress_1d_direct(ctx)
         elif ctx.graph_mode.is_target_verify():
-            if self._dsv4_has_low_ratio and self._is_dspark_algorithm:
+            if self._dsv4_has_low_ratio:
                 # V4.1 DSpark: active_target_verify is gated on c4/c128 and can
                 # never fire here, so dispatch on the mode itself. The draft
                 # worker (empty ratio list) keeps taking the silent bypass
