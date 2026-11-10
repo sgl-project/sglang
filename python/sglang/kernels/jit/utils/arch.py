@@ -102,10 +102,6 @@ def _cuda_arch_suffix(major: int, minor: int) -> str:
     return ""
 
 
-# JIT modules that build against FlashInfer's bundled CUTLASS. On CC 10.7 they
-# build the sm_100f family target until that CUTLASS declares Sm107: against it an
-# sm_107a build compiles, but CuTe's TMA copies and setmaxnreg compile out (#45911).
-# Every other module builds sm_107a (sm_100f also caps static smem at 48 KB, #49385).
 MODULE_USES_CUTLASS = ["deep_select_topk"]
 
 
