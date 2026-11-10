@@ -7,7 +7,6 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
-    EvictParams,
     IncLockRefResult,
     InsertParams,
     InsertResult,
@@ -20,6 +19,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PoolTransferResult,
 )
+from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.mem_cache.kv.plan import TREE_WINDOW
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeComponentDeviceSlot,
@@ -95,11 +95,9 @@ class SWAComponent(TreeComponent):
             raise ValueError("SWAComponent requires a positive window in its slot")
 
         super().__init__(cache, params, slot)
-        # The host pool of the slot's HiCache copies: the one its window slot
-        # names under unified memory, else the window host pool.
-        self.pool_name = (
-            PoolName.SWA if slot.host_pool is None else PoolName(slot.host_pool)
-        )
+        # The host pool of the slot's HiCache copies: the window sub-pool's
+        # own under unified memory, else the window host pool.
+        self.pool_name = PoolName.SWA if slot.host_pool is None else slot.host_pool
         self._independent = windows_stand_alone(params.tree_slots)
         self._session_leaf_covered_len: dict[str, dict[UnifiedTreeNode, int]] = {}
         # The history a prefix keeps, which every reader of the window needs
@@ -1089,20 +1087,7 @@ class SWAComponent(TreeComponent):
         # unified_kv keeps SWA as a device-only ring -- nothing to prefetch into.
         if self._swa_kv_pool_host is None:
             return PreparePrefetchResult()
-        sw_pages = self.full_window_pages
-        if sw_pages == 0:
-            return PreparePrefetchResult()
-        prefetch_pages = prefetch_tokens // self.cache.page_size
-        if prefetch_pages >= sw_pages:
-            num_pages = sw_pages
-        elif prefetch_pages > 0 and self.tree_core.is_root(node_id):
-            # At root the sequence is shorter than the window, so its whole
-            # SWA is the window -- complete, not a partial fetch.
-            num_pages = prefetch_pages
-        else:
-            # Mid-tree short span: the window head would have to come from the
-            # device prefix, which the match validator does not promise.
-            return PreparePrefetchResult()
+        num_pages = min(prefetch_tokens // self.cache.page_size, self.full_window_pages)
         return PreparePrefetchResult(staging_tokens=num_pages * self.cache.page_size)
 
     def alloc_prefetch_staging(self, num_tokens: int) -> Optional[torch.Tensor]:
@@ -1281,9 +1266,10 @@ class SWAComponent(TreeComponent):
         if phase == LinkerTransferPhase.LOAD:
             num_tokens = len(tail_keys) * page
             storage, sub_pool = self.storage_and_sub_pool()
-            shortfall = max(0, num_tokens - storage.available_units(sub_pool))
-            if shortfall:
-                self.cache.evict(EvictParams(window_num_tokens={sub_pool: shortfall}))
+            if not storage.units_fit(sub_pool, num_tokens):
+                self.cache.evict_for_alloc(
+                    KVDemand(window_tokens={sub_pool: num_tokens})
+                )
             transfer.device_indices = storage.take_units(sub_pool, num_tokens)
             if transfer.device_indices is None:
                 return None
@@ -1424,7 +1410,7 @@ class SWAComponent(TreeComponent):
     ) -> None:
         """Fill the prefetched SWA window onto the leaf→anchor path.
 
-        All-or-nothing over one full window: ``loaded_pages`` is the cross-rank
+        All-or-nothing over the staged window: ``loaded_pages`` is the cross-rank
         MIN, so ``loaded_pages < window_pages`` drops the whole window (keeps the
         tree identical across TP ranks). Otherwise map the buffer to token range
         ``[loaded_start, total_len)`` and walk leaf→anchor, filling SWA
@@ -1449,13 +1435,6 @@ class SWAComponent(TreeComponent):
             and insert_result.inserted_host_node is not None
             else None
         )
-        if anchor is not self.tree_core.root_node:
-            # Cache-mode graft commit only (buffer fills never reach here):
-            # a hit-shrunk window mid-tree is missing its head — drop it.
-            # Root anchors are complete windows of their own.
-            if window_require_pages < self.full_window_pages:
-                self._release_swa_host(host_indices, cache_actions)
-                return
         if (
             target is None
             or window_require_pages == 0

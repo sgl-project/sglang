@@ -2,7 +2,10 @@
 """SGLang's post-verify CUDA graphs for the EAGLE verify
 (SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH): sampling and acceptance, the commit
 outputs and, on a side stream, the mamba state commit, for every batch a graph can
-reproduce; any other batch runs SGLang's eager path."""
+reproduce; any other batch runs SGLang's eager path.
+
+The side-stream commit may run after the scheduler reused a finished request's
+row, so it writes the verify forward's slots, staged with the round's inputs."""
 
 from __future__ import annotations
 
@@ -13,7 +16,9 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 import torch
 
 from sglang.kernels.ops.memory.small_field_copy import SmallFieldCopyPlan
+from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardStateSlots
 from sglang.srt.speculative.eagle_worker_common import (
     STOCK_SPECULATIVE_RUNTIME_HOOKS,
     make_post_verify_io,
@@ -46,6 +51,8 @@ class EaglePostVerifyGraphs:
     ):
         self._target_worker = target_worker
         self._speculative_runtime_hooks = speculative_runtime_hooks
+        # Whether the commit writes recurrent state slots; resolved at first use.
+        self._stages_state_slots: Optional[bool] = None
         self._graphs = _PostVerifyGraphs(
             body=self._body,
             commit=self._commit,
@@ -73,11 +80,27 @@ class EaglePostVerifyGraphs:
             return None
         return self._graphs.run(
             key=key,
-            inputs=_post_verify_inputs(batch, verify_input),
+            inputs=_post_verify_inputs(
+                batch, verify_input, self._verify_state_slots(batch)
+            ),
             make_slot=lambda staged: self._make_slot(
                 staged, batch, verify_input, logits_output, max_top_k
             ),
             sim_max_len=verify_input.max_tree_depth,
+        )
+
+    def _verify_state_slots(self, batch: ScheduleBatch) -> Optional[ForwardStateSlots]:
+        """The verify forward's state slots, which the mamba commit writes; None
+        for a model without recurrent state."""
+        model_runner = self._target_worker.model_runner
+        if self._stages_state_slots is None:
+            self._stages_state_slots = (
+                mambaish_config(model_runner.model_config) is not None
+            )
+        if not self._stages_state_slots:
+            return None
+        return model_runner.attn_backend.forward_state_slots(
+            len(batch.seq_lens), batch.mamba_track_indices
         )
 
     def eager_simulated_accept_length(
@@ -207,13 +230,19 @@ class EaglePostVerifyGraphs:
         from sglang.srt.speculative.spec_utils import commit_mamba_states_after_verify
 
         # the batch fields the commit reads, on the slot's staged copies
+        staged = slot.staged
         batch_view = SimpleNamespace(
             forward_mode=slot.forward_mode,
-            seq_lens=slot.staged["seq_lens"],
-            req_pool_indices=slot.staged["req_pool_indices"],
-            mamba_track_indices=slot.staged.get("track_indices"),
+            seq_lens=staged["seq_lens"],
+            req_pool_indices=staged["req_pool_indices"],
+            mamba_track_indices=staged.get("track_indices"),
             tree_cache=slot.tree_cache,
         )
+        state_slots = None
+        if "state_slots" in staged:
+            state_slots = ForwardStateSlots(
+                staged["state_slots"], staged.get("track_state_slots")
+            )
         commit_mamba_states_after_verify(
             self._target_worker,
             batch_view,
@@ -221,6 +250,7 @@ class EaglePostVerifyGraphs:
             outputs[2],
             slot.tokens_per_request,
             prepared_step_indices=outputs[6],
+            state_slots=state_slots,
         )
 
 
@@ -457,9 +487,12 @@ class _PostVerifyGraphs:
 
 
 def _post_verify_inputs(
-    batch: ScheduleBatch, verify_input: Any
+    batch: ScheduleBatch,
+    verify_input: Any,
+    state_slots: Optional[ForwardStateSlots] = None,
 ) -> dict[str, torch.Tensor]:
-    """The round's inputs the post-verify graphs read, staged into fixed buffers."""
+    """The round's inputs the post-verify graphs read, staged into fixed buffers.
+    ``state_slots``: the verify forward's own, which the mamba commit writes."""
     info = batch.sampling_info
     inputs = {
         "draft_tokens": verify_input.draft_token,
@@ -475,4 +508,8 @@ def _post_verify_inputs(
         )
     if batch.mamba_track_indices is not None:
         inputs["track_indices"] = batch.mamba_track_indices
+    if state_slots is not None:
+        inputs["state_slots"] = state_slots.working
+        if state_slots.track is not None:
+            inputs["track_state_slots"] = state_slots.track
     return inputs

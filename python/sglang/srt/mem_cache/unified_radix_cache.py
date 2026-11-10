@@ -5,6 +5,7 @@ import json
 import logging
 import threading
 import time
+import zlib
 from array import array
 from contextlib import ExitStack, nullcontext
 from dataclasses import replace
@@ -49,6 +50,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
     TreeLock,
+    evictable_by_sub_pool,
 )
 from sglang.srt.mem_cache.buffer_mode.pipeline import (
     BufferModePipeline,
@@ -59,6 +61,7 @@ from sglang.srt.mem_cache.buffer_mode.storage_existence_cache import (
     StorageExistenceCache,
     default_belief_policy,
 )
+from sglang.srt.mem_cache.capacity import owner_rows_ready
 from sglang.srt.mem_cache.common import RetractionBackup
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
@@ -72,6 +75,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     PPPrefetchDecision,
     PrefetchOperation,
 )
+from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.plan import (
     TREE_BLOCK,
@@ -198,6 +202,7 @@ class _OngoingLoadBack(NamedTuple):
 class _StoragePrefetchWait(msgspec.Struct):
     timer: PollTimer = msgspec.field(default_factory=PollTimer)
     timeout_s: float = 0.0
+    # Rank-agreed verdict of the per-tick vote; admission polls only read it.
     expired: bool = False
 
 
@@ -215,6 +220,9 @@ class _OngoingPrefetch(NamedTuple):
 class UnifiedRadixCache(BasePrefixCache):
     # Unlimited-OCR v2 split-document KV reuse; None for every other model.
     uocr_doc_reuse: Optional[DocReuse] = None
+    # Whether eviction walks every component in one joint LRU order; set from the
+    # eviction policy at construction (a cache built piecemeal walks per component).
+    evicts_by_joint_lru: bool = False
 
     def __init__(
         self,
@@ -507,6 +515,10 @@ class UnifiedRadixCache(BasePrefixCache):
         ] = {}
         self.storage_prefetch_retries = StoragePrefetchRetries()
         self.ongoing_backup: dict[int, tuple[NodeId, DecLockRefParams]] = {}
+        # Requested KV tokens of each cache-mode storage write in
+        # ongoing_backup: the ack drain settles every write at a rank-agreed
+        # written prefix of this span (buffer mode reads it from its entry).
+        self._backup_requested_tokens: dict[int, int] = {}
         if self.buffer_pipeline is not None:
             self.buffer_pipeline.reset()
             # The dropped writes' content no longer reaches a storage ack.
@@ -561,11 +573,6 @@ class UnifiedRadixCache(BasePrefixCache):
                 storage_extra_config.setdefault(
                     "file_storage_path", server_args.file_storage_path
                 )
-        storage_prefetch_threshold = (
-            self._storage_attachment.resolve_prefetch_threshold(
-                storage_prefetch_threshold
-            )
-        )
 
         attach_hybrid_pool_to_unified_cache(
             self,
@@ -770,88 +777,211 @@ class UnifiedRadixCache(BasePrefixCache):
     def evict(self, params: EvictParams) -> EvictResult:
         return self._evict(params)
 
-    @rank_consensus(
-        same_params=["params", "allocation_reclaim_satisfied is not None"],
-        same_results=True,
-    )
-    def evict_for_alloc(
-        self,
-        params: EvictParams,
-        *,
-        allocation_reclaim_satisfied: Optional[Callable[[], bool]] = None,
-    ) -> EvictResult:
-        """Evict using component shortfalls or cumulative joint-reclaim quotas.
+    @rank_consensus(same_params=True, same_results=True)
+    def evict_for_alloc(self, demand: KVDemand) -> EvictResult:
+        """Evict so that an allocation of ``demand`` (what it will take, not
+        what to evict) can be served.
 
-        Without ``allocation_reclaim_satisfied``, ``params`` contains component
-        shortfalls. These become availability targets, allowing collateral frees
-        to satisfy an allocation before its requested eviction count is reached.
-
-        With ``allocation_reclaim_satisfied``, ``params`` instead contains
-        cumulative reclaim quotas and component-local targets are bypassed.
-        The pure predicate may stop the walk before those quotas are reached;
-        the allocator must prepare and recheck actual capacity after the walk.
+        By the pool's reclaim discipline: pools sharing their memory reclaim
+        the whole demand at once (`reclaim_jointly`). Pools of their own evict
+        each component's shortfall (`evict_pool_shortfalls`), and a walk stops
+        once its pool can serve its demand: a FULL leaf cascade can free a
+        window's or a state's entries too.
         """
         if self.disable:
             return EvictResult()
-        if allocation_reclaim_satisfied is not None:
-            return self._evict(
-                params, allocation_reclaim_satisfied=allocation_reclaim_satisfied
-            )
+        return super().evict_for_alloc(demand)
 
-        request_by_type = self._evict_request_by_type(params)
-        available_size_targets = {
-            ct: (ct, self._component_available_size(ct) + request_cnt)
-            for ct, request_cnt in request_by_type.items()
-            if request_cnt > 0
-        }
+    def reclaim_jointly(
+        self, demand: KVDemand, *, windows_first: bool = False
+    ) -> EvictResult:
         allocator = self.token_to_kv_pool_allocator
-        mamba_full_donor = allocator.mamba_full_cache_donor()
-        mamba_target = available_size_targets.get(self.slot_id(TREE_STATE))
-        initial_params = params
-        if mamba_target is not None and mamba_full_donor is not None:
-            # Full KV can supply bytes but cannot recycle Mamba virtual IDs.
-            mamba_id_shortfall = max(
-                0,
-                mamba_target[1]
-                - self.token_to_kv_pool_allocator.state_slots.available_size(),
+        demand = demand.completed(allocator.window_pool_names())
+        return self._reclaim(
+            allocator.page_demands(demand), windows_first=windows_first
+        )
+
+    def evict_pool_shortfalls(self, demand: KVDemand) -> EvictResult:
+        demand_by_type = {
+            ct: n for ct, n in self._demand_by_type(demand).items() if n > 0
+        }
+        shortfall = {
+            ct: n - self._pool_available(ct) for ct, n in demand_by_type.items()
+        }
+        short = {ct: n for ct, n in shortfall.items() if n > 0}
+        if not short:
+            return EvictResult()
+        return self._evict(
+            EvictParams(
+                num_tokens=short.get(self.slot_id(TREE_TOKEN), 0),
+                window_num_tokens={
+                    name: short[ct]
+                    for ct, name in self._window_sub_pools_by_slot().items()
+                    if ct in short
+                },
+                mamba_num=short.get(self.slot_id(TREE_STATE), 0),
+            ),
+            demand={ct: demand_by_type[ct] for ct in short},
+        )
+
+    def _demand_by_type(self, demand: KVDemand) -> dict[ComponentType, int]:
+        """Per tree component, what an allocation's ``demand`` takes of it."""
+        request = {ct: 0 for ct in self.tree_components}
+        request[BASE_COMPONENT_TYPE] = demand.full_tokens
+        state = self.slot_id(TREE_STATE)
+        if state is not None:
+            request[state] = demand.state_slots
+        for name, tokens in demand.window_tokens.items():
+            request[self.window_slot_of(name)] = tokens
+        return request
+
+    def reclaim(self, units: dict[str, int]) -> bool:
+        self._reclaim(units)
+        return self.token_to_kv_pool_allocator.units_fit(
+            {n: d for n, d in units.items() if d > 0}
+        )
+
+    def _reclaim(
+        self, units: dict[str, int], *, windows_first: bool = False
+    ) -> EvictResult:
+        """Evict cached entries until the allocator can take ``units`` (pages
+        per sub-pool, slots for state), and report what was evicted.
+
+        Evicts nothing for a demand that fits now, or that would not fit with
+        every evictable entry gone; admission credits the same evictable entries.
+        Every walk stops at the first victim after which the demand fits, so the
+        victim order is a heuristic. Frees queued in the caller's free group go
+        back first: neither the allocator nor the cache sees them as room."""
+        allocator = self.token_to_kv_pool_allocator
+        result = EvictResult()
+        demands = {n: d for n, d in units.items() if d > 0}
+        if allocator.fits_after_frees(demands):
+            return result
+        if not allocator.admits(
+            self._units_demand(demands), evictable=evictable_by_sub_pool(self)
+        ):
+            return result
+        owner, windows, state = self._sub_pool_roles()
+        if self.evicts_by_joint_lru and allocator.compaction_can_run():
+            # joint_lru: one walk over token and window entries by access
+            # time, every victim's bytes serving either side, stopping at the
+            # first victim after which the demand fits.
+            reclaimable = self._reclaimable_units()
+            self._evict_units(
+                {n: reclaimable.get(n, 0) for n in (owner, *windows)}, demands, result
             )
-            initial_params = EvictParams(
-                num_tokens=params.num_tokens,
-                window_num_tokens=dict(params.window_num_tokens),
-                mamba_num=mamba_id_shortfall,
+            return result
+        short = {n for n, d in demands.items() if not allocator.units_fit({n: d})}
+        spent_first, kept = ({owner}, set(windows))
+        if windows_first:
+            # FULL prefixes go last, even for a token demand short now.
+            spent_first, kept = kept, spent_first
+            short -= kept
+        order = [short, spent_first, set() if state is None else {state}, kept]
+        for names in order:
+            if allocator.fits_after_frees(demands):
+                break
+            reclaimable = self._reclaimable_units()
+            self._evict_units(
+                {n: reclaimable.get(n, 0) for n in names}, demands, result
             )
-        result = self._evict(initial_params, available_size_targets)
-
-        if mamba_target is not None and mamba_full_donor is not None:
-            mamba_full_donor.prepare_mamba_allocation(mamba_target[1])
-            mamba_free_ids = (
-                self.token_to_kv_pool_allocator.state_slots.available_size()
-            )
-            mamba_capacity = self._component_available_size(self.slot_id(TREE_STATE))
-
-            if mamba_free_ids >= mamba_target[1] and mamba_capacity < mamba_target[1]:
-                full_evictable = self.full_evictable_size()
-                if full_evictable > 0:
-                    donor_result = self._evict(
-                        EvictParams(num_tokens=full_evictable),
-                        {self.slot_id(TREE_TOKEN): mamba_target},
-                    )
-                    result.add(donor_result)
-
-                # Preserve Mamba-victim recovery if Full cannot fund the target.
-                if (
-                    self._component_available_size(self.slot_id(TREE_STATE))
-                    < mamba_target[1]
-                ):
-                    mamba_evictable = self.mamba_evictable_size()
-                    if mamba_evictable > 0:
-                        fallback_result = self._evict(
-                            EvictParams(mamba_num=mamba_evictable),
-                            {self.slot_id(TREE_STATE): mamba_target},
-                        )
-                        result.add(fallback_result)
-
         return result
+
+    def _units_demand(self, units: dict[str, int]) -> KVDemand:
+        """A demand in the allocator's units (pages, slots for state) as the
+        tokens and slots admission prices."""
+        page = self.token_to_kv_pool_allocator.page_size
+        owner, windows, state = self._sub_pool_roles()
+        return KVDemand(
+            units.get(owner, 0) * page,
+            {name: units.get(name, 0) * page for name in windows},
+            0 if state is None else units.get(state, 0),
+        )
+
+    def _reclaimable_units(self) -> dict[str, int]:
+        """What this cache could free per sub-pool, in the allocator's units:
+        pages, slots for the state sub-pool."""
+        page = self.token_to_kv_pool_allocator.page_size
+        _, _, state = self._sub_pool_roles()
+        return {
+            name: n if name == state else n // page
+            for name, n in evictable_by_sub_pool(self).items()
+        }
+
+    def _evict_units(
+        self, units: dict[str, int], demands: dict[str, int], result: EvictResult
+    ) -> None:
+        """Evict ``units`` (pages, slots for state) per sub-pool, the walks
+        stopping once the allocator can take ``demands``; add what was
+        evicted to ``result``."""
+        allocator = self.token_to_kv_pool_allocator
+        page = allocator.page_size
+        owner, windows, state = self._sub_pool_roles()
+        params = EvictParams(
+            num_tokens=units.get(owner, 0) * page,
+            window_num_tokens={
+                name: units[name] * page for name in windows if units.get(name, 0)
+            },
+            mamba_num=0 if state is None else units.get(state, 0),
+        )
+        if not (params.num_tokens or params.window_num_tokens or params.mamba_num):
+            return
+        if params.num_tokens and not windows and self.is_write_back:
+            # Evicted as one token target so write-back victims share one copy
+            # and wait; a per-victim stop would split it. With state, a victim's
+            # checkpoint frees bytes too, so only what no state free serves.
+            if state is None:
+                target = self._owner_tokens_short(demands, params.num_tokens)
+            else:
+                target = min(
+                    params.num_tokens,
+                    allocator.owner_tokens_only_owner_frees_serve(
+                        demands.get(owner, 0)
+                    ),
+                )
+            if target:
+                result.add(self.evict_until(EvictParams(num_tokens=target)))
+                if allocator.fits_after_frees(demands):
+                    return
+        result.add(
+            self.evict_until(
+                params, satisfied=lambda: allocator.fits_after_frees(demands)
+            )
+        )
+
+    def _owner_tokens_short(self, demands: dict[str, int], reclaimable: int) -> int:
+        """The fewest token sub-pool tokens, at most ``reclaimable``, whose
+        eviction lets the allocator take ``demands`` (pages per sub-pool,
+        slots for state); 0 when even all of them would not."""
+        allocator = self.token_to_kv_pool_allocator
+        page = allocator.page_size
+        owner, _, _ = self._sub_pool_roles()
+        demand = self._units_demand(demands)
+
+        def fits(pages: int) -> bool:
+            return allocator.admits(demand, evictable={owner: pages * page})
+
+        low, high = 1, reclaimable // page
+        if high < low or not fits(high):
+            return 0
+        while low < high:
+            mid = (low + high) // 2
+            if fits(mid):
+                high = mid
+            else:
+                low = mid + 1
+        return low * page
+
+    @rank_consensus(same_params=["params"], same_results=True)
+    def evict_until(
+        self, params: EvictParams, satisfied: Optional[Callable[[], bool]] = None
+    ) -> EvictResult:
+        """Evict up to ``params`` per component, stopping at the first victim
+        after which ``satisfied`` holds; without ``satisfied``, write-back
+        victims are batched behind one copy wait."""
+        if self.disable:
+            return EvictResult()
+        return self._evict(params, satisfied=satisfied)
 
     def _evict_request_by_type(self, params: EvictParams) -> dict[ComponentType, int]:
         """Per tree component, what ``params`` asks of it."""
@@ -864,16 +994,11 @@ class UnifiedRadixCache(BasePrefixCache):
             request[self.window_slot_of(name)] = tokens
         return request
 
-    def _component_available_size(self, component_type: ComponentType) -> int:
-        """Return capacity usable by the component's next allocation.
-
-        Shared allocators expose schedulable capacity, which includes peer holes
-        that an urgent allocator flush can reclaim without further eviction.
-        """
+    def _pool_available(self, component_type: ComponentType) -> int:
+        """What the component's own pool can serve now: the read a cache over
+        pools of their own sizes a component's shortfall against."""
         if component_type == self.slot_id(TREE_TOKEN):
-            if self.supports_swa():
-                return self.token_to_kv_pool_allocator.full_available_size()
-            return self.token_to_kv_pool_allocator.available_size()
+            return self.token_to_kv_pool_allocator.owner_available_size()
         if component_type in self.window_slots():
             return self.window_available_size(
                 self.window_sub_pool_of_slot(component_type)
@@ -887,11 +1012,9 @@ class UnifiedRadixCache(BasePrefixCache):
     def _evict(
         self,
         params: EvictParams,
-        available_size_targets: Optional[
-            dict[ComponentType, tuple[ComponentType, int]]
-        ] = None,
         *,
-        allocation_reclaim_satisfied: Optional[Callable[[], bool]] = None,
+        demand: Optional[dict[ComponentType, int]] = None,
+        satisfied: Optional[Callable[[], bool]] = None,
     ) -> EvictResult:
         if self.disable:
             return EvictResult()
@@ -899,22 +1022,17 @@ class UnifiedRadixCache(BasePrefixCache):
         tracker = {ct: 0 for ct in self.tree_components}
 
         if (
-            available_size_targets is None
+            demand is None
             and self.evicts_by_joint_lru
             and self.token_to_kv_pool_allocator.compaction_can_run()
         ):
             self._evict_by_joint_lru(
-                params,
-                tracker,
-                allocation_reclaim_satisfied=allocation_reclaim_satisfied,
+                params, tracker, allocation_reclaim_satisfied=satisfied
             )
         else:
             request_by_type = self._evict_request_by_type(params)
             self._evict_components(
-                request_by_type,
-                tracker,
-                available_size_targets=available_size_targets,
-                allocation_reclaim_satisfied=allocation_reclaim_satisfied,
+                request_by_type, tracker, demand=demand, satisfied=satisfied
             )
 
         if (
@@ -985,9 +1103,7 @@ class UnifiedRadixCache(BasePrefixCache):
             self.backup_node_for_write_back(node_id)
             result = self.tree_core.finish_mamba_state_eviction(node_id)
         elif result.swa_backup_node_id is not None:
-            assert (
-                component_type == self.slot_id(TREE_WINDOW) and result.node_id is None
-            )
+            assert component_type in self.window_slots() and result.node_id is None
             assert (
                 not result.device_frees
                 and not result.host_frees
@@ -999,9 +1115,12 @@ class UnifiedRadixCache(BasePrefixCache):
             # even if host allocation fails.
             node_id = result.swa_backup_node_id
             needed = result.swa_backup_num_tokens
-            swa_host_pool = self.host_pool_group.get_pool(PoolName.SWA)
-            if swa_host_pool is not None and swa_host_pool.available_size() < needed:
-                self.evict_host(needed, self.slot_id(TREE_WINDOW))
+            window_host_pool = self.components[component_type]._swa_kv_pool_host
+            if (
+                window_host_pool is not None
+                and window_host_pool.available_size() < needed
+            ):
+                self.evict_host(needed, component_type)
             self.backup_node_for_write_back(node_id)
             result = self.tree_core.finish_swa_state_eviction(node_id)
         self._apply_eviction_result(result)
@@ -1051,48 +1170,20 @@ class UnifiedRadixCache(BasePrefixCache):
         self,
         request_by_type: dict[ComponentType, int],
         tracker: dict[ComponentType, int],
-        available_size_targets: Optional[
-            dict[ComponentType, tuple[ComponentType, int]]
-        ] = None,
         *,
-        allocation_reclaim_satisfied: Optional[Callable[[], bool]] = None,
+        demand: Optional[dict[ComponentType, int]] = None,
+        satisfied: Optional[Callable[[], bool]] = None,
     ) -> None:
         # Buffer mode: eviction always wins over queued backup intents — a
         # destroyed victim's intent is stale-swept and the content rewrites
         # after its recompute.
-        last_mamba_donor_check = 0
-        mamba_donor_prepared = False
-
         def target_reached(component_type: ComponentType) -> bool:
-            nonlocal last_mamba_donor_check, mamba_donor_prepared
-            if allocation_reclaim_satisfied is not None:
-                return allocation_reclaim_satisfied()
-            if available_size_targets is None:
+            if satisfied is not None:
+                return satisfied()
+            if demand is None or component_type not in demand:
                 return False
-            target = available_size_targets.get(component_type)
-            if target is None:
-                return False
-            target_component, target_size = target
             # A Full-leaf cascade can release Mamba or SWA state directly.
-            if self._component_available_size(target_component) >= target_size:
-                return True
-            if component_type == self.slot_id(
-                TREE_TOKEN
-            ) and target_component == self.slot_id(TREE_STATE):
-                donor = self.token_to_kv_pool_allocator.mamba_full_cache_donor()
-                assert donor is not None, "Mamba target requires a Full donor"
-                recheck_after = (
-                    1
-                    if mamba_donor_prepared
-                    else donor.full_tokens_before_mamba_recheck(target_size)
-                )
-                if tracker[component_type] - last_mamba_donor_check < recheck_after:
-                    return False
-                donor.prepare_mamba_allocation(target_size)
-                last_mamba_donor_check = tracker[component_type]
-                mamba_donor_prepared = True
-            # Schedulable capacity includes donor holes that allocation can compact.
-            return self._component_available_size(target_component) >= target_size
+            return self._pool_available(component_type) >= demand[component_type]
 
         for ct in self.tree_components:
             request_cnt = request_by_type[ct]
@@ -1106,8 +1197,8 @@ class UnifiedRadixCache(BasePrefixCache):
             to_target = (
                 ct == self.slot_id(TREE_TOKEN)
                 and request_cnt > 0
-                and available_size_targets is not None
-                and ct in available_size_targets
+                and demand is not None
+                and ct in demand
             )
             # A preceding component may have cascade-evicted this component or,
             # on a shared pool, released enough bytes to satisfy its allocation.
@@ -1124,8 +1215,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 request_cnt,
                 tracker,
                 target_reached,
-                available_size_targets,
-                allocation_reclaim_satisfied,
+                demand,
+                satisfied,
             )
 
     def _write_back_batch_tokens(
@@ -1133,22 +1224,16 @@ class UnifiedRadixCache(BasePrefixCache):
         ct: ComponentType,
         request_cnt: int,
         tracker: dict[ComponentType, int],
-        available_size_targets: Optional[
-            dict[ComponentType, tuple[ComponentType, int]]
-        ],
-        allocation_reclaim_satisfied: Optional[Callable[[], bool]],
+        demand: Optional[dict[ComponentType, int]],
+        satisfied: Optional[Callable[[], bool]],
     ) -> int:
         """Full tokens the walk may leave queued before demoting; 0 (demote
         per victim) when its target is only observable after each demote."""
-        if ct != BASE_COMPONENT_TYPE or allocation_reclaim_satisfied is not None:
+        if ct != BASE_COMPONENT_TYPE or satisfied is not None:
             return 0
         need = request_cnt - tracker[ct]
-        target = (available_size_targets or {}).get(ct)
-        if target is not None:
-            target_component, target_size = target
-            if target_component != ct:
-                return 0
-            need = min(need, target_size - self._component_available_size(ct))
+        if demand is not None and ct in demand:
+            need = min(need, demand[ct] - self._pool_available(ct))
         return max(need, 0)
 
     def _evict_device_walk(
@@ -1158,10 +1243,8 @@ class UnifiedRadixCache(BasePrefixCache):
         request_cnt: int,
         tracker: dict[ComponentType, int],
         target_reached: Callable[[ComponentType], bool],
-        available_size_targets: Optional[
-            dict[ComponentType, tuple[ComponentType, int]]
-        ],
-        allocation_reclaim_satisfied: Optional[Callable[[], bool]],
+        demand: Optional[dict[ComponentType, int]],
+        satisfied: Optional[Callable[[], bool]],
     ) -> None:
         """One device-eviction walk: write-back victims queue their copies and
         demotes, then one wait lands the batch. Queued victims count as
@@ -1177,8 +1260,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 ct,
                 request_cnt,
                 tracker,
-                available_size_targets,
-                allocation_reclaim_satisfied,
+                demand,
+                satisfied,
             )
 
         def demote_queued() -> None:
@@ -1791,7 +1874,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.supports_swa()
                 and {
                     PoolName.KV,
-                    PoolName.SWA,
+                    *(self.components[ct].pool_name for ct in self.window_slots()),
                 }
                 <= self.host_pool_group.entry_map.keys()
             )
@@ -2296,14 +2379,16 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.dec_host_lock_ref(node_id, host_anchor_params)
                 return False
 
-        avail = self._component_available_size(self.slot_id(TREE_TOKEN))
-        if avail < kv_tokens:
-            needed = kv_tokens - avail
-            self.evict_for_alloc(EvictParams(num_tokens=needed))
-            if self._component_available_size(self.slot_id(TREE_TOKEN)) < kv_tokens:
-                self.dec_lock_ref(node_id, ancestor_lock_params)
-                self.dec_host_lock_ref(node_id, host_anchor_params)
-                return False
+        token_slot = self.slot_id(TREE_TOKEN)
+        if not owner_rows_ready(
+            self,
+            self.token_to_kv_pool_allocator,
+            kv_tokens,
+            lambda: self._pool_available(token_slot),
+        ):
+            self.dec_lock_ref(node_id, ancestor_lock_params)
+            self.dec_host_lock_ref(node_id, host_anchor_params)
+            return False
 
         # Load H→D
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
@@ -2440,6 +2525,9 @@ class UnifiedRadixCache(BasePrefixCache):
         self.ongoing_backup[operation_id] = (
             node_id,
             self.inc_host_lock_ref(node_id).to_dec_params(),
+        )
+        self._backup_requested_tokens[operation_id] = (
+            len(spec.hash_value) * self.page_size
         )
 
     def is_backuped(self, node_id: NodeId) -> bool:
@@ -2723,17 +2811,64 @@ class UnifiedRadixCache(BasePrefixCache):
             # progress, rank-min queue drain); a vote here only adds collectives.
             return False
         if self.prefetch_stop_policy == "timeout":
-            # Wall clocks differ across ranks: PP0 decides, TP takes MAX (any
-            # rank timed out) and _all_reduce broadcasts the verdict along PP.
-            should_terminate = False
-            if self.pp_rank == 0:
-                should_terminate = self._prefetch_deadline_expired(operation)
-            should_terminate_tensor = torch.tensor(
-                int(should_terminate), dtype=torch.int, device="cpu"
-            )
-            self._all_reduce(should_terminate_tensor, torch.distributed.ReduceOp.MAX)
-            return should_terminate_tensor.item() == 1
+            # The verdict is agreed once per tick by _vote_prefetch_deadlines,
+            # which also terminates the operation (the poll then takes the
+            # is_terminated path); a poll only reads it, so ranks may poll
+            # different requests (batch_is_full, allocatable-request exits)
+            # without a collective.
+            wait = self._storage_prefetch_wait.get(operation.handle)
+            return wait is not None and wait.expired
         return True
+
+    def _vote_prefetch_deadlines(self) -> None:
+        """One MAX vote per tick over every live prefetch's `timeout` budget.
+
+        Wall clocks differ across ranks: PP0 decides per operation, TP takes
+        MAX (any rank timed out) and _all_reduce relays the verdict along PP.
+        The packed tensor has one slot per `ongoing_prefetch` entry in
+        insertion order; this tick's ready-count sync asserted that set is
+        rank-identical (_hicache_sync_digest), and the drain between them
+        only retires in lockstep. With no live prefetch no rank issues a
+        collective. A wait that has not started yet (no blocked poll on PP0)
+        contributes 0 until the next tick. An expired operation is terminated
+        here so the transfer worker and the hit drain stop spending on it;
+        its retirement stays with the admission poll or the drain.
+        """
+        if self.prefetch_stop_policy != "timeout" or not self.ongoing_prefetch:
+            return
+        operations = [info.operation for info in self.ongoing_prefetch.values()]
+        expired = [0] * len(operations)
+        if self.pp_rank == 0:
+            expired = [
+                int(self._prefetch_deadline_expired(operation))
+                for operation in operations
+            ]
+        verdicts = torch.tensor(expired, dtype=torch.int, device="cpu")
+        self._all_reduce(verdicts, torch.distributed.ReduceOp.MAX)
+        for operation, verdict in zip(operations, verdicts.tolist()):
+            if verdict:
+                self._mark_prefetch_deadline_expired(operation)
+                self.cache_controller.terminate_prefetch(operation)
+
+    def _hicache_sync_digest(self) -> int:
+        """Value piggybacked on the ready-count MIN sync: equal on every rank
+        iff the write_back reclaim victim order matched and, when the deadline
+        vote reads it, so did the live prefetch set (`ongoing_prefetch` in
+        insertion order). The admission polls retire per request, so a rank
+        that left the loop earlier than its peers (#30760) is caught here, in
+        the same tick on every rank, instead of hanging in a vote of a
+        different length. Fits int64: 42-bit digest * 1000003 + crc32."""
+        digest = self.tree_core.write_back_duplicate_reclaim_digest
+        if (
+            self.enable_storage
+            and self.prefetch_stop_policy == "timeout"
+            and self.ongoing_prefetch
+        ):
+            live = "\0".join(
+                f"{handle.rid}\0{handle.attempt_id}" for handle in self.ongoing_prefetch
+            )
+            digest = digest * 1000003 + zlib.crc32(live.encode()) + 1
+        return digest
 
     def has_ongoing_prefetch(self, handle: CacheRequestHandle) -> bool:
         return handle in self.ongoing_prefetch
@@ -3478,6 +3613,9 @@ class UnifiedRadixCache(BasePrefixCache):
             if info is None:
                 return True  # aborted/cleaned; nothing to retry
             if operation.is_terminated():
+                if operation.deadline_expired:
+                    # Cut by the tick vote while parked: same reason as the poll.
+                    self._finish_storage_prefetch(request, 0, reason="deadline")
                 self.revoke_pending_prefetch(request)
                 return True
 
@@ -3671,26 +3809,50 @@ class UnifiedRadixCache(BasePrefixCache):
                         )
 
         def _drain_backup():
-            drained = 0
-            for operation in _drain_queue(cc.ack_backup_queue, n_backup):
-                drained += 1
-                if buffer_mode:
-                    # Storage write acked: free the staging.
-                    self.buffer_pipeline.finish_storage_write_ack(operation.id)
-                else:
-                    entry = self.ongoing_backup.pop(operation.id, None)
-                    if entry is not None:
-                        node_id, lock_params = entry
-                        self.dec_host_lock_ref(node_id, lock_params)
-                if (
-                    log_metrics
-                    and self.enable_storage_metrics
-                    and self.storage_metrics_collector is not None
-                ):
-                    self.storage_metrics_collector.log_backuped_tokens(
-                        operation.completed_tokens
+            acked = list(_drain_queue(cc.ack_backup_queue, n_backup))
+            if not acked:
+                return 0
+            page_size = self.page_size
+            # The requested KV span comes from the scheduler-side record, not
+            # the operation: a native controller's operation exposes only its
+            # id and completed_tokens. None is a write no longer tracked
+            # (dropped by reset or detach) or a buffer-mode write of another
+            # pool, which carries no KV pages and settles whole.
+            requested = [self._backup_requested_tokens_of(op.id) for op in acked]
+            if cc.backup_skip:
+                # Not the KV writer (replicated MLA KV): this rank's
+                # completed_tokens carries no KV evidence, so it vouches for
+                # the whole span; its own rank-sharded sidecars are written
+                # whole or logged by the controller.
+                written = [req or 0 for req in requested]
+            else:
+                written = [
+                    min(op.completed_tokens, req or 0)
+                    for op, req in zip(acked, requested)
+                ]
+            if n_backup is not None:
+                # n_backup is the rank-agreed count, so this tensor has the
+                # same shape on every rank. One MIN gives every rank the same
+                # written prefix per operation: backup submission and acks
+                # have no other collective and the acks pair by position, so
+                # beliefs settled from a rank-local count would diverge. The
+                # local detach drain passes None and enters no collective.
+                votes = torch.tensor(written, dtype=torch.int64)
+                self._all_reduce_storage_drain(votes)
+                written = votes.tolist()
+            for operation, req, done in zip(acked, requested, written):
+                if req is not None and not (0 <= done <= req and done % page_size == 0):
+                    raise RuntimeError(
+                        f"HiCache storage backup operation {operation.id} reported "
+                        f"{done} written tokens of {req} (page size {page_size})"
                     )
-            return drained
+                self._finish_backup_ack(
+                    operation,
+                    requested_tokens=req,
+                    agreed_tokens=done,
+                    log_metrics=log_metrics,
+                )
+            return len(acked)
 
         def _drain_release():
             host_indices_list = []
@@ -3727,6 +3889,82 @@ class UnifiedRadixCache(BasePrefixCache):
         _drain_backup()
         _drain_release()
         _drain_extra_release()
+
+    def _all_reduce_storage_drain(self, data: torch.Tensor) -> None:
+        """MIN-reduce a per-drain tensor over the ranks whose storage drain
+        runs in lockstep, as _sync_hicache_ready_counts reduces the counts:
+        every TP rank of each PP stage in buffer_only mode (each stage drains
+        its own completions), else PP0's TP verdict propagated along PP."""
+        if self.host_memory_mode == "buffer_only" and self.pp_size > 1:
+            self._all_reduce_attn_groups(data, torch.distributed.ReduceOp.MIN)
+        else:
+            self._all_reduce(data, torch.distributed.ReduceOp.MIN)
+
+    def _backup_requested_tokens_of(self, operation_id: int) -> Optional[int]:
+        """Requested KV tokens of an acked storage write; None for a write no
+        longer tracked (dropped by reset or detach) and for a buffer-mode
+        write of another pool, which carries no KV pages and settles whole."""
+        if self.buffer_pipeline is None:
+            return self._backup_requested_tokens.get(operation_id)
+        entry = self.buffer_pipeline.ongoing_backup.get(operation_id)
+        if entry is None or entry.intent.pool != PoolName.KV:
+            return None
+        return len(entry.keys_by_pool[PoolName.KV]) * self.page_size
+
+    def _finish_backup_ack(
+        self,
+        operation,
+        *,
+        requested_tokens: Optional[int],
+        agreed_tokens: int,
+        log_metrics: bool,
+    ) -> None:
+        """Settle one acked storage write at its agreed written prefix.
+
+        Buffer mode believes only the written keys; the unwritten tail is
+        neither believed nor in flight, so the next write-through piece that
+        covers it writes it. Cache mode releases the host lock as before:
+        the span is sent again when the node's host copy is evicted and the
+        node is hit again, the existing write-through cycle. Nothing is
+        retried here; a shortfall is logged and counted.
+        """
+        page_size = self.page_size
+        short = requested_tokens is not None and agreed_tokens < requested_tokens
+        if self.buffer_pipeline is not None:
+            self.buffer_pipeline.finish_storage_write_ack(
+                operation.id,
+                written_pages=(
+                    None if requested_tokens is None else agreed_tokens // page_size
+                ),
+            )
+        else:
+            self._backup_requested_tokens.pop(operation.id, None)
+            entry = self.ongoing_backup.pop(operation.id, None)
+            if entry is not None:
+                node_id, lock_params = entry
+                self.dec_host_lock_ref(node_id, lock_params)
+        if short:
+            logger.warning(
+                "HiCache storage backup operation %d wrote %d of %d tokens; the "
+                "tail stays un-backed until a later write-through covers it.",
+                operation.id,
+                agreed_tokens,
+                requested_tokens,
+            )
+        if (
+            log_metrics
+            and self.enable_storage_metrics
+            and self.storage_metrics_collector is not None
+        ):
+            collector = self.storage_metrics_collector
+            # What this rank wrote of the agreed prefix.
+            collector.log_backuped_tokens(
+                min(operation.completed_tokens, agreed_tokens)
+            )
+            if short:
+                collector.log_storage_backup_failed_tokens(
+                    requested_tokens - agreed_tokens
+                )
 
     def drain_storage_control_queues(self) -> None:
         cc = self.cache_controller
@@ -3873,8 +4111,8 @@ class UnifiedRadixCache(BasePrefixCache):
             )
 
         # Piggybacked TP check: [digest, -digest] MIN-reduces to [min, -max],
-        # equal iff reclaim victim order matched on every rank.
-        digest = self.tree_core.write_back_duplicate_reclaim_digest
+        # equal iff reclaim victim order and live prefetch set matched on every rank.
+        digest = self._hicache_sync_digest()
         exchange = self._shm_count_exchange()
         if exchange is not None:
             values = [write_acks, load_acks, *storage_queue_sizes, *fold_u64(digest)]
@@ -3883,7 +4121,8 @@ class UnifiedRadixCache(BasePrefixCache):
             if len(values) <= exchange.width:
                 rows = exchange.allgather(values)
                 assert all(row[-2:] == rows[0][-2:] for row in rows), (
-                    "write_back duplicate-reclaim victims diverged across TP ranks"
+                    "write_back duplicate-reclaim victims or live storage "
+                    "prefetches diverged across TP ranks"
                 )
                 mins = [min(col) for col in zip(*rows)]
                 return mins[0], mins[1], tuple(mins[2:-2]), extra_pool_names
@@ -3905,7 +4144,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
         count_values = list(map(int, ready_counts.tolist()))
         assert digest == count_values[-2] and digest == -count_values[-1], (
-            "write_back duplicate-reclaim victims diverged across PP/TP ranks"
+            "write_back duplicate-reclaim victims or live storage prefetches "
+            "diverged across PP/TP ranks"
         )
         return (
             count_values[0],
@@ -4138,6 +4378,20 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
         return failed
 
+    def _raise_if_storage_workers_died(self) -> None:
+        """A storage worker that raised out of its loop no longer drains or
+        acks, and the counts the tick reduces below would wait on it forever.
+        The rank that lost one exits loudly in its own tick; the peers follow
+        through the engine teardown (the parent's SIGQUIT on this host, the
+        NCCL watchdog elsewhere), so the check stays rank-local: no agreed
+        word, no row change, no PP caveat."""
+        dead = self.cache_controller.dead_storage_workers()
+        if dead:
+            raise RuntimeError(
+                "HiCache storage worker thread(s) exited on this rank: "
+                + ", ".join(dead)
+            )
+
     def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""
         if self.linker is not None:
@@ -4158,6 +4412,8 @@ class UnifiedRadixCache(BasePrefixCache):
             self.linker.check_prefetch_events()
             return
 
+        if self.enable_storage:
+            self._raise_if_storage_workers_died()
         # Reap the previous round's PP-sync sends before issuing new ones.
         self._drain_async_work()
         # Backups queued outside process_batch_result: the chunked-prefill stash
@@ -4187,6 +4443,9 @@ class UnifiedRadixCache(BasePrefixCache):
                 extra_release_counts=extra_release_counts,
                 log_metrics=True,
             )
+        if self.enable_storage:
+            # After the drain: a prefetch it retired is not voted on.
+            self._vote_prefetch_deadlines()
         if self.buffer_pipeline is not None:
             self.buffer_pipeline.flush_pending_writes()
         if self.enable_storage_metrics and self.storage_metrics_collector is not None:
@@ -4196,6 +4455,17 @@ class UnifiedRadixCache(BasePrefixCache):
             if not hasattr(storage_metrics, "prefetch_stats"):
                 storage_metrics.prefetch_stats = self.prefetch_outcome_stats_snapshot()
             self.storage_metrics_collector.log_storage_metrics(storage_metrics)
+
+    def transfers_in_flight(self) -> bool:
+        # The buffer-mode pipeline (storage without a host pool) tracks its
+        # own device-to-host copies and load-backs.
+        return bool(
+            self.ongoing_write_through
+            or self.ongoing_load_back
+            or self.ongoing_backup
+            or self.ongoing_prefetch
+            or (self.buffer_pipeline is not None and not self.buffer_pipeline.is_idle())
+        )
 
     def flush_pending_backups(self) -> None:
         """Submit pending D2H backups as a merged operation."""
@@ -4232,11 +4502,11 @@ class UnifiedRadixCache(BasePrefixCache):
 
     @property
     def sliding_window_size(self):
-        """The history the tree retains for its first window, the target's;
-        None without a window. A tree keeping several windows retains each
-        one's own (`window_retain_size`)."""
+        """The history a tree keeping one window retains for it; None with no
+        window, or with several, each of which has its own
+        (`window_retain_size`)."""
         windows = self.window_slots()
-        if not windows:
+        if len(windows) != 1:
             return None
         return self.components[windows[0]].sliding_window_size
 
@@ -4271,6 +4541,16 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.tree_core.has_swa_host_pool:
             return 0
         return window
+
+    def window_checkpoint_interval(self) -> int:
+        """The grid the latest state checkpoint lands on (`swa_retain_floor`
+        keeps the window behind it), when the cache keeps checkpoints and
+        shares prefixes (`retire_window_rows` applies the floor only then)."""
+        if not self.is_mamba_enabled or not self.supports_prefix_sharing():
+            return 0
+        from sglang.srt.runtime_context import mamba_track_grid
+
+        return mamba_track_grid(self.page_size)
 
     def swa_retain_floor(self, req, *, window: int) -> int | None:
         """The lowest position ``window``'s retirement must keep for the
@@ -4311,6 +4591,15 @@ class UnifiedRadixCache(BasePrefixCache):
     def slot_id(self, family: str) -> Optional[ComponentType]:
         """The id of the tree's slot of ``family``; None when it has none."""
         return self._family_slot_ids.get(family)
+
+    def full_load_back_tokens(self, node_id: NodeId) -> int:
+        """Token rows a load-back of ``node_id``'s path copies to the device. A
+        host hit can include token KV still resident behind host-only window or
+        state values; those rows take no new device slots."""
+        transfer = self.tree_core.build_hicache_transfers(
+            self.slot_id(TREE_TOKEN), node_id, CacheTransferPhase.LOAD_BACK
+        )[0]
+        return len(transfer.host_indices)
 
     def component_of(self, family: str) -> Optional[TreeComponent]:
         """The component keeping the tree's slot of ``family``, if any."""
@@ -4353,6 +4642,9 @@ class UnifiedRadixCache(BasePrefixCache):
     def window_retain_size(self, sub_pool: str) -> int:
         """The tail a running request keeps of ``sub_pool`` (`window_lengths`)."""
         return dict(self.window_lengths())[sub_pool]
+
+    def _sub_pool_roles(self):
+        return self.token_to_kv_pool_allocator.sub_pool_roles()
 
     def window_lengths(self) -> tuple[tuple[str, int], ...]:
         return tuple(

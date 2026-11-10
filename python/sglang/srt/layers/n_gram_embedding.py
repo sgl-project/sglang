@@ -2,10 +2,17 @@ import torch
 from torch import nn
 from torch.nn import Parameter
 
-from sglang.kernels.ops.embeddings.ngram_embedding import compute_n_gram_ids
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.utils import is_npu
+
+_is_npu = is_npu()
+
+if _is_npu:
+    import sgl_kernel_npu  # noqa: F401  Registers torch.ops.npu OE operators.
+else:
+    from sglang.kernels.ops.embeddings.ngram_embedding import compute_n_gram_ids
 
 
 class NgramEmbedding(torch.nn.Module):
@@ -131,6 +138,65 @@ class NgramEmbedding(torch.nn.Module):
         else:
             assert False, f"Unknown ngram embedding weight name: {weight_name}"
 
+    def _compute_n_gram_ids_npu(self, input_ids, forward_batch, batch_size):
+        output = self.oe_n_gram_ids[: len(input_ids)]
+        if input_ids.numel() == 0:
+            return
+        if batch_size == 0:
+            output.zero_()
+            return
+        info = forward_batch.ngram_embedding_info
+        offsets = torch.arange(len(input_ids), device=input_ids.device)
+        requests = torch.searchsorted(
+            self.exclusive_req_len_sums[1 : batch_size + 1], offsets, right=True
+        )
+        valid = requests < batch_size
+        requests.clamp_max_(batch_size - 1)
+        positions = forward_batch.positions
+        rows = forward_batch.req_pool_indices[requests]
+        lookback = torch.arange(1 - self.over_embedding_n, 1, device=input_ids.device)
+        # The native op stops at negative tokens but has no EOS boundary check.
+        # Match the GPU rule with a separate N-token history for each query:
+        # keep the current token, even if it is EOS, and mask historical EOS to
+        # -1. A shared EOS mask would also discard the current EOS's own n-gram.
+        # Each history row is a temporary request that computes only its last
+        # token; the original request's token table is not modified.
+        #
+        # 8192 limits the number of temporary requests per call, not the history
+        # length. Each core stages all request metadata in UB: 4-byte lengths,
+        # 8-byte row indices, and 4-byte column starts per request. For LongCat-2.0
+        # (N=5, K=4), the other buffers use 512 bytes after 32-byte alignment.
+        # 8192 requests therefore use 128.5 KiB, leaving 63.5 KiB of a 192 KiB UB.
+        for start in range(0, len(input_ids), 8192):
+            end = min(start + 8192, len(input_ids))
+            size = end - start
+            chunk_positions = torch.where(valid[start:end], positions[start:end], 0)
+            cols = chunk_positions[:, None] + lookback
+            context = info.token_table[rows[start:end, None], cols.clamp_min(0)]
+            context = context.masked_fill(
+                (cols < 0) | ((context == self.eos_token_id) & (lookback != 0)), -1
+            ).contiguous()
+            result = torch.ops.npu.compute_n_gram_ids(
+                self.oe_weights,
+                self.oe_mods,
+                self.exclusive_oe_embedder_size_sums,
+                context[:, -1].contiguous(),
+                torch.arange(1, size + 1, dtype=torch.int32, device=context.device),
+                context,
+                torch.arange(size, dtype=torch.int64, device=context.device),
+                torch.full(
+                    (size,),
+                    self.over_embedding_n - 1,
+                    dtype=torch.int32,
+                    device=context.device,
+                ),
+                batch_size=size,
+                oe_n=self.over_embedding_n,
+                oe_k=self.over_embedding_k,
+                max_context_len=self.over_embedding_n,
+            )
+            output[start:end].copy_(result)
+
     def forward(self, input_ids: torch.Tensor, forward_batch: ForwardBatch):
         if (
             forward_batch.forward_mode.is_extend()
@@ -152,20 +218,23 @@ class NgramEmbedding(torch.nn.Module):
                 dtype=torch.int32,
                 out=self.exclusive_req_len_sums[1 : 1 + _ng_bs],
             )
-            compute_n_gram_ids(
-                ne_n=self.over_embedding_n,
-                ne_k=self.over_embedding_k,
-                ne_weights=self.oe_weights,
-                ne_mods=self.oe_mods,
-                tokens=input_ids.to(torch.int32),
-                exclusive_ne_embedder_size_sums=self.exclusive_oe_embedder_size_sums,
-                exclusive_req_len_sums=self.exclusive_req_len_sums[: _ng_bs + 1],
-                ne_token_table=ngram_embedding_info.token_table,
-                row_indices=forward_batch.req_pool_indices[:_ng_bs],
-                column_starts=ngram_embedding_info.column_starts[:_ng_bs],
-                n_gram_ids=self.oe_n_gram_ids[: len(input_ids)],
-                eos_token_id=self.eos_token_id,
-            )
+            if _is_npu:
+                self._compute_n_gram_ids_npu(input_ids, forward_batch, _ng_bs)
+            else:
+                compute_n_gram_ids(
+                    ne_n=self.over_embedding_n,
+                    ne_k=self.over_embedding_k,
+                    ne_weights=self.oe_weights,
+                    ne_mods=self.oe_mods,
+                    tokens=input_ids.to(torch.int32),
+                    exclusive_ne_embedder_size_sums=self.exclusive_oe_embedder_size_sums,
+                    exclusive_req_len_sums=self.exclusive_req_len_sums[: _ng_bs + 1],
+                    ne_token_table=ngram_embedding_info.token_table,
+                    row_indices=forward_batch.req_pool_indices[:_ng_bs],
+                    column_starts=ngram_embedding_info.column_starts[:_ng_bs],
+                    n_gram_ids=self.oe_n_gram_ids[: len(input_ids)],
+                    eos_token_id=self.eos_token_id,
+                )
 
         # [13, seq_len, hidden_dim]
         all_hidden_states = torch.empty(

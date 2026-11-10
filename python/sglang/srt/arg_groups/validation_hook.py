@@ -383,6 +383,13 @@ def check_server_args(server_args: Any):
         ], (
             f"To use priority scheduling, schedule_policy must be 'fcfs' or 'lof'. '{cfg.schedule_policy}' is not supported."
         )
+        if cfg.enable_unified_memory and not cfg.disable_priority_preemption:
+            logger.warning(
+                "--enable-unified-memory turns priority preemption off: a "
+                "higher-priority request is admitted first but does not retract "
+                "running requests. Pass --disable-priority-preemption to silence "
+                "this warning."
+            )
         if cfg.default_priority_value is None:
             logger.warning(
                 "--default-priority-value is not set while --enable-priority-scheduling is enabled. "
