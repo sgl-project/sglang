@@ -156,6 +156,21 @@ _MEDIA_CONTENT_PART_TYPES = frozenset({"image_url", "video_url", "audio_url"})
 _CHAT_TEMPLATE_CACHE_MAX_SIZE = 128
 
 
+class _ClosingStreamingResponse(StreamingResponse):
+    """Close the body iterator however streaming ends.
+
+    Starlette leaves the iterator suspended when a send fails, and on ASGI
+    spec >= 2.4 it also skips the background task, so nothing would abort the
+    request until the generator is garbage collected.
+    """
+
+    async def stream_response(self, send) -> None:
+        try:
+            await super().stream_response(send)
+        finally:
+            await self.body_iterator.aclose()
+
+
 def _incomplete_tool_call_indices(parser) -> set[int]:
     detector = getattr(parser, "detector", parser)
     return getattr(detector, "incomplete_tool_call_indices", set())
@@ -1238,7 +1253,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     "or contains a cycle."
                 )
 
-        max_output_tokens = request.max_completion_tokens or request.max_tokens
+        max_output_tokens = request.effective_max_tokens
         server_context_length = get_model().context_length
         if (
             validate_max_output_tokens
@@ -2509,11 +2524,14 @@ class OpenAIServingChat(OpenAIServingBase):
             return self.create_error_response(str(e))
 
         async def prepend_first_chunk():
-            yield first_chunk
-            async for chunk in generator:
-                yield chunk
+            try:
+                yield first_chunk
+                async for chunk in generator:
+                    yield chunk
+            finally:
+                await generator.aclose()
 
-        return StreamingResponse(
+        return _ClosingStreamingResponse(
             prepend_first_chunk(),
             media_type="text/event-stream",
             background=self.tokenizer_manager.create_abort_task(adapted_request),
@@ -2557,6 +2575,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
         stream_started = False
         error_aborted = False
+        stream = self.tokenizer_manager.generate_request(adapted_request, raw_request)
         try:
             include_usage, continuous_usage_stats = should_include_usage(
                 request.stream_options,
@@ -2571,9 +2590,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 and raw_request.headers.get("x-sglext-ids-framed") == "1"
             )
 
-            async for content in self.tokenizer_manager.generate_request(
-                adapted_request, raw_request
-            ):
+            async for content in stream:
                 index = content.get("index", 0)
 
                 prompt_tokens[index] = self._reported_prompt_tokens(
@@ -2882,6 +2899,10 @@ class OpenAIServingChat(OpenAIServingBase):
                 raise
             error = self.create_streaming_error_response(str(e))
             yield f"data: {error}\n\n"
+        finally:
+            # Closing generate_request runs its cleanup, which aborts the
+            # request only while this request still owns its rid.
+            await stream.aclose()
 
         yield "data: [DONE]\n\n"
 
@@ -3877,6 +3898,8 @@ class OpenAIServingChat(OpenAIServingBase):
         # Get the last tool call that was being processed
         tool_index = len(detector.prev_tool_call_arr) - 1
         if tool_index < 0 or tool_index >= len(detector.streamed_args_for_tool):
+            return None
+        if tool_index in _incomplete_tool_call_indices(parser):
             return None
 
         # Get expected vs actual arguments

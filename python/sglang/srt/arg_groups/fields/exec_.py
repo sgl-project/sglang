@@ -309,7 +309,7 @@ class ExecKernel(msgspec.Struct):
     bf16_gemm_backend: A[
         str,
         Arg(
-            help="Choose the backend for unquantized BF16 GEMM operations. Options: 'auto' (default; selects 'cutedsl' on SM10x GPUs, except deterministic inference selects 'torch'; otherwise uses cuBLAS via torch.nn.functional.linear), 'cutedsl' (SGLang JIT CuTe DSL TGV BF16 GEMM on SM10x; dispatches between the allowlisted low-M Split-K kernel, the CuTe DSL kernel, and cuBLAS; set SGLANG_ENABLE_BF16_SPLITK_GEMM=0 to disable Split-K), 'gemv', 'torch' (always uses cuBLAS via torch.nn.functional.linear).",
+            help="Choose the backend for unquantized BF16 GEMM operations. Options: 'auto' (default; selects 'cutedsl' on SM10x GPUs, except deterministic inference selects 'torch'; otherwise uses cuBLAS via torch.nn.functional.linear), 'cutedsl' (SGLang JIT CuTe DSL TGV BF16 GEMM on SM10x; dispatches between the allowlisted low-M Split-K kernel, the CuTe DSL kernel, and cuBLAS), 'gemv', 'torch' (always uses cuBLAS via torch.nn.functional.linear).",
             cli_name="--bf16-gemm-backend",
             choices=["auto", "cutedsl", "gemv", "torch"],
         ),
@@ -871,7 +871,8 @@ class ExecMoe(msgspec.Struct):
             "nixl",
             "mori",
             "ascend_fuseep",
-            "flashinfer",
+            "flashinfer_nvlink_one_sided",
+            "flashinfer",  # Deprecated alias for "flashinfer_nvlink_one_sided"
             "megamoe",
             "deepep_v2",
             "ascend_ops",
@@ -879,7 +880,9 @@ class ExecMoe(msgspec.Struct):
             "flashinfer_megamoe",
         ],
         Arg(
-            help="Choose the backend for MoE A2A.",
+            help="Choose the backend for MoE A2A. 'flashinfer_nvlink_one_sided' is "
+            "FlashInfer's NVLink one-sided all-to-all; 'flashinfer' is a deprecated "
+            "alias for it.",
             choices=[
                 "none",
                 "deepep",
@@ -887,7 +890,8 @@ class ExecMoe(msgspec.Struct):
                 "nixl",
                 "mori",
                 "ascend_fuseep",
-                "flashinfer",
+                "flashinfer_nvlink_one_sided",
+                "flashinfer",  # Deprecated alias for "flashinfer_nvlink_one_sided"
                 "megamoe",
                 "deepep_v2",
                 "pplx",
@@ -1053,6 +1057,12 @@ class ExecMoe(msgspec.Struct):
             type_parser=_paged_experts_num_resident,
         ),
     ] = None
+    paged_experts_enable_disk: A[
+        bool,
+        "Let Paged Experts write to disk under $SGLANG_CACHE_DIR/paged_experts: each MoE "
+        "layer's experts are kept there (about the size of the experts), so that later starts "
+        "read them instead of loading and repacking them. Requires --enable-paged-experts.",
+    ] = False
 
     # -------------------------------------------------------------------------
     # Ktransformers/AMX expert parallelism
@@ -1146,7 +1156,7 @@ class ExecOffload(msgspec.Struct):
             "directly; use it on unified-memory devices (e.g. GB10 / DGX Spark) "
             "where pinned host memory comes out of the same pool as the model "
             "weights. Requires a device that reports "
-            "cudaDevAttrPageableMemoryAccessUsesHostPageTables.",
+            "cudaDevAttrPageableMemoryAccess (GB10, or HMM).",
             choices=["pinned", "file"],
         ),
     ] = "pinned"

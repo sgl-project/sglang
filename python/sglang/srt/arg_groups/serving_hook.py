@@ -332,6 +332,22 @@ def handle_deprecated_args(server_args: Any):
     if renamed:
         declare_resolution(server_args, "_handle_deprecated_args", **renamed)
 
+    # Deprecated MoE A2A backend alias.
+    renamed = {}
+    for attr, value in (
+        ("moe_a2a_backend", cfg.moe_a2a_backend),
+        ("speculative_moe_a2a_backend", cfg.speculative_moe_a2a_backend),
+    ):
+        if value == "flashinfer":
+            logger.warning(
+                "--%s=flashinfer is deprecated; use 'flashinfer_nvlink_one_sided' "
+                "instead.",
+                attr.replace("_", "-"),
+            )
+            renamed[attr] = "flashinfer_nvlink_one_sided"
+    if renamed:
+        declare_resolution(server_args, "_handle_deprecated_args", **renamed)
+
     # --grpc-mode is a deprecated alias for --smg-grpc-mode.
     if cfg.grpc_mode and not cfg.smg_grpc_mode:
         logger.warning(
@@ -452,7 +468,6 @@ def handle_environment_variables(server_args: Any):
                 server_args, "_handle_environment_variables", debug_cuda_graph=False
             )
         else:
-            envs.SGLANG_USE_BREAKABLE_CUDA_GRAPH.set("1")
             logger.warning(
                 "Debug mode for CUDA graph is enabled via breakable CUDA graph. "
                 "All operations will run eagerly through the graph capture/replay path."
