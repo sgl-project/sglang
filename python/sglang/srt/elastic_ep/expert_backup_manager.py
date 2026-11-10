@@ -44,7 +44,9 @@ def extract_expert_id(param_name):
 
 class ExpertBackupManager:
     def __init__(self, server_args: ServerArgs, port_args: PortArgs):
-        self.load_format = get_model().load_format
+        self.load_format = (
+            "auto" if get_model().load_format == "dummy" else get_model().load_format
+        )
         self.model_config = ModelConfig.from_server_args(server_args)
         self.continuous_buffer = None
         self.weight_pointer_map = {}
