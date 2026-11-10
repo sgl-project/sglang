@@ -894,6 +894,7 @@ class DeepseekV4HipRadixBackend(
     write_tail_source_kv = DeepseekV4AttnBackend.write_tail_source_kv
     # No two-level candidates on HIP: the ratio-1/2 sources stay one eager break.
     low_ratio_prefill_graph = False
+
     # This attribute is used in python/sglang/srt/model_executor/runner/prefill_cuda_graph_runner.py.
     # PrefillCudaGraphRunner looks this up via getattr; contexts over prefill.max_seq_len run eager.
     def can_run_prefill_cuda_graph(self, forward_batch: ForwardBatch) -> bool:
