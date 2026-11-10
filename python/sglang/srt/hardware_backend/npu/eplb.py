@@ -38,14 +38,7 @@ _MAX_COPY_ELEMENTS = 2**31 - 1
 _FORMAT_NCHW = 0
 _FORMAT_ND = 2
 _FORMAT_FRACTAL_NZ = 29
-_FORMAT_FRACTAL_NZ_C0_16 = 50
-_FORMAT_FRACTAL_NZ_C0_32 = 51
 _BASE_FORMATS = (_FORMAT_NCHW, _FORMAT_ND)
-_NZ_FORMATS = (
-    _FORMAT_FRACTAL_NZ,
-    _FORMAT_FRACTAL_NZ_C0_16,
-    _FORMAT_FRACTAL_NZ_C0_32,
-)
 
 
 def update_expert_weights_with_staging(
@@ -306,8 +299,8 @@ def _expert_storage_layout(weight: torch.Tensor) -> _ExpertStorageLayout:
     storage_elements = torch_npu.get_storage_size(owner)
     npu_format = torch_npu.get_npu_format(owner)
     # Inspect the tensor's actual format, independently of the model name.
-    # This implementation accepts base formats and 3D batched NZ.
-    if npu_format not in _BASE_FORMATS + _NZ_FORMATS:
+    # This implementation accepts base formats and 3D batched FRACTAL_NZ.
+    if npu_format not in _BASE_FORMATS + (_FORMAT_FRACTAL_NZ,):
         raise ValueError(f"A5 EPLB does not support storage format {npu_format}.")
     if npu_format not in _BASE_FORMATS and owner.ndim != 3:
         raise ValueError("A5 EPLB requires 3D batched NZ expert weights.")
