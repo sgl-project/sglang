@@ -15,7 +15,7 @@ mod request_log;
 mod validator;
 
 pub(crate) use drain::{DrainEnd, DrainState, InFlight};
-pub(crate) use error::{CoreError, CoreErrorKind};
+pub(crate) use error::{CoreError, CoreErrorKind, STREAM_INVALID_REQUEST_ERROR};
 #[cfg(test)]
 pub(crate) use frame::frame_metadata_case;
 pub(crate) use frame::{CoreEvent, CoreOutput, HealthStatus};
