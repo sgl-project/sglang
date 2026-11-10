@@ -9,6 +9,7 @@ on:
       - main
     paths:
       - ".github/workflows/nightly-test-npu.yml"
+      - ".github/workflows/_npu-single-node-test-stage.yml"
   workflow_dispatch:
     inputs:
       ref:

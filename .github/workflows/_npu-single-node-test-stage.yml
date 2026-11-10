@@ -212,6 +212,20 @@ jobs:
         run: |
           npu-smi info
 
+      # TEMP: the container ships its own sglang build, so core-source fixes in this
+      # validation PR are not exercised unless the installed package is patched.
+      - name: TEMP patch installed sglang for per-request ViT validation
+        shell: bash
+        run: |
+          set -euo pipefail
+          target=/sgl-workspace/sglang/python/sglang/srt/managers/mm_schedule.py
+          grep -q "^_is_npu = is_npu()" "${target}" || {
+            echo "TEMP patch precondition failed: _is_npu is not defined in ${target}"
+            exit 1
+          }
+          sed -i 's/if _is_hip or _is_xpu:/if _is_hip or _is_xpu or _is_npu:/' "${target}"
+          grep -n "if _is_hip or _is_xpu" "${target}"
+
       - name: Install sglang dependencies
         if: ${{ inputs.install_sglang_deps == true }}
         shell: bash
