@@ -1624,6 +1624,133 @@ class TestEstimatedPerfConstantsHybridMambaSplit(CustomTestCase):
         self.assertAlmostEqual(reporter._linear_flops_per_token, expected_linear)
         self.assertAlmostEqual(reporter._attn_dot_flops_coeff, expected_attn_coeff)
 
+    def test_mixer_only_layer_labels_keep_full_mlp_layer_count(self):
+        # Qwen3-Next/Qwen3.5/GigaChat3.5/BailingHybrid style: layers_block_type
+        # only labels the *mixer* ("attention" vs "linear_attention"); every
+        # layer still builds its own FFN unconditionally. Counting "mlp"/"moe"
+        # strings against this vocabulary (as NemotronH's split does) would
+        # zero out num_mlp_layers and silently drop all FFN FLOPs/bytes.
+        layers_block_type = ["attention", "linear_attention"] * 5
+        full_attention_layer_ids = [
+            i
+            for i, block_type in enumerate(layers_block_type)
+            if block_type == "attention"
+        ]
+        reporter = self._constants(
+            layers_block_type=layers_block_type,
+            full_attention_layer_ids=full_attention_layer_ids,
+        )
+        expected_linear = self._attn_linear_flops() * 5 + self._mlp_flops() * (
+            self.NUM_ATTENTION_LAYERS
+        )
+        expected_attn_coeff = 4.0 * self.NUM_HEADS * self.HEAD_DIM * 5
+        self.assertAlmostEqual(reporter._linear_flops_per_token, expected_linear)
+        self.assertAlmostEqual(reporter._attn_dot_flops_coeff, expected_attn_coeff)
+        self.assertGreater(reporter._ffn_act_bytes_per_token, 0.0)
+
+    def test_uniform_single_label_costs_every_layer_as_attention_and_mlp(self):
+        # Falcon-H1 style: every layer shares one label ("falcon_h1") outside
+        # NemotronH's exclusive vocabulary entirely, and every layer has both
+        # full attention and a full FFN. Counting "attention"/"mlp"/"moe"
+        # strings against this label would zero out *both* counts -- worse
+        # than the overcounting bug this estimator set out to fix. Both must
+        # instead fall back to the full layer count via
+        # full_attention_layer_ids.
+        layers_block_type = ["falcon_h1"] * self.NUM_ATTENTION_LAYERS
+        full_attention_layer_ids = list(range(self.NUM_ATTENTION_LAYERS))
+        reporter = self._constants(
+            layers_block_type=layers_block_type,
+            full_attention_layer_ids=full_attention_layer_ids,
+        )
+        expected_linear = (
+            self._attn_linear_flops() + self._mlp_flops()
+        ) * self.NUM_ATTENTION_LAYERS
+        expected_attn_coeff = (
+            4.0 * self.NUM_HEADS * self.HEAD_DIM * self.NUM_ATTENTION_LAYERS
+        )
+        self.assertAlmostEqual(reporter._linear_flops_per_token, expected_linear)
+        self.assertAlmostEqual(reporter._attn_dot_flops_coeff, expected_attn_coeff)
+        self.assertGreater(reporter._linear_flops_per_token, 0.0)
+
+    def test_byte_estimates_scale_by_attention_and_mlp_layer_counts(self):
+        # The same per-component split that FLOPs use must also apply to the
+        # KV-cache/weight/activation byte estimates -- otherwise hybrid
+        # models keep the old per-total-layer-count overcount on the bytes
+        # side even after FLOPs are fixed (e.g. ~13x overcounted KV-cache
+        # bytes for the PR's own 52-layer/4-attention NemotronH example).
+        layers_block_type = (
+            ["attention"] * 2 + ["mlp"] * 3 + ["moe"] * 2 + ["mamba"] * 3
+        )
+        reporter = self._constants(layers_block_type=layers_block_type)
+        num_attn_layers, num_mlp_layers = 2.0, 5.0
+        dtype_bytes = 2.0
+
+        expected_kv_cache = (
+            2.0 * num_attn_layers * self.NUM_KV_HEADS * self.HEAD_DIM * dtype_bytes
+        )
+        expected_weight_read = (
+            self.HIDDEN_SIZE
+            * self.HEAD_DIM
+            * (self.NUM_HEADS + 2.0 * self.NUM_KV_HEADS)
+            * dtype_bytes
+            * num_attn_layers
+            + self.HIDDEN_SIZE
+            * self.HEAD_DIM
+            * self.NUM_HEADS
+            * dtype_bytes
+            * num_attn_layers
+            + 3.0
+            * self.HIDDEN_SIZE
+            * self.INTERMEDIATE_SIZE
+            * dtype_bytes
+            * num_mlp_layers
+        )
+        expected_qkv_act = (
+            self.HIDDEN_SIZE * dtype_bytes * num_attn_layers
+            + (self.NUM_HEADS + 2.0 * self.NUM_KV_HEADS)
+            * self.HEAD_DIM
+            * dtype_bytes
+            * num_attn_layers
+            + self.HEAD_DIM * self.NUM_HEADS * dtype_bytes * num_attn_layers
+            + self.HIDDEN_SIZE * dtype_bytes * num_attn_layers
+        )
+        expected_ffn_act = 3.0 * self.INTERMEDIATE_SIZE * dtype_bytes * num_mlp_layers
+        expected_prefill_attn_read = (
+            (self.NUM_HEADS + 2.0 * self.NUM_KV_HEADS)
+            * self.HEAD_DIM
+            * dtype_bytes
+            * num_attn_layers
+        )
+        expected_decode_q_read = (
+            self.NUM_HEADS * self.HEAD_DIM * dtype_bytes * num_attn_layers
+        )
+
+        self.assertAlmostEqual(reporter._kv_cache_bytes_per_token, expected_kv_cache)
+        self.assertAlmostEqual(
+            reporter._weight_read_bytes_per_token, expected_weight_read
+        )
+        self.assertAlmostEqual(reporter._qkv_act_bytes_per_token, expected_qkv_act)
+        self.assertAlmostEqual(reporter._ffn_act_bytes_per_token, expected_ffn_act)
+        self.assertAlmostEqual(
+            reporter._prefill_attn_act_read_per_token, expected_prefill_attn_read
+        )
+        self.assertAlmostEqual(
+            reporter._decode_q_read_bytes_per_token, expected_decode_q_read
+        )
+
+        # Regression guard for the reviewer's literal complaint: using the
+        # old unsplit total layer count would overcount KV-cache bytes by
+        # NUM_ATTENTION_LAYERS / num_attn_layers (5x here; ~13x for the PR's
+        # own 52-layer/4-attention NemotronH example).
+        stale_kv_cache = (
+            2.0
+            * self.NUM_ATTENTION_LAYERS
+            * self.NUM_KV_HEADS
+            * self.HEAD_DIM
+            * dtype_bytes
+        )
+        self.assertLess(reporter._kv_cache_bytes_per_token, stale_kv_cache)
+
 
 if __name__ == "__main__":
     unittest.main()
