@@ -53,8 +53,11 @@ from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
 )
 from sglang.kernels.ops.attention.dsv4.opus_sparse_prefill_hip import (
     Csr,
+    Mxfp8Rows,
     combined_to_csr,
     opus_sparse_prefill,
+    opus_sparse_prefill_mxfp8,
+    to_mxfp8_rows,
 )
 from sglang.kernels.ops.attention.dsv4.swapab_gluon_hip import swapab_attention
 from sglang.kernels.plugin_kernels.amd.spec import StepMetadata
@@ -172,8 +175,10 @@ class _OpusPrefillState:
     cache: SparsePrefillChunkCache
     # the SWA rows every layer lays out alike
     swa_csr: Csr
-    # ratio -> (data_ptr of the compressed cache, its bf16 rows)
-    compressed_kv: Dict[int, Tuple[int, torch.Tensor]] = field(default_factory=dict)
+    # ratio -> (data_ptr of the compressed cache, its bf16 rows or their MXFP8 rows)
+    compressed_kv: Dict[int, Tuple[int, Union[torch.Tensor, Mxfp8Rows]]] = field(
+        default_factory=dict
+    )
     # ratio -> CSR of the top-k into compressed_kv[ratio]; dropped when the indexer
     # rewrites that ratio's top-k
     topk_csr: Dict[int, Csr] = field(default_factory=dict)
@@ -3202,15 +3207,17 @@ class DeepseekV4HipRadixBackend(
             layout=pool.get_swa_key_layout(),
         )
         swa_kv = swa_rows.view(num_swa_rows, -1)
+        mxfp8 = envs.SGLANG_OPT_HIP_OPUS_SPARSE_PREFILL_MXFP8.get()
+        attend = opus_sparse_prefill_mxfp8 if mxfp8 else opus_sparse_prefill
+        if mxfp8:
+            swa_kv = to_mxfp8_rows(swa_kv)
         if compress_ratio == 0:
-            out = opus_sparse_prefill(
-                q, swa_kv, state.swa_csr, attn_sink, self.softmax_scale
-            )
+            out = attend(q, swa_kv, state.swa_csr, attn_sink, self.softmax_scale)
         else:
             compressed_kv, topk_csr = self._opus_compressed_inputs(
-                state, layer_id, compress_ratio, core_attn_metadata
+                state, layer_id, compress_ratio, core_attn_metadata, mxfp8
             )
-            out = opus_sparse_prefill(
+            out = attend(
                 q,
                 compressed_kv,
                 topk_csr,
@@ -3229,9 +3236,10 @@ class DeepseekV4HipRadixBackend(
         layer_id: int,
         compress_ratio: int,
         core_attn_metadata: DSV4AttnMetadata,
-    ) -> Tuple[torch.Tensor, Csr]:
-        """The bf16 compressed history of the layer's kv_source and the CSR of the
-        ratio's current top-k into it."""
+        mxfp8: bool = False,
+    ) -> Tuple[Union[torch.Tensor, Mxfp8Rows], Csr]:
+        """The compressed history of the layer's kv_source, as bf16 rows or their
+        MXFP8 rows, and the CSR of the ratio's current top-k into it."""
         pool = self.token_to_kv_pool
         cache = state.cache
         c_cache = pool.get_extra_key_buffer(layer_id)
@@ -3250,7 +3258,8 @@ class DeepseekV4HipRadixBackend(
                 out=rows,
                 layout=pool.get_extra_key_layout(layer_id),
             )
-            entry = (c_cache.data_ptr(), rows.view(num_rows, -1))
+            rows = rows.view(num_rows, -1)
+            entry = (c_cache.data_ptr(), to_mxfp8_rows(rows) if mxfp8 else rows)
             state.compressed_kv[compress_ratio] = entry
         compressed_kv = entry[1]
         topk_csr = state.topk_csr.get(compress_ratio)
@@ -3259,7 +3268,8 @@ class DeepseekV4HipRadixBackend(
             indices, lens = cache.combine_compressed(
                 compress_ratio, raw_indices[: cache.num_qo_tokens]
             )
-            topk_csr = combined_to_csr(indices, lens, 0, compressed_kv.shape[0])
+            num_rows = (compressed_kv[0] if mxfp8 else compressed_kv).shape[0]
+            topk_csr = combined_to_csr(indices, lens, 0, num_rows)
             state.topk_csr[compress_ratio] = topk_csr
         return compressed_kv, topk_csr
 

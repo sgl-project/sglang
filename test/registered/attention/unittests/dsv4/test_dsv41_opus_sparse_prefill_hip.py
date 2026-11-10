@@ -1,5 +1,6 @@
-"""The DSV4.1 OPUS sparse prefill path on gfx950: the -1 padded lists to CSR conversion, the
-two-source OPUS attention against an fp32 reference, and the -1 filled raw top-k buffers it reads."""
+"""The DSV4.1 OPUS sparse prefill path on gfx950: the -1 padded lists to CSR conversion,
+the two-source OPUS attention against an fp32 reference, bf16 and over MXFP8 rows, and
+the -1 filled raw top-k buffers it reads."""
 
 import unittest
 
@@ -125,6 +126,79 @@ class TestOpusSparsePrefill(CustomTestCase):
     def test_matches_fp32_reference(self):
         gen = torch.Generator(device="cuda").manual_seed(0)
         for heads in (32, 16):
+            for two_sources in (True, False):
+                self._case(heads, two_sources, gen)
+
+
+def _v41_available() -> bool:
+    if not _opus_available():
+        return False
+    try:
+        from aiter.ops.mla_sparse_prefill import mla_sparse_prefill_v41  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def _dequant_mxfp8(values, scales):
+    from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import dequant_mxfp8_to_bf16
+
+    # exact: an e4m3 value times a power of 2 fits in bf16
+    return dequant_mxfp8_to_bf16(values, scales).float()
+
+
+@unittest.skipUnless(_v41_available(), "gfx950 with aiter's mla_sparse_prefill_v41")
+class TestOpusSparsePrefillMxfp8(CustomTestCase):
+    """SGLANG_OPT_HIP_OPUS_SPARSE_PREFILL_MXFP8: the same two sources as MXFP8 rows. The
+    reference attends over the dequantized MXFP8 q and rows, so only the kernel's own
+    error remains."""
+
+    def _case(self, heads, two_sources, gen):
+        from sglang.kernels.ops.attention.dsv4.opus_sparse_prefill_hip import (
+            combined_to_csr,
+            opus_sparse_prefill_mxfp8,
+            to_mxfp8_rows,
+        )
+
+        T, n_c, n_s = 48, 700, 300
+        q = (torch.randn(T, heads, D, generator=gen, device="cuda") * 0.5).to(
+            torch.bfloat16
+        )
+        sink = torch.randn(heads, generator=gen, device="cuda") * 0.5
+        swa = to_mxfp8_rows(
+            (torch.randn(n_s, D, generator=gen, device="cuda") * 0.5).to(torch.bfloat16)
+        )
+        swa_idx, swa_lens = _padded_lists(T, 128, n_s, gen)
+        swa_idx[:, 0] = torch.arange(T, device="cuda", dtype=torch.int32) % n_s
+        swa_lens = swa_lens.clamp(min=1)
+        swa_csr = combined_to_csr(swa_idx, swa_lens, 0, n_s)
+        q_ref = _dequant_mxfp8(*to_mxfp8_rows(q.flatten(0, 1))).unflatten(0, (T, heads))
+        if not two_sources:
+            out = opus_sparse_prefill_mxfp8(q, swa, swa_csr, sink, SCALE)
+            ref = _attention_reference(q_ref, [(_dequant_mxfp8(*swa), swa_csr)], sink)
+        else:
+            c = to_mxfp8_rows(
+                (torch.randn(n_c, D, generator=gen, device="cuda") * 0.5).to(
+                    torch.bfloat16
+                )
+            )
+            c_idx, c_lens = _padded_lists(T, 512, n_c, gen)
+            c_lens[0] = 0
+            c_csr = combined_to_csr(c_idx, c_lens, 0, n_c)
+            out = opus_sparse_prefill_mxfp8(
+                q, c, c_csr, sink, SCALE, extend_kv=swa, extend_csr=swa_csr
+            )
+            ref = _attention_reference(
+                q_ref,
+                [(_dequant_mxfp8(*c), c_csr), (_dequant_mxfp8(*swa), swa_csr)],
+                sink,
+            )
+        err = (out.float() - ref).abs().max().item() / ref.abs().max().item()
+        self.assertLess(err, TOL, (heads, two_sources, err))
+
+    def test_matches_fp32_reference(self):
+        gen = torch.Generator(device="cuda").manual_seed(0)
+        for heads in (64, 16):
             for two_sources in (True, False):
                 self._case(heads, two_sources, gen)
 
