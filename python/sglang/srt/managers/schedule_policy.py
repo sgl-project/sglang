@@ -163,6 +163,10 @@ def estimate_prefill_extend_tile_metrics(
     }
 
 
+# Bound matching work and cross-batch overtaking without a new server argument.
+BOUNDED_LPM_WINDOW_SIZE = 64
+
+
 class CacheAwarePolicy(Enum):
     """Scheduling policies that are aware of the tree cache."""
 
@@ -191,7 +195,14 @@ class SchedulePolicy:
         enable_hierarchical_cache: bool,
         enable_priority_scheduling: bool,
         schedule_low_priority_values_first: bool,
+        bounded_lpm_enabled: bool = True,
     ):
+        self._bounded_lpm_enabled = bounded_lpm_enabled
+        self._bounded_active = False
+        self._bounded_members: List[Req] = []
+        self._bounded_next_members: List[Req] = []
+        self._bounded_next_selected = False
+        self._bounded_skipped: set[int] = set()
         self.policy = self._validate_and_adjust_policy(policy, tree_cache)
         self.tree_cache = tree_cache
         self.enable_hierarchical_cache = enable_hierarchical_cache
@@ -213,6 +224,54 @@ class SchedulePolicy:
     ) -> List[Req]:
         """The waiting requests in the order the policy admits them."""
         waiting_queue = list(waiting)
+        if self.policy == CacheAwarePolicy.LPM and self._bounded_lpm_enabled:
+            live = {id(req) for req in waiting_queue}
+            self._bounded_members = [r for r in self._bounded_members if id(r) in live]
+            self._bounded_next_members = [
+                r for r in self._bounded_next_members if id(r) in live
+            ]
+            if not self._bounded_members:
+                self._bounded_members = self._bounded_next_members
+                self._bounded_next_members = []
+                self._bounded_next_selected = False
+                if not self._bounded_members:
+                    self._bounded_members = (
+                        waiting_queue[:BOUNDED_LPM_WINDOW_SIZE]
+                        if len(waiting_queue) > WAITING_QUEUE_PREFIX_MATCH_MAX
+                        else []
+                    )
+            # Finish committed batches even after the queue drops below 128.
+            self._bounded_active = bool(self._bounded_members)
+
+        if self._bounded_active:
+            self._bounded_skipped.clear()
+            members = {id(req) for req in self._bounded_members}
+            tail = [r for r in waiting_queue if id(r) not in members]
+            # Keep the existing FCFS refresh cadence/cap for non-members.
+            # Touch them first so matching the current batch makes its prefixes
+            # more recent. Fast-match caches retain the existing match-anyway path.
+            if (
+                self.tree_cache.supports_fast_match_prefix()
+                and get_disagg().disaggregation_mode != "decode"
+            ):
+                for r in tail:
+                    r.init_next_round_input(self.tree_cache)
+            self._touch_waiting_prefixes(
+                CacheAgnosticPolicy.FCFS, tail, bootstrap_queue
+            )
+            if not self._bounded_members:
+                return waiting_queue
+            deprioritized = self._compute_prefix_matches(
+                self._bounded_members, CacheAwarePolicy.LPM
+            )
+            self._sort_by_longest_prefix(self._bounded_members, deprioritized)
+            next_ids = {id(r) for r in self._bounded_next_members}
+            return (
+                self._bounded_members
+                + self._bounded_next_members
+                + [r for r in tail if id(r) not in next_ids]
+            )
+
         policy = self._determine_active_policy(waiting_queue)
 
         # Cache-agnostic policies sort without matching; match anyway so the load
@@ -277,6 +336,60 @@ class SchedulePolicy:
         self._touch_waiting_prefixes(policy, waiting_queue, bootstrap_queue)
         return waiting_queue
 
+    def retire_waiting_members(self, reqs: Iterable[Req]) -> None:
+        """Retire on departure; never refill the next batch within an epoch."""
+        if self._bounded_members or self._bounded_next_members:
+            leaving = {id(req) for req in reqs}
+            self._bounded_members = [
+                req for req in self._bounded_members if id(req) not in leaving
+            ]
+            self._bounded_next_members = [
+                req for req in self._bounded_next_members if id(req) not in leaving
+            ]
+            self._bounded_skipped.difference_update(leaving)
+
+    def mark_admission_skipped(self, req: Req) -> None:
+        """Record only a current member skipped for a temporary prerequisite."""
+        if self._bounded_active and any(
+            req is member for member in self._bounded_members
+        ):
+            self._bounded_skipped.add(id(req))
+
+    def admission_candidates(self, waiting: Iterable[Req]) -> Iterable[Req]:
+        """Yield current members first, then at most one fixed fallback batch.
+
+        The caller reports temporary skips. A resource/budget break closes this
+        generator before it can expose next-batch candidates. Matching the next
+        batch is lazy, so the normal path still sorts at most 64 requests.
+        """
+        if not self._bounded_active:
+            yield from waiting
+            return
+        self._bounded_skipped.clear()
+        yield from self._bounded_members
+        if not self._bounded_skipped:
+            return
+        if not self._bounded_next_selected:
+            members = {id(r) for r in self._bounded_members}
+            self._bounded_next_members = [r for r in waiting if id(r) not in members][
+                :BOUNDED_LPM_WINDOW_SIZE
+            ]
+            self._bounded_next_selected = True
+        if self._bounded_next_members:
+            deprioritized = self._compute_prefix_matches(
+                self._bounded_next_members, CacheAwarePolicy.LPM
+            )
+            self._sort_by_longest_prefix(self._bounded_next_members, deprioritized)
+            yield from self._bounded_next_members
+
+    def allows_admission(self, req: Req) -> bool:
+        if not self._bounded_active:
+            return True
+        return any(req is member for member in self._bounded_members) or (
+            bool(self._bounded_skipped)
+            and any(req is member for member in self._bounded_next_members)
+        )
+
     def _touch_waiting_prefixes(
         self,
         policy: Policy,
@@ -322,6 +435,8 @@ class SchedulePolicy:
         return self.policy
 
     def waiting_queue_prefix_matched(self, waiting_queue: List[Req]) -> bool:
+        if self._bounded_active:
+            return False
         policy = self._determine_active_policy(waiting_queue)
         return (
             isinstance(policy, CacheAwarePolicy)
