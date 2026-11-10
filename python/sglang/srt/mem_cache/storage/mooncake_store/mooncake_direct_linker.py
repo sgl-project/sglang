@@ -423,7 +423,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 group_futures = []
                 futures.append(group_futures)
                 for name, (keys, locations) in batches.items():
-                    meta = self._group_range_meta(name, locations, group)
+                    meta = self.pools[name].get_prepared_layers_range_meta(
+                        locations, group
+                    )
                     if meta is not None:
                         group_futures.extend(self._submit_range_gets(name, keys, *meta))
             for group, group_futures in zip(groups, futures):
@@ -447,22 +449,6 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 except BaseException as error:
                     self.layer_done_counter.fail(counter_index, error)
                     logger.exception("Mooncake layer-wise load session cleanup failed")
-
-    def _group_range_meta(self, name: PoolName, locations: list[int], group: range):
-        merged = None
-        for layer in group:
-            meta = self.pools[name].get_prepared_layer_range_meta(locations, layer)
-            if meta is None:
-                continue
-            if merged is None:
-                # Pool metadata may share read-only size/offset rows.
-                # Grouping extends each row, so give it independent ownership.
-                merged = tuple([list(row) for row in rows] for rows in meta)
-                continue
-            for merged_rows, rows in zip(merged, meta):
-                for merged_row, row in zip(merged_rows, rows):
-                    merged_row.extend(row)
-        return merged
 
     def _submit_range_gets(
         self, name: PoolName, keys: list[str], ptrs, sizes, offsets
