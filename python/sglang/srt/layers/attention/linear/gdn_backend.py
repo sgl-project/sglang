@@ -48,6 +48,7 @@ from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_exec,
     get_memory,
@@ -65,7 +66,15 @@ if not is_cpu():
         CHUNK_SIZE as FLA_CHUNK_SIZE,
     )
 
-if is_cuda() or is_hip() or is_xpu():
+if (
+    is_cuda()
+    or is_hip()
+    or is_xpu()
+    or (
+        current_platform.is_out_of_tree()
+        and current_platform.capabilities.supports_triton
+    )
+):
     from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
         can_use_fused_qkvzba_causal_conv1d_update_contiguous,
         fused_qkv_split_gdn_prefill,

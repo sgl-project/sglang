@@ -132,6 +132,7 @@ from sglang.srt.models.utils import (
     fused_qk_gemma_rmsnorm_with_gate,
     maybe_enable_silu_fp4_quant_fusion,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_exec,
     get_forward,
@@ -182,8 +183,12 @@ _qknorm_use_alt_stream = _is_cuda or (
     get_bool_env_var("SGLANG_QK_NORM_ALT_STREAM", "False") and _hip_use_alt_stream
 )
 _gdn_decode_fused_proj_conv = (
-    _is_cuda and envs.SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV.get()
-)
+    _is_cuda
+    or (
+        current_platform.is_out_of_tree()
+        and current_platform.capabilities.supports_triton
+    )
+) and envs.SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV.get()
 _gdn_online_mxfp4 = (
     ("in_proj_qkvz", "out_proj")
     if envs.SGLANG_ROCM_GDN_ONLINE_MXFP4.get() and _use_aiter and _is_gfx95
