@@ -141,6 +141,7 @@ class TestKvProvenanceForwardPaths(CustomTestCase):
         output = GenerationBatchResult(kv_weight_version_record=record)
         batch = SimpleNamespace(
             spec_info=SimpleNamespace(),
+            sampling_info=SimpleNamespace(synthid_state=None),
             seq_lens=torch.tensor([2]),
             input_ids=None,
             out_cache_loc=None,

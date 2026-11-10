@@ -24,6 +24,7 @@ from sglang.srt.models.unlimited_ocr_v2_support.greedy_graph import UocrGreedyGr
 from sglang.srt.models.unlimited_ocr_v2_support.scheduler_runtime import (
     UocrSchedulerRuntime,
 )
+from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -44,6 +45,7 @@ def _decode_batch():
     sampling.has_custom_logit_processor = False
     sampling.penalizer_orchestrator = None
     sampling.has_watermark_candidates = False
+    sampling.synthid_state = None
     batch = Mock()
     batch.forward_mode.is_decode.return_value = True
     batch.forward_mode.is_extend.return_value = False
@@ -139,6 +141,9 @@ class TestDeferredThenEagerDecode(CustomTestCase):
         """A decode whose graph published the next inputs itself must still
         leave them in the future map: the following eager, mixed or
         non-greedy step gathers its inputs from there."""
+        config = get_context().override_server_args()
+        config.install()
+        self.addCleanup(config.restore)
         graph_io = _graph_io()
         scheduler = object.__new__(Scheduler)
         scheduler.spec_algorithm = SpeculativeAlgorithm.NONE
@@ -318,6 +323,9 @@ class TestFlushWithDocumentState(CustomTestCase):
     def test_flush_drops_document_state_before_the_pools_and_aborts_held_windows(self):
         """Held windows must get an answer, and the retained windows must be
         forgotten before the clear returns their KV to the pools."""
+        config = get_context().override_server_args()
+        config.install()
+        self.addCleanup(config.restore)
         hooks, _ = self._hooks()
         held = FakeReq(rid="w1")
         hooks._prefetch._parked.join([held])

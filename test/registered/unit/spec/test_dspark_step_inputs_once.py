@@ -239,6 +239,7 @@ class TestPostFoldRelay(unittest.TestCase):
         fm._maybe_init_dsa_topk_indices_buf = lambda payload: None
         fm.need_topk = fm.need_hidden_states = False
         fm.draft_probs_buf = fm.dsa_topk_indices_buf = None
+        fm.draft_prob_token_ids_buf = None
         marked_bonus = torch.tensor([-1, -1])
         relay.published_bonus = marked_bonus
         fm.stash(
