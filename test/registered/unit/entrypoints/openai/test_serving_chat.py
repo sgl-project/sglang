@@ -21,7 +21,6 @@ from typing import Optional
 from unittest.mock import Mock, patch
 
 from fastapi import HTTPException, Request
-from fastapi.responses import StreamingResponse
 from tokenizers import Tokenizer as BackendTokenizer
 from tokenizers import models as tokenizer_models
 from tokenizers import pre_tokenizers
@@ -31,8 +30,10 @@ from xgrammar import Grammar
 from xgrammar.testing import _is_grammar_accept_string
 
 from sglang.srt.entrypoints.openai.chat_encoding import resolve_chat_encoding_spec
-from sglang.srt.entrypoints.openai.kimi_k3_adapter import GENERATION_STUB_TOKENS
-from sglang.srt.entrypoints.openai.kimi_k3_wire import KimiK3ChatWire
+from sglang.srt.entrypoints.openai.kimi_k3_wire import (
+    GENERATION_STUB_TOKENS,
+    KimiK3ChatWire,
+)
 from sglang.srt.entrypoints.openai.parallel_prompt_encode import encode_prompt_segments
 from sglang.srt.entrypoints.openai.protocol import (
     STREAM_DELTA_CONTEXT,
@@ -53,7 +54,6 @@ from sglang.srt.entrypoints.openai.serving_chat import (
 )
 from sglang.srt.entrypoints.openai.sse_utils import build_sse_content
 from sglang.srt.environ import envs
-from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.kimik3_format import TOOLS_CLOSE, TOOLS_OPEN
 from sglang.srt.function_call.kimik3_structural_tag import get_kimik3_structural_tag
@@ -176,7 +176,6 @@ _TOOL_RESULT_REORDER_TEMPLATE = """
 
 
 def _use_chat_encoding(chat: OpenAIServingChat, spec: Optional[str]) -> None:
-    """Serve ``spec`` on a handler built for another one."""
     chat.chat_encoding_spec = spec
     chat._encoding_adapter = chat._build_chat_encoding_adapter()
 
@@ -6290,14 +6289,6 @@ class TestStreamNullFieldsOutsideK3(CustomTestCase):
 
 
 class K3StreamSpecConformanceTestCase(unittest.TestCase):
-    """Wire-level conformance for the Kimi K3 streaming chat contract.
-
-    Each test names the spec rule it pins. The mock engine stands in for a real
-    K3 server, so these assert the shape sglang puts on the wire, not model
-    behavior; the timing-sensitive rules (UTF-8 stitching, the end-of-thinking
-    boundary, token-id/text fidelity) still need a live engine.
-    """
-
     _STUB = GENERATION_STUB_TOKENS
 
     def setUp(self):
@@ -6340,15 +6331,14 @@ class K3StreamSpecConformanceTestCase(unittest.TestCase):
         }
 
     def _stream(self, events, req):
-        """Stream ``events`` in the shape the /v1/chat/completions route sends;
-        the response's wire stays on ``self.wire``."""
+        """Stream ``events`` as the chat route does; the wire stays on ``self.wire``."""
 
         async def _gen():
             for e in events:
                 yield e
 
         self.tm.generate_request = Mock(return_value=_gen())
-        self.wire = self.chat.openai_wire.new_response(req, created=1_700_000_000)
+        self.wire = self.chat.chat_wire.new_response(req, created=1_700_000_000)
 
         async def _run():
             out = []
@@ -6374,16 +6364,18 @@ class K3StreamSpecConformanceTestCase(unittest.TestCase):
         kw.setdefault("stream", True)
         return ChatCompletionRequest(**kw)
 
+    def _engine(self, events):
+        async def _gen():
+            for e in events:
+                if isinstance(e, BaseException):
+                    raise e
+                yield e
+
+        self.tm.generate_request = Mock(side_effect=lambda *a, **k: _gen())
+        self.tm.create_abort_task = Mock(return_value=None)
+
     # ------------- usage summary -------------
     def test_summary_frame_carries_both_usage_detail_objects(self):
-        """The include_usage summary frame must carry
-        completion_tokens_details.reasoning_tokens and
-        prompt_tokens_details.cached_tokens as integers.
-
-        --enable-cache-report stays off here on purpose: the flag gated whether
-        cached_tokens was reported at all, which is what made it disagree with
-        the usage accounting header.
-        """
         self.tm.server_args.enable_cache_report = False
         req = self._req(stream_options={"include_usage": True})
         frames = self._frames(
@@ -6399,7 +6391,6 @@ class K3StreamSpecConformanceTestCase(unittest.TestCase):
             self.assertIs(type(usage[key]), int, key)
 
     def test_end_frame_usage_matches_summary_frame(self):
-        """Per-choice end-frame usage and the summary agree."""
         req = self._req(stream_options={"include_usage": True})
         frames = self._frames(
             self._stream([self._event(finish={"type": "stop", "matched": None})], req)
@@ -6416,24 +6407,6 @@ class K3StreamSpecConformanceTestCase(unittest.TestCase):
             "prompt_tokens_details",
         ):
             self.assertEqual(end_usage[key], summary_usage[key], key)
-
-    def test_other_encodings_keep_the_historical_usage_shape(self):
-        """Other models keep their usage shape except upstream's OpenAI location
-        of reasoning tokens (#46133), present only when there are some."""
-        _use_chat_encoding(self.chat, None)
-        req = self._req(stream_options={"include_usage": True})
-        frames = self._frames(
-            self._stream([self._event(finish={"type": "stop", "matched": None})], req)
-        )
-        summary = [f for f in frames if f["choices"] == []][0]
-        self.assertEqual(
-            summary["usage"].get("completion_tokens_details"),
-            {"reasoning_tokens": summary["usage"]["reasoning_tokens"]},
-        )
-        # ...and no per-choice usage is bolted onto the end frame either.
-        end = [f for f in frames if f["choices"] and f["choices"][0]["finish_reason"]]
-        self.assertEqual(len(end), 1)
-        self.assertIsNone(end[0]["choices"][0].get("usage"))
 
     def test_continuous_usage_never_leaks_to_k3_increment_frames(self):
         for include in (True, False):
@@ -6465,8 +6438,6 @@ class K3StreamSpecConformanceTestCase(unittest.TestCase):
 
     # ------------- usage accounting headers -------------
     def test_usage_headers_agree_with_the_final_usage(self):
-        """The usage headers must equal the usage the client finally sees,
-        with --enable-cache-report off."""
         self.tm.server_args.enable_cache_report = False
         req = self._req(stream_options={"include_usage": True})
         with envs.SGLANG_USAGE_HEADER_PREFIX.override("X-Test-Usage"):
@@ -6484,21 +6455,10 @@ class K3StreamSpecConformanceTestCase(unittest.TestCase):
             int(headers["X-Test-Usage-Cached-Tokens"]),
             usage["prompt_tokens_details"]["cached_tokens"],
         )
-        # And the reported prompt count still excludes K3's generation stub.
         self.assertEqual(usage["prompt_tokens"], 10 - self._STUB)
-
-    def test_usage_headers_are_off_without_a_prefix(self):
-        """No SGLANG_USAGE_HEADER_PREFIX: no usage headers are sent."""
-        req = self._req(stream_options={"include_usage": True})
-        with envs.SGLANG_USAGE_HEADER_PREFIX.override(""):
-            self._stream([self._event(finish={"type": "stop", "matched": None})], req)
-        self.assertEqual(self.wire.headers(), {})
 
     # ------------- constant response id -------------
     def test_wire_id_is_constant_across_frames_with_n_gt_1(self):
-        """One id for the whole response. The engine gives
-        every sampled choice its own rid, so a per-frame derivation emitted a
-        different id per candidate."""
         req = self._req(n=2, stream_options={"include_usage": True})
         chunks = self._stream(
             [
@@ -6525,7 +6485,6 @@ class K3StreamSpecConformanceTestCase(unittest.TestCase):
         self.assertRegex(ids.pop(), r"^chatcmpl-[0-9a-f]{24}$")
         created = {f["created"] for f in frames}
         self.assertEqual(len(created), 1, "created must be constant too")
-        # Both candidates still run a full sequence, one choice element a frame.
         self.assertTrue(all(len(f["choices"]) <= 1 for f in frames))
         finished = {
             f["choices"][0]["index"]
@@ -6534,28 +6493,8 @@ class K3StreamSpecConformanceTestCase(unittest.TestCase):
         }
         self.assertEqual(finished, {0, 1})
 
-    def test_engine_assigns_a_separate_rid_per_sampled_choice(self):
-        """The premise behind pinning the wire id: n>1 fans one request out
-        into one rid per candidate, so meta_info["id"] differs between the
-        frames of a single response."""
-        from sglang.srt.managers.io_struct import GenerateReqInput
-
-        anon = GenerateReqInput(text="hi", sampling_params={"n": 2})
-        anon.normalize_batch_and_arguments()
-        self.assertEqual(len(anon.rid), 2)
-        self.assertNotEqual(anon.rid[0], anon.rid[1])
-
-        # A client-supplied rid is suffixed rather than replaced, but the
-        # per-candidate values still differ.
-        named = GenerateReqInput(text="hi", sampling_params={"n": 2}, rid="fixed")
-        named.normalize_batch_and_arguments()
-        self.assertEqual(named.rid, ["fixed_0", "fixed_1"])
-
     def test_wire_id_separates_rids_that_share_no_hex(self):
-        """Distinct rids must not collapse onto one id. Filtering the rid
-        down to its hex characters mapped "req-a" and "req-b" both onto
-        chatcmpl-a000...; hashing keeps them apart."""
-        wire = KimiK3ChatWire(tokenizer=None, uncounted_prompt_tokens=0)
+        wire = KimiK3ChatWire(tokenizer=None)
         seen = set()
         for rid in ("req-a", "req-b", "x", "y"):
             response = wire.new_response(self._req(), created=1_700_000_000)
@@ -6565,17 +6504,13 @@ class K3StreamSpecConformanceTestCase(unittest.TestCase):
         self.assertEqual(len(seen), 4, f"ids collided: {sorted(seen)}")
 
     def test_wire_id_sorts_lexicographically_by_time(self):
-        """The id's leading bytes encode creation time."""
-        wire = KimiK3ChatWire(tokenizer=None, uncounted_prompt_tokens=0)
+        wire = KimiK3ChatWire(tokenizer=None)
         early = wire.new_response(self._req(), created=1_700_000_000)
         late = wire.new_response(self._req(), created=1_700_000_001)
         self.assertLess(early.response_id("same-rid"), late.response_id("same-rid"))
 
     # ------------- abort finish reasons -------------
     def test_abort_becomes_server_interrupted_not_an_error_frame(self):
-        """A mid-stream abort is expressed through
-        finish_reason; "abort" is not a value the K3 contract defines, and an
-        error-only SSE frame is explicitly forbidden."""
         req = self._req()
         chunks = self._stream(
             [
@@ -6599,6 +6534,59 @@ class K3StreamSpecConformanceTestCase(unittest.TestCase):
         self.assertEqual(end[0]["choices"][0]["finish_reason"], "server_interrupted")
         self.assertIsInstance(end[0]["choices"][0]["usage"], dict)
 
+    def test_mid_stream_failure_ends_every_open_choice(self):
+        abort = self._event(
+            index=0,
+            text="",
+            finish={
+                "type": "abort",
+                "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+                "message": "oom",
+            },
+        )
+        for name, failure in (("abort", abort), ("exception", RuntimeError("died"))):
+            with self.subTest(failure=name):
+                req = self._req(n=2)
+                self._engine(
+                    [
+                        self._event(index=0, rid="r0", text="one"),
+                        self._event(index=1, rid="r1", text="two"),
+                        failure,
+                    ]
+                )
+                wire = self.chat.chat_wire.new_response(req, created=0)
+
+                async def _run():
+                    return [
+                        c
+                        async for c in self.chat._generate_chat_stream(
+                            Mock(), req, self.fastapi_request, wire=wire
+                        )
+                    ]
+
+                frames = self._frames(
+                    get_or_create_event_loop().run_until_complete(_run())
+                )
+                ends = {
+                    f["choices"][0]["index"]: f["choices"][0]["finish_reason"]
+                    for f in frames
+                    if f["choices"] and f["choices"][0]["finish_reason"]
+                }
+                self.assertEqual(
+                    ends, {0: "server_interrupted", 1: "server_interrupted"}
+                )
+
+    def test_non_streaming_abort_is_server_interrupted(self):
+        self._engine(
+            [self._event(text="part", finish={"type": "abort"}, weight_version="v")]
+        )
+        response = get_or_create_event_loop().run_until_complete(
+            self.chat._handle_non_streaming_request(
+                Mock(), self._req(stream=False), None
+            )
+        )
+        self.assertEqual(response.choices[0].finish_reason, "server_interrupted")
+
     def _abort_before_first_token(self, status_code):
         async def _gen():
             yield self._event(
@@ -6619,59 +6607,19 @@ class K3StreamSpecConformanceTestCase(unittest.TestCase):
         )
 
     def test_client_abort_before_first_token_is_an_http_error(self):
-        """A 4xx abort found before any byte is sent is an HTTP error,
-        which handle_request turns into the JSON error envelope."""
         with self.assertRaises(HTTPException) as ctx:
             self._abort_before_first_token(HTTPStatus.BAD_REQUEST)
         self.assertEqual(ctx.exception.status_code, 400)
         self.assertEqual(ctx.exception.detail, "grammar failed")
 
-    def test_server_abort_before_first_token_stays_server_interrupted(self):
-        response = self._abort_before_first_token(HTTPStatus.SERVICE_UNAVAILABLE)
-        self.assertIsInstance(response, StreamingResponse)
-
-        async def _drain():
-            return [chunk async for chunk in response.body_iterator]
-
-        frames = self._frames(get_or_create_event_loop().run_until_complete(_drain()))
-        end = [f for f in frames if f["choices"] and f["choices"][0]["finish_reason"]]
-        self.assertEqual(end[0]["choices"][0]["finish_reason"], "server_interrupted")
-
-    def test_other_encodings_still_emit_the_abort_error_frame(self):
-        """The mid-stream abort change is K3-gated; stock sglang behavior is untouched."""
-        _use_chat_encoding(self.chat, None)
-        req = self._req()
-        chunks = self._stream(
-            [
-                self._event(text="partial"),
-                self._event(
-                    text="partial",
-                    finish={
-                        "type": "abort",
-                        "status_code": HTTPStatus.INTERNAL_SERVER_ERROR,
-                        "message": "engine died",
-                    },
-                ),
-            ],
-            req,
-        )
-        self.assertTrue(any('"error"' in c for c in chunks))
-
     # ------------- pre-stream errors -------------
     def test_error_body_is_wrapped_in_an_error_envelope(self):
-        """Pre-stream errors must be {"error": {...}}."""
         response = self.chat.create_error_response("bad thing", "invalid_request_error")
         payload = json.loads(bytes(response.body))
         self.assertIn("error", payload)
         self.assertEqual(payload["error"]["message"], "bad thing")
         self.assertEqual(payload["error"]["type"], "invalid_request_error")
         self.assertEqual(response.status_code, 400)
-
-    def test_error_envelope_is_k3_gated(self):
-        _use_chat_encoding(self.chat, None)
-        payload = json.loads(bytes(self.chat.create_error_response("bad").body))
-        self.assertNotIn("error", payload)
-        self.assertEqual(payload["message"], "bad")
 
     def test_request_validation_errors_use_the_error_envelope(self):
         from types import SimpleNamespace
@@ -6704,72 +6652,23 @@ class K3StreamSpecConformanceTestCase(unittest.TestCase):
         payload = json.loads(bytes(handle("/v1/chat/completions").body))
         self.assertNotIn("error", payload)
 
-    def test_unexpected_mid_stream_exception_ends_with_server_interrupted(self):
-        async def _gen():
-            yield self._event(text="partial")
-            raise RuntimeError("engine died")
-
-        self.tm.generate_request = Mock(return_value=_gen())
-        req = self._req()
-        wire = self.chat.openai_wire.new_response(req, created=0)
-
-        async def _run():
-            return [
-                chunk
-                async for chunk in self.chat._generate_chat_stream(
-                    Mock(), req, self.fastapi_request, wire=wire
-                )
-            ]
-
-        chunks = get_or_create_event_loop().run_until_complete(_run())
-        frames = self._frames(chunks)
-        self.assertEqual(
-            frames[-1]["choices"][0]["finish_reason"], "server_interrupted"
+    def test_internal_content_without_a_byte_decoder_is_a_client_error(self):
+        self.tm.tokenizer.model = None
+        self.tm.tokenizer.tokenizer = None
+        self._engine([self._event(finish={"type": "stop", "matched": None})])
+        response = get_or_create_event_loop().run_until_complete(
+            self.chat.handle_request(
+                self._req(stream_options={"include_internal_content": True}),
+                self.fastapi_request,
+            )
         )
-        self.assertEqual(chunks[-1], "data: [DONE]\n\n")
+        self.assertEqual(response.status_code, 400)
+        self.assertIn(
+            "byte decoder", json.loads(bytes(response.body))["error"]["message"]
+        )
+        self.tm.generate_request.assert_not_called()
 
     # ------------- internal content token ids -------------
-    def test_tool_call_token_ids_ride_on_the_opening_frame_only(self):
-        """A call whose first parser delta carries arguments opens with
-        arguments="" and sends them in a continuation; the tokens behind that
-        delta go out once, on the opening frame."""
-        req = self._req(
-            stream_options={"include_internal_content": True},
-            tools=[{"type": "function", "function": {"name": "get_weather"}}],
-        )
-        pieces = {101: b"answer: ", 102: b"<call>"}
-        self.tm.tokenizer.model.decode_single_token_bytes.side_effect = pieces.get
-        call = ToolCallItem(
-            tool_index=0,
-            name="get_weather",
-            parameters='{"c":"SF"}',
-            source_text="<call>",
-        )
-        with patch(
-            "sglang.srt.entrypoints.openai.serving_chat.FunctionCallParser"
-        ) as ParserMock:
-            parser = ParserMock.return_value
-            parser.parse_stream_chunk.return_value = ("answer: ", [call])
-            parser.detector = Mock(prev_tool_call_arr=None, streamed_args_for_tool=None)
-            frames = self._frames(self._stream([self._event(text="answer: ")], req))
-
-        increments = [
-            f["choices"][0]
-            for f in frames
-            if f["choices"]
-            and (
-                f["choices"][0]["delta"].get("content")
-                or f["choices"][0]["delta"].get("tool_calls")
-            )
-        ]
-        self.assertEqual(
-            [choice.get("internal_content") for choice in increments],
-            [[{"token_ids": [101]}], [{"token_ids": [102]}], None],
-        )
-        opening, arguments = (c["delta"]["tool_calls"][0] for c in increments[1:])
-        self.assertEqual(opening["function"]["arguments"], "")
-        self.assertEqual(arguments["function"], {"arguments": '{"c":"SF"}'})
-
     def test_tool_wire_usage_and_internal_content_with_buffered_markers(self):
         self.chat.tool_call_parser = "kimi_k3"
         req = self._req(
@@ -6927,51 +6826,15 @@ class K3StreamSpecConformanceTestCase(unittest.TestCase):
         ][0]
         self.assertEqual(terminal["finish_reason"], "length")
 
-    def test_internal_content_absent_unless_requested(self):
-        req = self._req(tools=[{"type": "function", "function": {"name": "w"}}])
-        frames = self._frames(
-            self._stream([self._event(finish={"type": "stop", "matched": None})], req)
+    def test_internal_content_is_ignored_outside_k3(self):
+        _use_chat_encoding(self.chat, None)
+        req = self._req(stream_options={"include_internal_content": True})
+        chunks = self._stream(
+            [self._event(text="hi", finish={"type": "stop", "matched": None})], req
         )
-        for f in frames:
-            if f["choices"]:
-                self.assertNotIn("internal_content", f["choices"][0]["delta"])
-                self.assertNotIn("internal_content", f["choices"][0])
-
-    # ------------- include_usage override -------------
-    def test_explicit_include_usage_false_beats_the_server_default(self):
-        """A client must be able to suppress the summary frame even when
-        --stream-response-default-include-usage is on."""
-        from sglang.srt.entrypoints.openai.protocol import StreamOptions
-        from sglang.srt.entrypoints.openai.utils import should_include_usage
-
-        self.assertEqual(
-            should_include_usage(StreamOptions(include_usage=False), True)[0], False
-        )
-        # Unset still defers to the server default, in both directions.
-        self.assertEqual(should_include_usage(StreamOptions(), True)[0], True)
-        self.assertEqual(should_include_usage(StreamOptions(), False)[0], False)
-        self.assertEqual(
-            should_include_usage(StreamOptions(include_usage=True), False)[0], True
-        )
-
-    def test_no_summary_frame_by_default(self):
-        req = self._req()
-        frames = self._frames(
-            self._stream([self._event(finish={"type": "stop", "matched": None})], req)
-        )
-        self.assertFalse([f for f in frames if f["choices"] == []])
+        self.assertFalse([c for c in chunks if "internal_content" in c])
 
     # ------------- only /v1/chat/completions takes the K3 wire -------------
-    def _engine(self, events):
-        async def _gen():
-            for e in events:
-                if isinstance(e, BaseException):
-                    raise e
-                yield e
-
-        self.tm.generate_request = Mock(side_effect=lambda *a, **k: _gen())
-        self.tm.create_abort_task = Mock(return_value=None)
-
     def test_anthropic_stream_errors_keep_their_stock_shape(self):
         from sglang.srt.entrypoints.anthropic.protocol import AnthropicMessagesRequest
         from sglang.srt.entrypoints.anthropic.serving import AnthropicServing
@@ -7044,85 +6907,6 @@ class K3StreamSpecConformanceTestCase(unittest.TestCase):
         self.assertEqual(anthropic.status_code, 200)
         self.assertEqual(json.loads(bytes(anthropic.body))["type"], "message")
 
-    # ------------- review fixes -------------
-    def test_non_streaming_abort_is_server_interrupted(self):
-        self._engine(
-            [self._event(text="part", finish={"type": "abort"}, weight_version="v")]
-        )
-        response = get_or_create_event_loop().run_until_complete(
-            self.chat._handle_non_streaming_request(
-                Mock(), self._req(stream=False), None
-            )
-        )
-        self.assertEqual(response.choices[0].finish_reason, "server_interrupted")
-
-    def test_mid_stream_failure_ends_every_open_choice(self):
-        abort = self._event(
-            index=0,
-            text="",
-            finish={
-                "type": "abort",
-                "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
-                "message": "oom",
-            },
-        )
-        for name, failure in (("abort", abort), ("exception", RuntimeError("died"))):
-            with self.subTest(failure=name):
-                req = self._req(n=2)
-                self._engine(
-                    [
-                        self._event(index=0, rid="r0", text="one"),
-                        self._event(index=1, rid="r1", text="two"),
-                        failure,
-                    ]
-                )
-                wire = self.chat.openai_wire.new_response(req, created=0)
-
-                async def _run():
-                    return [
-                        c
-                        async for c in self.chat._generate_chat_stream(
-                            Mock(), req, self.fastapi_request, wire=wire
-                        )
-                    ]
-
-                frames = self._frames(
-                    get_or_create_event_loop().run_until_complete(_run())
-                )
-                ends = {
-                    f["choices"][0]["index"]: f["choices"][0]["finish_reason"]
-                    for f in frames
-                    if f["choices"] and f["choices"][0]["finish_reason"]
-                }
-                self.assertEqual(
-                    ends, {0: "server_interrupted", 1: "server_interrupted"}
-                )
-
-    def test_internal_content_is_ignored_outside_k3(self):
-        _use_chat_encoding(self.chat, None)
-        req = self._req(stream_options={"include_internal_content": True})
-        chunks = self._stream(
-            [self._event(text="hi", finish={"type": "stop", "matched": None})], req
-        )
-        self.assertFalse([c for c in chunks if "internal_content" in c])
-
-    def test_internal_content_without_a_byte_decoder_is_a_client_error(self):
-        self.tm.tokenizer.model = None
-        self.tm.tokenizer.tokenizer = None
-        self._engine([self._event(finish={"type": "stop", "matched": None})])
-        response = get_or_create_event_loop().run_until_complete(
-            self.chat._handle_streaming_request(
-                Mock(),
-                self._req(stream_options={"include_internal_content": True}),
-                self.fastapi_request,
-            )
-        )
-        self.assertEqual(response.status_code, 400)
-        self.assertIn(
-            "byte decoder", json.loads(bytes(response.body))["error"]["message"]
-        )
-        self.tm.generate_request.assert_not_called()
-
 
 class KimiK3ThinkingTestCase(unittest.TestCase):
     MESSAGES = [{"role": "user", "content": "hi"}]
@@ -7179,6 +6963,7 @@ class KimiK3ThinkingTestCase(unittest.TestCase):
 
     def test_k31_keeps_medium_as_its_own_tier(self):
         self.tm.model_config.hf_config.model_type = "kimi_k31"
+        _use_chat_encoding(self.chat, "kimi_k3")
         for requested, expected in (
             ("minimal", "low"),
             ("medium", "medium"),

@@ -599,7 +599,7 @@ def _chat_route_error_response(
         param=None,
         code=status_code,
     )
-    body = request.app.state.openai_serving_chat.openai_wire.error_body(error)
+    body = request.app.state.openai_serving_chat.chat_wire.error_body(error)
     if body is None:
         return None
     return ORJSONResponse(content=body, status_code=status_code)

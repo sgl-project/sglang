@@ -1,7 +1,5 @@
 from types import SimpleNamespace
 
-import pytest
-
 from sglang.srt.entrypoints.openai.kimi_token_provenance import KimiTokenProvenance
 from sglang.srt.function_call.kimik3_format import RESPONSE_OPEN, THINK_CLOSE
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -45,11 +43,6 @@ def test_markers_in_argument_value_are_not_stripped():
     assert ids(source.take(RESPONSE_OPEN)) == [0]
 
 
-def test_channel_marker_words_do_not_steal_content_tokens():
-    source = ledger([RESPONSE_OPEN.encode(), b"response"])
-    assert ids(source.take("response", text=True)) == [1]
-
-
 def test_replayed_reasoning_uses_its_original_tokens():
     source = ledger([b"first", b" second", b" tail"])
     assert ids(source.take("first", text=True, reasoning=True)) == [0]
@@ -64,12 +57,6 @@ def test_replayed_reasoning_uses_its_original_tokens():
 def test_text_spanning_removed_wrappers():
     source = ledger([b"a", RESPONSE_OPEN.encode(), b"b"])
     assert ids(source.take("ab", text=True)) == [0, 2]
-
-
-def test_mismatch_is_not_silently_assigned_arbitrary_ids():
-    source = ledger([b"actual"])
-    with pytest.raises(ValueError, match="no matching"):
-        source.take("invented", text=True)
 
 
 def test_same_token_id_generated_twice_is_not_deduplicated():

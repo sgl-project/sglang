@@ -1321,9 +1321,7 @@ class TestSystemOne(unittest.IsolatedAsyncioTestCase):
                 scope={"root_path": root_path},
                 app=SimpleNamespace(
                     state=SimpleNamespace(
-                        openai_serving_chat=SimpleNamespace(
-                            openai_wire=OPENAI_CHAT_WIRE
-                        )
+                        openai_serving_chat=SimpleNamespace(chat_wire=OPENAI_CHAT_WIRE)
                     )
                 ),
             )

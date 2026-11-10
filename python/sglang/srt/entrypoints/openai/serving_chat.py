@@ -44,7 +44,7 @@ _CHAT_TEMPLATE_CLIENT_ERRORS: tuple[type[BaseException], ...] = (
     jinja2.TemplateError,
     TypeError,
 ) + _MISTRAL_COMMON_ERRORS
-from fastapi.responses import ORJSONResponse, StreamingResponse
+from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 from jsonschema import Draft202012Validator, SchemaError
 
 from sglang.srt.entrypoints.openai import (
@@ -143,6 +143,7 @@ from sglang.srt.sampling.sampling_params import (
     set_request_reasoning_end_token_ids,
     set_request_reasoning_in_grammar,
 )
+from sglang.srt.utils.json_response import model_json_response
 from sglang.srt.utils.weight_versions import build_endpoint_weight_version_metadata
 
 if TYPE_CHECKING:
@@ -650,8 +651,7 @@ class OpenAIServingChat(OpenAIServingBase):
         return self._encoding_adapter.output
 
     @property
-    def openai_wire(self) -> chat_encoding_adapters.ChatWire:
-        """The shape of this handler's /v1/chat/completions responses."""
+    def chat_wire(self) -> chat_encoding_adapters.ChatWire:
         if self._encoding_adapter is None:
             return chat_encoding_adapters.OPENAI_CHAT_WIRE
         return self._encoding_adapter.wire
@@ -728,11 +728,9 @@ class OpenAIServingChat(OpenAIServingBase):
         return self._encoding_adapter.uncounted_prompt_tokens
 
     def _reported_prompt_tokens(self, meta_info: dict[str, Any]) -> int:
-        prompt_tokens = meta_info.get("prompt_tokens", 0)
-        uncounted = self._uncounted_prompt_tokens()
-        if uncounted:
-            prompt_tokens = max(0, prompt_tokens - uncounted)
-        return prompt_tokens
+        return chat_encoding_adapters.reported_prompt_tokens(
+            meta_info, self._uncounted_prompt_tokens()
+        )
 
     @staticmethod
     def _sort_tool_message_run(
@@ -859,6 +857,7 @@ class OpenAIServingChat(OpenAIServingBase):
         # nor duplicated across chunks; flush any leftover at the end.
         remaining_logprobs = choice_logprobs
 
+        finishing = finish_reason_type is not None and finish_reason_type != "abort"
         # Handle reasoning content
         if self.reasoning_parser and request.separate_reasoning:
             reasoning_text, delta = self._process_reasoning_stream(
@@ -895,12 +894,11 @@ class OpenAIServingChat(OpenAIServingBase):
                 remaining_logprobs = None
 
             reasoning_parser = reasoning_parser_dict.get(index)
-            if reasoning_parser is not None and wire.reasoning_step(
+            if reasoning_parser is not None and wire.ends_reasoning(
                 index,
                 reasoning_parser.detector,
                 reasoning_text,
-                finishing=finish_reason_type is not None
-                and finish_reason_type != "abort",
+                finishing=finishing,
             ):
                 yield build_sse_content(
                     omit_null_reasoning=wire.omit_null_delta,
@@ -924,7 +922,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 has_tool_calls,
                 created=created,
                 continuous_usage_stats=continuous_usage_stats,
-                flush=finish_reason_type is not None and finish_reason_type != "abort",
+                flush=finishing,
                 wire=wire,
             ):
                 if chunk:
@@ -1974,15 +1972,15 @@ class OpenAIServingChat(OpenAIServingBase):
             else ThinkingMode.CHAT
         )
         messages = [msg.model_dump() for msg in request.messages]
-        strict_tool_call_arguments = (
-            self._encoding_adapter.strict_tool_call_arguments
+        history_tool_call_arguments = (
+            self._encoding_adapter.history_tool_call_arguments
             if self._encoding_adapter is not None
-            else True
+            else "strict"
         )
-        if strict_tool_call_arguments is not None:
+        if history_tool_call_arguments != "as_sent":
             for message in messages:
                 normalize_assistant_tool_call_arguments(
-                    message, strict=strict_tool_call_arguments
+                    message, strict=history_tool_call_arguments == "strict"
                 )
 
         prompt_ids = self._encode_messages(
@@ -2362,11 +2360,7 @@ class OpenAIServingChat(OpenAIServingBase):
         raw_request: Request,
     ) -> StreamingResponse | ErrorResponse:
         """Handle streaming chat completion request"""
-        wire = self.openai_wire
-        request_error = wire.request_error(request)
-        if request_error:
-            return self.create_error_response(request_error)
-        wire_response = wire.new_response(request, created=int(time.time()))
+        wire_response = self.chat_wire.new_response(request, created=int(time.time()))
         generator = self._generate_chat_stream(
             adapted_request, request, raw_request, wire=wire_response
         )
@@ -2440,8 +2434,6 @@ class OpenAIServingChat(OpenAIServingBase):
         ended_choices: set[int] = set()
 
         def end_frames(close_open_choices: bool):
-            """End frames of the recorded finishes; with close_open_choices,
-            every other choice ends as aborted. A choice ends once."""
             finishes = dict(finish_reasons)
             if close_open_choices:
                 for idx in range(request.n):
@@ -2781,7 +2773,6 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
                 usage = wire.finalize_usage(
                     usage,
-                    reasoning_tokens=sum(tok or 0 for tok in reasoning_tokens.values()),
                     cached_tokens=sum(
                         tok or 0
                         for idx, tok in cached_tokens.items()
@@ -2825,15 +2816,18 @@ class OpenAIServingChat(OpenAIServingBase):
         adapted_request: GenerateReqInput,
         request: ChatCompletionRequest,
         raw_request: Request,
-    ) -> ChatCompletionResponse | ErrorResponse | ORJSONResponse:
+    ) -> ChatCompletionResponse | ErrorResponse | Response:
         """Handle non-streaming chat completion request"""
-        wire = self.openai_wire.new_response(request, created=int(time.time()))
+        wire = self.chat_wire.new_response(request, created=int(time.time()))
         response = await self._chat_completion_response(
             adapted_request, request, raw_request, wire=wire
         )
         headers = wire.headers()
         if headers and isinstance(response, ChatCompletionResponse):
-            return ORJSONResponse(content=response.model_dump(), headers=headers)
+            # The body the route sends when there are no headers.
+            json_response = model_json_response(response)
+            json_response.headers.update(headers)
+            return json_response
         return response
 
     async def _chat_completion_response(
@@ -2845,7 +2839,6 @@ class OpenAIServingChat(OpenAIServingBase):
             chat_encoding_adapters.OPENAI_CHAT_WIRE
         ),
     ) -> ChatCompletionResponse | ErrorResponse | ORJSONResponse:
-        """A non-streaming chat completion in ``wire``'s shape."""
         try:
             ret = await self.tokenizer_manager.generate_request(
                 adapted_request, raw_request
@@ -3084,9 +3077,6 @@ class OpenAIServingChat(OpenAIServingBase):
         )
         usage = wire.finalize_usage(
             usage,
-            reasoning_tokens=sum(
-                r["meta_info"].get("reasoning_tokens", 0) or 0 for r in ret
-            ),
             cached_tokens=sum(
                 ret[i]["meta_info"].get("cached_tokens", 0) or 0
                 for i in range(0, len(ret), request.n)
@@ -3194,7 +3184,7 @@ class OpenAIServingChat(OpenAIServingBase):
             param=param,
             code=status_code,
         )
-        body = self.openai_wire.error_body(error)
+        body = self.chat_wire.error_body(error)
         if body is None:
             return super().create_error_response(message, err_type, status_code, param)
         return ORJSONResponse(content=body, status_code=status_code)
@@ -3822,8 +3812,6 @@ class OpenAIServingChat(OpenAIServingBase):
             )
             tool_call_deltas = [tool_call]
             if wire.split_tool_call_opening and function_name is not None:
-                # The opening chunk carries arguments=""; the arguments the
-                # parser already has follow in a chunk of their own.
                 tool_call_deltas = [
                     ToolCall(
                         id=tool_call_id,

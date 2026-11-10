@@ -1,14 +1,15 @@
-"""Kimi-K3 serving glue for the ``kimi_k3`` chat encoding spec: its request
-rules, prompt encoding through the checkpoint's own encoder, and the K3 wire
-shape of /v1/chat/completions responses. Output parsing stays with the kimi_k3
-text parsers."""
+"""Kimi-K3 serving glue for the ``kimi_k3`` chat encoding spec; output parsing
+stays with the kimi_k3 text parsers."""
 
 from __future__ import annotations
 
 import re
 from typing import TYPE_CHECKING, Any, Optional
 
-from sglang.srt.entrypoints.openai.kimi_k3_wire import KimiK3ChatWire
+from sglang.srt.entrypoints.openai.kimi_k3_wire import (
+    GENERATION_STUB_TOKENS,
+    KimiK3ChatWire,
+)
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageGenericParam,
     ChatCompletionRequest,
@@ -16,10 +17,6 @@ from sglang.srt.entrypoints.openai.protocol import (
 
 if TYPE_CHECKING:
     from sglang.srt.entrypoints.openai.chat_encoding_adapters import ChatOutputHooks
-
-# K3's three-token assistant generation stub is model input, but the
-# reference API excludes it from billed/reported prompt tokens.
-GENERATION_STUB_TOKENS = 3
 
 KIMI_K3_IMAGE_PLACEHOLDER = "<|kimi_image_placeholder|>"
 KIMI_K3_IMAGE_PLACEHOLDER_ESCAPED = "<| kimi_image_placeholder |>"
@@ -54,23 +51,6 @@ def _map_kimi_k3_effort(reasoning_effort: Any, level_by_tier: dict) -> Optional[
         f"Kimi K3 supports reasoning_effort {_kimi_k3_levels_text(level_by_tier)} "
         f"(the other OpenAI tiers map onto them); got {reasoning_effort!r}."
     )
-
-
-def _validate_kimi_k3_request(request: ChatCompletionRequest) -> str | None:
-    """Request rules of the K3 serving contract that the encoder cannot enforce."""
-    error = _validate_kimi_k3_message_tools(request)
-    if error:
-        return error
-    # `thinking` stays a plain dict on the request; `keep` is accepted and ignored.
-    thinking = request.thinking
-    if thinking is not None and not (
-        isinstance(thinking, dict) and thinking.get("type") in _KIMI_K3_THINKING_TYPES
-    ):
-        return (
-            f"invalid thinking: {thinking!r}; expected an object whose type, if "
-            "set, is 'enabled', 'disabled' or 'adaptive'."
-        )
-    return None
 
 
 def neutralize_kimi_k3_image_placeholder(text: str) -> str:
@@ -124,21 +104,37 @@ class KimiK3ChatEncodingAdapter:
     # The encoder parses history tool-call arguments itself and keeps the
     # original bytes of nested values; parsing them first would re-serialize
     # them and change the prompt.
-    strict_tool_call_arguments = None
+    history_tool_call_arguments = "as_sent"
     renders_response_format = True
     uncounted_prompt_tokens = GENERATION_STUB_TOKENS
     output = None
 
     def __init__(self, *, tokenizer: Any, hf_config: Any, chat_hooks: ChatOutputHooks):
         self._tokenizer = tokenizer
-        self._hf_config = hf_config
-        self._hooks = chat_hooks
-        self.wire = KimiK3ChatWire(
-            tokenizer=tokenizer, uncounted_prompt_tokens=GENERATION_STUB_TOKENS
+        self._level_by_tier = (
+            _KIMI_K31_LEVEL_BY_TIER
+            if hf_config.model_type == "kimi_k31"
+            else _KIMI_K3_LEVEL_BY_TIER
         )
+        self._hooks = chat_hooks
+        self.wire = KimiK3ChatWire(tokenizer=tokenizer)
 
     def validate_request(self, request: ChatCompletionRequest) -> Optional[str]:
-        return _validate_kimi_k3_request(request)
+        """Request rules of the K3 serving contract that the encoder cannot enforce."""
+        error = _validate_kimi_k3_message_tools(request)
+        if error:
+            return error
+        # `thinking` stays a plain dict on the request; `keep` is accepted and ignored.
+        thinking = request.thinking
+        if thinking is not None and not (
+            isinstance(thinking, dict)
+            and thinking.get("type") in _KIMI_K3_THINKING_TYPES
+        ):
+            return (
+                f"invalid thinking: {thinking!r}; expected an object whose type, if "
+                "set, is 'enabled', 'disabled' or 'adaptive'."
+            )
+        return self.wire.internal_content_error(request)
 
     def encode_messages(
         self,
@@ -169,18 +165,17 @@ class KimiK3ChatEncodingAdapter:
         if image_count:
             template_kwargs["image_prompts"] = ["<|media_pad|>"] * image_count
 
-        level_by_tier = self._level_by_tier()
         ctk_effort = template_kwargs.get("thinking_effort")
-        if ctk_effort is not None and ctk_effort not in level_by_tier.values():
+        if ctk_effort is not None and ctk_effort not in self._level_by_tier.values():
             raise ValueError(
                 f"chat_template_kwargs.thinking_effort must be one of "
-                f"{_kimi_k3_levels_text(level_by_tier)}; got {ctk_effort!r}."
+                f"{_kimi_k3_levels_text(self._level_by_tier)}; got {ctk_effort!r}."
             )
         if (
             "thinking_effort" not in template_kwargs
             and template_kwargs.get("thinking") is not False
         ):
-            effort = _map_kimi_k3_effort(request.reasoning_effort, level_by_tier)
+            effort = _map_kimi_k3_effort(request.reasoning_effort, self._level_by_tier)
             if effort is not None:
                 template_kwargs["thinking_effort"] = effort
 
@@ -223,11 +218,6 @@ class KimiK3ChatEncodingAdapter:
                 prompt_ids, assistant_prefix
             )
         return prompt_ids
-
-    def _level_by_tier(self) -> dict:
-        if self._hf_config.model_type == "kimi_k31":
-            return _KIMI_K31_LEVEL_BY_TIER
-        return _KIMI_K3_LEVEL_BY_TIER
 
     def _prepare_messages(
         self,

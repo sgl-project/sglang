@@ -265,9 +265,6 @@ class UsageInfo(BaseModel):
 
 
 class StreamOptions(BaseModel):
-    # None means "unset": fall back to the server default. An explicit false
-    # must be able to suppress the summary frame even when the server default
-    # turns it on, which a False default cannot express.
     include_usage: Optional[bool] = None
     continuous_usage_stats: Optional[bool] = False
     # Kimi-K3 extension, ignored elsewhere: attach
@@ -776,9 +773,8 @@ RerankContentPart = Union[
 RerankContent = Union[str, List[RerankContentPart]]
 
 
-# Serialization context of stream chunks on a wire that drops null delta keys.
-# Request messages reuse ToolCall and reach chat templates through
-# model_dump(), so the key dropping below applies under this context only.
+# Request messages reuse ToolCall and reach chat templates through model_dump(),
+# so stream chunks drop null delta keys only under this context.
 STREAM_DELTA_CONTEXT = {"stream_delta": True}
 
 

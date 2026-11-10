@@ -52,7 +52,8 @@ JSON_RESPONSE_FORMATS = ("json_object", "json_schema")
 class DeepSeekRecipeChatEncodingAdapter:
     # recipe sorts tool results by call order, so images come from its render.
     collects_openai_media = False
-    strict_tool_call_arguments = False  # recipe serializes object arguments itself.
+    # recipe serializes object arguments itself.
+    history_tool_call_arguments = "lenient"
     renders_response_format = False
     uncounted_prompt_tokens = 0
     wire = OPENAI_CHAT_WIRE

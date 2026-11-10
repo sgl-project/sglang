@@ -26,11 +26,8 @@ class StreamDelta(msgspec.Struct, omit_defaults=True):
 
 
 class StreamChoice(msgspec.Struct):
-    """A single choice in a streaming response.
-
-    Must NOT use omit_defaults: the finish_reason key has to appear on every
-    frame. usage is set only on the K3 end frame and omitted otherwise.
-    """
+    """A single choice in a streaming response. No omit_defaults: the
+    finish_reason key has to appear on every frame."""
 
     index: int
     delta: StreamDelta

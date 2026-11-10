@@ -37,7 +37,7 @@ if TYPE_CHECKING:
 
 class InklingChatEncodingAdapter:
     collects_openai_media = True
-    strict_tool_call_arguments = True
+    history_tool_call_arguments = "strict"
     renders_response_format = False
     uncounted_prompt_tokens = 0
     wire = OPENAI_CHAT_WIRE

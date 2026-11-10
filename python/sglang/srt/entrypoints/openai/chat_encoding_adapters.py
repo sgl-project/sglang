@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     from sglang.srt.function_call.core_types import ToolCallItem
 
 EncodingBackend = Literal["builtin", "recipe"]
+HistoryToolCallArguments = Literal["strict", "lenient", "as_sent"]
 
 
 class ChatOutputHooks(msgspec.Struct, frozen=True, kw_only=True):
@@ -43,7 +44,6 @@ class ChatWireResponse(Protocol):
     """The pydantic serialization context of its stream chunks."""
 
     omit_null_delta: bool
-    """Whether stream deltas drop their null keys."""
 
     continuous_usage: bool
     """Whether increment frames may carry continuous usage stats."""
@@ -60,9 +60,7 @@ class ChatWireResponse(Protocol):
 
     def finish_reason(self, reason: Optional[str]) -> Optional[str]: ...
 
-    def finalize_usage(
-        self, usage: UsageInfo, *, reasoning_tokens: int, cached_tokens: int
-    ) -> UsageInfo: ...
+    def finalize_usage(self, usage: UsageInfo, *, cached_tokens: int) -> UsageInfo: ...
 
     def choice_usage(
         self,
@@ -89,11 +87,10 @@ class ChatWireResponse(Protocol):
         """Sees each engine event of choice ``index`` before its chunks."""
         ...
 
-    def reasoning_step(
+    def ends_reasoning(
         self, index: int, detector: Any, reasoning_text: str, *, finishing: bool
     ) -> bool:
-        """After a reasoning parse step: whether to send the end-of-thinking
-        boundary frame now."""
+        """Whether to send the end-of-thinking frame after this parse step."""
         ...
 
     def internal_content(
@@ -112,18 +109,13 @@ class ChatWire(Protocol):
         self, request: ChatCompletionRequest, *, created: int
     ) -> ChatWireResponse: ...
 
-    def request_error(self, request: ChatCompletionRequest) -> Optional[str]:
-        """A request this wire cannot serve, found before generation."""
-        ...
-
     def error_body(self, error: ErrorResponse) -> Optional[dict[str, Any]]:
         """The body of an error response; None for the handler's own."""
         ...
 
 
 class _OpenAIChatWire:
-    """OpenAI's shape, which the chat handler builds unchanged. Stateless, so it
-    is also its own per-response object."""
+    """OpenAI's shape; stateless, so it is also its own per-response object."""
 
     serialization_context = None
     omit_null_delta = False
@@ -134,9 +126,6 @@ class _OpenAIChatWire:
     def new_response(self, request, *, created):
         return self
 
-    def request_error(self, request):
-        return None
-
     def error_body(self, error):
         return None
 
@@ -146,7 +135,7 @@ class _OpenAIChatWire:
     def finish_reason(self, reason):
         return reason
 
-    def finalize_usage(self, usage, *, reasoning_tokens, cached_tokens):
+    def finalize_usage(self, usage, *, cached_tokens):
         return usage
 
     def choice_usage(
@@ -163,7 +152,7 @@ class _OpenAIChatWire:
     def observe(self, index, content):
         return None
 
-    def reasoning_step(self, index, detector, reasoning_text, *, finishing):
+    def ends_reasoning(self, index, detector, reasoning_text, *, finishing):
         return False
 
     def internal_content(self, index, source, *, kind):
@@ -171,6 +160,10 @@ class _OpenAIChatWire:
 
 
 OPENAI_CHAT_WIRE = _OpenAIChatWire()
+
+
+def reported_prompt_tokens(meta_info: dict[str, Any], uncounted: int) -> int:
+    return max(0, meta_info.get("prompt_tokens", 0) - uncounted)
 
 
 class ResponsesOutputStream(Protocol):
@@ -228,10 +221,11 @@ class ChatEncodingAdapter(Protocol):
     """Whether media still has to be collected from the OpenAI messages after
     ``encode_messages`` returns prompt ids."""
 
-    strict_tool_call_arguments: Optional[bool]
-    """Whether history tool-call ``arguments`` must parse as JSON before
-    ``encode_messages`` sees them; False when the encoding serializes them itself;
-    None when it parses them itself, so they reach it as sent."""
+    history_tool_call_arguments: HistoryToolCallArguments
+    """How history tool-call ``arguments`` reach ``encode_messages``: "strict"
+    parsed as JSON, rejecting any that do not parse; "lenient" parsed where
+    they parse, the encoding serializing the rest itself; "as_sent" unparsed,
+    the encoding parsing them itself."""
 
     renders_response_format: bool
     """Whether the prompt carries ``response_format`` instead of a grammar."""
@@ -424,7 +418,7 @@ def _build_inkling(ctx: ChatEncodingAdapterContext) -> ChatEncodingAdapter:
 
 
 def _build_kimi_k3(ctx: ChatEncodingAdapterContext) -> ChatEncodingAdapter:
-    from sglang.srt.entrypoints.openai.kimi_k3_adapter import (
+    from sglang.srt.entrypoints.openai.serving_kimi_k3 import (
         KimiK3ChatEncodingAdapter,
     )
 
