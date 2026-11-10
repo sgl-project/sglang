@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Rollout hooks for denoise loops.
 
-A loop calls ``prepare_rollout_if_enabled`` before SP sharding,
-``init_rollout_env_if_enabled`` at the loop start and
+A loop calls ``prepare_rollout_if_enabled`` before it reads its schedule and
+before SP sharding, ``init_rollout_env_if_enabled`` at the loop start and
 ``finalize_rollout_if_enabled`` at the loop end, and passes
 ``**rollout_step_kwargs(batch)`` to ``scheduler.step``. Every hook is a no-op for
 serving requests.
@@ -26,6 +26,9 @@ from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
     RolloutDenoisingEnv,
     RolloutDitTrajectory,
     RolloutTrajectoryData,
+)
+from sglang.multimodal_gen.runtime.post_training.rollout_scheduler import (
+    truncate_rollout_schedule,
 )
 from sglang.multimodal_gen.runtime.post_training.sp_utils import (
     gather_stacked_latents_for_sp,
@@ -102,23 +105,28 @@ def prepare_rollout_if_enabled(
 ) -> None:
     """Create the rollout controller of the visual stream of this request.
 
-    Must run before SP sharding so the controller records the full latent shape.
-    ``build_controller(batch=, pipeline_config=)`` returns it; a loop without a
-    scheduler passes its own.
+    A rollout with ``rollout_stop_step_index`` runs steps ``0..i`` and then goes
+    straight to the terminal sigma: ``batch.scheduler`` and ``batch.timesteps``
+    are cut to that schedule here, so the loop must call this before it reads
+    them, and before SP sharding so the controller records the full latent
+    shape. ``build_controller(batch=, pipeline_config=)`` returns the
+    controller; a loop without a scheduler passes its own, cut to the stop.
     """
     if not batch.rollout:
         return
+    stop_step_index = batch.rollout_stop_step_index
+    if stop_step_index is not None and batch.scheduler is not None:
+        batch.timesteps = truncate_rollout_schedule(batch.scheduler, stop_step_index)
     current_rollout_controller = build_controller(
         batch=batch, pipeline_config=pipeline_config
     )
-    stop_step_index = batch.rollout_stop_step_index
     if (
         stop_step_index is not None
         and len(current_rollout_controller.sigmas) != stop_step_index + 2
     ):
         raise ValueError(
-            "rollout_stop_step_index is set, but this pipeline's timestep stage "
-            "did not stop the schedule at that step"
+            "rollout_stop_step_index is set, but this loop's rollout controller "
+            "does not run on the schedule stopped at that step"
         )
     batch.rollout_controllers = {VISUAL_STREAM: current_rollout_controller}
 

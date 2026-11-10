@@ -668,8 +668,13 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             _minimax_h3_subblock_video_query_indices,
             minimax_h3_denoise_loop,
         )
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.minimax_h3_rollout import (
+            minimax_h3_rollout_sigmas,
+        )
 
         ctx = _resolve_full_loop_context(batch)
+        # a stopped rollout runs on cut grids; the step count below follows them
+        ctx.sigmas = minimax_h3_rollout_sigmas(batch, ctx.sigmas)
 
         if not (
             current_platform.is_cuda()

@@ -1226,6 +1226,11 @@ class DenoisingStage(PipelineStage):
         scheduler = batch.scheduler
         assert scheduler is not None
 
+        # Before the schedule is read: a stopped rollout cuts it here.
+        prepare_rollout_if_enabled(
+            batch=batch, pipeline_config=server_args.pipeline_config
+        )
+
         dual_transformer_mode = self._dual_transformer_execution_mode()
         uses_boundary_transformer_2 = (
             dual_transformer_mode == DualTransformerExecutionMode.BOUNDARY_EXPERTS
@@ -1256,10 +1261,6 @@ class DenoisingStage(PipelineStage):
 
         if freshly_loaded:
             register_loaded_transformer(self, server_args, pipeline)
-
-        prepare_rollout_if_enabled(
-            batch=batch, pipeline_config=server_args.pipeline_config
-        )
 
         # Prepare extra step kwargs for scheduler
         extra_step_kwargs = self.prepare_extra_func_kwargs(

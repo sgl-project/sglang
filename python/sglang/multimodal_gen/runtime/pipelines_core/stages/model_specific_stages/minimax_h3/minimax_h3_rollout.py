@@ -14,8 +14,26 @@ from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
     RolloutDitTrajectory,
     RolloutTrajectoryData,
 )
+from sglang.multimodal_gen.runtime.post_training.rollout_scheduler import (
+    truncate_rollout_sigmas,
+)
 
 _LOG_SQRT_2PI = math.log(math.sqrt(2 * math.pi))
+
+
+def minimax_h3_rollout_sigmas(
+    batch, sigmas: dict[str, list[float]]
+) -> dict[str, list[float]]:
+    """The video/audio grids the loop runs on. A rollout with
+    ``rollout_stop_step_index`` keeps steps ``0..i`` of each grid and goes
+    straight to the terminal sigma; every other request runs the full grids."""
+    stop_step_index = getattr(batch, "rollout_stop_step_index", None)
+    if not getattr(batch, "rollout", False) or stop_step_index is None:
+        return sigmas
+    return {
+        modality: truncate_rollout_sigmas(values, stop_step_index=stop_step_index)
+        for modality, values in sigmas.items()
+    }
 
 
 def _effective_sde_type(batch, loop_step_index: int) -> str:
@@ -238,5 +256,6 @@ class MiniMaxH3RolloutCollector:
 __all__ = [
     "MiniMaxH3RolloutCollector",
     "MiniMaxH3RolloutCtx",
+    "minimax_h3_rollout_sigmas",
     "minimax_h3_rollout_update_video_target",
 ]
