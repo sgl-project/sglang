@@ -290,7 +290,7 @@ class TestMambaLazyBoundaryWithoutSlot(unittest.TestCase):
         batch.token_to_kv_pool_allocator = SimpleNamespace(
             storage=storage,
             state=SimpleNamespace(
-                slots=SimpleNamespace(schedulable_available_size=lambda: int(took))
+                slots=SimpleNamespace(slots_fit=lambda count: count <= int(took))
             ),
         )
         return req, batch
@@ -347,9 +347,7 @@ class TestMambaLazyBoundaryWithoutSlot(unittest.TestCase):
                 allocator.storage.take_tracking_slot = lambda req, position: bool(
                     free_slots and free_slots.pop()
                 )
-                allocator.state.slots.schedulable_available_size = lambda: len(
-                    free_slots
-                )
+                allocator.state.slots.slots_fit = lambda count: count <= len(free_slots)
                 batch.tree_cache = SimpleNamespace(
                     page_size=TRACK_INTERVAL,
                     supports_mamba=lambda: True,
@@ -417,7 +415,7 @@ class TestTrackingSlotsAskTheWholeDemand(unittest.TestCase):
             take_tracking_slot=lambda req, pos: bool(free_slots and free_slots.pop())
         )
         state = SimpleNamespace(
-            slots=SimpleNamespace(schedulable_available_size=lambda: len(free_slots))
+            slots=SimpleNamespace(slots_fit=lambda count: count <= len(free_slots))
         )
         candidates = [(object(), i) for i in range(4)]
         taken = alloc_tracking_slots(storage, state, candidates, cache)

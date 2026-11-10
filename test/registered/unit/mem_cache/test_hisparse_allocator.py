@@ -218,7 +218,9 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
             full_available_size=MagicMock(return_value=512),
         )
         queue.token_to_kv_pool_allocator = SimpleNamespace(
-            logical_attn_allocator=logical_allocator, storage=None
+            logical_attn_allocator=logical_allocator,
+            storage=None,
+            pools_share_memory=False,
         )
         queue.scheduler = SimpleNamespace(enable_hisparse=True, last_batch=None)
         queue.retracted_queue = []
@@ -267,6 +269,7 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         allocator = SimpleNamespace(
             state=None,
             storage=None,
+            pools_share_memory=False,
             # The window pool, keeping the scheduler's window.
             window_pool_names=lambda: ("swa",),
             target_window_pool=lambda: "swa",

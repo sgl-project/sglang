@@ -11,6 +11,19 @@ from torch import nn
 from torch.nn import functional as F
 
 from sglang.multimodal_gen.configs.models.dits.sana_video2 import SanaVideo2Config
+from sglang.multimodal_gen.runtime.distributed.communication_op import (
+    sequence_model_parallel_all_reduce,
+    sequence_model_parallel_all_to_all_4D,
+)
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_sp_world_size,
+    model_parallel_is_initialized,
+)
+from sglang.multimodal_gen.runtime.distributed.sp_shard_utils import (
+    build_shard_plan,
+    gather_seq,
+    shard_like,
+)
 from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
 from sglang.multimodal_gen.runtime.models.dits.sana_wm_components import (
     CaptionEmbedder,
@@ -56,7 +69,7 @@ class GatedLinearAttention(nn.Module):
         self.output_gate = nn.Linear(dim, dim)
         self.o_norm = ChannelRMSNorm(head_dim, eps=1e-5)
 
-    def forward(self, x, rotary_emb=None):
+    def forward(self, x, rotary_emb=None, shard=None):
         batch, tokens, channels = x.shape
         q, k, v = self.qkv(x).reshape(batch, tokens, 3, channels).unbind(2)
         dtype = q.dtype
@@ -78,7 +91,17 @@ class GatedLinearAttention(nn.Module):
         k = k * beta
         if self.fp32_attention:
             q, k, v = q.float(), k.float(), v.float()
-        out = (v @ k.transpose(-1, -2)) @ q
+        if shard is None:
+            kv = v @ k.transpose(-1, -2)
+        else:
+            # the token sum is the only coupling between shards; padding can
+            # span several ranks, so count the real tokens from the rank's offset
+            real = shard.orig_len - shard.sp_rank * shard.local_len
+            real = min(max(real, 0), shard.local_len)
+            kv = sequence_model_parallel_all_reduce(
+                v[..., :real] @ k[..., :real].transpose(-1, -2)
+            )
+        out = kv @ q
         out = self.o_norm(out.to(dtype))
         out = out.reshape(batch, channels, tokens).transpose(1, 2)
         return self.proj(out * self.output_gate(x).sigmoid())
@@ -96,7 +119,7 @@ class GatedSoftmaxAttention(nn.Module):
         self.k_norm = _RMSNorm(dim, eps=1e-5) if qk_norm else nn.Identity()
         self.output_gate = nn.Linear(dim, dim)
 
-    def forward(self, x, rotary_emb=None):
+    def forward(self, x, rotary_emb=None, shard=None):
         batch, tokens, channels = x.shape
         q, k, v = self.qkv(x).reshape(batch, tokens, 3, channels).unbind(2)
         dtype = q.dtype
@@ -105,10 +128,24 @@ class GatedSoftmaxAttention(nn.Module):
         v = v.reshape(batch, tokens, self.heads, self.dim).transpose(1, 2)
         if rotary_emb is not None:
             q, k = _apply_rope(q, rotary_emb), _apply_rope(k, rotary_emb)
+        if shard is not None:
+            # local tokens of every head -> every token of the local heads
+            q, k, v = (
+                sequence_model_parallel_all_to_all_4D(
+                    tensor.transpose(1, 2), scatter_dim=2, gather_dim=1
+                ).transpose(1, 2)
+                for tensor in (q, k, v)
+            )
+            k, v = k[:, :, : shard.orig_len], v[:, :, : shard.orig_len]
         if self.fp32_attention:
             q, k, v = q.float(), k.float(), v.float()
         out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0)
-        out = out.transpose(1, 2).reshape(batch, tokens, channels).to(dtype)
+        out = out.transpose(1, 2)
+        if shard is not None:
+            out = sequence_model_parallel_all_to_all_4D(
+                out.to(dtype), scatter_dim=1, gather_dim=2
+            )
+        out = out.reshape(batch, tokens, channels).to(dtype)
         return self.proj(out * self.output_gate(x).sigmoid())
 
 
@@ -180,14 +217,14 @@ class SanaVideo2Block(nn.Module):
             self.scale_shift_table[None, None] + t.reshape(batch, groups, 6, -1)
         ).chunk(6, dim=2)
 
-    def forward_attn_sublayer(self, x, y, t, mask=None, rotary_emb=None):
+    def forward_attn_sublayer(self, x, y, t, mask=None, rotary_emb=None, shard=None):
         batch, _, channels = x.shape
         shift, scale, gate, _, _, _ = self._modulation(t, batch)
         grouped_shape = (
             (batch, -1, channels) if t.ndim == 2 else (batch, t.shape[2], -1, channels)
         )
         attn_input = self.norm1(x).reshape(grouped_shape) * (1 + scale) + shift
-        delta = self.attn(attn_input.reshape_as(x), rotary_emb)
+        delta = self.attn(attn_input.reshape_as(x), rotary_emb, shard)
         delta = (gate * delta.reshape(grouped_shape)).reshape_as(x)
         return delta + self.cross_attn(x + delta, y, mask)
 
@@ -304,12 +341,20 @@ class SanaVideo2Transformer3DModel(BaseDiT):
         else:
             timestep = timestep.float() / c.timestep_norm_scale_factor
         x = self.x_embedder(hidden_states.to(self.dtype))
+        shard = None
+        if model_parallel_is_initialized() and get_sp_world_size() > 1:
+            shard = build_shard_plan(x.shape[1])
         ropes_key = (frames, height, width, x.device)
         if ropes_key != self._ropes_key:
             self._ropes = {
                 "linear": self.rope_linear((frames, height, width), x.device),
                 "softmax": self.rope_softmax((frames, height, width), x.device),
             }
+            if shard is not None:
+                self._ropes = {
+                    kind: shard_like(rope, shard, dim=2, pad_mode="repeat_last")
+                    for kind, rope in self._ropes.items()
+                }
             self._ropes_key = ropes_key
         ropes = self._ropes
         t = self.t_embedder(timestep.flatten())
@@ -321,6 +366,19 @@ class SanaVideo2Transformer3DModel(BaseDiT):
         mask = encoder_attention_mask
         if mask is not None:
             mask = mask.reshape(batch, -1)
+        if shard is not None:
+            x = shard_like(x, shard)
+            if timestep.ndim == 3:
+                # shards cut through frames: carry the frame timestep per token
+                start = shard.sp_rank * shard.local_len
+                token_frames = (
+                    torch.arange(start, start + shard.local_len, device=x.device)
+                    // (height * width)
+                ).clamp(max=frames - 1)
+                t0, t = (
+                    t0.index_select(2, token_frames),
+                    t.index_select(2, token_frames),
+                )
         # Keep the grouped depth buffer layout stable across denoising steps.
         count = math.ceil(c.depth / c.attn_res_block_size)
         values = x.new_empty(count + 2, batch, x.shape[1], c.hidden_size)
@@ -333,7 +391,7 @@ class SanaVideo2Transformer3DModel(BaseDiT):
                 self.attn_res.attn_proj, values, keys, active_count, partial
             )
             delta = block.forward_attn_sublayer(
-                hidden, y, t0, mask, ropes[self.block_attention_types[index]]
+                hidden, y, t0, mask, ropes[self.block_attention_types[index]], shard
             )
             partial = delta if partial is None else partial + delta
             hidden = self.attn_res.attend_buffer(
@@ -350,11 +408,10 @@ class SanaVideo2Transformer3DModel(BaseDiT):
         x = self.attn_res.attend_buffer(
             self.attn_res.final_proj, values, keys, active_count, None
         )
-        return (
-            self.final_layer(x, t)
-            .transpose(1, 2)
-            .reshape(batch, c.in_channels, frames, height, width)
-        )
+        x = self.final_layer(x, t)
+        if shard is not None:
+            x = gather_seq(x, shard.orig_len)
+        return x.transpose(1, 2).reshape(batch, c.in_channels, frames, height, width)
 
 
 EntryClass = SanaVideo2Transformer3DModel
