@@ -328,8 +328,6 @@ class ModelRunner:
     """ModelRunner runs the forward passes of the models."""
 
     watermark_state: Optional[WatermarkState] = None
-    # A DFLASH draft runner's per-request KV ring (DFlashDraftKVRing), if any.
-    draft_kv_ring = None
     # Unlimited-OCR v2 only; see maybe_init_uocr_greedy_graph.
     uocr_greedy_graph: Optional[UocrGreedyGraph] = None
     canary_manager: Optional[CanaryManager] = None

@@ -731,7 +731,6 @@ class DFlashWorkerV2(BaseSpecWorker):
             req_pool_rows=req_pool_rows,
             device=self.device,
         )
-        self.draft_model_runner.draft_kv_ring = self.draft_kv_ring
         if get_parallel().tp_rank == 0:
             logger.info(
                 "DFLASH draft KV ring: %d rows per request per rank (%d positions), "
@@ -754,6 +753,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_tp_context(self.draft_parallel_layout),
         ):
             self._draft_worker.init_attention_backends()
+        if self.draft_kv_ring is not None:
+            self.draft_model_runner.attn_backend.set_draft_kv_ring(self.draft_kv_ring)
         self._need_mamba_verify_commit = mambaish_config(
             self.model_runner.model_config
         ) is not None and hasattr(

@@ -86,6 +86,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.mem_cache.kv.alloc.iteration_ids import IterationIds
     from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.speculative.dflash_draft_ring import DFlashDraftKVRing
 
 logger = logging.getLogger(__name__)
 
@@ -330,8 +331,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         self._verify_mask = None
         # Tree-mask scratch is fetched from the target backend only.
         self.is_draft_runner = model_runner.is_draft_worker
-        # The DFLASH worker attaches the draft KV ring after the backends exist.
-        self._draft_runner = model_runner if self.is_draft_runner else None
+        # A DFLASH draft's per-request KV ring; see set_draft_kv_ring.
+        self._draft_kv_ring = None
 
         # Fused KV-scatter + q-concat on the decode dense-loc path (one launch
         # instead of set_mla_kv_buffer + concat_mla_absorb_q). Disabled under
@@ -1445,6 +1446,11 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         )
         return output.flatten(1), lse
 
+    def set_draft_kv_ring(self, ring: DFlashDraftKVRing) -> None:
+        """Read a DFLASH draft's sliding-window keys from its per-request KV ring
+        instead of the request table."""
+        self._draft_kv_ring = ring
+
     def _window_sparse_indices(
         self, layer: RadixAttention, forward_batch: ForwardBatch
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1459,7 +1465,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             self._window_index_cache = (cache[0], layer.layer_id, *cache[2:])
             return cache[2], cache[3]
         parallel = get_parallel()
-        ring = self._draft_runner.draft_kv_ring if self._draft_runner else None
+        ring = self._draft_kv_ring
         indices, counts = mla_window_sparse_indices(
             req_to_token=self.req_to_token,
             req_pool_indices=forward_batch.req_pool_indices,
