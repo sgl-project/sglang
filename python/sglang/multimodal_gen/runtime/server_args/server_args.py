@@ -1794,6 +1794,7 @@ class ServerArgs(DisaggServerArgsMixin):
         Check whether the model uses classifier-free guidance by default.
 
         CFG is active when *both* ``negative_prompt is not None`` and ``guidance_scale > 1``.
+        A ``guidance_scale`` of None (resolved per request, e.g. FLUX.3) does not count.
         """
         from sglang.multimodal_gen.registry import get_model_info
 
@@ -1801,10 +1802,12 @@ class ServerArgs(DisaggServerArgsMixin):
         if model_info is None:
             return False
         default_params = model_info.sampling_param_cls()
+        guidance_scale = getattr(default_params, "guidance_scale", None)
 
         return (
             getattr(default_params, "negative_prompt", None) is not None
-            and getattr(default_params, "guidance_scale", 0) > 1.0
+            and guidance_scale is not None
+            and guidance_scale > 1.0
         )
 
     @staticmethod
