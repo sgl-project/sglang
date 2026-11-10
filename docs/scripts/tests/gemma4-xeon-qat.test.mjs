@@ -52,7 +52,37 @@ test("Xeon QAT hardware switches clear stale parser and speculative selections",
 
 test("Unvalidated Xeon QAT variants cannot generate a launch command", () => {
   const { generateCommand } = load();
-  for (const modelSize of ["31b", "26b-a4b"]) {
+  for (const modelSize of ["12b", "31b", "26b-a4b"]) {
     assert.match(generateCommand({ ...base, modelSize }), /^# Error: No validated Xeon QAT/);
   }
+});
+
+test("Gemma 4 standard 12B is selectable and emits its independently validated CPU preset", () => {
+  const { options, generateCommand } = load();
+  const values = { ...base, modelSize: "12b", checkpoint: "standard" };
+  assert.equal(options.hardware.getDynamicItems(values).find((item) => item.id === "xeon").disabled, false);
+  const command = generateCommand(values);
+  for (const flag of [
+    "--model-path google/gemma-4-12B-it",
+    "--revision 43c9d014b231474fa7212dbb48a762566c2b255d",
+    "--device cpu", "--disable-overlap-schedule", "--tp 6",
+    "--dtype bfloat16", "--max-total-tokens 8192", "--host 0.0.0.0 --port 30000",
+  ]) assert.ok(command.includes(flag), flag);
+  assert.doesNotMatch(command, /qat|--reasoning-parser|--tool-call-parser|--speculative|--mem-fraction/);
+  for (const axis of ["reasoning", "toolcall", "speculative"]) {
+    assert.equal(options[axis].condition(values), false);
+    assert.equal(options[axis].condition({ ...values, hardware: "h200" }), true);
+  }
+});
+
+test("Gemma 4 12B hardware changes reset hidden axes and reject unvalidated CPU QAT", () => {
+  let state = { ...base, hardware: "h200", modelSize: "12b" };
+  const api = load((update) => { state = update(state); });
+  api.handleRadioChange("hardware", "xeon");
+  assert.equal(state.checkpoint, "standard");
+  for (const axis of ["reasoning", "toolcall", "speculative"]) {
+    assert.equal(state[axis], "disabled");
+  }
+  api.handleRadioChange("checkpoint", "qat");
+  assert.equal(state.checkpoint, "standard");
 });
