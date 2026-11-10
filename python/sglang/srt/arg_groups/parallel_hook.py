@@ -773,6 +773,16 @@ def handle_eplb_and_dispatch(server_args: Any):
             "EPLB is enabled. The expert_distribution_recorder_mode is automatically set."
         )
 
+    if cfg.enable_eplb and cfg.expert_distribution_recorder_mode in (
+        "per_pass",
+        "per_token",
+    ):
+        raise ValueError(
+            "--enable-eplb needs --expert-distribution-recorder-mode stat or "
+            "stat_approx; the detailed recorder modes (per_pass/per_token) only "
+            f"support file dumps (got {cfg.expert_distribution_recorder_mode})."
+        )
+
     # Without an a2a backend all EP ranks run the MoE over the same tokens and
     # sum their partial outputs, so the pick has to agree across ranks.
     needs_rank_invariant_dispatch = resolved_view(server_args).moe_a2a_backend == "none"

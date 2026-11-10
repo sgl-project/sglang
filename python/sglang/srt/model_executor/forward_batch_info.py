@@ -64,7 +64,6 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.speculative.spec_info import SpecInputType
 from sglang.srt.utils import (
-    get_bool_env_var,
     is_cpu,
     is_hip,
     is_npu,
@@ -691,6 +690,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For two-batch overlap
     tbo_parent_token_range: Optional[Tuple[int, int]] = None
+    # This DP rank's first row in the parent's gathered layout; non-EP DP TBO only.
+    tbo_parent_dp_offset: Optional[int] = None
     tbo_padded_len: Optional[int] = None
     tbo_children: Optional[List[ForwardBatch]] = None
 
@@ -1587,13 +1588,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             return
 
         if not has_precomputed_mrope:
-            # Compute all requests together to avoid per-request Python loops.
-            deltas_list = [0] * batch_size
-            for i, mm in enumerate(mm_inputs):
-                deltas_list[i] = mm.mrope_position_delta.item() if mm is not None else 0
-            deltas = torch.tensor(
-                deltas_list, dtype=torch.int64, device=model_runner.device
-            )
+            # Device-resident deltas avoid a host sync that stalls overlap scheduling.
+            device = model_runner.device
+            deltas_list = [
+                (
+                    mm.get_mrope_position_delta_on_device(device)
+                    if mm is not None
+                    else torch.zeros(1, dtype=torch.int64, device=device)
+                )
+                for mm in mm_inputs
+            ]
+            deltas = deltas_list[0] if batch_size == 1 else torch.cat(deltas_list)
             positions_1d = (deltas - 1) + seq_lens_int64
             self.mrope_positions = positions_1d.unsqueeze(0).repeat(3, 1)
             return
@@ -2218,12 +2223,22 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             if logits_output.hidden_states is not None:
                 logits_output.hidden_states = logits_output.hidden_states[:bs]
         elif self.forward_mode.is_extend():
-            num_tokens = self.seq_lens_sum
+            # Drop the MLP-sync pad rows: a spec draft re-pads the hidden states to
+            # its own bucket. seq_lens_sum also counts the cached prefix.
+            num_tokens = (
+                self._original_num_tokens
+                if self._original_num_tokens is not None
+                else self.seq_lens_sum
+            )
             logits_output.next_token_logits = logits_output.next_token_logits[
                 :num_tokens
             ]
             if logits_output.hidden_states is not None:
                 logits_output.hidden_states = logits_output.hidden_states[:num_tokens]
+            if logits_output.mm_input_embeds is not None:
+                logits_output.mm_input_embeds = logits_output.mm_input_embeds[
+                    :num_tokens
+                ]
 
         # Full aux capture keeps both outputs on the same token rows.
         if (
@@ -2261,10 +2276,7 @@ def _dp_tp_moe_masks_pad_rows() -> bool:
     from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 
     return (
-        _is_hip
-        and get_bool_env_var("SGLANG_DP_MASK_PAD_ROWS", default="true")
-        and get_parallel().attn_dp_size > 1
-        and get_moe_a2a_backend().is_none()
+        _is_hip and get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none()
     )
 
 

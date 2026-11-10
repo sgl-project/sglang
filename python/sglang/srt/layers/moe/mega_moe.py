@@ -52,9 +52,8 @@ _is_hip = is_hip()
 
 
 def _use_amd_flydsl_mega_moe() -> bool:
-    # aiter MegaMoEv2 exists only on ROCm; the platform check keeps the env from
-    # diverting a CUDA run into a path whose kernels it does not have.
-    return _is_hip and envs.SGLANG_AMD_USE_FLYDSL_MEGA_MOE.get()
+    # DeepGEMM MegaMoE has no ROCm kernels: megamoe on ROCm is aiter MegaMoEv2.
+    return _is_hip and get_moe_a2a_backend().is_megamoe()
 
 
 def _mega_moe_mma_type(experts) -> str:
@@ -68,12 +67,8 @@ def _mega_moe_mma_type(experts) -> str:
     return "fp8xfp8" if experts.w13_weight.dtype == torch.float8_e4m3fn else "fp8xfp4"
 
 
-# Decode/target-verify on sm107: SMs left for the mHC stats stream beside MegaMoE.
-_MEGA_MOE_SM107_DECODE_RESERVED_SMS = 18
-
-
-@functools.cache
-def _mega_moe_max_num_sms(decode_like: bool) -> Optional[int]:
+@functools.lru_cache(maxsize=1)
+def _mega_moe_max_num_sms() -> Optional[int]:
     if _device_sm < 100:
         # The SM90 MegaMoE implementation does not use the whole-grid clustered
         # launch that needs a residency margin.
@@ -82,16 +77,13 @@ def _mega_moe_max_num_sms(decode_like: bool) -> Optional[int]:
     # Physical count, not deep_gemm.get_num_sms(): two-batch overlap and the DSA
     # indexer reconfigure that process-wide, so reserving on top would compound.
     num_sms = torch.cuda.get_device_properties(device="cuda").multi_processor_count
-    reserved_num_sms = max(
-        envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS.get(),
-        _MEGA_MOE_SM107_DECODE_RESERVED_SMS if decode_like and _device_sm == 107 else 0,
-    )
+    reserved_num_sms = max(envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS.get(), 0)
     return max(2, num_sms - reserved_num_sms)
 
 
 @contextmanager
-def _configure_mega_moe_deep_gemm_num_sms(deep_gemm, decode_like: bool = False):
-    max_num_sms = _mega_moe_max_num_sms(decode_like)
+def _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
+    max_num_sms = _mega_moe_max_num_sms()
     if max_num_sms is None:
         yield
         return
@@ -116,10 +108,12 @@ def check_mega_moe_shapes(hidden: int, intermediate: int, mma_type: str) -> None
     # SGLang's pre-dispatch requires 16-byte input SF rows (hidden % 512).
     # The pinned DeepGEMM FP8/FP4 path copies intermediate scales separately
     # from token TMA loads, so intermediate % 128 suffices, including V4.1
-    # Flash's 2304-wide intermediate dimension.
+    # Flash's 2304-wide intermediate dimension. The MXFP4 path writes and loads
+    # the intermediate SFs MN-major (token-contiguous) as well, so it needs the
+    # same 128 only.
     # Keep the existing restrictions on the other MMA paths.
     scale_group = 16 if mma_type == "nvfp4xnvfp4" else 32
-    align = 128 if mma_type in ("fp8xfp4", "fp8xfp8") else 16 * scale_group
+    align = 128 if mma_type in ("fp8xfp4", "fp8xfp8", "mxf4xmxf4") else 16 * scale_group
     hidden_align = 16 * scale_group
     if hidden % hidden_align != 0 or intermediate % align != 0:
         raise ValueError(
@@ -219,8 +213,7 @@ def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool
 def should_fuse_mega_moe_shared_experts(moe: DeepseekV2MoE) -> bool:
     # DeepGEMM's in-kernel shared expert takes FP8 weights on SM100 fp8xfp4 only.
     return (
-        envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_FUSE_SHARED_EXPERTS.get()
-        and get_moe_a2a_backend().is_megamoe()
+        get_moe_a2a_backend().is_megamoe()
         and getattr(moe.experts, "_mega_moe_weights_built", False)
         and is_sm100_supported()
         and _mega_moe_mma_type(moe.experts) == "fp8xfp4"
@@ -453,8 +446,6 @@ def _run_mega_routed(
             else float(moe.routed_scaling_factor)
         )
 
-    mode = forward_batch.forward_mode if forward_batch is not None else None
-    decode_like = mode is not None and (mode.is_decode() or mode.is_target_verify())
     return run_mega_routed_experts(
         moe.experts,
         hidden_states,
@@ -474,7 +465,6 @@ def _run_mega_routed(
         routing_in_buffer=routing is not None and routing.in_buffer,
         buf=buf,
         eplb_load_row=eplb_load_row,
-        decode_like=decode_like,
     )
 
 
@@ -519,7 +509,6 @@ def run_mega_routed_experts(
     routing_in_buffer: bool = False,
     buf: Optional[SymmBuffer] = None,
     eplb_load_row: Optional[torch.Tensor] = None,
-    decode_like: bool = False,
 ) -> torch.Tensor:
     # Rows are this rank's tokens; the returned rows are fully combined.
     import deep_gemm
@@ -671,7 +660,7 @@ def run_mega_routed_experts(
         dtype=torch.bfloat16,
         device=hidden_states.device,
     )
-    with _configure_mega_moe_deep_gemm_num_sms(deep_gemm, decode_like):
+    with _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
         deep_gemm.fp8_fp4_mega_moe(
             y,
             experts.mega_l1_weights,

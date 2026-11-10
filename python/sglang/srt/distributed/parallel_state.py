@@ -86,11 +86,6 @@ _is_cpu = is_cpu()
 _is_xpu = is_xpu()
 _is_musa = is_musa()
 _is_mlu = is_mlu()
-# Under CUDA-graph capture, stage aiter custom all-gather / reduce-scatter inputs
-# through the pre-registered IPC pool instead of registering graph-pool tensors:
-# the registered path makes peers read stale data over IPC on replay (garbage
-# rows / NaN under DP attention + TP MoE on MI355X). Set to 0 to restore it.
-_AITER_CAPTURE_COPY_IN = os.environ.get("SGLANG_AITER_CAPTURE_COPY_IN", "0") == "1"
 
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 
@@ -1217,7 +1212,10 @@ class GroupCoordinator:
             return False
         if getattr(ca_comm, "_IS_CAPTURING", False):
             if torch.cuda.is_current_stream_capturing():
-                if envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get() or _AITER_CAPTURE_COPY_IN:
+                if (
+                    envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
+                    or envs.SGLANG_AITER_CAPTURE_COPY_IN.get()
+                ):
                     ca_comm.reduce_scatter(input, output, registered=False)
                 else:
                     ca_comm.reduce_scatter(input, output, registered=True)
@@ -1334,7 +1332,7 @@ class GroupCoordinator:
                 if torch.cuda.is_current_stream_capturing():
                     if (
                         envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
-                        or _AITER_CAPTURE_COPY_IN
+                        or envs.SGLANG_AITER_CAPTURE_COPY_IN.get()
                     ):
                         ca_comm.all_gather_unreg(input, out=output, dim=0)
                     else:
@@ -3330,6 +3328,27 @@ def destroy_distributed_environment():
     _MODEL_PARALLEL_GROUP_TIMEOUT = None
     if torch.distributed.is_initialized():
         torch.distributed.destroy_process_group()
+
+
+def close_custom_all_reduce() -> None:
+    """Release ROCm carv2 multi-node workspaces while the groups still exist.
+
+    Graceful shutdown aborts the process groups instead of destroying them, and
+    carv2 frees a FABRIC workspace collectively on its group.
+    """
+    if not is_hip():
+        return
+    for name in sorted(_groups):
+        group = _groups[name]()
+        if group is None or not getattr(group.ca_comm, "_is_multinode", False):
+            continue
+        try:
+            group.ca_comm.close()
+        except Exception as e:
+            logger.warning(
+                f"Custom all-reduce close on shutdown failed, {type(e).__name__}: {e}"
+            )
+        group.ca_comm = None
 
 
 def abort_distributed_environment() -> None:

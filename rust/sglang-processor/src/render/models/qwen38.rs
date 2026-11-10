@@ -169,8 +169,10 @@ pub(super) fn template_tools(request: &Value) -> Result<Option<Vec<Value>>, Stri
         .into_iter()
         .zip(tools)
         .map(|(mut dump, tool)| {
-            let defer = tool.get("defer_loading").filter(|v| !v.is_null());
-            dump["defer_loading"] = defer.map(pydantic_bool).transpose()?.into();
+            // `Tool._serialize` drops an unset `defer_loading`, null included.
+            if let Some(defer) = tool.get("defer_loading").filter(|v| !v.is_null()) {
+                dump["defer_loading"] = pydantic_bool(defer)?.into();
+            }
             // `Tool.type` is any string, dumped as sent.
             if let Some(kind) = tool.get("type").filter(|kind| kind.is_string()) {
                 dump["type"] = kind.clone();

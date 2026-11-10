@@ -58,7 +58,6 @@ from sglang.srt.managers.scheduler_components.batch_result_processor import (
 )
 from sglang.srt.mem_cache.deepseek_v4_compress_state import (
     CompressStatePool,
-    c4_state_transfer_indices,
     request_scoped_state_transfer_indices,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
@@ -136,6 +135,40 @@ class TestBatchStagingReservations(CustomTestCase):
             prefetch.assert_called_once_with(7)
         del manager._prefetch_staging_reqs
         run(scheduler, batch)
+
+
+class TestRequestWindowRetention(CustomTestCase):
+    """DeepSeek-V4.1 encoder replay keeps SWA in per-request window rows over a
+    plain paged allocator, which keeps no window pool: the window entry's kept
+    tail still comes from the pool's window."""
+
+    def test_request_window_over_a_paged_allocator_keeps_the_window(self):
+        page_size, window = 4, 8
+        calls = []
+
+        class _Rows:
+            def page_indices(self, slot, start, end):
+                calls.append((slot, start, end))
+                return list(range(start // page_size, -(-end // page_size)))
+
+        pool = object.__new__(DeepSeekV4TokenToKVPool)
+        pool.request_window = _Rows()
+        pool.sliding_window = window
+        pool.page_size = page_size
+        allocator = SimpleNamespace(
+            storage=None,
+            state=None,
+            page_size=page_size,
+            get_kvcache=lambda: pool,
+            window_pool_names=lambda: (),
+        )
+        storage = StaticKVStorage(None, allocator)
+        self.assertEqual(storage.retained_window_lengths(), {"swa": window})
+        req = SimpleNamespace(kv=SimpleNamespace(req_pool_idx=3))
+        units = storage.resume_units("swa", req, token_start=0, token_boundary=21)
+        self.assertEqual(calls, [(3, 12, 21)])
+        self.assertEqual(units.token_start, 12)
+        self.assertEqual(units.unit_ids.tolist(), [3, 4, 5])
 
 
 class TestMixedSWAKVBlockScales(CustomTestCase):
@@ -473,6 +506,43 @@ class TestDisaggregationWire(unittest.TestCase):
         self.assertFalse(manager.state_strides_validated)
         self.assertEqual(manager.state_layout_rejections, {"decode": mismatch})
         self.assertIs(manager.decode_kv_args_table["decode"], bad)
+
+    def test_mooncake_dflash_tp_mismatch_allows_dcp_collapsed_mla_draft(self):
+        for collapsed in (False, True):
+            with self.subTest(collapsed=collapsed):
+                manager = object.__new__(MooncakeKVManager)
+                manager.kv_args = SimpleNamespace(
+                    state_types=[],
+                    num_draft_entries=0,
+                    kv_layer_ids=[],
+                    kv_item_lens=[],
+                )
+                manager.is_mla_backend = True
+                manager.is_hybrid_mla_backend = False
+                manager.pp_size = 1
+                manager.state_tp_size = 2
+                manager.attn_tp_size = 1
+                registration_info = SimpleNamespace(
+                    mooncake_session_id="decode",
+                    dst_attn_tp_size=8,
+                    dst_draft_rows_dcp_collapsed=collapsed,
+                    dst_kv_layer_ids=[],
+                    dst_kv_item_lens=[],
+                    dst_dcp_size=1,
+                    requires_dcp_relayout=False,
+                )
+                with get_context().override_server_args(
+                    enable_unified_memory=False, speculative_algorithm="DFLASH"
+                ):
+                    fully_checked, reason = manager._validate_peer_state_layout(
+                        registration_info
+                    )
+                if collapsed:
+                    self.assertTrue(fully_checked)
+                    self.assertIsNone(reason)
+                else:
+                    self.assertFalse(fully_checked)
+                    self.assertIn("same physical TP size", reason)
 
     def test_mooncake_rejects_a_decode_kv_page_stride_at_registration(self):
         """A decode KV pool with another page stride is rejected at registration.
@@ -1144,6 +1214,35 @@ class TestPollCollectives(CustomTestCase):
             result = poll_and_all_reduce([poller], object())
         self.assertEqual(result, [KVPoll.Failed])
         all_reduce.assert_not_called()
+
+
+class TestDsaIndexKTokenBytes(unittest.TestCase):
+    def test_static_dsa_pool_reports_its_key_and_scale_bytes(self):
+        from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+
+        for use_fp4_indexer, kpool, expected in (
+            (False, 1, (128, 4)),
+            (True, 1, (64, 4)),
+            (False, 4, None),
+        ):
+            with self.subTest(use_fp4_indexer=use_fp4_indexer, kpool=kpool):
+                pool = object.__new__(DSATokenToKVPool)
+                pool.start_layer = 0
+                pool.layer_num = 1
+                pool.index_head_dim = 128
+                pool.use_fp4_indexer = use_fp4_indexer
+                pool.index_bytes_per_token = DSATokenToKVPool.index_bytes_per_token_for(
+                    128, use_fp4_indexer
+                )
+                pool.index_kpool = kpool
+                pool.get_state_buf_infos = lambda: ([0x1000], [4096], [64 * 132])
+                pool.get_compress_tail_buf_infos = lambda: ([], [], [])
+
+                kv_args = KVArgs()
+                setup_state_kv_args(kv_args, _static_storage(pool))
+
+                self.assertEqual(kv_args.state_types, [StateType.DSA])
+                self.assertEqual(kv_args.dsa_index_k_token_bytes, expected)
 
 
 class TestCPReplicatedStateTransfer(unittest.TestCase):
@@ -2754,29 +2853,6 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
         self.assertTrue(future_map.need_topk)
         self.assertEqual(future_map.topk_p_buf.shape, (4, 3))
         self.assertEqual(future_map.topk_index_buf.shape, (4, 3))
-
-
-class TestDSV4C4StateIndices(unittest.TestCase):
-    def test_non_mtp_to_mtp_maps_the_same_logical_positions(self):
-        # seq_len=13 keeps logical positions [8, 13) for the overlap C4 state.
-        src = c4_state_transfer_indices(2, 13, ring_size=8)
-        dst = c4_state_transfer_indices(2, 13, ring_size=16)
-
-        np.testing.assert_array_equal(src, np.array([16, 17, 18, 19, 20]))
-        np.testing.assert_array_equal(dst, np.array([40, 41, 42, 43, 44]))
-        self.assertEqual(src.size, dst.size)
-
-    def test_ring_wrap_preserves_position_order(self):
-        np.testing.assert_array_equal(
-            c4_state_transfer_indices(0, 10, ring_size=8),
-            np.array([4, 5, 6, 7, 0, 1], dtype=np.int32),
-        )
-
-    def test_invalid_ring_size_is_rejected(self):
-        with self.assertRaises(ValueError):
-            c4_state_transfer_indices(0, 8, ring_size=4)
-        with self.assertRaises(ValueError):
-            c4_state_transfer_indices(0, 8, ring_size=10)
 
 
 class TestDSV4C128StateIndices(unittest.TestCase):
