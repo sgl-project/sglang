@@ -10,21 +10,53 @@ use sglang_api_types::api::v1 as api;
 /// file against Python's `RequestLogger`.
 const FIXTURE: &str = include_str!("../../../../testdata/request_log.json");
 
-fn config(settings: &Value) -> RequestLogConfig {
+/// The settings Python hands over in `format` at `level`.
+fn config_in(fixture: &Value, format: &str, level: &str) -> RequestLogConfig {
+    let settings = &fixture["levels"][format][level];
     let strings = |key: &str| -> Vec<String> {
         serde_json::from_value(settings[key].clone()).expect("a string list")
+    };
+    let openai_requests = settings["openai_requests"].as_bool().unwrap();
+    let openai_fields = |key: &str| match openai_requests {
+        true => serde_json::from_value(fixture["openai_fields"][key].clone()).unwrap(),
+        false => Vec::new(),
     };
     RequestLogConfig {
         max_length: settings["max_length"].as_u64().unwrap() as usize,
         skip_names: strings("skip_names"),
         out_skip_names: strings("out_skip_names"),
+        json: settings["json"].as_bool().unwrap(),
         class_name: settings["class_name"].as_str().unwrap().into(),
         fields: serde_json::from_value(settings["fields"].clone()).unwrap(),
         batch_item_fields: strings("batch_item_fields"),
         batch_shared_fields: strings("batch_shared_fields"),
         headers: strings("headers"),
         exceeded_ms: settings["exceeded_ms"].as_i64().unwrap(),
+        openai_requests,
+        chat_completion_fields: openai_fields("chat_completion_fields"),
+        completion_fields: openai_fields("completion_fields"),
+        stdout: true,
+        files: Vec::new(),
     }
+}
+
+fn config(fixture: &Value, level: &str) -> RequestLogConfig {
+    config_in(fixture, "text", level)
+}
+
+/// `line` with its JSON `timestamp` (the time it was logged) replaced by the
+/// fixture's.
+fn at_fixture_time(line: &str, fixture: &Value) -> String {
+    const KEY: &str = "{\"timestamp\": \"";
+    let Some(rest) = line.strip_prefix(KEY) else {
+        return line.to_owned();
+    };
+    let end = rest.find('"').expect("a closed timestamp");
+    format!(
+        "{KEY}{}{}",
+        fixture["timestamp"].as_str().unwrap(),
+        &rest[end..]
+    )
 }
 
 fn header_map(headers: &Value) -> http::HeaderMap {
@@ -51,48 +83,115 @@ fn receive_body(
 }
 
 /// Every fixture case renders exactly Python's `Receive` and `Finish` lines at
-/// every level it lists.
+/// every level it lists, in both formats; and every OpenAI case Python's
+/// `Receive OpenAI` line.
 #[test]
 fn lines_match_python_request_logger() {
     let fixture: Value = serde_json::from_str(FIXTURE).unwrap();
     let mut checked = 0;
     for case in fixture["cases"].as_array().unwrap() {
         let name = case["name"].as_str().unwrap();
-        for (level, expected) in case["expected"].as_object().unwrap() {
-            let log = RequestLog::for_test(Some(config(&fixture["levels"][level])), false);
-            let records = receive_body(&log, &case["body"], &header_map(&case["headers"]));
-            let item = case["batch_item"].as_u64().unwrap_or(0) as usize;
-            let record = &records[item];
-            let out = match case.get("core_output") {
-                // The Rust server's own frame of that output.
-                Some(output) => python_out(
-                    core_output(output),
-                    &record.rid,
-                    output["e2e_latency"].as_f64().unwrap(),
-                ),
-                None => case["out"].as_object().unwrap().clone(),
-            };
-            assert_eq!(Value::Object(out.clone()), case["out"], "{name}: out");
-            log.logger
-                .as_ref()
-                .unwrap()
-                .finished(&record.obj, &record.headers, &out, 1.0);
-            let lines = log.logged_lines();
-            // A batch's `Receive` is best effort and not compared.
-            if !expected["receive"].is_null() {
+        for (format, expected) in case["expected"].as_object().unwrap() {
+            for (level, expected) in expected.as_object().unwrap() {
+                let log = RequestLog::for_test(Some(config_in(&fixture, format, level)), false);
+                let records = receive_body(&log, &case["body"], &header_map(&case["headers"]));
+                let item = case["batch_item"].as_u64().unwrap_or(0) as usize;
+                let record = &records[item];
+                let out = match case.get("core_output") {
+                    // The Rust server's own frame of that output.
+                    Some(output) => python_out(
+                        core_output(output),
+                        &record.rid,
+                        output["e2e_latency"].as_f64().unwrap(),
+                    ),
+                    None => case["out"].as_object().unwrap().clone(),
+                };
+                assert_eq!(Value::Object(out.clone()), case["out"], "{name}: out");
+                log.logger
+                    .as_ref()
+                    .unwrap()
+                    .finished(&record.obj, &record.headers, &out, 1.0);
+                let lines: Vec<String> = log
+                    .logged_lines()
+                    .iter()
+                    .map(|line| at_fixture_time(line, &fixture))
+                    .collect();
+                // A batch's `Receive` is best effort and not compared.
+                if !expected["receive"].is_null() {
+                    assert_eq!(
+                        lines[0], expected["receive"],
+                        "{name} at {format} level {level}: Receive"
+                    );
+                }
                 assert_eq!(
-                    lines[0], expected["receive"],
-                    "{name} at level {level}: Receive"
+                    lines[1], expected["finish"],
+                    "{name} at {format} level {level}: Finish"
                 );
+                checked += 1;
             }
-            assert_eq!(
-                lines[1], expected["finish"],
-                "{name} at level {level}: Finish"
-            );
-            checked += 1;
         }
     }
-    assert!(checked >= 21, "the fixture lost cases: {checked}");
+    assert!(checked >= 42, "the fixture lost cases: {checked}");
+
+    let mut checked = 0;
+    for case in fixture["openai_cases"].as_array().unwrap() {
+        let name = case["name"].as_str().unwrap();
+        let request = match case["request"].as_str().unwrap() {
+            "chat" => OpenAiRequest::ChatCompletion,
+            _ => OpenAiRequest::Completion,
+        };
+        let body = serde_json::to_vec(&case["body"]).unwrap();
+        for (format, expected) in case["expected"].as_object().unwrap() {
+            for (level, expected) in expected.as_object().unwrap() {
+                let log = RequestLog::for_test(Some(config_in(&fixture, format, level)), false);
+                log.openai_received(request, &body, &header_map(&case["headers"]));
+                let lines = log.logged_lines();
+                assert_eq!(
+                    at_fixture_time(&lines[0], &fixture),
+                    *expected,
+                    "{name} at {format} level {level}"
+                );
+                checked += 1;
+            }
+        }
+        // Not logged below level 2.
+        let log = RequestLog::for_test(Some(config(&fixture, "1")), false);
+        log.openai_received(request, &body, &header_map(&case["headers"]));
+        assert!(log.logged_lines().is_empty(), "{name} at level 1");
+    }
+    assert!(checked >= 8, "the fixture lost OpenAI cases: {checked}");
+}
+
+/// A chat request's media content parts give its `Receive OpenAI` line
+/// Python's `multimodal` summary, in both formats.
+#[test]
+fn openai_multimodal_summary_matches_python() {
+    let fixture: Value = serde_json::from_str(FIXTURE).unwrap();
+    let cases = fixture["openai_multimodal_cases"].as_array().unwrap();
+    assert!(cases.len() >= 2, "the fixture lost OpenAI media cases");
+    for case in cases {
+        let name = case["name"].as_str().unwrap();
+        let body = serde_json::to_vec(&case["body"]).unwrap();
+        for (format, expected) in case["expected"].as_object().unwrap() {
+            let log = RequestLog::for_test(Some(config_in(&fixture, format, "2")), false);
+            log.openai_received(
+                OpenAiRequest::ChatCompletion,
+                &body,
+                &http::HeaderMap::new(),
+            );
+            let lines = log.logged_lines();
+            if format == "json" {
+                let line: Value = serde_json::from_str(&lines[0]).unwrap();
+                let summary = line.get("multimodal").cloned().unwrap_or(Value::Null);
+                assert_eq!(summary, *expected, "{name} at json");
+            } else {
+                let segment = lines[0]
+                    .find(", multimodal=")
+                    .map_or("", |start| &lines[0][start..]);
+                assert_eq!(segment, expected.as_str().unwrap(), "{name} at text");
+            }
+        }
+    }
 }
 
 fn core_output(output: &Value) -> CoreOutput {
@@ -146,7 +245,7 @@ fn chunk(rid: &Rid, text: &str, ids: &[i64], finish: Option<FinishReason>) -> Ch
 }
 
 fn level1(fixture: &Value) -> RequestLogConfig {
-    config(&fixture["levels"]["1"])
+    config(fixture, "1")
 }
 
 /// The record follows the call: `Finish` (abort included) and the crash-dump
@@ -196,10 +295,9 @@ fn terminal_output_logs_finish_and_keeps_the_request() {
 fn incremental_stream_logs_last_delta() {
     let fixture: Value = serde_json::from_str(FIXTURE).unwrap();
     let log = Arc::new(RequestLog {
-        logger: Some(RequestLogger::new(
-            config(&fixture["levels"]["3"]),
-            LogSink::Memory(Mutex::default()),
-        )),
+        logger: Some(
+            RequestLogger::new(config(&fixture, "3"), LogSink::Memory(Mutex::default())).unwrap(),
+        ),
         recorder: None,
         server_added_custom_params: Vec::new(),
         default_priority: None,
@@ -550,10 +648,22 @@ fn built_request_keeps_its_media() {
         rid: Rid::from_client("with-media"),
         text: Some("look".into()),
         mm: Some(Box::new(MmData {
-            image_data: vec![MmItem::Source("data:image/png;base64,AAAA".into())],
+            image_data: vec![
+                MmItem::Source("data:image/png;base64,AAAA".into()),
+                MmItem::Ref {
+                    url: "file:///i.png".into(),
+                    hints: MediaHints {
+                        detail: Some("low".into()),
+                        ..Default::default()
+                    },
+                },
+            ],
             video_data: vec![MmItem::Ref {
                 url: "file:///v.mp4".into(),
-                hints: MediaHints { fps: Some(2.0) },
+                hints: MediaHints {
+                    fps: Some(2.0),
+                    ..Default::default()
+                },
             }],
             ..Default::default()
         })),
@@ -566,11 +676,121 @@ fn built_request_keeps_its_media() {
     let body = &snapshot["bodies"][snapshot["unfinished"][0]["body"].to_string()];
     assert_eq!(
         body["image_data"],
-        serde_json::json!(["data:image/png;base64,AAAA"])
+        serde_json::json!([
+            "data:image/png;base64,AAAA",
+            {"url": "file:///i.png", "detail": "low"}
+        ])
     );
     assert_eq!(
         body["video_data"],
         serde_json::json!([{"url": "file:///v.mp4", "fps": 2.0}])
     );
     assert_eq!(body["audio_data"], Value::Null);
+}
+
+/// A target directory's file, written through the process writer, rolls over
+/// as `TimedRotatingFileHandler(when="H")` rolls it: an hour after it was
+/// opened (not on the hour), renamed after the hour that started, then an hour
+/// after the rollover.
+#[test]
+fn log_file_rotates_hourly() {
+    let dir = std::env::temp_dir().join(format!("request-log-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&dir).unwrap();
+    let path = dir.join("host_3.log");
+    let fixture: Value = serde_json::from_str(FIXTURE).unwrap();
+    let targets = Arc::new(
+        Targets::open(&RequestLogConfig {
+            stdout: false,
+            files: vec![path.to_string_lossy().into_owned()],
+            ..level1(&fixture)
+        })
+        .unwrap(),
+    );
+    LogSink::Targets(targets.clone()).emit("through the writer");
+    flush_request_log();
+    let written = std::fs::read_to_string(&path).unwrap();
+    assert!(written.ends_with("] through the writer\n"), "{written}");
+
+    let mut files = lock(&targets.files);
+    let file = &mut files[0];
+    let opened = file.rollover_at - ROTATE_INTERVAL;
+    let later = opened + ROTATE_INTERVAL * 2 + Duration::from_secs(1);
+    file.write_line(b"next hour\n", later).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "next hour\n");
+    let started: chrono::DateTime<chrono::Local> = opened.into();
+    let rotated = format!("{}{}", path.display(), started.format(".%Y-%m-%d_%H"));
+    assert_eq!(std::fs::read_to_string(rotated).unwrap(), written);
+    assert_eq!(file.rollover_at, later + ROTATE_INTERVAL);
+    drop(files);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// A rollover names the file across a DST change as Python does, never
+/// replaces an archive (Python takes a taken name as already rolled over and
+/// keeps writing), outlives a log file deleted under it, and reads times in
+/// whole seconds as Python does.
+#[test]
+fn rollover_keeps_archives_and_survives_a_deleted_file() {
+    let dir = std::env::temp_dir().join(format!("request-log-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&dir).unwrap();
+    let path = dir.join("host_0.log");
+    let read = |suffix: &str| std::fs::read_to_string(format!("{}{suffix}", path.display()));
+    // America/Los_Angeles, whose DST ends at 09:00 UTC on 2026-11-01.
+    let dst_end = UNIX_EPOCH + Duration::from_secs(1_793_523_600);
+    let la = |at: SystemTime| {
+        let hours = if at < dst_end { 7 } else { 8 };
+        chrono::FixedOffset::west_opt(hours * 3600).unwrap()
+    };
+    let utc = |minutes: u64| dst_end + Duration::from_secs(minutes * 60);
+    let mut file = RotatingFile::open(path.clone(), SystemTime::now()).unwrap();
+    let roll = |file: &mut RotatingFile, minutes, line: &[u8]| {
+        file.rollover_at = utc(minutes);
+        file.roll_over(utc(minutes), la).unwrap();
+        file.write_line(line, utc(minutes)).unwrap();
+    };
+    file.write_line(b"01:30 PDT\n", SystemTime::now()).unwrap();
+    // 01:30 PDT to 01:30 PST: named after 00:30 PDT, as Python shifts it.
+    roll(&mut file, 30, b"01:30 PST\n");
+    assert_eq!(read(".2026-11-01_00").unwrap(), "01:30 PDT\n");
+    // So the repeated hour gets its own name.
+    roll(&mut file, 90, b"02:30 PST\n");
+    assert_eq!(read(".2026-11-01_01").unwrap(), "01:30 PST\n");
+    // A taken name is left alone; the file keeps its lines.
+    std::fs::write(format!("{}.2026-11-01_02", path.display()), "kept\n").unwrap();
+    roll(&mut file, 150, b"03:30 PST\n");
+    assert_eq!(read(".2026-11-01_02").unwrap(), "kept\n");
+    assert_eq!(read("").unwrap(), "02:30 PST\n03:30 PST\n");
+    // A deleted file is not renamed and is created again.
+    std::fs::remove_file(&path).unwrap();
+    roll(&mut file, 210, b"04:30 PST\n");
+    assert_eq!(read("").unwrap(), "04:30 PST\n");
+    assert!(read(".2026-11-01_03").is_err());
+
+    // Australia/Lord_Howe, whose DST ends by half an hour at 15:00 UTC on
+    // 2026-04-04: Python still shifts by a whole hour.
+    let path = dir.join("host_1.log");
+    let mut file = RotatingFile::open(path.clone(), SystemTime::now()).unwrap();
+    let dst_end = UNIX_EPOCH + Duration::from_secs(1_775_314_800);
+    let lord_howe = |at: SystemTime| {
+        let minutes = if at < dst_end { 11 * 60 } else { 10 * 60 + 30 };
+        chrono::FixedOffset::east_opt(minutes * 60).unwrap()
+    };
+    // 01:45 to 02:15 (+10:30), named after 00:45 (+11).
+    file.rollover_at = dst_end + Duration::from_secs(45 * 60);
+    file.roll_over(file.rollover_at, lord_howe).unwrap();
+    assert!(std::fs::exists(format!("{}.2026-04-05_00", path.display())).unwrap());
+
+    // Python reads the file time and the clock in whole seconds.
+    let path = dir.join("host_2.log");
+    let created = std::fs::File::create(&path).unwrap();
+    created
+        .set_modified(dst_end + Duration::from_millis(900))
+        .unwrap();
+    let mut file = RotatingFile::open(path, SystemTime::now()).unwrap();
+    assert_eq!(file.rollover_at, dst_end + ROTATE_INTERVAL);
+    let later = dst_end + ROTATE_INTERVAL * 2;
+    file.write_line(b"x\n", later + Duration::from_millis(100))
+        .unwrap();
+    assert_eq!(file.rollover_at, later + ROTATE_INTERVAL);
+    std::fs::remove_dir_all(dir).unwrap();
 }

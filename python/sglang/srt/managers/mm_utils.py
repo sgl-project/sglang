@@ -1483,6 +1483,36 @@ def _model_specific_shm_values(item):
             yield key, value
 
 
+def _compact_inline_tensors(value, memo=None):
+    """Keep pickle from serializing a CPU view's entire backing storage.
+
+    Per-image slices can share the storage of a whole image batch. PyTorch's
+    pickle reducer serializes that storage for each distinct Tensor, even when
+    the slice is contiguous. Only compact oversized CPU storage at the inline
+    transport boundary; SHM and GPU transport features need no such copy.
+    """
+    if memo is None:
+        memo = {}
+    if isinstance(value, torch.Tensor):
+        if (
+            value.is_cpu
+            and value.layout == torch.strided
+            and value.untyped_storage().nbytes() > value.numel() * value.element_size()
+        ):
+            key = id(value)
+            if key not in memo:
+                memo[key] = value.clone(memory_format=torch.contiguous_format)
+            return memo[key]
+        return value
+    if isinstance(value, list):
+        return [_compact_inline_tensors(item, memo) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_compact_inline_tensors(item, memo) for item in value)
+    if isinstance(value, dict):
+        return {key: _compact_inline_tensors(item, memo) for key, item in value.items()}
+    return value
+
+
 def _wrap_shm_or_inline(tensor: torch.Tensor, precomputed_hash: Optional[int] = None):
     """Wrap a tensor in ShmPointerMMData, falling back to inline (pickled)
     transport when shared memory cannot be allocated, e.g. /dev/shm is full
@@ -1495,7 +1525,7 @@ def _wrap_shm_or_inline(tensor: torch.Tensor, precomputed_hash: Optional[int] = 
             f"({e}); falling back to inline transport. "
             f"Consider increasing /dev/shm size."
         )
-        return tensor
+        return _compact_inline_tensors(tensor)
 
 
 def _wrap_tensor_or_list(value, precomputed_hash: Optional[int] = None):
@@ -1574,28 +1604,42 @@ def _wrap_model_specific_data(item) -> None:
 
 def wrap_shm_features(obj):
     """
-    Scan the object for multimodal tensors and wrap them in SHM pointers.
+    Wrap multimodal features in SHM pointers, or compact inline CPU storage.
     """
-    if _get_is_default_transport() or get_serving().skip_tokenizer_init:
-        return obj
+    use_shm = not (_get_is_default_transport() or get_serving().skip_tokenizer_init)
 
     if obj.mm_inputs:
+        inline_memo = {}
         wrap_model_data = (
-            obj.mm_inputs.shm_model_specific_data
+            use_shm
+            and obj.mm_inputs.shm_model_specific_data
             and envs.SGLANG_ENABLE_UOCR_SHM_WRAP_MODEL_DATA.get()
         )
         for item in obj.mm_inputs.mm_items:
             item_hash = item.hash
             if item.feature is not None:
-                item.feature = _wrap_tensor_or_list(
-                    item.feature, precomputed_hash=item_hash
+                item.feature = (
+                    _wrap_tensor_or_list(item.feature, precomputed_hash=item_hash)
+                    if use_shm
+                    else _compact_inline_tensors(item.feature, inline_memo)
                 )
             if item.precomputed_embeddings is not None:
-                item.precomputed_embeddings = _wrap_tensor_or_list(
-                    item.precomputed_embeddings, precomputed_hash=item_hash
+                item.precomputed_embeddings = (
+                    _wrap_tensor_or_list(
+                        item.precomputed_embeddings, precomputed_hash=item_hash
+                    )
+                    if use_shm
+                    else _compact_inline_tensors(
+                        item.precomputed_embeddings, inline_memo
+                    )
                 )
             if wrap_model_data:
                 _wrap_model_specific_data(item)
+            # Compact remaining inline tensors after the optional SHM wrapping.
+            # SHM pointers and shape-only placeholder crops stay unchanged.
+            item.model_specific_data = _compact_inline_tensors(
+                item.model_specific_data, inline_memo
+            )
     return obj
 
 

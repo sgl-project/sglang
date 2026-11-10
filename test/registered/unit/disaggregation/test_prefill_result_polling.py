@@ -31,6 +31,7 @@ from sglang.srt.managers.scheduler import Scheduler, _dispatch_event_loop_once
 from sglang.srt.managers.scheduler_components.deferred_responses import (
     DeferredResponses,
 )
+from sglang.srt.managers.scheduler_components.pause_state import PauseState
 from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     KeyedReqList,
@@ -135,7 +136,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
     launch_batch_sample_if_needed = Scheduler.launch_batch_sample_if_needed
     _copy_result_to_cpu = Scheduler._copy_result_to_cpu
     pause_generation = Scheduler.pause_generation
-    _retract_running_batch = Scheduler._retract_running_batch
+    _retract_batches = Scheduler._retract_batches
     _publish_paused_state = Scheduler._publish_paused_state
     continue_generation = Scheduler.continue_generation
     increment_scheduler_iterations = Scheduler.increment_scheduler_iterations
@@ -157,7 +158,6 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self.ready_at = ready_at
         self.ready_batches = deque()
         self.request_receiver = SimpleNamespace(recv_requests=self.recv_requests)
-        self._deferred_input_requests = []
         self._incoming_requests = []
         self.pause_at = pause_at
         self.resume_at = resume_at
@@ -187,6 +187,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         )
         self.chunked_req = None
         self.decode_offload_manager = None
+        self.hisparse_coordinator = None
         self.running_batch = ScheduleBatch(reqs=[])
         self.running_reqs = KeyedReqList(ListKind.DECODING)
         self.prefill_launched_reqs = KeyedReqList(ListKind.PREFILL_LAUNCHED)
@@ -194,9 +195,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self.uocr_runtime = None
         self.waiting_queue = IndexedReqList(ListKind.WAITING)
         self.cur_batch_for_debug = None
-        self._engine_paused = False
-        self._pause_started_at = None
-        self._pause_intervals = deque()
+        self.pause_state = PauseState()
         self.gracefully_exit = False
         self.enable_staging = False
         self.enable_hierarchical_cache = False
@@ -462,7 +461,7 @@ def _rank_consensus_worker(rank, rendezvous):
                 assert [a[2] for a in scheduler.actions if a[1] == "result"] == list(
                     names
                 )
-                assert not scheduler._deferred_input_requests
+                assert not scheduler.pause_state.holds_inputs()
                 for name, event in scheduler.copy_events.items():
                     assert event.synchronizations == 1
                     assert event.blocking_synchronizations == int(
@@ -637,7 +636,7 @@ class TestPrefillResultPolling(CustomTestCase):
                     flush_pending_backups=Mock(),
                     storage_prefetch_retries=retries,
                     supports_fast_match_prefix=lambda: True,
-                    swa_reprefill_tail_tokens=lambda req=None: 0,
+                    window_reprefill_tail_tokens=lambda req=None: 0,
                     match_prefix=match_prefix,
                 )
                 scheduler.policy = SchedulePolicy(
@@ -1277,7 +1276,6 @@ class TestPrefillResultPolling(CustomTestCase):
                     resume_at=pause_at + 2,
                     pause_mode="retract",
                 )
-                scheduler.disagg_prefill_pending_chunk_rids = set()
                 scheduler.processed_tokens_counter = 0
                 scheduler.metrics_reporter.enable_metrics = False
                 release_steps = []
