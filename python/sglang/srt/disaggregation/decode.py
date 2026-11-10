@@ -184,6 +184,8 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.kv.storage import KVStorage
 
 CLIP_MAX_NEW_TOKEN = envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.get()
+MAX_PREALLOC_BYPASSES = 4
+MAX_PREALLOC_BACKFILL_SKIP = 8
 
 
 @dataclass
@@ -441,6 +443,8 @@ class DecodeRequest:
     hicache_restore_lock: Optional[TreeLock] = None
     hicache_load_consumer_index: int = -1
     hicache_restore_status: HiCacheRestoreResult = HiCacheRestoreResult.PENDING
+    # Charge only a later request that actually acquires a KV reservation.
+    prealloc_bypass_count: int = 0
 
 
 class _PendingPublish(msgspec.Struct, frozen=True):
@@ -529,6 +533,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.pp_rank = parallel.pp_rank
         self.pp_size = parallel.pp_size
         self.num_reserved_decode_tokens = num_reserved_decode_tokens
+        self.enable_prealloc_backfill = (
+            envs.SGLANG_ENABLE_DECODE_PREALLOC_BACKFILL.get()
+        )
         self.transfer_backend = transfer_backend
         # Queue for requests pending pre-allocation
         self.queue = IndexedReqList(
@@ -1636,7 +1643,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         pp_good_rids: Optional[List[str]] = None,
         pp_bad_rids: Optional[List[str]] = None,
     ) -> Tuple[List[DecodeRequest], List[DecodeRequest]]:
-        """Pop the preallocated requests from the pending queue (FIFO)."""
+        """Reserve in FIFO order, with optional bounded backfill around KV stalls."""
         is_pp_mode = self.pp_size > 1
         if is_pp_mode and (pp_good_rids is None or pp_bad_rids is None):
             raise ValueError("PP consensus is required when pp_size > 1")
@@ -1681,6 +1688,21 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
         reserved_restore_tokens = self._hicache_pending_restore_tokens()
         full_allocatable_tokens -= reserved_restore_tokens
+        # Keep priority, pipeline and specialized-pool ordering unchanged.
+        # All candidates still pass the native reservation and slot checks.
+        allow_backfill = (
+            getattr(self, "enable_prealloc_backfill", False)
+            and not is_pp_mode
+            and not self.scheduler.enable_priority_scheduling
+            and not self.scheduler.enable_hisparse
+            and not self.scheduler.enable_lora
+            and not self.scheduler.enable_decode_hicache
+            and not self.transfer_queue.enable_staging
+            and swa_allocatable_tokens is None
+            and not self.req_to_token_pool.holds_state_slots
+            and get_disagg().disaggregation_decode_host_receive_threshold >= 1
+        )
+        blocked_reqs: List[DecodeRequest] = []
         # Sort by priority before any index-based bookkeeping so that both the
         # abort-scan loop and the preallocation loop operate on the same order.
         queue = list(self.queue.items())
@@ -1890,6 +1912,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 if prefix_match is not None and prefix_match.l1_prefix_len > 0:
                     self.tree_cache.unlock(decode_req.req.lock)
                     decode_req.req.lock = None
+                if (
+                    allow_backfill
+                    and len(blocked_reqs) < MAX_PREALLOC_BACKFILL_SKIP
+                    and decode_req.prealloc_bypass_count < MAX_PREALLOC_BYPASSES
+                ):
+                    blocked_reqs.append(decode_req)
+                    continue
                 break
 
             if window_allocatable_tokens is not None:
@@ -2010,6 +2039,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             indices_to_remove.add(i)
             if self.scheduler.enable_lora:
                 running_loras.add(decode_req.req.lora_id)
+            # An unsuccessful scan must not spend a blocked request's budget:
+            # later requests may only arrive after many empty scheduler ticks.
+            for blocked in blocked_reqs:
+                blocked.prealloc_bypass_count += 1
+            if any(
+                blocked.prealloc_bypass_count >= MAX_PREALLOC_BYPASSES
+                for blocked in blocked_reqs
+            ):
+                break
 
         if failed_reqs:
             failed_ids = {id(r) for r in failed_reqs}

@@ -806,6 +806,9 @@ class Envs:
     SGLANG_DISAGGREGATION_ZMQ_SEND_TIMEOUT = EnvInt(1)
     SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL = EnvFloat(5.0)
     SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE = EnvInt(2)
+    # Bound overtaking of a KV-blocked decode preallocation by successful
+    # admissions. Opt-in; unsupported queue modes retain FIFO.
+    SGLANG_ENABLE_DECODE_PREALLOC_BACKFILL = EnvBool(False)
     SGLANG_DISAGGREGATION_WAITING_TIMEOUT = EnvInt(300)
     # Seconds a unified-memory page move waits for network transfers before it
     # fails; unset: past the bootstrap, waiting and deferred-release timeouts.

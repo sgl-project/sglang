@@ -28,10 +28,13 @@ from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     ListKind,
 )
-from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.mem_cache.base_prefix_cache import InsertParams
+from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
+from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.scheduler_test_utils import FakeReq, decode_queue
+from sglang.test.separate_buffer_allocator_double import bind_separate_buffer_capacity
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=13, suite="base-a-test-cpu")
@@ -43,6 +46,208 @@ def _run_as_single_rank(test: unittest.TestCase) -> None:
     world_size = patch("torch.distributed.get_world_size", return_value=1)
     world_size.start()
     test.addCleanup(world_size.stop)
+
+
+class TestDecodePreallocBackfill(CustomTestCase):
+    def setUp(self):
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="scheduler")
+
+    def make_request(self, rid, tokens):
+        receiver = SimpleNamespace(destinations=None)
+
+        def send_metadata(pages, metadata_index, state_indices, **kwargs):
+            receiver.destinations = pages.tolist()
+
+        receiver.send_metadata = send_metadata
+        req = FakeReq(
+            rid=rid,
+            priority=0,
+            origin_input_ids=[0] * tokens,
+            output_ids=[],
+            finished_reason=None,
+            sampling_params=SimpleNamespace(max_new_tokens=1),
+            kv=ReqKvInfo(req_pool_idx=0, cache_protected_len=0),
+            time_stats=MagicMock(),
+        )
+        return DecodeRequest(req, receiver, waiting_for_input=True)
+
+    def make_queue(self, requests, free=5):
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.pp_size = 1
+        queue.enable_prealloc_backfill = True
+        queue.queue = decode_queue(ListKind.PD_PREALLOC, requests)
+        queue.pending_reqs = []
+        queue.retracted_queue = []
+        queue.num_reserved_decode_tokens = 1
+        queue._num_published_destinations = 0
+        # Transport handshakes are already complete; no RPC in this CPU case.
+        queue._resolve_pending_reqs = MagicMock()
+        queue._update_handshake_waiters = MagicMock()
+        queue.transfer_queue = SimpleNamespace(
+            queue=decode_queue(ListKind.PD_RECEIVING), enable_staging=False
+        )
+        queue.kv_manager = SimpleNamespace(kv_args=SimpleNamespace(state_types=[]))
+        queue.tree_cache = MagicMock()
+        queue.token_to_kv_pool = SimpleNamespace(
+            layer_router=SimpleNamespace(sub_pool=lambda kind: None)
+        )
+        pool = SimpleNamespace(free=free, allocations=[])
+        allocator = MagicMock(page_size=1)
+        bind_separate_buffer_capacity(allocator)
+        allocator.available_size.side_effect = lambda: pool.free
+        allocator.translate_kv_indices_for_transfer.side_effect = lambda x: x
+        queue.token_to_kv_pool_allocator = allocator
+        queue.req_to_token_pool = SimpleNamespace(
+            available_size=lambda: 32,
+            mamba_allocator=None,
+            holds_state_slots=False,
+            req_to_token=torch.arange(32 * 128).reshape(32, 128),
+        )
+        metadata_slots = iter(range(32))
+        queue.req_to_metadata_buffer_idx_allocator = SimpleNamespace(
+            available_size=lambda: 32, alloc=lambda: next(metadata_slots)
+        )
+        queue.scheduler = SimpleNamespace(
+            enable_priority_scheduling=False,
+            schedule_low_priority_values_first=False,
+            enable_hisparse=False,
+            enable_lora=False,
+            enable_overlap=False,
+            enable_decode_hicache=False,
+            running_batch=SimpleNamespace(reqs=[]),
+            waiting_queue=[],
+            last_batch=None,
+        )
+
+        def allocate(req, prefix_indices, prefix_len, total_prefix_len):
+            count = len(req.origin_input_ids) - prefix_len
+            self.assertLessEqual(count, pool.free)
+            req.kv.req_pool_idx = len(pool.allocations)
+            pool.allocations.append(req.rid)
+            pool.free -= count
+            return torch.arange(count)
+
+        # Substitute device allocation, retaining the real reservation math.
+        queue._pre_alloc = allocate
+        return queue, pool
+
+    def test_idle_scans_do_not_exhaust_later_request_backfill(self):
+        """A KV-blocked head must not strand a fitting arrival after idle polls."""
+        head = self.make_request("head", 8)
+        queue, pool = self.make_queue([head])
+        for _ in range(10):
+            self.assertEqual(queue.pop_preallocated(), ([], []))
+        self.assertEqual(getattr(head, "prealloc_bypass_count", 0), 0)
+
+        small = self.make_request("small", 2)
+        queue.queue.join([small])
+        admitted, failed = queue.pop_preallocated()
+        self.assertEqual(admitted, [small])
+        self.assertEqual(failed, [])
+        self.assertEqual(list(queue.queue.items()), [head])
+        self.assertEqual(pool.allocations, ["small"])
+        self.assertEqual(small.kv_receiver.destinations, [0, 1])
+        self.assertEqual(head.prealloc_bypass_count, 1)
+
+    def test_successful_overtakes_are_bounded_across_scans(self):
+        head = self.make_request("head", 100)
+        small = [self.make_request(f"small-{i}", 1) for i in range(6)]
+        queue, pool = self.make_queue([head, *small], free=64)
+        self.assertEqual(queue.pop_preallocated()[0], small[:4])
+        self.assertEqual(head.prealloc_bypass_count, 4)
+        self.assertEqual(queue.pop_preallocated(), ([], []))
+        self.assertEqual(list(queue.queue.items()), [head, *small[4:]])
+
+        # Once capacity is released, the aged head is admitted before the rest.
+        pool.free = 128
+        self.assertEqual(queue.pop_preallocated()[0], [head, *small[4:]])
+        self.assertEqual(list(queue.queue.items()), [])
+
+    def test_backfill_keeps_reserved_decode_headroom(self):
+        head = self.make_request("head", 8)
+        first = self.make_request("first", 3)
+        second = self.make_request("second", 1)
+        queue, pool = self.make_queue([head, first, second])
+        self.assertEqual(queue.pop_preallocated()[0], [first])
+        self.assertEqual(pool.free, 2)
+        self.assertEqual(list(queue.queue.items()), [head, second])
+        self.assertEqual(second.prealloc_bypass_count, 0)
+
+    def test_blocked_prefix_lock_is_released_before_backfill(self):
+        override = get_context().override_server_args(
+            disaggregation_decode_enable_radix_cache=True
+        )
+        override.install()
+        self.addCleanup(override.restore)
+        head = self.make_request("head", 8)
+        small = self.make_request("small", 2)
+        small.req.origin_input_ids = [1, 1]
+        for request in (head, small):
+            request.req.extra_key = None
+            request.req.cache_salt = None
+            request.req._compute_max_prefix_len = lambda length: length
+            request.req.swa_prefix_lock_released = False
+            request.req.cache_ignore = False
+        queue, pool = self.make_queue([head, small], free=3)
+        queue.scheduler.tp_worker = SimpleNamespace(is_hybrid_swa=False)
+        queue.token_to_kv_pool_allocator.device = torch.device("cpu")
+        cache = RadixCache.create_simulated(
+            mock_allocator=queue.token_to_kv_pool_allocator, page_size=1
+        )
+        cache.insert(InsertParams(key=RadixKey([0]), value=torch.tensor([127])))
+        queue.tree_cache = cache
+
+        self.assertEqual(queue.pop_preallocated()[0], [small])
+        self.assertEqual(list(queue.queue.items()), [head])
+        self.assertEqual(pool.allocations, ["small"])
+        self.assertEqual(cache.protected_size(), 0)
+        self.assertEqual(cache.evictable_size(), 1)
+        self.assertEqual(head.prealloc_bypass_count, 1)
+
+    def test_slot_limits_still_block_the_whole_queue(self):
+        for kind in ("request", "metadata"):
+            with self.subTest(kind):
+                head = self.make_request("head", 8)
+                small = self.make_request("small", 2)
+                queue, pool = self.make_queue([head, small])
+                target = (
+                    queue.req_to_token_pool
+                    if kind == "request"
+                    else queue.req_to_metadata_buffer_idx_allocator
+                )
+                target.available_size = lambda: 0
+                self.assertEqual(queue.pop_preallocated(), ([], []))
+                self.assertEqual(pool.allocations, [])
+                self.assertEqual(head.prealloc_bypass_count, 0)
+
+    def test_disabled_priority_and_pipeline_modes_keep_fifo(self):
+        for mode in ("disabled", "priority", "pipeline"):
+            with self.subTest(mode):
+                head = self.make_request("head", 8)
+                small = self.make_request("small", 2)
+                queue, pool = self.make_queue([head, small])
+                kwargs = {}
+                if mode == "disabled":
+                    queue.enable_prealloc_backfill = False
+                elif mode == "priority":
+                    queue.scheduler.enable_priority_scheduling = True
+                else:
+                    queue.pp_size = 2
+                    kwargs = dict(pp_good_rids=["head", "small"], pp_bad_rids=[])
+                self.assertEqual(queue.pop_preallocated(**kwargs), ([], []))
+                self.assertEqual(pool.allocations, [])
+
+    def test_blocked_lookahead_is_bounded_without_charging_idle_work(self):
+        heads = [self.make_request(f"head-{i}", 100) for i in range(9)]
+        small = self.make_request("small", 1)
+        queue, pool = self.make_queue([*heads, small], free=64)
+        self.assertEqual(queue.pop_preallocated(), ([], []))
+        self.assertEqual([r.prealloc_bypass_count for r in heads], [0] * 9)
+        queue.queue.leave([heads[0].req])
+        self.assertEqual(queue.pop_preallocated()[0], [small])
+        self.assertEqual([r.prealloc_bypass_count for r in heads[1:]], [1] * 8)
 
 
 class TestDecodeQueueCleanup(CustomTestCase):
