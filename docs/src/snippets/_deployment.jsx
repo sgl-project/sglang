@@ -77,7 +77,8 @@
 //                      `(selection, cell) => template` when the request payload
 //                      depends on a custom match/overlay dimension
 //   benchmarkCommands  optional — powers the "⚡ Reproduce" modal (speed +
-//                      per-eval accuracy templates)
+//                      per-eval accuracy templates). A benchmark entry may set
+//                      benchmarkCommands: false when these templates do not apply.
 //   defaultAccuracy    optional — per-variant accuracy merged under cell.accuracy
 //   accuracyLabels     [key, label, unit][] — the eval set shown in the
 //                      benchmark card + "⚡ Reproduce". NO engine default:
@@ -87,6 +88,8 @@
 //                      A benchmarks entry may carry its own latencyPercentile to
 //                      override the page value per cell (entry → config → "P50").
 //                      Legacy "Mean" data is being re-measured to P50; drop once done
+//                      Speed rows may use itl_ms instead of tpot_ms, and
+//                      output_tokens_per_sec_per_gpu for output-only throughput.
 //   multiNodeHints     optional — {[hwId]: string[]} prepended as `# ...` lines
 //   dockerImages       optional — `docker run` image, keyed by
 //                      `hw|variant|quant` then `variant|quant` then
@@ -1004,15 +1007,19 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
     // [key, label, unit, compute?]. Optional compute(measurement) supplies
     // derived metrics (preferred over measurement[key] when present).
     const pct = (entry && entry.latencyPercentile) || config.latencyPercentile || "P50";
+    const speed = normalizeSpeed(entry && entry.speed);
+    const latencyKey = speed.some((m) => m && m.itl_ms != null) ? "itl_ms" : "tpot_ms";
+    const latencyLabel = latencyKey === "itl_ms" ? "ITL" : "TPOT";
+    const outputThroughput = speed.some((m) => m && m.output_tokens_per_sec_per_gpu != null);
     const SPEED_LABELS = [
       ["ttft_ms",                `TTFT (${pct})`,      "ms"],
-      ["tpot_ms",                `TPOT (${pct})`,      "ms"],
-      // throughput per gpu = total(input+output)/elapsed/GPU;
-      // stored directly in the benchmarks file (= output tok/s/GPU × (isl+osl)/osl).
-      ["tokens_per_sec_per_gpu", "throughput per gpu", "tok/s"],
+      [latencyKey,               `${latencyLabel} (${pct})`, "ms"],
+      // Total and output-only throughput are distinct measurements.
+      [outputThroughput ? "output_tokens_per_sec_per_gpu" : "tokens_per_sec_per_gpu",
+        outputThroughput ? "output throughput per gpu" : "throughput per gpu", "tok/s"],
       ["interactivity",          "interactivity",   "tokens/s/user",
-        (m) => (m.tpot_ms != null && m.tpot_ms !== 0)
-          ? Math.round((1000 / m.tpot_ms) * 10) / 10
+        (m) => (m[latencyKey] != null && m[latencyKey] !== 0)
+          ? Math.round((1000 / m[latencyKey]) * 10) / 10
           : null],
     ];
     const WORKLOAD_KEYS = ["dataset", "isl", "osl", "max_concurrency"];
@@ -1154,8 +1161,10 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
       return { title: "Speed", sharedText, colHeaders, rows,
                colCount: measurements.length,
                legend: [
-                 `throughput per gpu = (input+output tokens)/elapsed/GPU`,
-                 `interactivity = 1000/TPOT(ms) (tokens/s/user)`,
+                 outputThroughput
+                   ? `output throughput per gpu = output tokens/elapsed/GPU`
+                   : `throughput per gpu = (input+output tokens)/elapsed/GPU`,
+                 `interactivity = 1000/${latencyLabel}(ms) (tokens/s/user)`,
                ] };
     };
 
@@ -1215,6 +1224,7 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
   // interpolation happens in the modal where `env` is in scope. Returns null
   // when nothing is renderable (caller hides the button).
   const buildBenchCommands = (entry, sel) => {
+    if (entry && entry.benchmarkCommands === false) return null;
     const bc = config.benchmarkCommands;
     if (!bc) return null;
 

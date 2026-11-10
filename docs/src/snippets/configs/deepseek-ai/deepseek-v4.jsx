@@ -1516,12 +1516,11 @@ sgl-eval run mmmu_pro \\
     // B200 + NVFP4 — Official (0731 / 0813)
     // Mirrors the Flash/Pro NVFP4 cells; the official checkpoints bundle a
     // DSpark draft head, so low-latency uses `--speculative-algorithm DSPARK`
-    // instead of the EAGLE shape flags. GPU validation of these tuned settings
-    // is pending.
+    // instead of the EAGLE shape flags.
     // ====================================================================
     {
       match: { hw: "b200", variant: "flash-official", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
-      verified: false,
+      verified: true,
       env: [],
       flags: [
         "--trust-remote-code",
@@ -1548,7 +1547,7 @@ sgl-eval run mmmu_pro \\
     },
     {
       match: { hw: "b200", variant: "pro-official", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
-      verified: false,
+      verified: true,
       env: [],
       flags: [
         "--trust-remote-code",
@@ -2333,12 +2332,12 @@ sgl-eval run mmmu_pro \\
     },
     // ====================================================================
     // H200 + FP4 — Pro Official (0813)
-    // Mirrors the verified Pro cells; speculative decoding re-fitted to the
-    // bundled DSpark head. NOT yet run end-to-end on this hardware.
+    // The low-latency recipe uses the bundled DSpark head and a host KV tier.
+    // Balanced and high-throughput recipes are not yet verified on this hardware.
     // ====================================================================
     {
       match: { hw: "h200", variant: "pro-official", quant: "fp4", strategy: "low-latency", nodes: "single" },
-      verified: false,
+      verified: true,
       env: ["PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"],
       warn: "Allow approximately 240 GB of pinnable host memory for HiCache; recheck when changing cache sizes.",
       flags: [
@@ -2747,7 +2746,7 @@ sgl-eval run mmmu_pro \\
       // W4A8 (MXFP4 weights x FP8 activations, FlashInfer Humming kernels);
       // requires FlashInfer >= 0.6.18. Falls back: drop the precision flag
       // for the W4A16 path, or use --moe-runner-backend marlin.
-      verified: false,
+      verified: true,
       env: [],
       flags: [
         "--trust-remote-code",

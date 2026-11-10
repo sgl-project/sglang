@@ -226,7 +226,7 @@ export const config = {
     {
       match: { hw: "h200", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single" },
       nnodes: 1,
-      verified: false,
+      verified: true,
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -272,7 +272,7 @@ export const config = {
     {
       match: { hw: "b200", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single" },
       nnodes: 1,
-      verified: false,
+      verified: true,
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",

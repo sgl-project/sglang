@@ -379,7 +379,7 @@ export const config = {
     },
     {
       match: { hw: "h200", variant: "default", quant: "bf16", strategy: "dflash", nodes: "single" },
-      verified: false,
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -474,7 +474,7 @@ export const config = {
     },
     {
       match: { hw: "b200", variant: "default", quant: "nvfp4", strategy: "standard", nodes: "single" },
-      verified: false,
+      verified: true,
       env: [],
       flags: [
         "--model-path {{QUANT_PATH}}",

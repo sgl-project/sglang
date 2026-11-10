@@ -1183,7 +1183,8 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "b200", strategy: "high-throughput", quant: "nvfp4-nvda" },
       nnodes: 1,
-      verified: false,
+      verified: true,
+      verificationStatus: (s) => s.bcg === "off" && s.hicache === "off" && s.kvDsaPair === "fp8-trtllm" ? "verified" : "unverified",
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -1336,8 +1337,8 @@ sgl-eval run gsm8k \\
     {
       match: { hw: "h200", strategy: "high-throughput", quant: "fp8" },
       nnodes: 1,
-      verified: false,
-      verificationStatus: "unverified",
+      verified: true,
+      verificationStatus: (s) => s.bcg === "off" && s.hicache === "off" && s.kvDsaPair === "bf16-tilelang" ? "verified" : "unverified",
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",

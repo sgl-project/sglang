@@ -500,11 +500,11 @@ export const config = {
     // MTP (speculative decoding) — Inkling's multi-layer MTP draft head.
     // --enable-multi-layer-eagle is REQUIRED (without it the standard EAGLE
     // worker runs against the multi-layer draft and outputs garbage).
-    // B300 / GB300 / H200 verified end-to-end.
+    // B200 / B300 / GB300 / H200 verified end-to-end.
     // ====================================================================
     {
       match: { hw: "b200", variant: "default", quant: "nvfp4", strategy: "mtp", nodes: "single" },
-      verified: false,
+      verified: true,
       env: [],
       flags: [
         "--trust-remote-code",

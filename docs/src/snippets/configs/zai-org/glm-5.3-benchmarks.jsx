@@ -2,7 +2,29 @@
 // Bare match stubs render as pending until speed and accuracy measurements are available.
 export const benchmarks = [
   // NVIDIA FP8, single node.
-  { match: { hw: "h200",  variant: "default", quant: "fp8", strategy: "low-latency",     nodes: "single" } },
+  {
+    match: { hw: "h200", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
+    sglang_version: "v0.5.22",
+    latencyPercentile: "Mean",
+    benchmarkCommands: false,
+    speed: [
+      { workload: { dataset: "Agentic Mooncake trace (4%)", isl: 67585, osl: 399, max_concurrency: 4 },
+        ttft_ms: 1381, itl_ms: 10.11, output_tokens_per_sec_per_gpu: 45.33 },
+      { workload: { dataset: "Agentic Mooncake trace (4%)", isl: 67585, osl: 399, max_concurrency: 8 },
+        ttft_ms: 3194.62, itl_ms: 14.36, output_tokens_per_sec_per_gpu: 62.34 },
+      { workload: { dataset: "Agentic Mooncake trace (4%)", isl: 67585, osl: 399, max_concurrency: 16 },
+        ttft_ms: 16082.69, itl_ms: 19.56, output_tokens_per_sec_per_gpu: 75.71 },
+      { workload: { dataset: "Agentic Mooncake trace (4%)", isl: 67585, osl: 399, max_concurrency: 32 },
+        ttft_ms: 73086.71, itl_ms: 20.29, output_tokens_per_sec_per_gpu: 77.37 },
+      { workload: { dataset: "Agentic Mooncake trace (4%)", isl: 67585, osl: 399, max_concurrency: 64 },
+        ttft_ms: 184305.28, itl_ms: 20.22, output_tokens_per_sec_per_gpu: 77.73 },
+      { workload: { dataset: "Agentic Mooncake trace (4%)", isl: 67585, osl: 399, max_concurrency: 128 },
+        ttft_ms: 365178.36, itl_ms: 21.67, output_tokens_per_sec_per_gpu: 80.9 },
+      { workload: { dataset: "Agentic Mooncake trace (4%)", isl: 67585, osl: 399, max_concurrency: 256 },
+        ttft_ms: 747648.43, itl_ms: 19.9, output_tokens_per_sec_per_gpu: 76.33 },
+    ],
+    notes: "Trace ISL/OSL are medians; token-weighted prefix reuse is 75.2%. Simulated speculative acceptance length 2.15; performance only. 938/942 requests completed per run. Benchmark context limit: 250,000 tokens.",
+  },
   {
     match: { hw: "h200",  variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
     sglang_version: "main @ 20a491d1d311",
@@ -95,8 +117,30 @@ export const benchmarks = [
       "Speed measured under SGLANG_SIMULATE_ACC_LEN=2 with the EAGLE 1/1/2 draft (measured accept length 2.000 exactly at both concurrencies, saturating the 2-token draft). The pinned accept length makes these throughput-mechanism numbers only, never correctness evidence; the accuracy runs carry no such env.",
   },
 
-  // NVIDIA NVFP4, single node (RadixArk/GLM-5.3-NVFP4).
-  { match: { hw: "b200",  variant: "default", quant: "nvfp4", strategy: "low-latency",     nodes: "single" } },
+  // NVIDIA NVFP4, single node (NVIDIA checkpoint on B200; RadixArk elsewhere).
+  {
+    match: { hw: "b200", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
+    sglang_version: "v0.5.22",
+    latencyPercentile: "Mean",
+    benchmarkCommands: false,
+    speed: [
+      { workload: { dataset: "Agentic Mooncake trace (4%)", isl: 67585, osl: 399, max_concurrency: 4 },
+        ttft_ms: 1541.21, itl_ms: 7.22, output_tokens_per_sec_per_gpu: 59.89 },
+      { workload: { dataset: "Agentic Mooncake trace (4%)", isl: 67585, osl: 399, max_concurrency: 8 },
+        ttft_ms: 2223.26, itl_ms: 9.98, output_tokens_per_sec_per_gpu: 83.53 },
+      { workload: { dataset: "Agentic Mooncake trace (4%)", isl: 67585, osl: 399, max_concurrency: 16 },
+        ttft_ms: 3256.82, itl_ms: 15.25, output_tokens_per_sec_per_gpu: 108.68 },
+      { workload: { dataset: "Agentic Mooncake trace (4%)", isl: 67585, osl: 399, max_concurrency: 32 },
+        ttft_ms: 10846.92, itl_ms: 23.77, output_tokens_per_sec_per_gpu: 126.45 },
+      { workload: { dataset: "Agentic Mooncake trace (4%)", isl: 67585, osl: 399, max_concurrency: 64 },
+        ttft_ms: 67321.24, itl_ms: 29.5, output_tokens_per_sec_per_gpu: 130.74 },
+      { workload: { dataset: "Agentic Mooncake trace (4%)", isl: 67585, osl: 399, max_concurrency: 128 },
+        ttft_ms: 193597.92, itl_ms: 29.41, output_tokens_per_sec_per_gpu: 130.27 },
+      { workload: { dataset: "Agentic Mooncake trace (4%)", isl: 67585, osl: 399, max_concurrency: 256 },
+        ttft_ms: 426102.6, itl_ms: 29.99, output_tokens_per_sec_per_gpu: 127.67 },
+    ],
+    notes: "Trace ISL/OSL are medians; token-weighted prefix reuse is 75.2%. Simulated speculative acceptance length 2.05; performance only. 942/942 requests completed per run. Benchmark context limit: 500,000 tokens.",
+  },
   { match: { hw: "b200",  variant: "default", quant: "nvfp4", strategy: "balanced",        nodes: "single" } },
   { match: { hw: "b200",  variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" } },
   {

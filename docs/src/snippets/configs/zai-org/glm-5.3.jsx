@@ -36,6 +36,7 @@ export const config = {
   ],
 
   modelNames: {
+    "b200|default|nvfp4": "nvidia/GLM-5.3-NVFP4",
     "a5|default|w8a8c8-mxfp8": "glm53",
     "a3|default|w8a8": "glm-5",
     "default|fp8": "zai-org/GLM-5.3",
@@ -578,7 +579,7 @@ sgl-eval run aime25 \\
     // ====================================================================
     {
       match: { hw: "h200", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
-      verified: false,
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -972,7 +973,7 @@ sgl-eval run aime25 \\
     // ====================================================================
     {
       match: { hw: "b200", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
-      verified: false,
+      verified: true,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
