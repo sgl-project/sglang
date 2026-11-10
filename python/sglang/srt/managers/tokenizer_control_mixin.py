@@ -110,6 +110,17 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+class ProfileStateError(RuntimeError):
+    """The profiler refused a request because of its current state.
+
+    Raised for client-caused conflicts (starting a profile while one is already
+    running, stopping one that is not in progress) so that callers can answer
+    with a controlled response instead of a bare 500. It stays a ``RuntimeError``
+    so existing callers of the engine-level API keep working unchanged.
+    """
+
+
 # Declarative spec: (attr_name_prefix, response_type[, mode])
 # Each entry creates self.{prefix}_communicator and registers
 # response_type -> communicator.handle_recv in the dispatch table.
@@ -430,7 +441,7 @@ class TokenizerControlMixin:
     async def _execute_profile(self: TokenizerManager, req: ProfileReq):
         result = (await self.profile_communicator(req))[0]
         if not result.success:
-            raise RuntimeError(result.message)
+            raise ProfileStateError(result.message)
         return result
 
     async def start_expert_distribution_record(self: TokenizerManager):

@@ -180,6 +180,7 @@ from sglang.srt.managers.multi_tokenizer_mixin import (
     write_data_for_multi_tokenizer,
 )
 from sglang.srt.managers.scheduler import run_scheduler_process
+from sglang.srt.managers.tokenizer_control_mixin import ProfileStateError
 from sglang.srt.managers.tokenizer_manager import (
     ServerStatus,
     TokenizerManager,
@@ -1222,7 +1223,12 @@ async def get_hicache_l3_cache_layout():
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def start_profile_async(obj: Annotated[Optional[ProfileReq], Body()] = None):
     """Start profiling."""
-    await _global_state.tokenizer_manager.start_profile(obj or ProfileReq())
+    try:
+        await _global_state.tokenizer_manager.start_profile(obj or ProfileReq())
+    except ProfileStateError as e:
+        # Client-caused conflict (e.g. a profile is already running): answer with a
+        # controlled status instead of letting it surface as a bare 500.
+        raise HTTPException(status_code=HTTPStatus.CONFLICT, detail=str(e)) from e
     return Response(
         content="Start profiling.\n",
         status_code=200,
@@ -1233,7 +1239,12 @@ async def start_profile_async(obj: Annotated[Optional[ProfileReq], Body()] = Non
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def stop_profile_async():
     """Stop profiling."""
-    await _global_state.tokenizer_manager.stop_profile()
+    try:
+        await _global_state.tokenizer_manager.stop_profile()
+    except ProfileStateError as e:
+        # Stopping a profile that is not in progress (or that a num_steps capture
+        # already finished) is a conflict, not a server error.
+        raise HTTPException(status_code=HTTPStatus.CONFLICT, detail=str(e)) from e
     return Response(
         content="Stop profiling. This will take some time.\n",
         status_code=200,
