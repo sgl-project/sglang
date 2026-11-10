@@ -23,6 +23,7 @@ from sglang.srt.disaggregation.mooncake.conn import (
 )
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
 from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     KeyedReqList,
@@ -42,6 +43,12 @@ from sglang.test.scheduler_test_utils import FakeReq, decode_queue
 from sglang.test.test_utils import CustomTestCase, enter_scope
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+
+
+class _ChunkedSlot(SimpleNamespace):
+    """A partial scheduler whose chunked slot is its CHUNKED list."""
+
+    chunked_req = Scheduler.chunked_req
 
 
 class TestAllocationConfiguration(CustomTestCase):
@@ -289,7 +296,11 @@ class TestAllocationIntegration(CustomTestCase):
         entry = DecodeRequest(req=req, kv_receiver=receiver)
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
         queue.queue = decode_queue(ListKind.PD_PREALLOC, [entry])
+        queue.transfer_queue = SimpleNamespace(
+            queue=decode_queue(ListKind.PD_RECEIVING)
+        )
         queue.pending_reqs = []
+        queue._num_published_destinations = 0
         queue.pp_size, queue.tp_rank = 1, 0
         queue.gloo_group = object()
         queue._resolve_pending_reqs = Mock()
@@ -431,12 +442,13 @@ class TestAllocationIntegration(CustomTestCase):
         req.time_stats = MagicMock()
         scheduler = SimpleNamespace(
             tree_cache=Mock(supports_mamba=Mock(return_value=False)),
-            prefill_launched_reqs=Mock(),
+            prefill_launched_reqs=KeyedReqList(ListKind.PREFILL_LAUNCHED),
             waiting_queue=IndexedReqList(ListKind.WAITING),
             disagg_prefill_bootstrap_queue=SimpleNamespace(queue=[]),
             metrics_reporter=SimpleNamespace(enable_metrics=False),
             processed_tokens_counter=0,
         )
+        scheduler.prefill_launched_reqs.join([req])
         with (
             patch("sglang.srt.disaggregation.prefill.checkpoint_kv_cache"),
             patch("sglang.srt.disaggregation.prefill.release_kv_cache"),
@@ -446,6 +458,7 @@ class TestAllocationIntegration(CustomTestCase):
             )
 
         self.assertEqual(list(scheduler.waiting_queue), [req])
+        self.assertEqual(list(scheduler.prefill_launched_reqs), [])
         self.assertIsNotNone(req.multimodal_inputs)
         req.multimodal_inputs.release_features.assert_not_called()
         scheduler.tree_cache.finish.assert_called_once_with(
@@ -466,8 +479,8 @@ class TestAllocationIntegration(CustomTestCase):
                             to_finish=None,
                             inflight_steps=inflight_steps,
                         )
-                        scheduler = SimpleNamespace(
-                            chunked_req=req,
+                        scheduler = _ChunkedSlot(
+                            chunked_reqs=IndexedReqList(ListKind.CHUNKED),
                             tree_cache=Mock(),
                             check_bootstrap=Mock(return_value=False),
                             has_bootstrapped_waiting_req=Mock(return_value=True),
@@ -476,6 +489,7 @@ class TestAllocationIntegration(CustomTestCase):
                                 ListKind.PREFILL_LAUNCHED
                             ),
                         )
+                        scheduler.chunked_req = req
                         scheduler.checkpoint_disagg_prefill = MethodType(
                             SchedulerDisaggregationPrefillMixin.checkpoint_disagg_prefill,
                             scheduler,

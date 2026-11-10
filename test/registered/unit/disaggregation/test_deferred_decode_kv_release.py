@@ -569,6 +569,7 @@ class TestResolveDeferredReleases(CustomTestCase):
         entry.pending_metadata = (SimpleNamespace(query=lambda: False), (), {})
         # ABORT was sent before metadata, so this rank has no ack generation.
         # A peer that already published still makes every rank retain capacity.
+        queue.queue.join([entry])
         queue._defer_release(entry)
         self.assertEqual(list(queue._deferred_releases.items())[0][-1], 0)
         with patch.object(queue.scheduler.request_retirer, "release") as release:
@@ -588,6 +589,7 @@ class TestResolveDeferredReleases(CustomTestCase):
             entry.host_staged = True
             room = entry.req.bootstrap_room
             generations[room] = mgr.register_deferred_abort_room(room)
+            q.queue.join([entry])
             q._defer_release(entry)
         with (
             patch.object(q.scheduler.request_retirer, "release") as release,
@@ -621,6 +623,7 @@ class TestResolveDeferredReleases(CustomTestCase):
         with patch.object(
             decode_mod.time, "monotonic", side_effect=[10.0, 11.0, 12.0, 13.0]
         ):
+            q.queue.join([dreq])
             q._defer_release(dreq)
             with patch.object(q.scheduler.request_retirer, "release") as rel:
                 # Not yet acked -> held, not released.
@@ -717,6 +720,7 @@ class TestResolveDeferredReleases(CustomTestCase):
         q = _make_queue(timeout=12.5)
         dreq = _make_decode_req(room=400, idx=9, mgr=mgr)
         with patch.object(decode_mod.time, "monotonic", return_value=5.0):
+            q.queue.join([dreq])
             q._defer_release(dreq)
         self.assertEqual(len(q._deferred_releases), 1)
         held_req, start_time, deadline, held_idx, required = list(
@@ -773,7 +777,9 @@ def _run_release_consensus(rank: int, rendezvous: str) -> None:
             ready_generation = mgr.register_deferred_abort_room(44)
             mgr.note_abort_ack(44, 0, ready_generation)
             with patch.object(decode_mod.time, "monotonic", return_value=0.0):
+                q.queue.join([dreq])
                 q._defer_release(dreq)
+                q.queue.join([ready_req])
                 q._defer_release(ready_req)
             with (
                 patch.object(decode_mod.time, "monotonic", return_value=now) as clock,
