@@ -443,9 +443,7 @@ def block_topk_triton(
 split_qkv_rmsnorm_rope_pos_cache_half_npu = None
 if _is_npu:
     try:
-        from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope_pos_cache_half_npu import (
-            split_qkv_rmsnorm_rope_pos_cache_half_npu,
-        )
+        from sgl_kernel_npu.operators.norm import split_qkv_rmsnorm_rope_pos_cache_half_npu
     except (ImportError, OSError):
         pass
 
