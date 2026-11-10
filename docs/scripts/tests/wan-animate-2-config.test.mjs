@@ -71,8 +71,9 @@ test("all 233 legacy selections preserve flags, environment and verification", (
 
 test("H3 builder uses scoped settings and preserves the default HTTP workload", () => {
   assert.equal(config.cells, undefined);
+  assert.deepEqual(config.overlayDims.filter((d) => d.scope === "base").map((d) => d.id), ["weights"]);
   assert.deepEqual(config.overlayDims.filter((d) => d.scope === "serve").map((d) => d.id), ["placement", "encoder", "cfg"]);
-  assert.deepEqual(config.overlayDims.filter((d) => d.scope === "request").map((d) => d.id), ["resolution", "clip_len", "steps", "audio"]);
+  assert.deepEqual(config.overlayDims.filter((d) => d.scope === "request").map((d) => d.id), ["resolution", "clip_len", "steps", "distilled_steps", "audio"]);
   assert.equal(config.overlayDims.find((d) => d.id === "steps").unit, "steps");
   assert.equal(config.curl(selection()), [
     "curl -sS -X POST http://{{CURL_HOST}}:{{CURL_PORT}}/v1/videos",
@@ -91,7 +92,8 @@ test("H3 builder uses scoped settings and preserves the default HTTP workload", 
 
 test("recommended recipes have accurate verification and consumer memory settings", () => {
   const recipes = config.commandBuilder.resource.verifiedRecipes;
-  assert.equal(recipes.filter((r) => !r.unverified).length, 7);
+  assert.equal(recipes.filter((r) => !r.unverified && r.weights !== "distilled").length, 7);
+  assert.equal(recipes.filter((r) => r.weights === "distilled").length, 9);
   for (const hw of config.supportedHardware) {
     assert.equal(recipes.filter((r) => r.hw === hw && r.default).length, 1);
   }
@@ -152,4 +154,44 @@ test("invalid resource and topology combinations cannot be verified", () => {
     assert.equal(result.verified, false);
     assert.deepEqual(result.builder.verification, { serve: "error", request: "error" });
   }
+});
+
+test("distilled checkpoint: GB200 recipes, Ulysses auto topology and no CFG parallelism", () => {
+  const recipes = config.commandBuilder.resource.verifiedRecipes.filter((r) => r.weights === "distilled");
+  for (const recipe of recipes) {
+    assert.equal(recipe.hw, "gb200");
+    const result = resolve({ ...recipe, topology_mode: "manual" });
+    assert.deepEqual(result.builder.errors, [], recipe.id);
+    assert.equal(result.verified, true, recipe.id);
+    assert.deepEqual(result.builder.verification, { serve: "verified", request: "verified" }, recipe.id);
+    assert.ok(result.flags.includes("--model-path {{DISTILLED_MODEL_PATH}}"), recipe.id);
+    assert.ok(result.flags.includes("--text-encoder-cpu-offload"), recipe.id);
+    assert.ok(!result.flags.includes("--enable-cfg-parallel"), recipe.id);
+    assert.deepEqual(result.env, [], recipe.id);
+  }
+  // Auto topology is Ulysses across the GPUs; explicit CPU offload is the same command.
+  const four = resolve({ weights: "distilled", hw: "gb200", gpus_per_node: 4 });
+  assert.deepEqual(four.builder.topology, { tp_size: 1, ulysses_degree: 4, ring_degree: 1 });
+  assert.deepEqual(four.flags, ["--model-path {{DISTILLED_MODEL_PATH}}", "--port {{PORT}}", "--num-gpus 4",
+    "--ulysses-degree 4", "--text-encoder-cpu-offload"]);
+  assert.equal(four.verified, true);
+  assert.deepEqual(resolve({ weights: "distilled", hw: "gb200", encoder: "offload" }).flags,
+    resolve({ weights: "distilled", hw: "gb200" }).flags);
+  assert.equal(resolve({ weights: "distilled", hw: "gb200", encoder: "offload" }).verified, true);
+  assert.equal(resolve({ weights: "distilled", hw: "gb200", gpus_per_node: 2 }).builder.topology.ulysses_degree, 2);
+  assert.equal(resolve({ weights: "distilled", hw: "gb200" }).builder.resolvedSettings.cfg, "Disabled");
+  // The request carries the distilled defaults; a step change leaves the verified serve recipe alone.
+  const request = config.curl(selection({ weights: "distilled" }));
+  assert.ok(request.includes("num_inference_steps=10"));
+  assert.ok(request.includes("guidance_scale=1.0"));
+  const steps = resolve({ weights: "distilled", hw: "gb200", distilled_steps: 20 });
+  assert.deepEqual(steps.builder.verification, { serve: "verified", request: "unverified" });
+  assert.ok(config.curl(selection({ weights: "distilled", distilled_steps: 20 })).includes("num_inference_steps=20"));
+  // Other hardware is unverified, CFG parallelism is rejected, and the base checkpoint keeps GB200 derived.
+  assert.equal(resolve({ weights: "distilled", hw: "h200" }).verified, false);
+  const cfgOn = resolve({ weights: "distilled", hw: "gb200", gpus_per_node: 2, cfg: "on" });
+  assert.ok(cfgOn.builder.errors.length);
+  assert.deepEqual(cfgOn.builder.verification, { serve: "error", request: "error" });
+  assert.equal(resolve({ hw: "gb200" }).verified, false);
+  assert.equal(resolve({ hw: "gb200" }).builder.verification.serve, "unverified");
 });

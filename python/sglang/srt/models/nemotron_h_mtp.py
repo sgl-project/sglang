@@ -17,7 +17,8 @@ from collections.abc import Iterable
 import torch
 from torch import nn
 
-from sglang.srt.configs import NemotronHConfig
+from sglang.srt.configs.nemotron_h import NemotronHConfig
+from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layer_boundary import layer_stack
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
@@ -26,6 +27,7 @@ from sglang.srt.layers.linear import ColumnParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptNvFp4A16LinearMethod
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -38,7 +40,6 @@ from sglang.srt.models.nemotron_h import (
 )
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix
 
 
 class NemotronHMTPAttentionDecoderLayer(NemotronHAttentionDecoderLayer):
@@ -137,6 +138,7 @@ class NemotronHMTPMoEDecoderLayer(NemotronHMoEDecoderLayer):
             layer_idx=layer_idx,
             quant_config=quant_config,
             prefix=prefix,
+            is_nextn=True,
         )
         self.has_start_projections = has_start_projections
         self.has_end_norm = has_end_norm
@@ -302,12 +304,13 @@ class NemotronHMultiTokenPredictor(nn.Module):
         hidden_states = forward_batch.spec_info.hidden_states
         residual_batch.start(forward_batch)
 
-        for i in range(self.pattern_len):
-            hidden_states = self.layers[str(i)](
-                inputs_embeds=inputs_embeds,
-                hidden_states=hidden_states,
-                forward_batch=forward_batch,
-            )
+        with get_global_expert_distribution_recorder().disable_this_region():
+            for i in range(self.pattern_len):
+                hidden_states = self.layers[str(i)](
+                    inputs_embeds=inputs_embeds,
+                    hidden_states=hidden_states,
+                    forward_batch=forward_batch,
+                )
         return residual_batch.take_output(hidden_states, forward_batch)
 
 

@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+import torch
 import torch.nn as nn
 
 from sglang.multimodal_gen.runtime.models.dits.flux import (
@@ -210,6 +211,15 @@ def test_flux_compile_conditions_match_both_block_types():
     assert matches(FluxTransformerBlock.__new__(FluxTransformerBlock))
     assert matches(FluxSingleTransformerBlock.__new__(FluxSingleTransformerBlock))
     assert not matches(nn.Linear(2, 2))
+
+
+def test_diffusion_qknorm_is_an_opaque_op_for_torch_compile():
+    # Importing the layer registers it; a bare JIT launch would graph-break.
+    from sglang.multimodal_gen.runtime.layers import layernorm  # noqa: F401
+
+    schema = torch.ops.sglang.fused_inplace_qknorm.default._schema
+    args = {arg.name: arg for arg in schema.arguments}
+    assert args["q"].alias_info.is_write and args["k"].alias_info.is_write
 
 
 def test_compile_matching_submodules_matches_only_declared_regions():

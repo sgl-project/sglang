@@ -30,7 +30,7 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
@@ -43,43 +43,53 @@ from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
-from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
-    _swa_allocation_callbacks,
-)
+from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
+from sglang.srt.mem_cache.kv.plan import TREE_WINDOW
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.pool_host import common as host_memory
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.unified_cache.components.base import ComponentType
+from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.tree_core_registry import _TREE_CORE_REGISTRY
-from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.unified_allocator_fixtures import build_tri_pool
+from sglang.test.tree_slots import (
+    only_window,
+    storage_tree_slots,
+    window_evictable,
+)
+from sglang.test.unified_allocator_fixtures import (
+    build_test_unified_pools,
+    build_tri_pool,
+    chain_snapshot,
+)
 
-register_cpu_ci(est_time=15, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 PAGE = 4
-D2H = ("controller", "write")
-H2D = ("controller", "load")
-FULL, SWA = ComponentType.FULL, ComponentType.SWA
+FULL = ComponentType.FULL
 
 
 def _python_inspector(params, components):
-    from unified_tree_core_inspector import UnifiedTreeCoreInspector
+    from sglang.test.kits.unified_radix_cache.unified_tree_core_inspector import (
+        UnifiedTreeCoreInspector,
+    )
 
     return UnifiedTreeCoreInspector(params, components)
 
 
 def _rust_inspector(params, _components):
-    from rust_unified_tree_core_inspector import RustUnifiedTreeCoreInspector
+    from sglang.test.kits.unified_radix_cache.rust_unified_tree_core_inspector import (
+        RustUnifiedTreeCoreInspector,
+    )
 
     return RustUnifiedTreeCoreInspector(params)
 
 
 def _unified_swa_bundle(*, tokens: int = 64):
-    return init_unified_swa_pools(
+    return build_test_unified_pools(
         device="cpu",
         kv_cache_dtype=torch.float16,
         head_num=1,
@@ -112,14 +122,14 @@ class _Rows:
 
     def __init__(self, bundle):
         self.allocator = bundle.token_to_kv_pool_allocator
-        self.full = bundle.token_to_kv_pool.full_kv_pool.get_key_buffer(0)
-        self.swa = bundle.token_to_kv_pool.swa_kv_pool.get_key_buffer(0)
+        self.full = bundle.token_to_kv_pool.layer_router.view("full").get_key_buffer(0)
+        self.swa = bundle.token_to_kv_pool.layer_router.view("swa").get_key_buffer(0)
 
     def full_rows(self, ids: torch.Tensor) -> torch.Tensor:
-        return self.allocator.full_attn_allocator.translate_kv_loc(ids.to(torch.int64))
+        return self.allocator.full_attn_allocator.ids.translate(ids.to(torch.int64))
 
     def swa_rows(self, ids: torch.Tensor) -> torch.Tensor:
-        return self.allocator.translate_loc_from_full_to_swa(ids)
+        return self.allocator.id_spaces()[self.allocator.roles.window].ids(ids)
 
     def markers(self, base: int, count: int) -> torch.Tensor:
         # One value per token row; float16 holds these integers exactly.
@@ -151,6 +161,13 @@ class _Stream:
         self.log.append(("wait_stream", stream))
 
 
+class _Copy:
+    """A copy's done event, still pending."""
+
+    def query(self) -> bool:
+        return False
+
+
 @contextlib.contextmanager
 def _recorded_stream():
     log = []
@@ -162,22 +179,27 @@ def _recorded_stream():
 
 def _record_moves(allocator, log: list) -> None:
     """Log every compaction copy on either side into `log`, then perform it."""
-    for side in (allocator.full_attn_allocator, allocator.swa_attn_allocator):
-        kvcache = side._kvcache
-        move = kvcache.move_kv_cache
+    arena = allocator.arena
+    move = arena.move_units
+    sides = {allocator.full_attn_allocator.sub_pool_name}
+    sides.add(allocator.swa_attn_allocator.sub_pool_name)
 
-        def recorded(dst, src, *, move=move, name=side.sub_pool_name):
+    def recorded(name, dst, src):
+        if name in sides:
             log.append(("move", name))
-            return move(dst, src)
+        return move(name, dst, src)
 
-        kvcache.move_kv_cache = recorded
+    arena.move_units = recorded
 
 
 class _ConfigCase(unittest.TestCase):
     def setUp(self):
         reset_context()
         self.addCleanup(reset_context)
-        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+        args = ServerArgs(model_path="dummy")
+        # Mamba cache setup must not resolve the dummy model through Hugging Face.
+        args._mamba_cache_chunk_size = 64
+        publish(args, role="tokenizer")
 
 
 class TestPhysicalReservation(_ConfigCase):
@@ -194,12 +216,15 @@ class TestPhysicalReservation(_ConfigCase):
         # The node being loaded: its FULL rows are resident, SWA is tombstoned.
         target = allocator.alloc(2 * PAGE)
         allocator.free_swa(target)
-        allocator.free(gap)
 
+        # The reservation takes the only free SWA rows, at the band's end.
         reserved = swa.alloc_physical(2 * PAGE)
         # Stand in for the H2D copy into the reserved rows.
         rows.swa[reserved] = rows.markers(300, 2 * PAGE)
         allocator.set_full_to_swa_mapping(target, reserved)
+        # An interior hole left after the reservation: once the load is queued,
+        # compaction relocates the reserved rows into it.
+        allocator.free(gap)
 
         moves = []
         _record_moves(allocator, moves)
@@ -209,12 +234,14 @@ class TestPhysicalReservation(_ConfigCase):
             self.assertEqual(swa.flush_opportunistic(), 0)
             self.assertEqual(moves, [])
 
-            load_done = object()
-            allocator.set_hicache_transfer_done_event(H2D, load_done)
+            load_done = _Copy()
+            allocator.end_load_reservations()
+            # Submitted: the load names the rows it writes by the owner's ids.
+            swa.record_transfer(load_done, target, writes=True)
             # Queued: compaction waits on the copy, then relocates rows.
             self.assertGreater(swa._flush(urgent=True), 0)
         self.assertEqual(waits[0], ("wait", load_done))
-        self.assertIn(("move", "swa"), moves)
+        self.assertIn(("move", swa.sub_pool_name), moves)
         _, target_swa = rows.read(target)
         self.assertTrue(torch.equal(target_swa, rows.markers(300, 2 * PAGE)))
         self.assertTrue(torch.equal(rows.read(head)[1], expected_head[1]))
@@ -226,12 +253,13 @@ class TestFloatSwaReservation(_ConfigCase):
     """The tri-pool's SWA middle floats: it relocates its pages to make room for
     a neighbour, so a load's SWA reservation must pin it as on an end pool."""
 
-    def test_state_allocation_cannot_move_a_reservation_before_its_load_is_queued(
-        self,
-    ):
+    def _float_load(self):
+        """A tri-pool whose next state slot needs the float to move, and a
+        load of one FULL page, one SWA page and one state slot: the
+        controller, its transfers, and the counts allocated before it."""
         bundle, allocator = build_tri_pool(page_size=PAGE)
         full, swa = allocator.full_attn_allocator, allocator.swa_attn_allocator
-        states = bundle.req_to_token_pool.mamba_allocator
+        states = allocator.state_slots
         mamba = allocator.mamba_allocator
         resident = allocator.alloc(4 * PAGE)
         # The Mamba end is full: its next slot needs the float to move.
@@ -244,12 +272,16 @@ class TestFloatSwaReservation(_ConfigCase):
         # Only what `HybridCacheController.load` reads, with production callbacks.
         controller = object.__new__(HybridCacheController)
         controller.mem_pool_device_allocator = allocator
+        controller.kv_storage = kv_storage_of(None, allocator)
         controller.device = "cpu"
         controller.load_queue, controller.ack_load_queue = [], []
+        swa_alloc, swa_free = controller.kv_storage.host_load_alloc(swa.sub_pool_name)
         controller.mem_pool_host = SimpleNamespace(
             entry_map={
                 PoolName.SWA: SimpleNamespace(
-                    device_evict_fn=None, **_swa_allocation_callbacks(swa)
+                    device_evict_fn=None,
+                    device_alloc_fn=swa_alloc,
+                    device_free_fn=swa_free,
                 ),
                 PoolName.MAMBA: SimpleNamespace(
                     device_alloc_fn=states.alloc,
@@ -264,6 +296,14 @@ class TestFloatSwaReservation(_ConfigCase):
             PoolTransfer(name=PoolName.SWA, host_indices=torch.arange(PAGE)),
             PoolTransfer(name=PoolName.MAMBA, host_indices=torch.tensor([1])),
         ]
+        return allocator, controller, transfers, allocated, moves
+
+    def test_state_allocation_cannot_move_a_reservation_before_its_load_is_queued(
+        self,
+    ):
+        allocator, controller, transfers, allocated, moves = self._float_load()
+        full, swa = allocator.full_attn_allocator, allocator.swa_attn_allocator
+        states = allocator.state_slots
 
         # The state slot needs the float to move, which the SWA reservation
         # taken just before forbids: the load rolls back instead.
@@ -276,9 +316,107 @@ class TestFloatSwaReservation(_ConfigCase):
         self.assertEqual((full.allocated_count(), swa.allocated_count()), allocated)
         self.assertEqual(allocator.verify_byte_accounting(), [])
 
-        # Cancelled, so the float makes room again.
+        # Cancellation releases the pin. Trimming the leading hole can make
+        # room without copying live pages; either form of reclaim is valid.
+        previous_low = swa._byte_low_frontier()
         self.assertIsNotNone(states.alloc(1))
-        self.assertIn(("move", "swa"), moves)
+        self.assertGreater(swa._byte_low_frontier(), previous_low)
+        self.assertEqual(allocator.verify_byte_accounting(), [])
+
+    def test_a_load_back_inside_its_scope_takes_every_part(self):
+        """Regression: a FULL + SWA + state load that fits as a whole takes every
+        part inside its scope, also on a chain with one window."""
+        allocator, controller, transfers, allocated, _ = self._float_load()
+        full, swa = allocator.full_attn_allocator, allocator.swa_attn_allocator
+        demand = KVDemand(PAGE, {swa.sub_pool_name: PAGE}, state_slots=1)
+        self.assertTrue(allocator.admits(demand))
+        with allocator.scoped_physical_takes(demand):
+            for band in allocator.members:
+                self.assertIsNotNone(band._physical_take_scope)
+            loaded = controller.load(
+                host_indices=torch.arange(PAGE), extra_pools=transfers
+            )
+        self.assertIsNotNone(loaded)
+        self.assertTrue(all(t.device_indices is not None for t in transfers))
+        self.assertEqual(
+            (full.allocated_count(), swa.allocated_count()),
+            (allocated[0] + PAGE, allocated[1] + PAGE),
+        )
+        self.assertEqual(transfers[1].device_indices.numel(), 1, "the state slot")
+        # As the tree does once the load is queued: bind the window's rows.
+        allocator.set_full_to_swa_mapping(loaded, transfers[0].device_indices)
+        self.assertEqual(allocator.verify_byte_accounting(), [])
+
+    def test_a_full_and_swa_load_back_is_scoped(self):
+        """A chain of FULL and one window takes its load-back in a scope too."""
+        allocator, _ = _unified_swa()
+        swa = allocator.swa_attn_allocator
+        demand = KVDemand(PAGE, {swa.sub_pool_name: PAGE})
+        with allocator.scoped_physical_takes(demand):
+            for band in allocator.members:
+                self.assertIsNotNone(band._physical_take_scope)
+            self.assertIsNotNone(allocator.alloc(PAGE))
+        for band in allocator.members:
+            self.assertIsNone(band._physical_take_scope)
+        self.assertEqual(allocator.verify_byte_accounting(), [])
+
+
+class TestCallerOwnedLoadDestination(_ConfigCase):
+    """A load into rows the caller already owns allocates nothing, keeps those
+    rows when it rolls back, and binds KV-derived side pools to the caller's
+    anchor rows rather than to the destination."""
+
+    def test_load_into_caller_owned_rows_allocates_nothing_and_keeps_them(self):
+        allocator, _ = _unified_swa()
+        full = allocator.full_attn_allocator
+        owned = allocator.alloc(PAGE)
+        anchor = allocator.alloc(PAGE)
+        allocated = full.allocated_count()
+        host_indices = torch.arange(PAGE)
+
+        controller = object.__new__(HybridCacheController)
+        controller.mem_pool_device_allocator = allocator
+        controller.kv_storage = kv_storage_of(None, allocator)
+        controller.device = "cpu"
+        controller.load_queue, controller.ack_load_queue = [], []
+        controller.mem_pool_host = SimpleNamespace(
+            entry_map={
+                PoolName.SWA: SimpleNamespace(
+                    device_alloc_fn=lambda size: None,
+                    device_free_fn=lambda indices: None,
+                    device_evict_fn=None,
+                )
+            }
+        )
+
+        # A side pool that cannot allocate cancels the load; the destination
+        # rows were never the load's to free.
+        self.assertIsNone(
+            controller.load(
+                host_indices=host_indices,
+                extra_pools=[
+                    PoolTransfer(name=PoolName.SWA, host_indices=torch.arange(PAGE))
+                ],
+                device_indices=owned,
+                anchor_indices=anchor,
+            )
+        )
+        self.assertEqual(controller.load_queue, [])
+        self.assertEqual(full.allocated_count(), allocated)
+
+        derived = PoolTransfer(name=PoolName.SWA, indices_from_pool=PoolName.KV)
+        self.assertIs(
+            controller.load(
+                host_indices=host_indices,
+                extra_pools=[derived],
+                device_indices=owned,
+                anchor_indices=anchor,
+            ),
+            owned,
+        )
+        self.assertEqual(full.allocated_count(), allocated)
+        self.assertIs(controller.load_queue[-1].device_indices, owned)
+        self.assertIs(derived.device_indices, anchor)
 
 
 class TestAllocationAndTransferOrder(_ConfigCase):
@@ -293,8 +431,7 @@ class TestAllocationAndTransferOrder(_ConfigCase):
         expected_source = rows.seed(source, 100)
         expected_target = rows.seed(target, 200)
         allocator.free(gap)
-        allocator.set_hicache_transfer_done_event(D2H, object())
-        allocator.set_hicache_transfer_done_event(H2D, object())
+        allocator.end_load_reservations()
 
         with _recorded_stream() as waits:
             fresh = allocator.alloc(2 * PAGE)
@@ -344,7 +481,7 @@ class _UnifiedHiCacheCase(_ConfigCase):
             page_size=PAGE,
             disable=False,
             sliding_window_size=self.window,
-            tree_components=(ComponentType.FULL, ComponentType.SWA),
+            tree_slots=storage_tree_slots(self.allocator.storage, window=self.window),
         )
         with mock.patch.dict(
             _TREE_CORE_REGISTRY, {"python": _python_inspector, "rust": _rust_inspector}
@@ -356,12 +493,11 @@ class _UnifiedHiCacheCase(_ConfigCase):
         atexit.unregister(cache.shutdown)
         self.addCleanup(cache.release_host_resources)
         controller = cache.cache_controller
-        # The scheduler's gate: rows stay put until host copies are acknowledged.
-        self.allocator.set_host_transfer_move_gate(
-            lambda: not controller.has_inflight_device_transfers()
-        )
         self.cache = cache
         self.controller = controller
+        # The window sub-pool names its host pool; the tree numbers its slot.
+        self.window_pool = only_window(cache)
+        self.window_slot = cache.slot_id(TREE_WINDOW)
         # Compaction and frees wait through this stand-in stream.
         stream = _recorded_stream()
         stream.__enter__()
@@ -401,7 +537,11 @@ class TestSwaLoadBackReservation(_UnifiedHiCacheCase):
             )
         self.cache.flush_pending_backups()
         self.cache.writing_check()
-        entry = self.controller.mem_pool_host.entry_map[PoolName.SWA]
+        # Admission stops at its target before this band exhausts its physical
+        # span. Hold that spare span so this test exercises eviction on retry.
+        spare = swa.alloc_physical(swa.available_size())
+        self.assertIsNotNone(spare)
+        entry = self.controller.mem_pool_host.entry_map[self.window_pool]
         evict = entry.device_evict_fn
         evictions = []
 
@@ -409,7 +549,9 @@ class TestSwaLoadBackReservation(_UnifiedHiCacheCase):
             evictions.append(need_size)
             return evict(need_size)
 
-        transfer = PoolTransfer(name=PoolName.SWA, host_indices=torch.arange(2 * PAGE))
+        transfer = PoolTransfer(
+            name=self.window_pool, host_indices=torch.arange(2 * PAGE)
+        )
         with mock.patch.object(entry, "device_evict_fn", side_effect=recorded_evict):
             result = self.controller._resolve_device_transfers(
                 [transfer], kv_device_indices=torch.empty(0, dtype=torch.int64)
@@ -419,6 +561,7 @@ class TestSwaLoadBackReservation(_UnifiedHiCacheCase):
         self.assertIsNotNone(result)
         self.assertEqual(evictions, [2 * PAGE])
         swa.cancel_physical_reservation(transfer.device_indices)
+        swa.cancel_physical_reservation(spare)
         self.assertEqual(self.allocator.verify_byte_accounting(), [])
         self.cache.sanity_check()
 
@@ -445,6 +588,7 @@ class TestLoadBackAdmission(_UnifiedHiCacheCase):
         match = self._match(tokens)
         req = mock.MagicMock(spec=Req)
         req.rid = "load-back"
+        req.extra_key = None
         req.cache_request_handle = CacheRequestHandle(req.rid, 0)
         req.priority = 0
         req.prefix_len = match.device_prefix_len
@@ -454,18 +598,19 @@ class TestLoadBackAdmission(_UnifiedHiCacheCase):
         req.output_ids = []
         req.sampling_params = SimpleNamespace(max_new_tokens=PAGE, ignore_eos=False)
         req.host_hit_length = match.host_hit_length
-        req.swa_host_hit_length = match.swa_host_hit_length
+        req.matched_window_host_hit_lengths = dict(match.window_host_hit_lengths)
         req.mamba_host_hit_length = 0
         req.storage_hit_length = 0
         req.storage_hit_start = None
         req.host_hit_is_storage = False
         req.host_loaded_length = 0
+        req.window_host_hit_lengths = dict(match.window_host_hit_lengths)
         req.retracted_stain = False
         req.needs_host_load_back.return_value = True
         req.finished.return_value = False
         req.materialized_host_hit_len.return_value = match.host_hit_length
         req.fulfilled_storage_hit_len.return_value = 0
-        req.kv = SimpleNamespace(
+        req.kv = ReqKvInfo(
             cache_protected_len=match.device_prefix_len, mamba_pool_idx=None
         )
         type(req).extend_len = mock.PropertyMock(
@@ -478,7 +623,7 @@ class TestLoadBackAdmission(_UnifiedHiCacheCase):
         return (
             core.get_component_device_lock_ref(node, FULL),
             core.get_component_host_lock_ref(node, FULL),
-            core.get_component_host_lock_ref(node, SWA),
+            core.get_component_host_lock_ref(node, self.window_slot),
         )
 
     def _host_pressure(self):
@@ -495,7 +640,10 @@ class TestLoadBackAdmission(_UnifiedHiCacheCase):
             self._insert(tokens, 300)
             self.cache.evict(EvictParams(num_tokens=len(tokens)))
             filler += 100
-        self._insert(list(range(5000, 5040)), 500)
+        # Reclaim prices the shared pool jointly: the window rows free a full
+        # request part of the way, so the victim must leave too little room for
+        # the load and its new tokens together, not just for the full rows.
+        self._insert(list(range(5000, 5048)), 500)
         return match_tokens + list(range(17, 25)), expected
 
     def test_host_match_stays_pinned_while_reclaim_evicts_host_leaves(self):
@@ -537,7 +685,7 @@ class TestLoadBackAdmission(_UnifiedHiCacheCase):
         _, expected = self._insert(tokens, 100)
         self.cache.flush_pending_backups()
         self.cache.writing_check()
-        self.cache.evict(EvictParams(swa_num_tokens=len(tokens)))
+        self.cache.evict(EvictParams(window_num_tokens={self.window_pool: len(tokens)}))
         req = self._request(tokens + list(range(17, 21)))
         # A running request locks its whole path; only its SWA past the window
         # can be reclaimed.
@@ -547,7 +695,7 @@ class TestLoadBackAdmission(_UnifiedHiCacheCase):
         self.cache.writing_check()
         running_node = self._match(running).last_device_node
         pin = self.cache.inc_lock_ref(running_node).to_dec_params()
-        reclaimable_swa = self.cache.swa_evictable_size()
+        reclaimable_swa = window_evictable(self.cache)
         # The batch's decode tokens are pending demand on both bands. With
         # them, the load fits the shared gap only after that SWA is reclaimed.
         decode = 6 * PAGE
@@ -570,7 +718,7 @@ class TestLoadBackAdmission(_UnifiedHiCacheCase):
         self.assertEqual(len(moves), moved)
         # That room came from reclaiming the running request's out-of-window
         # SWA; its FULL rows and its window stay.
-        self.assertLess(self.cache.swa_evictable_size(), reclaimable_swa)
+        self.assertLess(window_evictable(self.cache), reclaimable_swa)
         self._assert_rows(running_ids, running_expected, swa_tail=self.window)
 
         self.cache.ready_to_load_host_cache()
@@ -580,6 +728,113 @@ class TestLoadBackAdmission(_UnifiedHiCacheCase):
         self.assertTrue(torch.equal(swa[-self.window :], expected[1][-self.window :]))
         self.allocator.free(torch.cat([own, pending]))
         self.cache.dec_lock_ref(running_node, pin)
+        self.assertEqual(self.allocator.verify_byte_accounting(), [])
+        self.cache.sanity_check()
+
+    # Window copies name their rows by the owner's token ids and translate them
+    # when submitted, so page moves need no pin while copies are queued or
+    # unacknowledged.
+
+    def test_pricing_ignores_queued_and_unacknowledged_copies(self):
+        self._cache(write_policy="write_through", tokens=64)
+        self._insert(list(range(1, 17)), 100)
+        self.assertTrue(self.controller.write_queue)
+        queued = chain_snapshot(self.allocator)
+        self.cache.flush_pending_backups()
+        self.assertTrue(self.controller.ack_write_queue)
+        unacknowledged = chain_snapshot(self.allocator)
+        self.cache.writing_check()
+        self.assertEqual(queued, chain_snapshot(self.allocator))
+        self.assertEqual(unacknowledged, chain_snapshot(self.allocator))
+
+    def test_queued_backup_follows_a_window_move_and_loads_back(self):
+        self._cache(write_policy="write_through", tokens=64)
+        swa = self.allocator.swa_attn_allocator
+        # Window rows below the node, freed once its backup is queued: the
+        # node's window pages then move down into them.
+        gap = self.allocator.alloc(2 * PAGE)
+        tokens = list(range(1, 17))
+        ids, expected = self._insert(tokens, 100)
+        self.assertTrue(self.controller.write_queue)
+        before = self.rows.swa_rows(ids)
+        self.allocator.free(gap)
+        moves = []
+        _record_moves(self.allocator, moves)
+        with _recorded_stream():
+            self.assertGreater(swa._flush(urgent=True), 0)
+        self.assertIn(("move", swa.sub_pool_name), moves)
+        after = self.rows.swa_rows(ids)
+        vacated = before[~torch.isin(before, after)]
+        self.assertGreater(vacated.numel(), 0)
+        # Reuse of the vacated rows: a copy still aimed at them reads this.
+        self.rows.swa[vacated] = -7
+        self._assert_rows(ids, expected, swa_tail=self.window)
+
+        # Submitted after the move: the copy reads where the rows went.
+        self.cache.flush_pending_backups()
+        self.cache.writing_check()
+        self.cache.evict(EvictParams(window_num_tokens={self.window_pool: len(tokens)}))
+        req = self._request(tokens + list(range(17, 21)))
+        verdict = self._adder().add_one_req(
+            req, has_chunked_req=False, truncation_align_size=None
+        )
+        self.assertIs(verdict, AddReqResult.CONTINUE)
+        (op,) = self.controller.load_queue
+        (window,) = [t for t in op.pool_transfers if t.name == self.window_pool]
+        owner = self.cache.prefix_device_indices(req)[-len(window.device_indices) :]
+        # The load-back's bound rows go by the owner's ids until submission.
+        self.assertTrue(torch.equal(window.device_indices, owner.to(torch.int64)))
+        self.cache.ready_to_load_host_cache()
+        self.cache.loading_check()
+        full, swa_rows = self.rows.read(self.cache.prefix_device_indices(req))
+        self.assertTrue(torch.equal(full, expected[0]))
+        self.assertTrue(
+            torch.equal(swa_rows[-self.window :], expected[1][-self.window :])
+        )
+        self.assertEqual(self.allocator.verify_byte_accounting(), [])
+        self.cache.sanity_check()
+
+    def test_reserved_rows_moved_before_submission_receive_the_load(self):
+        # A queued load-back's window rows stop being fixed once the tree names
+        # them by owner ids; a move before submission is followed by the copy.
+        self._cache(write_policy="write_through", tokens=64)
+        swa = self.allocator.swa_attn_allocator
+        tokens = list(range(1, 17))
+        ids, expected = self._insert(tokens, 100)
+        self.cache.flush_pending_backups()
+        self.cache.writing_check()
+        self.cache.evict(EvictParams(window_num_tokens={self.window_pool: len(tokens)}))
+        # Window rows that end up below the load's reservation, freed once the
+        # load is queued so that compaction moves the reserved rows into them.
+        gap = self.allocator.alloc(2 * PAGE)
+        req = self._request(tokens + list(range(17, 21)))
+        verdict = self._adder().add_one_req(
+            req, has_chunked_req=False, truncation_align_size=None
+        )
+        self.assertIs(verdict, AddReqResult.CONTINUE)
+        (op,) = self.controller.load_queue
+        (window,) = [t for t in op.pool_transfers if t.name == self.window_pool]
+        prefix = self.cache.prefix_device_indices(req)
+        owner = prefix[-len(window.device_indices) :].to(torch.int64)
+        self.assertTrue(torch.equal(window.device_indices, owner))
+        # Queued and named by owner ids: nothing of it is fixed any more.
+        self.assertEqual(dict(swa.usage.fixed), {})
+        before = self.rows.swa_rows(owner)
+        self.allocator.free(gap)
+        moves = []
+        _record_moves(self.allocator, moves)
+        with _recorded_stream():
+            self.assertGreater(swa._flush(urgent=True), 0)
+        self.assertIn(("move", swa.sub_pool_name), moves)
+        after = self.rows.swa_rows(owner)
+        self.assertFalse(torch.equal(before, after))
+        self.cache.ready_to_load_host_cache()
+        self.cache.loading_check()
+        full, swa_rows = self.rows.read(self.cache.prefix_device_indices(req))
+        self.assertTrue(torch.equal(full, expected[0]))
+        self.assertTrue(
+            torch.equal(swa_rows[-self.window :], expected[1][-self.window :])
+        )
         self.assertEqual(self.allocator.verify_byte_accounting(), [])
         self.cache.sanity_check()
 

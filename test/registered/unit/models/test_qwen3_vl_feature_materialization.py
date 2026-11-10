@@ -7,12 +7,9 @@ from unittest.mock import Mock, patch
 
 import torch
 
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalInputs,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.qwen_vl import QwenVLImageProcessor
 from sglang.srt.multimodal.transport.cuda_ipc import (
     BORROW_CUDA_IPC_FEATURE_KEY,
@@ -286,7 +283,7 @@ class TestQwen3VLFeatureMaterialization(CustomTestCase):
 
                 self.assertIs(output, encoded)
                 items[0].reconstruct.assert_not_called()
-                items[1].reconstruct.assert_called_once_with(0, ipc_consumer_count=8)
+                items[1].reconstruct.assert_called_once_with(0)
                 materialize.assert_called_once_with(
                     [items[1].feature], device=visual.device, dtype=visual.dtype
                 )

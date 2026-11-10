@@ -1,0 +1,14 @@
+{
+  "version": "1.0",
+  "truncation": null,
+  "padding": null,
+  "added_tokens": [
+    {"id": 3, "content": "<eot>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true},
+    {"id": 4, "content": "[UNK]", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "Whitespace"},
+  "post_processor": null,
+  "decoder": {"type": "Fuse"},
+  "model": {"type": "WordLevel", "vocab": {"a": 0, "b": 1, "c": 2, "<eot>": 3, "[UNK]": 4}, "unk_token": "[UNK]"}
+}

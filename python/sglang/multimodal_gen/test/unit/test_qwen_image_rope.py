@@ -1,12 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
 
+from unittest.mock import patch
+
 import pytest
 import torch
 
+from sglang.multimodal_gen.configs.models.dits.qwenimage import QwenImageDitConfig
+from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
+    QwenImagePipelineConfig,
+)
+from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.models.dits import qwen_image
 from sglang.multimodal_gen.runtime.models.dits.qwen_image import (
     QwenEmbedLayer3DRope,
     QwenEmbedRope,
+    QwenImageTransformer2DModel,
 )
+
+# the DiT's fused kernels need a GPU on a GPU platform; elsewhere run on the CPU
+_DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def _reference_freqs(coordinates, axes, device):
@@ -80,3 +92,65 @@ def test_qwen_image_rope_coordinates_and_device_lifecycle(
         rope._compute_video_freqs.cache_clear()
         if layered:
             rope._compute_condition_freqs.cache_clear()
+
+
+def _tiny_qwen_image_dit(num_layers):
+    config = QwenImageDitConfig()
+    for key, value in dict(
+        in_channels=8,
+        out_channels=8,
+        num_layers=num_layers,
+        attention_head_dim=128,
+        num_attention_heads=2,
+        joint_attention_dim=12,
+    ).items():
+        setattr(config.arch_config, key, value)
+    model = QwenImageTransformer2DModel(config, {})
+    generator = torch.Generator().manual_seed(0)
+    for param in model.parameters():
+        param.copy_(0.2 * torch.randn(param.shape, generator=generator))
+    return model.to(device=_DEVICE, dtype=torch.bfloat16)
+
+
+def _tiny_qwen_image_inputs(model, txt_seq_lens):
+    batch_size, txt_len = len(txt_seq_lens), max(txt_seq_lens)
+    img_shapes = [[(1, 2, 2)]] * batch_size
+    freqs_cis, freqs_complex = QwenImagePipelineConfig.get_freqs_cis(
+        img_shapes, txt_seq_lens, model.rotary_emb, _DEVICE, torch.bfloat16
+    )
+    generator = torch.Generator().manual_seed(1)
+    bf16 = dict(device=_DEVICE, dtype=torch.bfloat16)
+    return dict(
+        hidden_states=torch.randn(batch_size, 4, 8, generator=generator).to(**bf16),
+        encoder_hidden_states=torch.randn(
+            batch_size, txt_len, 12, generator=generator
+        ).to(**bf16),
+        timestep=torch.full((batch_size,), 500.0, **bf16),
+        img_shapes=img_shapes,
+        txt_seq_lens=txt_seq_lens,
+        freqs_cis=freqs_cis,
+        freqs_complex=freqs_complex,
+    )
+
+
+@torch.no_grad()
+def test_batched_text_varlen_metadata_is_built_once(single_process_model_parallel):
+    """Batched prompts of different lengths reuse their varlen metadata: building
+    it uploads the lengths from pageable memory, a host sync per step."""
+    model = _tiny_qwen_image_dit(num_layers=2)
+    inputs = _tiny_qwen_image_inputs(model, [3, 2])
+    inputs["encoder_hidden_states_mask"] = torch.tensor(
+        [[True, True, True], [True, True, False]], device=_DEVICE
+    )
+    qwen_image._text_image_varlen_meta.cache_clear()
+    with (
+        set_forward_context(current_timestep=0, attn_metadata=None),
+        patch.object(
+            qwen_image,
+            "build_varlen_mask_meta_from_ranges",
+            wraps=qwen_image.build_varlen_mask_meta_from_ranges,
+        ) as build,
+    ):
+        first, second = model(**inputs), model(**inputs)
+    assert build.call_count == 1
+    torch.testing.assert_close(second, first, atol=0, rtol=0)

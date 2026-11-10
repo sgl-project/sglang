@@ -15,7 +15,7 @@ from sglang.srt.speculative.dspark_components.dspark_verify import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 DEVICE = "cpu" if os.environ.get("TRITON_INTERPRET") == "1" else "cuda"
 
@@ -360,6 +360,7 @@ def test_dflash_family_accept_uses_block_verification(any_greedy):
                 corrected_logits=draft_logits,
                 greedy_mask=greedy_mask,
                 temperatures=torch.ones(batch, device=DEVICE),
+                greedy_draft=False,
             ),
             sampling_info=SimpleNamespace(
                 is_all_greedy=False,

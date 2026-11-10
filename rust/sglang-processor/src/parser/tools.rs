@@ -16,6 +16,7 @@ use dynamo_protocols::types::{
     FinishReason, FunctionCallStream, FunctionObject, FunctionType,
 };
 use futures::{Stream, StreamExt};
+use serde_json::Value;
 
 use super::ChatToolCallDelta;
 use crate::ProcessorError;
@@ -189,11 +190,17 @@ pub(super) fn post_tool_terminal_markers(parser: Option<&str>) -> &'static [&'st
 type ChunkStream =
     Pin<Box<dyn Stream<Item = Annotated<CreateChatCompletionStreamResponse>> + Send>>;
 
-fn tool_names(tools: Option<&[ToolDefinition]>) -> Vec<String> {
+/// The tools as the request lists them, which SGLang's detectors read.
+fn tool_values(tools: Option<&[ToolDefinition]>) -> Vec<Value> {
     tools
         .into_iter()
         .flatten()
-        .map(|tool| tool.name.clone())
+        .map(|tool| {
+            serde_json::json!({
+                "type": "function",
+                "function": {"name": tool.name, "parameters": tool.parameters},
+            })
+        })
         .collect()
 }
 
@@ -209,8 +216,8 @@ pub fn tool_call_stream<S>(
 where
     S: Stream<Item = Annotated<CreateChatCompletionStreamResponse>> + Send + 'static,
 {
-    let names = tool_names(tools.as_deref());
-    let Some(_) = tool_detector(parser, names.clone()) else {
+    let tool_values = tool_values(tools.as_deref());
+    let Some(_) = tool_detector(parser, &tool_values) else {
         let parser = dynamo_tool_parser_name(parser).to_owned();
         return Box::pin(apply_tool_calling_jail(
             Some(parser),
@@ -229,7 +236,7 @@ where
             for choice in item.data.iter_mut().flat_map(|chunk| chunk.choices.iter_mut()) {
                 let detector = detectors
                     .entry(choice.index)
-                    .or_insert_with(|| tool_detector(&parser, names.clone()).expect("checked"));
+                    .or_insert_with(|| tool_detector(&parser, &tool_values).expect("checked"));
                 let text = match choice.delta.content.take() {
                     Some(ChatCompletionMessageContent::Text(text)) => text,
                     _ => String::new(),
@@ -239,14 +246,18 @@ where
                     (!normal.is_empty()).then_some(ChatCompletionMessageContent::Text(normal));
                 if !calls.is_empty() {
                     called.insert(choice.index);
-                    let calls = calls.into_iter().map(|call| ChatCompletionMessageToolCallChunk {
-                        index: call.tool_index as u32,
-                        id: Some(tool_call_id()),
-                        r#type: Some(FunctionType::Function),
-                        function: Some(FunctionCallStream {
-                            name: Some(call.name),
-                            arguments: Some(call.parameters),
-                        }),
+                    // Python streams an id and name only for a non-empty name.
+                    let calls = calls.into_iter().map(|call| {
+                        let named = !call.name.is_empty();
+                        ChatCompletionMessageToolCallChunk {
+                            index: call.tool_index as u32,
+                            id: named.then(tool_call_id),
+                            r#type: Some(FunctionType::Function),
+                            function: Some(FunctionCallStream {
+                                name: named.then_some(call.name),
+                                arguments: Some(call.parameters),
+                            }),
+                        }
                     });
                     choice.delta.tool_calls = Some(calls.collect());
                 }
@@ -266,7 +277,7 @@ pub async fn parse_tool_calls(
     text: &str,
     tools: Option<&[ToolDefinition]>,
 ) -> Result<(Vec<ToolCallResponse>, Option<String>), String> {
-    let Some(detector) = tool_detector(parser, tool_names(tools)) else {
+    let Some(detector) = tool_detector(parser, &tool_values(tools)) else {
         let parser = dynamo_tool_parser_name(parser);
         return try_tool_call_parse_aggregate_finalize(text, Some(parser), tools)
             .await

@@ -46,6 +46,8 @@ def _convert_weights(weights: WeightIterator, dit_config: Any) -> WeightIterator
 
 
 _PARAM_NAMES_MAPPING = {
+    # GGUF skips _convert_weights; its fused qkv already matches to_qkv.
+    r"(.*)\.attention\.qkv\.(weight|bias)$": (r"\1.attention.to_qkv.\2", None, None),
     r"(.*)\.attention\.k_norm\.weight$": (r"\1.attention.norm_k.weight", None, None),
     r"(.*)\.attention\.q_norm\.weight$": (r"\1.attention.norm_q.weight", None, None),
     r"(.*)\.attention\.out\.weight$": (r"\1.attention.to_out.0.weight", None, None),

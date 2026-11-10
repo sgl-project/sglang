@@ -9,31 +9,35 @@ from sglang.kernels.ops.attention.cutedsl_kda import (
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
+from sglang.srt.layers.attention.linear.kernels.state_pool_io import state_pool_indices
 
 logger = logging.getLogger(__name__)
 
 
-def _is_blackwell() -> bool:
-    """True iff running on SM100+ (Blackwell), where the chunk prefill kernels run."""
+def _is_sm10x() -> bool:
+    """True iff on SM10x, the only arch with the tcgen05/TMEM the chunk prefill uses.
+
+    SM120 (desktop Blackwell) lacks tcgen05 despite its larger capability number.
+    """
     if not torch.cuda.is_available():
         return False
     major, _ = torch.cuda.get_device_capability()
-    return major >= 10
+    return major == 10
 
 
 class CuteDSLKDAKernel(LinearAttnKernelBase):
     """CuTe DSL kernel for KDA.
 
     Decode: ``cutedsl_fused_sigmoid_gating_kda_update`` (SM90+).
-    Extend (prefill): SM100 chunk pipeline ``chunk_kda_cutedsl`` (SM100+ only,
-    ``head_k_dim`` must be 128). On SM90 the prefill path is unsupported; callers
+    Extend (prefill): SM100 chunk pipeline ``chunk_kda_cutedsl`` (SM10x only,
+    ``head_k_dim`` must be 128). Elsewhere the prefill path is unsupported; callers
     query :attr:`supports_prefill` and fall back to Triton.
     """
 
     supports_safe_gate: bool = False
 
     def __init__(self):
-        self.supports_prefill = _is_blackwell()
+        self.supports_prefill = _is_sm10x()
         self._extend_fn: Optional[callable] = None
         self._l2norm_fn: Optional[callable] = None
 
@@ -47,7 +51,7 @@ class CuteDSLKDAKernel(LinearAttnKernelBase):
                 else -1
             )
             raise RuntimeError(
-                f"CuTe DSL KDA prefill requires SM100+ (Blackwell); got SM{major}."
+                f"CuTe DSL KDA prefill requires SM10x (tcgen05); got SM{major}."
             )
         if head_k_dim != 128:
             raise RuntimeError(
@@ -145,11 +149,8 @@ class CuteDSLKDAKernel(LinearAttnKernelBase):
         # Pool state I/O is fused into the h kernel's TMA load/store: pass the
         # pool + per-seq slots and the kernel reads h0/writes ht in place at
         # those rows (no gather/scatter kernels, no [N, HV, V, K] intermediates).
-        # Remap padding (-1) to the last (sentinel) slot. State is
-        # [slots, HV, V, K] == cutedsl [V,K] layout, no transpose needed.
-        ssm_cache_indices = torch.where(
-            cache_indices >= 0, cache_indices, ssm_states.shape[0] - 1
-        ).to(torch.int32)
+        # State is [slots, HV, V, K], matching the CuTe DSL layout.
+        ssm_cache_indices = state_pool_indices(cache_indices, dtype=torch.int32)
 
         o, _ = self._extend_fn(
             q_n,
