@@ -352,7 +352,12 @@ class TestFlushWithDocumentState(CustomTestCase):
         held = Req("w1", "", [1], SamplingParams())
         scheduler = object.__new__(Scheduler)
         scheduler.rust_server = Mock()
-        for name in ("tree_cache", "beam_coordinator", "uocr_runtime"):
+        for name in (
+            "tree_cache",
+            "beam_coordinator",
+            "uocr_runtime",
+            "output_streamer",
+        ):
             setattr(scheduler, name, Mock())
         scheduler.hisparse_coordinator = None
         scheduler.init_request_retirer()

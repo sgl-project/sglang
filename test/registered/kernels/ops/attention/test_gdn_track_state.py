@@ -62,6 +62,25 @@ class TestGdnTrackState(CustomTestCase):
         self.assertTrue(torch.isnan(snapshot[1]).all())
         self.assertTrue(torch.isfinite(snapshot[0]).all())
 
+        # Main's mapped output must coexist with the replay checkpoint snapshot.
+        mapped = torch.full(
+            (1, total * 2, heads, dim), 7, device=q.device, dtype=q.dtype
+        )
+        mapped_state = initial.clone()
+        mapped_snapshot = torch.full_like(snapshot, float("nan"))
+        mapped_output, _, _ = run(
+            mapped_state,
+            out=mapped,
+            output_indices=torch.arange(0, total * 2, 2, device=q.device),
+            track_state=mapped_snapshot,
+            track_chunk_idx=torch.tensor([1, -1], device=q.device, dtype=torch.int32),
+        )
+        torch.testing.assert_close(mapped_output[:, ::2], plain_output, rtol=0, atol=0)
+        self.assertTrue((mapped_output[:, 1::2] == 7).all())
+        torch.testing.assert_close(mapped_state, plain_state, rtol=0, atol=0)
+        torch.testing.assert_close(mapped_snapshot[0], snapshot[0], rtol=0, atol=0)
+        self.assertTrue(torch.isnan(mapped_snapshot[1]).all())
+
         reference = initial.clone()
         chunk_gated_delta_rule(
             q[:, :64].contiguous(),
