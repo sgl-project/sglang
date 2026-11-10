@@ -3709,9 +3709,7 @@ def _restore_hc_pp_state(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     hidden_states = pp_proxy_tensors["hidden_states"]
     if hidden_states.ndim == 2:
-        hidden_states = hidden_states.view(
-            hidden_states.shape[0], hc_mult, hidden_size
-        )
+        hidden_states = hidden_states.view(hidden_states.shape[0], hc_mult, hidden_size)
     return hidden_states, pp_proxy_tensors["hc_pre"]
 
 
@@ -4050,9 +4048,7 @@ class DeepseekV4Model(nn.Module):
                 assert (
                     not (self.start_layer <= last_source < self.end_layer)
                     or self.layers[last_source].engram is None
-                ), (
-                    "the last kv_source layer must not carry an Engram"
-                )
+                ), "the last kv_source layer must not carry an Engram"
                 # The tail layers read the top-k and candidates the source layer
                 # publishes inside the tail; no earlier layer carries them over.
                 assert (

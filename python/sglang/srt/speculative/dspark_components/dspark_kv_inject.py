@@ -11,10 +11,10 @@ from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
     is_unified_kv_triton,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.alloc.iteration_ids import Cols, IterationIds
 from sglang.srt.model_executor.forward_batch_info import compute_position
-from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 from sglang.srt.utils import is_pin_memory_available
 

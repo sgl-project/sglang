@@ -43,8 +43,8 @@ from sglang.srt.managers.overlap_utils import (
     offer_future_relay_buffers,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
@@ -75,7 +75,7 @@ from sglang.srt.utils.invariants import Bucket, Invariant, NotNaN, expect
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.scheduler import GenerationBatchResult
+    from sglang.srt.managers.utils import GenerationBatchResult
 
 _is_hip = is_hip()
 _is_npu = is_npu()

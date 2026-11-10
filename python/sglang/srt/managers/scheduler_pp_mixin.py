@@ -566,18 +566,14 @@ class SchedulerPPMixin:
                     self.decode_offload_manager.check_offload_progress()
 
                 if rmbs[next_mb_id] is not None:
-                    next_consensus_retract_rids = (
-                        self._pp_recv_pyobj_from_prev_stage()
-                    )
+                    next_consensus_retract_rids = self._pp_recv_pyobj_from_prev_stage()
                     next_consensus_retract_rids = self.process_retract_queue(
                         next_consensus_retract_rids
                     )
                 self._pp_commit_comm_work(send_consensus_retract_work)
 
                 if pmbs[next_mb_id] is not None:
-                    next_consensus_prealloc_rids = (
-                        self._pp_recv_pyobj_from_prev_stage()
-                    )
+                    next_consensus_prealloc_rids = self._pp_recv_pyobj_from_prev_stage()
                     next_consensus_prealloc_rids = self.process_prealloc_queue(
                         next_consensus_prealloc_rids
                     )

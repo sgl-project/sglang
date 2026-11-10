@@ -313,5 +313,6 @@ class TestDsparkReplicatedPPDraft(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "Decode.*disable-radix-cache"):
             _handle_dspark(args)
 
+
 if __name__ == "__main__":
     unittest.main()

@@ -283,11 +283,7 @@ class IterationIds:
                 return None
             assert tensor.numel() % batch_size == 0
             index = rows.to(device=tensor.device)
-            return (
-                tensor.reshape(batch_size, -1)
-                .index_select(0, index)
-                .reshape(-1)
-            )
+            return tensor.reshape(batch_size, -1).index_select(0, index).reshape(-1)
 
         plan = IterationIds(
             source=self._source,

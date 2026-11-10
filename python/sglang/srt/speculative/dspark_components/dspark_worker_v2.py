@@ -30,6 +30,7 @@ from sglang.srt.model_loader.weight_utils import get_pp_stage_load_group
 from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
+    get_memory,
     get_parallel,
     get_schedule,
     get_spec,
@@ -83,15 +84,15 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
     dp_global_verify_tier_num_tokens,
     idle_ragged_layout,
 )
-from sglang.srt.speculative.dspark_components.dspark_sampling_accept_graph import (
-    DsparkSamplingAcceptGraph,
-)
 from sglang.srt.speculative.dspark_components.dspark_pp import (
     PPDSparkCandidate,
     PPDSparkIdentity,
     draft_owner,
     owned_token_rows,
     validate_identities,
+)
+from sglang.srt.speculative.dspark_components.dspark_sampling_accept_graph import (
+    DsparkSamplingAcceptGraph,
 )
 from sglang.srt.speculative.dspark_components.dspark_verify import (
     CommitInjectCtx,
@@ -117,7 +118,7 @@ from sglang.srt.utils import (
     is_hip,
     is_npu,
 )
-from sglang.srt.utils.device import async_h2d, is_pin_memory_available
+from sglang.srt.utils.device import is_pin_memory_available
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -169,6 +170,8 @@ def sim_draw_ahead_enabled(simulated_correct_len: Optional[torch.Tensor]) -> boo
         envs.SGLANG_OPT_DSV41_DSPARK_SIM_DRAW_AHEAD.get()
         and simulated_correct_len is not None
     )
+
+
 @dataclass(frozen=True)
 class PPDSparkCommitState:
     rids: tuple[str, ...]

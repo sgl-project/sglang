@@ -26,10 +26,8 @@ from sglang.srt.mem_cache.kv.alloc.id_space import (  # noqa: E402
     IdSpaceKind,
 )
 from sglang.srt.mem_cache.kv.alloc.iteration_ids import IterationIds  # noqa: E402
-from sglang.srt.model_executor.forward_batch_info import (  # noqa: E402
-    ForwardMode,
-    PPProxyTensors,
-)
+from sglang.srt.model_executor.forward_batch_info import PPProxyTensors  # noqa: E402
+from sglang.srt.model_executor.forward_mode import ForwardMode  # noqa: E402
 from sglang.srt.model_executor.runner.base_runner import (  # noqa: E402
     _allocate_decode_buffers,
 )
@@ -67,12 +65,8 @@ class TestDSparkPPContext(CustomTestCase):
             return apply
 
         spaces = {
-            IdSpaceKind.FULL: IdSpace(
-                key="full", write=translate("full", 100)
-            ),
-            IdSpaceKind.SLIDING_WINDOW: IdSpace(
-                key="swa", write=translate("swa", 200)
-            ),
+            IdSpaceKind.FULL: IdSpace(key="full", write=translate("full", 100)),
+            IdSpaceKind.SLIDING_WINDOW: IdSpace(key="swa", write=translate("swa", 200)),
         }
         source = SimpleNamespace(space=spaces.__getitem__)
         plan = IterationIds(
@@ -92,18 +86,12 @@ class TestDSparkPPContext(CustomTestCase):
 
         selected = plan.take_rows(torch.tensor([2, 0]))
 
-        self.assertTrue(
-            torch.equal(selected.req_pool_indices, torch.tensor([9, 3]))
-        )
+        self.assertTrue(torch.equal(selected.req_pool_indices, torch.tensor([9, 3])))
         self.assertTrue(torch.equal(selected.seq_lens, torch.tensor([17, 11])))
-        self.assertTrue(
-            torch.equal(selected.seq_lens_cpu, torch.tensor([17, 11]))
-        )
+        self.assertTrue(torch.equal(selected.seq_lens_cpu, torch.tensor([17, 11])))
         expected_virtual = torch.cat((torch.arange(10, 15), torch.arange(5)))
         self.assertTrue(torch.equal(selected.write_virtual, expected_virtual))
-        self.assertTrue(
-            torch.equal(selected.write_physical, expected_virtual + 100)
-        )
+        self.assertTrue(torch.equal(selected.write_physical, expected_virtual + 100))
         self.assertTrue(
             torch.equal(
                 selected.write_ids(source, kind=IdSpaceKind.SLIDING_WINDOW),
