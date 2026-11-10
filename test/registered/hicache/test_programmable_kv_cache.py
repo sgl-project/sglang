@@ -22,7 +22,11 @@ from sglang.srt.managers.kv_control.contracts import (
 from sglang.srt.managers.kv_control.service import KVControlService, ServiceConfig
 from sglang.srt.managers.kv_hints import KvHintAction, KvHintsEnvelope
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
-from sglang.srt.mem_cache.base_prefix_cache import EvictParams, InsertParams
+from sglang.srt.mem_cache.base_prefix_cache import (
+    CacheRequestHandle,
+    EvictParams,
+    InsertParams,
+)
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
@@ -219,11 +223,34 @@ class TestProgrammableKVCache(CustomTestCase):
             self.assertEqual(claim.state, "invalidated")
             self.assertEqual(host.available_size(), available + len(tokens))
             self.assertFalse(cache.tree_core.root_node.children)
-            self._wait(
-                service,
-                public_action(
-                    service, "prefetch", target, location, {"tier": "host"}, "read"
-                ).ref,
+            request = CacheRequestHandle("inference-first", 0)
+            controller = cache.cache_controller
+            before = controller.storage_read_stats_snapshot()
+            with (
+                patch.object(cache, "prefetch_threshold", 1),
+                patch.object(cache, "prefetch_stop_policy", "wait_complete"),
+            ):
+                cache.prefetch_from_storage(
+                    request,
+                    cache.tree_core.root_node.id,
+                    array("q", tokens),
+                    cache_salt=service.cache_salt(None),
+                )
+                loaded = self._wait(
+                    service,
+                    public_action(
+                        service, "prefetch", target, location, {"tier": "host"}, "read"
+                    ).ref,
+                )
+                self.assertEqual(loaded.status, Status.COMPLETED)
+                self.assertEqual(
+                    cache.pop_prefetch_loaded_span(request), (len(tokens), 0)
+                )
+            after = controller.storage_read_stats_snapshot()
+            key = "storage_read_get_batches"
+            self.assertEqual(after[key] - before[key], 1)
+            self.assertEqual(
+                service.control.executor.storage_reads.stats["ordinary_reads_reused"], 1
             )
             path = service.control.executor._walk(
                 tokens, service.control.executor._compatibility(target)

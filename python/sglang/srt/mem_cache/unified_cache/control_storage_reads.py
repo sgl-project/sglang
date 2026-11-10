@@ -31,7 +31,7 @@ _MAX_DEMAND_BURST = 8
 
 @dataclass
 class _Read:
-    key: bytes
+    key: bytes | CacheRequestHandle
     tokens: tuple
     compatibility: object
     handle: CacheRequestHandle = field(
@@ -53,6 +53,10 @@ class _Read:
     admission_order: int = 0
     created_at: float = field(default_factory=time.monotonic)
     started_at: float | None = None
+
+    @property
+    def borrowed(self) -> bool:
+        return isinstance(self.key, CacheRequestHandle)
 
 
 @dataclass
@@ -81,7 +85,7 @@ class StorageCacheReads:
 
     def __init__(self, executor):
         self.executor, self.cache = executor, executor.cache
-        self.jobs: dict[bytes, _Read] = {}
+        self.jobs: dict[bytes | CacheRequestHandle, _Read] = {}
         self.interests: dict[str, _Interest] = {}
         self.demands: dict[CacheRequestHandle, _Demand] = {}
         self._joinable: dict[tuple, _Read] = {}
@@ -105,6 +109,7 @@ class StorageCacheReads:
             demand_consumed=0,
             demand_aborted=0,
             demand_limit_declined=0,
+            ordinary_reads_reused=0,
             jobs_created=0,
             interests_coalesced=0,
             jobs_started=0,
@@ -230,6 +235,8 @@ class StorageCacheReads:
 
     def _rows(self, job):
         path = self.executor._walk(job.tokens, job.compatibility)
+        if job.borrowed:
+            return [(node, start, matched) for node, start, _, matched in path]
         if any(end > len(job.tokens) or matched != end for _, _, end, matched in path):
             raise ControlError(
                 "unsupported", "Resident prefix must end at an existing radix boundary"
@@ -274,10 +281,64 @@ class StorageCacheReads:
             length = end
         return length
 
+    def _borrow_ordinary(self, tokens, compatibility):
+        end = len(tokens)
+        for request, info in self.cache.ongoing_prefetch.items():
+            op, suffix = info.operation, info.prefetch_key
+            prefix = getattr(op, "control_prefix", None)
+            start = op.storage_start
+            if (
+                prefix is None
+                or not start < end <= start + len(suffix)
+                or suffix.cache_salt != compatibility.cache_salt
+                or suffix.extra_key != compatibility.extra_key
+                or op.is_terminated()
+                or suffix.token_ids[end - start - 1] != tokens[-1]
+                or tuple(prefix) != tokens[:start]
+                or tuple(suffix.token_ids[: end - start]) != tokens[start:]
+            ):
+                continue
+            if (job := self.jobs.get(request)) is not None:
+                return job
+            if self.cache.prefetch_stop_policy != "wait_complete":
+                raise ControlError(
+                    "unavailable", "Compatible ordinary restore uses early stop"
+                )
+            if (
+                len(self.demands) >= self.executor.config.max_prepared_prefixes
+                or start + len(suffix)
+                > self.cache.kv_control_service.config.limits.max_scope_tokens
+            ):
+                raise ControlError(
+                    "unavailable", "Ordinary read interest capacity exhausted"
+                )
+            # The existing operation keeps its request handle, allocation and
+            # stop policy. Only its lifetime and publication become shared.
+            job = _Read(
+                request,
+                tokens[:start] + tuple(suffix.token_ids),
+                compatibility,
+                handle=request,
+                operation=op,
+            )
+            self.jobs[request] = job
+            self.demands[request] = _Demand(job, start)
+            job.demands.add(request)
+            self._observe_publication(job)
+            self.stats["ordinary_reads_reused"] += 1
+            return job
+        return None
+
+    def _observe_publication(self, job):
+        job.operation.native_quiescent = False
+        job.operation.native_on_publish = lambda: self._published(job)
+
     def start(self, work):
         tokens, compatibility = self._scope(work)
         key = hashlib.sha256(msgspec.json.encode((tokens, compatibility))).digest()
         job = self.jobs.get(key)
+        if job is None:
+            job = self._borrow_ordinary(tokens, compatibility)
         if job is None:
             job = _Read(
                 key,
@@ -390,8 +451,7 @@ class StorageCacheReads:
                     if job.demands
                     else 0
                 )
-            job.operation.native_quiescent = False
-            job.operation.native_on_publish = lambda: self._published(job)
+            self._observe_publication(job)
         except Exception as error:
             job.failure = (getattr(error, "code", "storage_error"), str(error)[:512])
             if job.operation is None:
@@ -583,62 +643,52 @@ class StorageCacheReads:
                 # after the previous drain's release-count snapshot.
                 self.cache.drain_storage_control_queues()
             length = self._host_length(job)
-            outcomes = []
-            for start, end in ((0, length), (length, len(job.tokens))):
-                if start == end:
-                    continue
-                ready = end <= length
-                outcomes.append(
-                    TargetOutcome(
-                        coverage=TokenRange(
-                            component="full", start_token=start, end_token=end
-                        ),
-                        status=Status.COMPLETED if ready else Status.MISSING,
-                        completed_steps=("destination_ready",) if ready else (),
-                        location=Location(
-                            tier="host",
-                            engine_id=self.executor.engine_id,
-                        ),
-                        code="" if ready else "missing_copy",
-                        content_id=self.executor._content_id(
-                            job.tokens[:end], FULL, job.compatibility
-                        ),
-                    )
-                )
+            scopes = {}
             for identity in job.interests:
                 interest = self.interests[identity]
-                terminal = (
-                    job.failure_status
-                    if job.failure
-                    else Status.CANCELLED
-                    if interest.cancelled
-                    else status
-                    or (
-                        Status.COMPLETED
-                        if length == len(job.tokens)
-                        else Status.PARTIAL
+                end = interest.work.target.requested.end_token
+                ready_end = min(end, length)
+                ready = ready_end == end
+                if end not in scopes:
+                    scopes[end] = self._outcomes(job, ready_end, end)
+                failure = job.failure
+                if (
+                    job.borrowed
+                    and ready
+                    and failure
+                    and failure[0]
+                    in (
+                        "missing_copy",
+                        "incomplete_storage_read",
                     )
+                ):
+                    failure = None
+                terminal = (
+                    Status.CANCELLED
+                    if interest.cancelled
+                    else job.failure_status
+                    if failure
+                    else status or (Status.COMPLETED if ready else Status.PARTIAL)
                 )
                 interest.result = ExecutionUpdate(
                     status=terminal,
                     quiescent=True,
-                    code=job.failure[0]
-                    if job.failure
-                    else "cancelled"
+                    code="cancelled"
                     if interest.cancelled
+                    else failure[0]
+                    if failure
                     else code,
-                    reason=job.failure[1] if job.failure else "",
-                    completed_steps=("destination_ready",)
-                    if length == len(job.tokens)
-                    else (),
-                    target_outcomes=tuple(outcomes),
+                    reason=failure[1] if failure else "",
+                    completed_steps=("destination_ready",) if ready else (),
+                    target_outcomes=scopes[end],
                 )
         finally:
             job.reserved_host_tokens = 0
             job.loaded_span = self.cache.pop_prefetch_loaded_span(job.handle)
-            self.stats["loaded_tokens"] += job.loaded_span[0]
-            if job.started_at is not None:
-                self.stats["restore_seconds"] += time.monotonic() - job.started_at
+            if not job.borrowed:
+                self.stats["loaded_tokens"] += job.loaded_span[0]
+                if job.started_at is not None:
+                    self.stats["restore_seconds"] += time.monotonic() - job.started_at
             outcome = (
                 "failed"
                 if job.failure
@@ -651,7 +701,8 @@ class StorageCacheReads:
                 if length == len(job.tokens)
                 else "failed"
             )
-            self.stats["jobs_" + outcome] += 1
+            if not job.borrowed:
+                self.stats["jobs_" + outcome] += 1
             job.retired = True
             key = self._demand_key(
                 job.tokens, job.compatibility.extra_key, job.compatibility.cache_salt
@@ -663,12 +714,32 @@ class StorageCacheReads:
             # ordinary match/load-back, just like a completed ordinary restore.
             if not job.demands:
                 self._release(job)
-            self.cache.discard_storage_prefetch_accounting(job.handle)
-            self.cache.storage_prefetch_retries.cancel(job.handle.rid)
-            self.cache._storage_prefetch_wait.pop(job.handle, None)
+            if not job.borrowed or job.handle not in job.demands:
+                self.cache.discard_storage_prefetch_accounting(job.handle)
+                self.cache.storage_prefetch_retries.cancel(job.handle.rid)
+                self.cache._storage_prefetch_wait.pop(job.handle, None)
             if job.operation is not None:
                 job.operation.native_on_publish = None
             self.jobs.pop(job.key)
+
+    def _outcomes(self, job, ready_end, end):
+        location = Location(tier="host", engine_id=self.executor.engine_id)
+        return tuple(
+            TargetOutcome(
+                coverage=TokenRange(
+                    component="full", start_token=left, end_token=right
+                ),
+                status=Status.COMPLETED if right == ready_end else Status.MISSING,
+                completed_steps=("destination_ready",) if right == ready_end else (),
+                location=location,
+                code="" if right == ready_end else "missing_copy",
+                content_id=self.executor._content_id(
+                    job.tokens[:right], FULL, job.compatibility
+                ),
+            )
+            for left, right in ((0, ready_end), (ready_end, end))
+            if left < right
+        )
 
     def _take(self, interest):
         if interest.result is not None:

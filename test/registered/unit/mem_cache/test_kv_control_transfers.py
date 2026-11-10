@@ -2106,6 +2106,113 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                 cache.release_aborted_request(demand)
             assert_retired(cache, service)
 
+    def test_late_hint_shares_covering_ordinary_io_and_its_own_receipt(self):
+        from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
+
+        for cancel in (None, "hint", "demand", "both_during_query"):
+            with (
+                self.subTest(cancel=cancel),
+                hicache(self, namespace_keys=True) as owner,
+            ):
+                cache, service, _ = cold_prefix(owner)
+                cc = cache.cache_controller
+                reads = service.control.executor.storage_reads
+                entered, release = threading.Event(), threading.Event()
+                calls = {"query": 0, "get": 0}
+                query, get = cc._storage_hit_query, cc.page_get_func
+                block_query = cancel == "both_during_query"
+
+                def counted_query(*args, **kwargs):
+                    calls["query"] += 1
+                    if block_query:
+                        entered.set()
+                        assert release.wait(5)
+                    return query(*args, **kwargs)
+
+                def counted_get(*args, **kwargs):
+                    calls["get"] += 1
+                    if not block_query:
+                        entered.set()
+                        assert release.wait(5)
+                    return get(*args, **kwargs)
+
+                demand = CacheRequestHandle("demand-first", 0)
+                try:
+                    with (
+                        patch.object(cc, "_storage_hit_query", counted_query),
+                        patch.object(cc, "page_get_func", counted_get),
+                        patch.object(cache, "prefetch_threshold", 1),
+                        patch.object(cache, "prefetch_stop_policy", "wait_complete"),
+                    ):
+                        cache.prefetch_from_storage(
+                            demand,
+                            cache.tree_core.root_node.id,
+                            cache_fixtures.array("q", [1, 2, 3, 4, 5]),
+                            matched_prefix_tokens=[],
+                            cache_salt=service.cache_salt(None),
+                        )
+                        operation = cache.ongoing_prefetch[demand].operation
+
+                        def started():
+                            cache.drain_storage_control_queues()
+                            return entered.is_set()
+
+                        wait_for(service, started)
+                        hint = transfer(service, message="late")
+                        self.assertEqual(hint.status, Status.RUNNING)
+                        self.assertIs(reads.jobs[demand].operation, operation)
+                        if cancel is None:
+                            longer = public_transfer(
+                                service,
+                                "prefetch",
+                                "storage",
+                                "host",
+                                "whole",
+                                tokens=(1, 2, 3, 4, 5),
+                            )
+                        if cancel in ("hint", "both_during_query"):
+                            cancelled = service.control.cancel(hint.ref)
+                            self.assertEqual(cancelled.status, Status.CANCELLING)
+                            self.assertFalse(cancelled.update.quiescent)
+                            self.assertFalse(operation.is_terminated())
+                        if cancel in ("demand", "both_during_query"):
+                            cache.release_aborted_request(demand)
+                            service.progress()
+                            self.assertEqual(operation.is_terminated(), block_query)
+                            self.assertFalse(current(service, hint).update.quiescent)
+
+                        release.set()
+                        done = wait(service, hint)
+                        self.assertEqual(
+                            done.status,
+                            Status.CANCELLED
+                            if cancel in ("hint", "both_during_query")
+                            else Status.COMPLETED,
+                        )
+                        if cancel is None:
+                            self.assertEqual(
+                                wait(service, longer).status, Status.FAILED
+                            )
+                            self.assertEqual(
+                                done.public_result.ready_scope[-1].coverage.end_token, 4
+                            )
+                        if cancel in (None, "hint"):
+                            self.assertTrue(cache.check_prefetch_progress(demand))
+                            self.assertEqual(cache.evict_host(4), 0)
+                            self.assertEqual(
+                                cache.pop_prefetch_loaded_span(demand), (4, 0)
+                            )
+                        self.assertEqual(
+                            calls, {"query": 1, "get": int(not block_query)}
+                        )
+                        self.assertEqual(reads.stats["ordinary_reads_reused"], 1)
+                        self.assertEqual(reads.stats["jobs_started"], 0)
+                finally:
+                    release.set()
+                    cache.release_aborted_request(demand)
+                assert_retired(cache, service)
+                cache.sanity_check()
+
     def test_native_demand_cancel_lifetimes_and_mismatches(self):
         from dataclasses import replace
 

@@ -2398,6 +2398,12 @@ class UnifiedRadixCache(BasePrefixCache):
         operation.storage_start = storage_start
         if minimum_prefetch_tokens is not None:
             operation.native_prefetch_threshold = threshold
+        elif (
+            native_reads is not None and not buffer_mode and not prefetch_key.is_bigram
+        ):
+            # Keep the already sliced request prefix for late control hints.
+            # Ordinary submission/allocation is otherwise unchanged.
+            operation.control_prefix = matched_prefix_tokens or ()
         if submission.decision is not None:
             return submission.decision
 
@@ -2968,6 +2974,10 @@ class UnifiedRadixCache(BasePrefixCache):
         ):
             return
         self.discard_storage_prefetch_accounting(request)
+        if reads is not None and request in reads.jobs:
+            # A control interest may still need this ordinary operation. The
+            # shared owner will cancel it only after its last interest leaves.
+            return
         if request not in self.ongoing_prefetch:
             return
 
@@ -3190,7 +3200,8 @@ class UnifiedRadixCache(BasePrefixCache):
         if info is None:
             return
         if (
-            getattr(info.operation, "native_query_done", False)
+            hasattr(info.operation, "native_quiescent")
+            and getattr(info.operation, "native_query_done", False)
             and info.host_indices is None
         ):
             info.operation.native_quiescent = True
@@ -3356,7 +3367,9 @@ class UnifiedRadixCache(BasePrefixCache):
                         break
                     parked.popleft()
             for operation in _drain_queue(cc.prefetch_hit_queue, n_storage_hit):
-                if hasattr(operation, "native_prefetch_threshold"):
+                if hasattr(operation, "native_quiescent") or hasattr(
+                    operation, "control_prefix"
+                ):
                     operation.native_query_done = True
                 threshold = getattr(
                     operation, "native_prefetch_threshold", self.prefetch_threshold
@@ -3366,6 +3379,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 hit_tokens = operation.storage_hit_count
                 info = self.ongoing_prefetch.get(request)
                 if info is None:
+                    if hasattr(operation, "native_quiescent"):
+                        operation.native_quiescent = True
                     if hit_tokens > 0:
                         self.discard_storage_prefetch_accounting(request)
                     continue
@@ -3438,7 +3453,7 @@ class UnifiedRadixCache(BasePrefixCache):
                                 else None
                             ),
                         )
-                    if hasattr(operation, "native_prefetch_threshold"):
+                    if hasattr(operation, "native_quiescent"):
                         operation.native_quiescent = True
 
         def _drain_backup():
