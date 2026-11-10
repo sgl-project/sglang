@@ -367,6 +367,8 @@ class DSAMetadata:
     # DeepSeek-V4 top-k v2 plan (cluster-threshold metadata) for the folded
     # decode top-k transform. None unless the SGL top-k v2 path is enabled.
     topk_v2_plan: Optional[torch.Tensor] = None
+    # HiSparse HiCache backend index pages can outlive their original attention KV pages.
+    indexer_page_table: Optional[torch.Tensor] = None
     # The sum of sequence lengths for key, prefill only
     seq_lens_sum: Optional[int] = None
     # The flattened 1D page table with shape (seq_lens_sum,), prefill only
@@ -4587,6 +4589,7 @@ class DeepseekSparseAttnBackend(
             )
         )
         return DSAIndexerMetadata(
+            indexer_page_table=self.forward_metadata.indexer_page_table,
             attn_metadata=self.forward_metadata,
             topk_transform_method=self.get_topk_transform_method(
                 forward_batch.forward_mode
