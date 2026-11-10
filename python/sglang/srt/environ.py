@@ -407,6 +407,9 @@ class Envs:
     SGLANG_PYSPY_DUMP_BEFORE_CRASH = EnvBool(True)
     SGLANG_CUDA_COREDUMP_BEFORE_CRASH = EnvBool(True)
     SGLANG_CUDA_COREDUMP_BEFORE_CRASH_WAIT_SECS = EnvFloat(60.0)
+    # Opt-in: on /health timeout, py-spy dump every sglang:: process of this
+    # server; minimum seconds between two dumps, 0 disables.
+    SGLANG_DEBUG_HEALTH_FAIL_PYSPY_DUMP_INTERVAL_SECS = EnvInt(0)
 
     # ===================================================================
     # Constrained decoding and grammar
