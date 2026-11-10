@@ -1002,12 +1002,13 @@ class TestKVControlStorage(cache_fixtures.KVCacheTestCase):
             self.assertEqual(node.component_data[FULL].lock_ref, 0)
 
     def test_storage_namespace_description_and_backend_mismatch(self):
+        from pathlib import Path
+
         from sglang.srt.managers.kv_control.contracts import ControlError
         from sglang.srt.managers.kv_control.service import Command
         from sglang.srt.mem_cache.unified_cache.storage_execution import (
             storage_execution_adapter,
         )
-        from pathlib import Path
 
         with hicache(self, namespace_keys=True) as owner:
             _, cache, service, dma = owner
@@ -1741,11 +1742,11 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
     def test_storage_admission_config_validation_and_optional_defaults(self):
         from dataclasses import replace
 
+        from sglang.srt.mem_cache.unified_cache.control_state import (
+            CacheControlConfig,
+        )
         from sglang.srt.mem_cache.unified_cache.control_storage_reads import (
             StorageCacheReads,
-        )
-        from sglang.srt.mem_cache.unified_cache.priority_claims import (
-            CacheControlConfig,
         )
 
         names = (
@@ -2136,7 +2137,7 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
             cache.sanity_check()
 
     def test_storage_pipeline_config_defaults_bounds_and_public_wiring(self):
-        from sglang.srt.mem_cache.unified_cache.priority_claims import (
+        from sglang.srt.mem_cache.unified_cache.control_state import (
             CacheControlConfig,
         )
 
@@ -3103,9 +3104,10 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
 
     def test_native_demand_cancel_lifetimes_and_mismatches(self):
         from dataclasses import replace
+
+        from sglang.srt.managers.schedule_batch import split_cached_prefix_by_tier
         from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
         from sglang.srt.mem_cache.radix_cache import RadixKey
-        from sglang.srt.managers.schedule_batch import split_cached_prefix_by_tier
 
         for abort_demand in (False, True):
             with (
@@ -3231,8 +3233,8 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                 assert_retired(cache, service)
 
     def test_native_demand_partial_failure_and_abort_leave_no_holds(self):
-        from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
         from sglang.srt.managers.schedule_batch import split_cached_prefix_by_tier
+        from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 
         with hicache(self, namespace_keys=True) as owner:
             cache, service, dma = cold_prefix(owner)
@@ -3283,8 +3285,8 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
             assert_retired(cache, service)
 
     def test_native_demand_published_prefix_and_disabled_control(self):
-        from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
         from sglang.srt.managers.schedule_batch import split_cached_prefix_by_tier
+        from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 
         with hicache(self, namespace_keys=True) as owner:
             cache, service, dma = cold_prefix(owner)

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Native priority and persistent-host execution on Python radix copies."""
+"""Persistent-host cache control on Python radix copies."""
 
 from __future__ import annotations
 
@@ -16,7 +16,6 @@ from sglang.srt.managers.kv_control.contracts import (
     CopyTo,
     ExecutionUpdate,
     Location,
-    SetPriority,
     Status,
     TargetOutcome,
     TokenRange,
@@ -29,7 +28,7 @@ from sglang.srt.managers.kv_control.controller import ExecutionRequest
 from sglang.srt.managers.kv_control.index import ResolvedTarget
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
-from sglang.srt.mem_cache.unified_cache.priority_claims import CopySelection
+from sglang.srt.mem_cache.unified_cache.control_state import CopySelection
 
 
 class ResidencyEntry(Value):
@@ -37,7 +36,6 @@ class ResidencyEntry(Value):
     descriptor: ContentSpan
     coverage_kind: str
     window_size: int | None
-    effective_priority: int
     lock_ref: int
     location: Location = Location(tier="gpu")
 
@@ -81,22 +79,22 @@ class UnifiedCacheExecutor:
     def __init__(self, cache, *, engine_id: str, engine_epoch: str):
         self.cache = cache
         self.core = cache.tree_core
-        self.claims = getattr(self.core, "priority_claims", None)
-        if self.claims is None:
-            raise ControlError("unsupported", "Cache copy priorities are disabled")
+        self.control_state = getattr(self.core, "control_state", None)
+        if self.control_state is None:
+            raise ControlError("unsupported", "KV control is disabled")
         if threading.get_ident() != cache._kv_control_owner_thread:
             raise ControlError(
                 "wrong_owner", "Bind cache control on the cache owner thread"
             )
-        self.claims.bind(engine_id, engine_epoch)
-        self.config = self.claims.config
+        self.control_state.bind(engine_id, engine_epoch)
+        self.config = self.control_state.config
         self.engine_id, self.engine_epoch = engine_id, engine_epoch
         self.layout_id = "python:{}:p{}:w{}".format(
             "+".join(ct.name.lower() for ct in self.core.component_types),
             self.core.page_size,
             cache._sliding_window_size or 0,
         )
-        self.generation = self.claims.generation
+        self.generation = self.control_state.generation
         self._thread = threading.get_ident()
         self.gpu_copy_capacity = None
         self.cache_salt_transform = None
@@ -188,7 +186,7 @@ class UnifiedCacheExecutor:
             )
         if (
             target.engine_epoch != self.engine_epoch
-            or self.claims.generation != self.generation
+            or self.control_state.generation != self.generation
         ):
             raise ControlError("stale_epoch", "Cache control generation changed")
         if target.namespace != self.config.namespace:
@@ -207,7 +205,7 @@ class UnifiedCacheExecutor:
         reason = self.cache._kv_control_unsupported_reason
         if self.core.enable_hicache:
             reason = reason or self._transfer_unsupported_reason()
-        if self.claims.generation != self.generation:
+        if self.control_state.generation != self.generation:
             reason = "Cache generation changed; construct a new epoch-bound executor"
         supported = not reason and not self.core.enable_external_cache_linker
         return {
@@ -227,12 +225,8 @@ class UnifiedCacheExecutor:
             "cache_generation": self.generation,
             "tree_core": "python",
             "layout_id": self.layout_id,
-            "actions": (
-                ("sglang.set_priority", "sglang.copy_to", "sglang.move_to")
-                if self.transfers is not None
-                else ("sglang.set_priority",)
-            )
-            if supported
+            "actions": ("sglang.copy_to", "sglang.move_to")
+            if supported and self.transfers is not None
             else (),
             "components": tuple(ct.name.lower() for ct in self.core.component_types)
             if supported
@@ -691,78 +685,6 @@ class UnifiedCacheExecutor:
                 raise ControlError("capacity", "Cache result scope exceeds budget")
         return rows, missing
 
-    def _plan_splits(self, rows):
-        cuts = {}
-        for row in rows:
-            if row.kind != "checkpoint":
-                cuts.setdefault(row.selection.node.id, set()).update(
-                    (row.selection.start, row.selection.end)
-                )
-        planned = []
-        for row in rows:
-            if row.kind == "checkpoint":
-                planned.append(row)
-                continue
-            boundaries = (
-                [row.selection.start]
-                + sorted(
-                    c
-                    for c in cuts[row.selection.node.id]
-                    if row.selection.start < c < row.selection.end
-                )
-                + [row.selection.end]
-            )
-            planned.extend(
-                replace(
-                    row,
-                    selection=CopySelection(
-                        row.selection.node, row.selection.component, a, b
-                    ),
-                )
-                for a, b in zip(boundaries, boundaries[1:])
-            )
-        return planned, cuts
-
-    def _split(self, rows, cuts):
-        fragments = {}
-        for row in rows:
-            original = row.selection.node
-            if original.id in fragments:
-                continue
-            current, start, parts = original, row.node_start, []
-            for boundary in sorted(
-                c
-                for c in cuts.get(original.id, ())
-                if row.node_start < c < row.node_end
-            ):
-                parent, action = self.core._split_node(
-                    current.key, current, boundary - start
-                )
-                assert action is None, "control excludes in-flight cache transfers"
-                parts.append((parent, start, boundary))
-                start = boundary
-            parts.append((current, start, row.node_end))
-            fragments[original.id] = parts
-        result = []
-        for row in rows:
-            for node, start, end in fragments[row.selection.node.id]:
-                selected = row.selection
-                if (row.kind == "checkpoint" and end == selected.end) or (
-                    row.kind != "checkpoint"
-                    and start <= selected.start
-                    and selected.end <= end
-                ):
-                    result.append(
-                        replace(
-                            row,
-                            selection=CopySelection(
-                                node, selected.component, selected.start, selected.end
-                            ),
-                        )
-                    )
-                    break
-        return result
-
     def _descriptor(self, row):
         selected = row.selection
         return ContentSpan(
@@ -798,12 +720,7 @@ class UnifiedCacheExecutor:
         try:
             self._refresh_storage_adapter()
             payload = work.payload
-            locations = (
-                (payload.location,)
-                if isinstance(payload, SetPriority)
-                else (payload.src, payload.dst)
-            )
-            for location in locations:
+            for location in (payload.src, payload.dst):
                 if location.backend_namespace is not None and (
                     location.tier != "storage"
                     or self.storage_adapter is None
@@ -818,89 +735,13 @@ class UnifiedCacheExecutor:
                 or work.ref.context.engine_epoch != self.engine_epoch
             ):
                 raise ControlError("stale_epoch", "Executor owner identity differs")
-            if not isinstance(work.payload, SetPriority) and self.transfers is not None:
-                if work.payload.dst.tier == "storage" and self.storage is not None:
-                    return self.storage.start(work)
-                if (
-                    work.payload.src.tier == "storage"
-                    and self.storage_reads is not None
-                ):
-                    return self.storage_reads.start(work)
-                return self.transfers.start(work)
-            if not isinstance(work.payload, SetPriority):
-                raise ControlError(
-                    "unsupported", "Cache movement has no executable adapter"
-                )
-            location = work.payload.location
-            if (
-                location.tier != "gpu"
-                or location.backend is not None
-                or location.engine_id not in (None, self.engine_id)
-            ):
-                raise ControlError(
-                    "unsupported", "Only the local device cache priority is supported"
-                )
-            limit = min(self.config.max_result_targets, work.max_result_targets)
-            rows, missing = self._resolve(work.target, limit)
-            rows, cuts = self._plan_splits(rows)
-            if len(rows) + len(missing) > limit:
-                raise ControlError("capacity", "Split result scope exceeds budget")
-            if not rows:
-                unsupported = missing and all(
-                    gap.status == Status.UNSUPPORTED for gap in missing
-                )
-                return ExecutionUpdate(
-                    status=Status.UNSUPPORTED if unsupported else Status.MISSING,
-                    quiescent=True,
-                    code="unaligned" if unsupported else "missing_copy",
-                    target_outcomes=tuple(missing),
-                )
-            self.claims.preflight(
-                [row.selection for row in rows],
-                work.payload,
-                work.ref.context.caller_id,
-                origin=work.origin,
-            )
-            # All scope, compatibility, result and claim budgets pass before
-            # splitting or changing claims. The synchronous owner cannot race.
-            rows = self._split(rows, cuts)
-            changed = self.claims.apply(
-                [row.selection for row in rows],
-                work.payload,
-                work.ref.context.caller_id,
-                origin=work.origin,
-            )
-            step = (
-                "priority_cleared" if work.payload.value is None else "priority_applied"
-            )
-            outcomes = []
-            for row in rows:
-                descriptor = self._descriptor(row)
-                outcomes.append(
-                    TargetOutcome(
-                        branch_index=row.branch,
-                        coverage=TokenRange(
-                            component=descriptor.component,
-                            start_token=descriptor.start_token,
-                            end_token=descriptor.end_token,
-                        ),
-                        content_id=descriptor.content_id,
-                        coverage_kind=row.kind,
-                        window_size=row.window,
-                        status=Status.COMPLETED,
-                        location=Location(tier="gpu", engine_id=self.engine_id),
-                        completed_steps=(step,),
-                        code=""
-                        if (row.selection.node.id, row.selection.component) in changed
-                        else "revision_unchanged",
-                    )
-                )
-            return ExecutionUpdate(
-                status=Status.PARTIAL if missing else Status.COMPLETED,
-                quiescent=True,
-                completed_steps=(step,),
-                target_outcomes=tuple(outcomes + missing),
-            )
+            if self.transfers is None:
+                raise ControlError("unsupported", "Cache movement requires HiCache")
+            if payload.dst.tier == "storage" and self.storage is not None:
+                return self.storage.start(work)
+            if payload.src.tier == "storage" and self.storage_reads is not None:
+                return self.storage_reads.start(work)
+            return self.transfers.start(work)
         except ControlError as error:
             status = {
                 "unsupported": Status.UNSUPPORTED,
@@ -969,21 +810,13 @@ class UnifiedCacheExecutor:
             namespace=self.config.namespace,
             engine_epoch=self.engine_epoch,
             cache_generation=self.generation,
-            observed_at=self.claims.clock(),
+            observed_at=self.control_state.clock(),
             items=tuple(
                 ResidencyEntry(
                     branch_index=row.branch,
                     descriptor=self._descriptor(row),
                     coverage_kind=row.kind,
                     window_size=row.window,
-                    effective_priority=(
-                        self.claims.effective(
-                            row.selection.node, row.selection.component
-                        )
-                        or 0
-                    )
-                    if location.tier == "gpu"
-                    else 0,
                     lock_ref=getattr(
                         row.selection.node.component_data[row.selection.component],
                         "lock_ref" if location.tier == "gpu" else "host_lock_ref",

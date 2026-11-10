@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Serving control, request completion and weight namespace isolation."""
 
-import asyncio
 import unittest
 from array import array
 from contextlib import contextmanager
@@ -12,19 +11,12 @@ import msgspec
 import pytest
 import test_kv_control_cache as cache_fixtures
 import torch
-from fastapi import FastAPI
-from httpx import ASGITransport, AsyncClient
 
 from sglang.srt.managers.io_struct import (
     BeginWeightUpdateReqInput,
     EndWeightUpdateReqInput,
-    KVControlReqInput,
-    KVControlReqOutput,
-    msgpack_decode,
-    msgpack_encode,
 )
-from sglang.srt.managers.kv_control.contracts import Status, TokensTarget
-from sglang.srt.managers.kv_control.http import install_routes
+from sglang.srt.managers.kv_control.contracts import TokensTarget
 from sglang.srt.managers.kv_control.key_namespace import encode_cache_salt
 from sglang.srt.managers.kv_control.service import (
     KVControlService,
@@ -33,56 +25,16 @@ from sglang.srt.managers.kv_control.service import (
     runtime_config,
 )
 from sglang.srt.managers.kv_control.weight_lifecycle import weight_namespace
-from sglang.srt.managers.kv_hints import KvHintAction, KvHintsEnvelope
 from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req
 from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
 )
-from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
-
-
-def envelope(*, attached=False, message="message", opaque=False, invalid=False):
-    selection = "request_cached" if attached else msgspec.to_builtins(target())
-    actions = [
-        KvHintAction(
-            action_id="keep",
-            action_type="sglang.set_priority",
-            action_version="1.0",
-            payload={
-                "target": selection,
-                "location": {"tier": "gpu"},
-                "claim_id": "keep",
-                "revision": 1,
-                "value": 90,
-                "ttl_seconds": 10,
-            },
-        )
-    ]
-    if invalid:
-        actions.append(
-            KvHintAction(
-                action_id="bad",
-                action_type="sglang.set_priority",
-                action_version="1.0",
-                payload={"bad": "value"},
-            )
-        )
-    if opaque:
-        actions.append(
-            KvHintAction(
-                action_id="other",
-                action_type="backend.opaque",
-                action_version="8",
-                payload={"private": [1, 2]},
-            )
-        )
-    return KvHintsEnvelope(protocol_version="0.1", message_id=message, actions=actions)
 
 
 def serving_request(rid="same", *, salt=None):
@@ -121,145 +73,6 @@ insert, match_len, target = (
 
 
 class TestKVControlService(cache_fixtures.KVCacheTestCase):
-    def test_http_executes_real_priority_and_replay_and_epoch_checks(self):
-        with service_owner(self) as owner:
-            cache, service = owner
-            insert(cache, [1, 2, 3, 4])
-            insert(cache, [5, 6, 7, 8])
-
-            class Manager:
-                async def kv_control(self, command):
-                    wire = msgpack_decode(
-                        msgpack_encode(
-                            KVControlReqInput(request_id="rpc", command=command)
-                        )
-                    )
-                    reply = KVControlReqOutput(
-                        request_id=wire.request_id,
-                        result=dispatch(service, wire.command),
-                    )
-                    return msgpack_decode(msgpack_encode(reply)).result
-
-            app = FastAPI()
-            install_routes(app, lambda: Manager())
-
-            async def call():
-                async with AsyncClient(
-                    transport=ASGITransport(app), base_url="http://owner"
-                ) as client:
-                    cap = (await client.get("/v1/kv/capabilities")).json()["data"]
-                    assert (
-                        cap["engine_id"] == "engine"
-                        and cap["topology"] == "single_owner"
-                    )
-                    ctx = msgspec.to_builtins(service.control.context("router"))
-                    body = {
-                        "kind": "submit",
-                        "context": ctx,
-                        "envelope": msgspec.to_builtins(envelope()),
-                    }
-                    result = await client.post("/v1/kv/control", json=body)
-                    assert result.status_code == 200
-                    assert (
-                        result.json()["data"]["results"][0]["update"]["status"]
-                        == Status.COMPLETED.value
-                    )
-                    replayed = await client.post("/v1/kv/control", json=body)
-                    assert replayed.json()["data"]["replayed"]
-                    stale = await client.post(
-                        "/v1/kv/control",
-                        json={
-                            "kind": "capacity",
-                            "context": dict(ctx, engine_epoch="stale"),
-                        },
-                    )
-                    assert stale.status_code == 409
-
-            asyncio.run(call())
-            cache.evict(EvictParams(num_tokens=4))
-            assert match_len(cache, [1, 2, 3, 4]) == 4
-            assert match_len(cache, [5, 6, 7, 8]) == 0
-
-    def test_attached_fanout_lookup_does_not_mutate_shared_envelope(self):
-        with service_owner(self) as owner:
-            cache, service = owner
-            insert(cache, [1, 2, 3, 4])
-            hints = envelope(attached=True, opaque=True, invalid=True)
-            original = msgspec.json.encode(hints)
-            reqs = [serving_request(), serving_request()]
-            for req in reqs:
-                service.attach(req, hints)
-                assert len(req.kv_hints.actions) == 1
-                assert req.kv_hints.actions[0] is hints.actions[-1]
-            assert msgspec.json.encode(hints) == original
-            lookup = dispatch(
-                service,
-                {
-                    "kind": "lookup",
-                    "context": msgspec.to_builtins(service.control.context("request")),
-                    "message_id": "message",
-                },
-            )
-            refs = [message["results"][0]["ref"] for message in lookup["data"]]
-            assert (
-                len(refs) == 2
-                and refs[0]["context"]["binding_id"] != refs[1]["context"]["binding_id"]
-            )
-            assert service.has_pending
-            service.finish_request(reqs[0], aborted=True)
-            reqs[1].finished_reason = FINISH_LENGTH(1)
-            reqs[1].refresh_fill_ids()
-            service.finish_request(reqs[1], checkpointed=True, committed_len=4)
-            results = [
-                service.control.registry.query(
-                    msgspec.convert(
-                        r["context"], type=type(service.control.context("request"))
-                    ),
-                    "message",
-                ).results
-                for r in refs
-            ]
-            assert results[0][0].status == Status.CANCELLED
-            assert results[1][0].status == Status.COMPLETED
-            assert all((batch[1].status == Status.REJECTED for batch in results))
-            assert not service.has_pending
-
-    def test_real_release_binds_after_checkpoint_before_unlock_and_keeps_salt(self):
-        with service_owner(self) as owner:
-            cache, service = owner
-            req = serving_request(salt="tenant")
-            req.output_ids = array("q", [5])
-            req.finished_reason = FINISH_LENGTH(1)
-            cache.req_to_token_pool.alloc([req])
-            slots = cache.token_to_kv_pool_allocator.alloc(5)
-            cache.req_to_token_pool.write((req.kv.req_pool_idx, slice(0, 5)), slots)
-            req.kv.kv_committed_len = req.kv.kv_allocated_len = 5
-            service.attach(req, envelope(attached=True))
-            context = req.kv_control_context
-            observed = []
-            start = service.control.executor.start
-
-            def inspect(work):
-                observed.append(
-                    (
-                        req.kv.holds_kv,
-                        req.lock is not None,
-                        tuple(work.target.branches[0].content.token_ids),
-                    )
-                )
-                return start(work)
-
-            with patch.object(service.control.executor, "start", side_effect=inspect):
-                release_kv_cache(req, cache, checkpoint=True)
-            assert observed == [(True, True, (1, 2, 3, 4, 5))]
-            result = service.control.registry.query(context, "message").results[0]
-            assert result.status == Status.COMPLETED
-            assert not req.kv.holds_kv and req.lock is None
-            assert match_len(cache, [1, 2, 3, 4, 5], salt="tenant") == 5
-            assert match_len(cache, [1, 2, 3, 4, 5]) == 0
-            assert cache.token_to_kv_pool_allocator.available_size() == 59
-            cache.sanity_check()
-
     def test_runtime_profile_rejects_unsupported_config(self):
         for fields in [{"tp_size": 2}, {"disable_radix_cache": True}]:
             with self.subTest(fields=fields):
@@ -299,39 +112,6 @@ def namespace_target(service, salt=None):
     )
 
 
-def namespace_priority(
-    service, selection="request_cached", context=None, message="keep"
-):
-    selection = (
-        selection
-        if isinstance(selection, str)
-        else msgspec.json.decode(msgspec.json.encode(selection))
-    )
-    result = service.control.submit(
-        KvHintsEnvelope(
-            protocol_version="0.1",
-            message_id=message,
-            actions=[
-                KvHintAction(
-                    action_id="a",
-                    action_type="sglang.set_priority",
-                    action_version="1.0",
-                    payload={
-                        "target": selection,
-                        "location": {"tier": "gpu"},
-                        "claim_id": "c",
-                        "revision": 1,
-                        "value": 90,
-                        "ttl_seconds": 10,
-                    },
-                )
-            ],
-        ),
-        context or service.control.context("router"),
-    )
-    return result.results[0]
-
-
 class TestKVControlNamespaces(cache_fixtures.KVCacheTestCase):
     def test_ordinary_unhinted_request_and_independent_lookup_use_same_real_key(self):
         with service_owner(self, namespace_keys=True) as owner:
@@ -346,7 +126,7 @@ class TestKVControlNamespaces(cache_fixtures.KVCacheTestCase):
                     return TaggedReq(*args, **kwargs)
 
             cache, service = owner
-            raw_node = cache_fixtures.insert(cache, [1, 2, 3, 4, 5], salt=salt)
+            cache_fixtures.insert(cache, [1, 2, 3, 4, 5], salt=salt)
             scheduler = Scheduler.__new__(TaggedScheduler)
             scheduler.kv_control_service = service
             req = scheduler._new_generation_req(
@@ -363,19 +143,17 @@ class TestKVControlNamespaces(cache_fixtures.KVCacheTestCase):
             assert not hasattr(req, "kv_control_context")
             assert req.cache_salt == encode_cache_salt("ns", salt)
             assert req.kv_control_logical_cache_salt == salt
-            result = namespace_priority(service, namespace_target(service, salt))
-            assert result.status == Status.COMPLETED, result
             snapshot = service.control.executor.residency(
                 service.control.index.resolve(namespace_target(service, salt))
             )
-            assert snapshot.items and (not snapshot.missing)
-            assert all((row.effective_priority == 90 for row in snapshot.items))
             assert (
-                cache.tree_core.priority_claims.effective(
-                    raw_node, cache_fixtures.ComponentType.FULL
+                sum(
+                    item.descriptor.end_token - item.descriptor.start_token
+                    for item in snapshot.items
                 )
-                is None
+                == 5
             )
+            assert not snapshot.missing
             encoded_as_logical = service.control.executor.residency(
                 service.control.index.resolve(namespace_target(service, req.cache_salt))
             )

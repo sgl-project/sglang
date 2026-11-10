@@ -27,7 +27,6 @@ from sglang.srt.managers.kv_control.contracts import (
     Pin,
     Prefetch,
     Primitive,
-    SetPriority,
     Signal,
     Status,
     Submission,
@@ -38,7 +37,11 @@ from sglang.srt.managers.kv_control.contracts import (
     validated,
 )
 from sglang.srt.managers.kv_control.index import LogicalIndex, ResolvedTarget
-from sglang.srt.managers.kv_control.public import normalize_public, requested_outcomes
+from sglang.srt.managers.kv_control.public import (
+    PUBLIC_ACTIONS,
+    normalize_public,
+    requested_outcomes,
+)
 from sglang.srt.managers.kv_control.registry import OperationRegistry, snapshot_envelope
 from sglang.srt.managers.kv_hints import KvHintsEnvelope
 
@@ -48,9 +51,6 @@ class ExecutionRequest(Value):
     payload: Primitive
     target: ResolvedTarget
     max_result_targets: int = 4096
-    # Internal provenance, supplied by the owner. Public envelopes/contexts
-    # cannot choose policy authority by naming a caller or adding payload keys.
-    origin: Literal["explicit", "policy"] = "explicit"
     # Owner-selected semantics, never a caller-controlled primitive field.
     public_demote: bool = False
 
@@ -67,12 +67,7 @@ class Executor(Protocol):
 
     COPY requires destination publication after every required component/rank;
     MOVE reports destination publication and source reclamation separately.
-    Priority uses caller_id + claim_id, ordered revisions and independent TTLs
-    on current copy incarnations. No method may infer residency from this index.
-
-    An exception is NOT a quiescence certificate: the core retains the operation
-    in CANCELLING until poll/cancel supplies an explicit terminal update. After
-    retirement its result is FAILED with the original cause and observed progress.
+    Cancelling work drains outstanding backend access before releasing holds.
     """
 
     def start(self, work: ExecutionRequest) -> ExecutionUpdate: ...
@@ -91,7 +86,6 @@ class _Pending:
     cancel_sent: bool = False
     # Keep a bounded cause, never an exception/traceback retaining worker state.
     failure: tuple[str, str] | None = None
-    origin: Literal["explicit", "policy"] = "explicit"
     deadline: float | None = None
 
 
@@ -141,6 +135,7 @@ class KVControl:
         context: ControlContext,
         *,
         execute_primitives: bool = True,
+        public_only: bool = False,
     ) -> Submission:
         if type(execute_primitives) is not bool:
             raise ControlError("invalid_payload", "Execution support must be a bool")
@@ -162,6 +157,8 @@ class KVControl:
                     raise ControlError(
                         "unsupported", "Unsupported native protocol version"
                     )
+                if public_only and frozen.action_type not in PUBLIC_ACTIONS:
+                    raise ControlError("unsupported", "Use PIN, PREFETCH, or DEMOTE")
                 payload = parse_action(frozen.thaw())
                 if frozen.invalid_numbers:
                     raise ControlError(
@@ -190,7 +187,7 @@ class KVControl:
                             "incompatible_namespace", "Target namespace differs"
                         )
                 if not execute_primitives and isinstance(
-                    payload, (SetPriority, CopyTo, MoveTo, Pin)
+                    payload, (CopyTo, MoveTo, Pin)
                 ):
                     raise ControlError(
                         "unsupported",
@@ -210,12 +207,8 @@ class KVControl:
                                 )
                         else:
                             scope = self.index.resolve(payload.target)
-                if isinstance(payload, (SetPriority, CopyTo, MoveTo)):
-                    locations = (
-                        (payload.location,)
-                        if isinstance(payload, SetPriority)
-                        else (payload.src, payload.dst)
-                    )
+                if isinstance(payload, (CopyTo, MoveTo)):
+                    locations = (payload.src, payload.dst)
                     if any(
                         location.engine_id not in (None, context.engine_id)
                         for location in locations
@@ -251,7 +244,7 @@ class KVControl:
         for result, item in zip(submission.results, prepared):
             if not isinstance(item, ControlError):
                 payload, scope = item
-                if isinstance(payload, (SetPriority, CopyTo, MoveTo)) or (
+                if isinstance(payload, (CopyTo, MoveTo)) or (
                     isinstance(payload, Pin)
                     and payload.mode == "acquire"
                     and payload.target == "request_cached"
@@ -340,9 +333,7 @@ class KVControl:
         else:
             pending = self._pending[ref.operation_id]
             wait = ref.context.binding_id is not None and (
-                payload.target == "request_cached"
-                or isinstance(payload, SetPriority)
-                or payload.src.tier == "gpu"
+                payload.target == "request_cached" or payload.src.tier == "gpu"
             )
             if wait:
                 key = ref.context.caller_id, ref.context.binding_id
@@ -477,7 +468,6 @@ class KVControl:
                     payload=pending.payload,
                     target=pending.target,
                     max_result_targets=self.limits.max_scope_spans,
-                    origin=pending.origin,
                     public_demote=current.action_type == "sglang.demote",
                 )
             )
@@ -567,15 +557,11 @@ class KVControl:
                 "Executors cannot report logical mutations or create child operations",
             )
         payload = pending.payload
-        location = payload.location if isinstance(payload, SetPriority) else payload.dst
+        location = payload.dst
         required = (
-            ("priority_cleared" if payload.value is None else "priority_applied",)
-            if isinstance(payload, SetPriority)
-            else (
-                ("destination_ready", "source_reclaimed")
-                if isinstance(payload, MoveTo)
-                else ("destination_ready",)
-            )
+            ("destination_ready", "source_reclaimed")
+            if isinstance(payload, MoveTo)
+            else ("destination_ready",)
         )
         successful = []
         if "source_reclaimed" in update.completed_steps and (

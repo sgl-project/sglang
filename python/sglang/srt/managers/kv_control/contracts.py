@@ -9,6 +9,7 @@ from enum import Enum
 from typing import Annotated, Literal, TypeAlias
 
 import msgspec
+
 from sglang.srt.managers.kv_hints import KvHintAction
 
 PROTOCOL_VERSION = "0.1"
@@ -250,15 +251,6 @@ class ClaimState(Value):
     location: PublicLocation | None = None
 
 
-class SetPriority(Value):
-    target: Target
-    location: Location
-    claim_id: Identifier
-    revision: Position
-    value: Priority | None
-    ttl_seconds: Seconds | None = None
-
-
 class CopyTo(Value):
     target: Target
     src: Location
@@ -271,7 +263,7 @@ class MoveTo(Value):
     dst: Location
 
 
-Primitive: TypeAlias = SetPriority | CopyTo | MoveTo
+Primitive: TypeAlias = CopyTo | MoveTo
 
 
 class TaskReference(Value):
@@ -584,7 +576,6 @@ def validate_public(payload):
 def parse_action(action: KvHintAction) -> Payload:
     """Interpret only native names; generic forwarding never calls this parser."""
     schemas = {
-        "sglang.set_priority": SetPriority,
         "sglang.copy_to": CopyTo,
         "sglang.move_to": MoveTo,
         "sglang.associate": Associate,
@@ -602,27 +593,13 @@ def parse_action(action: KvHintAction) -> Payload:
         validate_target(payload.target)
     if isinstance(payload, (Prefetch, Pin)):
         validate_public(payload)
-    if isinstance(payload, (SetPriority, CopyTo, MoveTo)):
-        locations = (
-            (payload.location,)
-            if isinstance(payload, SetPriority)
-            else (payload.src, payload.dst)
+    if isinstance(payload, (CopyTo, MoveTo)) and any(
+        location.tier != "storage" and location.backend_namespace is not None
+        for location in (payload.src, payload.dst)
+    ):
+        raise ControlError(
+            "invalid_payload", "Only storage locations may name a backend namespace"
         )
-        if any(
-            location.tier != "storage" and location.backend_namespace is not None
-            for location in locations
-        ):
-            raise ControlError(
-                "invalid_payload", "Only storage locations may name a backend namespace"
-            )
-    if isinstance(payload, SetPriority):
-        if payload.value is None:
-            if payload.ttl_seconds is not None:
-                raise ControlError("invalid_payload", "Clearing a claim must omit TTL")
-        elif payload.ttl_seconds is None or not math.isfinite(payload.ttl_seconds):
-            raise ControlError(
-                "invalid_payload", "Priority requires a finite positive TTL"
-            )
     if isinstance(payload, Signal) and payload.resume_after_seconds is not None:
         if not math.isfinite(payload.resume_after_seconds):
             raise ControlError("invalid_payload", "Prediction must be finite")

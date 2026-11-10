@@ -9,6 +9,7 @@ from pathlib import Path
 
 import msgspec
 import pytest
+
 from sglang.srt.managers.kv_control import KVControl, LogicalIndex
 from sglang.srt.managers.kv_control.contracts import (
     Associate,
@@ -120,19 +121,6 @@ def movement(target=None, *, src="storage", dst="gpu"):
     }
 
 
-def priority(**changes):
-    result = {
-        "target": "request_cached",
-        "location": {"tier": "gpu"},
-        "claim_id": "router/claim",
-        "revision": 1,
-        "value": -20,
-        "ttl_seconds": 10,
-    }
-    result.update(changes)
-    return result
-
-
 def submit(core, *actions, message_id="m", context=None, protocol="0.1"):
     return core.submit(
         envelope(*actions, message_id=message_id, protocol=protocol),
@@ -180,7 +168,9 @@ class TestKVControl(CustomTestCase):
             action_version="9",
             payload=opaque_payload,
         )
-        invalid = action("set_priority", priority(value=True), action_id="bad")
+        invalid = action(
+            "copy_to", movement() | {"dst": {"tier": True}}, action_id="bad"
+        )
         unknown = action("future_action", {}, action_id="unsupported")
         assoc = action("associate", wire(association()))
         original = envelope(opaque, invalid, unknown, assoc)
@@ -205,7 +195,6 @@ class TestKVControl(CustomTestCase):
         for kind, payload, location in (
             ("copy_to", movement(src="gpu", dst="host"), "dst"),
             ("move_to", movement(src="gpu", dst="host"), "src"),
-            ("set_priority", priority(), "location"),
         ):
             payload[location]["backend_namespace"] = "storage-domain"
             result = submit(core, action(kind, payload), message_id=kind).results[0]
@@ -354,7 +343,9 @@ class TestKVControl(CustomTestCase):
         core = KVControl("engine", "ns", enabled=True, executor=boundary)
         context = core.context("router", binding_id="r")
         result = submit(
-            core, action("set_priority", priority()), context=context
+            core,
+            action("copy_to", movement() | {"target": "request_cached"}),
+            context=context,
         ).results[0]
         assert result.status == Status.QUEUED
         assert core.request_event(context, "checkpoint", committed=tokens()) == ()
@@ -369,7 +360,9 @@ class TestKVControl(CustomTestCase):
         )
         assert core.request_event(context, "success", committed=tokens((9,))) == ()
         assert submit(
-            core, action("set_priority", priority()), context=context
+            core,
+            action("copy_to", movement() | {"target": "request_cached"}),
+            context=context,
         ).replayed
         assert boundary.starts == 1
 
@@ -647,8 +640,8 @@ class TestPublicKVProtocol(CustomTestCase):
 
     def test_result_and_claim_vectors_remain_separate(self):
         from sglang.srt.managers.kv_control.contracts import (
-            PublicResult,
             ClaimState,
+            PublicResult,
             validated,
         )
 

@@ -15,7 +15,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.unified_cache.components.base import (
         TreeComponent,
     )
-    from sglang.srt.mem_cache.unified_cache.priority_claims import CacheControlConfig
+    from sglang.srt.mem_cache.unified_cache.control_state import CacheControlConfig
 
 
 @dataclasses.dataclass

@@ -11,6 +11,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Literal
 
 import msgspec
+
 from sglang.srt.managers.kv_control.contracts import ControlError
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 
@@ -147,8 +148,8 @@ class ProtectionRegistry:
         self._core = cache.tree_core
         self._root = self._core.root_node
         self._supported()
-        claims = self._core.priority_claims
-        if claims is not None and claims.config.namespace != namespace:
+        state = self._core.control_state
+        if state is not None and state.config.namespace != namespace:
             raise ControlError("incompatible_namespace", "Cache namespace differs")
         self.engine_id, self.engine_epoch, self.namespace = (
             engine_id,

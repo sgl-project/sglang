@@ -18,6 +18,7 @@ import test_kv_control_transfers as transfer_fixtures
 import torch
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
+
 from sglang.srt.managers.kv_control.contracts import (
     Associate,
     ControlError,
@@ -1316,6 +1317,10 @@ class TestKVControlPinRuntime(cache_fixtures.KVCacheTestCase):
             denied = dispatch(service, request)["data"]["results"][0]
             self.assertEqual(denied["update"]["status"], "unsupported")
             self.assertIsNone(denied["public_result"]["claim"])
+            legacy = pin_command(service, message="legacy")
+            legacy["envelope"]["actions"][0]["action_type"] = "sglang.set_priority"
+            denied = dispatch(service, legacy)["data"]["results"][0]
+            self.assertEqual(denied["update"]["status"], "unsupported")
             self.assertEqual(node.component_data[FULL].host_lock_ref, 0)
             cache.sanity_check()
 

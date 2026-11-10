@@ -1,104 +1,78 @@
 # Programmable KV cache
 
-Native KV control implements [RFC #45189](https://github.com/sgl-project/sglang/issues/45189).
-It is disabled by default. Enabling it allows explicit cache control commands.
+Native KV control is disabled by default. It lets a caller use three versioned
+actions:
 
-Native storage reads accept optional `cache_limits` settings:
-`max_storage_read_inflight_tokens`, `max_speculative_storage_read_tokens`,
-`demand_host_reserve_tokens`, and `storage_demand_priority`. Token budgets default
-to zero (disabled) and must be page aligned; priority defaults to false. The
-total-read gate counts ordinary read occupancy before admitting native work;
-ordinary inference retains its existing recovery path. The speculative budget
-counts native in-flight physical spans, not completed cache residency. A real
-demand joining that job changes its classification without duplicating I/O.
-Demand preference allows one background turn after eight demand admissions and
-preserves GPU FIFO and same-salt serialization. The host reserve is an admission
-floor, not a new allocation. A scope larger than its enabled budget is deferred.
-Read cost and capacity observations are available through the existing capacity
-query and `loads.memory.storage.prefetch_stats`; byte counters describe anchor
-KV API payload, and wire bytes remain unknown.
+| Action | Effect |
+| --- | --- |
+| `sglang.pin` | Acquire, renew, or release finite eviction protection for existing host KV. |
+| `sglang.prefetch` | Prepare a supported destination while keeping the source. |
+| `sglang.demote` | Preserve data at a lower tier, then reclaim the eligible source range. |
+
+The [Router orchestrator](../../../../../sgl-router/KV_ORCHESTRATION.md) uses
+these actions for application task and tool events. The executing Engine owns
+the allocation, transfer, and reference checks. Query actual target coverage
+and protection state before treating a receipt as proof of readiness.
 
 ## Configuration
 
 ```bash
 python -m sglang.launch_server --model-path MODEL_PATH \
+  --enable-hierarchical-cache --disable-overlap-schedule \
+  --hicache-storage-backend mooncake \
   --kv-control-config '{"namespace":"model-weights-v1","engine_id":"worker-a"}'
 ```
 
-The executable profile requires one TP/PP/CP/DP owner, the built-in unified
-cache, and ordinary text generation. Priority control supports FULL, SWA and
-Mamba components through the Python tree backend. Copy and move require FULL
-attention, persistent-host HiCache, and `--disable-overlap-schedule`. Enable
-HiCache with `--enable-hierarchical-cache`; storage transfers use `--hicache-storage-backend mooncake` or `file` with the
-matching backend configuration.
-
-Remote engines, buffer-only/direct-linker transfers, speculative decoding, PD
-disaggregation, LoRA, multimodal and streaming-session control are unsupported.
-Capability discovery reports the active profile; an unsupported operation does
-not imply successful publication or cache reuse.
+Configure the Mooncake backend separately. The file backend is also useful for
+local tests. Transfers and PIN require a built-in FULL-attention cache with
+persistent host HiCache. The serving profile has one TP/PP/CP/DP owner and
+ordinary text requests. Discovery reports which actions and directions the
+current backend can execute.
 
 ## Control API
 
 Use `GET /v1/kv/capabilities` for discovery and `POST /v1/kv/control` for commands.
-The Python engine exposes `kv_control(command)` and `async_kv_control(command)`.
-An inference request can attach the existing `KvHintsEnvelope` through
-`kv_hints`; other consumers' actions remain available to those consumers.
-
-Control commands use `engine_id`, `engine_epoch` and `namespace` from discovery,
-a caller-supplied `caller_id`, and a versioned envelope:
+The Python Engine exposes `kv_control(command)` and `async_kv_control(command)`.
+Use the Engine ID, epoch and namespace returned by discovery in every command:
 
 ```json
 {
   "kind": "submit",
   "context": {
     "engine_id": "worker-a",
-    "engine_epoch": "EPOCH_FROM_DISCOVERY",
+    "engine_epoch": "epoch-from-discovery",
     "namespace": "model-weights-v1",
-    "caller_id": "router"
+    "caller_id": "trusted-controller"
   },
   "envelope": {
     "protocol_version": "0.1",
-    "message_id": "retain-prefix-1",
+    "message_id": "keep-prefix-1",
     "actions": [{
       "action_id": "keep",
-      "action_type": "sglang.set_priority",
+      "action_type": "sglang.pin",
       "action_version": "1.0",
       "payload": {
         "target": {"kind": "tokens", "namespace": "model-weights-v1", "token_ids": [1, 2, 3, 4]},
-        "location": {"tier": "gpu"},
+        "location": {"tier": "host"},
+        "mode": "acquire",
         "claim_id": "prefix-1",
         "revision": 1,
-        "value": 90,
-        "ttl_seconds": 30
+        "ttl_seconds": 30,
+        "required_protection": "eviction_exclusion"
       }
     }]
   }
 }
 ```
 
-| Action | Behavior |
-| --- | --- |
-| `sglang.set_priority` | Apply or clear a signed, expiring priority on existing copies. |
-| `sglang.copy_to` | Publish a destination copy while keeping the source. |
-| `sglang.move_to` | Publish the destination, then reclaim eligible source state. |
-| `sglang.associate` | Associate an append-only continuation with a logical task. |
-| `sglang.finish_task` | Remove task associations and abandon its pending interests. |
-| `sglang.signal` | Reports an unconsumed Engine signal; use Router lifecycle events to request actions. |
+Use a target that matches the worker's page size, layout and cache salt. A PIN
+requires an already published host copy; it does not copy missing data. An
+attached PIN targeting `"request_cached"` binds only after successful request
+completion and cache checkpointing.
 
-Targets identify token prefixes, logical content descriptors, or tracked session
-continuations. The attached-request target `"request_cached"` binds only after
-successful completion and cache checkpointing. Cache salt and model/weight
-namespace must match the request that produced the KV.
-
-Priorities are soft: active request/transfer references remain protected, and
-memory pressure can evict any unreferenced copy. Explicit priorities take
-precedence over session eviction preferences. Expiry, copy
-eviction and cache generation changes end a claim; cache hits do not renew it.
-PIN is a separate finite L2 eviction protection claim, not a copy priority.
-
-Use `query`, `ack` and `cancel` commands with the returned operation references.
-Message replay is idempotent within bounded retention; changed payloads conflict.
-Cancellation drains outstanding worker access before releasing resources.
-`deferred` is a terminal resource refusal and requires a new message ID to retry.
-Task cleanup does not delete shared KV bytes. Weight updates fence inference and
-rotate the lookup namespace before parameter mutation; stale contexts are rejected.
+Use `query` and `claim` to inspect the result. `cancel` drains worker access before
+releasing resources. Acknowledge with `ack` once the operation is quiescent. An
+identical message can be replayed within the retention window; a changed payload
+with the same identity is rejected. Capacity refusal preserves the inference
+request's normal recovery path. DEMOTE can confirm preservation and report
+that a source range is blocked by a live GPU copy, reference, or PIN.

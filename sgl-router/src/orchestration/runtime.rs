@@ -929,24 +929,6 @@ impl Actor {
                                 json!({"state":"on_demand_fallback","estimated_ms":cost,"reason":"insufficient preparation lead"}),
                             );
                         }
-                        if event == "tool_wait" && value["retention"].is_object() {
-                            let retention = &value["retention"];
-                            let pin_id = format!("policy-pin-{}", digest(&(&task, id)));
-                            let pin = json!({"kind":"submit","task":value.get("task").unwrap_or(&value),"message_id":pin_id,
-                                "action":"sglang.pin","target":value.get("target").cloned().unwrap_or(Value::Null),
-                                "location":{"tier":"host"},"mode":"acquire","claim_id":pin_id,"revision":revision,
-                                "ttl_seconds":retention["ttl_seconds"],"required_protection":retention["required_protection"]});
-                            let pin_demand = DemandId {
-                                task: task.clone(),
-                                id: pin_id,
-                            };
-                            let retained = self.submit(pin, task.clone(), pin_demand).await;
-                            if !value["pressure"].as_bool().unwrap_or(false) {
-                                return Ok(
-                                    json!({"retention":retained.unwrap_or_else(|e|error("unsupported",e)),"demote":"skipped_no_pressure"}),
-                                );
-                            }
-                        }
                         if event == "tool_wait"
                             && (!value["pressure"].as_bool().unwrap_or(false)
                                 || value["expected_wait_ms"].as_u64().unwrap_or(0)

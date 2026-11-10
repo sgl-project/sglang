@@ -44,13 +44,10 @@ from sglang.srt.mem_cache.unified_cache.control_protection import (
     HostCacheProtection,
     ProtectionLimits,
 )
-from sglang.srt.mem_cache.unified_cache.priority_claims import CacheControlConfig
+from sglang.srt.mem_cache.unified_cache.control_state import CacheControlConfig
 
 
 class CacheLimits(Value):
-    max_copy_units: int = 65536
-    max_claims_per_copy: int = 16
-    max_policy_claims_per_copy: int = 4
     max_query_nodes: int = 4096
     max_result_targets: int = 4096
     max_prepared_prefixes: int = 128
@@ -267,7 +264,7 @@ class KVControlService:
         )
         self.control.executor = self._bind_executor()
         capabilities = self.control.executor.capabilities()
-        if not capabilities["actions"]:
+        if capabilities["reason"]:
             raise ValueError(
                 "KV control cache is unsupported: " + capabilities["reason"]
             )
@@ -397,9 +394,9 @@ class KVControlService:
         capacity = self.control.executor.gpu_copy_capacity
         self.control.reset(namespace)
         self.config = msgspec.structs.replace(self.config, namespace=namespace)
-        claims = self.cache.tree_core.priority_claims
-        claims.config = replace(claims.config, namespace=namespace)
-        claims.reset()
+        state = self.cache.tree_core.control_state
+        state.config = replace(state.config, namespace=namespace)
+        state.reset()
         self.control.executor = self._bind_executor(capacity)
         self._bind_feedback()
 
@@ -457,9 +454,10 @@ class KVControlService:
 
         registry = self.control.registry
         executor = self.control.executor.capabilities()
+        public = public_capabilities(executor)
         return {
             "enabled": True,
-            "public_protocol": public_capabilities(executor),
+            "public_protocol": public,
             "feedback": {
                 **self.feedback.describe(),
                 "cache_watermark": self.cache_watermark(),
@@ -467,7 +465,7 @@ class KVControlService:
             "engine_id": registry.engine_id,
             "engine_epoch": registry.engine_epoch,
             "namespace": registry.namespace,
-            "executor": executor,
+            "executor": {**executor, "actions": tuple(public["actions"])},
             "topology": "single_owner",
             "attached_caller_id": "request",
             "weight_updates": "guarded_transactions"
@@ -485,9 +483,8 @@ class KVControlService:
     @property
     def has_pending(self):
         reads = self.control.executor.storage_reads
-        return (
-            self.control.registry.capacity()["active"] != 0
-            or (reads is not None and bool(reads.demands))
+        return self.control.registry.capacity()["active"] != 0 or (
+            reads is not None and bool(reads.demands)
         )
 
     @property
@@ -588,7 +585,7 @@ class KVControlService:
         # Refuse this request's physical work without removing the owner that
         # must still cancel/drain existing transfers on logical task cleanup.
         submission = self.control.submit(
-            envelope, context, execute_primitives=not unsupported
+            envelope, context, execute_primitives=not unsupported, public_only=True
         )
         req.kv_control_context = context
         req.kv_hints = msgspec.structs.replace(
@@ -695,7 +692,7 @@ class KVControlService:
                 )
             # Independent control has no external consumer. Opaque actions
             # remain in the reply for their owner to handle.
-            return control.submit(command.envelope, context)
+            return control.submit(command.envelope, context, public_only=True)
         if isinstance(command, Query):
             return registry.query(context, command.message_id)
         if isinstance(command, Lookup):
@@ -744,7 +741,6 @@ class KVControlService:
         return {
             "operations": registry.capacity(),
             "associations": control.index.capacity(),
-            "copies": control.executor.claims.capacity(),
             "storage_reads": self.cache.prefetch_outcome_stats_snapshot()
             if control.executor.storage_reads is not None
             else None,
