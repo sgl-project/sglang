@@ -18,7 +18,7 @@ from sglang.srt.speculative.dflash_utils import (
     _get_or_create_chain_verify_buffers,
     build_speculative_verify_target_probs,
 )
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import is_hip, is_npu
 
 try:
     from sglang.kernels.ops.speculative.dspark.dspark_accept_split import (
@@ -27,7 +27,8 @@ try:
 except ImportError:  # pragma: no cover - a tree without the split kernels
     chain_speculative_sampling_split = None
 _SPLIT_ACCEPT = (
-    chain_speculative_sampling_split is not None
+    is_hip()
+    and chain_speculative_sampling_split is not None
     and __import__("os").environ.get("SGLANG_DSPARK_SPLIT_ACCEPT", "1") == "1"
 )
 
@@ -404,6 +405,48 @@ def softmax_temp(
 
 
 @triton.jit
+def _softmax_temp_kernel(
+    logits_ptr,
+    temp_ptr,
+    out_ptr,
+    vocab,
+    rows_per_request,
+    logits_row_stride,
+    BLOCK_V: tl.constexpr,
+):
+    row = tl.program_id(0)
+    temp = tl.load(temp_ptr + row // rows_per_request).to(tl.float32)
+    base = logits_ptr + row.to(tl.int64) * logits_row_stride
+    out_base = out_ptr + row.to(tl.int64) * vocab
+
+    row_max = -float("inf")
+    for v0 in range(0, vocab, BLOCK_V):
+        offs = v0 + tl.arange(0, BLOCK_V)
+        vmask = offs < vocab
+        x = tl.load(base + offs, mask=vmask, other=-float("inf")).to(tl.float32)
+        x = x / temp
+        row_max = tl.maximum(row_max, tl.max(x, axis=0))
+
+    sum_exp = 0.0
+    for v0 in range(0, vocab, BLOCK_V):
+        offs = v0 + tl.arange(0, BLOCK_V)
+        vmask = offs < vocab
+        x = tl.load(base + offs, mask=vmask, other=-float("inf")).to(tl.float32)
+        x = x / temp
+        e = tl.exp(x - row_max)
+        e = tl.where(vmask, e, 0.0)
+        sum_exp += tl.sum(e, axis=0)
+
+    for v0 in range(0, vocab, BLOCK_V):
+        offs = v0 + tl.arange(0, BLOCK_V)
+        vmask = offs < vocab
+        x = tl.load(base + offs, mask=vmask, other=-float("inf")).to(tl.float32)
+        x = x / temp
+        e = tl.exp(x - row_max)
+        tl.store(out_base + offs, e / sum_exp, mask=vmask)
+
+
+@triton.jit
 def _softmax_temp_stats_kernel(
     logits_ptr,
     temp_ptr,
@@ -494,6 +537,17 @@ def softmax_temp_triton(
     temperatures = temperatures.reshape(bs).to(torch.float32).contiguous()
     out = torch.empty((num_rows, vocab), dtype=torch.float32, device=logits.device)
     if num_rows == 0:
+        return out
+    if not is_hip():
+        _softmax_temp_kernel[(num_rows,)](
+            logits,
+            temperatures,
+            out,
+            vocab,
+            rows_per_request,
+            logits.stride(0),
+            BLOCK_V=4096,
+        )
         return out
     # A verify has only bs x block rows: split each row over enough programs to fill the GPU. One pass writes
     # per-chunk max / sum-exp, the second combines them and writes its normalized chunk.

@@ -5,6 +5,39 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
+from sglang.srt.utils.device import is_hip
+
+
+@triton.jit
+def _softcap_row_argmax_kernel(
+    logits_ptr,
+    out_ptr,
+    row_stride,
+    valid_width,
+    col_offset,
+    softcapping_value,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    best_val = -float("inf")
+    best_idx = 0
+    for start in range(0, valid_width, BLOCK_SIZE):
+        cols = start + tl.arange(0, BLOCK_SIZE)
+        mask = cols < valid_width
+        x = tl.load(logits_ptr + row * row_stride + cols, mask=mask, other=0.0)
+        x = x / softcapping_value
+        x = libdevice.tanh(x)
+        x = x * softcapping_value
+        x = tl.where(mask, x, -float("inf"))
+        block_val, block_idx = tl.max(
+            x, axis=0, return_indices=True, return_indices_tie_break_left=True
+        )
+        take = block_val > best_val
+        best_idx = tl.where(take, start + block_idx, best_idx)
+        best_val = tl.where(take, block_val, best_val)
+    tl.store(out_ptr + row * 2, best_val)
+    tl.store(out_ptr + row * 2 + 1, (best_idx + col_offset).to(tl.float32))
+
 
 @triton.jit
 def _softcap_row_argmax_partial_kernel(
@@ -99,7 +132,20 @@ def softcap_row_argmax(logits, final_logit_softcapping, valid_width, col_offset)
     assert logits.dtype == torch.float32 and logits.stride(1) == 1
     assert col_offset + logits.shape[1] < 2**24
     num_rows = logits.shape[0]
-    # A verify has only bs x block rows; spreading each over chunks fills the GPU.
+    if not is_hip():
+        out = torch.empty(num_rows, 2, dtype=torch.float32, device=logits.device)
+        _softcap_row_argmax_kernel[(num_rows,)](
+            logits,
+            out,
+            logits.stride(0),
+            valid_width,
+            col_offset,
+            final_logit_softcapping,
+            BLOCK_SIZE=4096,
+            num_warps=8,
+        )
+        return out
+    # ROCm: a verify has only bs x block rows; spreading each over chunks fills the GPU.
     block = 4096
     nsplit = triton.next_power_of_2(max(1, triton.cdiv(valid_width, block)))
     part_val = torch.empty(num_rows, nsplit, dtype=torch.float32, device=logits.device)

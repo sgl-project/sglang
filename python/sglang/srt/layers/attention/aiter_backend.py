@@ -863,8 +863,12 @@ class AiterAttnBackend(AttentionBackend):
         # Muse Spark TP8 shapes on gfx950: head_dim 64, GQA 8, SWA KV pool, unified
         # Triton attention. Extend and target verify take the Muse fast paths below
         # (each behind its own SGLANG_MUSE_* switch); decode is unchanged.
+        # Muse Spark's attention shapes (GQA 8, head_dim 64, sliding window); other models with the
+        # same shapes (gpt-oss) keep the generic paths.
         self.use_muse_attention_paths = (
             is_gfx95_supported()
+            and getattr(model_runner.model_config.hf_config, "model_type", None)
+            in ("muse_spark", "muse_spark_text")
             and not self.use_mla
             and self.use_triton_unified_attention
             and self.use_sliding_window_kv_pool

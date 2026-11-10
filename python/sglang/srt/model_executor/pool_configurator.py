@@ -153,8 +153,8 @@ def _dflash_draft_cell_size(kvc: KVCacheConfigurator) -> int:
 def dflash_draft_kv_follows_target_swa(kvc: KVCacheConfigurator) -> bool:
     """Whether the target sizes its compact-window DFLASH draft pool per
     sliding-window token (SGLANG_ENABLE_DFLASH_SWA_DRAFT_KV). The draft's whole
-    read window must stay inside what the target's SWA eviction retains."""
-    if not envs.SGLANG_ENABLE_DFLASH_SWA_DRAFT_KV.get():
+    read window must stay inside what the target's SWA eviction retains. ROCm only."""
+    if not _is_hip or not envs.SGLANG_ENABLE_DFLASH_SWA_DRAFT_KV.get():
         return False
     if kvc.is_draft_worker or not kvc.spec_algorithm.is_dflash_family():
         return False

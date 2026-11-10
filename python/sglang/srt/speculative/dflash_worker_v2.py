@@ -134,6 +134,12 @@ def _get_fused_kv_materialize_helper():
     return _FusedKVMaterializeHelper
 
 
+def _unit_scale_on_hip(scale):
+    """ROCm: a missing draft KV scale becomes 1.0, which takes the fused fp8 write (bit-exact
+    with the eager saturating cast it replaces); other platforms keep None."""
+    return 1.0 if scale is None and is_hip() else scale
+
+
 class _DflashDraftSampler:
     """Capture-safe greedy argmax over the target LM head, run inside the draft
     cuda graph so the draft sampling is captured and counted in fwd_occupancy.
@@ -2049,10 +2055,10 @@ class DFlashWorkerV2(BaseSpecWorker):
                         commit_lens,
                         k,
                         v,
-                        # a unit scale where the layer has none: the fused fp8 write (one
-                        # launch) instead of the eager clamp / cast / write fallback
-                        attn.attn.k_scale if attn.attn.k_scale is not None else 1.0,
-                        attn.attn.v_scale if attn.attn.v_scale is not None else 1.0,
+                        # ROCm: a unit scale where the layer has none, so the fused fp8
+                        # write (one launch) replaces the eager clamp / cast / write fallback
+                        _unit_scale_on_hip(attn.attn.k_scale),
+                        _unit_scale_on_hip(attn.attn.v_scale),
                     )
                 return
 
@@ -2168,10 +2174,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                     commit_lens,
                     cache_k,
                     cache_v,
-                    attn.k_scale
-                    if attn.k_scale is not None
-                    else 1.0,  # the fused fp8 write
-                    attn.v_scale if attn.v_scale is not None else 1.0,
+                    _unit_scale_on_hip(attn.k_scale),
+                    _unit_scale_on_hip(attn.v_scale),
                 )
             else:
                 token_to_kv_pool.layer_router.layer(attn.layer_id).store(

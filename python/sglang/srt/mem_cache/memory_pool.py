@@ -2187,11 +2187,11 @@ def _set_mha_kv_buffer_prefix_valid(
             f"head_dim={pool.head_dim} v_head_dim={pool.v_head_dim}."
         )
 
-    # No scale: the eager fallback below is a plain saturating cast, which the fused kernel does bit-exactly
-    # at scale 1.0 (one launch instead of five per layer).
+    # No scale on ROCm: the eager fallback below is a plain saturating cast, which the fused kernel does
+    # bit-exactly at scale 1.0 (one launch instead of five per layer).
     fused_k_scale = (
         1.0
-        if k_scale is None
+        if _is_hip and k_scale is None
         else _resolve_fused_scale(
             k_scale,
             getattr(layer, "k_scale", None),
@@ -2200,7 +2200,7 @@ def _set_mha_kv_buffer_prefix_valid(
     )
     fused_v_scale = (
         1.0
-        if v_scale is None
+        if _is_hip and v_scale is None
         else _resolve_fused_scale(
             v_scale,
             getattr(layer, "v_scale", None),

@@ -1342,7 +1342,10 @@ class LogitsProcessor(nn.Module):
             (group.world_size, num_tokens, 2), dtype=local.dtype, device=local.device
         )
         group.all_gather_into_tensor(gathered.view(-1, 2), local)
-        return merge_row_argmax_shards(gathered)
+        if is_hip():
+            return merge_row_argmax_shards(gathered)
+        best_rank = gathered[..., 0].argmax(dim=0, keepdim=True)
+        return gathered[..., 1].gather(0, best_rank).squeeze(0).long()
 
     def gather_deferred_rows(
         self, logits: torch.Tensor, row_index: torch.Tensor
