@@ -53,8 +53,8 @@ from typing import TYPE_CHECKING, Dict, Iterable, List, Mapping, Optional, Set, 
 import torch
 
 from sglang.srt.dllm.config import DllmConfig
+from sglang.srt.managers.req_types import FINISH_ABORT
 from sglang.srt.managers.schedule_batch import (
-    FINISH_ABORT,
     Req,
     ScheduleBatch,
     split_cached_prefix_by_tier,

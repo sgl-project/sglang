@@ -9,7 +9,7 @@ import unittest
 from unittest.mock import patch
 
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import FINISH_ABORT
+from sglang.srt.managers.req_types import FINISH_ABORT
 from sglang.srt.managers.schedule_policy import (
     CacheAgnosticPolicy,
     CacheAwarePolicy,
