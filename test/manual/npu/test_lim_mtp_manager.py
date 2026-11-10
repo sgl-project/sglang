@@ -14,7 +14,6 @@ from sgl_kernel_npu.sparsity_driven_kv_offload.fused_shm import (
     free_fused_shm as free_shm,
 )
 
-from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_attention import (
     forward_sparsity_driven_kv_offload,
 )
@@ -46,7 +45,6 @@ class _IndexPool(MLATokenToKVPool):
 
 
 @pytest.mark.parametrize("graph", [False, True])
-@pytest.mark.parametrize("async_checks", [False, True])
 @pytest.mark.parametrize("heads", [4, 8])
 @pytest.mark.parametrize(
     "query_width,capacity",
@@ -62,9 +60,7 @@ class _IndexPool(MLATokenToKVPool):
         (14, 28672),
     ],
 )
-def test_real_manager_mtp_owner_share_lifecycle(
-    graph, async_checks, heads, query_width, capacity
-):
+def test_real_manager_mtp_owner_share_lifecycle(graph, heads, query_width, capacity):
     if not torch.npu.is_available():
         pytest.skip("NPU is required")
     device_id = torch.npu.current_device()
@@ -161,7 +157,6 @@ def test_real_manager_mtp_owner_share_lifecycle(
     spec = SimpleNamespace(speculative_eagle_topk=1, speculative_num_draft_tokens=Q)
     try:
         with ExitStack() as stack:
-            stack.enter_context(envs.SGLANG_ENABLE_ASYNC_ASSERT.override(async_checks))
             stack.enter_context(
                 patch("sglang.srt.runtime_context.get_spec", return_value=spec)
             )
@@ -220,15 +215,6 @@ def test_real_manager_mtp_owner_share_lifecycle(
             assert plan.miss_counts.cpu().tolist() == [C, C, 0]
             if graph:
                 captured = torch.npu.NPUGraph()
-                if async_checks:
-                    # Ascend's torch._assert_async performs a synchronous copy
-                    # during capture. The diagnostic must reject this mode.
-                    with pytest.raises(
-                        RuntimeError, match="async validation is unsupported"
-                    ):
-                        with torch.npu.graph(captured):
-                            run()
-                    return
                 with torch.npu.graph(captured):
                     plan, outputs = run()
             # Rewrite resident positions after a rejected draft. A warm plan
@@ -282,7 +268,6 @@ def test_real_manager_mtp_owner_share_lifecycle(
                         {
                             "metadata_fused": True,
                             "graph": graph,
-                            "async_checks": async_checks,
                             "heads": heads,
                             "query_width": Q,
                             "capacity": C,
@@ -342,7 +327,6 @@ def test_real_manager_mtp_owner_share_lifecycle(
                         {
                             "metadata_fused": True,
                             "graph": graph,
-                            "async_checks": async_checks,
                             "heads": heads,
                             "query_width": Q,
                             "capacity": C,

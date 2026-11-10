@@ -8,6 +8,7 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     get_sparsity_driven_kv_offload_cell_size,
     get_sparsity_driven_kv_offload_sparse_context_len,
     is_sparsity_driven_kv_offload_enabled,
+    use_pd_split_kv,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -34,6 +35,77 @@ def _glm_indexer_types():
 
 
 class TestSparsityDrivenKVOffloadConfig(CustomTestCase):
+    def test_pd_split_kv_transport_and_data_parallelism(self):
+        from sglang.srt.environ import envs
+
+        prefix = "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config."
+        parallel = SimpleNamespace(
+            nnodes=1,
+            pp_size=1,
+            attn_cp_size=1,
+            dcp_enabled=False,
+            dp_size=1,
+            attn_dp_size=1,
+        )
+        disagg = SimpleNamespace(
+            disaggregation_mode="decode",
+            enable_pd_role_switch=False,
+            disaggregation_transfer_backend="ascend",
+            disaggregation_decode_host_receive_threshold=1,
+        )
+        with (
+            envs.SGLANG_NPU_ENABLE_PD_SPLIT_KV.override(True),
+            envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.override(True),
+            envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.override(True),
+            patch(prefix + "is_npu", return_value=True),
+            patch(prefix + "attention_backends", return_value=("ascend", "ascend")),
+            patch(prefix + "get_disagg", return_value=disagg),
+            patch(prefix + "get_parallel", return_value=parallel),
+            patch(prefix + "get_schedule", return_value=SimpleNamespace(page_size=128)),
+            patch(
+                prefix + "get_memory",
+                return_value=SimpleNamespace(
+                    enable_hisparse=False,
+                    enable_hierarchical_cache=False,
+                ),
+            ),
+        ):
+            for backend in ("ascend", "mooncake"):
+                disagg.disaggregation_transfer_backend = backend
+                for mode in ("prefill", "decode"):
+                    disagg.disaggregation_mode = mode
+                    for dp_size, attn_dp_size in ((1, 1), (2, 1), (2, 2)):
+                        parallel.dp_size, parallel.attn_dp_size = dp_size, attn_dp_size
+                        with self.subTest(
+                            backend=backend, mode=mode, dp=dp_size, attn_dp=attn_dp_size
+                        ):
+                            self.assertTrue(use_pd_split_kv())
+
+            disagg.disaggregation_decode_host_receive_threshold = 0
+            self.assertTrue(
+                use_pd_split_kv()
+            )  # Mooncake registers host buffers directly.
+            disagg.disaggregation_transfer_backend = "ascend"
+            with self.assertRaisesRegex(ValueError, "host receive threshold"):
+                use_pd_split_kv()
+            disagg.disaggregation_decode_host_receive_threshold = 1
+            for obj, attribute, value, message in (
+                (disagg, "disaggregation_transfer_backend", "fake", "transfer backend"),
+                (parallel, "nnodes", 2, "single-node"),
+                (parallel, "pp_size", 2, "PP=1"),
+                (parallel, "attn_cp_size", 2, "context parallelism"),
+                (parallel, "dcp_enabled", True, "context parallelism"),
+                (disagg, "enable_pd_role_switch", True, "role switching"),
+            ):
+                previous = getattr(obj, attribute)
+                with (
+                    self.subTest(attribute=attribute),
+                    patch.object(obj, attribute, value),
+                ):
+                    with self.assertRaisesRegex(ValueError, message):
+                        use_pd_split_kv()
+                self.assertEqual(getattr(obj, attribute), previous)
+
     def test_copy_sfa_heads_follow_model_and_attention_tp(self):
         from sglang.srt.environ import envs
 

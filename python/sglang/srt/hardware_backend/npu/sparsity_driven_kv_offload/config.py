@@ -41,7 +41,7 @@ def use_fused_sparse_kv_offload() -> bool:
 
 
 def use_pd_split_kv() -> bool:
-    """Select split host storage only for explicitly enabled Ascend PD roles."""
+    """Select split host storage only for explicitly enabled NPU PD roles."""
     if not (
         envs.SGLANG_NPU_ENABLE_PD_SPLIT_KV.get()
         and use_fused_sparse_kv_offload()
@@ -61,15 +61,20 @@ def use_pd_split_kv() -> bool:
         raise ValueError("PD split KV requires PP=1 and context parallelism disabled.")
     if disagg.enable_pd_role_switch:
         raise ValueError("PD split KV does not support PD role switching.")
-    if disagg.disaggregation_transfer_backend != "ascend":
-        raise ValueError("PD split KV requires the Ascend transfer backend.")
-    if disagg.disaggregation_decode_host_receive_threshold < 1:
+    if disagg.disaggregation_transfer_backend not in ("ascend", "mooncake"):
+        raise ValueError(
+            "PD split KV requires the Ascend or Mooncake transfer backend."
+        )
+    if (
+        disagg.disaggregation_transfer_backend == "ascend"
+        and disagg.disaggregation_decode_host_receive_threshold < 1
+    ):
         raise ValueError("PD split KV requires host receive threshold 1.")
     memory = get_memory()
     if memory.enable_hisparse or memory.enable_hierarchical_cache:
         raise ValueError("PD split KV cannot share MF with HiSparse or HiCache.")
-    if parallel.nnodes != 1 or parallel.dp_size != 1 or parallel.attn_dp_size != 1:
-        raise ValueError("PD split KV requires single-node TP without DP.")
+    if parallel.nnodes != 1:
+        raise ValueError("PD split KV requires single-node workers.")
     return True
 
 

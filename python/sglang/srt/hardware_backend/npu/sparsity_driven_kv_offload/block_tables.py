@@ -66,16 +66,20 @@ def make_fused_prefill_plan(batch, manager, stream):
     ):
         raise RuntimeError("Prefill CPU and device metadata must have matching sizes")
     device = manager.device
-    req = batch.req_pool_indices.to(device=device, dtype=torch.long)
+    req_pool_indices = batch.req_pool_indices.to(device=device, dtype=torch.long)
     lengths = batch.seq_lens.to(device=device, dtype=torch.long)
-    if keep.numel() != req.numel():
+    if keep.numel() != req_pool_indices.numel():
         keep = keep.to(device=device, dtype=torch.long, non_blocking=True)
-        req, lengths = req.index_select(0, keep), lengths.index_select(0, keep)
+        req_pool_indices = req_pool_indices.index_select(0, keep)
+        lengths = lengths.index_select(0, keep)
     starts = torch.cumsum(lengths, 0) - lengths
-    rows = torch.repeat_interleave(req, lengths, output_size=total)
+    token_to_slots = torch.repeat_interleave(
+        req_pool_indices, lengths, output_size=total
+    )
     starts = torch.repeat_interleave(starts, lengths, output_size=total)
     destination = torch.arange(total, device=device, dtype=torch.long)
-    source = manager.host_source_indices(rows, destination - starts).contiguous()
+    token_positions = destination - starts
+    source = manager.host_source_indices(token_to_slots, token_positions).contiguous()
     return FusedPrefillPlan(
         stream,
         total,
