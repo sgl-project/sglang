@@ -13,7 +13,7 @@ from typing import Any, Dict, Mapping, NoReturn, Optional, Tuple
 
 import torch
 
-from sglang.srt.utils import MultiprocessingSerializer
+from sglang.srt.utils import MultiprocessingSerializer, is_npu
 
 from .protocol import send_msg
 
@@ -190,8 +190,6 @@ class VmmFdTransportBackend(WeightCacheTransportBackend):
 def choose_daemon_transport_backend(
     state_tensors: Mapping[str, Tuple[torch.Tensor, bool]],
 ) -> WeightCacheTransportBackend:
-    from sglang.srt.utils.common import is_npu
-
     if is_npu():
         # torch_npu must be imported before the first ForkingPickler dump of an
         # NPU tensor so its reducer is registered; otherwise the tensor falls

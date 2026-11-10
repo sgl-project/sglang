@@ -58,8 +58,6 @@ from sglang.srt.runtime_context import (
     publish,
     spawn_world_rank,
 )
-from sglang.srt.utils.common import is_npu
-
 from .protocol import (
     CacheConfig,
     check_ipc_quant_support,
@@ -257,7 +255,7 @@ class WeightCacheDaemon:
         # (CUDA / ROCm) via _share_cuda_, and NPU via native torch_npu reduction.
         # Fail loud here instead of dying deep inside the export with an opaque
         # error on anything else.
-        if not current_platform.is_cuda_alike() and not is_npu():
+        if not current_platform.is_cuda_alike() and not current_platform.is_npu():
             raise RuntimeError(
                 f"[WeightCacheDaemon] the weight cache daemon requires an "
                 f"IPC-capable platform (CUDA, ROCm, or NPU/Ascend) for zero-copy "
