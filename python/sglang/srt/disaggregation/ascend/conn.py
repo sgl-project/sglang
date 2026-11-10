@@ -124,12 +124,6 @@ class AscendKVManager(MooncakeKVManager):
             disaggregation_mode=self.disaggregation_mode,
         )
 
-    def _transfer_data(self, mooncake_session_id, transfer_blocks):
-        # Empty KV views retain layer positions in PD metadata but have no
-        # registered memory to transfer.
-        transfer_blocks = [block for block in transfer_blocks if block[2] != 0]
-        return super()._transfer_data(mooncake_session_id, transfer_blocks)
-
     def requires_dcp_relayout(self, dst_dcp_size: int, dst_dcp_rank: int) -> bool:
         if self._is_npu_dsa_layout() and self.dcp_size != dst_dcp_size:
             if self.dcp_size == 1 and dst_dcp_size > 1:

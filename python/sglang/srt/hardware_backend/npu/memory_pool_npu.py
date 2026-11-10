@@ -815,6 +815,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             req_pool_size = max_running_requests + 1
             tail_dtype = torch.bfloat16
             tail_width = index_kpool + tail_extra_slots
+            # get [0, tail_width, index_head_dim] tensor if skipped
             self._compress_tail_k: Optional[List[torch.Tensor]] = [
                 torch.zeros(
                     req_pool_size if not self.skip_topk_layers[i] else 0,
@@ -974,12 +975,10 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         return data_ptrs, data_lens, item_lens
 
     def get_compress_tail_buf_infos(self):
-        """Buffer infos for per-request DSA kpool compress-tail rows."""
+        """Get ptr/len from [K_tail_0, K_tail_1, …, K_tail_L-1,
+        S_tail_0, S_tail_1, …, S_tail_L-1] layout, where some entries may be 0-tensor"""
         if not self.kpool_use_compress:
             return [], [], []
-        # Keys first, then scores — keep zero-row (skip-topk) entries so layer
-        # offsets stay aligned across PD peers; item_len=0 makes transfer
-        # backends skip them.
         tail_buffers = list(self._compress_tail_k) + list(self._compress_tail_score)
         data_ptrs = [buf.data_ptr() for buf in tail_buffers]
         data_lens = [buf.nbytes for buf in tail_buffers]
