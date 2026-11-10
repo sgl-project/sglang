@@ -100,11 +100,17 @@ if _is_mlu:
 
 # FlagTree's interleaved (GPT-J style) kernel runs one program per (token block,
 # head) and is slower than forward_native beyond this many tokens on MLU370.
+# Measured on MLU370-S4 only; other MLU generations are untested, so this is a
+# conservative empirical threshold.
 _MLU_INTERLEAVED_MAX_TOKENS = 128
 
 
 def _mlu_rope_block_m(num_tokens: int, interleaved: bool) -> int:
-    """Tokens per FlagTree program (BLOCK_M), from a sweep on MLU370-S4."""
+    """Tokens per FlagTree program (BLOCK_M), from a sweep on MLU370-S4.
+
+    These are empirical values measured on MLU370-S4 only; other MLU
+    generations are untested.
+    """
     if interleaved:
         return 8 if num_tokens <= 8 else 64
     if num_tokens <= 64:
@@ -627,6 +633,10 @@ class RotaryEmbedding(BaseFusedOp):
             # The interleaved kernel also rotates the pass-through dims.
             or (interleaved and self.rotary_dim != self.head_size)
             or (interleaved and num_tokens > _MLU_INTERLEAVED_MAX_TOKENS)
+            # The in-place view needs a contiguous last dim (row strides may be
+            # larger, e.g. column slices of a fused qkv buffer).
+            or query.stride(-1) != 1
+            or key.stride(-1) != 1
         ):
             return self.forward_native(
                 positions, query, key, offsets, fused_set_kv_buffer_arg
