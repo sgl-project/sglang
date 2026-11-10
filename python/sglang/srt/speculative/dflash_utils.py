@@ -15,7 +15,6 @@ from sglang.kernels.ops.speculative.verify_sampling import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
-from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.layers.sampler import (
     apply_custom_logit_processor,
     top_p_normalize_probs_torch,
@@ -602,43 +601,6 @@ def validate_dflash_mla_draft_config(draft_hf_config: Any) -> None:
             f"DFLASH mla drafts support rope_type in {sorted(_DFLASH_MLA_ROPE_TYPES)}, "
             f"got {rope_type!r}."
         )
-
-
-def _get_dflash_attention_type(config, *, default: AttentionType) -> AttentionType:
-    """Honor explicit causality while preserving legacy layer defaults."""
-    text_config = config.get_text_config()
-    is_causal = getattr(text_config, "is_causal", None)
-    if is_causal is None:
-        return default
-    return AttentionType.DECODER if is_causal else AttentionType.ENCODER_ONLY
-
-
-def get_dflash_layer_attention_params(
-    config, layer_id: int
-) -> Tuple[int, AttentionType]:
-    layer_types = get_dflash_layer_types(config)
-    if layer_types is None:
-        return -1, AttentionType.ENCODER_ONLY
-    if layer_id >= len(layer_types):
-        raise ValueError(
-            "DFLASH config.layer_types must contain one entry per draft layer. "
-            f"Got {len(layer_types)} entries, layer_id={layer_id}."
-        )
-
-    layer_type = layer_types[layer_id]
-    if layer_type == "full_attention":
-        return -1, _get_dflash_attention_type(
-            config, default=AttentionType.ENCODER_ONLY
-        )
-    if layer_type == "sliding_attention":
-        sliding_window_size = get_dflash_attention_sliding_window_size(config)
-        assert sliding_window_size is not None
-        return sliding_window_size, _get_dflash_attention_type(
-            config, default=AttentionType.DECODER
-        )
-    raise ValueError(
-        f"Unsupported DFLASH draft layer type. layer_types[{layer_id}]={layer_type!r}."
-    )
 
 
 def mla_draft_compact_window_narrows(
