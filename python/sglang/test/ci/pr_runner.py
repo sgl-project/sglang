@@ -88,6 +88,7 @@ def run_pytest_files(
     suite_timeout=None,
     continue_on_error=False,
     allowed_skips=(),
+    deselect=(),
 ):
     directory = Path(report_dir)
     directory.mkdir(parents=True, exist_ok=True)
@@ -97,6 +98,7 @@ def run_pytest_files(
         "files": [],
         "success": False,
         "allowed_skips": list(allowed_skips),
+        "deselect": list(deselect),
     }
     summary = directory / "summary.json"
 
@@ -163,6 +165,8 @@ def run_pytest_files(
                 "junit_family=xunit2",
                 f"--junitxml={junit}",
             ]
+            for node in deselect:
+                command.extend(["--deselect", node])
             with log.open("w+", errors="replace") as output:
                 process = subprocess.Popen(
                     command,

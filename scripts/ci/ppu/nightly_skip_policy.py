@@ -3,13 +3,14 @@
 
 import argparse
 import json
+from pathlib import Path
 
 
 def allowed_skips():
     batch_sizes = [2**x for x in range(12)]
     batch_sizes += [x + 1 for x in batch_sizes]
-    batch_sizes[1] = "2_0"
-    batch_sizes[12] = "2_1"
+    batch_sizes[1] = "20"
+    batch_sizes[12] = "21"
     skips = [
         f"registered.kernels.ops.attention.test_rope.test_partial_rope[64-{rope_dim}-{is_neox}-{batch_size}]"
         for rope_dim in (80, 96, 128)
@@ -50,18 +51,31 @@ def allowed_skips():
         "registered.unit.model_loader.test_modelopt_export.TestModelOptExport.test_standard_workflow_selection",
         "registered.unit.model_loader.test_modelopt_export.TestModelOptExportIntegration.test_full_workflow_with_export",
     ]
+    baseline_path = Path(__file__).with_name("nightly_baseline_skips.json")
+    skips.extend(json.loads(baseline_path.read_text()))
     skips.append(
         "registered.kernels.ops.diffusion.test_timestep_embedding.test_timestep_embedding_perf"
     )
     return skips
 
 
+def deselected_nodes():
+    # This bare function was never executed by the legacy unittest runner.
+    return [
+        "registered/rl/test_update_weights_from_tensor.py::test_update_weights_from_tensor"
+    ]
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--json", action="store_true")
+    parser.add_argument("--deselect", action="store_true")
     args = parser.parse_args()
     skips = allowed_skips()
-    if args.json:
+    if args.deselect:
+        for node in deselected_nodes():
+            print(f"--deselect\n{node}")
+    elif args.json:
         print(json.dumps(skips, indent=2))
     else:
         for node in skips:

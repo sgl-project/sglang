@@ -69,6 +69,16 @@ class StrictRunnerTest(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertTrue(report["success"])
 
+    def test_explicit_deselect_preserves_other_tests(self):
+        result, report = self.run_fixture(
+            "def test_legacy(missing_fixture): pass\ndef test_ok(): pass\n",
+            deselect=("test_fixture.py::test_legacy",),
+        )
+        self.assertEqual(result, 0)
+        self.assertTrue(report["success"])
+        self.assertEqual(report["files"][0]["executed"], 1)
+        self.assertEqual(report["deselect"], ["test_fixture.py::test_legacy"])
+
     def test_failure_retains_counts(self):
         result, report = self.run_fixture("def test_bad():\n    assert False\n")
         self.assertEqual(result, 1)

@@ -164,6 +164,7 @@ def run_unittest_files(
     junit_dir: Optional[str] = None,
     suite_timeout: Optional[float] = None,
     allowed_skips: tuple = (),
+    deselect: tuple = (),
 ):
     """
     Run a list of test files.
@@ -193,9 +194,10 @@ def run_unittest_files(
             suite_timeout,
             continue_on_error,
             allowed_skips,
+            deselect,
         )
-    if junit_dir or suite_timeout or allowed_skips:
-        raise ValueError("JUnit, suite budget, and skip policy require --pytest")
+    if junit_dir or suite_timeout or allowed_skips or deselect:
+        raise ValueError("JUnit, suite budget, and selection policy require --pytest")
     if require_nonempty and not files:
         return 1
     coredump_enabled = cuda_coredump.is_enabled()
