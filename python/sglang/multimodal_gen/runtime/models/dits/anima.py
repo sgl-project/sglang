@@ -17,6 +17,9 @@ from sglang.kernels.ops.diffusion import (
 from sglang.multimodal_gen.configs.models.dits.anima import AnimaDiTConfig
 from sglang.multimodal_gen.configs.models.fsdp import is_module_list_entry_in
 from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_classifier_free_guidance_world_size,
+)
 from sglang.multimodal_gen.runtime.distributed.sp_shard_utils import (
     gather_seq,
     shard_like,
@@ -30,6 +33,10 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
+from sglang.multimodal_gen.runtime.managers.forward_context import (
+    DENOISING_LOOP_STATE,
+    get_forward_context,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
@@ -38,6 +45,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     is_in_breakable_cuda_graph,
 )
+from sglang.srt.utils import is_device_stream_capturing
 
 logger = init_logger(__name__)
 
@@ -164,11 +172,15 @@ class AnimaAdaLayerNorm(nn.Module):
             rank, (3 if gated else 2) * hidden_size, bias=False
         )
 
-    def forward(self, x, embedded_timestep, temb):
+    def project_modulation(self, embedded_timestep, temb):
         modulation = self.linear_1(torch.nn.functional.silu(embedded_timestep))[0]
         modulation = self.linear_2(modulation)[0]
         modulation = modulation + temb[..., : modulation.shape[-1]]
-        values = modulation.unsqueeze(1).chunk(3 if self.gated else 2, dim=-1)
+        return modulation.unsqueeze(1).chunk(3 if self.gated else 2, dim=-1)
+
+    def forward(self, x, embedded_timestep, temb, values=None):
+        if values is None:
+            values = self.project_modulation(embedded_timestep, temb)
         norm_x = self.norm(x)
         if (
             norm_x.is_cuda
@@ -297,16 +309,20 @@ class AnimaTransformerBlock(nn.Module):
         temb,
         rope,
         attn_mask_meta=None,
+        modulations=None,
     ):
-        x, gate = self.norm1(hidden_states, embedded_timestep, temb)
+        kw = {} if modulations is None else {"values": modulations[0]}
+        x, gate = self.norm1(hidden_states, embedded_timestep, temb, **kw)
         hidden_states = _anima_residual_add(
             hidden_states, self.attn1(x, rope=rope, attn_mask_meta=attn_mask_meta), gate
         )
-        x, gate = self.norm2(hidden_states, embedded_timestep, temb)
+        kw = {} if modulations is None else {"values": modulations[1]}
+        x, gate = self.norm2(hidden_states, embedded_timestep, temb, **kw)
         hidden_states = _anima_residual_add(
             hidden_states, self.attn2(x, context=encoder_hidden_states), gate
         )
-        x, gate = self.norm3(hidden_states, embedded_timestep, temb)
+        kw = {} if modulations is None else {"values": modulations[2]}
+        x, gate = self.norm3(hidden_states, embedded_timestep, temb, **kw)
         return _anima_residual_add(hidden_states, self.ff(x), gate)
 
 
@@ -351,6 +367,55 @@ class AnimaTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         )
         self.__post_init__()
 
+    def _step_modulations(self, timestep, embedded_timestep, temb):
+        if (
+            torch.compiler.is_compiling()
+            or torch.is_grad_enabled()
+            or is_in_breakable_cuda_graph()
+            or is_device_stream_capturing(embedded_timestep.device)
+            or self.layerwise_offload_managers
+            or type(self.time_embed) is not AnimaTimeEmbedding
+            or "forward" in vars(self.time_embed)
+            or not all(
+                type(block) is AnimaTransformerBlock and "forward" not in vars(block)
+                for block in self.transformer_blocks
+            )
+        ):
+            return None
+        ctx = get_forward_context()
+        req = ctx.forward_batch
+        if (
+            req is None
+            or not req.do_classifier_free_guidance
+            or get_classifier_free_guidance_world_size() != 1
+        ):
+            return None
+        norms = [
+            norm
+            for block in self.transformer_blocks
+            for norm in (block.norm1, block.norm2, block.norm3)
+        ] + [self.norm_out]
+        if not all(
+            type(norm) is AnimaAdaLayerNorm
+            and "forward" not in vars(norm)
+            and type(norm.linear_1) is ReplicatedLinear
+            and type(norm.linear_2) is ReplicatedLinear
+            for norm in norms
+        ):
+            return None
+        cached = req.extra.setdefault(DENOISING_LOOP_STATE, {}).setdefault(
+            "anima_modulations", {}
+        )
+        key = (ctx.current_timestep, embedded_timestep.device, embedded_timestep.dtype)
+        entry = cached.get(id(self))
+        if entry is not None and entry[0] is timestep and entry[1] == key:
+            return entry[2]
+        # CFG branches share this tensor. Retain it to prevent id reuse, and keep
+        # only the latest step; the denoising stage drops the state before decode.
+        values = [norm.project_modulation(embedded_timestep, temb) for norm in norms]
+        cached[id(self)] = (timestep, key, values)
+        return values
+
     def forward(self, hidden_states, encoder_hidden_states, timestep, **kwargs):
         encoder_hidden_states = encoder_hidden_states.to(hidden_states.dtype)
         b, _, t, h, w = hidden_states.shape
@@ -371,7 +436,13 @@ class AnimaTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         temb, embedded_timestep = self.time_embed(
             timestep.to(hidden_states.dtype) / 1000, hidden_states.dtype
         )
-        for block in self.transformer_blocks:
+        modulations = self._step_modulations(timestep, embedded_timestep, temb)
+        for i, block in enumerate(self.transformer_blocks):
+            kw = (
+                {}
+                if modulations is None
+                else {"modulations": modulations[3 * i : 3 * i + 3]}
+            )
             hidden_states = block(
                 hidden_states,
                 encoder_hidden_states,
@@ -379,8 +450,10 @@ class AnimaTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 temb,
                 rope,
                 attn_mask_meta,
+                **kw,
             )
-        hidden_states = self.norm_out(hidden_states, embedded_timestep, temb)
+        kw = {} if modulations is None else {"values": modulations[-1]}
+        hidden_states = self.norm_out(hidden_states, embedded_timestep, temb, **kw)
         hidden_states = self.proj_out(hidden_states)[0]
         hidden_states = gather_seq(hidden_states, shard.orig_len)
         # checkpoint output ordering is (ph, pw, pt, c), unlike the input patches
