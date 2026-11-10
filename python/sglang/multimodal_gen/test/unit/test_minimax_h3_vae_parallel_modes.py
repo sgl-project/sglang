@@ -85,6 +85,18 @@ def test_decode_mode_uses_released_tiled_recipe(mode):
     assert kwargs["decoder_parallel"] is False
 
 
+def test_physis_vae_uses_released_tiles_on_its_decoder_rank():
+    """The published H3 frames use overlapping 256px tiles, even on one GPU."""
+    from sglang.multimodal_gen.configs.pipeline_configs.physis_h3 import (
+        PhysisH3PipelineConfig,
+    )
+
+    _, kwargs = _init_kwargs(PhysisH3PipelineConfig().vae_config)
+    assert kwargs["decoder_tiling"] is True
+    assert (kwargs["tile_size"], kwargs["tile_overlap_min"]) == (256, 64)
+    assert kwargs["parallel_tiling"] is False
+
+
 @pytest.mark.parametrize("mode", ["spatial", "spatial_shard", "patch"])
 def test_unvalidated_decode_modes_are_rejected(mode):
     config = MiniMaxH3VideoVAEConfig(parallel_decode_mode=mode)

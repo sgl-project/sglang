@@ -21,7 +21,7 @@ class PhysisH3PipelineConfig(MiniMaxH3PipelineConfig):
     native_only_components: tuple[str, ...] = ("text_encoder", "transformer", "vae")
     vae_config: MiniMaxH3VideoVAEConfig = field(
         default_factory=lambda: MiniMaxH3VideoVAEConfig(
-            use_tiling=False, use_parallel_decode=False
+            use_tiling=True, use_parallel_decode=False
         )
     )
     output_audio_sample_rate: int | None = None
