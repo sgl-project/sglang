@@ -14,6 +14,8 @@ import json
 import os
 
 import torch
+from transformers import AutoProcessor, PreTrainedTokenizerBase
+
 from sglang.multimodal_gen.configs.models.dits.hidream_o1_image import (
     HiDreamO1ImageDitConfig,
 )
@@ -21,7 +23,6 @@ from sglang.multimodal_gen.configs.pipeline_configs.hidream_o1_image import (
     HiDreamO1ImagePipelineConfig,
 )
 from sglang.multimodal_gen.configs.sample.hidream_o1_image import (
-    _VARIANT_DEFAULTS,
     HiDreamO1ImageSamplingParams,
     _resolve_variant,
 )
@@ -45,13 +46,12 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.h
     HiDreamO1ImageDenoisingStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.runtime.utils.precision_types import PRECISION_TO_TYPE
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_model
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from transformers import AutoProcessor
-from transformers import PreTrainedTokenizerBase
+from sglang.multimodal_gen.runtime.utils.precision_types import PRECISION_TO_TYPE
 
 logger = init_logger(__name__)
+
 
 class HiDreamO1ImagePipeline(ComposedPipelineBase):
     pipeline_name = "HiDreamO1ImagePipeline"
@@ -183,9 +183,9 @@ class HiDreamO1ImagePipeline(ComposedPipelineBase):
         # take its dense 4D-mask branch instead (see _fsdp_wrapped).
         from torch.distributed.fsdp import FSDPModule
 
-        transformer._fsdp_wrapped = isinstance(
-            transformer, FSDPModule
-        ) or any(isinstance(m, FSDPModule) for m in transformer.modules())
+        transformer._fsdp_wrapped = isinstance(transformer, FSDPModule) or any(
+            isinstance(m, FSDPModule) for m in transformer.modules()
+        )
         if transformer._fsdp_wrapped:
             logger.info(
                 "FSDP inference wrapping detected: TI2I requests take the "

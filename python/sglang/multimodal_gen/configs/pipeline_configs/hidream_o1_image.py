@@ -9,8 +9,8 @@ from sglang.multimodal_gen.configs.models.dits.base import DiTConfig
 from sglang.multimodal_gen.configs.models.dits.hidream_o1_image import (
     HiDreamO1ImageDitConfig,
 )
-from sglang.multimodal_gen.configs.sample.hidream_o1_image import _resolve_variant
 from sglang.multimodal_gen.configs.pipeline_configs.base import ImagePipelineConfig
+from sglang.multimodal_gen.configs.sample.hidream_o1_image import _resolve_variant
 from sglang.multimodal_gen.configs.task_type import ModelTaskType
 
 # Key under which the before-denoising stage stashes the per-branch backbone

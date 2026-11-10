@@ -16,7 +16,6 @@ from torch import nn
 
 from sglang.kernels.ops.diffusion import (
     BitExactFusionGate,
-    fused_rope_rotate_half_bitexact,
     tensors_equal,
 )
 from sglang.multimodal_gen.configs.models.dits.hidream_o1_image import (
@@ -42,11 +41,10 @@ from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
 )
 from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.configs.qwen3_vl import Qwen3VLVisionConfig
 from sglang.srt.layers.rotary_embedding import apply_rotary_pos_emb
 from sglang.srt.models.qwen3_vl import Qwen3VLMoeVisionModel
-from torch import nn
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 _HIDREAM_ROPE = BitExactFusionGate("HiDream fused RoPE")
@@ -233,6 +231,10 @@ class HiDreamO1Attention(nn.Module):
             and q.is_contiguous()
             and k.is_contiguous()
         ):
+            # Triton-backed bit-exact RoPE is CUDA-only; import lazily so the
+            # module still imports on Ascend NPU (which only ships ascend-triton).
+            from sglang.kernels.ops.diffusion import fused_rope_rotate_half_bitexact
+
             # Keep the BF16 rounding after each product in the eager RoPE.
             q, k = _HIDREAM_ROPE.run(
                 lambda: (
@@ -535,7 +537,11 @@ def _flash_decoder_layer(
         v_ar = v[:, :, idx_ar].contiguous()
         if pad_mask is None:
             out_ar = F.scaled_dot_product_attention(
-                q_ar, k_ar, v_ar, is_causal=True, scale=softmax_scale,
+                q_ar,
+                k_ar,
+                v_ar,
+                is_causal=True,
+                scale=softmax_scale,
             )
         else:
             # Column-vs-row views give a real [L, L] causal matrix; two row
@@ -546,25 +552,34 @@ def _flash_decoder_layer(
             slot_k = idx_ar.view(1, -1)
             keep = (slot_q >= slot_k).unsqueeze(0) & ~pad_mask[:, idx_ar].unsqueeze(1)
             out_ar = F.scaled_dot_product_attention(
-                q_ar, k_ar, v_ar, attn_mask=keep.unsqueeze(1), scale=softmax_scale,
+                q_ar,
+                k_ar,
+                v_ar,
+                attn_mask=keep.unsqueeze(1),
+                scale=softmax_scale,
             )
     else:
         out_ar = None
 
     if pad_mask is None:
         out_full = F.scaled_dot_product_attention(
-            q, k, v, scale=softmax_scale,
+            q,
+            k,
+            v,
+            scale=softmax_scale,
         )
     else:
         # Expand the [B, 1, 1, Skv] key mask to [B, 1, Sq, Skv]: torch-npu's
         # flash attention kernel rejects the broadcast form (only [B, N, Sq,
         # Skv] / [B, 1, Sq, Skv] / [1, 1, Sq, Skv] / [Sq, Skv] tile).
         batch, seq = pad_mask.shape
-        key_keep = (
-            (~pad_mask)[:, None, None, :].expand(batch, 1, seq, seq).contiguous()
-        )
+        key_keep = (~pad_mask)[:, None, None, :].expand(batch, 1, seq, seq).contiguous()
         out_full = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=key_keep, scale=softmax_scale,
+            q,
+            k,
+            v,
+            attn_mask=key_keep,
+            scale=softmax_scale,
         )
 
     if out_ar is not None:
@@ -580,7 +595,9 @@ def _flash_decoder_layer(
 
     if deepstack_embed is not None and visual_pos_masks is not None:
         hidden_states = deepstack_process(
-            hidden_states, visual_pos_masks, deepstack_embed,
+            hidden_states,
+            visual_pos_masks,
+            deepstack_embed,
         )
 
     return hidden_states
@@ -672,9 +689,7 @@ class HiO1CacheBlockAdapter(nn.Module):
         )
         for layer_idx, block in enumerate(self.blocks):
             deepstack_embed = (
-                deepstack_visual_embeds[layer_idx]
-                if layer_idx < n_deepstack
-                else None
+                deepstack_visual_embeds[layer_idx] if layer_idx < n_deepstack else None
             )
             hidden_states = block(
                 hidden_states,
@@ -732,6 +747,14 @@ class HiDreamO1ImageModel(nn.Module):
         position_ids: torch.Tensor,
         attention_mask: torch.Tensor,
     ) -> torch.Tensor:
+        import torch.distributed as dist
+        _r = dist.get_rank() if dist.is_initialized() else -1
+        print(
+            f"[DBG r{_r}] ids{tuple(input_ids.shape)} "
+            f"pos{tuple(position_ids.shape)} mask{tuple(attention_mask.shape)} "
+            f"lat{tuple(patchified_latents.shape)}",
+            flush=True,
+        )
         inputs_embeds = self.language_model.embed_tokens(input_ids)
         # <|tms_token|> slots carry the flow timestep instead of a token embedding.
         timestep_embeds = self.t_embedder1(timestep).to(inputs_embeds.dtype)

@@ -19,16 +19,17 @@ import numpy as np
 import torch
 import torchvision.transforms.v2 as transforms
 from PIL import Image
+
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.hidream_o1_image import (
     HIDREAM_O1_COND_KEY,
     HIDREAM_O1_NEG_COND_KEY,
 )
 from sglang.multimodal_gen.configs.sample.hidream_o1_image import (
-    HIDREAM_O1_SUPPORTED_RESOLUTIONS,
     _VARIANT_DEFAULTS,
+    HIDREAM_O1_SUPPORTED_RESOLUTIONS,
     _resolve_variant,
 )
-from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
     CacheDitConfig,
     enable_cache_on_transformer,
@@ -41,6 +42,9 @@ from sglang.multimodal_gen.runtime.distributed import (
 )
 from sglang.multimodal_gen.runtime.models.dits.hidream_o1_image import (
     HiO1CacheBlockAdapter,
+)
+from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (
+    FlowMatchEulerDiscreteScheduler,
 )
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_unipc_multistep import (
     FlowUniPCMultistepScheduler,
@@ -90,48 +94,56 @@ HIDREAM_O1_MROPE_FIX_POINT = 4096
 PREDEFINED_RESOLUTIONS = HIDREAM_O1_SUPPORTED_RESOLUTIONS
 
 DEFAULT_TIMESTEPS = [
-    999, 987, 974, 960, 945, 929, 913, 895, 877, 857, 836, 814,
-    790, 764, 737, 707, 675, 640, 602, 560, 515, 464, 409, 347, 278, 199, 110, 8,
+    999,
+    987,
+    974,
+    960,
+    945,
+    929,
+    913,
+    895,
+    877,
+    857,
+    836,
+    814,
+    790,
+    764,
+    737,
+    707,
+    675,
+    640,
+    602,
+    560,
+    515,
+    464,
+    409,
+    347,
+    278,
+    199,
+    110,
+    8,
 ]
 
-class FlowMatchScheduler:
-    """Simple Euler flow matching scheduler with sigma shift."""
 
-    def __init__(self, shift: float = 3.0):
-        self.shift = shift
-        self.timesteps = None
-        self.sigmas = None
-
-    def set_timesteps(self, num_inference_steps: int, device: torch.device):
-        sigmas = np.linspace(1.0, 1.0 / num_inference_steps, num_inference_steps)
-        sigmas = self.shift * sigmas / (1 + (self.shift - 1) * sigmas)
-        timesteps = sigmas * 1000
-        sigmas_full = np.concatenate([sigmas, [0.0]]).astype(np.float32)
-        self.sigmas = torch.from_numpy(sigmas_full).to(
-            device=device, dtype=torch.float32
-        )
-        self.timesteps = torch.from_numpy(timesteps.astype(np.int64)).to(
-            device=device, dtype=torch.long
-        )
-
-    def set_timesteps_list(self, timesteps_list, device: torch.device):
-        timesteps = torch.tensor(timesteps_list, device=device, dtype=torch.long)
-        sigmas = [t.item() / 1000.0 for t in timesteps]
-        sigmas.append(0.0)
-        self.sigmas = torch.tensor(sigmas, device=device, dtype=torch.float32)
-        self.timesteps = timesteps
-
-    def step(
-        self, model_output: torch.Tensor, timestep: torch.Tensor, sample: torch.Tensor
-    ) -> torch.Tensor:
-        """Euler step: z_next = z + dt * model_output."""
-        step_idx = (
-            (self.timesteps == timestep.long()).nonzero(as_tuple=True)[0][0].item()
-        )
-        sigma = self.sigmas[step_idx]
-        sigma_next = self.sigmas[step_idx + 1]
-        dt = sigma_next - sigma
-        return sample + dt * model_output
+def _set_flow_match_fixed_timesteps(
+    sched: FlowMatchEulerDiscreteScheduler,
+    timesteps_list,
+    device: torch.device,
+) -> None:
+    """Pin the fixed ``DEFAULT_TIMESTEPS`` schedule onto a flow-match Euler
+    scheduler, bypassing the repo scheduler's default sigma shifting (the
+    timesteps are already shifted)."""
+    timesteps = torch.tensor(timesteps_list, device=device, dtype=torch.float32)
+    sigmas = torch.tensor(
+        [t / 1000.0 for t in timesteps_list] + [0.0],
+        device=device,
+        dtype=torch.float32,
+    )
+    sched.timesteps = timesteps
+    sched.sigmas = sigmas
+    sched.num_inference_steps = len(timesteps_list)
+    sched._step_index = None
+    sched._begin_index = None
 
 
 class FlashFlowMatchScheduler:
@@ -220,13 +232,16 @@ def build_scheduler(
     if scheduler_name == "flash":
         sched = FlashFlowMatchScheduler()
     elif scheduler_name == "flow_match":
-        sched = FlowMatchScheduler(shift=shift)
+        sched = FlowMatchEulerDiscreteScheduler(shift=shift)
     elif scheduler_name == "default":
         sched = FlowUniPCMultistepScheduler(use_dynamic_shifting=False, shift=shift)
     else:
         raise ValueError(f"Unknown scheduler_name={scheduler_name!r}")
     if timesteps_list is not None:
-        sched.set_timesteps_list(timesteps_list, device)
+        if scheduler_name == "flow_match":
+            _set_flow_match_fixed_timesteps(sched, timesteps_list, device)
+        else:
+            sched.set_timesteps_list(timesteps_list, device)
     elif scheduler_name == "flash":
         sched.set_timesteps(num_inference_steps, shift, device)
     else:
@@ -860,7 +875,9 @@ def _carry_pixel_fields(stacked: dict, samples: list[dict]) -> dict:
     """Attach batched vision inputs (TI2I) to a stacked sample."""
     if samples and samples[0].get("pixel_values") is not None:
         stacked["pixel_values"] = torch.cat([s["pixel_values"] for s in samples], dim=0)
-        stacked["image_grid_thw"] = torch.cat([s["image_grid_thw"] for s in samples], dim=0)
+        stacked["image_grid_thw"] = torch.cat(
+            [s["image_grid_thw"] for s in samples], dim=0
+        )
     return stacked
 
 
@@ -927,10 +944,29 @@ class HiDreamO1ImageBeforeDenoisingStage(PipelineStage):
 
     def _enhance_prompts(self, batch: Req, server_args: ServerArgs) -> list[str]:
         prompts = batch.prompt if isinstance(batch.prompt, list) else [batch.prompt]
-        return [
-            prepare_prompt(p, pe_server_url=server_args.pe_server_url)
-            for p in prompts
-        ]
+
+        # The enhancer samples at temperature 1.0, so running it independently on
+        # every TP rank yields different prompts and, in turn, different token
+        # lengths. That desyncs the vocab-parallel embedding's all_reduce
+        # (HcclAllReduce EI0005 "parameter count" mismatch). Enhance once on the
+        # TP rank-0 worker and broadcast the result so all ranks tokenize the
+        # identical prompt.
+        tp_group = get_tp_group() if model_parallel_is_initialized() else None
+        if tp_group is None or tp_group.world_size <= 1:
+            return [
+                prepare_prompt(p, pe_server_url=server_args.pe_server_url)
+                for p in prompts
+            ]
+
+        if tp_group.rank_in_group == 0:
+            enhanced = [
+                prepare_prompt(p, pe_server_url=server_args.pe_server_url)
+                for p in prompts
+            ]
+        else:
+            enhanced = [None] * len(prompts)
+        tp_group.broadcast_object_list(enhanced, src=0)
+        return enhanced
 
     def _build_ctx(self, batch: Req, server_args: ServerArgs) -> dict:
         pad_token_id = (
@@ -1126,6 +1162,7 @@ class HiDreamO1ImageBeforeDenoisingStage(PipelineStage):
             + HIDREAM_O1_BOI_TOKEN
             + HIDREAM_O1_TMS_TOKEN
         )
+        print(f"[DBG encode] prompt={prompt!r} text_len={input_ids.shape[-1]}", flush=True)
         input_ids = self.tokenizer.encode(
             template_caption, return_tensors="pt", add_special_tokens=False
         )
@@ -1244,9 +1281,10 @@ class HiDreamO1ImageBeforeDenoisingStage(PipelineStage):
         # recipes, TI2I, cache-dit, merged multi-prompt batches — runs on the
         # hand-rolled trajectory below.
         single_prompt = not isinstance(batch.prompt, list) or len(batch.prompt) == 1
-        uni_pc = (
-            ctx["model_type"] == "full"
-            and ctx["scheduler_name"] in ("default", "unipc", "flow_unipc")
+        uni_pc = ctx["model_type"] == "full" and ctx["scheduler_name"] in (
+            "default",
+            "unipc",
+            "flow_unipc",
         )
         # cache-dit runs on the hand-rolled flash trajectory, never the framework
         # dense path, so a cache-dit request must stay off ``framework_path``.
@@ -1255,7 +1293,9 @@ class HiDreamO1ImageBeforeDenoisingStage(PipelineStage):
             if batch.sampling_params.enable_cache_dit is None
             else batch.sampling_params.enable_cache_dit
         )
-        framework_path = single_prompt and not editing and uni_pc and not cache_dit_requested
+        framework_path = (
+            single_prompt and not editing and uni_pc and not cache_dit_requested
+        )
         ctx["framework_path"] = framework_path
         ctx["cache_dit_requested"] = cache_dit_requested
         ctx["device"] = str(device)
@@ -1310,7 +1350,6 @@ class HiDreamO1ImageBeforeDenoisingStage(PipelineStage):
         batch.height = height
         batch.width = width
         return batch
-
 
     def verify_output(self, batch: Req, server_args: ServerArgs):
         result = VerificationResult()
@@ -1468,20 +1507,15 @@ class HiDreamO1ImageDenoisingStage(DenoisingStage):
     ) -> list[Req]:
         """Fuse expanded outputs into one hand-rolled denoising forward."""
         if len(batches) == 1 or any(
-            batch.extra["hidream_o1_ctx"].get("framework_path")
-            for batch in batches
+            batch.extra["hidream_o1_ctx"].get("framework_path") for batch in batches
         ):
             return super().run_grouped_requests(batches, server_args)
 
         merged = copy(batches[0])
         merged.extra = dict(batches[0].extra)
-        merged.extra["hidream_o1_ctx"] = dict(
-            batches[0].extra["hidream_o1_ctx"]
-        )
+        merged.extra["hidream_o1_ctx"] = dict(batches[0].extra["hidream_o1_ctx"])
         items = [
-            dict(item)
-            for batch in batches
-            for item in batch.extra["hidream_o1_items"]
+            dict(item) for batch in batches for item in batch.extra["hidream_o1_items"]
         ]
         for index, item in enumerate(items):
             item["index"] = index
@@ -1554,7 +1588,6 @@ class HiDreamO1ImageDenoisingStage(DenoisingStage):
                 **ctx.extra_step_kwargs,
                 return_dict=False,
             )[0].to(latents_dtype)
-
 
     def _run_trajectory(
         self, chunk: list[dict], ctx: dict, batch: Req
@@ -1633,9 +1666,7 @@ class HiDreamO1ImageDenoisingStage(DenoisingStage):
                 (1, 3, height, width), generator=gen, dtype=torch.float32
             )
             noise = noise.to(device=device, dtype=dit_dtype)
-            patches = noise.reshape(
-                1, 3, h_patches, PATCH_SIZE, w_patches, PATCH_SIZE
-            )
+            patches = noise.reshape(1, 3, h_patches, PATCH_SIZE, w_patches, PATCH_SIZE)
             z_rows.append(
                 patches.permute(0, 2, 4, 1, 3, 5)
                 .contiguous()
@@ -1667,7 +1698,10 @@ class HiDreamO1ImageDenoisingStage(DenoisingStage):
                 cache_enabled=False,
             ):
                 x_pred_cond, embeds = self._forward_batch(
-                    cond, vinputs, t_pixeldit.to(device), precomputed,
+                    cond,
+                    vinputs,
+                    t_pixeldit.to(device),
+                    precomputed,
                     use_cache_dit=step_idx >= 1,
                 )
             if embeds is not None and precomputed[0] is None:
@@ -1700,7 +1734,10 @@ class HiDreamO1ImageDenoisingStage(DenoisingStage):
                     cache_enabled=False,
                 ):
                     x_pred_uncond, _ = self._forward_batch(
-                        uncond, vinputs, t_pixeldit.to(device), precomputed,
+                        uncond,
+                        vinputs,
+                        t_pixeldit.to(device),
+                        precomputed,
                         use_cache_dit=step_idx >= 1,
                     )
                 x_tgt_uncond = x_pred_uncond[
@@ -1721,14 +1758,16 @@ class HiDreamO1ImageDenoisingStage(DenoisingStage):
                     s_noise=noise_scale_schedule[step_idx],
                     noise=noise,
                 ).to(dit_dtype)
-            elif isinstance(sched, FlowMatchScheduler):
-                # FlowMatch's Euler step takes no ``return_dict`` and returns
-                # the sample tensor directly.
-                z = sched.step(
+            elif isinstance(sched, FlowMatchEulerDiscreteScheduler):
+                # The flow-match Euler scheduler is diffusers-style: with
+                # ``return_dict=False`` it returns a ``(prev_sample,)`` tuple.
+                step_out = sched.step(
                     model_output.float(),
                     step_t.to(dtype=torch.float32),
                     z.float(),
-                ).to(dit_dtype)
+                    return_dict=False,
+                )
+                z = step_out[0].to(dit_dtype)
             else:
                 # UniPC (full-model TI2I) is diffusers-style: it accepts
                 # ``return_dict`` and returns a ``(prev_sample,)`` tuple.
@@ -1738,9 +1777,9 @@ class HiDreamO1ImageDenoisingStage(DenoisingStage):
                     z.float(),
                     return_dict=False,
                 )
-                z = (
-                    step_out[0] if isinstance(step_out, tuple) else step_out
-                ).to(dit_dtype)
+                z = (step_out[0] if isinstance(step_out, tuple) else step_out).to(
+                    dit_dtype
+                )
 
         return [z[i : i + 1] for i in range(len(chunk))]
 
