@@ -1209,17 +1209,23 @@ class BufferModePipeline:
             )
         return list(merged.values())
 
-    def finish_storage_write_ack(self, operation_id: int) -> None:
+    def finish_storage_write_ack(
+        self, operation_id: int, written_pages: Optional[int] = None
+    ) -> None:
         """Storage ack (rank-synced drain): free the staging and feed each
-        written pool's beliefs unconditionally, keeping admission
-        TP-deterministic under per-rank backend failures."""
+        carried pool's beliefs with the written prefix. ``written_pages`` is
+        the rank-agreed written prefix of the operation's KV chain (None: a
+        write with no KV evidence, every key counts); feeding the same prefix
+        on every rank keeps admission TP-deterministic under per-rank backend
+        failures. The in-flight marks are dropped for the whole span, so an
+        un-backed tail reads as absent until a later write-through covers it."""
         entry = self.ongoing_backup.pop(operation_id, None)
         if entry is None:
             return
         beliefs = self._cache.storage_existence_cache
         for pool, keys in entry.keys_by_pool.items():
             pool_beliefs = beliefs.pool(pool)
-            pool_beliefs.add(keys)
+            pool_beliefs.add(keys if written_pages is None else keys[:written_pages])
             pool_beliefs.untrack_inflight(keys)
         self._free_staging_now(entry.host_indices, entry.aux_xfers)
         self.write_staged_tokens_ -= entry.occupied_units

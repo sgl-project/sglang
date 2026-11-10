@@ -2372,6 +2372,15 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
         )
 
+        self.storage_backup_failed_tokens_total = Counter(
+            name="sglang:hicache_storage_backup_failed_tokens_total",
+            documentation="Tokens of a storage backup span that were not "
+            "written when the span was settled at its rank-agreed written "
+            "prefix. The tail stays un-backed until a later write-through "
+            "covers it.",
+            labelnames=labels.keys(),
+        )
+
         bucket_io = [
             1,
             5,
@@ -2458,6 +2467,12 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
     def log_prefetch_aux_alloc_failed_tokens(self, num_tokens: int):
         if num_tokens > 0:
             self.prefetch_aux_alloc_failed_tokens_total.labels(**self.labels).inc(
+                num_tokens
+            )
+
+    def log_storage_backup_failed_tokens(self, num_tokens: int) -> None:
+        if num_tokens > 0:
+            self.storage_backup_failed_tokens_total.labels(**self.labels).inc(
                 num_tokens
             )
 
