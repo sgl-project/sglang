@@ -22,7 +22,7 @@ import os
 from bisect import bisect_left
 from contextlib import contextmanager
 from dataclasses import dataclass, field, fields, replace
-from functools import cached_property
+from functools import cache, cached_property
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
@@ -78,6 +78,20 @@ def megamoe_autotune_context(
             _active_context = previous
             if context.dirty:
                 tuner.publish_namespaced_records(_CACHE_NAMESPACE, context.records)
+
+
+def forward_megamoe(mega, tensors, workspace=None):
+    if mega.supports_output_view:
+        return mega.forward(tensors, workspace=workspace, return_workspace_view=True)
+    return mega.forward(tensors, workspace=workspace)
+
+
+@cache
+def _log_decode_workspace_skipped() -> None:
+    logger.info(
+        "SGLANG_FLASHINFER_MEGAMOE_DECODE_MAX_TOKENS_PER_RANK is unused: "
+        "MegaMoE startup autotuning already prepares small-capacity profiles."
+    )
 
 
 @contextmanager
@@ -159,7 +173,9 @@ class MegaMoeTunedForward:
     ``knobs=None``. Preparation must precede ordinary forwarding and capture.
     """
 
-    def __init__(self, bootstrap, fleet_params, backend):
+    def __init__(
+        self, bootstrap, fleet_params, backend, *, decode_max_tokens_per_rank=0
+    ):
         if backend.megakernel.knobs is not None:
             raise ValueError("MegaMoE startup tuning requires knobs=None")
         if backend.preprocess_weights or backend.transformed_weights is None:
@@ -170,6 +186,10 @@ class MegaMoeTunedForward:
         self.workspaces: dict[int, Any] = {}
         self._fallback_used = False
         self._profile_capacities: tuple[int, ...] = ()
+        # Optional smaller profile for decode-only forwards when startup tuning
+        # does not run; 0 means none.
+        self._decode_max_tokens_per_rank = decode_max_tokens_per_rank
+        self._decode_workspace = None
 
     def _common_tokens(self, tensors) -> int:
         if self.bootstrap.world_size == 1:
@@ -182,6 +202,28 @@ class MegaMoeTunedForward:
                 "MegaMoE workspace selection requires synchronized DP token counts"
             )
         return max(counts, default=0)
+
+    def _untuned_workspace(self, mega, tensors):
+        """The decode workspace if no DP rank extends and every rank fits, else None.
+
+        MegaMoE is a lockstep collective, so the choice reads only DP-synchronized
+        state; the token bound also keeps prefill-sized extend=False forwards out.
+        """
+        if not self._decode_max_tokens_per_rank:
+            return None
+        if self._decode_workspace is None:
+            # Creation is an EP collective: every rank runs this first untuned
+            # forward eagerly, and startup tuning refuses to follow it.
+            self._decode_workspace = mega.create_workspace(
+                self._decode_max_tokens_per_rank
+            )
+        from sglang.srt.layers.dp_attention import get_is_extend_in_batch
+
+        if get_is_extend_in_batch():
+            return None
+        if self._common_tokens(tensors) > self._decode_max_tokens_per_rank:
+            return None
+        return self._decode_workspace
 
     @cached_property
     def _geometry_key(self) -> str:
@@ -323,19 +365,13 @@ class MegaMoeTunedForward:
         mega.warmup(profile_inputs, workspace=workspace)
         self.workspaces[capacity] = workspace
 
-    @staticmethod
-    def _forward(mega, tensors, workspace=None):
-        if mega.supports_output_view:
-            return mega.forward(
-                tensors, workspace=workspace, return_workspace_view=True
-            )
-        return mega.forward(tensors, workspace=workspace)
-
     def __call__(self, mega, tensors):
         context = _active_context
         if context is None and not self.workspaces:
             self._fallback_used = True
-            return self._forward(mega, tensors)
+            return forward_megamoe(
+                mega, tensors, self._untuned_workspace(mega, tensors)
+            )
         if context is not None and not self.workspaces:
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError(
@@ -354,6 +390,8 @@ class MegaMoeTunedForward:
                 raise RuntimeError(
                     "FlashInfer MegaMoE startup tuning currently requires the full WORLD process group"
                 )
+            if self._decode_max_tokens_per_rank:
+                _log_decode_workspace_skipped()
             # The startup dummy can be much larger than captured decode batches.
             # Keep small-N profiles bounded by decode, plus one prefill profile.
             capacities = set(_capacities(context.decode_num_tokens))
@@ -365,7 +403,7 @@ class MegaMoeTunedForward:
         count = self._common_tokens(tensors)
         index = bisect_left(self._profile_capacities, count)
         if index < len(self._profile_capacities):
-            return self._forward(
+            return forward_megamoe(
                 mega, tensors, self.workspaces[self._profile_capacities[index]]
             )
         raise ValueError(
