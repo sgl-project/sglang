@@ -2985,6 +2985,192 @@ class TestUnifiedRadixPrefetchCorruption(
         cache.unlock(decode_req.hicache_restore_lock)
         cache.sanity_check()
 
+    def test_pd_budget_wait_holds_no_anchor_and_cancels_cleanly(self):
+        if self.cfg.has_swa:
+            self.skipTest("PD reservation currently covers Full/Mamba pools")
+        cache, _, _ = build_fixture(self.cfg)
+        self._init_hicache(cache)
+        cache.enable_storage = True
+        cache.prefetch_stop_policy = "wait_complete"
+        pool = cache.cache_controller.mem_pool_host
+        available = pool.available_size()
+        handle = CacheRequestHandle("budget-wait", 0)
+        with mock.patch(
+            "sglang.srt.mem_cache.unified_radix_cache.get_disagg",
+            return_value=SimpleNamespace(disaggregation_mode="prefill"),
+        ):
+            cache.prefetch_from_storage(
+                handle,
+                cache.root_node_handle(),
+                list(range(self.ps * 4)),
+                matched_prefix_tokens=[],
+            )
+        self.assertIn(handle, cache.prefetch_admission_budget.waiting)
+        self.assertNotIn(handle, cache.ongoing_prefetch)
+        self.assertNotIn(handle, cache.prefetch_admission_locks)
+        self.assertEqual(pool.available_size(), available)
+        self.assertFalse(cache.check_prefetch_progress(handle))
+        cache._abandon_attempt(handle)
+        cache._abandon_attempt(handle)
+        self.assertTrue(cache.check_prefetch_progress(handle))
+        self.assertFalse(cache.prefetch_admission_budget.waiting)
+        self.assertFalse(cache.prefetch_admission_budget.granted)
+        self.assertEqual(pool.available_size(), available)
+        cache.sanity_check()
+
+    def test_pd_budget_rematches_evicted_anchor_and_releases_skip(self):
+        cache, _, _ = build_fixture(self.cfg)
+        self._init_hicache(cache)
+        cache.enable_storage = True
+        cache.prefetch_stop_policy = "wait_complete"
+        cache.prefetch_threshold = self.ps
+        owner = CacheRequestHandle("old-anchor", 0)
+        key = self._completed_host_prefetch(cache, owner)
+        cache.finish_storage_prefetch_admission(owner, len(key), None)
+        anchor = cache.match_prefix(MatchPrefixParams(key=key)).last_host_node
+        handle = CacheRequestHandle("deferred", 0)
+        tokens = list(key.token_ids) + list(range(2000, 2000 + self.ps))
+        with (
+            mock.patch(
+                "sglang.srt.mem_cache.unified_radix_cache.get_disagg",
+                return_value=SimpleNamespace(disaggregation_mode="prefill"),
+            ),
+            mock.patch(
+                "sglang.srt.mem_cache.unified_radix_cache.get_model",
+                return_value=SimpleNamespace(context_length=self.ps * 8),
+            ),
+        ):
+            cache.prefetch_from_storage(
+                handle,
+                anchor,
+                tokens[len(key) :],
+                matched_prefix_tokens=list(key.token_ids),
+            )
+            cache.evict_host(len(key))
+            self.assertEqual(
+                cache.match_prefix(MatchPrefixParams(key=key)).host_hit_length, 0
+            )
+            cache.set_prefetch_admission_ready([handle])
+            with (
+                mock.patch.object(
+                    cache.cache_controller, "get_prefetch_submission", return_value=None
+                ),
+                mock.patch.object(
+                    cache.cache_controller,
+                    "submit_prefetch",
+                    return_value=SimpleNamespace(operation=None, decision=False),
+                ) as submit,
+            ):
+                cache._drain_storage_control_queues_impl(
+                    n_storage_hit=0,
+                    n_ack_prefetch=0,
+                    n_backup=0,
+                    n_release=0,
+                    extra_release_counts={},
+                    log_metrics=True,
+                )
+            self.assertEqual(list(submit.call_args.args[1].token_ids), tokens)
+            self.assertEqual(list(submit.call_args.args[4]), [])
+            self.assertIsInstance(submit.call_args.args[1].token_ids, array)
+            self.assertEqual(submit.call_args.args[1].token_ids.typecode, "q")
+        self.assertFalse(cache.prefetch_admission_budget.waiting)
+        self.assertFalse(cache.prefetch_admission_budget.granted)
+        cache.sanity_check()
+
+    def test_pd_budget_completion_retains_reservation_until_handoff(self):
+        cache, _, _ = build_fixture(self.cfg)
+        self._init_hicache(cache)
+        handle = CacheRequestHandle("reserved", 0)
+        budget = cache.prefetch_admission_budget
+        budget.enqueue(handle, self.ps * 4, "payload")
+        budget.ready.add(handle)
+        budget.grant(handle, self.ps * 8, 0)
+        key = self._completed_host_prefetch(cache, handle)
+        self.assertIn(handle, budget.granted)
+        self.assertIn(handle, cache.prefetch_admission_locks)
+        match = cache.match_prefix(MatchPrefixParams(key=key))
+        receipt = cache.inc_host_lock_ref(match.last_host_node).to_dec_params()
+        cache.finish_storage_prefetch_admission(handle, len(key), None)
+        self.assertNotIn(handle, budget.granted)
+        cache.evict_host(len(key))
+        self.assertEqual(
+            cache.match_prefix(MatchPrefixParams(key=key)).host_hit_length, len(key)
+        )
+        cache.dec_host_lock_ref(match.last_host_node, receipt)
+        cache.evict_host(len(key))
+        cache.sanity_check()
+
+    def test_pd_query_skip_and_error_release_anchor(self):
+        for fails in (False, True):
+            with self.subTest(fails=fails):
+                cache, _, _ = build_fixture(self.cfg)
+                self._init_hicache(cache)
+                cache.enable_storage = True
+                cache.prefetch_stop_policy = "wait_complete"
+                cache.prefetch_threshold = self.ps
+                owner = CacheRequestHandle("owner", 0)
+                key = self._completed_host_prefetch(cache, owner)
+                cache.finish_storage_prefetch_admission(owner, len(key), None)
+                handle = CacheRequestHandle("query", 0)
+                budget = cache.prefetch_admission_budget
+                budget.enqueue(handle, len(key) + self.ps, "query")
+                budget.ready.add(handle)
+                budget.grant(handle, len(key) + self.ps, 0)
+                anchor = cache.match_prefix(MatchPrefixParams(key=key)).last_host_node
+                with (
+                    mock.patch.object(
+                        cache.cache_controller,
+                        "get_prefetch_submission",
+                        return_value=None,
+                    ),
+                    mock.patch.object(
+                        cache.cache_controller,
+                        "submit_prefetch",
+                        side_effect=RuntimeError("lookup failed") if fails else None,
+                        return_value=SimpleNamespace(operation=None, decision=False),
+                    ),
+                ):
+
+                    def query():
+                        cache.prefetch_from_storage(
+                            handle,
+                            anchor,
+                            list(range(2000, 2000 + self.ps)),
+                            matched_prefix_tokens=list(key.token_ids),
+                        )
+
+                    if fails:
+                        with self.assertRaisesRegex(RuntimeError, "lookup failed"):
+                            query()
+                    else:
+                        query()
+                cache._abandon_attempt(handle)
+                cache.evict_host(len(key))
+                self.assertEqual(
+                    cache.match_prefix(MatchPrefixParams(key=key)).host_hit_length, 0
+                )
+                self.assertFalse(budget.granted)
+                cache.sanity_check()
+
+    def test_storage_shutdown_clears_budget_waiters_without_starting_lookup(self):
+        from sglang.srt.mem_cache.unified_cache.storage_attachment import (
+            StorageAttachment,
+        )
+
+        cache, _, _ = build_fixture(self.cfg)
+        self._init_hicache(cache)
+        handle = CacheRequestHandle("shutdown-waiter", 0)
+        budget = cache.prefetch_admission_budget
+        budget.enqueue(handle, self.ps, "unused")
+        budget.ready.add(handle)
+        with mock.patch.object(cache.cache_controller, "submit_prefetch") as submit:
+            StorageAttachment(cache)._release_pending_storage_ops()
+            submit.assert_not_called()
+        self.assertFalse(budget.waiting)
+        self.assertFalse(budget.granted)
+        self.assertFalse(budget.ready)
+        cache.sanity_check()
+
     def test_hit_waits_for_completed_prefetch_to_be_consumed(self):
         """Under real host-pool pressure, retain a confirmed hit and launch
         its read after admission frees the earlier prefix's eviction hold."""

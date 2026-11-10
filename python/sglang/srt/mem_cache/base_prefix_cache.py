@@ -710,7 +710,8 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
 
     def on_release(self, req: Req, *, checkpointed: bool) -> None:
         """The row is freed and the lock dropped; ``checkpointed`` says whether
-        the KV went into the tree first. Drop per-request state kept outside the tree."""
+        the KV went into the tree first. Drop per-request state kept outside the tree.
+        """
 
     def evictable_size(self):
         return 0
@@ -786,6 +787,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         Notify the cache controller to start the KV cache loading
         """
         raise NotImplementedError()
+
+    def set_prefetch_admission_ready(self, handles) -> None:
+        """Publish requests that can progress without a decode allocation."""
+        pass
 
     def check_hicache_events(self) -> Any:
         """

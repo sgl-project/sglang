@@ -446,6 +446,7 @@ class StorageAttachment:
         cache.prefetch_loaded_tokens_by_reqid.clear()
         for handle in list(cache.prefetch_admission_locks):
             cache._release_prefetch_admission_lock(handle)
+        cache.prefetch_admission_budget.clear()
         cache.pending_cache_hit_allocs.clear()
         cache.prefetch_loaded_storage_start_by_reqid.clear()
         cache.storage_prefetch_retries.clear()

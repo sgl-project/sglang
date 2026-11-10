@@ -84,6 +84,7 @@ from sglang.srt.mem_cache.kv.plan import (
     TREE_WINDOW,
 )
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+from sglang.srt.mem_cache.prefetch_admission_budget import PrefetchAdmissionBudget
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
 from sglang.srt.mem_cache.unified_cache.cache_action import (
@@ -499,14 +500,15 @@ class UnifiedRadixCache(BasePrefixCache):
         # Reset Controller.
         self.session.slots.clear()
         self.ongoing_write_through: dict[int, _OngoingWriteThrough] = {}
-        self.ongoing_load_back: dict[
-            int, _OngoingLoadBack | list[_OngoingLoadBack]
-        ] = {}
+        self.ongoing_load_back: dict[int, _OngoingLoadBack | list[_OngoingLoadBack]] = (
+            {}
+        )
         self.enable_storage = False
         self.prefetch_loaded_tokens_by_reqid: dict[CacheRequestHandle, int] = {}
         self.prefetch_admission_locks: dict[
             CacheRequestHandle, tuple[NodeId, DecLockRefParams]
         ] = {}
+        self.prefetch_admission_budget = PrefetchAdmissionBudget()
         self.pending_cache_hit_allocs: deque[PrefetchOperation] = deque()
         self.prefetch_loaded_storage_start_by_reqid: dict[CacheRequestHandle, int] = {}
         self.ongoing_prefetch: dict[CacheRequestHandle, _OngoingPrefetch] = {}
@@ -514,9 +516,9 @@ class UnifiedRadixCache(BasePrefixCache):
         # Rank-agreed L3-hit tokens not yet resolved as usable or unfulfilled.
         # Cache-mode entries survive L3->L2 until H2D succeeds or admission
         # fails; buffer-mode entries survive staging until the H2D ack.
-        self._storage_prefetch_hit_remaining_by_reqid: dict[
-            CacheRequestHandle, int
-        ] = {}
+        self._storage_prefetch_hit_remaining_by_reqid: dict[CacheRequestHandle, int] = (
+            {}
+        )
         self.storage_prefetch_retries = StoragePrefetchRetries()
         self.ongoing_backup: dict[int, tuple[NodeId, DecLockRefParams]] = {}
         if self.buffer_pipeline is not None:
@@ -1701,9 +1703,9 @@ class UnifiedRadixCache(BasePrefixCache):
         new_last_node = result.last_device_node
         new_indices = self.path_device_indices(new_last_node)
         new_prefix_len = result.prefix_len
-        assert req.kv.cache_protected_len <= len(new_indices) + self.page_size - 1, (
-            f"{req.kv.cache_protected_len=}, {len(new_indices)=}, {page_aligned_len=}"
-        )
+        assert (
+            req.kv.cache_protected_len <= len(new_indices) + self.page_size - 1
+        ), f"{req.kv.cache_protected_len=}, {len(new_indices)=}, {page_aligned_len=}"
         assert (
             new_prefix_len <= len(new_indices) and len(new_indices) == page_aligned_len
         ), f"{new_prefix_len=}, {len(new_indices)=}, {page_aligned_len=}"
@@ -2598,6 +2600,29 @@ class UnifiedRadixCache(BasePrefixCache):
         if not self.enable_storage or self.cache_controller is None:
             return
 
+        budget = self.prefetch_admission_budget
+        if (
+            self.host_memory_mode == "cache"
+            and self.prefetch_stop_policy == "wait_complete"
+            and self.pp_size == 1
+            and get_disagg().disaggregation_mode == "prefill"
+            and self.slot_id(TREE_WINDOW) is None
+            and request not in budget.granted
+            and request not in self.ongoing_prefetch
+        ):
+            # Budget waiting precedes even the lookup's anchor lock. Store token
+            # identity, not a node ID which could be evicted or split meanwhile.
+            tokens = array("q", matched_prefix_tokens or ())
+            tokens.extend(new_input_tokens)
+            capacity = self.cache_controller.mem_pool_host.logical_size
+            if 0 < len(tokens) <= capacity:
+                budget.enqueue(
+                    request,
+                    len(tokens),
+                    (tokens, extra_key, cache_salt, storage_hit_end),
+                )
+                return
+
         req_id = request.rid
         self.storage_prefetch_retries.cancel(req_id)
         wait = self._storage_prefetch_wait.get(request)
@@ -2722,17 +2747,25 @@ class UnifiedRadixCache(BasePrefixCache):
 
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
-        submission = self.cache_controller.submit_prefetch(
-            request,
-            prefetch_key,
-            last_hash,
-            prefix_keys,
-            matched_prefix_tokens,
-            aux_xfers or None,
-            assume_stored=assume_stored,
-        )
+        try:
+            submission = self.cache_controller.submit_prefetch(
+                request,
+                prefetch_key,
+                last_hash,
+                prefix_keys,
+                matched_prefix_tokens,
+                aux_xfers or None,
+                assume_stored=assume_stored,
+            )
+        except Exception:
+            if anchor_lock_params is not None:
+                self.dec_host_lock_ref(last_host_node_id, anchor_lock_params)
+            self.prefetch_admission_budget.release(request)
+            raise
         operation = submission.operation
         if operation is None:
+            if anchor_lock_params is not None:
+                self.dec_host_lock_ref(last_host_node_id, anchor_lock_params)
             assert submission.decision is not None
             self.cache_controller.append_host_mem_release(extra_pools=aux_xfers or None)
             return submission.decision
@@ -2745,6 +2778,8 @@ class UnifiedRadixCache(BasePrefixCache):
         operation.stats_requested_tokens = prefetch_length
         operation.storage_start = storage_start
         if submission.decision is not None:
+            if anchor_lock_params is not None:
+                self.dec_host_lock_ref(last_host_node_id, anchor_lock_params)
             return submission.decision
 
         self.ongoing_prefetch[request] = _OngoingPrefetch(
@@ -2768,6 +2803,58 @@ class UnifiedRadixCache(BasePrefixCache):
             # Cache mode reserves the requested span up front; buffer mode
             # grants occupancy later at hit-alloc time, sized to the hit.
             self.cache_controller.prefetch_tokens_occupied += len(prefetch_key)
+
+    def set_prefetch_admission_ready(self, handles) -> None:
+        self.prefetch_admission_budget.ready = set(handles)
+
+    def _drain_prefetch_admission_budget(self) -> None:
+        budget = self.prefetch_admission_budget
+        if not budget.waiting:
+            return
+        cc = self.cache_controller
+        capacity = cc.mem_pool_host.logical_size
+        reserve = min(capacity, get_model().context_length or capacity)
+        entry = self.host_pool_group.entry_map.get(PoolName.MAMBA)
+        mamba = entry.host_pool if entry is not None else None
+        slots = mamba.size if mamba is not None else None
+        for handle in budget.candidates():
+            payload = budget.grant(handle, capacity, reserve, slots)
+            if payload is None:
+                continue
+            tokens, extra_key, cache_salt, storage_hit_end = payload
+            match = self.match_prefix(
+                MatchPrefixParams(
+                    key=RadixKey(
+                        tokens,
+                        extra_key=extra_key,
+                        is_bigram=self.tree_core.is_eagle,
+                        cache_salt=cache_salt,
+                    ),
+                    cow_mamba=False,
+                )
+            )
+            start = match.device_prefix_len + match.host_hit_length
+            node = match.last_host_node
+            if not (self.is_root(node) or self.is_backuped(node)):
+                budget.release(handle)
+                continue
+            self.prefetch_from_storage(
+                handle,
+                node,
+                tokens[start:],
+                self.get_last_hash_value(node),
+                (
+                    self.get_prefix_hash_values(node)
+                    if self.hicache_storage_pass_prefix_keys
+                    else None
+                ),
+                matched_prefix_tokens=tokens[:start],
+                extra_key=extra_key,
+                cache_salt=cache_salt,
+                storage_hit_end=storage_hit_end,
+            )
+            if handle not in self.ongoing_prefetch:
+                budget.release(handle)
 
     def _start_storage_prefetch_wait(self, operation: PrefetchOperation) -> None:
         if (
@@ -2873,7 +2960,10 @@ class UnifiedRadixCache(BasePrefixCache):
         return digest
 
     def has_ongoing_prefetch(self, handle: CacheRequestHandle) -> bool:
-        return handle in self.ongoing_prefetch
+        return (
+            handle in self.ongoing_prefetch
+            or handle in self.prefetch_admission_budget.waiting
+        )
 
     def bind_prefetch_ticket(self, req_id: str, decision: bool = True) -> None:
         # PP0 also records misses/skips; only hits travel with the request relay.
@@ -2958,6 +3048,8 @@ class UnifiedRadixCache(BasePrefixCache):
         ):
             return self._check_pp_prefetch_progress(request)
 
+        if request in self.prefetch_admission_budget.waiting:
+            return False
         if request not in self.ongoing_prefetch:
             return True
 
@@ -3303,6 +3395,7 @@ class UnifiedRadixCache(BasePrefixCache):
         A consumer must acquire its own host reference before calling this;
         duplicate completion or subsequent cancellation is safe.
         """
+        self.prefetch_admission_budget.release(request)
         self._storage_prefetch_wait.pop(request, None)
         if self.host_memory_mode == "cache":
             self._release_prefetch_admission_lock(request)
@@ -3346,6 +3439,7 @@ class UnifiedRadixCache(BasePrefixCache):
     @rank_consensus(same_params=True)
     def _abandon_attempt(self, request: CacheRequestHandle) -> None:
         rid = request.rid
+        self.prefetch_admission_budget.release(request)
         self._release_prefetch_admission_lock(request)
         self._storage_prefetch_wait.pop(request, None)
         if self.linker is not None:
@@ -3392,6 +3486,7 @@ class UnifiedRadixCache(BasePrefixCache):
         extra_pools: Optional[list[PoolTransfer]],
     ) -> None:
         """Drop an in-flight prefetch, releasing ``host_indices`` and ``extra_pools``."""
+        self.prefetch_admission_budget.release(request)
         info = self.ongoing_prefetch.pop(request)
         if info.anchor_lock_params is not None:
             self.dec_host_lock_ref(info.anchor_node_id, info.anchor_lock_params)
@@ -3631,7 +3726,10 @@ class UnifiedRadixCache(BasePrefixCache):
                     # A PD prefill waiting on another request's admission can
                     # block decode capacity needed by that owner. In-flight IO
                     # and load-backs below can still release independently.
-                    get_disagg().disaggregation_mode != "prefill"
+                    (
+                        get_disagg().disaggregation_mode != "prefill"
+                        or operation.handle in self.prefetch_admission_budget.granted
+                    )
                     and any(
                         handle != operation.handle
                         and handle not in self.ongoing_prefetch
@@ -3915,6 +4013,10 @@ class UnifiedRadixCache(BasePrefixCache):
         _drain_backup()
         _drain_release()
         _drain_extra_release()
+        if log_metrics:
+            # Both scheduler event polling and explicit synchronized drains use
+            # this path. Shutdown drains must never start a deferred lookup.
+            self._drain_prefetch_admission_budget()
 
     def drain_storage_control_queues(self) -> None:
         cc = self.cache_controller
@@ -4199,9 +4301,9 @@ class UnifiedRadixCache(BasePrefixCache):
             )
             self._all_reduce(sync_tensor, torch.distributed.ReduceOp.MIN)
             finish_count = int(sync_tensor[0].item())
-            assert sync_tensor[1].item() == -sync_tensor[2].item(), (
-                "write_back duplicate-reclaim victims diverged across TP ranks"
-            )
+            assert (
+                sync_tensor[1].item() == -sync_tensor[2].item()
+            ), "write_back duplicate-reclaim victims diverged across TP ranks"
 
         while finish_count > 0:
             ack = cc.ack_load_queue.pop(0)

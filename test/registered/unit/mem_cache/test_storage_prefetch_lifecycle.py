@@ -26,6 +26,7 @@ from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
+from sglang.srt.mem_cache.prefetch_admission_budget import PrefetchAdmissionBudget
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
@@ -53,6 +54,7 @@ _REQ = CacheRequestHandle("r", 0)
 
 def _staged_fixture(full_match=2):
     cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+    cache.prefetch_admission_budget = PrefetchAdmissionBudget()
     cache.tree_core = SimpleNamespace(
         page_size=2,
         is_eagle=False,
@@ -69,6 +71,7 @@ def _staged_fixture(full_match=2):
         empty_match_result=SimpleNamespace(last_device_node=0),
     )
     cache.host_memory_mode = "buffer_only"
+    cache.prefetch_stop_policy = "best_effort"
     cache.linker = None
     # The one window slot, by the sub-pool name its hits go by.
     cache.__dict__["_window_slot_sub_pools"] = {ComponentType.SWA: "swa"}
@@ -161,6 +164,7 @@ def _staged_fixture(full_match=2):
 def _hit_drain_fixture():
     """A buffer-mode cache whose hit drain and outcome accounting are real."""
     cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+    cache.prefetch_admission_budget = PrefetchAdmissionBudget()
     cache.host_memory_mode = "buffer_only"
     cache.prefetch_threshold = 2
     cache.enable_storage_metrics = False
