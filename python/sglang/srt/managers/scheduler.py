@@ -3430,27 +3430,28 @@ class Scheduler(
             )
             return
 
-        if self.spec_algorithm.is_ubtree():
-            error_msg = validate_ubtree_request(req)
-            if error_msg is not None:
-                abort_req = make_abort_req(
-                    req,
-                    finished_reason={
-                        "type": "abort",
-                        "status_code": HTTPStatus.BAD_REQUEST,
-                        "message": error_msg,
-                    },
-                )
-                req.time_stats.trace_ctx.abort(abort_info=abort_req.finished_reason)
-                self.send_abort_output(abort_req, req)
-                return
-        elif self.spec_algorithm.is_dflash_family():
-            error_msg = validate_dflash_request(req, self.enable_overlap)
-            if error_msg is not None:
-                req.set_finish_with_abort(error_msg)
-                self.init_req_max_new_tokens(req)
-                self._add_request_to_queue(req)
-                return
+        if self.spec_algorithm.is_dflash_family():
+            if self.spec_algorithm.is_ubtree():
+                error_msg = validate_ubtree_request(req)
+                if error_msg is not None:
+                    abort_req = make_abort_req(
+                        req,
+                        finished_reason={
+                            "type": "abort",
+                            "status_code": HTTPStatus.BAD_REQUEST,
+                            "message": error_msg,
+                        },
+                    )
+                    req.time_stats.trace_ctx.abort(abort_info=abort_req.finished_reason)
+                    self.send_abort_output(abort_req, req)
+                    return
+            else:
+                error_msg = validate_dflash_request(req, self.enable_overlap)
+                if error_msg is not None:
+                    req.set_finish_with_abort(error_msg)
+                    self.init_req_max_new_tokens(req)
+                    self._add_request_to_queue(req)
+                    return
 
         if self.spec_algorithm.is_uno():
             error_msg = validate_uno_request(req)
