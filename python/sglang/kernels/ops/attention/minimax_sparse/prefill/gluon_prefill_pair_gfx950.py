@@ -384,8 +384,6 @@ def pair_sparse_prefill(
     as the (fp8 [total_q, H * D], scale [total_q, H] column-major) pair the o_proj's
     separate per 1 x 128 quant would write, else as bf16."""
     total_q, num_heads, head_dim = q.shape
-    topk = topk_idx.shape[2]
-    topk_rows = topk_idx[0]
     out_fp8 = out_quant == "fp8"
     if out_fp8:
         q8 = torch.empty(
@@ -397,6 +395,47 @@ def pair_sparse_prefill(
     else:
         out = torch.empty_like(q)
         q8, scale = out, out
+    pair_sparse_prefill_into(
+        q,
+        k_scratch,
+        v_scratch,
+        topk_idx[0],
+        req_id,
+        abs_pos,
+        page_start,
+        sm_scale,
+        k_scale,
+        v_scale,
+        out,
+        q8,
+        scale,
+        out_fp8,
+    )
+    if out_fp8:
+        return q8, scale.t()
+    return out
+
+
+def pair_sparse_prefill_into(
+    q: torch.Tensor,  # [total_q, H, D] bf16, may be a head slice of a wider q
+    k_scratch: torch.Tensor,
+    v_scratch: torch.Tensor,
+    topk_rows: torch.Tensor,  # [total_q, topk] int32
+    req_id: torch.Tensor,
+    abs_pos: torch.Tensor,
+    page_start: torch.Tensor,
+    sm_scale: float,
+    k_scale: float,
+    v_scale: float,
+    out: torch.Tensor,  # [total_q, H, D] bf16 view written in place (dtype only with fp8)
+    q8: torch.Tensor,  # [total_q, H * D] fp8 view, with out_fp8
+    scale: torch.Tensor,  # [H, total_q] fp32 view, with out_fp8
+    out_fp8: bool,
+) -> None:
+    """The pair kernel over caller-owned views: q, O, the fp8 O and its scales may be head
+    slices of the full-width tensors, so several KV heads fill one output without copies."""
+    total_q, num_heads, head_dim = q.shape
+    topk = topk_rows.shape[1]
     num_pairs = triton.cdiv(total_q, 2)
     _sparse_prefill_pair_kernel[(triton.cdiv(num_pairs, _XCDS) * _XCDS,)](
         q,
@@ -430,6 +469,3 @@ def pair_sparse_prefill(
         # Two waves per SIMD fit in 256 registers here; the default allocation runs one.
         waves_per_eu=2,
     )
-    if out_fp8:
-        return q8, scale.t()
-    return out
