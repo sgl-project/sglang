@@ -36,6 +36,7 @@ __all__ = [
     "RowShard",
     "has_dense_fp4_indexer",
     "is_sm100",
+    "is_sm100_or_newer",
     "make_candidate_indexer",
     "make_full_topk_indexer",
 ]
@@ -43,9 +44,19 @@ __all__ = [
 
 @functools.cache
 def is_sm100() -> bool:
-    # The DeepGEMM fp8_fp4 mqa-logits paths are SM100-family only; other devices
-    # (Hopper, SM120, non-CUDA) take the torch / Triton indexer.
+    # Strict SM100 only. DeepGEMM's *sparse* mqa-logits kernels (and the
+    # paged sparse metadata) assert arch == 10, so only the
+    # candidate/sparse-table path is gated on this; see #49173.
     return current_arch().is_sm(10)
+
+
+@functools.cache
+def is_sm100_or_newer() -> bool:
+    # The *dense* DeepGEMM fp8_fp4 mqa-logits kernels support SM100 and newer
+    # (sgl-deep-gemm 0.2.6 dispatches arch 12 with the fp32 weights/logits
+    # contract, see kernels/ops/attention/dsv4/index_logits.py); Hopper and
+    # non-CUDA devices take the torch indexer.
+    return current_arch().is_sm_at_least(10)
 
 
 @functools.cache
@@ -61,7 +72,7 @@ def has_dense_fp4_indexer() -> bool:
 
 @functools.cache
 def _use_deep_gemm_prefill() -> bool:
-    return is_sm100() and has_dense_fp4_indexer()
+    return is_sm100_or_newer() and has_dense_fp4_indexer()
 
 
 def make_full_topk_indexer(
@@ -73,7 +84,7 @@ def make_full_topk_indexer(
         token_to_kv_pool=token_to_kv_pool,
         req_to_token=req_to_token,
         use_deep_gemm_prefill=_use_deep_gemm_prefill(),
-        use_deep_gemm_decode=is_sm100(),
+        use_deep_gemm_decode=is_sm100_or_newer(),
     )
 
 
@@ -98,6 +109,10 @@ def make_candidate_indexer(
         use_deep_gemm_prefill=use_deep_gemm_prefill,
     )
     # Without candidate blocks no layer is a candidate source or consumer.
+    # Stays strict SM100 on purpose: the sparse-table path needs DeepGEMM's
+    # paged sparse mqa-logits, whose kernels assert arch == 10, so widening
+    # this gate would only turn the dense-blocks fallback into a startup
+    # RuntimeError on SM120 (see #49173).
     if not is_sm100() or candidate_topk_blocks <= 0:
         return dense_blocks, dense_blocks
 

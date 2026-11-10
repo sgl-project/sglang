@@ -143,7 +143,21 @@ class MarlinContract(RunnerContract):
         return merged
 
     def _sum_top_k(self, entries, out, routed_scaling_factor: float) -> None:
-        # The reduce fused_marlin_moe itself ends with.
+        # fused_marlin_moe's own reduce, vectorized: 6.5 us per layer with the general
+        # moe_sum_reduce vs ~1.5-2 us here, at bs=8 decode ([8, 10, 2560]).
+        if (
+            entries.dtype == torch.bfloat16
+            and entries.is_contiguous()
+            and out.is_contiguous()
+            and entries.shape[-1] % 8 == 0
+            # moe_topk_sum's grid is (ceil(K / 8 / threads), M) and gridDim.y is capped at
+            # 65,535: a prefill chunk past that stays on the general reduce.
+            and entries.shape[0] <= 65535
+        ):
+            from sglang.kernels.ops.moe.moe_topk_sum import moe_topk_sum
+
+            moe_topk_sum(entries, out, routed_scaling_factor, threads=64)
+            return
         from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
             moe_sum_reduce,
         )
