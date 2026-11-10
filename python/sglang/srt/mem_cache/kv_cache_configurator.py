@@ -2089,7 +2089,7 @@ class KVCacheConfigurator:
             self.kv_cache_dtype == torch.float8_e4m3fn and is_arch35
         )
         dsa_pool_kwargs = {}
-        if is_dsa_model:
+        if is_dsa_model and get_dsa_index_kpool(self.model_config.hf_config) > 1:
             hf_config = self.model_config.hf_config
             dsa_pool_kwargs = {
                 "index_kpool": get_dsa_index_kpool(hf_config),
@@ -2553,7 +2553,7 @@ class KVCacheConfigurator:
         self, *, mha_pool_class: type, mla_pool_class: type, dsa_pool_class: type
     ) -> type:
         if self.use_mla_backend and is_deepseek_dsa(self.model_config.hf_config):
-            if _is_npu:
+            if _is_npu and get_dsa_index_kpool(self.model_config.hf_config) > 1:
                 from sglang.srt.hardware_backend.npu.memory_pool_npu import (
                     NPUMLATokenToKVPool,
                 )

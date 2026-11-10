@@ -1,7 +1,7 @@
 import logging
 from typing import Optional
 
-from sglang.srt.configs.model_config import is_deepseek_dsa
+from sglang.srt.configs.model_config import get_dsa_index_kpool, is_deepseek_dsa
 from sglang.srt.layers.attention.qsa.config import QSAProfile
 from sglang.srt.runtime_context import attention_backends, get_spec
 from sglang.srt.utils.common import (
@@ -419,9 +419,8 @@ class DraftBackendFactory:
         )
 
     def _create_ascend_decode_backend(self):
-        # DSA draft decode must generate indexer/KPool metadata for each step
-        # and cannot use the regular backend.
-        if is_deepseek_dsa(self.draft_model_runner.model_config.hf_config):
+        config = self.draft_model_runner.model_config.hf_config
+        if is_deepseek_dsa(config) and get_dsa_index_kpool(config) > 1:
             from sglang.srt.hardware_backend.npu.attention.ascend_dsa_backend import (
                 AscendDSAAttnMultiStepDraftBackend as backend_cls,
             )
@@ -562,9 +561,7 @@ class DraftBackendFactory:
             ATTENTION_BACKENDS,
         )
 
-        # Draft extend reuses the main model-aware factory so DSA models select
-        # AscendDSAAttnBackend, which generates indexer/KPool metadata, instead
-        # of falling back to the regular forward_mtp path.
+        # Reuse the registered factory to select KPool metadata for draft extend.
         return ("ascend", ATTENTION_BACKENDS["ascend"](self.draft_model_runner))
 
     def _create_flashmla_prefill_backend(self):

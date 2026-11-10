@@ -141,12 +141,13 @@ def create_wave_backend(runner):
 
 @register_attention_backend("ascend")
 def create_ascend_backend(runner):
-    from sglang.srt.configs.model_config import is_deepseek_dsa
+    from sglang.srt.configs.model_config import get_dsa_index_kpool, is_deepseek_dsa
     from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
         AscendAttnBackend,
     )
 
-    if is_deepseek_dsa(runner.model_config.hf_config):
+    config = runner.model_config.hf_config
+    if is_deepseek_dsa(config) and get_dsa_index_kpool(config) > 1:
         from sglang.srt.hardware_backend.npu.attention.ascend_dsa_backend import (
             AscendDSAAttnBackend,
         )

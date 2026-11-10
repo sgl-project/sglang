@@ -292,7 +292,6 @@ class Glm5NextVisionModel(GlmOcrVisionModel):
             max_position=8192,
             base=10000.0,
             is_neox_style=True,
-            dtype=torch.float32,
         )
 
         self.blocks = nn.ModuleList(
