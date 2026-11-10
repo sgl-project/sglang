@@ -1,8 +1,8 @@
 """CPU-only tests for the Ascend DSA KV cache capability and its consumers.
 
 Covers the startup rejection, the MLA KV cache dim selector, the NPU MLA pool
-layout and the indexer sizer. NPU extension modules are stubbed; no operator
-runs.
+layout and PD layer ids, and the indexer sizer. NPU extension modules are
+stubbed; no operator runs.
 """
 
 import sys
@@ -164,6 +164,38 @@ def _build_pool(
 
 
 class TestNpuMlaPoolLayout(CustomTestCase):
+    def assertLayerIdsAlign(self, pool, expected):
+        ptrs, _, item_lens = pool.get_contiguous_buf_infos()
+        layer_ids = pool.get_kv_layer_ids()
+        self.assertEqual(layer_ids, expected)
+        self.assertEqual(len(layer_ids), len(ptrs))
+        self.assertEqual(len(layer_ids), len(item_lens))
+        self.assertEqual(len(layer_ids), len(pool.get_dcp_remote_decode_layout()))
+
+    def test_packed_pool_layer_ids_match_the_pd_entries(self):
+        """The packed record transfers no V buffers; the layer ids used to list
+        K and V per layer and so outnumbered the PD entries (8 ids, 6 buffers)."""
+        pool = _build_pool(FP8)
+        self.assertEqual(pool.v_buffer.shape[-1], 0)
+        self.assertLayerIdsAlign(pool, [0, 1] * 3)
+
+    def test_layer_ids_follow_each_entry_group(self):
+        """Index K entries carry indexer_layer_ids (compact layout), unpacked
+        pools keep their V entries, and a combined buffer has one per layer."""
+        cases = (
+            (FP8, {"indexer_layer_ids": (5,)}, [4, 5, 5, 5]),
+            (torch.bfloat16, {"indexer_layer_ids": (5,)}, [4, 5, 4, 5, 5]),
+            (
+                torch.bfloat16,
+                {"index_head_dim": None, "use_combined_kv_buffer": True},
+                [4, 5],
+            ),
+        )
+        for dtype, kwargs, expected in cases:
+            with self.subTest(dtype=dtype, kwargs=kwargs):
+                pool = _build_pool(dtype, start_layer=4, **kwargs)
+                self.assertLayerIdsAlign(pool, expected)
+
     def test_dsa_pool_rejects_fp8_on_a2(self):
         """A pool built without the configurator's check still refuses the
         unpacked FP8 layout that sparse attention would read as packed."""
