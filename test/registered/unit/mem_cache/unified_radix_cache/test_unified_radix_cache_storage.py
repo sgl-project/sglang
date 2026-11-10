@@ -5,17 +5,20 @@ import time
 import unittest
 from array import array
 from contextlib import ExitStack
+from queue import Queue
 from types import SimpleNamespace
 from unittest import mock
 
 import torch
 
+from sglang.srt.disaggregation.decode_hicache_mixin import DecodeHiCachePreallocMixin
 from sglang.srt.disaggregation.kv_events import (
     BlockRemoved,
     BlockStored,
     StorageMedium,
 )
 from sglang.srt.environ import envs
+from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     CacheRequestOutcome,
@@ -23,26 +26,26 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertParams,
     MatchPrefixParams,
 )
+from sglang.srt.mem_cache.common import match_kv_cache
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
     PoolTransfer,
     PoolTransferResult,
+    SidecarPoolSpec,
 )
+from sglang.srt.mem_cache.pool_host import PoolEntry
+from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
-from sglang.srt.mem_cache.unified_cache.cache_action import (
-    FreeComponentHostSlot,
-)
-from sglang.srt.mem_cache.unified_cache.components.base import (
-    CacheTransferPhase,
-    ComponentType,
-)
+from sglang.srt.mem_cache.static_kv_storage import acquire_rows
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.mem_cache.unified_cache.components.base import CacheTransferPhase
 from sglang.srt.mem_cache.unified_cache.storage_attachment import StorageAttachment
 from sglang.srt.mem_cache.unified_radix_cache import (
     UnifiedRadixCache,
     _OngoingPrefetch,
 )
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.unified_radix_cache.config import (
     CacheConfig,
@@ -64,6 +67,9 @@ from sglang.test.kits.unified_radix_cache.fixtures import (
     node_token_ids,
     write_backup,
 )
+from sglang.test.kits.unified_radix_cache.kv_events import (
+    UnifiedRadixCacheKVEventsFixtures,
+)
 from sglang.test.kits.unified_radix_cache.mixins import UnifiedRadixCacheFixtures
 from sglang.test.kits.unified_radix_cache.storage import (
     AnchorLockOutcomePolicyFixtures,
@@ -75,12 +81,24 @@ from sglang.test.kits.unified_radix_cache.storage import (
 )
 from sglang.test.mem_cache_utils import finish_req
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.tree_slots import FAMILY_OF, window_evictable
+
+
+def _window_hit(req):
+    """The one window's ``Req.window_host_hit_lengths`` entry, read off a
+    stand-in request."""
+    from sglang.srt.managers.schedule_batch import Req
+
+    return max(Req.window_host_hit_lengths.fget(req).values(), default=0)
+
 
 register_cuda_ci(est_time=28, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=28, suite="stage-b-test-1-gpu-small-amd")
 
 
-class TestUnifiedRadixCacheEagleHiCacheStorageKey(CustomTestCase):
+class TestUnifiedRadixCacheEagleHiCacheStorageKey(
+    UnifiedRadixCacheStorageFixtures, CustomTestCase
+):
     cfg = CacheConfig(
         page_size=4,
         components=(ComponentType.FULL,),
@@ -177,62 +195,97 @@ class TestUnifiedRadixCacheEagleHiCacheStorageKey(CustomTestCase):
             canonical_hashes.append(running_hash)
         self.assertNotEqual(canonical_hashes, cache.tree_core.get_hash_values(leaf))
 
-    def test_buffer_anchor_rematch_preserves_bigram_boundary(self):
-        from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
+    def test_decode_restore_rematch_covers_bigram_prefix(self):
+        from sglang.srt.disaggregation.decode_hicache_mixin import (
+            DecodeHiCacheTransferMixin,
+            DecodePrefixMatch,
+            HiCacheRestoreResult,
+        )
+        from sglang.srt.mem_cache.common import match_kv_cache
 
-        cache, allocator, _ = build_fixture(self.cfg)
+        cache, allocator, pool = build_fixture(self.cfg)
+        UnifiedRadixCacheKVEventsFixtures._init_hicache(self, cache)
+        stored = array("q", range(1, 18))
+        value = allocator.alloc(len(stored) - 1)
+        cache.insert(InsertParams(key=RadixKey(stored), value=value))
+        leaf = cache.match_prefix(MatchPrefixParams(key=RadixKey(stored)))
+        UnifiedRadixCacheKVEventsFixtures._backup_node(
+            self, cache, leaf.last_device_node
+        )
+        cache.evict(EvictParams(num_tokens=len(stored) - 1))
+
+        req = Req(
+            rid="decode-eagle-restore",
+            origin_input_text="",
+            origin_input_ids=stored + array("q", range(100, 104)),
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+        )
+        acquire_rows(pool, pool.state, [req])
+        first = match_kv_cache(req, cache, req.origin_input_ids, cow_mamba=False)
+        self.assertEqual((first.device_prefix_len, first.host_hit_length), (0, 16))
+        req.lock = cache.lock(first.last_device_node)
+        decode_req = SimpleNamespace(
+            req=req,
+            prefix_match=DecodePrefixMatch(
+                prefix_indices=cache.prefix_device_indices(req),
+                l2_host_hit_length=first.host_hit_length,
+                l3_storage_hit_length=0,
+                last_device_node=first.last_device_node,
+            ),
+            hicache_restore_status=HiCacheRestoreResult.PENDING,
+            hicache_restore_lock=None,
+        )
+
+        queued = DecodeHiCacheTransferMixin._try_hicache_queue_load_back(
+            SimpleNamespace(tree_cache=cache), decode_req
+        )
+
+        self.assertTrue(queued)
+        self.assertEqual(
+            decode_req.hicache_restore_status, HiCacheRestoreResult.PENDING
+        )
+        self.assertEqual(len(decode_req.hicache_restored_kv_indices), 16)
+        cache.ready_to_load_host_cache()
+        for ack in list(cache.cache_controller.ack_load_queue):
+            ack.finish_event.synchronize()
+        cache.loading_check()
+        cache.unlock(decode_req.hicache_restore_lock)
+        cache.unlock(req.lock)
+        cache.sanity_check()
+
+    def test_buffer_anchor_rematch_preserves_bigram_boundary(self):
+        cache, allocator, _ = self._build_buffer_hicache_fixture(
+            self._make_storage_dir()
+        )
+        pipeline = cache.buffer_pipeline
         extra_key = "adapter-a"
         cache_salt = "tenant-a"
         prefix_tokens = array("q", [1, 2, 3, 4, 5])
         value = allocator.alloc(len(prefix_tokens) - 1)
         self.assertIsNotNone(value)
-        cache.insert(
-            InsertParams(
-                key=RadixKey(
-                    prefix_tokens,
-                    extra_key=extra_key,
-                    cache_salt=cache_salt,
-                ),
-                value=value,
-            )
-        )
-        match = cache.match_prefix(
-            MatchPrefixParams(
-                key=RadixKey(
-                    prefix_tokens,
-                    extra_key=extra_key,
-                    cache_salt=cache_salt,
-                )
-            )
-        )
+        key = RadixKey(prefix_tokens, extra_key=extra_key, cache_salt=cache_salt)
+        cache.insert(InsertParams(key=key, value=value))
+        match = cache.match_prefix(MatchPrefixParams(key=key))
         self.assertEqual(match.device_prefix_len, len(prefix_tokens) - 1)
-
         req_id = CacheRequestHandle("bigram-anchor", 0)
-        prefetch_key = RadixKey(
-            array("q", [prefix_tokens[-1], 6, 7, 8, 9]),
-            extra_key=extra_key,
-            is_bigram=True,
-            cache_salt=cache_salt,
-        )
+        # What prefetch_from_storage registers for a bigram request anchored
+        # at the matched node: the suffix key starts at the boundary token.
         cache.ongoing_prefetch[req_id] = _OngoingPrefetch(
             anchor_node_id=match.last_device_node,
-            prefetch_key=prefetch_key,
+            prefetch_key=RadixKey(
+                array("q", [prefix_tokens[-1], 6, 7, 8, 9]),
+                extra_key=extra_key,
+                is_bigram=True,
+                cache_salt=cache_salt,
+            ),
             host_indices=None,
             operation=None,
             anchor_lock_params=None,
             comp_xfers={},
         )
-
-        pipeline = BufferModePipeline.__new__(BufferModePipeline)
-        pipeline.anchor_locks = {}
-        pipeline.anchor_locked_tokens_ = 0
-        pipeline.anchor_lock_cap_tokens = 10_000
-        pipeline._anchor_lock_cap_skips = 0
-        pipeline._prefetch_prefix_ctx = {
-            req_id: (list(prefix_tokens[:-1]), extra_key, cache_salt)
-        }
-        pipeline._cache = cache
-
+        pipeline.set_prefix_ctx(
+            req_id, list(prefix_tokens[:-1]), extra_key=extra_key, cache_salt=cache_salt
+        )
         lock_ref = node_device_lock_ref(
             cache, match.last_device_node, ComponentType.FULL
         )
@@ -244,8 +297,8 @@ class TestUnifiedRadixCacheEagleHiCacheStorageKey(CustomTestCase):
             node_device_lock_ref(cache, match.last_device_node, ComponentType.FULL),
             lock_ref + 1,
         )
-
         pipeline.release_anchor_lock(req_id)
+        pipeline.pop_prefix_ctx(req_id)
         cache.ongoing_prefetch.pop(req_id)
         self.assertEqual(
             node_device_lock_ref(cache, match.last_device_node, ComponentType.FULL),
@@ -287,52 +340,23 @@ class TestUnifiedRadixCacheEagleHiCacheStorageKey(CustomTestCase):
 
     def test_sanity_check_reads_buffer_backup_node_id_from_snapshot(self):
         """A buffer-mode backup entry keeps its node id inside the detached
-        snapshot; sanity_check must read it from there. It used to read
-        ``entry.intent.node_id``, an attribute the intent no longer has, so the
-        idle check raised AttributeError whenever a backup was in flight."""
-        from sglang.srt.mem_cache.buffer_mode.pipeline import (
-            BufferModePipeline,
-            _UnifiedBackupIntent,
-            _UnifiedBufferBackupEntry,
+        snapshot; sanity_check must read it from there while the write is in
+        flight."""
+        cache, allocator, _ = self._build_buffer_hicache_fixture(
+            self._make_storage_dir()
         )
-
-        cache, allocator, _ = build_fixture(self.cfg)
-        cache.enable_storage = True
         tokens = array("q", [1, 2, 3, 4, 5, 6, 7, 8, 9])
         value = allocator.alloc(len(tokens) - 1)
         self.assertIsNotNone(value)
         cache.insert(InsertParams(key=RadixKey(tokens), value=value))
-        leaf_id = cache.match_prefix(
+        leaf = cache.match_prefix(
             MatchPrefixParams(key=RadixKey(tokens))
         ).last_device_node
-        snapshot = cache.tree_core.snapshot_buffer_backup(
-            leaf_id, pass_prefix_keys=False
-        )
-        self.assertIsNotNone(snapshot)
-
-        # The post-launch entry pins its node, as sanity_check requires of
-        # every in-flight backup.
-        lock_params = cache.inc_lock_ref(leaf_id).to_dec_params()
-        pipeline = BufferModePipeline.__new__(BufferModePipeline)
-        keys = list(snapshot.hash_values)
-        # Entries are keyed by the write's ack id, not by the node.
-        pipeline.ongoing_write_through = {
-            -1: _UnifiedBufferBackupEntry(
-                intent=_UnifiedBackupIntent(
-                    snapshot=snapshot, pool=PoolName.KV, keys=keys
-                ),
-                host_indices=torch.empty(0, dtype=torch.int64),
-                aux_xfers=[],
-                lock_params=lock_params,
-                occupied_units=0,
-                keys_by_pool={PoolName.KV: keys},
-            )
-        }
-        cache.buffer_pipeline = pipeline
+        write_backup(cache, leaf)
+        cache.buffer_pipeline.flush_pending_writes()
+        self.assertTrue(cache.buffer_pipeline.ongoing_write_through)
         cache.sanity_check()
-
-        cache.buffer_pipeline = None
-        cache.dec_lock_ref(leaf_id, lock_params)
+        self._drain_buffer_writes(cache)
         cache.sanity_check()
 
 
@@ -343,18 +367,14 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         "mamba L3 prefetch is out of scope for this unit fixture",
     )
     def test_hicache_l3_prefetch(self):
-        """L3 round trip: write with one tree, prefetch into a fresh tree.
-
-        Uses two independent trees that share the same file storage dir so the
-        prefetch path genuinely reloads from L3 (no host/device residue).
-        """
+        """Write with one tree, prefetch into a fresh tree sharing the storage dir,
+        so the path reloads from L3."""
 
         storage_dir = self._make_storage_dir()
         num_pages = 4
         if self.cfg.has_swa:
-            # SWA L3 prefetch is all-or-nothing over one full sliding window.
-            # Keep the generic L3 round trip valid for SWA configs whose window
-            # is larger than the old fixed 4-page request.
+            # SWA L3 prefetch is all-or-nothing over one full sliding window;
+            # size the request to cover it.
             sw_pages = (
                 self.cfg.sliding_window_size + self.cfg.page_size - 1
             ) // self.cfg.page_size
@@ -369,14 +389,12 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         )
         self._run_prefetch_to_completion(cons, req_id)
 
-        # The full prefix must now be a host hit (loaded from L3).
         mc = match_prefix(cons, seq)
         self.assertEqual(mc.host_hit_length, len(seq))
         host_node = mc.last_host_node
         self.assertNotEqual(host_node, cons.root_node_handle())
         self.assertTrue(cons.tree_core.is_full_device_evicted(host_node))
 
-        # Load the reloaded host prefix back to device and verify KV bytes.
         self._load_back_node(cons, host_node)
         loaded_indices = cons.path_device_indices(
             match_prefix(cons, seq).last_device_node
@@ -389,17 +407,59 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
 
     @requires_hicache
     @requires(
+        lambda cfg: not cfg.has_mamba,
+        "mamba L3 prefetch is out of scope for this unit fixture",
+    )
+    def test_hicache_l3_prefetch_attaches_a_sub_window_suffix_under_a_device_anchor(
+        self,
+    ):
+        """A stored continuation of a prefix that a write-back tree holds only on
+        device restores under that unbacked mid-tree anchor, even when it is
+        shorter than the sliding window: the window head is the anchor path's
+        own SWA."""
+        storage_dir = self._make_storage_dir()
+        base = self._make_seq(1, 2)
+        seq = base + self._make_seq(500, 2)
+        self._l3_produce(storage_dir, seq)
+
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self._init_hicache(
+            cache,
+            write_policy="write_back",
+            storage_backend="file",
+            storage_dir=storage_dir,
+            prefetch_threshold=1,
+        )
+        self._insert(cache, allocator, req_to_token_pool, base)
+        anchor = match_prefix(cache, base).last_device_node
+        self.assertFalse(cache.is_backuped(anchor))
+        last_hash = cache.get_last_hash_value(anchor)
+        self.assertIsNotNone(last_hash)
+
+        req_id = CacheRequestHandle("device-anchor-req", 0)
+        cache.prefetch_from_storage(
+            req_id,
+            anchor,
+            array("q", seq[len(base) :]),
+            last_hash,
+            None,
+            matched_prefix_tokens=array("q", base),
+        )
+        self._run_prefetch_to_completion(cache, req_id)
+
+        m = match_prefix(cache, seq)
+        self.assertEqual(m.device_prefix_len, len(base))
+        self.assertEqual(m.host_hit_length, len(seq) - len(base))
+        cache.sanity_check()
+
+    @requires_hicache
+    @requires(
         lambda cfg: cfg.has_swa and not cfg.has_mamba,
         "SWA-only fixture required to exercise extra pool",
     )
-    def test_release_aborted_request_l3_prefetch_io_in_progress(self):
-        """Test release_aborted_request while a prefetch IO is still in-progress.
-        1. Fill KV and SWA to L3.
-        2. Trigger L3 prefetch.
-        3. Hack IO thread, blocking at _page_transfer.
-        4. Call release_aborted_request.  Assert that the KV and SWA buffers are not released (owned by the IO thread).
-        5. Unlbock IO thread.  Assert that KV and SWA buffers are eventually released.
-        """
+    def test_abandon_attempt_l3_prefetch_io_in_progress(self):
+        """_abandon_attempt while a prefetch IO is still in progress; the IO
+        thread owns the buffers until it finishes."""
 
         # SWA prefetch is all-or-nothing over one full sliding window: size the
         # request at sw_pages + 1 pages so prepare_prefetch actually materializes
@@ -433,7 +493,6 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         )
         self.assertIn(req_id, cons.ongoing_prefetch)
 
-        # Block IO thread at the entry of _page_transfer.
         import threading
 
         from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
@@ -446,19 +505,16 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         swa_release_q = cc.extra_host_mem_release_queues.get(PoolName.SWA)
 
         def _page_transfer_hook(_self, op):
-            # Signal that the worker has reached the sidecar step, then block
-            # until the main thread releases the gate.
+            # Block the worker at the sidecar step until the main thread
+            # releases the gate.
             entered.set()
             gate.wait(timeout=10.0)
-            # Forward to the real implementation so the worker runs the
-            # terminate-aware release path itself.
+            # The worker runs the terminate-aware release path itself.
             original_sidecar(_self, op)
 
-        # Simulate a slow prefetch IO.  Hook on _page_transfer.
         with mock.patch.object(
             HybridCacheController, "_page_transfer", _page_transfer_hook
         ):
-            # Pump until the IO aux thread has entered the sidecar barrier.
             deadline = time.time() + 10.0
             while time.time() < deadline:
                 cons.drain_storage_control_queues()
@@ -469,9 +525,6 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
             else:
                 self.fail("prefetch did not reach the sidecar barrier in time")
 
-        # Now, the prefetch IO thread is stopping at _page_transfer.
-        # Let the scheduler thread calls release_aborted_request.
-        # Assert that everything will not be released.
         op = cons.ongoing_prefetch[req_id].operation
         self.assertFalse(op.pool_transfers_done)
         self.assertEqual(cc.host_mem_release_queue.qsize(), 0)
@@ -480,12 +533,8 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         self.assertEqual(cc.host_mem_release_queue.qsize(), 0)
         self.assertEqual(swa_release_q.qsize(), 0)
 
-        # Let the prefetch IO thread continue to run.
         gate.set()
 
-        # Wait for the IO thread has completed prefetch.
-        # We don't consume release queue, as we will use that later to check whether
-        # the host memory was released yet (as used by the prefetch IO thread).
         deadline = time.time() + 10.0
         while time.time() < deadline:
             cons._drain_storage_control_queues_impl(
@@ -502,7 +551,6 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         else:
             self.fail("SWA extra pool was not released after the abort")
 
-        # Asserts that everything is correctly released.
         self.assertFalse(op.pool_transfers_done)
         self.assertGreater(cc.host_mem_release_queue.qsize(), 0)
         self.assertGreater(swa_release_q.qsize(), 0)
@@ -526,14 +574,9 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         lambda cfg: cfg.has_swa and not cfg.has_mamba,
         "SWA-only fixture required to exercise extra pool",
     )
-    def test_release_aborted_request_l3_prefetch_io_done(self):
-        """Test release_aborted_request is called after the IO thread has completed
-        prefetch.
-        1. Fill KV and SWA to L3.
-        2. Trigger L3 prefetch.
-        3. Wait until the completion of L3 prefetch IO.
-        4. Call release_aborted_request.  Assert that KV and SWA buffers are released.
-        """
+    def test_abandon_attempt_l3_prefetch_io_done(self):
+        """_abandon_attempt after the prefetch IO completed releases the
+        buffers."""
 
         # SWA prefetch is all-or-nothing over one full sliding window: size the
         # request at sw_pages + 1 pages so prepare_prefetch actually materializes
@@ -570,14 +613,8 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         swa_release_q = cc.extra_host_mem_release_queues.get(PoolName.SWA)
         self.assertIsNotNone(swa_release_q)
 
-        # Simulate polling check_hicache_events.
-        # There will be a sequence of events populated from queue:
-        # 1. a storage hit notification (from cc.prefetch_hit_queue).
-        # 2. a HiCacheAck, indicating the completion of KV pool read.
-        # 3. a HiCacheAck, indicating the completion of SWA pool read.
-        # 4. a HiCacheACk, idnicating the completion of entire prefetch request.
-        # We are going to stop at the exact timing-window between 3 and 4.  So we have to
-        # consume ONE event from the queue at each iteration.
+        # Consume one queued event per iteration to stop in the window between the
+        # SWA pool ack and the whole-request ack.
         deadline = time.time() + 10.0
         while time.time() < deadline:
             cons._drain_storage_control_queues_impl(
@@ -599,7 +636,6 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         self.assertEqual(cc.host_mem_release_queue.qsize(), 0)
         self.assertEqual(swa_release_q.qsize(), 0)
 
-        # --- Act: abort without committing the prefetch. ---
         cons.finish(req_id, CacheRequestOutcome.ABORT)
 
         self.assertTrue(op.pool_transfers_done)
@@ -620,10 +656,6 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         )
 
         cons.sanity_check()
-
-    # ================================================================
-    # Buffer-only host memory mode (host = transient staging, L3 = cache)
-    # ================================================================
 
     @requires_hicache
     @requires_swa
@@ -794,7 +826,6 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         pipeline = cache.buffer_pipeline
         controller = cache.cache_controller
         write_backup(cache, leaf)
-        # One intent per pool of every node on the path.
         intents = list(pipeline.pending_write_queue)
         node_ids = sorted({intent.snapshot.node_id for intent in intents})
         self.assertGreaterEqual(len(node_ids), 2)
@@ -833,7 +864,6 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         self.assertFalse(pipeline.pending_write_queue)
         self.assertFalse(controller.write_queue)
         self.assertEqual(len(controller.ack_write_queue), 1)
-        # Every intent is a write of its own, acked under its own id.
         ack = controller.ack_write_queue[0]
         self.assertEqual(len(ack.node_ids), len(intents))
         self.assertEqual(list(ack.node_ids), list(pipeline.ongoing_write_through))
@@ -896,7 +926,6 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
                         transfer.keys
                     )
                 )
-        # Re-hit absorbed when every pool is believed present.
         write_backup(cache, leaf)
         self.assertNotIn(leaf, cache.buffer_pipeline.inflight_backup_node_ids)
 
@@ -939,7 +968,6 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
                     ],
                     [(leaf, PoolName.SWA)],
                 )
-                # One admission per node per walk.
                 self.assertEqual(admissions.call_count, len(node_ids))
                 self.assertTrue(cache.buffer_backup_pending(leaf))
                 self._pump_hicache_until(
@@ -983,7 +1011,6 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
 
     @requires_hicache
     def test_buffer_only_split_intent_writes_every_piece(self):
-        """Repeated splits preserve every pool's write once, parents first."""
         storage_dir = self._make_storage_dir()
         cache, allocator, req_to_token_pool = self._build_buffer_hicache_fixture(
             storage_dir
@@ -1044,7 +1071,6 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         "only FULL-only caches split the leaf at the prompt",
     )
     def test_buffer_only_finish_writes_prompt_and_output(self):
-        """The finish-path split preserves both prompt and output writes."""
         storage_dir = self._make_storage_dir()
         cache, allocator, req_to_token_pool = self._build_buffer_hicache_fixture(
             storage_dir
@@ -1071,15 +1097,16 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
 
     @requires_hicache
     def test_buffer_only_writes_component_pools_independently(self):
-        """A component's own pool (aliased host entry, per-pool keys,
-        BACKUP_HOST transfers) is written, believed and re-written
-        independently of the KV pool."""
+        """A component's own pool is written, believed and re-written independently
+        of the KV pool."""
         storage_dir = self._make_storage_dir()
 
         # Component buffer-mode hooks are Python-core only.
         cache, allocator, req_to_token_pool = build_fixture(
             self.cfg,
-            component_registry_override={ComponentType.FULL: ExtraPoolFullComponent},
+            component_registry_override={
+                FAMILY_OF[ComponentType.FULL]: ExtraPoolFullComponent
+            },
             tree_core_backend="python",
         )
         self._init_buffer_hicache(cache, storage_dir)
@@ -1203,19 +1230,103 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
             )
         self.assertEqual(self._host_avail_sizes(cache), avail0)
 
-        # Everything believed stored: a requested backup is absorbed.
         cache.request_buffer_backup(leaf)
         self.assertNotIn(leaf, pipeline.inflight_backup_node_ids)
         cache.sanity_check()
 
     @requires_hicache
+    def test_buffer_only_split_pool_sidecar_storage_roundtrip(self):
+        """A sidecar of a pool staged in several transfers copies and
+        persists every transfer's pages, not only the first one's."""
+        storage_dir = self._make_storage_dir()
+        # Component buffer-mode hooks are Python-core only.
+        cache, allocator, req_pool = build_fixture(
+            self.cfg,
+            component_registry_override={
+                FAMILY_OF[ComponentType.FULL]: ExtraPoolFullComponent
+            },
+            tree_core_backend="python",
+        )
+        self._init_buffer_hicache(cache, storage_dir)
+        controller = cache.cache_controller
+        source = controller.mem_pool_host.entry_map[ExtraPoolFullComponent.EXTRA_POOL]
+        sidecar_host = MHATokenToKVPoolHost(
+            buffer_info=source.device_pool.get_device_pool_infos()[0].buffer_info,
+            host_to_device_ratio=source.host_pool.size / source.device_pool.size,
+            host_size=0,
+            page_size=self.cfg.page_size,
+            layout=source.host_pool.layout,
+            device_capacity_tokens=source.device_pool.size,
+            start_layer=source.device_pool.start_layer,
+            end_layer=source.device_pool.end_layer,
+        )
+        controller.register_host_pool_entry(
+            PoolEntry(
+                name=PoolName.DRAFT_SWA,
+                host_pool=sidecar_host,
+                device_pool=source.device_pool,
+                layer_mapper=source.layer_mapper,
+            )
+        )
+        cache.sidecar_pool_specs.append(
+            SidecarPoolSpec(PoolName.DRAFT_SWA, ExtraPoolFullComponent.EXTRA_POOL)
+        )
+        sidecar_host.kv_buffer.fill_(-1000)
+        tokens = self._make_seq(1, 8)
+        self._insert(cache, allocator, req_pool, tokens)
+        leaf = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", tokens)))
+        ).last_device_node
+        # SWA may split the leaf at the window boundary; check a node whose
+        # pool is staged in two transfers.
+        node = next(
+            n
+            for n in self._path_chain(cache, leaf)
+            if len(cache.tree_core.get_hash_values(n)) >= 2
+        )
+        transfers = cache.tree_core.build_hicache_transfers(
+            ComponentType.FULL, node, CacheTransferPhase.BACKUP_HOST
+        )
+        self.assertEqual(len(transfers), 2)
+        for segment, transfer in enumerate(transfers):
+            for layer in range(source.device_pool.layer_num):
+                source.device_pool.k_buffer[layer][transfer.device_indices] = (
+                    segment + 7
+                )
+                source.device_pool.v_buffer[layer][transfer.device_indices] = (
+                    segment + 17
+                )
+        torch.cuda.synchronize()
+        self._buffer_backup_and_wait(cache, leaf)
+
+        keys = list(cache.tree_core.get_hash_values(node))
+        indices = source.host_pool.alloc(len(keys) * self.cfg.page_size)
+        self.assertIsNotNone(indices)
+        try:
+            source.host_pool.kv_buffer.zero_()
+            sidecar_host.kv_buffer.zero_()
+            reads = [
+                PoolTransfer(name=name, keys=keys, host_indices=indices)
+                for name in (ExtraPoolFullComponent.EXTRA_POOL, PoolName.DRAFT_SWA)
+            ]
+            results = controller.storage_backend.batch_get_v2(reads)
+            self.assertTrue(all(results[ExtraPoolFullComponent.EXTRA_POOL]))
+            self.assertTrue(all(results[PoolName.DRAFT_SWA]))
+            for index in indices[:: self.cfg.page_size].tolist():
+                self.assertTrue(
+                    torch.equal(
+                        source.host_pool.get_data_page(index),
+                        sidecar_host.get_data_page(index),
+                    ),
+                    "Every persisted sidecar page must contain its source's GPU data",
+                )
+        finally:
+            source.host_pool.free(indices)
+
+    @requires_hicache
     def test_buffer_only_read_path_roundtrip(self):
-        """Read path end to end: prefetch -> staged (host bounce only,
-        nothing device-side, unmatchable, stable readiness, counters fed) ->
-        admission-time load-back against a saturated-but-evictable pool
-        (evict-before-alloc) publishing pre-ack -> ack frees the bounce.
-        Data bytes match the producer's; no CPU-tier KV events anywhere;
-        declines feed the outcome counters."""
+        """Read path end to end: prefetch -> staged -> load-back that evicts before
+        alloc and publishes pre-ack -> ack frees the bounce."""
         storage_dir = self._make_storage_dir()
 
         seq = self._buffer_swa_seq()
@@ -1260,8 +1371,8 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         self.assertEqual(stats["l3_demand_requests"], 1)
         self.assertEqual(stats["l3_miss_tokens"], 0)
 
-        # Saturate the device pool with unrelated evictable spans: the
-        # load-back must evict, not degrade to recompute (run-2 regression).
+        # Saturate the device pool with unrelated evictable spans: load-back must
+        # evict, not degrade to recompute.
         def _avail():
             if cons.supports_swa():
                 return cons.token_to_kv_pool_allocator.full_available_size()
@@ -1279,7 +1390,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         from sglang.srt.mem_cache.base_prefix_cache import InitLoadBackParams
 
         held = cons.buffer_pipeline.staged_prefetches[req_id]
-        req = mock.Mock()
+        req = self._make_req(cons.req_to_token_pool)
         req.rid = req_id.rid
         req.cache_request_handle = req_id
         req.extra_key = None
@@ -1299,8 +1410,6 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
             (m.device_prefix_len, m.last_device_node), (len(seq), spliced_node)
         )
 
-        # Ack: bounce freed, beliefs fed, tree holds no host values, and the
-        # loaded KV bytes equal the producer's.
         self._pump_hicache_until(
             cons,
             lambda: (
@@ -1321,8 +1430,6 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
                 self._all_page_hashes(cons, leaf)
             )
         )
-        # The fetch is evidence for every pool it delivered, so the
-        # consumer's own re-write of the span is skipped pool by pool.
         for transfer in aux_storage_key_transfers(cons, leaf) or ():
             self.assertTrue(
                 cons.storage_existence_cache.pool(transfer.name).contains_all(
@@ -1351,6 +1458,59 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         cons.storage_metrics_collector.log_storage_prefetch_unfulfilled_tokens.assert_not_called()
 
         cons.sanity_check()
+
+    @requires_hicache
+    @requires(
+        lambda cfg: cfg.components == (ComponentType.FULL,) and cfg.page_size == 4,
+        "one FULL page_size=4 fixture covers the decode L3 promise",
+    )
+    def test_decode_promises_only_the_prefetched_l3_span(self):
+        threshold = 16
+        storage_dir = self._make_storage_dir()
+        short_hit = self._make_seq(1, 2)  # below prefetch_threshold
+        long_hit = self._make_seq(1001, 6)
+        prod, prod_alloc, prod_rtp = build_fixture(self.cfg)
+        self._init_hicache(
+            prod,
+            storage_backend="file",
+            storage_dir=storage_dir,
+            prefetch_threshold=threshold,
+        )
+        for seq in (short_hit, long_hit):
+            self._insert(prod, prod_alloc, prod_rtp, seq)
+            leaf = prod.match_prefix(
+                MatchPrefixParams(key=RadixKey(array("q", seq)))
+            ).last_device_node
+            self._backup_node(prod, leaf)
+            self._write_path_to_l3(prod, leaf)
+        self._flush_l3_backups(prod)
+
+        cons, _, cons_rtp = build_fixture(self.cfg)
+        self._init_hicache(
+            cons,
+            storage_backend="file",
+            storage_dir=storage_dir,
+            prefetch_threshold=threshold,
+        )
+        decode = SimpleNamespace(
+            scheduler=SimpleNamespace(enable_decode_hicache=True), tree_cache=cons
+        )
+        for stored, promised in ((short_hit, 0), (long_hit, len(long_hit))):
+            req = self._make_req(cons_rtp)
+            req.origin_input_ids = array("q", stored + list(range(5000, 5016)))
+            result = match_kv_cache(req, cons, req.origin_input_ids)
+            match = DecodeHiCachePreallocMixin._build_decode_prefix_match(
+                decode, req, result
+            )
+            self.assertEqual(match.l3_storage_hit_length, len(stored))
+            DecodeHiCachePreallocMixin._start_hicache_prefetch(decode, req, match)
+            self.assertEqual(match.decode_prefix_len, promised)
+            if promised:
+                self._run_prefetch_to_completion(cons, req.cache_request_handle)
+                hit = cons.match_prefix(
+                    MatchPrefixParams(key=RadixKey(array("q", stored)))
+                )
+                self.assertEqual(hit.host_hit_length, promised)
 
     @requires_hicache
     @requires(
@@ -1502,7 +1662,6 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         cons, cons_alloc, cons_rtp = self._build_buffer_hicache_fixture(storage_dir)
         stats = cons._prefetch_outcome_stats
 
-        # Query BEFORE any producer wrote the span: full miss -> revoked.
         req_id = CacheRequestHandle("early-query-miss", 0)
         cons.prefetch_from_storage(
             req_id, cons.root_node_handle(), array("q", seq), None, None
@@ -1542,7 +1701,6 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         self.assertNotIn(req_id.rid, cons.storage_prefetch_retries._pending)
         self.assertEqual(cons.pop_prefetch_loaded_tokens(req_id), len(seq))
 
-        # Unserved markers must not leak: abort cleanup ...
         aborted_rid = CacheRequestHandle("aborted-miss", 0)
         cons.prefetch_from_storage(
             aborted_rid,
@@ -1575,11 +1733,9 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
     @requires_hicache
     @requires_ps1_window4
     def test_buffer_only_anchor_lock_cap_clamped_by_context_headroom(self):
-        """Deadlock invariant: cap <= pool - context_length (floor 0), so
-        pinned anchors always leave room to admit the largest request."""
-        # The cap is pool-size arithmetic, not a layout property; pin to one
-        # SWA config (which also covers the SWAKVPool full_kv_pool branch) so
-        # the retained per-fixture device memory stays bounded.
+        """The anchor lock cap is clamped to pool - context_length (floor 0), so
+        pinned anchors leave room for the largest request."""
+        # Layout-independent; pinned to one config to bound GPU memory.
         storage_dir = self._make_storage_dir()
         from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
@@ -1603,14 +1759,8 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
     @requires_hicache
     @requires(lambda cfg: cfg.has_swa, "SWA-specific admission accounting")
     def test_buffer_load_back_swa_window_charged_at_admission(self):
-        """Admission contract: a request the SWA budget gate accepts must be
-        allocatable at batch time (estimate_swa_kv_tokens: "an admitted request
-        cannot OOM"). Regression: buffer mode surfaced a staged prefetch as
-        host_hit_length only, so the gate never charged the SWA window that
-        consumption (init_load_back -> cc.load) allocates and the request
-        lock pins; with the rest of the SWA pool batch-held, the batch alloc
-        fell short by up to one window and raised the fail-loud prefill OOM
-        (prod scheduler crash, 2026-08-17)."""
+        """A request the SWA budget gate accepts must be allocatable at batch time:
+        a staged prefetch's SWA window must be charged at admission."""
         from sglang.srt.mem_cache.allocation import (
             alloc_paged_token_slots_extend,
             alloc_token_slots,
@@ -1645,26 +1795,25 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         hold = cons_alloc.swa_available_size() - (window + extend_need - 1)
         self.assertIsNotNone(cons_alloc.swa_attn_allocator.alloc(hold // ps * ps))
 
-        # The adder's SWA gate for this request (_swa_budget_for_req).
+        # The adder's SWA budget gate for this request.
         req = SimpleNamespace(
             rid=req_id.rid,
             cache_request_handle=req_id,
             prefix_len=cons.tree_core.empty_match_result.device_prefix_len,
-            kv=SimpleNamespace(cache_protected_len=0),
+            kv=ReqKvInfo(cache_protected_len=0),
         )
         self.assertTrue(cons.buffer_pipeline.prepare_staged_prefetch(req))
-        surfaced_swa_hit = req.swa_host_hit_length
+        surfaced_swa_hit = _window_hit(req)
         reserved = (
             max(extend_need - window, 0)
             + min(extend_need + max_new, window)
             + ps
             + (surfaced_swa_hit + ps - 1) // ps * ps
         )
-        budget = cons_alloc.swa_available_size() + cons.swa_evictable_size()
+        budget = cons_alloc.swa_available_size() + window_evictable(cons)
 
-        # Consume at admission (init_load_back + request lock).
         held = cons.buffer_pipeline.staged_prefetches[req_id]
-        req = mock.Mock()
+        req = self._make_req(cons.req_to_token_pool)
         req.rid = req_id.rid
         req.cache_request_handle = req_id
         req.extra_key = None
@@ -1682,8 +1831,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         cons.ready_to_load_host_cache()
         cons.inc_lock_ref(last_node)  # the admission lock
 
-        self.assertEqual(cons.swa_evictable_size(), 0)  # window is protected
-        # FULL stays roomy: only SWA can fail below.
+        self.assertEqual(window_evictable(cons), 0)  # window is protected
         self.assertGreaterEqual(cons_alloc.full_available_size(), extend_need + ps)
 
         if reserved <= budget:
@@ -1715,12 +1863,11 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
                     f"but the batch alloc OOMed: {e}"
                 )
         else:
-            # Rejection must come from the surfaced window charge.
             self.assertGreaterEqual(surfaced_swa_hit, window)
 
     @requires_hicache
     def test_buffer_only_load_back_drops_on_sibling_published_span(self):
-        """Queued-UAF regression: a sibling publishes the staged span between
+        """A sibling publishes the staged span between
         staging and consumption; the live pre-check must drop the hold before
         any device allocation or H2D exists."""
         storage_dir = self._make_storage_dir()
@@ -1747,7 +1894,6 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         )
         cons.pop_prefetch_loaded_tokens(req_id)
 
-        # Sibling publishes the identical span (live FULL + SWA).
         self._insert(cons, cons_alloc, cons_rtp, seq)
         sib = match_prefix(cons, seq)
         self.assertEqual(sib.device_prefix_len, len(seq))
@@ -1764,7 +1910,6 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         spliced = self._consume_staged_prefetch(cons, req_id, prefix_len=0)
         self.assertEqual(int(spliced.numel()), 0)
 
-        # Nothing device-side happened; sibling slots and staging intact.
         self.assertEqual(cons.token_to_kv_pool_allocator.available_size(), dev_avail0)
         self.assertEqual(cons.buffer_pipeline.ongoing_buffer_load_back, {})
         self.assertFalse(cons.buffer_pipeline.has_staged(req_id))
@@ -1790,7 +1935,6 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
     @requires_hicache
     @requires(lambda cfg: cfg.has_swa, "masked overlap requires an SWA component")
     def test_buffer_only_load_back_uses_full_behind_swa_tombstone(self):
-        """FULL-only rematch keeps resident FULL and repairs missing SWA rows."""
         storage_dir = self._make_storage_dir()
         seq = self._buffer_swa_seq()
         self._produce_buffer_l3(storage_dir, seq)
@@ -1809,7 +1953,6 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
     @requires_hicache
     @requires(lambda cfg: cfg.has_swa, "masked overlap requires an SWA component")
     def test_buffer_only_load_back_reuses_partial_masked_full(self):
-        """FULL-only rematch reuses a resident head and fetches only its tail."""
         page_size = self.cfg.page_size
         storage_dir = self._make_storage_dir()
 
@@ -1886,7 +2029,6 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
     @requires_hicache
     @requires(lambda cfg: cfg.has_swa, "masked overlap requires an SWA component")
     def test_buffer_only_masked_head_is_not_evicted_for_tail_load(self):
-        """Loading past a masked FULL head preserves its existing ownership."""
         page_size = self.cfg.page_size
         storage_dir = self._make_storage_dir()
 
@@ -1921,10 +2063,8 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         )
         cons.pop_prefetch_loaded_tokens(req_id)
 
-        # Admission's temporary request lock must protect the head on its own.
         cons.buffer_pipeline.release_anchor_lock(req_id)
         self.assertEqual(cons.buffer_pipeline.anchor_locks, {})
-        # Starve FULL only; SWA stays free so the window still loads.
         ballast = cons_alloc.full_attn_allocator.alloc(cons_alloc.full_available_size())
         self.assertIsNotNone(ballast)
         self.addCleanup(cons_alloc.full_attn_allocator.free, ballast)
@@ -1940,7 +2080,6 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         self._consume_staged_prefetch(cons, req_id, prefix_len=0)
 
         self.assertEqual(accounted0, full_accounted(), "a FULL page is free and owned")
-        # The resident FULL head was reused rather than evicted for the tail.
         live = match_prefix(cons, seq)
         self.assertEqual(live.full_kv_hit_length, split_at)
         cons.sanity_check()
@@ -1981,7 +2120,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
             return real_load(*args, **kwargs)
 
         f = cons.buffer_pipeline.staged_prefetches[req_id]
-        req = mock.Mock()
+        req = self._make_req(cons.req_to_token_pool)
         req.rid = req_id.rid
         req.cache_request_handle = req_id
         req.extra_key = None
@@ -2000,19 +2139,10 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
     @requires_hicache
     @requires_ps1_window4
     def test_buffer_only_load_back_trims_head_published_by_sibling(self):
-        """Growth-waste regression: a sibling publishing the span HEAD after
-        enqueue used to invalidate the whole staged fetch at consumption
-        (splice base moved past matched_len -> full drop, every fetched byte
-        wasted). Consumption must instead splice the tail beyond the live
-        prefix: sibling head slots stay untouched (add-only insert), the
-        tail carries the producer's bytes, and the ack frees the entire
-        bounce including the trimmed head.
-
-        A window-sized fetch still passes the global threshold, but after
-        sibling growth its FULL splice is shorter than its SWA transfer."""
-        # Buffer-mode plan/commit logic is layout-independent, and each
-        # hicache fixture retains its pools for the whole file run. Pin to
-        # one config so the matrix does not exhaust a small CI GPU.
+        """A sibling publishing the span head after enqueue must not drop the staged
+        fetch; consumption splices the tail beyond the live prefix and the ack frees
+        the whole bounce, trimmed head included."""
+        # Layout-independent; pinned to one config to bound GPU memory.
         storage_dir = self._make_storage_dir()
 
         with self.subTest(span="over-window"):
@@ -2032,9 +2162,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         the surface-time plan must report (0, 0) and free it (bounce, anchor
         pin, occupancy) — a kept hold would leak, since admission without a
         host hit never calls init_load_back."""
-        # Buffer-mode plan/commit logic is layout-independent, and each
-        # hicache fixture retains its pools for the whole file run. Pin to
-        # one config so the matrix does not exhaust a small CI GPU.
+        # Layout-independent; pinned to one config to bound GPU memory.
         storage_dir = self._make_storage_dir()
 
         seq = self._buffer_swa_seq()
@@ -2059,19 +2187,23 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         self._insert(cons, cons_alloc, cons_rtp, seq)
 
         live = match_prefix(cons, seq)
-        req = mock.Mock(
-            rid=req_id.rid,
-            cache_request_handle=req_id,
-            prefix_len=live.device_prefix_len,
-            last_node=live.last_device_node,
-        )
+        req = self._make_req(cons.req_to_token_pool)
+        req.rid = req_id.rid
+        req.cache_request_handle = req_id
+        req.prefix_len = live.device_prefix_len
+        req.last_node = live.last_device_node
         self.assertTrue(cons.buffer_pipeline.prepare_staged_prefetch(req))
-        self.assertEqual((req.host_hit_length, req.swa_host_hit_length), (0, 0))
+        self.assertEqual(
+            (
+                req.host_hit_length,
+                _window_hit(req),
+            ),
+            (0, 0),
+        )
         self.assertFalse(cons.buffer_pipeline.has_staged(req_id))
         self.assertEqual(cons.buffer_pipeline.anchor_locks, {})
         self.assertEqual(cons.cache_controller.prefetch_tokens_occupied, 0)
         self.assertEqual(self._host_avail_sizes(cons), avail0)
-        # Idempotent once freed.
         self.assertTrue(cons.buffer_pipeline.prepare_staged_prefetch(req))
         self.assertIsNone(req.staged_prefetch_plan)
         cons.sanity_check()
@@ -2083,9 +2215,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         in flight makes the fetch unconsumable; the IO-commit gate must
         cancel it BEFORE the bounce alloc and the storage read (counted as
         declined_device_covered), leaving no staging or occupancy behind."""
-        # Buffer-mode plan/commit logic is layout-independent, and each
-        # hicache fixture retains its pools for the whole file run. Pin to
-        # one config so the matrix does not exhaust a small CI GPU.
+        # Layout-independent; pinned to one config to bound GPU memory.
         storage_dir = self._make_storage_dir()
 
         seq = self._buffer_swa_seq()
@@ -2124,148 +2254,126 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         self.assertEqual(self._host_avail_sizes(cons), avail0)
         cons.sanity_check()
 
+    def _stage_buffer_mid_tree_hit(self, storage_dir, suffix_pages):
+        """A buffer-mode consumer holding one window on device, with a staged
+        L3 hit for the next ``suffix_pages`` pages."""
+        sw_pages = self.cfg.sliding_window_size // self.cfg.page_size
+        seq_a = self._make_seq(1, sw_pages)
+        seq_ab = seq_a + self._make_seq(900, suffix_pages)
+        self._produce_buffer_l3(storage_dir, seq_ab)
+        cons, alloc, rtp = self._build_buffer_hicache_fixture(storage_dir)
+        self._insert(cons, alloc, rtp, seq_a)
+        anchor = match_prefix(cons, seq_a).last_device_node
+        req_id = CacheRequestHandle(f"mid-tree-{suffix_pages}", 0)
+        cons.prefetch_from_storage(
+            req_id,
+            anchor,
+            array("q", seq_ab[len(seq_a) :]),
+            cons.get_last_hash_value(anchor),
+            None,
+            matched_prefix_tokens=list(seq_a),
+        )
+        self._pump_hicache_until(
+            cons,
+            lambda: (
+                cons.check_prefetch_progress(req_id)
+                and cons.buffer_pipeline.has_staged(req_id)
+            ),
+            "mid-tree prefetch did not stage",
+        )
+        return cons, req_id, seq_a, seq_ab
+
     @requires_hicache
     @requires_swa
-    def test_buffer_only_swa_window_semantics(self):
-        """Root and mid-tree requests and hits share a complete-window minimum."""
+    def test_buffer_only_hit_restores_a_window_shorter_than_full(self):
+        """At the root a hit shorter than a window is the sequence's whole SWA;
+        under a device anchor a window shorter than full takes its head from the
+        anchor path's own SWA."""
         window = self.cfg.sliding_window_size
-        if window <= self.cfg.page_size:
-            self.skipTest("window fits in one page")
-        sw_pages = (window + self.cfg.page_size - 1) // self.cfg.page_size
+        if window <= self.cfg.page_size or window % self.cfg.page_size:
+            self.skipTest("needs a window of two or more whole pages")
+        sw_pages = window // self.cfg.page_size
         storage_dir = self._make_storage_dir()
 
-        # 1. A root-anchored sub-window request is declined before querying.
-        seq = self._make_seq(1, sw_pages - 1)
-        self._produce_buffer_l3(storage_dir, seq, marker=5)
-        cons, _, _ = self._build_buffer_hicache_fixture(storage_dir)
-        self.assertEqual(cons.prefetch_threshold, sw_pages * self.cfg.page_size)
-        self.assertEqual(
-            cons.cache_controller.prefetch_threshold, cons.prefetch_threshold
-        )
-        avail = self._host_avail_sizes(cons)
-        cons.prefetch_from_storage(
-            CacheRequestHandle("short-req", 0),
-            cons.root_node_handle(),
-            array("q", seq),
-            None,
-            None,
-        )
-        self.assertNotIn(CacheRequestHandle("short-req", 0), cons.ongoing_prefetch)
-        self.assertEqual(cons._prefetch_outcome_stats["declined_too_short"], 1)
-        self.assertEqual(cons._prefetch_outcome_stats["issued"], 0)
-        self.assertEqual(self._host_avail_sizes(cons), avail)
-        cons.sanity_check()
-
-        # 2. The same threshold applies mid-tree; an exact window is accepted.
-        if sw_pages >= 2:
-            seq_a = self._make_seq(1, max(2, sw_pages))
-            seq_ab = seq_a + self._make_seq(900, sw_pages)
-            self._produce_buffer_l3(storage_dir, seq_ab, marker=14)
-            cons2, cons2_alloc, cons2_rtp = self._build_buffer_hicache_fixture(
-                storage_dir
-            )
-            avail2 = self._host_avail_sizes(cons2)
-            self._insert(cons2, cons2_alloc, cons2_rtp, seq_a)
-            m = match_prefix(cons2, seq_a)
-            last_hash = cons2.get_last_hash_value(m.last_device_node)
-            cons2.prefetch_from_storage(
-                CacheRequestHandle("subwin-req", 0),
-                m.last_device_node,
-                array("q", seq_ab[len(seq_a) : -self.cfg.page_size]),
-                last_hash,
-                None,
-                matched_prefix_tokens=list(seq_a),
-            )
-            self.assertNotIn(
-                CacheRequestHandle("subwin-req", 0), cons2.ongoing_prefetch
-            )
-            self.assertEqual(cons2._prefetch_outcome_stats["declined_too_short"], 1)
-            # A declined span issues no lookup, so it must not spend the
-            # re-issue budget on polls.
-            self.assertNotIn("subwin-req", cons2.storage_prefetch_retries._pending)
-
-            cons2.prefetch_from_storage(
-                CacheRequestHandle("window-req", 0),
-                m.last_device_node,
-                array("q", seq_ab[len(seq_a) :]),
-                last_hash,
-                None,
-                matched_prefix_tokens=list(seq_a),
+        with self.subTest(anchor="root"):
+            seq = self._make_seq(5000, sw_pages - 1)
+            self._produce_buffer_l3(storage_dir, seq)
+            cons, _, _ = self._build_buffer_hicache_fixture(storage_dir)
+            req_id = CacheRequestHandle("root", 0)
+            cons.prefetch_from_storage(
+                req_id, cons.root_node_handle(), array("q", seq), None, None
             )
             self._pump_hicache_until(
-                cons2,
+                cons,
                 lambda: (
-                    cons2.check_prefetch_progress(CacheRequestHandle("window-req", 0))
-                    and cons2.buffer_pipeline.has_staged(
-                        CacheRequestHandle("window-req", 0)
-                    )
+                    cons.check_prefetch_progress(req_id)
+                    and cons.buffer_pipeline.has_staged(req_id)
                 ),
-                "whole-window mid-tree prefetch did not stage",
+                "root prefetch did not stage",
             )
-            self.assertTrue(
-                any(
-                    t.name == PoolName.SWA
-                    for t in cons2.buffer_pipeline.staged_prefetches[
-                        CacheRequestHandle("window-req", 0)
-                    ].aux_xfers
-                ),
-                "mid-tree fetch degraded to KV-only",
-            )
-            spliced = self._consume_staged_prefetch(
-                cons2,
-                CacheRequestHandle("window-req", 0),
-            )
-            self.assertEqual(int(spliced.numel()), len(seq_ab) - len(seq_a))
-            self.assertEqual(
-                len(
-                    cons2.path_device_indices(
-                        match_prefix(cons2, seq_ab).last_device_node
-                    )
-                ),
-                len(seq_ab),
-            )
-            self.assertEqual(self._host_avail_sizes(cons2), avail2)
-            cons2.sanity_check()
+            spliced = self._consume_staged_prefetch(cons, req_id)
+            self.assertEqual(int(spliced.numel()), len(seq))
+            self.assertEqual(match_prefix(cons, seq).device_prefix_len, len(seq))
+            cons.sanity_check()
 
-        # 3. An accepted request with a sub-window L3 hit is also declined.
-        full = self._make_seq(6000, sw_pages + 1)
-        stored = full[: (sw_pages - 1) * self.cfg.page_size]
-        self._produce_buffer_l3(storage_dir, stored, marker=6)
-        cons3, _, _ = self._build_buffer_hicache_fixture(storage_dir)
-        avail3 = self._host_avail_sizes(cons3)
-        cons3.prefetch_from_storage(
-            CacheRequestHandle("partial-req", 0),
-            cons3.root_node_handle(),
-            array("q", full),
-            None,
-            None,
-        )
-        operation = cons3.ongoing_prefetch[
-            CacheRequestHandle("partial-req", 0)
-        ].operation
-        self._run_prefetch_to_completion(cons3, CacheRequestHandle("partial-req", 0))
-        cons3.drain_storage_control_queues()
-        self.assertEqual(operation.storage_hit_count, len(stored))
-        self.assertEqual(
-            len(
-                cons3.path_device_indices(match_prefix(cons3, stored).last_device_node)
-            ),
-            0,
-            "sub-window hit should not be loaded",
-        )
-        self.assertEqual(cons3._prefetch_outcome_stats["issued"], 1)
-        self.assertEqual(cons3._prefetch_outcome_stats["revoked_insufficient"], 1)
-        self.assertFalse(
-            cons3.buffer_pipeline.has_staged(CacheRequestHandle("partial-req", 0))
-        )
-        self.assertEqual(self._host_avail_sizes(cons3), avail3)
-        cons3.sanity_check()
+        for suffix_pages in (sw_pages - 1, sw_pages):
+            with self.subTest(anchor="mid-tree", suffix_pages=suffix_pages):
+                cons, req_id, _, seq_ab = self._stage_buffer_mid_tree_hit(
+                    storage_dir, suffix_pages
+                )
+                staged = cons.buffer_pipeline.staged_prefetches[req_id]
+                self.assertEqual(
+                    sum(
+                        len(t.host_indices)
+                        for t in staged.aux_xfers
+                        if t.name == PoolName.SWA and t.host_indices is not None
+                    ),
+                    suffix_pages * self.cfg.page_size,
+                )
+                spliced = self._consume_staged_prefetch(cons, req_id)
+                self.assertEqual(
+                    int(spliced.numel()), suffix_pages * self.cfg.page_size
+                )
+                self.assertEqual(
+                    match_prefix(cons, seq_ab).device_prefix_len, len(seq_ab)
+                )
+                cons.sanity_check()
 
-    # TP consistency for SWA prefetch
+    @requires_hicache
+    @requires_swa
+    def test_buffer_only_sub_window_hit_refetches_when_its_window_head_is_evicted(
+        self,
+    ):
+        """A staged hold pins FULL only, so the anchor path's SWA can go while a
+        sub-window hit waits; admission then refetches instead of splicing a
+        window without its head."""
+        window = self.cfg.sliding_window_size
+        if window <= self.cfg.page_size or window % self.cfg.page_size:
+            self.skipTest("needs a window of two or more whole pages")
+        sw_pages = window // self.cfg.page_size
+        cons, req_id, seq_a, _ = self._stage_buffer_mid_tree_hit(
+            self._make_storage_dir(), sw_pages - 1
+        )
+        cons.evict(
+            EvictParams(
+                window_num_tokens={
+                    cons.window_sub_pool_of_slot(ComponentType.SWA): len(seq_a)
+                }
+            )
+        )
+        staged = cons.buffer_pipeline.staged_prefetches[req_id]
+        req = self._make_req(cons.req_to_token_pool)
+        req.rid = req_id.rid
+        req.cache_request_handle = req_id
+        req.prefix_len = match_prefix(cons, staged.key_tokens).device_prefix_len
+        self.assertLess(req.prefix_len, len(seq_a))
+
+        self.assertFalse(cons.buffer_pipeline.prepare_staged_prefetch(req))
+        self.assertFalse(cons.buffer_pipeline.has_staged(req_id))
+        self.assertIsNone(req.staged_prefetch_plan)
+        cons.sanity_check()
 
     def test_tp_swa_prefetch_dropped_when_peer_misses(self):
-        """A peer rank missing the SWA window drops the whole prefetch result
-        on every rank (TP-consistent all-or-nothing)."""
         setup = self._setup_swa_tp_prefetch()
         if setup is None:
             return
@@ -2274,6 +2382,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         cons, _, _ = self._l3_consumer(storage_dir)
         cons.tp_world_size = 2
         self._patch_tp_prefetch_sync(cons, drop_swa=True)
+        avail_before = cons.swa_kv_pool_host.available_size()
         self._consume_prefetch(cons, seq, CacheRequestHandle("drop", 0))
 
         m = match_prefix(cons, seq)
@@ -2281,11 +2390,11 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         self.assertFalse(
             self._swa_host_on_path(cons, seq), "SWA must be dropped when a peer misses"
         )
+        cons.drain_storage_control_queues()  # Drain the release queue.
+        self.assertEqual(cons.swa_kv_pool_host.available_size(), avail_before)
         cons.sanity_check()
 
     def test_tp_swa_prefetch_adopted_when_peer_present(self):
-        """When every rank has the full SWA window, SWA is adopted under tp>1
-        (the single packed all_reduce path still works)."""
         setup = self._setup_swa_tp_prefetch()
         if setup is None:
             return
@@ -2304,35 +2413,12 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         )
         cons.sanity_check()
 
-    def test_tp_swa_prefetch_drop_frees_host_pool(self):
-        """A dropped SWA prefetch must return its whole host buffer to the pool
-        (no leak, no over-free)."""
-        setup = self._setup_swa_tp_prefetch()
-        if setup is None:
-            return
-        storage_dir, seq = setup
-
-        cons, _, _ = self._l3_consumer(storage_dir)
-        cons.tp_world_size = 2
-        self._patch_tp_prefetch_sync(cons, drop_swa=True)
-        avail_before = cons.swa_kv_pool_host.available_size()
-        self._consume_prefetch(cons, seq, CacheRequestHandle("drop", 0))
-
-        self.assertEqual(
-            match_prefix(cons, seq).host_hit_length,
-            0,
-        )
-        # Whole window dropped -> its host buffer is fully released back.
-        cons.drain_storage_control_queues()  # Drain the release queue.
-        self.assertEqual(cons.swa_kv_pool_host.available_size(), avail_before)
-
     @requires_full_swa_ps1
     def test_prepare_prefetch_swa(self):
         cache, _, _ = self._build_hicache_fixture()
         sw = cache.sliding_window_size
         swa = cache.components[ComponentType.SWA]
         avail = cache.swa_kv_pool_host.available_size()
-        # zero-length prefetch -> does not participate
         self.assertEqual(
             swa.prepare_prefetch(
                 cache.root_node_handle(), prefetch_tokens=0
@@ -2347,14 +2433,12 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
             ).staging_tokens,
             sw - 1,
         )
-        # a full window available -> one window of host pages
         self.assertEqual(
             swa.prepare_prefetch(
                 cache.root_node_handle(), prefetch_tokens=sw
             ).staging_tokens,
             sw,
         )
-        # a non-participating component never stages
         self.assertEqual(
             cache.components[ComponentType.FULL]
             .prepare_prefetch(cache.root_node_handle(), prefetch_tokens=sw)
@@ -2369,9 +2453,8 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
     @requires_swa_only
     @requires_hicache
     def test_buffer_only_hit_parks_on_swa_staging_shortfall(self):
-        """A hit whose SWA window cannot be staged parks whole and launches
-        once the pool frees. It is never forfeited, and it never launches with
-        the KV staged and the window not; a parked hit holds no host memory."""
+        """A hit whose SWA window cannot be staged parks whole, holding no host
+        memory, and launches once the pool frees."""
         storage_dir = self._make_storage_dir()
         seq = self._buffer_swa_seq()
         self._produce_buffer_l3(storage_dir, seq)
@@ -2396,7 +2479,6 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
                 None,
                 None,
             )
-            # The query holds no SWA staging.
             self.assertEqual(pool.available_size(), avail)
             self._pump_hicache_until(
                 cons,
@@ -2405,13 +2487,46 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
             )
             self.assertIn(CacheRequestHandle("r", 0), cons.ongoing_prefetch)
             self.assertEqual(cons._prefetch_outcome_stats["declined_rate_limited"], 1)
-            # Parked, before the next drain retries it: nothing is held.
             self.assertEqual(pool.available_size(), avail)
         self._run_prefetch_to_completion(cons, CacheRequestHandle("r", 0))
         cons.drain_storage_control_queues()
         m = match_prefix(cons, seq)
         self.assertEqual(m.device_prefix_len, len(seq))
         cons.sanity_check()
+
+    @requires_swa_only
+    @requires(
+        lambda cfg: cfg.sliding_window_size > cfg.page_size,
+        "the window must reach past the leaf's own page",
+    )
+    def test_swa_backup_reaches_device_ancestor_in_cache_mode_only(self):
+        """Cache mode carries a leaf's SWA window into the device-only parent;
+        buffer mode writes each node's SWA under its own pages."""
+        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
+        chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 2)
+        if len(chain) < 2:
+            self.skipTest("chain too short")
+        parent, leaf = chain[-2], chain[-1]
+        write_backup(cache, leaf, write_back=True)
+        cache.writing_check(write_back=True)
+        self.assertIsNotNone(node_host_value(cache, leaf, ComponentType.SWA))
+        self.assertIsNotNone(node_host_value(cache, parent, ComponentType.SWA))
+        self.assertIsNone(node_host_value(cache, parent, ComponentType.FULL))
+
+        cache, allocator, req_to_token_pool = self._build_buffer_hicache_fixture(
+            self._make_storage_dir()
+        )
+        chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 2)
+        parent, leaf = chain[-2], chain[-1]
+        write_backup(cache, leaf)
+        swa_keys = {
+            intent.snapshot.node_id: list(intent.keys)
+            for intent in cache.buffer_pipeline.pending_write_queue
+            if intent.pool == PoolName.SWA
+        }
+        self.assertEqual(swa_keys[leaf], cache.tree_core.get_hash_values(leaf))
+        self._drain_buffer_writes(cache)
+        cache.sanity_check()
 
 
 define_config_test_classes(UnifiedRadixCacheStorageSuite, globals())
@@ -2423,7 +2538,7 @@ class TestUnifiedTreeCoreSWAPrefetchBackends(UnifiedRadixCacheFixtures, CustomTe
         components=(ComponentType.FULL, ComponentType.SWA), sliding_window_size=4
     )
 
-    def test_mid_tree_shortened_swa_prefetch_is_released(self):
+    def test_mid_tree_sub_window_swa_prefetch_is_attached(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         prefix = [1, 2]
         self._insert(cache, allocator, req_to_token_pool, prefix)
@@ -2460,18 +2575,94 @@ class TestUnifiedTreeCoreSWAPrefetchBackends(UnifiedRadixCacheFixtures, CustomTe
             ),
         )
 
-        self.assertIsNone(
-            node_host_value(cache, insert_result.inserted_host_node, ComponentType.SWA)
+        self.assertTrue(
+            torch.equal(
+                node_host_value(
+                    cache, insert_result.inserted_host_node, ComponentType.SWA
+                ),
+                swa_host_indices,
+            )
         )
-        self.assertEqual(len(actions), 1)
-        self.assertIsInstance(actions[0], FreeComponentHostSlot)
-        self.assertEqual(actions[0].component_type, ComponentType.SWA)
-        self.assertEqual(len(actions[0].host_indices), 1)
-        self.assertTrue(torch.equal(actions[0].host_indices[0], swa_host_indices))
+        self.assertEqual(actions, [])
 
 
 class TestPrefetchCommitOrdering(CustomTestCase):
     """The prefetch commit's action ordering (mock-based)."""
+
+    def test_hybrid_prefetch_rejects_partial_host_allocation(self):
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+            HybridCacheController,
+        )
+
+        for component, pool in (
+            (ComponentType.SWA, PoolName.SWA),
+            (ComponentType.MAMBA, PoolName.MAMBA),
+        ):
+            with self.subTest(component=component):
+                cache = mock.MagicMock()
+                cache.host_memory_mode = "cache"
+                cache.page_size = 4
+                cache.prefetch_threshold = 4
+                cc = cache.cache_controller
+                cc.page_size = cache.page_size
+                cc.mem_pool_host.anchor_entry.host_pool = object()
+                cc.mem_pool_host.available_size.return_value = 4
+                cc.prefetch_hit_queue = Queue()
+                cc.prefetch_buffer = Queue()
+                cc.allocate_storage_hit = (
+                    HybridCacheController.allocate_storage_hit.__get__(cc)
+                )
+
+                # A full hit cannot fit, but a page-sized partial allocation can.
+                def allocate_host_buffers(operation, num_tokens):
+                    return list(range(num_tokens)) if num_tokens <= 4 else None
+
+                cc.alloc_prefetch_host_buffers.side_effect = allocate_host_buffers
+                operation = mock.Mock()
+                operation.handle = CacheRequestHandle("hybrid-capacity", 0)
+                operation.storage_start = 4
+                operation.storage_hit_count = 8
+                operation.hash_value = ["h1", "h2"]
+                operation.host_indices = None
+                operation.is_terminated.return_value = False
+                cache.ongoing_prefetch = {
+                    operation.handle: _OngoingPrefetch(
+                        anchor_node_id=0,
+                        prefetch_key=RadixKey(array("q", range(8))),
+                        host_indices=None,
+                        operation=operation,
+                        anchor_lock_params=None,
+                        comp_xfers={component: [PoolTransfer(name=pool)]},
+                    )
+                }
+                cc.prefetch_hit_queue.put(operation)
+
+                UnifiedRadixCache._drain_storage_control_queues_impl(
+                    cache,
+                    n_storage_hit=1,
+                    n_ack_prefetch=0,
+                    n_backup=0,
+                    n_release=0,
+                    extra_release_counts=None,
+                    log_metrics=False,
+                )
+
+                self.assertEqual(
+                    cc.alloc_prefetch_host_buffers.call_args_list,
+                    [mock.call(operation, 8), mock.call(operation, 8)],
+                )
+                self.assertTrue(cc.prefetch_buffer.empty())
+                self.assertIsNone(operation.host_indices)
+                self.assertEqual(operation.storage_hit_count, 8)
+                self.assertEqual(operation.hash_value, ["h1", "h2"])
+                cache._alloc_prefetch_aux_staging.assert_not_called()
+                cache._finish_storage_prefetch.assert_called_once_with(
+                    operation.handle, fulfilled_tokens=0, reason="host_capacity"
+                )
+                cache.revoke_pending_prefetch.assert_called_once_with(operation.handle)
+                cache.storage_prefetch_retries.poll_miss.assert_called_once_with(
+                    operation.handle.rid, 12
+                )
 
     def test_prefetch_commit_applies_host_insert_actions_before_transfers(self):
         """The prefetch commit applies the host-insert walk's actions before
@@ -2544,12 +2735,8 @@ class TestPrefetchCommitOrdering(CustomTestCase):
 class TestUnifiedRadixPrefetchCorruption(
     UnifiedRadixPrefetchCorruptionFixtures, CustomTestCase
 ):
-    """Prefetch must not hang a backed-up host child under an un-backed-up parent.
-
-    Under write-through that broke the "child backed up => parent backed up"
-    invariant, failing as an idle-sanity error and, on eviction, as
-    `_remove_leaf_from_parent -> assert v == node`. Fix: drop the refill.
-    """
+    """Prefetch must not hang a backed-up host child under an un-backed-up parent
+    (breaks "child backed up => parent backed up"); the refill is dropped."""
 
     ps = 16
     cfg = CacheConfig(
@@ -2716,13 +2903,8 @@ class TestUnifiedRadixPrefetchCorruption(
 class TestUnifiedRadixCacheStorageAttachBackfill(
     UnifiedRadixCacheStorageAttachBackfillFixtures, CustomTestCase
 ):
-    """Enabling a storage backend must hash nodes that predate it.
-
-    Page hashes chain off the parent's last hash, so a node hashed against an
-    unhashed parent restarts the chain mid-sequence: its L3 keys then cover only a
-    suffix of the prefix they claim to represent, which aliases any unrelated
-    request that happens to start with those tokens.
-    """
+    """Enabling storage must hash nodes that predate it: page hashes chain off the
+    parent, so an unhashed parent yields keys that alias unrelated requests."""
 
     cfg = CacheConfig(
         page_size=4,
@@ -2780,7 +2962,6 @@ class TestUnifiedRadixCacheStorageAttachBackfill(
         cache.tree_core.set_node_hash_values(parent, parent_hashes)
 
     def test_enabling_storage_backfills_the_tree(self):
-        """The tree is hashed by the time `enable_storage` flips on."""
         cache = self._build_two_level_tree(storage_on_from_the_start=False)
         StorageAttachment(cache).apply_runtime_config(
             storage_backend="file",
@@ -2800,134 +2981,142 @@ class TestUnifiedRadixCacheStorageAttachBackfill(
 
 
 class TestAnchorLockOutcomePolicy(AnchorLockOutcomePolicyFixtures, CustomTestCase):
-    """try_lock_anchor finds the anchor by re-matching the live tree (no
-    carried node id to go stale): prefix intact -> lock the live node;
-    prefix shrunk -> anchor_lost so the caller re-plans; over the whole cap
-    -> cap_skip (launch unlocked, since no drain can ever fit it), merely
-    over budget -> cap_busy (park)."""
+    """try_lock_anchor re-matches the live tree: intact -> lock; shrunk ->
+    anchor_lost; over cap -> cap_skip; over budget -> cap_busy."""
 
+    cfg = CacheConfig()
     _REQ = CacheRequestHandle("req-1", 0)
     _PREFIX = list(range(100, 100 + 8))
 
     def test_intact_prefix_locks_live_node(self):
-        cache = self._make_cache(live_match_len=len(self._PREFIX))
-        pipeline = self._make_pipeline(cache)
-        self.assertEqual(pipeline.try_lock_anchor(self._REQ, 0)[0], "locked")
-        self.assertEqual(pipeline.anchor_locks[self._REQ].node_id, 99)
+        cache, pipeline = self._make_buffer_cache(resident=self._PREFIX)
+        leaf = match_prefix(cache, self._PREFIX).last_device_node
+        self.assertEqual(
+            pipeline.try_lock_anchor(self._REQ, 0), ("locked", len(self._PREFIX))
+        )
+        self.assertEqual(pipeline.anchor_locks[self._REQ].node_id, leaf)
         self.assertEqual(pipeline.anchor_locked_tokens_, len(self._PREFIX))
-        cache.tree_core.inc_full_pin.assert_called_once_with(99)
-        cache.inc_lock_ref.assert_not_called()
+        self.assertEqual(node_device_lock_ref(cache, leaf, ComponentType.FULL), 1)
+        pipeline.release_anchor_lock(self._REQ)
+        self.assertEqual(node_device_lock_ref(cache, leaf, ComponentType.FULL), 0)
 
     def test_shrunk_prefix_reports_anchor_lost(self):
-        cache = self._make_cache(live_match_len=len(self._PREFIX) - 2)
-        pipeline = self._make_pipeline(cache)
+        cache, pipeline = self._make_buffer_cache(resident=self._PREFIX[:-2])
         self.assertEqual(pipeline.try_lock_anchor(self._REQ, 0)[0], "anchor_lost")
         self.assertEqual(pipeline.anchor_locks, {})
         self.assertEqual(pipeline.anchor_locked_tokens_, 0)
 
     def test_storage_cleanup_releases_buffer_prefetch_anchor(self):
-        cache = self._make_cache(live_match_len=len(self._PREFIX))
-        pipeline = self._make_pipeline(cache)
-        cache.buffer_pipeline = pipeline
-        self.assertEqual(pipeline.try_lock_anchor(self._REQ, 0)[0], "locked")
-        host_indices = torch.arange(4)
-        cache.ongoing_prefetch = {
-            self._REQ: _OngoingPrefetch(
-                anchor_node_id=99,
-                prefetch_key=RadixKey(array("q", range(16))),
-                host_indices=host_indices,
-                operation=mock.Mock(
-                    buffer_host_occupied_units=4, pool_transfers_done=True
-                ),
-                anchor_lock_params=None,
-                comp_xfers={},
-            )
-        }
-        cache.ongoing_backup = {}
-        cache.host_memory_mode = "buffer_only"
-        cache._prefetch_occupied_span.side_effect = (
-            lambda key, indices, *, operation=None: (
-                UnifiedRadixCache._prefetch_occupied_span(
-                    cache, key, indices, operation=operation
-                )
-            )
+        storage_dir = self._make_storage_dir()
+        suffix = list(range(200, 208))
+        self._produce_buffer_l3(storage_dir, self._PREFIX + suffix)
+        cache, pipeline = self._make_buffer_cache(
+            resident=self._PREFIX, storage_dir=storage_dir, prefix=None
         )
-        cache._retire_ongoing_prefetch.side_effect = lambda *args: (
-            UnifiedRadixCache._retire_ongoing_prefetch(cache, *args)
+        anchor = match_prefix(cache, self._PREFIX).last_device_node
+        pipeline.pop_prefix_ctx(self._REQ)
+        cache.prefetch_from_storage(
+            self._REQ,
+            anchor,
+            array("q", suffix),
+            cache.get_last_hash_value(anchor),
+            None,
+            matched_prefix_tokens=list(self._PREFIX),
         )
-        controller = cache.cache_controller
-        controller.terminate_prefetch.return_value = (4, None)
-        controller.prefetch_tokens_occupied = 12
-
-        StorageAttachment(cache)._release_pending_storage_ops()
-
+        self._pump_hicache_until(
+            cache,
+            lambda: self._REQ in pipeline.anchor_locks,
+            "the storage hit did not pin its anchor",
+        )
+        self.assertEqual(node_device_lock_ref(cache, anchor, ComponentType.FULL), 1)
+        detached, message = StorageAttachment(cache).detach()
+        self.assertTrue(detached, message)
         self.assertEqual(cache.ongoing_prefetch, {})
         self.assertEqual(pipeline.anchor_locks, {})
         self.assertEqual(pipeline.anchor_locked_tokens_, 0)
         self.assertNotIn(self._REQ, pipeline._prefetch_prefix_ctx)
-        cache.tree_core.dec_full_pin.assert_called_once_with(99)
-        cache.dec_lock_ref.assert_not_called()
-        cache.dec_host_lock_ref.assert_not_called()
-        self.assertEqual(controller.prefetch_tokens_occupied, 8)
+        self.assertEqual(node_device_lock_ref(cache, anchor, ComponentType.FULL), 0)
+        self.assertEqual(cache.cache_controller.prefetch_tokens_occupied, 0)
 
     def test_positive_hit_with_lost_anchor_reports_anchor_lost(self):
-        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
-        cache.storage_prefetch_retries = StoragePrefetchRetries()
-        cache.ongoing_prefetch = {
-            self._REQ: SimpleNamespace(
-                operation=SimpleNamespace(storage_start=4, storage_hit_count=8)
-            )
-        }
-        cache._finish_storage_prefetch = mock.Mock()
-        cache.revoke_pending_prefetch = mock.Mock()
-
-        cache._handle_storage_prefetch_anchor_loss(self._REQ)
-
-        cache._finish_storage_prefetch.assert_called_once_with(
-            self._REQ, fulfilled_tokens=0, reason="anchor_lost"
+        """A storage hit whose anchor was evicted before the progress check
+        pinned it is declined as anchor_lost, and the request replans the
+        widened span right away -- skipping the query, the prior hit having
+        proved it stored, and the poll interval."""
+        storage_dir = self._make_storage_dir()
+        suffix = list(range(200, 208))
+        self._produce_buffer_l3(storage_dir, self._PREFIX + suffix)
+        cache, pipeline = self._make_buffer_cache(
+            resident=self._PREFIX, storage_dir=storage_dir, prefix=None
         )
-        # The eviction widened the span, so the request replans over it --
-        # skipping the query, the prior hit having proved it stored, and the
-        # poll interval, which would only let admission run without it.
-        req = SimpleNamespace(rid=self._REQ.rid, storage_prefetch_retry_attempts=0)
+        anchor = match_prefix(cache, self._PREFIX).last_device_node
+        pipeline.pop_prefix_ctx(self._REQ)
+        cache.prefetch_from_storage(
+            self._REQ,
+            anchor,
+            array("q", suffix),
+            cache.get_last_hash_value(anchor),
+            None,
+            matched_prefix_tokens=list(self._PREFIX),
+        )
+        self.assertIn(self._REQ, cache.ongoing_prefetch)
+        cache.evict(EvictParams(num_tokens=len(self._PREFIX)))
+        self.assertEqual(match_prefix(cache, self._PREFIX).device_prefix_len, 0)
+        self._pump_hicache_until(
+            cache,
+            lambda: self._REQ not in cache.ongoing_prefetch,
+            "the anchor loss did not end the prefetch",
+        )
+        self.assertEqual(pipeline.anchor_locks, {})
+        req = self._make_req(cache.req_to_token_pool)
+        req.rid = self._REQ.rid
         self.assertEqual(
-            cache.storage_prefetch_retries.pop_ready([req], 0, 8), [(req, 12)]
+            cache.storage_prefetch_retries.pop_ready([req], 0, 8),
+            [(req, len(self._PREFIX) + len(suffix))],
         )
-        cache.revoke_pending_prefetch.assert_called_once_with(self._REQ)
 
     def test_over_cap_reports_cap_skip_after_full_rematch(self):
-        cache = self._make_cache(live_match_len=len(self._PREFIX))
-        pipeline = self._make_pipeline(cache, cap_tokens=len(self._PREFIX) - 1)
+        cache, pipeline = self._make_buffer_cache(
+            resident=self._PREFIX, cap_tokens=len(self._PREFIX) - 1
+        )
+        leaf = match_prefix(cache, self._PREFIX).last_device_node
         self.assertEqual(pipeline.try_lock_anchor(self._REQ, 0)[0], "cap_skip")
         self.assertEqual(pipeline.anchor_locks, {})
-        cache.tree_core.match_full_device_prefix.assert_called_once()
+        self.assertEqual(node_device_lock_ref(cache, leaf, ComponentType.FULL), 0)
 
     def test_root_anchor_reports_no_anchor(self):
-        cache = self._make_cache(live_match_len=0)
-        cache.ongoing_prefetch[self._REQ].prefetch_key = RadixKey(array("q", range(8)))
-        pipeline = self._make_pipeline(cache)
-        pipeline._prefetch_prefix_ctx[self._REQ] = ([], None, None)
+        cache, pipeline = self._make_buffer_cache(prefix=[])
+        cache.ongoing_prefetch[self._REQ] = _OngoingPrefetch(
+            anchor_node_id=cache.root_node_handle(),
+            prefetch_key=RadixKey(array("q", range(8))),
+            host_indices=None,
+            operation=None,
+            anchor_lock_params=None,
+            comp_xfers={},
+        )
         self.assertEqual(pipeline.try_lock_anchor(self._REQ, 8), ("no_anchor", 0))
-        cache.tree_core.match_full_device_prefix.assert_called_once()
+        cache.ongoing_prefetch.pop(self._REQ)
 
     def test_anchor_lock_requires_release_before_retry(self):
-        cache = self._make_cache(live_match_len=8, pinned_len=12)
-        pipeline = self._make_pipeline(cache)
+        tokens = self._PREFIX + [900, 901, 902, 903]
+        cache, pipeline = self._make_buffer_cache(resident=tokens)
+        node = match_prefix(cache, tokens).last_device_node
         self.assertEqual(pipeline.try_lock_anchor(self._REQ, 0), ("locked", 8))
         with self.assertRaisesRegex(AssertionError, "prefetch anchor already locked"):
             pipeline.try_lock_anchor(self._REQ, 0)
-        self.assertEqual(pipeline.anchor_locked_tokens_, 12)
-        cache.tree_core.match_full_device_prefix.assert_called_once()
-        cache.tree_core.inc_full_pin.assert_called_once_with(99)
-
+        self.assertEqual(pipeline.anchor_locked_tokens_, len(tokens))
+        self.assertEqual(node_device_lock_ref(cache, node, ComponentType.FULL), 1)
         pipeline.release_anchor_lock(self._REQ)
         self.assertEqual(pipeline.anchor_locked_tokens_, 0)
-        cache.tree_core.dec_full_pin.assert_called_once_with(99)
-        cache.tree_core.match_full_device_prefix.return_value = (8, 100, 8)
+        self.assertEqual(node_device_lock_ref(cache, node, ComponentType.FULL), 0)
+        # A branch at the prefix boundary splits the node; the retry re-matches
+        # the live tree and pins the new prefix node alone.
+        self._insert_tokens(cache, self._PREFIX + [800, 801])
+        prefix_node = match_prefix(cache, self._PREFIX).last_device_node
         self.assertEqual(pipeline.try_lock_anchor(self._REQ, 0), ("locked", 8))
-        self.assertEqual(pipeline.anchor_locks[self._REQ].node_id, 100)
-        self.assertEqual(pipeline.anchor_locked_tokens_, 8)
-        self.assertEqual(cache.tree_core.match_full_device_prefix.call_count, 2)
+        self.assertEqual(pipeline.anchor_locks[self._REQ].node_id, prefix_node)
+        self.assertEqual(pipeline.anchor_locked_tokens_, len(self._PREFIX))
+        pipeline.release_anchor_lock(self._REQ)
 
 
 if __name__ == "__main__":
