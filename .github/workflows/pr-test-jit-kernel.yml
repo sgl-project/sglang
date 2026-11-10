@@ -113,7 +113,8 @@ jobs:
           CUSTOM_BUILD_SGL_KERNEL=${{ inputs.sgl_kernel }} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
 
       - name: Run test
-        timeout-minutes: 60
+        # Cold JIT caches after shared-header or toolchain changes need ~50-61 min (see #49340).
+        timeout-minutes: 90
         env:
           CONTINUE_ON_ERROR_FLAG: ${{ inputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
         run: |
