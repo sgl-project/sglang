@@ -146,6 +146,10 @@ def run_pytest_files(
             env = dict(
                 os.environ, PYTEST_DISABLE_PLUGIN_AUTOLOAD="1", PYTEST_ADDOPTS=""
             )
+            # Match direct-script imports for objects serialized into server children.
+            env["PYTHONPATH"] = os.pathsep.join(
+                filter(None, [str(Path(filename).parent), env.get("PYTHONPATH")])
+            )
             # -o addopts= prevents repository configuration from changing selection.
             command = [
                 sys.executable,

@@ -58,6 +58,17 @@ class StrictRunnerTest(unittest.TestCase):
         self.assertTrue((self.root / "results" / record["junit"]).is_file())
         self.assertGreater(record["elapsed"], 0)
 
+    def test_file_directory_is_inherited_by_test_subprocesses(self):
+        (self.root / "serialized_fixture.py").write_text("VALUE = 42\n")
+        result, report = self.run_fixture(
+            "import subprocess,sys\n"
+            "def test_child_import():\n"
+            " subprocess.run([sys.executable, '-c', "
+            "'import serialized_fixture; assert serialized_fixture.VALUE == 42'], check=True)\n"
+        )
+        self.assertEqual(result, 0)
+        self.assertTrue(report["success"])
+
     def test_failure_retains_counts(self):
         result, report = self.run_fixture("def test_bad():\n    assert False\n")
         self.assertEqual(result, 1)

@@ -16,6 +16,40 @@ def allowed_skips():
         for is_neox in (False, True)
         for batch_size in batch_sizes
     ]
+    skips += [
+        f"registered.layers.mamba.test_mamba_ssm.test_selective_state_update_stochastic_rounding[{dim}-{head_dim}-{with_heads}-{cache_index}]"
+        for dim in (2048, 4096)
+        for head_dim in (16, 64)
+        for with_heads in (False, True)
+        for cache_index in (0, 4)
+    ]
+    skips += [
+        # nsys is not installed in the PPU image.
+        "registered.profiling.test_start_profile.TestStartProfileWithNsys.test_start_profile_cuda_profiler",
+        "registered.profiling.test_start_profile.TestStartProfileWithNsys.test_start_profile_cuda_profiler_with_start_step",
+        # The negative-penalty diversity assertion is disabled as flaky upstream.
+        "registered.sampling.test_penalty.TestPenalty.test_penalty_edge_cases_negative_penalty_values",
+        # These page_size=1 cases are ROCm-specific.
+        "registered.unit.managers.test_hisparse_unit.TestHiSparseUnit.test_allocator_page_size_one_alloc_free_cycle",
+        "registered.unit.managers.test_hisparse_unit.TestHiSparseUnit.test_decode_remap_frees_stale_page_size_one_mapping",
+        # Pytest collects this abstract base class but skips it by design.
+        "registered.lora.test_virtual_experts_kernels._AlignBlockSizeSentinelBucketBase.test_all_valid_baseline",
+        "registered.lora.test_virtual_experts_kernels._AlignBlockSizeSentinelBucketBase.test_empty_topk_ids_does_not_crash",
+        "registered.lora.test_virtual_experts_kernels._AlignBlockSizeSentinelBucketBase.test_mixed_invalid_at_production_size",
+        "registered.lora.test_virtual_experts_kernels._AlignBlockSizeSentinelBucketBase.test_negative_ids_routed_to_sentinel",
+        "registered.lora.test_virtual_experts_kernels._AlignBlockSizeSentinelBucketBase.test_oor_ids_routed_to_sentinel",
+        # The baseline PPU nightly runs the Python server without the Rust extension.
+        "registered.openai_server.basic.test_openai_server.TestOpenAICompletionWithRust.test_completion",
+        "registered.openai_server.basic.test_openai_server.TestOpenAICompletionWithRust.test_completion_stream",
+        "registered.openai_server.basic.test_openai_server.TestOpenAIChatWithRust.test_chat_completion",
+        "registered.openai_server.basic.test_openai_server.TestOpenAIChatWithRust.test_chat_completion_stream",
+        # nvidia-modelopt is not installed in the PPU image.
+        "registered.unit.model_loader.test_modelopt_export.TestModelOptExport.test_export_modelopt_checkpoint_success",
+        "registered.unit.model_loader.test_modelopt_export.TestModelOptExport.test_setup_quantization_with_export_after_calibration",
+        "registered.unit.model_loader.test_modelopt_export.TestModelOptExport.test_setup_quantization_with_export_from_checkpoint",
+        "registered.unit.model_loader.test_modelopt_export.TestModelOptExport.test_standard_workflow_selection",
+        "registered.unit.model_loader.test_modelopt_export.TestModelOptExportIntegration.test_full_workflow_with_export",
+    ]
     skips.append(
         "registered.kernels.ops.diffusion.test_timestep_embedding.test_timestep_embedding_perf"
     )
