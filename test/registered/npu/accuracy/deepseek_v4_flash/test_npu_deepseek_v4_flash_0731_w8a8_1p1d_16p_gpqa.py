@@ -227,13 +227,9 @@ class TestNPUDeepSeekV4Flash0731W8A8PDSEPGPQAHigh(
     # (reference: Flash W8A8 GPQA Diamond baseline is 0.874).
     accuracy = 0.874
     datasets = ["gpqa_diamond"]
-    # Run evalscope only once (no retry on accuracy miss): the default gsm8k
-    # retry budget would not fit the multi-node step timeout.
+    # A single attempt: gsm8k's 3-retry budget would exceed the step timeout.
     max_retries = 1
-    # Weekend nightly runs gpqa_diamond (the dataset above, using `accuracy`),
-    # weekday (Mon-Fri) runs gsm8k with a 200-sample cap through
-    # NPU_ACCURACY_DATASET. The gsm8k baseline starts ~5 points below the
-    # official 95.0 and is tightened once nightly runs report the Ascend number.
+    # Weekday nightly overrides this to gsm8k (baseline is provisional).
     dataset_baselines = {
         "gsm8k": 0.90,
     }

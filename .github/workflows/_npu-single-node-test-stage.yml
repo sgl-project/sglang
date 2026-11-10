@@ -277,11 +277,14 @@ jobs:
           create_time="${{ fromJson(inputs.run_start_metadata).create_time }}"
           if [ -z "${create_time}" ]; then create_time=$(date -u -d '+8 hours' +%Y%m%d-%H%M); fi
 
-          # Sweep stale result/log dirs older than 30 days left by killed jobs.
-          find /root/.cache/tests/output -regextype posix-extended -maxdepth 1 -type d \
-            -regex '.*/.+-[0-9]{8}-[0-9]{4}-[0-9]+-[0-9]+$' -mtime +30 -exec rm -rf {} + 2>/dev/null || true
-          find /root/.cache/tests/logs/log -regextype posix-extended -maxdepth 1 -type d \
-            -regex '.*/(.+-[0-9]{8}-[0-9]{4}-[0-9]+-[0-9]+|[0-9]{8})$' -mtime +30 -exec rm -rf {} + 2>/dev/null || true
+          # Sweep stale result/log dirs (>30 days) left by killed jobs. Backgrounded
+          # and capped: the shared PVC is slow and a backlog must not delay the test.
+          ( find /root/.cache/tests/output -regextype posix-extended -maxdepth 1 -type d \
+              -regex '.*/.+-[0-9]{8}-[0-9]{4}-[0-9]+-[0-9]+$' -mtime +30 -print 2>/dev/null \
+            | head -n 5 | xargs -r rm -rf
+            find /root/.cache/tests/logs/log -regextype posix-extended -maxdepth 1 -type d \
+              -regex '.*/(.+-[0-9]{8}-[0-9]{4}-[0-9]+-[0-9]+|[0-9]{8})$' -mtime +30 -print 2>/dev/null \
+            | head -n 5 | xargs -r rm -rf ) >/dev/null 2>&1 </dev/null &
           # Append the image tag to the workflow-name segment so that runs with
           # different images (CANN 9.0.0/9.1.0, a3/a5) persist into distinct,
           # image-tagged output/log directories.

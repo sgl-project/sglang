@@ -106,33 +106,22 @@ def get_max_retries(datasets):
 
 
 # Exported by the nightly pipeline to pick the dataset of multi-node accuracy
-# cases: gsm8k on weekdays (Mon-Fri) and gpqa_diamond on weekends. The test
-# case declares the matching baselines in `dataset_baselines`.
+# cases: gsm8k on weekdays (Mon-Fri) and gpqa_diamond on weekends.
 ACCURACY_DATASET_ENV = "NPU_ACCURACY_DATASET"
 
-# Sample caps applied when the dataset is overridden, so the weekday gsm8k run
-# stays inside the multi-node job step budget. Cases may extend this mapping
-# through their own `dataset_limits`.
+# Sample cap kept for the overridden gsm8k run, to stay inside the step budget.
 ACCURACY_DATASET_LIMITS = {"gsm8k": 200}
 
 
 def apply_accuracy_dataset_override(test_cls):
-    """Apply the dataset selected by the nightly pipeline on `test_cls`.
+    """Apply the pipeline-selected dataset on `test_cls`.
 
-    No-op when NPU_ACCURACY_DATASET is unset (PR/full-test/manual runs keep the
-    dataset declared by the case itself), or when it selects the dataset the
-    case already declares, whose baseline is `accuracy`. Cases opt in to the
-    other dataset by declaring its baseline in `dataset_baselines`; a case
-    without one keeps its own dataset instead of failing, so enabling the
-    pipeline-wide override never breaks cases that have not been calibrated yet.
+    No-op when NPU_ACCURACY_DATASET is unset or selects the dataset the case
+    already declares. Cases opt in to the other dataset by declaring its
+    baseline in `dataset_baselines`; uncalibrated cases keep their own dataset.
     """
     dataset = os.environ.get(ACCURACY_DATASET_ENV, "").strip()
-    if not dataset:
-        return
-
-    # Selecting the dataset the case already declares is a no-op: `accuracy`
-    # is its baseline.
-    if dataset in (getattr(test_cls, "datasets", None) or []):
+    if not dataset or dataset in test_cls.datasets:
         return
 
     baselines = getattr(test_cls, "dataset_baselines", None) or {}
@@ -140,25 +129,17 @@ def apply_accuracy_dataset_override(test_cls):
         logger.warning(
             f"[accuracy-dataset] {ACCURACY_DATASET_ENV}={dataset} ignored for "
             f"{test_cls.__name__}: no dataset_baselines['{dataset}'], keeping "
-            f"datasets={getattr(test_cls, 'datasets', None)}. Declare the "
-            f"baseline to opt this case in."
+            f"datasets={test_cls.datasets}."
         )
         return
 
-    limits = {
-        **ACCURACY_DATASET_LIMITS,
-        **(getattr(test_cls, "dataset_limits", None) or {}),
-    }
     test_cls.datasets = [dataset]
     test_cls.accuracy = baselines[dataset]
-    test_cls.limit = limits.get(dataset, test_cls.limit)
-    # dataset_args is keyed by dataset name (the evalscope format); keep only
-    # the entry of the selected dataset.
-    dataset_args = getattr(test_cls, "dataset_args", None)
-    if dataset_args:
-        test_cls.dataset_args = (
-            {dataset: dataset_args[dataset]} if dataset in dataset_args else None
-        )
+    test_cls.limit = ACCURACY_DATASET_LIMITS.get(dataset, test_cls.limit)
+    # dataset_args is keyed by dataset name; keep the selected entry only.
+    if test_cls.dataset_args:
+        entry = test_cls.dataset_args.get(dataset)
+        test_cls.dataset_args = {dataset: entry} if entry else None
     logger.info(
         f"[accuracy-dataset] {ACCURACY_DATASET_ENV}={dataset}: "
         f"datasets={test_cls.datasets} accuracy={test_cls.accuracy} "
@@ -341,24 +322,14 @@ def assert_metrics(self, metrics):
 
     if self.accuracy is not None:
         threshold = get_accuracy_threshold(self.datasets, self.accuracy)
-        # The dataset is part of the label: multi-node accuracy cases run
-        # gpqa_diamond on weekends and gsm8k on weekdays, and the two numbers
-        # must not land in the same metric series.
+        # Keep weekday gsm8k and weekend gpqa_diamond in separate series.
         labels = {
             "test_case": self.__class__.__name__,
             "type": "accuracy",
-            "dataset": self.datasets[0] if self.datasets else "unknown",
+            "dataset": (self.datasets or ["unknown"])[0],
         }
-        dump_metric(
-            "accuracy",
-            float(metrics["accuracy"]),
-            labels=labels,
-        )
-        dump_metric(
-            "accuracy_baseline",
-            float(self.accuracy),
-            labels=labels,
-        )
+        dump_metric("accuracy", float(metrics["accuracy"]), labels=labels)
+        dump_metric("accuracy_baseline", float(self.accuracy), labels=labels)
         self.assertGreaterEqual(
             float(metrics["accuracy"]),
             threshold,
