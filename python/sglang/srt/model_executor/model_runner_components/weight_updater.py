@@ -393,24 +393,15 @@ class WeightUpdater:
             (name, _unwrap_tensor(tensor, tp_rank=tp_rank, device=infered_device))
             for name, tensor in named_tensors
         ]
-        try:
-            if load_format == "direct":
-                _model_load_weights_direct(self.get_model(), named_tensors)
-            elif load_format in self.custom_weight_loaders:
-                custom_loader = dynamic_import(load_format)
-                custom_loader(self.get_model(), named_tensors)
-            elif load_format is None:
-                self.get_model().load_weights(named_tensors)
-            else:
-                raise NotImplementedError(f"Unknown load_format={load_format}")
-        except Exception as e:
-            error_msg = (
-                f"Failed to update parameter online: {e}. "
-                f"The weights of the ModelRunner may be partially updated. "
-                f"Please discard the whole weights."
-            )
-            logger.error(error_msg)
-            return False, error_msg
+        if load_format == "direct":
+            _model_load_weights_direct(self.get_model(), named_tensors)
+        elif load_format in self.custom_weight_loaders:
+            custom_loader = dynamic_import(load_format)
+            custom_loader(self.get_model(), named_tensors)
+        elif load_format is None:
+            self.get_model().load_weights(named_tensors)
+        else:
+            raise NotImplementedError(f"Unknown load_format={load_format}")
         return True, "Success"
 
     def _update_weights_from_flattened_bucket(
@@ -441,16 +432,7 @@ class WeightUpdater:
         reconstructed_tensors = bucket.reconstruct_tensors()
 
         # Load the reconstructed tensors using the standard method
-        try:
-            self.get_model().load_weights(reconstructed_tensors)
-        except Exception as e:
-            error_msg = (
-                f"Failed to update parameter online: {e}. "
-                f"The weights of the ModelRunner may be partially updated. "
-                f"Please discard the whole weights."
-            )
-            logger.error(error_msg)
-            return False, error_msg
+        self.get_model().load_weights(reconstructed_tensors)
 
         return True, "Success"
 

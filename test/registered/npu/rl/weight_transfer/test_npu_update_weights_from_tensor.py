@@ -6,6 +6,7 @@ Comparing two live updates with each other would only prove determinism.
 """
 
 import os
+import time
 import unittest
 
 import requests
@@ -175,33 +176,44 @@ class TestNpuUpdateWeightsFromTensor(CustomTestCase):
         end_weight_update(self.lane_url)
         self._assert_serves_reference("restoring the subset did not restore the output")
 
-    def test_05_update_failure_is_reported(self):
+    def test_05_update_failure_is_fail_stop(self):
         self._ensure_reference()
         bad = torch.zeros(1, dtype=torch.bfloat16, device="npu")
         begin_weight_update(self.lane_url)
-        response = requests.post(
-            self.lane_url + "/update_weights_from_tensor",
-            json={
-                "serialized_named_tensors": [
-                    serialize_named_tensors([(TARGET_WEIGHT, bad)])
-                ],
-                "load_format": None,
-                "flush_cache": True,
-            },
-            timeout=300,
-        )
+
+        try:
+            response = requests.post(
+                self.lane_url + "/update_weights_from_tensor",
+                json={
+                    "serialized_named_tensors": [
+                        serialize_named_tensors([(TARGET_WEIGHT, bad)])
+                    ],
+                    "load_format": None,
+                    "flush_cache": True,
+                },
+                timeout=300,
+            )
+        except requests.RequestException:
+            pass
+        else:
+            self.assertNotEqual(
+                response.status_code, 200, "malformed tensor payload was accepted"
+            )
+
         try:
             end_weight_update(self.lane_url)
         except Exception:
-            # A rejected payload may also fail the finalize step; the server
-            # must stay usable either way.
             pass
 
-        self.assertNotEqual(
-            response.status_code, 200, "malformed tensor payload was accepted"
+        # An in-place load can fail after mutating part of the weights, so the
+        # engine must not keep serving: no rollback is possible here.
+        deadline = time.time() + 30
+        while health(self.lane_url) and time.time() < deadline:
+            time.sleep(0.5)
+        self.assertFalse(
+            health(self.lane_url),
+            "engine stayed alive after a failed in-place weight update",
         )
-        self.assertTrue(health(self.lane_url))
-        self._assert_serves_reference("failed update left the served weights corrupted")
 
 
 if __name__ == "__main__":
