@@ -209,7 +209,7 @@ class DeferredDraftKVStore:
     def before_draft_forward(self, graph_bs: Optional[int], reqs) -> None:
         """Host, before a draft forward of ``reqs``: a graph of ``graph_bs`` requests
         (None: eager) writes only its own rows, so anything it would miss is
-        written first."""
+        written first; what stays pending is the graph's to write."""
         self._draft_forwards += 1
         if self._draft_forwards % _LOG_EVERY == 0:
             logger.debug(
@@ -226,10 +226,7 @@ class DeferredDraftKVStore:
             self._flush("draft graph without the fork")
         elif len(self._staged_reqs) > graph_bs:
             self._flush("draft graph rows")
-
-    def after_draft_forward(self, graph_ran: bool) -> None:
-        # A pending staging past before_draft_forward is one the graph writes.
-        if graph_ran and self.pending:
+        elif self.pending:
             self._staged_reqs = ()
             self.num_written_in_graph += 1
 

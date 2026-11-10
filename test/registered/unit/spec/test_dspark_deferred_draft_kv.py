@@ -127,7 +127,6 @@ class TestDeferredCommit(CustomTestCase):
                 deferred_draft_kv.note_staged(reqs)
                 deferred_draft_kv.before_draft_forward(graph_bs=graph_bs, reqs=reqs)
                 self.assertEqual(len(injector.stores), int(flushes))
-                deferred_draft_kv.after_draft_forward(graph_ran=graph_bs is not None)
                 self.assertFalse(deferred_draft_kv.pending)
 
     def test_only_rows_of_the_requests_the_draft_carries_are_written(self):

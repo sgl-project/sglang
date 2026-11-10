@@ -670,9 +670,8 @@ class DraftBlockProposer:
             )
         with torch.inference_mode():
             draft_out = self.draft_model_runner.forward(draft_forward_batch)
-        if deferred_draft_kv is not None:
-            assert draft_out.can_run_graph == runs_graph
-            deferred_draft_kv.after_draft_forward(graph_ran=draft_out.can_run_graph)
+        # The deferred store took runs_graph for whether the graph writes its staging.
+        assert deferred_draft_kv is None or draft_out.can_run_graph == runs_graph
         logits_output = draft_out.logits_output
         raw_hidden = logits_output.hidden_states
         if raw_hidden is None:
