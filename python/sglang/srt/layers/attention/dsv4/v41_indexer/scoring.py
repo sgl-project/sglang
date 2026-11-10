@@ -380,12 +380,9 @@ _TORCH_SCORE_BUDGET_BYTES = 1 << 30
 
 
 def _prefill_score_budget_bytes(default: int) -> int:
-    budget = envs.SGLANG_DSV41_PREFILL_SCORE_BUDGET_MIB.get()
-    if budget is None:
-        return default
-    if budget <= 0:
-        raise ValueError("SGLANG_DSV41_PREFILL_SCORE_BUDGET_MIB must be positive")
-    return budget << 20
+    if envs.SGLANG_OPT_DSV41_LARGE_PREFILL_SCORE_BUDGET.get():
+        return 2 << 30
+    return default
 
 
 class RequestScores(msgspec.Struct, frozen=True):
