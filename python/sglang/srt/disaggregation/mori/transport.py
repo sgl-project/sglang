@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from typing import Dict, List, Optional, Sequence
 
 import numpy as np
@@ -47,6 +48,14 @@ class MoriHandle(Handle):
         self.transfer_status = transfer_status
 
 
+class _ConvertedRanges(threading.local):
+    # The ranges array this thread last converted for batch_write, a copy of its
+    # values to catch an in-place change, and the converted lists.
+    ranges: Optional[np.ndarray] = None
+    snapshot: Optional[np.ndarray] = None
+    lists: Optional[List[List[int]]] = None
+
+
 class MoriTransport(Transport):
     """Transport over a Mori IOEngine made by create().
 
@@ -60,6 +69,9 @@ class MoriTransport(Transport):
         self._engine_desc = engine.get_engine_desc()
         # The MemoryDesc each key is registered with; None for a zero-length key.
         self._registrations: Dict[BufferKey, Optional[MemoryDesc]] = {}
+        # The protocol writes one ranges array to every layer, and Mori offsets
+        # are relative to each buffer, so the lists converted from it are reused.
+        self._converted = _ConvertedRanges()
 
     @classmethod
     def create(
@@ -165,15 +177,28 @@ class MoriTransport(Transport):
         """Post the copies in one batch_write, with a transfer uid and a handle
         per copy."""
         uids = [self._engine.allocate_transfer_uid() for _ in copies]
+        lists = [self._batch_lists(c.ranges) for c in copies]
         statuses = self._engine.batch_write(
             [self._registrations[c.src] for c in copies],
-            [c.ranges[:, 0].tolist() for c in copies],
+            [src_offsets for src_offsets, _, _ in lists],
             [remote.descs[c.dst] for c in copies],
-            [c.ranges[:, 1].tolist() for c in copies],
-            [c.ranges[:, 2].tolist() for c in copies],
+            [dst_offsets for _, dst_offsets, _ in lists],
+            [lengths for _, _, lengths in lists],
             uids,
         )
         return [MoriHandle(status) for status in statuses]
+
+    def _batch_lists(self, ranges: np.ndarray) -> List[List[int]]:
+        """ranges.T.tolist(), reusing this thread's last conversion when the same
+        array comes back unchanged."""
+        converted = self._converted
+        if converted.ranges is not ranges or not np.array_equal(
+            ranges, converted.snapshot
+        ):
+            converted.ranges = ranges
+            converted.snapshot = ranges.copy()
+            converted.lists = ranges.T.tolist()
+        return converted.lists
 
     def status(self, handle: MoriHandle) -> Result:
         status = handle.transfer_status
