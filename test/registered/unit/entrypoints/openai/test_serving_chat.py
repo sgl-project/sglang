@@ -2808,6 +2808,38 @@ class ServingChatTestCase(CustomTestCase):
         self.assertEqual(result.prompt_ids, [7, 8, 9])
         self.assertEqual(result.image_data[0].url, "image-1")
 
+    def test_kimi_k3_video_takes_its_ordered_media_slot(self):
+        self.template_manager.chat_template_name = None
+        self.chat.chat_encoding_spec = "kimi_k3"
+        self.tm.model_config.is_multimodal = True
+        self.tm.tokenizer.apply_chat_template.return_value = [7, 8, 9]
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": "image-1"}},
+                        {"type": "video_url", "video_url": {"url": "video-1"}},
+                        {"type": "text", "text": "Compare them."},
+                    ],
+                }
+            ],
+        )
+
+        result = self.chat._process_messages(request, is_multimodal=True)
+
+        call = self.tm.tokenizer.apply_chat_template.call_args
+        self.assertEqual(
+            call.kwargs["image_prompts"], ["<|media_pad|>", "<|media_content|>"]
+        )
+        self.assertEqual(
+            [part["type"] for part in call.args[0][0]["content"]],
+            ["image_url", "image_url", "text"],
+        )
+        self.assertEqual(result.image_data[0].url, "image-1")
+        self.assertEqual(result.video_data, ["video-1"])
+
     def test_kimi_k3_neutralizes_text_only_assistant_history(self):
         self.template_manager.chat_template_name = None
         self.chat.chat_encoding_spec = "kimi_k3"

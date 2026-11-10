@@ -265,6 +265,11 @@ def _extract_max_dynamic_patch(request: ChatCompletionRequest):
 KIMI_K3_IMAGE_PLACEHOLDER = "<|kimi_image_placeholder|>"
 KIMI_K3_IMAGE_PLACEHOLDER_ESCAPED = "<| kimi_image_placeholder |>"
 
+# Kimi has no dedicated video padding token, so we use "<|media_content|>" instead.
+# This must match in multimodal/processors/kimi_k3.py
+KIMI_K3_IMAGE_SLOT = "<|media_pad|>"
+KIMI_K3_VIDEO_SLOT = "<|media_content|>"
+
 
 def neutralize_kimi_k3_image_placeholder(text: str) -> str:
     return text.replace(KIMI_K3_IMAGE_PLACEHOLDER, KIMI_K3_IMAGE_PLACEHOLDER_ESCAPED)
@@ -716,8 +721,8 @@ class OpenAIServingChat(OpenAIServingBase):
         self,
         messages: list[dict[str, Any]],
         request: ChatCompletionRequest,
-    ) -> tuple[list[dict[str, Any]], int, str | None]:
-        image_count = 0
+    ) -> tuple[list[dict[str, Any]], list[str], str | None]:
+        image_prompts = []
         for index, message in enumerate(messages):
             content = message.get("content")
             if isinstance(content, list):
@@ -740,7 +745,11 @@ class OpenAIServingChat(OpenAIServingBase):
                         if isinstance(image, str):
                             image = {"url": image, "detail": part.get("detail")}
                         parts.append({"type": "image_url", "image_url": image})
-                        image_count += 1
+                        image_prompts.append(KIMI_K3_IMAGE_SLOT)
+                    elif part_type == "video_url":
+                        # The encoder renders each media part as an image slot.
+                        parts.append({"type": "image_url", "image_url": {"url": ""}})
+                        image_prompts.append(KIMI_K3_VIDEO_SLOT)
                 message["content"] = parts
             elif isinstance(content, str):
                 message["content"] = neutralize_kimi_k3_image_placeholder(content)
@@ -784,7 +793,7 @@ class OpenAIServingChat(OpenAIServingBase):
             messages, assistant_prefix = self._handle_last_assistant_message(
                 messages, request
             )
-        return messages, image_count, assistant_prefix
+        return messages, image_prompts, assistant_prefix
 
     def _encode_messages(
         self,
@@ -808,15 +817,15 @@ class OpenAIServingChat(OpenAIServingBase):
                 image_data=image_data,
             )
         if self.chat_encoding_spec == "kimi_k3":
-            messages, image_count, assistant_prefix = self._prepare_kimi_k3_messages(
+            messages, image_prompts, assistant_prefix = self._prepare_kimi_k3_messages(
                 messages, request
             )
             template_kwargs = dict(request.chat_template_kwargs or {})
             template_kwargs.pop("tokenize", None)
             template_kwargs.pop("return_dict", None)
             template_kwargs.pop("image_prompts", None)
-            if image_count:
-                template_kwargs["image_prompts"] = ["<|media_pad|>"] * image_count
+            if image_prompts:
+                template_kwargs["image_prompts"] = image_prompts
 
             supported_efforts = ("low", "high", "max")
             if self.tokenizer_manager.model_config.hf_config.model_type == "kimi_k31":
