@@ -1,4 +1,5 @@
-"""DFlash MLA drafts on real MLA backends, bidirectional and causal, eager and graph."""
+"""DFlash MLA drafts on real MLA backends, bidirectional and causal, eager and graph,
+and sliding-window layers on the window backends."""
 
 import copy
 import math
@@ -31,6 +32,10 @@ register_cuda_ci(est_time=40, stage="base-b", runner_config="4-gpu-b200")
 HIDDEN, HEADS, RANK, NOPE, ROPE, VALUE, BLOCK = 128, 32, 512, 128, 64, 128, 8
 CAPACITY = 256
 BACKENDS = ("triton", "flashinfer")
+WINDOW_BACKENDS = ("triton", "trtllm_mla", "cutedsl_mla")
+# HF sliding_window counts the query token: row p attends [p - 15, p], which
+# drops keys of the 31- and 63-token prefixes.
+SLIDING_WINDOW = 16
 
 
 def _rope(x, positions):
@@ -43,7 +48,7 @@ def _rope(x, positions):
     return x * cos[:, None] + torch.stack((-b, a), -1).flatten(-2) * sin[:, None]
 
 
-def _expanded_reference(module, prefix, hidden, positions, *, causal):
+def _expanded_reference(module, prefix, hidden, positions, *, causal, window_left=None):
     """Independent FP32 SpecForge equations with per-head K and V."""
     w = {name: p.float() for name, p in module.named_parameters()}
 
@@ -70,10 +75,11 @@ def _expanded_reference(module, prefix, hidden, positions, *, causal):
         k = torch.cat((k_nope, k_pe.expand(-1, HEADS, -1)), -1)
         scores = torch.einsum("qhd,khd->hqk", q[i * BLOCK : (i + 1) * BLOCK], k)
         if causal:
-            allowed = (
-                torch.arange(len(x), device=x.device)[None]
-                <= (len(ctx) + torch.arange(BLOCK, device=x.device))[:, None]
-            )
+            keys = torch.arange(len(x), device=x.device)[None]
+            rows = (len(ctx) + torch.arange(BLOCK, device=x.device))[:, None]
+            allowed = keys <= rows
+            if window_left is not None:
+                allowed &= keys >= rows - window_left
             scores.masked_fill_(~allowed[None], -torch.inf)
         probs = (scores * (NOPE + ROPE) ** -0.5).softmax(-1)
         output = torch.einsum("hqk,khd->qhd", probs, v).flatten(1)
@@ -142,8 +148,9 @@ class TestDFlashMLABackends(unittest.TestCase):
         backend.decode_attention_backend_str = backend_name
         return backend
 
-    def _check(self, backend_name, *, causal):
+    def _check(self, backend_name, *, causal, sliding_window=None):
         torch.manual_seed(20261016)
+        window_left = None if sliding_window is None else sliding_window - 1
         config = Qwen3Config(
             hidden_size=HIDDEN,
             num_hidden_layers=1,
@@ -157,10 +164,16 @@ class TestDFlashMLABackends(unittest.TestCase):
             rope_theta=10000,
             max_position_embeddings=CAPACITY,
             is_causal=causal,
-            layer_types=["full_attention"],
+            layer_types=[
+                "full_attention" if sliding_window is None else "sliding_attention"
+            ],
+            use_sliding_window=sliding_window is not None,
+            sliding_window=sliding_window,
             dflash_config={"attention_mode": "mla", "block_size": BLOCK},
         )
         runner = self._make_runner(backend_name, config)
+        # As ModelRunner sets it from the draft's layers.
+        runner.sliding_window_size = window_left
         module = DFlashMLAAttention(config, layer_id=0)
         # get_rope() shares one cached instance, and the CUDA RoPE kernel reads
         # an FP32 table that Module.to would round to BF16.
@@ -225,7 +238,12 @@ class TestDFlashMLABackends(unittest.TestCase):
                         ].long(),
                     )
             expected = _expanded_reference(
-                module, prefix, hidden, batch.positions, causal=causal
+                module,
+                prefix,
+                hidden,
+                batch.positions,
+                causal=causal,
+                window_left=window_left,
             )
             return batch, hidden, expected
 
@@ -279,6 +297,11 @@ class TestDFlashMLABackends(unittest.TestCase):
 
     def test_causal(self):
         self._check_backends(causal=True)
+
+    def test_sliding_window(self):
+        for backend_name in WINDOW_BACKENDS:
+            with self.subTest(backend=backend_name):
+                self._check(backend_name, causal=True, sliding_window=SLIDING_WINDOW)
 
 
 if __name__ == "__main__":
