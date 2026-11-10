@@ -21,7 +21,7 @@ from sglang.srt.layers.attention.linear.kda_backend import (
 )
 from sglang.srt.layers.attention.linear.utils import LinearAttnKernelBackend
 from sglang.srt.mem_cache.memory_pool import MambaPool
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import override_platform
 from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
@@ -107,8 +107,9 @@ class TestKDAFusedVerifyBackend(CustomTestCase):
             slots = perm.to(device="cuda", dtype=torch.int32)
         batch = SimpleNamespace(
             forward_mode=ForwardMode.TARGET_VERIFY,
+            ragged_verify_layout=None,
             req_pool_indices=torch.arange(batch_size, device="cuda", dtype=torch.int32),
-            spec_info=SimpleNamespace(draft_token_num=steps, ragged_verify_layout=None),
+            spec_info=SimpleNamespace(draft_token_num=steps),
         )
         rounds = [
             [
@@ -151,12 +152,14 @@ class TestKDAFusedVerifyBackend(CustomTestCase):
         # Only the model/pool setup is a fixture. Verify, dispatch, ring fold and
         # conv rollback below all use the production backend and GPU kernels.
         backend = KDAAttnBackend.__new__(KDAAttnBackend)
-        backend.req_to_token_pool = SimpleNamespace(
-            size=state.temporal.shape[1],
-            mamba2_layer_cache=state.at_layer_idx,
+        backend.state_layer_cache = state.at_layer_idx
+        backend.state_pool = SimpleNamespace(
+            replayssm_is_kda=ring,
+            replayssm_request_ring=False,
+            enable_linear_replayssm=False,
             get_speculative_mamba2_params_all_layers=lambda: state,
-            mamba_pool=SimpleNamespace(replayssm_is_kda=ring),
         )
+        backend.req_to_token_pool = SimpleNamespace(size=state.temporal.shape[1])
         backend.forward_metadata = SimpleNamespace(
             query_start_loc=torch.arange(
                 slots.numel() + 1, device="cuda", dtype=torch.int32

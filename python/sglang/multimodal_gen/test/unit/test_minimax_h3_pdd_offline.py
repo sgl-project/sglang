@@ -201,6 +201,37 @@ class TestMiniMaxH3PDDOffline(CustomTestCase):
                 index,
             )
 
+    def test_fc1_delta_is_merged_into_native_gate_value_rows(self):
+        """The LoRA's fc1 delta comes in the Diffusers [value, gate] row order; merged
+        unswapped, the gate delta lands on the native value rows and vice versa."""
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            base = root / "base"
+            base.mkdir()
+            weight_name = "blocks.0.mlp.fc1.weight"
+            save_file({weight_name: torch.zeros(4, 3)}, str(base / "model.safetensors"))
+            lora_up = torch.arange(4, dtype=torch.float32).reshape(4, 1)
+            lora_down = torch.ones(1, 3)
+            lora = {
+                "transformer_blocks.0.ff.net.0.proj.lora_down": lora_down,
+                "transformer_blocks.0.ff.net.0.proj.lora_up": lora_up,
+            }
+            for key, value in _make_heads().items():
+                lora[
+                    key.replace("video_out", "proj_out").replace(
+                        "audio_out", "audio_proj_out"
+                    )
+                ] = value
+            lora_path = root / "lora.safetensors"
+            save_file(lora, str(lora_path), metadata={"lora_rank": "1"})
+            out = root / "out"
+            build.main([str(base), str(lora_path), str(out)])
+            value, gate = (lora_up @ lora_down).chunk(2)
+            torch.testing.assert_close(
+                load_file(str(out / "transformer" / "model.safetensors"))[weight_name],
+                torch.cat((gate, value)),
+            )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=3)

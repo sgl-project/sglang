@@ -40,6 +40,9 @@ _capture_lora_variant: Optional[str] = None
 # Attention execution variant active through metadata preparation and capture.
 _capture_attention_variant: Optional[str] = None
 
+# Target-verify logits format being captured; None = the processor's single format.
+_capture_logits_variant: Optional[str] = None
+
 
 def get_is_capture_mode() -> bool:
     return is_capture_mode or is_in_breakable_cuda_graph()
@@ -80,6 +83,21 @@ def capture_lora_variant(variant: Optional[str]):
 
 def get_capture_attention_variant() -> Optional[str]:
     return _capture_attention_variant
+
+
+def get_capture_logits_variant() -> Optional[str]:
+    return _capture_logits_variant
+
+
+@contextmanager
+def capture_logits_variant(variant: Optional[str]):
+    global _capture_logits_variant
+    previous = _capture_logits_variant
+    _capture_logits_variant = variant
+    try:
+        yield
+    finally:
+        _capture_logits_variant = previous
 
 
 def skip_low_ratio_indexer(compress_ratio: int) -> bool:
