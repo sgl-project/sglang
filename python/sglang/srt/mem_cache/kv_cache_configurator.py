@@ -2759,6 +2759,44 @@ class KVCacheConfigurator:
 
         return draft_kv_ring_enabled()
 
+    def _dflash_draft_kv_ring_bytes(self) -> int:
+        """The draft runner's KV ring, charged to the target's budget like the
+        other per-request fixed pools: rows for every req pool row (+1: the
+        pool's padding slot) and the pool's padding page."""
+        if self.is_draft_worker or not self.spec_algorithm.is_dflash():
+            return 0
+        from sglang.srt.speculative.dflash_draft_ring import (
+            draft_kv_ring_enabled,
+            draft_kv_ring_pool_rows,
+            draft_kv_ring_rows_per_req,
+            draft_kv_ring_window_left,
+        )
+
+        draft_model_config = self.spec_aux_config.draft_model_config
+        cell_size = self.dflash_draft_cell_size_per_token
+        if not draft_kv_ring_enabled() or draft_model_config is None or not cell_size:
+            return 0
+        rows_per_req = draft_kv_ring_rows_per_req(
+            window_left=draft_kv_ring_window_left(draft_model_config.hf_config),
+            block_size=int(get_spec().speculative_num_draft_tokens),
+            dcp_size=get_parallel().attn_dcp_size,
+        )
+        max_num_reqs = max(1, get_schedule().max_running_requests // self.attn_dp_size)
+        page_size = get_schedule().page_size * self.dflash_draft_loc_space_scale
+        rows = draft_kv_ring_pool_rows(
+            req_pool_rows=self._req_pool_rows(max_num_reqs) + 1,
+            rows_per_req=rows_per_req,
+            page_size=page_size,
+        )
+        ring_bytes = (rows + page_size) * int(cell_size)
+        logger.info(
+            "DFLASH draft KV ring: %d rows per request, %.2f GB charged to the KV "
+            "budget.",
+            rows_per_req,
+            ring_bytes / (1 << 30),
+        )
+        return ring_bytes
+
     def _hybrid_full_attention_pool_class(
         self, *, mha_pool_class: type, mla_pool_class: type, dsa_pool_class: type
     ) -> type:
@@ -3083,6 +3121,7 @@ class KVCacheConfigurator:
         rest_memory = available_gpu_memory - slack_gb - mm_reservation_gb
         if self.mambaish_config is not None and not get_memory().enable_unified_memory:
             rest_memory = self._handle_max_mamba_cache(rest_memory)
+        rest_memory -= self._dflash_draft_kv_ring_bytes() / (1 << 30)
 
         # Loaded weights (target + draft) can exceed the static budget
         if rest_memory <= 0:

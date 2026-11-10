@@ -142,7 +142,8 @@ logger = logging.getLogger(__name__)
 
 def _has_dflash_draft_kv(kvc: KVCacheConfigurator) -> bool:
     """Whether the target's per-token budget carries a draft KV row. A DFLASH
-    draft KV ring is a small fixed pool instead, so it charges nothing here."""
+    draft KV ring is a fixed pool instead, charged before token sizing
+    (KVCacheConfigurator._dflash_draft_kv_ring_bytes)."""
     from sglang.srt.speculative.dflash_draft_ring import draft_kv_ring_enabled
 
     return (
