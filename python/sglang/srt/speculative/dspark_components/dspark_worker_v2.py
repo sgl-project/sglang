@@ -48,8 +48,8 @@ from sglang.srt.speculative.dspark_components.dspark_config import (
     draft_uses_compressed_kv_attention,
     resolve_runtime_config,
 )
-from sglang.srt.speculative.dspark_components.dspark_deferred_commit import (
-    DeferredContextCommit,
+from sglang.srt.speculative.dspark_components.dspark_deferred_draft_kv import (
+    DeferredDraftKVStore,
     defer_context_kv_refusal,
 )
 from sglang.srt.speculative.dspark_components.dspark_draft import (
@@ -427,7 +427,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 fused_accept_tail=envs.SGLANG_DSPARK_FUSED_ACCEPT_TAIL.get(),
                 accept_tail_min_bs=envs.SGLANG_DSPARK_ACCEPT_TAIL_MIN_BS.get(),
                 accept_tail_max_bs=envs.SGLANG_DSPARK_ACCEPT_TAIL_MAX_BS.get(),
-                deferred_commit=self._maybe_build_deferred_commit(
+                deferred_draft_kv=self._maybe_build_deferred_draft_kv(
                     static_epilogue_supported
                 ),
                 post_fold=(
@@ -615,14 +615,14 @@ class DSparkWorkerV2(BaseSpecWorker):
                             make_draft_sampler_capture_hook(self._draft_sampler)
                         )
                 self._proposer.attach_draft_sampler(self._draft_sampler)
-            commit = self._deferred_commit()
-            if commit is not None:
-                self._wire_deferred_commit(commit)
+            deferred_draft_kv = self._deferred_draft_kv()
+            if deferred_draft_kv is not None:
+                self._wire_deferred_draft_kv(deferred_draft_kv)
             self._draft_worker.init_cuda_graphs(
                 capture_decode_cuda_graph=capture_decode_cuda_graph
             )
-            if commit is not None:
-                commit.disarm()
+            if deferred_draft_kv is not None:
+                deferred_draft_kv.disarm()
 
     def _defer_context_kv_eligible(self, static_epilogue_supported: bool) -> bool:
         """SGLANG_DSPARK_DEFER_CONTEXT_KV: only where nothing moves or reads draft KV
@@ -646,19 +646,19 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
         if refusal:
             logger.warning(
-                "SGLANG_DSPARK_DEFER_CONTEXT_KV refused, the commit stays in the "
-                "verify graph: %s",
+                "SGLANG_DSPARK_DEFER_CONTEXT_KV refused, the draft KV store stays "
+                "in the verify graph: %s",
                 refusal,
             )
             return False
         return True
 
-    def _maybe_build_deferred_commit(
+    def _maybe_build_deferred_draft_kv(
         self, static_epilogue_supported: bool
-    ) -> Optional[DeferredContextCommit]:
+    ) -> Optional[DeferredDraftKVStore]:
         if not self._defer_context_kv_eligible(static_epilogue_supported):
             return None
-        commit = DeferredContextCommit(
+        deferred_draft_kv = DeferredDraftKVStore(
             max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
             stride=self.verify_num_draft_tokens,
             device=self.device,
@@ -667,15 +667,15 @@ class DSparkWorkerV2(BaseSpecWorker):
         # The target's logits processor: SGLang's forward and a megakernel's head
         # both call it, with the DSpark hidden, once the hidden is final.
         self.model_runner.model.logits_processor.register_forward_pre_hook(
-            commit.logits_pre_hook, with_kwargs=True
+            deferred_draft_kv.logits_pre_hook, with_kwargs=True
         )
-        return commit
+        return deferred_draft_kv
 
-    def _deferred_commit(self):
+    def _deferred_draft_kv(self):
         epilogue = self._verify_epilogue
-        return None if epilogue is None else epilogue.deferred_commit
+        return None if epilogue is None else epilogue.deferred_draft_kv
 
-    def _wire_deferred_commit(self, commit) -> None:
+    def _wire_deferred_draft_kv(self, deferred_draft_kv) -> None:
         """Draft side of SGLANG_DSPARK_DEFER_CONTEXT_KV: the draft graph forks the
         staged write at its head and its first KV store joins it."""
         from sglang.srt.layers.attention.deepseek_v4_backend import (
@@ -683,17 +683,19 @@ class DSparkWorkerV2(BaseSpecWorker):
             DeepseekV4MultiStepBackend,
         )
 
-        self._proposer.deferred_commit = commit
-        self.draft_model_runner.capture_head_hooks.append(commit.capture_head_hook)
+        self._proposer.deferred_draft_kv = deferred_draft_kv
+        self.draft_model_runner.capture_head_hooks.append(
+            deferred_draft_kv.capture_head_hook
+        )
         backend = self.draft_model_runner.attn_backend
         backends = [backend]
         if isinstance(backend, DeepseekV4MultiStepBackend):
             backends.extend(backend.attn_backends)
         for b in backends:
             if isinstance(b, DeepseekV4AttnBackend):
-                b.pre_kv_store_hook = commit.join
+                b.pre_kv_store_hook = deferred_draft_kv.join
         logger.info(
-            "SGLANG_DSPARK_DEFER_CONTEXT_KV: the draft context-KV commit runs at the "
+            "SGLANG_DSPARK_DEFER_CONTEXT_KV: the draft KV store runs at the "
             "head of the next draft graph, joined at its first KV store."
         )
 
@@ -719,9 +721,9 @@ class DSparkWorkerV2(BaseSpecWorker):
         if not self._hosts_draft:
             return
         # The staged rows' slots were just freed.
-        commit = self._deferred_commit()
-        if commit is not None:
-            commit.disarm()
+        deferred_draft_kv = self._deferred_draft_kv()
+        if deferred_draft_kv is not None:
+            deferred_draft_kv.disarm()
 
     def set_dspark_forced_budget_frac(self, frac: Optional[float]) -> None:
         if not self._hosts_draft:
@@ -1244,9 +1246,9 @@ class DSparkWorkerV2(BaseSpecWorker):
                 draft_tokens=draft_tokens,
                 simulate_bonus_sampling_info=simulate_bonus_sampling_info,
             )
-        commit = self._deferred_commit()
-        if graph_accept and commit is not None:
-            commit.note_static_verify(batch.reqs)
+        deferred_draft_kv = self._deferred_draft_kv()
+        if graph_accept and deferred_draft_kv is not None:
+            deferred_draft_kv.note_static_verify(batch.reqs)
         if watermark_rows is not None:
             self.target_worker.model_runner.watermark_state.commit_speculative_chain(
                 req_pool_indices=batch.req_pool_indices,

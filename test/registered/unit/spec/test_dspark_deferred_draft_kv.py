@@ -1,4 +1,4 @@
-"""SGLANG_DSPARK_DEFER_CONTEXT_KV: the staged draft context-KV stores replay exactly the
+"""SGLANG_DSPARK_DEFER_CONTEXT_KV: the staged draft KV stores replay exactly the
 stores the static verify graph would have run (same projected KV, same locations from
 the same commit lengths), once, and run before any draft forward that would not run
 them itself (eager, a graph without the fork, or a graph whose rows miss staged ones),
@@ -11,8 +11,8 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.speculative.dspark_components.dspark_deferred_commit import (
-    DeferredContextCommit,
+from sglang.srt.speculative.dspark_components.dspark_deferred_draft_kv import (
+    DeferredDraftKVStore,
 )
 from sglang.srt.speculative.dspark_components.dspark_verify import (
     CommitInjectCtx,
@@ -62,25 +62,25 @@ class _Injector:
         self.inline.append(kw)
 
 
-def _commit(injector, device="cpu"):
-    commit = DeferredContextCommit(
+def _deferred_draft_kv(injector, device="cpu"):
+    deferred_draft_kv = DeferredDraftKVStore(
         max_bs=MAX_BS, stride=STRIDE, device=device, kv_injector=injector
     )
     # What the forked projection leaves: per-stage KV of the verify rows.
-    commit.kvs = [
+    deferred_draft_kv.kvs = [
         torch.randn(MAX_BS * STRIDE, KV_WIDTH, device=device) for _ in range(3)
     ]
-    return commit
+    return deferred_draft_kv
 
 
 def _staged_req():
     return FakeReq(retraction_count=0)
 
 
-def _stage(commit, bs):
+def _stage(deferred_draft_kv, bs):
     n = bs * STRIDE
     lens = torch.tensor([2, 1, 3][:bs], dtype=torch.int32)
-    commit.stage(
+    deferred_draft_kv.stage(
         cache_loc=torch.arange(100, 100 + n),
         positions=torch.arange(n) + 7,
         commit_lens=lens,
@@ -92,16 +92,16 @@ def _stage(commit, bs):
 class TestDeferredCommit(CustomTestCase):
     def test_write_runs_the_inline_stores_once(self):
         injector = _Injector()
-        commit = _commit(injector)
-        lens = _stage(commit, 3)
+        deferred_draft_kv = _deferred_draft_kv(injector)
+        lens = _stage(deferred_draft_kv, 3)
         reqs = [_staged_req() for _ in range(3)]
-        commit.note_static_verify(reqs)
-        commit.before_draft_forward(graph_bs=None, reqs=reqs)
+        deferred_draft_kv.note_static_verify(reqs)
+        deferred_draft_kv.before_draft_forward(graph_bs=None, reqs=reqs)
         (store,) = injector.stores
         n = MAX_BS * STRIDE
-        for got, kv in zip(store["kvs"], commit.kvs):
+        for got, kv in zip(store["kvs"], deferred_draft_kv.kvs):
             self.assertTrue(torch.equal(got, kv[:n]))
-        loc = commit.cache_loc.clone()
+        loc = deferred_draft_kv.cache_loc.clone()
         expect = injector.committed_swa_loc(
             cache_loc=loc,
             cache_loc_2d=loc.view(MAX_BS, STRIDE),
@@ -110,9 +110,9 @@ class TestDeferredCommit(CustomTestCase):
         self.assertTrue(torch.equal(store["swa_loc"], expect))
         # Requests past the staged ones store nothing.
         self.assertTrue(bool((store["swa_loc"][9:] == -1).all()))
-        self.assertFalse(commit.pending)
-        self.assertTrue(bool((commit.commit_lens == 0).all()))
-        commit.before_draft_forward(graph_bs=None, reqs=reqs)
+        self.assertFalse(deferred_draft_kv.pending)
+        self.assertTrue(bool((deferred_draft_kv.commit_lens == 0).all()))
+        deferred_draft_kv.before_draft_forward(graph_bs=None, reqs=reqs)
         self.assertEqual(len(injector.stores), 1)
 
     def test_flush_before_every_draft_forward_that_would_miss_it(self):
@@ -124,15 +124,15 @@ class TestDeferredCommit(CustomTestCase):
         ):
             with self.subTest(graph_bs=graph_bs, forked=forked, staged=staged):
                 injector = _Injector()
-                commit = _commit(injector)
-                commit._forked_bs = set(forked)
-                _stage(commit, 3)
+                deferred_draft_kv = _deferred_draft_kv(injector)
+                deferred_draft_kv._forked_bs = set(forked)
+                _stage(deferred_draft_kv, 3)
                 reqs = [_staged_req() for _ in range(staged)]
-                commit.note_static_verify(reqs)
-                commit.before_draft_forward(graph_bs=graph_bs, reqs=reqs)
+                deferred_draft_kv.note_static_verify(reqs)
+                deferred_draft_kv.before_draft_forward(graph_bs=graph_bs, reqs=reqs)
                 self.assertEqual(len(injector.stores), int(flushes))
-                commit.after_draft_forward(graph_ran=graph_bs is not None)
-                self.assertFalse(commit.pending)
+                deferred_draft_kv.after_draft_forward(graph_ran=graph_bs is not None)
+                self.assertFalse(deferred_draft_kv.pending)
 
     def test_only_rows_of_the_requests_the_draft_carries_are_written(self):
         """The draft batch is in its own order; a staged request it leaves out,
@@ -142,22 +142,26 @@ class TestDeferredCommit(CustomTestCase):
                 with self.subTest(case=case, graph_bs=graph_bs):
                     a, b, c = (_staged_req() for _ in range(3))
                     injector = _Injector()
-                    commit = _commit(injector)
-                    commit._forked_bs = {MAX_BS}
-                    _stage(commit, 3)
-                    commit.note_static_verify([a, b, c])
+                    deferred_draft_kv = _deferred_draft_kv(injector)
+                    deferred_draft_kv._forked_bs = {MAX_BS}
+                    _stage(deferred_draft_kv, 3)
+                    deferred_draft_kv.note_static_verify([a, b, c])
                     draft_reqs = [c, a]
                     if case == "readmitted":
                         b.retraction_count += 1
                         draft_reqs.append(b)
-                    commit.before_draft_forward(graph_bs=graph_bs, reqs=draft_reqs)
+                    deferred_draft_kv.before_draft_forward(
+                        graph_bs=graph_bs, reqs=draft_reqs
+                    )
                     if graph_bs is None:
                         (store,) = injector.stores
                         rows = store["swa_loc"][: 3 * STRIDE].view(3, STRIDE)
                         self.assertEqual((rows != -1).sum(dim=1).tolist(), [2, 0, 3])
                     else:
                         # What the draft graph reads when it writes the staging.
-                        self.assertEqual(commit.commit_lens.tolist()[:3], [2, 0, 3])
+                        self.assertEqual(
+                            deferred_draft_kv.commit_lens.tolist()[:3], [2, 0, 3]
+                        )
 
 
 class TestEpilogueStagesOnlyAfterItsProjection(CustomTestCase):
@@ -165,10 +169,10 @@ class TestEpilogueStagesOnlyAfterItsProjection(CustomTestCase):
         injector = _Injector()
         if ring:
             injector.swa_ring_size = 8
-        commit = _commit(injector, device)
-        commit.join_projection = lambda: projected
+        deferred_draft_kv = _deferred_draft_kv(injector, device)
+        deferred_draft_kv.join_projection = lambda: projected
         if ring:
-            commit._one_launch_stage = True
+            deferred_draft_kv._one_launch_stage = True
         epilogue = DsparkVerifyEpilogue(
             max_bs=MAX_BS,
             verify_num_draft_tokens=STRIDE,
@@ -181,7 +185,7 @@ class TestEpilogueStagesOnlyAfterItsProjection(CustomTestCase):
                 resolve_req_to_token=lambda: None,
                 kv_injector=injector,
             ),
-            deferred_commit=commit,
+            deferred_draft_kv=deferred_draft_kv,
         )
         epilogue.begin_static_step(bs, armed=True)
         torch.manual_seed(0)
@@ -200,25 +204,27 @@ class TestEpilogueStagesOnlyAfterItsProjection(CustomTestCase):
             req_pool_indices=req_pool_indices,
         )
         epilogue._static_epilogue(out, fb)
-        return injector, commit, epilogue, bs
+        return injector, deferred_draft_kv, epilogue, bs
 
     def test_projected_graph_stages_the_stores(self):
-        injector, commit, epilogue, bs = self._run(projected=True)
+        injector, deferred_draft_kv, epilogue, bs = self._run(projected=True)
         self.assertEqual(injector.inline, [])
         self.assertTrue(
             torch.equal(
-                commit.commit_lens[:bs],
+                deferred_draft_kv.commit_lens[:bs],
                 epilogue.read_accept(bs).commit_lens.to(torch.int32),
             )
         )
         self.assertTrue(
-            torch.equal(commit.cache_loc[: bs * STRIDE], torch.arange(6) + 50)
+            torch.equal(
+                deferred_draft_kv.cache_loc[: bs * STRIDE], torch.arange(6) + 50
+            )
         )
 
     def test_graph_without_projection_keeps_the_inline_commit(self):
-        injector, commit, _, _ = self._run(projected=False)
+        injector, deferred_draft_kv, _, _ = self._run(projected=False)
         self.assertEqual(len(injector.inline), 1)
-        self.assertTrue(bool((commit.commit_lens == 0).all()))
+        self.assertTrue(bool((deferred_draft_kv.commit_lens == 0).all()))
 
     @unittest.skipIf(_TRITON_DEVICE is None, "needs CUDA or TRITON_INTERPRET=1")
     def test_one_launch_stage_writes_each_request_slot_into_its_rows(self):
@@ -226,12 +232,14 @@ class TestEpilogueStagesOnlyAfterItsProjection(CustomTestCase):
         also at bs 1."""
         for bs in (1, 2):
             with self.subTest(bs=bs):
-                _, commit, _, _ = self._run(
+                _, deferred_draft_kv, _, _ = self._run(
                     projected=True, bs=bs, ring=True, device=_TRITON_DEVICE
                 )
                 want = torch.tensor([1, 2], device=_TRITON_DEVICE)[:bs]
                 want = want.repeat_interleave(STRIDE)
-                self.assertTrue(torch.equal(commit.state_slot[: bs * STRIDE], want))
+                self.assertTrue(
+                    torch.equal(deferred_draft_kv.state_slot[: bs * STRIDE], want)
+                )
 
 
 @unittest.skipIf(_TRITON_DEVICE is None, "needs CUDA or TRITON_INTERPRET=1")

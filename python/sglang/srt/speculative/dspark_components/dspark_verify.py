@@ -50,8 +50,8 @@ from sglang.srt.speculative.dflash_utils import (
     apply_dflash_verify_logits_adjustments,
     build_speculative_verify_target_probs,
 )
-from sglang.srt.speculative.dspark_components.dspark_deferred_commit import (
-    DeferredContextCommit,
+from sglang.srt.speculative.dspark_components.dspark_deferred_draft_kv import (
+    DeferredDraftKVStore,
 )
 from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResult
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
@@ -599,7 +599,7 @@ class DsparkVerifyEpilogue:
         fused_accept_tail: bool = False,
         accept_tail_min_bs: int = 1,
         accept_tail_max_bs: int = 0,
-        deferred_commit: Optional[DeferredContextCommit] = None,
+        deferred_draft_kv: Optional[DeferredDraftKVStore] = None,
         post_fold: bool = False,
     ) -> None:
         self.max_bs = int(max_bs)
@@ -608,8 +608,8 @@ class DsparkVerifyEpilogue:
         self._post_fold = bool(post_fold)
         self.future_relay: Optional[FutureRelayBuffers] = None
         # SGLANG_DSPARK_DEFER_CONTEXT_KV: static graphs join its forked projection and
-        # stage the commit's stores into it; the next draft forward runs them.
-        self.deferred_commit = deferred_commit
+        # stage its stores; the next draft forward runs them.
+        self.deferred_draft_kv = deferred_draft_kv
         # SGLANG_SIMULATE_ACC_LEN with a sampled bonus inside the graph too: the bonus
         # is drawn at the simulated correct_len from these buffers, which
         # begin_sim_bonus writes before replay (<= 0 temperature: argmax).
@@ -781,9 +781,11 @@ class DsparkVerifyEpilogue:
                 .reshape(-1)
                 .contiguous()
             )
-        commit = self.deferred_commit
-        if commit is not None and (kv_projected or commit.join_projection()):
-            commit.stage(
+        deferred_draft_kv = self.deferred_draft_kv
+        if deferred_draft_kv is not None and (
+            kv_projected or deferred_draft_kv.join_projection()
+        ):
+            deferred_draft_kv.stage(
                 cache_loc=cache_loc,
                 positions=io.positions,
                 commit_lens=gated_commit_lens,

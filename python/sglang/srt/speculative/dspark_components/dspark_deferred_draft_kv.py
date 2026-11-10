@@ -1,7 +1,7 @@
-"""The draft context-KV commit of a static verify, split around the accept
+"""The draft KV store of a static verify's committed tokens, split around the accept
 (SGLANG_DSPARK_DEFER_CONTEXT_KV).
 
-The commit projects the committed rows' target hidden into each draft stage's KV
+It projects the committed rows' target hidden into each draft stage's KV
 (GEMMs, independent of the accept) and stores the committed rows (needs the accept's
 commit lengths). In a static verify graph the projection is forked onto a side stream
 at the target's logits processor (a forward pre-hook, which SGLang's forward and a
@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 _LOG_EVERY = 4096
 
 
-class DeferredContextCommit:
+class DeferredDraftKVStore:
     def __init__(
         self,
         *,
@@ -222,7 +222,7 @@ class DeferredContextCommit:
         self._draft_forwards += 1
         if self._draft_forwards % _LOG_EVERY == 0:
             logger.debug(
-                "DSpark deferred context-KV commit: %d written in draft graphs, "
+                "DSpark deferred draft KV store: %d written in draft graphs, "
                 "%d eagerly %s",
                 self.num_written_in_graph,
                 self.num_written_eagerly,
@@ -262,7 +262,7 @@ class DeferredContextCommit:
         self._fork_unjoined = True
         self._forked_bs.add(bs)
         logger.info(
-            "DSpark draft graph bs=%d: deferred context-KV commit forked at its head",
+            "DSpark draft graph bs=%d: deferred draft KV store forked at its head",
             bs,
         )
 
@@ -272,7 +272,7 @@ class DeferredContextCommit:
             torch.cuda.current_stream().wait_event(self._store_done)
             self._fork_unjoined = False
             logger.info(
-                "DSpark draft graph: deferred context-KV commit joined at the first KV store"
+                "DSpark draft graph: deferred draft KV store joined at the first KV store"
             )
 
     def disarm(self) -> None:
@@ -297,7 +297,7 @@ def defer_context_kv_refusal(
     disaggregated: bool,
     attn_dp: bool,
 ) -> str:
-    """Why the deferred commit cannot run here, or ""."""
+    """Why the deferred draft KV store cannot run here, or ""."""
     reasons = (
         (not static_verify, "the verify is not static (SGLANG_RAGGED_VERIFY_MODE)"),
         (not draft_is_moe, "the draft has no MoE layers"),
