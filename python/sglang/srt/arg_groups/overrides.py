@@ -469,15 +469,37 @@ def _mamba_radix_cache_resolution(view: Any) -> dict:
 
     declared: Dict[str, Any] = {"uses_mamba_radix_cache": True}
     if view.mamba_radix_cache_strategy == "auto":
+        # A deterministic run must not depend on what ran before it. The
+        # ``extra_buffer`` strategy restores a donated Mamba checkpoint whose
+        # recurrent state came from a differently shaped prefill and crossed a
+        # BF16 boundary, so a radix hit is not bit-exact with a cold prefill
+        # (#47213). Fall back to ``no_buffer``, which replays the prefix.
         wants_overlap = not view.disable_overlap_schedule
         wants_paging = view.page_size is not None and view.page_size > 1
-        if (wants_overlap or wants_paging) and supports_mamba_cache_extra_buffer(
-            view, hf_config
+        if (
+            (wants_overlap or wants_paging)
+            and not view.enable_deterministic_inference
+            and supports_mamba_cache_extra_buffer(view, hf_config)
         ):
             declared["mamba_radix_cache_strategy"] = "extra_buffer"
         else:
             declared["mamba_radix_cache_strategy"] = "no_buffer"
             declared["disable_overlap_schedule"] = True
+    elif view.enable_deterministic_inference and view.mamba_radix_cache_strategy in (
+        "extra_buffer",
+        "extra_buffer_lazy",
+    ):
+        # An explicit strategy is kept, but it cannot honour the deterministic
+        # contract: cold and cache-hit logprobs diverge (#47213).
+        logger.warning(
+            "Deterministic inference is not bit-exact with "
+            "--mamba-radix-cache-strategy %s on %s: a cache hit restores donated "
+            "Mamba state, so cold and cache-hit logprobs differ even at "
+            "temperature 0 (#47213). Pass --mamba-radix-cache-strategy no_buffer "
+            "to replay the prefix instead.",
+            view.mamba_radix_cache_strategy,
+            hf_config.architectures[0],
+        )
     return declared
 
 
