@@ -1062,7 +1062,8 @@ class Envs:
     # stays accuracy-gated and default OFF.
     SGLANG_ENABLE_DP_GATHER_FP8 = EnvBool(False)
     SGLANG_USE_AITER_UNIFIED_ATTN = EnvBool(False)
-    # GDN prefill causal conv1d on aiter's FlyDSL kernel instead of Triton; needs SGLANG_USE_AITER.
+    # GDN prefill causal conv1d on aiter's FlyDSL kernel instead of Triton;
+    # needs SGLANG_USE_AITER and a gfx950 GPU.
     SGLANG_AITER_GDN_CONV = EnvBool(False)
     # Select the gate/up tile layout for AITER MoE: True -> interleave
     # (matches FlyDSL `gate_mode="interleave"` kernels), False -> separated

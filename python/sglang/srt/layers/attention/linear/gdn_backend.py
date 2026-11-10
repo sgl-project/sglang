@@ -55,7 +55,7 @@ from sglang.srt.runtime_context import (
     get_schedule,
     mamba_cache_chunk_size,
 )
-from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu, is_xpu
+from sglang.srt.utils import is_cpu, is_cuda, is_gfx95_supported, is_hip, is_npu, is_xpu
 from sglang.srt.utils.device import is_pin_memory_available
 from sglang.srt.utils.log_utils import rank0_log
 
@@ -289,15 +289,21 @@ _AITER_GDN_CONV_UNAVAILABLE = False
 def _aiter_gdn_prefill_conv():
     """AITER's FlyDSL prefill causal conv, or None if it cannot be used.
 
-    Opt-in: SGLANG_USE_AITER plus SGLANG_AITER_GDN_CONV. It implements the same
-    ``causal_conv1d_fn`` contract (one output, ``conv_states`` updated in place),
-    mapping channels to lanes instead of going through an implicit GEMM.
+    Opt-in on gfx950: SGLANG_USE_AITER plus SGLANG_AITER_GDN_CONV. It implements
+    the same ``causal_conv1d_fn`` contract (one output, ``conv_states`` updated in
+    place), mapping channels to lanes instead of going through an implicit GEMM.
     Measured on MI355X at ISL 32768 it is ~1.8x the Triton prefill convolution.
     """
     global _AITER_GDN_CONV_UNAVAILABLE
     if _AITER_GDN_CONV_UNAVAILABLE:
         return None
-    if not (envs.SGLANG_USE_AITER.get() and envs.SGLANG_AITER_GDN_CONV.get()):
+    # Validated and tuned on gfx950 (MI355X) only; other archs keep Triton.
+    if not (
+        _is_hip
+        and is_gfx95_supported()
+        and envs.SGLANG_USE_AITER.get()
+        and envs.SGLANG_AITER_GDN_CONV.get()
+    ):
         _AITER_GDN_CONV_UNAVAILABLE = True
         return None
     try:
