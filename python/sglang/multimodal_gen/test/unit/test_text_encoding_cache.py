@@ -68,6 +68,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
     TextEncodingStage,
 )
 from sglang.multimodal_gen.runtime.realtime.session import RealtimeSession
+from sglang.multimodal_gen.runtime.server_args.server_args import ServerArgs
 
 _GLOBAL_ARGS_PATCH = (
     "sglang.multimodal_gen.runtime.pipelines_core.stages.base.get_global_server_args"
@@ -244,6 +245,7 @@ def make_server_args(**kwargs):
         "model_id": None,
         "explicit_residency_mode": lambda _: None,
         "pipeline_config": SimpleNamespace(text_encoder_configs=[]),
+        "conditioning_cache_max_entries": ServerArgs.conditioning_cache_max_entries,
     }
     defaults.update(kwargs)
     return SimpleNamespace(**defaults)

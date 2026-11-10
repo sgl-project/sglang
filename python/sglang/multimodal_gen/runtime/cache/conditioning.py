@@ -297,14 +297,23 @@ def _map_output(value, tensor_fn, *, restore=False):
 class ConditioningCache:
     """One bounded cache per rank with host entries and device-hot conditioning."""
 
-    def __init__(self, max_bytes: int):
+    def __init__(self, max_bytes: int, *, max_entries: int | None = None):
         if max_bytes < 0:
             raise ValueError("conditioning cache capacity must be nonnegative")
+        if max_entries is not None and max_entries < 1:
+            raise ValueError("conditioning cache entry limit must be positive")
         _live_caches.add(self)
         self.max_bytes = max_bytes
+        # None leaves only the byte budget.
+        self.max_entries = max_entries
         self.bytes = 0
         self.hits = self.misses = self.evictions = self.bypasses = 0
+        # Least recently used first. Non-preferred keys keep the same order in
+        # _normal_keys, the only entries a non-preferred store may evict.
         self._entries = OrderedDict()
+        self._normal_keys = OrderedDict()
+        self._normal_bytes = 0
+        self._provisional_keys = set()
         self._models = weakref.WeakKeyDictionary()
         self._next_model = 0
         self._group_entries = ContextVar("conditioning_group_entries", default=None)
@@ -317,19 +326,65 @@ class ConditioningCache:
         for entry in self._entries.values():
             entry.wait()
         self._entries.clear()
-        self.bytes = 0
+        self._normal_keys.clear()
+        self._provisional_keys.clear()
+        self.bytes = self._normal_bytes = 0
+
+    def _put(self, *, key, entry):
+        if key in self._entries:
+            self._pop(key)
+        self._entries[key] = entry
+        self.bytes += entry.size
+        self._index(key=key, entry=entry)
+
+    def _pop(self, key):
+        entry = self._entries.pop(key)
+        self._unindex(key=key, entry=entry)
+        self.bytes -= entry.size
+        return entry
+
+    # Call after changing an entry's preferred/provisional flags.
+    def _reindex(self, *, key, entry):
+        self._unindex(key=key, entry=entry)
+        self._entries.move_to_end(key)
+        self._index(key=key, entry=entry)
+
+    def _index(self, *, key, entry):
+        if not entry.preferred:
+            self._normal_keys[key] = None
+            self._normal_bytes += entry.size
+            if entry.provisional:
+                self._provisional_keys.add(key)
+
+    def _unindex(self, *, key, entry):
+        if key in self._normal_keys:
+            del self._normal_keys[key]
+            self._normal_bytes -= entry.size
+        self._provisional_keys.discard(key)
+
+    # A non-preferred store may only evict non-preferred entries; False means no room.
+    def _make_room(self, *, size: int, preferred: bool) -> bool:
+        evictable = self._entries if preferred else self._normal_keys
+        evictable_bytes = self.bytes if preferred else self._normal_bytes
+        if size > self.max_bytes - self.bytes + evictable_bytes or (
+            self._entries_full() and not evictable
+        ):
+            return False
+        while evictable and (
+            self.bytes + size > self.max_bytes or self._entries_full()
+        ):
+            self._pop(next(iter(evictable))).wait()
+            self.evictions += 1
+        return True
+
+    def _entries_full(self) -> bool:
+        return self.max_entries is not None and len(self._entries) >= self.max_entries
 
     def _recycle_provisional_entries(self):
         """Free warmup-only entries so served snapshots reuse their pinned blocks
         instead of pinning fresh pages (~0.3 ms/MB). Seeded negatives stay."""
-        for key in [
-            key
-            for key, entry in self._entries.items()
-            if entry.provisional and not entry.preferred
-        ]:
-            removed = self._entries.pop(key)
-            removed.wait()
-            self.bytes -= removed.size
+        for key in list(self._provisional_keys):
+            self._pop(key).wait()
             self.evictions += 1
 
     def invalidate(self, parameters):
@@ -345,9 +400,7 @@ class ConditioningCache:
         }
         for key, entry in list(self._entries.items()):
             if entry.owner in owners:
-                entry.wait()
-                self.bytes -= entry.size
-                del self._entries[key]
+                self._pop(key).wait()
         group_entries = self._group_entries.get()
         if group_entries is not None:
             for key, entry in list(group_entries.items()):
@@ -491,7 +544,7 @@ class ConditioningCache:
                 entry.preferred |= _prefer_cache.get()
                 if not _refresh_cache.get():
                     entry.provisional = False
-                self._entries.move_to_end(key)
+                self._reindex(key=key, entry=entry)
             if group_entry is not None:
                 self.group_hits += 1
                 group_entry.wait()
@@ -511,8 +564,11 @@ class ConditioningCache:
                 else _map_output(entry.output, restore, restore=True)
             )
             if keep_on_device and not entry.device_resident:
-                self._entries[key] = _CacheEntry.snapshot(
-                    output, entry.size, entry.owner, True, True
+                self._put(
+                    key=key,
+                    entry=_CacheEntry.snapshot(
+                        output, entry.size, entry.owner, True, True
+                    ),
                 )
             self._remember_group(key, output, entry.owner, share_in_group)
             return output
@@ -545,39 +601,20 @@ class ConditioningCache:
         except Uncacheable:
             self.bypasses += 1
             return output
-        old = self._entries.pop(key, None)
-        if old is not None:
-            old.wait()
-            self.bytes -= old.size
+        if key in self._entries:
+            self._pop(key).wait()
         refresh = _refresh_cache.get()
-        if not refresh:
+        if not refresh and self._provisional_keys:
             self._recycle_provisional_entries()
         preferred = _prefer_cache.get()
-        evictable = [
-            key
-            for key, entry in self._entries.items()
-            if preferred or not entry.preferred
-        ]
-        available = (
-            self.max_bytes
-            - self.bytes
-            + sum(self._entries[key].size for key in evictable)
-        )
-        if size > available or (len(self._entries) >= 128 and not evictable):
+        if not self._make_room(size=size, preferred=preferred):
             self.bypasses += 1
             return output
-        for evicted in evictable:
-            if self.bytes + size <= self.max_bytes and len(self._entries) < 128:
-                break
-            removed = self._entries.pop(evicted)
-            removed.wait()
-            self.bytes -= removed.size
-            self.evictions += 1
-        self._entries[key] = _CacheEntry.snapshot(
+        entry = _CacheEntry.snapshot(
             output, size, self._identity(model), preferred, keep_on_device
         )
-        self._entries[key].provisional = refresh
-        self.bytes += size
+        entry.provisional = refresh
+        self._put(key=key, entry=entry)
         logger.debug(
             "Conditioning cache store: %s.%s, %d bytes",
             type(model).__name__,

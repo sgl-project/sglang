@@ -51,6 +51,7 @@ def _server_args(**overrides):
         "use_fsdp_inference": False,
         "disable_conditioning_cache": ServerArgs.disable_conditioning_cache,
         "conditioning_cache_max_size_mb": ServerArgs.conditioning_cache_max_size_mb,
+        "conditioning_cache_max_entries": ServerArgs.conditioning_cache_max_entries,
         "component_modes": {},
     }
     values.update(overrides)

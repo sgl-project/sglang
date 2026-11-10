@@ -1250,6 +1250,7 @@ def _make_sensenova_u1_sequential_entrypoint(*, fail=False, fail_request_ids=Non
         pipeline_config=SenseNovaU1PipelineConfig(),
         disable_conditioning_cache=False,
         conditioning_cache_max_size_mb=512,
+        conditioning_cache_max_entries=ServerArgs.conditioning_cache_max_entries,
         use_fsdp_inference=False,
     )
     pipeline = _SequentialTestPipeline(

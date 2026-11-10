@@ -300,7 +300,8 @@ For supported native pipelines, set `SGLANG_CACHE_DIT_ENABLED=true` to enable Ca
 Native conditioning reuse is enabled by default, independently of Cache-DiT:
 
 - `--disable-conditioning-cache`: disable cross-request text/image conditioning reuse and VAE posterior caching. Reuse within a grouped stage remains enabled.
-- `--conditioning-cache-max-size-mb {MiB}`: shared CPU and device LRU capacity per executor/rank, default `512`; `0` disables cross-request caching. Consumed negative text conditioning stays on its original device; other entries live on the CPU. The cache holds at most 128 entries and bypasses oversized outputs.
+- `--conditioning-cache-max-size-mb {MiB}`: shared CPU and device LRU capacity per executor/rank, default `512`; `0` disables cross-request caching. Consumed negative text conditioning stays on its original device; other entries live on the CPU. The cache bypasses oversized outputs.
+- `--conditioning-cache-max-entries {N}`: per-executor/rank limit on cached entries, default `4096`. It bounds bookkeeping rather than memory, so the byte capacity above normally binds first; tiled VAE encoders store one small entry per tile.
 
 See [conditioning cache](/docs/sglang-diffusion/caching-acceleration#conditioning-cache) for model coverage, invalidation, and the distinction between cold and repeated-input latency.
 
