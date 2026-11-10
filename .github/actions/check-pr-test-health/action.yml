@@ -127,7 +127,8 @@ runs:
             const failedStep = (j.steps || []).find(s => s.conclusion === 'failure');
             if (
               independentTestJobPrefix && j.name.startsWith(independentTestJobPrefix) &&
-              (failedStep?.name === 'Run diffusion suite' || failedStep?.name === 'Run test')
+              // pre-suite commands also run architecture-specific numerical tests
+              ['Run diffusion suite', 'Run pre-suite commands', 'Run test'].includes(failedStep?.name)
             ) {
               core.info(`[health-check] Collecting independent test failure: ${j.name}`);
               return false;

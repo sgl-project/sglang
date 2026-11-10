@@ -124,7 +124,13 @@ test('other callers still stop on diffusion test failures', async () => {
   assert.match(result.failures[0], /diffusion-1-gpu-5090/);
 });
 
-for (const step of ['Install dependencies', 'Run pre-suite commands', 'Run ./.github/actions/check-maintenance']) {
+test('architecture-specific pre-suite failures do not stop independent suites', async () => {
+  const result = await check({ independentTestJobPrefix: diffusionPrefix,
+    jobs: [diffusionJob('diffusion-1-gpu-b200 (0)', 'Run pre-suite commands')] });
+  assert.deepEqual(result.failures, []);
+});
+
+for (const step of ['Install dependencies', 'Run ./.github/actions/check-maintenance']) {
   test(`independent lanes still stop on setup failure: ${step}`, async () => {
     const result = await check({ independentTestJobPrefix: diffusionPrefix,
       jobs: [diffusionJob('diffusion-1-gpu-5090 (0)', step)] });
