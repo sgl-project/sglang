@@ -998,6 +998,27 @@ class TestCommonKVManagerPrefillRecompute(unittest.TestCase):
         receiver.abort.assert_not_called()
         self.assertEqual(mgr.failure_records, {})
 
+    def test_run_splits_connect_and_read_timeout(self):
+        # An unreachable prefill must fail within the short connect budget; the
+        # read budget still has to cover a full prefix recompute.
+        from sglang.srt.disaggregation.common.conn import (
+            REBOOTSTRAP_CONNECT_TIMEOUT_S,
+        )
+
+        mgr = self._new_manager()
+        session = MagicMock()
+        session.post.return_value = SimpleNamespace(status_code=200, text="")
+        mgr._prefill_recompute_sessions.session = session
+        receiver = MagicMock(bootstrap_room=7)
+
+        mgr._run_prefill_recompute(receiver, "http://prefill", self._payload())
+
+        self.assertEqual(
+            session.post.call_args.kwargs["timeout"],
+            (REBOOTSTRAP_CONNECT_TIMEOUT_S, mgr.waiting_timeout),
+        )
+        self.assertLess(REBOOTSTRAP_CONNECT_TIMEOUT_S, mgr.waiting_timeout)
+
 
 class TestDecodePrebuilt(unittest.TestCase):
     def setUp(self):

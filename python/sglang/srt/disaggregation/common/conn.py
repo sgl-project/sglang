@@ -81,6 +81,11 @@ logger = logging.getLogger(__name__)
 ABORT_TAG = b"ABORT"
 ABORT_ACK_TAG = b"ABORT_ACK"
 
+# Connect budget for the retract rebootstrap ``/generate`` POST. The read
+# budget stays at ``waiting_timeout`` because a full prefix recompute is slow,
+# but an unreachable prefill has to surface in seconds, not minutes.
+REBOOTSTRAP_CONNECT_TIMEOUT_S = 5.0
+
 
 # Reuse a keep-alive session per bootstrap_addr for decode-side bootstrap queries
 # so we don't open a fresh TCP connection per query (that churns short-lived
@@ -1372,7 +1377,7 @@ class CommonKVManager(BaseKVManager):
             response = self._get_prefill_recompute_session().post(
                 prefill_url.rstrip("/") + "/generate",
                 json=payload,
-                timeout=self.waiting_timeout,
+                timeout=(REBOOTSTRAP_CONNECT_TIMEOUT_S, self.waiting_timeout),
             )
             if response.status_code >= 400:
                 logger.error(
