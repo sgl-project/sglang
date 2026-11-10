@@ -64,6 +64,7 @@ from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
+from sglang.srt.model_executor.sparse_query import SparseQueryMetadata
 from sglang.srt.speculative.eagle_utils import draft_step_writes
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import (
@@ -94,6 +95,7 @@ if is_flashinfer_available():
         fast_decode_plan,
     )
     from flashinfer.cascade import merge_state
+    from flashinfer.quantization import packbits
 
     from sglang.kernels.ops.attention.merge_state import merge_state_triton
 
@@ -866,6 +868,8 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
+        if forward_batch.sparse_query is not None:
+            raise ValueError("Sparse query prefill currently requires eager execution")
         bs = forward_batch.batch_size
         req_pool_indices = forward_batch.req_pool_indices
         seq_lens = forward_batch.seq_lens
@@ -1121,6 +1125,22 @@ class FlashInferAttnBackend(AttentionBackend):
         return layer.k_scale, layer.v_scale
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        sparse_query = forward_batch.sparse_query
+        if sparse_query is not None and (
+            forward_batch.forward_mode != ForwardMode.EXTEND
+            or forward_batch.spec_info is not None
+            or self.num_wrappers != 1
+            or self.is_multimodal
+            or self.enable_mis
+            or self.prefill_uses_dequant_workspace
+            or self.flashinfer_kv_cache_dtype not in (torch.float16, torch.bfloat16)
+            or is_cp_active(forward_batch)
+            or is_in_tc_piecewise_cuda_graph()
+        ):
+            raise ValueError(
+                "Sparse queries require eager, non-speculative FP16/BF16 "
+                "full self-attention without context parallelism or multi-item scoring"
+            )
         if is_cp_active(forward_batch):
             self._init_forward_metadata_cp(forward_batch)
             return
@@ -1170,7 +1190,7 @@ class FlashInferAttnBackend(AttentionBackend):
             prefix_lens = forward_batch.extend_prefix_lens
 
             # Disable ragged wrapper and ensure prefix handling for multimodal and multi-item scoring
-            if self.is_multimodal or self.enable_mis:
+            if self.is_multimodal or self.enable_mis or sparse_query is not None:
                 # use_ragged = False: Multi-item scoring requires the paged wrapper because:
                 # 1. Ragged wrapper doesn't support the specialized multi-item parameters
                 #    (prefix_len_ptr, token_pos_in_items_ptr, etc.)
@@ -1213,6 +1233,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 extend_prefix_lens_cpu=forward_batch.extend_prefix_lens_cpu,
                 custom_kv_indices=self.dq_page_table,
                 plan=forward_batch.iteration_ids,
+                sparse_query=sparse_query,
             )
             self.forward_metadata = PrefillMetadata(
                 self.prefill_wrappers_paged,
@@ -2131,6 +2152,7 @@ class FlashInferIndicesUpdaterPrefill:
         custom_kv_indices: Optional[torch.Tensor] = None,
         *,
         plan: IterationIds,
+        sparse_query: Optional[SparseQueryMetadata] = None,
     ):
         # Keep the signature for type checking. It will be assigned during runtime.
         raise NotImplementedError()
@@ -2153,6 +2175,7 @@ class FlashInferIndicesUpdaterPrefill:
         custom_kv_indices: Optional[torch.Tensor] = None,
         *,
         plan: IterationIds,
+        sparse_query: Optional[SparseQueryMetadata] = None,
     ):
         if use_ragged:
             assert prefix_lens is not None
@@ -2184,6 +2207,7 @@ class FlashInferIndicesUpdaterPrefill:
             seq_lens_cpu=seq_lens_cpu,
             custom_kv_indices=custom_kv_indices,
             plan=plan,
+            sparse_query=sparse_query,
         )
 
     def update_sliding_window(
@@ -2204,6 +2228,7 @@ class FlashInferIndicesUpdaterPrefill:
         custom_kv_indices: Optional[torch.Tensor] = None,
         *,
         plan: IterationIds,
+        sparse_query: Optional[SparseQueryMetadata] = None,
     ):
         if custom_kv_indices is not None:
             raise RuntimeError(
@@ -2352,6 +2377,7 @@ class FlashInferIndicesUpdaterPrefill:
         custom_kv_indices: Optional[torch.Tensor] = None,
         *,
         plan: IterationIds,
+        sparse_query: Optional[SparseQueryMetadata] = None,
     ):
         if custom_kv_indices is not None:
             raise RuntimeError(
@@ -2413,8 +2439,10 @@ class FlashInferIndicesUpdaterPrefill:
         window: Optional[WindowRead] = None,
         *,
         plan: IterationIds,
+        sparse_query: Optional[SparseQueryMetadata] = None,
     ):
         bs = len(seq_lens)
+        kv_last_page_len = self.kv_last_page_len[:bs]
         # Unified SWA wrapper-0: gather from the swa canonical directly -- its
         # entries are already swa-side physical ids, so the in-place
         # full->swa translate below must not run on top of them.
@@ -2455,10 +2483,31 @@ class FlashInferIndicesUpdaterPrefill:
                     kv_start_idx=kv_start_idx,
                     kind=read_kind,
                 )
-            qo_indptr[1 : bs + 1] = torch.cumsum(seq_lens - prefix_lens, dim=0)
-            qo_indptr = qo_indptr[: bs + 1]
-
             custom_mask = cross_attention_custom_mask
+            if sparse_query is not None:
+                if seq_lens_cpu is None:
+                    raise ValueError("Sparse queries require host-known KV lengths")
+                # FlashInfer plans on the host; these lengths are already known
+                # without reading back the GPU prefixes used to gather KV.
+                query_lens = torch.tensor(
+                    sparse_query.query_lens, dtype=torch.int32, device="cpu"
+                )
+                qo_indptr = torch.empty(
+                    bs + 1, dtype=torch.int32, device="cpu", pin_memory=True
+                )
+                qo_indptr[0] = 0
+                torch.cumsum(query_lens, dim=0, out=qo_indptr[1:])
+                kv_indptr = torch.empty_like(qo_indptr, pin_memory=True)
+                kv_indptr[0] = 0
+                torch.cumsum(seq_lens_cpu, dim=0, dtype=torch.int32, out=kv_indptr[1:])
+                kv_last_page_len = torch.ones(
+                    bs, dtype=torch.int32, device="cpu", pin_memory=True
+                )
+                custom_mask = sparse_query.causal_mask(seq_lens_cpu.tolist())
+            else:
+                query_lens = seq_lens - prefix_lens
+                qo_indptr[1 : bs + 1] = torch.cumsum(query_lens, dim=0)
+                qo_indptr = qo_indptr[: bs + 1]
         else:
             assert isinstance(spec_info, SpecInput)
             # Every mode reads from its window read's first token on; a mask
@@ -2584,11 +2633,17 @@ class FlashInferIndicesUpdaterPrefill:
         ):
             paged_plan_kwargs["window_left"] = window.window_left
 
+        if sparse_query is not None and bs == 1:
+            # SegmentPackBits uses one CTA per request; parallelize a long mask.
+            paged_plan_kwargs["packed_custom_mask"] = packbits(
+                custom_mask, bitorder="little"
+            )
+
         wrapper_paged.begin_forward(
             qo_indptr,
             kv_indptr,
             kv_indices,
-            self.kv_last_page_len[:bs],
+            kv_last_page_len,
             self.num_qo_heads,
             self.num_kv_heads,
             self.head_dim,
