@@ -1065,8 +1065,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             and self.state_tp_size != self.attn_tp_size
             and registration_info.dst_attn_tp_size != self.state_tp_size
             and not registration_info.dst_draft_rows_dcp_collapsed
-            # No draft KV entries to reslice: an earlier stage of a pipelined
-            # PD prefill holds no draft.
+            # Only appended draft KV entries need resliced shards. A manager
+            # that registers none (an earlier stage of a pipelined PD prefill,
+            # or any setup that sends no separate draft KV) has nothing to check.
             and self.kv_args.num_draft_entries > 0
         ):
             # Appended draft MHA KV uses physical TP shards, while target MLA
