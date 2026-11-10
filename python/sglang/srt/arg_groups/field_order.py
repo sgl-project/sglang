@@ -561,6 +561,8 @@ POSITIONAL_FIELD_ORDER = (
     "uocr_max_page_tokens",
     "enable_fp4_indexer",
     "paged_experts_enable_disk",
+    "disable_normalize_embedding",
+    "log_schedule_decisions",
     # Kimi-K3.1 additions, appended to keep existing positional slots
     "pp_min_chunked_prefill_size",
     "pp_chunk_overhead_tokens",
