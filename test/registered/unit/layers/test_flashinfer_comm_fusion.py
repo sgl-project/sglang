@@ -4,14 +4,27 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers import flashinfer_comm_fusion as fusion
 from sglang.srt.runtime_context import get_parallel, override_platform
+from sglang.srt.utils.device import is_confidential_compute
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 # Collectives are mocked and world_size is a plain int, so the world_size=4
 # cases need one real CUDA device.
-register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-small")
+
+
+@contextlib.contextmanager
+def _confidential_compute(enabled: bool):
+    # is_confidential_compute is lru_cached, so clear it on both edges.
+    is_confidential_compute.cache_clear()
+    try:
+        with envs.SGLANG_FORCE_CONFIDENTIAL_COMPUTE.override(enabled):
+            yield
+    finally:
+        is_confidential_compute.cache_clear()
 
 
 class _FakeWorkspace:
@@ -31,6 +44,7 @@ class _FakeFlashInferComm:
 
     def __init__(self):
         self.calls = []
+        self.fusion_kwargs = None
 
     def create_allreduce_fusion_workspace(self, **kwargs):
         self.calls.append(kwargs)
@@ -52,6 +66,7 @@ class _FakeFlashInferComm:
         rms_eps=None,
         **_kwargs,
     ):
+        self.fusion_kwargs = _kwargs
         if pattern is self.AllReduceFusionPattern.kAllReduce:
             allreduced = input * workspace.world_size
             if output is None:
@@ -95,6 +110,10 @@ class TestFlashInferCommFusion(CustomTestCase):
     `exec.comm.flashinfer_allreduce_fusion_backend` and `parallel.nnodes` off the
     published bags -- so the cases here drive the dispatch directly.
     """
+
+    def setUp(self):
+        super().setUp()
+        self.enterContext(_confidential_compute(False))
 
     def test_auto_backend_resolves_by_arch(self):
         single_node = ("auto", False)
@@ -180,6 +199,15 @@ class TestFlashInferCommFusion(CustomTestCase):
                         with self.assertRaises(ValueError):
                             fusion._resolve_backend(*args)
 
+    def test_confidential_compute_allows_only_single_node_trtllm(self):
+        with override_platform(is_sm100=True), _confidential_compute(True):
+            self.assertEqual(fusion._resolve_backend("auto", False), "trtllm")
+            for backend in ("mnnvl", "cutedsl"):
+                with self.subTest(backend=backend), self.assertRaises(ValueError):
+                    fusion._resolve_backend(backend, False)
+            with self.assertRaises(ValueError):
+                fusion._resolve_backend("auto", True)
+
     def test_allreduce_fusion_backends_match_torch_baseline(self):
         fake_comm = _FakeFlashInferComm()
         original_comm = fusion._flashinfer_comm
@@ -202,6 +230,7 @@ class TestFlashInferCommFusion(CustomTestCase):
                     world_size = 4
                     manager = fusion.FlashInferWorkspaceManager()
                     manager.workspace = _FakeWorkspace(backend, world_size)
+                    manager.backend = backend
                     manager.initialized = True
                     buffers[manager_key] = manager
                     if not torch.cuda.is_available():
@@ -240,6 +269,10 @@ class TestFlashInferCommFusion(CustomTestCase):
 
                     torch.testing.assert_close(norm_out, expected_norm)
                     torch.testing.assert_close(residual_out, expected_residual)
+                    self.assertEqual(
+                        fake_comm.fusion_kwargs.get("fp32_acc", False),
+                        backend == "trtllm",
+                    )
         finally:
             fusion._flashinfer_comm = original_comm
             fusion._create_allreduce_fusion_workspace = original_create
@@ -279,10 +312,11 @@ class TestFlashInferAllReduceOnly(CustomTestCase):
         original_unavailable = fusion._flashinfer_allreduce_unavailable
 
         buffers[manager_key] = manager
-        fusion._flashinfer_comm = _FakeFlashInferComm()
+        fake_comm = _FakeFlashInferComm()
+        fusion._flashinfer_comm = fake_comm
         fusion._flashinfer_allreduce_unavailable = False
         try:
-            yield
+            yield fake_comm
         finally:
             fusion._flashinfer_comm = original_comm
             fusion._flashinfer_allreduce_unavailable = original_unavailable
@@ -306,7 +340,7 @@ class TestFlashInferAllReduceOnly(CustomTestCase):
         manager = self._make_manager(world_size)
         manager.dtype = torch.bfloat16
         manager.use_fp32_lamport = False
-        with self._patched_attn_workspace(manager):
+        with self._patched_attn_workspace(manager) as fake_comm:
             input_ = torch.randn(8, 16, dtype=torch.bfloat16, device="cuda")
             expected = input_ * world_size
 
@@ -315,6 +349,8 @@ class TestFlashInferAllReduceOnly(CustomTestCase):
                 result = fusion.flashinfer_allreduce(input_, use_attn_tp_group=True)
 
             torch.testing.assert_close(result, expected)
+            # trtllm rounds to the input dtype on every rank without this
+            self.assertTrue(fake_comm.fusion_kwargs["fp32_acc"])
 
     def test_shape_guard_rejects_non_2d(self):
         with self._patched_attn_workspace(self._make_manager(4)):
@@ -523,6 +559,140 @@ class TestTagGroupsForFlashInferAllReduceOnly(CustomTestCase):
 
         self.assertEqual(shared._fi_workspace_hint, "attn_tp")
         self.assertIsNone(moe_tp._fi_workspace_hint)
+
+
+class TestWorkspacePreflightVote(CustomTestCase):
+    """No rank may enter FlashInfer's workspace exchange unless all ranks can.
+
+    FlashInfer allocates the workspace locally and then exchanges handles across
+    ranks; a rank that fails alone leaves its peers waiting in the exchange.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self._saved = fusion._flashinfer_allreduce_unavailable
+        fusion._flashinfer_allreduce_unavailable = False
+
+    def tearDown(self):
+        fusion._flashinfer_allreduce_unavailable = self._saved
+        super().tearDown()
+
+    def _initialize(self, *, cc, free_bytes, peers_ok=True):
+        fake_comm = _FakeFlashInferComm()
+        create = MagicMock(side_effect=fake_comm.create_allreduce_fusion_workspace)
+        vmm_probe = MagicMock(return_value=True)
+
+        def vote(flag, op=None, group=None):
+            if not peers_ok:
+                flag.zero_()
+
+        manager = fusion.FlashInferWorkspaceManager()
+        with (
+            _confidential_compute(cc),
+            patch.object(fusion, "_flashinfer_comm", fake_comm),
+            patch.object(fusion, "_create_allreduce_fusion_workspace", create),
+            patch.object(fusion, "in_the_same_node_as", return_value=[True] * 4),
+            patch.object(fusion, "get_cuda_driver_bindings"),
+            patch.object(fusion, "_make_flashinfer_workspace_allocation_prop"),
+            patch.object(
+                fusion,
+                "_flashinfer_trtllm_workspace_allocation_sizes",
+                return_value=[1 << 21],
+            ),
+            patch.object(fusion, "_probe_cumem_create_sequence", vmm_probe),
+            patch.object(torch.cuda, "mem_get_info", return_value=(free_bytes, 0)),
+            patch.object(torch.distributed, "all_reduce", side_effect=vote),
+            patch.object(torch.distributed, "get_rank", return_value=0),
+        ):
+            manager.initialize(
+                world_size=4,
+                rank=0,
+                max_token_num=8,
+                hidden_dim=4096,
+                backend="trtllm",
+                cpu_group=MagicMock(),
+            )
+        return manager, create, vmm_probe
+
+    def test_cc_rank_without_memory_stops_every_rank(self):
+        manager, create, vmm_probe = self._initialize(cc=True, free_bytes=0)
+        create.assert_not_called()
+        # CC blocks the VMM probe, so it must not run there.
+        vmm_probe.assert_not_called()
+        self.assertFalse(manager.initialized)
+        self.assertTrue(fusion.is_flashinfer_allreduce_unavailable())
+
+    def test_cc_peer_without_memory_stops_this_rank(self):
+        manager, create, _ = self._initialize(
+            cc=True, free_bytes=1 << 40, peers_ok=False
+        )
+        create.assert_not_called()
+        self.assertFalse(manager.initialized)
+
+    def test_cc_proceeds_when_every_rank_fits(self):
+        manager, create, _ = self._initialize(cc=True, free_bytes=1 << 40)
+        create.assert_called_once()
+        self.assertTrue(manager.initialized)
+
+    def test_vmm_probe_runs_off_cc(self):
+        # Off CC FlashInfer allocates its VMM workspace: the cuMemCreate probe
+        # decides, and free memory is not consulted.
+        _, create, vmm_probe = self._initialize(cc=False, free_bytes=0)
+        vmm_probe.assert_called_once()
+        create.assert_called_once()
+
+
+class TestMnnvlCliqueGate(CustomTestCase):
+    """MNNVL fusion must be declined when a cross-node group is not one clique."""
+
+    def setUp(self):
+        self._saved = fusion._flashinfer_allreduce_unavailable
+        fusion._flashinfer_allreduce_unavailable = False
+
+    def tearDown(self):
+        fusion._flashinfer_allreduce_unavailable = self._saved
+
+    def _initialize(self, manager, one_clique, **kw):
+        fake_comm = _FakeFlashInferComm()
+        create = MagicMock(side_effect=fake_comm.create_allreduce_fusion_workspace)
+        clique = MagicMock(return_value=one_clique)
+        with (
+            patch.object(fusion, "_flashinfer_comm", fake_comm),
+            patch.object(fusion, "_create_allreduce_fusion_workspace", create),
+            patch.object(
+                fusion, "_preflight_check_workspace_memory", return_value=True
+            ),
+            patch.object(
+                fusion, "in_the_same_node_as", return_value=[True] * 4 + [False] * 4
+            ),
+            patch.object(fusion, "is_one_nvlink_clique", clique),
+            patch.object(torch.cuda, "current_device", return_value=0),
+        ):
+            manager.initialize(
+                world_size=8,
+                rank=0,
+                max_token_num=8,
+                hidden_dim=4096,
+                backend="mnnvl",
+                group=MagicMock(),
+                **kw,
+            )
+        return create, clique
+
+    def test_declines_when_not_one_clique(self):
+        manager = fusion.FlashInferWorkspaceManager()
+        with self.assertLogs(fusion.logger, level="WARNING") as logs:
+            create, _ = self._initialize(manager, one_clique=False)
+        create.assert_not_called()
+        self.assertFalse(manager.initialized)
+        self.assertTrue(fusion.is_flashinfer_allreduce_unavailable())
+        self.assertIn("NVLink clique", "\n".join(logs.output))
+
+    def test_proceeds_when_one_clique(self):
+        manager = fusion.FlashInferWorkspaceManager()
+        create, _ = self._initialize(manager, one_clique=True)
+        create.assert_called_once()
+        self.assertTrue(manager.initialized)
 
 
 if __name__ == "__main__":

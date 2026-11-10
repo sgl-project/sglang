@@ -559,6 +559,9 @@ class GPTQMoEMethod(FusedMoEMethodBase):
     ):
         layer.scheme.create_moe_runner(layer, moe_runner_config)
 
+    def get_moe_runner_backend(self, layer):
+        return layer.scheme.get_moe_runner_backend(layer)
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         layer.scheme.process_weights_after_loading(layer)
 
@@ -651,6 +654,9 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
     ):
         layer.scheme.create_moe_runner(layer, moe_runner_config)
 
+    def get_moe_runner_backend(self, layer):
+        return layer.scheme.get_moe_runner_backend(layer)
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -661,18 +667,8 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
 
 # Register fake implementations for torch.compile support. The decorator is a
 # no-op when the custom op is unavailable on the current platform.
-@register_fake_if_exists("sgl_kernel::gptq_gemm")
-def _(a, b_q_weight, b_gptq_qzeros, b_gptq_scales, b_g_idx, use_shuffle, bit):
-    return a.new_empty((a.shape[0], b_q_weight.shape[-1]), dtype=a.dtype)
-
-
 @register_fake_if_exists("sgl_kernel::gptq_marlin_repack")
 def _(b_q_weight, perm, size_k, size_n, num_bits):
     return b_q_weight.new_empty(
         (size_k // 16, size_n * (num_bits // 2)), dtype=b_q_weight.dtype
     )
-
-
-@register_fake_if_exists("sgl_kernel::gptq_shuffle")
-def _(q_weight, q_perm, bit):
-    return

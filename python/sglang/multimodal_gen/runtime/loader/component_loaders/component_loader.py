@@ -7,7 +7,8 @@ import os
 import pkgutil
 import traceback
 from abc import ABC
-from typing import Any, Type
+from collections.abc import Callable, Iterator
+from typing import Any
 
 import torch
 import transformers
@@ -21,17 +22,30 @@ from transformers import (
 )
 from transformers.quantizers import AutoHfQuantizer
 
+from sglang.multimodal_gen.configs.attention_roles import AttentionRole
+from sglang.multimodal_gen.configs.models.base import ModelConfig
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.layers.attention.selector import (
     ComponentAttentionBackendNotAppliedError,
     component_attn_backend_context_manager,
     get_component_attn_backend_context,
 )
+from sglang.multimodal_gen.runtime.loader.fsdp_load import maybe_load_fsdp_model
 from sglang.multimodal_gen.runtime.loader.utils import (
+    _list_safetensors_files,
     _normalize_component_type,
     component_name_to_loader_cls,
+    finalize_loaded_model,
     format_component_residency,
     get_memory_usage_of_component,
+    get_param_names_mapping,
+    hf_to_custom_state_dict,
+    initialize_model,
+    load_model_state_dict,
+)
+from sglang.multimodal_gen.runtime.loader.weight_load_plan import WeightLoadPlan
+from sglang.multimodal_gen.runtime.loader.weight_utils import (
+    checkpoint_weights_iterator,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
     RESIDENT,
@@ -40,7 +54,12 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency 
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_strategies import (
     is_fsdp_managed_module,
 )
-from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
+from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     get_diffusers_component_config,
@@ -48,7 +67,10 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     prepare_diffusers_component_path_for_loading,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.runtime.utils.precision import resolve_component_precision
+from sglang.multimodal_gen.runtime.utils.precision import (
+    resolve_component_precision,
+    resolve_precision,
+)
 from sglang.multimodal_gen.runtime.weights.source import (
     materialize_weight,
     resolve_weight,
@@ -128,8 +150,8 @@ class ComponentLoader(ABC):
     # the list of possible name of the component in model_index.json, e.g., scheduler
     component_names: list[str] = []
 
-    # diffusers or transformers
-    expected_library: str = ""
+    # diffusers or transformers (a tuple lists several accepted spellings)
+    expected_library: str | tuple[str, ...] = ""
 
     _loaders_registered = False
 
@@ -224,11 +246,13 @@ class ComponentLoader(ABC):
         attn_backend: Any,
         component_attn_name: str | None,
         require_backend_selection: bool,
+        backend_by_role: dict[AttentionRole, AttentionBackendEnum] | None = None,
     ):
         """Build the attention-selection context used by this loader."""
         return component_attn_backend_context_manager(
             attn_backend,
             component_name=component_attn_name,
+            backend_by_role=backend_by_role,
             allow_global_backend_fallback=True,
             require_backend_selection=require_backend_selection,
         )
@@ -265,11 +289,13 @@ class ComponentLoader(ABC):
         attn_backend: Any,
         component_attn_name: str | None,
         require_backend_selection: bool,
+        backend_by_role: dict[AttentionRole, AttentionBackendEnum] | None = None,
     ) -> AutoModel:
         with self.component_attention_backend_context(
             attn_backend,
             component_attn_name,
             require_backend_selection,
+            backend_by_role,
         ):
             load_kwargs = self.customized_load_kwargs_for_component(
                 server_args, component_name
@@ -287,11 +313,13 @@ class ComponentLoader(ABC):
         attn_backend: Any,
         component_attn_name: str | None,
         require_backend_selection: bool,
+        backend_by_role: dict[AttentionRole, AttentionBackendEnum] | None = None,
     ) -> AutoModel:
         with self.component_attention_backend_context(
             attn_backend,
             component_attn_name,
             require_backend_selection,
+            backend_by_role,
         ):
             component = self.load_native(
                 component_model_path,
@@ -310,6 +338,10 @@ class ComponentLoader(ABC):
         *,
         component_attn_backend: Any = None,
         component_attn_name: str | None = None,
+        component_backend_by_role: (
+            dict[AttentionRole, AttentionBackendEnum] | None
+        ) = None,
+        allow_native_fallback: bool = True,
     ) -> tuple[AutoModel, float]:
         """
         Template method that standardizes logging around the core load implementation.
@@ -350,13 +382,26 @@ class ComponentLoader(ABC):
                     component_attn_backend.name.lower(),
                     matched_backend_key,
                 )
+        if (
+            component_backend_by_role is None
+            and get_component_attn_backend_context() is None
+        ):
+            # A caller that resolved only the component-wide backend must not
+            # silently drop the role-qualified overrides that go with it.
+            component_backend_by_role = server_args.resolve_component_backend_by_role(
+                component_name, component_attn_name
+            )
         requested_backend = (
             server_args.requested_component_attention_backend(component_attn_name)
             if component_attn_name is not None
             else None
         )
-        require_backend_selection = requested_backend is not None
-        if require_backend_selection and (
+        # A role override is as explicit as a component-wide one, so it carries
+        # the same requirement that the component actually apply it.
+        require_backend_selection = requested_backend is not None or bool(
+            component_backend_by_role
+        )
+        if requested_backend is not None and (
             component_attn_backend is None
             or component_attn_backend.name.lower() != requested_backend
         ):
@@ -372,16 +417,23 @@ class ComponentLoader(ABC):
                 component_attn_backend,
                 component_attn_name,
                 require_backend_selection,
+                component_backend_by_role,
             )
             source = "sgl-diffusion"
         except (
             ComponentAttentionBackendNotAppliedError,
             ComponentCheckpointUnsupportedError,
             ComponentResidencyError,
+            # the native fallback answers "there is no customized implementation
+            # for this architecture"; a checkpoint that cannot be read is a
+            # different failure and the fallback cannot read it either, so let
+            # the original error name the file instead of reporting it as a
+            # missing implementation
+            OSError,
         ):
             raise
         except Exception as e:
-            if require_backend_selection:
+            if require_backend_selection or not allow_native_fallback:
                 raise
             native_loader_required = isinstance(e, NativeComponentLoaderRequired)
             if native_loader_required and component_weight_override is not None:
@@ -430,6 +482,7 @@ class ComponentLoader(ABC):
                 component_attn_backend,
                 component_attn_name,
                 require_backend_selection,
+                component_backend_by_role,
             )
             source = "native"
             logger.warning(
@@ -450,7 +503,7 @@ class ComponentLoader(ABC):
                 # a parallel capability declaration for FSDP support.
                 server_args.disable_fsdp_for_component(component_name)
             if isinstance(component, nn.Module):
-                component = component.eval()
+                component = finalize_loaded_model(component)
                 if (
                     not is_fsdp_managed_module(component)
                     and not self._native_load_manages_placement
@@ -631,6 +684,8 @@ class ComponentLoader(ABC):
         component_type: str,
         transformers_or_diffusers: str,
         component_architecture: str | None = None,
+        *,
+        loader_cls: type["ComponentLoader"] | None = None,
     ) -> "ComponentLoader":
         """
         Factory method to create a component loader for a specific component type.
@@ -649,13 +704,17 @@ class ComponentLoader(ABC):
             transformers_or_diffusers, loader_type
         )
 
-        if loader_type in component_name_to_loader_cls:
-            loader_cls: Type[ComponentLoader] = component_name_to_loader_cls[
-                loader_type
-            ]
+        if loader_cls is None:
+            loader_cls = component_name_to_loader_cls.get(loader_type)
+        if loader_cls is not None:
             expected_library = loader_cls.expected_library
             # Assert that the library matches what's expected for this component type
-            assert transformers_or_diffusers == expected_library, (
+            allowed = (
+                (expected_library,)
+                if isinstance(expected_library, str)
+                else tuple(expected_library)
+            )
+            assert transformers_or_diffusers in allowed, (
                 f"{loader_type} must be loaded from {expected_library}, got {transformers_or_diffusers}"
             )
             loader = loader_cls()
@@ -677,6 +736,58 @@ class ComponentLoader(ABC):
 
 class WeightOverrideComponentLoader(ComponentLoader):
     """Base for loaders that consume an exact weights-only override."""
+
+    ignored_checkpoint_prefixes: tuple[str, ...] = ()
+    # True: a checkpoint key that maps to no model parameter fails the load instead
+    # of being logged and skipped.
+    strict_checkpoint_keys: bool = False
+
+    def load_state_dict_model(
+        self,
+        model_cls: type[nn.Module],
+        init_params: dict[str, Any],
+        weight_files: list[str],
+        server_args: ServerArgs,
+        component_name: str,
+        dtype: torch.dtype,
+        *,
+        component_starts_on_cpu: bool,
+        weight_load_plan: WeightLoadPlan | None = None,
+        checkpoint_key_filter: Callable[[str], bool] | None = None,
+        weights_iterator: Iterator[tuple[str, torch.Tensor]] | None = None,
+    ) -> nn.Module:
+        """Restore mapped model state with optional TP/FSDP materialization."""
+        return maybe_load_fsdp_model(
+            model_cls=model_cls,
+            init_params=init_params,
+            weight_dir_list=weight_files,
+            device=get_local_torch_device(),
+            hsdp_replicate_dim=server_args.hsdp_replicate_dim,
+            hsdp_shard_dim=server_args.hsdp_shard_dim,
+            component_starts_on_cpu=component_starts_on_cpu,
+            pin_cpu_memory=server_args.pin_cpu_memory,
+            fsdp_inference=server_args.should_use_fsdp_for_component(component_name),
+            param_dtype=dtype,
+            reduce_dtype=torch.float32,
+            strict=self.strict_checkpoint_keys,
+            weight_load_plan=weight_load_plan,
+            checkpoint_key_filter=checkpoint_key_filter,
+            weights_iterator=weights_iterator,
+        )
+
+    def validate_checkpoint_keys(
+        self, missing: list[str] | set[str], unexpected: list[str], component_name: str
+    ) -> None:
+        unexpected = [
+            name
+            for name in unexpected
+            if not name.startswith(self.ignored_checkpoint_prefixes)
+        ]
+        if missing or unexpected:
+            raise ComponentCheckpointUnsupportedError(
+                f"Checkpoint weights do not match {component_name!r}. "
+                f"Missing: {sorted(missing)}. Unexpected: {sorted(unexpected)}."
+            )
 
     def resolve_component_weight_override(
         self, server_args: ServerArgs, component_name: str
@@ -711,7 +822,97 @@ class OnlineQuantizationComponentLoader(WeightOverrideComponentLoader):
 
 
 class PlainStateDictComponentLoader(WeightOverrideComponentLoader):
-    """Base for native loaders whose current materializer expects plain weights."""
+    """Construct registered modules and restore a complete plain state dict."""
+
+    expected_library = "diffusers"
+    config_classes: dict[str, type[ModelConfig]] = {}
+    default_precision_attr = "dit_precision"
+    default_dtype = torch.bfloat16
+
+    def load_customized(
+        self, component_model_path: str, server_args: ServerArgs, component_name: str
+    ) -> nn.Module:
+        config = self.load_component_config(component_model_path, component_name)
+        class_name = config.pop("_class_name", None) or self.component_architecture
+        if class_name is None:
+            raise ComponentCheckpointUnsupportedError(
+                f"{component_name!r} must declare _class_name in config.json "
+                "or its architecture in model_index.json"
+            )
+        weights_path = self.resolve_component_weights_path(
+            component_model_path, server_args, component_name
+        )
+        model_cls, _ = ModelRegistry.resolve_model_cls(class_name)
+        model_config = self.build_model_config(config, component_name)
+        dtype = self.resolve_dtype(server_args, component_name)
+        component_starts_on_cpu = server_args.should_start_component_on_cpu(
+            component_name
+        )
+        server_args.model_paths[component_name] = component_model_path
+        if issubclass(model_cls, BaseDiT):
+            weight_files = _list_safetensors_files(weights_path)
+            return self.load_state_dict_model(
+                model_cls,
+                {"config": model_config, "hf_config": config},
+                weight_files,
+                server_args,
+                component_name,
+                dtype,
+                component_starts_on_cpu=component_starts_on_cpu,
+                weights_iterator=(
+                    None if weight_files else checkpoint_weights_iterator(weights_path)
+                ),
+            )
+
+        target_device = self.target_device(component_starts_on_cpu)
+        model = initialize_model(
+            model_cls,
+            model_config
+            if isinstance(model_config, dict)
+            else {"config": model_config},
+            dtype,
+        ).to(target_device)
+
+        try:
+            state_dict, _ = hf_to_custom_state_dict(
+                checkpoint_weights_iterator(weights_path),
+                get_param_names_mapping(
+                    model_config.arch_config.param_names_mapping
+                    if isinstance(model_config, ModelConfig)
+                    else {}
+                ),
+                valid_target_names=set(model.state_dict()),
+                strict=True,
+            )
+            missing, unexpected = load_model_state_dict(model, state_dict, strict=False)
+        except (RuntimeError, ValueError) as error:
+            raise ComponentCheckpointUnsupportedError(
+                f"Cannot restore checkpoint for {component_name!r}: {error}"
+            ) from error
+        self.validate_checkpoint_keys(missing, unexpected, component_name)
+        return model
+
+    def build_model_config(
+        self, config: dict[str, Any], component_name: str
+    ) -> ModelConfig | dict[str, Any]:
+        config_cls = self.config_classes.get(
+            self.structural_component_type(component_name)
+        )
+        if config_cls is not None:
+            model_config = config_cls()
+            model_config.update_model_arch(config)
+            return model_config
+        return {key: value for key, value in config.items() if not key.startswith("_")}
+
+    def resolve_dtype(
+        self, server_args: ServerArgs, component_name: str
+    ) -> torch.dtype:
+        try:
+            return resolve_precision(
+                server_args, component_name, precision_attr=self.default_precision_attr
+            )
+        except AttributeError:
+            return self.default_dtype
 
     def component_load_precision(
         self, server_args: ServerArgs, component_name: str
@@ -774,7 +975,7 @@ class AutoProcessorLoader(ComponentLoader):
 class TokenizerLoader(ComponentLoader):
     """Loader for tokenizers."""
 
-    component_names = ["tokenizer", "text_tokenizer"]
+    component_names = ["tokenizer", "text_tokenizer", "t5_tokenizer"]
     expected_library = "transformers"
 
     def load_customized(
@@ -830,12 +1031,14 @@ class GenericComponentLoader(ComponentLoader):
         attn_backend: Any,
         component_attn_name: str | None,
         require_backend_selection: bool,
+        backend_by_role: dict[AttentionRole, AttentionBackendEnum] | None = None,
     ):
         # An unknown out-of-tree component may itself be the primary transformer.
         # Require it to opt into fallback through a registered component loader.
         return component_attn_backend_context_manager(
             attn_backend,
             component_name=component_attn_name,
+            backend_by_role=backend_by_role,
             allow_global_backend_fallback=False,
             require_backend_selection=require_backend_selection,
         )
@@ -855,7 +1058,11 @@ class PipelineComponentLoader:
         component_architecture: str | None = None,
         component_attn_backend: Any = None,
         component_attn_name: str | None = None,
+        component_backend_by_role: (
+            dict[AttentionRole, AttentionBackendEnum] | None
+        ) = None,
         component_type: str | None = None,
+        loader_cls: type[ComponentLoader] | None = None,
     ):
         """
         Load a pipeline component.
@@ -866,6 +1073,7 @@ class PipelineComponentLoader:
             transformers_or_diffusers: Whether the component is from transformers or diffusers
             component_architecture: the class name of the module
             component_type: structural config slot when it differs from the exact key
+            loader_cls: explicit pipeline-local loader, with no native fallback
         """
 
         # Get the appropriate loader for this component type
@@ -873,6 +1081,7 @@ class PipelineComponentLoader:
             component_type or component_name,
             transformers_or_diffusers,
             component_architecture,
+            loader_cls=loader_cls,
         )
 
         try:
@@ -883,6 +1092,8 @@ class PipelineComponentLoader:
                 transformers_or_diffusers,
                 component_attn_backend=component_attn_backend,
                 component_attn_name=component_attn_name,
+                component_backend_by_role=component_backend_by_role,
+                allow_native_fallback=loader_cls is None,
             )
         except Exception:
             logger.error(

@@ -9,7 +9,7 @@ import math
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from sglang.multimodal_gen.utils import StoreBoolean
+from sglang.multimodal_gen.runtime.utils.argparse import StoreBoolean
 
 _VALID_ROLLOUT_SDE_TYPES = ("sde", "cps", "ode")
 

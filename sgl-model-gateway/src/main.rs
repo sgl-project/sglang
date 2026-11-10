@@ -211,6 +211,10 @@ struct CliArgs {
     #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash", "manual"], help_heading = "PD Disaggregation")]
     decode_policy: Option<String>,
 
+    /// Max requests per prefill worker in flight to decode; the rest pick their decode worker when sent
+    #[arg(long, help_heading = "PD Disaggregation")]
+    decode_dispatch_limit: Option<usize>,
+
     /// Timeout in seconds for worker startup and registration
     #[arg(long, default_value_t = 1800, help_heading = "PD Disaggregation")]
     worker_startup_timeout_secs: u64,
@@ -1056,6 +1060,7 @@ impl CliArgs {
                 (!self.request_id_headers.is_empty()).then(|| self.request_id_headers.clone()),
             )
             .maybe_rate_limit_tokens_per_second(self.rate_limit_tokens_per_second)
+            .maybe_decode_dispatch_limit(self.decode_dispatch_limit)
             .maybe_model_path(self.model_path.as_ref())
             .maybe_tokenizer_path(self.tokenizer_path.as_ref())
             .maybe_chat_template(self.chat_template.as_ref())

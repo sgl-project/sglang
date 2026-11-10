@@ -19,16 +19,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.kernels.ops.diffusion import (
+    FUSED_LINEAR_GELU,
     BitExactFusionGate,
-    can_use_fused_layernorm_modulate,
     can_use_fused_qk_head_layernorm,
     can_use_linear_gelu,
-    fused_gelu_active,
-    fused_layernorm_modulate,
     fused_linear_gelu_tanh,
     fused_qk_head_layernorm,
     is_plain_layer_norm,
-    mark_fused_gelu_site,
     residual_gate_add,
     tensors_equal,
 )
@@ -52,14 +49,16 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
     QuantizationConfig,
 )
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
-    _apply_rotary_emb,
-    apply_flashinfer_rope_qk_inplace,
+    RotaryEmbedding,
 )
 from sglang.multimodal_gen.runtime.layers.visual_embedding import Timesteps
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
+from sglang.multimodal_gen.runtime.models.dits.common import (
+    layernorm_modulate_bitexact,
+)
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
@@ -100,32 +99,15 @@ def _glm_ln_modulate(
     the first call verifies ``torch.equal`` against the eager chain and
     disables the fast path permanently on any mismatch.
     """
-    verified = _GLM_LN_MOD.verified
-    if (
-        not _GLM_LN_MOD.disabled
-        and _is_cuda
-        and dtype is x.dtype
-        and is_plain_layer_norm(norm, x.shape[-1])
-        and can_use_fused_layernorm_modulate(x, scale, shift)
-        and (verified or _GLM_LN_MOD.can_attempt_once())
-    ):
-        try:
-            out = fused_layernorm_modulate(x, scale, shift, norm.eps)
-        except Exception as exc:
-            _GLM_LN_MOD.on_exception(exc, logger=logger)
-        else:
-            if verified:
-                return out
-            return _GLM_LN_MOD.accept_or_fallback(
-                out,
-                _eager_ln_modulate(norm, x, scale, shift, dtype),
-                logger=logger,
-                mismatch_msg=(
-                    "GLM fused LN+modulate fast path is not bit-exact against "
-                    "this platform's LayerNorm dispatch; falling back to eager"
-                ),
-            )
-
+    if _is_cuda and dtype is x.dtype:
+        return layernorm_modulate_bitexact(
+            _GLM_LN_MOD,
+            norm,
+            x,
+            scale,
+            shift,
+            lambda: _eager_ln_modulate(norm, x, scale, shift, dtype),
+        )
     return _eager_ln_modulate(norm, x, scale, shift, dtype)
 
 
@@ -141,40 +123,22 @@ def _glm_qk_layernorm(
     First call verifies ``torch.equal`` against the eager pair and falls
     back permanently on any mismatch.
     """
-    verified = _GLM_QK_LN.verified
     if (
-        not _GLM_QK_LN.disabled
-        and _is_cuda
+        _is_cuda
+        and query.is_cuda
         and dtype is query.dtype
         and dtype is key.dtype
         and is_plain_layer_norm(norm_q, query.shape[-1])
         and is_plain_layer_norm(norm_k, key.shape[-1])
         and norm_q.eps == norm_k.eps
-        and can_use_fused_qk_head_layernorm(query, key)
-        and (verified or _GLM_QK_LN.can_attempt_once())
+        and can_use_fused_qk_head_layernorm(query.dtype, query.shape[-1])
     ):
-        try:
-            out = fused_qk_head_layernorm(query, key, norm_q.eps)
-        except Exception as exc:
-            _GLM_QK_LN.on_exception(exc, logger=logger)
-        else:
-            if verified:
-                return out
-            ref = (
-                norm_q(query).to(dtype=dtype),
-                norm_k(key).to(dtype=dtype),
-            )
-            return _GLM_QK_LN.accept_or_fallback(
-                out,
-                ref,
-                equal=tensors_equal,
-                logger=logger,
-                mismatch_msg=(
-                    "GLM fused qk-LayerNorm fast path is not bit-exact against "
-                    "this platform's LayerNorm dispatch; falling back to eager"
-                ),
-            )
-
+        return _GLM_QK_LN.run(
+            lambda: fused_qk_head_layernorm(query, key, norm_q.eps),
+            lambda: (norm_q(query).to(dtype=dtype), norm_k(key).to(dtype=dtype)),
+            equal=tensors_equal,
+            logger=logger,
+        )
     return norm_q(query).to(dtype=dtype), norm_k(key).to(dtype=dtype)
 
 
@@ -447,12 +411,14 @@ class GlmImageGELU(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.proj" if prefix else "proj",
         )
-        # extra-high/high fusion site: up-proj GEMM + tanh-GELU in cublasLt
+        # lossless/high fusion site: up-proj GEMM + tanh-GELU in cublasLt
         # epilogue. Off by default; mounted per batch by the denoising stage.
-        mark_fused_gelu_site(self, "proj")
+        FUSED_LINEAR_GELU.mark(self, "proj")
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if fused_gelu_active(self) and can_use_linear_gelu(self.proj, hidden_states):
+        if FUSED_LINEAR_GELU.is_enabled(self) and can_use_linear_gelu(
+            self.proj, hidden_states
+        ):
             return fused_linear_gelu_tanh(
                 hidden_states, self.proj.weight, self.proj.bias
             )
@@ -590,6 +556,12 @@ class GlmImageAttention(torch.nn.Module):
             raise ValueError(
                 f"unknown qk_norm: {qk_norm}. Should be one of None, 'layer_norm', 'fp32_layer_norm', 'layer_norm_across_heads', 'rms_norm', 'rms_norm_across_heads', 'l2'."
             )
+        self.rotary_emb = RotaryEmbedding(
+            head_size=dim_head,
+            rotary_dim=dim_head,
+            use_precomputed_cache=False,
+            is_neox_style=True,
+        )
 
         self.attn = USPAttention(
             num_heads=self.num_local_heads,
@@ -635,28 +607,21 @@ class GlmImageAttention(torch.nn.Module):
         # 3. Rotational positional embeddings applied to latent stream
         if image_rotary_emb is not None:
             cos, sin = image_rotary_emb
+            q_img = query[:, text_seq_length:, :, :]
+            k_img = key[:, text_seq_length:, :, :]
 
-            if _is_cuda and cos.dim() == 2:
-                q_img = query[:, text_seq_length:, :, :]
-                k_img = key[:, text_seq_length:, :, :]
-                cos_sin_cache = torch.cat(
-                    [
-                        cos.to(dtype=torch.float32).contiguous(),
-                        sin.to(dtype=torch.float32).contiguous(),
-                    ],
-                    dim=-1,
-                )
-                # apply_flashinfer_rope_qk_inplace is inplace kernel and q_img/k_img are views of query/key, so we need not copy back
-                q_out, k_out = apply_flashinfer_rope_qk_inplace(
-                    q_img, k_img, cos_sin_cache, is_neox=True
-                )
-            else:
-                query[:, text_seq_length:, :, :] = _apply_rotary_emb(
-                    query[:, text_seq_length:, :, :], cos, sin, is_neox_style=True
-                )
-                key[:, text_seq_length:, :, :] = _apply_rotary_emb(
-                    key[:, text_seq_length:, :, :], cos, sin, is_neox_style=True
-                )
+            q_rot, k_rot = self.rotary_emb(
+                query=q_img,
+                key=k_img,
+                cos=cos,
+                sin=sin,
+            )
+            # The CUDA RoPE rotates contiguous views in place and returns them;
+            # torch >= 2.14 rejects copying a tensor onto its own memory.
+            if q_rot.data_ptr() != q_img.data_ptr():
+                q_img.copy_(q_rot)
+            if k_rot.data_ptr() != k_img.data_ptr():
+                k_img.copy_(k_rot)
 
         if kv_cache is not None:
             if kv_cache.mode == "write":
@@ -1099,7 +1064,10 @@ class GlmImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 prior_token_drop.unsqueeze(-1), 0
             )
         else:
-            prior_embedding[prior_token_drop] *= 0.0
+            # select, not a boolean-mask write: its nonzero syncs the host
+            prior_embedding = torch.where(
+                prior_token_drop.unsqueeze(-1), prior_embedding * 0.0, prior_embedding
+            )
 
         prior_hidden_states = self.prior_projector(prior_embedding)
         # SP: when latents are H-sharded, hidden_states has fewer patches than prior_hidden_states.

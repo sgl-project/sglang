@@ -32,6 +32,10 @@ from sglang.kernels.ops.attention.cute_utils import (
     fence_before_tma_store,
     simple_tma_copy,
 )
+from sglang.kernels.ops.attention.linear.tma import (
+    make_chunk_tma_args,
+    make_output_state_tma_args,
+)
 
 
 class Sm100KdaChunkOKernel:
@@ -59,50 +63,6 @@ class Sm100KdaChunkOKernel:
         self.num_warps = 10
 
     @cute.jit
-    def _make_bf16_tma_args(
-        self,
-        tensor: cute.Tensor,
-        dim: cutlass.Constexpr[int],
-        op: cpasync.TmaCopyOp,
-        stages: cutlass.Constexpr[int],
-    ):
-        swizzle_128B = cute.make_swizzle(3, 4, 3)
-        slayout = cute.make_layout(
-            (self.BT, 1, (64, dim // 64), stages),
-            stride=(64, 0, (1, self.BT * 64), self.BT * dim),
-        )
-        slayout = cute.make_composed_layout(swizzle_128B, 0, slayout)
-        atom, tma_tensor = cpasync.make_tiled_tma_atom(
-            op,
-            cute.logical_divide(tensor, (None, None, 64)),
-            slayout,
-            cta_tiler=(self.BT, 1, dim),
-        )
-        return atom, tma_tensor, slayout
-
-    @cute.jit
-    def _make_h_tma_args(
-        self,
-        tensor: cute.Tensor,
-        op: cpasync.TmaCopyOp,
-        stages: cutlass.Constexpr[int],
-    ):
-        num_elems = 128 // (tensor.element_type.width // 8)
-        swizzle_128B = cute.make_swizzle(3, 4, 3)
-        slayout = cute.make_layout(
-            (1, self.V_dim, (num_elems, self.K_dim // num_elems), stages),
-            stride=(0, num_elems, (1, self.V_dim * num_elems), self.V_dim * self.K_dim),
-        )
-        slayout = cute.make_composed_layout(swizzle_128B, 0, slayout)
-        atom, tma_tensor = cpasync.make_tiled_tma_atom(
-            op,
-            cute.logical_divide(tensor, (None, None, num_elems)),
-            slayout,
-            cta_tiler=(1, self.V_dim, self.K_dim),
-        )
-        return atom, tma_tensor, slayout
-
-    @cute.jit
     def __call__(
         self,
         qg: cute.Tensor,  # scale*q*exp(g_cu)            [T, Hv, K]
@@ -121,14 +81,16 @@ class Sm100KdaChunkOKernel:
         block = (self.num_warps * 32, 1, 1)
         tma_g2s = cpasync.CopyBulkTensorTileG2SOp()
         tma_s2g = cpasync.CopyBulkTensorTileS2GOp()
-        Q_args = self._make_bf16_tma_args(qg2, self.K_dim, tma_g2s, self.num_stages)
-        Q2_args = self._make_bf16_tma_args(qg, self.K_dim, tma_g2s, self.num_stages)
-        K_args = self._make_bf16_tma_args(kg, self.K_dim, tma_g2s, self.num_stages)
-        V_args = self._make_bf16_tma_args(
-            v_new_chunks, self.V_dim, tma_g2s, self.num_stages
+        Q_args = make_chunk_tma_args(qg2, self.K_dim, tma_g2s, self.num_stages, self.BT)
+        Q2_args = make_chunk_tma_args(qg, self.K_dim, tma_g2s, self.num_stages, self.BT)
+        K_args = make_chunk_tma_args(kg, self.K_dim, tma_g2s, self.num_stages, self.BT)
+        V_args = make_chunk_tma_args(
+            v_new_chunks, self.V_dim, tma_g2s, self.num_stages, self.BT
         )
-        H_args = self._make_h_tma_args(h, tma_g2s, self.num_stages)
-        O_args = self._make_bf16_tma_args(o, self.V_dim, tma_s2g, 1)
+        H_args = make_output_state_tma_args(
+            h, tma_g2s, self.num_stages, self.K_dim, self.V_dim
+        )
+        O_args = make_chunk_tma_args(o, self.V_dim, tma_s2g, 1, self.BT)
         self.kernel(
             Q_args,
             Q2_args,

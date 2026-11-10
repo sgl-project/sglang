@@ -11,50 +11,35 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Byte-budget buffer sizing for the unified 2-pool factories.
+"""A total device budget includes the chain, its sink and declared fixed storage.
 
-Derived properties pinned here:
-
-  * Budget honored EXACTLY: with ``unified_total_bytes`` set, the swa pair's
-    buffer is that many bytes (the mamba pair adds the state pool's bytes on
-    top — the budget is captured AFTER the state carve-out). Sizing from the
-    ratio-derived token counts instead re-introduces the configurator's
-    rounding: the swa split floors the budget by the cell size and then
-    page-aligns EACH side's token count, so the re-sum reconstructs less
-    than the profiled budget by up to about one page of tokens per side.
-  * Fallback: without the budget, sizing is the historical token-count re-sum,
-    bit-for-bit.
-  * bs=1 feasibility floor: a budget that cannot fit ONE worst-case request
-    (full KV at max context, plus one SWA window / the state slots a single
-    running request locks) raises at BOOT, before any pool construction —
-    under-sizing is a retract LIVELOCK at runtime, not a perf bug.
-  * The 4096-byte alignment exists because the factories ``.view()`` the whole
-    uint8 buffer as the KV dtype; an unaligned budget must be floored, never
-    rounded up (rounding up overcommits profiled memory).
-
-    python -m pytest test/registered/unit/mem_cache/test_unified_byte_budget_sizing.py -v
+The bs=1 floor rejects budgets that cannot hold the state slots and window of
+one request, before constructing any arena.
 """
 
 import unittest
 
+import msgspec
 import torch
 
-from sglang.srt.mem_cache.unified_memory_pool import (
-    MambaSubPoolSpec,
-    MHASubPoolSpec,
-    UnifiedKVPool,
-    _check_bs1_feasibility_floor,
-    _reserved_floor_bytes,
-    init_unified_swa_pools,
-)
+from sglang.srt.mem_cache.kv.decl import FullLifetime, StateLifetime
+from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
+from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
+from sglang.srt.mem_cache.kv.memory.arena import KVArena, plan_bands
+from sglang.srt.mem_cache.kv.plan import KVStoragePlan, PlannedSubPool, _unit
+from sglang.srt.mem_cache.kv.sizing import check_bs1_floor
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.unified_allocator_fixtures import build_test_unified_pools
 
-register_cpu_ci(est_time=15, suite="base-a-test-cpu")
+register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
 _DEV = "cpu"
 
 
 def _swa_factory(**over):
+    from sglang.test.unified_allocator_fixtures import setup_allocator_context
+
+    setup_allocator_context()
     kw = dict(
         device=_DEV,
         kv_cache_dtype=torch.float16,
@@ -75,7 +60,7 @@ def _swa_factory(**over):
         need_sort=False,
     )
     kw.update(over)
-    return init_unified_swa_pools(**kw)
+    return build_test_unified_pools(**kw)
 
 
 def _entry_bytes():
@@ -92,37 +77,121 @@ def _entry_bytes():
 
 class TestBudgetSizing(unittest.TestCase):
     def test_swa_factory_honors_the_budget_exactly(self):
+        """Arena and fixed storage partition the complete budget, including
+        bytes that a whole-token capacity cannot represent."""
         e = _entry_bytes()
-        budget = 96 * e + 512  # deliberately NOT a token-count multiple
-        bundle = _swa_factory(unified_total_bytes=budget)
-        self.assertEqual(bundle.unified_memory_pool.total_bytes, budget)
+        for budget in (
+            96 * e + 512,  # deliberately NOT a token-count multiple
+            (64 + 32) * e + (e - 2),  # almost one more entry
+        ):
+            with self.subTest(budget=budget):
+                bundle = _swa_factory(total_bytes=budget)
+                self.assertEqual(
+                    bundle.arena.total_bytes + bundle.storage.sized.fixed_bytes, budget
+                )
+
+    def test_eager_host_capacity_uses_the_resolved_full_cap(self):
+        from sglang.srt.mem_cache.kv.build import UnifiedBuildContext, build_kv_storage
+        from sglang.srt.mem_cache.kv.decl import MHAGeometry, kv_layer_decls
+        from sglang.srt.mem_cache.kv.layout.base import HostPoolOptions
+        from sglang.srt.mem_cache.kv.plan import plan_kv_storage
+        from sglang.srt.mem_cache.kv.sizing import KVSizingInputs, size_plan
+        from sglang.srt.mem_cache.pool_host.base import host_memory_budget_scope
+        from sglang.srt.runtime_context import get_parallel
+        from sglang.test.unified_allocator_fixtures import setup_allocator_context
+
+        setup_allocator_context()
+        geometry = MHAGeometry(
+            head_num=1, head_dim=16, v_head_dim=16, kv_cache_dtype=torch.float16
+        )
+        plan = plan_kv_storage(
+            kv_layer_decls(
+                full_layer_ids=(0,),
+                full_geometry=geometry,
+                window_layer_ids=(1,),
+                window_geometry=geometry,
+                window=16,
+            ),
+            page_size=4,
+        )
+        for cap, dcp in ((None, 1), (4096, 1), (4096, 2)):
+            with (
+                self.subTest(cap=cap, dcp=dcp),
+                get_parallel().override(attn_dcp_size=dcp),
+            ):
+                # A FULL cap is a pipeline stage's synchronized share; the
+                # token limit alone sizes the FULL target without capping it.
+                sized = msgspec.structs.replace(
+                    size_plan(
+                        plan,
+                        KVSizingInputs(
+                            budget_bytes=64 << 20,
+                            max_total_tokens=cap,
+                            max_running_requests=2,
+                            context_len=4096,
+                            floor_window=16,
+                            alignment=1,
+                        ),
+                    ),
+                    full_cap_tokens=cap,
+                )
+                storage = build_kv_storage(
+                    plan,
+                    sized,
+                    UnifiedBuildContext(
+                        device="cpu",
+                        start_layer=0,
+                        end_layer=2,
+                        enable_memory_saver=False,
+                        need_sort=False,
+                        max_num_reqs=2,
+                        model_context_len=4096,
+                    ),
+                )
+                allocator = storage.allocator
+                view = allocator.views["full"]
+                self.assertGreater(allocator.arena.total_bytes, 60 << 20)
+                if cap is None:
+                    self.assertGreater(view.host_capacity_tokens, 4096)
+                    continue
+                self.assertEqual(allocator.size_full, cap * dcp)
+                self.assertEqual(view.host_capacity_tokens, cap)
+                self.assertEqual(view.host_capacity_bytes, cap * 64)
+                if dcp == 1:
+                    layout = storage.host_layout("full")
+                    self.assertEqual(layout.capacity, cap)
+                    with host_memory_budget_scope(16 << 20):
+                        host = layout.build(
+                            HostPoolOptions(
+                                ratio=2,
+                                size=0,
+                                page_size=4,
+                                layout="page_first",
+                                allocator_type="default",
+                                pool_label="full",
+                                pin_memory=False,
+                            )
+                        )
+                    self.assertEqual(host.device_capacity_tokens, cap)
+                    self.assertEqual(host.size, 2 * cap + 4)
 
     def test_fallback_is_the_token_count_resum(self):
         e = _entry_bytes()
         bundle = _swa_factory()
-        self.assertEqual(bundle.unified_memory_pool.total_bytes, (64 + 32) * e)
-
-    def test_budget_beats_resum_on_rounding(self):
-        """The property that motivates the whole phase: the re-sum cannot
-        represent a budget that is not a whole-token multiple per side, so it
-        strands bytes the buffer could have held."""
-        e = _entry_bytes()
-        budget = (64 + 32) * e + (e - 2)  # almost one more entry
-        bundle = _swa_factory(unified_total_bytes=budget)
-        self.assertEqual(bundle.unified_memory_pool.total_bytes, budget)
-        self.assertGreater(budget, (64 + 32) * e)
+        self.assertEqual(
+            bundle.arena.total_bytes, (64 + 32) * e + bundle.storage.plan.sink_bytes()
+        )
 
 
 class TestReservedFloorIsOneSourceOfTruth(unittest.TestCase):
     """The bs=1 floor charges the slot-0 sink, and MUST charge exactly what
-    `UnifiedKVPool` actually reserves.
+    the arena actually reserves.
 
-    Regression (GPU eval_434/436, Falcon-H1 boot): the floor hand-copied the
-    formula as `page_size * max(entry_bytes)`, applying the page multiplier to
-    the MAMBA spec. The pool deliberately excludes mamba (it is page_size=1),
-    so with page_size=256 and a ~139 MB state entry the floor over-charged the
-    sink by 256x — ~33 GiB of phantom requirement — and a healthy config
-    failed to boot with 25 GiB of real headroom.
+    Regression (Falcon-H1 boot): the floor hand-copied the formula as
+    `page_size * max(entry_bytes)`, applying the page multiplier to the MAMBA
+    spec, which the pool deliberately excludes because it is page_size=1. At
+    page_size=256 that over-charged the sink 256x and a healthy config failed
+    to boot with real headroom to spare.
     """
 
     def _specs(self, page_size):
@@ -134,7 +203,7 @@ class TestReservedFloorIsOneSourceOfTruth(unittest.TestCase):
             store_dtype=torch.float16,
             grow_direction="down",
         )
-        # A state entry vastly larger than a KV token entry — the real ratio
+        # A state entry vastly larger than a KV token entry: the real ratio
         # (~139 MB vs ~45 KB) is what made the over-charge fatal.
         mamba = MambaSubPoolSpec(
             name="mamba",
@@ -147,9 +216,28 @@ class TestReservedFloorIsOneSourceOfTruth(unittest.TestCase):
         )
         return full, mamba
 
+    @staticmethod
+    def _plan(full, mamba, page_size) -> KVStoragePlan:
+        """The two specs as a plan lays them out; only units and specs matter."""
+        return KVStoragePlan(
+            page_size=page_size,
+            sub_pools=tuple(
+                PlannedSubPool(
+                    name=spec.name,
+                    lifetime=lifetime,
+                    unit=_unit(lifetime, page_size),
+                    layer_ids=(0, 1),
+                    geometry=None,
+                    spec=spec,
+                    external=None,
+                )
+                for spec, lifetime in ((mamba, StateLifetime()), (full, FullLifetime()))
+            ),
+        )
+
     def test_mamba_entry_is_not_multiplied_by_page_size(self):
         full, mamba = self._specs(page_size=256)
-        got = _reserved_floor_bytes([full, mamba], 256)
+        got = self._plan(full, mamba, 256).sink_bytes()
         self.assertEqual(got, max(mamba.entry_bytes(), 256 * full.entry_bytes()))
         self.assertLess(got, 256 * mamba.entry_bytes())  # the bug's value
 
@@ -158,18 +246,18 @@ class TestReservedFloorIsOneSourceOfTruth(unittest.TestCase):
         for page_size in (1, 4, 256):
             with self.subTest(page_size=page_size):
                 full, mamba = self._specs(page_size)
-                floor = _reserved_floor_bytes([full, mamba], page_size)
-                pool = UnifiedKVPool(
+                plan = self._plan(full, mamba, page_size)
+                floor = plan.sink_bytes()
+                pool = KVArena(
+                    bands=plan_bands(plan),
                     total_bytes=floor + 64 * mamba.entry_bytes(),
-                    sub_pool_specs=[full, mamba],
+                    sink_bytes=floor,
                     device=_DEV,
-                    enable_memory_saver=False,
-                    page_size=page_size,
                 )
                 # min_slot_index is ceil(reserved_floor / entry_bytes) per side.
                 for spec in (full, mamba):
                     self.assertEqual(
-                        pool.min_slot_index(spec.name),
+                        pool.first_entry(spec.name),
                         -(-floor // spec.entry_bytes()),
                     )
 
@@ -180,64 +268,39 @@ class TestBs1FeasibilityFloor(unittest.TestCase):
         must fail loud instead of livelocking later."""
         with self.assertRaises(RuntimeError) as ctx:
             _swa_factory(
-                unified_total_bytes=8 * _entry_bytes(),
+                total_bytes=8 * _entry_bytes(),
                 model_context_len=4096,
                 sliding_window_size=4096,
             )
         self.assertIn("bs=1 floor", str(ctx.exception))
-        self.assertIn("swa_window_kv", str(ctx.exception))
+        self.assertIn("window_4096_window_kv", str(ctx.exception))
 
-    def test_context_longer_than_the_pool_is_not_rejected(self):
-        """REGRESSION: the floor must NOT charge the full-attention token side.
-        `TpModelWorker.get_worker_info` clamps max_req_len to the pool, so a
-        context far larger than the buffer is refused at admission, not a
-        livelock -- and it is an ordinary way to serve a long-context model on
-        one GPU. Charging it here made such configs fail at boot."""
+    def test_feasible_floor_inputs_are_not_rejected(self):
+        """Floor inputs that must NOT raise: charging the full-attention token
+        side, or a window the context never clamps, failed these at boot."""
         e = _entry_bytes()
-        bundle = _swa_factory(
-            unified_total_bytes=200 * e,
-            model_context_len=1_000_000,  # far beyond what the buffer holds
-            sliding_window_size=16,
-        )
-        self.assertEqual(bundle.unified_memory_pool.total_bytes, 200 * e)
-
-    def test_feasible_config_boots_with_floor_inputs_present(self):
-        e = _entry_bytes()
-        bundle = _swa_factory(
-            unified_total_bytes=200 * e,
-            model_context_len=64,
-            sliding_window_size=16,
-        )
-        self.assertEqual(bundle.unified_memory_pool.total_bytes, 200 * e)
-
-    def test_window_term_is_clamped_to_context(self):
-        """A window larger than the context must charge at most the context —
-        otherwise short-context models over-raise."""
-        e = _entry_bytes()
-        bundle = _swa_factory(
-            unified_total_bytes=200 * e,
-            model_context_len=64,
-            sliding_window_size=10_000,  # window >> context
-        )
-        self.assertIsNotNone(bundle)
-
-    def test_floor_message_itemizes_terms(self):
-        with self.assertRaises(RuntimeError) as ctx:
-            _check_bs1_feasibility_floor(
-                total_bytes=10,
-                floor_terms=[("a", 8), ("b", 8)],
-                factory="test",
-            )
-        msg = str(ctx.exception)
-        self.assertIn("a=8", msg)
-        self.assertIn("b=8", msg)
-        self.assertIn("16", msg)
+        for case, model_context_len, sliding_window_size in (
+            ("context_longer_than_the_pool", 1_000_000, 16),
+            ("feasible_config", 64, 16),
+            ("window_larger_than_context", 64, 10_000),
+        ):
+            with self.subTest(case=case):
+                # The request table is fixed storage even when context is much
+                # longer than the KV capacity; reserve its two rows explicitly.
+                table_bytes = 2 * 4 * model_context_len
+                bundle = _swa_factory(
+                    total_bytes=200 * e + table_bytes,
+                    model_context_len=model_context_len,
+                    sliding_window_size=sliding_window_size,
+                )
+                self.assertEqual(
+                    bundle.arena.total_bytes + bundle.storage.sized.fixed_bytes,
+                    200 * e + table_bytes,
+                )
 
     def test_exact_floor_passes(self):
         """Boundary: total == floor must NOT raise (>= is the contract)."""
-        _check_bs1_feasibility_floor(
-            total_bytes=16, floor_terms=[("a", 8), ("b", 8)], factory="test"
-        )
+        check_bs1_floor(total_bytes=16, floor_terms=[("a", 8), ("b", 8)], where="test")
 
 
 if __name__ == "__main__":

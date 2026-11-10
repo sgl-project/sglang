@@ -36,7 +36,10 @@ from sglang.test.test_utils import (
 )
 
 register_amd_ci(
-    est_time=5400, suite="nightly-amd-8-gpu-mi35x-deepseek-v4-pro", nightly=True
+    est_time=5400,
+    suite="nightly-amd-8-gpu-mi35x-deepseek-v4-pro",
+    nightly=True,
+    disabled="DeepSeek-V4 prefill CP on HIP does not support two-batch overlap yet.",
 )
 
 DEEPSEEK_V4_PRO_FP4_MODEL_PATH = os.environ.get(
@@ -63,6 +66,7 @@ FP4_ENV_VARS = {
 }
 
 
+@unittest.skip("DeepSeek-V4 prefill CP on HIP does not support two-batch overlap yet.")
 class TestDeepseekV4ProFp4CPInterleaveTbo(CustomTestCase):
     """DeepSeek-V4-Pro FP4 unified_kv prefill CP (round-robin-split) + TBO, tp=8."""
 

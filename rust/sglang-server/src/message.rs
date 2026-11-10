@@ -2,12 +2,16 @@
 //! buffers are `bytes::Bytes`, so fanning one out to several detok shards is a
 //! refcount bump, not a copy.
 
+pub mod buffers;
 pub mod config;
 pub mod detok;
 pub mod finish_reason;
 pub mod ids;
+pub mod info;
 pub mod io_struct;
+pub mod multimodal;
 pub mod request;
 pub mod response;
 pub mod sampling;
 pub mod types;
+pub mod wire;

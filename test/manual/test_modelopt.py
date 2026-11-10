@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.run_eval import run_eval
+from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_MODELOPT_QUANT_ACCURACY_TEST_FP8,
     DEFAULT_MODEL_NAME_FOR_MODELOPT_QUANT_ACCURACY_TEST_FP8_REVISION,
@@ -37,7 +37,7 @@ class TestEvalFP8ModelOptQuantAccuracy(CustomTestCase):
                 temperature=0.1,
             )
 
-            metrics = run_eval(args)
+            metrics = run_sgl_eval(args)
             self.assertGreaterEqual(metrics["score"], expected_score)
         finally:
             kill_process_tree(process.pid)

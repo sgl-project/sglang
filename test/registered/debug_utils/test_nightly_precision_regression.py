@@ -225,6 +225,9 @@ def _collect_ci_context() -> dict[str, Any]:
         ("GITHUB_ACTOR", "ci_actor"),
         ("GITHUB_REF", "git_ref"),
         ("GITHUB_WORKFLOW", "ci_workflow"),
+        # Numerics are bit-reproducible across healthy runners, so a deviation
+        # that follows one runner across commits points at that machine.
+        ("RUNNER_NAME", "ci_runner"),
     ):
         v = os.environ.get(env_key)
         if v:
@@ -608,7 +611,7 @@ def _run_server_and_dump(
         "--mem-fraction-static",
         "0.9",
         "--disable-cuda-graph",
-        "--disable-piecewise-cuda-graph",
+        "--cuda-graph-backend-prefill=disabled",
         "--disable-radix-cache",
         "--flashinfer-allreduce-fusion-backend",
         PRECISION_FUSION_BACKEND,

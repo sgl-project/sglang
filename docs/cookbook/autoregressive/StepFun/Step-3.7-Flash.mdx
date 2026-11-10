@@ -1,5 +1,5 @@
 ---
-title: Step-3.7-Flash (new)
+title: Step-3.7-Flash
 metatags:
     description: "Deploy Step-3.7-Flash multimodal reasoning engine with SGLang."
 ---

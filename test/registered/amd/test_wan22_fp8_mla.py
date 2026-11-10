@@ -101,13 +101,6 @@ FP8_MLA_CASES = [
 class TestWan22FP8MLA(DiffusionServerBase):
     """AMD test for FP8 MLA attention on Wan2.2-T2V-A14B."""
 
-    @classmethod
-    def teardown_class(cls):
-        try:
-            super().teardown_class()
-        except AttributeError:
-            pass
-
     @pytest.fixture(params=FP8_MLA_CASES, ids=lambda c: c.id)
     def case(self, request) -> DiffusionTestCase:
         return request.param

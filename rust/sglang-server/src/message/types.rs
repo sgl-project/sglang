@@ -2,12 +2,15 @@
 //! adapter (with the sealed allowlist that keeps its `untagged` selection safe),
 //! and the msgspec tagging machinery behind [`wire_struct!`].
 
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
+
+use crate::utils::error::Error;
 
 /// A flat token-id buffer — one request's `array("q")` cell on the Python side.
 /// Wrapped in [`OneOrMany`] on the wire, where a bare list is one prompt's ids
 /// (or a broadcast) and a list of lists is per-prompt.
-pub type TokenIds = Vec<i32>;
+pub type TokenIds = Vec<i64>;
 
 /// A field taking a bare `T` **or** `[T,…]` (`text: "hi"` or `text: ["a","b"]`).
 /// `untagged` takes the first variant that matches, so a `T` that itself accepts
@@ -28,11 +31,12 @@ pub enum OneOrMany<T: OneOrManyItem> {
 /// a batch silently arrives as a single request. Those types need a
 /// `deserialize_any` dispatch instead (see [`SamplingParamsInput`]).
 ///
-/// [`TokenIds`] is the one member that does accept a sequence, and that ambiguity
-/// is the intended semantics: flat `[1,2]` is one prompt's ids (or a broadcast),
-/// `[[1],[2]]` is per-prompt — the shapes Python's `_normalize_batch`
-/// distinguishes. `String` / `bool` / `i64` never match a list, so both forms
-/// round-trip.
+/// [`TokenIds`] and `Vec<String>` are the members that do accept a sequence, and
+/// that ambiguity is the intended semantics: flat `[1,2]` is one prompt's ids
+/// (or a broadcast), `[[1],[2]]` is per-prompt — the shapes Python's
+/// `_normalize_batch` distinguishes, and `mm_hashes`'s
+/// `Union[List[str], List[List[str]]]` reads the same way. `String` / `bool` /
+/// `i64` never match a list, so both forms round-trip.
 pub trait OneOrManyItem: sealed::SealedItem {}
 
 impl<T: sealed::SealedItem> OneOrManyItem for T {}
@@ -45,6 +49,8 @@ mod sealed {
     impl SealedItem for i64 {}
     impl SealedItem for String {}
     impl SealedItem for super::TokenIds {}
+    /// `mm_hashes`: a flat list is one request's hashes, nested is per-request.
+    impl SealedItem for Vec<String> {}
     // Nullable elements for the PD bootstrap fields (`List[Optional[...]]` in
     // Python — the PD router sends `bootstrap_port: [null, …]` when deferring to
     // the scheduler's default port). A bare `null` never reaches `One(None)`: the
@@ -209,6 +215,9 @@ macro_rules! control_messages {
         #[derive(Debug)]
         pub enum ControlRequest {
             $($name($name),)+
+            /// A message another listener already encoded for its own DP
+            /// rank's scheduler, relayed to this one unchanged.
+            Forwarded($crate::message::types::ForwardedControlReq),
         }
 
         impl ControlRequest {
@@ -217,6 +226,7 @@ macro_rules! control_messages {
             pub(crate) fn rid(&self) -> &str {
                 match self {
                     $(Self::$name(m) => m.get_rid(),)+
+                    Self::Forwarded(m) => &m.rid,
                 }
             }
 
@@ -225,6 +235,7 @@ macro_rules! control_messages {
             pub(crate) fn encode(&self) -> Result<Bytes, Error> {
                 match self {
                     $(Self::$name(m) => m.encode(),)+
+                    Self::Forwarded(m) => Ok(m.header.clone()),
                 }
             }
         }
@@ -234,9 +245,49 @@ macro_rules! control_messages {
 // `macro_rules!` is scoped by declaration order; name it so siblings can `use` it.
 pub(super) use {control_messages, wire_struct};
 
+/// A control message encoded by another listener (`wire_struct`'s positional
+/// `[tag, rid, http_worker_ipc, ...]`), carried as those bytes. Only the rid
+/// is read here, to route the scheduler's reply; the tag and fields are the
+/// scheduler's to validate, as for a message this process encoded itself.
+#[derive(Debug)]
+pub struct ForwardedControlReq {
+    pub rid: String,
+    pub header: Bytes,
+}
+
+impl ForwardedControlReq {
+    pub fn parse(header: Bytes) -> Result<Self, Error> {
+        let value = rmpv::decode::read_value(&mut &header[..])
+            .map_err(|e| Error::Codec(format!("forwarded control request: {e}")))?;
+        let rid = match &value {
+            rmpv::Value::Array(items) if items.len() >= 2 => items[1].as_str(),
+            _ => None,
+        }
+        .filter(|rid| !rid.is_empty())
+        .ok_or_else(|| Error::Codec("forwarded control request: no rid at position 1".into()))?;
+        Ok(Self {
+            rid: rid.to_owned(),
+            header,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A forwarded header's rid is the one at the `BaseReq` position, so the
+    /// scheduler's reply routes back to the relaying request.
+    #[test]
+    fn forwarded_control_reads_the_rid_from_the_base_req_position() {
+        let header = rmp_serde::to_vec(&("FlushCacheReqInput", "rid-7", (), 1.5)).unwrap();
+        let forwarded = ForwardedControlReq::parse(Bytes::from(header.clone())).unwrap();
+        assert_eq!(forwarded.rid, "rid-7");
+        assert_eq!(forwarded.header, Bytes::from(header));
+        assert!(ForwardedControlReq::parse(Bytes::from_static(b"\xc0")).is_err());
+        let no_rid = rmp_serde::to_vec(&("FlushCacheReqInput", (), ())).unwrap();
+        assert!(ForwardedControlReq::parse(Bytes::from(no_rid)).is_err());
+    }
 
     /// Pins `untagged`'s first-match-wins variant selection for the vetted
     /// [`OneOrManyItem`] types: the `TokenIds` rows are the shapes

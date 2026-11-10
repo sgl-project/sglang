@@ -12,6 +12,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget i
     host_copies_would_not_fit,
     host_memory_available_bytes,
     module_weight_bytes,
+    page_cache_cannot_hold,
     pin_benefit_bytes,
 )
 
@@ -19,12 +20,16 @@ _V2_FILES = ("memory.max", "memory.current")
 _V1_FILES = ("memory.limit_in_bytes", "memory.usage_in_bytes")
 
 
-def _write_cgroup(directory, files, values):
-    """Lay out one cgroup directory's limit and usage files."""
+def _write_cgroup(directory, files, values, stat=None):
+    """Lay out one cgroup directory's limit, usage and memory.stat files."""
     directory.mkdir(parents=True, exist_ok=True)
     if values is not None:
         for name, value in zip(files, values):
             (directory / name).write_text(str(value))
+    if stat is not None:
+        (directory / "memory.stat").write_text(
+            "".join(f"{key} {value}\n" for key, value in stat.items())
+        )
     return directory
 
 
@@ -194,6 +199,83 @@ class TestNestedCgroup:
         assert cgroup_memory_limit_bytes() == (32 * GIB_BYTES, 0)
 
 
+class TestCgroupPageCache:
+    @staticmethod
+    def _capped(monkeypatch, tmp_path, *, v2=None, v1=None, stat):
+        # psutil sees a large machine, so the cgroup reading decides
+        _point_at(monkeypatch, tmp_path, v2=v2, v1=v1)
+        version, files, values = ("v2", _V2_FILES, v2) if v2 else ("v1", _V1_FILES, v1)
+        _write_cgroup(tmp_path / version, files, values, stat=stat)
+        monkeypatch.setattr(
+            host_memory_budget.psutil,
+            "virtual_memory",
+            lambda: type("VM", (), {"available": 900 * GIB_BYTES})(),
+        )
+
+    def test_page_cache_charged_to_a_capped_cgroup_counts_as_available(
+        self, monkeypatch, tmp_path
+    ):
+        """Cache left in a capped cgroup is reclaimed under the cap, so it must count
+        as available the way MemAvailable counts it outside a cgroup."""
+        # a 56 GiB scope right after another engine read its checkpoint there
+        self._capped(
+            monkeypatch,
+            tmp_path,
+            v2=(56 * GIB_BYTES, 38 * GIB_BYTES),
+            stat={
+                "anon": 14 * GIB_BYTES,
+                "file": 24 * GIB_BYTES,
+                "active_file": 10 * GIB_BYTES,
+                "inactive_file": 14 * GIB_BYTES,
+            },
+        )
+        assert host_memory_available_bytes() == 42 * GIB_BYTES
+        assert not host_copies_would_not_fit(30 * GIB_BYTES)
+
+    def test_a_mapping_the_cache_already_holds_is_room_for_itself(
+        self, monkeypatch, tmp_path
+    ):
+        # A streamed mapping sits on the active list. Counting only inactive
+        # cache would send a mapping that is already cached to direct reads.
+        self._capped(
+            monkeypatch,
+            tmp_path,
+            v2=(56 * GIB_BYTES, 50 * GIB_BYTES),
+            stat={"active_file": 30 * GIB_BYTES, "inactive_file": 0},
+        )
+        assert not page_cache_cannot_hold(30 * GIB_BYTES)
+
+    def test_shmem_charged_to_the_cgroup_is_not_available(self, monkeypatch, tmp_path):
+        # v2 "file" includes tmpfs and shm, which only swap can reclaim
+        self._capped(
+            monkeypatch,
+            tmp_path,
+            v2=(32 * GIB_BYTES, 24 * GIB_BYTES),
+            stat={
+                "file": 20 * GIB_BYTES,
+                "shmem": 8 * GIB_BYTES,
+                "active_file": 6 * GIB_BYTES,
+                "inactive_file": 6 * GIB_BYTES,
+            },
+        )
+        assert host_memory_available_bytes() == 20 * GIB_BYTES
+
+    def test_v1_subtracts_the_cache_of_the_whole_subtree(self, monkeypatch, tmp_path):
+        # v1 usage_in_bytes covers descendants; the unprefixed stat keys do not
+        self._capped(
+            monkeypatch,
+            tmp_path,
+            v1=(32 * GIB_BYTES, 20 * GIB_BYTES),
+            stat={
+                "active_file": 0,
+                "inactive_file": 0,
+                "total_active_file": 4 * GIB_BYTES,
+                "total_inactive_file": 6 * GIB_BYTES,
+            },
+        )
+        assert host_memory_available_bytes() == 22 * GIB_BYTES
+
+
 class TestHostPinBudget:
     def test_a_component_that_fits_is_granted(self):
         budget = HostPinBudget(available_bytes=40 * GIB_BYTES)
@@ -298,4 +380,31 @@ def test_the_forced_host_size_behaves_like_a_machine_of_that_size(monkeypatch):
     larger = host_memory_budget.host_memory_available_bytes()
     assert abs((larger - available) - 32 * 1024**3) < 512 * 1024**2, (
         "the same process on a machine twice the size has one machine more room"
+    )
+
+
+def test_the_physical_reading_ignores_the_forced_host_view(monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        host_memory_budget.psutil,
+        "virtual_memory",
+        lambda: SimpleNamespace(available=200 * host_memory_budget.GIB_BYTES),
+    )
+    monkeypatch.setattr(
+        host_memory_budget, "cgroup_memory_limit_bytes", lambda *a, **k: None
+    )
+    monkeypatch.setenv("SGLANG_DIFFUSION_TEST_FORCE_HOST_AVAILABLE_GIB", "32")
+    # the pretend host sizes our own copies ...
+    assert (
+        host_memory_budget.host_memory_available_bytes()
+        <= 32 * host_memory_budget.GIB_BYTES
+    )
+    # ... but not what the kernel's page cache can hold
+    assert (
+        host_memory_budget.physical_host_memory_available_bytes()
+        == 200 * host_memory_budget.GIB_BYTES
+    )
+    assert not host_memory_budget.page_cache_cannot_hold(
+        45 * host_memory_budget.GIB_BYTES
     )

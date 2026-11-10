@@ -76,6 +76,10 @@ def _from_nvidia_kda_state_layout(
 
 
 class NvidiaKDAKernel(LinearAttnKernelBase):
+    # Tracked batches route to the embedded Triton fallback, which forwards
+    # the fp32 snapshot arguments (see _triton_extend).
+    supports_track_state_snapshot: bool = True
+
     def __init__(self):
         # This kernel uses tcgen05 + TMEM, which are available on datacenter
         # Blackwell (SM100/SM103, reported as capability major 10), but not on
@@ -233,8 +237,11 @@ class NvidiaKDAKernel(LinearAttnKernelBase):
         dt_bias: Optional[torch.Tensor] = None,
         lower_bound: Optional[float] = None,
         return_intermediate_states: bool = False,
+        beta_is_raw: bool = False,
         **kwargs,
     ) -> torch.Tensor:
+        if beta_is_raw:
+            beta = beta.float().sigmoid()
         num_tokens = q.shape[1]
         seq_lens_cpu = kwargs.get("extend_seq_lens_cpu")
         track_h_src = kwargs.get("track_ssm_h_src")

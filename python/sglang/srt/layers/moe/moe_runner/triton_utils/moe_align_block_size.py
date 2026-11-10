@@ -34,6 +34,9 @@ def moe_align_block_size(
     block_size: int,
     num_experts: int,
     ignore_invalid_expert: bool = False,
+    *,
+    return_inactive_prefix_count: bool = False,
+    pad_expert_ids: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Aligns the token distribution across experts to be compatible with block
@@ -50,7 +53,9 @@ def moe_align_block_size(
         to their allocated expert.
     - expert_ids: A tensor indicating the assigned expert index for each block.
     - num_tokens_post_padded: The total number of tokens after padding,
-        ensuring divisibility by block_size.
+        ensuring divisibility by block_size. Opting into ``return_inactive_prefix_count``
+        returns int32 ``[padded_tokens, inactive_blocks]`` from a supporting local
+        producer; the second word counts negative physical blocks, not tokens.
 
     This function pads the number of tokens that each expert needs to process
     so that it is divisible by block_size.
@@ -72,22 +77,47 @@ def moe_align_block_size(
     - The padding ensures that the total number of tokens is now divisible
         by block_size for proper block matrix operations.
     """
+    if pad_expert_ids and (not _is_cuda or ignore_invalid_expert):
+        raise ValueError(
+            "Padding expert IDs requires CUDA and the invalid-expert bucket"
+        )
+
+    if return_inactive_prefix_count:
+        if not _is_cuda or ignore_invalid_expert or num_experts > 8191:
+            raise ValueError(
+                "Inactive-prefix counts require CUDA alignment with at most 8191 experts and the +1 bucket convention"
+            )
     # ===== TO BE REFACTORED ====
-    if _SGLANG_EXPERIMENTAL_LORA_OPTI:
+    if _SGLANG_EXPERIMENTAL_LORA_OPTI and not pad_expert_ids:
         from sglang.srt.lora.trtllm_lora_temp.environ import lora_envs
 
         if lora_envs.SGLANG_OPT_USE_JIT_KERNEL_MOE_ALIGN.get() and num_experts <= 8191:
-            from sglang.kernels.ops.moe.trtllm_lora_temp.virtual_experts import (
+            from sglang.kernels.ops.lora.moe.virtual_experts import (
                 _align_block_size_jit,
             )
 
-            return _align_block_size_jit(topk_ids, block_size, num_experts)
+            if return_inactive_prefix_count:
+                return _align_block_size_jit(
+                    topk_ids,
+                    block_size,
+                    num_experts,
+                    return_inactive_prefix_count=return_inactive_prefix_count,
+                    map_invalid_experts_to_sentinel=False,
+                )
+            return _align_block_size_jit(
+                topk_ids,
+                block_size,
+                num_experts,
+                map_invalid_experts_to_sentinel=False,
+            )
     # ===== END TO BE REFACTORED ====
 
     if topk_ids.numel() < num_experts + 1:
         max_num_tokens_padded = topk_ids.numel() * block_size
     else:
         max_num_tokens_padded = topk_ids.numel() + (num_experts + 1) * (block_size - 1)
+    # The align kernel pads sorted_ids with int4 stores.
+    max_num_tokens_padded = (max_num_tokens_padded + 3) // 4 * 4
 
     sorted_ids = torch.empty(
         (max_num_tokens_padded,), dtype=torch.int32, device=topk_ids.device
@@ -96,7 +126,11 @@ def moe_align_block_size(
     expert_ids = torch.empty(
         (max_num_m_blocks,), dtype=torch.int32, device=topk_ids.device
     )
-    num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device=topk_ids.device)
+    num_tokens_post_pad = torch.empty(
+        (2 if return_inactive_prefix_count else 1,),
+        dtype=torch.int32,
+        device=topk_ids.device,
+    )
 
     # In EP, expert_ids for filtered experts are -1. We have num_experts + 1 ids in total.
     cumsum_buffer = torch.empty(
@@ -114,6 +148,7 @@ def moe_align_block_size(
         and topk_ids.numel() <= SMALL_NUMEL_LIMIT
         and num_experts + 1 > _CUDA_SMALL_BATCH_MAX_BUCKETS
         and not ignore_invalid_expert
+        and not pad_expert_ids
     ):
         moe_align_small_numel(
             topk_ids,
@@ -122,15 +157,18 @@ def moe_align_block_size(
             sorted_ids,
             expert_ids,
             num_tokens_post_pad,
+            write_inactive_prefix_count=return_inactive_prefix_count,
         )
         return sorted_ids, expert_ids, num_tokens_post_pad
 
     # ===== TO BE REFACTORED ====
-    use_jit_align = False
+    use_jit_align = return_inactive_prefix_count or pad_expert_ids
     if _SGLANG_EXPERIMENTAL_LORA_OPTI:
         from sglang.srt.lora.trtllm_lora_temp.environ import lora_envs
 
-        use_jit_align = lora_envs.SGLANG_OPT_USE_JIT_KERNEL_MOE_ALIGN.get()
+        use_jit_align = (
+            use_jit_align or lora_envs.SGLANG_OPT_USE_JIT_KERNEL_MOE_ALIGN.get()
+        )
     if use_jit_align:
         from sglang.kernels.ops.moe.moe_align import (
             moe_align_block_size as jit_moe_align_block_size,
@@ -145,6 +183,8 @@ def moe_align_block_size(
             num_tokens_post_pad,
             cumsum_buffer,
             True,
+            write_inactive_prefix_count=return_inactive_prefix_count,
+            pad_expert_ids=pad_expert_ids,
         )
     # ===== END TO BE REFACTORED ====
     else:

@@ -61,13 +61,16 @@ def l2norm_fwd_kernel(
     BT: tl.constexpr,
     BD: tl.constexpr,
 ):
-    i_t = tl.program_id(0)
-    p_x = tl.make_block_ptr(x, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
-    b_x = tl.load(p_x, boundary_check=(0, 1)).to(tl.float32)
+    i_t = tl.program_id(0).to(tl.int64)
+    o_t = i_t * BT + tl.arange(0, BT)
+    o_d = tl.arange(0, BD)
+    m_x = (o_t[:, None] < T) & (o_d[None, :] < D)
+    p_x = x + o_t[:, None] * D + o_d[None, :]
+    p_y = y + o_t[:, None] * D + o_d[None, :]
+    b_x = tl.load(p_x, mask=m_x, other=0.0).to(tl.float32)
     b_var = tl.sum(b_x * b_x, axis=1)
     b_y = b_x / tl.sqrt(b_var + eps)[:, None]
-    p_y = tl.make_block_ptr(y, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
-    tl.store(p_y, b_y.to(p_y.dtype.element_ty), boundary_check=(0, 1))
+    tl.store(p_y, b_y.to(p_y.dtype.element_ty), mask=m_x)
 
 
 def l2norm_fwd(
@@ -117,6 +120,145 @@ def l2norm_fwd(
         )
 
     return y.view(x_shape_og)
+
+
+@triton.jit(do_not_specialize=["T"])
+def gdn_prefill_qkv_prepare_kernel(
+    q,
+    k,
+    v,
+    q_out,
+    k_out,
+    v_out,
+    q_stride_t,
+    q_stride_h,
+    q_stride_d,
+    k_stride_t,
+    k_stride_h,
+    k_stride_d,
+    v_stride_t,
+    v_stride_h,
+    v_stride_d,
+    T,
+    H_QK: tl.constexpr,
+    H_V: tl.constexpr,
+    D: tl.constexpr,
+    BT: tl.constexpr,
+    BD: tl.constexpr,
+):
+    """Materialize strided Q/K/V into token-major tensors in one launch."""
+    token_block = tl.program_id(0).to(tl.int64)
+    head_idx = tl.program_id(1)
+
+    o_t = token_block * BT + tl.arange(0, BT)
+    o_d = tl.arange(0, BD)
+    m_x = (o_t[:, None] < T) & (o_d[None, :] < D)
+    if head_idx < H_QK:
+        # Match l2norm_fwd_kernel's block layout so the BF16 reduction tree is
+        # unchanged for strided inputs.
+        q_block = (
+            q
+            + head_idx * q_stride_h
+            + o_t[:, None] * q_stride_t
+            + o_d[None, :] * q_stride_d
+        )
+        k_block = (
+            k
+            + head_idx * k_stride_h
+            + o_t[:, None] * k_stride_t
+            + o_d[None, :] * k_stride_d
+        )
+        q_values = tl.load(q_block, mask=m_x, other=0.0).to(tl.float32)
+        k_values = tl.load(k_block, mask=m_x, other=0.0).to(tl.float32)
+        q_output_block = q_out + head_idx * D + o_t[:, None] * (H_QK * D) + o_d[None, :]
+        k_output_block = k_out + head_idx * D + o_t[:, None] * (H_QK * D) + o_d[None, :]
+        tl.store(
+            q_output_block,
+            q_values.to(q_output_block.dtype.element_ty),
+            mask=m_x,
+        )
+        tl.store(
+            k_output_block,
+            k_values.to(k_output_block.dtype.element_ty),
+            mask=m_x,
+        )
+    else:
+        value_head = head_idx - H_QK
+        v_block = (
+            v
+            + value_head * v_stride_h
+            + o_t[:, None] * v_stride_t
+            + o_d[None, :] * v_stride_d
+        )
+        v_values = tl.load(v_block, mask=m_x, other=0.0)
+        v_output_block = (
+            v_out + value_head * D + o_t[:, None] * (H_V * D) + o_d[None, :]
+        )
+        tl.store(v_output_block, v_values, mask=m_x)
+
+
+def gdn_prefill_qkv_prepare_fwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    eps: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Prepare Q/K/V for FlashInfer, materializing only strided inputs."""
+    if q.ndim != 3 or k.shape != q.shape or v.ndim != 3:
+        raise ValueError(
+            "GDN fused prepare requires equal Q/K [T, Hqk, D] shapes and "
+            "V [T, Hv, D], got "
+            f"{q.shape=}, {k.shape=}, {v.shape=}"
+        )
+    if v.shape[0] != q.shape[0] or v.shape[2] != q.shape[2]:
+        raise ValueError(
+            "GDN fused prepare requires common token and head-dim axes, got "
+            f"{q.shape=}, {v.shape=}"
+        )
+    if q.device != k.device or q.device != v.device:
+        raise ValueError("GDN fused prepare requires Q/K/V on the same device")
+    if q.dtype != k.dtype or q.dtype != v.dtype:
+        raise ValueError("GDN fused prepare requires equal Q/K/V dtypes")
+
+    T, H_QK, D = q.shape
+    H_V = v.shape[1]
+    if D > 512:
+        raise ValueError(f"GDN fused prepare supports head dim <= 512, got {D}")
+    if q.is_contiguous() and k.is_contiguous() and v.is_contiguous():
+        return l2norm_fwd(q, eps), l2norm_fwd(k, eps), v
+
+    q_out = torch.empty(q.shape, dtype=q.dtype, device=q.device)
+    k_out = torch.empty(k.shape, dtype=k.dtype, device=k.device)
+    v_out = torch.empty(v.shape, dtype=v.dtype, device=v.device)
+    BT = 16
+    BD = triton.next_power_of_2(D)
+    grid = (triton.cdiv(T, BT), H_QK + H_V)
+    gdn_prefill_qkv_prepare_kernel[grid](
+        q,
+        k,
+        v,
+        q_out,
+        k_out,
+        v_out,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        v.stride(0),
+        v.stride(1),
+        v.stride(2),
+        T=T,
+        H_QK=H_QK,
+        H_V=H_V,
+        D=D,
+        BT=BT,
+        BD=BD,
+        num_warps=4,
+        num_stages=2,
+    )
+    return l2norm_fwd(q_out, eps), l2norm_fwd(k_out, eps), v_out
 
 
 class L2NormFunction(torch.autograd.Function):

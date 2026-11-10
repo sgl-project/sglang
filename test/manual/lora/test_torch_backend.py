@@ -3,7 +3,8 @@ import unittest
 import torch
 
 from sglang.srt.lora.backend.torch_backend import TorchNativeLoRABackend
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.lora_utils import reference_sgmv_expand, reference_sgmv_shrink
 from sglang.test.test_utils import CustomTestCase
 
@@ -103,18 +104,20 @@ class TestTorchNativeLoRABackend(CustomTestCase):
             self.lora_ranks, dtype=torch.int32, device=self.device
         )
 
+        output_offset = torch.tensor(
+            [0, weight_out_dim], dtype=torch.int32, device="cpu"
+        )
+
         expect_output = reference_sgmv_expand(
             x,
             weights,
             weight_indices_tensor,
             seg_len_tensor,
             lora_ranks_tensor,
-            slice_offsets=torch.tensor(
-                [0, weight_out_dim], dtype=torch.int32, device="cpu"
-            ),
+            slice_offsets=output_offset,
         )
 
-        actual_output = self.backend.run_lora_b_sgemm(x, weights)
+        actual_output = self.backend.run_lora_b_sgemm(x, weights, output_offset)
 
         self.assertTrue(torch.allclose(actual_output, expect_output))
 
@@ -237,7 +240,9 @@ class TestTorchNativeLoRABackend(CustomTestCase):
             slice_offsets=output_offset,
         )
 
-        actual_output = self.backend.run_gate_up_lora(x, gate_up_lora_a, gate_up_lora_b)
+        actual_output = self.backend.run_gate_up_lora(
+            x, gate_up_lora_a, gate_up_lora_b, output_offset
+        )
         self.assertTrue(torch.allclose(actual_output, expect_output))
 
 

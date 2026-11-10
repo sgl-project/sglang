@@ -6,6 +6,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Callable
 
+import msgspec
 import torch
 
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -109,6 +110,18 @@ class _BoundedCaptureCache:
             or self.evict_on_miss
         )
 
+    def _evict_lru(self) -> None:
+        evicted_signature, evicted = self.entries.popitem(last=False)
+        self._release(evicted)
+        self.evictions += 1
+        logger.debug(
+            "Evicted VLA %s CUDA graph for signature %s (entries=%d/%d)",
+            self.name,
+            evicted_signature,
+            len(self.entries),
+            self.max_entries,
+        )
+
     def prepare_admission(self, signature: Any) -> None:
         if (
             signature in self.entries
@@ -116,16 +129,7 @@ class _BoundedCaptureCache:
             or not self.evict_on_miss
         ):
             return
-        evicted_signature, evicted = self.entries.popitem(last=False)
-        self._release(evicted)
-        self.evictions += 1
-        logger.info(
-            "Evicted VLA %s CUDA graph for signature %s (entries=%d/%d)",
-            self.name,
-            evicted_signature,
-            len(self.entries),
-            self.max_entries,
-        )
+        self._evict_lru()
 
     def put(self, signature: Any, entry: Any) -> bool:
         if self.max_entries == 0 or not self.can_admit(signature):
@@ -138,16 +142,7 @@ class _BoundedCaptureCache:
         self.captures += 1
 
         if len(self.entries) > self.max_entries:
-            evicted_signature, evicted = self.entries.popitem(last=False)
-            self._release(evicted)
-            self.evictions += 1
-            logger.info(
-                "Evicted VLA %s CUDA graph for signature %s (entries=%d/%d)",
-                self.name,
-                evicted_signature,
-                len(self.entries),
-                self.max_entries,
-            )
+            self._evict_lru()
         return True
 
     def discard(self, signature: Any) -> None:
@@ -496,3 +491,99 @@ class VLADenoiseGraphRunner:
                 exc_info=True,
             )
             return step_fn(prefix_context, x_t, timestep)
+
+
+class _CapturedTensorGraph(msgspec.Struct):
+    graph: torch.cuda.CUDAGraph
+    static_inputs: tuple[torch.Tensor, ...]
+    static_outputs: tuple[torch.Tensor, ...]
+
+
+class VLATensorGraphRunner:
+    """CUDA graphs of a function of tensors, keyed by the input shapes and ``key``.
+
+    Every call copies ``inputs`` into the graph's static buffers, so ``fn`` must
+    read its tensors only from its arguments (anything else is baked in by
+    address). The returned tensors are overwritten by the next replay.
+    """
+
+    def __init__(self, name: str, *, enabled: bool, max_entries: int):
+        self.name = name
+        self.enabled = enabled and max_entries > 0
+        self._cache = _BoundedCaptureCache(name, max_entries, evict_on_miss=True)
+        self._disabled_signatures: set[Any] = set()
+        self._capture_stream: torch.cuda.Stream | None = None
+        self._graph_pool: Any = None
+
+    def cache_info(self) -> VLAGraphCacheInfo:
+        return self._cache.info()
+
+    def clear(self) -> None:
+        self._cache.clear()
+
+    def _capture(
+        self,
+        fn: Callable[..., tuple[torch.Tensor, ...]],
+        inputs: tuple[torch.Tensor, ...],
+    ) -> _CapturedTensorGraph:
+        device = inputs[0].device
+        device_module = torch.get_device_module(device)
+        if self._capture_stream is None:
+            self._capture_stream = device_module.Stream(device=device)
+        if self._graph_pool is None:
+            self._graph_pool = get_or_create_global_graph_memory_pool(device_module)
+            set_graph_pool_id(self._graph_pool)
+        static_inputs = tuple(t.detach().clone() for t in inputs)
+        # Warm up lazy kernels, workspaces and first-sight fusion checks.
+        device_module.synchronize()
+        with device_module.stream(self._capture_stream):
+            fn(*static_inputs)
+        self._capture_stream.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with device_module.graph(
+            cuda_graph=graph, pool=self._graph_pool, stream=self._capture_stream
+        ):
+            static_outputs = tuple(fn(*static_inputs))
+        self._capture_stream.synchronize()
+        logger.info(
+            "Captured VLA %s CUDA graph for %s",
+            self.name,
+            [tuple(t.shape) for t in inputs],
+        )
+        return _CapturedTensorGraph(
+            graph=graph, static_inputs=static_inputs, static_outputs=static_outputs
+        )
+
+    def run(
+        self,
+        fn: Callable[..., tuple[torch.Tensor, ...]],
+        inputs: tuple[torch.Tensor, ...],
+        *,
+        key: Any = None,
+    ) -> tuple[torch.Tensor, ...]:
+        if not self.enabled or not inputs or inputs[0].device.type != "cuda":
+            return tuple(fn(*inputs))
+        signature = (key, tuple((tuple(t.shape), t.dtype) for t in inputs))
+        if signature in self._disabled_signatures:
+            return tuple(fn(*inputs))
+        try:
+            captured = self._cache.get(signature)
+            if captured is None:
+                self._cache.prepare_admission(signature)
+                captured = self._capture(fn, inputs)
+                self._cache.put(signature, captured)
+            for static, value in zip(captured.static_inputs, inputs, strict=True):
+                static.copy_(value)
+            captured.graph.replay()
+            return captured.static_outputs
+        except Exception:
+            self._disabled_signatures.add(signature)
+            self._cache.discard(signature)
+            self._cache.mark_failure()
+            logger.warning(
+                "VLA %s CUDA graph disabled for signature %s",
+                self.name,
+                signature,
+                exc_info=True,
+            )
+            return tuple(fn(*inputs))

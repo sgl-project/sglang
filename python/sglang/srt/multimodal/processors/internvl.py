@@ -8,18 +8,16 @@ import numpy as np
 import torch
 from PIL import Image
 
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalProcessorOutput,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
 from sglang.srt.models.interns1 import InternS1ForConditionalGeneration
 from sglang.srt.models.internvl import InternVLChatModel
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     BaseMultiModalProcessorOutput,
     MultimodalSpecialTokens,
 )
+from sglang.srt.runtime_context import get_model
 from sglang.srt.utils import get_device
 from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 
@@ -135,7 +133,7 @@ class InternVLProcessor(BaseMultimodalProcessor):
         ).build(_image_processor)
 
         self.max_context_len = (
-            getattr(server_args, "context_length", None)
+            get_model().context_length
             or getattr(server_args, "max_context_len", None)
             or getattr(hf_config, "max_position_embeddings", None)
             or getattr(text_cfg, "max_position_embeddings", None)

@@ -8,6 +8,7 @@ RUN apt-get update && \
     apt-get full-upgrade -y && \
     DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends -y \
     ca-certificates \
+    ffmpeg \
     git \
     curl \
     wget \
@@ -15,6 +16,7 @@ RUN apt-get update && \
     gcc \
     g++ \
     make \
+    libssl-dev \
     libsqlite3-dev \
     libgoogle-perftools-dev \
     libtbb-dev \
@@ -34,9 +36,10 @@ ENV UV_CONFIG_FILE=/opt/.venv/uv.toml
 
 WORKDIR /sgl-workspace
 RUN source /opt/.venv/bin/activate && \
-    git clone ${SGLANG_REPO} sglang && \
+    git clone "${SGLANG_REPO}" sglang && \
     cd sglang && \
-    git checkout ${VER_SGLANG} && \
+    git fetch origin "${VER_SGLANG}" && \
+    git checkout --detach FETCH_HEAD && \
     cd python && \
     cp pyproject_cpu.toml pyproject.toml && \
     uv pip install ".[diffusion]" && \

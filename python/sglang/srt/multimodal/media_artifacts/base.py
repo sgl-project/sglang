@@ -32,7 +32,6 @@ import numpy as np
 import torch
 from PIL import Image
 
-from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.multimodal.cache import (
     CacheLookup,
     CacheMiss,
@@ -42,7 +41,8 @@ from sglang.srt.multimodal.cache import (
     parse_content_hash,
     snapshot_media,
 )
-from sglang.srt.utils import load_image
+from sglang.srt.multimodal.media_io import load_image
+from sglang.srt.multimodal.modality import Modality
 
 
 @runtime_checkable
@@ -51,8 +51,8 @@ class MediaArtifact(Protocol):
 
     ``content_digest`` identifies the media contents. ``artifact_key`` also
     includes every preprocessing choice that can change the artifact.
-    ``feature_hash`` becomes ``MultimodalDataItem.hash`` and identifies the
-    corresponding encoder embedding.
+    ``feature_hash`` carries a full-width server-computed fingerprint, not a
+    caller-provided hint or a truncated embedding-cache key.
     """
 
     content_digest: str
@@ -411,6 +411,66 @@ class MediaArtifactCacheMixin:
         if any(artifact is None for artifact in artifacts):
             raise RuntimeError("Artifact cache did not resolve every media item")
         return [artifact for artifact in artifacts if artifact is not None]
+
+    async def prepare_media_artifacts_without_cache(
+        self,
+        media_data: Sequence[Any],
+        *,
+        content_hashes: Optional[Sequence[Optional[str]]] = None,
+        modality: Optional[Modality] = None,
+    ) -> list[MediaArtifact]:
+        """Build request-local artifacts without cache lookup or retention."""
+        modality = self._resolve_artifact_modality(modality)
+        media_count = len(media_data)
+        if content_hashes is None:
+            content_hashes = [None] * media_count
+        if len(content_hashes) != media_count:
+            raise ValueError(
+                f"mm_content_hashes has {len(content_hashes)} entries for "
+                f"{media_count} {modality.name.lower()} items"
+            )
+        content_hashes = [parse_content_hash(value) for value in content_hashes]
+
+        snapshot_futures = [
+            self.io_executor.submit(self.snapshot_media_source, source, modality)
+            for source in media_data
+        ]
+        snapshots = []
+        for index, future in enumerate(snapshot_futures):
+            snapshot = await asyncio.wrap_future(future)
+            caller_hash = content_hashes[index]
+            if caller_hash is not None and caller_hash != snapshot.content_digest:
+                raise ValueError(
+                    f"content hash mismatch for media_data[{index}]: "
+                    f"expected {caller_hash}, got {snapshot.content_digest}"
+                )
+            snapshots.append(snapshot)
+
+        decode_futures = [
+            self.io_executor.submit(self.decode_media_snapshot, snapshot, modality)
+            for snapshot in snapshots
+        ]
+        entries = []
+        for source, snapshot, future in zip(media_data, snapshots, decode_futures):
+            entries.append(
+                MediaArtifactInput(
+                    content_digest=snapshot.content_digest,
+                    artifact_key=self._artifact_key(
+                        snapshot.content_digest, source, modality=modality
+                    ),
+                    modality=modality,
+                    media=await asyncio.wrap_future(future),
+                )
+            )
+
+        artifacts = await self._run_preprocess_and_build_artifact_batch(entries)
+        if len(artifacts) != len(entries):
+            raise ValueError(
+                "prepare_artifact_batch must return one artifact per media input"
+            )
+        for artifact, entry in zip(artifacts, entries):
+            self.validate_artifact(artifact, entry)
+        return artifacts
 
     async def _compute_cache_misses(
         self,

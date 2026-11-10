@@ -108,7 +108,7 @@ class TestDisaggregationAccuracy(PDDisaggregationServerBase):
             num_questions=200,
             max_new_tokens=512,
             parallel=128,
-            host=f"http://{self.base_host}",
+            host=self.base_host,
             port=int(self.lb_port),
         )
         metrics = run_eval_few_shot_gsm8k(args)
@@ -311,7 +311,7 @@ class TestDisaggregationMooncakeFailure(PDDisaggregationServerBase):
             num_questions=200,
             max_new_tokens=512,
             parallel=128,
-            host=f"http://{self.base_host}",
+            host=self.base_host,
             port=int(self.lb_port),
         )
 
@@ -423,7 +423,7 @@ class TestDisaggregationSimulatedRetract(PDDisaggregationServerBase):
             num_questions=200,
             max_new_tokens=512,
             parallel=128,
-            host=f"http://{self.base_host}",
+            host=self.base_host,
             port=int(self.lb_port),
         )
         metrics = run_eval_few_shot_gsm8k(args)

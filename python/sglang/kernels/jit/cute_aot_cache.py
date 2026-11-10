@@ -21,6 +21,8 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Hashable, TypeAlias
 
+from sglang.kernels.arch import current_arch
+
 logger = logging.getLogger(__name__)
 
 _runtime_library_handles: list[Any] = []
@@ -93,11 +95,9 @@ def _compute_source_fingerprint(
 def _resolve_target_arch() -> str:
     if target_arch := os.getenv("CUTE_DSL_ARCH"):
         return target_arch
-
-    import torch
-
-    major, minor = torch.cuda.get_device_capability()
-    return f"sm_{major}{minor}"
+    cuda = current_arch().cuda
+    assert cuda is not None
+    return f"sm_{cuda.major}{cuda.minor}"
 
 
 # Pre-load cute DSL runtime libraries with RTLD_GLOBAL so that their symbols

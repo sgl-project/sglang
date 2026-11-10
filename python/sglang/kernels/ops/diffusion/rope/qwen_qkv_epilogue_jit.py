@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils import cache_once, load_jit
 
 if TYPE_CHECKING:
@@ -39,6 +40,8 @@ def _qkv_tensor(tensor: torch.Tensor, like: torch.Tensor | None = None) -> bool:
         and tensor.numel() > 0
         and tensor.stride(-1) == 1
         and tensor.stride(-2) == _HEAD_DIM
+        # The paired-head V copy uses 16-byte loads at every token boundary.
+        and tensor.stride(1) * tensor.element_size() % 16 == 0
         and tensor.data_ptr() % _ALIGN == 0
         and (
             like is None
@@ -84,8 +87,7 @@ def try_fused_qwen_qkv_epilogue(
         and _qkv_tensor(txt_k, txt_q)
         and _qkv_tensor(txt_v, txt_q)
         and img_q.shape[2] == txt_q.shape[2]
-        and torch.version.cuda is not None
-        and torch.cuda.get_device_capability(img_q.device)[0] >= 10
+        and current_arch().is_sm_at_least(9)
     ):
         return None
 
@@ -122,6 +124,8 @@ def try_fused_qwen_qkv_epilogue(
         and txt_cache.shape[0] >= txt_q.shape[1]
         and img_cache.is_contiguous()
         and txt_cache.is_contiguous()
+        and img_cache.data_ptr() % 8 == 0
+        and txt_cache.data_ptr() % 8 == 0
     ):
         return None
 
