@@ -79,6 +79,7 @@ def _server_args(ext, port: int):
             is_multimodal=False,
             default_sampling_params=ext.DefaultSamplingParams(),
             model_type=None,
+            architectures=None,
         ),
         preferred_sampling_params=None,
         default_max_new_tokens=128,
