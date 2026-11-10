@@ -101,6 +101,23 @@ def _make_per_tensor_scale_parameter(
     return scale
 
 
+def _fused_parts_max(
+    scale: torch.Tensor, unwritten: Optional[float] = None
+) -> torch.Tensor:
+    """The global scale of a fused linear: the largest per-part scale.
+
+    The per-part scales start at 0, which no checkpoint stores, so a part that
+    no checkpoint tensor writes never wins: Gemma 4's KV-shared layers store
+    only q_proj, and the k and v parts of their fused qkv_proj stay unwritten.
+    ``unwritten`` is the value to use when no part is written (the input scale
+    of online quantization, which stores none: 1.0).
+    """
+    m = scale.max().to(torch.float32)
+    if unwritten is not None:
+        m = torch.where(m > 0, m, torch.full_like(m, unwritten))
+    return m
+
+
 try:
     from flashinfer import mm_fp4 as flashinfer_fp4_gemm
     from flashinfer import reorder_rows_for_gated_act_gemm, shuffle_matrix_sf_a
@@ -1856,7 +1873,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         input_scale = _make_per_tensor_scale_parameter(
             (len(output_partition_sizes),),
             weight_loader=weight_loader,
-            fill_value=1.0,
+            fill_value=0.0,  # unwritten parts never win; none written means 1.0
             needs_scalar_to_array=True,
         )
         layer.register_parameter("input_scale", input_scale)
@@ -1876,6 +1893,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         weight_scale_2 = _make_per_tensor_scale_parameter(
             (len(output_partition_sizes),),
             weight_loader=weight_loader,
+            fill_value=0.0,  # see _fused_parts_max
             needs_scalar_to_array=True,
         )
         layer.register_parameter("weight_scale_2", weight_scale_2)
@@ -1894,8 +1912,8 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         layer.register_parameter("weight_scale", weight_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        input_scale_2 = layer.input_scale.max().to(torch.float32)
-        weight_scale_2 = layer.weight_scale_2.max().to(torch.float32)
+        input_scale_2 = _fused_parts_max(layer.input_scale, unwritten=1.0)
+        weight_scale_2 = _fused_parts_max(layer.weight_scale_2)
 
         if self.quant_mode == "w4a16":
             from flashinfer import prepare_bf16_fp4_weights
@@ -2250,6 +2268,7 @@ class ModelOptNvFp4A16LinearMethod(LinearMethodBase):
         weight_scale_2 = _make_per_tensor_scale_parameter(
             (len(output_partition_sizes),),
             weight_loader=weight_loader,
+            fill_value=0.0,  # see _fused_parts_max
             needs_scalar_to_array=True,
         )
         layer.register_parameter("weight_scale_2", weight_scale_2)
@@ -2280,7 +2299,8 @@ class ModelOptNvFp4A16LinearMethod(LinearMethodBase):
         if hasattr(layer, "input_scale"):
             del layer.input_scale
 
-        if torch.unique(layer.weight_scale_2).numel() != 1:
+        written = layer.weight_scale_2[layer.weight_scale_2 > 0]
+        if torch.unique(written).numel() > 1:
             logger.warning(
                 "In NVFP4A16 linear, weight_scale_2 differs across fused "
                 "parallel layers. Accuracy may be degraded."
@@ -2289,7 +2309,7 @@ class ModelOptNvFp4A16LinearMethod(LinearMethodBase):
         copy_or_rebind_param(
             layer,
             "weight_global_scale",
-            layer.weight_scale_2.max().to(torch.float32),
+            _fused_parts_max(layer.weight_scale_2),
         )
         del layer.weight_scale_2
 

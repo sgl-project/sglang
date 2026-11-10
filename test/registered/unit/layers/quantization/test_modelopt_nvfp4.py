@@ -9,6 +9,8 @@ from sglang.srt.layers.parameter import PerTensorScaleParameter
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp4LinearMethod,
+    ModelOptNvFp4A16LinearMethod,
+    _fused_parts_max,
 )
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -97,9 +99,48 @@ class TestModelOptNvfp4(CustomTestCase):
             weight_loader=default_weight_loader,
         )
 
-        torch.testing.assert_close(layer.input_scale, torch.ones(1))
+        # no part written: the global input scale is 1.0
+        torch.testing.assert_close(
+            _fused_parts_max(layer.input_scale, unwritten=1.0), torch.tensor(1.0)
+        )
         default_weight_loader(layer.input_scale, torch.tensor(0.25))
-        torch.testing.assert_close(layer.input_scale, torch.tensor([0.25]))
+        torch.testing.assert_close(
+            _fused_parts_max(layer.input_scale, unwritten=1.0), torch.tensor(0.25)
+        )
+
+    def test_unwritten_fused_parts_do_not_set_global_scales(self):
+        # Gemma 4's KV-shared layers store only q_proj: the k and v parts of the
+        # fused qkv_proj are never written and must not decide its global scales.
+        config = ModelOptFp4Config(
+            is_checkpoint_nvfp4_serialized=True,
+            group_size=16,
+            use_per_token_activation=False,
+        )
+        qkv = self._make_qkv_layer()
+        for method in (
+            ModelOptFp4LinearMethod(config),
+            ModelOptNvFp4A16LinearMethod(config),
+        ):
+            with self.subTest(method=type(method).__name__):
+                layer = nn.Module()
+                method.create_weights(
+                    layer,
+                    input_size_per_partition=16,
+                    output_partition_sizes=[16, 16, 16],
+                    input_size=16,
+                    output_size=48,
+                    params_dtype=torch.bfloat16,
+                    weight_loader=qkv.weight_loader_v2,
+                )
+                qkv.weight_loader_v2(layer.weight_scale_2, torch.tensor(0.003), "q")
+                qkv.weight_loader_v2(layer.input_scale, torch.tensor(0.002), "q")
+                torch.testing.assert_close(
+                    _fused_parts_max(layer.weight_scale_2), torch.tensor(0.003)
+                )
+                torch.testing.assert_close(
+                    _fused_parts_max(layer.input_scale, unwritten=1.0),
+                    torch.tensor(0.002),
+                )
 
     @patch(
         "sglang.srt.layers.quantization.modelopt_quant.envs."
