@@ -68,7 +68,7 @@ def _paged_prealloc():
         total_prefix_len=PAGE_SIZE,
         prefix_indices=prefix_indices,
         uses_swa_tail=False,
-        swa_tail_len=fill_len,
+        window_tails=dict.fromkeys(allocator.window_pool_names(), fill_len),
     )
 
 
@@ -96,7 +96,7 @@ def _swa_tail_prealloc():
         total_prefix_len=0,
         prefix_indices=None,
         uses_swa_tail=True,
-        swa_tail_len=2 * PAGE_SIZE,
+        window_tails=dict.fromkeys(allocator.window_pool_names(), 2 * PAGE_SIZE),
     )
 
 

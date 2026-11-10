@@ -606,7 +606,7 @@ def _try_npu_fused_scale_shift(
     if not _can_use_npu_fused_scale_shift(x, shift, scale):
         return None
 
-    from sgl_kernel_npu.norm.scale_shift import fused_scale_shift
+    from sgl_kernel_npu.operators.elementwise import fused_scale_shift
 
     scale = scale.reshape(-1)
     if tuple(shift.shape) != tuple(x.shape):
