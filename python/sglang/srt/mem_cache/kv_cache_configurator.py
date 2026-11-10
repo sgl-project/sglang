@@ -416,6 +416,7 @@ class KVCacheConfigurator:
     draft_model_idx: Optional[int] = None
     kv_cache_dtype_str: Optional[str] = None
     extra_mamba_cache_bytes_per_req: int = 0
+    allocate_intermediate_ssm: bool = True
     mambaish_config: Optional[Any] = field(init=False)
     hybrid_gdn_config: Optional[Any] = field(init=False)
     hybrid_kda_config: Optional[Any] = field(init=False)
@@ -1598,6 +1599,7 @@ class KVCacheConfigurator:
             replayssm_request_ring=(
                 host_only_mamba_checkpoint() and self.hybrid_kda_config is not None
             ),
+            allocate_intermediate_ssm=self.allocate_intermediate_ssm,
         )
         return req_to_token_pool
 
@@ -1668,6 +1670,7 @@ class KVCacheConfigurator:
             replayssm_request_ring=(
                 host_only_mamba_checkpoint() and self.hybrid_kda_config is not None
             ),
+            allocate_intermediate_ssm=self.allocate_intermediate_ssm,
         )
         return req_to_token_pool
 
@@ -2081,11 +2084,8 @@ class KVCacheConfigurator:
         if not self.is_draft_worker:
             # Fresh rows include beam slots and PD preallocation. Reused rows
             # retain their current history; retraction has its own replay reset.
-            # FIXME: the ring and request-window rows are reset on the schedule
-            # stream when a row is reused, while the forward of the row's
-            # previous request may still read or write them (the write-after-read
-            # barrier orders only shared reads). Order the reset after that
-            # forward.
+            # TODO(ch-wan): these C4 ring and request-window resets race the row's
+            # previous forward; run them in the next forward, as `reset_new_rows` does.
             def reset_request_rows(rows):
                 if token_to_kv_pool._unified_kv:
                     token_to_kv_pool.clear_c4_req_states(rows)
@@ -2265,6 +2265,7 @@ class KVCacheConfigurator:
             enable_memory_saver=get_exec().features.enable_memory_saver,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
+            modelslim_cache_layout=self.modelslim_cache_layout,
         )
         return token_to_kv_pool
 
@@ -3329,10 +3330,6 @@ class KVCacheConfigurator:
                 ),
                 frozen=frozen,
             )
-        # PP stages select batches independently, so the synchronized share is
-        # also a live admission cap, even on the stage already at the minimum.
-        full_cap = full if get_parallel().pp_size > 1 else None
-        sized = msgspec.structs.replace(sized, full_cap_tokens=full_cap)
         self._unified_sized = sized
         return MemoryPoolConfig(
             max_total_num_tokens=sized.full_tokens,
@@ -3445,6 +3442,7 @@ class KVCacheConfigurator:
             has_spec_dec
             and not replayssm_active
             and not _pd_prefill_skips_mamba_spec_state()
+            and self.allocate_intermediate_ssm
         )
         if has_spec_dec:
             assert get_spec().speculative_num_draft_tokens is not None

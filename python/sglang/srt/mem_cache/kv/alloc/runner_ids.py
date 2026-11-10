@@ -77,6 +77,7 @@ from sglang.kernels.ops.kvcache.kv_read_table import (
 )
 from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
 from sglang.srt.layers.dcp.layout import localize_dcp_indices
+from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind, state_id_space
 from sglang.srt.mem_cache.kv.alloc.iteration_ids import (
     IterationIds,
@@ -398,7 +399,13 @@ class RunnerIds:
         """
         if self.is_translating:
             return self._capture_token_capacity
-        return max_token_pool_size + self.page_size
+        capacity = max_token_pool_size + self.page_size
+        if (allocator := self._token_to_kv_pool_allocator) is not None:
+            # DCP and KV sharding number slots over every rank's pool, past
+            # one reserved page per shard.
+            reserved = page_interleave_shard_size(allocator) * allocator.page_size
+            capacity = max(capacity, allocator.size + reserved)
+        return capacity
 
     # -- the iteration's plan --------------------------------------------------
 
