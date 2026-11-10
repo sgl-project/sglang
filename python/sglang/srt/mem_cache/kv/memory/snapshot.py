@@ -114,10 +114,12 @@ def copy_to_cpu(allocator, indices, *, state_indices, request_row):
                 )
         bands[band.sub_pool_name] = snapshot
     request = {}
-    storage = allocator.storage
-    if storage is not None and request_row is not None:
-        memory = storage.request_memory
+    if request_row is not None:
+        memory = allocator.request_memory
         if memory is not None:
+            # A row handed out since the last forward holds its previous
+            # request's state until reset; the sync above ordered that forward.
+            allocator.storage.reset_row_before_backup(int(request_row))
             for part in memory.parts:
                 tensor = memory.tensors[part.name]
                 row = torch.tensor([request_row], device=tensor.device)
@@ -169,7 +171,9 @@ def restore_from_cpu(allocator, snapshot, indices, *, state_indices, request_row
     if snapshot.request_parts:
         if request_row is None:
             raise ValueError("restoring request parts requires the new request row")
-        memory = allocator.storage.request_memory
+        memory = allocator.request_memory
+        # The backup is the row's whole request memory: no reset follows.
+        allocator.storage.row_state_restored(int(request_row))
         for part in memory.parts:
             tensor = memory.tensors[part.name]
             _scatter_from_cpu(

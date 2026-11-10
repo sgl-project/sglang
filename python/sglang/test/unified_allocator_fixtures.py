@@ -12,12 +12,7 @@ from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.kv.alloc.band import Band
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
-from sglang.srt.mem_cache.kv.alloc.pricing import (
-    ChainSnapshot,
-    FloatChain,
-    TokenEnds,
-    snapshot_chain,
-)
+from sglang.srt.mem_cache.kv.alloc.pricing import ChainSnapshot, snapshot_chain
 from sglang.srt.mem_cache.kv.build import UnifiedBuildContext, build_unified_pools
 from sglang.srt.mem_cache.kv.decl import (
     FullLifetime,
@@ -52,21 +47,40 @@ def chain_snapshot(allocator) -> ChainSnapshot:
     )
 
 
-def token_ends(allocator) -> TokenEnds:
-    """The pricing constants of a chain of two token ends."""
-    return allocator._policy._ends(allocator)
+def largest_take(allocator, *sub_pools: str) -> int:
+    """The most units each of ``sub_pools`` (default: the token sub-pool and every
+    window) can take together now, by binary search over `units_fit`; a test oracle."""
+    owner, windows, state = allocator.sub_pool_roles()
+    if not sub_pools:
+        sub_pools = (owner, *windows)
+    low, high = 0, max(band.num_pages for band in allocator.bands)
+    while low < high:
+        mid = (low + high + 1) // 2
+        if allocator.units_fit(dict.fromkeys(sub_pools, mid)):
+            low = mid
+        else:
+            high = mid - 1
+    return low if sub_pools == (state,) else low * allocator.page_size
 
 
-def float_chain(allocator) -> FloatChain:
-    """The roles of a chain whose window floats between two ends."""
-    roles = allocator.roles
-    return FloatChain(owner=roles.owner, window=roles.window, state=roles.state)
-
-
-def pin_every_band(allocator, busy) -> None:
-    """Register ``busy`` as a pin source over every band of a chain allocator,
-    as PD and HiCache register theirs over every sub-pool."""
-    allocator.add_pin_source(tuple(m.sub_pool_name for m in allocator.members), busy)
+def open_float_side(flt, side: str, min_bytes: int) -> int:
+    """Move a float's live pages, as a planned layout does (`relocate_into`
+    of one packed block), so the gap on ``side`` holds at least ``min_bytes``;
+    return the bytes then open on that side."""
+    epp = flt.entry_bytes_per_page
+    lo, hi = flt._region_bounds_pages()
+    live = flt._live_pages()
+    pages = -(-min_bytes // epp)
+    if side == "low":
+        first = lo + pages
+        end = first + live
+    else:
+        end = hi - pages
+        first = end - live
+    assert lo <= first and end <= hi, "the region cannot open that much"
+    flt.relocate_into(first, end)
+    gap_low, gap_high = flt._gap_pages()
+    return (gap_low if side == "low" else gap_high) * epp
 
 
 HOLD = "test-hold"
@@ -83,6 +97,16 @@ def hold_band(band, key=HOLD) -> None:
 
 def release_band(band, key=HOLD) -> None:
     band.unfix_pages(key)
+
+
+def hold_every_band(allocator, key=HOLD) -> None:
+    for band in allocator.members:
+        hold_band(band, key)
+
+
+def release_every_band(allocator, key=HOLD) -> None:
+    for band in allocator.members:
+        release_band(band, key)
 
 
 def setup_allocator_context():
@@ -985,7 +1009,7 @@ def _layer_maps(bundle) -> dict:
 def _capacity_summary(bundle) -> dict:
     allocator = bundle.token_to_kv_pool_allocator
     out = {
-        "available": allocator.available_size(),
+        "available": largest_take(allocator),
         "size_full": allocator.size_full,
         "draft_virtual_id_space": allocator.draft_virtual_id_space,
     }

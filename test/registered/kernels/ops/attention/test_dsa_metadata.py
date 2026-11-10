@@ -408,6 +408,18 @@ class TestDSAMetadataKernels(CustomTestCase):
                     fill_ctx_lens=fill_ctx_lens,
                 )
 
+    def test_target_verify_long_context_and_dcp_pages(self):
+        for page_size in (1, 64, 512):
+            with self.subTest(page_size=page_size):
+                self._check_target_verify(
+                    [0, 8193, 1048576 - 8],
+                    max_seqlen_k=1048576,
+                    dsa_index_topk=2048,
+                    physical_page_size=page_size,
+                    next_n=8,
+                    fill_ctx_lens=True,
+                )
+
     def test_draft_extend_static_width_matches_eager_reference(self):
         self._check_draft_extend(
             [16, 31, 80],
@@ -470,6 +482,19 @@ class TestDSAMetadataKernels(CustomTestCase):
             max_extend_len=1,
             max_total_len=0,
             static_extend_len=True,
+        )
+
+    def test_target_verify_programs_stride_over_row_blocks(self):
+        """Few programs per row (48 requests x 8 draft rows) over many live
+        column blocks of varying length, as in a large-batch verify."""
+        seq_lens = (torch.arange(48, dtype=torch.int64) * 677 % 30000 + 1).tolist()
+        self._check_target_verify(
+            seq_lens,
+            max_seqlen_k=32768,
+            dsa_index_topk=2048,
+            physical_page_size=512,
+            next_n=8,
+            fill_ctx_lens=False,
         )
 
     def test_large_shape_coverage(self):
