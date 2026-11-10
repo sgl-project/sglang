@@ -18,6 +18,7 @@
 /python/sglang/multimodal_gen/test/server/ascend  @ping1jing2 @ssshinigami @Makcum888e @e-martirosian
 /python/sglang/srt/batch_invariant_ops @Fridge003 @hebiao064
 /python/sglang/srt/compilation @hebiao064 @Oasis-Git
+/python/sglang/srt/configs/embedding_model_spec.py @sundar24295s @fortunecookiee
 /python/sglang/srt/constrained @hnyls2002 @DarkSharpness @JustinTong0323
 /python/sglang/srt/disaggregation @ByronHsu @hnyls2002 @ShangmingCai @HaiShaw @Duyi-Wang @sogalin
 /python/sglang/srt/disaggregation/ascend @ping1jing2 @iforgetmyname
@@ -30,9 +31,11 @@
 /python/sglang/srt/entrypoints @ispobock @CatherineSue @slin1237 @merrymercy @JustinTong0323
 /python/sglang/srt/entrypoints/anthropic @JustinTong0323
 /python/sglang/srt/entrypoints/openai @JustinTong0323
-/python/sglang/srt/entrypoints/engine_score_mixin.py @sundar24295s @chanh @fortunecookiee
+/python/sglang/srt/entrypoints/engine_score_mixin.py @sundar24295s @fortunecookiee
 /python/sglang/srt/entrypoints/grpc_server.py @CatherineSue @slin1237
-/python/sglang/srt/entrypoints/openai/serving_score.py @sundar24295s @chanh @fortunecookiee
+/python/sglang/srt/entrypoints/openai/serving_decisions.py @sundar24295s @fortunecookiee
+/python/sglang/srt/entrypoints/openai/serving_embedding.py @JustinTong0323 @sundar24295s @fortunecookiee
+/python/sglang/srt/entrypoints/openai/serving_score.py @sundar24295s @fortunecookiee
 /python/sglang/srt/eplb @fzyzcjy @ch-wan @xutizhou
 /python/sglang/srt/function_call @JustinTong0323
 /python/sglang/srt/grpc @CatherineSue @slin1237
@@ -56,7 +59,7 @@
 /python/sglang/srt/managers @merrymercy @Ying1123 @hnyls2002 @xiezhq-hermann
 /python/sglang/srt/managers/hisparse_coordinator.py @merrymercy @Ying1123 @hnyls2002 @xiezhq-hermann @hzh0425 @ispobock @alphabetc1 @huangtingwei9988
 /python/sglang/srt/managers/scheduler_pp_mixin.py @ShangmingCai @XucSh
-/python/sglang/srt/managers/tokenizer_manager_score_mixin.py @sundar24295s @chanh @fortunecookiee
+/python/sglang/srt/managers/tokenizer_manager_score_mixin.py @sundar24295s @fortunecookiee
 /python/sglang/srt/mem_cache @merrymercy @Ying1123 @hnyls2002 @xiezhq-hermann @hanming-lu @yizhang2077 @hzh0425 @ispobock @alphabetc1 @huangtingwei9988
 /python/sglang/srt/mem_cache/allocator @hnyls2002 @hzh0425 @xiezhq-hermann @ispobock @alphabetc1 @huangtingwei9988
 /python/sglang/srt/mem_cache/rust_tree_core @Jialin @hzh0425 @xiezhq-hermann @ispobock @alphabetc1
@@ -101,8 +104,10 @@
 /sgl-model-gateway/src/routers @CatherineSue @key4ng @slin1237
 /sgl-model-gateway/src/wasm @slin1237
 /sgl-model-gateway/examples/wasm @slin1237
-/test/registered/prefill_only @sundar24295s @chanh @fortunecookiee
-/benchmark/prefill_only/bench_score.py @sundar24295s @chanh @fortunecookiee
+/test/registered/prefill_only @sundar24295s @fortunecookiee
+/test/manual/prefill_only @sundar24295s @fortunecookiee
+/benchmark/prefill_only @sundar24295s @fortunecookiee
+/docs/docs/supported-models/decision_models.mdx @wisclmy0611 @zijiexia @Richardczl98 @sundar24295s @fortunecookiee
 /test/registered/npu @ping1jing2 @ssshinigami  @e-martirosian
 /test/srt/test_modelopt* @Edwardf0t1
 /python/sglang/srt/function_call/gemma4_detector.py @CatherineSue @JustinTong0323 @kpham-sgl @pyc96

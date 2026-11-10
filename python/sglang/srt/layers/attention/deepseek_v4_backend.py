@@ -1004,6 +1004,8 @@ class LateLayerTail(msgspec.Struct, frozen=True):
     pad_rows: int = 0
     cp_metadata: Optional[InterleaveContextParallelMetadata] = None
     local_lens_cpu: Optional[List[int]] = None
+    # Original extend rows in global request order; token_indices is rank-local under CP.
+    global_token_indices: Optional[torch.Tensor] = None
     req_global: Optional[torch.Tensor] = None
     pos_global: Optional[torch.Tensor] = None
     # Prefill CUDA graph: token_indices/positions are persistent buffers of a fixed
@@ -1298,7 +1300,7 @@ class DeepseekV4AttnBackend(
     ):
         super().__init__()
         self.model_runner = model_runner
-        # Run at every KV store-location read; the DSpark deferred context-KV commit
+        # Run at every KV store-location read; the DSpark deferred draft KV store
         # joins its forked write there (SGLANG_DSPARK_DEFER_CONTEXT_KV).
         self.pre_kv_store_hook: Optional[Callable[[], None]] = None
         self.encoder_replay = False
@@ -2085,6 +2087,7 @@ class DeepseekV4AttnBackend(
                 pad_rows=cp_tail["pad_rows"],
                 cp_metadata=cp_tail["cp_metadata"],
                 local_lens_cpu=cp_tail["local_lens_cpu"],
+                global_token_indices=token_indices,
                 req_global=metadata.low_ratio_req_indices,
                 pos_global=metadata.low_ratio_pos_i64,
             )

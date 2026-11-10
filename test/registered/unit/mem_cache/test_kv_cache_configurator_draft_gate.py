@@ -129,6 +129,7 @@ def _swa_cache_params(*, sliding_window_size, draft_swa_window):
     allocator = SimpleNamespace(
         storage=None,
         window_pool_names=lambda: ("swa",),
+        target_window_pool=lambda: "swa",
         get_kvcache=lambda: SimpleNamespace(request_window=None),
     )
     kv_storage_of(None, allocator).bind_window_retention(
@@ -194,7 +195,12 @@ class TestDraftBindingDispatch(CustomTestCase):
         )
         total = n_full * full_spec.entry_bytes() + n_swa * swa_spec.entry_bytes()
         placement = (
-            FusedDraftPlacement.from_counts(counts={host: [1]}, regions={host: region})
+            FusedDraftPlacement.from_counts(
+                counts={host: [1]},
+                regions={host: region},
+                # These pools name their window sub-pool `swa`.
+                hosted={"swa": "window"} if host == "swa" else None,
+            )
             if region is not None
             else None
         )
@@ -221,7 +227,7 @@ class TestDraftBindingDispatch(CustomTestCase):
             forward_stream=None,
         )
         # The target's KV storage, as far as draft binding reads it.
-        alloc.storage = SimpleNamespace(plan=plan_stand_in(pool, placement))
+        alloc.plan = plan_stand_in(pool, placement)
         return alloc
 
     def _run(

@@ -886,6 +886,14 @@ class Tool(BaseModel):
             self.function.defer_loading = self.defer_loading
         return self
 
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        # Chat templates render this dict; do not inject a field the client left out.
+        data = handler(self)
+        if self.defer_loading is None:
+            data.pop("defer_loading", None)
+        return data
+
 
 # Tool is defined after the message params that reference it, so the forward
 # reference has to be resolved explicitly.
@@ -1581,6 +1589,8 @@ class ScoringRequest(BaseModel):
     return_token_logprobs: bool = False
     item_first: bool = False
     return_pooled_hidden_states: bool = False
+    # Base request id; expanded to `<rid>_<i>` per item (`i` zero-padded).
+    rid: Optional[str] = None
 
     # Setwise readout: when set, the readout is taken AT every occurrence of this
     # token in each `query + item` sequence instead of the last token, and `scores`
