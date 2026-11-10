@@ -5,6 +5,7 @@ These tests deliberately stop at the Python dispatcher boundary.  The
 hardware integration tests when an NPU job is available.
 """
 
+import sys
 import unittest
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -15,7 +16,7 @@ import torch
 from sglang.srt.hardware_backend.npu.moe.routing import (
     MXFP8_QUANT_MODE,
     RoutedTokens,
-    combine_local_expert_routes,
+    npu_moe_token_unpermute,
 )
 from sglang.srt.layers.moe.token_dispatcher.ascend_ops import (
     AscendOpsCombineInput,
@@ -280,32 +281,26 @@ class TestAscendOpsDispatcherContracts(CustomTestCase):
 
         self.assertIsNone(get_forward().ascend_allgather_row_sizes)
 
-    def test_allgather_finalize_uses_zero_padding_and_fp32(self):
-        """A dropped route must never read an unwritten expert output row."""
-        module = "sglang.srt.hardware_backend.npu.moe.routing"
-        hidden = torch.tensor([[1.0], [float("nan")]], dtype=torch.bfloat16)
-        indices = torch.tensor([0, 3, 3, 3], dtype=torch.int32)
-        weights = torch.tensor([[1.003, 0.0], [0.0, 0.0]])
+    def test_allgather_unpermute_passes_gmm_output_directly(self):
+        """The vendor op must receive the original rows and dtype."""
+        hidden = torch.tensor([[2.0], [4.0]], dtype=torch.bfloat16)
+        indices = torch.tensor([1, 0], dtype=torch.int32)
+        weights = torch.tensor([[0.25, 0.75]])
 
-        def finalize(expert_output, row_idx, topk_weights):
-            rows = expert_output.index_select(0, row_idx).reshape(2, 2, 1)
-            return (rows * topk_weights[:, :, None]).sum(dim=1)
-
-        with patch(f"{module}.npu_moe_finalize_routing", side_effect=finalize):
-            for output in (hidden, torch.cat((hidden, hidden))):
-                result = combine_local_expert_routes(
-                    output, indices, weights, torch.tensor([1])
-                )
-                torch.testing.assert_close(result, torch.tensor([[1.003], [0.0]]))
-
-            # With a full set of valid routes, the last row is live.
-            result = combine_local_expert_routes(
-                torch.arange(1, 5, dtype=torch.bfloat16)[:, None],
-                torch.arange(4, dtype=torch.int32),
-                torch.ones(2, 2),
-                torch.tensor([4]),
+        def unpermute(*, permuted_tokens, sorted_indices, probs):
+            self.assertIs(permuted_tokens, hidden)
+            rows = permuted_tokens.index_select(0, sorted_indices)
+            return (
+                (rows.float() * probs.reshape(-1, 1))
+                .sum(0, keepdim=True)
+                .to(permuted_tokens.dtype)
             )
-            torch.testing.assert_close(result, torch.tensor([[3.0], [7.0]]))
+
+        torch_npu = SimpleNamespace(npu_moe_token_unpermute=unpermute)
+        with patch.dict(sys.modules, {"torch_npu": torch_npu}):
+            result = npu_moe_token_unpermute(hidden, indices, weights)
+
+        torch.testing.assert_close(result, torch.tensor([[2.5]], dtype=torch.bfloat16))
 
     # Protects the forward-state handoff: combine must work without a cached
     # dispatch result stored on the dispatcher instance.

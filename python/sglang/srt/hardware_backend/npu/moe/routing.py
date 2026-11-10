@@ -2,9 +2,9 @@
 
 Every Ascend MoE path — no-A2A ``standard``, ``ascend_ops`` alltoallv and
 allgather — permutes tokens into expert order with
-``npu_moe_init_routing_v2`` and undoes the permutation with
-``npu_moe_finalize_routing``. AllGather prepares a full-capacity FP32
-input for finalize from each rank's subset of the global routes.
+``npu_moe_init_routing_v2``. Standard and AllToAllV undo the permutation
+with ``npu_moe_finalize_routing``. AllGather uses ``npu_moe_token_unpermute``
+to combine each rank's subset of the global routes.
 
 - :func:`npu_moe_init_routing`: quantizing pass (``quant_mode``), or
   scale-reuse pass (``scale``) that re-permutes already-quantized tokens
@@ -179,21 +179,16 @@ def npu_moe_finalize_routing(
     )
 
 
-def combine_local_expert_routes(
+def npu_moe_token_unpermute(
     hidden_states: torch.Tensor,
     expanded_row_idx: torch.Tensor,
-    topk_weights: torch.Tensor,
-    expert_tokens: torch.Tensor,
+    topk_weights: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Finalize local expert contributions in FP32 for ReduceScatter."""
-    num_routes = expanded_row_idx.numel()
-    expert_output = hidden_states.new_zeros(
-        (num_routes, hidden_states.shape[1]), dtype=torch.float32
-    )
-    expert_output[: hidden_states.shape[0]].copy_(hidden_states)
-    # Routing packs valid expert rows at the front. When there are dropped
-    # routes, the caller maps them to the last capacity row with zero weight.
-    expert_output[-1:].masked_fill_(expert_tokens.sum() < num_routes, 0)
-    return npu_moe_finalize_routing(
-        expert_output, expanded_row_idx, topk_weights=topk_weights
+    """Unpermute and weight local expert outputs in the GMM output dtype."""
+    import torch_npu
+
+    return torch_npu.npu_moe_token_unpermute(
+        permuted_tokens=hidden_states,
+        sorted_indices=expanded_row_idx,
+        probs=topk_weights,
     )

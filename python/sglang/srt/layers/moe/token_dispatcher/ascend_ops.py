@@ -113,7 +113,6 @@ class _AllGatherState:
     input_dtype: torch.dtype
     topk_weights: Optional[torch.Tensor] = None
     expanded_row_idx: Optional[torch.Tensor] = None
-    expert_tokens: Optional[torch.Tensor] = None
 
 
 @dataclass
