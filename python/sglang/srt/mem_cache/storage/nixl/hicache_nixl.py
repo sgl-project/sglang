@@ -119,12 +119,9 @@ class HiCacheNixl(HiCacheStorage):
         sync_mode = getattr(
             nixlBind, "NIXL_THREAD_SYNC_RW", nixlBind.NIXL_THREAD_SYNC_STRICT
         )
-        # nixl 1.6.0 (upstream DOCA_MEMOS, #1717) renamed nixl_agent_config
-        # fields: enable_pthread -> enable_prog_thread, enable_listen ->
-        # enable_listen_thread, port -> listen_port. Enable the progress thread
-        # only there: its DOCA_MEMOS plugin runs a low-contention threaded
-        # progress engine off it, while the pre-upstream fork plugin ignores
-        # the flag and would only burn a busy-poll thread (pthrDelay == 0).
+        # nixl 1.6.0 renamed nixl_agent_config fields:
+        # enable_pthread -> enable_prog_thread, enable_listen ->
+        # enable_listen_thread, port -> listen_port.
         try:
             agent_config = nixl_agent_config(backends=[], enable_prog_thread=True)
             prog_thread = True
