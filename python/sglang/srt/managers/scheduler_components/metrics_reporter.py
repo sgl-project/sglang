@@ -562,6 +562,9 @@ class SchedulerMetricsReporter:
 
     def report_spec_execution(self) -> None:
         if self.is_stats_logging_rank:
+            if not logger.isEnabledFor(logging.INFO):
+                self.spec_execution_window.drain(discard=True)
+                return
             if execution := self.spec_execution_window.drain():
                 logger.info(
                     "Completed speculative execution: %s", json.dumps(execution)

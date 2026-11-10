@@ -5,7 +5,7 @@ API calls. A multi-step draft replay covers several model forwards. A graph
 dispatch returning successfully does not prove asynchronous GPU completion.
 """
 
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from typing import Literal
 
 Phase = Literal["draft", "target_verify", "draft_extend"]
@@ -95,9 +95,9 @@ class SpecExecutionWindow:
             execution.num_draft_tokens,
             execution.verify_num_tokens_per_req,
         )
-        row = self._totals.setdefault(
-            key,
-            dict(
+        row = self._totals.get(key)
+        if row is None:
+            row = self._totals[key] = dict(
                 num_steps=key[0],
                 draft_num_tokens_per_req=key[1],
                 num_draft_tokens=key[2],
@@ -107,20 +107,21 @@ class SpecExecutionWindow:
                     p: dict(graph_forwards=0, eager_forwards=0, unexecuted_rounds=0)
                     for p in PHASES
                 },
-            ),
-        )
+            )
         row["rounds"] += 1
         for phase in PHASES:
             counts = getattr(execution, phase)
             totals = row["phases"][phase]
-            for name, value in asdict(counts).items():
-                totals[name] += value
+            totals["graph_forwards"] += counts.graph_forwards
+            totals["eager_forwards"] += counts.eager_forwards
             totals["unexecuted_rounds"] += (
                 counts.graph_forwards + counts.eager_forwards == 0
             )
         result.spec_execution_accounted = True
 
-    def drain(self) -> list[dict]:
-        rows = [self._totals[key] for key in sorted(self._totals)]
-        self._totals = {}
-        return rows
+    def drain(self, *, discard: bool = False) -> list[dict] | None:
+        """End the interval, optionally without materializing its output rows."""
+        totals, self._totals = self._totals, {}
+        if discard:
+            return None
+        return [totals[key] for key in sorted(totals)]

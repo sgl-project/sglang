@@ -618,5 +618,100 @@ def test_real_draft_extend_dispatch_observations(
     assert worker.draft_runner.forward.call_count == int(not specialized_graph)
 
 
+def test_info_disabled_discards_interval_without_output_materialization():
+    r = reporter_for_window()
+    _, completed = run_round(1)
+    snapshot = completed.spec_execution
+    r.observe_spec_execution(completed)
+
+    class UnmaterializedRows(dict):
+        def __iter__(self):
+            raise AssertionError("disabled INFO must not sort or materialize rows")
+
+    r.spec_execution_window._totals = UnmaterializedRows(
+        r.spec_execution_window._totals
+    )
+    with (
+        patch(
+            "sglang.srt.managers.scheduler_components.metrics_reporter.logger"
+        ) as logger,
+        patch(
+            "sglang.srt.managers.scheduler_components.metrics_reporter.json.dumps",
+            side_effect=AssertionError("disabled INFO must not serialize"),
+        ),
+    ):
+        logger.isEnabledFor.return_value = False
+        r.report_spec_execution()
+        logger.info.assert_not_called()
+    assert r.spec_execution_window.drain() == []
+    r.observe_spec_execution(completed)
+    assert r.spec_execution_window.drain() == []
+    assert completed.spec_execution is snapshot
+    assert completed.spec_execution_accounted
+
+    _, next_result = run_round(3)
+    r.observe_spec_execution(next_result)
+    with patch(
+        "sglang.srt.managers.scheduler_components.metrics_reporter.logger"
+    ) as logger:
+        logger.isEnabledFor.return_value = True
+        r.report_spec_execution()
+    rows = json.loads(logger.info.call_args.args[1])
+    assert len(rows) == 1 and rows[0]["num_steps"] == 3
+    assert rows[0]["rounds"] == 1  # Discarded K1 interval cannot leak forward.
+
+
+def test_discard_empty_or_populated_window_keeps_duplicate_marker():
+    from sglang.srt.speculative.execution_info import SpecExecutionWindow
+
+    w = SpecExecutionWindow()
+    assert w.drain(discard=True) is None
+    _, result = run_round(1)
+    w.observe(result)
+    assert w.drain(discard=True) is None
+    w.observe(result)
+    assert w.drain() == []
+    assert result.spec_execution_accounted
+
+
+def test_existing_key_accumulates_mixed_phases_without_mutating_snapshot():
+    from sglang.srt.speculative.execution_info import (
+        SpecExecutionRecorder,
+        SpecExecutionWindow,
+    )
+
+    rec = SpecExecutionRecorder(3, 1, 4)
+    rec.verify_num_tokens_per_req = 4
+    rec.record("draft", graph=True, num_forwards=2)
+    rec.record("draft", graph=False)
+    rec.record("target_verify", graph=False)
+    snapshot = rec.finish()
+    before = pickle.dumps(snapshot)
+    first = GenerationBatchResult(spec_execution=snapshot)
+    second = GenerationBatchResult(spec_execution=snapshot)
+    w = SpecExecutionWindow()
+    w.observe(first)
+    w.observe(second)
+    w.observe(first)
+    rows = w.drain()
+    assert len(rows) == 1 and rows[0]["rounds"] == 2
+    assert rows[0]["phases"] == {
+        "draft": {"graph_forwards": 4, "eager_forwards": 2, "unexecuted_rounds": 0},
+        "target_verify": {
+            "graph_forwards": 0,
+            "eager_forwards": 2,
+            "unexecuted_rounds": 0,
+        },
+        "draft_extend": {
+            "graph_forwards": 0,
+            "eager_forwards": 0,
+            "unexecuted_rounds": 2,
+        },
+    }
+    assert pickle.dumps(snapshot) == before
+    w.observe(second)
+    assert w.drain() == []
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v", "-x"]))
