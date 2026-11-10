@@ -7,8 +7,11 @@ from unittest.mock import patch
 
 from prometheus_client import CollectorRegistry, Counter, make_asgi_app
 
-import sglang.srt.utils.common as common_module
-from sglang.srt.utils.common import _make_guarded_metrics_app, add_prometheus_middleware
+import sglang.srt.entrypoints.server_utils as server_utils_module
+from sglang.srt.entrypoints.server_utils import (
+    _make_guarded_metrics_app,
+    add_prometheus_middleware,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
@@ -233,7 +236,7 @@ def test_metrics_guard_logs_background_failure_after_timeout(caplog):
             raise RuntimeError("registry read failed")
 
         app = _make_guarded_metrics_app(metrics_app, scrape_timeout_s=0.01)
-        caplog.set_level(logging.ERROR, logger=common_module.logger.name)
+        caplog.set_level(logging.ERROR, logger=server_utils_module.logger.name)
         messages = await _call_asgi(app)
         assert _status(messages) == 504
         assert started.is_set()
