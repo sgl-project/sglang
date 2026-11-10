@@ -17,7 +17,6 @@
 from typing import Iterable, List, Optional, Tuple, Union
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 from transformers.models.ernie4_5_moe.configuration_ernie4_5_moe import (
     Ernie4_5_MoeConfig,
@@ -30,6 +29,7 @@ from sglang.srt.hf_transformers import get_rope_config
 from sglang.srt.layers.layer_boundary import is_dense_ffn_fully_dp
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.moe import RouterGate
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
@@ -51,25 +51,6 @@ _is_cpu = is_cpu()
 _is_npu = is_npu()
 
 
-class MoEGate(nn.Module):
-    def __init__(
-        self,
-        config,
-        prefix: str = "",
-    ):
-        super().__init__()
-        self.weight = nn.Parameter(
-            torch.empty((config.moe_num_experts, config.hidden_size))
-        )
-        self.e_score_correction_bias = nn.Parameter(
-            torch.empty((1, config.moe_num_experts), dtype=torch.float32)
-        )
-
-    def forward(self, hidden_states):
-        logits = F.linear(hidden_states, self.weight, None)
-        return logits
-
-
 class Ernie4Moe(nn.Module):
     def __init__(
         self,
@@ -89,7 +70,14 @@ class Ernie4Moe(nn.Module):
                 "Only silu is supported for now."
             )
 
-        self.gate = MoEGate(config=config, prefix=add_prefix("gate", prefix))
+        self.gate = RouterGate(
+            hidden_size=config.hidden_size,
+            num_experts=config.moe_num_experts,
+            has_correction_bias=True,
+            correction_bias_shape=(1, config.moe_num_experts),
+            fp32_compute=False,
+            prefix=add_prefix("gate", prefix),
+        )
 
         correction_bias = self.gate.e_score_correction_bias
         # npu/cpu only support 1D, but current correction_bias is 2D

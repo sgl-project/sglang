@@ -35,7 +35,6 @@ from typing import (
 )
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -73,6 +72,7 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
+    RouterGate,
     get_deepep_mode,
     get_moe_a2a_backend,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
@@ -112,7 +112,6 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     _load_fused_indexer_wk,
 )
-from sglang.srt.models.deepseek_common.utils import tiny_router_gemm_max_tokens
 from sglang.srt.models.dots3_common.fp8 import per_token_group_quant_einsum_fp8
 from sglang.srt.models.utils import bind_or_assign
 from sglang.srt.multimodal.modality import Modality
@@ -137,10 +136,8 @@ _is_fp8_fnuz = is_fp8_fnuz()
 if _is_cuda:
     from sgl_kernel import merge_state_v2
 
-    from sglang.kernels.ops.gemm.tiny_gemm import tiny_gemm_bf16
 else:
     merge_state_v2 = None
-    tiny_gemm_bf16 = None
 
 
 def _require_cuda() -> None:
@@ -233,34 +230,6 @@ class Dots3MLP(nn.Module):
         return x
 
 
-class Dots3MoEGate(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.weight = nn.Parameter(
-            torch.empty((config.n_routed_experts, config.hidden_size))
-        )
-        if config.topk_method == "noaux_tc":
-            self.e_score_correction_bias = nn.Parameter(
-                torch.empty((config.n_routed_experts), dtype=torch.float32)
-            )
-        else:
-            self.e_score_correction_bias = None
-        self.tiny_router_gemm_max_tokens = tiny_router_gemm_max_tokens(
-            num_experts=config.n_routed_experts,
-            hidden_size=config.hidden_size,
-            weight_dtype=self.weight.dtype,
-        )
-
-    def forward(self, hidden_states):
-        # Use the fused router only for its tuned shapes.
-        if hidden_states.shape[0] <= self.tiny_router_gemm_max_tokens:
-            logits = tiny_gemm_bf16(hidden_states, self.weight)
-        else:
-            logits = F.linear(hidden_states, self.weight, None)
-
-        return logits
-
-
 class Dots3MoE(nn.Module):
     def __init__(
         self,
@@ -291,7 +260,13 @@ class Dots3MoE(nn.Module):
                 "Only silu is supported for now."
             )
 
-        self.gate = Dots3MoEGate(config)
+        self.gate = RouterGate(
+            hidden_size=config.hidden_size,
+            num_experts=config.n_routed_experts,
+            has_correction_bias=config.topk_method == "noaux_tc",
+            fp32_compute=False,
+            prefix=add_prefix("gate", prefix),
+        )
 
         self.experts = get_moe_impl_class(quant_config)(
             num_experts=config.n_routed_experts

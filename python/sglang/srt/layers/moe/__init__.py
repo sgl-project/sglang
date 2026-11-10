@@ -1,4 +1,9 @@
 from sglang.srt.layers.moe.moe_runner import MoeRunner, MoeRunnerConfig
+from sglang.srt.layers.moe.router_gate import (
+    ROUTER_HPC_GEMM_MIN_M,
+    RouterGate,
+    tiny_router_gemm_max_tokens,
+)
 from sglang.srt.layers.moe.utils import (
     AscendOpsConfig,
     DeepEPMode,
@@ -33,6 +38,9 @@ __all__ = [
     "MoeRunner",
     "MoeRunnerConfig",
     "MoeRunnerBackend",
+    "RouterGate",
+    "ROUTER_HPC_GEMM_MIN_M",
+    "tiny_router_gemm_max_tokens",
     "initialize_moe_config",
     "get_moe_a2a_backend",
     "get_moe_runner_backend",
