@@ -22,7 +22,7 @@ for (const [vendor, name, checkpoint, revision, cap, gpu] of [
 ]) {
 const config = await load(name, vendor);
 const firstVariant = vendor === "IFM" ? "0.9b" : "3b";
-const staleVariant = vendor === "IFM" ? "375b" : "30b";
+const staleVariant = vendor === "IFM" ? "375b" : "invalid";
 
 test(`${name} exposes only validated Python-only Xeon recipes`, () => {
   assert.ok(config.supportedHardware.includes("xeon"));
@@ -31,7 +31,7 @@ test(`${name} exposes only validated Python-only Xeon recipes`, () => {
   assert.deepEqual(modes("xeon"), ["python"]);
   if (vendor === "ibm-granite") assert.deepEqual(modes(gpu), ["python", "docker"]);
   const cells = config.cells.filter((cell) => cell.match.hw === "xeon");
-  const expectedVariants = vendor === "IFM" ? ["0.9b", "3.7b"] : ["3b", "8b"];
+  const expectedVariants = vendor === "IFM" ? ["0.9b", "3.7b"] : ["3b", "8b", "30b"];
   if (vendor === "IFM") expectedVariants.push("7b");
   if (name === "k2-horizon") expectedVariants.push("32b");
   assert.deepEqual(cells.map((cell) => cell.match.variant).sort(), expectedVariants.sort());
@@ -83,6 +83,7 @@ for (const [vendor, name, variant, checkpoint, revision] of [
   ["IFM", "jais-3", "3.7b", "Jais-3-3.7B", "78d52c03900ef18ee3ebae631426556df6bd925a"],
   ["IFM", "jais-3", "7b", "Jais-3-7B", "c7daf3c43355921602398a0d97bbeba05bfbe81b"],
   ["ibm-granite", "granite-4.2", "8b", "granite-4.2-8b", "a7042144125ce5ae64f89610e8289647fc000b9a"],
+  ["ibm-granite", "granite-4.2", "30b", "granite-4.2-30b", "9e668ce1c538387ef24d3644e9b0606647762636"],
 ]) {
 test(`${checkpoint} emits its independently validated checkpoint and cache limit`, async () => {
   const config = await load(name, vendor);
