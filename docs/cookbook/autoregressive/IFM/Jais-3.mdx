@@ -1,6 +1,6 @@
 ---
 title: Jais 3
-description: "Deploy the IFM Jais 3 family with SGLang — BF16 recipes on NVIDIA H100 GPUs and a 0.9B recipe on Intel Xeon CPUs."
+description: "Deploy the IFM Jais 3 family with SGLang — BF16 recipes on NVIDIA H100 GPUs and 0.9B/3.7B recipes on Intel Xeon CPUs."
 tag: NEW
 ---
 
@@ -23,7 +23,7 @@ For other install methods, see [Install](/docs/get-started/install).
 
 Choose hardware and a model size to generate its launch command. On H100, five checkpoints run on a single node; 375B-A23B needs two. The H100 recipes serve each repository's `main` branch.
 
-The **XEON** recipe covers `IFM/Jais-3-0.9B` only. Basic chat generation passed on Intel Xeon CPUs (6972P, TP6) with unmodified SGLang revision `99fd01047d67bb249641a8e50282a1a5218afc63`. It pins the tested checkpoint and an 8,192-token cache; full-context capacity, dataset accuracy, and performance were not evaluated on CPU. Use an installed SGLang CPU environment with its OpenMP and allocator setup.
+The **XEON** recipes cover `IFM/Jais-3-0.9B` and `IFM/Jais-3-3.7B`. Basic chat generation passed on Intel Xeon CPUs (6972P, TP6) with unmodified SGLang revision `99fd01047d67bb249641a8e50282a1a5218afc63`. Each recipe pins its independently tested checkpoint and an 8,192-token cache; full-context capacity, dataset accuracy, and performance were not evaluated on CPU. Use an installed SGLang CPU environment with its OpenMP and allocator setup.
 
 import { Deployment } from "/src/snippets/_deployment.jsx";
 import { config }     from "/src/snippets/configs/IFM/jais-3.jsx";
@@ -104,7 +104,7 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 ## 2. Configuration tips
 
-- **Hardware and precision:** The matrix covers NVIDIA H100 GPUs and Intel Xeon CPUs with BF16 checkpoints. Xeon is limited to the validated 0.9B checkpoint.
+- **Hardware and precision:** The matrix covers NVIDIA H100 GPUs and Intel Xeon CPUs with BF16 checkpoints. Xeon is limited to the validated 0.9B and 3.7B checkpoints.
 - **Parallelism:** On H100, use TP1 for 0.9B, 3.7B, and 7B; TP2 for 32B; TP2 with expert parallelism (`--ep 2`) for MoVA-36B-A4B; and TP16 with `--ep 16` across two eight-GPU nodes for 375B-A23B. Xeon uses single-node TP6. Every other recipe stays within one node.
 - **Attention:** The H100 recipes select FlashAttention-3 with `--attention-backend fa3`; Xeon uses the native CPU backend.
 - **Parsers:** The H100 recipes enable reasoning with `--reasoning-parser k2_horizon`. Enable `--tool-call-parser k2_horizon` from the **Parsers** card in the [Playground](#playground) when you need tool calling.

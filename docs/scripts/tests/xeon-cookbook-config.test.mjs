@@ -31,10 +31,10 @@ test(`${name} exposes only validated Python-only Xeon recipes`, () => {
   assert.deepEqual(modes("xeon"), ["python"]);
   if (vendor === "ibm-granite") assert.deepEqual(modes(gpu), ["python", "docker"]);
   const cells = config.cells.filter((cell) => cell.match.hw === "xeon");
-  assert.deepEqual(cells.map((cell) => cell.match.variant),
-    name === "k2-horizon" ? ["0.9b", "3.7b"] : [firstVariant]);
+  assert.deepEqual(cells.map((cell) => cell.match.variant).sort(),
+    vendor === "IFM" ? ["0.9b", "3.7b"] : [firstVariant]);
   const api = engine(config);
-  const cell = cells[0];
+  const cell = cells.find((candidate) => candidate.match.variant === firstVariant);
   const command = api.renderCommand(cell, cell.match, {
     HOST_IP: "127.0.0.1", PORT: "31000",
   });
@@ -74,16 +74,21 @@ test(`${name} hides unvalidated Playground axes and discards stale GPU overrides
 });
 }
 
-test("K2 Horizon 3.7B emits its independently validated checkpoint and cache limit", async () => {
-  const config = await load("k2-horizon");
-  const cell = config.cells.find((cell) => cell.match.hw === "xeon" && cell.match.variant === "3.7b");
+for (const [vendor, name, variant, checkpoint, revision] of [
+  ["IFM", "k2-horizon", "3.7b", "K2-Horizon-3.7B", "4525090a8f0fce1026d861701b9bde2fb726b7a0"],
+  ["IFM", "jais-3", "3.7b", "Jais-3-3.7B", "78d52c03900ef18ee3ebae631426556df6bd925a"],
+]) {
+test(`${checkpoint} emits its independently validated checkpoint and cache limit`, async () => {
+  const config = await load(name, vendor);
+  const cell = config.cells.find((cell) => cell.match.hw === "xeon" && cell.match.variant === variant);
   const command = engine(config).renderCommand(cell, cell.match, {
     HOST_IP: "127.0.0.1", PORT: "31001",
   });
   for (const flag of [
-    "--model IFM/K2-Horizon-3.7B",
-    "--revision 4525090a8f0fce1026d861701b9bde2fb726b7a0",
+    `--model ${vendor}/${checkpoint}`,
+    `--revision ${revision}`,
     "--tp 6", "--max-total-tokens 8192", "OPENBLAS_NUM_THREADS=1",
   ]) assert.ok(command.includes(flag), flag);
   assert.doesNotMatch(command, /docker|--gpus|fa3|--ep |--nnodes|--reasoning-parser|--speculative/);
 });
+}
