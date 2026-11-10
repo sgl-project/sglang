@@ -13,7 +13,7 @@ from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
 from sglang.srt.distributed.communication_op import attn_cp_tp_broadcast_pyobj
 from sglang.srt.distributed.parallel_state import P2PWork
-from sglang.srt.environ import envs
+from sglang.srt.environ import InvariantCheckLevel, envs
 from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.mm_utils import strip_mm_features_for_pp_relay
@@ -27,6 +27,8 @@ from sglang.srt.managers.utils import (
     get_logprob_dict_from_result,
     get_logprob_from_pp_outputs,
 )
+from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator
+from sglang.srt.mem_cache.kv.alloc.invariants import STAGE_CAPACITY_AGREEMENT
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.observability.req_time_stats import set_time_batch
@@ -47,6 +49,7 @@ from sglang.srt.sampling.sampling_observer_pp import (
 )
 from sglang.srt.utils import DynamicGradMode, point_to_point_pyobj
 from sglang.srt.utils.device import async_d2h, is_npu
+from sglang.srt.utils.invariants import expect_host, resolve_level
 
 _is_npu = is_npu()
 logger = logging.getLogger(__name__)
@@ -120,14 +123,13 @@ class SchedulerPPMixin:
     _pp_spec_relay: bool = False
     # Side stream of `_pp_result_done_event`; made on first use.
     _pp_skip_output_stream = None
+    # Unified memory under PP with invariant checks: the allocator whose decisions
+    # the stages compare, and their digest up to this iteration (`init_pp_loop_state`).
+    _pp_checked_allocator: Optional[ChainAllocator] = None
+    _pp_capacity_digest: Optional[bytes] = None
 
     @DynamicGradMode()
     def event_loop_pp(self: Scheduler):
-        # FIXME: this loop never applies the write-after-read barrier
-        # (`Scheduler._apply_war_barrier`). Unified memory frees ids and
-        # rewrites request rows on the schedule stream at once and relies on
-        # this barrier, so an in-flight microbatch can read unbound or rebound
-        # mappings.
         """
         A scheduler loop for pipeline parallelism.
         Notes:
@@ -162,12 +164,15 @@ class SchedulerPPMixin:
                     mb_id + get_parallel().pp_size
                 ) % self.pp_loop_size
                 next_mb_id = (mb_id + 1) % self.pp_loop_size
+                self._pp_mark_capacity_digest()
                 with torch.profiler.record_function("recv_requests"):
                     recv_reqs = self._pp_ingest_requests()
+                self._pp_check_capacity_digest()
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
                     with torch.profiler.record_function("send_reqs_to_next_stage"):
                         self.send_req_work = self._pp_send_reqs_to_next_stage(recv_reqs)
+                    self._pp_send_capacity_digest()
                 with torch.profiler.record_function("get_next_batch_to_run"):
                     batch = None
                     if self.pause_state.may_launch():
@@ -235,6 +240,8 @@ class SchedulerPPMixin:
                         self._pp_send_proxy_to_next_stage(result)
 
                 self.pp_outputs = next_pp_outputs
+                if cur_batch:
+                    self._pp_apply_war_barrier()
 
                 # `self.last_batch` is the one reloaded for this micro-batch, so
                 # pass the batch this iteration launched.
@@ -303,7 +310,9 @@ class SchedulerPPMixin:
                 d2h_event = None
                 next_batch_result = None
 
+                self._pp_mark_capacity_digest()
                 recv_reqs = self._pp_ingest_requests()
+                self._pp_check_capacity_digest()
 
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
@@ -386,6 +395,7 @@ class SchedulerPPMixin:
                     self.process_disagg_prefill_transfer_queue(next_release_rids)
                 if not self.pp_group.is_last_rank:
                     self.send_req_work = self._pp_send_reqs_to_next_stage(recv_reqs)
+                    self._pp_send_capacity_digest()
                     send_transfer_work = self._pp_send_pyobj_to_next_stage(
                         transferred_rids, async_send=True
                     )
@@ -394,6 +404,8 @@ class SchedulerPPMixin:
 
                 self.pp_outputs = next_pp_outputs
                 release_rids = next_release_rids
+                if cur_batch:
+                    self._pp_apply_war_barrier()
 
                 self.running_batch.batch_is_full = False
 
@@ -441,7 +453,9 @@ class SchedulerPPMixin:
                 d2h_event = None
                 next_batch_result = None
 
+                self._pp_mark_capacity_digest()
                 recv_reqs = self._pp_ingest_requests()
+                self._pp_check_capacity_digest()
 
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
@@ -573,6 +587,7 @@ class SchedulerPPMixin:
 
                 if not self.pp_group.is_last_rank:
                     self.send_req_work = self._pp_send_reqs_to_next_stage(recv_reqs)
+                    self._pp_send_capacity_digest()
                     if may_launch:
                         send_retract_work = self._pp_send_pyobj_to_next_stage(
                             retract_rids, async_send=True
@@ -593,6 +608,8 @@ class SchedulerPPMixin:
                 release_rids = next_release_rids
                 consensus_retract_rids = next_consensus_retract_rids
                 consensus_prealloc_rids = next_consensus_prealloc_rids
+                if cur_batch:
+                    self._pp_apply_war_barrier()
 
                 self.running_batch.batch_is_full = False
 
@@ -617,6 +634,12 @@ class SchedulerPPMixin:
         unprocessed."""
         has_unprocessed_mb = any(mb is not None for mb in self.mbs)
         return self.ingest_requests(stop_at_pause=has_unprocessed_mb)
+
+    def _pp_apply_war_barrier(self: Scheduler) -> None:
+        """Order later schedule-stream writes after the launched forward's reads.
+        Result processing may run first: its result is another micro-batch's, and
+        what it releases is only reused at the next schedule, behind this wait."""
+        self._apply_war_barrier()
 
     def _pp_retract_microbatches(self: Scheduler) -> None:
         """Retract the requests of every micro-batch, none of them in flight."""
@@ -674,6 +697,70 @@ class SchedulerPPMixin:
         self._pp_tensor_dict_inbox: Dict[
             str, deque[Tuple[Dict[str, torch.Tensor], Optional[torch.Event]]]
         ] = defaultdict(deque)
+        self._pp_capacity_send_work: List[P2PWork] = []
+        self._pp_init_stage_capacity()
+
+    def _pp_init_stage_capacity(self: Scheduler) -> None:
+        """Under unified memory, share the stages' geometry (sized after capture) so
+        each asks every capacity question of all stages; checks compare digests."""
+        allocator = self.token_to_kv_pool_allocator
+        if get_parallel().pp_size == 1 or not isinstance(allocator, ChainAllocator):
+            return
+        checks = resolve_level() >= InvariantCheckLevel.WARN
+        if checks and self.recv_skipper is not None:
+            raise ValueError(
+                "the pipeline stages compare their capacity decisions with "
+                "every iteration's requests under invariant checks; that needs "
+                "--scheduler-recv-interval 1"
+            )
+        geometries = [None] * get_parallel().pp_size
+        torch.distributed.all_gather_object(
+            geometries, allocator.stage_geometry(), group=self.pp_group.cpu_group
+        )
+        allocator.install_stage_capacity(
+            get_parallel().pp_rank, geometries, checks=checks
+        )
+        if checks:
+            self._pp_checked_allocator = allocator
+        logger.info(
+            "Unified memory capacity asked of every pipeline stage, with stage "
+            "arenas of %s bytes",
+            [geometry.total_bytes for geometry in geometries],
+        )
+
+    def _pp_mark_capacity_digest(self: Scheduler) -> None:
+        """At the start of an iteration: the digest of every capacity decision
+        made so far, the same point on every stage."""
+        allocator = self._pp_checked_allocator
+        if allocator is not None:
+            self._pp_capacity_digest = allocator.stage_capacity.take_digest(
+                allocator.stage_counts()
+            )
+
+    def _pp_check_capacity_digest(self: Scheduler) -> None:
+        """Right after the iteration's requests arrive: the previous stage's
+        digest, sent right after them, must be this stage's."""
+        if self._pp_capacity_digest is None or self.pp_group.is_first_rank:
+            return
+        (received,) = self._pp_recv_pyobj_from_prev_stage()
+        expect_host(
+            STAGE_CAPACITY_AGREEMENT,
+            received == self._pp_capacity_digest,
+            msg=(
+                f"pipeline stage {get_parallel().pp_rank} made capacity "
+                "decisions, or holds units, unlike the previous stage's by "
+                f"iteration {self.forward_ct}"
+            ),
+        )
+
+    def _pp_send_capacity_digest(self: Scheduler) -> None:
+        """Right after the iteration's requests go to the next stage."""
+        if self._pp_capacity_digest is None:
+            return
+        self._pp_commit_comm_work(self._pp_capacity_send_work)
+        self._pp_capacity_send_work = self._pp_send_pyobj_to_next_stage(
+            [self._pp_capacity_digest], async_send=True
+        )
 
     @scheduler_stage_method(SCHEDULER_STAGE_DISAGG_BOOKKEEPING)
     def process_bootstrapped_queue(self: Scheduler):
@@ -1298,6 +1385,7 @@ class SchedulerPPMixin:
         from sglang.srt.speculative.spec_utils import (
             commit_mamba_states_after_verify,
             move_accept_tokens_to_target_kvcache,
+            relayed_commit_state_slots,
         )
 
         # Preserve the forward batch's row order after live-batch recomposition.
@@ -1329,6 +1417,7 @@ class SchedulerPPMixin:
                 accept_lens,
                 accept_index,
                 get_spec().speculative_num_draft_tokens,
+                state_slots=relayed_commit_state_slots(self.tp_worker, fwd_batch),
             )
 
         if verify_out_cache_loc is None:

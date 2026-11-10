@@ -252,6 +252,61 @@ def test_detector_capabilities_and_registration() -> None:
     assert parser.get_structure_constraint("required") is not None
 
 
+@pytest.mark.parametrize("size", [1, 7, 23, 4096])
+def test_streamed_arguments_match_non_streaming(size):
+    args = {
+        'a"&b': ("string", '中文 "quote" \\ path\n' * 100),
+        "empty": ("string", ""),
+        "obj": ("object", '{"a": [1, true, null]}'),
+        "bad": ("number", "not JSON"),
+    }
+    # Escape the attribute independently of the raw string value.
+    text = (
+        TOOLS_OPEN
+        + _call_block("python", 1, args).replace('key="a"&b"', 'key="a&quot;&amp;b"')
+        + _call_block("python", 2, {})
+        + TOOLS_CLOSE
+    )
+    detector = KimiK3Detector()
+    _, calls = _stream(detector, _chunks(text, size), [_make_tool("python")])
+    expected = detector.detect_and_parse(text, []).calls
+    assert [c.name for c in calls if c.name] == ["python", "python"]
+    for i in (0, 1):
+        actual = "".join(c.parameters for c in calls if c.tool_index == i)
+        assert json.loads(actual) == json.loads(expected[i].parameters)
+        assert actual == detector.streamed_args_for_tool[i]
+    assert detector.incomplete_tool_call_indices == set()
+
+
+def test_arguments_are_emitted_before_argument_and_call_close():
+    detector = KimiK3Detector()
+    prefix = (
+        TOOLS_OPEN + '<|open|>call tool="python" index="1"<|sep|>'
+        '<|open|>argument key="code" type="string"<|sep|>'
+    )
+    first = detector.parse_streaming_increment(prefix + "first", [])
+    second = detector.parse_streaming_increment("second", [])
+    assert "first" in "".join(c.parameters for c in first.calls)
+    assert "second" in "".join(c.parameters for c in second.calls)
+    assert detector.incomplete_tool_call_indices == {0}
+    assert all(c.name is None for c in second.calls)
+
+
+def test_nameless_call_is_skipped_like_non_streaming():
+    text = (
+        TOOLS_OPEN
+        + _call_block("", 1, {"x": ("string", "a")})
+        + _call_block("python", 2, {"y": ("string", "b")})
+        + TOOLS_CLOSE
+    )
+    detector = KimiK3Detector()
+    _, calls = _stream(detector, _chunks(text, 5), [_make_tool("python")])
+    expected = detector.detect_and_parse(text, []).calls
+    assert [c.name for c in calls if c.name] == [c.name for c in expected]
+    actual = "".join(c.parameters for c in calls)
+    assert json.loads(actual) == json.loads(expected[0].parameters)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
 
