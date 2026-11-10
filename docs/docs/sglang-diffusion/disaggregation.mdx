@@ -449,9 +449,15 @@ recovered. Results without an identifiable request are logged and discarded;
 affected requests still rely on `--disagg-timeout`. Reported worker errors release
 their scheduling capacity and reserved receive slots so later requests can run.
 
-Keep scheduler and worker ports on a trusted private network. This error handling
-does not make the pickle-based scheduler protocol safe for untrusted clients, or
-provide durable jobs and transparent recovery after a head restart.
+The HTTP frontend-to-head hop uses restricted pickle decoding. It accepts request
+data and the server-selected sampling contract, including annotated data types
+from out-of-tree models, but rejects arbitrary Python globals. Custom objects or
+callbacks in `Any` fields are not automatically authorized.
+
+Keep scheduler and worker ports on a trusted private network. Restricted decoding
+does not authenticate peers, prevent resource-exhaustion attacks, harden every
+pickle transport, or provide durable jobs and transparent recovery after a head
+restart.
 
 ### RDMA Flags
 
