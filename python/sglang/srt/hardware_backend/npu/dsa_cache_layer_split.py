@@ -239,6 +239,10 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
         owned_start, _ = self._owned_local_layer_range()
         return layer_id - self.start_layer - owned_start
 
+    def _kv_buffer_layer_ids(self) -> range:
+        owned_start, owned_end = self._owned_local_layer_range()
+        return range(self.start_layer + owned_start, self.start_layer + owned_end)
+
     def _kv_slice_tokens(self, used_bound: Optional[int]) -> int:
         """Row-space slice of the remote scratches for a bound.
         The bound is POOL ROWS (token-major flat rows).
@@ -686,13 +690,6 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
                     self.index_k_scale_buffer[slot][tgt_flat] = (
                         self.index_k_scale_buffer[slot][src_flat]
                     )
-
-    def get_kv_layer_ids(self):
-        owned_start, owned_end = self._owned_local_layer_range()
-        owned = list(
-            range(self.start_layer + owned_start, self.start_layer + owned_end)
-        )
-        return owned * 2 + self.get_state_layer_ids()
 
     def get_kv_transfer_layer_span(self, num_entries: int) -> int:
         """Layer count covered by ``num_entries`` contiguous buf entries.
