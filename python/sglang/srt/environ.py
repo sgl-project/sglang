@@ -1250,6 +1250,12 @@ class Envs:
     SGLANG_NPU_USE_SCATTER_PA_KV_CACHE = EnvBool(False)
     # Use the graph-safe Triton-Ascend kernel for masked speculative KV commits.
     SGLANG_NPU_USE_TRITON_PREFIX_KV_CACHE_STORE = EnvBool(False)
+    # Fuse top-k/top-p truncation and sampling into a single candidate-set pass
+    # on the decode path, avoiding the full-vocabulary sort / cumsum. Only
+    # batches whose nucleus is guaranteed to fit in the candidates
+    # (top_k <= SGLANG_NPU_FUSED_TRUNC_K) use it; the rest keep the slow path.
+    SGLANG_NPU_USE_FUSED_TRUNC = EnvBool(False)
+    SGLANG_NPU_FUSED_TRUNC_K = EnvInt(512)
     # Quantize x to int8 in the dispatch operator (vendor alias consumed by the
     # Ascend DeepEP library; the MTP draft-build scopes override it to False).
     DEEP_NORMAL_MODE_USE_INT8_QUANT = EnvBool(False)
