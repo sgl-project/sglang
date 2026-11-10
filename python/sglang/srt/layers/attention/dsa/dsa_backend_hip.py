@@ -12,7 +12,6 @@ from sglang.kernels.ops.attention.dsa.sparse_mla_decode_gfx950 import (
     supports_sparse_mla_decode_gfx950,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.dsa.dsa_dcp_sharded import dcp_localize_compact
 from sglang.srt.utils import is_gfx95_supported
 
 if TYPE_CHECKING:
@@ -46,8 +45,12 @@ def forward_triton_dcp_partial(
     """A decode or target-verify layer over this rank's KV shard: (o [T, H, D],
     natural-log lse [T, H]) for the merge, as _forward_flashmla_kv's
     dcp_partial returns."""
+    # the indexer's local slots (dcp_local_topk) and their counts
+    topk_length = backend.forward_metadata.dcp_topk_length
+    pad = page_table_1.shape[0] - topk_length.shape[0]
+    if pad > 0:  # padded rows (DP / attention-TP padding) select nothing
+        topk_length = torch.nn.functional.pad(topk_length, (0, pad))
     # Each rank holds about 1/N of the global top-k; bound rows by their share.
-    page_table_1, topk_length = dcp_localize_compact(page_table_1)
     expected_topk = -(-page_table_1.shape[-1] // backend.attn_dcp_size)
     if _gfx950_decode_enabled() and supports_sparse_mla_decode_gfx950(
         q_nope, kv_cache, layer.v_head_dim

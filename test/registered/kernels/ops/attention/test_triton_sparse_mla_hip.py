@@ -22,6 +22,7 @@ from sglang.kernels.ops.attention.dsa.triton_sparse_mla_decode import (
     _splitk_bufs,
 )
 from sglang.kernels.ops.quantization.dsa_quant_k_cache import quantize_k_cache
+from sglang.srt.layers.attention.dsa import dsa_backend_hip
 from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
 from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
@@ -381,6 +382,42 @@ def test_decode_without_row_lengths_skips_the_padding():
     lengths = torch.tensor(lens, dtype=torch.int32, device=_DEVICE)
     # the Triton split-K kernel keeps q in BF16
     o_ref, _ = _decode_reference(qn, qr, idx, lengths, kd, sm, mxfp8_q=False)
+    torch.testing.assert_close(o.float(), o_ref, rtol=0, atol=3e-2)
+
+
+@pytest.mark.skipif(not is_gfx95_supported(), reason="gfx950 kernel")
+def test_dcp_partial_reads_the_indexer_local_slots():
+    """Sharded index-K hands the backend this rank's compact slots and their counts
+    (dcp_local_topk); localizing them again reads other requests' KV."""
+    kv, kd = _pow2_scaled_kv()
+    lens = [256, 0, 1, 255]  # this rank's share of a 2048 top-k under DCP8
+    R, H = len(lens) + 2, 16  # two graph-padding rows select nothing
+    qkv = torch.randn(R, H, _DV + _DR, device=_DEVICE).bfloat16()
+    qn, qr = qkv[..., :_DV], qkv[..., _DV:]
+    idx = torch.full((R, _TOPK), -1, dtype=torch.int32, device=_DEVICE)
+    for r, n in enumerate(lens):
+        idx[r, :n] = torch.randperm(_N, device=_DEVICE)[:n].int()
+    lengths = torch.tensor(lens, dtype=torch.int32, device=_DEVICE)
+    sm = (_DV + _DR) ** -0.5
+    backend = SimpleNamespace(
+        _triton_sparse_mla_workspaces={},
+        attn_dcp_size=8,
+        forward_metadata=SimpleNamespace(dcp_topk_length=lengths),
+    )
+    layer = SimpleNamespace(scaling=sm, v_head_dim=_DV)
+    o, lse = dsa_backend_hip.forward_triton_dcp_partial(backend, qn, qr, kv, idx, layer)
+    o_ref, lse_ref = _decode_reference(
+        qn,
+        qr,
+        idx,
+        torch.nn.functional.pad(lengths, (0, R - len(lens))),
+        kd,
+        sm,
+        mxfp8_q=dsa_backend_hip._gfx950_decode_enabled(),
+    )
+    finite = torch.isfinite(lse_ref)
+    assert torch.equal(torch.isfinite(lse), finite)
+    torch.testing.assert_close(lse[finite], lse_ref[finite], rtol=0, atol=1e-3)
     torch.testing.assert_close(o.float(), o_ref, rtol=0, atol=3e-2)
 
 
