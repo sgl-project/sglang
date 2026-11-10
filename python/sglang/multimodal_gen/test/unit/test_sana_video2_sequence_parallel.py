@@ -44,6 +44,38 @@ def test_attention_ignores_tail_padding(attention_cls):
     torch.testing.assert_close(actual[:, :3], expected, atol=2e-6, rtol=2e-5)
 
 
+def test_linear_attention_ignores_padding_spanning_ranks(monkeypatch):
+    from sglang.multimodal_gen.runtime.models.dits import sana_video2
+
+    torch.manual_seed(22)
+    module = GatedLinearAttention(24, 12, fp32_attention=True).eval()
+    x = torch.randn(2, 8, 24)
+    # 8 tokens over 10 ranks: ranks 8 and 9 hold nothing but padding
+    padded = torch.cat([x, torch.randn(2, 2, 24)], dim=1)
+    shards = [
+        SpShard(orig_len=8, local_len=1, num_pad=2, sp_size=10, sp_rank=rank)
+        for rank in range(10)
+    ]
+
+    def forward_ranks(all_reduce):
+        monkeypatch.setattr(
+            sana_video2, "sequence_model_parallel_all_reduce", all_reduce
+        )
+        with torch.no_grad():
+            return [
+                module(padded[:, rank : rank + 1], shard=shard)
+                for rank, shard in enumerate(shards)
+            ]
+
+    partial_sums = []
+    forward_ranks(lambda kv: partial_sums.append(kv) or kv)
+    total = torch.stack(partial_sums).sum(0)
+    actual = torch.cat(forward_ranks(lambda kv: total)[:8], dim=1)
+    with torch.no_grad():
+        expected = module(x)
+    torch.testing.assert_close(actual, expected, atol=2e-6, rtol=2e-5)
+
+
 def test_unsupported_parallel_layouts_are_rejected():
     config = SanaVideo2PipelineConfig()
     config.validate_server_args(SimpleNamespace(ring_degree=1, sp_degree=2))

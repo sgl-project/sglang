@@ -94,8 +94,10 @@ class GatedLinearAttention(nn.Module):
         if shard is None:
             kv = v @ k.transpose(-1, -2)
         else:
-            # the token sum is the only coupling between shards
-            real = shard.local_real_len
+            # the token sum is the only coupling between shards; padding can
+            # span several ranks, so count the real tokens from the rank's offset
+            real = shard.orig_len - shard.sp_rank * shard.local_len
+            real = min(max(real, 0), shard.local_len)
             kv = sequence_model_parallel_all_reduce(
                 v[..., :real] @ k[..., :real].transpose(-1, -2)
             )
