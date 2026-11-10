@@ -920,6 +920,13 @@ class TestGenerateReqInputNormalization(CustomTestCase):
             ["batch_0", "batch_1", "batch_2", "batch_3"],
         )
 
+    def test_generate_rids_stay_unpadded(self):
+        # Clients and the Rust server rebuild unpadded `<rid>_<i>` for generate.
+        req = GenerateReqInput(text="x", rid="base", sampling_params={"n": 12})
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req.rid[0], "base_0")
+        self.assertEqual(req.rid[11], "base_11")
+
     def test_audio_data_handling(self):
         """Test handling of audio_data."""
         req = copy.deepcopy(self.base_req)
@@ -1619,6 +1626,29 @@ class TestEmbeddingReqInputGetItem(CustomTestCase):
         req = EmbeddingReqInput(text=["t0", "t1", "t2"], image_data=["a.jpg"])
         with self.assertRaisesRegex(ValueError, "image_data has 1 entries"):
             req.normalize_batch_and_arguments()
+
+
+class TestEmbeddingReqInputRid(CustomTestCase):
+    def test_expanded_rids_are_zero_padded(self):
+        # The scheduler aborts by rid prefix, so no sub-rid may prefix another.
+        req = EmbeddingReqInput(text=["t"] * 12, rid="base")
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req.rid[0], "base_00")
+        self.assertEqual(req.rid[11], "base_11")
+        for a in req.rid:
+            for b in req.rid:
+                if a != b:
+                    self.assertFalse(b.startswith(a), f"{a!r} prefixes {b!r}")
+
+    def test_invalid_base_rid_rejected(self):
+        for bad, msg in (
+            ("", "non-empty"),
+            ("HEALTH_CHECK_1", "reserved prefix"),
+        ):
+            with self.subTest(rid=bad):
+                req = EmbeddingReqInput(text=["a", "b"], rid=bad)
+                with self.assertRaisesRegex(ValueError, msg):
+                    req.normalize_batch_and_arguments()
 
 
 if __name__ == "__main__":
