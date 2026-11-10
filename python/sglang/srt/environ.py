@@ -639,10 +639,10 @@ class Envs:
     # HND KV layout folds (page, head) into one paged index for per-kv-head sparse
     # page tables (DP attn); paged backends like trtllm_mha consume it directly.
     SGLANG_USE_HND_KVCACHE = EnvBool(False)
-    # --enable-kv-cache-sharding: register single-node prefix gather scratch
-    # as NCCL symmetric memory and request copy engines on its dedicated
-    # communicator. Leave NCCL_CTA_POLICY unset to preserve per-comm policies.
-    # The engine defaults NCCL cuMem on for eligible single-node deployments.
+    # --enable-kv-cache-sharding: allocate single-node prefix gather scratch
+    # with PyTorch symmetric memory and gather it on copy engines through its
+    # CUDA multicast mapping (MulticastAllGather). Without multicast the
+    # gather stays an NCCL allgather.
     SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER = EnvBool(True)
 
     # Attention (aiter, ROCm): route NEXTN spec draft_extend (EAGLE-v2 KV
