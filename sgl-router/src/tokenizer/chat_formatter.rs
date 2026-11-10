@@ -50,6 +50,9 @@ pub struct ChatFormatter {
     minimax_m31: bool,
     /// Worker defaults, merged before model-specific effort conversion.
     worker_defaults: ChatTemplateKwargs,
+    /// DeepSeek-V4/V4.1 prompt ids come from the router's tokenizer rather than
+    /// the processor's own HF one; see [`Self::with_router_segment_encoding`].
+    router_encodes_deepseek: bool,
 }
 
 impl ChatFormatter {
@@ -209,6 +212,7 @@ impl ChatFormatter {
             processor,
             minimax_m31,
             worker_defaults: ChatTemplateKwargs::new(),
+            router_encodes_deepseek: false,
         }))
     }
 
@@ -225,6 +229,7 @@ impl ChatFormatter {
             processor: Some(ProcessorFormatter::KimiK3),
             minimax_m31: false,
             worker_defaults: ChatTemplateKwargs::new(),
+            router_encodes_deepseek: false,
         })
     }
 
@@ -271,6 +276,7 @@ impl ChatFormatter {
             },
             minimax_m31: false,
             worker_defaults: ChatTemplateKwargs::new(),
+            router_encodes_deepseek: false,
         })
     }
 
@@ -303,6 +309,12 @@ impl ChatFormatter {
         matches!(self.processor, Some(ProcessorFormatter::KimiK3))
     }
 
+    /// Whether DeepSeek prompt ids come from the router's tokenizer
+    /// ([`Self::with_router_segment_encoding`]).
+    pub fn router_encodes_deepseek(&self) -> bool {
+        self.router_encodes_deepseek
+    }
+
     /// MiniMax-M3.1, whose always-adaptive thinking contract the chat route
     /// enforces at ingress. MiniMax-M3 shares its `model_type` but can disable
     /// thinking, so it is told apart by the template's `thinking_mode` switch.
@@ -319,6 +331,24 @@ impl ChatFormatter {
     /// request leaves unset, and a default `reasoning_effort` acts as the request's.
     pub fn with_defaults(mut self, defaults: &ChatTemplateKwargs) -> Self {
         self.worker_defaults = defaults.clone();
+        self
+    }
+
+    /// Encode DeepSeek-V4/V4.1 prompts with the router's tokenizer when it encodes
+    /// rendered segments the way the processor's checkpoint tokenizer does:
+    /// special segments with the added vocabulary, plain text without it.
+    ///
+    /// The processor encodes them with HF `tokenizers`, which bypasses the
+    /// configured backend, so the whole prompt is re-encoded with HF on every
+    /// request. Callers enable this only when the router's tokenizer is fastokens
+    /// over the same `tokenizer.json`. Other models ignore it. The L1 cache does
+    /// not apply: segmented encodes bypass it.
+    pub fn with_router_segment_encoding(mut self, enabled: bool) -> Self {
+        self.router_encodes_deepseek = enabled
+            && matches!(
+                self.processor,
+                Some(ProcessorFormatter::DeepSeekV4(_) | ProcessorFormatter::DeepSeekV41(_))
+            );
         self
     }
 
@@ -432,6 +462,14 @@ impl ChatFormatter {
     }
 
     pub fn encode(&self, tokenizer: &Tokenizer, request: &JsonValue) -> Result<Vec<u32>> {
+        if self.router_encodes_deepseek {
+            // The processor's own encode ignores the continuation prefix too.
+            let (prompt, _) = self.render_parts(request)?;
+            let segments = prompt
+                .encode_segments()
+                .context("a DeepSeek prompt is segmented")?;
+            return Ok(tokenizer.encode_segments(&segments)?.token_ids().to_vec());
+        }
         if let Some(ids) = self
             .processor
             .as_ref()
