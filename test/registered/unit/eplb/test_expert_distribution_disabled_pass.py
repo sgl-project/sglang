@@ -16,8 +16,8 @@ import torch
 from sglang.srt.eplb.expert_distribution import (
     _ExpertDistributionRecorderNoop,
     _ExpertDistributionRecorderReal,
-    _merge_pipeline_record,
     _SelectExpertsSinglePassGatherer,
+    _StatAccumulator,
 )
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.utils import Withable
@@ -159,28 +159,63 @@ class TestDisabledForwardPass(CustomTestCase):
                 ran.append(1)
         self.assertEqual(ran, [1])
 
-    def test_static_pipeline_records_merge_by_global_layer(self):
-        record = torch.tensor([[[1, 2], [3, 4]]])
-        gathered = [record, None, record * 2, None]
-
-        world_group = SimpleNamespace(
-            rank_in_group=0, all_gather_object=lambda _record: gathered
-        )
-        with (
-            patch(
-                "sglang.srt.eplb.expert_distribution.torch.distributed.is_initialized",
-                return_value=True,
-            ),
-            patch(
-                "sglang.srt.eplb.expert_distribution.get_parallel",
-                return_value=SimpleNamespace(pp_size=2, world_group=world_group),
-            ),
-        ):
-            merged = _merge_pipeline_record({"logical_count": record}, True)
-
-        self.assertTrue(torch.equal(merged["logical_count"], record * 3))
-        self.assertEqual(merged["rank"], 0)
-        self.assertTrue(merged["pipeline_record_merged"])
+    def test_stat_dump_preserves_each_pipeline_stages_records(self):
+        module = "sglang.srt.eplb.expert_distribution"
+        for pp_size, pp_rank, record_count in ((1, 0, 2), (2, 0, 1), (2, 1, 3)):
+            for is_root in (False, True):
+                with self.subTest(pp_size=pp_size, pp_rank=pp_rank, is_root=is_root):
+                    record = torch.arange(record_count * 4, dtype=torch.int32).view(
+                        record_count, 2, 2
+                    )
+                    accumulator = _StatAccumulator.__new__(_StatAccumulator)
+                    accumulator._expert_location_metadata = SimpleNamespace(
+                        num_layers=2,
+                        num_logical_experts=2,
+                        physical_to_logical_map=torch.tensor([[0, 1], [0, 1]]),
+                    )
+                    accumulator._global_physical_count_of_buffered_step = (
+                        SimpleNamespace(get_all=lambda: record)
+                    )
+                    accumulator._first_dump = False
+                    accumulator._rank = pp_rank * 2 + int(not is_root)
+                    accumulator._communication_group = object()
+                    accumulator._is_communication_root = is_root
+                    accumulator._get_global_average_utilization_rate = Mock(
+                        return_value=None
+                    )
+                    world_group = Mock()
+                    with (
+                        patch(f"{module}.torch.distributed.all_reduce") as reduce,
+                        patch(f"{module}._dump_to_file") as save,
+                        patch(
+                            f"{module}.get_parallel",
+                            return_value=SimpleNamespace(
+                                pp_size=pp_size,
+                                pp_rank=pp_rank,
+                                world_group=world_group,
+                            ),
+                        ),
+                    ):
+                        accumulator.dump("file")
+                    reduce.assert_called_once()
+                    self.assertIs(
+                        reduce.call_args.kwargs["group"],
+                        accumulator._communication_group,
+                    )
+                    world_group.all_gather_object.assert_not_called()
+                    if not is_root:
+                        save.assert_not_called()
+                        continue
+                    save.assert_called_once()
+                    name, output = save.call_args.args
+                    self.assertTrue(torch.equal(output["logical_count"], record))
+                    if pp_size > 1:
+                        self.assertTrue(name.endswith(f"_pp{pp_rank}.pt"))
+                        self.assertEqual(output["pipeline_parallel_rank"], pp_rank)
+                        self.assertEqual(output["pipeline_parallel_size"], pp_size)
+                    else:
+                        self.assertNotIn("_pp", name)
+                        self.assertNotIn("pipeline_parallel_rank", output)
 
     def test_model_runner_disables_draft_before_entering_forward_pass(self):
         source = _model_runner_path().read_text()

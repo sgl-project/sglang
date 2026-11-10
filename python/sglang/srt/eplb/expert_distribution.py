@@ -1061,9 +1061,21 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
         )
 
         if output_mode == "file":
-            output = _merge_pipeline_record(output, self._is_communication_root)
-            if torch.distributed.get_rank() == 0:
-                _dump_to_file(f"expert_distribution_recorder_{time.time()}.pt", output)
+            if self._is_communication_root:
+                parallel = get_parallel()
+                suffix = ""
+                if parallel.pp_size > 1:
+                    # The scheduler forwards this request after handling it.
+                    # Save each stage locally; a WORLD gather here would block
+                    # the request from reaching the next stage.
+                    suffix = f"_pp{parallel.pp_rank}"
+                    output.update(
+                        pipeline_parallel_rank=parallel.pp_rank,
+                        pipeline_parallel_size=parallel.pp_size,
+                    )
+                _dump_to_file(
+                    f"expert_distribution_recorder_{time.time()}{suffix}.pt", output
+                )
         elif output_mode == "object":
             return output
         else:
@@ -1101,34 +1113,6 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             group=self._communication_group,
         )
         return avg_rate_tensor.item()
-
-
-def _merge_pipeline_record(output: Dict, is_communication_root: bool) -> Dict:
-    """Merge one TP-root record from every PP stage into a static file."""
-    if get_parallel().pp_size == 1 or not torch.distributed.is_initialized():
-        return output
-
-    local_record = (
-        output["logical_count"].detach().cpu() if is_communication_root else None
-    )
-    world_group = get_parallel().world_group
-    records = world_group.all_gather_object(local_record)
-    if world_group.rank_in_group != 0:
-        return output
-
-    merged_record = None
-    for record in records:
-        if record is not None:
-            merged_record = record if merged_record is None else merged_record + record
-    if merged_record is None:
-        raise RuntimeError("EPLB static record has no TP-root contribution.")
-    return dict(
-        rank=0,
-        logical_count=merged_record,
-        average_utilization_rate_over_window=None,
-        pipeline_parallel_size=get_parallel().pp_size,
-        pipeline_record_merged=True,
-    )
 
 
 def _dump_to_file(name, data):
