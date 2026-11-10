@@ -92,7 +92,7 @@ def _staged_fixture(full_match=2):
     cache.supports_swa = lambda: True
     cache.evict_for_alloc = Mock()
     cache.token_to_kv_pool_allocator = SimpleNamespace(
-        full_available_size=Mock(return_value=100)
+        full_available_size=Mock(return_value=100), pools_share_memory=False
     )
     cc = HybridCacheController.__new__(HybridCacheController)
     # Worker-thread state __init__ sets; read by the tick of #47617 (inert here, no workers started).

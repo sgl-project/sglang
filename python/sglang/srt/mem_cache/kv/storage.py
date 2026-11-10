@@ -509,10 +509,15 @@ class KVStorage:
             return self._allocator.full_attn_allocator
         return self._allocator
 
-    def available_units(self, sub_pool: str) -> int:
-        """Units ``take_units`` can hand out without eviction: the planner's
-        answer, which counts the room a relayout makes, as a take does."""
-        return self._allocator.units_available(sub_pool)
+    def units_fit(self, sub_pool: str, count: int) -> bool:
+        """Whether ``take_units`` can hand out ``count`` units (tokens, slots for
+        state) now, counting the room a relayout makes, as a take does."""
+        if count <= 0:
+            return True
+        allocator = self._allocator
+        if sub_pool != allocator.sub_pool_roles()[2]:
+            count = -(-count // allocator.page_size)
+        return allocator.units_fit({sub_pool: count})
 
     def take_units(self, sub_pool: str, count: int) -> Optional[torch.Tensor]:
         """``count`` rows of ``sub_pool`` alone (a load the tree stages); None

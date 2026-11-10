@@ -535,6 +535,10 @@ class StaticKVStorage:
     def available_units(self, sub_pool: str) -> int:
         return self._band(sub_pool).available_size()
 
+    def units_fit(self, sub_pool: str, count: int) -> bool:
+        """Whether ``take_units`` can hand out ``count`` units now."""
+        return self.available_units(sub_pool) >= count
+
     def take_units(self, sub_pool: str, count: int) -> Optional[torch.Tensor]:
         return self._band(sub_pool).alloc(count)
 

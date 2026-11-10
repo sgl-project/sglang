@@ -138,25 +138,26 @@ class StateStorage:
         # What this call hands out, given back if a later request finds no slot.
         given_state: list[Req] = []
         given_tracking: list[Req] = []
-        for req in reqs:
-            if req.kv.holds_mamba:  # for radix cache / continuing chunked
-                pass
-            else:
-                mid = self.slots.alloc(1)
-                if mid is None:
-                    self._give_back(given_state, given_tracking)
-                    raise StateSlotsExhausted(
-                        f"Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size. {mid=}, {self.pool.size=}, {self.slots.available_size()=}, {len(reqs)=}"
-                    )
-                req.kv.mamba_pool_idx = mid[0]
-                given_state.append(req)
+        # The requests holding no slot (a radix hit or a continuing chunk keeps
+        # its own) take theirs in one allocation.
+        needing = [req for req in reqs if not req.kv.holds_mamba]
+        if needing:
+            mids = self.slots.alloc(len(needing))
+            if mids is None:
+                raise StateSlotsExhausted(
+                    f"Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size. {self.pool.size=}, {self.slots.available_size()=}, {len(needing)=}"
+                )
+            for req, mid in zip(needing, mids):
+                req.kv.mamba_pool_idx = mid
                 req.kv.mamba_needs_clear = True
-                # A zero write_pos empties the ReplaySSM ring;
-                # decode then reads only the checkpoint written by prefill.
-                if self.pool.replayssm_write_pos is not None:
-                    self.pool.replayssm_write_pos.index_fill_(
-                        0, self.slots.translate(mid).to(torch.int64), 0
-                    )
+            given_state.extend(needing)
+            # A zero write_pos empties the ReplaySSM ring;
+            # decode then reads only the checkpoint written by prefill.
+            if self.pool.replayssm_write_pos is not None:
+                self.pool.replayssm_write_pos.index_fill_(
+                    0, self.slots.translate(mids).to(torch.int64), 0
+                )
+        for req in reqs:
             mamba_indices.append(req.kv.mamba_pool_idx)
             if table.enable_mamba_extra_buffer:
                 if req.kv.mamba_ping_pong_track_buffer is None:

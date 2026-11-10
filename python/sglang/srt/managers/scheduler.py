@@ -343,6 +343,7 @@ from sglang.srt.managers.utils import (
 )
 from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
+from sglang.srt.mem_cache.capacity import shares_memory
 from sglang.srt.mem_cache.common import checkpoint_kv_cache, storage_prefetch_end
 from sglang.srt.mem_cache.events import KvEventLoraNames
 from sglang.srt.mem_cache.kv.alloc.demand import window_retirement
@@ -1549,9 +1550,13 @@ class Scheduler(
                 )
 
         # NOTE: preemption is enabled by default for priority scheduling.
+        # TODO(ch-wan): a unified pool admits by pricing demands, and preemption
+        # does not yet ask admission itself whether its victims make room; it
+        # stays off there until it does.
         self.enable_priority_preemption = (
             self.enable_priority_scheduling
             and not get_schedule().disable_priority_preemption
+            and not get_memory().enable_unified_memory
         )
 
         self.new_token_ratio_tracker = NewTokenRatioTracker.from_config()
@@ -4418,6 +4423,17 @@ class Scheduler(
             f"picked-rids={picked_rids}{more}"
         )
 
+    def _drop_unadmitted_match(self, req: Req) -> None:
+        """Undo what the prefix match staged for a request this pass does not admit."""
+        # init_next_round_input() may stage deferred Mamba COW/clear metadata,
+        # and take a state slot a session does not own.
+        req.kv.mamba_cow_src_index = None
+        req.kv.mamba_needs_clear = False
+        if req.kv.holds_mamba and req.session is None:
+            kv_storage_of(
+                self.req_to_token_pool, self.token_to_kv_pool_allocator
+            ).release_state_slot(req)
+
     def _get_new_batch_prefill_raw(
         self,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
@@ -4637,17 +4653,27 @@ class Scheduler(
                     # marks the staged span below once it is surfaced.
                     req.host_hit_is_storage = False
 
-            req.init_next_round_input(self.tree_cache)
+            # On a shared memory the match takes no state slot: admission prices
+            # it, and the slot is bound with the row. A request this pass leaves
+            # queued drops the copy its match staged.
+            defer_cow_slot = shares_memory(self.token_to_kv_pool_allocator)
+            req.init_next_round_input(self.tree_cache, defer_cow_slot=defer_cow_slot)
             if adder.should_defer(req):
+                if defer_cow_slot:
+                    self._drop_unadmitted_match(req)
                 break
             if self.enable_hicache_storage and (
                 self._prefetch_after_device_hit_loss(req)
             ):
+                if defer_cow_slot:
+                    self._drop_unadmitted_match(req)
                 continue
             if self.enable_hicache_storage and buffer_pipeline is not None:
                 staging_ready = buffer_pipeline.prepare_staged_prefetch(req)
                 req.time_stats.observe_storage_staging_ready(staging_ready)
                 if not staging_ready:
+                    if defer_cow_slot:
+                        self._drop_unadmitted_match(req)
                     continue
             res = adder.add_one_req(
                 req,
@@ -4669,14 +4695,7 @@ class Scheduler(
                 # lifecycle and freeing them here causes double-free.
                 added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
                 if not added:
-                    # init_next_round_input() may stage deferred Mamba COW/clear
-                    # metadata before add_one_req() rejects the request.
-                    req.kv.mamba_cow_src_index = None
-                    req.kv.mamba_needs_clear = False
-                    if req.kv.holds_mamba and not getattr(req, "session", None):
-                        kv_storage_of(
-                            self.req_to_token_pool, self.token_to_kv_pool_allocator
-                        ).release_state_slot(req)
+                    self._drop_unadmitted_match(req)
                 if res == AddReqResult.UNSCHEDULABLE and not added:
                     # Nothing holding memory will give it back: waiting would
                     # keep the request queued forever.
