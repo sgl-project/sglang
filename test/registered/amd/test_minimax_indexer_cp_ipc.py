@@ -15,7 +15,7 @@ from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
 # backend-specific: the exchange is gfx950 HIP IPC; the suite's MI35x box supplies 4 GPUs
-register_amd_ci(est_time=60, suite="stage-c-test-large-8-gpu-amd-mi35x")
+register_amd_ci(est_time=60, stage="base-c", runner_config="8-gpu-mi35x")
 
 WORLD = 4
 BLOCK, TOPK, HEADS, DIM = 128, 16, 4, 128

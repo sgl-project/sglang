@@ -14,7 +14,9 @@ from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=30, stage="jit-kernel-unit", runner_config="amd")
+register_amd_ci(
+    est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large-mi30x"
+)
 
 HEAD_DIM = 256
 # Qwen3-Next-80B-A3B: 16 q heads, 2 kv heads; per-rank widths at TP1/TP2/TP4.

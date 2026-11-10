@@ -37,7 +37,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 # backend-specific: the gfx950 builds of the V4.1 row quantizers, the dequant NaN
 # canonicalization and the query rope in the K launch exist only on HIP
-register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=60, stage="base-b", runner_config="1-gpu-small-mi35x")
 
 V41_LAYOUTS = (
     KVLayout.V41,

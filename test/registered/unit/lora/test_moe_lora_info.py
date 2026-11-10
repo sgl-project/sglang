@@ -23,7 +23,7 @@ from sglang.test.ci.ci_register import (
 register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-small")
 # backend-specific: ROCm's Triton build of _compute_moe_lora_info_kernel,
 # graph-padding clear included.
-register_amd_ci(est_time=5, stage="stage-b", runner_config="1-gpu-small-amd")
+register_amd_ci(est_time=5, stage="base-b", runner_config="1-gpu-small-mi30x")
 # backend-specific: XPU takes the native torch mapping path instead of the
 # Triton launch.
 register_xpu_ci(est_time=20, suite="stage-a-test-1-gpu-xpu")

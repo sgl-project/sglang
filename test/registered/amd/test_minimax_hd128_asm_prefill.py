@@ -10,7 +10,7 @@ import torch
 from sglang.srt.mem_cache.kv.router import PlainPoolRouter
 from sglang.test.ci.ci_register import register_amd_ci
 
-register_amd_ci(est_time=45, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=45, stage="base-b", runner_config="1-gpu-small-mi35x")
 
 
 class _Pool:

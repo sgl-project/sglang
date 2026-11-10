@@ -4,7 +4,7 @@ from sglang.test.unified_allocator_fixtures import arena_of, stand_in_views
 register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-small")
 # Backend-specific: AMD lowers unified page zeroing through ROCm Triton,
 # catching HIP-only codegen, launch, or stale-page failures.
-register_amd_ci(est_time=9, suite="stage-b-test-1-gpu-small-amd")
+register_amd_ci(est_time=9, stage="base-b", runner_config="1-gpu-small-mi30x")
 
 import unittest
 from types import SimpleNamespace

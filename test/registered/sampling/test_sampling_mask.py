@@ -36,7 +36,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=221, stage="extra-a", runner_config="2-gpu-large")
-register_amd_ci(est_time=320, suite="extra-a-test-1-gpu-small-amd")
+register_amd_ci(est_time=320, stage="extra-a", runner_config="1-gpu-small-mi30x")
 
 _MAX_NEW_TOKENS = 4
 _TOP_P = 0.99

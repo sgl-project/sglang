@@ -21,7 +21,7 @@ from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.communicator_patch import patch_communicator
 from sglang.test.test_utils import CustomTestCase, publish_build_topology
 
-register_amd_ci(est_time=240, suite="stage-c-test-large-8-gpu-amd")
+register_amd_ci(est_time=240, stage="base-c", runner_config="8-gpu-mi30x")
 
 HIDDEN_DIMS = [2880, 4096, 5120, 6144, 7168, 8192]
 

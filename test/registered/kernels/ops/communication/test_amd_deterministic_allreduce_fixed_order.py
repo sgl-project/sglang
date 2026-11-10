@@ -18,7 +18,7 @@ import torch.distributed as dist
 from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 
-register_amd_ci(est_time=120, suite="stage-c-test-large-8-gpu-amd-mi35x")
+register_amd_ci(est_time=120, stage="base-c", runner_config="8-gpu-mi35x")
 
 HIDDEN = 4096
 # Rows of HIDDEN bf16 values; 32 rows (256 KiB) and 64 rows (512 KiB) are the 2-stage

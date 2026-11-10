@@ -12,7 +12,7 @@ from sglang.test.server_fixtures.ngram_fixture import NgramServerBase
 register_cuda_ci(est_time=216, stage="extra-a", runner_config="1-gpu-small")
 # AMD: flashinfer is not built in the ROCm sgl_kernel, so only the
 # triton-backend class runs on ROCm.
-register_amd_ci(est_time=130, suite="extra-a-test-1-gpu-large-amd")
+register_amd_ci(est_time=130, stage="extra-a", runner_config="1-gpu-large-mi30x")
 
 _AMD_SKIP_BACKEND = (
     "flashinfer attention backend is CUDA-only (not in the ROCm sgl_kernel build)"

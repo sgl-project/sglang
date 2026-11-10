@@ -11,7 +11,7 @@ register_cuda_ci(est_time=236, stage="extra-a", runner_config="1-gpu-large")
 # AMD: fa3 / flashinfer attention backends are not built in the ROCm
 # sgl_kernel, so only the triton-backend class runs on ROCm (the fa3 and
 # flashinfer classes are skipped on ROCm below).
-register_amd_ci(est_time=103, suite="extra-a-test-1-gpu-large-amd")
+register_amd_ci(est_time=103, stage="extra-a", runner_config="1-gpu-large-mi30x")
 
 _AMD_SKIP_BACKEND = "fa3 / flashinfer attention backends are CUDA-only (not in the ROCm sgl_kernel build)"
 

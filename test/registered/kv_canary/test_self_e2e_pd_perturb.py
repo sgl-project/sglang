@@ -8,7 +8,7 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kv_canary.pd_fixture import CanaryPDFixture
 
 register_cuda_ci(est_time=248, stage="extra-a", runner_config="2-gpu-large")
-register_amd_ci(est_time=450, stage="extra-a", runner_config="2-gpu-large-amd")
+register_amd_ci(est_time=450, stage="extra-a", runner_config="2-gpu-large-mi30x")
 
 
 class _PDPerturbBase(CanaryPDFixture):

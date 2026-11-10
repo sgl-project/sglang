@@ -20,7 +20,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=222, stage="extra-a", runner_config="2-gpu-large")
-register_amd_ci(est_time=330, suite="extra-a-test-2-gpu-large-amd")
+register_amd_ci(est_time=330, stage="extra-a", runner_config="2-gpu-large-mi30x")
 
 
 def _query_loads(base_url, retries=5, interval=2.0):

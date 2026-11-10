@@ -18,7 +18,7 @@ from sglang.test.test_utils import (
     popen_launch_pd_server,
 )
 
-register_amd_ci(est_time=600, suite="stage-b-test-large-8-gpu-mi35x-disaggregation-amd")
+register_amd_ci(est_time=600, stage="base-b", runner_config="8-gpu-mi35x-fabric")
 
 
 class TestDisaggregationAccuracy(PDDisaggregationServerBase):
@@ -216,7 +216,7 @@ class TestDisaggregationAccuracy(PDDisaggregationServerBase):
         )
 
 
-# register_amd_ci(est_time=300, suite="stage-b-test-2-gpu-large-amd")
+# register_amd_ci(est_time=300, stage="base-b", runner_config="2-gpu-large-mi30x")
 class TestDisaggregationMooncakeFailure(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
@@ -332,7 +332,7 @@ class TestDisaggregationMooncakeFailure(PDDisaggregationServerBase):
                 raise e from health_check_error
 
 
-# register_amd_ci(est_time=300, suite="stage-b-test-2-gpu-large-amd")
+# register_amd_ci(est_time=300, stage="base-b", runner_config="2-gpu-large-mi30x")
 class TestDisaggregationSimulatedRetract(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
