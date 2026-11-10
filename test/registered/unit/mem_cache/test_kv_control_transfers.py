@@ -1017,6 +1017,56 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
             assert_retired(cache, service)
             cache.sanity_check()
 
+    def test_ordinary_read_does_not_wait_for_a_rate_limited_hint(self):
+        from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
+
+        with hicache(self, namespace_keys=True) as owner:
+            _, cache, service, _ = owner
+            busy, target = [
+                cache_fixtures.target(cache_salt=salt)
+                for salt in ("rate-busy", "rate-queued")
+            ]
+            self._cold_scopes(owner, (busy, target))
+            cc = cache.cache_controller
+            entered, release = threading.Event(), threading.Event()
+            get = cc.page_get_func
+            reads = []
+            demand = CacheRequestHandle("rate-limited-demand", 0)
+
+            def blocked_get(operation, *args, **kwargs):
+                reads.append(operation.request_id)
+                entered.set()
+                assert release.wait(5)
+                return get(operation, *args, **kwargs)
+
+            try:
+                with (
+                    patch.object(cc, "page_get_func", blocked_get),
+                    patch.object(cc, "prefetch_capacity_limit", len(busy.token_ids)),
+                    patch.object(cache, "prefetch_threshold", 1),
+                    patch.object(cache, "prefetch_stop_policy", "wait_complete"),
+                ):
+                    active = self._restore(service, busy, "rate-active")
+                    wait_for(service, entered.is_set)
+                    queued = self._restore(service, target, "rate-queued")
+                    self.assertEqual(queued.update.code, "storage_rate_limit")
+
+                    self._ordinary_prefetch(cache, service, target, demand)
+                    self.assertTrue(cache.check_prefetch_progress(demand))
+                    self.assertFalse(cache.has_ongoing_prefetch(demand))
+                    terminal = wait(service, queued)
+                    self.assertEqual(terminal.status, Status.DEFERRED)
+                    self.assertEqual(terminal.update.code, "ordinary_restore")
+
+                    release.set()
+                    self.assertEqual(wait(service, active).status, Status.COMPLETED)
+                    self.assertEqual(len(reads), 1)
+            finally:
+                release.set()
+                cache.release_aborted_request(demand)
+            assert_retired(cache, service)
+            cache.sanity_check()
+
     def test_storage_pipeline_config_defaults_bounds_and_public_wiring(self):
         from sglang.srt.mem_cache.unified_cache.control_state import (
             CacheControlConfig,

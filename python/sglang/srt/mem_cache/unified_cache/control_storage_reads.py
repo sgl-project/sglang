@@ -214,10 +214,13 @@ class StorageCacheReads:
         if job.operation is None:
             if not self._has_live_interest(job):
                 return False
-            if self._admission_wait(job) == "storage_concurrency_limit":
+            if (
+                self._admission_wait(job) == "storage_concurrency_limit"
+                or self.cache.cache_controller.prefetch_rate_limited()
+            ):
                 # The speculative queue has not issued I/O for this scope.
-                # Preserve ordinary admission and retire the hint so that
-                # it cannot start a second GET after the demand proceeds.
+                # Preserve ordinary admission (including the rate-limit
+                # fallback) and retire the hint so it cannot issue a late GET.
                 self._retire(job, status=Status.DEFERRED, code="ordinary_restore")
                 return False
         self.demands[request] = _Demand(
