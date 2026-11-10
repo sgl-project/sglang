@@ -13,7 +13,8 @@ export const LagunaXS2Deployment = () => {
       title: 'Hardware Platform',
       items: [
         { id: 'h200', label: 'H200', default: true },
-        { id: 'b200', label: 'B200/GB200', default: false }
+        { id: 'b200', label: 'B200/GB200', default: false },
+        { id: 'xeon', label: 'XEON', default: false }
       ]
     },
     quantization: {
@@ -23,11 +24,17 @@ export const LagunaXS2Deployment = () => {
         { id: 'bf16',  label: 'BF16',  default: true },
         { id: 'fp8',   label: 'FP8',   default: false },
         { id: 'nvfp4', label: 'NVFP4', default: false }
+      ],
+      getDynamicItems: (values) => [
+        { id: 'bf16', label: 'BF16', default: true },
+        { id: 'fp8', label: 'FP8', default: false, disabled: values.hardware === 'xeon' },
+        { id: 'nvfp4', label: 'NVFP4', default: false, disabled: values.hardware === 'xeon' }
       ]
     },
     reasoning: {
       name: 'reasoning',
       title: 'Reasoning Parser',
+      condition: (values) => values.hardware !== 'xeon',
       items: [
         { id: 'disabled', label: 'Disabled', default: false },
         { id: 'enabled',  label: 'Enabled',  default: true }
@@ -36,6 +43,7 @@ export const LagunaXS2Deployment = () => {
     toolcall: {
       name: 'toolcall',
       title: 'Tool Call Parser',
+      condition: (values) => values.hardware !== 'xeon',
       items: [
         { id: 'disabled', label: 'Disabled', default: false },
         { id: 'enabled',  label: 'Enabled',  default: true }
@@ -44,6 +52,7 @@ export const LagunaXS2Deployment = () => {
     dpAttention: {
       name: 'dpAttention',
       title: 'DP Attention',
+      condition: (values) => values.hardware !== 'xeon',
       items: [
         { id: 'disabled', label: 'Disabled', subtitle: 'Low Latency',     default: true },
         { id: 'enabled',  label: 'Enabled',  subtitle: 'High Throughput', default: false }
@@ -103,12 +112,34 @@ export const LagunaXS2Deployment = () => {
           if (fallback) next[key] = fallback.id;
         }
       });
+      if (next.hardware === 'xeon') {
+        next.reasoning = 'disabled';
+        next.toolcall = 'disabled';
+        next.dpAttention = 'disabled';
+      }
       return next;
     });
   };
 
   const generateCommand = () => {
     const { hardware, quantization, reasoning, toolcall, dpAttention } = values;
+
+    if (hardware === 'xeon') {
+      if (quantization !== 'bf16') return '# Error: No validated Xeon recipe for this checkpoint format.';
+      return [
+        'SGLANG_USE_CPU_ENGINE=1 RAYON_NUM_THREADS=1 TOKENIZERS_PARALLELISM=false OPENBLAS_NUM_THREADS=1 sglang serve \\',
+        '  --model-path poolside/Laguna-XS.2 \\',
+        '  --revision a397bde04501591d0ac3d74a5d9d0a4ec298ffb8 \\',
+        '  --device cpu \\',
+        '  --disable-overlap-schedule \\',
+        '  --trust-remote-code \\',
+        '  --tp 4 \\',
+        '  --dtype bfloat16 \\',
+        '  --max-total-tokens 8192 \\',
+        '  --host 0.0.0.0 \\',
+        '  --port 30000'
+      ].join('\n');
+    }
 
     if (hardware === 'h200' && quantization === 'nvfp4') {
       return '# Error: NVFP4 is Blackwell-only. Select B200, or pick BF16/FP8 for H200.';
@@ -160,6 +191,7 @@ export const LagunaXS2Deployment = () => {
   return (
     <div style={containerStyle} className="not-prose">
       {Object.entries(options).map(([key, option]) => {
+        if (option.condition && !option.condition(values)) return null;
         const items = resolveItems(option, values);
         return (
           <div key={key} style={cardStyle}>
