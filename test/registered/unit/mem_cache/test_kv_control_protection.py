@@ -1179,27 +1179,12 @@ class TestKVControlPinRuntime(cache_fixtures.KVCacheTestCase):
             self.assertEqual(query_claim(service)["data"]["state"], "expired")
             cache.sanity_check()
 
-    def test_reset_and_weights_invalidate_before_host_slots_or_namespace_change(self):
+    def test_reset_invalidates_claims_before_host_slots_are_reused(self):
         with transfer_fixtures.hicache(self, namespace_keys=True) as owner:
             _, cache, service, _ = owner
             node = host_copy(owner)
             run_pin(service)
             old_epoch = service.control.registry.engine_epoch
-            request_lock = cache.lock(node.id)
-            try:
-                with self.assertRaises(ControlError):
-                    service.weights.begin("v2")
-                self.assertEqual(query_claim(service)["data"]["state"], "active")
-                self.assertEqual(node.component_data[FULL].host_lock_ref, 1)
-            finally:
-                cache.unlock(request_lock)
-            service.weights.begin("v2")
-            self.assertEqual(node.component_data[FULL].host_lock_ref, 0)
-            self.assertNotEqual(service.control.registry.engine_epoch, old_epoch)
-            self.assertEqual(query_claim(service)["error"]["code"], "missing")
-            service.weights.finish(True, synchronized=True)
-            node = host_copy(owner, message="new-weights")
-            run_pin(service, message="new-pin")
             previous = service.control.executor.protection
             cache.reset()
             self.assertEqual(node.component_data[FULL].host_lock_ref, 0)
@@ -1208,6 +1193,7 @@ class TestKVControlPinRuntime(cache_fixtures.KVCacheTestCase):
                 "invalidated",
             )
             service.reset_after_cache_flush()
+            self.assertNotEqual(service.control.registry.engine_epoch, old_epoch)
             self.assertFalse(service.has_background_work)
             self.assertEqual(query_claim(service)["error"]["code"], "missing")
 

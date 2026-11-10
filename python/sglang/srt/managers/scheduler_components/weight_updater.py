@@ -44,8 +44,6 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromIPCReqOutput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
-    UpdateWeightVersionReqInput,
-    UpdateWeightVersionReqOutput,
 )
 from sglang.srt.runtime_context import get_model, get_parallel
 from sglang.srt.utils.weight_checker import overall_checksum
@@ -87,15 +85,15 @@ class _WeightUpdateSession(msgspec.Struct, frozen=True):
     loaded_weights: bool = False
 
 
-def _native_weight_transition(response_type, phase):
-    """Keep the disabled path and existing runner/update implementation intact."""
-
+def _requires_mutable_weights(response_type):
     def decorate(function):
         @wraps(function)
-        def wrapped(self, request):
-            return self._native_weight_call(
-                request, response_type, lambda: function(self, request), phase
-            )
+        def wrapped(self, recv_req):
+            if getattr(self.scheduler, "kv_control_service", None) is not None:
+                return response_type(
+                    success=False, message="KV control requires fixed model weights"
+                )
+            return function(self, recv_req)
 
         return wrapped
 
@@ -140,15 +138,6 @@ class SchedulerWeightUpdaterManager:
     ) -> Tuple[bool, str]:
         """Flush the cache the old weights produced. A flush refused because
         requests are still running or queued fails the update call."""
-        service = getattr(getattr(self, "scheduler", None), "kv_control_service", None)
-        if (
-            getattr(getattr(service, "control", None), "enabled", False) is True
-            and service.weights.active
-        ):
-            service.weights.request_flush(
-                recv_req.flush_cache, recv_req.torch_empty_cache
-            )
-            return success, message  # Flush only after parameter work synchronizes.
         if recv_req.flush_cache and not self.flush_cache(
             empty_cache=recv_req.torch_empty_cache
         ):
@@ -162,170 +151,9 @@ class SchedulerWeightUpdaterManager:
     def record_weight_version_after_update(self, weight_version: Optional[str]) -> None:
         self.scheduler.record_weight_version_change(new_version=weight_version)
 
-    def _native_kv_weight_guard(self, response_type):
-        service = getattr(getattr(self, "scheduler", None), "kv_control_service", None)
-        if (
-            getattr(getattr(service, "control", None), "enabled", False) is True
-            and not service.namespace_keys
-        ):
-            return response_type(
-                success=False,
-                message="Weight updates require KV weight-namespace isolation, which is not integrated with this control profile",
-            )
-        return None
-
-    def _native_finish_weights(self, service, result, response_type):
-        service.weights.request_finish(result.success)
-        try:
-            device = service.cache.token_to_kv_pool_allocator.device
-            module = torch.get_device_module(device)
-            if str(device).split(":")[0] == "cuda":
-                module.synchronize(device)
-            else:
-                module.synchronize()
-            service.weights.mark_quiescent()
-            fence = service.weights.fence
-            if fence.flush_requested and not self.flush_cache(
-                empty_cache=fence.empty_cache_requested
-            ):
-                return response_type(
-                    success=False,
-                    message="Parameter work finished, but cache flush could not complete; weight generation remains fenced",
-                )
-            committed = service.weights.finish(result.success, synchronized=True)
-        except Exception as error:
-            service.weights.fail()
-            logger.exception("Native weight generation could not be finalized")
-            return response_type(
-                success=False,
-                message=f"Weight generation remains fenced: {type(error).__name__}: {str(error)[:256]}",
-            )
-        if result.success and not committed:
-            return msgspec.structs.replace(
-                result,
-                success=False,
-                message="Weight session closed after a failed update; its cache namespace remains isolated",
-            )
-        return result
-
-    def _native_weight_call(self, request, response_type, call, phase):
-        service = getattr(getattr(self, "scheduler", None), "kv_control_service", None)
-        if getattr(getattr(service, "control", None), "enabled", False) is not True:
-            return call()
-        try:
-            service.weights._owner(require_keys=False)
-        except ValueError as error:
-            return response_type(success=False, message=str(error))
-        if phase == "version":
-            version = request.new_version
-            if not service.weights.active and version == service.weights.version:
-                return call()
-            if service.weights.active:
-                try:
-                    service.weights.note_version(version)
-                except ValueError as error:
-                    return response_type(success=False, message=str(error))
-                return call()
-            phase = "single"
-        if phase == "checker":
-            if request.action != "reset_tensors":
-                if (
-                    service.weights.active
-                    or GPU_MEMORY_TYPE_WEIGHTS in self.offload_tags
-                ):
-                    return response_type(
-                        success=False,
-                        message="Finish the weight update before inspecting parameters",
-                    )
-                return call()
-            phase = "single"
-        if (rejected := self._native_kv_weight_guard(response_type)) is not None:
-            return rejected
-        if str(service.cache.token_to_kv_pool_allocator.device).split(":")[0] not in (
-            "cpu",
-            "cuda",
-        ):
-            return response_type(
-                success=False,
-                message="Native weight-update validation currently supports CPU/CUDA owners",
-            )
-        session = self._session
-        if self.offload_tags:
-            return response_type(
-                success=False,
-                message="Resume offloaded model/cache resources before updating weights",
-            )
-        if phase == "begin" and session is not None:
-            return call()  # Preserve the existing typed already-open refusal.
-        if phase == "part" and session is None:
-            return call()  # No mutation or namespace changes for missing begin.
-        if phase == "end" and session is None:
-            if service.weights.active and service.weights.fence.ready_to_finish:
-                return self._native_finish_weights(
-                    service,
-                    response_type(success=True, message="Finalize parameter work"),
-                    response_type,
-                )
-            return call()
-        if phase == "single" and session is not None:
-            return response_type(
-                success=False,
-                message="Close the multipart weight session before a standalone weight update",
-            )
-        try:
-            selector = getattr(request, "selector", None)
-            if selector is not None:
-                _parse_runner_selector(selector)
-                if not self._select_runners(selector):
-                    return response_type(
-                        success=False,
-                        message="No selected weight-update runner is configured",
-                    )
-            if phase in ("single", "begin"):
-                service.weights.begin(
-                    getattr(
-                        request, "weight_version", getattr(request, "new_version", None)
-                    )
-                )
-            elif not service.weights.active:
-                return response_type(
-                    success=False, message="The native weight update was not prepared"
-                )
-            if phase == "part":
-                service.weights.note_version(getattr(request, "weight_version", None))
-            service.weights.request_flush(
-                getattr(request, "flush_cache", False),
-                getattr(request, "torch_empty_cache", False),
-            )
-        except (ValueError, TypeError) as error:
-            return response_type(success=False, message=str(error)[:512])
-        try:
-            result = call()
-        except Exception as error:
-            service.weights.fail()
-            logger.exception("Native parameter work failed; inference remains fenced")
-            return response_type(
-                success=False,
-                message=f"Parameter work remains fenced: {type(error).__name__}: {str(error)[:256]}",
-            )
-        if not result.success:
-            service.weights.fail()
-        if phase in ("single", "end"):
-            return self._native_finish_weights(service, result, response_type)
-        return result
-
-    @_native_weight_transition(UpdateWeightVersionReqOutput, "version")
-    def update_weight_version(self, request: UpdateWeightVersionReqInput):
-        self.record_weight_version_after_update(request.new_version)
-        return UpdateWeightVersionReqOutput()
-
-    @_native_weight_transition(UpdateWeightFromDiskReqOutput, "single")
+    @_requires_mutable_weights(UpdateWeightFromDiskReqOutput)
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         """In-place update of the weights from disk."""
-        if (
-            rejected := self._native_kv_weight_guard(UpdateWeightFromDiskReqOutput)
-        ) is not None:
-            return rejected
         with self._observe_weight_load("disk"):
             success, message = True, "Succeeded to update model weights."
             target_updated = False
@@ -373,18 +201,12 @@ class SchedulerWeightUpdaterManager:
             runners += self.draft_worker.weight_update_runners()
         return runners
 
-    @_native_weight_transition(UpdateWeightsFromDistributedReqOutput, "part")
+    @_requires_mutable_weights(UpdateWeightsFromDistributedReqOutput)
     def update_weights_from_distributed(
         self,
         recv_req: UpdateWeightsFromDistributedReqInput,
     ) -> Tuple[bool, str]:
         """Update the online model parameter, fanning out to the selected runners."""
-        if (
-            rejected := self._native_kv_weight_guard(
-                UpdateWeightsFromDistributedReqOutput
-            )
-        ) is not None:
-            return rejected
         if self._session is None:
             return UpdateWeightsFromDistributedReqOutput(
                 success=False,
@@ -425,13 +247,9 @@ class SchedulerWeightUpdaterManager:
                 success=success, message=message
             )
 
-    @_native_weight_transition(UpdateWeightsFromTensorReqOutput, "part")
+    @_requires_mutable_weights(UpdateWeightsFromTensorReqOutput)
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         """Update the online model parameter from tensors on the selected runners."""
-        if (
-            rejected := self._native_kv_weight_guard(UpdateWeightsFromTensorReqOutput)
-        ) is not None:
-            return rejected
         if self._session is None:
             return UpdateWeightsFromTensorReqOutput(
                 success=False,
@@ -463,13 +281,9 @@ class SchedulerWeightUpdaterManager:
             torch.distributed.barrier(group=self.tp_cpu_group)
             return UpdateWeightsFromTensorReqOutput(success=success, message=message)
 
-    @_native_weight_transition(UpdateWeightsFromIPCReqOutput, "single")
+    @_requires_mutable_weights(UpdateWeightsFromIPCReqOutput)
     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
         """Update the online model parameter from IPC for checkpoint-engine integration."""
-        if (
-            rejected := self._native_kv_weight_guard(UpdateWeightsFromIPCReqOutput)
-        ) is not None:
-            return rejected
         with self._observe_weight_load("ipc"):
             success, message = True, "Succeeded to update model weights."
             target_updated = False
@@ -512,13 +326,9 @@ class SchedulerWeightUpdaterManager:
                 f"Restart with --weight-cache-mode off to use this operation."
             )
 
-    @_native_weight_transition(BeginWeightUpdateReqOutput, "begin")
+    @_requires_mutable_weights(BeginWeightUpdateReqOutput)
     def begin_weight_update(self, recv_req: BeginWeightUpdateReqInput):
         """Open the session: restore in-place-packed weights on the selected runners."""
-        if (
-            rejected := self._native_kv_weight_guard(BeginWeightUpdateReqOutput)
-        ) is not None:
-            return rejected
         if self._session is not None:
             return BeginWeightUpdateReqOutput(
                 success=False,
@@ -531,7 +341,7 @@ class SchedulerWeightUpdaterManager:
         torch.distributed.barrier(group=self.tp_cpu_group)
         return BeginWeightUpdateReqOutput(success=True, message="Success")
 
-    @_native_weight_transition(EndWeightUpdateReqOutput, "end")
+    @_requires_mutable_weights(EndWeightUpdateReqOutput)
     def end_weight_update(self, recv_req: EndWeightUpdateReqInput):
         """Finalize the runners begin opened; post_load_weights only if no load ran (P2P/RDMA)."""
         if self._session is None:
@@ -546,26 +356,12 @@ class SchedulerWeightUpdaterManager:
         torch.distributed.barrier(group=self.tp_cpu_group)
         return EndWeightUpdateReqOutput(success=True, message="Success")
 
-    def _native_memory_guard(self, response_type):
-        service = getattr(getattr(self, "scheduler", None), "kv_control_service", None)
-        if getattr(getattr(service, "control", None), "enabled", False) is not True:
-            return None
-        if service.weights.active:
-            return response_type(
-                success=False,
-                message="Finish the weight update before changing memory ownership",
-            )
-        try:
-            service.require_quiescent_cache()
-        except ValueError as error:
-            return response_type(success=False, message=str(error))
-        return None
-
     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
-        if (
-            rejected := self._native_memory_guard(ReleaseMemoryOccupationReqOutput)
-        ) is not None:
-            return rejected
+        if getattr(self.scheduler, "kv_control_service", None) is not None:
+            return ReleaseMemoryOccupationReqOutput(
+                success=False,
+                message="KV control requires resident model and cache memory",
+            )
         scheduler = self.scheduler
         assert self.is_fully_idle(
             ignore_waiting=scheduler is not None and scheduler._engine_paused
@@ -612,10 +408,11 @@ class SchedulerWeightUpdaterManager:
         return ReleaseMemoryOccupationReqOutput()
 
     def resume_memory_occupation(self, recv_req: ResumeMemoryOccupationReqInput):
-        if (
-            rejected := self._native_memory_guard(ResumeMemoryOccupationReqOutput)
-        ) is not None:
-            return rejected
+        if getattr(self.scheduler, "kv_control_service", None) is not None:
+            return ResumeMemoryOccupationReqOutput(
+                success=False,
+                message="KV control requires resident model and cache memory",
+            )
         tags = recv_req.tags
 
         if tags is None or len(tags) == 0:
@@ -656,8 +453,14 @@ class SchedulerWeightUpdaterManager:
 
         return ResumeMemoryOccupationReqOutput()
 
-    @_native_weight_transition(CheckWeightsReqOutput, "checker")
     def check_weights(self, recv_req: CheckWeightsReqInput):
+        if (
+            recv_req.action == "reset_tensors"
+            and getattr(self.scheduler, "kv_control_service", None) is not None
+        ):
+            return CheckWeightsReqOutput(
+                success=False, message="KV control requires fixed model weights"
+            )
         try:
             role_payloads = []
             for role, runner in self._select_runners(recv_req.selector):

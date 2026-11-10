@@ -98,7 +98,6 @@ class UnifiedCacheExecutor:
         self._thread = threading.get_ident()
         self.gpu_copy_capacity = None
         self.cache_salt_transform = None
-        self.cache_available = None
         self.transfers = None
         self.storage = None
         self.storage_adapter = None
@@ -179,11 +178,6 @@ class UnifiedCacheExecutor:
             raise ControlError(
                 "wrong_owner", "Cache control must run on its owning thread"
             )
-        if self.cache_available is not None and not self.cache_available():
-            raise ControlError(
-                "unavailable",
-                "Cache memory is offloaded; resume it before KV execution",
-            )
         if (
             target.engine_epoch != self.engine_epoch
             or self.control_state.generation != self.generation
@@ -210,7 +204,6 @@ class UnifiedCacheExecutor:
         supported = not reason and not self.core.enable_external_cache_linker
         return {
             "namespace": self.config.namespace,
-            "available": self.cache_available is None or self.cache_available(),
             "pin_protections": (
                 {
                     "tier": "host",

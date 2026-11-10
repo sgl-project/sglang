@@ -259,7 +259,6 @@ def hicache(
             config,
             clock=case.clock,
             namespace_keys=namespace_keys,
-            idle_check=(lambda: True) if namespace_keys else None,
         )
         try:
             yield (case, cache, service, dma)
