@@ -229,6 +229,7 @@ from sglang.srt.managers.overlap_utils import (
     RelayPayload,
     decide_needs_confidence_relay,
     decide_needs_cpu_seq_lens,
+    pre_upload_prefill_input_ids,
     resolve_forward_inputs,
 )
 from sglang.srt.managers.prefill_delayer import (
@@ -4700,12 +4701,6 @@ class Scheduler(
         )
         new_batch.hisparse_coordinator = self.hisparse_coordinator
 
-        if self.enable_hierarchical_cache or self.enable_unified_cache_external_linker:
-            # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
-            new_batch.hicache_consumer_index = (
-                self.tree_cache.ready_to_load_host_cache()
-            )
-
         new_batch.prepare_for_extend()
 
         if self.tp_worker.model_runner.prefill_aware_swa:
@@ -4763,7 +4758,28 @@ class Scheduler(
         else:
             new_batch.decoding_reqs = None
 
+        self._handover_hicache_load(new_batch)
+
         return new_batch, running_batch
+
+    def _handover_hicache_load(self, batch: ScheduleBatch) -> None:
+        """Start the host loads queued for a new prefill batch, after the
+        batch's own host-to-device copies.
+
+        start_loading records the burst's start event on the current stream, so
+        a copy issued before it is ordered ahead of the burst. A copy issued
+        after it can queue behind the whole burst on the copy engine and hold
+        up the forward."""
+        if not (
+            self.enable_hierarchical_cache or self.enable_unified_cache_external_linker
+        ):
+            return
+        if get_parallel().pp_size == 1:
+            # A pipeline stage launches its forward on another stream and does
+            # not keep the batch's tensors alive past it.
+            pre_upload_prefill_input_ids(batch)
+        # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
+        batch.hicache_consumer_index = self.tree_cache.ready_to_load_host_cache()
 
     def can_schedule_lora_req(
         self, req: Req, running_loras: set[Optional[str]]
