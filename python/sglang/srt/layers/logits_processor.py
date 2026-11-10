@@ -1422,11 +1422,18 @@ class LogitsProcessor(nn.Module):
             elif _aiter_lm_head_ok(hidden_states, lm_head.weight):
                 logits = tgemm.mm(hidden_states, lm_head.weight)
             else:
-                lhs = hidden_states.to(lm_head.weight.dtype)
-                if out is not None and out.dtype == lm_head.weight.dtype:
-                    logits = torch.matmul(lhs, lm_head.weight.T, out=out)
-                else:
-                    logits = torch.matmul(lhs, lm_head.weight.T)
+                from sglang.srt.layers.quantization.unquant import pinned_bf16_linear
+
+                use_out = out is not None and out.dtype == lm_head.weight.dtype
+                logits = pinned_bf16_linear(
+                    hidden_states, lm_head.weight, out=out if use_out else None
+                )
+                if logits is None:
+                    lhs = hidden_states.to(lm_head.weight.dtype)
+                    if use_out:
+                        logits = torch.matmul(lhs, lm_head.weight.T, out=out)
+                    else:
+                        logits = torch.matmul(lhs, lm_head.weight.T)
         else:
             # GGUF models
             # TODO: use weight_packed_linear for GGUF models

@@ -1727,6 +1727,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_OPT_BF16_GEMM_TABLE</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Path to a JSON table of pinned cuBLASLt algorithms per (N, K, M) for unquantized BF16 linears and the BF16 <code>lm_head</code>, written for one GPU model and cuBLASLt version by <code>benchmark/kernels/pinned_bf16_gemm/tune_pinned_bf16_gemm.py</code>. The tuner keeps only algorithms that give <code>torch.mm</code>'s bits on inputs where another accumulation order differs with overwhelming probability, and marks the table <code>"order_checked": true</code>; tables without the marker, or from another GPU or cuBLASLt version, are ignored. The serving process re-checks each entry on plain inputs with the real weight, which catches gross mismatches but not another accumulation order, so a hand-edited table is not protected. Ignored with <code>--enable-deterministic-inference</code> and under <code>torch.compile</code>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Not set (off)</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ENABLE_FP8_BLOCK_GEMV</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>On SM90, route small-M (decode) blockwise-FP8 linears and router-gate logits to the Hopper GEMV kernels, and tune the KDA recurrent decode tiling.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
