@@ -68,7 +68,7 @@ on:
         required: false
         type: string
         default: ""
-        description: "Comma separated container patch sets under scripts/ci/npu/container_patches. Empty keeps the image untouched."
+        description: "Comma separated container patch sets under scripts/ci/npu/patches. Empty keeps the image untouched."
 
 concurrency:
   group: ascend-nightly-multi-node-${{ github.workflow_ref }}-${{ github.ref }}-${{ inputs.test_config_name }}
