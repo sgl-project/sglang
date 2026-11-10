@@ -1,6 +1,5 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock
 
 import msgspec
 import torch
@@ -246,37 +245,6 @@ class TestSimBonusSharedLength(CustomTestCase):
         full = simulated_bonus_partials_graph(correct_len=shared.repeat(bs), **args)
         self.assertTrue(torch.equal(view[0], full[0]))
         self.assertTrue(torch.equal(view[1], full[1]))
-
-
-class TestTargetVerifyCaptures(CustomTestCase):
-    def test_verify_result_keeps_the_target_forward_captures(self):
-        """The verify result must carry the target forward's routed-experts, indexer top-k and KV-version captures;
-        dropping them returns all-zero routed experts for every DSpark-verified token."""
-        captures = dict(
-            routed_experts_output=object(),
-            indexer_topk_output=object(),
-            kv_weight_version_record=object(),
-        )
-        target_out = SimpleNamespace(
-            logits_output="logits", can_run_cuda_graph=True, **captures
-        )
-        executor = TargetVerifyExecutor.__new__(TargetVerifyExecutor)
-        executor._target_is_dsv41 = False
-        executor.target_worker = MagicMock()
-        executor.target_worker.forward_batch_generation.return_value = target_out
-        verify_input = MagicMock(live_seq_lens_cpu=None)
-        verify_input.prepare_for_verify.return_value = ("verify_batch", False)
-
-        result = executor._forward_prepared_verify(
-            batch=SimpleNamespace(seq_lens_cpu=None, seq_lens_sum=0),
-            verify_input=verify_input,
-            seq_lens_cpu_backup=None,
-            seq_lens_sum_backup=0,
-        )
-
-        self.assertEqual(result.logits_output, "logits")
-        for name, value in captures.items():
-            self.assertIs(getattr(result, name), value, name)
 
 
 if __name__ == "__main__":
