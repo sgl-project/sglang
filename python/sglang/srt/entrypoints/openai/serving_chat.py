@@ -156,6 +156,21 @@ _MEDIA_CONTENT_PART_TYPES = frozenset({"image_url", "video_url", "audio_url"})
 _CHAT_TEMPLATE_CACHE_MAX_SIZE = 128
 
 
+class _ClosingStreamingResponse(StreamingResponse):
+    """Close the body iterator however streaming ends.
+
+    Starlette leaves the iterator suspended when a send fails, and on ASGI
+    spec >= 2.4 it also skips the background task, so nothing would abort the
+    request until the generator is garbage collected.
+    """
+
+    async def stream_response(self, send) -> None:
+        try:
+            await super().stream_response(send)
+        finally:
+            await self.body_iterator.aclose()
+
+
 def _incomplete_tool_call_indices(parser) -> set[int]:
     detector = getattr(parser, "detector", parser)
     return getattr(detector, "incomplete_tool_call_indices", set())
@@ -249,6 +264,54 @@ def _extract_max_dynamic_patch(request: ChatCompletionRequest):
 
 KIMI_K3_IMAGE_PLACEHOLDER = "<|kimi_image_placeholder|>"
 KIMI_K3_IMAGE_PLACEHOLDER_ESCAPED = "<| kimi_image_placeholder |>"
+
+
+# OpenAI effort tiers mapped onto the nearest K3 level; K3.1 adds "medium".
+_KIMI_K3_LEVEL_BY_TIER = {
+    "minimal": "low",
+    "low": "low",
+    "medium": "high",
+    "high": "high",
+    "xhigh": "max",
+    "ultra": "max",
+    "max": "max",
+}
+_KIMI_K31_LEVEL_BY_TIER = {**_KIMI_K3_LEVEL_BY_TIER, "medium": "medium"}
+
+
+_KIMI_K3_THINKING_TYPES = (None, "enabled", "disabled", "adaptive")
+
+
+def _kimi_k3_levels_text(level_by_tier: dict) -> str:
+    return ", ".join(repr(level) for level in dict.fromkeys(level_by_tier.values()))
+
+
+def _map_kimi_k3_effort(reasoning_effort: Any, level_by_tier: dict) -> Optional[str]:
+    if reasoning_effort is None or reasoning_effort == "none":
+        return None
+    if isinstance(reasoning_effort, str) and reasoning_effort in level_by_tier:
+        return level_by_tier[reasoning_effort]
+    raise ValueError(
+        f"Kimi K3 supports reasoning_effort {_kimi_k3_levels_text(level_by_tier)} "
+        f"(the other OpenAI tiers map onto them); got {reasoning_effort!r}."
+    )
+
+
+def _validate_kimi_k3_request(request: ChatCompletionRequest) -> str | None:
+    """Request rules of the K3 serving contract that the encoder cannot enforce."""
+    error = _validate_kimi_k3_message_tools(request)
+    if error:
+        return error
+    # `thinking` stays a plain dict on the request; `keep` is accepted and ignored.
+    thinking = request.thinking
+    if thinking is not None and not (
+        isinstance(thinking, dict) and thinking.get("type") in _KIMI_K3_THINKING_TYPES
+    ):
+        return (
+            f"invalid thinking: {thinking!r}; expected an object whose type, if "
+            "set, is 'enabled', 'disabled' or 'adaptive'."
+        )
+    return None
 
 
 def neutralize_kimi_k3_image_placeholder(text: str) -> str:
@@ -686,6 +749,11 @@ class OpenAIServingChat(OpenAIServingBase):
     def _request_id_prefix(self) -> str:
         return "chatcmpl-"
 
+    def _kimi_k3_level_by_tier(self) -> dict:
+        if self.tokenizer_manager.model_config.hf_config.model_type == "kimi_k31":
+            return _KIMI_K31_LEVEL_BY_TIER
+        return _KIMI_K3_LEVEL_BY_TIER
+
     def _effective_tools(self, request: ChatCompletionRequest) -> list[Tool]:
         tools = list(request.tools or [])
         for message in request.messages:
@@ -800,23 +868,31 @@ class OpenAIServingChat(OpenAIServingBase):
             template_kwargs.pop("tokenize", None)
             template_kwargs.pop("return_dict", None)
             template_kwargs.pop("image_prompts", None)
+            # The encoder call below always passes add_generation_prompt=True.
+            template_kwargs.pop("add_generation_prompt", None)
+            for key in ("conversation", "tools"):
+                if key in template_kwargs:
+                    raise ValueError(
+                        f"chat_template_kwargs cannot set {key!r}; "
+                        "use the request fields instead."
+                    )
             if image_count:
                 template_kwargs["image_prompts"] = ["<|media_pad|>"] * image_count
 
-            supported_efforts = ("low", "high", "max")
-            if self.tokenizer_manager.model_config.hf_config.model_type == "kimi_k31":
-                supported_efforts = ("low", "medium", "high", "max")
-            if (
-                request.reasoning_effort in supported_efforts
-                and "thinking_effort" not in template_kwargs
-            ):
-                template_kwargs["thinking_effort"] = request.reasoning_effort
-            elif request.reasoning_effort not in (None, "none", *supported_efforts):
-                logger.warning(
-                    "Kimi K3 does not support reasoning_effort=%r; using the "
-                    "encoder default.",
-                    request.reasoning_effort,
+            level_by_tier = self._kimi_k3_level_by_tier()
+            ctk_effort = template_kwargs.get("thinking_effort")
+            if ctk_effort is not None and ctk_effort not in level_by_tier.values():
+                raise ValueError(
+                    f"chat_template_kwargs.thinking_effort must be one of "
+                    f"{_kimi_k3_levels_text(level_by_tier)}; got {ctk_effort!r}."
                 )
+            if (
+                "thinking_effort" not in template_kwargs
+                and template_kwargs.get("thinking") is not False
+            ):
+                effort = _map_kimi_k3_effort(request.reasoning_effort, level_by_tier)
+                if effort is not None:
+                    template_kwargs["thinking_effort"] = effort
 
             effective_tools = self._effective_tools(request)
             # The encoder renders tool_choice="none" with or without tools, so a
@@ -1178,7 +1254,7 @@ class OpenAIServingChat(OpenAIServingBase):
             if m3_error:
                 return m3_error
         if self.chat_encoding_spec == "kimi_k3":
-            k3_error = _validate_kimi_k3_message_tools(request)
+            k3_error = _validate_kimi_k3_request(request)
             if k3_error:
                 return k3_error
         if request.return_flat_raw_output_top_logprobs and not request.return_meta_info:
@@ -1238,7 +1314,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     "or contains a cycle."
                 )
 
-        max_output_tokens = request.max_completion_tokens or request.max_tokens
+        max_output_tokens = request.effective_max_tokens
         server_context_length = get_model().context_length
         if (
             validate_max_output_tokens
@@ -2509,11 +2585,14 @@ class OpenAIServingChat(OpenAIServingBase):
             return self.create_error_response(str(e))
 
         async def prepend_first_chunk():
-            yield first_chunk
-            async for chunk in generator:
-                yield chunk
+            try:
+                yield first_chunk
+                async for chunk in generator:
+                    yield chunk
+            finally:
+                await generator.aclose()
 
-        return StreamingResponse(
+        return _ClosingStreamingResponse(
             prepend_first_chunk(),
             media_type="text/event-stream",
             background=self.tokenizer_manager.create_abort_task(adapted_request),
@@ -2557,6 +2636,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
         stream_started = False
         error_aborted = False
+        stream = self.tokenizer_manager.generate_request(adapted_request, raw_request)
         try:
             include_usage, continuous_usage_stats = should_include_usage(
                 request.stream_options,
@@ -2571,9 +2651,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 and raw_request.headers.get("x-sglext-ids-framed") == "1"
             )
 
-            async for content in self.tokenizer_manager.generate_request(
-                adapted_request, raw_request
-            ):
+            async for content in stream:
                 index = content.get("index", 0)
 
                 prompt_tokens[index] = self._reported_prompt_tokens(
@@ -2882,6 +2960,10 @@ class OpenAIServingChat(OpenAIServingBase):
                 raise
             error = self.create_streaming_error_response(str(e))
             yield f"data: {error}\n\n"
+        finally:
+            # Closing generate_request runs its cleanup, which aborts the
+            # request only while this request still owns its rid.
+            await stream.aclose()
 
         yield "data: [DONE]\n\n"
 
@@ -3877,6 +3959,8 @@ class OpenAIServingChat(OpenAIServingBase):
         # Get the last tool call that was being processed
         tool_index = len(detector.prev_tool_call_arr) - 1
         if tool_index < 0 or tool_index >= len(detector.streamed_args_for_tool):
+            return None
+        if tool_index in _incomplete_tool_call_indices(parser):
             return None
 
         # Get expected vs actual arguments

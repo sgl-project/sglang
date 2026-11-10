@@ -265,13 +265,12 @@ if _is_cuda:
 
 if _is_cuda or _is_hip or _is_xpu:
     if _is_xpu:
-        # XPU has no tvm_ffi, so the CUDA JIT topk_sigmoid isn't reachable;
-        # use the AOT symbols from sgl_kernel directly. topk_sigmoid was aligned
-        # with the post-#28715 CUDA signature in sgl-kernel-xpu#285.
+        # XPU has no tvm_ffi; use the AOT symbols from sgl_kernel directly.
+        # topk_sigmoid was aligned with the post-#28715 CUDA signature in
+        # sgl-kernel-xpu#285.
         from sgl_kernel import topk_sigmoid, topk_softmax
     else:
         from sglang.kernels.ops.moe import topk_softmax
-        from sglang.kernels.ops.moe.moe_topk_sigmoid import topk_sigmoid
 if _use_aiter:
     try:
         from aiter import biased_grouped_topk as aiter_biased_grouped_topk
@@ -1407,7 +1406,7 @@ def fused_topk(
                 topk_weights *= (
                     routed_scaling_factor if routed_scaling_factor is not None else 1.0
                 )
-        elif _is_cuda:
+        elif _is_cuda or _is_hip:
             # Unified Triton router (subsumes the AOT topk_sigmoid CUDA kernel).
             from sglang.kernels.ops.moe.moe_fused_gate import (
                 moe_fused_gate as _jit_moe_fused_gate,
@@ -2198,31 +2197,6 @@ def biased_grouped_topk_gpu(
             )
 
         return topk_weights, topk_ids
-
-    elif (
-        _is_cuda
-        and not dynamic_bias
-        and num_experts == 512
-        and num_expert_group == 8
-        and topk_group == 4
-        and 1 <= topk_routed <= 8
-        and 0 <= num_fused_shared_experts <= 1
-    ):
-        from sglang.kernels.ops.moe.bailing_moe_topk import (
-            bailing_moe_biased_grouped_topk,
-        )
-
-        return bailing_moe_biased_grouped_topk(
-            gating_output.to(dtype=torch.float32),
-            correction_bias.to(dtype=torch.float32),
-            num_expert_group,
-            topk_group,
-            topk,
-            renormalize,
-            num_fused_shared_experts,
-            routed_scaling_factor if routed_scaling_factor is not None else 1.0,
-            bool(apply_routed_scaling_factor_on_output),
-        )
 
     elif _is_cuda and num_expert_group > 1 and not dynamic_bias:
         # CUDA grouped fallback (flashinfer unavailable / constraints unmet): the
@@ -3084,6 +3058,16 @@ def select_experts(
                 scoring_func=scoring_func,
             )
         else:
+            from sglang.srt.layers.moe import route_quant_handoff
+
+            route_quant_handoff.bind_select_experts(
+                num_token_non_padded,
+                fused_routing_ok=(
+                    expert_location_dispatch_info is None
+                    and not routing_overridden
+                    and num_shared_topk_slots == 0
+                ),
+            )
             topk_weights, topk_ids = biased_grouped_topk(
                 hidden_states=hidden_states,
                 gating_output=router_logits,
@@ -3096,6 +3080,7 @@ def select_experts(
                 routed_scaling_factor=routed_scaling_factor,
                 apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
             )
+            padded_rows_masked = route_quant_handoff.take_padded_rows_masked()
     elif torch_native and custom_routing_function is None:
         fold_scale_after_routing = True
         topk_weights, topk_ids = fused_topk_native(

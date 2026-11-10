@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import contextlib
-import io
+import json
 import shlex
 import unittest
+from importlib import resources
 from unittest.mock import MagicMock, patch
 
 from sglang.cli.serve import serve
@@ -15,7 +16,7 @@ from sglang.cli.serve_backends import (
     ServeBackendRegistry,
     ServeRequest,
 )
-from sglang.srt.server_args import prepare_server_args
+from sglang.srt.server_args import compute_world_size, prepare_server_args
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -354,11 +355,6 @@ DIRECT_LAUNCH_CASES = {
 # TODO(Yichi): expect the CLI Guide for these once it lands.
 GUIDE_CASES = {
     "bare model": (["Qwen/Qwen3-8B"], "llm", ["--model-path", "Qwen/Qwen3-8B"]),
-    "bare model with --mode": (
-        ["Qwen/Qwen3-8B", "--mode", "balanced"],
-        "llm",
-        ["--model-path", "Qwen/Qwen3-8B", "--mode", "balanced"],
-    ),
 }
 
 
@@ -402,14 +398,43 @@ class TestServeDirectLaunch(CustomTestCase):
     def test_guide_candidates_launch_directly_today(self):
         self._assert_cases(GUIDE_CASES)
 
-    def test_mode_is_not_a_server_flag(self):
-        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-            prepare_server_args(["--model-path", "Qwen/Qwen3-8B", "--mode", "balanced"])
-
     # TODO(Yichi): expect the CLI Guide's model prompt once it lands.
     def test_missing_model_is_rejected(self):
         with self.assertRaisesRegex(Exception, "--model-path is required"):
             self._serve([])
+
+
+class TestExportedCookbookCommands(CustomTestCase):
+    def test_every_command_parses_as_server_args(self):
+        exported = {
+            path.name.removesuffix(".json").replace("--", "/"): json.loads(
+                path.read_text()
+            )
+            for path in resources.files("sglang.cli").joinpath("_commands").iterdir()
+            if path.name.endswith(".json")
+        }
+        self.assertTrue(exported)
+        for model, entries in exported.items():
+            for entry in entries:
+                with self.subTest(entry["url"]):
+                    server_args = prepare_server_args(_cookbook_argv(entry["command"]))
+                    self.assertEqual(server_args.model_path, model)
+                    gpus = compute_world_size(
+                        dp_size=server_args.dp_size,
+                        tp_size=server_args.tp_size,
+                        pp_size=server_args.pp_size,
+                    )
+                    self.assertEqual(entry["gpus"], gpus)
+                    prefix = entry["command"].split("sglang serve")[0]
+                    env_lines = [
+                        line.rstrip(" \\")
+                        for line in prefix.splitlines()
+                        if line.strip() and not line.startswith("#")
+                    ]
+                    self.assertEqual(
+                        env_lines,
+                        [f"{key}={value}" for key, value in entry["env"].items()],
+                    )
 
 
 if __name__ == "__main__":

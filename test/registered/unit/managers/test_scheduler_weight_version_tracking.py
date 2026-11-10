@@ -126,8 +126,6 @@ class TestSchedulerBatchWeightVersion(CustomTestCase):
         scheduler.batch_result_processor = SchedulerBatchResultProcessor(
             is_generation=True,
             disaggregation_mode=DisaggregationMode.NULL,
-            enable_overlap=False,
-            enable_overlap_mlx=False,
             model_config=SimpleNamespace(think_end_ids=None),
             token_to_kv_pool_allocator=MagicMock(),
             tree_cache=scheduler.tree_cache,
@@ -144,6 +142,7 @@ class TestSchedulerBatchWeightVersion(CustomTestCase):
             beam_coordinator=MagicMock(),
             request_retirer=release_only_retirer(tree_cache=scheduler.tree_cache),
             abort_request=lambda *args, **kwargs: None,
+            still_in_batch=lambda req: True,
         )
         for name, value in (
             ("get_observability", SimpleNamespace(enable_metrics=False)),

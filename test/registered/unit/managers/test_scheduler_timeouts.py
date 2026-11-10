@@ -36,12 +36,12 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     CacheRequestOutcome,
 )
-from sglang.test.scheduler_test_utils import empty_request_lists
+from sglang.test.scheduler_test_utils import FakeReq, empty_request_lists
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
-class _FakeReq:
+class _FakeReq(FakeReq):
     release_mm_inputs_on_abort = Req.release_mm_inputs_on_abort
     request_finish = Req.request_finish
     finish_outside_step = Req.finish_outside_step
@@ -230,6 +230,25 @@ class TestQueuedAbort(CustomTestCase):
         s.tree_cache.finish.assert_called_once_with(
             req.cache_request_handle, CacheRequestOutcome.ABORT
         )
+
+    def test_hisparse_staged_request_is_finished_at_its_next_step(self):
+        req = _req("staged")
+        # Prefilled, in no batch, waiting for its host copy to land.
+        staging = IndexedReqList(ListKind.HISPARSE_STAGING, req_of=lambda x: x.req)
+        staging.join([SimpleNamespace(req=req)])
+        s = _scheduler([])
+        s.disaggregation_mode = DisaggregationMode.NULL
+        s.hisparse_coordinator = SimpleNamespace(
+            ack_staging_queue=staging,
+            request_lists=lambda: {ListKind.HISPARSE_STAGING: staging},
+        )
+        s.mm_receiver = None
+        s.dllm_config = None
+        s.grammar_manager = MagicMock()
+
+        s.abort_request(AbortReq(rid="staged"))
+
+        self.assertIsInstance(req.to_finish, FINISH_ABORT)
 
 
 class TestRunningTimeout(CustomTestCase):

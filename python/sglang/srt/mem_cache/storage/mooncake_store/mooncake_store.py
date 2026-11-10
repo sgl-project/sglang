@@ -8,7 +8,7 @@ import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import cached_property
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Mapping, Optional, Tuple
 
 import requests
 import torch
@@ -24,6 +24,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransferResult,
     SidecarPoolSpec,
     disabled_l3_layout,
+    l3_page_span,
 )
 from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import DevicePoolEntry
 from sglang.srt.mem_cache.pool_host import HostKVCache, HostTensorAllocator
@@ -903,15 +904,16 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         self,
         *,
         sidecar_pool_specs: Sequence[SidecarPoolSpec],
-        swa_trailing_pages: Optional[int],
+        window_trailing_pages: Mapping[str, int],
         page_size: int,
     ) -> dict:
         """Describe physical objects using the same key builders as writes.
 
         Args:
             sidecar_pool_specs: Sidecar hit policies and their index-source pools.
-            swa_trailing_pages: The SWA component's full_window_pages, or None
-                when no SWA component exists. Mamba uses one trailing page.
+            window_trailing_pages: Each window component's full_window_pages,
+                by its host pool's name; empty when no window component
+                exists. Mamba uses one trailing page.
             page_size: Resolved engine page size in tokens.
 
         Returns:
@@ -948,7 +950,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             suffixes, _, _ = self._batch_preprocess(
                 [""],
                 torch.arange(
-                    self.mem_pool_host.page_size, dtype=torch.int64, device="cpu"
+                    l3_page_span(self.mem_pool_host), dtype=torch.int64, device="cpu"
                 ),
             )
             pools.append(
@@ -960,7 +962,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             )
 
         specs = {spec.pool_name: spec for spec in sidecar_pool_specs}
-        trailing_pages = {PoolName.MAMBA: 1, PoolName.SWA: swa_trailing_pages}
+        trailing_pages = {PoolName.MAMBA: 1, **window_trailing_pages}
         for pool_name in self.registered_pools:
             if pool_name == PoolName.KV:
                 continue
@@ -1095,7 +1097,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             # DSA indexer and DeepSeek V4 side pools are page-packed
             # single-object pools.
             suffixes = [f"_{self.mla_suffix}_{pool_name}"]
-        elif pool_name == PoolName.SWA:
+        elif pool_name == PoolName.SWA or str(pool_name).startswith("window"):
+            # A window host pool: `swa`, or a unified pool's window sub-pool,
+            # named by the sub-pool and keyed by that name.
             if not self.is_mla_backend and hasattr(host_pool, "v_buffer"):
                 # Ordinary MHA SWA mirrors a K/V pool.
                 suffixes = [
@@ -1253,7 +1257,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             keys = transfer.keys
             if host_pool is None:
                 raise ValueError(f"Unregistered Mooncake hybrid pool: {transfer.name}")
-            page_size = host_pool.page_size or 1
+            page_size = l3_page_span(host_pool)
             host_indices = transfer.host_indices
             assert len(keys) > 0
             assert len(keys) == len(host_indices) // page_size
@@ -1363,7 +1367,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             if len(missing_pages) * key_multiplier < len(key_strs):
                 # Metadata generation consumes CPU indices anyway, so select
                 # the logical pages there rather than uploading a new index.
-                page_size = host_pool.page_size or 1
+                page_size = l3_page_span(host_pool)
                 host_indices = host_indices.detach().to(device="cpu")
                 host_indices = host_indices.reshape(-1, page_size)[
                     missing_pages

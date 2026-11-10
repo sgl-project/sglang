@@ -33,6 +33,7 @@ from sglang.srt.disaggregation.encoder.receiver import (
     video_meta_attrs_for,
 )
 from sglang.srt.distributed.parallel_state import (
+    create_custom_parallel_group,
     get_default_distributed_backend,
     get_mooncake_transfer_engine,
     init_distributed_environment,
@@ -668,23 +669,7 @@ class MMEncoder:
         ).element_size()
         self._embedding_dims = self._infer_embedding_dims()
 
-        if get_mm().enable_mm_global_cache:
-            from sglang.srt.mem_cache.embedding_cache_controller import (
-                EmbeddingCacheController,
-            )
-            from sglang.srt.mem_cache.embedding_store import EmbeddingStoreFactory
-
-            embedding_store = EmbeddingStoreFactory.create_backend(
-                get_mm().mm_global_cache_backend,
-            )
-            self.mm_global_cache = EmbeddingCacheController(
-                embedding_store=embedding_store,
-                hidden_dims=self._embedding_dims,
-                all_rank_get=False,
-                dtype=self._embedding_dtype,
-            )
-        else:
-            self.mm_global_cache = None
+        self._init_global_cache()
 
         if self.rank == 0:
             logger.info(
@@ -730,6 +715,42 @@ class MMEncoder:
                 )
 
         logger.info(f"rank {rank} init finish ")
+
+    def _init_global_cache(self) -> None:
+        self.mm_global_cache_enabled = get_mm().enable_mm_global_cache
+        self.mm_global_cache = None
+        self.global_cache_tp_group = None
+        if not self.mm_global_cache_enabled:
+            return
+
+        parallel = get_parallel()
+        if parallel.tp_size > 1:
+            # Every rank participates in cache hit/fallback decisions, even
+            # though only rank 0 needs the embedding data and host pools.
+            group_ranks = torch.distributed.get_process_group_ranks(
+                parallel.tp_group.cpu_group
+            )
+            self.global_cache_tp_group = create_custom_parallel_group(
+                group_ranks=group_ranks, backend="gloo"
+            )
+
+        if self.rank != 0:
+            return
+
+        from sglang.srt.mem_cache.embedding_cache_controller import (
+            EmbeddingCacheController,
+        )
+        from sglang.srt.mem_cache.embedding_store import EmbeddingStoreFactory
+
+        embedding_store = EmbeddingStoreFactory.create_backend(
+            get_mm().mm_global_cache_backend,
+        )
+        self.mm_global_cache = EmbeddingCacheController(
+            embedding_store=embedding_store,
+            hidden_dims=self._embedding_dims,
+            all_rank_get=False,
+            dtype=self._embedding_dtype,
+        )
 
     def _background_task_done(self, task: asyncio.Task) -> None:
         self.background_tasks.discard(task)
@@ -1350,7 +1371,7 @@ class MMEncoder:
             torch.distributed.broadcast(
                 mask_tensor,
                 src=0,
-                group=self.mm_global_cache.prefetch_tp_group,
+                group=self.global_cache_tp_group,
             )
 
     async def _lookup_global_cache(
@@ -1745,7 +1766,7 @@ class MMEncoder:
                 mm_hashes = [mm_item.cache_key for mm_item in mm_items]
                 mm_hash = MultiModalStaticCache.combine_hashes(mm_hashes)
                 async with self.mm_cache_lock:
-                    mm_cache = self.mm_cache.get(mm_hashes)
+                    mm_cache = self.mm_cache.get(mm_hashes, combined_hash=mm_hash)
                     if mm_cache is not None:
                         mm_embedding = mm_cache.embedding
                         cache_hit = True
@@ -2232,7 +2253,7 @@ class MMEncoder:
             is_health_check_request(req["req_id"]) for req in requests
         )
         keep_on_gpu = self.use_mooncake and not is_health_check
-        use_global_cache = self.mm_global_cache is not None and not is_health_check
+        use_global_cache = self.mm_global_cache_enabled and not is_health_check
         try:
             if self.rank == 0:
                 async with encode_state_condition:

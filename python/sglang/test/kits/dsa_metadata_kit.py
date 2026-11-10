@@ -1,7 +1,9 @@
 """Small real CUDA metadata fixtures; no model runner or model weights required."""
 
+from contextlib import nullcontext
 from dataclasses import fields
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -60,7 +62,13 @@ def make_backend(mode, seq, req, *, fusion=True):
         "page_table": torch.zeros(BS * NEXT_N, WIDTH, device="cuda", dtype=torch.int32),
         "cu_seqlens_q": backend._arange_buf,
     }
-    with envs.SGLANG_EXPERIMENTAL_DSA_KPOOL_METADATA_FUSION.override(fusion):
+    # fusion=False builds the ordinary-metadata reference on the same geometry.
+    unsupported = patch(
+        "sglang.srt.layers.attention.dsa.dsa_metadata_manager."
+        "kpool_metadata_fusion_supported",
+        return_value=False,
+    )
+    with nullcontext() if fusion else unsupported:
         backend._init_kpool_metadata_fusion()
     with envs.SGLANG_OPT_USE_TOPK_V2.override(True):
         apply_metadata(backend, mode, seq, req)

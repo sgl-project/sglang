@@ -69,6 +69,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 from fastapi.routing import APIRoute
+from pydantic import ValidationError
 from uvicorn.supervisors.multiprocess import Multiprocess
 
 from sglang.srt.configs.model_config import load_joint_head_config, load_pointer_head
@@ -2218,16 +2219,52 @@ async def sagemaker_health() -> Response:
     return Response(status_code=status_code)
 
 
+# Checked in order, so a body with `messages` always reaches chat. Dispatch is by key
+# rather than by trying each model, because `input` is shared by
+# embeddings/classify/responses and ScoringRequest accepts any body.
+_SAGEMAKER_INVOCATION_ROUTES = (
+    ("messages", ChatCompletionRequest, openai_v1_chat_completions),
+    ("prompt", CompletionRequest, openai_v1_completions),
+    ("input", EmbeddingRequest, openai_v1_embeddings),
+)
+_SAGEMAKER_NO_MATCH_MSG = (
+    "Cannot determine the request type: expected one of 'messages' "
+    "(chat completions), 'prompt' (completions) or 'input' (embeddings)"
+)
+
+
 @app.post("/invocations")
-async def sagemaker_chat_completions(
-    request: ChatCompletionRequest, raw_request: Request
+async def sagemaker_invocations(
+    body: Annotated[Dict[str, Any], Body()], raw_request: Request
 ):
-    """OpenAI-compatible chat completion endpoint."""
-    return model_json_response(
-        await raw_request.app.state.openai_serving_chat.handle_request(
-            request, raw_request
+    """SageMaker's only inference route: dispatch by body key to the matching OpenAI route."""
+    for key, request_cls, route in _SAGEMAKER_INVOCATION_ROUTES:
+        if key in body:
+            break
+    else:
+        # The body is not echoed back: SageMaker request bodies can be up to 6 MB.
+        raise RequestValidationError(
+            errors=[
+                {
+                    "type": "value_error",
+                    "loc": ("body",),
+                    "msg": _SAGEMAKER_NO_MATCH_MSG,
+                }
+            ]
         )
-    )
+    try:
+        request = request_cls.model_validate(body)
+    except ValidationError as e:
+        raise RequestValidationError(
+            errors=[
+                {**err, "loc": ("body", *err["loc"])}
+                for err in e.errors(include_url=False)
+            ]
+        ) from e
+    # Route functions are called directly, so their route-level Depends (e.g.
+    # validate_json_request) and response_class do not apply; the wrapper replaces
+    # the ORJSONResponse that /v1/embeddings would otherwise get.
+    return model_json_response(await route(request, raw_request))
 
 
 ## Vertex AI API
@@ -3188,7 +3225,8 @@ def launch_server(
         # The Rust server serves api-server, tokenizer, and detokenizer, so the
         # main process has no Python HTTP server / tokenizer manager to run.
         # Each Rust listener runs its own startup warmup and keeps /health at
-        # 503 until it succeeds, so the main process does not warm up here.
+        # 503 until it succeeds, so the main process does not warm up here. A
+        # failed warmup signals this process as a crashed scheduler does.
         from sglang.srt.rust_server.server import drain_notify_name
         from sglang.srt.rust_server.shutdown import RustServerSigtermDrain
 
