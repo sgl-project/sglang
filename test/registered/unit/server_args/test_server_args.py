@@ -1127,6 +1127,40 @@ class TestTokenspeedMlaAlias(CustomTestCase):
         )
 
 
+class TestFlashinferMoeA2AAlias(CustomTestCase):
+    def test_maps_to_flashinfer_nvlink_one_sided(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            moe_a2a_backend="flashinfer",
+            speculative_moe_a2a_backend="flashinfer",
+        )
+
+        with self.assertLogs(serving_hook.logger, level="WARNING") as cm:
+            handle_deprecated_args(server_args)
+
+        for field in ("moe_a2a_backend", "speculative_moe_a2a_backend"):
+            self.assertEqual(
+                resolution_result(server_args, field), "flashinfer_nvlink_one_sided"
+            )
+            flag = "--" + field.replace("_", "-")
+            self.assertTrue(
+                any(f"{flag}=flashinfer is deprecated" in line for line in cm.output)
+            )
+
+    def test_canonical_name_is_unchanged(self):
+        server_args = ServerArgs(
+            model_path="dummy", moe_a2a_backend="flashinfer_nvlink_one_sided"
+        )
+
+        handle_deprecated_args(server_args)
+
+        self.assertEqual(
+            resolution_result(server_args, "moe_a2a_backend"),
+            "flashinfer_nvlink_one_sided",
+        )
+        self.assertIsNone(resolution_result(server_args, "speculative_moe_a2a_backend"))
+
+
 class TestMultimodalFeatureTransport(CustomTestCase):
     @override_platform(is_cuda=True)
     def test_gpu_admission_preserves_transport_and_describes_overflow(self):
@@ -2295,7 +2329,7 @@ class TestFlashinferA2ADispatchType(CustomTestCase):
         server_args = ServerArgs(
             model_path="dummy",
             quantization=quantization,
-            moe_a2a_backend="flashinfer",
+            moe_a2a_backend="flashinfer_nvlink_one_sided",
             moe_runner_backend=runner_backend,
             flashinfer_a2a_dispatch_type=dispatch_type,
             attn_dp_size=4,
