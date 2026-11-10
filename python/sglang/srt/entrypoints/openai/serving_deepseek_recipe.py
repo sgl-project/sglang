@@ -14,7 +14,9 @@ from sglang.srt.entrypoints.openai.chat_encoding_adapters import (
     token_output_sse_chunks,
 )
 from sglang.srt.entrypoints.openai.protocol import (
+    Function,
     FunctionResponse,
+    Tool,
     ToolCall,
 )
 from sglang.srt.environ import envs
@@ -28,7 +30,9 @@ from sglang.srt.parser.deepseek_recipe_output import (
     whole_tool_calls,
 )
 from sglang.srt.parser.deepseek_recipe_renderer import (
+    DYNAMIC_TOOLS_SPEC,
     DeepSeekRecipe,
+    NativeRequest,
     parse_effort_budget,
 )
 from sglang.srt.runtime_context import get_serving
@@ -38,7 +42,6 @@ if TYPE_CHECKING:
     from sglang.srt.entrypoints.openai.protocol import (
         ChatCompletionRequest,
         ResponsesRequest,
-        Tool,
     )
 
 DEFAULT_EFFORT_ENVS = {
@@ -108,6 +111,24 @@ class DeepSeekRecipeChatEncodingAdapter:
     ) -> list[int]:
         # The wire request: the handler's message dumps carry None for unset fields.
         wire = request.model_dump(exclude_unset=True, by_alias=True, mode="json")
+        native = request._native_request
+        if native is not None:
+            # The native payload carries the conversation; the request, its settings.
+            settings = {
+                "messages": [{"role": "user", "content": ""}],
+                "thinking": thinking,
+                "response_format": wire.get("response_format"),
+            }
+            image_urls = []
+            prompt_ids = self._encode(
+                {key: value for key, value in settings.items() if value is not None},
+                effort=request.reasoning_effort,
+                image_urls=image_urls,
+                native=native,
+            )
+            image_data.extend(ImageData(url=url) for url in image_urls)
+            return prompt_ids
+        self._validate_dynamic_tools(request)
         wire_messages = _null_content_as_empty(wire["messages"])
         continue_final = request.continue_final_message
         task_prefix = None
@@ -138,6 +159,9 @@ class DeepSeekRecipeChatEncodingAdapter:
                 }
                 for tool in tools
             ]
+        if tools is not None or request._message_tools_indices:
+            # Also without request tools: `none` drops message-level declarations
+            # and a named choice keeps only that tool.
             body["tool_choice"] = wire.get("tool_choice")
         body = {key: value for key, value in body.items() if value is not None}
         image_urls = []
@@ -152,6 +176,68 @@ class DeepSeekRecipeChatEncodingAdapter:
             prompt_ids += self.deepseek_recipe.encode_text(task_prefix)
         return prompt_ids
 
+    def native_request(
+        self,
+        protocol: str,
+        body: dict[str, Any],
+        *,
+        tool_name: Optional[str],
+        strict: frozenset[str] = frozenset(),
+    ) -> tuple[NativeRequest, list[Tool]]:
+        """A Responses or Messages payload that recipe's adapter converts, and the
+        tools the model can call after its history, for validation, grammar and
+        parser. `strict` names tools whose arguments the grammar must enforce, which
+        recipe's Messages adapter does not carry. Invalid payloads raise ValueError."""
+        native = NativeRequest(protocol=protocol, body=body, tool_name=tool_name)
+        # The tools stay callable under `none`, which only hides them.
+        declared = NativeRequest(
+            protocol=protocol,
+            body={key: value for key, value in body.items() if key != "tool_choice"},
+        )
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name=tool.name,
+                    description=tool.description,
+                    parameters=tool.parameters,
+                    strict=True if tool.name in strict else tool.strict,
+                ),
+            )
+            for tool in self.deepseek_recipe.native_tools(declared)
+        ]
+        return native, tools
+
+    def responses_tool_names(
+        self, tools: list[dict[str, Any]]
+    ) -> dict[str, dict[str, str]]:
+        """Call names of namespace members, as recipe joins them, mapped to the
+        Responses `namespace` and `name` the calls report."""
+        return {
+            call_name: {"namespace": namespace, "name": name}
+            for call_name, (namespace, name) in self.deepseek_recipe.namespace_tool_map(
+                tools
+            ).items()
+        }
+
+    def _validate_dynamic_tools(self, request: ChatCompletionRequest) -> None:
+        for index in request._message_tools_indices:
+            role = request.messages[index].role
+            if role not in ("system", "developer"):
+                raise ValueError(
+                    f"messages[{index}]: only system and developer messages can "
+                    f"declare tools, got role {role!r}"
+                )
+        if self._spec == DYNAMIC_TOOLS_SPEC and any(
+            tool.function.defer_loading for tool in request.tools or []
+        ):
+            # Chat has no reference that would load it, so it could never be shown.
+            raise ValueError(
+                "tools: defer_loading is not supported by Chat Completions for "
+                "DeepSeek-V4.1; declare the tool in a system or developer message "
+                "where it becomes available"
+            )
+
     def _encode(
         self,
         body: dict[str, Any],
@@ -159,6 +245,7 @@ class DeepSeekRecipeChatEncodingAdapter:
         effort: Union[str, int, float, None],
         task: Optional[str] = None,
         image_urls: Optional[list[str]] = None,
+        native: Optional[NativeRequest] = None,
     ) -> list[int]:
         effort = _numeric_effort(effort)
         if effort is None or effort == "none":
@@ -173,7 +260,7 @@ class DeepSeekRecipeChatEncodingAdapter:
         elif effort is not None:
             body["reasoning_effort"] = effort
         return self.deepseek_recipe.encode(
-            body, task=task, effort_budget=budget, image_urls=image_urls
+            body, task=task, effort_budget=budget, image_urls=image_urls, native=native
         )
 
     def parse_chat_response(

@@ -91,6 +91,13 @@ class ToolReferenceBlock(BaseModel):
     id: Optional[str] = None
 
 
+class ToolAdditionBlock(BaseModel):
+    """deepseek-recipe extension: a ``system`` message loads a declared tool."""
+
+    type: Literal["tool_addition"] = "tool_addition"
+    tool: ToolReferenceBlock
+
+
 class SearchResultBlock(BaseModel):
     type: Literal["search_result"] = "search_result"
     # ``source`` here is a URL/identifier string (unlike ImageBlock.source).
@@ -117,6 +124,7 @@ AnthropicContentBlock = Annotated[
         ToolUseBlock,
         ToolResultBlock,
         ToolReferenceBlock,
+        ToolAdditionBlock,
         SearchResultBlock,
         ThinkingBlock,
         RedactedThinkingBlock,
