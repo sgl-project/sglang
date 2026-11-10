@@ -13,7 +13,7 @@ from sglang.srt.runtime_context import (
     mamba_track_grid,
 )
 from sglang.srt.utils.common import ceil_align, flatten_arrays_to_pinned_cpu
-from sglang.srt.utils.device import async_h2d, is_hip, is_pin_memory_available
+from sglang.srt.utils.device import async_h2d, is_pin_memory_available
 from sglang.srt.utils.weight_versions import (
     WeightVersionEvent,
     WeightVersionSpans,
@@ -62,6 +62,7 @@ from typing import (
     Any,
     Dict,
     List,
+    Mapping,
     NamedTuple,
     Optional,
     Set,
@@ -128,9 +129,9 @@ from sglang.srt.mem_cache.common import (
     match_kv_cache,
 )
 from sglang.srt.mem_cache.kv.advance import TrackingAdvance
+from sglang.srt.mem_cache.kv.alloc.demand import windows_retire_by_forward
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
-from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.model_executor.encoder_swa_replay import resets_swa_window
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.multimodal.cache.digest import structured_digest
@@ -168,8 +169,6 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
 logger = logging.getLogger(__name__)
-
-_is_hip = is_hip()
 
 
 def get_batch_return_hidden_states_mode(reqs: List[Req]) -> CaptureHiddenMode:
@@ -275,11 +274,10 @@ class ReqKvInfo:
     kv_committed_len: int = 0  # KV content committed up to here, <= kv_allocated_len
     kv_allocated_len: int = 0
 
-    # SWA slots in [swa_dead_lo(page_size), get_evicted_seqlen(SWA)) are freed.
-    swa_evict_floor: int = 0  # [0, here) never window-evicted (prefill-aware SWA)
-    component_evicted_seqlens: dict[ComponentType, int] = dataclasses.field(
-        default_factory=dict
-    )
+    # Each window's slots in [window_dead_lo(page_size), get_evicted_seqlen(its
+    # sub-pool)) are freed; every window keeps its own cursor, by sub-pool name.
+    window_evict_floor: int = 0  # [0, here) never window-evicted (prefill-aware SWA)
+    window_evicted_seqlens: dict[str, int] = dataclasses.field(default_factory=dict)
 
     # Host-side KV backup the request holds across a retraction (unified cache).
     retraction_backup: Optional[RetractionBackup] = None
@@ -306,10 +304,10 @@ class ReqKvInfo:
     # Deferred clear: newly allocated mamba slot needs zeroing on forward stream
     mamba_needs_clear: bool = False
 
-    def swa_dead_lo(self, page_size: int) -> int:
-        # Lowest SWA position this request may free itself: above the tree-owned
-        # prefix and above the eviction shield, page-aligned upward.
-        lo = max(self.cache_protected_len, self.swa_evict_floor)
+    def window_dead_lo(self, page_size: int) -> int:
+        # Lowest position this request may free itself in any window: above the
+        # tree-owned prefix and above the eviction shield, page-aligned upward.
+        lo = max(self.cache_protected_len, self.window_evict_floor)
         if page_size > 1 and lo > self.cache_protected_len:
             lo = ceil_align(lo, page_size)
         return lo
@@ -328,24 +326,25 @@ class ReqKvInfo:
 
     @property
     def max_evicted_seqlen(self) -> int:
-        return max(self.component_evicted_seqlens.values(), default=0)
+        return max(self.window_evicted_seqlens.values(), default=0)
 
-    def get_evicted_seqlen(self, component_type: ComponentType) -> int:
-        return self.component_evicted_seqlens.get(component_type, 0)
+    def get_evicted_seqlen(self, sub_pool: str) -> int:
+        return self.window_evicted_seqlens.get(sub_pool, 0)
 
-    def set_evicted_seqlen(self, component_type: ComponentType, length: int) -> None:
-        self.component_evicted_seqlens[component_type] = length
+    def set_evicted_seqlen(self, sub_pool: str, length: int) -> None:
+        self.window_evicted_seqlens[sub_pool] = length
 
-    def copy_evicted_seqlens(self) -> dict[ComponentType, int]:
-        return self.component_evicted_seqlens.copy()
+    def evicted_seqlens(self) -> dict[str, int]:
+        """Every window's cursor by sub-pool name, as a copy."""
+        return dict(self.window_evicted_seqlens)
 
     def clamp_evicted_seqlens(self, length: int) -> None:
-        for component, cursor in self.component_evicted_seqlens.items():
-            self.component_evicted_seqlens[component] = min(cursor, length)
+        for sub_pool, cursor in self.window_evicted_seqlens.items():
+            self.window_evicted_seqlens[sub_pool] = min(cursor, length)
 
     def mark_kv_released(self) -> None:
         self.kv_allocated_len = 0
-        self.component_evicted_seqlens.clear()
+        self.window_evicted_seqlens.clear()
 
     def set_row_len(self, end: int) -> None:
         """The row holds exactly [0, end), all of it committed."""
@@ -405,9 +404,9 @@ class ReqKvInfo:
         self.cache_protected_len = 0
         self.cache_inserted_len = 0
 
-    def shield_swa_prefill(self, extend_end: int) -> None:
-        """Prefill-aware SWA: the window never evicts [0, extend_end)."""
-        self.swa_evict_floor = extend_end
+    def shield_window_prefill(self, extend_end: int) -> None:
+        """Prefill-aware windows: no window evicts [0, extend_end)."""
+        self.window_evict_floor = extend_end
 
     def reset_for_retract(self) -> None:
         """A retracted request, its row already released, starts over: the tree
@@ -586,6 +585,9 @@ class Req(ReqDllmMixin):
         self.finished_len = None
         # Whether this request has finished output
         self.finished_output = None
+        # Set by exit_ledger (CI only).
+        self.exit_via: Optional[str] = None
+        self.send_via: Optional[str] = None
         # Owned by Scheduler.defer_response until its completion is retired.
         self.defer_output = False
         # If we want to abort the request in the middle of the event loop,
@@ -616,8 +618,8 @@ class Req(ReqDllmMixin):
         self.best_match_node: Any = None
         # Per-component host hit lengths split off from host_hit_length:
         self.host_hit_length = 0
-        self.swa_host_hit_length = 0
-        self.matched_auxiliary_swa_host_hit_length = 0
+        # Host-hit tokens per window sub-pool.
+        self.matched_window_host_hit_lengths: Mapping[str, int] = {}
         self.mamba_host_hit_length = 0
         # The branching point seqlen to track mamba state. If set, given by prefix
         # match, it will be the tracked seqlen in the ping pong buffer for the
@@ -925,21 +927,19 @@ class Req(ReqDllmMixin):
         return self.output_ids
 
     @property
-    def auxiliary_swa_host_hit_length(self) -> int:
+    def window_host_hit_lengths(self) -> Mapping[str, int]:
+        """Host hit tokens per window sub-pool."""
         plan = self.staged_prefetch_plan
-        return (
-            plan.window_tokens(ComponentType.AUXILIARY_SWA)
-            if plan is not None
-            else self.matched_auxiliary_swa_host_hit_length
-        )
+        if plan is None:
+            return self.matched_window_host_hit_lengths
+        return plan.window_host_hit_lengths()
 
     def needs_host_load_back(self) -> bool:
         """Whether any cache layer has a host hit that needs L2 H2D load_back."""
         return (
             self.host_hit_length > 0
-            or self.swa_host_hit_length > 0
             or self.mamba_host_hit_length > 0
-            or self.auxiliary_swa_host_hit_length > 0
+            or any(self.window_host_hit_lengths.values())
         )
 
     def materialized_host_hit_len(self) -> int:
@@ -1068,6 +1068,7 @@ class Req(ReqDllmMixin):
             self.multimodal_inputs.merge(image_inputs)
 
         self.multimodal_inputs.mrope_position_delta_repeated_cache = None
+        self.multimodal_inputs.mrope_position_delta_device_cache = None
         if positions is not None:
             self.multimodal_inputs.mrope_positions = positions
             self.multimodal_inputs.mrope_position_delta = (
@@ -1505,7 +1506,6 @@ class Req(ReqDllmMixin):
         self.lock = None
         self.swa_branching_seqlen = None
         self.extend_end = None
-        self.dllm_initialized = False
         self.is_retracted = True
         self.retracted_stain = True
         self.input_token_logprobs = None
@@ -1530,6 +1530,8 @@ class Req(ReqDllmMixin):
             self.weight_version_events = truncate_weight_version_events(
                 self.weight_version_events, num_kept_tokens=self.send_token_offset
             )
+        # Reads output_ids, which input_embeds discards above.
+        self.reset_dllm_progress()
 
     def _mamba_pool_needing_backup(self, req_to_token_pool, allocator):
         if allocator.cpu_copy_carries_mamba:
@@ -1663,6 +1665,7 @@ class Req(ReqDllmMixin):
         )  # set it to one token to skip the long prefill
         self.return_logprob = False
         self.logprob_start_len = -1
+        self.routed_experts_start_len = 0
         self.request_finish(FINISH_ABORT(error_msg, status_code, err_type))
 
     def update_reasoning_tokens(self, token_id, think_end_ids):
@@ -1808,6 +1811,16 @@ def release_req(
     return resumable
 
 
+def free_beam_member_rows(
+    req: Req, req_to_token_pool, token_to_kv_pool_allocator
+) -> None:
+    """Free a beam leader's member rows. Call before releasing the leader:
+    the member rows are found through its lockstep allocated length."""
+    free_member_rows(
+        req.beam_group, kv_storage_of(req_to_token_pool, token_to_kv_pool_allocator)
+    )
+
+
 def retract_all(
     *,
     reqs: List[Req],
@@ -1815,18 +1828,46 @@ def retract_all(
     request_retirer: RequestRetirer,
     offload_kv: bool = True,
 ) -> List[Req]:
-    """Returns the requests that cannot be resumed."""
-    unresumable = []
-    for idx in range(len(reqs)):
+    """Returns the requests to abort, each with its abort reason recorded: those
+    that cannot be resumed, and beam leaders, since beam groups cannot be
+    requeued."""
+    reqs_to_abort = []
+    for idx, req in enumerate(reqs):
+        if req.beam_group is not None:
+            req.request_finish(
+                FINISH_ABORT(
+                    "Beam search group aborted: beam groups cannot be retracted, "
+                    "so they are aborted instead of being requeued.",
+                    status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                )
+            )
+            free_beam_member_rows(
+                req, tree_cache.req_to_token_pool, tree_cache.token_to_kv_pool_allocator
+            )
+            release_req(
+                req=req,
+                remaing_req_count=len(reqs) - idx,
+                tree_cache=tree_cache,
+                request_retirer=request_retirer,
+                offload_kv=False,
+            )
+            reqs_to_abort.append(req)
+            continue
         if not release_req(
-            req=reqs[idx],
+            req=req,
             remaing_req_count=len(reqs) - idx,
             tree_cache=tree_cache,
             request_retirer=request_retirer,
             offload_kv=offload_kv,
         ):
-            unresumable.append(reqs[idx])
-    return unresumable
+            req.request_finish(
+                FINISH_ABORT(
+                    unresumable_abort_message(),
+                    status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                )
+            )
+            reqs_to_abort.append(req)
+    return reqs_to_abort
 
 
 def compute_extend_logprob_start_len(
@@ -1862,6 +1903,36 @@ def _compute_chunked_req_next_prompt_token(
         return None
     if origin_ids[fill_len] < vocab_size:
         return int(origin_ids[fill_len])
+    return None
+
+
+def prefill_checkpoint_boundary(
+    prefix_len: int, extend_len: int, checkpoint_grid: int
+) -> Optional[int]:
+    """Depth a prefill extend checkpoints at without DCP: the last whole
+    ``checkpoint_grid`` multiple past the prefix; None (no checkpoint, so no
+    window row retires behind one) for an extend shorter than the grid."""
+    if extend_len < checkpoint_grid:
+        return None
+    return prefix_len + extend_len // checkpoint_grid * checkpoint_grid
+
+
+def branch_checkpoint(
+    prefix_len: int,
+    branching_seqlen: Optional[int],
+    track_seqlen: int,
+    cache_chunk_size: int,
+) -> Optional[int]:
+    """The branch depth (`branching_checkpoint_depth`) an extend tracks instead
+    of its own checkpoint, when it lies inside the extend before ``track_seqlen``
+    on the state-chunk grid past the prefix; else None."""
+    if branching_seqlen is None:
+        return None
+    if (
+        prefix_len < branching_seqlen < track_seqlen
+        and (branching_seqlen - prefix_len) % cache_chunk_size == 0
+    ):
+        return branching_seqlen
     return None
 
 
@@ -2599,10 +2670,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # Chunked prefill can leave an active request off the absolute
             # checkpoint grid. Without DCP, keep tracking snapshots relative to
             # that request prefix so later chunks can continue donating states.
-            mask = req.extend_len >= checkpoint_grid
-            mamba_track_seqlen_aligned = (
-                prefix_len + (req.extend_len // checkpoint_grid) * checkpoint_grid
+            boundary = prefill_checkpoint_boundary(
+                prefix_len, req.extend_len, checkpoint_grid
             )
+            mask = boundary is not None
+            mamba_track_seqlen_aligned = prefix_len if boundary is None else boundary
         track_position = req.kv.mamba_next_track_idx
         mamba_track_seqlen = -1
         if mask:
@@ -2625,22 +2697,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 # so we need to add 1 to the seqlen to retrieve the correct mamba state from h.
                 mamba_track_seqlen = _force_track_h(mamba_track_seqlen_aligned)
 
-            if req.mamba_branching_seqlen is not None:
-                # track branching point in this forward if the branching point
-                # is within the current extend batch.
-                branching_seqlen_aligned_mask = (
-                    req.mamba_branching_seqlen - req.prefix_len
-                ) % cache_chunk_size == 0
-                if (
-                    req.mamba_branching_seqlen > req.prefix_len
-                    and req.mamba_branching_seqlen < mamba_track_seqlen
-                    and branching_seqlen_aligned_mask
-                ):
-                    # We want to track mamba_track_seqlen_aligned, and it's not the last position,
-                    # so we need to add 1 to the seqlen to retrieve the correct mamba state from h.
-                    # See _force_track_h() for more details.
-                    mamba_track_seqlen = _force_track_h(req.mamba_branching_seqlen)
-                    mamba_track_seqlen_aligned = req.mamba_branching_seqlen
+            # Track the branching point instead, if it lies within this extend.
+            branch = branch_checkpoint(
+                req.prefix_len,
+                req.mamba_branching_seqlen,
+                mamba_track_seqlen,
+                cache_chunk_size,
+            )
+            if branch is not None:
+                # We want to track mamba_track_seqlen_aligned, and it's not the last position,
+                # so we need to add 1 to the seqlen to retrieve the correct mamba state from h.
+                # See _force_track_h() for more details.
+                mamba_track_seqlen = _force_track_h(branch)
+                mamba_track_seqlen_aligned = branch
             kv_storage_of(
                 self.req_to_token_pool, self.token_to_kv_pool_allocator
             ).advance(
@@ -2866,9 +2935,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if selected_indices is None
             else [self.reqs[i] for i in selected_indices]
         )
-        return self.token_to_kv_pool_allocator.check_decode_capacity(
+        from sglang.srt.mem_cache.capacity import check_decode_capacity
+
+        return check_decode_capacity(
+            self.tree_cache,
+            self.token_to_kv_pool_allocator,
             num_tokens=num_tokens,
-            tree_cache=self.tree_cache,
             requests=requests,
             spec_algorithm=self.spec_algorithm,
         )
@@ -2894,8 +2966,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             idx = sorted_indices.pop()
             req = self.reqs[idx]
             if req.beam_group is not None:
-                # Free member rows before release_req: they need the leader's kv
-                # info, which still carries the lockstep allocated length.
                 req.request_finish(
                     FINISH_ABORT(
                         "Beam search group aborted: KV cache pool is full. Beam "
@@ -2905,11 +2975,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     )
                 )
                 reqs_to_abort.append(req)
-                free_member_rows(
-                    req.beam_group,
-                    kv_storage_of(
-                        self.req_to_token_pool, self.token_to_kv_pool_allocator
-                    ),
+                free_beam_member_rows(
+                    req, self.req_to_token_pool, self.token_to_kv_pool_allocator
                 )
                 # Aborting, so a host backup to resume from would be wasted.
                 self.release_req(
@@ -2957,11 +3024,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
             reqs_to_abort.append(last_req)
             if last_req.beam_group is not None:
-                free_member_rows(
-                    last_req.beam_group,
-                    kv_storage_of(
-                        self.req_to_token_pool, self.token_to_kv_pool_allocator
-                    ),
+                free_beam_member_rows(
+                    last_req, self.req_to_token_pool, self.token_to_kv_pool_allocator
                 )
             self.release_req(last_idx, 0, request_retirer, offload_kv=False)
             logger.warning(
@@ -3478,67 +3542,68 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             extend_num_tokens=self.extend_num_tokens,
         )
 
-    def _swa_eviction_trigger(self, sliding_window_size: int, eviction_interval: int):
-        """Pick this forward's per-request SWA eviction trigger.
+    def _window_eviction_trigger(self, eviction_interval: int):
+        """Pick this forward's per-request window eviction trigger, and the
+        interval each window then checks its own cursor against.
 
-        Default: evict only once >= eviction_interval tokens have slid out of
-        the window, amortizing eviction work while keeping each request's
-        overshoot within the interval the pool budget reserves. Gating on
-        accumulated tokens rather than an iteration-counter phase cannot
-        starve, because seqlen progress is monotonic per KV handle.
+        Default: a window evicts only once >= eviction_interval tokens have
+        slid out of it, amortizing eviction work while keeping each request's
+        overshoot within the interval the pool budget reserves; every window
+        gates on its own cursor. Gating on accumulated tokens rather than an
+        iteration-counter phase cannot starve, because seqlen progress is
+        monotonic per KV handle.
 
         Aiter MegaMoE DSV4 keeps the older forward-interval cadence instead:
         per-request token gating synchronizes SWA pressure across DP ranks and
         triggers a retraction / re-prefill storm at high concurrency.
         """
-        if _is_hip:
-            from sglang.srt.layers.moe.utils import get_moe_a2a_backend
-
-            if get_moe_a2a_backend().is_megamoe():
-                due_this_forward = (self.forward_iter or 0) % eviction_interval == 0
-                return lambda req: due_this_forward
-        return lambda req: (
-            req.seqlen - 1 - sliding_window_size
-            >= req.kv.get_evicted_seqlen(ComponentType.SWA) + eviction_interval
-        )
+        if windows_retire_by_forward():
+            due_this_forward = (self.forward_iter or 0) % eviction_interval == 0
+            return (lambda req: due_this_forward), 1
+        windows = self.tree_cache.window_lengths()
+        return (
+            lambda req: any(
+                req.seqlen - 1 - window
+                >= req.kv.get_evicted_seqlen(sub_pool) + eviction_interval
+                for sub_pool, window in windows
+            )
+        ), eviction_interval
 
     def maybe_evict_swa(self):
         if self.tree_cache.supports_swa():
             retain_window = self.tree_cache.swa_retain_window
-            # Auxiliary windows check their own cursors and prefix locks.
-            has_auxiliary_swa = self.tree_cache.supports_auxiliary_swa()
+            # With several windows each checks its own cursors and prefix locks.
+            several_windows = len(self.tree_cache.window_sub_pools()) > 1
 
             release_leaf_lock = envs.SGLANG_OPT_RELEASE_PREFILL_SWA.get() and hasattr(
                 self.tree_cache, "release_swa_prefix_lock"
             )
 
             eviction_interval = max(1, envs.SGLANG_SWA_EVICTION_INTERVAL.get())
-            swa_evict_due = self._swa_eviction_trigger(retain_window, eviction_interval)
+            window_evict_due, window_interval = self._window_eviction_trigger(
+                eviction_interval
+            )
             self.token_to_kv_pool_allocator.free_group_begin()
             for idx, req in enumerate(self.reqs):
                 if self.forward_mode.is_decode():
                     # In overlap scheduler, we cannot evict swa when
                     # req.decode_batch_idx == 0 since the prev extend batch is
-                    # still running. `_swa_eviction_trigger` owns the rest.
+                    # still running. `_window_eviction_trigger` owns the rest.
                     if (
                         req.decode_batch_idx >= 1
                         and req.kv.holds_kv
-                        and (has_auxiliary_swa or swa_evict_due(req))
+                        and window_evict_due(req)
                     ):
-                        # The scheduler already gated the primary window,
-                        # including backends that use a forward-based cadence.
+                        # Each window rechecks its own cursor against
+                        # ``window_interval``.
                         self._evict_swa(
-                            req,
-                            req.seqlen - 1,
-                            eviction_interval=(
-                                eviction_interval if has_auxiliary_swa else 1
-                            ),
+                            req, req.seqlen - 1, eviction_interval=window_interval
                         )
 
                     # Past the retain window the request no longer reads its prefill's
                     # SWA; release that part of the tree lock so SWA LRU can reclaim it.
                     if release_leaf_lock and (
-                        has_auxiliary_swa or req.decode_batch_idx >= retain_window
+                        several_windows or req.decode_batch_idx >= retain_window
                     ):
                         self.tree_cache.release_swa_prefix_lock(req)
                 elif (

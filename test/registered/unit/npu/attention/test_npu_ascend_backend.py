@@ -23,6 +23,8 @@ for _ in (
     "sgl_kernel_npu",
     "sgl_kernel_npu.attention",
     "sgl_kernel_npu.attention.sinks_attention",
+    "sgl_kernel_npu.operators",
+    "sgl_kernel_npu.operators.attention",
     "sglang.srt.speculative",
     "sglang.srt.speculative.decoupled_spec_io",
     "sglang.srt.speculative.spec_info",
@@ -699,10 +701,12 @@ class TestMlaPrefixCacheDcp(unittest.TestCase):
         cycles = (int(seq_lens.max()) + stride - 1) // stride
         mapping = torch.arange(3 * cycles * stride).reshape(3, -1)
         backend = AscendAttnBackend.__new__(AscendAttnBackend)
+        backend.use_quant_flash_attn = False
         backend.device = torch.device("cpu")
         backend.use_mla = True
         backend.use_dsa = False
         backend.dcp_size, backend.dcp_rank = size, rank
+        backend.use_flash_mla = backend.use_paged_mtp = False
         backend.dense_mla_dcp_target = size > 1
         backend.dsa_dcp_target = False
         backend.is_hybrid_swa = False
