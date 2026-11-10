@@ -232,16 +232,3 @@ class DFlashDraftKVRing:
             [self.min_pos.nbytes],
             [self.min_pos.element_size()],
         )
-
-
-_active_ring: Optional[DFlashDraftKVRing] = None
-
-
-def set_draft_kv_ring(ring: Optional[DFlashDraftKVRing]) -> None:
-    global _active_ring
-    _active_ring = ring
-
-
-def get_draft_kv_ring() -> Optional[DFlashDraftKVRing]:
-    """This process's draft KV ring, for PD state registration and payloads."""
-    return _active_ring

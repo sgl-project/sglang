@@ -52,6 +52,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.kv.storage import KVStorage
     from sglang.srt.mem_cache.static_kv_storage import StaticKVStorage
+    from sglang.srt.speculative.dflash_draft_ring import DFlashDraftKVRing
 
 logger = logging.getLogger(__name__)
 
@@ -1790,6 +1791,7 @@ def setup_state_kv_args(
     draft_token_to_kv_pool=None,
     total_kv_layers: Optional[int] = None,
     window_tails: Optional[Dict[str, int]] = None,
+    draft_kv_ring: Optional[DFlashDraftKVRing] = None,
 ) -> None:
     """Register the storage's state entries in its wire order, and the flags
     peers read from its token KV layout. ``window_tails`` gives the tail each
@@ -1862,7 +1864,7 @@ def setup_state_kv_args(
             if draft_token_to_kv_pool is not None
             else 0
         )
-    _append_draft_kv_ring_state(kv_args)
+    _append_draft_kv_ring_state(kv_args, draft_kv_ring)
 
 
 def _token_kv_view(token_to_kv_pool):
@@ -1872,14 +1874,14 @@ def _token_kv_view(token_to_kv_pool):
     return token_to_kv_pool.layer_router.wrapped_view() or token_to_kv_pool
 
 
-def _append_draft_kv_ring_state(kv_args: KVArgs) -> None:
+def _append_draft_kv_ring_state(
+    kv_args: KVArgs, ring: Optional[DFlashDraftKVRing]
+) -> None:
     """A DFLASH draft KV ring ships its last window and its floor, last on both
     sides so the component order matches. A PP stage without the draft keeps
     empty slots and sends nothing for them."""
     from sglang.srt.disaggregation.base.conn import StateType
-    from sglang.srt.speculative.dflash_draft_ring import get_draft_kv_ring
 
-    ring = get_draft_kv_ring()
     if ring is not None:
         append_state_component(kv_args, StateType.DRAFT_RING, *ring.ring_buf_infos())
         append_state_component(kv_args, StateType.REQUEST_ROW, *ring.floor_buf_infos())

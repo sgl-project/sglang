@@ -170,7 +170,6 @@ from sglang.srt.runtime_context import (
     get_memory,
     get_parallel,
 )
-from sglang.srt.speculative.dflash_draft_ring import get_draft_kv_ring
 from sglang.srt.utils import ceil_align, is_npu, rank_consensus_checker
 from sglang.srt.utils.device import async_h2d
 from sglang.srt.utils.network import NetworkAddress
@@ -185,6 +184,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.managers.scheduler import Scheduler
     from sglang.srt.mem_cache.kv.storage import KVStorage
+    from sglang.srt.speculative.dflash_draft_ring import DFlashDraftKVRing
 
 CLIP_MAX_NEW_TOKEN = envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.get()
 
@@ -488,12 +488,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         max_total_num_tokens: int,
         num_reserved_decode_tokens: int,
         transfer_backend: TransferBackend,
+        draft_kv_ring: Optional[DFlashDraftKVRing] = None,
     ):
         parallel = get_parallel()
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.token_to_kv_pool = token_to_kv_pool_allocator.get_kvcache()
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
+        self.draft_kv_ring = draft_kv_ring
         self.is_mla_backend = is_mla_backend(self.token_to_kv_pool)
         self.metadata_buffers = metadata_buffers
         self.req_to_metadata_buffer_idx_allocator = req_to_metadata_buffer_idx_allocator
@@ -913,6 +915,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.draft_token_to_kv_pool,
             total_kv_layers=self.scheduler.model_config.num_hidden_layers,
             window_tails=storage.retained_window_lengths(),
+            draft_kv_ring=self.draft_kv_ring,
         )
         if get_disagg().disaggregation_decode_host_receive_threshold < 1:
             pool = self.token_to_kv_pool
@@ -2231,7 +2234,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
 
         def _draft_ring_payload():
-            ring = get_draft_kv_ring()
+            ring = self.draft_kv_ring
             if ring is None:
                 return None
             ring.reset_floor(int(decode_req.req.kv.req_pool_idx), seq_len)
