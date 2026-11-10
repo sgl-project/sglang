@@ -1844,6 +1844,12 @@ class InklingForConditionalGenerationMTP(nn.Module):
             hidden_states_before_norm=hidden_states_before_norm,
         )
 
+    @staticmethod
+    def sliding_layer_window_size(config) -> Optional[int]:
+        """A banded depth's window, one less than its extent; only banded depths
+        (``mtp_local_layer_ids``) have window layers."""
+        return config.text_config.mtp_local_extent - 1
+
     def get_attention_sliding_window_size(self) -> Optional[int]:
         """The trunk's convention (`InklingForConditionalGeneration`): the
         backend window is one less than the extent, so the head reads back
@@ -1851,7 +1857,7 @@ class InklingForConditionalGenerationMTP(nn.Module):
         its own extent, every other depth at the trunk's window."""
         text_config = self.text_config
         if self.draft_model_idx in text_config.mtp_local_layer_ids:
-            return text_config.mtp_local_extent - 1
+            return self.sliding_layer_window_size(self.config)
         return text_config.sliding_window_size - 1
 
     def get_embed_and_head(self):
