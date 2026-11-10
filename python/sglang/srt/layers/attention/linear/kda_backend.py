@@ -4,9 +4,6 @@ from typing import Optional, Tuple, Union
 import torch
 
 from sglang.kernels.ops.attention import kda_fused_decode
-from sglang.kernels.ops.attention.linear.fused_kda_conv_tree_transform import (
-    fused_kda_conv_tree_transform,
-)
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
     causal_conv1d_update,
@@ -1503,6 +1500,10 @@ class KDAAttnBackend(MambaAttnBackendBase):
             and layer.head_k_dim == 128
         )
         if use_fused_tree_conv:
+            from sglang.kernels.ops.attention.linear.fused_kda_conv_tree_transform import (
+                fused_kda_conv_tree_transform,
+            )
+
             tree_transforms = (
                 self.kernel_dispatcher.triton_kernel.get_tree_transform_scratch(
                     mixed_qkv_reshaped.device,
