@@ -397,9 +397,8 @@ class TestEvenMoERuntimeContext(unittest.TestCase):
         context.resources.expert_distribution_recorder.on_select_experts.assert_called_once_with(
             topk_ids=output.recorded_physical_topk_ids
         )
-        context.resources.experts_capturer.capture.assert_called_once_with(
-            layer_id=3, topk_indices=output.recorded_physical_topk_ids
-        )
+        # Routed-experts capture keeps logical ids and runs in TopK instead.
+        context.resources.experts_capturer.capture.assert_not_called()
         self.assertIs(result.topk_ids, output.topk_ids)
         self.assertIs(result.topk_weights, output.topk_weights)
         self.assertIs(result.router_logits, output.router_logits)

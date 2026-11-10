@@ -134,9 +134,7 @@ def test_routing_glue_refreshes_placement_before_routing():
 
 @pytest.mark.parametrize("empty", [False, True])
 def test_current_batch_refresh_includes_idle_rank_and_commits_before_routing(empty):
-    from evenmoe.policies.l1 import RefreshGate
-
-    from sglang.srt.eplb.eplb_manager import EPLBManager
+    from sglang.srt.eplb.layer_refresh import LayerPlacementRefresher
 
     context = get_context()
     live = metadata([torch.ones(2, 2), torch.ones(2, 2)])
@@ -176,15 +174,12 @@ def test_current_batch_refresh_includes_idle_rank_and_commits_before_routing(emp
         events.append("move")
 
     updater.update_layer.side_effect = move
-    manager = object.__new__(EPLBManager)
-    manager._refresh_gate = RefreshGate(2)
-    manager._rebalance_disabled_reason = None
-    manager._moe_load_balancer = mlb
-    manager._get_expert_location_updater = lambda: updater
-    manager._get_model = lambda: SimpleNamespace(
-        routed_experts_weights_of_layer={1: []}
+    manager = LayerPlacementRefresher(
+        moe_load_balancer=mlb,
+        get_model=lambda: SimpleNamespace(routed_experts_weights_of_layer={1: []}),
+        get_expert_location_updater=lambda: updater,
+        refresh_interval=2,
     )
-    manager._ps = SimpleNamespace(tp_rank=0)
     manager._forward_batch = SimpleNamespace(
         global_forward_mode=SimpleNamespace(
             is_decode=lambda: False, is_idle=lambda: False
@@ -271,20 +266,22 @@ def refresh_batch(non_padded=None, dp_counts=None, decode=False):
 
 
 def test_refresh_decision_bootstraps_then_waits_for_representative_batches():
-    from evenmoe.policies.l1 import RefreshGate
+    from sglang.srt.eplb.layer_refresh import LayerPlacementRefresher
 
-    from sglang.srt.eplb.eplb_manager import EPLBManager
-
-    manager = object.__new__(EPLBManager)
-    manager._refresh_gate = RefreshGate(2)
-    manager._rebalance_disabled_reason = None
+    manager = LayerPlacementRefresher(
+        moe_load_balancer=None,
+        get_model=None,
+        get_expert_location_updater=None,
+        refresh_interval=2,
+    )
 
     def decide(batch):
-        manager._forward_batch = batch
-        return manager._should_refresh_layer(0)
+        with manager.forward_scope(batch):
+            return manager._should_refresh_layer(0)
 
     with patch("torch.cuda.is_current_stream_capturing", return_value=False):
         assert not decide(None)  # ModelRunner published no batch
+        assert manager._forward_batch is None  # the scope always clears it
         assert not decide(refresh_batch(1024, decode=True))  # decode never counts
         assert manager._refresh_gate._batches_since_refresh == {}
         assert decide(refresh_batch(100))  # the first call always bootstraps
@@ -419,39 +416,46 @@ def test_initial_layout_comes_from_the_placement_policy(algorithm):
     common = dict(
         ep_size=2,
         model_config_for_expert_location=SimpleNamespace(
-            num_layers=2, num_logical_experts=4
+            num_layers=1, num_logical_experts=4
         ),
+    )
+    moe = SimpleNamespace(ep_num_redundant_experts=2, ep_join_mode=None)
+    context = SimpleNamespace(
+        resources=SimpleNamespace(
+            mlb_model_info={"num_logical_experts": 4, "num_groups": None}
+        ),
+        parallel=SimpleNamespace(ep_size=2, nnodes=1, elastic_ep_initial_size=None),
+        config_bag=lambda name: SimpleNamespace(moe=moe),
     )
     with (
         get_context().override_server_args(
-            init_expert_location="trivial",
-            tp_size=2,
-            ep_size=2,
-            ep_num_redundant_experts=2,
-        ),
-        get_context().resources.override(
-            mlb_model_info={"num_logical_experts": 4, "num_groups": 1}
+            init_expert_location="trivial", device="cpu"
         ),
         patch.object(ExpertLocationMetadata, "_init_common", return_value=common),
-        patch.object(ExpertLocationMetadata, "init_by_mapping") as initialize,
+        patch("sglang.srt.runtime_context.get_context", return_value=context),
+        patch.object(ExpertLocationMetadata, "_init_raw") as initialize,
         patch.object(ExpertLocationMetadata, "init_trivial") as trivial,
     ):
         compute_initial_expert_location_metadata(object(), 0, mlb)
-    if algorithm == "ultraep":
-        trivial.assert_not_called()
-        layout = initialize.call_args.kwargs["physical_to_logical_map"]
-        assert layout.tolist() == [[0, 1, 0, 2, 3, 2]] * 2
-    else:
+    if algorithm != "ultraep":
         initialize.assert_not_called()
         trivial.assert_called_once()
+        return
+    trivial.assert_not_called()
+    kwargs = initialize.call_args.kwargs
+    # Each rank's masters, then its redundant slots filled with its own masters:
+    # the layout SGLang hand-built before EvenMoE owned it.
+    assert kwargs["physical_to_logical_map"].tolist() == [[0, 1, 0, 2, 3, 2]]
+    # Every replica is listed, master first, as a later plan publishes them.
+    assert kwargs["logical_to_all_physical_map"][0, :, 0].tolist() == [0, 1, 3, 4]
+    # Any routing state the policy publishes up front is committed on device.
+    for state in kwargs["mlb_routing_metadata"].values():
+        assert all(value.device.type == "cpu" for value in state.values())
 
 
 @pytest.mark.parametrize(
     "overrides, message",
     [
-        ({"ep_num_redundant_experts": 0}, "redundant"),
-        ({"ep_num_redundant_experts": 3}, "split evenly across EP ranks"),
-        ({"ep_size": 1}, "more than one rank"),
         ({"pp_size": 2}, "PP=1"),
         ({"enable_eplb": False}, "recorded placement"),
         ({"disable_cuda_graph": False}, "disable-cuda-graph"),
@@ -483,6 +487,37 @@ def test_unsupported_coupled_configuration_fails_early(overrides, message):
     ):
         with pytest.raises(ValueError, match=message):
             handle_moe_load_balancer(object())
+
+
+@pytest.mark.parametrize("per_layer", [False, True])
+def test_per_layer_refresh_replaces_the_periodic_rebalance(per_layer):
+    from sglang.srt.eplb.layer_refresh import LayerPlacementRefresher
+    from sglang.srt.model_executor import model_runner as model_runner_module
+
+    runner = object.__new__(model_runner_module.ModelRunner)
+    runner.is_draft_worker = False
+    runner.model_config = object()
+    runner.moe_load_balancer = SimpleNamespace(
+        placement_policy="ultraep" if per_layer else None
+    )
+    context = get_context()
+    with (
+        context.override_server_args(enable_eplb=True),
+        context.resources.override(mlb_placement_refresh=None),
+        patch.object(model_runner_module, "EPLBManager") as manager_cls,
+    ):
+        runner.maybe_init_eplb_manager()
+        refresh = context.resources.mlb_placement_refresh
+    if per_layer:
+        # No periodic rebalance runs, so no EPLBManager starts the recorder.
+        manager_cls.assert_not_called()
+        assert runner.eplb_manager is None
+        assert isinstance(runner.layer_placement_refresher, LayerPlacementRefresher)
+        assert refresh == runner.layer_placement_refresher.refresh_layer
+    else:
+        assert runner.eplb_manager is manager_cls.return_value
+        assert runner.layer_placement_refresher is None
+        assert refresh is None
 
 
 if __name__ == "__main__":

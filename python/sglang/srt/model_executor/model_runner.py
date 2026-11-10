@@ -839,8 +839,14 @@ class ModelRunner:
         )
 
     def maybe_init_eplb_manager(self):
-        self.eplb_manager = (
-            EPLBManager(
+        from sglang.srt.eplb.moe_load_balancer_glue import refreshes_placement_per_layer
+
+        self.eplb_manager = None
+        self.layer_placement_refresher = None
+        if not get_exec().moe.enable_eplb or self.is_draft_worker:
+            return
+        if not refreshes_placement_per_layer(self.moe_load_balancer):
+            self.eplb_manager = EPLBManager(
                 model_config=self.model_config,
                 get_model=lambda: self.model,
                 get_expert_location_updater=lambda: self.expert_location_updater,
@@ -848,13 +854,20 @@ class ModelRunner:
                 get_weight_updater=lambda: self.weight_updater,
                 moe_load_balancer=self.moe_load_balancer,
             )
-            if get_exec().moe.enable_eplb and (not self.is_draft_worker)
-            else None
+            return
+        # Per-layer refresh replaces the periodic whole-model rebalance;
+        # statistics are recorded only when explicitly requested.
+        from sglang.srt.eplb.layer_refresh import LayerPlacementRefresher
+
+        self.layer_placement_refresher = LayerPlacementRefresher(
+            moe_load_balancer=self.moe_load_balancer,
+            get_model=lambda: self.model,
+            get_expert_location_updater=lambda: self.expert_location_updater,
+            refresh_interval=get_exec().moe.eplb_rebalance_num_iterations,
         )
-        if self.eplb_manager is not None and self.eplb_manager.refreshes_per_layer:
-            get_context().resources.mlb_placement_refresh = (
-                self.eplb_manager.refresh_layer
-            )
+        get_context().resources.mlb_placement_refresh = (
+            self.layer_placement_refresher.refresh_layer
+        )
 
     def maybe_init_elastic_ep(self):
         if get_exec().moe.elastic_ep_backend:
@@ -1911,16 +1924,21 @@ class ModelRunner:
             else contextlib.nullcontext()
         )
 
+        refresh_ctx = (
+            self.layer_placement_refresher.forward_scope(forward_batch)
+            if self.layer_placement_refresher is not None
+            else contextlib.nullcontext()
+        )
+
         with (
             canary_ctx,
             step_span_ctx,
+            refresh_ctx,
             get_global_expert_distribution_recorder().with_forward_pass(
                 self.forward_pass_id,
                 forward_batch,
             ) as recorder_outputs,
         ):
-            if self.eplb_manager is not None:
-                self.eplb_manager.on_forward_pass_start(forward_batch)
             output = self._forward_raw(forward_batch, pp_proxy_tensors)
             if self.enable_elastic_ep:
                 output = self._maybe_rebalance_after_rank_fault(

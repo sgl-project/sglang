@@ -143,6 +143,8 @@ class HashTopK(nn.Module):
                 shared_experts=self.shared_experts,
                 routed_scaling_factor=self.routed_scaling_factor,
                 apply_routed_scaling_factor_on_output=self.apply_routed_scaling_factor_on_output,
+                # HashTopK's native path does not capture routed experts either.
+                allow_routed_experts_capture=False,
             ),
             router_logits=topk_output.router_logits,
             layer_id=self.layer_id,

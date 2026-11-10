@@ -49,6 +49,7 @@ def handle_moe_load_balancer(server_args: Any):
     cfg = resolving_view(server_args)
     from sglang.srt.eplb.moe_load_balancer_glue import (
         get_moe_load_balancer_pipeline,
+        refreshes_placement_per_layer,
         uses_coupled_placement,
     )
 
@@ -75,41 +76,31 @@ def handle_moe_load_balancer(server_args: Any):
                 "The selected EvenMoE pipeline changes routing buffers after placement updates; "
                 "--enable-eplb requires --disable-cuda-graph."
             )
+        if refreshes_placement_per_layer(pipeline):
+            _check_layer_refresh(cfg)
         if uses_coupled_placement(pipeline):
-            _check_coupled_placement(cfg, pipeline)
+            _check_coupled_placement(cfg)
         declare_resolution(server_args, "_handle_moe_load_balancer", **resolutions)
 
 
-def _check_coupled_placement(cfg: Any, pipeline: Any) -> None:
-    """A coupled placement policy re-plans layers online from live traffic."""
-    from evenmoe import ExpertDeploymentConfig
-
-    # The policy's own layout rules (EP size, redundant slots per rank), checked
-    # here on the server arguments so they fail before any process launches.
-    # Shared-expert dispatch is not known until the model is resolved;
-    # resolve_shared_experts_config checks the full deployment then.
-    reason = pipeline.is_applicable(
-        ExpertDeploymentConfig(
-            num_redundant_experts=cfg.ep_num_redundant_experts,
-            routes_shared_expert=True,
-            carries_placement_metadata=True,
-            ep_size=cfg.ep_size,
-        )
-    )
-    if reason is not None:
-        raise ValueError(reason)
+def _check_layer_refresh(cfg: Any) -> None:
+    """SGLang limits for per-layer placement refresh, which moves one layer's
+    expert weights inside the forward."""
     if cfg.elastic_ep_backend is not None or cfg.pp_size != 1:
         raise ValueError(
-            "Coupled EvenMoE placement requires a fixed EP group and PP=1."
+            "Per-layer EvenMoE placement refresh requires a fixed EP group and PP=1."
         )
+
+
+def _check_coupled_placement(cfg: Any) -> None:
+    """Coupled routing needs its placement's routing state, which only a recorded
+    plan or an online refresh provides. The policy's own layout preconditions
+    are checked by EvenMoE at model load, as for every other pipeline."""
     if not cfg.enable_eplb and cfg.init_expert_location == "trivial":
         raise ValueError(
             "Coupled EvenMoE placement requires --enable-eplb or recorded placement statistics."
         )
-    if cfg.enable_eplb and not cfg.disable_cuda_graph:
-        raise ValueError(
-            "Online coupled EvenMoE placement currently requires --disable-cuda-graph."
-        )
+    # Its placement policy plans from each source rank's own counts.
     if cfg.expert_distribution_recorder_mode not in (None, "stat"):
         raise ValueError("Coupled EvenMoE placement requires the stat expert recorder.")
 

@@ -110,6 +110,37 @@ class TestRoutingBoundary(CustomTestCase):
                     route.call_args.kwargs["topk_output"].topk_ids.shape, (0, 2)
                 )
 
+    def test_routed_experts_capture_keeps_logical_ids_under_balancer(self):
+        class Capture:
+            def __init__(self):
+                self.ids = None
+
+            def capture(self, *, layer_id, topk_indices):
+                self.ids = topk_indices.clone()
+
+        logical = torch.tensor([[1, 3], [0, 2]], dtype=torch.int32)
+        weights = torch.tensor([[0.5, 0.5], [0.25, 0.75]])
+        physical = StandardTopKOutput(weights, logical + 8, None)
+        capture = Capture()
+        with (
+            get_context().resources.override(experts_capturer=capture),
+            patch(
+                "sglang.srt.eplb.moe_load_balancer_glue.route_topk_with_mlb",
+                return_value=physical,
+            ),
+        ):
+            ids, _, _ = topk_module._post_process_topk_ids(
+                topk_ids=logical.clone(),
+                topk_weights=weights.clone(),
+                topk_config=TopKConfig(top_k=2),
+                router_logits=torch.zeros((2, 4)),
+                layer_id=0,
+                moe_load_balancer=object(),
+            )
+        # Users get the model's logical experts; dispatch uses the physical ids.
+        self.assertEqual(capture.ids.tolist(), logical.tolist())
+        self.assertEqual(ids.tolist(), (logical + 8).tolist())
+
     def test_routing_router_requires_published_balancer(self):
         pipeline = SimpleNamespace(
             capabilities=SimpleNamespace(requires_post_topk_routing=True)
@@ -159,6 +190,48 @@ class TestRoutingBoundary(CustomTestCase):
                     )
                 else:
                     with self.assertRaises(ValueError):
+                        resolve_shared_experts_config(_SharedModel, config, None)
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("evenmoe"), "evenmoe is not installed"
+    )
+    def test_model_load_checks_the_policy_layout_preconditions(self):
+        from evenmoe import RoutingPipeline
+
+        cases = (
+            # (num_logical_experts, ep_size, num_redundant_experts, error)
+            (4, 2, 2, None),
+            (5, 2, 2, "split evenly"),
+            (4, 2, 3, "split evenly"),
+            (4, 2, 0, "redundant"),
+            (4, 1, 1, "more than one rank"),
+        )
+        context = get_context()
+        for num_logical_experts, ep_size, num_redundant, error in cases:
+            with (
+                self.subTest(
+                    num_logical_experts=num_logical_experts,
+                    ep_size=ep_size,
+                    num_redundant=num_redundant,
+                ),
+                context.override_server_args(
+                    tp_size=ep_size,
+                    ep_size=ep_size,
+                    ep_num_redundant_experts=num_redundant,
+                ),
+                context.resources.override(
+                    mlb_model_info={"num_logical_experts": num_logical_experts}
+                ),
+                patch(
+                    "sglang.srt.eplb.moe_load_balancer_glue.get_configured_moe_load_balancer_pipeline",
+                    return_value=RoutingPipeline.from_value("ultraep"),
+                ),
+            ):
+                config = SimpleNamespace(disable_reason=None, shared_count=0)
+                if error is None:
+                    resolve_shared_experts_config(_SharedModel, config, None)
+                else:
+                    with self.assertRaisesRegex(ValueError, error):
                         resolve_shared_experts_config(_SharedModel, config, None)
 
     def test_unconfigured_path_and_draft_do_not_import_evenmoe(self):

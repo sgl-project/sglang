@@ -914,7 +914,8 @@ def compute_initial_expert_location_metadata(
 
 def _init_policy_layout(model_config: ModelConfig, moe_ep_rank: int, moe_load_balancer):
     """The configured EvenMoE placement policy's layout before any traffic, or
-    None when the policy has none of its own."""
+    None when the policy has none of its own. Built raw so the policy's routing
+    state (UltraEP's quotas) is committed with it."""
     common = ExpertLocationMetadata._init_common(model_config)
     if common is None:
         return None
@@ -929,10 +930,17 @@ def _init_policy_layout(model_config: ModelConfig, moe_ep_rank: int, moe_load_ba
     )
     if maps is None:
         return None
-    return ExpertLocationMetadata.init_by_mapping(
-        model_config,
-        physical_to_logical_map=maps.physical_to_logical_map,
+    device = get_device().device
+    return ExpertLocationMetadata._init_raw(
+        ep_size=common["ep_size"],
+        physical_to_logical_map=maps.physical_to_logical_map.to(device),
+        logical_to_all_physical_map=maps.logical_to_all_physical_map.to(device),
         moe_ep_rank=moe_ep_rank,
+        # Routing reads the policy's state on device.
+        mlb_routing_metadata={
+            layer_id: {name: value.to(device) for name, value in state.items()}
+            for layer_id, state in maps.routing_metadata.items()
+        },
     )
 
 

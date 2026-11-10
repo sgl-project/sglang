@@ -45,8 +45,8 @@ def route_topk_with_mlb(
 
     ``topk_output`` holds logical expert ids straight from the router; the
     returned output holds physical ids (and the fused shared-expert slot when
-    the pipeline routes it) and has been recorded for EPLB statistics and
-    routed-experts capture.
+    the pipeline routes it) and has been recorded for EPLB statistics. Routed-
+    experts capture keeps the logical ids and runs in TopK before this call.
     """
 
     from evenmoe.adapters.sglang import (
@@ -59,7 +59,7 @@ def route_topk_with_mlb(
     context = get_context()
     refresh = context.resources.mlb_placement_refresh
     if refresh is not None:
-        # Coupled placement re-plans this layer from the current batch and
+        # Per-layer refresh re-plans this layer from the current batch and
         # commits it before routing reads the placement.
         refresh(layer_id, topk_output.topk_ids)
     request = to_routing_request(
@@ -80,15 +80,10 @@ def route_topk_with_mlb(
         router_logits=topk_output.router_logits,
         routed_scaling_factor=routed_scaling_factor,
     )
-    resources = context.resources
     # With a balancer, physical ids are recorded here rather than in TopK.
-    resources.expert_distribution_recorder.on_select_experts(
+    context.resources.expert_distribution_recorder.on_select_experts(
         topk_ids=output.recorded_physical_topk_ids
     )
-    if resources.experts_capturer is not None:
-        resources.experts_capturer.capture(
-            layer_id=layer_id, topk_indices=output.recorded_physical_topk_ids
-        )
     return StandardTopKOutput(
         topk_weights=output.topk_weights,
         topk_ids=output.topk_ids,
@@ -144,17 +139,27 @@ def get_moe_load_balancer_pipeline(algorithm):
 
 
 def uses_coupled_placement(pipeline_or_balancer) -> bool:
-    """Whether the routing pipeline brings its own placement policy (today: UltraEP).
+    """Whether routing is coupled to its own placement policy (today: UltraEP).
 
-    Its placement also produces routing state (a per-source-rank quota), is
-    re-planned per layer from live traffic using per-rank statistics, and keeps
-    each rank's master experts fixed. Accepts a RoutingPipeline or the
-    MoELoadBalancer built from it.
+    Routing consumes state that placement produces (a per-source-rank quota), so
+    the two run as a pair, and the layout keeps each rank's master experts
+    fixed. Accepts a RoutingPipeline or the MoELoadBalancer built from it.
     """
     return (
         pipeline_or_balancer is not None
         and pipeline_or_balancer.placement_policy is not None
     )
+
+
+def refreshes_placement_per_layer(pipeline_or_balancer) -> bool:
+    """Whether ``--enable-eplb`` re-plans placement one layer at a time inside
+    the forward (``eplb.layer_refresh``) instead of the periodic whole-model
+    rebalance (``EPLBManager``).
+
+    A different question from coupling, though today the same pipelines answer
+    yes: only UltraEP refreshes per layer, and EvenMoE does not declare it apart.
+    """
+    return uses_coupled_placement(pipeline_or_balancer)
 
 
 def resolve_pipeline_a2a_backend(pipeline, moe_a2a_backend: str) -> str:

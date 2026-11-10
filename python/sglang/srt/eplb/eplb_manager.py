@@ -28,13 +28,6 @@ logger = logging.getLogger(__name__)
 
 
 class EPLBManager:
-    # A coupled placement policy (the L2 expression names its L1 half, e.g.
-    # ultraep) re-plans each layer from the batch it is about to route, every
-    # `eplb_rebalance_num_iterations` representative batches, instead of the
-    # periodic whole-model rebalance.
-    refreshes_per_layer = False
-    _forward_batch = None
-
     def __init__(
         self,
         *,
@@ -61,14 +54,6 @@ class EPLBManager:
         self._rebalance_num_iterations = get_exec().moe.eplb_rebalance_num_iterations
         self._rebalance_disabled_reason = None
         self._rebalance_disabled_logged = False
-        from sglang.srt.eplb.moe_load_balancer_glue import uses_coupled_placement
-
-        self.refreshes_per_layer = uses_coupled_placement(moe_load_balancer)
-        self._refresh_gate = None
-        if self.refreshes_per_layer:
-            from evenmoe.policies.l1 import RefreshGate
-
-            self._refresh_gate = RefreshGate(self._rebalance_num_iterations)
 
         # Otherwise, the circular buffer will contain stale data. If the case is needed, it can be implemented.
         assert (
@@ -87,78 +72,8 @@ class EPLBManager:
 
         self._main_generator = self._entrypoint()
 
-    def on_forward_pass_start(self, forward_batch):
-        self._forward_batch = forward_batch
-
     def on_forward_pass_end(self):
-        self._forward_batch = None
-        if not self.refreshes_per_layer:
-            next(self._main_generator)
-
-    def refresh_layer(self, layer_id, logical_topk_ids):
-        """Re-plan one layer from its current TopK and commit weights + placement
-        before that layer dispatches."""
-        if not self._should_refresh_layer(layer_id):
-            return
-
-        from evenmoe.adapters.sglang import commit_placement, plan_layer_from_topk
-
-        # EvenMoE counts this rank's TopK, combines the counts over the EP group
-        # and plans this single layer. The maps hold one layer; their routing
-        # metadata is already keyed by layer_id.
-        maps = plan_layer_from_topk(
-            self._moe_load_balancer, get_context(), layer_id, logical_topk_ids
-        )
-        layer_metadata = ExpertLocationMetadata._init_raw(
-            ep_size=get_global_expert_location_metadata().ep_size,
-            physical_to_logical_map=maps.physical_to_logical_map,
-            logical_to_all_physical_map=maps.logical_to_all_physical_map,
-            mlb_routing_metadata=maps.routing_metadata,
-        )
-        # Move this layer's expert weights against the still-live placement.
-        self._get_expert_location_updater().update_layer(
-            self._get_model().routed_experts_weights_of_layer[layer_id],
-            layer_metadata,
-            layer_id,
-            nnodes=get_parallel().nnodes,
-            rank=get_parallel().tp_rank,
-        )
-        # Publish the new placement so this layer's routing reads it.
-        commit_placement(self._moe_load_balancer, get_context(), [layer_id])
-
-    def _should_refresh_layer(self, layer_id) -> bool:
-        """Whether this layer re-plans on this pass. Every EP rank must reach the
-        same answer, since the refresh runs collectives, so only global batch
-        facts decide it."""
-        # TopK does not see the batch; ModelRunner.forward published it.
-        forward_batch = self._forward_batch
-        if (
-            forward_batch is None
-            or self._rebalance_disabled_reason is not None
-            or torch.cuda.is_current_stream_capturing()
-        ):
-            return False
-        mode = forward_batch.global_forward_mode or forward_batch.forward_mode
-        # Decode-only passes (idle DP ranks included) do not count as batches.
-        if (
-            mode.is_decode() or mode.is_idle()
-        ) and not forward_batch.is_extend_in_batch:
-            return False
-        if not self._refresh_gate.is_due(layer_id):
-            return False
-        # DP batches list every rank's count (prefer the one before speculative
-        # scaling); without DP the batch's real-token count is already global.
-        counts = forward_batch.original_global_num_tokens_cpu
-        if counts is None:
-            counts = forward_batch.global_num_tokens_cpu
-        num_tokens = (
-            sum(counts)
-            if counts is not None
-            else forward_batch.global_num_token_non_padded_cpu
-        )
-        return self._refresh_gate.should_refresh(
-            layer_id, representative=num_tokens >= 512
-        )
+        next(self._main_generator)
 
     def reset_generator(self):
         self._main_generator = self._entrypoint()

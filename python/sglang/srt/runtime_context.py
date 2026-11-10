@@ -32,7 +32,7 @@ import os
 import sys
 from contextlib import contextmanager
 from enum import Enum, auto
-from typing import TYPE_CHECKING, Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
 import msgspec
 
@@ -647,9 +647,10 @@ class Resources(_FlagGroupBase):
     # The target's EvenMoE MoELoadBalancer, published by ModelRunner before it
     # builds the model so every target (Hash)TopK binds it at construction.
     moe_load_balancer: Any = None
-    # Coupled EvenMoE placement: EPLBManager.refresh_layer, run by the routing glue
-    # ahead of each layer's dispatch. None unless placement refreshes per layer.
-    mlb_placement_refresh: Any = None
+    # Per-layer placement refresh: LayerPlacementRefresher.refresh_layer(layer_id,
+    # logical_topk_ids), run by the routing glue ahead of each layer's dispatch.
+    # None unless placement refreshes per layer.
+    mlb_placement_refresh: Optional[Callable[[int, Any], None]] = None
     # Named side streams (see RuntimeContext.get_stream): name -> stream.
     streams: dict = msgspec.field(default_factory=dict)
     # Named persistent buffers (see RuntimeContext.get_buffer): name -> tensor.

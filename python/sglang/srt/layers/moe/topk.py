@@ -2662,8 +2662,9 @@ def _post_process_topk_ids(
     routed_topk_ids = (
         topk_ids[:, :-num_shared_topk_slots] if _gate_appended else topk_ids
     )
-    if moe_load_balancer is None:
-        capture_routed_experts_if_allowed(topk_config, layer_id, routed_topk_ids)
+    # Routed-experts capture returns logical ids, so it runs before any remap,
+    # including the load balancer's.
+    capture_routed_experts_if_allowed(topk_config, layer_id, routed_topk_ids)
     recorder_topk_ids = None
     _aiter_append = (
         num_shared_topk_slots > 0
