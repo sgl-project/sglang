@@ -13,7 +13,9 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import time
+from dataclasses import dataclass
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import requests
@@ -375,6 +377,66 @@ def stream_generate(
             if not data or data == "[DONE]":
                 break
             yield json.loads(data)
+
+
+@dataclass
+class StreamRequest:
+    """A streaming /generate request running in a background thread."""
+
+    thread: threading.Thread
+    events: List[Dict[str, Any]]
+    errors: List[BaseException]
+
+
+def start_stream(
+    base_url: str,
+    prompt: str,
+    *,
+    max_new_tokens: int = 128,
+    timeout: float = 300,
+) -> StreamRequest:
+    events: List[Dict[str, Any]] = []
+    errors: List[BaseException] = []
+
+    def _run():
+        try:
+            for event in stream_generate(
+                base_url,
+                prompt,
+                max_new_tokens=max_new_tokens,
+                timeout=timeout,
+            ):
+                events.append(event)
+        except Exception as exc:  # pragma: no cover - surfaced in the test
+            errors.append(exc)
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+    return StreamRequest(thread=thread, events=events, errors=errors)
+
+
+def wait_for_first_token(
+    request: StreamRequest,
+    *,
+    label: str,
+    timeout: float = 30,
+) -> None:
+    """Wait until the request decoded one token and is still running."""
+    deadline = time.time() + timeout
+    while (
+        request.thread.is_alive()
+        and not request.events
+        and not request.errors
+        and time.time() < deadline
+    ):
+        time.sleep(0.02)
+
+    if request.errors:
+        raise AssertionError(f"{label} failed before the first token: {request.errors}")
+    if not request.events:
+        raise AssertionError(f"{label} produced no token within {timeout}s")
+    if not request.thread.is_alive():
+        raise AssertionError(f"{label} finished before it could be paused")
 
 
 def generation_signature(

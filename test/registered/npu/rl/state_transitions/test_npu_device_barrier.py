@@ -7,8 +7,6 @@ race that only shows up over rounds.
 """
 
 import os
-import threading
-import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -33,8 +31,9 @@ from sglang.test.ascend.test_npu_rl_utils import (
     npu_device_count,
     npu_server,
     pause_generation,
-    stream_generate,
+    start_stream,
     update_weights_from_tensor,
+    wait_for_first_token,
 )
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -195,40 +194,15 @@ class TestNpuDeviceBarrier(CustomTestCase):
     @unittest.skipUnless(os.path.isdir(MODEL), f"model not found: {MODEL}")
     def test_02_dp_pause_returns_after_all_ranks_drain(self):
         with npu_server(MODEL, extra_args=DP_ARGS) as base_url:
-            events = [[], []]
-            errors = [[], []]
-
-            def _run(idx):
-                try:
-                    for event in stream_generate(base_url, PROMPT, max_new_tokens=384):
-                        events[idx].append(event)
-                except Exception as exc:  # pragma: no cover - surfaced in test
-                    errors[idx].append(exc)
-
-            threads = [
-                threading.Thread(target=_run, args=(idx,), daemon=True)
-                for idx in range(2)
+            requests_ = [
+                start_stream(base_url, PROMPT, max_new_tokens=384) for _ in range(2)
             ]
-            for thread in threads:
-                thread.start()
+            for idx, request in enumerate(requests_):
+                wait_for_first_token(request, label=f"DP request {idx}")
 
-            # Wait until both requests have decoded a token; aborting requests
-            # that are still queued would not drain either DP replica.
-            deadline = time.time() + 30
-            while (
-                any(not chunk for chunk in events)
-                and all(thread.is_alive() for thread in threads)
-                and time.time() < deadline
-            ):
-                time.sleep(0.02)
-
-            for idx in range(2):
-                self.assertTrue(events[idx], f"DP request {idx} never started decoding")
-                self.assertTrue(
-                    threads[idx].is_alive(), f"DP request {idx} finished early"
-                )
             dp_ranks = {
-                events[idx][0].get("meta_info", {}).get("dp_rank") for idx in range(2)
+                request.events[0].get("meta_info", {}).get("dp_rank")
+                for request in requests_
             }
             self.assertEqual(
                 dp_ranks,
@@ -237,15 +211,17 @@ class TestNpuDeviceBarrier(CustomTestCase):
             )
 
             pause_generation(base_url, mode="abort")
-            for thread in threads:
-                thread.join(timeout=60)
+            for request in requests_:
+                request.thread.join(timeout=60)
 
-            for idx in range(2):
-                self.assertFalse(errors[idx], f"DP stream {idx} failed: {errors[idx]}")
+            for idx, request in enumerate(requests_):
                 self.assertFalse(
-                    threads[idx].is_alive(), f"DP stream {idx} did not end"
+                    request.errors, f"DP stream {idx} failed: {request.errors}"
                 )
-                last = events[idx][-1]
+                self.assertFalse(
+                    request.thread.is_alive(), f"DP stream {idx} did not end"
+                )
+                last = request.events[-1]
                 finish_type = (
                     last.get("meta_info", {}).get("finish_reason", {}).get("type")
                 )
