@@ -35,11 +35,18 @@ try:
 except ImportError:  # pragma: no cover
     scipy_wavfile = None
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.configs.task_type import DataType
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import CYAN, RESET, init_logger
+from sglang.multimodal_gen.runtime.utils.png_encoder import (
+    PARALLEL_PNG_MIN_BYTES,
+    encode_png_parallel,
+    parallel_png_strip_count,
+    png_encoder_executor,
+)
 from sglang.multimodal_gen.runtime.utils.profiler import maybe_record_function
 from sglang.srt.observability.trace import TraceReqContext
 
@@ -1306,6 +1313,18 @@ def _encode_image_frame(
             frame = frame[..., 0]
         if compress_level == 0 and frame.dtype == np.uint8:
             return _encode_png_stored(frame)
+        if (
+            frame.dtype == np.uint8
+            and (frame.ndim == 2 or (frame.ndim == 3 and frame.shape[-1] in (3, 4)))
+            and frame.nbytes >= PARALLEL_PNG_MIN_BYTES
+            and not envs.SGLANG_DIFFUSION_DISABLE_PARALLEL_PNG
+        ):
+            return encode_png_parallel(
+                frame,
+                compress_level=compress_level,
+                num_strips=parallel_png_strip_count(frame),
+                executor=png_encoder_executor(),
+            )
         buffer = io.BytesIO()
         Image.fromarray(frame).save(buffer, format="PNG", compress_level=compress_level)
         return buffer.getvalue()
