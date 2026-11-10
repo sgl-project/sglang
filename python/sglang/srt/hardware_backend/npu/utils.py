@@ -6,12 +6,13 @@ from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
 
-from sglang.srt.arg_groups.model_override_base import resolving_view, use_mla_backend
+from sglang.srt.arg_groups.model_override_base import (
+    model_config_of,
+    resolving_view,
+    use_mla_backend,
+)
 from sglang.srt.arg_groups.overrides import declare_resolution
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.npu.dsa_dcp_config import (
-    validate_dsa_token_dcp_config,
-)
 from sglang.srt.model_executor.cuda_graph_config import Phase, with_phase
 from sglang.srt.utils import get_npu_memory_capacity, is_npu
 
@@ -81,8 +82,20 @@ def set_default_server_args(args: "ServerArgs"):
     Set default server arguments for NPU backend.
     """
 
-    validate_dsa_token_dcp_config(args)
     cfg = resolving_view(args)
+    if cfg.dcp_size > 1:
+        from sglang.srt.configs.model_config import is_deepseek_dsa
+
+        if is_deepseek_dsa(model_config_of(args).hf_config):
+            if cfg.enable_unified_memory:
+                raise ValueError("NPU DSA DCP requires a static KV pool.")
+            if cfg.disaggregation_mode != "null" and (
+                cfg.disaggregation_transfer_backend
+                not in ("ascend", "mooncake", "fake")
+            ):
+                raise ValueError(
+                    "NPU DSA DCP PD requires the Ascend or Mooncake transfer backend."
+                )
 
     # NPU only works with "ascend" attention backend for now
     declare_resolution(

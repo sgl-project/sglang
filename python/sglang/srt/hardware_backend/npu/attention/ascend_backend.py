@@ -30,7 +30,6 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_fia_nz,
     is_mla_preprocess_enabled,
 )
-from sglang.srt.hardware_backend.npu.dsa_dcp_config import npu_dcp_interleave_size
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     get_sparsity_driven_kv_offload_sparse_context_len,
     is_sparsity_driven_kv_offload_enabled,
@@ -345,9 +344,7 @@ class AscendAttnBackend(AttentionBackend):
         # Only DSA models (GLM-5.2, DeepSeek-V3-DSA, ...) consume the per-token DSA
         # CP metadata built by prepare_dsa_cp_metadata; V4 keeps its own variant.
         self.use_dsa = is_deepseek_dsa(model_runner.model_config.hf_config)
-        self.dcp_interleave_size = npu_dcp_interleave_size(
-            self.page_size, use_dsa=self.use_dsa
-        )
+        self.dcp_interleave_size = 1 if self.use_dsa else self.page_size
         parallel = get_parallel()
         # Draft KV remains replicated even when the target uses DCP.
         self.dcp_size = 1 if self.is_draft_worker else parallel.attn_dcp_size

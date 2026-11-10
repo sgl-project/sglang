@@ -3287,13 +3287,17 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     )
                     registration_error = None
                     adapter = getattr(self.kv_args, "dcp_transfer", None)
-                    layout_id = adapter.layout_id if adapter is not None else b""
+                    layout_id = (
+                        adapter.layout_id
+                        if adapter is not None and decode_kv_args.dst_dcp_size > 1
+                        else b""
+                    )
                     if decode_kv_args.dst_dcp_layout_id != layout_id:
                         registration_error = (
                             f"PD DCP layout mismatch: prefill={layout_id!r}, "
                             f"decode={decode_kv_args.dst_dcp_layout_id!r}"
                         )
-                    elif adapter is not None:
+                    elif adapter is not None and decode_kv_args.requires_dcp_relayout:
                         try:
                             (
                                 decode_kv_args.dcp_token_item_lens,
@@ -3610,7 +3614,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 *self.kv_args.kv_item_lens,
             ),
             b"1" if self.kv_args.draft_rows_dcp_collapsed else b"0",
-            *([adapter.layout_id] if adapter is not None else []),
+            *([adapter.layout_id] if adapter is not None and self.dcp_size > 1 else []),
         ]
 
     def build_receiver_metadata_message(

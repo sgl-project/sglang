@@ -1,11 +1,12 @@
 """Mooncake token-interleaved DSA DCP transfer on Ascend."""
 
+from dataclasses import dataclass
 from functools import partial
+from typing import Callable
 
 import numpy as np
 import torch
 
-from sglang.srt.disaggregation.base.conn import DCPTransferAdapter
 from sglang.srt.disaggregation.common.utils import group_concurrent_contiguous
 from sglang.srt.disaggregation.utils import resolve_dcp_dst_entry_indices
 from sglang.srt.utils import device_stream_context
@@ -49,8 +50,19 @@ def _pack_rows(pack_buffer, buffers, src_indices, token_widths):
 
 
 def _prepare_dsa_token_dcp(
-    kv_args, peer, *, target_buffers, pack_buffers, num_workers, register
+    kv_args,
+    peer,
+    *,
+    target_buffers,
+    supports_relayout,
+    pack_buffers,
+    num_workers,
+    register,
 ):
+    if not supports_relayout:
+        raise ValueError(
+            "NPU DSA token PD relayout requires a static row-contiguous KV pool."
+        )
     if (
         not target_buffers
         or not peer.requires_dcp_relayout
@@ -150,12 +162,23 @@ def _send_dsa_token_dcp(
     return 0
 
 
+@dataclass(frozen=True)
+class _DSATokenDCPTransfer:
+    prepare: Callable[..., tuple[list[int], list[_PackBuffer]]]
+    send: Callable[..., int]
+    layout_id = b"npu-dsa-token"
+
+
 def build_dsa_token_dcp_transfer(
     target_buffers: dict[int, torch.Tensor],
-) -> DCPTransferAdapter:
-    return DCPTransferAdapter(
-        # Preserve the layout ID sent by the first experimental implementation.
-        layout_id=b"1",
-        prepare=partial(_prepare_dsa_token_dcp, target_buffers=target_buffers),
+    *,
+    supports_relayout: bool,
+) -> _DSATokenDCPTransfer:
+    return _DSATokenDCPTransfer(
+        prepare=partial(
+            _prepare_dsa_token_dcp,
+            target_buffers=target_buffers,
+            supports_relayout=supports_relayout,
+        ),
         send=partial(_send_dsa_token_dcp, target_buffers=target_buffers),
     )

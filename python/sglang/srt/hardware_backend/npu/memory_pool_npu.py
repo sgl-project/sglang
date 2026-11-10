@@ -4,7 +4,6 @@ import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.npu.dsa_dcp_config import npu_dcp_interleave_size
 from sglang.srt.layers.dcp.layout import localize_dcp_indices
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKOnlyPool,
@@ -14,7 +13,7 @@ from sglang.srt.mem_cache.memory_pool import (
     get_tensor_size_bytes,
     unwrap_write_loc,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_disagg, get_memory, get_parallel
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.async_probe import maybe_detect_oob
 from sglang.srt.utils.device import is_npu
@@ -725,9 +724,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         parallel = get_parallel()
         self.dcp_size = parallel.attn_dcp_size
         self.dcp_rank = parallel.attn_dcp_rank
-        self.dcp_interleave_size = npu_dcp_interleave_size(
-            page_size, use_dsa=index_head_dim is not None
-        )
+        self.dcp_interleave_size = 1 if index_head_dim is not None else page_size
         self.use_combined_kv_buffer = use_combined_kv_buffer
         global_page_padding = self.dcp_size if self.dcp_size > 1 else 1
         kv_page_padding = global_page_padding if is_draft_worker else 1
@@ -1017,10 +1014,12 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
     def get_pd_dcp_transfer_adapter(self):
         if (
             self.index_head_dim is None
-            or not envs.SGLANG_NPU_DSA_DCP_TOKEN_INTERLEAVE.get()
+            or self.is_draft_worker
+            or get_disagg().disaggregation_transfer_backend
+            not in ("ascend", "mooncake")
         ):
             return None
-        if self.use_fia_nz:
+        if self.use_fia_nz and self.dcp_size > 1:
             raise ValueError("NPU DSA token PD requires a row-contiguous KV pool.")
         from sglang.srt.hardware_backend.npu.mooncake_dsa_dcp import (
             build_dsa_token_dcp_transfer,
@@ -1031,7 +1030,10 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 buffer.data_ptr(): buffer
                 for buffer, uses_global_slots in self._get_disagg_buffer_entries()
                 if not uses_global_slots
-            }
+            },
+            supports_relayout=(
+                not self.use_fia_nz and not get_memory().enable_unified_memory
+            ),
         )
 
     def get_kv_layer_ids(self):
