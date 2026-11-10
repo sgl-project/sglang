@@ -61,8 +61,8 @@ class _TaggedTokenizerManager(TokenizerManager):
     batch_tokenized_generate_req_type = _TaggedBatch
 
 
-def _scheduler(sessions, queued):
-    scheduler = Scheduler.__new__(_TaggedScheduler)
+def _scheduler(sessions, queued, scheduler_cls=_TaggedScheduler):
+    scheduler = Scheduler.__new__(scheduler_cls)
     scheduler.session_controller = sessions
     scheduler.enable_session_radix_cache = False
     scheduler.disaggregation_mode = DisaggregationMode.NULL
@@ -98,25 +98,44 @@ def _recv(rid, session_params=None):
 
 class TestRequestClassOverridePoints(CustomTestCase):
     def test_scheduler_builds_every_generation_request_through_the_factory(self):
-        """Plain, session, and unknown-session paths all yield the subclass."""
-        live = Session(capacity_of_str_len=0, session_id="live", streaming=True)
+        """Every route preserves the request class and EOS policy, including
+        factories overridden to return a custom Req subclass."""
         paths = {
-            "plain": (None, {}),
-            "session": (SessionParams(id="live"), {"live": live}),
-            "unknown-session": (SessionParams(id="gone"), {}),
+            "plain": None,
+            "session": SessionParams(id="live"),
+            "unknown-session": SessionParams(id="gone"),
         }
-        for name, (session_params, sessions) in paths.items():
-            with self.subTest(path=name):
-                queued = []
-                scheduler = _scheduler(sessions, queued)
-                recv = _recv(f"rid-{name}", session_params)
-                # An mm_input_error stops every path right after construction.
-                with get_parallel().override(tp_rank=0):
-                    scheduler.handle_generate_request(recv, mm_input_error="stop")
-                (req,) = queued
-                self.assertIsInstance(req, _TaggedReq)
-                self.assertEqual(req.source_rid, recv.rid)
-                self.assertEqual(req.rid, recv.rid)
+        for scheduler_cls, req_cls in (
+            (Scheduler, Req),
+            (_TaggedScheduler, _TaggedReq),
+        ):
+            for disable in (False, True):
+                for name, session_params in paths.items():
+                    with (
+                        self.subTest(
+                            scheduler=scheduler_cls.__name__,
+                            disable_model_eos_stop=disable,
+                            path=name,
+                        ),
+                        get_context().override_server_args(
+                            disable_model_eos_stop=disable
+                        ),
+                        get_parallel().override(tp_rank=0),
+                    ):
+                        live = Session(
+                            capacity_of_str_len=0, session_id="live", streaming=True
+                        )
+                        queued = []
+                        scheduler = _scheduler({"live": live}, queued, scheduler_cls)
+                        recv = _recv(f"rid-{name}", session_params)
+                        # Stop every path right after request construction.
+                        scheduler.handle_generate_request(recv, mm_input_error="stop")
+                        (req,) = queued
+                        self.assertIsInstance(req, req_cls)
+                        if isinstance(req, _TaggedReq):
+                            self.assertEqual(req.source_rid, recv.rid)
+                        self.assertEqual(req.rid, recv.rid)
+                        self.assertIs(req.stop_on_model_eos, not disable)
 
     def test_tokenizer_manager_emits_the_subclass_wire_types(self):
         """Single and batched dispatch hand the subclass types to the scheduler."""

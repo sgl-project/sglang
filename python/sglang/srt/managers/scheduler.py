@@ -3227,9 +3227,7 @@ class Scheduler(
         self, recv_req: TokenizedGenerateReqInput, *args, **kwargs
     ) -> Req:
         """Extension point for request-local state, including session requests."""
-        req = Req(*args, **kwargs)
-        req.stop_on_model_eos = not get_serving().disable_model_eos_stop
-        return req
+        return Req(*args, **kwargs)
 
     def handle_generate_request(
         self,
@@ -3254,6 +3252,12 @@ class Scheduler(
         *,
         mm_input_error: Optional[str] = None,
     ):
+        # Pass policy through the factory so custom Req subclasses inherit it.
+        req_factory = partial(
+            self._create_generation_req,
+            recv_req,
+            stop_on_model_eos=not get_serving().disable_model_eos_stop,
+        )
         # Route: normal request / session request / session-not-found
         session_id = (
             recv_req.session_params.id if recv_req.session_params is not None else None
@@ -3273,8 +3277,7 @@ class Scheduler(
                 recv_req.input_ids = array("q", [1]) * seq_length
 
             is_beam = BeamCoordinator.request_beam_width(recv_req) > 1
-            req = self._create_generation_req(
-                recv_req,
+            req = req_factory(
                 recv_req.rid,
                 recv_req.input_text,
                 recv_req.input_ids,
@@ -3363,7 +3366,7 @@ class Scheduler(
                 self.model_config.vocab_size,
                 eos_token_ids=self.model_config.hf_eos_token_id,
                 disagg_mode=self.disaggregation_mode,
-                req_factory=partial(self._create_generation_req, recv_req),
+                req_factory=req_factory,
             )
             if self.enable_session_radix_cache:
                 req.session_generation = self.tree_cache.ensure_session_generation(
@@ -3385,8 +3388,7 @@ class Scheduler(
                 )
             else:
                 error_msg = f"Invalid request: session id {session_id} does not exist"
-            req = self._create_generation_req(
-                recv_req,
+            req = req_factory(
                 recv_req.rid,
                 recv_req.input_text,
                 recv_req.input_ids,

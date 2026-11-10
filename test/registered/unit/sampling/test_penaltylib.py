@@ -37,6 +37,7 @@ def _make_req(freq=0.0, presence=0.0, min_tokens=0, stop_ids=None, eos_id=2):
     req.sampling_params.min_new_tokens = min_tokens
     req.sampling_params.stop_token_ids = stop_ids
     req.eos_token_ids = None
+    req.grammar = None
     req.tokenizer.additional_stop_token_ids = None
     req.tokenizer.eos_token_id = eos_id
     return req
@@ -392,6 +393,42 @@ class TestBatchedMinNewTokensPenalizer(CustomTestCase):
         pen.apply(logits)
         self.assertTrue(torch.isneginf(logits[0, 5]))
         self.assertEqual(logits[0, 6].item(), 0.0)
+
+    def test_grammar_eos_respects_min_tokens_when_model_eos_stop_is_disabled(self):
+        """Grammar EOS must not end JSON output before min_new_tokens, even
+        when ordinary model EOS stopping is disabled."""
+        import xgrammar as xgr
+
+        tokenizer_info = xgr.TokenizerInfo(["1", "<eos>"], stop_token_ids=[1])
+        compiled = xgr.GrammarCompiler(tokenizer_info).compile_json_schema(
+            {"type": "integer"}
+        )
+        for stop_on_model_eos in (True, False):
+            with self.subTest(stop_on_model_eos=stop_on_model_eos):
+                req = _make_req(min_tokens=5, eos_id=1)
+                req.eos_token_ids = {1}
+                req.stop_on_model_eos = stop_on_model_eos
+                req.grammar = xgr.GrammarMatcher(compiled)
+                batch = _make_batch([req])
+                orch = BatchedPenalizerOrchestrator(
+                    2, batch, {BatchedMinNewTokensPenalizer}
+                )
+                mask = xgr.allocate_token_bitmask(1, 2)
+                output_ids = []
+                for _ in range(6):
+                    req.grammar.fill_next_token_bitmask(mask)
+                    logits = torch.tensor([[1.0, 10.0]])
+                    orch.apply(logits)
+                    xgr.apply_token_bitmask_inplace(logits, mask, backend="cpu")
+                    token = logits.argmax(-1).item()
+                    self.assertTrue(req.grammar.accept_token(token))
+                    output_ids.append(token)
+                    orch.cumulate_output_tokens(torch.tensor([token]))
+                    if req.grammar.is_terminated():
+                        break
+
+                self.assertEqual(output_ids, [0] * 5 + [1])
+                self.assertTrue(req.grammar.is_terminated())
 
     def test_filter_keeps_subset(self):
         """Test that filter keeps the second request (min_tokens=5) and drops the first."""

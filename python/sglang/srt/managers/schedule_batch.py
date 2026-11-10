@@ -480,6 +480,7 @@ class Req(ReqDllmMixin):
         decision_layout: Optional[List[int]] = None,
         session_id: Optional[str] = None,
         cache_salt: Optional[str] = None,
+        stop_on_model_eos: bool = True,
     ):
         # Input and output info
         self.rid = rid
@@ -601,7 +602,7 @@ class Req(ReqDllmMixin):
         self.eos_token_ids = eos_token_ids
         # False under --disable-model-eos-stop: the model's EOS tokens (eos_token_ids
         # and the tokenizer's) don't finish the request; its stop_token_ids still do.
-        self.stop_on_model_eos = True
+        self.stop_on_model_eos = stop_on_model_eos
         self.vocab_size = vocab_size
         self.priority = priority
 

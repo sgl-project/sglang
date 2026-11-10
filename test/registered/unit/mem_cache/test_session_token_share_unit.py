@@ -17,9 +17,8 @@ register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 import unittest
 from array import array
-from functools import partial
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import torch
 
@@ -292,31 +291,6 @@ class TestSessionTeardown(CustomTestCase):
                 self._reap()
                 self.assertNotIn("s", self.controller)
                 self.assertIsNone(item.feature)
-
-
-class TestSessionModelEosStop(CustomTestCase):
-    def test_session_request_follows_disable_model_eos_stop(self):
-        """Session turns build their Req through the scheduler's factory, so
-        --disable-model-eos-stop reaches them as it does non-session requests."""
-        from sglang.srt.managers.scheduler import Scheduler
-
-        for disable, expected in ((False, True), (True, False)):
-            with (
-                self.subTest(disable_model_eos_stop=disable),
-                patch(
-                    "sglang.srt.managers.scheduler.get_serving",
-                    return_value=SimpleNamespace(disable_model_eos_stop=disable),
-                ),
-            ):
-                recv = _recv("r", [1, 2])
-                session = Session(capacity_of_str_len=0, session_id="s")
-                req = session.create_req(
-                    recv,
-                    tokenizer=None,
-                    vocab_size=VOCAB,
-                    req_factory=partial(Scheduler._create_generation_req, None, recv),
-                )
-                self.assertIs(req.stop_on_model_eos, expected)
 
 
 if __name__ == "__main__":
