@@ -57,11 +57,7 @@ class BeamSharedContextFlashInferAttnBackend(FlashInferAttnBackend):
             if save_kv_cache:
                 self.kv_layers.layer(layer.layer_id).store(
                     layer,
-                    KVWriteLoc.for_layer(
-                        forward_batch,
-                        layer,
-                        swa_loc=self.forward_metadata.swa_out_cache_loc,
-                    ),
+                    KVWriteLoc.for_layer(forward_batch, layer),
                     k,
                     v,
                     *self._kv_write_scales(layer),

@@ -725,6 +725,7 @@ class TboForwardBatchPreparer:
             "extend_prefix_lens_cpu",
             "extend_seq_lens_cpu",
             "extend_logprob_start_lens_cpu",
+            "extend_is_final_cpu",
             "lora_ids",
             "rids",
             "beam_trie_levels",

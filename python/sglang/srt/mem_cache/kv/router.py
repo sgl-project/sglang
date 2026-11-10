@@ -15,10 +15,7 @@ from typing import Any, Dict, Optional, Sequence, Tuple
 
 import msgspec
 
-# The part every token KV view holds today; derived parts get their own names.
-KV_PART = "kv"
-# A request's recurrent state, one slot per request, in the state sub-pool.
-STATE_PART = "state"
+from sglang.srt.mem_cache.kv.decl import KV_PART
 
 
 class PartRoute(msgspec.Struct, frozen=True, kw_only=True):
@@ -28,6 +25,8 @@ class PartRoute(msgspec.Struct, frozen=True, kw_only=True):
     part: str
     # 0-based position of the layer among the layers the part's view holds.
     index: int
+    # The attention window the layer reads over, when its sub-pool keeps one.
+    window: Optional[int] = None
 
 
 class KVLayer(msgspec.Struct, frozen=True, kw_only=True):
@@ -40,7 +39,8 @@ class KVLayer(msgspec.Struct, frozen=True, kw_only=True):
     # pass it today: a composite's local index, or a plain pool's model layer id.
     view_layer_id: int
     # Whether the layer's sub-pool is the router's owner, whose write ids are the
-    # request's token ids; another token sub-pool writes at the batch's `swa_loc`.
+    # request's token ids; another token sub-pool writes at its own entry of the
+    # batch's `window_locs`.
     owner: bool = True
     # A plain pool's own layer: the view is the pool, which takes the write loc
     # as the backend hands it and resolves it itself.
@@ -64,8 +64,8 @@ class KVLayer(msgspec.Struct, frozen=True, kw_only=True):
 
     def store(self, layer, loc_info, cache_k, cache_v, *args, **kwargs) -> None:
         """Writes the layer's K and V at the ids of its sub-pool: the owner's
-        (`full_loc`, else `loc`) or the window's (`swa_loc`), as the attention
-        backend bound them for the batch."""
+        (`full_loc`, else `loc`) or its window sub-pool's entry of
+        `window_locs`, as the attention backend bound them for the batch."""
         if self.plain:
             self.view.set_kv_buffer(layer, loc_info, cache_k, cache_v, *args, **kwargs)
             return
@@ -91,6 +91,20 @@ class KVLayer(msgspec.Struct, frozen=True, kw_only=True):
             **kwargs,
         )
 
+    def store_prefix(
+        self, layer, loc_info, commit_lens, cache_k, cache_v, *args, **kwargs
+    ) -> None:
+        """Commit each request's live prefix using this layer's physical ids."""
+        from sglang.srt.mem_cache.memory_pool import unwrap_write_loc
+
+        write_loc = loc_info if self.plain else self._write_loc(layer, loc_info)
+        loc, _, _ = unwrap_write_loc(write_loc)
+        if not self.plain:
+            kwargs["layer_id_override"] = self.view_layer_id
+        self.view.set_kv_buffer_prefix_valid(
+            layer, loc, commit_lens, cache_k, cache_v, *args, **kwargs
+        )
+
     def store_mla(self, layer, loc_info, cache_k_nope, cache_k_rope) -> None:
         if self.plain:
             self.view.set_mla_kv_buffer(layer, loc_info, cache_k_nope, cache_k_rope)
@@ -103,6 +117,18 @@ class KVLayer(msgspec.Struct, frozen=True, kw_only=True):
             layer_id_override=self.view_layer_id,
         )
 
+    def store_mla_prefix(
+        self, layer, loc_info, commit_lens, cache_k_nope, cache_k_rope
+    ) -> None:
+        from sglang.srt.mem_cache.memory_pool import unwrap_write_loc
+
+        write_loc = loc_info if self.plain else self._write_loc(layer, loc_info)
+        loc, _, _ = unwrap_write_loc(write_loc)
+        kwargs = {} if self.plain else {"layer_id_override": self.view_layer_id}
+        self.view.set_mla_kv_buffer_prefix_valid(
+            layer, loc, commit_lens, cache_k_nope, cache_k_rope, **kwargs
+        )
+
     def _write_loc(self, layer, loc_info):
         # Imported here: memory_pool imports this module for its routers.
         from sglang.srt.mem_cache.memory_pool import (
@@ -111,15 +137,17 @@ class KVLayer(msgspec.Struct, frozen=True, kw_only=True):
             write_loc_is_physical,
         )
 
-        loc, window_loc, owner_loc = unwrap_write_loc(loc_info)
+        loc, window_locs, owner_loc = unwrap_write_loc(loc_info)
         if self.owner:
             ids = owner_loc if owner_loc is not None else loc
         else:
-            assert window_loc is not None, (
-                f"layer {layer.layer_id} writes sub-pool {self.route.sub_pool!r}, "
-                "but the attention backend bundled no swa_loc for it"
+            # A window layer writes at its own sub-pool's write ids.
+            assert window_locs is not None and self.route.sub_pool in window_locs, (
+                f"layer {layer.layer_id} writes window sub-pool "
+                f"{self.route.sub_pool!r}, but the attention backend bundled "
+                f"write ids for {sorted(window_locs or ())}"
             )
-            ids = window_loc
+            ids = window_locs[self.route.sub_pool]
         return KVWriteLoc(ids, physical=write_loc_is_physical(loc_info))
 
     def read_mla(self, layer, loc, dst_dtype=None):
@@ -135,6 +163,8 @@ class PublicSubPool(msgspec.Struct, frozen=True, kw_only=True):
     name: str
     # Model layer ids routed to this sub-pool, in the order the pool declares them.
     layer_ids: Tuple[int, ...]
+    # The attention window its layers read over, when it keeps one.
+    window: Optional[int] = None
 
 
 class KVLayerRouter:
@@ -153,10 +183,14 @@ class KVLayerRouter:
         sub_pools: Tuple[PublicSubPool, ...],
         views: Dict[str, Any],
         layers: Dict[int, KVLayer],
+        roles: Optional[Dict[str, str]] = None,
     ):
         self._pool = pool
         self._sub_pools = sub_pools
         self._by_name = {sub_pool.name: sub_pool for sub_pool in sub_pools}
+        # Attention roles consumers ask for (the sliding-window layers' role)
+        # and the sub-pool that plays each.
+        self._roles = dict(roles or {})
         self._views = views
         self._layers = layers
         self._part_layers: Dict[Tuple[int, str], KVLayer] = {}
@@ -171,20 +205,28 @@ class KVLayerRouter:
         layer_maps: Sequence[Tuple[str, Any, Dict[int, int]]],
         *,
         owner: Optional[str] = None,
+        roles: Optional[Dict[str, str]] = None,
+        windows: Optional[Dict[str, Optional[int]]] = None,
     ) -> KVLayerRouter:
         """A composite's router: per sub-pool, in plan order, its name, its
         view, and each routed model layer's index in that view, which is also
         the id the composite passes the view today. ``owner`` names the
         sub-pool whose write ids are the request's token ids (default: the
-        first). No layer maps build a router without token KV, for parts to be
-        bound to."""
+        first); ``windows`` the attention window of each window sub-pool. No
+        layer maps build a router without token KV, for parts to be bound to."""
         if owner is None and layer_maps:
             owner = layer_maps[0][0]
+        windows = windows or {}
         layers: Dict[int, KVLayer] = {}
         for name, view, indices in layer_maps:
             for layer_id, index in indices.items():
                 layers[layer_id] = KVLayer(
-                    route=PartRoute(sub_pool=name, part=KV_PART, index=index),
+                    route=PartRoute(
+                        sub_pool=name,
+                        part=KV_PART,
+                        index=index,
+                        window=windows.get(name),
+                    ),
                     view=view,
                     view_layer_id=index,
                     owner=name == owner,
@@ -192,11 +234,14 @@ class KVLayerRouter:
         return cls(
             pool,
             sub_pools=tuple(
-                PublicSubPool(name=name, layer_ids=tuple(indices))
+                PublicSubPool(
+                    name=name, layer_ids=tuple(indices), window=windows.get(name)
+                )
                 for name, _, indices in layer_maps
             ),
             views={name: view for name, view, _ in layer_maps},
             layers=layers,
+            roles=roles,
         )
 
     def bind_part(
@@ -275,16 +320,30 @@ class KVLayerRouter:
         return self._sub_pools
 
     def sub_pool(self, name: str) -> Optional[PublicSubPool]:
-        """The named sub-pool, or None when the pool has none by that name."""
-        return self._by_name.get(name)
+        """The named sub-pool (or the one playing the named role), or None
+        when the pool has none by that name."""
+        return self._by_name.get(self._roles.get(name, name))
 
     def routes_to(self, sub_pool: str) -> bool:
         """Whether some layer's KV lives in the named sub-pool."""
         found = self.sub_pool(sub_pool)
         return found is not None and len(found.layer_ids) > 0
 
+    def plays(self, layer_id: int, role: str) -> bool:
+        """Whether the layer's KV lives in the sub-pool playing ``role`` (or
+        named ``role``): a role names the sub-pool by what it does, while a
+        layer's route names it by what it is."""
+        found = self.sub_pool(role)
+        return found is not None and self.route(layer_id).sub_pool == found.name
+
+    def storage_name(self, sub_pool: str) -> str:
+        """Backing sub-pool for an attention role, including routed drafts."""
+        if self._pool.requires_physical_write_loc:
+            return self.view(sub_pool)._sub_pool_name
+        return self._roles.get(sub_pool, sub_pool)
+
     def view(self, sub_pool: str) -> Any:
-        return self._views[sub_pool]
+        return self._views[self._roles.get(sub_pool, sub_pool)]
 
     def wrapped_view(self) -> Optional[Any]:
         """The one token KV view the pool wraps, when all its token KV lives in
