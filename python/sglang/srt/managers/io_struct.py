@@ -82,6 +82,7 @@ from sglang.srt.utils.msgspec_utils import (
     Base64Bytes,
     msgspec_struct_pydantic_core_schema,
 )
+from sglang.srt.utils.rid_utils import expand_base_rid
 from sglang.srt.utils.weight_versions import WeightVersionSpans
 
 # Handle serialization of Image for pydantic
@@ -146,19 +147,17 @@ class SessionParams(msgspec.Struct, kw_only=True, array_like=True):
     # The session identifier. Used by the scheduler to look up or create the
     # Session object that groups all requests in a multi-turn conversation.
     id: Optional[str] = None
-    # A request identifier *within* the session. In non-streaming sessions the
-    # session maintains a tree of request nodes keyed by rid; this field selects
-    # which node to continue from (append) or replace. When None the default
-    # branch point is used (latest node for streaming, all nodes cleared on
-    # replace).
+    # A request identifier *within* the session: the turn to continue from. A
+    # non-streaming session keeps every turn by rid, so a new turn may continue
+    # from any of them. When None, a streaming session continues from its
+    # latest turn and a non-streaming one starts with no history.
     rid: Optional[str] = None
     # Token-level insertion point. When set, the new request's tokens are
     # spliced into the accumulated context at this position instead of being
     # appended at the end (i.e. ``context[:offset] + new_tokens``).
     offset: Optional[int] = None
-    # When True, the request node identified by ``rid`` (or all nodes if
-    # ``rid`` is None) is aborted and its children are cleared before the new
-    # request is inserted. Not supported in streaming sessions.
+    # Unsupported: a request that sets it is rejected. The field keeps the
+    # positional (array_like) wire layout of the fields after it.
     replace: Optional[bool] = None
     # When True, the previous request's generated output tokens are excluded
     # from the accumulated context so the new turn sees only the original input.
@@ -782,6 +781,7 @@ class GenerateReqInput:
         if self.rid is None:
             self.rid = [uuid.uuid4().hex for _ in range(num)]
         elif isinstance(self.rid, str):
+            # Unpadded on purpose: clients and the Rust server rebuild `<rid>_<i>`.
             new_rids = [f"{self.rid}_{i}" for i in range(num)]
             self.rid = new_rids
         elif isinstance(self.rid, list):
@@ -1401,6 +1401,8 @@ class EmbeddingReqInput:
         else:
             if self.rid is None:
                 self.rid = [uuid.uuid4().hex for _ in range(self.batch_size)]
+            elif isinstance(self.rid, str):
+                self.rid = expand_base_rid(self.rid, self.batch_size)
             else:
                 assert isinstance(self.rid, list), "The rid should be a list."
 

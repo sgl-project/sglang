@@ -27,7 +27,6 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
     get_platform,
-    get_schedule,
     get_spec,
 )
 
@@ -119,6 +118,7 @@ from sglang.srt.layers.dcp.layout import (
     filter_dcp_local_chunk_kv_indices,
     get_dcp_lens,
 )
+from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.utils import (
@@ -512,7 +512,6 @@ def _validate_flashmla_sparse_q8_backend(
     qk_rope_head_dim: int,
     device_sm_major: int,
     hisparse_enabled: bool = False,
-    mixed_chunk_enabled: bool = False,
 ) -> None:
     # flashmla_sparse_q8 casts q and KV to fp8 per call, so the KV cache may be
     # bfloat16 or fp8_e4m3.
@@ -546,16 +545,6 @@ def _validate_flashmla_sparse_q8_backend(
             raise ValueError(
                 "--dsa-prefill-backend flashmla_sparse_q8 is SM90-only; got compute "
                 f"capability sm_{device_sm_major}x."
-            )
-        # A mixed batch takes the PAGED top-k transform, which belongs to the
-        # bf16 kernel. forward_extend refuses it, but the flag is readable here,
-        # so the refusal belongs at launch rather than on the first mixed batch
-        # formed under load.
-        if mixed_chunk_enabled:
-            raise ValueError(
-                "--dsa-prefill-backend flashmla_sparse_q8 does not support "
-                "--enable-mixed-chunk: q8 prefill runs on RAGGED extend batches "
-                "only."
             )
         # The q8 route hands top-k to the kernel as ragged ids and never binds the
         # page table HiSparse would translate, so the two cannot be combined.
@@ -662,7 +651,9 @@ class DeepseekSparseAttnBackend(
             model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
         )
         self.num_q_heads = self.local_num_q_heads * sharded_dcp_size
-        self.num_dcp_q_heads = self.local_num_q_heads * self.attn_dcp_size
+        self.num_dcp_q_heads = _trtllm_padded_heads(
+            self.local_num_q_heads * self.attn_dcp_size
+        )
         self._dcp_page_table_cache = DcpPageTableCache()
         self.kv_cache_dim = model_runner.token_to_kv_pool.kv_cache_dim
         self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim
@@ -822,7 +813,6 @@ class DeepseekSparseAttnBackend(
             qk_rope_head_dim=self.qk_rope_head_dim,
             device_sm_major=self.device_sm_major,
             hisparse_enabled=self.hisparse_coordinator is not None,
-            mixed_chunk_enabled=get_schedule().enable_mixed_chunk,
         )
 
         if self.dsa_prefill_impl == "triton_sparse_mla":
@@ -2507,10 +2497,9 @@ class DeepseekSparseAttnBackend(
             and topk_transform_method != TopkTransformMethod.RAGGED
         ):
             raise NotImplementedError(
-                "--dsa-prefill-backend flashmla_sparse_q8 supports EXTEND prefill "
-                f"batches only; got forward_mode={forward_batch.forward_mode.name} "
-                "(DLLM_EXTEND under --dllm-algorithm; --enable-mixed-chunk is "
-                "rejected at launch)."
+                "--dsa-prefill-backend flashmla_sparse_q8 supports EXTEND and MIXED "
+                f"prefill batches only; got forward_mode={forward_batch.forward_mode.name} "
+                "(DLLM_EXTEND under --dllm-algorithm)."
             )
 
         if self.use_fused_topk:
@@ -3153,8 +3142,9 @@ class DeepseekSparseAttnBackend(
         """
         if self.dsa_prefill_impl != "flashmla_sparse_q8":
             return False
-        # RAGGED routing requires exactly EXTEND (excludes decode/idle, MIXED,
-        # target-verify and draft-extend, which use dsa_decode_impl anyway).
+        # Born-fp8 q is EXTEND-only. MIXED routes RAGGED as well but stays on
+        # the bf16-q hand-off (the helper casts); decode/idle, target-verify and
+        # draft-extend use dsa_decode_impl.
         if forward_batch.forward_mode != ForwardMode.EXTEND:
             return False
         # Per-batch dense fallback (il <= threshold) reads bf16 q directly.
@@ -4199,6 +4189,25 @@ class DeepseekSparseAttnBackend(
 
         # The BF16 no-RoPE path passes a zero-width q_rope tensor.
         merge_query = q_rope is not None and self.qk_rope_head_dim > 0
+        sharded_dcp = self.dsa_shards_index_k
+        dcp_partial = sharded_dcp and (
+            not is_prefill or forward_batch.forward_mode.is_target_verify()
+        )
+        replicated_dcp = self.attn_dcp_size > 1 and not sharded_dcp
+        if (dcp_partial or replicated_dcp) and get_in_autotune_dummy_run():
+            # Discarded warmup: nested FlashInfer tuning overflows the DCP slab.
+            return (
+                torch.zeros(
+                    (q.shape[0], layer.tp_q_head_num, layer.v_head_dim),
+                    dtype=torch.bfloat16,
+                    device=q.device,
+                ),
+                torch.zeros(
+                    (q.shape[0], layer.tp_q_head_num),
+                    dtype=torch.float32,
+                    device=q.device,
+                ),
+            )
         if self.kv_cache_dtype == torch.float8_e4m3fn:
             # For FP8 path, we quantize the query and rope parts and merge them into a single tensor
             # Note: rope application in deepseek_v2.py:forward_absorb_prepare is skipped for FP8 decode path of this trtllm_mla backend
@@ -4285,6 +4294,8 @@ class DeepseekSparseAttnBackend(
             self.kv_layers.layer(layer.layer_id).store_mla(layer, cache_loc, k, k_rope)
 
         k_cache = self.kv_layers.read(layer.layer_id).key()
+        if sharded_dcp and not dcp_partial:
+            k_cache = self.dcp_gather_kv_cache(k_cache, forward_batch, metadata)
         kv_cache = k_cache.view(
             -1, self.physical_page_size, self.kv_cache_dim
         ).unsqueeze(1)
@@ -4346,7 +4357,7 @@ class DeepseekSparseAttnBackend(
         page_table_1, sparse_mla_top_k = self._pad_trtllm_sparse_page_table(
             page_table_1
         )
-        if self.attn_dcp_size > 1 and not self.dsa_shards_index_k:
+        if self.attn_dcp_size > 1 and (not self.dsa_shards_index_k or dcp_partial):
             page_table_1, seq_lens = localize_dcp_page_table(
                 self._dcp_page_table_cache,
                 metadata=metadata,
@@ -4400,7 +4411,7 @@ class DeepseekSparseAttnBackend(
             multi_ctas_kv_counter_buffer=multi_ctas_kv_counter_buffer,
         )
 
-        if self.attn_dcp_size > 1 and not self.dsa_shards_index_k:
+        if (self.attn_dcp_size > 1 and not self.dsa_shards_index_k) or dcp_partial:
             out, lse = dcp_trtllm_sparse_attention(
                 query=q,
                 block_tables=block_tables,
@@ -4412,8 +4423,12 @@ class DeepseekSparseAttnBackend(
             # Restore the layer's logical head count for both Q preparation paths.
             output_heads = layer.tp_q_head_num
             if kernel_heads != output_heads:
-                out = out[..., :output_heads, :].contiguous()
-                lse = lse[:, :output_heads].contiguous()
+                if dcp_partial:
+                    out = out.view(batch_size, kernel_heads, -1)[:, :output_heads]
+                    lse = lse[:, :output_heads]
+                else:
+                    out = out[..., :output_heads, :].contiguous()
+                    lse = lse[:, :output_heads].contiguous()
             if row_plan.q_pad_rows:
                 lse = torch.cat(
                     [
@@ -4539,7 +4554,9 @@ class DeepseekSparseAttnBackend(
             # dequantizes inside the RAGGED branch and its kernel is bf16-only.
             and self.dsa_prefill_impl
             in ("flashmla_sparse", "flashmla_sparse_q8", "triton_sparse_mla")
-            and forward_mode == ForwardMode.EXTEND
+            # MIXED matches EXTEND: the prefill graph runner builds metadata from
+            # MIXED but replays EXTEND graphs.
+            and forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
         ):
             topk_transform_method = TopkTransformMethod.RAGGED
         elif self.dsa_shards_index_k and forward_mode == ForwardMode.EXTEND:

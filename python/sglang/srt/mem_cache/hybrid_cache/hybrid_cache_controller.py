@@ -57,6 +57,7 @@ from sglang.srt.observability.trace import (
 )
 
 if TYPE_CHECKING:
+    from sglang.srt.mem_cache.kv.storage import KVStorage
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 
 from sglang.srt.mem_cache.utils import get_storage_hash_str
@@ -352,6 +353,7 @@ class HybridCacheController(BaseHiCacheController):
         transfer_layer_id_max: Optional[int] = None,
         enable_storage_metrics: bool = False,
         host_memory_mode: str = "cache",
+        kv_storage: Optional[KVStorage] = None,
     ):
         startup_storage_backend = storage_backend
         self.is_kv_sharded = isinstance(
@@ -364,6 +366,9 @@ class HybridCacheController(BaseHiCacheController):
         self.pp_prefetch_state_lock = threading.Lock()
         self.pp_prefetch_states: dict[str, PPPrefetchState] = {}
         self.pp_prefetch_decisions: dict[str, PPPrefetchDecision] = {}
+        # The pool names a collective over a set of sync groups reduces, with
+        # the groups they were agreed on (`_host_pool_schema`).
+        self._host_pool_schemas: List[tuple] = []
         super().__init__(
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
             mem_pool_host=mem_pool_host,
@@ -381,6 +386,7 @@ class HybridCacheController(BaseHiCacheController):
             storage_backend_extra_config=storage_backend_extra_config,
             enable_storage_metrics=enable_storage_metrics,
             host_memory_mode=host_memory_mode,
+            kv_storage=kv_storage,
         )
         # Hybrid transfer IDs span every component pool, including holes for
         # uncached layers that the anchor pool alone cannot describe.
@@ -1111,11 +1117,11 @@ class HybridCacheController(BaseHiCacheController):
         """Per-pool token counts for a merged transfer op (anchor + extra
         pools), shared by D->H write and H->D load acks; sidecar transfers
         reusing another pool's indices are excluded."""
-        counts = {self.mem_pool_host.anchor_entry.name.value: len(op.device_indices)}
+        counts = {str(self.mem_pool_host.anchor_entry.name): len(op.device_indices)}
         for transfer in op.pool_transfers or []:
             if transfer.indices_from_pool is not None or transfer.host_indices is None:
                 continue
-            name = transfer.name.value
+            name = str(transfer.name)
             counts[name] = counts.get(name, 0) + len(transfer.host_indices)
         return counts
 
@@ -1190,6 +1196,11 @@ class HybridCacheController(BaseHiCacheController):
             assert len(device_indices) == len(host_indices)
         elif not need_load_kv:
             device_indices = torch.empty((0,), dtype=torch.int64, device=self.device)
+        elif self.kv_storage is not None:
+            take_owner_rows, _ = self.kv_storage.owner_load_alloc()
+            device_indices = take_owner_rows(len(host_indices))
+            if device_indices is None:
+                return None
         else:
             if isinstance(full_allocator, PageInterleavePoolAllocator):
                 # Loaded pages keep their host copies' owners; host slots share
@@ -1212,7 +1223,11 @@ class HybridCacheController(BaseHiCacheController):
         )
         if pool_transfers is None and extra_pools:
             if need_load_kv and not caller_owned:
-                full_allocator.free(device_indices)
+                if self.kv_storage is not None:
+                    _, give_back = self.kv_storage.owner_load_alloc()
+                    give_back(device_indices)
+                else:
+                    full_allocator.free(device_indices)
             return None
 
         self.load_queue.append(
@@ -1628,9 +1643,10 @@ class HybridCacheController(BaseHiCacheController):
         )
 
     def _sync_prefetch_hit_query(self, operation, storage_hit_count: int) -> int:
-        """One MIN collective for the folded hit count and every pool's own
-        boundary, so per-pool beliefs stay rank-identical. A pool omitted
-        by any rank heals from the folded cut without learning presence."""
+        """One MIN collective for the folded hit count and every host pool's
+        own boundary, named windows included (`_host_pool_schema`), so
+        per-pool beliefs stay rank-identical. A pool omitted by any rank
+        heals from the folded cut without learning presence."""
         if any(
             transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES
             for transfer in operation.pool_transfers or []
@@ -1655,7 +1671,7 @@ class HybridCacheController(BaseHiCacheController):
                         hits[page] = 1
         else:
             hits = [storage_hit_count]
-        pools = list(PoolName)
+        pools = self._host_pool_schema(self.prefetch_hits_sync_groups)
         local = operation.query_pool_hit_pages
         packed = torch.tensor(
             hits + [local.get(pool, _NO_POOL_VERDICT) for pool in pools],
@@ -1955,8 +1971,6 @@ class HybridCacheController(BaseHiCacheController):
             if sidecar_ok:
                 for transfer in backup_transfers:
                     result = results.get(transfer.name)
-                    if result is None:
-                        result = results.get(transfer.name.value)
                     expected = len(transfer.keys or [])
                     if expected == 0 and transfer.host_indices is not None:
                         expected = int(transfer.host_indices.numel())
@@ -2148,10 +2162,11 @@ class HybridCacheController(BaseHiCacheController):
 
         # Handle other sidecar pools, e.g. SWA, Mamba.
         if ack.pool_hits is not None:
-            # "for ... in PoolName" ensures the same order across all ranks.
-            # On prefetch failure, pool_hits may be empty dict.
+            # On prefetch failure, pool_hits may be an empty dict; a pool this
+            # rank does not hold contributes 0.
+            names = self._host_pool_schema(self.prefetch_completion_sync_groups)
             packed = torch.tensor(
-                [ack.pool_hits.get(pool.value, 0) for pool in PoolName],
+                [ack.pool_hits.get(name, 0) for name in names],
                 dtype=torch.int,
             )
             self._all_reduce(
@@ -2159,8 +2174,28 @@ class HybridCacheController(BaseHiCacheController):
                 torch.distributed.ReduceOp.MIN,
                 self.prefetch_completion_sync_groups,
             )
-            for i, pool in enumerate(PoolName):
-                ack.pool_hits[pool.value] = packed[i].item()
+            for i, name in enumerate(names):
+                ack.pool_hits[name] = packed[i].item()
+
+    def _host_pool_schema(self, groups) -> List[str]:
+        """The ordered host-pool names a collective over ``groups`` reduces, the
+        same on every rank: exactly the pools some rank registers (a PP stage
+        holds only its own layers' windows). Agreed once per set of groups;
+        every rank of a set reaches its first call at the same point."""
+        for agreed_groups, schema in self._host_pool_schemas:
+            if agreed_groups is groups:
+                return schema
+        names = {str(name) for name in self.mem_pool_host.entry_map}
+        for group in groups:
+            names = set().union(*self._all_gather_object(sorted(names), group))
+        schema = sorted(names)
+        self._host_pool_schemas.append((groups, schema))
+        return schema
+
+    def _all_gather_object(self, obj, group) -> list:
+        gathered = [None] * torch.distributed.get_world_size(group)
+        torch.distributed.all_gather_object(gathered, obj, group=group)
+        return gathered
 
     def prefetch_sync_thread_func(self) -> None:
         """Synchronize progressive ACKs and publish PP ticket completion."""

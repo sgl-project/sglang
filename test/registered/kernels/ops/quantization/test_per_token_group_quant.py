@@ -27,6 +27,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
     create_per_token_group_quant_fp8_output_scale,
     fp8_dtype,
     fp8_max,
+    sglang_per_token_group_quant_fp8,
 )
 from sglang.kernels.ops.quantization.per_token_group_quant import (
     per_token_group_quant,
@@ -85,6 +86,153 @@ def ref_fp8_ue8m0(x, gs):
     quant_scale = ((127 + 127 - exp) << 23).view(torch.float32)  # 2^(127 - (exp-127))
     q = _quantize(x, gs, quant_scale, fp8_dtype, -FMAX, FMAX)
     return q, exp.to(torch.uint8)
+
+
+def ref_fp8_fp32_pow2(x, gs=32):
+    """Finite-input reference with FP32 power-of-two scales."""
+    xf = x.float().unflatten(-1, (-1, gs))
+    amax = xf.abs().amax(-1)
+    raw = (amax.clamp_min(EPS) * (1.0 / FMAX)).contiguous()
+    bits = raw.view(torch.int32)
+    exp = ((bits >> 23) & 0xFF) + ((bits & 0x7FFFFF) != 0).int()
+    scale = (exp << 23).view(torch.float32)
+    multiplier = ((254 - exp) << 23).view(torch.float32)
+    scaled = xf * multiplier.unsqueeze(-1)
+    q = scaled.clamp(-FMAX, FMAX).to(fp8_dtype).flatten(-2)
+    return q, scale
+
+
+def _check_fp32_pow2(x, public=False):
+    q_ref, s_ref = ref_fp8_fp32_pow2(x)
+    q = torch.empty_like(x, dtype=fp8_dtype)
+    s = torch.full((x.shape[0], x.shape[1] // 32), torch.nan, device=x.device)
+    if public:
+        sglang_per_token_group_quant_fp8(
+            x, 32, scale_ue8m0=True, output_q=q, output_s=s
+        )
+    else:
+        per_token_group_quant(x, q, s, 32, scale_ue8m0=True)
+    assert torch.equal(q.view(torch.uint8), q_ref.view(torch.uint8))
+    assert torch.equal(s.view(torch.int32), s_ref.view(torch.int32))
+
+
+@pytest.mark.parametrize("public", [False, True])
+@pytest.mark.parametrize(
+    "shape", [(0, 5120), (1, 32), (7, 96), (33, 160), (128, 1536), (4096, 5120)]
+)
+def test_fp32_pow2_group32(shape, public):
+    torch.manual_seed(42)
+    x = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
+    _check_fp32_pow2(x, public)
+
+
+def test_fp32_pow2_public_batched():
+    """Unmasked batched inputs retain their shape and row-major FP32 scales."""
+    torch.manual_seed(42)
+    x = torch.randn(2, 3, 64, device="cuda", dtype=torch.bfloat16)
+    q, s = sglang_per_token_group_quant_fp8(x, 32, scale_ue8m0=True)
+    q_ref, s_ref = ref_fp8_fp32_pow2(x)
+    assert q.shape == x.shape
+    assert s.shape == (2, 3, 2)
+    assert torch.equal(q.view(torch.uint8), q_ref.view(torch.uint8))
+    assert torch.equal(s.view(torch.int32), s_ref.view(torch.int32))
+
+
+@pytest.mark.parametrize("offset", [8, 16])
+def test_fp32_pow2_public_offset_view(offset):
+    # v2 admits a 16B-aligned view; the trait kernel requires 32B alignment.
+    x = torch.randn(3 * 160 + offset, device="cuda", dtype=torch.bfloat16)
+    _check_fp32_pow2(x[offset:].view(3, 160), public=True)
+
+
+@pytest.mark.parametrize("offset", [0, 8])
+def test_fp32_pow2_public_singleton_scale(offset):
+    """A contiguous transposed [8, 1] FP32 buffer must receive FP32 scales."""
+    torch.manual_seed(42)
+    # Exercise the Hopper trait path and its 16B-aligned v2 fallback.
+    storage = torch.randn(8 * 32 + offset, device="cuda", dtype=torch.bfloat16)
+    x = storage[offset:].view(8, 32)
+    q = torch.empty_like(x, dtype=fp8_dtype)
+    s = torch.full((1, 8), torch.nan, device="cuda", dtype=torch.float32).T
+    assert s.is_contiguous() and s.stride() == (1, 8)
+
+    q_out, s_out = sglang_per_token_group_quant_fp8(
+        x, 32, scale_ue8m0=True, output_q=q, output_s=s
+    )
+    q_ref, s_ref = ref_fp8_fp32_pow2(x)
+    assert q_out is q and s_out is s
+    assert s.stride() == (1, 8)
+    assert torch.equal(q.view(torch.uint8), q_ref.view(torch.uint8))
+    assert torch.equal(s.view(torch.int32), s_ref.view(torch.int32))
+
+
+@pytest.mark.parametrize("mixed_groups", [False, True])
+def test_fp32_pow2_finite_bf16_encodings(mixed_groups):
+    # Includes signed zero, subnormals and exponent boundaries. Uniform groups
+    # exercise the full scale range; shuffled groups mix small and large values.
+    values = torch.arange(65536, device="cuda").to(torch.int16).view(torch.bfloat16)
+    values = values[torch.isfinite(values)]
+    if mixed_groups:
+        torch.manual_seed(42)
+        x = values[torch.randperm(values.numel(), device="cuda")].view(-1, 32)
+    else:
+        x = values[:, None].expand(-1, 32).contiguous()
+    _check_fp32_pow2(x)
+
+
+def test_fp32_pow2_graph_replay():
+    x = torch.zeros(33, 160, device="cuda", dtype=torch.bfloat16)
+    q = torch.empty_like(x, dtype=fp8_dtype)
+    s = torch.empty(33, 5, device="cuda")
+
+    def run():
+        sglang_per_token_group_quant_fp8(
+            x, 32, scale_ue8m0=True, output_q=q, output_s=s
+        )
+
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for value in (0.0, 1.0, -1.0):
+        x.normal_()
+        x[0, :32] = value
+        graph.replay()
+        q_ref, s_ref = ref_fp8_fp32_pow2(x)
+        assert torch.equal(q.view(torch.uint8), q_ref.view(torch.uint8))
+        assert torch.equal(s.view(torch.int32), s_ref.view(torch.int32))
+
+
+@pytest.mark.parametrize("offset", [0, 8])
+@pytest.mark.parametrize("backend", ["eager", "inductor"])
+def test_fp32_pow2_compile(offset, backend):
+    # Dispatch must remain traceable, including the 16B-aligned v2 fallback.
+    def quantize(x):
+        return sglang_per_token_group_quant_fp8(x, 32, scale_ue8m0=True)
+
+    storage = torch.randn(33 * 160 + offset, device="cuda", dtype=torch.bfloat16)
+    x = storage[offset:].view(33, 160)
+    compiled = torch.compile(quantize, backend=backend, fullgraph=True)
+    for value in (0.0, 1.0):
+        x.normal_()
+        x[0, :32] = value
+        q, s = compiled(x)
+        q_ref, s_ref = ref_fp8_fp32_pow2(x)
+        assert torch.equal(q.view(torch.uint8), q_ref.view(torch.uint8))
+        assert torch.equal(s.view(torch.int32), s_ref.view(torch.int32))
+
+
+@pytest.mark.parametrize(
+    "dtype,group_size", [(torch.float16, 32), (torch.bfloat16, 128)]
+)
+def test_fp32_pow2_public_fallback(dtype, group_size):
+    x = torch.zeros(3, 128, device="cuda", dtype=dtype)
+    x[1] = torch.finfo(dtype).tiny
+    x[2] = torch.finfo(dtype).max
+    q, s = sglang_per_token_group_quant_fp8(x, group_size, scale_ue8m0=True)
+    q_ref, s_ref = ref_fp8_fp32_pow2(x, group_size)
+    assert torch.equal(q.view(torch.uint8), q_ref.view(torch.uint8))
+    assert torch.equal(s.view(torch.int32), s_ref.view(torch.int32))
 
 
 def _decode_packed_exp(s_int32: torch.Tensor, ng: int) -> torch.Tensor:
@@ -1002,6 +1150,23 @@ def test_auto_allocation(out_dtype, column_major_scales, scale_ue8m0):
     assert s_auto.dtype == s_buf.dtype and s_auto.shape == s_buf.shape
     assert torch.equal(q_auto.view(torch.int8), q_buf.view(torch.int8)), "codes differ"
     assert torch.equal(_as_int32(s_auto), _as_int32(s_buf)), "scales differ"
+
+
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability()[0] >= 10,
+    reason="SM100+ uses the tanh-form SiLU (as the AOT op), which flushes this group to 0",
+)
+def test_fused_silu_tiny_group():
+    """A group whose SiLU values are all tiny (gate=-20) keeps nonzero codes."""
+    x = torch.empty(1, 2 * G, device="cuda", dtype=torch.bfloat16)
+    x[:, :G] = -20.0
+    x[:, G:] = 32.0
+    x_q, x_s = per_token_group_quant(x, group_size=G, fuse_silu_and_mul=True)
+    torch.cuda.synchronize()
+    ref = (torch.nn.functional.silu(x[:, :G].float()) * x[:, G:].float()).flatten()
+    assert bool((x_q.view(torch.uint8) != 0).all()), "tiny SiLU group flushed to zero"
+    deq = x_q.float().flatten() * x_s.float().flatten()[0]
+    torch.testing.assert_close(deq, ref, rtol=0.13, atol=0.0)
 
 
 if __name__ == "__main__":
