@@ -213,7 +213,7 @@ export const config = {
           ],
           // Keeps every rank on the Rust TreeCore; write-back asserts on a mix with the Python one.
           env: (s) => [`SGLANG_HICACHE_MAMBA_HOST_RATIO=${s.pdMode === "prefill" ? 5 : 10}`, "RUSTUP_TOOLCHAIN=stable"],
-          hints: ["The host pools pin 170-185 GB of host memory per GPU, and the 8 ranks share the node's GTT (1511 GiB on MI355X); ratio 12 overflowed it at 32 agents. Check the node's GTT limit before raising either ratio."],
+          hints: ["The host pools pin 170-190 GB of host memory per GPU, and the 8 ranks share the node's GTT (1511 GiB on MI355X); ratio 12 overflowed it at 32 agents. Check the node's GTT limit before raising either ratio."],
         },
         { id: "amd-off", label: "Off", showWhen: (s) => config.isAmd(s) },
         {
@@ -221,7 +221,7 @@ export const config = {
           label: "+ L3 (Mooncake)",
           showWhen: (s) => config.isAmd(s),
           disabled: () => true,
-          disableReason: "HiCache L3 has not run on MI350X / MI355X.",
+          disableReason: "HiCache L3 is not part of the MI350X / MI355X recipes.",
         },
       ],
     },

@@ -108,72 +108,7 @@ Agentic workloads, such as coding agents and other multi-turn, tool-using assist
 On MI355X:
 
 - **Shape.** One node up to 56 agents: TP8 on the monokernel for 1 and 4, TP8 · DCP8 with HiCache from 8. The 1P1D runs on two nodes.
-- **Image.** `lmsysorg/sglang:dev-kimi-k31-pro-mi35x` at `sha256:5901db14`, measured in [InferenceX run 42695979942](https://github.com/SemiAnalysisAI/InferenceX/actions/runs/42695979942).
-
-Measured points (3600 s); tok/s/user is the P90 interactivity and TTFT is p50 / p90:
-
-<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
-  <colgroup>
-    <col style={{width: "13%"}} />
-    <col style={{width: "17%"}} />
-    <col style={{width: "18%"}} />
-    <col style={{width: "18%"}} />
-    <col style={{width: "16%"}} />
-    <col style={{width: "18%"}} />
-  </colgroup>
-  <thead>
-    <tr style={{borderBottom: "2px solid #d55816"}}>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Agents</th>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Shape</th>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>tok/s/GPU</th>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>tok/s/user</th>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>TTFT (s)</th>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Prefix hit</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr style={{backgroundColor: "rgba(255,255,255,0.02)"}}>
-      <td style={{padding: "9px 12px"}}>16</td>
-      <td style={{padding: "9px 12px"}}>1×8</td>
-      <td style={{padding: "9px 12px"}}>9,132</td>
-      <td style={{padding: "9px 12px"}}>82.6</td>
-      <td style={{padding: "9px 12px"}}>1.4 / 6.5</td>
-      <td style={{padding: "9px 12px"}}>96.6%</td>
-    </tr>
-    <tr style={{backgroundColor: "rgba(255,255,255,0.05)"}}>
-      <td style={{padding: "9px 12px"}}>32</td>
-      <td style={{padding: "9px 12px"}}>1×8</td>
-      <td style={{padding: "9px 12px"}}>15,968</td>
-      <td style={{padding: "9px 12px"}}>53.6</td>
-      <td style={{padding: "9px 12px"}}>2.0 / 10.8</td>
-      <td style={{padding: "9px 12px"}}>96.7%</td>
-    </tr>
-    <tr style={{backgroundColor: "rgba(255,255,255,0.02)"}}>
-      <td style={{padding: "9px 12px"}}>48</td>
-      <td style={{padding: "9px 12px"}}>1×8</td>
-      <td style={{padding: "9px 12px"}}>17,780</td>
-      <td style={{padding: "9px 12px"}}>31.0</td>
-      <td style={{padding: "9px 12px"}}>3.0 / 13.5</td>
-      <td style={{padding: "9px 12px"}}>96.2%</td>
-    </tr>
-    <tr style={{backgroundColor: "rgba(255,255,255,0.05)"}}>
-      <td style={{padding: "9px 12px"}}>56</td>
-      <td style={{padding: "9px 12px"}}>1×8</td>
-      <td style={{padding: "9px 12px"}}>19,844</td>
-      <td style={{padding: "9px 12px"}}>32.1</td>
-      <td style={{padding: "9px 12px"}}>3.8 / 19.7</td>
-      <td style={{padding: "9px 12px"}}>95.8%</td>
-    </tr>
-    <tr style={{backgroundColor: "rgba(255,255,255,0.02)"}}>
-      <td style={{padding: "9px 12px"}}>144</td>
-      <td style={{padding: "9px 12px"}}>1P1D, 2×8</td>
-      <td style={{padding: "9px 12px"}}>21,605</td>
-      <td style={{padding: "9px 12px"}}>31.7</td>
-      <td style={{padding: "9px 12px"}}>3.8 / 11.1</td>
-      <td style={{padding: "9px 12px"}}>94.6%</td>
-    </tr>
-  </tbody>
-</table>
+- **Image.** `lmsysorg/sglang:dev-kimi-k31-pro-mi35x`; the recipes were measured on `sha256:5901db14`.
 
 import { AgentX } from "/src/snippets/_agentx.jsx";
 import { agentx } from "/src/snippets/agentx/moonshotai/kimi-k3.1-pro.jsx";
@@ -243,9 +178,9 @@ Kimi K3.1 Pro always thinks; set the depth with the top-level `reasoning_effort`
 ### AMD MI350X / MI355X
 
 - **ROCm 10** only. MI350X runs the MI355X commands.
-- **By agent count.** 1-4: `Unified` `Low-Latency`, on the monokernel (no HiCache). 8-56: `Unified` `High-Throughput` with HiCache, at its 48-agent shape; below 48, use 16k chunks and fewer running requests (6, 8, 13 and 20 at 8, 16, 24 and 32 agents). Beyond that, the 1P1D (see [On AMD MI355X](#pd-amd)).
-- **DFLASH.** Triton draft attention and block verification; block 8 at 1-4 agents, 5 from 16 agents and on both PD roles.
-- **HiCache.** The pinned host pools share the node's GTT limit (1511 GiB on MI355X); larger ratios fail at startup. L3 has not run on MI35x.
+- **By agent count.** 1-4: `Unified` `Low-Latency`, on the monokernel (no HiCache); at 1 agent run 1 request. 8-56: `Unified` `High-Throughput` with HiCache, at its 48-agent shape; at 56 agents run 56 requests, and below 48 use 16k chunks with 6, 8, 13 and 20 requests at 8, 16, 24 and 32 agents. Beyond that, the 1P1D (see [On AMD MI355X](#pd-amd)).
+- **DFLASH.** Triton draft attention and block verification; block 8 at 1-4 agents, 6 at 8, and 5 from 16 agents and on both PD roles.
+- **HiCache.** The pinned host pools share the node's GTT limit (1511 GiB on MI355X); larger ratios fail at startup.
 
 ## 3. Advanced Usage
 
