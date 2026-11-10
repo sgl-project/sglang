@@ -16,6 +16,13 @@ class XpuGDNAttnBackend(GDNAttnBackend):
     as other platforms).
     """
 
+    def __init__(self, model_runner):
+        super().__init__(model_runner)
+        # Avoids one fill kernel per GDN layer in every decode step / graph replay.
+        self._decode_has_initial_state = torch.ones(
+            self.req_to_token_pool.size, dtype=torch.bool, device=model_runner.device
+        )
+
     def supports_fused_gdn(self, layer, forward_batch: ForwardBatch) -> bool:
         """Conservative guard: only the plain decode / non-prefix-cached,
         non-speculative extend cases are handled by the fused kernel."""
@@ -68,7 +75,7 @@ class XpuGDNAttnBackend(GDNAttnBackend):
         full pool directly for both conv and ssm.
         """
         fm = self.forward_metadata
-        layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+        layer_cache = self.state_layer_cache(layer.layer_id)
         conv_states = layer_cache.conv[0]  # [cache, dim, width-1]
         ssm_states = layer_cache.temporal  # [cache, nv, hv, hk]
         cache_indices = fm.mamba_cache_indices
@@ -81,7 +88,10 @@ class XpuGDNAttnBackend(GDNAttnBackend):
 
         if forward_batch.forward_mode.is_decode_or_idle():
             num_decodes, num_prefills = bs, 0
-            has_initial_state = torch.ones(bs, dtype=torch.bool, device=device)
+            if bs <= self._decode_has_initial_state.numel():
+                has_initial_state = self._decode_has_initial_state[:bs]
+            else:
+                has_initial_state = torch.ones(bs, dtype=torch.bool, device=device)
         else:
             num_decodes, num_prefills = 0, bs
             has_initial_state = forward_batch.extend_prefix_lens > 0

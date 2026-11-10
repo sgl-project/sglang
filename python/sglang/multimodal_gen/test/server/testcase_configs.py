@@ -28,8 +28,8 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Sequence
 
-from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.configs.sample.sampling_params import normalize_quality
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 from sglang.multimodal_gen.registry import (
     get_model_info,
     get_pipeline_config_classes,
@@ -187,7 +187,13 @@ class BaselineConfig:
         for prefix, overrides in data.get("runner_overrides", {}).items():
             if runner_name.startswith(prefix):
                 for name, metrics in overrides.items():
-                    data["scenarios"][name].update(metrics)
+                    scenario = data["scenarios"][name]
+                    for key, value in metrics.items():
+                        # merge per-stage/per-step maps so unlisted entries keep their guard
+                        if isinstance(value, dict):
+                            scenario[key] = {**scenario[key], **value}
+                        else:
+                            scenario[key] = value
                 print(f"--- Performance Runner Baseline: {prefix} ---")
                 break
 
@@ -341,6 +347,9 @@ class DiffusionTestCase:
     perf_repeat_requests: int = 1
     perf_warmup_requests: int = 0
     run_consistency_check: bool = True
+    # Sent first after the server warmup and checked against its own golden: the
+    # request that inherits whatever state the warmup leaves behind.
+    lead_sampling_params: DiffusionSamplingParams | None = None
     run_component_accuracy_check: bool = True
     run_models_api_check: bool = True
     expected_model_id: str | None = None
@@ -351,6 +360,20 @@ class DiffusionTestCase:
     run_multi_lora_api_check: bool = False
     # Cached MiniMax goldens require its implicit-quality cache mode.
     pin_consistency_quality: bool = True
+    # GT-free checks against other requests to the same server, same seed: the
+    # output must match the request at this quality level ...
+    reference_quality: str | None = None
+    # ... and must change once the server's LoRA adapter is deactivated
+    run_lora_effect_check: bool = False
+
+    def lead_case(self) -> DiffusionTestCase:
+        """The lead request as a case named "<id>_lead" (its golden's name)."""
+        return replace(
+            self,
+            id=f"{self.id}_lead",
+            sampling_params=self.lead_sampling_params,
+            lead_sampling_params=None,
+        )
 
     def __post_init__(self) -> None:
         if self.perf_repeat_requests < 1:
@@ -441,6 +464,17 @@ class DiffusionTestCase:
                 f"{self.id}: run_multi_lora_api_check requires lora_path and second_lora_path"
             )
 
+        if self.run_lora_effect_check and not (has_startup_lora or has_dynamic_lora):
+            raise ValueError(
+                f"{self.id}: run_lora_effect_check requires lora_path or dynamic_lora_path"
+            )
+
+
+# per-key-frame bounds in 0-255 levels: lossless-tier drift is ~1 level, a
+# full-strength LoRA moves tens; the 4x gap keeps a dropped delta out of "match"
+OUTPUT_MATCH_MAX_MEAN_ABS_DIFF = 3.0
+OUTPUT_MATCH_MIN_PSNR = 30.0
+OUTPUT_CHANGE_MIN_MEAN_ABS_DIFF = 12.0
 
 _REALTIME_MODEL_COMMON_EXTRAS = {
     "seed": 42,

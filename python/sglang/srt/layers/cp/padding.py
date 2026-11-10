@@ -60,3 +60,22 @@ def pad_local_rows(x: torch.Tensor, metadata: Any, dim: int) -> torch.Tensor:
     pad_shape = list(x.shape)
     pad_shape[dim] = pad_size
     return torch.cat([x, x.new_zeros(pad_shape)], dim=dim)
+
+
+def attention_query_tokens(forward_batch, n):
+    cp_metadata = getattr(forward_batch, "attn_cp_metadata", None)
+    if getattr(cp_metadata, "graph_num_tokens", None) is not None:
+        # Interleave BCG gathers KV in global sequence order but Q stays
+        # local. Empty padded queries must not enter sparse attention.
+        n = cp_metadata.per_rank_logical_token[get_parallel().attn_cp_rank]
+    return n
+
+
+def attention_output_tokens(forward_batch, raw):
+    cp_metadata = getattr(forward_batch, "attn_cp_metadata", None)
+    if cp_metadata is not None and cp_metadata.per_rank_logical_token is not None:
+        # Q/output rows are CP-local; cache locations and positions
+        # above remain global. Zero every invalid local row before
+        # captured projections/MoE can consume an empty-attention NaN.
+        raw = cp_metadata.per_rank_logical_token[get_parallel().attn_cp_rank]
+    return raw

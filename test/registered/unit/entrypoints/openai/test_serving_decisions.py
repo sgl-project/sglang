@@ -41,7 +41,7 @@ from sglang.srt.runtime_context import publish, restore_context, snapshot_contex
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=25, suite="base-a-test-cpu")
+register_cpu_ci(est_time=45, suite="base-a-test-cpu")
 
 # Tokenizer files only, of a chat template that thinks by default.
 TOKENIZER = "Qwen/Qwen3.5-35B-A3B"
@@ -1334,10 +1334,11 @@ class TestSystemOne(unittest.IsolatedAsyncioTestCase):
                         }
                     ],
                 )
-                decisions = await validation_exception_handler(
-                    request(root_path, "/v1/decisions"), error
-                )
-                self.assertEqual(decisions.status_code, 400)
+                for path in ["/v1/decisions", "/v1/chat/completions"]:
+                    response = await validation_exception_handler(
+                        request(root_path, path), error
+                    )
+                    self.assertEqual(response.status_code, 400)
 
     async def test_levels_the_legend_cannot_return_are_refused_before_scoring(self):
         def nested(depth):

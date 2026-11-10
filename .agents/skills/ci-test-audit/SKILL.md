@@ -22,6 +22,31 @@ An audit is only useful if it is specific. "This suite could be trimmed" is not 
 finding; "`TestFooLargePage` is a strict subset of `TestFooRetractLargePage`, drop it"
 is. Every finding needs the file, the pattern it matches, and what to do.
 
+## Auditing at scale
+
+An audit over hundreds of files (a whole tier, every CPU test) splits the reading from
+the judgment:
+
+- **Inventory first.** Collect each file's registrations, cost (live estimate x GPUs,
+  from the `sglang-ci-stats` model), and the exact items to check (CI-skipped classes,
+  overlapping configs) with a script, before any agent reads a file.
+- **Fan out file reads to the cheapest model** with a fixed brief and a TSV answer, in
+  chunks of about 15 files. The brief lists the exact items to verify; "review every
+  case in the file" makes the pass slow and adds nothing.
+- **Prosecutor stance.** Each file in the brief is deleted or demoted by default; keeping
+  it needs a reason: the change that would turn it red, and the grep that shows no other
+  test catches that change.
+- **The main agent re-judges** every verdict, most expensive first, before reporting.
+  Treat cheap-model "covered by X" or "superseded by Y" verdicts as leads: in one audit
+  none of 20 proposed file deletions held on verification.
+- **Re-tier before deleting.** For cost, moving a test down a tier (base, extra,
+  nightly, weekly) saves far more than deleting: the tier policy is in
+  [write-sglang-test, Choosing a Tier](../write-sglang-test/SKILL.md#choosing-a-tier).
+  Delete only what never runs in CI or is verified redundant.
+- **Failure evidence comes from failed runs' job logs.** `sglang-ci-stats` records only
+  successful jobs, so whether a tier catches regressions the tier above misses is read
+  from the failed scheduled runs on main.
+
 ## Reporting
 
 Group findings by confidence in the claim, not by pattern id. Lead with the ones where

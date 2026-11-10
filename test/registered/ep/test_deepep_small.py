@@ -1,4 +1,3 @@
-import os
 import unittest
 from types import SimpleNamespace
 
@@ -16,7 +15,7 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
-register_cuda_ci(est_time=407, stage="base-c", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=415, stage="extra-b", runner_config="4-gpu-h100")
 
 
 class TestPureDP(CustomTestCase):
@@ -132,10 +131,6 @@ class TestTBO(CustomTestCase):
                 "--max-running-requests",
                 "512",
             ],
-            env={
-                **os.environ,
-                "SGLANG_TBO_DEBUG": "1",
-            },
         )
 
     @classmethod
@@ -194,10 +189,6 @@ class TestMTPWithTBO(CustomTestCase):
                 "--max-running-requests",
                 "128",
             ],
-            env={
-                **os.environ,
-                "SGLANG_TBO_DEBUG": "1",
-            },
         )
 
     @classmethod

@@ -26,18 +26,20 @@ HW_MAPPING = {
     "mlx": HWBackend.MLX,
     "mps": HWBackend.MPS,
     "ppu": HWBackend.PPU,
+    "mlu": HWBackend.MLU,
 }
 
 # Per-commit test suites (run on every PR).
 # Includes both base-a/b/c (always-on; pr-test.yml) and extra-a/b
 # (label-gated; pr-test-extra.yml). Tests are tagged per-commit regardless;
-# pr-test-extra.yml's `run-ci-extra` PR label decides whether extra-* dispatches.
+# pr-test-extra.yml's `run-ci-nv-extra` PR label decides whether extra-* dispatches.
 PER_COMMIT_SUITES = {
     HWBackend.CPU: [
         "base-a-test-cpu",
         "stage-a-test-cpu-intel",
         "stage-a-tp-test-cpu-intel",
         "stage-b-test-cpu-intel",
+        "extra-test-cpu-intel",
         "base-b-test-cpu-arm64",
     ],
     HWBackend.AMD: [
@@ -56,7 +58,7 @@ PER_COMMIT_SUITES = {
         "stage-c-test-large-8-gpu-amd-mi35x",
         # extra-a: label-gated PR opt-in suites in pr-test-amd-extra.yml
         # (mirror of CUDA extra-a; tests stay tagged per-commit but only
-        # dispatch when the PR carries the `run-ci-extra` label). 1-gpu-small
+        # dispatch when the PR carries the `run-ci-amd-extra` label). 1-gpu-small
         # carries the mock-model / kv_canary unit + single-GPU canary e2e
         # tests; 1-gpu-large carries the subset of model e2e tests validated
         # to pass on mi325 (quant fp8kv-triton, sessions streaming-session
@@ -65,9 +67,14 @@ PER_COMMIT_SUITES = {
         # of CUDA extra-a tests fail on ROCm (missing flash_attn.cute/flash_ops
         # kernels, OOM, or accuracy regressions — e.g. gemma4-mtp-31b dips
         # below the gsm8k floor on the topk=3 leg) and stay CUDA-only for now.
+        # Tests that pass on ROCm but sit in CUDA's extra tier (basic_perf,
+        # torch.compile, LoRA/RL weight updates, ...) are registered here too
+        # rather than in the always-on stage-b/c suites.
         "extra-a-test-1-gpu-small-amd",
         "extra-a-test-1-gpu-large-amd",
         "extra-a-test-2-gpu-large-amd",
+        # extra-b: 4-GPU tests that CUDA runs in extra-b (4-gpu-h100/b200).
+        "extra-b-test-4-gpu-amd",
     ],
     HWBackend.MUSA: [],
     HWBackend.CUDA: [
@@ -79,7 +86,7 @@ PER_COMMIT_SUITES = {
         "base-b-kernel-unit-test-1-gpu-small",
         "base-b-kernel-unit-test-1-gpu-large",
         "base-b-kernel-unit-test-4-gpu-b200",
-        "base-b-kernel-unit-test-8-gpu-h200",
+        "base-b-kernel-benchmark-test-1-gpu-small",
         "base-b-kernel-benchmark-test-1-gpu-large",
         # Diffusion keeps case-level pytest partitioning behind registered
         # bridge files while sharing this discovery and dispatch entry point.
@@ -90,13 +97,11 @@ PER_COMMIT_SUITES = {
         "base-b-test-diffusion-bcg-1-gpu-h100",
         "base-b-test-diffusion-component-2-gpu-h100",
         "base-b-test-diffusion-unit-1-gpu-h100",
+        "base-b-test-diffusion-unit-1-gpu-b300",
         "base-c-test-4-gpu-h100",
         "base-c-test-4-gpu-b200",
         "base-c-test-2-gpu-gb300",
         "base-c-test-4-gpu-gb300",
-        "base-c-test-8-gpu-h20",
-        "base-c-test-8-gpu-h200",
-        "base-c-test-8-gpu-b200",
         "base-c-test-8-gpu-b300",
         # extra-a / extra-b: label-gated PR opt-in suites in pr-test-extra.yml
         # (tests still tagged per-commit but skipped on default PR runs).
@@ -106,7 +111,10 @@ PER_COMMIT_SUITES = {
         "extra-b-test-4-gpu-h100",
         "extra-b-test-4-gpu-b200",
         "extra-b-test-8-gpu-h200",
+        "extra-b-test-8-gpu-h20",
         "extra-b-test-8-gpu-b300",
+        "extra-b-test-2-gpu-gb300",
+        "extra-b-test-4-gpu-gb300",
     ],
     HWBackend.NPU: [
         "base-a-test-npu",
@@ -136,6 +144,10 @@ PER_COMMIT_SUITES = {
     HWBackend.PPU: [
         "stage-a-test-1-gpu-ppu",
     ],
+    HWBackend.MLU: [
+        "pr-test-1-mlu",
+        "pr-test-2-mlu",
+    ],
 }
 
 # Nightly test suites (run nightly, organized by GPU configuration)
@@ -144,6 +156,7 @@ NIGHTLY_SUITES = {
         # `stage="nightly"` + a runner_config, same `{stage}-test-{runner_config}`
         # shape as the per-commit suites. No `nightly=True`: the stage name
         # carries the cadence; only the legacy suites below still need the flag.
+        "nightly-test-1-gpu-small",
         "nightly-test-1-gpu-large",
         "nightly-test-2-gpu-large",
         "nightly-test-4-gpu-h100",
@@ -151,6 +164,7 @@ NIGHTLY_SUITES = {
         "nightly-test-4-gpu-gb300",
         "nightly-test-8-gpu-h200",
         "nightly-test-8-gpu-b200",
+        "nightly-test-8-gpu-b300",
     ],
     HWBackend.AMD: [
         "nightly-amd",
@@ -158,9 +172,11 @@ NIGHTLY_SUITES = {
         "nightly-amd-kernel-1-gpu",
         "nightly-amd-1-gpu-mi35x",
         "nightly-amd-1-gpu-zimage-turbo",
+        "nightly-amd-2-gpu",
         "nightly-amd-2-gpu-mi35x-deepseek-r1-mxfp4-tp2",
         "nightly-amd-8-gpu-mi35x-deepseek-r1-mxfp4-tp4",
         "nightly-amd-accuracy-8-gpu-mi35x-kimi-k3",
+        "nightly-amd-accuracy-8-gpu-mi35x-kimi-k31-pro",
         "nightly-amd-8-gpu-mi35x-qwen38-mxfp4",
         "nightly-amd-8-gpu-mi35x-glm52-fp8",
         "nightly-amd-8-gpu-mi35x-glm53-flash",
@@ -168,7 +184,6 @@ NIGHTLY_SUITES = {
         "nightly-amd-8-gpu-mi35x-glm53",
         "nightly-amd-4-gpu",
         "nightly-amd-8-gpu",
-        "nightly-amd-vlm",
         "nightly-amd-accuracy-8-gpu-deepseek-v4-flash",
         "nightly-amd-8-gpu-mi35x-deepseek-v4-flash",
         "nightly-amd-4-gpu-mi35x-deepseek-v41-flash",
@@ -193,7 +208,6 @@ NIGHTLY_SUITES = {
         "nightly-perf-4-npu-a3",
         "nightly-perf-16-npu-a3",
         "nightly-perf-16-npu-a3-cann910",
-        "nightly-acc-16-npu-a3-cann910",
         "full-4-npu-a2",
         "full-1-npu-a3",
         "full-2-npu-a3",
@@ -212,7 +226,6 @@ NIGHTLY_SUITES = {
         "nightly-xpu-kernel-main-1-gpu",
         "nightly-xpu-kernel-main-2-gpu",
         "nightly-xpu-kernel-main-4-gpu",
-        "nightly-xpu-kernel-main-8-gpu",
         "nightly-xpu-kernel-wheel-1-gpu",
     ],
 }
@@ -247,6 +260,7 @@ _SUITE_CHECKED_BACKENDS = {
     HWBackend.MLX,
     HWBackend.MPS,
     HWBackend.PPU,
+    HWBackend.MLU,
 }
 
 
@@ -468,6 +482,7 @@ def run_a_suite(args):
         max_attempts=args.max_attempts,
         retry_wait_seconds=args.retry_wait_seconds,
         fork_worker_batch_size=args.fork_worker_batch_size,
+        fork_worker_preload=args.fork_worker_preload,
         timeout_overrides=dict(args.timeout_override),
     )
 
@@ -508,8 +523,8 @@ def main():
         "--nightly",
         action="store_true",
         help=(
-            "Include tests registered with nightly=True (AMD/CPU/NPU). CUDA "
-            "scheduled suites are selected by name and take no flag."
+            "Include tests registered with nightly=True (AMD/NPU/XPU/MUSA). "
+            "CUDA/CPU scheduled suites are selected by name and take no flag."
         ),
     )
     parser.add_argument(
@@ -598,6 +613,15 @@ def main():
         help=(
             "Preload common modules, then run this many files in isolated fork "
             "children (default: 1, preserving one exec per file)."
+        ),
+    )
+    parser.add_argument(
+        "--fork-worker-preload",
+        nargs="*",
+        default=[],
+        help=(
+            "Extra modules the fork worker imports before forking, on top of "
+            "the common numpy/torch/triton stack."
         ),
     )
     args = parser.parse_args()
