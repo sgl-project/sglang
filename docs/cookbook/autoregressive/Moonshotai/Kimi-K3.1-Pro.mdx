@@ -441,39 +441,6 @@ sgl-router \
 - **Prefill host tier**: HiCache's host pools are pinned and count against the node's GTT limit, so a tier larger than that fails at startup. If yours does, lower `--hicache-ratio` or `SGLANG_HICACHE_MAMBA_HOST_RATIO`.
 - **Router**: the panel's MI355X router (`sglang_router` from the ROCm image) is the one measured.
 
-**Measured 1P1D** (MI355X 2×8, `High-Throughput` prefill + `High-Throughput` decode, AgentX for 3600 s, acceptance length simulated at 3.25, [InferenceX run 42695979942](https://github.com/SemiAnalysisAI/InferenceX/actions/runs/42695979942)):
-
-<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
-  <colgroup>
-    <col style={{width: "40%"}} />
-    <col style={{width: "60%"}} />
-  </colgroup>
-  <thead>
-    <tr style={{borderBottom: "2px solid #d55816"}}>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Workload</th>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700}}>Result</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr style={{backgroundColor: "rgba(255,255,255,0.02)"}}>
-      <td style={{padding: "9px 12px"}}>AgentX, concurrency 144, 3600 s</td>
-      <td style={{padding: "9px 12px"}}>21,605 tok/s per GPU at 31.7 tok/s per user (P90 interactivity)</td>
-    </tr>
-    <tr style={{backgroundColor: "rgba(255,255,255,0.05)"}}>
-      <td style={{padding: "9px 12px"}}>Time to first token</td>
-      <td style={{padding: "9px 12px"}}>P50 3.78 s, P90 11.1 s (94.6% prefix hit)</td>
-    </tr>
-    <tr style={{backgroundColor: "rgba(255,255,255,0.02)"}}>
-      <td style={{padding: "9px 12px"}}>AgentX, concurrency 128, 3600 s</td>
-      <td style={{padding: "9px 12px"}}>20,638 tok/s per GPU at 33.4 tok/s per user; TTFT P50 4.38 s</td>
-    </tr>
-    <tr style={{backgroundColor: "rgba(255,255,255,0.05)"}}>
-      <td style={{padding: "9px 12px"}}>GSM8K (native acceptance)</td>
-      <td style={{padding: "9px 12px"}}>97.9% at concurrency 144, 98.0% at 128</td>
-    </tr>
-  </tbody>
-</table>
-
 <a id="tpu" />
 
 ### 3.4 TPU7x deployment
