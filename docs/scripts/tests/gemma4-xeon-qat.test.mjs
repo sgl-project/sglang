@@ -16,6 +16,7 @@ const base = {
 
 for (const [modelSize, checkpoint, revision] of [
   ["e2b", "E2B", "6befbaca7398925921802abd1f277b495b78b738"],
+  ["e4b", "E4B", "476025a01dbf99361c062bbeca3d6a76bb4c4566"],
 ]) {
   test(`Gemma 4 QAT ${checkpoint} emits only the independently verified CPU command`, () => {
     const command = load().generateCommand({ ...base, modelSize });
