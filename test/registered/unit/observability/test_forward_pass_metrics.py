@@ -822,6 +822,9 @@ class TestForwardPassMetrics(unittest.TestCase):
                 Event=Mock, current_stream=lambda: object()
             ),
         )
+        scheduler._pp_result_done_event = types.MethodType(
+            SchedulerPPMixin._pp_result_done_event, scheduler
+        )
         wire, result, _ = SchedulerPPMixin._pp_make_skip_output_result(
             scheduler, types.SimpleNamespace(reqs=[object()]), metadata
         )

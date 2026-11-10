@@ -416,6 +416,7 @@ class KVCacheConfigurator:
     draft_model_idx: Optional[int] = None
     kv_cache_dtype_str: Optional[str] = None
     extra_mamba_cache_bytes_per_req: int = 0
+    allocate_intermediate_ssm: bool = True
     mambaish_config: Optional[Any] = field(init=False)
     hybrid_gdn_config: Optional[Any] = field(init=False)
     hybrid_kda_config: Optional[Any] = field(init=False)
@@ -1598,6 +1599,7 @@ class KVCacheConfigurator:
             replayssm_request_ring=(
                 host_only_mamba_checkpoint() and self.hybrid_kda_config is not None
             ),
+            allocate_intermediate_ssm=self.allocate_intermediate_ssm,
         )
         return req_to_token_pool
 
@@ -1668,6 +1670,7 @@ class KVCacheConfigurator:
             replayssm_request_ring=(
                 host_only_mamba_checkpoint() and self.hybrid_kda_config is not None
             ),
+            allocate_intermediate_ssm=self.allocate_intermediate_ssm,
         )
         return req_to_token_pool
 
@@ -2265,6 +2268,7 @@ class KVCacheConfigurator:
             enable_memory_saver=get_exec().features.enable_memory_saver,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
+            modelslim_cache_layout=self.modelslim_cache_layout,
         )
         return token_to_kv_pool
 
@@ -3445,6 +3449,7 @@ class KVCacheConfigurator:
             has_spec_dec
             and not replayssm_active
             and not _pd_prefill_skips_mamba_spec_state()
+            and self.allocate_intermediate_ssm
         )
         if has_spec_dec:
             assert get_spec().speculative_num_draft_tokens is not None

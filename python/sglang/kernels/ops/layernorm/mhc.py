@@ -2729,7 +2729,10 @@ def hc_mix_stats_sinkhorn_deepgemm(
     hc_eps: float,
     hc_mult: int = 4,
 ):
-    from sglang.srt.layers.deep_gemm_wrapper.entrypoint import tf32_hc_prenorm_gemm
+    from sglang.srt.layers.deep_gemm_wrapper.entrypoint import (
+        tf32_hc_prenorm_gemm,
+        tf32_hc_prenorm_gemm_dual,
+    )
 
     assert x_flat.dtype == torch.bfloat16 and x_flat.is_contiguous()
     m, k = x_flat.shape
@@ -2747,10 +2750,13 @@ def hc_mix_stats_sinkhorn_deepgemm(
     mix_hi = torch.empty((slices, m, mix), dtype=torch.float32, device=dev)
     mix_lo = torch.empty_like(mix_hi)
     sq = torch.empty((slices, m), dtype=torch.float32, device=dev)
-    tf32_hc_prenorm_gemm(x_flat, high, mix_hi, sq, slices)
-    # sq depends only on x_flat, so the second projection recomputes the same
-    # values; overwriting it avoids a throwaway (slices, m) scratch, 4 MiB at m=65536.
-    tf32_hc_prenorm_gemm(x_flat, low, mix_lo, sq, slices)
+    if current_arch().is_sm(10):
+        tf32_hc_prenorm_gemm_dual(x_flat, high, low, mix_hi, mix_lo, sq, slices)
+    else:
+        tf32_hc_prenorm_gemm(x_flat, high, mix_hi, sq, slices)
+        # sq depends only on x_flat, so the second projection recomputes the same
+        # values; overwriting it avoids a throwaway (slices, m) scratch, 4 MiB at m=65536.
+        tf32_hc_prenorm_gemm(x_flat, low, mix_lo, sq, slices)
     _hc_mix_reduce_sinkhorn_kernel[(m,)](
         mix_hi,
         sq,
