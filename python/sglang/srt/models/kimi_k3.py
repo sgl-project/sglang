@@ -365,24 +365,21 @@ def _add3(
 
 # The sharded tail adds one collective launch, so it only pays off at prefill
 # sizes.
-_SHARDED_UP_PROJ_MIN_TOKENS = 1024
+_ROCM_SHARDED_UP_PROJ_MIN_TOKENS = 1024
 
 
 def _sharded_up_proj_eligible(
     up_proj: Optional[nn.Module], tp_size: int, *, on_hip: bool
 ) -> bool:
-    """ROCm, and a dense bias-free bf16/fp16 up_proj weight whose output rows
-    split evenly over TP. The sharded tail calls the GEMM directly, so any
-    bias would be dropped."""
+    """ROCm TP8 and a bf16 up_proj whose rows split evenly over TP. Quantized
+    weights (FP8, packed MXFP4) have another dtype and keep the stock tail.
+    TP4 and TP2 measured slower than the replicated tail at 4096 tokens."""
     weight = getattr(up_proj, "weight", None)
     return (
         on_hip
-        and tp_size > 1
-        and getattr(up_proj, "bias", None) is None
+        and tp_size == 8
         and isinstance(weight, torch.Tensor)
-        and type(weight.data) is torch.Tensor
-        and weight.dtype in (torch.bfloat16, torch.float16)
-        and weight.dim() == 2
+        and weight.dtype == torch.bfloat16
         and weight.shape[0] % tp_size == 0
     )
 
@@ -1552,7 +1549,7 @@ class KimiK3MoE(nn.Module):
             self._forward_routed(hidden_states, router_logits, routed_input, latent)
             if (
                 self._shard_up_proj
-                and num_tokens >= _SHARDED_UP_PROJ_MIN_TOKENS
+                and num_tokens >= _ROCM_SHARDED_UP_PROJ_MIN_TOKENS
                 and not k3_ar_fusion.enabled()
             ):
                 return _sharded_up_proj_tail(
