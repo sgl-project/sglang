@@ -1,9 +1,9 @@
 //! Bounded Engine HTTP adapter. Control responses never become residency evidence.
+use crate::models::{Compatibility, PrefixTarget};
 use bytes::BytesMut;
 use futures::StreamExt;
 use reqwest::{header::HeaderValue, Client};
 use serde_json::{json, Value};
-use sgl_kv_orchestrator::models::{Compatibility, PrefixTarget};
 use std::time::Duration;
 
 #[derive(Clone, Debug)]
@@ -37,11 +37,8 @@ impl Capabilities {
                 .ok_or("hash scheme absent")?
                 .into(),
         };
-        sgl_kv_orchestrator::session_index::ContentKey::new(
-            compatibility.clone(),
-            "validate".into(),
-        )
-        .map_err(|_| "invalid compatibility")?;
+        crate::session_index::ContentKey::new(compatibility.clone(), "validate".into())
+            .map_err(|_| "invalid compatibility")?;
         Ok(Self {
             engine_id: value["engine_id"]
                 .as_str()

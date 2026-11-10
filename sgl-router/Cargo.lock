@@ -3624,10 +3624,17 @@ dependencies = [
 name = "sgl-kv-orchestrator"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "bytes",
+ "futures",
  "jsonschema",
+ "parking_lot",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

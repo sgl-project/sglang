@@ -4,15 +4,6 @@ use super::{
     OrchestrationConfig,
 };
 use crate::{
-    discovery::{ModelId, WorkerMode},
-    workers::{Worker, WorkerRegistry},
-};
-use axum::http::{HeaderMap, HeaderValue};
-use bytes::Bytes;
-use parking_lot::RwLock;
-use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
-use sgl_kv_orchestrator::{
     models::{PrefixTarget, SessionIdentity},
     operations::{DemandBook, DemandId},
     protocol::{parse_action, Action},
@@ -22,6 +13,11 @@ use sgl_kv_orchestrator::{
     },
     target_resolver::{FrozenTarget, Selector},
 };
+use bytes::Bytes;
+use parking_lot::RwLock;
+use reqwest::header::{HeaderMap, HeaderValue};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -95,8 +91,7 @@ pub struct Runtime {
 impl Runtime {
     pub fn start(
         config: OrchestrationConfig,
-        registry: Arc<WorkerRegistry>,
-        model: ModelId,
+        workers: impl Fn() -> Vec<String> + Send + 'static,
         auth: Option<HeaderValue>,
     ) -> Arc<Self> {
         let (tx, rx) = mpsc::channel(config.queue_capacity);
@@ -108,7 +103,7 @@ impl Runtime {
             config: config.clone(),
             traffic: traffic.clone(),
         });
-        let actor = Actor::new(config, registry, model, auth, published, traffic);
+        let actor = Actor::new(config, Box::new(workers), auth, published, traffic);
         tokio::spawn(actor.run(rx));
         runtime
     }
@@ -270,7 +265,7 @@ fn validate_input(value: &Value) -> Result<(), String> {
         if let Some(number) = value.get(key) {
             if number
                 .as_u64()
-                .is_none_or(|n| n > sgl_kv_orchestrator::protocol::MAX_INTEGER)
+                .is_none_or(|n| n > crate::protocol::MAX_INTEGER)
             {
                 return Err(format!("{key} exceeds the safe integer domain"));
             }
@@ -307,7 +302,7 @@ fn validate_input(value: &Value) -> Result<(), String> {
     {
         if revision
             .as_u64()
-            .is_none_or(|n| n > sgl_kv_orchestrator::protocol::MAX_INTEGER)
+            .is_none_or(|n| n > crate::protocol::MAX_INTEGER)
         {
             return Err("invalid selector revision".into());
         }
@@ -358,8 +353,7 @@ struct Intent {
 struct Actor {
     config: OrchestrationConfig,
     client: EngineClient,
-    registry: Arc<WorkerRegistry>,
-    model: ModelId,
+    workers: Box<dyn Fn() -> Vec<String> + Send>,
     published: Arc<RwLock<Published>>,
     index: SessionIndex,
     book: DemandBook,
@@ -376,8 +370,7 @@ struct Actor {
 impl Actor {
     fn new(
         config: OrchestrationConfig,
-        registry: Arc<WorkerRegistry>,
-        model: ModelId,
+        workers: Box<dyn Fn() -> Vec<String> + Send>,
         auth: Option<HeaderValue>,
         published: Arc<RwLock<Published>>,
         traffic: Arc<AtomicU64>,
@@ -387,8 +380,7 @@ impl Actor {
             index: SessionIndex::new(config.limits.clone()),
             book: DemandBook::new(config.limits.max_intents, config.max_operations),
             config: config.clone(),
-            registry,
-            model,
+            workers,
             published,
             jobs: BTreeMap::new(),
             intents: BTreeMap::new(),
@@ -423,18 +415,8 @@ impl Actor {
         // Actor shutdown never fabricates quiescence. Engine leases/deadlines
         // remain authoritative; explicit Router cleanup drains while running.
     }
-    fn workers(&self) -> Vec<Arc<Worker>> {
-        let mut workers: Vec<_> = self
-            .registry
-            .healthy_workers_for(&self.model)
-            .into_iter()
-            .filter(|w| w.mode() == WorkerMode::Plain || w.mode() == WorkerMode::Prefill)
-            .collect();
-        workers.sort_by(|a, b| {
-            a.router_inflight_load()
-                .cmp(&b.router_inflight_load())
-                .then_with(|| a.id.0.cmp(&b.id.0))
-        });
+    fn workers(&self) -> Vec<String> {
+        let mut workers = (self.workers)();
         workers.truncate(self.config.max_workers);
         workers
     }
@@ -517,7 +499,7 @@ impl Actor {
         salt: Option<String>,
         worker: String,
     ) -> Result<(), String> {
-        if !self.workers().iter().any(|w| w.url == worker) {
+        if !self.workers().iter().any(|w| *w == worker) {
             return Err("worker unavailable".into());
         }
         let caps = self.refresh(&worker).await?;
@@ -1040,17 +1022,17 @@ impl Actor {
         }
         let mut workers = self.workers();
         if let Some(url) = value["worker_url"].as_str() {
-            workers.retain(|w| w.url == url);
+            workers.retain(|w| w == url);
         }
         // A read-only affinity preference. No policy.select, load guard, pending
         // stake or session-affinity commit is used for preparation placement.
         if let Some(preferred) = self.last_route.get(&task) {
-            workers.sort_by_key(|w| (w.url != *preferred, w.router_inflight_load()));
+            workers.sort_by_key(|url| url != preferred);
         }
         let mut available = Vec::new();
-        for w in workers {
-            if let Ok(caps) = self.refresh(&w.url).await {
-                available.push((w.url.clone(), caps));
+        for url in workers {
+            if let Ok(caps) = self.refresh(&url).await {
+                available.push((url, caps));
             }
         }
         let due = Instant::now()
@@ -1263,7 +1245,7 @@ impl Actor {
             self.release(&d);
         }
         self.tick_cursor = self.tick_cursor.wrapping_add(1);
-        let healthy: BTreeSet<_> = self.workers().into_iter().map(|w| w.url.clone()).collect();
+        let healthy: BTreeSet<_> = self.workers().into_iter().collect();
         self.caps.retain(|url, _| healthy.contains(url));
         for job in self.jobs.values_mut().filter(|j| !healthy.contains(&j.url)) {
             job.ready_end = 0;
@@ -1272,8 +1254,8 @@ impl Actor {
         }
         let candidates = self.workers();
         if let Some(worker) = candidates.get(self.tick_cursor % candidates.len().max(1)) {
-            if let Ok(caps) = self.refresh(&worker.url).await {
-                let _ = self.poll_feedback(&worker.url, &caps).await;
+            if let Ok(caps) = self.refresh(worker).await {
+                let _ = self.poll_feedback(worker, &caps).await;
             }
         }
         let ids: Vec<_> = self.jobs.keys().cloned().collect();
@@ -1345,7 +1327,7 @@ impl Actor {
         if Instant::now() < job.due {
             return Ok(());
         }
-        if !self.workers().iter().any(|w| w.url == job.url) {
+        if !self.workers().iter().any(|w| *w == job.url) {
             return Err("worker unavailable".into());
         }
         let live = self.refresh(&job.url).await?;
@@ -1466,7 +1448,7 @@ impl Actor {
     }
     fn publish(&self) {
         let now = Instant::now();
-        let healthy: BTreeSet<_> = self.workers().iter().map(|w| w.url.clone()).collect();
+        let healthy: BTreeSet<_> = self.workers().into_iter().collect();
         let ready = self
             .jobs
             .values()

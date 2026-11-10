@@ -133,7 +133,7 @@ impl AppContext {
         let bucket_selector = Arc::new(BucketSelector::new(config.model.bucket_config.clone()));
         let decode_gate = DecodeGate::new(config.proxy.decode_dispatch_limit);
         let orchestration = config.server.orchestration.clone().map(|cfg| {
-            crate::orchestration::Runtime::start(
+            crate::orchestration::start(
                 cfg,
                 registry.clone(),
                 ModelId(config.model.id.clone()),
