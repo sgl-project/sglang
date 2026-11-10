@@ -2084,11 +2084,8 @@ class KVCacheConfigurator:
         if not self.is_draft_worker:
             # Fresh rows include beam slots and PD preallocation. Reused rows
             # retain their current history; retraction has its own replay reset.
-            # FIXME: the ring and request-window rows are reset on the schedule
-            # stream when a row is reused, while the forward of the row's
-            # previous request may still read or write them (the write-after-read
-            # barrier orders only shared reads). Order the reset after that
-            # forward.
+            # TODO(ch-wan): these C4 ring and request-window resets race the row's
+            # previous forward; run them in the next forward, as `reset_new_rows` does.
             def reset_request_rows(rows):
                 if token_to_kv_pool._unified_kv:
                     token_to_kv_pool.clear_c4_req_states(rows)
