@@ -203,6 +203,32 @@ def request_model_kwargs(
     return kwargs
 
 
+def parse_form_extra_value(value: Any) -> Any:
+    """Decode a multipart form value as JSON, keeping text that is not JSON."""
+    if not isinstance(value, str):
+        return value
+    try:
+        return json.loads(value)
+    except Exception:
+        return value
+
+
+def form_model_kwargs(
+    form: Any,
+    sampling_params_cls: type[SamplingParams],
+    api: Literal["image", "video"],
+) -> dict[str, Any]:
+    """Multipart counterpart of ``request_model_kwargs``: the active model's
+    declared constructor fields sent as form fields."""
+    kwargs = {}
+    for field_name in get_sampling_request_extra_fields(sampling_params_cls, api):
+        if field_name in form:
+            value = parse_form_extra_value(form[field_name])
+            if value is not None:
+                kwargs[field_name] = value
+    return kwargs
+
+
 @contextmanager
 def temp_dir_if_disabled(
     configured_path: str | None,

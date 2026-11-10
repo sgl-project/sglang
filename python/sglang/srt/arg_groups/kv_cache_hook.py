@@ -548,6 +548,13 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             "--enable-unified-memory with PD disaggregation does not support "
             "speculative decoding with the Mooncake transfer backend."
         )
+        # This flag also selects decode's non-blocking metadata readback, which
+        # records a receive as in flight before its destination is published.
+        assert not envs.SGLANG_DISAGG_STAGING_BUFFER.get(), (
+            "--enable-unified-memory with PD disaggregation does not support "
+            "SGLANG_DISAGG_STAGING_BUFFER: heterogeneous-TP staging is not "
+            "supported with unified memory; unset SGLANG_DISAGG_STAGING_BUFFER."
+        )
         assert not cfg.enable_hisparse, (
             "--enable-unified-memory with PD disaggregation is not compatible "
             "with --enable-hisparse: the decode-side HiSparse prealloc path "

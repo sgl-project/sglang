@@ -277,6 +277,10 @@ class MiniMaxH3Qwen3VLEncoder(TextEncoder):
             use_tensor_parallel=True,
             prefix="model",
         )
+        # CPU initialization computes pow differently from CUDA. Rebuild the
+        # small vision frequency table after offload transfers so conditioning
+        # matches the GPU-resident encoder, as in the native Qwen-Image path.
+        self.model.visual.rotary_pos_emb.recompute_on_device_change = True
         # H3 and ClipProj consume an unnormalized intermediate residual stream.
         self.model.language_model.norm = nn.Identity()
         self.image_token_id = int(arch.image_token_id)
@@ -334,6 +338,7 @@ class MiniMaxH3Qwen3VLEncoder(TextEncoder):
         image_grid_thw: torch.Tensor | None = None,
         pixel_values_videos: torch.Tensor | None = None,
         video_grid_thw: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if input_ids.dim() != 1:
             raise ValueError(f"input_ids must be 1-D, got {list(input_ids.shape)}")
@@ -355,8 +360,12 @@ class MiniMaxH3Qwen3VLEncoder(TextEncoder):
             if video_grid_thw is not None
             else None
         )
-        position_ids = None
-        if host_image_grid_thw is not None or host_video_grid_thw is not None:
+        # Callers may pass mRoPE position_ids (the image release repeats the final
+        # multimodal position over padding); otherwise derive them here, where
+        # padding counts as trailing text.
+        if position_ids is None and (
+            host_image_grid_thw is not None or host_video_grid_thw is not None
+        ):
             position_ids, _ = self.model.get_rope_index(
                 host_ids,
                 host_image_grid_thw,
