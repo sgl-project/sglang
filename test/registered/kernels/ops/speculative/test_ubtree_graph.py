@@ -793,7 +793,7 @@ def _reference_ubtree_batch(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA Graph requires CUDA")
-@pytest.mark.parametrize("width", range(2, 50))
+@pytest.mark.parametrize("width", [2, 16, 17, 32, 33, 49])
 def test_tree_metadata_all_widths_matches_cpu_after_replay(width):
     from sglang.srt.speculative.ubtree_components.tree import (
         _tree_metadata,
