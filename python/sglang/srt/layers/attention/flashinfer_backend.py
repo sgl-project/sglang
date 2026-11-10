@@ -1583,7 +1583,6 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
                 if forward_batch.full_kv_replay:
                     fresh = forward_batch.full_kv_fresh_token_indices
-                    assert fresh is not None
                     # Compact K/V must never overwrite borrowed tree-owned slots.
                     write_loc = KVWriteLoc(
                         write_loc.loc.index_select(0, fresh),

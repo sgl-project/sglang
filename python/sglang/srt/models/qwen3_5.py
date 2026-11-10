@@ -1631,10 +1631,6 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
     ) -> torch.Tensor:
         """Full attention forward pass."""
         if forward_batch.full_kv_replay:
-            assert _is_cuda and isinstance(
-                self.qkv_proj.quant_method, UnquantizedLinearMethod
-            )
-            assert self.attn_output_gate and self.qkv_proj.bias is None
             q_gate = torch.nn.functional.linear(
                 hidden_states, self.qkv_proj.weight[: 2 * self.q_size]
             )

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Usage: launch_server.sh MODEL_PATH REUSE_FLAG [PORT]
+# Usage: launch_server.sh MODEL_PATH REUSE_FLAG [PORT] [EXTRA_SERVER_ARGS...]
 model_path=$1
 reuse_flag=$2
 port=${3:-30000}
@@ -36,4 +36,5 @@ exec "${PYTHON:-python3}" -m sglang.launch_server \
   --max-running-requests "${MAX_RUNNING_REQUESTS:-4}" \
   --max-mamba-cache-size "${MAX_MAMBA_CACHE_SIZE:-32}" --mamba-max-states-per-path 1 --mem-fraction-static "${MEM_FRACTION_STATIC:-0.8}" \
   "${overlap_args[@]}" --cuda-graph-backend-prefill disabled \
-  --cuda-graph-backend-decode disabled --log-level debug --enable-request-time-stats-logging
+  --cuda-graph-backend-decode disabled --log-level debug --enable-request-time-stats-logging \
+  "${@:4}"

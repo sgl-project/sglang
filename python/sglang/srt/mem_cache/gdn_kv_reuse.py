@@ -14,7 +14,6 @@ from sglang.srt.runtime_context import (
     get_memory,
     get_parallel,
     get_schedule,
-    mamba_checkpoint_grid,
 )
 
 logger = logging.getLogger(__name__)
@@ -24,7 +23,7 @@ def try_borrow_full_kv(batch):
     """Return per-request borrowed slots, or None if no request can reuse KV.
 
     Admission still charges the ordinary extend budget. Each reusable request
-    must have a page/checkpoint-aligned, entirely cached prefill chunk.
+    must have a page-aligned, entirely cached prefill chunk.
     """
     if not envs.SGLANG_ENABLE_GDN_KV_REUSE.get():
         return None
@@ -37,10 +36,7 @@ def try_borrow_full_kv(batch):
         not isinstance(cache, UnifiedRadixCache)
         or cache.disable
         or not cache.supports_mamba()
-        or len(cache.components) != 2
-        or not cache.enable_mamba_extra_buffer
         or get_memory().enable_hierarchical_cache
-        or get_memory().enable_session_radix_cache
         or get_disagg().disaggregation_mode != "null"
         or not (
             (
@@ -53,12 +49,13 @@ def try_borrow_full_kv(batch):
             )
         )
         or config.quantization is not None
-        or config.dtype != torch.bfloat16
         or not batch.spec_algorithm.is_none()
         or get_schedule().enable_mixed_chunk
-        or get_lora().enable_lora
-        or parallel.tp_size != 1
-        or parallel.pp_size != 1
+        or (
+            get_lora().enable_lora
+            and any(req.lora_id is not None for req in batch.reqs)
+        )
+        or parallel.dcp_enabled
         or parallel.attn_cp_size != 1
         or parallel.attn_dp_size != 1
         or attention_backends()[0] != "flashinfer"
@@ -105,24 +102,16 @@ def try_borrow_full_kv(batch):
 
 def _try_borrow_request(cache, req):
     start, end = req.prefix_len, req.extend_end
-    grid = mamba_checkpoint_grid(cache.page_size)
     if (
-        start == 0
-        or end <= start
+        end <= start
         or start % cache.page_size
         or end % cache.page_size
-        or (end - start) % grid
         or req.kv.cache_protected_len != start
         or req.full_kv_replay_node is not None
-        or req.skip_radix_cache_insert
         or req.multimodal_inputs is not None
         or req.input_embeds is not None
         or req.positional_embed_overrides is not None
         or req.session_id is not None
-        or (
-            req.mamba_branching_seqlen is not None
-            and start < req.mamba_branching_seqlen < end
-        )
     ):
         return None
     key = RadixKey(
@@ -137,7 +126,6 @@ def _try_borrow_request(cache, req):
     cache.tree_core.inc_full_pin(node)
     try:
         indices = cache.path_device_indices(node)[start:end]
-        assert len(indices) == end - start
     except Exception:
         cache.tree_core.dec_full_pin(node)
         raise
@@ -149,8 +137,13 @@ def _try_borrow_request(cache, req):
     return indices
 
 
-def release_full_kv_pin(cache, req):
-    """Release after a normal tree lock takes over, or on request teardown."""
+def release_full_kv_pin(cache, req, *, covered_prefix_len=None):
+    """Release once the normal lock covers borrowed KV, or on teardown."""
+    if (
+        covered_prefix_len is not None
+        and covered_prefix_len < req.kv.cache_protected_len
+    ):
+        return
     if req.full_kv_replay_node is not None:
         cache.tree_core.dec_full_pin(req.full_kv_replay_node)
         req.full_kv_replay_node = None

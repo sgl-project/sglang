@@ -33,10 +33,9 @@ class TestGdnKVReuse(CustomTestCase):
                 enable_hierarchical_cache=False, enable_session_radix_cache=False
             ),
             "get_parallel": lambda: NS(
-                tp_size=1, pp_size=1, attn_cp_size=1, attn_dp_size=1
+                tp_size=1, pp_size=1, attn_cp_size=1, attn_dp_size=1, dcp_enabled=False
             ),
             "get_schedule": lambda: NS(enable_mixed_chunk=False),
-            "mamba_checkpoint_grid": lambda page_size: 256,
         }
         self.context.enter_context(patch.multiple(reuse, **values))
         self.context.enter_context(
@@ -52,6 +51,11 @@ class TestGdnKVReuse(CustomTestCase):
         self.cache.page_size = 256
         self.cache.tree_core = Mock()
         self.cache.tree_core.match_full_device_prefix.return_value = (8192, 17, 12288)
+        self.cache.tree_core.match_full_device_prefix.side_effect = lambda key: (
+            (4096, 17, 4096)
+            if key.cache_salt == "uncached"
+            else self.cache.tree_core.match_full_device_prefix.return_value
+        )
         self.indices = torch.arange(12288, dtype=torch.int64) + 256
         self.cache.path_device_indices.return_value = self.indices
         self.req = NS(
@@ -69,6 +73,7 @@ class TestGdnKVReuse(CustomTestCase):
             extra_key=None,
             cache_salt="test-namespace",
             rid="test",
+            lora_id=None,
         )
         self.batch = NS(
             device="cpu",
@@ -169,7 +174,7 @@ class TestGdnKVReuse(CustomTestCase):
         fresh = deepcopy(self.req)
         fresh.extend_end = 4352
         fresh.mamba_branching_seqlen = 4352
-        fresh.skip_radix_cache_insert = True
+        fresh.cache_salt = "uncached"
         other = deepcopy(self.req)
         self.batch.reqs = [fresh, self.req, other]
         borrowed = reuse.try_borrow_full_kv(self.batch)
@@ -201,7 +206,7 @@ class TestGdnKVReuse(CustomTestCase):
     def test_mixed_allocation_only_allocates_fresh_request_slots(self):
         fresh = deepcopy(self.req)
         fresh.extend_end = 4608
-        fresh.skip_radix_cache_insert = True
+        fresh.cache_salt = "uncached"
         self.batch.reqs = [self.req, fresh]
         self.batch.seq_lens_cpu = torch.tensor([8192, 4608])
         self.batch.req_to_token_pool = NS(req_to_token=torch.empty((2, 8192)))
@@ -233,7 +238,7 @@ class TestGdnKVReuse(CustomTestCase):
     def _check_allocation_failure(self, stage):
         fresh = deepcopy(self.req)
         fresh.extend_end = 4352
-        fresh.skip_radix_cache_insert = True
+        fresh.cache_salt = "uncached"
         self.batch.reqs.append(fresh)
         self.batch.maybe_evict_swa = Mock()
         self.batch.is_dllm = lambda: False
@@ -309,6 +314,14 @@ class TestGdnKVReuse(CustomTestCase):
         self.req.extend_end = 8191
         self.assert_fallback()
 
+    def test_unpaged_cache_does_not_require_state_chunk_alignment(self):
+        self.cache.page_size = 1
+        self.cache.enable_mamba_extra_buffer = False
+        self.req.extend_end = 8191
+        out = reuse.try_borrow_full_kv(self.batch)[0]
+        self.assertTrue(torch.equal(out, self.indices[4096:8191]))
+        self.assertEqual(self.req.kv.cache_protected_len, 8191)
+
     def test_quantized_model_falls_back(self):
         self.batch.model_config.quantization = "modelopt_fp4"
         self.assert_fallback()
@@ -317,7 +330,7 @@ class TestGdnKVReuse(CustomTestCase):
         self.batch.enable_overlap = True
         fresh = deepcopy(self.req)
         fresh.extend_end = 4352
-        fresh.skip_radix_cache_insert = True
+        fresh.cache_salt = "uncached"
         self.batch.reqs = [self.req, fresh]
         borrowed = reuse.try_borrow_full_kv(self.batch)
         self.assertIsNotNone(borrowed[0])
@@ -354,9 +367,88 @@ class TestGdnKVReuse(CustomTestCase):
         saved = scheduler.batch_record_buf[1][1]
         self.assertTrue(any(value is fresh for value in saved))
 
-    def test_earlier_branch_checkpoint_falls_back(self):
-        self.req.mamba_branching_seqlen = 6144
-        self.assert_fallback()
+    def test_interior_gdn_checkpoint_borrows_entire_kv_chunk(self):
+        self.req.full_untruncated_fill_ids = self.req.full_untruncated_fill_ids[:8192]
+        self.req.mamba_branching_seqlen = 7936
+        out = reuse.try_borrow_full_kv(self.batch)[0]
+        self.assertTrue(torch.equal(out, self.indices[4096:8192]))
+        self.assertEqual(self.req.kv.cache_protected_len, 8192)
+        reuse.release_full_kv_pin(self.cache, self.req, covered_prefix_len=7936)
+        self.cache.tree_core.dec_full_pin.assert_not_called()
+        self.assertEqual(self.req.full_kv_replay_node, 17)
+        reuse.release_full_kv_pin(self.cache, self.req, covered_prefix_len=8192)
+        self.cache.tree_core.dec_full_pin.assert_called_once_with(17)
+
+    def test_interior_checkpoint_pin_is_released_on_teardown(self):
+        reuse.try_borrow_full_kv(self.batch)
+        reuse.release_full_kv_pin(self.cache, self.req, covered_prefix_len=7936)
+        UnifiedRadixCache.on_release(self.cache, self.req, checkpointed=True)
+        self.cache.tree_core.dec_full_pin.assert_called_once_with(17)
+
+    def test_zero_gdn_prefix_can_replay_cached_kv(self):
+        self.req.prefix_len = 0
+        self.req.extend_end = 4096
+        self.req.kv.protect_prefix(0)
+        out = reuse.try_borrow_full_kv(self.batch)[0]
+        self.assertTrue(torch.equal(out, self.indices[:4096]))
+
+    def test_fp16_and_tensor_parallel_can_borrow_rank_local_slots(self):
+        self.batch.model_config.dtype = torch.float16
+        with patch.object(
+            reuse,
+            "get_parallel",
+            return_value=NS(
+                tp_size=2, pp_size=1, attn_cp_size=1, attn_dp_size=1, dcp_enabled=False
+            ),
+        ):
+            out = reuse.try_borrow_full_kv(self.batch)[0]
+        self.assertTrue(torch.equal(out, self.indices[4096:8192]))
+
+    def test_pipeline_parallel_can_borrow_stage_local_slots(self):
+        with patch.object(
+            reuse,
+            "get_parallel",
+            return_value=NS(
+                tp_size=1,
+                pp_size=2,
+                attn_cp_size=1,
+                attn_dp_size=1,
+                dcp_enabled=False,
+            ),
+        ):
+            self.assertIsNotNone(reuse.try_borrow_full_kv(self.batch))
+
+    def test_dcp_layout_requires_index_remapping(self):
+        with patch.object(
+            reuse,
+            "get_parallel",
+            return_value=NS(
+                tp_size=2,
+                pp_size=1,
+                attn_cp_size=1,
+                attn_dp_size=1,
+                dcp_enabled=True,
+            ),
+        ):
+            self.assert_fallback()
+
+    def test_skip_insert_still_allows_cached_kv_reads(self):
+        self.req.skip_radix_cache_insert = True
+        self.assertIsNotNone(reuse.try_borrow_full_kv(self.batch))
+        self.cache._components_tuple = ()
+        UnifiedRadixCache.on_release(self.cache, self.req, checkpointed=False)
+        self.cache.tree_core.dec_full_pin.assert_called_once_with(17)
+
+    def test_lora_enabled_without_active_adapters_can_borrow(self):
+        with patch.object(reuse, "get_lora", return_value=NS(enable_lora=True)):
+            self.assertIsNotNone(reuse.try_borrow_full_kv(self.batch))
+
+    def test_active_lora_in_any_request_falls_back_for_whole_batch(self):
+        other = deepcopy(self.req)
+        other.lora_id = "adapter"
+        self.batch.reqs.append(other)
+        with patch.object(reuse, "get_lora", return_value=NS(enable_lora=True)):
+            self.assert_fallback()
 
     def test_failed_path_collection_releases_pin(self):
         self.cache.path_device_indices.side_effect = RuntimeError("failed collection")

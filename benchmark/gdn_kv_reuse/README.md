@@ -4,7 +4,36 @@ This manual benchmark exercises real HTTP serving, scheduling, prefix matching,
 Full KV allocation/borrowing, GDN checkpoint tracking, and request cleanup. It
 compares `SGLANG_ENABLE_GDN_KV_REUSE=0` against `1` on the same source snapshot.
 
-## Request fixture
+## Pure 8192-token replay
+
+Use `bench_pure_replay.py` for an **8192-token input and one output token**.
+No query suffix is appended. The GDN prefix is 4096; Full KV is cached through
+8192. Each request therefore replays exactly one 4096-token chunk, all of whose
+Full KV can be reused, including at concurrency 8 or 16.
+
+The untimed preparation submits a seed of 8449 tokens and then extends it to
+8705, allowing the native path-state cap to evict the unlocked 8192 checkpoint
+without retaining a long KV suffix. A divergent branch recreates the 4096 GDN
+checkpoint. No cache or state tensors are injected.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 MAX_RUNNING_REQUESTS=16 MAX_MAMBA_CACHE_SIZE=64 \
+  MAX_TOTAL_TOKENS=81920 MEM_FRACTION_STATIC=0.9 PYTHON=/path/to/venv/bin/python \
+  bash benchmark/gdn_kv_reuse/launch_server.sh /path/to/Qwen3.5-4B 1
+python benchmark/gdn_kv_reuse/bench_pure_replay.py \
+  --model-path /path/to/Qwen3.5-4B --concurrency 16 \
+  --new-tokens 1 --output-dir pure-replay
+```
+
+The normal matcher leaves the last input token for logits, so it may request an
+interior GDN checkpoint at 7936. This does not prevent KV reuse: the extra Full
+pin and protected prefix remain at 8192 until a later checkpoint lock covers
+them, or until teardown. See [admission audit](ADMISSION_AUDIT.md).
+
+## Historical fixture with a new suffix
+
+The historical results below used a nine-token query suffix and an 8201-token
+input. They are not measurements of the pure 8192-token case above.
 
 With chunk size 4096, page size 256, and
 `--mamba-max-states-per-path 1`:
@@ -124,8 +153,10 @@ while other requests allocate fresh slots. Q and any attention gate are computed
 for all tokens; K/V are computed and written only for ordinary chunks. The
 single-request restrictions above still apply to each reusable chunk, including
 alignment and the requirement that the entire chunk is cached. Both normal
-and overlap scheduling are supported. Prefill graphs, quantization, and TP/PP
-greater than one remain unsupported.
+and overlap scheduling are supported. Prefill graphs and quantized projection
+weights remain outside this path. Native Qwen projections use rank-local
+weights; there is no blanket TP/PP=1 or BF16-only gate. The external Olmo fixture
+still has its own TP/PP=1 and model-equation restrictions.
 
 Set `ENABLE_OVERLAP=1` with the launcher to use SGLang's overlap scheduler.
 For eight requests, also set `MAX_MAMBA_CACHE_SIZE=64`: overlap uses five
@@ -142,7 +173,7 @@ CUDA_VISIBLE_DEVICES=0 ENABLE_OVERLAP=1 MAX_MAMBA_CACHE_SIZE=64 \
 
 The scheduler's existing per-forward field snapshot retains the compact K/V
 index tensor across streams. A request's temporary Full pin remains held until
-checkpoint lock handover or teardown. If the previous replay still holds that
+a checkpoint lock covers its entire borrowed KV prefix, or until teardown. If the previous replay still holds that
 pin when the request is scheduled again, the new chunk falls back rather than
 replacing the in-flight pin. No additional stream synchronization is introduced.
 
