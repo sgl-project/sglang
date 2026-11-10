@@ -9,6 +9,7 @@ import pytest
 import torch
 
 from sglang.kernels.ops.attention.mla_window_indices import mla_window_sparse_indices
+from sglang.kernels.ops.speculative.dflash_ring_locs import dflash_ring_block_locs
 from sglang.srt.speculative.dflash_draft_ring import (
     DFlashDraftKVRing,
     draft_kv_ring_pool_rows,
@@ -69,6 +70,25 @@ def test_window_reads_the_rows_the_ring_writes(dcp):
             got = indices[row, : int(counts[row])].tolist()
             assert got == expected, (rank, row)
             assert all(0 < r < pool_rows for r in got)
+
+
+@pytest.mark.parametrize("dcp", [1, 8])
+def test_fused_block_locs_match_locs(dcp):
+    """SGLANG_OPT_DFLASH_RING_LOCS_FUSED computes the same block locs."""
+    device = "cuda"
+    ring = _ring(dcp, 9, device)
+    req_pool_indices = torch.tensor([3, 7, 1, 8], dtype=torch.int32, device=device)
+    prefix = torch.tensor([5000, 700, 3, 0], dtype=torch.int64, device=device)
+    positions = (prefix.unsqueeze(1) + torch.arange(BLOCK, device=device)).reshape(-1)
+    expected = ring.locs(req_pool_indices.repeat_interleave(BLOCK), positions)
+    got = dflash_ring_block_locs(
+        req_pool_indices,
+        positions,
+        block_size=BLOCK,
+        rows_per_req=ring.rows_per_req,
+        dcp_size=dcp,
+    )
+    assert torch.equal(got, expected)
 
 
 @pytest.mark.parametrize("dcp", [1, 8])
