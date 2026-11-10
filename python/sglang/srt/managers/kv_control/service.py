@@ -432,11 +432,6 @@ class KVControlService:
             self.feedback.close()
         atexit.unregister(self.close)
 
-    @property
-    def blocks_prefill(self):
-        transfers = self.control.executor.transfers
-        return transfers is not None and transfers.blocks_prefill
-
     def progress(self):
         executor = self.control.executor
         backend = self._backend_identity()

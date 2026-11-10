@@ -1961,8 +1961,6 @@ class UnifiedRadixCache(BasePrefixCache):
         node_id: NodeId,
         mem_quota: Optional[int] = None,
         req=None,
-        *,
-        minimum_load_tokens: Optional[int] = None,
     ) -> bool:
         """Load evicted KV data from host back to device (H→D)."""
         if self.cache_controller is None:
@@ -1989,7 +1987,6 @@ class UnifiedRadixCache(BasePrefixCache):
                 result=result,
                 ancestor_lock_params=ancestor_lock_params,
                 host_anchor_params=host_anchor_params,
-                minimum_load_tokens=minimum_load_tokens,
             )
             return success
         finally:
@@ -2005,7 +2002,6 @@ class UnifiedRadixCache(BasePrefixCache):
         result: IncLockRefResult,
         ancestor_lock_params: DecLockRefParams,
         host_anchor_params: DecLockRefParams,
-        minimum_load_tokens: Optional[int] = None,
     ) -> bool:
         # Build the KV + per-component aux transfers.
         kv_xfer, comp_xfers = self.tree_core.build_load_back_spec(node_id, req=req)
@@ -2019,12 +2015,7 @@ class UnifiedRadixCache(BasePrefixCache):
         # when the Full-KV load is skipped by thresholding. max(1, ...): an
         # entirely empty spec (e.g. foreign-pin rejection) must never report
         # success, even at load_back_threshold <= 0.
-        threshold = (
-            self.load_back_threshold
-            if minimum_load_tokens is None
-            else minimum_load_tokens
-        )
-        if (kv_tokens < max(1, threshold) and not comp_xfers) or (
+        if (kv_tokens < max(1, self.load_back_threshold) and not comp_xfers) or (
             mem_quota is not None and kv_tokens + result.delta > mem_quota
         ):
             self.dec_lock_ref(node_id, ancestor_lock_params)

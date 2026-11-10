@@ -31,7 +31,7 @@ def public_capabilities(caps):
         (
             "sglang.prefetch",
             "copy_to",
-            (("host", "gpu"), ("storage", "host"), ("storage", "gpu")),
+            (("storage", "host"),),
         ),
         (
             "sglang.demote",

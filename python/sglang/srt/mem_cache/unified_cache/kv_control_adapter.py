@@ -227,7 +227,7 @@ class UnifiedCacheExecutor:
             "tier": "gpu",
             "directions": (
                 {
-                    "copy_to": (("gpu", "host"), ("host", "gpu"))
+                    "copy_to": (("gpu", "host"),)
                     + (
                         self.storage_adapter.copy_paths
                         if self.storage_adapter is not None
@@ -255,7 +255,6 @@ class UnifiedCacheExecutor:
                     else None,
                     "granularity": "whole_token_prefix_at_existing_radix_boundary",
                     "page_alignment": self.core.page_size,
-                    "native_load_prefill_barrier": True,
                     "gpu_copy_approval": "scheduler_prefill_budget"
                     if self.gpu_copy_capacity is not None
                     else "allocator_capacity",

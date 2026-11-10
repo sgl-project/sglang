@@ -14,6 +14,7 @@ from test_kv_control_transfers import (
     public_transfer,
     seed,
     stage,
+    start_inference_load,
     wait,
 )
 
@@ -79,13 +80,13 @@ class TestKVControlHostDemote(cache_fixtures.KVCacheTestCase):
                 # H2D back to a request-usable device allocation.
                 loaded = public_transfer(service, "prefetch", "storage", "host", "read")
                 self.assertEqual(wait(service, loaded).status, Status.COMPLETED)
-                loaded = public_transfer(service, "prefetch", "host", "gpu", "load")
-                stage(service, dma)
-                self.assertEqual(wait(service, loaded).status, Status.COMPLETED)
                 rows = service.control.executor._walk(
                     (1, 2, 3, 4),
                     service.control.executor._compatibility(cache_fixtures.target()),
                 )
+                start_inference_load(cache, rows[-1][0])
+                dma.finish()
+                cache.loading_check()
                 indices = torch.cat([n.component_data[FULL].value for n, *_ in rows])
                 device = cache.token_to_kv_pool_allocator.get_kvcache()
                 self.assertTrue(torch.all(device.k_buffer[0][indices] == 7))
@@ -272,9 +273,7 @@ class TestKVControlHostDemote(cache_fixtures.KVCacheTestCase):
                         service, "demote", "host", "storage", "cold"
                     )
                     self.assertTrue(entered.wait(5))
-                    loaded = public_transfer(service, "prefetch", "host", "gpu", "load")
-                    self.assertEqual(loaded.status, Status.RUNNING)
-                    service.progress()
+                    start_inference_load(cache, node)
                     self.assertTrue(dma.pending)
                     release.set()
                     done = wait(service, result)
@@ -287,7 +286,7 @@ class TestKVControlHostDemote(cache_fixtures.KVCacheTestCase):
             self.assertEqual(pool.available_size(), initial)
             self.assertIsNotNone(node.component_data[FULL].host_value)
             dma.finish()
-            self.assertEqual(wait(service, loaded).status, Status.COMPLETED)
+            cache.loading_check()
             self.assertTrue(
                 torch.all(
                     cache.token_to_kv_pool_allocator.get_kvcache().k_buffer[0][

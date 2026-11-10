@@ -194,12 +194,13 @@ class TestProgrammableKVCache(CustomTestCase):
             self._wait(
                 service,
                 public_action(
-                    service, "prefetch", target, location, {"tier": "gpu"}, "read"
+                    service, "prefetch", target, location, {"tier": "host"}, "read"
                 ).ref,
             )
             path = service.control.executor._walk(
                 tokens, service.control.executor._compatibility(target)
             )
+            self._load_for_inference(cache, path[-1][0])
             actual = torch.cat(
                 [node.component_data[ComponentType.FULL].value for node, *_ in path]
             )
@@ -311,19 +312,23 @@ class TestProgrammableKVCache(CustomTestCase):
                 # Reusing the same allocator slots must still require an actual copy.
                 pool.k_buffer[0].fill_(-17)
                 pool.v_buffer[0].fill_(-18)
-                result = public_action(
-                    service,
-                    "prefetch",
-                    target,
-                    {"tier": cold_tier},
-                    {"tier": "gpu"},
-                    "restore",
-                )
-                loaded = self._wait(service, result.ref)
-                self.assertEqual(loaded.update.completed_steps, ("destination_ready",))
+                if storage:
+                    result = public_action(
+                        service,
+                        "prefetch",
+                        target,
+                        {"tier": "storage"},
+                        {"tier": "host"},
+                        "restore",
+                    )
+                    loaded = self._wait(service, result.ref)
+                    self.assertEqual(
+                        loaded.update.completed_steps, ("destination_ready",)
+                    )
                 node = service.control.executor._walk(
                     target.token_ids, service.control.executor._compatibility(target)
                 )[-1][0]
+                self._load_for_inference(cache, node)
                 restored = node.component_data[ComponentType.FULL].value
                 self.assertTrue(torch.all(pool.k_buffer[0][restored] == 17).item())
                 self.assertTrue(torch.all(pool.v_buffer[0][restored] == 18).item())
@@ -336,7 +341,6 @@ class TestProgrammableKVCache(CustomTestCase):
                 cache.evict(EvictParams(num_tokens=4))
                 self.assertEqual(allocator.available_size(), 64)
                 self.assertFalse(service.has_pending)
-                self.assertFalse(service.blocks_prefill)
                 cache.sanity_check()
             finally:
                 torch.cuda.synchronize()
@@ -501,10 +505,7 @@ class TestProgrammableKVCache(CustomTestCase):
                         ).item()
                     )
             # A normal host-to-GPU load after publication verifies usable bytes.
-            loaded = public_action(
-                sb, "prefetch", target, {"tier": "host"}, {"tier": "gpu"}, "load"
-            )
-            self._wait(sb, loaded.ref)
+            self._load_for_inference(b, nodes[-1][0])
             for node, *_ in nodes:
                 cd = node.component_data[ComponentType.FULL]
                 for layer in range(2):
@@ -518,6 +519,13 @@ class TestProgrammableKVCache(CustomTestCase):
             self.assertFalse(sb.has_pending)
             a.sanity_check()
             b.sanity_check()
+
+    def _load_for_inference(self, cache, node):
+        with patch.object(cache, "load_back_threshold", 1):
+            self.assertTrue(cache.load_back(node.id))
+        cache.ready_to_load_host_cache()
+        torch.cuda.synchronize()
+        cache.loading_check()
 
     def _wait(self, service, ref):
         deadline = time.monotonic() + 10

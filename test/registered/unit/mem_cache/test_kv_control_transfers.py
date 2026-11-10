@@ -15,9 +15,7 @@ import test_kv_control_cache as cache_fixtures
 import torch
 
 from sglang.srt.managers.kv_control.contracts import (
-    Associate,
     Location,
-    SessionTarget,
     Status,
 )
 from sglang.srt.managers.kv_control.service import (
@@ -180,21 +178,6 @@ def seed(cache, tokens=(1, 2, 3, 4), value=7, *, salt=None):
     return cache.tree_core.node_by_id(result.last_device_node)
 
 
-def branched_scope(cache, service):
-    seed(cache, (1, 2, 3, 4))
-    seed(cache, (1, 2, 5, 6), value=11)
-    for name, tokens in (("a", (1, 2, 3, 4)), ("b", (1, 2, 5, 6))):
-        service.control.index.associate(
-            Associate(
-                session_id="task",
-                continuation_id=name,
-                expected_revision=0,
-                target=cache_fixtures.target(tokens),
-            )
-        )
-    return SessionTarget(namespace="ns", session_id="task")
-
-
 @contextmanager
 def hicache(
     case, config=None, *, storage=False, namespace_keys=False, write_policy="write_back"
@@ -332,8 +315,8 @@ def public_transfer(
 
 
 class TestKVControlTransfers(cache_fixtures.KVCacheTestCase):
-    def test_public_demote_then_prefetch_observe_actual_fences(self):
-        with hicache(self) as owner:
+    def test_gpu_destination_is_rejected_and_native_load_preserves_bytes(self):
+        with hicache(self, storage=True) as owner:
             _, cache, service, dma = owner
             node = seed(cache)
             initial = cache.token_to_kv_pool_allocator.available_size()
@@ -352,18 +335,15 @@ class TestKVControlTransfers(cache_fixtures.KVCacheTestCase):
             assert done.public_result.reclaimed_scope
             assert node.component_data[FULL].value is None
             assert cache.token_to_kv_pool_allocator.available_size() == initial + 4
-            result = public_transfer(service, "prefetch", "host", "gpu", "prefetch")
-            assert result.status == Status.RUNNING, result
-            assert not result.public_result.ready_scope
-            service.progress()
+            for source in ("host", "storage"):
+                rejected = public_transfer(
+                    service, "prefetch", source, "gpu", f"{source}-to-gpu"
+                )
+                assert rejected.status == Status.UNSUPPORTED
+            assert not dma.pending
+            start_inference_load(cache, node)
             dma.finish()
-            service.progress()
-            done = current(service, result)
-            assert done.status == Status.COMPLETED, done
-            assert done.public_result.ready_scope
-            assert done.public_result.ready_location.tier == "gpu"
-            assert not done.public_result.preserved_scope
-            assert not done.public_result.reclaimed_scope
+            cache.loading_check()
             cd = node.component_data[FULL]
             pool = cache.token_to_kv_pool_allocator.get_kvcache()
             assert torch.all(pool.k_buffer[0][cd.value] == 7)
@@ -464,8 +444,7 @@ class TestKVControlTransfers(cache_fixtures.KVCacheTestCase):
             saved = transfer(service, kind="move_to")
             stage(service, dma)
             self.assertEqual(wait(service, saved).status, Status.COMPLETED)
-            loaded = transfer(service, src="host", dst="gpu", message="load")
-            service.progress()
+            start_inference_load(cache, node)
             initial = cache.token_to_kv_pool_allocator.available_size()
             result = public_transfer(service, "demote", "gpu", "host", "blocked")
             self.assertEqual(result.status, Status.PARTIAL)
@@ -475,10 +454,10 @@ class TestKVControlTransfers(cache_fixtures.KVCacheTestCase):
             self.assertTrue(result.public_result.preserved_scope)
             self.assertFalse(result.public_result.reclaimed_scope)
             self.assertEqual(cache.token_to_kv_pool_allocator.available_size(), initial)
-            self.assertEqual(current(service, loaded).status, Status.RUNNING)
+            self.assertTrue(cache.ongoing_load_back)
             dma.finish()
-            service.progress()
-            self.assertEqual(current(service, loaded).status, Status.COMPLETED)
+            cache.loading_check()
+            self.assertFalse(cache.ongoing_load_back)
             retry = public_transfer(service, "demote", "gpu", "host", "retry")
             self.assertEqual(wait(service, retry).status, Status.COMPLETED)
             self.assertIsNone(node.component_data[FULL].value)
@@ -640,94 +619,6 @@ class TestKVControlTransfers(cache_fixtures.KVCacheTestCase):
             assert not service.control.executor.transfers.jobs
             cache.sanity_check()
 
-    def test_host_load_holds_whole_prefix_and_blocks_prefill_until_fence(self):
-        with hicache(self) as owner:
-            _, cache, service, dma = owner
-            node = seed(cache)
-            saved = transfer(service, kind="move_to")
-            service.progress()
-            dma.finish()
-            service.progress()
-            assert current(service, saved).status == Status.COMPLETED
-            pool = cache.token_to_kv_pool_allocator.get_kvcache()
-            pool.k_buffer[0].fill_(-7)
-            pool.v_buffer[0].fill_(-8)
-            loaded = transfer(service, src="host", dst="gpu", message="load")
-            assert service.blocks_prefill
-            service.progress()
-            assert current(service, loaded).status == Status.RUNNING
-            assert node.component_data[ComponentType.FULL].value is not None
-            assert node.component_data[ComponentType.FULL].lock_ref > 0
-            assert service.blocks_prefill
-            dma.finish()
-            service.progress()
-            assert not service.blocks_prefill
-            assert current(service, loaded).status == Status.COMPLETED, current(
-                service, loaded
-            )
-            slots = node.component_data[ComponentType.FULL].value
-            pool = cache.token_to_kv_pool_allocator.get_kvcache()
-            assert torch.all(pool.k_buffer[0][slots] == 7)
-            assert torch.all(pool.v_buffer[0][slots] == 8)
-            assert cache.load_back_threshold == 10
-            cache.sanity_check()
-
-    def test_shared_prefix_whole_scope_capacity_is_charged_once(self):
-        with hicache(self) as owner:
-            _, cache, service, dma = owner
-            selection = branched_scope(cache, service)
-            assert cache.token_to_kv_pool_allocator.available_size() == 58
-            saved = transfer(service, kind="move_to", selection=selection)
-            service.progress()
-            dma.finish()
-            service.progress()
-            assert current(service, saved).status == Status.COMPLETED, current(
-                service, saved
-            )
-            assert cache.token_to_kv_pool_allocator.available_size() == 64
-            other = cache.token_to_kv_pool_allocator.alloc(58)
-            loaded = transfer(
-                service, src="host", dst="gpu", selection=selection, message="load"
-            )
-            assert loaded.status == Status.RUNNING, loaded
-            assert cache.token_to_kv_pool_allocator.available_size() == 0
-            service.progress()
-            assert dma.submitted == [("save", 6), ("load", 6)]
-            assert cache.tree_core.full_protected_size() == 6
-            dma.finish()
-            service.progress()
-            assert current(service, loaded).status == Status.COMPLETED, current(
-                service, loaded
-            )
-            assert cache.tree_core.full_protected_size() == 0
-            cache.token_to_kv_pool_allocator.free(other)
-            cache.sanity_check()
-
-    def test_insufficient_whole_scope_defers_without_reserving_or_queuing(self):
-        with hicache(self) as owner:
-            _, cache, service, dma = owner
-            selection = branched_scope(cache, service)
-            saved = transfer(service, kind="move_to", selection=selection)
-            service.progress()
-            dma.finish()
-            service.progress()
-            assert current(service, saved).status == Status.COMPLETED
-            other = cache.token_to_kv_pool_allocator.alloc(60)
-            loaded = transfer(
-                service, src="host", dst="gpu", selection=selection, message="load"
-            )
-            assert loaded.status == Status.QUEUED, loaded
-            service.progress()
-            assert not cache.cache_controller.load_queue and (not dma.pending)
-            assert cache.token_to_kv_pool_allocator.available_size() == 4
-            assert cache.tree_core.full_protected_size() == 0
-            for node in cache.tree_core._node_arena.values():
-                if node is not cache.tree_core.root_node:
-                    cd = node.component_data[ComponentType.FULL]
-                    assert cd.lock_ref == cd.host_lock_ref == 0
-            assert service.control.cancel(loaded.ref).status == Status.CANCELLED
-            cache.token_to_kv_pool_allocator.free(other)
-
     def test_partial_submission_failure_keeps_cause_after_cancel_ack_and_retry(self):
         with hicache(self) as owner:
             _, cache, service, dma = owner
@@ -782,63 +673,6 @@ class TestKVControlTransfers(cache_fixtures.KVCacheTestCase):
             assert cache.tree_core.full_protected_size() == 0
             cache.sanity_check()
 
-    def test_native_load_preserves_existing_running_growth_budget_without_double_charge(
-        self,
-    ):
-        with hicache(self) as owner:
-            from array import array
-            from types import SimpleNamespace
-
-            from sglang.srt.managers.schedule_batch import Req
-            from sglang.srt.managers.scheduler import Scheduler
-            from sglang.srt.sampling.sampling_params import SamplingParams
-
-            _, cache, service, dma = owner
-            selection = branched_scope(cache, service)
-            saved = transfer(service, kind="move_to", selection=selection)
-            service.progress()
-            dma.finish()
-            service.progress()
-            assert current(service, saved).status == Status.COMPLETED
-            other = cache.token_to_kv_pool_allocator.alloc(56)
-            running = Req(
-                rid="running",
-                origin_input_text=None,
-                origin_input_ids=array("q", [99]),
-                sampling_params=SamplingParams(max_new_tokens=8, ignore_eos=True),
-                vocab_size=128,
-            )
-            scheduler = Scheduler.__new__(Scheduler)
-            scheduler.tree_cache = cache
-            scheduler.token_to_kv_pool_allocator = cache.token_to_kv_pool_allocator
-            scheduler.running_batch = SimpleNamespace(reqs=[running])
-            scheduler.chunked_req = running
-            scheduler.new_token_ratio_tracker = SimpleNamespace(current=0.01)
-            service.control.executor.gpu_copy_capacity = (
-                scheduler._kv_control_gpu_copy_capacity
-            )
-            assert scheduler._kv_control_gpu_copy_capacity() == 0
-            loaded = transfer(
-                service, src="host", dst="gpu", selection=selection, message="load"
-            )
-            assert (
-                loaded.status == Status.QUEUED
-                and loaded.update.code == "whole_scope_capacity"
-            )
-            cache.token_to_kv_pool_allocator.free(other[:6])
-            service.progress()
-            assert current(service, loaded).status == Status.RUNNING, current(
-                service, loaded
-            )
-            assert cache.token_to_kv_pool_allocator.available_size() == 8
-            dma.finish()
-            service.progress()
-            assert current(service, loaded).status == Status.COMPLETED, current(
-                service, loaded
-            )
-            cache.token_to_kv_pool_allocator.free(other[6:])
-            cache.sanity_check()
-
 
 def wait(service, result):
     deadline = time.monotonic() + 5
@@ -847,6 +681,12 @@ def wait(service, result):
         assert time.monotonic() < deadline, current(service, result)
         time.sleep(0.005)
     return current(service, result)
+
+
+def start_inference_load(cache, node):
+    with patch.object(cache, "load_back_threshold", 1):
+        assert cache.load_back(node.id)
+    cache.ready_to_load_host_cache()
 
 
 def stage(service, dma):
@@ -1624,120 +1464,6 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
             assert_retired(cache, service)
             cache.sanity_check()
 
-    def test_gpu_waiter_under_pin_pressure_keeps_ordinary_fallback_independent(self):
-        from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
-
-        with hicache(self, namespace_keys=True) as owner:
-            _, cache, service, dma = owner
-            scopes = [
-                cache_fixtures.target(cache_salt=f"gpu-pin-{i}") for i in range(2)
-            ]
-            self._cold_scopes(owner, scopes)
-            pressure = self._host_pressure(owner)
-            self._pin_pressure(service, pressure)
-            demand = CacheRequestHandle("gpu-barrier-fallback", 0)
-            cc = cache.cache_controller
-            query, queries = cc._storage_hit_query, []
-
-            def counted_query(operation):
-                queries.append(operation.request_id)
-                return query(operation)
-
-            try:
-                with (
-                    patch.object(cc, "_storage_hit_query", counted_query),
-                    patch.object(cache, "prefetch_threshold", 1),
-                    patch.object(cache, "prefetch_stop_policy", "wait_complete"),
-                ):
-                    gpu = self._restore(service, scopes[0], "gpu-pin-waiter", dst="gpu")
-                    host = self._restore(service, scopes[1], "host-pin-waiter")
-                    self.assertEqual(
-                        current(service, host).update.code,
-                        "shared_prefix_serialization",
-                    )
-                    self._ordinary_prefetch(cache, service, scopes[1], demand)
-                    self.assertNotIn(
-                        demand, service.control.executor.storage_reads.demands
-                    )
-                    self.assertEqual(
-                        self._consume_ordinary_prefetch(cache, service, demand),
-                        (0, None),
-                    )
-                    self.assertEqual(queries, [demand.rid])
-                    self.assertTrue(cache.check_prefetch_progress(demand))
-                    self.assertFalse(service.blocks_prefill)
-                    self.assertFalse(dma.pending)
-                    self.assertEqual(
-                        service.control.cancel(gpu.ref).status, Status.CANCELLED
-                    )
-                    self.assertEqual(
-                        service.control.cancel(host.ref).status, Status.CANCELLED
-                    )
-            finally:
-                cache.release_aborted_request(demand)
-                self._pin_pressure(service, pressure, mode="release")
-            assert_retired(cache, service)
-            cache.sanity_check()
-
-    def test_joined_waiter_defers_if_gpu_load_becomes_active_after_join(self):
-        from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
-
-        with hicache(self, namespace_keys=True) as owner:
-            _, cache, service, dma = owner
-            gpu_target, host_target = [
-                cache_fixtures.target(cache_salt=f"late-gpu-{i}") for i in range(2)
-            ]
-            self._cold_scopes(owner, [gpu_target, host_target])
-            self.assertEqual(
-                wait(service, self._restore(service, gpu_target, "warm-host")).status,
-                Status.COMPLETED,
-            )
-            gpu_path = service.control.executor._walk(
-                gpu_target.token_ids,
-                service.control.executor._compatibility(gpu_target),
-            )
-            gpu_rows = [(gpu_path[-1][0], gpu_target.token_ids)]
-            pressure = self._host_pressure(owner)
-            self._pin_pressure(service, pressure)
-            self._pin_pressure(service, gpu_rows, salt=gpu_target.cache_salt)
-            demand = CacheRequestHandle("late-gpu-fallback", 0)
-            try:
-                with (
-                    patch.object(cache, "prefetch_threshold", 1),
-                    patch.object(cache, "prefetch_stop_policy", "wait_complete"),
-                    patch.object(
-                        cache.cache_controller,
-                        "_storage_hit_query",
-                        side_effect=AssertionError("unapproved cold I/O"),
-                    ),
-                ):
-                    host = self._restore(service, host_target, "older-host-queued")
-                    self._ordinary_prefetch(cache, service, host_target, demand)
-                    self.assertIn(
-                        demand, service.control.executor.storage_reads.demands
-                    )
-                    gpu = self._restore(service, gpu_target, "new-gpu-load", dst="gpu")
-                    wait_for(service, lambda: bool(dma.pending))
-                    done = wait(service, host)
-                    self.assertEqual(done.status, Status.DEFERRED)
-                    self.assertEqual(done.update.code, "shared_prefix_serialization")
-                    self.assertEqual(
-                        self._consume_ordinary_prefetch(cache, service, demand),
-                        (0, None),
-                    )
-                    self.assertTrue(service.blocks_prefill)
-                    self.assertTrue(dma.pending)
-                    dma.finish()
-                    self.assertEqual(wait(service, gpu).status, Status.COMPLETED)
-            finally:
-                cache.release_aborted_request(demand)
-                self._pin_pressure(service, pressure, mode="release")
-                self._pin_pressure(
-                    service, gpu_rows, mode="release", salt=gpu_target.cache_salt
-                )
-            assert_retired(cache, service)
-            cache.sanity_check()
-
     def test_storage_admission_config_validation_and_optional_defaults(self):
         from dataclasses import replace
 
@@ -2397,166 +2123,6 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
             assert_retired(cache, service)
             cache.sanity_check()
 
-    def test_gpu_destination_is_exclusive_through_storage_and_dma_fences(self):
-        for first_dst in ("host", "gpu"):
-            with (
-                self.subTest(first_dst=first_dst),
-                hicache(self, namespace_keys=True) as owner,
-            ):
-                _, cache, service, dma = owner
-                scopes = [
-                    cache_fixtures.target(cache_salt=f"gpu-exclusive-{i}")
-                    for i in range(3)
-                ]
-                self._cold_scopes(owner, scopes)
-                cc = cache.cache_controller
-                entered, release = threading.Event(), threading.Event()
-                get = cc.page_get_func
-
-                def blocked_get(*args, **kwargs):
-                    entered.set()
-                    assert release.wait(5)
-                    return get(*args, **kwargs)
-
-                try:
-                    with patch.object(cc, "page_get_func", blocked_get):
-                        first = self._restore(
-                            service, scopes[0], "exclusive-first", dst=first_dst
-                        )
-                        wait_for(service, entered.is_set)
-                        second = self._restore(
-                            service,
-                            scopes[1],
-                            "exclusive-second",
-                            dst="gpu" if first_dst == "host" else "host",
-                        )
-                        self.assertEqual(
-                            current(service, second).update.code,
-                            "shared_prefix_serialization",
-                        )
-                        reads = service.control.executor.storage_reads
-                        self.assertIsNone(
-                            reads.interests[second.ref.operation_id].job.operation
-                        )
-                        release.set()
-                        wait_for(service, lambda: service.blocks_prefill)
-                        wait_for(service, lambda: bool(dma.pending))
-                        third = self._restore(service, scopes[2], "exclusive-third")
-                        self.assertEqual(
-                            current(service, third).update.code,
-                            "shared_prefix_serialization",
-                        )
-                        for _ in range(3):
-                            service.progress()
-                        self.assertIsNone(
-                            reads.interests[third.ref.operation_id].job.operation
-                        )
-                        dma.finish()
-                        for result in (first, second, third):
-                            self.assertEqual(
-                                wait(service, result).status, Status.COMPLETED
-                            )
-                finally:
-                    release.set()
-                self.assertFalse(service.blocks_prefill)
-                assert_retired(cache, service)
-                cache.sanity_check()
-
-    def test_older_gpu_waiter_fences_new_host_jobs_until_drained_or_cancelled(self):
-        for finish in ("complete", "cancel", "expire"):
-            with (
-                self.subTest(finish=finish),
-                hicache(self, namespace_keys=True) as owner,
-            ):
-                _, cache, service, dma = owner
-                scopes = [
-                    cache_fixtures.target(cache_salt=f"fifo-{i}") for i in range(4)
-                ]
-                self._cold_scopes(owner, scopes)
-                self.assertEqual(
-                    wait(service, self._restore(service, scopes[3], "resident")).status,
-                    Status.COMPLETED,
-                )
-                cc = cache.cache_controller
-                entered, release = threading.Event(), threading.Event()
-                query, get = cc._storage_hit_query, cc.page_get_func
-                queries = []
-
-                def counted_query(operation):
-                    queries.append(operation.token_ids.cache_salt)
-                    return query(operation)
-
-                def blocked_get(*args, **kwargs):
-                    entered.set()
-                    assert release.wait(5)
-                    return get(*args, **kwargs)
-
-                try:
-                    with (
-                        patch.object(cc, "_storage_hit_query", counted_query),
-                        patch.object(cc, "page_get_func", blocked_get),
-                    ):
-                        first = self._restore(service, scopes[0], "host-first")
-                        wait_for(service, entered.is_set)
-                        exclusive = public_transfer(
-                            service,
-                            "prefetch",
-                            "storage",
-                            "gpu",
-                            "gpu-second",
-                            salt=scopes[1].cache_salt,
-                        )
-                        later = self._restore(service, scopes[2], "host-third")
-                        reads = service.control.executor.storage_reads
-                        later_job = reads.interests[later.ref.operation_id].job
-                        self.assertIsNone(later_job.operation)
-                        self.assertEqual(
-                            current(service, later).update.code,
-                            "shared_prefix_serialization",
-                        )
-                        for _ in range(3):
-                            service.progress()
-                        self.assertIsNone(later_job.operation)
-                        # A read requiring no new work still bypasses the barrier.
-                        resident = self._restore(service, scopes[3], "resident-later")
-                        self.assertEqual(resident.status, Status.COMPLETED)
-                        expected = [service.cache_salt(scopes[0].cache_salt)]
-                        if finish == "complete":
-                            release.set()
-                            wait_for(service, lambda: bool(dma.pending))
-                            expected.append(service.cache_salt(scopes[1].cache_salt))
-                            self.assertEqual(queries, expected)
-                            self.assertTrue(service.blocks_prefill)
-                            self.assertIsNone(later_job.operation)
-                            dma.finish()
-                            self.assertEqual(
-                                wait(service, exclusive).status, Status.COMPLETED
-                            )
-                        else:
-                            if finish == "cancel":
-                                self.assertEqual(
-                                    service.control.cancel(exclusive.ref).status,
-                                    Status.CANCELLED,
-                                )
-                            else:
-                                self.clock.now += 5.1
-                            wait_for(service, lambda: len(queries) == 2)
-                            self.assertEqual(
-                                current(service, exclusive).status, Status.CANCELLED
-                            )
-                            self.assertIsNotNone(later_job.operation)
-                            self.assertFalse(service.blocks_prefill)
-                            self.assertFalse(dma.pending)
-                            release.set()
-                        self.assertEqual(wait(service, first).status, Status.COMPLETED)
-                        self.assertEqual(wait(service, later).status, Status.COMPLETED)
-                        expected.append(service.cache_salt(scopes[2].cache_salt))
-                        self.assertEqual(queries, expected)
-                finally:
-                    release.set()
-                assert_retired(cache, service)
-                cache.sanity_check()
-
     def test_pipelined_job_keeps_exact_coalescing_and_demand_cancellation_ownership(
         self,
     ):
@@ -2944,57 +2510,43 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
             assert_retired(cache, service)
             cache.sanity_check()
 
-    def test_storage_prefetch_checks_destination_and_transfer_budgets_before_host_eviction(
-        self,
-    ):
-        for blocker in ("gpu", "transfer"):
+    def test_rate_limited_prefetch_does_not_evict_host(self):
+        with hicache(self, namespace_keys=True) as owner:
+            cache, service, _ = cold_prefix(owner)
+            rows = self._host_pressure(owner)
+            gpu_free = cache.token_to_kv_pool_allocator.available_size()
+            held = {
+                node.id: node.component_data[FULL].host_value.clone()
+                for node, _ in rows
+            }
+            cc = cache.cache_controller
             with (
-                self.subTest(blocker=blocker),
-                hicache(self, namespace_keys=True) as owner,
+                patch.object(
+                    cache,
+                    "evict_host",
+                    side_effect=AssertionError("unapproved host eviction"),
+                ),
+                patch.object(cc, "prefetch_rate_limited", return_value=True),
             ):
-                cache, service, _ = cold_prefix(owner)
-                rows = self._host_pressure(owner)
-                gpu_free = cache.token_to_kv_pool_allocator.available_size()
-                held = {
-                    node.id: node.component_data[FULL].host_value.clone()
+                result = transfer(service, src="storage", dst="host", message="blocked")
+                for _ in range(3):
+                    service.progress()
+                self.assertEqual(current(service, result).status, Status.QUEUED)
+                self.assertEqual(
+                    service.control.cancel(result.ref).status, Status.CANCELLED
+                )
+            self.assertEqual(cache.cache_controller.mem_pool_host.available_size(), 0)
+            self.assertEqual(
+                cache.token_to_kv_pool_allocator.available_size(), gpu_free
+            )
+            self.assertTrue(
+                all(
+                    torch.equal(node.component_data[FULL].host_value, held[node.id])
                     for node, _ in rows
-                }
-                if blocker == "gpu":
-                    service.control.executor.gpu_copy_capacity = lambda: 0
-                cc = cache.cache_controller
-                with (
-                    patch.object(
-                        cache,
-                        "evict_host",
-                        side_effect=AssertionError("unapproved host eviction"),
-                    ),
-                    patch.object(
-                        cc, "prefetch_rate_limited", return_value=blocker == "transfer"
-                    ),
-                ):
-                    result = transfer(
-                        service, src="storage", dst="gpu", message="blocked"
-                    )
-                    for _ in range(3):
-                        service.progress()
-                    self.assertEqual(current(service, result).status, Status.QUEUED)
-                    self.assertEqual(
-                        service.control.cancel(result.ref).status, Status.CANCELLED
-                    )
-                self.assertEqual(
-                    cache.cache_controller.mem_pool_host.available_size(), 0
                 )
-                self.assertEqual(
-                    cache.token_to_kv_pool_allocator.available_size(), gpu_free
-                )
-                self.assertTrue(
-                    all(
-                        torch.equal(node.component_data[FULL].host_value, held[node.id])
-                        for node, _ in rows
-                    )
-                )
-                assert_retired(cache, service)
-                cache.sanity_check()
+            )
+            assert_retired(cache, service)
+            cache.sanity_check()
 
     def test_waiting_prefetch_uses_freed_capacity_before_scan_retry_deadline(self):
         with hicache(self, namespace_keys=True) as owner:
@@ -3345,43 +2897,6 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                 assert cd.lock_ref == cd.host_lock_ref == 0
             assert_retired(cache, service)
 
-    def test_restore_from_actual_file_without_resident_radix_nodes(self):
-        with hicache(self, namespace_keys=True) as owner:
-            destination = "gpu"
-            cache, service, dma = cold_prefix(owner)
-            pool = cache.token_to_kv_pool_allocator.get_kvcache()
-            pool.k_buffer[0].fill_(-100)
-            pool.v_buffer[0].fill_(-101)
-            threshold = cache.prefetch_threshold
-            assert threshold > 4
-            result = transfer(
-                service, src="storage", dst=destination, message="restore"
-            )
-            if destination == "gpu":
-                wait_for(service, lambda: service.blocks_prefill)
-                assert current(service, result).status == Status.RUNNING
-                assert not current(service, result).update.completed_steps
-                service.progress()
-                assert len(dma.pending) == 1
-                dma.finish()
-            done = wait(service, result)
-            assert done.status == Status.COMPLETED, done
-            assert done.update.completed_steps == ("destination_ready",)
-            assert cache.prefetch_threshold == threshold
-            for node, _, _, _ in prefix_path(cache, service):
-                cd = node.component_data[FULL]
-                source = (
-                    cache.host_pool_group.anchor_entry.host_pool
-                    if destination == "host"
-                    else pool
-                )
-                indices = cd.host_value if destination == "host" else cd.value
-                assert torch.all(source.k_buffer[0][indices] == 7)
-                assert torch.all(source.v_buffer[0][indices] == 8)
-                assert cd.lock_ref == cd.host_lock_ref == 0
-            assert not service.blocks_prefill
-            assert_retired(cache, service)
-
     def test_storage_read_cancel_waits_for_actual_worker_exit(self):
         with hicache(self, namespace_keys=True) as owner:
             cache, service, dma = cold_prefix(owner)
@@ -3397,7 +2912,7 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
             try:
                 with patch.object(cc, "page_get_func", blocked):
                     result = transfer(
-                        service, src="storage", dst="gpu", message="restore"
+                        service, src="storage", dst="host", message="restore"
                     )
                     wait_for(service, entered.is_set)
                     assert (

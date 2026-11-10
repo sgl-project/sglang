@@ -38,7 +38,6 @@ class _Adapter:
         ("gpu", "storage"),
         ("host", "storage"),
         ("storage", "host"),
-        ("storage", "gpu"),
     )
     move_paths = (("gpu", "storage"), ("host", "storage"))
 

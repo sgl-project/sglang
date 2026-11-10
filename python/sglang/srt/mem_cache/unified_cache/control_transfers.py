@@ -51,20 +51,12 @@ class HostCacheTransfers:
 
     HiCache owns allocation, queued DMA, fences and physical publication. This
     adapter holds the complete reusable scope until its last required fence.
-    H2D admission uses a scheduler prefill barrier while the installed indices
-    are still pending, since a native load has no inference-batch consumer index.
     """
 
     def __init__(self, executor):
         self.executor, self.cache, self.core = executor, executor.cache, executor.core
         self.jobs: dict[bytes, _Job] = {}
         self.interests: dict[str, _Interest] = {}
-
-    @property
-    def blocks_prefill(self):
-        return any(
-            j.started and j.work.payload.dst.tier == "gpu" for j in self.jobs.values()
-        )
 
     def _prefixes(self, work, *, validate_direction=True):
         self.executor._check(work.target)
@@ -194,6 +186,8 @@ class HostCacheTransfers:
         return False
 
     def start(self, work):
+        if (work.payload.src.tier, work.payload.dst.tier) != ("gpu", "host"):
+            raise ControlError("unsupported", "Device restore is owned by inference")
         prefixes = self._prefixes(work)
         self._paths(work)  # Each joiner approves its own immutable scope/budget.
         key = hashlib.sha256(
@@ -246,12 +240,7 @@ class HostCacheTransfers:
         try:
             paths = self._paths(job.work)
             nodes = {n.id: n for _, _, rows in paths for n, _, _ in rows}
-            src = job.work.payload.src.tier
-            pool = (
-                self.cache.cache_controller.mem_pool_host.anchor_entry.host_pool
-                if src == "gpu"
-                else self.cache.token_to_kv_pool_allocator
-            )
+            pool = self.cache.cache_controller.mem_pool_host.anchor_entry.host_pool
             capacity = getattr(pool, "size", None)
             if (
                 type(capacity) is int
@@ -266,16 +255,9 @@ class HostCacheTransfers:
                     )
                 self.jobs.pop(job.key, None)
                 return
-            if any(
-                (
-                    self._load_pending(n)
-                    if src == "gpu"
-                    else n.write_through_pending_id is not None
-                )
-                for n in nodes.values()
-            ):
+            if any(self._load_pending(n) for n in nodes.values()):
                 if job.work.public_demote:
-                    job.blocked = "inflight_load" if src == "gpu" else "inflight_backup"
+                    job.blocked = "inflight_load"
                     self._retire(job)
                 else:
                     job.waiting = "source_pending"
@@ -286,26 +268,18 @@ class HostCacheTransfers:
             needed = sum(
                 len(n.key)
                 for n in nodes.values()
-                if (
-                    n.component_data[FULL].host_value
-                    if src == "gpu"
-                    else n.component_data[FULL].value
-                )
-                is None
+                if n.component_data[FULL].host_value is None
             )
-            if src == "gpu":
-                available = self.cache.cache_controller.mem_pool_host.available_size()
-                if (
-                    needed
-                    and self.executor.gpu_copy_capacity is not None
-                    and self.executor.gpu_copy_capacity() < 0
-                ):
-                    self._release_host(job)
-                    self._release_gpu(job)
-                    job.waiting = "running_growth_capacity"
-                    return
-            else:
-                available = self._gpu_available()
+            available = pool.available_size()
+            if (
+                needed
+                and self.executor.gpu_copy_capacity is not None
+                and self.executor.gpu_copy_capacity() < 0
+            ):
+                self._release_host(job)
+                self._release_gpu(job)
+                job.waiting = "running_growth_capacity"
+                return
             if needed > available:
                 # No destination is reserved until the entire unique scope fits.
                 self._release_host(job)
@@ -313,41 +287,19 @@ class HostCacheTransfers:
                 job.waiting = "whole_scope_capacity"
                 return
             job.started = True  # Partial submission must retain holds on error.
-            if src == "gpu":
-                self.cache._execute_and_commit_kv_backup(
-                    BackupKV(node_ids=list(nodes)), mirror_storage=False
+            self.cache._execute_and_commit_kv_backup(
+                BackupKV(node_ids=list(nodes)), mirror_storage=False
+            )
+            self._host_hold(job, nodes.values())
+            if any(n.component_data[FULL].host_value is None for n in nodes.values()):
+                raise ControlError(
+                    "capacity",
+                    "Host allocation stopped before the full scope was queued",
                 )
-                self._host_hold(job, nodes.values())
-                if any(
-                    n.component_data[FULL].host_value is None for n in nodes.values()
-                ):
-                    raise ControlError(
-                        "capacity",
-                        "Host allocation stopped before the full scope was queued",
-                    )
-            else:
-                for _, _, rows in paths:
-                    anchor = rows[-1][0]
-                    if any(n.component_data[FULL].value is None for n, _, _ in rows):
-                        quota = self._gpu_available()
-                        if not self.cache.load_back(
-                            anchor.id, mem_quota=quota, minimum_load_tokens=1
-                        ):
-                            raise ControlError(
-                                "capacity",
-                                "Device allocation stopped before the full scope was queued",
-                            )
         except Exception as error:
             job.failure = (getattr(error, "code", "transfer_error"), str(error)[:512])
             if not job.started:
                 self._retire(job)
-
-    def _gpu_available(self):
-        if self.executor.gpu_copy_capacity is not None:
-            return self.executor.gpu_copy_capacity()
-        return (
-            self.cache._component_available_size(FULL) + self.core.full_evictable_size()
-        )
 
     def begin_poll(self, *, limit=64):
         if not self.jobs:
@@ -363,8 +315,6 @@ class HostCacheTransfers:
         try:
             self.cache.flush_pending_backups()
             self.cache.writing_check()
-            if self.blocks_prefill:
-                self.cache.ready_to_load_host_cache()
             self.cache.loading_check()
         except Exception as error:
             for job in self.jobs.values():
@@ -446,15 +396,10 @@ class HostCacheTransfers:
         for branch, (_, _, rows) in enumerate(paths):
             for node, start, end in rows:
                 cd = node.component_data[FULL]
-                destination = (
-                    cd.host_value if work.payload.dst.tier == "host" else cd.value
+                ready = (
+                    cd.host_value is not None and node.write_through_pending_id is None
                 )
-                ready = destination is not None and (
-                    node.write_through_pending_id is None
-                    if work.payload.dst.tier == "host"
-                    else not self._load_pending(node)
-                )
-                source = cd.value if work.payload.src.tier == "gpu" else cd.host_value
+                source = cd.value
                 steps = ("destination_ready",) if ready else ()
                 complete = ready
                 if isinstance(work.payload, MoveTo):

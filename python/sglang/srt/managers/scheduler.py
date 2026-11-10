@@ -4235,13 +4235,6 @@ class Scheduler(
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
         running_batch: ScheduleBatch,
     ) -> Tuple[Optional[ScheduleBatch], ScheduleBatch]:
-        if (
-            getattr(self, "kv_control_service", None) is not None
-            and self.kv_control_service.blocks_prefill
-        ):
-            # Native H2D has no inference-batch consumer index. Admit fresh
-            # prefix matches only after its required completion fence.
-            return None, running_batch
         # Check if the grammar is ready in the grammar queue
         if self.grammar_manager.has_waiting_grammars():
             ready_grammar_requests = self.grammar_manager.get_ready_grammar_requests()

@@ -25,14 +25,13 @@ from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 
 FULL = ComponentType.FULL
 # Limit demand preference without letting a stream of arrivals starve background
-# reads. Physical conflict, capacity, and GPU barriers retain precedence.
+# reads. Physical conflict and capacity retain precedence.
 _MAX_DEMAND_BURST = 8
 
 
 @dataclass
 class _Read:
     key: bytes
-    work: object
     tokens: tuple
     compatibility: object
     handle: CacheRequestHandle = field(
@@ -43,7 +42,6 @@ class _Read:
     host_locks: list = field(default_factory=list)
     anchor: int | None = None
     operation: object = None
-    loading: bool = False
     failure: tuple[str, str] | None = None
     failure_status: Status = Status.FAILED
     cancel_requested: bool = False
@@ -77,8 +75,8 @@ class StorageCacheReads:
     """Shared one-prefix restores with complete-scope approval and real fences.
 
     Cold host scopes pipeline across independent salt domains with bounded
-    admission. A domain serializes until publication; GPU destinations remain
-    exclusive. Compatible readers share one interest-independent physical job.
+    admission. A domain serializes until publication. Compatible readers
+    share one interest-independent physical job.
     """
 
     def __init__(self, executor):
@@ -128,9 +126,7 @@ class StorageCacheReads:
         active = [job for job in self.jobs.values() if job.operation is not None]
         stats.update(
             active_jobs=len(active),
-            queued_jobs=sum(
-                job.operation is None and not job.loading for job in self.jobs.values()
-            ),
+            queued_jobs=sum(job.operation is None for job in self.jobs.values()),
             demand_waiters=len(self.demands),
             reserved_host_tokens=self._unallocated_reservations(None),
             inflight_tokens=sum(job.reserved_host_tokens for job in active),
@@ -155,7 +151,7 @@ class StorageCacheReads:
             "demand_priority",
         ):
             stats["waiting_" + reason] = sum(
-                job.operation is None and not job.loading and job.waiting == reason
+                job.operation is None and job.waiting == reason
                 for job in self.jobs.values()
             )
         return stats
@@ -182,14 +178,10 @@ class StorageCacheReads:
         job = self._joinable.get(self._demand_key(tokens, extra_key, cache_salt))
         if job is None or job.cancel_requested or job.failure or job.retired:
             return False
-        if job.operation is None and (
-            not self._has_live_interest(job) or self._gpu_barrier(job)
-        ):
-            # Ordinary reads retain their existing fallback if an exclusive
-            # control operation cannot progress. Never bypass its native gate.
+        if job.operation is None and not self._has_live_interest(job):
             return False
         self.demands[request] = _Demand(
-            job, max(len(prefix or ()), self._length(job, "host"))
+            job, max(len(prefix or ()), self._host_length(job))
         )
         job.demands.add(request)
         self.stats["demand_coalesced"] += 1
@@ -220,7 +212,7 @@ class StorageCacheReads:
         payload = work.payload
         if (
             not isinstance(payload, CopyTo)
-            or payload.src.tier != "storage"
+            or (payload.src.tier, payload.dst.tier) != ("storage", "host")
             or (payload.src.tier, payload.dst.tier)
             not in self.executor.storage_adapter.copy_paths
             or payload.src.backend not in (None, self.executor.storage_adapter.backend)
@@ -231,7 +223,7 @@ class StorageCacheReads:
             )
         ):
             raise ControlError(
-                "unsupported", "Storage adapter supports local COPY to host/GPU"
+                "unsupported", "Storage prefetch requires a local host destination"
             )
         if len(work.target.branches) != 1:
             raise ControlError(
@@ -279,30 +271,24 @@ class StorageCacheReads:
         self.host._release_gpu(job)
         job.anchor = None
 
-    def _length(self, job, tier):
+    def _host_length(self, job):
         length = 0
         for node, _, end in self._rows(job):
-            cd = node.component_data[FULL]
-            ready = (
-                cd.host_value is not None and node.write_through_pending_id is None
-                if tier == "host"
-                else cd.value is not None and not self.host._load_pending(node)
-            )
-            if not ready:
+            if (
+                node.component_data[FULL].host_value is None
+                or node.write_through_pending_id is not None
+            ):
                 break
             length = end
         return length
 
     def start(self, work):
         tokens, compatibility = self._scope(work)
-        key = hashlib.sha256(
-            msgspec.json.encode((tokens, compatibility, work.payload.dst.tier))
-        ).digest()
+        key = hashlib.sha256(msgspec.json.encode((tokens, compatibility))).digest()
         job = self.jobs.get(key)
         if job is None:
             job = _Read(
                 key,
-                work,
                 tokens,
                 compatibility,
                 admission_order=self._next_admission_order,
@@ -316,27 +302,20 @@ class StorageCacheReads:
         interest = _Interest(work, job)
         self.interests[work.ref.operation_id] = interest
         job.interests.add(work.ref.operation_id)
-        if job.work.payload.dst.tier == "host":
-            # A queued physical job is already a valid exact-scope owner.
-            # Arriving demand must not issue duplicate I/O before it starts.
-            self._joinable[
-                self._demand_key(
-                    job.tokens,
-                    job.compatibility.extra_key,
-                    job.compatibility.cache_salt,
-                )
-            ] = job
-        if job.operation is None and not job.loading:
+        # Demand may join a queued job before any I/O is issued.
+        self._joinable[
+            self._demand_key(
+                job.tokens, job.compatibility.extra_key, job.compatibility.cache_salt
+            )
+        ] = job
+        if job.operation is None:
             self._start(job)
         return self._take(interest)
 
     def _start(self, job):
         try:
             pool = self.cache.cache_controller.mem_pool_host
-            if len(job.tokens) > pool.size or (
-                job.work.payload.dst.tier == "gpu"
-                and len(job.tokens) > self.cache.token_to_kv_pool_allocator.size
-            ):
+            if len(job.tokens) > pool.size:
                 self._retire(
                     job,
                     status=Status.DEFERRED,
@@ -351,33 +330,14 @@ class StorageCacheReads:
                 job.waiting = "source_pending"
                 return
             self._hold(job)
-            host_length = self._length(job, "host")
-            gpu_length = self._length(job, "gpu")
-            # A complete host prefix needs no cold-stage turn. GPU targets
-            # retain the exclusive admission/fence behavior below.
-            if job.work.payload.dst.tier == "host" and host_length == len(job.tokens):
+            host_length = self._host_length(job)
+            if host_length == len(job.tokens):
                 self._retire(job)
                 return
             waiting = self._admission_wait(job)
             if waiting is not None:
                 job.waiting = waiting
-                if job.demands and self._gpu_barrier(job):
-                    self._retire(job, status=Status.DEFERRED, code=waiting)
-                else:
-                    self._release(job)
-                return
-            if gpu_length == len(job.tokens) and job.work.payload.dst.tier == "gpu":
-                self._retire(job)
-                return
-            if (
-                job.work.payload.dst.tier == "gpu"
-                and len(job.tokens) - gpu_length > self.host._gpu_available()
-            ):
-                job.waiting = "whole_scope_capacity"
                 self._release(job)
-                return
-            if host_length == len(job.tokens):
-                self._load_gpu(job)
                 return
             if self.cache.cache_controller.prefetch_rate_limited():
                 job.waiting = "storage_rate_limit"
@@ -442,7 +402,7 @@ class StorageCacheReads:
             job.operation.native_on_publish = lambda: self._published(job)
         except Exception as error:
             job.failure = (getattr(error, "code", "storage_error"), str(error)[:512])
-            if job.operation is None and not job.loading:
+            if job.operation is None:
                 self._retire(job)
 
     def _read_budget(self, job, needed):
@@ -481,22 +441,15 @@ class StorageCacheReads:
         return None
 
     def _admission_wait(self, job):
-        # Polling rotates the job dictionary. Use immutable admission order so
-        # newer host arrivals cannot keep refilling ahead of a GPU waiter.
-        if self._gpu_barrier(job):
-            return "shared_prefix_serialization"
         active = [
             other
             for other in self.jobs.values()
-            if other is not job and (other.operation is not None or other.loading)
+            if other is not job and other.operation is not None
         ]
         if len(active) >= self.executor.config.max_concurrent_storage_reads:
             return "storage_concurrency_limit"
         if any(
-            job.work.payload.dst.tier == "gpu"
-            or other.work.payload.dst.tier == "gpu"
-            or other.loading
-            or job.compatibility.cache_salt == other.compatibility.cache_salt
+            job.compatibility.cache_salt == other.compatibility.cache_salt
             for other in active
         ):
             return "shared_prefix_serialization"
@@ -509,31 +462,11 @@ class StorageCacheReads:
                 other is not job
                 and other.demands
                 and other.operation is None
-                and not other.loading
                 and self._has_live_interest(other)
                 for other in self.jobs.values()
             ):
                 return "demand_priority"
         return None
-
-    def _gpu_barrier(self, job):
-        return any(
-            other is not job
-            and (
-                other.loading
-                or (
-                    other.work.payload.dst.tier == "gpu"
-                    and (
-                        other.operation is not None
-                        or (
-                            other.admission_order < job.admission_order
-                            and self._has_live_interest(other)
-                        )
-                    )
-                )
-            )
-            for other in self.jobs.values()
-        )
 
     def _has_live_interest(self, job):
         if job.demands:
@@ -596,30 +529,11 @@ class StorageCacheReads:
         self._host_reclaim_retry_at = 0.0
         return True
 
-    def _load_work(self, job):
-        return msgspec.structs.replace(
-            job.work,
-            payload=CopyTo(
-                target=job.work.payload.target,
-                src=Location(tier="host"),
-                dst=Location(tier="gpu"),
-            ),
-        )
-
-    def _load_gpu(self, job):
-        work = self._load_work(job)
-        result = self.host.start(work)
-        job.loading = not result.status.terminal
-        if result.status.terminal:
-            if result.status != Status.COMPLETED:
-                job.failure = (result.code or "load_failed", result.reason)
-            self._retire(job)
-
     def _observe_cold_result(self, job):
         if (
             job.failure is None
             and not job.cancel_requested
-            and self._length(job, "host") != len(job.tokens)
+            and self._host_length(job) != len(job.tokens)
         ):
             missing = job.operation.storage_hit_count == 0
             job.failure_status = Status.MISSING if missing else Status.FAILED
@@ -634,8 +548,8 @@ class StorageCacheReads:
         self.cache.drain_storage_control_queues()
         jobs = tuple(self.jobs.values())
         if self.executor.config.storage_demand_priority:
-            active = [job for job in jobs if job.operation is not None or job.loading]
-            queued = [job for job in jobs if job.operation is None and not job.loading]
+            active = [job for job in jobs if job.operation is not None]
+            queued = [job for job in jobs if job.operation is None]
             demand = sorted(
                 (job for job in queued if job.demands),
                 key=lambda job: job.admission_order,
@@ -658,30 +572,14 @@ class StorageCacheReads:
             if cancelled and job.operation is not None and not job.cancel_requested:
                 job.cancel_requested = True
                 self.cache.cache_controller.terminate_prefetch(job.operation)
-            if job.loading:
-                result = (
-                    self.host.cancel(job.work.ref)
-                    if cancelled or job.failure
-                    else self.host.poll(job.work.ref)
-                )
-                if result is not None and result.status.terminal:
-                    job.loading = False
-                    if result.status not in (Status.COMPLETED, Status.CANCELLED):
-                        job.failure = (result.code or "load_failed", result.reason)
-                    self._retire(job)
-            elif job.operation is None:
+            if job.operation is None:
                 if cancelled:
                     self._retire(job)
                 else:
                     self._start(job)
             elif getattr(job.operation, "native_quiescent", False):
                 self._observe_cold_result(job)
-                if cancelled or job.failure:
-                    self._retire(job)
-                elif job.work.payload.dst.tier == "gpu":
-                    self._load_gpu(job)
-                else:
-                    self._retire(job)
+                self._retire(job)
 
     def _retire(self, job, *, status=None, code=""):
         length = 0
@@ -692,7 +590,7 @@ class StorageCacheReads:
                 # Final ACK publication may have queued unused scratch pages
                 # after the previous drain's release-count snapshot.
                 self.cache.drain_storage_control_queues()
-            length = self._length(job, job.work.payload.dst.tier)
+            length = self._host_length(job)
             outcomes = []
             for start, end in ((0, length), (length, len(job.tokens))):
                 if start == end:
@@ -706,7 +604,7 @@ class StorageCacheReads:
                         status=Status.COMPLETED if ready else Status.MISSING,
                         completed_steps=("destination_ready",) if ready else (),
                         location=Location(
-                            tier=job.work.payload.dst.tier,
+                            tier="host",
                             engine_id=self.executor.engine_id,
                         ),
                         code="" if ready else "missing_copy",
@@ -785,7 +683,7 @@ class StorageCacheReads:
             self.interests.pop(interest.work.ref.operation_id)
             return interest.result
         job = interest.job
-        waiting = job.operation is None and not job.loading
+        waiting = job.operation is None
         return ExecutionUpdate(
             status=Status.CANCELLING
             if interest.cancelled or job.failure
@@ -822,14 +720,7 @@ class StorageCacheReads:
             job.interests.remove(ref.operation_id)
             self.interests.pop(ref.operation_id)
             return ExecutionUpdate(status=Status.CANCELLED, quiescent=True)
-        if job.loading:
-            update = self.host.cancel(job.work.ref)
-            if update.quiescent:
-                job.loading = False
-                if update.status not in (Status.COMPLETED, Status.CANCELLED):
-                    job.failure = (update.code or "load_failed", update.reason)
-                self._retire(job)
-        elif job.operation is not None:
+        if job.operation is not None:
             if getattr(job.operation, "native_quiescent", False):
                 self._observe_cold_result(job)
                 self._retire(job)
