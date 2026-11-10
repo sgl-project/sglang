@@ -54,10 +54,6 @@ on:
         description: 'Partition config to parallelize a suite across jobs, e.g. {"size":3,"arr":[0,1,2]}. Each element of arr is a partition id; the template expands one matrix job per element. size is passed to run_suite.py --auto-partition-size.'
         type: string
         default: '{"size":1,"arr":[0]}'
-      max_parallel_partitions:
-        description: 'Cap how many partition jobs run at once. Use when the shards share a host resource budget (e.g. locked memory). 0 means no cap (one job per partition).'
-        type: number
-        default: 0
       ref:
         description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the event SHA.'
         type: string
@@ -92,8 +88,6 @@ jobs:
     name: ${{ inputs.test_suite }}${{ inputs.use_coverage_runner && format(' ({0})', matrix.partition) || '' }}
     strategy:
       fail-fast: false
-      # Shards sharing one host's locked-memory budget must not all start together.
-      max-parallel: ${{ inputs.max_parallel_partitions || fromJson(inputs.partitions).size }}
       matrix:
         partition: ${{ fromJson(inputs.partitions).arr }}
     runs-on: ${{ inputs.runner }}
@@ -276,7 +270,6 @@ jobs:
           workflow_name=$(echo "${{ fromJson(inputs.run_start_metadata).workflow_name }}" | tr ' ' '_' | tr -d '()')
           create_time="${{ fromJson(inputs.run_start_metadata).create_time }}"
           if [ -z "${create_time}" ]; then create_time=$(date -u -d '+8 hours' +%Y%m%d-%H%M); fi
-
           # Append the image tag to the workflow-name segment so that runs with
           # different images (CANN 9.0.0/9.1.0, a3/a5) persist into distinct,
           # image-tagged output/log directories.
