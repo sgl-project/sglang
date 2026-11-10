@@ -1,0 +1,384 @@
+{
+  "schema_version": 1,
+  "measurement_date": "2026-11-10",
+  "scope": "Synthetic rank-local native K3 projection/gate consumer segment on a shared SM103 device. No model, attention-core, DCP or HiCache execution.",
+  "sglang_runtime_revision": "f36efc0961a1af60ba0e4170b4bfc6dec30b7f7a",
+  "flashinfer_source_revision": "f454a17f3f2bae878caf2d49637b1d2b6f407fcd",
+  "execution_mode": "Normal SGLang and complete FI source-package imports, FI public-loader JIT compilation of FI-shipped Cake-generated CUDA. Installed-wheel-trio compatibility is not established.",
+  "flashinfer_source_reported_version": "0.0.0+unknown",
+  "installed_distributions": {
+    "torch": "2.14.1",
+    "nvidia-cutlass-dsl": "4.8.0",
+    "apache-tvm-ffi": "0.1.11",
+    "flashinfer-python": "0.7.2",
+    "flashinfer-cubin": null,
+    "flashinfer-jit-cache": null
+  },
+  "native_rounding_api": [
+    {
+      "requested": "bf16",
+      "supported": false,
+      "error": "sigmoid_precision must be one of ('fp32',) ('fp32': the sigmoid is evaluated in FP32 and not rounded to BF16), got 'bf16'"
+    },
+    {
+      "requested": "bf16",
+      "supported": false,
+      "error": "sigmoid_precision must be one of ('fp32',) ('fp32': the sigmoid is evaluated in FP32 and not rounded to BF16), got 'bf16'"
+    }
+  ],
+  "conditions": {
+    "synthetic_weight_seed": 48510,
+    "activation_dtype": "BF16",
+    "local_heads": 12,
+    "latent_width": 512,
+    "value_width": 128,
+    "gate_input_width": 7168,
+    "correctness": "Three changed-input graph replays with nonpositive lengths and NaN gate inputs on invalid rows.",
+    "timing": "Finite matched inputs with all-positive lengths, warm state, 5 warmups and3 samples of30 complete segments. Eager is Python-dispatched, graph is captured replay with the native gate side stream."
+  },
+  "checks": [
+    {
+      "rows": 8,
+      "heads": 12,
+      "latent_width": 512,
+      "value_width": 128,
+      "gate_input_width": 7168,
+      "weight_stride": [
+        65536,
+        1,
+        512
+      ],
+      "gate_stride": [
+        1536,
+        1
+      ],
+      "program": "cake_mla_value_gate_0df66a90a1dc776a3834",
+      "normal_production_methods": true,
+      "gate_projection_calls_per_eager_segment": 1,
+      "changed_input_graph": [
+        {
+          "iteration": 0,
+          "fi_vs_native_bf16": {
+            "maximum_absolute": 0.00048828125,
+            "mean_absolute": 3.210629802197218e-05,
+            "different_elements": 2398,
+            "elements": 9216,
+            "reference_maximum_absolute": 0.1171875
+          },
+          "fi_vs_native_fp32": {
+            "maximum_absolute": 4.76837158203125e-07,
+            "mean_absolute": 5.1740143419687357e-11,
+            "different_elements": 1,
+            "elements": 9216,
+            "reference_maximum_absolute": 0.1171875
+          },
+          "native_fp32_vs_bf16": {
+            "maximum_absolute": 0.00048828125,
+            "mean_absolute": 3.210624709026888e-05,
+            "different_elements": 2397,
+            "elements": 9216,
+            "reference_maximum_absolute": 0.1171875
+          }
+        },
+        {
+          "iteration": 1,
+          "fi_vs_native_bf16": {
+            "maximum_absolute": 0.00048828125,
+            "mean_absolute": 3.1955383747117594e-05,
+            "different_elements": 2401,
+            "elements": 9216,
+            "reference_maximum_absolute": 0.10791015625
+          },
+          "fi_vs_native_fp32": {
+            "maximum_absolute": 9.5367431640625e-07,
+            "mean_absolute": 1.0671404732098821e-10,
+            "different_elements": 2,
+            "elements": 9216,
+            "reference_maximum_absolute": 0.10791015625
+          },
+          "native_fp32_vs_bf16": {
+            "maximum_absolute": 0.00048828125,
+            "mean_absolute": 3.19552855216898e-05,
+            "different_elements": 2401,
+            "elements": 9216,
+            "reference_maximum_absolute": 0.10791015625
+          }
+        },
+        {
+          "iteration": 2,
+          "fi_vs_native_bf16": {
+            "maximum_absolute": 0.00048828125,
+            "mean_absolute": 3.1625295378034934e-05,
+            "different_elements": 2396,
+            "elements": 9216,
+            "reference_maximum_absolute": 0.1328125
+          },
+          "fi_vs_native_fp32": {
+            "maximum_absolute": 5.960464477539063e-08,
+            "mean_absolute": 6.4675179274609196e-12,
+            "different_elements": 1,
+            "elements": 9216,
+            "reference_maximum_absolute": 0.1328125
+          },
+          "native_fp32_vs_bf16": {
+            "maximum_absolute": 0.00048828125,
+            "mean_absolute": 3.162528810207732e-05,
+            "different_elements": 2395,
+            "elements": 9216,
+            "reference_maximum_absolute": 0.1328125
+          }
+        }
+      ],
+      "ordinary_native_gate_applied_after_fi": "double-gate negative control differs; a native integration must bypass it",
+      "new_weight_storage_new_preparation": "passed outside graph capture",
+      "timing_inputs": {
+        "finite": true,
+        "positive_lengths": true,
+        "valid_rows": 8,
+        "eager_mode": "complete Python-dispatched segment, gate on current stream",
+        "graph_mode": "captured segment replay, actual capture-only gate side stream",
+        "warmups": 5,
+        "repeats": 30,
+        "samples": 3,
+        "shared_device": true
+      },
+      "timing_eager": {
+        "native_bf16": {
+          "unit": "microseconds_per_complete_segment",
+          "samples": [
+            58.998401959737144,
+            61.69600089391073,
+            57.06026554107666
+          ],
+          "median": 58.998401959737144
+        },
+        "native_fp32_diagnostic": {
+          "unit": "microseconds_per_complete_segment",
+          "samples": [
+            83.1221342086792,
+            82.50986735026042,
+            82.39253362019856
+          ],
+          "median": 82.50986735026042
+        },
+        "fi_fp32": {
+          "unit": "microseconds_per_complete_segment",
+          "samples": [
+            74.26133155822754,
+            73.84640375773112,
+            74.94080066680908
+          ],
+          "median": 74.26133155822754
+        }
+      },
+      "timing_graph": {
+        "native_bf16": {
+          "unit": "microseconds_per_complete_segment",
+          "samples": [
+            12.425600488980612,
+            12.416000167528788,
+            12.418133020401001
+          ],
+          "median": 12.418133020401001
+        },
+        "native_fp32_diagnostic": {
+          "unit": "microseconds_per_complete_segment",
+          "samples": [
+            21.195733547210693,
+            21.04746699333191,
+            21.35466734568278
+          ],
+          "median": 21.195733547210693
+        },
+        "fi_fp32": {
+          "unit": "microseconds_per_complete_segment",
+          "samples": [
+            12.32319970925649,
+            12.371200323104858,
+            12.382933497428894
+          ],
+          "median": 12.371200323104858
+        }
+      }
+    },
+    {
+      "rows": 32,
+      "heads": 12,
+      "latent_width": 512,
+      "value_width": 128,
+      "gate_input_width": 7168,
+      "weight_stride": [
+        65536,
+        1,
+        512
+      ],
+      "gate_stride": [
+        1536,
+        1
+      ],
+      "program": "cake_mla_value_gate_0df66a90a1dc776a3834",
+      "normal_production_methods": true,
+      "gate_projection_calls_per_eager_segment": 1,
+      "changed_input_graph": [
+        {
+          "iteration": 0,
+          "fi_vs_native_bf16": {
+            "maximum_absolute": 0.00048828125,
+            "mean_absolute": 3.217255652998574e-05,
+            "different_elements": 11958,
+            "elements": 46080,
+            "reference_maximum_absolute": 0.123046875
+          },
+          "fi_vs_native_fp32": {
+            "maximum_absolute": 0.0001220703125,
+            "mean_absolute": 6.153034970424187e-09,
+            "different_elements": 11,
+            "elements": 46080,
+            "reference_maximum_absolute": 0.12353515625
+          },
+          "native_fp32_vs_bf16": {
+            "maximum_absolute": 0.00048828125,
+            "mean_absolute": 3.216640106984414e-05,
+            "different_elements": 11950,
+            "elements": 46080,
+            "reference_maximum_absolute": 0.123046875
+          }
+        },
+        {
+          "iteration": 1,
+          "fi_vs_native_bf16": {
+            "maximum_absolute": 0.00048828125,
+            "mean_absolute": 3.320810355944559e-05,
+            "different_elements": 12260,
+            "elements": 46080,
+            "reference_maximum_absolute": 0.12109375
+          },
+          "fi_vs_native_fp32": {
+            "maximum_absolute": 6.103515625e-05,
+            "mean_absolute": 3.5357516914302778e-09,
+            "different_elements": 13,
+            "elements": 46080,
+            "reference_maximum_absolute": 0.12109375
+          },
+          "native_fp32_vs_bf16": {
+            "maximum_absolute": 0.00048828125,
+            "mean_absolute": 3.320465111755766e-05,
+            "different_elements": 12253,
+            "elements": 46080,
+            "reference_maximum_absolute": 0.12109375
+          }
+        },
+        {
+          "iteration": 2,
+          "fi_vs_native_bf16": {
+            "maximum_absolute": 0.00048828125,
+            "mean_absolute": 3.1716972443973646e-05,
+            "different_elements": 11985,
+            "elements": 46080,
+            "reference_maximum_absolute": 0.1396484375
+          },
+          "fi_vs_native_fp32": {
+            "maximum_absolute": 6.103515625e-05,
+            "mean_absolute": 1.5316700130441063e-09,
+            "different_elements": 5,
+            "elements": 46080,
+            "reference_maximum_absolute": 0.1396484375
+          },
+          "native_fp32_vs_bf16": {
+            "maximum_absolute": 0.00048828125,
+            "mean_absolute": 3.171544085489586e-05,
+            "different_elements": 11983,
+            "elements": 46080,
+            "reference_maximum_absolute": 0.1396484375
+          }
+        }
+      ],
+      "ordinary_native_gate_applied_after_fi": "double-gate negative control differs; a native integration must bypass it",
+      "new_weight_storage_new_preparation": "passed outside graph capture",
+      "timing_inputs": {
+        "finite": true,
+        "positive_lengths": true,
+        "valid_rows": 32,
+        "eager_mode": "complete Python-dispatched segment, gate on current stream",
+        "graph_mode": "captured segment replay, actual capture-only gate side stream",
+        "warmups": 5,
+        "repeats": 30,
+        "samples": 3,
+        "shared_device": true
+      },
+      "timing_eager": {
+        "native_bf16": {
+          "unit": "microseconds_per_complete_segment",
+          "samples": [
+            59.543466567993164,
+            58.75840187072754,
+            61.108267307281494
+          ],
+          "median": 59.543466567993164
+        },
+        "native_fp32_diagnostic": {
+          "unit": "microseconds_per_complete_segment",
+          "samples": [
+            84.51626300811768,
+            83.12853177388509,
+            84.98026529947917
+          ],
+          "median": 84.51626300811768
+        },
+        "fi_fp32": {
+          "unit": "microseconds_per_complete_segment",
+          "samples": [
+            78.53333155314128,
+            74.07146294911702,
+            73.87839953104655
+          ],
+          "median": 74.07146294911702
+        }
+      },
+      "timing_graph": {
+        "native_bf16": {
+          "unit": "microseconds_per_complete_segment",
+          "samples": [
+            16.53439998626709,
+            16.546133160591125,
+            16.482133666674297
+          ],
+          "median": 16.53439998626709
+        },
+        "native_fp32_diagnostic": {
+          "unit": "microseconds_per_complete_segment",
+          "samples": [
+            24.741333723068237,
+            24.706133206685383,
+            24.695465962092083
+          ],
+          "median": 24.706133206685383
+        },
+        "fi_fp32": {
+          "unit": "microseconds_per_complete_segment",
+          "samples": [
+            18.53226621945699,
+            18.455467621485393,
+            18.485333522160847
+          ],
+          "median": 18.485333522160847
+        }
+      }
+    }
+  ],
+  "resources": {
+    "process_gpu_peak_mib": 1094,
+    "process_gpu_limit_mib": 1536,
+    "torch_peak_reserved_bytes": 251658240,
+    "torch_peak_allocated_bytes": 167011328,
+    "host_status": "passed",
+    "gpu_status": "passed",
+    "exit_code": 0
+  },
+  "earlier_attempt": {
+    "status": "host watchdog failure",
+    "reason": "1094MiB process GPU memory exceeded chosen1024MiB cap. GPU output alone did not count as a completed qualification.",
+    "retained": true
+  },
+  "driver_cleanup": "Two unused output-sized allocations were removed after measurement. Remaining AST is identical to the measured driver."
+}

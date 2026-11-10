@@ -147,9 +147,19 @@ The implementation uses a direct residual-vector norm in both AttnRes consumers
 to avoid cancellation-induced NaNs and a monotonic incremental detokenization
 cursor to avoid duplicate Unicode streaming text. CPU regressions cover these
 counterexamples, late weight-address binding and auxiliary-capture admission.
-Earlier isolated SM103 consumer tests covered B1/B64, eager/graph, empty-bank
-and final branches; the relocated implementation still needs its own CUDA and
-full-model validation.
+At in-tree revision `f36efc0`, the actual `ClusterAttnRes` and `OprojConsumer`
+classes passed the registered SM103 fixture through normal SGLang package
+initialization with Torch 2.14.1+cu130 and CuTe DSL 4.8.0. Eager execution and
+three graph replays cover B1/B64, empty-bank and final branches. Outputs remain
+finite and match the FP64 reference within the fixture's tolerances, while the
+prefix and saved bank remain unchanged. This qualifies consumer arithmetic and
+barriers. TP8 producers, TwoShot and full-model behavior need separate validation.
+
+Run that focused fixture in a matching environment from the repository root:
+
+```bash
+python -m pytest -q test/registered/kernels/ops/layernorm/test_kimi_k3_attnres_stability.py
+```
 
 ![Historical pre-fix integrated-build throughput and p95 time to first token](/images/kimi-k3-specialized-decode/integrated-comparison.png)
 

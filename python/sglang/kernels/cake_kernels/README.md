@@ -42,6 +42,14 @@ validation, not full-model qualification of this adapter. Record the exact
 FlashInfer revision and matching package versions when qualifying the slot;
 SGLang's pinned `flashinfer_python==0.7.2` retains `MlaValue`.
 
+The official `flashinfer_python-0.7.3-py3-none-any.whl` was also inspected on
+November 10, 2026. Its ZIP directory contains neither
+`flashinfer/cake_mla_value_gate.py` nor the corresponding experimental package.
+Matching Python/cubin/JIT-cache version numbers alone therefore cannot enable
+this operator on that release. Selection continues to check for the actual
+module. The source/AOT checks below remain distinct from installed-wheel
+qualification.
+
 Only an explicit capability refusal (missing module, unsupported architecture or
 unavailable program) disables the adapter for the device. Other prepare errors,
 including OOM, capture refusal and unclassified JIT/load errors, keep `MlaValue`
@@ -77,3 +85,54 @@ changed-input graph replay. The CuTe launch uses the current runtime stream,
 including during capture. These are source-package/operator checks; installed
 wheel-trio compatibility, the complete K3 executor, TP8/DCP/HiCache, task quality
 and matched serving performance still require separate qualification.
+
+### Native K3 consumer segment
+
+The [manual consumer driver](../../../../test/manual/kernels/bench_kimi_k3_native_value_gate.py)
+calls the production native value-projection method, K3's gate-stream helpers and
+the native BF16 gate kernel, alongside FI's public preparation/launch API. It uses
+synthetic TP8-rank-shaped tensors with 12 local heads, a 512-wide latent, 128 value
+columns per head and a 7168-wide gate input. It covers changed-input graphs,
+invalid rows with NaN gate inputs, a double-gating negative control and new
+preparation after replacing weight storage.
+
+On SM103 with Torch 2.14.1+cu130 and CuTe DSL 4.8.0, the complete consumer segment
+produced these warm medians in microseconds:
+
+| Rows | Execution | Native BF16 | Native projection + FP32 diagnostic | FI FP32 |
+| --- | --- | ---: | ---: | ---: |
+| 8 | Python-dispatched eager | 58.998 | 82.510 | 74.261 |
+| 8 | Captured graph replay | 12.418 | 21.196 | 12.371 |
+| 32 | Python-dispatched eager | 59.543 | 84.516 | 74.071 |
+| 32 | Captured graph replay | 16.534 | 24.706 | 18.485 |
+
+Timing inputs are identical, finite and all valid. Each point has five warmups
+and three samples of 30 segments on a shared device. The graph uses the native
+capture-only gate side stream. The FP32 diagnostic isolates the precision policy
+and uses separate Torch elementwise operations. It is a diagnostic reference.
+[Measurements and samples](../../../../docs/images/kimi-k3-specialized-decode/native-consumer-measurements.json)
+record the complete scope and the earlier resource-guard failure separately.
+
+The FI output's maximum absolute difference from native BF16 was 0.00048828125.
+Against the FP32 diagnostic it was at most 0.0000009536743 at B8 and 0.0001220703125
+at B32. FI explicitly refuses `sigmoid_precision="bf16"`. The tested native/FI
+bridge uses normal source-package imports and JIT compilation of FI-shipped
+Cake-generated CUDA through FI's public loader. Its source package reports
+`0.0.0+unknown` at the archived `f454a17f` revision. This is source-build evidence.
+
+These points leave the native BF16 serving path in place. A native FI selection
+still needs an agreed precision policy, an exactly-once handoff past the existing
+gate wrapper, and live valid-row metadata for graph padding. Native graph padding
+can have nonzero sequence lengths, and its valid-token scalar is conditional on
+engine configuration. The prepared executor's FI adapter remains separately
+scoped to its existing `MlaValue` sites.
+
+With a FI build exposing this experimental API and one visible SM103 GPU, run
+the driver from the repository root:
+
+```bash
+python test/manual/kernels/bench_kimi_k3_native_value_gate.py \
+  --output /tmp/k3-native-value-gate.json
+```
+
+Use `--flashinfer-revision` to record the source build's commit.
