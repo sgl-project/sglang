@@ -165,6 +165,145 @@ class TestFusedSigmoidGatingDeltaRuleUpdateNonContiguous(unittest.TestCase):
         """target_verify style: T>1."""
         self._run_test(batch=4, T=4, num_v_heads=8, head_k_dim=64, head_v_dim=32)
 
+    def _run_fp16_verify_block_matches_repeated_decode(
+        self,
+        *,
+        key_heads,
+        value_heads,
+        steps,
+    ):
+        """Low-precision recurrent state must cross the same boundary per token."""
+        torch.manual_seed(7)
+        batch, key_dim, value_dim = 1, 128, 128
+        state_shape = (batch, value_heads, key_dim, value_dim)
+
+        A_log = torch.randn(value_heads, dtype=torch.float32, device="cuda") * 0.1
+        dt_bias = torch.randn(value_heads, dtype=torch.float16, device="cuda") * 0.1
+        q = torch.randn(
+            batch,
+            steps,
+            key_heads,
+            key_dim,
+            dtype=torch.float16,
+            device="cuda",
+        )
+        k = torch.randn_like(q)
+        v = torch.randn(
+            batch,
+            steps,
+            value_heads,
+            value_dim,
+            dtype=torch.float16,
+            device="cuda",
+        )
+        a = torch.randn(batch * steps, value_heads, dtype=torch.float16, device="cuda")
+        b = torch.randn_like(a)
+        initial_state = (
+            torch.randn(*state_shape, dtype=torch.float16, device="cuda") * 0.01
+        )
+        state_indices = torch.tensor([0], dtype=torch.int32, device="cuda")
+
+        intermediate_states = torch.empty(
+            batch,
+            steps,
+            value_heads,
+            key_dim,
+            value_dim,
+            dtype=torch.float16,
+            device="cuda",
+        )
+        block_output = fused_sigmoid_gating_delta_rule_update(
+            A_log=A_log,
+            dt_bias=dt_bias,
+            q=q,
+            k=k,
+            v=v,
+            a=a,
+            b=b,
+            initial_state_source=initial_state.clone(),
+            initial_state_indices=state_indices,
+            use_qk_l2norm_in_kernel=True,
+            softplus_beta=1.0,
+            softplus_threshold=20.0,
+            disable_state_update=True,
+            intermediate_states_buffer=intermediate_states,
+            intermediate_state_indices=state_indices,
+        )
+
+        decode_state = initial_state.clone()
+        decode_outputs = []
+        for step in range(steps):
+            decode_outputs.append(
+                fused_sigmoid_gating_delta_rule_update(
+                    A_log=A_log,
+                    dt_bias=dt_bias,
+                    q=q[:, step : step + 1],
+                    k=k[:, step : step + 1],
+                    v=v[:, step : step + 1],
+                    a=a[step : step + 1],
+                    b=b[step : step + 1],
+                    initial_state_source=decode_state,
+                    initial_state_indices=state_indices,
+                    use_qk_l2norm_in_kernel=True,
+                    softplus_beta=1.0,
+                    softplus_threshold=20.0,
+                )
+            )
+        decode_output = torch.cat(decode_outputs, dim=1)
+
+        self.assertTrue(
+            torch.equal(block_output, decode_output),
+            (
+                "output mismatch: "
+                f"max diff={(block_output - decode_output).abs().max().item()}, "
+                f"count={torch.count_nonzero(block_output != decode_output).item()}"
+            ),
+        )
+        self.assertTrue(
+            torch.equal(intermediate_states[0, -1], decode_state[0]),
+            (
+                "final state mismatch: "
+                f"max diff={(intermediate_states[0, -1] - decode_state[0]).abs().max().item()}, "
+                f"count={torch.count_nonzero(intermediate_states[0, -1] != decode_state[0]).item()}"
+            ),
+        )
+
+    def test_qwen35_122b_tp4_fp16_verify_block_matches_repeated_decode(self):
+        # Qwen3.5-122B: global H=16/HV=64, therefore TP4 H=4/HV=16.
+        self._run_fp16_verify_block_matches_repeated_decode(
+            key_heads=4,
+            value_heads=16,
+            steps=16,
+        )
+
+    def test_qwen36_27b_tp4_fp16_verify_block_matches_repeated_decode(self):
+        # Qwen3.6-27B: global H=16/HV=48, therefore TP4 H=4/HV=12.
+        # The 3:1 mapping also exercises the recurrent kernel shape used by the
+        # model's non-fused QKVZBA split path.
+        self._run_fp16_verify_block_matches_repeated_decode(
+            key_heads=4,
+            value_heads=12,
+            steps=16,
+        )
+
+    def test_qwen36_35b_a3b_tp4_fp16_verify_block8_matches_repeated_decode(self):
+        # Qwen3.6-35B-A3B: global H=16/HV=32, therefore TP4 H=4/HV=8.
+        # The model card currently demonstrates an eight-token override.
+        self._run_fp16_verify_block_matches_repeated_decode(
+            key_heads=4,
+            value_heads=8,
+            steps=8,
+        )
+
+    def test_qwen36_35b_a3b_tp4_fp16_verify_block16_matches_repeated_decode(self):
+        # Also cover the checkpoint's configured block size and the common
+        # explicit --speculative-dflash-block-size 16 deployment.
+        self._run_fp16_verify_block_matches_repeated_decode(
+            key_heads=4,
+            value_heads=8,
+            steps=16,
+        )
+
 
 @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestFusedSigmoidGatingKDAStride(unittest.TestCase):

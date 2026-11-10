@@ -2508,6 +2508,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         def _args(**kw):
             defaults = dict(
                 device="cuda",
+                dtype="auto",
                 swa_full_tokens_ratio=_declared_default("swa_full_tokens_ratio"),
                 moe_a2a_backend="none",
                 moe_runner_backend="auto",
@@ -2518,7 +2519,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
 
         with (
             envs.SGLANG_DSV4_FP4_DEQUANT.override(False),
-            override_platform(is_sm100=True),
+            override_platform(is_sm100=True, is_sm70=False),
         ):
             self.assertEqual(
                 _deepseek_v4_overrides(_args(), hf),
@@ -2554,7 +2555,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         # FlashInfer MXFP4 only supports the standard (non-A2A) dispatcher.
         with (
             envs.SGLANG_DSV4_FP4_DEQUANT.override(False),
-            override_platform(is_sm100=True),
+            override_platform(is_sm100=True, is_sm70=False),
         ):
             self.assertNotIn(
                 "moe_runner_backend",
@@ -2563,34 +2564,39 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         # Runtime FP4-to-FP8 dequantization must retain the generic FP8 runner.
         with (
             envs.SGLANG_DSV4_FP4_DEQUANT.override(True),
-            override_platform(is_sm100=True),
+            override_platform(is_sm100=True, is_sm70=False),
         ):
             self.assertNotIn(
                 "moe_runner_backend",
                 _deepseek_v4_overrides(_args(), hf),
             )
         # FP8 checkpoints and non-CUDA platforms keep their platform-specific
-        # auto-resolution paths.
+        # auto-resolution paths (not SM70: that path always declares marlin).
         fp8_model_config = SimpleNamespace(is_fp4_experts=False, nvfp4_moe_meta=None)
-        self.assertNotIn(
-            "moe_runner_backend",
-            _deepseek_v4_overrides(_args(_model_config=fp8_model_config), hf),
-        )
+        with override_platform(
+            is_sm70=False, is_sm90=False, is_sm100=False, is_sm120=False
+        ):
+            self.assertNotIn(
+                "moe_runner_backend",
+                _deepseek_v4_overrides(_args(_model_config=fp8_model_config), hf),
+            )
         self.assertNotIn(
             "moe_runner_backend",
             _deepseek_v4_overrides(_args(device="npu"), hf),
         )
-        with override_platform(is_hip=True):
+        with override_platform(is_hip=True, is_sm70=False):
             self.assertNotIn(
                 "moe_runner_backend",
                 _deepseek_v4_overrides(_args(), hf),
             )
-        # Unsupported NVIDIA architectures keep the generic auto-resolution
-        # path instead of selecting a FlashInfer kernel that cannot launch.
-        with (
-            override_platform(is_sm90=False),
-            override_platform(is_sm100=False),
-            override_platform(is_sm120=False),
+        # Unsupported NVIDIA architectures (not SM70) keep the generic
+        # auto-resolution path instead of selecting a FlashInfer kernel.
+        with override_platform(
+            is_sm70=False,
+            is_sm90=False,
+            is_sm100=False,
+            is_sm120=False,
+            device_sm=80,
         ):
             self.assertNotIn(
                 "moe_runner_backend",
@@ -2599,26 +2605,94 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         # SM120 uses the same model hook; no later pass is needed.
         with (
             envs.SGLANG_DSV4_FP4_DEQUANT.override(False),
-            override_platform(is_sm90=False),
-            override_platform(is_sm100=False),
-            override_platform(is_sm120=True),
+            override_platform(
+                is_sm90=False, is_sm100=False, is_sm120=True, is_sm70=False
+            ),
         ):
             self.assertEqual(
                 _deepseek_v4_overrides(_args(), hf)["moe_runner_backend"],
                 "flashinfer_mxfp4",
             )
         # nvfp4 hybrid checkpoint routes the MoE runner
-        self.assertEqual(
-            _deepseek_v4_overrides(
-                _args(
-                    _model_config=SimpleNamespace(
-                        is_fp4_experts=False, nvfp4_moe_meta=object()
-                    )
-                ),
-                hf,
-            )["moe_runner_backend"],
-            "flashinfer_trtllm_routed",
+        with override_platform(is_sm70=False, is_sm100=True):
+            self.assertEqual(
+                _deepseek_v4_overrides(
+                    _args(
+                        _model_config=SimpleNamespace(
+                            is_fp4_experts=False, nvfp4_moe_meta=object()
+                        )
+                    ),
+                    hf,
+                )["moe_runner_backend"],
+                "flashinfer_trtllm_routed",
+            )
+
+    def test_deepseek_v41_sm70_overrides(self):
+        from sglang.srt.arg_groups.model_overrides.deepseek_v4 import (
+            _deepseek_v4_overrides,
         )
+
+        hf_v4 = SimpleNamespace(architectures=["DeepseekV4ForCausalLM"])
+        hf_v41 = SimpleNamespace(architectures=["DeepseekV41ForCausalLM"])
+
+        def _args(**kw):
+            defaults = dict(
+                device="cuda",
+                dtype="auto",
+                swa_full_tokens_ratio=_declared_default("swa_full_tokens_ratio"),
+                moe_a2a_backend="none",
+                moe_runner_backend="auto",
+                _model_config=SimpleNamespace(is_fp4_experts=True, nvfp4_moe_meta=None),
+            )
+            defaults.update(kw)
+            return SimpleNamespace(**defaults)
+
+        sm70 = dict(
+            is_cuda=True,
+            is_hip=False,
+            is_sm70=True,
+            is_sm90=False,
+            is_sm100=False,
+            is_sm120=False,
+            device_sm=70,
+        )
+        expected = {
+            "attention_backend": "dsv4",
+            "page_size": 256,
+            "swa_full_tokens_ratio": 0.1,
+            "dtype": "float16",
+            "moe_runner_backend": "marlin",
+        }
+        with override_platform(**sm70):
+            self.assertEqual(_deepseek_v4_overrides(_args(), hf_v4), expected)
+            self.assertEqual(_deepseek_v4_overrides(_args(), hf_v41), expected)
+            # Explicit fp16 / marlin are already the SM70 choice; do not redeclare.
+            declared = _deepseek_v4_overrides(
+                _args(dtype="float16", moe_runner_backend="marlin"), hf_v41
+            )
+            self.assertNotIn("dtype", declared)
+            self.assertNotIn("moe_runner_backend", declared)
+            self.assertEqual(declared["page_size"], 256)
+            with self.assertRaises(ValueError) as bf16:
+                _deepseek_v4_overrides(_args(dtype="bfloat16"), hf_v41)
+            self.assertIn("bfloat16", str(bf16.exception))
+            with self.assertRaises(ValueError) as mxfp4:
+                _deepseek_v4_overrides(
+                    _args(moe_runner_backend="flashinfer_mxfp4"), hf_v41
+                )
+            self.assertIn("flashinfer_mxfp4", str(mxfp4.exception))
+            # SM70 still prefers marlin over the Hopper TRT-LLM hybrid default.
+            self.assertEqual(
+                _deepseek_v4_overrides(
+                    _args(
+                        _model_config=SimpleNamespace(
+                            is_fp4_experts=False, nvfp4_moe_meta=object()
+                        )
+                    ),
+                    hf_v41,
+                )["moe_runner_backend"],
+                "marlin",
+            )
 
     def test_bailing_v3_mixed_mxfp4_selects_native_runner(self):
         """Packed MXFP4 experts must not reach the FP8 Triton runner."""

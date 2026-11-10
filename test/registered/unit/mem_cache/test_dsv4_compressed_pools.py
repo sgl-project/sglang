@@ -32,16 +32,18 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     DeepSeekV4UniformFP8KVPool,
     _CompressedPoolConfig,
     _num_dsv4_physical_kv_pages,
+    collect_sources_by_ratio,
 )
 from sglang.srt.mem_cache.dsv41_request_window import window_layout
 from sglang.srt.mem_cache.hicache_storage import PoolName
+from sglang.srt.mem_cache.prefill_budget import SWAPrefillBudget
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     CudaGraphConfig,
     PhaseConfig,
 )
 from sglang.srt.model_executor.forward_mode import ForwardMode
-from sglang.srt.runtime_context import get_context
+from sglang.srt.runtime_context import get_context, override_platform
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
     TargetHiddenKvInjector,
 )
@@ -383,6 +385,41 @@ class TestDSV4CompressedPools(CustomTestCase):
         self.assertEqual(pool.get_index_k_page_size(4), 32)
         with self.assertRaisesRegex(AssertionError, "No indexer pool"):
             pool.get_index_k_page_size(128)
+
+    def test_v41_low_ratio_layers_map_without_c4_c128_pools(self):
+        pool = DeepSeekV4TokenToKVPool.__new__(DeepSeekV4TokenToKVPool)
+        pool.kv_pools = {4: None, 128: None}
+        pool.compression_ratios = [0, 0, 2, 2, 2, 1, 1]
+        pool._stage_start, pool._stage_end = 0, 7
+        # Ratio 1/2 ids come from kv_source layers, which __init__ records
+        # before the mapping. This bare object has to do the same.
+        pool.kv_source_layers = [2, 3, 5]
+        pool.sources_by_ratio = collect_sources_by_ratio(
+            pool.compression_ratios, pool.kv_source_layers, range(0, 7)
+        )
+        pool._init_compressed_layer_mapping()
+        self.assertEqual(pool.layer_mapping[0].compress_ratio, 0)
+        self.assertIsNone(pool.layer_mapping[0].compress_kv_pool)
+        self.assertEqual(pool.layer_mapping[2].compress_ratio, 2)
+        self.assertIsNone(pool.layer_mapping[2].compress_kv_pool)
+        self.assertEqual(pool.layer_mapping[2].compress_layer_id, 0)
+        self.assertEqual(pool.layer_mapping[3].compress_layer_id, 1)
+        self.assertEqual(pool.layer_mapping[5].compress_ratio, 1)
+        self.assertIsNone(pool.layer_mapping[5].compress_kv_pool)
+
+        pool.compressed_pool_configs = {
+            4: _CompressedPoolConfig(256, 64, torch.bfloat16, indexer_size=1024),
+            128: _CompressedPoolConfig(512, 8, torch.float32),
+        }
+        pool.index_pools = {4: object()}
+        pool.qk_nope_head_dim, pool.qk_rope_head_dim = 448, 64
+        pool.indexer_head_dim = 128
+        pool.device = "cpu"
+        pool.swa_page_size = 128
+        pool.online_mtp_max_draft_tokens = 0
+        pool._init_paged_compress_states(False)
+        self.assertTrue(all(p is None for p in pool.compress_state_pools))
+        self.assertTrue(all(p is None for p in pool.indexer_compress_state_pools))
 
 
 HEAD_DIM = 512
@@ -757,6 +794,65 @@ class TestV41KVPoolLayouts(CustomTestCase):
         }
         self.assertNotEqual(names[KVLayout.V41], names[KVLayout.V41_NEW])
         self.assertIn("v41_fp4_new", names[KVLayout.V41_NEW])
+
+    def test_sm70_paged_swa_is_per_request_ring(self):
+        """A 23k first prefill must not be billed 1:1 into the vestigial SWA floor.
+
+        SM70 CSA2 writes the window into compressed rings. The paged pool is
+        still constructed, and the hybrid allocator used to take one SWA token
+        per prompt token. That filled the 5120 floor, shrank every later
+        chunk, and the client aborted before the request could be pinned.
+        """
+        sm70 = dict(
+            is_cuda=True,
+            is_hip=False,
+            is_sm70=True,
+            is_sm90=False,
+            is_sm100=False,
+            is_sm120=False,
+            device_sm=70,
+        )
+        with override_platform(**sm70):
+            pool = self.make_pool([0, 2], [1], KVLayout.V41)
+        self.assertIsNotNone(pool.swa_kv_pool)
+        self.assertEqual(pool.swa_req_ring_size, pool.sliding_window)
+
+        req_pool = MagicMock()
+        req_pool.available_size.return_value = 2
+        alloc = SWATokenToKVPoolAllocator(
+            FULL_SIZE,
+            5120,
+            page_size=PAGE_SIZE,
+            dtype=torch.float8_e4m3fn,
+            device="cpu",
+            kvcache=pool,
+            need_sort=False,
+            req_to_token_pool=req_pool,
+        )
+        self.assertTrue(alloc.swa_req_ring)
+        tree = MagicMock()
+        tree.sliding_window_size = pool.sliding_window
+        tree.swa_evictable_size.return_value = 0
+        tree.full_evictable_size.return_value = 0
+        tree.supports_mamba.return_value = False
+        budget = SWAPrefillBudget(alloc, tree)
+        # One ring, not the 23428-token prompt.
+        self.assertEqual(
+            budget.swa_tokens(23428, 1, chunk_limit=2048),
+            alloc.swa_ring_cost_tokens,
+        )
+        self.assertLess(alloc.swa_ring_cost_tokens, 5120)
+
+    def test_non_sm70_paged_swa_stays_token_paged(self):
+        with override_platform(
+            is_cuda=True,
+            is_sm70=False,
+            is_sm100=True,
+            is_sm120=False,
+            device_sm=100,
+        ):
+            pool = self.make_pool([0, 2], [1], KVLayout.V41)
+        self.assertIsNone(pool.swa_req_ring_size)
 
     def test_pd_entries_cover_the_c4_kv_page_count(self):
         """The PD transfer walks every registered entry with the c4 KV pool's

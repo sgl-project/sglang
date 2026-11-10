@@ -31,6 +31,18 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+@pytest.fixture(autouse=True)
+def _ple_model_compute_dtype():
+    """The loader builds PLE under the model dtype; gathers emit that dtype."""
+
+    previous = torch.get_default_dtype()
+    torch.set_default_dtype(torch.bfloat16)
+    try:
+        yield
+    finally:
+        torch.set_default_dtype(previous)
+
+
 def _make_source_embedding(
     *,
     dtype=torch.bfloat16,

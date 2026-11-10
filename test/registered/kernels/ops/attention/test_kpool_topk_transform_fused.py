@@ -6,9 +6,10 @@ gives ``group_topk=512``); ``kpool_fp8_index`` has no Python fallback in that
 range, so a build or numerical break here takes the model down rather than
 making it slower.
 
-The radix selector does not specify an output order and DSA attention is
-permutation-invariant over the selected set, so the pooled columns are compared
-as a set. The tail columns are positional and are compared exactly.
+The pooled columns come out in ascending group order, and exact ties keep the
+lowest group ids: the sparse attention sums over the selected keys in column
+order, so a run-dependent order would make outputs run-dependent. The tail
+columns are positional and are compared exactly.
 
 The overfull-bin rescan is shared by CUDA and ROCm, so the tie and graph-replay
 cases run on both.
@@ -116,6 +117,27 @@ class TestKpoolTopkTransformFused(CustomTestCase):
                 expected_tail += [-1] * (self.POOL_SIZE - 1 - extra)
                 for row in range(out.shape[0]):
                     self.assertEqual(out[row, topk:].tolist(), expected_tail)
+
+    def test_order_and_ties_are_deterministic(self):
+        # Few distinct values, so the last radix round has to break exact ties.
+        torch.manual_seed(0)
+        rows, groups, topk = 3, 3000, 2048
+        group_topk = topk // self.POOL_SIZE
+        score = (torch.randint(0, 40, (rows, groups)).float() / 7).cuda()
+        lengths = torch.full((rows,), groups, dtype=torch.int32, device="cuda")
+        outs = [
+            fast_kpool_topk_transform_fused(
+                score=score, lengths=lengths, pool_size=self.POOL_SIZE, topk=topk
+            ).cpu()
+            for _ in range(10)
+        ]
+        for out in outs[1:]:
+            self.assertTrue(torch.equal(out, outs[0]))
+        for row in range(rows):
+            values = score[row].cpu().tolist()
+            expected = sorted(range(groups), key=lambda g: (-values[g], g))[:group_topk]
+            selected = outs[0][row, :topk:self.POOL_SIZE] // self.POOL_SIZE
+            self.assertEqual(selected.tolist(), sorted(expected))
 
     def test_output_width_carries_the_tail_columns(self):
         # kpool_fp8_index feeds this width straight into the page-table transform,

@@ -58,6 +58,25 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 from sglang.srt.mem_cache.kv.plan import TREE_WINDOW
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.unified_cache.tree_core_registry import (
+    resolve_tree_core_backend,
+)
+
+# Skip where production would also fall back to Python (e.g. torch outside range).
+if (
+    resolve_tree_core_backend(
+        "rust",
+        CacheInitParams(
+            disable=False,
+            req_to_token_pool=None,
+            token_to_kv_pool_allocator=None,
+            page_size=1,
+        ),
+    )
+    != "rust"
+):
+    pytest.skip("the Rust TreeCore is unavailable here", allow_module_level=True)
+
 from sglang.srt.mem_cache.rust_tree_core.adapter import (
     RustUnifiedTreeCore,
     _tlru_float_config,

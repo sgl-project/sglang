@@ -192,6 +192,40 @@ class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
         )
         self.assertEqual(component.full_window_pages, 2)
 
+    def test_sticky_wraps_chunk_cache_when_env_on(self):
+        from sglang.srt.environ import envs
+
+        inner = MagicMock()
+        inner.supports_prefix_sharing.return_value = False
+        inner.cache_controller = None
+        register_radix_cache_backend("chunky", MagicMock(return_value=inner))
+
+        envs.SGLANG_DSV41_STICKY_LAST_SEQ.set(True)
+        self.addCleanup(envs.SGLANG_DSV41_STICKY_LAST_SEQ.clear)
+
+        with patch(
+            "sglang.srt.mem_cache.sticky_last_sequence.StickyLastSequenceCache"
+        ) as sticky_cls:
+            sticky_cls.return_value = MagicMock(name="sticky")
+            result = create_tree_cache(_make_ctx(self, backend="chunky"))
+
+        sticky_cls.assert_called_once_with(inner)
+        self.assertIs(result, sticky_cls.return_value)
+
+    def test_sticky_skipped_when_cache_shares_prefixes(self):
+        from sglang.srt.environ import envs
+
+        inner = MagicMock()
+        inner.supports_prefix_sharing.return_value = True
+        inner.cache_controller = None
+        register_radix_cache_backend("radixy", MagicMock(return_value=inner))
+
+        envs.SGLANG_DSV41_STICKY_LAST_SEQ.set(True)
+        self.addCleanup(envs.SGLANG_DSV41_STICKY_LAST_SEQ.clear)
+
+        result = create_tree_cache(_make_ctx(self, backend="radixy"))
+        self.assertIs(result, inner)
+
     def test_pure_swa_with_disable_radix_skips_storage_backends(self):
         ctx = _make_ctx(
             self, disable_radix_cache=True, is_hybrid_swa=True, full_tokens_per_layer=0

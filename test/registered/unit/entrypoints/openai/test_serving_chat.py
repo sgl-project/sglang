@@ -185,6 +185,7 @@ class _MockTokenizerManager:
             grammar_backend="xgrammar",
         )
         self.model_path = self.server_args.model_path
+        self.segment_encoder = None
         # The manager tracks the served name itself; a weight update rewrites it.
         self.served_model_name = "test-model"
         # Stands in for the context's resolved leaves: an override replaces the
@@ -955,6 +956,67 @@ class ServingChatTestCase(CustomTestCase):
                 self.assertIsNone(self.chat._validate_request(above_limit))
 
     # ------------- conversion tests -------------
+    def test_text_only_model_rejects_multimodal_content(self):
+        for media_part, media_name in (
+            (
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,AA=="},
+                },
+                "image",
+            ),
+            (
+                {
+                    "type": "video_url",
+                    "video_url": {"url": "https://example.com/video.mp4"},
+                },
+                "video",
+            ),
+            (
+                {
+                    "type": "audio_url",
+                    "audio_url": {"url": "https://example.com/audio.wav"},
+                },
+                "audio",
+            ),
+        ):
+            with self.subTest(media_name=media_name):
+                req = ChatCompletionRequest(
+                    model="x",
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [
+                                media_part,
+                                {"type": "text", "text": "Describe this."},
+                            ],
+                        }
+                    ],
+                )
+                self.assertEqual(
+                    self.chat._validate_request(req),
+                    f"This model does not support multimodal input ({media_name}).",
+                )
+
+    def test_multimodal_model_accepts_multimodal_content(self):
+        self.tm.model_config.is_multimodal = True
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "data:image/png;base64,AA=="},
+                        },
+                        {"type": "text", "text": "Describe this."},
+                    ],
+                }
+            ],
+        )
+        self.assertIsNone(self.chat._validate_request(req))
+
     def test_convert_to_internal_request_single(self):
         with (
             patch(
@@ -5619,6 +5681,29 @@ class ServingChatTestCase(CustomTestCase):
             kwargs = self._run_jinja_with_effort("high")
         self.assertNotIn("low_effort", kwargs)
         self.assertTrue(any("only 'low' reasoning effort" in m for m in logs.output))
+
+    def test_glm53_effort_aliases_keep_levels_ordered(self):
+        # GLM-5.3 renders every effort but low/high as Max; medium must not
+        # out-think high.
+        self.template_manager.chat_template_name = None
+        self.template_manager.reasoning_config = ReasoningToggleConfig(
+            special_case="always",
+            effort_aliases=(("minimal", "low"), ("medium", "high")),
+        )
+        self.chat.chat_encoding_spec = None
+        cases = {
+            "minimal": "low",
+            "low": "low",
+            "medium": "high",
+            "high": "high",
+            "xhigh": "xhigh",
+            "max": "max",
+        }
+        for effort, rendered in cases.items():
+            with self.subTest(effort=effort):
+                kwargs = self._run_jinja_with_effort(effort)
+                self.assertEqual(kwargs.get("reasoning_effort"), rendered)
+        self.assertNotIn("reasoning_effort", self._run_jinja_with_effort(None))
 
     def test_nemotron_nano_no_effort_kwarg(self):
         # Nano template has no low_effort, so effort_kwarg stays None and no

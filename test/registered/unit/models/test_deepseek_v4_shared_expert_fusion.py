@@ -263,6 +263,9 @@ class TestDeepseekV4SharedExpertFusionPolicy(CustomTestCase):
             def post_load_weights(self):
                 return None
 
+            def _assert_markov_head_loaded(self, **_kwargs):
+                return None
+
         weight = torch.ones(1)
         DeepseekV4ForCausalLMDSpark.load_weights(
             DraftModel(),

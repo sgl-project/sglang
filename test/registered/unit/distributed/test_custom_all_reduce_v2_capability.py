@@ -3,10 +3,16 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from sglang.kernels.ops.communication.all_reduce import AllReduceAlgo
 from sglang.srt.distributed.device_communicators import (
     custom_all_reduce_utils,
     custom_all_reduce_v2,
 )
+from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
+    AllReduceConfig,
+    CustomAllReduceV2,
+)
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
@@ -289,6 +295,53 @@ def test_zero_cluster_uuid_clique_ends_at_its_node(
     # The undecorated function: the CPU runner has no NVML to initialize.
     is_one_nvlink_clique = custom_all_reduce_utils.is_one_nvlink_clique.__wrapped__
     assert is_one_nvlink_clique(object(), object()) is expected
+
+
+def test_pcie_opt_in_default_off_rejects_non_nvlink(monkeypatch):
+    group, device = _patch_group(monkeypatch, world_size=4, same_node=True)
+    monkeypatch.setattr(
+        custom_all_reduce_v2,
+        "can_use_custom_all_reduce_with_nvlink",
+        Mock(return_value=False),
+    )
+    with envs.SGLANG_CUSTOM_AR_ALLOW_PCIE.override(False):
+        assert custom_all_reduce_v2.can_use_custom_all_reduce_v2(group, device) is False
+
+
+def test_pcie_opt_in_allows_non_nvlink_intra_node(monkeypatch):
+    group, device = _patch_group(monkeypatch, world_size=4, same_node=True)
+    monkeypatch.setattr(
+        custom_all_reduce_v2,
+        "can_use_custom_all_reduce_with_nvlink",
+        Mock(return_value=False),
+    )
+    with envs.SGLANG_CUSTOM_AR_ALLOW_PCIE.override(True):
+        assert custom_all_reduce_v2.can_use_custom_all_reduce_v2(group, device) is True
+
+
+def test_pcie_opt_in_still_rejects_when_nvlink_probe_fails(monkeypatch):
+    group, device = _patch_group(monkeypatch, world_size=4, same_node=True)
+    monkeypatch.setattr(
+        custom_all_reduce_v2,
+        "can_use_custom_all_reduce_with_nvlink",
+        Mock(return_value=None),
+    )
+    with envs.SGLANG_CUSTOM_AR_ALLOW_PCIE.override(True):
+        assert custom_all_reduce_v2.can_use_custom_all_reduce_v2(group, device) is False
+
+
+def test_pcie_only_pick_config_is_push_and_size_capped():
+    comm = CustomAllReduceV2.__new__(CustomAllReduceV2)
+    comm.disabled = True
+    comm.pcie_only = True
+    comm.max_push_size = 128 * 1024
+    assert comm._pick_config(4 * 1024, can_use_graph=True) == AllReduceConfig(
+        AllReduceAlgo.ONE_SHOT_PUSH
+    )
+    assert comm._pick_config(128 * 1024, can_use_graph=False) == AllReduceConfig(
+        AllReduceAlgo.ONE_SHOT_PUSH
+    )
+    assert comm._pick_config(128 * 1024 + 16, can_use_graph=True) is None
 
 
 if __name__ == "__main__":

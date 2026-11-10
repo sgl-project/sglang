@@ -152,6 +152,26 @@ class TestModelOptNvfp4(CustomTestCase):
         # Only the gate is BF16 (Qwen3-Next NVFP4): the FP4 body still fuses.
         self.assertTrue(gate_only_bf16.can_fuse_shared_expert())
 
+    def test_torch_nvfp4_quantizer_rounds_half_to_even_low_nibble_first(self):
+        """The pre-SM100 load-time quantizer must match FlashInfer's E2M1 rounding
+        and the ModelOpt nibble order, or converted experts decode to other values."""
+        from sglang.srt.layers.quantization.nvfp4_online import _nvfp4_quantize_torch
+        from sglang.test.quant_ref_utils import break_fp4_bytes
+
+        # Block amax 6 with decode scale 1/448 gives block scale 1, so values are codes.
+        values = [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.5, -6]
+        values += [0.25, 0.75, 1.25, 1.75, 2.5, 3.5]
+        expected = [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.5, -6, 0, 1, 1, 2, 2, 4]
+        weight = torch.tensor([values])
+        packed, block_scales = _nvfp4_quantize_torch(
+            weight=weight, weight_scale_2=torch.tensor(1 / 448)
+        )
+
+        self.assertEqual(packed.shape, (1, 8))
+        self.assertEqual(block_scales.dtype, torch.float8_e4m3fn)
+        decoded = break_fp4_bytes(packed) * block_scales.float() / 448
+        torch.testing.assert_close(decoded[0], torch.tensor(expected).float())
+
 
 if __name__ == "__main__":
     unittest.main()

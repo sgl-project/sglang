@@ -355,6 +355,91 @@ def test_qsa_glue_builds_compressed_indexer(monkeypatch):
         raise AssertionError("non-QSA configs must be rejected")
 
 
+def test_qsa_tokenwise_indexer_prefill_on_sm70():
+    """Qwen3Next-DSA glue builds QwenDSAIndexer and a short prefill selects causally."""
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
+        pytest.skip("SM70 tokenwise indexer smoke")
+
+    from sglang.srt.layers.attention.qsa.dsa_indexer import (
+        QwenDSAIndexer,
+        torch_dsa_weighted_mqa_logits,
+    )
+    from sglang.srt.layers.attention.qsa.glue import build_qsa_indexer
+    from sglang.srt.model_loader.utils import set_default_torch_dtype
+
+    cfg = SimpleNamespace(
+        model_type="qwen3_next",
+        hidden_size=256,
+        num_attention_heads=4,
+        head_dim=64,
+        index_topk=2048,
+        index_n_heads=4,
+        index_kv_heads=1,
+        index_head_dim=64,
+        max_position_embeddings=128,
+        rope_theta=10000.0,
+        rms_norm_eps=1e-6,
+        partial_rotary_factor=1.0,
+    )
+    rows = 4
+    with set_default_torch_dtype(torch.float16):
+        indexer = build_qsa_indexer(cfg, layer_id=0, prefix="layers.0").cuda()
+    assert isinstance(indexer, QwenDSAIndexer)
+    # The SM70 RoPE kernel reads a float32 cos/sin table. Device moves must
+    # not cast that buffer; only an explicit dtype cast would.
+    assert indexer.rotary_emb.cos_sin_cache.dtype == torch.float32
+    # create_weights leaves the projection empty until a checkpoint load.
+    with torch.no_grad():
+        indexer.index_qkw_proj.weight.normal_(0, 0.02)
+
+    torch.manual_seed(0)
+    hidden = torch.randn(rows, cfg.hidden_size, device="cuda", dtype=torch.float16)
+    positions = torch.arange(rows, device="cuda")
+    q, w, k = indexer.project_qkw(hidden, positions)
+    assert q.shape == (rows, cfg.index_n_heads, cfg.index_head_dim)
+    assert k.shape == (rows, 1, cfg.index_head_dim)
+    assert torch.isfinite(q).all() and torch.isfinite(k).all()
+
+    index_k = torch.zeros(
+        (rows + 64, 1, cfg.index_head_dim), dtype=torch.float16, device="cuda"
+    )
+
+    class _Pool:
+        def set_dsa_index_k_buffer(self, layer_id, loc, keys):
+            index_k[loc.long()] = keys.to(index_k.dtype)
+
+        def get_dsa_index_k_buffer(self, layer_id):
+            return index_k
+
+    metadata = SimpleNamespace(
+        token_to_kv_pool=_Pool(),
+        token_to_batch_idx=torch.zeros(rows, dtype=torch.int32, device="cuda"),
+        sequence_lengths=torch.tensor([rows], dtype=torch.int32, device="cuda"),
+        token_slot_table=torch.arange(rows, dtype=torch.int32, device="cuda").view(
+            1, rows
+        ),
+        get_token_to_batch_idx=lambda: metadata.token_to_batch_idx,
+    )
+    forward_batch = SimpleNamespace(
+        forward_mode=ForwardMode.EXTEND,
+        positions=positions,
+        out_cache_loc=torch.arange(rows, dtype=torch.int32, device="cuda"),
+    )
+    selected = indexer.forward_cuda(
+        hidden, positions, forward_batch, metadata
+    )
+    assert selected.shape == (rows, 2048)
+    reference = torch_dsa_weighted_mqa_logits(q, w, index_k[:rows], indexer.score_scale)
+    for row in range(rows):
+        live = [int(v) for v in selected[row].tolist() if v >= 0]
+        assert live == list(range(row + 1)) or set(live) == set(range(row + 1))
+        assert max(live) <= row
+        window = reference[row, : row + 1]
+        order = torch.topk(window, row + 1).indices.sort().values.tolist()
+        assert sorted(live) == order
+
+
 def test_qsa_glue_fetches_indexer_metadata_without_model_unwrap():
     from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
         HybridLinearAttnBackend,
@@ -390,10 +475,11 @@ def test_qsa_draft_extend_backend_decision_follows_profile():
     from sglang.srt.layers.attention.qsa.config import parse_qsa_profile
     from sglang.srt.speculative.draft_utils import DraftBackendFactory
 
-    def factory(config):
+    def factory(config, attn_backend):
         runner = SimpleNamespace(
             model_config=SimpleNamespace(hf_config=config),
             draft_attention_backend=None,
+            attn_backend=attn_backend,
         )
         return DraftBackendFactory(
             draft_model_runner=runner,
@@ -402,11 +488,23 @@ def test_qsa_draft_extend_backend_decision_follows_profile():
             qsa_profile=parse_qsa_profile(config),
         )
 
-    compressed = factory(_compressed_config_namespace())
-    backend = compressed.create_draft_extend_backend()
-    assert isinstance(backend, QwenSparseAttnBackend)
-    assert backend.runner is compressed.draft_model_runner
-    assert backend.decode_attention_backend_str == "qsa"
+    compressed_backend = object()
+    compressed = factory(_compressed_config_namespace(), compressed_backend)
+    assert compressed.create_draft_extend_backend() is compressed_backend
+
+    # Tokenwise draft-extend stays eager: the BF16 indexer is not graph-stable.
+    tokenwise_backend = object()
+    tokenwise = factory(
+        SimpleNamespace(
+            model_type="qwen3_next",
+            index_topk=2048,
+            index_n_heads=8,
+            index_kv_heads=1,
+            index_head_dim=128,
+        ),
+        tokenwise_backend,
+    )
+    assert tokenwise.create_draft_extend_backend() is None
 
 
 def _make_mtp_draft_batch(steps: int, seq_lens=(8, 16), loc_base: int = 40):
@@ -594,6 +692,10 @@ def test_qsa_indexer_ignores_dp_attention_token_padding():
 def test_qsa_cuda_extend_ignores_dp_attention_padding(monkeypatch):
     if not torch.cuda.is_available():
         return
+
+    # This case checks row trimming, not the SM70 dense prefill kernel.
+    # Leaving the dense route on sends head_dim=2 into TileLang.
+    monkeypatch.setenv("SGLANG_SM70_QSA_DENSE_PREFILL_MAX_TOKENS", "0")
 
     kernel_shapes = []
 
@@ -1357,6 +1459,8 @@ def test_qsa_graph_metadata_kernels_match_legacy_host_path(max_pages):
 
     class _Pool:
         qsa_compress_ratio = ratio
+        # The pending ring covers a whole verify window plus retained members.
+        qsa_ring_size = ratio * 2
         # compressed slots per full-KV page (page 64 tokens / ratio 4)
         qsa_compressed_page_size = full_page // ratio
         qsa_block_topk = 512
@@ -1525,6 +1629,7 @@ def test_qsa_graph_layout_covers_speculative_rows_and_padded_tail(seq_offset):
 
     class _Pool:
         qsa_compress_ratio = ratio
+        qsa_ring_size = ratio * 2
         qsa_compressed_page_size = full_page // ratio
         qsa_block_topk = 512
 
@@ -1674,7 +1779,9 @@ def test_qsa_draft_metadata_multi_step_graph(bs, padding):
     )
 
     pages, ratio, full_page = 129, 4, 64
-    pool = SimpleNamespace(qsa_compress_ratio=ratio, qsa_compressed_page_size=16)
+    pool = SimpleNamespace(
+        qsa_compress_ratio=ratio, qsa_ring_size=ratio * 2, qsa_compressed_page_size=16
+    )
     table = torch.arange(
         (bs + 2) * pages * full_page, dtype=torch.int32, device="cuda"
     ).reshape(bs + 2, -1)

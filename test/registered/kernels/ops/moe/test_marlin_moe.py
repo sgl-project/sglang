@@ -418,7 +418,8 @@ class TestFusedMarlinMoe(CustomTestCase):
                     topk = 2
                     ep_size = 2
                     group_size = 128
-                    dtype = torch.bfloat16
+                    cuda_major, _ = torch.cuda.get_device_capability()
+                    dtype = torch.float16 if cuda_major == 7 else torch.bfloat16
                     quant_type = scalar_types.uint4b8
 
                     local_e = e // ep_size
@@ -497,23 +498,69 @@ class TestFusedMarlinMoe(CustomTestCase):
                         expert_map=e_map,
                     )
 
-                    marlin_output = fused_marlin_moe(
+                    # The legacy global-ID/expert-map invocation is an SM80+
+                    # contract.  SM70 serving uses the standard dispatcher's
+                    # rank-local IDs, exercised below.
+                    if cuda_major >= 8:
+                        marlin_output = fused_marlin_moe(
+                            a,
+                            qweight1,
+                            qweight2,
+                            scales1,
+                            scales2,
+                            score,
+                            topk_weights,
+                            topk_ids,
+                            global_num_experts=e,
+                            expert_map=e_map,
+                            num_bits=4,
+                            is_k_full=True,
+                        )
+
+                        torch.testing.assert_close(
+                            marlin_output, torch_output, atol=5e-2, rtol=0
+                        )
+
+                    # SGLang's standard dispatcher maps global IDs before the
+                    # runner: local experts become [0, local_e), remote experts
+                    # become -1, and no expert_map reaches Marlin.  Force one
+                    # route of each kind and verify that explicitly marking EP
+                    # keeps the remote route output at zero.
+                    ep_score = torch.randn((m, e), device="cuda", dtype=dtype)
+                    ep_score[:, 0] = 10.0
+                    ep_score[:, local_e] = 9.0
+                    ep_topk_weights, ep_topk_ids = fused_topk_torch_native(
+                        a, ep_score, topk, False
+                    )
+                    local_topk_ids = e_map[ep_topk_ids]
+                    standard_dispatch_reference = torch_moe(
+                        a,
+                        w_ref1_full,
+                        w_ref2_full,
+                        ep_score,
+                        topk,
+                        global_num_experts=e,
+                        expert_map=e_map,
+                    )
+                    standard_dispatch_output = fused_marlin_moe(
                         a,
                         qweight1,
                         qweight2,
                         scales1,
                         scales2,
-                        score,
-                        topk_weights,
-                        topk_ids,
-                        global_num_experts=e,
-                        expert_map=e_map,
+                        ep_score,
+                        ep_topk_weights,
+                        local_topk_ids,
+                        global_num_experts=local_e,
+                        is_expert_parallel=True,
                         num_bits=4,
                         is_k_full=True,
                     )
-
                     torch.testing.assert_close(
-                        marlin_output, torch_output, atol=5e-2, rtol=0
+                        standard_dispatch_output,
+                        standard_dispatch_reference,
+                        atol=5e-2,
+                        rtol=0,
                     )
 
 

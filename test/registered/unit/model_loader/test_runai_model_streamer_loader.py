@@ -307,6 +307,7 @@ class TestRunaiModelStreamerLoader(CustomTestCase):
             ),
             _assert_confidence_head_loaded=lambda **_kwargs: None,
             post_load_weights=lambda: None,
+            _assert_markov_head_loaded=lambda **_kwargs: None,
         )
 
         def weights():

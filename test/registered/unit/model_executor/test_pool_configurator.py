@@ -1567,7 +1567,15 @@ class TestSWAPoolFloor(CustomTestCase):
         )
         self.assertEqual(config.swa_max_total_num_tokens, 3072)
 
-    def _dsv4_sizes(self, max_tokens, page_size, unified=False):
+    def _dsv4_sizes(
+        self,
+        max_tokens,
+        page_size,
+        unified=False,
+        sm70_csa2=False,
+        chunked_prefill_size=0,
+        chunks_in_flight=2,
+    ):
         """Exercise the DSV4 size arithmetic without a full V4 model fixture:
         _compute_dsv4_sizes reads only these attributes."""
         from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
@@ -1578,10 +1586,54 @@ class TestSWAPoolFloor(CustomTestCase):
         cfg.ring_sizes = {4: 8}
         cfg.c4_shrink_factor = 1
         cfg._unified = unified
+        cfg._sm70_csa2_skip_paged_swa = sm70_csa2
+        cfg._chunked_prefill_size = chunked_prefill_size
+        cfg._sm70_swa_chunks_in_flight = chunks_in_flight
         cfg.operator_swa_ratio = None
         cfg.swa_cap_tokens = None
         cfg.swa_prefix_tails = 0
         return cfg._compute_dsv4_sizes(max_tokens, page_size)
+
+    def test_dsv4_sm70_csa2_keeps_swa_at_two_req_floor(self):
+        # Paged SWA is unused on SM70 CSA2. 256k full tokens must not pull a
+        # 0.1-ratio SWA pool (that was the 135k DSpark cap on 32 GiB).
+        sizes = self._dsv4_sizes(max_tokens=262144, page_size=128, sm70_csa2=True)
+        self.assertEqual(sizes.full_max_total_num_tokens, 262144)
+        self.assertEqual(sizes.swa_max_total_num_tokens, 640)
+        self.assertLess(sizes.swa_max_total_num_tokens, int(262144 * 0.1))
+
+    def test_dsv4_sm70_csa2_swa_covers_chunked_prefill(self):
+        # relaunch148: window-only 1024 at page=256 could not admit chunk=2048.
+        sizes = self._dsv4_sizes(
+            max_tokens=262144,
+            page_size=256,
+            sm70_csa2=True,
+            chunked_prefill_size=2048,
+        )
+        self.assertEqual(sizes.full_max_total_num_tokens, 262144)
+        # 2*2048 + 2*(128+256) + 256
+        self.assertEqual(sizes.swa_max_total_num_tokens, 5120)
+        self.assertGreaterEqual(sizes.swa_max_total_num_tokens, 2048 + 256)
+        self.assertLess(sizes.swa_max_total_num_tokens, int(262144 * 0.1))
+
+    def test_dsv4_sm70_csa2_does_not_charge_paged_swa_bytes(self):
+        from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
+
+        cfg = object.__new__(DSV4PoolConfigurator)
+        cfg._unified = False
+        cfg._sm70_csa2_skip_paged_swa = True
+        cfg.qk_nope_head_dim = 512
+        cfg.qk_rope_head_dim = 64
+        cfg.indexer_head_dim = 128
+        cfg.indexer_bytes_per_token = 128
+        cfg.num_layers_total = 40
+        cfg.num_layers_ca4 = 0
+        cfg.num_layers_ca128 = 0
+        cfg.c4_ring_size = 8
+        cfg.swa_page_size = 128
+        cfg.swa_ratio = 0.1
+        cfg.c4_shrink_factor = 1
+        self.assertEqual(cfg._get_bytes_per_full_token(), 64.0)
 
     def test_dsv4_rejects_single_page_pool(self):
         # DeepSeek-V4-Flash defaults (page 256, ratio 0.1): int(4096 * 0.1) aligns

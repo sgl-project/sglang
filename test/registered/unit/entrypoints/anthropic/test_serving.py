@@ -18,6 +18,9 @@ from sglang.srt.entrypoints.anthropic.protocol import (  # noqa: E402
     AnthropicMessagesRequest,
 )
 from sglang.srt.entrypoints.anthropic.serving import AnthropicServing  # noqa: E402
+from sglang.srt.entrypoints.openai.chat_encoding import (  # noqa: E402
+    spec_supports_inline_system,
+)
 from sglang.srt.entrypoints.openai.protocol import (  # noqa: E402
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -33,13 +36,19 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 class _FakeOpenAIServingChat:
     native_reasoning_history = False
 
-    def __init__(self, stream_lines=None, chat_template=None):
+    def __init__(self, stream_lines=None, chat_template=None, chat_encoding_spec=None):
         self.stream_lines = stream_lines or []
         self.apply_reasoning_calls: list[bool] = []
+        self.chat_encoding_spec = chat_encoding_spec
         self.tokenizer_manager = SimpleNamespace(
             tokenizer=SimpleNamespace(chat_template=chat_template)
         )
-        self.supports_inline_system = detect_inline_system_support(chat_template)
+        # Mirrors OpenAIServingChat._resolve_inline_system_support.
+        self.supports_inline_system = (
+            spec_supports_inline_system(chat_encoding_spec)
+            if chat_encoding_spec is not None
+            else detect_inline_system_support(chat_template)
+        )
 
     def supports_native_reasoning_history(self):
         return self.native_reasoning_history
@@ -154,8 +163,10 @@ class TestAnthropicServing(unittest.TestCase):
 {%- endfor -%}
 """
 
-    def _serving(self, stream_lines=None, chat_template=None):
-        return AnthropicServing(_FakeOpenAIServingChat(stream_lines, chat_template))
+    def _serving(self, stream_lines=None, chat_template=None, chat_encoding_spec=None):
+        return AnthropicServing(
+            _FakeOpenAIServingChat(stream_lines, chat_template, chat_encoding_spec)
+        )
 
     def _anthropic_request(self, **overrides):
         data = {
@@ -1690,6 +1701,34 @@ class TestAnthropicServing(unittest.TestCase):
         )
         self.assertEqual(chat_request.messages[0].content, "You are terse.")
         self.assertEqual(chat_request.messages[2].content, "Reply with exactly: OK")
+
+    def test_dsv41_keeps_midconversation_system_inline_without_chat_template(self):
+        """V4.1 ships without an HF chat template, so the template probe
+        would say merge. Claude Code appends a harness reminder as a later
+        system turn; folding that into the leading block changes the token
+        prefix and the sticky cache misses. The V4.1 encoder renders the turn
+        in place (spec_supports_inline_system), so the adapter leaves it."""
+        serving = self._serving(chat_encoding_spec="dsv41")
+        self.assertFalse(serving._merge_inline_system)
+        request = self._anthropic_request(
+            stream=False,
+            system="You are terse.",
+            messages=[
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "system",
+                    "content": "<system-reminder>\nToday.\n</system-reminder>",
+                },
+                {"role": "user", "content": "go"},
+            ],
+        )
+        chat_request = serving._convert_to_chat_completion_request(request)
+        self.assertEqual(
+            [m.role for m in chat_request.messages],
+            ["system", "user", "system", "user"],
+        )
+        self.assertEqual(chat_request.messages[0].content, "You are terse.")
+        self.assertIn("system-reminder", chat_request.messages[2].content)
 
     def test_inline_system_support_comes_from_the_prompt_renderer(self):
         """Native encoders have no Jinja template to probe, so Messages must use

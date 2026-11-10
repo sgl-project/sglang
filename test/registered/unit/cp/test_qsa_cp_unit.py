@@ -163,7 +163,9 @@ def test_cuda_indexer_forwards_global_rope_to_cp_path():
     batch = SimpleNamespace(forward_mode=ForwardMode.EXTEND)
     expected = object()
     indexer = SimpleNamespace(forward_cuda_cp=Mock(return_value=expected))
-    indexer._forward_impl = lambda *args: QSAIndexer._forward_impl(indexer, *args)
+    indexer._forward_impl = lambda *args, **kwargs: QSAIndexer._forward_impl(
+        indexer, *args, **kwargs
+    )
 
     actual = QSAIndexer.forward_cuda(
         indexer,

@@ -126,6 +126,9 @@ class TestDSparkDPSpecPrefillCoordination(CustomTestCase):
         for enabled, mode, extend, counts, prefills, expected in cases:
             with self.subTest(enabled=enabled, mode=mode, expected=expected):
                 worker = object.__new__(DSparkWorkerV2)
+                # A target without a vision config: extend batches skip the
+                # image-prefill check instead of recursing in __getattr__.
+                worker._target_worker = SimpleNamespace(model_runner=None)
                 worker._hosts_draft = True
                 worker.enable_dp_spec_prefill_coordination = enabled
                 worker.verify_num_draft_tokens = 7

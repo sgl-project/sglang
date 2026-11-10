@@ -54,6 +54,7 @@ class MockTokenizerManager:
         self.served_model_name = self.SERVED_MODEL_NAME
         self.model_path = "model"
         self.lora_registry = None
+        self.segment_encoder = None
         self.server_args = Mock(
             enable_cache_report=False,
             reasoning_parser=None,

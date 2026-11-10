@@ -364,6 +364,35 @@ class TestTrackOrTouch(HiCacheFileLRUTestBase):
         self.assertEqual(b._evictor._total_bytes, 64)
 
 
+class TestStoredPageSizeMismatch(HiCacheFileLRUTestBase):
+    """A page stored by a build with another page layout has another size. Reading
+    it must be a miss, not an exception (which ends the prefetch IO thread) and
+    not the wrong bytes, and the page must be storable again."""
+
+    def test_shorter_page_is_removed_and_stored_again(self):
+        b = self.make_backend(
+            max_size="1000", metadata_ttl=-1.0, enable_metadata_cache=True
+        )
+        self.assertTrue(b.set("k", _t(90, fill=1)))
+        self.assertIsNone(b.get("k", target_location=_t(100)))
+        self.assertFalse(b.exists("k"))
+        self.assertEqual(b._evictor._total_bytes, 0)
+        self.assertTrue(b.set("k", _t(100, fill=2)))
+        out = b.get("k", target_location=_t(100))
+        self.assertTrue(torch.equal(out, _t(100, fill=2)))
+
+    def test_longer_page_is_a_miss(self):
+        b = self.make_backend()
+        self.assertTrue(b.set("k", _t(110, fill=1)))
+        self.assertIsNone(b.get("k", target_location=_t(100)))
+        self.assertFalse(b.exists("k"))
+
+    def test_unreadable_page_is_a_miss(self):
+        b = self.make_backend()
+        os.makedirs(os.path.join(b.file_path, f"{b._get_suffixed_key('k')}.bin"))
+        self.assertIsNone(b.get("k", target_location=_t(100)))
+
+
 class TestMinFreeSpaceWatermark(HiCacheFileLRUTestBase):
     def test_refuses_when_fs_would_drop_below_min_free(self):
         # Force statvfs to report a tiny free figure so the watermark trips.

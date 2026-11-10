@@ -964,6 +964,33 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(adder.can_run_list, [])
         self.assertIsNone(req.extend_end)
 
+    def test_ignore_eos_prefix_hit_on_disabled_cache_chunks_past_prefix(self):
+        """A cache can report disable=True and still return a prefix hit (the sticky
+        last-sequence wrapper); a chunked ignore_eos request must not crash the scheduler."""
+        self.mock_tree_cache.disable = True
+        self.mock_token_allocator.available_size.return_value = 1000
+        adder = self.create_adder(
+            self.create_running_batch(), rem_input_tokens=200, rem_chunk_tokens=16
+        )
+
+        req = self.create_mock_req("ignore_eos_prefix", priority=0, max_new_tokens=1)
+        req.sampling_params.ignore_eos = True
+        req.prefix_indices = list(range(8))
+        req.origin_input_ids = list(range(32))
+        req.full_untruncated_fill_ids = list(range(32))
+        req.last_node = MagicMock()
+        req.set_extend_range = MagicMock(
+            side_effect=lambda start, end: setattr(
+                req, "extend_range", Range(start, end)
+            )
+        )
+
+        adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None)
+
+        self.assertEqual(adder.can_run_list, [req])
+        self.assertIs(adder.new_chunked_req, req)
+        self.assertEqual(req.extend_range, Range(8, 24))
+
     def create_sharded_adder(
         self,
         *,
@@ -1442,9 +1469,11 @@ class TestPrefillAdder(CustomTestCase):
                 adder.add_one_req(
                     req, has_chunked_req=False, truncation_align_size=None
                 ),
-                AddReqResult.NO_TOKEN,
+                AddReqResult.ABORT,
             )
         self.assertEqual(len(adder.can_run_list), 0)
+        req.set_finish_with_abort.assert_called()
+        req.set_finish_with_abort.reset_mock()
 
         # Fix: min(extend + decode, window) reservation admits it.
         adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None)
@@ -2560,10 +2589,18 @@ class TestPrefillAdder(CustomTestCase):
     # collapses the SWA evictable cushion and causes a retraction storm.
 
     def create_swa_adder(
-        self, *, size_swa: int, sliding_window: int, page_size: int = 16
+        self,
+        *,
+        size_swa: int,
+        sliding_window: int,
+        page_size: int = 16,
+        swa_available_size: int = 0,
+        rem_chunk_tokens: int = 512,
     ) -> PrefillAdder:
         self.mock_tree_cache.sliding_window_size = sliding_window
-        self.mock_token_allocator = self.create_token_allocator(size_swa=size_swa)
+        self.mock_token_allocator = self.create_token_allocator(
+            size_swa=size_swa, swa_available_size=swa_available_size
+        )
         self.mock_token_allocator.create_prefill_budget.side_effect = (
             lambda tree_cache, **kwargs: SWAPrefillBudget(
                 self.mock_token_allocator, tree_cache, **kwargs
@@ -2572,7 +2609,7 @@ class TestPrefillAdder(CustomTestCase):
         return self.create_adder(
             self.create_running_batch(),
             page_size=page_size,
-            rem_chunk_tokens=512,
+            rem_chunk_tokens=rem_chunk_tokens,
         )
 
     def test_swa_never_fits_false_under_transient_pressure(self):
@@ -2613,6 +2650,66 @@ class TestPrefillAdder(CustomTestCase):
                 size_swa=4096, sliding_window=128
             ).memory_budget.swa_never_fits(**req)
         )
+
+    def test_swa_wait_is_futile_when_idle(self):
+        adder = self.create_swa_adder(size_swa=1024, sliding_window=128)
+        adder.is_hybrid_swa = True
+        adder._swa_req_ring = False
+        self.assertTrue(adder._swa_wait_is_futile())
+        running = self.create_mock_req("run", priority=0, max_new_tokens=8)
+        adder.running_batch = self.create_running_batch([running])
+        self.assertFalse(adder._swa_wait_is_futile())
+
+    def test_swa_gate_aborts_when_idle_and_no_page_fits(self):
+        # relaunch148: vestigial SWA exhausted, nothing running, NO_TOKEN hung.
+        adder = self.create_swa_adder(
+            size_swa=1024,
+            sliding_window=128,
+            page_size=256,
+            rem_chunk_tokens=2048,
+        )
+        adder.is_hybrid_swa = True
+        adder._swa_req_ring = False
+        req = self.create_mock_req("pp8k", priority=0, max_new_tokens=1)
+        gate, _ = adder._apply_swa_token_gate(
+            real_input_tokens=8192, req=req, chunk_tokens_limit=2048
+        )
+        self.assertEqual(gate, AddReqResult.ABORT)
+        req.set_finish_with_abort.assert_called_once()
+        msg = req.set_finish_with_abort.call_args[0][0]
+        self.assertIn("waiting forever", msg)
+
+    def test_swa_gate_chunks_when_idle_but_a_page_remains(self):
+        adder = self.create_swa_adder(
+            size_swa=1024,
+            sliding_window=128,
+            page_size=256,
+            swa_available_size=768,
+            rem_chunk_tokens=2048,
+        )
+        adder.is_hybrid_swa = True
+        adder._swa_req_ring = False
+        req = self.create_mock_req("pp8k", priority=0, max_new_tokens=1)
+        gate, limit = adder._apply_swa_token_gate(
+            real_input_tokens=8192, req=req, chunk_tokens_limit=2048
+        )
+        self.assertIsNone(gate)
+        self.assertGreater(limit, 0)
+        self.assertLessEqual(limit, 2048)
+        req.set_finish_with_abort.assert_not_called()
+
+    def test_swa_gate_waits_when_running_can_free_swa(self):
+        adder = self.create_swa_adder(size_swa=1024, sliding_window=128, page_size=256)
+        adder.is_hybrid_swa = True
+        adder._swa_req_ring = False
+        running = self.create_mock_req("run", priority=0, max_new_tokens=8)
+        adder.running_batch = self.create_running_batch([running])
+        req = self.create_mock_req("pp8k", priority=0, max_new_tokens=1)
+        gate, _ = adder._apply_swa_token_gate(
+            real_input_tokens=8192, req=req, chunk_tokens_limit=2048
+        )
+        self.assertEqual(gate, AddReqResult.NO_TOKEN)
+        req.set_finish_with_abort.assert_not_called()
 
 
 if __name__ == "__main__":

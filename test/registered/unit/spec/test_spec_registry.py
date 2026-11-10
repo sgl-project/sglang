@@ -153,6 +153,8 @@ class TestCustomSpecAlgoInterface(_RegistryIsolated):
         self.assertFalse(self.algo.is_eagle3())
         self.assertFalse(self.algo.is_frozen_kv_mtp())
         self.assertFalse(self.algo.is_dflash())
+        self.assertFalse(self.algo.is_dspark())
+        self.assertFalse(self.algo.is_dflash_family())
         self.assertFalse(self.algo.is_standalone())
         self.assertFalse(self.algo.is_ngram())
         self.assertTrue(self.algo.is_speculative())
