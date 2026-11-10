@@ -436,6 +436,9 @@ class DeepseekV2WeightLoaderMixin:
                     if ("mlp.experts." in name) and name not in params_dict:
                         continue
                     name = name.replace(weight_name, param_name)
+                    # Stacked block-FP8 linears register `weight_scale_inv`
+                    # while the checkpoint stores `weight_scale`.
+                    name = _resolve_quark_fp8_block_scale_name(name, params_dict)
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
                         continue
