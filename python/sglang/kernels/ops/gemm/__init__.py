@@ -474,6 +474,14 @@ register_kernel(
 )
 register_kernel(
     KernelSpec(
+        op="gemm.nvfp4_moe_swiglu",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.gemm.sm120_nvfp4_moe:nvfp4_moe_swiglu",
+        capabilities=_SM120,
+    )
+)
+register_kernel(
+    KernelSpec(
         op="gemm.gptq_marlin_gemm",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.gemm.gptq_marlin:gptq_marlin_gemm",
