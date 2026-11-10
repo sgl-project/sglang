@@ -2,12 +2,16 @@
 // The launch flags follow the SGLang quickstarts published on the model cards; the 9B recipe makes the single-GPU default explicit with --tp 1.
 // FP8 quantization cells use their FP8 repo ids from the collection with the same flags; their README quickstarts currently point to the non-FP8 repos.
 // Reasoning / tool-call parsers are exposed as a Playground toggle (qwen3 / qwen3_coder), not baked into the deploy cells.
-// Cells remain unverified until exact recipes are run and signed off.
+// GPU cells remain unverified until exact recipes are run and signed off.
 
 export const config = {
   modelName: "Ornith-1.0",
 
-  supportedHardware: ["h100", "h200"],
+  supportedHardware: ["h100", "h200", "xeon"],
+  hardware: [
+    { id: "xeon", label: "XEON", vram: "CPU", vendor: "cpu" },
+  ],
+  runModes: (s) => s.hw === "xeon" ? ["python"] : ["python", "docker"],
 
   variants: [
     { id: "397b", label: "397B", subtitle: "MoE" },
@@ -72,7 +76,9 @@ export const config = {
   // not baked into the cells. Both ids are registered in the SGLang parser
   // registries and match the model's Qwen3.5 chat template.
   playgroundFeatures: {
+    normalizeDeltas: (deltas, derived, base) => base.hw === "xeon" ? {} : deltas,
     parsers: {
+      showWhen: (base) => base.hw !== "xeon",
       items: [
         { id: "reasoning", label: "Reasoning Parser", flag: "--reasoning-parser qwen3" },
         { id: "toolCall",  label: "Tool Call Parser", flag: "--tool-call-parser qwen3_coder" },
@@ -81,6 +87,29 @@ export const config = {
   },
 
   cells: [
+    {
+      match: { hw: "xeon", variant: "9b", quant: "bf16", strategy: "balanced", nodes: "single" },
+      verified: true,
+      warn: "Quick generation verified on Intel Xeon 6972P at TP6. The 8,192-token cache does not cover the full context. Playground overrides, dataset accuracy, and performance are unverified.",
+      env: [
+        "SGLANG_USE_CPU_ENGINE=1",
+        "RAYON_NUM_THREADS=1",
+        "TOKENIZERS_PARALLELISM=false",
+        "OPENBLAS_NUM_THREADS=1",
+      ],
+      flags: [
+        "--model deepreinforce-ai/Ornith-1.0-9B",
+        "--device cpu",
+        "--disable-overlap-schedule",
+        "--revision 83dc1f5e24ef8527af019a6b3bf66ac0f1c2c999",
+        "--served-model-name {{MODEL_NAME}}",
+        "--tp 6",
+        "--dtype bfloat16",
+        "--max-total-tokens 8192",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
     {
       match: { hw: "h200", variant: "397b", quant: "bf16", strategy: "balanced", nodes: "single" },
       env: [],
