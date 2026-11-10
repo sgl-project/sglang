@@ -116,12 +116,10 @@ class TestNpuSegmentCapture(CustomTestCase):
         @bcg.eager_on_graph
         def break_one():
             order.append("break1")
-            return "out1"
 
         @bcg.eager_on_graph
         def break_two():
             order.append("break2")
-            return "out2"
 
         graph = bcg.BreakableCUDAGraph()
         with (
@@ -131,9 +129,7 @@ class TestNpuSegmentCapture(CustomTestCase):
                 bcg, "_device_graph_cls", return_value=_make_fake_graph_cls(made)
             ),
         ):
-            with bcg.BreakableCUDAGraphCapture(
-                cuda_graph=graph, pool=(0, 0), barrier_fn=None
-            ):
+            with bcg.BreakableCUDAGraphCapture(cuda_graph=graph, pool=(0, 0)):
                 order.append("seg1")
                 break_one()
                 order.append("seg2")
@@ -148,14 +144,15 @@ class TestNpuSegmentCapture(CustomTestCase):
                     pool=(0, 0), capture_error_mode="global"
                 )
                 seg.capture_end.assert_called_once()
-            self.assertEqual(order, ["seg1", "break1", "seg2", "break2", "seg3"])
+            # Break bodies are recorded, not executed, while capturing.
+            self.assertEqual(order, ["seg1", "seg2", "seg3"])
             self.assertEqual(len(graph._break_fns), 2)
 
             # Replay: segment replay and eager breaks strictly alternate.
             order.clear()
             for i, seg in enumerate(made):
                 seg.replay.side_effect = (
-                    lambda i=i: order.append(f"seg{i+1}")  # noqa: B023
+                    lambda i=i: order.append(f"seg{i + 1}")  # noqa: B023
                 )
             graph.replay()
             self.assertEqual(order, ["seg1", "break1", "seg2", "break2", "seg3"])
