@@ -11,7 +11,8 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.ops.activation._triton_silu import _silu_fast_math
+from sglang.kernels.arch import current_arch
+from sglang.kernels.numerics import silu_approx_f32
 
 
 @triton.jit
@@ -44,7 +45,7 @@ def _gate_up_gemv_kernel(
         accumulator = accumulator + w * x[None, :]
     y = tl.sum(accumulator, 1).to(tl.bfloat16).to(tl.float32)
     gate, up = tl.split(tl.reshape(y, (BLOCK_N // 2, 2)))
-    silu = _silu_fast_math(gate)
+    silu = silu_approx_f32(gate)
     column = tl.program_id(1) * (BLOCK_N // 2) + tl.arange(0, BLOCK_N // 2)
     tl.store(
         Intermediate + route * INTERMEDIATE_SIZE + column,
@@ -94,8 +95,12 @@ def beam_decode_gemv(
     """Return weighted BF16 expert outputs for Beam's single-token TP4 path.
 
     Weights use the interleaved gate/up layout. Expert reduction, routed scaling
-    and TP communication remain with the caller.
+    and TP communication remain with the caller. Every id in `topk_ids` must be
+    a local expert in [0, 256), as the MoE TP4/EP1 router produces; ids are not
+    range-checked, since that would synchronize with the host.
     """
+    if not current_arch().is_sm(10, 3):
+        raise RuntimeError("beam_decode_gemv requires an SM103 GPU")
     assert hidden_states.shape == (1, 5120)
     assert w13_weight.shape == (256, 1280, 5120)
     assert w2_weight.shape == (256, 5120, 640)

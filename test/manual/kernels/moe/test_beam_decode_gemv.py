@@ -1,11 +1,11 @@
 """Manual correctness test for the SM103 single-token Beam MoE decode GEMV.
 
-Run on one SM103 GPU (GB300): ``python test/manual/kernels/moe/test_beam_decode_gemv.py``.
+Run on one SM103 GPU (B300/GB300): ``python test/manual/kernels/moe/test_beam_decode_gemv.py``.
 
 Compares the weighted per-expert outputs with an independent FP64 reference that
 keeps the kernel's BF16 rounding points (gate/up, activation, weighted down
 projection), eagerly and through CUDA-graph replays whose inputs change between
-replays.
+replays, with int32 (the router's dtype) and int64 expert ids.
 """
 
 import sys
@@ -47,16 +47,15 @@ def _refill(seed, h, ids, tw):
     tw.copy_(torch.softmax(torch.randn(1, 8, device="cuda", generator=g), -1))
 
 
-def test_matches_fp64_reference_under_graph_replay(weights):
+@pytest.mark.parametrize("id_dtype", [torch.int64, torch.int32])
+def test_matches_fp64_reference_under_graph_replay(weights, id_dtype):
     w13, w2 = weights
     h = torch.empty(1, H, device="cuda", dtype=torch.bfloat16)
-    ids = torch.empty(1, 8, device="cuda", dtype=torch.int64)
+    ids = torch.empty(1, 8, device="cuda", dtype=id_dtype)
     tw = torch.empty(1, 8, device="cuda")
     _refill(0, h, ids, tw)
-    expected = _reference(h, ids, tw, w13, w2)
-    torch.testing.assert_close(beam_decode_gemv(h, w13, w2, tw, ids), expected, **TOL)
     torch.testing.assert_close(
-        beam_decode_gemv(h, w13, w2, tw, ids.int()), expected, **TOL
+        beam_decode_gemv(h, w13, w2, tw, ids), _reference(h, ids, tw, w13, w2), **TOL
     )
 
     graph = torch.cuda.CUDAGraph()

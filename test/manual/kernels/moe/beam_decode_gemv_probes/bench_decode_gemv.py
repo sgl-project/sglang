@@ -1,7 +1,7 @@
 """Single-token latency of the Beam decode GEMV against the Triton fused MoE.
 
 Manual and not CI-registered. Run the correctness test first, then this probe,
-from the repository root on one SM103 GPU (GB300):
+from the repository root on one SM103 GPU (B300/GB300):
 
     python test/manual/kernels/moe/test_beam_decode_gemv.py
     python test/manual/kernels/moe/beam_decode_gemv_probes/bench_decode_gemv.py
@@ -107,6 +107,10 @@ def main():
         from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
             fused_experts_impl,
         )
+        from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config import (
+            try_get_optimal_moe_config,
+        )
+        from sglang.srt.utils.device import get_nvidia_driver_version_str
 
         torch.manual_seed(args.seed)
         # Interleaved gate/up rows: row 2j is gate j and row 2j + 1 is up j.
@@ -135,6 +139,10 @@ def main():
             return out.sum(dim=1, dtype=torch.float32).bfloat16()
 
         graphs = {"fused_moe": _capture(fused), "decode_gemv": _capture(gemv)}
+        # The lookup fused_experts_impl makes for this BF16 shape at M=1.
+        config, (down_config, _) = try_get_optimal_moe_config(
+            w13.shape, w2.shape, TOPK, None, 1, return_down_config=True
+        )
         l2_bytes = props.L2_cache_size
         flush = torch.empty(
             args.flush_l2_multiple * l2_bytes // 4, dtype=torch.int32, device="cuda"
@@ -146,7 +154,11 @@ def main():
                     "capability": capability,
                     "sm_count": props.multi_processor_count,
                     "torch": torch.__version__,
+                    "cuda": torch.version.cuda,
+                    "driver": get_nvidia_driver_version_str(),
                     "triton": triton.__version__,
+                    "fused_moe_config": config,
+                    "fused_moe_down_config": down_config,
                     "l2_bytes": l2_bytes,
                     "flush_bytes": flush.numel() * 4,
                     # Only the routed experts' weights are read.
