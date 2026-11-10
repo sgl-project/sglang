@@ -575,7 +575,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     full_prefill_cuda_graph_capture: bool = False
     # Marks a captured prefill forward so the MoE dispatcher takes its
     # fixed-width path; None keeps the layer's own runtime dispatch.
-    moe_prefill_graph_state: Optional["MoePrefillGraphState"] = None
+    moe_prefill_graph_state: Optional[MoePrefillGraphState] = None
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False
 

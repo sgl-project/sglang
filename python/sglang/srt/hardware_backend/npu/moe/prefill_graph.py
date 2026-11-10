@@ -50,7 +50,7 @@ class MoePrefillGraphState(msgspec.Struct, frozen=True):
     """
 
 
-def install_capture_state(forward_batch: "ForwardBatch") -> None:
+def install_capture_state(forward_batch: ForwardBatch) -> None:
     """Bind the capture marker; no-op for backends without a graph dispatch."""
     if not get_moe_a2a_backend().is_ascend_ops():
         return

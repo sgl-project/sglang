@@ -38,7 +38,7 @@ except ImportError:
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.cuda_utils import (
     checkCudaErrors,
 )
-from sglang.srt.utils import get_device_module, is_hip, is_npu, is_musa, is_xpu
+from sglang.srt.utils import get_device_module, is_hip, is_musa, is_npu, is_xpu
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.runner_backend_utils.hicache_graph_events import (
