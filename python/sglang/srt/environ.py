@@ -295,6 +295,11 @@ class Envs:
     SGLANG_OPT_OVERLAP_EVENT_REUSE = EnvRuntimeBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # EAGLE verify target-only tree sampling (fp32, vocab >= 65536, <= 64 rows) as
+    # multi-CTA kernels that keep the stock reduction orders (bitwise).
+    SGLANG_OPT_MULTI_CTA_VERIFY_TREE_SAMPLING = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
 
     # ===================================================================
     # Model configuration, discovery, and weight loading
