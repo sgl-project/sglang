@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import inspect
 import logging
 from typing import Callable, Optional
 
@@ -39,9 +40,10 @@ from sglang.srt.layers.quantization.utils import (
     replace_parameter,
     unpack_cols,
 )
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cuda, is_hip
 
 _is_cuda = is_cuda()
+_is_hip = is_hip()
 
 if _is_cuda:
     from sglang.kernels.ops.quantization.gptq_marlin_repack import gptq_marlin_repack
@@ -50,6 +52,115 @@ if _is_cuda:
 ScalarType, scalar_types = get_scalar_types()
 
 logger = logging.getLogger(__name__)
+
+
+_OLD_SHUFFLE_NPARAMS = 3  # gptq_shuffle(q_weight, g_idx, bit)
+_NEW_SHUFFLE_NPARAMS = 2  # gptq_shuffle(q_weight, bit)
+_OLD_GEMM_NPARAMS = 8  # gptq_gemm(a, b_q_weight, b_gptq_qzeros, b_gptq_scales, g_idx, use_exllama, use_v2_format, bit)
+_NEW_GEMM_NPARAMS = 7  # gptq_gemm(a, b_q_weight, b_gptq_qzeros, b_gptq_scales, use_exllama, use_v2_format, bit)
+
+
+def _signature_kind(fn: Callable, name: str, old_nparams: int, new_nparams: int) -> str:
+    """Classify a vLLM ROCm GPTQ op as "old" or "new", rejecting anything
+    else with a clear error.
+
+    Only vLLM's real Python wrappers (``vllm._custom_ops.gptq_shuffle`` /
+    ``gptq_gemm``) are supported: plain ``def``s with a fixed, introspectable
+    argument count. A raw/opaque callable -- e.g. an un-wrapped
+    ``torch.ops._C`` op, whose Python-visible signature is ``(*args,
+    **kwargs)`` -- is deliberately never classified as either API: it is
+    rejected instead of silently guessed at.
+    """
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError) as exc:
+        raise NotImplementedError(
+            f"ROCm WNA16 could not read {name}'s signature ({fn!r}): {exc}. "
+            "Only vLLM's plain Python vllm._custom_ops wrapper is supported, "
+            "not an opaque or raw-bound callable."
+        ) from exc
+    if any(
+        p.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+        for p in params.values()
+    ):
+        raise NotImplementedError(
+            f"ROCm WNA16 does not support an opaque {name} signature "
+            f"{inspect.signature(fn)}; pass vLLM's plain Python "
+            f"vllm._custom_ops.{name} wrapper, not a raw/variadic callable."
+        )
+    nparams = len(params)
+    if nparams == old_nparams:
+        return "old"
+    if nparams == new_nparams:
+        return "new"
+    raise NotImplementedError(
+        f"ROCm WNA16 does not recognize {name}'s signature "
+        f"{inspect.signature(fn)} ({nparams} params); expected {old_nparams} "
+        f"(pre-vllm-project/vllm#54809) or {new_nparams} (post-#54809)."
+    )
+
+
+def _bind_rocm_gptq_ops(gptq_shuffle: Callable, gptq_gemm: Callable) -> tuple:
+    """Adapt to either GPTQ ROCm op signature vLLM may expose.
+
+    vllm-project/vllm#54809 ("[Quant][Kernel] Remove GPTQ Group/Dynamic
+    Activation Ordering", 2026-09-08) dropped the g_idx argument from
+    ``gptq_shuffle``/``gptq_gemm``: the ROCm kernels themselves no longer
+    accept an activation-order permutation (the CUDA-graph-friendly
+    identity-order path becomes the only path). This module never builds a
+    non-trivial g_idx -- activation ordering is already rejected in
+    __init__ -- so we bind wrappers that keep the old (pre-#54809, e.g.
+    rocm/sgl-dev:rocm7-vllm-20250904) call shape our callers use, dropping
+    the always-empty g_idx when the installed vLLM no longer accepts it.
+    """
+    shuffle_kind = _signature_kind(
+        gptq_shuffle, "gptq_shuffle", _OLD_SHUFFLE_NPARAMS, _NEW_SHUFFLE_NPARAMS
+    )
+    gemm_kind = _signature_kind(
+        gptq_gemm, "gptq_gemm", _OLD_GEMM_NPARAMS, _NEW_GEMM_NPARAMS
+    )
+    if shuffle_kind != gemm_kind:
+        raise NotImplementedError(
+            f"ROCm WNA16 found mismatched vLLM GPTQ op signatures: "
+            f"gptq_shuffle looks {shuffle_kind} ({inspect.signature(gptq_shuffle)}) "
+            f"but gptq_gemm looks {gemm_kind} ({inspect.signature(gptq_gemm)}). "
+            "Check the installed vLLM build."
+        )
+    if shuffle_kind == "old":
+        return gptq_shuffle, gptq_gemm
+
+    def shuffle(q_weight: torch.Tensor, g_idx: torch.Tensor, bit: int) -> None:
+        if g_idx.numel():
+            raise NotImplementedError(
+                "ROCm WNA16 activation ordering is unsupported: the installed "
+                "vLLM's gptq_shuffle no longer accepts g_idx "
+                "(vllm-project/vllm#54809)."
+            )
+        gptq_shuffle(q_weight, bit)
+
+    def gemm(
+        a: torch.Tensor,
+        b_q_weight: torch.Tensor,
+        b_gptq_qzeros: torch.Tensor,
+        b_gptq_scales: torch.Tensor,
+        g_idx: torch.Tensor,
+        use_exllama: bool,
+        use_v2_format: bool,
+        bit: int,
+    ) -> torch.Tensor:
+        if g_idx.numel():
+            raise NotImplementedError(
+                "ROCm WNA16 activation ordering is unsupported: the installed "
+                "vLLM's gptq_gemm no longer accepts g_idx "
+                "(vllm-project/vllm#54809)."
+            )
+        return gptq_gemm(
+            a, b_q_weight, b_gptq_qzeros, b_gptq_scales, use_exllama,
+            use_v2_format, bit,
+        )
+
+    return shuffle, gemm
+
 
 __all__ = ["CompressedTensorsWNA16", "XPUCompressedTensorsWNA16"]
 WNA16_SUPPORTED_TYPES_MAP = {
@@ -69,6 +180,18 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
                  group_size: Optional[int] = None,
                  symmetric: Optional[bool] = True,
                  actorder: Optional[ActivationOrdering] = None):
+
+        if _is_hip and (
+            num_bits != 4
+            or not symmetric
+            or actorder is not None
+            or strategy not in ("group", "channel")
+            or group_size not in (None, -1, 32, 64, 128)
+        ):
+            raise NotImplementedError(
+                "ROCm WNA16 requires symmetric 4-bit group/channel quantization "
+                "without activation ordering (group_size: -1, 32, 64, 128)."
+            )
 
         self.pack_factor = 32 // num_bits
         self.strategy = strategy
@@ -115,6 +238,14 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
             zero_points=not self.symmetric,
             has_g_idx=self.has_g_idx
         )
+
+        if _is_hip:
+            if params_dtype not in (torch.float16, torch.bfloat16):
+                raise NotImplementedError("ROCm WNA16 requires float16 or bfloat16.")
+            if input_size_per_partition % 128 or output_size_per_partition % 128:
+                raise NotImplementedError(
+                    "ROCm WNA16 requires partition dimensions divisible by 128."
+                )
 
         # If group_size is -1, we are in channelwise case.
         group_size = self.group_size if self.group_size != -1 else input_size
@@ -205,9 +336,62 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
                                             weight_loader=weight_loader)
             layer.register_parameter("weight_g_idx", weight_g_idx)
 
+    def _process_weights_rocm(self, layer: torch.nn.Module) -> None:
+        # These optional ops are supplied by ROCm vLLM builds. Do not import
+        # vLLM at module scope: CUDA and other quantization schemes do not need it.
+        try:
+            from vllm._custom_ops import gptq_gemm, gptq_shuffle
+        except ImportError as exc:
+            raise ImportError(
+                "ROCm compressed-tensors W4A16 requires a ROCm vLLM build "
+                "providing gptq_gemm and gptq_shuffle."
+            ) from exc
+
+        rocm_gptq_shuffle, self._rocm_gptq_gemm = _bind_rocm_gptq_ops(
+            gptq_shuffle, gptq_gemm
+        )
+        k, n = self.kernel_config.partition_weight_shape
+        group_size = k if self.group_size == -1 else self.group_size
+        if k % group_size:
+            raise ValueError("ROCm WNA16 input partition must contain whole groups.")
+
+        # The checkpoint packs unsigned (signed + 8) nibbles along K, in
+        # [N, K/8] order. GPTQ wants [K/8, N]; scales follow the same transpose.
+        # Use the checkpoint layout, not a shape heuristic (square shapes
+        # cannot distinguish the two orientations).
+        if tuple(layer.weight_packed.shape) != (n, k // 8):
+            raise ValueError("Unexpected compressed-tensors packed weight shape.")
+        if tuple(layer.weight_scale.shape) != (n, k // group_size):
+            raise ValueError("Unexpected compressed-tensors scale shape.")
+        qweight = layer.weight_packed.t().contiguous()
+        scales = layer.weight_scale.t().contiguous().to(torch.float16)
+        if not torch.isfinite(scales).all():
+            raise ValueError("ROCm WNA16 scales must be finite in float16.")
+
+        # GPTQ v1 stores zero - 1: symmetric CT's zero=8 becomes eight 7s
+        # per int32. No unpack/repack or full dequantization is necessary.
+        qzeros = torch.full(
+            (k // group_size, n // 8),
+            0x77777777,
+            dtype=torch.int32,
+            device=qweight.device,
+        )
+        g_idx = torch.empty(0, dtype=torch.int32, device=qweight.device)
+        rocm_gptq_shuffle(qweight, g_idx, 4)
+
+        # Replace the checkpoint parameters rather than retaining duplicate
+        # packed weights/scales alongside the serving representation.
+        replace_parameter(layer, "weight_packed", qweight)
+        replace_parameter(layer, "weight_scale", scales)
+        layer.register_buffer("rocm_qzeros", qzeros)
+        layer.register_buffer("rocm_g_idx", g_idx)
+
     # Checkpoints are serialized in compressed-tensors format, which is
     # different from the format the kernel may want. Handle repacking here.
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if _is_hip:
+            self._process_weights_rocm(layer)
+            return
         # Default names since marlin requires empty parameters for these,
         # TODO: remove this requirement from marlin (allow optional tensors)
         self.w_q_name = "weight_packed"
@@ -303,6 +487,31 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
 
     def apply_weights(self, layer: torch.nn.Module, x: torch.Tensor,
                       bias: Optional[torch.Tensor]) -> torch.Tensor:
+        if _is_hip:
+            if x.dtype not in (torch.float16, torch.bfloat16):
+                raise TypeError("ROCm WNA16 requires float16 or bfloat16 input.")
+            if x.shape[-1] != self.kernel_config.partition_weight_shape[0]:
+                raise ValueError("ROCm WNA16 input does not match the weight partition.")
+            output_shape = (
+                *x.shape[:-1], self.kernel_config.partition_weight_shape[1]
+            )
+            if x.numel() == 0:
+                return x.new_empty(output_shape)
+            # ExLlama's ROCm GPTQ kernel requires FP16 activations/scales.
+            # BF16 inputs therefore use FP16 arithmetic and must fit its range.
+            out = self._rocm_gptq_gemm(
+                x.reshape(-1, x.shape[-1]).to(torch.float16).contiguous(),
+                layer.weight_packed,
+                layer.rocm_qzeros,
+                layer.weight_scale,
+                layer.rocm_g_idx,
+                True,  # use_exllama
+                False,  # use_v2_format (GPTQ v1 zero points)
+                4,
+            )
+            out = out.to(x.dtype).reshape(output_shape)
+            return out if bias is None else out + bias
+
         c = self.kernel_config
 
         def _get_weight_params(
