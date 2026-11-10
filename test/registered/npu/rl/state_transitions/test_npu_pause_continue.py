@@ -23,8 +23,9 @@ from sglang.test.ascend.test_npu_rl_utils import (
     npu_available,
     npu_server,
     pause_generation,
-    stream_generate,
+    start_stream,
     update_weights_from_tensor,
+    wait_for_first_token,
 )
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -91,38 +92,18 @@ class TestNpuPauseContinue(CustomTestCase):
         thread.start()
         return thread
 
-    def _stream_async(self, events, errors, max_new_tokens=128):
-        def _run():
-            try:
-                for event in stream_generate(
-                    self.base_url, SHORT_PROMPT, max_new_tokens=max_new_tokens
-                ):
-                    events.append(event)
-            except Exception as exc:  # pragma: no cover
-                errors.append(exc)
-
-        thread = threading.Thread(target=_run, daemon=True)
-        thread.start()
-        return thread
-
     def test_pause_abort_returns_inflight(self):
-        events, errors = [], []
-        thread = self._stream_async(events, errors, max_new_tokens=512)
-
-        # Wait for the first decoded token and require the request to still be
-        # running; aborting a completed or unstarted request proves nothing.
-        deadline = time.time() + 30
-        while thread.is_alive() and not events and time.time() < deadline:
-            time.sleep(0.02)
-        self.assertTrue(events, "no token was emitted before pause(abort)")
-        self.assertTrue(thread.is_alive(), "request finished before pause(abort)")
+        request = start_stream(self.base_url, SHORT_PROMPT, max_new_tokens=512)
+        wait_for_first_token(request, label="pause(abort)")
 
         pause_generation(self.base_url, mode="abort")
-        thread.join(timeout=60)
+        request.thread.join(timeout=60)
 
-        self.assertFalse(errors, f"stream failed: {errors}")
-        self.assertFalse(thread.is_alive(), "request stream did not end after abort")
-        last = events[-1]
+        self.assertFalse(request.errors, f"stream failed: {request.errors}")
+        self.assertFalse(
+            request.thread.is_alive(), "request stream did not end after abort"
+        )
+        last = request.events[-1]
         finish_type = last.get("meta_info", {}).get("finish_reason", {}).get("type")
         self.assertEqual(
             finish_type, "abort", f"pause(abort) did not abort the request: {last}"
@@ -137,25 +118,17 @@ class TestNpuPauseContinue(CustomTestCase):
         self.assertTrue(generate(self.base_url, SHORT_PROMPT, max_new_tokens=4))
 
     def test_pause_retract_recomputes_kv(self):
-        events, errors = [], []
-        thread = self._stream_async(events, errors, max_new_tokens=64)
-
-        # Wait for at least one decoded token and make sure the request is still
-        # running; pausing after completion would not exercise retraction.
-        deadline = time.time() + 30
-        while thread.is_alive() and not events and time.time() < deadline:
-            time.sleep(0.02)
-        self.assertTrue(events, "no token was emitted before pause(retract)")
-        self.assertTrue(thread.is_alive(), "request finished before pause(retract)")
+        request = start_stream(self.base_url, SHORT_PROMPT, max_new_tokens=64)
+        wait_for_first_token(request, label="pause(retract)")
 
         pause_generation(self.base_url, mode="retract")
         time.sleep(0.2)
         continue_generation(self.base_url)
-        thread.join(timeout=60)
+        request.thread.join(timeout=60)
 
-        self.assertFalse(errors, f"stream failed: {errors}")
+        self.assertFalse(request.errors, f"stream failed: {request.errors}")
         # Native /generate streaming returns the cumulative output_ids per chunk.
-        output_ids = list(events[-1].get("output_ids", []))
+        output_ids = list(request.events[-1].get("output_ids", []))
         self.assertEqual(
             len(output_ids),
             64,
@@ -168,35 +141,29 @@ class TestNpuPauseContinue(CustomTestCase):
         )
 
     def test_pause_in_place_freezes_output(self):
-        events, errors = [], []
-        thread = self._stream_async(events, errors, max_new_tokens=64)
-
-        # Wait for the first decoded token and require the request to still be
-        # running; freezing an unscheduled request proves nothing.
-        deadline = time.time() + 30
-        while thread.is_alive() and not events and time.time() < deadline:
-            time.sleep(0.02)
-        self.assertTrue(events, "no token was emitted before pause(in_place)")
-        self.assertTrue(thread.is_alive(), "request finished before pause(in_place)")
+        request = start_stream(self.base_url, SHORT_PROMPT, max_new_tokens=64)
+        wait_for_first_token(request, label="pause(in_place)")
 
         pause_generation(self.base_url, mode="in_place")
         time.sleep(0.5)
-        frozen_tokens = len(events[-1].get("output_ids", []))
+        frozen_tokens = len(request.events[-1].get("output_ids", []))
         self.assertGreater(frozen_tokens, 0, "in-place pause froze before any token")
 
         time.sleep(1.0)
         self.assertEqual(
-            len(events[-1].get("output_ids", [])),
+            len(request.events[-1].get("output_ids", [])),
             frozen_tokens,
             "in-flight request kept emitting tokens while generation was paused",
         )
 
         continue_generation(self.base_url)
-        thread.join(timeout=60)
+        request.thread.join(timeout=60)
 
-        self.assertFalse(errors, f"stream failed: {errors}")
-        self.assertFalse(thread.is_alive(), "request did not finish after continue")
-        output_ids = list(events[-1].get("output_ids", []))
+        self.assertFalse(request.errors, f"stream failed: {request.errors}")
+        self.assertFalse(
+            request.thread.is_alive(), "request did not finish after continue"
+        )
+        output_ids = list(request.events[-1].get("output_ids", []))
         self.assertEqual(
             len(output_ids), 64, "in-place pause/continue did not complete the decode"
         )
@@ -210,20 +177,12 @@ class TestNpuPauseContinue(CustomTestCase):
         original = load_checkpoint_tensor(self.tensor_index, NORM_WEIGHT)
         updated = original.new_full(original.shape, 0.5)
 
-        events, errors = [], []
-        thread = self._stream_async(events, errors, max_new_tokens=64)
-
-        # Put a request in decode before pausing so the update window has
-        # something that must stay frozen.
-        deadline = time.time() + 30
-        while thread.is_alive() and not events and time.time() < deadline:
-            time.sleep(0.02)
-        self.assertTrue(events, "no token was emitted before pause(update)")
-        self.assertTrue(thread.is_alive(), "request finished before pause(update)")
+        request = start_stream(self.base_url, SHORT_PROMPT, max_new_tokens=64)
+        wait_for_first_token(request, label="pause(update)")
 
         pause_generation(self.base_url, mode="in_place")
         time.sleep(0.5)
-        frozen_tokens = len(events[-1].get("output_ids", []))
+        frozen_tokens = len(request.events[-1].get("output_ids", []))
         self.assertGreater(frozen_tokens, 0, "in-place pause froze before any token")
 
         try:
@@ -237,19 +196,20 @@ class TestNpuPauseContinue(CustomTestCase):
 
             time.sleep(0.5)
             self.assertEqual(
-                len(events[-1].get("output_ids", [])),
+                len(request.events[-1].get("output_ids", [])),
                 frozen_tokens,
                 "in-flight request emitted tokens during the weight update",
             )
 
             continue_generation(self.base_url)
-            thread.join(timeout=60)
+            request.thread.join(timeout=60)
 
-            self.assertFalse(errors, f"stream failed: {errors}")
+            self.assertFalse(request.errors, f"stream failed: {request.errors}")
             self.assertFalse(
-                thread.is_alive(), "frozen request did not finish after continue"
+                request.thread.is_alive(),
+                "frozen request did not finish after continue",
             )
-            output_ids = list(events[-1].get("output_ids", []))
+            output_ids = list(request.events[-1].get("output_ids", []))
             self.assertEqual(
                 len(output_ids),
                 64,
@@ -308,42 +268,26 @@ class TestNpuPauseContinueQueued(CustomTestCase):
         except Exception:
             pass
 
-    def _stream_async(self, events, errors, max_new_tokens=512):
-        def _run():
-            try:
-                for event in stream_generate(
-                    self.base_url, SHORT_PROMPT, max_new_tokens=max_new_tokens
-                ):
-                    events.append(event)
-            except Exception as exc:  # pragma: no cover
-                errors.append(exc)
-
-        thread = threading.Thread(target=_run, daemon=True)
-        thread.start()
-        return thread
-
     def _start_two(self):
-        events = [[], []]
-        errors = [[], []]
-        threads = [self._stream_async(events[idx], errors[idx]) for idx in range(2)]
+        # Submit the first request and wait for its first token before starting
+        # the second: with max-running-requests=1, arrival order decides which
+        # request owns the running slot.
+        first = start_stream(self.base_url, SHORT_PROMPT, max_new_tokens=512)
+        wait_for_first_token(first, label="first request")
 
-        deadline = time.time() + 30
-        while threads[0].is_alive() and not events[0] and time.time() < deadline:
-            time.sleep(0.02)
-        self.assertTrue(events[0], "first request never started decoding")
-        self.assertTrue(threads[0].is_alive(), "first request finished early")
+        second = start_stream(self.base_url, SHORT_PROMPT, max_new_tokens=512)
+        # Give the second request time to reach the scheduler; it can only be
+        # queued while the first request is running.
+        time.sleep(0.5)
+        self.assertFalse(second.events, "second request was not queued")
+        self.assertTrue(second.thread.is_alive(), "queued request finished early")
+        return [first, second]
 
-        # Check immediately after the first token: with max-running-requests=1
-        # the second request must still be queued.
-        self.assertFalse(events[1], "second request was not queued")
-        self.assertTrue(threads[1].is_alive(), "queued request finished early")
-        return events, errors, threads
-
-    def _assert_completed(self, events, errors, threads, expected_tokens=512):
-        for idx in range(2):
-            self.assertFalse(errors[idx], f"stream {idx} failed: {errors[idx]}")
-            self.assertFalse(threads[idx].is_alive(), f"stream {idx} did not end")
-            output_ids = list(events[idx][-1].get("output_ids", []))
+    def _assert_completed(self, requests_, expected_tokens=512):
+        for idx, request in enumerate(requests_):
+            self.assertFalse(request.errors, f"stream {idx} failed: {request.errors}")
+            self.assertFalse(request.thread.is_alive(), f"stream {idx} did not end")
+            output_ids = list(request.events[-1].get("output_ids", []))
             self.assertEqual(
                 len(output_ids),
                 expected_tokens,
@@ -356,17 +300,17 @@ class TestNpuPauseContinueQueued(CustomTestCase):
             )
 
     def test_pause_abort_drains_running_and_queued(self):
-        events, errors, threads = self._start_two()
+        requests_ = self._start_two()
 
         pause_generation(self.base_url, mode="abort")
-        for thread in threads:
-            thread.join(timeout=60)
+        for request in requests_:
+            request.thread.join(timeout=60)
 
-        for idx in range(2):
-            self.assertFalse(errors[idx], f"stream {idx} failed: {errors[idx]}")
-            self.assertFalse(threads[idx].is_alive(), f"stream {idx} did not end")
-            self.assertTrue(events[idx], f"stream {idx} produced no final event")
-            last = events[idx][-1]
+        for idx, request in enumerate(requests_):
+            self.assertFalse(request.errors, f"stream {idx} failed: {request.errors}")
+            self.assertFalse(request.thread.is_alive(), f"stream {idx} did not end")
+            self.assertTrue(request.events, f"stream {idx} produced no final event")
+            last = request.events[-1]
             finish_type = last.get("meta_info", {}).get("finish_reason", {}).get("type")
             self.assertEqual(
                 finish_type,
@@ -383,31 +327,33 @@ class TestNpuPauseContinueQueued(CustomTestCase):
         self.assertTrue(generate(self.base_url, SHORT_PROMPT, max_new_tokens=4))
 
     def test_pause_in_place_freezes_running_and_queued(self):
-        events, errors, threads = self._start_two()
+        requests_ = self._start_two()
 
         pause_generation(self.base_url, mode="in_place")
         time.sleep(0.5)
-        frozen_tokens = len(events[0][-1].get("output_ids", []))
+        frozen_tokens = len(requests_[0].events[-1].get("output_ids", []))
         self.assertGreater(frozen_tokens, 0)
 
         time.sleep(0.5)
-        self.assertEqual(len(events[0][-1].get("output_ids", [])), frozen_tokens)
-        self.assertFalse(events[1], "queued request started while paused")
+        self.assertEqual(
+            len(requests_[0].events[-1].get("output_ids", [])), frozen_tokens
+        )
+        self.assertFalse(requests_[1].events, "queued request started while paused")
 
         continue_generation(self.base_url)
-        for thread in threads:
-            thread.join(timeout=60)
-        self._assert_completed(events, errors, threads)
+        for request in requests_:
+            request.thread.join(timeout=60)
+        self._assert_completed(requests_)
 
     def test_pause_retract_preserves_queued_request(self):
-        events, errors, threads = self._start_two()
+        requests_ = self._start_two()
 
         pause_generation(self.base_url, mode="retract")
         time.sleep(0.2)
         continue_generation(self.base_url)
-        for thread in threads:
-            thread.join(timeout=60)
-        self._assert_completed(events, errors, threads)
+        for request in requests_:
+            request.thread.join(timeout=60)
+        self._assert_completed(requests_)
 
 
 if __name__ == "__main__":
