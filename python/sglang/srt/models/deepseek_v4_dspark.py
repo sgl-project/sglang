@@ -71,6 +71,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.speculative.dspark_components.dspark_config import (
     builds_confidence_head,
+    drops_unloaded_confidence_head,
     get_dspark_sample_from_anchor,
     parse_dspark_draft_config,
 )
@@ -1091,30 +1092,18 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                     weight_loader(param, loaded_weight)
                     loaded_params.add(mapped)
 
-        self._assert_confidence_head_loaded(
-            params_dict=params_dict, loaded_params=loaded_params
+        drops_unloaded_confidence_head(
+            self,
+            param_names={
+                name for name in params_dict if name.startswith("confidence_head.")
+            },
+            loaded_names=loaded_params,
         )
         self.post_load_weights()
 
     def post_load_weights(self, is_nextn=False, weight_names=None):
         for stage in self.stages:
             stage.refresh_mhc_norm_weight_cache()
-
-    def _assert_confidence_head_loaded(
-        self, *, params_dict: dict, loaded_params: set
-    ) -> None:
-        if self.confidence_head is None:
-            return
-        confidence_param_names = {
-            name for name in params_dict if name.startswith("confidence_head.")
-        }
-        missing = confidence_param_names - loaded_params
-        if missing:
-            raise ValueError(
-                f"DSpark V4 confidence head is enabled but the checkpoint is missing "
-                f"{sorted(missing)}. Provide a checkpoint with trained confidence weights, "
-                f"or set SGLANG_DSPARK_USE_ONLINE_ESTIMATOR=1."
-            )
 
     def _remap_dspark_weight_name(self, name: str) -> Optional[str]:
         if name.startswith(("embed.", "embed_tokens.", "head.", "lm_head.")):

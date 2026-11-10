@@ -27,6 +27,9 @@ from sglang.srt.speculative.dflash_utils import (
     can_dflash_slice_qkv_weight,
     get_dflash_attention_sliding_window_size,
 )
+from sglang.srt.speculative.dspark_components.dspark_config import (
+    drops_unloaded_confidence_head,
+)
 
 
 class DSparkMiniMaxAttention(MiniMaxM3Attention):
@@ -313,6 +316,11 @@ class DSparkMiniMaxDraftModel(DSparkDraftMixin, MiniMaxDraftBackbone):
                 raise ValueError(
                     f"Missing DSpark checkpoint shards for {name}: {expected - shards}"
                 )
+        head_names = {name for name in params if name.startswith("confidence_head.")}
+        if drops_unloaded_confidence_head(
+            self, param_names=head_names, loaded_names=loaded
+        ):
+            params = {k: v for k, v in params.items() if k not in head_names}
         missing = {
             name
             for name, param in params.items()

@@ -63,6 +63,7 @@ from sglang.srt.models.ernie55 import (
 )
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.speculative.dspark_components.dspark_config import (
+    drops_unloaded_confidence_head,
     get_dspark_sample_from_anchor,
     parse_dspark_draft_config,
 )
@@ -405,11 +406,21 @@ class _Ernie5_5DSparkWeightLoader(Ernie5_5WeightLoader):
     _DRAFT_PREFIX = "model.mtp."
 
     def __init__(self, model: Ernie5_5_MoeForCausalLMDSpark):
+        self.model = model
         self._init_tables(model, layers=model.stages, mla_layers=())
         # The static ragged-verify mode builds no confidence head.
         self.skipped = (
             () if model.confidence_head is not None else ("confidence_head.",)
         )
+
+    def finish(self) -> None:
+        names = {name for name in self.params if name.startswith("confidence_head.")}
+        if drops_unloaded_confidence_head(
+            self.model, param_names=names, loaded_names=self.loaded
+        ):
+            for name in names:
+                del self.params[name]
+        super().finish()
 
     def load(self, name: str, tensor: torch.Tensor) -> None:
         if name in self._DRAFT_TRANSPOSED:

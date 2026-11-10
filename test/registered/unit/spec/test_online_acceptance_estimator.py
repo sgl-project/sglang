@@ -214,9 +214,35 @@ class TestConfidenceSource(CustomTestCase):
     def test_source_selection(self):
         compact = RaggedVerifyMode.COMPACT
         self.assertTrue(self._builds(mode=compact, enable_field=True))
-        self.assertFalse(self._builds(mode=compact, enable_field=None))
+        self.assertTrue(self._builds(mode=compact, enable_field=None))
         self.assertFalse(self._builds(mode=compact, enable_field=False))
         self.assertFalse(self._builds(mode=compact, enable_field=True, use_online=True))
+
+    def test_unloaded_head_dropped_only_when_unnamed_on_first_load(self):
+        names = {"confidence_head.a", "confidence_head.b"}
+
+        def model(enable_field):
+            config = SimpleNamespace()
+            if enable_field is not None:
+                config.enable_confidence_head = enable_field
+            return SimpleNamespace(config=config, confidence_head=object())
+
+        def drops(model, loaded):
+            return dspark_config.drops_unloaded_confidence_head(
+                model, param_names=names, loaded_names=loaded
+            )
+
+        unnamed = model(None)
+        self.assertTrue(drops(unnamed, set()))
+        self.assertIsNone(unnamed.confidence_head)
+        kept = model(None)
+        self.assertFalse(drops(kept, names))
+        self.assertFalse(drops(kept, set()))
+        self.assertIsNotNone(kept.confidence_head)
+        with self.assertRaises(ValueError):
+            drops(model(True), set())
+        with self.assertRaises(ValueError):
+            drops(model(None), {"confidence_head.a"})
 
 
 if __name__ == "__main__":
