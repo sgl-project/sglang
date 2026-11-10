@@ -35,12 +35,17 @@ validate actually addresses the bytes the collective delivers:
    rank falls back to NCCL together for a cross-node group or a rank without
    a multicast mapping.
 
+``TestSymmetricBufferLifetime`` covers the NCCL symmetric-window allocator
+(``allocate_symmetric_buffer``), which the pool no longer uses.
+
 Registered for base-b 2-gpu-large and base-c 4-gpu-b200; multi-GPU tests skip
 when too few CUDA devices are visible. Run directly with:
     CUDA_VISIBLE_DEVICES=0,1 python3 \
         test/registered/unit/mem_cache/test_page_interleave_gather_multi_gpu.py
 """
 
+import ctypes
+import gc
 import math
 import os
 import unittest
@@ -56,6 +61,9 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.distributed.device_communicators.multicast_all_gather import (
     has_multicast_support,
+)
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    allocate_symmetric_buffer,
 )
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocator.page_interleave import PageInterleavePoolAllocator
@@ -853,6 +861,36 @@ class TestPageInterleaveMulticastGather(CustomTestCase):
             nprocs=_GATHER_WORLD,
             join=True,
         )
+
+
+@unittest.skipIf(not torch.cuda.is_available(), "needs a CUDA device")
+class TestSymmetricBufferLifetime(CustomTestCase):
+    def test_zeroed_buffer_deregisters_before_free(self):
+        """The allocation needs only window registration and memory ownership."""
+        released = []
+
+        def free(ptr):
+            released.append(("free", ptr))
+            torch.cuda.caching_allocator_delete(ptr)
+
+        comm = SimpleNamespace(
+            device=torch.device("cuda", torch.cuda.current_device()),
+            nccl=SimpleNamespace(
+                ncclMemAlloc=torch.cuda.caching_allocator_alloc,
+                ncclMemFree=free,
+            ),
+            register_comm_window_raw=lambda ptr, size: ctypes.c_void_p(ptr),
+            deregister_comm_window=lambda window: released.append(
+                ("deregister", window.value)
+            ),
+        )
+        buf, registered = allocate_symmetric_buffer(comm, 8192)
+        self.assertTrue(registered)
+        self.assertEqual(int(buf.count_nonzero()), 0)
+        ptr = buf.data_ptr()
+        del buf
+        gc.collect()
+        self.assertEqual(released, [("deregister", ptr), ("free", ptr)])
 
 
 if __name__ == "__main__":
