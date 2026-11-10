@@ -115,7 +115,6 @@ class NPUSwigluDeepEPKernel(BaseActivation):
                 need_quant=self.need_quant,
                 group_list=group_list,
                 group_list_type=group_list_type,
-                impl="auto",
             )
         else:
             hidden_states, per_token_scale = self._kernel(

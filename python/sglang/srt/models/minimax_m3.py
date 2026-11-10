@@ -304,7 +304,7 @@ class MiniMaxM3MLP(nn.Module):
         """swiglu_oai using fused Triton kernel (sgl_kernel_npu), no quant."""
         from sgl_kernel_npu.operators.activation import swiglu_oai_quant
 
-        out, _ = swiglu_oai_quant(x, alpha, limit, need_quant=False, impl="auto")
+        out, _ = swiglu_oai_quant(x, alpha, limit, need_quant=False)
         return out
 
     def __init__(
