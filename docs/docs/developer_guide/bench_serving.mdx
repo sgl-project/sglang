@@ -3,7 +3,7 @@ title: "Bench Serving Guide"
 metatags:
     description: "SGLang bench_serving: benchmark throughput, TTFT, ITL with random/sharegpt/image datasets. Multi-backend support."
 ---
-This guide explains how to benchmark online serving throughput and latency using `python -m sglang.bench_serving`. It supports multiple inference backends via OpenAI-compatible and native endpoints, and produces both console metrics and optional JSONL outputs.
+This guide explains how to benchmark online serving throughput and latency using `python -m sglang.benchmark.serving`. It supports multiple inference backends via OpenAI-compatible and native endpoints, and produces both console metrics and optional JSONL outputs.
 
 ### What it does
 
@@ -25,7 +25,7 @@ If `--base-url` is provided, requests are sent to it. Otherwise, `--host` and `-
 
 ### Prerequisites
 
-- Python 3.10+
+- Python 3.11+
 - Dependencies typically used by this script: `aiohttp`, `numpy`, `requests`, `tqdm`, `transformers`, and for some datasets `datasets`, `pillow`, `pybase64`. Install as needed.
 - An inference server running and reachable via the endpoints above
 - If your server requires authentication, set environment variable `OPENAI_API_KEY` (used as `Authorization: Bearer <key>`)
@@ -39,7 +39,7 @@ python3 -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct
 ```
 
 ```bash Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --host 127.0.0.1 --port 30000 \
   --num-prompts 1000 \
@@ -49,7 +49,7 @@ python3 -m sglang.bench_serving \
 Or, using an OpenAI-compatible endpoint (completions):
 
 ```bash Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend vllm \
   --base-url http://127.0.0.1:8000 \
   --num-prompts 1000 \
@@ -62,7 +62,7 @@ Use the two embedding backends with the same model, tokenizer, input length, pro
 
 ```bash Command
 # Start either server on the same hardware and precision, then run one at a time.
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang-embedding \
   --model google/embeddinggemma-300m \
   --dataset-name random \
@@ -75,7 +75,7 @@ python3 -m sglang.bench_serving \
 
 ```bash Command
 # vLLM's cache reset endpoint requires VLLM_SERVER_DEV_MODE=1 at server startup.
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend vllm-embedding \
   --model google/embeddinggemma-300m \
   --dataset-name random \
@@ -149,7 +149,7 @@ python -m sglang.launch_server --model-path Qwen/Qwen2.5-VL-3B-Instruct --disabl
 ```
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
     --backend sglang-oai-chat \
     --dataset-name image \
     --num-prompts 500 \
@@ -166,7 +166,7 @@ python -m sglang.launch_server --model-path Qwen/Qwen2.5-3B-Instruct
 ```
 
 ```bash Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
     --backend sglang \
     --dataset-name random \
     --num-prompts 3000 \
@@ -183,7 +183,7 @@ python -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct \
 ```
 
 ```bash Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
     --backend sglang \
     --dataset-name speed-bench \
     --dataset-path /path/to/throughput_1k.jsonl \
@@ -245,6 +245,25 @@ Printed after each run:
 
 The script also retokenizes generated text with the configured tokenizer and reports "retokenized" counts.
 
+### Goodput
+
+Throughput counts every completed request, including the ones that came back too late to be useful. Pass service level objectives with `--goodput` to count only the requests that met them:
+
+```bash Command
+python3 -m sglang.benchmark.serving \
+  --backend sglang --host 127.0.0.1 --port 30000 \
+  --num-prompts 1000 --request-rate 16 \
+  --goodput ttft:500 tpot:50 e2el:20000
+```
+
+Each entry is `KEY:VALUE` in milliseconds, with `KEY` one of `ttft`, `tpot`, `e2el` (end-to-end latency). A request is good if it succeeded and met every listed SLO; a single-token response has a TPOT of 0. The run then also prints:
+
+- Request goodput (req/s): good requests per second
+- SLO attainment (%): good requests over all requests sent, so failed requests count as misses
+- One attainment line per listed SLO, which shows which SLO is the binding one
+
+Sweeping `--request-rate` and reading goodput gives the highest rate the deployment sustains within its SLOs: throughput keeps rising or flattens under overload, goodput peaks and then falls.
+
 ### JSONL output format
 
 When `--output-file` is set, one JSON object is appended per run. Base fields:
@@ -253,6 +272,7 @@ When `--output-file` is set, one JSON object is appended per run. Base fields:
 - Duration and totals: completed, total_input_tokens, total_output_tokens, retokenized totals
 - Throughputs and latency statistics as printed in the console
 - `accept_length` when available (sglang)
+- `goodput_slos_ms`, `request_goodput`, `slo_attainment`, `slo_attainment_by_metric` when `--goodput` is given
 
 With `--output-details`, an extended object also includes arrays:
 
@@ -265,7 +285,7 @@ With `--output-details`, an extended object also includes arrays:
 1) sglang native `/generate` (streaming):
 
 ```bash Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --host 127.0.0.1 --port 30000 \
   --model meta-llama/Llama-3.1-8B-Instruct \
@@ -280,7 +300,7 @@ python3 -m sglang.bench_serving \
 2) OpenAI-compatible Completions (e.g., vLLM):
 
 ```bash Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend vllm \
   --base-url http://127.0.0.1:8000 \
   --model meta-llama/Llama-3.1-8B-Instruct \
@@ -292,7 +312,7 @@ python3 -m sglang.bench_serving \
 3) OpenAI-compatible Chat Completions (streaming):
 
 ```bash Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend vllm-chat \
   --base-url http://127.0.0.1:8000 \
   --model meta-llama/Llama-3.1-8B-Instruct \
@@ -304,7 +324,7 @@ python3 -m sglang.bench_serving \
 4) Images (VLM) with chat template:
 
 ```bash Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --host 127.0.0.1 --port 30000 \
   --model your-vlm-model \
@@ -319,7 +339,7 @@ python3 -m sglang.bench_serving \
 4a) Images with custom resolution:
 
 ```bash Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --host 127.0.0.1 --port 30000 \
   --model your-vlm-model \
@@ -334,7 +354,7 @@ python3 -m sglang.bench_serving \
 4b) 1080p images with PNG format and blank content:
 
 ```bash Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --host 127.0.0.1 --port 30000 \
   --model your-vlm-model \
@@ -351,7 +371,7 @@ python3 -m sglang.bench_serving \
 5) Generated shared prefix (long system prompts + short questions):
 
 ```bash Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --host 127.0.0.1 --port 30000 \
   --model meta-llama/Llama-3.1-8B-Instruct \
@@ -364,7 +384,7 @@ python3 -m sglang.bench_serving \
 Zipfian / power-law prefix popularity (opt-in via `--gsp-group-distribution=zipf`):
 
 ```bash Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --host 127.0.0.1 --port 30000 \
   --model meta-llama/Llama-3.1-8B-Instruct \
@@ -384,7 +404,7 @@ This flag controls prefix-popularity shape only. It does not by itself reproduce
 6) Tokenized prompts (ids) for strict length control (sglang only):
 
 ```bash Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --host 127.0.0.1 --port 30000 \
   --model meta-llama/Llama-3.1-8B-Instruct \
@@ -396,7 +416,7 @@ python3 -m sglang.bench_serving \
 7) Profiling and cache flush (sglang):
 
 ```bash Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --host 127.0.0.1 --port 30000 \
   --model meta-llama/Llama-3.1-8B-Instruct \
@@ -407,7 +427,7 @@ python3 -m sglang.bench_serving \
 8) TensorRT-LLM streaming endpoint:
 
 ```bash Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend trt \
   --base-url http://127.0.0.1:8000 \
   --model your-trt-llm-model \
@@ -419,7 +439,7 @@ python3 -m sglang.bench_serving \
 9) Evaluating large-scale KVCache sharing with mooncake trace (sglang only):
 
 ```bash Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --host 127.0.0.1 --port 30000 \
   --model model-name \
@@ -444,7 +464,7 @@ python -m sglang.launch_server \
   --port 30001
 
 # Step 2: Run bench_serving with --fake-prefill
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --host 127.0.0.1 --port 30001 \
   --model meta-llama/Llama-3.1-8B-Instruct \
@@ -457,7 +477,7 @@ python3 -m sglang.bench_serving \
 Similarly, `bench_one_batch_server` also supports `--fake-prefill`:
 
 ```bash Command
-python3 -m sglang.bench_one_batch_server \
+python3 -m sglang.benchmark.one_batch_server \
   --base-url http://127.0.0.1:30001 \
   --model-path meta-llama/Llama-3.1-8B-Instruct \
   --batch-size 32 --input-len 1024 --output-len 256 \

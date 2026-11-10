@@ -16,7 +16,12 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
 from sglang.test.test_utils import try_cached_model
 
 # Initial estimate; update after the first B300 CI run.
-register_cuda_ci(est_time=1800, stage="extra-b", runner_config="8-gpu-b300")
+register_cuda_ci(
+    est_time=1800,
+    stage="extra-b",
+    runner_config="8-gpu-b300",
+    disabled="Temporarily disabled: DSV4.1 PD+CP B300 E2E.",
+)
 
 MODEL = "deepseek-ai/DeepSeek-V4.1-Flash"
 
@@ -51,6 +56,8 @@ COMMON_ARGS = [
 ]
 
 
+# Also skip selective reruns, which bypass the registry's disabled marker.
+@unittest.skip("Temporarily disabled: DSV4.1 PD+CP B300 E2E")
 class TestDeepseekV41PDCPDSpark(PDDisaggregationServerBase, GSM8KMixin):
     model = MODEL
     prefill_tp_size = 4

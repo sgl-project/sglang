@@ -26,7 +26,7 @@ from sgl_kernel import infllmv2_attn_stage1, max_pooling_1d_varlen
 from sglang.srt.layers.attention.minicpm.sparse_kernels import (
     compress_k_complete_kernel_new,
 )
-from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+from sglang.srt.model_executor.forward_context import get_kv_layers
 
 
 def batched_gather(a, lengths_cpu, select):
@@ -116,7 +116,7 @@ def get_compress_k_v2(
     k2_kernel_stride,
 ):
     batch = len(forward_batch.req_pool_indices)
-    key_cache = get_token_to_kv_pool().get_key_buffer(layer.layer_id)
+    key_cache = get_kv_layers().read(layer.layer_id).key()
     key_cache = key_cache.view(-1, layer.tp_k_head_num, layer.head_dim)
 
     for full_compressed_k, level, kernel_size, kernel_stride in (

@@ -365,6 +365,37 @@ for chunk in stream:
 
 For MoE models, set `return_routed_experts: true` in `extra_body` to return expert routing data. Requires `--enable-return-routed-experts` server flag. By default, `routed_experts` is returned in the response-level `sglext` object as base64-encoded int32 expert IDs in a flattened array with logical shape `[num_tokens, num_layers, top_k]`. For non-streaming chat responses with `return_meta_info: true`, `routed_experts` is returned only in each choice's `meta_info` object and omitted from response-level `sglext` to avoid duplicating the routing data. Other requested extension fields, such as `cached_tokens_details` and `spec_tokens_details`, remain in response-level `sglext`. By default, routed experts cover `[0, seqlen - 1)`, the full available sequence, because RL workflows need them for the full sequence. Set `routed_experts_start_len` in `extra_body` to an absolute prefix length to return only `[routed_experts_start_len, seqlen - 1)`. For example, in multi-turn RL rollouts, routed experts for tokens from previous turns have already been collected, so setting this value avoids unnecessary transfer that causes bottlenecks.
 
+#### Returning Flat Output Top Logprobs
+
+With `logprobs: true` and `top_logprobs: k`, set `return_flat_raw_output_top_logprobs: true` and `return_meta_info: true` in `extra_body` to receive the output top logprobs as flat arrays in each choice's `meta_info` instead of nested objects. This skips detokenizing every candidate and shrinks the response, which matters for large `k`. The arrays arrive with the finished response only, so `stream: true` is not supported. `choices[].logprobs` still carries the selected-token logprobs, but its `top_logprobs` lists are empty.
+
+`meta_info` then carries `output_top_logprobs_shape` (`[rows, k]`) and `output_top_logprobs_null_prefix`; covered position `i`, rank `j` sits at flat index `(i - null_prefix) * k + j`. On chat completions the arrays are base64 by default: `output_top_logprobs_{val,idx}_flat_b64`, little-endian bytes whose dtypes are given by the `_dtype` fields (float32 and int32), so non-finite logprobs such as `-inf` survive. Set `return_flat_raw_top_logprobs_b64: false` for plain JSON lists in `output_top_logprobs_{val,idx}_flat`. The native `/generate` API takes the same fields, with base64 off by default.
+
+```python
+import base64
+
+import numpy as np
+
+response = client.chat.completions.create(
+    model="qwen/qwen2.5-0.5b-instruct",
+    messages=[{"role": "user", "content": "Say this is a test"}],
+    max_tokens=16,
+    logprobs=True,
+    top_logprobs=5,
+    extra_body={"return_meta_info": True, "return_flat_raw_output_top_logprobs": True},
+)
+meta = response.choices[0].meta_info
+shape = meta["output_top_logprobs_shape"]
+val = np.frombuffer(
+    base64.b64decode(meta["output_top_logprobs_val_flat_b64"]),
+    dtype=meta["output_top_logprobs_val_flat_b64_dtype"],
+).reshape(shape)
+idx = np.frombuffer(
+    base64.b64decode(meta["output_top_logprobs_idx_flat_b64"]),
+    dtype=meta["output_top_logprobs_idx_flat_b64_dtype"],
+).reshape(shape)
+```
+
 ```python Example
 # Example with logit_bias parameter for completions API
 # Note: You need to get the actual token IDs from your tokenizer
