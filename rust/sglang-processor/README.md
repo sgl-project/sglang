@@ -56,6 +56,11 @@ Pass-through. `load_tokenizer` calls `Tokenizer::from_file_with_options`, and
 `add_special_tokens` at load time, so `DynamoTokenizer` holds one handle per
 setting and picks one per request.
 
+`DynamoTokenizer::load` also reads `tokenizer_config.json`. For the classes whose
+`add_bos_token` Python's `_fix_v5_add_bos_eos_token` restores (Llama, CodeLlama,
+Gemma, Cohere; a missing flag means true), an encode with specials is the BOS
+plus the encode without them, whatever `tokenizer.json`'s post-processor adds.
+
 ## render
 
 ```rust
