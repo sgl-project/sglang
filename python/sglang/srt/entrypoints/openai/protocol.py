@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 import unicodedata
@@ -31,6 +32,7 @@ from typing import (
     Optional,
     Protocol,
     Tuple,
+    Type,
     TypeAlias,
     Union,
     get_args,
@@ -77,11 +79,43 @@ try:
 except:
     StructuralTag = Any
 
-from sglang.utils import convert_json_schema_to_str
 
 logger = logging.getLogger(__name__)
 
+# OpenAI's limit on n; SGLANG_MAX_BATCH_REQS_PER_HTTP_REQ still applies after it.
+OPENAI_MAX_N = 128
+
 DEFAULT_MODEL_NAME = "default"
+
+
+def convert_json_schema_to_str(json_schema: Union[dict, str, Type[BaseModel]]) -> str:
+    """Convert a JSON schema to a string.
+    Parameters
+    ----------
+    json_schema
+        The JSON schema.
+    Returns
+    -------
+    str
+        The JSON schema converted to a string.
+    Raises
+    ------
+    ValueError
+        If the schema is not a dictionary, a string or a Pydantic class.
+    """
+    if isinstance(json_schema, dict):
+        schema_str = json.dumps(json_schema)
+    elif isinstance(json_schema, str):
+        schema_str = json_schema
+    elif issubclass(json_schema, BaseModel):
+        schema_str = json.dumps(json_schema.model_json_schema())
+    else:
+        raise ValueError(
+            f"Cannot parse schema {json_schema}. The schema must be either "
+            + "a Pydantic class, a dictionary or a string that contains the JSON "
+            + "schema specification"
+        )
+    return schema_str
 
 
 class ModelCard(BaseModel):
@@ -376,7 +410,7 @@ class CompletionRequest(PDRoutingFields):
     logit_bias: Optional[Dict[str, float]] = None
     logprobs: Optional[int] = None
     max_tokens: int = 16
-    n: int = 1
+    n: int = Field(default=1, ge=1, le=OPENAI_MAX_N)
     presence_penalty: float = 0.0
     seed: Optional[int] = None
     stop: Optional[Union[str, List[str]]] = None
@@ -860,6 +894,14 @@ class Tool(BaseModel):
             self.function.defer_loading = self.defer_loading
         return self
 
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        # Chat templates render this dict; do not inject a field the client left out.
+        data = handler(self)
+        if self.defer_loading is None:
+            data.pop("defer_loading", None)
+        return data
+
 
 # Tool is defined after the message params that reference it, so the forward
 # reference has to be resolved explicitly.
@@ -952,27 +994,32 @@ class ChatCompletionRequest(PDRoutingFields):
         description="Model name. Supports LoRA adapters via 'base-model:adapter-name' syntax.",
     )
     frequency_penalty: float = 0.0
+    # NOTE: OpenAI limits (temperature <= 2, top_logprobs <= 20, logit_bias in
+    # [-100, 100], top_logprobs requires logprobs) are deliberately not enforced:
+    # SGLang applies these values correctly and existing clients rely on that.
     logit_bias: Optional[Dict[str, float]] = None
     logprobs: bool = False
-    top_logprobs: Optional[int] = None
+    top_logprobs: Optional[int] = Field(default=None, ge=0)
     max_tokens: Optional[int] = Field(
         default=None,
+        ge=0,
         deprecated="max_tokens is deprecated in favor of the max_completion_tokens field",
         description="The maximum number of tokens that can be generated in the chat completion. ",
     )
     max_completion_tokens: Optional[int] = Field(
         default=None,
+        ge=0,
         description="The maximum number of completion tokens for a chat completion request, "
         "including visible output tokens and reasoning tokens. Input tokens are not included. ",
     )
-    n: int = 1
+    n: int = Field(default=1, ge=1, le=OPENAI_MAX_N)
     presence_penalty: float = 0.0
     response_format: Optional[Union[ResponseFormat, StructuralTagResponseFormat]] = None
     seed: Optional[int] = None
     stop: Optional[Union[str, List[str]]] = None
     stream: bool = False
     stream_options: Optional[StreamOptions] = None
-    temperature: Optional[float] = None
+    temperature: Optional[float] = Field(default=None, ge=0.0, allow_inf_nan=False)
     top_p: Optional[float] = None
     user: Optional[str] = None
     tools: Optional[List[Tool]] = Field(default=None, examples=[None])
@@ -1142,6 +1189,14 @@ class ChatCompletionRequest(PDRoutingFields):
             raise ValueError("reasoning_effort must not be a boolean")
         return value
 
+    @field_validator("max_tokens", "max_completion_tokens", mode="before")
+    @classmethod
+    def validate_output_limit_type(cls, value, info):
+        # Lax int parsing would read a boolean as a 0- or 1-token limit.
+        if isinstance(value, bool):
+            raise ValueError(f"{info.field_name} must not be a boolean")
+        return value
+
     @model_validator(mode="before")
     @classmethod
     def normalize_reasoning_inputs(cls, values: Dict):
@@ -1229,6 +1284,15 @@ class ChatCompletionRequest(PDRoutingFields):
 
         return values
 
+    @property
+    def effective_max_tokens(self) -> Optional[int]:
+        """Prefer max_completion_tokens when set, including an explicit zero."""
+        return (
+            self.max_completion_tokens
+            if self.max_completion_tokens is not None
+            else self.max_tokens
+        )
+
     def to_sampling_params(
         self,
         stop: List[str],
@@ -1258,7 +1322,7 @@ class ChatCompletionRequest(PDRoutingFields):
 
         sampling_params = {
             "temperature": get_param("temperature"),
-            "max_new_tokens": self.max_completion_tokens or self.max_tokens,
+            "max_new_tokens": self.effective_max_tokens,
             "min_new_tokens": self.min_tokens,
             "stop": stop,
             "stop_token_ids": self.stop_token_ids,
@@ -1568,6 +1632,8 @@ class ScoringRequest(BaseModel):
     return_token_logprobs: bool = False
     item_first: bool = False
     return_pooled_hidden_states: bool = False
+    # Base request id; expanded to `<rid>_<i>` per item (`i` zero-padded).
+    rid: Optional[str] = None
 
     # Setwise readout: when set, the readout is taken AT every occurrence of this
     # token in each `query + item` sequence instead of the last token, and `scores`

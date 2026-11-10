@@ -20,6 +20,7 @@ from typing import List, Optional
 from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 
 from sglang.srt.entrypoints.openai.protocol import (
+    OPENAI_MAX_N,
     ChatCompletionMessageContentAudioPart,
     ChatCompletionMessageContentAudioURLPart,
     ChatCompletionMessageContentImageURL,
@@ -37,12 +38,14 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolCall,
     UsageInfo,
 )
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 
-class TestCompletionRequest(unittest.TestCase):
+class TestCompletionRequest(CustomTestCase):
     """Test CompletionRequest protocol model"""
 
     def test_basic_completion_request(self):
@@ -64,9 +67,31 @@ class TestCompletionRequest(unittest.TestCase):
         with self.assertRaises(ValidationError):
             CompletionRequest(model="test-model")  # missing prompt
 
+    def test_completion_n_bounds(self):
+        """n outside [1, OPENAI_MAX_N] must be rejected before the response path."""
+        for n in (-1, 0, OPENAI_MAX_N + 1):
+            with self.subTest(n=n), self.assertRaises(ValidationError):
+                CompletionRequest(model="test-model", prompt="Hello", n=n)
+        for n in (1, OPENAI_MAX_N):
+            self.assertEqual(
+                CompletionRequest(model="test-model", prompt="Hello", n=n).n, n
+            )
 
-class TestChatCompletionRequest(unittest.TestCase):
+
+class TestChatCompletionRequest(CustomTestCase):
     """Test ChatCompletionRequest protocol model"""
+
+    def _chat_request(self, **params):
+        return ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "Hello"}],
+            **params,
+        )
+
+    def _assert_rejected_field(self, field, **params):
+        with self.assertRaises(ValidationError) as ctx:
+            self._chat_request(**params)
+        self.assertEqual([error["loc"] for error in ctx.exception.errors()], [(field,)])
 
     def test_full_assistant_ebnf_preserves_explicit_output_constraints(self):
         constraint = ("full_assistant_ebnf", 'root ::= "generated"')
@@ -529,8 +554,77 @@ class TestChatCompletionRequest(unittest.TestCase):
         )
         self.assertNotIn("json_schema", sampling_params)
 
+    def test_zero_output_limits_preserve_precedence(self):
+        """An explicit zero completion limit must survive request conversion."""
+        for params, expected in (
+            ({}, None),
+            ({"max_tokens": None, "max_completion_tokens": None}, None),
+            ({"max_tokens": 0}, 0),
+            ({"max_completion_tokens": 0}, 0),
+            ({"max_tokens": 5, "max_completion_tokens": 0}, 0),
+            ({"max_tokens": 0, "max_completion_tokens": 5}, 5),
+            ({"max_tokens": 5, "max_completion_tokens": None}, 5),
+        ):
+            with self.subTest(params=params):
+                request = ChatCompletionRequest(
+                    messages=[{"role": "user", "content": "Hello"}], **params
+                )
+                sampling_params = SamplingParams(**request.to_sampling_params([], {}))
+                sampling_params.verify(vocab_size=32)
+                self.assertEqual(sampling_params.max_new_tokens, expected)
 
-class TestAudioContentParts(unittest.TestCase):
+    def test_out_of_range_sampling_params_are_rejected(self):
+        """Out-of-range sampling values previously passed validation."""
+        for field, value in (
+            ("n", -1),
+            ("n", 0),
+            ("n", OPENAI_MAX_N + 1),
+            ("top_logprobs", -1),
+            ("temperature", -0.1),
+            ("temperature", float("inf")),
+        ):
+            with self.subTest(field=field, value=value):
+                self._assert_rejected_field(field, **{field: value}, logprobs=True)
+
+    def test_invalid_output_limits_are_rejected(self):
+        """Invalid limits must not be hidden by precedence or coerced from booleans."""
+        for params, field in (
+            ({"max_tokens": -1}, "max_tokens"),
+            ({"max_completion_tokens": -1}, "max_completion_tokens"),
+            ({"max_tokens": -1, "max_completion_tokens": 1}, "max_tokens"),
+            ({"max_tokens": False}, "max_tokens"),
+            ({"max_tokens": True}, "max_tokens"),
+            (
+                {"max_tokens": 5, "max_completion_tokens": False},
+                "max_completion_tokens",
+            ),
+        ):
+            with self.subTest(params=params):
+                self._assert_rejected_field(field, **params)
+
+    def test_sampling_param_boundaries_are_accepted(self):
+        for params in (
+            {"n": 1, "logprobs": True, "top_logprobs": 0},
+            {"n": OPENAI_MAX_N, "logprobs": True, "top_logprobs": 20},
+            {"temperature": 0.0},
+        ):
+            with self.subTest(params=params):
+                self._chat_request(**params)
+        self.assertIsNone(self._chat_request().temperature)
+
+    def test_openai_limits_are_deliberately_not_enforced(self):
+        """The engine applies these values as expected; they must not be rejected."""
+        for params in (
+            {"temperature": 3.0},
+            {"logprobs": True, "top_logprobs": 50},
+            {"top_logprobs": 3},
+            {"logit_bias": {"1": -1000, "2": 1e4}},
+        ):
+            with self.subTest(params=params):
+                self._chat_request(**params)
+
+
+class TestAudioContentParts(CustomTestCase):
     """Test audio content parts and the input_audio conversion"""
 
     def _audio_part(self, part):
@@ -599,7 +693,7 @@ class TestAudioContentParts(unittest.TestCase):
         )
 
 
-class TestModelSerialization(unittest.TestCase):
+class TestModelSerialization(CustomTestCase):
     """Test model serialization with hidden states"""
 
     def _chat_payloads(self, tool_calls):
@@ -716,7 +810,7 @@ class TestModelSerialization(unittest.TestCase):
         self.assertEqual(data["meta_info"], {"prompt_tokens": 3})
 
 
-class TestFunctionDeferLoading(unittest.TestCase):
+class TestFunctionDeferLoading(CustomTestCase):
     """Test defer_loading field behavior on Function/Tool."""
 
     def test_function_defaults_omit_optional_contract_fields(self):
@@ -777,6 +871,28 @@ class TestFunctionDeferLoading(unittest.TestCase):
         )
         self.assertFalse(tool.function.defer_loading)
 
+    def test_tool_without_defer_loading_dumps_client_fields_only(self):
+        """The dict passed to chat templates must not gain a null field."""
+        raw = {
+            "type": "function",
+            "function": {
+                "name": "search_db",
+                "description": "Search the database.",
+                "parameters": {"type": "object"},
+            },
+        }
+        tool = Tool.model_validate(raw)
+        self.assertEqual(tool.model_dump(), raw)
+        self.assertEqual(json.loads(tool.model_dump_json()), raw)
+
+    def test_tool_level_defer_loading_is_kept_when_set(self):
+        for value in (True, False):
+            data = Tool(
+                defer_loading=value, function={"name": "search_db"}
+            ).model_dump()
+            self.assertIs(data["defer_loading"], value)
+            self.assertIs(data["function"]["defer_loading"], value)
+
     def test_tool_reference_content_part_accepted(self):
         """Chat completion should accept tool_reference content on tool-role
         messages (GLM-specific extension consumed by the chat template)."""
@@ -798,7 +914,7 @@ class TestFunctionDeferLoading(unittest.TestCase):
         self.assertEqual(parts[1].type, "text")
 
 
-class TestValidationEdgeCases(unittest.TestCase):
+class TestValidationEdgeCases(CustomTestCase):
     """Test edge cases and validation scenarios"""
 
     def test_negative_token_limits(self):
