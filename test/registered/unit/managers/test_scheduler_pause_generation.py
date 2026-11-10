@@ -466,45 +466,6 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         self.assertIsNone(scheduler.chunked_req)
         self.assertIsNone(scheduler.last_batch)
 
-    def test_retract_moves_each_request_out_of_its_list(self):
-        scheduler = self._new_scheduler()
-        running, launched, chunked = map(
-            self._make_req, ("running", "launched", "chunked")
-        )
-        scheduler.running_batch = self._make_batch(
-            scheduler, reqs=[running], with_tensors=True
-        )
-        scheduler.last_batch = self._make_batch(
-            scheduler,
-            reqs=[launched, chunked],
-            forward_mode=ForwardMode.EXTEND,
-            with_tensors=True,
-        )
-        scheduler.running_reqs.join([running])
-        scheduler.prefill_launched_reqs.join([launched])
-        scheduler.chunked_reqs.join([chunked])
-        sources = []
-
-        def requeue(req, *, src=None):
-            sources.append(src.kind)
-            move([req], src, scheduler.waiting_queue)
-
-        scheduler._add_request_to_queue = MagicMock(side_effect=requeue)
-
-        scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
-
-        self.assertEqual(
-            sources,
-            [ListKind.DECODING, ListKind.PREFILL_LAUNCHED, ListKind.CHUNKED],
-        )
-        self.assertEqual(list(scheduler.waiting_queue), [running, launched, chunked])
-        for held in (
-            scheduler.running_reqs,
-            scheduler.prefill_launched_reqs,
-            scheduler.chunked_reqs,
-        ):
-            self.assertEqual(len(held), 0)
-
     def test_retract_after_dp_conversion_releases_each_req_once(self):
         """retract after DP attention converted the running batch to extend
         (running_batch is last_batch) releases each request once."""

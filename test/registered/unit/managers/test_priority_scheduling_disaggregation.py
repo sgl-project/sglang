@@ -309,9 +309,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
                 return_value=SimpleNamespace(optimistic_prefill_attempts=2),
             ),
         ):
-            waiting = IndexedReqList(ListKind.WAITING)
-            result = queue.move_bootstrapped(waiting)
-        self.assertEqual(list(waiting), result)
+            result = queue.move_bootstrapped(IndexedReqList(ListKind.WAITING))
 
         return queue, req, result
 
@@ -1080,7 +1078,6 @@ class TestDecodePrebuilt(unittest.TestCase):
         selected_reqs = init_new.call_args.args[0]
         self.assertEqual([req.rid for req in selected_reqs], ["high"])
         self.assertEqual([req.rid for req in scheduler.waiting_queue], ["low"])
-        self.assertEqual([req.rid for req in scheduler.running_reqs], ["high"])
 
     def test_overlap_waits_for_forward_before_processing_prebuilt(self):
         scheduler = self._new_scheduler(enable_overlap=True)

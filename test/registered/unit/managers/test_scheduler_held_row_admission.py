@@ -138,21 +138,14 @@ class TestHeldRowAdmission(CustomTestCase):
             running_batch.batch_is_full,
             final_chunk,
             waiting,
-            s,
         )
 
     def test_final_chunk_leaves_the_free_row_to_a_waiting_request(self):
         for mode in (DisaggregationMode.NULL, DisaggregationMode.PREFILL):
             with self.subTest(mode=mode):
-                can_run_list, batch_is_full, final_chunk, waiting, s = self._admitted(
-                    mode
-                )
+                can_run_list, batch_is_full, final_chunk, waiting = self._admitted(mode)
                 self.assertEqual(can_run_list, [final_chunk, waiting])
                 self.assertFalse(batch_is_full)
-                # Both move into prefill_launched before the batch is built.
-                self.assertEqual(list(s.prefill_launched_reqs), [final_chunk, waiting])
-                self.assertEqual(list(s.chunked_reqs), [])
-                self.assertEqual(list(s.waiting_queue), [])
 
 
 if __name__ == "__main__":

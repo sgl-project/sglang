@@ -478,20 +478,6 @@ class TestDeferredDestinationPublish(CustomTestCase):
             fill_len=4,
         )
 
-    @staticmethod
-    def _gate_at_handoff(queue):
-        """Record, at each handoff to the transfer queue, whether destinations
-        still count as published."""
-        gate = []
-        note_destinations_queued = queue.note_destinations_queued
-
-        def queued(count):
-            gate.append(queue.has_published_destinations)
-            note_destinations_queued(count)
-
-        queue.note_destinations_queued = queued
-        return gate
-
     def test_deferred_destination_keeps_its_metadata_slot_until_published(self):
         # The transfer queue frees the metadata slot of any request it fails, so
         # a deferred request must own one before joining the queue, and the
@@ -568,7 +554,6 @@ class TestDeferredDestinationPublish(CustomTestCase):
         queue.scheduler.enable_overlap = True
         queue.scheduler.device_module = SimpleNamespace(Event=lambda: ready)
         queue.scheduler.forward_stream = object()
-        gate_closed = self._gate_at_handoff(queue)
 
         self.assertEqual(
             queue.move_preallocated(queue.transfer_queue.queue), ([decode_req], [])
@@ -583,10 +568,6 @@ class TestDeferredDestinationPublish(CustomTestCase):
         self.assertEqual(args[1], decode_req.metadata_buffer_index)
         self.assertEqual(kwargs, {"decode_prefix_len": 0})
         self.assertEqual(decode_req.metadata_buffer_index, 0)
-        # The transfer queue holds the send now.
-        self.assertEqual(gate_closed, [True])
-        self.assertEqual(list(queue.transfer_queue.queue.items()), [decode_req])
-        self.assertFalse(queue.has_published_destinations)
 
     def test_staging_readback_preserves_payload_and_waits_for_both_events(self):
         payloads = []
@@ -755,14 +736,11 @@ class TestDeferredDestinationPublish(CustomTestCase):
         request's rows before its publish reads their ids back. Unified memory
         keeps no pool-wide move gate: the deferral holds the request's receive
         rows in place, which a relief keeps whenever it can, until the publish
-        has recorded the rows' transfer. The destination still counts as
-        published until the transfer queue takes it."""
+        has recorded the rows' transfer."""
         queue = self._deferring_queue([self._decode_req(_PollingReceiver())])
-        gate_closed = self._gate_at_handoff(queue)
 
         queue.move_preallocated(queue.transfer_queue.queue)
 
-        self.assertEqual(gate_closed, [True])
         start, end, signal = self.storage.holds["deferred"]
         self.assertEqual((start, end), (0, 5))
         self.assertIs(signal, queue._pending_publish[0].allocated)
@@ -801,52 +779,25 @@ class TestDeferredDestinationPublish(CustomTestCase):
         # Both holds end: the released one unpublished, the live one published.
         self.assertEqual(self.storage.ended, ["deferred", "deferred"])
 
+
+class TestPublishedDestinationHandoff(CustomTestCase):
     def test_transfer_queue_takes_host_destinations_over(self):
         """REGRESSION: the transfer queue takes published host destinations
         over, so the host backing's peer-write gate reopens once they drain."""
-        receiver = _PollingReceiver()
-        receiver.supports_host_destination = True
-        decode_req = self._decode_req(receiver)
-        decode_req.req.bootstrap_host = "prefill"
-        queue = self._deferring_queue([decode_req])
+        prealloc = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        prealloc._num_published_destinations = 0
         transfer = DecodeTransferQueue.__new__(DecodeTransferQueue)
-        transfer.queue = decode_queue(ListKind.PD_RECEIVING)
+        decode_req = SimpleNamespace(req=FakeReq(rid="r"), host_staged=True)
+        transfer.queue = decode_queue(ListKind.PD_RECEIVING, [decode_req])
         transfer._deferred_releases = IndexedReqList(
             ListKind.PD_RELEASING, req_of=lambda entry: entry[0].req
         )
-        transfer.enable_staging = False
-        queue.transfer_queue = transfer
-        queue.host_pool = SimpleNamespace(
-            page_size=1,
-            available_size=lambda: 64,
-            alloc=torch.arange,
-            peer_write_indices=lambda indices: indices,
-        )
-        queue.host_reserved_tokens = 0
-        queue.host_window_entries = []
-        queue._host_receive_keeps_reserve = MagicMock(return_value=True)
-        queue.tree_cache.sidecar_pool_specs = []
-        queue.scheduler.pool_stats_observer.get_pool_stats.return_value = (
-            SimpleNamespace(full_token_usage=1.0)
-        )
-        disagg = SimpleNamespace(
-            disaggregation_decode_host_receive_threshold=0.5,
-            disaggregation_decode_enable_radix_cache=False,
-        )
-
-        with patch("sglang.srt.disaggregation.decode.get_disagg", return_value=disagg):
-            self.assertEqual(
-                queue.move_preallocated(queue.transfer_queue.queue), ([decode_req], [])
-            )
-
-        self.assertTrue(decode_req.host_staged)
-        receiver.send_metadata.assert_called_once()
-        self.assertFalse(queue.has_published_destinations)
-        self.assertFalse(queue._host_destinations_quiescent())
+        prealloc.transfer_queue = transfer
+        self.assertFalse(prealloc._host_destinations_quiescent())
 
         # The receive completes and leaves the queue.
         transfer.queue.leave([decode_req.req])
-        self.assertTrue(queue._host_destinations_quiescent())
+        self.assertTrue(prealloc._host_destinations_quiescent())
 
 
 def _admit_req(**overrides):

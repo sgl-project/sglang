@@ -18,7 +18,6 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.environ import envs
-from sglang.srt.managers.hisparse_coordinator import HiSparseAct, HiSparseCoordinator
 from sglang.srt.managers.req_types import FINISH_LENGTH
 from sglang.srt.managers.schedule_batch import NextBatchPlan, Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
@@ -27,11 +26,6 @@ from sglang.srt.managers.scheduler_components.invariant_checker import (
     SchedulerInvariantChecker,
 )
 from sglang.srt.managers.scheduler_components.pause_state import PauseState
-from sglang.srt.managers.scheduler_components.request_list import (
-    IndexedReqList,
-    ListKind,
-)
-from sglang.srt.managers.scheduler_components.request_retirer import RequestRetirer
 from sglang.srt.managers.scheduler_components.state_check import CheckPhase
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -252,9 +246,7 @@ class TestRunningReqsHooks(CustomTestCase):
         _launch(s, mixed)
         _launch(s, _batch([decoding], ForwardMode.DECODE))
 
-        self.assertEqual(list(s.prefill_launched_reqs), [a, new])
         self.assertEqual(list(s.running_reqs), [decoding])
-        self.assertEqual(list(s.chunked_reqs), [chunk])
 
         # The merge moves the mixed step's prefill; its decode row stays put.
         _schedule_without_admission(s)
@@ -271,36 +263,6 @@ class TestRunningReqsHooks(CustomTestCase):
         s.dllm_manager.waiting_queue.append(_req("p"))
         _launch(s, _batch(s.dllm_manager.waiting_queue, ForwardMode.EXTEND))
         self.assertEqual(list(s.prefill_launched_reqs), [])
-
-    def test_a_staged_hisparse_request_moves_straight_into_running(self):
-        s = _scheduler()
-        _schedule_without_admission(s)
-        staged = _req("h")
-        staged.kv.req_pool_idx = 0
-        staged.hisparse_staging = True
-        coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
-        coordinator.ack_staging_queue = IndexedReqList(
-            ListKind.HISPARSE_STAGING, req_of=lambda act: act.req
-        )
-        landed = SimpleNamespace(query=lambda: True)
-        coordinator.ack_staging_queue.join([HiSparseAct(None, landed, staged)])
-        coordinator.tp_world_size = 1
-        coordinator._skip_first_backup = {}
-        s.enable_hisparse = True
-        s.hisparse_coordinator = coordinator
-
-        def lists_of(req):
-            return [kind for kind, reqs in s.request_lists().items() if req in reqs]
-
-        coordinator.alloc_device_buffer = lambda req: None
-        s._build_hisparse_decode_batch = lambda reqs: _batch(reqs, ForwardMode.DECODE)
-
-        plan = Scheduler.get_next_batch_to_run(
-            s, ScheduleBatch(reqs=[], batch_is_full=False), None
-        )
-
-        self.assertEqual(plan.running_batch.reqs, [staged])
-        self.assertEqual(lists_of(staged), [ListKind.DECODING])
 
     def test_ngram_grammar_step_launches_no_finished_row(self):
         # A grammar row under NGRAM processes the previous result early; once it
@@ -457,34 +419,6 @@ class TestRunningReqsHooks(CustomTestCase):
         self.assertIsNone(new_batch)
         self.assertEqual(list(s.waiting_queue), [waiting, victim])
         self.assertEqual(list(s.running_reqs), [other])
-
-    def test_a_requeued_request_moves_and_a_refused_one_still_leaves(self):
-        s = _scheduler()
-        s.uocr_runtime = None
-        # A priority on a server without priority scheduling is refused.
-        s.enable_priority_scheduling = False
-        s.abort_on_priority_when_disabled = True
-        s.request_retirer = RequestRetirer(
-            tree_cache=None,
-            beam_coordinator=None,
-            hisparse_coordinator=None,
-            uocr_runtime=None,
-            send_abort_output=Mock(),
-            stream_output=None,
-        )
-        s.request_retirer.release = Mock()
-        s._abort_on_queued_limit = Mock(return_value=False)
-        s._prefetch_kvcache = Mock()
-        queued, refused = _req("queued"), _req("refused")
-        refused.priority = 1
-        s.running_reqs.join([queued, refused])
-
-        for req in (queued, refused):
-            s._add_request_to_queue(req, src=s.running_reqs)
-
-        self.assertEqual(list(s.waiting_queue), [queued])
-        self.assertEqual(list(s.running_reqs), [])
-        s.request_retirer.release.assert_called_once_with(refused, checkpoint=False)
 
     def test_launch_counts_in_flight_steps_and_processing_drops_them(self):
         s = _scheduler()

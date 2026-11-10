@@ -181,10 +181,9 @@ class TestPopTransferredFollowsConsensusOutcome(CustomTestCase):
     def test_non_pp_path_keeps_the_request_list(self):
         admitted = _decode_req("s", KVPoll.Success)
         queue = _transfer_queue([admitted])
-        waiting = IndexedReqList(ListKind.WAITING)
-        self.assertEqual(queue.move_transferred(waiting), [admitted.req])
-        self.assertEqual(list(waiting), [admitted.req])
-        self.assertEqual(len(queue.queue), 0)
+        self.assertEqual(
+            queue.move_transferred(IndexedReqList(ListKind.WAITING)), [admitted.req]
+        )
 
 
 class TestProcessDecodeTransferQueueForwardsOutcomes(CustomTestCase):

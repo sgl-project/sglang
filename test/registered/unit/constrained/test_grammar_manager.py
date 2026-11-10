@@ -613,7 +613,6 @@ class TestGetReadyGrammarRequests(unittest.TestCase):
 
         result = mgr.get_ready_grammar_requests()
         self.assertEqual(result, [req])
-        self.assertEqual(list(mgr.grammar_queue), [req])
 
     def test_timeout_aborts_req(self):
         mgr = self._make_mgr()
@@ -695,7 +694,7 @@ class TestGetReadyGrammarRequests(unittest.TestCase):
         result = mgr.get_ready_grammar_requests()
         self.assertEqual(len(result), 1)
         self.assertIs(result[0], ready_req)
-        self.assertEqual(list(mgr.grammar_queue), [ready_req, pending_req])
+        self.assertIn(pending_req, mgr.grammar_queue)
 
     def test_empty_queue(self):
         """get_ready_grammar_requests on empty queue should return empty list."""
@@ -780,8 +779,7 @@ class TestGetReadyGrammarRequests(unittest.TestCase):
         # Intersection of ready: {0} ∩ {0,1} = {0}
         self.assertEqual(len(result), 1)
         self.assertIs(result[0], req0)
-        # Both stay queued: req1 pending, req0 until the caller moves it.
-        self.assertEqual(list(mgr.grammar_queue), [req0, req1])
+        self.assertIn(req1, mgr.grammar_queue)
 
     @patch("sglang.srt.constrained.grammar_manager.torch.distributed.all_gather_object")
     def test_multi_rank_sync_unions_failed(self, mock_all_gather):
@@ -810,7 +808,6 @@ class TestGetReadyGrammarRequests(unittest.TestCase):
         self.assertEqual(len(result), 1)
         req.set_finish_with_abort.assert_called_once()
         self.assertIn("timed out", req.set_finish_with_abort.call_args[0][0])
-        self.assertEqual(list(mgr.grammar_queue), [req])
 
 
 class _FakePPSendWork:

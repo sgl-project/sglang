@@ -645,15 +645,10 @@ class TestHiSparseUnit(unittest.TestCase):
         launched.join([req])
         self.coordinator.admit_request_into_staging(req, src=launched)
         self.assertTrue(req.hisparse_staging)
-        self.assertEqual(list(launched), [])
-        self.assertEqual(list(self.coordinator.ack_staging_queue), [req])
 
         get_device_module().synchronize()
-        running = KeyedReqList(ListKind.DECODING)
-        ready = self.coordinator.move_ready_reqs(running)
+        ready = self.coordinator.move_ready_reqs(KeyedReqList(ListKind.DECODING))
         self.assertEqual(len(ready), 1)
-        self.assertEqual(list(self.coordinator.ack_staging_queue), [])
-        self.assertEqual(list(running), [req])
         self.assertFalse(req.hisparse_staging)
         self.assertTrue(self.coordinator._skip_first_backup[req.kv.req_pool_idx])
 

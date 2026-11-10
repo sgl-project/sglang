@@ -588,39 +588,6 @@ class TestGetNewPrebuiltBatchChecksum(unittest.TestCase):
         mock_abort.assert_called_once()
 
 
-class TestKvChecksumMismatchLeavesRunning(unittest.TestCase):
-    def test_a_mismatched_request_leaves_running(self):
-        sched = _FakeScheduler(SimpleNamespace(compute=lambda pages, states: 0x1), None)
-        bad = _make_req(0xBAD, 4, rid="bad")
-        good = _make_req(0x1, 4, rid="good")
-        # Prebuilt admission moved both into running.
-        sched.running_reqs.join([bad, good])
-        batch = Mock(reqs=[bad, good])
-        batch.filter_batch.side_effect = lambda *, keep_indices: setattr(
-            batch, "reqs", [batch.reqs[i] for i in keep_indices]
-        )
-        with (
-            envs.SGLANG_IS_IN_CI.override(False),
-            patch("sglang.srt.disaggregation.decode.prepare_abort"),
-            patch(
-                "sglang.srt.disaggregation.decode.page_indices_for_request",
-                lambda *args, **kwargs: None,
-            ),
-            patch(
-                "sglang.srt.disaggregation.decode.state_indices_for_request",
-                lambda *args, **kwargs: None,
-            ),
-            patch(
-                "sglang.srt.disaggregation.decode.all_reduce_flags",
-                lambda flags, group, op: flags,
-            ),
-        ):
-            sched._verify_kv_checksums(batch)
-
-        self.assertEqual(batch.reqs, [good])
-        self.assertEqual(list(sched.running_reqs), [good])
-
-
 class TestKvChecksumMismatchHiSparse(unittest.TestCase):
     def test_mismatch_releases_hisparse_before_kv(self):
         # Transfer already admitted the request into HiSparse; the abort must

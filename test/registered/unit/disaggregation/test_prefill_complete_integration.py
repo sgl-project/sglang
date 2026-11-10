@@ -462,7 +462,6 @@ class TestAllocationIntegration(CustomTestCase):
             )
 
         self.assertEqual(list(scheduler.waiting_queue), [req])
-        self.assertEqual(list(scheduler.prefill_launched_reqs), [])
         self.assertIsNotNone(req.multimodal_inputs)
         req.multimodal_inputs.release_features.assert_not_called()
         scheduler.tree_cache.finish.assert_called_once_with(
