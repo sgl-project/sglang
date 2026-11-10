@@ -71,6 +71,8 @@
 //                      (a 1P1D deployment has two nodes, one per worker).
 //                      cell.pd, pdMode, router, commands, hints, dockerImage,
 //                      dockerMounts carry role-specific rendering metadata.
+//   cell.autoMambaRatio optional — false keeps calculator ratios out of a
+//                      fixed recipe (defaults to enabled).
 //   modelNames         HF slug lookup, `hw|variant|quant`, `variant|quant`,
 //                      `hw|quant`, `quant`, `hw`, then `default`
 //   placeholders       {{KEY}} → {target: 'command'|'curl', label, default?, showWhen?(sel)}
@@ -1549,7 +1551,7 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
   // host/port tail); cells themselves stay ratio-free. Cells sizing the pool
   // with --max-mamba-cache-size opt out.
   const cellWithRatio = (() => {
-    if (!cell || !mambaRatio) return cell;
+    if (!cell || cell.autoMambaRatio === false || !mambaRatio) return cell;
     if (cell.flags.some((f) =>
       f.startsWith("--mamba-full-memory-ratio") || f.startsWith("--max-mamba-cache-size"))) return cell;
     const flags = [...cell.flags];

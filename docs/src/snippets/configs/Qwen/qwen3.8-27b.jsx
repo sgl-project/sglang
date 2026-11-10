@@ -400,6 +400,8 @@ export const config = {
   },
 
   playgroundFeatures: {
+    normalizeDeltas: (deltas, derived, base) =>
+      base.hw === "xeon" && base.quant === "fp8" ? {} : deltas,
 
     // No "Attention Parallelism" card: the page is single-GPU throughout,
     // and a TP knob would desync the ratio calculator (TP1-only geometry).
@@ -412,6 +414,7 @@ export const config = {
     // `tool_calls`. So this card is an opt-OUT — the handler derives both chips
     // as already-on from the cell and strips the flag when one is toggled off.
     parsers: {
+      showWhen: (base) => base.hw !== "xeon" || base.quant !== "fp8",
       items: [
         { id: "reasoning", label: "Reasoning Parser", flag: "--reasoning-parser qwen3" },
         { id: "toolCall",  label: "Tool Call Parser", flag: "--tool-call-parser qwen3_coder" },
@@ -425,6 +428,7 @@ export const config = {
     // alias would survive toggles and double up). DSpark is the trained draft
     // model, a separate checkpoint.
     speculative: {
+      showWhen: (base) => base.hw !== "xeon" || base.quant !== "fp8",
       options: [
         { id: "current", label: "Inherited from base" },
         { id: "off",     label: "Off (greedy)" },
@@ -454,6 +458,7 @@ export const config = {
         // FlashInfer build whose prefill `plan` predates `uniform_q_len`
         // (<= 0.6.15.post1).
         id: "attnBackend", title: "Attention Backend",
+        showWhen: (base) => base.hw !== "xeon" || base.quant !== "fp8",
         stripPrefixes: ["--attention-backend"],
         options: [
           { id: "flashinfer", label: "FlashInfer (default)",
@@ -470,6 +475,7 @@ export const config = {
         // now pins fp8_e4m3, so this row is the opt-OUT: pick BFloat16 to undo
         // it on the BF16/FP8 checkpoints, which carry no fp8 KV calibration.
         id: "kvCacheDtype", title: "KV Cache Precision",
+        showWhen: (base) => base.hw !== "xeon" || base.quant !== "fp8",
         stripPrefixes: ["--kv-cache-dtype"],
         options: [
           { id: "auto", label: "Auto (checkpoint-declared)" },
@@ -482,6 +488,7 @@ export const config = {
         // biggest lever on the GDN state pool, which is what bounds concurrency
         // on small-VRAM cards.
         id: "mambaSsmDtype", title: "GDN State Precision",
+        showWhen: (base) => base.hw !== "xeon" || base.quant !== "fp8",
         stripPrefixes: ["--mamba-ssm-dtype"],
         options: [
           { id: "auto", label: "Auto (FP32)" },
@@ -493,6 +500,7 @@ export const config = {
         // S=1 slot, which is the cheapest way to buy concurrency on a 32GB card
         // when the traffic has no shared prefixes (offline batch, evals).
         id: "prefixCache", title: "Prefix Cache",
+        showWhen: (base) => base.hw !== "xeon" || base.quant !== "fp8",
         stripPrefixes: ["--disable-radix-cache"],
         options: [
           { id: "on",  label: "On" },
@@ -506,7 +514,8 @@ export const config = {
         // Changing S changes the balanced ratio — recompute it in the page's
         // calculator after picking a strategy here.
         id: "mambaRadix", title: "GDN Radix Cache Strategy",
-        showWhen: (b, v, d) => (((v && v.prefixCache) ?? (d && d.prefixCache)) !== "off"),
+        showWhen: (b, v, d) => (b.hw !== "xeon" || b.quant !== "fp8") &&
+          (((v && v.prefixCache) ?? (d && d.prefixCache)) !== "off"),
         stripPrefixes: ["--mamba-radix-cache-strategy"],
         options: [
           { id: "auto",  label: "Auto (extra_buffer, S=5)" },
@@ -1020,7 +1029,7 @@ export const config = {
     },
     {
       // Xeon CPU: reference recipe only, not benchmarked on this page. No
-      // NVFP4/FP8 cell — those checkpoints have no verified CPU recipe.
+      // NVFP4 cell — those checkpoints have no verified CPU recipe.
       match: { hw: "xeon", variant: "default", quant: "bf16", nodes: "single" },
       verified: false,
       verificationStatus: "unverified",
@@ -1034,6 +1043,30 @@ export const config = {
         "--mem-fraction-static 0.8",
         "--reasoning-parser qwen3",
         "--tool-call-parser qwen3_coder",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "xeon", variant: "default", quant: "fp8", nodes: "single" },
+      verified: true,
+      autoMambaRatio: false,
+      warn: "Quick text generation verified on Intel Xeon 6972P at TP6. The 8,192-token cache does not cover the full context. Vision, Playground overrides, dataset accuracy, and performance are unverified.",
+      env: [
+        "SGLANG_USE_CPU_ENGINE=1",
+        "RAYON_NUM_THREADS=1",
+        "TOKENIZERS_PARALLELISM=false",
+        "OPENBLAS_NUM_THREADS=1",
+      ],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--revision 017b9c7af6b5689d5dd426a76e0bc077eb5ca20a",
+        "--device cpu",
+        "--disable-overlap-schedule",
+        "--tp 6",
+        "--dtype bfloat16",
+        "--max-total-tokens 8192",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
