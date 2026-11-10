@@ -1,6 +1,6 @@
 ---
 title: Laguna-XS-2.1
-description: "Deploy poolside's Laguna-XS-2.1 — a 33B hybrid-SWA Mixture-of-Experts model (3B active) for agentic coding — with SGLang on NVIDIA H200, B300, and GB300 in BF16, FP8, NVFP4, and INT4."
+description: "Deploy poolside's Laguna-XS-2.1 — a 33B hybrid-SWA Mixture-of-Experts model (3B active) for agentic coding — with SGLang on NVIDIA H200, B300, and GB300 in BF16, FP8, NVFP4, and INT4, plus BF16 basic generation on Intel Xeon CPUs."
 ---
 
 ## Deployment
@@ -12,6 +12,8 @@ description: "Deploy poolside's Laguna-XS-2.1 — a 33B hybrid-SWA Mixture-of-Ex
 Laguna-XS-2.1 support is fully merged to SGLang `main` ([PR #29446](https://github.com/sgl-project/sglang/pull/29446): DFlash speculative decoding + shared-expert fix; [PR #29761](https://github.com/sgl-project/sglang/pull/29761): INT4 loader fix). Any build at or past their merge covers every cell below.
 
 The model ships custom config code on the Hub, so `--trust-remote-code` is required (included in the launch commands).
+
+For **XEON**, use the [CPU installation guide](../../../docs/hardware-platforms/cpu_server) and its CPU runtime libraries and `LD_PRELOAD` setup instead of the GPU installation paths below. The Python-only BF16 recipe passed a basic generation check on Intel Xeon 6972P using upstream SGLang commit `99fd01047d67bb249641a8e50282a1a5218afc63`, PyTorch `2.14.0+cpu`, Transformers `5.19.0`, and `sglang-kernel-cpu` `0.4.10`, without runtime changes.
 
 <Tabs>
 
@@ -44,12 +46,14 @@ For how to launch the image, see [Install → Method 3: Using Docker](../../../d
 
 </Accordion>
 
-Pick your hardware + quantization + strategy to generate the launch command. The two serving strategies cover the common operating points:
+Pick your hardware + quantization + strategy to generate the launch command. On GPUs, the two serving strategies cover the common operating points:
 
 - **Low-latency** — DFlash speculative decoding with a matched draft model. Pick for chat and interactive agents.
 - **High-throughput** — plain serving. Best for batch workloads, where speculation's draft + rejection overhead costs more than it saves.
 
 On the 8-GPU HGX platforms (H200 / B300), BF16 and NVFP4 run plain `--tp 8`; FP8 and INT4 run `--tp 8 --ep-size 8` because their quantization scales cannot shard the MoE 8-way (see [Configuration Tips](#2-configuration-tips)). The 4-GPU GB300 node runs plain `--tp 4` throughout.
+
+The **XEON** cell pins checkpoint `c5f36269bbdbd3f27fddc9a9f9dbae0cf2cf57db`, uses TP4 and an 8,192-token cache, and retains the page's High-throughput label for plain serving; that label is not a CPU performance measurement. TP6 failed sharding alignment. Only a complete, coherent greedy text response was checked, not dataset accuracy, the full 262,144-token context, vision, parser behavior or DFlash. CPU quantized checkpoints and Low-latency cells are not enabled. Playground overrides are hidden and cleared on Xeon.
 
 import { Deployment } from "/src/snippets/_deployment.jsx";
 import { config }     from "/src/snippets/configs/poolside/laguna-xs21.jsx";
@@ -164,7 +168,7 @@ DFlash is a block-wise speculative decoder: the 5-layer draft proposes a block o
 
 ### 3.2 Reasoning
 
-Launch with `--reasoning-parser poolside_v1` (baked into every generated command). Reasoning is opt-in via `enable_thinking=True`; the `<think>` trace lands in `message.reasoning_content`, separate from the final answer in `message.content`.
+On GPUs, launch with `--reasoning-parser poolside_v1` (baked into the GPU commands). Reasoning is opt-in via `enable_thinking=True`; the `<think>` trace lands in `message.reasoning_content`, separate from the final answer in `message.content`. Parser separation was not tested on Xeon.
 
 <Accordion title="Reasoning Example (Python)">
 
