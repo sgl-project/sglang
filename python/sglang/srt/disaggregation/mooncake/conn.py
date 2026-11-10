@@ -176,7 +176,7 @@ class KVArgsRegisterInfo:
     dcp_token_item_lens: Optional[List[int]] = None
     dst_draft_rows_dcp_collapsed: bool = False
     dst_kv_item_lens: List[int] = dataclasses.field(default_factory=list)
-    dst_npu_dsa_token_dcp: bool = False
+    dst_dcp_layout_id: bytes = b""
     staging_base_ptr: int = 0
     staging_total_size: int = 0
     dst_aux_item_lens: Optional[List[int]] = None
@@ -234,7 +234,7 @@ class KVArgsRegisterInfo:
                 else []
             ),
             dst_draft_rows_dcp_collapsed=(len(msg) > 21 and msg[21] == b"1"),
-            dst_npu_dsa_token_dcp=(len(msg) > 22 and msg[22] == b"1"),
+            dst_dcp_layout_id=msg[22] if len(msg) > 22 else b"",
             # Note: always put the staging field at the final
             staging=StagingRegisterInfo.from_zmq_fields(msg, 15, slot_ids_index=19),
         )
@@ -1705,19 +1705,15 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         )
         if plan.empty():
             return 0
-        if self.kv_args.npu_dsa_dcp_target_buffers is not None:
-            from sglang.srt.hardware_backend.npu.mooncake_dsa_dcp import (
-                send_dsa_token_dcp,
-            )
-
-            return send_dsa_token_dcp(
+        adapter = getattr(self.kv_args, "dcp_transfer", None)
+        if adapter is not None:
+            return adapter.send(
                 transfer_data=partial(self._transfer_data, mooncake_session_id),
                 plan=plan,
                 src_ptrs=src_kv_ptrs,
                 dst_ptrs=dst_kv_ptrs,
                 widths=dcp_token_item_lens,
                 pack_buffer=pack_buffer,
-                target_buffers=self.kv_args.npu_dsa_dcp_target_buffers,
             )
 
         target_src_kv_ptrs = src_kv_ptrs[:num_target]
@@ -3290,19 +3286,19 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         decode_kv_args.dst_dcp_rank,
                     )
                     registration_error = None
-                    if (
-                        self.kv_args.npu_dsa_dcp_target_buffers is not None
-                        or decode_kv_args.dst_npu_dsa_token_dcp
-                    ):
-                        from sglang.srt.hardware_backend.npu.mooncake_dsa_dcp import (
-                            prepare_dsa_token_dcp,
+                    adapter = getattr(self.kv_args, "dcp_transfer", None)
+                    layout_id = adapter.layout_id if adapter is not None else b""
+                    if decode_kv_args.dst_dcp_layout_id != layout_id:
+                        registration_error = (
+                            f"PD DCP layout mismatch: prefill={layout_id!r}, "
+                            f"decode={decode_kv_args.dst_dcp_layout_id!r}"
                         )
-
+                    elif adapter is not None:
                         try:
                             (
                                 decode_kv_args.dcp_token_item_lens,
                                 self._dcp_pack_buffers,
-                            ) = prepare_dsa_token_dcp(
+                            ) = adapter.prepare(
                                 self.kv_args,
                                 decode_kv_args,
                                 pack_buffers=self._dcp_pack_buffers,
@@ -3542,6 +3538,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
     def build_receiver_registration_message(self) -> List[bytes]:
         session_id = self.get_session_id()
+        adapter = getattr(self.kv_args, "dcp_transfer", None)
         packed_kv_data_ptrs = b"".join(
             struct.pack("Q", ptr) for ptr in self.kv_args.kv_data_ptrs
         )
@@ -3613,7 +3610,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 *self.kv_args.kv_item_lens,
             ),
             b"1" if self.kv_args.draft_rows_dcp_collapsed else b"0",
-            *([b"1"] if self.kv_args.npu_dsa_dcp_target_buffers is not None else []),
+            *([adapter.layout_id] if adapter is not None else []),
         ]
 
     def build_receiver_metadata_message(

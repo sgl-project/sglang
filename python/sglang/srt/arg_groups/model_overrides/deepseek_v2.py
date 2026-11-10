@@ -107,12 +107,6 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                     )
 
     if is_deepseek_dsa(hf_config):  # DeepSeek 3.2/GLM 5
-        if get_platform().is_npu:
-            from sglang.srt.hardware_backend.npu.dsa_dcp_config import (
-                validate_dsa_token_dcp_config,
-            )
-
-            validate_dsa_token_dcp_config(cfg)
         if not is_kimi_k31(hf_config):
             overrides.update(_dsa_dcp_overrides(cfg))
         # Set attention backend for DeepSeek

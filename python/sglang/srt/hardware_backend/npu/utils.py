@@ -9,6 +9,9 @@ import torch
 from sglang.srt.arg_groups.model_override_base import resolving_view, use_mla_backend
 from sglang.srt.arg_groups.overrides import declare_resolution
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.npu.dsa_dcp_config import (
+    validate_dsa_token_dcp_config,
+)
 from sglang.srt.model_executor.cuda_graph_config import Phase, with_phase
 from sglang.srt.utils import get_npu_memory_capacity, is_npu
 
@@ -78,6 +81,7 @@ def set_default_server_args(args: "ServerArgs"):
     Set default server arguments for NPU backend.
     """
 
+    validate_dsa_token_dcp_config(args)
     cfg = resolving_view(args)
 
     # NPU only works with "ascend" attention backend for now

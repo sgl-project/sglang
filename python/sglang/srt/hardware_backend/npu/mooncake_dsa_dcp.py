@@ -1,8 +1,11 @@
 """Mooncake token-interleaved DSA DCP transfer on Ascend."""
 
+from functools import partial
+
 import numpy as np
 import torch
 
+from sglang.srt.disaggregation.base.conn import DCPTransferAdapter
 from sglang.srt.disaggregation.common.utils import group_concurrent_contiguous
 from sglang.srt.disaggregation.utils import resolve_dcp_dst_entry_indices
 from sglang.srt.utils import device_stream_context
@@ -45,11 +48,11 @@ def _pack_rows(pack_buffer, buffers, src_indices, token_widths):
     return packed_ptrs, np.arange(count, dtype=np.int64)
 
 
-def prepare_dsa_token_dcp(kv_args, peer, *, pack_buffers, num_workers, register):
-    buffers = kv_args.npu_dsa_dcp_target_buffers
+def _prepare_dsa_token_dcp(
+    kv_args, peer, *, target_buffers, pack_buffers, num_workers, register
+):
     if (
-        not buffers
-        or not peer.dst_npu_dsa_token_dcp
+        not target_buffers
         or not peer.requires_dcp_relayout
         or peer.dst_draft_rows_dcp_collapsed
     ):
@@ -68,7 +71,7 @@ def prepare_dsa_token_dcp(kv_args, peer, *, pack_buffers, num_workers, register)
     for ptr, src_bytes, dst_entry in zip(
         kv_args.kv_data_ptrs, kv_args.kv_item_lens, entries
     ):
-        scale = 1 if ptr in buffers else peer.dst_dcp_size
+        scale = 1 if ptr in target_buffers else peer.dst_dcp_size
         width, remainder = divmod(src_bytes, kv_args.page_size)
         if remainder or width <= 0 or dst_entry >= len(peer.dst_kv_item_lens):
             raise ValueError("Invalid NPU DSA token DCP page geometry")
@@ -92,7 +95,7 @@ def prepare_dsa_token_dcp(kv_args, peer, *, pack_buffers, num_workers, register)
     return widths, pack_buffers
 
 
-def send_dsa_token_dcp(
+def _send_dsa_token_dcp(
     *, transfer_data, plan, src_ptrs, dst_ptrs, widths, pack_buffer, target_buffers
 ) -> int:
     entries = list(zip(src_ptrs, dst_ptrs, widths, strict=True))
@@ -145,3 +148,14 @@ def send_dsa_token_dcp(
             replicas, plan.draft_src_token_indices, plan.draft_dst_token_indices
         )
     return 0
+
+
+def build_dsa_token_dcp_transfer(
+    target_buffers: dict[int, torch.Tensor],
+) -> DCPTransferAdapter:
+    return DCPTransferAdapter(
+        # Preserve the layout ID sent by the first experimental implementation.
+        layout_id=b"1",
+        prepare=partial(_prepare_dsa_token_dcp, target_buffers=target_buffers),
+        send=partial(_send_dsa_token_dcp, target_buffers=target_buffers),
+    )

@@ -1014,7 +1014,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             for _, uses_global_slots in self._get_disagg_buffer_entries()
         ]
 
-    def get_pd_dcp_target_buffers(self) -> dict[int, torch.Tensor] | None:
+    def get_pd_dcp_transfer_adapter(self):
         if (
             self.index_head_dim is None
             or not envs.SGLANG_NPU_DSA_DCP_TOKEN_INTERLEAVE.get()
@@ -1022,11 +1022,17 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             return None
         if self.use_fia_nz:
             raise ValueError("NPU DSA token PD requires a row-contiguous KV pool.")
-        return {
-            buffer.data_ptr(): buffer
-            for buffer, uses_global_slots in self._get_disagg_buffer_entries()
-            if not uses_global_slots
-        }
+        from sglang.srt.hardware_backend.npu.mooncake_dsa_dcp import (
+            build_dsa_token_dcp_transfer,
+        )
+
+        return build_dsa_token_dcp_transfer(
+            {
+                buffer.data_ptr(): buffer
+                for buffer, uses_global_slots in self._get_disagg_buffer_entries()
+                if not uses_global_slots
+            }
+        )
 
     def get_kv_layer_ids(self):
         return (

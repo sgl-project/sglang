@@ -3,7 +3,7 @@ from __future__ import annotations
 import dataclasses
 import enum
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
 
 import numpy as np
 import numpy.typing as npt
@@ -11,8 +11,6 @@ import numpy.typing as npt
 from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
-    import torch
-
     from sglang.srt.disaggregation.mode import DisaggregationMode
 
 
@@ -57,6 +55,15 @@ class KVTransferDestination(str, enum.Enum):
     HOST = "host"
 
 
+@dataclasses.dataclass(frozen=True)
+class DCPTransferAdapter:
+    """Optional device implementation for a PD DCP layout."""
+
+    layout_id: bytes
+    prepare: Callable[..., Tuple[List[int], List]]
+    send: Callable[..., int]
+
+
 class KVArgs:
     engine_rank: int
     kv_data_ptrs: List[int]
@@ -93,7 +100,7 @@ class KVArgs:
     # None when the SWA state is not held in an MHA sub-pool.
     swa_kv_cache_layout: Optional[str]
     dsa_index_k_token_bytes: Optional[Tuple[int, int]] = None
-    npu_dsa_dcp_target_buffers: Optional[dict[int, torch.Tensor]] = None
+    dcp_transfer: Optional[DCPTransferAdapter] = None
     ib_device: str
     gpu_id: int
     kv_head_num: int
