@@ -12,7 +12,10 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from sglang.kernels.ops.speculative.dflash import selector_walk_triton
+from sglang.kernels.ops.speculative.dflash import (
+    dflash_grouped_conv,
+    selector_walk_triton,
+)
 from sglang.kernels.ops.speculative.lilicorr import lilicorr_topk_lse
 from sglang.srt.configs.draft_parallel import DraftParallelSpec, DraftTPExecution
 from sglang.srt.configs.laguna import normalize_gating
@@ -702,6 +705,15 @@ class DFlashGroupedConv(nn.Module):
         )
 
     def _convolve(self, hidden_states, delta, side: int) -> torch.Tensor:
+        if hidden_states.is_cuda and hidden_states.dim() == 2:
+            return dflash_grouped_conv(
+                hidden_states,
+                delta,
+                self.base_kernel[side],
+                self.block_size,
+                self.group_size,
+                self.taps,
+            )
         # Marked here, not inside: by the time the compiled function traces, the dim
         # is symbolic and the group index costs an integer div and mod per element.
         torch._dynamo.mark_static(hidden_states, 1)
