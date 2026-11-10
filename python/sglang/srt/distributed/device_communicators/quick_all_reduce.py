@@ -87,6 +87,7 @@ class QuickAllReduce:
         are in the same node.
         """
         self.disabled = True
+        self.first_min_bytes = envs.SGLANG_ROCM_QUICK_REDUCE_FIRST_MIN_BYTES.get()
         if not qr_rocm_arch_available():
             logger.debug(
                 "Custom quick allreduce is only supported on ROCm MI300 series."
@@ -252,8 +253,9 @@ class QuickAllReduce:
     def should_quick_allreduce_first(self, inp: torch.Tensor) -> bool:
         """Whether ``inp`` takes quick all-reduce ahead of the custom all-reduce:
         it is at least SGLANG_ROCM_QUICK_REDUCE_FIRST_MIN_BYTES (0 = never)."""
-        first_min = envs.SGLANG_ROCM_QUICK_REDUCE_FIRST_MIN_BYTES.get()
-        return first_min > 0 and self.should_quick_allreduce(inp, min_size=first_min)
+        return self.first_min_bytes > 0 and self.should_quick_allreduce(
+            inp, min_size=self.first_min_bytes
+        )
 
     def quick_all_reduce(self, inp: torch.Tensor, *, out: torch.Tensor = None):
         """Performs an out-of-place custom quick all reduce."""

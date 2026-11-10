@@ -171,7 +171,7 @@ def test_custom_allreduce_precedes_symmetric_memory_pynccl():
     coordinator.pynccl_comm.all_reduce.assert_not_called()
 
 
-def _quick_all_reduce_tp4_int4(monkeypatch):
+def _quick_all_reduce_tp4_int4(monkeypatch, first_min_bytes):
     from sglang.srt.distributed.device_communicators.quick_all_reduce import (
         MB,
         QuickAllReduce,
@@ -192,6 +192,7 @@ def _quick_all_reduce_tp4_int4(monkeypatch):
     quick_reduce.qr_quant_level = QuickReduceRegime.INT4
     quick_reduce.use_fp16_kernels = 1
     quick_reduce.qr_max_size = 2048 * MB
+    quick_reduce.first_min_bytes = first_min_bytes
     return quick_reduce
 
 
@@ -221,9 +222,8 @@ def _coordinator_with_custom_allreduce(qr_comm):
 def test_quick_allreduce_first_min_bytes_precedes_custom_allreduce(
     monkeypatch, first_min_bytes, rows, method
 ):
-    monkeypatch.setenv("SGLANG_ROCM_QUICK_REDUCE_FIRST_MIN_BYTES", str(first_min_bytes))
     coordinator = _coordinator_with_custom_allreduce(
-        _quick_all_reduce_tp4_int4(monkeypatch)
+        _quick_all_reduce_tp4_int4(monkeypatch, first_min_bytes)
     )
     input_ = torch.empty(rows, 5120, dtype=torch.bfloat16)
     assert coordinator._resolve_outplace_all_reduce_method(input_) == method
@@ -237,9 +237,8 @@ def test_quick_allreduce_first_min_bytes_precedes_custom_allreduce(
 def test_quick_allreduce_first_min_bytes_keeps_kernel_input_rules(
     monkeypatch, shape, dtype
 ):
-    monkeypatch.setenv("SGLANG_ROCM_QUICK_REDUCE_FIRST_MIN_BYTES", str(1 << 20))
     coordinator = _coordinator_with_custom_allreduce(
-        _quick_all_reduce_tp4_int4(monkeypatch)
+        _quick_all_reduce_tp4_int4(monkeypatch, 1 << 20)
     )
     input_ = torch.empty(shape, dtype=dtype)
     assert coordinator._resolve_outplace_all_reduce_method(input_) == "ca"
