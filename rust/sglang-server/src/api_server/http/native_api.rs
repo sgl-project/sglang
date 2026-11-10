@@ -676,6 +676,19 @@ async fn generate(
     }
 }
 
+/// Whether Python reads `sampling_logprobs_mode` as set: any value but `null`,
+/// or for a batch of `n` prompts a list naming a mode for one of them (Python
+/// reads no entry past them; an empty list is set, being no per-prompt list).
+fn sampling_logprobs_mode_set(mode: &serde_json::Value, batch: Option<usize>) -> bool {
+    match (mode, batch) {
+        (serde_json::Value::Null, _) => false,
+        (serde_json::Value::Array(modes), Some(n)) => {
+            modes.is_empty() || modes.iter().take(n).any(|mode| !mode.is_null())
+        }
+        _ => true,
+    }
+}
+
 /// Batch item `item`'s share of the `sampling_params` the client sent: the
 /// object itself, or the item's entry of a list.
 fn item_sampling_params(
@@ -744,6 +757,8 @@ pub(super) fn generate_requests(
     if let Err(error) = merge_preferred_sampling(&mut body, &default_max_new_tokens) {
         return Err((StatusCode::INTERNAL_SERVER_ERROR, error, false));
     }
+    // Outside the schema, so decoding drops it; checked below.
+    let sampling_logprobs_mode = body.get("sampling_logprobs_mode").cloned();
     // The schema (sglang_api_types) is the contract: decode errors carry
     // serde's field-level text, as Python's 400s do.
     let body: api::GenerateRequest = match serde_json::from_value(body) {
@@ -754,8 +769,18 @@ pub(super) fn generate_requests(
     // Fan `text`/`input_ids`/`sampling_params` (scalar or list) into per-request
     // payloads. `is_batch` = list form -> the response is a JSON array.
     // Request normalization only returns validation failures.
-    let (mut requests, is_batch) = into_requests(body, &state.generation_policy)
-        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string(), stream))?;
+    let (mut requests, is_batch) = into_requests(body, &state.generation_policy).map_err(|e| {
+        tracing::warn!(error = %e, "rejected request");
+        (StatusCode::BAD_REQUEST, e.to_string(), stream)
+    })?;
+    // Python refuses a mode without `return_sampling_mask=true`, and
+    // `into_requests` refused the mask.
+    let batch = is_batch.then_some(requests.len());
+    if sampling_logprobs_mode.is_some_and(|mode| sampling_logprobs_mode_set(&mode, batch)) {
+        let message = "sampling_logprobs_mode can only be set when return_sampling_mask=true.";
+        tracing::warn!(error = %message, "rejected request");
+        return Err((StatusCode::BAD_REQUEST, message.into(), stream));
+    }
     client_max_new_tokens.mark(&mut requests);
     Ok((requests, is_batch))
 }
@@ -867,7 +892,9 @@ pub(super) async fn drain_unary_frame(
 /// or (streaming) multiplex their streams into one SSE response, each frame carrying
 /// its `index`.
 /// Each submitted call owns its own cancellation. A failed unary item is its
-/// own `{ "error": … }` entry; the batch response is 200.
+/// own `{ "error": … }` entry; the batch response is 200. This differs from
+/// Python on purpose: there, one item failing validation fails the whole batch
+/// with a single 400.
 async fn generate_batch(
     state: &AppState,
     requests: Vec<GenerateRequest>,
@@ -1415,9 +1442,130 @@ mod tests {
         responder.await.unwrap()
     }
 
+    /// A body `/generate` refuses before the core sees it is answered with the
+    /// bare message, as Python's `ValueError` text, in the shape the client
+    /// asked for (a 400, or one in-stream error frame), and logged with the
+    /// reason, as Python's `[http_server] Error:` line is.
+    #[tokio::test]
+    async fn refused_bodies_answer_and_log_the_bare_reason() {
+        let core = crate::api_server::handlers::CoreHandle::new(
+            flume::unbounded().0,
+            flume::unbounded().0,
+            crate::api_server::handlers::CoreConfig {
+                response_capacity: 8,
+                response_activity: Default::default(),
+                startup_ready: true,
+                is_disaggregation: false,
+                mm_limits: Default::default(),
+                multimodal: false,
+                metadata: crate::api_server::handlers::CoreMetadata::default(),
+                metrics: None,
+                peer_endpoints: Vec::new(),
+                request_log: None,
+                generate_validator: None,
+            },
+        );
+        let server_args = crate::message::config::ServerArgs::default();
+        let state = Arc::new(AppState {
+            core,
+            generation_policy: GenerationPolicy::from(&server_args),
+            server_args: Arc::new(server_args),
+            chat_formatter: None,
+            generate_hook: None,
+            openai_chat: None,
+        });
+        let app = routes().with_state(state.clone());
+        for (body, message) in [
+            (
+                serde_json::json!({"text": "hi", "input_ids": [1]}),
+                "provide either `text` or `input_ids`, not both",
+            ),
+            (
+                serde_json::json!({"text": "hi", "custom_logit_processor": "cls"}),
+                "custom_logit_processor is not supported by the Rust server",
+            ),
+            (
+                serde_json::json!({"text": "hi", "sampling_logprobs_mode": "support"}),
+                "sampling_logprobs_mode can only be set when return_sampling_mask=true.",
+            ),
+            (
+                serde_json::json!({"text": "hi", "sampling_logprobs_mode": [null]}),
+                "sampling_logprobs_mode can only be set when return_sampling_mask=true.",
+            ),
+            (
+                serde_json::json!({"text": ["a", "b"], "sampling_logprobs_mode": [null, "support"]}),
+                "sampling_logprobs_mode can only be set when return_sampling_mask=true.",
+            ),
+            (
+                serde_json::json!({
+                    "text": "hi",
+                    "return_sampling_mask": true,
+                    "sampling_logprobs_mode": "support",
+                }),
+                "return_sampling_mask is not supported by the Rust server",
+            ),
+        ] {
+            for stream in [false, true] {
+                let mut body = body.clone();
+                body["stream"] = stream.into();
+                let logs = crate::utils::logging::capture_logs();
+                let request = Request::builder()
+                    .method("POST")
+                    .uri("/generate")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap();
+                let response = app.clone().oneshot(request).await.unwrap();
+                let status = response.status();
+                let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                    .await
+                    .unwrap();
+                let text = std::str::from_utf8(&bytes).unwrap();
+                let error = if stream {
+                    assert_eq!(status, StatusCode::OK, "{body}");
+                    let frame = text
+                        .strip_prefix("data: ")
+                        .and_then(|rest| rest.strip_suffix("\n\ndata: [DONE]\n\n"))
+                        .unwrap_or_else(|| panic!("one error frame then [DONE]: {text}"));
+                    parse(frame)
+                } else {
+                    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+                    parse(text)
+                };
+                assert_eq!(error["error"]["message"], message, "{body}");
+                assert_eq!(error["error"]["code"], 400, "{body}");
+                let rejections = logs.rejections();
+                assert!(
+                    matches!(rejections.as_slice(), [line] if line.contains("WARN") && line.contains(message)),
+                    "{rejections:?}"
+                );
+            }
+        }
+        // A mode Python reads as unset passes.
+        for body in [
+            serde_json::json!({"text": "hi", "sampling_logprobs_mode": null}),
+            serde_json::json!({"text": ["a", "b"], "sampling_logprobs_mode": [null, null, "support"]}),
+        ] {
+            assert!(generate_requests(&state, body.clone()).is_ok(), "{body}");
+        }
+        // A body the schema refuses is refused as such first, unlogged, as
+        // Python's contract check is.
+        let logs = crate::utils::logging::capture_logs();
+        let body = serde_json::json!({
+            "text": "hi",
+            "stream": true,
+            "sampling_params": {"unknown": 1},
+            "sampling_logprobs_mode": "support",
+        });
+        let (status, message, _) = generate_requests(&state, body).unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(message.contains("unknown"), "{message}");
+        assert!(logs.rejections().is_empty());
+    }
+
     /// `/generate` checks the DP rank a body names as Python does: the
     /// deprecated `data_parallel_rank` when `routed_dp_rank` is unset, and a
-    /// rank outside the deployment is a 400 with Python's message.
+    /// rank outside the deployment is a 400 with Python's message, logged once.
     #[tokio::test]
     async fn generate_refuses_a_routed_dp_rank_out_of_range() {
         let state = Arc::new(AppState {
@@ -1451,6 +1599,7 @@ mod tests {
                 2,
             ),
         ] {
+            let logs = crate::utils::logging::capture_logs();
             let request = Request::builder()
                 .method("POST")
                 .uri("/generate")
@@ -1466,9 +1615,15 @@ mod tests {
             let reply = axum::body::to_bytes(response.into_body(), 64 * 1024)
                 .await
                 .unwrap();
+            let message = format!("routed_dp_rank={rank} out of range [0, 1)");
             assert_eq!(
                 parse(std::str::from_utf8(&reply).unwrap())["error"]["message"],
-                format!("routed_dp_rank={rank} out of range [0, 1)")
+                message
+            );
+            let rejections = logs.rejections();
+            assert!(
+                matches!(rejections.as_slice(), [line] if line.contains("WARN") && line.contains(&message)),
+                "{rejections:?}"
             );
         }
     }
@@ -2768,10 +2923,7 @@ mod tests {
         assert_eq!(stream.next().await.unwrap(), "[DONE]");
         // A package's hook hears of the failure, and of the other item's end.
         let log = log.lock().unwrap();
-        assert_eq!(
-            log[0]["failed"],
-            serde_json::json!([400, "validation failed: bad"])
-        );
+        assert_eq!(log[0]["failed"], serde_json::json!([400, "bad"]));
         assert_eq!(log[1]["completion_tokens"], 1);
     }
 

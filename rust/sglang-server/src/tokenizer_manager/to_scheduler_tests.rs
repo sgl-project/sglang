@@ -866,6 +866,49 @@ fn out_of_vocab_input_ids_rejected() {
     }
 }
 
+/// A request refused as the client's fault logs why once, with its rid, as
+/// Python's `[http_server] Error:` line does, and the client reads the bare
+/// message, as Python's `ValueError` text: an intake check, and media the MM
+/// pool refused (which hands the request back failed, unlogged).
+#[test]
+fn client_rejection_logs_its_reason_and_answers_unprefixed() {
+    let (mut intake, _detok_rx, _consumer, _tm_tx, _mm_rx) = make_intake();
+    let mut out_of_vocab = generate_req(23, SamplingParams::default());
+    if let RequestKind::Generate(g) = &mut out_of_vocab.kind {
+        g.input_ids = Some(vec![2_000_000_000]);
+    }
+    let mut refused_media = generate_req(24, SamplingParams::default());
+    refused_media.state =
+        RequestState::Failed(Error::Encode(MediaError::Client("bad media".into())));
+    for (mut req, rid, reason) in [
+        (
+            out_of_vocab,
+            "rid=23",
+            "input_ids contains out-of-vocabulary",
+        ),
+        (refused_media, "rid=24", "bad media"),
+    ] {
+        let (tx, mut rx) = mpsc::channel(8);
+        req.sink = ResponseSink::Local(tx);
+        let logs = crate::utils::logging::capture_logs();
+        intake.drive(req);
+        let Ok(ResponseItem::Error(err)) = rx.try_recv() else {
+            panic!("the client must get the rejection");
+        };
+        let message = err.client_fault_reason().expect("the client's fault");
+        assert!(message.starts_with(reason), "{message}");
+        let rejections = logs.rejections();
+        assert!(
+            matches!(
+                rejections.as_slice(),
+                [line] if line.contains("WARN") && line.contains(rid)
+                    && line.ends_with(&format!("error={message}"))
+            ),
+            "{rejections:?}"
+        );
+    }
+}
+
 /// Same guard for negative ids and for `token_ids_logprob` entries.
 #[test]
 fn negative_and_logprob_token_ids_rejected() {
@@ -1243,6 +1286,37 @@ fn abort_while_in_mm_pool_drops_on_return() {
     );
     assert!(rx.try_recv().is_err(), "no frame for a client that left");
     assert!(detok_rx.try_recv().is_err(), "deregistered exactly once");
+}
+
+/// A request whose client left while it was in the mm pool, and whose media
+/// then failed as the server's fault, is dropped on return without a log line:
+/// the client's abort is not a server failure (the worker logs nothing either).
+#[test]
+fn abort_while_in_mm_pool_then_server_fault_is_not_logged() {
+    let (mut intake, detok_rx, consumer, _tm_tx, mm_rx) = make_intake();
+    let (tx, mut rx) = mpsc::channel(8);
+    let mut req = mm_pretokenized_req("mm-left");
+    req.sink = ResponseSink::Local(tx);
+    intake.drive(req);
+    let mut req = mm_rx.try_recv().expect("sent to the mm pool");
+    assert!(matches!(detok_rx.try_recv(), Ok(DetokMsg::Register { .. })));
+    intake.on_abort(AbortSource::Guard("mm-left".to_string().into()));
+    assert!(matches!(
+        detok_rx.try_recv(),
+        Ok(DetokMsg::Deregister { .. })
+    ));
+
+    req.state
+        .apply(Event::Error(Error::Encode(MediaError::Server(
+            "video decode: out of memory".into(),
+        ))))
+        .unwrap();
+    let logs = crate::utils::logging::capture_logs();
+    intake.drive(req);
+    assert_eq!(logs.text(), "");
+    assert!(rx.try_recv().is_err(), "no frame for a client that left");
+    assert!(detok_rx.try_recv().is_err(), "deregistered exactly once");
+    assert!(consumer.drain(16).is_empty());
 }
 
 /// The same for the tokenizer stage: an abort while the request is in the

@@ -64,9 +64,11 @@ pub async fn abortable_before_generate<T>(
 }
 
 /// The app [`abortable_before_generate`] needs, for tests of an
-/// [`HttpLayer`] outside a running server.
+/// [`HttpLayer`] outside a running server, and the capture of what it logs.
 #[cfg(feature = "test-support")]
 pub mod test_support {
+    pub use crate::utils::logging::{CapturedLogs, capture_logs};
+
     use super::*;
     use crate::api_server::handlers::{AbortEnding, CoreConfig, CoreMetadata};
     use crate::tokenizer_manager::wiring::{AbortSource, TmEvent};
