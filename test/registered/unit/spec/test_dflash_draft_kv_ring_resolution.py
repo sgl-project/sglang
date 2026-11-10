@@ -1,4 +1,4 @@
-"""SGLANG_DFLASH_DRAFT_KV_RING resolution and budget.
+"""SGLANG_ENABLE_DFLASH_DRAFT_KV_RING resolution and budget.
 
 The ring is resolved once at startup: on by default for an all-sliding MLA
 draft on trtllm_mla / cutedsl_mla, off (with a log line) where it is not
@@ -27,7 +27,7 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 HOOK_MODULE = "sglang.srt.arg_groups.speculative_hook"
 KVC_MODULE = "sglang.srt.mem_cache.kv_cache_configurator"
-FLAG = "SGLANG_DFLASH_DRAFT_KV_RING"
+FLAG = "SGLANG_ENABLE_DFLASH_DRAFT_KV_RING"
 SWA_MLA_DRAFT = {
     "num_hidden_layers": 5,
     "dflash_config": {"attention_mode": "mla"},
@@ -60,7 +60,7 @@ class TestResolveDraftKVRing(CustomTestCase):
     def _resolve(self, args, draft_cfg=SWA_MLA_DRAFT) -> bool:
         with patch(f"{HOOK_MODULE}._load_draft_hf_config", return_value=draft_cfg):
             _resolve_dflash_draft_kv_ring(args)
-        return envs.SGLANG_DFLASH_DRAFT_KV_RING.get()
+        return envs.SGLANG_ENABLE_DFLASH_DRAFT_KV_RING.get()
 
     def test_on_by_default_for_a_sliding_mla_draft(self):
         for backend in ("cutedsl_mla", "trtllm_mla"):

@@ -102,7 +102,7 @@ export const KimiK31MambaRatioCalculator = () => {
       Number(flagArg("--speculative-dflash-block-size")) ||
       Number(flagArg("--speculative-num-draft-tokens")) || 8;
     const drafts = specOn && !replaySpec && pdRole !== "prefill" ? block : 0;
-    const ringOn = specOn && !env.some((e) => e.startsWith("SGLANG_DFLASH_DRAFT_KV_RING=0"));
+    const ringOn = specOn && !env.some((e) => e.startsWith("SGLANG_ENABLE_DFLASH_DRAFT_KV_RING=0"));
 
     const ssmBytes = ssmDtype === "float32" ? 4 : 2;
     // Fixed K3.1 geometry:

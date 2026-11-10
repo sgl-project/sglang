@@ -1119,14 +1119,14 @@ def _resolve_dflash_mla_draft_window(server_args: ServerArgs) -> None:
 
 
 def _resolve_dflash_draft_kv_ring(server_args: ServerArgs) -> None:
-    """Settle SGLANG_DFLASH_DRAFT_KV_RING once, before any worker starts, so
+    """Settle SGLANG_ENABLE_DFLASH_DRAFT_KV_RING once, before any worker starts, so
     every process agrees. Runs after the draft backend and the compact window
     are final."""
     from sglang.srt.speculative.dflash_draft_ring import (
         draft_kv_ring_unsupported_reason,
     )
 
-    flag = envs.SGLANG_DFLASH_DRAFT_KV_RING
+    flag = envs.SGLANG_ENABLE_DFLASH_DRAFT_KV_RING
     if not flag.get():
         return
     cfg = resolving_view(server_args)
@@ -1141,7 +1141,7 @@ def _resolve_dflash_draft_kv_ring(server_args: ServerArgs) -> None:
         logger.info("DFLASH draft KV ring: on.")
         return
     if flag.is_set():
-        raise ValueError(f"SGLANG_DFLASH_DRAFT_KV_RING=1, but {reason}.")
+        raise ValueError(f"SGLANG_ENABLE_DFLASH_DRAFT_KV_RING=1, but {reason}.")
     logger.info("DFLASH draft KV ring: off, %s.", reason)
     flag.set(False)
 

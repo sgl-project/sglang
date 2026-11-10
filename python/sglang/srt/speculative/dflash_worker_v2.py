@@ -718,7 +718,7 @@ class DFlashWorkerV2(BaseSpecWorker):
     def _init_draft_kv_ring(self) -> None:
         if self.use_compact_draft_cache:
             raise ValueError(
-                "SGLANG_DFLASH_DRAFT_KV_RING replaces the compact draft table; "
+                "SGLANG_ENABLE_DFLASH_DRAFT_KV_RING replaces the compact draft table; "
                 "drop --speculative-draft-window-size."
             )
         parallel = get_parallel()
@@ -726,7 +726,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         pool = self.draft_model_runner.token_to_kv_pool
         if dcp_size > 1 and not pool.rows_are_dcp_collapsed:
             raise ValueError(
-                "SGLANG_DFLASH_DRAFT_KV_RING under DCP needs DCP-collapsed draft rows."
+                "SGLANG_ENABLE_DFLASH_DRAFT_KV_RING under DCP needs DCP-collapsed draft rows."
             )
         window_left = draft_kv_ring_window_left(
             self.draft_model_runner.model_config.hf_config

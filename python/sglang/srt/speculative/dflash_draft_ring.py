@@ -28,7 +28,7 @@ from sglang.srt.environ import envs
 
 def draft_kv_ring_enabled() -> bool:
     """The flag as resolved at startup (``_resolve_dflash_draft_kv_ring``)."""
-    return envs.SGLANG_DFLASH_DRAFT_KV_RING.get()
+    return envs.SGLANG_ENABLE_DFLASH_DRAFT_KV_RING.get()
 
 
 def draft_kv_ring_unsupported_reason(
@@ -74,7 +74,7 @@ def draft_kv_ring_window_left(draft_hf_config) -> int:
     layer_types = get_dflash_layer_types(draft_hf_config)
     if not layer_types or any(t != "sliding_attention" for t in layer_types):
         raise ValueError(
-            "SGLANG_DFLASH_DRAFT_KV_RING needs a draft whose every layer is "
+            "SGLANG_ENABLE_DFLASH_DRAFT_KV_RING needs a draft whose every layer is "
             f"sliding_attention; got layer_types={layer_types}."
         )
     return get_dflash_attention_sliding_window_size(draft_hf_config)

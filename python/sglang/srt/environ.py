@@ -1771,7 +1771,7 @@ class Envs:
     # Keep an all-sliding-window MLA DFLASH draft's KV in a per-request ring of
     # window + verify-block rows instead of one row per target slot. On by default;
     # resolved at startup to off for drafts or backends it does not fit.
-    SGLANG_DFLASH_DRAFT_KV_RING = EnvBool(True)
+    SGLANG_ENABLE_DFLASH_DRAFT_KV_RING = EnvBool(True)
     # Compute a draft block's ring locs in one Triton launch; off by default.
     SGLANG_OPT_DFLASH_RING_LOCS_FUSED = EnvBool(False)
     # Skip the SWA draft's LSE and zero-KV fixup when DCP is off.
