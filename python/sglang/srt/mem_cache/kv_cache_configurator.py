@@ -823,23 +823,12 @@ class KVCacheConfigurator:
                 )
 
         if self._uses_dflash_draft_kv_ring() and req_to_token_pool is not None:
-            from sglang.srt.speculative.dflash_draft_ring import (
-                draft_kv_ring_pool_rows,
-                draft_kv_ring_rows_per_req,
-                draft_kv_ring_window_left,
-            )
-
             # The draft keeps a per-request ring of rows, not one per target slot.
-            rows_per_req = draft_kv_ring_rows_per_req(
-                window_left=draft_kv_ring_window_left(self.model_config.hf_config),
-                block_size=int(get_spec().speculative_num_draft_tokens),
-                dcp_size=get_parallel().attn_dcp_size,
-            )
             sizes = msgspec.structs.replace(
                 sizes,
-                max_total_num_tokens=draft_kv_ring_pool_rows(
-                    req_pool_rows=req_to_token_pool.req_to_token.shape[0],
-                    rows_per_req=rows_per_req,
+                max_total_num_tokens=self._dflash_draft_kv_ring_rows(
+                    draft_hf_config=self.model_config.hf_config,
+                    req_to_token_rows=req_to_token_pool.req_to_token.shape[0],
                     page_size=max(int(self.pool_page_size or 1), 1),
                 ),
             )
@@ -1519,16 +1508,29 @@ class KVCacheConfigurator:
             return 2 * max_running_requests
         return max_running_requests
 
+    def _req_pool_pre_alloc_size(self) -> Optional[int]:
+        """Pre-alloc rows of a PD decode req pool (0 for any other pool)."""
+        disagg = get_disagg()
+        # A flip-capable prefill needs the decode pool shape, and the extra-slot
+        # default is only computed for a decode launch.
+        if disagg.enable_pd_role_switch:
+            return disagg.disaggregation_decode_extra_slots or 0
+        if disagg.disaggregation_mode == "decode":
+            return disagg.disaggregation_decode_extra_slots
+        return 0
+
+    def _req_to_token_rows(self, max_running_requests: int) -> int:
+        """req_to_token rows of the pool built for max_running_requests: the
+        request rows, the PD pre-alloc rows and the padding row."""
+        pre_alloc_size = self._req_pool_pre_alloc_size() or 0
+        return self._req_pool_rows(max_running_requests) + pre_alloc_size + 1
+
     def _build_req_to_token_pool(self, *, max_num_reqs: int) -> ReqToTokenPool:
         extra_max_context_len = get_req_to_token_extra_context_len()
 
         disagg = get_disagg()
         if disagg.disaggregation_mode == "decode" or disagg.enable_pd_role_switch:
-            # A flip-capable prefill needs the decode pool shape, and the extra-slot
-            # default is only computed for a decode launch.
-            pre_alloc_size = disagg.disaggregation_decode_extra_slots
-            if disagg.enable_pd_role_switch:
-                pre_alloc_size = pre_alloc_size or 0
+            pre_alloc_size = self._req_pool_pre_alloc_size()
             if self.mambaish_config:
                 return self._build_hybrid_mamba_decode_req_pool(
                     max_num_reqs=max_num_reqs,
@@ -2755,39 +2757,48 @@ class KVCacheConfigurator:
     def _uses_dflash_draft_kv_ring(self) -> bool:
         return self.is_draft_worker and get_spec().speculative_dflash_draft_kv_ring
 
-    def _dflash_draft_kv_ring_bytes(self) -> int:
-        """The draft runner's KV ring, charged to the target's budget like the
-        other per-request fixed pools: rows for every req pool row (+1: the
-        pool's padding slot) and the pool's padding page."""
-        if self.is_draft_worker or not get_spec().speculative_dflash_draft_kv_ring:
-            return 0
+    def _dflash_draft_kv_ring_rows(
+        self, *, draft_hf_config, req_to_token_rows: int, page_size: int
+    ) -> int:
+        """Rows of a DFLASH draft KV pool holding one ring per req_to_token row.
+        The target's budget charge and the draft's allocation both size it here."""
         from sglang.srt.speculative.dflash_draft_ring import (
             draft_kv_ring_pool_rows,
             draft_kv_ring_rows_per_req,
             draft_kv_ring_window_left,
         )
 
+        rows_per_req = draft_kv_ring_rows_per_req(
+            window_left=draft_kv_ring_window_left(draft_hf_config),
+            block_size=int(get_spec().speculative_num_draft_tokens),
+            dcp_size=get_parallel().attn_dcp_size,
+        )
+        return draft_kv_ring_pool_rows(
+            req_pool_rows=req_to_token_rows,
+            rows_per_req=rows_per_req,
+            page_size=page_size,
+        )
+
+    def _dflash_draft_kv_ring_bytes(self) -> int:
+        """The draft runner's KV ring, charged to the target's budget like the
+        other per-request fixed pools, with the pool's padding page."""
+        if self.is_draft_worker or not get_spec().speculative_dflash_draft_kv_ring:
+            return 0
         draft_model_config = self.spec_aux_config.draft_model_config
         cell_size = self.dflash_draft_cell_size_per_token
         if draft_model_config is None or not cell_size:
             return 0
-        rows_per_req = draft_kv_ring_rows_per_req(
-            window_left=draft_kv_ring_window_left(draft_model_config.hf_config),
-            block_size=int(get_spec().speculative_num_draft_tokens),
-            dcp_size=get_parallel().attn_dcp_size,
-        )
         max_num_reqs = max(1, get_schedule().max_running_requests // self.attn_dp_size)
         page_size = get_schedule().page_size * self.dflash_draft_loc_space_scale
-        rows = draft_kv_ring_pool_rows(
-            req_pool_rows=self._req_pool_rows(max_num_reqs) + 1,
-            rows_per_req=rows_per_req,
+        rows = self._dflash_draft_kv_ring_rows(
+            draft_hf_config=draft_model_config.hf_config,
+            req_to_token_rows=self._req_to_token_rows(max_num_reqs),
             page_size=page_size,
         )
         ring_bytes = (rows + page_size) * int(cell_size)
         logger.info(
-            "DFLASH draft KV ring: %d rows per request, %.2f GB charged to the KV "
-            "budget.",
-            rows_per_req,
+            "DFLASH draft KV ring: %d rows, %.2f GB charged to the KV budget.",
+            rows,
             ring_bytes / (1 << 30),
         )
         return ring_bytes

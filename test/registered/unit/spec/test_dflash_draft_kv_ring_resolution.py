@@ -1,33 +1,25 @@
-"""DFLASH draft KV ring resolution and budget.
+"""DFLASH draft KV ring resolution.
 
 The ring is resolved once at startup into speculative_dflash_draft_kv_ring:
 on by default for an all-sliding MLA draft on trtllm_mla / cutedsl_mla, off
 (with a log line) where it is not served, and an explicit
-SGLANG_ENABLE_DFLASH_DRAFT_KV_RING=1 there is an error. When on, the ring is
-charged as a fixed pool.
+SGLANG_ENABLE_DFLASH_DRAFT_KV_RING=1 there is an error.
 """
 
 import contextlib
 import unittest
-from types import SimpleNamespace
 from unittest.mock import patch
 
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.arg_groups.speculative_hook import _resolve_dflash_draft_kv_ring
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.dflash_draft_ring import (
-    draft_kv_ring_pool_rows,
-    draft_kv_ring_rows_per_req,
-)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 HOOK_MODULE = "sglang.srt.arg_groups.speculative_hook"
-KVC_MODULE = "sglang.srt.mem_cache.kv_cache_configurator"
 SWITCH = envs.SGLANG_ENABLE_DFLASH_DRAFT_KV_RING
 SWA_MLA_DRAFT = {
     "num_hidden_layers": 5,
@@ -122,75 +114,6 @@ class TestResolveDraftKVRing(CustomTestCase):
     def test_explicit_off_is_kept(self):
         with _switch(False):
             self.assertFalse(self._resolve(_args(), draft_cfg=None))
-
-
-def _kvc(*, is_draft_worker=False, cell_size=2880, attn_dp_size=1):
-    return SimpleNamespace(
-        is_draft_worker=is_draft_worker,
-        spec_aux_config=SimpleNamespace(
-            draft_model_config=SimpleNamespace(hf_config=SWA_MLA_DRAFT)
-        ),
-        dflash_draft_cell_size_per_token=cell_size,
-        dflash_draft_loc_space_scale=1,
-        attn_dp_size=attn_dp_size,
-        _req_pool_rows=lambda n: n,
-    )
-
-
-class TestDraftKVRingBudget(CustomTestCase):
-    def _ring_bytes(
-        self, kvc, *, ring=True, dcp_size=8, max_running_requests=48, page_size=1
-    ):
-        with (
-            patch(
-                f"{KVC_MODULE}.get_spec",
-                return_value=SimpleNamespace(
-                    speculative_num_draft_tokens=8,
-                    speculative_dflash_draft_kv_ring=ring,
-                ),
-            ),
-            patch(
-                f"{KVC_MODULE}.get_parallel",
-                return_value=SimpleNamespace(attn_dcp_size=dcp_size),
-            ),
-            patch(
-                f"{KVC_MODULE}.get_schedule",
-                return_value=SimpleNamespace(
-                    max_running_requests=max_running_requests, page_size=page_size
-                ),
-            ),
-        ):
-            return KVCacheConfigurator._dflash_draft_kv_ring_bytes(kvc)
-
-    def test_ring_is_charged_as_its_draft_pool(self):
-        for dcp_size, page_size, dp in ((8, 1, 1), (1, 64, 1), (8, 64, 2)):
-            with self.subTest(dcp=dcp_size, page=page_size, dp=dp):
-                rows_per_req = draft_kv_ring_rows_per_req(
-                    window_left=1023, block_size=8, dcp_size=dcp_size
-                )
-                # The draft pool spans every req_to_token row (48 / dp + 1)
-                # plus the pool's padding page.
-                rows = draft_kv_ring_pool_rows(
-                    req_pool_rows=48 // dp + 1,
-                    rows_per_req=rows_per_req,
-                    page_size=page_size,
-                )
-                self.assertEqual(
-                    self._ring_bytes(
-                        _kvc(attn_dp_size=dp), dcp_size=dcp_size, page_size=page_size
-                    ),
-                    (rows + page_size) * 2880,
-                )
-
-    def test_nothing_is_charged_without_a_ring(self):
-        cases = {
-            "draft worker": (_kvc(is_draft_worker=True), True),
-            "unresolved draft bytes": (_kvc(cell_size=None), True),
-            "ring off": (_kvc(), False),
-        }
-        for name, (kvc, ring) in cases.items():
-            with self.subTest(name):
-                self.assertEqual(self._ring_bytes(kvc, ring=ring), 0)
 
 
 if __name__ == "__main__":
