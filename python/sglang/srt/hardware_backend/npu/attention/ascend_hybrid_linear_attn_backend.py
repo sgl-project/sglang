@@ -238,6 +238,7 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
         mamba_steps_to_track: Optional[torch.Tensor],
         model,
         req_pool_indices: Optional[torch.Tensor] = None,
+        state_slots=None,
     ):
         """
         Update mamba states after MTP verify using fully fused Triton kernel.
@@ -248,14 +249,16 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
         - index_select kernel launches
         - nonzero kernel launches
         """
-        del req_pool_indices  # accepted for hook parity; slots come from metadata
+        del req_pool_indices  # accepted for hook parity
         request_number = last_correct_step_indices.shape[0]
 
-        state_indices_tensor = (
-            self.linear_attn_backend.forward_metadata.mamba_cache_indices[
-                :request_number
-            ]
-        )
+        if state_slots is None:
+            state_slots = self.forward_state_slots(request_number, mamba_track_indices)
+        state_indices_tensor = state_slots.working[:request_number]
+        # Checkpoints go to the slots the same forward resolved.
+        if mamba_track_indices is not None:
+            assert state_slots.track is not None
+            mamba_track_indices = state_slots.track[:request_number]
 
         mamba_caches = self.linear_attn_backend.state_pool.get_speculative_mamba2_params_all_layers()
 

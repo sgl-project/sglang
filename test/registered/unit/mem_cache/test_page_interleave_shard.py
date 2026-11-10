@@ -88,6 +88,7 @@ from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
+from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
@@ -1127,9 +1128,9 @@ class TestShardedAllocationEviction(CustomTestCase):
         initial_available = allocator.available_size()
         self.assertEqual(initial_available, GS)
 
-        # The shortfall is smaller than the initial free capacity: treating
-        # it as the absolute target would incorrectly skip eviction.
-        result = tree.evict_for_alloc(EvictParams(num_tokens=PS))
+        # A demand one page past the free capacity: the min-class capacity
+        # rises only once the tight class gets a page back.
+        result = tree.evict_for_alloc(KVDemand(full_tokens=initial_available + PS))
 
         self.assertGreaterEqual(allocator.available_size(), initial_available + PS)
         self.assertEqual(allocator.class_free_page_counts(), [2, 3, 4, 4])
@@ -1139,7 +1140,9 @@ class TestShardedAllocationEviction(CustomTestCase):
     def test_allocation_eviction_stops_when_tight_class_cannot_be_reclaimed(self):
         tree, allocator = self._cache_with_imbalanced_classes(cache_tight_page=False)
 
-        result = tree.evict_for_alloc(EvictParams(num_tokens=PS))
+        result = tree.evict_for_alloc(
+            KVDemand(full_tokens=allocator.available_size() + PS)
+        )
 
         self.assertEqual(allocator.available_size(), GS)
         self.assertEqual(allocator.class_free_page_counts(), [1, 3, 4, 4])
@@ -2158,6 +2161,7 @@ class TestOwnerMatchedLoadBack(CustomTestCase):
         host = _host_pool(0).alloc(5 * PS, start_owner=2)
         controller = SimpleNamespace(
             mem_pool_device_allocator=_make_allocator(),
+            kv_storage=None,
             device="cpu",
             load_queue=[],
             _resolve_device_transfers=lambda *args, **kwargs: None,

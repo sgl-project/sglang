@@ -6,7 +6,7 @@ from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
 )
 from sglang.test.ascend.e2e.test_npu_multi_node_utils import NIC_NAME
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
-    GLM_5_2_W8A8_MODEL_PATH,
+    GLM_5_3_W8A8_MODEL_PATH,
 )
 from sglang.test.ci.ci_register import register_npu_ci
 
@@ -17,7 +17,7 @@ register_npu_ci(
     disabled="accuracy testcase",
 )
 
-GLM_5_2_W8A8_16P_TWO_NODE_ENVS = {
+GLM_5_3_W8A8_16P_TWO_NODE_ENVS = {
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
     "STREAMS_PER_DEVICE": "32",
     "SGLANG_SET_CPU_AFFINITY": "1",
@@ -33,7 +33,10 @@ GLM_5_2_W8A8_16P_TWO_NODE_ENVS = {
     "GLOO_SOCKET_IFNAME": NIC_NAME,
 }
 
-GLM_5_2_W8A8_16P_TWO_NODE_OTHER_ARGS = [
+# NOTE: the GLM-5.3-w8a8 MTP layer is W8A8_DYNAMIC in the checkpoint; do NOT
+# set --speculative-draft-model-quantization unquant (draft load would fail).
+# The draft inherits --quantization modelslim by default.
+GLM_5_3_W8A8_16P_TWO_NODE_OTHER_ARGS = [
     "--attention-backend",
     "ascend",
     "--device",
@@ -54,7 +57,7 @@ GLM_5_2_W8A8_16P_TWO_NODE_OTHER_ARGS = [
     "--context-length",
     135000,
     "--served-model-name",
-    "glm-5.2-w8a8",
+    "glm-5.3-w8a8",
     "--cuda-graph-max-bs-decode",
     4,
     "--max-running-requests",
@@ -81,26 +84,31 @@ GLM_5_2_W8A8_16P_TWO_NODE_OTHER_ARGS = [
     1,
     "--speculative-num-draft-tokens",
     4,
-    "--speculative-draft-model-quantization",
-    "unquant",
 ]
 
-GLM_5_2_W8A8_16P_TWO_NODE_MODEL_CONFIG = {
-    "model_path": GLM_5_2_W8A8_MODEL_PATH,
-    "other_args": GLM_5_2_W8A8_16P_TWO_NODE_OTHER_ARGS,
-    "node_envs": GLM_5_2_W8A8_16P_TWO_NODE_ENVS,
+GLM_5_3_W8A8_16P_TWO_NODE_MODEL_CONFIG = {
+    "model_path": GLM_5_3_W8A8_MODEL_PATH,
+    "other_args": GLM_5_3_W8A8_16P_TWO_NODE_OTHER_ARGS,
+    "node_envs": GLM_5_3_W8A8_16P_TWO_NODE_ENVS,
 }
 
 
-class TestNPUGLM_5_2_W8A8_16P_GPQA(TestNpuAccuracyMultiNodePdMixTestCaseBase):
-    """Test NPU accuracy for GLM-5.2-w8a8 16p two nodes on gpqa_diamond"""
+class TestNPUGLM_5_3_W8A8_16P_GPQA(TestNpuAccuracyMultiNodePdMixTestCaseBase):
+    """Test NPU accuracy for GLM-5.3-w8a8 16p two nodes on gpqa_diamond"""
 
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
-    model_config = GLM_5_2_W8A8_16P_TWO_NODE_MODEL_CONFIG
+    model_config = GLM_5_3_W8A8_16P_TWO_NODE_MODEL_CONFIG
+    max_retries = 1
     accuracy = 0.912
     datasets = ["gpqa_diamond"]
-    # eval_batch_size = 16
-    # generation_config = {"max_tokens": 131072, "temperature": 1.0}
+    # Weekday nightly overrides this to gsm8k (baseline is provisional).
+    dataset_baselines = {
+        "gsm8k": 0.92,
+    }
+    # Strip the reasoning trace before extraction, as upstream gsm8k does.
+    dataset_args = {
+        "gsm8k": {"filters": {"remove_until": "</think>"}},
+    }
     eval_batch_size = 32
     generation_config = {
         "max_tokens": 131072,
@@ -111,8 +119,8 @@ class TestNPUGLM_5_2_W8A8_16P_GPQA(TestNpuAccuracyMultiNodePdMixTestCaseBase):
         "stream": True,
     }
 
-    def test_npu_glm_5_2_w8a8_16p_gpqa(self):
-        """Run NPU accuracy test for GLM-5.2-w8a8 16p two nodes on gpqa_diamond"""
+    def test_npu_glm_5_3_w8a8_16p_gpqa(self):
+        """Run NPU accuracy test for GLM-5.3-w8a8 16p two nodes on gpqa_diamond"""
         self.run_accuracy()
 
 

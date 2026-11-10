@@ -261,6 +261,12 @@ def build_kv_storage(
         # Backends ask for the sliding-window layers by their role: the
         # target's window.
         roles={} if window is None else {IdSpaceKind.SLIDING_WINDOW: window.name},
+        # Routes carry each window sub-pool's attention window.
+        windows={
+            s.name: s.lifetime.window
+            for s in token_sub_pools
+            if isinstance(s.lifetime, WindowLifetime)
+        },
     )
     req_to_token_pool = _build_request_table(plan, ctx, sized)
     state_storage = None
@@ -305,10 +311,14 @@ def build_kv_storage(
         _wire_mamba_slot_allocator(
             mamba_end=allocator.mamba_allocator,
             take=allocator.alloc_state_slots,
+            fits=allocator.state_slots_fit,
+            estimate=allocator.estimated_state_slots_available,
             state=state_storage,
             device=ctx.device,
         )
         allocator.state = state_storage
+    allocator.plan = plan
+    allocator.request_memory = request_memory
     allocator.storage = KVStorage(
         plan=plan,
         sized=sized,
