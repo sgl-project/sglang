@@ -3,10 +3,10 @@ set -euo pipefail
 
 # Apply declarative container patch sets inside a pod before the test starts.
 #
-# Patch sets are committed under ./container_patches/<name>.sh and selected by
-# SGLANG_NPU_CONTAINER_PATCHES (comma separated) or by the first positional
-# argument. An empty value is a no-op, so jobs that do not ask for a patch
-# behave exactly as before.
+# Patch sets are committed under scripts/ci/npu/container_patches/<name>.sh and
+# selected by SGLANG_NPU_CONTAINER_PATCHES (comma separated) or by the first
+# positional argument. An empty value is a no-op, so jobs that do not ask for a
+# patch behave exactly as before.
 #
 # Notes:
 #   * The set name comes from a workflow input, so only names matching
@@ -24,7 +24,8 @@ set -euo pipefail
 #     that cannot be trusted.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PATCH_DIR="${SCRIPT_DIR}/container_patches"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../../../.." && pwd)"
+PATCH_DIR="${REPO_ROOT}/scripts/ci/npu/container_patches"
 PATCH_CACHE_DIR="${PATCH_CACHE_DIR:-/tmp/sglang_npu_patch_cache}"
 PATCH_STATE_FILE="${PATCH_STATE_FILE:-/tmp/sglang_npu_patches_applied.json}"
 REQUESTED="${1:-${SGLANG_NPU_CONTAINER_PATCHES:-}}"

@@ -19,6 +19,7 @@ on:
     paths:
       - ".github/workflows/release-model-data-npu.yml"
       - ".github/workflows/nightly-test-npu-e2e-multi-node.yml"
+      - "scripts/ci/npu/**"
       - "scripts/ci/utils/collect_npu_release_data.py"
       - "test/registered/npu/accuracy/glm5_3/**"
       - "python/sglang/test/ascend/e2e/**"
