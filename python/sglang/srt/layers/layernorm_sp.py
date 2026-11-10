@@ -41,7 +41,8 @@ from typing import Optional
 import torch
 
 from sglang.srt.runtime_context import get_flags, get_forward, get_parallel
-from sglang.srt.utils.common import ceil_align, is_npu
+from sglang.srt.utils import is_npu
+from sglang.srt.utils.common import ceil_align
 
 logger = logging.getLogger(__name__)
 
