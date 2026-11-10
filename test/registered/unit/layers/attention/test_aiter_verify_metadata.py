@@ -55,6 +55,8 @@ def _unified_verify_backend():
     backend.use_mla = False
     backend._use_unified_verify = True
     backend.use_sliding_window_kv_pool = False
+    backend.use_muse_attention_paths = False
+    backend.muse_reuse_verify_lengths = False
     backend.page_size = 1
     backend.max_context_len = 128
     backend.num_draft_tokens = _VERIFY_TOKENS_PER_REQ
