@@ -114,6 +114,7 @@ class TestAutoRoundCPUConfig(CustomTestCase):
             rms_norm_eps=1e-6,
         )
         with (
+            patch("sglang.srt.models.qwen3_5._is_cpu", True),
             patch(
                 "sglang.srt.models.qwen3_5.get_parallel",
                 return_value=parallel,

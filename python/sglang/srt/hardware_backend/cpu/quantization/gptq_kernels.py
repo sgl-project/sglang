@@ -25,6 +25,7 @@ class GPTQIntelAMXLinearKernel:
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         layer._amx_output_size = layer.qweight.shape[-1]
         output_padding = -layer._amx_output_size % 32
+        layer._amx_output_padding = output_padding
         if output_padding:
             layer.qweight.data = torch.nn.functional.pad(
                 layer.qweight.data, (0, output_padding)
@@ -41,6 +42,12 @@ class GPTQIntelAMXLinearKernel:
         layer.qweight = torch.nn.Parameter(layer.qweight.data, requires_grad=False)
         layer.qzeros = torch.nn.Parameter(layer.qzeros.data, requires_grad=False)
         layer.scales = torch.nn.Parameter(layer.scales.data, requires_grad=False)
+        # layer.bias stays unpadded since skip_bias_add hands it back to the caller.
+        layer._amx_padded_bias = (
+            torch.nn.functional.pad(layer.bias.data, (0, output_padding))
+            if output_padding and layer.bias is not None
+            else None
+        )
 
     def apply(
         self,
@@ -49,9 +56,13 @@ class GPTQIntelAMXLinearKernel:
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         output_size = layer._amx_output_size
-        output_padding = -output_size % 32
+        output_padding = layer._amx_output_padding
         if bias is not None and output_padding:
-            bias = torch.nn.functional.pad(bias, (0, output_padding))
+            bias = (
+                layer._amx_padded_bias
+                if bias is layer.bias
+                else torch.nn.functional.pad(bias, (0, output_padding))
+            )
         output = torch.ops.sgl_kernel.int4_scaled_mm_cpu(
             x.reshape(-1, x.shape[-1]),
             layer.qweight,
@@ -59,9 +70,9 @@ class GPTQIntelAMXLinearKernel:
             layer.scales,
             bias,
         )
-        return (
-            output[..., :output_size].reshape(*x.shape[:-1], output_size).contiguous()
-        )
+        if output_padding:
+            output = output[:, :output_size].contiguous()
+        return output.view(*x.shape[:-1], output_size)
 
 
 class GPTQIntelAMXMoEKernel:
