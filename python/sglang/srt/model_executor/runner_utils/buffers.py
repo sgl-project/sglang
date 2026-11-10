@@ -47,9 +47,12 @@ def _grouped_foreach_copy_(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -
             for dst, src in zip(dsts, srcs):
                 dst.copy_(src)
 
-    # No small_copy kernel here: Triton specializes its tuple arguments on pointer
-    # alignment and size divisibility, so new replay shapes would JIT on the
-    # serving path; the grouped foreach copies below never compile.
+    if dsts and dsts[0].is_cuda:
+        from sglang.kernels.ops.memory.small_copy import try_small_copy
+
+        if try_small_copy(dsts, srcs):
+            return
+
     groups: Dict[Tuple[torch.dtype, torch.dtype], Tuple[List, List]] = {}
     for dst, src in zip(dsts, srcs):
         key = (dst.dtype, src.dtype)
