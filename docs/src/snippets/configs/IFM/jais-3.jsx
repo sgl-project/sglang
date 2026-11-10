@@ -10,7 +10,10 @@ export const config = {
 
   latencyPercentile: "P50",
 
-  supportedHardware: ["h100"],
+  supportedHardware: ["h100", "xeon"],
+  hardware: [
+    { id: "xeon", label: "XEON", vram: "CPU", vendor: "cpu" },
+  ],
   runModes: ["python"],
 
   variants: [
@@ -92,9 +95,11 @@ sgl-eval run gsm8k \\
   },
 
   playgroundFeatures: {
+    normalizeDeltas: (deltas, derived, base) => base.hw === "xeon" ? {} : deltas,
     // CP is unsupported/unvalidated for the xLLM path. DP-attention and
     // alternate MoE backends are also intentionally omitted until validated.
     attention: {
+      showWhen: (base) => base.hw !== "xeon",
       knobs: [
         {
           id: "tp",
@@ -120,6 +125,7 @@ sgl-eval run gsm8k \\
     // expert parallelism disabled on the dense variants.
     // The MoVA recipe runs with EP=2. The 375B recipe is two-node TP=16 with EP=16.
     moe: {
+      showWhen: (base) => base.hw !== "xeon",
       ep: {
         label: "EP",
         values: [
@@ -166,6 +172,7 @@ sgl-eval run gsm8k \\
     },
 
     parsers: {
+      showWhen: (base) => base.hw !== "xeon",
       items: [
         { id: "reasoning", label: "Reasoning Parser", flag: "--reasoning-parser k2_horizon" },
         { id: "toolCall", label: "Tool Call Parser", flag: "--tool-call-parser k2_horizon" },
@@ -173,6 +180,7 @@ sgl-eval run gsm8k \\
     },
 
     speculative: {
+      showWhen: (base) => base.hw !== "xeon",
       options: [
         { id: "current", label: "Inherited from base" },
         { id: "off", label: "Off" },
@@ -184,6 +192,7 @@ sgl-eval run gsm8k \\
     },
 
     pdDisagg: {
+      showWhen: (base) => base.hw !== "xeon",
       modes: [
         { id: "off", label: "Off" },
         { id: "prefill", label: "Prefill role" },
@@ -207,6 +216,7 @@ sgl-eval run gsm8k \\
     },
 
     hicache: {
+      showWhen: (base) => base.hw !== "xeon",
       backends: [
         { id: null, label: "Auto" },
         { id: "file", label: "File" },
@@ -224,6 +234,27 @@ sgl-eval run gsm8k \\
   },
 
   cells: [
+    {
+      match: { hw: "xeon", variant: "0.9b", quant: "bf16", strategy: "balanced", nodes: "single" },
+      verified: true,
+      warn: "Quick generation verified on Intel Xeon 6972P at TP6. The 8,192-token cache does not cover the full context. Playground overrides, dataset accuracy, and performance are unverified.",
+      env: [
+        "SGLANG_USE_CPU_ENGINE=1",
+        "RAYON_NUM_THREADS=1",
+        "TOKENIZERS_PARALLELISM=false",
+      ],
+      flags: [
+        "--model {{MODEL_NAME}}",
+        "--device cpu",
+        "--disable-overlap-schedule",
+        "--revision ef8b0e93cae13e7fdb6c711770ab00e03616baac",
+        "--tp 6",
+        "--dtype bfloat16",
+        "--max-total-tokens 8192",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
     {
       match: { hw: "h100", variant: "0.9b", quant: "bf16", strategy: "balanced", nodes: "single" },
       verified: true,

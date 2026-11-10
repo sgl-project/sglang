@@ -15,9 +15,13 @@ const load = async (name) => {
   return (await import("data:text/javascript," + encodeURIComponent(text))).config;
 };
 
-const config = await load("k2-horizon");
+for (const [name, checkpoint, revision, cap, gpu] of [
+  ["k2-horizon", "K2-Horizon-0.9B", "d50881f4f8dc6923fb8f301e1c2313fe3a2b6c1d", 4096, "h200"],
+  ["jais-3", "Jais-3-0.9B", "ef8b0e93cae13e7fdb6c711770ab00e03616baac", 8192, "h100"],
+]) {
+const config = await load(name);
 
-test("K2 Horizon exposes only validated Python-only Xeon recipes", () => {
+test(`${name} exposes only validated Python-only Xeon recipes`, () => {
   assert.ok(config.supportedHardware.includes("xeon"));
   assert.ok(config.hardware.some((hw) => hw.id === "xeon" && hw.vendor === "cpu"));
   assert.deepEqual(config.runModes, ["python"]);
@@ -29,17 +33,17 @@ test("K2 Horizon exposes only validated Python-only Xeon recipes", () => {
     HOST_IP: "127.0.0.1", PORT: "31000",
   });
   for (const flag of [
-    "--model IFM/K2-Horizon-0.9B", "--device cpu", "--disable-overlap-schedule",
-    "--tp 6", "--dtype bfloat16", "--max-total-tokens 4096", "--port 31000",
-    "--revision d50881f4f8dc6923fb8f301e1c2313fe3a2b6c1d",
+    `--model IFM/${checkpoint}`, "--device cpu", "--disable-overlap-schedule",
+    "--tp 6", "--dtype bfloat16", `--max-total-tokens ${cap}`, "--port 31000",
+    `--revision ${revision}`,
   ]) assert.ok(command.includes(flag), flag);
   assert.doesNotMatch(command, /docker|--gpus|fa3|--ep |--nnodes|--reasoning-parser|--speculative/);
   assert.match(cell.warn, /Quick generation.*full context.*unverified/);
 });
 
-test("hardware switching and stale URLs snap to a validated Xeon cell", () => {
+test(`${name} hardware switches and stale URLs snap to a validated Xeon cell`, () => {
   const api = engine(config);
-  const stale = { hw: "h200", variant: "375b", quant: "bf16", strategy: "balanced", nodes: "single" };
+  const stale = { hw: gpu, variant: "375b", quant: "bf16", strategy: "balanced", nodes: "single" };
   const switched = api.snapToValidCell(config.cells, stale, "hw", "xeon");
   assert.equal(switched.variant, "0.9b");
   assert.ok(api.findCell(config.cells, switched));
@@ -49,16 +53,17 @@ test("hardware switching and stale URLs snap to a validated Xeon cell", () => {
   assert.equal(fromUrl.nodes, "single");
 });
 
-test("Xeon hides unvalidated Playground axes and discards stale GPU overrides", () => {
+test(`${name} hides unvalidated Playground axes and discards stale GPU overrides`, () => {
   const features = config.playgroundFeatures;
   for (const axis of ["attention", "moe", "parsers", "speculative", "pdDisagg", "hicache"]) {
     assert.equal(features[axis].showWhen({ hw: "xeon" }), false, axis);
-    assert.equal(features[axis].showWhen({ hw: "h200" }), true, axis);
+    assert.equal(features[axis].showWhen({ hw: gpu }), true, axis);
   }
   const stale = {
     attention: { tp: 8 }, moe: { ep: 8 }, parsers: { toolCall: true },
     speculative: "ngram", pdDisagg: { mode: "prefill" }, hicache: { enabled: true },
   };
   assert.deepEqual(features.normalizeDeltas(stale, {}, { hw: "xeon" }), {});
-  assert.equal(features.normalizeDeltas(stale, {}, { hw: "h200" }), stale);
+  assert.equal(features.normalizeDeltas(stale, {}, { hw: gpu }), stale);
 });
+}
