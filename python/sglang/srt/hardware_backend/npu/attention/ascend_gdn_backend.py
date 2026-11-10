@@ -3,10 +3,10 @@ from typing import Optional, Tuple, Union
 import torch
 from sgl_kernel_npu.fla.fused_gdn_gating import (
     fused_gdn_gating_kernel_without_sigmoid,
-    fused_gdn_gating_npu,
 )
 from sgl_kernel_npu.fla.l2norm import l2norm_fwd
 from sgl_kernel_npu.fla.utils import prepare_chunk_indices
+from sgl_kernel_npu.operators.attention.gdn import fused_gdn_gating
 
 from sglang.srt.hardware_backend.npu.attention.ascend_hybrid_linear_attn_backend import (
     AscendMambaAttnBackendBase,
@@ -18,8 +18,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
-
-fused_gdn_gating = fused_gdn_gating_npu
 
 
 class AscendGDNAttnBackend(AscendMambaAttnBackendBase):

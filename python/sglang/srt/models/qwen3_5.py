@@ -286,7 +286,9 @@ if _is_npu:
 
     # NPU uses the Ascend-tuned implementation; other backends keep the
     # original Triton kernel.
-    from sgl_kernel_npu.fla.utils import fused_qkvzba_split_reshape_cat_contiguous
+    from sgl_kernel_npu.operators.attention.gdn import (
+        fused_qkvzba_split_reshape_cat_contiguous,
+    )
 
 
 def _linear_accepts_fp8_tuple(linear: nn.Module) -> bool:
