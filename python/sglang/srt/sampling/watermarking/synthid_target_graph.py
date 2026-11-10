@@ -101,7 +101,12 @@ class _MixedTargetGraph:
         self.graph.replay()
         if isinstance(self.output, tuple):
             probs, sampled_probs, sampled_tokens = self.output
-            return probs[:rows], sampled_probs[:rows], sampled_tokens[:rows]
+            # Eager draft loops retain each step across subsequent replays.
+            return (
+                probs[:rows].clone(),
+                sampled_probs[:rows].clone(),
+                sampled_tokens[:rows].clone(),
+            )
         return self.output[:rows]
 
 

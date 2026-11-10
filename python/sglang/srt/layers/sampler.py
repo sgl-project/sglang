@@ -125,6 +125,36 @@ def _select_sampling_mask_rows(
     return tensor.index_select(0, batch_indices)
 
 
+def filter_sampling_probs(
+    probs: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    min_ps: torch.Tensor,
+    *,
+    need_top_k_sampling: bool,
+    need_top_p_sampling: bool,
+    need_min_p_sampling: bool,
+) -> torch.Tensor:
+    """Build the FlashInfer sampler's realized support without drawing a token."""
+    filtered = probs
+    if need_min_p_sampling:
+        if need_top_p_sampling:
+            filtered = top_p_renorm_prob(filtered, top_ps)
+        if need_top_k_sampling:
+            filtered = top_k_renorm_prob(filtered, top_ks)
+        threshold = filtered.max(dim=-1, keepdim=True).values * min_ps.view(-1, 1)
+        return filtered.masked_fill(filtered < threshold, 0.0)
+    if need_top_k_sampling:
+        filtered = top_k_renorm_prob(probs, top_ks)
+    if need_top_p_sampling:
+        top_p_probs = top_p_renorm_prob(probs, top_ps)
+        if filtered is probs:
+            filtered = top_p_probs
+        else:
+            filtered.masked_fill_(top_p_probs <= 0, 0.0)
+    return filtered
+
+
 class Sampler(nn.Module):
     def __init__(self):
         super().__init__()
@@ -483,11 +513,14 @@ class Sampler(nn.Module):
                         capture_probs = select_capture_rows(probs)
                         capture_min_ps = select_capture_rows(sampling_info.min_ps)
                         capture_tokens = select_capture_rows(batch_next_token_ids)
-                        min_p_thresholds = (
-                            capture_probs.max(dim=-1).values * capture_min_ps
-                        )
-                        filtered_probs = capture_probs.masked_fill(
-                            capture_probs < min_p_thresholds.view(-1, 1), 0
+                        filtered_probs = filter_sampling_probs(
+                            capture_probs,
+                            sampling_info.top_ks,
+                            sampling_info.top_ps,
+                            capture_min_ps,
+                            need_top_k_sampling=False,
+                            need_top_p_sampling=False,
+                            need_min_p_sampling=True,
                         )
                         selected_weight = torch.gather(
                             filtered_probs,
@@ -516,19 +549,15 @@ class Sampler(nn.Module):
                         capture_top_ks = select_capture_rows(sampling_info.top_ks)
                         capture_top_ps = select_capture_rows(sampling_info.top_ps)
                         capture_tokens = select_capture_rows(batch_next_token_ids)
-                        filtered_probs = capture_probs
-                        if sampling_info.need_top_k_sampling:
-                            filtered_probs = top_k_renorm_prob(
-                                capture_probs, capture_top_ks
-                            )
-                        if sampling_info.need_top_p_sampling:
-                            top_p_probs = top_p_renorm_prob(
-                                capture_probs, capture_top_ps
-                            )
-                            if filtered_probs is capture_probs:
-                                filtered_probs = top_p_probs
-                            else:
-                                filtered_probs.masked_fill_(top_p_probs <= 0, 0)
+                        filtered_probs = filter_sampling_probs(
+                            capture_probs,
+                            capture_top_ks,
+                            capture_top_ps,
+                            select_capture_rows(sampling_info.min_ps),
+                            need_top_k_sampling=sampling_info.need_top_k_sampling,
+                            need_top_p_sampling=sampling_info.need_top_p_sampling,
+                            need_min_p_sampling=False,
+                        )
                         selected_weight = torch.gather(
                             filtered_probs,
                             1,

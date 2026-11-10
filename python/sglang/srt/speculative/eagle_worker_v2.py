@@ -937,8 +937,21 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
         synthid_enabled = is_enabled(forward_batch.sampling_info.synthid_state)
         if needs_draft_probs:
-            draft_probs_list: List[torch.Tensor] = [spec_info.draft_probs]
-            draft_prob_token_ids_list = [spec_info.draft_prob_token_ids]
+            initial_probs, initial_token_ids = (
+                spec_info.draft_probs,
+                spec_info.draft_prob_token_ids,
+            )
+            if (
+                synthid_enabled
+                and not forward_batch.sampling_info.synthid_force_dense_draft_probs
+            ):
+                initial_probs, initial_token_ids = (
+                    self._ensure_sparse_algo5_draft_probs(
+                        initial_probs, initial_token_ids, forward_batch.sampling_info
+                    )
+                )
+            draft_probs_list: List[torch.Tensor] = [initial_probs]
+            draft_prob_token_ids_list = [initial_token_ids]
         synthid_chain_tokens = [topk_index] if synthid_enabled else None
 
         topk1_chain_fits = (
@@ -1163,7 +1176,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             ):
                 self.draft_runner.forward(forward_batch)
 
-        return None, None, None, None
+        return None, None, None, None, None
 
     def draft_extend(self):
         pass

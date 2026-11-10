@@ -87,7 +87,7 @@ def validate_synthid_watermark(
     if algorithm:
         if view.pp_size > 1:
             raise ValueError("SynthID does not support pipeline-parallel speculation.")
-        supported = {"EAGLE", "STANDALONE"}
+        supported = {"EAGLE"}
         if algorithm not in supported:
             raise ValueError(
                 "SynthID watermarking currently supports non-speculative "

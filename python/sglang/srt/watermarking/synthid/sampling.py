@@ -268,16 +268,15 @@ def filter_synthid_probs(
     top_ks = top_ks.clamp(max=probs.shape[-1])
     backend = sampler_module.get_exec().kernel.sampling_backend
     if backend == "flashinfer":
-        top_k_probs = sampler_module.top_k_renorm_prob(probs, top_ks)
-        if sampling_info.need_min_p_sampling:
-            filtered = sampler_module.top_p_renorm_prob(top_k_probs, top_ps)
-            threshold = filtered.max(dim=-1, keepdim=True).values
-            threshold = threshold * min_ps.view(-1, 1)
-            filtered = filtered.masked_fill(filtered < threshold, 0.0)
-        else:
-            # Match the ordinary sampler's joint top-k/top-p intersection.
-            top_p_probs = sampler_module.top_p_renorm_prob(probs, top_ps)
-            filtered = top_k_probs.masked_fill(top_p_probs == 0, 0.0)
+        filtered = sampler_module.filter_sampling_probs(
+            probs,
+            top_ks,
+            top_ps,
+            min_ps,
+            need_top_k_sampling=sampling_info.need_top_k_sampling,
+            need_top_p_sampling=sampling_info.need_top_p_sampling,
+            need_min_p_sampling=sampling_info.need_min_p_sampling,
+        )
     elif backend == "pytorch":
         sorted_probs, indices = sampler_module.top_k_top_p_min_p_filter_probs_torch(
             probs,

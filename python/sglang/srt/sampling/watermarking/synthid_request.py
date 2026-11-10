@@ -4,16 +4,12 @@ from __future__ import annotations
 
 import torch
 
+from sglang.srt.sampling.watermarking.server import resolve_synthid_request_enabled
 from sglang.srt.watermarking.synthid.state import SynthIDState
 
 
 def request_enabled(request, features) -> bool:
-    control = request.sampling_params.watermark
-    if control is None:
-        return features.watermark_default_enabled or features.watermark_enforce_all
-    if control.enabled is False and features.watermark_enforce_all:
-        raise ValueError("SynthID enforce_all does not allow explicit opt-out")
-    return control.enabled is True
+    return resolve_synthid_request_enabled(request.sampling_params.watermark, features)
 
 
 def is_mixed(state) -> bool:

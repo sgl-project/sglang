@@ -51,31 +51,31 @@ def _filter_unwatermarked_target_probs(
     rows_per_request: int,
 ) -> torch.Tensor:
     """Retain EAGLE's joint top-k/top-p target law, without min-p."""
-    top_ks = sampling_info.top_ks.repeat_interleave(rows_per_request)
-    top_ps = sampling_info.top_ps.repeat_interleave(rows_per_request)
+    from sglang.srt.speculative.eagle_utils import _apply_joint_top_k_top_p
+
     if probs.is_cuda:
-        from sgl_kernel import top_k_renorm_prob, top_p_renorm_prob
-
-        if sampling_info.need_top_p_sampling:
-            probs = top_p_renorm_prob(probs, top_ps)
-        if sampling_info.need_top_k_sampling:
-            probs = top_k_renorm_prob(probs, top_ks)
-        return probs
-
-    from sglang.srt.layers.sampler import (
-        top_k_top_p_min_p_filter_probs_torch,
-        top_p_normalize_probs_torch,
-    )
-
-    if sampling_info.need_top_p_sampling:
-        probs = top_p_normalize_probs_torch(probs, top_ps)
-    if sampling_info.need_top_k_sampling:
-        values, indices = top_k_top_p_min_p_filter_probs_torch(
-            probs, top_ks, torch.ones_like(top_ps), torch.zeros_like(top_ps), False
+        from sglang.srt.layers.sampling_renorm import (
+            top_k_renorm_prob,
+            top_p_renorm_prob,
         )
-        probs = torch.zeros_like(probs).scatter_(1, indices, values)
-        probs = probs / probs.sum(dim=-1, keepdim=True)
-    return probs
+    else:
+        from sglang.srt.layers.sampler import (
+            top_k_top_p_min_p_filter_probs_torch,
+            top_p_normalize_probs_torch,
+        )
+
+        top_p_renorm_prob = top_p_normalize_probs_torch
+
+        def top_k_renorm_prob(probs, top_ks):
+            values, indices = top_k_top_p_min_p_filter_probs_torch(
+                probs, top_ks, torch.ones_like(top_ks), torch.zeros_like(top_ks), False
+            )
+            values = values / values.sum(dim=-1, keepdim=True)
+            return torch.zeros_like(probs).scatter_(1, indices, values)
+
+    return _apply_joint_top_k_top_p(
+        probs, sampling_info, rows_per_request, top_k_renorm_prob, top_p_renorm_prob
+    )
 
 
 def _pin_greedy_logits(

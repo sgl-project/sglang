@@ -102,6 +102,21 @@ def _load_synthid_config(source: str) -> dict:
     return raw
 
 
+def resolve_synthid_request_enabled(watermark: Any, features: Any) -> bool:
+    if watermark is not None:
+        if watermark.enabled is None:
+            raise ValueError("SynthID request watermark must set enabled")
+        if watermark.enabled is False and features.watermark_enforce_all:
+            raise ValueError(
+                "request watermark enabled=false is not allowed when enforce_all is set"
+            )
+    return features.watermark_enforce_all or (
+        watermark.enabled
+        if watermark is not None
+        else features.watermark_default_enabled
+    )
+
+
 def validate_watermark_request(sampling_params: Any, features: Any) -> bool:
     watermark = sampling_params.watermark
     if features.enable_watermark and features.watermark_algorithm == "synthid":
@@ -110,17 +125,7 @@ def validate_watermark_request(sampling_params: Any, features: Any) -> bool:
                 raise ValueError(
                     "SynthID keys and context are server-wide, not per-request"
                 )
-            if watermark.enabled is None:
-                raise ValueError("SynthID request watermark must set enabled")
-            if watermark.enabled is False and features.watermark_enforce_all:
-                raise ValueError(
-                    "request watermark enabled=false is not allowed when enforce_all is set"
-                )
-        return features.watermark_enforce_all or (
-            watermark.enabled
-            if watermark is not None
-            else features.watermark_default_enabled
-        )
+        return resolve_synthid_request_enabled(watermark, features)
     _, _, enabled = resolve_watermark_request(
         watermark,
         server_enabled=features.enable_watermark,
