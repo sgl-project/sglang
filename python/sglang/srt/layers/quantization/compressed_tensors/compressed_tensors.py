@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from contextlib import suppress
 from typing import (
     TYPE_CHECKING,
@@ -117,6 +118,17 @@ class DeviceCapability(NamedTuple):
         return self.major * 10 + self.minor
 
 
+# The MLP prefix of a plain `ignore` entry that names its layer.
+_LAYER_MLP_PREFIX = re.compile(r"^(?!re:)(.*\.layers\.\d+\.mlp)\.")
+# Layers probed for `ignore` entries that name none (regexes, bare suffixes).
+_FUSION_PROBE_LAYERS = 256
+_EXPERT_PROBE_TAILS = (
+    "mlp.experts.0.gate_proj",
+    "mlp.shared_experts.gate_proj",
+    "mlp.shared_expert.gate_proj",
+)
+
+
 class CompressedTensorsConfig(QuantizationConfig):
     def __init__(
         self,
@@ -172,21 +184,36 @@ class CompressedTensorsConfig(QuantizationConfig):
     def can_fuse_shared_expert(self) -> bool:
         """Whether shared experts can fuse into the routed-expert FusedMoE.
 
-        A shared expert that `ignore` keeps unquantized cannot share quantized
-        routed-expert buffers, unless that layer's routed experts are ignored
-        too. The shared_expert_gate is a separate linear and does not count. A
-        regex entry names no layer to compare with, so it vetoes fusion.
+        Not where `ignore` keeps a layer's shared expert unquantized but its
+        routed experts quantized. Both are resolved per MoE layer with
+        should_ignore_layer, so names and regexes match alike.
         """
+        prefixes = set()
         for name in self.ignore:
-            if "shared_expert" not in name.replace("shared_expert_gate", ""):
-                continue
-            if name.startswith("re:"):
-                return False
-            moe_prefix = name.split(".shared_expert")[0]
-            if not should_ignore_layer(
-                f"{moe_prefix}.experts.0.gate_proj",
+            match = _LAYER_MLP_PREFIX.match(name)
+            if match is not None:
+                prefixes.add(match.group(1))
+            elif name.startswith("re:") or any(
+                f".{tail}".endswith(f".{name}") for tail in _EXPERT_PROBE_TAILS
+            ):
+                # Names no layer but may match expert modules: probe them all.
+                prefixes.update(
+                    f"model.layers.{i}.mlp" for i in range(_FUSION_PROBE_LAYERS)
+                )
+
+        def ignored(layer_name: str) -> bool:
+            return should_ignore_layer(
+                layer_name,
                 ignore=self.ignore,
                 fused_mapping=self.packed_modules_mapping,
+            )
+
+        for prefix in prefixes:
+            if ignored(f"{prefix}.experts.0.gate_proj"):
+                continue
+            if any(
+                ignored(f"{prefix}.{shared}.gate_proj")
+                for shared in ("shared_experts", "shared_expert")
             ):
                 return False
         return True

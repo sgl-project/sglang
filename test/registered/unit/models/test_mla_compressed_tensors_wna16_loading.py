@@ -225,6 +225,32 @@ class TestFusedQkvALoad(CustomTestCase):
             (2048, 168),
         )
 
+    def test_gptq_packed_tensors_stack_on_their_output_dim(self):
+        """GPTQ also stores qweight / qzeros / scales as [in-ish, out], but only
+        AWQ formats were recognized, so a GPTQ MLA checkpoint stacked on dim 0.
+        GGUF's qweight is row-major and keeps dim 0."""
+        q, kv = torch.zeros(256, 768), torch.zeros(256, 576)
+        for fmt, dim in (
+            ("gptq", 1),
+            ("gptq_marlin", 1),
+            ("auto-round", 1),
+            ("gguf", 0),
+        ):
+            with self.subTest(fmt=fmt):
+                cfg = SimpleNamespace(get_name=lambda fmt=fmt: fmt)
+                fused = (
+                    fuse_qkv_a_proj_tensors(
+                        "x.qweight", q_a=q, kv_a=kv, quant_config=cfg
+                    )
+                    if dim == 1
+                    else fuse_qkv_a_proj_tensors(
+                        "x.qweight", q_a=q.T, kv_a=kv.T, quant_config=cfg
+                    )
+                )
+                self.assertEqual(
+                    tuple(fused.shape), (256, 1344) if dim == 1 else (1344, 256)
+                )
+
     def test_awq_checkpoints_keep_unconverted_attention_on_dim_0(self):
         """QuantTrio/GLM-4.7-Flash-AWQ leaves self_attn in BF16 under an awq
         config; choosing the dim from the config alone stacked those [out, in]
@@ -251,12 +277,14 @@ class TestFusedQkvALoad(CustomTestCase):
                 kv_a=torch.tensor([576, 1024]),
             )
         g_idx = torch.arange(64) // 32
-        self.assertIs(
-            fuse_qkv_a_proj_tensors("x.weight_g_idx", q_a=g_idx, kv_a=g_idx.clone()),
-            g_idx,
-        )
-        with self.assertRaises(ValueError):
-            fuse_qkv_a_proj_tensors("x.weight_g_idx", q_a=g_idx, kv_a=g_idx.flip(0))
+        for name in ("x.weight_g_idx", "x.g_idx"):  # compressed-tensors, GPTQ
+            with self.subTest(name=name):
+                self.assertIs(
+                    fuse_qkv_a_proj_tensors(name, q_a=g_idx, kv_a=g_idx.clone()),
+                    g_idx,
+                )
+                with self.assertRaises(ValueError):
+                    fuse_qkv_a_proj_tensors(name, q_a=g_idx, kv_a=g_idx.flip(0))
 
 
 class TestWNA16Dequantize(CustomTestCase):
@@ -386,6 +414,12 @@ class TestGlm47FlashW4A16Config(CustomTestCase):
             (["lm_head", *shared, *routed], True),
             (["lm_head", "re:.*shared_experts.*"], False),
             (["lm_head", "re:.*shared_expert(s|_gate).*"], False),
+            # Matches the shared experts without naming "shared_expert".
+            (["lm_head", r"re:.*mlp\.shared.*"], False),
+            # Anchored to layers that no explicit entry names.
+            (["lm_head", r"re:model\.layers\.(3|5)\.mlp\.shared_experts\..*"], False),
+            (["lm_head", "shared_experts.gate_proj"], False),
+            (["lm_head", r"re:.*mlp\..*"], True),
         ):
             with self.subTest(ignore=ignore):
                 config = CompressedTensorsConfig.from_config(
