@@ -223,8 +223,10 @@ def test_masked_oai_activation_preserves_rows(experts, width, dtype, alpha):
     """Check the alpha formula, non-block-aligned widths and non-power-of-two channel
     scales; invalid rows must not be written."""
     from sglang.kernels.ops.moe.ep_moe_kernels import (
-        silu_and_mul_masked_fwd,
         silu_and_mul_masked_post_quant_fwd,
+    )
+    from sglang.srt.hardware_backend.sail.moe.activations import (
+        silu_and_mul_masked_fwd,
     )
 
     torch.manual_seed(42)
