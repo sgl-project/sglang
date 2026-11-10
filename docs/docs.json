@@ -981,6 +981,13 @@
                   "docs/advanced_features/hicache_storage_runtime_attach_detach"
                 ]
               },
+              {
+                "group": "Unified Memory",
+                "pages": [
+                  "docs/advanced_features/unified_memory",
+                  "docs/advanced_features/unified_memory_design"
+                ]
+              },
               "docs/advanced_features/sglang_simulator",
               "docs/advanced_features/vlm_query",
               "docs/advanced_features/dp_for_multi_modal_encoder",
@@ -1623,7 +1630,8 @@
                   {
                     "group": "MiniMax",
                     "pages": [
-                      "cookbook/diffusion/MiniMax/MiniMax-H3"
+                      "cookbook/diffusion/MiniMax/MiniMax-H3",
+                      "cookbook/diffusion/MiniMax/MiniMax-H3-Image"
                     ]
                   },
                   {
