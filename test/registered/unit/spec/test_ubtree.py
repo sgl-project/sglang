@@ -119,6 +119,42 @@ def _lookup_config():
     return config
 
 
+def _run_ubtree_hook(*, target_vocab_size=17, locked=()):
+    from sglang.srt.arg_groups import speculative_hook
+    from sglang.srt.arg_groups.overrides import declare_resolution
+    from sglang.srt.model_executor.cuda_graph_config import (
+        CudaGraphConfig,
+        PhaseConfig,
+    )
+    from sglang.srt.server_args import ServerArgs
+
+    args = ServerArgs(
+        model_path="dummy",
+        device="cuda",
+        attention_backend="fa3",
+        page_size=1,
+        speculative_algorithm="UBTREE",
+        speculative_draft_model_path="draft",
+        speculative_draft_attention_backend="fa3",
+    )
+    args._model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(architectures=["BailingMoeV3ForCausalLM"]),
+        vocab_size=target_vocab_size,
+    )
+    graph = CudaGraphConfig(
+        decode=PhaseConfig(backend="full", bs=[1, 2, 4]),
+        prefill=PhaseConfig(backend="breakable"),
+    )
+    declare_resolution(args, "test", cuda_graph_config=graph)
+    args._cuda_graph_config_locked = set(locked)
+    with (
+        patch.object(speculative_hook.current_platform, "is_cuda", return_value=True),
+        patch("sglang.srt.hf_transformers.get_config", return_value=_config()),
+    ):
+        speculative_hook._handle_ubtree(args)
+    return args
+
+
 class TestUBTreeComponents(CustomTestCase):
     def test_config_separates_draft_width_from_verify_width(self):
         config = parse_ubtree_config(_config())
@@ -375,30 +411,23 @@ class TestUBTreeRuntimeConfig(CustomTestCase):
             resolve_verify_width(replace(config, tree_budget=31), 49)
 
     def test_startup_rejects_draft_for_another_target_or_block_contract(self):
-        from sglang.srt.arg_groups import speculative_hook
-        from sglang.srt.server_args import ServerArgs
-
         with self.assertRaisesRegex(ValueError, "dflash_contract"):
             parse_ubtree_config(
                 SimpleNamespace(**vars(_config()), dflash_contract="other")
             )
-        args = ServerArgs(
-            model_path="dummy",
-            speculative_algorithm="UBTREE",
-            speculative_draft_model_path="draft",
-        )
-        args._model_config = SimpleNamespace(
-            hf_config=SimpleNamespace(architectures=["BailingMoeV3ForCausalLM"]),
-            vocab_size=18,
-        )
-        with (
-            patch.object(
-                speculative_hook.current_platform, "is_cuda", return_value=True
-            ),
-            patch("sglang.srt.hf_transformers.get_config", return_value=_config()),
-            self.assertRaisesRegex(ValueError, "vocab_size 17 must match"),
-        ):
-            speculative_hook._handle_ubtree(args)
+        with self.assertRaisesRegex(ValueError, "vocab_size 17 must match"):
+            _run_ubtree_hook(target_vocab_size=18)
+
+    def test_hook_fills_single_valued_graph_settings(self):
+        from sglang.srt.arg_groups.overrides import resolution_result
+
+        args = _run_ubtree_hook()
+        graph = resolution_result(args, "cuda_graph_config")
+        self.assertEqual((graph.prefill.backend, graph.decode.bs), ("disabled", [1]))
+        self.assertTrue(resolution_result(args, "disable_cuda_graph_padding"))
+        for locked in (("prefill", "backend"), ("decode", "bs"), ("decode", "max_bs")):
+            with self.subTest(locked=locked), self.assertRaises(ValueError):
+                _run_ubtree_hook(locked=[locked])
 
     def test_builtin_identity_and_capabilities_preserve_plugin_protocol(self):
         algo = SpeculativeAlgorithm.from_string("ubtree")

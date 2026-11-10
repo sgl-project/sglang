@@ -455,6 +455,7 @@ def _handle_dflash(server_args: ServerArgs) -> None:
 
 def _handle_ubtree(server_args: ServerArgs) -> None:
     from sglang.srt.hf_transformers import get_config
+    from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
     from sglang.srt.speculative.ubtree_components.config import (
         parse_ubtree_config,
         resolve_verify_width,
@@ -507,6 +508,19 @@ def _handle_ubtree(server_args: ServerArgs) -> None:
         ),
         enable_mixed_chunk=False,
     )
+    graph = cfg.cuda_graph_config
+    if graph.decode.backend != Backend.DISABLED:
+        locked = server_args._cuda_graph_config_locked
+        if (Phase.PREFILL, "backend") not in locked:
+            graph = with_phase(graph, Phase.PREFILL, backend=Backend.DISABLED)
+        if not {(Phase.DECODE, "bs"), (Phase.DECODE, "max_bs")} & locked:
+            graph = with_phase(graph, Phase.DECODE, bs=[1], max_bs=1)
+        declare_resolution(
+            server_args,
+            "_handle_ubtree",
+            cuda_graph_config=graph,
+            disable_cuda_graph_padding=True,
+        )
     _resolve_dflash_draft_attention_backend(server_args)
     validate_runtime_config(cfg, tuple(attention_backends_of(cfg)))
     if cfg.enable_unified_memory:
