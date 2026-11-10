@@ -391,8 +391,13 @@ def check_server_args(server_args: Any):
             "--prefill-cache-reserve does not support PD disaggregation"
         )
         # Priority preemption retracts running requests before the reserve check.
-        assert not cfg.enable_priority_scheduling, (
-            "--prefill-cache-reserve does not support --enable-priority-scheduling"
+        assert not (
+            cfg.enable_priority_scheduling and not cfg.disable_priority_preemption
+        ), "--prefill-cache-reserve does not support priority preemption"
+        # A cache-aware order puts cached requests first every pass, so a held
+        # request behind them would never get its turn.
+        assert cfg.schedule_policy in ("fcfs", "lof"), (
+            "--prefill-cache-reserve needs --schedule-policy fcfs or lof"
         )
 
     # Check scheduling policy

@@ -142,7 +142,7 @@ class Schedule(msgspec.Struct):
     ] = 1.0
     prefill_cache_reserve: A[
         Optional[float],
-        "Fraction of the KV pool, and of the Mamba state pool on hybrid models, kept for cached prefixes while requests run. A request whose cached prefix covers less than half of its prompt waits instead of taking that room, so sessions that come back (multi-turn agents) still find their KV; like any request that does not fit, it also holds the requests queued behind it. Traffic without reuse only waits longer. Not supported with unified memory, PD disaggregation or priority scheduling. Unset (default) disables it; 0.3 did best in a replay of coding-agent traffic.",
+        "Fraction of the KV pool, and of the Mamba state pool on hybrid models, kept for cached prefixes while requests run. A request whose cached prefix covers less than half of its prompt waits instead of taking that room, so sessions that come back (multi-turn agents) still find their KV; like any request that does not fit, it also holds the requests queued behind it. Traffic without reuse loses some throughput and waits longer. Needs --schedule-policy fcfs or lof; not supported with unified memory, PD disaggregation or priority preemption. Unset (default) disables it; 0.3 did best in a replay of coding-agent traffic.",
     ] = None
     page_size: A[
         Optional[int], Arg(help="The number of tokens in a page.", resolvable=True)

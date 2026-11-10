@@ -4589,6 +4589,7 @@ class Scheduler(
 
         mamba_allocator = self.token_to_kv_pool_allocator.state_slots
         if mamba_allocator is not None:
+            # The adder read its free state slots before this pre-take.
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         buffer_pipeline = self.tree_cache.buffer_pipeline
         # Requests no memory will ever come back for; aborted after the loop.

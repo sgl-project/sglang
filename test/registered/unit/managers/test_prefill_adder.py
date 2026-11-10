@@ -2942,6 +2942,18 @@ class TestPrefillAdder(CustomTestCase):
         big = self._reserve_req(prefix_len=0, prompt_len=800)
         self.assertFalse(adder._holds_for_cache_reserve(big, total_tokens=811))
 
+    def test_cache_reserve_is_sized_in_the_budget_pool(self):
+        """On a hybrid SWA budget `remaining_total` counts the full pool, so the
+        reserve is a fraction of it, not of the smaller `size`."""
+        override = get_context().override_server_args(prefill_cache_reserve=0.3)
+        override.install()
+        self.addCleanup(override.restore)
+        adder = self.create_swa_adder(size_swa=1000, sliding_window=128)
+        self.mock_token_allocator.size = 1000
+        self.mock_token_allocator.size_full = 4000
+        adder._init_cache_reserve()
+        self.assertEqual(adder.cache_reserve_tokens, 1200)
+
     def test_cache_reserve_counts_state_slots_from_the_pass_start(self):
         """On a hybrid cache the reserve also covers state slots (30 of 100). The
         count is read before the scheduler pre-takes slots for the waiting queue,
