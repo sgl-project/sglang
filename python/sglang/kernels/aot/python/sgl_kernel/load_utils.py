@@ -60,12 +60,19 @@ def _load_architecture_specific_ops():
     if compute_capability == 90:
         ops_subdir = "sm90"
         variant_name = "SM90 (Hopper/H100 with fast math optimization)"
+    elif compute_capability == 70:
+        ops_subdir = "sm70"
+        variant_name = "SM70 (V100 Volta, precise math)"
+        # Fallback: also try sm100 if sm70 dir not found (V100_ONLY=False builds)
+        fallback_subdirs = ["sm100"]
     elif compute_capability is not None:
         ops_subdir = "sm100"
         variant_name = f"SM{compute_capability} (precise math for compatibility)"
+        fallback_subdirs = None
     else:
         ops_subdir = "sm100"
         variant_name = "CPU/No GPU detected (using precise math)"
+        fallback_subdirs = None
 
     # Look for the compiled module with any valid extension
 
@@ -110,6 +117,17 @@ def _load_architecture_specific_ops():
         logger.debug(
             f"[sgl_kernel] ✗ Architecture-specific library not found matching pattern: {ops_pattern}"
         )
+
+        # Try fallback subdirs (e.g., sm70 -> sm100, sm100 -> sm70)
+        if fallback_subdirs:
+            for fb_subdir in fallback_subdirs:
+                fb_pattern = str(sgl_kernel_dir / fb_subdir / "common_ops.*")
+                fb_files = _filter_compiled_extensions(glob.glob(fb_pattern))
+                if fb_files:
+                    logger.debug(f"[sgl_kernel] Trying cross-arch fallback: {fb_pattern}")
+                    ops_pattern = fb_pattern
+                    matching_files = fb_files
+                    break
 
     # Try alternative directory (in case installation structure differs)
     alt_pattern = str(sgl_kernel_dir / "common_ops.*")

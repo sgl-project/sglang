@@ -1,5 +1,25 @@
 // Fused QSA (Qwen4-Exp sparse attention) indexer-prep kernels.
-// Outputs are bit-identical to the eager bf16/fp16 aten chain, mirrored step by step.
+//
+// qsa_index_q_prep_kernel replaces, per token, the eager chain
+//   split -> GemmaRMSNorm(index q) -> MRoPE(index q)
+//   -> set_qsa_key_state_buffer(raw token k) -> set_qsa_rope_position_buffer
+// with a single kernel launch. q rows are normalised per (token, head) and
+// rotated with the model's (multimodal) RoPE; the raw k row and the RoPE
+// coordinates are written to the indexer state buffers.
+//
+// qsa_index_k_compress_kernel replaces, per completed compress group,
+//   gather group -> fp32 mean -> round to storage dtype -> GemmaRMSNorm
+//   -> MRoPE(group-start position) -> set_qsa_compressed_k_buffer
+// with one warp per group.
+//
+// Numerics follow the eager chain step by step so results are bit-identical:
+//   - norm: fp32 sum of squares, rsqrt(mean + eps), x * nf * (1 + w) rounded
+//     once to the storage dtype (matches sgl_kernel gemma_rmsnorm);
+//   - rope: cos/sin are rounded to the storage dtype first, every elementary
+//     multiply/add is rounded to the storage dtype, matching PyTorch's
+//     opmath (fp32) + per-op rounding on 2-byte tensors;
+//   - mean: fp32 sequential accumulation over the group, scaled by 1/ratio,
+//     rounded to the storage dtype before the norm reads it.
 
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
@@ -13,9 +33,17 @@
 #include <tvm/ffi/container/tensor.h>
 
 #include <cstdint>
+#include <sstream>
+#include <stdexcept>
 #include <type_traits>
 
 namespace sglang {
+
+// The vendored sgl_kernel headers now provide DTypeTrait and CHECK_HOST
+// directly (type.cuh, utils.h), so only the namespace shorthands remain --
+// and they resolve inside namespace sglang, not at global scope.
+namespace warp = device::warp;
+namespace math = device::math;
 
 /// \brief Round a float to the storage dtype and back (one eager aten step).
 /// The inline cvt keeps nvcc from folding the round-trip away: every eager
@@ -149,7 +177,10 @@ SGL_DEVICE void qsa_mrope_apply(
  */
 template <typename T, int kHeadDim>
 SGL_DEVICE void qsa_gemma_norm_row(
-    const T* __restrict__ x_row, const T* __restrict__ weight, const float eps, T* __restrict__ smem_row) {
+    const T* __restrict__ x_row,
+    const T* __restrict__ weight,
+    const float eps,
+    T* __restrict__ smem_row) {
   using namespace device;
   constexpr int kPerLane = kHeadDim / kWarpThreads;
   using vec_t = AlignedVector<T, kPerLane>;
@@ -195,15 +226,15 @@ SGL_DEVICE void qsa_gemma_norm_row(
 }
 
 struct QsaIndexQPrepParams {
-  const void* qk;                 // [tokens, (num_q_heads + 1) * kHeadDim]
-  void* q_out;                    // [tokens, q_heads_padded, kHeadDim]
-  const void* weight;             // [kHeadDim]
-  const float* cos_sin_cache;     // [positions_capacity, rotary_dim]
-  const int32_t* axis_map;        // [rotary_dim / 2]
-  const int64_t* positions;       // [num_axes, tokens] (row stride may exceed tokens)
-  const int64_t* cache_loc;       // [tokens]
-  void* key_state_buffer;         // [slots, kHeadDim]
-  int64_t* rope_position_buffer;  // [slots, 3]
+  const void* qk;                  // [tokens, (num_q_heads + 1) * kHeadDim]
+  void* q_out;                     // [tokens, q_heads_padded, kHeadDim]
+  const void* weight;              // [kHeadDim]
+  const float* cos_sin_cache;      // [positions_capacity, rotary_dim]
+  const int32_t* axis_map;         // [rotary_dim / 2]
+  const int64_t* positions;        // [num_axes, tokens] (row stride may exceed tokens)
+  const int64_t* cache_loc;        // [tokens]
+  void* key_state_buffer;          // [slots, kHeadDim]
+  int64_t* rope_position_buffer;   // [slots, 3]
   int64_t positions_stride;
   int32_t num_axes;
   int32_t num_q_heads;
@@ -230,7 +261,8 @@ __global__ __launch_bounds__(128) void qsa_index_q_prep_kernel(const QsaIndexQPr
 
   device::PDLWaitPrimary<kUsePDL>();
 
-  const int64_t qk_row = static_cast<int64_t>(token) * (params.num_q_heads + 1) * kHeadDim;
+  const int64_t qk_row =
+      static_cast<int64_t>(token) * (params.num_q_heads + 1) * kHeadDim;
   const int64_t loc = params.cache_loc[token];
   int64_t pos[3];
 #pragma unroll
@@ -261,7 +293,8 @@ __global__ __launch_bounds__(128) void qsa_index_q_prep_kernel(const QsaIndexQPr
     kv.load(
         static_cast<const T*>(params.qk) + qk_row + params.num_q_heads * kHeadDim,
         lane);  // offset is in vector units
-    kv.store(static_cast<T*>(params.key_state_buffer) + loc * kHeadDim, lane);
+    kv.store(static_cast<T*>(params.key_state_buffer) + loc * kHeadDim,
+             lane);
   }
   if (warp == 1 && lane < 3) {
     params.rope_position_buffer[loc * 3 + lane] = pos[lane];
@@ -271,14 +304,14 @@ __global__ __launch_bounds__(128) void qsa_index_q_prep_kernel(const QsaIndexQPr
 }
 
 struct QsaIndexKCompressParams {
-  const void* key_state_buffer;         // [slots, kHeadDim]
-  const int32_t* group_locs;            // [groups, compress_ratio]
+  const void* key_state_buffer;      // [slots, kHeadDim]
+  const int32_t* group_locs;         // [groups, compress_ratio]
   const int64_t* rope_position_buffer;  // [slots, 3]
-  const float* cos_sin_cache;           // [positions_capacity, rotary_dim]
-  const int32_t* axis_map;              // [rotary_dim / 2]
-  const void* weight;                   // [kHeadDim]
-  const int32_t* write_locs;            // [groups]
-  void* compressed_k_buffer;            // [compressed_slots, kHeadDim]
+  const float* cos_sin_cache;        // [positions_capacity, rotary_dim]
+  const int32_t* axis_map;           // [rotary_dim / 2]
+  const void* weight;                // [kHeadDim]
+  const int32_t* write_locs;         // [groups]
+  void* compressed_k_buffer;         // [compressed_slots, kHeadDim]
   int32_t compress_ratio;
   int32_t rotary_dim;
   int32_t num_groups;
@@ -317,7 +350,8 @@ __launch_bounds__(128) void qsa_index_k_compress_kernel(const QsaIndexKCompressP
     for (int32_t r = 0; r < params.compress_ratio; ++r) {
       vec_t v;
       v.load(
-          static_cast<const T*>(params.key_state_buffer) + static_cast<int64_t>(locs[r]) * kHeadDim,
+          static_cast<const T*>(params.key_state_buffer) +
+              static_cast<int64_t>(locs[r]) * kHeadDim,
           lane);  // offset is in vector units
 #pragma unroll
       for (int i = 0; i < kPerLane; ++i) {
@@ -349,8 +383,10 @@ __launch_bounds__(128) void qsa_index_k_compress_kernel(const QsaIndexKCompressP
     const float nf = math::rsqrt(ss / kHeadDim + params.eps);
 #pragma unroll
     for (int i = 0; i < kPerLane; ++i) {
-      const float wf = static_cast<float>(static_cast<const T*>(params.weight)[lane * kPerLane + i]);
-      smem_rows[warp][lane * kPerLane + i] = DTypeTrait<T>::from(mf[i] * nf * (1.0f + wf));
+      const float wf = static_cast<float>(
+          static_cast<const T*>(params.weight)[lane * kPerLane + i]);
+      smem_rows[warp][lane * kPerLane + i] =
+          DTypeTrait<T>::from(mf[i] * nf * (1.0f + wf));
     }
     __syncwarp();
   }
@@ -399,25 +435,45 @@ void qsa_index_q_prep(
   device.set_options<kDLGPU>();
   constexpr int64_t D = kHeadDim;
 
-  TensorMatcher({tokens, (num_q_heads + 1) * D}).with_dtype<T>().with_device(device).verify(qk);
+  TensorMatcher({tokens, (num_q_heads + 1) * D})
+      .with_dtype<T>()
+      .with_device(device)
+      .verify(qk);
   auto heads_padded = SymbolicSize{"heads_padded"};
   TensorMatcher({tokens, heads_padded, D}).with_dtype<TOut>().with_device(device).verify(q_out);
   TensorMatcher({D}).with_dtype<T>().with_device(device).verify(weight);
   auto cache_rows = SymbolicSize{"cos_sin_cache_rows"};
-  TensorMatcher({cache_rows, rotary_dim}).with_dtype<fp32_t>().with_device(device).verify(cos_sin_cache);
-  TensorMatcher({rotary_dim / 2}).with_dtype<int32_t>().with_device(device).verify(axis_map);
-  TensorMatcher({num_axes, tokens}).with_dtype<int64_t>().with_device(device).with_strides({-1, 1}).verify(positions);
-  TensorMatcher({tokens}).with_dtype<int64_t>().with_device(device).verify(cache_loc);
+  TensorMatcher({cache_rows, rotary_dim})
+      .with_dtype<fp32_t>()
+      .with_device(device)
+      .verify(cos_sin_cache);
+  TensorMatcher({rotary_dim / 2})
+      .with_dtype<int32_t>()
+      .with_device(device)
+      .verify(axis_map);
+  TensorMatcher({num_axes, tokens})
+      .with_dtype<int64_t>()
+      .with_device(device)
+      .with_strides({-1, 1})
+      .verify(positions);
+  TensorMatcher({tokens}).with_dtype<int64_t>().with_device(device).verify(
+      cache_loc);
   auto slots = SymbolicSize{"state_slots"};
-  TensorMatcher({slots, D}).with_dtype<T>().with_device(device).verify(key_state_buffer);
-  TensorMatcher({slots, 3}).with_dtype<int64_t>().with_device(device).verify(rope_position_buffer);
+  TensorMatcher({slots, D}).with_dtype<T>().with_device(device).verify(
+      key_state_buffer);
+  TensorMatcher({slots, 3})
+      .with_dtype<int64_t>()
+      .with_device(device)
+      .verify(rope_position_buffer);
 
   const int64_t num_tokens = tokens.unwrap();
   const int64_t q_heads_padded = heads_padded.unwrap();
   CHECK_HOST(num_tokens > 0) << "qsa_index_q_prep: no tokens";
-  CHECK_HOST(num_axes == 1 || num_axes == 3) << "qsa_index_q_prep: positions must have 1 or 3 axes, got " << num_axes;
+  CHECK_HOST(num_axes == 1 || num_axes == 3)
+      << "qsa_index_q_prep: positions must have 1 or 3 axes, got " << num_axes;
   CHECK_HOST(q_heads_padded >= num_q_heads)
-      << "qsa_index_q_prep: padded heads " << q_heads_padded << " < num_q_heads " << num_q_heads;
+      << "qsa_index_q_prep: padded heads " << q_heads_padded
+      << " < num_q_heads " << num_q_heads;
   CHECK_HOST(rotary_dim > 0 && rotary_dim % 2 == 0 && rotary_dim <= D)
       << "qsa_index_q_prep: invalid rotary_dim " << rotary_dim;
 
@@ -430,7 +486,8 @@ void qsa_index_q_prep(
       .positions = static_cast<const int64_t*>(positions.data_ptr()),
       .cache_loc = static_cast<const int64_t*>(cache_loc.data_ptr()),
       .key_state_buffer = key_state_buffer.data_ptr(),
-      .rope_position_buffer = static_cast<int64_t*>(rope_position_buffer.data_ptr()),
+      .rope_position_buffer =
+          static_cast<int64_t*>(rope_position_buffer.data_ptr()),
       .positions_stride = positions.stride(0),
       .num_axes = static_cast<int32_t>(num_axes),
       .num_q_heads = static_cast<int32_t>(num_q_heads),
@@ -464,15 +521,29 @@ void qsa_index_k_compress(
   constexpr int64_t D = kHeadDim;
 
   auto slots = SymbolicSize{"state_slots"};
-  TensorMatcher({slots, D}).with_dtype<T>().with_device(device).verify(key_state_buffer);
+  TensorMatcher({slots, D}).with_dtype<T>().with_device(device).verify(
+      key_state_buffer);
   auto groups = SymbolicSize{"groups"};
-  TensorMatcher({groups, compress_ratio}).with_dtype<int32_t>().with_device(device).verify(group_locs);
-  TensorMatcher({slots, 3}).with_dtype<int64_t>().with_device(device).verify(rope_position_buffer);
+  TensorMatcher({groups, compress_ratio})
+      .with_dtype<int32_t>()
+      .with_device(device)
+      .verify(group_locs);
+  TensorMatcher({slots, 3})
+      .with_dtype<int64_t>()
+      .with_device(device)
+      .verify(rope_position_buffer);
   auto cache_rows = SymbolicSize{"cos_sin_cache_rows"};
-  TensorMatcher({cache_rows, rotary_dim}).with_dtype<fp32_t>().with_device(device).verify(cos_sin_cache);
-  TensorMatcher({rotary_dim / 2}).with_dtype<int32_t>().with_device(device).verify(axis_map);
+  TensorMatcher({cache_rows, rotary_dim})
+      .with_dtype<fp32_t>()
+      .with_device(device)
+      .verify(cos_sin_cache);
+  TensorMatcher({rotary_dim / 2})
+      .with_dtype<int32_t>()
+      .with_device(device)
+      .verify(axis_map);
   TensorMatcher({D}).with_dtype<T>().with_device(device).verify(weight);
-  TensorMatcher({groups}).with_dtype<int32_t>().with_device(device).verify(write_locs);
+  TensorMatcher({groups}).with_dtype<int32_t>().with_device(device).verify(
+      write_locs);
   auto compressed_slots = SymbolicSize{"compressed_slots"};
   TensorMatcher({compressed_slots, D}).with_dtype<TOut>().with_device(device).verify(compressed_k_buffer);
 
@@ -486,7 +557,8 @@ void qsa_index_k_compress(
   const auto params = QsaIndexKCompressParams{
       .key_state_buffer = key_state_buffer.data_ptr(),
       .group_locs = static_cast<const int32_t*>(group_locs.data_ptr()),
-      .rope_position_buffer = static_cast<const int64_t*>(rope_position_buffer.data_ptr()),
+      .rope_position_buffer =
+          static_cast<const int64_t*>(rope_position_buffer.data_ptr()),
       .cos_sin_cache = static_cast<const float*>(cos_sin_cache.data_ptr()),
       .axis_map = static_cast<const int32_t*>(axis_map.data_ptr()),
       .weight = weight.data_ptr(),

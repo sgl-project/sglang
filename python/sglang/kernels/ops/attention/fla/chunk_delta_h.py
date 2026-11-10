@@ -16,13 +16,25 @@ from sglang.kernels.ops.attention.fla.index import (
 from sglang.kernels.ops.attention.fla.op import exp, exp2, safe_exp
 from sglang.kernels.ops.attention.fla.utils import (
     autotune_cache_kwargs,
+    is_nvidia,
     is_nvidia_hopper,
 )
 
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8, 16]
 CHUNK_SIZE = 64
-GDN_CHUNK_H_BV = int(os.getenv("SGLANG_GDN_CHUNK_H_BV", "32"))
-GDN_CHUNK_H_NUM_WARPS = int(os.getenv("SGLANG_GDN_CHUNK_H_NUM_WARPS", "4"))
+
+# Volta (sm70) wants a much smaller V tile with more warps than the
+# Hopper-style default. Hand-tuned via a standalone sweep on Qwen3.6-27B GDN
+# shapes (H=12, Hg=4, K=128, V=128): BV=16/num_warps=8 is ~12.6x faster than
+# BV=32/num_warps=4, which leaves V100 deeply under-occupied.
+_is_sm70 = is_nvidia and torch.cuda.get_device_capability()[0] == 7
+_GDN_CHUNK_H_BV_DEFAULT = "16" if _is_sm70 else "32"
+_GDN_CHUNK_H_NUM_WARPS_DEFAULT = "8" if _is_sm70 else "4"
+
+GDN_CHUNK_H_BV = int(os.getenv("SGLANG_GDN_CHUNK_H_BV", _GDN_CHUNK_H_BV_DEFAULT))
+GDN_CHUNK_H_NUM_WARPS = int(
+    os.getenv("SGLANG_GDN_CHUNK_H_NUM_WARPS", _GDN_CHUNK_H_NUM_WARPS_DEFAULT)
+)
 GDN_CHUNK_H_NUM_STAGES = int(os.getenv("SGLANG_GDN_CHUNK_H_NUM_STAGES", "2"))
 
 
@@ -39,6 +51,8 @@ GDN_CHUNK_H_NUM_STAGES = int(os.getenv("SGLANG_GDN_CHUNK_H_NUM_STAGES", "2"))
     # state to a separate output buffer). The env knobs keep this single-config
     # property while allowing model/hardware-local validation of the selected
     # tile without corrupting the state pool through multi-config autotune.
+    # Defaults are architecture-aware (see GDN_CHUNK_H_BV above): sm70 picks
+    # BV=16/num_warps=8, everything else keeps the upstream BV=32/num_warps=4.
     configs=[
         triton.Config(
             {"BV": GDN_CHUNK_H_BV},

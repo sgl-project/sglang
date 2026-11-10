@@ -11,7 +11,6 @@
 
 namespace sglang {
 
-using DType = bf16_t;
 constexpr int64_t kRopeDim = 64;
 constexpr uint32_t kBlockSize = 128;
 constexpr uint32_t kNumWarps = kBlockSize / device::kWarpThreads;
@@ -30,7 +29,7 @@ struct FusedQKRopeParams {
   uint32_t batch_size;
 };
 
-template <bool kUsePDL, bool kInverse, typename IndexType>
+template <typename DType, bool kUsePDL, bool kInverse, typename IndexType>
 __global__ __launch_bounds__(kBlockSize, 16)  //
     void deepseek_rope_kernel(const __grid_constant__ FusedQKRopeParams param) {
   using namespace device;
@@ -84,13 +83,13 @@ __global__ __launch_bounds__(kBlockSize, 16)  //
   PDLTriggerSecondary<kUsePDL>();
 }
 
-template <bool kUsePDL>
+template <typename DType, bool kUsePDL>
 struct FusedQKRopeKernel {
   // 4 kernel variants: {forward, inverse} x {int32, int64}
-  static constexpr auto kernel_fwd_i32 = deepseek_rope_kernel<kUsePDL, false, int32_t>;
-  static constexpr auto kernel_fwd_i64 = deepseek_rope_kernel<kUsePDL, false, int64_t>;
-  static constexpr auto kernel_inv_i32 = deepseek_rope_kernel<kUsePDL, true, int32_t>;
-  static constexpr auto kernel_inv_i64 = deepseek_rope_kernel<kUsePDL, true, int64_t>;
+  static constexpr auto kernel_fwd_i32 = deepseek_rope_kernel<DType, kUsePDL, false, int32_t>;
+  static constexpr auto kernel_fwd_i64 = deepseek_rope_kernel<DType, kUsePDL, false, int64_t>;
+  static constexpr auto kernel_inv_i32 = deepseek_rope_kernel<DType, kUsePDL, true, int32_t>;
+  static constexpr auto kernel_inv_i64 = deepseek_rope_kernel<DType, kUsePDL, true, int64_t>;
 
   static void forward(
       const tvm::ffi::TensorView q,

@@ -256,15 +256,10 @@ fast_topk_cuda_tl_impl(const float* __restrict__ input, int* __restrict__ index,
           const auto pos = ::atomicAdd(&s_counter, 1);
           index[pos] = idx;
         } else if (bin == threshold_bin) {
-          if (round == 3) {
-            const auto pos = ::atomicAdd(&s_last_remain, -1);
-            if (pos > 0) {
-              index[K - pos] = idx;
-            }
-          } else {
-            const auto pos = ::atomicAdd(&s_num_input[r_idx ^ 1], 1);
-            if (C10_LIKELY(pos < SMEM_INPUT_SIZE)) {
-              s_input_idx[r_idx ^ 1][pos] = idx;
+          const auto pos = ::atomicAdd(&s_num_input[r_idx ^ 1], 1);
+          if (C10_LIKELY(pos < SMEM_INPUT_SIZE)) {
+            s_input_idx[r_idx ^ 1][pos] = idx;
+            if (round < 3) {
               const auto bin = convert_to_uint32(raw_input);
               const auto sub_bin = (bin >> (offset - 8)) & 0xFF;
               ::atomicAdd(&s_histogram[sub_bin], 1);
@@ -273,8 +268,67 @@ fast_topk_cuda_tl_impl(const float* __restrict__ input, int* __restrict__ index,
         }
       }
       __syncthreads();
+      if (round == 3) {
+        // Keys left here are bitwise equal; keep the lowest indices so the set
+        // does not depend on which thread reached the counter first.
+        const int num_ties = min(s_num_input[r_idx ^ 1], int(SMEM_INPUT_SIZE));
+        const int* ties = s_input_idx[r_idx ^ 1];
+        for (int i = tx; i < num_ties; i += BLOCK_SIZE) {
+          const int idx = ties[i];
+          int rank = 0;
+          for (int j = 0; j < num_ties; ++j) rank += ties[j] < idx;
+          if (rank < s_last_remain) {
+            index[K - s_last_remain + rank] = idx;
+          }
+        }
+        __syncthreads();
+      }
     }
   }
+}
+
+// Writes the N distinct ids of src (all in [0, length)) to dst in ascending
+// order, through a bitmap of length bits in the dynamic shared memory.
+template <int N>
+__device__ void sort_selected_ascending(const int* __restrict__ src, int* __restrict__ dst, int length) {
+  extern __shared__ uint32_t s_bitmap[];
+  __shared__ int s_warp_sums[kThreadsPerBlock / 32];
+  const int tx = static_cast<int>(threadIdx.x);
+  const int lane = tx % 32;
+  const int warp = tx / 32;
+  const int words = (length + 31) / 32;
+  for (int w = tx; w < words; w += kThreadsPerBlock) s_bitmap[w] = 0;
+  __syncthreads();
+  for (int i = tx; i < N; i += kThreadsPerBlock) ::atomicOr(&s_bitmap[src[i] / 32], 1u << (src[i] % 32));
+  __syncthreads();
+  const int per_thread = (words + kThreadsPerBlock - 1) / kThreadsPerBlock;
+  const int w0 = min(tx * per_thread, words);
+  const int w1 = min(w0 + per_thread, words);
+  int count = 0;
+  for (int w = w0; w < w1; ++w) count += __popc(s_bitmap[w]);
+  int inclusive = count;
+#pragma unroll
+  for (int d = 1; d < 32; d <<= 1) {
+    const int v = __shfl_up_sync(0xffffffffu, inclusive, d);
+    if (lane >= d) inclusive += v;
+  }
+  if (lane == 31) s_warp_sums[warp] = inclusive;
+  __syncthreads();
+  if (warp == 0) {
+    int total = s_warp_sums[lane];
+#pragma unroll
+    for (int d = 1; d < 32; d <<= 1) {
+      const int v = __shfl_up_sync(0xffffffffu, total, d);
+      if (lane >= d) total += v;
+    }
+    s_warp_sums[lane] = total;
+  }
+  __syncthreads();
+  int pos = inclusive - count + (warp > 0 ? s_warp_sums[warp - 1] : 0);
+  for (int w = w0; w < w1; ++w) {
+    for (uint32_t bits = s_bitmap[w]; bits != 0; bits &= bits - 1) dst[pos++] = w * 32 + __ffs(bits) - 1;
+  }
+  __syncthreads();
 }
 
 __device__ __forceinline__ int32_t transform_kpool_token(
@@ -293,7 +347,8 @@ __device__ __forceinline__ int32_t transform_kpool_token(
 
 template <int K>
 __global__ __launch_bounds__(kThreadsPerBlock) void kpool_topk_transform_kernel(
-    const __grid_constant__ FastTopKParams params,
+    // By value. __grid_constant__ is SM90+ and this struct is a handful of pointers.
+    FastTopKParams params,
     int32_t* __restrict__ dst_token_indices,
     const int64_t dst_stride,
     const int32_t pool_size,
@@ -336,8 +391,18 @@ __global__ __launch_bounds__(kThreadsPerBlock) void kpool_topk_transform_kernel(
     return;
   }
 
+  __shared__ int s_selected[K];
   __shared__ int s_indices[K];
-  fast_topk_cuda_tl_impl<K>(score, s_indices, row_start, length);
+  fast_topk_cuda_tl_impl<K>(score, s_selected, row_start, length);
+  // The radix select hands out slots in arrival order; a fixed order keeps the
+  // downstream attention sum reproducible. The bitmap reuses the select's
+  // dynamic shared memory, which covers kSmem * 8 groups.
+  if (length <= static_cast<int>(kSmem * 8)) {
+    sort_selected_ascending<K>(s_selected, s_indices, length);
+  } else {
+    for (int i = tid; i < K; i += kThreadsPerBlock) s_indices[i] = s_selected[i];
+    __syncthreads();
+  }
   for (int col = tid; col < out_cols; col += kThreadsPerBlock) {
     if (col < history_len) {
       const auto group_rank = col / pool_size;

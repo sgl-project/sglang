@@ -18,6 +18,7 @@ from sglang.srt.utils import (
 _is_hip = is_hip()
 _is_gfx95 = is_gfx95_supported()
 _is_sm90 = is_sm90_supported()
+_is_sm70 = is_cuda() and get_device_sm() == 70
 _is_sm103 = is_cuda() and get_device_sm() == 103
 _is_sm107 = is_cuda() and get_device_sm() == 107
 
@@ -218,6 +219,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     # Optional flags for target_verify support (default False for decode)
     DISABLE_STATE_UPDATE: tl.constexpr = False,
     CACHE_INTERMEDIATE_STATES: tl.constexpr = False,
+    QUANTIZE_STATE_EACH_STEP: tl.constexpr = False,
     HAS_EAGLE_TREE_CUSTOM_ATTN_MASK: tl.constexpr = False,
     # ReplaySSM fused ring-write. Pointers stay None and CACHE_RING False for
     # decode / flag-off -> byte-identical. The gate ring layout follows IS_KDA
@@ -548,6 +550,15 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
                 )
                 tl.store(cache_ptr, b_h.to(cache_ptr.dtype.element_ty), mask=mask_h)
 
+                # A normal decode invocation persists and reloads the recurrent
+                # state after every token.  Target verification processes several
+                # tokens in one invocation, so keeping b_h in fp32 between steps
+                # changes the recurrence whenever the persistent state is
+                # fp16/bf16.  Reload the state we just cached to preserve the
+                # exact store/load boundary (a cast pair can be optimized away).
+                if QUANTIZE_STATE_EACH_STEP:
+                    b_h = tl.load(cache_ptr, mask=mask_h, other=0).to(tl.float32)
+
         # A BF16 recurrent-state decode persists its state after every token.
         # Multi-token verification must make that precision boundary visible to
         # the next recurrence step instead of retaining the FP32 accumulator for
@@ -674,6 +685,19 @@ def fused_sigmoid_gating_delta_rule_update(
     )
     if is_kda and _is_sm90 and envs.SGLANG_ENABLE_FP8_BLOCK_GEMV.get():
         BV = _select_bv(V, N * HV, v.device)
+    # Small-batch decode leaves most of the GPU idle: the grid is
+    # (cdiv(V, BV), N, HV) of one warp each, which for Qwen3.8-Flash-Next at
+    # TP4 (HV=12, V=128, N=1) is 48 CTAs on an 80-SM V100. V is a pure output
+    # dimension -- both state reductions reduce over K -- so narrowing BV
+    # spreads the same work over more CTAs at equal traffic, and is bitwise
+    # identical. One CTA of one warp cannot hide the state load, so the target
+    # is several resident per SM, not merely one. Measured on V100 at that
+    # shape, T=4: 48 CTAs 24.03 us, 96 13.19, 192 8.09, 384 9.07 -- so aim for
+    # <= 3 CTAs/SM and never split below BV=8.
+    if _is_sm70 and envs.SGLANG_SM70_MTP_GDN.get() and q.is_cuda:
+        num_sms = _sm_count(q.device.index)
+        while BV > 8 and triton.cdiv(V, BV // 2) * N * HV <= 3 * num_sms:
+            BV //= 2
     BK = triton.next_power_of_2(K)
     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
     assert NK == 1, "NK > 1 is not supported yet"
@@ -792,6 +816,11 @@ def fused_sigmoid_gating_delta_rule_update(
         USE_LOWER_BOUND=lower_bound is not None,
         DISABLE_STATE_UPDATE=disable_state_update,
         CACHE_INTERMEDIATE_STATES=intermediate_states_buffer is not None,
+        QUANTIZE_STATE_EACH_STEP=(
+            intermediate_states_buffer is not None
+            and intermediate_states_buffer.dtype != torch.float32
+            and retrieve_parent_token is None
+        ),
         HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_parent_token is not None,
         replayssm_rawv=replayssm_rawv,
         replayssm_rawk=replayssm_rawk,

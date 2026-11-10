@@ -31,7 +31,7 @@ def _jit_fast_topk_module(topk: int) -> Module:
         "fast_topk",
         *args,
         cuda_files=["elementwise/fast_topk.cuh"],
-        cuda_wrappers=[("fast_topk", f"FastTopKKernel<{args}>::run")],
+        cuda_wrappers=[("fast_topk", f"sglang::FastTopKKernel<{args}>::run")],
     )
 
 

@@ -69,7 +69,8 @@ def fused_engram_gate(
         for a in (x, kv, q_weight, k_weight)
     )
     assert all(
-        a.dtype in (torch.bfloat16, torch.float32) for a in (x, kv, q_weight, k_weight)
+        a.dtype in (torch.bfloat16, torch.float16, torch.float32)
+        for a in (x, kv, q_weight, k_weight)
     )
     out = torch.empty_like(x)
     if t:

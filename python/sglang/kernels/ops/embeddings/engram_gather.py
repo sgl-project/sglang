@@ -2,9 +2,12 @@
 e8m0 block scales.
 
 The table pointers arrive as raw addresses so one kernel serves a device table, a
-pinned host table, or (on Grace-Blackwell, through ATS) a plain host mapping. The
-output is bf16 computed as fp32(row) * 2**(exp - 127) then rounded once, which is
-the arithmetic of the torch lookup it replaces.
+pinned host table, or (on Grace-Blackwell, through ATS) a plain host mapping.
+
+Dequant is fp32(row) * 2**(exp - 127) then a single round to the activation
+dtype. Hopper/Blackwell keep bf16. SM70 has no BF16 and no Triton ``fp8e4nv``,
+so Volta loads the payload as uint8, converts e4m3fn in software, and stores
+fp16.
 """
 
 import torch
@@ -13,6 +16,10 @@ import triton.language as tl
 
 # e8m0 has no zero: the exponent byte 0 encodes 2**-127.
 _E8M0_ZERO = 2.0**-127
+
+
+def _sm70_gather() -> bool:
+    return torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 7
 
 
 @triton.jit
@@ -26,6 +33,7 @@ def _dequant_rows(
     BLK: tl.constexpr,
     E8M0_ZERO: tl.constexpr,
     MXFP4: tl.constexpr,
+    SM70: tl.constexpr = False,
 ):
     # Dequantized fp32 values at columns `offs` of table rows `row`, whose payload
     # and e8m0 scales start at byte addresses `w_base` and `s_base`. MXFP4 rows
@@ -43,6 +51,23 @@ def _dequant_rows(
         bits = tl.where(m >= 2, (m + 252) << 22, m * (252 << 22))
         # Set the sign bit: before Triton 3.8, -x is 0 - x, which turns -0 into +0.
         vals = (bits | ((nib & 0x8) << 28)).to(tl.float32, bitcast=True)
+    elif SM70:
+        # SM70 Triton's fp8e4nv is unsupported; uint8 + software e4m3fn matches
+        # torch.float() of float8_e4m3fn (including denorms: man * 2**-9).
+        w = w_base.to(tl.int64).to(tl.pointer_type(tl.uint8))
+        raw = tl.load(w + row * DIM + offs, mask=mask, other=0).to(tl.int32)
+        sign = (raw >> 7) & 1
+        exp = (raw >> 3) & 0xF
+        man = raw & 7
+        denorm = man.to(tl.float32) * (2.0**-9)
+        norm = (1.0 + man.to(tl.float32) * 0.125) * tl.math.exp2(
+            exp.to(tl.float32) - 7.0
+        )
+        vals = tl.where(exp == 0, denorm, norm)
+        vals = tl.where((exp == 0) & (man == 0), 0.0, vals)
+        # e4m3fn: exp=15, man=7 is NaN (no Inf).
+        vals = tl.where((exp == 15) & (man == 7), float("nan"), vals)
+        vals = tl.where(sign == 1, -vals, vals)
     else:
         vals = tl.load(
             w_base.to(tl.pointer_type(tl.float8e4nv)) + row * DIM + offs,
@@ -84,6 +109,8 @@ def _engram_gather_kernel(
     E8M0_ZERO: tl.constexpr,
     HAS_DST: tl.constexpr,
     MXFP4: tl.constexpr,
+    OUT_BF16: tl.constexpr = True,
+    SM70: tl.constexpr = False,
 ):
     row = tl.program_id(0).to(tl.int64)
     idx = tl.load(ids_ptr + row).to(tl.int64)
@@ -103,9 +130,13 @@ def _engram_gather_kernel(
         BLK,
         E8M0_ZERO,
         MXFP4,
+        SM70,
     )
     out = tl.where(owned, vals, 0.0)
-    tl.store(out_ptr + dst * DIM + offs, out.to(tl.bfloat16))
+    if OUT_BF16:
+        tl.store(out_ptr + dst * DIM + offs, out.to(tl.bfloat16))
+    else:
+        tl.store(out_ptr + dst * DIM + offs, out.to(tl.float16))
 
 
 def engram_gather(
@@ -120,7 +151,7 @@ def engram_gather(
     sort_ids: bool = False,
     mxfp4: bool = False,
 ) -> torch.Tensor:
-    """Gather rows ``ids`` ([N] int) into ``out`` ([N, dim] bf16, contiguous).
+    """Gather rows ``ids`` ([N] int) into ``out`` ([N, dim] fp16/bf16, contiguous).
 
     ``weight_ptr`` addresses [rows, dim] fp8 e4m3 bytes, or with ``mxfp4``
     [rows, dim // 2] bytes of E2M1 pairs (even column in the low nibble), and
@@ -130,14 +161,22 @@ def engram_gather(
 
     ``sort_ids`` reads the rows in address order and writes each to its original
     position. Random rows of a host table larger than the GPU's translation reach
-    miss on nearly every row; sorted, neighbouring programs share a page.
+    miss on nearly every row; sorted, neighbouring programs share a page. SM70
+    requires ``out.dtype == torch.float16``.
     """
     assert dim > 0 and dim & (dim - 1) == 0 and block_size > 0, (dim, block_size)
     assert dim % block_size == 0, (dim, block_size)
     assert (
         ids.is_cuda and ids.is_contiguous() and ids.dtype in (torch.int32, torch.int64)
     )
-    assert out.is_contiguous() and out.dtype == torch.bfloat16
+    assert out.is_contiguous()
+    sm70 = _sm70_gather()
+    if sm70:
+        assert out.dtype == torch.float16, (
+            f"SM70 engram_gather writes fp16, not {out.dtype}"
+        )
+    else:
+        assert out.dtype == torch.bfloat16
     assert out.device == ids.device and out.shape == (ids.numel(), dim), out.shape
     n = ids.numel()
     if n:
@@ -157,6 +196,8 @@ def engram_gather(
             E8M0_ZERO=_E8M0_ZERO,
             HAS_DST=dst is not None,
             MXFP4=mxfp4,
+            OUT_BF16=out.dtype == torch.bfloat16,
+            SM70=sm70,
         )
     return out
 

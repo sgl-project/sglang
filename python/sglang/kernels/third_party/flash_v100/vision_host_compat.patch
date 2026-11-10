@@ -1,0 +1,230 @@
+diff --git a/flash_attn_v100/flash_attn_interface.py b/flash_attn_v100/flash_attn_interface.py
+index bb450cc..44f62a1 100644
+--- a/flash_attn_v100/flash_attn_interface.py
++++ b/flash_attn_v100/flash_attn_interface.py
+@@ -361,8 +361,6 @@ def flash_attn_with_kvcache(
+     cache_batch_idx = maybe_contiguous(cache_batch_idx)
+     block_table = maybe_contiguous(block_table)
+ 
+-    out = torch.empty_like(q)
+-
+     out, softmax_lse = flash_attn_v100_cuda.fwd_kvcache(
+         q,
+         k_cache,
+@@ -376,7 +374,7 @@ def flash_attn_with_kvcache(
+         cache_leftpad,
+         block_table,
+         alibi_slopes,
+-        out,
++        None,
+         softmax_scale,
+         causal,
+         window_size[0],
+diff --git a/kernel/fused_mha_api.cpp b/kernel/fused_mha_api.cpp
+index e354563..2d898aa 100644
+--- a/kernel/fused_mha_api.cpp
++++ b/kernel/fused_mha_api.cpp
+@@ -35,9 +35,15 @@ PYBIND11_MODULE(flash_attn_2_cuda, n) {
+ // ======================================================================================
+ // TorchBind
+ // ======================================================================================
++// TorchBind converts None -> std::nullopt for const optionals, but sometimes
++// creates empty tensors for mutable optionals. This helper treats empty tensors
++// as nullopt for robustness.
+ inline std::optional<const at::Tensor> convert_opt(const std::optional<at::Tensor>& opt) {
+     if (opt.has_value()) {
+-        return std::optional<const at::Tensor>(std::in_place, opt.value());
++        const at::Tensor& t = opt.value();
++        // Treat empty tensors as nullopt (TorchBind None workaround)
++        if (t.numel() == 0) return std::nullopt;
++        return std::optional<const at::Tensor>(std::in_place, t);
+     }
+     return std::nullopt;
+ }
+@@ -277,9 +283,15 @@ std::vector<at::Tensor> torchbind_fwd_kvcache(
+     std::optional<const at::Tensor> rotary_sin_ref = convert_opt(rotary_sin);
+     std::optional<const at::Tensor> cache_idx_ref  = convert_opt(cache_batch_idx);
+     std::optional<const at::Tensor> leftpad_ref    = convert_opt(leftpad_k);
+-    std::optional<at::Tensor> block_ref            = block_table;
+-    std::optional<at::Tensor> alibi_ref            = alibi_slopes;
+-    std::optional<at::Tensor> out_ref              = out;
++
++    // TorchBind None workaround: treat empty mutable tensors as nullopt
++    auto convert_mut = [](const std::optional<at::Tensor>& opt) -> std::optional<at::Tensor> {
++        if (opt.has_value() && opt.value().numel() == 0) return std::nullopt;
++        return opt;
++    };
++    std::optional<at::Tensor> block_ref = convert_mut(block_table);
++    std::optional<at::Tensor> alibi_ref = convert_mut(alibi_slopes);
++    std::optional<at::Tensor> out_ref   = convert_mut(out);
+ 
+     return flash_attention_kvcache(
+         q,
+diff --git a/kernel/fused_mha_forward_kvcache.cu b/kernel/fused_mha_forward_kvcache.cu
+index 9868cf1..819a915 100644
+--- a/kernel/fused_mha_forward_kvcache.cu
++++ b/kernel/fused_mha_forward_kvcache.cu
+@@ -451,7 +451,7 @@ std::vector<at::Tensor> flash_attention_kvcache(
+     const int T_Q       = q.size(1);
+     const int H_Q       = q.size(2);
+     const int D         = q.size(3);
+-    const int H_K       = kcache.size(2);
++    const int H_K       = (kcache.dim() == 3) ? kcache.size(1) : kcache.size(2);
+     const bool is_paged = block_table.has_value();
+ 
+     TORCH_CHECK(B > 0, "batch size must be positive");
+@@ -475,6 +475,9 @@ std::vector<at::Tensor> flash_attention_kvcache(
+     int page_block_size = 1;
+     int max_seqlen_k = 0;
+ 
++    // Paged KV: support both 4D [num_blocks, block_page, H, D] and 3D [N, H, D]
++    at::Tensor kcache_for_launch = kcache;
++    at::Tensor vcache_for_launch = vcache;
+     if (is_paged) {
+         TORCH_CHECK(!cache_batch_idx.has_value(), "Paged KVcache does not support cache_batch_idx");
+         block_table_tensor = block_table.value();
+@@ -483,18 +486,23 @@ std::vector<at::Tensor> flash_attention_kvcache(
+         TORCH_CHECK(block_table_tensor.stride(-1) == 1, "block_table must have contiguous last dimension");
+         TORCH_CHECK(block_table_tensor.size(0) == B, "block_table batch dim must match q");
+ 
+-        page_block_size = kcache.size(1);
+-        TORCH_CHECK(page_block_size % 256 == 0, "Paged KV block size must be divisible by 256");
++        // Support 3D [N, H, D] layout (page_block_size=1, sglang radix-cache)
++        if (kcache.dim() == 3) {
++            kcache_for_launch = kcache.unsqueeze(1); // [N, H, D] -> [N, 1, H, D]
++            vcache_for_launch = vcache.unsqueeze(1);
++            page_block_size = 1;
++        } else {
++            page_block_size = kcache.size(1);
++            TORCH_CHECK(page_block_size % 256 == 0, "4D Paged KV block size must be divisible by 256");
++        }
+ 
+-        const int num_blocks = kcache.size(0);
+         const int max_num_blocks_per_seq = block_table_tensor.size(1);
+         max_seqlen_k = max_num_blocks_per_seq * page_block_size;
+ 
+-        TORCH_CHECK(kcache.sizes() == vcache.sizes(), "K and V paged shapes must match");
+-        TORCH_CHECK(kcache.size(0) == num_blocks, "kcache block dim mismatch");
+-        TORCH_CHECK(kcache.size(1) == page_block_size, "kcache page size mismatch");
+-        TORCH_CHECK(kcache.size(2) == H_K, "kcache heads mismatch");
+-        TORCH_CHECK(kcache.size(3) == D, "kcache head_dim mismatch");
++        TORCH_CHECK(kcache_for_launch.sizes() == vcache_for_launch.sizes(), "K and V paged shapes must match");
++        TORCH_CHECK(kcache_for_launch.size(1) == page_block_size, "kcache page size mismatch");
++        TORCH_CHECK(kcache_for_launch.size(2) == H_K, "kcache heads mismatch");
++        TORCH_CHECK(kcache_for_launch.size(3) == D, "kcache head_dim mismatch");
+     } else {
+         max_seqlen_k = kcache.size(1);
+     }
+@@ -525,8 +533,8 @@ std::vector<at::Tensor> flash_attention_kvcache(
+         TORCH_CHECK(v_tensor.size(2) == H_K, "v heads mismatch");
+         TORCH_CHECK(v_tensor.size(3) == D, "v head_dim mismatch");
+     } else {
+-        k_tensor = torch::empty({0}, q.options());
+-        v_tensor = torch::empty({0}, q.options());
++        k_tensor = torch::empty({0, 0, 0, 0}, q.options());
++        v_tensor = torch::empty({0, 0, 0, 0}, q.options());
+     }
+ 
+     // seqlens_k
+@@ -634,7 +642,7 @@ std::vector<at::Tensor> flash_attention_kvcache(
+     auto stream = at::cuda::getCurrentCUDAStream().stream();
+ 
+     #define LAUNCH_KERNEL(DIM) \
+-    launcher_flash_attention_kvcache<DIM>(q, k_tensor, v_tensor, kcache, vcache, out_fp16, softmax_lse, seqlens_tensor, cbi_tensor, \
++    launcher_flash_attention_kvcache<DIM>(q, k_tensor, v_tensor, kcache_for_launch, vcache_for_launch, out_fp16, softmax_lse, seqlens_tensor, cbi_tensor, \
+                                     leftpad_tensor, block_table_tensor, cos_tensor, sin_tensor, T_NEW, max_seqlen_k, is_rope, is_interleaved, rotary_dim, \
+                                     softmax_scale, is_causal, softcap, alibi_ptr, alibi_batch, window_left, window_right, is_paged, stream);
+     switch (D) {
+diff --git a/kernel/fused_mha_forward_varlen.cu b/kernel/fused_mha_forward_varlen.cu
+index dc3f169..b6d4dc8 100644
+--- a/kernel/fused_mha_forward_varlen.cu
++++ b/kernel/fused_mha_forward_varlen.cu
+@@ -426,8 +426,8 @@ std::vector<at::Tensor> flash_attention_varlen_forward(
+     const int B   = cu_seqlens_q.size(0) - 1;
+     const bool paged_KV = block_table.has_value();
+ 
+-    int H_K = paged_KV ? k.size(2) : k.size(1);
+-    int page_block_size = paged_KV ? k.size(1) : 1;
++    int H_K = (k.dim() == 3) ? k.size(1) : k.size(2);
++    int page_block_size = paged_KV ? ((k.dim() == 3) ? 1 : k.size(1)) : 1;
+ 
+     TORCH_CHECK(B > 0, "batch size must be positive");
+     TORCH_CHECK(D <= 256, "head dimension must be <= 256");
+@@ -443,23 +443,30 @@ std::vector<at::Tensor> flash_attention_varlen_forward(
+         TORCH_CHECK(p_dropout == 0.f, "Softcapping does not support dropout");
+     }
+ 
+-    // paged KV
++    // paged KV: support both 4D [num_blocks, block_page, H, D] and 3D [N, H, D]
++    at::Tensor k_for_launch = k;
++    at::Tensor v_for_launch = v;
+     at::Tensor block_table_tensor;
+     if (paged_KV) {
+         block_table_tensor = block_table.value();
+         TORCH_CHECK(block_table_tensor.is_cuda(), "block_table must be on CUDA");
+         TORCH_CHECK(block_table_tensor.dtype() == torch::kInt32, "block_table must have dtype int32");
+         TORCH_CHECK(block_table_tensor.stride(-1) == 1, "block_table must have contiguous last dimension");
+-        TORCH_CHECK(page_block_size % 256 == 0, "Paged KV block size must be divisible by 256");
+ 
+-        const int num_blocks = k.size(0);
+-        const int max_num_blocks_per_seq = block_table_tensor.size(1);
++        // Support 3D [N, H, D] layout (page_block_size=1, sglang radix-cache)
++        if (k.dim() == 3) {
++            k_for_launch = k.unsqueeze(1); // [N, H, D] -> [N, 1, H, D]
++            v_for_launch = v.unsqueeze(1);
++            page_block_size = 1;
++        } else {
++            TORCH_CHECK(page_block_size % 256 == 0, "4D Paged KV block size must be divisible by 256");
++        }
++
+         TORCH_CHECK(block_table_tensor.size(0) == B, "block_table batch dim must match q");
+-        TORCH_CHECK(k.sizes() == v.sizes(), "K and V paged shapes must match");
+-        TORCH_CHECK(k.size(0) == num_blocks, "k block dim mismatch");
+-        TORCH_CHECK(k.size(1) == page_block_size, "k page size mismatch");
+-        TORCH_CHECK(k.size(2) == H_K, "k heads mismatch");
+-        TORCH_CHECK(k.size(3) == D, "k head_dim mismatch");
++        TORCH_CHECK(k_for_launch.sizes() == v_for_launch.sizes(), "K and V paged shapes must match");
++        TORCH_CHECK(k_for_launch.size(1) == page_block_size, "k page size mismatch");
++        TORCH_CHECK(k_for_launch.size(2) == H_K, "k heads mismatch");
++        TORCH_CHECK(k_for_launch.size(3) == D, "k head_dim mismatch");
+     }
+ 
+     // cu_seqlens
+@@ -563,7 +570,7 @@ std::vector<at::Tensor> flash_attention_varlen_forward(
+     auto stream = at::cuda::getCurrentCUDAStream().stream();
+ 
+     #define LAUNCH_KERNEL(DIM) \
+-        launcher_flash_attention_forward_varlen<DIM>(q, k, v, out_fp16, softmax_lse, dmask, cu_seqlens_q, cu_seqlens_k, seqused_tensor, leftpad_tensor, \
++        launcher_flash_attention_forward_varlen<DIM>(q, k_for_launch, v_for_launch, out_fp16, softmax_lse, dmask, cu_seqlens_q, cu_seqlens_k, seqused_tensor, leftpad_tensor, \
+                                                      block_table_tensor, paged_KV, T_Q, max_seqlen_q, max_seqlen_k, softmax_scale, is_causal, softcap, p_dropout, \
+                                                      alibi_ptr, alibi_batch, window_left, window_right, dropout_seed, dropout_offset, stream);
+     switch (D) {
+diff --git a/pyproject.toml b/pyproject.toml
+index 520c683..9e37adb 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -17,8 +17,7 @@ version = "26.06"
+ description = "Flash Attention 2 for Tesla v100"
+ readme = "README.md"
+ requires-python = ">=3.10"
+-license = "BSD-3-Clause"
+-license-files = ["LICENSE", "AUTHORS"]
++license = {text = "BSD-3-Clause"}
+ dynamic = ["authors", "classifiers", "urls"]
+ dependencies = [
+     "torch @ https://download-r2.pytorch.org/whl/cu129/torch-2.10.0%2Bcu129-cp312-cp312-manylinux_2_28_x86_64.whl#sha256=a3c703e74a88cccfeb4b1807c49d563a0a73793ba72d4fa035d4ac5885f3aefd",
+diff --git a/setup.py b/setup.py
+index 3395520..45d1bcc 100644
+--- a/setup.py
++++ b/setup.py
+@@ -138,8 +138,8 @@ def get_cmdclass():
+ 
+             if not torch.cuda.is_available():
+                 raise RuntimeError("CUDA is required but not available.")
+-            if parse(torch.version.cuda) < parse("12.9"):
+-                raise RuntimeError(f"CUDA version {torch.version.cuda} < 12.9 is not supported.")
++            if parse(torch.version.cuda) < parse("12.8"):
++                raise RuntimeError(f"CUDA version {torch.version.cuda} < 12.8 is not supported.")
+ 
+             super().build_extensions()
+ 

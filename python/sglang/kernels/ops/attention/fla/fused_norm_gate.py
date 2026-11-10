@@ -9,6 +9,10 @@ import triton.language as tl
 
 from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.kernels.ops.elementwise.sm70_norm_gate import (
+    sm70_norm_gate,
+    sm70_norm_gate_covered,
+)
 from sglang.srt.utils import (
     cdiv,
     cpu_has_amx_support,
@@ -446,15 +450,21 @@ class FusedRMSNormGated(nn.Module):
             return torch.ops.sgl_kernel.fused_rmsnorm_gated_cpu(
                 x, self.weight, g, self.eps
             )
-        else:
-            return rms_norm_gated(
-                x,
-                g,
-                self.weight,
-                self.bias,
-                self.activation,
-                residual=residual,
-                eps=self.eps,
-                prenorm=prenorm,
-                residual_in_fp32=residual_in_fp32,
-            )
+        if residual is None and not prenorm and not residual_in_fp32:
+            x_rows = x.reshape(-1, x.shape[-1])
+            g_rows = g.reshape(-1, g.shape[-1])
+            if sm70_norm_gate_covered(x_rows, g_rows, self.weight, self.activation):
+                return sm70_norm_gate(x_rows, g_rows, self.weight, self.eps).view(
+                    x.shape
+                )
+        return rms_norm_gated(
+            x,
+            g,
+            self.weight,
+            self.bias,
+            self.activation,
+            residual=residual,
+            eps=self.eps,
+            prenorm=prenorm,
+            residual_in_fp32=residual_in_fp32,
+        )

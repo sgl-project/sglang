@@ -148,6 +148,10 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
             x_elem_ty = x_ptr.dtype.element_ty
             prior_tokens = conv_states_base + (state_len - 1) * stride_conv_state_tok
             mask_w = idx_feats < dim
+            # Cast conv_state loads to the activation dtype: conv_states may be
+            # bf16 while the model runs fp16 (forced on SM70/V100), and the
+            # else-branch below produces x_ptr.dtype, so both branches of this
+            # if/else must agree or Triton rejects the kernel.
             if KERNEL_WIDTH == 2:
                 conv_states_ptrs = prior_tokens  # [BLOCK_N]
                 col0 = tl.load(conv_states_ptrs, mask_w, 0.0).to(x_elem_ty)

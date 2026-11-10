@@ -17,16 +17,22 @@ BKV_LIST = [64, 128] if check_shared_mem() else [32, 64]
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8]
 
 
-# @triton.autotune(
-#     configs=[
-#         triton.Config({"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages)
-#         for BK in BKV_LIST
-#         for BV in BKV_LIST
-#         for num_warps in NUM_WARPS
-#         for num_stages in [2, 3, 4]
-#     ],
-#     key=["H", "K", "V", "BT"],
-# )
+@triton.autotune(
+    # V100/A100-friendly search. chunk_fwd_kernel_o writes to a freshly-allocated
+    # output `o` (no in-place state mutation), so multi-config autotune is safe
+    # here (unlike fwd_h, which writes ht into initial_state in-place). The
+    # previous build hardcoded BK=128,BV=64,num_warps=4,num_stages=2 — H100-tuned
+    # defaults that under-utilise V100 (this kernel was 44.7% of prefill GPU time
+    # at ~180W/300W). Results are cached per (H,K,V,BT,USE_G,IS_VARLEN).
+    configs=[
+        triton.Config({"BK": bk, "BV": bv}, num_warps=nw, num_stages=ns)
+        for bk in [32, 64, 128]
+        for bv in [32, 64]
+        for nw in [4, 8]
+        for ns in [2, 3]
+    ],
+    key=["H", "K", "V", "BT", "USE_G", "IS_VARLEN"],
+)
 @triton.jit(do_not_specialize=["T"])
 def chunk_fwd_kernel_o(
     q,

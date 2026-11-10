@@ -13,6 +13,22 @@ from sglang.srt.utils import is_hip, is_xpu
 from .kv_layout import KVLayout
 from .utils import make_name
 
+_FREQS_REAL_CACHE: dict = {}
+
+
+def _freqs_cis_as_real(freqs_cis: torch.Tensor) -> torch.Tensor:
+    """Interleaved fp32 [max_pos, rope_dim] view of a constant complex table."""
+    if not torch.is_complex(freqs_cis):
+        return freqs_cis if freqs_cis.is_contiguous() else freqs_cis.contiguous()
+    key = (int(freqs_cis.data_ptr()), tuple(freqs_cis.shape), str(freqs_cis.device))
+    cached = _FREQS_REAL_CACHE.get(key)
+    if cached is None:
+        table = torch.view_as_real(freqs_cis).flatten(-2)
+        cached = table if table.is_contiguous() else table.contiguous()
+        _FREQS_REAL_CACHE[key] = cached
+    return cached
+
+
 _is_hip = is_hip()
 _is_xpu = is_xpu()
 
@@ -22,8 +38,8 @@ if _is_xpu:
 
 
 @cache_once
-def _jit_fused_rope_module():
-    args = make_cpp_args(is_arch_support_pdl())
+def _jit_fused_rope_module(dtype: torch.dtype):
+    args = make_cpp_args(dtype, is_arch_support_pdl())
     return load_jit(
         make_name("fused_rope"),
         *args,
@@ -149,8 +165,8 @@ def fused_rope_inplace(
     """Apply rotary embeddings to both Q and K in a single fused CUDA kernel.
 
     Args:
-        q: [batch_size, num_q_heads, rope_dim] bfloat16
-        k: [batch_size, num_k_heads, rope_dim] bfloat16 or None
+        q: [batch_size, num_q_heads, rope_dim] bfloat16 or float16
+        k: [batch_size, num_k_heads, rope_dim] same dtype as q, or None
         freqs_cis: [max_seq_len, rope_dim // 2] complex64 (full table)
         positions: [batch_size] int32 or int64, indices into freqs_cis
         inverse: if True, apply inverse rotation (conjugate freqs)
@@ -165,8 +181,8 @@ def fused_rope_inplace(
             apply_rotary_emb_triton(k, freqs_cis, positions=positions, inverse=inverse)
         return
 
-    freqs_real = torch.view_as_real(freqs_cis).flatten(-2).contiguous()
-    module = _jit_fused_rope_module()
+    freqs_real = _freqs_cis_as_real(freqs_cis)
+    module = _jit_fused_rope_module(q.dtype)
     module.forward(q, k, freqs_real, positions, inverse)
 
 
@@ -205,7 +221,7 @@ def fused_q_norm_rope(
         assert q_output.shape == q_input.shape
         assert q_output.device == q_input.device
         q_output = torch.empty_like(q_input)
-    freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
+    freqs_real = _freqs_cis_as_real(freqs_cis)
     head_dim = q_input.shape[-1]
     rope_dim = freqs_real.shape[-1]
     if _is_xpu:
@@ -227,7 +243,7 @@ def fused_q_indexer_rope_hadamard_quant(
     freqs_cis: torch.Tensor,
     positions: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
+    freqs_real = _freqs_cis_as_real(freqs_cis)
     q_fp8 = torch.empty(q_input.shape, dtype=torch.float8_e4m3fn, device=q_input.device)
     weights_out = torch.empty(
         (*q_input.shape[:-1], 1), dtype=torch.float32, device=q_input.device
@@ -277,7 +293,7 @@ def fused_q_indexer_rope_hadamard_fp4_quant(
 ) -> Tuple[Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
     if _is_hip:
         raise RuntimeError("DeepSeek V4 FP4 indexer requires the CUDA fused Q path.")
-    freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
+    freqs_real = _freqs_cis_as_real(freqs_cis)
     q_fp4 = torch.empty(
         (*q_input.shape[:-1], q_input.shape[-1] // 2),
         dtype=torch.int8,
@@ -316,7 +332,7 @@ def fused_k_norm_rope_flashmla(
     """RMSNorm + RoPE ``kv`` and write it into the ``layout`` paged FlashMLA
     cache at ``out_loc``."""
     layout = KVLayout.parse(layout)
-    freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
+    freqs_real = _freqs_cis_as_real(freqs_cis)
     head_dim = kv.shape[-1]
     rope_dim = freqs_real.shape[-1]
     if _is_xpu:

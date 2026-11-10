@@ -59,21 +59,28 @@ def get_flashinfer_include_paths() -> List[str]:
         )
 
     flashinfer_data = flashinfer_root / "data"
-    candidates = [
-        flashinfer_data / "include",
+    required = [flashinfer_data / "include"]
+    # Wheel layout ships cutlass/spdlog under data/. The SM70 editable
+    # checkout only vendors those as empty 3rdparty stubs; MTP sampling
+    # needs <flashinfer/sampling.cuh>, not cutlass. Keep optional paths
+    # when present so other JIT kernels still pick them up.
+    optional = [
         flashinfer_data / "csrc",
         flashinfer_data / "cutlass" / "include",
         flashinfer_data / "cutlass" / "tools" / "util" / "include",
         flashinfer_data / "spdlog" / "include",
     ]
 
-    for path in candidates:
+    for path in required:
         if not path.exists():
             raise RuntimeError(
                 f"Required header path {path} for flashinfer dependency not found."
                 " Please check your flashinfer installation."
             )
         include_paths.append(str(path))
+    for path in optional:
+        if path.exists():
+            include_paths.append(str(path))
     return include_paths
 
 

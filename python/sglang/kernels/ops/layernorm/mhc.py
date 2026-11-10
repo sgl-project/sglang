@@ -20,6 +20,7 @@ from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.utils.common import strict_contiguous
 from sglang.srt.runtime_context import get_parallel, get_platform
 from sglang.srt.utils import is_gfx95_supported, is_hip
+from sglang.srt.utils.common import is_sm70_supported
 from sglang.srt.utils.device import is_gfx1250_supported
 
 _is_hip = is_hip()
@@ -446,6 +447,21 @@ def hc_split_sinkhorn(
         # TileLang's CK-backed addressing doesn't compile on gfx1250; use the
         # Triton port.
         return _hc_split_sinkhorn_triton(
+            mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps
+        )
+    if is_sm70_supported():
+        # Volta cannot compile TileLang MHC. DSV4.1-shaped mixes use the SM70
+        # JIT (same 4-wide reduction order as _hc_split_sinkhorn_torch);
+        # other shapes keep the torch golden so TileLang is never pulled.
+        if hc_mult == 4 and mixes.shape[-1] == 24:
+            from sglang.kernels.ops.elementwise.sm70_dsv41_hc_mix import (
+                split_sinkhorn as _sm70_dsv41_split_sinkhorn,
+            )
+
+            return _sm70_dsv41_split_sinkhorn(
+                mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps
+            )
+        return _hc_split_sinkhorn_torch(
             mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps
         )
     pre = mixes.new_empty(b, s, hc_mult)
@@ -1912,6 +1928,69 @@ def hc_contract(x: torch.Tensor, n: int) -> torch.Tensor:
     return x.unflatten(-1, (n, -1)).mean(dim=-2)
 
 
+# Measured to win at decode sizes only; prefill keeps the cuBLAS mix GEMM.
+_GLM_SM70_PRE_FUSED_MAX_TOKENS = 64
+
+
+def _is_glm_sm70_hc(
+    residual: torch.Tensor,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+) -> bool:
+    _, n, h = residual.shape
+    return (
+        n == 4
+        and h == 4096
+        and hc_post_mult_value == 2.0
+        and hc_pre_eps == hc_sinkhorn_eps
+        and residual.dtype == torch.float16
+        and residual.is_cuda
+        and torch.cuda.get_device_capability(residual.device) == (7, 0)
+    )
+
+
+def _glm_sm70_pre_fused_norm(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    norm_weight: torch.Tensor,
+    norm_eps: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    """_mhc_pre_torch followed by the caller's RMSNorm, or None when the SM70
+    kernel does not cover it. Bitwise equal to sgl_kernel rmsnorm on the layer
+    input, so it only stands in for a plain RMSNorm (no HF cast)."""
+    if not (
+        _is_glm_sm70_hc(residual, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value)
+        and 0 < residual.shape[0] <= _GLM_SM70_PRE_FUSED_MAX_TOKENS
+    ):
+        return None
+    from sglang.kernels.ops.elementwise.sm70_glm_hc import (
+        glm_hc_pre_fused,
+        glm_hc_pre_fused_norm_covered,
+    )
+
+    if not glm_hc_pre_fused_norm_covered(norm_weight):
+        return None
+    return glm_hc_pre_fused(
+        residual,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        sinkhorn_repeat,
+        float(hc_sinkhorn_eps),
+        norm_weight=norm_weight,
+        norm_eps=float(norm_eps),
+    )
+
+
 def _mhc_pre_torch(
     residual: torch.Tensor,
     fn: torch.Tensor,
@@ -1928,9 +2007,38 @@ def _mhc_pre_torch(
     s, n, h = residual.shape
     dtype = residual.dtype
 
+    # GLM-5.3 on SM70: one Sinkhorn+combine kernel instead of ~40 launches.
+    glm_sm70 = _is_glm_sm70_hc(
+        residual, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value
+    )
+    if glm_sm70 and s <= _GLM_SM70_PRE_FUSED_MAX_TOKENS:
+        from sglang.kernels.ops.elementwise.sm70_glm_hc import glm_hc_pre_fused
+
+        return glm_hc_pre_fused(
+            residual,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            sinkhorn_repeat,
+            float(hc_sinkhorn_eps),
+        )
+
     x_flat = residual.view(s, n * h).float()
     rsqrt = torch.rsqrt(x_flat.square().mean(-1, keepdim=True) + rms_eps)
     mixes = F.linear(x_flat, fn) * rsqrt
+
+    if glm_sm70:
+        from sglang.kernels.ops.elementwise.sm70_glm_hc import glm_hc_pre
+
+        return glm_hc_pre(
+            residual,
+            mixes,
+            hc_scale,
+            hc_base,
+            sinkhorn_repeat,
+            float(hc_sinkhorn_eps),
+        )
 
     pre_raw = mixes[:, :n]
     post_raw = mixes[:, n : 2 * n]
@@ -1959,6 +2067,16 @@ def _mhc_post_torch(
     post_layer_mix: torch.Tensor,
     comb_res_mix: torch.Tensor,
 ) -> torch.Tensor:
+    if (
+        residual.shape[-2] == 4
+        and residual.shape[-1] == 4096
+        and x.dtype == torch.float16
+        and x.is_cuda
+        and torch.cuda.get_device_capability(x.device) == (7, 0)
+    ):
+        from sglang.kernels.ops.elementwise.sm70_glm_hc import glm_hc_post
+
+        return glm_hc_post(x, residual, post_layer_mix, comb_res_mix)
     out = post_layer_mix * x.unsqueeze(1) + (
         comb_res_mix.unsqueeze(-1) * residual.unsqueeze(2)
     ).sum(dim=1)
@@ -2000,6 +2118,22 @@ def _mhc_pre_dispatch(
             return post_mix, comb_mix, layer_input, norm_weight is not None
 
     if not _use_tilelang_mhc_pre():
+        if norm_weight is not None:
+            fused = _glm_sm70_pre_fused_norm(
+                residual=residual,
+                fn=fn,
+                hc_scale=hc_scale,
+                hc_base=hc_base,
+                rms_eps=rms_eps,
+                hc_pre_eps=hc_pre_eps,
+                hc_sinkhorn_eps=hc_sinkhorn_eps,
+                hc_post_mult_value=hc_post_mult_value,
+                sinkhorn_repeat=sinkhorn_repeat,
+                norm_weight=norm_weight,
+                norm_eps=norm_eps,
+            )
+            if fused is not None:
+                return (*fused, True)
         post_mix, comb_mix, layer_input = _mhc_pre_torch(
             residual=residual,
             fn=fn,

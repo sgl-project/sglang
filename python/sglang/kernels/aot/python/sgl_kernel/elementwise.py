@@ -1,3 +1,4 @@
+import os
 from typing import Optional
 
 import torch
@@ -9,6 +10,14 @@ try:
     _has_flashinfer = True
 except ImportError:
     _has_flashinfer = False
+
+_flashinfer_norm_disabled = os.environ.get("SGLANG_DISABLE_FLASHINFER_NORM", "0") == "1"
+
+
+def _is_sm70():
+    if not torch.cuda.is_available():
+        return False
+    return torch.cuda.get_device_capability()[0] == 7
 
 _FLASHINFER_NORM_SUPPORTED_DTYPES = {torch.float16, torch.bfloat16}
 
@@ -114,6 +123,8 @@ def rmsnorm(
     #      https://github.com/flashinfer-ai/flashinfer/pull/2733
     if (
         _has_flashinfer
+        and not _flashinfer_norm_disabled
+        and not _is_sm70()
         and input.dtype in _FLASHINFER_NORM_SUPPORTED_DTYPES
         and not torch.compiler.is_dynamo_compiling()
     ):
@@ -154,6 +165,8 @@ def fused_add_rmsnorm(
     """
     if (
         _has_flashinfer
+        and not _flashinfer_norm_disabled
+        and not _is_sm70()
         and input.dtype in _FLASHINFER_NORM_SUPPORTED_DTYPES
         and not torch.compiler.is_dynamo_compiling()
     ):
@@ -195,6 +208,8 @@ def gemma_rmsnorm(
     """
     if (
         _has_flashinfer
+        and not _flashinfer_norm_disabled
+        and not _is_sm70()
         and input.dtype in _FLASHINFER_NORM_SUPPORTED_DTYPES
         and not torch.compiler.is_dynamo_compiling()
     ):
@@ -235,6 +250,8 @@ def gemma_fused_add_rmsnorm(
     """
     if (
         _has_flashinfer
+        and not _flashinfer_norm_disabled
+        and not _is_sm70()
         and input.dtype in _FLASHINFER_NORM_SUPPORTED_DTYPES
         and not torch.compiler.is_dynamo_compiling()
     ):

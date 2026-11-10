@@ -474,6 +474,16 @@ def moe_fused_gate(
         )
         if moe_route_radix.covered(scores, bias, topk):
             return moe_route_radix.route_radix(*radix_args, sorted=False)
+        from sglang.kernels.ops.moe import sm70_router_topk
+
+        if sm70_router_topk.sm70_router_covered(scores, bias, topk):
+            return sm70_router_topk.sm70_router_topk(
+                scores,
+                bias,
+                renormalize,
+                routed_scaling_factor,
+                apply_routed_scaling_factor_on_output,
+            )
 
     # One-warp-per-token CUDA router: same selection, order and padding contract
     # as the Triton kernel below.

@@ -4,16 +4,32 @@ import triton.language as tl
 
 
 @triton.jit(
-    do_not_specialize=["sizes", "cols", "source_strides", "dest_strides"],
-    do_not_specialize_on_alignment=["sizes", "cols", "source_strides", "dest_strides"],
+    do_not_specialize=[
+        "sizes",
+        "cols",
+        "source_row_strides",
+        "source_col_strides",
+        "dest_row_strides",
+        "dest_col_strides",
+    ],
+    do_not_specialize_on_alignment=[
+        "sizes",
+        "cols",
+        "source_row_strides",
+        "source_col_strides",
+        "dest_row_strides",
+        "dest_col_strides",
+    ],
 )
 def _small_copy_kernel(
     sources,
     destinations,
     sizes,
     cols,
-    source_strides,
-    dest_strides,
+    source_row_strides,
+    source_col_strides,
+    dest_row_strides,
+    dest_col_strides,
     BIT_WIDTHS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
@@ -21,14 +37,13 @@ def _small_copy_kernel(
     offsets = (tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)).to(tl.int64)
     for i in tl.static_range(len(BIT_WIDTHS)):
         if field == i:
-            src_offset = (
-                offsets // cols[i] * source_strides[i][0]
-                + offsets % cols[i] * source_strides[i][1]
-            )
-            dst_offset = (
-                offsets // cols[i] * dest_strides[i][0]
-                + offsets % cols[i] * dest_strides[i][1]
-            )
+            # Nested stride tuples (`strides[i][1]`) lose their type in
+            # Triton 3.5. Flat row/col tuples keep the same addressing.
+            col = cols[i]
+            quot = offsets // col
+            rem = offsets - quot * col
+            src_offset = quot * source_row_strides[i] + rem * source_col_strides[i]
+            dst_offset = quot * dest_row_strides[i] + rem * dest_col_strides[i]
             src = sources[i]
             dst = destinations[i]
             if BIT_WIDTHS[i] == 8:
@@ -128,8 +143,10 @@ def try_small_copy(dsts, srcs):
             tuple(dsts),
             tuple(sizes),
             tuple(cols),
-            tuple(src_strides),
-            tuple(dst_strides),
+            tuple(pair[0] for pair in src_strides),
+            tuple(pair[1] for pair in src_strides),
+            tuple(pair[0] for pair in dst_strides),
+            tuple(pair[1] for pair in dst_strides),
             tuple(bit_widths),
             BLOCK=256,
         )

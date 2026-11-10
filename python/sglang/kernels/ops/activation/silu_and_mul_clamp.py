@@ -15,6 +15,10 @@ from sglang.srt.utils import is_xpu
 _is_xpu = is_xpu()
 
 
+def _is_sm70() -> bool:
+    return torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 7
+
+
 def make_name(name: str) -> str:
     return f"dpsk_v4_{name}"
 
@@ -63,6 +67,13 @@ def silu_and_mul_clamp(
         from sgl_kernel import silu_and_mul_clamp
 
         silu_and_mul_clamp(input, output, float(swiglu_limit))
+    elif input.dtype == torch.float16 and _is_sm70():
+        # The JIT kernel rounds its inputs to bf16 (the DeepSeek-V4 clamp
+        # contract), which drops three mantissa bits of an fp16 gate_up.
+        # SM70 only: the fallback stays upstream's on every other arch.
+        from sglang.kernels.ops.moe.sm70_moe_glue import swiglu_clamp
+
+        swiglu_clamp(output, input, float(swiglu_limit))
     else:
         module = _jit_silu_and_mul_clamp_module(input.dtype)
         module.run(input, output, float(swiglu_limit))

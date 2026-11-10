@@ -319,6 +319,7 @@ def fused_moe_kernel(
     c_ptr,
     a_scale_ptr,
     b_scale_ptr,
+    b_scale2_ptr,
     topk_weights_ptr,
     sorted_token_ids_ptr,
     expert_ids_ptr,
@@ -361,6 +362,8 @@ def fused_moe_kernel(
     use_fp8_w8a8: tl.constexpr,
     use_int8_w8a8: tl.constexpr,
     use_int8_w8a16: tl.constexpr,
+    use_nvfp4_w4a16: tl.constexpr,
+    nvfp4_group_size: tl.constexpr,
     per_channel_quant: tl.constexpr,
     even_Ks: tl.constexpr,
     c_sorted: tl.constexpr,
@@ -489,6 +492,17 @@ def fused_moe_kernel(
 
     if b_desc is not None:
         start_offs_n = pid_n * BLOCK_SIZE_N
+    elif use_nvfp4_w4a16:
+        # NVFP4 weights are packed 2 elements per uint8 along K; index into
+        # the packed K dimension with offs_k // 2.
+        b_ptrs = (
+            b_ptr
+            + off_experts * stride_be
+            + ((offs_k // 2)[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+        )
+        b_scale_ptrs = (
+            b_scale_ptr + off_experts * stride_bse + offs_bn[None, :] * stride_bsn
+        )
     else:
         b_ptrs = (
             b_ptr
@@ -574,7 +588,55 @@ def fused_moe_kernel(
             b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k_start, other=0.0)
 
         # We accumulate along the K dimension.
-        if use_int8_w8a16:
+        if use_nvfp4_w4a16:
+            # ---- NVFP4 (SM70) on-the-fly dequant: FP4 E2M1 weight *
+            # ---- E4M3 block scale * per-expert tensor scale -> fp16.
+            if even_Ks:
+                b_packed = tl.load(b_ptrs)
+            else:
+                b_packed = tl.load(
+                    b_ptrs,
+                    mask=(offs_k[:, None] < K - k_start),
+                    other=0,
+                )
+            xb = b_packed.to(tl.int32)
+            # nibble interleave: low nibble = even K, high nibble = odd K
+            sel = (offs_k % 2).to(tl.int32)
+            lo = xb & 0x0F
+            hi = (xb >> 4) & 0x0F
+            nib = lo * (1 - sel[:, None]) + hi * sel[:, None]
+            # FP4 E2M1 decode (arithmetic-only: LUT/interleave broken on SM70)
+            expf = (nib >> 1) & 3
+            mant = (nib & 1).to(tl.float32)
+            normal = (1.0 + 0.5 * mant) * tl.exp2(expf.to(tl.float32) - 1.0)
+            subn = mant * 0.5
+            fp4val = (
+                normal * (1.0 - (expf == 0).to(tl.float32))
+                + subn * (expf == 0).to(tl.float32)
+            )
+            fp4val = fp4val * (1.0 - 2.0 * ((nib >> 3) & 1).to(tl.float32))
+            # E4M3 block scale (group_size == 16) decode. The scale
+            # pointer is not advanced per k-tile, so offset by k_start.
+            sf_u = tl.load(
+                b_scale_ptrs
+                + (k_start // nvfp4_group_size + offs_k // nvfp4_group_size)[:, None]
+                * stride_bsk,
+                mask=(offs_k[:, None] < K - k_start),
+                other=0,
+            ).to(tl.int32)
+            sf_s = (sf_u >> 7) & 1
+            sf_e = (sf_u >> 3) & 0xF
+            sf_m = (sf_u & 0x7).to(tl.float32)
+            sfn = (1.0 + sf_m / 8.0) * tl.exp2(sf_e.to(tl.float32) - 7.0)
+            sfu = sf_m * 0.015625
+            sf = (
+                sfn * (1.0 - (sf_e == 0).to(tl.float32))
+                + sfu * (sf_e == 0).to(tl.float32)
+            )
+            sf = sf * (1.0 - 2.0 * sf_s.to(tl.float32))
+            b = (fp4val * sf).to(compute_type)
+            accumulator = tl.dot(a, b, acc=accumulator)
+        elif use_int8_w8a16:
             accumulator = tl.dot(a, b.to(compute_type), acc=accumulator)
         elif use_fp8_w8a8 or use_int8_w8a8:
             if group_k > 0 and group_n > 0:
@@ -607,12 +669,19 @@ def fused_moe_kernel(
         if a_desc is None:
             a_ptrs += BLOCK_SIZE_K * stride_ak
         if b_desc is None:
-            b_ptrs += BLOCK_SIZE_K * stride_bk
+            if use_nvfp4_w4a16:
+                b_ptrs += (BLOCK_SIZE_K // 2) * stride_bk
+            else:
+                b_ptrs += BLOCK_SIZE_K * stride_bk
 
     if swap_ab:
         accumulator = tl.trans(accumulator, (1, 0))
 
-    if use_int8_w8a16:
+    if use_nvfp4_w4a16:
+        # Per-expert tensor scale (fp32) folded after fp32 accumulation.
+        alpha = tl.load(b_scale2_ptr + off_experts)
+        accumulator *= alpha
+    elif use_int8_w8a16:
         accumulator *= b_scale
     elif use_fp8_w8a8 or use_int8_w8a8:
         if group_k == 0 or group_n == 0:
@@ -819,8 +888,11 @@ def invoke_fused_moe_kernel(
     use_int8_w8a8: bool,
     use_int8_w8a16: bool,
     use_int4_w4a16: bool,
-    per_channel_quant: bool,
+    use_nvfp4_w4a16: bool = False,
+    nvfp4_group_size: int = 16,
+    per_channel_quant: bool = False,
     block_shape: Optional[List[int]] = None,
+    B_scale2: Optional[torch.Tensor] = None,
     no_combine: bool = False,
     a_use_tma: bool = False,
     b_use_tma: bool = False,
@@ -938,6 +1010,11 @@ def invoke_fused_moe_kernel(
     elif use_int8_w8a16 or use_int4_w4a16:
         assert B_scale is not None
         assert block_shape is None or block_shape[0] == 0
+    elif use_nvfp4_w4a16:
+        assert A_scale is None
+        assert B_scale is not None
+        assert B_scale2 is not None
+        assert B_scale.dtype == torch.uint8
     else:
         assert A_scale is None
         assert B_scale is None
@@ -951,7 +1028,14 @@ def invoke_fused_moe_kernel(
         ),
     )
 
-    K = B.shape[2] - padded_size
+    if use_nvfp4_w4a16:
+        # B stores 2 fp4 elements per uint8: real K = 2 * packed width.
+        K = B.shape[2] * 2 - padded_size
+        assert B_scale2 is not None
+        b_scale2 = B_scale2
+    else:
+        K = B.shape[2] - padded_size
+        b_scale2 = None
     if K % config["BLOCK_SIZE_K"] == 0:
         even_Ks = True
     else:
@@ -1062,13 +1146,14 @@ def invoke_fused_moe_kernel(
             C,
             A_scale,
             B_scale,
+            b_scale2,
             topk_weights,
             sorted_token_ids,
             expert_ids,
             num_tokens_post_padded,
             add_output_mask,
             B.shape[1],
-            B.shape[2] - padded_size,
+            K,
             sorted_token_ids.shape[0],
             topk_ids.numel(),
             A.stride(0),
@@ -1093,6 +1178,8 @@ def invoke_fused_moe_kernel(
             use_fp8_w8a8=use_fp8_w8a8,
             use_int8_w8a8=use_int8_w8a8,
             use_int8_w8a16=use_int8_w8a16,
+            use_nvfp4_w4a16=use_nvfp4_w4a16,
+            nvfp4_group_size=nvfp4_group_size,
             per_channel_quant=per_channel_quant,
             even_Ks=even_Ks,
             c_sorted=c_sorted,
