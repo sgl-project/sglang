@@ -209,8 +209,8 @@ class MambaPoolHost(HostKVCache):
             self.allocator,
             self._buffer_device,
         )
-        if allocation_bytes > available_bytes and host_size <= 0:
-            # a ratio-sized pool takes what the host budget has left rather than failing
+        if _is_hip and allocation_bytes > available_bytes and host_size <= 0:
+            # ROCm: a ratio-sized pool takes what the pinnable budget left rather than failing
             page_bytes = self.size_per_token * self.page_size
             self.page_num = max(available_bytes // page_bytes, 1)
             self.size = self.page_num * self.page_size
