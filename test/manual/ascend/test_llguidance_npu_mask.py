@@ -67,17 +67,10 @@ class _FakeNpuOps:
         logits.copy_(out)
 
 
-def _install_npu_mock(test_case):
-    """Replace the sampler module for this test case."""
+def _install_npu_mock():
+    """Install a fake sampler module for testing."""
     fake_ops = _FakeNpuOps()
-    module_name = "sgl_kernel_npu.operators.sampler"
-    if module_name in sys.modules:
-        test_case.addCleanup(
-            sys.modules.__setitem__, module_name, sys.modules[module_name]
-        )
-    else:
-        test_case.addCleanup(sys.modules.pop, module_name, None)
-    sys.modules[module_name] = MagicMock(
+    sys.modules["sgl_kernel_npu.operators.sampler"] = MagicMock(
         apply_token_bitmask=fake_ops.apply_token_bitmask
     )
     return fake_ops
@@ -101,7 +94,7 @@ if _HAS_TORCH and _HAS_LLGUIDANCE:
 
         def test_npu_branch_dispatches_to_npu_kernel(self):
             """When logits are on npu, the NPU kernel is invoked (mocked)."""
-            fake_ops = _install_npu_mock(self)
+            fake_ops = _install_npu_mock()
 
             vocab_size = 64
             logits = torch.zeros((1, vocab_size), dtype=torch.float32)
@@ -137,7 +130,7 @@ if _HAS_TORCH and _HAS_LLGUIDANCE:
 
         def test_npu_branch_matches_reference(self):
             """The mocked NPU kernel matches the CPU reference result."""
-            _install_npu_mock(self)
+            _install_npu_mock()
 
             vocab_size = 128
             torch.manual_seed(42)
