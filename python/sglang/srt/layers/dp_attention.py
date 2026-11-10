@@ -500,6 +500,20 @@ def is_dp_attention_enabled() -> bool:
     return get_flags().dp.enabled
 
 
+def get_attention_dp_size() -> int:
+    """Alias of ``get_parallel().attn_dp_size``.
+
+    Upstream moved the width into the runtime context and dropped this name.
+    SM70 leftovers (Engram, DSV4.1) still import it; keep the alias so those
+    modules register instead of falling through to HuggingFace AutoModel.
+    """
+    return get_parallel().attn_dp_size
+
+
+def get_attention_dp_rank() -> int:
+    return get_parallel().attn_dp_rank
+
+
 def get_dp_tp_group() -> GroupCoordinator:
     """The TP ranks that run one DP rank's batch: the attention-TP group with
     attention DP, otherwise the whole TP group.

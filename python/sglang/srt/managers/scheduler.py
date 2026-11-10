@@ -3849,6 +3849,15 @@ class Scheduler(
         for req in reqs:
             self.request_retirer.abort(req, finished_reason=finished_reason)
 
+    def _emit_aborted_waiting_req(self, req: Req) -> None:
+        """Fail a waiting request that can never be admitted (e.g. SWA livelock)."""
+        try:
+            self.waiting_queue.remove(req)
+        except ValueError:
+            pass
+        reason = req.to_finish.to_json() if req.to_finish else None
+        self.request_retirer.abort(req, finished_reason=reason)
+
     def _abort_on_queued_limit(self, recv_req: Req) -> bool:
         """Abort an incoming or existing request if the waiting queue is full. Returns True if the incoming request is aborted."""
         if (
@@ -4347,6 +4356,14 @@ class Scheduler(
             # A beam candidate owns beam_width rows once decoding.
             res = min(res, row_budget // beam_width)
 
+        # Sticky DSV41 on V100 captures decode/prefill bs=1 only (CSA2 v1).
+        # The extra req row is for the idle pin vs the next HTTP turn, not a
+        # second user. Admit at most one new request; queue the rest.
+        if envs.SGLANG_DSV41_STICKY_LAST_SEQ.get() and self.disable_radix_cache:
+            if running_bs >= 1:
+                return 0
+            return min(res, 1)
+
         return res
 
     def get_new_batch_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:
@@ -4544,6 +4561,9 @@ class Scheduler(
                 self.page_size,
             )
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
+            if self.chunked_req is not None and self.chunked_req.to_finish:
+                self._emit_aborted_waiting_req(self.chunked_req)
+                self.chunked_req = None
 
         if self.enable_lora:
             running_reqs = running_batch.reqs
@@ -4657,6 +4677,10 @@ class Scheduler(
 
             if self.enable_lora:
                 running_loras.add(req.lora_id)
+
+            if res == AddReqResult.ABORT:
+                self._emit_aborted_waiting_req(req)
+                continue
 
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:

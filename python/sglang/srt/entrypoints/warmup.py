@@ -8,6 +8,7 @@ import tqdm
 
 from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.runtime_context import get_exec
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -159,3 +160,83 @@ async def prefill_shapes(disaggregation_mode: str, tokenizer_manager: TokenizerM
             generate_req_input.bootstrap_host = FAKE_BOOTSTRAP_HOST
 
         await tokenizer_manager.generate_request(generate_req_input, None).__anext__()
+
+
+@warmup("dsv41_chunk")
+async def dsv41_chunk(disaggregation_mode: str, tokenizer_manager: TokenizerManager):
+    """One chunked-prefill-sized extend so SM70 DSV41 hits the Engram unpack /
+    CSA2 extend shape of a long prompt's first chunk before serving."""
+    chunk = getattr(tokenizer_manager.server_args, "chunked_prefill_size", None)
+    if not chunk or chunk <= 0:
+        chunk = 2048
+    generate_req_input = GenerateReqInput(
+        input_ids=np.random.randint(1, 1024, size=[int(chunk)]).tolist(),
+        sampling_params={
+            "max_new_tokens": 1,
+            "temperature": 0.0,
+        },
+    )
+    if disaggregation_mode != "null":
+        generate_req_input.bootstrap_room = 0
+        generate_req_input.bootstrap_host = FAKE_BOOTSTRAP_HOST
+
+    async for _ in tokenizer_manager.generate_request(generate_req_input, None):
+        pass
+
+
+@warmup("prefix_reuse")
+async def prefix_reuse(disaggregation_mode: str, tokenizer_manager: TokenizerManager):
+    """Load the kernels of a long agentic turn before serving.
+
+    A prompt spanning two prefill chunks, a radix-cache hit on it, and a
+    grammar-constrained decode (tool-call parsers such as glm47 constrain every
+    chat turn that carries tools). Their Triton kernels otherwise device-load
+    on the first real request, when little memory is left.
+    """
+    chunk = tokenizer_manager.server_args.chunked_prefill_size
+    if not chunk or chunk <= 0:
+        chunk = 2048
+    context_len = tokenizer_manager.context_len
+    prompt_len = min(chunk + chunk // 2, context_len // 2)
+    prompt = np.random.randint(1, 1024, size=[prompt_len]).tolist()
+    follow_up_len = min(256, context_len // 4)
+    follow_up = prompt + np.random.randint(1, 1024, size=[follow_up_len]).tolist()
+    follow_up_params = {"max_new_tokens": 8}
+    # A regex request is rejected when there is no grammar backend to compile it.
+    if (
+        get_exec().kernel.grammar_backend != "none"
+        and not tokenizer_manager.skip_tokenizer_init
+    ):
+        follow_up_params["regex"] = "[a-z]{8}"
+    for input_ids, extra_params in ((prompt, {}), (follow_up, follow_up_params)):
+        generate_req_input = GenerateReqInput(
+            input_ids=input_ids,
+            sampling_params={"max_new_tokens": 1, "temperature": 0.0, **extra_params},
+        )
+        if disaggregation_mode != "null":
+            generate_req_input.bootstrap_room = 0
+            generate_req_input.bootstrap_host = FAKE_BOOTSTRAP_HOST
+
+        async for _ in tokenizer_manager.generate_request(generate_req_input, None):
+            pass
+
+
+@warmup("sampling")
+async def sampling_kernels(
+    disaggregation_mode: str, tokenizer_manager: TokenizerManager
+):
+    """Serve one short sampled request before startup completes.
+
+    The first non-greedy request JIT-builds FlashInfer's sampling module
+    (about 90 s on SM70); without this it lands on the first user request.
+    """
+    generate_req_input = GenerateReqInput(
+        input_ids=np.random.randint(1, 1024, size=[16]).tolist(),
+        sampling_params={"max_new_tokens": 4, "temperature": 1.0, "top_p": 0.95},
+    )
+    if disaggregation_mode != "null":
+        generate_req_input.bootstrap_room = 0
+        generate_req_input.bootstrap_host = FAKE_BOOTSTRAP_HOST
+
+    async for _ in tokenizer_manager.generate_request(generate_req_input, None):
+        pass

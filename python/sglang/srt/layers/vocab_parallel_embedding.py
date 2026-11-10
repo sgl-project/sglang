@@ -526,6 +526,8 @@ class VocabParallelEmbedding(torch.nn.Module):
             else:
                 # Reduce across all the model parallel GPUs.
                 output_parallel = tensor_model_parallel_all_reduce(output_parallel)
+        if self.output_dtype is not None:
+            output_parallel = output_parallel.to(self.output_dtype)
         return output_parallel
 
     def extra_repr(self) -> str:

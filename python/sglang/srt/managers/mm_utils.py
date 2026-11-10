@@ -822,10 +822,13 @@ def prepare_mm_inputs(
                         mm_schedule.host_offload_event = torch.cuda.Event()
                     mm_schedule.host_offload_event.record(stream)
             forward_batch.mm_inputs = None
+            # copy when a draft re-reads this after the target forward: the
+            # target may overwrite input_embeds in place (deepstack add_,
+            # residual reuse), which would corrupt the MTP/DSpark draft's input.
             forward_batch.mm_input_embeds = (
                 input_embeds.clone()
                 if forward_batch.spec_algorithm is not None
-                and forward_batch.spec_algorithm.is_eagle()
+                and not forward_batch.spec_algorithm.is_none()
                 else input_embeds
             )
         else:

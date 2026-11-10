@@ -128,6 +128,11 @@ def fused_sigmoid_gating_delta_rule_update(
         IS_KDA=is_kda,
         DISABLE_STATE_UPDATE=disable_state_update,
         CACHE_INTERMEDIATE_STATES=intermediate_states_buffer is not None,
+        QUANTIZE_STATE_EACH_STEP=(
+            intermediate_states_buffer is not None
+            and intermediate_states_buffer.dtype != torch.float32
+            and retrieve_parent_token is None
+        ),
         HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_parent_token is not None,
         USE_LOWER_BOUND=lower_bound is not None,
         num_warps=num_warps,

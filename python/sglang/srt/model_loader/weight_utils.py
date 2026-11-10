@@ -1144,12 +1144,20 @@ def _drop_file_cache_after_load(path: str) -> None:
             os.close(fd)
 
 
+def _tensor_from_safetensors_handle(handle, name: str, read_tensor):
+    """Materialize one tensor, or None when ``read_tensor`` says this rank skips it."""
+    if read_tensor is None:
+        return handle.get_tensor(name)
+    return read_tensor(name, handle)
+
+
 def safetensors_weights_iterator(
     hf_weights_files: List[str],
     disable_mmap: bool = False,
     prefetch: bool = False,
     prefetch_num_threads: int = 4,
     drop_cache_after_load: bool = False,
+    read_tensor=None,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files."""
     enable_tqdm = (
@@ -1169,7 +1177,7 @@ def safetensors_weights_iterator(
         bar_format=BAR_FORMAT,
         position=tqdm._get_free_pos(),
     ):
-        if disable_mmap:
+        if disable_mmap and read_tensor is None:
             with open(st_file, "rb") as f:
                 result = safetensors.torch.load(f.read())
                 for name in sorted(result.keys()):
@@ -1177,7 +1185,10 @@ def safetensors_weights_iterator(
         else:
             with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
                 for name in f.keys():
-                    yield name, f.get_tensor(name)
+                    tensor = _tensor_from_safetensors_handle(f, name, read_tensor)
+                    if tensor is None:
+                        continue
+                    yield name, tensor
         if drop_cache_after_load:
             _drop_file_cache_after_load(st_file)
     if prefetch_handle is not None:
@@ -1380,6 +1391,7 @@ def buffered_multi_thread_safetensors_weights_iterator(
     prefetch: bool = False,
     prefetch_num_threads: int = 4,
     drop_cache_after_load: bool = False,
+    read_tensor=None,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Multi-threaded safetensor loader with bounded memory via a sliding window.
 
@@ -1397,12 +1409,17 @@ def buffered_multi_thread_safetensors_weights_iterator(
     )
 
     def _load_file(st_file: str):
-        if disable_mmap:
+        if disable_mmap and read_tensor is None:
             with open(st_file, "rb") as f:
                 result = safetensors.torch.load(f.read())
         else:
             with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
-                result = {k: f.get_tensor(k) for k in f.keys()}
+                result = {}
+                for key in f.keys():
+                    tensor = _tensor_from_safetensors_handle(f, key, read_tensor)
+                    if tensor is None:
+                        continue
+                    result[key] = tensor
         return result
 
     # Sliding window: max_workers loading + 1 prefetched.

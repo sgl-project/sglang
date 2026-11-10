@@ -1145,9 +1145,14 @@ def generate_glm_grammar(
         )
     )
 
-    ebnf_lines.append(
-        f"text_block ::= ( {extra_seperator} text_without_special_tokens )?"
-    )
+    # A required call starts right after thinking: with free text allowed first,
+    # a model that declines to call cannot end its turn and runs to max_tokens.
+    if required and functions:
+        ebnf_lines.append('text_block ::= ""')
+    else:
+        ebnf_lines.append(
+            f"text_block ::= ( {extra_seperator} text_without_special_tokens )?"
+        )
 
     if functions:
         ebnf_lines.extend(

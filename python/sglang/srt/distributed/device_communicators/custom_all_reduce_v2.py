@@ -92,6 +92,31 @@ _FORCE_PULL_SIZE_KB = envs.SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PULL_SIZE_KB.get()
 _FORCE_PUSH_SIZE_KB = envs.SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PUSH_SIZE_KB.get()
 
 
+def _resolve_forced_algo_family() -> Optional[str]:
+    """Restrict algorithm selection from SGLANG_CUSTOM_ALLREDUCE_ALGO.
+
+    The V100 mesh is only partially NVLink-connected (in-domain links plus a
+    single cross-pair link per rank), where the two-stage algorithm is
+    pathological, so the production launcher pins `1stage`. Until now only the
+    legacy sgl-kernel communicator read this variable, so that same launch
+    silently ignored it whenever CustomAllReduceV2 initialized instead.
+    """
+    value = envs.SGLANG_CUSTOM_ALLREDUCE_ALGO.get()
+    if not value:
+        return None
+    if value in ("1stage", "oneshot"):
+        return "one_shot"
+    if value in ("2stage", "twoshot"):
+        return "two_shot"
+    raise ValueError(
+        f"Invalid SGLANG_CUSTOM_ALLREDUCE_ALGO={value!r}. "
+        "Valid values: 1stage, oneshot, 2stage, twoshot."
+    )
+
+
+_FORCED_ALGO_FAMILY = _resolve_forced_algo_family()
+
+
 def _ceil_align(nbytes: int, align: int) -> int:
     return (nbytes + align - 1) // align * align
 
@@ -202,6 +227,7 @@ class CustomAllReduceV2:
         priority and override all of the size parameters above.
         """
         self.disabled = True
+        self.pcie_only = False
         if not can_use_custom_all_reduce_v2(group=group, device=device):
             return
 
@@ -234,6 +260,15 @@ class CustomAllReduceV2:
             max_pull_size = int(_FORCE_PULL_SIZE_KB) * 1024
         if _FORCE_PUSH_SIZE_KB is not None:
             max_push_size = int(_FORCE_PUSH_SIZE_KB) * 1024
+        # After FORCE_* so a pull-size override cannot re-enable kernels
+        # that hang on PCIe P2P. Default-off env: this block is a no-op.
+        self.pcie_only = bool(envs.SGLANG_CUSTOM_AR_ALLOW_PCIE.get())
+        if self.pcie_only:
+            max_push_size = min(
+                max_push_size, int(envs.SGLANG_CUSTOM_AR_PCIE_MAX_BYTES.get())
+            )
+            max_pull_size = 0
+            max_pull_blocks = 0
 
         def force_thresholds(heuristic):
             # forced sizes bypass the tuned NCCL-crossover heuristics: lift
@@ -266,6 +301,17 @@ class CustomAllReduceV2:
         num_push_blocks = base_config.num_push_blocks
         if max_pull_blocks:
             num_pull_blocks = max(min(num_pull_blocks, max_pull_blocks), 1)
+        if (
+            max_push_blocks is None
+            and self.world_size == 4
+            and envs.SGLANG_SM70_AR_PUSH16.get()
+            and torch.cuda.get_device_capability(device) == (7, 0)
+            and can_use_custom_all_reduce_with_nvlink(group, device) is True
+        ):
+            # Fixed for the communicator lifetime, captures included. Small
+            # TP4 messages keep fewer push CTAs resident; the pull plane is
+            # untouched.
+            num_push_blocks = 16
         if max_push_blocks is not None:
             num_push_blocks = max(max_push_blocks, 1)
         self.config = base_config.clip(
@@ -522,7 +568,32 @@ class CustomAllReduceV2:
 
     def _pick_config(self, nbytes: int, can_use_graph: bool) -> AllReduceConfig | None:
         # TODO: refactor this along with the config file
+        # PCIe P2P: pull kernels spin forever. Push beats NCCL only for
+        # small messages; larger sizes return None (NCCL).
+        if self.pcie_only:
+            if nbytes <= self.max_push_size:
+                return AllReduceConfig(AllReduceAlgo.ONE_SHOT_PUSH)
+            return None
         heuristic = self.config.graph if can_use_graph else self.config.eager
+        # Forcing a family must not also bypass the capacity guard: a config
+        # returned for a tensor larger than the workspace overruns it inside the
+        # kernel ("slice [0, N) escapes the M-byte pull workspace"). None means
+        # "not eligible for custom all-reduce", i.e. fall back to NCCL, which is
+        # what the unforced path below does for the same sizes.
+        if _FORCED_ALGO_FAMILY == "one_shot":
+            if nbytes <= heuristic.one_shot_push_threshold:
+                return AllReduceConfig(AllReduceAlgo.ONE_SHOT_PUSH)
+            if nbytes <= self.max_pull_size:
+                return AllReduceConfig(
+                    AllReduceAlgo.ONE_SHOT_PULL, use_graph=can_use_graph
+                )
+            return None
+        if _FORCED_ALGO_FAMILY == "two_shot":
+            if nbytes <= self.max_pull_size:
+                return AllReduceConfig(
+                    AllReduceAlgo.TWO_SHOT_PULL, use_graph=can_use_graph
+                )
+            return None
         can_use_multicast = self.config.num_mc_blocks is not None
         if nbytes <= heuristic.one_shot_push_threshold:
             return AllReduceConfig(AllReduceAlgo.ONE_SHOT_PUSH)
@@ -787,4 +858,7 @@ def can_use_custom_all_reduce_v2(
         supported_world_size=list(supported),
         cls_name="CustomAllReduceV2",
     )
-    return full_nvlink is True
+    if full_nvlink is True:
+        return True
+    # False: P2P works, no full NVLink clique. None: rejected / P2P failed.
+    return full_nvlink is False and envs.SGLANG_CUSTOM_AR_ALLOW_PCIE.get()

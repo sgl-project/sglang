@@ -1308,9 +1308,33 @@ class GemmaRMSNorm(BaseFusedOp):
         if needs_reshape:
             original_shape = x.shape
             x = x.contiguous().reshape(-1, original_shape[-1])
+        elif not x.is_contiguous():
+            # A last-dim split (the tokenwise indexer Q/K/W projection) is a
+            # 2-D view whose row stride is the fused width. The SM70 Gemma
+            # kernel vector-loads each row and faults on that stride.
+            x = x.contiguous()
         if residual is not None:
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
+                post_residual_addition = None
+            if _is_cuda:
+                from sglang.srt.layers.tilelang_gemma_rmsnorm_sm70 import (
+                    can_use_gemma_fused_add_rmsnorm_sm70,
+                    gemma_fused_add_rmsnorm_sm70,
+                )
+
+                if can_use_gemma_fused_add_rmsnorm_sm70(
+                    x,
+                    residual,
+                    self.weight.data,
+                    post_residual_addition,
+                ):
+                    return gemma_fused_add_rmsnorm_sm70(
+                        x,
+                        residual,
+                        self.weight.data,
+                        self.variance_epsilon,
+                    )
             gemma_fused_add_rmsnorm(
                 x, residual, self.weight.data, self.variance_epsilon
             )

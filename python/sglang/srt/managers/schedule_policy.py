@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from http import HTTPStatus
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
@@ -574,6 +575,11 @@ class SchedulePolicy:
             logger.info(f"waiting_keys_after={waiting_keys_after}")
 
 
+def _window_hits(host_hit_length: int):
+    """The window-pool host-hit mapping ``PrefillBudget.swa_tokens`` expects."""
+    return {"window": host_hit_length} if host_hit_length else None
+
+
 class AddReqResult(Enum):
     CONTINUE = auto()  # Continue to add requests
     NO_TOKEN = auto()  # No token left
@@ -581,6 +587,7 @@ class AddReqResult(Enum):
     # No memory comes back for a request no chunk of which fits now
     # (`PrefillBudget.unschedulable`): it is aborted, not queued.
     UNSCHEDULABLE = auto()
+    ABORT = auto()  # This request can never be admitted; fail it now
 
 
 @dataclass(frozen=True, slots=True)
@@ -706,6 +713,9 @@ class PrefillAdder:
             tree_cache,
             num_mixed_decode_tokens=num_mixed_decode_tokens,
         )
+        # Upstream moved SWA token math into PrefillBudget; V100 admission
+        # still calls rem_swa_tokens / _swa_budget_for_req / _swa_req_ring.
+        self._swa_req_ring = bool(getattr(self.memory_budget, "req_ring", False))
 
         self.req_states = None
         self.can_run_list = []
@@ -823,6 +833,48 @@ class PrefillAdder:
     def cur_rem_tokens(self):
         return self.memory_budget.remaining_current
 
+    @property
+    def rem_swa_tokens(self):
+        # Upstream's PrefillBudget name for the SWA window availability
+        # (SWAPrefillBudget.remaining_window_tokens).
+        return self.memory_budget.remaining_window_tokens
+
+    def _swa_budget_for_req(
+        self, extend_input_len: int, max_new_tokens: int, swa_host_hit_length: int = 0
+    ) -> int:
+        """SWA pool budget per request. Only valid when is_hybrid_swa is True."""
+        swa_tokens = getattr(self.memory_budget, "swa_tokens", None)
+        if swa_tokens is None:
+            return extend_input_len + max_new_tokens + self.page_size
+        return swa_tokens(
+            extend_input_len,
+            max_new_tokens,
+            chunk_limit=self.rem_chunk_tokens,
+            window_host_hit_lengths=_window_hits(swa_host_hit_length),
+        )
+
+    def _swa_reserved_tokens(
+        self, extend_input_len: int, max_new_tokens: int, swa_host_hit_length: int = 0
+    ) -> int:
+        """SWA slots a request adds to its window + page slack + load-back."""
+        swa_tokens = getattr(self.memory_budget, "swa_tokens", None)
+        if swa_tokens is None:
+            window = getattr(self.tree_cache, "sliding_window_size", 0) or 0
+            headroom = (
+                min(extend_input_len + max_new_tokens, window)
+                if window
+                else extend_input_len + max_new_tokens
+            )
+            reserved = headroom + self.page_size
+            if swa_host_hit_length > 0:
+                reserved += self.ceil_paged_tokens(swa_host_hit_length)
+            return reserved
+        return swa_tokens(
+            extend_input_len,
+            max_new_tokens,
+            window_host_hit_lengths=_window_hits(swa_host_hit_length),
+        )
+
     def _swa_new_tokens(self, req: Req) -> int:
         """Tokens a request may still decode, for SWA headroom sizing. Mirrors
         the remaining-then-clip order of add_one_req's max_new: clip-then-subtract
@@ -831,6 +883,140 @@ class PrefillAdder:
         return min(
             max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
             CLIP_MAX_NEW_TOKENS,
+        )
+
+    def _swa_wait_is_futile(self) -> bool:
+        """True when no running request can free SWA for the waiting head.
+
+        NO_TOKEN means "wait for the pool to drain". With an empty running
+        batch that wait never ends (relaunch148: 8k prefill, vestigial SWA
+        1024, GPUs idle). Clients must get a completed chunk or an abort.
+        """
+        if self._swa_req_ring:
+            return False
+        running = self.running_batch
+        reqs = getattr(running, "reqs", None) if running is not None else None
+        if not reqs:
+            return True
+        for req in reqs:
+            finished = getattr(req, "finished", None)
+            if callable(finished):
+                try:
+                    if finished():
+                        continue
+                except TypeError:
+                    pass
+            return False
+        return True
+
+    def _abort_swa_unadmittable(self, req: Req, swa_needed: int) -> AddReqResult:
+        pool = int(self.token_to_kv_pool_allocator.size_swa)
+        free = int(self.rem_swa_tokens)
+        req.set_finish_with_abort(
+            (
+                f"Cannot admit prefill: sliding-window KV pool has {free} free "
+                f"tokens (pool={pool}, page={self.page_size}, need={swa_needed}) "
+                f"and nothing running can free more. Aborting instead of "
+                f"waiting forever."
+            ),
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+            err_type="ServiceUnavailableError",
+        )
+        return AddReqResult.ABORT
+
+    def _apply_swa_token_gate(
+        self,
+        real_input_tokens: int,
+        req: Req,
+        chunk_tokens_limit: Optional[int],
+    ) -> tuple[Optional[AddReqResult], Optional[int]]:
+        """SWA admission: fit as-is, shrink the chunk, wait, or abort.
+
+        Returns (None, limit) when the caller may proceed (limit may be a
+        shrunken chunk). Returns (NO_TOKEN|ABORT, limit) to stop this req.
+        """
+        if not self.is_hybrid_swa:
+            return None, chunk_tokens_limit
+        max_new = self._swa_new_tokens(req)
+        host_hit = int(getattr(req, "swa_host_hit_length", 0) or 0)
+        swa_needed = self._swa_budget_for_req(
+            real_input_tokens, max_new, swa_host_hit_length=host_hit
+        )
+        blocked = (
+            swa_needed > self.rem_swa_tokens
+            if self._swa_req_ring
+            else swa_needed >= self.rem_swa_tokens
+        )
+        if not blocked:
+            return None, chunk_tokens_limit
+
+        never_fits = self._swa_req_never_fits(real_input_tokens, max_new, host_hit)
+        wait_futile = self._swa_wait_is_futile()
+        swa_cap = self._swa_chunk_cap(max_new, host_hit)
+        # Idle HOL: reserved headroom can zero the cap while a page remains.
+        # Only when waiting cannot help — do not eat decode-window crumbs.
+        if (
+            swa_cap <= 0
+            and wait_futile
+            and int(self.rem_swa_tokens) >= self.page_size
+        ):
+            swa_cap = self.page_size
+
+        if self.rem_chunk_tokens is not None and swa_cap > 0:
+            return None, min(self.rem_chunk_tokens, swa_cap)
+
+        if wait_futile or (never_fits and self.rem_chunk_tokens is None):
+            return self._abort_swa_unadmittable(req, swa_needed), chunk_tokens_limit
+        return AddReqResult.NO_TOKEN, chunk_tokens_limit
+
+    def _swa_chunk_cap(self, max_new_tokens: int, swa_host_hit_length: int = 0) -> int:
+        """Largest page-aligned extend chunk the SWA pool can admit right now,
+        keeping a sliding window of headroom below rem_swa_tokens; 0 if not
+        even one page fits. Only valid when is_hybrid_swa is True.
+
+        Escape hatch for a request whose budget can never pass the
+        _swa_budget_for_req gate (extend near/above the pool size, or a large
+        load-back charge): without shrinking its chunk it would be rejected
+        forever (head-of-line livelock). Shrinking is sound because past a
+        chunk boundary only the sliding window stays locked — the rest turns
+        evictable — so each pass's transient footprint fits the pool."""
+        # extend_input_len=0: this solves for the extend chunk itself, so the
+        # reserved headroom is the post-chunk decode window only.
+        cap = int(self.rem_swa_tokens) - self._swa_reserved_tokens(
+            0, max_new_tokens, swa_host_hit_length
+        )
+        if cap <= 0:
+            return 0
+        return cap // self.page_size * self.page_size
+
+    def _swa_req_never_fits(
+        self, extend_input_len: int, max_new_tokens: int, swa_host_hit_length: int = 0
+    ) -> bool:
+        """True when a request's SWA budget exceeds the *entire* SWA pool, so it
+        can never be admitted whole no matter how far the pool drains.
+
+        This is the head-of-line livelock the _swa_chunk_cap escape hatch exists
+        for; the hatch must fire only in this case. A request that merely
+        exceeds *current* rem_swa (transient pressure) would fit once running
+        decodes free their windows, so it must wait — admitting it into the
+        decode headroom collapses the SWA evictable cushion and forces running
+        requests to retract (observed as a severe retraction/re-prefill storm on
+        hybrid-SWA models at high concurrency)."""
+        never_fits = getattr(self.memory_budget, "swa_never_fits", None)
+        if never_fits is not None:
+            return bool(
+                never_fits(
+                    extend_input_len,
+                    max_new_tokens,
+                    window_host_hit_lengths=_window_hits(swa_host_hit_length),
+                )
+            )
+        capacity = self.token_to_kv_pool_allocator.size_swa
+        return (
+            self._swa_budget_for_req(
+                extend_input_len, max_new_tokens, swa_host_hit_length
+            )
+            >= capacity
         )
 
     def _check_prefill_budget(
@@ -1229,7 +1415,15 @@ class PrefillAdder:
                 self.rem_chunk_tokens
             )
             if _rem_tokens is None:
+                if self.is_hybrid_swa and self._swa_wait_is_futile():
+                    self._abort_swa_unadmittable(
+                        req, swa_needed=max(self.page_size, 1)
+                    )
                 return req
+            if self.is_hybrid_swa and not self._swa_req_ring:
+                _rem_tokens = min(
+                    _rem_tokens, int(self.rem_swa_tokens) - self.page_size
+                )
             if self.kv_shard_granule:
                 # Align the absolute boundary to keep pages within one scratch region.
                 # If no budget remains, use a full chunk to make progress.
@@ -1590,6 +1784,28 @@ class PrefillAdder:
         request_slot_reserve = self._request_slot_reserve_for_req(req)
         total_tokens += request_slot_reserve
 
+        # adjusting the input_tokens based on host_hit_length and page_size
+        real_input_tokens = cand_extend_input_len - req.host_hit_length
+        real_input_tokens = self.ceil_paged_tokens(real_input_tokens)
+        prefix_len = len(req.prefix_indices)
+
+        if total_tokens >= self.rem_total_tokens:
+            return AddReqResult.NO_TOKEN
+
+        chunk_tokens_limit = self.rem_chunk_tokens
+        gate, chunk_tokens_limit = self._apply_swa_token_gate(
+            real_input_tokens, req, chunk_tokens_limit
+        )
+        if gate is not None:
+            return gate
+
+        if (
+            self.rem_chunk_tokens is None
+            and len(self.can_run_list) != 0
+            and real_input_tokens >= self.rem_input_tokens
+        ):
+            return AddReqResult.OTHER
+
         # The temporary pin excludes this prefix from the evictable budget.
         # Selection itself neither allocates slots nor materializes host hits.
         with self._lock_node(req.last_node):
@@ -1607,6 +1823,15 @@ class PrefillAdder:
                     self._defer_staged_for_capacity_if_idle(req, pool="prefill_budget")
                 return admission
 
+            gate, chunk_tokens_limit = self._apply_swa_token_gate(
+                real_input_tokens, req, chunk_tokens_limit
+            )
+            if gate is not None:
+                return gate
+
+            # Negotiate only after every KV-budget gate (a NO_TOKEN rank must
+            # report not-prefillable via finalize()) and before init_load_back
+            # (a delay verdict must not start KV load-back).
             # A rejected candidate must not report prefillable or queue H2D.
             if (self.prefill_delayer_single_pass is not None) and (
                 not self.prefill_delayer_single_pass.negotiate_should_allow_prefill(

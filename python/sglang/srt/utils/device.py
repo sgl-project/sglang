@@ -66,6 +66,7 @@ __all__ = [
     "is_sm100_or_sm110_supported",
     "is_sm110_supported",
     "is_sm80_supported",
+    "is_sm70_supported",
     "is_sm90_supported",
     "is_sm120",
     "is_sm121",
@@ -341,6 +342,15 @@ is_sm110_supported = lru_cache(maxsize=1)(
 is_sm80_supported = lru_cache(maxsize=1)(
     partial(
         _check_cuda_device_version, device_capability_majors=[8], cuda_version=(11, 0)
+    )
+)
+
+
+# SM70 / V100 (Volta): fp16-only datacenter arch; cuda_version floor is the
+# oldest toolkit that still ships sm_70 kernels.
+is_sm70_supported = lru_cache(maxsize=1)(
+    partial(
+        _check_cuda_device_version, device_capability_majors=[7], cuda_version=(10, 0)
     )
 )
 

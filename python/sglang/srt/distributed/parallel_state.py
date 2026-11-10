@@ -33,7 +33,7 @@ import sys
 import warnings
 import weakref
 from collections import namedtuple
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import timedelta
 from multiprocessing import shared_memory
@@ -572,6 +572,20 @@ class GroupCoordinator:
                 self.cpu_group, 1 << 22, 6
             )
 
+        self.dsv41_hier_ar = None
+        if (
+            group_name == "tp"
+            and self.world_size == 8
+            and envs.SGLANG_DSV41_HIER_AR.get()
+        ):
+            from sglang.srt.distributed.device_communicators.dsv41_hier_ar import (
+                Dsv41HierAllReduce,
+            )
+
+            self.dsv41_hier_ar = Dsv41HierAllReduce(
+                self.ranks, self.rank, self.device
+            )
+
     def __repr__(self):
         return (
             f"ranks={self.ranks} rank={self.rank} local_rank={self.local_rank} use_pynccl={self.use_pynccl} "
@@ -644,7 +658,6 @@ class GroupCoordinator:
         # We don't need the context of custom quick allreduce because the ipc access
         # is already collected in init() and we can capture the quick allreduce directly.
         ca_comm = self.ca_comm
-        maybe_ca_context = nullcontext() if ca_comm is None else ca_comm.capture()
 
         # ensure all initialization operations complete before attempting to
         # capture the graph on another stream
@@ -652,7 +665,16 @@ class GroupCoordinator:
         if curr_stream != stream:
             stream.wait_stream(curr_stream)
 
-        with self.device_module.stream(stream), maybe_ca_context:
+        with ExitStack() as stack:
+            stack.enter_context(self.device_module.stream(stream))
+            if ca_comm is not None:
+                stack.enter_context(ca_comm.capture())
+            # Hier CA copies through the pre-registered staging buffer
+            # (never graph-pool pointers). capture() then IPCs those
+            # cudaMalloc buffers. Skipping it left rank_data slots empty.
+            hier = getattr(self, "dsv41_hier_ar", None)
+            if hier is not None:
+                stack.enter_context(hier.graph_capture_contexts())
             # In graph mode, we have to be very careful about the collective
             # operations. The current status is:
             #     allreduce \ Mode   |  Eager  |  Graph  |
@@ -712,6 +734,10 @@ class GroupCoordinator:
         """
         # Bypass the function if we are using only 1 GPU.
         if self.world_size == 1:
+            return input_
+
+        hier = getattr(self, "dsv41_hier_ar", None)
+        if hier is not None and hier.reduce_inplace(input_):
             return input_
 
         if input_.is_cpu:
@@ -1088,6 +1114,11 @@ class GroupCoordinator:
         return out
 
     def _all_reduce_in_place(self, input_: torch.Tensor) -> None:
+        # SM70 (V100 hybrid mesh) hook: 2-step quad/pair hierarchical all-reduce.
+        # No-op unless SGLANG_DSV41_HIER_AR built the communicator.
+        hier = getattr(self, "dsv41_hier_ar", None)
+        if hier is not None and hier.reduce_inplace(input_):
+            return
         pynccl_comm = self.get_available_pynccl_comm()
         torch_symm_mem_comm = self.torch_symm_mem_comm
         if pynccl_comm is not None and not pynccl_comm.disabled:
@@ -1229,6 +1260,10 @@ class GroupCoordinator:
         return True
 
     def _all_to_all_single(self, output: torch.Tensor, input: torch.Tensor) -> None:
+        # 2-step quad/pair A2A on the V100 hybrid mesh (same split as hier AR).
+        hier = getattr(self, "dsv41_hier_ar", None)
+        if hier is not None and hier.all_to_all_single(output, input):
+            return
         # pynccl path keeps the a2a exchange CUDA-graph-capturable (DCP a2a backend).
         pynccl_comm = self.get_available_pynccl_comm()
         if pynccl_comm is not None and not pynccl_comm.disabled:

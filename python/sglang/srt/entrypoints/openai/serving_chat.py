@@ -576,6 +576,10 @@ class OpenAIServingChat(OpenAIServingBase):
         self._template_reads_reasoning_content = (
             self._chat_template_reads_reasoning_content()
         )
+        # Prompt segment cache (managers/tokenizer_manager.maybe_init_segment_encoder);
+        # None when SGLANG_DISABLE_PROMPT_SEGMENT_CACHE is set or the tokenizer
+        # adds special tokens, so the upstream encode path is kept.
+        self._segment_encoder = self.tokenizer_manager.segment_encoder
         self._chat_template_cache: OrderedDict[bytes, tuple[tuple[int, ...], str]] = (
             OrderedDict()
         )
@@ -2407,6 +2411,15 @@ class OpenAIServingChat(OpenAIServingBase):
             modalities=modalities,
             stop=stop,
         )
+
+    def _encode_prompt_text(
+        self, text: str, encode_kwargs: Dict[str, Any]
+    ) -> List[int]:
+        # The segment encoder only exists for tokenizers that add no specials,
+        # so it matches the plain encode for either kwargs choice.
+        if self._segment_encoder is not None:
+            return self._segment_encoder.encode(text)
+        return self.tokenizer_manager.tokenizer.encode(text, **encode_kwargs)
 
     def _render_and_encode_chat_template(
         self,

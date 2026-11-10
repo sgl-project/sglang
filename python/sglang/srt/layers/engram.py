@@ -1047,6 +1047,20 @@ def shard_range(
     )
 
 
+def engram_shard_rows(num_rows: int, tp_rank: int, tp_size: int) -> tuple[int, int]:
+    """Half-open row range of the Engram table this TP rank copies.
+
+    The checkpoint tensor is ``[num_rows, dim]``. Integer division matches
+    ``EngramEmbedding`` so a pre-sliced load and a full-tensor load write the
+    same rows.
+    """
+    if tp_size <= 1:
+        return 0, int(num_rows)
+    start = int(num_rows) * int(tp_rank) // int(tp_size)
+    end = int(num_rows) * (int(tp_rank) + 1) // int(tp_size)
+    return start, end
+
+
 def _table_dtype(mxfp4: bool) -> torch.dtype:
     # torch has no 4-bit dtype: MXFP4 rows are raw bytes.
     return torch.uint8 if mxfp4 else torch.float8_e4m3fn

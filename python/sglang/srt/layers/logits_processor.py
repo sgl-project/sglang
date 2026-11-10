@@ -239,6 +239,73 @@ def autotune_dummy_run_mode(*, run_lm_head: bool):
         _autotune_run_lm_head = None
 
 
+def _v100_greedy_tp_top1_enabled() -> bool:
+    """SM70/V100 opt-in: exact top-1 without a full-vocabulary all-gather.
+
+    SGLANG_V100_GREEDY_TP_TOP1, default off; when unset every path below is
+    identical to upstream (full-vocabulary logits).
+    """
+    return bool(envs.SGLANG_V100_GREEDY_TP_TOP1.get())
+
+
+_SM70_DENSE_GEMV: Any = False  # False = not probed yet, None = not installed
+
+
+def _sm70_dense_gemv():
+    """(linear, supported) for the optional SM70 dense-GEMV kernel, else None.
+
+    The kernel ships with the SM70 kernel package (cluster 01-kernels); when it
+    is absent the lm_head matmul stays on the upstream path.
+    """
+    global _SM70_DENSE_GEMV
+    if _SM70_DENSE_GEMV is False:
+        try:
+            from sglang.kernels.ops.gemm.sm70_dense_gemv import linear, supported
+
+            _SM70_DENSE_GEMV = (linear, supported)
+        except Exception:
+            _SM70_DENSE_GEMV = None
+    return _SM70_DENSE_GEMV
+
+
+def _is_strict_greedy_forward_batch(forward_batch: ForwardBatch) -> bool:
+    """Return whether top-1 can bypass every full-vocabulary consumer."""
+
+    if not _v100_greedy_tp_top1_enabled() or forward_batch.is_prefill_only:
+        return False
+    mode = forward_batch.forward_mode
+    if mode.is_target_verify() or not (mode.is_decode() or mode.is_extend()):
+        return False
+    spec_algorithm = forward_batch.spec_algorithm
+    if spec_algorithm is not None and not spec_algorithm.is_none():
+        return False
+    sampling = forward_batch.sampling_info
+    if sampling is None or not sampling.is_all_greedy:
+        return False
+    if forward_batch.return_logprob:
+        return False
+    if forward_batch.top_logprobs_nums and any(forward_batch.top_logprobs_nums):
+        return False
+    if forward_batch.token_ids_logprobs and any(forward_batch.token_ids_logprobs):
+        return False
+    if sampling.grammars and any(grammar is not None for grammar in sampling.grammars):
+        return False
+    if sampling.has_custom_logit_processor or sampling.logit_bias is not None:
+        return False
+    if sampling.vocab_mask is not None or sampling.apply_mask_func is not None:
+        return False
+    if sampling.acc_additive_penalties is not None:
+        return False
+    if sampling.acc_scaling_penalties is not None:
+        return False
+    if (
+        sampling.penalizer_orchestrator is not None
+        and sampling.penalizer_orchestrator.is_required
+    ):
+        return False
+    return True
+
+
 @dataclasses.dataclass
 class _TypedCustomizedInfo:
     """A ``customized_info`` value with one row per request of the batch."""
@@ -264,6 +331,9 @@ class LogitsProcessorOutput:
     # The logits of the next tokens.       shape: [#seq, vocab_size]
     # Can be None for certain prefill-only requests (e.g., multi-item scoring) that don't need next token generation
     next_token_logits: Optional[torch.Tensor]
+    # Strict-greedy TP shortcut. When set, no complete vocabulary logits were
+    # materialized and ModelRunner.sample returns these exact global token IDs.
+    greedy_token_ids: Optional[torch.Tensor] = None
     # Used by speculative decoding (EAGLE)
     # The last hidden layers
     hidden_states: Optional[torch.Tensor] = None
@@ -425,6 +495,7 @@ class LogitsMetadata:
 
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
+    use_greedy_tp_top1: bool = False
 
     # Carried from ForwardBatch so logits pruning can reconstruct the SP gather.
     attn_tp_sequence_sharded: bool = False
@@ -489,6 +560,7 @@ class LogitsMetadata:
             token_ids_logprobs=forward_batch.token_ids_logprobs,
             extend_input_logprob_token_ids_gpu=forward_batch.extend_input_logprob_token_ids_gpu,
             is_prefill_only=forward_batch.is_prefill_only,
+            use_greedy_tp_top1=_is_strict_greedy_forward_batch(forward_batch),
             attn_tp_sequence_sharded=forward_batch.attn_tp_sequence_sharded,
             global_num_tokens_gpu=forward_batch.global_num_tokens_gpu,
             dp_local_start_pos=forward_batch.dp_local_start_pos,
@@ -779,6 +851,19 @@ class LogitsProcessor(nn.Module):
         )
         del hidden_states
 
+        if self._can_use_greedy_tp_top1(pruned_states, lm_head, logits_metadata):
+            sampled_states = (
+                pruned_states[sample_indices]
+                if sample_indices is not None
+                else pruned_states
+            )
+            return LogitsProcessorOutput(
+                next_token_logits=None,
+                greedy_token_ids=self._get_greedy_tp_top1(sampled_states, lm_head),
+                hidden_states=hidden_states_to_store,
+                mm_input_embeds=logits_metadata.mm_input_embeds,
+            )
+
         if not logits_metadata.extend_return_logprob:
             vocab_shard = self._verify_vocab_shard(lm_head, logits_metadata)
             if vocab_shard is not None:
@@ -887,6 +972,80 @@ class LogitsProcessor(nn.Module):
         if flat.numel() < numel:
             return None
         return flat[:numel].view(shape)
+
+    def _can_use_greedy_tp_top1(
+        self,
+        hidden_states: torch.Tensor,
+        lm_head: VocabParallelEmbedding,
+        logits_metadata: LogitsMetadata,
+    ) -> bool:
+        """Check the remaining model/layout requirements for the shortcut."""
+
+        if not logits_metadata.use_greedy_tp_top1:
+            return False
+        if (
+            hidden_states.device.type != "cuda"
+            or torch.cuda.get_device_capability(hidden_states.device) != (7, 0)
+            or hidden_states.dtype != torch.float16
+        ):
+            return False
+        if (
+            get_parallel().tp_size <= 1
+            or not self.do_tensor_parallel_all_gather
+            or self.do_tensor_parallel_all_gather_dp_attn
+            or self.use_attn_tp_group
+            or self.use_tp_lm_head_all_to_all
+        ):
+            return False
+        if (
+            self.use_fp32_lm_head
+            or self.return_full_logits
+            or self.logit_scale is not None
+            or self.final_logit_softcapping is not None
+            or logits_metadata.next_token_logits_buffer is not None
+        ):
+            return False
+        if not hasattr(lm_head, "weight") or hasattr(lm_head, "apply_lora"):
+            return False
+        weight = lm_head.weight
+        shard = getattr(lm_head, "shard_indices", None)
+        return (
+            weight.device == hidden_states.device
+            and weight.dtype == torch.float16
+            and weight.ndim == 2
+            and shard is not None
+            and getattr(lm_head, "num_added_embeddings", 0) == 0
+            and shard.num_org_elements > 0
+            and weight.shape[0] >= shard.num_org_elements
+        )
+
+    def _get_greedy_tp_top1(
+        self,
+        hidden_states: torch.Tensor,
+        lm_head: VocabParallelEmbedding,
+    ) -> torch.Tensor:
+        """Exchange one exact top-1 candidate per tensor-parallel rank."""
+
+        shard = lm_head.shard_indices
+        valid_rows = shard.num_org_elements
+        local_logits = torch.matmul(hidden_states, lm_head.weight[:valid_rows].T)
+        local_values, local_indices = torch.max(local_logits, dim=-1)
+        global_ids = local_indices + shard.org_vocab_start_index
+
+        # FP32 represents Qwen's token IDs exactly. Packing value/id together
+        # turns the full-vocabulary all-gather into one tiny collective.
+        candidates = torch.stack((local_values.float(), global_ids.float()), dim=-1)
+        gathered = (
+            get_parallel().tp_group
+            .all_gather(candidates, dim=-1)
+            .reshape(
+                candidates.shape[0],
+                get_parallel().tp_size,
+                2,
+            )
+        )
+        best_rank = gathered[..., 0].argmax(dim=-1, keepdim=True)
+        return torch.gather(gathered[..., 1], 1, best_rank).squeeze(1).long()
 
     def _get_pruned_states(
         self,
@@ -1423,10 +1582,23 @@ class LogitsProcessor(nn.Module):
                 logits = tgemm.mm(hidden_states, lm_head.weight)
             else:
                 lhs = hidden_states.to(lm_head.weight.dtype)
-                if out is not None and out.dtype == lm_head.weight.dtype:
-                    logits = torch.matmul(lhs, lm_head.weight.T, out=out)
-                else:
-                    logits = torch.matmul(lhs, lm_head.weight.T)
+                logits = None
+                # SM70 hook: the fp32-accumulating dense GEMV from the optional
+                # SM70 kernel package replaces the lm_head matmul on V100. It is
+                # only reached when that package is installed (cluster
+                # 01-kernels) and the shape/layout is supported; otherwise the
+                # upstream matmul below is used unchanged.
+                if out is None:
+                    sm70_gemv = _sm70_dense_gemv()
+                    if sm70_gemv is not None:
+                        sm70_linear, sm70_supported = sm70_gemv
+                        if sm70_supported(lhs, lm_head.weight):
+                            logits = sm70_linear(lhs, lm_head.weight)
+                if logits is None:
+                    if out is not None and out.dtype == lm_head.weight.dtype:
+                        logits = torch.matmul(lhs, lm_head.weight.T, out=out)
+                    else:
+                        logits = torch.matmul(lhs, lm_head.weight.T)
         else:
             # GGUF models
             # TODO: use weight_packed_linear for GGUF models

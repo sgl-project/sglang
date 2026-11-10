@@ -644,6 +644,11 @@ class _SelectExpertsSinglePassGatherer(_LayerBasedGpuSinglePassGatherer):
         super().__init__(*args, **kwargs, enable_global_physical_experts=True)
 
     def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor):
+        # CUDA-graph capture also takes this hook. Draft/nextn forwards that
+        # omit with_current_layer leave layer_idx None; skip rather than
+        # scatter into `_data[None, :]`.
+        if layer_idx is None:
+            return
         if topk_ids.is_cuda:
             record_physical_counts(topk_ids, self._data[layer_idx])
             return

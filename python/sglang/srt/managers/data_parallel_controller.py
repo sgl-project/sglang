@@ -908,7 +908,18 @@ class DataParallelController:
         sock_send(self.workers[target_worker], req)
 
     def event_loop(self):
+        # Idle-sleep (local patch 2026-08-31): gate the NOBLOCK drain on a zmq
+        # poller so an idle controller doesn't busy-spin a full core. The
+        # scheduler workers do the same via --sleep-on-idle / IdleSleeper, but
+        # this loop was never wired to it. POLLIN fires as soon as a message
+        # lands, so no added request latency; the 1s timeout only bounds how
+        # often we feed the watchdog while idle.
+        poller = zmq.Poller()
+        poller.register(self.recv_from_tokenizer, zmq.POLLIN)
         while True:
+            if not poller.poll(timeout=1000):
+                self.soft_watchdog.feed()
+                continue
             while True:
                 self.soft_watchdog.feed()
                 try:

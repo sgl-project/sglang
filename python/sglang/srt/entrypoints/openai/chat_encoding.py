@@ -17,6 +17,9 @@ def is_deepseek_v41_arch(*, arch: str, model_type: str) -> bool:
     return model_type == "deepseek_v41" or "DeepseekV41" in arch
 
 
+is_deepseek_v41_config = is_deepseek_v41_arch
+
+
 def resolve_chat_encoding_spec(
     *,
     hf_config: Any,
@@ -62,7 +65,10 @@ def resolve_chat_encoding_spec(
 def spec_supports_inline_system(spec: Optional[str]) -> bool:
     """Native encoders verified to render mid-conversation system messages in place."""
     # K3's tokenizer renders in Python, so there is no Jinja source to probe.
-    return spec == "kimi_k3"
+    # The V4.1 encoder renders a mid-conversation system turn at its own
+    # position; folding it into the leading system block would rewrite the
+    # token prefix on the next turn and drop the sticky-cache pin.
+    return spec in ("kimi_k3", "dsv41")
 
 
 def spec_owns_reasoning_history(spec: Optional[str]) -> bool:

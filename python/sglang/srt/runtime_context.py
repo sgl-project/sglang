@@ -1845,6 +1845,7 @@ _PLATFORM_PROBES: Dict[str, str] = {
     "is_npu": "is_npu",
     "is_xpu": "is_xpu",
     "is_musa": "is_musa",
+    "is_sm70": "is_sm70_supported",
     "is_mps": "is_mps",
     "is_mlu": "is_mlu",
     "is_sail": "is_sail",

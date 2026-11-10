@@ -87,6 +87,24 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _log_dsv41_prefill_done(req) -> None:
+    """Phase-1 line: how much of this prefill was already cached, and how long it took."""
+    if not envs.SGLANG_DSV41_STICKY_LAST_SEQ.get():
+        return
+    stats = getattr(req, "time_stats", None)
+    start = float(getattr(stats, "forward_entry_time", 0.0) or 0.0)
+    end = float(getattr(stats, "prefill_finished_time", 0.0) or 0.0)
+    prefill_s = (end - start) if start > 0.0 and end >= start else -1.0
+    cached = int(getattr(req, "num_matched_prefix_tokens", 0) or 0)
+    prompt = len(getattr(req, "origin_input_ids", ()) or ())
+    logger.info(
+        "dsv41 prefill done cached=%d prompt=%d prefill_s=%.3f",
+        cached,
+        prompt,
+        prefill_s,
+    )
+
+
 def _get_speculative_output_stride(result: GenerationBatchResult) -> int:
     """Return the padded per-request width in flattened speculative output."""
     stride = result.speculative_output_stride
@@ -461,6 +479,7 @@ class SchedulerBatchResultProcessor:
                     req.time_stats.set_prefill_finished_time()
                     if (x := self.kv_weight_version_tracker) is not None:
                         x.fill_req_prefill_weight_versions(req)
+                    _log_dsv41_prefill_done(req)
 
                     if discard_finish_reason is not None:
                         req.request_finish(discard_finish_reason)

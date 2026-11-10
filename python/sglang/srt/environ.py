@@ -1670,6 +1670,34 @@ class Envs:
     # See docs/references/environment_variables.
     SGLANG_ENABLE_PCIE_IPC_ALLREDUCE = EnvBool(False)
     SGLANG_PCIE_IPC_MAX_NUMEL = EnvInt(0)
+    # Opt-in custom all-reduce on >2 GPUs without a full NVLink clique
+    # (PCIe P2P, e.g. 4x V100 on one PLX switch). Default off: identical to
+    # upstream (NCCL). When set, only one-shot push is used - pull kernels
+    # hang on PCIe P2P - and only up to SGLANG_CUSTOM_AR_PCIE_MAX_BYTES.
+    # Do not enable on an 8x V100 hybrid NVLink mesh (TP8 DSV41).
+    SGLANG_CUSTOM_AR_ALLOW_PCIE = EnvBool(False)
+    SGLANG_CUSTOM_AR_PCIE_MAX_BYTES = EnvInt(128 * 1024)
+    # Restrict CustomAllReduceV2 algorithm selection to one name; unset keeps
+    # the automatic choice.
+    SGLANG_CUSTOM_ALLREDUCE_ALGO = EnvStr(None)
+    # SM70 (V100/Volta) TP4 push-plane tuning: on a full 4-way NVLink mesh,
+    # pin CustomAllReduceV2's push plane at 16 blocks instead of one per SM.
+    # Opt-in, default off: upstream block count is kept unless set.
+    SGLANG_SM70_AR_PUSH16 = EnvBool(False)
+    # SM70 only, default off: POST /flush_cache once after server warmup so the
+    # warmup generate's sticky pin cannot make the first chat full-prefill.
+    SGLANG_SM70_WARMUP_FLUSH_CACHE = EnvBool(False)
+    # SM70/V100 only, default off: strict-greedy batches exchange one exact
+    # top-1 candidate per TP rank instead of gathering full-vocabulary logits.
+    # Needs TP all-gather, fp16 hidden states and no logprob/penalty consumers.
+    SGLANG_V100_GREEDY_TP_TOP1 = EnvBool(False)
+    # Opt out of the prompt segment cache (reuses token ids between added
+    # tokens across requests). Unset keeps the cache on.
+    SGLANG_DISABLE_PROMPT_SEGMENT_CACHE = EnvBool(False)
+    # Default off: hash a harness session id onto one DP replica on the
+    # Anthropic endpoint so a conversation's hot prefix stays in one host tier.
+    # Unset keeps upstream's round-robin replica choice.
+    SGLANG_ANTHROPIC_DP_SESSION_PIN = EnvBool(False)
 
     # ===================================================================
     # RoPE cache
@@ -1966,6 +1994,25 @@ class Envs:
     # a deepseek-recipe tier name or an integer budget in [1, 100]; unset ->
     # deepseek-recipe's default.
     SGLANG_DSV41_REASONING_EFFORT = EnvStr(None)
+    # TP all-reduce (and all-to-all) via two NVLink quads then the
+    # four cross-quad pairs (8xV100 hybrid mesh). Decode-sized tensors only.
+    # Default off: in-graph custom-AR is capturable but RankSignals-
+    # bound (~67 ms/tok) while spill_copy is rank-divergent; leave off.
+    SGLANG_DSV41_HIER_AR = EnvBool(False)
+    SGLANG_DSV41_HIER_AR_CA = EnvBool(False)
+    # Quad and pair steps of the custom-AR chain fused into one push kernel
+    # (sm70_hier_push_ar), bitwise equal to the chain. Needs HIER_AR_CA.
+    SGLANG_DSV41_HIER_AR_PUSH = EnvBool(False)
+    # One-slot exact token-id continuation on ChunkCache (radix stays off).
+    # Next HTTP turn reuses KV only if new_ids starts with the last finished
+    # sequence. Miss / /health / flush drops the pin. Off in generic prod.
+    SGLANG_DSV41_STICKY_LAST_SEQ = EnvBool(False)
+    # Scalar stats of DSV4.1 intermediates (RMS/NaN/MoE topk/logits). Off in prod.
+    SGLANG_DEBUG_DSV41_PROBE_STATS = EnvBool(False)
+    SGLANG_DEBUG_DSV41_PROBE_STATS_DIR = EnvStr("/tmp/dsv41-probe")
+    # Row-level TARGET_VERIFY vs EXTEND fingerprints. Off in prod. Host-syncs.
+    SGLANG_DEBUG_DSV41_ALIGN_DUMP = EnvBool(False)
+    SGLANG_DEBUG_DSV41_ALIGN_DUMP_DIR = EnvStr("/tmp/dsv41-align-dump")
     # Quantize the SWA fp8 KV cache from bf16-rounded values (matches
     # trainer-side QAT and the DSA-CP path) instead of fp32 registers.
     SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE = EnvBool(False)

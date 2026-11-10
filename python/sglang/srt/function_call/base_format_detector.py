@@ -1,3 +1,4 @@
+import inspect
 import json
 import logging
 from abc import ABC, abstractmethod
@@ -8,10 +9,142 @@ from partial_json_parser.core.exceptions import MalformedJSON
 from partial_json_parser.core.options import Allow
 
 try:
-    from xgrammar import StructuralTag, get_model_structural_tag
+    from xgrammar import StructuralTag
+
+    try:
+        from xgrammar import get_model_structural_tag
+    except ImportError:
+        # XGrammar 0.1.x names the model-tag helper get_builtin_structural_tag,
+        # uses other model keys and has no tool_choice argument. Keep SGLang's
+        # stable detector API while preserving required/named tool-choice semantics.
+        from xgrammar import get_builtin_structural_tag
+
+        def get_model_structural_tag(
+            *,
+            model: str,
+            tools: List[Dict[str, Any]],
+            tool_choice: Union[Dict[str, Any], Literal["auto", "required"]],
+            reasoning: bool,
+        ) -> Optional[StructuralTag]:
+            deepseek_v4 = model == "deepseek_v4"
+            model = {
+                "qwen_3_coder": "qwen_coder",
+                # XGrammar 0.1.32 has the same DSML body grammar under the
+                # V3.2 template. V4 only renames the outer function_calls tag.
+                "deepseek_v4": "deepseek_v3_2",
+            }.get(model, model)
+            if model not in {
+                "llama",
+                "qwen",
+                "qwen_coder",
+                "kimi",
+                "deepseek_r1",
+                "harmony",
+                "deepseek_v3_2",
+                "minimax",
+            }:
+                # Match the old optional-helper behavior for detector formats
+                # that the pinned builtin API does not yet implement (for
+                # example DeepSeek V4), rather than raising during a request.
+                return None
+
+            require_tool = tool_choice == "required"
+            if isinstance(tool_choice, dict):
+                selected_name = (
+                    tool_choice.get("function", {}).get("name")
+                    if isinstance(tool_choice.get("function"), dict)
+                    else None
+                )
+                if selected_name:
+                    tools = [
+                        tool
+                        for tool in tools
+                        if tool.get("function", {}).get("name") == selected_name
+                    ]
+                    require_tool = True
+
+            structural_tag = get_builtin_structural_tag(
+                model=model,
+                tools=tools,
+                reasoning=reasoning,
+            )
+            if not require_tool and not deepseek_v4:
+                return structural_tag
+
+            payload = structural_tag.model_dump()
+
+            def update_payload(value: Any) -> Any:
+                if isinstance(value, dict):
+                    if value.get("type") == "triggered_tags":
+                        if require_tool:
+                            value["at_least_one"] = True
+                    for key, child in value.items():
+                        value[key] = update_payload(child)
+                elif isinstance(value, list):
+                    for index, child in enumerate(value):
+                        value[index] = update_payload(child)
+                elif deepseek_v4 and isinstance(value, str):
+                    return value.replace(
+                        "<｜DSML｜function_calls>",
+                        "<｜DSML｜tool_calls>",
+                    ).replace(
+                        "</｜DSML｜function_calls>",
+                        "</｜DSML｜tool_calls>",
+                    )
+                return value
+
+            update_payload(payload)
+            return StructuralTag.model_validate(payload)
+
 except ImportError:
     StructuralTag = Any
     get_model_structural_tag = None
+
+# XGrammar >= 0.2.7 caps these tool-call formats at one call when
+# parallel_tool_calls=False.
+_TOOL_DISPATCH_FORMATS = (
+    "triggered_tags",
+    "token_triggered_tags",
+    "tags_with_separator",
+)
+
+
+def _stop_after_first_call(value: Any) -> None:
+    if isinstance(value, dict):
+        if value.get("type") in _TOOL_DISPATCH_FORMATS:
+            value["stop_after_first"] = True
+        for child in value.values():
+            _stop_after_first_call(child)
+    elif isinstance(value, list):
+        for child in value:
+            _stop_after_first_call(child)
+
+
+def _with_parallel_tool_calls(get_tag):
+    # Workaround for XGrammar < 0.2.7, which rejects parallel_tool_calls;
+    # drop once requirements.txt pins >= 0.2.7. Harmony keeps the parallel tag,
+    # because there the cap would also forbid ordinary messages.
+    def get_tag_with_parallel_tool_calls(*, parallel_tool_calls: bool = True, **kwargs):
+        structural_tag = get_tag(**kwargs)
+        if (
+            parallel_tool_calls
+            or structural_tag is None
+            or kwargs.get("model") == "harmony"
+        ):
+            return structural_tag
+        payload = structural_tag.model_dump()
+        _stop_after_first_call(payload)
+        return StructuralTag.model_validate(payload)
+
+    return get_tag_with_parallel_tool_calls
+
+
+if (
+    get_model_structural_tag is not None
+    and "parallel_tool_calls"
+    not in inspect.signature(get_model_structural_tag).parameters
+):
+    get_model_structural_tag = _with_parallel_tool_calls(get_model_structural_tag)
 
 from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
 from sglang.srt.environ import envs

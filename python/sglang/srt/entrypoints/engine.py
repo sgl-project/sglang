@@ -2032,8 +2032,14 @@ def _set_envs_and_config(server_args: ServerArgs):
     # Set ulimit
     set_ulimit()
 
-    # Check flashinfer version
-    if not get_bool_env_var("SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK"):
+    # Check flashinfer / sglang-kernel versions. V100 is pinned to
+    # sglang-kernel 0.4.6.post1 (CUDA 12.8); upstream now requires 0.4.7.
+    skip_kernel_pkg = get_bool_env_var("SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK")
+    skip_sgl_kernel_on_sm70 = False
+    if _is_cuda and torch.cuda.is_available():
+        major, minor = torch.cuda.get_device_capability()
+        skip_sgl_kernel_on_sm70 = major == 7 and minor == 0
+    if not skip_kernel_pkg:
         if (
             "flashinfer" in attention_backends_of(resolved_view(cfg))
             or cfg.dsa_topk_backend == "flashinfer"
@@ -2046,7 +2052,7 @@ def _set_envs_and_config(server_args: ServerArgs):
                 "reinstall the latest version by following the instructions "
                 "at https://docs.flashinfer.ai/installation.html.",
             )
-        if _is_cuda:
+        if _is_cuda and not skip_sgl_kernel_on_sm70:
             assert_pkg_version(
                 "sglang-kernel",
                 "0.4.9",

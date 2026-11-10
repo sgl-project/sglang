@@ -27,6 +27,7 @@ from contextlib import contextmanager, suppress
 from typing import (
     TYPE_CHECKING,
     Any,
+    Callable,
     Dict,
     Generator,
     Iterable,
@@ -280,13 +281,39 @@ def _get_quantization_config(
             if major is not None and minor is not None:
                 assert 0 <= minor < 10
                 capability = major * 10 + minor
-                if capability < quant_config.get_min_capability():
-                    raise ValueError(
-                        f"The quantization method {model_config.quantization} "
-                        "is not supported for the current GPU. "
-                        f"Minimum capability: {quant_config.get_min_capability()}. "
-                        f"Current capability: {capability}."
-                    )
+                min_cap = quant_config.get_min_capability()
+                if capability < min_cap:
+                    # SM70 (V100): the stock Marlin kernels are SM80+ stubs,
+                    # but the marlin_v100 integration supplies real WMMA
+                    # kernels. When it is installed, allow gptq_marlin /
+                    # awq_marlin / marlin to run on SM70. Absent integration
+                    # (kernel cluster not applied) keeps the upstream error.
+                    try:
+                        from sglang.srt.layers.quantization.marlin_utils import (
+                            _sm70_marlin_v100_available,
+                        )
+                    except ImportError:
+                        _sm70_marlin_v100_available = None
+
+                    if (
+                        capability == 70
+                        and min_cap == 80
+                        and _sm70_marlin_v100_available is not None
+                        and _sm70_marlin_v100_available()
+                    ):
+                        logger.info(
+                            "SM70 (V100): allowing quant=%s (min_capability=%d) "
+                            "via the marlin_v100 kernel.",
+                            model_config.quantization,
+                            min_cap,
+                        )
+                    else:
+                        raise ValueError(
+                            f"The quantization method {model_config.quantization} "
+                            "is not supported for the current GPU. "
+                            f"Minimum capability: {min_cap}. "
+                            f"Current capability: {capability}."
+                        )
         supported_dtypes = quant_config.get_supported_act_dtypes()
         if model_config.dtype not in supported_dtypes:
             raise ValueError(
@@ -443,8 +470,17 @@ class DefaultModelLoader(BaseModelLoader):
         model_config: Optional[ModelConfig] = None
         """The model configuration (for checking architecture, etc)."""
 
+        tensor_reader: Optional[Callable] = None
+        """Optional ``(name, safetensors handle) -> tensor | None``.
+
+        None skips the tensor before it is materialized. Used by DSV4.1 so an
+        EP rank does not read expert and Engram bytes it will throw away.
+        """
+
         @classmethod
         def init_new(cls, model_config: ModelConfig, model):
+            reader_factory = getattr(model, "checkpoint_tensor_reader", None)
+            tensor_reader = reader_factory() if callable(reader_factory) else None
             return cls(
                 model_config.model_path,
                 model_config.revision,
@@ -454,6 +490,7 @@ class DefaultModelLoader(BaseModelLoader):
                     model, "allow_patterns_overrides", None
                 ),
                 model_config=model_config,
+                tensor_reader=tensor_reader,
             )
 
     @dataclasses.dataclass(frozen=True)
@@ -716,6 +753,7 @@ class DefaultModelLoader(BaseModelLoader):
                 )
                 use_multithread = False
 
+            read_tensor = getattr(source, "tensor_reader", None)
             if self.load_config.load_format == LoadFormat.FASTSAFETENSORS:
                 enable_gds = extra_config.get("enable_gds", True)
                 weights_iterator = fastsafetensors_weights_iterator(
@@ -733,6 +771,7 @@ class DefaultModelLoader(BaseModelLoader):
                     prefetch=start_iterator_prefetch,
                     prefetch_num_threads=prefetch_num_threads,
                     drop_cache_after_load=weight_loader_drop_cache_after_load,
+                    read_tensor=read_tensor,
                 )
             else:
                 weights_iterator = safetensors_weights_iterator(
@@ -741,6 +780,7 @@ class DefaultModelLoader(BaseModelLoader):
                     prefetch=start_iterator_prefetch,
                     prefetch_num_threads=prefetch_num_threads,
                     drop_cache_after_load=weight_loader_drop_cache_after_load,
+                    read_tensor=read_tensor,
                 )
 
         else:
@@ -1107,7 +1147,24 @@ class DefaultModelLoader(BaseModelLoader):
     def postprocess_weights(model, target_device):
         if QuantizedRLModelLoader.is_reload_scenario(model):
             return
-        for module, quant_method in _modules_with_quant_method(model):
+
+        def _sm70_process_order(item):
+            # SM70 only (a no-op elsewhere): fused MoE repack is a same-sized
+            # rewrite and must see the un-expanded slot, while methods that
+            # dequant to a wider dtype (fp16 on V100) must run last.
+            module, quant_method = item
+            if getattr(module, "w13_weight", None) is not None and hasattr(
+                module, "num_local_experts"
+            ):
+                return 0
+            expands = getattr(quant_method, "expands_storage_after_loading", None)
+            if callable(expands) and expands(module):
+                return 2
+            return 1
+
+        for module, quant_method in sorted(
+            _modules_with_quant_method(model), key=_sm70_process_order
+        ):
             # When quant methods need to process weights after loading
             # (for repacking, quantizing, etc), they expect parameters
             # to be on the global target device. This scope is for the
@@ -1116,6 +1173,10 @@ class DefaultModelLoader(BaseModelLoader):
             with device_loading_context(module, target_device):
                 quant_method.process_weights_after_loading(module)
         finalize_gfx115_weight_padding(model)
+
+        finalize = getattr(model, "finalize_after_quant_processing", None)
+        if callable(finalize):
+            finalize()
 
     @staticmethod
     def restore_weights_before_loading(model, target_device):

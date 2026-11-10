@@ -7,6 +7,7 @@ OpenAIServingChat for processing, and converts responses back to Anthropic forma
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import uuid
@@ -53,7 +54,9 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolChoice,
     ToolChoiceFuncName,
 )
+from sglang.srt.environ import envs
 from sglang.srt.observability.req_time_stats import monotonic_time
+from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
@@ -192,6 +195,82 @@ class AnthropicServing:
         self.openai_serving_chat = openai_serving_chat
         self._merge_inline_system = not openai_serving_chat.supports_inline_system
 
+    @staticmethod
+    def _session_key_from_metadata(
+        anthropic_request: AnthropicMessagesRequest,
+    ) -> Optional[str]:
+        """Recover a stable per-session id from ``metadata.user_id``.
+
+        Claude Code packs a JSON string like ``{"device_id": ...,
+        "account_uuid": ..., "session_id": ...}`` into ``metadata.user_id``.
+        Prefer ``session_id``, fall back to ``device_id``, then to the raw
+        value. Anything unexpected returns None (no pinning, never an error).
+        """
+        meta = anthropic_request.metadata
+        if not meta:
+            return None
+        user_id = meta.get("user_id")
+        if not user_id or not isinstance(user_id, str):
+            return None
+        try:
+            obj = json.loads(user_id)
+        except (ValueError, TypeError):
+            return user_id  # opaque id string -- use as-is
+        if isinstance(obj, dict):
+            return obj.get("session_id") or obj.get("device_id")
+        return None
+
+    def _apply_session_dp_pinning(
+        self,
+        chat_request: ChatCompletionRequest,
+        anthropic_request: AnthropicMessagesRequest,
+        raw_request: Request,
+    ) -> None:
+        """Pin a harness session to one DP replica by hashing its session id.
+
+        Claude Code sends a stable per-conversation identifier: the
+        ``X-Claude-Code-Session-Id`` header and, redundantly, a ``session_id``
+        inside ``metadata.user_id``. Under data parallelism, hashing that id
+        onto a replica keeps a session's hot prefix in ONE replica's host tier
+        instead of alternating host-miss -> shared-disk-hit every turn under
+        round-robin.
+
+        Explicit control always wins: a client-set ``routed_dp_rank`` (body) or
+        an ``X-Data-Parallel-Rank`` header is left untouched.
+        """
+        # Default off: without SGLANG_ANTHROPIC_DP_SESSION_PIN the request keeps
+        # upstream's round-robin replica choice.
+        if not envs.SGLANG_ANTHROPIC_DP_SESSION_PIN.get():
+            return
+        if chat_request.routed_dp_rank is not None:
+            return
+        if (
+            raw_request is not None
+            and raw_request.headers.get("x-data-parallel-rank") is not None
+        ):
+            return
+        num_dp_ranks = get_parallel().num_dp_ranks
+        if num_dp_ranks <= 1:
+            return
+
+        session_key = None
+        if raw_request is not None:
+            session_key = raw_request.headers.get("x-claude-code-session-id")
+        if not session_key:
+            session_key = self._session_key_from_metadata(anthropic_request)
+        if not session_key:
+            return
+
+        # sha256, not builtin hash(): the latter is PYTHONHASHSEED-salted per
+        # process and would re-shuffle every session across an engine restart.
+        digest = hashlib.sha256(str(session_key).encode("utf-8")).hexdigest()
+        chat_request.routed_dp_rank = int(digest, 16) % num_dp_ranks
+        logger.debug(
+            "Pinned Anthropic session %s to DP rank %d",
+            session_key,
+            chat_request.routed_dp_rank,
+        )
+
     async def handle_messages(
         self,
         request: AnthropicMessagesRequest,
@@ -209,6 +288,8 @@ class AnthropicServing:
                 error_type="invalid_request_error",
                 message=str(e),
             )
+
+        self._apply_session_dp_pinning(chat_request, request, raw_request)
 
         if request.stream:
             return await self._handle_streaming(chat_request, request, raw_request)
@@ -599,8 +680,12 @@ class AnthropicServing:
             self.openai_serving_chat.apply_reasoning_enabled(chat_request, enabled)
 
         # Claude 4.7 ``output_config``: map ``effort`` onto the OpenAI
-        # ``reasoning_effort`` knob. ``xhigh`` collapses to ``max`` because
-        # the OpenAI Literal does not include the Anthropic-only ``xhigh``.
+        # ``reasoning_effort`` knob. Forwarded unchanged -- ``ReasoningEffortTier``
+        # has included ``xhigh`` since 02236fa38, so the old collapse of
+        # ``xhigh`` -> ``max`` is no longer needed, and it actively broke
+        # templates whose accepted set includes ``xhigh`` but not ``max``
+        # (Qwen3.8-Flash-Next accepts exactly xhigh/medium/low, so a client
+        # asking for xhigh got a 500).
         # ``task_budget`` is a soft hint forwarded as a custom param so the
         # model can see it without it becoming a hard cap (``max_tokens``
         # is still the hard cap).
@@ -616,9 +701,7 @@ class AnthropicServing:
                     },
                 )
             if oc.effort is not None:
-                chat_request.reasoning_effort = (
-                    "max" if oc.effort == "xhigh" else oc.effort
-                )
+                chat_request.reasoning_effort = oc.effort
             if oc.task_budget is not None:
                 # Custom params are silently ignored by backends that
                 # don't recognise them; logging it makes the propagation

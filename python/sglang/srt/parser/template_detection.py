@@ -70,6 +70,9 @@ class ReasoningToggleConfig:
     default_enabled: Optional[bool] = None
     special_case: Optional[str] = None
     effort_kwarg: Optional[str] = None
+    # (requested, rendered) reasoning_effort pairs for templates that silently
+    # map unknown levels to their strongest one.
+    effort_aliases: tuple[tuple[str, str], ...] = ()
 
     @property
     def always_on(self) -> bool:
@@ -172,7 +175,12 @@ REASONING_MODE_RULES = (
     ),
     DetectionRule(
         name="glm53_always_think",
-        value=ReasoningToggleConfig(special_case="always"),
+        # GLM-5.3 knows low/high/max and renders anything else as Max, so
+        # medium would out-think high.
+        value=ReasoningToggleConfig(
+            special_case="always",
+            effort_aliases=(("minimal", "low"), ("medium", "high")),
+        ),
         # GLM-5.3's generation prompt opens <think>, so the output carries no
         # opening tag; lambda because _is_glm53 is defined below.
         predicate=lambda ctx: _is_glm53(ctx),

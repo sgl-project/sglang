@@ -68,6 +68,16 @@ _NULL_CONTEXT = nullcontext()
 
 
 @contextmanager
+def cuda_nvtx_range(name: str):
+    """CUDA-runtime NVTX range for Nsight Systems (no ``nvtx`` pip package)."""
+    torch.cuda.nvtx.range_push(name)
+    try:
+        yield
+    finally:
+        torch.cuda.nvtx.range_pop()
+
+
+@contextmanager
 def _profile_range_impl(
     debug_name: str, color: Optional[str], record: bool, nvtx_enabled: bool
 ):

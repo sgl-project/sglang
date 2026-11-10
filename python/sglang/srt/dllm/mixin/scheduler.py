@@ -409,6 +409,9 @@ class SchedulerDllmMixin:
             )
 
             if res != AddReqResult.CONTINUE:
+                if res == AddReqResult.ABORT:
+                    self._emit_aborted_waiting_req(req)
+                    continue
                 if res == AddReqResult.NO_TOKEN:
                     running_batch.batch_is_full = True
                 break

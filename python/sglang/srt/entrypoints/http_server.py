@@ -2607,6 +2607,28 @@ def _multi_tokenizer_warmup_kwargs(server_args: ServerArgs, worker_id: int):
     )
 
 
+def _flush_cache_after_server_warmup(server_args: ServerArgs):
+    # SM70 only, default off (SGLANG_SM70_WARMUP_FLUSH_CACHE): drop the warmup
+    # generate's sticky pin so the first real chat is not a miss that
+    # full-prefills against leftover KV.
+    if not envs.SGLANG_SM70_WARMUP_FLUSH_CACHE.get():
+        return
+    flush_key = get_serving().admin_api_key or get_serving().api_key
+    flush_headers = {}
+    if flush_key:
+        flush_headers["Authorization"] = f"Bearer {flush_key}"
+    try:
+        res = requests.post(
+            server_args.url() + "/flush_cache",
+            headers=flush_headers,
+            timeout=30,
+            verify=ssl_verify_of(server_args),
+        )
+        res.raise_for_status()
+    except requests.exceptions.RequestException:
+        logger.warning("post-warmup flush_cache failed", exc_info=True)
+
+
 def _freeze_gc_after_server_warmup(server_args: ServerArgs):
     # Freeze GC after server warmup so static objects skip future GC gen2 collection.
     # Use /freeze_gc to freeze scheduler and detokenizer as well.
@@ -2651,6 +2673,7 @@ def _wait_and_warmup(
 
     if post_warmup_callback is not None:
         post_warmup_callback()
+    _flush_cache_after_server_warmup(server_args)
     _freeze_gc_after_server_warmup(server_args)
 
     # The server is ready for requests
