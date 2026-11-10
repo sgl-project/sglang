@@ -45,6 +45,12 @@ from sglang.test.test_utils import CustomTestCase, enter_scope
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
+class _ChunkedSlot(SimpleNamespace):
+    """A partial scheduler whose chunked slot is its CHUNKED list."""
+
+    chunked_req = Scheduler.chunked_req
+
+
 class TestAllocationConfiguration(CustomTestCase):
     def test_unsupported_modes_fail_explicitly(self):
         combinations = [
@@ -290,13 +296,17 @@ class TestAllocationIntegration(CustomTestCase):
         entry = DecodeRequest(req=req, kv_receiver=receiver)
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
         queue.queue = decode_queue(ListKind.PD_PREALLOC, [entry])
+        queue.transfer_queue = SimpleNamespace(
+            queue=decode_queue(ListKind.PD_RECEIVING)
+        )
         queue.pending_reqs = []
+        queue._num_published_destinations = 0
         queue.pp_size, queue.tp_rank = 1, 0
         queue.gloo_group = object()
         queue._resolve_pending_reqs = Mock()
         queue._uses_swa_tail_prealloc = Mock(return_value=False)
         queue.token_to_kv_pool_allocator = SimpleNamespace(
-            prealloc_fits_assumes_reclaim=Mock(return_value=False)
+            pools_share_memory=False, window_pool_names=lambda: ()
         )
         queue._allocatable_token_budgets = Mock(return_value=100000)
         queue._hicache_pending_restore_tokens = Mock(return_value=0)
@@ -315,14 +325,18 @@ class TestAllocationIntegration(CustomTestCase):
             "sglang.srt.disaggregation.decode.poll_and_all_reduce",
             side_effect=lambda receivers, group: [r.poll() for r in receivers],
         ):
-            self.assertEqual(queue.pop_preallocated(), ([], []))
+            self.assertEqual(
+                queue.move_preallocated(queue.transfer_queue.queue), ([], [])
+            )
             self.flush()
             self.assertFalse(entry.waiting_for_input)
             queue.req_to_metadata_buffer_idx_allocator.available_size.assert_not_called()
             queue.req_to_token_pool.available_size.assert_not_called()
             sender.mark_prefill_complete()
             self.flush()
-            self.assertEqual(queue.pop_preallocated(), ([], []))
+            self.assertEqual(
+                queue.move_preallocated(queue.transfer_queue.queue), ([], [])
+            )
         self.assertTrue(entry.waiting_for_input)
         queue.req_to_metadata_buffer_idx_allocator.available_size.assert_called_once()
         queue.req_to_token_pool.available_size.assert_called_once()
@@ -353,7 +367,6 @@ class TestAllocationIntegration(CustomTestCase):
         )
         scheduler = SimpleNamespace(
             tree_cache=Mock(supports_mamba=Mock(return_value=False)),
-            clear_pending_chunk_send=Mock(),
             prefill_launched_reqs=KeyedReqList(ListKind.PREFILL_LAUNCHED),
             waiting_queue=IndexedReqList(ListKind.WAITING),
             disagg_prefill_bootstrap_queue=SimpleNamespace(
@@ -433,16 +446,13 @@ class TestAllocationIntegration(CustomTestCase):
         req.time_stats = MagicMock()
         scheduler = SimpleNamespace(
             tree_cache=Mock(supports_mamba=Mock(return_value=False)),
-            clear_pending_chunk_send=Mock(),
-            prefill_launched_reqs=Mock(),
+            prefill_launched_reqs=KeyedReqList(ListKind.PREFILL_LAUNCHED),
             waiting_queue=IndexedReqList(ListKind.WAITING),
             disagg_prefill_bootstrap_queue=SimpleNamespace(queue=[]),
             metrics_reporter=SimpleNamespace(enable_metrics=False),
             processed_tokens_counter=0,
         )
-        scheduler.release_aborted_request = MethodType(
-            Scheduler.release_aborted_request, scheduler
-        )
+        scheduler.prefill_launched_reqs.join([req])
         with (
             patch("sglang.srt.disaggregation.prefill.checkpoint_kv_cache"),
             patch("sglang.srt.disaggregation.prefill.release_kv_cache"),
@@ -472,8 +482,8 @@ class TestAllocationIntegration(CustomTestCase):
                             to_finish=None,
                             inflight_steps=inflight_steps,
                         )
-                        scheduler = SimpleNamespace(
-                            chunked_req=req,
+                        scheduler = _ChunkedSlot(
+                            chunked_reqs=IndexedReqList(ListKind.CHUNKED),
                             tree_cache=Mock(),
                             check_bootstrap=Mock(return_value=False),
                             has_bootstrapped_waiting_req=Mock(return_value=True),
@@ -482,6 +492,7 @@ class TestAllocationIntegration(CustomTestCase):
                                 ListKind.PREFILL_LAUNCHED
                             ),
                         )
+                        scheduler.chunked_reqs.join([req])
                         scheduler.checkpoint_disagg_prefill = MethodType(
                             SchedulerDisaggregationPrefillMixin.checkpoint_disagg_prefill,
                             scheduler,
@@ -824,7 +835,11 @@ class TestAllocationIntegration(CustomTestCase):
                     queue.kv_manager = Mock()
                     queue.req_to_metadata_buffer_idx_allocator = Mock()
                     queue._transfer_page_indices = Mock(return_value=[0])
-                    queue.transfer_queue = SimpleNamespace(enable_staging=False)
+                    queue.token_to_kv_pool_allocator = SimpleNamespace(storage=None)
+                    queue.req_to_token_pool = Mock()
+                    queue.transfer_queue = SimpleNamespace(
+                        enable_staging=False, enable_deferred_kv_release=False
+                    )
                     queue._num_published_destinations = 0
                     queue.scheduler = SimpleNamespace(enable_overlap=False)
                     events = Mock()

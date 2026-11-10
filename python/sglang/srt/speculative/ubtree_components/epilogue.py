@@ -413,7 +413,6 @@ class UBTreeVerifyEpilogue:
             retrieve_next_token=self.retrieve_next_token_buf[:bs],
             retrieve_next_sibling=self.retrieve_next_sibling_buf[:bs],
             target_predict=target_predict,
-            topk=-1,
         )
         if broadcast_outputs:
             # All TP ranks must commit rank zero's sampled path, including its

@@ -187,7 +187,13 @@ class BaselineConfig:
         for prefix, overrides in data.get("runner_overrides", {}).items():
             if runner_name.startswith(prefix):
                 for name, metrics in overrides.items():
-                    data["scenarios"][name].update(metrics)
+                    scenario = data["scenarios"][name]
+                    for key, value in metrics.items():
+                        # merge per-stage/per-step maps so unlisted entries keep their guard
+                        if isinstance(value, dict):
+                            scenario[key] = {**scenario[key], **value}
+                        else:
+                            scenario[key] = value
                 print(f"--- Performance Runner Baseline: {prefix} ---")
                 break
 
@@ -772,6 +778,19 @@ MODELOPT_TI2I_CI_sampling_params = DiffusionSamplingParams(
 
 TI2I_sampling_params = DiffusionSamplingParams(
     prompt="Convert 2D style to 3D style",
+    image_path=TI2I_QWEN_IMAGE_EDIT_INPUT,
+)
+
+MINIMAX_H3_IMAGE_T2I_sampling_params = DiffusionSamplingParams(
+    prompt="A quiet London street after rain, warm shop lights reflected on the pavement, detailed photograph",
+    output_size="2048x2048",
+    output_format="png",
+    extras={"num_inference_steps": 6, "seed": 42, "generator_device": "cpu"},
+)
+
+MINIMAX_H3_IMAGE_EDIT_sampling_params = replace(
+    MINIMAX_H3_IMAGE_T2I_sampling_params,
+    prompt="Keep the composition of <Picture 1> and convert it to a watercolor painting.",
     image_path=TI2I_QWEN_IMAGE_EDIT_INPUT,
 )
 

@@ -14,6 +14,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
     KeyedReqList,
     ListKind,
 )
+from sglang.srt.managers.scheduler_components.request_retirer import RequestRetirer
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
@@ -25,6 +26,26 @@ class FakeReq(SimpleNamespace):
 
     __eq__ = object.__eq__
     __hash__ = object.__hash__
+
+    # Req's exit_ledger fields.
+    exit_via = None
+    send_via = None
+
+
+def release_only_retirer(
+    tree_cache=None, hisparse_coordinator=None, beam_coordinator=None
+) -> RequestRetirer:
+    """A `RequestRetirer` for a test that only releases requests, never aborts
+    a queued one."""
+    return RequestRetirer(
+        tree_cache=tree_cache,
+        beam_coordinator=beam_coordinator
+        or SimpleNamespace(retire_group=lambda req: None),
+        hisparse_coordinator=hisparse_coordinator,
+        uocr_runtime=None,
+        send_abort_output=None,
+        stream_output=None,
+    )
 
 
 def decode_queue(kind: ListKind, decode_reqs: Iterable = ()) -> IndexedReqList:

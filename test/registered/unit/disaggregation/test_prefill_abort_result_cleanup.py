@@ -20,12 +20,13 @@ from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_test_utils import FakeReq, release_only_retirer
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
-class _Req:
+class _Req(FakeReq):
     def __init__(self, *, allocated: bool = True):
         self.rid = "aborted-prefill"
         self.cache_request_handle = CacheRequestHandle(self.rid, 0)
@@ -40,6 +41,9 @@ class _Req:
         self.to_finish = FINISH_ABORT() if allocated else None
         self.finished_reason = None if allocated else FINISH_ABORT()
         self.discard_output_reason = None
+        self.session = None
+        self.get_mm_token_counts = Mock()
+        self.release_mm_inputs_on_abort = Mock()
         self.return_logprob = False
         self.return_sampling_mask = False
         self.grammar = None
@@ -71,8 +75,8 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         )
         self.spec_algorithm = SimpleNamespace(is_eagle=lambda: False)
         self.tree_cache = Mock()
+        self.request_retirer = release_only_retirer(self.tree_cache)
         self.disagg_prefill_transfer_queue = IndexedReqList(ListKind.PD_SENDING)
-        self.disagg_prefill_pending_chunk_rids = {"aborted-prefill"}
         self.send_kv_chunk = Mock()
         self.output_streamer = Mock()
         self.metrics_reporter = SimpleNamespace(report_prefill_stats=Mock())
@@ -116,14 +120,17 @@ def _free_req(req, _tree_cache, *, checkpoint):
 )
 def test_customized_info_failure_is_request_local(capacity, customized_info, error):
     scheduler = SchedulerDisaggregationPrefillMixin()
-    scheduler.disagg_prefill_pending_chunk_rids = set()
     scheduler.enable_staging = False
     scheduler.token_to_kv_pool_allocator = SimpleNamespace(
-        page_size=1, translate_kv_indices_for_transfer=lambda indices: indices
+        page_size=1,
+        translate_kv_indices_for_transfer=lambda indices: indices,
+        storage=None,
     )
     scheduler.req_to_token_pool = SimpleNamespace(req_to_token=torch.tensor([[0]]))
     scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(
-        kv_manager=SimpleNamespace(kv_args=SimpleNamespace(state_types=[]))
+        kv_manager=SimpleNamespace(
+            kv_args=SimpleNamespace(state_types=[], state_sub_pools=[])
+        )
     )
     with envs.SGLANG_DISAGG_CUSTOMIZED_INFO_MAX_BYTES.override(capacity):
         scheduler.disagg_metadata_buffers = MetadataBuffers(
@@ -143,7 +150,6 @@ def test_customized_info_failure_is_request_local(capacity, customized_info, err
         req.disagg_kv_sender = Mock()
         req.disagg_kv_sender.supports_host_tensor_indices = False
         req.disagg_kv_sender.get_max_transfer_tokens.return_value = None
-        scheduler.disagg_prefill_pending_chunk_rids.add(req.rid)
 
         scheduler._send_kv_chunk(req, last_chunk=True)
 
@@ -162,7 +168,6 @@ def test_customized_info_failure_is_request_local(capacity, customized_info, err
                 scheduler.disagg_metadata_buffers.get_customized_info(0)
                 == req.customized_info
             )
-        assert req.rid not in scheduler.disagg_prefill_pending_chunk_rids
 
     with (
         patch.object(
@@ -221,7 +226,10 @@ class TestPrefillCompleteResult(CustomTestCase):
         self.assertTrue(req.pending_bootstrap)
         scheduler.send_kv_chunk.assert_not_called()
 
-    @patch("sglang.srt.disaggregation.prefill.release_kv_cache", side_effect=_free_req)
+    @patch(
+        "sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache",
+        side_effect=_free_req,
+    )
     def test_aborted_final_result_never_publishes_ready(self, release):
         scheduler = _Scheduler()
         req = _Req()

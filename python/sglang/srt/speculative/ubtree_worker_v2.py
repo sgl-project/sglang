@@ -15,7 +15,7 @@ import torch
 from sglang.kernels.ops.speculative.cache_locs import assign_extend_cache_locs_func
 from sglang.kernels.ops.speculative.dflash import _prepare_dflash_draft_block_unchecked
 from sglang.srt.managers.utils import GenerationBatchResult
-from sglang.srt.mem_cache.kv.router import STATE_PART
+from sglang.srt.mem_cache.kv.decl import STATE_PART
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,

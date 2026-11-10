@@ -89,6 +89,59 @@ class _FakeServerArgs:
         return False
 
 
+class TestCustomVAETrust(unittest.TestCase):
+    def test_custom_module_executes_only_with_explicit_trust(self):
+        for trust_remote_code in (False, True):
+            with self.subTest(trust_remote_code=trust_remote_code):
+                loader = vae_loader.VAELoader()
+                pipeline_config = QwenImagePipelineConfig()
+                pipeline_config.native_only_components = ()
+                server_args = _FakeServerArgs(pipeline_config)
+                server_args.trust_remote_code = trust_remote_code
+                with TemporaryDirectory() as root:
+                    marker = pathlib.Path(root) / "executed"
+                    (pathlib.Path(root) / "custom.py").write_text(
+                        "from pathlib import Path\n"
+                        "import torch.nn as nn\n"
+                        f"Path({str(marker)!r}).write_text('imported')\n"
+                        "class TestVAE(nn.Module):\n"
+                        "    @classmethod\n"
+                        "    def from_pretrained(cls, path, *, revision, trust_remote_code):\n"
+                        "        assert revision == 'test-revision'\n"
+                        "        assert trust_remote_code is True\n"
+                        "        return cls()\n"
+                    )
+                    with (
+                        patch.object(
+                            vae_loader,
+                            "get_diffusers_component_config",
+                            return_value={
+                                "_class_name": "TestVAE",
+                                "auto_map": {"AutoModel": "custom.TestVAE"},
+                            },
+                        ),
+                        patch.object(
+                            loader, "target_device", return_value=torch.device("cpu")
+                        ),
+                        patch.object(
+                            vae_loader.current_platform,
+                            "optimize_vae",
+                            side_effect=lambda vae: vae,
+                        ),
+                    ):
+                        if trust_remote_code:
+                            loaded = loader.load_customized(root, server_args, "vae")
+                            self.assertIsInstance(loaded, nn.Module)
+                            self.assertEqual(marker.read_text(), "imported")
+                        else:
+                            with self.assertRaisesRegex(
+                                ComponentCheckpointUnsupportedError,
+                                "--trust-remote-code",
+                            ):
+                                loader.load_customized(root, server_args, "vae")
+                            self.assertFalse(marker.exists())
+
+
 class TestDeploymentBytesRoot(unittest.TestCase):
     """A hub repo id is not a directory; the component path always is."""
 
@@ -375,6 +428,7 @@ class TestDirectGPUVAEState(unittest.TestCase):
                     pipeline_config = QwenImagePipelineConfig()
                     pipeline_config.native_only_components = ("vae",)
                     server_args = _FakeServerArgs(pipeline_config)
+                    server_args.trust_remote_code = False
                     server_args.component_direct_gpu_weight_loading = {
                         "vae": direct_gpu_loading
                     }

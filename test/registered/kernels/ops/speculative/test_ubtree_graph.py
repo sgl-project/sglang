@@ -257,6 +257,7 @@ def test_fa3_verify_metadata_graph_isolated_and_refreshes_live_inputs(
                 scheduler_metadata=metadata.scheduler_metadata
                 if use_precomputed
                 else None,
+                ver=backend.fa_impl_ver,
             )
             results.extend(result[:2])
         return results
@@ -393,9 +394,9 @@ def test_full_draft_graph_refreshes_replaced_request_tensors(monkeypatch):
     monkeypatch.setattr(draft_graph, "graph_capture", capture_context)
 
     class Layer(torch.nn.Module):
-        def forward(self, positions, hidden, batch, residual):
+        def forward(self, positions, hidden, batch, residual, output_conv):
             values = positions + batch.seq_lens[0] + batch.req_pool_indices[0]
-            return hidden + values[:, None], None
+            return hidden + values[:, None], None, None
 
     embedding = torch.nn.Embedding(17, 8, device="cuda")
     model = SimpleNamespace(
@@ -1064,7 +1065,6 @@ def test_sampling_and_tree_walk_match_joint_ar_distribution(
             retrieve_next_token=next_token,
             retrieve_next_sibling=next_sibling,
             target_predict=target_predict,
-            topk=-1,
         )
 
     draw()

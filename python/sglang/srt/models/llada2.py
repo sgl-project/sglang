@@ -34,6 +34,7 @@ from triton.language.extra import libdevice
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.hf_transformers import get_rope_config
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
@@ -70,6 +71,8 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -81,17 +84,10 @@ from sglang.srt.models.utils import (
     apply_qk_norm,
     create_fused_set_kv_buffer_arg,
     enable_fused_set_kv_buffer,
+    is_non_idle_and_non_empty,
 )
 from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
-from sglang.srt.utils import (
-    LazyValue,
-    add_prefix,
-    is_cuda,
-    is_non_idle_and_non_empty,
-    is_npu,
-    make_pp_layers,
-)
-from sglang.srt.utils.hf_transformers import get_rope_config
+from sglang.srt.utils import LazyValue, is_cuda, is_npu
 
 LoraConfig = None
 logger = logging.getLogger(__name__)

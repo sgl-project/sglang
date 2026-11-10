@@ -12,7 +12,7 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import attention_backends, get_schedule
-from sglang.srt.utils.common import is_npu
+from sglang.srt.utils.device import is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
