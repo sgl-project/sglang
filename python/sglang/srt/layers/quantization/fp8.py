@@ -1392,7 +1392,8 @@ class Fp8LinearMethod(LinearMethodBase):
                 _amx_process_weight_after_loading(layer, ["weight"])
                 return
 
-        if self.use_xpu_w8a16:
+        # _is_xpu first: other platforms (and tests that build the method with __new__) never read the XPU flag.
+        if _is_xpu and self.use_xpu_w8a16:
             prepare_xpu_fp8_w8a16_layer(layer, self.block_quant)
 
         if self.use_marlin:
@@ -1419,7 +1420,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 bias=bias,
             )
 
-        if self.use_xpu_w8a16 and layer.xpu_fp8_w8a16:
+        if _is_xpu and self.use_xpu_w8a16 and layer.xpu_fp8_w8a16:
             return apply_xpu_fp8_w8a16_linear(layer, x, bias, self.block_quant)
 
         if _is_hip and self.block_fp8_as_mxfp8 and self.mxfp8_dense_backend.is_gfx95():
