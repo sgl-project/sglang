@@ -692,46 +692,10 @@ class DFlashMLAAttention(DeepseekV2AttentionMLA):
 
 
 class DFlashMLP(DraftMLP):
-    """The dense FFN of a DFlash draft layer, sized from its config."""
+    """The dense kind of a DFlash draft layer; gfx950 may run gate_up on hipBLASLt."""
 
-    def __init__(self, config, quant_config=None, prefix: str = "") -> None:
-        dense = DraftDenseFFNSpec.from_config(config)
-        super().__init__(
-            int(config.hidden_size),
-            dense.intermediate_size,
-            dense.hidden_act,
-            swiglu_limit=dense.swiglu_limit,
-            swiglu_alpha=dense.swiglu_alpha,
-            quant_config=quant_config,
-            prefix=prefix,
-        )
-<<<<<<< HEAD
-=======
-        self.down_proj = RowParallelLinear(
-            intermediate_size,
-            hidden_size,
-            bias=False,
-            quant_config=quant_config,
-            prefix="down_proj" if not prefix else f"{prefix}.down_proj",
-        )
-        hidden_act = getattr(config, "hidden_act", "silu")
-        if hidden_act == "silu":
-            self.act_fn = SiluAndMul()
-        elif hidden_act == "swigluoai":
-            from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
-                swiglu_no_interleaved_with_alpha_and_limit,
-            )
-
-            self.act_fn = partial(
-                swiglu_no_interleaved_with_alpha_and_limit,
-                gemm1_alpha=float(config.swiglu_alpha),
-                gemm1_limit=float(config.swiglu_limit),
-            )
-        else:
-            raise ValueError(
-                f"Unsupported DFlash activation: {hidden_act}. "
-                "Supported activations are silu and swigluoai."
-            )
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
         self.gate_up_on_hipblaslt = (
             _is_gfx95
             and envs.SGLANG_ROCM_MUSE_DFLASH_DENSE.get()
@@ -739,15 +703,20 @@ class DFlashMLP(DraftMLP):
             and tuple(self.gate_up_proj.weight.shape) in _GFX950_HIPBLASLT_WEIGHTS
         )
 
+    @classmethod
+    def from_config(cls, config, quant_config=None, prefix: str = "") -> DFlashMLP:
+        dense = DraftDenseFFNSpec.from_config(config)
+        return cls.from_spec(
+            dense, int(config.hidden_size), quant_config=quant_config, prefix=prefix
+        )
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.gate_up_on_hipblaslt and x.shape[0] in _GFX950_HIPBLASLT_ROWS:
             gate_up = F.linear(x, self.gate_up_proj.weight)
         else:
             gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
-        return x
->>>>>>> origin/main
+        out, _ = self.down_proj(self.act_fn(gate_up))
+        return out
 
 
 @torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
@@ -917,6 +886,7 @@ class DFlashDecoderLayer(nn.Module):
             ffn_spec,
             layer_id,
             hidden_size,
+            dense=DFlashMLP,
             quant_config=quant_config,
             prefix=mlp_prefix,
         )

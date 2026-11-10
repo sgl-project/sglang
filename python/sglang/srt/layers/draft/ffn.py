@@ -468,10 +468,11 @@ def build_ffn(
     layer_id: int,
     hidden_size: int,
     *,
+    dense: type[DraftMLP] = DraftMLP,
     quant_config: Optional[QuantizationConfig] = None,
     prefix: str = "",
 ) -> nn.Module:
-    """The FFN of draft layer ``layer_id``: DraftMoE where the spec says MoE, else DraftMLP."""
+    """The FFN of draft layer ``layer_id``: DraftMoE where the spec says MoE, else ``dense``."""
     if spec.kind(layer_id) == FFN_KIND_MOE:
         return DraftMoE(
             spec.moe,
@@ -482,6 +483,6 @@ def build_ffn(
         )
     if spec.dense is None:
         raise ValueError("Draft FFN: intermediate_size is required for dense layers.")
-    return DraftMLP.from_spec(
+    return dense.from_spec(
         spec.dense, hidden_size, quant_config=quant_config, prefix=prefix
     )
