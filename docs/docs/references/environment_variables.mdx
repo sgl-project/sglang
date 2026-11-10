@@ -471,6 +471,8 @@ SGLang supports various environment variables that can be used to configure its 
 
 ## MORI Configuration
 
+With `--deepep-mode low_latency` or `MORI_ENABLE_SDMA=1`, MORI EPv2 runs its AsyncLL kernels (copy engine with SDMA, peer stores otherwise). They have no fp4 dispatch or quantized combine: fp4 dispatch falls back to MXFP8 for FP4 weights (bf16 on gfx1250 or older AITER) and combine to bf16. Only `low_latency` lets two-batch overlap hide the transfers behind the sibling batch.
+
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
     <col style={{width: "33.3%"}} />
@@ -502,7 +504,7 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
 <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Maximum number of dispatch tokens per rank for MORI-EP buffer allocation. When unset, a server that prefills uses its per-rank <code>--chunked-prefill-size</code> (after the DP attention split) if that is larger than <code>4096</code>; a disaggregated decode server uses <code>4096</code>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Maximum number of dispatch tokens per rank for MORI-EP buffer allocation. When unset, a server that prefills uses the larger of its per-rank <code>--chunked-prefill-size</code> (after the DP attention split) and the default <code>4096</code>; a disaggregated decode server, or one with chunked prefill disabled, uses the default.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>4096</code></td>
     </tr>
 <tr>
@@ -522,7 +524,7 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
 <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_MORI_EP_V2</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Select MORI EPv2 for <code>--moe-a2a-backend mori</code>. When unset, EPv2 is used for DeepSeek-V4 on AITER with a bfloat16 model dtype and <code>ep_size</code> &lt;= 8 (on gfx1250, any <code>ep_size</code> within one UALink vPOD), and EPv1 otherwise; AsyncLL modes also need a MORI build with EPv2 AsyncLL. <code>true</code> forces EPv2 (warning on any failed check), <code>false</code> forces EPv1. With <code>--deepep-mode low_latency</code> or <code>MORI_ENABLE_SDMA=1</code>, EPv2 runs MORI's AsyncLL kernels (copy engine with SDMA, peer stores otherwise). They have no fp4 dispatch or quantized combine: fp4 dispatch falls back to MXFP8 for FP4 weights (bf16 on gfx1250 or older AITER) and combine to bf16. Only <code>low_latency</code> lets two-batch overlap hide transfers behind the sibling batch.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Select MORI EPv2 for <code>--moe-a2a-backend mori</code>. When unset, EPv2 is used for DeepSeek-V4 on AITER with a bfloat16 model dtype and <code>ep_size</code> &lt;= 8 (on gfx1250, any <code>ep_size</code> within one UALink vPOD), and EPv1 otherwise; the AsyncLL modes (see above) also need a MORI build with EPv2 AsyncLL. <code>true</code> forces EPv2 (warning on any failed check), <code>false</code> forces EPv1.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
     </tr>
 <tr>
