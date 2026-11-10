@@ -36,6 +36,7 @@ from sglang.kernels.ops.diffusion import (
     QWEN_IMAGE_ADDED_QKV,
     SANA_VIDEO2_SOFTMAX_ATTENTION,
     SANA_VIDEO_LINEAR_ATTENTION,
+    WAN_ROCM_FLYDSL_NORM_SCALE_SHIFT,
     QualityGatedFusion,
 )
 from sglang.multimodal_gen import envs
@@ -192,6 +193,8 @@ _QUALITY_FUSION_HANDLERS: tuple[tuple[str, QualityGatedFusion], ...] = (
     # Ideogram's reference keeps the norm statistics in fp32; the
     # BF16-native kernel rounds them, which lowers accumulation precision
     ("high", FUSED_GATE_RMSNORM),
+    # Wan FlyDSL converts FP32 gate/modulation operands and residuals to BF16.
+    ("high", WAN_ROCM_FLYDSL_NORM_SCALE_SHIFT),
     ("lossless", HUNYUAN_QKNORM),
     ("lossless", LINGBOT_VIDEO_RMSNORM),
     ("lossless", LINGBOT_VIDEO_GATED_RESIDUAL),

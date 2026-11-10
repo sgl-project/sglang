@@ -132,6 +132,11 @@ flash attention instead of the FP32 memory-efficient kernel the default path
 uses. Accumulation stays FP32 inside the kernel, but the output is no longer
 bit-identical to the default path.
 
+With two GPUs, add `--num-gpus 2` to split the video tokens across them
+(sequence parallelism). The result is not bit-identical to the single-GPU
+result. The sequence-parallel degree must divide the 10 softmax attention
+heads; `--ring-degree` above 1 and `--enable-cfg-parallel` are not supported.
+
 For offline weights, keep the model directory name, such as
 `/path/to/SANA-Video_2.0_5B_720p`, and pass it as `--model-path`. That directory
 must contain `config.yaml` and `checkpoints/SANA_Video_2.0_5B_720p.pth`. Set

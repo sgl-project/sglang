@@ -46,7 +46,6 @@ from sglang.srt.hf_transformers import (
     get_context_length,
     get_generation_config,
     get_hf_text_config,
-    get_sparse_attention_config,
 )
 from sglang.srt.hf_transformers.config import POINTER_ADAPTER_BASES
 from sglang.srt.runtime_context import get_platform
@@ -734,6 +733,15 @@ class ModelConfig:
                 **kwargs,
             )
         )
+        if (
+            get_platform().is_npu
+            and self.hf_config.model_type == "longcat_flash"
+            and not hasattr(self.hf_config, "indexer_rope_interleave")
+        ):
+            # Resolve LongCat's indexer layout after applying model overrides.
+            self.hf_config.indexer_rope_interleave = getattr(
+                self.hf_config, "rope_interleave", True
+            )
         self.pointer_head = None
         base = POINTER_ADAPTER_BASES.get((self.model_path, revision))
         if base is not None:
@@ -1009,8 +1017,11 @@ class ModelConfig:
         # Verify quantization
         self._verify_quantization()
 
-        # Verify dual-chunk attention config
-        self._verify_dual_chunk_attention_config()
+        if getattr(self.hf_config, "dual_chunk_attention_config", None) is not None:
+            logger.warning(
+                "dual_chunk_attention_config is ignored: Dual Chunk Attention is "
+                "not supported, so this model runs with standard RoPE."
+            )
 
         # Cache attributes
         self.hf_eos_token_id = self._get_hf_eos_token_id()
@@ -2347,23 +2358,6 @@ class ModelConfig:
                         "non-quantized models.",
                         self.quantization,
                     )
-
-    def _verify_dual_chunk_attention_config(self) -> None:
-        if hasattr(self.hf_config, "dual_chunk_attention_config"):
-            # Try loading the sparse attention config
-            sparse_attn_config = get_sparse_attention_config(self.model_path)
-            if not sparse_attn_config:
-                return
-            self.hf_config.dual_chunk_attention_config["sparse_attention_config"] = (
-                sparse_attn_config
-            )
-            if (
-                "sparse_attention_enabled"
-                not in self.hf_config.dual_chunk_attention_config
-            ):
-                self.hf_config.dual_chunk_attention_config[
-                    "sparse_attention_enabled"
-                ] = True
 
     def _get_hf_eos_token_id(self) -> Optional[Set[int]]:
         eos_ids = getattr(self.hf_config, "eos_token_id", None)
