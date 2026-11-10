@@ -91,7 +91,7 @@ class TestDeferredCommit(CustomTestCase):
         deferred_draft_kv = _deferred_draft_kv(injector)
         lens = _stage(deferred_draft_kv, 3)
         reqs = [_staged_req() for _ in range(3)]
-        deferred_draft_kv.note_static_verify(reqs)
+        deferred_draft_kv.note_staged(reqs)
         deferred_draft_kv.before_draft_forward(graph_bs=None, reqs=reqs)
         (store,) = injector.stores
         n = MAX_BS * STRIDE
@@ -124,7 +124,7 @@ class TestDeferredCommit(CustomTestCase):
                 deferred_draft_kv._forked_bs = set(forked)
                 _stage(deferred_draft_kv, 3)
                 reqs = [_staged_req() for _ in range(staged)]
-                deferred_draft_kv.note_static_verify(reqs)
+                deferred_draft_kv.note_staged(reqs)
                 deferred_draft_kv.before_draft_forward(graph_bs=graph_bs, reqs=reqs)
                 self.assertEqual(len(injector.stores), int(flushes))
                 deferred_draft_kv.after_draft_forward(graph_ran=graph_bs is not None)
@@ -140,7 +140,7 @@ class TestDeferredCommit(CustomTestCase):
                     deferred_draft_kv = _deferred_draft_kv(injector)
                     deferred_draft_kv._forked_bs = {MAX_BS}
                     _stage(deferred_draft_kv, 3)
-                    deferred_draft_kv.note_static_verify([a, b, c])
+                    deferred_draft_kv.note_staged([a, b, c])
                     draft_reqs = [c, a]
                     if case == "readmitted":
                         b.retraction_count += 1

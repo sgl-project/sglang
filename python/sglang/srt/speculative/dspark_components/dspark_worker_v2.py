@@ -1248,7 +1248,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
         deferred_draft_kv = self._deferred_draft_kv()
         if graph_accept and deferred_draft_kv is not None:
-            deferred_draft_kv.note_static_verify(batch.reqs)
+            deferred_draft_kv.note_staged(batch.reqs)
         if watermark_rows is not None:
             self.target_worker.model_runner.watermark_state.commit_speculative_chain(
                 req_pool_indices=batch.req_pool_indices,

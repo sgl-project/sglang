@@ -155,8 +155,8 @@ class DeferredDraftKVStore:
         if state_slot is not None:
             self.state_slot[:n].copy_(state_slot[:n])
 
-    def note_static_verify(self, reqs) -> None:
-        """Host, after a static verify graph ran ``reqs``."""
+    def note_staged(self, reqs) -> None:
+        """Host, after a static verify graph staged the rows of ``reqs``."""
         self._staged_reqs = tuple((req, req.retraction_count) for req in reqs)
 
     def _disarm_stale_rows(self, reqs) -> None:
