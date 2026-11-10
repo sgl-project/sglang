@@ -929,6 +929,8 @@ class Envs:
     # Staging buffer for heterogeneous TP KV transfer
     SGLANG_DISAGG_STAGING_BUFFER = EnvBool(False)
     SGLANG_DISAGG_STAGING_POOL_SIZE_MB = EnvInt(4096)
+    SGLANG_ENABLE_NIXL_KV_PACKING = EnvBool(False)
+    SGLANG_NIXL_KV_PACK_BUFFER_SIZE_MB = EnvInt(64)
     # Queue incoming KV scatters between forwards; disabled by default.
     SGLANG_PLB_SCATTER_DEFER = EnvBool(False)
     # Decode stream priority relative to background KV scatters.
