@@ -55,6 +55,10 @@ class Observability(msgspec.Struct):
         Optional[List[str]],
         "Target(s) for request logging: 'stdout' and/or directory path(s) for file output. Can specify multiple targets, e.g., '--log-requests-target stdout /my/path'. ",
     ] = None
+    log_schedule_decisions: A[
+        bool,
+        "Log the outcome of every prefill pass that evaluates the waiting queue: picked vs left in queue, running and preempted counts, KV free/evictable tokens, and the picked rids (first 16). Logged on attention TP/CP rank 0 only. Passes that return early (e.g. running batch full, no free request slots) are not logged, and a pass that picks nothing is logged only when its counters differ from the previous empty pass. Verbose, so off by default.",
+    ] = False
     uvicorn_access_log_exclude_prefixes: A[
         List[str],
         Arg(
