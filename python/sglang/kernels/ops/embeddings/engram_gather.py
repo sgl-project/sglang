@@ -120,10 +120,10 @@ def _engram_gather_kernel(
 
 
 def _gather_rows_per_program() -> int:
-    """Rows per program of the local gather: 8 on SM103 and SM107, where one row
+    """Rows per program of the local gather: 16 on SM103 and SM107, where one row
     per program is bound by its chain of dependent loads; 1 on GPUs not measured."""
     cuda = current_arch().cuda
-    return 8 if cuda is not None and cuda.capability in ((10, 3), (10, 7)) else 1
+    return 16 if cuda is not None and cuda.capability in ((10, 3), (10, 7)) else 1
 
 
 def engram_gather(
