@@ -491,10 +491,22 @@ class ServerArgs:
         """Preserve resolution bookkeeping as well as Struct fields when pickling.
 
         Restore fields before bookkeeping so the write seal is re-armed last.
+        A ModelConfig that model_config_of built from the checkpoint stays
+        behind: the receiving process builds it again from the same key on
+        first use. It holds the whole HF config, a quantized checkpoint's
+        quantization config included, and multiprocessing's spawn writes a
+        child's pickled arguments into a pipe the child reads only after
+        importing __main__, so a record larger than the pipe buffer makes each
+        Process.start() wait out one child's imports. A memo with no key (one a
+        fixture supplied) cannot be rebuilt and travels as it is.
         """
+        bookkeeping = dict(self.__dict__)
+        if bookkeeping.get("_model_config_built_from") is not None:
+            bookkeeping.pop("_model_config", None)
+            bookkeeping.pop("_model_config_built_from")
         return (
             _rebuild_server_args,
-            (type(self), msgspec.structs.asdict(self), dict(self.__dict__)),
+            (type(self), msgspec.structs.asdict(self), bookkeeping),
         )
 
     def check_server_args(self):
