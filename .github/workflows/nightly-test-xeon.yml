@@ -1,0 +1,97 @@
+name: Nightly Test (Xeon Models)
+
+on:
+  schedule:
+    - cron: '0 3 * * *' # Daily at 03:00 UTC.
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch, tag, or SHA to test (default: main)'
+        required: false
+        type: string
+        default: main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-test-xeon-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  nightly-xeon-models:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: xeon-gnr
+    timeout-minutes: 180
+    env:
+      IMAGE: sglang-xeon-nightly:${{ github.run_id }}-${{ github.run_attempt }}
+      CONTAINER: sglang_xeon_nightly_${{ github.run_id }}_${{ github.run_attempt }}
+    steps:
+      - name: Restore workspace ownership
+        run: sudo chown -R "$(id -u):$(id -g)" "$GITHUB_WORKSPACE"
+
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || 'main' }}
+
+      - name: Build CPU image for the checked-out commit
+        run: |
+          docker build . -f docker/xeon.Dockerfile --no-cache \
+            --build-arg SGLANG_REPO="https://github.com/${{ github.repository }}.git" \
+            --build-arg VER_SGLANG="$(git rev-parse HEAD)" \
+            -t "$IMAGE"
+
+      - name: Start full-machine Xeon container
+        run: |
+          touch nightly-xeon-summary.md nightly-xeon-metrics.jsonl
+          docker run -dt --name "$CONTAINER" --shm-size=64g \
+            -v "$GITHUB_WORKSPACE:/sglang-checkout" \
+            -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \
+            -v "$HOME/.cache/sgl_eval:/root/.cache/sgl_eval" \
+            -e HF_TOKEN="$(cat "$HOME/huggingface_token.txt")" \
+            -e SGLANG_IS_IN_CI=true \
+            -e GITHUB_STEP_SUMMARY=/sglang-checkout/nightly-xeon-summary.md \
+            -e SGLANG_TEST_METRICS_FILE=/sglang-checkout/nightly-xeon-metrics.jsonl \
+            "$IMAGE"
+
+      - name: Check AMX CPU backend
+        run: |
+          docker exec "$CONTAINER" python3 -c \
+            'import torch, sgl_kernel; assert torch.cpu._is_amx_tile_supported(); assert hasattr(torch.ops.sgl_kernel, "convert_weight_packed")'
+
+      - name: Run nightly model accuracy and performance tests
+        timeout-minutes: 120
+        shell: bash
+        run: |
+          set -o pipefail
+          docker exec -w /sglang-checkout/test "$CONTAINER" \
+            python3 run_suite.py --hw cpu --suite nightly-xeon-e2e \
+            --nightly --continue-on-error --timeout-from-est-time \
+            2>&1 | tee nightly-xeon.log
+
+      - name: Publish summary and restore artifact ownership
+        if: always()
+        run: |
+          if [ -f nightly-xeon-summary.md ]; then
+            cat nightly-xeon-summary.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+          docker exec -u root "$CONTAINER" \
+            chown -R "$(id -u):$(id -g)" /sglang-checkout || true
+
+      - name: Upload test output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-xeon-models-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: warn
+          path: |
+            nightly-xeon.log
+            nightly-xeon-summary.md
+            nightly-xeon-metrics.jsonl
+
+      - name: Clean up container and image
+        if: always()
+        run: |
+          docker rm -f "$CONTAINER" || true
+          docker image rm "$IMAGE" || true
