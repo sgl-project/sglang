@@ -1005,7 +1005,11 @@ fn gds_counts_only_the_gap_to_the_nearest_shallower_state() {
     let mut tc = gds_core();
     let lone = vec![100, 101];
     tc.insert(&insert_params_mamba(&vec![1, 2, 3], &[10, 11, 12], Some(1)));
-    tc.insert(&insert_params_mamba(&vec![1, 2, 3, 4], &[10, 11, 12, 13], Some(2)));
+    tc.insert(&insert_params_mamba(
+        &vec![1, 2, 3, 4],
+        &[10, 11, 12, 13],
+        Some(2),
+    ));
     tc.insert(&insert_params_mamba(&lone, &[20, 21], Some(3)));
 
     walk_gds(&mut tc, /* states = */ 1);
