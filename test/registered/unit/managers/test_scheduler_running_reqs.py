@@ -28,6 +28,7 @@ from sglang.srt.managers.scheduler_components.invariant_checker import (
 from sglang.srt.managers.scheduler_components.pause_state import PauseState
 from sglang.srt.managers.scheduler_components.state_check import CheckPhase
 from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.scheduler_test_utils import empty_request_lists
@@ -393,7 +394,9 @@ class TestRunningReqsHooks(CustomTestCase):
         s.request_retirer = None
         s.page_size = 1
         s.tree_cache = SimpleNamespace(buffer_pipeline=None)
-        s.token_to_kv_pool_allocator = SimpleNamespace(state_slots=None)
+        s.token_to_kv_pool_allocator = SimpleNamespace(
+            state_slots=None, pools_share_memory=False
+        )
         s.new_token_ratio_tracker = SimpleNamespace(current=0.0)
         s.max_prefill_tokens = 1 << 20
         s.is_mixed_chunk = False
@@ -431,6 +434,33 @@ class TestRunningReqsHooks(CustomTestCase):
             with self.assertRaisesRegex(RuntimeError, r"launched with \[\]"):
                 never_launched = _batch([_req("c")], ForwardMode.DECODE)
                 s.process_batch_result(never_launched, MagicMock())
+
+
+class TestPriorityPreemptionUnderUnifiedMemory(CustomTestCase):
+    """Priority preemption is off under unified memory, while priority
+    scheduling itself stays on."""
+
+    def _preemption(self, **fields):
+        override = get_context().override_server_args(
+            enable_priority_scheduling=True, **fields
+        )
+        override.install()
+        self.addCleanup(override.restore)
+        s = Scheduler.__new__(Scheduler)
+        s.schedule_policy = "fcfs"
+        s.tree_cache = MagicMock()
+        s.enable_hierarchical_cache = False
+        s.enable_priority_scheduling = True
+        s.schedule_low_priority_values_first = False
+        s.metrics_reporter = SimpleNamespace(enable_metrics=False)
+        Scheduler.init_schedule_policy(s)
+        return s.enable_priority_preemption
+
+    def test_off_with_unified_memory(self):
+        self.assertFalse(self._preemption(enable_unified_memory=True))
+
+    def test_on_without_it(self):
+        self.assertTrue(self._preemption(enable_unified_memory=False))
 
 
 if __name__ == "__main__":

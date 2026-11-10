@@ -1842,12 +1842,34 @@ class KVCacheConfigurator:
                     assert not enable_page_major, (
                         "page-major KV layout is not supported with fp4 KV cache"
                     )
+                follows_target_swa = self._draft_follows_target_swa()
                 token_to_kv_pool = self._build_mha_kv_pool(
-                    max_total_num_tokens=sizes.max_total_num_tokens,
+                    max_total_num_tokens=(
+                        self.memory_pool_config.swa_max_total_num_tokens
+                        if follows_target_swa
+                        else sizes.max_total_num_tokens
+                    ),
                     mha_pool_class=mha_pool_class,
                     quant_method=quant_method,
                 )
+                if follows_target_swa:
+                    token_to_kv_pool.follows_target_swa_ids = True
+                    logger.info(
+                        "DFLASH draft KV pool follows the target's SWA ids: "
+                        "%d rows (target full pool %d rows)",
+                        token_to_kv_pool.size,
+                        sizes.max_total_num_tokens,
+                    )
         return token_to_kv_pool
+
+    def _draft_follows_target_swa(self) -> bool:
+        """Whether this draft pool takes the target's sliding-window ids, as the
+        target decided when it priced the pools."""
+        return (
+            self.is_draft_worker
+            and self.memory_pool_config is not None
+            and self.memory_pool_config.dflash_draft_follows_swa
+        )
 
     def _build_mtp_kv_shard_pool(
         self, *, sizes: _PoolSizes, is_dsa_model: bool, is_compressed_kv_model: bool
@@ -2084,11 +2106,8 @@ class KVCacheConfigurator:
         if not self.is_draft_worker:
             # Fresh rows include beam slots and PD preallocation. Reused rows
             # retain their current history; retraction has its own replay reset.
-            # FIXME: the ring and request-window rows are reset on the schedule
-            # stream when a row is reused, while the forward of the row's
-            # previous request may still read or write them (the write-after-read
-            # barrier orders only shared reads). Order the reset after that
-            # forward.
+            # TODO(ch-wan): these C4 ring and request-window resets race the row's
+            # previous forward; run them in the next forward, as `reset_new_rows` does.
             def reset_request_rows(rows):
                 if token_to_kv_pool._unified_kv:
                     token_to_kv_pool.clear_c4_req_states(rows)
@@ -3333,10 +3352,6 @@ class KVCacheConfigurator:
                 ),
                 frozen=frozen,
             )
-        # PP stages select batches independently, so the synchronized share is
-        # also a live admission cap, even on the stage already at the minimum.
-        full_cap = full if get_parallel().pp_size > 1 else None
-        sized = msgspec.structs.replace(sized, full_cap_tokens=full_cap)
         self._unified_sized = sized
         return MemoryPoolConfig(
             max_total_num_tokens=sized.full_tokens,
