@@ -157,3 +157,6 @@ bucket = ""
 # device_name = "/dev/ng0n1"  # NVMe namespace character device
 # nguid = "00000000000000000000000000000000"
 # num_tasks = "8192"         # max concurrent DOCA tasks
+# convert_key_to_128bit = "false"
+#   false (default): SGLang hashes cache keys to 128-bit hex itself;
+#   true: the backend Blake2b-hashes full keys instead.
