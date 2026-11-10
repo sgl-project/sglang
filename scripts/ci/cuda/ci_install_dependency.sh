@@ -858,6 +858,10 @@ install_extra_deps() {
 }
 
 install_msa() {
+    if [ "$OPTIONAL_DEPS" = "diffusion" ]; then
+        mark_step_done "${FUNCNAME[0]}"
+        return
+    fi
     # MiniMax MSA sparse-attention kernels: MiniMax-M3.1 imports them at startup on
     # Blackwell. Same commit and layout as docker/Dockerfile.cu134; editable because
     # prefill JIT-compiles against its CUTLASS submodule.
