@@ -945,6 +945,12 @@ class HiDreamO1ImageBeforeDenoisingStage(PipelineStage):
     def _enhance_prompts(self, batch: Req, server_args: ServerArgs) -> list[str]:
         prompts = batch.prompt if isinstance(batch.prompt, list) else [batch.prompt]
 
+        # The PE rewriter is trained for text-to-image only; a request that
+        # carries a reference image keeps the raw prompt so the edit
+        # instruction survives.
+        if getattr(batch, "image_path", None):
+            return prompts
+
         # The enhancer samples at temperature 1.0, so running it independently on
         # every TP rank yields different prompts and, in turn, different token
         # lengths. That desyncs the vocab-parallel embedding's all_reduce
