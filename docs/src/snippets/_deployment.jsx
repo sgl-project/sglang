@@ -119,6 +119,9 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
     return <div style={{padding: 12, color: "#b91c1c"}}>Deployment: missing <code>config</code> prop</div>;
   }
 
+  // ==== COMMAND ENGINE ====
+  // docs/scripts/export_commands.mjs runs this block in Node; keep it free of JSX and React.
+
   // ==== 1. Hardware catalog (shared across cookbooks) ====
   // VRAM is per-GPU on-chip memory, not per-module.
   const AMD_RDMA_DOCKER_FLAGS = [
@@ -145,6 +148,7 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
       { id: "h20-3e", label: "H20-3e", vram: "141GB" },
       { id: "h800",  label: "H800",  vram: "80GB"  },
     ],
+    rubin: [],
     // ROCm multi-node runs the RDMA NICs straight through: /dev/infiniband
     // covers rdma_cm plus the per-NIC uverbsN nodes, IPC_LOCK + an unlimited
     // memlock let the transport pin its registered buffers, and the stack /
@@ -994,6 +998,7 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
     }
     return cmd;
   };
+  // ==== end COMMAND ENGINE ====
 
   // Accuracy labels: [field-key, display-label, unit]. Declared per model via
   // `config.accuracyLabels` — the engine ships NO default eval set. A config

@@ -295,7 +295,7 @@ class TestAllocationIntegration(CustomTestCase):
         queue._resolve_pending_reqs = Mock()
         queue._uses_swa_tail_prealloc = Mock(return_value=False)
         queue.token_to_kv_pool_allocator = SimpleNamespace(
-            prealloc_fits_assumes_reclaim=Mock(return_value=False)
+            pools_share_memory=False, window_pool_names=lambda: ()
         )
         queue._allocatable_token_budgets = Mock(return_value=100000)
         queue._hicache_pending_restore_tokens = Mock(return_value=0)
@@ -352,7 +352,6 @@ class TestAllocationIntegration(CustomTestCase):
         )
         scheduler = SimpleNamespace(
             tree_cache=Mock(supports_mamba=Mock(return_value=False)),
-            clear_pending_chunk_send=Mock(),
             prefill_launched_reqs=KeyedReqList(ListKind.PREFILL_LAUNCHED),
             waiting_queue=IndexedReqList(ListKind.WAITING),
             disagg_prefill_bootstrap_queue=SimpleNamespace(
@@ -432,7 +431,6 @@ class TestAllocationIntegration(CustomTestCase):
         req.time_stats = MagicMock()
         scheduler = SimpleNamespace(
             tree_cache=Mock(supports_mamba=Mock(return_value=False)),
-            clear_pending_chunk_send=Mock(),
             prefill_launched_reqs=Mock(),
             waiting_queue=IndexedReqList(ListKind.WAITING),
             disagg_prefill_bootstrap_queue=SimpleNamespace(queue=[]),
@@ -820,7 +818,11 @@ class TestAllocationIntegration(CustomTestCase):
                     queue.kv_manager = Mock()
                     queue.req_to_metadata_buffer_idx_allocator = Mock()
                     queue._transfer_page_indices = Mock(return_value=[0])
-                    queue.transfer_queue = SimpleNamespace(enable_staging=False)
+                    queue.token_to_kv_pool_allocator = SimpleNamespace(storage=None)
+                    queue.req_to_token_pool = Mock()
+                    queue.transfer_queue = SimpleNamespace(
+                        enable_staging=False, enable_deferred_kv_release=False
+                    )
                     queue._num_published_destinations = 0
                     queue.scheduler = SimpleNamespace(enable_overlap=False)
                     events = Mock()

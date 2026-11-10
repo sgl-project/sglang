@@ -212,7 +212,13 @@ class TokenizerManagerScoreMixin:
         phs_list = None
         if return_pooled_hidden_states:
             raw_phs = single_result.get("pooled_hidden_state")
-            if raw_phs is not None and len(raw_phs) == expected_count:
+            if raw_phs is not None:
+                if len(raw_phs) != expected_count:
+                    raise RuntimeError(
+                        f"Expected {expected_count} pooled hidden state rows for "
+                        f"multi-item scoring with {num_items} items, but got "
+                        f"{len(raw_phs)}. Request ID: {request_id}"
+                    )
                 phs_list = list(raw_phs[1:])
 
         return ScoreResult(
@@ -1015,10 +1021,10 @@ class TokenizerManagerScoreMixin:
                 "stacked_query_item_embed_overrides is mutually exclusive with "
                 "query_embed_overrides / item_embed_overrides."
             )
-        if item_embed_overrides is not None and len(item_embed_overrides) != len(items):
+        if item_embed_overrides is not None and len(item_embed_overrides) != num_items:
             raise ValueError(
                 f"item_embed_overrides length ({len(item_embed_overrides)}) "
-                f"must match items length ({len(items)})."
+                f"must match items length ({num_items})."
             )
         if stacked_query_item_embed_overrides is not None:
             if isinstance(query, str) or isinstance(items, str):
