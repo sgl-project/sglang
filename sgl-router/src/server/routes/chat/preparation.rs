@@ -578,6 +578,34 @@ impl PreparedRequest {
         Some(uuid::Uuid::new_v4().simple().to_string())
     }
 
+    /// Use only IDs that will be sent to the Engine, and stay within the
+    /// reusable input range. Routing-only token estimates are insufficient.
+    pub(super) fn prefetch_prefix_len(&self) -> Option<usize> {
+        if !matches!(self.path, CHAT_PATH | COMPLETIONS_PATH | GENERATE_PATH) {
+            return None;
+        }
+        let tokens = self.tokens.as_ref()?;
+        let reparsed;
+        let body = if let Some(body) = &self.parsed_body {
+            body
+        } else {
+            reparsed = serde_json::from_slice(&self.body).ok()?;
+            &reparsed
+        };
+        if !has_caller_input_ids(body)
+            && self.input_ids_forwarding != Some(InputIdsForwarding::Forwarded)
+        {
+            return None;
+        }
+        let mut end = tokens.ids.len().saturating_sub(1);
+        if body["return_logprob"] == true {
+            if let Some(start) = body["logprob_start_len"].as_u64() {
+                end = end.min(start as usize);
+            }
+        }
+        (end > 0).then_some(end)
+    }
+
     /// The engine body for one dispatch attempt; each attempt brings its own
     /// bootstrap fields and rid.
     pub(super) fn outgoing_body(

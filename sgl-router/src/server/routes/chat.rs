@@ -348,6 +348,10 @@ impl<'a> ModelRouting<'a> {
                     &selected_url,
                     tokens.map(|t| t.ids.as_slice()),
                     request.cache_namespace.cache_salt.as_deref(),
+                    runtime
+                        .request_prefetch_authorized(&headers)
+                        .then(|| request.prefetch_prefix_len())
+                        .flatten(),
                 );
             }
             let mut attempt =

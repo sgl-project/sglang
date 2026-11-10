@@ -63,6 +63,7 @@ enum Message {
         salt: Option<String>,
         worker: String,
         observed_at: Instant,
+        prefetch_end: Option<usize>,
     },
 }
 /// Bounded admission handle. Queue pressure drops optional route observations;
@@ -90,8 +91,15 @@ impl Runtime {
         runtime
     }
     pub fn authorized(&self, headers: &HeaderMap) -> bool {
-        headers
-            .get("authorization")
+        self.bearer_matches(headers.get("authorization"))
+    }
+    pub fn request_prefetch_authorized(&self, headers: &HeaderMap) -> bool {
+        // This header is local to the Router and outside the proxy's forwarding
+        // whitelist. Inference can keep its own Authorization header.
+        self.bearer_matches(headers.get("x-kv-control-authorization"))
+    }
+    fn bearer_matches(&self, header: Option<&HeaderValue>) -> bool {
+        header
             .and_then(|v| v.to_str().ok())
             .is_some_and(|v| v.strip_prefix("Bearer ") == Some(self.config.control_bearer.as_str()))
     }
@@ -154,6 +162,7 @@ impl Runtime {
         worker: &str,
         tokens: Option<&[u32]>,
         salt: Option<&str>,
+        prefetch_end: Option<usize>,
     ) {
         let Ok(permit) = self.tx.try_reserve() else {
             self.dropped_routes.fetch_add(1, Ordering::Relaxed);
@@ -165,6 +174,7 @@ impl Runtime {
             tokens: tokens.filter(|t| t.len() <= 65_536).map(<[u32]>::to_vec),
             salt: salt.map(str::to_string),
             observed_at: Instant::now(),
+            prefetch_end,
         });
     }
 }
@@ -315,6 +325,7 @@ struct Intent {
     frozen: FrozenTarget,
     expires: Option<Instant>,
     released: bool,
+    request_triggered: bool,
 }
 enum WaitFor {
     Workers(Vec<String>),
@@ -544,14 +555,58 @@ impl Actor {
                 salt,
                 worker,
                 observed_at,
+                prefetch_end,
             } => {
                 let task = context.task(&self.config.caller_id);
-                if let Some(tokens) = tokens {
-                    if let Err(reason) = self.record(context, tokens, salt, &worker) {
-                        tracing::debug!(%reason, "KV association unavailable");
+                let preparation = tokens.and_then(|tokens| {
+                    let request = prefetch_end.map(|end| (context.request(), end));
+                    match self.record(context, tokens, salt, &worker) {
+                        Ok(()) => request,
+                        Err(reason) => {
+                            tracing::debug!(%reason, "KV association unavailable");
+                            None
+                        }
+                    }
+                });
+                self.changed_route(&task, &worker, observed_at);
+                if let Some((request, prefetch_end)) = preparation {
+                    if self
+                        .last_route
+                        .get(&task)
+                        .is_some_and(|(_, at)| *at == observed_at)
+                        && observed_at.elapsed()
+                            < Duration::from_millis(self.config.operation_ttl_ms)
+                    {
+                        self.prepare_request(task, request, worker, prefetch_end);
                     }
                 }
-                self.changed_route(&task, &worker, observed_at);
+            }
+        }
+    }
+    fn prepare_request(
+        &mut self,
+        task: SessionIdentity,
+        request: RequestIdentity,
+        worker: String,
+        prefetch_end: usize,
+    ) {
+        let demand = DemandId {
+            task: task.clone(),
+            id: format!(
+                "route-{}",
+                digest(&(&request.request_id, &request.incarnation, &worker))
+            ),
+        };
+        let command = json!({
+            "action":"sglang.prefetch", "worker_url":worker,
+            "source":{"tier":"storage"}, "destination":{"tier":"host"}, "allow_partial":true,
+            "target":{"kind":"request","request_id":request.request_id,"request_incarnation":request.incarnation},
+        });
+        if let Err(reason) = self.submit(command, task, demand.clone(), Some(prefetch_end)) {
+            tracing::debug!(%reason, "request prefetch unavailable");
+        } else if let Some(intent) = self.intents.get(&demand) {
+            for id in intent.jobs.clone() {
+                self.request_poll(&id);
             }
         }
     }
@@ -587,6 +642,13 @@ impl Actor {
         let cancel = job
             .as_ref()
             .is_some_and(|j| self.book.job(&j.id).is_some_and(|b| b.cancel_requested));
+        let request_only = job.as_ref().is_some_and(|j| {
+            self.book.job(&j.id).is_some_and(|b| {
+                b.interests
+                    .iter()
+                    .all(|d| self.intents.get(d).is_some_and(|i| i.request_triggered))
+            })
+        });
         let shared_pin = cancel
             && job.as_ref().is_some_and(|j| {
                 j.action == "sglang.pin" && j.quiescent && self.shares_live_claim(j)
@@ -596,7 +658,7 @@ impl Actor {
         self.polls.push(Box::pin(async move {
             if let Some(mut job) = job {
                 if !shared_pin {
-                    if let Err(reason) = poll.advance(&mut job, cancel).await {
+                    if let Err(reason) = poll.advance(&mut job, cancel, request_only).await {
                         job.last_error = Some(reason);
                         job.ready_end = 0;
                         job.ready_at = None;
@@ -778,6 +840,15 @@ impl Actor {
         let _ = self
             .index
             .untrack_resource(&demand.task, ResourceKind::Intent, &demand.id);
+    }
+    fn forget_intent(&mut self, demand: &DemandId) {
+        if let Some(intent) = self.intents.remove(demand) {
+            for id in intent.jobs {
+                if self.book.forget_job(&id) {
+                    self.jobs.remove(&id);
+                }
+            }
+        }
     }
     fn resolve(&mut self, target: &Value, task: &SessionIdentity) -> Result<FrozenTarget, String> {
         let selector = match target["kind"].as_str().unwrap_or("session") {
@@ -966,12 +1037,7 @@ impl Actor {
                 {
                     return Err("operation/claim not quiescent".into());
                 }
-                self.intents.remove(&demand);
-                for id in ids {
-                    if self.book.forget_job(&id) {
-                        self.jobs.remove(&id);
-                    }
-                }
+                self.forget_intent(&demand);
                 self.index.collect_garbage();
                 Ok(json!({"acknowledged":true}))
             }
@@ -1081,12 +1147,12 @@ impl Actor {
                         command["action"] = json!(action);
                         command["source"] = json!({"tier":source});
                         command["destination"] = json!({"tier":destination});
-                        self.submit(command, task, demand)
+                        self.submit(command, task, demand, None)
                     }
                     _ => Err("unsupported lifecycle signal".into()),
                 }
             }
-            "submit" => self.submit(value, task, demand),
+            "submit" => self.submit(value, task, demand, None),
             _ => Err("unsupported Router control kind".into()),
         }
     }
@@ -1095,6 +1161,7 @@ impl Actor {
         value: Value,
         task: SessionIdentity,
         demand: DemandId,
+        request_prefix_len: Option<usize>,
     ) -> Result<Value, String> {
         let fingerprint = digest(&value);
         if let Some(intent) = self.intents.get(&demand) {
@@ -1170,13 +1237,23 @@ impl Actor {
         let mut ids = BTreeSet::new();
         let mut missing = Vec::new();
         for resolved in frozen.known_scope() {
-            let prefix = match self.index.materialize(resolved.scope()) {
+            let mut prefix = match self.index.materialize(resolved.scope()) {
                 Ok(p) => p,
                 Err(gaps) => {
                     missing.push(format!("{gaps:?}"));
                     continue;
                 }
             };
+            if let Some(limit) = request_prefix_len {
+                let page = prefix.compatibility.page_size;
+                prefix.end_token = prefix.end_token.min(limit as u64 / page * page);
+                if prefix.end_token == 0 {
+                    continue;
+                }
+                if let Some(tokens) = prefix.token_ids.as_mut() {
+                    tokens.truncate(prefix.end_token as usize);
+                }
+            }
             let Some((url, caps)) = available.iter().find(|(_, c)| {
                 c.compatible(&prefix)
                     && if action == "sglang.pin" {
@@ -1278,6 +1355,9 @@ impl Actor {
             planned.clear();
             missing.push("full request not admitted: allow_partial is false".into());
         }
+        if request_prefix_len.is_some() && ids.is_empty() {
+            return Ok(Value::Null);
+        }
         let bytes: usize = self
             .jobs
             .values()
@@ -1334,9 +1414,14 @@ impl Actor {
                 // stay associated with the task until explicit cleanup.
                 expires: (action != "sglang.pin").then_some(deadline),
                 released: false,
+                request_triggered: request_prefix_len.is_some(),
             },
         );
-        Ok(self.intent_view(&demand))
+        Ok(if request_prefix_len.is_some() {
+            Value::Null
+        } else {
+            self.intent_view(&demand)
+        })
     }
     fn intent_view(&self, demand: &DemandId) -> Value {
         let Some(intent) = self.intents.get(demand) else {
@@ -1363,6 +1448,22 @@ impl Actor {
             .collect();
         for d in expired {
             self.release(&d);
+        }
+        let finished: Vec<_> = self
+            .intents
+            .iter()
+            .filter(|(_, intent)| {
+                intent.request_triggered
+                    && intent
+                        .jobs
+                        .iter()
+                        .all(|id| self.jobs.get(id).is_none_or(|j| self.drained(j)))
+            })
+            .map(|(d, _)| d.clone())
+            .collect();
+        for demand in finished {
+            self.release(&demand);
+            self.forget_intent(&demand);
         }
         self.tick_cursor = self.tick_cursor.wrapping_add(1);
         self.resume_pending();
@@ -1428,9 +1529,25 @@ impl WorkerPoll {
             }
         }
     }
-    async fn advance(&mut self, job: &mut Job, cancel: bool) -> Result<(), String> {
+    async fn advance(
+        &mut self,
+        job: &mut Job,
+        cancel: bool,
+        request_only: bool,
+    ) -> Result<(), String> {
         if !job.submitted && !job.attempted && cancel {
             job.quiescent = true;
+            return Ok(());
+        }
+        if request_only && !job.attempted && !job.submitted {
+            if Instant::now() >= job.deadline {
+                job.quiescent = true;
+                return Err("expired before submission".into());
+            }
+            // Capabilities already selected the owner; the Engine validates
+            // its epoch on submit. Skip a redundant probe on this short path.
+            self.submit_action(job).await?;
+            job.last_error = None;
             return Ok(());
         }
         if cancel
@@ -1477,13 +1594,7 @@ impl WorkerPoll {
                 job.quiescent = true;
                 return Err("expired before submission".into());
             }
-            // Stable IDs survive lost HTTP responses; retries submit the same
-            // envelope/context. Never make a new physical attempt implicitly.
-            job.attempted = true;
-            let reply=self.client.command(&job.url,&json!({"kind":"submit","context":job.context,"envelope":{"protocol_version":"0.1","message_id":job.message_id,
-                "actions":[{"action_id":"transfer","action_type":job.action,"action_version":"1.0","payload":job.payload.as_ref()}]}})).await?;
-            job.submitted = true;
-            self.update_result(job, reply)?;
+            self.submit_action(job).await?;
         }
         if cancel && !job.releasing_pin && !job.cancel_sent && !job.quiescent {
             if let Some(reference) = &job.operation_ref {
@@ -1519,7 +1630,7 @@ impl WorkerPoll {
             }
             job.claim_view = claim;
         }
-        if job.action == "sglang.prefetch" && !cancel {
+        if job.action == "sglang.prefetch" && !cancel && !request_only {
             // A terminal result alone cannot establish current location.
             let tier = job.payload["destination"]["tier"]
                 .as_str()
@@ -1542,6 +1653,17 @@ impl WorkerPoll {
             job.ready_at = Some(Instant::now());
         }
         job.last_error = None;
+        Ok(())
+    }
+    async fn submit_action(&self, job: &mut Job) -> Result<(), String> {
+        // Retry the same envelope after a lost response.
+        job.attempted = true;
+        let reply = self.client.command(&job.url, &json!({"kind":"submit","context":job.context,
+            "envelope":{"protocol_version":"0.1","message_id":job.message_id,"actions":[{
+                "action_id":"transfer","action_type":job.action,"action_version":"1.0","payload":job.payload.as_ref()
+            }]}})).await?;
+        self.update_result(job, reply)?;
+        job.submitted = true;
         Ok(())
     }
     fn update_result(&self, job: &mut Job, reply: Value) -> Result<(), String> {

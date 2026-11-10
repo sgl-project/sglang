@@ -16,7 +16,7 @@ destination Engines.
 
 | Action | Initial use |
 | --- | --- |
-| `sglang.pin` | Acquire, renew, or release finite eviction protection for a complete host prefix. |
+| `sglang.pin` | Set or release a TTL and/or eviction priority for a complete host prefix. |
 | `sglang.prefetch` | Prepare a storage prefix in host memory. The Engine reports the actually available range. |
 | `sglang.demote` | Preserve a host prefix in storage and reclaim the eligible host range. The result separates these outcomes. |
 
@@ -65,11 +65,15 @@ intent. Cancel detaches only that intent; shared physical work can continue for
 other interests. Release a PIN before acknowledging its intent and wait for
 quiescence before discarding an operation's receipt.
 
-Routing can use recently confirmed host coverage as an additional cache signal.
-The existing routing policy still decides the inference worker. Discovery,
-Engine epoch, and scoped cache feedback fence that signal; a missing worker or
-an observation gap invalidates it. A control receipt by itself does not prove
-the subsequent inference request reused the prefix.
+For request-triggered prefetch, send `kv_context` on a generation request along
+with `x-kv-control-authorization: Bearer <control_bearer>`. The Router consumes
+this header locally; inference can use a separate `Authorization` credential.
+The existing routing policy picks a worker. The Router then offers the
+page-aligned reusable input prefix to that worker's control queue and forwards
+inference without waiting for preparation. The hint can share a compatible
+in-flight HiCache restore. If tokens or queue capacity are unavailable, the
+request takes its normal recovery path. A control receipt by itself does not
+prove subsequent inference reused the prefix.
 
 See the [Engine control README](../python/sglang/srt/managers/kv_control/README.md)
 for configuration and command envelopes.

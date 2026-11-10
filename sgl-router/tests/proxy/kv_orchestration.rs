@@ -57,6 +57,7 @@ struct EngineState {
     residency_override: Option<Value>,
     delayed_query: Option<Arc<DelayedQuery>>,
     delayed_capabilities: Option<Arc<DelayedQuery>>,
+    delayed_submit: Option<Arc<DelayedQuery>>,
 }
 #[derive(Default)]
 struct DelayedQuery {
@@ -103,10 +104,10 @@ async fn command(
     State(state): State<Arc<Mutex<EngineState>>>,
     Json(body): Json<Value>,
 ) -> (axum::http::StatusCode, Json<Value>) {
-    let delayed = if body["kind"] == "residency" {
-        state.lock().unwrap().delayed_query.take()
-    } else {
-        None
+    let delayed = match body["kind"].as_str() {
+        Some("residency") => state.lock().unwrap().delayed_query.take(),
+        Some("submit") => state.lock().unwrap().delayed_submit.take(),
+        _ => None,
     };
     let response = command_now(state, body);
     if let Some(delayed) = delayed {
@@ -243,8 +244,10 @@ fn command_now(
 }
 async fn inference(
     State(state): State<Arc<Mutex<EngineState>>>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<Value>,
 ) -> Json<Value> {
+    assert!(!headers.contains_key("x-kv-control-authorization"));
     state.lock().unwrap().inference.push(body);
     Json(
         json!({"id":"mock","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":4,"completion_tokens":1,"total_tokens":5}}),
@@ -559,6 +562,90 @@ async fn slow_worker_control_does_not_delay_another_worker_or_inference() {
             query_gate.release.notify_one();
         };
         tokio::join!(query, other);
+    }
+}
+
+#[tokio::test]
+async fn request_prefetch_uses_the_selected_worker_without_waiting_for_control() {
+    for reorg in [false, true] {
+        let a = Engine::start().await;
+        let b = Engine::start().await;
+        let router = router_with(
+            &[&a, &b],
+            reorg,
+            Some(OrchestrationConfig {
+                max_operations: 1,
+                rpc_timeout_ms: 8_000,
+                ..orchestration()
+            }),
+        )
+        .await;
+        let ids = vec![1, 2, 3, 4, 5];
+        let hashes = compute_block_hashes(&ids, 1);
+        router
+            .tree
+            .insert(&KvWorkerId::new(b.url.clone(), 0), None, &hashes);
+        let meta = |session| {
+            json!({"session_id":session,"incarnation":"task-1","branch_id":"main",
+            "revision":1,"branch_revision":1,"request_id":"r","request_incarnation":"one"})
+        };
+        let client = reqwest::Client::new();
+        let endpoint = format!("{}/generate", router.url);
+        assert!(client
+            .post(&endpoint)
+            .json(&json!({"input_ids":[6,7,8,9,10],"kv_context":meta("untrusted")}))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .is_success());
+
+        let hold = Arc::new(DelayedQuery::default());
+        b.state.lock().unwrap().delayed_submit = Some(hold.clone());
+        let response = tokio::time::timeout(
+            Duration::from_secs(2),
+            client
+                .post(&endpoint)
+                .header("x-kv-control-authorization", "Bearer test-control")
+                .json(&json!({"input_ids":ids,"kv_context":meta("authorized"),
+                    "return_logprob":true,"logprob_start_len":3}))
+                .send(),
+        )
+        .await
+        .expect("inference must not wait for prefetch submission")
+        .unwrap();
+        assert!(response.status().is_success());
+        assert_eq!(response.headers()["x-sgl-worker-url"], b.url);
+        tokio::time::timeout(Duration::from_secs(2), hold.started.notified())
+            .await
+            .unwrap();
+        assert!(a.state.lock().unwrap().commands.is_empty());
+        {
+            let state = b.state.lock().unwrap();
+            let submits: Vec<_> = state
+                .commands
+                .iter()
+                .filter(|c| c["kind"] == "submit")
+                .collect();
+            assert_eq!(submits.len(), 1);
+            let action = &submits[0]["envelope"]["actions"][0];
+            assert_eq!(action["action_type"], "sglang.prefetch");
+            assert_eq!(action["payload"]["target"]["token_ids"], json!([1, 2, 3]));
+        }
+        hold.release.notify_one();
+        // The internal intent must retire without an application ACK.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let response = client.post(format!("{}/v1/kv/control", router.url))
+                    .bearer_auth("test-control").json(&json!({"kind":"submit","task":task("authorized"),
+                    "message_id":"external","action":"sglang.prefetch","target":prefix(vec![5,6,7,8]),
+                    "worker_url":b.url,"source":{"tier":"storage"},"destination":{"tier":"host"}}))
+                    .send().await.unwrap();
+                if response.status().is_success() { break; }
+                assert_eq!(response.status(), 429);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("completed request-triggered hint must release its intent slot");
     }
 }
 
