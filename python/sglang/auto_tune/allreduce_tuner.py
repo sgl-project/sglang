@@ -571,7 +571,7 @@ def tune_allreduce(
     qr_cast_bf16_to_fp16: bool = True,
     use_car_v2: bool = False,
     ignore_acr_max_size: bool = False,
-) -> List[AllreduceConfig]:
+) -> Tuple[List[AllreduceConfig], List[Dict[str, Any]]]:
     """Tune allreduce algorithm for the given model and TP size.
 
     Benchmarks each backend for key tensor sizes and returns the
@@ -645,6 +645,7 @@ def tune_allreduce(
         print(f"  Sizes: {sizes}", flush=True)
 
     results = []
+    measurements: List[Dict[str, Any]] = []
     total_start = time.perf_counter()
 
     try:
@@ -663,6 +664,7 @@ def tune_allreduce(
 
             best_backend = None
             best_time = float("inf")
+            row_times: Dict[str, Optional[float]] = {}
 
             for backend_name, (run, _close) in backends.items():
                 if verbose:
@@ -691,10 +693,14 @@ def tune_allreduce(
                         flush=True,
                     )
 
+                row_times[backend_name] = t
                 if t is not None and t < best_time:
                     best_time = t
                     best_backend = backend_name
 
+            measurements.append(
+                {"size_bytes": size_bytes, "times_us": row_times}
+            )
             if best_backend is not None:
                 config = AllreduceConfig(
                     size_bytes=size_bytes,
@@ -724,7 +730,7 @@ def tune_allreduce(
         print(f"\n  Allreduce tuning completed in {total_end - total_start:.2f}s")
         print(f"  Sizes profiled: {len(results)}/{len(sizes)}")
 
-    return results
+    return results, measurements
 
 
 def run_allreduce_tuning(
@@ -756,7 +762,7 @@ def run_allreduce_tuning(
         print(f"  TP: {tp_size}, EP: {ep_size}")
 
     qr_quants = _normalize_qr_quants(qr_quants)
-    results = tune_allreduce(
+    results, measurements = tune_allreduce(
         model_config,
         tp_size,
         group=group,
@@ -786,6 +792,7 @@ def run_allreduce_tuning(
         "use_car_v2": True,
         "ignore_acr_max_size": bool(ignore_acr_max_size),
         "configs": [r.to_dict() for r in results],
+        "measurements": measurements,
     }
 
     if output_dir:
@@ -797,6 +804,43 @@ def run_allreduce_tuning(
             print(f"  Saved to: {path}")
 
     return output
+
+
+def _print_comparison(measurements: List[Dict[str, Any]]) -> None:
+    """One row per message size, one column per kernel that was opened."""
+    if not measurements:
+        return
+    names: List[str] = []
+    for row in measurements:
+        for name in row.get("times_us", {}):
+            if name not in names:
+                names.append(name)
+    if not names:
+        return
+    width = max(12, *(len(name) for name in names))
+    print(
+        "\nAllreduce comparison, microseconds. "
+        "A star marks the fastest kernel at that size. "
+        "skip means the kernel declined the tensor."
+    )
+    header = f"{'size':>10}  " + "  ".join(f"{name:<{width}}" for name in names)
+    print(header)
+    print("-" * len(header))
+    for row in measurements:
+        times = row.get("times_us") or {}
+        ranked = [value for value in times.values() if value is not None]
+        best = min(ranked) if ranked else None
+        cells = []
+        for name in names:
+            value = times.get(name)
+            if value is None:
+                cells.append(f"{'skip':<{width}}")
+                continue
+            text = f"{value:.2f}"
+            if best is not None and value == best:
+                text += "*"
+            cells.append(f"{text:<{width}}")
+        print(f"{row['size_bytes']:>10}  " + "  ".join(cells))
 
 
 def print_allreduce_summary(results: Dict[str, Any]) -> None:
@@ -812,3 +856,4 @@ def print_allreduce_summary(results: Dict[str, Any]) -> None:
     for c in configs:
         print(f"  {c['size_bytes']:>10}B  {c['backend']:20s}  {c['time_us']:8.2f} us")
     print(f"{'=' * 60}")
+    _print_comparison(results.get("measurements") or [])
