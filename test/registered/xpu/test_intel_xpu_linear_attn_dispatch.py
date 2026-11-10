@@ -262,6 +262,68 @@ class TestIntelXpuGDNDispatch(CustomTestCase):
         sycl.assert_called_once()
         triton.assert_not_called()
 
+    def test_target_verify_clamps_padded_seed_indices(self):
+        kernel = XpuGDNKernel()
+        x = torch.zeros(1, 3, 1, 2)
+        starts = torch.tensor([0, 1, 2, 3], dtype=torch.int32)
+        indices = torch.tensor([4, -1, -1, -1], dtype=torch.int32)
+        inter = torch.tensor([0, 1, 2, 3], dtype=torch.int32)
+        with patch.object(gdn_xpu, "gated_delta_rule_verify") as verify:
+            kernel.target_verify(
+                sentinel.A_log,
+                sentinel.dt_bias,
+                x,
+                x,
+                x,
+                sentinel.a,
+                sentinel.b,
+                ssm_states=sentinel.states,
+                cache_indices=indices,
+                query_start_loc=starts,
+                intermediate_states_buffer=sentinel.buf,
+                intermediate_state_indices=inter,
+                cache_steps=1,
+                retrieve_parent_token=None,
+            )
+        seeds = verify.call_args.args[9]
+        self.assertEqual(seeds.tolist(), [4, 0, 0])
+        self.assertEqual(indices.tolist(), [4, -1, -1, -1])
+
+    def test_sycl_prefill_defers_gates_and_fallback_computes_them(self):
+        kernel = XpuGDNKernel()
+        self.assertTrue(kernel.defers_prefill_gates)
+        q = k = v = torch.zeros(1, 100, 1, 2)
+        indices = torch.tensor([0], dtype=torch.int32)
+        starts = torch.tensor([0, 100], dtype=torch.int32)
+        with (
+            patch.object(
+                TritonGDNKernel, "extend", return_value=(v, None, None)
+            ) as triton,
+            patch.object(
+                gdn_xpu, "fused_gdn_gating", return_value=(sentinel.g, sentinel.beta)
+            ) as gating,
+        ):
+            kernel.extend(
+                q,
+                k,
+                v,
+                None,
+                None,
+                ssm_states=sentinel.states,
+                cache_indices=indices,
+                query_start_loc=starts,
+                a=sentinel.a,
+                b=sentinel.b,
+                A_log=sentinel.A_log,
+                dt_bias=sentinel.dt_bias,
+                needs_track_state=True,
+            )
+        gating.assert_called_once_with(
+            sentinel.A_log, sentinel.a, sentinel.b, sentinel.dt_bias
+        )
+        self.assertIs(triton.call_args.args[3], sentinel.g)
+        self.assertIs(triton.call_args.args[4], sentinel.beta)
+
     def test_prefill_conv_uses_device_kernel_and_optional_block_table(self):
         backend = object.__new__(GDNAttnBackend)
         x = torch.zeros(3, 4)

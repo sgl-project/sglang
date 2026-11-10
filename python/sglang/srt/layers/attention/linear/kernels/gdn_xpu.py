@@ -2,6 +2,7 @@ import torch
 from sgl_kernel import gated_delta_rule, gated_delta_rule_verify
 from sgl_kernel.mamba import causal_conv1d_update_verify_xpu, causal_conv1d_update_xpu
 
+from sglang.kernels.ops.attention.linear.fused_gdn_gating import fused_gdn_gating
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
 
 
@@ -54,6 +55,7 @@ class XpuGDNKernel(TritonGDNKernel):
 
     supports_packed_decode = False
     supports_strided_target_verify_qkv = True
+    defers_prefill_gates = True
 
     @staticmethod
     def _tokens(x: torch.Tensor) -> torch.Tensor:
@@ -113,6 +115,8 @@ class XpuGDNKernel(TritonGDNKernel):
             or kwargs.get("track_state") is not None
             or kwargs.get("needs_track_state", False)
         ):
+            if g is None:
+                g, beta = fused_gdn_gating(kwargs["A_log"], a, b, kwargs["dt_bias"])
             return super().extend(
                 q,
                 k,
@@ -163,6 +167,9 @@ class XpuGDNKernel(TritonGDNKernel):
         **kwargs,
     ):
         out = v.new_empty(v.shape)
+        # Padded graph replays carry -1 slots; the seed-state load is unguarded.
+        num_seqs = query_start_loc.numel() - 1
+        seed_indices = cache_indices[:num_seqs].clamp(min=0)
         gated_delta_rule_verify(
             out.reshape(-1, *out.shape[-2:]),
             self._tokens(q),
@@ -173,9 +180,9 @@ class XpuGDNKernel(TritonGDNKernel):
             A_log,
             dt_bias,
             ssm_states,
-            cache_indices[: query_start_loc.numel() - 1],
+            seed_indices,
             intermediate_states_buffer,
-            intermediate_state_indices[: query_start_loc.numel() - 1],
+            intermediate_state_indices[:num_seqs],
             cache_steps,
             retrieve_parent_token=retrieve_parent_token,
         )

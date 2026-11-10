@@ -1505,7 +1505,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     stable_rows=pp_spec_stable_rows_enabled(),
                 )
         else:
-            g, beta = self._prefill_gates(layer, a, b)
+            if self.kernel_dispatcher.extend_kernel.defers_prefill_gates:
+                g = beta = None
+            else:
+                g, beta = self._prefill_gates(layer, a, b)
             h_track_buf = None
             if (
                 forward_metadata.has_mamba_track_mask
