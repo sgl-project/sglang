@@ -5,7 +5,7 @@ import unittest
 import torch
 import torch.nn.functional as F
 
-from sglang.kernels.jit.utils import get_jit_cuda_arch, is_hip_runtime
+from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.gemm import nvfp4_dual_gemm_swiglu
 from sglang.kernels.ops.gemm.cutedsl_nvfp4_dual_gemm import (
     _ceil_div,
@@ -102,7 +102,7 @@ def _reference_nvfp4_dual_gemm(
 class TestCuteDSLNvfp4DualGemm(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        if is_hip_runtime() or get_jit_cuda_arch().major != 10:
+        if not current_arch().is_sm(10):
             raise unittest.SkipTest("NVIDIA SM10x required")
 
     def test_2cta_and_1cta_shapes_fp16(self):

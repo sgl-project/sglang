@@ -4,7 +4,7 @@ import unittest
 
 import torch
 
-from sglang.kernels.jit.utils import get_jit_cuda_arch, is_hip_runtime
+from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.gemm import nvfp4_grouped_gemm
 from sglang.kernels.ops.gemm.cutedsl_nvfp4_group_gemm import (
     _ceil_div,
@@ -81,7 +81,7 @@ def _make_group_inputs(problem_sizes, out_dtype=torch.float16, seed=1234):
 class TestCuteDSLNvfp4GroupGemm(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        if is_hip_runtime() or get_jit_cuda_arch().major != 10:
+        if not current_arch().is_sm(10):
             raise unittest.SkipTest("NVIDIA SM10x required")
 
     def test_1cta_and_2cta_groups_fp16_and_bf16(self):

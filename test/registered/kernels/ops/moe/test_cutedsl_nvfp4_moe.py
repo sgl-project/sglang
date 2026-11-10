@@ -4,7 +4,7 @@ import unittest
 
 import torch
 
-from sglang.kernels.jit.utils import get_jit_cuda_arch, is_hip_runtime
+from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.moe import nvfp4_masked_grouped_moe, nvfp4_routed_grouped_moe
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -72,7 +72,7 @@ def _ref_flashinfer_moe_masked(
 class TestCuteDSLNvfp4MoE(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        if is_hip_runtime() or get_jit_cuda_arch().major != 10:
+        if not current_arch().is_sm(10):
             raise unittest.SkipTest("NVIDIA SM10x required")
 
     def test_nvfp4_masked_grouped_moe_silu_and_dual_gemm(self):
