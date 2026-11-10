@@ -40,6 +40,9 @@ from sglang.srt.utils.common import check_pkg_version_at_least, get_bool_env_var
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "is_host_cpu_riscv",
+    "cpu_has_rvv_support",
+    "use_riscv_rvv_backend",
     "is_hip",
     "FP8_E4M3_MAX",
     "FP8_E4M3_MIN",
@@ -224,10 +227,20 @@ def is_host_cpu_arm64() -> bool:
 
 
 @lru_cache(maxsize=1)
+def is_host_cpu_riscv() -> bool:
+    machine = platform.machine().lower()
+    return (
+        machine in ("riscv64", "riscv32", "riscv")
+        and hasattr(torch, "cpu")
+        and torch.cpu.is_available()
+    )
+
+
+@lru_cache(maxsize=1)
 def is_cpu() -> bool:
-    if os.getenv("SGLANG_USE_CPU_ENGINE", "0") != "1":
+    if os.getenv("SGLANG_USE_CPU_ENGINE", "1" if is_host_cpu_riscv() else "0") != "1":
         return False
-    return is_host_cpu_x86() or is_host_cpu_arm64()
+    return is_host_cpu_x86() or is_host_cpu_arm64() or is_host_cpu_riscv()
 
 
 @lru_cache(maxsize=1)
@@ -1561,3 +1574,22 @@ def init_cublas():
     b = torch.ones((16, 16), dtype=dtype, device=device)
     c = a @ b
     return c
+
+
+@lru_cache(maxsize=1)
+def cpu_has_rvv_support() -> bool:
+    try:
+        if not is_host_cpu_riscv():
+            return False
+        _probe = torch.ops.sgl_kernel.weight_packed_linear  # noqa: F841
+        return True
+    except AttributeError:
+        logger.warning(
+            "cpu_has_rvv_support: sgl_kernel.weight_packed_linear not found on RISC-V host."
+            " RVV backend disabled. Rebuild sgl-kernel with RVV support."
+        )
+        return False
+
+
+def use_riscv_rvv_backend(layer):
+    return getattr(layer, "use_riscv_rvv_backend", False)

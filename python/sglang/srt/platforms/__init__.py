@@ -13,6 +13,7 @@ Usage:
 import logging
 import os
 import pkgutil
+import platform as _host_platform
 from importlib.metadata import entry_points
 
 import torch
@@ -44,7 +45,12 @@ def _is_rocm_available() -> bool:
 
 
 def _is_cpu_available() -> bool:
-    return os.getenv("SGLANG_USE_CPU_ENGINE", "0") == "1"
+    default = (
+        "1"
+        if _host_platform.machine().lower() in ("riscv64", "riscv32", "riscv")
+        else "0"
+    )
+    return os.getenv("SGLANG_USE_CPU_ENGINE", default) == "1"
 
 
 def _is_npu_available() -> bool:

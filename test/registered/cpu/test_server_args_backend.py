@@ -23,8 +23,15 @@ class TestServerArgsCPUBackend(CustomTestCase):
         server_args.sampling_backend = None
         return server_args
 
-    @patch("sglang.srt.arg_groups.platform_hook.is_host_cpu_arm64", return_value=True)
-    def test_arm_cpu_defaults_to_torch_native(self, _mock_is_arm64):
+    @patch(
+        "sglang.srt.arg_groups.platform_hook.cpu_has_rvv_support", return_value=False
+    )
+    @patch(
+        "sglang.srt.arg_groups.platform_hook.cpu_has_amx_support", return_value=False
+    )
+    def test_cpu_without_specialized_backend_defaults_to_torch_native(
+        self, _mock_has_amx, _mock_has_rvv
+    ):
         server_args = self._make_server_args()
 
         handle_cpu_backends(server_args)
@@ -34,8 +41,11 @@ class TestServerArgsCPUBackend(CustomTestCase):
         )
         self.assertEqual(resolution_result(server_args, "sampling_backend"), "pytorch")
 
-    @patch("sglang.srt.arg_groups.platform_hook.is_host_cpu_arm64", return_value=False)
-    def test_x86_cpu_defaults_to_intel_amx(self, _mock_is_arm64):
+    @patch(
+        "sglang.srt.arg_groups.platform_hook.cpu_has_rvv_support", return_value=False
+    )
+    @patch("sglang.srt.arg_groups.platform_hook.cpu_has_amx_support", return_value=True)
+    def test_amx_cpu_defaults_to_intel_amx(self, _mock_has_amx, _mock_has_rvv):
         server_args = self._make_server_args()
 
         handle_cpu_backends(server_args)
@@ -43,6 +53,18 @@ class TestServerArgsCPUBackend(CustomTestCase):
         self.assertEqual(
             resolution_result(server_args, "attention_backend"), "intel_amx"
         )
+        self.assertEqual(resolution_result(server_args, "sampling_backend"), "pytorch")
+
+    @patch("sglang.srt.arg_groups.platform_hook.cpu_has_rvv_support", return_value=True)
+    @patch(
+        "sglang.srt.arg_groups.platform_hook.cpu_has_amx_support", return_value=False
+    )
+    def test_rvv_cpu_defaults_to_rvv(self, _mock_has_amx, _mock_has_rvv):
+        server_args = self._make_server_args()
+
+        handle_cpu_backends(server_args)
+
+        self.assertEqual(resolution_result(server_args, "attention_backend"), "rvv")
         self.assertEqual(resolution_result(server_args, "sampling_backend"), "pytorch")
 
 
