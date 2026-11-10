@@ -146,17 +146,23 @@ class TestMambaGDSEviction(UnifiedRadixCacheFixtures, CustomTestCase):
         self.assertTrue(self._resumes_at_end(parent))
         self.assertTrue(self._resumes_at_end(lone))
 
-    def test_locked_state_is_not_evicted_even_when_cheapest(self):
-        cheapest, expensive = list(range(100)), list(range(1000, 1400))
-        node = self._insert_state(cheapest)
-        self._insert_state(expensive)
-        lock = self.cache.inc_lock_ref(node)
+    def test_re_cached_state_drops_a_gain_from_before_a_shallower_state(self):
+        """A state evicted and cached again after a shallower state appeared
+        above it is cheap to rebuild; its old gain must not outrank a lone
+        state that is costlier."""
+        upper, child = list(range(200)), list(range(1200))
+        lone = list(range(5000, 5300))
+        self._insert_state(upper)
+        self._insert_state(child)
+        self._insert_state(lone)
+        self._evict_states(1)
+        self._insert_state(list(range(150)))
+        self._insert_state(upper)
 
         self._evict_states(1)
 
-        self.assertTrue(self._resumes_at_end(cheapest))
-        self.assertFalse(self._resumes_at_end(expensive))
-        self.cache.dec_lock_ref(node, lock.to_dec_params())
+        self.assertFalse(self._resumes_at_end(upper))
+        self.assertTrue(self._resumes_at_end(lone))
 
 
 class TestMambaGDSEvictionRustCore(TestMambaGDSEviction):

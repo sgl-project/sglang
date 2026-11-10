@@ -16,7 +16,7 @@ A policy only scores. It does not decide how much to free, and it cannot pin KV 
 
 ## Available policies
 
-Select one with `--radix-eviction-policy`. All of them fall back to least-recently-used order within a tie.
+Select one with `--radix-eviction-policy`. All of them fall back to least-recently-used order within a tie, except the recurrent-state order of `gds`, which breaks ties by node.
 
 | Policy | Evicts first | Use when |
 |---|---|---|

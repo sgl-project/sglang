@@ -16,7 +16,6 @@ from sglang.srt.arg_groups.model_override_base import (
 from sglang.srt.arg_groups.overrides import declare_resolution, resolution_result
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.evict_policy import GDSStrategy
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
 
@@ -391,6 +390,8 @@ def handle_cache_compatibility(server_args: Any) -> None:
             )
 
     if cfg.radix_eviction_policy == "gds":
+        from sglang.srt.mem_cache.evict_policy import GDSStrategy
+
         # Building the strategy checks its cost coefficients.
         GDSStrategy(**(cfg.radix_eviction_policy_config or {}))
 

@@ -56,9 +56,9 @@ class Memory(msgspec.Struct):
                 "protected_threshold (int, default 2), e.g. "
                 "'{\"protected_threshold\": 4}'; 'tlru' takes threshold and "
                 "next_prompt_estimate (ints, tokens), e.g. "
-                '\'{"threshold": 4096, "next_prompt_estimate": 512}\'; "gds" takes '
+                "'{\"threshold\": 4096, \"next_prompt_estimate\": 512}'; 'gds' takes "
                 "the prefill cost coefficients d and e (floats, only their ratio "
-                "matters). An "
+                'matters), e.g. \'{"d": 1.862e-5, "e": 3.33e-6}\'. An '
                 "unrecognized key fails at startup, naming the key and the "
                 "policy. See "
                 "https://docs.sglang.io/docs/advanced_features/radix_eviction_policy#policy-parameters "
