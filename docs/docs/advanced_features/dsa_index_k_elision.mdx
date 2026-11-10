@@ -29,12 +29,21 @@ Elision needs no change to the PD transfer protocol. A skip layer's buffer is ze
 
 ## Memory impact
 
-The saving is proportional to the fraction of skip layers. For GLM-5.2 (78 layers, 21 with an indexer, FP8 KV cache) the per-token cost of the device KV pool is `78 × 656 B` of latent KV plus `132 B` per indexer-owning layer:
+The saving is proportional to the fraction of skip layers. For GLM-5.2 (78 layers, 21 with an indexer, FP8 KV cache) elision removes `57 × 132 = 7,524 B` of index-K per token, multiplied by `host_to_device_ratio` under HiSparse. The rest of the per-token cost is the latent KV, whose row width depends on the DSA backend:
 
-| Pool | Elision off | Elision on | Change |
-|---|---|---|---|
-| Plain DSA or HiCache decode | 51,168 + 78 × 132 = 61,464 B | 51,168 + 21 × 132 = 53,940 B | +14% tokens |
-| HiSparse decode, `host_to_device_ratio=10` | 51,168 + 78 × 132 × 10 = 154,128 B | 51,168 + 21 × 132 × 10 = 78,888 B | +95% tokens |
+- `656 B` per layer for the scaled FP8 layout (FlashMLA, FlashInfer sparse MLA). The measured results below use this layout.
+- `576 B` per layer for the raw FP8 layout (TRTLLM, TileLang on both prefill and decode, and the HIP TileLang / Triton / AITER kernels).
+
+| Pool | Latent row | Elision off | Elision on | Saved per token | Pool size |
+|---|---|---|---|---|---|
+| Plain DSA or HiCache decode | 656 B | 51,168 + 78 × 132 = 61,464 B | 51,168 + 21 × 132 = 53,940 B | 7,524 B | 1.14× |
+| Plain DSA or HiCache decode | 576 B | 44,928 + 78 × 132 = 55,224 B | 44,928 + 21 × 132 = 47,700 B | 7,524 B | 1.16× |
+| HiSparse decode, `host_to_device_ratio=10` | 656 B | 51,168 + 78 × 132 × 10 = 154,128 B | 51,168 + 21 × 132 × 10 = 78,888 B | 75,240 B | 1.95× |
+| HiSparse decode, `host_to_device_ratio=10` | 576 B | 44,928 + 78 × 132 × 10 = 147,888 B | 44,928 + 21 × 132 × 10 = 72,648 B | 75,240 B | 2.04× |
+| HiSparse decode, `host_to_device_ratio=20` | 656 B | 51,168 + 78 × 132 × 20 = 257,088 B | 51,168 + 21 × 132 × 20 = 106,608 B | 150,480 B | 2.41× |
+| HiSparse decode, `host_to_device_ratio=20` | 576 B | 44,928 + 78 × 132 × 20 = 250,848 B | 44,928 + 21 × 132 × 20 = 100,368 B | 150,480 B | 2.50× |
+
+The bytes saved per token do not depend on the latent row width. A narrower latent row makes the index-K a larger share of the per-token cost, so the same saving grows the pool by a larger factor.
 
 HiSparse stores index-K at logical (host) capacity on the device, so its saving is multiplied by `host_to_device_ratio`. The host pool holds `max_total_num_tokens × host_to_device_ratio` tokens, so decode concurrency is bounded by that capacity divided by each request's `input_len + output_len`, and it grows by the same factor as the pool.
 
