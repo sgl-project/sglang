@@ -9,14 +9,16 @@ import test_kv_control_cache as cache_fixtures
 import torch
 from test_kv_control_transfers import (
     FULL,
+    backup_prefix,
     current,
     hicache,
+    persist_prefix,
     public_transfer,
     seed,
-    backup_prefix,
-    wait_for,
+    start_inference_backup,
     start_inference_load,
     wait,
+    wait_for,
 )
 
 from sglang.srt.managers.kv_control.contracts import Status
@@ -97,6 +99,13 @@ class TestKVControlHostDemote(cache_fixtures.KVCacheTestCase):
             backup_prefix(cache, dma, sibling, evict=True)
             pool = cache.host_pool_group.anchor_entry.host_pool
             initial = pool.available_size()
+            with patch.object(cache.cache_controller, "write_storage") as write:
+                blocked = public_transfer(
+                    service, "demote", "host", "storage", "ancestor", tokens=(1, 2)
+                )
+                self.assertEqual(blocked.status, Status.DEFERRED)
+                self.assertEqual(blocked.update.code, "structural_dependency")
+                write.assert_not_called()
             result = public_transfer(service, "demote", "host", "storage", "cold")
             done = wait(service, result)
             self.assertEqual(done.status, Status.PARTIAL)
@@ -117,18 +126,19 @@ class TestKVControlHostDemote(cache_fixtures.KVCacheTestCase):
             self.assertIsNone(leaf.component_data[FULL].host_value)
             cache.sanity_check()
 
-    def test_gpu_resident_host_copy_is_saved_but_retained(self):
+    def test_gpu_resident_host_copy_is_not_queued_for_storage(self):
         with hicache(self, storage=True) as owner:
             _, cache, service, dma = owner
             node = seed(cache)
             backup_prefix(cache, dma, node)
             pool = cache.host_pool_group.anchor_entry.host_pool
             initial = pool.available_size()
-            done = wait(
-                service, public_transfer(service, "demote", "host", "storage", "cold")
-            )
-            self.assertEqual(done.status, Status.PARTIAL)
-            self.assertTrue(done.public_result.preserved_scope)
+            with patch.object(cache.cache_controller, "write_storage") as write:
+                done = public_transfer(service, "demote", "host", "storage", "cold")
+                write.assert_not_called()
+            self.assertEqual(done.status, Status.DEFERRED)
+            self.assertTrue(done.update.quiescent)
+            self.assertFalse(done.public_result.preserved_scope)
             self.assertFalse(done.public_result.reclaimed_scope)
             self.assertEqual(
                 {o.code for o in done.public_result.blocked_scope},
@@ -139,7 +149,22 @@ class TestKVControlHostDemote(cache_fixtures.KVCacheTestCase):
             self.assertEqual(node.component_data[FULL].host_lock_ref, 0)
             cache.sanity_check()
 
-    def test_pin_and_computation_refs_survive_own_source_hold_release(self):
+    def test_unpublished_backup_does_not_enqueue_a_storage_write(self):
+        with hicache(self, storage=True, write_policy="write_through") as owner:
+            _, cache, service, dma = owner
+            node = seed(cache)
+            start_inference_backup(cache, node)
+            self.assertTrue(dma.pending)
+            with patch.object(cache.cache_controller, "write_storage") as write:
+                blocked = public_transfer(service, "demote", "host", "storage", "cold")
+                self.assertEqual(blocked.status, Status.DEFERRED)
+                self.assertEqual(blocked.update.code, "inflight_backup")
+                write.assert_not_called()
+            dma.finish()
+            cache.writing_check()
+            cache.sanity_check()
+
+    def test_pin_and_computation_refs_skip_storage_and_allow_retry_after_release(self):
         from test_kv_control_protection import run_pin
 
         for protection in ("pin", "compute"):
@@ -149,7 +174,7 @@ class TestKVControlHostDemote(cache_fixtures.KVCacheTestCase):
             ):
                 _, cache, service, dma = owner
                 node = seed(cache)
-                backup_prefix(cache, dma, node, evict=True)
+                persist_prefix(cache, service, dma, node)
                 pool = cache.host_pool_group.anchor_entry.host_pool
                 initial = pool.available_size()
                 if protection == "pin":
@@ -158,16 +183,17 @@ class TestKVControlHostDemote(cache_fixtures.KVCacheTestCase):
                 else:
                     lock = cache.lock(node.id)
                 try:
-                    done = wait(
-                        service,
-                        public_transfer(service, "demote", "host", "storage", "cold"),
-                    )
-                    self.assertEqual(done.status, Status.PARTIAL)
+                    with patch.object(cache.cache_controller, "write_storage") as write:
+                        done = public_transfer(
+                            service, "demote", "host", "storage", "cold"
+                        )
+                        write.assert_not_called()
+                    self.assertEqual(done.status, Status.DEFERRED)
                     self.assertEqual(
                         {o.code for o in done.public_result.blocked_scope},
                         {"active_reference"},
                     )
-                    self.assertTrue(done.public_result.preserved_scope)
+                    self.assertFalse(done.public_result.preserved_scope)
                     self.assertFalse(done.public_result.reclaimed_scope)
                     self.assertEqual(pool.available_size(), initial)
                     self.assertGreater(

@@ -29,7 +29,6 @@ class _Write:
     compatibility: object
     interests: set[str] = field(default_factory=set)
     host_locks: list = field(default_factory=list)
-    staged: bool = False
     operation_id: int | None = None
     completed: int = 0
     failure: tuple[str, str] | None = None
@@ -106,10 +105,17 @@ class StorageCacheTransfers:
         try:
             rows = self._rows(job)
             if any(node.write_through_pending_id is not None for node, _, _ in rows):
-                return
-            values = [node.component_data[FULL].host_value for node, _, _ in rows]
-            if any(value is None for value in values):
-                raise ControlError("missing", "Host source is not fully published")
+                blocked = "inflight_backup"
+            else:
+                values = [node.component_data[FULL].host_value for node, _, _ in rows]
+                if any(value is None for value in values):
+                    raise ControlError("missing", "Host source is not fully published")
+                # Reclamation proceeds from the end of the path. A blocked
+                # endpoint prevents reclaiming any of its ancestors.
+                blocked = self._host_reclamation_reason(rows[-1][0])
+            if blocked:
+                job.failure_status = Status.DEFERRED
+                raise ControlError(blocked, "No host range can be reclaimed")
             if any(
                 value.numel() != end - start
                 for value, (_, start, end) in zip(values, rows)
@@ -134,14 +140,13 @@ class StorageCacheTransfers:
                 verify_prefix=True,
             )
             self.cache._native_storage_write_results[job.operation_id] = None
-            job.staged = True
         except Exception as error:
             job.failure = (getattr(error, "code", "storage_error"), str(error)[:512])
             job.failure_status = {
                 "missing": Status.MISSING,
                 "unsupported": Status.UNSUPPORTED,
                 "capacity": Status.DEFERRED,
-            }.get(job.failure[0], Status.FAILED)
+            }.get(job.failure[0], job.failure_status)
             self._retire(job)
 
     def begin_poll(self, *, limit=64):
@@ -151,14 +156,6 @@ class StorageCacheTransfers:
         for job in tuple(self.jobs.values())[:limit]:
             self.jobs.pop(job.key)
             self.jobs[job.key] = job
-            if job.operation_id is None:
-                if job.failure or all(
-                    self.interests[i].cancelled for i in job.interests
-                ):
-                    self._retire(job)
-                else:
-                    self._stage(job)
-                continue
             completed = self.cache._native_storage_write_results[job.operation_id]
             if completed is not None:
                 end = len(job.tokens)
@@ -274,15 +271,15 @@ class StorageCacheTransfers:
     def _retire(self, job):
         # Freeze current radix geometry before a host MOVE removes any nodes.
         # Ordinary matching may have split the path while the worker ran.
-        rows = self._rows(job) if job.staged else ()
+        rows = self._rows(job) if job.operation_id is not None else ()
         self.executor._release_host(job.host_locks)
         active = any(not self.interests[i].cancelled for i in job.interests)
-        if job.staged and job.failure is None and active:
+        if rows and job.failure is None and active:
             self._reclaim_host(job, rows)
         try:
             for identity in job.interests:
                 interest = self.interests[identity]
-                outcomes = self._outcomes(interest, rows) if job.staged else ()
+                outcomes = self._outcomes(interest, rows) if rows else ()
                 status = (
                     job.failure_status
                     if job.failure
@@ -319,14 +316,11 @@ class StorageCacheTransfers:
         if interest.result is not None:
             self.interests.pop(interest.work.ref.operation_id)
             return interest.result
-        waiting = interest.job.operation_id is None
         return ExecutionUpdate(
             status=Status.CANCELLING
             if interest.cancelled or interest.job.failure
-            else Status.QUEUED
-            if waiting
             else Status.RUNNING,
-            quiescent=waiting,
+            quiescent=False,
             code="draining" if interest.cancelled else "storage_pending",
         )
 
@@ -348,6 +342,4 @@ class StorageCacheTransfers:
             job.interests.remove(ref.operation_id)
             self.interests.pop(ref.operation_id)
             return ExecutionUpdate(status=Status.CANCELLED, quiescent=True)
-        if job.operation_id is None:
-            self._retire(job)
         return self._take(interest)
