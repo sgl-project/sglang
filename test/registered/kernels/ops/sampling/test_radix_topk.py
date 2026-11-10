@@ -1,3 +1,5 @@
+import sys
+
 import pytest
 import torch
 
@@ -24,3 +26,7 @@ def test_radix_topk_matches_torch(device, dtype, k, strided):
     torch.testing.assert_close(values, ref_values, rtol=0, atol=0)
     torch.testing.assert_close(scores.gather(-1, ids), ref_values, rtol=0, atol=0)
     assert torch.all(ids.sort(-1).values.diff(dim=-1) > 0)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__]))

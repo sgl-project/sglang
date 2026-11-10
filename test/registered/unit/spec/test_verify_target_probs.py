@@ -6,6 +6,7 @@ When several logits tie at a row's top-k boundary, which of them keep the mass
 is chosen deterministically but may differ from ``torch.topk``; the kept count
 and the probability values are the same."""
 
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -13,12 +14,12 @@ import torch
 import torch.nn.functional as F
 
 import sglang.kernels.ops.sampling.topk as topk_ops
+from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.dflash_utils import (
     _adjust_top_p_for_top_k,
     _dflash_top_p_renorm_prob,
     build_speculative_verify_target_probs,
 )
-from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=45, stage="base-b", runner_config="1-gpu-small")
@@ -216,3 +217,7 @@ def test_torch_fallback(device, monkeypatch):
     kwargs = _case(device, logits, top_ks, need_top_p=need_top_p, seed=12)
     got = build_speculative_verify_target_probs(**kwargs)
     torch.testing.assert_close(got, _reference(**kwargs), rtol=0, atol=0)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__]))
