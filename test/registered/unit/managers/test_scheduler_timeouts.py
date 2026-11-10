@@ -36,12 +36,12 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     CacheRequestOutcome,
 )
-from sglang.test.scheduler_test_utils import empty_request_lists
+from sglang.test.scheduler_test_utils import FakeReq, empty_request_lists
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
-class _FakeReq:
+class _FakeReq(FakeReq):
     release_mm_inputs_on_abort = Req.release_mm_inputs_on_abort
     request_finish = Req.request_finish
     finish_outside_step = Req.finish_outside_step
@@ -214,7 +214,6 @@ class TestQueuedAbort(CustomTestCase):
         # Still listed in the last batch, as a requeued or dLLM request is.
         s = _scheduler([req], last_batch_reqs=[req])
         s.disaggregation_mode = DisaggregationMode.NULL
-        s.chunked_req = None
         s.mm_receiver = None
         s.dllm_config = None
         s.grammar_manager = MagicMock()
@@ -285,7 +284,6 @@ class TestRunningTimeout(CustomTestCase):
         s.enable_continuous_input_polling = True
         s.result_queue = deque([(_batch([stale]), None), (s.last_batch, None)])
         s.disaggregation_mode = DisaggregationMode.PREFILL
-        s.chunked_req = None
         s.mm_receiver = None
         s.dllm_config = None
         s.grammar_manager = MagicMock()

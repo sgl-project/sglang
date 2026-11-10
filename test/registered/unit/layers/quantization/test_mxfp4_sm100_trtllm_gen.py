@@ -122,6 +122,7 @@ def _build_method(num_experts, hidden, inter, precision):
     method.use_deep_gemm = False
     method.use_mega_moe = False
     method.num_experts = num_experts
+    method.with_bias = False
     method.hidden_size = hidden
     method.intermediate_size_per_partition = inter
     method.flashinfer_mxfp4_moe_precision = precision

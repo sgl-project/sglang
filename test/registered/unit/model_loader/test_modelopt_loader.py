@@ -436,6 +436,34 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
         self.assertTrue(method.quant_config.is_checkpoint_fp8_serialized)
         self.assertEqual(method.quant_config.activation_scheme, "dynamic")
 
+    def test_mxfp8_layers_convert_to_block_fp8_off_blackwell(self):
+        config = {
+            "quant_algo": "MIXED_PRECISION",
+            "quantized_layers": {
+                "model.layers.0.mlp.down_proj": {"quant_algo": "MXFP8"}
+            },
+            "packed_modules_mapping": {},
+        }
+        mq = "sglang.srt.layers.quantization.modelopt_quant"
+        for blackwell in (False, True):
+            with (
+                self.subTest(blackwell=blackwell),
+                patch(f"{mq}.is_cuda", return_value=True),
+                patch(
+                    f"{mq}.get_platform",
+                    return_value=SimpleNamespace(is_blackwell=blackwell),
+                ),
+            ):
+                quant_config = ModelOptMixedPrecisionConfig.from_config(config)
+                linear = ReplicatedLinear.__new__(ReplicatedLinear)
+                method = quant_config.get_quant_method(
+                    linear, "model.layers.0.mlp.down_proj"
+                )
+                self.assertIsInstance(method, Fp8LinearMethod)
+                self.assertEqual(method.convert_mxfp8_to_block, not blackwell)
+                # The MoE methods keep the unconverted MXFP8 config.
+                self.assertIsNone(quant_config.mxfp8_config.convert_mxfp8_to_block_fp8)
+
     def _block_fp8_moe_method(self, algo, group_size=128):
         quant_config = ModelOptMixedPrecisionConfig.from_config(
             {

@@ -31,6 +31,7 @@ from sglang.srt.managers.scheduler import Scheduler, _dispatch_event_loop_once
 from sglang.srt.managers.scheduler_components.deferred_responses import (
     DeferredResponses,
 )
+from sglang.srt.managers.scheduler_components.pause_state import PauseState
 from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     KeyedReqList,
@@ -132,9 +133,12 @@ def _sending(reqs=()):
 class _Scheduler(SchedulerDisaggregationPrefillMixin):
     """Run real scheduling and result handling with controlled intake and GPU events."""
 
+    chunked_req = Scheduler.chunked_req
     launch_batch_sample_if_needed = Scheduler.launch_batch_sample_if_needed
     _copy_result_to_cpu = Scheduler._copy_result_to_cpu
     pause_generation = Scheduler.pause_generation
+    _retract_batches = Scheduler._retract_batches
+    _publish_paused_state = Scheduler._publish_paused_state
     continue_generation = Scheduler.continue_generation
     increment_scheduler_iterations = Scheduler.increment_scheduler_iterations
     _on_step_processed = Scheduler._on_step_processed
@@ -155,7 +159,6 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self.ready_at = ready_at
         self.ready_batches = deque()
         self.request_receiver = SimpleNamespace(recv_requests=self.recv_requests)
-        self._deferred_input_requests = []
         self._incoming_requests = []
         self.pause_at = pause_at
         self.resume_at = resume_at
@@ -183,8 +186,9 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
             output_streamer=None,
             send_abort=None,
         )
-        self.chunked_req = None
+        self.chunked_reqs = IndexedReqList(ListKind.CHUNKED)
         self.decode_offload_manager = None
+        self.hisparse_coordinator = None
         self.running_batch = ScheduleBatch(reqs=[])
         self.running_reqs = KeyedReqList(ListKind.DECODING)
         self.prefill_launched_reqs = KeyedReqList(ListKind.PREFILL_LAUNCHED)
@@ -192,9 +196,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self.uocr_runtime = None
         self.waiting_queue = IndexedReqList(ListKind.WAITING)
         self.cur_batch_for_debug = None
-        self._engine_paused = False
-        self._pause_started_at = None
-        self._pause_intervals = deque()
+        self.pause_state = PauseState()
         self.gracefully_exit = False
         self.enable_staging = False
         self.enable_hierarchical_cache = False
@@ -203,7 +205,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self.enable_async_d2h_copy = False
         self.enable_overlap_mlx = False
         self.disagg_prefill_bootstrap_queue = SimpleNamespace(
-            pop_bootstrapped=lambda: []
+            move_bootstrapped=lambda dst: []
         )
         self.ngram_embedding_manager = SimpleNamespace(
             prepare_for_forward=lambda batch, chunked_req: batch
@@ -323,15 +325,15 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         if batch is not None:
             self.actions.append((self.iteration, "prepare_batch", batch.forward_iter))
             self.waiting_queue.leave(batch.reqs)
+            self.prefill_launched_reqs.join(
+                req for req in batch.reqs if req is not batch.chunked_req
+            )
         return NextBatchPlan(batch_to_run=batch, running_batch=running_batch)
 
     def run_batch(self, batch):
         assert len(self.result_queue) < 2, "Overwrote a live forward's keep-alive slot"
         self.actions.append((self.iteration, "launch", batch.forward_iter))
         batch.add_inflight_step()
-        self.prefill_launched_reqs.join(
-            req for req in batch.reqs if req is not batch.chunked_req
-        )
         result = self.results[batch.forward_iter]
         if result.delay_sample_func is not None:
 
@@ -460,7 +462,7 @@ def _rank_consensus_worker(rank, rendezvous):
                 assert [a[2] for a in scheduler.actions if a[1] == "result"] == list(
                     names
                 )
-                assert not scheduler._deferred_input_requests
+                assert not scheduler.pause_state.holds_inputs()
                 for name, event in scheduler.copy_events.items():
                     assert event.synchronizations == 1
                     assert event.blocking_synchronizations == int(
@@ -635,7 +637,7 @@ class TestPrefillResultPolling(CustomTestCase):
                     flush_pending_backups=Mock(),
                     storage_prefetch_retries=retries,
                     supports_fast_match_prefix=lambda: True,
-                    swa_reprefill_tail_tokens=lambda req=None: 0,
+                    window_reprefill_tail_tokens=lambda req=None: 0,
                     match_prefix=match_prefix,
                 )
                 scheduler.policy = SchedulePolicy(
@@ -1174,7 +1176,7 @@ class TestPrefillResultPolling(CustomTestCase):
                     def run_batch(self, batch):
                         end = int(batch.forward_iter)
                         req.extend_end = end
-                        self.chunked_req = req if end < 12 else None
+                        self.chunked_reqs.replace([req] if end < 12 else [])
                         batch.chunked_req = self.chunked_req
                         batch.chunked_req = req if end < 12 else None
                         return super().run_batch(batch)
@@ -1250,7 +1252,7 @@ class TestPrefillResultPolling(CustomTestCase):
                     def run_batch(self, batch):
                         if req in batch.reqs:
                             req.extend_end = batch.forward_iter
-                            self.chunked_req = batch.chunked_req = req
+                            self.chunked_reqs.replace([req])
                             batch.chunked_req = req
                         return super().run_batch(batch)
 
@@ -1275,7 +1277,6 @@ class TestPrefillResultPolling(CustomTestCase):
                     resume_at=pause_at + 2,
                     pause_mode="retract",
                 )
-                scheduler.disagg_prefill_pending_chunk_rids = set()
                 scheduler.processed_tokens_counter = 0
                 scheduler.metrics_reporter.enable_metrics = False
                 release_steps = []
@@ -1354,7 +1355,6 @@ class _EarlySendScheduler(SchedulerDisaggregationPrefillMixin):
     """Just enough Scheduler state for run_batch to reach the forward launch."""
 
     _on_step_launch = Scheduler._on_step_launch
-    _join_prefill_launched = Scheduler._join_prefill_launched
 
     def __init__(self):
         self.scheduler_stage_metrics = None
@@ -1367,9 +1367,6 @@ class _EarlySendScheduler(SchedulerDisaggregationPrefillMixin):
         self.profiler_manager = SimpleNamespace(_profile_batch_predicate=Mock())
         self.forward_sleep_time = None
         self.disaggregation_mode = DisaggregationMode.PREFILL
-        self.dllm_config = None
-        self.running_reqs = KeyedReqList(ListKind.DECODING)
-        self.prefill_launched_reqs = KeyedReqList(ListKind.PREFILL_LAUNCHED)
         self.enable_staging = False
         self.enable_overlap = False
         self.token_to_kv_pool_allocator = SimpleNamespace(page_size=64)

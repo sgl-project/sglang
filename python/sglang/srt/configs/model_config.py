@@ -46,7 +46,6 @@ from sglang.srt.hf_transformers import (
     get_context_length,
     get_generation_config,
     get_hf_text_config,
-    get_sparse_attention_config,
 )
 from sglang.srt.hf_transformers.config import POINTER_ADAPTER_BASES
 from sglang.srt.runtime_context import get_platform
@@ -499,14 +498,27 @@ def is_minimax_sparse(config: PretrainedConfig) -> bool:
 def uses_minimax_m3_nvfp4_native_stack(quantization: Optional[str]) -> bool:
     """Whether an NVFP4 checkpoint runs its native MSA-v1 stack.
 
-    The attention backend, the KV pool class and the KV cell-size budget must
-    all agree on this answer; sizing the pool for one layout while allocating
-    the other runs out of memory at startup. The MSA-v1 kernels are built for
-    SM10x only, so SM11x/SM12x Blackwell is excluded.
+    The attention backend keys on this; the KV pool class and its cell-size budget
+    key on `uses_minimax_m3_packed_nvfp4_kv`, which also covers gfx950. The MSA-v1
+    kernels are built for SM10x only, so SM11x/SM12x Blackwell is excluded.
     """
     from sglang.srt.runtime_context import get_platform
 
     return quantization == "minimax_m3_nvfp4" and get_platform().is_sm100
+
+
+def uses_minimax_m3_packed_nvfp4_kv(
+    quantization: Optional[str], *, speculative_algorithm: Optional[str]
+) -> bool:
+    """Whether the KV pool is `MiniMaxM3Nvfp4KVPool`; the pool class and the
+    cell-size budget must agree on it."""
+    if not get_platform().is_hip:
+        return uses_minimax_m3_nvfp4_native_stack(quantization)
+    from sglang.srt.arg_groups.model_overrides import minimax_m3_hip
+
+    return minimax_m3_hip.uses_nvfp4_kv(
+        quantization, speculative_algorithm=speculative_algorithm
+    )
 
 
 # v2 checkpoints reuse the v1 arch name; the DASH training stage selects this arch.
@@ -721,6 +733,15 @@ class ModelConfig:
                 **kwargs,
             )
         )
+        if (
+            get_platform().is_npu
+            and self.hf_config.model_type == "longcat_flash"
+            and not hasattr(self.hf_config, "indexer_rope_interleave")
+        ):
+            # Resolve LongCat's indexer layout after applying model overrides.
+            self.hf_config.indexer_rope_interleave = getattr(
+                self.hf_config, "rope_interleave", True
+            )
         self.pointer_head = None
         base = POINTER_ADAPTER_BASES.get((self.model_path, revision))
         if base is not None:
@@ -996,8 +1017,11 @@ class ModelConfig:
         # Verify quantization
         self._verify_quantization()
 
-        # Verify dual-chunk attention config
-        self._verify_dual_chunk_attention_config()
+        if getattr(self.hf_config, "dual_chunk_attention_config", None) is not None:
+            logger.warning(
+                "dual_chunk_attention_config is ignored: Dual Chunk Attention is "
+                "not supported, so this model runs with standard RoPE."
+            )
 
         # Cache attributes
         self.hf_eos_token_id = self._get_hf_eos_token_id()
@@ -2177,6 +2201,7 @@ class ModelConfig:
             "auto-round-int8",
             "quark_int4fp8_moe",
             "quark_mxfp4",
+            "minimax_m3_nvfp4",
         ]
         optimized_quantization_methods = [
             "fp8",
@@ -2333,23 +2358,6 @@ class ModelConfig:
                         "non-quantized models.",
                         self.quantization,
                     )
-
-    def _verify_dual_chunk_attention_config(self) -> None:
-        if hasattr(self.hf_config, "dual_chunk_attention_config"):
-            # Try loading the sparse attention config
-            sparse_attn_config = get_sparse_attention_config(self.model_path)
-            if not sparse_attn_config:
-                return
-            self.hf_config.dual_chunk_attention_config["sparse_attention_config"] = (
-                sparse_attn_config
-            )
-            if (
-                "sparse_attention_enabled"
-                not in self.hf_config.dual_chunk_attention_config
-            ):
-                self.hf_config.dual_chunk_attention_config[
-                    "sparse_attention_enabled"
-                ] = True
 
     def _get_hf_eos_token_id(self) -> Optional[Set[int]]:
         eos_ids = getattr(self.hf_config, "eos_token_id", None)

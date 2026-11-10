@@ -721,6 +721,54 @@ fn abort_deregisters_and_bypasses_request_ring_capacity() {
     assert_eq!(consumer.drain(8).len(), 2, "both aborts must be delivered");
 }
 
+/// A one-way control message is never retried, so a full request ring must
+/// not drop it: it takes the reserved lane and its sender learns it is queued.
+#[test]
+fn one_way_control_bypasses_request_ring_capacity() {
+    let (producer, consumer) = to_scheduler(1);
+    assert!(producer.try_push(SchedulerRequest {
+        header: bytes::Bytes::from_static(b"filler"),
+        buffers: Vec::new(),
+    }));
+    let (tm_tx, tm_rx) = flume::unbounded();
+    let (sd_tx, sd_rx) = flume::unbounded::<()>();
+    std::mem::forget(sd_tx);
+    let (abort_tx, abort_rx) = flume::unbounded::<AbortSource>();
+    std::mem::forget(abort_tx);
+    let intake = Intake::new(
+        tm_rx,
+        abort_rx,
+        Senders {
+            tok_manager_tx: flume::unbounded().0,
+            abort_tx: flume::unbounded().0,
+            tokenizer_tx: flume::unbounded().0,
+            detokenizer_tx: vec![flume::unbounded().0],
+        },
+        producer,
+        test_limits(),
+        test_mm(flume::unbounded().0, true),
+        sd_rx,
+    );
+    let (queued, queued_rx) = tokio::sync::oneshot::channel();
+    tm_tx
+        .send(TmEvent::OneWay {
+            control: ControlRequest::FreezeGCReq(crate::message::io_struct::FreezeGCReq::new(
+                "freeze".into(),
+                None,
+            )),
+            queued,
+        })
+        .unwrap();
+    drop(tm_tx);
+    intake.run();
+
+    assert!(matches!(queued_rx.blocking_recv(), Ok(Ok(()))));
+    let pushed = consumer.drain(8);
+    assert_eq!(pushed.len(), 2, "the full ring must not drop the message");
+    let header = rmpv::decode::read_value(&mut &pushed[0].header[..]).unwrap();
+    assert_eq!(header[0].as_str(), Some("FreezeGCReq"));
+}
+
 /// The rid keys the detok table and rides on every chunk of every decode step,
 /// so an unbounded client-supplied one is a recurring cost, not a one-off.
 #[test]

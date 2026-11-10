@@ -482,9 +482,9 @@ class TestOptimisticPrefillMambaRetryRelease(CustomTestCase):
             disagg_prefill_bootstrap_queue=SimpleNamespace(queue=[]),
             metrics_reporter=SimpleNamespace(enable_metrics=False),
             processed_tokens_counter=0,
-            clear_pending_chunk_send=lambda req: None,
             prefill_launched_reqs=KeyedReqList(ListKind.PREFILL_LAUNCHED),
         )
+        scheduler.prefill_launched_reqs.join([req])
         with patch(
             "sglang.srt.disaggregation.prefill.get_disagg",
             return_value=SimpleNamespace(optimistic_prefill_attempts=3),
@@ -570,9 +570,9 @@ class TestOptimisticPrefillWriteThroughRetryPublish(CustomTestCase):
             disagg_prefill_bootstrap_queue=SimpleNamespace(queue=[]),
             metrics_reporter=SimpleNamespace(enable_metrics=False),
             processed_tokens_counter=0,
-            clear_pending_chunk_send=lambda req: None,
             prefill_launched_reqs=KeyedReqList(ListKind.PREFILL_LAUNCHED),
         )
+        scheduler.prefill_launched_reqs.join([req])
         with (
             patch(
                 "sglang.srt.disaggregation.prefill.get_disagg",

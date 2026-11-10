@@ -25,8 +25,10 @@ from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.invariant_checker import (
     SchedulerInvariantChecker,
 )
+from sglang.srt.managers.scheduler_components.pause_state import PauseState
 from sglang.srt.managers.scheduler_components.state_check import CheckPhase
 from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.scheduler_test_utils import empty_request_lists
@@ -168,7 +170,7 @@ class TestRequestListsCheck(CustomTestCase):
         self._start_running([decoding])
         self.s.running_batch.reqs += [retracted, chunk]
         self.s.waiting_queue.join([retracted])
-        self.s.chunked_req = chunk
+        self.s.chunked_reqs.join([chunk])
 
         with self.assertRaisesRegex(
             RuntimeError, r"running batch but not in running: \['w'\]"
@@ -211,6 +213,7 @@ class TestRequestListsCheck(CustomTestCase):
         new, decoding = _req("n"), _req("d")
         mixed = _batch([new, decoding], ForwardMode.MIXED)
         self.s.running_reqs.join([decoding])
+        self.s.prefill_launched_reqs.join([new])
         _launch(self.s, mixed)
         self.s.invariant_checker.get_pp_mbs = lambda: [mixed, None]
         self.s.invariant_checker.get_running_batches = lambda: (
@@ -227,23 +230,26 @@ class TestRunningReqsHooks(CustomTestCase):
         super().setUp()
         enter_scope(self, published_topology())
 
-    def test_launch_holds_prefills_until_the_merge(self):
+    def test_prefills_wait_in_prefill_launched_until_the_merge(self):
         s = _scheduler()
         a, chunk, new, decoding = (_req(rid) for rid in ("a", "c", "n", "d"))
         s.running_batch = ScheduleBatch(reqs=[decoding])
         s.running_reqs.join([decoding])
-        s.chunked_req = chunk
+        s.chunked_reqs.join([chunk])
         # A parked chunk: scheduling has no KV of it to stash.
         chunk.extend_end = chunk.prefix_len
+        # As admission leaves them.
+        s.prefill_launched_reqs.join([a, new])
 
+        # A launch moves no request between lists.
         _launch(s, _batch([a, chunk], ForwardMode.EXTEND, chunked_req=chunk))
         mixed = _batch([new, decoding], ForwardMode.MIXED)
         _launch(s, mixed)
         _launch(s, _batch([decoding], ForwardMode.DECODE))
 
-        self.assertEqual(list(s.prefill_launched_reqs), [a, new])
         self.assertEqual(list(s.running_reqs), [decoding])
 
+        # The merge moves the mixed step's prefill; its decode row stays put.
         _schedule_without_admission(s)
         with envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.override(True):
             Scheduler.get_next_batch_to_run(
@@ -280,7 +286,7 @@ class TestRunningReqsHooks(CustomTestCase):
         s._confidence_budget_prepare = None
         # Event loop
         s.gracefully_exit = False
-        s._engine_paused = False
+        s.pause_state = PauseState()
         s.increment_scheduler_iterations = Mock()
         s.ingest_requests = Mock(side_effect=[None, None, None, StopIteration])
         s.is_generation = True
@@ -328,7 +334,7 @@ class TestRunningReqsHooks(CustomTestCase):
 
         def process_batch_result(batch, result):
             _finish(done)
-            s._on_step_processed(batch)
+            s._on_step_processed(batch, result)
 
         s.run_batch = run_batch
         s.process_batch_result = process_batch_result
@@ -392,7 +398,9 @@ class TestRunningReqsHooks(CustomTestCase):
         s.request_retirer = None
         s.page_size = 1
         s.tree_cache = SimpleNamespace(buffer_pipeline=None)
-        s.token_to_kv_pool_allocator = SimpleNamespace(state_slots=None)
+        s.token_to_kv_pool_allocator = SimpleNamespace(
+            state_slots=None, pools_share_memory=False
+        )
         s.new_token_ratio_tracker = SimpleNamespace(current=0.0)
         s.max_prefill_tokens = 1 << 20
         s.is_mixed_chunk = False
@@ -404,12 +412,15 @@ class TestRunningReqsHooks(CustomTestCase):
         s.enable_unified_cache_external_linker = False
         s.enable_lmcache = False
         s.truncation_align_size = None
-        s._add_request_to_queue = Mock()
+        s.uocr_runtime = None
+        s._set_or_validate_priority = Mock(return_value=True)
+        s._abort_on_queued_limit = Mock(return_value=False)
+        s._prefetch_kvcache = Mock()
 
         new_batch, _ = s._get_new_batch_prefill_raw(None, running_batch)
 
         self.assertIsNone(new_batch)
-        s._add_request_to_queue.assert_called_once_with(victim)
+        self.assertEqual(list(s.waiting_queue), [waiting, victim])
         self.assertEqual(list(s.running_reqs), [other])
 
     def test_launch_counts_in_flight_steps_and_processing_drops_them(self):
@@ -430,6 +441,33 @@ class TestRunningReqsHooks(CustomTestCase):
             with self.assertRaisesRegex(RuntimeError, r"launched with \[\]"):
                 never_launched = _batch([_req("c")], ForwardMode.DECODE)
                 s.process_batch_result(never_launched, MagicMock())
+
+
+class TestPriorityPreemptionUnderUnifiedMemory(CustomTestCase):
+    """Priority preemption is off under unified memory, while priority
+    scheduling itself stays on."""
+
+    def _preemption(self, **fields):
+        override = get_context().override_server_args(
+            enable_priority_scheduling=True, **fields
+        )
+        override.install()
+        self.addCleanup(override.restore)
+        s = Scheduler.__new__(Scheduler)
+        s.schedule_policy = "fcfs"
+        s.tree_cache = MagicMock()
+        s.enable_hierarchical_cache = False
+        s.enable_priority_scheduling = True
+        s.schedule_low_priority_values_first = False
+        s.metrics_reporter = SimpleNamespace(enable_metrics=False)
+        Scheduler.init_schedule_policy(s)
+        return s.enable_priority_preemption
+
+    def test_off_with_unified_memory(self):
+        self.assertFalse(self._preemption(enable_unified_memory=True))
+
+    def test_on_without_it(self):
+        self.assertTrue(self._preemption(enable_unified_memory=False))
 
 
 if __name__ == "__main__":
