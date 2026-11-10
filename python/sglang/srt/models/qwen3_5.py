@@ -280,7 +280,7 @@ if _is_cpu:
     )
 
 if _is_npu:
-    from sgl_kernel_npu.activation.fused_sigmoid_mul import (
+    from sgl_kernel_npu.operators.activation import (
         fused_sigmoid_mul as npu_fused_sigmoid_mul,
     )
 
