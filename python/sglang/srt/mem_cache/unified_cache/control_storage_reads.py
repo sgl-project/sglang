@@ -406,6 +406,10 @@ class StorageCacheReads:
         return self._take(interest)
 
     def _start(self, job):
+        # The owner polls storage before applying individual deadlines. A
+        # newly available slot must not start a read for expired hints only.
+        if not self._has_live_interest(job):
+            return
         try:
             pool = self.cache.cache_controller.mem_pool_host
             if len(job.tokens) > pool.size:

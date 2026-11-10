@@ -1536,6 +1536,31 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                 assert_retired(cache, service)
                 cache.sanity_check()
 
+    def test_expired_queued_prefetch_does_not_start_when_storage_becomes_available(
+        self,
+    ):
+        with hicache(self, namespace_keys=True) as owner:
+            _, cache, service, _ = owner
+            self._cold_scopes(owner, [cache_fixtures.target()])
+            reads = service.control.executor.storage_reads
+            with patch.object(
+                cache.cache_controller, "prefetch_rate_limited", return_value=True
+            ):
+                result = public_transfer(
+                    service, "prefetch", "storage", "host", "expired-before-start"
+                )
+                self.assertEqual(result.update.code, "storage_rate_limit")
+                self.assertEqual(reads.stats["jobs_started"], 0)
+
+            # The same scheduler pass sees both the available slot and the
+            # expired deadline. It must not submit a new storage query.
+            self.clock.now += 5.1
+            service.progress()
+            self.assertEqual(reads.stats["jobs_started"], 0)
+            self.assertEqual(current(service, result).status, Status.CANCELLED)
+            assert_retired(cache, service)
+            cache.sanity_check()
+
     def _host_pressure(self, owner, *, leave_free=0):
         """Fill real host rows via native HiCache backup; keep GPU empty."""
         _, cache, service, dma = owner
