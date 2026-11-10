@@ -28,8 +28,8 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.state_capturer.base import TopkCaptureOutput
-from sglang.srt.utils.common import async_d2h as _async_d2h
-from sglang.srt.utils.common import is_cuda
+from sglang.srt.utils.device import async_d2h as _async_d2h
+from sglang.srt.utils.device import is_cuda
 from sglang.srt.utils.weight_versions import compute_weight_version_spans
 
 if TYPE_CHECKING:
@@ -39,6 +39,7 @@ if TYPE_CHECKING:
         HostAuxiliaryOutput,
     )
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.mem_cache.kv.alloc.forward_steps import ForwardLaunch
     from sglang.srt.mem_cache.kv.alloc.iteration_ids import IterationIds
     from sglang.srt.observability.forward_pass_metrics import (
         FpmTiming,
@@ -65,6 +66,11 @@ def allocate_distinct_stream(device_module, avoid_streams):
 
 
 def is_war_barrier_enabled() -> bool:
+    # FIXME: off CUDA (ROCm included) the barrier is off unless
+    # SGLANG_ENABLE_WAR_BARRIER is set. Unified memory frees ids and rewrites
+    # request rows on the schedule stream at once and relies on this barrier to
+    # order those writes after the overlapped forward's shared reads; without
+    # it that forward can read unbound or rebound mappings.
     return is_cuda() or envs.SGLANG_ENABLE_WAR_BARRIER.get()
 
 
@@ -95,7 +101,12 @@ class GenerationBatchResult:
 
     # For overlap scheduling
     copy_done: Optional[Union[torch.cuda.Event, HostCopyDone]] = None
+    # The unified pool's record of this forward; processing the result retires
+    # it, so page moves stop treating its pages as in flight.
+    unified_forward_done: Optional[torch.cuda.Event] = None
     delay_sample_func: Optional[callable] = None
+    # The step's launch record, for the unified pool's processing.
+    forward_launch: Optional[ForwardLaunch] = None
     future_indices: Optional[torch.Tensor] = None
     speculative_num_draft_tokens: Optional[int] = None
     # Padded row width in flattened speculative output. Existing algorithms
@@ -149,9 +160,8 @@ class GenerationBatchResult:
     # Every stage holds the KV for its own layers, so every stage has to compact
     # that path into its committed prefix; only the last stage can compute it.
     accept_index: Optional[torch.Tensor] = None
-    prepared_draft_extend_inputs: Optional[
-        tuple[torch.Tensor, torch.Tensor, torch.Tensor]
-    ] = None
+    # The optional fourth item is the prepared draft-extend layout.
+    prepared_draft_extend_inputs: Optional[tuple] = None
 
     # Refs the worker wants scheduler to keep alive for the same 2-iter window
     # as batch_record_buf. Used for cross-stream tensor lifetime (e.g. a spec
@@ -414,13 +424,18 @@ class EmbeddingBatchResult:
             only when the batch contained ``return_pooled_hidden_states=True``
             requests.  Tensor (uniform shapes) or list of tensors (MIS).
         copy_done: CUDA event recorded after the async CPU copy completes.
+        unified_forward_done: The unified pool's record of an overlapped
+            forward; processing the result retires it.
     """
 
     embeddings: torch.Tensor
     pooled_hidden_states: Optional[torch.Tensor] = None
     copy_done: Optional[Union[torch.cuda.Event, HostCopyDone]] = None
+    unified_forward_done: Optional[torch.cuda.Event] = None
     can_run_cuda_graph: bool = False
     fpm_timing: Optional[FpmTiming] = None
+    # The step's launch record, for the unified pool's processing.
+    forward_launch: Optional[ForwardLaunch] = None
 
     @torch.profiler.record_function("copy_embedding_to_cpu")
     def copy_to_cpu(self):
