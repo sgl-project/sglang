@@ -266,9 +266,11 @@ def _embedding_nemotron3_spec() -> EmbeddingModelSpec:
 def _native_embedding_spec(
     family: str, execution: EmbeddingExecution, pooling: PoolingStrategy
 ) -> EmbeddingModelSpec:
-    # An encoder's K/V depend on later prompt tokens, so neither a reused prefix
-    # nor a split prefill is valid.
-    encoder_only = execution == EmbeddingExecution.ENCODER_ONLY
+    # Only a causal decoder's K/V stay valid as the prompt grows. An encoder's
+    # K/V depend on later prompt tokens, and CLIP's text tower runs on the
+    # uncached tokens alone without reading the KV pool, so neither a reused
+    # prefix nor a split prefill is valid for them.
+    decoder_pooling = execution == EmbeddingExecution.DECODER_POOLING
     return EmbeddingModelSpec(
         family=family,
         task=EmbeddingTask.EMBED,
@@ -289,8 +291,8 @@ def _native_embedding_spec(
         auto_enable_embedding=True,
         bidirectional_attention=execution != EmbeddingExecution.DECODER_POOLING,
         bcg_prefill_policy=BCGPrefillPolicy.DEFAULT,
-        safe_disable_radix_cache=encoder_only,
-        safe_disable_chunked_prefill=encoder_only,
+        safe_disable_radix_cache=not decoder_pooling,
+        safe_disable_chunked_prefill=not decoder_pooling,
     )
 
 
