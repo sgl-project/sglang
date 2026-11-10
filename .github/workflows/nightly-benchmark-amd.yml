@@ -1,15 +1,8 @@
 name: Nightly Benchmark (AMD)
 
-# InferenceX AgentX (agentic-coding) curves on MI35x, measured against sglang
-# main and reported rather than gated: a point fails only when its server or
-# client does. Each point takes a whole node of the perf-bench partition through
-# scripts/ci/slurm/launch_amd_ci_mi35x.sh, so nothing shares the node while it
-# is measured. The test pins the InferenceX commit and takes the point's server
-# flags, env and client from it; the points below are that commit's matrix row,
-# which the test checks.
-#
-# Every point uploads its InferenceX aggregate; the summary job merges them into
-# one artifact for the sglang-ci-bot daily report.
+# InferenceX AgentX curves on MI35x against sglang main, reported rather than
+# gated. Each point holds a whole perf-bench node so nothing shares it while it
+# is measured. The points must be the matrix row of the test's INFERENCEX_COMMIT.
 on:
   schedule:
     # The rocm10 MI35x image lands about 12:00 UTC; 13 points take 7-9 h, so the
@@ -90,9 +83,7 @@ jobs:
             scancel $JOBS
           fi
 
-  # One file per run for the sglang-ci-bot daily report: a JSON list of the
-  # points' records (config key, point, InferenceX and sglang commits, and
-  # InferenceX's aggregate).
+  # One JSON list of the points' records per run, read by the sglang-ci-bot daily report.
   dsv41-flash-agentx-summary:
     needs: dsv41-flash-agentx-mi35x
     if: always() && github.repository == 'sgl-project/sglang'

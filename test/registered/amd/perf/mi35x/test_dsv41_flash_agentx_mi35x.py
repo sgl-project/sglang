@@ -1,34 +1,14 @@
 """MI35x InferenceX AgentX curve for DeepSeek-V4.1-Flash, one point per run.
 
-Runs one point of InferenceX's AgentX (agentic-coding) sweep
-``dsv41flash-fp4-mi355x-sglang-agentic-dspark`` against this checkout's
-sglang, so the nightly tracks the curve InferenceX publishes for MI355X.
+Runs the point AGENTX_POINT (``tp2-c1``, ``tp2-dpa-c64``, ...) of InferenceX's
+``dsv41flash-fp4-mi355x-sglang-agentic-dspark`` sweep against this checkout.
+The point's server flags, env, golden acceptance length and the AgentX client
+all come from InferenceX at INFERENCEX_COMMIT, bound by its own srt-slurm
+planner, so a result is comparable with InferenceX's for the same image. The
+only departures are CI ones: no power telemetry, server and router addresses.
 
-Nothing about the point is restated here. The matrix row, the point's server
-flags and env, the golden acceptance length and the AgentX client all come from
-InferenceX itself, checked out at INFERENCEX_COMMIT:
-
-* the point is bound by InferenceX's own srt-slurm planner
-  (``infx.srt_slurm.single_node.select_recipe``) and acceptance injector
-  (``infx.srt_slurm.synthetic_acceptance.build_overrides``);
-* the server command is rendered the way srt-slurm renders a direct sglang
-  worker, and the DP-attention points get the sglang-router frontend their
-  recipe asks for;
-* the client is ``python3 -m infx.bench agentic``, as InferenceX's
-  ``benchmarks/srt_agentic.sh`` runs it, with InferenceX's workflow settings
-  (``benchmarks/runtime_settings.sh``).
-
-The only departures are the ones a CI job needs: no power telemetry, and the
-server and router addresses. A result is therefore comparable with InferenceX's
-for the same point and image. Bump INFERENCEX_COMMIT deliberately; the points
-in nightly-benchmark-amd.yml must be that commit's matrix row, which the test
-checks.
-
-nightly-benchmark-amd.yml passes the point as AGENTX_POINT (``tp2-c1``,
-``tp2-dpa-c64``, ...). The test reports rather than gates: it fails only when
-the server, the router or the client fails, including InferenceX's own result
-validation. The aggregate JSON and a one-row summary go to $CI_ARTIFACT_DIR,
-which the Spur launcher copies back for the workflow to upload.
+Reports rather than gates: fails only when the server, router or client fails,
+including InferenceX's result validation.
 
 Registry: nightly-perf-8-gpu-mi35x-dsv41-flash-agentx suite
 """
@@ -78,10 +58,7 @@ SUMMARY_HEADER = (
 
 
 def _checkout_inferencex() -> Path:
-    """InferenceX's ``inferencex-e2e`` tree at INFERENCEX_COMMIT, in a temp dir.
-
-    Not cached under /sgl-data: the clone takes seconds and goes with the container.
-    """
+    # A temp dir, not /sgl-data: the clone takes seconds and goes with the container.
     root = Path(tempfile.mkdtemp(prefix="inferencex-"))
     git = ["git", "-C", str(root)]
     subprocess.run([*git, "init", "-q"], check=True)
@@ -283,7 +260,6 @@ def _client_env(
     result_dir: Path,
     result_filename: str,
 ) -> dict:
-    """The AgentX client's env: InferenceX's, plus this job's addresses and paths."""
     return {
         **os.environ,
         **_runtime_settings(e2e),
@@ -342,7 +318,6 @@ def _summary_row(point: str, aggregate: dict) -> str:
 def _write_artifacts(
     artifact_dir: Path, variant: str, aggregate: dict, client_exit_code: int
 ) -> None:
-    """The point's record for the daily report, and its step-summary row."""
     artifact_dir.mkdir(parents=True, exist_ok=True)
     record = {
         "config_key": CONFIG_KEY,
@@ -366,8 +341,6 @@ def _write_artifacts(
 # the second attempt's numbers as a pass.
 @unittest.skipUnless(POINT, "AGENTX_POINT is not set")
 class TestDeepSeekV41FlashAgentXMI35x(unittest.TestCase):
-    """One InferenceX AgentX point for DeepSeek-V4.1-Flash on MI35x."""
-
     def test_agentx_point(self):
         e2e = _checkout_inferencex()
         variant, recipe, environment = _bind_point(e2e=e2e, point=POINT)
