@@ -308,7 +308,7 @@ def _case_expand_prefill_causally(tc):
         padded_num_tokens=num_tokens + 5,
     )
     # Large decode-verify batch: a 16-token BLOCK against a 256-wide request tile.
-    bs_large = 224
+    bs_large = 223
     seq_lens_large = _ri(8, 500, (bs_large,))
     extend_large = torch.full((bs_large,), 4, device=DEVICE)
     tc._parity(
@@ -320,7 +320,7 @@ def _case_expand_prefill_causally(tc):
         seq_lens_cpu=None,
         extend_seq_lens_cpu=None,
         num_tokens=bs_large * 4,
-        padded_num_tokens=bs_large * 4 + 64,
+        padded_num_tokens=bs_large * 4 + 61,
     )
     # Loop branch: uniform extend with CPU lens and no padding.
     bs2, block = 8, 6
