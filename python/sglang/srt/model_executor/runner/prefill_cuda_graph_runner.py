@@ -54,6 +54,7 @@ from sglang.kernels.ops.attention.kv_indices import (
 )
 from sglang.srt.configs.model_config import is_qwen4_exp
 from sglang.srt.distributed.parallel_state import graph_capture
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.cp.bcg import supports_prefill_cp_bcg
@@ -102,6 +103,9 @@ from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
     BreakableCudaGraphBackend,
+)
+from sglang.srt.model_executor.runner_backend.capture_profile import (
+    CaptureProfileOptions,
 )
 from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
     FullCudaGraphBackend,
@@ -172,6 +176,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
 from sglang.srt.utils import (
+    empty_context,
     get_available_gpu_memory,
     get_cuda_graph_max_batch_size,
     is_cuda,
@@ -379,6 +384,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # Classification/reward forwards branch on return_pooled_hidden_states;
         # capture must use the same flag value as replay for those models.
         self.capture_return_pooled_hidden_states = not model_runner.is_generation
+        # Per-shape CUDA-graph capture traces (TraceLens); mirrors decode.
+        self.enable_profile_cuda_graph = get_exec().graph.enable_profile_cuda_graph
 
         # --- prefill graph config -------------------------------------
         prefill_config = get_exec().graph.cuda_graph_config.prefill
@@ -1789,6 +1796,42 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
         return forward_batch, self.model_runner.attn_backend
 
+    def _graph_batch_capture_active(self) -> bool:
+        """Whether per-shape capture traces are active (SGLANG_GRAPH_BATCH_CAPTURE).
+
+        The original single-trace export (SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE)
+        takes precedence: when both are set we fall back to that behavior.
+        """
+        return (
+            envs.SGLANG_GRAPH_BATCH_CAPTURE.get()
+            and not envs.SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE.get()
+        )
+
+    def _profile_runner_name(self) -> str:
+        """Runner name used in capture-trace filenames.
+
+        Draft workers capture prefill graphs with this class at the same token
+        buckets as the target, so the class name alone would collide. Subclasses
+        are already unique.
+        """
+        name = type(self).__name__
+        if type(self) is PrefillCudaGraphRunner and self.model_runner.is_draft_worker:
+            return f"Draft{name}"
+        return name
+
+    def _set_profile_trace_tag(self, size: int, variant_label: Optional[str]) -> None:
+        """Name the trace for one prefill capture shape.
+
+        ``size`` is the prefill token count. ``variant_label`` distinguishes
+        chunked-prefix captures. Absent variants keep the ``tokens_<n>`` stem.
+        """
+        if getattr(self, "_profiler", None) is None:
+            return
+        parts = [f"tokens_{size}"]
+        if variant_label is not None:
+            parts.append(str(variant_label))
+        self._profile_trace_tag = "_".join(parts)
+
     def capture(self) -> None:
         with self.model_context():
             self._capture()
@@ -1797,18 +1840,46 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # Warm up + autotune kernels once before capture (run-once across the
         # decode + prefill runners; see BaseRunner.warmup).
         self.warmup()
+        profile_context = empty_context()
+        # Holds the active torch profiler during capture so the backend can
+        # advance its schedule (profiler.step()) per shape. Only the scheduled
+        # per-shape profiler (SGLANG_GRAPH_BATCH_CAPTURE) needs stepping.
+        # The trace is the capture pass. Breakable attention
+        # (RadixAttention._eager_attention) is an eager graph break: capture
+        # records the call and does not run it, so attention and KV-store
+        # kernels are not in these files. They run between segments at replay.
+        self._profiler = None
+        profile_options = None
+        if self.enable_profile_cuda_graph:
+            per_shape = self._graph_batch_capture_active()
+            if per_shape:
+                self._profile_trace_tag = None
+            profile_options = CaptureProfileOptions(
+                runner_name=self._profile_runner_name(),
+                per_shape=per_shape,
+                get_trace_tag=lambda: getattr(self, "_profile_trace_tag", None),
+            )
+            profile_context = self.backend.capture_profile_context(profile_options)
+            if per_shape:
+                self._profiler = profile_context
         dp_flags = get_flags().dp
         dp_flags.capturing_prefill_graph = True
         try:
             with freeze_gc(get_exec().graph.enable_cudagraph_gc):
-                with graph_capture(
-                    stream=get_or_create_global_graph_capture_stream()
-                ) as graph_capture_context:
+                with (
+                    graph_capture(
+                        stream=get_or_create_global_graph_capture_stream()
+                    ) as graph_capture_context,
+                    profile_context as prof,
+                ):
                     self.stream = graph_capture_context.stream
                     with self.backend.capture_session(self.stream):
                         self._capture_one_stream()
+            if self.enable_profile_cuda_graph:
+                self.backend.finish_capture_profile(profile_options, prof)
         finally:
             dp_flags.capturing_prefill_graph = False
+            self._profiler = None
         if dp_flags.prefill_graph_has_dp_gather:
             logger.info(
                 "Prefill CUDA graph captured a DP gather/scatter; "
@@ -1886,6 +1957,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 else None
             ),
         )
+        self._set_profile_trace_tag(num_tokens, shape_key.variant_label)
         if prefix_num_chunks:
             self._prepare_chunked_prefix_capture(
                 forward_batch, shape_key, prefix_num_chunks

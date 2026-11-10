@@ -134,12 +134,27 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         capture_inputs: Optional[Any] = None,
         post_warmup_hook: Optional[Callable[[], None]] = None,
     ) -> None:
+        # When per-shape capture traces are enabled (--enable-profile-cuda-graph
+        # + SGLANG_GRAPH_BATCH_CAPTURE), the runner created a scheduled torch
+        # profiler (wait=2, active=1) and exposed it as _profiler. Step past the
+        # two warmups and once after capture so only the capture run is recorded
+        # and each shape produces its own trace, matching FullCudaGraphBackend.
+        # With --enable-profile-cuda-graph alone the runner leaves _profiler
+        # None, so no stepping happens here.
+        runner = self._cuda_graph_runner
+        profiler = (
+            getattr(runner, "_profiler", None)
+            if getattr(runner, "enable_profile_cuda_graph", False)
+            else None
+        )
         warmup_out = None
         for _ in range(2):
             self._device_module.synchronize()
             self._tp_group.barrier()
             with self._precarve.measure():
                 warmup_out = forward_fn()
+            if profiler is not None:
+                profiler.step()
             if post_warmup_hook is not None:
                 post_warmup_hook()
 
@@ -185,6 +200,9 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
                 out = forward_fn()
                 out_rows = self._output_rows(out, size)
                 self._copy_output_to_buffer(out, buffer, out_rows)
+
+        if profiler is not None:
+            profiler.step()
 
         stored = self._slice_output(buffer, out_rows)
         self._graphs[shape_key] = graph
