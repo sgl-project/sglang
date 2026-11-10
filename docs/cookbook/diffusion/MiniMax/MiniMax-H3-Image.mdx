@@ -11,8 +11,8 @@ import { config } from "/src/snippets/configs/MiniMaxAI/minimax-h3-image.jsx";
 
 ## 1. Quick start
 
-Use the [integration branch](https://github.com/mickqian/sglang/tree/codex/h3-image-day0)
-with the [diffusion installation guide](/docs/sglang-diffusion/installation),
+Use the [SGLang repository](https://github.com/sgl-project/sglang) with the
+[diffusion installation guide](/docs/sglang-diffusion/installation),
 then install its diffusion dependencies from the repository root:
 
 ```bash
@@ -23,7 +23,7 @@ Use an authenticated Hugging Face environment with access to both
 `MiniMaxAI/MiniMax-H3-Image` and its `MiniMaxAI/MiniMax-H3` text encoder.
 Run the commands from the same checkout and Python environment. The picker
 saves the returned image as `generated.png`. These recipes use a source
-installation; a stock container image has not been verified for this branch.
+installation; a stock container image has not been verified for this model.
 These are Linux CUDA recipes.
 
 <Deployment config={config} />
