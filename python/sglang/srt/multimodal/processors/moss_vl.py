@@ -10,7 +10,7 @@ import torch
 
 from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
 from sglang.srt.models.moss_vl import MossVLForConditionalGeneration
-from sglang.srt.multimodal.media_io import download_remote_media
+from sglang.srt.multimodal.media_io import download_remote_media, resolve_media_url
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
@@ -449,9 +449,10 @@ class MossVLImageProcessor(SGLangBaseProcessor):
             )
             return temp_path, temp_path
 
-        temp_path = self._write_video_bytes_to_tempfile(
-            pybase64.b64decode(value, validate=True)
-        )
+        resolved = resolve_media_url(value)
+        if resolved is None:
+            resolved = pybase64.b64decode(value, validate=True)
+        temp_path = self._write_video_bytes_to_tempfile(resolved)
         return temp_path, temp_path
 
     def _normalize_single_video_input(
