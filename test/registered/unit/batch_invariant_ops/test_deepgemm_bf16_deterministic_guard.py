@@ -110,6 +110,11 @@ class TestDeepGemmBf16DeterministicGuard(CustomTestCase):
         with (
             mock.patch.object(batch_invariant_ops, "ENABLE_JIT_DEEPGEMM", True),
             mock.patch.object(batch_invariant_ops, "deep_gemm", fake_dg, create=True),
+            # CPU CI has no accelerator; register on CPU like test_batch_invariant_context.
+            mock.patch.object(
+                batch_invariant_ops, "get_dispatch_device_backend", lambda: "CPU"
+            ),
+            mock.patch.object(batch_invariant_ops, "_is_npu", False),
         ):
             batch_invariant_ops.disable_batch_invariant_mode()
             toggles.clear()
