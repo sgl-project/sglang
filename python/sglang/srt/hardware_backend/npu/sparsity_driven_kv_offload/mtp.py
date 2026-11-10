@@ -22,7 +22,7 @@ def prepare_mtp_rows(forward_batch, num_tokens, request_rows, context_len):
     includes the draft step. Draft-extend has a fixed Q stride but only its
     num_accept_tokens leading columns contain KV to publish.
     """
-    token_to_slots = forward_batch.req_pool_indices.long()
+    token_to_slots = forward_batch.req_pool_indices
     batch = token_to_slots.numel()
     query_width = getattr(forward_batch.spec_info, "num_tokens_per_req", -1)
     if not (
@@ -39,6 +39,13 @@ def prepare_mtp_rows(forward_batch, num_tokens, request_rows, context_len):
         raise ValueError("Sparse MTP query window exceeds the padded token rows")
     if forward_batch.positions.numel() != num_tokens:
         raise ValueError("Sparse MTP requires one absolute position per query")
+    if token_to_slots.device.type == "npu":
+        from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.row_metadata import (
+            mtp_rows,
+        )
+
+        return mtp_rows(forward_batch, query_width, request_rows, context_len)
+    token_to_slots = token_to_slots.long()
     token_to_slots = token_to_slots[:, None].expand(batch, query_width)
     # TP may append token rows independently of request padding (e.g. 2*3
     # queries padded to 8). Those rows are not another column of each request.

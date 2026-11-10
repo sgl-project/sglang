@@ -1,4 +1,4 @@
-"""CPU metadata for compact sparse-KV prefill gathers."""
+"""Sparse-KV prefill mappings with CPU shape validation."""
 
 from __future__ import annotations
 
@@ -53,12 +53,16 @@ class FusedPrefillPlan:
     current_mapping: object = None
 
 
-def make_fused_prefill_plan(batch, manager, stream):
-    keep, total = prepare_prefill_gather_rows(
-        batch.req_pool_indices_cpu,
-        batch.seq_lens_cpu,
-        manager.size,
-        manager.max_context_len,
+def make_fused_prefill_plan(batch, manager, stream, *, prepared=None):
+    keep, total = (
+        prepare_prefill_gather_rows(
+            batch.req_pool_indices_cpu,
+            batch.seq_lens_cpu,
+            manager.size,
+            manager.max_context_len,
+        )
+        if prepared is None
+        else prepared
     )
     if (
         batch.req_pool_indices.numel() != batch.seq_lens.numel()
@@ -66,6 +70,13 @@ def make_fused_prefill_plan(batch, manager, stream):
     ):
         raise RuntimeError("Prefill CPU and device metadata must have matching sizes")
     device = manager.device
+    if torch.device(device).type == "npu":
+        from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.row_metadata import (
+            prefill_plan,
+        )
+
+        source, destination, valid = prefill_plan(batch, manager, total)
+        return FusedPrefillPlan(stream, total, source, destination, valid)
     req_pool_indices = batch.req_pool_indices.to(device=device, dtype=torch.long)
     lengths = batch.seq_lens.to(device=device, dtype=torch.long)
     if keep.numel() != req_pool_indices.numel():
@@ -125,6 +136,22 @@ def fused_prefill_current_mapping(plan, batch, current_valid, host_token_capacit
         slots = [rows // n] * n
     else:
         return None
+    if plan.source.device.type == "npu":
+        from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.row_metadata import (
+            prefill_current_mapping,
+        )
+
+        return prefill_current_mapping(
+            plan,
+            batch,
+            current_valid,
+            host_token_capacity,
+            slots,
+            requests,
+            lens,
+            prefixes,
+            counts,
+        )
     dest, eligible = [], []
     offset = 0
     for req_id, length, pre, ext_len, width in zip(

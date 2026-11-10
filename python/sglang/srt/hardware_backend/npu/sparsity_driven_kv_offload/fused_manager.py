@@ -596,19 +596,22 @@ class FusedSparseKVCacheManager:
         capacity = getattr(self.budget, "prefill_workspace_tokens", 0)
         if not capacity:
             return None
-        _, total = prepare_prefill_gather_rows(
+        prepared = prepare_prefill_gather_rows(
             forward_batch.req_pool_indices_cpu,
             forward_batch.seq_lens_cpu,
             self.size,
             self.max_context_len,
         )
+        _, total = prepared
         if not total or total > capacity:
             return None
         if self._prefill_workspace_stream is None:
             self._prefill_workspace_stream = actual_stream
         if self._prefill_workspace_stream != actual_stream:
             return None
-        return make_fused_prefill_plan(forward_batch, self, actual_stream)
+        return make_fused_prefill_plan(
+            forward_batch, self, actual_stream, prepared=prepared
+        )
 
     def get_forward_kv(
         self,

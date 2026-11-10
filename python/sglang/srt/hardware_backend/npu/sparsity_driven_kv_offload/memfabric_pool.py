@@ -100,11 +100,7 @@ class MemFabricKVPool:
             raise ValueError(
                 "Sparse KV row indices and validity must be matching vectors"
             )
-        src, dst, lengths = [], [], []
-        safe_src = torch.where(valid, source_rows, 0).to(torch.int64)
-        safe_dst = torch.where(valid, destination_rows, 0).to(torch.int64)
         for source, destination in zip(sources, destinations):
-            row_bytes = source.shape[-1] * source.element_size()
             if (
                 destination.shape[-1] != source.shape[-1]
                 or destination.dtype != source.dtype
@@ -116,18 +112,32 @@ class MemFabricKVPool:
                 raise ValueError(
                     "Sparse KV copies require contiguous component buffers"
                 )
-            # Mask addresses as well as lengths; padded rows may contain -1.
-            src.append(safe_src * row_bytes + source.data_ptr())
-            dst.append(safe_dst * row_bytes + destination.data_ptr())
-            lengths.append(valid.to(torch.int32) * row_bytes)
         if source_rows.numel() == 0:
             return
-        src = torch.cat(src).contiguous()
-        dst = torch.cat(dst).contiguous()
-        lengths = torch.cat(lengths).contiguous()
-        count = torch.full(
-            (1,), src.numel(), dtype=torch.int32, device=source_rows.device
-        )
+        if source_rows.device.type == "npu":
+            from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.row_metadata import (
+                copy_rows_metadata,
+            )
+
+            src, dst, lengths, count = copy_rows_metadata(
+                sources, destinations, source_rows, destination_rows, valid
+            )
+        else:
+            src, dst, lengths = [], [], []
+            safe_src = torch.where(valid, source_rows, 0).to(torch.int64)
+            safe_dst = torch.where(valid, destination_rows, 0).to(torch.int64)
+            for source, destination in zip(sources, destinations):
+                row_bytes = source.shape[-1] * source.element_size()
+                # Mask addresses as well as lengths; padded rows may contain -1.
+                src.append(safe_src * row_bytes + source.data_ptr())
+                dst.append(safe_dst * row_bytes + destination.data_ptr())
+                lengths.append(valid.to(torch.int32) * row_bytes)
+            src = torch.cat(src).contiguous()
+            dst = torch.cat(dst).contiguous()
+            lengths = torch.cat(lengths).contiguous()
+            count = torch.full(
+                (1,), src.numel(), dtype=torch.int32, device=source_rows.device
+            )
         result = self.offload.sparse_copy(src, dst, lengths, count, source_rows.device)
         if result not in (None, 0):
             raise RuntimeError(f"Sparse KV MF sparse_copy failed: {result}")

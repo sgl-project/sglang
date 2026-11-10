@@ -158,7 +158,8 @@ class TestWorkspaceLifecycle(unittest.TestCase):
         original = next(
             node
             for node in tree.body
-            if isinstance(node, ast.ClassDef) and node.name == "SparseKVCacheManager"
+            if isinstance(node, ast.ClassDef)
+            and node.name == "FusedSparseKVCacheManager"
         )
         methods = [
             node
