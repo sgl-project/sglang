@@ -213,6 +213,40 @@ def _build_processor_manually(
     return proc_cls(**init_kwargs)
 
 
+def _build_phi4mm_processor(model_path, trust_remote_code, revision):
+    # Checkpoints re-saved by transformers v5 store a renamed audio_processor in
+    # processor_config.json that the remote-code extractor cannot be built from.
+    from transformers import AutoTokenizer
+    from transformers.dynamic_module_utils import get_class_from_dynamic_module
+
+    pp_file = _resolve_local_or_cached_file(
+        model_path, "preprocessor_config.json", revision
+    )
+    with open(pp_file) as f:
+        raw = json.load(f)
+    auto_map = raw["auto_map"]
+
+    def load_cls(key):
+        return get_class_from_dynamic_module(
+            auto_map[key], model_path, code_revision=revision
+        )
+
+    image_processor = load_cls("AutoImageProcessor")(dynamic_hd=raw["dynamic_hd"])
+    audio_processor = load_cls("AutoFeatureExtractor")(
+        audio_compression_rate=raw["audio_compression_rate"],
+        audio_downsample_rate=raw["audio_downsample_rate"],
+        audio_feat_stride=raw["audio_feat_stride"],
+    )
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_path, trust_remote_code=trust_remote_code, revision=revision
+    )
+    return load_cls("AutoProcessor")(
+        image_processor=image_processor,
+        audio_processor=audio_processor,
+        tokenizer=tokenizer,
+    )
+
+
 def _get_minimax_m31_processor(model_path, config, revision):
     from transformers import MiniMaxM3VLProcessor
 
@@ -384,6 +418,11 @@ def _get_processor(
                     **kwargs,
                 )
 
+    except TypeError as e:
+        if "audio_compression_rate" not in str(e):
+            raise
+        logger.info("Building Phi4MM processor manually for %s", tokenizer_name)
+        processor = _build_phi4mm_processor(tokenizer_name, trust_remote_code, revision)
     except ValueError as e:
         error_message = str(e)
         if "Unrecognized feature extractor" in error_message:
