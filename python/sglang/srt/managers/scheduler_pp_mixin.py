@@ -99,6 +99,8 @@ class PPBatchMetadata:
     # Rank-local: the unified pool's record of this forward, retired when its
     # result is processed.
     unified_forward_done: Optional[torch.cuda.Event] = None
+    # Rank-local: recorded on the forward stream after this forward, any pool.
+    forward_done: Optional[torch.cuda.Event] = None
 
 
 class SchedulerPPMixin:
@@ -106,8 +108,7 @@ class SchedulerPPMixin:
     # ran init_pp_loop_state (plain TP, unit-test doubles) read False;
     # init_pp_loop_state overwrites it per instance.
     _pp_spec_relay: bool = False
-    # Records a skipped output's completion behind the unified pool's forward
-    # (`_pp_make_skip_output_result`); made on first use.
+    # Side stream of `_pp_result_done_event`; made on first use.
     _pp_skip_output_stream = None
 
     @DynamicGradMode()
@@ -603,8 +604,8 @@ class SchedulerPPMixin:
 
     def _pp_retract_microbatches(self: Scheduler) -> None:
         """Retract the requests of every micro-batch, none of them in flight."""
+        self._retract_batches(list(zip(self.running_mbs, self.last_mbs)))
         for mb_id in range(self.pp_loop_size):
-            self._retract_batch(self.running_mbs[mb_id], self.last_mbs[mb_id])
             self.last_mbs[mb_id] = None
         self.last_batch = None
         self.cur_batch_for_debug = None
@@ -1026,21 +1027,29 @@ class SchedulerPPMixin:
                 mb_metadata.unified_forward_done if mb_metadata else None
             ),
         )
-        d2h_event = self.device_module.Event()
-        forward_done = batch_result.unified_forward_done
-        if forward_done is None:
-            d2h_event.record(self.device_module.current_stream())
-        else:
-            # Processing this result retires the microbatch's forward, so the
-            # host must see that forward end first: record the event on a side
-            # stream that waits it, which the caller's synchronize then implies.
-            # The current stream gains no dependency on the forward.
-            stream = self._pp_skip_output_stream
-            if stream is None:
-                stream = self._pp_skip_output_stream = self.device_module.Stream()
-            stream.wait_event(forward_done)
-            d2h_event.record(stream)
+        d2h_event = self._pp_result_done_event(mb_metadata, side_stream=True)
         return None, batch_result, d2h_event
+
+    def _pp_result_done_event(
+        self: Scheduler,
+        mb_metadata: Optional[PPBatchMetadata],
+        *,
+        side_stream: bool = False,
+    ) -> torch.Event:
+        """An event recorded after this rank's forward of the micro-batch, which
+        processing the result retires. ``side_stream`` keeps the current stream
+        from waiting on it."""
+        stream = self.device_module.current_stream()
+        forward_done = mb_metadata.forward_done if mb_metadata else None
+        if forward_done is not None:
+            if side_stream:
+                if self._pp_skip_output_stream is None:
+                    self._pp_skip_output_stream = self.device_module.Stream()
+                stream = self._pp_skip_output_stream
+            stream.wait_event(forward_done)
+        event = self.device_module.Event()
+        event.record(stream)
+        return event
 
     def _pp_prep_batch_result(
         self: Scheduler,
@@ -1592,18 +1601,17 @@ class SchedulerPPMixin:
                 batch_result = self._pp_prep_batch_result(
                     target, mb_metadata[next_mb_id], next_pp_outputs
                 )
-                d2h_event = self.device_module.Event()
+                d2h_event = self._pp_result_done_event(mb_metadata[next_mb_id])
                 if (
                     batch_result.logits_output is not None
                     and batch_result.logits_output.sampling_mask_output is not None
                 ):
+                    # `copy_to_cpu` records it again behind its copies.
                     batch_result.copy_done = d2h_event
                     batch_result.copy_to_cpu(
                         return_logprob=target.return_logprob,
                         return_hidden_states=False,
                     )
-                else:
-                    d2h_event.record(self.device_module.current_stream())
 
         if send_first:
             send_output_work = _do_send()
@@ -1698,8 +1706,7 @@ class SchedulerPPMixin:
                     batch_result = self._pp_prep_batch_result(
                         target_recv, mb_metadata[next_mb_id], next_pp_outputs
                     )
-                    d2h_event = self.device_module.Event()
-                    d2h_event.record(self.device_module.current_stream())
+                    d2h_event = self._pp_result_done_event(mb_metadata[next_mb_id])
 
         # ---- Execute communication ----
         if send_dict is not None and should_recv:
@@ -1753,6 +1760,8 @@ class SchedulerPPMixin:
                     trace_only=True,
                     attrs={"pp_mb_id": mb_id},
                 )
+                event = self.device_module.Event()
+                event.record(self.device_module.current_stream())
                 mb_metadata[mb_id] = PPBatchMetadata(
                     can_run_cuda_graph=result.can_run_cuda_graph,
                     fwd_batch=_pp_snapshot_forward_batch(cur_batch),
@@ -1760,9 +1769,8 @@ class SchedulerPPMixin:
                     fpm_timing=result.fpm_timing,
                     forward_launch=result.forward_launch,
                     unified_forward_done=result.unified_forward_done,
+                    forward_done=event,
                 )
-                event = self.device_module.Event()
-                event.record(self.device_module.current_stream())
                 if self.pp_group.is_last_rank:
                     # (last rank) buffer the outputs for async batch depth
                     last_rank_comm_queue.append(
