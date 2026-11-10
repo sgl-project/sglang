@@ -47,6 +47,7 @@ from enum import Enum, auto
 from functools import lru_cache
 from typing import TYPE_CHECKING, Dict, Iterable, List, Mapping, Optional, Set, Union
 
+import msgspec
 import torch
 
 from sglang.srt.dllm.config import DllmConfig
@@ -75,6 +76,7 @@ if TYPE_CHECKING:
         RequestRetirer,
     )
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+    from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
 
 # Clip the estimation of max_new_tokens for the request whose max_new_tokens is very large.
 # This can prevent the server from being too conservative.
@@ -640,6 +642,16 @@ def windows_retire_behind_checkpoints(tree_cache: Optional[BasePrefixCache]) -> 
     )
 
 
+class _CacheReserve(msgspec.Struct, frozen=True, kw_only=True):
+    """The room `--prefill-cache-reserve` keeps for cached prefixes."""
+
+    kv_tokens: int
+    # The Mamba slot pool of a hybrid model, None otherwise.
+    state_pool: Optional[MambaSlotAllocator]
+    state_slots: int
+    state_slots_per_req: int
+
+
 class PrefillAdder:
     def __init__(
         self,
@@ -740,6 +752,7 @@ class PrefillAdder:
             priority_scheduling_preemption_threshold
         )
         self.max_running_requests = max_running_requests
+        self.cache_reserve = self._init_cache_reserve()
         # Align sharded chunk boundaries to physical pages; 0 disables alignment.
         kv_shard_size = page_interleave_shard_size(self.token_to_kv_pool_allocator)
         self.kv_shard_granule = (
@@ -871,6 +884,48 @@ class PrefillAdder:
         if self.memory_budget.unschedulable:
             return AddReqResult.UNSCHEDULABLE
         return AddReqResult.NO_TOKEN
+
+    def _init_cache_reserve(self) -> Optional[_CacheReserve]:
+        ratio = get_schedule().prefill_cache_reserve
+        if ratio is None:
+            return None
+        state_pool = (
+            self.tree_cache.req_to_token_pool.mamba_allocator
+            if self.is_hybrid_ssm_cache
+            else None
+        )
+        return _CacheReserve(
+            kv_tokens=int(ratio * self.token_to_kv_pool_allocator.size),
+            state_pool=state_pool,
+            state_slots=0 if state_pool is None else int(ratio * state_pool.size),
+            # A running request's working slot plus its tracking slots.
+            state_slots_per_req=(
+                0
+                if state_pool is None
+                else 1 + self.tree_cache.req_to_token_pool.mamba_initial_tracking_slots
+            ),
+        )
+
+    def _holds_for_cache_reserve(self, req: Req, *, total_tokens: int) -> bool:
+        """Whether a mostly-uncached ``req`` would take the room kept for cached
+        prefixes; it waits for running requests to finish instead."""
+        reserve = self.cache_reserve
+        if reserve is None or self.running_batch is None:
+            return False
+        # Nothing running would free memory, so waiting could never end.
+        if self.running_batch.is_empty():
+            return False
+        cached = req.prefix_len + req.host_hit_length
+        if 2 * cached >= len(req.full_untruncated_fill_ids):
+            return False
+        if self.memory_budget.remaining_total - total_tokens < reserve.kv_tokens:
+            return True
+        if reserve.state_pool is None:
+            return False
+        free_states = (
+            reserve.state_pool.available_size() + self.tree_cache.mamba_evictable_size()
+        )
+        return free_states - reserve.state_slots_per_req < reserve.state_slots
 
     def _state_slots_for_req(self, req: Req, *, include_host_hit: bool = False) -> int:
         """Number of state slots a request still needs.
@@ -1672,6 +1727,10 @@ class PrefillAdder:
                 if admission is AddReqResult.NO_TOKEN:
                     self._defer_staged_for_capacity_if_idle(req, pool="prefill_budget")
                 return admission
+
+            # OTHER, not NO_TOKEN: the batch is not full, the next pass asks again.
+            if self._holds_for_cache_reserve(req, total_tokens=total_tokens):
+                return AddReqResult.OTHER
 
             # A rejected candidate must not report prefillable or queue H2D.
             if (self.prefill_delayer_single_pass is not None) and (

@@ -140,6 +140,10 @@ class Schedule(msgspec.Struct):
         float,
         "How conservative the schedule policy is. A larger value means more conservative scheduling. Use a larger value if you see requests being retracted frequently.",
     ] = 1.0
+    prefill_cache_reserve: A[
+        Optional[float],
+        "Fraction of the KV pool, and of the Mamba state pool on hybrid models, kept for cached prefixes while requests run. A request whose cached prefix covers less than half of its prompt waits instead of taking that room, so sessions that come back (multi-turn agents) still find their KV. Traffic without reuse only waits longer. Unset (default) disables it; 0.3 was the measured setting.",
+    ] = None
     page_size: A[
         Optional[int], Arg(help="The number of tokens in a page.", resolvable=True)
     ] = None

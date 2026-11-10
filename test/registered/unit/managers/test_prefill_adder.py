@@ -2869,6 +2869,79 @@ class TestPrefillAdder(CustomTestCase):
             ).memory_budget.swa_never_fits(**req)
         )
 
+    def _cache_reserve_adder(self, *, running: bool, mamba_slots=None):
+        """A 1,000-token pool with 400 free or evictable tokens and a 0.3 reserve;
+        ``mamba_slots`` is (pool size, free, evictable) for a hybrid model."""
+        override = get_context().override_server_args(prefill_cache_reserve=0.3)
+        override.install()
+        self.addCleanup(override.restore)
+        self.mock_token_allocator = self.create_token_allocator(available_size=100)
+        self.mock_token_allocator.size = 1000
+        self.mock_tree_cache = self.create_tree_cache(evictable_size=300)
+        self.mock_tree_cache.supports_mamba.return_value = mamba_slots is not None
+        if mamba_slots is not None:
+            size, free, evictable = mamba_slots
+            self.mock_tree_cache.full_evictable_size.return_value = 300
+            pool = self.mock_tree_cache.req_to_token_pool
+            pool.mamba_allocator.size = size
+            pool.mamba_allocator.available_size.return_value = free
+            pool.mamba_initial_tracking_slots = 4
+            self.mock_tree_cache.mamba_evictable_size.return_value = evictable
+        batch = self.create_running_batch(
+            [self.create_mock_req("run", priority=0, max_new_tokens=0)]
+            if running
+            else []
+        )
+        batch.is_empty.return_value = not running
+        return self.create_adder(batch)
+
+    def _reserve_req(self, *, prefix_len: int):
+        req = self.create_mock_req("new", priority=0, max_new_tokens=10)
+        req.full_untruncated_fill_ids = list(range(200))
+        req.prefix_len = prefix_len
+        return req
+
+    def test_cache_reserve_holds_uncached_request_while_others_run(self):
+        """A request that would leave less than the reserve free or evictable
+        waits (OTHER, so the next pass asks again) and takes nothing."""
+        adder = self._cache_reserve_adder(running=True)
+        req = self._reserve_req(prefix_len=0)
+        self.assertEqual(
+            adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None),
+            AddReqResult.OTHER,
+        )
+        self.assertEqual(adder.can_run_list, [])
+
+    def test_cache_reserve_admits_cached_or_idle(self):
+        """A request whose cached prefix covers half its prompt reuses resident
+        KV, and with nothing running no wait would ever end: both are admitted."""
+        for running, prefix_len in ((True, 100), (False, 0)):
+            with self.subTest(running=running, prefix_len=prefix_len):
+                adder = self._cache_reserve_adder(running=running)
+                req = self._reserve_req(prefix_len=prefix_len)
+                self.assertEqual(
+                    adder.add_one_req(
+                        req, has_chunked_req=False, truncation_align_size=None
+                    ),
+                    AddReqResult.CONTINUE,
+                )
+                self.assertEqual(adder.can_run_list, [req])
+
+    def test_cache_reserve_counts_mamba_state_slots(self):
+        """On a hybrid model the reserve also covers state slots: KV fits, but a
+        running request's 5 slots would leave fewer than 30 of 100 slots."""
+        for free, held in ((10, True), (30, False)):
+            with self.subTest(free=free):
+                adder = self._cache_reserve_adder(
+                    running=True, mamba_slots=(100, free, 15)
+                )
+                # A small prompt so the KV reserve alone admits it.
+                req = self._reserve_req(prefix_len=0)
+                req.full_untruncated_fill_ids = list(range(20))
+                self.assertEqual(
+                    adder._holds_for_cache_reserve(req, total_tokens=40), held
+                )
+
 
 if __name__ == "__main__":
     unittest.main()
