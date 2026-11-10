@@ -34,7 +34,7 @@
     "value_width": 128,
     "gate_input_width": 7168,
     "correctness": "Three changed-input graph replays with nonpositive lengths and NaN gate inputs on invalid rows.",
-    "timing": "Finite matched inputs with all-positive lengths, warm state, 5 warmups and3 samples of30 complete segments. Eager is Python-dispatched, graph is captured replay with the native gate side stream."
+    "timing": "Finite matched inputs with all-positive lengths, warm state, 5 warmups and 3 samples of 30 complete segments. Eager is Python-dispatched, graph is captured replay with the native gate side stream."
   },
   "checks": [
     {
@@ -377,8 +377,18 @@
   },
   "earlier_attempt": {
     "status": "host watchdog failure",
-    "reason": "1094MiB process GPU memory exceeded chosen1024MiB cap. GPU output alone did not count as a completed qualification.",
+    "reason": "1094 MiB process GPU memory exceeded chosen 1024 MiB cap. GPU output alone did not count as a completed qualification.",
     "retained": true
   },
-  "driver_cleanup": "Two unused output-sized allocations were removed after measurement. Remaining AST is identical to the measured driver."
+  "driver_cleanup": "After the original measurement, two unused output-sized allocations were removed. At that cleanup stage, the remaining AST matched the measured version.",
+  "consumer_setup": {
+    "owner": "synthetic SimpleNamespace with rank-local weights",
+    "gate_projection": "torch.nn.functional.linear",
+    "native_methods": "Real production helper implementations called in a synthetic stitched segment",
+    "capture_flags": "Driver-controlled get_is_capture_mode follows torch CUDA capture, breakable graph is false",
+    "legacy_normal_production_methods_field": "The legacy flag records helper implementation identity",
+    "native_model_forward": false
+  },
+  "source_revision_provenance": "The manual driver records the CLI revision as supplied. Archived FI source and generated-CUDA build records establish the measured revision.",
+  "maintained_driver": "Later CLI/import/device/metadata refinements preserve the measured numerical, masking, rounding, graph and timing AST. Original samples remain unchanged."
 }

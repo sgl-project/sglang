@@ -11,6 +11,13 @@ LeslieWylie/sgl-nvidia-mega, not a claim that those updates were merged upstream
 Original file-level notices are retained.
 SOURCE_MAPPING.json identifies every original source and its in-tree locations.
 
+The original MlaValue implementation was written by Lee Nau in
+sgl-project/sgl-nvidia-mega#17. yyihuang implemented the optional FlashInfer Cake
+MLA value-gate primitive and initial SGLang adapter, incorporated separately from
+the migrated payload.
+https://github.com/flashinfer-ai/flashinfer/pull/8867
+https://github.com/YaoleWu/sglang/pull/2
+
 The split-K GEMM now in kernels/ops/gemm/kimi_k3_specialized/splitk.py is adapted from
 FlashInfer's flashinfer/gemm/kernels/dense_bf16_gemm_sm100_splitk.py at
 v0.7.0.post1 (Apache License 2.0). FlashInfer's NOTICE reads:

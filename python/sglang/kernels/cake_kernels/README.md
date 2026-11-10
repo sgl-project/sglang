@@ -21,11 +21,21 @@ The fast path also requires FlashInfer's `cake_blackwell_softmax` module. Older
 FlashInfer installations retain Torch softmax; this adapter does not change
 SGLang's dependency pins.
 
+## MLA value gate
+
 The MLA value gate (`attention.mla_value_gate`) is the Cake form of Kimi K3's
-`MlaValue`: the W_UV projection of the BF16 attention latent, rounded to BF16 and
+`MlaValue`, originally written by Lee Nau in
+[sgl-nvidia-mega #17](https://github.com/sgl-project/sgl-nvidia-mega/pull/17).
+yyihuang implemented the FI primitive and initial SGLang adapter. The
+[NOTICE](../../srt/kernel_plugins/nvidia/kimi_k3/NOTICE) and
+[source mapping](../../srt/kernel_plugins/nvidia/kimi_k3/SOURCE_MAPPING.json)
+preserve the migrated payload's provenance.
+
+It computes the W_UV projection of the BF16 attention latent, rounded to BF16 and
 multiplied by the FP32 sigmoid of the gate, with every row whose request length is
-zero or negative written as zero. Measured on B200 and GB300, its output is
-bit-exact to MlaValue.
+zero or negative written as zero. The upstream FI component results report
+bitwise agreement with `MlaValue` on B200 and GB300. Their scope is the operator
+contract.
 `prepare_cake_mla_value_gate` binds W_UV outside CUDA Graph capture and returns a
 runner whose launches can be captured and replayed with new input contents; a
 replaced W_UV storage needs a new runner. Kimi K3 selects it per prepared bucket
@@ -71,6 +81,8 @@ keeps the two shipped programs: gains from other variants do not justify another
 program for the default dependent-PDL consumer. Revisit that decision when the
 consumer's launch mode or shapes change, rather than adding another kernel here.
 
+### Prepared adapter checks from November 6
+
 SM103 checks with the complete FI `f454a17f` source package used normal FI and
 SGLang package initialization, the real slot/environment and operator registry,
 and FI's supported AOT loader. A native load failure in a private test-library
@@ -86,13 +98,17 @@ including during capture. These are source-package/operator checks; installed
 wheel-trio compatibility, the complete K3 executor, TP8/DCP/HiCache, task quality
 and matched serving performance still require separate qualification.
 
-### Native K3 consumer segment
+### Native K3 consumer experiment from November 10
 
 The [manual consumer driver](../../../../test/manual/kernels/bench_kimi_k3_native_value_gate.py)
 calls the production native value-projection method, K3's gate-stream helpers and
-the native BF16 gate kernel, alongside FI's public preparation/launch API. It uses
-synthetic TP8-rank-shaped tensors with 12 local heads, a 512-wide latent, 128 value
-columns per head and a 7168-wide gate input. It covers changed-input graphs,
+the native BF16 gate kernel, alongside FI's public preparation/launch API. A
+synthetic `SimpleNamespace` owns the local tensors and an `F.linear` gate
+projector. The driver controls capture flags to exercise the native gate side
+stream. The stitched helper segment ends at the gated value output. It uses
+synthetic TP8-rank-shaped tensors
+with 12 local heads, a 512-wide latent, 128 value columns per head and a 7168-wide
+gate input. It covers changed-input graphs,
 invalid rows with NaN gate inputs, a double-gating negative control and new
 preparation after replacing weight storage.
 
@@ -128,11 +144,27 @@ engine configuration. The prepared executor's FI adapter remains separately
 scoped to its existing `MlaValue` sites.
 
 With a FI build exposing this experimental API and one visible SM103 GPU, run
-the driver from the repository root:
+the driver from the repository root.
 
 ```bash
 python test/manual/kernels/bench_kimi_k3_native_value_gate.py \
   --output /tmp/k3-native-value-gate.json
 ```
 
-Use `--flashinfer-revision` to record the source build's commit.
+Use `--flashinfer-revision` to record a caller-supplied source revision. The
+driver also records loaded module paths, the module-reported version and
+installed distribution metadata. The CLI records the revision value as supplied.
+The archived source/build records establish the revision for the measurements
+above.
+
+`--help` and importing the driver need only the Python standard library. A real
+run requires matching SGLang dependencies, a FI build exposing
+`flashinfer.cake_mla_value_gate`, and exactly one visible SM103 GPU. Dependency or
+device refusals write a JSON result with `stage="environment"` and exit with code
+2. Select the device through `CUDA_VISIBLE_DEVICES`. The default Torch allocator
+limit is 256 MiB, and `--torch-memory-limit-mib` must be a positive integer. That
+cap covers the Torch allocator. The measured NVML process peak, including CUDA
+and JIT resources, was 1094 MiB.
+
+Integration scope and acceptance remain under discussion in
+[RFC #49536](https://github.com/sgl-project/sglang/issues/49536).
