@@ -39,7 +39,7 @@ import numpy as np
 import orjson
 import requests
 from tqdm.asyncio import tqdm
-from transformers import AutoTokenizer, PreTrainedTokenizerBase
+from transformers import PreTrainedTokenizerBase
 
 from sglang.benchmark.datasets import DatasetRow, get_dataset
 from sglang.benchmark.datasets.mooncake import get_mooncake_request_over_time
@@ -1968,13 +1968,10 @@ async def benchmark(
     return result | result_details
 
 
-def check_chat_template(model_path):
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-        return "chat_template" in tokenizer.init_kwargs
-    except Exception as e:
-        print(f"Fail to load tokenizer config with error={e}")
-        return False
+def has_chat_template(tokenizer) -> bool:
+    return bool(getattr(tokenizer, "chat_template", None)) or (
+        "chat_template" in getattr(tokenizer, "init_kwargs", {})
+    )
 
 
 def set_global_args(args_: argparse.Namespace):
@@ -2136,12 +2133,6 @@ def run_benchmark(args_: argparse.Namespace):
         print("No model specified or found. Please provide a model using `--model`.")
         sys.exit(1)
 
-    if args.backend not in _EMBEDDING_BACKENDS and not check_chat_template(args.model):
-        print(
-            "\nWARNING It is recommended to use the `Chat` or `Instruct` model for benchmarking.\n"
-            "Because when the tokenizer counts the output tokens, if there is gibberish, it might count incorrectly.\n"
-        )
-
     if (
         args.backend in _EMBEDDING_BACKENDS
         and args.dataset_name in _EMBEDDING_UNSUPPORTED_DATASETS
@@ -2184,6 +2175,11 @@ def run_benchmark(args_: argparse.Namespace):
         tokenizer_id = args.model
 
     tokenizer = get_tokenizer(tokenizer_id)
+    if args.backend not in _EMBEDDING_BACKENDS and not has_chat_template(tokenizer):
+        print(
+            "\nWARNING It is recommended to use the `Chat` or `Instruct` model for benchmarking.\n"
+            "Because when the tokenizer counts the output tokens, if there is gibberish, it might count incorrectly.\n"
+        )
     input_requests = get_dataset(args, tokenizer, model_id)
 
     # compatible with SimpleNamespace
