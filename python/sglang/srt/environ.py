@@ -728,6 +728,9 @@ class Envs:
     # if its prefill were one chunked-prefill budget instead of jumping the queue.
     SGLANG_SPF_AGE_ROUNDS = EnvInt(0)
     SGLANG_SPF_AGE_CAP = EnvBool(False)
+    # Shortest-prefill-first: the in-progress chunk keeps at least this percent of the
+    # budget when shorter waiting requests are reserved room (0 = one page).
+    SGLANG_SPF_CHUNK_MIN_PCT = EnvInt(0)
 
     # ===================================================================
     # Scheduler polling, timeouts, and output

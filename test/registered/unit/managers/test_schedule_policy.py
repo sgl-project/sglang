@@ -297,6 +297,39 @@ class TestShortestPrefillFirst(CustomTestCase):
                     )
                 )
 
+    def test_chunk_floor_keeps_a_share_of_the_budget(self):
+        continuation = self.make_req("continuation", 16384)
+        waiting = [self.make_req("a", 1024), self.make_req("b", 2048)]
+        self.assertEqual(
+            self.policy.shortest_prefill_chunk_limit(
+                continuation, waiting, 4096, 256, processed_tokens=0
+            ),
+            1024,
+        )
+        with envs.SGLANG_SPF_CHUNK_MIN_PCT.override(50):
+            self.assertEqual(
+                self.policy.shortest_prefill_chunk_limit(
+                    continuation, waiting, 4096, 256, processed_tokens=0
+                ),
+                3072,
+            )
+
+    def test_chunk_floor_skips_requests_not_shorter_than_the_chunk(self):
+        continuation = self.make_req("continuation", 4096)
+        waiting = [self.make_req("aged", 8192), self.make_req("short", 512)]
+        self.assertIsNone(
+            self.policy.shortest_prefill_chunk_limit(
+                continuation, waiting, 4096, 256, processed_tokens=0
+            )
+        )
+        with envs.SGLANG_SPF_CHUNK_MIN_PCT.override(25):
+            self.assertEqual(
+                self.policy.shortest_prefill_chunk_limit(
+                    continuation, waiting, 4096, 256, processed_tokens=0
+                ),
+                3584,
+            )
+
     def test_other_policy_keeps_normal_chunk_limit(self):
         self.policy.policy = CacheAwarePolicy.HRRN
         self.assertIsNone(
