@@ -586,14 +586,24 @@ def update_expert_weights_single_layer(
                     req.wait()
 
     def _execute_buffer2weight_copies(buffer2weight_copy_infos):
-        for (
-            temp_buffers_expert_location,
-            routed_experts_weights_expert_location,
-        ) in buffer2weight_copy_infos:
+        # Copy adjacent source/destination slots together. Repeated sources
+        # (replicated experts) start a new run, preserving the original order.
+        start = 0
+        while start < len(buffer2weight_copy_infos):
+            src, dst = buffer2weight_copy_infos[start]
+            end = start + 1
+            while end < len(buffer2weight_copy_infos) and buffer2weight_copy_infos[
+                end
+            ] == (src + end - start, dst + end - start):
+                end += 1
+            count = end - start
+            src = _get_local_expert_location(src)
+            dst = _get_local_expert_location(dst)
             for i in range(num_tensors):
-                _get_tensor(
-                    routed_experts_weights, i, routed_experts_weights_expert_location
-                ).copy_(_get_tensor(temp_buffers, i, temp_buffers_expert_location))
+                routed_experts_weights[i][dst : dst + count].copy_(
+                    temp_buffers[i][src : src + count]
+                )
+            start = end
 
     def _get_tensor(tensors, tensor_index: int, expert_location: int) -> torch.Tensor:
         return tensors[tensor_index][_get_local_expert_location(expert_location)]
