@@ -4912,7 +4912,7 @@ class Scheduler(
         # The pages freed while the forward ran join the free lists. Every
         # result processor has already synchronized an event recorded behind
         # the step's `forward_done`: its `copy_done`, or on a pipeline stage its
-        # `d2h_event` (see `_pp_make_skip_output_result` for skipped outputs).
+        # `d2h_event` (see `_pp_result_done_event`).
         forward_steps = forward_steps_of(
             getattr(self, "token_to_kv_pool_allocator", None)
         )
@@ -6302,45 +6302,60 @@ class Scheduler(
             self._drain_mlx_pending_jobs()
         # The pause starts once the in-flight result has drained.
         self.pause_state.start_window()
-        self._retract_batch(self.running_batch, self.last_batch)
+        self._retract_batches([(self.running_batch, self.last_batch)])
         self.last_batch = None
         self.cur_batch_for_debug = None
         self._publish_paused_state()
 
-    def _retract_batch(
-        self, running_batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
+    def _retract_batches(
+        self, batches: List[Tuple[ScheduleBatch, Optional[ScheduleBatch]]]
     ) -> None:
-        """Retract the requests of `running_batch`, of `last_batch` when it is a
-        prefill not merged into it yet, and the chunked request, none of them in
-        flight. PD decode also retracts the waiting requests that hold KV; PD
-        prefill keeps the chunked request and a prefill already handed to transfer."""
-        retract_reqs = [r for r in running_batch.reqs if not r.finished()]
-        if (
-            last_batch is not None
-            and last_batch.forward_mode.is_extend()
-            # A running batch that DP attention converted to extend is
-            # last_batch itself; its requests are already listed above.
-            and last_batch is not running_batch
-            # Skip merge for disagg prefill: completed prefill requests are
-            # already in disagg_prefill_transfer_queue. Merging them into
-            # running_batch leaks them, since the prefill event loop never
-            # calls update_running_batch to clean them up.
-            and self.disaggregation_mode != DisaggregationMode.PREFILL
-        ):
-            retract_reqs += [r for r in last_batch.reqs if not r.finished()]
+        """Retract every request that holds KV, once for the whole pause; `batches`
+        holds one `(running_batch, last_batch)` pair per PP micro-batch, none in
+        flight. PD prefill keeps the chunked request and a prefill already handed
+        to transfer."""
+        retract_reqs = []
+        for running_batch, last_batch in batches:
+            retract_reqs += [r for r in running_batch.reqs if not r.finished()]
+            if (
+                last_batch is not None
+                and last_batch.forward_mode.is_extend()
+                # A running batch that DP attention converted to extend is
+                # last_batch itself; its requests are already listed above.
+                and last_batch is not running_batch
+                # Skip merge for disagg prefill: completed prefill requests are
+                # already in disagg_prefill_transfer_queue. Merging them into
+                # running_batch leaks them, since the prefill event loop never
+                # calls update_running_batch to clean them up.
+                and self.disaggregation_mode != DisaggregationMode.PREFILL
+            ):
+                retract_reqs += [r for r in last_batch.reqs if not r.finished()]
 
         if (
             self.chunked_req is not None
             and not self.chunked_req.finished()
-            and self.chunked_req not in retract_reqs
             and self.disaggregation_mode != DisaggregationMode.PREFILL
         ):
             retract_reqs.append(self.chunked_req)
+
+        if self.hisparse_coordinator is not None:
+            # Only a running loop moves a staged request on; the whole queue, so
+            # TP ranks agree.
+            retract_reqs += self.hisparse_coordinator.ack_staging_queue.take()
+
+        if self.dllm_config is not None:
+            # A dLLM request keeps its row between rounds; a finished one leaves
+            # the lists only at the next schedule, which a paused loop never reaches.
+            self.dllm_manager.filter_finished_reqs()
+            retract_reqs += self.dllm_manager.take(lambda r: r.kv.holds_kv)
 
         if self.disaggregation_mode == DisaggregationMode.DECODE:
             # Transferred requests wait for a slot holding their row and KV;
             # retract them too, so their KV is rebuilt under the new weights.
             retract_reqs += self.waiting_queue.take(lambda r: r.kv.holds_kv)
+
+        # The chunked, a staged or a dLLM request may also sit in a batch.
+        retract_reqs = list(dict.fromkeys(retract_reqs))
 
         if self.decode_offload_manager is not None:
             # Pending offload copies may still read the device KV that retraction frees,
@@ -6356,9 +6371,10 @@ class Scheduler(
                 request_retirer=self.request_retirer,
                 offload_kv=False,
             )
-        # Empties the batch through filter_batch so a beam tail goes with the reqs.
-        running_batch.filter_batch(keep_indices=[])
-        # Under PP the other micro-batches keep running.
+        for running_batch, _ in batches:
+            # Empties the batch through filter_batch so a beam tail goes with the reqs.
+            running_batch.filter_batch(keep_indices=[])
+            running_batch.batch_is_full = False
         self.running_reqs.leave(retract_reqs)
         self.prefill_launched_reqs.leave(retract_reqs)
         for req in retract_reqs:
@@ -6370,7 +6386,6 @@ class Scheduler(
                 self.disagg_decode_prealloc_queue.hold_rebootstrap(req)
             else:
                 self._add_request_to_queue(req)
-        running_batch.batch_is_full = False
         # In disagg-PREFILL, keep a live mid-chunk chunked_req rather than retract it:
         # freeing its KV under a live disagg KV-sender crashes pop_bootstrapped or
         # sends freed/reused KV to decode. Kept, it resumes prefill after the pause.
@@ -6538,6 +6553,10 @@ class Scheduler(
     ) -> UnloadLoRAAdapterReqOutput:
         """Unload the lora adapter."""
 
+        if self.enable_overlap or get_parallel().pp_size > 1:
+            # The unload zeroes the adapter's pool slot on this stream; a step
+            # launched before this request may still run that adapter.
+            self.schedule_stream.wait_stream(self.forward_stream)
         result = self.tp_worker.unload_lora_adapter(recv_req)
         return result
 
