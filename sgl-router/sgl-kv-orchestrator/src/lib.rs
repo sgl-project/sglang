@@ -3,7 +3,6 @@ mod client;
 mod config;
 mod feedback;
 pub mod models;
-pub mod observations;
 pub mod operations;
 pub mod protocol;
 mod runtime;
