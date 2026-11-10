@@ -1391,6 +1391,21 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         self.assertEqual(req[0].routed_dp_rank, 3)
         self.assertEqual(req[1].routed_dp_rank, 3)
 
+    def test_bidir_prefix_len_normalization(self):
+        req = copy.deepcopy(self.base_req)
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req.bidir_prefix_len, [-1, -1])
+
+        req = copy.deepcopy(self.base_req)
+        req.bidir_prefix_len = 4
+        req.normalize_batch_and_arguments()
+        self.assertEqual([req[0].bidir_prefix_len, req[1].bidir_prefix_len], [4, 4])
+
+        req = copy.deepcopy(self.base_req)
+        req.bidir_prefix_len = [4]
+        with self.assertRaisesRegex(ValueError, "bidir_prefix_len has 1 entries"):
+            req.normalize_batch_and_arguments()
+
 
 class TestKvHintsTransport(CustomTestCase):
     """The kv_hints envelope must survive every hop from HTTP to the scheduler."""

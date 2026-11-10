@@ -286,6 +286,8 @@ class GenerateReqInput:
     # of `CustomLogitProcessor` in python/sglang/srt/sampling/custom_logit_processor.py
     # Use the processor's `to_str()` method to generate the serialized string.
     custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None
+    # Block-bidirectional attention boundary for decision models; None/-1 = causal.
+    bidir_prefix_len: Optional[Union[List[int], int]] = None
     # Embedding overrides to place at specific token positions.
     # Runtime type: Optional[Union[PositionalEmbeds, List[Optional[PositionalEmbeds]]]]
     # Typed as Any to avoid Pydantic/FastAPI schema errors (PositionalEmbeds contains torch.Tensor).
@@ -621,6 +623,7 @@ class GenerateReqInput:
         self._normalize_logprob_params(num)
         self._normalize_return_hidden_states(num)
         self._normalize_custom_logit_processor(num)
+        self._normalize_bidir_prefix_len(num)
         self._normalize_extra_key(num)
         self._normalize_cache_salt(num)
         self._normalize_kv_hints(num)
@@ -858,6 +861,21 @@ class GenerateReqInput:
             get_return_hidden_states_mode(self.return_hidden_states)
             self.return_hidden_states = [self.return_hidden_states] * num
 
+    def _normalize_bidir_prefix_len(self, num):
+        if self.bidir_prefix_len is None:
+            self.bidir_prefix_len = [-1] * num
+        elif not isinstance(self.bidir_prefix_len, list):
+            self.bidir_prefix_len = [self.bidir_prefix_len] * num
+        elif self.parallel_sample_num > 1:
+            raise ValueError(
+                "Cannot use list bidir_prefix_len with parallel_sample_num > 1"
+            )
+        elif len(self.bidir_prefix_len) != num:
+            raise ValueError(
+                f"bidir_prefix_len has {len(self.bidir_prefix_len)} entries "
+                f"for a batch of {num} prompts"
+            )
+
     def _normalize_custom_logit_processor(self, num):
         """Normalize custom logit processor for batch processing."""
         if self.custom_logit_processor is None:
@@ -1033,6 +1051,9 @@ class GenerateReqInput:
                 else None
             ),
             mm_processor_kwargs=self.mm_processor_kwargs,
+            bidir_prefix_len=(
+                self.bidir_prefix_len[i] if self.bidir_prefix_len is not None else None
+            ),
             positional_embed_overrides=self._get_positional_embed_overrides_item(i),
             # If `__getitem__` is called, these bootstrap fields must be lists.
             bootstrap_host=(
@@ -1199,6 +1220,8 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     sampling_logprobs_mode: SamplingLogprobsMode = "selected"
     # LoRA adapter name; KV events namespace this request's blocks by it.
     lora_name: Optional[str] = None
+    # Block-bidirectional attention boundary; -1 = causal.
+    bidir_prefix_len: int = -1
 
     def wrap_pickle_fields(self):
         self.mm_inputs = wrap_object_fields_as_pickle(self.mm_inputs)

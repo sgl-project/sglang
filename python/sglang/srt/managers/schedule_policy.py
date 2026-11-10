@@ -1812,6 +1812,13 @@ class PrefillAdder:
             if extend_len <= 0:
                 return AddReqResult.OTHER
             max_new_tokens = 0
+        elif (
+            req.bidir_prefix_len >= 0
+            and chunk_tokens_limit is not None
+            and chunk_fit_tokens > chunk_tokens_limit
+        ):
+            # A block-bidirectional prompt cannot be split across chunks.
+            return AddReqResult.OTHER
         elif chunk_tokens_limit is not None and chunk_fit_tokens > chunk_tokens_limit:
             if has_chunked_req:
                 # Only one unfinished chunked request can be tracked; a

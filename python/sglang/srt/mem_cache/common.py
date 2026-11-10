@@ -204,6 +204,16 @@ def match_kv_cache(
         match_result = zero_match_result(
             tree_cache, match_result, extra_key=req.extra_key
         )
+    if req.bidir_prefix_len >= 0:
+        # The state block attends to itself in full, so a partial match is a miss.
+        state_hit = match_result.full_kv_hit_length or match_result.device_prefix_len
+        if 0 < state_hit < req.bidir_prefix_len:
+            match_result = zero_match_result(
+                tree_cache, match_result, extra_key=req.extra_key
+            )._replace(mamba_branching_seqlen=None, cache_protected_len=None)
+            if req.kv.holds_mamba:
+                req.kv.mamba_cow_src_index = None
+                req.kv.mamba_needs_clear = True
     req.prefix_len = match_result.device_prefix_len
     (
         req.last_node,

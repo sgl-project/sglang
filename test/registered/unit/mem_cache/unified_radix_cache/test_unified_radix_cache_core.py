@@ -1872,6 +1872,57 @@ class TestMambaFinishedOvershootCheckpoint(
                 cache.sanity_check()
 
 
+class TestBidirStateBlockCheckpoint(
+    MambaFinishedOvershootCheckpointFixtures, CustomTestCase
+):
+    """A finished block-bidirectional request keeps the KV of its whole state
+    block, not only up to the Mamba checkpoint, so the next question can prove
+    the state matched; its question tokens are not kept."""
+
+    _rid = 0
+    cfg = CacheConfig(
+        page_size=1,
+        components=(ComponentType.FULL, ComponentType.MAMBA),
+        enable_mamba_extra_buffer=True,
+        kv_size=64,
+        max_context_len=64,
+    )
+    STATE_LEN, PROMPT_LEN, CHECKPOINT = 12, 16, 8
+
+    def _finish(self, bidir_prefix_len):
+        cache, allocator, pool = build_fixture(self.cfg, mamba_cache_chunk_size=4)
+        req, _ = self._build_req(allocator, pool, None)
+        tokens = list(range(self.PROMPT_LEN))
+        req.origin_input_ids = array("q", tokens)
+        req.kv.kv_committed_len = req.kv.kv_allocated_len = len(tokens)
+        pool.write(
+            (req.kv.req_pool_idx, slice(self.STATE_LEN, len(tokens))),
+            allocator.alloc(len(tokens) - self.STATE_LEN),
+        )
+        req.kv.mamba_last_track_seqlen = self.CHECKPOINT
+        req.bidir_prefix_len = bidir_prefix_len
+        req.last_node = cache.root_node_handle()
+        avail_before = allocator.available_size()
+        finish_req(cache, req, len(tokens))
+        cache.sanity_check()
+        return cache, tokens, allocator.available_size() - avail_before
+
+    def test_state_block_is_kept_past_the_checkpoint(self):
+        cache, tokens, freed = self._finish(self.STATE_LEN)
+        state = match_prefix(cache, tokens[: self.STATE_LEN])
+        self.assertEqual(state.full_kv_hit_length, self.STATE_LEN)
+        self.assertEqual(state.device_prefix_len, self.CHECKPOINT)
+        self.assertEqual(match_prefix(cache, tokens).full_kv_hit_length, self.STATE_LEN)
+        self.assertEqual(freed, self.PROMPT_LEN - self.STATE_LEN)
+
+    def test_causal_request_is_unchanged(self):
+        cache, tokens, freed = self._finish(-1)
+        self.assertEqual(
+            match_prefix(cache, tokens).full_kv_hit_length, self.CHECKPOINT
+        )
+        self.assertEqual(freed, self.PROMPT_LEN - self.CHECKPOINT)
+
+
 class TestUnifiedRadixCacheInt8MambaCheckpoint(
     UnifiedRadixCacheInt8MambaCheckpointFixtures, CustomTestCase
 ):
