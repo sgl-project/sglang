@@ -844,6 +844,8 @@ class TestMooncakeStorageMetrics(CustomTestCase):
         self.assertGreater(store.backup_bandwidth[0], 0)
 
     def test_v2_get_records_prefetch_metrics_for_mixed_pools(self):
+        """The same logical page fetched through two pools counts once, like
+        the v1 pages metric."""
         store, fake_store = _make_store(
             extra_backend_tag="tag", enable_storage_metrics=True
         )
@@ -865,10 +867,36 @@ class TestMooncakeStorageMetrics(CustomTestCase):
             ]
         )
 
-        self.assertEqual(store.prefetch_pgs, [2])
+        self.assertEqual(store.prefetch_pgs, [1])
         self.assertEqual(len(store.prefetch_bandwidth), 1)
         self.assertGreater(store.prefetch_bandwidth[0], 0)
         self.assertEqual(len(fake_store.batch_get_calls), 1)
+
+    def test_v2_set_metrics_dedupe_logical_pages_across_pools(self):
+        """The same logical page backed up into two pools counts once in the
+        pages metric, like the v1 pages metric."""
+        store, _ = _make_store(extra_backend_tag="tag", enable_storage_metrics=True)
+        store.register_mem_host_pool_v2(FakeIndexerPool(), PoolName.INDEXER)
+        store.register_mem_host_pool_v2(FakeMultiBufferPool(), PoolName.DEEPSEEK_V4_C4)
+
+        store.batch_set_v2(
+            [
+                PoolTransfer(
+                    name=PoolName.INDEXER,
+                    keys=["page0"],
+                    host_indices=torch.tensor([0]),
+                ),
+                PoolTransfer(
+                    name=PoolName.DEEPSEEK_V4_C4,
+                    keys=["page0"],
+                    host_indices=torch.tensor([0]),
+                ),
+            ]
+        )
+
+        self.assertEqual(store.backup_pgs, [1])
+        self.assertEqual(len(store.backup_bandwidth), 1)
+        self.assertGreater(store.backup_bandwidth[0], 0)
 
     def test_v2_metrics_disabled_by_config(self):
         store, _ = _make_store(extra_backend_tag="tag")
