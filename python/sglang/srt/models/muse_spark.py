@@ -1163,6 +1163,7 @@ class MuseSpark1xModel(nn.Module):
                             lease,
                             comm,
                             hidden_dim=hidden_dim,
+                            device_group=tp_group.device_group,
                             multicast=comm.world_size > 4,
                         )
                         if lease is not None

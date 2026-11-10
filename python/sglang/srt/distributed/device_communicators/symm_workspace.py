@@ -497,6 +497,19 @@ def close_symm_workspaces() -> None:
     _WORKSPACES.clear()
 
 
+def close_group_symm_workspaces(group: ProcessGroup) -> None:
+    """Release ``group``'s workspaces and forget its cached state (collective).
+
+    Runs while the group still exists, before it is destroyed; a group created later
+    under the same name starts from scratch.
+    """
+    name = group.group_name
+    for workspace in _WORKSPACES.pop(name, ()):
+        workspace.close()
+    for cache in (_SUPPORTED, _MULTICAST, _V2_PUSH_SLOT_BYTES):
+        cache.pop(name, None)
+
+
 def is_multinode_symm_group(group: ProcessGroup) -> bool:
     """Whether ``group`` holds a workspace that spans nodes (FABRIC on ROCm)."""
     return any(ws.multinode for ws in _WORKSPACES.get(group.group_name, ()))

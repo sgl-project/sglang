@@ -26,6 +26,7 @@ class FinalizePushWorkspace:
 
     Storage comes from ``lease`` and is resolved on first use, after the workspace
     is allocated; ``policy`` (the TP custom all-reduce) picks 1-shot vs 2-shot.
+    ``device_group`` is the TP device group the unfused finalize paths all-reduce on.
     """
 
     def __init__(
@@ -34,10 +35,12 @@ class FinalizePushWorkspace:
         policy: CustomAllReduceV2,
         hidden_dim=4096,
         *,
+        device_group: dist.ProcessGroup,
         multicast=False,
     ):
         self.lease = lease
         self.policy = policy
+        self.group = device_group
         self.rank = lease.rank
         self.world_size = lease.world_size
         self.device = lease.device

@@ -2115,6 +2115,15 @@ class GroupCoordinator:
         if self.pcie_ipc_comm is not None:
             self.pcie_ipc_comm.destroy()
             self.pcie_ipc_comm = None
+        # Also before destroy_process_group(): the symmetric workspace is released
+        # collectively on cpu_group, after the custom all-reduce drops its views.
+        self.ca_comm = None
+        if self.cpu_group is not None:
+            from sglang.srt.distributed.device_communicators.symm_workspace import (
+                close_group_symm_workspaces,
+            )
+
+            close_group_symm_workspaces(self.cpu_group)
         if self.device_group is not None:
             torch.distributed.destroy_process_group(self.device_group)
             self.device_group = None
@@ -2125,8 +2134,6 @@ class GroupCoordinator:
             self.pynccl_comm = None
         if self.pymscclpp_comm is not None:
             self.pymscclpp_comm.destroy()
-        if self.ca_comm is not None:
-            self.ca_comm = None
         if self.mq_broadcaster is not None:
             self.mq_broadcaster = None
 
