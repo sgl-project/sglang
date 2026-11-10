@@ -17,6 +17,7 @@ from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
+from sglang.srt.model_executor.swa_recompute import swa_recompute_batch
 from sglang.srt.model_loader.weight_utils import get_pp_stage_load_group
 from sglang.srt.runtime_context import (
     get_disagg,
@@ -59,6 +60,7 @@ from sglang.srt.speculative.dspark_components.dspark_draft_sampler import (
     maybe_build_draft_sampler,
 )
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
+    PrefillPlacement,
     TargetHiddenKvInjector,
 )
 from sglang.srt.speculative.dspark_components.dspark_observability import (
@@ -349,6 +351,18 @@ class DSparkWorkerV2(BaseSpecWorker):
             verify_num_draft_tokens=self.verify_num_draft_tokens,
             block_pos_offsets=self._block_pos_offsets,
         )
+        draft_window = self.draft_model_runner.sliding_window_size
+        target_window = self.target_worker.model_runner.sliding_window_size
+        if (
+            get_exec().features.enable_swa_recompute
+            and draft_window is not None
+            and (target_window is None or draft_window > target_window)
+        ):
+            # A replay leaves only the target's last window exact.
+            raise ValueError(
+                f"--enable-swa-recompute needs the DSpark draft window ({draft_window}) "
+                f"to be no larger than the target window ({target_window})"
+            )
         self._simulate_acc_len = float(envs.SGLANG_SIMULATE_ACC_LEN.get())
         # The step's simulated correct length, read by the eager and graph accepts.
         self._simulated_correct_len = (
@@ -758,6 +772,10 @@ class DSparkWorkerV2(BaseSpecWorker):
         # Placing the draft KV reads scheduler-shared tables, which prefill
         # read-done releases once the target forward's own reads end.
         placement = self._kv_injector.place_prefill(batch)
+        replay = swa_recompute_batch(batch, self.target_worker.model_runner)
+        replay_placements = (
+            [] if replay is None else [self._kv_injector.place_prefill(replay)]
+        )
         batch_output = self.target_worker.forward_batch_generation(
             batch,
             pp_proxy_tensors=pp_proxy_tensors,
@@ -779,6 +797,31 @@ class DSparkWorkerV2(BaseSpecWorker):
         if on_publish is not None:
             on_publish(batch_output.new_seq_lens)
 
+        self._inject_prefill_target_hidden(
+            batch, logits_output, placement, target_hidden_is_projected
+        )
+        for replay, replay_placement in zip(
+            batch_output.swa_recompute_outputs or (), replay_placements, strict=True
+        ):
+            self._inject_prefill_target_hidden(
+                replay.batch,
+                replay.logits_output,
+                replay_placement,
+                target_hidden_is_projected,
+            )
+        batch_output.next_draft_input = make_next_draft_input(
+            bonus_tokens=next_token_ids,
+            new_seq_lens=new_seq_lens,
+        )
+        return batch_output
+
+    def _inject_prefill_target_hidden(
+        self,
+        batch: ScheduleBatch,
+        logits_output,
+        placement: PrefillPlacement,
+        target_hidden_is_projected: bool,
+    ) -> None:
         if logits_output.hidden_states is None:
             raise RuntimeError(
                 "DSpark requires target aux hidden capture for prefill, but got None. "
@@ -817,12 +860,6 @@ class DSparkWorkerV2(BaseSpecWorker):
         # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
         logits_output.hidden_states = None
         logits_output.hidden_states_token_indices = None
-
-        batch_output.next_draft_input = make_next_draft_input(
-            bonus_tokens=next_token_ids,
-            new_seq_lens=new_seq_lens,
-        )
-        return batch_output
 
     def _idle_verify_ragged_layout(self, batch: ScheduleBatch):
         if batch.global_num_tokens is None or not self._verify_planner.is_compact_mode:

@@ -109,6 +109,13 @@ from sglang.srt.mem_cache.unified_cache.session_ref_tracker import (
     UnifiedSessionRefTracker,
 )
 from sglang.srt.mem_cache.unified_cache.storage_attachment import StorageAttachment
+from sglang.srt.mem_cache.unified_cache.swa_recompute import (
+    SWARecompute,
+    init_swa_recompute,
+    release_swa_recompute_workspace,
+    supports_swa_recompute,
+    swa_recompute_hit_length,
+)
 from sglang.srt.mem_cache.unified_cache.tree_core_registry import (
     create_tree_core,
     select_tree_core_backend,
@@ -279,6 +286,15 @@ class UnifiedRadixCache(BasePrefixCache):
         self.enable_mamba_extra_buffer = (
             params.enable_mamba_extra_buffer if self.is_mamba_enabled else False
         )
+        self.swa_recompute_len = params.swa_recompute_len
+        if self.swa_recompute_len is not None and not (
+            self.is_swa_enabled
+            and supports_swa_recompute(params.token_to_kv_pool_allocator)
+        ):
+            raise ValueError(
+                "--enable-swa-recompute needs a sliding-window tree on a separate "
+                "SWA pool without a per-request ring"
+            )
         self.decoder_swa_bounded_replay = params.decoder_swa_bounded_replay
         # The TreeCore owns the tree member-var state (structure, LRUs, sizes,
         # evictable leaves) and drives the components' tree-level hooks.
@@ -708,7 +724,28 @@ class UnifiedRadixCache(BasePrefixCache):
             and get_disagg().disaggregation_mode != "decode"
         ):
             result = self.linker.match(params.key, params.req, result)
+        if (
+            self.swa_recompute_len is not None
+            and result.host_hit_length == 0
+            and not any(result.window_host_hit_lengths.values())
+        ):
+            result = result._replace(
+                swa_recompute_hit_length=swa_recompute_hit_length(
+                    self,
+                    params.key,
+                    result.device_prefix_len,
+                    result.full_kv_hit_length,
+                )
+            )
         return result
+
+    def init_swa_recompute(
+        self, req: Req, key: RadixKey
+    ) -> Optional[tuple[int, NodeId, SWARecompute]]:
+        return init_swa_recompute(self, req, key)
+
+    def release_swa_recompute_workspace(self, req: Req) -> None:
+        release_swa_recompute_workspace(self, req)
 
     def _linker_offload_skip_prefix(self, req: Req, token_ids):
         # Skip uploads delegated to another writer (e.g. PD prefill), keeping local tree inserts.

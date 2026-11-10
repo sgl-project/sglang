@@ -66,6 +66,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 from sglang.srt.mem_cache.capacity import create_prefill_budget
 from sglang.srt.mem_cache.common import match_kv_cache, touch_waiting_prefix
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
+from sglang.srt.mem_cache.unified_cache.swa_recompute import replay_window_host_hits
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.model_executor import encoder_swa_replay
 
@@ -1027,6 +1028,8 @@ class PrefillAdder:
             self.reprocessed_log_input_tokens += raw_extend_input_len
 
     def _replay_len(self, req: Req, prefix_len: int) -> int:
+        if req.swa_recompute_hit_length:
+            return self.tree_cache.swa_recompute_len
         if (
             get_exec().features.enable_encoder_swa_bounded_replay
             and encoder_swa_replay.resets_swa_window(req)
@@ -1592,13 +1595,32 @@ class PrefillAdder:
 
         # The temporary pin excludes this prefix from the evictable budget.
         # Selection itself neither allocates slots nor materializes host hits.
+        if (
+            req.swa_recompute_hit_length
+            and not self.can_run_list
+            and self.rem_chunk_tokens is not None
+            and self.rem_chunk_tokens
+            < self.tree_cache.swa_recompute_len + self.page_size
+        ):
+            # Even a fresh chunk cannot hold the replay; prefill the prefix instead.
+            req.swa_recompute_hit_length = 0
+            req.swa_recompute_key = None
+
         with self._lock_node(req.last_node):
+            # A replay reuses resident FULL like a host hit and needs window
+            # rows for the whole replayed span.
             admission = self._select_prefill_admission(
                 req,
                 total_tokens=total_tokens,
                 state_slots=state_slots,
-                host_hit_length=req.host_hit_length,
-                window_host_hit_lengths=req.window_host_hit_lengths,
+                host_hit_length=req.host_hit_length + req.swa_recompute_hit_length,
+                window_host_hit_lengths=(
+                    replay_window_host_hits(
+                        self.tree_cache, req.window_host_hit_lengths
+                    )
+                    if req.swa_recompute_hit_length
+                    else req.window_host_hit_lengths
+                ),
                 truncation_align_size=truncation_align_size,
                 has_chunked_req=has_chunked_req,
             )
@@ -1746,6 +1768,30 @@ class PrefillAdder:
                     prefix_len=admission.prefix_len, extend_len=admission.extend_len
                 ):
                     return AddReqResult.OTHER
+
+            # Bind last: the published window holds no data until this batch runs.
+            if req.swa_recompute_hit_length:
+                recomputed = self.tree_cache.init_swa_recompute(
+                    req, req.swa_recompute_key
+                )
+                req.swa_recompute_hit_length = 0
+                req.swa_recompute_key = None
+                if recomputed is None:
+                    admission = self._select_prefill_admission(
+                        req,
+                        total_tokens=total_tokens,
+                        state_slots=state_slots,
+                        host_hit_length=0,
+                        window_host_hit_lengths={},
+                        truncation_align_size=truncation_align_size,
+                        has_chunked_req=has_chunked_req,
+                    )
+                    if isinstance(admission, AddReqResult):
+                        return admission
+                else:
+                    gained_len, req.last_node, req.swa_recompute = recomputed
+                    req.prefix_len += gained_len
+                    req.kv.protect_prefix(req.prefix_len)
 
             self._commit_prefill_admission(req, admission, state_slots)
 

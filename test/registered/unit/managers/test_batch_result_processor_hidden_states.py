@@ -232,6 +232,7 @@ class _PrefillReq(FakeReq):
         self.return_hidden_states = return_hidden_states
         self.hidden_states = []
         self.is_retracted = False
+        self.swa_recompute = None
         self.output_ids = []
         self.time_stats = Mock()
         self.return_logprob = False

@@ -1090,6 +1090,15 @@ def _pad_rows(t: torch.Tensor, *, num_rows: int) -> torch.Tensor:
     return torch.nn.functional.pad(t, (0, num_rows - t.shape[0]))
 
 
+def swa_recompute_floor(forward_batch: ForwardBatch) -> torch.Tensor:
+    """Per-token replay start: window rows below it were never rebuilt."""
+    extend_lens = forward_batch.extend_seq_lens.to(torch.int64)
+    prefix_lens = forward_batch.seq_lens.to(torch.int64) - extend_lens
+    return torch.repeat_interleave(
+        prefix_lens, extend_lens, output_size=forward_batch.extend_num_tokens
+    ).to(torch.int32)
+
+
 # Arbitrary floor: below it the dense scores are short enough that the
 # all-gather's fixed latency eats most of what sharding saves.
 _INDEXER_TP_SHARD_MIN_ROWS = 512
@@ -1818,6 +1827,8 @@ class DeepseekV4AttnBackend(
     def can_run_prefill_cuda_graph(self, forward_batch: ForwardBatch) -> bool:
         max_seq_len = self._prefill_graph_seq_limit()
         seq_lens_cpu = forward_batch.seq_lens_cpu
+        if forward_batch.swa_recompute:
+            return False
         if seq_lens_cpu is None or seq_lens_cpu.numel() == 0:
             return True
         if max_seq_len is not None and int(seq_lens_cpu.max().item()) > max_seq_len:
@@ -3289,6 +3300,11 @@ class DeepseekV4AttnBackend(
                 use_prefill_cuda_graph=use_prefill_cuda_graph,
                 forward_batch=forward_batch,
                 real_num_tokens=real_num_tokens,
+                swa_replay_start=(
+                    swa_recompute_floor(forward_batch)
+                    if forward_batch.swa_recompute
+                    else None
+                ),
             )
             self._snapshot_low_ratio_k_slots(
                 forward_batch, metadata, publish_rows=not use_prefill_cuda_graph

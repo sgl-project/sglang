@@ -211,6 +211,7 @@ def _req(rid, prompt, max_new_tokens=4):
     req.host_hit_length = 0
     req.window_host_hit_lengths = {}
     req.mamba_host_hit_length = 0
+    req.swa_recompute_hit_length = 0
     req.storage_hit_length = 0
     req.storage_hit_start = None
     req.host_hit_is_storage = False
