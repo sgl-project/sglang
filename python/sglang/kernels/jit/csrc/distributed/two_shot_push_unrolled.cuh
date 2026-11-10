@@ -36,8 +36,8 @@ inline constexpr int64_t kTwoShotPushUnrolledMinBytes =
 /// `all_reduce_2shot_push_kernel` with the ring_simple memory pipeline: same
 /// slots, markers and epochs, but warps take contiguous hunks of
 /// `kWarpThreads * unroll` vectors and issue every load of a hunk before using
-/// any, and slot payload moves as streaming loads and batched streaming
-/// system-scope stores while the input and output take plain accesses. The
+/// any, and slot payload moves as device-scope loads and batched system-scope
+/// stores while the input and output take plain accesses. The
 /// tail past the last whole hunk takes the per-vector path. Single node only
 /// (at most 8 ranks).
 template <typename T, uint32_t kWorldSize, bool kUsePDL, typename Params>
@@ -96,12 +96,12 @@ __global__ __launch_bounds__(kTwoShotPushThreads, 1) __attribute__((
       for (uint32_t u = 0; u < kUnroll; ++u) {
         Lamport::clear_pos_zero(vecs[u].data());
       }
-      ptx::st_relaxed_nt_run_16B<kWarpThreads, kUnroll>(vecs, push_ptr + j);
+      ptx::st_relaxed_run_16B<kWarpThreads, kUnroll>(vecs, push_ptr + j);
     }
     for (auto j = peer_full + group_tid; j < peer_len; j += group_stride) {
       vec_t vec = src[j];
       Lamport::clear_pos_zero(vec.data());
-      ptx::st_relaxed_nt_16B(vec, push_ptr, j);
+      ptx::st_relaxed_16B(vec, push_ptr, j);
     }
   }
 
@@ -134,7 +134,7 @@ __global__ __launch_bounds__(kTwoShotPushThreads, 1) __attribute__((
       for (uint32_t u = 0; u < kReduceUnroll; ++u) {
 #pragma unroll
         for (uint32_t i = 0; i < kWorldSize; ++i) {
-          ptx::ld_nt_16B(vecs[u][i], poll_ptrs[i], j + u * kWarpThreads);
+          ptx::ld_relaxed_16B(vecs[u][i], poll_ptrs[i], j + u * kWarpThreads);
         }
       }
       // A late peer is re-polled alone, with a sleep per spin: re-polling every
@@ -151,7 +151,7 @@ __global__ __launch_bounds__(kTwoShotPushThreads, 1) __attribute__((
           __builtin_amdgcn_s_sleep(1);
 #pragma unroll
           for (uint32_t u = 0; u < kReduceUnroll; ++u) {
-            ptx::ld_nt_16B(vecs[u][i], poll_ptrs[i], j + u * kWarpThreads);
+            ptx::ld_relaxed_16B(vecs[u][i], poll_ptrs[i], j + u * kWarpThreads);
           }
         }
       }
@@ -170,7 +170,7 @@ __global__ __launch_bounds__(kTwoShotPushThreads, 1) __attribute__((
       for (uint32_t i = 0; i < kWorldSize; ++i) {
         if (i != r) {
           const auto send_ptr = static_cast<vec_t*>(epoch.slot_ptr(/*dst=*/i, /*src=*/r));
-          ptx::st_relaxed_nt_run_16B<kWarpThreads, kReduceUnroll>(outs, send_ptr + chunk_vecs + j);
+          ptx::st_relaxed_run_16B<kWarpThreads, kReduceUnroll>(outs, send_ptr + chunk_vecs + j);
         }
       }
 #pragma unroll
@@ -182,7 +182,7 @@ __global__ __launch_bounds__(kTwoShotPushThreads, 1) __attribute__((
         if (i != r) {
 #pragma unroll
           for (uint32_t u = 0; u < kReduceUnroll; ++u) {
-            ptx::st_nt_16B(pos_zero_vec, poll_ptrs[i] + j, u * kWarpThreads);
+            ptx::st_global_16B(pos_zero_vec, poll_ptrs[i] + j, u * kWarpThreads);
           }
         }
       }
@@ -194,7 +194,7 @@ __global__ __launch_bounds__(kTwoShotPushThreads, 1) __attribute__((
         bool has_zero = false;
 #pragma unroll
         for (uint32_t i = 0; i < kWorldSize; ++i) {
-          if (i != r) ptx::ld_nt_16B(vec[i], poll_ptrs[i], j);
+          if (i != r) ptx::ld_relaxed_16B(vec[i], poll_ptrs[i], j);
         }
 #pragma unroll
         for (uint32_t i = 0; i < kWorldSize; ++i) {
@@ -210,12 +210,12 @@ __global__ __launch_bounds__(kTwoShotPushThreads, 1) __attribute__((
       Lamport::clear_pos_zero(out_vec.data());
 #pragma unroll
       for (uint32_t i = 0; i < kWorldSize; ++i) {
-        if (i != r) ptx::st_relaxed_nt_16B(out_vec, epoch.slot_ptr(/*dst=*/i, /*src=*/r), chunk_vecs + j);
+        if (i != r) ptx::st_relaxed_16B(out_vec, epoch.slot_ptr(/*dst=*/i, /*src=*/r), chunk_vecs + j);
       }
       out_vec.store(my_out, j);
 #pragma unroll
       for (uint32_t i = 0; i < kWorldSize; ++i) {
-        if (i != r) ptx::st_nt_16B(pos_zero_vec, poll_ptrs[i], j);
+        if (i != r) ptx::st_global_16B(pos_zero_vec, poll_ptrs[i], j);
       }
     }
   }
@@ -231,7 +231,7 @@ __global__ __launch_bounds__(kTwoShotPushThreads, 1) __attribute__((
       while (true) {
 #pragma unroll
         for (uint32_t u = 0; u < kUnroll; ++u) {
-          ptx::ld_nt_16B(vecs[u], poll_ptr, j + u * kWarpThreads);
+          ptx::ld_relaxed_16B(vecs[u], poll_ptr, j + u * kWarpThreads);
         }
         bool has_zero = false;
 #pragma unroll
@@ -247,16 +247,16 @@ __global__ __launch_bounds__(kTwoShotPushThreads, 1) __attribute__((
       }
 #pragma unroll
       for (uint32_t u = 0; u < kUnroll; ++u) {
-        ptx::st_nt_16B(pos_zero_vec, at, u * kWarpThreads);
+        ptx::st_global_16B(pos_zero_vec, at, u * kWarpThreads);
       }
     }
     for (auto j = peer_full + group_tid; j < peer_len; j += group_stride) {
       vec_t vec;
       do {
-        ptx::ld_nt_16B(vec, poll_ptr, j);
+        ptx::ld_relaxed_16B(vec, poll_ptr, j);
       } while (Lamport::has_pos_zero(vec.data()));
       dst[j] = vec;
-      ptx::st_nt_16B(pos_zero_vec, poll_ptr, j);
+      ptx::st_global_16B(pos_zero_vec, poll_ptr, j);
     }
   }
 
