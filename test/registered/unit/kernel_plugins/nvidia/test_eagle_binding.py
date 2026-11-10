@@ -747,6 +747,47 @@ def _defaults() -> spec.SpeculativeRuntimeHooks:
 
 
 class TestSpeculativeRuntimeHooks(CustomTestCase):
+    def test_checkpoint_callback_is_optional_and_collectively_validated(self):
+        defaults = _defaults()
+        self.assertIsNone(defaults.checkpoint_commit)
+        callback = lambda view: True
+        model = _model(
+            speculative_runtime_hooks=lambda stock: spec.SpeculativeRuntimeHooks(
+                post_verify=stock.post_verify, checkpoint_commit=callback
+            )
+        )
+        with (
+            envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True),
+            patch.object(runtime, "megakernel_agree") as agree,
+        ):
+            selected = runtime.bind_speculative_runtime_hooks(model, defaults)
+        self.assertIs(selected.checkpoint_commit, callback)
+        agree.assert_any_call(True, what="checkpoint commit callback presence")
+
+    def test_checkpoint_presence_must_agree_across_ranks(self):
+        model = _model(speculative_runtime_hooks=lambda stock: stock)
+        with (
+            envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True),
+            patch.object(
+                runtime, "_gather_tp", side_effect=lambda value, **_: [value, True]
+            ),
+            self.assertRaisesRegex(RuntimeError, "checkpoint commit callback presence"),
+        ):
+            runtime.bind_speculative_runtime_hooks(model, _defaults())
+
+    def test_checkpoint_callback_rejects_non_callable(self):
+        model = _model(
+            speculative_runtime_hooks=lambda stock: spec.SpeculativeRuntimeHooks(
+                post_verify=stock.post_verify, checkpoint_commit=7
+            )
+        )
+        with (
+            envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True),
+            patch.object(runtime, "megakernel_agree"),
+            self.assertRaisesRegex(TypeError, "checkpoint_commit"),
+        ):
+            runtime.bind_speculative_runtime_hooks(model, _defaults())
+
     def test_switch_off_returns_stock_identity_without_provider_work(self):
         defaults = _defaults()
         model = _model(
@@ -796,7 +837,7 @@ class TestSpeculativeRuntimeHooks(CustomTestCase):
         model = _model(speculative_runtime_hooks=factory)
         with (
             envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True),
-            patch.object(runtime, "_gather_tp", return_value=[True]),
+            patch.object(runtime, "_gather_tp", side_effect=lambda value, **_: [value]),
         ):
             selected = runtime.bind_speculative_runtime_hooks(model, defaults)
         self.assertIs(selected.post_verify.run, defaults.post_verify.run)
