@@ -119,16 +119,6 @@ export const benchmarks = [
         ttft_ms: 509, tpot_ms: 11.13, tokens_per_sec_per_gpu: 1210 },
     ],
   },
-  {
-    match: { hw: "b200", variant: "flash-official", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
-    sglang_version: "dev@07c8f7294",
-    accuracy: { gsm8k_pct: 96.82, aime25_pct: 98.96 },
-  },
-  {
-    match: { hw: "b200", variant: "pro-official", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
-    sglang_version: "dev@07c8f7294",
-    accuracy: { gsm8k_pct: 96.44, aime25_pct: 98.33 },
-  },
   // ====================================================================
   // B300 + FP4
   // ====================================================================
@@ -487,16 +477,6 @@ export const benchmarks = [
   // ====================================================================
   // H200 + FP4
   // ====================================================================
-  {
-    match: { hw: "h200", variant: "flash-official", quant: "fp4", strategy: "low-latency", nodes: "single" },
-    sglang_version: "0.5.16",
-    speed: [
-      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
-        ttft_ms: 308.29, tpot_ms: 1.72, tokens_per_sec_per_gpu: 606 },
-      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16 },
-        ttft_ms: 661.70, tpot_ms: 8.39, tokens_per_sec_per_gpu: 2538 },
-    ],
-  },
   {
     match: { hw: "h200", variant: "flash-official", quant: "fp4", strategy: "balanced", nodes: "single" },
     sglang_version: "0.5.16",

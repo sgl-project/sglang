@@ -52,7 +52,7 @@ import { Deployment } from "/src/snippets/_deployment.jsx";
 import { config }     from "/src/snippets/configs/meta-models/muse-glimmer.jsx";
 import { benchmarks } from "/src/snippets/configs/meta-models/muse-glimmer-benchmarks.jsx";
 
-<Deployment config={config} benchmarks={benchmarks} agenticLink="agentic-long-context-deployment" />
+<Deployment config={config} benchmarks={benchmarks} />
 
 ## Playground
 
@@ -61,55 +61,6 @@ Use the Playground to test SGLang features that are not in the verified matrix. 
 import { Playground } from "/src/snippets/_playground.jsx";
 
 <Playground config={config} />
-
-## Agentic long-context deployment
-
-Use these single-GPU recipes on Linux with NVIDIA CUDA after following the
-[installation steps above](#install). B200 uses the NVFP4 checkpoint; H200 uses BF16
-with the DFlash draft model.
-
-Running requests are capped at 32 on B200 and 20 on H200. Higher client concurrency
-queues requests and increases time to first token. The B200 recipe serves text only.
-
-<Accordion title="B200 TP1 NVFP4">
-
-```bash Launch command
-sglang serve \
-  --model-path RadixArk/Muse-Glimmer-NVFP4 \
-  --tp-size 1 \
-  --cuda-graph-bs-decode 1 2 4 8 12 16 20 24 28 32 \
-  --disable-hybrid-swa-memory \
-  --kv-cache-dtype fp8_e4m3 \
-  --language-model-only \
-  --max-running-requests 32 \
-  --mem-fraction-static 0.85 \
-  --prefill-decode-interval 40 \
-  --swa-full-tokens-ratio 0.8 \
-  --host 0.0.0.0 \
-  --port 30000
-```
-
-</Accordion>
-
-<Accordion title="H200 TP1 BF16 with DFlash">
-
-```bash Launch command
-sglang serve \
-  --model-path meta-models/Muse-Glimmer-30B \
-  --tp-size 1 \
-  --max-running-requests 20 \
-  --mem-fraction-static 0.88 \
-  --swa-full-tokens-ratio 0.4 \
-  --speculative-algorithm DFLASH \
-  --speculative-draft-kv-cache-dtype fp8_e4m3 \
-  --speculative-draft-model-path meta-models/Muse-Glimmer-30B-assistant \
-  --speculative-draft-model-revision c676cce91658f9568aaf264a416211e2782735b7 \
-  --speculative-num-draft-tokens 16 \
-  --host 0.0.0.0 \
-  --port 30000
-```
-
-</Accordion>
 
 ## 1. Model Introduction
 

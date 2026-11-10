@@ -2,19 +2,7 @@
 // Bare match stubs render as pending until speed and accuracy measurements are available.
 export const benchmarks = [
   // NVIDIA FP8, single node.
-  {
-    match: { hw: "h200",  variant: "default", quant: "fp8", strategy: "low-latency",     nodes: "single" },
-    sglang_version: "main @ 20a491d1d311",
-    accuracy: { gsm8k_pct: 97.42 },
-    speed: [
-      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
-        ttft_ms: 780, tpot_ms: 3.71, tokens_per_sec_per_gpu: 252 },
-      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16 },
-        ttft_ms: 5499, tpot_ms: 14.20, tokens_per_sec_per_gpu: 920 },
-    ],
-    notes:
-      "Speed measured under SGLANG_SIMULATE_ACC_LEN=3.5 with the EAGLE 5/1/6 draft (measured accept length 3.496 at concurrency 1, 3.476 at concurrency 16). The pinned accept length makes these throughput-mechanism numbers only, never correctness evidence; the accuracy runs carry no such env.",
-  },
+  { match: { hw: "h200",  variant: "default", quant: "fp8", strategy: "low-latency",     nodes: "single" } },
   {
     match: { hw: "h200",  variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
     sglang_version: "main @ 20a491d1d311",

@@ -54,7 +54,7 @@ import { Deployment } from "/src/snippets/_deployment.jsx";
 import { config }     from "/src/snippets/configs/thinkingmachines/inkling-small.jsx";
 import { benchmarks } from "/src/snippets/configs/thinkingmachines/inkling-small-benchmarks.jsx";
 
-<Deployment config={config} benchmarks={benchmarks} agenticLink="agentic-long-context-deployment" />
+<Deployment config={config} benchmarks={benchmarks} />
 
 <div style={{fontSize: "0.85em", lineHeight: "1.55", color: "#6b7280", margin: "0.5rem 0 1rem 0"}}>
   <p style={{margin: "0 0 0.3rem 0"}}><strong>Panel controls</strong> (top of the command box):</p>
@@ -75,38 +75,6 @@ Lines highlighted **green** are added by your overrides; lines with **red strike
 import { Playground } from "/src/snippets/_playground.jsx";
 
 <Playground config={config} />
-
-## Agentic long-context deployment
-
-Use the B200 TP8 NVFP4 recipe below on one Linux/NVIDIA CUDA node. It matches the
-**Balanced** configuration in the Deploy panel and uses eight GPUs. Follow the
-[installation steps above](#install).
-
-<Accordion title="B200 TP8 NVFP4">
-
-```bash Launch command
-sglang serve \
-  --trust-remote-code \
-  --model-path thinkingmachines/Inkling-Small-NVFP4 \
-  --tp 8 \
-  --quantization modelopt_fp4 \
-  --attention-backend fa4 \
-  --page-size 128 \
-  --fp4-gemm-backend flashinfer_trtllm \
-  --moe-runner-backend flashinfer_trtllm_routed \
-  --enable-torch-symm-mem \
-  --mamba-radix-cache-strategy extra_buffer \
-  --mem-fraction-static 0.85 \
-  --swa-full-tokens-ratio 0.1 \
-  --mamba-full-memory-ratio 0.1 \
-  --enable-multimodal \
-  --reasoning-parser inkling \
-  --tool-call-parser inkling \
-  --host 0.0.0.0 \
-  --port 30000
-```
-
-</Accordion>
 
 ## 1. Model Introduction
 

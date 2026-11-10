@@ -379,7 +379,7 @@ export const config = {
     },
     {
       match: { hw: "h200", variant: "default", quant: "bf16", strategy: "dflash", nodes: "single" },
-      verified: true,
+      verified: false,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
@@ -387,7 +387,12 @@ export const config = {
         "--tool-call-parser muse",
         "--speculative-algorithm DFLASH",
         "--speculative-draft-model-path {{DRAFT_PATH}}",
-        "--mem-fraction-static 0.85",
+        "--speculative-draft-model-revision c676cce91658f9568aaf264a416211e2782735b7",
+        "--speculative-draft-kv-cache-dtype fp8_e4m3",
+        "--speculative-num-draft-tokens 16",
+        "--mem-fraction-static 0.88",
+        "--max-running-requests 20",
+        "--swa-full-tokens-ratio 0.4",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -469,7 +474,7 @@ export const config = {
     },
     {
       match: { hw: "b200", variant: "default", quant: "nvfp4", strategy: "standard", nodes: "single" },
-      verified: true,
+      verified: false,
       env: [],
       flags: [
         "--model-path {{QUANT_PATH}}",
@@ -477,6 +482,11 @@ export const config = {
         "--tool-call-parser muse",
         "--kv-cache-dtype fp8_e4m3",
         "--mem-fraction-static 0.85",
+        "--max-running-requests 32",
+        "--cuda-graph-bs-decode 1 2 4 8 12 16 20 24 28 32",
+        "--disable-hybrid-swa-memory",
+        "--prefill-decode-interval 40",
+        "--swa-full-tokens-ratio 0.8",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],

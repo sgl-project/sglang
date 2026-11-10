@@ -6,18 +6,6 @@ export const benchmarks = [
   // ---- H200 + FP8 ----  (8-GPU single node; serve recipe in glm-5.2.jsx; real weights,
   // --random-range-ratio 1.0, flush-cache every run)
   {
-    // EAGLE MTP 5-1-6, mfs 0.8. env SGLANG_SIMULATE_ACC_LEN=3.5
-    // (match-expected: 50% accept 3 / 50% accept 4) fixes the acceptance length.
-    match: { hw: "h200", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "single" },
-    sglang_version: "v0.5.14 @ 49e384ce",
-    speed: [
-      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
-        ttft_ms: 668, tpot_ms: 5.05, tokens_per_sec_per_gpu: 197 },
-      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16 },
-        ttft_ms: 6148, tpot_ms: 16.11, tokens_per_sec_per_gpu: 813 },
-    ],
-  },
-  {
     // Balanced: DP8 + deepep + mfs 0.85 + chunked-prefill 32768 (÷dp8 = 4096) + max-running 256,
     // 1-1-2 EAGLE. env SGLANG_SIMULATE_ACC_LEN=2 (match-expected: accept 2 of 2 draft tokens).
     match: { hw: "h200", variant: "default", quant: "fp8", strategy: "balanced", nodes: "single" },
@@ -136,16 +124,7 @@ export const benchmarks = [
   // ---- B200 + NVFP4 ----  (8-GPU single node, TP8; nvidia/GLM-5.2-NVFP4 via --quantization modelopt_fp4,
   // flush-cache every run.
   // ttft_ms/tpot_ms are P50; tokens_per_sec_per_gpu = total (in+out) tok/s/GPU (output/GPU × (isl+osl)/osl).
-  // balanced & high-throughput add DP-Attention (dp8); low-latency uses MTP 5-1-6, balanced MTP 2-1-3.)
-  {
-    match: { hw: "b200", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
-    speed: [
-      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 1 },
-        ttft_ms: 295, tpot_ms: 1.85, tokens_per_sec_per_gpu: 527 },
-      { workload: { dataset: "random", isl: 8192, osl: 1024, max_concurrency: 16 },
-        ttft_ms: 2491, tpot_ms: 5.43, tokens_per_sec_per_gpu: 2289 },
-    ],
-  },
+  // balanced & high-throughput add DP-Attention (dp8); balanced uses MTP 2-1-3.)
   {
     match: { hw: "b200", variant: "default", quant: "nvfp4", strategy: "balanced", nodes: "single" },
     speed: [

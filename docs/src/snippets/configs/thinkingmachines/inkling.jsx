@@ -500,11 +500,11 @@ export const config = {
     // MTP (speculative decoding) — Inkling's multi-layer MTP draft head.
     // --enable-multi-layer-eagle is REQUIRED (without it the standard EAGLE
     // worker runs against the multi-layer draft and outputs garbage).
-    // B200 / B300 / GB300 / H200 verified end-to-end.
+    // B300 / GB300 / H200 verified end-to-end.
     // ====================================================================
     {
       match: { hw: "b200", variant: "default", quant: "nvfp4", strategy: "mtp", nodes: "single" },
-      verified: true,
+      verified: false,
       env: [],
       flags: [
         "--trust-remote-code",
@@ -517,7 +517,8 @@ export const config = {
         "--moe-runner-backend flashinfer_trtllm_routed",
         "--enable-torch-symm-mem",
         "--mamba-radix-cache-strategy extra_buffer",
-        "--mem-fraction-static 0.75",
+        "--mem-fraction-static 0.8",
+        "--max-running-requests 24",
         "--swa-full-tokens-ratio 0.1",
         "--mamba-full-memory-ratio 0.1",
         "--enable-multimodal",

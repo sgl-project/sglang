@@ -53,7 +53,7 @@ import { Deployment } from "/src/snippets/_deployment.jsx";
 import { config }     from "/src/snippets/configs/thinkingmachines/inkling.jsx";
 import { benchmarks } from "/src/snippets/configs/thinkingmachines/inkling-benchmarks.jsx";
 
-<Deployment config={config} benchmarks={benchmarks} agenticLink="agentic-long-context-deployment" />
+<Deployment config={config} benchmarks={benchmarks} />
 
 <div style={{fontSize: "0.85em", lineHeight: "1.55", color: "#6b7280", margin: "0.5rem 0 1rem 0"}}>
   <p style={{margin: "0 0 0.3rem 0"}}><strong>Panel controls</strong> (top of the command box):</p>
@@ -74,82 +74,6 @@ Lines highlighted **green** are added by your overrides; lines with **red strike
 import { Playground } from "/src/snippets/_playground.jsx";
 
 <Playground config={config} />
-
-## Agentic long-context deployment
-
-Use these single-node NVFP4 recipes for long-context workloads on Linux with NVIDIA CUDA.
-Follow the [installation steps above](#install). Both commands use eight GPUs, a
-1,048,576-token context window, and EAGLE MTP with eight steps and nine draft tokens.
-
-The B200 recipe caps running requests at 24; additional requests queue. The H200 recipe
-uses Marlin for the NVFP4 checkpoint.
-
-<Accordion title="B200 TP8 NVFP4">
-
-```bash Launch command
-sglang serve \
-  --model-path thinkingmachines/Inkling-NVFP4 \
-  --tp-size 8 \
-  --quantization modelopt_fp4 \
-  --mem-fraction-static 0.8 \
-  --context-length 1048576 \
-  --max-running-requests 24 \
-  --attention-backend fa4 \
-  --enable-multi-layer-eagle \
-  --enable-multimodal \
-  --enable-torch-symm-mem \
-  --fp4-gemm-backend flashinfer_trtllm \
-  --mamba-full-memory-ratio 0.1 \
-  --mamba-radix-cache-strategy extra_buffer \
-  --moe-runner-backend flashinfer_trtllm_routed \
-  --page-size 128 \
-  --reasoning-parser inkling \
-  --speculative-algorithm EAGLE \
-  --speculative-eagle-topk 1 \
-  --speculative-num-draft-tokens 9 \
-  --speculative-num-steps 8 \
-  --speculative-use-rejection-sampling \
-  --swa-full-tokens-ratio 0.1 \
-  --tool-call-parser inkling \
-  --trust-remote-code \
-  --host 0.0.0.0 \
-  --port 30000
-```
-
-</Accordion>
-
-<Accordion title="H200 TP8 NVFP4">
-
-```bash Launch command
-sglang serve \
-  --model-path thinkingmachines/Inkling-NVFP4 \
-  --tp-size 8 \
-  --quantization modelopt_fp4 \
-  --mem-fraction-static 0.78 \
-  --context-length 1048576 \
-  --attention-backend fa4 \
-  --enable-multi-layer-eagle \
-  --enable-multimodal \
-  --enable-torch-symm-mem \
-  --fp4-gemm-backend marlin \
-  --mamba-full-memory-ratio 0.1 \
-  --mamba-radix-cache-strategy extra_buffer \
-  --moe-runner-backend marlin \
-  --page-size 128 \
-  --reasoning-parser inkling \
-  --speculative-algorithm EAGLE \
-  --speculative-eagle-topk 1 \
-  --speculative-num-draft-tokens 9 \
-  --speculative-num-steps 8 \
-  --speculative-use-rejection-sampling \
-  --swa-full-tokens-ratio 0.1 \
-  --tool-call-parser inkling \
-  --trust-remote-code \
-  --host 0.0.0.0 \
-  --port 30000
-```
-
-</Accordion>
 
 ## 1. Model Introduction
 

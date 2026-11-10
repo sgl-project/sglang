@@ -98,7 +98,7 @@ import { Deployment } from "/src/snippets/_deployment.jsx";
 import { config } from "/src/snippets/configs/zai-org/glm-5.3-flash.jsx";
 import { benchmarks } from "/src/snippets/configs/zai-org/glm-5.3-flash-benchmarks.jsx";
 
-<Deployment config={config} benchmarks={benchmarks} agenticLink="agentic-long-context-deployment" />
+<Deployment config={config} benchmarks={benchmarks} />
 
 <Note>
 Generated commands leave `--mamba-full-memory-ratio` at its `0.9` default, which is a generic starting point rather than a workload-tuned split: too low starves the KDA state pool and clamps `max_running_requests`, too high over-provisions it and shrinks the KV pool. Use the repo-local [`compute-mamba-ratio`](https://github.com/sgl-project/sglang/blob/main/.claude/skills/compute-mamba-ratio/SKILL.md) skill to compute the balanced ratio — or the `--max-mamba-cache-size` pin to use instead — from your average request length and the two pool sizes printed in one boot log. See [Size both memory pools](#size-both-memory-pools) for what each pool caps.
@@ -111,50 +111,6 @@ Use the Playground for lower-level tuning such as attention parallelism, MoE com
 import { Playground } from "/src/snippets/_playground.jsx";
 
 <Playground config={config} />
-
-## Agentic long-context deployment
-
-### Single-node performance recipes
-
-Use these configurations for long-context workloads on one Linux/NVIDIA CUDA node.
-Follow the installation instructions above and choose the GPU count and precision below.
-
-<Accordion title="B200 TP4 NVFP4">
-
-```bash Launch command
-sglang serve \
-  --model-path nvidia/GLM-5.3-Flash-NVFP4 \
-  --tp-size 4 \
-  --cuda-graph-max-bs-prefill 8192 \
-  --linear-attn-prefill-backend triton \
-  --mem-fraction-static 0.8 \
-  --prefill-decode-interval 20 \
-  --reasoning-parser glm45 \
-  --tool-call-parser glm47 \
-  --host 0.0.0.0 \
-  --port 30000
-```
-
-</Accordion>
-
-<Accordion title="H200 TP4 FP8">
-
-```bash Launch command
-sglang serve \
-  --model-path zai-org/GLM-5.3-Flash \
-  --tp-size 4 \
-  --chunked-prefill-size 16384 \
-  --cuda-graph-bs-decode 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 36 40 44 48 52 56 60 64 72 80 88 96 104 112 120 \
-  --mamba-full-memory-ratio 0.5 \
-  --mem-fraction-static 0.88 \
-  --prefill-decode-interval 64 \
-  --reasoning-parser glm45 \
-  --tool-call-parser glm47 \
-  --host 0.0.0.0 \
-  --port 30000
-```
-
-</Accordion>
 
 ## 1. Model introduction
 
