@@ -57,12 +57,29 @@ def npu_available() -> bool:
     return _NPU_IMPORT_ERROR is None and shutil.which("npu-smi") is not None
 
 
+def _parse_npu_counts(out: str) -> Tuple[int, int]:
+    """Parse ``npu-smi info -l`` output into ``(npu_count, chip_count)``.
+
+    Driver versions disagree on this listing: some print a ``Chip Count``
+    header, others (e.g. 25.1.rc3) only list one ``NPU ID`` block per device
+    and omit it. Missing headers fall back to counting the listed devices and
+    to one chip per device instead of crashing on ``None``.
+    """
+    total = re.search(r"Total Count\s*:\s*(\d+)", out)
+    chips = re.search(r"Chip Count\s*:\s*(\d+)", out)
+    npu_count = (
+        int(total.group(1))
+        if total is not None
+        else len(re.findall(r"^\s*NPU ID\s*:", out, flags=re.MULTILINE))
+    )
+    chip_count = int(chips.group(1)) if chips is not None else 1
+    return npu_count, chip_count
+
+
 def npu_device_count() -> int:
     if not npu_available():
         return 0
-    out = _npu_smi("info", "-l")
-    npus = int(re.search(r"Total Count\s*:\s*(\d+)", out).group(1))
-    chips = int(re.search(r"Chip Count\s*:\s*(\d+)", out).group(1))
+    npus, chips = _parse_npu_counts(_npu_smi("info", "-l"))
     return npus * chips
 
 
@@ -82,9 +99,13 @@ def _physical_device_id(device: int) -> int:
 
 
 def _npu_smi_card_and_chip(physical_device: int) -> list[str]:
-    """Translate a host device id into npu-smi's card/chip addressing."""
-    out = _npu_smi("info", "-l")
-    chips_per_card = int(re.search(r"Chip Count\s*:\s*(\d+)", out).group(1))
+    """Translate a host device id into npu-smi's card/chip addressing.
+
+    Some drivers (e.g. Ascend 950) do not print ``Chip Count`` and do not
+    accept ``-c``; treat the missing header as one chip per NPU and use the
+    device id directly as the card id.
+    """
+    _, chips_per_card = _parse_npu_counts(_npu_smi("info", "-l"))
     if chips_per_card <= 1:
         return ["-i", str(physical_device)]
     return [
