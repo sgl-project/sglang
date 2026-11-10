@@ -1,5 +1,6 @@
 import unittest
 
+from sglang.test.ascend.e2e.test_npu_multi_node_utils import NIC_NAME
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
     BENCHMARK_TOOL_DEFAULT,
     GLM_5_2_W8A8C8_MXFP8_MODEL_PATH,
@@ -33,7 +34,8 @@ GLM_5_2_W8A8C8_MXFP8_ENVS = {
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
     "TRANSFORMERS_VERBOSITY": "error",
     "HCCL_HOST_SOCKET_PORT_RANGE": "auto",
-    "GLOO_SOCKET_IFNAME": "data0.173",
+    "HCCL_SOCKET_IFNAME": NIC_NAME,
+    "GLOO_SOCKET_IFNAME": NIC_NAME,
 }
 
 GLM_5_2_W8A8C8_MXFP8_OTHER_ARGS = [
