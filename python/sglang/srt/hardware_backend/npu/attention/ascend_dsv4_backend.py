@@ -2750,12 +2750,13 @@ class DeepseekV4AscendAttnBackend(
             (max_bs, max_pages), -1, dtype=torch.int32, device=device
         )
 
-        self.graph_metadata["c4_page_table"] = torch.full(
-            (max_bs, max_pages), -1, dtype=torch.int32, device=device
-        )
-        self.graph_metadata["c128_page_table"] = torch.full(
-            (max_bs, max_pages), -1, dtype=torch.int32, device=device
-        )
+        if self._dsv4_has_c4:
+            self.graph_metadata["c4_page_table"] = torch.full(
+                (max_bs, max_pages), -1, dtype=torch.int32, device=device
+            )
+            self.graph_metadata["c128_page_table"] = torch.full(
+                (max_bs, max_pages), -1, dtype=torch.int32, device=device
+            )
 
         # V4.1 low-ratio indexer page tables: the FULL table expanded to the
         # index pool's page granularity (full page p -> index pages
@@ -2781,23 +2782,25 @@ class DeepseekV4AscendAttnBackend(
                     device=device,
                 )
 
-        # 1024 int32 per kernel-metadata buffer (fixed op metadata size)
-        for key in (
-            "kernel_metadata_c1a",
-            "kernel_metadata_c4a",
-            "kernel_metadata_c128a",
-            "kernel_metadata_li_quant",
-        ):
-            self.graph_metadata[key] = torch.zeros(
-                1024, dtype=torch.int32, device=device
-            )
+        # 1024 int32 per kernel-metadata buffer (fixed op metadata size);
+        # c1a/c4a/c128a/li_quant serve the V4 kernels only.
+        if self._dsv4_has_c4:
+            for key in (
+                "kernel_metadata_c1a",
+                "kernel_metadata_c4a",
+                "kernel_metadata_c128a",
+                "kernel_metadata_li_quant",
+            ):
+                self.graph_metadata[key] = torch.zeros(
+                    1024, dtype=torch.int32, device=device
+                )
 
-        self.graph_metadata["c4_topk_indices"] = torch.full(
-            (max_num_tokens, self._dsv4_index_topk),
-            -1,
-            dtype=torch.int32,
-            device=device,
-        )
+            self.graph_metadata["c4_topk_indices"] = torch.full(
+                (max_num_tokens, self._dsv4_index_topk),
+                -1,
+                dtype=torch.int32,
+                device=device,
+            )
 
         if self._is_dspark_draft_worker:
             block_size = self._dsv4_graph_tokens_per_req
@@ -2889,14 +2892,7 @@ class DeepseekV4AscendAttnBackend(
         )
 
         metadata.swa_page_table = self.graph_metadata["swa_page_table"][:bs, :]
-        metadata.c4_page_table = self.graph_metadata["c4_page_table"][:bs, :]
-        metadata.c128_page_table = self.graph_metadata["c128_page_table"][:bs, :]
-
-        c4_pad = min(n_tok, n_tok // 4 + bs)
-        c128_pad = min(n_tok, n_tok // 128 + bs)
         metadata.swa_loc = torch.zeros(n_tok, dtype=torch.int64, device=device)
-        metadata.c4_loc = torch.zeros(c4_pad, dtype=torch.int64, device=device)
-        metadata.c128_loc = torch.zeros(c128_pad, dtype=torch.int64, device=device)
         metadata.dsv4_max_input_capacity = tokens_per_req
         if is_npu_arch35():
             metadata.dsv4_cycle_state_block_table = torch.zeros(
@@ -2922,33 +2918,47 @@ class DeepseekV4AscendAttnBackend(
                 for ratio, state_pool in self._dsv4_state_pools_by_ratio.items()
             }
 
-        metadata.positions_cmp_padding_c4 = torch.zeros(
-            c4_pad, dtype=torch.int64, device=device
-        )
-        metadata.positions_cmp_padding_c128 = torch.zeros(
-            c128_pad, dtype=torch.int64, device=device
-        )
         metadata.start_pos = torch.zeros(bs, dtype=torch.int32, device=device)
         metadata.seqused = torch.zeros(bs, dtype=torch.int32, device=device)
-        # The live-row mask the captured graphs read; filled per replay by
-        # _refresh_graph_seq_metadata (never traced inside the graph).
-        metadata.dsv41_live_mask_buf = torch.zeros(
-            bs * tokens_per_req, dtype=torch.bool, device=device
-        )
-
-        metadata.kernel_metadata = {
-            "c1a_metadata": self.graph_metadata["kernel_metadata_c1a"],
-            "c4a_metadata": self.graph_metadata["kernel_metadata_c4a"],
-            "c128a_metadata": self.graph_metadata["kernel_metadata_c128a"],
-            "li_quant_metadata": self.graph_metadata["kernel_metadata_li_quant"],
-        }
-
-        if self._dsv4_has_low_ratio:
-            # V4.1: MQSMLA/QLI dispatch tables plus window/topk-length buffers.
-            self._init_dsv41_graph_metadata(metadata, bs, tokens_per_req, device)
+        metadata.kernel_metadata = {}
 
         T = n_tok
-        metadata.c4_topk_indices = self.graph_metadata["c4_topk_indices"][:T, :]
+        if self._dsv4_has_c4:
+            c4_pad = min(n_tok, n_tok // 4 + bs)
+            c128_pad = min(n_tok, n_tok // 128 + bs)
+            metadata.c4_page_table = self.graph_metadata["c4_page_table"][:bs, :]
+            metadata.c128_page_table = self.graph_metadata["c128_page_table"][:bs, :]
+            metadata.c4_loc = torch.zeros(c4_pad, dtype=torch.int64, device=device)
+            metadata.c128_loc = torch.zeros(
+                c128_pad, dtype=torch.int64, device=device
+            )
+            metadata.positions_cmp_padding_c4 = torch.zeros(
+                c4_pad, dtype=torch.int64, device=device
+            )
+            metadata.positions_cmp_padding_c128 = torch.zeros(
+                c128_pad, dtype=torch.int64, device=device
+            )
+            # c1a/c4a/c128a/li_quant are the V4 kernels' metadata buffers only.
+            metadata.kernel_metadata.update(
+                {
+                    "c1a_metadata": self.graph_metadata["kernel_metadata_c1a"],
+                    "c4a_metadata": self.graph_metadata["kernel_metadata_c4a"],
+                    "c128a_metadata": self.graph_metadata["kernel_metadata_c128a"],
+                    "li_quant_metadata": self.graph_metadata[
+                        "kernel_metadata_li_quant"
+                    ],
+                }
+            )
+            metadata.c4_topk_indices = self.graph_metadata["c4_topk_indices"][:T, :]
+
+        if self._dsv4_has_low_ratio:
+            # The live-row mask the captured graphs read; filled per replay by
+            # _refresh_graph_seq_metadata (never traced inside the graph).
+            metadata.dsv41_live_mask_buf = torch.zeros(
+                bs * tokens_per_req, dtype=torch.bool, device=device
+            )
+            # V4.1: MQSMLA/QLI dispatch tables plus window/topk-length buffers.
+            self._init_dsv41_graph_metadata(metadata, bs, tokens_per_req, device)
 
         metadata.ori_sparse_indices = None
         metadata.ori_win_left = self._dsv4_sliding_window_size - 1
