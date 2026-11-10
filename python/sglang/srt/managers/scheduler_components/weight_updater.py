@@ -465,9 +465,15 @@ class SchedulerWeightUpdaterManager:
 
     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
         scheduler = self.scheduler
-        assert self.is_fully_idle(
-            ignore_waiting=scheduler is not None and scheduler._engine_paused
-        ), "release_memory_occupation should be called only when server is idle."
+        if not self.is_fully_idle(
+            ignore_waiting=scheduler is not None and scheduler.pause_state.paused
+        ):
+            return ReleaseMemoryOccupationReqOutput(
+                success=False,
+                message="Memory was not released because requests are still "
+                "running or queued. Finish them, or pause generation in retract "
+                "mode, then retry.",
+            )
 
         tags = recv_req.tags
 
@@ -492,6 +498,7 @@ class SchedulerWeightUpdaterManager:
                     if queue is not None:
                         queue.release_memory_occupation()
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_KV_CACHE)
+            # Cannot be refused: its idle gate is the check at the top.
             self.flush_cache()
 
         if GPU_MEMORY_TYPE_WEIGHTS in tags:
@@ -507,7 +514,7 @@ class SchedulerWeightUpdaterManager:
 
         torch.get_device_module().synchronize()
 
-        return ReleaseMemoryOccupationReqOutput()
+        return ReleaseMemoryOccupationReqOutput(success=True, message="Success")
 
     def resume_memory_occupation(self, recv_req: ResumeMemoryOccupationReqInput):
         tags = recv_req.tags

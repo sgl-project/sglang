@@ -13,11 +13,12 @@ from typing import TYPE_CHECKING, Dict, List, Optional
 
 import torch
 
-from sglang.srt.mem_cache.kv.router import STATE_PART, KVLayerRouter
+from sglang.srt.mem_cache.kv.decl import STATE_PART
 from sglang.srt.utils.device import async_h2d
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.mem_cache.kv.router import KVLayerRouter
 
 
 class StateSlotsExhausted(RuntimeError):
@@ -96,6 +97,13 @@ class StateStorage:
 
     # -- slot lifecycle --
 
+    def fresh_request_slots(self, table) -> int:
+        """Slots acquire allocates for a request that holds no state yet: its
+        working slot and, with extra buffers, its initial tracking slots."""
+        return 1 + (
+            table.mamba_initial_tracking_slots if table.enable_mamba_extra_buffer else 0
+        )
+
     def pending_request_slots(self, table, req: Req) -> int:
         """Slots acquire will allocate for this request's working/tracking state."""
         return int(not req.kv.holds_mamba) + (
@@ -103,6 +111,21 @@ class StateStorage:
             if table.enable_mamba_extra_buffer
             and req.kv.mamba_ping_pong_track_buffer is None
             else 0
+        )
+
+    def held_request_slots(self, table, req: Req) -> int:
+        """Slots the request holds before acquire: its working and tracking
+        slots once taken, and the cached checkpoint its working copy is made
+        from; with `pending_request_slots`, every slot it occupies once acquired."""
+        return (
+            int(req.kv.holds_mamba)
+            + (
+                table.mamba_initial_tracking_slots
+                if table.enable_mamba_extra_buffer
+                and req.kv.mamba_ping_pong_track_buffer is not None
+                else 0
+            )
+            + int(req.kv.mamba_cow_src_index is not None)
         )
 
     def acquire(
@@ -119,6 +142,10 @@ class StateStorage:
         the table's columns. A request that already holds a slot (a radix hit,
         a continuing chunk) keeps it. ``fresh_rows`` marks rows the requests
         did not hold before: their speculative ReplaySSM cursors restart."""
+        # FIXME: these cursor resets run on the schedule stream when a row is
+        # reused, while the forward of the row's previous request may still be
+        # running and advancing the same cursors (the write-after-read barrier
+        # orders only shared reads). Order the reset after that forward.
         spec_write_pos = self.pool.replayssm_spec_write_pos
         if spec_write_pos is not None and reset_request_parts:
             fresh_indices = [idx for idx, fresh in zip(rows, fresh_rows) if fresh]
