@@ -169,7 +169,9 @@ impl TokenizerRegistry {
             .ok();
         match ChatFormatter::load_from(&m.id, &files) {
             Ok(Some(formatter)) => {
-                let formatter = formatter.with_defaults(&m.default_chat_template_kwargs);
+                let formatter = formatter
+                    .with_defaults(&m.default_chat_template_kwargs)
+                    .with_prompt_affixes(me.prompt_affixes.as_ref());
                 me.chat_model.always_thinks = formatter.always_thinks();
                 me.chat_model.reasoning_toggle =
                     formatter
@@ -205,8 +207,9 @@ impl TokenizerRegistry {
                      and SGLANG_DSV4_REASONING_EFFORT or SGLANG_DSV41_REASONING_EFFORT"),
                 ForwardingScope::Guarded => tracing::warn!(model = %m.id,
                     "UNVERIFIED input_ids forwarding: router rendering is verified against SGLang only \
-                     for DeepSeek-V4, V4.1, GLM-5.3, Kimi-K3 and Qwen3.8, so this model forwards only guarded shapes (plain text \
-                     chat). Requires the workers' model files and --default-chat-template-kwargs; \
+                     for DeepSeek-V4, V4.1, GLM-5.3, Kimi-K3, MiniMax-M3, Qwen3.8 and StepFun, so this \
+                     model forwards only guarded shapes (plain text chat). Requires the workers' \
+                     model files and --default-chat-template-kwargs; \
                      worker parser overrides, content-format detection, and conversation-template stop \
                      strings are not replicated. Pass --disable-input-ids-forwarding unless you have \
                      verified parity for this model"),
