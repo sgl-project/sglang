@@ -341,20 +341,14 @@ class Natten3D(nn.Module):
             )
             packed = qkv if qkv.is_contiguous() else qkv.contiguous()
             if can_use_flux3_video_qknorm_rope(packed, cos, sin):
-                try:
-                    out = flux3_video_qknorm_rope(packed, cos, sin, eps=self.q_norm.eps)
-                except Exception as exc:
-                    _VIDEO_QKV_GATE.on_exception(exc, logger=logger)
-                else:
-                    if _VIDEO_QKV_GATE.verified:
-                        return out
-                    ref_q, ref_k, ref_v = self._eager_qkv(qkv, temporal_offset)
-                    return _VIDEO_QKV_GATE.accept_or_fallback(
-                        out,
-                        (ref_q, ref_k, ref_v),
-                        equal=tensors_equal,
-                        logger=logger,
-                    )
+                return _VIDEO_QKV_GATE.run(
+                    lambda: flux3_video_qknorm_rope(
+                        packed, cos, sin, eps=self.q_norm.eps
+                    ),
+                    lambda: self._eager_qkv(qkv, temporal_offset),
+                    equal=tensors_equal,
+                    logger=logger,
+                )
         return self._eager_qkv(qkv, temporal_offset)
 
     def _eager_qkv(

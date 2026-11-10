@@ -272,7 +272,7 @@ struct TopkNormal {
  *
  * Whether a launch belongs here -- small batch, long rows, bf16 -- is decided
  * in Python, which also picks the cluster size: 8 CTAs on SM90, 16 on
- * SM100/SM103, where 16 needs the non-portable cluster attribute.
+ * SM100/SM103/SM107, where 16 needs the non-portable cluster attribute.
  */
 template <typename Config>
 struct TopkCluster {

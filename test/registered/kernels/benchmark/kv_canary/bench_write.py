@@ -31,7 +31,7 @@ from sglang.kernels.ops.kv_canary.write import WritePlan, launch_canary_write_ke
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
-    est_time=20, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
+    est_time=20, stage="base-b-kernel-benchmark", runner_config="1-gpu-small"
 )
 # AMD mirrors the CUDA nightly registration (nightly-only, no per-PR suite).
 # Note: amd_ci_exec.sh sets SGLANG_IS_IN_CI, so this runs the CI-reduced range

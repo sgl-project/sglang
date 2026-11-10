@@ -161,6 +161,16 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                 f"got '{cfg.disaggregation_transfer_backend}'."
             )
 
+        if cfg.disaggregation_enable_kv_checksum:
+            from sglang.srt.configs.model_config import is_deepseek_v4
+
+            if is_deepseek_v4(model_config_of(server_args).hf_config):
+                raise ValueError(
+                    "--disaggregation-enable-kv-checksum does not support "
+                    "DeepSeek-V4 yet: the checksum has no per-request state "
+                    "indices for its KV pool."
+                )
+
         # Reject features whose role-specific state is not rebuilt on a flip.
         if cfg.enable_pd_role_switch:
             view = resolved_view(server_args)
@@ -364,6 +374,7 @@ def handle_encoder_disaggregation(server_args: Any):
         "KimiVLForConditionalGeneration",
         "KimiK25ForConditionalGeneration",
         "KimiK3ForConditionalGeneration",
+        "KimiK31ForConditionalGeneration",
         "MiMoV2ForCausalLM",
         "Glm5NextForConditionalGeneration",
         "MiniMaxM3SparseForConditionalGeneration",
