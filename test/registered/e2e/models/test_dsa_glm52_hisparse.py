@@ -8,6 +8,7 @@ from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.kl_test_utils import get_input_ids
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
+    assert_process_healthy,
 )
 
 register_cuda_ci(
@@ -67,7 +68,15 @@ class TestGLM52PDHiSparseSpec(PDDisaggregationServerBase, GSM8KMixin):
         "--enable-hisparse",
         "--hisparse-config",
         '{"top_k": 2048, "device_buffer_size": 4096, "host_to_device_ratio": 5}',
+        "--enable-metrics",
     ]
+    # Force retraction on decode: HiSparse keeps no host copy of a request's
+    # KV, so each one resumes by rebootstrap. The interval of 20 passes is
+    # arbitrary, sparse enough to keep the run short.
+    extra_decode_env = {
+        "SGLANG_TEST_RETRACT": "1",
+        "SGLANG_TEST_RETRACT_INTERVAL": "20",
+    }
 
     # Reuse the NVFP4 accuracy floor from test_dsa_glm52_pd_mtp_cp_layersplit.py.
     gsm8k_accuracy_thres = 0.935
@@ -93,6 +102,14 @@ class TestGLM52PDHiSparseSpec(PDDisaggregationServerBase, GSM8KMixin):
                 self.assertGreater(
                     state["avg_spec_accept_length"], self.gsm8k_accept_length_thres
                 )
+        assert_process_healthy(self, "decode", self.process_decode, self.decode_url)
+        metrics = requests.get(self.decode_url + "/metrics", timeout=30).text
+        retracted = sum(
+            float(line.rsplit(" ", 1)[1])
+            for line in metrics.splitlines()
+            if line.startswith("sglang:num_retracted_requests_total")
+        )
+        self.assertGreater(retracted, 0, "decode never retracted a request")
 
     def test_long_context_spec_swap(self):
         self._test_long_context_spec_swap(temperature=0)
