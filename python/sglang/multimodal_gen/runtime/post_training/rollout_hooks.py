@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Rollout hooks for denoise loops.
 
-A loop calls ``prepare_rollout_if_enabled`` before SP sharding,
-``init_rollout_env_if_enabled`` at the loop start and
-``finalize_rollout_if_enabled`` at the loop end, and passes
-``**rollout_step_kwargs(batch)`` to ``scheduler.step``. Every hook is a no-op for
-serving requests.
+A loop calls ``prepare_rollout_if_enabled`` then ``set_rollout_early_stop_if_enabled``
+before SP sharding and before reading ``batch.timesteps``, calls
+``init_rollout_env_if_enabled`` at the loop start and ``finalize_rollout_if_enabled``
+at the loop end, and passes ``**rollout_step_kwargs(batch)`` to ``scheduler.step``.
+Every hook is a no-op for serving requests.
 """
 
 from __future__ import annotations
@@ -87,6 +87,8 @@ def _build_scheduler_rollout_controller(
             stacked_latents=stacked_latents,
         ),
         sigmas=scheduler.sigmas,
+        # what the loop iterates; Krea-2 publishes raw sigmas, not scheduler.timesteps
+        timesteps=batch.timesteps,
         latents_shape=tuple(batch.latents.shape),
     )
     return current_rollout_controller
@@ -102,25 +104,35 @@ def prepare_rollout_if_enabled(
 ) -> None:
     """Create the rollout controller of the visual stream of this request.
 
-    Must run before SP sharding so the controller records the full latent shape.
-    ``build_controller(batch=, pipeline_config=)`` returns it; a loop without a
-    scheduler passes its own.
+    Placement: in the loop's preparation, after the timestep stage has published
+    ``batch.timesteps`` and ``batch.scheduler`` and before SP sharding, so the
+    controller records the full latent shape; ``set_rollout_early_stop_if_enabled``
+    follows it directly. ``build_controller(batch=, pipeline_config=)`` returns
+    the controller; a loop without a scheduler passes its own.
     """
     if not batch.rollout:
         return
     current_rollout_controller = build_controller(
         batch=batch, pipeline_config=pipeline_config
     )
-    stop_step_index = batch.rollout_stop_step_index
-    if (
-        stop_step_index is not None
-        and len(current_rollout_controller.sigmas) != stop_step_index + 2
-    ):
-        raise ValueError(
-            "rollout_stop_step_index is set, but this pipeline's timestep stage "
-            "did not stop the schedule at that step"
-        )
     batch.rollout_controllers = {VISUAL_STREAM: current_rollout_controller}
+
+
+def set_rollout_early_stop_if_enabled(*, batch: Req) -> None:
+    """Cut this request's schedule to steps 0..``rollout_stop_step_index``: the
+    controller keeps the cut grid for its transitions and ``batch.timesteps``
+    becomes what the loop iterates. No-op without a rollout or without a stop.
+
+    Placement: directly after ``prepare_rollout_if_enabled`` and before the loop
+    reads ``batch.timesteps`` or derives anything from it: the step count for
+    warmup, cache-dit or the progress bar, a second stream's scheduler clone
+    (see the LTX-2 audio scheduler). Anything read earlier sees the full grid.
+    """
+    if not batch.rollout or batch.rollout_stop_step_index is None:
+        return
+    current_rollout_controller = batch.rollout_controllers[VISUAL_STREAM]
+    current_rollout_controller.stop_at(batch.rollout_stop_step_index)
+    batch.timesteps = current_rollout_controller.timesteps
 
 
 def init_rollout_env_if_enabled(
@@ -180,6 +192,13 @@ def finalize_rollout_if_enabled(
     if not batch.rollout:
         return
     current_rollout_controller = batch.rollout_controllers[VISUAL_STREAM]
+    num_schedule_steps = len(current_rollout_controller.timesteps)
+    if num_inference_steps != num_schedule_steps:
+        raise ValueError(
+            f"the denoising loop ran {num_inference_steps} steps but the rollout "
+            f"schedule has {num_schedule_steps}; a rollout loop must iterate the "
+            "controller's timesteps"
+        )
     if batch.rollout_trajectory_data is None:
         batch.rollout_trajectory_data = RolloutTrajectoryData()
     batch.rollout_trajectory_data.rollout_log_probs = (

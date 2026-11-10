@@ -133,7 +133,7 @@ class MiniMaxH3TimestepPreparationStage(PipelineStage):
 
     @staticmethod
     def _truncate_rollout_schedule(batch: Req) -> None:
-        from sglang.multimodal_gen.runtime.post_training.rollout_scheduler import (
+        from sglang.multimodal_gen.runtime.post_training.flow_rollout_controller import (
             truncate_rollout_sigmas,
         )
 
