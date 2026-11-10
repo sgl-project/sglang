@@ -914,9 +914,6 @@ at::Tensor fused_experts_cpu(
       !is_int_quant || act_func == CPUActMethod::silu_and_mul,
       "fused_experts_cpu: INT8_W8A8 and INT4_W4A8 support activation='silu' only, got: ",
       activation.value_or("silu"));
-  TORCH_CHECK(
-      !is_relu2 || moe_comp_method == CPUQuantMethod::BF16,
-      "fused_experts_cpu: activation='relu2' currently supports only unquantized BF16 path");
 
   auto packed_w1 = is_vnni ? w1 : convert_weight_packed(w1);
   auto packed_w2 = is_vnni ? w2 : convert_weight_packed(w2);
