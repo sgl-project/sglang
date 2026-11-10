@@ -569,11 +569,27 @@ class SchedulerMetricsReporter:
         #     MLP together. These vocabularies never contain "mlp"/"moe" at
         #     all, so detect the convention by that and fall back to
         #     "every layer pays the FFN cost" instead of silently zeroing it.
+        # `layers_block_type`'s vocabulary is not standardized across hybrid
+        # configs. NemotronH and Jamba/Bamba use sglang's/transformers' own
+        # exclusive {"mamba", "attention", "mlp", "moe"} labels (Jamba/Bamba
+        # never emit "mlp"/"moe" since the FFN is bundled into every mixer
+        # layer -- see has_dedicated_ffn_layers below). But Qwen3-Next/
+        # Qwen3.5, GigaChat3.5, and BailingHybrid's own layers_block_type
+        # returns "full_attention"/"linear_attention" instead -- counting
+        # "attention" against that vocabulary silently finds zero real
+        # attention layers while the generic "not mamba/mlp/moe" fallback
+        # would overcount by treating every linear_attention layer as full
+        # attention too. Only trust literal label-counting when the
+        # vocabulary is actually a subset of the exclusive convention;
+        # otherwise fall back to full_attention_layer_ids, which each of
+        # those config classes computes correctly for its own semantics.
         layers_block_type = getattr(hf_text_config, "layers_block_type", None)
-        if layers_block_type:
-            num_attn_layers = float(
-                sum(1 for t in layers_block_type if t not in ("mamba", "mlp", "moe"))
-            )
+        _EXCLUSIVE_HYBRID_BLOCK_TYPES = {"mamba", "attention", "mlp", "moe"}
+        if (
+            layers_block_type
+            and set(layers_block_type) <= _EXCLUSIVE_HYBRID_BLOCK_TYPES
+        ):
+            num_attn_layers = float(layers_block_type.count("attention"))
             has_dedicated_ffn_layers = any(
                 t in ("mlp", "moe") for t in layers_block_type
             )
@@ -732,27 +748,36 @@ class SchedulerMetricsReporter:
             + mlp_weight_elems_per_layer * w_bytes * num_mlp_layers
         )
 
-        # Activation movement bytes per token (coarse approximation).
+        # Activation movement bytes per token (coarse approximation). The
+        # qkv/attention terms scale with the attention layer count; the FFN
+        # term scales with the MLP layer count -- same split as the weight-
+        # read/KV-cache bytes above, not the unsplit total layer count.
         self._qkv_act_bytes_per_token = (
-            hidden_size * act_bytes * num_layers
-            + (num_attn_heads + 2.0 * num_kv_heads) * head_dim * act_bytes * num_layers
-            + head_dim * num_attn_heads * act_bytes * num_layers
-            + hidden_size * act_bytes * num_layers
+            hidden_size * act_bytes * num_attn_layers
+            + (num_attn_heads + 2.0 * num_kv_heads)
+            * head_dim
+            * act_bytes
+            * num_attn_layers
+            + head_dim * num_attn_heads * act_bytes * num_attn_layers
+            + hidden_size * act_bytes * num_attn_layers
         )
         self._ffn_act_bytes_per_token = (
-            3.0 * intermediate_size * act_bytes * num_layers
+            3.0 * intermediate_size * act_bytes * num_mlp_layers
             if intermediate_size > 0
             else 0.0
         )
 
         # Prefill reads Q/K/V activations from on-device memory.
         self._prefill_attn_act_read_per_token = (
-            (num_attn_heads + 2.0 * num_kv_heads) * head_dim * act_bytes * num_layers
+            (num_attn_heads + 2.0 * num_kv_heads)
+            * head_dim
+            * act_bytes
+            * num_attn_layers
         )
 
         # Decode reads Q from activation memory; K/V reads are from KV cache.
         self._decode_q_read_bytes_per_token = (
-            num_attn_heads * head_dim * act_bytes * num_layers
+            num_attn_heads * head_dim * act_bytes * num_attn_layers
         )
 
     def _estimate_prefill_perf(self, batch) -> Tuple[float, float, float]:
