@@ -1269,6 +1269,10 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
 class HybridLinearAttnBackend(AttentionBackend):
     """Manages a full and linear attention backend"""
 
+    def window_capacity_children(self) -> list:
+        # Window layers attend through the full-attention child only.
+        return [self.full_attn_backend]
+
     def __init__(
         self,
         full_attn_backend: AttentionBackend,

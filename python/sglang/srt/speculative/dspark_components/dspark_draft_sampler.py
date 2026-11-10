@@ -1,13 +1,20 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import Optional
 
 import torch
 
+from sglang.kernels.ops.speculative.dspark.markov_walk import MAX_BS, MarkovWalker
 from sglang.srt.environ import envs
+from sglang.srt.kernel_plugins.nvidia.binding import megakernel_draft_sampler
 from sglang.srt.kernel_plugins.nvidia.dspark_binding import (
     bind_dspark_draft_strategy,
+)
+from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from sglang.srt.speculative.dspark_components.dspark_block_accept_estimator import (
+    block_accept_estimate_enabled,
 )
 from sglang.srt.speculative.dspark_components.dspark_draft import (
     DraftNoise,
@@ -17,7 +24,7 @@ from sglang.srt.speculative.dspark_components.dspark_draft import (
     select_draft_hidden_without_anchor,
     step_logits_width,
 )
-from sglang.srt.speculative.spec_tp_sync import SpecTpSync
+from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.srt.utils import is_xpu
 
 logger = logging.getLogger(__name__)
@@ -42,6 +49,7 @@ class DsparkDraftSampler:
         greedy_draft: bool,
         sharded_accept: bool = False,
         out=None,
+        markov_walker: Optional[MarkovWalker] = None,
     ):
         self.model = model
         self.markov_head = model.markov_head
@@ -112,6 +120,27 @@ class DsparkDraftSampler:
         )
         self._draft_strategy = bound_strategy.strategy
         self.step_logits = bound_strategy.step_logits
+        self._markov_walker = markov_walker
+        # With the int8 walker: step temperatures are 0 from this row on.
+        self._staged_bs = 0
+        if markov_walker is not None:
+            self._init_markov_walker(markov_walker)
+
+    def _init_markov_walker(self, walker: MarkovWalker) -> None:
+        assert walker.gamma == self.gamma, (walker.gamma, self.gamma)
+        if not self.greedy_draft:
+            # The kernel writes bf16 logits and leaves temperature-0 rows' unwritten; a
+            # mixed accept still reads them.
+            self.step_logits = torch.zeros(
+                (self.max_bs, self.gamma, walker.vocab),
+                dtype=torch.bfloat16,
+                device=self.out.device,
+            )
+        self.markov_head._derived_weight_cache_error = (
+            "Online weight updates are not supported with "
+            "SGLANG_DSPARK_OPT_INT8_MARKOV_WALK: the draft walks an int8 copy of the "
+            "markov head made at startup."
+        )
 
     def _step_logits(self, base_logits: torch.Tensor) -> torch.Tensor:
         if self.step_logits is None:
@@ -134,6 +163,12 @@ class DsparkDraftSampler:
     def stage_sampling_params(self, *, bs: int, sampling_info) -> None:
         """Must run before the draft graph replay that reads these buffers."""
         resolve_draft_params(sampling_info=sampling_info, bs=bs, out=self.params)
+        if self._markov_walker is not None:
+            # The graph walks the padded bucket but staging writes [:bs]; the int8
+            # kernel would sample a stale T > 0 padding row for nothing.
+            if self._staged_bs > bs:
+                self.params.step_temperatures[bs : self._staged_bs].zero_()
+            self._staged_bs = bs
 
     def __call__(self, hidden_states, input_ids):
         bs = hidden_states.shape[0] // self.query_token_num
@@ -172,6 +207,19 @@ class DsparkDraftSampler:
     def _markov_block(self, model_hidden, sample_hidden, anchor, bs: int):
         base_logits, confidence_features = self.model.compute_base_logits(model_hidden)
         base_logits = base_logits.view(bs, self.gamma, -1)
+        # bs is the padded graph bucket, a Python int: fixed per captured graph.
+        if self._markov_walker is not None and self._markov_walker.supports(bs):
+            draft_tokens = self._markov_walker.walk(
+                base_logits=base_logits,
+                anchor=anchor,
+                temps=None if self.greedy_draft else self.params.step_temperatures[:bs],
+                tokens_out=self.out[: bs * self.gamma],
+                corrected_out=None if self.greedy_draft else self.step_logits[:bs],
+            )
+            # Every rank walks all the steps; rank 0's tokens are kept, as after each
+            # step of the default walk.
+            draft_tokens = self._tp_sync.sync(SpecTpSyncSite.DSPARK_DRAFT, draft_tokens)
+            return draft_tokens, confidence_features
         draft_tokens, _ = draft_markov_block(
             markov_head=self.markov_head,
             base_logits=base_logits,
@@ -222,6 +270,17 @@ def maybe_build_draft_sampler(
         return _eager("gamma<=0")
     if draft_model.markov_head is None:
         return _eager("no markov head")
+    markov_walker = None
+    if envs.SGLANG_DSPARK_OPT_INT8_MARKOV_WALK.get():
+        markov_walker = _build_int8_markov_walker(
+            draft_model=draft_model,
+            gamma=gamma,
+            max_bs=min(max_bs, MAX_BS),
+            device=device,
+            seed=noise.key,
+            megakernel=megakernel_draft_sampler(draft_model) is not None,
+            tp_rank=tp_rank,
+        )
     sampler = DsparkDraftSampler(
         model=draft_model,
         gamma=gamma,
@@ -232,6 +291,7 @@ def maybe_build_draft_sampler(
         greedy_draft=greedy_draft,
         sharded_accept=sharded_accept,
         out=out,
+        markov_walker=markov_walker,
     )
     if tp_rank == 0:
         logger.info(
@@ -240,3 +300,71 @@ def maybe_build_draft_sampler(
             sampler._draft_strategy.log_suffix,
         )
     return sampler
+
+
+def _int8_markov_walk_unsupported_reason(
+    *, draft_model, megakernel: bool
+) -> Optional[str]:
+    """None when the int8 kernel computes this drafter's default walk, up to the
+    int8 weights and bf16 rounding; MarkovWalker checks the GPU, rank and gamma."""
+    if megakernel:
+        return "the NVIDIA megakernel plugin runs the draft sampler"
+    if block_accept_estimate_enabled():
+        return "the block-accept estimator reads greedy rows' step logits"
+    head = draft_model.markov_head
+    if head.vocab_shard is not None:
+        return "markov_w2 is vocab-sharded over the TP ranks"
+    # The fused greedy step's test: the bias is exactly W2 W1[prev].
+    if head.greedy_w2_weight() is None:
+        return f"the {type(head).__name__} bias is not the markov_w2 GEMV"
+    lm_head = draft_model.lm_head
+    if not isinstance(lm_head, VocabParallelEmbedding):
+        return f"lm_head is {type(lm_head).__name__}"
+    vocab = int(lm_head.org_vocab_size)
+    if head.vocab_size != vocab:
+        return f"markov vocab {head.vocab_size} != lm_head vocab {vocab}"
+    if lm_head.num_embeddings_padded != vocab:
+        # The kernel reads base logits with row stride V, not a cropped slice.
+        return f"lm_head vocab is padded to {lm_head.num_embeddings_padded}"
+    if lm_head.weight.dtype != torch.bfloat16:
+        return f"lm_head is {lm_head.weight.dtype}, the kernel reads bf16 base logits"
+    return None
+
+
+def _build_int8_markov_walker(
+    *,
+    draft_model,
+    gamma: int,
+    max_bs: int,
+    device,
+    seed: int,
+    megakernel: bool,
+    tp_rank: int,
+) -> MarkovWalker:
+    reason = _int8_markov_walk_unsupported_reason(
+        draft_model=draft_model, megakernel=megakernel
+    )
+    if reason is not None:
+        raise ValueError(
+            f"SGLANG_DSPARK_OPT_INT8_MARKOV_WALK cannot run this setup: {reason}."
+        )
+    tic = time.perf_counter()
+    head = draft_model.markov_head
+    walker = MarkovWalker(
+        w1=head.markov_w1.weight.detach(),
+        w2=head.greedy_w2_weight().detach(),
+        gamma=gamma,
+        max_bs=max_bs,
+        device=device,
+        seed=seed,
+    )
+    walker.warmup()
+    if tp_rank == 0:
+        logger.info(
+            "Build DSpark int8 markov walk end. max_bs=%d, elapsed=%.2f s, "
+            "mem usage=%.2f GB.",
+            walker.max_bs,
+            time.perf_counter() - tic,
+            walker.memory_bytes() / (1 << 30),
+        )
+    return walker

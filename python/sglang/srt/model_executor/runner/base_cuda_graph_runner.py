@@ -47,17 +47,23 @@ logger = logging.getLogger(__name__)
 def freeze_gc(enable_cudagraph_gc: bool):
     """Optimize garbage collection during CUDA graph capture.
 
-    Clean up first, then freeze remaining objects from being included in
-    future collections if GC is disabled during capture.
+    Clean up first. If GC is disabled during capture, freeze the remaining
+    objects and pause automatic collection until capture ends.
     """
     gc.collect()
     should_freeze = not enable_cudagraph_gc
+    gc_was_enabled = gc.isenabled()
     if should_freeze:
         gc.freeze()
+        # A collection can finalize a Triton kernel, and unloading its module
+        # on a capturing stream is not permitted and invalidates the capture.
+        gc.disable()
     try:
         yield
     finally:
         if should_freeze:
+            if gc_was_enabled:
+                gc.enable()
             gc.unfreeze()
             gc.collect()
 
