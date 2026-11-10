@@ -67,8 +67,8 @@ class TestNpuMemoryOccupation(CustomTestCase):
         cls._server.__exit__(None, None, None)
 
     def setUp(self):
-        # A failed case may leave a tag offloaded. resume is idempotent, so
-        # each case starts from the fully-resident state.
+        # Failure recovery for the shared server: a failed case may leave a
+        # tag offloaded, and resume is idempotent.
         resume_memory(self.base_url, ["weights", "kv_cache"])
 
     def test_01_release_weights_frees_memory(self):
@@ -119,7 +119,7 @@ class TestNpuMemoryOccupation(CustomTestCase):
             timeout=120,
         )
 
-        self.assertNotEqual(second.status_code, 500, "second resume crashed the server")
+        self.assertEqual(second.status_code, 200, second.text)
         self.assertTrue(health(self.base_url))
         actual = generation_signature(self.base_url, PROMPTS)
         self.assertEqual(actual, golden, "double resume changed the output")
@@ -133,6 +133,19 @@ class TestNpuMemoryOccupationFreshServer(CustomTestCase):
         # cover repeated cycles, but not the first release on a clean allocator.
         with npu_server(MODEL, extra_args=MEMORY_ARGS) as base_url:
             golden = generation_signature(base_url, PROMPTS)
+
+            # Nothing has been released yet: resume must be a 200 no-op.
+            fresh_resume = requests.post(
+                base_url + "/resume_memory_occupation",
+                json={"tags": ["weights"]},
+                timeout=120,
+            )
+            self.assertEqual(fresh_resume.status_code, 200, fresh_resume.text)
+            self.assertEqual(
+                generation_signature(base_url, PROMPTS),
+                golden,
+                "fresh-server resume changed the output",
+            )
 
             release_memory(base_url, ["weights", "kv_cache"])
             resume_memory(base_url, ["weights", "kv_cache"])
