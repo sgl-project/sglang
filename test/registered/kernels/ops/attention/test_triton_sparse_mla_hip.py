@@ -376,6 +376,56 @@ def test_dcp_owned_count_decode_merges_to_full_kv(fp8, heads, kv_splits):
     )
 
 
+def _scaled_kv_reference(q_nope, q_rope, keys, idx, sm_scale):
+    q = torch.cat([q_nope.float(), q_rope.float()], -1)
+    rows = keys[idx.clamp(min=0).long()]
+    s = torch.einsum("thd,tkd->thk", q, rows) * sm_scale
+    s = s.masked_fill((idx < 0)[:, None, :], float("-inf"))
+    return torch.einsum("thk,tkd->thd", torch.softmax(s, -1), rows[..., :512])
+
+
+def _scaled_kv_case(seq, heads, topk, pool, seed):
+    kv, keys = _scaled_fp8_ds_mla_kv(pool, seed)
+    q_nope = torch.randn(seq, heads, 512, device="cuda", dtype=torch.bfloat16) * 0.1
+    q_rope = torch.randn(seq, heads, 64, device="cuda", dtype=torch.bfloat16) * 0.1
+    idx = torch.randint(0, pool, (seq, topk), device="cuda", dtype=torch.int32)
+    idx[: max(1, seq // 4), -300:] = -1
+    return kv, keys, q_nope, q_rope, idx
+
+
+def _rel_err(out, ref):
+    return ((out.float() - ref).norm() / ref.norm()).item()
+
+
+@pytest.mark.parametrize("kv_dtype", [torch.uint8, torch.float8_e4m3fn])
+@pytest.mark.parametrize("seq", [6, 1024])  # split-K, and single-pass past the CUs
+def test_scaled_kv_prefill_matches_reference(seq, kv_dtype):
+    """Kimi-K3.1's fp8_ds_mla rows (TP8: 12 heads) are dequantized before BF16 dots."""
+    kv, keys, q_nope, q_rope, idx = _scaled_kv_case(seq, 12, 2048, 8192, seed=seq)
+    sm_scale = 576**-0.5
+
+    out = triton_sparse_mla_fwd(
+        q_nope, q_rope, kv.view(kv_dtype), idx.unsqueeze(1), sm_scale
+    )
+
+    ref = _scaled_kv_reference(q_nope, q_rope, keys, idx, sm_scale)
+    assert _rel_err(out[0], ref) < 4e-3
+
+
+@pytest.mark.parametrize("kv_splits", [None, 1])
+@pytest.mark.parametrize("bs", [1, 8, 48])
+def test_scaled_kv_decode_matches_reference(bs, kv_splits):
+    kv, keys, q_nope, q_rope, idx = _scaled_kv_case(bs, 12, 2048, 8192, seed=bs)
+    sm_scale = 576**-0.5
+
+    out = triton_sparse_mla_decode_splitk(
+        q_nope, q_rope, kv, idx.unsqueeze(1), sm_scale, kv_splits=kv_splits
+    )
+
+    ref = _scaled_kv_reference(q_nope, q_rope, keys, idx, sm_scale)
+    assert _rel_err(out[0], ref) < 4e-3
+
+
 def _pow2_scaled_kv():
     torch.manual_seed(0)
     k = (torch.randn(_N, 1, _DV + _DR, device=_DEVICE) * 2).bfloat16()
