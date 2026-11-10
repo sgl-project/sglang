@@ -207,10 +207,10 @@ GLM_5_2_PCP_PD_SEP_MODEL_CONFIG = {
 }
 
 
-# PCP variant (wiki: GLM5.2-A3-4-node 2P2D with cpp-pcp-L2HiCache):
+# PCP variant (wiki: GLM5.2-A3-4-node 1P1D with cpp-pcp-L2HiCache):
 # prefill tp8 + attn-cp8 (interleave) + pp4, decode tp32/dp32/ep32
-class TestNPUGLM5_2_W8A8_2P2D_PCP_GPQA(TestNpuAccuracyMultiNodePdSepTestCaseBase):
-    """Test NPU accuracy for GLM-5.2-w8a8 PD separation 2p2d with PCP on gpqa_diamond"""
+class TestNPUGLM5_2_W8A8_1P1D_PCP_GPQA(TestNpuAccuracyMultiNodePdSepTestCaseBase):
+    """Test NPU accuracy for GLM-5.2-w8a8 PD separation 1p1d with PCP on gpqa_diamond"""
 
     model_config = GLM_5_2_PCP_PD_SEP_MODEL_CONFIG
     # Run evalscope only once (no retry on accuracy miss)
@@ -230,8 +230,8 @@ class TestNPUGLM5_2_W8A8_2P2D_PCP_GPQA(TestNpuAccuracyMultiNodePdSepTestCaseBase
         "top_p": 0.95,
     }
 
-    def test_npu_glm_5_2_w8a8_2p2d_pcp_gpqa(self):
-        """Run NPU accuracy test for GLM-5.2-w8a8 PD separation 2p2d with PCP on gpqa_diamond"""
+    def test_npu_glm_5_2_w8a8_1p1d_pcp_gpqa(self):
+        """Run NPU accuracy test for GLM-5.2-w8a8 PD separation 1p1d with PCP on gpqa_diamond"""
         self.run_accuracy()
 
 

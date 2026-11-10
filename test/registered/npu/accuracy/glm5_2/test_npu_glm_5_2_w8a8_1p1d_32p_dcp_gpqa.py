@@ -59,7 +59,7 @@ GLM_5_2_DCP_PD_SEP_DECODE_ENVS = {
     "GLOO_SOCKET_IFNAME": NIC_NAME,
 }
 
-# DCP variant (wiki: GLM5.2-A3-4-node 2P2D with cpp-dcp-L2HiCache):
+# DCP variant (wiki: GLM5.2-A3-4-node 1P1D with cpp-dcp-L2HiCache):
 # prefill dp8 + pp4, decode tp32/dp8/dcp4, both sides keep dp-attention
 GLM_5_2_DCP_PD_SEP_PREFILL_ARGS = [
     "--disaggregation-mode",
@@ -200,8 +200,8 @@ GLM_5_2_DCP_PD_SEP_MODEL_CONFIG = {
 }
 
 
-class TestNPUGLM5_2_W8A8_2P2D_DCP_GPQA(TestNpuAccuracyMultiNodePdSepTestCaseBase):
-    """Test NPU accuracy for GLM-5.2-w8a8 PD separation 2p2d with DCP on gpqa_diamond"""
+class TestNPUGLM5_2_W8A8_1P1D_DCP_GPQA(TestNpuAccuracyMultiNodePdSepTestCaseBase):
+    """Test NPU accuracy for GLM-5.2-w8a8 PD separation 1p1d with DCP on gpqa_diamond"""
 
     model_config = GLM_5_2_DCP_PD_SEP_MODEL_CONFIG
     # Run evalscope only once (no retry on accuracy miss)
@@ -221,8 +221,8 @@ class TestNPUGLM5_2_W8A8_2P2D_DCP_GPQA(TestNpuAccuracyMultiNodePdSepTestCaseBase
         "top_p": 0.95,
     }
 
-    def test_npu_glm_5_2_w8a8_2p2d_dcp_gpqa(self):
-        """Run NPU accuracy test for GLM-5.2-w8a8 PD separation 2p2d with DCP on gpqa_diamond"""
+    def test_npu_glm_5_2_w8a8_1p1d_dcp_gpqa(self):
+        """Run NPU accuracy test for GLM-5.2-w8a8 PD separation 1p1d with DCP on gpqa_diamond"""
         self.run_accuracy()
 
 
