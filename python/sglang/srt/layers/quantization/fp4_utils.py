@@ -10,11 +10,8 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_platform,
 )
-from sglang.srt.utils.common import (
-    get_device_capability,
-    is_cuda,
-)
 from sglang.srt.utils.custom_op import register_custom_op_from_extern
+from sglang.srt.utils.device import get_device_capability, is_cuda
 
 logger = logging.getLogger(__name__)
 

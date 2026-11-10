@@ -107,7 +107,7 @@ Or run a benchmark:
 
 ```bash Command
 drun sglang:main-musa \
-  python3 -m sglang.bench_serving \
+  python3 -m sglang.benchmark.serving \
   --backend sglang \
   --dataset-name random \
   --num-prompts 4000 \

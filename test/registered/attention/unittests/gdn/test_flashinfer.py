@@ -3,7 +3,7 @@ import unittest
 import torch
 
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.utils import is_flashinfer_available
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.attention_unittest.attention_methods.gdn_attention import (
@@ -370,7 +370,7 @@ class TestFlashInferLinearGDNBackendCorrectness(CustomTestCase):
             device="cuda",
         )
 
-        cache = fixture.runner.req_to_token_pool.mamba2_layer_cache(0)
+        cache = fixture.runner.req_to_token_pool.mamba_pool.mamba2_layer_cache(0)
         initial_conv = cache.conv[0].clone()
         initial_ssm = cache.temporal.clone()
         flashinfer_output = run_gdn_fixture_eager(fixture)

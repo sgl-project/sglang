@@ -680,6 +680,76 @@ mod tests {
         }
     }
 
+    /// Each request decodes with its own `skip_special_tokens`, across chunk
+    /// boundaries, and a matched stop token is still trimmed from the text when
+    /// special tokens are kept (Python decodes `decode_ids` less the matched
+    /// stop with the request's flag). Three co-located requests stream the
+    /// same ids, `<eot>` (3) being special and the matched stop.
+    #[test]
+    fn special_tokens_follow_each_requests_flag_while_streaming() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/special_token_tokenizer.json"
+        );
+        let backend = DetokenizerBackend::Dynamo(
+            sglang_processor::dynamo_tokenizers::Tokenizer::from_file(path).unwrap(),
+        );
+        let (tm_tx, _tm_rx) = flume::unbounded::<AbortSource>();
+        let mut table = HashMap::new();
+        let mut sinks = Vec::new();
+        // (rid, skip_special_tokens, no_stop_trim, expected text deltas)
+        let cases = [
+            ("keep", false, false, ["a", "<eot>b", "c"]),
+            ("skip", true, false, ["a", "b", "c"]),
+            ("keep-stop", false, true, ["a", "<eot>b", "c<eot>"]),
+        ];
+        for (rid, skip_special_tokens, no_stop_trim, _) in cases {
+            let (tx, rx) = mpsc::channel::<ResponseItem>(4);
+            table.insert(
+                Rid::from(rid),
+                DetokState {
+                    sink: ResponseSink::Local(tx),
+                    decode_logprob_text: false,
+                    no_stop_trim,
+                    decoder: backend.new_decoder(skip_special_tokens),
+                    fsm: RequestState::Queued,
+                },
+            );
+            sinks.push(rx);
+        }
+
+        let stop = serde_json::json!({ "type": "stop", "matched": 3 });
+        let chunks: [(TokenIds, Option<serde_json::Value>); 3] = [
+            (vec![0], None),
+            (vec![3, 1], None),
+            (vec![2, 3], Some(stop)),
+        ];
+        for (ids, finish_reason) in chunks {
+            for (rid, ..) in cases {
+                let ev = ChunkEvent {
+                    rid: Rid::from(rid),
+                    token_ids: ids.clone(),
+                    finish_reason: finish_reason
+                        .clone()
+                        .map(|fr| serde_json::from_value(fr).unwrap()),
+                    ..Default::default()
+                };
+                handle_chunk(&mut table, ev, &backend, &tm_tx);
+            }
+        }
+
+        for ((rid, _, _, expected), rx) in cases.iter().zip(&mut sinks) {
+            let deltas: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok())
+                .map(|item| match item {
+                    ResponseItem::Frame(ev) | ResponseItem::Done(ev) => ev.text,
+                    other => panic!("{rid}: expected a text frame, got {other:?}"),
+                })
+                .collect();
+            assert_eq!(deltas, expected, "{rid}");
+        }
+        assert!(table.is_empty(), "every request finished");
+    }
+
     /// A non-stop finish (`length`, no `matched`) never trims.
     #[test]
     fn length_finish_keeps_all_tokens() {
