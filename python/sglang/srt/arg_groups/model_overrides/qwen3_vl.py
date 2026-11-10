@@ -1,7 +1,4 @@
-"""Config-time override declarations for qwen3_vl.
-
-Architectures: Qwen3VLForConditionalGeneration, Qwen3VLMoeForConditionalGeneration.
-"""
+"""Config-time override declarations for qwen3_vl."""
 
 import logging
 from typing import Any, Optional
@@ -13,7 +10,7 @@ from sglang.srt.arg_groups.model_override_base import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils.common import get_device_memory_capacity, is_sm90_supported
+from sglang.srt.utils.device import get_device_memory_capacity, is_sm90_supported
 
 logger = logging.getLogger(__name__)
 

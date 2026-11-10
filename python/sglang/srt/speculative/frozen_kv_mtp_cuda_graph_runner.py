@@ -8,15 +8,17 @@ import torch
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
+    deployment_attn_dp_size,
+    require_attn_tp_gather,
+    require_gathered_buffer,
+    require_mlp_sync,
+    require_mlp_tp_gather,
     set_dp_buffer_len,
     set_is_extend_in_batch,
 )
-from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
-    ForwardBatch,
-    ForwardMode,
-)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.model_executor.runner import (
     DecodeCudaGraphRunner,
@@ -40,12 +42,6 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.speculative.frozen_kv_mtp_info import FrozenKVMTPDraftInput
 from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
-from sglang.srt.utils import (
-    require_attn_tp_gather,
-    require_gathered_buffer,
-    require_mlp_sync,
-    require_mlp_tp_gather,
-)
 from sglang.srt.utils.device_timer import device_timer_ctx
 
 if TYPE_CHECKING:
@@ -98,8 +94,7 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
         self.require_mlp_tp_gather = require_mlp_tp_gather()
         self.require_mlp_sync = require_mlp_sync()
         self.require_attn_tp_gather = require_attn_tp_gather()
-        self.tp_size = self.model_runner.ps.tp_size
-        self.attn_dp_size = self.model_runner.ps.attn_dp_size
+        self.attn_dp_size = deployment_attn_dp_size()
         self.pp_size = get_parallel().pp_size
         self.speculative_num_steps = get_spec().speculative_num_steps
         self.topk = get_spec().speculative_eagle_topk
@@ -109,7 +104,6 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
         self.attn_backend = self.draft_attn_backend
 
         self.compile_bs = []
-        self.enable_pdmux = False
         self.record_nolora_graph = False
         self.attention_graph_variants = None
         self.is_dllm = False
@@ -199,11 +193,12 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
                 f"{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
             )
 
-    def _make_graph_key(self, bs, stream_idx=None, variant_label=None):
+    def _make_graph_key(self, bs, variant_label=None):
         return ShapeKey(size=bs)
 
     def _replay_graph(self, shape_key, forward_batch):
-        return self.backend.replay(shape_key, forward_batch)
+        with self.model_context():
+            return self.backend.replay(shape_key, forward_batch)
 
     def can_run_graph(self, forward_batch: ForwardBatch):
         # Uniform-width replay invariant: the batch's actual per-request width
@@ -246,11 +241,10 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
         self,
         size: int,
         forward: Callable,
-        stream_idx: Optional[int] = None,
         variant_label: Optional[str] = None,
         attention_variant: Optional[str] = None,
     ):
-        del forward, stream_idx, variant_label, attention_variant
+        del forward, variant_label, attention_variant
         buffers = self.buffers
         request_bs = size
         expanded_bs = request_bs * self.captured_req_width
@@ -320,6 +314,7 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
             spec_info=spec_info,
             capture_hidden_mode=CaptureHiddenMode.LAST,
         )
+        self.model_runner.runner_ids.bind_runner_slots(forward_batch)
 
         def run_once():
             # Record the metadata rebuild against the committed target-prefix
@@ -355,7 +350,10 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
         saved_backend_pool = self.draft_attn_backend.token_to_kv_pool
         self.draft_attn_backend.token_to_kv_pool = target_pool
         try:
-            with forward_context(ForwardContext(attn_backend=self.draft_attn_backend)):
+            with forward_context(
+                ForwardContext(attn_backend=self.draft_attn_backend),
+                forward_batch=forward_batch,
+            ):
                 self.frozen_kv_mtp_worker._init_frozen_kv_metadata_capture_cuda_graph(
                     forward_batch
                 )

@@ -15,6 +15,7 @@
 
 import logging
 import re
+from array import array
 from functools import lru_cache
 from typing import Iterable, List, Optional, Set, Tuple, TypedDict, Union
 
@@ -28,8 +29,8 @@ from transformers import (
     PreTrainedModel,
 )
 
-from sglang.srt.distributed import get_pp_group
 from sglang.srt.environ import envs
+from sglang.srt.hf_transformers import get_processor
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.layernorm import Gemma4RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
@@ -37,23 +38,16 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils import PPMissingLayer
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
+    pad_mm_tokens,
 )
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalInputs,
-    flatten_nested_list,
-)
-from sglang.srt.model_executor.forward_batch_info import (
-    ForwardBatch,
-    ForwardMode,
-    PPProxyTensors,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_context import get_attn_backend
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
@@ -65,8 +59,9 @@ from sglang.srt.models.gemma4_causal import (
     pp_filter_load_weight,
 )
 from sglang.srt.models.gemma4_vision import Gemma4VisionEncoder
-from sglang.srt.utils import add_prefix, cpu_has_amx_support, is_cpu
-from sglang.srt.utils.hf_transformers_utils import get_processor
+from sglang.srt.multimodal.modality import Modality
+from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils import cpu_has_amx_support, flatten_nested_list, is_cpu, is_xpu
 
 logger = logging.getLogger(__name__)
 
@@ -187,7 +182,7 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         prefix: str = "",
     ) -> None:
         super().__init__(config=config)
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
         self.quant_config = quant_config
 
@@ -296,12 +291,11 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
 
     def pad_input_ids(
         self,
-        input_ids: List[int],
+        input_ids: array,
         mm_inputs: MultimodalInputs,
-    ) -> List[int]:
+    ) -> array:
         """Pad input IDs with image and audio tokens."""
-        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
-        return pattern.pad_input_tokens(input_ids, mm_inputs)
+        return pad_mm_tokens(input_ids, mm_inputs)
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.language_model.get_input_embeddings()
@@ -327,18 +321,88 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         forward_batch: ForwardBatch,
         input_ids: torch.Tensor,
         mask_dtype: torch.dtype,
+        sliding_layers_only: bool = True,
     ):
         """Prepare bidirectional attention masks for image tokens.
 
         Gemma 4 uses bidirectional attention for image soft tokens
         during prefill. Following the HF implementation, bidirectional attention
         is only enabled within each individual image group (same-item
-        tokens), not across items.
-        Currently only the TritonAttnBackend supports this.
+        tokens), not across items, and only for checkpoints with
+        ``use_bidirectional_attention == "vision"``; E2B/E4B keep it causal.
+        Triton and FA4 use causal attention for image spans split across chunks.
+        XPU passes Gemma 3's per-token image-block ids to the sgl-kernel-xpu
+        prefill, on sliding-window layers only when ``sliding_layers_only`` (HF
+        Gemma 4 keeps full-attention layers causal; DiffusionGemma does not).
+        That mask has no sliding-window variant, so sliding layers keep causal
+        image attention once the KV length exceeds the window.
 
         TODO(kpham-sgl): Guard appropriately for gemma3_mm.py:prepare_attn_masks()
         """
-        if not isinstance(get_attn_backend(), TritonAttnBackend):
+        if (
+            getattr(self.config.text_config, "use_bidirectional_attention", None)
+            != "vision"
+        ):
+            return
+        attn_backend = get_attn_backend()
+        prefill_backend = getattr(attn_backend, "prefill_backend", attn_backend)
+        if getattr(prefill_backend, "fa_impl_ver", None) == 4 or getattr(
+            prefill_backend, "fa3_upgrades_to_fa4", False
+        ):
+            # O(query tokens) metadata instead of a dense Q x KV mask. Keep
+            # absolute ranges so cached text prefixes retain the right offset.
+            lengths = forward_batch.extend_seq_lens_cpu
+            prefixes = forward_batch.extend_prefix_lens_cpu
+            ranges = torch.full((sum(lengths), 2), -1, dtype=torch.int32)
+            offset = 0
+            split_images = []
+            for i, (length, prefix) in enumerate(zip(lengths, prefixes)):
+                mm_inputs = forward_batch.mm_inputs[i]
+                if mm_inputs is not None:
+                    for item in mm_inputs.mm_items:
+                        if not item.is_image():
+                            continue
+                        for begin, end in item.offsets:
+                            if end < prefix or begin >= prefix + length:
+                                continue
+                            if begin < prefix or end >= prefix + length:
+                                # Match Triton: leave split image rows at the
+                                # causal sentinel instead of granting partial
+                                # bidirectional attention within this chunk.
+                                split_images.append((i, begin, end))
+                                continue
+                            ranges[
+                                offset + begin - prefix : offset + end + 1 - prefix
+                            ] = torch.tensor([begin, end], dtype=torch.int32)
+                offset += length
+            if split_images:
+                logger.warning_once(
+                    f"{len(split_images)} images are split across chunk boundaries. "
+                    f"First 5 split images (batch, begin, end): {split_images[:5]}. "
+                    "Those images will receive causal attention. Disable chunked "
+                    "prefill (--chunked-prefill-size=-1) for full bidirectional attention."
+                )
+            prefill_backend.forward_metadata.image_token_ranges = ranges.to(
+                input_ids.device, non_blocking=True
+            )
+            return
+        if is_xpu():
+            # Same per-token image-block ids as Gemma 3; the sgl-kernel-xpu FMHA
+            # prefill turns them into bidirectional image attention. Imported
+            # lazily so non-XPU builds are unaffected.
+            from sglang.srt.layers.attention.xpu_backend import XPUAttentionBackend
+            from sglang.srt.models.gemma3_mm import Gemma3ForConditionalGeneration
+
+            if isinstance(prefill_backend, XPUAttentionBackend):
+                assert forward_batch.forward_mode == ForwardMode.EXTEND
+                prefill_backend.bidirectional_block_ids = (
+                    Gemma3ForConditionalGeneration._build_xpu_image_block_ids(
+                        forward_batch=forward_batch, device=input_ids.device
+                    )
+                )
+                prefill_backend.bidirectional_sliding_layers_only = sliding_layers_only
+                return
+        if not isinstance(prefill_backend, TritonAttnBackend):
             logger.warning_once(
                 "Bidirectional attention for image tokens requires TritonAttnBackend. "
                 "Falling back to causal attention, which may degrade image quality."
@@ -412,10 +476,10 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             )
         if bidirectional_attn_masks_list:
             bidirectional_attn_masks = torch.cat(bidirectional_attn_masks_list, dim=0)
-            get_attn_backend().forward_metadata.mask_indptr = (
+            prefill_backend.forward_metadata.mask_indptr = (
                 bidirectional_attn_mask_indptr
             )
-            get_attn_backend().forward_metadata.custom_mask = bidirectional_attn_masks
+            prefill_backend.forward_metadata.custom_mask = bidirectional_attn_masks
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         vt = self.vision_tower
@@ -653,6 +717,10 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                 input_ids,
                 mask_dtype=torch.bool,
             )
+
+        # Graph PLE lookup needs the IDs from before multimodal embedding clamps them.
+        if is_first_rank and forward_batch.contains_mm_inputs():
+            input_ids = input_ids.clone()
 
         # general_mm_embed_routine already handles PP: it skips the embedding
         # work on non-first ranks and forwards pp_proxy_tensors via **kwargs.
@@ -1058,12 +1126,8 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                     logger.log(level, "%s: %s", msg, names)
         return loaded_params
 
-    lora_pattern = re.compile(
-        r"^language_model\.layers\.(\d+)\.(?:self_attn|mlp)\.(?:qkv_proj|o_proj|down_proj|gate_up_proj)"
-    )
-
     def should_apply_lora(self, module_name: str) -> bool:
-        return bool(self.lora_pattern.match(module_name))
+        return module_name.startswith("language_model.layers.")
 
     def get_hidden_dim(self, module_name, layer_idx):
         # return input_dim, output_dim

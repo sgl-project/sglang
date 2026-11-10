@@ -32,13 +32,23 @@ from sglang.kernels.ops.layernorm.norm import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
+from sglang.srt.mem_cache.layout.paged_view import paged_kv_view
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+from sglang.srt.model_executor.forward_context import (
+    get_kv_layers,
+    get_token_to_kv_pool,
+)
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.runtime_context import get_exec
-from sglang.srt.utils import get_current_device_stream_fast, is_cuda, is_hip
+from sglang.srt.runtime_context import get_exec, get_forward, get_parallel
+from sglang.srt.utils import (
+    get_current_device_stream_fast,
+    is_cpu,
+    is_cuda,
+    is_hip,
+    print_info_once,
+)
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -46,6 +56,7 @@ if TYPE_CHECKING:
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_is_cpu = is_cpu()
 
 WeightsMapping = Mapping[str, Optional[str]]
 """If a key maps to a value of `None`, the corresponding weight is ignored."""
@@ -291,14 +302,31 @@ def enable_fused_set_kv_buffer(forward_batch: ForwardBatch):
     `.view(-> 4D NHD)` reshape, and let the rotary forward pass
     `flash_layout=False`. See `create_fused_set_kv_buffer_arg` below.
     """
+    # The fused RoPE writer cannot localize DCP slots or filter token owners.
+    if get_parallel().dcp_enabled:
+        return False
     pool = get_token_to_kv_pool()
     return (
         _is_cuda
         and pool.dtype == torch.bfloat16
-        and not isinstance(pool, SWAKVPool)
+        and pool.layer_router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is None
         and not is_cp_active(forward_batch)
         and getattr(forward_batch, "dcp_kv_mask", None) is None
-    ) or (_is_hip and getattr(forward_batch, "dcp_kv_mask", None) is None)
+    ) or (
+        _is_hip
+        and getattr(forward_batch, "dcp_kv_mask", None) is None
+        and not _window_writes_translated(pool)
+    )
+
+
+def _window_writes_translated(pool) -> bool:
+    """Whether the pool's window layers write at ids of their own that only the
+    pool's write door derives (a unified pool's window view). The fused store
+    maps window slots through `full_to_swa_index_mapping`, which such a pool
+    does not have, so it would write window layers at the owner's ids."""
+    router = pool.layer_router
+    window = router.sub_pool(IdSpaceKind.SLIDING_WINDOW)
+    return window is not None and router.view(window.name).requires_physical_write_loc
 
 
 def create_fused_set_kv_buffer_arg(
@@ -308,9 +336,8 @@ def create_fused_set_kv_buffer_arg(
 ):
     layer_id = layer.layer_id
     token_to_kv_pool = get_token_to_kv_pool()
-
-    k_buffer = token_to_kv_pool.get_key_buffer(layer_id)
-    v_buffer = token_to_kv_pool.get_value_buffer(layer_id)
+    kv = get_kv_layers().read(layer_id)
+    k_buffer, v_buffer = kv.key(), kv.value()
 
     if not _is_hip:
         # CUDA path.
@@ -330,7 +357,8 @@ def create_fused_set_kv_buffer_arg(
         # out_cache_loc, matching the CUDA path (which never fuses the hybrid pool).
         full_to_swa = (
             token_to_kv_pool.full_to_swa_index_mapping
-            if isinstance(token_to_kv_pool, SWAKVPool)
+            if token_to_kv_pool.layer_router.sub_pool(IdSpaceKind.SLIDING_WINDOW)
+            is not None
             else None
         )
         slot_mapping_swa = (
@@ -346,11 +374,11 @@ def create_fused_set_kv_buffer_arg(
             key_cache = k_buffer
             value_cache = v_buffer
         else:
-            key_cache = k_buffer.view(
-                -1, page_size, layer.tp_k_head_num, layer.qk_head_dim
+            key_cache = paged_kv_view(
+                k_buffer, page_size, layer.tp_k_head_num, layer.qk_head_dim
             )
-            value_cache = v_buffer.view(
-                -1, page_size, layer.tp_v_head_num, layer.v_head_dim
+            value_cache = paged_kv_view(
+                v_buffer, page_size, layer.tp_v_head_num, layer.v_head_dim
             )
         return {
             "v": value.view(-1, layer.tp_v_head_num, layer.v_head_dim),
@@ -361,6 +389,84 @@ def create_fused_set_kv_buffer_arg(
             "slot_mapping": forward_batch.out_cache_loc,
             "swa_slot_mapping": slot_mapping_swa,
         }
+
+
+def maybe_enable_silu_fp4_quant_fusion(mlp: torch.nn.Module) -> None:
+    """Fuse SiLU+mul with the down_proj NVFP4 input quantization.
+
+    Replaces the separate act_and_mul and per-token FP4 quantize kernels with
+    one FlashInfer kernel and feeds down_proj a prequantized (fp4, scale)
+    tuple. Kill switch: SGLANG_DISABLE_SILU_FP4_QUANT_FUSION=1.
+    """
+    if envs.SGLANG_DISABLE_SILU_FP4_QUANT_FUSION.get():
+        return
+    from sglang.srt.layers.quantization.fp4_utils import get_fp4_gemm_runner_backend
+    from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4LinearMethod
+
+    if not (
+        isinstance(mlp.gate_up_proj.quant_method, ModelOptFp4LinearMethod)
+        and mlp.gate_up_proj.quant_method.quant_mode == "w4a4"
+        and isinstance(mlp.down_proj.quant_method, ModelOptFp4LinearMethod)
+    ):
+        return
+    # The fused producer does not apply AWQ's per-input-channel scale.
+    if mlp.down_proj.quant_method.quant_config.is_awq:
+        return
+    # Marlin, the SM80-SM90 default, takes a floating-point input, not the tuple.
+    if get_fp4_gemm_runner_backend().is_marlin():
+        return
+    # The fused kernel never writes the scale padding, which exists when K % 64 != 0.
+    if mlp.down_proj.input_size_per_partition % 64 != 0:
+        return
+    try:
+        from flashinfer import silu_and_mul_scaled_nvfp4_experts_quantize  # noqa: F401
+    except ImportError:
+        return
+    mlp._enable_silu_fp4_quant_fusion = True
+    mlp.down_proj._accepts_prequantized_fp4 = True
+    print_info_once("Enabled fused SiLU+mul+FP4-quant for dense MLP down_proj input.")
+
+
+def can_run_silu_fp4_quant_fusion(
+    mlp: torch.nn.Module, gate_up: torch.Tensor | tuple
+) -> bool:
+    """Whether this forward can hand down_proj the fused (fp4, scale) tuple."""
+    return (
+        mlp._enable_silu_fp4_quant_fusion
+        and not isinstance(gate_up, tuple)
+        and not get_forward().sp_active  # the SP g-bar matmul needs a tensor
+        and not hasattr(mlp.down_proj, "base_layer")  # LoRA reads the activation
+    )
+
+
+def silu_and_mul_fp4_quant(
+    mlp: torch.nn.Module, gate_up: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """SiLU(gate) * up of a dense MLP, quantized to NVFP4 for its down_proj."""
+    from flashinfer import silu_and_mul_scaled_nvfp4_experts_quantize
+
+    # input_scale_inv only exists after weight loading, so derive it lazily;
+    # the fused kernel requires a 1-D global scale.
+    if mlp._down_input_scale_inv_1d is None:
+        mlp._down_input_scale_inv_1d = mlp.down_proj.input_scale_inv.reshape(1)
+    num_tokens = gate_up.shape[0]
+    masked_m = mlp._masked_m_cache.get(num_tokens)
+    if masked_m is None:
+        masked_m = torch.tensor([num_tokens], dtype=torch.int32, device=gate_up.device)
+        mlp._masked_m_cache[num_tokens] = masked_m
+    y_fp4, y_sf = silu_and_mul_scaled_nvfp4_experts_quantize(
+        gate_up.unsqueeze(0),
+        masked_m,
+        mlp._down_input_scale_inv_1d,
+    )
+    # [M, K/2, 1] -> [M, K/2]; scale: expert-grouped 6-D swizzle
+    # (32, 4, m_blocks, 4, K/64, 1) -> the dense swizzled layout
+    # fp4_gemm expects (verified bit-exact vs fp4_quantize up to FP4
+    # rounding ties for M in 64..8192).
+    y_fp4 = y_fp4.squeeze(-1).view(torch.uint8)
+    m_padded = y_sf.shape[2] * y_sf.shape[0] * y_sf.shape[3]  # m_blocks*32*4
+    y_sf = y_sf.view(torch.uint8).permute(2, 4, 0, 1, 3, 5).reshape(m_padded, -1)
+    return y_fp4, y_sf
 
 
 def permute_inv(perm: torch.Tensor) -> torch.Tensor:
@@ -449,6 +555,30 @@ def _reshape_for_qk_norm(x: torch.Tensor, head_dim: int) -> torch.Tensor:
     return x.reshape(-1, head_dim)
 
 
+@lru_cache(maxsize=1)
+def _has_cpu_fused_qk_norm() -> bool:
+    return hasattr(torch.ops.sgl_kernel, "fused_qk_norm_cpu")
+
+
+def can_use_fused_qk_norm_cpu(
+    q: torch.Tensor, k: torch.Tensor, head_dim: int, q_eps: float, k_eps: float
+) -> bool:
+    return (
+        _is_cpu
+        and q_eps == k_eps
+        and q.dim() == 2
+        and k.dim() == 2
+        and q.dtype in (torch.bfloat16, torch.float16)
+        and k.dtype == q.dtype
+        # q/k are usually strided views into qkv; only the head rows must be dense
+        and q.stride(-1) == 1
+        and k.stride(-1) == 1
+        and q.size(-1) % head_dim == 0
+        and k.size(-1) % head_dim == 0
+        and _has_cpu_fused_qk_norm()
+    )
+
+
 def apply_qk_norm(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -478,6 +608,12 @@ def apply_qk_norm(
     batch_size = q.size(0)
     q_eps = q_norm.variance_epsilon
     k_eps = k_norm.variance_epsilon
+
+    if allow_inplace and can_use_fused_qk_norm_cpu(q, k, head_dim, q_eps, k_eps):
+        torch.ops.sgl_kernel.fused_qk_norm_cpu(
+            q, k, q_norm.weight, k_norm.weight, q_eps
+        )
+        return q, k
 
     if (
         _is_cuda  # TODO(dark): have not tested on ROCm or other backends
@@ -739,3 +875,19 @@ def fused_qk_gemma_rmsnorm_with_gate(
 
 # Register the inplace op
 fused_inplace_qknorm = register_custom_op(fused_inplace_qknorm, mutates_args=["q", "k"])
+
+
+def is_non_idle_and_non_empty(forward_mode, hidden_states):
+    return (
+        (forward_mode is not None)
+        and not forward_mode.is_idle()
+        and hidden_states.shape[0] > 0
+    )
+
+
+def bind_or_assign(target, source):
+    if target is not None:
+        target.copy_(source)
+        return target
+    else:
+        return source

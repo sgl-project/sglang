@@ -222,9 +222,9 @@ jobs:
       - name: Run sgl-kernel test
         timeout-minutes: 20
         run: |
-          pytest python/sglang/kernels/aot/tests/speculative/test_eagle_utils.py
-          pytest python/sglang/kernels/aot/tests/speculative/test_ngram_utils.py
-          pytest python/sglang/kernels/aot/tests/speculative/test_speculative_sampling.py
+          pytest test/registered/kernels/ops/speculative/test_eagle_utils.py
+          pytest test/registered/kernels/ops/speculative/test_ngram_utils.py
+          pytest test/registered/kernels/ops/speculative/test_speculative_sampling.py
           pytest python/sglang/kernels/aot/tests/test_torch_defaults_reset.py
 
 

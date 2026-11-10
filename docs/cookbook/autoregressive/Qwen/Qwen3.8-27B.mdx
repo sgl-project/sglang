@@ -541,3 +541,34 @@ providers:
 ```
 
 </Accordion>
+
+## 4. Semantic Decisions
+
+Qwen3.8-27B can answer typed questions about an input with a probability for every option through `/v1/decisions`, without generating text. The server turns thinking off for these requests, so the answer is read after a closed think block, and the same server keeps serving chat traffic. No launch flag is needed. Until a release contains `/v1/decisions`, install a [nightly build](/docs/get-started/install#nightly-builds). With a server started by `sglang serve --model-path Qwen/Qwen3.8-27B --host 127.0.0.1 --port 30000`:
+
+```python Example
+import requests
+
+response = requests.post(
+    "http://127.0.0.1:30000/v1/decisions",
+    json={
+        "input": "I've been trying to connect my Stripe account for 3 days and the integration keeps failing.",
+        "questions": [
+            {
+                "id": "team",
+                "type": "choice",
+                "question": "Which team should handle this ticket?",
+                "options": [{"name": "billing"}, {"name": "technical"}, {"name": "sales"}],
+            },
+            {"id": "urgent", "type": "yes_no", "question": "The customer needs an answer today."},
+        ],
+    },
+    timeout=60,
+)
+response.raise_for_status()
+answers = response.json()["answers"]
+print(answers["team"]["choice"], answers["team"]["probabilities"])
+print(answers["urgent"]["probabilities"]["yes"])
+```
+
+See [Decision models](/docs/supported-models/decision_models) for the request reference, how the probabilities are computed, and the limits.

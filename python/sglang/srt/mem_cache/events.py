@@ -18,21 +18,102 @@ consumed by KV-aware routers (e.g. dynamo). A cache holds one recorder and calls
 it; the recorder owns the queue and needs nothing back from its owner.
 """
 
-from typing import Any, Optional
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any, Iterable, Optional
 
 from sglang.srt.disaggregation.kv_events import (
     AllBlocksCleared,
     BlockRemoved,
     BlockStored,
-    BlockStoredMetadata,
-    BlockStoredWithMetadata,
     StorageMedium,
+    kv_event_namespace_seed,
+    namespaced_block_hash,
 )
 from sglang.srt.mem_cache.utils import (
     compute_node_event_hash_values,
     compute_node_hash_values,
     hash_str_to_int64,
 )
+
+if TYPE_CHECKING:
+    from sglang.srt.lora.lora_registry import LoRARef
+
+# Length of LoRARef.lora_id, a uuid4 or uuid5 hex string. Req adds the id to the
+# end of extra_key, so the last 32 characters of extra_key are the id.
+_LORA_ID_LEN = 32
+
+
+class LoRANameTable:
+    """Find the LoRA adapter name from the lora_id at the end of extra_key.
+
+    Req adds lora_id to the end of extra_key, so a tree node has only the id.
+    The table keeps all entries. A lora_id is not used again, and nodes of an
+    unloaded adapter can publish stores until eviction.
+    """
+
+    def __init__(self):
+        self._names: dict[str, str] = {}
+
+    @classmethod
+    def from_lora_refs(cls, lora_refs: Optional[Iterable[LoRARef]]) -> LoRANameTable:
+        table = cls()
+        for lora_ref in lora_refs or ():
+            table.register(lora_id=lora_ref.lora_id, lora_name=lora_ref.lora_name)
+        return table
+
+    def register(self, *, lora_id: str, lora_name: str) -> None:
+        self._names[lora_id] = lora_name
+
+    def get(self, extra_key: Optional[str]) -> Optional[str]:
+        return self.resolve(extra_key)
+
+    def resolve(self, extra_key: Optional[str]) -> Optional[str]:
+        if not extra_key:
+            return None
+        return self._names.get(extra_key[-_LORA_ID_LEN:])
+
+
+class KvEventLoraNames(LoRANameTable):
+    """Public names of selected LoRA namespaces, kept for the publisher lifetime.
+
+    Write-back can publish a host store after the last GPU removal and after
+    its request dies, so request or published-block counts cannot bound this.
+    """
+
+    def __init__(self):
+        # Adapter-id registrations keep the existing Dynamo load-time lookup.
+        self._adapter_names: dict[str, str] = {}
+        self._names: dict[str, str] = {}
+
+    def register(
+        self,
+        req: Any = None,
+        lora_name: Optional[str] = None,
+        *,
+        lora_id: Optional[str] = None,
+    ) -> None:
+        """Name ``req``'s namespace; ``req`` needs ``extra_key`` and ``lora_id``."""
+        if lora_id is not None:
+            self._adapter_names[lora_id] = lora_name
+            return
+        if req.lora_id is None:
+            return
+        # Older IPC senders omit the optional name; admission still resolves an ID.
+        lora_name = lora_name or self._adapter_names.get(req.lora_id)
+        if not lora_name:
+            return
+        self._names[req.extra_key] = lora_name
+
+    def get(self, extra_key: Optional[str]) -> Optional[str]:
+        return self._names.get(extra_key)
+
+    def resolve(self, extra_key: Optional[str]) -> Optional[str]:
+        if not extra_key:
+            return None
+        return self._names.get(extra_key) or self._adapter_names.get(
+            extra_key[-_LORA_ID_LEN:]
+        )
 
 
 class KVCacheEventRecorder:
@@ -42,9 +123,18 @@ class KVCacheEventRecorder:
     empty list, so callers never have to guard.
     """
 
-    def __init__(self, *, enabled: bool, page_size: int):
+    def __init__(
+        self,
+        *,
+        enabled: bool,
+        page_size: int,
+        dynamo_format: bool = False,
+        lora_names: Optional[KvEventLoraNames] = None,
+    ):
         self.enabled = enabled
         self.page_size = page_size
+        self.dynamo_format = dynamo_format
+        self.lora_names = lora_names if lora_names is not None else KvEventLoraNames()
         self._queue: list = []
 
     def enqueue(self, event) -> None:
@@ -63,19 +153,13 @@ class KVCacheEventRecorder:
                     return
 
             elif isinstance(tail, BlockStored) and isinstance(event, BlockStored):
-                tail_metadata = (
-                    tail.metadata if isinstance(tail, BlockStoredWithMetadata) else None
-                )
-                event_metadata = (
-                    event.metadata
-                    if isinstance(event, BlockStoredWithMetadata)
-                    else None
-                )
                 if (
                     tail.medium == event.medium
                     and tail.lora_id == event.lora_id
                     and tail.block_size == event.block_size
-                    and tail_metadata == event_metadata
+                    and tail.cache_salt == event.cache_salt
+                    and tail.session_id == event.session_id
+                    and tail.lora_name == event.lora_name
                     and tail.block_hashes
                     and event.parent_block_hash == tail.block_hashes[-1]
                 ):
@@ -112,7 +196,23 @@ class KVCacheEventRecorder:
             return None
         return hash_str_to_int64(parent_hash_values[-1])
 
-    def record_store(self, node: Any, medium=None) -> None:
+    def _namespace_seed(self, node: Any) -> Optional[bytes]:
+        if not self.dynamo_format:
+            return kv_event_namespace_seed(
+                extra_key=(
+                    node.key.extra_key
+                    if self.lora_names.get(node.key.extra_key) is not None
+                    else None
+                ),
+                cache_salt=None,
+            )
+        return kv_event_namespace_seed(
+            extra_key=node.key.extra_key, cache_salt=node.key.cache_salt
+        )
+
+    def record_store(
+        self, node: Any, medium=None, *, session_id: Optional[str] = None
+    ) -> None:
         # One BlockStored per ``page_size`` chunk.
         # ``medium`` defaults to StorageMedium.GPU but callers may override
         # for lower-tier insertions (e.g. StorageMedium.CPU for host/L2 cache).
@@ -122,7 +222,17 @@ class KVCacheEventRecorder:
             medium = StorageMedium.GPU
 
         event_hash_values = self._node_event_hash_values(node)
+        namespace_seed = self._namespace_seed(node)
         parent_block_hash = self._parent_block_hash(node)
+        if parent_block_hash is not None:
+            parent_block_hash = namespaced_block_hash(
+                parent_block_hash, namespace_seed=namespace_seed
+            )
+        lora_name = (
+            self.lora_names.resolve(node.key.extra_key)
+            if self.dynamo_format
+            else self.lora_names.get(node.key.extra_key)
+        )
 
         page_index = 0
         logical_len = len(node.key)
@@ -138,24 +248,24 @@ class KVCacheEventRecorder:
             else:
                 page_tokens = list(raw[start:end])
 
-            block_hash = hash_str_to_int64(event_hash_values[page_index])
+            block_hash = namespaced_block_hash(
+                hash_str_to_int64(event_hash_values[page_index]),
+                namespace_seed=namespace_seed,
+            )
 
-            event_args = {
-                "block_hashes": [block_hash],
-                "parent_block_hash": parent_block_hash,
-                "token_ids": page_tokens,
-                "block_size": len(page_tokens),
-                "lora_id": None,
-                "medium": medium,
-            }
-            if node.key.cache_salt is None:
-                event = BlockStored(**event_args)
-            else:
-                event = BlockStoredWithMetadata(
-                    **event_args,
-                    metadata=BlockStoredMetadata(cache_salt=node.key.cache_salt),
+            self.enqueue(
+                BlockStored(
+                    block_hashes=[block_hash],
+                    parent_block_hash=parent_block_hash,
+                    token_ids=page_tokens,
+                    block_size=len(page_tokens),
+                    lora_id=None,
+                    medium=medium,
+                    cache_salt=node.key.cache_salt,
+                    session_id=session_id,
+                    lora_name=lora_name,
                 )
-            self.enqueue(event)
+            )
 
             parent_block_hash = block_hash
             page_index += 1
@@ -171,6 +281,7 @@ class KVCacheEventRecorder:
 
         # Hash values must match what was stored.
         event_hash_values = self._node_event_hash_values(node)
+        namespace_seed = self._namespace_seed(node)
 
         block_hashes = []
         logical_len = len(node.key)
@@ -180,7 +291,12 @@ class KVCacheEventRecorder:
             if end <= start:
                 continue
 
-            block_hashes.append(hash_str_to_int64(event_hash_values[page_index]))
+            block_hashes.append(
+                namespaced_block_hash(
+                    hash_str_to_int64(event_hash_values[page_index]),
+                    namespace_seed=namespace_seed,
+                )
+            )
             page_index += 1
 
         if block_hashes:

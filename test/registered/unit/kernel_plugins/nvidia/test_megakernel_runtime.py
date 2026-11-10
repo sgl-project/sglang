@@ -1,0 +1,523 @@
+"""CPU checks of the megakernel install, dispatch and capture check."""
+
+import sys
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock, call, patch
+
+import torch
+from msgspec.structs import replace
+
+from sglang.kernels.plugin_kernels.nvidia import spec as registry
+from sglang.srt.kernel_plugins.nvidia import binding
+from sglang.srt.kernel_plugins.nvidia.binding import MegakernelBinding, PreparationView
+from sglang.srt.runtime_context import publish, reset_context
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _fakes import (  # noqa: E402
+    ANY_TP,
+    ARCH,
+    DRAFT,
+    ISA,
+    SPEC,
+    Lm,
+    batch,
+    server_args,
+)
+
+register_cpu_ci(est_time=5, stage="base-a", runner_config="cpu")
+
+
+class OtherBinding:
+    def __init__(self, *, model):
+        self.model = model
+
+
+def install(
+    *,
+    archs=(ARCH,),
+    gathered=None,
+    tokens=2,
+    hooks=None,
+    is_draft=False,
+    model=None,
+):
+    """install_megakernel on an Lm as rank 0 of the published server; gathered maps
+    a gathered value to what the other ranks report, default the same as this rank."""
+    lm, hooks = (Lm() if model is None else model), [] if hooks is None else hooks
+    gpu = SimpleNamespace(multi_processor_count=160)
+    with (
+        patch.object(binding, "device_isa", return_value=ISA),
+        patch.object(binding, "deadline_s", return_value=30.0),
+        patch.object(
+            binding, "_gather_tp", side_effect=gathered or (lambda x, group=None: [x])
+        ),
+        patch.object(binding, "_tokens_per_request", return_value=tokens),
+        patch.object(binding, "_decode_graphs_enabled", return_value=True),
+        patch.object(torch.cuda, "current_device", return_value=0),
+        patch.object(torch.cuda, "get_device_properties", return_value=gpu),
+        patch.object(torch.cuda, "mem_get_info", return_value=(0, 0)),
+    ):
+        binding.install_megakernel(
+            model=lm,
+            hf_config=SimpleNamespace(architectures=list(archs)),
+            capture_tail_hooks=hooks,
+            is_draft=is_draft,
+        )
+    return lm
+
+
+class TestMegakernelRuntime(CustomTestCase):
+    def setUp(self):
+        registry_patch = patch.dict(registry._REGISTRY, clear=True)
+        registry_patch.start()
+        self.addCleanup(registry_patch.stop)
+        registry.register(architecture=ARCH, path="_fakes:SPEC")
+        publish(server_args(enable_nvidia_megakernel=True), role="test")
+        self.addCleanup(reset_context)
+        # the running forward's view reads its attention backend, which tests lack
+        view_patch = patch.object(
+            MegakernelBinding, "forward_view", return_value="view"
+        )
+        view_patch.start()
+        self.addCleanup(view_patch.stop)
+        capture_view_patch = patch.object(MegakernelBinding, "seal_capture_view")
+        capture_view_patch.start()
+        self.addCleanup(capture_view_patch.stop)
+
+    def _install_spec(self, spec, **kw):
+        with patch.object(binding, "find_spec", return_value=(spec, "")):
+            return install(**kw)
+
+    def _warmup(self, model_runner, events):
+        from sglang.srt.model_executor.runner import base_runner
+
+        runner = SimpleNamespace(
+            model_runner=model_runner,
+            _pre_initialize_flashinfer_allreduce_workspace=lambda: events.append(
+                "allreduce"
+            ),
+            _pre_initialize_fi_a2a_workspace=lambda: events.append("a2a"),
+            _pre_initialize_dcp_push_combine=lambda: events.append("dcp"),
+            _pre_initialize_pcie_ipc_workspace=lambda: events.append("pcie"),
+            _autotune_buffers=lambda: (object(), 1),
+            _flashinfer_autotune=lambda **kw: events.append("autotune"),
+        )
+        with (
+            patch.object(
+                base_runner, "should_run_flashinfer_autotune", return_value=True
+            ),
+            patch.object(
+                base_runner,
+                "maybe_flashinfer_autotune_extend",
+                side_effect=lambda *args, **kw: events.append("extend"),
+            ),
+            patch.object(
+                base_runner.envs.SGLANG_PP_PARALLEL_DEEPGEMM_WARMUP,
+                "get",
+                return_value=False,
+            ),
+        ):
+            base_runner.BaseRunner._warmup(runner)
+
+    def test_covered_steps_run_the_megakernel_and_others_the_forward(self):
+        lm = install(tokens=1)
+        built = binding.built_megakernel(lm)
+        with patch.object(
+            torch.cuda, "is_current_stream_capturing", return_value=False
+        ):
+            self.assertEqual(lm(batch(4).input_ids, None, batch(4)), "megakernel")
+            self.assertEqual(lm(batch(6).input_ids, None, batch(6)), "standard")
+        # only a covered step runs the megakernel, with the running forward's view
+        self.assertEqual((built.steps, built.views), ([4], ["view"]))
+        MegakernelBinding.seal_capture_view.assert_not_called()
+
+    def test_dispatch_passes_and_seals_the_current_capture_view(self):
+        lm = install(tokens=1)
+        forward_batch = batch(4)
+        with patch.object(torch.cuda, "is_current_stream_capturing", return_value=True):
+            lm(forward_batch.input_ids, None, forward_batch)
+        MegakernelBinding.forward_view.assert_called_once_with(forward_batch)
+        MegakernelBinding.seal_capture_view.assert_called_once_with(
+            forward_batch, "view"
+        )
+
+    def test_verify_build_widths_are_token_rows_but_capture_keys_are_requests(self):
+        for q in (4, 5, 6, 7, 8):
+            with self.subTest(q=q):
+                contexts = []
+
+                def build(model, hf_config, context):
+                    contexts.append(context)
+                    return SimpleNamespace(
+                        widths=context.widths,
+                        draft_sampler=None,
+                        draft_loop=None,
+                        draft_extend=None,
+                        begin_draft_round=None,
+                        graph_variants=None,
+                        summary=lambda: "uniform verify",
+                        plan=lambda ids, fb: registry.Step(
+                            "target_verify", ids.numel()
+                        ),
+                        forward=lambda *args, **kwargs: "megakernel",
+                    )
+
+                model = self._install_spec(
+                    replace(SPEC, max_rows=64, build=build), tokens=q
+                )
+                self.assertEqual(contexts[0].tokens_per_request, q)
+                self.assertEqual(contexts[0].widths, tuple(range(q, 65, q)))
+                forward_batch = batch(3)
+                forward_batch.input_ids = torch.zeros(3 * q)
+                with patch.object(
+                    torch.cuda, "is_current_stream_capturing", return_value=True
+                ):
+                    model(forward_batch.input_ids, None, forward_batch)
+                # The wrapper's bound dispatch keeps the native request-sized key.
+                dispatch = model.forward.__closure__
+                captured = next(
+                    cell.cell_contents.captured
+                    for cell in dispatch
+                    if isinstance(cell.cell_contents, binding._Dispatch)
+                )
+                self.assertEqual(set(captured), {3})
+                self.assertEqual(captured[3].rows, 3 * q)
+
+    def test_preparation_runs_after_model_once_per_warmup_lifecycle(self):
+        """All phase runners share preparation; an explicit warmup reset repeats it."""
+        events = []
+        prepared_view = PreparationView()
+
+        def prepare(built, view):
+            built.prepared = view
+            events.append(("plugin", built, view))
+
+        model = Lm()
+        original = Mock(side_effect=lambda runner: events.append(("model", runner)))
+        model.__dict__["prepare_before_cuda_graph_capture"] = original
+        lm = self._install_spec(replace(SPEC, prepare=prepare), model=model)
+        built = binding.built_megakernel(lm)
+        self.assertIs(lm.prepare_before_cuda_graph_capture, original)
+        mr = SimpleNamespace(model=lm, device="cuda")
+        expected = [
+            "allreduce",
+            "a2a",
+            "dcp",
+            "pcie",
+            ("model", mr),
+            ("plugin", built, prepared_view),
+            "autotune",
+            "extend",
+        ]
+        # Preparation must share the binding passed to build and forward dispatch.
+        with patch.object(
+            lm.context.binding, "preparation_view", return_value=prepared_view
+        ) as make_view:
+            self._warmup(mr, events)
+            self.assertTrue(mr._kernel_warmed_up)
+            self.assertIs(built.prepared, prepared_view)
+            self.assertEqual(events, expected)
+            self._warmup(mr, events)
+            self.assertEqual(events, expected)
+            mr._kernel_warmed_up = False
+            self._warmup(mr, events)
+        self.assertEqual(events, expected * 2)
+        self.assertEqual(make_view.call_args_list, [call(mr), call(mr)])
+
+    def test_absent_preparation_is_a_noop_and_leaves_model_hooks_untouched(self):
+        model = Lm()
+        original = Mock()
+        model.__dict__["prepare_before_cuda_graph_capture"] = original
+        lm = install(model=model)
+        self.assertIs(lm.__dict__["prepare_before_cuda_graph_capture"], original)
+
+        hookless = install()
+        self.assertNotIn("prepare_before_cuda_graph_capture", hookless.__dict__)
+        uninstalled = Lm()
+        with patch.object(
+            MegakernelBinding,
+            "preparation_view",
+            side_effect=AssertionError("unrequested preparation"),
+        ):
+            for model in (lm, hookless, uninstalled):
+                binding.prepare_megakernel(SimpleNamespace(model=model))
+        original.assert_not_called()
+        self.assertIsNone(binding.built_megakernel(uninstalled))
+
+    def test_preparation_failures_propagate_in_order(self):
+        stages = ["model", "view", "plugin"]
+        for failed_stage in stages:
+            with self.subTest(failed_stage=failed_stage):
+                events = []
+
+                def record(stage):
+                    events.append(stage)
+                    if stage == failed_stage:
+                        raise RuntimeError(f"{stage} failed")
+
+                def make_view(runner):
+                    record("view")
+                    return PreparationView()
+
+                model = Lm()
+                model.__dict__["prepare_before_cuda_graph_capture"] = lambda runner: (
+                    record("model")
+                )
+                lm = self._install_spec(
+                    replace(SPEC, prepare=lambda built, view: record("plugin")),
+                    model=model,
+                )
+                with (
+                    patch.object(
+                        lm.context.binding, "preparation_view", side_effect=make_view
+                    ),
+                    self.assertRaisesRegex(RuntimeError, f"{failed_stage} failed"),
+                ):
+                    self._warmup(SimpleNamespace(model=lm, device="cuda"), events)
+                self.assertEqual(
+                    events,
+                    ["allreduce", "a2a", "dcp", "pcie"]
+                    + stages[: stages.index(failed_stage) + 1],
+                )
+
+    def test_zero_width_build_prepares_without_a_model_hook(self):
+        """Sampler-only builds still prepare before their captured sampler tail."""
+        prepared_view = PreparationView()
+
+        def prepare(built, view):
+            built.prepared = view
+
+        zero = SimpleNamespace(
+            widths=(),
+            draft_sampler=print,
+            draft_loop=None,
+            draft_extend=None,
+            begin_draft_round=None,
+            graph_variants=None,
+            summary=lambda: "draft sampler",
+        )
+        spec = replace(
+            SPEC, max_rows=0, build=lambda model, hf, ctx: zero, prepare=prepare
+        )
+        with patch.object(
+            MegakernelBinding, "preparation_view", return_value=prepared_view
+        ):
+            lm = self._install_spec(spec, is_draft=True)
+            self._warmup(SimpleNamespace(model=lm, device="cuda"), [])
+        self.assertIs(zero.prepared, prepared_view)
+        self.assertIs(binding.built_megakernel(lm), zero)
+        self.assertIs(binding.megakernel_draft_sampler(lm), print)
+        self.assertNotIn("forward", lm.__dict__)
+        self.assertNotIn("prepare_before_cuda_graph_capture", lm.__dict__)
+
+    def test_a_target_without_a_usable_spec_is_refused_and_a_draft_keeps_its_forward(
+        self,
+    ):
+        # the flag must not silently run the model's own forward
+        with self.assertRaisesRegex(ValueError, "in the model workers"):
+            install(archs=["TargetWithoutSpec"])
+        tp8 = replace(SPEC, requires=replace(SPEC.requires, tp_sizes=frozenset({8})))
+        with self.assertRaisesRegex(ValueError, "tp_size 4"):
+            self._install_spec(tp8)
+        # an empty field accepts any value
+        self.assertIsNotNone(binding.built_megakernel(self._install_spec(ANY_TP)))
+        with self.assertLogs(binding.logger, "INFO") as logs:
+            lm = install(archs=["DraftWithoutSpec"], is_draft=True)
+        self.assertNotIn("forward", lm.__dict__)
+        self.assertIn("keeps its own forward", "".join(logs.output))
+        registry.register(architecture="Draft", path="_fakes:DRAFT")
+        # a draft spec offers only its draft sampler
+        lm = install(archs=["Draft"], is_draft=True)
+        self.assertNotIn("forward", lm.__dict__)
+        self.assertIs(binding.megakernel_draft_sampler(lm), print)
+
+    def test_each_architecture_gets_its_registered_binding(self):
+        with patch.dict(binding._BINDINGS, {ARCH: OtherBinding}):
+            lm = install(tokens=1)
+        self.assertIsInstance(lm.context.binding, OtherBinding)
+        self.assertIs(lm.context.binding.model, lm)
+
+    def test_offered_entries_reach_sglang_only_when_every_rank_offers_them(self):
+        registry.register(architecture="EagleDraft", path="_fakes:EAGLE_DRAFT")
+        lm = install(archs=["EagleDraft"], is_draft=True)
+        self.assertIs(binding.megakernel_entry(lm, "draft_loop"), print)
+        self.assertIsNone(binding.megakernel_entry(lm, "draft_extend"))
+        self.assertIsNone(binding.megakernel_entry(Lm(), "draft_loop"))
+
+        def fewer_entries_on_rank_1(value, group=None):
+            entries = value == ("draft_loop", "begin_draft_round")
+            return [value, value[:1]] if entries else [value]
+
+        with self.assertRaisesRegex(RuntimeError, "entries fake offers differ"):
+            install(
+                archs=["EagleDraft"], is_draft=True, gathered=fewer_entries_on_rank_1
+            )
+
+    def test_graph_variants_reach_a_runner_only_when_every_rank_offers_the_same(self):
+        """A runner captures one graph per label of the variants offered it, so ranks
+        offering other runners or labels would wait in different collectives."""
+        labels = SimpleNamespace(capture_labels=("short", "long"))
+
+        def offering(graph_variants):
+            return replace(
+                DRAFT,
+                build=lambda model, hf, ctx: SimpleNamespace(
+                    widths=(),
+                    draft_sampler=None,
+                    draft_loop=None,
+                    draft_extend=None,
+                    begin_draft_round=None,
+                    graph_variants=graph_variants,
+                ),
+            )
+
+        lm = self._install_spec(offering({"draft_loop": labels}))
+        served = binding.megakernel_graph_variants(lm, "draft_loop", batch_sizes={1})
+        self.assertIs(served, labels)
+        # one graph per batch size: another runner, no batch size the megakernel
+        # serves, a built object offering none, no megakernel
+        for model, runner, sizes in (
+            (lm, "draft_extend", {1}),
+            (lm, "draft_loop", frozenset()),
+            (self._install_spec(offering(None)), "draft_loop", {1}),
+            (Lm(), "target_verify", {1}),
+        ):
+            with self.subTest(runner=runner, sizes=sizes):
+                self.assertIsNone(
+                    binding.megakernel_graph_variants(model, runner, batch_sizes=sizes)
+                )
+
+        def fewer_labels_on_rank_1(value, group=None):
+            offered = value == [("draft_loop", ("short", "long"))]
+            return [value, [("draft_loop", ("short",))]] if offered else [value]
+
+        with self.assertRaisesRegex(RuntimeError, "graph variants fake offers differ"):
+            self._install_spec(
+                offering({"draft_loop": labels}), gathered=fewer_labels_on_rank_1
+            )
+        with self.assertRaisesRegex(ValueError, "graph_variants names 'verify'"):
+            self._install_spec(offering({"verify": labels}))
+
+    def test_the_verify_graphs_capture_the_variants_where_the_megakernel_runs(self):
+        """A target's verify step runs the megakernel only at the rows it built, so
+        the batch sizes that capture its variants are those rows over the width."""
+        labels = SimpleNamespace(capture_labels=("short", "long"))
+        lm = Lm()
+        lm.__dict__["_megakernel"] = binding._InstalledMegakernel(
+            built=SimpleNamespace(
+                widths=(7, 14), graph_variants={"target_verify": labels}
+            ),
+            binding=None,
+            prepare=None,
+        )
+        self.assertEqual(
+            binding.megakernel_verify_variants(
+                lm, capture_bs=[1, 2, 4, 8], tokens_per_request=7
+            ),
+            (labels, frozenset({1, 2})),
+        )
+
+    def test_ranks_that_disagree_are_refused_on_every_rank(self):
+        """A rank that differs would wait in a different collective."""
+
+        def no_spec_on_rank_1(value, group=None):
+            return [value, (value[0], "rank-1 reason", None)]
+
+        def fewer_widths_on_rank_1(value, group=None):
+            widths = isinstance(value, tuple) and all(isinstance(w, int) for w in value)
+            return [value, value[:1]] if widths else [value]
+
+        with self.assertRaisesRegex(ValueError, "rank 1: rank-1 reason"):
+            install(gathered=no_spec_on_rank_1)
+        with self.assertRaisesRegex(RuntimeError, "widths fake built differ"):
+            install(gathered=fewer_widths_on_rank_1)
+
+    def test_capture_check_refuses_when_no_graph_runs_the_megakernel(self):
+        def capture(sizes, capture_bs):
+            hooks = []
+            lm = install(tokens=1, hooks=hooks)
+            runner = SimpleNamespace(capture_bs=capture_bs)
+            with patch.object(
+                torch.cuda, "is_current_stream_capturing", return_value=True
+            ):
+                for bs in sizes:
+                    lm(batch(bs).input_ids, None, batch(bs))
+                    hooks[0](runner, None, batch(bs), bs)
+
+        capture([2, 8], capture_bs=[2, 8, 16])  # not all captured yet: no verdict
+        capture([2, 8], capture_bs=[2, 8])
+        with self.assertRaisesRegex(ValueError, "none of the 2 captured decode graphs"):
+            capture([8, 16], capture_bs=[8, 16])
+
+    def test_capture_tail_seals_the_auxiliary_allocation_owner(self):
+        """Replacing the runner pool must invalidate its captured auxiliary slices."""
+        hooks = []
+        lm = install(tokens=1, hooks=hooks)
+        aux = torch.empty(8, 12, dtype=torch.bfloat16)
+        lm.context.binding._capture_aux_buffers["target_verify:1"] = aux[:4]
+        runner = SimpleNamespace(
+            capture_bs=[4], buffers=SimpleNamespace(aux_hidden_states=aux)
+        )
+        with patch.object(torch.cuda, "is_current_stream_capturing", return_value=True):
+            lm(batch(4).input_ids, None, batch(4))
+            hooks[0](runner, None, batch(4), 4)
+        runner.buffers.aux_hidden_states = torch.empty_like(aux)
+        with self.assertRaisesRegex(RuntimeError, "decode_graph_aux_hidden_states"):
+            lm.context.binding.assert_live()
+
+    def test_prefill_step_uses_prefill_view_not_forward_view(self):
+        """A prefill step must call prefill_view(), not forward_view(forward_batch),
+        and must not seal graph-static tensors (prefill runs eagerly, never captured)."""
+        from sglang.kernels.plugin_kernels.nvidia.spec import Step
+
+        prefill_step = Step(mode="prefill", rows=8)
+        prefill_built = SimpleNamespace(
+            widths=(4,),
+            draft_sampler=None,
+            draft_loop=None,
+            draft_extend=None,
+            begin_draft_round=None,
+            graph_variants=None,
+            speculative_runtime_hooks=None,
+            summary=lambda: "prefill-fake",
+            plan=lambda ids, fb, *a, **kw: prefill_step,
+            forward=lambda step, orig, *a, **kw: ("megakernel", step),
+        )
+        with patch.object(binding, "find_spec", return_value=(SPEC, "")):
+            with patch.object(
+                SPEC.__class__, "build", create=True, return_value=prefill_built
+            ):
+                lm = self._install_spec(
+                    replace(SPEC, build=lambda m, hf, ctx: prefill_built), tokens=1
+                )
+        with (
+            patch.object(MegakernelBinding, "prefill_view", return_value="pview"),
+            patch.object(torch.cuda, "is_current_stream_capturing", return_value=False),
+        ):
+            result = lm(batch(4).input_ids, None, batch(4))
+        tag, ran_step = result
+        self.assertEqual(tag, "megakernel")
+        self.assertEqual(ran_step.mode, "prefill")
+        self.assertEqual(ran_step.view, "pview")
+        MegakernelBinding.forward_view.assert_not_called()
+        MegakernelBinding.seal_capture_view.assert_not_called()
+
+    def test_decode_step_does_not_call_prefill_view(self):
+        """A decode step must call forward_view(forward_batch) and not prefill_view."""
+        with patch.object(MegakernelBinding, "prefill_view", return_value="pview"):
+            lm = install(tokens=1)
+            forward_batch = batch(4)
+            with patch.object(
+                torch.cuda, "is_current_stream_capturing", return_value=False
+            ):
+                lm(forward_batch.input_ids, None, forward_batch)
+            MegakernelBinding.forward_view.assert_called_once_with(forward_batch)
+            MegakernelBinding.prefill_view.assert_not_called()
+
+
+if __name__ == "__main__":
+    unittest.main()

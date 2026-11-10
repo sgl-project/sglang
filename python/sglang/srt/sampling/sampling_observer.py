@@ -9,49 +9,14 @@ manager consumes the resulting customized response fields.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Callable, Optional, Protocol, Sequence
+from typing import TYPE_CHECKING, Any, Optional, Protocol
 
 import torch
 
+from sglang.srt.managers.auxiliary_output import DeviceAuxiliaryOutput
+
 if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-
-
-@dataclass(frozen=True)
-class CommittedTokens:
-    output_index: int
-    token_ids: tuple[int, ...]
-
-
-class DeviceAuxiliaryOutput(Protocol):
-    """Device output copied later by the scheduler.
-
-    Tensors must not alias CUDA-graph static buffers that a later replay can
-    overwrite before the scheduler-side copy completes.
-    """
-
-    def copy_to_host(
-        self, copy_tensor: Callable[[torch.Tensor], torch.Tensor]
-    ) -> HostAuxiliaryOutput: ...
-
-
-class HostAuxiliaryOutput(Protocol):
-    """Scheduler-side result produced by ``DeviceAuxiliaryOutput``.
-
-    ``consume`` runs after sampled tokens have been committed to each request
-    and immediately before response streaming. ``commits`` is aligned with
-    ``batch.reqs`` and identifies only the newly visible tokens. Implementations
-    can buffer per-request values for a ``SchedulerOutputStreamer`` subclass to
-    expose through customized response metadata.
-    """
-
-    def consume(
-        self,
-        batch: ScheduleBatch,
-        commits: Sequence[Optional[CommittedTokens]],
-    ) -> None: ...
 
 
 class SamplingObserver(Protocol):

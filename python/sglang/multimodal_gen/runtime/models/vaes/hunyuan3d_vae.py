@@ -209,7 +209,6 @@ class QKVMultiheadCrossAttention(nn.Module):
     ):
         super().__init__()
         self.heads = heads
-        self.n_data = n_data
         self.q_norm = (
             norm_layer(width // heads, elementwise_affine=True, eps=1e-6)
             if qk_norm
@@ -255,7 +254,6 @@ class MultiheadCrossAttention(nn.Module):
         kv_cache: bool = False,
     ):
         super().__init__()
-        self.n_data = n_data
         self.width = width
         self.heads = heads
         self.data_width = width if data_width is None else data_width
@@ -338,7 +336,6 @@ class QKVMultiheadAttention(nn.Module):
     ):
         super().__init__()
         self.heads = heads
-        self.n_ctx = n_ctx
         self.q_norm = (
             norm_layer(width // heads, elementwise_affine=True, eps=1e-6)
             if qk_norm
@@ -381,7 +378,6 @@ class MultiheadAttention(nn.Module):
         drop_path_rate: float = 0.0,
     ):
         super().__init__()
-        self.n_ctx = n_ctx
         self.width = width
         self.heads = heads
         self.c_qkv = nn.Linear(width, width * 3, bias=qkv_bias)
@@ -450,7 +446,6 @@ class Transformer(nn.Module):
         drop_path_rate: float = 0.0,
     ):
         super().__init__()
-        self.n_ctx = n_ctx
         self.width = width
         self.layers = layers
         self.resblocks = nn.ModuleList(
@@ -512,7 +507,6 @@ class CrossAttentionDecoder(nn.Module):
         if self.enable_ln_post:
             self.ln_post = nn.LayerNorm(width)
         self.output_proj = nn.Linear(width, out_channels)
-        self.label_type = label_type
 
     def set_cross_attention_processor(self, processor):
         self.cross_attn_decoder.attn.attention.attn_processor = processor
@@ -639,18 +633,15 @@ class VanillaVolumeDecoder:
             bounds = [-bounds, -bounds, -bounds, bounds, bounds, bounds]
 
         bbox_min, bbox_max = np.array(bounds[0:3]), np.array(bounds[3:6])
-        xyz_samples, grid_size, length = generate_dense_grid_points(
-            bbox_min=bbox_min,
-            bbox_max=bbox_max,
-            octree_resolution=octree_resolution,
-            indexing="ij",
-        )
-        xyz_samples = (
-            torch.from_numpy(xyz_samples)
-            .to(device, dtype=dtype)
-            .contiguous()
-            .reshape(-1, 3)
-        )
+        grid_size = [int(octree_resolution) + 1] * 3
+        x = np.linspace(bbox_min[0], bbox_max[0], grid_size[0], dtype=np.float32)
+        y = np.linspace(bbox_min[1], bbox_max[1], grid_size[1], dtype=np.float32)
+        z = np.linspace(bbox_min[2], bbox_max[2], grid_size[2], dtype=np.float32)
+        x = torch.from_numpy(x).to(device, dtype=dtype)
+        y = torch.from_numpy(y).to(device, dtype=dtype)
+        z = torch.from_numpy(z).to(device, dtype=dtype)
+        xs, ys, zs = torch.meshgrid(x, y, z, indexing="ij")
+        xyz_samples = torch.stack((xs, ys, zs), dim=-1).reshape(-1, 3)
 
         batch_logits = []
         for start in tqdm(

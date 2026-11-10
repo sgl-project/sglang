@@ -3,22 +3,19 @@
 import contextlib
 from collections import namedtuple
 from collections.abc import Callable
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 import triton
 import triton.language as tl
 
 from sglang.srt.layers.deep_gemm_wrapper.configurer import ENABLE_JIT_DEEPGEMM
-from sglang.srt.utils import is_npu
-from sglang.srt.utils.common import (
-    calc_diff,
-    get_bool_env_var,
-    get_device_core_count,
-    get_dispatch_device_backend,
-)
+from sglang.srt.utils import is_gfx95_supported, is_npu
+from sglang.srt.utils.common import calc_diff, get_bool_env_var
+from sglang.srt.utils.device import get_device_core_count, get_dispatch_device_backend
 
 _is_npu = is_npu()
+_is_gfx95 = is_gfx95_supported()
 if _is_npu:
     import torch_npu
 
@@ -170,32 +167,7 @@ def matmul_kernel_persistent(
         tl.store(c_ptrs, c, mask=c_mask)
 
 
-def _matmul_persistent_triton(
-    a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None = None
-):
-    # Check constraints.
-    assert a.shape[1] == b.shape[0], "Incompatible dimensions"
-    assert a.dtype == b.dtype, "Incompatible dtypes"
-    assert bias is None or bias.dim() == 1, (
-        "Currently assuming bias is 1D, let Horace know if you run into this"
-    )
-    NUM_SMS = get_device_core_count()
-    M, K = a.shape
-    K, N = b.shape
-    dtype = a.dtype
-    # Allocates output.
-    c = torch.empty((M, N), device=a.device, dtype=dtype)
-
-    # 1D launch kernel where each block gets its own program.
-    def grid(META):
-        return (
-            min(
-                NUM_SMS,
-                triton.cdiv(M, META["BLOCK_SIZE_M"])
-                * triton.cdiv(N, META["BLOCK_SIZE_N"]),
-            ),
-        )
-
+def _matmul_persistent_configs() -> dict:
     configs = {
         torch.bfloat16: {
             "BLOCK_SIZE_M": 128,
@@ -222,6 +194,51 @@ def _matmul_persistent_triton(
             "num_warps": 8,
         },
     }
+    if _is_gfx95:
+        # Measured on MI350X: faster than the default on average over M = 1-4096
+        # on dense and MoE linear shapes up to N ~ 8k, neutral on wider N; needs
+        # gfx950's 160 KB of LDS.
+        configs[torch.bfloat16] = {
+            "BLOCK_SIZE_M": 128,
+            "BLOCK_SIZE_N": 64,
+            "BLOCK_SIZE_K": 128,
+            "GROUP_SIZE_M": 8,
+            "num_stages": 3,
+            "num_warps": 8,
+            "matrix_instr_nonkdim": 16,
+        }
+    return configs
+
+
+def _matmul_persistent_triton(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    out_dtype: torch.dtype,
+    bias: torch.Tensor | None = None,
+):
+    # Check constraints.
+    assert a.shape[1] == b.shape[0], "Incompatible dimensions"
+    assert a.dtype == b.dtype, "Incompatible dtypes"
+    assert bias is None or bias.dim() == 1, (
+        "Currently assuming bias is 1D, let Horace know if you run into this"
+    )
+    NUM_SMS = get_device_core_count()
+    M, K = a.shape
+    K, N = b.shape
+    # Allocates output.
+    c = torch.empty((M, N), device=a.device, dtype=out_dtype)
+
+    # 1D launch kernel where each block gets its own program.
+    def grid(META):
+        return (
+            min(
+                NUM_SMS,
+                triton.cdiv(M, META["BLOCK_SIZE_M"])
+                * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+            ),
+        )
+
+    configs = _matmul_persistent_configs()
     # print(a.device, b.device, c.device)
     matmul_kernel_persistent[grid](
         a,
@@ -242,18 +259,228 @@ def _matmul_persistent_triton(
         B_LARGE=b.numel() > 2**31,
         C_LARGE=c.numel() > 2**31,
         HAS_BIAS=bias is not None,
-        **configs[dtype],
+        **configs[a.dtype],
     )
     return c
 
 
+# The segmented matmul splits K into _SEGMENT_COUNT fixed segments and adds the
+# segment sums in order, at every M. Small M runs the segments in separate programs
+# (fp32 partials, then a fixed-order reduce) and large M runs them in one program;
+# both give the same bits, so tiles and the split may be chosen by M and N. Outputs
+# with the same BLOCK_K and segment count were bitwise equal across tiles and warps
+# on MI350X; changing either changes the numerics.
+_SEGMENT_COUNT = 4
+_SEGMENT_BLOCK_K = 64
+# With a single BLOCK_K step per segment the compiler folds the segment's sum into the
+# running total when the segments run in one program, so the split and unsplit launches
+# round differently; K up to this size keeps the persistent kernel.
+_SEGMENT_MIN_K = _SEGMENT_COUNT * _SEGMENT_BLOCK_K
+
+
+@triton.jit
+def _segmented_matmul_kernel(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    partial_ptr,
+    bias_ptr,
+    M,
+    N,
+    K,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    SEGMENT_K: tl.constexpr,
+    SEGMENT_COUNT: tl.constexpr,
+    SPLIT: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    segment = tl.program_id(1)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    first_pid_m = (pid // num_pid_in_group) * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + (pid % num_pid_in_group) % group_size_m
+    pid_n = (pid % num_pid_in_group) // group_size_m
+    offs_m = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)).to(tl.int64)
+    offs_n = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)).to(tl.int64)
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    total = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    first = segment if SPLIT else 0
+    last = segment + 1 if SPLIT else SEGMENT_COUNT
+    for s in range(first, last):
+        acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        for k0 in range(0, SEGMENT_K, BLOCK_SIZE_K):
+            k = s * SEGMENT_K + k0 + offs_k
+            a = tl.load(
+                a_ptr + offs_m[:, None] * stride_am + k[None, :] * stride_ak,
+                mask=(offs_m[:, None] < M) & (k[None, :] < K),
+                other=0.0,
+            )
+            b = tl.load(
+                b_ptr + k[:, None] * stride_bk + offs_n[None, :] * stride_bn,
+                mask=(k[:, None] < K) & (offs_n[None, :] < N),
+                other=0.0,
+            )
+            acc = tl.dot(a, b, acc)
+        total += acc
+    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    if SPLIT:
+        tl.store(
+            partial_ptr
+            + segment.to(tl.int64) * M * N
+            + offs_m[:, None] * N
+            + offs_n[None, :],
+            total,
+            mask=mask,
+        )
+    else:
+        if HAS_BIAS:
+            bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+            total += bias.to(tl.float32)[None, :]
+        tl.store(
+            c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn,
+            total.to(c_ptr.dtype.element_ty),
+            mask=mask,
+        )
+
+
+@triton.jit
+def _segment_reduce_kernel(
+    partial_ptr,
+    c_ptr,
+    bias_ptr,
+    M,
+    N,
+    SEGMENT_COUNT: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offs = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < M * N
+    total = tl.zeros((BLOCK,), dtype=tl.float32)
+    for s in range(SEGMENT_COUNT):
+        total += tl.load(
+            partial_ptr + s * (M * N).to(tl.int64) + offs, mask=mask, other=0.0
+        )
+    if HAS_BIAS:
+        total += tl.load(bias_ptr + offs % N, mask=mask, other=0.0).to(tl.float32)
+    tl.store(c_ptr + offs, total.to(c_ptr.dtype.element_ty), mask=mask)
+
+
+def _segmented_matmul_launch(M: int, N: int) -> tuple:
+    """(BLOCK_SIZE_M, BLOCK_SIZE_N, num_warps, num_stages, split) by M and N.
+
+    None of these change the bits. Measured on MI350X over the bf16 linear shapes of
+    Qwen3-8B, Qwen3.8-27B, Qwen3-30B-A3B and gpt-oss-20b, M = 1-8192.
+
+    Without the split, one program loops over all segments, and it is never
+    software-pipelined (num_stages 1): with pipelining across that loop the output
+    was not run-to-run deterministic for some K on MI350X.
+    """
+    if N < 1024:
+        return 32, 64, 4, 2, True
+    if N <= 8192:
+        if M <= 32:
+            return 32, 64, 4, 2, True
+        if M <= 64:
+            return 64, 64, 4, 2, True
+        if M <= 256:
+            return 128, 128, 8, 3, True
+        if M <= 1024:
+            return 128, 128, 8, 2, True
+        if M <= 2048:
+            return 128, 128, 8, 1, False
+        return 128, 256, 8, 1, False
+    if M <= 32:
+        return 32, 64, 4, 2, True
+    if M <= 64:
+        return 64, 64, 4, 2, True
+    if M <= 128:
+        return 128, 128, 8, 2, True
+    return 256, 128, 8, 1, False
+
+
+def _matmul_segmented_triton(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    out_dtype: torch.dtype,
+    bias: torch.Tensor | None = None,
+):
+    M, K = a.shape
+    N = b.shape[1]
+    block_m, block_n, num_warps, num_stages, split = _segmented_matmul_launch(M, N)
+    num_tiles = triton.cdiv(M, block_m) * triton.cdiv(N, block_n)
+    segment_k = (
+        triton.cdiv(triton.cdiv(K, _SEGMENT_COUNT), _SEGMENT_BLOCK_K) * _SEGMENT_BLOCK_K
+    )
+    c = torch.empty((M, N), device=a.device, dtype=out_dtype)
+    partial = (
+        torch.empty((_SEGMENT_COUNT, M, N), device=a.device, dtype=torch.float32)
+        if split
+        else c
+    )
+    _segmented_matmul_kernel[(num_tiles, _SEGMENT_COUNT if split else 1)](
+        a,
+        b,
+        c,
+        partial,
+        bias,
+        M,
+        N,
+        K,
+        a.stride(0),
+        a.stride(1),
+        b.stride(0),
+        b.stride(1),
+        c.stride(0),
+        c.stride(1),
+        SEGMENT_K=segment_k,
+        SEGMENT_COUNT=_SEGMENT_COUNT,
+        SPLIT=split,
+        HAS_BIAS=bias is not None,
+        BLOCK_SIZE_M=block_m,
+        BLOCK_SIZE_N=block_n,
+        BLOCK_SIZE_K=_SEGMENT_BLOCK_K,
+        GROUP_SIZE_M=8,
+        num_warps=num_warps,
+        num_stages=num_stages,
+        matrix_instr_nonkdim=16,
+    )
+    if split:
+        block = 4096
+        _segment_reduce_kernel[(triton.cdiv(M * N, block),)](
+            partial,
+            c,
+            bias,
+            M,
+            N,
+            SEGMENT_COUNT=_SEGMENT_COUNT,
+            HAS_BIAS=bias is not None,
+            BLOCK=block,
+        )
+    return c
+
+
 def _matmul_persistent_deepgemm(
-    a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None = None
+    a: torch.Tensor,
+    b: torch.Tensor,
+    out_dtype: torch.dtype,
+    bias: torch.Tensor | None = None,
 ):
     M, K = a.shape
     K, N = b.shape
-    dtype = a.dtype
-    out = torch.empty((M, N), device=a.device, dtype=dtype)
+    out = torch.empty((M, N), device=a.device, dtype=out_dtype)
 
     # DeepGEMM 0.2 defaults BF16 GEMMs to cuBLASLt, whose reduction can
     # depend on the batch size. Older wheels always use the invariant kernel.
@@ -282,12 +509,18 @@ def _matmul_persistent_deepgemm(
 
 
 def matmul_persistent(
-    a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None = None
+    a: torch.Tensor,
+    b: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
 ):
     K, N = b.shape
+    out_dtype = out_dtype or a.dtype
 
     # DeepGEMM has minimum dimension requirements for TMA descriptors
     MIN_DEEPGEMM_DIM = 16
+    element_size = a.element_size()
+    deepgemm_tma_aligned = (N * element_size) % 16 == 0 and (K * element_size) % 16 == 0
 
     if (
         _ENABLE_MM_DEEPGEMM
@@ -297,10 +530,15 @@ def matmul_persistent(
         and a.is_contiguous()
         and b.transpose(0, 1).is_contiguous()
         and N >= MIN_DEEPGEMM_DIM
+        and deepgemm_tma_aligned
     ):
         if _ENABLE_MM_COMPARISON_TEST:
-            out_triton = _matmul_persistent_triton(a=a, b=b, bias=bias)
-            out_deepgemm = _matmul_persistent_deepgemm(a=a, b=b, bias=bias)
+            out_triton = _matmul_persistent_triton(
+                a=a, b=b, bias=bias, out_dtype=out_dtype
+            )
+            out_deepgemm = _matmul_persistent_deepgemm(
+                a=a, b=b, bias=bias, out_dtype=out_dtype
+            )
             diff = calc_diff(out_triton, out_deepgemm)
             assert diff < 0.0001, f"{diff=} {out_triton=} {out_deepgemm=}"
             # can be enabled for debugging
@@ -313,15 +551,23 @@ def matmul_persistent(
             # print(f"{a=} {b=} {bias=} {out_triton=} {out_deepgemm=}")
             return out_deepgemm
 
-        return _matmul_persistent_deepgemm(a=a, b=b, bias=bias)
+        return _matmul_persistent_deepgemm(a=a, b=b, bias=bias, out_dtype=out_dtype)
 
-    if _ENABLE_MM_FALLBACK_VARIANT:
+    if _ENABLE_MM_FALLBACK_VARIANT and out_dtype == a.dtype:
         out = torch.einsum("ik,kj->ij", a, b)
         if bias is not None:
             out += bias
         return out
 
-    return _matmul_persistent_triton(a=a, b=b, bias=bias)
+    if (
+        _is_gfx95
+        and a.dtype == torch.bfloat16
+        and out_dtype == torch.bfloat16
+        and K > _SEGMENT_MIN_K
+    ):
+        return _matmul_segmented_triton(a=a, b=b, bias=bias, out_dtype=out_dtype)
+
+    return _matmul_persistent_triton(a=a, b=b, bias=bias, out_dtype=out_dtype)
 
 
 @triton.jit
@@ -585,6 +831,12 @@ def mean_dim(
 
 def mm_batch_invariant(a, b):
     return matmul_persistent(a, b)
+
+
+def mm_out_batch_invariant(
+    a: torch.Tensor, b: torch.Tensor, *, out: torch.Tensor
+) -> torch.Tensor:
+    return out.copy_(matmul_persistent(a, b))
 
 
 def addmm_batch_invariant(bias, a, b):
@@ -948,6 +1200,147 @@ def rms_norm_batch_invariant(
     return rms_norm(input, weight, eps=eps)
 
 
+@triton.jit
+def _fused_add_rms_norm_kernel(
+    input_ptr,
+    residual_ptr,
+    addend_ptr,
+    weight_ptr,
+    output_ptr,
+    residual_out_ptr,
+    input_row_stride: tl.constexpr,
+    residual_row_stride: tl.constexpr,
+    addend_row_stride: tl.constexpr,
+    output_row_stride: tl.constexpr,
+    residual_out_row_stride: tl.constexpr,
+    n_cols: tl.constexpr,
+    eps,
+    HAS_ADDEND: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """
+    Add the residual (and an optional addend) to the input in float32, store the
+    sum as the new residual, and RMS-normalize the sum.
+    Each block handles one row, so a row's result does not depend on the others.
+    """
+    row_idx = tl.program_id(0).to(tl.int64)
+    input_row = input_ptr + row_idx * input_row_stride
+    residual_row = residual_ptr + row_idx * residual_row_stride
+    addend_row = addend_ptr + row_idx * addend_row_stride
+    output_row = output_ptr + row_idx * output_row_stride
+    residual_out_row = residual_out_ptr + row_idx * residual_out_row_stride
+
+    # Step 1: Sum in float32, store the new residual, accumulate the sum of squares
+    sum_sq = tl.zeros([1], dtype=tl.float32)
+    for col_offset in range(0, n_cols, BLOCK_SIZE):
+        col_idx = col_offset + tl.arange(0, BLOCK_SIZE)
+        mask = col_idx < n_cols
+        vals_f32 = tl.load(input_row + col_idx, mask=mask, other=0.0).to(tl.float32)
+        vals_f32 += tl.load(residual_row + col_idx, mask=mask, other=0.0).to(tl.float32)
+        if HAS_ADDEND:
+            vals_f32 += tl.load(addend_row + col_idx, mask=mask, other=0.0).to(
+                tl.float32
+            )
+        tl.store(
+            residual_out_row + col_idx,
+            vals_f32.to(residual_out_ptr.dtype.element_ty),
+            mask=mask,
+        )
+        sum_sq += tl.sum(tl.where(mask, vals_f32 * vals_f32, 0.0))
+
+    # Step 2: Compute RMS (root mean square) in float32
+    mean_sq = sum_sq / n_cols
+    rms = tl.sqrt(mean_sq + eps)
+    inv_rms = 1.0 / rms
+
+    # Step 3: Recompute the float32 sum, normalize and apply weight
+    for col_offset in range(0, n_cols, BLOCK_SIZE):
+        col_idx = col_offset + tl.arange(0, BLOCK_SIZE)
+        mask = col_idx < n_cols
+        vals_f32 = tl.load(input_row + col_idx, mask=mask, other=0.0).to(tl.float32)
+        vals_f32 += tl.load(residual_row + col_idx, mask=mask, other=0.0).to(tl.float32)
+        if HAS_ADDEND:
+            vals_f32 += tl.load(addend_row + col_idx, mask=mask, other=0.0).to(
+                tl.float32
+            )
+        weight_f32 = tl.load(weight_ptr + col_idx, mask=mask, other=1.0).to(tl.float32)
+        output_f32 = vals_f32 * inv_rms * weight_f32
+        tl.store(
+            output_row + col_idx,
+            output_f32.to(output_ptr.dtype.element_ty),
+            mask=mask,
+        )
+
+
+def fused_add_rms_norm_batch_invariant(
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+    addend: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
+    residual_dtype: Optional[torch.dtype] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Batch-invariant fused residual add and RMS normalization.
+
+    sum = input + residual (+ addend), computed in float32
+    output = sum / sqrt(mean(sum^2) + eps) * weight
+
+    Args:
+        input: Input tensor of shape (..., hidden_size)
+        residual: Residual tensor of the same shape
+        weight: Weight tensor of shape (hidden_size,)
+        eps: Small constant for numerical stability
+        addend: Optional tensor of the same shape, added after the residual
+        out_dtype: dtype of the output (default: input's dtype)
+        residual_dtype: dtype of the new residual (default: input's dtype)
+
+    Returns:
+        (output, new residual), both of the input's shape
+    """
+    assert weight.dim() == 1, "Weight must be 1-dimensional"
+    assert input.shape[-1] == weight.shape[0], (
+        f"Input last dimension ({input.shape[-1]}) must match "
+        f"weight dimension ({weight.shape[0]})"
+    )
+    assert residual.shape == input.shape, "Residual must match the input's shape"
+
+    original_shape = input.shape
+    input_2d = input.reshape(-1, input.shape[-1]).contiguous()
+    residual_2d = residual.reshape(-1, input.shape[-1]).contiguous()
+    addend_2d = (
+        addend.reshape(-1, input.shape[-1]).contiguous()
+        if addend is not None
+        else input_2d
+    )
+    weight = weight.contiguous()
+
+    n_rows, n_cols = input_2d.shape
+    output = torch.empty_like(input_2d, dtype=out_dtype or input.dtype)
+    residual_out = torch.empty_like(input_2d, dtype=residual_dtype or input.dtype)
+    BLOCK_SIZE = 1024
+    grid = (n_rows,)
+    _fused_add_rms_norm_kernel[grid](
+        input_2d,
+        residual_2d,
+        addend_2d,
+        weight,
+        output,
+        residual_out,
+        input_2d.stride(0),
+        residual_2d.stride(0),
+        addend_2d.stride(0),
+        output.stride(0),
+        residual_out.stride(0),
+        n_cols,
+        eps,
+        HAS_ADDEND=addend is not None,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+    return output.reshape(original_shape), residual_out.reshape(original_shape)
+
+
 _ONES_CACHE: dict[Tuple, torch.Tensor] = {}
 
 
@@ -974,7 +1367,7 @@ def _rms_norm_aten_compat(input, normalized_shape, weight=None, eps=None):
 
 
 def _mm_dtype_compat(self, mat2, out_dtype):
-    return matmul_persistent(self.contiguous(), mat2.contiguous()).to(out_dtype)
+    return matmul_persistent(self.contiguous(), mat2.contiguous(), out_dtype=out_dtype)
 
 
 _batch_invariant_MODE = False
@@ -999,6 +1392,7 @@ def enable_batch_invariant_mode(enable_bmm: bool = True):
     if not _is_npu:
         # Register for detected device
         _batch_invariant_LIB.impl("aten::mm", mm_batch_invariant, dispatch_key)
+        _batch_invariant_LIB.impl("aten::mm.out", mm_out_batch_invariant, dispatch_key)
         _batch_invariant_LIB.impl("aten::addmm", addmm_batch_invariant, dispatch_key)
         _batch_invariant_LIB.impl(
             "aten::_log_softmax", _log_softmax_batch_invariant, dispatch_key
@@ -1015,6 +1409,7 @@ def enable_batch_invariant_mode(enable_bmm: bool = True):
     else:
         from sglang.srt.hardware_backend.npu.batch_invariant_ops.npu_batch_invariant_ops import (
             npu_add_rms_norm_batch_invariant,
+            npu_fia_batch_invariant_get_max_workspace,
             npu_fused_infer_attention_score_batch_invariant,
             npu_log_softmax_batch_invariant,
             npu_matmul_batch_invariant,
@@ -1035,6 +1430,12 @@ def enable_batch_invariant_mode(enable_bmm: bool = True):
         torch.ops.npu.npu_fused_infer_attention_score = (
             npu_fused_infer_attention_score_batch_invariant
         )
+        torch_npu.npu_fused_infer_attention_score = (
+            npu_fused_infer_attention_score_batch_invariant
+        )
+        torch_npu._npu_fused_infer_attention_score_get_max_workspace = (
+            npu_fia_batch_invariant_get_max_workspace
+        )
         torch_npu.npu_add_rms_norm = npu_add_rms_norm_batch_invariant
 
 
@@ -1051,16 +1452,22 @@ def disable_batch_invariant_mode():
 
 @contextlib.contextmanager
 def set_batch_invariant_mode(enabled: bool = True):
-    global _batch_invariant_MODE, _batch_invariant_LIB
-    old_data = (_batch_invariant_MODE, _batch_invariant_LIB)
-    if enabled:
-        enable_batch_invariant_mode()
-    else:
-        disable_batch_invariant_mode()
-    yield
-    if _batch_invariant_LIB is not None:
-        _batch_invariant_LIB._destroy()
-    _batch_invariant_MODE, _batch_invariant_LIB = old_data
+    previous_mode = _batch_invariant_MODE
+    previous_bmm_enabled = _original_torch_bmm is not None
+    try:
+        if enabled:
+            enable_batch_invariant_mode()
+        else:
+            disable_batch_invariant_mode()
+        yield
+    finally:
+        if (_batch_invariant_MODE, _original_torch_bmm is not None) != (
+            previous_mode,
+            previous_bmm_enabled,
+        ):
+            disable_batch_invariant_mode()
+            if previous_mode:
+                enable_batch_invariant_mode(enable_bmm=previous_bmm_enabled)
 
 
 AttentionBlockSize = namedtuple("AttentionBlockSize", ["block_m", "block_n"])

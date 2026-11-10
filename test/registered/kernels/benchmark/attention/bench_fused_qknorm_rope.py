@@ -5,7 +5,7 @@ Measures throughput (µs) for fused_qk_norm_rope across typical
 LLM configurations (head_dim × num_heads × num_tokens).
 
 Run:
-    python test/registered/jit/benchmark/bench_fused_qknorm_rope.py
+    python test/registered/kernels/benchmark/attention/bench_fused_qknorm_rope.py
 """
 
 import itertools
@@ -21,7 +21,7 @@ from sglang.kernels.ops.attention.fused_qknorm_rope import (
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
-    est_time=6, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
+    est_time=6, stage="base-b-kernel-benchmark", runner_config="1-gpu-small"
 )
 
 try:

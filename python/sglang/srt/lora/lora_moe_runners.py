@@ -37,7 +37,7 @@ _is_hip = is_hip()
 _is_xpu = is_xpu()
 
 if _is_cuda or _is_hip or _is_xpu:
-    from sglang.kernels.ops.moe.moe_lora_align import moe_lora_align_block_size
+    from sglang.kernels.ops.lora.moe.moe_lora_align import moe_lora_align_block_size
 
 
 def _get_moe_lora_block_config(max_lora_rank: int) -> dict:
@@ -184,16 +184,17 @@ class LoRAInfo:
     experts_shared_outer_loras: bool = False
     cg_buffers: dict | None = None
 
-    fully_sharded: bool = False
-    tp_size: int = 1
-    tp_rank: int = 0
-    hidden_size: int = 0
     lora_use_virtual_experts: bool = False
 
 
 @dataclass
 class LoRAHooks:
-    """Hook callbacks for injecting LoRA deltas into the MoE pipeline."""
+    """Hook callbacks for injecting LoRA deltas into the MoE pipeline.
+
+    Dropped route IDs remain negative. Hooks must skip those routes before
+    reading their payloads or scores; private inactive intermediates may be
+    uninitialized and routing scores are passed without a sanitized copy.
+    """
 
     after_gate_up: (
         Callable[[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], None] | None
@@ -316,8 +317,10 @@ def _add_lora_gate_up_delta(
     routing_cache: dict | None = None,
 ) -> None:
     """Add LoRA gate_up delta to intermediate_cache in-place."""
-    from sglang.kernels.ops.moe.fused_moe_lora_kernel import fused_moe_lora
-    from sglang.kernels.ops.moe.virtual_experts import merged_experts_fused_moe_lora_add
+    from sglang.kernels.ops.lora.moe.fused_moe_lora_kernel import fused_moe_lora
+    from sglang.kernels.ops.lora.moe.virtual_experts import (
+        merged_experts_fused_moe_lora_add,
+    )
 
     if lora_info is None or lora_info.max_lora_rank == 0:
         return
@@ -359,6 +362,8 @@ def _add_lora_gate_up_delta(
             experts_shared_outer_loras_a=lora_info.experts_shared_outer_loras,
             experts_shared_outer_loras_b=False,
             routing_cache=routing_cache,
+            adapter_enabled=lora_info.adapter_enabled,
+            a_output_slices=2 if is_gated else 1,
         )
     else:
         blk = _get_moe_lora_block_config(r)
@@ -389,7 +394,6 @@ def _add_lora_gate_up_delta(
             expand_num_warps=4,
             expand_num_stages=2,
             expand_split_k=1,
-            fully_sharded=lora_info.fully_sharded,
         )
 
 
@@ -407,8 +411,10 @@ def _add_lora_down_delta(
     routing_cache: dict | None = None,
 ) -> None:
     """Add LoRA down delta to intermediate_cache in-place."""
-    from sglang.kernels.ops.moe.fused_moe_lora_kernel import fused_moe_lora
-    from sglang.kernels.ops.moe.virtual_experts import merged_experts_fused_moe_lora_add
+    from sglang.kernels.ops.lora.moe.fused_moe_lora_kernel import fused_moe_lora
+    from sglang.kernels.ops.lora.moe.virtual_experts import (
+        merged_experts_fused_moe_lora_add,
+    )
 
     if lora_info.max_lora_rank == 0:
         return
@@ -419,12 +425,6 @@ def _add_lora_down_delta(
     down_lora_b = lora_info.down_lora_b_weights
     if lora_info.experts_shared_outer_loras and not lora_info.lora_use_virtual_experts:
         down_lora_b = down_lora_b.expand(-1, lora_info.num_experts, -1, -1)
-
-    if lora_info.fully_sharded and lora_info.tp_size > 1:
-        shard_size = lora_info.hidden_size // lora_info.tp_size
-        offset = shard_size * lora_info.tp_rank
-    else:
-        offset = 0
 
     if lora_info.lora_use_virtual_experts:
         merged_experts_fused_moe_lora_add(
@@ -439,6 +439,7 @@ def _add_lora_down_delta(
             experts_shared_outer_loras_a=False,
             experts_shared_outer_loras_b=lora_info.experts_shared_outer_loras,
             routing_cache=routing_cache,
+            adapter_enabled=lora_info.adapter_enabled,
         )
     else:
         blk = _get_moe_lora_block_config(lora_info.max_lora_rank)
@@ -470,8 +471,6 @@ def _add_lora_down_delta(
             expand_num_stages=2,
             expand_split_k=1,
             mul_routed_weight=True,
-            fully_sharded=lora_info.fully_sharded,
-            offset=offset,
         )
 
 

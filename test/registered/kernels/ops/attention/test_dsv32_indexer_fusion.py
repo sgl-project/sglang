@@ -1,4 +1,4 @@
-"""Correctness tests for the DeepSeek-V3.2 DSA indexer fused kernels.
+"""Correctness tests for the DSA indexer fused kernels (DeepSeek-V3.2, ERNIE 5.5).
 
 Covers:
   - fused_q_indexer_rope_first_quant      (Q: rope-first + fp8 quant + head-gate fold)
@@ -17,22 +17,21 @@ from __future__ import annotations
 import pytest
 import torch
 
-from sglang.kernels.ops.attention.dsv4 import fused_q_indexer_rope_first_quant
-from sglang.kernels.ops.attention.fused_store_index_cache import (
-    can_use_dsa_fused_store,
-    fused_store_index_k_cache,
-)
-from sglang.kernels.ops.quantization.dsv32 import (
+from sglang.kernels.ops.attention.dsa.indexer_k import (
     fused_k_indexer_norm_rope,
     fused_k_indexer_norm_rope_store,
 )
+from sglang.kernels.ops.attention.dsa.indexer_q import fused_q_indexer_rope_first_quant
+from sglang.kernels.ops.kvcache.dsa_fused_store_index_cache import (
+    can_use_dsa_fused_store,
+    fused_store_index_k_cache,
+)
 from sglang.srt.utils import is_hip
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci
 
 _is_hip = is_hip()
 
-register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-large")
-register_amd_ci(est_time=45, suite="jit-kernel-unit-test-amd")
+register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-small")
 
 HEAD_DIM = 128
 ROPE_DIM = 64
@@ -268,6 +267,126 @@ def test_indexer_uses_replaced_rope_cache_for_fused_kernels():
         rtol=1e-3,
     )
     assert ((q_fp8.float() * scale - q_ref).abs() <= 0.0625 * q_ref.abs() + scale).all()
+
+
+def _rope_neox(x, cos_p, sin_p):
+    x = x.clone()
+    x1 = x[..., :HALF].clone()
+    x2 = x[..., HALF:ROPE_DIM].clone()
+    x[..., :HALF] = x1 * cos_p - x2 * sin_p
+    x[..., HALF:ROPE_DIM] = x2 * cos_p + x1 * sin_p
+    return x
+
+
+def _hadamard(x):
+    from scipy.linalg import hadamard
+
+    h = torch.tensor(hadamard(HEAD_DIM), dtype=torch.float32, device=x.device)
+    return x @ h * HEAD_DIM**-0.5
+
+
+def test_neox_hadamard_k_matches_reference():
+    _skip_if_unavailable()
+    dev = "cuda"
+    B = 37
+    g = torch.Generator(device=dev).manual_seed(5)
+    cos, sin, cos_sin_cache, positions = _make_inputs(B, seed=5)
+    key = torch.randn(B, HEAD_DIM, dtype=torch.bfloat16, device=dev, generator=g)
+    weight = torch.randn(HEAD_DIM, dtype=torch.float32, device=dev, generator=g)
+    bias = torch.randn(HEAD_DIM, dtype=torch.float32, device=dev, generator=g)
+
+    out = fused_k_indexer_norm_rope(
+        key,
+        weight,
+        bias,
+        EPS,
+        cos_sin_cache,
+        positions,
+        hadamard=True,
+        neox_style=True,
+    )
+    normed = torch.nn.functional.layer_norm(
+        key.float(), (HEAD_DIM,), weight=weight, bias=bias, eps=EPS
+    )
+    ref = _hadamard(_rope_neox(normed, cos[positions.long()], sin[positions.long()]))
+    torch.testing.assert_close(out.float(), ref, atol=BF16_ATOL, rtol=BF16_RTOL)
+
+
+def test_neox_hadamard_k_store_matches_unfused():
+    _skip_if_unavailable()
+    if not can_use_dsa_fused_store(torch.bfloat16, torch.int64, PAGE_SIZE):
+        pytest.skip("fused store JIT unavailable")
+    dev = "cuda"
+    B, n_heads = 41, 64
+    cos, sin, cos_sin_cache, positions = _make_inputs(B, seed=6)
+    weight = torch.randn(HEAD_DIM, dtype=torch.float32, device=dev)
+    bias = torch.randn(HEAD_DIM, dtype=torch.float32, device=dev)
+    kw = torch.randn(B, HEAD_DIM + n_heads, dtype=torch.bfloat16, device=dev)
+    key = kw[:, :HEAD_DIM]
+    loc = torch.randperm(B * 4, device=dev)[:B].to(torch.int64)
+    num_pages = int(loc.max().item()) // PAGE_SIZE + 2
+    buf_ref = torch.zeros(
+        num_pages, BYTES_PER_TOKEN * PAGE_SIZE, dtype=torch.uint8, device=dev
+    )
+    buf_fused = torch.zeros_like(buf_ref)
+    flags = dict(hadamard=True, neox_style=True)
+
+    key_bf16 = fused_k_indexer_norm_rope(
+        key, weight, bias, EPS, cos_sin_cache, positions, **flags
+    )
+    fused_store_index_k_cache(key_bf16, buf_ref, loc, PAGE_SIZE)
+    fused_k_indexer_norm_rope_store(
+        key,
+        buf_fused,
+        loc,
+        weight,
+        bias,
+        EPS,
+        cos_sin_cache,
+        positions,
+        PAGE_SIZE,
+        **flags,
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(buf_ref, buf_fused)
+
+
+def test_neox_hadamard_q_matches_reference():
+    _skip_if_unavailable()
+    dev = "cuda"
+    B, n_heads = 37, 64
+    cos, sin, cos_sin_cache, positions = _make_inputs(B, seed=7)
+    q = torch.randn(B, n_heads, HEAD_DIM, dtype=torch.bfloat16, device=dev)
+    weight = torch.randn(B, n_heads, dtype=torch.bfloat16, device=dev)
+    weight_scale = 0.137
+
+    q_fp8, weights_out = fused_q_indexer_rope_first_quant(
+        q,
+        weight,
+        weight_scale,
+        cos_sin_cache,
+        positions,
+        hadamard=True,
+        neox_style=True,
+    )
+    torch.cuda.synchronize()
+
+    ref = _hadamard(
+        _rope_neox(
+            q.float(),
+            cos[positions.long()][:, None, :],
+            sin[positions.long()][:, None, :],
+        )
+    )
+    scale = torch.clamp(ref.abs().amax(dim=-1, keepdim=True), min=1e-4) / FP8_MAX
+    torch.testing.assert_close(
+        weights_out.squeeze(-1),
+        weight.float() * weight_scale * scale.squeeze(-1),
+        atol=1e-3,
+        rtol=1e-3,
+    )
+    deq = q_fp8.float() * scale
+    assert ((deq - ref).abs() <= 0.0625 * ref.abs() + scale).all()
 
 
 if __name__ == "__main__":

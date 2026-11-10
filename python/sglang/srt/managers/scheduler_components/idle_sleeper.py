@@ -7,6 +7,7 @@ import zmq
 from sglang.srt.environ import envs
 from sglang.srt.observability.req_time_stats import real_time
 from sglang.srt.platforms import current_platform
+from sglang.srt.runtime_context import get_device
 
 if TYPE_CHECKING:
     from sglang.srt.rust_server.server import RustServer
@@ -24,9 +25,10 @@ class IdleSleeper:
     data that needs handling immediately.
     """
 
-    def __init__(self, sockets):
+    def __init__(self, sockets, can_empty_cache=None):
         self.poller = zmq.Poller()
         self.last_empty_time = real_time()
+        self.can_empty_cache = can_empty_cache
         for s in sockets:
             self.poller.register(s, zmq.POLLIN)
 
@@ -39,7 +41,8 @@ class IdleSleeper:
             and real_time() - self.last_empty_time > self.empty_cache_interval
         ):
             self.last_empty_time = real_time()
-            current_platform.empty_cache()
+            if self.can_empty_cache is None or self.can_empty_cache():
+                current_platform.empty_cache()
 
 
 class RustServerIdleSleeper:
@@ -52,11 +55,18 @@ class RustServerIdleSleeper:
     requests — or the timeout elapses.
     """
 
-    def __init__(self, rust_server: RustServer, timeout_ms: int = 1000):
+    def __init__(
+        self, rust_server: RustServer, timeout_ms: int = 1000, can_empty_cache=None
+    ):
         self.rust_server = rust_server
         self.timeout_ms = timeout_ms
         self.last_empty_time = real_time()
-        self.empty_cache_interval = envs.SGLANG_EMPTY_CACHE_INTERVAL.get()
+        self.can_empty_cache = can_empty_cache
+        # Python's loop empties the cache only in its IdleSleeper, which it
+        # installs only with --sleep-on-idle.
+        self.empty_cache_interval = (
+            envs.SGLANG_EMPTY_CACHE_INTERVAL.get() if get_device().sleep_on_idle else -1
+        )
 
     def maybe_sleep(self):
         self.rust_server.wait_request(self.timeout_ms)
@@ -65,4 +75,5 @@ class RustServerIdleSleeper:
             and real_time() - self.last_empty_time > self.empty_cache_interval
         ):
             self.last_empty_time = real_time()
-            current_platform.empty_cache()
+            if self.can_empty_cache is None or self.can_empty_cache():
+                current_platform.empty_cache()

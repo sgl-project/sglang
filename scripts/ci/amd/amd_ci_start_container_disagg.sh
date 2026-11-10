@@ -4,23 +4,21 @@ set -euo pipefail
 # Get version from git tags
 SGLANG_VERSION="v0.5.5"   # Default version, will be overridden if git tags are found
 
-# Fetch tags from origin to ensure we have the latest
-if git fetch --tags origin; then
-  # Use the shared helper so stable/post releases sort above rc tags.
-  VERSION_FROM_TAG=$(python3 scripts/release/get_version_tag.py --tag-only || true)
-  if [ -n "$VERSION_FROM_TAG" ]; then
-    SGLANG_VERSION="$VERSION_FROM_TAG"
-    echo "Using SGLang version from git tags: $SGLANG_VERSION"
-  else
-    echo "Warning: No version tags found; using default $SGLANG_VERSION" >&2
-  fi
+# List the release tags on origin rather than fetching them: `git fetch --tags`
+# also pulls every branch head (~30 s per job) just to read one tag name.
+# The shared helper sorts stable/post releases above rc tags.
+VERSION_FROM_TAG=$(python3 scripts/release/get_version_tag.py --tag-only --remote || true)
+if [ -n "$VERSION_FROM_TAG" ]; then
+  SGLANG_VERSION="$VERSION_FROM_TAG"
+  echo "Using SGLang version from git tags: $SGLANG_VERSION"
 else
-  echo "Warning: Failed to fetch tags from origin; using default $SGLANG_VERSION" >&2
+  echo "Warning: Failed to list version tags on origin; using default $SGLANG_VERSION" >&2
 fi
 
 
-# Default base tags (can be overridden by command line arguments)
-ROCM_VERSION="rocm700"
+# Default base tags (can be overridden by command line arguments).
+# Keep this aligned with the default AMD PR and Nightly CI lane.
+ROCM_VERSION="rocm10"
 DEFAULT_MI30X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi30x"
 DEFAULT_MI35X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi35x"
 LOCAL_DOCKER_REGISTRY="10.44.14.109:5000"
@@ -56,7 +54,11 @@ HOSTNAME_VALUE=$(hostname)
 GPU_ARCH="mi30x"   # default
 
 # Host names look like: linux-mi35x-gpu-1-xxxxx-runner-zzzzz
-if [[ "${HOSTNAME_VALUE}" =~ ^linux-(mi[0-9]+[a-z]*)-gpu-[0-9]+ ]]; then
+# Non-ARC runners have no such hostname and set AMD_CI_GPU_ARCH instead.
+if [[ -n "${AMD_CI_GPU_ARCH:-}" ]]; then
+  GPU_ARCH="${AMD_CI_GPU_ARCH}"
+  echo "Using GPU architecture from AMD_CI_GPU_ARCH: ${GPU_ARCH}"
+elif [[ "${HOSTNAME_VALUE}" =~ ^linux-(mi[0-9]+[a-z]*)-gpu-[0-9]+ ]]; then
   GPU_ARCH="${BASH_REMATCH[1]}"
   echo "Detected GPU architecture from hostname: ${GPU_ARCH}"
 else
@@ -196,13 +198,6 @@ find_latest_image() {
         echo "rocm/sgl-dev:v0.5.8.post1-rocm720-mi30x-20260211-preview"
       fi
       ;;
-    rocm700)
-      if [[ "${gpu_arch}" == "mi35x" ]]; then
-        echo "rocm/sgl-dev:v0.5.8.post1-rocm700-mi35x-20260211"
-      else
-        echo "rocm/sgl-dev:v0.5.8.post1-rocm700-mi30x-20260211"
-      fi
-      ;;
     *)
       echo "Error: no hard-coded fallback available for ${ROCM_VERSION}" >&2
       return 1
@@ -226,7 +221,11 @@ else
   retry_with_backoff 6 docker pull "${IMAGE}"
 fi
 
-CACHE_HOST=/home/runner/sglang-data
+# Non-ARC hosts have no /home/runner; setting AMD_CI_CACHE_HOST also turns the mount on.
+CACHE_HOST="${AMD_CI_CACHE_HOST:-/home/runner/sglang-data}"
+if [[ -z "${ENABLE_CACHE_HOST:-}" && -n "${AMD_CI_CACHE_HOST:-}" ]]; then
+  ENABLE_CACHE_HOST="1"
+fi
 if [[ -z "${ENABLE_CACHE_HOST:-}" ]]; then
   RUNNER_NAME_LOWER="${RUNNER_NAME:-}"
   RUNNER_NAME_LOWER="${RUNNER_NAME_LOWER,,}"

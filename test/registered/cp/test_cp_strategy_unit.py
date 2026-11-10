@@ -8,6 +8,7 @@ import torch
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.cp.base import (
     ContextParallelStrategyKind,
+    CPAttentionBackendKind,
     get_cp_strategy,
     get_cp_strategy_kind,
     init_cp_strategy,
@@ -15,7 +16,8 @@ from sglang.srt.layers.cp.base import (
     is_interleave,
     is_zigzag,
 )
-from sglang.srt.layers.cp.bcg import PrefillCPBCGInput
+from sglang.srt.layers.cp.bcg.interleave_bcg import InterleaveCPBCGInput
+from sglang.srt.layers.cp.bcg.zigzag_bcg import ZigzagCPBCGInput
 from sglang.srt.layers.cp.interleave import InterleaveCPStrategy
 from sglang.srt.layers.cp.padding import (
     get_cp_padding_align_size,
@@ -30,18 +32,17 @@ from sglang.srt.layers.cp.utils import (
 from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.cuda_graph_config import Backend
-from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
-    ForwardMode,
-)
+from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.mem_cache_utils import routed
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class _ExtendMode:
@@ -98,28 +99,21 @@ class TestCPStrategyUnit(CustomTestCase):
         self.assertTrue(is_cp_enabled())
         self.assertTrue(is_interleave())
 
-    def test_hip_dsa_cp_is_disabled(self):
-        parallel = SimpleNamespace(
-            attn_cp_size=2,
-        )
-        model_config = SimpleNamespace(hf_config=SimpleNamespace())
-
-        with (
-            patch(
-                "sglang.srt.layers.attention.dsa.utils.get_parallel",
-                return_value=parallel,
-            ),
-            patch(
-                "sglang.srt.layers.attention.dsa.utils.process_model_config",
-                return_value=model_config,
-            ),
-            patch("sglang.srt.layers.attention.dsa.utils.is_hip", return_value=True),
-            patch(
-                "sglang.srt.configs.model_config.is_deepseek_dsa",
-                return_value=True,
-            ),
-        ):
-            self.assertFalse(is_dsa_enable_prefill_cp())
+    def test_hip_dsa_cp_is_deepseek_v4_only(self):
+        utils = "sglang.srt.layers.attention.dsa.utils"
+        model_config = "sglang.srt.configs.model_config"
+        parallel = SimpleNamespace(attn_cp_size=2)
+        config = SimpleNamespace(hf_config=SimpleNamespace())
+        for is_v4 in (True, False):
+            with (
+                self.subTest(is_v4=is_v4),
+                patch(f"{utils}.get_parallel", return_value=parallel),
+                patch(f"{utils}.process_model_config", return_value=config),
+                patch(f"{utils}.is_hip", return_value=True),
+                patch(f"{model_config}.is_deepseek_dsa", return_value=not is_v4),
+                patch(f"{model_config}.is_deepseek_v4", return_value=is_v4),
+            ):
+                self.assertEqual(is_dsa_enable_prefill_cp(), is_v4)
 
 
 class TestPrefillCPBCGReplay(CustomTestCase):
@@ -135,6 +129,8 @@ class TestPrefillCPBCGReplay(CustomTestCase):
         runner.has_mha_companion_layers = False
         runner.capture_hidden_mode = CaptureHiddenMode.NULL
         runner.capture_num_tokens = [2048, 2304]
+        runner.max_context_size = None
+        runner.max_seq_len = None
         runner.max_num_tokens = 2304
         runner.enable_cp_bcg_capture = True
         return runner
@@ -145,6 +141,7 @@ class TestPrefillCPBCGReplay(CustomTestCase):
             input_embeds=None,
             replace_embeds=None,
             mm_inputs=None,
+            contains_mm_inputs=lambda: False,
             forward_mode=ForwardMode.EXTEND,
             capture_hidden_mode=CaptureHiddenMode.NULL,
             global_num_tokens_cpu=None,
@@ -162,11 +159,39 @@ class TestPrefillCPBCGReplay(CustomTestCase):
             cp_strategy="zigzag",
         )
 
+    def test_interleave_replay_uses_total_tokens_across_requests(self):
+        """A captured token shape remains reusable when request boundaries change."""
+        runner = self._make_runner()
+        runner.prefill_cp_bcg_input = InterleaveCPBCGInput(
+            input_embeds=torch.empty(0),
+            positions=torch.empty(0),
+            bucket_local_tokens={2048: 512, 2304: 576},
+        )
+        batch = self._make_forward_batch()
+        init_cp_strategy(enable_prefill_cp=True, cp_size=4, cp_strategy="interleave")
+        for rank in range(4):
+            with (
+                self.subTest(rank=rank),
+                get_parallel().override(attn_cp_rank=rank, attn_cp_size=4),
+            ):
+                # Uneven request boundaries must not round each request up
+                # independently: interleave shards their concatenation.
+                self.assertEqual(
+                    runner.prefill_cp_bcg_input.required_local_tokens(
+                        batch.extend_seq_lens_cpu
+                    ),
+                    512,
+                )
+                self.assertTrue(runner.can_run_graph(batch))
+        with get_parallel().override(attn_cp_rank=0, attn_cp_size=4):
+            batch.extend_prefix_lens_cpu = [0, 1, 0]
+            self.assertTrue(runner.can_run_graph(batch))
+
     def test_local_capacity_overflow_uses_next_capture_bucket(self):
         runner = self._make_runner()
         runner.capture_num_tokens.append(2560)
         runner.max_num_tokens = 2560
-        runner.prefill_cp_bcg_input = PrefillCPBCGInput(
+        runner.prefill_cp_bcg_input = ZigzagCPBCGInput(
             input_embeds=torch.empty(0),
             positions=torch.empty(0),
             bucket_local_tokens={2048: 512, 2304: 576, 2560: 640},
@@ -176,7 +201,7 @@ class TestPrefillCPBCGReplay(CustomTestCase):
 
         with (
             patch(
-                "sglang.srt.layers.cp.bcg.get_cp_padding_align_size",
+                "sglang.srt.layers.cp.bcg.bcg.get_cp_padding_align_size",
                 return_value=8,
             ),
         ):
@@ -198,7 +223,7 @@ class TestPrefillCPBCGReplay(CustomTestCase):
 
     def test_bucket_search_preserves_two_x_padding_limit(self):
         runner = self._make_runner()
-        runner.prefill_cp_bcg_input = PrefillCPBCGInput(
+        runner.prefill_cp_bcg_input = ZigzagCPBCGInput(
             input_embeds=torch.empty(0),
             positions=torch.empty(0),
             bucket_local_tokens={2048: 512, 2304: 576},
@@ -215,7 +240,7 @@ class TestPrefillCPBCGReplay(CustomTestCase):
 
     def test_bucket_search_falls_back_when_no_capture_has_capacity(self):
         runner = self._make_runner()
-        runner.prefill_cp_bcg_input = PrefillCPBCGInput(
+        runner.prefill_cp_bcg_input = ZigzagCPBCGInput(
             input_embeds=torch.empty(0),
             positions=torch.empty(0),
             bucket_local_tokens={2048: 512, 2304: 516},
@@ -226,7 +251,7 @@ class TestPrefillCPBCGReplay(CustomTestCase):
         with (
             get_parallel().override(attn_cp_rank=0, attn_cp_size=4),
             patch(
-                "sglang.srt.layers.cp.bcg.get_cp_padding_align_size",
+                "sglang.srt.layers.cp.bcg.bcg.get_cp_padding_align_size",
                 return_value=8,
             ),
         ):
@@ -244,7 +269,7 @@ class TestPrefillCPBCGReplay(CustomTestCase):
                 raise StopAfterRecordingFill
 
         runner = self._make_runner()
-        runner.prefill_cp_bcg_input = PrefillCPBCGInput(
+        runner.prefill_cp_bcg_input = ZigzagCPBCGInput(
             input_embeds=torch.empty(0),
             positions=torch.empty(0),
             bucket_local_tokens={2048: 512, 2304: 576},
@@ -256,7 +281,7 @@ class TestPrefillCPBCGReplay(CustomTestCase):
         with (
             get_parallel().override(attn_cp_rank=0, attn_cp_size=4),
             patch(
-                "sglang.srt.layers.cp.bcg.get_cp_padding_align_size",
+                "sglang.srt.layers.cp.bcg.bcg.get_cp_padding_align_size",
                 return_value=8,
             ),
             self.assertRaises(StopAfterRecordingFill),
@@ -613,9 +638,11 @@ class TestCPZigzagStrategy(CustomTestCase):
         swa_loc = torch.arange(5) + 16
         forward_batch = SimpleNamespace(
             out_cache_loc=cache_loc,
+            out_cache_loc_is_physical=False,
             encoder_out_cache_loc=torch.arange(3) + 32,
         )
         layer = SimpleNamespace(
+            layer_id=0,
             is_cross_attention=False,
             k_scale="key-scale",
             v_scale="value-scale",
@@ -627,11 +654,13 @@ class TestCPZigzagStrategy(CustomTestCase):
         with (
             patch.object(strategy, "gather_kv_cache", return_value=local_kv) as gather,
             patch(
-                "sglang.srt.layers.cp.zigzag.get_token_to_kv_pool",
-                return_value=pool,
+                "sglang.srt.layers.cp.zigzag.get_kv_layers",
+                return_value=routed(pool).layer_router,
             ),
         ):
-            strategy.materialize_full_kv(forward_batch, layer, key, value, swa_loc)
+            strategy.materialize_full_kv(
+                forward_batch, layer, key, value, window_locs={"window_8": swa_loc}
+            )
 
         gather.assert_called_once()
         gathered_kv, gathered_forward_batch = gather.call_args.args
@@ -645,7 +674,7 @@ class TestCPZigzagStrategy(CustomTestCase):
         self.assertIs(written_layer, layer)
         self.assertIsInstance(write_loc, KVWriteLoc)
         self.assertIs(write_loc.loc, cache_loc)
-        self.assertTrue(torch.equal(write_loc.swa_loc, swa_loc[:3]))
+        self.assertTrue(torch.equal(write_loc.window_locs["window_8"], swa_loc[:3]))
         self.assertTrue(written_key.is_contiguous())
         self.assertTrue(written_value.is_contiguous())
         self.assertTrue(torch.equal(written_key, key))
@@ -685,6 +714,35 @@ class TestCPZigzagStrategy(CustomTestCase):
         self.assertTrue(torch.equal(calls[0][0], q[:2]))
         self.assertTrue(torch.equal(calls[1][0], q[2:]))
         self.assertTrue(torch.equal(out, q + 100))
+
+    def test_zigzag_attention_slices_query_components_without_copying(self):
+        metadata = self._metadata_for_rank(
+            0, cp_size=2, seq_lens=[8], extend_seq_lens=[8]
+        )
+        fb = SimpleNamespace(attn_cp_metadata=metadata)
+        q_nope = torch.arange(5 * 2 * 3).view(5, 2, 3)
+        q_rope = torch.arange(5 * 2 * 4).view(5, 2, 4)[..., ::2]
+        calls = []
+
+        def attn_fn(components, cu_seqlens_q, cache_seqlens, max_seqlen_q):
+            calls.append(components)
+            for chunk, original in zip(components, (q_nope, q_rope)):
+                self.assertEqual(
+                    chunk.untyped_storage().data_ptr(),
+                    original.untyped_storage().data_ptr(),
+                )
+            return torch.cat(components, dim=-1)
+
+        out = ZigzagCPStrategy(cp_size=2).run_attention(
+            (q_nope, q_rope), fb, device=torch.device("cpu"), attn_fn=attn_fn
+        )
+        self.assertEqual(len(calls), 2)
+        for i, original in enumerate((q_nope, q_rope)):
+            self.assertTrue(torch.equal(calls[0][i], original[:2]))
+            self.assertTrue(torch.equal(calls[1][i], original[2:4]))
+        expected = torch.cat((q_nope[:4], q_rope[:4]), dim=-1)
+        expected = torch.cat((expected, torch.zeros_like(expected[:1])), dim=0)
+        self.assertTrue(torch.equal(out, expected))
 
     def test_zigzag_combined_attention_matches_two_half_reference(self):
         def reference_attention(
@@ -787,6 +845,70 @@ class TestCPZigzagStrategy(CustomTestCase):
                 torch.testing.assert_close(
                     combined_out, two_half_out, atol=1e-5, rtol=1e-5
                 )
+
+    def test_zigzag_flashinfer_dispatch_runs_once_and_restores_padding(self):
+        cp_size = 2
+        metadata = self._metadata_for_rank(
+            0,
+            cp_size=cp_size,
+            seq_lens=[12],
+            extend_seq_lens=[12],
+        )
+        with get_parallel().override(attn_cp_size=cp_size):
+            pad_logical_token_to_physical(metadata)
+        fb = SimpleNamespace(attn_cp_metadata=metadata)
+        q = torch.arange(8 * 2).view(8, 2)
+        calls = []
+
+        def attn_fn(logical_q):
+            calls.append(logical_q.clone())
+            return logical_q + 100
+
+        out = ZigzagCPStrategy(cp_size=cp_size).run_attention(
+            q=q,
+            forward_batch=fb,
+            device=torch.device("cpu"),
+            attn_fn=attn_fn,
+            attention_backend=CPAttentionBackendKind.FLASHINFER,
+        )
+
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(torch.equal(calls[0], q[:6]))
+        self.assertTrue(torch.equal(out[:6], q[:6] + 100))
+        self.assertTrue(torch.equal(out[6:], torch.zeros_like(q[6:])))
+
+    def _can_apply_with_backend(self, attention_backend, backend):
+        strategy = ZigzagCPStrategy(cp_size=2)
+        fb = SimpleNamespace(forward_mode=_ExtendMode(), extend_seq_lens_cpu=[8])
+        with (
+            get_context().override_server_args(attention_backend=attention_backend),
+            forward_context(ForwardContext(attn_backend=backend)),
+        ):
+            return strategy.can_apply(8, fb), strategy.can_apply(8, fb)
+
+    def test_zigzag_can_apply_falls_back_on_unsupported_flashinfer(self):
+        calls = []
+
+        def reason():
+            calls.append(True)
+            return "prefill CUDA graphs must be disabled"
+
+        backend = SimpleNamespace(prefill_cp_unsupported_reason=reason)
+        with self.assertLogs("sglang.srt.layers.cp.zigzag", level="WARNING"):
+            self.assertEqual(
+                self._can_apply_with_backend("flashinfer", backend), (False, False)
+            )
+        self.assertEqual(len(calls), 1)
+
+    def test_zigzag_can_apply_skips_flashinfer_check_for_other_backends(self):
+        def reason():
+            raise AssertionError("only the FlashInfer prefill backend is asked")
+
+        # TRT-LLM MHA subclasses FlashInferAttnBackend and inherits the method.
+        backend = SimpleNamespace(prefill_cp_unsupported_reason=reason)
+        self.assertEqual(
+            self._can_apply_with_backend("trtllm_mha", backend), (True, True)
+        )
 
 
 class TestCPInterleaveStrategy(CustomTestCase):
@@ -907,7 +1029,9 @@ class TestCPInterleaveStrategy(CustomTestCase):
         )
 
         with (
-            get_parallel().override(attn_cp_rank=2, attn_cp_size=4),
+            get_parallel().override(
+                attn_cp_rank=2, attn_cp_size=4, enable_cp_tp_group_sharing=False
+            ),
             patch(
                 "sglang.srt.layers.cp.padding.get_cp_padding_align_size",
                 return_value=4,

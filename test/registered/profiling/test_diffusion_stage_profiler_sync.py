@@ -16,7 +16,7 @@ from sglang.multimodal_gen.runtime.utils.perf_logger import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -24,6 +24,9 @@ def test_stage_entry_sync_excludes_previous_stage_tail(monkeypatch):
     monkeypatch.setenv("SGLANG_DIFFUSION_SYNC_STAGE_PROFILING", "1")
     logger = init_logger(__name__)
     metrics = RequestMetrics("stage-sync-test")
+
+    # warm the consumer kernels before measuring stage synchronization
+    torch.ones(8, device="cuda").sum().cpu()
 
     # Calibrate ~0.5 s of queued GPU work.
     torch.cuda.synchronize()

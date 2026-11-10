@@ -15,23 +15,118 @@ the raw value must be restored once replay finishes.
 """
 
 import unittest
+from dataclasses import fields
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
+from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative import eagle_draft_cuda_graph_runner as draft_graph
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
+)
+from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
+    EAGLEDraftExtendCudaGraphRunner,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 CAPTURE_BS = 4
 SEQ_LEN_FILL_VALUE = 1
 NUM_STEPS = 3
+
+# A megakernel's graph variants of the batch sizes it serves; select reads host state.
+_KV_LENGTH_VARIANTS = SimpleNamespace(
+    capture_labels=("short", "long"),
+    select=lambda fb: "long" if fb.attention_kv_len_lower_bound >= 8 else "short",
+)
+# (variants offered, the requests' KV lengths, the lower bound, the label replayed):
+# a batch of the size the megakernel serves (1) replays what select picks; a batch of
+# another size, or a runner offered none, replays the unlabeled graph
+_REPLAY_KEYS = (
+    (True, [9], 8, "long"),
+    (True, [9], 7, "short"),
+    (True, [9, 10], None, None),
+    (False, [9], 8, None),
+)
+
+
+def _offer_variants(runner, served):
+    runner.attention_graph_variants = _KV_LENGTH_VARIANTS
+    runner.attention_variant_sizes = frozenset(served)
+
+
+def _extend_runner(raw_bs, *, keep_hidden_in_place=False):
+    """A bare draft-extend runner of capture sizes 1 and 2, as execute() reads it, and
+    a forward batch of raw_bs requests three rows wide."""
+    width = 3
+    rows = 2 * width
+    runner = EAGLEDraftExtendCudaGraphRunner.__new__(EAGLEDraftExtendCudaGraphRunner)
+    runner.deepep_adapter = SimpleNamespace(replay=lambda: None)
+    runner.buffers = SimpleNamespace(
+        input_ids=torch.zeros(rows, dtype=torch.int64),
+        seq_lens=torch.zeros(2, dtype=torch.int64),
+        out_cache_loc=torch.zeros(rows, dtype=torch.int64),
+        positions=torch.zeros(rows, dtype=torch.int64),
+        req_pool_indices=torch.zeros(2, dtype=torch.int64),
+        num_correct_drafts=torch.zeros(2, dtype=torch.int32),
+        num_accept_tokens=torch.zeros(2, dtype=torch.int32),
+        extend_seq_lens=torch.zeros(2, dtype=torch.int32),
+        select_index=torch.zeros(2, dtype=torch.int64),
+        mamba_track_indices=None,
+        hidden_states=torch.zeros((rows, 2)),
+        seq_lens_cpu=torch.zeros(2, dtype=torch.int64),
+    )
+    runner.require_mlp_tp_gather = runner.require_gathered_buffer = False
+    runner.keep_hidden_in_place = keep_hidden_in_place
+    runner._prepared_next_draft = runner._copy_plans = False
+    runner.in_graph_metadata_prep_done = None
+    runner.kv_reuse_guard = None
+    runner._runtime_optimization = False
+    runner._pd_reuse_needs_full_replay = False
+    runner._planned_inputs = {}
+    runner.captured_req_width, runner.capture_bs = width, [1, 2]
+    runner.seq_len_fill_value = 1
+    runner.extend_seq_lens_cpu = [width] * 2
+    runner.forward_mode = ForwardMode.DRAFT_EXTEND_V2
+    runner.model_runner = SimpleNamespace(
+        model_config=SimpleNamespace(model_is_mrope=False), device_timer=None
+    )
+    runner.draft_extend_attn_backend = SimpleNamespace(
+        init_forward_metadata_out_graph=lambda fb_view: None,
+        shared_read_ends=lambda mode: SharedReadEnds.UNKNOWN,
+    )
+    num_tokens = raw_bs * width
+    forward_batch = SimpleNamespace(
+        batch_size=raw_bs,
+        input_ids=torch.zeros(num_tokens, dtype=torch.int64),
+        seq_lens=torch.full((raw_bs,), 12),
+        out_cache_loc=torch.zeros(num_tokens, dtype=torch.int64),
+        positions=torch.zeros(num_tokens, dtype=torch.int64),
+        req_pool_indices=torch.ones(raw_bs, dtype=torch.int64),
+        mrope_positions=None,
+        extend_seq_lens=torch.full((raw_bs,), width, dtype=torch.int32),
+        mamba_track_indices=None,
+        seq_lens_cpu=None,
+        extend_seq_lens_cpu=[width] * raw_bs,
+        seq_lens_sum=None,
+        out_cache_loc_virtual=None,
+        iteration_ids=None,
+        iteration_cols=None,
+        spec_info=SimpleNamespace(
+            num_correct_drafts=torch.zeros(raw_bs, dtype=torch.int32),
+            num_accept_tokens=torch.ones(raw_bs, dtype=torch.int32),
+            hidden_states=torch.zeros((num_tokens, 2)),
+        ),
+    )
+    select_index = torch.arange(raw_bs) * width + width - 1
+    return runner, forward_batch, select_index
 
 
 class _RecordingDraftBackend:
@@ -61,13 +156,45 @@ class _RecordingDraftBackend:
 
 
 class TestEagleDraftCudaGraphRunner(CustomTestCase):
+    def test_relay_outputs_survive_other_runners_sharing_input_buffers(self):
+        from sglang.srt.model_executor import input_buffers
+
+        def buffers():
+            values = dict.fromkeys(
+                f.name for f in fields(draft_graph.EagleDraftInputBuffers)
+            )
+            values.update(
+                topk_index=torch.zeros((4, 1), dtype=torch.int64),
+                topk_p=torch.ones((4, 1)),
+                hidden_states=torch.zeros((4, 8)),
+            )
+            return draft_graph.EagleDraftInputBuffers(**values)
+
+        with (
+            patch.object(input_buffers, "_forward_input_buffer_pool", {}),
+            patch.object(draft_graph, "spec_relay_bypass_enabled", return_value=True),
+            patch.object(
+                draft_graph, "get_parallel", return_value=SimpleNamespace(moe_ep_size=1)
+            ),
+        ):
+            relay = buffers()
+            relay.share_buffers(exclude=draft_graph._relay_private_inputs())
+            other = buffers()
+            other.share_buffers()
+            for name in ("topk_index", "topk_p", "hidden_states"):
+                source, target = getattr(relay, name), getattr(other, name)
+                source.fill_(7)
+                target.zero_()
+                self.assertTrue(torch.all(source == 7), name)
+                self.assertNotEqual(source.data_ptr(), target.data_ptr(), name)
+
     def setUp(self):
         # The code under test reads its config from the bags.
         reset_context()
         self.addCleanup(reset_context)
         publish(ServerArgs(model_path="dummy"), role="tokenizer")
 
-    def _build_runner(self, backend):
+    def _build_runner(self, backend, graph_output=None):
         runner = EAGLEDraftCudaGraphRunner.__new__(EAGLEDraftCudaGraphRunner)
         runner.deepep_adapter = SimpleNamespace(replay=lambda: None)
         runner.buffers = SimpleNamespace(
@@ -91,7 +218,7 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
         runner.require_mlp_tp_gather = False
         runner.require_gathered_buffer = False
         runner.model_runner = SimpleNamespace(
-            model_config=SimpleNamespace(vocab_size=8),
+            model_config=SimpleNamespace(vocab_size=8, model_is_mrope=False),
             server_args=SimpleNamespace(speculative_use_rejection_sampling=False),
             device_timer=None,
             draft_attn_backend=backend,
@@ -102,7 +229,7 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
         def replay_graph_stub(shape_key, forward_batch):
             # Observe again during graph replay to catch a premature restore.
             backend.observe("graph_replay", forward_batch)
-            return None
+            return graph_output
 
         runner._replay_graph = replay_graph_stub
         return runner
@@ -139,6 +266,98 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
             ["metadata_build", "graph_replay"],
         )
         return backend, forward_batch
+
+    def test_replay_keys_the_graph_select_picks_where_the_megakernel_serves(self):
+        """A batch size the draft megakernel serves captures one graph per label of
+        its draft_loop variants; a replay must ask for the one select picks, and for
+        the unlabeled graph at any other size."""
+        for offered, seq_lens, bound, label in _REPLAY_KEYS:
+            with self.subTest(offered=offered, seq_lens=seq_lens, bound=bound):
+                runner = self._build_runner(_RecordingDraftBackend())
+                keys = []
+                runner._replay_graph = lambda key, fb: keys.append(key)
+                if offered:
+                    _offer_variants(runner, served=[1])
+                forward_batch = self._build_forward_batch(seq_lens, sum(seq_lens))
+                forward_batch.attention_kv_len_lower_bound = bound
+                runner.execute(forward_batch)
+                self.assertEqual(keys[0].attention_variant, label)
+
+    def test_draft_extend_replay_keys_the_graph_select_picks(self):
+        """As the draft graphs, for the draft-extend graphs and their variants."""
+        for offered, seq_lens, bound, label in _REPLAY_KEYS:
+            with self.subTest(offered=offered, seq_lens=seq_lens, bound=bound):
+                runner, forward_batch, select_index = _extend_runner(len(seq_lens))
+                keys = []
+                out = SimpleNamespace(
+                    next_token_logits=torch.zeros((2, 4)),
+                    hidden_states=torch.zeros((2, 2)),
+                )
+                runner._replay_graph = lambda key, fb: keys.append(key) or out
+                if offered:
+                    _offer_variants(runner, served=[1])
+                forward_batch.attention_kv_len_lower_bound = bound
+                runner.execute(forward_batch, select_index)
+                self.assertEqual(keys[0].attention_variant, label)
+
+    def test_draft_extend_shared_read_fence_and_kv_reuse(self):
+        cases = (
+            # External markers let shared reads finish before KV writes.
+            (SharedReadEnds.IN_REPLAY, True, False, True, "marker", True),
+            # Devices without external events wait until replay completes.
+            (SharedReadEnds.IN_REPLAY, False, False, True, "event", False),
+            (SharedReadEnds.PRE_REPLAY, False, False, True, "event", True),
+            # An allocator without guarded reuse cannot release the WAR fence early.
+            (SharedReadEnds.IN_REPLAY, True, True, False, "event", False),
+            (SharedReadEnds.PRE_REPLAY, False, True, False, "event", False),
+            # UNKNOWN includes a hybrid backend with an unaudited GDN child.
+            (SharedReadEnds.UNKNOWN, True, False, True, None, False),
+        )
+        for declared, marker, full_replay, guarded, published, kv_pending in cases:
+            with self.subTest(
+                declared=declared, marker=marker, full_replay=full_replay
+            ):
+                runner, forward_batch, select_index = _extend_runner(1)
+                runner._runtime_optimization = True
+                runner._pd_reuse_needs_full_replay = full_replay
+                marker_event = object() if marker else None
+                runner.in_graph_metadata_prep_done = marker_event
+                runner.model_runner.shared_read_done_event = object()
+                runner.draft_extend_attn_backend.shared_read_ends = lambda fm: declared
+                order, guards = [], []
+
+                def new_event():
+                    return SimpleNamespace(record=lambda: order.append("event"))
+
+                runner.device_module = SimpleNamespace(Event=new_event)
+                runner.kv_reuse_guard = (
+                    SimpleNamespace(set_reuse_guard_event=guards.append)
+                    if guarded
+                    else None
+                )
+                out = SimpleNamespace(
+                    next_token_logits=torch.zeros((2, 4)),
+                    hidden_states=torch.zeros((2, 2)),
+                )
+                runner._replay_graph = lambda key, fb: order.append("replay") or out
+                runner.execute(forward_batch, select_index)
+                read_done = runner.model_runner.shared_read_done_event
+                if published is None:
+                    self.assertIsNone(read_done)
+                elif published == "marker":
+                    self.assertIs(read_done, marker_event)
+                else:
+                    self.assertIsNotNone(read_done)
+                    self.assertIsNot(read_done, marker_event)
+                if guarded:
+                    self.assertEqual(len(guards), 1)
+                    self.assertEqual(guards[0] is not None, kv_pending)
+                if declared is SharedReadEnds.PRE_REPLAY and not full_replay:
+                    self.assertEqual(order, ["event", "replay", "event"])
+                elif published == "event" or kv_pending:
+                    self.assertEqual(order, ["replay", "event"])
+                else:
+                    self.assertEqual(order, ["replay"])
 
     def test_padded_replay_keeps_seq_lens_sum_consistent(self):
         # raw_bs=2 < CAPTURE_BS=4: the batch is padded with fake rows of length
@@ -201,6 +420,17 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
         for observation in backend.observations:
             self.assertIsNone(observation.seq_lens_sum, msg=observation.phase)
         self.assertIsNone(forward_batch.seq_lens_sum)
+
+    def test_execute_leaves_graph_output_ownership_to_caller(self):
+        backend = _RecordingDraftBackend()
+        pooled_probs = torch.ones(CAPTURE_BS, NUM_STEPS, 8)
+        graph_output = (None, None, None, pooled_probs)
+        runner = self._build_runner(backend, graph_output=graph_output)
+        forward_batch = self._build_forward_batch([3, 4, 5, 6], 18)
+
+        output = runner.execute(forward_batch)
+
+        self.assertIs(output[-1], pooled_probs)
 
 
 if __name__ == "__main__":

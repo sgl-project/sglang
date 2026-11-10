@@ -1,4 +1,4 @@
-"""Length-aware split-KV segment plan of the gfx950 asm attention kernel (the default split for bs > 1).
+"""Length-aware split-KV segment plan of the gfx950 asm attention kernel (the default split).
 
 Guards, on a gfx950 device:
   * the planned split matches an fp32 reference as closely as the fixed split, for both GQA ratios the
@@ -10,6 +10,7 @@ Guards, on a gfx950 device:
 
 import math
 import unittest
+from unittest import mock
 
 import torch
 from torch.profiler import ProfilerActivity, profile
@@ -123,7 +124,7 @@ class TestVattnSegPlan(CustomTestCase):
         T, work = plan[0], plan[1:]
         nts = [(kv + 15) // 16 for kv in seq_lens.tolist()]
         target = V.seg_plan_target_wgs(hkv)
-        lo = max(_cdiv(sum(nts), target), _cdiv(max(nts), seg_max), 1)
+        lo = max(_cdiv(sum(nts), target), _cdiv(max(nts), seg_max), 16)
         slack = target - len(lens)
         hi = max(lo, _cdiv(sum(nts), slack)) if slack > 0 else lo
         while lo < hi:
@@ -156,14 +157,70 @@ class TestVattnSegPlan(CustomTestCase):
                     q, k, v, bt, seq_lens, cu_q, kd, vd, scale
                 ).float()
                 torch.cuda.synchronize()
-                if len(lens) > 1:
-                    self._check_plan(lens, qlens, hkv, seq_lens, cu_q)
+                self._check_plan(lens, qlens, hkv, seq_lens, cu_q)
                 e_leg = (o_leg - r).abs().max().item()
                 e_plan = (o_plan - r).abs().max().item()
                 self.assertFalse(torch.isnan(o_plan).any().item())
                 # same error budget as the fixed split (fp8 KV dominates); 0.02 floor for the tiny cases
                 self.assertLessEqual(e_plan, max(2 * e_leg, 0.02))
                 torch.cuda.empty_cache()
+
+    def test_launches_on_a_side_stream_and_under_graph_capture(self):
+        # ROCm 10 images carry two libamdhip64 of the same SONAME (torch loads
+        # _rocm_sdk_core, LD_LIBRARY_PATH points at _rocm_sdk_devel). Binding
+        # the wrong one still loads the module and still launches on the default
+        # stream, so only a torch stream catches it: every launch there fails
+        # with hipErrorContextIsDestroyed (709). Decode captures graphs, so this
+        # is the path serving actually takes.
+        V = self.V
+        lens, qlens, hq, hkv = [4096, 3777], [4, 2], 16, 1
+        k, v, bt, q, cu_q, seq_lens, kd, vd = make(lens, qlens, hq, hkv)
+        scale = 1.0 / math.sqrt(HD)
+        r = ref(k, v, bt, q, cu_q, seq_lens, kd, vd, hq, hkv)
+
+        stream = torch.cuda.Stream()
+        with torch.cuda.stream(stream):
+            eager = V.mtp_verify_attn_fwd_asm(
+                q, k, v, bt, seq_lens, cu_q, kd, vd, scale
+            )
+        stream.synchronize()
+        self.assertLess((eager.float() - r).abs().max().item(), 0.05)
+
+        out = torch.empty_like(eager)
+        g = torch.cuda.CUDAGraph()
+        V.reset_seg_plan_cache()
+        with torch.cuda.graph(g, stream=stream):
+            V.mtp_verify_attn_fwd_asm(
+                q, k, v, bt, seq_lens, cu_q, kd, vd, scale, out=out
+            )
+        out.zero_()
+        g.replay()
+        torch.cuda.synchronize()
+        self.assertLess((out.float() - r).abs().max().item(), 0.05)
+
+    def test_triton_reduce_matches_vred(self):
+        # Same batch, same plan, two reducers: vred.s (cap 64) vs the Triton fallback
+        # (cap patched to 128; the plan's T is unchanged, ~32 real segments).
+        V = self.V
+        lens, qlens, hq, hkv = [70000] * 8, [4] * 8, 16, 1
+        k, v, bt, q, cu_q, seq_lens, kd, vd = make(lens, qlens, hq, hkv)
+        scale = 1.0 / math.sqrt(HD)
+        V.reset_seg_plan_cache()
+        with mock.patch.object(V, "_reduce_triton", wraps=V._reduce_triton) as tri:
+            o_vred = V.mtp_verify_attn_fwd_asm(
+                q, k, v, bt, seq_lens, cu_q, kd, vd, scale
+            ).float()
+            self.assertEqual(tri.call_count, 0)
+            V.reset_seg_plan_cache()
+            with mock.patch.object(V, "mtp_verify_attn_seg_max", return_value=128):
+                o_tri = V.mtp_verify_attn_fwd_asm(
+                    q, k, v, bt, seq_lens, cu_q, kd, vd, scale
+                ).float()
+            self.assertEqual(tri.call_count, 1)
+        torch.cuda.synchronize()
+        self.assertLess(
+            (o_vred - o_tri).abs().max().item(), 0.01 * o_vred.abs().max().item()
+        )
 
     def test_plan_cache_per_forward(self):
         V = self.V

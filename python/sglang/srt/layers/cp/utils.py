@@ -17,6 +17,8 @@
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Optional, Tuple
 
+import torch
+
 from sglang.srt.layers.cp.base import (
     BaseContextParallelMetadata,
     ContextParallelStrategy,
@@ -36,10 +38,130 @@ from sglang.srt.layers.cp.zigzag import (
     ZigzagCPStrategy,
 )
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
-from sglang.srt.runtime_context import get_parallel, uses_mla_backend
+from sglang.srt.runtime_context import get_parallel, get_schedule, uses_mla_backend
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
+
+
+def get_cp_sharded_padded(value):
+    """Convert a global KV count to local storage for sharded CP storage."""
+    strategy = get_cp_strategy()
+    return value // strategy.cp_size
+
+
+def from_cp_sharded(value):
+    """Convert a local KV count back to global for sharded CP storage."""
+    strategy = get_cp_strategy()
+    return value * strategy.cp_size
+
+
+def get_cp_sharded_padded_cache_indices(value):
+    """Recover complete reserved local pages from actual cache-group rows."""
+    strategy = get_cp_strategy()
+    c = strategy.cp_size
+    p = get_schedule().page_size
+    # The interval starts at a group boundary; its last group may be partial.
+    representatives = value[:: c * p]
+    pages = (
+        get_cp_sharded_padded_cache_transfer_indices(representatives.to(torch.int64))
+        // p
+    )
+    local = pages[:, None] * p + torch.arange(p, device=value.device)
+    return torch.where(
+        representatives[:, None] > 0,
+        local.to(value.dtype),
+        representatives[:, None],
+    ).reshape(-1)
+
+
+def from_cp_sharded_expanded_indices(value):
+    """Expand complete local pages into every CP column in cache-row order."""
+    strategy = get_cp_strategy()
+    c = strategy.cp_size
+    p = get_schedule().page_size
+    pages = value[::p] // p
+    columns = torch.arange(c, device=value.device)
+    offsets = torch.arange(p, device=value.device)
+    return (
+        ((pages[:, None, None] - 1) * c + 1 + columns[None, :, None]) * p
+        + offsets[None, None, :]
+    ).reshape(-1)
+
+
+def _ceil_group_count(value, group_size):
+    """Count complete groups needed to cover a token endpoint."""
+    return (value + group_size - 1) // group_size
+
+
+def get_cp_sharded_padded_allocation_tokens(value, *, prefix_tokens):
+    """Convert raw request tokens to fresh KV capacity for sharded CP storage."""
+    strategy = get_cp_strategy()
+    page_size = get_schedule().page_size
+    group_size = strategy.cp_size * page_size
+    return (
+        _ceil_group_count(prefix_tokens + value, group_size) * group_size
+        - _ceil_group_count(prefix_tokens, group_size) * group_size
+    )
+
+
+def get_cp_sharded_padded_cache_transfer_indices(value):
+    """Project cache rows to local rows, preserving shape, dtype and sentinels."""
+    strategy = get_cp_strategy()
+    c = strategy.cp_size
+    p = get_schedule().page_size
+    shifted = value.to(torch.int64) + (c - 1) * p
+    local = (shifted // (c * p)) * p + shifted % p
+    return torch.where(value > 0, local.to(value.dtype), value)
+
+
+def get_cp_sharded_padded_allocation_lengths(value):
+    """Convert request endpoints to reserved local capacity for allocation."""
+    strategy = get_cp_strategy()
+    page_size = get_schedule().page_size
+    group_size = strategy.cp_size * page_size
+    return _ceil_group_count(value, group_size) * page_size
+
+
+def get_cp_sharded_padded_allocation_size(value, *, prefix_lens, extend_lens):
+    """Count fresh local rows from the existing CPU request endpoints."""
+    strategy = get_cp_strategy()
+    page_size = get_schedule().page_size
+    seq_lens = prefix_lens + extend_lens
+    group_size = strategy.cp_size * page_size
+    pages = _ceil_group_count(seq_lens, group_size) - _ceil_group_count(
+        prefix_lens, group_size
+    )
+    return int(pages.sum()) * page_size
+
+
+def get_cp_sharded_padded_chunk_tokens(value, *, prefix_tokens):
+    """Align a chunk to complete fresh groups, retaining its reserved prefix tail."""
+    strategy = get_cp_strategy()
+    page_size = get_schedule().page_size
+    group_size = strategy.cp_size * page_size
+    tail = _ceil_group_count(prefix_tokens, group_size) * group_size - prefix_tokens
+    groups = max(0, int((value - tail) // group_size))
+    return min(max(value, 0), tail + groups * group_size)
+
+
+def get_cp_sharded_padded_available_tokens(value, *, reserved_tokens=0):
+    """Adapt free capacity before the existing chunk headroom subtraction.
+
+    The resource group is C times the strategy's physical token page size.
+    Without a prefix, allow at most one partial group's tail. A request-aware
+    geometry entry bounds that allowance by the actual reserved tail.
+    """
+    strategy = get_cp_strategy()
+    if value < 0:
+        return value
+    group_size = strategy.cp_size * get_schedule().page_size
+    return (
+        reserved_tokens
+        + max(0, (value - reserved_tokens) // group_size) * group_size
+        + group_size
+        - 1
+    )
 
 
 def is_glm_dsa_cache_layer_split_enabled(model_runner: "ModelRunner") -> bool:
@@ -166,7 +288,12 @@ def prepare_cp_forward(forward_batch) -> None:
         )
         pad_logical_token_to_physical(forward_batch.attn_cp_metadata)
 
-    if getattr(forward_batch, "global_num_tokens_cpu", None) is not None:
+    # Under CP-TP group sharing the model owns the CP row layout and gathers
+    # full rows for its MLPs, so their buffers keep the full-batch length.
+    if (
+        not get_parallel().enable_cp_tp_group_sharing
+        and getattr(forward_batch, "global_num_tokens_cpu", None) is not None
+    ):
         from sglang.srt.layers.dp_attention import set_local_dp_buffer_len
 
         set_local_dp_buffer_len(
@@ -201,6 +328,16 @@ def cp_shard_hidden_states(complete_hidden_states: Any, forward_batch):
     return strategy.shard_hidden_states(complete_hidden_states, forward_batch)
 
 
+def cp_gather_full_sequence_states(sharded_states, forward_batch, stream=None):
+    """Gather CP-sharded states into the full logical sequence order."""
+    assert is_cp_active(forward_batch)
+    strategy = get_cp_strategy()
+    assert strategy is not None
+    assert sharded_states is not None
+    assert getattr(forward_batch, "attn_cp_metadata", None) is not None
+    return strategy.gather_hidden_states(sharded_states, forward_batch, stream)
+
+
 def cp_shard_position_ids(complete_position_ids: Any, forward_batch):
     assert is_cp_active(forward_batch)
     strategy = get_cp_strategy()
@@ -208,6 +345,43 @@ def cp_shard_position_ids(complete_position_ids: Any, forward_batch):
     assert complete_position_ids is not None
     assert getattr(forward_batch, "attn_cp_metadata", None) is not None
     return strategy.shard_position_ids(complete_position_ids, forward_batch)
+
+
+def cp_local_rope_positions(forward_batch, positions: Any, local_k: Any) -> Any:
+    """Return the CP-local positions matching the local K shard, row for row.
+
+    ``forward_batch.positions`` stays global in every mode (eager CP and
+    breakable prefill graph capture/replay); the shard is taken here from the
+    CP metadata, which BCG rewrites to the captured per-rank geometry, so the
+    result is padded to the same physical rows as the local K shard.
+    """
+    assert is_cp_active(forward_batch)
+    positions = cp_shard_position_ids(positions, forward_batch)
+    assert positions.shape[0] == local_k.shape[0], (
+        "CP prefill: rope positions do not match the local K shard "
+        f"(positions={positions.shape[0]}, k={local_k.shape[0]})"
+    )
+    return positions
+
+
+def cp_live_store_rows(forward_batch, gathered_rows: int, what: str) -> int:
+    """Rows to write to the KV cache after a CP all-gather: the live tokens.
+
+    The gathered tensor may carry padded bucket rows at its tail and BCG replay
+    hands over a bucket-sized static out_cache_loc; both must cover the live
+    rows and only those rows are written.
+    """
+    assert is_cp_active(forward_batch)
+    n_store = int(forward_batch.attn_cp_metadata.total_seq_lens)
+    n_loc = int(forward_batch.out_cache_loc.shape[0])
+    assert n_store <= gathered_rows, (
+        f"CP prefill ({what}): gathered rows {gathered_rows} < live tokens {n_store}"
+    )
+    assert n_store <= n_loc, (
+        f"CP prefill ({what}): out_cache_loc has {n_loc} rows < live tokens "
+        f"{n_store}; padding must sit at the tail of out_cache_loc"
+    )
+    return n_store
 
 
 def cp_interleave_input_ids(input_ids: Any, forward_batch):
@@ -263,8 +437,10 @@ def cp_shard_model_inputs(
 ):
     """Restore the shared batch so logits processing keeps full-batch metadata."""
     assert is_cp_active(forward_batch)
-    sharded_hidden_states = cp_shard_hidden_states(
-        complete_hidden_states, forward_batch
+    sharded_hidden_states = (
+        cp_shard_hidden_states(complete_hidden_states, forward_batch)
+        if complete_hidden_states is not None
+        else None
     )
     sharded_positions = cp_shard_position_ids(complete_position_ids, forward_batch)
     model_input_ids = (
@@ -285,6 +461,7 @@ def cp_shard_model_inputs(
     spec_hidden_states_backup = None
     if (
         spec_hidden_states is not None
+        and complete_hidden_states is not None
         and spec_hidden_states.shape[0] == complete_hidden_states.shape[0]
     ):
         spec_hidden_states_backup = spec_hidden_states
