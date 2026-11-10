@@ -29,13 +29,13 @@ class FakePool:
     def prepare_locations(self, host_indices):
         return list(host_indices)
 
-    def get_prepared_layer_range_meta(self, locations, layer):
-        if layer in self.skip_layers:
+    def get_prepared_layers_range_meta(self, locations, layers):
+        layers = [layer for layer in layers if layer not in self.skip_layers]
+        if not layers:
             return None
-        ptrs = [[(row, layer)] for row in locations]
-        # DevicePoolEntry shares these read-only rows across locations.
-        sizes = [[SLICE]] * len(locations)
-        offsets = [[layer * SLICE]] * len(locations)
+        ptrs = [[(row, layer) for layer in layers] for row in locations]
+        sizes = [[SLICE] * len(layers) for _ in locations]
+        offsets = [[layer * SLICE for layer in layers] for _ in locations]
         return ptrs, sizes, offsets
 
 
@@ -190,7 +190,7 @@ class TestGroupedLoad(CustomTestCase):
                 )
 
         class FailingPool(FakePool):
-            def get_prepared_layer_range_meta(self, locations, layer):
+            def get_prepared_layers_range_meta(self, locations, layers):
                 fail()
 
         store = BlockingStore()
