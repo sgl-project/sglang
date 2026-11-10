@@ -1215,6 +1215,9 @@ class Envs:
     # scale, weight quantized once and cached). Halves the per-step head GEMM;
     # off by default. Only engages for a floating-point (non-quantized) head.
     SGLANG_ROCM_OPT_DSPARK_FP8_LM_HEAD = EnvBool(False)
+    # DSPARK draft logits on SM10x: run the shared lm_head projection in MXFP8
+    # (FlashInfer CuTe DSL), weight quantized once and cached. Off by default.
+    SGLANG_OPT_DSPARK_MXFP8_LM_HEAD = EnvBool(False)
     # Pooled prefill-logits budget of the HIP FP4 indexer, in MiB.
     SGLANG_DSV4_FP4_LOGITS_BUDGET_MB = EnvInt(2048)
     # Split-K for HCA streams in the HIP unified-KV paged decode; 0 keeps the heuristic.
