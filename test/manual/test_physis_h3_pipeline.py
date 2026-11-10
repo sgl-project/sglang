@@ -386,7 +386,76 @@ def rank_cancel_main(rank, port, folder, mode):
     dist.destroy_process_group()
 
 
+def rank_oom_main(rank, port, entered, escaped):
+    os.environ["LOCAL_RANK"] = str(rank)
+    torch.cuda.set_device(rank)
+    init_distributed_environment(
+        world_size=2,
+        rank=rank,
+        local_rank=rank,
+        backend="nccl",
+        distributed_init_method=f"tcp://127.0.0.1:{port}",
+        device_id=torch.device("cuda", rank),
+    )
+    initialize_model_parallel(sequence_parallel_degree=2, ulysses_degree=2)
+    args = SimpleNamespace(
+        comfyui_mode=False,
+        causal_pipeline_mode="off",
+        causal_pipeline_parallel_size=1,
+        pipeline_config=SimpleNamespace(
+            physis_bootstrap_chunks=5, physis_history_chunks=18
+        ),
+    )
+    set_global_server_args(args)
+    model = TinyModel()
+    original_final_layer = model.final_layer
+
+    def final_layer(hidden, **kwargs):
+        dist.barrier(group=get_world_group().cpu_group)
+        if rank == 0:
+            entered.set()
+            raise torch.cuda.OutOfMemoryError("injected Ulysses allocation failure")
+        return original_final_layer(hidden, **kwargs)
+
+    model.final_layer = final_layer
+    stage = PhysisH3DenoisingStage(SimpleNamespace(get_module=lambda name: model))
+    batch = Req(num_frames=22, height=32, width=32, seed=42)
+    batch.prompt_embeds = [torch.ones(2, 8, device="cuda", dtype=torch.bfloat16)]
+    try:
+        stage.forward(batch, args)
+    except torch.cuda.OutOfMemoryError:
+        escaped.set()
+        os._exit(23)
+    raise AssertionError("The injected OOM did not reach worker failure handling")
+
+
 class TestPhysisPipelineFailures(CustomTestCase):
+    @unittest.skipUnless(torch.cuda.device_count() >= 2, "requires two CUDA GPUs")
+    def test_ulysses_oom_reaches_worker_failure_handling(self):
+        """A failed rank escapes promptly while peers wait in its forward collective."""
+        spawn = mp.get_context("spawn")
+        entered, escaped = spawn.Event(), spawn.Event()
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+        context = mp.spawn(
+            rank_oom_main, args=(port, entered, escaped), nprocs=2, join=False
+        )
+        try:
+            self.assertTrue(entered.wait(90), "workers did not reach the injected OOM")
+            self.assertTrue(escaped.wait(10), "Ulysses OOM waited in component cleanup")
+            context.processes[0].join(timeout=5)
+            self.assertEqual(context.processes[0].exitcode, 23)
+        finally:
+            for process in context.processes:
+                if process.is_alive():
+                    process.terminate()
+            for process in context.processes:
+                process.join(timeout=5)
+                if process.is_alive():
+                    process.kill()
+                    process.join(timeout=5)
+
     @unittest.skipUnless(torch.cuda.device_count() >= 4, "requires four CUDA GPUs")
     def test_cancellation_at_sampling_boundaries(self):
         """Every rank stops together during bootstrap, sink setup and later sampling."""

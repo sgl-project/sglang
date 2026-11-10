@@ -264,7 +264,7 @@ class PhysisH3DenoisingStage(PipelineStage):
             else nullcontext()
         )
         with (
-            _synchronized_component_scope(scope),
+            _synchronized_component_scope(scope) if parallel else scope,
             set_forward_context(
                 current_timestep=0, attn_metadata=None, forward_batch=batch
             ),
