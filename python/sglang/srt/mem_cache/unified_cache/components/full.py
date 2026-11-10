@@ -7,7 +7,6 @@ import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
-    EvictParams,
     IncLockRefResult,
     InsertResult,
     MatchPrefixParams,
@@ -18,13 +17,15 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PoolTransferResult,
 )
+from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
+from sglang.srt.mem_cache.kv.plan import TREE_TOKEN
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeComponentDeviceSlot,
     UpdatePendingBackupOnNodeSplit,
 )
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.components.base import (
     CacheTransferPhase,
-    ComponentType,
     EvictLayer,
     ExternalLinkerLoadPhase,
     LinkerTransferPhase,
@@ -39,14 +40,13 @@ if TYPE_CHECKING:
         CacheAction,
         ComponentAction,
     )
-    from sglang.srt.mem_cache.unified_radix_cache import (
-        NodeId,
-        UnifiedTreeNode,
-    )
+    from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeNode
+    from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import NodeId
 
 
 class FullComponent(TreeComponent):
     component_type = ComponentType.FULL
+    family = TREE_TOKEN
 
     def __init__(self, cache, params, slot):
         super().__init__(cache, params, slot)
@@ -228,7 +228,7 @@ class FullComponent(TreeComponent):
         if (
             lv is not None
             and lv.parent is not None
-            and lv.parent in self.tree_core.evictable_device_leaves
+            and self.tree_core._is_device_walk_candidate(lv.parent)
         ):
             heapq.heappush(
                 self._evict_device_heap,
@@ -237,7 +237,7 @@ class FullComponent(TreeComponent):
         self._evict_device_last_node = None
         while tracker[ct] < self._evict_device_request_cnt and self._evict_device_heap:
             _, x = heapq.heappop(self._evict_device_heap)
-            if x not in self.tree_core.evictable_device_leaves:
+            if not self.tree_core._is_device_walk_candidate(x):
                 continue
             self._evict_device_last_node = x
             return x.id
@@ -452,9 +452,16 @@ class FullComponent(TreeComponent):
 
             xfer = transfers[0]
             device_indices = xfer.device_indices
+            loaded = [
+                self.tree_core.node_by_id(nid) for nid in xfer.nodes_to_load or []
+            ]
+            chain_len = sum(len(n.component_data[ct].host_value) for n in loaded)
+            assert len(device_indices) == chain_len, (
+                f"load-back filled {len(device_indices)} device slots for a chain "
+                f"of {chain_len} host tokens"
+            )
             offset = 0
-            for nid in xfer.nodes_to_load or []:
-                n = self.tree_core.node_by_id(nid)
+            for n in loaded:
                 cd = n.component_data[ct]
                 n_len = len(cd.host_value)
                 cd.value = device_indices[offset : offset + n_len].clone()
@@ -497,9 +504,8 @@ class FullComponent(TreeComponent):
         if phase == LinkerTransferPhase.LOAD:
             storage, sub_pool = self.storage_and_sub_pool()
             num_tokens = len(keys) * self.cache.page_size
-            shortfall = max(0, num_tokens - storage.available_units(sub_pool))
-            if shortfall:
-                self.cache.evict(EvictParams(num_tokens=shortfall))
+            if storage.available_units(sub_pool) < num_tokens:
+                self.cache.evict_for_alloc(KVDemand(full_tokens=num_tokens))
             slots = storage.take_units(sub_pool, num_tokens)
             if slots is None:
                 return None

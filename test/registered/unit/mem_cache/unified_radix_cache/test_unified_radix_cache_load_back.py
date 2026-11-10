@@ -19,14 +19,15 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
 )
+from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     RebuildFullToSWAMapping,
 )
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.components.base import (
     CacheTransferPhase,
-    ComponentType,
     EvictLayer,
 )
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
@@ -57,6 +58,7 @@ from sglang.test.kits.unified_radix_cache.load_back import (
     UnifiedTreeCoreLoadBackPendingFixtures,
 )
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.tree_slots import window_evictable
 
 register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=11, suite="stage-b-test-1-gpu-small-amd")
@@ -353,7 +355,7 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
         req = self._make_req(req_to_token_pool)
         req.swa_branching_seqlen = 8
         req.kv.cache_protected_len = 4
-        req.kv.set_evicted_seqlen(ComponentType.SWA, 3)
+        req.kv.set_evicted_seqlen(cache.window_sub_pools()[0][0], 3)
 
         for is_finished in (False, True):
             params = InsertParams(component_evicted_seqlens={ComponentType.MAMBA: 6})
@@ -1002,7 +1004,7 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
             ) as evict_for_alloc,
         ):
             prep = comp.prepare_load_back(leaf, req=req)
-        evict_for_alloc.assert_called_once_with(EvictParams(num_tokens=0, mamba_num=1))
+        evict_for_alloc.assert_called_once_with(KVDemand(state_slots=1))
         self.assertIs(prep.allocated_mamba_slot, retry_slot)
         self.assertEqual(int(req.kv.mamba_pool_idx), int(retry_slot[0]))
 
@@ -1182,6 +1184,8 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
             ComponentType.FULL, leaf, CacheTransferPhase.LOAD_BACK
         )[0]
         self.assertEqual(int(kv_xfer.host_indices.numel()), kv_tokens)
+        # Admission sizes a load-back by the rows this transfer copies.
+        self.assertEqual(cache.full_load_back_tokens(leaf), kv_tokens)
 
         swa_xfer = cache.tree_core.build_hicache_transfers(
             ComponentType.SWA, leaf, CacheTransferPhase.LOAD_BACK
@@ -1191,7 +1195,7 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
         # Leave tree-owned SWA available for controller-side SWA eviction.
         unrelated_seq = self._make_seq(100_000, sw)
         self._insert(cache, allocator, req_to_token_pool, unrelated_seq)
-        self.assertGreaterEqual(cache.swa_evictable_size(), sw)
+        self.assertGreaterEqual(window_evictable(cache), sw)
 
         # Make raw SWA availability smaller than both load-back transfers.
         target_swa_avail = sw - 1
@@ -1225,7 +1229,7 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
         full_pre_evict_calls = [
             call
             for call in evict_for_alloc_mock.call_args_list
-            if call.args and call.args[0].num_tokens > 0
+            if call.args and call.args[0].full_tokens > 0
         ]
         self.assertEqual(full_pre_evict_calls, [])
 
@@ -1233,8 +1237,8 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
         self.assertTrue(
             any(
                 call.args
-                and call.args[0].num_tokens == 0
-                and call.args[0].swa_num_tokens > 0
+                and call.args[0].full_tokens == 0
+                and sum(call.args[0].window_tokens.values()) > 0
                 for call in evict_for_alloc_mock.call_args_list
             )
         )
