@@ -5,6 +5,7 @@ import torch
 
 from sglang.srt.runtime_context import get_platform
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=25, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
@@ -296,6 +297,74 @@ def test_parallel_walk_replay_switches_with_lengths():
         run(False)
         assert torch.equal(outputs[0][0], outputs[1][0])
         assert torch.equal(outputs[0][1], outputs[1][1])
+
+
+def _native_flashmla():
+    from sglang.kernels.ops.attention import flash_mla_interface
+
+    if not flash_mla_interface.supports_native_heads():
+        pytest.skip("installed FlashMLA predates native head support")
+    return flash_mla_interface
+
+
+@pytest.mark.skipif(not get_platform().is_sm100, reason="native heads require SM100")
+class TestFlashMLAGraphMetadata(CustomTestCase):
+    def test_partition_changes_between_graph_batch_sizes(self):
+        from sglang.srt.model_executor.forward_mode import ForwardMode
+        from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+        from sglang.test.kits.dsa_metadata_kit import inputs, make_backend
+
+        _native_flashmla()
+        for mode in (ForwardMode.DECODE, ForwardMode.TARGET_VERIFY):
+            with self.subTest(mode=mode):
+                seq, req = inputs([64] * 4, list(range(4)))
+                backend = make_backend(mode, seq, req)
+                backend.dsa_decode_impl = "flashmla_kv"
+                backend.num_q_heads = backend.flashmla_kv_num_q_heads = 96
+                backend.speculative_num_draft_tokens = 8
+                backend._flashmla_kv_pad_q_in_place = False
+                backend.hisparse_coordinator = None
+                backend.use_fused_topk = True
+                backend._memory_saver_adapter = TorchMemorySaverAdapter.create(
+                    enable=False
+                )
+                backend.req_to_token = torch.arange(
+                    80 * 512, device="cuda", dtype=torch.int32
+                ).view(80, 512)
+                backend._arange_buf = torch.arange(
+                    641, device="cuda", dtype=torch.int32
+                )
+                backend.init_cuda_graph_state(max_bs=80, max_num_tokens=640)
+                saved = {}
+                # Decode and eight-token verify cross the native-head partition
+                # boundary at different request counts. Replay in both directions.
+                for bs in (80, 64, 16, 8, 1, 8, 80, 1, 64):
+                    seq = torch.full((bs,), 128 + bs, device="cuda", dtype=torch.int64)
+                    req = torch.arange(bs, device="cuda", dtype=torch.int64)
+                    backend._apply_cuda_graph_metadata(
+                        bs, req, seq, seq.cpu(), mode, spec_info=None
+                    )
+                    metadata = backend.forward_metadata
+                    actual = metadata.flashmla_metadata
+                    expected = backend._compute_flashmla_metadata(
+                        metadata.dsa_cache_seqlens_int32, seq_len_q=1
+                    )
+                    self.assertEqual(
+                        actual.flashmla_metadata.shape, expected.flashmla_metadata.shape
+                    )
+                    # Word 7 is unwritten padding in the FlashMLA scheduler.
+                    torch.testing.assert_close(
+                        actual.flashmla_metadata[:, :7],
+                        expected.flashmla_metadata[:, :7],
+                        rtol=0,
+                        atol=0,
+                    )
+                    torch.testing.assert_close(actual.num_splits, expected.num_splits)
+                    pointers = (
+                        actual.flashmla_metadata.data_ptr(),
+                        actual.num_splits.data_ptr(),
+                    )
+                    self.assertEqual(pointers, saved.setdefault(bs, pointers))
 
 
 def _replay_schedule(meta, splits, num_blocks):
