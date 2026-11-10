@@ -924,8 +924,15 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                 pad_loaded_weight,
             )
 
+            pad_sizes = output_sizes
+            # Packed along the output dim (e.g. GPTQ qzeros): sizes are in packed units.
+            if (
+                isinstance(param, (PackedColumnParameter, PackedvLLMParameter))
+                and param.packed_dim == param.output_dim
+            ):
+                pad_sizes = [int(size // param.packed_factor) for size in output_sizes]
             loaded_weight = pad_loaded_weight(
-                loaded_weight, param.output_dim, output_sizes
+                loaded_weight, param.output_dim, pad_sizes
             )
 
         for shard_id, shard_offset, shard_size in shard_offsets:
