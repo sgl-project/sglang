@@ -103,6 +103,8 @@ The Gemma 4 series offers models in various sizes and architectures, optimized f
 
 <Gemma4Deployment />
 
+For **XEON / QAT / E2B**, follow the [CPU installation guide](../../../docs/hardware-platforms/cpu_server), including its CPU runtime libraries and `LD_PRELOAD` setup. The Python-only recipe passed one greedy text-generation check on Intel Xeon 6972P using unmodified SGLang commit `99fd01047d67bb249641a8e50282a1a5218afc63`, PyTorch `2.14.0+cpu`, Transformers `5.19.0`, and `sglang-kernel-cpu` `0.4.10`. It pins the tested checkpoint at TP4 with BF16 weights and an 8,192-token cache. QAT-unquantized checkpoints retain BF16 weights; this is not a four-bit CPU kernel claim. Full-context capacity, image/audio inputs, dataset accuracy, performance, parser separation, and speculative decoding were not evaluated; the unverified options stay hidden for this CPU recipe.
+
 ### 3.2 Configuration Tips
 
 - SGLang automatically selects the Triton attention backend for Gemma 4 models (required for bidirectional image-token attention during prefill).
@@ -111,7 +113,7 @@ The Gemma 4 series offers models in various sizes and architectures, optimized f
 - **Gemma 4 26B-A4B on B200**: Use `--mem-fraction-static 0.75` to leave workspace headroom for the Triton MoE path.
 - For the 26B-A4B MoE model, consider `--tp 2` for high-throughput workloads.
 - **Speculative Decoding (MTP)**: Each Gemma 4 variant ships with a paired `*-assistant` draft model that enables NEXTN multi-token prediction. Enable it via the selector above, or pass `--speculative-algorithm NEXTN --speculative-draft-model-path google/gemma-4-<variant>-it-assistant --speculative-num-steps 5 --speculative-num-draft-tokens 6 --speculative-eagle-topk 1`. MTP can significantly reduce latency for interactive use cases. The 26B-A4B MoE model requires `--tp 2` when MTP is enabled.
-- **QAT checkpoints**: Toggle **Checkpoint → QAT** in the selector to target the `qat-q4_0-unquantized` releases. These keep bf16 weights, so memory and TP requirements match the standard checkpoints, and each has a matching `*-qat-q4_0-unquantized-assistant` draft model for MTP.
+- **QAT checkpoints**: Toggle **Checkpoint → QAT** in the selector to target the `qat-q4_0-unquantized` releases. These keep bf16 weights; GPU memory and TP requirements match the standard checkpoints, and each has a matching `*-qat-q4_0-unquantized-assistant` draft model for MTP. The separately verified Xeon QAT preset uses TP4 without speculative decoding.
 - **Text only**: `--language-model-only` skips the vision and audio towers. SGLang does not build or load their weights, which frees memory for the KV cache, and rejects image, video and audio requests. The Rust server (`SGLANG_RUST_SERVER=1`) has no Gemma 4 multimodal pipeline, so it serves Gemma 4 only in this mode.
 - Hardware requirements:
 
