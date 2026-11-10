@@ -1647,6 +1647,9 @@ class Envs:
     SGLANG_CUSTOM_ALL_REDUCE_V2_MAX_SIZE_KB = EnvInt(16 * 1024)
     SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PULL_SIZE_KB = EnvInt(None)
     SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PUSH_SIZE_KB = EnvInt(None)
+    # Fused all-reduce + add + RMSNorm on the 1shot_push sizes; off by default
+    # because on gfx1250 TP8 it trails all-reduce + a separate norm by ~0.5 us
+    SGLANG_CUSTOM_ALL_REDUCE_V2_FUSED_RMSNORM_1SHOT = EnvBool(False)
     # See docs/references/environment_variables.
     SGLANG_ENABLE_PCIE_IPC_ALLREDUCE = EnvBool(False)
     SGLANG_PCIE_IPC_MAX_NUMEL = EnvInt(0)

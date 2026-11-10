@@ -44,6 +44,7 @@ from sglang.kernels.ops.communication.all_reduce import (
     PullPlane,
     PushPlane,
     custom_all_reduce,
+    custom_all_reduce_rmsnorm,
     custom_pair_stage,
     get_all_reduce_module,
 )
@@ -90,6 +91,7 @@ _DEFAULT_MAX_SIZE = envs.SGLANG_CUSTOM_ALL_REDUCE_V2_MAX_SIZE_KB.get() * 1024
 # tuned config and explicit constructor sizes (None = not forced)
 _FORCE_PULL_SIZE_KB = envs.SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PULL_SIZE_KB.get()
 _FORCE_PUSH_SIZE_KB = envs.SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PUSH_SIZE_KB.get()
+_FUSED_RMSNORM_1SHOT = envs.SGLANG_CUSTOM_ALL_REDUCE_V2_FUSED_RMSNORM_1SHOT.get()
 
 
 def _ceil_align(nbytes: int, align: int) -> int:
@@ -641,6 +643,52 @@ class CustomAllReduceV2:
         )
         out = custom_pair_stage(self._pair_obj, half, all_gather=True)
         return out.view(input.shape)
+
+    def fused_allreduce_rmsnorm(
+        self,
+        input: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """All-reduce ``input``, add ``residual`` and RMSNorm the sum.
+
+        Returns ``(output, residual_out)``, or None when neither push algorithm
+        would serve this size; the caller then all-reduces and norms separately.
+        """
+        if self.disabled or input.dim() != 2:
+            return None
+        if input.dtype not in (torch.bfloat16, torch.float16):
+            return None
+        if residual.shape != input.shape or residual.dtype != input.dtype:
+            return None
+        if weight.dtype != input.dtype or weight.shape != input.shape[1:]:
+            return None
+        if not (
+            input.is_contiguous()
+            and residual.is_contiguous()
+            and weight.is_contiguous()
+        ):
+            return None
+        num_rows, hidden = input.shape
+        row_bytes = hidden * input.element_size()
+        # the kernel holds a row in one 1024-thread block, 4 vectors per thread
+        if num_rows == 0 or row_bytes % 16 or row_bytes > 1024 * 4 * 16:
+            return None
+        nbytes = num_rows * row_bytes
+        if self.uses_one_shot_push(nbytes):
+            if not _FUSED_RMSNORM_1SHOT:
+                return None
+            algo, rows_per_slot = AllReduceAlgo.ONE_SHOT_PUSH, num_rows
+        elif self.uses_two_shot_push(nbytes):
+            algo = AllReduceAlgo.TWO_SHOT_PUSH
+            rows_per_slot = -(-num_rows // self.world_size)
+        else:
+            return None
+        # both kernels stage the reduced rows in a second half of the slot
+        if 2 * rows_per_slot * row_bytes > self.max_push_size:
+            return None
+        return custom_all_reduce_rmsnorm(self.obj, input, residual, weight, eps, algo)
 
     def _allocate_graph_row(self, input: torch.Tensor, nbytes: int) -> torch.Tensor:
         index = self._graph_counter + len(self._graph_inputs)
