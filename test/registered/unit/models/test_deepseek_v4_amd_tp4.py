@@ -157,7 +157,9 @@ def _replay_fused_and_unfused(group, run, check, *, residual, pre):
             graph = torch.cuda.CUDAGraph()
             with group.graph_capture() as capture:
                 run()
-                with torch.cuda.graph(graph, stream=capture.stream):
+                with torch.cuda.graph(
+                    graph, stream=capture.stream, capture_error_mode="thread_local"
+                ):
                     output = run()
             check(enabled)
             graphs.append((graph, output, eager))
@@ -412,7 +414,9 @@ def test_engram_eager_and_graph_reconstruction(group, rows):
     graph = torch.cuda.CUDAGraph()
     with group.graph_capture() as capture:
         embed(ids)
-        with torch.cuda.graph(graph, stream=capture.stream):
+        with torch.cuda.graph(
+            graph, stream=capture.stream, capture_error_mode="thread_local"
+        ):
             output = embed(ids)
     for shift in (1, 3):
         ids.add_(shift).remainder_(rows)
