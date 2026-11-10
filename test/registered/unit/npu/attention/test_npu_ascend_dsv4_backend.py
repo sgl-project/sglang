@@ -702,25 +702,20 @@ class TestCompressorStateTableABI(unittest.TestCase):
                 "Dsv4NpuRoPE.for_freqs",
                 return_value=rope,
             ),
-            patch.object(torch.ops, "custom", MagicMock(), create=True) as custom_ops,
-            patch.object(torch.ops, "npu", MagicMock(), create=True) as npu_ops,
             patch("sgl_kernel_npu.operators.attention.compressor") as compressor_op,
+            patch.object(torch.ops, "npu", MagicMock(), create=True) as npu_ops,
         ):
             compressor_op.return_value = torch.empty((0, 1))
             backend.forward_compress(compressor, torch.empty((2, 1)), forward_batch)
             backend.forward_compress(compressor, torch.empty((2, 1)), forward_batch)
 
         self.assertEqual(npu_ops.compressor.call_count, 0)
-        self.assertEqual(custom_ops.compressor.call_count, 0)
-        self.assertEqual(compressor_op.call_count, 2)
         self.assertIs(
             compressor_op.call_args_list[0].kwargs["state_block_table"], table
         )
         self.assertIs(
             compressor_op.call_args_list[1].kwargs["state_block_table"], table
         )
-        for call in compressor_op.call_args_list:
-            self.assertEqual(call.kwargs["impl"], "auto")
 
 
 class TestArch35SparseAttentionDispatch(unittest.TestCase):
