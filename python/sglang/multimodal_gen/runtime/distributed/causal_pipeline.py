@@ -8,12 +8,12 @@ Timestep partitioning keeps entire forwards together; block partitioning can
 split a forward across ranks.
 """
 
-from dataclasses import dataclass
 from typing import Literal
 
+from msgspec import Struct
 
-@dataclass(frozen=True)
-class CausalPipelinePlacement:
+
+class CausalPipelinePlacement(Struct, frozen=True):
     """Physical ranks for denoising and the dedicated VAE decoder."""
 
     denoising_ranks: int
@@ -27,15 +27,13 @@ class CausalPipelinePlacement:
         return self.denoising_ranks + 1
 
 
-@dataclass(frozen=True)
-class CausalPipelineSlice:
+class CausalPipelineSlice(Struct, frozen=True):
     timestep: int
     block_start: int
     block_end: int
 
 
-@dataclass(frozen=True)
-class CausalPipelinePlan:
+class CausalPipelinePlan(Struct, frozen=True):
     num_steps: int
     num_blocks: int
     degree: int
