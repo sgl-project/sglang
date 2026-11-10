@@ -21,10 +21,13 @@ def test_factorized_tree_matches_serial_model_shape(width, lower_bound):
     key_dim = value_dim = 128
     wave_width = (width - 1 + 3) // 4
     parent_values = [-1] + [0] * wave_width
+    depth_values = [0] + [1] * wave_width
     for depth in range(2, 5):
         previous_start = 1 + (depth - 2) * wave_width
         parent_values.extend(range(previous_start, previous_start + wave_width))
+        depth_values.extend([depth] * wave_width)
     parents = torch.tensor([parent_values[:width]], dtype=torch.int32, device=device)
+    depths = torch.tensor([depth_values[:width]], dtype=torch.int32, device=device)
     total = batch_size * width
     q = torch.randn(
         1, total, num_query_heads, key_dim, dtype=torch.bfloat16, device=device
@@ -98,16 +101,35 @@ def test_factorized_tree_matches_serial_model_shape(width, lower_bound):
     serial_out = fused_sigmoid_gating_delta_rule_update(
         **common, intermediate_states_buffer=serial_states
     )
-    factorized_out = fused_sigmoid_gating_delta_rule_update(
-        **common,
+    factor_kwargs = dict(
         intermediate_states_buffer=None,
+        tree_depths=depths,
         tree_max_depth=5,
         tree_query_factors=tree_query_factors,
         tree_value_factors=tree_value_factors,
         force_factorized_tree=True,
     )
-
-    torch.testing.assert_close(factorized_out, serial_out, rtol=2e-2, atol=2e-2)
+    keys = k[0].float().repeat_interleave(num_value_heads // num_query_heads, dim=1)
+    keys = keys / torch.sqrt((keys * keys).sum(-1, keepdim=True) + 1e-6)
+    gate_input = a[0].float() + dt_bias.float()
+    if lower_bound is None:
+        gate = -A_log.exp()[:, None] * torch.nn.functional.softplus(gate_input)
+    else:
+        gate = lower_bound * torch.sigmoid(A_log.exp()[:, None] * gate_input)
+    transforms = {
+        "tree_processed_k": keys,
+        "tree_processed_decay": gate.exp(),
+        "tree_processed_beta": torch.sigmoid(b[0].float()),
+    }
+    precomputed = {
+        name: value.transpose(0, 1).unsqueeze(0).contiguous()
+        for name, value in transforms.items()
+    }
+    for extra in ({}, {**precomputed, "force_precomputed_tree_transforms": True}):
+        factorized_out = fused_sigmoid_gating_delta_rule_update(
+            **common, **factor_kwargs, **extra
+        )
+        torch.testing.assert_close(factorized_out, serial_out, rtol=2e-2, atol=2e-2)
 
 
 @pytest.mark.parametrize("width", [2, 16, 17, 32, 33, 49, 65])
