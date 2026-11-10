@@ -43,7 +43,8 @@ class TestHiCacheGraphEvents(unittest.TestCase):
                 SimpleNamespace(
                     load_events=[
                         SimpleNamespace(cuda_event=1000 + s * 10 + i) for i in range(6)
-                    ]
+                    ],
+                    wait_enqueue_done=Mock(),
                 )
                 for s in range(3)
             ],
@@ -154,6 +155,16 @@ class TestHiCacheGraphEvents(unittest.TestCase):
         ):
             events.capture_layer_wait(4)
         self.ready[0].wait.assert_not_called()
+
+    def test_bind_waits_for_a_queued_load_before_reading_its_events(self):
+        # A graph wait on an event not recorded yet passes at once.
+        slot = self.counter.events[0]
+        recorded = slot.load_events
+        del slot.load_events
+        slot.wait_enqueue_done = lambda: setattr(slot, "load_events", recorded)
+        self.counter.consumer_index = 0
+        self.owner.bind(self.graphs, self.bindings)
+        self.assertEqual(self.bindings[0][0].event_handle, 1000)
 
     def test_only_own_event_wait_nodes_are_bound(self):
         self.rt.cudaGraphGetNodes = Mock(side_effect=[(0, [], 4), (0, [1, 2, 3, 4], 4)])
