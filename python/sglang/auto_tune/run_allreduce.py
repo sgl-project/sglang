@@ -111,7 +111,8 @@ def create_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--ignore-size-bounds",
+        "--ignore-scr-size-bounds",
+        dest="ignore_scr_size_bounds",
         action="store_true",
         help=(
             "Do not apply the published QuickReduce or custom all-reduce size "
@@ -214,8 +215,8 @@ def main(argv: list[str] | None = None) -> None:
             qr_quants=args.qr_quant,
             num_iters=args.num_iters,
             sizes=args.sizes,
-            qr_ignore_min_size=args.qr_ignore_min_size or args.ignore_size_bounds,
-            qr_ignore_max_size=args.ignore_size_bounds,
+            qr_ignore_min_size=args.qr_ignore_min_size or args.ignore_scr_size_bounds,
+            qr_ignore_max_size=args.ignore_scr_size_bounds,
             use_aiter_allreduce=args.use_aiter_allreduce,
             qr_cast_bf16_to_fp16=bool(args.qr_cast_bf16_to_fp16),
             use_car_v2=args.use_car_v2,
