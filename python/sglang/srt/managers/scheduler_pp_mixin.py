@@ -99,6 +99,8 @@ class PPBatchMetadata:
     # Rank-local: the unified pool's record of this forward, retired when its
     # result is processed.
     unified_forward_done: Optional[torch.cuda.Event] = None
+    # Rank-local: recorded on the forward stream after this forward, any pool.
+    forward_done: Optional[torch.cuda.Event] = None
 
 
 class SchedulerPPMixin:
@@ -106,7 +108,7 @@ class SchedulerPPMixin:
     # ran init_pp_loop_state (plain TP, unit-test doubles) read False;
     # init_pp_loop_state overwrites it per instance.
     _pp_spec_relay: bool = False
-    # Records a skipped output's completion behind the unified pool's forward
+    # Records a skipped output's completion behind its microbatch's forward
     # (`_pp_make_skip_output_result`); made on first use.
     _pp_skip_output_stream = None
 
@@ -603,8 +605,8 @@ class SchedulerPPMixin:
 
     def _pp_retract_microbatches(self: Scheduler) -> None:
         """Retract the requests of every micro-batch, none of them in flight."""
+        self._retract_batches(list(zip(self.running_mbs, self.last_mbs)))
         for mb_id in range(self.pp_loop_size):
-            self._retract_batch(self.running_mbs[mb_id], self.last_mbs[mb_id])
             self.last_mbs[mb_id] = None
         self.last_batch = None
         self.cur_batch_for_debug = None
@@ -1027,7 +1029,7 @@ class SchedulerPPMixin:
             ),
         )
         d2h_event = self.device_module.Event()
-        forward_done = batch_result.unified_forward_done
+        forward_done = mb_metadata.forward_done if mb_metadata else None
         if forward_done is None:
             d2h_event.record(self.device_module.current_stream())
         else:
@@ -1753,6 +1755,8 @@ class SchedulerPPMixin:
                     trace_only=True,
                     attrs={"pp_mb_id": mb_id},
                 )
+                event = self.device_module.Event()
+                event.record(self.device_module.current_stream())
                 mb_metadata[mb_id] = PPBatchMetadata(
                     can_run_cuda_graph=result.can_run_cuda_graph,
                     fwd_batch=_pp_snapshot_forward_batch(cur_batch),
@@ -1760,9 +1764,8 @@ class SchedulerPPMixin:
                     fpm_timing=result.fpm_timing,
                     forward_launch=result.forward_launch,
                     unified_forward_done=result.unified_forward_done,
+                    forward_done=event,
                 )
-                event = self.device_module.Event()
-                event.record(self.device_module.current_stream())
                 if self.pp_group.is_last_rank:
                     # (last rank) buffer the outputs for async batch depth
                     last_rank_comm_queue.append(
