@@ -2337,6 +2337,11 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
     def should_apply_lora(self, module_name: str) -> bool:
         return module_name.startswith("model.layers.")
 
+    def prepare_before_cuda_graph_capture(self, model_runner) -> None:
+        prepare = getattr(self.model, "prepare_before_cuda_graph_capture", None)
+        if prepare is not None:
+            prepare(model_runner)
+
     @staticmethod
     def shared_experts_fusion_disable_reason(hf_config, quant_config):
         return Qwen4ExpVLModel.shared_experts_fusion_disable_reason(

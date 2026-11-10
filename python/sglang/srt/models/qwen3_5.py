@@ -163,8 +163,11 @@ _is_cpu = is_cpu()
 _is_gfx95 = is_gfx95_supported()
 _is_hip = is_hip()
 _QWEN3_5_MOE_TEXT_MODEL_TYPES = ("qwen3_5_moe_text", "qwen4_exp_text")
-# qwen4_exp shares these classes, but the ROCm packed path is Qwen3.5-only.
+# qwen4_exp shares these classes; on ROCm it packs only the Quark FP8 projections.
 _QWEN3_5_ROCM_PACKED_MODEL_TYPES = ("qwen3_5_text", "qwen3_5_moe_text")
+_QWEN3_5_ROCM_PACKED_FP8_MODEL_TYPES = _QWEN3_5_ROCM_PACKED_MODEL_TYPES + (
+    "qwen4_exp_text",
+)
 _is_xpu = is_xpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 if _use_aiter:
@@ -711,7 +714,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             return
         if (
             _use_aiter
-            and self.config.model_type not in _QWEN3_5_ROCM_PACKED_MODEL_TYPES
+            and self.config.model_type not in _QWEN3_5_ROCM_PACKED_FP8_MODEL_TYPES
         ):
             return
         if get_lora().enable_lora or get_lora().lora_paths:
@@ -722,6 +725,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             return
         qkvz, ba = self.in_proj_qkvz, self.in_proj_ba
         if _use_aiter and self._finalize_fused_fp8_in_proj():
+            return
+        if (
+            _use_aiter
+            and self.config.model_type not in _QWEN3_5_ROCM_PACKED_MODEL_TYPES
+        ):
             return
         if not (
             isinstance(qkvz.quant_method, UnquantizedLinearMethod)
@@ -756,7 +764,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             type(getattr(proj, "scheme", None)) is QuarkW8A8Fp8
             and proj.scheme.weight_qscheme == "per_channel"
             and proj.scheme.per_token
-            and proj.input_scale is None
+            and getattr(proj, "input_scale", None) is None
             and proj.bias is None
             and proj.weight.dtype == torch.float8_e4m3fn
             and proj.weight.is_cuda
@@ -1893,7 +1901,10 @@ class Qwen3_5ForCausalLM(nn.Module):
         return self.embed_tokens
 
     def prepare_before_cuda_graph_capture(self, model_runner) -> None:
-        if _use_aiter and self.config.model_type in _QWEN3_5_ROCM_PACKED_MODEL_TYPES:
+        if (
+            _use_aiter
+            and self.config.model_type in _QWEN3_5_ROCM_PACKED_FP8_MODEL_TYPES
+        ):
             packed = 0
             mxfp4 = 0
             for module in self.modules():

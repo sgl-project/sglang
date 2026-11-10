@@ -14,7 +14,7 @@ register_amd_ci(est_time=90, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 
 class _FP8Linear(torch.nn.Module):
-    def __init__(self, rows):
+    def __init__(self, rows, processed=True):
         super().__init__()
         from sglang.srt.layers.quantization.quark.schemes.quark_w8a8_fp8 import (
             QuarkW8A8Fp8,
@@ -32,7 +32,8 @@ class _FP8Linear(torch.nn.Module):
             {"qscheme": "per_channel"},
             {"qscheme": "per_channel", "is_dynamic": True},
         )
-        self.scheme.process_weights_after_loading(self)
+        if processed:
+            self.scheme.process_weights_after_loading(self)
         self.bias = None
         self.quant_method = object()
 
@@ -52,11 +53,11 @@ class TestQwen35GDNPackedFP8InProj(CustomTestCase):
         cls.module = qwen3_5
         cls.gdn_cls = qwen3_5.Qwen3_5GatedDeltaNet
 
-    def make_gdn(self, tp, pp_size=1, model_type="qwen3_5_moe_text"):
+    def make_gdn(self, tp, pp_size=1, model_type="qwen3_5_moe_text", processed=True):
         gdn = types.SimpleNamespace(
             config=types.SimpleNamespace(model_type=model_type),
-            in_proj_qkvz=_FP8Linear(20480 // tp),
-            in_proj_ba=_FP8Linear(128 // tp),
+            in_proj_qkvz=_FP8Linear(20480 // tp, processed),
+            in_proj_ba=_FP8Linear(128 // tp, processed),
             _fused_in_proj_weight=None,
             _fused_in_proj_scale=None,
             _fused_in_proj_sources=None,
@@ -124,11 +125,11 @@ class TestQwen35GDNPackedFP8InProj(CustomTestCase):
         gdn = self.make_gdn(4, pp_size=2)
         self.assertIsNone(gdn._fused_in_proj_weight)
 
-    def test_fp8_packing_is_limited_to_qwen35(self):
+    def test_fp8_packing_model_types(self):
         for model_type, supported in (
             ("qwen3_5_text", True),
             ("qwen3_5_moe_text", True),
-            ("qwen4_exp_text", False),
+            ("qwen4_exp_text", True),
             ("other_text_model", False),
         ):
             with self.subTest(model_type=model_type):
@@ -136,6 +137,16 @@ class TestQwen35GDNPackedFP8InProj(CustomTestCase):
                 self.assertEqual(gdn._fused_in_proj_weight is not None, supported)
                 self.assertEqual(gdn._fused_in_proj_scale is not None, supported)
                 self.assertEqual(hasattr(gdn, "_derived_weight_cache_error"), supported)
+
+    def test_finalize_before_weight_processing_keeps_projections(self):
+        # qwen4_exp calls finalize from load_weights, before Quark registers
+        # input_scale and transposes the weights; the capture hook packs later.
+        for model_type in ("qwen3_5_moe_text", "qwen4_exp_text"):
+            with self.subTest(model_type=model_type):
+                gdn = self.make_gdn(4, model_type=model_type, processed=False)
+                self.assertFalse(hasattr(gdn.in_proj_qkvz, "input_scale"))
+                self.assertIsNone(gdn._fused_in_proj_weight)
+                self.assertIsNone(gdn._fused_in_proj_scale)
 
 
 if __name__ == "__main__":
