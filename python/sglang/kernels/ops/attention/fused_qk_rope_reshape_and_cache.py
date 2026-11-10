@@ -1,20 +1,18 @@
-import os
-
 import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
 from sglang.srt.utils import is_gfx1250_supported
 
-# Large-T path: one program per (BLOCK_T tokens, HB q heads) and one per
-# BLOCK_T tokens for the K rope and the KV cache write, instead of one 1-warp
-# program per (token, q head). On by default for gfx1250 when T >= _TILED_MIN_T.
-# SGLANG_FUSED_ROPE_KV_TILED=0 keeps the original kernel.
-_TILED_ENABLED = os.environ.get("SGLANG_FUSED_ROPE_KV_TILED", "1") != "0"
-_TILED_MIN_T = int(os.environ.get("SGLANG_FUSED_ROPE_KV_TILED_MIN_T", "256"))
-_TILED_BLOCK_T = int(os.environ.get("SGLANG_FUSED_ROPE_KV_TILED_BLOCK_T", "16"))
-_TILED_HB = int(os.environ.get("SGLANG_FUSED_ROPE_KV_TILED_HB", "8"))
-_TILED_WARPS = int(os.environ.get("SGLANG_FUSED_ROPE_KV_TILED_WARPS", "4"))
+# Large-T path: one program per (16 tokens, 8 q heads) and one per 16 tokens
+# for the K rope and the KV cache write, instead of one 1-warp program per
+# (token, q head). On by default for gfx1250 when T >= _TILED_MIN_T.
+# SGLANG_FUSED_ROPE_KV_TILED=false keeps the original kernel.
+_TILED_MIN_T = 256
+_TILED_BLOCK_T = 16
+_TILED_HB = 8
+_TILED_WARPS = 4
 _TILED_QK_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
 
@@ -39,7 +37,7 @@ def _use_tiled(
     # A non-fp32 table, or Q/K outside bf16, fp16, and fp32, rounds
     # differently from the untiled kernel.
     if not (
-        _TILED_ENABLED
+        envs.SGLANG_FUSED_ROPE_KV_TILED.get()
         and is_gfx1250_supported()
         and t >= _TILED_MIN_T
         and t_slot == t
