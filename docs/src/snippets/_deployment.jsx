@@ -93,7 +93,8 @@
 //                      `hw|quant|strategy` then `hw|quant` then `hw`;
 //                      falls back to `lmsysorg/sglang:dev`
 //   dockerHostNetworkWhen optional — `(selection, {flags, env}) => boolean`
-//   dockerMounts       optional — additional `-v` mount specs
+//   dockerMounts       optional — additional `-v` mount specs, as an array or
+//                      `(selection) => array`
 //   dockerRunCommand   optional — command placed after the image and before
 //                      generated server flags; string or `(selection) => string`
 //   runModes           optional — command output tabs to show (`python` and/or
@@ -118,6 +119,9 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
   if (!config) {
     return <div style={{padding: 12, color: "#b91c1c"}}>Deployment: missing <code>config</code> prop</div>;
   }
+
+  // ==== COMMAND ENGINE ====
+  // docs/scripts/export_commands.mjs runs this block in Node; keep it free of JSX and React.
 
   // ==== 1. Hardware catalog (shared across cookbooks) ====
   // VRAM is per-GPU on-chip memory, not per-module.
@@ -145,6 +149,7 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
       { id: "h20-3e", label: "H20-3e", vram: "141GB" },
       { id: "h800",  label: "H800",  vram: "80GB"  },
     ],
+    rubin: [],
     // ROCm multi-node runs the RDMA NICs straight through: /dev/infiniband
     // covers rdma_cm plus the per-NIC uverbsN nodes, IPC_LOCK + an unlimited
     // memlock let the transport pin its registered buffers, and the stack /
@@ -955,7 +960,10 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
         // The NPU device block already mounts ~/.cache/.
         ...(vendorOf(sel.hw) === "npu"
           ? [] : ["  -v ~/.cache/huggingface:/root/.cache/huggingface"]),
-        ...[...(config.dockerMounts || []), ...(cell.pd ? cell.dockerMounts || [] : [])].map((mount) => `  -v ${mount}`),
+        ...[
+          ...(typeof config.dockerMounts === "function" ? config.dockerMounts(sel) : config.dockerMounts || []),
+          ...(cell.pd ? cell.dockerMounts || [] : []),
+        ].map((mount) => `  -v ${mount}`),
         // HF token only for gated checkpoints — configs that declare an HF_TOKEN placeholder.
         ...(config.placeholders && config.placeholders.HF_TOKEN
           ? [`  --env "HF_TOKEN={{HF_TOKEN}}"`] : []),
@@ -994,6 +1002,7 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
     }
     return cmd;
   };
+  // ==== end COMMAND ENGINE ====
 
   // Accuracy labels: [field-key, display-label, unit]. Declared per model via
   // `config.accuracyLabels` — the engine ships NO default eval set. A config

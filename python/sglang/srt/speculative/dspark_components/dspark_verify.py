@@ -50,8 +50,8 @@ from sglang.srt.speculative.dflash_utils import (
     apply_dflash_verify_logits_adjustments,
     build_speculative_verify_target_probs,
 )
-from sglang.srt.speculative.dspark_components.dspark_deferred_commit import (
-    DeferredContextCommit,
+from sglang.srt.speculative.dspark_components.dspark_deferred_draft_kv import (
+    DeferredDraftKVStore,
 )
 from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResult
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
@@ -197,7 +197,6 @@ class TargetVerifyExecutor:
         override drawn by begin_simulated_step.
         """
         if folded_accept:
-            self.verify_epilogue.note_static_verify(bs)
             return self.verify_epilogue.read_accept(bs)
 
         correct_len, bonus, cap_trim_lens = accept_draft_tokens(
@@ -326,7 +325,12 @@ class TargetVerifyExecutor:
         batch.out_cache_loc = verify_cache_loc
         seq_lens_cpu_backup = batch.seq_lens_cpu
         seq_lens_sum_backup = batch.seq_lens_sum
-        if not self._verify_backend_self_adds_seq_lens():
+        if (
+            getattr(
+                self.target_worker.model_runner.attn_backend, "needs_cpu_seq_lens", True
+            )
+            and not self._verify_backend_self_adds_seq_lens()
+        ):
             if seq_lens_cpu_backup is not None:
                 batch.seq_lens_cpu = seq_lens_cpu_backup + verify_w
                 batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
@@ -595,7 +599,7 @@ class DsparkVerifyEpilogue:
         fused_accept_tail: bool = False,
         accept_tail_min_bs: int = 1,
         accept_tail_max_bs: int = 0,
-        deferred_commit: Optional[DeferredContextCommit] = None,
+        deferred_draft_kv: Optional[DeferredDraftKVStore] = None,
         post_fold: bool = False,
     ) -> None:
         self.max_bs = int(max_bs)
@@ -604,8 +608,8 @@ class DsparkVerifyEpilogue:
         self._post_fold = bool(post_fold)
         self.future_relay: Optional[FutureRelayBuffers] = None
         # SGLANG_DSPARK_DEFER_CONTEXT_KV: static graphs join its forked projection and
-        # stage the commit's stores into it; the next draft forward runs them.
-        self.deferred_commit = deferred_commit
+        # stage its stores; the next draft forward runs them.
+        self.deferred_draft_kv = deferred_draft_kv
         # SGLANG_SIMULATE_ACC_LEN with a sampled bonus inside the graph too: the bonus
         # is drawn at the simulated correct_len from these buffers, which
         # begin_sim_bonus writes before replay (<= 0 temperature: argmax).
@@ -777,9 +781,11 @@ class DsparkVerifyEpilogue:
                 .reshape(-1)
                 .contiguous()
             )
-        commit = self.deferred_commit
-        if commit is not None and (kv_projected or commit.join_projection()):
-            commit.stage(
+        deferred_draft_kv = self.deferred_draft_kv
+        if deferred_draft_kv is not None and (
+            kv_projected or deferred_draft_kv.join_projection()
+        ):
+            deferred_draft_kv.stage(
                 cache_loc=cache_loc,
                 positions=io.positions,
                 commit_lens=gated_commit_lens,
@@ -899,11 +905,6 @@ class DsparkVerifyEpilogue:
             bs,
             "sim-fold" if self.simulate_fold else "argmax",
         )
-
-    def note_static_verify(self, bs: int) -> None:
-        """Host, after a static verify graph replayed ``bs`` requests."""
-        if self.deferred_commit is not None:
-            self.deferred_commit.note_static_verify(bs)
 
     def _commit_engram_history(
         self, candidates, req_pool_indices, commit_lens, verify_lens, gate

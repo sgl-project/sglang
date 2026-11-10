@@ -7,6 +7,7 @@ a naive walk-in-order loop written here, not the implementation under test.
 
 import random
 import unittest
+from types import SimpleNamespace
 
 import torch
 
@@ -249,6 +250,19 @@ class TestBeamGroup(CustomTestCase):
         self.assertAlmostEqual(group.beam_score(-0.3, 2), -0.3, places=6)
         group2 = self._make_group(length_penalty=1.0)
         self.assertAlmostEqual(group2.beam_score(-0.3, 2), -0.15, places=6)
+
+    def test_out_of_vocab_stop_ids_are_dropped(self):
+        """Out-of-vocab stop ids never match and must not break the group's tensor."""
+        from sglang.srt.beam_search.coordinator import BeamCoordinator
+
+        req = SimpleNamespace(eos_token_ids={2}, tokenizer=None)
+        params = SimpleNamespace(
+            ignore_eos=False, stop_token_ids={-1, 0, 5, 31, 32, 2**63}
+        )
+        ids = BeamCoordinator._collect_stop_token_ids(req, params, vocab_size=32)
+        self.assertEqual(ids, [0, 2, 5, 31])
+        group = self._make_group(stop_token_ids=ids)
+        self.assertEqual(group.stop_token_ids.tolist(), ids)
 
 
 if __name__ == "__main__":
