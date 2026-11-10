@@ -2333,6 +2333,10 @@ class Envs:
     # and the latent up_proj tail above the fused-GEMV range (k3_ar_fusion
     # gemm_ag_up_fits). Online weight updates are rejected while on.
     SGLANG_K3_SHARDED_MOE = EnvBool(True)
+    # Kimi-K3.1 on GB300 (SM103): the measured per-M TGV tactics of the decode
+    # dense GEMMs, the side-stream [f_a | b] TGV, and attention side streams up
+    # to 288 rows (kimi_k3._k31_gb300_tuning). 0 restores the generic picks.
+    SGLANG_K31_DECODE_GEMM_TACTICS = EnvBool(True)
     # Use the ROCm radix-4 router for covered K3 top-k workloads.
     SGLANG_K3_RADIX4_TOPK = EnvBool(False)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)
