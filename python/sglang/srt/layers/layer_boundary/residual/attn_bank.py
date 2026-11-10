@@ -120,6 +120,10 @@ class AttnBankState:
     # gather of what it needs, in place of gathering the normed input. Takes the
     # padded rows and the token count; False leaves the gather to the read.
     ffn_shard_front: Optional[Callable[[torch.Tensor, int], bool]] = None
+    # With ffn_row_shards: the attention output's complete sum on this rank's
+    # padded rows when the attention produced it there, else None (the read
+    # reduce-scatters its TP-partial output).
+    ffn_attn_rows: Optional[Callable[[int], Optional[torch.Tensor]]] = None
 
     def _aggregate(
         self, contribution, residual, norm, *, score_proj, score_norm, write

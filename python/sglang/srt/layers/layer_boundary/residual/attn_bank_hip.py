@@ -68,10 +68,12 @@ def reduce_scatter_rows_and_read_ffn_input(
     world, rank = group.world_size, group.rank_in_group
     padded = -(-num_tokens // world) * world
     rows = padded // world
-    if padded != num_tokens:
-        hidden_states = _padded_rows(hidden_states, padded)
-    reduced = hidden_states.new_empty(rows, hidden_size)
-    group.reduce_scatter_tensor(reduced, hidden_states.contiguous())
+    reduced = None if state.ffn_attn_rows is None else state.ffn_attn_rows(num_tokens)
+    if reduced is None:
+        if padded != num_tokens:
+            hidden_states = _padded_rows(hidden_states, padded)
+        reduced = hidden_states.new_empty(rows, hidden_size)
+        group.reduce_scatter_tensor(reduced, hidden_states.contiguous())
     start, valid = row_shard(num_tokens, world, rank)
     if valid == 0:
         # this rank's padded rows all lie past the last token
