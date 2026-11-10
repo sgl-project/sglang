@@ -280,3 +280,28 @@ A cold-versus-warm comparison within either mode changes the cache partition
 and is an additional backend diagnostic, not an interchangeable Base/reuse
 comparison. Keep such differences visible; task-level accuracy, cancellation,
 OOM/eviction pressure, and Rust TreeCore validation remain separate work.
+
+## Pure 8192-token concurrency comparison
+
+`pure8k_results.json` records the completed three-model comparison at commit
+`70d677788`: input 8192, output 1, chunk 4096, GDN hit 4096, KV hit 8192.
+All replay KV rows were reused at concurrency 1/8/16. Forward p50 reductions
+were 0.68–0.74% for Qwen3.5-4B, 0.68–0.89% for Qwen3.5-9B and
+3.01–3.29% for the experimental Olmo fixture. These measurements predate
+the subsequent main merge; they are not performance measurements of the merged code.
+
+Reproduce the ABBA suite on one available GPU with the three model directories
+(and their `download_revision.json` provenance files) under MODEL_DIR:
+
+```bash
+python benchmark/gdn_kv_reuse/run_pure8k_concurrency.py \
+  --model-dir MODEL_DIR --output-dir NEW_RESULT_DIR
+```
+
+The suite uses physical GPU 0, starts its own servers on port 18110 and requires
+enough free GPU memory. Each round uses the same 16 targets, submitted in
+groups of 1/8/16; each arm retains 30 rounds / 480 requests per concurrency.
+The global 4096-token budget usually serializes the 4096-token prefills;
+serving concurrency is not prefill batch size. Cache preparation is untimed.
+The suite checks replay coverage and records ordinary-CUDA one-token output
+comparisons; it does not assert general numerical equivalence.
