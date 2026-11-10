@@ -616,6 +616,7 @@ def test_pool_configurator_only_merges_dspark_target_cache(
     config = config_mod.KVCacheConfigurator.__new__(config_mod.KVCacheConfigurator)
     config.is_draft_worker = is_draft
     config.modelslim_cache_layout = None
+    config.kv_shard_rank = None
     config.spec_algorithm = SimpleNamespace(is_dspark=lambda: dspark)
     config.model_config = SimpleNamespace(
         kv_lora_rank=512,
