@@ -33,7 +33,7 @@ test(`${name} exposes only validated Python-only Xeon recipes`, () => {
   const cells = config.cells.filter((cell) => cell.match.hw === "xeon");
   const expectedVariants = vendor === "IFM" ? ["0.9b", "3.7b"] : ["3b", "8b", "30b"];
   if (vendor === "IFM") expectedVariants.push("7b");
-  if (name === "k2-horizon") expectedVariants.push("32b");
+  if (vendor === "IFM") expectedVariants.push("32b");
   assert.deepEqual(cells.map((cell) => cell.match.variant).sort(), expectedVariants.sort());
   const api = engine(config);
   const cell = cells.find((candidate) => candidate.match.variant === firstVariant);
@@ -82,6 +82,7 @@ for (const [vendor, name, variant, checkpoint, revision] of [
   ["IFM", "k2-horizon", "32b", "K2-Horizon-32B", "4b05c13ad1972e8f470ab93ff90c3e90010ce592"],
   ["IFM", "jais-3", "3.7b", "Jais-3-3.7B", "78d52c03900ef18ee3ebae631426556df6bd925a"],
   ["IFM", "jais-3", "7b", "Jais-3-7B", "c7daf3c43355921602398a0d97bbeba05bfbe81b"],
+  ["IFM", "jais-3", "32b", "Jais-3-32B", "2d4da325cfa0d28b9f2eb4ddac2baa1ae0ed6063"],
   ["ibm-granite", "granite-4.2", "8b", "granite-4.2-8b", "a7042144125ce5ae64f89610e8289647fc000b9a"],
   ["ibm-granite", "granite-4.2", "30b", "granite-4.2-30b", "9e668ce1c538387ef24d3644e9b0606647762636"],
 ]) {
