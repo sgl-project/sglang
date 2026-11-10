@@ -546,7 +546,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--prefill-cache-reserve`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Fraction of the KV pool, and of the Mamba state pool on hybrid models, kept for cached prefixes while requests run. A request whose cached prefix covers less than half of its prompt waits instead of taking that room, so multi-turn sessions that come back still find their KV. Traffic without reuse only waits longer. Unset disables it; `0.3` was the measured setting.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Fraction of the KV pool, and of the Mamba state pool on hybrid models, kept for cached prefixes while requests run. A request whose cached prefix covers less than half of its prompt waits instead of taking that room, so multi-turn sessions that come back still find their KV; like any request that does not fit, it also holds the requests queued behind it. Traffic without reuse only waits longer. Not supported with unified memory, PD disaggregation or priority scheduling. Unset disables it; `0.3` did best in a replay of coding-agent traffic.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: float</td>
     </tr>

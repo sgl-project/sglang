@@ -21,6 +21,7 @@ from sglang.srt.managers.schedule_policy import (
     estimate_prefill_extend_tile_metrics,
 )
 from sglang.srt.mem_cache.allocator.hisparse import HiSparseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
 from sglang.srt.mem_cache.allocator.page_interleave import PageInterleavePoolAllocator
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -2869,48 +2870,52 @@ class TestPrefillAdder(CustomTestCase):
             ).memory_budget.swa_never_fits(**req)
         )
 
-    def _cache_reserve_adder(self, *, running: bool, mamba_slots=None):
+    def _cache_reserve_adder(self, *, running: bool, state_pool=None, **kwargs):
         """A 1,000-token pool with 400 free or evictable tokens and a 0.3 reserve;
-        ``mamba_slots`` is (pool size, free, evictable) for a hybrid model."""
+        ``state_pool`` makes it a hybrid cache (no evictable states)."""
         override = get_context().override_server_args(prefill_cache_reserve=0.3)
         override.install()
         self.addCleanup(override.restore)
         self.mock_token_allocator = self.create_token_allocator(available_size=100)
         self.mock_token_allocator.size = 1000
         self.mock_tree_cache = self.create_tree_cache(evictable_size=300)
-        self.mock_tree_cache.supports_mamba.return_value = mamba_slots is not None
-        if mamba_slots is not None:
-            size, free, evictable = mamba_slots
+        self.mock_tree_cache.supports_mamba.return_value = state_pool is not None
+        if state_pool is not None:
             self.mock_tree_cache.full_evictable_size.return_value = 300
-            pool = self.mock_tree_cache.req_to_token_pool
-            pool.mamba_allocator.size = size
-            pool.mamba_allocator.available_size.return_value = free
-            pool.mamba_initial_tracking_slots = 4
-            self.mock_tree_cache.mamba_evictable_size.return_value = evictable
+            self.mock_tree_cache.mamba_evictable_size.return_value = 0
+            table = self.mock_tree_cache.req_to_token_pool
+            table.mamba_allocator = state_pool
+            table.enable_mamba_extra_buffer = True
+            table.mamba_initial_tracking_slots = 2
         batch = self.create_running_batch(
             [self.create_mock_req("run", priority=0, max_new_tokens=0)]
             if running
             else []
         )
         batch.is_empty.return_value = not running
-        return self.create_adder(batch)
+        return self.create_adder(batch, **kwargs)
 
-    def _reserve_req(self, *, prefix_len: int):
+    def _reserve_req(self, *, prefix_len: int, prompt_len: int = 200):
         req = self.create_mock_req("new", priority=0, max_new_tokens=10)
-        req.full_untruncated_fill_ids = list(range(200))
+        req.full_untruncated_fill_ids = list(range(prompt_len))
         req.prefix_len = prefix_len
         return req
 
     def test_cache_reserve_holds_uncached_request_while_others_run(self):
         """A request that would leave less than the reserve free or evictable
-        waits (OTHER, so the next pass asks again) and takes nothing."""
-        adder = self._cache_reserve_adder(running=True)
+        waits (OTHER, so the next pass asks again) before the delayer is asked
+        or anything is taken."""
+        delayer = _RecordingDelayer(allow=True)
+        adder = self._cache_reserve_adder(
+            running=True, prefill_delayer_single_pass=delayer
+        )
         req = self._reserve_req(prefix_len=0)
         self.assertEqual(
             adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None),
             AddReqResult.OTHER,
         )
         self.assertEqual(adder.can_run_list, [])
+        self.assertEqual(delayer.calls, [])
 
     def test_cache_reserve_admits_cached_or_idle(self):
         """A request whose cached prefix covers half its prompt reuses resident
@@ -2927,20 +2932,32 @@ class TestPrefillAdder(CustomTestCase):
                 )
                 self.assertEqual(adder.can_run_list, [req])
 
-    def test_cache_reserve_counts_mamba_state_slots(self):
-        """On a hybrid model the reserve also covers state slots: KV fits, but a
-        running request's 5 slots would leave fewer than 30 of 100 slots."""
-        for free, held in ((10, True), (30, False)):
-            with self.subTest(free=free):
-                adder = self._cache_reserve_adder(
-                    running=True, mamba_slots=(100, free, 15)
-                )
-                # A small prompt so the KV reserve alone admits it.
-                req = self._reserve_req(prefix_len=0)
-                req.full_untruncated_fill_ids = list(range(20))
-                self.assertEqual(
-                    adder._holds_for_cache_reserve(req, total_tokens=40), held
-                )
+    def test_cache_reserve_never_holds_what_cannot_fit_beside_it(self):
+        """A host hit counts as cached, and a request larger than the pool minus
+        the reserve would wait until the server drains, so neither is held."""
+        adder = self._cache_reserve_adder(running=True)
+        req = self._reserve_req(prefix_len=0)
+        req.host_hit_length = 100
+        self.assertFalse(adder._holds_for_cache_reserve(req, total_tokens=211))
+        big = self._reserve_req(prefix_len=0, prompt_len=800)
+        self.assertFalse(adder._holds_for_cache_reserve(big, total_tokens=811))
+
+    def test_cache_reserve_counts_state_slots_from_the_pass_start(self):
+        """On a hybrid cache the reserve also covers state slots (30 of 100). The
+        count is read before the scheduler pre-takes slots for the waiting queue,
+        and each request admitted in the pass takes its 3 fresh slots off it."""
+        pool = MambaSlotAllocator(size=100, device="cpu")
+        pool.alloc(60)
+        adder = self._cache_reserve_adder(running=True, state_pool=pool)
+        pool.alloc_group_begin(35)
+        self.addCleanup(pool.alloc_group_end)
+        # A small prompt so the KV reserve alone admits it.
+        req = self._reserve_req(prefix_len=0, prompt_len=20)
+        # 40 free at the pass start: 40 - 3 = 37 slots are left.
+        self.assertFalse(adder._holds_for_cache_reserve(req, total_tokens=40))
+        adder.can_run_list = [MagicMock(), MagicMock(), MagicMock()]
+        # Three admitted already: 40 - 4 * 3 = 28 slots are left.
+        self.assertTrue(adder._holds_for_cache_reserve(req, total_tokens=40))
 
 
 if __name__ == "__main__":

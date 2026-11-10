@@ -386,6 +386,14 @@ def check_server_args(server_args: Any):
         assert not cfg.enable_unified_memory, (
             "--prefill-cache-reserve does not support --enable-unified-memory"
         )
+        # A PD prefill server runs no decode batch, so the reserve would never hold.
+        assert cfg.disaggregation_mode == "null", (
+            "--prefill-cache-reserve does not support PD disaggregation"
+        )
+        # Priority preemption retracts running requests before the reserve check.
+        assert not cfg.enable_priority_scheduling, (
+            "--prefill-cache-reserve does not support --enable-priority-scheduling"
+        )
 
     # Check scheduling policy
     if cfg.enable_priority_scheduling:
