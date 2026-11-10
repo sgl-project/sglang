@@ -1293,9 +1293,7 @@ The component column describes global `--quantization w8a8_int` selection.
 
 Use the [Wan 2.2 cookbook](/cookbook/diffusion/Wan/Wan2.2) or
 [MiniMax-H3 cookbook](/cookbook/diffusion/MiniMax/MiniMax-H3) for model and
-input settings. MiniMax-H3 optionally fuses SwiGLU or residual RMSNorm with
-activation quantization when the installed NPU operators support them; otherwise it
-uses separate activation, normalization, and quantization operations.
+input settings. This W8A8 path quantizes activations at the linear layer input.
 
 On Wan 2.2 A14B, global `--quantization w8a8_int` applies to both
 `transformer` and `transformer_2`. To select only the primary transformer,

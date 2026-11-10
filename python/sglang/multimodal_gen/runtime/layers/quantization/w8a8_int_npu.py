@@ -16,7 +16,6 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.weight_attrs import set_weight_attrs
 from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
     NPUW8A8Int8DynamicLinearMethod,
-    _INT8Activation,
 )
 from sglang.srt.layers.quantization.utils import _module_path_match, is_layer_skipped
 
@@ -81,14 +80,9 @@ class NPUOnlineW8A8DiffusionConfig(QuantizationConfig):
 
 
 class NPUOnlineW8A8DiffusionLinearMethod(LinearMethodBase):
-    accepts_int8_input = True
-
     def __init__(self, quant_config: NPUOnlineW8A8DiffusionConfig) -> None:
         self.quant_config = quant_config
         self.kernel = NPUW8A8Int8DynamicLinearMethod(online_weights=True)
-
-    def quantize_swiglu(self, x: torch.Tensor) -> _INT8Activation | None:
-        return self.kernel.quantize_swiglu(x)
 
     def create_weights(
         self,
@@ -134,21 +128,16 @@ class NPUOnlineW8A8DiffusionLinearMethod(LinearMethodBase):
     def apply(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor | _INT8Activation,
+        x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if isinstance(x, _INT8Activation):
-            input_shape = x.data.shape
-            output_dtype = x.source_dtype
-        else:
-            input_shape = x.shape
-            output_dtype = x.dtype
+        input_shape = x.shape
+        output_dtype = x.dtype
         if output_dtype not in (torch.float16, torch.bfloat16):
             raise ValueError(
                 "w8a8_int diffusion quantization requires FP16 or BF16 "
                 f"activations, got {output_dtype}"
             )
-        if not isinstance(x, _INT8Activation):
-            x = x.reshape(-1, x.shape[-1])
+        x = x.reshape(-1, x.shape[-1])
         output = self.kernel.apply(layer, x, bias)
         return output.reshape(*input_shape[:-1], output.shape[-1])

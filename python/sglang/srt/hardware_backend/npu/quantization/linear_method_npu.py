@@ -1,5 +1,5 @@
 import logging
-from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -102,15 +102,7 @@ class NPUW8A8Int8LinearMethod(_NPULinearMethodBase):
         )
 
 
-class _INT8Activation(NamedTuple):
-    data: torch.Tensor
-    scale: torch.Tensor
-    source_dtype: torch.dtype
-
-
 class NPUW8A8Int8DynamicLinearMethod(_NPULinearMethodBase):
-    accepts_int8_input = True
-
     def __init__(
         self,
         quant_config: Optional["QuantizationConfig"] = None,
@@ -119,15 +111,6 @@ class NPUW8A8Int8DynamicLinearMethod(_NPULinearMethodBase):
     ):
         super().__init__(quant_config)
         self.online_weights = online_weights
-
-    def quantize_swiglu(self, x: torch.Tensor) -> _INT8Activation | None:
-        from sglang.srt.hardware_backend.npu.moe.activation import NPUSwigluQuant
-
-        result = NPUSwigluQuant.apply(x)
-        if result is None:
-            return None
-        data, scale = result
-        return _INT8Activation(data, scale, x.dtype)
 
     def process_weights_after_loading(self, layer: torch.nn.Module):
         if self.online_weights:
@@ -147,12 +130,10 @@ class NPUW8A8Int8DynamicLinearMethod(_NPULinearMethodBase):
     def apply(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor | _INT8Activation | Tuple[torch.Tensor, torch.Tensor],
+        x: torch.Tensor | Tuple[torch.Tensor, torch.Tensor],
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if isinstance(x, _INT8Activation):
-            quant_out, dynamic_scale, original_dtype = x
-        elif isinstance(x, tuple):
+        if isinstance(x, tuple):
             # MLAProlog supplies quantized activations with BF16 output.
             original_dtype = torch.bfloat16
             quant_out, dynamic_scale = x
