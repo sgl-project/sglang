@@ -23,7 +23,9 @@ the same Mega commit even after Mega `main` or the pin on SGLang `main` changes.
 A missing or malformed pin fails the workflow; it never falls back to `main`.
 Older tags without the pin file cannot be built through this release-pin path.
 
-Direct Docker builds still default to Mega `main` unless
-`SGL_NVIDIA_MEGA_REF` is explicitly supplied. The selected Mega revision is logged
+Direct Docker builds select Mega in this order: an explicitly supplied
+`SGL_NVIDIA_MEGA_REF`, the legacy `SGL_NVIDIA_MEGA_COMMIT` argument if nonempty,
+then `main`. Existing scripts that pass `SGL_NVIDIA_MEGA_COMMIT` keep their pin;
+new scripts should use `SGL_NVIDIA_MEGA_REF`. The selected Mega revision is logged
 and saved in `/sgl-workspace/sgl-nvidia-mega.commit` inside the image. This fixes
 Mega source selection; it does not make all other image dependencies reproducible.

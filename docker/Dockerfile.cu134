@@ -897,8 +897,10 @@ WORKDIR /src
 
 FROM scratch AS mega_source_1
 ARG SGL_NVIDIA_MEGA_REPO="https://github.com/sgl-project/sgl-nvidia-mega.git"
-# Official multi-arch builds pass the SHA resolved from main once for the run.
-ARG SGL_NVIDIA_MEGA_REF=main
+# Keep the legacy commit argument as a fallback for existing build scripts.
+ARG SGL_NVIDIA_MEGA_COMMIT
+# Explicit REF takes precedence; otherwise use the legacy commit or main.
+ARG SGL_NVIDIA_MEGA_REF=${SGL_NVIDIA_MEGA_COMMIT:-main}
 ADD --keep-git-dir=true ${SGL_NVIDIA_MEGA_REPO}#${SGL_NVIDIA_MEGA_REF} /src/
 
 FROM mega_source_${ENABLE_SGL_NVIDIA_MEGA} AS mega_source
