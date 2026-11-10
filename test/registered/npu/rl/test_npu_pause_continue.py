@@ -170,16 +170,25 @@ class TestNpuPauseContinue(CustomTestCase):
 
     def test_pause_in_place_freezes_output(self):
         events, errors = [], []
-        thread = self._stream_async(events, errors)
+        thread = self._stream_async(events, errors, max_new_tokens=64)
 
-        time.sleep(0.5)
+        # Wait for the first decoded token and require the request to still be
+        # running; freezing an unscheduled request proves nothing.
+        deadline = time.time() + 30
+        while thread.is_alive() and not events and time.time() < deadline:
+            time.sleep(0.02)
+        self.assertTrue(events, "no token was emitted before pause(in_place)")
+        self.assertTrue(thread.is_alive(), "request finished before pause(in_place)")
+
         pause_generation(self.base_url, mode="in_place")
         time.sleep(0.5)
-        frozen_at = len(events)
+        frozen_tokens = len(events[-1].get("output_ids", []))
+        self.assertGreater(frozen_tokens, 0, "in-place pause froze before any token")
+
         time.sleep(1.0)
         self.assertEqual(
-            len(events),
-            frozen_at,
+            len(events[-1].get("output_ids", [])),
+            frozen_tokens,
             "in-flight request kept emitting tokens while generation was paused",
         )
 
@@ -187,36 +196,81 @@ class TestNpuPauseContinue(CustomTestCase):
         thread.join(timeout=60)
 
         self.assertFalse(errors, f"stream failed: {errors}")
-        self.assertGreater(len(events), frozen_at, "stream did not resume")
+        self.assertFalse(thread.is_alive(), "request did not finish after continue")
+        output_ids = list(events[-1].get("output_ids", []))
+        self.assertEqual(
+            len(output_ids), 64, "in-place pause/continue did not complete the decode"
+        )
+        self.assertEqual(
+            tuple(output_ids[: len(self.baseline[0])]),
+            self.baseline[0],
+            "in-place pause/continue changed a greedy rollout",
+        )
 
     def test_pause_then_update_then_continue(self):
         original = load_checkpoint_tensor(self.tensor_index, NORM_WEIGHT)
         updated = original.new_full(original.shape, 0.5)
 
+        events, errors = [], []
+        thread = self._stream_async(events, errors, max_new_tokens=64)
+
+        # Put a request in decode before pausing so the update window has
+        # something that must stay frozen.
+        deadline = time.time() + 30
+        while thread.is_alive() and not events and time.time() < deadline:
+            time.sleep(0.02)
+        self.assertTrue(events, "no token was emitted before pause(update)")
+        self.assertTrue(thread.is_alive(), "request finished before pause(update)")
+
         pause_generation(self.base_url, mode="in_place")
-        begin_weight_update(self.base_url)
-        update_weights_from_tensor(
-            self.base_url,
-            [(NORM_WEIGHT, updated.to("npu"))],
-            weight_version="paused-v1",
-        )
-        end_weight_update(self.base_url)
-        continue_generation(self.base_url)
+        time.sleep(0.5)
+        frozen_tokens = len(events[-1].get("output_ids", []))
+        self.assertGreater(frozen_tokens, 0, "in-place pause froze before any token")
 
-        response = generate(self.base_url, SHORT_PROMPT, max_new_tokens=8)
-        self.assertEqual(
-            response["meta_info"]["weight_version"],
-            "paused-v1",
-            "resumed request was not served by the updated weights",
-        )
+        try:
+            begin_weight_update(self.base_url)
+            update_weights_from_tensor(
+                self.base_url,
+                [(NORM_WEIGHT, updated.to("npu"))],
+                weight_version="paused-v1",
+            )
+            end_weight_update(self.base_url)
 
-        begin_weight_update(self.base_url)
-        update_weights_from_tensor(
-            self.base_url,
-            [(NORM_WEIGHT, original.to("npu"))],
-            weight_version="restored",
-        )
-        end_weight_update(self.base_url)
+            time.sleep(0.5)
+            self.assertEqual(
+                len(events[-1].get("output_ids", [])),
+                frozen_tokens,
+                "in-flight request emitted tokens during the weight update",
+            )
+
+            continue_generation(self.base_url)
+            thread.join(timeout=60)
+
+            self.assertFalse(errors, f"stream failed: {errors}")
+            self.assertFalse(
+                thread.is_alive(), "frozen request did not finish after continue"
+            )
+            output_ids = list(events[-1].get("output_ids", []))
+            self.assertEqual(
+                len(output_ids),
+                64,
+                "frozen request did not complete after pause/update/continue",
+            )
+
+            response = generate(self.base_url, SHORT_PROMPT, max_new_tokens=8)
+            self.assertEqual(
+                response["meta_info"]["weight_version"],
+                "paused-v1",
+                "resumed request was not served by the updated weights",
+            )
+        finally:
+            begin_weight_update(self.base_url)
+            update_weights_from_tensor(
+                self.base_url,
+                [(NORM_WEIGHT, original.to("npu"))],
+                weight_version="restored",
+            )
+            end_weight_update(self.base_url)
 
     def test_continue_without_pause_is_noop(self):
         continue_generation(self.base_url)

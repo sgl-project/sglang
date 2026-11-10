@@ -262,6 +262,12 @@ class TestNpuDeviceBarrier(CustomTestCase):
                     f"DP rank {idx} produced the full completion",
                 )
 
+            # The per-rank scheduler stream is not observable over HTTP, so
+            # this case proves both DP ranks were decoding and were aborted by
+            # pause. The physical idle contract is covered by the single-rank
+            # unit cases above; a true DP idle assertion needs an in-process
+            # worker/RPC hook rather than a production readback field.
+
             continue_generation(base_url)
             self.assertTrue(generate(base_url, PROMPT, max_new_tokens=4))
 
