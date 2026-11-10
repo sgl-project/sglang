@@ -12,52 +12,12 @@ from sglang.srt.distributed.parallel_state import (
     init_distributed_environment,
     initialize_model_parallel,
 )
-from sglang.srt.layers.moe.fused_moe_triton.triton_kernels_moe import (
-    triton_kernel_moe_forward,
-)
-from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
     fused_moe as fused_moe_sglang,
 )
-from sglang.srt.layers.moe.topk import (
-    TopK,
-    TopKConfig,
-    TopKOutputFormat,
-    select_experts,
-)
+from sglang.srt.layers.moe.topk import TopKConfig, select_experts
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.test_utils import publish_build_topology
-
-
-def fused_moe_triton_api(
-    x,
-    w1,
-    w2,
-    input_gating,
-    topk,
-):
-    topk_op = TopK(
-        top_k=topk,
-        layer_id=0,
-        renormalize=False,
-        use_grouped_topk=False,
-        output_format=TopKOutputFormat.TRITON_KERNEL,
-    )
-    triton_topk_output = topk_op.forward_cuda(
-        hidden_states=x,
-        router_logits=input_gating,
-    )
-
-    moe_runner_config = MoeRunnerConfig(
-        inplace=False,
-    )
-    return triton_kernel_moe_forward(
-        x,
-        w1,
-        w2,
-        triton_topk_output,
-        moe_runner_config,
-    )
 
 
 def fused_moe_sglang_api(
@@ -97,18 +57,9 @@ def fused_moe_sglang_api(
         x_names=["batch_size"],
         x_vals=list([128, 256, 512, 1024, 2048, 4096, 8192]),
         line_arg="provider",
-        line_vals=[
-            "sglang_fused_moe_triton_v340",
-            "sglang_fused_moe_triton",
-        ],
-        line_names=[
-            "sglang_fused_moe_triton_v340",
-            "sglang_fused_moe_triton",
-        ],
-        styles=[
-            ("blue", "-"),
-            ("green", "-"),
-        ],
+        line_vals=["sglang_fused_moe_triton"],
+        line_names=["sglang_fused_moe_triton"],
+        styles=[("green", "-")],
         ylabel="Time (ms)",
         plot_name="fused-moe-performance",
         args={},
@@ -140,33 +91,18 @@ def benchmark(
         num_experts, hidden_size, shard_intermediate_size // 2, dtype=dtype
     )
 
-    w1_tri = w1.clone()
-    w2_tri = w2.clone()
-    w1_tri = w1_tri.transpose(-2, -1).contiguous()
-    w2_tri = w2_tri.transpose(-2, -1).contiguous()
-
     input_gating = torch.randn(num_tokens, num_experts, dtype=torch.float32)
 
-    if provider == "sglang_fused_moe_triton_v340":
-        api_func = fused_moe_triton_api
-        api_kwargs = {
-            "x": x,
-            "w1": w1_tri,
-            "w2": w2_tri,
-            "input_gating": input_gating,
-            "topk": topk,
-        }
-    else:
-        api_func = fused_moe_sglang_api
-        api_kwargs = {
-            "x": x,
-            "w1": w1,
-            "w2": w2,
-            "input_gating": input_gating,
-            "topk": topk,
-            "use_fp8_w8a8": use_fp8_w8a8,
-            "block_shape": block_shape,
-        }
+    api_func = fused_moe_sglang_api
+    api_kwargs = {
+        "x": x,
+        "w1": w1,
+        "w2": w2,
+        "input_gating": input_gating,
+        "topk": topk,
+        "use_fp8_w8a8": use_fp8_w8a8,
+        "block_shape": block_shape,
+    }
 
     # Warmup
     for _ in range(10):
