@@ -3,12 +3,14 @@
 export const config = {
   modelName: "Unlimited-OCR",
 
-  supportedHardware: ["h100"],
+  supportedHardware: ["h100", "a3"],
 
   variants: [{ id: "default", label: "Default" }],
   quantizations: [{ id: "default", label: "Default" }],
   strategies: [{ id: "balanced", label: "Balanced" }],
   nodesOptions: [{ id: "single", label: "Single Node" }],
+
+  runModes: (s) => (["a3", "a5"].includes(s.hw) ? ["python"] : ["python", "docker"]),
 
   modelNames: {
     "default|default": "baidu/Unlimited-OCR",
@@ -74,6 +76,29 @@ export const config = {
         "--attention-backend fa3",
         "--page-size 1",
         "--context-length 32768",
+        "--enable-custom-logit-processor",
+        "--disable-radix-cache",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: {
+        hw: "a3",
+        variant: "default",
+        quant: "default",
+        strategy: "balanced",
+        nodes: "single",
+      },
+      verified: true,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--device npu",
+        "--attention-backend ascend",
+        "--page-size 128",
+        "--context-length 32768",
+        "--mem-fraction-static 0.8",
         "--enable-custom-logit-processor",
         "--disable-radix-cache",
         "--host {{HOST_IP}}",
