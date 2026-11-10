@@ -343,6 +343,7 @@ def test_verify_metadata_builds_no_rail():
     bs = 2
     backend = TritonAttnBackend.__new__(TritonAttnBackend)
     backend.use_mla = True
+    backend.is_gfx950_m31_draft = backend.verify_reads_window_kv_only = False
     backend.topk = 0
     backend.dcp_size, backend.dcp_rank = 8, 0
     backend.sliding_window_size = WINDOWS[1]

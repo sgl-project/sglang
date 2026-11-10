@@ -63,6 +63,7 @@ def _make_pool() -> DSATokenToKVPool:
 
 class _IndexerStub:
     _store_index_k_cache = Indexer._store_index_k_cache
+    _write_index_k_cache = Indexer._write_index_k_cache
     block_size, scale_fmt = 128, "ue8m0"
     fp4_index_k = False
 
