@@ -17,6 +17,7 @@
 from dataclasses import dataclass
 from typing import Optional
 
+import msgspec
 import torch
 
 
@@ -35,3 +36,14 @@ class DecodeContextParallelMetadata:
     dcp_kv_indices: Optional[torch.Tensor] = None
     dcp_local_prefix_kv_indices: Optional[torch.Tensor] = None
     dcp_extend_prefix_lens_sum: Optional[int] = None
+
+
+class DecodeContextParallelMetadataDsa(msgspec.Struct, kw_only=True):
+    # [rows padded to a page, 1, kv_cache_dim] request after request, positions
+    # 0..seq_len-1 of each: the order the ragged top-k indices address.
+    dcp_kv_buffer: torch.Tensor
+    dcp_local_prefix_kv_rows: torch.Tensor
+    dcp_prefix_dst_rows: torch.Tensor
+    dcp_extend_dst_rows: torch.Tensor
+    dcp_extend_prefix_lens_cpu: torch.Tensor
+    dcp_extend_prefix_lens_sum: int

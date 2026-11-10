@@ -13,6 +13,7 @@ from sglang.srt.layers.attention.dsa_backend import uses_raw_fp8_dsa_kv_layout
 from sglang.srt.layers.attention.index_topk_share import write_mtp_seed
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.dcp import (
+    all_gather_kv_cache_for_extend_dsa,
     all_gather_kv_cache_for_mha_chunk_extend,
     all_gather_kv_cache_for_mha_extend,
     filter_dcp_local_kv_indices,
@@ -266,6 +267,15 @@ class DeepseekMHAForwardMixin:
                 )
             ):
                 # FP8 path: dequantize DSA-specific FP8 format to BF16
+                if dsa_shards_index_k():
+                    all_gather_kv_cache_for_extend_dsa(
+                        kv_cache=get_kv_layers().read(self.attn_mha.layer_id).key(),
+                        metadata=forward_batch.attn_dcp_metadata,
+                        k_nope=kv_a.unsqueeze(1),
+                        k_pe=k_pe,
+                        kv_cache_store_fp8=get_token_to_kv_pool().dsa_kv_cache_store_fp8,
+                        kv_scale_ue8m0=get_token_to_kv_pool().kv_scale_ue8m0,
+                    )
                 kv_a, k_pe = self._get_mla_kv_buffer_from_fp8_for_dsa(forward_batch)
             else:
                 # BF16/FP16 path: directly fetch from cache
@@ -693,9 +703,7 @@ class DeepseekMHAForwardMixin:
 
         kv_cache_fp8 = get_kv_layers().read(self.attn_mha.layer_id).key()
         if dsa_shards_index_k():
-            kv_cache_fp8 = backend.dcp_gather_kv_cache(
-                kv_cache_fp8, forward_batch, backend.forward_metadata
-            )
+            kv_cache_fp8 = forward_batch.attn_dcp_metadata.dcp_kv_buffer
             kv_indices = torch.arange(
                 kv_indices.shape[0], dtype=kv_indices.dtype, device=kv_indices.device
             )

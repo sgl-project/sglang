@@ -24,9 +24,18 @@ from sglang.kernels.ops.attention.dcp_kernels import (
     create_dcp_kv_indices,
     update_kv_lens_and_indices,
 )
-from sglang.srt.layers.dcp.layout import update_local_kv_lens_for_dcp
-from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
-from sglang.srt.model_executor.forward_context import get_attn_backend
+from sglang.srt.layers.dcp.layout import (
+    filter_dcp_local_chunk_kv_indices,
+    update_local_kv_lens_for_dcp,
+)
+from sglang.srt.layers.dcp.metadata import (
+    DecodeContextParallelMetadata,
+    DecodeContextParallelMetadataDsa,
+)
+from sglang.srt.model_executor.forward_context import (
+    get_attn_backend,
+    get_token_to_kv_pool,
+)
 from sglang.srt.runtime_context import get_device, get_parallel
 
 
@@ -132,6 +141,80 @@ def prepare_decode_context_parallel_metadata(
         dcp_extend_prefix_lens_sum=extend_prefix_lens_sum,
     )
     return attn_dcp_metadata
+
+
+def prepare_decode_context_parallel_metadata_dsa(
+    seq_lens: torch.Tensor,
+    extend_prefix_lens: torch.Tensor,
+    extend_prefix_lens_cpu: torch.Tensor,
+    extend_seq_lens: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    req_to_token: torch.Tensor,
+    seq_lens_sum: int,
+    kv_buffer_shape: torch.Size,
+    kv_cache_dtype,
+    kv_cache_device,
+    create_chunked_prefix_cache_kv_indices_fn,
+) -> DecodeContextParallelMetadataDsa:
+    device = get_device().device
+    parallel = get_parallel()
+    num_reqs = len(seq_lens)
+    prefix_lens_cpu = torch.as_tensor(extend_prefix_lens_cpu, dtype=torch.int64)
+    prefix_lens_sum = int(prefix_lens_cpu.sum())
+    extend_lens_sum = seq_lens_sum - prefix_lens_sum
+
+    cu_prefix_lens = torch.zeros(num_reqs + 1, dtype=torch.int32, device=device)
+    cu_prefix_lens[1:] = torch.cumsum(extend_prefix_lens, dim=0)
+    prefix_kv_indices = torch.empty(prefix_lens_sum, dtype=torch.int32, device=device)
+    create_chunked_prefix_cache_kv_indices_fn[(num_reqs,)](
+        req_to_token,
+        req_pool_indices,
+        torch.zeros(num_reqs, dtype=torch.int32, device=device),
+        extend_prefix_lens,
+        cu_prefix_lens[:-1],
+        prefix_kv_indices,
+        req_to_token.shape[1],
+    )
+    local_prefix_kv_rows = (
+        filter_dcp_local_chunk_kv_indices(
+            prefix_kv_indices, torch.zeros_like(prefix_lens_cpu), prefix_lens_cpu
+        )
+        // parallel.attn_dcp_size
+    )
+
+    cu_seq_lens = torch.zeros(num_reqs + 1, dtype=torch.int64, device=device)
+    cu_seq_lens[1:] = torch.cumsum(seq_lens, dim=0)
+    cu_extend_lens = torch.zeros(num_reqs + 1, dtype=torch.int64, device=device)
+    cu_extend_lens[1:] = torch.cumsum(extend_seq_lens, dim=0)
+    prefix_dst_rows = torch.arange(
+        prefix_lens_sum, device=device
+    ) + torch.repeat_interleave(
+        cu_seq_lens[:-1] - cu_prefix_lens[:-1],
+        extend_prefix_lens,
+        output_size=prefix_lens_sum,
+    )
+    extend_dst_rows = torch.arange(
+        extend_lens_sum, device=device
+    ) + torch.repeat_interleave(
+        cu_seq_lens[:-1] + extend_prefix_lens - cu_extend_lens[:-1],
+        extend_seq_lens,
+        output_size=extend_lens_sum,
+    )
+
+    page_size = get_token_to_kv_pool().page_size
+    num_rows = -(-seq_lens_sum // page_size) * page_size
+    kv_buffer = torch.empty(
+        (num_rows, *kv_buffer_shape[1:]), dtype=kv_cache_dtype, device=kv_cache_device
+    )
+    kv_buffer[seq_lens_sum:].view(torch.uint8).zero_()
+    return DecodeContextParallelMetadataDsa(
+        dcp_kv_buffer=kv_buffer,
+        dcp_local_prefix_kv_rows=local_prefix_kv_rows,
+        dcp_prefix_dst_rows=prefix_dst_rows,
+        dcp_extend_dst_rows=extend_dst_rows,
+        dcp_extend_prefix_lens_cpu=prefix_lens_cpu,
+        dcp_extend_prefix_lens_sum=prefix_lens_sum,
+    )
 
 
 def plan_dcp_decode_metadata(
