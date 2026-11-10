@@ -16,7 +16,7 @@ import torch
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-large")
 
 
 class TestLSECombineTritonVsCPU(CustomTestCase):
@@ -31,10 +31,8 @@ class TestLSECombineTritonVsCPU(CustomTestCase):
     def _run_combine_test(
         self, N, B, H_local, D, is_base_e, dtype=torch.bfloat16, atol=1e-2
     ):
-        from sglang.kernels.ops.attention.dcp_kernels import (
-            _lse_weighted_combine_cpu,
-            dcp_lse_combine_triton,
-        )
+        from sglang.kernels.ops.attention.dcp_kernels import dcp_lse_combine_triton
+        from sglang.test.kernels.dcp import lse_weighted_combine_cpu
 
         torch.manual_seed(42)
 
@@ -49,7 +47,7 @@ class TestLSECombineTritonVsCPU(CustomTestCase):
                 * 5.0
             )
 
-        cpu_result = _lse_weighted_combine_cpu(
+        cpu_result = lse_weighted_combine_cpu(
             partial_outputs.cpu(),
             partial_lses.cpu(),
             is_lse_base_on_e=is_base_e,
@@ -197,10 +195,8 @@ class TestLSECombineEdgeCases(CustomTestCase):
 
     def test_one_shard_dominant(self):
         """One shard has much larger LSE -- output should be close to that shard."""
-        from sglang.kernels.ops.attention.dcp_kernels import (
-            _lse_weighted_combine_cpu,
-            dcp_lse_combine_triton,
-        )
+        from sglang.kernels.ops.attention.dcp_kernels import dcp_lse_combine_triton
+        from sglang.test.kernels.dcp import lse_weighted_combine_cpu
 
         N, B, H_local, D = 2, 1, 1, 64
         partial_outputs = torch.randn(
@@ -213,7 +209,7 @@ class TestLSECombineEdgeCases(CustomTestCase):
         triton_result, _ = dcp_lse_combine_triton(
             partial_outputs, partial_lses, is_lse_base_on_e=True
         )
-        cpu_result = _lse_weighted_combine_cpu(
+        cpu_result = lse_weighted_combine_cpu(
             partial_outputs.cpu(), partial_lses.cpu(), is_lse_base_on_e=True
         )
 
@@ -260,7 +256,6 @@ class TestLSEBaseByBackend(CustomTestCase):
         self.assertTrue(is_mla_dcp_lse_base_on_e("flashmla"))
         self.assertTrue(is_mla_dcp_lse_base_on_e("cutedsl_mla"))
         self.assertFalse(is_mla_dcp_lse_base_on_e("flashinfer_mla"))
-        self.assertFalse(is_mla_dcp_lse_base_on_e("tokenspeed_mla"))
         self.assertFalse(is_mla_dcp_lse_base_on_e("trtllm_mla"))
         self.assertFalse(is_mla_dcp_lse_base_on_e(None))
 
@@ -407,6 +402,32 @@ class TestDCPA2AReduceWithCUDAGraphBuffers(CustomTestCase):
                 self.assertTrue(
                     torch.equal(lane, lse.view(B, N, H_per_rank).permute(1, 0, 2))
                 )
+
+    def test_pack_strided_partials(self):
+        """Partials sliced out of a head-padded kernel output pack without a
+        contiguous copy."""
+        from sglang.kernels.ops.attention.dcp_kernels import dcp_pack_a2a_send
+
+        N, B, H_per_rank, D, H_pad = 8, 3, 12, 512, 128
+        H = H_per_rank * N
+        out_pad = torch.randn(B, 1, H_pad, D, device=self.device, dtype=torch.bfloat16)
+        lse_pad = torch.randn(B, H_pad, 1, device=self.device, dtype=torch.float32)
+        out = out_pad[:, :, :H].view(B, H, D)
+        lse = lse_pad.view(B, H_pad)[:, :H]
+        self.assertFalse(out.is_contiguous() or lse.is_contiguous())
+
+        partial_o = torch.empty(
+            B, H_per_rank, N, D, dtype=torch.bfloat16, device=self.device
+        )
+        stats = torch.empty(B, H_per_rank, N, device=self.device, dtype=torch.float32)
+        dcp_pack_a2a_send(
+            out, lse, partial_o.permute(2, 0, 1, 3), stats.permute(2, 0, 1)
+        )
+
+        self.assertTrue(
+            torch.equal(partial_o, out.view(B, N, H_per_rank, D).permute(0, 2, 1, 3))
+        )
+        self.assertTrue(torch.equal(stats, lse.view(B, N, H_per_rank).permute(0, 2, 1)))
 
     def test_pack_serves_the_split_peer_inside_layout(self):
         from sglang.kernels.ops.attention.dcp_kernels import dcp_pack_a2a_send

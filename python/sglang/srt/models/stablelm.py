@@ -38,6 +38,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -45,9 +46,10 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix, is_npu
+from sglang.srt.utils import is_npu, is_xpu
 
 _is_npu = is_npu()
+_is_xpu = is_xpu()
 
 
 class StablelmMLP(nn.Module):
@@ -142,7 +144,7 @@ class StablelmAttention(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("o_proj", prefix),
         )
-        if not _is_npu:
+        if not _is_npu and not _is_xpu:
             self.rotary_emb = get_rope(
                 self.head_dim,
                 rotary_dim=self.rotary_ndims,
@@ -175,7 +177,7 @@ class StablelmAttention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        if not _is_npu:
+        if not _is_npu and not _is_xpu:
             q, k = self.rotary_emb(positions, q, k)
         else:
             odtype = q.dtype

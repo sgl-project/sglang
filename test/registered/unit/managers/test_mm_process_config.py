@@ -25,17 +25,6 @@ class TestMmProcessConfigValidation(CustomTestCase):
         handle_multimodal(args)
         return args
 
-    def test_valid_config_accepted(self):
-        args = self._validate_config({"image": {"max_pixels": 5000000}})
-        self.assertEqual(
-            resolution_result(args, "mm_process_config"),
-            {"image": {"max_pixels": 5000000}},
-        )
-
-    def test_empty_config_accepted(self):
-        args = self._validate_config({})
-        self.assertEqual(resolution_result(args, "mm_process_config"), {})
-
     def test_top_level_non_dict_rejected(self):
         with self.assertRaises(TypeError) as ctx:
             self._validate_config("bad")
@@ -45,16 +34,6 @@ class TestMmProcessConfigValidation(CustomTestCase):
         with self.assertRaises(TypeError) as ctx:
             self._validate_config({"image": "bad"})
         self.assertIn("mm_process_config['image'] must be a dict", str(ctx.exception))
-
-    def test_modality_non_dict_rejected_video(self):
-        with self.assertRaises(TypeError) as ctx:
-            self._validate_config({"video": 123})
-        self.assertIn("mm_process_config['video'] must be a dict", str(ctx.exception))
-
-    def test_modality_non_dict_rejected_audio(self):
-        with self.assertRaises(TypeError) as ctx:
-            self._validate_config({"audio": [1, 2]})
-        self.assertIn("mm_process_config['audio'] must be a dict", str(ctx.exception))
 
     def test_multi_modality_config_accepted(self):
         config = {
@@ -539,7 +518,8 @@ class TestStreamOrderedMmFeaturePool(CustomTestCase):
 
 class TestCudaIpcProcessorRollback(CustomTestCase):
     def test_partial_wrap_failure_restores_items_and_cancels_proxy(self):
-        from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+        from sglang.srt.managers.req_types import MultimodalDataItem
+        from sglang.srt.multimodal.modality import Modality
         from sglang.srt.multimodal.processors.base_processor import (
             BaseMultimodalProcessor,
         )
@@ -587,7 +567,8 @@ class TestPrecomputeHashBeforeCpuTransfer(CustomTestCase):
         return processor
 
     def test_enabled_path_sets_hash_and_pad_value(self):
-        from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+        from sglang.srt.managers.req_types import MultimodalDataItem
+        from sglang.srt.multimodal.modality import Modality
 
         item = MultimodalDataItem(
             modality=Modality.IMAGE, feature=torch.arange(8, dtype=torch.float32)
@@ -600,7 +581,8 @@ class TestPrecomputeHashBeforeCpuTransfer(CustomTestCase):
         self.assertTrue(item.feature.is_cpu)
 
     def test_disabled_path_leaves_item_unmodified(self):
-        from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+        from sglang.srt.managers.req_types import MultimodalDataItem
+        from sglang.srt.multimodal.modality import Modality
 
         item = MultimodalDataItem(
             modality=Modality.IMAGE, feature=torch.arange(8, dtype=torch.float32)

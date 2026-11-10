@@ -13,13 +13,13 @@ from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.utils import get_moe_weight_sizes
 from sglang.srt.layers.quantization.quark.schemes import QuarkMoEScheme
 from sglang.srt.layers.quantization.utils import all_close_1d
+from sglang.srt.layers.utils.common import set_weight_attrs
 from sglang.srt.utils import (
     get_bool_env_var,
     is_gfx95_supported,
     is_gfx1250_supported,
     is_hip,
     round_up,
-    set_weight_attrs,
 )
 
 if TYPE_CHECKING:
@@ -40,11 +40,7 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 # incorrect results, so route through aiter's triton ``moe_gemm_a8w4`` kernel
 # instead. This uses an unpadded, contraction-major weight layout (no aiter
 # shuffle) prepared in ``process_weights_after_loading``.
-_use_gfx1250_w4a8 = (
-    _is_hip
-    and is_gfx1250_supported()
-    and get_bool_env_var("SGLANG_GFX1250_W4A8_MOE", "true")
-)
+_use_gfx1250_w4a8 = _is_hip and is_gfx1250_supported()
 # Whether to use the aiter CK/ASM shuffled weight layout (gfx950 etc.). Disabled
 # on gfx1250, which uses the triton moe_gemm_a8w4 layout.
 _use_aiter_shuffle_layout = _use_aiter and not _use_gfx1250_w4a8
@@ -261,8 +257,23 @@ class QuarkW4A8MXFp4MoE(QuarkMoEScheme):
         gate/up-interleaved layout consumed by aiter's triton ``moe_gemm_a8w4``
         (no CK/ASM shuffle)."""
         from sglang.srt.layers.moe.fused_moe_triton.aiter_mxfp4_w4a8_moe import (
+            build_ep_expert_map,
             prepare_w4a8_gfx1250_weights,
         )
+
+        self.ep_expert_map = None
+        self.num_local_experts = layer.w13_weight.shape[0]
+        if getattr(layer, "moe_ep_size", 1) > 1:
+            if getattr(layer, "num_fused_shared_experts", 0):
+                raise NotImplementedError(
+                    "gfx1250 W4A8 MoE does not support fused shared experts with EP."
+                )
+            self.ep_expert_map = build_ep_expert_map(
+                num_experts=layer.num_experts,
+                num_local_experts=self.num_local_experts,
+                ep_rank=layer._expert_storage_rank,
+                device=layer.w13_weight.device,
+            )
 
         (
             w13_weight,
@@ -392,8 +403,17 @@ class QuarkW4A8MXFp4MoE(QuarkMoEScheme):
         )
 
         if hasattr(layer, "dispatcher"):
+            from sglang.srt.layers.moe.moe_runner.aiter import AiterQuantType
+            from sglang.srt.layers.moe.token_dispatcher.base import (
+                build_dispatcher_quant_config,
+            )
+
             # Weights are stored as torch.uint8 but semantically MXFP4
-            layer.dispatcher.set_quant_config({"weight_dtype": torch.float4_e2m1fn_x2})
+            layer.dispatcher.set_quant_config(
+                build_dispatcher_quant_config(
+                    layer, torch.float4_e2m1fn_x2, AiterQuantType.PER_1X32
+                )
+            )
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
@@ -458,6 +478,8 @@ class QuarkW4A8MXFp4MoE(QuarkMoEScheme):
                 gemm1_limit=limit,
                 renormalize=True,
                 apply_router_weight_on_input=cfg.apply_router_weight_on_input,
+                expert_map=self.ep_expert_map,
+                num_local_experts=self.num_local_experts,
             )
             return StandardCombineInput(hidden_states=output)
 
