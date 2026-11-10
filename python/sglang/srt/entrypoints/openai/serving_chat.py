@@ -263,6 +263,7 @@ _KIMI_K3_EFFORT_TIERS = {
     "medium": "high",
     "high": "high",
     "xhigh": "max",
+    "ultra": "max",
     "max": "max",
 }
 _KIMI_K31_EFFORT_TIERS = {**_KIMI_K3_EFFORT_TIERS, "medium": "medium"}
@@ -720,10 +721,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
     def _kimi_k3_effort_tiers(self) -> dict:
         """K3.1 adds a native "medium" thinking tier on top of K3's three."""
-        model_type = getattr(
-            self.tokenizer_manager.model_config.hf_config, "model_type", None
-        )
-        if model_type == "kimi_k31":
+        if self.tokenizer_manager.model_config.hf_config.model_type == "kimi_k31":
             return _KIMI_K31_EFFORT_TIERS
         return _KIMI_K3_EFFORT_TIERS
 
@@ -1240,7 +1238,7 @@ class OpenAIServingChat(OpenAIServingBase):
         if self.chat_encoding_spec == "kimi_k3":
             # thinking stays a plain dict on the request (other models' templates
             # read it as one); the K3 surface enforces the K3 shape.
-            if isinstance(request.thinking, dict):
+            if request.thinking is not None:
                 try:
                     ThinkingParam.model_validate(request.thinking)
                 except ValidationError as exc:

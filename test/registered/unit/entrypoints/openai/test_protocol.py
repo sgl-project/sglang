@@ -864,6 +864,14 @@ class TestThinkingParam(unittest.TestCase):
         request = self._request(reasoning_effort="high", thinking={"type": "disabled"})
         self.assertIs(request.chat_template_kwargs["thinking"], False)
 
+    def test_invalid_effort_names_the_thinking_field(self):
+        with self.assertRaisesRegex(ValidationError, "invalid thinking effort"):
+            self._request(thinking={"type": "enabled", "effort": "bogus"})
+
+    def test_non_object_thinking_leaves_the_toggle_unset(self):
+        request = self._request(thinking=False)
+        self.assertIsNone(request.chat_template_kwargs)
+
     def test_adaptive_is_treated_as_enabled(self):
         request = self._request(thinking={"type": "adaptive"})
         self.assertIs(request.chat_template_kwargs["thinking"], True)

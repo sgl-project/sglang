@@ -6480,6 +6480,7 @@ class KimiK3ThinkingTestCase(unittest.TestCase):
             ("medium", "high"),
             ("high", "high"),
             ("xhigh", "max"),
+            ("ultra", "max"),
             ("max", "max"),
         ):
             with self.subTest(reasoning_effort=requested):
@@ -6531,10 +6532,7 @@ class KimiK3ThinkingTestCase(unittest.TestCase):
         with self.assertRaises(ValueError):
             self._template_kwargs(reasoning_effort=0.5)
 
-    def test_keep_is_normalized_not_rejected(self):
-        """ "all" is the only retention mode implemented, and a deployment is
-        expected to force it. Rejecting instead fails a request the reference
-        service answers."""
+    def test_keep_is_accepted(self):
         for keep in ("all", "none", "some-future-mode"):
             for thinking_type in ("enabled", "disabled"):
                 with self.subTest(keep=keep, type=thinking_type):
@@ -6544,6 +6542,12 @@ class KimiK3ThinkingTestCase(unittest.TestCase):
                         thinking={"type": thinking_type, "keep": keep},
                     )
                     self.assertIsNone(self.chat._validate_request(request))
+
+    def test_non_object_thinking_is_a_client_error(self):
+        request = ChatCompletionRequest(
+            model="x", messages=self.MESSAGES, thinking=False
+        )
+        self.assertIn("invalid thinking", self.chat._validate_request(request))
 
 
 if __name__ == "__main__":
