@@ -1011,6 +1011,7 @@ class MqaAttentionBase(nn.Module):
     # Class-level defaults for subclasses that read them without running __init__.
     wo_a_fp8: bool = False
     wo_a_fp8_block128: bool = False
+    use_mega_attention: bool = False
 
     def __init__(
         self,
@@ -1378,7 +1379,6 @@ class MqaAttentionBase(nn.Module):
 
 class MQALayer(MqaAttentionBase):
     is_dsv41: bool = False
-    use_mega_attention: bool = False
 
     def __init__(
         self,

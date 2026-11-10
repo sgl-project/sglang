@@ -490,8 +490,9 @@ def run_deferred_attn_stats_fork() -> None:
 
 
 def fork_stats_stream(stats_stream: Optional[torch.cuda.Stream]) -> None:
-    """Let the side stream pick up from here; the layers call it right before
-    each combine (fork position measured indistinguishable across batch sizes)."""
+    """Let the side stream pick up from here; reads call it right before the
+    combine, except MegaAttention attention reads, which defer it to the core
+    (``defer_attn_stats_fork``)."""
     if stats_stream is not None:
         stats_stream.wait_stream(torch.cuda.current_stream())
 
@@ -692,9 +693,9 @@ def _compute_triplet(
 ) -> HcTriplet:
     """Issue the triplet (on the side stream, beside the sublayer) and join before
     the post reads it."""
+    run_deferred_attn_stats_fork()
     if precomputed is not None:
         return precomputed
-    run_deferred_attn_stats_fork()
     coefficients = mix_stats(hc, residual, stats_stream)
     if stats_stream is not None:
         torch.cuda.current_stream().wait_stream(stats_stream)

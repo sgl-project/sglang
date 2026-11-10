@@ -224,7 +224,7 @@ class HcReadCall(HcRead):
             if (
                 self.attention
                 and stream is not None
-                and getattr(layer.self_attn, "use_mega_attention", False)
+                and layer.self_attn.use_mega_attention
             ):
                 mhc.defer_attn_stats_fork(stream)
             else:
