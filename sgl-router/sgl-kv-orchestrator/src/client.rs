@@ -120,8 +120,20 @@ impl EngineClient {
             bytes.extend_from_slice(&chunk);
         }
         let value: Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+        let claim_lookup = body.is_some_and(|command| command["kind"] == "claim");
+        if claim_lookup
+            && status == reqwest::StatusCode::NOT_FOUND
+            && value["success"] == false
+            && value["error"]["code"] == "missing"
+        {
+            // The owner confirmed the claim is absent in the requested epoch.
+            return Ok(Value::Null);
+        }
         if !status.is_success() || value["success"] != true {
             return Err(format!("engine {status}: {}", value["error"]));
+        }
+        if claim_lookup && !value["data"].is_object() {
+            return Err("engine returned an invalid claim".into());
         }
         Ok(value["data"].clone())
     }

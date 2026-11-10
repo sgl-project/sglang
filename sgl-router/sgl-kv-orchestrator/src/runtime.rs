@@ -305,6 +305,7 @@ struct Job {
     result: Arc<Value>,
     operation_ref: Option<Value>,
     claim_view: Value,
+    claim_absent: bool,
     submitted: bool,
     attempted: bool,
     message_id: String,
@@ -688,6 +689,7 @@ impl Actor {
                         job.ready_end = 0;
                         job.ready_at = None;
                         job.claim_view = Value::Null;
+                        job.claim_absent = false;
                     }
                 }
                 job.polls += 1;
@@ -711,6 +713,7 @@ impl Actor {
             job.ready_end = 0;
             job.ready_at = None;
             job.claim_view = Value::Null;
+            job.claim_absent = false;
             job.last_error = Some("worker unavailable".into());
             return;
         }
@@ -738,6 +741,7 @@ impl Actor {
             }
             if effect.claims {
                 job.claim_view = Value::Null;
+                job.claim_absent = false;
             }
         }
     }
@@ -759,6 +763,7 @@ impl Actor {
             && (job.action != "sglang.pin"
                 || !job.attempted
                 || !self.book.job(&job.id).is_some_and(|b| b.cancel_requested)
+                || job.claim_absent
                 || matches!(
                     job.claim_view["state"].as_str(),
                     Some("released" | "expired" | "invalidated")
@@ -1355,6 +1360,7 @@ impl Actor {
                         result: Arc::new(Value::Null),
                         operation_ref: None,
                         claim_view: Value::Null,
+                        claim_absent: false,
                         submitted: false,
                         attempted: false,
                         message_id: id.clone(),
@@ -1582,11 +1588,15 @@ impl WorkerPoll {
             && !job.releasing_pin
         {
             let current = self.client.command(&job.url, &json!({"kind":"claim","context":job.context,"claim_id":job.payload["claim_id"]})).await?;
-            if matches!(
-                current["state"].as_str(),
-                Some("released" | "expired" | "invalidated")
-            ) {
+            job.claim_absent = current.is_null();
+            if job.claim_absent
+                || matches!(
+                    current["state"].as_str(),
+                    Some("released" | "expired" | "invalidated")
+                )
+            {
                 job.claim_view = current;
+                job.last_error = None;
                 return Ok(());
             }
             let payload = Arc::make_mut(&mut job.payload);
@@ -1650,13 +1660,14 @@ impl WorkerPoll {
         if job.action == "sglang.pin" {
             let ticket = self.feedback.ticket(&job.url)?;
             let claim=self.client.command(&job.url,&json!({"kind":"claim","context":job.context,"claim_id":job.payload["claim_id"]})).await?;
-            if claim["owner_epoch"] != job.caps.epoch {
+            if !claim.is_null() && claim["owner_epoch"] != job.caps.epoch {
                 return Err("stale claim owner epoch".into());
             }
             self.poll_feedback(&job.url, &live).await?;
             if !self.feedback.accept_claim(&job.url, &ticket) {
                 return Err("claim query crossed feedback invalidation".into());
             }
+            job.claim_absent = claim.is_null();
             job.claim_view = claim;
         }
         if job.action == "sglang.prefetch" && !cancel && !request_only {

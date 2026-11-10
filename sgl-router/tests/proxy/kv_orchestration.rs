@@ -40,6 +40,7 @@ struct EngineState {
     running: bool,
     cancelled: bool,
     claims: BTreeMap<String, Value>,
+    pin_missing: bool,
     epoch: String,
     fail_residency: bool,
     lose_submit_once: bool,
@@ -157,12 +158,13 @@ fn command_now(
         );
     }
     if body["kind"] == "claim" {
-        let claim = s
-            .claims
-            .get(body["claim_id"].as_str().unwrap())
-            .cloned()
-            .unwrap_or(Value::Null);
-        return (StatusCode::OK, Json(json!({"success":true,"data":claim})));
+        return match s.claims.get(body["claim_id"].as_str().unwrap()) {
+            Some(claim) => (StatusCode::OK, Json(json!({"success":true,"data":claim}))),
+            None => (
+                StatusCode::NOT_FOUND,
+                Json(json!({"success":false,"error":{"code":"missing"}})),
+            ),
+        };
     }
     if body["kind"] == "residency" {
         if s.fail_residency {
@@ -197,9 +199,17 @@ fn command_now(
             .as_array()
             .unwrap()
             .len() as u64;
+        let pin = action["action_type"] == "sglang.pin";
+        let status = if s.running {
+            "running"
+        } else if pin && s.pin_missing {
+            "missing"
+        } else {
+            "completed"
+        };
         let result = json!({"ref":{"context":body["context"],"message_id":id,"action_id":"transfer","operation_id":format!("op-{id}")},
-            "sequence":1,"update":{"status":if s.running{"running"}else{"completed"},"quiescent":!s.running},"public_result":{"state_version":99_999}});
-        if action["action_type"] == "sglang.pin" {
+            "sequence":1,"update":{"status":status,"quiescent":!s.running},"public_result":{"state_version":99_999}});
+        if pin && !s.pin_missing {
             let payload = &action["payload"];
             let epoch = s.epoch.clone();
             s.claims.insert(payload["claim_id"].as_str().unwrap().into(),json!({"owner_epoch":epoch,"revision":payload["revision"],
@@ -871,6 +881,46 @@ async fn l2_pin_queries_claim_state_and_task_finish_releases_without_engine_task
         .all(|c| c["envelope"]["actions"][0]["payload"]
             .get("owner_task")
             .is_none()));
+}
+
+#[tokio::test]
+async fn missing_l2_pin_drains_without_issuing_a_release() {
+    let engine = Engine::start().await;
+    engine.state.lock().unwrap().pin_missing = true;
+    let router = router(&[&engine], false, true).await;
+    start(&router, "task").await;
+    api(&router,json!({"kind":"submit","task":task("task"),"message_id":"keep","action":"sglang.pin","target":prefix(vec![1,2,3,4]),
+        "location":{"tier":"host"},"mode":"acquire","claim_id":"keep","revision":1,"ttl_seconds":1})).await;
+    let view = query(&router, "task", "keep").await;
+    assert_eq!(
+        view["operations"][0]["result"]["update"]["status"],
+        "missing"
+    );
+    event(&router, "task", "task_finished", 1, "finish").await;
+    let view = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let view = query(&router, "task", "keep").await;
+            if view["quiescent"] == true {
+                break view;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(view["operations"][0]["claim"].is_null());
+    assert!(view["operations"][0]["error"].is_null());
+    let state = engine.state.lock().unwrap();
+    assert!(state.claims.is_empty());
+    assert!(state.commands.iter().any(|c| c["kind"] == "claim"));
+    assert_eq!(
+        state
+            .commands
+            .iter()
+            .filter(|c| c["kind"] == "submit")
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]
