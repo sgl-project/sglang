@@ -284,6 +284,28 @@ sgl-eval run gsm8k \\
       ],
     },
     {
+      match: { hw: "xeon", variant: "32b", quant: "bf16", strategy: "balanced", nodes: "single" },
+      verified: true,
+      warn: "Quick generation verified on Intel Xeon 6972P at TP6. The 8,192-token cache does not cover the full context. Playground overrides, dataset accuracy, and performance are unverified.",
+      env: [
+        "SGLANG_USE_CPU_ENGINE=1",
+        "RAYON_NUM_THREADS=1",
+        "TOKENIZERS_PARALLELISM=false",
+        "OPENBLAS_NUM_THREADS=1",
+      ],
+      flags: [
+        "--model {{MODEL_NAME}}",
+        "--revision 4b05c13ad1972e8f470ab93ff90c3e90010ce592",
+        "--device cpu",
+        "--disable-overlap-schedule",
+        "--tp 6",
+        "--dtype bfloat16",
+        "--max-total-tokens 8192",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
       match: { hw: "h200", variant: "0.9b", quant: "bf16", strategy: "balanced", nodes: "single" },
       verified: true,
       env: [],

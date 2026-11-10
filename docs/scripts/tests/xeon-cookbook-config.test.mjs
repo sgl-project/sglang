@@ -33,7 +33,8 @@ test(`${name} exposes only validated Python-only Xeon recipes`, () => {
   const cells = config.cells.filter((cell) => cell.match.hw === "xeon");
   const expectedVariants = vendor === "IFM" ? ["0.9b", "3.7b"] : ["3b", "8b"];
   if (vendor === "IFM") expectedVariants.push("7b");
-  assert.deepEqual(cells.map((cell) => cell.match.variant).sort(), expectedVariants);
+  if (name === "k2-horizon") expectedVariants.push("32b");
+  assert.deepEqual(cells.map((cell) => cell.match.variant).sort(), expectedVariants.sort());
   const api = engine(config);
   const cell = cells.find((candidate) => candidate.match.variant === firstVariant);
   const command = api.renderCommand(cell, cell.match, {
@@ -78,6 +79,7 @@ test(`${name} hides unvalidated Playground axes and discards stale GPU overrides
 for (const [vendor, name, variant, checkpoint, revision] of [
   ["IFM", "k2-horizon", "3.7b", "K2-Horizon-3.7B", "4525090a8f0fce1026d861701b9bde2fb726b7a0"],
   ["IFM", "k2-horizon", "7b", "K2-Horizon-7B", "92f61d9123d12e223196ca484edf34a56df7803e"],
+  ["IFM", "k2-horizon", "32b", "K2-Horizon-32B", "4b05c13ad1972e8f470ab93ff90c3e90010ce592"],
   ["IFM", "jais-3", "3.7b", "Jais-3-3.7B", "78d52c03900ef18ee3ebae631426556df6bd925a"],
   ["IFM", "jais-3", "7b", "Jais-3-7B", "c7daf3c43355921602398a0d97bbeba05bfbe81b"],
   ["ibm-granite", "granite-4.2", "8b", "granite-4.2-8b", "a7042144125ce5ae64f89610e8289647fc000b9a"],
