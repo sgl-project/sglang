@@ -1108,14 +1108,12 @@ class EngramEmbedding(nn.Module):
         from sglang.srt.engram_share.vmm.external import attach_table
 
         assert config.shared_host_endpoint is not None
-        assert config.shared_host_token_file is not None
         assert config.shared_host_generation is not None
         head_sizes = tuple(
             end - start for start, end in zip(column_bounds, column_bounds[1:])
         )
         self.external_table = attach_table(
             endpoint=config.shared_host_endpoint,
-            token_file=Path(config.shared_host_token_file),
             generation=config.shared_host_generation,
             checkpoint_dir=Path(get_model().model_path),
             layer=layer_id,

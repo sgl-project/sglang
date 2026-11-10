@@ -44,7 +44,7 @@ CUDA FABRIC handles, checkpoint identity and a generation ID through a trusted
 control endpoint. The SGLang workers import read-only GPU mappings and run the
 existing `engram_gather` kernel against them. Lookup IDs and rows do not pass
 through the control endpoint. The current compatible provider protocol is in
-[the vLLM VMM port](https://github.com/foraxe/vllm/tree/nyx/engram-vmm-port-6b3488cc),
+[the vLLM VMM port](https://github.com/foraxe/vllm/tree/feat/dsv41-engram-shared-nvl72),
 intended for [vLLM #64082](https://github.com/vllm-project/vllm/pull/64082).
 The complete four-GPU owner, P TP2, D TP2 and router launch recipe is in
 `examples/engram_shared/`, including a routed request.
@@ -52,7 +52,7 @@ The complete four-GPU owner, P TP2, D TP2 and router launch recipe is in
 ```bash
 sglang serve --model-path /models/DeepSeek-V4.1-Flash --tp-size 2 \
   --load-format safetensors \
-  --engram-config '{"placement":"external","shared_host_endpoint":"OWNER:56000","shared_host_token_file":"/shared/private/engram.token","shared_host_generation":"GENERATION_ID"}'
+  --engram-config '{"placement":"external","shared_host_endpoint":"OWNER:56000","shared_host_generation":"GENERATION_ID"}'
 ```
 
 Use the same owner generation in every independent instance. Each consumer
@@ -63,7 +63,7 @@ encoding before exposing a pointer. SGLang skips the large table tensors
 before safetensors materialization but still loads the smaller weights in
 their shards. External placement currently needs CUDA, attention DP=1 and
 CP=1, ordinary mmap-backed safetensors loading and a reachable trusted TCP
-control network. The control channel is not encrypted.
+control network.
 Online weight updates are rejected while an external generation is attached;
 start a new owner and new workers for an updated checkpoint.
 

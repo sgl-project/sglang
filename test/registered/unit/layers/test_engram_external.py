@@ -32,7 +32,6 @@ class TestExternalEngram(CustomTestCase):
             {
                 "placement": "external",
                 "shared_host_endpoint": "127.0.0.1:56000",
-                "shared_host_token_file": "/tmp/token",
                 "shared_host_generation": "generation",
             }
         )
@@ -46,7 +45,6 @@ class TestExternalEngram(CustomTestCase):
         valid = {
             "placement": "external",
             "shared_host_endpoint": "127.0.0.1:56000",
-            "shared_host_token_file": "/tmp/token",
             "shared_host_generation": "generation",
         }
         self.assertEqual(EngramConfig.from_dict(valid).placement, "external")
@@ -99,7 +97,6 @@ class TestExternalEngram(CustomTestCase):
                 {
                     "placement": "external",
                     "shared_host_endpoint": "127.0.0.1:56000",
-                    "shared_host_token_file": "/tmp/token",
                     "shared_host_generation": "generation",
                 }
             )
@@ -208,8 +205,6 @@ class TestExternalEngram(CustomTestCase):
             directory = Path(temporary)
             (directory / "config.json").write_text("{}")
             (directory / "model.safetensors.index.json").write_text("{}")
-            token = directory / "token"
-            token.write_text("private-token")
             connection = FakeConnection()
             with (
                 mock.patch.object(
@@ -222,7 +217,6 @@ class TestExternalEngram(CustomTestCase):
             ):
                 engram_external.attach_table(
                     endpoint="127.0.0.1:56000",
-                    token_file=token,
                     generation="expected-generation",
                     checkpoint_dir=directory,
                     layer=1,
@@ -258,8 +252,6 @@ class TestExternalEngram(CustomTestCase):
             index_path = directory / "model.safetensors.index.json"
             config_path.write_text("{}")
             index_path.write_text("{}")
-            token = directory / "token"
-            token.write_text("private-token")
             manifest = {
                 "generation": "expected-generation",
                 "config_sha256": hashlib.sha256(config_path.read_bytes()).hexdigest(),
@@ -304,7 +296,6 @@ class TestExternalEngram(CustomTestCase):
             ):
                 engram_external.attach_table(
                     endpoint="127.0.0.1:56000",
-                    token_file=token,
                     generation="expected-generation",
                     checkpoint_dir=directory,
                     layer=1,
@@ -316,6 +307,7 @@ class TestExternalEngram(CustomTestCase):
             self.assertTrue(connection.closed)
             self.assertEqual(len(connection.sent), 1)
             self.assertEqual(connection.sent[0]["op"], "attach")
+            self.assertNotIn("token", connection.sent[0])
 
     def test_partial_vmm_import_reports_failed_unmap(self):
         class FakeDriver:

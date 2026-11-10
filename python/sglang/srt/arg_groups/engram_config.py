@@ -45,7 +45,6 @@ class EngramConfig:
     replication: str = _choice(EngramReplication.NONE, EngramReplication.ALL)
     lookup: str = _choice(EngramLookup.AUTO, EngramLookup.ALL)
     shared_host_endpoint: Optional[str] = None
-    shared_host_token_file: Optional[str] = None
     shared_host_generation: Optional[str] = None
 
     @classmethod
@@ -70,14 +69,12 @@ class EngramConfig:
         config = cls(**raw)
         external_fields = (
             config.shared_host_endpoint,
-            config.shared_host_token_file,
             config.shared_host_generation,
         )
         if config.placement == EngramPlacement.EXTERNAL:
             if not all(isinstance(value, str) and value for value in external_fields):
                 raise ValueError(
-                    "--engram-config: external placement needs endpoint, token "
-                    "file and generation."
+                    "--engram-config: external placement needs endpoint and generation."
                 )
             if config.replication != EngramReplication.NONE or config.lookup not in (
                 EngramLookup.AUTO,
@@ -89,7 +86,7 @@ class EngramConfig:
                 )
         elif any(value is not None for value in external_fields):
             raise ValueError(
-                "--engram-config: shared host endpoint, token and generation "
+                "--engram-config: shared host endpoint and generation "
                 "require external placement."
             )
         elif config.lookup == EngramLookup.DIRECT:

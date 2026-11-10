@@ -76,7 +76,6 @@ class ExternalEngramTable:
 def attach_table(
     *,
     endpoint: str,
-    token_file: Path,
     generation: str,
     checkpoint_dir: Path,
     layer: int,
@@ -95,7 +94,6 @@ def attach_table(
             raise ValueError("external Engram needs a local checkpoint directory")
         request = {
             "op": "attach",
-            "token": token_file.read_text().strip(),
             "client": {
                 "hostname": socket.gethostname(),
                 "pid": os.getpid(),

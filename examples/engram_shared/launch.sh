@@ -5,11 +5,6 @@ set -euo pipefail
 role=${1:?usage: launch.sh owner|prefill|decode|router}
 if [[ "$role" != router ]]; then
   : "${MODEL_DIR:?set MODEL_DIR to the local DeepSeek-V4.1-Flash checkpoint}"
-  : "${TOKEN_FILE:?set TOKEN_FILE to a private token file shared with consumers}"
-  if [[ ! -r "$TOKEN_FILE" ]]; then
-    echo "TOKEN_FILE is not readable: $TOKEN_FILE" >&2
-    exit 2
-  fi
 fi
 
 sglang_python=${SGLANG_PYTHON:-python}
@@ -32,7 +27,7 @@ case "$role" in
       --model-dir "$MODEL_DIR" \
       --listen-host "${OWNER_BIND_HOST:-127.0.0.1}" \
       --listen-port "$owner_port" \
-      --token-file "$TOKEN_FILE" --device "${OWNER_DEVICE:-0}"
+      --device "${OWNER_DEVICE:-0}"
     ;;
   prefill|decode)
     : "${GENERATION:?copy generation from ENGRAM_OWNER_READY line}"
@@ -50,8 +45,8 @@ case "$role" in
       nccl_port=${D_NCCL_PORT:-30100}
     fi
     engram_json=$(OWNER_ENDPOINT="$owner_endpoint" GENERATION="$GENERATION" \
-      TOKEN_FILE="$TOKEN_FILE" "$sglang_python" -c \
-      'import json, os; print(json.dumps({"placement": "external", "shared_host_endpoint": os.environ["OWNER_ENDPOINT"], "shared_host_token_file": os.environ["TOKEN_FILE"], "shared_host_generation": os.environ["GENERATION"]}))')
+      "$sglang_python" -c \
+      'import json, os; print(json.dumps({"placement": "external", "shared_host_endpoint": os.environ["OWNER_ENDPOINT"], "shared_host_generation": os.environ["GENERATION"]}))')
     run "$sglang_python" -m sglang.launch_server \
       --model-path "$MODEL_DIR" --host "${SERVE_HOST:-127.0.0.1}" \
       --port "$port" --tp 2 --base-gpu-id "$base_gpu" \
