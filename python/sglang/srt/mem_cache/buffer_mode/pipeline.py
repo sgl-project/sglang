@@ -684,8 +684,7 @@ class BufferModePipeline:
             self._queued_span_refs[span] = refs - 1
 
     def begin_insert_walk(self) -> None:
-        """Admit each node once per insert walk: the trigger chains every
-        unbacked ancestor, so a depth-d path is presented d(d+1)/2 times."""
+        """Admit each node once per insert walk, even if the walk's backups repeat it."""
         self._walk_admitted = set()
 
     def end_insert_walk(self) -> None:
