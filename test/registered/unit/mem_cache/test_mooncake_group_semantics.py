@@ -8,6 +8,7 @@ import torch
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
+    PoolHitPolicy,
     PoolName,
     PoolTransfer,
 )
@@ -286,6 +287,98 @@ def _make_store(
 
 
 class TestMooncakeGroupSemantics(CustomTestCase):
+    def test_c128_query_restores_only_complete_block_boundaries(self):
+        for pages, endpoints, expected in (
+            (0, (), []),
+            (15, (), []),
+            (16, (16,), [16]),
+            (32, (16, 32), [16, 32]),
+            (35, (16, 32), [16, 32]),
+            # Regression: the 6016-token reproduction must restore 4096 tokens.
+            (47, (16, 32), [16, 32]),
+            (48, (16, 32, 48), [16, 32, 48]),
+            (48, (16, 48), [16]),
+            (48, (32, 48), []),
+        ):
+            with self.subTest(pages=pages, endpoints=endpoints):
+                store, fake = _make_store(extra_backend_tag="tag", is_mla_model=True)
+                # DSV4 uses a logical anchor with no physical FULL KV object.
+                store.mem_pool_host = types.SimpleNamespace(kv_buffer=None)
+                store.register_mem_host_pool_v2(
+                    FakeIndexerPool(), PoolName.DEEPSEEK_V4_C128
+                )
+                fake.existing_keys.update(
+                    f"tag_H{i}__deepseek_v4_c128" for i in endpoints
+                )
+                transfer = PoolTransfer(
+                    name=PoolName.DEEPSEEK_V4_C128,
+                    keys=["__placeholder__"] * (pages // 16),
+                    hit_policy=PoolHitPolicy.BLOCK_GROUPS,
+                    block_pages=16,
+                    group_pages=1,
+                )
+                result = store.batch_exists_v2(
+                    [f"H{i}" for i in range(1, pages + 1)], [transfer]
+                )
+                boundary = expected[-1] if expected else 0
+                self.assertEqual(result.kv_hit_pages, boundary)
+                self.assertEqual(result.restorable_prefix_pages, expected)
+                self.assertEqual(
+                    result.extra_pool_hit_pages.get(PoolName.DEEPSEEK_V4_C128, 0),
+                    boundary,
+                )
+
+    def test_c128_query_intersects_other_pool_restore_boundaries(self):
+        for trailing_endpoints, expected in (
+            ((16, 24, 32), [16]),
+            ((24,), []),
+        ):
+            for reverse in (False, True):
+                with self.subTest(endpoints=trailing_endpoints, reverse=reverse):
+                    store, fake = _make_store(
+                        extra_backend_tag="tag", is_mla_model=True
+                    )
+                    store.mem_pool_host = types.SimpleNamespace(kv_buffer=None)
+                    for name in (
+                        PoolName.DEEPSEEK_V4_C128,
+                        PoolName.DEEPSEEK_V4_C4,
+                        PoolName.SWA,
+                    ):
+                        store.register_mem_host_pool_v2(FakeIndexerPool(), name)
+                    fake.existing_keys.update(
+                        f"tag_H{i}__deepseek_v4_c128" for i in (16, 32)
+                    )
+                    # C4 supports the first 30 pages; SWA has sparse endpoints.
+                    fake.existing_keys.update(
+                        f"tag_H{i}__deepseek_v4_c4" for i in range(1, 31)
+                    )
+                    fake.existing_keys.update(
+                        f"tag_H{i}__swa" for i in trailing_endpoints
+                    )
+                    transfers = [
+                        PoolTransfer(
+                            name=PoolName.DEEPSEEK_V4_C128,
+                            keys=["__placeholder__"] * 2,
+                            hit_policy=PoolHitPolicy.BLOCK_GROUPS,
+                            block_pages=16,
+                            group_pages=1,
+                        ),
+                        PoolTransfer(name=PoolName.DEEPSEEK_V4_C4),
+                        PoolTransfer(
+                            name=PoolName.SWA,
+                            keys=["__placeholder__"],
+                            hit_policy=PoolHitPolicy.TRAILING_PAGES,
+                        ),
+                    ]
+                    result = store.batch_exists_v2(
+                        [f"H{i}" for i in range(1, 48)],
+                        list(reversed(transfers)) if reverse else transfers,
+                    )
+                    self.assertEqual(result.restorable_prefix_pages, expected)
+                    self.assertEqual(
+                        result.kv_hit_pages, expected[-1] if expected else 0
+                    )
+
     def test_dcp_shard_keys_and_replicas(self):
         base = replace(
             _make_config(is_mla_model=True, tp_size=4),
