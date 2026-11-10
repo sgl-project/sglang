@@ -2753,20 +2753,15 @@ class KVCacheConfigurator:
         return token_to_kv_pool
 
     def _uses_dflash_draft_kv_ring(self) -> bool:
-        if not (self.is_draft_worker and self.spec_algorithm.is_dflash()):
-            return False
-        from sglang.srt.speculative.dflash_draft_ring import draft_kv_ring_enabled
-
-        return draft_kv_ring_enabled()
+        return self.is_draft_worker and get_spec().speculative_dflash_draft_kv_ring
 
     def _dflash_draft_kv_ring_bytes(self) -> int:
         """The draft runner's KV ring, charged to the target's budget like the
         other per-request fixed pools: rows for every req pool row (+1: the
         pool's padding slot) and the pool's padding page."""
-        if self.is_draft_worker or not self.spec_algorithm.is_dflash():
+        if self.is_draft_worker or not get_spec().speculative_dflash_draft_kv_ring:
             return 0
         from sglang.srt.speculative.dflash_draft_ring import (
-            draft_kv_ring_enabled,
             draft_kv_ring_pool_rows,
             draft_kv_ring_rows_per_req,
             draft_kv_ring_window_left,
@@ -2774,7 +2769,7 @@ class KVCacheConfigurator:
 
         draft_model_config = self.spec_aux_config.draft_model_config
         cell_size = self.dflash_draft_cell_size_per_token
-        if not draft_kv_ring_enabled() or draft_model_config is None or not cell_size:
+        if draft_model_config is None or not cell_size:
             return 0
         rows_per_req = draft_kv_ring_rows_per_req(
             window_left=draft_kv_ring_window_left(draft_model_config.hf_config),

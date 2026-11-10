@@ -16,6 +16,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
     get_server_args,
+    get_spec,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -1483,6 +1484,29 @@ class TestDflashDraftKvBudget(CustomTestCase):
                     cfg._cell_size,
                     target_kv_per_token + draft_kv_per_token * loc_space_scale,
                 )
+
+    def test_draft_kv_ring_drops_the_per_token_draft_charge(self):
+        """A resolved DFLASH draft KV ring is a fixed pool, so the target's
+        per-token budget carries no draft row."""
+        mr = _make_model_runner(self)
+        mr.spec_algorithm.is_dflash.return_value = True
+        mr.spec_algorithm.is_dflash_family.return_value = True
+        mr.spec_aux_config = SimpleNamespace(
+            eagle_draft_num_layers=None,
+            dflash_draft_num_layers=5,
+        )
+        mr.dflash_draft_cell_size_per_token = 10_240
+        with (
+            mock_cpu_env(),
+            get_spec().override(speculative_dflash_draft_kv_ring=True),
+        ):
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            cfg = create_memory_pool_configurator(mr)
+
+        self.assertEqual(cfg._cell_size, 4 * (64 + 64) * 32 * KV_SIZE)
 
     def test_draft_loc_space_scale(self):
         """An MLA draft that executes DCP keeps per-rank rows."""

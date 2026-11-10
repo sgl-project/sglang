@@ -61,7 +61,6 @@ from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, HiCacheDraft
 from sglang.srt.speculative.dflash_dp import gather_draft_embedding
 from sglang.srt.speculative.dflash_draft_ring import (
     DFlashDraftKVRing,
-    draft_kv_ring_enabled,
     draft_kv_ring_rows_per_req,
     draft_kv_ring_window_left,
 )
@@ -712,7 +711,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 ),
                 token_to_kv_pool_allocator=token_to_kv_pool_allocator,
             )
-        if draft_kv_ring_enabled():
+        if get_spec().speculative_dflash_draft_kv_ring:
             self._init_draft_kv_ring()
 
     def _init_draft_kv_ring(self) -> None:
@@ -755,7 +754,7 @@ class DFlashWorkerV2(BaseSpecWorker):
 
     def _build_hicache_draft_plan(self) -> HiCacheDraftPlan:
         # A ring holds no prefix: a cached prefix brings no draft KV back.
-        if draft_kv_ring_enabled():
+        if get_spec().speculative_dflash_draft_kv_ring:
             return HiCacheDraftPlan()
         return super()._build_hicache_draft_plan()
 

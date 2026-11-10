@@ -1119,15 +1119,14 @@ def _resolve_dflash_mla_draft_window(server_args: ServerArgs) -> None:
 
 
 def _resolve_dflash_draft_kv_ring(server_args: ServerArgs) -> None:
-    """Settle SGLANG_ENABLE_DFLASH_DRAFT_KV_RING once, before any worker starts, so
-    every process agrees. Runs after the draft backend and the compact window
-    are final."""
+    """Declare ``speculative_dflash_draft_kv_ring`` once, before any worker
+    starts. Runs after the draft backend and the compact window are final."""
     from sglang.srt.speculative.dflash_draft_ring import (
         draft_kv_ring_unsupported_reason,
     )
 
-    flag = envs.SGLANG_ENABLE_DFLASH_DRAFT_KV_RING
-    if not flag.get():
+    switch = envs.SGLANG_ENABLE_DFLASH_DRAFT_KV_RING
+    if not switch.get():
         return
     cfg = resolving_view(server_args)
     reason = draft_kv_ring_unsupported_reason(
@@ -1137,13 +1136,17 @@ def _resolve_dflash_draft_kv_ring(server_args: ServerArgs) -> None:
         disaggregation_mode=cfg.disaggregation_mode,
         enable_unified_memory=cfg.enable_unified_memory,
     )
-    if reason is None:
-        logger.info("DFLASH draft KV ring: on.")
+    if reason is not None:
+        if switch.is_set():
+            raise ValueError(f"SGLANG_ENABLE_DFLASH_DRAFT_KV_RING=1, but {reason}.")
+        logger.info("DFLASH draft KV ring: off, %s.", reason)
         return
-    if flag.is_set():
-        raise ValueError(f"SGLANG_ENABLE_DFLASH_DRAFT_KV_RING=1, but {reason}.")
-    logger.info("DFLASH draft KV ring: off, %s.", reason)
-    flag.set(False)
+    logger.info("DFLASH draft KV ring: on.")
+    declare_resolution(
+        server_args,
+        "_resolve_dflash_draft_kv_ring",
+        speculative_dflash_draft_kv_ring=True,
+    )
 
 
 def _handle_frozen_kv_mtp(server_args: ServerArgs) -> None:

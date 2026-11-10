@@ -1,20 +1,21 @@
-"""SGLANG_ENABLE_DFLASH_DRAFT_KV_RING resolution and budget.
+"""DFLASH draft KV ring resolution and budget.
 
-The ring is resolved once at startup: on by default for an all-sliding MLA
-draft on trtllm_mla / cutedsl_mla, off (with a log line) where it is not
-served, and an explicit 1 there is an error. When on, the target's per-token
-budget carries no draft row and the ring is charged as a fixed pool.
+The ring is resolved once at startup into speculative_dflash_draft_kv_ring:
+on by default for an all-sliding MLA draft on trtllm_mla / cutedsl_mla, off
+(with a log line) where it is not served, and an explicit
+SGLANG_ENABLE_DFLASH_DRAFT_KV_RING=1 there is an error. When on, the ring is
+charged as a fixed pool.
 """
 
-import os
+import contextlib
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
+from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.arg_groups.speculative_hook import _resolve_dflash_draft_kv_ring
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
-from sglang.srt.model_executor.pool_configurator import _has_dflash_draft_kv
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dflash_draft_ring import (
     draft_kv_ring_pool_rows,
@@ -27,7 +28,7 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 HOOK_MODULE = "sglang.srt.arg_groups.speculative_hook"
 KVC_MODULE = "sglang.srt.mem_cache.kv_cache_configurator"
-FLAG = "SGLANG_ENABLE_DFLASH_DRAFT_KV_RING"
+SWITCH = envs.SGLANG_ENABLE_DFLASH_DRAFT_KV_RING
 SWA_MLA_DRAFT = {
     "num_hidden_layers": 5,
     "dflash_config": {"attention_mode": "mla"},
@@ -36,11 +37,13 @@ SWA_MLA_DRAFT = {
 }
 
 
-def _env(flag=None):
-    env = {k: v for k, v in os.environ.items() if k != FLAG}
-    if flag is not None:
-        env[FLAG] = flag
-    return patch.dict(os.environ, env, clear=True)
+@contextlib.contextmanager
+def _switch(value=None):
+    """The ring switch at ``value``, or unset (the default) for None."""
+    with SWITCH.override(True if value is None else value):
+        if value is None:
+            SWITCH.clear()
+        yield
 
 
 def _args(**overrides) -> ServerArgs:
@@ -60,13 +63,15 @@ class TestResolveDraftKVRing(CustomTestCase):
     def _resolve(self, args, draft_cfg=SWA_MLA_DRAFT) -> bool:
         with patch(f"{HOOK_MODULE}._load_draft_hf_config", return_value=draft_cfg):
             _resolve_dflash_draft_kv_ring(args)
-        return envs.SGLANG_ENABLE_DFLASH_DRAFT_KV_RING.get()
+        return resolution_result(args, "speculative_dflash_draft_kv_ring")
 
     def test_on_by_default_for_a_sliding_mla_draft(self):
         for backend in ("cutedsl_mla", "trtllm_mla"):
-            with self.subTest(backend=backend), _env():
+            with self.subTest(backend=backend), _switch():
                 args = _args(speculative_draft_attention_backend=backend)
                 self.assertTrue(self._resolve(args))
+                # The decision lives in the declaration, not in the environment.
+                self.assertFalse(SWITCH.is_set())
 
     def test_off_by_default_where_not_served(self):
         cases = {
@@ -76,30 +81,26 @@ class TestResolveDraftKVRing(CustomTestCase):
             "flashinfer": _args(speculative_draft_attention_backend="flashinfer"),
         }
         for name, args in cases.items():
-            with self.subTest(name), _env():
+            with self.subTest(name), _switch():
                 self.assertFalse(self._resolve(args))
-        with _env():
+        with _switch():
             mixed = dict(SWA_MLA_DRAFT, layer_types=["full_attention"] * 5)
             self.assertFalse(self._resolve(_args(), draft_cfg=mixed))
 
     def test_explicit_on_where_not_served_is_an_error(self):
         for mode in ("prefill", "decode"):
-            with self.subTest(mode=mode), _env("1"):
+            with self.subTest(mode=mode), _switch(True):
                 with self.assertRaises(ValueError):
                     self._resolve(_args(disaggregation_mode=mode))
 
     def test_explicit_off_is_kept(self):
-        with _env("0"):
+        with _switch(False):
             self.assertFalse(self._resolve(_args()))
 
 
-def _kvc(*, is_draft_worker=False, dflash=True, cell_size=2880, attn_dp_size=1):
-    spec_algorithm = MagicMock()
-    spec_algorithm.is_dflash.return_value = dflash
-    spec_algorithm.is_dflash_family.return_value = True
+def _kvc(*, is_draft_worker=False, cell_size=2880, attn_dp_size=1):
     return SimpleNamespace(
         is_draft_worker=is_draft_worker,
-        spec_algorithm=spec_algorithm,
         spec_aux_config=SimpleNamespace(
             draft_model_config=SimpleNamespace(hf_config=SWA_MLA_DRAFT)
         ),
@@ -111,11 +112,16 @@ def _kvc(*, is_draft_worker=False, dflash=True, cell_size=2880, attn_dp_size=1):
 
 
 class TestDraftKVRingBudget(CustomTestCase):
-    def _ring_bytes(self, kvc, *, dcp_size=8, max_running_requests=48, page_size=1):
+    def _ring_bytes(
+        self, kvc, *, ring=True, dcp_size=8, max_running_requests=48, page_size=1
+    ):
         with (
             patch(
                 f"{KVC_MODULE}.get_spec",
-                return_value=SimpleNamespace(speculative_num_draft_tokens=8),
+                return_value=SimpleNamespace(
+                    speculative_num_draft_tokens=8,
+                    speculative_dflash_draft_kv_ring=ring,
+                ),
             ),
             patch(
                 f"{KVC_MODULE}.get_parallel",
@@ -132,7 +138,7 @@ class TestDraftKVRingBudget(CustomTestCase):
 
     def test_ring_is_charged_as_its_draft_pool(self):
         for dcp_size, page_size, dp in ((8, 1, 1), (1, 64, 1), (8, 64, 2)):
-            with self.subTest(dcp=dcp_size, page=page_size, dp=dp), _env():
+            with self.subTest(dcp=dcp_size, page=page_size, dp=dp):
                 rows_per_req = draft_kv_ring_rows_per_req(
                     window_left=1023, block_size=8, dcp_size=dcp_size
                 )
@@ -152,23 +158,13 @@ class TestDraftKVRingBudget(CustomTestCase):
 
     def test_nothing_is_charged_without_a_ring(self):
         cases = {
-            "draft worker": (_kvc(is_draft_worker=True), None),
-            "dspark": (_kvc(dflash=False), None),
-            "unresolved draft bytes": (_kvc(cell_size=None), None),
-            "ring off": (_kvc(), "0"),
+            "draft worker": (_kvc(is_draft_worker=True), True),
+            "unresolved draft bytes": (_kvc(cell_size=None), True),
+            "ring off": (_kvc(), False),
         }
-        for name, (kvc, flag) in cases.items():
-            with self.subTest(name), _env(flag):
-                self.assertEqual(self._ring_bytes(kvc), 0)
-
-    def test_per_token_draft_charge_follows_the_ring(self):
-        with _env():
-            self.assertFalse(_has_dflash_draft_kv(_kvc()))
-            # DSPARK has no ring and keeps its per-token draft rows.
-            self.assertTrue(_has_dflash_draft_kv(_kvc(dflash=False)))
-            self.assertFalse(_has_dflash_draft_kv(_kvc(is_draft_worker=True)))
-        with _env("0"):
-            self.assertTrue(_has_dflash_draft_kv(_kvc()))
+        for name, (kvc, ring) in cases.items():
+            with self.subTest(name):
+                self.assertEqual(self._ring_bytes(kvc, ring=ring), 0)
 
 
 if __name__ == "__main__":

@@ -144,12 +144,10 @@ def _has_dflash_draft_kv(kvc: KVCacheConfigurator) -> bool:
     """Whether the target's per-token budget carries a draft KV row. A DFLASH
     draft KV ring is a fixed pool instead, charged before token sizing
     (KVCacheConfigurator._dflash_draft_kv_ring_bytes)."""
-    from sglang.srt.speculative.dflash_draft_ring import draft_kv_ring_enabled
-
     return (
         not kvc.is_draft_worker
         and kvc.spec_algorithm.is_dflash_family()
-        and not (kvc.spec_algorithm.is_dflash() and draft_kv_ring_enabled())
+        and not get_spec().speculative_dflash_draft_kv_ring
     )
 
 
