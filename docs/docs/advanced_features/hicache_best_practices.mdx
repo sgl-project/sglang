@@ -229,6 +229,28 @@ python3 -m sglang.launch_server \
 ```
 
 
+### Monitoring the Backup Pipeline
+
+With `--enable-metrics` and a storage backend attached, the following metrics show how far the backup pipeline is behind and whether storage writes are landing.
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `sglang:hicache_d2h_pending_ops` | Gauge | Device-to-host writes not yet acked |
+| `sglang:hicache_d2h_ack_queue_depth` | Gauge | Length of the device-to-host ack queue |
+| `sglang:hicache_l3_pending_ops` | Gauge | Storage backups not yet acked |
+| `sglang:hicache_l3_backup_queue_depth` | Gauge | Length of the storage backup queue |
+| `sglang:hicache_l3_ack_queue_depth` | Gauge | Length of the storage backup ack queue |
+| `sglang:hicache_l3_backup_worker_alive` | Gauge | 1 while the backup worker thread is alive, 0 otherwise |
+| `sglang:hicache_l3_backup_submitted_tokens_total` | Counter | Primary KV tokens submitted for storage backup |
+| `sglang:hicache_l3_backup_failed_ops_total` | Counter | Backup operations the storage backend refused or failed |
+| `sglang:hicache_l3_backup_unwritten_pages_total` | Counter | Primary KV pages those operations left unwritten |
+| `sglang:hicache_l3_backup_unwritten_tokens_total` | Counter | The same pages, in tokens |
+| `sglang:hicache_l3_backup_sidecar_unwritten_pages_total{pool}` | Counter | Sidecar pages left unwritten, per pool |
+
+- A backup queue depth or pending count that keeps growing means the storage backend is slower than the rate at which new KV is produced.
+- `sglang:hicache_l3_backup_failed_ops_total` growing means writes are being lost; the server keeps serving, and the affected prefixes are recomputed instead of loaded from storage.
+- Compare `sglang:hicache_l3_backup_submitted_tokens_total` with `sglang:backuped_tokens_total` on a rank that writes the primary KV. On other ranks the submitted counter grows while the written counter stays 0.
+
 ## Custom Storage Backend Integration
 
 To integrate a new storage backend:
