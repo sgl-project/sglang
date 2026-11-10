@@ -1,13 +1,7 @@
 """Shared harness for NPU RLHF lifecycle tests.
 
-The NPU test suites are plain ``unittest`` files executed as
-``python3 <test_file> -f`` by ``test/run_suite.py``; there is no pytest
-collection, so this module (not a ``conftest.py``) is the place for common
-server, memory, and weight-signature helpers.
-
-Sibling suites import it by path, where the test file's directory is already
-on ``sys.path``. The ``conftest.py`` name lets both ``run_suite.py`` and the
-registered-test lint skip this shared helper without a fake CI registry entry.
+The suites run as plain ``unittest`` files via ``python3 <test_file> -f``;
+this module holds the common server, memory, request, and weight helpers.
 """
 
 from __future__ import annotations
