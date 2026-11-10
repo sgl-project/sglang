@@ -231,5 +231,62 @@ class TestMxfp8AiterRouteGfx95(CustomTestCase):
                 self.assertTrue(torch.equal(out_q, out), (n, k, m))
 
 
+@unittest.skipUnless(is_hip() and is_gfx95_supported(), "gfx950 native MXFP8 route")
+class TestMxfp8NativePackedQGfx95(CustomTestCase):
+    def test_packed_query_is_the_bf16_output_quantized(self):
+        """apply_dense_packed_q writes exactly quantize_q_opus_fp8 of apply_dense's bf16
+        output, for every operand form the fused q_norm hands wq_b."""
+        from sglang.kernels.ops.attention.dsv4.opus_sparse_prefill_hip import (
+            quantize_q_opus_fp8,
+        )
+
+        backend = Mxfp8DenseGemmBackend.GFX95_MXFP8_NATIVE
+        method = types.SimpleNamespace(
+            block_fp8_as_mxfp8=True,
+            mxfp8_dense_backend=backend,
+            weight_block_size=[32, 32],
+            w8a8_mxfp8_linear=dispatch_block_fp8_mxfp8_linear(backend),
+        )
+        # (N, K): V4.1 wq_b at TP4 (16 heads of 512) and a narrower one
+        for n, k in ((8192, 1280), (4096, 1536)):
+            torch.manual_seed(0)
+            w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+            w[64:96] = 0  # an all-zero 32-column output block
+            wq, ws = _quant_weight_block32(w)
+            layer = torch.nn.Module()
+            layer.weight = torch.nn.Parameter(wq.clone(), requires_grad=False)
+            layer.weight_scale_inv = torch.nn.Parameter(ws.clone(), requires_grad=False)
+            layer.block_fp8_mxfp8_ready = True
+            fp8_hip.process_dense_weights(method, layer, None)
+            self.assertIsNone(
+                fp8_hip.apply_dense_packed_q(
+                    method, layer, torch.randn(16, k, device="cuda").bfloat16()
+                ),
+                "the gemv rows have no packed epilogue",
+            )
+            for m in (1025, 4100):
+                x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+                xq, xs = fp8_grid_quantize(x)
+                for operand in (
+                    x,
+                    Fp8GridActivation(fake_quant_fp8_activation(x)),
+                    Mxfp8Activation(xq, xs),
+                    (xq, xs),
+                ):
+                    out = fp8_hip.apply_dense(method, layer, operand, None)
+                    ref_nope, ref_rope = quantize_q_opus_fp8(out.view(m, n // 512, 512))
+                    q_nope, q_rope = fp8_hip.apply_dense_packed_q(method, layer, operand)
+                    self.assertTrue(
+                        torch.equal(
+                            q_nope.view(torch.uint8)[..., :464],
+                            ref_nope.view(torch.uint8)[..., :464],
+                        ),
+                        (n, k, m, type(operand)),
+                    )
+                    self.assertTrue(
+                        torch.equal(q_rope, ref_rope), (n, k, m, type(operand))
+                    )
+
+
 if __name__ == "__main__":
     unittest.main()

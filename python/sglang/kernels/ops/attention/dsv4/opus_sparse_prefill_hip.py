@@ -5,9 +5,10 @@ gathers rows into workspaces and builds padded per-query lists
 (``SparsePrefillChunkCache``); this module turns those lists into CSR and runs the
 kernel: bf16 rows through ``pa_sparse_prefill_opus``, or fp8 rows in aiter's DMA
 layout (512 e4m3 per row at unit scale, RoPE in the last 64) through
-``pa_sparse_prefill_fp8_opus``.
+``pa_sparse_prefill_fp8_opus``, with the rows' bf16 RoPE alongside for QK^T.
 """
 
+import dataclasses
 import functools
 from typing import Optional, Tuple
 
@@ -24,6 +25,17 @@ _D = 512
 _D_NOPE = 448
 _D_ROPE = 64
 _Q_BLK = 32
+
+
+@dataclasses.dataclass(frozen=True)
+class OpusPackedQ:
+    """A query handed to attention already as the fp8 OPUS kernel's pair, written by its
+    projection: q_nope [T, H, 512] fp8 (what quantize_q_opus_fp8 writes) and q_rope
+    [T, H, 64] bf16 with its RoPE applied. A dataclass, not a tuple: tuples already
+    mean (fp8, scale) operands to the linear layers."""
+
+    q_nope: torch.Tensor
+    q_rope: torch.Tensor
 
 
 @functools.cache
@@ -46,42 +58,52 @@ def _quant_q_mxfp8_kernel(
     q_stride_t,
     q_stride_h,
     num_heads,
+    num_rows,
     NBLK: tl.constexpr,
     NBLK_P2: tl.constexpr,
     BLK: tl.constexpr,
     D: tl.constexpr,
     D_NOPE: tl.constexpr,
     D_ROPE: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
 ):
-    # one program per (token, head) row
-    row = tl.program_id(0).to(tl.int64)
+    # BLOCK_ROWS (token, head) rows per program: one row per program left the pass
+    # at a third of HBM bandwidth
+    row = tl.program_id(0).to(tl.int64) * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+    rmask = row < num_rows
     t = row // num_heads
     h = row % num_heads
     src = q_ptr + t * q_stride_t + h * q_stride_h
     blk = tl.arange(0, NBLK_P2)
     col = tl.arange(0, BLK)
-    ok = (blk < NBLK)[:, None]
-    x = tl.load(src + blk[:, None] * BLK + col[None, :], mask=ok, other=0.0).to(
-        tl.float32
-    )
+    ok = rmask[:, None, None] & (blk < NBLK)[None, :, None]
+    x = tl.load(
+        src[:, None, None] + blk[None, :, None] * BLK + col[None, None, :],
+        mask=ok,
+        other=0.0,
+    ).to(tl.float32)
     # E8M0 putting each block's max in (224, 448], as aiter's reference quantizer
-    amax = tl.max(tl.abs(x), axis=1)
+    amax = tl.max(tl.abs(x), axis=2)
     e = tl.ceil(tl.log2(tl.maximum(amax, 1e-30) / 448.0))
     e = tl.where(amax == 0.0, 0.0, tl.clamp(e, -127.0, 127.0))
-    y = tl.clamp(x * tl.exp2(-e)[:, None], -448.0, 448.0)
-    dst = nope_ptr + row * D
+    y = tl.clamp(x * tl.exp2(-e)[:, :, None], -448.0, 448.0)
+    dst = nope_ptr + row[:, None, None] * D
     tl.store(
-        dst + blk[:, None] * BLK + col[None, :],
+        dst + blk[None, :, None] * BLK + col[None, None, :],
         y.to(nope_ptr.dtype.element_ty),
         mask=ok,
     )
     # one byte per block at [D_NOPE, D_NOPE + NBLK); the two after them are read as
     # the RoPE blocks' slots, which the kernel fills itself
-    sblk = tl.arange(0, NBLK_P2)
-    sval = tl.where(sblk < NBLK, e, 0.0) + 127.0
-    tl.store(scale_ptr + row * D + D_NOPE + sblk, sval.to(tl.uint8))
+    sval = tl.where((blk < NBLK)[None, :], e, 0.0) + 127.0
+    tl.store(
+        scale_ptr + row[:, None] * D + D_NOPE + blk[None, :],
+        sval.to(tl.uint8),
+        mask=rmask[:, None],
+    )
     rc = tl.arange(0, D_ROPE)
-    tl.store(rope_ptr + row * D_ROPE + rc, tl.load(src + D_NOPE + rc))
+    rope = tl.load(src[:, None] + D_NOPE + rc[None, :], mask=rmask[:, None])
+    tl.store(rope_ptr + row[:, None] * D_ROPE + rc[None, :], rope, mask=rmask[:, None])
 
 
 def quantize_q_opus_fp8(q: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -93,9 +115,11 @@ def quantize_q_opus_fp8(q: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     q_rope = torch.empty(
         (num_tokens, num_heads, _D_ROPE), dtype=q.dtype, device=q.device
     )
-    if num_tokens * num_heads:
+    num_rows = num_tokens * num_heads
+    if num_rows:
         nblk = _D_NOPE // _Q_BLK
-        _quant_q_mxfp8_kernel[(num_tokens * num_heads,)](
+        block_rows = 8
+        _quant_q_mxfp8_kernel[(triton.cdiv(num_rows, block_rows),)](
             q,
             q_nope,
             q_nope.view(torch.uint8),
@@ -103,12 +127,15 @@ def quantize_q_opus_fp8(q: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
             q.stride(0),
             q.stride(1),
             num_heads,
+            num_rows,
             NBLK=nblk,
             NBLK_P2=triton.next_power_of_2(nblk),
             BLK=_Q_BLK,
             D=_D,
             D_NOPE=_D_NOPE,
             D_ROPE=_D_ROPE,
+            BLOCK_ROWS=block_rows,
+            num_warps=4,
         )
     return q_nope, q_rope
 
@@ -202,36 +229,36 @@ def opus_sparse_prefill_fp8(
     q_nope: torch.Tensor,
     q_rope: torch.Tensor,
     kv: torch.Tensor,
+    kv_rope: torch.Tensor,
     csr: Csr,
     attn_sink: torch.Tensor,
     softmax_scale: float,
     extend_kv: Optional[torch.Tensor] = None,
+    extend_kv_rope: Optional[torch.Tensor] = None,
     extend_csr: Optional[Csr] = None,
 ) -> torch.Tensor:
-    """``opus_sparse_prefill`` over fp8 rows: q from ``quantize_q_opus_fp8``, kv and
-    extend_kv [R, 512] fp8 in the DMA layout (unit scale, fp8 RoPE in the last 64).
-    At most 32 heads: wider launches take a kernel that also reads bf16 RoPE."""
+    """``opus_sparse_prefill`` over fp8 rows: q from ``quantize_q_opus_fp8`` or an
+    ``OpusPackedQ``, kv and extend_kv [R, 512] fp8 in the DMA layout (unit scale, fp8
+    RoPE in the last 64), and kv_rope / extend_kv_rope [R, 64] the same rows' bf16
+    RoPE. QK^T takes its RoPE from q_rope and the bf16 rows; P*V reads the fp8 rows
+    whole. At most 32 heads."""
     from aiter.ops.pa_sparse_prefill_opus import pa_sparse_prefill_fp8_opus
 
     assert q_nope.shape[1] <= 32, q_nope.shape
     indices, indptr = csr
     if extend_kv is None:
-        extend_kv = kv[:1]
+        extend_kv, extend_kv_rope = kv[:1], kv_rope[:1]
         extend_csr = (indices[:1], torch.zeros_like(indptr))
     extend_indices, extend_indptr = extend_csr
-    # The kernel takes QK's RoPE from the rows themselves; the bf16 RoPE operands are
-    # only shape-checked, so one zero row stands in for them. The two must share a row
-    # stride, which expand() leaves at 64 for a single row, hence as_strided.
-    rope_stub = q_rope.new_zeros((1, _D_ROPE))
     return pa_sparse_prefill_fp8_opus(
         q_nope,
         q_rope,
         kv,
-        rope_stub.as_strided((kv.shape[0], _D_ROPE), (0, 1)),
+        kv_rope,
         indices,
         indptr,
         extend_kv,
-        rope_stub.as_strided((extend_kv.shape[0], _D_ROPE), (0, 1)),
+        extend_kv_rope,
         extend_indices,
         extend_indptr,
         attn_sink,

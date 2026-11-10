@@ -222,6 +222,13 @@ def _mxfp8_shuffled_gemm_kernel(
     BLOCK_K: tl.constexpr,
     OUT_F32: tl.constexpr,
     K_TAIL: tl.constexpr,
+    # PACKED_Q: out_ptr / out_u8_ptr are the fp8 OPUS query's q_nope [M, H, 512] (fp8
+    # and its byte view) and rope_ptr its q_rope [M, H, 64] bf16, the output columns
+    # being H heads of 448 NoPE + 64 RoPE; see mxfp8_native_packed_q
+    out_u8_ptr=None,
+    rope_ptr=None,
+    stride_rm=0,
+    PACKED_Q: tl.constexpr = False,
 ):
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -275,16 +282,57 @@ def _mxfp8_shuffled_gemm_kernel(
         w_ptrs += S * 2048
         ws_ptrs += BLOCK_K // 32
 
-    o_ptrs = (
-        out_ptr
-        + pid_k.to(tl.int64) * M * N
-        + offs_m[:, None] * stride_om
-        + offs_n[None, :]
-    )
-    if OUT_F32:
-        tl.store(o_ptrs, acc, mask=m_mask[:, None] & n_mask[None, :])
+    if PACKED_Q:
+        # The bf16 output, then quantize_q_opus_fp8's MXFP8 1x32 on each head's 448
+        # NoPE columns (E8M0 bytes at 448..463, the two RoPE slots at 127) and the
+        # 64 RoPE columns as bf16. BLOCK_N is a multiple of 32 and 512 a multiple of
+        # 32, so no 32-column block straddles a head or the NoPE / RoPE boundary.
+        NB: tl.constexpr = BLOCK_N // 32
+        y = acc.to(tl.bfloat16)
+        yb = tl.reshape(y.to(tl.float32), (BLOCK_M, NB, 32))
+        amax = tl.max(tl.abs(yb), axis=2)
+        e = tl.ceil(tl.log2(tl.maximum(amax, 1e-30) / 448.0))
+        e = tl.where(amax == 0.0, 0.0, tl.clamp(e, -127.0, 127.0))
+        q8 = tl.reshape(
+            tl.clamp(yb * tl.exp2(-e)[:, :, None], -448.0, 448.0), (BLOCK_M, BLOCK_N)
+        )
+        row = offs_m.to(tl.int64)[:, None] * stride_om
+        head, d = offs_n // 512, offs_n % 512
+        nope = n_mask & (d < 448)
+        rope = n_mask & (d >= 448)
+        tl.store(
+            out_ptr + row + (head * 512 + d)[None, :],
+            q8.to(out_ptr.dtype.element_ty),
+            mask=m_mask[:, None] & nope[None, :],
+        )
+        blk_n = pid_n * BLOCK_N + tl.arange(0, NB) * 32
+        blk_head, blk_d = blk_n // 512, blk_n % 512
+        sval = tl.where((blk_d < 448)[None, :], e, 0.0) + 127.0
+        tl.store(
+            out_u8_ptr + row + (blk_head * 512 + 448 + blk_d // 32)[None, :],
+            sval.to(tl.uint8),
+            mask=m_mask[:, None] & (blk_n < N)[None, :],
+        )
+        tl.store(
+            rope_ptr
+            + offs_m.to(tl.int64)[:, None] * stride_rm
+            + (head * 64 + d - 448)[None, :],
+            y,
+            mask=m_mask[:, None] & rope[None, :],
+        )
     else:
-        tl.store(o_ptrs, acc.to(tl.bfloat16), mask=m_mask[:, None] & n_mask[None, :])
+        o_ptrs = (
+            out_ptr
+            + pid_k.to(tl.int64) * M * N
+            + offs_m[:, None] * stride_om
+            + offs_n[None, :]
+        )
+        if OUT_F32:
+            tl.store(o_ptrs, acc, mask=m_mask[:, None] & n_mask[None, :])
+        else:
+            tl.store(
+                o_ptrs, acc.to(tl.bfloat16), mask=m_mask[:, None] & n_mask[None, :]
+            )
 
 
 def _mxfp8_shuffled_gemm(
@@ -376,3 +424,65 @@ def mxfp8_native_blockscaled_linear(
     if output_dtype is not None and out.dtype != output_dtype:
         out = out.to(output_dtype)
     return out.view(*input.shape[:-1], n)
+
+
+def mxfp8_native_packed_q(
+    input: torch.Tensor,
+    weight_shuffled: torch.Tensor,
+    weight_scale_ue8m0: torch.Tensor,
+    input_scale: Optional[torch.Tensor] = None,
+) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    """mxfp8_native_blockscaled_linear of a query projection, its output [M, H * 512]
+    written as the fp8 OPUS kernel's query pair instead of bf16: q_nope [M, H, 512] fp8
+    (each head's 448 NoPE values as MXFP8 1x32, E8M0 at bytes 448..463, what
+    quantize_q_opus_fp8 writes for the bf16 output) and q_rope [M, H, 64] bf16, the
+    RoPE columns un-rotated. None where this shape runs the gemv or a split-K tile;
+    the caller then takes the bf16 output."""
+    input_2d = input.view(-1, input.shape[-1])
+    m, k = input_2d.shape
+    n = weight_shuffled.shape[0] * 16
+    assert n % 512 == 0, n
+    if m <= _GEMV_MAX_TOKENS:
+        return None
+    *tile, split_k = _large_m_tile(m, n, k)
+    bm, bn, bk, warps = tile
+    if split_k != 1 or bn % 32:
+        return None
+    if input_scale is not None:
+        assert input_2d.dtype == torch.float8_e4m3fn, input_2d.dtype
+        xq, xs = input_2d.contiguous(), input_scale
+    else:
+        xq, xs = fp8_grid_quantize(input_2d.to(torch.bfloat16).contiguous())
+    k_pad = weight_shuffled.shape[1] * _STEP_K
+    heads = n // 512
+    q_nope = torch.empty((m, heads, 512), dtype=torch.float8_e4m3fn, device=xq.device)
+    q_rope = torch.empty((m, heads, 64), dtype=torch.bfloat16, device=xq.device)
+    _mxfp8_shuffled_gemm_kernel[(triton.cdiv(m, bm), triton.cdiv(n, bn), 1)](
+        xq.view(torch.uint8),
+        xs,
+        weight_shuffled,
+        weight_scale_ue8m0,
+        q_nope,
+        m,
+        n,
+        k,
+        xq.stride(0),
+        xs.stride(0),
+        weight_scale_ue8m0.stride(0),
+        q_nope.stride(0),
+        k_pad,
+        k_pad,
+        BLOCK_M=bm,
+        BLOCK_N=bn,
+        BLOCK_K=bk,
+        OUT_F32=False,
+        K_TAIL=k != k_pad,
+        out_u8_ptr=q_nope.view(torch.uint8),
+        rope_ptr=q_rope,
+        stride_rm=q_rope.stride(0),
+        PACKED_Q=True,
+        num_warps=warps,
+        num_stages=2,
+    )
+    lead = input.shape[:-1]
+    return q_nope.view(*lead, heads, 512), q_rope.view(*lead, heads, 64)

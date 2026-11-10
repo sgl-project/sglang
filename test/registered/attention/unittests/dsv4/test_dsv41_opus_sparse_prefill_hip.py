@@ -16,7 +16,7 @@ SCALE = D**-0.5
 # about 3x the measured bf16 error of the kernel (~3e-3 of the output's max)
 TOL = 1e-2
 # the fp8 kernel against a reference over its own fp8 operands, so what is left is P's
-# fp8 rounding: about 2x the worst measured over three seeds (3.7e-2; bf16 is 4e-3)
+# fp8 rounding: about 2.5x the worst measured over three seeds (3.2e-2; bf16 is 4e-3)
 FP8_TOL = 8e-2
 
 
@@ -81,19 +81,21 @@ def _csr_reference(indices, lens, row_start, row_end):
 
 
 def _attention_reference(q, sources, sink):
-    """fp32 attention with sink: every query row over the union of its rows in each source."""
+    """fp32 attention with sink: every query row over the union of its rows in each
+    (keys, values, csr) source."""
     T, H, _ = q.shape
     out = torch.zeros(T, H, D, dtype=torch.float32, device=q.device)
     for t in range(T):
-        keys = []
-        for kv, (indices, indptr) in sources:
+        keys, values = [], []
+        for k_src, v_src, (indices, indptr) in sources:
             rows = indices[indptr[t] : indptr[t + 1]].long()
-            keys.append(kv[rows].float())
-        k = torch.cat(keys)
+            keys.append(k_src[rows].float())
+            values.append(v_src[rows].float())
+        k, v = torch.cat(keys), torch.cat(values)
         s = q[t].float() @ k.T * SCALE
         logits = torch.cat([s, sink[:, None].float()], dim=1)
         p = torch.softmax(logits, dim=1)[:, :-1]
-        out[t] = p @ k
+        out[t] = p @ v
     return out
 
 
@@ -136,7 +138,7 @@ class TestOpusSparsePrefill(CustomTestCase):
         swa_csr = combined_to_csr(swa_idx, swa_lens, 0, n_s)
         if not two_sources:
             out = opus_sparse_prefill(q, swa_kv, swa_csr, sink, SCALE)
-            ref = _attention_reference(q, [(swa_kv, swa_csr)], sink)
+            ref = _attention_reference(q, [(swa_kv, swa_kv, swa_csr)], sink)
         else:
             c_kv = (torch.randn(n_c, D, generator=gen, device="cuda") * 0.5).to(
                 torch.bfloat16
@@ -148,7 +150,9 @@ class TestOpusSparsePrefill(CustomTestCase):
             out = opus_sparse_prefill(
                 q, c_kv, c_csr, sink, SCALE, extend_kv=swa_kv, extend_csr=swa_csr
             )
-            ref = _attention_reference(q, [(c_kv, c_csr), (swa_kv, swa_csr)], sink)
+            ref = _attention_reference(
+                q, [(c_kv, c_kv, c_csr), (swa_kv, swa_kv, swa_csr)], sink
+            )
         err = (out.float() - ref).abs().max().item() / ref.abs().max().item()
         self.assertLess(err, TOL, (heads, two_sources, err))
 
@@ -195,9 +199,16 @@ class TestOpusSparsePrefillFp8(CustomTestCase):
         )
 
         def rows(n):
-            # the DMA layout: 512 unit-scale e4m3 values, RoPE in the last 64
+            """The DMA layout (512 unit-scale e4m3 values, RoPE in the last 64), a bf16
+            RoPE drawn apart from the rows' own, so only QK^T reading it and P*V
+            reading the rows matches the reference, and the keys QK^T sees."""
             x = torch.randn(n, D, generator=gen, device="cuda") * 0.5
-            return x.to(torch.float8_e4m3fn)
+            kv = x.to(torch.float8_e4m3fn)
+            rope = (torch.randn(n, 64, generator=gen, device="cuda") * 0.5).to(
+                torch.bfloat16
+            )
+            keys = torch.cat([kv[:, :448].float(), rope.float()], dim=-1)
+            return kv, rope, keys
 
         T, n_c, n_s = 48, 700, 300
         q = (torch.randn(T, heads, D, generator=gen, device="cuda") * 0.5).to(
@@ -205,19 +216,21 @@ class TestOpusSparsePrefillFp8(CustomTestCase):
         )
         sink = torch.randn(heads, generator=gen, device="cuda") * 0.5
         q_nope, q_rope = quantize_q_opus_fp8(q)
-        # what the kernel multiplies: the packed NoPE and its MXFP8 RoPE
-        q_ref = torch.cat([_decode_q_nope(q_nope), _mx_quant(q_rope)], dim=-1)
+        # what the kernel multiplies: the packed NoPE and the bf16 RoPE
+        q_ref = torch.cat([_decode_q_nope(q_nope), q_rope.float()], dim=-1)
 
-        swa_kv = rows(n_s)
+        swa_kv, swa_rope, swa_keys = rows(n_s)
         swa_idx, swa_lens = _padded_lists(T, 128, n_s, gen)
         swa_idx[:, 0] = torch.arange(T, device="cuda", dtype=torch.int32) % n_s
         swa_lens = swa_lens.clamp(min=1)
         swa_csr = combined_to_csr(swa_idx, swa_lens, 0, n_s)
         if not two_sources:
-            out = opus_sparse_prefill_fp8(q_nope, q_rope, swa_kv, swa_csr, sink, SCALE)
-            ref = _attention_reference(q_ref, [(swa_kv, swa_csr)], sink)
+            out = opus_sparse_prefill_fp8(
+                q_nope, q_rope, swa_kv, swa_rope, swa_csr, sink, SCALE
+            )
+            ref = _attention_reference(q_ref, [(swa_keys, swa_kv, swa_csr)], sink)
         else:
-            c_kv = rows(n_c)
+            c_kv, c_rope, c_keys = rows(n_c)
             c_idx, c_lens = _padded_lists(T, 512, n_c, gen)
             c_lens[0] = 0
             c_csr = combined_to_csr(c_idx, c_lens, 0, n_c)
@@ -225,13 +238,17 @@ class TestOpusSparsePrefillFp8(CustomTestCase):
                 q_nope,
                 q_rope,
                 c_kv,
+                c_rope,
                 c_csr,
                 sink,
                 SCALE,
                 extend_kv=swa_kv,
+                extend_kv_rope=swa_rope,
                 extend_csr=swa_csr,
             )
-            ref = _attention_reference(q_ref, [(c_kv, c_csr), (swa_kv, swa_csr)], sink)
+            ref = _attention_reference(
+                q_ref, [(c_keys, c_kv, c_csr), (swa_keys, swa_kv, swa_csr)], sink
+            )
         err = (out.float() - ref).abs().max().item() / ref.abs().max().item()
         self.assertLess(err, FP8_TOL, (heads, two_sources, err))
 
@@ -280,9 +297,12 @@ class TestOpusFp8OverV4Cache(CustomTestCase):
         bf16_rows = dequantize_k_cache_paged_dsv4(
             cache, token_ids, page_size=page, layout=KVLayout.V4
         ).view(n, D)
+        rope_rows = torch.empty(n, 64, dtype=torch.bfloat16, device="cuda")
         fp8_rows = gather_dequant_requant_fp8_paged_dsv4(
-            cache, token_ids, page_size=page
+            cache, token_ids, page_size=page, rope_out=rope_rows
         ).view(n, D)
+        # the RoPE the cache holds, untouched
+        self.assertTrue(torch.equal(rope_rows, bf16_rows[:, 448:]))
 
         q = (torch.randn(T, heads, D, generator=gen, device="cuda") * 0.5).to(
             torch.bfloat16
@@ -292,15 +312,17 @@ class TestOpusFp8OverV4Cache(CustomTestCase):
         idx[:, 0] = torch.arange(T, device="cuda", dtype=torch.int32) % n
         csr = combined_to_csr(idx, lens.clamp(min=1), 0, n)
 
-        ref = _attention_reference(q, [(bf16_rows, csr)], sink)
+        ref = _attention_reference(q, [(bf16_rows, bf16_rows, csr)], sink)
         out_bf16 = opus_sparse_prefill(q, bf16_rows, csr, sink, SCALE)
         q_nope, q_rope = quantize_q_opus_fp8(q)
-        out_fp8 = opus_sparse_prefill_fp8(q_nope, q_rope, fp8_rows, csr, sink, SCALE)
+        out_fp8 = opus_sparse_prefill_fp8(
+            q_nope, q_rope, fp8_rows, rope_rows, csr, sink, SCALE
+        )
         scale = ref.abs().max().item()
         err_bf16 = (out_bf16.float() - ref).abs().max().item() / scale
         err_fp8 = (out_fp8.float() - ref).abs().max().item() / scale
         self.assertLess(err_bf16, TOL, err_bf16)
-        # here Q and the RoPE slice are quantized too, on top of P
+        # here Q's NoPE and V's RoPE slice are quantized too, on top of P
         self.assertLess(err_fp8, FP8_TOL, err_fp8)
 
 
