@@ -226,7 +226,9 @@ class TestNPUGLM5_3_W8A8_2P2D_32P_In128k_Out1k_Prefix90_20msPass1(
     def test_npu_glm_5_3_w8a8_2p2d_32p_in128k_out1k_prefix90_20ms_pass1(self):
         """Run pass-1 throughput and record the baseline metrics."""
         self.run_throughput()
-        record_pass1(CASE_ID, self.last_metrics)
+        # run_throughput is role-gated, so only the router pod has last_metrics.
+        if self.role == "router":
+            record_pass1(CASE_ID, self.last_metrics)
 
 
 class TestNPUGLM5_3_W8A8_2P2D_32P_In128k_Out1k_Prefix90_20msPass2(
@@ -239,7 +241,9 @@ class TestNPUGLM5_3_W8A8_2P2D_32P_In128k_Out1k_Prefix90_20msPass2(
     def test_npu_glm_5_3_w8a8_2p2d_32p_in128k_out1k_prefix90_20ms_pass2(self):
         """Run pass-2 throughput and assert no regression vs pass 1."""
         self.run_throughput()
-        assert_no_regression(self, CASE_ID, self.last_metrics)
+        # run_throughput is role-gated, so only the router pod has last_metrics.
+        if self.role == "router":
+            assert_no_regression(self, CASE_ID, self.last_metrics)
 
 
 if __name__ == "__main__":
