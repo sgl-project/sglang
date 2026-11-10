@@ -1,9 +1,7 @@
-"""Dispatch, head padding and capability fallback for sparse FlashMLA prefill."""
+"""Dispatch, head padding and configuration guards for sparse FlashMLA prefill."""
 
-import sys
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
 
 import torch
 
@@ -92,58 +90,24 @@ class TestFlashMLASparseHeadPadding(CustomTestCase):
         self.assertEqual(self.run_case(8, allow_small_heads=False), ["native"])
         self.assertEqual(self.run_case(8, kv_dtype=torch.float16), ["native"])
 
-    def test_startup_capability_fallback_and_configuration(self):
+    def test_startup_configuration(self):
         from sglang.srt.layers.attention.dsa_backend import _small_heads_prefill_enabled
 
-        probe = Mock(return_value=False)
-        module = SimpleNamespace(has_small_heads_prefill=probe)
-        with (
-            patch.dict(
-                sys.modules,
-                {
-                    "sglang.kernels.ops.attention.flash_mla_interface": module,
-                },
-            ),
-            patch(
-                "sglang.srt.layers.attention.dsa_backend.print_warning_once"
-            ) as warning,
-        ):
-            args = [10, torch.bfloat16, 8, 512, 64, "flashmla_sparse"]
-            self.assertFalse(_small_heads_prefill_enabled(*args))
-            warning.assert_called_once()
-            probe.return_value = True
-            self.assertTrue(_small_heads_prefill_enabled(*args))
-            args[-1] = "flashmla_auto"
-            self.assertTrue(_small_heads_prefill_enabled(*args))
-            for index, value in [
-                (0, 9),
-                (1, torch.float16),
-                (2, 64),
-                (3, 256),
-                (4, 128),
-                (5, "trtllm"),
-            ]:
-                invalid = list(args)
-                invalid[index] = value
-                probe.reset_mock()
-                self.assertFalse(_small_heads_prefill_enabled(*invalid))
-                probe.assert_not_called()
-
-    def test_public_probe_handles_old_and_mismatched_wheels(self):
-        from sglang.kernels.ops.attention import flash_mla_interface as interface
-
-        with patch.object(interface, "flash_mla", SimpleNamespace()):
-            self.assertFalse(interface.has_small_heads_prefill())
-        for result in (False, True):
-            module = SimpleNamespace(
-                has_small_heads_prefill=lambda: result,
-                flash_mla_sparse_fwd_small_heads=lambda: None,
-            )
-            with patch.object(interface, "flash_mla", module):
-                self.assertEqual(interface.has_small_heads_prefill(), result)
-        module.has_small_heads_prefill = Mock(side_effect=RuntimeError("ABI mismatch"))
-        with patch.object(interface, "flash_mla", module):
-            self.assertFalse(interface.has_small_heads_prefill())
+        args = [10, torch.bfloat16, 8, 512, 64, "flashmla_sparse"]
+        self.assertTrue(_small_heads_prefill_enabled(*args))
+        args[-1] = "flashmla_auto"
+        self.assertTrue(_small_heads_prefill_enabled(*args))
+        for index, value in [
+            (0, 9),
+            (1, torch.float16),
+            (2, 64),
+            (3, 256),
+            (4, 128),
+            (5, "trtllm"),
+        ]:
+            invalid = list(args)
+            invalid[index] = value
+            self.assertFalse(_small_heads_prefill_enabled(*invalid))
 
 
 if __name__ == "__main__":

@@ -511,24 +511,14 @@ def _small_heads_prefill_enabled(
     qk_rope_head_dim,
     prefill_impl,
 ) -> bool:
-    if not (
+    return (
         device_sm_major == 10
         and kv_cache_dtype == torch.bfloat16
         and 0 < num_heads <= 32
         and kv_lora_rank == 512
         and kv_lora_rank + qk_rope_head_dim in (512, 576)
         and prefill_impl in ("flashmla_sparse", "flashmla_auto")
-    ):
-        return False
-    from sglang.kernels.ops.attention.flash_mla_interface import has_small_heads_prefill
-
-    if not has_small_heads_prefill():
-        print_warning_once(
-            "FlashMLA small-head prefill is unavailable; using native sparse prefill. "
-            "Install a FlashMLA build with has_small_heads_prefill support to enable it."
-        )
-        return False
-    return True
+    )
 
 
 def _validate_flashmla_sparse_q8_backend(
