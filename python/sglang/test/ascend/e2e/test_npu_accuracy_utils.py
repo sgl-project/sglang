@@ -20,7 +20,6 @@ from sglang.test.ascend.e2e.test_npu_multi_node_utils import (
     launch_pd_mix_node,
     launch_pd_separation_node,
     launch_router,
-    resolve_meta_service_config,
     start_meta_service,
     wait_server_ready,
 )
@@ -707,12 +706,11 @@ class TestNpuAccuracyMultiNodePdSepTestCaseBase(CustomTestCase):
         # starts, so bring up the MetaService first (prefill node only). A
         # multi-pod prefill instance hosts it on its master pod, which every
         # pod of the instance has to target.
-        cls.meta_service_config = resolve_meta_service_config(
+        cls.meta_service_process = start_meta_service(
             cls.meta_service_config,
-            (cls.model_config or {}).get("prefill_args", []),
             cls.role,
+            (cls.model_config or {}).get("prefill_args"),
         )
-        cls.meta_service_process = start_meta_service(cls.meta_service_config, cls.role)
         cls.start_pd_server()
         cls.start_router_server()
 

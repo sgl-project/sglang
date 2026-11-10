@@ -951,15 +951,20 @@ def launch_router(model_config):
         raise RuntimeError(f"Failed to start router process: {e}")
 
 
-def start_meta_service(meta_service_config, role):
+def start_meta_service(meta_service_config, role, prefill_args=None):
     """Start the npu_memcache MetaService before the model server.
 
     The L3 npu_memcache backend connects to the Ascend MemCache MetaService
     at startup, so it must already be listening. In PD separation only the
-    prefill node enables the L3 backend.
+    prefill node enables the L3 backend. On a multi-pod prefill instance the
+    endpoints are retargeted at the instance master (see
+    ``resolve_meta_service_config``), which is also the only pod hosting it.
 
     Returns the MetaService process, or None when this pod does not host it.
     """
+    meta_service_config = resolve_meta_service_config(
+        meta_service_config, prefill_args or [], role
+    )
     if not meta_service_config or role != "prefill":
         return None
 
