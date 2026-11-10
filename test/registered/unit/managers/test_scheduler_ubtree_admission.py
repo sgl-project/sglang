@@ -54,7 +54,8 @@ class TestSchedulerUBTreeAdmission(CustomTestCase):
         scheduler.init_req_max_new_tokens = lambda req: None
         scheduler.max_req_input_len = 128
         scheduler.tree_cache = SimpleNamespace(
-            cache_controller=SimpleNamespace(pp_prefetch_command_group=None)
+            cache_controller=SimpleNamespace(pp_prefetch_command_group=None),
+            finish=Mock(),
         )
         scheduler.grammar_manager = SimpleNamespace(
             process_req_with_grammar=Mock(return_value=False)
@@ -63,6 +64,10 @@ class TestSchedulerUBTreeAdmission(CustomTestCase):
         scheduler.rust_server = None
         scheduler.output_streamer = Mock()
         scheduler.invariant_checker = Mock()
+        scheduler.beam_coordinator = Mock()
+        scheduler.hisparse_coordinator = None
+        scheduler.uocr_runtime = None
+        scheduler.init_request_retirer()
         scheduler._add_request_to_queue = Mock()
 
         with (

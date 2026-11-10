@@ -3434,16 +3434,17 @@ class Scheduler(
             if self.spec_algorithm.is_ubtree():
                 error_msg = validate_ubtree_request(req)
                 if error_msg is not None:
-                    abort_req = make_abort_req(
+                    finished_reason = {
+                        "type": "abort",
+                        "status_code": HTTPStatus.BAD_REQUEST,
+                        "message": error_msg,
+                    }
+                    req.time_stats.trace_ctx.abort(abort_info=finished_reason)
+                    self.request_retirer.abort(
                         req,
-                        finished_reason={
-                            "type": "abort",
-                            "status_code": HTTPStatus.BAD_REQUEST,
-                            "message": error_msg,
-                        },
+                        reason=FINISH_ABORT(error_msg, HTTPStatus.BAD_REQUEST),
+                        finished_reason=finished_reason,
                     )
-                    req.time_stats.trace_ctx.abort(abort_info=abort_req.finished_reason)
-                    self.send_abort_output(abort_req, req)
                     return
             else:
                 error_msg = validate_dflash_request(req, self.enable_overlap)
