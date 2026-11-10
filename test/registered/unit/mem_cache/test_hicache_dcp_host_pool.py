@@ -636,6 +636,7 @@ class TestDcpL3PoolCheck(CustomTestCase):
             (PoolName.KV, anchor),
             (PoolName.MAMBA, MambaPoolHost.__new__(MambaPoolHost)),
             (PoolName.INDEXER, _make_indexer_host(anchor)),
+            (PoolName.INDEXER_SCALE, _make_indexer_host(anchor)),
             (PoolName.DRAFT, _make_host_pool(1, dcp_size=2, layout="page_first")),
         ):
             with self.subTest(name=name, pool=type(pool).__name__):
@@ -650,6 +651,7 @@ class TestDcpL3PoolCheck(CustomTestCase):
         replicated_draft = _make_host_pool(0, dcp_size=1, layout="page_first")
         for label, name, pool, shards in (
             ("replicated index-K", PoolName.INDEXER, indexer, False),
+            ("replicated index-K exponents", PoolName.INDEXER_SCALE, indexer, False),
             ("indexer size", PoolName.INDEXER, resized, True),
             ("draft indexer", PoolName.DRAFT_INDEXER, indexer, True),
             ("dummy draft", PoolName.DRAFT, dummy_draft, True),
