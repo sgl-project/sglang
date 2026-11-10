@@ -14,7 +14,33 @@ class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
             req.sampling_params.min_new_tokens > 0 for req in self.orchestrator.reqs()
         )
 
+    @staticmethod
+    def _stop_token_ids(req) -> set:
+        ids = (req.sampling_params.stop_token_ids or set()) | (
+            req.eos_token_ids or set()
+        )
+        tok = req.tokenizer
+        if tok is not None:
+            ids |= tok.additional_stop_token_ids or set()
+            if tok.eos_token_id is not None:
+                ids.add(tok.eos_token_id)
+        return ids
+
     def _prepare(self):
+        if not self.orchestrator.reqs():
+            self.min_new_tokens = torch.zeros(
+                (0, 1), dtype=torch.int32, device=self.orchestrator.device
+            )
+            self.stop_token_penalties = torch.zeros(
+                (0, self.orchestrator.vocab_size),
+                dtype=torch.float32,
+                device=self.orchestrator.device,
+            )
+            self.len_output_tokens = torch.zeros(
+                (0, 1), dtype=torch.int32, device=self.orchestrator.device
+            )
+            return
+
         pin_memory = is_pin_memory_available(self.orchestrator.device)
         self.min_new_tokens = (
             torch.tensor(
@@ -35,14 +61,8 @@ class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
                     data=[
                         token_id
                         for token_id in (
-                            (req.sampling_params.stop_token_ids or set())
-                            | (req.eos_token_ids or set())
-                            | (req.tokenizer.additional_stop_token_ids or set())
-                            | (
-                                {req.tokenizer.eos_token_id}
-                                if req.tokenizer.eos_token_id is not None
-                                else set()
-                            )
+                            # Collect stop/eos token IDs even when req.tokenizer is None
+                            self._stop_token_ids(req)
                         )
                         if token_id is not None
                     ],
