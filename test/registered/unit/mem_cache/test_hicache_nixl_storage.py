@@ -1243,9 +1243,7 @@ class TestDocaMemosNixl(unittest.TestCase):
             envs.SGLANG_HUGEPAGE_SIZE.override("2MB"),
         ):
             selector.create_backend(agent)
-        agent.create_backend.assert_called_once_with(
-            "DOCA_MEMOS", {"query_mem_mode": "actual"}
-        )
+        agent.create_backend.assert_called_once_with("DOCA_MEMOS", {})
 
 
 if __name__ == "__main__":

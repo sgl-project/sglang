@@ -192,13 +192,6 @@ class NixlBackendSelection:
                 if self.nixlconfig
                 else {}
             )
-            if self.backend_name == "DOCA_MEMOS":
-                # Pre-upstream fork plugins default to assume-success existence
-                # checks; HiCache requires real ones. Upstream nixl (#1717)
-                # always issues a real EXIST per descriptor and ignores this
-                # parameter, so keep setting it for the fork at no cost.
-                initparams.setdefault("query_mem_mode", "actual")
-
             # Create backend and set memory type (S3 OBJ requires a bucket; DOCA_MEMOS does not)
             if self.backend_name == "OBJ" and "bucket" not in initparams:
                 bucket = os.environ.get("AWS_DEFAULT_BUCKET")
