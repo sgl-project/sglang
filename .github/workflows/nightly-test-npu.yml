@@ -35,6 +35,15 @@ on:
         required: false
         type: string
         default: 'true'
+      accuracy_dataset:
+        description: 'Force the dataset of multi-node accuracy cases. "auto" keeps the weekday rule (gsm8k Mon-Fri, gpqa_diamond on weekends).'
+        required: false
+        type: choice
+        options:
+          - auto
+          - gsm8k
+          - gpqa_diamond
+        default: 'auto'
   workflow_call:
     inputs:
       ref:
@@ -59,6 +68,11 @@ on:
         default: ''
       skip_install_flag:
         description: 'Indicates whether to skip the installation of sglang, defaulting to false.'
+        required: false
+        type: string
+        default: ''
+      accuracy_dataset:
+        description: 'Force the dataset of multi-node accuracy cases (gsm8k/gpqa_diamond). Empty or "auto" keeps the weekday rule.'
         required: false
         type: string
         default: ''
@@ -123,15 +137,28 @@ jobs:
           RUN_START_METADATA="$(python3 -c "import json,sys; print(json.dumps({'branch_label':sys.argv[1],'workflow_name':sys.argv[2],'create_time':sys.argv[3]}))" "$BRANCH_LABEL" "${{ github.workflow }}" "$(date -u -d '+8 hours' +%Y%m%d-%H%M)")"
           # Write to GITHUB_OUTPUT and print to the log in one command.
           echo "run_start_metadata=${RUN_START_METADATA}" | tee -a $GITHUB_OUTPUT
-          # Multi-node accuracy cases run gsm8k (200-sample cap) on weekdays and
-          # gpqa_diamond on weekends. The cron fires at 16:00 UTC, i.e. 00:00 the
-          # next day in Beijing, so resolve the weekday in Asia/Shanghai.
-          ACCURACY_DOW="$(TZ=Asia/Shanghai date +%u)"
-          if [ "${ACCURACY_DOW}" -le 5 ]; then
-            ACCURACY_DATASET="gsm8k"
-          else
-            ACCURACY_DATASET="gpqa_diamond"
-          fi
+          # Multi-node accuracy dataset: an explicit input wins; otherwise gsm8k
+          # (200-sample cap) on weekdays and gpqa_diamond on weekends. The cron
+          # fires at 16:00 UTC, i.e. 00:00 the next day in Beijing, so resolve
+          # the weekday in Asia/Shanghai.
+          ACCURACY_DATASET_INPUT="${{ inputs.accuracy_dataset }}"
+          case "${ACCURACY_DATASET_INPUT}" in
+            gsm8k|gpqa_diamond)
+              ACCURACY_DATASET="${ACCURACY_DATASET_INPUT}"
+              ;;
+            ""|auto)
+              ACCURACY_DOW="$(TZ=Asia/Shanghai date +%u)"
+              if [ "${ACCURACY_DOW}" -le 5 ]; then
+                ACCURACY_DATASET="gsm8k"
+              else
+                ACCURACY_DATASET="gpqa_diamond"
+              fi
+              ;;
+            *)
+              echo "Unsupported accuracy_dataset: ${ACCURACY_DATASET_INPUT}"
+              exit 1
+              ;;
+          esac
           echo "accuracy_dataset=${ACCURACY_DATASET}" | tee -a $GITHUB_OUTPUT
 
   nightly-1-npu-a3:
