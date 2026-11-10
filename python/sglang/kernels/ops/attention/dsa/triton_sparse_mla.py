@@ -31,6 +31,9 @@ _PREFERRED_BLOCK_K = 64
 _MIN_BLOCK_K = 16
 _INDEX_ELEMENT_SIZE = 4
 _I32_MAX = (1 << 31) - 1
+# Measured on MI355X, 64 heads, topk 2048: the decode plan with more splits (1-14 rows)
+# ran 1.05-2.5x slower than the BLOCK_H=16 path; at 16 splits it is at parity.
+_DECODE_MAX_SPLITS = 16
 
 _SUPPORTED_INPUT_DTYPES = (
     torch.bfloat16,
@@ -396,14 +399,15 @@ def _decode_splitk_splits(seq: int, topk: int, block_k: int, num_cu: int) -> int
 
     Returns ``None`` when fewer than two splits are available: at ``kv_splits ==
     1`` the split-K launcher falls through to the fused kernel, and fused at
-    BLOCK_H == H measured 28 % slower than today's geometry.
+    BLOCK_H == H measured 28 % slower than today's geometry. Also ``None`` above
+    ``_DECODE_MAX_SPLITS``: at those few rows the BLOCK_H=16 path is faster.
     """
     splits = min(
         num_cu // max(seq, 1),
         (topk + block_k - 1) // block_k,
         max(1, topk // _PREFERRED_BLOCK_K),
     )
-    return splits if splits >= 2 else None
+    return splits if 2 <= splits <= _DECODE_MAX_SPLITS else None
 
 
 def _gfx950_sparse_mla_num_warps(

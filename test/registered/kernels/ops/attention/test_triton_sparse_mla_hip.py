@@ -12,6 +12,7 @@ from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
     _IS_FNUZ,
     _cu_count,
     _cu_count_for_device,
+    _decode_splitk_splits,
     _is_gfx950_sparse_mla_fp8,
     _page_offsets_fit_i32,
     _reduce_d_chunk,
@@ -176,6 +177,14 @@ def test_gfx950_fp8_64h_decode_plan_matches_reference(seq, tail_invalid):
     q = torch.cat([q_nope, q_rope], dim=-1)
     ref, _ = _sparse_mla_reference(q, kv, indices[:, 0], sm_scale, value_dim)
     assert _snr_db(ref, out.reshape(ref.shape)) > 35.0
+
+
+def test_decode_plan_leaves_few_rows_to_the_block_h16_path():
+    """At 1-15 rows on 256 CUs the decode plan would need more than 16 splits,
+    where it measured slower than the BLOCK_H=16 path."""
+    assert _decode_splitk_splits(6, 2048, 64, 256) is None
+    assert _decode_splitk_splits(16, 2048, 64, 256) == 16
+    assert _decode_splitk_splits(60, 2048, 64, 256) == 4
 
 
 @pytest.mark.parametrize("active_splits", [2, 4])
