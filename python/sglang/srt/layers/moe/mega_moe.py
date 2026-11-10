@@ -52,9 +52,8 @@ _is_hip = is_hip()
 
 
 def _use_amd_flydsl_mega_moe() -> bool:
-    # aiter MegaMoEv2 exists only on ROCm; the platform check keeps the env from
-    # diverting a CUDA run into a path whose kernels it does not have.
-    return _is_hip and envs.SGLANG_AMD_USE_FLYDSL_MEGA_MOE.get()
+    # DeepGEMM MegaMoE has no ROCm kernels: megamoe on ROCm is aiter MegaMoEv2.
+    return _is_hip and get_moe_a2a_backend().is_megamoe()
 
 
 def _mega_moe_mma_type(experts) -> str:
@@ -109,10 +108,12 @@ def check_mega_moe_shapes(hidden: int, intermediate: int, mma_type: str) -> None
     # SGLang's pre-dispatch requires 16-byte input SF rows (hidden % 512).
     # The pinned DeepGEMM FP8/FP4 path copies intermediate scales separately
     # from token TMA loads, so intermediate % 128 suffices, including V4.1
-    # Flash's 2304-wide intermediate dimension.
+    # Flash's 2304-wide intermediate dimension. The MXFP4 path writes and loads
+    # the intermediate SFs MN-major (token-contiguous) as well, so it needs the
+    # same 128 only.
     # Keep the existing restrictions on the other MMA paths.
     scale_group = 16 if mma_type == "nvfp4xnvfp4" else 32
-    align = 128 if mma_type in ("fp8xfp4", "fp8xfp8") else 16 * scale_group
+    align = 128 if mma_type in ("fp8xfp4", "fp8xfp8", "mxf4xmxf4") else 16 * scale_group
     hidden_align = 16 * scale_group
     if hidden % hidden_align != 0 or intermediate % align != 0:
         raise ValueError(
@@ -212,8 +213,7 @@ def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool
 def should_fuse_mega_moe_shared_experts(moe: DeepseekV2MoE) -> bool:
     # DeepGEMM's in-kernel shared expert takes FP8 weights on SM100 fp8xfp4 only.
     return (
-        envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_FUSE_SHARED_EXPERTS.get()
-        and get_moe_a2a_backend().is_megamoe()
+        get_moe_a2a_backend().is_megamoe()
         and getattr(moe.experts, "_mega_moe_weights_built", False)
         and is_sm100_supported()
         and _mega_moe_mma_type(moe.experts) == "fp8xfp4"

@@ -7,7 +7,6 @@ import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
-    EvictParams,
     IncLockRefResult,
     InsertResult,
     MatchPrefixParams,
@@ -18,6 +17,8 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PoolTransferResult,
 )
+from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
+from sglang.srt.mem_cache.kv.plan import TREE_TOKEN
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeComponentDeviceSlot,
     UpdatePendingBackupOnNodeSplit,
@@ -45,6 +46,7 @@ if TYPE_CHECKING:
 
 class FullComponent(TreeComponent):
     component_type = ComponentType.FULL
+    family = TREE_TOKEN
 
     def __init__(self, cache, params, slot):
         super().__init__(cache, params, slot)
@@ -502,9 +504,8 @@ class FullComponent(TreeComponent):
         if phase == LinkerTransferPhase.LOAD:
             storage, sub_pool = self.storage_and_sub_pool()
             num_tokens = len(keys) * self.cache.page_size
-            shortfall = max(0, num_tokens - storage.available_units(sub_pool))
-            if shortfall:
-                self.cache.evict(EvictParams(num_tokens=shortfall))
+            if storage.available_units(sub_pool) < num_tokens:
+                self.cache.evict_for_alloc(KVDemand(full_tokens=num_tokens))
             slots = storage.take_units(sub_pool, num_tokens)
             if slots is None:
                 return None

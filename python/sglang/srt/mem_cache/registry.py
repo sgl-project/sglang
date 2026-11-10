@@ -115,7 +115,7 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
         # A pure-window model keeps no full-attention prefix in LMCache.
         params.tree_slots = tuple(
             slot
-            for slot in storage.tree_slots(window_reaches=params.draft_window_reaches)
+            for slot in storage.tree_slots()
             if not (is_pure_swa and slot.family == TREE_TOKEN)
         )
         return LMCacheUnifiedRadixCache(
@@ -191,7 +191,7 @@ def create_unified_radix_cache(
         allocator,
         shape=_static_tree_shape(ctx, allocator),
     )
-    tree_slots = list(storage.tree_slots(window_reaches=params.draft_window_reaches))
+    tree_slots = list(storage.tree_slots())
 
     if hasattr(params.req_to_token_pool, "req_to_c128_sidecar"):
         from sglang.srt.hardware_backend.npu.dsv4.c128_sidecar_component import (
