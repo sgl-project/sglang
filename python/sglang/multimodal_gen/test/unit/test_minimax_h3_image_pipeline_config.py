@@ -32,6 +32,15 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 
+@pytest.fixture(autouse=True)
+def cpu_config_policy(monkeypatch):
+    # These admission tests must not inherit the test runner's GB10 memory policy.
+    monkeypatch.setattr(
+        "sglang.multimodal_gen.configs.pipeline_configs.minimax_h3_image.current_platform",
+        SimpleNamespace(is_cuda=lambda: False),
+    )
+
+
 def normalized_args(**overrides):
     # ServerArgs dataclass defaults without __post_init__ (no model load, no GPU
     # probe), then the sglang backend, the image pipeline config and every

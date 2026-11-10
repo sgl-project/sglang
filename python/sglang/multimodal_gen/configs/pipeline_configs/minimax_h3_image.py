@@ -239,8 +239,7 @@ class MiniMaxH3ImagePipelineConfig(MiniMaxH3PipelineConfig):
             if type(value) is not int or value != 1:
                 raise ValueError(f"MiniMax H3 image requires {name}=1")
         # tp_size and ulysses_degree * ring_degree stay with the DiT's own
-        # head/alignment admission checks; ring already has the FA it needs
-        # because the image release forces FlashAttention below.
+        # head/alignment admission checks; Ring's FA requirement is checked above.
         if server_args.kv_gather_degree > 1 and not server_args.sp_split_auto:
             # The auto-assigned sp_degree=2 alias is fine: the H3 DiT exchanges
             # sequence shards with its own Ulysses all-to-all and never takes
