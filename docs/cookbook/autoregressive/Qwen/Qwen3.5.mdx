@@ -1010,7 +1010,7 @@ SGLANG_USE_CUDA_IPC_TRANSPORT=1 python -m sglang.launch_server \
 #### 5.2.1 Latency Benchmark
 
 ```bash Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --model Qwen/Qwen3.5-397B-A17B \
   --dataset-name random \
@@ -1065,7 +1065,7 @@ Max ITL (ms):                            58.03
 #### 5.2.2 Throughput Benchmark
 
 ```bash Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --model Qwen/Qwen3.5-397B-A17B \
   --dataset-name random \
@@ -1124,7 +1124,7 @@ We use SGLang's built-in benchmarking tool to conduct performance evaluation wit
 #### 5.3.1 Latency Benchmark
 
 ```bash Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang-oai-chat \
   --host 127.0.0.1 \
   --port 30000 \
@@ -1146,7 +1146,7 @@ TODO
 #### 5.3.2 Throughput Benchmark
 
 ```bash Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang-oai-chat \
   --host 127.0.0.1 \
   --port 30000 \

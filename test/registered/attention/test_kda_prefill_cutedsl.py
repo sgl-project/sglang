@@ -221,7 +221,10 @@ def test_kda_chunk_cutedsl_realistic_gate():
 
 
 @pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
-def test_kda_chunk_cutedsl_pool_mode_matches_dense(state_dtype: torch.dtype):
+@pytest.mark.parametrize("replay_entry", [False, True])
+def test_kda_chunk_cutedsl_pool_mode_matches_dense(
+    state_dtype: torch.dtype, replay_entry: bool
+):
     """Pool mode (h0_indices) must reproduce the dense gather/scatter path
     bit-for-bit: same o, same final-state rows written in place at the indexed
     pool slots, and every other pool row untouched."""
@@ -256,6 +259,55 @@ def test_kda_chunk_cutedsl_pool_mode_matches_dense(state_dtype: torch.dtype):
     pool = (
         torch.randn(num_slots, num_heads, head_dim, head_dim, device="cuda") * 0.05
     ).to(state_dtype)
+    other_parts = {}
+    if replay_entry:
+        from sglang.srt.mem_cache.kv.decl import (
+            StateGeometry,
+            StateReplay,
+            with_state_replay,
+        )
+        from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
+
+        geometry = with_state_replay(
+            StateGeometry(
+                conv_state_shapes=((3, 3072),),
+                conv_dtype=torch.bfloat16,
+                temporal_state_shape=(num_heads, head_dim, head_dim),
+                temporal_dtype=state_dtype,
+            ),
+            StateReplay(
+                decode=True,
+                speculative=False,
+                is_kda=True,
+                cache_len=16,
+                key_heads=num_heads,
+            ),
+            layer_ids=(0, 1),
+            speculative_num_draft_tokens=None,
+        )
+        spec = MambaSubPoolSpec(
+            name="mamba",
+            layer_num=2,
+            grow_direction="down",
+            conv_state_shapes=geometry.conv_state_shapes,
+            conv_dtype=geometry.conv_dtype,
+            temporal_state_shape=geometry.temporal_state_shape,
+            temporal_dtype=geometry.temporal_dtype,
+            extra_parts=geometry.extra_parts,
+            replay=geometry.replay,
+        )
+        raw = torch.zeros(
+            num_slots * spec.entry_bytes(), dtype=torch.uint8, device="cuda"
+        )
+        parts = spec.entry_layout().views(raw, num_slots)
+        parts["temporal"][1].copy_(pool)
+        pool = parts["temporal"][1]
+        other_parts = {
+            name: value for name, value in parts.items() if name != "temporal"
+        }
+        other_parts["other_layer"] = parts["temporal"][0]
+        assert pool.stride(0) * pool.element_size() == spec.entry_bytes()
+        assert pool.stride(0) % 16 == 0
     slots = torch.randperm(num_slots, device="cuda")[:num_seqs].to(torch.int32)
     pool[slots.long()] = h0_dense
     pool_before = pool.clone()
@@ -291,6 +343,8 @@ def test_kda_chunk_cutedsl_pool_mode_matches_dense(state_dtype: torch.dtype):
     untouched = torch.ones(num_slots, dtype=torch.bool, device="cuda")
     untouched[slots.long()] = False
     assert torch.equal(pool[untouched], pool_before[untouched])
+    for value in other_parts.values():
+        assert torch.count_nonzero(value) == 0
 
 
 if __name__ == "__main__":

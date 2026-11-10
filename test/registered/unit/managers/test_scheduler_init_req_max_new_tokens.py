@@ -9,6 +9,7 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
+from sglang.srt.mem_cache.kv.alloc.demand import WindowRetirement
 from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.model_runner import ModelRunner
@@ -18,6 +19,17 @@ from sglang.test.test_utils import CustomTestCase
 from sglang.test.unified_allocator_fixtures import build_test_unified_pools
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+
+def setUpModule():
+    # Window rows retire at once here; the scheduler's window retirement is
+    # priced in test_request_demand.py.
+    patcher = patch(
+        "sglang.srt.managers.scheduler.window_retirement",
+        return_value=WindowRetirement(0, 0, 1),
+    )
+    patcher.start()
+    unittest.addModuleCleanup(patcher.stop)
 
 
 class TestSchedulerInitReqMaxNewTokens(CustomTestCase):
@@ -69,6 +81,11 @@ class TestSchedulerInitReqMaxNewTokens(CustomTestCase):
         scheduler.max_new_tokens_limit = envs.SGLANG_MAX_NEW_TOKENS_LIMIT.get()
         scheduler.sliding_window_size = None
         scheduler.chunked_prefill_size = None
+        scheduler.tree_cache = SimpleNamespace(
+            supports_prefix_sharing=lambda: True,
+            window_checkpoint_interval=lambda: 0,
+            transfers_in_flight=lambda: False,
+        )
         scheduler.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
             size=max_total_num_tokens,
             dtype=torch.int64,
@@ -259,7 +276,9 @@ class TestSchedulerInitReqMaxNewTokens(CustomTestCase):
             end_layer=2,
             swa_attention_layer_ids=[1],
             full_attention_layer_ids=[0],
-            total_bytes=768,
+            # Eight pages: a prompt of up to two pages, its decode token and the
+            # one page of allocation rounding admission charges per sub-pool.
+            total_bytes=1024,
             enable_memory_saver=False,
             need_sort=False,
             lazy_compaction=True,
@@ -267,6 +286,8 @@ class TestSchedulerInitReqMaxNewTokens(CustomTestCase):
         scheduler = self._new_scheduler(page_size=4)
         scheduler.token_to_kv_pool_allocator = bundle.token_to_kv_pool_allocator
         scheduler.sliding_window_size = 4
+        # As the cache builder does: the pool's window states no length.
+        bundle.token_to_kv_pool_allocator.storage.bind_window_retention(4, None)
         scheduler.chunked_prefill_size = 4
         scheduler.max_new_tokens_limit = None
         for prompt_len in (4, 5, 6, 7):
