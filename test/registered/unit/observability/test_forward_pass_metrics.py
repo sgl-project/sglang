@@ -1026,6 +1026,9 @@ class TestForwardPassMetrics(unittest.TestCase):
                 Event=Mock, current_stream=lambda: object()
             ),
         )
+        scheduler._pp_result_done_event = types.MethodType(
+            SchedulerPPMixin._pp_result_done_event, scheduler
+        )
         wire, result, _ = SchedulerPPMixin._pp_make_skip_output_result(
             scheduler, types.SimpleNamespace(reqs=[object()]), metadata
         )
@@ -1232,7 +1235,8 @@ class TestIdleMetrics(CustomTestCase):
                 get_pool_stats=lambda: types.SimpleNamespace(
                     update_scheduler_stats=lambda _: None,
                     full_capacity=1,
-                    is_hybrid_swa=False,
+                    windows=(),
+                    target_window_stats=lambda: None,
                 ),
                 streaming_session_count=lambda: 0,
                 session_held_tokens=lambda: 0,
@@ -1250,7 +1254,7 @@ class TestIdleMetrics(CustomTestCase):
     def test_idle_publishes_refreshed_kv_metrics(self):
         self.reporter.current_scheduler_metrics_enabled = True
         self.scheduler.disagg_decode_prealloc_queue = types.SimpleNamespace(
-            queue=[], pre_allocated_token_counts=lambda: (0, 0)
+            queue=[], pre_allocated_token_counts=lambda windows=(): (0, {})
         )
         self.scheduler.disagg_decode_transfer_queue = types.SimpleNamespace(
             queue=[], num_pending_deferred_releases=lambda: 0
@@ -1278,7 +1282,8 @@ class TestIdleMetrics(CustomTestCase):
                                 stats, "token_usage", token_usage
                             ),
                             full_capacity=1,
-                            is_hybrid_swa=False,
+                            windows=(),
+                            target_window_stats=lambda: None,
                         )
                     )
                     with patch(
@@ -1336,7 +1341,7 @@ class TestIdleMetrics(CustomTestCase):
         self.scheduler.disaggregation_mode = DisaggregationMode.DECODE
         self.scheduler.enable_priority_scheduling = True
         self.scheduler.disagg_decode_prealloc_queue = types.SimpleNamespace(
-            queue=[], pre_allocated_token_counts=lambda: (0, 0)
+            queue=[], pre_allocated_token_counts=lambda windows: (0, {})
         )
         host_reqs = [
             types.SimpleNamespace(req=FakeReq(priority=priority), host_staged=True)
