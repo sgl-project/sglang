@@ -1470,8 +1470,8 @@ class HiDreamO1ImageDenoisingStage(DenoisingStage):
         ctx = batch.extra["hidream_o1_ctx"]
         # Build the request's scheduler from the recipe the before-denoising
         # stage resolved, and publish it for the framework loop
-        # (``batch.scheduler`` / ``batch.timesteps``) and the hand-rolled
-        # trajectory (``ctx["scheduler"]``).
+        # (``batch.scheduler`` / ``batch.timesteps``). The hand-rolled
+        # trajectory builds its own per-chunk scheduler in ``_run_trajectory``.
         scheduler = build_scheduler(
             num_inference_steps=ctx["num_steps"],
             timesteps_list=(
@@ -1483,7 +1483,6 @@ class HiDreamO1ImageDenoisingStage(DenoisingStage):
             device=self.device,
             scheduler_name=ctx["scheduler_name"],
         )
-        ctx["scheduler"] = scheduler
         batch.scheduler = scheduler
         batch.timesteps = scheduler.timesteps
         batch.sigmas = scheduler.sigmas.tolist()
@@ -1617,7 +1616,21 @@ class HiDreamO1ImageDenoisingStage(DenoisingStage):
         if guidance_scale > 1.0:
             uncond = self._build_uncond_sample(first, ctx, len(chunk))
 
-        sched = ctx["scheduler"]
+        # Build a fresh scheduler per chunk: flash, flow_match, and UniPC all
+        # keep stateful step/history cursors (UniPC also accumulates
+        # ``model_outputs``/``last_sample`` for its corrector), so reusing the
+        # request-level scheduler across chunks corrupts the second trajectory.
+        sched = build_scheduler(
+            num_inference_steps=ctx["num_steps"],
+            timesteps_list=(
+                DEFAULT_TIMESTEPS
+                if ctx["scheduler_name"] in ("flash", "flow_match")
+                else None
+            ),
+            shift=ctx["shift"],
+            device=self.device,
+            scheduler_name=ctx["scheduler_name"],
+        )
         # The flash scheduler is the one that injects per-step noise; key off
         # the scheduler in use so the name cannot desync the trajectory.
         inject_noise = isinstance(sched, FlashFlowMatchScheduler)

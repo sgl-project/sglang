@@ -52,9 +52,11 @@ class HiDreamO1ImagePipelineConfig(ImagePipelineConfig):
     # accelerator, matching the reference implementation.
     generator_device: str = "cpu"
 
-    def __post_init__(self):
-        variant = _resolve_variant(self.model_path)
-        if variant != "full":
+    def update_config_from_dict(self, args, prefix: str = "") -> None:
+        super().update_config_from_dict(args, prefix)
+        # model_path is only populated here in the serving path; Dev checkpoints
+        # are guidance-distilled and must run the DiT in fp32.
+        if _resolve_variant(self.model_path) != "full":
             self.dit_precision = "fp32"
 
     def validate_server_args(self, server_args: Any) -> None:
