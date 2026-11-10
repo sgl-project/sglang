@@ -10,7 +10,7 @@ import time
 import unittest
 
 import requests
-from npu_rl_utils import (
+from conftest import (
     begin_weight_update,
     checkpoint_tensor_index,
     continue_generation,
