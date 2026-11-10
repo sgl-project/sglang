@@ -62,10 +62,10 @@ constexpr int32_t ceil_log2_constexpr(int32_t value) {
 }
 
 // Compact miss entries keep the scratch-union hash position in the low bits,
-// below the approximate-admission flags; the table spans total_occurrences slots.
-template <int64_t TOTAL_OCCURRENCES>
+// below the approximate-admission flags; the table spans WORKSPACE_CAPACITY slots.
+template <int64_t TABLE_SLOTS>
 struct CompactHashPosition {
-  static constexpr int32_t MASK = (int32_t{1} << ceil_log2_constexpr(static_cast<int32_t>(TOTAL_OCCURRENCES))) - 1;
+  static constexpr int32_t MASK = (int32_t{1} << ceil_log2_constexpr(static_cast<int32_t>(TABLE_SLOTS))) - 1;
   static_assert(MASK < COMPACT_APPROX_CLAIM_FLAG, "compact hash positions overlap the admission flags.");
 };
 
