@@ -1,24 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Real GPU/host/file KV round trips and publication-to-admission ownership."""
+"""Real GPU/host/storage KV round trips and resource reclamation."""
 
 import atexit
 import json
 import os
-import uuid
-from contextlib import contextmanager, ExitStack
-
-import msgspec
 import tempfile
 import time
 import unittest
+import uuid
 from array import array
+from contextlib import ExitStack, contextmanager
 from unittest.mock import patch
 
+import msgspec
 import torch
 
 from sglang.srt.managers.kv_control.contracts import (
-    CopyTo,
-    Location,
     Status,
     TokensTarget,
 )
@@ -213,7 +210,7 @@ class TestProgrammableKVCache(CustomTestCase):
                 self.assertTrue(torch.equal(pool.v_buffer[layer][actual], value))
             cache.sanity_check()
 
-    def test_roundtrip_and_preparation_handoff(self):
+    def test_public_transfer_roundtrip(self):
         for storage in (False, True):
             with self.subTest(storage=storage):
                 self._roundtrip(storage)
@@ -276,7 +273,6 @@ class TestProgrammableKVCache(CustomTestCase):
             cache = UnifiedRadixCache(params)
             cache.init_hicache(get_server_args(), params)
             atexit.unregister(cache.shutdown)
-            preparation = None
             try:
                 service = KVControlService(cache, config)
                 target = TokensTarget(
@@ -293,29 +289,14 @@ class TestProgrammableKVCache(CustomTestCase):
                 ).last_device_node
                 node = cache.tree_core.node_by_id(node_id)
                 cold_tier = "storage" if storage else "host"
-                result = service.control.submit(
-                    KvHintsEnvelope(
-                        protocol_version="0.1",
-                        message_id="save",
-                        actions=[
-                            KvHintAction(
-                                action_id="save",
-                                action_type="sglang.move_to",
-                                action_version="1.0",
-                                payload={
-                                    "target": {
-                                        "kind": "tokens",
-                                        "namespace": config.namespace,
-                                        "token_ids": list(target.token_ids),
-                                    },
-                                    "src": {"tier": "gpu"},
-                                    "dst": {"tier": cold_tier},
-                                },
-                            )
-                        ],
-                    ),
-                    service.control.context("test"),
-                ).results[0]
+                result = public_action(
+                    service,
+                    "demote",
+                    target,
+                    {"tier": "gpu"},
+                    {"tier": cold_tier},
+                    "save",
+                )
                 moved = self._wait(service, result.ref)
                 self.assertEqual(
                     moved.update.completed_steps,
@@ -332,21 +313,15 @@ class TestProgrammableKVCache(CustomTestCase):
                 # Reusing the same allocator slots must still require an actual copy.
                 pool.k_buffer[0].fill_(-17)
                 pool.v_buffer[0].fill_(-18)
-                (ref,) = service.control._reserve_policy_operations(
-                    (
-                        (
-                            "restore",
-                            CopyTo(
-                                target=target,
-                                src=Location(tier=cold_tier),
-                                dst=Location(tier="gpu"),
-                            ),
-                        ),
-                    )
+                result = public_action(
+                    service,
+                    "prefetch",
+                    target,
+                    {"tier": cold_tier},
+                    {"tier": "gpu"},
+                    "restore",
                 )
-                preparation = service.control.executor.prepare_prefix(ref)
-                service.control._start_policy_operation(ref)
-                loaded = self._wait(service, ref)
+                loaded = self._wait(service, result.ref)
                 self.assertEqual(loaded.update.completed_steps, ("destination_ready",))
                 node = service.control.executor._walk(
                     target.token_ids, service.control.executor._compatibility(target)
@@ -354,13 +329,8 @@ class TestProgrammableKVCache(CustomTestCase):
                 restored = node.component_data[ComponentType.FULL].value
                 self.assertTrue(torch.all(pool.k_buffer[0][restored] == 17).item())
                 self.assertTrue(torch.all(pool.v_buffer[0][restored] == 18).item())
-                self.assertTrue(preparation.ready)
-                self.assertEqual(preparation.locked_tokens, 4)
-                cache.evict(EvictParams(num_tokens=4))
-                self.assertEqual(allocator.available_size(), 60)
                 request_lock = cache.lock(node.id)
                 try:
-                    preparation.release()
                     cache.evict(EvictParams(num_tokens=4))
                     self.assertEqual(allocator.available_size(), 60)
                 finally:
@@ -372,8 +342,6 @@ class TestProgrammableKVCache(CustomTestCase):
                 cache.sanity_check()
             finally:
                 torch.cuda.synchronize()
-                if preparation is not None:
-                    preparation.release()
                 if storage:
                     cache._storage_attachment.shutdown()
                 cache.release_host_resources()

@@ -9,6 +9,7 @@ from array import array
 from dataclasses import dataclass, replace
 
 import msgspec
+
 from sglang.srt.managers.kv_control.contracts import (
     ContentSpan,
     ControlError,
@@ -106,7 +107,6 @@ class UnifiedCacheExecutor:
         self.storage_reason = "Storage is not attached"
         self.storage_reads = None
         self.protection = None
-        self.preparations = {}
         if self.core.enable_hicache and not self._transfer_unsupported_reason():
             from sglang.srt.mem_cache.unified_cache.control_transfers import (
                 HostCacheTransfers,
@@ -165,72 +165,6 @@ class UnifiedCacheExecutor:
                 )
             self.storage = None
             self.storage_reads = None
-
-    def prepare_prefix(self, ref):
-        if threading.get_ident() != self._thread:
-            raise ControlError("wrong_owner", "Prepare a prefix on the cache owner")
-        service = getattr(self.cache, "kv_control_service", None)
-        if service is None or service.control.executor is not self:
-            raise ControlError(
-                "wrong_owner", "Preparation requires the live cache control owner"
-            )
-        service.control.registry.get(ref)
-        pending = service.control._pending.get(ref.operation_id)
-        if (
-            pending is None
-            or pending.origin != "policy"
-            or pending.started
-            or not isinstance(pending.payload, CopyTo)
-            or pending.payload.dst.tier != "gpu"
-        ):
-            raise ControlError(
-                "unsupported", "Prepare a registered private GPU COPY before dispatch"
-            )
-        self._check(pending.target)
-        if self.transfers is None:
-            raise ControlError(
-                "unsupported", "Preparation requires the native FULL HiCache path"
-            )
-        if ref.operation_id in self.preparations:
-            return self.preparations[ref.operation_id]
-        if len(self.preparations) >= self.config.max_prepared_prefixes:
-            raise ControlError("capacity", "Preparation prefix capacity exhausted")
-        from sglang.srt.mem_cache.unified_cache.control_preparation import (
-            PreparedPrefix,
-        )
-
-        lease = PreparedPrefix(self, ref, pending)
-        self.preparations[ref.operation_id] = lease
-        return lease
-
-    def _capture_preparation(self, work):
-        lease = self.preparations.get(work.ref.operation_id)
-        if lease is not None:
-            lease.capture()
-
-    def release_task_preparations(self, removed_tasks):
-        removed = frozenset(removed_tasks)
-        for lease in tuple(self.preparations.values()):
-            if any(
-                branch.continuation is not None and branch.continuation.task in removed
-                for branch in lease.work.target.branches
-            ):
-                lease.release()
-
-    def revalidate_preparations(self):
-        if not self.preparations or self.gpu_copy_capacity is None:
-            return 0
-        remaining = self.gpu_copy_capacity()
-        revoked = 0
-        for lease in tuple(self.preparations.values()):
-            if type(remaining) is int and remaining >= 0:
-                break
-            if lease.ready:
-                lease.release()
-                lease.code = "preparation_revoked"
-                revoked += 1
-                remaining = self.gpu_copy_capacity()
-        return revoked
 
     def _transfer_unsupported_reason(self):
         if self.core.component_types != (ComponentType.FULL,):

@@ -4336,34 +4336,6 @@ class Scheduler(
                 else []
             ),
         )
-        kv_service = getattr(self, "kv_control_service", None)
-        kv_guidance = kv_service is not None and kv_service.guides_requests
-        if kv_guidance:
-            kv_service.update_policy_guidance(self, running_batch)
-            if kv_service.policy_has_scores:
-                order = {id(req): i for i, req in enumerate(self.waiting_queue)}
-                priority_sign = (
-                    self.policy.priority_sign if self.enable_priority_scheduling else 0
-                )
-                self.waiting_queue.sort(
-                    key=lambda req: kv_service.policy_request_key(
-                        req, order[id(req)], priority_sign
-                    )
-                )
-        if kv_service is not None and kv_service.prepares_requests:
-            selected = next(
-                (
-                    req
-                    for req in self.waiting_queue
-                    if kv_service.policy_allows_request(req)
-                ),
-                None,
-            )
-            if selected is not None and not kv_service.prepare_admission(selected):
-                # Preparation can allocate and install GPU indices. Rebuild the
-                # adder on a later pass with current pool/growth/hit accounting.
-                return None, running_batch
-
         if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
             # If we are testing retraction and the running batch size exceeds
             # TEST_RETRACT_NO_PREFILL_BS, we skip the prefill to keep the requests
@@ -4438,12 +4410,6 @@ class Scheduler(
             # candidate: the resumed chunk or mixed decode rows can spend it.
             if adder.budget_state() == AddReqResult.OTHER:
                 break
-            if kv_guidance and not kv_service.policy_allows_request(req):
-                continue
-            if kv_service is not None and not kv_service.preparation_allows_candidate(
-                req
-            ):
-                continue
             if self.enable_lora and not self.can_schedule_lora_req(req, running_loras):
                 continue
 
@@ -4541,9 +4507,6 @@ class Scheduler(
 
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
-        if kv_service is not None:
-            for req in can_run_list:
-                kv_service.policy_request_admitted(req)
         if len(can_run_list) == 0:
             # Preemption already released these requests; requeue them even
             # though the request they made room for was not admitted.
@@ -5776,8 +5739,6 @@ class Scheduler(
 
     def flush_cache(self, empty_cache: bool = True):
         """Flush memory pools and optionally empty the device allocator cache."""
-        if getattr(self, "kv_control_service", None) is not None:
-            self.kv_control_service.prepare_reset()
         if self.is_fully_idle(ignore_waiting=self._engine_paused):
             self.cur_batch_for_debug = None
             self.last_batch = None

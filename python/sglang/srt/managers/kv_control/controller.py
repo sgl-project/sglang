@@ -4,12 +4,12 @@
 from __future__ import annotations
 
 import time
-import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
 import msgspec
+
 from sglang.srt.managers.kv_control.contracts import (
     PROTOCOL_VERSION,
     Associate,
@@ -40,7 +40,7 @@ from sglang.srt.managers.kv_control.contracts import (
 from sglang.srt.managers.kv_control.index import LogicalIndex, ResolvedTarget
 from sglang.srt.managers.kv_control.public import normalize_public, requested_outcomes
 from sglang.srt.managers.kv_control.registry import OperationRegistry, snapshot_envelope
-from sglang.srt.managers.kv_hints import KvHintAction, KvHintsEnvelope
+from sglang.srt.managers.kv_hints import KvHintsEnvelope
 
 
 class ExecutionRequest(Value):
@@ -120,7 +120,6 @@ class KVControl:
         self.index = LogicalIndex(namespace, self.registry.engine_epoch, limits=limits)
         self._pending: dict[str, _Pending] = {}
         self._requests: dict[tuple[str, str], set[str]] = {}
-        self.policy_runtime = None
         self.association_feedback = None
 
     def context(
@@ -135,115 +134,6 @@ class KVControl:
                 binding_id=binding_id,
             )
         )
-
-    def _reserve_policy_operations(self, proposals, *, resolutions=None):
-        """Owner-only reservation of a complete plan before any physical effect.
-
-        Each (action_id, primitive) is validated and resolved at this boundary.
-        The owner runtime may retain an already-resolved signal snapshot when a
-        sibling updated history; policies cannot supply authoritative snapshots.
-        Registered children remain queued until the runtime explicitly starts
-        them after dependency/admission checks. Public submit never uses this
-        authority, even with the same caller name.
-        """
-        if not self.enabled or self.executor is None:
-            raise ControlError(
-                "unsupported", "Policy execution requires a native owner"
-            )
-        kinds = {SetPriority: "set_priority", CopyTo: "copy_to", MoveTo: "move_to"}
-        if not proposals or len(proposals) > self.limits.max_actions:
-            raise ControlError("capacity", "Policy operation batch exceeds limit")
-        if resolutions is not None and len(resolutions) != len(proposals):
-            raise ControlError(
-                "invalid_payload", "Policy resolutions must match actions"
-            )
-        actions = []
-        for action_id, payload in proposals:
-            if type(payload) not in kinds:
-                raise ControlError(
-                    "invalid_payload", "Policy children must be primitives"
-                )
-            actions.append(
-                KvHintAction(
-                    action_id=action_id,
-                    action_type="sglang." + kinds[type(payload)],
-                    action_version="1.0",
-                    payload=msgspec.json.decode(msgspec.json.encode(payload)),
-                )
-            )
-        envelope = KvHintsEnvelope(
-            protocol_version=PROTOCOL_VERSION,
-            message_id="policy-" + uuid.uuid4().hex,
-            actions=actions,
-        )
-        batch, _ = snapshot_envelope(envelope, self.limits)
-        prepared = []
-        for i, frozen in enumerate(batch.actions):
-            payload = parse_action(frozen.thaw())
-            if payload.target == "request_cached":
-                raise ControlError(
-                    "invalid_payload", "Policy children require logical targets"
-                )
-            if payload.target.namespace != self.index.namespace:
-                raise ControlError(
-                    "incompatible_namespace", "Policy target namespace differs"
-                )
-            locations = (
-                (payload.location,)
-                if isinstance(payload, SetPriority)
-                else (payload.src, payload.dst)
-            )
-            if any(
-                location.engine_id not in (None, self.registry.engine_id)
-                for location in locations
-            ):
-                raise ControlError(
-                    "unsupported", "Remote owners approve their own resources"
-                )
-            if not isinstance(payload, SetPriority) and payload.src == payload.dst:
-                raise ControlError(
-                    "invalid_payload", "Source and destination must differ"
-                )
-            scope = (
-                self.index.resolve(payload.target)
-                if resolutions is None
-                else validated(resolutions[i], ResolvedTarget)
-            )
-            if (
-                scope.engine_epoch != self.registry.engine_epoch
-                or scope.namespace != self.index.namespace
-                or scope.index_generation > self.index.generation
-            ):
-                raise ControlError(
-                    "stale_epoch", "Policy snapshot belongs to another owner generation"
-                )
-            prepared.append((payload, scope))
-        submission = self.registry.reserve(batch, self.context("local-policy"))
-        for result, (payload, scope) in zip(submission.results, prepared, strict=True):
-            self._pending[result.ref.operation_id] = _Pending(
-                result.ref, payload, scope, origin="policy"
-            )
-            self.registry.update(
-                result.ref,
-                ExecutionUpdate(
-                    status=Status.QUEUED, quiescent=True, code="policy_dependency"
-                ),
-            )
-        return tuple(result.ref for result in submission.results)
-
-    def _start_policy_operation(self, ref):
-        result = self.registry.get(ref)
-        if result.status.terminal:
-            return result
-        pending = self._pending[ref.operation_id]
-        if pending.origin != "policy":
-            raise ControlError("invalid_payload", "Operation has explicit authority")
-        if not pending.started:
-            try:
-                self._start(pending)
-            except ControlError as error:
-                self._error(ref, error)
-        return self.registry.get(ref)
 
     def submit(
         self,
@@ -299,22 +189,13 @@ class KVControl:
                         raise ControlError(
                             "incompatible_namespace", "Target namespace differs"
                         )
-                if not execute_primitives and (
-                    isinstance(payload, (SetPriority, CopyTo, MoveTo, Pin))
-                    or isinstance(payload, Signal)
-                    and self.policy_runtime is not None
-                    and self.policy_runtime.consumes(payload)
+                if not execute_primitives and isinstance(
+                    payload, (SetPriority, CopyTo, MoveTo, Pin)
                 ):
                     raise ControlError(
                         "unsupported",
                         "This request profile cannot execute native cache operations",
                     )
-                if (
-                    isinstance(payload, Signal)
-                    and self.policy_runtime is not None
-                    and self.policy_runtime.consumes(payload)
-                ):
-                    scope = self.index.resolve(payload.target)
                 if isinstance(payload, Pin):
                     if payload.location.engine_id not in (None, context.engine_id):
                         raise ControlError(
@@ -419,30 +300,6 @@ class KVControl:
             else:
                 self._execute_pin(ref, payload, scope)
         elif isinstance(payload, Signal):
-            if self.policy_runtime is not None and self.policy_runtime.consumes(
-                payload
-            ):
-                if scope is None:
-                    raise ControlError(
-                        "invalid_payload", "Signal consumer lacks a submission snapshot"
-                    )
-                if any(
-                    branch.continuation is not None
-                    and self.index.task_identity(branch.continuation.task.session_id)
-                    != branch.continuation.task
-                    for branch in scope.branches
-                ):
-                    self.registry.update(
-                        ref,
-                        ExecutionUpdate(
-                            status=Status.CANCELLED,
-                            quiescent=True,
-                            code="task_finished_before_policy",
-                        ),
-                    )
-                else:
-                    self.policy_runtime.on_signal(ref, payload, scope=scope)
-                return
             # No consumer: do not resolve a session or build observations.
             self.registry.update(
                 ref,
@@ -474,8 +331,6 @@ class KVControl:
             cleanup = getattr(self.executor, "release_task_protections", None)
             if cleanup is not None:
                 cleanup(caller_id=ref.context.caller_id, tasks=change.removed_tasks)
-            if self.policy_runtime is not None:
-                self.policy_runtime.cleanup(change.removed_tasks)
             self.registry.update(
                 ref,
                 ExecutionUpdate(
@@ -532,9 +387,6 @@ class KVControl:
                 # Content equality alone establishes no task ownership. cancel
                 # retires queued work or asks the executor to drain started work.
                 self.cancel(pending.ref)
-        release = getattr(self.executor, "release_task_preparations", None)
-        if release is not None:
-            release(removed_tasks)
 
     def request_event(
         self,
@@ -610,8 +462,6 @@ class KVControl:
                 requested_outcomes(pending.target),
                 self.executor.capabilities().get("cache_generation"),
             )
-        if pending.origin == "explicit" and self.policy_runtime is not None:
-            self.policy_runtime.before_explicit(pending.payload, pending.target)
         if (
             any(branch.unaligned for branch in pending.target.branches)
             and not pending.target.allow_clip
