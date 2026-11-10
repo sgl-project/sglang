@@ -1795,7 +1795,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             get_foundry_adapter().capture_scope(
                 phase="prefill",
                 model=self.model_runner.model,
-                req_slots=self._capture_req_slots,
+                # Read only when active: a test may drive capture() on a stand-in.
+                req_slots=self._capture_req_slots
+                if get_foundry_adapter().enabled
+                else None,
                 flashinfer_tactics=flashinfer_tactics_cache_for_persistence(
                     self.model_runner
                 ),

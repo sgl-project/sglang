@@ -258,7 +258,9 @@ def activate_foundry(server_args: Any) -> FoundryAdapter:
     process (see the process contract)."""
     global _active
     mode = server_args.cuda_graph_persistence
-    if mode is None:
+    # Only the two modes activate; None, and any stand-in a test passes for
+    # server_args, run the no-op adapter.
+    if mode not in ("save", "load"):
         if isinstance(_active, _FoundryAdapterReal):
             raise RuntimeError(
                 "Foundry CUDA graph persistence is active in this process "

@@ -1296,7 +1296,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             get_foundry_adapter().capture_scope(
                 phase="decode",
                 model=self.model_runner.model,
-                kind=self._foundry_graph_kind(),
+                # Read only when active: a test may drive capture() on a stand-in.
+                kind=self._foundry_graph_kind()
+                if get_foundry_adapter().enabled
+                else None,
                 flashinfer_tactics=flashinfer_tactics_cache_for_persistence(
                     self.model_runner
                 ),
