@@ -53,16 +53,6 @@ def _get_first_visible_device():
 # instance can reach the MetaService across nodes.
 METASERVICE_CONFIG = build_meta_service_config()
 
-HICACHE_STORAGE_EXTRA_CONFIG = json.dumps(
-    {
-        "meta_service_url": METASERVICE_CONFIG["meta_service_url"],
-        "config_store_url": METASERVICE_CONFIG["config_store_url"],
-        "log_level": "info",
-        "world_size": 16,
-        "protocol": "device_sdma",
-        "dram_size": "4GB",
-    }
-)
 
 # Local service config for the npu_memcache L3 backend; it must point at the
 # same MetaService/config-store endpoints as METASERVICE_CONFIG.
