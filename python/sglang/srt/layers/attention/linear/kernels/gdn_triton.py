@@ -1,3 +1,5 @@
+from typing import Optional
+
 import torch
 
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
@@ -11,7 +13,7 @@ if not is_cpu():
         fused_recurrent_gated_delta_rule_packed_decode,
     )
     from sglang.kernels.ops.attention.linear.fused_recurrent_linear_replayssm import (
-        fused_recurrent_gdn_replayssm_decode,
+        fused_recurrent_linear_replayssm_decode,
     )
     from sglang.kernels.ops.attention.linear.fused_sigmoid_gating_recurrent import (
         fused_sigmoid_gating_delta_rule_update,
@@ -102,7 +104,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
             and replayssm_g is not None
             and replayssm_write_pos is not None
         ):
-            fused_recurrent_gdn_replayssm_decode(
+            fused_recurrent_linear_replayssm_decode(
                 mixed_qkv=mixed_qkv,
                 a=a,
                 b=b,
@@ -181,11 +183,23 @@ class TritonGDNKernel(LinearAttnKernelBase):
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
         inplace_update: bool = True,
+        use_qk_l2norm_in_kernel: bool = True,
+        out: Optional[torch.Tensor] = None,
+        output_indices: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> tuple:
         recurrent_state = ssm_states
         recurrent_state_indices_args = {"initial_state_indices": cache_indices}
         inplace_update_args = {"inplace_update": inplace_update}
+        output_args = {}
+        if (out is None) != (output_indices is None):
+            raise ValueError("out and output_indices must be supplied together")
+        if out is not None:
+            if is_cpu() or is_npu() or is_xpu():
+                raise NotImplementedError(
+                    "mapped GDN MIS output requires the Triton chunk kernel"
+                )
+            output_args = {"out": out, "output_indices": output_indices}
         track_args = {}
         if self.supports_track_state_snapshot:
             track_args = {
@@ -225,11 +239,12 @@ class TritonGDNKernel(LinearAttnKernelBase):
             initial_state=recurrent_state,
             cu_seqlens=query_start_loc,
             head_first=False,
-            use_qk_l2norm_in_kernel=True,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
             **recurrent_state_indices_args,
             **inplace_update_args,
             **track_args,
             **graph_table_args,
+            **output_args,
         )
 
     def target_verify(

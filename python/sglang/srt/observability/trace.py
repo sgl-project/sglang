@@ -839,7 +839,7 @@ class TraceReqContext:
         # set abort info into thread span
         if self.thread_context.thread_span:
             if abort_info:
-                from sglang.srt.managers.schedule_batch import BaseFinishReason
+                from sglang.srt.managers.req_types import BaseFinishReason
 
                 if isinstance(abort_info, BaseFinishReason):
                     abort_info = abort_info.to_json()
