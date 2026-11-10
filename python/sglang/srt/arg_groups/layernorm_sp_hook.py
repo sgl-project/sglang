@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Optional
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
-from sglang.srt.arg_groups.overrides import model_config_of, resolving_view
+from sglang.srt.arg_groups.model_override_base import model_config_of, resolving_view
 from sglang.srt.runtime_context import attn_dp_enabled_of
 
 logger = logging.getLogger(__name__)
@@ -154,15 +154,15 @@ def validate_layernorm_sp(
                 "--enable-megamoe-for-layernorm-sp."
             )
         if enable_megamoe_for_layernorm_sp:
-            if moe_a2a_backend not in ("none", "flashinfer"):
+            if moe_a2a_backend not in ("none", "flashinfer_nvlink_one_sided"):
                 raise ValueError(
-                    "Muse MegaMoE prefill requires --moe-a2a-backend none or flashinfer; "
+                    "Muse MegaMoE prefill requires --moe-a2a-backend none or flashinfer_nvlink_one_sided; "
                     "MegaMoE performs its own dispatch/combine and decode uses all-reduce."
                 )
-        elif moe_a2a_backend != "flashinfer":
+        elif moe_a2a_backend != "flashinfer_nvlink_one_sided":
             raise ValueError(
                 "Muse Spark --enable-layernorm-sp requires "
-                "--moe-a2a-backend flashinfer."
+                "--moe-a2a-backend flashinfer_nvlink_one_sided."
             )
         if moe_runner_backend != "flashinfer_trtllm":
             raise ValueError(
