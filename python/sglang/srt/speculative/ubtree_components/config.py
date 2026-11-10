@@ -115,10 +115,12 @@ def resolve_verify_width(config: UBTreeConfig, requested: int | None) -> int:
     # Keep the existing default for larger exports without restricting explicit
     # widths to the shapes with tuned kernels.
     width = min(49, config.verify_node_count) if requested is None else requested
-    if not 2 <= width <= config.verify_node_count:
+    if not config.block_size <= width <= config.verify_node_count:
         raise ValueError(
-            "UBTREE --speculative-num-draft-tokens must be at least 2 and fit "
-            f"the checkpoint tree budget ({config.verify_node_count} nodes), got {width}"
+            "UBTREE --speculative-num-draft-tokens must be at least the draft "
+            f"block size ({config.block_size}) so every draft KV write lands in "
+            "the request's reserved slots, and fit the checkpoint tree budget "
+            f"({config.verify_node_count} nodes), got {width}"
         )
     return width
 

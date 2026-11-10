@@ -61,9 +61,7 @@ class UBTreeVerifyEpilogue:
         self.max_bs = int(max_bs)
         self.node_count = int(node_count)
         # A root-inclusive accepted path cannot contain more rows than the
-        # verify tree itself.  Small forced-width buckets (for example M=9
-        # with a B16 drafter) therefore need a narrower graph-tail buffer than
-        # the checkpoint block depth.
+        # verify tree itself.
         self.max_depth = min(int(max_depth), self.node_count)
         self.target_kvcache = target_kvcache
         self.req_to_token = req_to_token
