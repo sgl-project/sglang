@@ -218,7 +218,7 @@ class KimiK3Detector(BaseFormatDetector):
         argument_close = "<|close|>argument<|sep|>"
         call_close = "<|close|>call<|sep|>"
 
-        def emit(fragment: str, name: str | None = None):
+        def emit(fragment: str, source: str, name: str | None = None):
             if fragment or name:
                 self.streamed_args_for_tool[self.current_tool_id] += fragment
                 calls.append(
@@ -226,6 +226,7 @@ class KimiK3Detector(BaseFormatDetector):
                         tool_index=self.current_tool_id,
                         name=name,
                         parameters=fragment,
+                        source_text=source,
                     )
                 )
 
@@ -242,19 +243,22 @@ class KimiK3Detector(BaseFormatDetector):
                 value = remaining[:count]
                 self._tool_pos += count
                 if self._argument_type == "string":
-                    emit(json.dumps(value, ensure_ascii=False)[1:-1])
+                    emit(json.dumps(value, ensure_ascii=False)[1:-1], value)
                 else:
                     self._argument_value += value
                 if end < 0:
                     break
                 if self._argument_type == "string":
-                    emit('"')
+                    emit('"', argument_close)
                 else:
                     try:
                         value = json.loads(self._argument_value)
                     except json.JSONDecodeError:
                         value = self._argument_value
-                    emit(json.dumps(value, ensure_ascii=False))
+                    emit(
+                        json.dumps(value, ensure_ascii=False),
+                        self._argument_value + argument_close,
+                    )
                 self._tool_pos += len(argument_close)
                 self._argument_type = None
                 self._argument_value = ""
@@ -265,7 +269,7 @@ class KimiK3Detector(BaseFormatDetector):
             self._tool_pos += len(remaining) - len(stripped)
             remaining = stripped
             if self._in_call and remaining.startswith(call_close):
-                emit("}")
+                emit("}", call_close)
                 self.prev_tool_call_arr[self.current_tool_id]["arguments"] = json.loads(
                     self.streamed_args_for_tool[self.current_tool_id]
                 )
@@ -298,14 +302,14 @@ class KimiK3Detector(BaseFormatDetector):
                 self.incomplete_tool_call_indices.add(self.current_tool_id)
                 self._argument_count = 0
                 self._in_call = True
-                emit("{", name=name)
+                emit("{", header[0], name=name)
             else:
                 prefix = ", " if self._argument_count else ""
                 prefix += json.dumps(attrs.get("key", ""), ensure_ascii=False) + ": "
                 self._argument_type = attrs.get("type", "string")
                 if self._argument_type == "string":
                     prefix += '"'
-                emit(prefix)
+                emit(prefix, header[0])
                 self._argument_count += 1
             self._tool_pos += header.end()
         return calls
