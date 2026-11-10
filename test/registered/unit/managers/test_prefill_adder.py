@@ -1,4 +1,5 @@
 import unittest
+from array import array
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -9,6 +10,8 @@ from sglang.srt.disaggregation.prefill import (
     PrefillBootstrapQueue,
     max_bootstrap_input_len,
 )
+from sglang.srt.dllm.config import DllmConfig
+from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.managers.req_types import FINISH_LENGTH
 from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.managers.schedule_policy import (
@@ -27,6 +30,8 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     IncLockRefResult,
     TreeLock,
 )
+from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.common import checkpoint_kv_cache
 from sglang.srt.mem_cache.kv.alloc.demand import WindowRetirement
 from sglang.srt.mem_cache.page_interleave import PageShardSpec, make_page_shard_spec
 from sglang.srt.mem_cache.prefill_budget import (
@@ -38,12 +43,19 @@ from sglang.srt.mem_cache.prefill_budget import (
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import get_context
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.session.streaming_session import SessionSlot, StreamingSession
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_test_utils import release_only_retirer
 from sglang.test.test_utils import CustomTestCase
-from sglang.test.unified_allocator_fixtures import build_test_unified_pools
+from sglang.test.tree_slots import storage_tree_slots
+from sglang.test.unified_allocator_fixtures import (
+    build_test_unified_pools,
+    largest_take,
+)
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
@@ -105,6 +117,7 @@ class TestPrefillAdder(CustomTestCase):
         )
         tree_cache.buffer_pipeline = None
         tree_cache.window_checkpoint_interval.return_value = 0
+        tree_cache.logical_page_size = 1
         return tree_cache
 
     def create_token_allocator(
@@ -174,6 +187,7 @@ class TestPrefillAdder(CustomTestCase):
         req.fulfilled_storage_hit_len.return_value = 0
         req.finished.return_value = False
         req.needs_host_load_back.return_value = False
+        req.last_node = MagicMock()
         return req
 
     def create_adder(self, running_batch, **kwargs):
@@ -199,6 +213,7 @@ class TestPrefillAdder(CustomTestCase):
         self.mock_tree_cache.window_retain_size.side_effect = lambda component: 8
         self.mock_tree_cache.supports_prefix_sharing.return_value = False
         self.mock_tree_cache.transfers_in_flight.return_value = False
+        self.mock_tree_cache.logical_page_size = 4
         allocator = build_test_unified_pools(
             device="cpu",
             kv_cache_dtype=torch.float16,
@@ -218,6 +233,7 @@ class TestPrefillAdder(CustomTestCase):
             need_sort=False,
             lazy_compaction=True,
         ).token_to_kv_pool_allocator
+        self.mock_tree_cache.token_to_kv_pool_allocator = allocator
         return self.create_adder(
             self.create_running_batch(),
             page_size=4,
@@ -623,30 +639,269 @@ class TestPrefillAdder(CustomTestCase):
         )  # 50 + 75 + 100 - 50 = 175
         running_batch.release_req.assert_called_once()
 
-    def test_preempt_prices_a_unified_request_in_owner_tokens(self):
-        """A unified chain's scalar preemption budget counts owner tokens, not
-        `available_size` (here a quarter of it)."""
-        running = self.create_mock_req("run", priority=0, max_new_tokens=100)
-        self.scheduling_order(schedule_low_priority_values_first=False)
-        allocator = self.mock_token_allocator
-        allocator.full_available_size.return_value = 1600
-        allocator.available_size.return_value = 400
-        allocator.mamba_allocator = None
-        allocator.window_pool_names.return_value = ("swa",)
-        self.mock_tree_cache.window_retain_size.side_effect = lambda name: 32
-        self.mock_tree_cache.supports_prefix_sharing.return_value = True
-        allocator.create_prefill_budget.side_effect = lambda tree_cache, **kwargs: (
-            ChainPrefillBudget(allocator, tree_cache, **kwargs)
+    @staticmethod
+    def create_unified_cache(*, page=4, window=8, sessions=False):
+        """A FULL + window pool with its prefix tree, for a running request's row."""
+        bundle = build_test_unified_pools(
+            device="cpu",
+            kv_cache_dtype=torch.float16,
+            head_num=1,
+            head_dim=8,
+            v_head_dim=8,
+            swa_head_num=1,
+            swa_head_dim=8,
+            swa_v_head_dim=8,
+            page_size=page,
+            start_layer=0,
+            end_layer=2,
+            swa_attention_layer_ids=[1],
+            full_attention_layer_ids=[0],
+            total_bytes=8192,
+            model_context_len=128,
+            max_num_reqs=2,
+            enable_memory_saver=False,
+            need_sort=False,
+            lazy_compaction=True,
         )
-        running_batch = self.create_running_batch([running])
-        adder = self.create_adder(running_batch, page_size=4)
-        self.assertEqual(adder.memory_budget.total_offset, 100)
-        self.assertEqual(adder.rem_total_tokens, 1500)
+        allocator = bundle.token_to_kv_pool_allocator
+        cache = UnifiedRadixCache(
+            CacheInitParams(
+                disable=False,
+                enable_session_radix_cache=sessions,
+                req_to_token_pool=bundle.req_to_token_pool,
+                token_to_kv_pool_allocator=allocator,
+                page_size=page,
+                sliding_window_size=window,
+                tree_slots=storage_tree_slots(allocator.storage, window=window),
+            )
+        )
+        return bundle, allocator, cache
 
-        new_req = self.create_mock_req("new", priority=1, max_new_tokens=32)
-        new_req.full_untruncated_fill_ids = [0] * 800
-        self.assertTrue(adder.preempt_to_schedule(new_req))
-        self.assertIn(running, adder.preempt_list)
+    def _retained_dllm_staging(self, *, separate, fresh_block_fits):
+        """An adder with a 32-token dLLM compute budget over a pool, beside two
+        retained 16-token blocks' rows, with room for one fresh block or none."""
+        block = 16
+        adder = self.create_shared_adder(total_bytes=4096)
+        allocator = adder.token_to_kv_pool_allocator
+        self.assertIsNotNone(allocator.alloc(2 * block))
+        # Fill until no chunk fits, or until a second fresh block does not.
+        room = 2 * block if fresh_block_fits else 1
+        while adder.memory_budget.largest_chunk_tokens(room) >= room:
+            self.assertIsNotNone(allocator.alloc(4))
+        if fresh_block_fits:
+            self.assertGreaterEqual(
+                adder.memory_budget.largest_chunk_tokens(block), block
+            )
+        dllm = SimpleNamespace(
+            block_size=block,
+            max_running_requests=2,
+            requires_separate_context_encoding=separate,
+        )
+        return self.create_adder(
+            self.create_running_batch(),
+            page_size=4,
+            rem_input_tokens=2 * block,
+            rem_chunk_tokens=block,
+            token_to_kv_pool_allocator=allocator,
+            dllm_config=dllm,
+        )
+
+    def _dllm_block_req(self, rid, *, retained_row=None):
+        block = 16
+        req = self.create_shared_req(rid)
+        req.origin_input_ids = []
+        req.full_untruncated_fill_ids = list(range(block))
+        req.is_dllm_prefill.return_value = False
+        req.extend_end = None
+        if retained_row is not None:
+            req.dllm_incomplete_ids = list(range(block))
+            req.kv = ReqKvInfo(
+                req_pool_idx=retained_row, kv_committed_len=0, kv_allocated_len=block
+            )
+        else:
+            req.dllm_incomplete_ids = []
+        return req
+
+    def test_staging_stops_on_compute_not_on_a_fresh_block(self):
+        """After a dLLM block is staged, the pass stops only once compute runs out, so
+        a next request that reuses its retained rows is staged even when no fresh
+        block fits."""
+        for separate in (False, True):
+            for first in (0, None):
+                with self.subTest(separate=separate, first_fresh=first is None):
+                    adder = self._retained_dllm_staging(
+                        separate=separate, fresh_block_fits=first is None
+                    )
+                    reqs = [
+                        self._dllm_block_req("first", retained_row=first),
+                        self._dllm_block_req("retained", retained_row=1),
+                    ]
+                    SchedulerDllmMixin.process_dllm_staging_reqs(None, adder, reqs)
+                    self.assertEqual(adder.can_run_list, reqs)
+                    self.assertEqual(adder.rem_dllm_tokens, 0)
+
+    def test_a_finishing_retained_block_reserves_no_further_output(self):
+        """A retained final dLLM block reserves no output past its end, so a fresh
+        block that fits beside it is staged in the same pass."""
+        block = 16
+        for separate in (False, True):
+            with self.subTest(separate=separate):
+                adder = self.create_shared_adder(total_bytes=4096)
+                allocator = adder.token_to_kv_pool_allocator
+                self.assertIsNotNone(allocator.alloc(block))
+                # Room for a fresh block and its page overhead, little more.
+                room = block + 8
+                while adder.memory_budget.largest_chunk_tokens(room) >= room:
+                    self.assertIsNotNone(allocator.alloc(4))
+                self.assertGreaterEqual(
+                    adder.memory_budget.largest_chunk_tokens(block + 4), block + 4
+                )
+                dllm = SimpleNamespace(
+                    block_size=block,
+                    max_running_requests=2,
+                    requires_separate_context_encoding=separate,
+                )
+                adder = self.create_adder(
+                    self.create_running_batch(),
+                    page_size=4,
+                    rem_input_tokens=2 * block,
+                    rem_chunk_tokens=block,
+                    token_to_kv_pool_allocator=allocator,
+                    dllm_config=dllm,
+                )
+                finishing = self._dllm_block_req("finishing", retained_row=0)
+                # Its final block ends at the prompt plus its output allowance.
+                finishing.origin_input_ids = list(range(block // 2))
+                finishing.sampling_params.max_new_tokens = block // 2
+                fresh = self._dllm_block_req("fresh")
+                SchedulerDllmMixin.process_dllm_staging_reqs(
+                    None, adder, [finishing, fresh]
+                )
+                self.assertEqual(adder.can_run_list, [finishing, fresh])
+
+    def test_a_block_takes_only_the_pages_past_its_prefix(self):
+        """A dLLM block is priced at the pages past its prefix, with no extra
+        rounding page, so it is staged when only those pages fit."""
+        block = 16
+        for separate in (False, True):
+            with self.subTest(separate=separate):
+                adder = self.create_shared_adder(total_bytes=4096)
+                allocator = adder.token_to_kv_pool_allocator
+                self.assertIsNotNone(allocator.alloc(block))  # its context
+                while adder.memory_budget.largest_chunk_tokens(block) >= block:
+                    self.assertIsNotNone(allocator.alloc(4))
+                dllm = SimpleNamespace(
+                    block_size=block,
+                    max_running_requests=2,
+                    requires_separate_context_encoding=separate,
+                )
+                adder = self.create_adder(
+                    self.create_running_batch(),
+                    page_size=4,
+                    rem_input_tokens=2 * block,
+                    rem_chunk_tokens=block,
+                    token_to_kv_pool_allocator=allocator,
+                    dllm_config=dllm,
+                )
+                # The block's own pages fit.
+                self.assertEqual(
+                    adder.memory_budget.largest_block_tokens(
+                        block, prefix_tokens=block
+                    ),
+                    block,
+                )
+                req = self._dllm_block_req("next")
+                req.prefix_len = block
+                req.full_untruncated_fill_ids = list(range(2 * block))
+                req.kv = ReqKvInfo(
+                    req_pool_idx=0, kv_committed_len=block, kv_allocated_len=block
+                )
+                SchedulerDllmMixin.process_dllm_staging_reqs(None, adder, [req])
+                self.assertEqual(adder.can_run_list, [req])
+                self.assertEqual(req.extend_end, 2 * block)
+
+    def test_static_staging_keeps_whole_blocks(self):
+        """On a static pool, dLLM staging reserves the whole output allowance, so
+        every staged chunk is a whole block, never a partial one the model cannot
+        run."""
+        block = 4
+        dllm = SimpleNamespace(
+            block_size=block,
+            max_running_requests=2,
+            requires_separate_context_encoding=False,
+        )
+        adder = self._create_delayer_adder(
+            available_tokens=12,
+            delayer=None,
+            page_size=block,
+            rem_chunk_tokens=block,
+            dllm_config=dllm,
+        )
+        # A retained unresolved block after an 8-token prompt, allowance 7.
+        retained = self._dllm_block_req("retained", retained_row=0)
+        retained.origin_input_ids = list(range(8))
+        retained.sampling_params.max_new_tokens = 7
+        retained.prefix_len = 8
+        retained.full_untruncated_fill_ids = list(range(8 + block))
+        # A fresh block after a 4-token prompt, allowance 3.
+        fresh = self._dllm_block_req("fresh")
+        fresh.origin_input_ids = list(range(4))
+        fresh.sampling_params.max_new_tokens = 3
+        fresh.prefix_len = 4
+        fresh.full_untruncated_fill_ids = list(range(4 + block))
+        SchedulerDllmMixin.process_dllm_staging_reqs(None, adder, [retained, fresh])
+        self.assertTrue(adder.can_run_list)
+        for req in adder.can_run_list:
+            self.assertEqual(req.extend_end - req.prefix_len, block)
+
+    def test_a_cut_dllm_block_is_whole_through_retraction(self):
+        """Without separate context encoding, a dLLM chunk cut to the memory left is
+        a whole block or none, so a retracted request's next prefix match ends on
+        the block grid."""
+        block = 8
+        bundle, allocator, cache = self.create_unified_cache()
+        dllm = DllmConfig("LowConfidence", {}, block, 99, 2)
+        req = Req(
+            "dllm",
+            "",
+            array("q", range(1, 21)),
+            SamplingParams(max_new_tokens=16, temperature=0),
+            vocab_size=128,
+            dllm_config=dllm,
+        )
+        req.init_next_round_input(cache)
+
+        def staging_adder():
+            return self.create_adder(
+                self.create_running_batch(),
+                page_size=4,
+                rem_chunk_tokens=block,
+                tree_cache=cache,
+                token_to_kv_pool_allocator=allocator,
+                dllm_config=dllm,
+            )
+
+        # Leave room for part of a block only.
+        budget = staging_adder().memory_budget
+        while budget.largest_chunk_tokens(block) >= block:
+            self.assertIsNotNone(allocator.alloc(4))
+        self.assertGreater(budget.largest_chunk_tokens(block), 0)
+
+        adder = staging_adder()
+        adder.add_dllm_staging_req(req)
+        if req in adder.can_run_list:
+            # The staged chunk runs, is checkpointed and is then retracted.
+            (row,) = allocator.storage.acquire([req])
+            ids = allocator.alloc(-(-req.extend_end // 4) * 4)
+            bundle.req_to_token_pool.write(
+                (row, slice(0, req.extend_end)), ids[: req.extend_end]
+            )
+            req.kv.kv_committed_len = req.kv.kv_allocated_len = req.extend_end
+            checkpoint_kv_cache(req, cache)
+            release_only_retirer(tree_cache=cache).retract(req, offload_kv=False)
+            req.reset_for_retract()
+        req.init_next_round_input(cache)
+        self.assertEqual(req.prefix_len % block, 0)
 
     def test_preempt_success_low_priority_values_first(self):
         params = [
@@ -1825,7 +2080,7 @@ class TestPrefillAdder(CustomTestCase):
         admitted beside it would take the room it waits for."""
         probe, allocator = self._pressured_shared_adder(running=0, held_tokens=0)
         adder, _ = self._pressured_shared_adder(
-            running=1, held_tokens=allocator.available_size() - 4
+            running=1, held_tokens=largest_take(allocator) - 4
         )
         continuation = self.create_shared_req("continuation", max_new_tokens=4096)
         continuation.prefix_len = 4
@@ -1861,7 +2116,7 @@ class TestPrefillAdder(CustomTestCase):
         # Rows held by no running request (a transfer, a load): with nothing
         # running, the continuation shrinks to the rows there are.
         adder, _ = self._pressured_shared_adder(
-            running=0, held_tokens=allocator.available_size() - 12
+            running=0, held_tokens=largest_take(allocator) - 12
         )
         continuation = self.create_shared_req("continuation", max_new_tokens=4096)
         continuation.prefix_len = 0
@@ -1895,7 +2150,7 @@ class TestPrefillAdder(CustomTestCase):
         """A request that fits an empty pool but not now waits while running work
         will give memory back; with nothing to give back it is unschedulable."""
         probe, allocator = self._pressured_shared_adder(running=0, held_tokens=0)
-        capacity = allocator.available_size()
+        capacity = largest_take(allocator)
         for running, held, expected in (
             (1, capacity - 8, AddReqResult.NO_TOKEN),
             (0, capacity - 8, AddReqResult.UNSCHEDULABLE),
@@ -1918,7 +2173,7 @@ class TestPrefillAdder(CustomTestCase):
         so it can make progress at all."""
         adder, allocator = self._pressured_shared_adder(running=1, held_tokens=0)
         req = self.create_shared_req("long", max_new_tokens=4096)
-        req.full_untruncated_fill_ids = list(range(allocator.available_size() * 2))
+        req.full_untruncated_fill_ids = list(range(largest_take(allocator) * 2))
         adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None)
         self.assertEqual(adder.can_run_list, [req])
         self.assertIs(adder.new_chunked_req, req)
@@ -1928,7 +2183,7 @@ class TestPrefillAdder(CustomTestCase):
         """A continuation waits, closing the pass, while other row holders will
         free memory; with no other holder it shrinks to make progress."""
         probe, allocator = self._pressured_shared_adder(running=0, held_tokens=0)
-        capacity = allocator.available_size()
+        capacity = largest_take(allocator)
         held = capacity - 8
         adder, _ = self._pressured_shared_adder(running=1, held_tokens=held)
         continuation = self.create_shared_req("continuation")
@@ -1950,7 +2205,7 @@ class TestPrefillAdder(CustomTestCase):
         """An idle streaming session's parked row gives no memory back, so a
         continuation shrinks to fit rather than wait for the session to close."""
         probe, _ = self._pressured_shared_adder(running=0, held_tokens=0)
-        held = probe.token_to_kv_pool_allocator.available_size() - 8
+        held = largest_take(probe.token_to_kv_pool_allocator) - 8
         adder, allocator = self._pressured_shared_adder(running=0, held_tokens=held)
         storage = kv_storage_of(None, allocator)
         session = StreamingSession(
@@ -2031,7 +2286,7 @@ class TestPrefillAdder(CustomTestCase):
             return req
 
         capacity = adder_after(0, park=False).token_to_kv_pool_allocator
-        capacity = capacity.available_size()
+        capacity = largest_take(capacity)
         found = False
         for held in range(0, capacity, 4):
             waiting = adder_after(held, park=False)
@@ -2091,7 +2346,7 @@ class TestPrefillAdder(CustomTestCase):
                 max_new = allocator.max_new_tokens_for_memory(
                     prompt,
                     4096,
-                    token_capacity=allocator.available_size(),
+                    token_capacity=largest_take(allocator),
                     sliding_window_size=8,
                     chunk_size=16,
                     **RETIRE_AT_ONCE,

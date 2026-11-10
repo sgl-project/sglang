@@ -60,7 +60,10 @@ from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import (
+    default_weight_loader,
+    maybe_remap_kv_scale_name,
+)
 from sglang.srt.models.qwen2_moe import Qwen2MoeMLP as Qwen3MoeMLP
 from sglang.srt.models.qwen2_moe import Qwen2MoeModel
 from sglang.srt.models.utils import (
@@ -593,6 +596,12 @@ class Qwen3MoeAttention(nn.Module):
             sliding_window_size=sliding_window_size,
             prefix=add_prefix("attn", prefix),
         )
+        if (
+            _is_npu
+            and quant_config is not None
+            and quant_config.get_name() == "modelslim"
+        ):
+            quant_config.init_kv_cache(self.attn, prefix, qkv_proj=self.qkv_proj)
 
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
@@ -1179,6 +1188,10 @@ class Qwen3MoeForCausalLM(nn.Module):
 
             if "rotary_emb.inv_freq" in name:
                 continue
+            if _is_npu and ".fa_" in name:
+                name = maybe_remap_kv_scale_name(name, params_dict)
+                if name is None:
+                    continue
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 # Skip non-stacked layers and experts (experts handled below).
                 if weight_name not in name:

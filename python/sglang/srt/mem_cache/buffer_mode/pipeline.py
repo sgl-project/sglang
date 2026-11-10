@@ -44,13 +44,13 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertResult,
     MatchPrefixParams,
 )
+from sglang.srt.mem_cache.capacity import owner_rows_ready
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
     PoolTransfer,
     SidecarPoolSpec,
 )
-from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.mem_cache.pool_host.base import HostKVCache
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage_prefetch import (
@@ -1920,11 +1920,7 @@ class BufferModePipeline:
                 return allocator.full_available_size()
             return allocator.available_size()
 
-        if available() < load_tokens:
-            cache.evict_for_alloc(KVDemand(full_tokens=load_tokens))
-            if available() < load_tokens:
-                return False
-        return True
+        return owner_rows_ready(cache, allocator, load_tokens, available)
 
     def _allocate_and_queue_load_back(
         self,

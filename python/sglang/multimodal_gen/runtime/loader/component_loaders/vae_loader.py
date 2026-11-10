@@ -635,6 +635,11 @@ class VAELoader(WeightOverrideComponentLoader):
                 "consume a weights-only override"
             )
         if auto_model_map and not native_only:
+            if not server_args.trust_remote_code:
+                raise ComponentCheckpointUnsupportedError(
+                    f"{component_name!r} uses custom auto_map code; "
+                    "pass --trust-remote-code only after reviewing the model code"
+                )
             module_path, cls_name = auto_model_map.rsplit(".", 1)
             custom_module_file = os.path.join(component_model_path, f"{module_path}.py")
             spec = importlib.util.spec_from_file_location("_custom", custom_module_file)

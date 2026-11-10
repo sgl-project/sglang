@@ -5,6 +5,7 @@ import json
 import logging
 import threading
 import time
+import zlib
 from array import array
 from contextlib import ExitStack, nullcontext
 from dataclasses import replace
@@ -60,6 +61,7 @@ from sglang.srt.mem_cache.buffer_mode.storage_existence_cache import (
     StorageExistenceCache,
     default_belief_policy,
 )
+from sglang.srt.mem_cache.capacity import owner_rows_ready
 from sglang.srt.mem_cache.common import RetractionBackup
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
@@ -200,6 +202,7 @@ class _OngoingLoadBack(NamedTuple):
 class _StoragePrefetchWait(msgspec.Struct):
     timer: PollTimer = msgspec.field(default_factory=PollTimer)
     timeout_s: float = 0.0
+    # Rank-agreed verdict of the per-tick vote; admission polls only read it.
     expired: bool = False
 
 
@@ -2373,12 +2376,15 @@ class UnifiedRadixCache(BasePrefixCache):
                 return False
 
         token_slot = self.slot_id(TREE_TOKEN)
-        if self._pool_available(token_slot) < kv_tokens:
-            self.evict_for_alloc(KVDemand(full_tokens=kv_tokens))
-            if self._pool_available(token_slot) < kv_tokens:
-                self.dec_lock_ref(node_id, ancestor_lock_params)
-                self.dec_host_lock_ref(node_id, host_anchor_params)
-                return False
+        if not owner_rows_ready(
+            self,
+            self.token_to_kv_pool_allocator,
+            kv_tokens,
+            lambda: self._pool_available(token_slot),
+        ):
+            self.dec_lock_ref(node_id, ancestor_lock_params)
+            self.dec_host_lock_ref(node_id, host_anchor_params)
+            return False
 
         # Load H→D
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
@@ -2798,17 +2804,64 @@ class UnifiedRadixCache(BasePrefixCache):
             # progress, rank-min queue drain); a vote here only adds collectives.
             return False
         if self.prefetch_stop_policy == "timeout":
-            # Wall clocks differ across ranks: PP0 decides, TP takes MAX (any
-            # rank timed out) and _all_reduce broadcasts the verdict along PP.
-            should_terminate = False
-            if self.pp_rank == 0:
-                should_terminate = self._prefetch_deadline_expired(operation)
-            should_terminate_tensor = torch.tensor(
-                int(should_terminate), dtype=torch.int, device="cpu"
-            )
-            self._all_reduce(should_terminate_tensor, torch.distributed.ReduceOp.MAX)
-            return should_terminate_tensor.item() == 1
+            # The verdict is agreed once per tick by _vote_prefetch_deadlines,
+            # which also terminates the operation (the poll then takes the
+            # is_terminated path); a poll only reads it, so ranks may poll
+            # different requests (batch_is_full, allocatable-request exits)
+            # without a collective.
+            wait = self._storage_prefetch_wait.get(operation.handle)
+            return wait is not None and wait.expired
         return True
+
+    def _vote_prefetch_deadlines(self) -> None:
+        """One MAX vote per tick over every live prefetch's `timeout` budget.
+
+        Wall clocks differ across ranks: PP0 decides per operation, TP takes
+        MAX (any rank timed out) and _all_reduce relays the verdict along PP.
+        The packed tensor has one slot per `ongoing_prefetch` entry in
+        insertion order; this tick's ready-count sync asserted that set is
+        rank-identical (_hicache_sync_digest), and the drain between them
+        only retires in lockstep. With no live prefetch no rank issues a
+        collective. A wait that has not started yet (no blocked poll on PP0)
+        contributes 0 until the next tick. An expired operation is terminated
+        here so the transfer worker and the hit drain stop spending on it;
+        its retirement stays with the admission poll or the drain.
+        """
+        if self.prefetch_stop_policy != "timeout" or not self.ongoing_prefetch:
+            return
+        operations = [info.operation for info in self.ongoing_prefetch.values()]
+        expired = [0] * len(operations)
+        if self.pp_rank == 0:
+            expired = [
+                int(self._prefetch_deadline_expired(operation))
+                for operation in operations
+            ]
+        verdicts = torch.tensor(expired, dtype=torch.int, device="cpu")
+        self._all_reduce(verdicts, torch.distributed.ReduceOp.MAX)
+        for operation, verdict in zip(operations, verdicts.tolist()):
+            if verdict:
+                self._mark_prefetch_deadline_expired(operation)
+                self.cache_controller.terminate_prefetch(operation)
+
+    def _hicache_sync_digest(self) -> int:
+        """Value piggybacked on the ready-count MIN sync: equal on every rank
+        iff the write_back reclaim victim order matched and, when the deadline
+        vote reads it, so did the live prefetch set (`ongoing_prefetch` in
+        insertion order). The admission polls retire per request, so a rank
+        that left the loop earlier than its peers (#30760) is caught here, in
+        the same tick on every rank, instead of hanging in a vote of a
+        different length. Fits int64: 42-bit digest * 1000003 + crc32."""
+        digest = self.tree_core.write_back_duplicate_reclaim_digest
+        if (
+            self.enable_storage
+            and self.prefetch_stop_policy == "timeout"
+            and self.ongoing_prefetch
+        ):
+            live = "\0".join(
+                f"{handle.rid}\0{handle.attempt_id}" for handle in self.ongoing_prefetch
+            )
+            digest = digest * 1000003 + zlib.crc32(live.encode()) + 1
+        return digest
 
     def has_ongoing_prefetch(self, handle: CacheRequestHandle) -> bool:
         return handle in self.ongoing_prefetch
@@ -3553,6 +3606,9 @@ class UnifiedRadixCache(BasePrefixCache):
             if info is None:
                 return True  # aborted/cleaned; nothing to retry
             if operation.is_terminated():
+                if operation.deadline_expired:
+                    # Cut by the tick vote while parked: same reason as the poll.
+                    self._finish_storage_prefetch(request, 0, reason="deadline")
                 self.revoke_pending_prefetch(request)
                 return True
 
@@ -3948,8 +4004,8 @@ class UnifiedRadixCache(BasePrefixCache):
             )
 
         # Piggybacked TP check: [digest, -digest] MIN-reduces to [min, -max],
-        # equal iff reclaim victim order matched on every rank.
-        digest = self.tree_core.write_back_duplicate_reclaim_digest
+        # equal iff reclaim victim order and live prefetch set matched on every rank.
+        digest = self._hicache_sync_digest()
         exchange = self._shm_count_exchange()
         if exchange is not None:
             values = [write_acks, load_acks, *storage_queue_sizes, *fold_u64(digest)]
@@ -3958,7 +4014,8 @@ class UnifiedRadixCache(BasePrefixCache):
             if len(values) <= exchange.width:
                 rows = exchange.allgather(values)
                 assert all(row[-2:] == rows[0][-2:] for row in rows), (
-                    "write_back duplicate-reclaim victims diverged across TP ranks"
+                    "write_back duplicate-reclaim victims or live storage "
+                    "prefetches diverged across TP ranks"
                 )
                 mins = [min(col) for col in zip(*rows)]
                 return mins[0], mins[1], tuple(mins[2:-2]), extra_pool_names
@@ -3980,7 +4037,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
         count_values = list(map(int, ready_counts.tolist()))
         assert digest == count_values[-2] and digest == -count_values[-1], (
-            "write_back duplicate-reclaim victims diverged across PP/TP ranks"
+            "write_back duplicate-reclaim victims or live storage prefetches "
+            "diverged across PP/TP ranks"
         )
         return (
             count_values[0],
@@ -4262,6 +4320,9 @@ class UnifiedRadixCache(BasePrefixCache):
                 extra_release_counts=extra_release_counts,
                 log_metrics=True,
             )
+        if self.enable_storage:
+            # After the drain: a prefetch it retired is not voted on.
+            self._vote_prefetch_deadlines()
         if self.buffer_pipeline is not None:
             self.buffer_pipeline.flush_pending_writes()
         if self.enable_storage_metrics and self.storage_metrics_collector is not None:
