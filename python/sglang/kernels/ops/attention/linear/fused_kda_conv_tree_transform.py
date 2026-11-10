@@ -1,10 +1,4 @@
-"""Fused UBTree causal-conv and KDA node transform.
-
-The production path is restricted to BS=1, 32/49 verify nodes, convolution
-width 4, H == HV, and K == V. It replaces the tree causal-conv launch plus
-``fused_sigmoid_gating_delta_rule_tree_transform_kernel`` while preserving the
-materialized post-conv Q/K/V tensor consumed by factor generation.
-"""
+"""Fused UBTree causal-conv and KDA node transform."""
 
 from __future__ import annotations
 
@@ -161,11 +155,7 @@ def _fused_kda_conv_tree_transform_kernel(
         acc_v += value_v.to(tl.float32) * wv
 
         if tap < 3:
-            # Keep the ancestor walk branch-free.  ``current > 0`` means the
-            # next value comes from a tree node; ``current <= 0`` encodes the
-            # persistent conv-state columns 2, 1, 0.  Triton runtime branches
-            # around a loop-carried scalar produced incorrect SSA merges for
-            # sibling programs, while masked loads + tl.where are deterministic.
+            # Triton miscompiled runtime branches on the loop-carried node, hence masks.
             use_tree_node = current > 0
             safe_node = tl.maximum(current, 0)
             parent = tl.load(
