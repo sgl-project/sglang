@@ -145,9 +145,7 @@ class TestNPUIndexerInt8Cache(CustomTestCase):
         self, dtype, kv_cache_dim=None, indexer_quant_mode=None, hierarchical=False
     ):
         with (
-            get_context().override_server_args(
-                enable_hierarchical_cache=hierarchical
-            ),
+            get_context().override_server_args(enable_hierarchical_cache=hierarchical),
             patch.object(
                 memory_pool_npu,
                 "get_parallel",

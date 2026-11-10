@@ -223,7 +223,7 @@ class Model(msgspec.Struct):
             help=(
                 "Quantization recipe for the DSA lightning-indexer KV cache "
                 "(Ascend NPU only). None disables the quantized indexer cache "
-                "and keeps the default indexer behavior. \"int8\" stores the "
+                'and keeps the default indexer behavior. "int8" stores the '
                 "indexer keys in INT8 with FP16 scales to speed up the "
                 "lightning indexer."
             ),
