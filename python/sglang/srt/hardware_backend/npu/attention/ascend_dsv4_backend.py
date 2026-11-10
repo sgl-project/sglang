@@ -519,7 +519,6 @@ class CompressorAscendBackendMixin:
             norm_eps=compressor.norm.variance_epsilon,
             rotary_mode=2,
             cache_mode=2,
-            impl="auto",
         )
 
         # prefill output may be padded; trim to loc length
