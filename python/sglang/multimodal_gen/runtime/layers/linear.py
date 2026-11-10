@@ -277,6 +277,41 @@ def apply_unquantized_linear(
     )
 
 
+def pack_rows_into_one_buffer(params: list[torch.Tensor]) -> None:
+    """Move the tensors into consecutive rows of one new buffer and leave each a
+    view of its rows, so one GEMM can read them all (``rows_of_one_buffer``).
+    Only the views hold the buffer: moving or offloading a layer frees it."""
+    with torch.no_grad():
+        packed = torch.cat([param.data for param in params])
+    offset = 0
+    for param in params:
+        rows = param.shape[0]
+        param.data = packed[offset : offset + rows]
+        offset += rows
+
+
+def rows_of_one_buffer(parts: list[torch.Tensor]) -> torch.Tensor | None:
+    """``torch.cat(parts)`` without a copy while the parts are still consecutive
+    rows of one buffer; None once a move, load or offload gave one its own."""
+    first = parts[0]
+    storage = first.untyped_storage().data_ptr()
+    offset = first.storage_offset()
+    for part in parts:
+        if (
+            not part.is_contiguous()
+            or part.untyped_storage().data_ptr() != storage
+            or part.storage_offset() != offset
+            or part.dtype != first.dtype
+            or part.shape[1:] != first.shape[1:]
+        ):
+            return None
+        offset += part.numel()
+    rows = sum(part.shape[0] for part in parts)
+    return first.as_strided(
+        (rows, *first.shape[1:]), first.stride(), first.storage_offset()
+    )
+
+
 def apply_amx_packed_linear(
     x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
 ) -> torch.Tensor:

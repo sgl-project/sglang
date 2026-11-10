@@ -329,6 +329,38 @@ def set_mla_kv_buffer_dcp_sharded_triton(
     )
 
 
+def set_mla_kv_buffer_cast_triton(
+    kv_buffer: torch.Tensor,
+    loc: torch.Tensor,
+    cache_k_nope: torch.Tensor,
+    cache_k_rope: torch.Tensor,
+    *,
+    dcp_world_size: int,
+    dcp_rank: int,
+    reserved_skip_index: int = 0,
+):
+    """Scatter bf16 rows into a lower-precision buffer (raw fp8), casting on
+    store: one kernel instead of a cast per input plus the copy."""
+    nope_dim, rope_dim = cache_k_nope.shape[-1], cache_k_rope.shape[-1]
+    pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
+    set_mla_kv_buffer_kernel[(loc.numel(), 1)](
+        kv_buffer,
+        cache_k_nope,
+        cache_k_rope,
+        loc,
+        reserved_skip_index,
+        kv_buffer.stride(0),
+        cache_k_nope.stride(0),
+        cache_k_rope.stride(0),
+        nope_dim,
+        rope_dim,
+        BLOCK=triton.next_power_of_2(nope_dim + rope_dim),
+        DCP_RANK=dcp_rank,
+        DCP_WORLD_SIZE=dcp_world_size,
+        **pdl_kwargs,
+    )
+
+
 @triton.jit
 def set_mla_kv_buffer_fp8_quant_kernel(
     kv_buffer_fp8_ptr,

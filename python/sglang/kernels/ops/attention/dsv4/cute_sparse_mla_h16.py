@@ -26,6 +26,7 @@ from cutlass.cute.nvgpu import OperandMajorMode, cpasync, warpgroup
 from cutlass.cute.nvgpu.warpgroup import MmaF16BF16Op, OperandSource
 from cutlass.cute.runtime import from_dlpack
 
+from sglang.kernels.arch import current_arch
 from sglang.srt.utils.custom_op import register_custom_op
 
 # SGLang DSV4 sparse-prefill contract.
@@ -663,11 +664,9 @@ def _validate_inputs(
     if q.data_ptr() % 16 != 0 or kv.data_ptr() % 16 != 0:
         raise ValueError("q and kv storage must be aligned to 16 bytes")
 
-    capability = torch.cuda.get_device_capability(q.device)
-    if capability != (9, 0):
+    if not current_arch().is_sm(9, 0):
         raise ValueError(
-            "cute_sparse_mla_h16_fwd requires a Hopper SM90 GPU, "
-            f"got compute capability {capability[0]}.{capability[1]}"
+            f"cute_sparse_mla_h16_fwd requires a Hopper SM90 GPU, got {current_arch()!r}"
         )
 
     scale = float(sm_scale)
