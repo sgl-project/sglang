@@ -169,9 +169,9 @@ class DeferredContextCommit:
         """Host, after a static verify graph ran ``reqs``."""
         self._staged_reqs = tuple((req, req.retraction_count) for req in reqs)
 
-    def _skip_rows_not_carried(self, reqs) -> None:
-        """Host, before a forward of ``reqs`` writes the staging: zero the rows
-        of the requests it does not carry, or that were retracted since."""
+    def _disarm_stale_rows(self, reqs) -> None:
+        """Host, before a draft forward of ``reqs`` writes the staging: disarm the
+        rows of the requests it does not carry or that were retracted since."""
         carried = set(reqs)
         for row, (req, retraction_count) in enumerate(self._staged_reqs):
             if req not in carried or req.retraction_count != retraction_count:
@@ -228,7 +228,7 @@ class DeferredContextCommit:
                 self.num_written_eagerly,
                 self._eager_reasons,
             )
-        self._skip_rows_not_carried(reqs)
+        self._disarm_stale_rows(reqs)
         if graph_bs is None:
             self._flush("eager draft")
         elif graph_bs not in self._forked_bs:
