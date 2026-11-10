@@ -10,7 +10,10 @@ from unittest import mock
 
 import torch
 
-from sglang.kernels.ops.attention import kda_fused_decode_aiter_hip
+from sglang.kernels.ops.attention import (
+    kda_fused_decode_aiter_hip,
+    kda_fused_decode_gfx950,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.quark.quark import QuarkLinearMethod
 from sglang.srt.layers.quantization.quark.schemes import QuarkW8A8Fp8
@@ -20,6 +23,7 @@ from sglang.srt.models.kimi_k3_rocm_quant import (
     _k3_channel_fp8_to_bf16,
     k3_fused_decode_f_b_weight,
 )
+from sglang.srt.runtime_context import get_context
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -156,6 +160,28 @@ class TestFusedDecodeFbWeight(CustomTestCase):
         warn.assert_called_once()
 
 
+def _armable_hip_attention() -> SimpleNamespace:
+    """A stand-in KDA attention whose static inputs fit the fused decode kernel."""
+    heads, dim = 12, 128
+    f_b_weight = torch.zeros(heads * dim, dim, dtype=torch.bfloat16)
+    return SimpleNamespace(
+        attn=SimpleNamespace(
+            conv_weights=torch.zeros(3 * heads * dim, 4),
+            A_log=torch.zeros(heads),
+            dt_bias=torch.zeros(heads * dim),
+            lower_bound=-5.0,
+        ),
+        f_b_proj=SimpleNamespace(weight=f_b_weight),
+        _fused_decode_f_b_weight=lambda: f_b_weight,
+        o_norm=SimpleNamespace(weight=torch.ones(dim), eps=1e-5),
+        config=SimpleNamespace(
+            mamba2_cache_params=SimpleNamespace(
+                dtype=SimpleNamespace(temporal=torch.bfloat16)
+            )
+        ),
+    )
+
+
 class TestHipFusedDecodeArming(CustomTestCase):
     """_prepare_fused_decode on ROCm, on a stand-in attention module."""
 
@@ -191,6 +217,32 @@ class TestHipFusedDecodeArming(CustomTestCase):
         self.assertFalse(attention._kda_hip_fused_decode_ready)
         self.assertIsNone(layer._k3_hip_fused_decode_args)
         self.assertIsNone(layer._k3_hip_fused_decode_ops)
+
+    def test_replayssm_ring_keeps_decode_from_deferring_f_b(self):
+        """Either ReplaySSM flag allocates the ring, whose decode skips the fused kernel;
+        a deferred f_b there reaches the recurrence as the raw f_a, so only ring-free
+        decode may defer it."""
+        for flags, defers in (
+            ({}, True),
+            ({"enable_linear_replayssm": True}, False),
+            ({"enable_linear_replayssm_spec": True}, False),
+        ):
+            attention = _armable_hip_attention()
+            with (
+                self.subTest(flags=flags),
+                get_context().override_server_args(**flags),
+                mock.patch.object(kimi_k3, "_is_hip", True),
+                envs.SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND.override("gfx950"),
+                mock.patch.object(
+                    kda_fused_decode_gfx950, "available", return_value=True
+                ),
+                mock.patch.object(kda_fused_decode_gfx950, "warmup"),
+            ):
+                KimiK3DeltaAttention._prepare_fused_decode(attention)
+
+                # Armed in every case, so a False comes from the ring alone.
+                self.assertIsNotNone(attention.attn._k3_hip_fused_decode_args)
+                self.assertEqual(attention._kda_hip_fused_decode_ready, defers)
 
     def test_block_fp8_f_b_arms_from_the_merged_bf16_copy(self):
         """A block-FP8 f_b_proj holds FP8 with no Quark scheme; the fused decode must

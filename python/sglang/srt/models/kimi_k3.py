@@ -2032,7 +2032,13 @@ class KimiK3DeltaAttention(nn.Module):
                 )
                 layer._k3_hip_fused_decode_backend = backend
                 layer._k3_hip_fused_decode_ops = fused_ops
-                self._kda_hip_fused_decode_ready = True
+                # Either ReplaySSM flag allocates the ring (kv_cache_configurator.py),
+                # whose decode skips the fused kernel and needs f_b already applied.
+                mamba = get_exec().mamba
+                replayssm_ring = (
+                    mamba.enable_linear_replayssm or mamba.enable_linear_replayssm_spec
+                )
+                self._kda_hip_fused_decode_ready = not replayssm_ring
             return
         layer = self.attn
         w = layer.conv_weights
