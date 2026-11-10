@@ -208,9 +208,10 @@ def resolve_rocm_fp4_gemm_backend(
             )
 
     if backend == "auto":
-        # With native MXFP4, auto stays unresolved: each Quark MXFP4 layer then
-        # uses the AITER GEMM if AITER's a4w4 tuned CSV covers its shape, else Triton.
-        return "auto" if mxfp4_gemm_supported else "triton"
+        # The AITER GEMM is faster for some models and slower for others (e.g.
+        # DeepSeek-R1 MLA projections fed pre-quantized activations), so it stays
+        # opt-in.
+        return "triton"
     if backend == "aiter" and not mxfp4_gemm_supported:
         raise ValueError(
             "--fp4-gemm-backend=aiter requires a GPU with native MXFP4 GEMM support "

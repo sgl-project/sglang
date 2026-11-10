@@ -328,7 +328,7 @@ Both quantization paths work: `--quantization mxfp8` on a BF16 checkpoint (quant
 
 On SM80-SM90, `auto` selects Marlin for NVFP4. The FlashInfer NVFP4 backends require FlashInfer to be installed.
 
-On ROCm gfx95, `auto` picks per Quark MXFP4 layer: `aiter` when AITER's tuned a4w4 GEMM CSV (`AITER_CONFIG_GEMM_A4W4`, or AITER's bundled tables) has a row for the layer's (N, K) on this GPU, `triton` otherwise. On other ROCm GPUs, `auto` selects `triton`. `aiter` uses the AITER GEMM for every eligible layer, tuned or not. Under both, layers with `N <= 128` stay on Triton. On a layer that uses the AITER GEMM, the fused-epilogue inputs of the Triton path (for example the split + cat of DeepSeek MLA `kv_b_proj`) run unfused after the GEMM. The deprecated `SGLANG_ROCM_USE_AITER_FP4_ASM_GEMM=1` is still honored as `--fp4-gemm-backend aiter` when the flag is left at `auto`.
+On ROCm, `auto` selects `triton`. `aiter` (gfx95 only) is opt-in because it is faster for some models and slower for others: for example, Qwen3.8-27B gains throughput with it, while DeepSeek-R1 MXFP4 decode is slower because its MLA projections receive pre-quantized activations. Under `aiter`, layers with `N <= 128` stay on Triton. On a layer that uses the AITER GEMM, the fused-epilogue inputs of the Triton path (for example the split + cat of DeepSeek MLA `kv_b_proj`) run unfused after the GEMM. The deprecated `SGLANG_ROCM_USE_AITER_FP4_ASM_GEMM=1` is still honored as `--fp4-gemm-backend aiter` when the flag is left at `auto`.
 
 ## Offline Quantization
 
