@@ -25,7 +25,7 @@ for (const [vendor, name, model, revision] of [
     assert.deepEqual(config.runModes({ hw: "xeon" }), ["python"]);
     assert.deepEqual(config.runModes({ hw: "h100" }), ["python", "docker"]);
     const cells = config.cells.filter((cell) => cell.match.hw === "xeon");
-    assert.equal(cells.length, 1);
+    assert.equal(cells.length, name === "ornith-1.0" ? 2 : 1);
     const [cell] = cells;
     assert.equal(cell.match.variant, "9b");
     assert.equal(cell.match.quant, "bf16");
@@ -66,5 +66,19 @@ for (const [vendor, name, model, revision] of [
       assert.equal(feature.showWhen({ hw: "xeon" }), false, axis);
       assert.equal(feature.showWhen({ hw: "h100" }), true, axis);
     }
+
   });
 }
+
+test("Ornith 1.0 35B uses its independent BF16 TP6 record, not its FP8 sibling", async () => {
+  const text = readFileSync(new URL("../../src/snippets/configs/deepreinforce-ai/ornith-1.0.jsx", import.meta.url), "utf8");
+  const { config } = await import("data:text/javascript," + encodeURIComponent(text));
+  const cell = config.cells.find((candidate) => candidate.match.hw === "xeon" && candidate.match.variant === "35b");
+  const command = engine(config).renderCommand(cell, cell.match, {});
+  for (const flag of [
+    "--model deepreinforce-ai/Ornith-1.0-35B", "--served-model-name Ornith-1.0-35B",
+    "--revision 5df2ed3f675c7beaa490328cc70bb573b65fb660",
+    "--device cpu", "--tp 6", "--dtype bfloat16", "--max-total-tokens 8192",
+  ]) assert.ok(command.includes(flag), flag);
+  assert.doesNotMatch(command, /-FP8|--reasoning-parser|--tool-call-parser|--speculative/);
+});
