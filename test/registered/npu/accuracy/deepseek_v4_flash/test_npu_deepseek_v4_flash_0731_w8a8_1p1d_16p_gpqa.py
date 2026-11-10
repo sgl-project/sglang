@@ -13,6 +13,9 @@ from sglang.test.ascend.e2e.test_npu_performance_utils import (
     run_bench_serving,
 )
 from sglang.test.ci.ci_register import register_npu_ci
+from sglang.test.ascend.e2e.test_npu_multi_node_utils import (
+    build_meta_service_config,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -35,16 +38,31 @@ def _get_first_visible_device():
     return int(devices.strip().split(",")[0])
 
 
-DEVICE_OFFSET = _get_first_visible_device()
-META_SERVICE_PORT = 5007 + DEVICE_OFFSET
-CONFIG_STORE_PORT = 6007 + DEVICE_OFFSET
-META_METRICS_PORT = 8007 + DEVICE_OFFSET
+# DEVICE_OFFSET = _get_first_visible_device()
+# META_SERVICE_PORT = 5007 + DEVICE_OFFSET
+# CONFIG_STORE_PORT = 6007 + DEVICE_OFFSET
+# META_METRICS_PORT = 8007 + DEVICE_OFFSET
+#
+# METASERVICE_CONFIG = {
+#     "meta_service_url": f"tcp://127.0.0.1:{META_SERVICE_PORT}",
+#     "config_store_url": f"tcp://127.0.0.1:{CONFIG_STORE_PORT}",
+#     "metrics_url": f"http://127.0.0.1:{META_METRICS_PORT}",
+# }
 
-METASERVICE_CONFIG = {
-    "meta_service_url": f"tcp://127.0.0.1:{META_SERVICE_PORT}",
-    "config_store_url": f"tcp://127.0.0.1:{CONFIG_STORE_PORT}",
-    "metrics_url": f"http://127.0.0.1:{META_METRICS_PORT}",
-}
+# Endpoints use the prefill pod's real IP (POD_IP) so a multi-pod prefill
+# instance can reach the MetaService across nodes.
+METASERVICE_CONFIG = build_meta_service_config()
+
+HICACHE_STORAGE_EXTRA_CONFIG = json.dumps(
+    {
+        "meta_service_url": METASERVICE_CONFIG["meta_service_url"],
+        "config_store_url": METASERVICE_CONFIG["config_store_url"],
+        "log_level": "info",
+        "world_size": 16,
+        "protocol": "device_sdma",
+        "dram_size": "4GB",
+    }
+)
 
 # Local service config for the npu_memcache L3 backend; it must point at the
 # same MetaService/config-store endpoints as METASERVICE_CONFIG.
@@ -64,7 +82,7 @@ HICACHE_STORAGE_EXTRA_CONFIG = json.dumps(
         "config_store_url": METASERVICE_CONFIG["config_store_url"],
         "log_level": "info",
         "world_size": 16,
-        "protocol": "device_rdma",
+        "protocol": "device_sdma",
         "dram_size": "4GB",
     }
 )
