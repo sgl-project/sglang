@@ -22,15 +22,16 @@ from abc import abstractmethod
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, List, Optional, Sequence, Tuple
 
+from sglang.srt.configs.model_config import is_deepseek_dsa
+from sglang.srt.dllm.config import DllmConfig
+from sglang.srt.layers.cp.cp_decode_attn_tp import can_defer_cp_decode_attn_tp
+from sglang.srt.layers.dp_attention import get_cuda_graph_batch_size_alignment
 from sglang.srt.model_executor.runner.base_runner import BaseRunner
 from sglang.srt.runtime_context import (
     get_exec,
     get_flags,
 )
-from sglang.srt.utils import (
-    get_cuda_graph_batch_size_alignment,
-    get_cuda_graph_max_batch_size,
-)
+from sglang.srt.utils import ceil_align
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
@@ -46,23 +47,32 @@ logger = logging.getLogger(__name__)
 def freeze_gc(enable_cudagraph_gc: bool):
     """Optimize garbage collection during CUDA graph capture.
 
-    Clean up first, then freeze remaining objects from being included in
-    future collections if GC is disabled during capture.
+    Clean up first. If GC is disabled during capture, freeze the remaining
+    objects and pause automatic collection until capture ends.
     """
     gc.collect()
     should_freeze = not enable_cudagraph_gc
+    gc_was_enabled = gc.isenabled()
     if should_freeze:
         gc.freeze()
+        # A collection can finalize a Triton kernel, and unloading its module
+        # on a capturing stream is not permitted and invalidates the capture.
+        gc.disable()
     try:
         yield
     finally:
         if should_freeze:
+            if gc_was_enabled:
+                gc.enable()
             gc.unfreeze()
             gc.collect()
 
 
 def get_batch_sizes_to_capture(
-    model_runner: ModelRunner, captured_req_width: int = 1
+    model_runner: ModelRunner,
+    captured_req_width: int = 1,
+    *,
+    gathered_buffer_required: Optional[bool] = None,
 ) -> Tuple[List[int], List[int]]:
     """Build the (capture_bs, compile_bs) lists for the decode runner.
 
@@ -72,8 +82,25 @@ def get_batch_sizes_to_capture(
 
     capture_bs = list(get_exec().graph.cuda_graph_config.decode.bs)
     num_max_requests = model_runner.req_to_token_pool.size
+    dllm_config = DllmConfig.from_server_args(model_runner.server_args)
+    if dllm_config is not None and dllm_config.requires_separate_context_encoding:
+        num_max_requests = min(num_max_requests, dllm_config.max_running_requests)
 
-    mul_base = get_cuda_graph_batch_size_alignment()
+    # These are decode/verify/draft buckets, not CP-prefill buckets. On the
+    # full-TP DSA dispatch path their rows are replicated across CP ranks, so
+    # padding to CP width only creates dummy requests (e.g. bs=4 for one
+    # six-token verify at CP8). Keep the original constraint elsewhere.
+    decode_uses_tp_rows = False
+    if can_defer_cp_decode_attn_tp():
+        hf_config = model_runner.model_config.hf_config
+        decode_uses_tp_rows = (
+            is_deepseek_dsa(hf_config)
+            and getattr(hf_config, "q_lora_rank", None) is not None
+        )
+    mul_base = get_cuda_graph_batch_size_alignment(
+        gathered_buffer_required=gathered_buffer_required,
+        include_cp_alignment=not decode_uses_tp_rows,
+    )
     # TBO splits each request's rows across two micro-batches, so the
     # alignment constraint applies per request rather than per token row.
     alignment_width = captured_req_width
@@ -81,7 +108,7 @@ def get_batch_sizes_to_capture(
         alignment_width = 1
 
     # pad `num_max_requests` to avoid being filtered out
-    num_max_requests = get_cuda_graph_max_batch_size(num_max_requests)
+    num_max_requests = ceil_align(num_max_requests, mul_base)
     if max(capture_bs) > num_max_requests:
         # In some cases (e.g., with a small GPU or --max-running-requests), the #max-running-requests
         # is very small. We add more values here to make sure we capture the maximum bs.

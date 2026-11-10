@@ -1,6 +1,6 @@
 """B200 per-commit coverage for the GLM-5.3-Flash serving recipes.
 
-Runs the Low Latency, DFlash2, and High Throughput TP4 recipes on four B200
+Runs the Low Latency and High Throughput TP4 recipes on four B200
 GPUs. All recipes must retain GSM8K accuracy; the Low Latency recipe also
 checks EAGLE speculative acceptance and single-request decode performance.
 """
@@ -19,10 +19,9 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=2400, stage="base-c", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=1068, stage="extra-b", runner_config="4-gpu-b200")
 
 MODEL_PATH = "zai-org/GLM-5.3-Flash"
-DFLASH2_DRAFT_MODEL_PATH = "incoai/GLM-5.3-Flash-DFlash2"
 SERVER_LAUNCH_TIMEOUT = 3600
 GPU_IDLE_TIMEOUT = 120
 
@@ -75,12 +74,14 @@ class TestGLM53FlashB200LowLatency(
     GSM8KMixin,
     _GLM53FlashB200Base,
 ):
-    gsm8k_score_threshold = 0.93
-    # Match the established DSA+MTP accuracy workload. The generic 200-question,
-    # 5-shot defaults leave a single question worth 0.5 percentage points and
-    # make this tight quality floor unnecessarily sensitive to kernel numerics.
-    gsm8k_num_examples = 500
-    gsm8k_num_shots = 20
+    gsm8k_score_threshold = 0.96
+    gsm8k_num_examples = 1319
+    gsm8k_num_threads = 256
+    gsm8k_backend = "sgl_eval"
+    gsm8k_thinking = True
+    gsm8k_max_tokens = 8192
+    gsm8k_temperature = 1.0
+    gsm8k_top_p = 0.95
     accept_length_thres = 4.0
     bs_1_speed_thres = 250
     server_args = [
@@ -100,34 +101,19 @@ class TestGLM53FlashB200HighThroughput(
     GSM8KMixin,
     _GLM53FlashB200Base,
 ):
-    gsm8k_score_threshold = 0.93
-    gsm8k_num_examples = 500
-    gsm8k_num_shots = 20
+    gsm8k_score_threshold = 0.96
+    gsm8k_num_examples = 1319
+    gsm8k_num_threads = 256
+    gsm8k_backend = "sgl_eval"
+    gsm8k_thinking = True
+    gsm8k_max_tokens = 8192
+    gsm8k_temperature = 1.0
+    gsm8k_top_p = 0.95
     server_args = [
         *COMMON_SERVER_ARGS,
-        "--enable-dp-attention",
-        "--dp-size",
+        "--attn-dp-size",
         "4",
-        "--cuda-graph-backend-prefill",
-        "breakable",
-    ]
-
-
-class TestGLM53FlashB200DFlash2(
-    GSM8KMixin,
-    _GLM53FlashB200Base,
-):
-    gsm8k_score_threshold = 0.93
-    gsm8k_num_examples = 500
-    gsm8k_num_shots = 20
-    server_args = [
-        *COMMON_SERVER_ARGS,
-        "--speculative-algorithm",
-        "DFLASH",
-        "--speculative-draft-model-path",
-        DFLASH2_DRAFT_MODEL_PATH,
-        "--speculative-draft-attention-backend",
-        "fa4",
+        "--mm-enable-dp-encoder",
     ]
 
 

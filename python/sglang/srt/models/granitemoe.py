@@ -21,6 +21,7 @@ from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -30,7 +31,6 @@ from sglang.srt.models import mixtral
 from sglang.srt.models.granite import build_attention_sinks, granite_layer_attn_params
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix
 
 SHARED_MOE_MODEL_TYPES = frozenset({"granitemoeshared", "granitemoe_swa"})
 
@@ -118,6 +118,7 @@ class GraniteMoeMoE(nn.Module):
         params_dtype: Optional[torch.dtype] = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        reduce_results: bool = True,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -145,10 +146,15 @@ class GraniteMoeMoE(nn.Module):
             intermediate_size=intermediate_size,
             layer_id=layer_id,
             params_dtype=params_dtype,
-            reduce_results=True,
+            reduce_results=reduce_results,
             quant_config=quant_config,
+            # granitemoe_load_split_experts maps llmcompressor's per-expert
+            # tensors onto the `_packed` param names, which Mxfp4MoEMethod
+            # does not register.
+            serves_fused_mxfp4=False,
             prefix=f"{prefix}.experts",
         )
+        self.topk.bind_runner_backend(self.experts.runner_backend)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # NOTE: hidden_states can have either 1D or 2D shape.
@@ -166,6 +172,7 @@ class GraniteMoeSharedMLP(nn.Module):
         config: GraniteConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        reduce_results: bool = True,
     ) -> None:
         super().__init__()
 
@@ -183,6 +190,7 @@ class GraniteMoeSharedMLP(nn.Module):
             self.input_size,
             bias=False,
             quant_config=quant_config,
+            reduce_results=reduce_results,
             prefix=add_prefix("output_linear", prefix),
         )
         if config.hidden_act != "silu":

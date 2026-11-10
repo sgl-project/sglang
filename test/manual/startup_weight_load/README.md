@@ -76,6 +76,11 @@ buffers, and EAGLE token-mapped target heads. Auto mode selects serial loading;
 forced overlap rejects them before capture-safe preparation. Ordinary dtype and
 parallelism validation remains in the normal startup pipeline.
 
+Modules that declare non-reloadable derived-weight caches through
+`_derived_weight_cache_error` also select serial in auto mode. Paged experts is
+one such path; forced overlap rejects it before capture-safe preparation. This
+follows the module's cache contract, not every restriction on online updates.
+
 LoRA/UNO with serialized block-FP8 weights also selects serial in auto mode:
 the wrappers hide checkpoint scale names before deferred loading. Unquantized
 dense LoRA remains eligible.
@@ -117,6 +122,16 @@ positive serial/replay regression; do not preserve the old failure expectation.
   work; an H100 check cannot establish a different GPU's conversion path.
 
 ## Coverage limits and development record
+
+On 2026-11-10, the refresh against main `6d12127cbb` passed 168 focused CPU
+tests, all five retained GPU layer checks, and the CPU-offload engine comparison,
+with no skips. H100 validation used PyTorch 2.14.1+cu130, FlashInfer 0.7.3,
+Transformers 5.19.0, and `sglang-kernel` 0.4.10. Serial and overlap captured
+prefill/decode graphs and matched token IDs and logprobs within `1e-5` for batches
+1, 3, and 3. The engine used the native Python TreeCore fallback, so this does not
+cover Rust TreeCore. Auxiliary adaptive/UNO backend refresh registration has
+CPU lifecycle coverage, not a full adaptive-model end-to-end run. Performance
+was not remeasured.
 
 After merging main `cebca698e` on 2026-09-13, all five retained GPU layer checks
 and the CPU-offload engine comparison passed again on H100, with no skips.

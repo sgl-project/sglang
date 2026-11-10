@@ -11,8 +11,9 @@ import logging
 from typing import TYPE_CHECKING, Callable, Optional, Tuple
 
 from sglang.srt.disaggregation.common.conn import CommonKVReceiver
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.io_struct import PdRoleSwitchReqInput, PdRoleSwitchReqOutput
+from sglang.srt.managers.scheduler_components.request_list import ListKind
 from sglang.srt.runtime_context import get_context, get_device, get_disagg
 from sglang.srt.utils import get_available_gpu_memory
 
@@ -75,6 +76,14 @@ def handle_pd_role_switch(
             "instance is not idle; drain all requests before switching",
             safe_to_restore=True,
         )
+    # is_fully_idle skips them so a weight update can flush during a retract
+    # pause, but the teardown would drop them unanswered.
+    if scheduler.request_lists().get(ListKind.PD_HELD):
+        return _fail(
+            "a retract pause holds requests; resume generation and drain them "
+            "before switching",
+            safe_to_restore=True,
+        )
 
     required_graph_gb = recv_req.decode_cuda_graph_memory_gb
     # Same condition ensure_decode_cuda_graphs skips on, so the check cannot be
@@ -109,6 +118,16 @@ def handle_pd_role_switch(
                 f"available={available_graph_gb:.3f} GB",
                 safe_to_restore=True,
             )
+
+    if recv_req.prepare_only:
+        # The tokenizer checks every DP worker before allowing any teardown.
+        return PdRoleSwitchReqOutput(
+            success=True,
+            message="ready",
+            old_role=old_role,
+            new_role=new_role,
+            safe_to_restore=True,
+        )
 
     scheduler._pd_role_switch_in_progress = True
     try:
@@ -237,7 +256,7 @@ def teardown_disaggregation(scheduler: Scheduler) -> None:
             if km is not None:
                 km.teardown()
             scheduler.disagg_prefill_bootstrap_queue = None
-        scheduler.disagg_prefill_inflight_queue = []
+        scheduler.disagg_prefill_transfer_queue.clear()
     elif mode == DisaggregationMode.DECODE:
         q = getattr(scheduler, "disagg_decode_prealloc_queue", None)
         if q is not None:
@@ -256,7 +275,7 @@ def teardown_disaggregation(scheduler: Scheduler) -> None:
 def _release_prefix_cache_for_role_switch(scheduler: Scheduler) -> None:
     """Release the prefix (radix/hicache) cache so a flip works with radix ON.
 
-    With radix disabled (ChunkCache) the flip needs nothing here: ChunkCache
+    With radix disabled the flip needs nothing here: the disabled cache
     keeps no persistent prefixes and, since the instance is idle before the
     switch, the allocator is already empty. This is the historical
     ``--disable-radix-cache`` path, left untouched by the guard below.

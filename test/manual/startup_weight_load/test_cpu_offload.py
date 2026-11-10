@@ -9,6 +9,7 @@ from torch import nn
 
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.layers.linear import ReplicatedLinear
+from sglang.srt.layers.offloader import OffloaderV1
 from sglang.srt.layers.quantization import fp8_utils
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.model_executor.model_runner_components.startup_weight_load import (
@@ -16,7 +17,6 @@ from sglang.srt.model_executor.model_runner_components.startup_weight_load impor
 )
 from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.runtime_context import get_context
-from sglang.srt.utils.offloader import OffloaderV1
 from sglang.test.test_utils import CustomTestCase
 
 

@@ -12,12 +12,7 @@ import { config } from '/src/snippets/configs/inclusionAI/ming-image.jsx';
 
 ## 1. Quick start
 
-Install the dependencies, then this integration from its source checkout:
-
-```bash Installation
-uv pip install "sglang[diffusion]" --prerelease=allow
-uv pip install -e "python[diffusion]" --no-deps
-```
+Use a nightly Docker image containing this integration, or install from source, following the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installation). Run the commands below inside that environment.
 
 Choose **Design** for generation or editing and **Design-Layer** for decomposition.
 The two checkpoints require separate servers. Start with one H200 on Linux/CUDA;
@@ -96,9 +91,19 @@ or parallel topologies.
 Full-checkpoint validation covers generation, editing, and layer decomposition
 on H200, including repeated HTTP requests before and after warmup. Tested
 resolutions include 2048-square generation and four-layer 1024-square
-decomposition. See the [compatibility notes](/docs/sglang-diffusion/compatibility_matrix#ming-image-integration-status)
-for the tested feature scope. Other GPU families and quantized checkpoints
-have not been validated for this model.
+decomposition, plus repeated 512-square HTTP generation and editing with one or
+two sequential generations per request.
+
+The validated runtime scope is:
+
+- One H200: DiT and encoder layerwise offload, opt-in VAE tiling, Cache-DiT,
+  SageAttention, breakable CUDA graph replay, and dynamic LoRA loading/removal
+  with a synthetic adapter.
+- Two H200s: DiT TP2, Ulysses2, Ring2 with FlashAttention, CFG parallelism for
+  Design-Layer, encoder folding, and spatial VAE decoding.
+
+These are functional checks, not quality-equivalence claims for lossy
+optimizations. Other GPU families and quantized checkpoints remain unverified.
 
 See [performance optimization](/docs/sglang-diffusion/performance-optimization)
 for shared runtime controls and the

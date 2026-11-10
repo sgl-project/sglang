@@ -3,14 +3,11 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.layers.moe.utils import (
-    draft_model_build_scope,
-    speculative_moe_backend_context,
-)
+from sglang.srt.configs.draft_parallel import DraftParallelSpec, DraftTPExecution
+from sglang.srt.layers.moe.utils import draft_model_build_scope
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.runtime_context import (
     get_device,
-    get_parallel,
     get_schedule,
     get_spec,
 )
@@ -22,6 +19,7 @@ from sglang.srt.speculative.base_spec_worker import (
     BaseSpecWorker,
     EagleDraftWorkerBase,
 )
+from sglang.srt.speculative.draft_parallel import resolve_draft_parallel_layout
 from sglang.srt.speculative.eagle_utils import default_tree_mask_mode
 from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker, EAGLEWorkerV2
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -30,7 +28,7 @@ from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
     get_plan_stream,
 )
-from sglang.srt.utils import empty_context, get_bool_env_var
+from sglang.srt.utils import get_bool_env_var
 
 logger = logging.getLogger(__name__)
 SGLANG_RETURN_ORIGINAL_LOGPROB = get_bool_env_var("SGLANG_RETURN_ORIGINAL_LOGPROB")
@@ -72,11 +70,20 @@ class StandaloneDraftWorker(EagleDraftWorker):
             self.speculative_num_steps * self.topk, self.speculative_num_draft_tokens
         )
 
+        # Retain the target's attention topology when swapping TP groups.
+        self.parallel_layout = resolve_draft_parallel_layout(
+            DraftParallelSpec(tp_execution=DraftTPExecution.TARGET_LAYOUT)
+        )
+
         # Load draft model weights only. The standalone draft is a real model
         # whose MoE gates run during construction; the scope routes their
         # fusion decision to the speculative leaf (it does not swap
         # runner_backend — the draft's forwards run outside that context).
-        with draft_pp_context(), draft_model_build_scope():
+        with (
+            draft_tp_context(self.parallel_layout),
+            draft_pp_context(),
+            draft_model_build_scope(),
+        ):
             self.draft_worker = TpModelWorker(
                 server_args=server_args,
                 gpu_id=gpu_id,
@@ -88,11 +95,6 @@ class StandaloneDraftWorker(EagleDraftWorker):
 
         # Alias for better readability
         self.draft_runner = self.draft_worker.model_runner
-        # Retain the target's attention topology when swapping TP groups.
-        self.draft_owns_attention = False
-        self.draft_tp_context = (
-            draft_tp_context if get_parallel().enable_dp_attention else empty_context
-        )
         self.tree_mask_mode = default_tree_mask_mode()
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
         # draft_forward reads this (set in EagleDraftWorker.__init__, skipped here).
@@ -125,26 +127,6 @@ class StandaloneDraftWorker(EagleDraftWorker):
         )
         self.init_token_map()
         self.init_lm_head()
-
-    def init_attention_backends(self):
-        with (
-            self.draft_tp_context(
-                self.draft_runner.tp_group,
-                owns_attention=self.draft_owns_attention,
-            ),
-            speculative_moe_backend_context(),
-        ):
-            super().init_attention_backends()
-
-    def init_cuda_graphs(self):
-        with (
-            self.draft_tp_context(
-                self.draft_runner.tp_group,
-                owns_attention=self.draft_owns_attention,
-            ),
-            speculative_moe_backend_context(),
-        ):
-            super().init_cuda_graphs()
 
     def init_lm_head(self):
         """Override to prevent sharing embeddings and lm_head with target model."""

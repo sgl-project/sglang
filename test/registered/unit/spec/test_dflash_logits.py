@@ -12,7 +12,7 @@ from sglang.srt.models.dflash import (
 from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=38, suite="base-a-test-cpu")
+register_cpu_ci(est_time=42, suite="base-a-test-cpu")
 
 
 def test_dflash_unary_logit_transform():
@@ -78,6 +78,7 @@ def test_selector_rejects_a_quantized_target_lm_head():
     model = SimpleNamespace(
         lm_head=SimpleNamespace(weight=torch.empty(8, 4, dtype=torch.int8)),
         candidate_selector=SimpleNamespace(top_k=4),
+        merge_candidates_fused=False,
     )
     with pytest.raises(RuntimeError, match="requires a dense"):
         DFlash2DraftModel.compute_candidates(model, torch.randn(2, 4))
@@ -136,6 +137,7 @@ def test_selector_projects_a_quantized_target_lm_head_through_its_quant_method(
         lm_head=lm_head,
         candidate_selector=SimpleNamespace(top_k=4),
         _transform_unary_logits=lambda logits: logits.float(),
+        merge_candidates_fused=False,
     )
     monkeypatch.setattr(
         "sglang.srt.models.dflash.get_parallel",
@@ -179,6 +181,7 @@ def test_selector_gathers_global_candidates_across_vocab_shards(monkeypatch):
         lm_head=lm_head,
         candidate_selector=SimpleNamespace(top_k=k),
         _transform_unary_logits=lambda logits: logits.float(),
+        merge_candidates_fused=False,
     )
 
     # Rank 0's gathered contribution, synthesized from the reference weights.
@@ -248,7 +251,7 @@ def test_worker_folds_a_gate_admitted_quantized_selector_head(monkeypatch):
     worker = SimpleNamespace(
         block_size=8,
         selector=object(),
-        model_runner=SimpleNamespace(tp_rank=0),
+        _target_tp_rank=0,
         ps=SimpleNamespace(tp_rank=0),
         draft_model=SimpleNamespace(lm_head=None),
         device="cpu",
@@ -270,64 +273,6 @@ def test_worker_folds_a_gate_admitted_quantized_selector_head(monkeypatch):
     worker.draft_model.lm_head = None
     assert worker_mod.DFlashWorkerV2._maybe_build_draft_sampler(worker) is None
     assert worker.draft_model.lm_head is None
-
-
-def test_lilicorr_sampling_falls_back_when_the_device_cannot_accept_it(monkeypatch):
-    from sglang.srt.speculative import dflash_worker_v2 as worker_mod
-
-    warnings = []
-    monkeypatch.setattr(
-        worker_mod.logger, "warning", lambda *args: warnings.append(args)
-    )
-    monkeypatch.setattr(
-        worker_mod, "is_dflash_sampling_verify_available", lambda: False
-    )
-    worker = SimpleNamespace(
-        selector=None,
-        lilicorr=object(),
-        _lilicorr_sampling_enabled=False,
-        _warned_sampling_fallback=False,
-        model_runner=SimpleNamespace(tp_rank=0),
-    )
-    batch = SimpleNamespace(sampling_info=SimpleNamespace(is_all_greedy=False))
-
-    worker_mod.DFlashWorkerV2._validate_phase1_sampling_support(worker, batch)
-    assert worker._warned_sampling_fallback
-    assert len(warnings) == 1
-
-    worker._lilicorr_sampling_enabled = True
-    worker._warned_sampling_fallback = False
-    worker_mod.DFlashWorkerV2._validate_phase1_sampling_support(worker, batch)
-    assert len(warnings) == 1
-
-
-def test_worker_warns_once_when_selector_sampling_is_disabled(monkeypatch):
-    from sglang.srt.speculative import dflash_worker_v2 as worker_mod
-
-    warnings = []
-    monkeypatch.setattr(
-        worker_mod.logger, "warning", lambda *args: warnings.append(args)
-    )
-    worker = SimpleNamespace(
-        selector=object(),
-        _selector_sampling_enabled=False,
-        _warned_sampling_fallback=False,
-        model_runner=SimpleNamespace(tp_rank=0),
-        ps=SimpleNamespace(tp_rank=0),
-    )
-    batch = SimpleNamespace(sampling_info=SimpleNamespace(is_all_greedy=False))
-
-    worker_mod.DFlashWorkerV2._validate_phase1_sampling_support(worker, batch)
-    worker_mod.DFlashWorkerV2._validate_phase1_sampling_support(worker, batch)
-
-    assert worker._warned_sampling_fallback
-    assert len(warnings) == 1
-    assert "sampling distribution will not be preserved" in warnings[0][0]
-
-    worker._selector_sampling_enabled = True
-    worker._warned_sampling_fallback = False
-    worker_mod.DFlashWorkerV2._validate_phase1_sampling_support(worker, batch)
-    assert len(warnings) == 1
 
 
 def test_disabled_selector_sampling_forces_greedy_draft():
@@ -398,10 +343,16 @@ def test_selector_accept_uses_greedy_fallback_without_staged_sample(monkeypatch)
     monkeypatch.setattr(
         worker_mod, "is_dflash_sampling_verify_available", lambda: False
     )
+    observed = {}
+
+    def fake_correct_drafts_and_bonus(**kwargs):
+        observed.update(kwargs)
+        return torch.tensor([0]), torch.tensor([7])
+
     monkeypatch.setattr(
         worker_mod,
         "compute_dflash_correct_drafts_and_bonus",
-        lambda **kwargs: (torch.tensor([0]), torch.tensor([7])),
+        fake_correct_drafts_and_bonus,
     )
 
     sync_sites = []
@@ -425,12 +376,12 @@ def test_selector_accept_uses_greedy_fallback_without_staged_sample(monkeypatch)
         bs=1,
     )
 
-    accept_len, commit_lens, bonus, out_tokens, _, target_predict = result
+    accept_len, commit_lens, bonus, out_tokens, _ = result
     assert accept_len.tolist() == [0]
     assert commit_lens.tolist() == [1]
     assert bonus.tolist() == [7]
     assert out_tokens.tolist() == [[7, 0]]
-    assert target_predict.tolist() == [[1, 0]]
+    assert observed["target_predict"].tolist() == [[1, 0]]
     assert sync_sites == [worker_mod.SpecTpSyncSite.DFLASH_ACCEPT_GREEDY]
 
 

@@ -17,12 +17,14 @@ from sglang.srt.compilation.compile_phase import (
     get_pcg_capture_stream,
     is_in_torch_compile_warmup,
 )
-from sglang.srt.compilation.weak_ref_tensor import weak_ref_tensors
+from sglang.srt.model_executor.runner_backend_utils.weak_ref_tensor import (
+    weak_ref_tensors,
+)
 from sglang.srt.model_executor.runner_utils.pool import (
     graph_pool_capture_scope,
     graph_pool_replay_scope,
 )
-from sglang.srt.utils.common import print_warning_once
+from sglang.srt.utils.log_utils import print_warning_once
 
 logger = logging.getLogger(__name__)
 

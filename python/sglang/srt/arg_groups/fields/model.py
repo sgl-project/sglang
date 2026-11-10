@@ -16,16 +16,14 @@ from sglang.srt.arg_groups.arg_utils import (
     A,
     Arg,
     Derived,
+    json_list_type,
+    nullable_str,
 )
 from sglang.srt.arg_groups.choices import (
     LOAD_FORMAT_CHOICES,
     QUANTIZATION_CHOICES,
 )
-from sglang.srt.utils.common import (
-    human_readable_int,
-    json_list_type,
-    nullable_str,
-)
+from sglang.srt.utils.common import human_readable_int
 
 
 class Model(msgspec.Struct):
@@ -41,6 +39,12 @@ class Model(msgspec.Struct):
     should_attempt_startup_weight_load_overlap = Derived(
         fn="sglang.srt.arg_groups.model_override_base.should_attempt_startup_weight_load_overlap_of",
         doc="Whether to check admission for deferred startup weight loading.",
+    )
+
+    # Runtime-only binding: loaders/runners scope the immutable model-owned value.
+    shared_experts = Derived(
+        fn="sglang.srt.configs.shared_experts.default_shared_experts_config",
+        doc="Shared-expert layout of the model being constructed or executed.",
     )
 
     # -------------------------------------------------------------------------
@@ -62,6 +66,8 @@ class Model(msgspec.Struct):
             "is not available. "
             '"pt" will load the weights in the pytorch bin format. '
             '"safetensors" will load the weights in the safetensors format. '
+            '"instanttensor" will load Safetensors weights using '
+            "InstantTensor's high-performance distributed loader. "
             '"npcache" will load the weights in pytorch format and store '
             "a numpy cache to speed up the loading. "
             '"dummy" will initialize the weights with random values, '
@@ -114,6 +120,13 @@ class Model(msgspec.Struct):
     is_embedding: A[
         bool,
         "Whether to use a CausalLM as an embedding model.",
+    ] = False
+    disable_normalize_embedding: A[
+        bool,
+        "Disable the L2 normalization the embedding Pooler applies after pooling, "
+        "returning the raw pooled vector. Only affects models whose Pooler is built "
+        "with normalize=True; custom poolers (cross-encoder, BERT pooler, vision "
+        "pooler) are unaffected.",
     ] = False
     revision: A[
         Optional[str],

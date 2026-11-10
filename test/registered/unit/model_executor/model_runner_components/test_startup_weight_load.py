@@ -12,7 +12,12 @@ import torch
 from torch import nn
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
+from sglang.test.test_utils import (
+    CustomTestCase,
+    enter_scope,
+    maybe_stub_sgl_kernel,
+    published_topology,
+)
 
 maybe_stub_sgl_kernel()
 
@@ -38,7 +43,6 @@ from sglang.srt.model_executor.model_runner_components.startup_weight_load impor
     _get_native_model_class,
     _get_startup_weight_load_profile,
     evaluate_startup_weight_load_admission,
-    refresh_attention_weight_copies,
 )
 from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.model_loader.weight_utils import (
@@ -1044,6 +1048,33 @@ class TestStartupWeightLoadSelector(CustomTestCase):
                             options=options,
                         )
 
+    def test_sm120_distinguishes_dense_and_moe_scale_conversion(self):
+        """SM120 keeps dense FP8 scales but repacks DeepGEMM MoE scales."""
+        with (
+            patch("sglang.srt.model_loader.utils.get_device_sm", return_value=120),
+            patch("sglang.srt.layers.deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM", True),
+            patch("sglang.srt.layers.deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0", True),
+        ):
+            options = _make_options(
+                fp8_gemm_runner_backend="deep_gemm",
+                moe_runner_backend="deep_gemm",
+            )
+            for make_config, rejected in (
+                (_make_model_config, False),
+                (_make_qwen3_moe_model_config, True),
+            ):
+                with self.subTest(model=make_config.__name__):
+                    config = make_config(quantization="fp8")
+                    config.hf_config.quantization_config = {
+                        "quant_method": "fp8",
+                        "weight_block_size": [128, 128],
+                    }
+                    if rejected:
+                        with self.assertRaisesRegex(ValueError, "moe_runner_backend"):
+                            self._create(model_config=config, options=options)
+                    else:
+                        self._create(model_config=config, options=options)
+
     def test_glm_fp8_auto_linear_checks_the_resolved_backend(self):
         from sglang.srt.layers.quantization.fp8_utils import (
             deepgemm_w8a8_block_fp8_linear_with_fallback,
@@ -1237,6 +1268,34 @@ class TestStartupWeightLoadManager(CustomTestCase):
                     )
                 else:
                     with self.assertRaisesRegex(ValueError, "checkpoint KV scales"):
+                        manager.prepare()
+                    self.assertEqual(trace, ["initialize", "resolve"])
+                    torch.testing.assert_close(model.weight, before)
+
+    def test_non_reloadable_weight_cache_falls_back_before_capture(self):
+        """One-shot weight caches must not consume loader state before commit."""
+        for auto in (False, True):
+            with self.subTest(auto=auto):
+                trace = []
+                model = _TiedWeightModel()
+                model.experts = nn.Module()
+                model.experts._derived_weight_cache_error = (
+                    "paged experts cannot reload"
+                )
+                before = model.weight.detach().clone()
+                loader = _RecordingLoader(model, trace)
+                manager = self._manager(loader, fallback_to_serial=auto)
+
+                if auto:
+                    self.assertIs(manager.prepare(), model)
+                    self.assertEqual(trace, ["initialize", "resolve", "serial_load"])
+                    self.assertEqual(manager.state, StartupWeightLoadState.READY)
+                    self.assertFalse(manager.is_deferred)
+                    torch.testing.assert_close(
+                        model.weight, torch.full_like(model.weight, 3)
+                    )
+                else:
+                    with self.assertRaisesRegex(ValueError, "paged experts"):
                         manager.prepare()
                     self.assertEqual(trace, ["initialize", "resolve"])
                     torch.testing.assert_close(model.weight, before)
@@ -1561,6 +1620,43 @@ class TestStartupWeightLoadManager(CustomTestCase):
         self.assertEqual(trace[-3:], ["commit", "refresh", "synchronize"])
         self.assertEqual(manifest.changed_names(model), ())
         torch.testing.assert_close(model.weight_copy, torch.full_like(model.weight, 3))
+
+    def test_additional_attention_backends_refresh_after_commit(self):
+        """Inactive adaptive graph states must not retain pre-load weight copies."""
+        model = _TiedWeightModel()
+        manager = self._manager(_RecordingLoader(model, []))
+        manager.prepare()
+        manager.start_prefetch()
+        runner = ModelRunner.__new__(ModelRunner)
+        runner.startup_weight_load = manager
+        backends = [
+            SimpleNamespace(weight_copy=model.weight.detach().clone()) for _ in range(2)
+        ]
+        pointers = [backend.weight_copy.data_ptr() for backend in backends]
+        for backend in backends:
+            backend.on_after_weight_load = lambda backend=backend: (
+                backend.weight_copy.copy_(model.weight)
+            )
+
+        with patch(
+            "sglang.srt.model_executor.model_runner.get_attention_backend",
+            side_effect=backends,
+        ):
+            for backend in backends:
+                self.assertIs(
+                    runner._get_attention_backend(init_new_workspace=True), backend
+                )
+        with (
+            patch(f"{_STARTUP_MODULE}.monkey_patch_vllm_parallel_state"),
+            patch(f"{_STARTUP_MODULE}.torch.cuda.synchronize"),
+        ):
+            manager.finalize()
+
+        for backend, pointer in zip(backends, pointers):
+            torch.testing.assert_close(
+                backend.weight_copy, torch.full_like(model.weight, 3)
+            )
+            self.assertEqual(backend.weight_copy.data_ptr(), pointer)
 
     def test_refresh_cannot_replace_graph_visible_storage(self):
         model = _TiedWeightModel()
@@ -2367,17 +2463,22 @@ class _RunnerStartupManager:
 
 class TestModelRunnerStartupWeightLoadOwnership(CustomTestCase):
     def setUp(self):
-        # The code under test reads its config from the bags.
-        reset_context()
-        self.addCleanup(reset_context)
-        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+        # The code under test reads its config and its rank from the context.
+        enter_scope(self, published_topology())
 
-    def test_shared_attention_roots_refresh_once(self):
+    def test_refresh_uses_the_single_owned_attention_root(self):
+        from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
+
         trace = []
         shared = SimpleNamespace(on_after_weight_load=lambda: trace.append("shared"))
-        extra = SimpleNamespace(on_after_weight_load=lambda: trace.append("extra"))
-        refresh_attention_weight_copies(shared, shared, [shared, None, extra])
-        self.assertEqual(trace, ["shared", "extra"])
+        backend = HybridAttnBackend.__new__(HybridAttnBackend)
+        backend.prefill_backend = backend.decode_backend = shared
+        runner = self._runner(None)
+        runner.attn_backend = backend
+
+        runner._refresh_startup_weight_copies()
+
+        self.assertEqual(trace, ["shared"])
 
     def test_retained_serial_fallback_does_not_overwrite_timing_or_repeat_barrier(self):
         trace = []
@@ -2410,17 +2511,15 @@ class TestModelRunnerStartupWeightLoadOwnership(CustomTestCase):
             elastic_ep_backend=None,
             is_ep_joiner=False,
         )
-        runner.tp_rank = 0
         runner.weight_load_time = 0.0
-        runner.attn_backend = None
-        runner.decode_attn_backend = None
-        runner.decode_attn_backend_group = []
+        runner.attn_backend = SimpleNamespace(on_after_weight_load=lambda: None)
         return runner
 
     def test_success_releases_ownership_after_the_barrier(self):
         trace = []
         manager = _RunnerStartupManager(trace)
         runner = self._runner(manager)
+        runner.attn_backend.on_after_weight_load = lambda: trace.append("refresh")
 
         def barrier(**kwargs):
             self.assertIs(runner.startup_weight_load, manager)
@@ -2436,7 +2535,7 @@ class TestModelRunnerStartupWeightLoadOwnership(CustomTestCase):
         ):
             runner.finalize_startup_weight_load()
 
-        self.assertEqual(trace, ["finalize", "barrier"])
+        self.assertEqual(trace, ["finalize", "refresh", "barrier"])
         self.assertEqual(runner.weight_load_time, 8.0)
         self.assertIsNone(runner.startup_weight_load)
 
@@ -2450,6 +2549,7 @@ class _SchedulerWorker:
             forward_stream=object(),
             prewarm_sampling=lambda: trace.append("prewarm"),
             token_to_kv_pool=SimpleNamespace(post_capture_active=post_capture_active),
+            token_to_kv_pool_allocator=None,
             post_capture_resize_kv_pool=Mock(
                 side_effect=lambda *, draft_runners: trace.append("resize")
             ),
@@ -2496,6 +2596,7 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
         )
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.enable_overlap = enable_overlap
+        scheduler.enable_unified_memory = False
         scheduler.init_tp_model_worker = lambda: setattr(scheduler, "tp_worker", worker)
         scheduler.maybe_init_draft_worker = lambda: setattr(
             scheduler, "draft_worker", draft_worker

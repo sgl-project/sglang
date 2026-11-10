@@ -36,15 +36,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def refresh_attention_weight_copies(attn_backend, decode_backend, decode_group) -> None:
-    """Refresh backend-owned weight copies without replacing captured storage."""
-    seen = set()
-    for backend in (attn_backend, decode_backend, *(decode_group or ())):
-        if backend is not None and id(backend) not in seen:
-            seen.add(id(backend))
-            backend.on_after_weight_load()
-
-
 def _resolve_llama_model_class():
     from sglang.srt.models.llama import LlamaForCausalLM
 
@@ -214,11 +205,13 @@ def _checkpoint_block_fp8_size(model_config: ModelConfig) -> tuple:
     )
 
 
-def _requires_fp8_scale_conversion(block_size: tuple) -> bool:
+def _requires_fp8_scale_conversion(
+    block_size: tuple, *, grouped_moe: bool = False
+) -> bool:
     from sglang.srt.model_loader.utils import should_deepgemm_weight_requant_ue8m0
 
     return block_size == (128, 128) and should_deepgemm_weight_requant_ue8m0(
-        weight_block_size=list(block_size)
+        weight_block_size=list(block_size), grouped_moe=grouped_moe
     )
 
 
@@ -293,7 +286,7 @@ def _moe_weight_rules(
 
     a2a = MoeA2ABackend(options.moe_a2a_backend)
     converts_scales = False
-    if _requires_fp8_scale_conversion(block_size):
+    if _requires_fp8_scale_conversion(block_size, grouped_moe=True):
         from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
 
         converts_scales = Fp8MoEMethod.is_deepgemm_moe_runner_backend_enabled(
@@ -777,6 +770,11 @@ class StartupWeightLoadManager:
         self._prefetch_failure_reported = False
         self._prefetch_stop_timed_out = False
         self._timings: Optional[StartupWeightLoadTimings] = None
+        self._weight_load_refreshes: list[Callable[[], None]] = []
+
+    def register_weight_load_refresh(self, refresh: Callable[[], None]) -> None:
+        """Retain refreshes for auxiliary backends built before the weight commit."""
+        self._weight_load_refreshes.append(refresh)
 
     @classmethod
     def create_from_published_config(
@@ -968,6 +966,12 @@ class StartupWeightLoadManager:
         from sglang.srt.layers.moe.utils import get_moe_runner_backend
         from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 
+        # One-shot caches (e.g. paged experts) cannot defer their first real load.
+        for module in model.modules():
+            reason = getattr(module, "_derived_weight_cache_error", None)
+            if reason:
+                return f"startup overlap requires reloadable weight caches: {reason}"
+
         # FP8 checkpoints can leave individual expert layers unquantized.
         if not get_moe_runner_backend().is_flashinfer_trtllm_routed():
             for module in model.modules():
@@ -1027,6 +1031,9 @@ class StartupWeightLoadManager:
         )
         if after_weight_load is not None:
             after_weight_load()
+        for refresh in self._weight_load_refreshes:
+            refresh()
+        self._weight_load_refreshes.clear()
         torch.cuda.synchronize()
         changed_names = manifest.changed_names(self._model)
         if changed_names:

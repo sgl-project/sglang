@@ -28,6 +28,29 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 
+def verify_latent_preparation_inputs(batch: Req) -> VerificationResult:
+    """Input contract shared by generic and model-specific latent preparation."""
+    result = VerificationResult()
+    result.add_check(
+        "prompt_or_embeds",
+        None,
+        lambda _: (
+            V.string_or_list_strings(batch.prompt)
+            or V.list_not_empty(batch.prompt_embeds)
+        ),
+    )
+    result.add_check("prompt_embeds", batch.prompt_embeds, V.list_of_tensors)
+    result.add_check(
+        "num_videos_per_prompt", batch.num_outputs_per_prompt, V.positive_int
+    )
+    result.add_check("generator", batch.generator, V.generator_or_list_generators)
+    result.add_check("num_frames", batch.num_frames, V.positive_int)
+    result.add_check("height", batch.height, V.positive_int)
+    result.add_check("width", batch.width, V.positive_int)
+    result.add_check("latents", batch.latents, V.none_or_tensor)
+    return result
+
+
 @dataclass(frozen=True)
 class LatentPreparationFingerprint:
     height: int | None
@@ -352,25 +375,7 @@ class LatentPreparationStage(PipelineStage):
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         """Verify latent preparation stage inputs."""
-        result = VerificationResult()
-        result.add_check(
-            "prompt_or_embeds",
-            None,
-            lambda _: (
-                V.string_or_list_strings(batch.prompt)
-                or V.list_not_empty(batch.prompt_embeds)
-            ),
-        )
-        result.add_check("prompt_embeds", batch.prompt_embeds, V.list_of_tensors)
-        result.add_check(
-            "num_videos_per_prompt", batch.num_outputs_per_prompt, V.positive_int
-        )
-        result.add_check("generator", batch.generator, V.generator_or_list_generators)
-        result.add_check("num_frames", batch.num_frames, V.positive_int)
-        result.add_check("height", batch.height, V.positive_int)
-        result.add_check("width", batch.width, V.positive_int)
-        result.add_check("latents", batch.latents, V.none_or_tensor)
-        return result
+        return verify_latent_preparation_inputs(batch)
 
     def verify_output(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         """Verify latent preparation stage outputs."""

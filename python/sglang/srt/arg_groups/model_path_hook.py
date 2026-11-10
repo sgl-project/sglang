@@ -9,14 +9,14 @@ import logging
 import os
 from typing import Any, Optional
 
+from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.arg_groups.overrides import (
     _gguf_quantization,
     declare_resolution,
-    resolving_view,
     run_post_process_pass,
 )
-from sglang.srt.utils.common import is_remote_url
-from sglang.srt.utils.hf_transformers_utils import check_gguf_file
+from sglang.srt.hf_transformers import check_gguf_file
+from sglang.srt.utils.common import find_local_repo_dir, is_remote_url
 from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 
 logger = logging.getLogger(__name__)
@@ -45,7 +45,7 @@ def handle_model_source_paths(server_args: Any):
 def resolve_hf_gguf_model_path(server_args: Any):
     """Turn a Hub reference to a .gguf into a local file path."""
     cfg = resolving_view(server_args)
-    from sglang.srt.utils.hf_transformers_utils import resolve_hf_gguf_reference
+    from sglang.srt.hf_transformers import resolve_hf_gguf_reference
 
     resolved = resolve_hf_gguf_reference(cfg.model_path, revision=cfg.revision)
     if resolved is not None:
@@ -351,16 +351,19 @@ def is_mistral_native_format(server_args: Any) -> bool:
         from huggingface_hub import HfApi
 
         files = {s.rfilename for s in HfApi().model_info(cfg.model_path).siblings}
-        return _check_format(
-            has_params="params.json" in files,
-            has_consolidated=any(
-                f.startswith("consolidated") and f.endswith(".safetensors")
-                for f in files
-            ),
-            has_hf_weights=any(
-                f.startswith("model") and f.endswith(".safetensors") and "/" not in f
-                for f in files
-            ),
-        )
     except Exception:
-        return False
+        # Hub unreachable (offline, rate-limited): judge from the local snapshot.
+        snapshot_dir = find_local_repo_dir(cfg.model_path, cfg.revision)
+        if snapshot_dir is None:
+            return False
+        files = set(os.listdir(snapshot_dir))
+    return _check_format(
+        has_params="params.json" in files,
+        has_consolidated=any(
+            f.startswith("consolidated") and f.endswith(".safetensors") for f in files
+        ),
+        has_hf_weights=any(
+            f.startswith("model") and f.endswith(".safetensors") and "/" not in f
+            for f in files
+        ),
+    )

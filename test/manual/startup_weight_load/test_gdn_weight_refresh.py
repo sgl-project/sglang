@@ -24,9 +24,11 @@ class TestGDNWeightRefresh(CustomTestCase):
         # Both parameters require separate aligned storage, even on SM90.
         A_log = torch.full((9,), -2.0, device="cuda")[1:]
         dt_bias = torch.full((9,), -3.0, dtype=torch.bfloat16, device="cuda")[1:]
-        initial_state = torch.randn(1, 8, 128, 128, device="cuda")
+        # Slot 0 is the state pool's padding sink; use a live request row.
+        initial_state = torch.randn(2, 8, 128, 128, device="cuda")
+        initial_state[0].zero_()
         state = torch.empty_like(initial_state)
-        cache_indices = torch.zeros(1, dtype=torch.int32, device="cuda")
+        cache_indices = torch.ones(1, dtype=torch.int32, device="cuda")
         query_start_loc = torch.tensor([0, 1], dtype=torch.int32, device="cuda")
 
         def run(active_kernel):

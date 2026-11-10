@@ -12,7 +12,7 @@ from sglang.srt.layers.parameter import (
     PackedvLLMParameter,
     RowvLLMParameter,
 )
-from sglang.srt.utils import set_weight_attrs
+from sglang.srt.layers.utils.common import set_weight_attrs
 
 from .gptq_scheme import GPTQLinearSchemeBase
 
