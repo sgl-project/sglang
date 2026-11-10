@@ -92,7 +92,7 @@ class SamplingBatchInfo:
     # Used for deterministic sampling
     sampling_seed: Optional[torch.Tensor] = None
 
-    mc32_flags: Optional[List[bool]] = None
+    mc_sample_counts: Optional[List[int]] = None
     array_logprob_flags: Optional[List[bool]] = None
     probe_seeds: Optional[torch.Tensor] = None
 
@@ -254,7 +254,7 @@ class SamplingBatchInfo:
             top_ks=top_ks,
             min_ps=min_ps,
             sampling_seed=sampling_seed,
-            mc32_flags=[r.sampling_params.score_centering_samples == 32 for r in reqs],
+            mc_sample_counts=[r.sampling_params.score_centering_samples for r in reqs],
             array_logprob_flags=[r.sampling_params.array_output_logprobs for r in reqs],
             probe_seeds=torch.tensor(
                 [r.sampling_params.sampling_seed or 0 for r in reqs],
@@ -441,7 +441,7 @@ class SamplingBatchInfo:
             if value is not None:
                 setattr(self, item, value[keep_indices_device])
 
-        for name in ("mc32_flags", "array_logprob_flags"):
+        for name in ("mc_sample_counts", "array_logprob_flags"):
             flags = getattr(self, name)
             if flags is not None:
                 setattr(self, name, [flags[i] for i in keep_indices])
@@ -554,7 +554,7 @@ class SamplingBatchInfo:
                 )
             )
 
-        for name in ("mc32_flags", "array_logprob_flags"):
+        for name in ("mc_sample_counts", "array_logprob_flags"):
             setattr(
                 self,
                 name,

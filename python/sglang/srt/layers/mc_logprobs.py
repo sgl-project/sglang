@@ -39,6 +39,7 @@ def _draw(
     V: tl.constexpr,
     STRIDE: tl.constexpr,
     TILES: tl.constexpr,
+    SAMPLES: tl.constexpr,
     REDUCE: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
@@ -52,8 +53,9 @@ def _draw(
     total = tl.sum(mass, 0)
     seed = tl.load(Seeds + row).to(tl.uint64) ^ 0x6A09E667F3BCC909
     pos = tl.load(Positions + row).to(tl.uint32)
-    # A separate Philox domain leaves the response token's RNG untouched.
-    u = tl.rand(seed, pos * 32 + draw)
+    # A separate Philox domain leaves response RNG untouched. Fixed stride
+    # keeps draws invariant to batch composition and requested sample count.
+    u = tl.rand(seed, pos * 128 + draw)
     cdf_total = tl.sum(tl.where(t == TILES - 1, cdf, 0.0), 0)
     target = tl.minimum(u * cdf_total, cdf_total * (1.0 - 1.1920928955078125e-7))
     tile = tl.min(tl.where((cdf > target) & (mass > 0), t, TILES), 0)
@@ -74,33 +76,35 @@ def _draw(
     token = tl.min(tl.where((local_cdf > local_target) & (weights > 0), ids, V), 0)
     value = tl.load(X + row * STRIDE + token).to(tl.float32)
     logz = maximum + tl.log(total)
-    tl.store(OutIds + row * 32 + draw, token)
-    tl.store(OutLP + row * 32 + draw, value - logz)
+    tl.store(OutIds + row * SAMPLES + draw, token)
+    tl.store(OutLP + row * SAMPLES + draw, value - logz)
 
 
-def compute_mc_scores(logits, seeds, positions, block=4096):
-    """32 independent categorical draws per row, with replacement.
+def compute_mc_scores(logits, seeds, positions, block=4096, num_samples=32):
+    """32, 64, or 128 independent categorical draws per row, with replacement.
 
     Input: processed, temperature-scaled logits, with finite support per row.
     Returns int32 IDs and float32 full-vocabulary normalized log probabilities.
     Separate seed domain leaves response sampling unchanged. No Python scalars
     or CPU synchronization are introduced in the draw path.
     """
+    if num_samples not in (32, 64, 128):
+        raise ValueError("num_samples must be 32, 64, or 128")
     batch, vocab = logits.shape
     if logits.stride(1) != 1 or seeds.numel() != batch or positions.numel() != batch:
         raise ValueError(
-            "MC32 requires contiguous vocabulary rows and one seed/position per row"
+            "MC probes require contiguous vocabulary rows and one seed/position per row"
         )
     tiles = triton.cdiv(vocab, block)
     maxima = torch.empty((batch, tiles), device=logits.device, dtype=torch.float32)
     sums = torch.empty_like(maxima)
-    ids = torch.empty((batch, 32), device=logits.device, dtype=torch.int32)
-    lp = torch.empty((batch, 32), device=logits.device, dtype=torch.float32)
+    ids = torch.empty((batch, num_samples), device=logits.device, dtype=torch.int32)
+    lp = torch.empty((batch, num_samples), device=logits.device, dtype=torch.float32)
     if batch:
         _partials[(batch, tiles)](
             logits, maxima, sums, vocab, logits.stride(0), tiles, block
         )
-        _draw[(batch, 32)](
+        _draw[(batch, num_samples)](
             logits,
             maxima,
             sums,
@@ -111,6 +115,7 @@ def compute_mc_scores(logits, seeds, positions, block=4096):
             vocab,
             logits.stride(0),
             tiles,
+            num_samples,
             triton.next_power_of_2(tiles),
             block,
         )

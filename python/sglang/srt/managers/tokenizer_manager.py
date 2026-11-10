@@ -1525,9 +1525,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 raise ValueError(
                     "Array scores do not yet support speculative decoding or beam search"
                 )
-            if sampling_params.score_centering_samples and obj.top_logprobs_num != 32:
+            if (
+                sampling_params.score_centering_samples
+                and obj.top_logprobs_num != sampling_params.score_centering_samples
+            ):
                 raise ValueError(
-                    "MC32 requires top_logprobs_num=32 (payload width, not top-k extraction)"
+                    "MC probes require top_logprobs_num=score_centering_samples (payload width, not top-k extraction)"
                 )
 
         # Build return object
@@ -2913,8 +2916,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         )
                     )
                 meta_info["input_top_logprobs"] = state.input_top_logprobs
-            if state.obj.sampling_params.get("score_centering_samples", 0) == 32:
-                meta_info["output_score_mode"] = "mc32"
+            if count := state.obj.sampling_params.get("score_centering_samples", 0):
+                meta_info["output_score_mode"] = f"mc{count}"
             elif state.obj.sampling_params.get("array_output_logprobs", False):
                 meta_info["output_score_mode"] = "topk"
             use_flat_output = state.obj.return_flat_raw_output_top_logprobs

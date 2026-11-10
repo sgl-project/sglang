@@ -165,13 +165,14 @@ class Sampler(nn.Module):
                 to get the unique seed for each position.
         """
         logits = logits_output.next_token_logits
-        mc_flags = sampling_info.mc32_flags or [False] * logits.shape[0]
+        mc_counts = sampling_info.mc_sample_counts or [0] * logits.shape[0]
+        mc_flags = [count > 0 for count in mc_counts]
         array_flags = sampling_info.array_logprob_flags or [False] * logits.shape[0]
         has_mc = any(mc_flags)
         mc_logits = None
         if has_mc and (not logits.is_cuda or SGLANG_RETURN_ORIGINAL_LOGPROB):
             raise ValueError(
-                "MC32 requires CUDA and processed rollout log probabilities"
+                "MC probes require CUDA and processed rollout log probabilities"
             )
         _trace_e2e_sampler(
             "forward_enter",
@@ -299,9 +300,12 @@ class Sampler(nn.Module):
             )
             if has_mc:
                 probe_values, probe_ids = compute_mc_scores(
-                    mc_logits, sampling_info.probe_seeds, positions
+                    mc_logits,
+                    sampling_info.probe_seeds,
+                    positions,
+                    num_samples=max(mc_counts),
                 )
-                if all(mc_flags):
+                if all(mc_flags) and len(set(mc_counts)) == 1:
                     logprob_result.top_logprobs_val = probe_values
                     logprob_result.top_logprobs_idx = probe_ids
                 else:
@@ -314,14 +318,18 @@ class Sampler(nn.Module):
                         ]
                     for i, mc in enumerate(mc_flags):
                         if mc:
-                            logprob_result.top_logprobs_val[i] = probe_values[i]
-                            logprob_result.top_logprobs_idx[i] = probe_ids[i]
+                            logprob_result.top_logprobs_val[i] = probe_values[
+                                i, : mc_counts[i]
+                            ]
+                            logprob_result.top_logprobs_idx[i] = probe_ids[
+                                i, : mc_counts[i]
+                            ]
             # Homogeneous array batches use two bulk D2H copies, rather than
             # one transfer per request. Mixed-width batches keep tensor rows.
             if (
                 all(array_flags)
                 and len(set(top_logprobs_nums)) == 1
-                and not all(mc_flags)
+                and isinstance(logprob_result.top_logprobs_val, list)
             ):
                 if logprob_result.top_logprobs_val is not None:
                     logprob_result.top_logprobs_val = torch.stack(
