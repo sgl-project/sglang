@@ -1,0 +1,152 @@
+diff --git a/csrc/moe/grouped_topk_kernels.cu b/csrc/moe/grouped_topk_kernels.cu
+index a7f3a8b..ea8fb52 100644
+--- a/csrc/moe/grouped_topk_kernels.cu
++++ b/csrc/moe/grouped_topk_kernels.cu
+@@ -23,6 +23,7 @@
+ #include <cmath>
+ #include <cuda_fp16.h>
+ #include <cuda_bf16.h>
++#include "sm70_bf16_compat.h"
+ #include <cuda/std/limits>
+ #include <cooperative_groups.h>
+ #include <cooperative_groups/reduce.h>
+diff --git a/csrc/moe/topk_softmax_kernels.cu b/csrc/moe/topk_softmax_kernels.cu
+index 4b63b8e..0cb69c1 100644
+--- a/csrc/moe/topk_softmax_kernels.cu
++++ b/csrc/moe/topk_softmax_kernels.cu
+@@ -26,6 +26,7 @@
+ #ifndef USE_ROCM
+     #include <cuda_bf16.h>
+     #include <cuda_fp16.h>
++    #include "sm70_bf16_compat.h"
+ #else
+     #include <hip/hip_bf16.h>
+     #include <hip/hip_fp16.h>
+diff --git a/csrc/quantization/marlin/dequant.h b/csrc/quantization/marlin/dequant.h
+index 77e3d8f..8faef11 100644
+--- a/csrc/quantization/marlin/dequant.h
++++ b/csrc/quantization/marlin/dequant.h
+@@ -72,6 +72,7 @@ where `scale_factor * multiplier` can be computed at weight loading.
+ #include <cuda_bf16.h>
+ #include <cuda_fp16.h>
+ #include <cuda_fp8.h>
++#include "sm70_bf16_compat.h"
+ 
+ #include <cstdint>
+ 
+diff --git a/csrc/type_convert.cuh b/csrc/type_convert.cuh
+index a8bd01f..c22cd3c 100644
+--- a/csrc/type_convert.cuh
++++ b/csrc/type_convert.cuh
+@@ -5,6 +5,7 @@
+ #ifndef USE_ROCM
+   #include <cuda_bf16.h>
+   #include <cuda_fp16.h>
++  #include "sm70_bf16_compat.h"
+ #else
+   #include <hip/hip_bf16.h>
+   #include <hip/hip_fp16.h>
+diff --git a/csrc/sm70_bf16_compat.h b/csrc/sm70_bf16_compat.h
+new file mode 100644
+index 0000000..048bdcb
+--- /dev/null
++++ b/csrc/sm70_bf16_compat.h
+@@ -0,0 +1,98 @@
++#ifndef SM70_BF16_COMPAT_H
++#define SM70_BF16_COMPAT_H
++
++// SM70 (V100) has no native bf16 hardware. CUDA 12.x's <cuda_bf16.h> gates the
++// bf16 *vector* intrinsics (and __bfloat1622float2) behind __CUDA_ARCH__ >= 800,
++// so on sm_70 the declarations are absent and marlin_v100's shared dequant/topk
++// code that references them fails to compile. This shim provides software
++// fallbacks using the fact that bf16 is the high 16 bits of fp32.
++//
++// This header MUST be included AFTER <cuda_bf16.h> (which defines the
++// __nv_bfloat16/__nv_bfloat162 types, the scalar conversion intrinsics such as
++// __bfloat162float / __float2bfloat16, and __low2float / __high2float — all of
++// which ARE available on SM70). Only the SM80+-gated vector intrinsics are
++// defined here, so there is no redefinition conflict.
++
++#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
++
++__device__ __forceinline__ float2 __sm70_bf162_to_f2(__nv_bfloat162 v) {
++    uint32_t u = *reinterpret_cast<uint32_t*>(&v);
++    float2 r;
++    r.x = __uint_as_float((u & 0x0000FFFFu) << 16);
++    r.y = __uint_as_float(u & 0xFFFF0000u);
++    return r;
++}
++
++// Pack two fp32 values into a bf16x2 by truncating each to its high 16 bits.
++// The dequant zero-point offsets used by marlin are exact bf16 values, so
++// truncation is lossless for those code paths.
++__device__ __forceinline__ __nv_bfloat162 __sm70_f2_to_bf162(float x, float y) {
++    uint32_t u = (__float_as_uint(x) & 0xFFFF0000u) | (__float_as_uint(y) >> 16);
++    return *reinterpret_cast<__nv_bfloat162*>(&u);
++}
++
++// --- Intrinsics gated to SM80+ in <cuda_bf16.h>, referenced on SM70 ---------
++
++__device__ __forceinline__ float2 __bfloat1622float2(__nv_bfloat162 v) {
++    return __sm70_bf162_to_f2(v);
++}
++
++__device__ __forceinline__ __nv_bfloat162 __float22bfloat162_rn(float2 f) {
++    return __sm70_f2_to_bf162(f.x, f.y);
++}
++
++__device__ __forceinline__ __nv_bfloat162 __hadd2(__nv_bfloat162 a, __nv_bfloat162 b) {
++    float2 fa = __sm70_bf162_to_f2(a);
++    float2 fb = __sm70_bf162_to_f2(b);
++    return __sm70_f2_to_bf162(fa.x + fb.x, fa.y + fb.y);
++}
++
++__device__ __forceinline__ __nv_bfloat162 __hsub2(__nv_bfloat162 a, __nv_bfloat162 b) {
++    float2 fa = __sm70_bf162_to_f2(a);
++    float2 fb = __sm70_bf162_to_f2(b);
++    return __sm70_f2_to_bf162(fa.x - fb.x, fa.y - fb.y);
++}
++
++__device__ __forceinline__ __nv_bfloat162 __hmul2(__nv_bfloat162 a, __nv_bfloat162 b) {
++    float2 fa = __sm70_bf162_to_f2(a);
++    float2 fb = __sm70_bf162_to_f2(b);
++    return __sm70_f2_to_bf162(fa.x * fb.x, fa.y * fb.y);
++}
++
++__device__ __forceinline__ __nv_bfloat162 __hfma2(
++    __nv_bfloat162 a, __nv_bfloat162 b, __nv_bfloat162 c) {
++    float2 fa = __sm70_bf162_to_f2(a);
++    float2 fb = __sm70_bf162_to_f2(b);
++    float2 fc = __sm70_bf162_to_f2(c);
++    return __sm70_f2_to_bf162(fa.x * fb.x + fc.x, fa.y * fb.y + fc.y);
++}
++
++__device__ __forceinline__ __nv_bfloat162 __hneg2(__nv_bfloat162 a) {
++    float2 fa = __sm70_bf162_to_f2(a);
++    return __sm70_f2_to_bf162(-fa.x, -fa.y);
++}
++
++__device__ __forceinline__ __nv_bfloat162 __hmax2(__nv_bfloat162 a, __nv_bfloat162 b) {
++    float2 fa = __sm70_bf162_to_f2(a);
++    float2 fb = __sm70_bf162_to_f2(b);
++    return __sm70_f2_to_bf162(fmaxf(fa.x, fb.x), fmaxf(fa.y, fb.y));
++}
++
++__device__ __forceinline__ __nv_bfloat162 __hmin2(__nv_bfloat162 a, __nv_bfloat162 b) {
++    float2 fa = __sm70_bf162_to_f2(a);
++    float2 fb = __sm70_bf162_to_f2(b);
++    return __sm70_f2_to_bf162(fminf(fa.x, fb.x), fminf(fa.y, fb.y));
++}
++
++// Scalar comparisons (cuda_bf16.h provides these only on SM80+; the scalar
++// conversion __bfloat162float is available on SM70 so we can lean on it).
++__device__ __forceinline__ __nv_bfloat16 __hmax(__nv_bfloat16 a, __nv_bfloat16 b) {
++    return __bfloat162float(a) >= __bfloat162float(b) ? a : b;
++}
++
++__device__ __forceinline__ __nv_bfloat16 __hmin(__nv_bfloat16 a, __nv_bfloat16 b) {
++    return __bfloat162float(a) <= __bfloat162float(b) ? a : b;
++}
++
++#endif  // __CUDA_ARCH__ < 800
++#endif  // SM70_BF16_COMPAT_H

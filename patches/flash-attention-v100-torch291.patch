@@ -1,0 +1,41 @@
+diff --git a/pyproject.toml b/pyproject.toml
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -7,7 +7,7 @@ requires = [
+     "setuptools>=82.0.1",
+     "wheel>=0.46.3",
+     "packaging>=26.0",
+-    "torch @ https://download-r2.pytorch.org/whl/cu129/torch-2.10.0%2Bcu129-cp312-cp312-manylinux_2_28_x86_64.whl#sha256=a3c703e74a88cccfeb4b1807c49d563a0a73793ba72d4fa035d4ac5885f3aefd",
++    "torch==2.9.1",
+     "ninja>=1.13.0",
+     "psutil>=7.2.2",
+     "numpy>=2.4.4"
+@@ -21,6 +21,6 @@ license = {text = "BSD-3-Clause"}
+ dynamic = ["authors", "classifiers", "urls"]
+ dependencies = [
+-    "torch @ https://download-r2.pytorch.org/whl/cu129/torch-2.10.0%2Bcu129-cp312-cp312-manylinux_2_28_x86_64.whl#sha256=a3c703e74a88cccfeb4b1807c49d563a0a73793ba72d4fa035d4ac5885f3aefd",
++    "torch==2.9.1",
+     "setuptools>=82.0.1",
+     "wheel>=0.46.3",
+     "packaging>=26.0",
+diff --git a/setup.py b/setup.py
+--- a/setup.py
++++ b/setup.py
+@@ -43,6 +43,6 @@ def get_ext_modules():
+         from torch.utils.cpp_extension import CUDAExtension
+     except ImportError as e:
+         raise RuntimeError(
+-            "torch is required to build flash_attn_v100. "
+-            "Please install torch >= 2.10 first (e.g., `pip install torch==2.10.0+cu129 --index-url https://download.pytorch.org/whl/cu129`)."
++            "torch is required to build flash_attn_v100. "
++            "Install the CUDA 12.8 torch 2.9.1 build used by SGLang-V100 first."
+         ) from e
+@@ -128,6 +128,6 @@ def get_cmdclass():
+         from torch.utils.cpp_extension import BuildExtension
+     except ImportError as e:
+         raise RuntimeError(
+-            "torch is required to build flash_attn_v100. "
+-            "Please install torch >= 2.10 first (e.g., `pip install torch==2.10.0+cu129 --index-url https://download.pytorch.org/whl/cu129`)."
++            "torch is required to build flash_attn_v100. "
++            "Install the CUDA 12.8 torch 2.9.1 build used by SGLang-V100 first."
+         ) from e

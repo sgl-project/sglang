@@ -111,6 +111,26 @@ default = true
 checkpoint-engine = ["checkpoint-engine==0.1.2"]
 instanttensor = ["instanttensor>=0.1.9"]
 runai = ["runai-model-streamer[s3,gcs,azure]>=0.15.7"]
+# V100 (sm70) diffusion runtime. The `diffusion` extra below pulls CUDA 13
+# quantization and attention wheels (nvidia-modelopt, st_attn, vsa) that cannot
+# run on Volta; this variant keeps only what does. Note that the V100 *engine*
+# is installed from requirements.txt, not from this file: upstream's dependency
+# list targets the CUDA 13 stack, and CUDA 13 dropped sm70.
+diffusion-v100 = [
+  "PyYAML==6.0.1",
+  "addict==2.4.0",
+  "av==16.1.0",
+  "cache-dit==1.3.0",
+  "cloudpickle==3.1.2",
+  "diffusers==0.37.0",
+  "imageio==2.36.0",
+  "imageio-ffmpeg==0.5.1",
+  "moviepy>=2.0.0",
+  "opencv-python-headless==4.10.0.84",
+  "remote-pdb==2.1.0",
+  "scikit-image==0.25.2",
+  "trimesh>=4.0.0",
+]
 diffusion = [
   "addict==2.4.0",
   "av==16.1.0",

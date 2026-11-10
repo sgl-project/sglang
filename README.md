@@ -22,6 +22,8 @@ SGLang is an open-source inference framework for large language, vision-language
 
 👋 Get started below, or meet the community at [SGLang Events](https://www.sglang.io/events), including meetups, developer meetings, workshops, and office hours.
 
+> **Building for V100 / Volta (sm70)?** This tree is also the `sglang-sxm2` fork: upstream SGLang plus Volta kernels and serving recipes. Upstream's CUDA 13 stack dropped Volta, so see [V100 (Volta, sm70) builds](#v100-volta-sm70-builds-this-fork) below for the cu128 install, the Docker image and the model launch recipes.
+
 > **[SGLang Summit 2026: Meet the builders of open AI](https://www.sglang.io/summit)**<br>
 > **Our flagship annual gathering · November 12–13 · San Francisco**
 >
@@ -65,6 +67,51 @@ Integrations in progress: AWS Trainium, [Alibaba T-Head PPU](https://github.com/
 SGLang-TorchTPU brings the SGLang serving engine to Google TPUs through PyTorch, torch_tpu, and Pallas kernels. It supports LLM and vision-language serving on TPU7x (Ironwood), including tensor and expert parallelism across hosts. SGL-JAX provides the JAX-based TPU serving path.
 
 See the [Cookbook](https://cookbook.sglang.io/) and platform guides for model compatibility and setup.
+
+## V100 (Volta, sm70) builds: this fork
+
+This tree carries the `sglang-sxm2` fork on top of upstream main: the Volta kernels and the serving recipes for 32 GB V100s. Upstream pins a CUDA 13 stack, and CUDA 13 dropped Volta, so the V100 build uses its own dependency set — [`requirements.txt`](requirements.txt) (torch 2.9.1 on cu128, installed with `pip install --no-deps`) plus source builds of patched FlashInfer, `sglang-kernel` and `marlin_v100`. The engine itself — radix and hierarchical caches, speculative decoding, the OpenAI and Anthropic servers, parsers — is upstream as-is. Everything in [`python/pyproject.toml`](python/pyproject.toml) stays upstream's; the V100 stack never edits upstream pins in place.
+
+**Requirements:** CUDA 12.8 or 12.9 (CUDA 13 dropped Volta), GCC ≤ 14, Python 3.12, Linux, and 32 GB V100s. SXM2/NVLink is only needed for speed; PCIe cards run the same scripts.
+
+Install, then check that the Volta kernels registered. A server missing them still starts and answers, but its MoE layers return zeros:
+
+```bash
+bash scripts/install_v100.sh    # about an hour, most of it nvcc
+conda activate sglang-v100
+bash scripts/smoke_v100.sh
+```
+
+[docs/v100/INSTALL.md](docs/v100/INSTALL.md) walks through each step and what to do when one fails, including running the server as a systemd service.
+
+### Docker
+
+The image builds the same stack from source; no pre-built image is published. You need Docker with the NVIDIA Container Toolkit and an R570-series or newer host driver (the image uses CUDA 12.8).
+
+```bash
+docker compose -f docker/v100-compose.yaml build glm53  # one image for all four models
+docker compose -f docker/v100-compose.yaml up glm53     # or qwen38, dsv41, h3
+```
+
+Checkpoints come from `MODELS_DIR` (default `~/models`). JIT kernels and caches persist in a Docker volume, so only the first launch compiles. [INSTALL.md](docs/v100/INSTALL.md#docker) covers how the image and compose file fit together.
+
+### Models and launch recipes
+
+Each model page has the measurements, the exact launch command, and why each flag has its value. Other models may load, but they are untested here.
+
+| Model | GPUs | Context |
+| --- | --- | --- |
+| [GLM-5.3-Flash](docs/v100/GLM-5.3-Flash.md), 320B MoE, NVFP4, MTP | 8× V100 32 GB | 240k |
+| [Qwen3.8-Flash-Next](docs/v100/Qwen3.8-Flash-Next.md), 125B MoE, NVFP4, MTP | 4× V100 32 GB | 262k |
+| [DeepSeek-V4.1-Flash](docs/v100/DeepSeek-V4.1-Flash.md), official MXFP8 + MXFP4 | 8× V100 32 GB, ~300 GiB host RAM | 256k |
+| [MiniMax-H3](docs/v100/MiniMax-H3.md), video + audio | 4× V100 32 GB | 4–15 s clips |
+
+```bash
+hf download RadixArk/GLM-5.3-Flash-NVFP4 --local-dir ~/models/GLM-5.3-Flash-NVFP4
+GLM53_MODEL=~/models/GLM-5.3-Flash-NVFP4 bash scripts/serve_glm53_flash_nvfp4_v100.sh
+```
+
+Volta has no bf16 and no FP4/FP8 hardware, so everything runs as fp16 with weight-only 4/8-bit kernels and numerics differ slightly from a Hopper run of the same checkpoint. GLM and DeepSeek serve one agent session per server; Qwen takes up to three streams. Report bugs in the Volta path here, not upstream. See [NOTICE](NOTICE) for the third-party kernels, their licenses, and the patches under [`patches/`](patches/) this build applies.
 
 ## SGL Ecosystem
 

@@ -1,0 +1,58 @@
+diff --git a/csrc/moe/marlin_moe_wna16/sm70_marlin_gemm.cuh b/csrc/moe/marlin_moe_wna16/sm70_marlin_gemm.cuh
+--- a/csrc/moe/marlin_moe_wna16/sm70_marlin_gemm.cuh
++++ b/csrc/moe/marlin_moe_wna16/sm70_marlin_gemm.cuh
+@@ -389,6 +389,42 @@ inline bool sm70_marlin_moe_try_select_poolside_laguna_s_2_1_int4_params(
+ 
+   return false;
+ }
++
++inline bool sm70_marlin_moe_try_select_radixark_qwen3_8_flash_next_nvfp4_params(
++    Sm70MarlinMoeAutoParamsContext const& ctx,
++    Sm70MarlinAutoParams& params) {
++  // RadixArk/Qwen3.8-Flash-Next-NVFP4, TP=4, batch-one decode.  It routes ten
++  // of 512 experts with hidden=2560 and TP-local intermediate=160.  The
++  // checkpoint is ModelOpt NVFP4 (group 16).  An exhaustive V100-SXM2 sweep
++  // measured 73.35 us for gate/up and 83.56 us for down at these shapes.
++  if (ctx.quant_format == nullptr ||
++      std::strcmp(ctx.quant_format, "nvfp4") != 0 ||
++      ctx.group_size != 16 || ctx.moe_block_size != 8) {
++    return false;
++  }
++
++  // Gate/up: M=1, N=2*(640/TP4)=320, K=2560, top-k=10.
++  if (ctx.size_m == 1 && ctx.top_k == 10 &&
++      ctx.size_n == 320 && ctx.size_k == 2560) {
++    params = {{32, 64, 64, 4, 32, 64, 16},
++              1,
++              true,
++              ctx.packed_macro_n};
++    return true;
++  }
++
++  // Down sees the ten routed rows as M=10 with top-k=1.
++  if (ctx.size_m == 10 && ctx.top_k == 1 &&
++      ctx.size_n == 2560 && ctx.size_k == 160) {
++    params = {{64, 256, 32, 4, 64, 64, 32},
++              1,
++              false,
++              ctx.packed_macro_n};
++    return true;
++  }
++
++  return false;
++}
+ 
+ inline bool sm70_marlin_moe_try_select_quanttrio_minimax_m2_7_awq_params(
+     Sm70MarlinMoeAutoParamsContext const& ctx,
+@@ -2352,6 +2388,11 @@ inline Sm70MarlinAutoParams sm70_marlin_moe_auto_stage_params(
+     validate_sm70_marlin_auto_params("MoE", params);
+     return params;
+   }
++  if (sm70_marlin_moe_try_select_radixark_qwen3_8_flash_next_nvfp4_params(
++          ctx, params)) {
++    validate_sm70_marlin_auto_params("MoE", params);
++    return params;
++  }
+   if (sm70_marlin_moe_try_select_quanttrio_minimax_m2_7_awq_params(
+           ctx, params)) {
+     validate_sm70_marlin_auto_params("MoE", params);

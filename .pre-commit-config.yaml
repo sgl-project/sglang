@@ -21,6 +21,12 @@ repos:
         exclude: ^sgl-model-gateway/tests/.*_test\.rs$
       - id: debug-statements
       - id: no-commit-to-branch
+        # Upstream protects main because work lands there by PR. In this fork
+        # main IS the development branch and is committed to directly, and
+        # publish is updated by cherry-pick -- which is also a commit, so
+        # guarding either one would block the normal workflow. Left pointing at
+        # master, which this fork does not use.
+        args: [--branch, master]
   - repo: https://github.com/PyCQA/isort
     rev: 7.0.0
     hooks:

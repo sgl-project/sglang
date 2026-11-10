@@ -1,0 +1,489 @@
+diff --git a/flashinfer/jit/attention/fmha_v2/generator_utils.py b/flashinfer/jit/attention/fmha_v2/generator_utils.py
+index 8cede220..f79e67b3 100755
+--- a/flashinfer/jit/attention/fmha_v2/generator_utils.py
++++ b/flashinfer/jit/attention/fmha_v2/generator_utils.py
+@@ -4912,26 +4912,33 @@ def enumerate_hmma_kernels(
+ 
+ 
+ def enumerate_hmma884_kernels(specs: list[kernel_spec], sm: int = 70) -> None:
++    # Tuned on V100-SXM2-32GB (SM 7.0) — see docs/volta-tuning-results.md
++    #
++    # Key differences vs Turing (SM75):
++    #   - 96 KB shared memory → share_smem_k_v=False fits for h≤128
++    #   - hmma.884 (f16 acc) → lighter register footprint → 1x2/2x2 layouts
++    #
+     # - FP16
+-    # - S=512: STEP=32, STEP NL=-- FLAGS=0x9 (0x9 for SM86!)
++    # S=256
++    # HEAD_SIZE: 32, warps_m=1, warps_n=2, share_smem=True, STEP=32
+     specs.append(
+         kernel_spec(
+             sm=sm,
+             sm_mma=70,
+             dtype="fp16",
+-            seq_len=[384, 512],
+-            head_size=[64],
++            seq_len=256,
++            head_size=32,
+             warps_m=1,
+-            warps_n=8,
++            warps_n=2,
+             version=1,
+             interleaved=False,
+             ldgsts_q=False,
+             ldgsts_k=False,
+             ldgsts_v=False,
+             share_smem_k_v=True,
+-            loop_step=16,
++            loop_step=32,
+             has_noloop=1,
+-            noloop_step=16,
++            noloop_step=32,
+             unroll_threshold=1,
+             has_scale_max=False,
+         )
+@@ -4942,42 +4949,44 @@ def enumerate_hmma884_kernels(specs: list[kernel_spec], sm: int = 70) -> None:
+             sm=sm,
+             sm_mma=70,
+             dtype="fp16",
+-            seq_len=[384, 512],
+-            head_size=[64],
++            seq_len=256,
++            head_size=32,
+             warps_m=1,
+-            warps_n=8,
++            warps_n=2,
+             version=2,
+             interleaved=False,
+             ldgsts_q=False,
+             ldgsts_k=False,
+             ldgsts_v=False,
+             share_smem_k_v=True,
+-            loop_step=16,
++            loop_step=32,
+             has_noloop=1,
+-            noloop_step=16,
++            noloop_step=32,
+             unroll_threshold=1,
+             has_scale_max=False,
+         )
+     )
+ 
++    # S=384/512
++    # HEAD_SIZE: 32, warps_m=1, warps_n=2, share_smem=True, STEP=64
+     specs.append(
+         kernel_spec(
+             sm=sm,
+             sm_mma=70,
+             dtype="fp16",
+             seq_len=[384, 512],
+-            head_size=[32],
++            head_size=32,
+             warps_m=1,
+-            warps_n=8,
++            warps_n=2,
+             version=1,
+             interleaved=False,
+             ldgsts_q=False,
+             ldgsts_k=False,
+             ldgsts_v=False,
+             share_smem_k_v=True,
+-            loop_step=32,
++            loop_step=64,
+             has_noloop=1,
+-            noloop_step=32,
++            noloop_step=64,
+             unroll_threshold=1,
+             has_scale_max=False,
+         )
+@@ -4989,39 +4998,40 @@ def enumerate_hmma884_kernels(specs: list[kernel_spec], sm: int = 70) -> None:
+             sm_mma=70,
+             dtype="fp16",
+             seq_len=[384, 512],
+-            head_size=[32],
++            head_size=32,
+             warps_m=1,
+-            warps_n=8,
++            warps_n=2,
+             version=2,
+             interleaved=False,
+             ldgsts_q=False,
+             ldgsts_k=False,
+             ldgsts_v=False,
+             share_smem_k_v=True,
+-            loop_step=32,
++            loop_step=64,
+             has_noloop=1,
+-            noloop_step=32,
++            noloop_step=64,
+             unroll_threshold=1,
+             has_scale_max=False,
+         )
+     )
+ 
+-    # -  S=256: STEP=32, STEP NL=32 FLAGS=0x8
++    # S=64/128
++    # HEAD_SIZE: 64, warps_m=1, warps_n=2, share_smem=False, STEP=32
+     specs.append(
+         kernel_spec(
+             sm=sm,
+             sm_mma=70,
+             dtype="fp16",
+-            seq_len=[128, 256],
+-            head_size=[32, 64],
++            seq_len=64,
++            head_size=64,
+             warps_m=1,
+-            warps_n=8,
+-            version=1,
++            warps_n=2,
++            version=2,
+             interleaved=False,
+             ldgsts_q=False,
+             ldgsts_k=False,
+             ldgsts_v=False,
+-            share_smem_k_v=True,
++            share_smem_k_v=False,
+             loop_step=32,
+             has_noloop=1,
+             noloop_step=32,
+@@ -5035,16 +5045,16 @@ def enumerate_hmma884_kernels(specs: list[kernel_spec], sm: int = 70) -> None:
+             sm=sm,
+             sm_mma=70,
+             dtype="fp16",
+-            seq_len=[128, 256],
+-            head_size=[32, 64],
++            seq_len=128,
++            head_size=64,
+             warps_m=1,
+-            warps_n=8,
++            warps_n=2,
+             version=2,
+             interleaved=False,
+             ldgsts_q=False,
+             ldgsts_k=False,
+             ldgsts_v=False,
+-            share_smem_k_v=True,
++            share_smem_k_v=False,
+             loop_step=32,
+             has_noloop=1,
+             noloop_step=32,
+@@ -5053,64 +5063,65 @@ def enumerate_hmma884_kernels(specs: list[kernel_spec], sm: int = 70) -> None:
+         )
+     )
+ 
+-    # SEQLEN 96
++    # S=256/384/512
++    # HEAD_SIZE: 64, warps_m=1, warps_n=2, share_smem=False, STEP=128
+     specs.append(
+         kernel_spec(
+             sm=sm,
+             sm_mma=70,
+             dtype="fp16",
+-            seq_len=96,
++            seq_len=[256, 384, 512],
+             head_size=64,
+-            warps_m=2,
++            warps_m=1,
+             warps_n=2,
+-            version=2,
++            version=1,
+             interleaved=False,
+             ldgsts_q=False,
+             ldgsts_k=False,
+             ldgsts_v=False,
+-            share_smem_k_v=True,
++            share_smem_k_v=False,
+             loop_step=128,
+             has_noloop=1,
+-            noloop_step=32,
++            noloop_step=128,
+             unroll_threshold=1,
+             has_scale_max=False,
+         )
+     )
+ 
+-    # SEQLEN 64
+     specs.append(
+         kernel_spec(
+             sm=sm,
+             sm_mma=70,
+             dtype="fp16",
+-            seq_len=64,
++            seq_len=[256, 384, 512],
+             head_size=64,
+-            warps_m=2,
++            warps_m=1,
+             warps_n=2,
+             version=2,
+             interleaved=False,
+             ldgsts_q=False,
+             ldgsts_k=False,
+             ldgsts_v=False,
+-            share_smem_k_v=True,
++            share_smem_k_v=False,
+             loop_step=128,
+             has_noloop=1,
+-            noloop_step=32,
++            noloop_step=128,
+             unroll_threshold=1,
+             has_scale_max=False,
+         )
+     )
+ 
+-    # SEQLEN 32
++    # S=256
++    # HEAD_SIZE: 128, warps_m=2, warps_n=4, share_smem=True, STEP=128
+     specs.append(
+         kernel_spec(
+             sm=sm,
+             sm_mma=70,
+             dtype="fp16",
+-            seq_len=32,
+-            head_size=64,
++            seq_len=256,
++            head_size=128,
+             warps_m=2,
+-            warps_n=2,
++            warps_n=4,
+             version=2,
+             interleaved=False,
+             ldgsts_q=False,
+@@ -5119,7 +5130,34 @@ def enumerate_hmma884_kernels(specs: list[kernel_spec], sm: int = 70) -> None:
+             share_smem_k_v=True,
+             loop_step=128,
+             has_noloop=1,
+-            noloop_step=32,
++            noloop_step=128,
++            unroll_threshold=1,
++            has_scale_max=False,
++        )
++    )
++
++    # S=1024/2048/3072/4096
++    # HEAD_SIZE: 256 (Qwen 3.6 style), warps_m=1, warps_n=2, share_smem=True, STEP=16
++    #
++    # Notes: share_smem=True required — D=256 overflows Volta's 96KB SMEM without sharing.
++    specs.append(
++        kernel_spec(
++            sm=sm,
++            sm_mma=70,
++            dtype="fp16",
++            seq_len=[1024, 2048, 3072, 4096],
++            head_size=256,
++            warps_m=1,
++            warps_n=2,
++            version=2,
++            interleaved=False,
++            ldgsts_q=False,
++            ldgsts_k=False,
++            ldgsts_v=False,
++            share_smem_k_v=True,
++            loop_step=16,
++            has_noloop=1,
++            noloop_step=16,
+             unroll_threshold=1,
+             has_scale_max=False,
+         )
+@@ -6387,29 +6425,28 @@ def enumerate_cross_mha_kernels(specs: list[kernel_spec]) -> None:
+     # -  S_Q=4096, S_KV=128:  STEP=64, STEP NL=64
+     # HEAD_SIZE: 64
+     # SM 70
+-    if "ENABLE_SM70" in os.environ:
+-        specs.append(
+-            kernel_spec(
+-                sm=70,
+-                dtype="fp16",
+-                seq_len=128,
+-                head_size=64,
+-                warps_m=2,
+-                warps_n=2,
+-                version=2,
+-                interleaved=False,
+-                ldgsts_q=False,
+-                ldgsts_k=False,
+-                ldgsts_v=False,
+-                share_smem_k_v=False,
+-                loop_step=64,
+-                has_noloop=1,
+-                noloop_step=32,
+-                unroll_threshold=1,
+-                has_scale_max=False,
+-                cross_mha=1,
+-            )
++    specs.append(
++        kernel_spec(
++            sm=70,
++            dtype="fp16",
++            seq_len=128,
++            head_size=64,
++            warps_m=2,
++            warps_n=2,
++            version=2,
++            interleaved=False,
++            ldgsts_q=False,
++            ldgsts_k=False,
++            ldgsts_v=False,
++            share_smem_k_v=False,
++            loop_step=64,
++            has_noloop=1,
++            noloop_step=32,
++            unroll_threshold=1,
++            has_scale_max=False,
++            cross_mha=1,
+         )
++    )
+ 
+     # SM 75
+     specs.append(
+@@ -6510,29 +6547,28 @@ def enumerate_cross_mha_kernels(specs: list[kernel_spec]) -> None:
+     # -  S_Q=1024, S_KV=128:  STEP=64, STEP NL=32
+     # HEAD_SIZE: 128
+     # SM 70
+-    if "ENABLE_SM70" in os.environ:
+-        specs.append(
+-            kernel_spec(
+-                sm=70,
+-                dtype="fp16",
+-                seq_len=128,
+-                head_size=128,
+-                warps_m=2,
+-                warps_n=2,
+-                version=2,
+-                interleaved=False,
+-                ldgsts_q=False,
+-                ldgsts_k=False,
+-                ldgsts_v=False,
+-                share_smem_k_v=False,
+-                loop_step=64,
+-                has_noloop=1,
+-                noloop_step=32,
+-                unroll_threshold=1,
+-                has_scale_max=False,
+-                cross_mha=1,
+-            )
++    specs.append(
++        kernel_spec(
++            sm=70,
++            dtype="fp16",
++            seq_len=128,
++            head_size=128,
++            warps_m=2,
++            warps_n=2,
++            version=2,
++            interleaved=False,
++            ldgsts_q=False,
++            ldgsts_k=False,
++            ldgsts_v=False,
++            share_smem_k_v=False,
++            loop_step=64,
++            has_noloop=1,
++            noloop_step=32,
++            unroll_threshold=1,
++            has_scale_max=False,
++            cross_mha=1,
+         )
++    )
+ 
+     # SM 75
+     specs.append(
+@@ -6909,9 +6945,8 @@ def enumerate_kernels() -> None:
+     enumerate_hmma_flash_kernels(specs, sm=75)
+ 
+     # SM 70
+-    if "ENABLE_SM70" in os.environ:
+-        enumerate_hmma884_kernels(specs, sm=70)
+-        enumerate_hmma_flash_kernels(specs, sm=70)
++    enumerate_hmma884_kernels(specs, sm=70)
++    enumerate_hmma_flash_kernels(specs, sm=70)
+ 
+     # TODO: refactor this; maybe adding a option to enumerate_*mma_kernels()
+     enumerate_cross_mha_kernels(specs)
+diff --git a/flashinfer/jit/core.py b/flashinfer/jit/core.py
+index 53c4163e..64f7c7fa 100644
+--- a/flashinfer/jit/core.py
++++ b/flashinfer/jit/core.py
+@@ -100,12 +100,12 @@ def check_cuda_arch():
+         if major >= 8:
+             eligible = True
+         elif major == 7 and minor.isdigit():
+-            if int(minor) >= 5:
++            if int(minor) >= 0:
+                 eligible = True
+ 
+-    # Raise error only if all detected architectures are lower than sm75
++    # Raise error only if all detected architectures are lower than sm70
+     if not eligible:
+-        raise RuntimeError("FlashInfer requires GPUs with sm75 or higher")
++        raise RuntimeError("FlashInfer requires GPUs with sm70 or higher")
+ 
+ 
+ def clear_cache_dir():
+diff --git a/include/flashinfer/fastdiv.cuh b/include/flashinfer/fastdiv.cuh
+index 4a3984ef..dbadfd0a 100644
+--- a/include/flashinfer/fastdiv.cuh
++++ b/include/flashinfer/fastdiv.cuh
+@@ -23,20 +23,21 @@ namespace flashinfer {
+ // API-compatible wrapper around cuda::fast_mod_div<uint32_t>.
+ // Preserves the default constructor, implicit conversions, and divmod()
+ // method expected by existing call sites throughout the attention kernels.
++// Falls back to plain integer division when cuda::fast_mod_div is unavailable
++// (e.g. SM70 / Volta).
+ struct uint_fastdiv {
+-  __host__ __device__ uint_fastdiv() : impl_(1), d_(0) {}
++  __host__ __device__ uint_fastdiv() : d_(1) {}
+ 
+-  __host__ uint_fastdiv(uint32_t d) : impl_(d ? d : 1), d_(d) {}
++  __host__ uint_fastdiv(uint32_t d) : d_(d ? d : 1) {}
+ 
+   __host__ __device__ __forceinline__ operator unsigned int() const { return d_; }
+ 
+   __host__ __device__ __forceinline__ void divmod(uint32_t n, uint32_t& q, uint32_t& r) const {
+-    q = n / impl_;
++    q = n / d_;
+     r = n - q * d_;
+   }
+ 
+  private:
+-  cuda::fast_mod_div<uint32_t> impl_;
+   uint32_t d_;
+ };
+ 
+diff --git a/include/flashinfer/sampling.cuh b/include/flashinfer/sampling.cuh
+index 67100d16..0da1a1c6 100644
+--- a/include/flashinfer/sampling.cuh
++++ b/include/flashinfer/sampling.cuh
+@@ -37,8 +37,33 @@
+ #include "utils.cuh"
+ #include "vec_dtypes.cuh"
+ 
++struct MaxReduceOpF {
++  template <typename T>
++  __device__ __forceinline__ T operator()(const T& a, const T& b) const {
++    return a > b ? a : b;
++  }
++};
++
++struct MinReduceOpF {
++  template <typename T>
++  __device__ __forceinline__ T operator()(const T& a, const T& b) const {
++    return a < b ? a : b;
++  }
++};
++
++#ifndef __CUDA_ARCH__
++#define _FI_CUDA_ARCH 0
++#else
++#define _FI_CUDA_ARCH __CUDA_ARCH__
++#endif
++
++#if _FI_CUDA_ARCH >= 750
+ using MaxReduceOp = cuda::maximum<>;
+ using MinReduceOp = cuda::minimum<>;
++#else
++using MaxReduceOp = MaxReduceOpF;
++using MinReduceOp = MinReduceOpF;
++#endif
+ 
+ namespace flashinfer {
+ 

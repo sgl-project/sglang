@@ -1,0 +1,93 @@
+# sglang-sxm2 on V100. One image, one service per model; start one language
+# model at a time (they share port 11435). Run from the repository root:
+#
+#   docker compose -f docker/v100-compose.yaml build glm53    # one image for all; ~1 h
+#   docker compose -f docker/v100-compose.yaml up glm53
+#   docker compose -f docker/v100-compose.yaml up qwen38
+#   docker compose -f docker/v100-compose.yaml up dsv41
+#   docker compose -f docker/v100-compose.yaml up h3
+#
+# Checkpoints are read from MODELS_DIR (default ~/models), one directory per
+# model under the names below. The first launch of each model compiles JIT
+# kernels into the sglang-sxm2-cache volume; later launches reuse them.
+
+x-v100: &v100
+  image: sglang-sxm2:latest
+  build:
+    context: ..
+    dockerfile: docker/v100.Dockerfile
+    network: host
+    args:
+      MAX_JOBS: ${MAX_JOBS:-}
+  network_mode: host
+  ipc: host
+  restart: "no"
+  ulimits:
+    memlock: -1
+    stack: 67108864
+  volumes:
+    - ${MODELS_DIR:-${HOME}/models}:/models:ro
+    - sglang-sxm2-cache:/root/.cache
+    - sglang-sxm2-jit:/root/sglang-v100-jit
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: all
+            capabilities: [gpu]
+
+x-env: &env
+  SGLANG_V100_HOST: ${SGLANG_V100_HOST:-0.0.0.0}
+  SGLANG_V100_PORT: ${SGLANG_V100_PORT:-11435}
+  SGLANG_V100_SKIP_STARTUP_CHECK: ${SGLANG_V100_SKIP_STARTUP_CHECK:-0}
+
+services:
+  glm53:
+    <<: *v100
+    profiles: [glm53]
+    command: [glm53]
+    environment:
+      <<: *env
+      GLM53_MODEL: /models/GLM-5.3-Flash-NVFP4
+      GLM53_GPUS: ${GLM53_GPUS:-0,1,2,3,4,5,6,7}
+
+  qwen38:
+    <<: *v100
+    profiles: [qwen38]
+    command: [qwen38, mtp]
+    environment:
+      <<: *env
+      FLASH_NEXT_MODEL: /models/Qwen3.8-Flash-Next-NVFP4
+      FLASH_NEXT_GPUS: ${FLASH_NEXT_GPUS:-0,1,2,3}
+      # The host KV tier spills to disk; keep it on the cache volume.
+      SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR: /root/.cache/hicache_storage
+      # PCIe cards without NVLink: SGLANG_CUSTOM_AR_ALLOW_PCIE=1.
+      SGLANG_CUSTOM_AR_ALLOW_PCIE: ${SGLANG_CUSTOM_AR_ALLOW_PCIE:-0}
+
+  dsv41:
+    <<: *v100
+    profiles: [dsv41]
+    command: [dsv41]
+    environment:
+      <<: *env
+      MODEL_PATH: /models/DeepSeek-V4.1-Flash
+      # Needs 1 GiB hugepages on the GPU-local NUMA node, reserved on the host.
+      # The server finds that node itself; these override it when set.
+      SGLANG_DSV41_ENGRAM_NUMA_NODE:
+      SGLANG_DSV41_EXPERT_SPILL_NUMA_NODES:
+      SGLANG_DSV41_CSA2_SESSION_DIR: /root/.cache/csa2-sessions
+
+  h3:
+    <<: *v100
+    profiles: [h3]
+    command: [h3, fl2va]
+    environment:
+      <<: *env
+      H3_MODEL: /models/MiniMax-H3
+      H3_GPUS: ${H3_GPUS:-0,1,2,3}
+      H3_PORT: ${H3_PORT:-30010}
+
+volumes:
+  sglang-sxm2-cache:
+  sglang-sxm2-jit:

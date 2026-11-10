@@ -1,0 +1,15 @@
+diff --git a/setup.py b/setup.py
+--- a/setup.py
++++ b/setup.py
+@@ -136,7 +136,10 @@ def get_cmdclass():
+         def build_extensions(self):
+             import torch
+ 
+-            if not torch.cuda.is_available():
++            # Docker builds have the CUDA toolkit but no GPU device. The
++            # extension has an explicit sm_70 gencode and can cross-compile.
++            if (not torch.cuda.is_available() and
++                    os.environ.get("SGLANG_V100_CROSS_COMPILE") != "1"):
+                 raise RuntimeError("CUDA is required but not available.")
+             if parse(torch.version.cuda) < parse("12.8"):
+                 raise RuntimeError(f"CUDA version {torch.version.cuda} < 12.8 is not supported.")

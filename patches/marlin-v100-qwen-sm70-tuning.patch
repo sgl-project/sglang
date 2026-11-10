@@ -1,0 +1,161 @@
+diff --git a/csrc/moe/marlin_moe_wna16/sm70_marlin_gemm.cuh b/csrc/moe/marlin_moe_wna16/sm70_marlin_gemm.cuh
+index 86550a9..f5846d6 100644
+--- a/csrc/moe/marlin_moe_wna16/sm70_marlin_gemm.cuh
++++ b/csrc/moe/marlin_moe_wna16/sm70_marlin_gemm.cuh
+@@ -70,8 +70,13 @@ inline Sm70MarlinAutoParams sm70_marlin_moe_auto_params_from_env(
+ inline bool sm70_marlin_moe_try_select_quanttrio_qwen3_6_35b_a3b_awq_params(
+     Sm70MarlinMoeAutoParamsContext const& ctx,
+     Sm70MarlinAutoParams& params) {
++  // AWQ uses uint4 while symmetric GPTQ uses uint4b8.  Both formats share
++  // the same optimal CTA/split-K geometry for these model shapes; only their
++  // dequantization metadata differs.  In particular, EP exposes the full
++  // intermediate width and otherwise misses the GPTQ-only TP selector below.
+   if (ctx.quant_format == nullptr ||
+-      std::strcmp(ctx.quant_format, "uint4") != 0 ||
++      (std::strcmp(ctx.quant_format, "uint4") != 0 &&
++       std::strcmp(ctx.quant_format, "uint4b8") != 0) ||
+       ctx.group_size != 128 || ctx.size_m <= 0) {
+     return false;
+   }
+@@ -165,7 +170,8 @@ inline bool sm70_marlin_moe_try_select_quanttrio_qwen3_5_122b_a10b_awq_params(
+     Sm70MarlinMoeAutoParamsContext const& ctx,
+     Sm70MarlinAutoParams& params) {
+   if (ctx.quant_format == nullptr ||
+-      std::strcmp(ctx.quant_format, "uint4") != 0 ||
++      (std::strcmp(ctx.quant_format, "uint4") != 0 &&
++       std::strcmp(ctx.quant_format, "uint4b8") != 0) ||
+       ctx.group_size != 128 || ctx.size_m <= 0) {
+     return false;
+   }
+@@ -277,6 +283,114 @@ inline bool sm70_marlin_moe_try_select_quanttrio_qwen3_5_122b_a10b_awq_params(
+   return false;
+ }
+ 
++inline bool sm70_marlin_moe_try_select_qwen3_5_122b_a10b_gptq_int4_params(
++    Sm70MarlinMoeAutoParamsContext const& ctx,
++    Sm70MarlinAutoParams& params) {
++  // Qwen/Qwen3.5-122B-A10B-GPTQ-Int4, TP=4, batch-1 decode w13.
++  // GPTQ symmetric int4 reaches Marlin as uint4b8, so it cannot use the
++  // otherwise shape-compatible AWQ (uint4) selector above. An exhaustive
++  // SM70 env sweep measured 149.50 us with split-K 8 versus 239.10 us for
++  // the generic split-K 1 fallback on a V100-SXM2-32GB.
++  if (ctx.quant_format == nullptr ||
++      std::strcmp(ctx.quant_format, "uint4b8") != 0 ||
++      ctx.group_size != 128 || ctx.size_m != 1 ||
++      ctx.moe_block_size != 8 || ctx.top_k != 8 ||
++      ctx.size_n != 512 || ctx.size_k != 3072) {
++    return false;
++  }
++
++  params = {{32, 256, 32, 4, 32, 64, 32},
++            8,
++            true,
++            ctx.packed_macro_n};
++  return true;
++}
++
++inline bool sm70_marlin_moe_try_select_poolside_laguna_s_2_1_int4_params(
++    Sm70MarlinMoeAutoParamsContext const& ctx,
++    Sm70MarlinAutoParams& params) {
++  // poolside/Laguna-S-2.1-INT4, TP=4 decode and DFlash verification. The
++  // checkpoint uses compressed-tensors symmetric INT4 group-32 weights, which
++  // reach Marlin as uint4b8 after SGLang repacks them. Laguna routes top-10
++  // experts, so neither the group-128 Qwen selector nor the generic fallback
++  // is a good match.
++  if (ctx.quant_format == nullptr ||
++      std::strcmp(ctx.quant_format, "uint4b8") != 0 ||
++      ctx.group_size != 32 || ctx.moe_block_size != 8) {
++    return false;
++  }
++
++  // Gate/up: N=2*(1024/TP4)=512, K=3072, top-k=10. Exhaustive SM70 sweeps
++  // selected separate geometries for ordinary decode M={1,2,4} and DFlash
++  // block-8 verification M={8,16,32}. The M=1 amortized check measured
++  // 107.2 us versus 159.6 us for the generic fallback. At M={8,16,32}, the
++  // selected kernels measured {162.8,173.1,209.9} us versus
++  // {276.0,278.5,294.9} us. M=64 covers block-16 verification at concurrency
++  // four and measured 265.2 us versus 293.9 us.
++  if (ctx.top_k == 10 && ctx.size_n == 512 && ctx.size_k == 3072) {
++    if (ctx.size_m == 1 || ctx.size_m == 4 || ctx.size_m == 8) {
++      params = {{32, 128, 32, 4, 32, 64, 16},
++                4,
++                true,
++                ctx.packed_macro_n};
++      return true;
++    }
++    if (ctx.size_m == 2) {
++      params = {{32, 128, 32, 4, 32, 32, 32},
++                8,
++                true,
++                ctx.packed_macro_n};
++      return true;
++    }
++    if (ctx.size_m == 16) {
++      params = {{32, 128, 128, 8, 32, 64, 32},
++                1,
++                true,
++                ctx.packed_macro_n};
++      return true;
++    }
++    if (ctx.size_m == 32) {
++      params = {{32, 256, 64, 8, 32, 64, 32},
++                1,
++                true,
++                ctx.packed_macro_n};
++      return true;
++    }
++    if (ctx.size_m == 64) {
++      params = {{32, 256, 32, 4, 32, 64, 32},
++                1,
++                true,
++                ctx.packed_macro_n};
++      return true;
++    }
++  }
++
++  // Down: routed rows have already expanded, so M=input_tokens*10 and
++  // top-k=1. Batch-one is effectively tied between the 128- and 256-wide
++  // geometries; retain the slightly faster 128-wide result. M={20,40,80,160,
++  // 320,640} use the 256-wide geometry, improving the DFlash widths by
++  // 1.09-1.11x.
++  if (ctx.top_k == 1 && ctx.size_n == 3072 && ctx.size_k == 256) {
++    if (ctx.size_m == 10) {
++      params = {{32, 128, 32, 4, 32, 64, 16},
++                1,
++                true,
++                ctx.packed_macro_n};
++      return true;
++    }
++    if (ctx.size_m == 20 || ctx.size_m == 40 || ctx.size_m == 80 ||
++        ctx.size_m == 160 || ctx.size_m == 320 || ctx.size_m == 640) {
++      params = {{32, 256, 32, 4, 32, 64, 32},
++                1,
++                true,
++                ctx.packed_macro_n};
++      return true;
++    }
++  }
++
++  return false;
++}
++
+ inline bool sm70_marlin_moe_try_select_quanttrio_minimax_m2_7_awq_params(
+     Sm70MarlinMoeAutoParamsContext const& ctx,
+     Sm70MarlinAutoParams& params) {
+@@ -2228,6 +2342,16 @@ inline Sm70MarlinAutoParams sm70_marlin_moe_auto_stage_params(
+     validate_sm70_marlin_auto_params("MoE", params);
+     return params;
+   }
++  if (sm70_marlin_moe_try_select_qwen3_5_122b_a10b_gptq_int4_params(
++          ctx, params)) {
++    validate_sm70_marlin_auto_params("MoE", params);
++    return params;
++  }
++  if (sm70_marlin_moe_try_select_poolside_laguna_s_2_1_int4_params(
++          ctx, params)) {
++    validate_sm70_marlin_auto_params("MoE", params);
++    return params;
++  }
+   if (sm70_marlin_moe_try_select_quanttrio_minimax_m2_7_awq_params(
+           ctx, params)) {
+     validate_sm70_marlin_auto_params("MoE", params);

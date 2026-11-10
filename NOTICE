@@ -1,0 +1,82 @@
+sglang-sxm2
+===========
+
+An agentic-coding inference engine for V100 GPUs, based on SGLang.
+
+    SGLang -- the inference engine
+    https://github.com/sgl-project/sglang
+    Copyright 2023-2024 SGLang Team
+    Licensed under the Apache License, Version 2.0
+
+This project incorporates work from:
+
+    sglang-V100 -- the original Volta (sm70) port of SGLang
+    https://github.com/haohervchb/sglang-V100
+    Parts of the sm70 kernels, the Qwen4-Exp model support and the serving
+    recipes carried here originate in that repository.
+    Related: https://github.com/haohervchb/flashinfer (sm70 FlashInfer)
+             https://github.com/haohervchb/GooseLLM (TileLang FlashAttention
+             and GDN kernels for V100, Apache 2.0)
+
+    1Cat-vLLM -- vLLM for V100; source of the sm70 TurboMind block-FP8 and
+    FP16 MoE backend the build compiles
+    https://github.com/1CatAI/1Cat-vLLM
+
+This is an independent project. It is not affiliated with, endorsed by, or
+supported by the SGLang project or LMSYS. Please do not file issues about this
+project's sm70 code against upstream SGLang, and do not file issues about
+upstream SGLang here.
+
+Third-party components
+----------------------
+
+The Volta build links against, derives from, or adapts code from the following
+projects. Each remains under its own license and copyright; consult each
+project for terms. Unless noted, they are not redistributed in this repository;
+the installer fetches them at pinned revisions.
+
+  lmdeploy / TurboMind -- sm70 MoE and FP8 GEMM kernels (via 1Cat-vLLM)
+    https://github.com/InternLM/lmdeploy
+    Apache License 2.0
+
+  marlin_v100 -- SM70 Marlin GPTQ/AWQ kernels
+    https://github.com/zhinianqin/marlin_v100
+
+  flash-attention-v100 -- FlashAttention for V100
+    https://github.com/ai-bond/flash-attention-v100
+    BSD 3-Clause License
+
+  v100-skinny -- the QPN8 FP8 decode GEMV adapted in
+    python/sglang/kernels/jit/csrc/sm70_fp8_qpn8_decode.cu
+    https://github.com/dnv2003/v100-skinny
+    MIT License
+
+  NVIDIA CUTLASS
+    https://github.com/NVIDIA/cutlass
+    Copyright (c) NVIDIA Corporation
+
+  FlashInfer (patched for sm70; see patches/flashinfer-sm70.patch)
+    https://github.com/flashinfer-ai/flashinfer
+
+  TileLang -- the sm70 attention and GDN kernels build on TileLang
+    https://github.com/tile-ai/tilelang
+
+Patches under patches/ are modifications to the above projects, distributed
+under this repository's Apache 2.0 license, and are only meaningful when applied
+to the upstream sources they name.
+
+Models
+------
+
+No model weights are distributed here. GLM-5.3-Flash, Qwen3.8-Flash-Next,
+DeepSeek-V4.1-Flash, MiniMax-H3 and any other checkpoint referenced in
+documentation or tests remain subject to their own licenses and terms of use,
+which you must satisfy independently.
+
+Disclaimer
+----------
+
+Provided "AS IS", without warranty or condition of any kind, express or implied,
+per Section 7 of the Apache License 2.0 in LICENSE. This software drives
+expensive hardware in ways its vendors no longer support; you are responsible
+for validating it in your own environment before relying on it.
