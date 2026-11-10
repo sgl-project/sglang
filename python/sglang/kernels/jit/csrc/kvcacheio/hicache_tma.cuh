@@ -27,10 +27,11 @@
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
-#include <sgl_kernel/mbarrier.cuh>
 #include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/utils.cuh>
 #include <sgl_kernel/warp.cuh>
+
+#include <sgl_kernel/ptx/barrier.cuh>
 
 #include <dlpack/dlpack.h>
 
@@ -38,6 +39,7 @@
 #include <cstdint>
 #include <cuda.h>
 #include <cudaTypedefs.h>
+#include <limits>
 
 namespace sglang {
 
@@ -109,9 +111,9 @@ struct HicacheTmaParams {
   const void* __restrict__ indices_dst;
   int64_t src_stride;  // bytes between consecutive token rows
   int64_t dst_stride;
-  uint32_t row_bytes;  // bytes copied per token row, multiple of 16
-  uint32_t length;     // number of token indices
-  uint32_t num_layers;
+  uint32_t row_bytes;            // bytes copied per token row, multiple of 16
+  uint32_t length;               // number of token indices
+  uint32_t num_layers;           // head groups for the page-unified specialization
   uint64_t units_per_row_magic;  // ceil(2^32 / (row_bytes / 16)); see store loop
   bool src_is_table;
   bool dst_is_table;
@@ -119,6 +121,11 @@ struct HicacheTmaParams {
   // Strided source rows ([K, V] views): one box per chunk instead of one op per row.
   bool has_src_map;
   CUtensorMap src_map[2];
+  // Page-unified sources keep a layer's rows contiguous only within each page.
+  // The component/layer offset is folded into k_src/v_src by the entry point.
+  uint32_t src_page_size = 0;
+  int64_t src_page_stride = 0;
+  int64_t src_group_stride = 0;
 };
 
 // Rows of one chunk are spread over the loader lanes; each lane prefetches at
@@ -138,6 +145,16 @@ SGL_DEVICE_HOST constexpr uint32_t hicache_tma_rows_per_chunk(uint32_t stage_byt
   return rows;
 }
 
+SGL_DEVICE_HOST constexpr uint32_t
+hicache_tma_page_unified_rows_per_chunk(uint32_t stage_bytes, uint32_t row_bytes, uint32_t page_size) {
+  uint32_t rows = hicache_tma_rows_per_chunk(stage_bytes, row_bytes);
+  // Whole-page index runs must not straddle the gaps between layer/component
+  // cells, including when a page is smaller than a stage or not a power of two.
+  while (page_size % rows != 0)
+    rows /= 2;
+  return rows;
+}
+
 template <uint32_t kStageBytes, uint32_t kNumStages>
 struct HicacheTmaSmem {
   alignas(128) uint8_t stages[kNumStages][kStageBytes];
@@ -147,7 +164,7 @@ struct HicacheTmaSmem {
   uint64_t empty[kNumStages];                       // storers -> loader: stage drained (count kStoreWarps)
 };
 
-template <typename T, uint32_t kStageBytes, uint32_t kNumStages, uint32_t kStoreWarps>
+template <typename T, uint32_t kStageBytes, uint32_t kNumStages, uint32_t kStoreWarps, bool kPageUnified = false>
 __global__ void __launch_bounds__((1 + kStoreWarps) * device::kWarpThreads, 1)
     hicache_tma_transfer_kernel(const __grid_constant__ HicacheTmaParams p) {
 #if SGL_ARCH_HOPPER_OR_GREATER
@@ -168,16 +185,18 @@ __global__ void __launch_bounds__((1 + kStoreWarps) * device::kWarpThreads, 1)
   }
   __syncthreads();
 
-  const uint32_t rows_per_chunk = hicache_tma_rows_per_chunk(kStageBytes, p.row_bytes);
+  const uint32_t rows_per_chunk =
+      kPageUnified ? hicache_tma_page_unified_rows_per_chunk(kStageBytes, p.row_bytes, p.src_page_size)
+                   : hicache_tma_rows_per_chunk(kStageBytes, p.row_bytes);
   const uint32_t token_chunks = div_ceil(p.length, rows_per_chunk);
   const uint32_t num_chunks = (p.has_v ? 2u : 1u) * p.num_layers * token_chunks;
   const T* idx_src = static_cast<const T*>(p.indices_src);
   const T* idx_dst = static_cast<const T*>(p.indices_dst);
 
   struct ChunkInfo {
-    uint32_t t0;    // first index position
-    uint32_t rows;  // rows in this chunk
-    uint32_t layer;
+    uint32_t t0;     // first index position
+    uint32_t rows;   // rows in this chunk
+    uint32_t layer;  // head group for page-unified sources
     bool is_v;
   };
   auto describe = [&](uint32_t chunk) {
@@ -190,6 +209,14 @@ __global__ void __launch_bounds__((1 + kStoreWarps) * device::kWarpThreads, 1)
     return is_table ? reinterpret_cast<const void*>(static_cast<const uint64_t*>(direct_or_table)[layer])
                     : direct_or_table;
   };
+  auto src_offset = [&](T token) -> int64_t {
+    const auto index = static_cast<int64_t>(token);
+    if constexpr (kPageUnified) {
+      return (index / p.src_page_size) * p.src_page_stride + (index % p.src_page_size) * p.row_bytes;
+    } else {
+      return index * p.src_stride;
+    }
+  };
 
   if (warp == 0) {
     // ---- loader: global -> smem ring via TMA bulk copies
@@ -201,7 +228,11 @@ __global__ void __launch_bounds__((1 + kStoreWarps) * device::kWarpThreads, 1)
     auto prefetch = [&](uint32_t chunk) {
       const ChunkInfo c = describe(chunk);
       Prefetch pf;
-      pf.src_base = base_ptr(c.is_v ? p.v_src : p.k_src, p.src_is_table, c.layer);
+      if constexpr (kPageUnified) {
+        pf.src_base = pointer::offset(c.is_v ? p.v_src : p.k_src, static_cast<int64_t>(c.layer) * p.src_group_stride);
+      } else {
+        pf.src_base = base_ptr(c.is_v ? p.v_src : p.k_src, p.src_is_table, c.layer);
+      }
 #pragma unroll
       for (uint32_t k = 0; k < kHicacheTmaRowsPerLane; ++k) {
         const uint32_t r = lane + k * kWarpThreads;
@@ -230,8 +261,15 @@ __global__ void __launch_bounds__((1 + kStoreWarps) * device::kWarpThreads, 1)
       }
       run = __all_sync(warp::kFullMask, run);
       run_dst = __all_sync(warp::kFullMask, run_dst);
-      const bool contiguous = run && p.src_stride == p.row_bytes;
-      const bool boxed = run && !contiguous && p.has_src_map;
+      bool contiguous = run && p.src_stride == p.row_bytes;
+      if constexpr (kPageUnified) {
+        // Arbitrary index lists may start mid-page even though chunk sizes tile
+        // pages. Consecutive token ids across a page boundary are not adjacent
+        // source rows in this layout.
+        const int64_t first_token = static_cast<int64_t>(first);
+        contiguous &= first_token / p.src_page_size == (first_token + c.rows - 1) / p.src_page_size;
+      }
+      const bool boxed = !kPageUnified && run && !contiguous && p.has_src_map;
 
       const uint32_t s = it % kNumStages;
       ptx::mbar_wait_parity(&smem.empty[s], ((it / kNumStages) & 1) ^ 1);  // fresh ring passes
@@ -249,11 +287,7 @@ __global__ void __launch_bounds__((1 + kStoreWarps) * device::kWarpThreads, 1)
       uint8_t* stage = smem.stages[s];
       if (contiguous) {
         if (lane == 0) {
-          ptx::bulk_g2s(
-              stage,
-              pointer::offset(cur.src_base, static_cast<int64_t>(first) * p.src_stride),
-              c.rows * p.row_bytes,
-              &smem.full[s]);
+          ptx::bulk_g2s(stage, pointer::offset(cur.src_base, src_offset(first)), c.rows * p.row_bytes, &smem.full[s]);
         }
       } else if (boxed) {
         if (lane == 0) {
@@ -266,7 +300,7 @@ __global__ void __launch_bounds__((1 + kStoreWarps) * device::kWarpThreads, 1)
           if (r < c.rows) {
             ptx::bulk_g2s(
                 stage + r * p.row_bytes,
-                pointer::offset(cur.src_base, static_cast<int64_t>(cur.src[k]) * p.src_stride),
+                pointer::offset(cur.src_base, src_offset(cur.src[k])),
                 p.row_bytes,
                 &smem.full[s]);
           }
@@ -303,7 +337,12 @@ __global__ void __launch_bounds__((1 + kStoreWarps) * device::kWarpThreads, 1)
     uint32_t it = 0;
     for (uint32_t chunk = blockIdx.x; chunk < num_chunks; chunk += gridDim.x, ++it) {
       const ChunkInfo c = describe(chunk);
-      void* dst_base = const_cast<void*>(base_ptr(c.is_v ? p.v_dst : p.k_dst, p.dst_is_table, c.layer));
+      void* dst_base;
+      if constexpr (kPageUnified) {
+        dst_base = pointer::offset(c.is_v ? p.v_dst : p.k_dst, static_cast<int64_t>(c.layer) * p.row_bytes);
+      } else {
+        dst_base = const_cast<void*>(base_ptr(c.is_v ? p.v_dst : p.k_dst, p.dst_is_table, c.layer));
+      }
       const uint32_t s = it % kNumStages;
       const uint32_t n_units = c.rows * units_per_row;
       const uint32_t n_full = n_units - n_units % kUnitsPerIter;
@@ -369,8 +408,8 @@ struct HiCacheTmaKernel {
   static_assert(kNumStages >= 3 && kStoreWarps >= 1, "two bulk stores in flight plus one loading stage");
   static constexpr uint32_t kThreads = (1 + kStoreWarps) * device::kWarpThreads;
 
-  template <typename T>
-  static constexpr auto kernel = hicache_tma_transfer_kernel<T, kStageBytes, kNumStages, kStoreWarps>;
+  template <typename T, bool kPageUnified = false>
+  static constexpr auto kernel = hicache_tma_transfer_kernel<T, kStageBytes, kNumStages, kStoreWarps, kPageUnified>;
 
   static uint32_t rows_per_chunk(uint32_t row_bytes) {
     return hicache_tma_rows_per_chunk(kStageBytes, row_bytes);
@@ -427,6 +466,7 @@ struct HiCacheTmaKernel {
     host::RuntimeCheck(res == CUDA_SUCCESS, "cuTensorMapEncodeTiled failed: ", static_cast<int>(res));
   }
 
+  template <bool kPageUnified = false>
   static void launch(const HicacheTmaParams& params, bool use_int32, DLDevice device) {
     using namespace host;
     RuntimeCheck(params.row_bytes > 0 && params.row_bytes % 16 == 0, "HiCache TMA: row bytes must be a multiple of 16");
@@ -435,15 +475,17 @@ struct HiCacheTmaKernel {
         params.src_stride % 16 == 0 && params.dst_stride % 16 == 0, "HiCache TMA: strides must be multiples of 16");
     if (params.length == 0 || params.num_layers == 0) return;
 
-    const uint32_t chunks =
-        (params.has_v ? 2u : 1u) * params.num_layers * div_ceil(params.length, rows_per_chunk(params.row_bytes));
+    const uint32_t chunk_rows =
+        kPageUnified ? hicache_tma_page_unified_rows_per_chunk(kStageBytes, params.row_bytes, params.src_page_size)
+                     : rows_per_chunk(params.row_bytes);
+    const uint32_t chunks = (params.has_v ? 2u : 1u) * params.num_layers * div_ceil(params.length, chunk_rows);
     constexpr std::size_t kSmemBytes = sizeof(Smem);
 
     runtime::init_per_device(device, [=] {
-      runtime::set_max_dynamic_smem(kernel<int32_t>, kSmemBytes);
-      runtime::set_max_dynamic_smem(kernel<int64_t>, kSmemBytes);
+      runtime::set_max_dynamic_smem(kernel<int32_t, kPageUnified>, kSmemBytes);
+      runtime::set_max_dynamic_smem(kernel<int64_t, kPageUnified>, kSmemBytes);
     });
-    const auto fn = use_int32 ? kernel<int32_t> : kernel<int64_t>;
+    const auto fn = use_int32 ? kernel<int32_t, kPageUnified> : kernel<int64_t, kPageUnified>;
     LaunchKernel(std::min(chunks, kBlockQuota), kThreads, device, kSmemBytes)(fn, params);
   }
 
@@ -470,6 +512,87 @@ struct HiCacheTmaKernel {
         .with_device<kDLGPU>(device)
         .verify(a)
         .verify(b);
+  }
+
+  // Host layout: [page, head group, layer, K/V, token in page, group row].
+  // MLA omits the head-group and K/V axes. Device rows contain all head groups.
+  template <bool kIsMLA>
+  static void run_one_page_unified(
+      const tvm::ffi::TensorView k_cache_dst,
+      const tvm::ffi::TensorView v_cache_dst,
+      const tvm::ffi::TensorView src,
+      const tvm::ffi::TensorView src_indices,
+      const tvm::ffi::TensorView dst_indices,
+      const int64_t layer_id,
+      const int64_t num_layers,
+      const int64_t num_groups,
+      const int64_t page_size) {
+    using namespace host;
+    auto B = SymbolicSize{"page elements"};
+    auto C = SymbolicSize{"layer elements per token"};
+    auto N = SymbolicSize{"indices length"};
+    auto cache_dtype = SymbolicDType{};
+    auto indices_dtype = SymbolicDType{};
+    auto device_ = SymbolicDevice{};
+
+    TensorMatcher({-1, C}).with_dtype(cache_dtype).with_device<kDLGPU>(device_).verify(k_cache_dst);
+    if constexpr (!kIsMLA) {
+      TensorMatcher({-1, C}).with_dtype(cache_dtype).with_device<kDLGPU>(device_).verify(v_cache_dst);
+    }
+    TensorMatcher({-1, B}).with_dtype(cache_dtype).with_device<kDLCPU, kDLGPUHost, kDLGPU>().verify(src);
+    verify_indices(src_indices, dst_indices, N, indices_dtype, device_);
+
+    constexpr int64_t kComponents = kIsMLA ? 1 : 2;
+    RuntimeCheck(num_layers > 0 && num_groups > 0 && page_size > 0, "Page-unified TMA load-back: invalid dimensions");
+    RuntimeCheck(layer_id >= 0 && layer_id < num_layers, "Page-unified TMA load-back: layer id out of range");
+    RuntimeCheck(!kIsMLA || num_groups == 1, "Page-unified MLA TMA load-back: expected one latent group");
+    RuntimeCheck(
+        num_groups <= std::numeric_limits<uint32_t>::max() && page_size <= std::numeric_limits<uint32_t>::max() &&
+            N.unwrap() <= std::numeric_limits<uint32_t>::max(),
+        "Page-unified TMA load-back: dimensions exceed uint32 range");
+    const auto dtype_size = dtype_bytes(cache_dtype.unwrap());
+    const int64_t dst_stride = C.unwrap() * dtype_size;
+    RuntimeCheck(dst_stride % num_groups == 0, "Page-unified TMA load-back: device row must divide into head groups");
+    const int64_t group_bytes = dst_stride / num_groups;
+    RuntimeCheck(
+        group_bytes > 0 && group_bytes % 16 == 0 && group_bytes <= kStageBytes,
+        "Page-unified TMA load-back: group row must be 16-byte aligned and fit the smem stage");
+    const int64_t group_stride = num_layers * kComponents * page_size * group_bytes;
+    RuntimeCheck(
+        B.unwrap() * dtype_size == num_groups * group_stride, "Page-unified TMA load-back: page byte size mismatch");
+    RuntimeCheck(
+        reinterpret_cast<uintptr_t>(src.data_ptr()) % 16 == 0 &&
+            reinterpret_cast<uintptr_t>(k_cache_dst.data_ptr()) % 16 == 0 &&
+            (kIsMLA || reinterpret_cast<uintptr_t>(v_cache_dst.data_ptr()) % 16 == 0),
+        "Page-unified TMA load-back: buffers must be 16-byte aligned");
+    if (N.unwrap() == 0) return;
+
+    const auto* raw = static_cast<const uint8_t*>(runtime::get_device_accessible_ptr(src));
+    const auto* k_src = raw + layer_id * kComponents * page_size * group_bytes;
+    const HicacheTmaParams params{
+        .k_src = k_src,
+        .v_src = kIsMLA ? nullptr : k_src + page_size * group_bytes,
+        .k_dst = k_cache_dst.data_ptr(),
+        .v_dst = kIsMLA ? nullptr : v_cache_dst.data_ptr(),
+        .indices_src = src_indices.data_ptr(),
+        .indices_dst = dst_indices.data_ptr(),
+        .src_stride = group_bytes,
+        .dst_stride = dst_stride,
+        .row_bytes = static_cast<uint32_t>(group_bytes),
+        .length = static_cast<uint32_t>(N.unwrap()),
+        // The selected layer is folded into the source base. Reuse the chunk's
+        // layer axis to visit each head group and offset both destination bases.
+        .num_layers = static_cast<uint32_t>(num_groups),
+        .units_per_row_magic = units_per_row_magic(static_cast<uint32_t>(group_bytes)),
+        .src_is_table = false,
+        .dst_is_table = false,
+        .has_v = !kIsMLA,
+        .has_src_map = false,
+        .src_page_size = static_cast<uint32_t>(page_size),
+        .src_page_stride = num_groups * group_stride,
+        .src_group_stride = group_stride,
+    };
+    launch<true>(params, indices_dtype.unwrap().bits == 32, device_.unwrap());
   }
 
   // One layer, direct pointers. `v_*` are ignored when `has_v == false`.

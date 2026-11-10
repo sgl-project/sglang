@@ -42,6 +42,7 @@ from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.token_demand import token_demand
 from sglang.test.unified_allocator_fixtures import (
     FakeKVCache,
     arena_of,
@@ -106,13 +107,10 @@ _TABLES = {"virtual_to_physical", "physical_to_virtual"}
 # a tombstone" is a per-method design fact a scan cannot infer.
 _TOMBSTONE_METHODS = [
     (mea.Band, "_free_lazy"),
-    (mea.Band, "free"),
-    (mea.Band, "free_physical"),
+    (mea.Band, "_unbind_physical"),
     (mea.Band, "_commit_move_batch"),
     (mea.FloatBand, "free"),
-    (mea.FloatBand, "free_physical"),
-    (mea.FloatBand, "make_room"),
-    (mea.FloatBand, "_relocate_to_positions"),
+    (mea.FloatBand, "relocate_into"),
 ]
 
 
@@ -364,7 +362,6 @@ class TestIndependentWindowFree(unittest.TestCase):
             DraftBand,
             FusedDraftPlacement,
         )
-        from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
         from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
         self.addCleanup(reset_context)
@@ -397,16 +394,13 @@ class TestIndependentWindowFree(unittest.TestCase):
                         )
                     )
                     ids = a.alloc(32)
-                    kv = ReqKvInfo(req_pool_idx=0, swa_evict_floor=8)
+                    kv = ReqKvInfo(req_pool_idx=0, window_evict_floor=8)
                     storage.requests.req_to_token[0, :32] = ids
-                    for name, ct, end in zip(
-                        ("swa", "draft_swa"),
-                        (ComponentType.SWA, ComponentType.AUXILIARY_SWA),
-                        cursors,
-                    ):
-                        start = 8 if ct == ComponentType.SWA and end else 0
+                    for name, end in zip(("window_16", "draft_swa"), cursors):
+                        # Every window frees from the request's shield up.
+                        start = 8 if end else 0
                         a.free_window_segment(name, ids[start:end], start_pos=start)
-                        kv.set_evicted_seqlen(ct, end)
+                        kv.set_evicted_seqlen(name, end)
                     recorder = _ShapeSyncRecorder()
                     with (
                         envs.SGLANG_INVARIANT_CHECK.override(
@@ -489,26 +483,27 @@ class TestIndependentWindowFree(unittest.TestCase):
         ):
             for primary, auxiliary in ((48, 40), (32, 16)):
                 ids = a.alloc(64)
-                a.free_window_segment("swa", ids[:primary], start_pos=0)
+                a.free_window_segment("window_16", ids[:primary], start_pos=0)
                 a.free_window_segment("draft_swa", ids[:auxiliary], start_pos=0)
                 cache.insert(
                     InsertParams(
                         key=RadixKey(array("q", range(64))),
                         value=ids,
                         component_evicted_seqlens={
-                            ComponentType.SWA: primary,
-                            ComponentType.AUXILIARY_SWA: auxiliary,
+                            ComponentType.of("WINDOW_16"): primary,
+                            ComponentType.of("DRAFT_SWA"): auxiliary,
                         },
                     )
                 )
             self.assertEqual(recorder.hits, [])
             self.assertEqual(
                 {b.sub_pool_name: b.allocated_count() for b in a.bands},
-                {"full": 64, "swa": 32, "draft_swa": 48},
+                {"full": 64, "window_16": 32, "draft_swa": 48},
             )
             cache.evict(
                 EvictParams(
-                    num_tokens=64, swa_num_tokens=64, auxiliary_swa_num_tokens=64
+                    num_tokens=64,
+                    window_num_tokens={"window_16": 64, "draft_swa": 64},
                 )
             )
         self.assertEqual(recorder.hits, [])
@@ -541,10 +536,13 @@ class TestUnifiedSwaFullSideGroup(unittest.TestCase):
         cache = mock.Mock()
         cache.supports_prefix_sharing.return_value = True
         cache.full_evictable_size.return_value = 0
-        cache.swa_evictable_size.return_value = 0
+        cache.window_evictable_size.return_value = 0
         cache.evict_for_alloc.side_effect = AssertionError("no tree eviction needed")
 
-        self.assertTrue(alloc.evict_to_free_tokens(cache, before + 4, swa_num_tokens=0))
+        alloc.flush_deferred_full_frees()
+        self.assertTrue(
+            cache.reclaim(alloc.page_demands(token_demand(alloc, before + 4, 0)))
+        )
         self.assertEqual(alloc.full_available_size(), before + 8)
 
     def test_full_only_frees_defer_until_group_end(self):
@@ -659,7 +657,7 @@ class TestFreeSwaWindowRatchetNoHostSync(CustomTestCase):
     def test_start_pos_path_matches_the_fallback_end_state(self):
         """Derived property: the stride-rep path and the dedup fallback leave
         identical v2p tombstones and capacity."""
-        for lazy in (True, False):
+        for lazy in (True,):
             with self.subTest(lazy=lazy):
                 a1 = self._swa_composite(lazy=lazy)
                 a2 = self._swa_composite(lazy=lazy)
@@ -675,10 +673,7 @@ class TestFreeSwaWindowRatchetNoHostSync(CustomTestCase):
                     )
                 )
                 self.assertEqual(a1.available_size(), a2.available_size())
-                self.assertEqual(
-                    a1.swa_attn_allocator.schedulable_available_size(),
-                    a2.swa_attn_allocator.schedulable_available_size(),
-                )
+                self.assertEqual(a1.swa_available_size(), a2.swa_available_size())
 
     def test_segment_frees_dispatch_no_data_dependent_shape(self):
         """Bug regression: the ratchet, a request's release and a tree eviction

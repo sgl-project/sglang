@@ -488,6 +488,7 @@ def mhc_pre_big_fuse_tilelang(
     n_splits: int = 16,
     hc_mult: int = 4,
     gemm_last_dim: int = -1,
+    eps_outside_sqrt: bool = False,
 ):
     num_tokens = T.dynamic("num_tokens")
     hc_mult3 = hc_mult * (2 + hc_mult)
@@ -516,7 +517,10 @@ def mhc_pre_big_fuse_tilelang(
 
         for i_split in T.serial(n_splits):
             rms[0] += gemm_out_sqrsum[i_split, i]
-        rms[0] = T.rsqrt(rms[0] / (hc_mult * hidden_size) + rms_eps)
+        if eps_outside_sqrt:
+            rms[0] = 1.0 / (T.sqrt(rms[0] / (hc_mult * hidden_size)) + rms_eps)
+        else:
+            rms[0] = T.rsqrt(rms[0] / (hc_mult * hidden_size) + rms_eps)
         for j in T.Parallel(hc_mult3):
             mixes[j] = 0
             for i_split in T.serial(n_splits):
@@ -911,6 +915,7 @@ def mhc_pre_big_fuse_with_norm_tilelang(
     n_splits: int = 16,
     hc_mult: int = 4,
     gemm_last_dim: int = -1,
+    eps_outside_sqrt: bool = False,
 ):
     """Fused mhc_pre big_fuse + RMSNorm of layer_input.
 
@@ -947,7 +952,10 @@ def mhc_pre_big_fuse_with_norm_tilelang(
 
         for i_split in T.serial(n_splits):
             rms[0] += gemm_out_sqrsum[i_split, i]
-        rms[0] = T.rsqrt(rms[0] / (hc_mult * hidden_size) + rms_eps)
+        if eps_outside_sqrt:
+            rms[0] = 1.0 / (T.sqrt(rms[0] / (hc_mult * hidden_size)) + rms_eps)
+        else:
+            rms[0] = T.rsqrt(rms[0] / (hc_mult * hidden_size) + rms_eps)
         for j in T.Parallel(hc_mult3):
             mixes[j] = 0
             for i_split in T.serial(n_splits):
@@ -1071,7 +1079,10 @@ def mhc_pre(
     *,
     norm_weight: torch.Tensor | None = None,
     norm_eps: float | None = None,
+    eps_outside_sqrt: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``eps_outside_sqrt`` normalizes by ``1 / (sqrt(mean_sq) + eps)`` instead of
+    ``rsqrt(mean_sq + eps)``; set it to the formula the checkpoint was trained with."""
     assert residual.dtype == torch.bfloat16
     assert fn.dtype == torch.float32
     assert hc_scale.dtype == torch.float32
@@ -1235,6 +1246,7 @@ def mhc_pre(
             big_fuse_n_splits,
             hc_mult,
             gemm_last_dim,
+            eps_outside_sqrt,
         )
     else:
         mhc_pre_big_fuse_tilelang(
@@ -1255,6 +1267,7 @@ def mhc_pre(
             big_fuse_n_splits,
             hc_mult,
             gemm_last_dim,
+            eps_outside_sqrt,
         )
 
     post_mix = post_mix.view(*outer_shape, hc_mult, 1)
@@ -2716,7 +2729,10 @@ def hc_mix_stats_sinkhorn_deepgemm(
     hc_eps: float,
     hc_mult: int = 4,
 ):
-    from sglang.srt.layers.deep_gemm_wrapper.entrypoint import tf32_hc_prenorm_gemm
+    from sglang.srt.layers.deep_gemm_wrapper.entrypoint import (
+        tf32_hc_prenorm_gemm,
+        tf32_hc_prenorm_gemm_dual,
+    )
 
     assert x_flat.dtype == torch.bfloat16 and x_flat.is_contiguous()
     m, k = x_flat.shape
@@ -2734,10 +2750,13 @@ def hc_mix_stats_sinkhorn_deepgemm(
     mix_hi = torch.empty((slices, m, mix), dtype=torch.float32, device=dev)
     mix_lo = torch.empty_like(mix_hi)
     sq = torch.empty((slices, m), dtype=torch.float32, device=dev)
-    tf32_hc_prenorm_gemm(x_flat, high, mix_hi, sq, slices)
-    # sq depends only on x_flat, so the second projection recomputes the same
-    # values; overwriting it avoids a throwaway (slices, m) scratch, 4 MiB at m=65536.
-    tf32_hc_prenorm_gemm(x_flat, low, mix_lo, sq, slices)
+    if current_arch().is_sm(10):
+        tf32_hc_prenorm_gemm_dual(x_flat, high, low, mix_hi, mix_lo, sq, slices)
+    else:
+        tf32_hc_prenorm_gemm(x_flat, high, mix_hi, sq, slices)
+        # sq depends only on x_flat, so the second projection recomputes the same
+        # values; overwriting it avoids a throwaway (slices, m) scratch, 4 MiB at m=65536.
+        tf32_hc_prenorm_gemm(x_flat, low, mix_lo, sq, slices)
     _hc_mix_reduce_sinkhorn_kernel[(m,)](
         mix_hi,
         sq,

@@ -85,6 +85,15 @@ register_kernel(
 
 register_kernel(
     KernelSpec(
+        op="attention.dcp_push_combine",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.dcp_push_combine:dcp_push_combine",
+        capabilities=CUDA_ONLY,
+    )
+)
+
+register_kernel(
+    KernelSpec(
         op="attention.kda_qwen38_qsa_sm121",
         backend=KernelBackend.KDA,
         target=("sglang.kernels.kda_kernels.qwen38_qsa_sm121:qwen38_qsa_sm121"),
@@ -323,6 +332,14 @@ register_kernel(
         op="attention.fast_kpool_topk_transform_fused",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.attention.dsa.kpool_topk_transform:fast_kpool_topk_transform_fused",
+        capabilities=CUDA_ONLY,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="attention.flashmla_token_pack_prepare",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.dsa.flashmla_token_pack:flashmla_token_pack_prepare",
         capabilities=CUDA_ONLY,
     )
 )
@@ -609,5 +626,31 @@ register_kernel(
         capabilities=frozenset(
             {CapabilityRequirement.cuda(min_sm=(12, 0), max_sm=(12, 1))}
         ),
+    )
+)
+
+register_kernel(
+    KernelSpec(
+        op="attention.append_window_to_topk",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.attention.dsa.append_window_to_topk:append_window_to_topk",
+        capabilities=CUDA_ONLY,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="attention.postmix_fp8_wo_a_quant",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.attention.postmix_fp8_wo_a:postmix_fp8_wo_a_quant",
+        # The UE8M0 packed scales are an SM100 layout.
+        capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(10, 0))}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="attention.indexer_q_quant_head_gate",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.attention.dsa.head_gate:indexer_q_quant_head_gate",
+        capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(8, 9))}),
     )
 )
