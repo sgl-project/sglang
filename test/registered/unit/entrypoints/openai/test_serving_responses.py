@@ -484,6 +484,7 @@ class ChatToolForwardingTestCase(CustomTestCase):
     def test_kimi_k3_request_uses_chat_encoder_fields(self):
         serving = make_serving()
         serving.chat_encoding_spec = "kimi_k3"
+        serving._encoding_adapter = serving._build_chat_encoding_adapter()
         serving.default_chat_template_kwargs = {}
         serving.template_manager.chat_template_name = None
         serving.tokenizer_manager.tokenizer.apply_chat_template.return_value = [4, 5, 6]
@@ -1686,6 +1687,9 @@ class ChatEncodingAdapterDispatchTestCase(CustomTestCase):
             tool_call_parsing_active=Mock(),
             history_tool_calls_count=Mock(),
             tool_call_id=Mock(),
+            effective_tools=Mock(),
+            split_assistant_prefix=Mock(),
+            append_assistant_prefix=Mock(),
         )
 
     def test_only_a_selected_inkling_encoding_requires_tml_renderers(self):

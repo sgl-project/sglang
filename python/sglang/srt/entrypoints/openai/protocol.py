@@ -66,6 +66,7 @@ from pydantic import (
     ConfigDict,
     Field,
     PrivateAttr,
+    SerializationInfo,
     StrictBool,
     field_serializer,
     field_validator,
@@ -262,15 +263,6 @@ class UsageInfo(BaseModel):
     # The OpenAI location of reasoning_tokens; set only when there are some.
     completion_tokens_details: Optional[CompletionTokensDetails] = None
 
-    @model_serializer(mode="wrap")
-    def _serialize(self, handler):
-        data = handler(self)
-        # Absent unless a surface fills it (K3 does, per its stream spec), so
-        # every other model's usage object keeps its historical shape.
-        if data.get("completion_tokens_details") is None:
-            data.pop("completion_tokens_details", None)
-        return data
-
 
 class StreamOptions(BaseModel):
     # None means "unset": fall back to the server default. An explicit false
@@ -278,8 +270,8 @@ class StreamOptions(BaseModel):
     # turns it on, which a False default cannot express.
     include_usage: Optional[bool] = None
     continuous_usage_stats: Optional[bool] = False
-    # K3 API extension: attach choices[].internal_content[].token_ids to
-    # every increment frame — the raw token ids behind that increment.
+    # Kimi-K3 extension, ignored elsewhere: attach
+    # choices[].internal_content[].token_ids to every increment frame.
     include_internal_content: Optional[bool] = False
 
 
@@ -784,6 +776,16 @@ RerankContentPart = Union[
 RerankContent = Union[str, List[RerankContentPart]]
 
 
+# Serialization context of stream chunks on a wire that drops null delta keys.
+# Request messages reuse ToolCall and reach chat templates through
+# model_dump(), so the key dropping below applies under this context only.
+STREAM_DELTA_CONTEXT = {"stream_delta": True}
+
+
+def _is_stream_delta(info: SerializationInfo) -> bool:
+    return bool(info.context and info.context.get("stream_delta"))
+
+
 class FunctionResponse(BaseModel):
     """Function response."""
 
@@ -791,11 +793,12 @@ class FunctionResponse(BaseModel):
     arguments: Optional[str | Dict[str, Any]] = None
 
     @model_serializer(mode="wrap")
-    def _serialize(self, handler):
-        # K3 streaming format: continuation chunks must not carry a name key, not
-        # even null; the arguments key must always be present.
-        # Non-streaming responses always set name, so they are unaffected.
+    def _serialize(self, handler, info: SerializationInfo):
+        # Continuation chunks must not carry a name key, not even null; the
+        # arguments key must always be present.
         data = handler(self)
+        if not _is_stream_delta(info):
+            return data
         if data.get("name") is None:
             data.pop("name", None)
         if data.get("arguments") is None:
@@ -812,11 +815,12 @@ class ToolCall(BaseModel):
     function: FunctionResponse
 
     @model_serializer(mode="wrap")
-    def _serialize(self, handler):
-        # Streaming continuation chunks (id is None) may only carry index +
+    def _serialize(self, handler, info: SerializationInfo):
+        # Continuation chunks (id is None) may only carry index +
         # function.arguments; id/type must not appear, not even null.
-        # First chunks and non-streaming responses (id set) keep every field.
         data = handler(self)
+        if not _is_stream_delta(info):
+            return data
         if data.get("id") is None:
             data.pop("id", None)
             data.pop("type", None)
@@ -1194,15 +1198,6 @@ class ChatCompletionRequest(PDRoutingFields):
         "repetition_penalty": 1.0,
     }
 
-    # Streaming created timestamp: set once per request by the serving layer
-    # and reused for every frame (the K3 streaming format requires it constant;
-    # computing it per frame drifts across second boundaries on long streams).
-    _stream_created_ts: Optional[int] = None
-    # Wire-level response id, derived once from the first engine event. With
-    # n>1 the engine assigns a separate rid per sampled choice, so deriving it
-    # per frame would break the constant-id contract.
-    _stream_wire_id: Optional[str] = None
-
     @model_validator(mode="before")
     @classmethod
     def _handle_deprecated_dp_rank(cls, values):
@@ -1487,7 +1482,13 @@ class ChatCompletionResponseChoice(BaseModel):
     logprobs: Optional[Union[LogProbs, ChoiceLogprobs]] = None
     finish_reason: Optional[
         Literal[
-            "stop", "length", "tool_calls", "content_filter", "function_call", "abort"
+            "stop",
+            "length",
+            "tool_calls",
+            "content_filter",
+            "function_call",
+            "abort",
+            "server_interrupted",
         ]
     ] = None
     matched_stop: Union[None, int, str] = None
@@ -1535,15 +1536,12 @@ class DeltaMessage(BaseModel):
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
     hidden_states: Optional[object] = None
 
-    # The K3 streaming format drops every null field: reasoning_content must
-    # not be null and the end frame must be {}. Other models keep the null
-    # keys, which OpenAI SDK clients read as attributes.
-    _omit_nulls: bool = PrivateAttr(default=False)
-
     @model_serializer(mode="wrap")
-    def _serialize(self, handler):
+    def _serialize(self, handler, info: SerializationInfo):
         data = handler(self)
-        if self._omit_nulls:
+        # Without the context, null keys stay: OpenAI SDK clients read
+        # reasoning_content as an attribute.
+        if _is_stream_delta(info):
             return {k: v for k, v in data.items() if v is not None}
         if self.hidden_states is None:
             data.pop("hidden_states", None)
@@ -1562,14 +1560,7 @@ class ChatCompletionResponseStreamChoice(BaseModel):
             "content_filter",
             "function_call",
             "abort",
-            # K3 API extensions; "abort" is mapped onto
-            # server_interrupted on the K3 wire.
-            "unexpected_state",
-            "malformed_byte_sequence",
-            "engine_overloaded",
             "server_interrupted",
-            "repeat",
-            "unknown",
         ]
     ] = None
     matched_stop: Union[None, int, str] = None

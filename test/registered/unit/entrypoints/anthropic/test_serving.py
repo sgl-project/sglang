@@ -75,7 +75,7 @@ class _FakeNonStreamingErrorOpenAI:
     def _convert_to_internal_request(self, chat_request, raw_request):
         return SimpleNamespace(), chat_request
 
-    async def _handle_non_streaming_request(
+    async def _chat_completion_response(
         self, adapted_request, processed_request, raw_request
     ):
         if self._exception is not None:

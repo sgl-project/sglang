@@ -31,14 +31,19 @@ from xgrammar import Grammar
 from xgrammar.testing import _is_grammar_accept_string
 
 from sglang.srt.entrypoints.openai.chat_encoding import resolve_chat_encoding_spec
+from sglang.srt.entrypoints.openai.kimi_k3_adapter import GENERATION_STUB_TOKENS
+from sglang.srt.entrypoints.openai.kimi_k3_wire import KimiK3ChatWire
 from sglang.srt.entrypoints.openai.parallel_prompt_encode import encode_prompt_segments
 from sglang.srt.entrypoints.openai.protocol import (
+    STREAM_DELTA_CONTEXT,
     ChatCompletionRequest,
     DeltaMessage,
     Function,
+    FunctionResponse,
     MessageProcessingResult,
     StreamOptions,
     Tool,
+    ToolCall,
     ToolChoice,
     ToolChoiceFuncName,
 )
@@ -168,6 +173,12 @@ _TOOL_RESULT_REORDER_TEMPLATE = """
     {%- endfor -%}
 {%- endfor -%}
 """
+
+
+def _use_chat_encoding(chat: OpenAIServingChat, spec: Optional[str]) -> None:
+    """Serve ``spec`` on a handler built for another one."""
+    chat.chat_encoding_spec = spec
+    chat._encoding_adapter = chat._build_chat_encoding_adapter()
 
 
 class _MockTokenizerManager:
@@ -1740,7 +1751,7 @@ class ServingChatTestCase(CustomTestCase):
 
     def test_prompt_reuse_only_for_text_on_a_processor_free_model(self):
         self.tm.model_config.is_multimodal = True
-        self.chat.chat_encoding_spec = None
+        _use_chat_encoding(self.chat, None)
         self.template_manager.chat_template_name = None
         self.chat._tokenizer_auto_adds_specials = False
         self.chat._prompt_text_round_trip_is_lossy = False
@@ -1936,7 +1947,7 @@ class ServingChatTestCase(CustomTestCase):
         conv_mock.assert_not_called()
 
     def test_kimi_k3_usage_excludes_assistant_generation_stub(self):
-        self.chat.chat_encoding_spec = "kimi_k3"
+        _use_chat_encoding(self.chat, "kimi_k3")
         ret = [
             {
                 "text": "Answer",
@@ -2615,7 +2626,7 @@ class ServingChatTestCase(CustomTestCase):
     def test_kimi_k3_constraint_failure_keeps_native_stop_format(self):
         self.template_manager.chat_template_name = None
         self.template_manager.jinja_template_content_format = "string"
-        self.chat.chat_encoding_spec = "kimi_k3"
+        _use_chat_encoding(self.chat, "kimi_k3")
         self.chat.tool_call_parser = "kimi_k3"
         self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
         tool = {
@@ -2671,7 +2682,7 @@ class ServingChatTestCase(CustomTestCase):
     def test_kimi_k3_tool_call_stop_is_scoped_to_active_tools(self):
         self.template_manager.chat_template_name = None
         self.template_manager.jinja_template_content_format = "string"
-        self.chat.chat_encoding_spec = "kimi_k3"
+        _use_chat_encoding(self.chat, "kimi_k3")
         self.chat.tool_call_parser = "kimi_k3"
         self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
         request = ChatCompletionRequest(
@@ -2696,7 +2707,7 @@ class ServingChatTestCase(CustomTestCase):
     def test_kimi_k3_tool_choice_none_forbids_tools_section(self):
         self.template_manager.chat_template_name = None
         self.template_manager.jinja_template_content_format = "string"
-        self.chat.chat_encoding_spec = "kimi_k3"
+        _use_chat_encoding(self.chat, "kimi_k3")
         self.chat.tool_call_parser = "kimi_k3"
         self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
         request = ChatCompletionRequest(
@@ -2757,7 +2768,7 @@ class ServingChatTestCase(CustomTestCase):
 
     def test_kimi_k3_encoder_receives_wire_request_fields(self):
         self.template_manager.chat_template_name = None
-        self.chat.chat_encoding_spec = "kimi_k3"
+        _use_chat_encoding(self.chat, "kimi_k3")
         self.tm.model_config.is_multimodal = True
         self.tm.tokenizer.apply_chat_template.return_value = [7, 8, 9]
         tool = {
@@ -2853,7 +2864,7 @@ class ServingChatTestCase(CustomTestCase):
 
     def test_kimi_k3_neutralizes_text_only_assistant_history(self):
         self.template_manager.chat_template_name = None
-        self.chat.chat_encoding_spec = "kimi_k3"
+        _use_chat_encoding(self.chat, "kimi_k3")
         self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
         request = ChatCompletionRequest(
             model="x",
@@ -2896,7 +2907,7 @@ class ServingChatTestCase(CustomTestCase):
         """The K3 encoder keeps a nested argument value's original JSON text;
         parsing the arguments to a dict first would re-serialize it."""
         self.template_manager.chat_template_name = None
-        self.chat.chat_encoding_spec = "kimi_k3"
+        _use_chat_encoding(self.chat, "kimi_k3")
         self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
         arguments = '{"options": { "unit" : "c" , "days" : 3 }}'
         request = ChatCompletionRequest(
@@ -2929,7 +2940,7 @@ class ServingChatTestCase(CustomTestCase):
         """An explicit tool_choice=none is rendered even without tools; the
         default "none" of a request without tools is not."""
         self.template_manager.chat_template_name = None
-        self.chat.chat_encoding_spec = "kimi_k3"
+        _use_chat_encoding(self.chat, "kimi_k3")
         self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
         messages = [{"role": "user", "content": "Hi"}]
         for kwargs, expected in (({"tool_choice": "none"}, "none"), ({}, None)):
@@ -3028,7 +3039,7 @@ class ServingChatTestCase(CustomTestCase):
             "developer message": (declare("developer", [tool()], None), False),
         }
         for chat_encoding_spec in (None, "kimi_k3"):
-            self.chat.chat_encoding_spec = chat_encoding_spec
+            _use_chat_encoding(self.chat, chat_encoding_spec)
             for name, (messages, rejected_by_k3) in cases.items():
                 with self.subTest(chat_encoding_spec=chat_encoding_spec, case=name):
                     error = self.chat._validate_request(
@@ -3057,7 +3068,7 @@ class ServingChatTestCase(CustomTestCase):
             (None, "required", json_object, None, False),
         )
         for spec, tool_choice, response_format, regex, accepted in cases:
-            self.chat.chat_encoding_spec = spec
+            _use_chat_encoding(self.chat, spec)
             self.chat.tool_call_parser = "kimi_k3" if spec else "hermes"
             request = ChatCompletionRequest(
                 model="x",
@@ -4045,7 +4056,7 @@ class ServingChatTestCase(CustomTestCase):
                 self.assertTrue(self.chat.supports_native_reasoning_history())
 
         # The HF chat-template path keeps the wrap-into-content behaviour.
-        self.chat.chat_encoding_spec = None
+        _use_chat_encoding(self.chat, None)
         self.assertFalse(self.chat.supports_native_reasoning_history())
 
     def test_response_template_messages_thinking_replay(self):
@@ -5590,7 +5601,7 @@ class ServingChatTestCase(CustomTestCase):
             default_enabled=True,
             effort_kwarg="low_effort",
         )
-        self.chat.chat_encoding_spec = None
+        _use_chat_encoding(self.chat, None)
 
     def _run_jinja_with_effort(self, effort):
         req = ChatCompletionRequest(
@@ -5633,7 +5644,7 @@ class ServingChatTestCase(CustomTestCase):
         self.template_manager.reasoning_config = ReasoningToggleConfig(
             toggle_param="enable_thinking", default_enabled=True
         )
-        self.chat.chat_encoding_spec = None
+        _use_chat_encoding(self.chat, None)
         kwargs = self._run_jinja_with_effort("high")
         self.assertNotIn("low_effort", kwargs)
 
@@ -6270,6 +6281,13 @@ class TestStreamNullFieldsOutsideK3(CustomTestCase):
         self.assertIn("reasoning_content", delta)
         self.assertIsNone(delta["reasoning_content"])
 
+    def test_history_tool_call_without_id_keeps_its_keys(self):
+        # Request messages reach chat templates through model_dump().
+        call = ToolCall(function=FunctionResponse(name="f", arguments="{}"))
+        self.assertEqual(call.model_dump()["type"], "function")
+        streamed = call.model_dump(context=STREAM_DELTA_CONTEXT)
+        self.assertNotIn("type", streamed)
+
 
 class K3StreamSpecConformanceTestCase(unittest.TestCase):
     """Wire-level conformance for the Kimi K3 streaming chat contract.
@@ -6280,7 +6298,7 @@ class K3StreamSpecConformanceTestCase(unittest.TestCase):
     boundary, token-id/text fidelity) still need a live engine.
     """
 
-    _STUB = OpenAIServingChat._KIMI_K3_GENERATION_STUB_TOKENS
+    _STUB = GENERATION_STUB_TOKENS
 
     def setUp(self):
         reset_context()
@@ -6298,7 +6316,7 @@ class K3StreamSpecConformanceTestCase(unittest.TestCase):
         self.tm.server_args.incremental_streaming_output = True
         self.template_manager = _MockTemplateManager()
         self.chat = OpenAIServingChat(self.tm, self.template_manager)
-        self.chat.chat_encoding_spec = "kimi_k3"
+        _use_chat_encoding(self.chat, "kimi_k3")
         self.fastapi_request = Mock(spec=Request)
         self.fastapi_request.headers = {}
 
@@ -6321,17 +6339,21 @@ class K3StreamSpecConformanceTestCase(unittest.TestCase):
             "index": index,
         }
 
-    def _stream(self, events, req, usage_headers=None):
+    def _stream(self, events, req):
+        """Stream ``events`` in the shape the /v1/chat/completions route sends;
+        the response's wire stays on ``self.wire``."""
+
         async def _gen():
             for e in events:
                 yield e
 
         self.tm.generate_request = Mock(return_value=_gen())
+        self.wire = self.chat.openai_wire.new_response(req, created=1_700_000_000)
 
         async def _run():
             out = []
             async for chunk in self.chat._generate_chat_stream(
-                Mock(), req, self.fastapi_request, usage_headers=usage_headers
+                Mock(), req, self.fastapi_request, wire=self.wire
             ):
                 out.append(chunk)
             return out
@@ -6398,7 +6420,7 @@ class K3StreamSpecConformanceTestCase(unittest.TestCase):
     def test_other_encodings_keep_the_historical_usage_shape(self):
         """Other models keep their usage shape except upstream's OpenAI location
         of reasoning tokens (#46133), present only when there are some."""
-        self.chat.chat_encoding_spec = None
+        _use_chat_encoding(self.chat, None)
         req = self._req(stream_options={"include_usage": True})
         frames = self._frames(
             self._stream([self._event(finish={"type": "stop", "matched": None})], req)
@@ -6446,16 +6468,14 @@ class K3StreamSpecConformanceTestCase(unittest.TestCase):
         """The usage headers must equal the usage the client finally sees,
         with --enable-cache-report off."""
         self.tm.server_args.enable_cache_report = False
-        headers = {}
         req = self._req(stream_options={"include_usage": True})
         with envs.SGLANG_USAGE_HEADER_PREFIX.override("X-Test-Usage"):
             frames = self._frames(
                 self._stream(
-                    [self._event(finish={"type": "stop", "matched": None})],
-                    req,
-                    usage_headers=headers,
+                    [self._event(finish={"type": "stop", "matched": None})], req
                 )
             )
+            headers = self.wire.headers()
         usage = [f for f in frames if f["choices"] == []][0]["usage"]
         self.assertEqual(
             int(headers["X-Test-Usage-Prompt-Tokens"]), usage["prompt_tokens"]
@@ -6469,17 +6489,10 @@ class K3StreamSpecConformanceTestCase(unittest.TestCase):
 
     def test_usage_headers_are_off_without_a_prefix(self):
         """No SGLANG_USAGE_HEADER_PREFIX: no usage headers are sent."""
-        headers = {}
         req = self._req(stream_options={"include_usage": True})
         with envs.SGLANG_USAGE_HEADER_PREFIX.override(""):
-            self._frames(
-                self._stream(
-                    [self._event(finish={"type": "stop", "matched": None})],
-                    req,
-                    usage_headers=headers,
-                )
-            )
-        self.assertEqual(headers, {})
+            self._stream([self._event(finish={"type": "stop", "matched": None})], req)
+        self.assertEqual(self.wire.headers(), {})
 
     # ------------- constant response id -------------
     def test_wire_id_is_constant_across_frames_with_n_gt_1(self):
@@ -6542,23 +6555,21 @@ class K3StreamSpecConformanceTestCase(unittest.TestCase):
         """Distinct rids must not collapse onto one id. Filtering the rid
         down to its hex characters mapped "req-a" and "req-b" both onto
         chatcmpl-a000...; hashing keeps them apart."""
+        wire = KimiK3ChatWire(tokenizer=None, uncounted_prompt_tokens=0)
         seen = set()
         for rid in ("req-a", "req-b", "x", "y"):
-            req = self._req()
-            wire = self.chat._wire_id(req, rid)
-            self.assertRegex(wire, r"^chatcmpl-[0-9a-f]{24}$")
-            seen.add(wire)
+            response = wire.new_response(self._req(), created=1_700_000_000)
+            response_id = response.response_id(rid)
+            self.assertRegex(response_id, r"^chatcmpl-[0-9a-f]{24}$")
+            seen.add(response_id)
         self.assertEqual(len(seen), 4, f"ids collided: {sorted(seen)}")
 
     def test_wire_id_sorts_lexicographically_by_time(self):
         """The id's leading bytes encode creation time."""
-        early, late = self._req(), self._req()
-        early._stream_created_ts = 1_700_000_000
-        late._stream_created_ts = 1_700_000_001
-        self.assertLess(
-            self.chat._wire_id(early, "same-rid"),
-            self.chat._wire_id(late, "same-rid"),
-        )
+        wire = KimiK3ChatWire(tokenizer=None, uncounted_prompt_tokens=0)
+        early = wire.new_response(self._req(), created=1_700_000_000)
+        late = wire.new_response(self._req(), created=1_700_000_001)
+        self.assertLess(early.response_id("same-rid"), late.response_id("same-rid"))
 
     # ------------- abort finish reasons -------------
     def test_abort_becomes_server_interrupted_not_an_error_frame(self):
@@ -6628,7 +6639,7 @@ class K3StreamSpecConformanceTestCase(unittest.TestCase):
 
     def test_other_encodings_still_emit_the_abort_error_frame(self):
         """The mid-stream abort change is K3-gated; stock sglang behavior is untouched."""
-        self.chat.chat_encoding_spec = None
+        _use_chat_encoding(self.chat, None)
         req = self._req()
         chunks = self._stream(
             [
@@ -6657,7 +6668,7 @@ class K3StreamSpecConformanceTestCase(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
 
     def test_error_envelope_is_k3_gated(self):
-        self.chat.chat_encoding_spec = None
+        _use_chat_encoding(self.chat, None)
         payload = json.loads(bytes(self.chat.create_error_response("bad").body))
         self.assertNotIn("error", payload)
         self.assertEqual(payload["message"], "bad")
@@ -6689,7 +6700,7 @@ class K3StreamSpecConformanceTestCase(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertIn("message", json.loads(bytes(response.body))["error"])
 
-        self.chat.chat_encoding_spec = None
+        _use_chat_encoding(self.chat, None)
         payload = json.loads(bytes(handle("/v1/chat/completions").body))
         self.assertNotIn("error", payload)
 
@@ -6699,12 +6710,14 @@ class K3StreamSpecConformanceTestCase(unittest.TestCase):
             raise RuntimeError("engine died")
 
         self.tm.generate_request = Mock(return_value=_gen())
+        req = self._req()
+        wire = self.chat.openai_wire.new_response(req, created=0)
 
         async def _run():
             return [
                 chunk
                 async for chunk in self.chat._generate_chat_stream(
-                    Mock(), self._req(), self.fastapi_request
+                    Mock(), req, self.fastapi_request, wire=wire
                 )
             ]
 
@@ -6716,66 +6729,46 @@ class K3StreamSpecConformanceTestCase(unittest.TestCase):
         self.assertEqual(chunks[-1], "data: [DONE]\n\n")
 
     # ------------- internal content token ids -------------
-    def test_every_increment_frame_carries_internal_content(self):
-        """With include_internal_content the token ids must ride on every
-        content / reasoning_content / tool_calls increment frame -- the
-        tool-call path emitted none at all."""
+    def test_tool_call_token_ids_ride_on_the_opening_frame_only(self):
+        """A call whose first parser delta carries arguments opens with
+        arguments="" and sends them in a continuation; the tokens behind that
+        delta go out once, on the opening frame."""
         req = self._req(
             stream_options={"include_internal_content": True},
             tools=[{"type": "function", "function": {"name": "get_weather"}}],
         )
-
-        call = ToolCallItem(tool_index=0, name="get_weather", parameters='{"c":"SF"}')
+        pieces = {101: b"answer: ", 102: b"<call>"}
+        self.tm.tokenizer.model.decode_single_token_bytes.side_effect = pieces.get
+        call = ToolCallItem(
+            tool_index=0,
+            name="get_weather",
+            parameters='{"c":"SF"}',
+            source_text="<call>",
+        )
         with patch(
             "sglang.srt.entrypoints.openai.serving_chat.FunctionCallParser"
         ) as ParserMock:
             parser = ParserMock.return_value
             parser.parse_stream_chunk.return_value = ("answer: ", [call])
-            parser.parse_stream_end.return_value = ("", [])
             parser.detector = Mock(prev_tool_call_arr=None, streamed_args_for_tool=None)
+            frames = self._frames(self._stream([self._event(text="answer: ")], req))
 
-            async def _run():
-                out = []
-                async for chunk in self.chat._generate_stream_content(
-                    content=self._event(text="answer: "),
-                    index=0,
-                    request=req,
-                    stream_offsets={},
-                    reasoning_parser_dict={},
-                    parser_dict={},
-                    has_tool_calls={},
-                    choice_logprobs=None,
-                    finish_reason_type=None,
-                    continuous_usage_stats=False,
-                    created=123,
-                    prompt_tokens={0: 10},
-                    reasoning_tokens={0: 0},
-                    completion_tokens={0: 2},
-                    internal_token_ids=[101, 102],
-                ):
-                    out.append(chunk)
-                return out
-
-            chunks = get_or_create_event_loop().run_until_complete(_run())
-
-        frames = self._frames(chunks)
-        self.assertTrue(frames, "expected increment frames")
-        increments = 0
-        for f in frames:
-            delta = f["choices"][0]["delta"]
-            if not any(
-                delta.get(k) for k in ("content", "reasoning_content", "tool_calls")
-            ):
-                continue
-            increments += 1
-            self.assertNotIn("internal_content", delta)
-            internal = f["choices"][0]["internal_content"]
-            self.assertIsInstance(internal, list)
-            ids = internal[0]["token_ids"]
-            self.assertTrue(ids, f"token_ids must be non-empty: {delta}")
-            self.assertTrue(all(type(i) is int and i >= 0 for i in ids), ids)
-        # normal text + the tool-call open chunk + its argument continuation
-        self.assertGreaterEqual(increments, 3)
+        increments = [
+            f["choices"][0]
+            for f in frames
+            if f["choices"]
+            and (
+                f["choices"][0]["delta"].get("content")
+                or f["choices"][0]["delta"].get("tool_calls")
+            )
+        ]
+        self.assertEqual(
+            [choice.get("internal_content") for choice in increments],
+            [[{"token_ids": [101]}], [{"token_ids": [102]}], None],
+        )
+        opening, arguments = (c["delta"]["tool_calls"][0] for c in increments[1:])
+        self.assertEqual(opening["function"]["arguments"], "")
+        self.assertEqual(arguments["function"], {"arguments": '{"c":"SF"}'})
 
     def test_tool_wire_usage_and_internal_content_with_buffered_markers(self):
         self.chat.tool_call_parser = "kimi_k3"
@@ -6819,7 +6812,6 @@ class K3StreamSpecConformanceTestCase(unittest.TestCase):
             delta = choice["delta"]
             self.assertNotIn("internal_content", delta)
             if delta.get("tool_calls"):
-                self.assertTrue(choice["internal_content"][0]["token_ids"])
                 call = delta["tool_calls"][0]
                 if "id" in call:
                     self.assertRegex(call["id"], r"^call_[0-9a-f]{24}$")
@@ -6829,17 +6821,18 @@ class K3StreamSpecConformanceTestCase(unittest.TestCase):
                     self.assertEqual(set(call), {"index", "function"})
                     self.assertEqual(set(call["function"]), {"arguments"})
                     fragment = call["function"]["arguments"]
+                    # "{" comes with the opening, which already carried [101].
                     expected_ids = {
-                        "{": [101],
+                        "{": None,
                         '"code": "': [102],
                         "first": [103],
                         "second": [104],
                         '"': [105],
                         "}": [106],
                     }
+                    internal = choice.get("internal_content")
                     self.assertEqual(
-                        choice["internal_content"][0]["token_ids"],
-                        expected_ids[fragment],
+                        internal and internal[0]["token_ids"], expected_ids[fragment]
                     )
                     fragments.append(fragment)
         self.assertEqual(json.loads("".join(fragments)), {"code": "firstsecond"})
@@ -6968,6 +6961,168 @@ class K3StreamSpecConformanceTestCase(unittest.TestCase):
         )
         self.assertFalse([f for f in frames if f["choices"] == []])
 
+    # ------------- only /v1/chat/completions takes the K3 wire -------------
+    def _engine(self, events):
+        async def _gen():
+            for e in events:
+                if isinstance(e, BaseException):
+                    raise e
+                yield e
+
+        self.tm.generate_request = Mock(side_effect=lambda *a, **k: _gen())
+        self.tm.create_abort_task = Mock(return_value=None)
+
+    def test_anthropic_stream_errors_keep_their_stock_shape(self):
+        from sglang.srt.entrypoints.anthropic.protocol import AnthropicMessagesRequest
+        from sglang.srt.entrypoints.anthropic.serving import AnthropicServing
+
+        cases = {
+            "overloaded_error": [
+                self._event(text="partial"),
+                self._event(
+                    text="",
+                    finish={
+                        "type": "abort",
+                        "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+                        "message": "oom",
+                    },
+                ),
+            ],
+            "invalid_request_error": [
+                self._event(
+                    text="",
+                    finish={
+                        "type": "abort",
+                        "status_code": HTTPStatus.BAD_REQUEST,
+                        "message": "too long",
+                    },
+                )
+            ],
+        }
+        anthropic_request = AnthropicMessagesRequest(
+            model="kimi-k3", max_tokens=16, messages=[{"role": "user", "content": "hi"}]
+        )
+        for error_type, events in cases.items():
+            with self.subTest(error_type=error_type):
+                self._engine(events)
+
+                async def _run():
+                    return [
+                        frame
+                        async for frame in AnthropicServing(
+                            self.chat
+                        )._generate_anthropic_stream(
+                            Mock(), self._req(), anthropic_request, self.fastapi_request
+                        )
+                    ]
+
+                frames = get_or_create_event_loop().run_until_complete(_run())
+                self.assertIn(f'"type":"{error_type}"', "".join(frames))
+
+    def test_anthropic_response_ignores_the_usage_headers(self):
+        from sglang.srt.entrypoints.anthropic.protocol import AnthropicMessagesRequest
+        from sglang.srt.entrypoints.anthropic.serving import AnthropicServing
+
+        req = self._req(stream=False)
+        self.chat._convert_to_internal_request = Mock(return_value=(Mock(), req))
+        anthropic_request = AnthropicMessagesRequest(
+            model="kimi-k3", max_tokens=16, messages=[{"role": "user", "content": "hi"}]
+        )
+        done = self._event(finish={"type": "stop", "matched": None}, weight_version="v")
+        with envs.SGLANG_USAGE_HEADER_PREFIX.override("X-Test-Usage"):
+            self._engine([done])
+            openai = get_or_create_event_loop().run_until_complete(
+                self.chat._handle_non_streaming_request(Mock(), req, None)
+            )
+            self._engine([done])
+            anthropic = get_or_create_event_loop().run_until_complete(
+                AnthropicServing(self.chat)._handle_non_streaming(
+                    req, anthropic_request, None
+                )
+            )
+        self.assertEqual(openai.headers["X-Test-Usage-Prompt-Tokens"], "7")
+        self.assertEqual(anthropic.status_code, 200)
+        self.assertEqual(json.loads(bytes(anthropic.body))["type"], "message")
+
+    # ------------- review fixes -------------
+    def test_non_streaming_abort_is_server_interrupted(self):
+        self._engine(
+            [self._event(text="part", finish={"type": "abort"}, weight_version="v")]
+        )
+        response = get_or_create_event_loop().run_until_complete(
+            self.chat._handle_non_streaming_request(
+                Mock(), self._req(stream=False), None
+            )
+        )
+        self.assertEqual(response.choices[0].finish_reason, "server_interrupted")
+
+    def test_mid_stream_failure_ends_every_open_choice(self):
+        abort = self._event(
+            index=0,
+            text="",
+            finish={
+                "type": "abort",
+                "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+                "message": "oom",
+            },
+        )
+        for name, failure in (("abort", abort), ("exception", RuntimeError("died"))):
+            with self.subTest(failure=name):
+                req = self._req(n=2)
+                self._engine(
+                    [
+                        self._event(index=0, rid="r0", text="one"),
+                        self._event(index=1, rid="r1", text="two"),
+                        failure,
+                    ]
+                )
+                wire = self.chat.openai_wire.new_response(req, created=0)
+
+                async def _run():
+                    return [
+                        c
+                        async for c in self.chat._generate_chat_stream(
+                            Mock(), req, self.fastapi_request, wire=wire
+                        )
+                    ]
+
+                frames = self._frames(
+                    get_or_create_event_loop().run_until_complete(_run())
+                )
+                ends = {
+                    f["choices"][0]["index"]: f["choices"][0]["finish_reason"]
+                    for f in frames
+                    if f["choices"] and f["choices"][0]["finish_reason"]
+                }
+                self.assertEqual(
+                    ends, {0: "server_interrupted", 1: "server_interrupted"}
+                )
+
+    def test_internal_content_is_ignored_outside_k3(self):
+        _use_chat_encoding(self.chat, None)
+        req = self._req(stream_options={"include_internal_content": True})
+        chunks = self._stream(
+            [self._event(text="hi", finish={"type": "stop", "matched": None})], req
+        )
+        self.assertFalse([c for c in chunks if "internal_content" in c])
+
+    def test_internal_content_without_a_byte_decoder_is_a_client_error(self):
+        self.tm.tokenizer.model = None
+        self.tm.tokenizer.tokenizer = None
+        self._engine([self._event(finish={"type": "stop", "matched": None})])
+        response = get_or_create_event_loop().run_until_complete(
+            self.chat._handle_streaming_request(
+                Mock(),
+                self._req(stream_options={"include_internal_content": True}),
+                self.fastapi_request,
+            )
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn(
+            "byte decoder", json.loads(bytes(response.body))["error"]["message"]
+        )
+        self.tm.generate_request.assert_not_called()
+
 
 class KimiK3ThinkingTestCase(unittest.TestCase):
     MESSAGES = [{"role": "user", "content": "hi"}]
@@ -6993,7 +7148,7 @@ class KimiK3ThinkingTestCase(unittest.TestCase):
         template_manager.chat_template_name = None
         template_manager.jinja_template_content_format = "string"
         self.chat = OpenAIServingChat(self.tm, template_manager)
-        self.chat.chat_encoding_spec = "kimi_k3"
+        _use_chat_encoding(self.chat, "kimi_k3")
         self.chat.tool_call_parser = "kimi_k3"
 
     def _template_kwargs(self, **kwargs):

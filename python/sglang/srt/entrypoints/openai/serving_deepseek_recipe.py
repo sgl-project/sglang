@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Optional, Union
 
 from sglang.srt.entrypoints.openai.chat_encoding_adapters import (
     ADAPTER_OUTPUT_PARSERS,
+    OPENAI_CHAT_WIRE,
     select_new_output_ids,
     token_output_sse_chunks,
 )
@@ -52,6 +53,9 @@ class DeepSeekRecipeChatEncodingAdapter:
     # recipe sorts tool results by call order, so images come from its render.
     collects_openai_media = False
     strict_tool_call_arguments = False  # recipe serializes object arguments itself.
+    renders_response_format = False
+    uncounted_prompt_tokens = 0
+    wire = OPENAI_CHAT_WIRE
 
     def __init__(
         self,
@@ -96,6 +100,9 @@ class DeepSeekRecipeChatEncodingAdapter:
     @property
     def output(self) -> Optional[DeepSeekRecipeChatEncodingAdapter]:
         return self if self._token_output else None
+
+    def validate_request(self, request: ChatCompletionRequest) -> Optional[str]:
+        return None
 
     def encode_messages(
         self,
