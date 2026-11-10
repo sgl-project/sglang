@@ -82,6 +82,41 @@ def _build_verify_inputs(
 
 @unittest.skipIf(not torch.cuda.is_available(), "GPU required")
 class TestVerifySplitKV(CustomTestCase):
+    def test_inactive_splits_ignore_poisoned_scratch(self):
+        from sglang.kernels.ops.attention.verify_splitkv import VerifySplitKV
+
+        q = torch.zeros(3, 16, 256, device="cuda", dtype=torch.bfloat16)
+        k = torch.zeros(3, 8, 256, device="cuda", dtype=q.dtype)
+        v = torch.tensor([4, 6, 8], device="cuda", dtype=q.dtype)
+        v = v[:, None, None].expand_as(k).contiguous()
+        kb = torch.zeros(1, 8, 256, device="cuda", dtype=q.dtype)
+        vb = torch.full_like(kb, 2)
+        qo = torch.tensor([0, 3], device="cuda", dtype=torch.int32)
+        kp = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
+        ids = torch.zeros(1, device="cuda", dtype=torch.int64)
+        kernel = VerifySplitKV(1, 16, 8, 256, 256, 3, n_splits=16)
+        out = torch.empty_like(q)
+
+        def run():
+            kernel(q, k, v, kb, vb, qo, kp, ids, 256**-0.5, o_out=out)
+
+        run()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run()
+        for prefix, expected in ((1, [3, 4, 5]), (0, [4, 5, 6])):
+            with self.subTest(prefix=prefix):
+                kp[1] = prefix
+                ref = torch.tensor(expected, device="cuda", dtype=q.dtype)
+                ref = ref[:, None, None].expand_as(q)
+                for replay in (False, True):
+                    # Stage1 writes -inf LSE for unused splits but leaves their
+                    # output scratch untouched. Zero times NaN is still NaN.
+                    kernel.att_out.fill_(float("nan"))
+                    kernel.att_lse.fill_(float("nan"))
+                    graph.replay() if replay else run()
+                    torch.testing.assert_close(out, ref, atol=0, rtol=0)
+
     def _run_parity(
         self,
         prefix_lens,
