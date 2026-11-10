@@ -366,6 +366,8 @@ def validate_deepseek_v4_swa_recompute(server_args: ServerArgs) -> None:
         ("LoRA", cfg.enable_lora),
         ("radix sessions", cfg.enable_session_radix_cache),
         ("external cache linker", cfg.enable_unified_cache_external_linker),
+        ("HiCache", cfg.enable_hierarchical_cache),
+        ("HiCache storage backends", cfg.hicache_storage_backend is not None),
     )
     for feature, enabled in incompatible:
         if enabled:

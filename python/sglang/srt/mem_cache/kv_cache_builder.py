@@ -354,6 +354,18 @@ def validate_decode_radix_cache(
         )
 
 
+def _swa_recompute_len(
+    *, is_hybrid_swa: bool, sliding_window: int, num_layers: int, page_size: int
+):
+    if not get_exec().features.enable_swa_recompute:
+        return None
+    if not is_hybrid_swa:
+        raise ValueError("--enable-swa-recompute needs a hybrid SWA KV pool")
+    return swa_recompute_len(
+        sliding_window=sliding_window, num_layers=num_layers, page_size=page_size
+    )
+
+
 def build_kv_cache(
     *,
     server_args: ServerArgs,
@@ -470,14 +482,11 @@ def build_kv_cache(
         attn_cp_size=parallel.attn_cp_size,
         chunked_prefill_size=effective_chunked_prefill_size,
         sliding_window_size=sliding_window_size,
-        swa_recompute_len=(
-            swa_recompute_len(
-                sliding_window=sliding_window_size,
-                num_layers=model_config.hf_config.num_hidden_layers,
-                page_size=page_size,
-            )
-            if get_exec().features.enable_swa_recompute and is_hybrid_swa
-            else None
+        swa_recompute_len=_swa_recompute_len(
+            is_hybrid_swa=is_hybrid_swa,
+            sliding_window=sliding_window_size,
+            num_layers=model_config.hf_config.num_hidden_layers,
+            page_size=page_size,
         ),
         swa_gates_prefix_match=swa_gates_prefix_match,
         mtp_draft_device_pools=mtp_draft_device_pools,

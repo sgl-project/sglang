@@ -1258,4 +1258,4 @@ sglang serve \
   --port 30000
 ```
 
-The flag works with TP and with DSpark. It does not yet work with DP attention, PD disaggregation, the TRT-LLM attention backend, UMBP or DeepSeek-V4.1, and the server refuses to start when it is combined with one of them.
+The flag works with TP and with DSpark. It does not yet work with DP attention, PD disaggregation, HiCache or HiCache storage backends, the TRT-LLM attention backend, UMBP or DeepSeek-V4.1, and the server refuses to start when it is combined with one of them. A replay runs in the same step as the request's extend and takes its share of the chunked prefill budget; when `--chunked-prefill-size` is smaller than the replay plus one page, the prefix is prefilled again instead.

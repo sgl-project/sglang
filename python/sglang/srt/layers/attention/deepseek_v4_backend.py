@@ -1094,7 +1094,9 @@ def swa_recompute_floor(forward_batch: ForwardBatch) -> torch.Tensor:
     """Per-token replay start: window rows below it were never rebuilt."""
     extend_lens = forward_batch.extend_seq_lens.to(torch.int64)
     prefix_lens = forward_batch.seq_lens.to(torch.int64) - extend_lens
-    return torch.repeat_interleave(prefix_lens, extend_lens).to(torch.int32)
+    return torch.repeat_interleave(
+        prefix_lens, extend_lens, output_size=forward_batch.extend_num_tokens
+    ).to(torch.int32)
 
 
 # Arbitrary floor: below it the dense scores are short enough that the

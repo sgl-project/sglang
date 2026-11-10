@@ -2032,6 +2032,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Per request: first prefix position whose SWA rows the worker rebuilds
     # before this extend, or None.
     swa_recompute_starts: Optional[List[Optional[int]]] = None
+    # The replay forward's batch, built once for both the target and the draft.
+    swa_recompute_replay: Optional[ScheduleBatch] = None
 
     req_pool_indices: torch.Tensor = None  # shape: [b], int64
     seq_lens: torch.Tensor = None  # shape: [b], int64
@@ -3254,6 +3256,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.replace_positions = None
         # The replay belongs to the prefill this batch just ran.
         self.swa_recompute_starts = None
+        self.swa_recompute_replay = None
 
         self.mamba_cow_src_indices = None
         self.mamba_cow_dst_indices = None

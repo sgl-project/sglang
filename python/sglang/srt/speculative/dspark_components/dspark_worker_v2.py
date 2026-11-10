@@ -17,7 +17,7 @@ from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
-from sglang.srt.model_executor.swa_recompute import swa_recompute_batches
+from sglang.srt.model_executor.swa_recompute import swa_recompute_batch
 from sglang.srt.model_loader.weight_utils import get_pp_stage_load_group
 from sglang.srt.runtime_context import (
     get_disagg,
@@ -352,6 +352,18 @@ class DSparkWorkerV2(BaseSpecWorker):
             verify_num_draft_tokens=self.verify_num_draft_tokens,
             block_pos_offsets=self._block_pos_offsets,
         )
+        draft_window = self.draft_model_runner.sliding_window_size
+        target_window = self.target_worker.model_runner.sliding_window_size
+        if (
+            get_exec().features.enable_swa_recompute
+            and draft_window is not None
+            and (target_window is None or draft_window > target_window)
+        ):
+            # A replay leaves only the target's last window exact.
+            raise ValueError(
+                f"--enable-swa-recompute needs the DSpark draft window ({draft_window}) "
+                f"to be no larger than the target window ({target_window})"
+            )
         self._simulate_acc_len = float(envs.SGLANG_SIMULATE_ACC_LEN.get())
         # The step's simulated correct length, read by the eager and graph accepts.
         self._simulated_correct_len = (
@@ -830,10 +842,10 @@ class DSparkWorkerV2(BaseSpecWorker):
         # Placing the draft KV reads scheduler-shared tables, which prefill
         # read-done releases once the target forward's own reads end.
         placement = self._kv_injector.place_prefill(batch)
-        replay_placements = [
-            self._kv_injector.place_prefill(replay)
-            for replay in swa_recompute_batches(batch, self.target_worker.model_runner)
-        ]
+        replay = swa_recompute_batch(batch, self.target_worker.model_runner)
+        replay_placements = (
+            [] if replay is None else [self._kv_injector.place_prefill(replay)]
+        )
         batch_output = self.target_worker.forward_batch_generation(
             batch,
             pp_proxy_tensors=pp_proxy_tensors,

@@ -284,12 +284,15 @@ class UnifiedRadixCache(BasePrefixCache):
         self.enable_mamba_extra_buffer = (
             params.enable_mamba_extra_buffer if self.is_mamba_enabled else False
         )
-        self.swa_recompute_len = (
-            params.swa_recompute_len
-            if self.is_swa_enabled
+        self.swa_recompute_len = params.swa_recompute_len
+        if self.swa_recompute_len is not None and not (
+            self.is_swa_enabled
             and supports_swa_recompute(params.token_to_kv_pool_allocator)
-            else None
-        )
+        ):
+            raise ValueError(
+                "--enable-swa-recompute needs a sliding-window tree on a separate "
+                "SWA pool without a per-request ring"
+            )
         self.decoder_swa_bounded_replay = params.decoder_swa_bounded_replay
         # The TreeCore owns the tree member-var state (structure, LRUs, sizes,
         # evictable leaves) and drives the components' tree-level hooks.
