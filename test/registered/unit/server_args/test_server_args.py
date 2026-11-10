@@ -3446,7 +3446,16 @@ class TestPipelineParallelCompat(CustomTestCase):
     def test_no_speculative_decoding_is_fine(self):
         check_pipeline_parallel_compat(self._cfg())
 
-    def test_dspark_pd_requires_replicated_draft_on_both_roles(self):
+    def test_dspark_pd_prefill_preserves_non_replicated_path(self):
+        check_pipeline_parallel_compat(
+            self._cfg(
+                speculative_algorithm="DSPARK",
+                speculative_dspark_pp_replicated_draft=False,
+                disaggregation_mode="prefill",
+            )
+        )
+
+    def test_dspark_replicated_draft_supports_both_pd_roles(self):
         for mode in ("prefill", "decode"):
             with self.subTest(mode=mode):
                 check_pipeline_parallel_compat(
@@ -3457,19 +3466,25 @@ class TestPipelineParallelCompat(CustomTestCase):
                     )
                 )
 
-    def test_dspark_rejects_missing_replicated_draft_or_non_pd_mode(self):
-        for mode, replicated in (
-            ("prefill", False),
-            ("decode", False),
-            ("null", True),
-        ):
-            with self.subTest(mode=mode):
-                with self.assertRaisesRegex(AssertionError, "DSPARK.*replicated-draft"):
+    def test_dspark_decode_requires_replicated_draft(self):
+        with self.assertRaisesRegex(AssertionError, "decode.*replicated-draft"):
+            check_pipeline_parallel_compat(
+                self._cfg(
+                    speculative_algorithm="DSPARK",
+                    speculative_dspark_pp_replicated_draft=False,
+                    disaggregation_mode="decode",
+                )
+            )
+
+    def test_dspark_rejects_non_pd_mode(self):
+        for replicated in (False, True):
+            with self.subTest(replicated=replicated):
+                with self.assertRaisesRegex(AssertionError, "DSPARK.*PD"):
                     check_pipeline_parallel_compat(
                         self._cfg(
                             speculative_algorithm="DSPARK",
                             speculative_dspark_pp_replicated_draft=replicated,
-                            disaggregation_mode=mode,
+                            disaggregation_mode="null",
                         )
                     )
 
