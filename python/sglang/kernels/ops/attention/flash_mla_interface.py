@@ -38,6 +38,17 @@ _MEGA_FIXED_PARAMS = dict(
 SPLIT_KV_MIN_TOPK = 641
 
 
+def supports_native_heads() -> bool:
+    """Whether the installed wheel's legacy sparse decode takes any head count
+    in [1, 128] on SM100, plus token packing (``heads_per_group``)."""
+    return hasattr(flash_mla, "sparse_decode_num_sm_parts")
+
+
+def sparse_decode_num_sm_parts(b: int, s_q: int, h_q: int) -> int:
+    """Rows of the split-KV schedule the legacy sparse decode kernel expects."""
+    return flash_mla.sparse_decode_num_sm_parts(b, s_q, h_q)
+
+
 def get_mla_metadata(
     cache_seqlens: Optional[torch.Tensor] = None,
     num_q_tokens_per_head_k: Optional[int] = None,
@@ -85,11 +96,15 @@ def flash_mla_with_kvcache(
     kv_format: Optional[str] = None,
     *,
     use_legacy: bool = True,
+    heads_per_group: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Paged MLA decode. ``tile_scheduler_metadata`` is a ``FlashMLASchedMeta``,
     or the schedule tensors from ``get_mla_metadata(cache_seqlens, ...)`` with
     ``num_splits``, which ride on a fresh ``FlashMLASchedMeta`` (legacy only:
-    V3.2 sparse, dense bf16, or dense fp8 when ``q`` is fp8)."""
+    V3.2 sparse, dense bf16, or dense fp8 when ``q`` is fp8). ``heads_per_group``
+    > 0 decodes token-packed ``q`` / ``indices`` (see ``dsa.flashmla_token_pack``)."""
+    # Only wheels with native heads accept the keyword.
+    extra = {"heads_per_group": heads_per_group} if heads_per_group else {}
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
     if isinstance(tile_scheduler_metadata, FlashMLASchedMeta):
@@ -138,6 +153,7 @@ def flash_mla_with_kvcache(
         kv_format=kv_format,
         descale_q=descale_q,
         descale_k=descale_k,
+        **extra,
     )
 
 

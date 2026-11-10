@@ -120,8 +120,8 @@ from sglang.srt.utils.async_probe import (
     maybe_detect_nan,
     maybe_detect_oob,
 )
-from sglang.srt.utils.common import (
-    fast_topk,
+from sglang.srt.utils.common import fast_topk
+from sglang.srt.utils.device import (
     get_available_gpu_memory,
     is_cpu,
     is_cuda,
@@ -129,8 +129,8 @@ from sglang.srt.utils.common import (
     is_musa,
     is_npu,
     is_xpu,
-    log_info_on_rank0,
 )
+from sglang.srt.utils.log_utils import log_info_on_rank0
 
 _is_cpu = is_cpu()
 _is_npu = is_npu()
@@ -837,13 +837,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     break
 
                 forward_batch.input_ids = input_ids
-                # Qwen3-MoE MTP uses a fused RoPE + KV-store path whose cache_loc
-                # argument must be contiguous.
-                if (
-                    self.draft_runner.model_config.hf_config.architectures[0]
-                    == "Qwen3MoeForCausalLMMTP"
-                ):
-                    out_cache_loc = out_cache_loc.contiguous()
                 forward_batch.out_cache_loc = out_cache_loc[i]
                 spec_info.hidden_states = hidden_states
 
@@ -1453,30 +1446,25 @@ class EAGLEWorkerV2(BaseSpecWorker):
         super().init_cuda_graphs()
         # Build adaptive runtime states after target and draft backends exist.
         if self.adaptive_controller is not None:
-            with (
-                draft_tp_context(self._draft_worker.parallel_layout),
-                speculative_moe_backend_context(),
-                speculative_moe_a2a_backend_context(),
-            ):
-                self.adaptive_controller.register(
-                    SpecRuntimeState(
-                        speculative_num_steps=self.speculative_num_steps,
-                        speculative_num_draft_tokens=self.speculative_num_draft_tokens,
-                        draft_attn_backend=self._draft_worker.draft_attn_backend,
-                        cuda_graph_runner=self._draft_worker.cuda_graph_runner,
-                        target_attn_backend=self._target_worker.model_runner.attn_backend,
-                        target_graph_runner=self._target_worker.model_runner.decode_cuda_graph_runner,
-                        draft_extend_attn_backend=self._draft_worker.draft_extend_attn_backend,
-                        cuda_graph_runner_for_draft_extend=self._draft_worker.cuda_graph_runner_for_draft_extend,
-                    )
+            self.adaptive_controller.register(
+                SpecRuntimeState(
+                    speculative_num_steps=self.speculative_num_steps,
+                    speculative_num_draft_tokens=self.speculative_num_draft_tokens,
+                    draft_attn_backend=self._draft_worker.draft_attn_backend,
+                    cuda_graph_runner=self._draft_worker.cuda_graph_runner,
+                    target_attn_backend=self._target_worker.model_runner.attn_backend,
+                    target_graph_runner=self._target_worker.model_runner.decode_cuda_graph_runner,
+                    draft_extend_attn_backend=self._draft_worker.draft_extend_attn_backend,
+                    cuda_graph_runner_for_draft_extend=self._draft_worker.cuda_graph_runner_for_draft_extend,
                 )
-                self.adaptive_controller.init_states(
-                    cuda_graph_bs=(
-                        None
-                        if check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED)
-                        else get_exec().graph.cuda_graph_bs_decode
-                    ),
-                )
+            )
+            self.adaptive_controller.init_states(
+                cuda_graph_bs=(
+                    None
+                    if check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED)
+                    else get_exec().graph.cuda_graph_bs_decode
+                ),
+            )
 
     def forward_batch_generation(
         self,
@@ -1860,8 +1848,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
             speculative_num_draft_tokens,
             cuda_graph_bs=cuda_graph_bs,
         ):
-            self._draft_worker.init_attention_backend()
-            self._draft_worker._capture_cuda_graphs()
+            # Draft overrides must end before target resources are constructed.
+            with (
+                draft_tp_context(self._draft_worker.parallel_layout),
+                speculative_moe_backend_context(),
+                speculative_moe_a2a_backend_context(),
+            ):
+                self._draft_worker.init_attention_backend()
+                self._draft_worker._capture_cuda_graphs()
 
             # Build target attention backend and CUDA graph runner
             target_model_runner = self._target_worker.model_runner
