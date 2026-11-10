@@ -37,7 +37,7 @@ from .processor import (
     get_normalize_transform,
 )
 from .vae_cnn import EncoderFCN3D
-from .vae_vit import ViT3DDecoder
+from .vae_vit import ViT2DDecoder, ViT3DDecoder
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -80,7 +80,14 @@ class DiagonalGaussianDistribution(object):
 
     @torch.compiler.disable
     def sample(self, generator=None):
-        noise = torch.randn(self.mean.shape, generator=generator)
+        # No generator: the process-global CPU RNG (video keyframe encoding
+        # samples under a scoped, seeded fork of it). With one, draw on the
+        # generator's device.
+        noise = torch.randn(
+            self.mean.shape,
+            generator=generator,
+            device=None if generator is None else generator.device,
+        )
         noise = noise.to(device=self.parameters.device)
         return noise.mul_(self.std).add_(self.mean)
 
@@ -936,6 +943,7 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         transform_input: bool = False,
         use_fp16_latent: bool = False,
         verbose: bool = False,
+        generator: Union[torch.Generator, None] = None,
     ) -> List[torch.Tensor]:
         """encode images into latents
 
@@ -951,6 +959,8 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
                 Whether to use fp16 latent. Defaults to False.
             verbose (bool, optional):
                 Whether to print debug information. Defaults to False.
+            generator (torch.Generator, optional):
+                RNG for the posterior sample. Defaults to the global CPU RNG.
 
         Returns:
             List[torch.Tensor]:
@@ -994,7 +1004,7 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
             stacked = torch.cat(prepared, dim=0)
             if verbose:
                 logger.info(f"batch encode input shape {tuple(stacked.shape)}")
-            all_latents = self.encode_base(stacked, True)
+            all_latents = self.encode_base(stacked, True, generator=generator)
             image_latents = [
                 all_latents[i].contiguous() for i in range(all_latents.shape[0])
             ]
@@ -1003,7 +1013,7 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
             for image_tensor in prepared:
                 if verbose:
                     logger.info(f"input shape {tuple(image_tensor.shape)}")
-                image_latent = self.encode_base(image_tensor, True)
+                image_latent = self.encode_base(image_tensor, True, generator=generator)
                 image_latents.append(image_latent.squeeze(0).contiguous())
 
         if use_fp16_latent:
@@ -1228,6 +1238,8 @@ class AutoencoderKLLegacy(AutoencoderKL):
         causal_decoder=True,
         use_vit_decoder=False,
         vit_decoder_kwargs=None,
+        # 2D image ViT decoder (Conv2d post_quant_conv) over one latent frame
+        vit_decoder_2d=False,
         # stats
         shift_factor=0.0,
         scaling_factor=1.0,
@@ -1282,9 +1294,11 @@ class AutoencoderKLLegacy(AutoencoderKL):
 
         # init pointwise quant/post_quant conv
         self.quant_conv = nn.Conv3d(z_channels * 2, 2 * embed_dim, 1)
-        self.post_quant_conv = nn.Conv3d(embed_dim, z_channels, 1)
+        post_quant_conv_cls = nn.Conv2d if vit_decoder_2d else nn.Conv3d
+        self.post_quant_conv = post_quant_conv_cls(embed_dim, z_channels, 1)
 
         self.use_vit_decoder = use_vit_decoder
+        self.vit_decoder_2d = vit_decoder_2d
 
         # init decoder
         vit_kwargs = {
@@ -1293,9 +1307,12 @@ class AutoencoderKLLegacy(AutoencoderKL):
             "out_channels": out_ch,
             **(vit_decoder_kwargs or {}),
         }
-        vit_kwargs.setdefault("patch_size_t", self.vae_ratio_t)
-        vit_kwargs.setdefault("t_causal", causal_decoder)
-        self.decoder = ViT3DDecoder(**vit_kwargs)
+        if vit_decoder_2d:
+            self.decoder = ViT2DDecoder(patch_size_t=1, t_causal=False, **vit_kwargs)
+        else:
+            vit_kwargs.setdefault("patch_size_t", self.vae_ratio_t)
+            vit_kwargs.setdefault("t_causal", causal_decoder)
+            self.decoder = ViT3DDecoder(**vit_kwargs)
 
     @torch.no_grad()
     @cached_vae_encode
@@ -1304,12 +1321,15 @@ class AutoencoderKLLegacy(AutoencoderKL):
 
     @torch.no_grad()
     def decode(self, z):
+        if self.vit_decoder_2d:
+            # Tiling stays BC1HW; the image decoder consumes the single frame.
+            return self.decoder(self.post_quant_conv(z.squeeze(2))).unsqueeze(2)
         z2 = self.post_quant_conv(z)
         if self.use_vit_decoder:
             return self.decoder(z2)
         return self.decoder(z2, z)
 
-    def encode_base(self, input, process_image=False):
+    def encode_base(self, input, process_image=False, generator=None):
         if self.use_3d_conv and input.ndim == 4:
             input = input.unsqueeze(2)
 
@@ -1318,7 +1338,7 @@ class AutoencoderKLLegacy(AutoencoderKL):
         else:
             moments = self.encode_temporal(input)
 
-        z = DiagonalGaussianDistribution(moments).sample()
+        z = DiagonalGaussianDistribution(moments).sample(generator=generator)
 
         if process_image and self.use_3d_conv:
             z = self.trim_code(z, 1)

@@ -490,6 +490,8 @@ def register():
         model_detectors=[
             lambda model_id: (
                 "minimaxh3" in model_id.lower().replace("-", "").replace("_", "")
+                and "minimaxh3image"
+                not in model_id.lower().replace("-", "").replace("_", "")
                 and "vdn" not in model_id.lower()
             )
         ],
