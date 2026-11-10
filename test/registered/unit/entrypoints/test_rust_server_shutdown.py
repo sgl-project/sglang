@@ -1,7 +1,8 @@
 """The Python side of the Rust server's SIGTERM drain: the main process relays
 SIGTERM to the listener-hosting schedulers and waits for the schedulers with
 Python mode's bound; the listener's scheduler drains on SIGTERM and stops the
-schedulers once its drain completed."""
+schedulers once its drain completed, with attention DP once every DP
+listener closed."""
 
 import contextlib
 import ctypes
@@ -19,8 +20,16 @@ import pytest
 from sglang.srt.entrypoints import engine
 from sglang.srt.entrypoints import sidecar as sidecar_module
 from sglang.srt.managers.io_struct import ShutdownReq
+from sglang.srt.managers.scheduler_components.dp_attn import DRAIN_STATE_NO_LISTENER
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.rust_server import shutdown as rust_shutdown
-from sglang.srt.rust_server.server import RustServer, claim_sigterm_before_compiles
+from sglang.srt.rust_server.server import (
+    DRAIN_CLOSED,
+    DRAIN_DRAINING,
+    DRAIN_FORCE_REQUESTED,
+    RustServer,
+    claim_sigterm_before_compiles,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -40,6 +49,10 @@ class _FakeServer:
     def __init__(self):
         self.complete = False
         self.drains = []
+        self.closed = False
+        self.held = False
+        self.release_calls = 0
+        self.releases = 0
         self.read_fd, self.write_fd = os.pipe()
         os.set_blocking(self.read_fd, False)
         os.set_blocking(self.write_fd, False)
@@ -52,6 +65,23 @@ class _FakeServer:
 
     def begin_drain(self, force=False):
         self.drains.append(force)
+
+    def drain_state(self):
+        state = DRAIN_DRAINING if self.drains else 0
+        if any(self.drains):
+            state |= DRAIN_FORCE_REQUESTED
+        return state | (DRAIN_CLOSED if self.closed else 0)
+
+    def hold_drain_end(self):
+        assert not self.drains, "held after the drain began"
+        self.held = True
+
+    def release_drain_end(self):
+        self.release_calls += 1
+        if not self.drains:
+            return False
+        self.releases += 1
+        return True
 
     def drain_signal_fd(self, signum, force=False, notify=None):
         self.signum, self.notify = signum, notify
@@ -89,6 +119,176 @@ def test_force_shutdown_env_forces_the_drain(restore_sigterm, monkeypatch):
     RustServer(fake, http_port=0).install_sigterm_drain()
     os.kill(os.getpid(), signal.SIGTERM)
     assert fake.drains == [True]
+
+
+DRAINING, FORCED, CLOSED = DRAIN_DRAINING, DRAIN_FORCE_REQUESTED, DRAIN_CLOSED
+NO_LISTENER = DRAIN_STATE_NO_LISTENER
+
+
+def _dp_listener(fake, *, hold, attn_dp_size=3, force_env=False, monkeypatch=None):
+    if force_env:
+        monkeypatch.setenv("SGLANG_FORCE_SHUTDOWN", "1")
+    server = RustServer(fake, http_port=0)
+    server._broadcasts_shutdown = hold
+    with get_parallel().override(attn_dp_size=attn_dp_size):
+        server.install_sigterm_drain(hold_drain_end=hold)
+    return server
+
+
+def test_any_draining_listener_drains_every_listener(restore_sigterm):
+    fake = _FakeServer()
+    server = _dp_listener(fake, hold=False)
+    server.on_drain_rows([0, 0, NO_LISTENER])
+    assert fake.drains == []
+    for _ in range(2):  # a step can gather twice
+        server.on_drain_rows([0, DRAINING | CLOSED, 0])
+    assert fake.drains == [False]
+    # A peer forced later upgrades the graceful drain; a failed probe, which
+    # shows only as closed, does not.
+    server.on_drain_rows([DRAINING, CLOSED | DRAINING, 0])
+    assert fake.drains == [False]
+    server.on_drain_rows([DRAINING, DRAINING | FORCED, 0])
+    server.on_drain_rows([DRAINING | FORCED, DRAINING | FORCED, 0])
+    assert fake.drains == [False, True]
+    assert fake.releases == 0
+
+
+def test_force_shutdown_env_forces_a_propagated_drain(restore_sigterm, monkeypatch):
+    fake = _FakeServer()
+    server = _dp_listener(fake, hold=False, force_env=True, monkeypatch=monkeypatch)
+    server.on_drain_rows([0, DRAINING])
+    assert fake.drains == [True]
+
+
+def test_rank_0_ends_its_drain_once_every_listener_closed(restore_sigterm):
+    fake = _FakeServer()
+    server = _dp_listener(fake, hold=True)
+    assert fake.held
+    # Every listener closed, but no drain is under way here: no release.
+    fake.closed = True
+    server.on_drain_rows([CLOSED, CLOSED, CLOSED])
+    assert fake.release_calls == 0
+    fake.closed = False
+
+    server.on_drain_rows([0, DRAINING, 0])
+    assert fake.drains == [False]
+    fake.closed = True
+    for rows in (
+        [DRAINING | CLOSED, DRAINING, DRAINING | CLOSED],
+        [DRAINING | CLOSED, DRAINING | CLOSED, DRAINING],
+    ):
+        server.on_drain_rows(rows)
+        assert fake.releases == 0, rows
+    for _ in range(2):
+        server.on_drain_rows([DRAINING | CLOSED] * 3)
+    assert fake.releases == 1
+
+
+def test_no_release_once_a_forced_drain_stopped_the_schedulers(restore_sigterm):
+    fake = _FakeServer()
+    server = _dp_listener(fake, hold=True)
+    server.server.begin_drain(True)
+    fake.complete = fake.closed = True  # a forced drain skips the hold
+    assert [type(req) for req in server.drain(8)] == [ShutdownReq]
+    server.on_drain_rows([DRAINING | FORCED | CLOSED] * 3)
+    assert fake.release_calls == 0
+
+
+def test_no_release_while_rank_0_has_not_begun_draining(restore_sigterm):
+    """Rank 0's own state, read fresh, must be draining, even if every row
+    shows a closed listener."""
+    fake = _FakeServer()
+    server = _dp_listener(fake, hold=True)
+    fake.begin_drain = lambda force=False: None  # the drain never begins here
+    server.on_drain_rows([CLOSED, DRAINING | CLOSED, CLOSED])
+    assert fake.release_calls == 0
+
+
+@pytest.mark.parametrize(
+    "rows",
+    [
+        # Every other DP group's row is an inactive slot: vacuously closed.
+        [CLOSED, NO_LISTENER, NO_LISTENER],
+        # One listener row short.
+        [CLOSED, CLOSED],
+    ],
+)
+def test_a_mismatched_row_set_fails_open_with_one_error(restore_sigterm, caplog, rows):
+    fake = _FakeServer()
+    server = _dp_listener(fake, hold=True)
+    caplog.set_level("ERROR")
+    server.on_drain_rows(rows)
+    server.on_drain_rows(rows)
+    assert fake.releases == 0, "released with no drain under way"
+    errors = [r for r in caplog.records if "drain barrier disabled" in r.message]
+    assert len(errors) == 1
+
+    server.server.begin_drain(False)
+    server.on_drain_rows(rows)
+    assert fake.releases == 0, "released before this listener closed"
+    fake.closed = True
+    server.on_drain_rows(rows)
+    assert fake.releases == 1
+    assert len([r for r in caplog.records if "drain barrier" in r.message]) == 1
+
+
+def _hold_scheduler(**parallel):
+    from sglang.srt.managers.scheduler import Scheduler
+
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.require_mlp_sync = parallel.pop("require_mlp_sync", True)
+    scheduler.rust_server_endpoints = [{}] * parallel.pop("endpoints", 2)
+    fields = dict(tp_rank=0, attn_dp_size=2, dp_size=1, pp_size=1, num_dp_ranks=2)
+    fields.update(parallel)
+    return scheduler, fields
+
+
+@pytest.mark.parametrize(
+    ("case", "hold"),
+    [
+        (dict(), True),
+        (dict(tp_rank=1), False),
+        (dict(attn_dp_size=1, num_dp_ranks=1, endpoints=1), False),
+        # `--dp-size` replicas with a gathered buffer: each its own listener.
+        (dict(attn_dp_size=1, dp_size=2, endpoints=1), False),
+        (dict(endpoints=1), False),
+        (dict(require_mlp_sync=False), False),
+        (dict(pp_size=2), False),
+        (dict(skip_all_gather=True), False),
+    ],
+)
+def test_rank_0_holds_its_drain_end_only_where_every_step_gathers(case, hold):
+    from sglang.srt.environ import envs
+
+    case = dict(case)
+    skip = case.pop("skip_all_gather", False)
+    scheduler, fields = _hold_scheduler(**case)
+    with (
+        get_parallel().override(**fields),
+        envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.override(skip),
+    ):
+        assert scheduler._holds_rust_drain_end() is hold
+
+
+def test_scheduler_gathers_its_listener_drain_state():
+    from sglang.srt.environ import envs
+    from sglang.srt.managers.scheduler import Scheduler
+
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.rust_server = None
+    with envs.SGLANG_RUST_SERVER.override(False):
+        assert scheduler._dp_drain_column_callbacks() == {}
+    with envs.SGLANG_RUST_SERVER.override(True):
+        callbacks = scheduler._dp_drain_column_callbacks()
+        assert callbacks["get_drain_state"]() == NO_LISTENER
+        assert "on_drain_rows" not in callbacks
+        fake = _FakeServer()
+        scheduler.rust_server = RustServer(fake, http_port=0)
+        callbacks = scheduler._dp_drain_column_callbacks()
+        fake.closed = True
+        assert callbacks["get_drain_state"]() == CLOSED
+        callbacks["on_drain_rows"]([DRAINING])
+        assert fake.drains == [False]
 
 
 def _sigaction(signum, new=None):
@@ -298,6 +498,46 @@ def test_main_process_bounds_a_wedged_scheduler(restore_sigterm, monkeypatch):
     finally:
         wedged.kill()
         wedged.join()
+
+
+def _exits_soon():
+    time.sleep(0.5)
+
+
+def test_a_clean_exit_without_sigterm_bounds_the_others(monkeypatch):
+    """No SIGTERM reached this launcher (another node's, or one scheduler's
+    own, began the drain): the first scheduler exiting 0 starts the exit
+    bound and stops the watchdog, so killing a straggler is not a crash."""
+    from sglang.srt.utils.watchdog import SubprocessWatchdog
+
+    monkeypatch.setattr(rust_shutdown, "_SCHEDULER_EXIT_TIMEOUT_SECS", 1)
+    sigquits = []
+    previous = signal.signal(signal.SIGQUIT, lambda *_: sigquits.append(True))
+    ctx = mp.get_context("fork")
+    ready = ctx.Event()
+    clean = ctx.Process(target=_exits_soon)
+    wedged = ctx.Process(target=_wedged_child, args=(ready,))
+    clean.start()
+    wedged.start()
+    try:
+        assert ready.wait(30)
+        watchdog = SubprocessWatchdog([clean, wedged], interval=0.1)
+        watchdog.start()
+        drain = rust_shutdown.RustServerSigtermDrain(
+            [clean, wedged], [clean], watchdog, _name()
+        )
+        start = time.monotonic()
+        drain.wait()
+        assert 0.5 + 1 <= time.monotonic() - start < 0.5 + 1 + 3
+        assert (clean.exitcode, wedged.exitcode) == (0, -signal.SIGKILL)
+        time.sleep(0.5)  # past several watchdog rounds
+        assert sigquits == [], "the straggler's kill read as a crash"
+    finally:
+        signal.signal(signal.SIGQUIT, previous)
+        for proc in (clean, wedged):
+            if proc.exitcode is None:
+                proc.kill()
+            proc.join()
 
 
 def test_main_process_raises_on_an_unreaped_scheduler(restore_sigterm, monkeypatch):

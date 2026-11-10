@@ -23,6 +23,7 @@ from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.deferred_responses import (
     DeferredResponses,
 )
+from sglang.srt.managers.scheduler_components.pause_state import PauseState
 from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     KeyedReqList,
@@ -138,7 +139,7 @@ class TestAsyncShmIdleAccounting(CustomTestCase):
         scheduler.enable_unified_cache_external_linker = False
         scheduler.enable_lmcache = False
         scheduler.dp_attn_adapter = MagicMock()
-        scheduler._engine_paused = False
+        scheduler.pause_state = PauseState()
         receiver = object.__new__(UocrRequestReceiver)
         object.__setattr__(receiver, "async_shm_materializer", materializer)
         scheduler.request_receiver = receiver

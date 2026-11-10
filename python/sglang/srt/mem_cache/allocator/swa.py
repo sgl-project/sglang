@@ -32,13 +32,6 @@ if _is_npu:
 _SWA_PEER_MAPPED = Invariant("swa.peer_mapped", Bucket.FATAL_UNCONTAINABLE, IsTrue())
 # free_full leaves the mapping alone, so a live entry would strand its SWA peer.
 _SWA_PEER_RELEASED = Invariant("swa.peer_released", Bucket.GUARD, IsTrue())
-# The unified allocator's segment frees trust the caller's bound/released split.
-UNIFIED_SWA_SEGMENT_BOUND = Invariant(
-    "unified_swa.segment_bound", Bucket.FATAL_UNCONTAINABLE, IsTrue()
-)
-UNIFIED_SWA_SEGMENT_RELEASED = Invariant(
-    "unified_swa.segment_released", Bucket.FATAL_UNCONTAINABLE, IsTrue()
-)
 
 
 class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
@@ -184,22 +177,29 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self, tree_cache, num_mixed_decode_tokens=num_mixed_decode_tokens
         )
 
-    def reclaim_for_prealloc(
-        self, tree_cache, full_tokens: int, swa_tokens: int
-    ) -> str | None:
+    def window_pool_names(self):
+        from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+
+        return (BaseSWAKVPool.WINDOW_SUB_POOL,)
+
+    def reclaim_for_prealloc(self, tree_cache, demand) -> str | None:
         """Free room for a decode-node preallocation; None means it is ready.
 
         Returns a description of the shortfall when it cannot be met, for the
         caller to attach to whichever request it was admitting. Separate
         buffers make the sliding-window side the only one that needs
-        reclaiming here, since the full side is priced by the caller's budget.
+        reclaiming here, since the full side is priced by the caller's budget
+        and state slots (in a pool of their own) by the caller's state check.
         """
-        from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+        from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 
+        (swa_tokens,) = demand.checked(self.window_pool_names()).window_tokens.values()
         available = self.swa_available_size()
         if available < swa_tokens:
             tree_cache.evict_for_alloc(
-                EvictParams(swa_num_tokens=swa_tokens - available)
+                KVDemand(
+                    window_tokens=dict.fromkeys(self.window_pool_names(), swa_tokens)
+                )
             )
             available = self.swa_available_size()
         if available < swa_tokens:
@@ -215,16 +215,19 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
 
     def evict_to_free_tokens(self, tree_cache, num_tokens: int) -> None:
-        from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+        from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 
         if tree_cache is None or not tree_cache.supports_prefix_sharing():
             return
-        full_shortfall = max(0, num_tokens - self.full_available_size())
-        swa_shortfall = max(0, num_tokens - self.swa_available_size())
-        if full_shortfall or swa_shortfall:
-            tree_cache.evict_for_alloc(
-                EvictParams(num_tokens=full_shortfall, swa_num_tokens=swa_shortfall)
-            )
+        if (
+            self.full_available_size() < num_tokens
+            or self.swa_available_size() < num_tokens
+        ):
+            tree_cache.evict_for_alloc(KVDemand.same_tokens(self, num_tokens))
+
+    def owner_available_size(self):
+        """What the token pool can serve now: its full-attention side."""
+        return self.full_available_size()
 
     def full_available_size(self):
         return self.full_attn_allocator.available_size()
@@ -798,6 +801,10 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             num_mixed_decode_tokens=num_mixed_decode_tokens,
             all_swa=True,
         )
+
+    def owner_available_size(self):
+        """What the token pool can serve now: its full-attention side."""
+        return self.full_available_size()
 
     def full_available_size(self):
         return self.swa_attn_allocator.available_size()

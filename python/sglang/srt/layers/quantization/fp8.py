@@ -40,6 +40,7 @@ from sglang.srt.layers.moe.utils import (
     get_moe_padding_size,
     get_moe_runner_backend,
     get_moe_weight_sizes,
+    route_dropped_experts_to_local,
 )
 from sglang.srt.layers.parameter import (
     BlockQuantScaleParameter,
@@ -1225,7 +1226,8 @@ class Fp8LinearMethod(LinearMethodBase):
     def process_weights_after_loading(self, layer: Module) -> None:
         if self.block_quant:
             self.process_weights_after_loading_block_quant(layer)
-            if layer.deepgemm_mxfp8_input:
+            # Only LinearBase defines this; an MXFP8 ParallelLMHead does not.
+            if getattr(layer, "deepgemm_mxfp8_input", False):
                 layer.deepgemm_mxfp8_input = self.prepare_deepgemm_mxfp8_input(layer)
         else:
             layer.weight = Parameter(layer.weight.data, requires_grad=False)
@@ -1382,7 +1384,7 @@ class Fp8LinearMethod(LinearMethodBase):
 
         if self.use_marlin:
             if self.block_quant:
-                layer.weight_block_size = self.quant_config.weight_block_size
+                layer.weight_block_size = self.weight_block_size
             prepare_fp8_layer_for_marlin(layer, not self.block_quant)
             # Activations not quantized for marlin.
             del layer.input_scale
@@ -3142,8 +3144,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             self.runner = create_ascend_moe_runner(
                 layer,
                 moe_runner_config,
-                w13_kernel=NPUW4A8MXFP4MoEMethod(),
-                w2_kernel=NPUW4A8MXFP4MoEMethod(),
+                w13_kernel=NPUW4A8MXFP4MoEMethod(weight_prefix="w13"),
+                w2_kernel=NPUW4A8MXFP4MoEMethod(weight_prefix="w2"),
             )
             return
 
@@ -3293,6 +3295,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             from sgl_kernel import fused_experts
 
             topk_weights, topk_ids, _ = dispatch_output.topk_output
+            topk_weights, topk_ids = route_dropped_experts_to_local(
+                topk_weights=topk_weights, topk_ids=topk_ids
+            )
             assert layer.w13_weight.dtype == layer.w2_weight.dtype
             use_fp8_w8a8 = layer.w13_weight.dtype == torch.float8_e4m3fn
             use_mxfp4_w4a16 = layer.w13_weight.dtype == torch.int8

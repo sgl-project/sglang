@@ -562,5 +562,9 @@ POSITIONAL_FIELD_ORDER = (
     "pp_min_chunked_prefill_size",
     "pp_chunk_overhead_tokens",
     "enable_fp4_indexer",
+    "paged_experts_enable_disk",
+    "disable_normalize_embedding",
+    "log_schedule_decisions",
+    "speculative_dspark_lm_head_dtype",
 )
 # fmt: on
