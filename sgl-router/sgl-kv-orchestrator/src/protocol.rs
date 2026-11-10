@@ -1,4 +1,4 @@
-//! The checked-in schemas are generated from Python contracts and drift-tested.
+//! The checked-in schema bundle is generated from Python contracts and drift-tested.
 use crate::models::PrefixTarget;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -79,13 +79,16 @@ pub enum Error {
     Unsupported,
 }
 
-static TRANSFER_SCHEMA: LazyLock<jsonschema::Validator> =
-    LazyLock::new(|| validator(include_str!("../fixtures/prefetch.schema.json")));
-static PIN_SCHEMA: LazyLock<jsonschema::Validator> =
-    LazyLock::new(|| validator(include_str!("../fixtures/pin.schema.json")));
+static ACTION_DEFINITIONS: LazyLock<Value> = LazyLock::new(|| {
+    serde_json::from_str(include_str!("../fixtures/actions.schema.json"))
+        .expect("checked-in JSON schema")
+});
+static TRANSFER_SCHEMA: LazyLock<jsonschema::Validator> = LazyLock::new(|| validator("Prefetch"));
+static PIN_SCHEMA: LazyLock<jsonschema::Validator> = LazyLock::new(|| validator("Pin"));
 
-fn validator(source: &str) -> jsonschema::Validator {
-    let schema: Value = serde_json::from_str(source).expect("checked-in JSON schema");
+fn validator(definition: &str) -> jsonschema::Validator {
+    let mut schema = ACTION_DEFINITIONS.clone();
+    schema["$ref"] = Value::String(format!("#/$defs/{definition}"));
     jsonschema::validator_for(&schema).expect("valid protocol schema")
 }
 

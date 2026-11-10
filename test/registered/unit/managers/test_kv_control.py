@@ -397,11 +397,11 @@ class TestPublicKVProtocol(CustomTestCase):
             parse_action,
         )
 
-        for name, schema in (("prefetch", Prefetch), ("pin", Pin)):
-            self.assertEqual(
-                json.loads((self.fixtures / f"{name}.schema.json").read_text()),
-                wire(msgspec.json.schema(schema)),
-            )
+        _, definitions = msgspec.json.schema_components((Prefetch, Pin))
+        self.assertEqual(
+            json.loads((self.fixtures / "actions.schema.json").read_text()),
+            wire({"$defs": definitions}),
+        )
         demote = wire(msgspec.json.schema(Demote))
         transfer = demote["$defs"].pop("Demote")
         transfer["title"] = "Prefetch"

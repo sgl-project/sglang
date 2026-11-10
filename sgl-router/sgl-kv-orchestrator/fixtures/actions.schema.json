@@ -1,5 +1,4 @@
 {
-  "$ref": "#/$defs/Prefetch",
   "$defs": {
     "Prefetch": {
       "title": "Prefetch",
@@ -622,6 +621,147 @@
       },
       "required": [
         "tier"
+      ],
+      "additionalProperties": false
+    },
+    "Pin": {
+      "title": "Pin",
+      "type": "object",
+      "properties": {
+        "mode": {
+          "enum": [
+            "acquire",
+            "release",
+            "renew"
+          ]
+        },
+        "target": {
+          "anyOf": [
+            {
+              "enum": [
+                "request_cached"
+              ]
+            },
+            {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ContentTarget"
+                },
+                {
+                  "$ref": "#/$defs/TokensTarget"
+                },
+                {
+                  "$ref": "#/$defs/SessionTarget"
+                },
+                {
+                  "$ref": "#/$defs/PrefixTarget"
+                }
+              ],
+              "discriminator": {
+                "propertyName": "kind",
+                "mapping": {
+                  "content": "#/$defs/ContentTarget",
+                  "tokens": "#/$defs/TokensTarget",
+                  "session": "#/$defs/SessionTarget",
+                  "prefix": "#/$defs/PrefixTarget"
+                }
+              }
+            }
+          ]
+        },
+        "location": {
+          "$ref": "#/$defs/PublicLocation"
+        },
+        "claim_id": {
+          "type": "string",
+          "maxLength": 256,
+          "minLength": 1
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "ttl_seconds": {
+          "anyOf": [
+            {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "maximum": 31536000
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "priority": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": -2147483648,
+              "maximum": 2147483647
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "required_protection": {
+          "anyOf": [
+            {
+              "enum": [
+                "backend_soft_pin",
+                "eviction_exclusion",
+                "eviction_priority"
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "owner_task": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskIdentity"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "mode",
+        "target",
+        "location",
+        "claim_id",
+        "revision"
+      ],
+      "additionalProperties": false
+    },
+    "TaskIdentity": {
+      "title": "TaskIdentity",
+      "type": "object",
+      "properties": {
+        "session_id": {
+          "type": "string",
+          "maxLength": 256,
+          "minLength": 1
+        },
+        "incarnation": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        }
+      },
+      "required": [
+        "session_id",
+        "incarnation"
       ],
       "additionalProperties": false
     }
