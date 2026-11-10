@@ -60,9 +60,10 @@ from sglang.srt.speculative.dflash_utils import (
     is_nemotron_35_draft_config,
     parse_dflash_draft_config,
 )
-from sglang.srt.utils import BumpAllocator, is_npu
+from sglang.srt.utils import BumpAllocator, is_cuda, is_npu
 from sglang.srt.utils.device import get_compiler_backend
 
+_is_cuda = is_cuda()
 _is_npu = is_npu()
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
@@ -761,14 +762,15 @@ class DFlashGroupedConv(nn.Module):
         )
 
     def _convolve(self, hidden_states, delta, side: int) -> torch.Tensor:
-        if hidden_states.is_cuda and hidden_states.dim() == 2:
+        # NVIDIA only: the Triton kernel is not validated on ROCm.
+        if _is_cuda and hidden_states.is_cuda and hidden_states.dim() == 2:
             return dflash_grouped_conv(
-                hidden_states,
-                delta,
-                self.base_kernel[side],
-                self.block_size,
-                self.group_size,
-                self.taps,
+                hidden_states=hidden_states,
+                delta=delta,
+                base=self.base_kernel[side],
+                block_size=self.block_size,
+                group_size=self.group_size,
+                taps=self.taps,
             )
         # Marked here, not inside: by the time the compiled function traces, the dim
         # is symbolic and the group index costs an integer div and mod per element.
