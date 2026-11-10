@@ -360,8 +360,11 @@ def handle_gpu_memory_settings(server_args: Any):
     if cfg.enable_symm_mem and not envs.SGLANG_SYMM_MEM_PREALLOC_GB_SIZE.is_set():
         envs.SGLANG_SYMM_MEM_PREALLOC_GB_SIZE.set(4)
         logger.warning(
-            "Symmetric memory is enabled, setting symmetric memory prealloc size to 4GB as default."
-            "Use environment variable SGLANG_SYMM_MEM_PREALLOC_GB_SIZE to change the prealloc size."
+            "Symmetric memory is enabled, setting symmetric memory prealloc size "
+            "to 4GB as default. Use environment variable "
+            "SGLANG_SYMM_MEM_PREALLOC_GB_SIZE to change the prealloc size. "
+            "When tensor parallelism is greater than 1 and post-capture KV "
+            "sizing is off, this prealloc is reserved out of the KV cache budget."
         )
 
 
