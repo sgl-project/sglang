@@ -665,7 +665,8 @@ class DraftBlockProposer:
                     ]
                     if runs_graph
                     else None
-                )
+                ),
+                reqs=batch.reqs,
             )
         with torch.inference_mode():
             draft_out = self.draft_model_runner.forward(draft_forward_batch)

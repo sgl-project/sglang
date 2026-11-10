@@ -821,10 +821,6 @@ class DSparkWorkerV2(BaseSpecWorker):
                 )
             return self._decode_idle_result(on_publish=on_publish)
 
-        # The prefill's draft KV may land in slots a pending commit targets.
-        commit = self._deferred_commit()
-        if commit is not None:
-            commit.flush()
         # Placing the draft KV reads scheduler-shared tables, which prefill
         # read-done releases once the target forward's own reads end.
         placement = self._kv_injector.place_prefill(batch)
@@ -1249,6 +1245,9 @@ class DSparkWorkerV2(BaseSpecWorker):
                 draft_tokens=draft_tokens,
                 simulate_bonus_sampling_info=simulate_bonus_sampling_info,
             )
+        commit = self._deferred_commit()
+        if commit is not None:
+            commit.note_staged_reqs(batch.reqs)
         if watermark_rows is not None:
             self.target_worker.model_runner.watermark_state.commit_speculative_chain(
                 req_pool_indices=batch.req_pool_indices,

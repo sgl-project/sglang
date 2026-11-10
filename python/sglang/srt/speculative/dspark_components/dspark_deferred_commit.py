@@ -10,16 +10,19 @@ epilogue joins it and stages the store's arguments (write locations, positions, 
 commit lengths, ring slots). The next captured draft graph runs the stores on a side
 stream forked at its head (a capture head hook); the draft's first KV store joins
 them (``join``, from the draft attention backend's ``get_swa_out_cache_loc``, which
-SGLang's draft attention and a megakernel's both reach on the store's stream). Any
-other forward runs the stores eagerly first.
+SGLang's draft attention and a megakernel's both reach on the store's stream). An
+eager draft, or a draft graph that would not run them all, runs them eagerly first.
 
 Contract:
 
+- Only a draft forward writes the staging, and only the rows of the requests it
+  carries: a step touches only its own requests, so their releases already wait
+  for it. A row of a request retracted since the staging is not written either:
+  its staged locations are pages it no longer holds.
 - Every write disarms the staging (commit lengths 0), so a staging is written once.
-- A forward that may write or read draft KV (prefill, draft extend, an eager draft)
-  runs after the pending write; a draft graph whose rows miss staged ones is preceded
-  by an eager write of every staged row.
-- Nothing reads draft KV between the verify and the next draft forward.
+- A prefill between the verify and the next draft forward leaves the staging
+  pending: a row written later belongs to a request that held its pages
+  throughout, so the prefill neither writes nor reads them.
 """
 
 from __future__ import annotations
@@ -73,6 +76,8 @@ class DeferredContextCommit:
         self._store_done: Optional[torch.cuda.Event] = None
         # Host: requests a static verify staged since the last write (0: nothing pending).
         self.staged_bs = 0
+        # Host: staged requests by row, with their `retraction_count` at staging.
+        self._staged_reqs: tuple = ()
         # Host: a forked projection the static epilogue has not joined yet.
         self._proj_unjoined = False
         # Host, capture only: forked stores the draft's first KV store has not joined yet.
@@ -169,6 +174,30 @@ class DeferredContextCommit:
         """Host, after a static verify graph ran ``live_bs`` requests."""
         self.staged_bs = live_bs
 
+    def note_staged_reqs(self, reqs) -> None:
+        """Host, after a verify of ``reqs``."""
+        self._staged_reqs = tuple(
+            (req, req.retraction_count) for req in reqs[: self.staged_bs]
+        )
+
+    def _skip_rows_not_carried(self, reqs) -> None:
+        """Host, before a forward of ``reqs`` writes the staging: zero the rows
+        of the requests it does not carry, or that were retracted since."""
+        carried = set(reqs)
+        # One launch per run of adjacent rows: an index tensor would need a
+        # host-to-device copy that waits for the stream.
+        run_start = None
+        for row, (req, retraction_count) in enumerate(self._staged_reqs):
+            skip = req not in carried or req.retraction_count != retraction_count
+            if skip and run_start is None:
+                run_start = row
+            elif not skip and run_start is not None:
+                self.commit_lens[run_start:row].zero_()
+                run_start = None
+        if run_start is not None:
+            self.commit_lens[run_start : len(self._staged_reqs)].zero_()
+        self._staged_reqs = ()
+
     # Draft side: the gated stores.
 
     def write(self, bs: Optional[int] = None) -> None:
@@ -198,7 +227,7 @@ class DeferredContextCommit:
             )
         self.commit_lens.zero_()
 
-    def flush(self, reason: str = "prefill") -> None:
+    def _flush(self, reason: str) -> None:
         """Host: write a pending staging now (an eager forward follows)."""
         # A graph captured here would replay the write on every later replay.
         if self.pending and not _capturing():
@@ -207,9 +236,10 @@ class DeferredContextCommit:
             self.num_written_eagerly += 1
             self._eager_reasons[reason] = self._eager_reasons.get(reason, 0) + 1
 
-    def before_draft_forward(self, graph_bs: Optional[int]) -> None:
-        """Host, before a draft forward: a graph of ``graph_bs`` requests (None: eager)
-        writes only its own rows, so anything it would miss is written first."""
+    def before_draft_forward(self, graph_bs: Optional[int], reqs) -> None:
+        """Host, before a draft forward of ``reqs``: a graph of ``graph_bs`` requests
+        (None: eager) writes only its own rows, so anything it would miss is
+        written first."""
         self._draft_forwards += 1
         if self._draft_forwards % _LOG_EVERY == 0:
             logger.debug(
@@ -219,12 +249,13 @@ class DeferredContextCommit:
                 self.num_written_eagerly,
                 self._eager_reasons,
             )
+        self._skip_rows_not_carried(reqs)
         if graph_bs is None:
-            self.flush("eager draft")
+            self._flush("eager draft")
         elif graph_bs not in self._forked_bs:
-            self.flush("draft graph without the fork")
+            self._flush("draft graph without the fork")
         elif self.staged_bs > graph_bs:
-            self.flush("draft graph rows")
+            self._flush("draft graph rows")
 
     def after_draft_forward(self, graph_ran: bool) -> None:
         # A pending staging past before_draft_forward is one the graph writes.
@@ -269,6 +300,7 @@ class DeferredContextCommit:
         """Drop whatever warmups or captures staged on placeholder inputs."""
         self.commit_lens.zero_()
         self.staged_bs = 0
+        self._staged_reqs = ()
         self._fork_unjoined = False
         self._proj_unjoined = False
 
