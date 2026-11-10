@@ -563,10 +563,10 @@
             "expected_e2e_ms": 399.62,
             "expected_avg_denoise_ms": 21.49,
             "expected_median_denoise_ms": 19.63,
-            "load_peak_vram_mb": 8504.0,
-            "runtime_peak_vram_mb": 13732.0,
-            "load_peak_allocated_mb": 8498.0,
-            "runtime_peak_allocated_mb": 10793.0,
+            "load_peak_vram_mb": 15294.0,
+            "runtime_peak_vram_mb": 20216.0,
+            "load_peak_allocated_mb": 15290.36,
+            "runtime_peak_allocated_mb": 17776.0,
             "estimated_full_test_time_s": 70
         },
         "flux_2_klein_base_image_t2i": {
@@ -635,10 +635,10 @@
             "expected_e2e_ms": 6112.68,
             "expected_avg_denoise_ms": 116.49,
             "expected_median_denoise_ms": 117.28,
-            "load_peak_vram_mb": 8504.0,
-            "runtime_peak_vram_mb": 13754.0,
-            "load_peak_allocated_mb": 8498.0,
-            "runtime_peak_allocated_mb": 10800.0,
+            "load_peak_vram_mb": 15294.0,
+            "runtime_peak_vram_mb": 18048.0,
+            "load_peak_allocated_mb": 15290.36,
+            "runtime_peak_allocated_mb": 16921.0,
             "estimated_full_test_time_s": 50
         },
         "flux_2_ti2i": {
