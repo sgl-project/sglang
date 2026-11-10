@@ -5,7 +5,7 @@ from __future__ import annotations
 import torch
 
 from sglang.srt.sampling.watermarking.server import resolve_synthid_request_enabled
-from sglang.srt.watermarking.synthid.state import SynthIDState
+from sglang.srt.sampling.watermarking.synthid.state import SynthIDState
 
 
 def request_enabled(request, features) -> bool:
@@ -85,7 +85,7 @@ def forward_mixed(
 ):
     from sglang.srt.environ import envs
     from sglang.srt.layers import sampler as sampler_module
-    from sglang.srt.watermarking.synthid.sampling import (
+    from sglang.srt.sampling.watermarking.synthid.sampling import (
         attach_sampling_mask,
         filter_synthid_probs,
     )

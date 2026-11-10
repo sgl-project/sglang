@@ -8,7 +8,9 @@ from typing import TYPE_CHECKING
 import torch
 
 if TYPE_CHECKING:
-    from sglang.srt.watermarking.synthid.processor import SynthIDWatermarkProcessor
+    from sglang.srt.sampling.watermarking.synthid.processor import (
+        SynthIDWatermarkProcessor,
+    )
 
 
 class _MixedTargetGraph:

@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Optional
 
 from sglang.srt.runtime_context import get_exec
-from sglang.srt.watermarking.synthid.setup import init_synthid_watermark
+from sglang.srt.sampling.watermarking.synthid.setup import init_synthid_watermark
 
 from .core import WatermarkState
 

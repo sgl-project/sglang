@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Optional
 
-from sglang.srt.watermarking.synthid import SynthIDWatermarkProcessor
+from sglang.srt.sampling.watermarking.synthid import SynthIDWatermarkProcessor
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch

@@ -13,7 +13,7 @@
 # ==============================================================================
 """SynthID Text watermarking runtime."""
 
-from sglang.srt.watermarking.synthid.processor import (
+from sglang.srt.sampling.watermarking.synthid.processor import (
     REFERENCE_SYNTHID_KEYS,
     SynthIDConfig,
     SynthIDSparseOutput,

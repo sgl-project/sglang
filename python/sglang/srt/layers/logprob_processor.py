@@ -18,7 +18,7 @@ from sglang.srt.model_executor.runner_utils.pool import (
     graph_pool_borrow_largest_run,
 )
 from sglang.srt.runtime_context import get_exec
-from sglang.srt.sampling.watermarking.synthid_request import is_enabled
+from sglang.srt.sampling.watermarking.synthid.request import is_enabled
 from sglang.srt.utils.device import async_d2h, is_pin_memory_available
 
 if TYPE_CHECKING:

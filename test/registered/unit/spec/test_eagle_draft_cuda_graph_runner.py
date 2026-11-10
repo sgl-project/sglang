@@ -28,6 +28,12 @@ from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMod
 from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
+from sglang.srt.sampling.watermarking.synthid import (
+    SynthIDConfig,
+    SynthIDSparseOutput,
+    SynthIDState,
+    SynthIDWatermarkProcessor,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative import eagle_draft_cuda_graph_runner as draft_graph
 from sglang.srt.speculative import eagle_worker_v2
@@ -39,12 +45,6 @@ from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
 )
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
-from sglang.srt.watermarking.synthid import (
-    SynthIDConfig,
-    SynthIDSparseOutput,
-    SynthIDState,
-    SynthIDWatermarkProcessor,
-)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 

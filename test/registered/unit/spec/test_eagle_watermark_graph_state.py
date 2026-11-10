@@ -14,12 +14,15 @@ from sglang.srt.model_executor.cuda_graph_config import (
     PhaseConfig,
 )
 from sglang.srt.runtime_context import get_context, get_server_args
+from sglang.srt.sampling.watermarking.synthid import (
+    SynthIDConfig,
+    SynthIDWatermarkProcessor,
+)
 from sglang.srt.speculative import eagle_draft_cuda_graph_runner, eagle_worker_v2
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
 )
 from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
-from sglang.srt.watermarking.synthid import SynthIDConfig, SynthIDWatermarkProcessor
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 

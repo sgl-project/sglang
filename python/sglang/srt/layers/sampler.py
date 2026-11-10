@@ -27,11 +27,13 @@ from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.sampling.watermarking.core import WatermarkState
-from sglang.srt.sampling.watermarking.synthid_request import (
+from sglang.srt.sampling.watermarking.synthid.request import (
     forward_mixed,
     is_enabled,
     is_mixed,
 )
+from sglang.srt.sampling.watermarking.synthid.sampling import forward_synthid
+from sglang.srt.sampling.watermarking.synthid.setup import init_synthid_watermark
 from sglang.srt.utils.async_probe import maybe_detect_nan, sanitize_nan_logits
 from sglang.srt.utils.common import get_bool_env_var
 from sglang.srt.utils.device import (
@@ -42,8 +44,6 @@ from sglang.srt.utils.device import (
     is_npu,
     is_xpu,
 )
-from sglang.srt.watermarking.synthid.sampling import forward_synthid
-from sglang.srt.watermarking.synthid.setup import init_synthid_watermark
 
 if is_cuda():
     from sglang.srt.layers.sampling_renorm import (

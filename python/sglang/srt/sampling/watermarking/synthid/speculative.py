@@ -21,16 +21,16 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.runtime_context import get_spec
-from sglang.srt.sampling.watermarking.synthid_request import (
+from sglang.srt.sampling.watermarking.synthid import (
+    SynthIDSparseOutput,
+    SynthIDWatermarkProcessor,
+)
+from sglang.srt.sampling.watermarking.synthid.request import (
     apply_mixed_logits,
     is_enabled,
     is_mixed,
 )
 from sglang.srt.utils.common import fast_topk
-from sglang.srt.watermarking.synthid import (
-    SynthIDSparseOutput,
-    SynthIDWatermarkProcessor,
-)
 
 if TYPE_CHECKING:
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -138,7 +138,9 @@ def apply_synthid_to_target(
             return None, None, None, original_logits
         filter_probs = None
         if has_filters:
-            from sglang.srt.watermarking.synthid.sampling import filter_synthid_probs
+            from sglang.srt.sampling.watermarking.synthid.sampling import (
+                filter_synthid_probs,
+            )
 
             filter_probs = partial(
                 filter_synthid_probs,
@@ -181,7 +183,9 @@ def apply_synthid_to_target(
 
     filter_probs = None
     if has_filters:
-        from sglang.srt.watermarking.synthid.sampling import filter_synthid_probs
+        from sglang.srt.sampling.watermarking.synthid.sampling import (
+            filter_synthid_probs,
+        )
 
         filter_probs = partial(
             filter_synthid_probs,
@@ -233,7 +237,9 @@ def apply_synthid_to_draft_logits(
                 return None, (probs, None, sampled_probs, sampled_tokens)
         filter_probs = None
         if has_filters:
-            from sglang.srt.watermarking.synthid.sampling import filter_synthid_probs
+            from sglang.srt.sampling.watermarking.synthid.sampling import (
+                filter_synthid_probs,
+            )
 
             filter_probs = partial(filter_synthid_probs, sampling_info=sampling_info)
         apply_mixed_logits(
@@ -248,7 +254,9 @@ def apply_synthid_to_draft_logits(
         return None, None
     filter_probs = None
     if has_filters:
-        from sglang.srt.watermarking.synthid.sampling import filter_synthid_probs
+        from sglang.srt.sampling.watermarking.synthid.sampling import (
+            filter_synthid_probs,
+        )
 
         filter_probs = partial(filter_synthid_probs, sampling_info=sampling_info)
     if sampling_info.synthid_force_dense_draft_probs:

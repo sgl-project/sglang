@@ -19,16 +19,16 @@ from sglang.srt.layers.sampler import sampling_from_probs_torch
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
-from sglang.srt.sampling.watermarking.synthid_request import apply_mixed_logits
-from sglang.srt.watermarking.synthid import (
+from sglang.srt.sampling.watermarking.synthid import (
     REFERENCE_SYNTHID_KEYS,
     SynthIDConfig,
     SynthIDState,
     SynthIDWatermarkProcessor,
     watermark_topk_scores_torch,
 )
-from sglang.srt.watermarking.synthid.sampling import filter_synthid_probs
-from sglang.srt.watermarking.synthid.speculative import (
+from sglang.srt.sampling.watermarking.synthid.request import apply_mixed_logits
+from sglang.srt.sampling.watermarking.synthid.sampling import filter_synthid_probs
+from sglang.srt.sampling.watermarking.synthid.speculative import (
     apply_synthid_to_draft_logits,
     apply_synthid_to_target,
 )

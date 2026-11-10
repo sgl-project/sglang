@@ -30,9 +30,9 @@ from sglang.srt.sampling.watermarking.config import (
     MAX_WATERMARK_CONTEXT_WINDOW,
     parse_watermark_key,
 )
+from sglang.srt.sampling.watermarking.synthid.config import validate_synthid_watermark
 from sglang.srt.utils.device import is_cuda
 from sglang.srt.utils.runai_utils import is_runai_obj_uri
-from sglang.srt.watermarking.synthid.config import validate_synthid_watermark
 
 logger = logging.getLogger(__name__)
 

@@ -46,16 +46,16 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
+from sglang.srt.sampling.watermarking.synthid import SynthIDState
+from sglang.srt.sampling.watermarking.synthid.graph import (
+    can_run_synthid_graph,
+    synthid_graph_config,
+)
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.speculative.eagle_utils import get_draft_recurrent_hidden_state_spec
 from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
 from sglang.srt.utils.async_probe import maybe_detect_nan, maybe_detect_oob
 from sglang.srt.utils.device_timer import device_timer_ctx
-from sglang.srt.watermarking.synthid import SynthIDState
-from sglang.srt.watermarking.synthid.graph import (
-    can_run_synthid_graph,
-    synthid_graph_config,
-)
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
@@ -422,7 +422,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
     # can_run_graph
     # -----------------------------------------------------------------
     def can_run_graph(self, forward_batch: ForwardBatch):
-        from sglang.srt.sampling.watermarking.synthid_request import is_mixed
+        from sglang.srt.sampling.watermarking.synthid.request import is_mixed
 
         mixed = forward_batch.sampling_info is not None and is_mixed(
             forward_batch.sampling_info.synthid_state

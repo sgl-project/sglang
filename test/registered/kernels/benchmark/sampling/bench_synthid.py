@@ -5,7 +5,7 @@ from __future__ import annotations
 import torch
 
 from sglang.kernels.jit.benchmark import marker
-from sglang.srt.watermarking.synthid import (
+from sglang.srt.sampling.watermarking.synthid import (
     REFERENCE_SYNTHID_KEYS,
     SynthIDConfig,
     SynthIDState,

@@ -22,7 +22,7 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.runtime_context import get_spec
-from sglang.srt.watermarking.synthid import SynthIDWatermarkProcessor
+from sglang.srt.sampling.watermarking.synthid import SynthIDWatermarkProcessor
 
 logger = logging.getLogger(__name__)
 

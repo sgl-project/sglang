@@ -880,7 +880,9 @@ def eagle_sample(
     synthid_sparse_probs = None
     synthid_sparse_token_ids = None
     if synthid_applied:
-        from sglang.srt.watermarking.synthid.speculative import apply_synthid_to_target
+        from sglang.srt.sampling.watermarking.synthid.speculative import (
+            apply_synthid_to_target,
+        )
 
         (
             synthid_sparse_output,

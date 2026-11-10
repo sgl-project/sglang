@@ -21,9 +21,9 @@ from typing import TYPE_CHECKING, Callable, Optional
 import torch
 
 if TYPE_CHECKING:
-    from sglang.srt.sampling.watermarking.synthid_target_graph import MixedTargetGraphs
+    from sglang.srt.sampling.watermarking.synthid.target_graph import MixedTargetGraphs
 
-from sglang.srt.watermarking.synthid.state import (
+from sglang.srt.sampling.watermarking.synthid.state import (
     REFERENCE_SYNTHID_KEYS,
     SynthIDConfig,
     SynthIDState,
@@ -335,7 +335,7 @@ class SynthIDWatermarkProcessor:
     def capture_mixed_target_graphs(
         self, *, capture_bs: list[int], rows_per_request: int, vocab_size: int
     ) -> None:
-        from sglang.srt.sampling.watermarking.synthid_target_graph import (
+        from sglang.srt.sampling.watermarking.synthid.target_graph import (
             MixedTargetGraphs,
         )
 

@@ -24,8 +24,8 @@ from sglang.srt.sampling.custom_logit_processor import (
 from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.sampling.watermarking.core import build_watermark_batch_config
+from sglang.srt.sampling.watermarking.synthid import SynthIDState, get_synthid_config
 from sglang.srt.utils.device import is_pin_memory_available
-from sglang.srt.watermarking.synthid import SynthIDState, get_synthid_config
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -266,7 +266,7 @@ class SamplingBatchInfo:
 
         synthid_config = get_synthid_config(exec_config)
         if synthid_config is not None:
-            from sglang.srt.sampling.watermarking.synthid_request import request_enabled
+            from sglang.srt.sampling.watermarking.synthid.request import request_enabled
 
             enabled_host = [request_enabled(req, exec_config.features) for req in reqs]
             synthid_state = SynthIDState.from_requests(

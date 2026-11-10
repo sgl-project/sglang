@@ -22,7 +22,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.layers import sampler as sampler_module
-from sglang.srt.watermarking.synthid.ordinary import prepare_synthid_sample
+from sglang.srt.sampling.watermarking.synthid.ordinary import prepare_synthid_sample
 
 if TYPE_CHECKING:
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput

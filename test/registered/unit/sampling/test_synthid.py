@@ -19,16 +19,7 @@ from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.sampling.watermarking.proposal_relay import RequestProposalRelay
-from sglang.srt.sampling.watermarking.synthid_request import (
-    apply_mixed_logits,
-    is_enabled,
-    is_mixed,
-)
-from sglang.srt.speculative import eagle_utils
-from sglang.srt.speculative.eagle_info import EagleDraftInput
-from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.watermarking.synthid import (
+from sglang.srt.sampling.watermarking.synthid import (
     SynthIDConfig,
     SynthIDSparseOutput,
     SynthIDState,
@@ -38,10 +29,19 @@ from sglang.srt.watermarking.synthid import (
     compute_synthid_key_iv,
     watermark_topk_scores_torch,
 )
-from sglang.srt.watermarking.synthid.speculative import (
+from sglang.srt.sampling.watermarking.synthid.request import (
+    apply_mixed_logits,
+    is_enabled,
+    is_mixed,
+)
+from sglang.srt.sampling.watermarking.synthid.speculative import (
     apply_synthid_to_draft_logits,
     apply_synthid_to_target,
 )
+from sglang.srt.speculative import eagle_utils
+from sglang.srt.speculative.eagle_info import EagleDraftInput
+from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -500,7 +500,7 @@ class TestSynthID(CustomTestCase):
                     )
 
     def test_all_greedy_mixed_draft_preserves_off_argmax_proposal(self):
-        from sglang.srt.watermarking.synthid.speculative import (
+        from sglang.srt.sampling.watermarking.synthid.speculative import (
             sample_synthid_draft_logits,
         )
 

@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Callable, Optional
 import msgspec
 import torch
 
-from sglang.srt.watermarking.synthid import (
+from sglang.srt.sampling.watermarking.synthid import (
     SynthIDSparseOutput,
     SynthIDWatermarkProcessor,
 )

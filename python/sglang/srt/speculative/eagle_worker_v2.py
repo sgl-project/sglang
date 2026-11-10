@@ -55,7 +55,12 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_spec,
 )
-from sglang.srt.sampling.watermarking.synthid_request import is_enabled, is_mixed
+from sglang.srt.sampling.watermarking.synthid.request import is_enabled, is_mixed
+from sglang.srt.sampling.watermarking.synthid.speculative import (
+    apply_synthid_to_draft_logits,
+    ensure_sparse_algo5_draft_probs,
+    sample_synthid_draft_logits,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative import eagle_megakernel
 from sglang.srt.speculative.adaptive_runtime_state import (
@@ -130,11 +135,6 @@ from sglang.srt.utils.device import (
     is_xpu,
 )
 from sglang.srt.utils.log_utils import log_info_on_rank0
-from sglang.srt.watermarking.synthid.speculative import (
-    apply_synthid_to_draft_logits,
-    ensure_sparse_algo5_draft_probs,
-    sample_synthid_draft_logits,
-)
 
 _is_cpu = is_cpu()
 _is_npu = is_npu()

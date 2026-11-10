@@ -23,8 +23,8 @@ from sglang.srt.sampling.watermarking.core import (
     redact_watermark_secrets,
 )
 from sglang.srt.sampling.watermarking.server import validate_watermark_request
+from sglang.srt.sampling.watermarking.synthid import get_synthid_config
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.watermarking.synthid import get_synthid_config
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 

@@ -20,7 +20,7 @@ from typing import Callable
 
 from sglang.srt.arg_groups.model_override_base import ResolvedView
 from sglang.srt.environ import envs
-from sglang.srt.watermarking.synthid.state import load_synthid_keys
+from sglang.srt.sampling.watermarking.synthid.state import load_synthid_keys
 
 logger = logging.getLogger(__name__)
 
