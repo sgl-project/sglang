@@ -18,11 +18,19 @@
 
 import math
 from dataclasses import dataclass
-from typing import Optional
+from typing import NamedTuple, Optional
 
 import torch
 
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+
+class ForwardStateSlots(NamedTuple):
+    """A forward's per-request state slots, resolved during its metadata preparation.
+    Work past its shared-read end uses these: the scheduler may rewrite the tables."""
+
+    working: torch.Tensor  # one slot per request
+    track: Optional[torch.Tensor] = None  # prefix-cache checkpoint slots
 
 
 @dataclass(kw_only=True)

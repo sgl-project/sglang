@@ -259,6 +259,12 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
         pool = SimpleNamespace(
             state_sub_pool="mamba", get_mamba_indices=lambda indices: indices
         )
+        # Each replay's resolved slots: the identity map of its request rows.
+        linear_backend = SimpleNamespace(
+            forward_state_slots=lambda n, track_ids: SimpleNamespace(
+                working=context.forward_batch.req_pool_indices[:n], track=None
+            )
+        )
         backend = SimpleNamespace(
             req_to_token_pool=pool,
             runner_ids=RunnerIds(
@@ -268,6 +274,8 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
                 page_size=1,
                 device="cpu",
             ),
+            linear_attn_backend=linear_backend,
+            forward_state_slots=linear_backend.forward_state_slots,
         )
         cases = [
             (

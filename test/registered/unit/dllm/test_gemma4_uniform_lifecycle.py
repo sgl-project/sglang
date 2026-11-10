@@ -223,7 +223,8 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
         adder = object.__new__(PrefillAdder)
         adder.dllm_config = SimpleNamespace(requires_separate_context_encoding=True)
         adder.can_run_list = []
-        adder._get_dllm_remain_tokens = lambda req=None: 64
+        adder._get_dllm_remain_tokens = lambda req=None, **_: 64
+        adder.memory_budget = SimpleNamespace(prices_by_demand=False)
         adder._state_slots_for_req = lambda req: 0
         adder._update_prefill_budget = Mock()
 

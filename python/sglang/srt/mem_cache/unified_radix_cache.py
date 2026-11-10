@@ -61,6 +61,7 @@ from sglang.srt.mem_cache.buffer_mode.storage_existence_cache import (
     StorageExistenceCache,
     default_belief_policy,
 )
+from sglang.srt.mem_cache.capacity import owner_rows_ready
 from sglang.srt.mem_cache.common import RetractionBackup
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
@@ -2375,12 +2376,15 @@ class UnifiedRadixCache(BasePrefixCache):
                 return False
 
         token_slot = self.slot_id(TREE_TOKEN)
-        if self._pool_available(token_slot) < kv_tokens:
-            self.evict_for_alloc(KVDemand(full_tokens=kv_tokens))
-            if self._pool_available(token_slot) < kv_tokens:
-                self.dec_lock_ref(node_id, ancestor_lock_params)
-                self.dec_host_lock_ref(node_id, host_anchor_params)
-                return False
+        if not owner_rows_ready(
+            self,
+            self.token_to_kv_pool_allocator,
+            kv_tokens,
+            lambda: self._pool_available(token_slot),
+        ):
+            self.dec_lock_ref(node_id, ancestor_lock_params)
+            self.dec_host_lock_ref(node_id, host_anchor_params)
+            return False
 
         # Load H→D
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
