@@ -54,6 +54,7 @@ class DsparkDraftSampler:
         out=None,
         acceptance_estimator: Optional[OnlineAcceptanceEstimator] = None,
         markov_walker: Optional[MarkovWalker] = None,
+        verify_ids_out: Optional[torch.Tensor] = None,
     ):
         self.model = model
         self.markov_head = model.markov_head
@@ -73,9 +74,15 @@ class DsparkDraftSampler:
         # graph tail, so the step skips its eager concat (SGLANG_OPT_DSV41_DSPARK_MID_FOLD).
         self.verify_ids: Optional[torch.Tensor] = None
         if envs.SGLANG_OPT_DSV41_DSPARK_MID_FOLD.get():
-            self.verify_ids = torch.empty(
-                (self.max_bs, self.gamma + 1), dtype=torch.int64, device=device
-            )
+            if verify_ids_out is not None:
+                assert verify_ids_out.shape == (self.max_bs, self.gamma + 1)
+                assert verify_ids_out.dtype == torch.int64
+                assert verify_ids_out.is_contiguous()
+                self.verify_ids = verify_ids_out
+            else:
+                self.verify_ids = torch.empty(
+                    (self.max_bs, self.gamma + 1), dtype=torch.int64, device=device
+                )
         confidence_head = model.confidence_head
         self.acceptance_estimator = acceptance_estimator
         self.acceptance_features_out: Optional[torch.Tensor] = None
@@ -278,6 +285,7 @@ def maybe_build_draft_sampler(
     sharded_accept: bool = False,
     out=None,
     acceptance_estimator: Optional[OnlineAcceptanceEstimator] = None,
+    verify_ids_out: Optional[torch.Tensor] = None,
 ) -> Optional[DsparkDraftSampler]:
     """Build the graph-folded draft sampler, or None (reason logged) when the
     proposal must stay eager."""
@@ -315,6 +323,7 @@ def maybe_build_draft_sampler(
         out=out,
         acceptance_estimator=acceptance_estimator,
         markov_walker=markov_walker,
+        verify_ids_out=verify_ids_out,
     )
     if tp_rank == 0:
         logger.info(

@@ -2121,6 +2121,11 @@ class Envs:
     SGLANG_OPT_DSV41_DSPARK_MID_FOLD = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # With the mid fold, the draft graph's tail writes [anchor | draft tokens] straight
+    # into the target verify graph's input_ids slot, so the verify replay copies none.
+    SGLANG_OPT_DSV41_DSPARK_VERIFY_IDS_IN_PLACE = EnvBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
     # DSpark static verify: run the target verify runner's metadata prep through the
     # metadata glue graph where its backend declares the prep host-free.
     SGLANG_OPT_DSV41_TARGET_VERIFY_METADATA_GLUE = EnvBool(
