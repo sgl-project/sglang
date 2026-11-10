@@ -743,7 +743,6 @@ def fused_muse_spark_routing(
         bias,
         topk_weights_view,
         topk_ids_view,
-        None,
         topk,
         route_scale,
         multiplier_val,
