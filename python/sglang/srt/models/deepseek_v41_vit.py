@@ -135,13 +135,159 @@ class ViT(nn.Module):
         return self.norm(x)
 
 
+# Query tile for CPU attention. A full 16×8649² fp32 score matrix is ~4.8 GiB.
+_CPU_QUERY_CHUNK = 256
+
+
+def _as_fp32_cpu(module: nn.Module) -> nn.Module:
+    return module.to(device="cpu", dtype=torch.float32)
+
+
+class CpuAttention(nn.Module):
+    """Checkpoint names (`wqkv`, `wo`). No TP linears and no CUDA attention."""
+
+    def __init__(self, args):
+        super().__init__()
+        dim = args.vision_dim
+        self.n_heads = args.vision_n_heads
+        self.head_dim = dim // self.n_heads
+        self.wqkv = nn.Linear(dim, 3 * dim, bias=True)
+        self.wo = nn.Linear(dim, dim, bias=True)
+
+    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        qkv = self.wqkv(x)
+        q, k, v = qkv.chunk(3, dim=-1)
+        q = apply_rotary(q.view(-1, self.n_heads, self.head_dim), cos, sin)
+        k = apply_rotary(k.view(-1, self.n_heads, self.head_dim), cos, sin)
+        v = v.view(-1, self.n_heads, self.head_dim)
+        out = _chunked_sdpa(q, k, v)
+        return self.wo(out.reshape(x.shape[0], -1))
+
+
+def _linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None) -> torch.Tensor:
+    """One GEMM. The master weight stays on CPU; this copy dies with the op."""
+    w = weight.detach().to(device=x.device, dtype=x.dtype)
+    b = None if bias is None else bias.detach().to(device=x.device, dtype=x.dtype)
+    return F.linear(x, w, b)
+
+
+def _rms(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    w = weight.detach().to(device=x.device, dtype=torch.float32)
+    y = x.float()
+    y = y * torch.rsqrt(y.pow(2).mean(dim=-1, keepdim=True) + eps)
+    return (y * w).to(dtype=x.dtype)
+
+
+def _streaming_block(block, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    h = _rms(x, block.norm1.weight)
+    qkv = _linear(h, block.attn.wqkv.weight, block.attn.wqkv.bias)
+    q, k, v = qkv.chunk(3, dim=-1)
+    heads, head_dim = block.attn.n_heads, block.attn.head_dim
+    q = apply_rotary(q.view(-1, heads, head_dim), cos, sin)
+    k = apply_rotary(k.view(-1, heads, head_dim), cos, sin)
+    v = v.view(-1, heads, head_dim)
+    attn = _chunked_sdpa(q, k, v).reshape(x.shape[0], -1)
+    x = x + _linear(attn, block.attn.wo.weight, block.attn.wo.bias)
+    h = _rms(x, block.norm2.weight)
+    gate, up = _linear(h, block.mlp.w1.weight, None).chunk(2, dim=-1)
+    return x + _linear(F.silu(gate) * up, block.mlp.w2.weight, None)
+
+
+def _chunked_sdpa(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    # q/k/v: [seq, heads, dim]. Score one query tile so the matrix stays small.
+    scale = q.shape[-1] ** -0.5
+    pieces = []
+    k_b = k.transpose(0, 1).unsqueeze(0)
+    v_b = v.transpose(0, 1).unsqueeze(0)
+    for start in range(0, q.shape[0], _CPU_QUERY_CHUNK):
+        q_b = q[start : start + _CPU_QUERY_CHUNK].transpose(0, 1).unsqueeze(0)
+        piece = F.scaled_dot_product_attention(q_b, k_b, v_b, scale=scale)
+        pieces.append(piece.squeeze(0).transpose(0, 1))
+    return torch.cat(pieces, dim=0)
+
+
+class CpuBlock(nn.Module):
+    def __init__(self, args):
+        super().__init__()
+        self.norm1 = _rms_norm(args.vision_dim)
+        self.attn = CpuAttention(args)
+        self.norm2 = _rms_norm(args.vision_dim)
+        self.mlp = MLP(args)
+
+    def forward(self, x, cos, sin):
+        x = x + self.attn(self.norm1(x), cos, sin)
+        return x + self.mlp(self.norm2(x))
+
+
+class CpuViT(nn.Module):
+    """One fp32 tower. Parameter names match the checkpoint."""
+
+    def __init__(self, args):
+        super().__init__()
+        self.rope_dim = args.vision_dim // args.vision_n_heads // 2
+        self.rope_theta = args.vision_rope_theta
+        self.patch_embed = PatchEmbed(args)
+        self.blocks = nn.ModuleList(
+            [CpuBlock(args) for _ in range(args.vision_n_layers)]
+        )
+        self.norm = _rms_norm(args.vision_dim)
+        _as_fp32_cpu(self)
+
+    def forward(self, patches: torch.Tensor, n_h: int, n_w: int) -> torch.Tensor:
+        x = self.patch_embed(patches.float())
+        cos, sin = get_vision_cos_sin(n_h, n_w, self.rope_dim, self.rope_theta)
+        for block in self.blocks:
+            x = block(x, cos, sin)
+        return self.norm(x)
+
+    def streaming_gpu(self, patches: torch.Tensor, n_h: int, n_w: int, device: torch.device) -> torch.Tensor:
+        """Same tower, fp16 on one GPU. Weights are copied per GEMM and not kept."""
+        x = patches.to(device=device, dtype=torch.float16).flatten(1)
+        x = _linear(x, self.patch_embed.proj.weight, self.patch_embed.proj.bias)
+        cos, sin = get_vision_cos_sin(n_h, n_w, self.rope_dim, self.rope_theta)
+        cos = cos.to(device=device)
+        sin = sin.to(device=device)
+        for block in self.blocks:
+            x = _streaming_block(block, x, cos, sin)
+        return _rms(x, self.norm.weight)
+
+
+class CpuAligner(nn.Module):
+    def __init__(self, args):
+        super().__init__()
+        self.downsample_ratio = args.vision_downsample_ratio
+        in_dim = args.vision_dim * self.downsample_ratio**2
+        hidden = args.hidden_size
+        self.w1 = nn.Linear(in_dim, hidden, bias=True)
+        self.w2 = nn.Linear(hidden, hidden, bias=True)
+        _as_fp32_cpu(self)
+
+    def _project(self, x: torch.Tensor, n_h: int, n_w: int) -> torch.Tensor:
+        r = self.downsample_ratio
+        x = x.view(n_h, n_w, -1).permute(2, 0, 1)
+        x = F.pad(x, (0, -n_w % r, 0, -n_h % r))
+        return F.unfold(x.unsqueeze(0), r, stride=r).squeeze(0).transpose(0, 1)
+
+    def forward(self, x: torch.Tensor, n_h: int, n_w: int) -> torch.Tensor:
+        x = self._project(x, n_h, n_w)
+        return self.w2(F.gelu(self.w1(x)))
+
+    def streaming_gpu(self, x: torch.Tensor, n_h: int, n_w: int) -> torch.Tensor:
+        x = self._project(x, n_h, n_w)
+        hidden = F.gelu(_linear(x, self.w1.weight, self.w1.bias))
+        return _linear(hidden, self.w2.weight, self.w2.bias)
+
+
 class Aligner(nn.Module):
     def __init__(self, args):
         super().__init__()
         self.downsample_ratio = args.vision_downsample_ratio
         in_dim = args.vision_dim * self.downsample_ratio**2
-        self.w1 = nn.Linear(in_dim, args.dim)
-        self.w2 = nn.Linear(args.dim, args.dim)
+        hidden = getattr(args, "hidden_size", None)
+        if hidden is None:
+            hidden = args.dim
+        self.w1 = nn.Linear(in_dim, hidden)
+        self.w2 = nn.Linear(hidden, hidden)
 
     def forward(self, x: torch.Tensor, n_h: int, n_w: int) -> torch.Tensor:
         r = self.downsample_ratio

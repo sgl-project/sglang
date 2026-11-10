@@ -62,6 +62,15 @@ def copy_with_check(target: torch.Tensor, loaded_weight: torch.Tensor):
         target.copy_(loaded_weight)
         return
 
+    # UE8M0 bytes are stored as uint8 in some allocators and as
+    # float8_e8m0fnu in official DSV4.1-Flash shards. Same 8-bit payload.
+    if {target.dtype, loaded_weight.dtype} <= {
+        torch.uint8,
+        torch.float8_e8m0fnu,
+    }:
+        target.copy_(loaded_weight.view(target.dtype))
+        return
+
     target_rank = _dtype_rank(target.dtype)
     loaded_rank = _dtype_rank(loaded_weight.dtype)
 
@@ -107,8 +116,7 @@ class BasevLLMParameter(Parameter):
         return self._weight_loader
 
     def _assert_and_load(self, loaded_weight: torch.Tensor):
-        assert self.data.shape == loaded_weight.shape
-        self.data.copy_(loaded_weight)
+        copy_with_check(self.data, loaded_weight)
 
     def load_column_parallel_weight(self, loaded_weight: torch.Tensor):
         self._assert_and_load(loaded_weight)
@@ -164,8 +172,7 @@ class _ColumnvLLMParameter(BasevLLMParameter):
                     self.output_dim,
                     shard_size,
                 )
-                assert param_data.shape == loaded_weight.shape
-                param_data.copy_(loaded_weight)
+                copy_with_check(param_data, loaded_weight)
                 return
             else:
                 loaded_weight = loaded_weight.narrow(
@@ -220,8 +227,7 @@ class _ColumnvLLMParameter(BasevLLMParameter):
                         self.output_dim, start_idx, shard_size
                     )
 
-        assert param_data.shape == loaded_weight.shape
-        param_data.copy_(loaded_weight)
+        copy_with_check(param_data, loaded_weight)
 
     def load_qkv_weight(
         self,
@@ -268,10 +274,7 @@ class _ColumnvLLMParameter(BasevLLMParameter):
                     self.output_dim, shard_id * shard_size, shard_size
                 )
 
-        assert param_data.shape == loaded_weight.shape, (
-            f"{param_data.shape=}, {loaded_weight.shape=}"
-        )
-        param_data.copy_(loaded_weight)
+        copy_with_check(param_data, loaded_weight)
 
 
 class RowvLLMParameter(BasevLLMParameter):
@@ -313,8 +316,7 @@ class RowvLLMParameter(BasevLLMParameter):
                     shard_size,
                 )
 
-                assert param_data.shape == loaded_weight.shape
-                param_data.copy_(loaded_weight)
+                copy_with_check(param_data, loaded_weight)
 
                 return
             else:
@@ -333,8 +335,7 @@ class RowvLLMParameter(BasevLLMParameter):
         if len(loaded_weight.shape) == 0:
             loaded_weight = loaded_weight.reshape(1)
 
-        assert self.data.shape == loaded_weight.shape
-        self.data.copy_(loaded_weight)
+        copy_with_check(self.data, loaded_weight)
 
 
 class ModelWeightParameter(_ColumnvLLMParameter, RowvLLMParameter):
@@ -437,8 +438,7 @@ class PerTensorScaleParameter(BasevLLMParameter):
             loaded_weight = loaded_weight[0]
 
         param_data = param_data[shard_id]
-        assert param_data.shape == loaded_weight.shape
-        param_data.copy_(loaded_weight)
+        copy_with_check(param_data, loaded_weight)
 
 
 class PackedColumnParameter(_ColumnvLLMParameter):

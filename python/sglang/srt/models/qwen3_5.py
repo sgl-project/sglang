@@ -166,6 +166,7 @@ _QWEN3_5_MOE_TEXT_MODEL_TYPES = ("qwen3_5_moe_text", "qwen4_exp_text")
 # qwen4_exp shares these classes, but the ROCm packed path is Qwen3.5-only.
 _QWEN3_5_ROCM_PACKED_MODEL_TYPES = ("qwen3_5_text", "qwen3_5_moe_text")
 _is_xpu = is_xpu()
+_is_sm70 = _is_cuda and torch.cuda.get_device_capability() == (7, 0)
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 if _use_aiter:
     from aiter.tuned_gemm import tgemm
@@ -742,6 +743,22 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         ba.weight.data = fused[self._fused_in_proj_qkvz_width :]
         self._fused_in_proj_weight = fused
 
+    def _sm70_input_proj_weights(self):
+        from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+
+        if (
+            type(self.in_proj_qkvz) is MergedColumnParallelLinear
+            and type(self.in_proj_ba) is MergedColumnParallelLinear
+            and type(self.in_proj_qkvz.quant_method) is UnquantizedLinearMethod
+            and type(self.in_proj_ba.quant_method) is UnquantizedLinearMethod
+            and not self.in_proj_qkvz.gather_output
+            and not self.in_proj_ba.gather_output
+            and self.in_proj_qkvz.bias is None
+            and self.in_proj_ba.bias is None
+        ):
+            return self.in_proj_qkvz.weight, self.in_proj_ba.weight
+        return None, None
+
     def _finalize_fused_fp8_in_proj(self) -> bool:
         """Pack loaded Quark per-channel FP8 projections without requantizing."""
         from aiter.ops.shuffle import shuffle_weight
@@ -884,6 +901,12 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 fused_out[:, self._fused_in_proj_qkvz_width :],
             )
 
+        from sglang.kernels.ops.gemm.sm70_qwen_fusions import qkv_ba, qkv_ba_supported
+
+        qkv_weight, ba_weight = self._sm70_input_proj_weights()
+        if qkv_ba_supported(hidden_states, qkv_weight, ba_weight):
+            return qkv_ba(hidden_states, qkv_weight, ba_weight)
+
         if (
             _is_cpu
             or _is_npu
@@ -987,6 +1010,24 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         output, _ = self.out_proj(core_attn_out)
         return output
 
+    def _prepare_input_projections(self, hidden_states: torch.Tensor):
+        from sglang.kernels.ops.gemm.sm70_qwen_fusions import qkvzba, qkvzba_supported
+
+        qkv_weight, ba_weight = self._sm70_input_proj_weights()
+        if (
+            self.key_dim // self.attn_tp_size,
+            self.value_dim // self.attn_tp_size,
+            self.num_v_heads // self.attn_tp_size,
+            self.head_k_dim,
+            self.head_v_dim,
+        ) == (512, 1536, 12, 128, 128) and qkvzba_supported(
+            hidden_states, qkv_weight, ba_weight
+        ):
+            # Write the QKV, Z, B and A layouts directly. This avoids the four
+            # copies needed by the ratio-three GDN verification path.
+            return qkvzba(hidden_states, qkv_weight, ba_weight)
+        return None
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -998,81 +1039,99 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         2. Core attention (custom op)
         3. Output projection
         """
-        projected_states_qkvz, projected_states_ba = self._forward_input_proj(
-            hidden_states
-        )
-
-        if _is_xpu and get_exec().mamba.linear_attn_backend == "intel_xpu":
-            from sglang.srt.model_executor.forward_context import get_attn_backend
-
-            backend = get_attn_backend()
-            backend = getattr(backend, "linear_attn_backend", backend)
-            if backend.supports_fused_gdn(self.attn, forward_batch):
-                return self._forward_xpu(
-                    backend, projected_states_qkvz, projected_states_ba, forward_batch
-                )
-
         use_strided_prefill_z = False
-        packed_verify = False
-        if forward_batch.forward_mode.is_target_verify():
-            from sglang.srt.model_executor.forward_context import get_attn_backend
-
-            backend = get_attn_backend()
-            backend = getattr(backend, "linear_attn_backend", backend)
-            packed_verify = getattr(backend, "supports_packed_verify", False)
-        use_fused_proj_conv = (
-            _gdn_decode_fused_proj_conv
-            and (forward_batch.forward_mode.is_decode() or packed_verify)
-            and isinstance(projected_states_qkvz, torch.Tensor)
-            and isinstance(projected_states_ba, torch.Tensor)
+        # SM70: the native qkvzba projection writes the QKV, Z, B and A layouts
+        # directly for the MTP verify shapes; ordinary decode keeps the fused
+        # projection/Conv1D path.
+        prepared = (
+            self._prepare_input_projections(hidden_states)
+            if not forward_batch.forward_mode.is_decode()
+            else None
         )
-        use_fused_contiguous_unpack = (
-            self.num_v_heads // self.num_k_heads in _GDN_FUSED_QKVZBA_RATIOS
-        )
-        if use_fused_proj_conv:
-            # GDN owns indexed Conv1D state and the safe unpack/Conv boundary;
-            # it replaces these temporary B/A placeholders before recurrence.
-            mixed_qkv = (projected_states_qkvz, projected_states_ba)
-            z = None
-            b = projected_states_ba
-            a = projected_states_ba
-        elif use_fused_contiguous_unpack:
-            if _is_cpu:
-                num_k_heads_tp = self.num_k_heads // self.attn_tp_size
-                num_v_heads_tp = self.num_v_heads // self.attn_tp_size
-            else:
-                num_k_heads_tp = triton.cdiv(self.num_k_heads, self.attn_tp_size)
-                num_v_heads_tp = triton.cdiv(self.num_v_heads, self.attn_tp_size)
-            # The strided views feed only prefill GDN; DP-relabeled decode rows
-            # run the decode kernels, so pick the layout from the logical mode.
-            use_strided_prefill_z = (
-                _is_cuda
-                and forward_batch.logical_forward_mode.is_extend_without_speculative()
-            )
-            split_fn = (
-                qwen3_5_gdn_prefill_projection_views
-                if use_strided_prefill_z
-                else fused_qkvzba_split_reshape_cat_contiguous
-            )
-            mixed_qkv, z, b, a = split_fn(
-                projected_states_qkvz,
-                projected_states_ba,
-                num_k_heads_tp,
-                num_v_heads_tp,
-                self.head_k_dim,
-                self.head_v_dim,
-            )
+        use_fused_proj_conv = False
+        if prepared is not None:
+            mixed_qkv, z, b, a = prepared
         else:
-            query, key, value, z, b, a = self.fix_query_key_value_ordering(
-                projected_states_qkvz, projected_states_ba
+            projected_states_qkvz, projected_states_ba = self._forward_input_proj(
+                hidden_states
             )
-            b = b.contiguous()
-            a = a.contiguous()
 
-            query, key, value = map(
-                lambda x: x.reshape(x.shape[0], -1), (query, key, value)
+            if _is_xpu and get_exec().mamba.linear_attn_backend == "intel_xpu":
+                from sglang.srt.model_executor.forward_context import get_attn_backend
+
+                backend = get_attn_backend()
+                backend = getattr(backend, "linear_attn_backend", backend)
+                if backend.supports_fused_gdn(self.attn, forward_batch):
+                    return self._forward_xpu(
+                        backend,
+                        projected_states_qkvz,
+                        projected_states_ba,
+                        forward_batch,
+                    )
+
+            packed_verify = False
+            if forward_batch.forward_mode.is_target_verify():
+                from sglang.srt.model_executor.forward_context import get_attn_backend
+
+                backend = get_attn_backend()
+                backend = getattr(backend, "linear_attn_backend", backend)
+                packed_verify = getattr(backend, "supports_packed_verify", False)
+            use_fused_proj_conv = (
+                _gdn_decode_fused_proj_conv
+                and (forward_batch.forward_mode.is_decode() or packed_verify)
+                and isinstance(projected_states_qkvz, torch.Tensor)
+                and isinstance(projected_states_ba, torch.Tensor)
             )
-            mixed_qkv = torch.cat((query, key, value), dim=-1)
+            use_fused_contiguous_unpack = (
+                self.num_v_heads // self.num_k_heads in _GDN_FUSED_QKVZBA_RATIOS
+            )
+            if use_fused_proj_conv:
+                # GDN owns indexed Conv1D state and the safe unpack/Conv boundary;
+                # it replaces these temporary B/A placeholders before recurrence.
+                mixed_qkv = (projected_states_qkvz, projected_states_ba)
+                z = None
+                b = projected_states_ba
+                a = projected_states_ba
+            elif use_fused_contiguous_unpack:
+                if _is_cpu:
+                    num_k_heads_tp = self.num_k_heads // self.attn_tp_size
+                    num_v_heads_tp = self.num_v_heads // self.attn_tp_size
+                else:
+                    num_k_heads_tp = triton.cdiv(self.num_k_heads, self.attn_tp_size)
+                    num_v_heads_tp = triton.cdiv(self.num_v_heads, self.attn_tp_size)
+                # The sm70 TileLang GDN kernels index mixed_qkv/a/b as densely
+                # packed, so upstream's strided projection views read the wrong
+                # elements. Keep the contiguous split on Volta: the copy it does is
+                # the one the kernel would need anyway.
+                use_strided_prefill_z = (
+                    _is_cuda
+                    and not _is_sm70
+                    and forward_batch.logical_forward_mode.is_extend_without_speculative()
+                )
+                split_fn = (
+                    qwen3_5_gdn_prefill_projection_views
+                    if use_strided_prefill_z
+                    else fused_qkvzba_split_reshape_cat_contiguous
+                )
+                mixed_qkv, z, b, a = split_fn(
+                    projected_states_qkvz,
+                    projected_states_ba,
+                    num_k_heads_tp,
+                    num_v_heads_tp,
+                    self.head_k_dim,
+                    self.head_v_dim,
+                )
+            else:
+                query, key, value, z, b, a = self.fix_query_key_value_ordering(
+                    projected_states_qkvz, projected_states_ba
+                )
+                b = b.contiguous()
+                a = a.contiguous()
+
+                query, key, value = map(
+                    lambda x: x.reshape(x.shape[0], -1), (query, key, value)
+                )
+                mixed_qkv = torch.cat((query, key, value), dim=-1)
 
         attn_result = self.attn(
             forward_batch,

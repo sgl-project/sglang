@@ -1,7 +1,6 @@
-from transformers import PretrainedConfig
-
 from sglang.srt.configs.qwen3_next import Qwen3NextConfig
 from sglang.srt.configs.qwen3_vl import Qwen3VLVisionConfig
+from transformers import PretrainedConfig
 
 
 class Qwen4ExpVisionConfig(Qwen3VLVisionConfig):
@@ -16,8 +15,6 @@ class Qwen4ExpTextConfig(Qwen3NextConfig):
     model_type = "qwen4_exp_text"
     base_config_key = "text_config"
     keys_to_ignore_at_inference = ["past_key_values"]
-    # ModelConfig sizes the speculative hidden width off the DSV4 mHC name.
-    attribute_map = {"hc_mult": "hc_count"}
 
     def __init__(
         self,
@@ -30,7 +27,7 @@ class Qwen4ExpTextConfig(Qwen3NextConfig):
         heads_per_ngram=8,
         ngram_vocab_size_base=20000000,
         make_ngram_vocab_size_divisible_by=128,
-        ple_offload_embedding=False,
+        ple_offload_embedding=True,
         ple_offload_backend="pinned",
         ple_offload_dir=None,
         ple_embedding_dtype=None,
@@ -41,8 +38,9 @@ class Qwen4ExpTextConfig(Qwen3NextConfig):
     ):
         if hc_count <= 1:
             raise ValueError(f"Qwen4-Exp requires hc_count > 1, got {hc_count}.")
-        # Newer checkpoints spell rope_scaling/rope_theta as rope_parameters;
-        # Qwen3NextConfig.__init__ only reads the old names.
+        # Qwen3.5/Qwen4-Exp checkpoints may provide RoPE settings under
+        # rope_parameters. Normalize it before parent init so Qwen3Next shared
+        # config logic sees the expected rope_scaling and rope_theta fields.
         if rope_parameters is not None:
             if kwargs.get("rope_scaling") is None:
                 kwargs["rope_scaling"] = rope_parameters
@@ -60,6 +58,9 @@ class Qwen4ExpTextConfig(Qwen3NextConfig):
             self.rope_scaling = rope_parameters or {}
         self.rope_parameters = rope_parameters or self.rope_scaling
         self.hc_count = hc_count
+        # ModelConfig sizes the speculative hidden width off `hc_mult`
+        # (the DeepSeek-V4 mHC field); Qwen4-Exp spells it `hc_count`.
+        self.hc_mult = hc_count
         self.hc_lowrank = hc_lowrank
         self.layer_types = layer_types
         self.ple_layer_ids = ple_layer_ids or []
@@ -76,7 +77,9 @@ class Qwen4ExpTextConfig(Qwen3NextConfig):
         self.ple_offload_dir = ple_offload_dir
         # "float8_e4m3fn" keeps fp8 PLE tables fp8-resident; text_config-scoped.
         self.ple_embedding_dtype = ple_embedding_dtype
-        # Draft decode steps reuse the draft-extend indexer top-k (IndexShare).
+        # MTP draft decode steps reuse the draft-extend indexer selection
+        # (GLM-5.2 IndexShare); default on for Qwen4-Exp, checkpoint config
+        # or --json-model-override-args can disable it.
         self.index_share_for_mtp_iteration = index_share_for_mtp_iteration
 
     @property

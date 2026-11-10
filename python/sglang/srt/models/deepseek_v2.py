@@ -582,6 +582,12 @@ class MoEGate(nn.Module):
                 return torch.mm(hidden_states, self.weight.t(), out_dtype=torch.float32)
             return F.linear(hidden_states.float(), self.weight.float(), None)
 
+        if self.weight.dtype == torch.float16:
+            from sglang.kernels.ops.moe import sm70_moe_glue
+
+            if sm70_moe_glue.router_logits_covered(hidden_states, self.weight):
+                return sm70_moe_glue.router_logits(hidden_states, self.weight)
+
         if hidden_states.shape[0] <= self.tiny_router_gemm_max_tokens:
             logits = tiny_gemm_bf16(
                 hidden_states,
@@ -711,6 +717,9 @@ class DeepseekV2MoE(nn.Module):
         self.config = config
         self.layer_id = layer_id
         self.alt_stream = alt_stream
+        # Built at the first forward, after weight processing repacked the experts.
+        self._sm70_shared_pack = None
+        self._sm70_shared_pack_built = False
         self.routed_quant_stream = routed_quant_stream
         self.is_nextn = is_nextn
         self.is_deepseek_v4 = is_deepseek_v4
@@ -1144,6 +1153,7 @@ class DeepseekV2MoE(nn.Module):
                 and hidden_states.shape[0] > 0
                 and get_is_capture_mode()
                 and not is_in_breakable_cuda_graph()
+                and self._sm70_shared_pack_for(hidden_states) is None
             ):
                 return self.forward_normal_dual_stream(
                     hidden_states,
@@ -1360,6 +1370,36 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states += shared_output
         return final_hidden_states
 
+    def _sm70_shared_pack_for(self, hidden_states: torch.Tensor):
+        """The shared expert to fold into the SM70 GLM routed decode, if any."""
+        if not self._sm70_shared_pack_built:
+            if (
+                not _is_cuda
+                or torch.cuda.is_current_stream_capturing()
+                or not hasattr(self, "shared_experts")
+                or self._shared_expert_tp1
+                or self._enable_a2a_moe
+                or self.shared_experts.swiglu_limit != self.experts.moe_runner_config.swiglu_limit
+                or torch.cuda.get_device_capability() != (7, 0)
+            ):
+                self._sm70_shared_pack_built = not torch.cuda.is_current_stream_capturing()
+                return None
+            from sglang.srt.layers.moe.sm70_shared_expert_fold import (
+                build_shared_expert_pack,
+            )
+
+            self._sm70_shared_pack = build_shared_expert_pack(
+                self.shared_experts.gate_up_proj, self.shared_experts.down_proj
+            )
+            self._sm70_shared_pack_built = True
+        if (
+            self._sm70_shared_pack is None
+            or hidden_states.dtype != torch.float16
+            or not 1 <= hidden_states.shape[0] <= 4
+        ):
+            return None
+        return self._sm70_shared_pack
+
     def forward_normal(
         self,
         hidden_states: torch.Tensor,
@@ -1376,6 +1416,13 @@ class DeepseekV2MoE(nn.Module):
         ):
             return self.forward_cpu(hidden_states)
         defer_shared = not self.experts.moe_runner_config.inplace
+        shared_pack = (
+            None
+            if skip_shared_experts or self._fuse_shared_experts_inside_sbo
+            else self._sm70_shared_pack_for(hidden_states)
+        )
+        if shared_pack is not None:
+            defer_shared = True
         # PoC (SGLANG_DP_SHARED_EXPERT_LOCAL): shared expert is computed on the LOCAL
         # hidden in the decoder layer (before the dp gather) and added after the
         # reduce_scatterv. When set, never compute/add it here (on the global buffer).
@@ -1464,17 +1511,27 @@ class DeepseekV2MoE(nn.Module):
                 self.experts.dispatcher.register_post_combine_hook(_post_combine_hook)
             )
 
-        if pre_quant_input is not None:
-            final_hidden_states = self.experts(
-                hidden_states,
-                topk_output,
-                pre_quant_input=pre_quant_input,
+        shared_fold = None
+        if shared_pack is not None:
+            from sglang.srt.layers.moe.sm70_shared_expert_fold import (
+                fold_shared_expert,
             )
-        else:
-            final_hidden_states = self.experts(
-                hidden_states,
-                topk_output,
-            )
+
+            shared_fold = fold_shared_expert(shared_pack)
+        with shared_fold or nullcontext() as fold_slot:
+            if pre_quant_input is not None:
+                final_hidden_states = self.experts(
+                    hidden_states,
+                    topk_output,
+                    pre_quant_input=pre_quant_input,
+                )
+            else:
+                final_hidden_states = self.experts(
+                    hidden_states,
+                    topk_output,
+                )
+        # The routed decode already added the shared expert.
+        shared_folded = fold_slot is not None and fold_slot.folded
         if (
             not _is_cuda
             and not _is_musa
@@ -1486,6 +1543,7 @@ class DeepseekV2MoE(nn.Module):
 
         if (
             defer_shared
+            and not shared_folded
             and hidden_states.shape[0] > 0
             and not self._fuse_shared_experts_inside_sbo
             and not skip_shared_experts

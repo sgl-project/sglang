@@ -133,7 +133,7 @@ def bcg_dcp_extend_kv_gather(
 
 
 if _is_cuda:
-    from sglang.kernels.ops.gemm import bmm_fp8
+    from sglang.kernels.ops.gemm import bmm_fp8, sm70_rows_gemv
 
 
 def should_defer_dsa_cp_kv_gather(
@@ -699,6 +699,12 @@ class DeepseekMLAForwardMixin:
                         self.w_scale,
                         torch.bfloat16,
                     )
+            elif _is_cuda and sm70_rows_gemv.supported(
+                q_nope.transpose(0, 1), self.w_kc.transpose(1, 2)
+            ):
+                q_nope_out = sm70_rows_gemv.bmm(
+                    q_nope.transpose(0, 1), self.w_kc.transpose(1, 2)
+                )
             else:
                 q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
 
@@ -1136,13 +1142,17 @@ class DeepseekMLAForwardMixin:
                 dtype=attn_output.dtype,
                 device=attn_output.device,
             )
-            torch.bmm(
-                attn_output.transpose(0, 1),
-                self.w_vc,
-                out=attn_bmm_output.view(
-                    -1, self.num_local_heads, self.v_head_dim
-                ).transpose(0, 1),
-            )
+            out = attn_bmm_output.view(
+                -1, self.num_local_heads, self.v_head_dim
+            ).transpose(0, 1)
+            if _is_cuda and sm70_rows_gemv.supported(
+                attn_output.transpose(0, 1), self.w_vc.transpose(1, 2)
+            ):
+                sm70_rows_gemv.bmm(
+                    attn_output.transpose(0, 1), self.w_vc.transpose(1, 2), out=out
+                )
+            else:
+                torch.bmm(attn_output.transpose(0, 1), self.w_vc, out=out)
         return attn_bmm_output
 
     def _fuse_rope_for_trtllm_mla(

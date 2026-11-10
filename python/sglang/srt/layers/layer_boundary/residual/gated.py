@@ -55,6 +55,10 @@ class GatedResidualState:
     attn_combine: Callable
     ffn_combine: Callable
     attn_reads_every_row: bool = False
+    # Optional fused "attn write-back + next read's branch norm": takes
+    # (hidden_states, (residual, normed)) and returns (streams, normed) or
+    # None to fall back. The streams it returns are the FFN read's input.
+    combine_and_norm: Optional[Callable] = None
     # Produced by a stage's read and consumed by that same stage's write-back.
     normed: Optional[torch.Tensor] = None
     gate_partials: Optional[torch.Tensor] = None
@@ -73,6 +77,21 @@ class GatedResidualState:
         return self._read(self.attn_mix, residual, out_norm)
 
     def update_and_read_ffn_input(self, hidden_states, residual, out_norm=None):
+        if out_norm is not None:
+            raise NotImplementedError(
+                "a gated hyper-connection read with a separate norm; the read "
+                "normalizes the streams itself"
+            )
+        if self.combine_and_norm is not None:
+            fused = self.combine_and_norm(hidden_states, (residual, self.normed))
+            if fused is not None:
+                combined, normalized = fused
+                # The FFN read reuses the norm the fused write-back produced,
+                # so the normed streams are computed once per layer boundary.
+                mixed, (residual, self.normed, self.gate_partials) = self.ffn_mix(
+                    combined, normalized_input=normalized
+                )
+                return mixed, residual
         residual = self.apply_attn_combine(hidden_states, residual)
         return self._read(self.ffn_mix, residual, out_norm)
 

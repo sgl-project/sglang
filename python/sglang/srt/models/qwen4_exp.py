@@ -13,8 +13,6 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 from torch import nn
-
-from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
 from sglang.srt.configs.qwen4_exp import Qwen4ExpConfig, Qwen4ExpTextConfig
 from sglang.srt.distributed import tensor_model_parallel_all_reduce
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -40,6 +38,7 @@ from sglang.srt.layers.dp_attention import (
     is_allocation_symmetric,
     is_dp_attention_enabled,
 )
+from sglang.srt.layers.elementwise.sigmoid_mul import fused_sigmoid_mul
 from sglang.srt.layers.hyperconnection import (
     GatedResidual,
     GroupedGemmaRMSNorm,
@@ -89,11 +88,11 @@ from sglang.srt.models.qwen2_moe import Qwen2MoeSparseMoeBlock
 from sglang.srt.models.qwen3_5 import (
     Qwen3_5AttentionDecoderLayer,
     Qwen3_5ForCausalLM,
-    Qwen3_5GatedDeltaNet,
     Qwen3_5LinearDecoderLayer,
     _qwen3_5_is_moe,
 )
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
+from sglang.srt.mem_cache.host_hugepage import set_qwen_host_hugepage_preference
 from sglang.srt.models.qwen4_exp_ple_table import (
     allocate_ple_host_table,
     make_ple_file_prefetcher,
@@ -150,8 +149,9 @@ def _breakable_qsa_indexer(layer, hidden_states, positions, output):
 
 
 def _get_ple_forward_mode(forward_batch: ForwardBatch) -> ForwardMode:
-    if forward_batch._original_forward_mode is not None:
-        return forward_batch._original_forward_mode
+    original_mode = getattr(forward_batch, "_original_forward_mode", None)
+    if original_mode is not None:
+        return original_mode
     return forward_batch.forward_mode
 
 
@@ -297,8 +297,9 @@ def _prepare_ple_batch(
                 f"{processed_tokens=} {row_width=}"
             )
         sequence_count = processed_tokens // row_width
-        # Eager verify rows can be shorter than the row stride;
-        # ignore the synthetic one-token lengths from DP attention's verify-as-EXTEND.
+        # Eager verify can carry a valid length smaller than its fixed row
+        # stride.  Ignore the synthetic one-token lengths created when DP
+        # attention temporarily rewrites verify as EXTEND.
         lengths = (
             forward_batch.extend_seq_lens[:sequence_count].long()
             if forward_batch.forward_mode.is_target_verify()
@@ -348,7 +349,9 @@ def _prepare_ple_batch(
 
     sequence_count = lengths.shape[0]
     if use_decode_fast_path:
-        # One token per decode row: every offset is valid, no index-select needed.
+        # Decode has one real token position per row.  Retain explicit tensors for
+        # the common PLE batch contract without launching an index-select solely
+        # to prove that every token offset (zero) is below every length (one).
         valid_tokens = torch.ones(
             processed_tokens, dtype=torch.bool, device=tokens.device
         )
@@ -392,8 +395,9 @@ def _prepare_ple_batch(
     if ngram_size is not None:
         assert ngram_eos_token_id is not None
         if use_decode_fast_path:
-            # One token per decode row:
-            # this view is the padded tensor the general path would materialize.
+            # For decode, rows and tokens are one-to-one and valid_tokens is all
+            # true.  The view is exactly the tensor the fill/where/index-put chain
+            # would materialize.
             padded = tokens.unsqueeze(1)
         else:
             padded = tokens.new_full((sequence_count, row_width), ngram_eos_token_id)
@@ -494,12 +498,17 @@ def _ple_track_targets(
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
     """Destination slots and gather offsets for the extra-buffer track snapshot.
 
-    With extra_buffer the radix tree caches the ping-pong track slot,
-    not the working slot.
-    Both PLE side states are laid out [incoming_state | chunk tokens],
-    so the boundary value is the state's own gather at a smaller offset;
-    callers differ only in tensor rank, hence offsets rather than a gather.
-    Masked-off rows route to reserved slot 0, so the shape stays graph-capturable.
+    With extra_buffer it is the ping-pong track slot — not the request's working
+    slot — that `cache_{un,}finished_req` hand to the radix tree, so a side state
+    that only writes the working slot gets cached with whatever the track slot's
+    previous owner left behind.
+
+    Both PLE side states are laid out `[incoming_state | this chunk's tokens]`, so
+    the boundary value is the state's own gather at a smaller offset; callers differ
+    only in tensor rank, hence returning offsets rather than doing the gather.
+    Masked-off rows route to reserved slot 0 instead of being compacted, so there is
+    no host sync and no data-dependent shape and this stays CUDA-graph capturable.
+
     None when tracking is inactive or its metadata is absent.
     """
     if (
@@ -609,7 +618,7 @@ class Qwen4ExpPLEGroupedNorm(nn.Module):
             and x.is_cuda
             and x.dtype in (torch.bfloat16, torch.float16)
         ):
-            from sglang.kernels.ops.layernorm.grouped_gemma_rmsnorm import (
+            from sglang.srt.layers.grouped_gemma_rmsnorm import (
                 grouped_gemma_rmsnorm,
             )
 
@@ -710,12 +719,12 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                     if _ple_table_is_fp8(config, quant_config, ngram_prefix)
                     else torch.bfloat16
                 ),
-                output_dtype=torch.bfloat16,
+                output_dtype=torch.get_default_dtype(),
                 use_attn_tp_group=self.use_attn_tp_ngram,
             )
         # weight_scale stays a real device tensor.
         ngram_embedding.register_buffer(
-            "weight_scale", torch.ones(1, dtype=torch.bfloat16), persistent=True
+            "weight_scale", torch.ones(1, dtype=torch.get_default_dtype()), persistent=True
         )
         if offload_embedding:
             ngram_embedding = Qwen4ExpPinnedHostEmbedding(
@@ -944,6 +953,7 @@ def _gather_ple_embedding_from_pinned_kernel(
     tp_vocab_start,
     tp_vocab_end,
     is_fp8: tl.constexpr,
+    emit_fp16: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
     row_id = tl.program_id(0)
@@ -952,15 +962,25 @@ def _gather_ple_embedding_from_pinned_kernel(
     local_idx = tl.where(in_range, global_idx - tp_vocab_start, 0)
     offsets = tl.arange(0, BLOCK_D)
     mask = offsets < embedding_dim
+    out_dtype = tl.float16 if emit_fp16 else tl.bfloat16
     if is_fp8:
-        weight_ptr = weight_ptr.to(tl.int64).to(tl.pointer_type(tl.float8e4nv))
+        # SM70 has no native fp8 support; route the fp8 bytes through Triton's
+        # fp8e4b15 (which is a software decode = E4M3FN value * 2^-8) and undo
+        # the 8-bit bias shift to recover the E4M3FN semantics of the table.
+        weight_ptr = weight_ptr.to(tl.int64).to(tl.pointer_type(tl.float8e4b15))
+        values = tl.load(
+            weight_ptr + local_idx * embedding_dim + offsets,
+            mask=mask,
+            other=0.0,
+        ).to(out_dtype)
+        values = values * 256.0
     else:
         weight_ptr = weight_ptr.to(tl.int64).to(tl.pointer_type(tl.bfloat16))
-    values = tl.load(
-        weight_ptr + local_idx * embedding_dim + offsets,
-        mask=mask,
-        other=0.0,
-    ).to(tl.bfloat16)
+        values = tl.load(
+            weight_ptr + local_idx * embedding_dim + offsets,
+            mask=mask,
+            other=0.0,
+        ).to(out_dtype)
     tl.store(
         output_ptr + row_id * embedding_dim + offsets,
         tl.where(in_range, values, 0.0),
@@ -1044,12 +1064,17 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         for name, value in vars(source_weight).items():
             setattr(cpu_weight, name, value)
         cpu_weight.weight_loader = self.weight_loader
+        # Parameter is a new object sharing the storage. Hugepage unregister is
+        # tied to host_table, so that object has to live as long as the weight.
+        if getattr(host_table, "_sglang_hugetlb_node", None) is not None:
+            cpu_weight._sglang_hugepage_owner = host_table
         self.register_parameter("weight", cpu_weight)
         # The scale is tiny; keep it with the model instead of offloading it
         # with the table.
         self.register_buffer("weight_scale", embedding.weight_scale, persistent=True)
         del embedding.weight
         self._block_d = triton.next_power_of_2(self.embedding_dim)
+        self._emit_dtype = torch.get_default_dtype()
 
     def allocate_output(
         self, shape: Tuple[int, ...], device: torch.device
@@ -1060,8 +1085,9 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
                 get_parallel().tp_group, disabled=not is_allocation_symmetric()
             )
         with allocation_context, torch.inference_mode(False):
-            # The gather kernel emits bf16 rows regardless of the table dtype.
-            return torch.empty(shape, dtype=torch.bfloat16, device=device)
+            # The gather kernel emits rows in the model's compute dtype
+            # regardless of the table dtype.
+            return torch.empty(shape, dtype=self._emit_dtype, device=device)
 
     def gather(
         self, input_ids: torch.Tensor, out: Optional[torch.Tensor] = None
@@ -1075,9 +1101,10 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
                     f"invalid PLE prefetch output shape: {tuple(out.shape)} != "
                     f"{expected_shape}"
                 )
-            if out.dtype != torch.bfloat16 or out.device != input_ids.device:
+            if out.dtype != self._emit_dtype or out.device != input_ids.device:
                 raise ValueError(
-                    "PLE prefetch output must be bfloat16 on the id device"
+                    "PLE prefetch output must be on the id device with the "
+                    f"expected dtype ({self._emit_dtype})"
                 )
             output = out
 
@@ -1097,6 +1124,7 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
                 tp_vocab_start=self.shard_indices.org_vocab_start_index,
                 tp_vocab_end=self.shard_indices.org_vocab_end_index,
                 is_fp8=self.weight.dtype == torch.float8_e4m3fn,
+                emit_fp16=self._emit_dtype == torch.float16,
                 BLOCK_D=self._block_d,
             )
         return output
@@ -1490,7 +1518,7 @@ class Qwen4ExpPLELayer(nn.Module):
             gate = gate / math.sqrt(hidden_size)
             fused_gate_value = False
             if batch.use_decode_fast_path:
-                from sglang.kernels.ops.elementwise.qwen4_gate import (
+                from sglang.srt.layers.qwen4_ple import (
                     can_fuse_qwen4_gate_value,
                     fused_qwen4_gate_value,
                 )
@@ -1675,8 +1703,8 @@ class Qwen4ExpLayerExtensionMixin:
             ple_layer_index = {
                 abs_id: index for index, abs_id in enumerate(ple_layer_ids_sorted)
             }[layer_id + 1]
-            # Strip the block-type segment like the dense mlp (PLE is attn's sibling);
-            # else the quant prefix misses the ckpt skip-list -> NaN.
+            # PLE is a sibling of the attn block (self.ple), so strip the block-type
+            # segment like the dense mlp; else quant prefix misses ckpt skip-list → NaN.
             ple_prefix = prefix.replace(".linear_attn", "").replace(".self_attn", "")
             self.ple = Qwen4ExpPLELayer(
                 config,
@@ -1689,7 +1717,7 @@ class Qwen4ExpLayerExtensionMixin:
         hc_config = HyperConnectionConfig(
             hc_count=self.hc_count,
             hidden_size=self.hidden_size,
-            params_dtype=torch.bfloat16,
+            params_dtype=torch.get_default_dtype(),
             hc_lowrank=config.hc_lowrank,
             rms_norm_eps=config.rms_norm_eps,
             hc_per_branch_norm=True,
@@ -1983,6 +2011,10 @@ class Qwen4ExpAttentionDecoderLayer(
             get_qsa_indexer_metadata,
             resolve_qsa_sparse_backend,
         )
+        from sglang.srt.layers.attention.qsa.qsa_indexer import QSAIndexer
+        from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
+            use_sm70_qsa_dense_prefill,
+        )
 
         backend = get_attn_backend()
         sparse_backend = resolve_qsa_sparse_backend(backend)
@@ -2006,6 +2038,19 @@ class Qwen4ExpAttentionDecoderLayer(
                 if positions.ndim == 2
                 else forward_batch.positions
             )
+        should_capture = getattr(
+            sparse_backend, "should_capture_mtp_sparse_indices", None
+        )
+        capture_indices = should_capture is not None and should_capture(forward_batch)
+        if (
+            isinstance(self.indexer, QSAIndexer)
+            and not capture_indices
+            and use_sm70_qsa_dense_prefill(forward_batch, hidden_states.device)
+        ):
+            # SM70: MTP draft prefill seeds sparse selections for its next
+            # decode; it needs the indices even when this attention pass is
+            # dense.
+            indexer_kwargs["skip_prefill_selection"] = True
         topk_indices = self.indexer(
             hidden_states,
             positions,
@@ -2013,14 +2058,21 @@ class Qwen4ExpAttentionDecoderLayer(
             indexer_metadata,
             **indexer_kwargs,
         )
-        should_capture = getattr(
-            sparse_backend, "should_capture_mtp_sparse_indices", None
-        )
-        if should_capture is not None and should_capture(forward_batch):
+        if capture_indices:
             sparse_backend.capture_mtp_sparse_indices(
                 topk_indices, forward_batch, self.layer_id, metadata=indexer_metadata
             )
         return topk_indices
+
+    def _prepare_qkv_gate(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        return self.forward_prepare_native(
+            positions=positions, hidden_states=hidden_states
+        )
 
     def self_attention(
         self,
@@ -2038,8 +2090,9 @@ class Qwen4ExpAttentionDecoderLayer(
         )
         attention_kwargs = {}
         if overlap_indexer:
-            # Safe to overlap: the indexer reads only hidden_states/positions,
-            # and writes QSA-private pool buffers.
+            # The indexer chain reads only hidden_states/positions and writes
+            # QSA-private pool buffers, so it runs concurrently with the main
+            # qkv projection + norm/rope chain.
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
 
@@ -2135,6 +2188,8 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         prefix: str = "",
         is_nextn: bool = False,
     ) -> None:
+        # Before layers allocate PLE, and before the later HiCache pools.
+        set_qwen_host_hugepage_preference(True)
         super().__init__(config, quant_config, prefix, is_nextn)
         self.hc_count = config.hc_count
         self.hidden_size = config.hidden_size
@@ -2151,7 +2206,7 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         hc_config = HyperConnectionConfig(
             hc_count=self.hc_count,
             hidden_size=self.hidden_size,
-            params_dtype=torch.bfloat16,
+            params_dtype=torch.get_default_dtype(),
             hc_lowrank=config.hc_lowrank,
             rms_norm_eps=config.rms_norm_eps,
             hc_per_branch_norm=True,
@@ -2427,8 +2482,9 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
             ("qkv_proj", "v_proj", "v"),
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
-            # Checkpoints use the qwen3.5 head-first in_proj layout,
-            # matching Qwen3_5GatedDeltaNet's forward, not qwen3-next's group-first.
+            # qwen4 checkpoints are qwen3.5 format (head-first in_proj). These merge head-first
+            # into the fused in_proj_qkvz/in_proj_ba, which is correct because the linear-attn
+            # layer uses Qwen3_5GatedDeltaNet (head-first forward), not qwen3-next's group-first.
             ("in_proj_qkvz.", "in_proj_qkv.", (0, 1, 2)),
             ("in_proj_qkvz.", "in_proj_z.", 3),
             ("in_proj_ba.", "in_proj_b.", 0),
@@ -2785,17 +2841,7 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 f"{skipped_visual_count} visual weights"
             )
 
-        for module in self.modules():
-            if isinstance(module, Qwen3_5GatedDeltaNet):
-                module.finalize_fused_in_proj()
-
         return loaded_params
-
-    def precompile_kernels_after_loading(self) -> None:
-        from sglang.srt.layers.quantization.unquant import precompile_splitk_tactics
-
-        if precompile_splitk_tactics():
-            logger.info("Precompiled BF16 split-K GEMM tactics for Qwen4-Exp")
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):

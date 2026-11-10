@@ -195,8 +195,11 @@ class Glm5NextTextConfig(PretrainedConfig):
         self.gate_lower_bound = (
             gate_lower_bound if gate_lower_bound is not None else linear_lower_bound
         )
+        # Pop before PretrainedConfig validates layer_types. Its allow-list
+        # has no deepseek_sparse_attention; GLM-5.3-Flash uses that name for
+        # the 11 NoPE sparse-MLA layers. Restored after super().__init__.
+        layer_types = kwargs.pop("layer_types", None)
         if linear_attn_config is None:
-            layer_types = kwargs.get("layer_types")
             if layer_types is None:
                 kda_layers = [
                     layer_idx
@@ -237,6 +240,8 @@ class Glm5NextTextConfig(PretrainedConfig):
             tie_word_embeddings=tie_word_embeddings,
             **kwargs,
         )
+        if layer_types is not None:
+            self.layer_types = layer_types
         if rope_parameters is not None or rope_scaling is not None:
             self.rope_parameters = rope_parameters or rope_scaling
 

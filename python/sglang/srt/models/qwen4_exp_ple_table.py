@@ -5,7 +5,10 @@ Qwen3.8-Flash-Next) out of device memory and lets the Triton gather kernel read
 rows straight from a host pointer. Two backends provide that pointer:
 
 ``pinned`` (default)
-    ``torch.empty(..., pin_memory=True)``. On a discrete GPU this frees VRAM.
+    A 1 GiB hugepage mapping when ``SGLANG_QWEN_HOST_HUGETLB`` is on (the
+    default) and some NUMA node has enough free pages for the whole table.
+    Otherwise ``torch.empty(..., pin_memory=True)``. On a discrete GPU either
+    backing frees VRAM. Tables under 1 GiB stay on ordinary pinned memory.
 
 ``file``
     A file-backed, shared ``mmap`` of a sparse file under
@@ -42,6 +45,7 @@ from typing import Optional, Sequence
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.host_hugepage import try_alloc_pinned_1g_hugepage
 
 logger = logging.getLogger(__name__)
 
@@ -242,6 +246,11 @@ def allocate_ple_host_table(
             f"unknown PLE offload backend {backend!r}; choose from {PLE_OFFLOAD_BACKENDS}"
         )
     if backend == "pinned":
+        huge = try_alloc_pinned_1g_hugepage(
+            tuple(shape), dtype, purpose="PLE table"
+        )
+        if huge is not None:
+            return huge
         return torch.empty(tuple(shape), dtype=dtype, device="cpu", pin_memory=True)
 
     numel = 1

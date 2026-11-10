@@ -139,6 +139,17 @@ def enable_nextn_moe_bf16_cast_to_fp8(
     )
 
 
+def enable_nextn_moe_bf16_cast_to_nvfp4(
+    quant_config: Optional[QuantizationConfig],
+) -> bool:
+    return (
+        envs.SGLANG_NVFP4_CKPT_NVFP4_NEXTN_MOE.get()
+        and quant_config is not None
+        and quant_config.get_name() == "modelopt_fp4"
+        and quant_config.is_checkpoint_nvfp4_serialized
+    )
+
+
 def is_wint4afp8_or_wint4a16_config(
     quant_config: Optional[QuantizationConfig],
 ) -> bool:

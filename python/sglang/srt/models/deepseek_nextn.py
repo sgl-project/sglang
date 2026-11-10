@@ -43,7 +43,10 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     get_embedding_tp_kwargs,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.models.deepseek_common.utils import enable_nextn_moe_bf16_cast_to_fp8
+from sglang.srt.models.deepseek_common.utils import (
+    enable_nextn_moe_bf16_cast_to_fp8,
+    enable_nextn_moe_bf16_cast_to_nvfp4,
+)
 from sglang.srt.models.deepseek_v2 import DeepseekV2DecoderLayer, DeepseekV3ForCausalLM
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import get_model, get_parallel, get_spec
@@ -69,6 +72,14 @@ class DeepseekModelNextN(nn.Module):
             moe_quant_config_override = Fp8Config(
                 is_checkpoint_fp8_serialized=True,
                 weight_block_size=[128, 128],
+            )
+        elif enable_nextn_moe_bf16_cast_to_nvfp4(quant_config):
+            from sglang.srt.layers.quantization.nvfp4_online import (
+                make_modelopt_fp4_online_config,
+            )
+
+            moe_quant_config_override = make_modelopt_fp4_online_config(
+                quant_config.packed_modules_mapping
             )
         else:
             moe_quant_config_override = None

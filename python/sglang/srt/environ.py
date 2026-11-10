@@ -1839,6 +1839,10 @@ class Envs:
     # ===================================================================
     SGLANG_MAMBA_CONV_DTYPE = EnvStr("bfloat16")
     SGLANG_MAMBA_SSM_DTYPE = EnvStr(None)
+    # SM70 (Volta): the mamba/GDN state and conv buffers have no fp32 fast path
+    # in the TileLang kernels, so hold them in fp16 instead of bf16. Off = the
+    # dtype the model config asks for.
+    SGLANG_SM70_FORCE_FP16 = EnvBool(False)
     # Kill-switch for the fused per-slot conv clear/copy kernel (MambaPool);
     # falls back to the per-conv-type Python loop.
     SGLANG_DISABLE_FUSED_MAMBA_SLOT_OPS = EnvBool(False)

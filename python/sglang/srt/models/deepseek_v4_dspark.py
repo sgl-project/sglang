@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import copy
 import logging
+import copy
 from contextlib import nullcontext
 from typing import Iterable, List, Optional, Tuple
 
@@ -54,8 +54,9 @@ from sglang.srt.models.deepseek_v4 import (
     MqaAttentionBase,
     _apply_wo_a_bf16_matmul,
     _dequant_fp8_wo_a_streaming,
-    hc_head_torch,
-    make_hc_head_params,
+    _skip_dsv41_language_only_weight,
+    bcg_csa2_attention_with_output,
+    bcg_csa2_low_ratio_sources,
 )
 from sglang.srt.models.deepseek_v4_platform_stage import NonCudaDSparkMixin
 from sglang.srt.models.dspark import (
@@ -83,6 +84,32 @@ logger = logging.getLogger(__name__)
 
 _PAD_NUM_HEADS = 64
 
+# V4.1 shards name mtp.2.markov_head.{embed,head}; VanillaMarkov uses markov_w1/w2.
+_DSPARK_MARKOV_EMBED_ALIASES = ("embed.weight", "embed_tokens.weight")
+_DSPARK_MARKOV_HEAD_ALIASES = ("head.weight", "lm_head.weight")
+
+
+def remap_dspark_markov_head_name(rest: str) -> str:
+    """Map `mtp.<stage>.markov_head.*` rest onto runtime param names."""
+    suffix = rest[len("markov_head.") :] if rest.startswith("markov_head.") else rest
+    if suffix in _DSPARK_MARKOV_EMBED_ALIASES:
+        return "markov_head.markov_w1.weight"
+    if suffix in _DSPARK_MARKOV_HEAD_ALIASES:
+        return "markov_head.markov_w2.weight"
+    return f"markov_head.{suffix}"
+
+
+def _remap_dspark_mlp_gate_bias(mapped_rest: str) -> Optional[str]:
+    # Exact `.gate.bias` only. Substring replace mangles `.gate.bias_vl`
+    # (vision-language; skipped under --language-model-only) into
+    # `e_score_correction_bias_vl`.
+    if mapped_rest.endswith(".gate.bias_vl"):
+        return None
+    if mapped_rest.endswith(".gate.bias"):
+        return mapped_rest[: -len(".gate.bias")] + ".gate.e_score_correction_bias"
+    return mapped_rest
+
+
 _is_npu = is_npu()
 
 
@@ -100,6 +127,43 @@ def apply_rotary_emb(
     x = torch.view_as_real(x * freqs_cis).flatten(-2)
     y.copy_(x)
     return y
+
+
+def _dspark_core_attention(
+    layer,  # DSparkAttention
+    hidden_states: torch.Tensor,
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    positions: torch.Tensor,
+    forward_batch: ForwardBatch,
+    attn_backend,
+    attn_sink: torch.Tensor,
+) -> torch.Tensor:
+    """SM70: CSA2 rings (window inject + this draft chunk). Hopper: DSV4 pool."""
+    if get_platform().is_sm70:
+        q_attn = q[:, : layer.n_local_heads]
+        bcg_csa2_low_ratio_sources(
+            layer, hidden_states, hidden_states, positions, forward_batch
+        )
+        return bcg_csa2_attention_with_output(
+            q_attn,
+            kv,
+            layer.attn,
+            0,
+            attn_sink,
+            forward_batch,
+            False,
+        )
+    return attn_backend.forward(
+        q=q,
+        k=kv,
+        v=kv,
+        layer=layer.attn,
+        forward_batch=forward_batch,
+        compress_ratio=0,
+        attn_sink=attn_sink,
+        save_kv_cache=False,
+    )
 
 
 class DSparkAttention(MqaAttentionBase):
@@ -129,6 +193,11 @@ class DSparkAttention(MqaAttentionBase):
         self.window_size = int(
             getattr(config, "sliding_window", None) or config.window_size
         )
+        self.sliding_window = self.window_size
+        self.compressor = None
+        self.indexer = None
+        # Window KV comes from wkv(main_x) inject; do not commit MASK into the ring.
+        self.sm70_swa_ring_from_inject = True
 
         self.attn = RadixAttention(
             self.n_local_heads,
@@ -139,6 +208,8 @@ class DSparkAttention(MqaAttentionBase):
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
         )
+        # sm70_forward_sparse is called with this module, not DSparkAttention.
+        self.attn.sm70_swa_ring_from_inject = True
 
         self.alt_streams = alt_streams
         self._multi_stream_bs_limit = 128 if get_platform().is_blackwell else 64
@@ -192,6 +263,7 @@ class DSparkAttention(MqaAttentionBase):
         positions: torch.Tensor,
         q_out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        # V4.1: q_lora RMSNorm + wq_b + RoPE on the rope tail (no per-head RMSNorm).
         q, _ = self.wq_a(x)
         q = self.q_norm(q)
         q, _ = self.wq_b(q)
@@ -258,14 +330,14 @@ class DSparkAttention(MqaAttentionBase):
         if forward_batch.forward_mode.is_idle():
             return torch.zeros_like(hidden_states)
 
-        from sglang.srt.model_executor.forward_context import get_attn_backend
-
-        pool = _resolve_dspark_pool()
-        attn_backend = get_attn_backend()
         rd = self.rope_head_dim
-
+        sm70 = get_platform().is_sm70
+        # SM70 CSA2 re-projects KV from the drafted hidden states, so the
+        # DSV4 token pool is not needed there.
+        pool = None if sm70 else _resolve_dspark_pool()
         enable_multi_stream = (
-            self.alt_streams is not None
+            (not sm70)
+            and self.alt_streams is not None
             and get_is_capture_mode()
             and hidden_states.shape[0] <= self._multi_stream_bs_limit
         )
@@ -273,7 +345,8 @@ class DSparkAttention(MqaAttentionBase):
         q_padded: Optional[torch.Tensor] = None
         q_out: Optional[torch.Tensor] = None
         if (
-            pool.uniform_fp8
+            pool is not None
+            and pool.uniform_fp8
             and not self.q_head_norm
             and self.n_local_heads in (8, 16, 32, 64, 128)
         ):
@@ -282,17 +355,38 @@ class DSparkAttention(MqaAttentionBase):
                 dtype=torch.float8_e4m3fn,
                 device=hidden_states.device,
             )
-        elif self.n_local_heads < _PAD_NUM_HEADS:
+        # Hopper FlashMLA pads to 64 heads. SM70 CSA2 is native n_local_heads.
+        elif (not sm70) and self.n_local_heads < _PAD_NUM_HEADS:
             q_padded = hidden_states.new_empty(
                 hidden_states.shape[0], _PAD_NUM_HEADS, self.head_dim
             )
             q_out = q_padded[:, : self.n_local_heads, :]
 
-        if enable_multi_stream:
-            current_stream = torch.cuda.current_stream()
-            stream_kv = self.alt_streams[0]
-            stream_kv.wait_stream(current_stream)
-            with torch.cuda.stream(stream_kv):
+        attn_backend = None
+        if sm70:
+            # CSA2 re-projects KV from x; the DSV4 pool is unused.
+            q = self._compute_q(hidden_states, positions, q_out=q_out)
+            kv = q
+        else:
+            from sglang.srt.model_executor.forward_context import get_attn_backend
+
+            attn_backend = get_attn_backend()
+            if enable_multi_stream:
+                current_stream = torch.cuda.current_stream()
+                stream_kv = self.alt_streams[0]
+                stream_kv.wait_stream(current_stream)
+                with torch.cuda.stream(stream_kv):
+                    kv = self.kv_proj_only(hidden_states)
+                    self._store_block_kv(
+                        kv=kv,
+                        positions=positions,
+                        forward_batch=forward_batch,
+                        attn_backend=attn_backend,
+                        pool=pool,
+                    )
+                q = self._compute_q(hidden_states, positions, q_out=q_out)
+                current_stream.wait_stream(stream_kv)
+            else:
                 kv = self.kv_proj_only(hidden_states)
                 self._store_block_kv(
                     kv=kv,
@@ -301,32 +395,23 @@ class DSparkAttention(MqaAttentionBase):
                     attn_backend=attn_backend,
                     pool=pool,
                 )
-            q = self._compute_q(hidden_states, positions, q_out=q_out)
-            current_stream.wait_stream(stream_kv)
-        else:
-            kv = self.kv_proj_only(hidden_states)
-            self._store_block_kv(
-                kv=kv,
-                positions=positions,
-                forward_batch=forward_batch,
-                attn_backend=attn_backend,
-                pool=pool,
-            )
-            q = self._compute_q(hidden_states, positions, q_out=q_out)
+                q = self._compute_q(hidden_states, positions, q_out=q_out)
 
         if q_padded is not None:
             q = q_padded
-        attn_sink = self._local_attn_sink()
+        attn_sink = self._local_attn_sink(
+            kernel_num_heads=self.n_local_heads if sm70 else None
+        )
 
-        o = attn_backend.forward(
-            q=q,
-            k=kv,
-            v=kv,
-            layer=self.attn,
-            forward_batch=forward_batch,
-            compress_ratio=0,
-            attn_sink=attn_sink,
-            save_kv_cache=False,
+        o = _dspark_core_attention(
+            self,
+            hidden_states,
+            q,
+            kv,
+            positions,
+            forward_batch,
+            attn_backend,
+            attn_sink,
         )
 
         if o.shape[1] != self.n_local_heads:
@@ -408,7 +493,6 @@ class DSparkV4MarkovHead(BaseDSparkMarkovHead):
         super().__init__()
         self.vocab_size = int(vocab_size)
         self.markov_rank = int(markov_rank)
-        self._is_dsv41 = bool(is_dsv41)
         if self.markov_rank <= 0:
             raise ValueError(
                 f"DSparkV4MarkovHead requires markov_rank > 0, got {self.markov_rank}."
@@ -416,7 +500,14 @@ class DSparkV4MarkovHead(BaseDSparkMarkovHead):
         self.markov_w1 = VocabParallelEmbedding(
             self.vocab_size, self.markov_rank, enable_tp=False
         )
-        self._opt_markov_w2_bf16 = envs.SGLANG_DSPARK_OPT_MARKOV_W2_BF16.get()
+        opt_bf16 = bool(envs.SGLANG_DSPARK_OPT_MARKOV_W2_BF16.get())
+        if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 7:
+            if opt_bf16:
+                logger.warning(
+                    "SM70 has no BF16; SGLANG_DSPARK_OPT_MARKOV_W2_BF16 forced off"
+                )
+            opt_bf16 = False
+        self._opt_markov_w2_bf16 = opt_bf16
         self._opt_markov_w2_tp_shard = envs.SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD.get()
         markov_w2_dtype = torch.bfloat16 if self._opt_markov_w2_bf16 else torch.float32
         self.markov_w2 = nn.Linear(
@@ -582,11 +673,9 @@ class DSparkV4StageMixin:
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         alt_streams: Optional[List[torch.cuda.Stream]] = None,
-        hc_stats_stream: Optional[torch.cuda.Stream] = None,
-        moe_routed_quant_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         super().__init__(
-            config=_dspark_stage_config(config),
+            config=config,
             layer_id=layer_id,
             quant_config=quant_config,
             prefix=prefix,
@@ -594,8 +683,6 @@ class DSparkV4StageMixin:
             boundary_pre_from_prev=config.hc_pre_from_prev_sublayer,
             boundary_mhc_fusions=False,
             alt_streams=alt_streams,
-            hc_stats_stream=hc_stats_stream,
-            moe_routed_quant_stream=moe_routed_quant_stream,
         )
         self.stage_id = stage_id
         self.dim = config.hidden_size
@@ -616,16 +703,6 @@ class DSparkV4StageMixin:
 
         if stage_id == num_stages - 1:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-            if self.hc_pre_from_prev_sublayer:
-                # V4.1 collapses the head with the last FFN's pre-mix; the
-                # checkpoint carries no hc_head_* tensors for the stages.
-                self.hc_head_fn = self.hc_head_base = self.hc_head_scale = None
-            else:
-                (
-                    self.hc_head_fn,
-                    self.hc_head_base,
-                    self.hc_head_scale,
-                ) = make_hc_head_params(config.hc_mult, config.hidden_size)
 
     def _build_self_attn(
         self,
@@ -697,7 +774,6 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                 "NPU DSpark ModelSlim weight loading does not support mapping "
                 "shared experts into fused expert slots."
             )
-
         return DeepseekV4ForCausalLM.shared_experts_fusion_disable_reason(
             hf_config, quant_config
         )
@@ -793,7 +869,6 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         self.markov_head = DSparkV4MarkovHead(
             vocab_size=int(config.vocab_size),
             markov_rank=int(dspark_config.markov_rank),
-            is_dsv41=getattr(config, "model_type", None) == "deepseek_v41",
         )
         self.confidence_head = build_dspark_v4_confidence_head(
             config=config, markov_rank=int(dspark_config.markov_rank)
@@ -801,9 +876,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         self.hc_mult = int(config.hc_mult)
         self.norm_eps = float(config.rms_norm_eps)
         self.hc_eps = float(config.hc_eps)
-        self.hc_pre_from_prev_sublayer = bool(
-            getattr(config, "hc_pre_from_prev_sublayer", False)
-        )
+        self._last_ffn_pre: Optional[torch.Tensor] = None
 
         if self.uses_own_vocab_modules:
             self.embed_tokens = VocabParallelEmbedding(
@@ -850,9 +923,16 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         swa_loc: torch.Tensor,
         positions: torch.Tensor,
         pool: DeepSeekV4TokenToKVPool,
+        attn_backend=None,
     ) -> None:
         kvs = self.project_commit_kv(main_hidden=main_hidden, pool=pool)
-        self.store_commit_kv(kvs=kvs, swa_loc=swa_loc, positions=positions, pool=pool)
+        self.store_commit_kv(
+            kvs=kvs,
+            swa_loc=swa_loc,
+            positions=positions,
+            pool=pool,
+            attn_backend=attn_backend,
+        )
 
     def project_commit_kv(
         self, *, main_hidden: torch.Tensor, pool: DeepSeekV4TokenToKVPool
@@ -868,6 +948,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                 get_platform().is_blackwell
                 and not is_unified_kv_triton()
                 and not pool.uniform_fp8
+                and not get_platform().is_sm70
             ),
         )
 
@@ -878,7 +959,30 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         swa_loc: torch.Tensor,
         positions: torch.Tensor,
         pool: DeepSeekV4TokenToKVPool,
+        attn_backend=None,
     ) -> None:
+        if get_platform().is_sm70:
+            # CSA2 seeds its swa ring from the draft's re-projected KV instead
+            # of the fused norm+rope store below.
+            if attn_backend is None:
+                raise RuntimeError(
+                    "SM70 DSpark write_target_hidden_kv needs the draft attn "
+                    "backend so CSA2 swa_ring can be seeded from main_x"
+                )
+            from sglang.srt.layers.attention.dsv4.sm70_csa2 import (
+                pack_swa_window_from_kv,
+            )
+
+            committed = swa_loc >= 0
+            for stage, kv in zip(self.stages, kvs):
+                pack_swa_window_from_kv(
+                    attn_backend,
+                    stage.self_attn,
+                    kv,
+                    positions,
+                    mask=committed,
+                )
+            return
         swa_loc = swa_loc.to(torch.int32)
         # Under unified_kv the swa_kv_pool is None; the caller passes a unified
         # ring loc (state_slot * ring + pos % ring, -1 for uncommitted) so the
@@ -963,18 +1067,15 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         return LogitsProcessorOutput(next_token_logits=None, hidden_states=x)
 
     def collapse_hc_head(self, x: torch.Tensor) -> torch.Tensor:
-        if self.hc_pre_from_prev_sublayer:
-            assert x.dim() == 2, "V4.1 draft hidden states leave forward() collapsed"
+        """Collapse HC copies with the last FFN pre-mix (official ``forward_head``)."""
+        if x.ndim == 2:
             return x
-        last = self.stages[-1]
-        return hc_head_torch(
-            x,
-            last.hc_head_fn,
-            last.hc_head_scale,
-            last.hc_head_base,
-            norm_eps=self.norm_eps,
-            hc_eps=self.hc_eps,
-        )
+        pre = self._last_ffn_pre
+        if pre is None:
+            return x[:, 0, :].contiguous()
+        if pre.shape[0] != x.shape[0]:
+            pre = pre[: x.shape[0]]
+        return torch.sum(pre.to(dtype=x.dtype).unsqueeze(-1) * x, dim=1)
 
     def compute_base_logits(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         x_post_hc = self.collapse_hc_head(x)
@@ -1011,9 +1112,42 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             markov_head=self.markov_head,
         )
 
+    def checkpoint_tensor_reader(self):
+        """The draft checkpoint lives in ``mtp.*`` of the target files.
+
+        Do not consult the target's expert-location metadata: it describes 384
+        experts and may still be installed in this process.
+        """
+        from sglang.srt.model_loader.dsv4_checkpoint_read import (
+            make_dsv4_checkpoint_reader,
+        )
+
+        reader = make_dsv4_checkpoint_reader(
+            n_routed_experts=int(self.config.n_routed_experts),
+            mtp_only=True,
+            narrow_engram=False,
+            use_expert_location_metadata=False,
+        )
+        self._checkpoint_reader = reader
+        return reader
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:
         params_dict = dict(self.named_parameters())
         loaded_params = set()
+
+        n_routed = int(self.config.n_routed_experts)
+        expected = getattr(self.config, "dspark_n_routed_experts", None)
+        if expected is not None and n_routed != int(expected):
+            raise ValueError(
+                "DSpark draft MoE n_routed_experts="
+                f"{n_routed} != dspark_n_routed_experts={expected}. "
+                "The draft hf config must be rewritten to 128 before construct."
+            )
+        if n_routed == 384:
+            raise ValueError(
+                "DSpark draft still has n_routed_experts=384; mtp.* is 128 experts. "
+                "Refusing to allocate a 384-expert × 3-stage MoE."
+            )
 
         weights = _dequant_fp8_wo_a_streaming(weights)
         n_routed_experts = _dspark_stage_config(self.config).n_routed_experts
@@ -1125,6 +1259,8 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             )
 
     def _remap_dspark_weight_name(self, name: str) -> Optional[str]:
+        if _skip_dsv41_language_only_weight(name):
+            return None
         if name.startswith(("embed.", "embed_tokens.", "head.", "lm_head.")):
             return None
         if "rotary_emb.inv_freq" in name:
@@ -1138,9 +1274,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         stage_id, rest = parts[1], parts[2]
 
         if rest.startswith("markov_head."):
-            rest = rest.replace("markov_head.embed.", "markov_head.markov_w1.", 1)
-            rest = rest.replace("markov_head.head.", "markov_head.markov_w2.", 1)
-            return f"markov_head.{rest[len('markov_head.') :]}"
+            return remap_dspark_markov_head_name(rest)
 
         if rest.startswith("confidence_head."):
             if self.confidence_head is None:
@@ -1156,11 +1290,12 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         mapped_rest = mapped_rest.replace(".w2.", ".down_proj.")
         mapped_rest = mapped_rest.replace(".w3.", ".up_proj.")
         mapped_rest = mapped_rest.replace(".gate.tid2eid", ".topk.tid2eid")
-        if mapped_rest.endswith(".gate.bias_vl"):
+        mapped_rest = _remap_dspark_mlp_gate_bias(mapped_rest)
+        if mapped_rest is None:
             return None
-        mapped_rest = mapped_rest.replace(".gate.bias", ".gate.e_score_correction_bias")
         mapped_rest = mapped_rest.replace(".scale", ".weight_scale_inv")
         return f"stages.{stage_id}.{mapped_rest}"
 
 
 EntryClass = [DeepseekV4ForCausalLMDSpark]
+

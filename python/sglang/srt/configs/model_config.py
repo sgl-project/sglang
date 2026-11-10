@@ -449,6 +449,7 @@ def is_deepseek_v4(config) -> bool:
         "DeepseekV4ForCausalLM",
         "DeepseekV4ForCausalLMNextN",
         "DeepseekV4ForCausalLMDSpark",
+        "DeepseekV41ForCausalLM",
     )
 
 
@@ -852,7 +853,10 @@ class ModelConfig:
         routed_experts_quant_method = quantization_config.get(
             "routed_experts_quant_method"
         )
-        self.is_fp4_experts: bool = routed_experts_quant_method == "mxfp4"
+        expert_dtype_fp4 = quantization_config.get("expert_dtype") in ("fp4", "mxfp4")
+        self.is_fp4_experts: bool = (
+            routed_experts_quant_method == "mxfp4" or expert_dtype_fp4
+        )
         if self.is_fp4_experts:
             logger.info("Detected mixed checkpoint layout: routed experts are MXFP4.")
 
@@ -866,7 +870,13 @@ class ModelConfig:
             logger.info("Detected MiMo-V2 mxfp4 routed-expert layout.")
 
         # DSV4 mxfp4 layout applies only when the ckpt does not opt in above.
-        if is_deepseek_v4(self.hf_config) and routed_experts_quant_method is None:
+        # Official V4.1-Flash uses expert_dtype=fp4, not routed_experts_quant_method;
+        # do not let shard-header probing overwrite that.
+        if (
+            is_deepseek_v4(self.hf_config)
+            and routed_experts_quant_method is None
+            and not expert_dtype_fp4
+        ):
             self.is_fp4_experts = envs.SGLANG_DSV4_FP4_EXPERTS.get()
             if (
                 not envs.SGLANG_DSV4_FP4_EXPERTS.is_set()
@@ -884,16 +894,23 @@ class ModelConfig:
             if envs.SGLANG_DSV4_FP4_DEQUANT.get():
                 envs.SGLANG_DSV4_FP4_DEQUANT.set(self.is_fp4_experts is not None)
 
-            # HF config.json inherits topk_group=4 from the V3 template, but
-            # DSV4 trains with no group limiting (sqrtsoftplus + full-expert
-            # top-k). Force topk_group == n_group so deepseek_v2.py:531's
-            # `n_group > topk_group` evaluates False and routes to the
-            # ungrouped sqrtsoftplus path. The grouped impl only supports
-            # sigmoid scoring (topk.py:722) and would silently corrupt expert
-            # weights if hit.
+        # HF config.json inherits topk_group=4 from the V3 template, but
+        # DSV4 trains with no group limiting (sqrtsoftplus + full-expert
+        # top-k). Force topk_group == n_group so deepseek_v2.py:531's
+        # `n_group > topk_group` evaluates False and routes to the
+        # ungrouped sqrtsoftplus path. The grouped impl only supports
+        # sigmoid scoring (topk.py:722) and would silently corrupt expert
+        # weights if hit. Runs for official V4.1-Flash too (expert_dtype=fp4).
+        if is_deepseek_v4(self.hf_config):
             n_group = getattr(self.hf_config, "n_group", None)
             if n_group is not None:
                 self.hf_config.topk_group = n_group
+            logger.info(
+                "DSV4 routing: n_group=%s topk_group=%s scoring_func=%s",
+                getattr(self.hf_config, "n_group", None),
+                getattr(self.hf_config, "topk_group", None),
+                getattr(self.hf_config, "scoring_func", None),
+            )
 
         # Handle hybrid NVFP4 moe (nvidia/DeepSeek-V4-Pro-NVFP4)
         self.nvfp4_moe_meta: Optional[dict] = None
@@ -939,7 +956,7 @@ class ModelConfig:
         )
         has_dsv41_vision = (
             self.hf_config.model_type == "deepseek_v41"
-            and self.hf_config.vision_n_layers > 0
+            and getattr(self.hf_config, "vision_n_layers", 0) > 0
         )
         self.is_multimodal = (
             enable_multimodal
@@ -1000,6 +1017,7 @@ class ModelConfig:
             self.hf_config.architectures
         )
         self.use_ngram_embedding = getattr(self.hf_config, "use_ngram_embedding", False)
+        self.engram_ngram_size = engram_ngram_size(self.hf_config)
         self.ngram_embedding_n = (
             self.hf_config.ngram_embedding_n if self.use_ngram_embedding else 0
         )
@@ -1195,6 +1213,36 @@ class ModelConfig:
                     "Draft checkpoint bundles a DSpark head; loading draft arch "
                     "DeepseekV4ForCausalLMDSpark."
                 )
+                n_dspark = getattr(
+                    self.hf_text_config, "dspark_n_routed_experts", None
+                )
+                topk = getattr(
+                    self.hf_text_config, "dspark_num_experts_per_tok", None
+                )
+                if n_dspark is None:
+                    raise ValueError(
+                        "DSpark draft checkpoint is missing dspark_n_routed_experts; "
+                        "refusing to build a 384-expert target MoE as the drafter."
+                    )
+                n_dspark = int(n_dspark)
+                old_n = getattr(self.hf_text_config, "n_routed_experts", None)
+                self.hf_config.n_routed_experts = n_dspark
+                self.hf_text_config.n_routed_experts = n_dspark
+                if topk is not None:
+                    topk = int(topk)
+                    self.hf_config.num_experts_per_tok = topk
+                    self.hf_text_config.num_experts_per_tok = topk
+                logger.info(
+                    "DSpark draft n_routed_experts %s -> %s, num_experts_per_tok %s",
+                    old_n,
+                    n_dspark,
+                    getattr(self.hf_text_config, "num_experts_per_tok", None),
+                )
+                if n_dspark != 128:
+                    raise ValueError(
+                        "DSpark mtp.* expert count must be 128 on this V100 path, "
+                        f"got dspark_n_routed_experts={n_dspark}."
+                    )
             else:
                 self.hf_config.architectures[0] = "DeepseekV4ForCausalLMNextN"
                 self.hf_config.num_nextn_predict_layers = 1
@@ -3067,3 +3115,9 @@ def get_hybrid_layer_ids(
         swa_attention_layer_ids = None
         full_attention_layer_ids = None
     return swa_attention_layer_ids, full_attention_layer_ids
+
+
+def engram_ngram_size(hf_config) -> int:
+    if getattr(hf_config, "engram_layer_ids", ()):
+        return hf_config.engram_max_ngram_size
+    return 0

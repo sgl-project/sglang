@@ -6,7 +6,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sglang.kernels.ops.gemm.hc_mix import fused_hc_mix, fused_hc_mix_supported
+from sglang.kernels.ops.gemm.hc_mix import (
+    fused_hc_mix,
+    fused_hc_mix_supported,
+    sm70_hc_down_gemv_silu,
+    sm70_hc_down_gemv_silu_supported,
+    sm70_hc_up_gemv_reduce,
+)
 from sglang.srt.layers.hc_mix_flydsl import (
     flydsl_hc_mix_supported,
     flydsl_hc_mix_weights_supported,
@@ -59,7 +65,7 @@ class GroupedGemmaRMSNorm(nn.Module):
             and x.is_cuda
             and x.dtype in (torch.bfloat16, torch.float16)
         ):
-            from sglang.kernels.ops.layernorm.grouped_gemma_rmsnorm import (
+            from sglang.srt.layers.grouped_gemma_rmsnorm import (
                 grouped_gemma_rmsnorm,
             )
 
@@ -158,10 +164,14 @@ class GatedResidual(HyperConnectionBase):
                 bias=False,
                 dtype=config.params_dtype,
             )
+            from sglang.srt.environ import envs
+
             lowrank = self.config.hc_lowrank
             self._jit_mix_ok = (
-                torch.cuda.is_available()
-                # The CuTe split-K pair is tcgen05 (sm_100 family) only.
+                envs.SGLANG_HC_MIX_CUDA.get()
+                and torch.cuda.is_available()
+                # The CuTe split-K pair is tcgen05 (sm_100 family) only; the
+                # default-on env must not route Hopper/Ada to it.
                 and torch.cuda.get_device_capability()[0] == 10
                 and (self.hc_count * self.hidden_size) % 2048 == 0
                 and self.hidden_size % 8 == 0
@@ -175,6 +185,9 @@ class GatedResidual(HyperConnectionBase):
             self._mix_flydsl_weight_key = None
 
         self._gate_stream = None
+        self._split_combine_ok = False
+        # SM70: (normed, gate partials) from the last mix, for its combine.
+        self._pending_gate = None
         if use_combine:
             self.block_inject_weight = nn.Linear(
                 self.hidden_size * self.hc_count,
@@ -182,14 +195,19 @@ class GatedResidual(HyperConnectionBase):
                 bias=False,
                 dtype=config.params_dtype,
             )
-            # hc_combine rejects other shapes; device and dtype are checked per call.
+            # The JIT combine kernel requires hidden_size % 8 == 0 and
+            # hc_count * hidden_size % 2048 == 0; this is init-static, so
+            # resolve it once here (device/dtype stay per-call).
             self._jit_combine_ok = (
                 self.hidden_size % 8 == 0
                 and (self.hc_count * self.hidden_size) % 2048 == 0
             )
+            from sglang.srt.environ import envs
+
             vecs = self.hc_count * self.hidden_size // 8
             self._split_combine_ok = (
-                self._jit_combine_ok
+                envs.SGLANG_HC_COMBINE_SPLIT.get()
+                and self._jit_combine_ok
                 and vecs % (8 * 160) == 0
                 and (self.hidden_size // 8) % (vecs // 8) == 0
             )
@@ -261,6 +279,7 @@ class GatedResidual(HyperConnectionBase):
             mixed_input = hyper_input.new_empty(
                 (*hyper_input.shape[:-1], self.hidden_size), dtype=self.params_dtype
             )
+            self._pending_gate = None
             return mixed_input, (hyper_input, hyper_input, None)
 
         if normalized_input is not None:
@@ -273,7 +292,39 @@ class GatedResidual(HyperConnectionBase):
             hyper_input_normed = self.hc_norm(
                 hyper_input.unflatten(-1, (self.hc_count, self.hidden_size))
             ).flatten(-2)
-        if (
+        gate_partials = None
+        if sm70_hc_down_gemv_silu_supported(
+            hyper_input_normed,
+            self.input_mix_weight_down.weight,
+            self.input_mix_weight_up.weight,
+        ):
+            from sglang.kernels.ops.elementwise.sm70_hc_mix import (
+                gate_supported,
+                hc_down_with_gate,
+            )
+
+            if self._split_combine_ok and gate_supported(
+                hyper_input_normed, self.block_inject_weight.weight
+            ):
+                activated_mix_weight_down_out, gate_partials = hc_down_with_gate(
+                    hyper_input_normed,
+                    self.input_mix_weight_down.weight,
+                    self.block_inject_weight.weight,
+                )
+            else:
+                activated_mix_weight_down_out = sm70_hc_down_gemv_silu(
+                    hyper_input_normed,
+                    self.input_mix_weight_down.weight,
+                    self.hc_count,
+                )
+            mixed_input = sm70_hc_up_gemv_reduce(
+                activated_mix_weight_down_out,
+                hyper_input_normed,
+                self.input_mix_weight_up.weight,
+                self.hc_count,
+                self.hidden_size,
+            ).to(self.params_dtype)
+        elif (
             self._jit_mix_ok
             and hyper_input_normed.is_cuda
             and hyper_input_normed.dtype in (torch.bfloat16, torch.float16)
@@ -343,6 +394,13 @@ class GatedResidual(HyperConnectionBase):
                     hyper_input_normed, self.block_inject_weight.weight
                 )
             hyper_input_normed.record_stream(stream)
+        # SM70: the down-GEMV may have produced the combine's gate as a
+        # byproduct. GatedResidualState carries only (residual, normed) from a
+        # read to its write-back, so the gate partials wait here, keyed by
+        # that normed.
+        self._pending_gate = (
+            None if gate_partials is None else (hyper_input_normed, gate_partials)
+        )
         return mixed_input, (hyper_input, hyper_input_normed, partials)
 
     def combine_and_normalize(
@@ -356,7 +414,7 @@ class GatedResidual(HyperConnectionBase):
         The BF16 combine result is retained before calculating the next norm.
         Callers must only pass the norm when no PLE or other update intervenes.
         """
-        hyper_input, _, partials = residuals
+        hyper_input, hyper_input_normed, partials = residuals
         if (
             partials is not None
             and next_norm is not None
@@ -378,7 +436,45 @@ class GatedResidual(HyperConnectionBase):
                 next_norm.weight,
                 next_norm.variance_epsilon,
             )
+        # SM70: one fused kernel for the write-back and the next read's branch
+        # norm; a shape it cannot take falls back to the generic path below.
+        fused = self.combine_and_norm(
+            block_output, (hyper_input, hyper_input_normed), next_norm
+        )
+        if fused is not None:
+            return fused
         return self.combine(block_output, residuals), None
+
+    def combine_and_norm(self, block_output, residuals, next_norm):
+        """Fuse combine() with the branch norm the next stage's read wants.
+
+        Returns (combined_streams, normed_streams) or None when the fused
+        kernel cannot take this shape; the caller then runs the split path.
+        The stashed gate partials are consumed here when they match, exactly
+        as combine() would consume them.
+        """
+        from sglang.kernels.ops.layernorm.sm70_hc_combine_norm import (
+            combine_norm,
+            supported,
+        )
+
+        pending, self._pending_gate = self._pending_gate, None
+        hyper_input, hyper_input_normed = residuals
+        gate = (
+            pending[1]
+            if pending is not None and pending[0] is hyper_input_normed
+            else None
+        )
+        ok = supported(
+            self, block_output, (hyper_input, hyper_input_normed), next_norm, gate
+        )
+        if not ok:
+            # Leave the side channel as it was found so combine() can use it.
+            self._pending_gate = pending
+            return None
+        return combine_norm(
+            self, block_output, (hyper_input, hyper_input_normed), next_norm, gate
+        )
 
     def combine(
         self,
@@ -395,6 +491,13 @@ class GatedResidual(HyperConnectionBase):
             current.wait_stream(self._gate_stream)
             partials.record_stream(current)
             return hc_combine_apply(block_output, hyper_input, partials)
+        pending, self._pending_gate = self._pending_gate, None
+        # A normed sliced or swapped since the mix falls through to the
+        # general path, which recomputes the gate from it.
+        if pending is not None and pending[0] is hyper_input_normed:
+            from sglang.kernels.ops.elementwise.sm70_hc_mix import hc_apply_gate
+
+            return hc_apply_gate(block_output, hyper_input, pending[1])
         assert hyper_input.shape[-1] == self.hc_count * self.hidden_size
         assert block_output.shape[-1] == self.hidden_size
         if block_output.shape[0] == 0:
@@ -409,7 +512,7 @@ class GatedResidual(HyperConnectionBase):
             and self.block_inject_weight.weight.dtype == block_output.dtype
         ):
             if self._split_combine_ok and block_output.shape[0] <= 32:
-                from sglang.kernels.ops.elementwise.hc_combine import (
+                from sglang.srt.layers.elementwise.hc_combine import (
                     hc_combine_split,
                 )
 
@@ -421,7 +524,7 @@ class GatedResidual(HyperConnectionBase):
                     self.hc_count,
                     self.hidden_size,
                 )
-            from sglang.kernels.ops.elementwise.hc_combine import hc_combine
+            from sglang.srt.layers.elementwise.hc_combine import hc_combine
 
             return hc_combine(
                 block_output,
