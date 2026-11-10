@@ -5,7 +5,10 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from fastapi.responses import ORJSONResponse
+
 from sglang.srt.entrypoints.grpc_bridge import RuntimeHandle
+from sglang.srt.entrypoints.openai.protocol import ErrorResponse
 from sglang.srt.managers.tokenizer_manager import ServerStatus, TokenizerManager
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -113,6 +116,89 @@ class TestNativeGrpcParallelResponses(CustomTestCase):
             [[1], [2], [3]],
         )
         self.assertEqual([call[1] for call in callback.calls], [False, False, True])
+
+
+class _KwargsRecordingCallback:
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, payload, **kwargs):
+        self.calls.append((payload, kwargs))
+        return _ChunkStatus.Ready
+
+
+class _ErrorResponseServing:
+    """OpenAI serving whose handle_request rejects the request, as it does for
+    a stream aborted before its first chunk (e.g. queue full)."""
+
+    def __init__(self, enveloped=False):
+        self.enveloped = enveloped
+
+    async def handle_request(self, request, raw_request):
+        error = ErrorResponse(
+            object="error",
+            message="The request queue is full.",
+            type="503",
+            code=503,
+        ).model_dump()
+        if self.enveloped:
+            error = {"error": error}
+        return ORJSONResponse(content=error, status_code=503)
+
+
+def _make_openai_runtime_handle(enveloped=False):
+    handle = RuntimeHandle.__new__(RuntimeHandle)
+    handle._openai_serving_classes = {"chat": _ErrorResponseServing(enveloped)}
+    handle._get_openai_request_class = lambda serving_key: (
+        lambda **fields: SimpleNamespace(**fields)
+    )
+    return handle
+
+
+class TestOpenAIGrpcErrorResponses(CustomTestCase):
+    def _run(self, stream, enveloped=False):
+        callback = _KwargsRecordingCallback()
+        handle = _make_openai_runtime_handle(enveloped)
+        asyncio.run(
+            handle._run_openai_request(
+                "chat",
+                json.dumps({"stream": stream}).encode("utf-8"),
+                callback,
+                # submit_openai_chat always runs the streaming RPC; the
+                # request body's "stream" flag picks the response shape.
+                streaming=True,
+            )
+        )
+        return callback.calls
+
+    def test_streaming_error_response_is_an_in_band_error_chunk(self):
+        """The streaming RPC drops status_code, so an error response must arrive
+        as an {"error": ...} data chunk, not as a normal final chunk."""
+        calls = self._run(stream=True)
+
+        self.assertEqual(len(calls), 2)
+        payload, kwargs = calls[0]
+        self.assertFalse(kwargs["finished"])
+        error = json.loads(payload)["error"]
+        self.assertEqual(error["message"], "The request queue is full.")
+        self.assertEqual(error["code"], 503)
+        self.assertEqual(calls[1], (b"", {"finished": True}))
+
+    def test_streaming_error_response_already_enveloped_is_not_rewrapped(self):
+        calls = self._run(stream=True, enveloped=True)
+
+        error = json.loads(calls[0][0])["error"]
+        self.assertEqual(error["message"], "The request queue is full.")
+
+    def test_non_streaming_error_response_keeps_status_code(self):
+        """stream:false on the streaming RPC still gets one final chunk with the
+        error body and status_code."""
+        calls = self._run(stream=False)
+
+        self.assertEqual(len(calls), 1)
+        payload, kwargs = calls[0]
+        self.assertEqual(kwargs, {"finished": True, "status_code": 503})
+        self.assertEqual(json.loads(payload)["code"], 503)
 
 
 class TestNativeGrpcOpenAIResponses(CustomTestCase):

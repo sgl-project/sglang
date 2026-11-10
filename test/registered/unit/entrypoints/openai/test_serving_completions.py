@@ -15,6 +15,7 @@ from typing import Optional
 from unittest.mock import AsyncMock, Mock
 
 from fastapi import Request
+from fastapi.responses import StreamingResponse
 
 from sglang.srt.entrypoints.openai.protocol import CompletionRequest
 from sglang.srt.entrypoints.openai.serving_completions import OpenAIServingCompletion
@@ -253,13 +254,29 @@ class ServingCompletionTestCase(unittest.TestCase):
         self.assertEqual(response.choices[0].prompt_token_ids, [1, 2])
 
     def test_streaming_abort_yields_error(self):
-        """Test that an abort finish reason during streaming correctly yields an error and stops."""
+        """Test that an abort finish reason after streaming has started yields an
+        in-band error and stops."""
         err_msg = "Aborted by scheduler"
         err_code = HTTPStatus.INTERNAL_SERVER_ERROR
 
         async def _mock_generate_abort(*args, **kwargs):
+            # A normal chunk first, so HTTP 200 is committed before the abort.
             yield {
-                "text": "Partial ",
+                "text": "Hello",
+                "meta_info": {
+                    "id": "cmpl-test",
+                    "prompt_tokens": 10,
+                    "completion_tokens": 1,
+                    "cached_tokens": 0,
+                    "finish_reason": None,
+                    "output_token_logprobs": [],
+                    "output_token_logprobs_length": 0,
+                    "output_top_logprobs": [],
+                },
+                "index": 0,
+            }
+            yield {
+                "text": "Hello partial ",
                 "meta_info": {
                     "id": "cmpl-test",
                     "prompt_tokens": 10,
@@ -303,22 +320,79 @@ class ServingCompletionTestCase(unittest.TestCase):
         loop = get_or_create_event_loop()
         chunks = loop.run_until_complete(run_stream())
 
-        error_chunk_data = None
-        for c in chunks:
-            if "error" in c:
-                error_chunk_data = json.loads(c[len("data: ") :])
-                break
-        self.assertIsNotNone(error_chunk_data, "Error chunk not found in stream")
+        error_idx = next((i for i, c in enumerate(chunks) if "error" in c), None)
+        self.assertIsNotNone(error_idx, "Error chunk not found in stream")
+        error_chunk_data = json.loads(chunks[error_idx][len("data: ") :])
         self.assertEqual(error_chunk_data["error"]["message"], err_msg)
         self.assertEqual(error_chunk_data["error"]["code"], err_code.value)
 
-        # Ensure the stream stops after the abort error
-        # The last chunk should be "data: [DONE]\n\n"
-        self.assertEqual(chunks[-1], "data: [DONE]\n\n")
+        # The error follows the chunks already streamed, and only [DONE] follows it.
+        self.assertGreater(error_idx, 0)
+        self.assertEqual(chunks[error_idx + 1 :], ["data: [DONE]\n\n"])
 
-        # Check that there is an error chunk and a DONE chunk, and possibly a role chunk
-        self.assertGreaterEqual(len(chunks), 2)
-        self.assertIn("error", chunks[0])
+    def test_streaming_abort_before_first_chunk_returns_http_error(self):
+        """An abort that arrives before any chunk is streamed (e.g. an admission
+        rejection) is returned as a real HTTP error, not in-band under a 200,
+        with the status and error type handle_request gives a non-stream abort."""
+        cases = [
+            # (status_code as sent by the engine, expected status, expected type)
+            (HTTPStatus.SERVICE_UNAVAILABLE, 503, "503"),
+            (HTTPStatus.BAD_REQUEST, 400, "BadRequestError"),
+            (HTTPStatus.INTERNAL_SERVER_ERROR, 500, "500"),
+            (HTTPStatus.TOO_MANY_REQUESTS, 429, "429"),
+            (HTTPStatus.BAD_GATEWAY, 502, "502"),
+            (HTTPStatus.GATEWAY_TIMEOUT, 504, "504"),
+            # msgpack IPC decodes HTTPStatus to a plain int.
+            (400, 400, "BadRequestError"),
+            (503, 503, "503"),
+            # Non-standard 4xx/5xx statuses match the non-streaming path too.
+            (499, 499, "499"),
+            (599, 599, "599"),
+        ]
+        for sent_code, want_status, want_type in cases:
+            with self.subTest(sent_code=sent_code):
+                err_msg = "The request queue is full."
+
+                async def _mock_generate_abort(*args, **kwargs):
+                    # Shape of a scheduler admission abort: no prompt_tokens.
+                    yield {
+                        "text": "",
+                        "meta_info": {
+                            "id": "cmpl-test",
+                            "completion_tokens": 0,
+                            "finish_reason": {
+                                "type": "abort",
+                                "status_code": sent_code,
+                                "message": err_msg,
+                            },
+                        },
+                        "index": 0,
+                    }
+
+                self.sc.tokenizer_manager.generate_request = _mock_generate_abort
+                self.sc.tokenizer_manager.request_logger = Mock(
+                    log_requests=False, log_requests_level=0
+                )
+                self.fastapi_request.headers = {}
+
+                req = CompletionRequest(
+                    model="x",
+                    prompt="Hello world",
+                    max_tokens=100,
+                    stream=True,
+                )
+
+                loop = get_or_create_event_loop()
+                response = loop.run_until_complete(
+                    self.sc.handle_request(req, self.fastapi_request)
+                )
+
+                self.assertNotIsInstance(response, StreamingResponse)
+                self.assertEqual(response.status_code, want_status)
+                body = json.loads(response.body)
+                self.assertEqual(body["message"], err_msg)
+                self.assertEqual(body["type"], want_type)
+                self.assertEqual(body["code"], want_status)
 
     def test_echo_with_zero_logprobs_streaming(self):
         """logprobs=0 requests token logprobs without top-logprobs, so the
