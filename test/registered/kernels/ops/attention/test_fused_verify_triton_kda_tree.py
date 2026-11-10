@@ -3,21 +3,14 @@
 import pytest
 import torch
 
+from sglang.kernels.ops.attention.linear.fused_sigmoid_gating_recurrent import (
+    fused_sigmoid_gating_delta_rule_update,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
-
-try:
-    from sglang.kernels.ops.attention.linear.fused_sigmoid_gating_recurrent import (
-        fused_sigmoid_gating_delta_rule_update,
-    )
-
-    KERNEL_AVAILABLE = True
-except ImportError:
-    KERNEL_AVAILABLE = False
 
 register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 
-@pytest.mark.skipif(not KERNEL_AVAILABLE, reason="Triton KDA kernel is unavailable")
 @pytest.mark.parametrize("width", [2, 17, 32, 33, 49, 65])
 @pytest.mark.parametrize("lower_bound", [None, -5.0])
 @pytest.mark.parametrize("factor_dtype", [torch.float32, torch.bfloat16])
@@ -121,7 +114,6 @@ def test_factorized_tree_matches_serial_model_shape(width, lower_bound, factor_d
     assert full_state_numel / factor_numel > 80
 
 
-@pytest.mark.skipif(not KERNEL_AVAILABLE, reason="Triton KDA kernel is unavailable")
 @pytest.mark.parametrize(
     "width,cache_width", [(width, width) for width in (*range(2, 50), 65)]
 )
@@ -387,7 +379,6 @@ def test_factorized_tree_raw_factor_commit_matches_serial_selected_state(
         torch.testing.assert_close(committed_state[0, :3], state[:3], rtol=0, atol=0)
 
 
-@pytest.mark.skipif(not KERNEL_AVAILABLE, reason="Triton KDA kernel is unavailable")
 @pytest.mark.parametrize("production_layout", [False, True])
 @pytest.mark.parametrize(
     "paths,track_nodes",
@@ -509,7 +500,6 @@ def test_tree_conv_raw_commit_matches_full_window(
     assert torch.equal(committed, expected)
 
 
-@pytest.mark.skipif(not KERNEL_AVAILABLE, reason="Triton KDA kernel is unavailable")
 @pytest.mark.parametrize("width", [2, 17, 32, 33, 49, 65])
 def test_factorized_tree_cuda_graph_replay_reads_new_inputs(width):
     """Factorized tree paths must remain address-stable and replay-safe."""
