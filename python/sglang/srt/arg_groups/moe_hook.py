@@ -236,6 +236,21 @@ def validate_flashinfer_megamoe_envs() -> None:
             f"{combine_dtype!r} is incompatible with "
             "SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE=1."
         )
+    decode_tokens = envs.SGLANG_FLASHINFER_MEGAMOE_DECODE_MAX_TOKENS_PER_RANK.get()
+    if decode_tokens < 0:
+        raise ValueError(
+            "SGLANG_FLASHINFER_MEGAMOE_DECODE_MAX_TOKENS_PER_RANK="
+            f"{decode_tokens} must be 0 (off) or positive."
+        )
+    # 0 derives the main capacity from resolved limits; the first MegaMoE layer
+    # build checks the decode capacity against that derived value.
+    max_tokens = envs.SGLANG_FLASHINFER_MEGAMOE_MAX_TOKENS_PER_RANK.get()
+    if 0 < max_tokens <= decode_tokens:
+        raise ValueError(
+            "SGLANG_FLASHINFER_MEGAMOE_DECODE_MAX_TOKENS_PER_RANK="
+            f"{decode_tokens} must be below "
+            f"SGLANG_FLASHINFER_MEGAMOE_MAX_TOKENS_PER_RANK={max_tokens}."
+        )
 
 
 def validate_flashinfer_megamoe_model(server_args: Any) -> None:
@@ -282,6 +297,22 @@ def validate_flashinfer_megamoe_model(server_args: Any) -> None:
             "with SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16=1; got "
             f"quantization={quantization!r}. Standard FP8 MoE checkpoints "
             "are not supported."
+        )
+    # These are the configs whose MoE layers build ModelOptNvFp4FusedMoEMethod
+    # or its nvfp4_online subclass, the only path with a decode workspace.
+    uses_modelopt_nvfp4_moe = (
+        quantization in ("modelopt_fp4", "nvfp4_online")
+        or model_config.nvfp4_moe_meta is not None
+    )
+    if (
+        envs.SGLANG_FLASHINFER_MEGAMOE_DECODE_MAX_TOKENS_PER_RANK.get() > 0
+        and not uses_modelopt_nvfp4_moe
+    ):
+        logger.warning(
+            "SGLANG_FLASHINFER_MEGAMOE_DECODE_MAX_TOKENS_PER_RANK is ignored: "
+            "FlashInfer MegaMOE builds the decode workspace only for ModelOpt "
+            "NVFP4 MoE layers, got quantization=%r.",
+            quantization,
         )
 
 

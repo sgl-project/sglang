@@ -701,6 +701,7 @@ class TestMlaPrefixCacheDcp(unittest.TestCase):
         cycles = (int(seq_lens.max()) + stride - 1) // stride
         mapping = torch.arange(3 * cycles * stride).reshape(3, -1)
         backend = AscendAttnBackend.__new__(AscendAttnBackend)
+        backend.use_quant_flash_attn = False
         backend.device = torch.device("cpu")
         backend.use_mla = True
         backend.use_dsa = False

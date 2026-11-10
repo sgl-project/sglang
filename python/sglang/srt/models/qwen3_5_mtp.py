@@ -32,7 +32,10 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import (
+    default_weight_loader,
+    maybe_remap_kv_scale_name,
+)
 from sglang.srt.models.qwen3_5 import QWEN3_5_KV_SCALE_MAPPER, Qwen3_5ForCausalLM
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
@@ -372,6 +375,10 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
 
             if ".self_attn." in name:
                 name = name.replace(".self_attn", "")
+            if is_npu() and ".fa_" in name:
+                name = maybe_remap_kv_scale_name(name, params_dict)
+                if name is None:
+                    continue
 
             if (
                 _use_aiter
