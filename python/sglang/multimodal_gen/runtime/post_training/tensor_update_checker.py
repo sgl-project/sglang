@@ -26,7 +26,7 @@ def compute_tensor_sha256(tensor: torch.Tensor) -> str:
     hasher = hashlib.sha256()
     hasher.update(str(tensor.dtype).encode("utf-8"))
     hasher.update(repr(tuple(tensor.shape)).encode("utf-8"))
-    hasher.update(tensor.view(torch.uint8).numpy().tobytes())
+    hasher.update(tensor.reshape(-1).view(torch.uint8).numpy().tobytes())
     return hasher.hexdigest()
 
 

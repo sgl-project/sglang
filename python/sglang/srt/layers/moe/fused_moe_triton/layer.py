@@ -130,6 +130,17 @@ def _fuses_routed_scaling_factor_in_topk(quant_method, runner_backend) -> bool:
     )
 
 
+def _validate_gluon_quant_method(layer, quant_method) -> None:
+    if not get_moe_runner_backend().is_gluon():
+        return
+
+    from sglang.srt.layers.moe.glm_mxfp4_gluon import (
+        validate_gluon_quant_method,
+    )
+
+    validate_gluon_quant_method(layer, quant_method)
+
+
 def _copy_weight_view_before_h2d(loaded_weight: torch.Tensor) -> torch.Tensor:
     """Copy a CPU tensor view into independent contiguous storage."""
     if loaded_weight.device.type != "cpu":
@@ -400,6 +411,7 @@ class FusedMoE(torch.nn.Module):
         enable_qwen35_fp8_deferred_finalize: bool = False,
         quant_method: Optional[FusedMoEMethodBase] = None,
         uses_expert_location: bool = True,
+        allow_fp8_blockwise_tail: bool = False,
     ):
         super().__init__()
         if params_dtype is None:
@@ -419,6 +431,7 @@ class FusedMoE(torch.nn.Module):
         self.num_experts = num_experts
         self.with_bias = with_bias
         self.num_fused_shared_experts = num_fused_shared_experts
+        self.allow_fp8_blockwise_tail = allow_fp8_blockwise_tail
 
         self.enable_flashinfer_cutlass_moe = (
             get_moe_runner_backend().is_flashinfer_cutlass()
@@ -609,6 +622,7 @@ class FusedMoE(torch.nn.Module):
             moe_intermediate_size=intermediate_size,
         )
 
+        _validate_gluon_quant_method(self, self.quant_method)
         self.quant_method.create_moe_runner(self, self.moe_runner_config)
         self.runner_backend = self.quant_method.get_moe_runner_backend(self)
         self.moe_runner_config.runner_backend = self.runner_backend
@@ -618,12 +632,28 @@ class FusedMoE(torch.nn.Module):
             and self.runner_backend.is_flashinfer_trtllm()
             and (nvfp4_deferred or qwen35_fp8_deferred or qwen4_bf16_deferred)
         ) or packed_nvfp4_routed_deferred
+        # The routed kernel defers the same way; the standard dispatcher passes
+        # the deferred triple through, an A2A combine cannot.
+        self.supports_routed_deferred_finalize = (
+            self.runner_backend is not None
+            and self.runner_backend.is_flashinfer_trtllm_routed()
+            and nvfp4_deferred
+            and get_moe_a2a_backend().is_none()
+            # No deferred consumer rescales, so the top-k weights must carry it.
+            and _fuses_routed_scaling_factor_in_topk(
+                self.quant_method, self.runner_backend
+            )
+        )
         global _deferred_finalize_info_logged
         if not _deferred_finalize_info_logged:
             _deferred_finalize_info_logged = True
+            deferred_finalize_supported = (
+                self.supports_deferred_finalize
+                or self.supports_routed_deferred_finalize
+            )
             logging.getLogger(__name__).debug(
                 "FlashInfer TRTLLM MoE deferred finalize is "
-                f"{'enabled' if self.supports_deferred_finalize else 'disabled'} "
+                f"{'enabled' if deferred_finalize_supported else 'disabled'} "
                 f"(moe_runner_backend={self.runner_backend}, "
                 f"quant_method={type(self.quant_method).__name__})."
             )
@@ -782,6 +812,7 @@ class FusedMoE(torch.nn.Module):
         shard_id: str,
         loaded_weight: torch.Tensor,
         is_bias: bool = False,
+        load_full_w2: bool = False,
     ):
         # Load grouped weight scales for group quantization
         # or model weights
@@ -792,6 +823,7 @@ class FusedMoE(torch.nn.Module):
                 loaded_weight=loaded_weight,
                 expert_data=expert_data,
                 is_bias=is_bias,
+                load_full=load_full_w2,
             )
         elif shard_id in ("w1", "w3", "w13"):
             self._load_w13(
@@ -921,6 +953,7 @@ class FusedMoE(torch.nn.Module):
         shard_id: str,
         loaded_weight: torch.Tensor,
         is_bias: bool = False,
+        load_full: bool = False,
     ):
         """Load w2 weights for down projection.
 
@@ -929,6 +962,7 @@ class FusedMoE(torch.nn.Module):
             shard_dim: The dimension to shard along
             shard_id: The shard ID (must be "w2")
             loaded_weight: The weight tensor to load from
+            load_full: Whether to load the complete w2 tensor without TP sharding.
         """
         if not isinstance(expert_data, torch.Tensor) or not isinstance(
             loaded_weight, torch.Tensor
@@ -959,24 +993,24 @@ class FusedMoE(torch.nn.Module):
             # for w2 in TP, it shards the input_features, i.e., shard_dim=2
             shard_size = expert_data.shape[shard_dim]
 
-        if self.use_padded_loading:
-            if _is_cpu and is_bias:
-                shard_dim = 1
-            weight_start = shard_size * self.moe_tp_rank
-            # Pre-sharded CPU weights are rank-local; do not apply the TP offset again.
-            if _is_cpu and self.use_presharded_weights:
-                weight_start = 0
-            expert_data, loaded_weight = narrow_padded_param_and_loaded_weight(
-                expert_data,
-                loaded_weight,
-                0,  # param_data_start
-                weight_start,
-                shard_dim,
-                shard_size,
-                not self.use_presharded_weights,
-            )
-        else:
-            if not is_bias and not self.use_presharded_weights:
+        if not load_full:
+            if self.use_padded_loading:
+                if _is_cpu and is_bias:
+                    shard_dim = 1
+                weight_start = shard_size * self.moe_tp_rank
+                # Pre-sharded CPU weights are rank-local; do not apply the TP offset again.
+                if _is_cpu and self.use_presharded_weights:
+                    weight_start = 0
+                expert_data, loaded_weight = narrow_padded_param_and_loaded_weight(
+                    expert_data,
+                    loaded_weight,
+                    0,  # param_data_start
+                    weight_start,
+                    shard_dim,
+                    shard_size,
+                    not self.use_presharded_weights,
+                )
+            elif not is_bias and not self.use_presharded_weights:
                 if self.use_triton_kernels:
                     loaded_weight = loaded_weight.transpose(-2, -1)
                 # Derive shard size from the loaded weight so padded buffers
@@ -1226,6 +1260,17 @@ class FusedMoE(torch.nn.Module):
                 param.data[:, :dim1, :dim2].copy_(loaded_weight)
             return
 
+        for local_expert_id in self._weight_loader_expert_ids(param, expert_id):
+            self._weight_loader_impl(
+                param=param,
+                loaded_weight=loaded_weight,
+                weight_name=weight_name,
+                shard_id=shard_id,
+                expert_id=local_expert_id,
+            )
+
+    def _weight_loader_expert_ids(self, param: torch.nn.Parameter, expert_id: int):
+        """Resolve destinations before online loaders allocate a source tensor."""
         global_expert_location_metadata = (
             get_global_expert_location_metadata() if self.uses_expert_location else None
         )
@@ -1234,14 +1279,7 @@ class FusedMoE(torch.nn.Module):
                 expert_id = self._map_global_expert_id_to_local_expert_id(expert_id)
                 if expert_id == -1:
                     return
-
-            self._weight_loader_impl(
-                param=param,
-                loaded_weight=loaded_weight,
-                weight_name=weight_name,
-                shard_id=shard_id,
-                expert_id=expert_id,
-            )
+            yield expert_id
             return
 
         require_global_experts = getattr(param, "_sglang_require_global_experts", False)
@@ -1273,44 +1311,18 @@ class FusedMoE(torch.nn.Module):
                 # routed slot can lie past _num_global_routed and map to the shared slot.
                 physical_expert_ids = self._local_routed_expert_ids(physical_expert_ids)
 
-        for physical_expert_id in physical_expert_ids:
-            self._weight_loader_physical(
-                param=param,
-                loaded_weight=loaded_weight,
-                weight_name=weight_name,
-                shard_id=shard_id,
-                expert_id=physical_expert_id,
-            )
-
-    def _weight_loader_physical(
-        self,
-        param: torch.nn.Parameter,
-        loaded_weight: torch.Tensor,
-        weight_name: str,
-        shard_id: str,
-        expert_id: int,
-    ) -> None:
-        # WARN: This makes the `expert_id` mean "local" and "global" in different cases
-        if not getattr(param, "_sglang_require_global_experts", False):
-            expert_id = self._map_global_expert_id_to_local_expert_id(expert_id)
-            if expert_id < 0 or expert_id >= self.num_local_experts:
-                return
-
-        if isinstance(
-            self.quant_method,
-            KTEPWrapperMethod,
-        ):
-            if self.quant_method.num_gpu_experts != -1:
-                if expert_id >= self.quant_method.num_gpu_experts:
-                    return
-
-        self._weight_loader_impl(
-            param=param,
-            loaded_weight=loaded_weight,
-            weight_name=weight_name,
-            shard_id=shard_id,
-            expert_id=expert_id,
-        )
+        for expert_id in physical_expert_ids:
+            # Expert IDs are local unless this parameter explicitly requires
+            # global expert storage. Preserve EPLB replicas and shared slots.
+            if not getattr(param, "_sglang_require_global_experts", False):
+                expert_id = self._map_global_expert_id_to_local_expert_id(expert_id)
+                if expert_id < 0 or expert_id >= self.num_local_experts:
+                    continue
+            if isinstance(self.quant_method, KTEPWrapperMethod):
+                if self.quant_method.num_gpu_experts != -1:
+                    if expert_id >= self.quant_method.num_gpu_experts:
+                        continue
+            yield expert_id
 
     def _load_gguf_weight(
         self,
@@ -1523,6 +1535,7 @@ class FusedMoE(torch.nn.Module):
                     shard_dim=shard_dim,
                     loaded_weight=loaded_weight,
                     expert_data=expert_data,
+                    load_full_w2=getattr(param, "load_full_w2", False),
                 )
             return
 
@@ -1554,6 +1567,7 @@ class FusedMoE(torch.nn.Module):
                     shard_dim=shard_dim,
                     loaded_weight=loaded_weight,
                     expert_data=expert_data,
+                    load_full_w2=getattr(param, "load_full_w2", False),
                 )
             elif quant_method == FusedMoeWeightScaleSupported.TENSOR.value:
                 # INT4-FP8 (INT4 MoE Weight, FP8 Compute): Adjust FP8 per-tensor scaling number for e4m3fnuz (AMD)
@@ -1587,6 +1601,7 @@ class FusedMoE(torch.nn.Module):
                 shard_dim=shard_dim,
                 loaded_weight=loaded_weight,
                 expert_data=expert_data,
+                load_full_w2=getattr(param, "load_full_w2", False),
             )
             return
 
