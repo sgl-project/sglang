@@ -18,6 +18,7 @@ from sglang.kernels.ops.attention.dsa.litetopk_prefill import (
     FP8_INDEXER_MAX_SPAN,
     fp8_indexer_topk,
     is_fp8_indexer_supported,
+    is_fp8_indexer_topk_supported,
 )
 from sglang.kernels.ops.attention.topk_page_table import topk_page_table_transform_
 from sglang.kernels.ops.kvcache.dsa_fused_store_index_cache import (
@@ -471,16 +472,17 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if config is not None:
             self.num_init_tokens = getattr(config, "index_init_tokens", 0)
             self.num_local_tokens = getattr(config, "index_local_tokens", 0)
-        # Prefill top-k from the sampled-threshold fp8 indexer (kernels/ops/attention/dsa/litetopk_prefill): 32 or 64
-        # index heads, a supported top-k and no forced init / local tokens.
+        # Prefill top-k from the sampled-threshold fp8 indexer (kernels/ops/attention/dsa/litetopk_prefill): up to
+        # 64 index heads and a supported top-k; forced init / local tokens are kept outside the selection.
         self.use_prefill_lite_topk = (
             envs.SGLANG_OPT_USE_PREFILL_LITE_TOPK.get()
             and envs.SGLANG_DSA_FUSE_TOPK.get()
             and is_fp8_indexer_supported()
-            and self.n_heads in (32, 64)
-            and self.index_topk in (512, 1024, 2048)
-            and self.num_init_tokens == 0
-            and self.num_local_tokens == 0
+            and is_fp8_indexer_topk_supported(
+                num_heads=self.n_heads,
+                topk=self.index_topk,
+                num_forced_tokens=self.num_init_tokens + self.num_local_tokens,
+            )
         )
         if dsa_shards_index_k() and (self.num_init_tokens or self.num_local_tokens):
             raise ValueError(
@@ -1967,6 +1969,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             ke,
             self.index_topk,
             out_offsets=None if offsets is None else offsets[: out.shape[0]],
+            num_init_tokens=self.num_init_tokens,
+            num_local_tokens=self.num_local_tokens,
             num_ctas=self._lite_topk_num_ctas(),
             out=out,
         )

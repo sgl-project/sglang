@@ -382,6 +382,123 @@ def test_fp8_indexer_topk(cell, heads):
         del logits
 
 
+def pad_heads(q, w, heads=32):
+    """The dense path's zero padding to DeepGEMM's 32 heads (Indexer._pad_heads_for_deep_gemm)."""
+    pad = heads - q.shape[1]
+    q = torch.nn.functional.pad(q.view(torch.uint8), (0, 0, 0, pad)).view(q.dtype)
+    return q, torch.nn.functional.pad(w, (0, pad))
+
+
+def check_forced_topk(out, q, w, kv, sf, ks, ke, topk, init, local):
+    """`out` (absolute key indices, -1 padded) against the dense path: DeepGEMM logits with +inf on each row's
+    first `init` and last `local` keys (Indexer._mask_init_and_local_tokens), then the exact top-k; valid
+    entries packed in front, the forced keys of rows longer than `topk` first."""
+    if q.shape[1] < 32:
+        q, w = pad_heads(q, w)
+    forced = init + local
+    lens = (ke - ks).long()
+    for r0 in range(0, ks.numel(), 256):
+        r1 = min(r0 + 256, ks.numel())
+        rk, re, n_r = ks[r0:r1, None].long(), ke[r0:r1, None].long(), lens[r0:r1]
+        logits = ref_logits(q[r0:r1], w[r0:r1], kv, sf, ks[r0:r1], ke[r0:r1])
+        col = torch.arange(logits.shape[1], device="cuda")[None, :]
+        pinned = ((col < rk + init) | (col >= re - local)) & (col >= rk) & (col < re)
+        logits = logits.masked_fill(pinned, float("inf"))
+        o = out[r0:r1].long()
+        n = n_r.clamp(max=topk)
+        valid = torch.arange(topk, device="cuda")[None, :] < n[:, None]
+        assert (o[valid] >= 0).all() and (o[~valid] == -1).all(), "not packed"
+        assert ((o >= rk) & (o < re) | ~valid).all(), "selected key outside the row"
+        srt = torch.where(valid, o, torch.full_like(o, -1)).sort(dim=1).values
+        assert not ((srt[:, 1:] == srt[:, :-1]) & (srt[:, 1:] >= 0)).any(), (
+            "duplicate selection"
+        )
+        long_rows = n_r > topk
+        rel = o[:, :forced] - rk
+        expect = torch.cat(
+            [
+                torch.arange(init, device="cuda").expand(r1 - r0, -1),
+                n_r[:, None] - local + torch.arange(local, device="cuda")[None, :],
+            ],
+            dim=1,
+        )
+        assert torch.equal(rel[long_rows], expect[long_rows]), "forced columns"
+        got = torch.where(
+            valid,
+            logits.gather(1, o.clamp(min=0)),
+            torch.full_like(logits[:, :1], float("inf")),
+        )
+        kth = logits.topk(topk, dim=1).values.gather(1, (n - 1).clamp(min=0)[:, None])
+        finite = logits.masked_fill(~torch.isfinite(logits), 0)
+        tol = 1e-5 * finite.abs().amax(1, keepdim=True)
+        assert (got >= kth - tol).all(), "selected key below the k-th logit"
+        assert torch.equal(
+            ((got > kth + tol) & valid).sum(1), (logits > kth + tol).sum(1)
+        ), "key above the k-th logit missed"
+        del logits
+
+
+# Requests whose rows run from 1 key past `topk + forced` (rows of a fresh 3000-key request), plus long rows.
+FORCED_REQUESTS = [(40000, 256, "last"), (3000, 3000, "last"), (20000, 512, "mid")]
+
+
+@pytest.mark.skipif(not is_fp8_indexer_supported(), reason="SM100 only")
+@pytest.mark.parametrize("heads", (16, 32, 64))
+@pytest.mark.parametrize("init,local", [(16, 1024), (0, 128), (4, 0)])
+def test_fp8_indexer_topk_forced_tokens(heads, init, local):
+    """LongCat's index_init_tokens / index_local_tokens: rows longer than topk keep their first `init` and last
+    `local` keys and the top (topk - init - local) between; shorter rows keep every key, as on the dense path."""
+    ks, ke, keys = make_ragged(FORCED_REQUESTS)
+    q, w, kv, sf = gen_inputs(ks.numel(), keys, 17, heads=heads)
+    offsets = ks + 7
+    out = fp8_indexer_topk(
+        q,
+        w,
+        kv,
+        sf,
+        ks,
+        ke,
+        TOPK,
+        out_offsets=offsets,
+        num_init_tokens=init,
+        num_local_tokens=local,
+    )
+    torch.cuda.synchronize()
+    out = torch.where(out >= 0, out - 7, out)
+    check_forced_topk(out, q, w, kv, sf, ks, ke, TOPK, init, local)
+
+
+@pytest.mark.skipif(not is_fp8_indexer_supported(), reason="SM100 only")
+@pytest.mark.parametrize("heads", (8, 16, 48))
+def test_fp8_indexer_topk_padded_heads(heads):
+    """Index heads below a kernel width (32 / 64) are zero-padded: the result is the top-k of the real heads."""
+    ks, ke, keys = make_ragged(CELLS["short_rows_mixed"])
+    q, w, kv, sf = gen_inputs(ks.numel(), keys, 19, heads=heads)
+    out = fp8_indexer_topk(q, w, kv, sf, ks, ke, TOPK, out_offsets=ks)
+    torch.cuda.synchronize()
+    width = 32 if heads <= 32 else 64
+    check_forced_topk(out, *pad_heads(q, w, width), kv, sf, ks, ke, TOPK, 0, 0)
+
+
+def test_fp8_indexer_topk_support():
+    from sglang.kernels.ops.attention.dsa.litetopk_prefill import (
+        is_fp8_indexer_topk_supported,
+    )
+
+    assert is_fp8_indexer_topk_supported(
+        num_heads=16, topk=2048, num_forced_tokens=1040
+    )
+    assert is_fp8_indexer_topk_supported(num_heads=64, topk=512)
+    assert not is_fp8_indexer_topk_supported(num_heads=128, topk=2048)
+    assert not is_fp8_indexer_topk_supported(num_heads=32, topk=4096)
+    assert not is_fp8_indexer_topk_supported(
+        num_heads=32, topk=2048, num_forced_tokens=1042
+    )
+    assert not is_fp8_indexer_topk_supported(
+        num_heads=32, topk=1024, num_forced_tokens=1024
+    )
+
+
 def test_sample_grid_cap():
     """Up to 2M keys of span the strided sample fits the 32 sample tiles (8192 samples per row) that the per-CTA
     sample-code scratch (kMaxSampleTiles) holds, so no sample is dropped."""
@@ -433,6 +550,7 @@ def run_ragged_topk(monkeypatch, requests, q, w, kv, sf, lengths=None, **attrs):
     indexer.index_topk = TOPK
     indexer.use_prefill_lite_topk = True
     indexer.logits_with_pp_recv = False
+    indexer.num_init_tokens = indexer.num_local_tokens = 0
     for name, value in attrs.items():
         setattr(indexer, name, value)
     attn = SimpleNamespace(
@@ -500,6 +618,19 @@ def test_lite_topk_stops_at_seqlens_expanded(monkeypatch):
     assert torch.equal((got > kth + tol).sum(1), (logits > kth + tol).sum(1)), (
         "key above the k-th logit missed"
     )
+
+
+@pytest.mark.skipif(not is_fp8_indexer_supported(), reason="SM100 only")
+def test_lite_topk_keeps_forced_tokens(monkeypatch):
+    """Indexer._get_topk_ragged with index_init_tokens / index_local_tokens (LongCat) returns what the dense
+    +inf override and top-k return."""
+    requests = [(30000, 64, "last"), (3000, 3000, "last")]
+    ks, ke, keys = make_ragged(requests)
+    q, w, kv, sf = gen_inputs(ks.numel(), keys, 23)
+    out = run_ragged_topk(
+        monkeypatch, requests, q, w, kv, sf, num_init_tokens=16, num_local_tokens=1024
+    )
+    check_forced_topk(out, q, w, kv, sf, ks, ke, TOPK, 16, 1024)
 
 
 @pytest.mark.skipif(not is_fp8_indexer_supported(), reason="SM100 only")
