@@ -684,6 +684,9 @@ class TestMooncakeGroupSemantics(CustomTestCase):
         self.assertEqual(call["ptrs"], [[3005], [3007], [4050, 4051], [4070, 4071]])
         self.assertEqual(call["sizes"], [[8], [8], [8, 16], [8, 16]])
         self.assertEqual(
+            store.last_put_bytes_by_pool, {"indexer": 16, "deepseek_v4_c4": 48}
+        )
+        self.assertEqual(
             call["args"][0].group_ids,
             [
                 "sglang-hicache:tag_page0",

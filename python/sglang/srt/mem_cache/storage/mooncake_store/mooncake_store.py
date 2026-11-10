@@ -761,6 +761,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             self.backup_pgs = []
             self.prefetch_bandwidth = []
             self.backup_bandwidth = []
+            self.last_put_bytes_by_pool = {}
 
         except ValueError as e:
             logger.error("Configuration loading failed: %s", e)
@@ -1323,6 +1324,17 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 )
                 for i, res in zip(missing_idx, put_results):
                     io_results[i] = res
+            # Bytes this call newly stored per pool; keys already present are skipped.
+            self.last_put_bytes_by_pool = {
+                str(name): sum(
+                    sum(all_sizes[i])
+                    if isinstance(all_sizes[i], list)
+                    else all_sizes[i]
+                    for i in missing_idx
+                    if start <= i < end and io_results[i] == 0
+                )
+                for name, _, start, end in prepared
+            }
         else:
             io_results = self._get_batch_zero_copy_impl(
                 all_key_strs, all_ptrs, all_sizes

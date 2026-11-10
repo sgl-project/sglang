@@ -2688,6 +2688,17 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
             documentation="KV tokens queued for writing to the external store.",
             labelnames=labels.keys(),
         )
+        self.linker_load_bytes = Counter(
+            name="sglang:linker_load_bytes_total",
+            documentation="Bytes this rank read from the external store, by pool.",
+            labelnames=list(labels.keys()) + ["pool"],
+        )
+        self.linker_offload_bytes = Counter(
+            name="sglang:linker_offload_bytes_total",
+            documentation="Bytes this rank newly wrote to the external store, by "
+            "pool; objects already stored are skipped.",
+            labelnames=list(labels.keys()) + ["pool"],
+        )
         self.linker_failures = Counter(
             name="sglang:linker_failures_total",
             documentation="External store operations that failed, by stage: lookup "
@@ -2753,6 +2764,14 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
 
     def increment_linker_offload_tokens(self, num_tokens: int) -> None:
         self.linker_offload_tokens.labels(**self.labels).inc(num_tokens)
+
+    def increment_linker_bytes(
+        self, load_bytes: Dict[str, int], offload_bytes: Dict[str, int]
+    ) -> None:
+        for pool, num_bytes in load_bytes.items():
+            self.linker_load_bytes.labels(**self.labels, pool=pool).inc(num_bytes)
+        for pool, num_bytes in offload_bytes.items():
+            self.linker_offload_bytes.labels(**self.labels, pool=pool).inc(num_bytes)
 
     def increment_linker_failures(self, stage: str, count: int = 1) -> None:
         self.linker_failures.labels(**self.labels, stage=stage).inc(count)

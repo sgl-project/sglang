@@ -248,6 +248,8 @@ class TestMooncakePrefetch(CustomTestCase):
         linker.layer_done_counter = LayerWiseLoadCounter(2)
         linker.gc_frozen = True
         linker.pending_loads, linker.broadcast_loads = {}, {}
+        linker.transfer_bytes_lock = threading.Lock()
+        linker.load_bytes, linker.offload_bytes = {}, {}
         linker.load_queue, linker.offload_queue, linker.offload_results = (
             Queue() for _ in range(3)
         )
@@ -2092,6 +2094,7 @@ def test_check_hicache_events_commits_common_rank_results():
         take_completed_offloads=lambda count: [True] * count,
         commit_completed_offloads=committed.append,
         check_prefetch_events=lambda: None,
+        record_transfer_bytes=lambda: None,
     )
 
     reduce_calls = 0
@@ -2414,6 +2417,7 @@ class TestTransferReadyEvents(CustomTestCase):
         order = MagicMock()
         linker.storage = order.storage
         order.storage.batch_set_v2.return_value = {}
+        order.storage.last_put_bytes_by_pool = {}
         linker.stats = {"offload": 1}
         linker.offload_results = queue.Queue()
         linker.offload_queue = queue.Queue()

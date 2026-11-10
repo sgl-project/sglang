@@ -251,6 +251,10 @@ class UnifiedCacheLinker(ABC):
     def num_completed_offloads(self) -> int:
         """Return the number of completed offloads waiting to be consumed."""
 
+    def pop_transfer_bytes(self) -> tuple[dict[str, int], dict[str, int]]:
+        """Bytes loaded and offloaded by pool since the last call."""
+        return {}, {}
+
     @abstractmethod
     def pop_completed_offload(self) -> bool:
         """Consume the oldest completed offload and return its result."""
@@ -886,6 +890,12 @@ class UnifiedCacheLinkerWrapper:
     def take_completed_offloads(self, finish_count: int) -> list[bool]:
         assert finish_count <= len(self.pending_offloads)
         return [self.cache_linker.pop_completed_offload() for _ in range(finish_count)]
+
+    def record_transfer_bytes(self) -> None:
+        if self.metrics is None:
+            return
+        load, offload = self.cache_linker.pop_transfer_bytes()
+        self.metrics.increment_linker_bytes(load, offload)
 
     def commit_completed_offloads(self, successes: Sequence[bool]) -> None:
         assert len(successes) <= len(self.pending_offloads)

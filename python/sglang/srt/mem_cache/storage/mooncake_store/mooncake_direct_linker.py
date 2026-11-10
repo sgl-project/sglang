@@ -155,6 +155,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         ] = Queue()
         self.offload_results: Queue[bool] = Queue()
         self.stats = {"lookup": 0, "load": 0, "offload": 0}
+        self.transfer_bytes_lock = threading.Lock()
+        self.load_bytes: dict[str, int] = {}
+        self.offload_bytes: dict[str, int] = {}
         self.load_thread = threading.Thread(
             target=self.load_thread_func,
             daemon=True,
@@ -247,8 +250,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             )
             received = self.storage._get_batch_zero_copy_impl(keys, ptrs, sizes)
             # Require every byte of every layer, including short reads.
-            if list(received) != [sum(s) if isinstance(s, list) else s for s in sizes]:
+            expected = [sum(s) if isinstance(s, list) else s for s in sizes]
+            if list(received) != expected:
                 return False
+            self._add_transfer_bytes(self.load_bytes, transfer.name, sum(expected))
         return True
 
     def cancel_queued_load(self, rid: str) -> bool:
@@ -410,6 +415,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                             f"layer={layer}: transferred={result}, "
                             f"expected={expected}"
                         )
+                    self._add_transfer_bytes(self.load_bytes, name, sum(expected))
                 self.layer_done_counter.complete(counter_index, layer)
         except BaseException as error:
             self.layer_done_counter.fail(counter_index, error)
@@ -452,6 +458,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     else None
                 )
                 results = self.storage.batch_set_v2(expanded, extra_info)
+                for pool, num_bytes in self.storage.last_put_bytes_by_pool.items():
+                    self._add_transfer_bytes(self.offload_bytes, pool, num_bytes)
                 success = all(all(pool_results) for pool_results in results.values())
                 if success:
                     self.stats["offload"] += 1
@@ -463,6 +471,16 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 self.offload_results.put(False)
             finally:
                 self.offload_queue.task_done()
+
+    def _add_transfer_bytes(self, totals: dict[str, int], pool, num_bytes: int):
+        with self.transfer_bytes_lock:
+            totals[str(pool)] = totals.get(str(pool), 0) + num_bytes
+
+    def pop_transfer_bytes(self) -> tuple[dict[str, int], dict[str, int]]:
+        with self.transfer_bytes_lock:
+            load, self.load_bytes = self.load_bytes, {}
+            offload, self.offload_bytes = self.offload_bytes, {}
+        return load, offload
 
     def num_completed_offloads(self) -> int:
         return self.offload_results.qsize()
