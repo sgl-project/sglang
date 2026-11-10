@@ -14,7 +14,7 @@ This is useful for:
 * Debugging model internals
 * Exporting hidden states to external tooling
 
-Hooks are attached once during `ModelRunner.initialize` and run on every forward pass.
+Hooks are attached once, after the final CUDA graph capture, and fire only on the eager forward path. A captured graph replays without running Python hooks, so a hook does not fire on any phase whose CUDA graph is enabled. See [Hook lifecycle and behavior](#hook-lifecycle-and-behavior).
 
 ***
 ### Configuration overview
@@ -149,12 +149,18 @@ The first two cause initialization to fail fast with a descriptive error; the la
 ***
 ### Hook lifecycle and behavior
 
-Hooks are registered in `ModelRunner.initialize()`:
+Hooks are registered in `finalize_cuda_graph_capture()`, which runs after the last graph capture so the captured graphs stay hook-free:
 
 ```python Example
-if server_args.forward_hooks:
-    register_forward_hooks(self.model, server_args.forward_hooks)
+def finalize_cuda_graph_capture(model_runner: ModelRunner) -> None:
+    """Run setup that must happen after the final graph capture."""
+    if get_observability().forward_hooks:
+        register_forward_hooks(model_runner.model, get_observability().forward_hooks)
 ```
+
+<Note>
+Because capture happens first, a hook never observes a graph-replay step. To make a hook see those steps, disable the CUDA graph for that phase, for example `--cuda-graph-backend-decode=disabled`.
+</Note>
 
 The actual registration logic is implemented by `register_forward_hooks`:
 
