@@ -106,6 +106,8 @@ def verify_logits_adjustments_are_noop(sampling_info) -> bool:
 class TargetVerifyResult(msgspec.Struct, frozen=True):
     logits_output: object
     can_run_cuda_graph: bool
+    # The target forward's per-token captures (R3 routing, indexer top-k, KV weight versions); the scheduler
+    # finalizes them from the step's GenerationBatchResult, so dropping them loses every verified token's rows.
     routed_experts_output: object = None
     indexer_topk_output: object = None
     kv_weight_version_record: object = None
