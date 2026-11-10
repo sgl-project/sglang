@@ -222,8 +222,15 @@ class PrefillBudget:
             chunk_limit,
             available_tokens,
         )
-        # Single-pool continuation must make progress to release its KV.
-        return available if available > 0 else chunk_limit
+        if available > 0:
+            return available
+        # Past the decode headroom a continuation still progresses, but only
+        # into rows free now; with none it waits for decode to release some.
+        free_now = int(self.remaining_current)
+        if is_cp_sharded_padded():
+            free_now = get_cp_sharded_padded_available_tokens(free_now)
+        free_now = free_now // self.page_size * self.page_size
+        return min(chunk_limit, free_now) if free_now > 0 else None
 
     def fit_chunk(
         self,

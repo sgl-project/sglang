@@ -374,6 +374,17 @@ class TestPrefillAdder(CustomTestCase):
         self.assertIs(adder.add_chunked_req(req), req)
         self.assertEqual(req.extend_len, 4096)
 
+    def test_continuation_past_decode_headroom_fits_free_rows(self):
+        allocator = self.create_token_allocator(available_size=3840)
+        allocator.page_size = 64
+        budget = PrefillBudget(allocator, self.mock_tree_cache)
+        budget.total_offset = 100_000
+        self.assertEqual(budget.available_chunk_tokens(8192), 3840)
+        budget.current_offset = 100
+        self.assertEqual(budget.available_chunk_tokens(8192), 3712)
+        allocator.available_size.return_value = 0
+        self.assertIsNone(budget.available_chunk_tokens(8192))
+
     def test_exact_chunk_fill_keeps_mamba_chunks_page_aligned(self):
         # A Mamba checkpoint only lands on a page-aligned chunk end, so an
         # off-grid chunk leaves the rest of the prompt uncacheable. Without
