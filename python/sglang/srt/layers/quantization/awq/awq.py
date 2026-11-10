@@ -112,8 +112,14 @@ class AWQConfig(QuantizationConfig):
             raise NotImplementedError(
                 'NPU hardware does not support "get_min_capability" feature.'
             )
-        else:
-            return 75
+        if _is_cuda and torch.cuda.is_available():
+            from sglang.srt.hardware_backend.gpu.quantization.awq_kernels import (
+                can_use_sm70_turbomind_awq,
+            )
+
+            if can_use_sm70_turbomind_awq():
+                return 70
+        return 75
 
     @staticmethod
     def get_config_filenames() -> List[str]:
@@ -377,6 +383,9 @@ class AWQMarlinConfig(QuantizationConfig):
             return AWQLinearMethod(self)
         elif isinstance(layer, FusedMoE):
             if is_layer_skipped_awq(prefix, self.modules_to_not_convert):
+                # Returning None lets FusedMoE pick its own fallback method,
+                # which on SM70 is SM70FP16MoEMethod (see fused_moe_triton
+                # layer.py). Do not construct UnquantizedFusedMoEMethod here.
                 return None
             from sglang.srt.layers.quantization.moe_wna16 import MoeWNA16Config
 

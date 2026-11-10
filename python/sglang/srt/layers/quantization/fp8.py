@@ -80,13 +80,23 @@ from sglang.srt.layers.quantization.fp8_utils import (
     use_aiter_bpreshuffle_gemm,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
-from sglang.srt.layers.quantization.marlin_utils_fp8 import prepare_fp8_layer_for_marlin
+from sglang.srt.layers.quantization.marlin_utils_fp8 import (
+    prepare_fp8_layer_for_marlin,
+    prepare_mxfp8_layer_for_sm70_marlin,
+    sm70_mxfp8_layer_skips_marlin,
+)
 from sglang.srt.layers.quantization.mxfp8_block_convert import (
     mxfp8_block_convert_required,
 )
 from sglang.srt.layers.quantization.mxfp8_input import (
     Mxfp8SwizzledInput,
     batch_invariant_or_deterministic,
+)
+from sglang.srt.layers.quantization.sm70_turbomind_fp8 import (
+    apply_sm70_turbomind_fp8_fused_silu_and_mul,
+    apply_sm70_turbomind_fp8_linear,
+    can_use_sm70_turbomind_fp8,
+    prepare_sm70_turbomind_fp8_linear,
 )
 from sglang.srt.layers.quantization.unquant import (
     UnquantizedFusedMoEMethod,
@@ -319,8 +329,12 @@ class Fp8Config(QuantizationConfig):
         if self.use_mxfp8:
             if weight_block_size is None:
                 weight_block_size = [1, 32]
-            elif weight_block_size != [1, 32]:
-                raise ValueError("MXFP8 requires weight_block_size=[1, 32].")
+            elif tuple(int(x) for x in weight_block_size) not in ((1, 32), (32, 32)):
+                raise ValueError(
+                    "MXFP8 requires weight_block_size=[1, 32] (per-N, K/32) or "
+                    "[32, 32] (N/32, K/32 UE8M0). "
+                    f"Got {weight_block_size}."
+                )
         self.weight_block_size = weight_block_size
 
     def get_name(self) -> str:
@@ -343,7 +357,14 @@ class Fp8Config(QuantizationConfig):
         if self.use_mxfp8 and is_xpu():
             return 20
 
-        return 100 if self.use_mxfp8 else 80
+        if self.use_mxfp8:
+            # SM70: reach the MXFP8 unpack (g32 -> FP16). Do not refuse at
+            # min-capability=100; marlin_v100 has no native MXFP8 g32 GEMM.
+            cap = get_device_capability()
+            if cap is not None and cap[0] == 7:
+                return 70
+            return 100
+        return 80
 
     @classmethod
     def get_config_filenames(cls) -> List[str]:
@@ -374,14 +395,28 @@ class Fp8Config(QuantizationConfig):
             config, ["kv_cache_quant_algo"], None
         )
         scale_fmt = cls.get_from_keys_or(config, ["scale_fmt"], None)
+        expert_dtype = cls.get_from_keys_or(config, ["expert_dtype"], None)
+        # Official DSV4.1-Flash writes quant_method=fp8 + scale_fmt=ue8m0 +
+        # weight_block_size [32, 32], not quant_method=mxfp8.
+        block = (
+            tuple(int(x) for x in weight_block_size)
+            if weight_block_size is not None
+            else None
+        )
+        if (not use_mxfp8) and scale_fmt == "ue8m0" and block in ((1, 32), (32, 32)):
+            use_mxfp8 = True
+        is_fp4_experts = expert_dtype in ("fp4", "mxfp4")
         if use_mxfp8:
-            # MXFP8 (OCP) spec fixes block size to [1, 32]; ckpt field is metadata only.
-            if weight_block_size is not None and weight_block_size != [1, 32]:
+            # OCP MXFP8 is K-groups of 32. DSV4.1-Flash dense may be [1, 32]
+            # or [32, 32] UE8M0; do not silently rewrite 32x32 to 1x32.
+            if weight_block_size is None:
+                weight_block_size = [1, 32]
+            elif tuple(int(x) for x in weight_block_size) not in ((1, 32), (32, 32)):
                 logger.warning(
                     "MXFP8 overriding weight_block_size=%s from config.json -> [1, 32].",
                     weight_block_size,
                 )
-            weight_block_size = [1, 32]
+                weight_block_size = [1, 32]
         return cls(
             is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized,
             activation_scheme=activation_scheme,
@@ -389,6 +424,7 @@ class Fp8Config(QuantizationConfig):
             weight_block_size=weight_block_size,
             packed_modules_mapping=packed_modules_mapping,
             use_mxfp8=use_mxfp8,
+            is_fp4_experts=is_fp4_experts,
             kv_cache_quant_algo=kv_cache_quant_algo,
             scale_fmt=scale_fmt,
         )
@@ -531,9 +567,16 @@ class Fp8LinearMethod(LinearMethodBase):
         # For GPUs that lack FP8 hardware support, we can leverage the Marlin
         # kernel for fast weight-only FP8 quantization
         self.use_marlin = False
+        self.use_sm70_turbomind = False
         if _is_cuda:
             force_marlin = get_bool_env_var("SGLANG_FORCE_FP8_MARLIN")
-            auto_enable = can_auto_enable_marlin_fp8()
+            if not force_marlin:
+                self.use_sm70_turbomind = can_use_sm70_turbomind_fp8(
+                    self.quant_config.weight_block_size
+                )
+            auto_enable = (
+                can_auto_enable_marlin_fp8() if not self.use_sm70_turbomind else False
+            )
             self.use_marlin = force_marlin or auto_enable
 
         self.use_mxfp8 = getattr(self.quant_config, "use_mxfp8", False)
@@ -776,6 +819,18 @@ class Fp8LinearMethod(LinearMethodBase):
             params_dtype=params_dtype,
         )
 
+    def expands_storage_after_loading(self, layer: Module) -> bool:
+        if not (self.block_quant and self.use_mxfp8):
+            return False
+        if getattr(self, "convert_mxfp8_to_block", False):
+            return False
+        if not self.is_checkpoint_fp8_serialized:
+            return False
+        # Some GPUs unpack MXFP8 to a wider dtype here. Always defer this
+        # method so MoE in-place repack still sees the packed checkpoint
+        # footprint. Harmless on GPUs that keep e4m3.
+        return True
+
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
         if self.use_npu_block_fp8:
             # G-B consumes checkpoint-layout E4M3 weights and FP32 scales.
@@ -829,6 +884,10 @@ class Fp8LinearMethod(LinearMethodBase):
             # Keep parameter object to preserve weight_loader attrs for hot reload.
             layer.weight_scale_inv.requires_grad_(False)
             layer.weight_scale_inv.format_ue8m0 = True
+            if get_platform().is_sm70:
+                layer.weight_block_size = self.quant_config.weight_block_size
+                prepare_mxfp8_layer_for_sm70_marlin(layer)
+                return
             self._process_mxfp8_linear_weight_scale(layer)
             return
         elif (
@@ -1229,6 +1288,12 @@ class Fp8LinearMethod(LinearMethodBase):
             # Only LinearBase defines this; an MXFP8 ParallelLMHead does not.
             if getattr(layer, "deepgemm_mxfp8_input", False):
                 layer.deepgemm_mxfp8_input = self.prepare_deepgemm_mxfp8_input(layer)
+
+            # SM70 MXFP8 stays packed e4m3+UE8M0 (or unpacks to FP16 when
+            # SGLANG_DSV41_MXFP8_W8A16=0) and must not fall through into
+            # Marlin/TurboMind FP8 packing (no g32 in marlin_v100).
+            if sm70_mxfp8_layer_skips_marlin(layer):
+                return
         else:
             layer.weight = Parameter(layer.weight.data, requires_grad=False)
 
@@ -1382,7 +1447,11 @@ class Fp8LinearMethod(LinearMethodBase):
                 _amx_process_weight_after_loading(layer, ["weight"])
                 return
 
-        if self.use_marlin:
+        if self.use_sm70_turbomind:
+            layer.weight_block_size = self.quant_config.weight_block_size
+            prepare_sm70_turbomind_fp8_linear(layer)
+            del layer.input_scale
+        elif self.use_marlin:
             if self.block_quant:
                 layer.weight_block_size = self.weight_block_size
             prepare_fp8_layer_for_marlin(layer, not self.block_quant)
@@ -1395,6 +1464,28 @@ class Fp8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if getattr(layer, "_sm70_mxfp8_w8a16", False):
+            from sglang.kernels.ops.quantization.sm70_dsv41_mxfp8_linear import (
+                sm70_dsv41_mxfp8_linear,
+            )
+
+            if isinstance(x, tuple):
+                x = x[0]
+            scale = getattr(layer, "weight_scale_inv", None)
+            if scale is None:
+                scale = layer.weight_scale
+            return sm70_dsv41_mxfp8_linear(
+                x, layer.weight, scale, bias, owner=layer
+            )
+
+        if getattr(layer, "_sm70_mxfp8_dequant_fp16", False):
+            if isinstance(x, tuple):
+                x = x[0]
+            return F.linear(x.to(dtype=layer.weight.dtype), layer.weight, bias)
+
+        if self.use_sm70_turbomind:
+            return apply_sm70_turbomind_fp8_linear(layer, x, bias)
+
         if self.use_marlin:
             return torch.ops.sglang.apply_fp8_marlin_linear(
                 input=x,
@@ -1563,6 +1654,15 @@ class Fp8LinearMethod(LinearMethodBase):
             cutlass_fp8_supported=self.cutlass_fp8_supported,
             use_per_token_if_dynamic=self.use_per_token_if_dynamic,
         )
+
+    def apply_fused_silu_and_mul(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        if not self.use_sm70_turbomind:
+            return None
+        return apply_sm70_turbomind_fp8_fused_silu_and_mul(layer, x)
 
 
 class Fp8MoEMethod(FusedMoEMethodBase):
@@ -2212,6 +2312,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                         layer.w2_weight.contiguous(), (16, 16)
                     )
                 return
+
+        if self.is_fp4_expert:
+            # Routed experts are MXFP4; use_mxfp8 on this config is the dense
+            # linear flag (DSV4.1-Flash). CUDA Marlin packs in the wrapper.
+            return
 
         if self.convert_mxfp8_to_block:
             # Only aiter-shuffle when the MoE runner is aiter; the triton runner

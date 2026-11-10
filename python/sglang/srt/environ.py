@@ -1308,6 +1308,33 @@ class Envs:
     SGLANG_FP4_IGNORED_LAYERS = EnvStr("")
 
     # ===================================================================
+    # SM70 (V100) quantization and MoE
+    # ===================================================================
+    # Block-FP8 linear backend on SM70: auto / turbomind / fp16. "auto" picks
+    # TurboMind when the extension is built and falls back to FP16 otherwise.
+    SGLANG_SM70_FP8_BACKEND = EnvStr("auto")
+    # SM70 block-FP8 prefill GEMM backend: auto / turbomind / fp16.
+    SGLANG_SM70_FP8_PREFILL_BACKEND = EnvStr("auto")
+    # Token count at which the SM70 block-FP8 prefill switches to the dense
+    # TurboMind GEMM (the validated 3920-token Qwen3.8-27B-FP8 TP4 shape).
+    SGLANG_SM70_FP8_PREFILL_MIN_TOKENS = EnvInt(3920)
+    # Run the exact-shape dense prefill kernel instead of the general dispatch.
+    SGLANG_SM70_FP8_PREFILL_EXACT_DENSE = EnvBool(True)
+    # QPN8 W8A16 kernels for SM70 block-FP8 decode (M<=8); off falls back to
+    # the TurboMind decode GEMM.
+    SGLANG_SM70_FP8_DECODE_QPN8 = EnvBool(True)
+    # Word-parallel QPN8 decoder for the validated SM70 decode shapes.
+    SGLANG_SM70_FP8_QPN8_FASTDEC = EnvBool(True)
+    # Fuse the QPN8 gate/up pair with the SiLU multiply at decode.
+    SGLANG_SM70_FP8_QPN8_FUSED_GATE = EnvBool(True)
+    # JIT build directory for the standalone QPN8 decode extension.
+    SGLANG_SM70_QPN8_BUILD_DIR = EnvStr("/tmp/sglang_qpn8_build")
+    # Prebuilt TurboMind SM70 extension; unset uses the bundled path.
+    SGLANG_SM70_TURBOMIND_OPS_PATH = EnvStr(None)
+    # TurboMind FP16 MoE runner on SM70; default on after validation.
+    SGLANG_SM70_FP16_MOE = EnvBool(True)
+
+    # ===================================================================
     # Humming quantization
     # ===================================================================
     SGLANG_HUMMING_ONLINE_QUANT_CONFIG = EnvJSON(None)

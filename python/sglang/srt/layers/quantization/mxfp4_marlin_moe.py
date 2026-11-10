@@ -1,3 +1,32 @@
+"""MXFP4 MoE → Marlin W4A16.
+
+Hopper (SM90/SM120) and SM70 (V100 ``marlin_v100``) share this method.
+Do not invent a third format and do not feed this path into
+``sm70_nvfp4_moe_decode`` (that kernel is NVFP4: E4M3 g16 + FP32 global).
+Decode M<=4 on SM70 uses ``sm70_dsv41_mxfp4_moe_decode`` (same packed
+MXFP4 layout); kill-switch ``SGLANG_DSV41_MOE_GEMV=0``. Spilled decode
+hits use D4-H host GEMV (``SGLANG_DSV41_HOST_GEMV``) instead of a second
+landing-pool GEMV.
+
+Exact SM70 pack (DeepSeek-V4.1-Flash experts):
+
+* Weights: MXFP4 e2m1, two nibbles per uint8 (low=even-K, high=odd-K),
+  LUT ``{0, ±0.5, ±1, ±1.5, ±2, ±3, ±4, ±6}``. Checkpoint ``[E, N, K/2]``.
+  ``view(int32).transpose(1, 2)`` → GPTQ ``[E, K/8, N]``, then
+  ``gptq_marlin_moe_repack`` from marlin_v100 (not the SM70 JIT stub).
+  Packed ``[E, K/16, N*(num_bits/2)]`` int32.
+* Scales: UE8M0 g32, checkpoint ``[E, N, K/32]`` (byte 127 = 1.0).
+  SM70 consumes raw E8M0 ``[E, K/32, N]``. No Hopper ``marlin_permute_scales``,
+  no 16-bit pair-swap, no NVFP4 S0E5M3, no global_scale.
+* Activations: FP16. Hopper upcasts FP16+E8M0 to BF16 because sgl-kernel
+  never instantiates that combo; marlin_v100 does, so SM70 must not upcast.
+* FP16 E8M0 dequant is exact iff scale bytes ∈ {0} ∪ [113, 142]. Otherwise
+  fail loud (Hopper BF16 would keep the exponent).
+* 384 routed experts / top-6 / hidden=5120 / intermediate=2304 fit one
+  ``moe_wna16_marlin_gemm``; there is no expert-count cap. Do not drop
+  experts to match the Qwen NVFP4 decode kernel.
+"""
+
 from __future__ import annotations
 
 import logging
@@ -158,8 +187,22 @@ class Mxfp4MarlinMoEMethod:
         if getattr(layer, "_mega_moe_weights_built", False):
             return
 
-        if not get_platform().is_sm90 and not get_platform().is_sm120:
-            raise RuntimeError("MXFP4 Marlin requires SM90 or SM120.")
+        platform = get_platform()
+        if platform.is_sm70:
+            from sglang.srt.layers.quantization.marlin_utils import (
+                _sm70_marlin_v100_available,
+            )
+
+            if not _sm70_marlin_v100_available():
+                raise RuntimeError(
+                    "MXFP4 Marlin on SM70 requires marlin_v100 "
+                    "(scripts/setup_v100_marlin.sh). Refusing the SM70 JIT "
+                    "repack stub, which would silently zero expert weights."
+                )
+        elif not platform.is_sm90 and not platform.is_sm120:
+            raise RuntimeError(
+                "MXFP4 Marlin requires SM90, SM120, or SM70+marlin_v100."
+            )
 
         if not check_moe_marlin_supports_layer(layer, 32, allow_tile_padding=True):
             raise RuntimeError(
@@ -206,9 +249,28 @@ class Mxfp4MarlinMoEMethod:
             )
 
         quant_info = build_marlin_moe_quant_info(layer)
+        padded_dispatch = dispatch_output._replace(hidden_states=hidden_states_padded)
         runner_output = self.runner.run(
-            dispatch_output._replace(hidden_states=hidden_states_padded),
+            padded_dispatch,
             quant_info=quant_info,
         )
 
-        return StandardCombineInput(hidden_states=runner_output.hidden_states)
+        hs = runner_output.hidden_states
+        # D4-H: CPU workers overlap this GPU GEMV; join adds host y.
+        # Always join when the request ran so CUDA graph capture cannot skip
+        # it via a host-side occupancy check. D4-G landing is the fallback.
+        if getattr(layer, "_dsv41_host_gemv_pending", False):
+            from sglang.srt.layers.moe.dsv41_expert_spill import spill_join_host_gemv
+
+            spill_join_host_gemv(layer, hs)
+        else:
+            land_ids = getattr(layer, "_dsv41_land_ids", None)
+            pool = getattr(layer, "_dsv41_landing_pool", None)
+            if land_ids is not None and pool is not None and pool.quant_info is not None:
+                land_topk = topk_output._replace(topk_ids=land_ids)
+                land_out = self.runner.run(
+                    padded_dispatch._replace(topk_output=land_topk),
+                    quant_info=pool.quant_info,
+                )
+                hs = hs + land_out.hidden_states
+        return StandardCombineInput(hidden_states=hs)

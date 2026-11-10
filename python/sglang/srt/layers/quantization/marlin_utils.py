@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import TYPE_CHECKING, Optional
 
 import numpy
@@ -23,6 +24,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.linear import LinearBase
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
+from sglang.kernels.sm70_paths import sm70_prebuilt_dir
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     get_tc_piecewise_forward_context,
 )
@@ -62,6 +64,113 @@ class MarlinLinearLayerConfig:
     has_g_idx: bool
 
 
+@lru_cache(maxsize=1)
+def _sm70_marlin_v100_available() -> bool:
+    """True iff the marlin_v100 SM70 MoE kernel is built and loadable.
+
+    The stock JIT Marlin MoE kernel is an empty stub on SM70 (writes nothing,
+    silently zeroing routed-expert output). marlin_v100 supplies real WMMA
+    kernels; when it is installed (scripts/setup_v100_marlin.sh) we re-enable
+    Marlin quant-type support and the gptq->gptq_marlin auto-promotion so that
+    AWQ/GPTQ MoE models work on V100.
+    """
+    try:
+        major, _ = get_device_capability()
+        if major != 7:
+            return False
+        from sglang.kernels.ops.moe.moe_wna16_marlin import _load_marlin_v100_op
+
+        return _load_marlin_v100_op() is not None
+    except Exception:
+        return False
+
+
+@lru_cache(maxsize=1)
+def _sm70_marlin_v100_repack_ops():
+    """Load marlin_v100's dense _C extension on SM70 and return its repack ops.
+
+    sglang's JIT ``gptq_marlin_repack``/``awq_marlin_repack`` are
+    ``__CUDA_ARCH__ < 800`` stubs on SM70 (the kernel body is empty, so the
+    output stays zeroed) -- meaning MoE expert weights are repacked to zeros
+    during loading and the marlin GEMM then reads all-zero weights. marlin_v100
+    ships real SM70 repack kernels in its dense extension; load it here.
+
+    Returns ``(gptq_repack, awq_repack)`` callables, or ``(None, None)`` if the
+    extension is unavailable (non-SM70 or not built).
+    """
+    if not _sm70_marlin_v100_available():
+        return None, None
+    import glob
+    import os
+
+    import torch  # noqa: F811
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    # setup_v100_marlin.sh installs the portable artifacts beside SGLang's
+    # JIT kernels.  The old lookup only checked this quantization source
+    # directory and ~/marlin_v100, so container images (which intentionally do
+    # not retain the full source checkout) silently fell back to SGLang's SM80+
+    # zero-output repack stub on V100.
+    jit_kernel_dir = str(sm70_prebuilt_dir())
+    home = os.path.expanduser("~")
+    candidates = sorted(
+        glob.glob(os.path.join(jit_kernel_dir, "_sm70_marlin_v100_dense*.so"))
+    )
+    candidates += sorted(glob.glob(os.path.join(here, "_sm70_marlin_v100_dense*.so")))
+    candidates += sorted(glob.glob(os.path.join(home, "marlin_v100", "vllm", "_C*.so")))
+    for path in candidates:
+        try:
+            torch.ops.load_library(path)
+        except Exception:
+            continue
+        gptq = getattr(torch.ops._C, "gptq_marlin_repack", None)
+        awq = getattr(torch.ops._C, "awq_marlin_repack", None)
+        if gptq is not None:
+            # marlin_v100's op takes an extra trailing `is_a_8bit` bool; wrap it
+            # so callers can use the sglang 5-arg signature unchanged.
+            def _gptq(b_q_weight, perm, size_k, size_n, num_bits, _op=gptq):
+                return _op(b_q_weight, perm, size_k, size_n, num_bits, False)
+
+            def _awq(b_q_weight, size_k, size_n, num_bits, _op=awq):
+                return _op(b_q_weight, size_k, size_n, num_bits, False)
+
+            logger.info(
+                "SM70 (V100): using marlin_v100 gptq/awq repack from %s "
+                "(stock JIT repack is a zero-output stub below sm_80).",
+                path,
+            )
+            return _gptq, _awq
+    return None, None
+
+
+@lru_cache(maxsize=1)
+def _sm70_marlin_v100_gemm_op():
+    """Return marlin_v100's dense SM70 GEMM op when it is installed.
+
+    SGLang's in-tree Marlin CUDA source intentionally compiles empty kernels
+    below SM80.  The V100 integration therefore has to use the dense
+    ``marlin_v100`` extension for both repacking and execution; using only its
+    repacker still produces zero output when the in-tree GEMM stub is called.
+    Loading the repack ops also loads the shared library that registers
+    ``torch.ops._C.marlin_gemm``.
+    """
+    if not _sm70_marlin_v100_available():
+        return None
+
+    gptq_repack, _ = _sm70_marlin_v100_repack_ops()
+    if gptq_repack is None:
+        return None
+
+    op = getattr(torch.ops._C, "marlin_gemm", None)
+    if op is None:
+        logger.warning(
+            "SM70 (V100): marlin_v100 repack is available, but its dense "
+            "marlin_gemm op was not registered."
+        )
+        return None
+    return op
+
+
 # For binary size and compile time, we don't support the same types for with and
 #  without runtime zero-point. We support common cases, i.e. AWQ and GPTQ.
 #  TODO: we may want to move this into the C++ so its closer to the actual impl
@@ -76,7 +185,14 @@ def query_marlin_supported_quant_types(
         device_capability = -1 if capability is None else capability
 
     if device_capability < 80:
-        return []
+        # The stock Marlin kernel is an SM80+ stub below sm_80. On SM70 (V100)
+        # the marlin_v100 integration (scripts/setup_v100_marlin.sh) supplies
+        # real WMMA kernels, so when it is loadable we report the same
+        # quant-type support matrix as SM80+.
+        if device_capability == 70 and _sm70_marlin_v100_available():
+            pass
+        else:
+            return []
 
     # - has_zp is True: return quant_types that has zero points
     # - has_zp is False: return quant_types that has not zero points
@@ -346,6 +462,241 @@ def marlin_moe_permute_scales(
     return output
 
 
+def sm70_marlin_moe_logical_scales(
+    s: torch.Tensor, size_k: int, size_n: int, group_size: int
+) -> torch.Tensor:
+    """Keep SM70 MoE metadata in logical, N-contiguous order."""
+    del size_k, group_size
+    return s.reshape((s.shape[0], -1, size_n)).contiguous()
+
+
+# SM70 marlin_v100 MXFP4 maps each UE8M0 byte `b` to FP16 as
+#   e = clamp(b - 112, 0, 31); value = 2^(e - 15)
+# which equals the OCP value 2^(b - 127) iff b ∈ [113, 142].
+# Byte 0 (zero-padding) flushes to +0. Hopper BF16 bit-shifts the full
+# E8M0 range (~2^-126 .. 2^127); we refuse out-of-range bytes rather than
+# silently clamp.
+SM70_MXFP4_UE8M0_FP16_EXACT_MIN = 113
+SM70_MXFP4_UE8M0_FP16_EXACT_MAX = 142
+
+# DeepSeek-V4.1-Flash routed-expert geometry. Not V4-Flash.
+DSV41_FLASH_HIDDEN_SIZE = 5120
+DSV41_FLASH_MOE_INTERMEDIATE_SIZE = 2304
+DSV41_FLASH_NUM_ROUTED_EXPERTS = 384
+DSV41_FLASH_NUM_EXPERTS_PER_TOK = 6
+DSV41_FLASH_MXFP4_GROUP_SIZE = 32
+
+
+def sm70_mxfp4_ue8m0_to_uint8(scales: torch.Tensor) -> torch.Tensor:
+    """Return raw UE8M0 bytes without a numerical round-trip.
+
+    Checkpoint-native ``float8_e8m0fnu`` / ``uint8`` are a view. Float
+    containers must already hold exact powers of two (``2**(e-127)``).
+    """
+    if scales.dtype == torch.float8_e8m0fnu:
+        return scales.view(torch.uint8)
+    if scales.dtype == torch.uint8:
+        return scales
+    if scales.dtype == torch.int8:
+        return scales.view(torch.uint8)
+    if scales.dtype in (torch.float32, torch.float16, torch.bfloat16):
+        finite = torch.isfinite(scales.float())
+        positive = scales.float() > 0
+        if bool((~finite | ~positive).any()):
+            raise RuntimeError(
+                "MXFP4 UE8M0 float scales must be finite and positive "
+                f"(got min={float(scales.float().min())}, "
+                f"max={float(scales.float().max())})."
+            )
+        log2_val = torch.log2(scales.float())
+        rounded = torch.round(log2_val)
+        if not torch.allclose(log2_val, rounded, atol=1e-4, rtol=0.0):
+            raise RuntimeError(
+                "MXFP4 UE8M0 float scales must be exact powers of two; "
+                "refusing a close-enough reinterpret as E8M0."
+            )
+        byte = (rounded + 127).to(torch.int32)
+        if bool((byte < 0).any() or (byte > 255).any()):
+            raise RuntimeError(
+                "MXFP4 UE8M0 exponent does not fit in a byte "
+                f"(got {int(byte.min())} .. {int(byte.max())})."
+            )
+        return byte.to(torch.uint8)
+    raise TypeError(f"Unsupported MXFP4 UE8M0 scale dtype: {scales.dtype}")
+
+
+def sm70_mxfp4_validate_ue8m0_scales(scales: torch.Tensor) -> None:
+    """Fail loud if any non-padding UE8M0 byte is outside the FP16-exact range."""
+    raw = sm70_mxfp4_ue8m0_to_uint8(scales)
+    in_range = (raw == 0) | (
+        (raw >= SM70_MXFP4_UE8M0_FP16_EXACT_MIN)
+        & (raw <= SM70_MXFP4_UE8M0_FP16_EXACT_MAX)
+    )
+    if bool(in_range.all()):
+        return
+    bad = raw[~in_range]
+    raise RuntimeError(
+        "SM70 marlin_v100 MXFP4 dequantizes UE8M0 in FP16 as "
+        "clamp(byte-112, 0, 31) << 10, which is exact only for bytes in "
+        f"{{0}} ∪ [{SM70_MXFP4_UE8M0_FP16_EXACT_MIN}, "
+        f"{SM70_MXFP4_UE8M0_FP16_EXACT_MAX}] (2^-14 .. 2^15). "
+        f"Found out-of-range bytes {int(bad.min())}..{int(bad.max())}. "
+        "Refusing to clamp (Hopper BF16 Marlin would keep these exponents)."
+    )
+
+
+def sm70_mxfp4_logical_ue8m0_scales(
+    scales: torch.Tensor,
+    *,
+    size_k: int,
+    size_n: int,
+    group_size: int = DSV41_FLASH_MXFP4_GROUP_SIZE,
+) -> torch.Tensor:
+    """Checkpoint ``[E, N, K/32]`` UE8M0 → logical ``[E, K/32, N]`` E8M0.
+
+    marlin_v100 indexes ``scales_ + group * size_n + cache_n`` as raw E8M0
+    bytes. Do **not** apply Hopper ``marlin_permute_scales`` or the 16-bit
+    pair-swap in ``mxfp4_marlin_process_scales`` — both corrupt SM70 metadata.
+    Do **not** encode NVFP4 S0E5M3; MXFP4 has no global_scale.
+    """
+    if group_size != 32:
+        raise ValueError(
+            f"Official MXFP4 is UE8M0 g32, got group_size={group_size}."
+        )
+    if size_k % group_size != 0:
+        raise ValueError(f"size_k={size_k} is not divisible by group_size=32.")
+    if scales.ndim != 3:
+        raise ValueError(
+            f"MXFP4 UE8M0 scales must be rank-3 [E, N, K/32] or "
+            f"[E, K/32, N], got shape={tuple(scales.shape)}"
+        )
+    if scales.dtype == torch.float8_e4m3fn:
+        raise RuntimeError(
+            "MXFP4 experts are UE8M0 g32, not NVFP4 E4M3 g16. "
+            "Refusing to approximately pack."
+        )
+
+    num_groups = size_k // group_size
+    raw = sm70_mxfp4_ue8m0_to_uint8(scales)
+    sm70_mxfp4_validate_ue8m0_scales(raw)
+
+    if raw.shape[1] == size_n and raw.shape[2] == num_groups:
+        logical = raw.transpose(1, 2).contiguous()
+    elif raw.shape[1] == num_groups and raw.shape[2] == size_n:
+        logical = raw.contiguous()
+    else:
+        raise ValueError(
+            "MXFP4 UE8M0 scales must be [E, N, K/32] (checkpoint) or "
+            f"[E, K/32, N] (logical); got shape={tuple(raw.shape)} "
+            f"with N={size_n}, K/32={num_groups}."
+        )
+    return sm70_marlin_moe_logical_scales(
+        logical.view(torch.float8_e8m0fnu), size_k, size_n, group_size
+    )
+
+
+def sm70_mxfp4_refuse_nvfp4_metadata(layer: torch.nn.Module) -> None:
+    """MXFP4 has no NVFP4 global scale / g16 E4M3 block scales."""
+    for name in (
+        "w13_weight_scale_2",
+        "w2_weight_scale_2",
+        "w13_global_scale",
+        "w2_global_scale",
+        "weight_global_scale",
+    ):
+        value = getattr(layer, name, None)
+        if value is not None:
+            raise RuntimeError(
+                "MXFP4 (e2m1 + UE8M0 g32) has no NVFP4 global_scale. "
+                f"Found {name}={type(value)}; refusing to pack into "
+                "sm70_nvfp4_moe_decode or NVFP4 Marlin metadata."
+            )
+
+
+def sm70_mxfp4_fused_decode_expert_limit() -> int | None:
+    """Expert-count cap of the SM70 fused MXFP4 decode, or None if uncapped.
+
+    ``marlin_v100 moe_wna16_marlin_gemm`` takes ``num_experts = b_q_weight.size(0)``
+    with no cap, so DeepSeek-V4.1-Flash's 384 routed experts fit one fused
+    decode (48 local with EP8). The specialized ``sm70_nvfp4_moe_decode``
+    kernel is a different format (NVFP4 E4M3 g16 + FP32 global, hidden=2560,
+    512 experts, top-10) and must not be used for V4.1-Flash.
+    """
+    return None
+
+
+def sm70_nvfp4_marlin_process_scales(
+    scales: torch.Tensor, activation_dtype: torch.dtype
+) -> tuple[torch.Tensor, float]:
+    """Encode logical E4M3 NVFP4 scales for the SM70 Marlin fast path.
+
+    The V100 iterator converts four metadata bytes to FP16/BF16 with integer
+    bit operations.  It therefore consumes the special non-negative S0E5M3
+    representation used by marlin_v100, not checkpoint-native S1E4M3 bytes.
+    ``scales`` must already be in logical ``[E, K/16, N]`` order.
+
+    Returns the encoded metadata and a power-of-two scale factor.  The caller
+    must divide the processed global scale by that factor.
+    """
+    if activation_dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError(
+            "SM70 NVFP4 Marlin supports FP16/BF16 activations, got "
+            f"{activation_dtype}"
+        )
+    if scales.dtype != torch.float8_e4m3fn or scales.ndim != 3:
+        raise ValueError(
+            "SM70 NVFP4 Marlin expects [E,K/16,N] E4M3 scales, got "
+            f"shape={tuple(scales.shape)}, dtype={scales.dtype}"
+        )
+
+    logical = scales.to(torch.float16)
+    if bool((logical < 0).any()):
+        raise ValueError("NVFP4 block scales must be non-negative")
+
+    # FP16 has enough exponent range for ModelOpt's normalized E4M3 scales.
+    # BF16 may need a shared rescale so every non-zero S0E5M3 byte keeps its
+    # high bit set, which the integer dequantizer relies on.
+    scale_factor = 1.0
+    if activation_dtype == torch.bfloat16:
+        nonzero = logical[logical > 0]
+        if nonzero.numel() > 0:
+            min_scaled = nonzero.float().min() * (2**7)
+            if min_scaled < 2:
+                scale_factor = float(torch.ceil(torch.log2(2 / min_scaled)).exp2())
+                logical = (logical.float() * scale_factor).to(torch.float16)
+
+    num_experts, num_groups, size_n = logical.shape
+    if size_n % 4 != 0:
+        raise ValueError(
+            f"SM70 NVFP4 Marlin requires N divisible by 4, got N={size_n}"
+        )
+    flat = logical.reshape(-1, size_n)
+    # The iterator deliberately reverses each pair when expanding metadata.
+    flat = flat.view(-1, 4)[:, [0, 2, 1, 3]].reshape(-1, size_n)
+    encoded = (flat * (2**7)).view(torch.int16) << 1
+    encoded = encoded.view(torch.float8_e4m3fn).reshape(-1, size_n * 2)
+    encoded = encoded[:, 1::2].contiguous()
+    return encoded.reshape(num_experts, num_groups, size_n), scale_factor
+
+
+def sm70_nvfp4_marlin_process_global_scale(
+    global_scale: torch.Tensor, activation_dtype: torch.dtype
+) -> torch.Tensor:
+    """Compensate an NVFP4 global scale for SM70's integer dequantizer."""
+    if activation_dtype == torch.float16:
+        target_exponent = 5
+    elif activation_dtype == torch.bfloat16:
+        target_exponent = 8
+    else:
+        raise ValueError(
+            "SM70 NVFP4 Marlin supports FP16/BF16 activations, got "
+            f"{activation_dtype}"
+        )
+    fp4_exponent = 2
+    exponent_bias = 2 ** (target_exponent - 1) - 2 ** (fp4_exponent - 1)
+    return (global_scale.to(torch.float32) * (2.0 ** (exponent_bias - 7))).contiguous()
+
+
 def marlin_zero_points(
     zp: torch.Tensor, size_k: int, size_n: int, num_bits: int
 ) -> torch.Tensor:
@@ -405,6 +756,37 @@ def moe_awq_to_marlin_zero_points(
     for e in range(num_experts):
         output[e] = awq_to_marlin_zero_points(q_zp_packed[e], size_k, size_n, num_bits)
     return output
+
+
+def moe_awq_to_sm70_marlin_zero_points_float(
+    q_zp_packed: torch.Tensor,
+    scales: torch.Tensor,
+    size_k: int,
+    size_n: int,
+    num_bits: int,
+) -> torch.Tensor:
+    """Expand AWQ zero-points to the FP16 metadata required by SM70 MoE.
+
+    marlin_v100 consumes logical ``zero_point * scale`` values rather than the
+    packed/permuted integer zero-points used by the SM80+ Marlin kernels.
+    """
+    q_zp = unpack_cols(
+        q_zp_packed.reshape(-1, q_zp_packed.shape[-1]),
+        num_bits,
+        size_k * q_zp_packed.shape[0],
+        size_n,
+    ).reshape(q_zp_packed.shape[0], size_k, size_n)
+
+    if num_bits == 4:
+        undo_interleave = numpy.argsort(numpy.array([0, 2, 4, 6, 1, 3, 5, 7]))
+    elif num_bits == 8:
+        undo_interleave = numpy.argsort(numpy.array([0, 2, 1, 3]))
+    else:
+        raise ValueError(f"num_bits must be 4 or 8, got {num_bits}")
+
+    q_zp = q_zp.reshape(-1, len(undo_interleave))[:, undo_interleave]
+    q_zp = q_zp.reshape(q_zp_packed.shape[0], size_k, size_n)
+    return (q_zp.float() * scales.contiguous().float()).to(scales.dtype).contiguous()
 
 
 def maybe_warn_marlin_atomic_add(device, dtype):

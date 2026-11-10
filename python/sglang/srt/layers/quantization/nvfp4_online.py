@@ -56,6 +56,34 @@ def _nvfp4_weight_quantization_scope():
                 _nvfp4_weight_quantization_env.close()
 
 
+# Midpoints between adjacent E2M1 magnitudes 0, 0.5, 1, 1.5, 2, 3, 4, 6.
+_E2M1_MIDPOINTS = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)
+# Ties at these midpoints round up to the even code (1, 2, 4); the rest round down.
+_E2M1_TIES_UP = (0.75, 1.75, 3.5)
+
+
+def _nvfp4_quantize_torch(
+    *, weight: torch.Tensor, weight_scale_2: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Packed NVFP4 [rows, cols / 2] (even element in the low nibble) and linear
+    E4M3 block scales [rows, cols / 16], rounding to nearest even like FlashInfer."""
+    rows, cols = weight.shape
+    blocks = weight.float().reshape(rows, cols // 16, 16)
+    block_amax = blocks.abs().amax(dim=-1)
+    weight_sf = (block_amax / (6.0 * weight_scale_2)).clamp(max=448.0)
+    weight_sf = weight_sf.to(torch.float8_e4m3fn)
+    block_scale = weight_sf.float() * weight_scale_2
+    scaled = blocks / torch.where(block_scale > 0, block_scale, 1.0).unsqueeze(-1)
+    magnitude = scaled.abs()
+    midpoints = torch.tensor(_E2M1_MIDPOINTS, device=weight.device)
+    code = torch.bucketize(magnitude, midpoints)
+    for tie in _E2M1_TIES_UP:
+        code += magnitude == tie
+    code = (code | ((scaled < 0).long() << 3)).to(torch.uint8).reshape(rows, cols)
+    packed = code[:, 0::2] | (code[:, 1::2] << 4)
+    return packed.contiguous(), weight_sf.contiguous()
+
+
 class NvFp4OnlineConfig(ModelOptQuantConfig):
     """Load-time NVFP4 expert weights with online activation handling.
 
@@ -322,6 +350,14 @@ class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
             weight_scale_2 = weight_scale_2.to(
                 device=weight.device, dtype=torch.float32
             )
+        rows, cols = weight.shape
+        # FlashInfer's cute-dsl quantizer requires SM100+.
+        if torch.cuda.get_device_capability(weight.device)[0] < 10:
+            fp4_weight, weight_sf = _nvfp4_quantize_torch(
+                weight=weight, weight_scale_2=weight_scale_2
+            )
+            return fp4_weight, weight_sf, weight_scale_2
+
         # FlashInfer still uses an environment flag for exact FP4 math.
         with _nvfp4_weight_quantization_scope():
             fp4_weight, weight_sf = nvfp4_quantize(
@@ -331,7 +367,6 @@ class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
                 backend="cute-dsl",
                 nvfp4_4over6=nvfp4_4over6_config,
             )
-        rows, cols = weight.shape
         weight_sf = weight_sf.view(torch.float8_e4m3fn).reshape(rows, cols // 16)
         return (
             fp4_weight.reshape(rows, cols // 2),

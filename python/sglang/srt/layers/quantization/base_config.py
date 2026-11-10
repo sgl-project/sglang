@@ -46,6 +46,14 @@ class QuantizeMethodBase(ABC):
         """
         return
 
+    def expands_storage_after_loading(self, layer: nn.Module) -> bool:
+        """True if ``process_weights_after_loading`` grows device storage.
+
+        The loader runs those methods in a second pass so in-place repack
+        can use the free block that exists before expansion.
+        """
+        return False
+
     def restore_weights_before_loading(self, layer: nn.Module) -> None:
         """Undo an in-place repack so checkpoint-format weights can be loaded again.
 
@@ -95,6 +103,10 @@ class LinearMethodBase(QuantizeMethodBase):
 
 
 class FusedMoEMethodBase(QuantizeMethodBase):
+    # True only when apply() leaves dispatch_output.hidden_states untouched,
+    # including all fallback paths. Models can then share the input with
+    # concurrent shared-expert computation.
+    preserves_input: bool = False
     runner: MoeRunner | None = None
 
     def create_weights(

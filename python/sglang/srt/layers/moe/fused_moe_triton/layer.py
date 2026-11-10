@@ -111,6 +111,7 @@ def _fuses_routed_scaling_factor_in_topk(quant_method, runner_backend) -> bool:
         or (
             isinstance(quant_method, ModelOptNvFp4FusedMoEMethod)
             # Marlin, or the LoRA MoE runner on its Marlin NVFP4 vendor.
+            and not quant_method.is_sm70
             and (
                 runner_backend is None
                 or not (runner_backend.is_marlin() or runner_backend.is_lora_marlin())
@@ -548,11 +549,23 @@ class FusedMoE(torch.nn.Module):
             if self.quant_method is None and quant_config is not None:
                 self.quant_method = quant_config.get_quant_method(self, prefix)
             if self.quant_method is None:
-                self.quant_method = UnquantizedFusedMoEMethod(
-                    self.use_triton_kernels,
-                    self.use_flashinfer_trtllm_moe,
-                    self.use_deep_gemm,
+                from sglang.srt.layers.quantization.sm70_fp16_moe import (
+                    SM70FP16MoEMethod,
+                    can_use_sm70_fp16_moe,
                 )
+
+                if (
+                    not with_bias
+                    and get_moe_a2a_backend().is_none()
+                    and can_use_sm70_fp16_moe(params_dtype)
+                ):
+                    self.quant_method = SM70FP16MoEMethod()
+                else:
+                    self.quant_method = UnquantizedFusedMoEMethod(
+                        self.use_triton_kernels,
+                        self.use_flashinfer_trtllm_moe,
+                        self.use_deep_gemm,
+                    )
             if get_exec().moe.enable_paged_experts:
                 from sglang.srt.layers.moe.paged_experts import make_for_layer
 
@@ -572,7 +585,6 @@ class FusedMoE(torch.nn.Module):
         self.moe_runner_config.intermediate_size_per_partition = (
             self.intermediate_size_per_partition
         )
-
         _validate_hpc_ops_quant_method(self.quant_method)
         _validate_deepep_v2_quant_method(self.quant_method)
         if (
@@ -607,9 +619,22 @@ class FusedMoE(torch.nn.Module):
         )
         self.supports_deferred_finalize = False
 
+        from sglang.srt.layers.moe.dsv41_expert_spill import (
+            alloc_spill_host_buffers,
+            plan_gpu_expert_slots,
+        )
+
+        gpu_n, spill_plan = plan_gpu_expert_slots(
+            num_local_experts=self.num_local_experts,
+            n_shared=int(self.num_fused_shared_experts),
+            hidden_size=hidden_size,
+            intermediate_size_per_partition=self.intermediate_size_per_partition,
+        )
+        self._dsv41_gpu_expert_slots = gpu_n
+
         self.quant_method.create_weights(
             layer=self,
-            num_experts=self.num_local_experts,
+            num_experts=gpu_n,
             hidden_size=hidden_size,
             intermediate_size_per_partition=self.intermediate_size_per_partition,
             params_dtype=params_dtype,
@@ -621,6 +646,8 @@ class FusedMoE(torch.nn.Module):
             with_bias=with_bias,
             moe_intermediate_size=intermediate_size,
         )
+        if spill_plan is not None and spill_plan.n_spilled:
+            alloc_spill_host_buffers(self, spill_plan)
 
         _validate_gluon_quant_method(self, self.quant_method)
         self.quant_method.create_moe_runner(self, self.moe_runner_config)
@@ -1013,12 +1040,21 @@ class FusedMoE(torch.nn.Module):
             elif not is_bias and not self.use_presharded_weights:
                 if self.use_triton_kernels:
                     loaded_weight = loaded_weight.transpose(-2, -1)
-                # Derive shard size from the loaded weight so padded buffers
-                # do not cause out-of-bounds indexing into the checkpoint.
-                loaded_shard_size = loaded_weight.shape[shard_dim] // self.moe_tp_size
-                loaded_weight = loaded_weight.narrow(
-                    shard_dim, loaded_shard_size * self.moe_tp_rank, loaded_shard_size
-                )
+                # Some params are allocated "full" on every rank (w2
+                # scales/qzeros for desc_act=False GPTQ-marlin carry all
+                # num_groups because is_k_full=True), so the checkpoint slice
+                # is already the per-rank shard and narrowing would overflow.
+                if loaded_weight.shape[shard_dim] > shard_size:
+                    # Derive shard size from the loaded weight so padded buffers
+                    # do not cause out-of-bounds indexing into the checkpoint.
+                    loaded_shard_size = (
+                        loaded_weight.shape[shard_dim] // self.moe_tp_size
+                    )
+                    loaded_weight = loaded_weight.narrow(
+                        shard_dim,
+                        loaded_shard_size * self.moe_tp_rank,
+                        loaded_shard_size,
+                    )
 
         # w2, down_proj: Load into only logical weight of w2.
         loaded_weight = _maybe_copy_weight_view_before_h2d(loaded_weight)
@@ -1197,10 +1233,18 @@ class FusedMoE(torch.nn.Module):
     def _load_single_value(
         self, param: torch.nn.Parameter, loaded_weight: torch.Tensor, expert_id: int
     ):
-        param_data = param.data
+        from sglang.srt.layers.moe.dsv41_expert_spill import (
+            remap_shared_expert_gpu_index,
+            spilled_expert_host_row,
+        )
 
-        # Input scales can be loaded directly and should be equal.
-        param_data[expert_id] = loaded_weight
+        spilled = spilled_expert_host_row(self, param, expert_id)
+        if spilled is not None:
+            host, host_row = spilled
+            host[host_row] = loaded_weight
+            return
+        expert_id = remap_shared_expert_gpu_index(self, expert_id)
+        param.data[expert_id] = loaded_weight
 
     def _load_g_idx(
         self,
@@ -1442,7 +1486,18 @@ class FusedMoE(torch.nn.Module):
         # dimension intermediate_size is used.
         SHARD_ID_TO_SHARDED_DIM = {"w1": 0, "w2": 1, "w3": 0}
 
-        expert_data = param.data[expert_id]
+        from sglang.srt.layers.moe.dsv41_expert_spill import (
+            remap_shared_expert_gpu_index,
+            spilled_expert_host_row,
+        )
+
+        spilled = spilled_expert_host_row(self, param, expert_id)
+        if spilled is not None:
+            host, host_row = spilled
+            expert_data = host[host_row]
+        else:
+            expert_id = remap_shared_expert_gpu_index(self, expert_id)
+            expert_data = param.data[expert_id]
 
         # is_transposed: if the dim to shard the weight
         # should be flipped. Required by GPTQ, compressed-tensors
@@ -1723,6 +1778,14 @@ class FusedMoE(torch.nn.Module):
         topk_output: TopKOutput,
         pre_quant_input: Optional[Tuple] = None,
     ):
+        if envs.SGLANG_DEBUG_DSV41_PROBE_STATS.get():
+            from sglang.srt.debug.dsv41_probe_stats import record_moe
+
+            record_moe(self.layer_id, hidden_states, topk_output)
+        if envs.SGLANG_DEBUG_DSV41_ALIGN_DUMP.get():
+            from sglang.srt.debug.dsv41_align_dump import record_moe_row
+
+            record_moe_row(self.layer_id, hidden_states, topk_output)
         if self._use_ascend_fuseep:
             from sglang.srt.hardware_backend.npu.moe.fuseep import forward_fuseep
 
@@ -1848,6 +1911,14 @@ class FusedMoE(torch.nn.Module):
 
     def run_moe_core(self, dispatch_output: DispatchOutput) -> CombineInput:
         # TODO: consider using symmetric memory
+        if getattr(self, "_dsv41_expert_lru", None) is not None:
+            from sglang.srt.layers.moe.dsv41_expert_spill import (
+                run_moe_with_expert_spill,
+            )
+
+            return run_moe_with_expert_spill(
+                self, dispatch_output, self.quant_method.apply
+            )
         return self.quant_method.apply(
             layer=self,
             dispatch_output=dispatch_output,

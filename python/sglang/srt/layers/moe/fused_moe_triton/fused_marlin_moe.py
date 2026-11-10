@@ -13,14 +13,29 @@ from sglang.srt.utils.custom_op import register_custom_op
 
 _is_cuda = is_cuda()
 
+# sgl_kernel's moe_sum_reduce C++ op is excluded from V100 (SGL_KERNEL_V100_ONLY)
+# builds, so on SM70 fall back to the triton kernel (mirrors the TRITON runner
+# guard in moe_runner/triton_utils/fused_moe.py added in acbb390dc).
+_has_sgl_moe_sum_reduce = False
 if _is_cuda:
-    from sgl_kernel import moe_sum_reduce
-
     from sglang.kernels.ops.activation.activation import (
         silu_and_mul,
         silu_and_mul_with_activation_rounding,
     )
-    from sglang.kernels.ops.moe.moe_wna16_marlin import moe_wna16_marlin_gemm
+    from sglang.kernels.ops.moe.fused_moe_triton_kernels import moe_sum_reduce_triton
+    from sglang.kernels.ops.moe.moe_wna16_marlin import (
+        moe_wna16_marlin_gemm,
+        sm70_qwen38_prefill_2k_enabled,
+    )
+
+    try:
+        _cuda_major, _ = torch.cuda.get_device_capability()
+    except Exception:
+        _cuda_major = 0
+    if _cuda_major >= 8:
+        from sgl_kernel import moe_sum_reduce
+
+        _has_sgl_moe_sum_reduce = True
 
 
 # Not the JIT situ_and_mul: tanh as 2 * sigmoid(2x) - 1 is not bit-exact with it.
@@ -99,7 +114,14 @@ def get_scalar_type(
         not has_zp
         and num_bits == 4
         and scales is not None
-        and (scales.dtype == torch.float8_e8m0fnu or global_scale is not None)
+        # e4m3fn block scales with 4-bit weights and no zero point are NVFP4;
+        # classifying them as uint4b8 would decode FP4 payloads as INT4 and
+        # silently produce garbage, so key off the dtype too, not only on the
+        # presence of a global scale.
+        and (
+            scales.dtype in (torch.float8_e4m3fn, torch.float8_e8m0fnu)
+            or global_scale is not None
+        )
     ):
         return scalar_types.float4_e2m1f
     if has_zp:
@@ -148,6 +170,7 @@ def fused_marlin_moe(
     topk_ids: torch.Tensor,
     global_num_experts: int = -1,
     expert_map: Optional[torch.Tensor] = None,
+    is_expert_parallel: bool = False,
     g_idx1: Optional[torch.Tensor] = None,
     g_idx2: Optional[torch.Tensor] = None,
     sort_indices1: Optional[torch.Tensor] = None,
@@ -168,6 +191,8 @@ def fused_marlin_moe(
     activation: str = "silu",
     is_gated: bool = True,
     no_combine: bool = False,
+    gate_up_input_scale: float = 1.0,
+    wide_output_scale: float = 1.0,
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -223,11 +248,22 @@ def fused_marlin_moe(
         and w1_global_scale is not None
         and w2_global_scale is not None
     )
+    if is_nvfp4_marlin:
+        assert w1_global_scale.dtype == torch.float32
+        assert w2_global_scale.dtype == torch.float32
     if is_mxfp4_marlin:
-        assert hidden_states.dtype == torch.bfloat16, (
-            "MXFP4 Marlin with E8M0 scales is only instantiated for bfloat16 "
-            f"activations, got {hidden_states.dtype}"
-        )
+        if hidden_states.dtype == torch.float16:
+            sm_major = torch.cuda.get_device_capability(hidden_states.device)[0]
+            assert sm_major == 7, (
+                "MXFP4 Marlin FP16+E8M0 is the SM70 marlin_v100 path; "
+                f"got SM{sm_major}0 with dtype {hidden_states.dtype}"
+            )
+        else:
+            assert hidden_states.dtype == torch.bfloat16, (
+                "MXFP4 Marlin with E8M0 scales is instantiated for bfloat16 "
+                "on Hopper/Blackwell and float16 on SM70 marlin_v100, "
+                f"got {hidden_states.dtype}"
+            )
     elif not is_nvfp4_marlin:
         assert hidden_states.dtype == w1_scale.dtype, (
             f"moe_wna16_marlin_gemm assumes hidden_states.dtype ({hidden_states.dtype}) == w1_scale.dtype ({w1_scale.dtype})"
@@ -248,6 +284,18 @@ def fused_marlin_moe(
     for block_size_m in [8, 16, 32, 48, 64]:
         if M * topk / E / block_size_m < 0.9:
             break
+
+    if (
+        is_nvfp4_marlin
+        and (M, K, N, E, topk) == (2048, 2560, 160, 512, 10)
+        and hidden_states.dtype == torch.float16
+        and sm70_qwen38_prefill_2k_enabled()
+        and torch.cuda.get_device_capability(hidden_states.device) == (7, 0)
+    ):
+        # The V100 kernel uses 64-row CTAs. Its 48-row routing groups create
+        # extra tiles for experts with 49-64 rows. The matched geometry and
+        # metadata settings are selected by moe_wna16_marlin_gemm below.
+        block_size_m = 64
 
     if global_num_experts == -1:
         global_num_experts = E
@@ -312,8 +360,21 @@ def fused_marlin_moe(
         or torch.cuda.get_device_capability(hidden_states.device)[0] >= 9
     ) and (not is_mxfp4_marlin)
 
+    # SGLang's standard dispatcher has already converted global expert IDs to
+    # rank-local IDs and replaced remote routes with -1.  Unlike vLLM, there
+    # is therefore no expert_map to pass through to the alignment kernel.  We
+    # still need to tell Marlin that this is EP: invalid blocks must be skipped
+    # and, most importantly, their output slots must start at zero before the
+    # per-rank results are summed and all-reduced.
+    is_ep = is_expert_parallel or expert_map is not None
+
+    if gate_up_input_scale != 1.0:
+        marlin_hidden_states = hidden_states / gate_up_input_scale
+    else:
+        marlin_hidden_states = hidden_states
+
     intermediate_cache1 = moe_wna16_marlin_gemm(
-        hidden_states,
+        marlin_hidden_states,
         intermediate_cache1,
         w1,
         w1_bias,
@@ -330,7 +391,7 @@ def fused_marlin_moe(
         moe_block_size=block_size_m,
         top_k=topk,
         mul_topk_weights=False,
-        is_ep=expert_map is not None,
+        is_ep=is_ep,
         expert_ids_are_sorted=expert_map is None,
         has_inactive_prefix_count=expert_map is None,
         b_q_type=scalar_type1,
@@ -340,10 +401,29 @@ def fused_marlin_moe(
         is_k_full=is_k_full,
         use_atomic_add=use_atomic_add,
         use_fp32_reduce=True,
-        is_zp_float=False,
+        is_zp_float=w1_zeros is not None and w1_zeros.dtype != torch.int32,
     )
 
-    if activation == "silu" and is_gated and gemm1_alpha is not None:
+    activation_scales = None
+    if wide_output_scale != 1.0:
+        # Laguna's SM70 wide-output path folds the activation scale into the
+        # GEMM2 input and rescales the result below; it has no clamped variant.
+        if clamp_limit is not None:
+            raise ValueError(
+                "Laguna's SM70 wide-output path does not support SwiGLU clamping."
+            )
+        if not (activation == "silu" and is_gated):
+            raise ValueError(
+                "Laguna's SM70 wide-output path only supports gated silu, got "
+                f"{activation=}, {is_gated=}."
+            )
+        from sglang.srt.layers.laguna_rmsnorm import laguna_silu_and_mul_sm70
+
+        intermediate_cache2, activation_scales = laguna_silu_and_mul_sm70(
+            intermediate_cache1.view(-1, gemm1_n),
+            gate_up_scale=gate_up_input_scale,
+        )
+    elif activation == "silu" and is_gated and gemm1_alpha is not None:
         if clamp_limit is None:
             raise ValueError("GPT-OSS Marlin activation requires clamp_limit.")
         swiglu_oai_split(
@@ -395,7 +475,7 @@ def fused_marlin_moe(
         top_k=1,
         mul_topk_weights=True,
         zero_inactive_output=True,
-        is_ep=expert_map is not None,
+        is_ep=is_ep,
         expert_ids_are_sorted=expert_map is None,
         has_inactive_prefix_count=expert_map is None,
         b_q_type=scalar_type2,
@@ -405,8 +485,17 @@ def fused_marlin_moe(
         is_k_full=is_k_full,
         use_atomic_add=use_atomic_add,
         use_fp32_reduce=True,
-        is_zp_float=False,
+        is_zp_float=w2_zeros is not None and w2_zeros.dtype != torch.int32,
     ).view(-1, topk, K)
+
+    if wide_output_scale != 1.0:
+        from sglang.srt.layers.laguna_rmsnorm import laguna_scale_output_sm70
+
+        laguna_scale_output_sm70(
+            intermediate_cache3,
+            activation_scales,
+            residual_scale=wide_output_scale,
+        )
 
     if no_combine:
         return intermediate_cache3
@@ -431,15 +520,27 @@ def fused_marlin_moe(
 
             moe_topk_sum(intermediate_cache3, output)
         else:
-            moe_sum_reduce(intermediate_cache3, output, 1.0)
+            if _has_sgl_moe_sum_reduce:
+                moe_sum_reduce(intermediate_cache3, output, 1.0)
+            else:
+                moe_sum_reduce_triton(intermediate_cache3, output, 1.0)
         return output
     else:
         if routed_scaling_factor is None:
             routed_scaling_factor = 1.0
 
-        moe_sum_reduce(
-            intermediate_cache3,
-            output,
-            routed_scaling_factor,
-        )
+        if _has_sgl_moe_sum_reduce:
+            moe_sum_reduce(
+                intermediate_cache3,
+                output,
+                routed_scaling_factor,
+            )
+        else:
+            # SM70 (V100): sgl_kernel moe_sum_reduce op is unavailable; use the
+            # triton fallback (same kernel the TRITON MoE runner uses on SM70).
+            moe_sum_reduce_triton(
+                intermediate_cache3,
+                output,
+                routed_scaling_factor,
+            )
         return output

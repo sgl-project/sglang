@@ -70,6 +70,12 @@ class TritonMoeQuantInfo(MoeQuantInfo):
     # w13 rows were permuted to interleave gate/up at load, so the activation
     # must be applied by the fused up-GEMM epilogue (see fused_moe_kernel).
     fuse_swiglu_interleaved: bool = False
+    # SM70 (V100) NVFP4 W4A16: raw [E,N,K/2] FP4 codes with [E,N,K/16] E4M3
+    # block scales and one FP32 global scale per expert, decoded on the fly.
+    use_nvfp4_w4a16: bool = False
+    nvfp4_group_size: int = 16
+    w13_scale2: Optional[torch.Tensor] = None
+    w2_scale2: Optional[torch.Tensor] = None
 
 
 def _topk_ids_may_be_nonlocal(config: MoeRunnerConfig) -> bool:
@@ -151,6 +157,8 @@ class TritonRunnerCore(MoeRunnerCore):
             use_int8_w8a8=quant_info.use_int8_w8a8,
             use_int8_w8a16=quant_info.use_int8_w8a16,
             use_int4_w4a16=quant_info.use_int4_w4a16,
+            use_nvfp4_w4a16=quant_info.use_nvfp4_w4a16,
+            nvfp4_group_size=quant_info.nvfp4_group_size,
             per_channel_quant=quant_info.per_channel_quant,
             w1_scale=quant_info.w13_scale,
             w2_scale=quant_info.w2_scale,
@@ -159,6 +167,8 @@ class TritonRunnerCore(MoeRunnerCore):
             a1_scale=quant_info.a13_scale,
             a2_scale=quant_info.a2_scale,
             block_shape=quant_info.block_shape,
+            w1_scale2=quant_info.w13_scale2,
+            w2_scale2=quant_info.w2_scale2,
             activation=self.config.activation,
             is_gated=self.config.is_gated,
             no_combine=self.config.no_combine,
@@ -248,6 +258,8 @@ def fused_experts_none_to_triton(
             use_int8_w8a8=quant_info.use_int8_w8a8,
             use_int8_w8a16=quant_info.use_int8_w8a16,
             use_int4_w4a16=quant_info.use_int4_w4a16,
+            use_nvfp4_w4a16=quant_info.use_nvfp4_w4a16,
+            nvfp4_group_size=quant_info.nvfp4_group_size,
             per_channel_quant=quant_info.per_channel_quant,
             w1_scale=quant_info.w13_scale,
             w2_scale=quant_info.w2_scale,
@@ -256,6 +268,8 @@ def fused_experts_none_to_triton(
             a1_scale=a1_scale,
             a2_scale=quant_info.a2_scale,
             block_shape=quant_info.block_shape,
+            w1_scale2=quant_info.w13_scale2,
+            w2_scale2=quant_info.w2_scale2,
             a1_q=a1_q,
             fuse_swiglu_interleaved=quant_info.fuse_swiglu_interleaved,
         )

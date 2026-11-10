@@ -3162,7 +3162,18 @@ def can_auto_enable_marlin_fp8() -> bool:
     try:
         major, minor = get_device_capability()
         sm = major * 10 + minor
-        return 80 <= sm < 89
+        if 80 <= sm < 89:
+            return True
+        if sm == 70:
+            # The in-tree Marlin kernels are SM80+ stubs, but this fork ships
+            # an optional marlin_v100 integration with real FP8 weight-only
+            # repack and GEMM kernels for Volta.
+            from sglang.srt.layers.quantization.marlin_utils import (
+                _sm70_marlin_v100_gemm_op,
+            )
+
+            return _sm70_marlin_v100_gemm_op() is not None
+        return False
     except Exception:
         return False
 

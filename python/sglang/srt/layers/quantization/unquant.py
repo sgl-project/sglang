@@ -839,7 +839,27 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 return bf16_gemm_dispatch(x, layer.weight, bias)
             return _bf16_gemm_dispatch_impl(x, layer.weight, bias)
 
-        return F.linear(x, layer.weight, bias)
+        from sglang.kernels.ops.gemm.sm70_dense_gemv import linear, supported
+
+        weight = layer.weight
+        if x.dtype != weight.dtype:
+            weight = weight.to(dtype=x.dtype)
+        if bias is not None and bias.dtype != x.dtype:
+            bias = bias.to(dtype=x.dtype)
+        if supported(x, weight, bias):
+            return linear(x, weight)
+        from sglang.kernels.ops.gemm import sm70_rows_gemv
+
+        if bias is None and sm70_rows_gemv.supported(x, weight):
+            return sm70_rows_gemv.linear(x, weight)
+        return F.linear(x, weight, bias)
+
+    def apply_fused_silu_and_mul(self, layer, x):
+        from sglang.kernels.ops.gemm.sm70_qwen_fusions import gate_up, gate_up_supported
+
+        if gate_up_supported(x, layer.weight):
+            return gate_up(x, layer.weight)
+        return None
 
     def apply_with_addend(
         self,

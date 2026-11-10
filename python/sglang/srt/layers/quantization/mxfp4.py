@@ -657,12 +657,24 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 prepare_moe_mxfp4_layer_for_marlin,
             )
 
-            if (
+            if get_platform().is_sm70:
+                from sglang.srt.layers.quantization.marlin_utils import (
+                    _sm70_marlin_v100_available,
+                )
+
+                if not _sm70_marlin_v100_available():
+                    raise RuntimeError(
+                        "MXFP4 Marlin on SM70 requires marlin_v100 "
+                        "(scripts/setup_v100_marlin.sh)."
+                    )
+            elif (
                 not get_platform().is_sm90
                 and not get_platform().is_sm100
                 and not get_platform().is_sm120
             ):
-                raise RuntimeError("MXFP4 Marlin requires SM90+.")
+                raise RuntimeError(
+                    "MXFP4 Marlin requires SM90+, or SM70 with marlin_v100."
+                )
             if not check_moe_marlin_supports_layer(layer, 32, allow_tile_padding=True):
                 raise RuntimeError(
                     "Current MXFP4 MoE layer is not supported by Marlin."

@@ -70,6 +70,14 @@ class MoeRunnerConfig:
     gate_up_interleaved: bool = True
     layer: Optional[torch.nn.Module] = None
     use_tp_all_gather_activation: bool = False
+    # Some BF16-trained models exceed FP16's range on pre-Ampere GPUs. A model
+    # may scale final projection weights by this value and restore the branch
+    # when it is accumulated into its wide residual stream.
+    wide_output_scale: float = 1.0
+    # Scale the input to a gate/up projection before its FP16 GEMM. The
+    # model-specific activation restores this scale in FP32 before applying
+    # SwiGLU, preventing an earlier overflow without changing the function.
+    gate_up_input_scale: float = 1.0
     # Request FP32 SiLU/multiply intermediates until FP8 quantization.
     # False preserves backend defaults, including their existing FP32 paths.
     silu_mul_keep_fp32: bool = False
