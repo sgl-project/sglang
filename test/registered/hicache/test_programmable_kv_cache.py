@@ -92,9 +92,7 @@ def mooncake_owner(extra, namespace, engine_id):
         cache.init_hicache(get_server_args(), params)
         atexit.unregister(cache.shutdown)
         try:
-            service = KVControlService(
-                cache, config, namespace_keys=True, idle_check=lambda: True
-            )
+            service = KVControlService(cache, config, namespace_keys=True)
             yield cache, service, pool
         finally:
             torch.cuda.synchronize()
