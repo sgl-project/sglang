@@ -29,10 +29,10 @@ from sglang.kernels.ops.gemm.fp8_prefill_gemm import (
     quantize_rows_fp8,
 )
 from sglang.kernels.ops.gemm.fp8w_small_m_gemm import quantize_weight
-from sglang.srt.distributed import get_tp_group
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.runtime_context import get_parallel
 
 SP_MIN_TOKENS = 2048
 # Pipelined Ulysses row chunks, measured on MI355X per layer (check_ulysses_pipeline.py): shards from
@@ -68,7 +68,7 @@ def sp_shape(forward_batch: ForwardBatch, num_tokens: int) -> SPShape | None:
         and num_tokens >= SP_MIN_TOKENS
     ):
         return None
-    world = get_tp_group().world_size
+    world = get_parallel().tp_group.world_size
     if world == 1:
         return None
     return SPShape(num_tokens, -(-num_tokens // world) * world)
@@ -76,14 +76,14 @@ def sp_shape(forward_batch: ForwardBatch, num_tokens: int) -> SPShape | None:
 
 def sp_shard(stream: torch.Tensor, sp: SPShape) -> torch.Tensor:
     """This rank's contiguous token shard of ``stream`` (padded to ``sp.padded`` rows)."""
-    group = get_tp_group()
+    group = get_parallel().tp_group
     stream = F.pad(stream, (0, 0, 0, sp.padded - sp.num_tokens))
     return stream.tensor_split(group.world_size)[group.rank_in_group].contiguous()
 
 
 def sp_gather(shard: torch.Tensor, rows: int) -> torch.Tensor:
     """All-gather token shards and keep the first ``rows`` rows."""
-    group = get_tp_group()
+    group = get_parallel().tp_group
     shard = shard.contiguous()
     if shard.dtype == torch.uint8 and shard.dim() == 2 and shard.shape[1] % 2 == 0:
         # MXFP4 rows / E8M0 scales: gathered as bf16 words, so the aiter custom all-gather (f32 / f16 / bf16
@@ -96,7 +96,7 @@ def sp_gather(shard: torch.Tensor, rows: int) -> torch.Tensor:
 
 def sp_reduce_scatter(full: torch.Tensor, padded: int) -> torch.Tensor:
     """Sum ``full`` over ranks and return this rank's token shard."""
-    group = get_tp_group()
+    group = get_parallel().tp_group
     if full.shape[0] != padded:
         full = F.pad(full, (0, 0, 0, padded - full.shape[0]))
     out = full.new_empty((padded // group.world_size, *full.shape[1:]))
@@ -114,14 +114,14 @@ def _sp_comm_stream() -> torch.cuda.Stream:
 
 
 def ulysses_enabled() -> bool:
-    return _PREFILL_SP and _PREFILL_ULYSSES and get_tp_group().world_size > 1
+    return _PREFILL_SP and _PREFILL_ULYSSES and get_parallel().tp_group.world_size > 1
 
 
 @torch.no_grad()
 def prepare_ulysses(attention, fp8: bool) -> None:
     """Gather the TP shards of the QKV/gate and O projections once after loading (rank-major head order); with
     ``fp8`` keep only their FP8 copies + channel scales (``fp8_prefill_gemm``), half the bytes of the BF16 gather."""
-    group = get_tp_group()
+    group = get_parallel().tp_group
     qkv = group.all_gather(attention.qkv_proj.weight.data.contiguous(), dim=0)
     o = group.all_gather(attention.o_proj.weight.data.contiguous(), dim=1).contiguous()
     attention.ulysses_qkv_weight = None if fp8 else qkv
@@ -153,7 +153,7 @@ def ulysses_attention(
 ) -> torch.Tensor:
     """Attention block for this rank's token shard ``x`` [padded / world, hidden]; returns its output rows.
     ``x_fp8`` = (per-row FP8 copy of ``x``, scales) from the boundary kernel, for the FP8 QKV projection."""
-    group = get_tp_group()
+    group = get_parallel().tp_group
     world, rows = group.world_size, x.shape[0]
     plan = _ulysses_chunk_plan(attention, rows)
     if plan is not None:

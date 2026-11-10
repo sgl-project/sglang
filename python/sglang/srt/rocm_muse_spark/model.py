@@ -59,7 +59,7 @@ from sglang.srt.configs.muse_spark import (
     MuseSparkTextConfig,
     should_skip_weight_loading,
 )
-from sglang.srt.distributed import get_tp_group, tensor_model_parallel_all_reduce
+from sglang.srt.distributed import tensor_model_parallel_all_reduce
 from sglang.srt.environ import envs
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -1038,7 +1038,7 @@ class MuseSpark1xMoE(nn.Module):
         # Collective and allocating: built at model construction, never under graph capture.
         self._finalize_ar = (
             finalize_allreduce.ensure_finalize_allreduce(
-                get_tp_group().cpu_group,
+                get_parallel().tp_group.cpu_group,
                 torch.device("cuda", torch.cuda.current_device()),
             )
             if _FINALIZE_AR_PUSH
@@ -1769,7 +1769,7 @@ def _a4w4_keeps_native(experts: list) -> bool:
         [int(free - per_layer * len(experts) >= _A4W4_RESERVE_BYTES)], dtype=torch.int64
     )
     torch.distributed.all_reduce(
-        fits, op=torch.distributed.ReduceOp.MIN, group=get_tp_group().cpu_group
+        fits, op=torch.distributed.ReduceOp.MIN, group=get_parallel().tp_group.cpu_group
     )
     keep = bool(fits.item())
     logger.info(
