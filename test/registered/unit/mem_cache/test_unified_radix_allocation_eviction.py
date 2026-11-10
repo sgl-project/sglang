@@ -1,12 +1,26 @@
 """CPU-only tests for allocation-aware UnifiedRadixCache eviction."""
 
 import unittest
+from contextlib import ExitStack
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import torch
+
+from sglang.srt.environ import envs
+from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.mem_cache.common import evict_from_tree_cache
 from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
-from sglang.srt.mem_cache.unified_cache.components import ComponentType
+from sglang.srt.mem_cache.kv.plan import TREE_TOKEN
+from sglang.srt.mem_cache.unified_cache.cache_action import FreeComponentDeviceSlot
+from sglang.srt.mem_cache.unified_cache.components import (
+    ComponentType,
+    FullComponent,
+)
+from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
+    DemoteResult,
+)
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -213,6 +227,124 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
                     cache.evict.assert_not_called()
                 else:
                     cache.evict.assert_called_once_with(expected)
+
+
+PAGE_SIZE = 4
+
+
+def _grouped_frees(enabled: bool) -> ExitStack:
+    stack = ExitStack()
+    stack.enter_context(envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True))
+    stack.enter_context(envs.SGLANG_OPT_HICACHE_GROUPED_DEVICE_FREES.override(enabled))
+    return stack
+
+
+class TestUnifiedRadixGroupedDeviceFrees(CustomTestCase):
+    @staticmethod
+    def _build_cache(need_sort: bool = False):
+        allocator = PagedTokenToKVPoolAllocator(
+            size=64 * PAGE_SIZE,
+            page_size=PAGE_SIZE,
+            dtype=torch.float16,
+            device="cpu",
+            kvcache=None,
+            need_sort=need_sort,
+        )
+        storage = SimpleNamespace(
+            _band=lambda sub_pool: allocator,
+            free_units=lambda sub_pool, ids: allocator.free_segment(ids, start_pos=0),
+        )
+        full = object.__new__(FullComponent)
+        full.storage_and_sub_pool = lambda: (storage, "full")
+        cache = object.__new__(UnifiedRadixCache)
+        cache.tree_components = (ComponentType.FULL,)
+        index_slots(cache, cache.tree_components)
+        cache.token_to_kv_pool_allocator = allocator
+        cache.components = {cache.slot_id(TREE_TOKEN): full}
+        return cache, allocator
+
+    @staticmethod
+    def _segments(allocator, pages_each=(1, 3, 2)):
+        return [allocator.alloc(n * PAGE_SIZE) for n in pages_each]
+
+    def test_one_free_leaves_the_per_segment_free_list(self):
+        for need_sort in (False, True):
+            with self.subTest(need_sort=need_sort):
+                cache, grouped_alloc = self._build_cache(need_sort)
+                _, stock_alloc = self._build_cache(need_sort)
+                ct = cache.slot_id(TREE_TOKEN)
+                segs = self._segments(grouped_alloc)
+                self.assertTrue(
+                    all(
+                        torch.equal(a, b)
+                        for a, b in zip(segs, self._segments(stock_alloc))
+                    )
+                )
+                for seg in segs:
+                    stock_alloc.free_segment(seg, start_pos=0)
+                with _grouped_frees(True):
+                    values = cache._group_page_exact_frees(ct, list(segs))
+                self.assertEqual(len(values), 1)
+                grouped_alloc.free_segment(values[0], start_pos=0)
+                if not need_sort:
+                    # Staged pages are sorted before use, so only this order matters.
+                    self.assertTrue(
+                        torch.equal(grouped_alloc.free_pages, stock_alloc.free_pages)
+                    )
+                grouped_alloc.merge_and_sort_free()
+                stock_alloc.merge_and_sort_free()
+                self.assertTrue(
+                    torch.equal(grouped_alloc.free_pages, stock_alloc.free_pages)
+                )
+
+    def test_segments_stay_apart_unless_page_exact_on_the_stock_allocator(self):
+        cache, allocator = self._build_cache()
+        ct = cache.slot_id(TREE_TOKEN)
+        segs = self._segments(allocator)
+        partial = [segs[0], segs[1][: PAGE_SIZE + 1]]
+        self.assertIs(cache._group_page_exact_frees(ct, partial), partial)
+        allocator.free_group_begin()
+        self.assertIs(cache._group_page_exact_frees(ct, segs), segs)
+        allocator.free_group_end()
+        cache.components[ct] = MagicMock()
+        self.assertIs(cache._group_page_exact_frees(ct, segs), segs)
+
+    def test_write_back_batch_frees_its_held_segments_once(self):
+        for enabled, expected in ((False, [[0], [1], [2]]), (True, [[1, 0], [2]])):
+            with self.subTest(enabled=enabled):
+                cache, allocator = self._build_cache()
+                ct = cache.slot_id(TREE_TOKEN)
+                segs = self._segments(allocator)
+                # The second demote carries a cache action, so the first one's
+                # held segment is freed with it, ahead of its own.
+                results = [
+                    DemoteResult(
+                        device_frees={ct: [seg]},
+                        cache_actions=[MagicMock()] if i == 1 else [],
+                    )
+                    for i, seg in enumerate(segs)
+                ]
+                cache.tree_core = MagicMock()
+                cache.tree_core.demote.side_effect = results
+                cache.writing_check = MagicMock()
+                cache._drain_host_frees = MagicMock()
+                cache._apply_cache_actions = MagicMock()
+                freed = []
+
+                def record(action):
+                    self.assertIsInstance(action, FreeComponentDeviceSlot)
+                    freed.append(list(action.indices))
+
+                cache._apply_cache_action = record
+                node_ids = [11, 12, 13]
+                with _grouped_frees(enabled):
+                    cache._demote_backed_up(node_ids, {ct: 0})
+                self.assertEqual(node_ids, [])
+                self.assertEqual(len(freed), len(expected))
+                for got, want in zip(freed, expected):
+                    self.assertEqual(len(got), 1 if enabled else len(want))
+                    want_cat = torch.cat([segs[i] for i in want])
+                    self.assertTrue(torch.equal(torch.cat(got), want_cat))
 
 
 if __name__ == "__main__":
