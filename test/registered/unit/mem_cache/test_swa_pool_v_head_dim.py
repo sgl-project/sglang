@@ -26,6 +26,7 @@ import torch
 
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
@@ -51,7 +52,7 @@ def _swa_pool(*, swa_attention_layer_ids=(0, 2), full_attention_layer_ids=(1, 3)
     )
 
 
-class TestSWAPoolVHeadDim(unittest.TestCase):
+class TestSWAPoolVHeadDim(CustomTestCase):
     def test_window_only_pool_answers_from_the_swa_side(self):
         """BUG REGRESSION. A sliding-window MTP depth is a window-only block,
         so its pool has an EMPTY full side; asking that side for a value
@@ -59,6 +60,15 @@ class TestSWAPoolVHeadDim(unittest.TestCase):
         served."""
         pool = _swa_pool(swa_attention_layer_ids=(0,), full_attention_layer_ids=())
         self.assertEqual(pool.get_v_head_dim(), _SWA_V_HEAD_DIM)
+
+    def test_later_pipeline_stage_starts_at_its_first_layer(self):
+        """BUG REGRESSION. A later pipeline stage's pool holds global layer ids;
+        its start_layer must be the first of them, not a layer the stage lacks."""
+        pool = _swa_pool(swa_attention_layer_ids=(2,), full_attention_layer_ids=(3,))
+        self.assertEqual(
+            pool.get_value_buffer(pool.start_layer).shape[-1], _SWA_V_HEAD_DIM
+        )
+        self.assertEqual(pool.start_layer, 2)
 
 
 if __name__ == "__main__":

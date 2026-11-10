@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any, List, Optional
 
 import msgspec
 
-from sglang.srt.arg_groups.overrides import resolved_view
+from sglang.srt.arg_groups.model_override_base import resolved_view
 from sglang.srt.runtime_context import (
     get_model,
     get_spec,
@@ -31,9 +31,9 @@ def get_dspark_sample_from_anchor(draft_hf_config: Any) -> bool:
     return bool(_cfg_get(draft_hf_config, "sample_from_anchor", True))
 
 
-def draft_is_deepseek_v4() -> bool:
-    from sglang.srt.configs.model_config import is_deepseek_v4
-    from sglang.srt.utils.hf_transformers_utils import get_config
+def draft_uses_compressed_kv_attention() -> bool:
+    from sglang.srt.configs.model_config import uses_compressed_kv_attention
+    from sglang.srt.hf_transformers import get_config
 
     draft_model_path = get_spec().speculative_draft_model_path
     if not draft_model_path:
@@ -45,7 +45,7 @@ def draft_is_deepseek_v4() -> bool:
         model_override_args=json.loads(get_model().json_model_override_args),
         model_config_parser=get_model().model_config_parser,
     )
-    return draft_hf_config is not None and is_deepseek_v4(draft_hf_config)
+    return draft_hf_config is not None and uses_compressed_kv_attention(draft_hf_config)
 
 
 def dspark_gamma_from_num_draft_tokens(num_draft_tokens: int) -> int:
@@ -67,6 +67,7 @@ class DSparkDraftConfig(msgspec.Struct, frozen=True):
     mask_token_id: Optional[int]
     markov_rank: int
     markov_head_type: Optional[str]
+    is_mla: bool = False
 
     def resolve_gamma(self, *, default: Optional[int] = None) -> Optional[int]:
         return self.gamma if self.gamma is not None else default
@@ -143,7 +144,7 @@ def read_draft_checkpoint_config(*, server_args: ServerArgs) -> DSparkDraftConfi
     silently drops the checkpoint's gamma and the cross-check with
     `--speculative-num-draft-tokens` along with it.
     """
-    from sglang.srt.utils.hf_transformers_utils import get_config
+    from sglang.srt.hf_transformers import get_config
 
     resolving = resolved_view(server_args)
     draft_hf_config = get_config(
@@ -319,4 +320,5 @@ def parse_dspark_draft_config(*, draft_hf_config: Any) -> DSparkDraftConfig:
         mask_token_id=mask_token_id,
         markov_rank=markov_rank,
         markov_head_type=markov_head_type,
+        is_mla=base.is_mla,
     )

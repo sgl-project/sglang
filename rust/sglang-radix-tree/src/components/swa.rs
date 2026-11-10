@@ -12,7 +12,7 @@ use crate::cache_action::{
     SwaRebuild,
 };
 use crate::components::TreeComponent;
-use crate::components::{ComponentType, FULL, SWA};
+use crate::components::{ComponentType, FULL, Family, SWA};
 use crate::node::ChildKeyType;
 use crate::node::Node;
 use crate::node::{NodeId, NodeIdx_, TreeCoreRuntimeError, ValueSlotIdx};
@@ -169,7 +169,12 @@ impl SwaComponent {
         let mut cur_id = node_id;
         while covered_tokens < self.sliding_window_size {
             let cur = tree_core.arena.node(cur_id);
-            if cur.is_root() || cur.write_through_pending_id.is_some() {
+            // A copy in the same write-back batch already committed this SWA
+            // host value.
+            if cur.is_root()
+                || (cur.write_through_pending_id.is_some()
+                    && !tree_core.is_round_write_pending_(cur))
+            {
                 break;
             }
             let (on_device, on_host) = (cur.has_device_value(SWA), cur.has_host_value(SWA));
@@ -222,7 +227,7 @@ impl SwaComponent {
 
     /// Fill the prefetched SWA window onto the leaf→anchor path.
     ///
-    /// All-or-nothing over one full window: `loaded_pages` is the cross-rank
+    /// All-or-nothing over the staged window: `loaded_pages` is the cross-rank
     /// MIN, so `loaded_pages < window_pages` drops the whole window (keeps the
     /// tree identical across TP ranks). Otherwise map the buffer to token range
     /// `[loaded_start, total_len)` and walk leaf→anchor, filling SWA
@@ -267,15 +272,6 @@ impl SwaComponent {
             }
             return;
         };
-        // Cache-mode graft commit only (buffer fills never reach here):
-        // a hit-shrunk window mid-tree is missing its head, so drop it.
-        // Root anchors are complete windows of their own.
-        if node_id != tree_core.arena.root()
-            && window_require_pages < self.sliding_window_size.div_ceil(page_size)
-        {
-            self.release_swa_host_(host_indices.shallow_clone(), cache_actions);
-            return;
-        }
         if window_require_pages == 0 || loaded_pages < window_require_pages {
             self.release_swa_host_(host_indices.shallow_clone(), cache_actions);
             return;
@@ -337,6 +333,10 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
 
     fn component_type(&self) -> ComponentType {
         SWA
+    }
+
+    fn family(&self) -> Family {
+        Family::Window
     }
 
     fn refresh_lru(

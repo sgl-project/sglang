@@ -44,10 +44,12 @@ from sglang.srt.disaggregation.common.utils import (
     build_dcp_token_transfer_plan,
     group_concurrent_contiguous,
     pack_int_lists,
+    run_on_device,
     unpack_int_lists,
 )
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.utils import (
-    DisaggregationMode,
+    align_window_tails,
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
     is_elided_entry,
@@ -419,9 +421,11 @@ class MoriKVManager(CommonKVManager):
                 # Track the thread so teardown() can join it: otherwise every
                 # P->D->P flip that re-enters PREFILL leaks _num_shards threads
                 # (each parked forever in FastQueue.get()).
+                # Bind to this rank's device: _transfer_worker makes device calls
+                # (wait_event.synchronize()) that would otherwise use device 0.
                 t = threading.Thread(
-                    target=self._transfer_worker,
-                    args=(queue,),
+                    target=run_on_device,
+                    args=(self.kv_args.gpu_id, self._transfer_worker, queue),
                     daemon=True,
                     name=(
                         f"mori-xfer-dp{self.system_dp_rank}-"
@@ -1647,6 +1651,9 @@ class MoriKVManager(CommonKVManager):
                 f"remote={len(peer_info.dst_state_mem_descs)})"
             )
 
+        src_state_indices = align_window_tails(
+            self.kv_args, src_state_indices, dst_state_indices
+        )
         src_state_item_lens = self.kv_args.state_item_lens
         src_state_dim_per_tensor = self.kv_args.state_dim_per_tensor
 
