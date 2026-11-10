@@ -29,7 +29,10 @@ from sglang.srt.layers.attention.linear.kda_prefill_graph import (
     KDAPrefillTrackRows,
     build_track_rows,
 )
-from sglang.srt.layers.attention.linear.kernels.gdn_flydsl import FlyDSLGDNKernel
+from sglang.srt.layers.attention.linear.kernels.gdn_flydsl import (
+    FlyDSLFusedGDNKernel,
+    FlyDSLGDNKernel,
+)
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
 from sglang.srt.layers.attention.linear.kernels.state_pool_io import (
     stage_pool_states,
@@ -270,11 +273,16 @@ def flashinfer_gdn_prefill_default(model_runner: ModelRunner) -> Optional[str]:
     return "flashinfer"
 
 
+def _is_flydsl_gdn(backend: LinearAttnKernelBackend) -> bool:
+    return backend.is_flydsl() or backend.is_flydsl_fused()
+
+
 def _validate_gdn_linear_attn_backends(backends: LinearAttnBackends) -> None:
-    if backends.decode.is_flydsl() or backends.verify.is_flydsl():
+    if _is_flydsl_gdn(backends.decode) or _is_flydsl_gdn(backends.verify):
         raise ValueError(
-            "The FlyDSL GDN backend supports prefill only. Set "
-            "--linear-attn-prefill-backend flydsl and keep decode/verify on Triton."
+            "The FlyDSL GDN backends support prefill only. Set "
+            "--linear-attn-prefill-backend flydsl or flydsl_fused and keep "
+            "decode/verify on Triton."
         )
     if (
         get_exec().deterministic.enable_deterministic_inference
@@ -285,14 +293,25 @@ def _validate_gdn_linear_attn_backends(backends: LinearAttnBackends) -> None:
             "--enable-deterministic-inference. Use "
             "--linear-attn-prefill-backend triton."
         )
-    if (
-        get_exec().deterministic.enable_deterministic_inference
-        and backends.prefill.is_flydsl()
+    if get_exec().deterministic.enable_deterministic_inference and _is_flydsl_gdn(
+        backends.prefill
     ):
         raise ValueError(
             "FlyDSL GDN prefill is not supported with "
             "--enable-deterministic-inference. Use "
             "--linear-attn-prefill-backend triton."
+        )
+
+
+def _validate_fused_flydsl_state_dtype(
+    prefill_backend: LinearAttnKernelBackend, ssm_dtype: torch.dtype
+) -> None:
+    # The fused kernel only takes a bf16 state pool; any other dtype would
+    # silently run the staged path on every batch.
+    if prefill_backend.is_flydsl_fused() and ssm_dtype != torch.bfloat16:
+        raise ValueError(
+            "--linear-attn-prefill-backend flydsl_fused requires "
+            f"--mamba-ssm-dtype bfloat16, got {ssm_dtype}."
         )
 
 
@@ -385,13 +404,17 @@ class GDNKernelDispatcher:
 
                 flashinfer_kernel = FlashInferGDNKernel()
                 self.extend_kernel = flashinfer_kernel
-        elif prefill_backend.is_flydsl():
+        elif _is_flydsl_gdn(prefill_backend):
             if not _use_aiter or not is_gfx95_supported():
                 raise ValueError(
                     "The FlyDSL GDN prefill backend requires AMD gfx95 and "
                     "SGLANG_USE_AITER=1"
                 )
-            self.extend_kernel = FlyDSLGDNKernel()
+            self.extend_kernel = (
+                FlyDSLFusedGDNKernel()
+                if prefill_backend.is_flydsl_fused()
+                else FlyDSLGDNKernel()
+            )
         elif prefill_backend.is_helion():
             raise ValueError(
                 "The Helion linear-attention backend supports KDA only, not GDN."
@@ -597,6 +620,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
         validate_gdn_mis_backend(backends.prefill)
         self.linear_attn_backends = backends
         self.kernel_dispatcher = self._create_kernel_dispatcher(backends)
+        _validate_fused_flydsl_state_dtype(
+            backends.prefill, self.state_pool.mamba_cache.temporal.dtype
+        )
         # Sized past the pool for attn_tp-padded warmup/MLP-sync batches (see helper).
         self.verify_intermediate_state_indices = (
             build_verify_intermediate_state_indices(

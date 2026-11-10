@@ -12,6 +12,7 @@ from sglang.srt.layers.attention.linear import gdn_backend
 from sglang.srt.layers.attention.linear.gdn_backend import (
     GDNAttnBackend,
     GDNKernelDispatcher,
+    _validate_fused_flydsl_state_dtype,
     _validate_gdn_linear_attn_backends,
     flashinfer_gdn_prefill_default,
     validate_gdn_mis_backend,
@@ -19,7 +20,10 @@ from sglang.srt.layers.attention.linear.gdn_backend import (
 from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
     maybe_build_flashinfer_checkpoint_plan,
 )
-from sglang.srt.layers.attention.linear.kernels.gdn_flydsl import FlyDSLGDNKernel
+from sglang.srt.layers.attention.linear.kernels.gdn_flydsl import (
+    FlyDSLFusedGDNKernel,
+    FlyDSLGDNKernel,
+)
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
 from sglang.srt.layers.attention.linear.utils import (
     LinearAttnBackends,
@@ -518,38 +522,64 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
                     GDNKernelDispatcher(decode_backend, prefill_backend)
 
     def test_flydsl_is_a_cli_choice(self):
-        self.assertIn("flydsl", LINEAR_ATTN_KERNEL_BACKEND_CHOICES)
+        for choice in ("flydsl", "flydsl_fused"):
+            with self.subTest(choice=choice):
+                self.assertIn(choice, LINEAR_ATTN_KERNEL_BACKEND_CHOICES)
+                LinearAttnKernelBackend(choice)
 
     def test_flydsl_rejects_decode_and_verify(self):
         triton = LinearAttnKernelBackend.TRITON
-        flydsl = LinearAttnKernelBackend.FLYDSL
-        cases = (
-            LinearAttnBackends(decode=flydsl, prefill=flydsl, verify=triton),
-            LinearAttnBackends(decode=triton, prefill=flydsl, verify=flydsl),
-        )
-        for backends in cases:
-            with self.subTest(backends=backends):
-                with self.assertRaisesRegex(ValueError, "supports prefill only"):
-                    GDNAttnBackend(SimpleNamespace(linear_attn_backends=backends))
+        for flydsl in (
+            LinearAttnKernelBackend.FLYDSL,
+            LinearAttnKernelBackend.FLYDSL_FUSED,
+        ):
+            cases = (
+                LinearAttnBackends(decode=flydsl, prefill=flydsl, verify=triton),
+                LinearAttnBackends(decode=triton, prefill=flydsl, verify=flydsl),
+            )
+            for backends in cases:
+                with self.subTest(backends=backends):
+                    with self.assertRaisesRegex(ValueError, "support prefill only"):
+                        GDNAttnBackend(SimpleNamespace(linear_attn_backends=backends))
 
     def test_flydsl_prefill_dispatch_requires_gfx95_and_aiter(self):
-        backends = (LinearAttnKernelBackend.TRITON, LinearAttnKernelBackend.FLYDSL)
-        for use_aiter, gfx95 in ((False, True), (True, False)):
-            with (
-                self.subTest(use_aiter=use_aiter, gfx95=gfx95),
-                patch.object(gdn_backend, "_use_aiter", use_aiter),
-                patch.object(gdn_backend, "is_gfx95_supported", return_value=gfx95),
-            ):
-                with self.assertRaisesRegex(ValueError, "SGLANG_USE_AITER=1"):
-                    GDNKernelDispatcher(*backends)
+        triton = LinearAttnKernelBackend.TRITON
+        kernel_classes = {
+            LinearAttnKernelBackend.FLYDSL: "FlyDSLGDNKernel",
+            LinearAttnKernelBackend.FLYDSL_FUSED: "FlyDSLFusedGDNKernel",
+        }
+        for prefill, kernel_class in kernel_classes.items():
+            for use_aiter, gfx95 in ((False, True), (True, False)):
+                with (
+                    self.subTest(prefill=prefill, use_aiter=use_aiter, gfx95=gfx95),
+                    patch.object(gdn_backend, "_use_aiter", use_aiter),
+                    patch.object(gdn_backend, "is_gfx95_supported", return_value=gfx95),
+                ):
+                    with self.assertRaisesRegex(ValueError, "SGLANG_USE_AITER=1"):
+                        GDNKernelDispatcher(triton, prefill)
 
-        flydsl_kernel = MagicMock(spec=FlyDSLGDNKernel)
-        with (
-            patch.object(gdn_backend, "_use_aiter", True),
-            patch.object(gdn_backend, "is_gfx95_supported", return_value=True),
-            patch.object(gdn_backend, "FlyDSLGDNKernel", return_value=flydsl_kernel),
-        ):
-            self.assertIs(GDNKernelDispatcher(*backends).extend_kernel, flydsl_kernel)
+            with (
+                self.subTest(prefill=prefill),
+                patch.object(gdn_backend, "_use_aiter", True),
+                patch.object(gdn_backend, "is_gfx95_supported", return_value=True),
+                patch.object(gdn_backend, "FlyDSLGDNKernel") as flydsl,
+                patch.object(gdn_backend, "FlyDSLFusedGDNKernel") as fused,
+            ):
+                chosen = {"FlyDSLGDNKernel": flydsl, "FlyDSLFusedGDNKernel": fused}
+                self.assertIs(
+                    GDNKernelDispatcher(triton, prefill).extend_kernel,
+                    chosen[kernel_class].return_value,
+                )
+
+    def test_flydsl_fused_requires_a_bf16_state_pool(self):
+        fused = LinearAttnKernelBackend.FLYDSL_FUSED
+        with self.assertRaisesRegex(ValueError, "--mamba-ssm-dtype bfloat16"):
+            _validate_fused_flydsl_state_dtype(fused, torch.float32)
+        _validate_fused_flydsl_state_dtype(fused, torch.bfloat16)
+        # The staged FlyDSL path also takes an fp32 pool.
+        _validate_fused_flydsl_state_dtype(
+            LinearAttnKernelBackend.FLYDSL, torch.float32
+        )
 
     def test_flydsl_schedule_flows_from_metadata_to_kernel(self):
         extend_kernel = MagicMock(spec=FlyDSLGDNKernel)
@@ -684,6 +714,76 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
         self.assertIs(result, sentinel.triton_result)
         triton_extend.assert_called_once()
         kernel._prefill_fn.assert_not_called()
+
+    def test_flydsl_fused_writes_the_track_snapshot_in_kernel(self):
+        """The backend reads the radix track snapshot only from track_state for
+        this kernel, so the fused call must receive it and return no h."""
+        kernel = object.__new__(FlyDSLFusedGDNKernel)
+        kernel._fused_supported = MagicMock(return_value=True)
+        kernel._fused_fn = MagicMock(return_value=sentinel.output)
+        q = torch.empty(1, 10, 1, 128, dtype=torch.bfloat16)
+        indices = torch.tensor([1, -1], dtype=torch.int32)
+        metadata = SimpleNamespace(layout=SimpleNamespace(seq_lens_cpu=(3, 7)))
+
+        result = kernel.extend(
+            q,
+            q,
+            q,
+            sentinel.g,
+            sentinel.beta,
+            ssm_states=sentinel.state,
+            cache_indices=indices,
+            query_start_loc=sentinel.cu_seqlens,
+            prefill_metadata=metadata,
+            track_state=sentinel.track_state,
+            track_chunk_idx=sentinel.track_chunk_idx,
+        )
+
+        self.assertEqual(result, (sentinel.output, None, None))
+        self.assertEqual(kernel._fused_supported.call_args.kwargs["max_seqlen"], 7)
+        call = kernel._fused_fn.call_args.kwargs
+        self.assertIs(call["track_state"], sentinel.track_state)
+        self.assertIs(call["track_chunk_idx"], sentinel.track_chunk_idx)
+        # The fused kernel skips negative indices itself; no sink remap.
+        self.assertIs(call["cache_indices"], indices)
+
+    def test_flydsl_fused_fallback_fills_the_track_snapshot_from_h(self):
+        """A batch the fused kernel declines runs the staged path, which returns
+        per-chunk h instead of a snapshot; each sequence's tracked chunk must be
+        copied from its own chunk range of h into track_state."""
+        kernel = object.__new__(FlyDSLFusedGDNKernel)
+        kernel._fused_supported = MagicMock(return_value=False)
+        kernel._prepare_supported = MagicMock(return_value=True)
+        # Sequences of 130 and 64 tokens own 64-token chunks 0..2 and 3.
+        h = (
+            torch.arange(4, dtype=torch.float32)
+            .view(1, 4, 1, 1, 1)
+            .expand(1, 4, 1, 2, 2)
+        )
+        kernel._prefill_fn = MagicMock(return_value=(sentinel.output, h))
+        q = torch.empty(1, 194, 1, 128, dtype=torch.bfloat16)
+        track_state = torch.full((2, 1, 2, 2), -1.0)
+
+        output, _, chunk_states = kernel.extend(
+            q,
+            q,
+            q,
+            torch.empty(1, 194, 1),
+            torch.empty(1, 194, 1),
+            ssm_states=torch.empty(3, 1, 2, 2, dtype=torch.bfloat16),
+            cache_indices=torch.tensor([1, 2], dtype=torch.int32),
+            query_start_loc=torch.tensor([0, 130, 194], dtype=torch.int32),
+            prefill_metadata=SimpleNamespace(
+                layout=SimpleNamespace(seq_lens_cpu=(130, 64))
+            ),
+            track_state=track_state,
+            track_chunk_idx=torch.tensor([2, 0]),
+        )
+
+        self.assertIs(output, sentinel.output)
+        self.assertIs(chunk_states, h)
+        # Chunk 2 of sequence 0 is h[2]; chunk 0 of sequence 1 is h[3].
+        torch.testing.assert_close(track_state[:, 0, 0, 0], torch.tensor([2.0, 3.0]))
 
 
 if __name__ == "__main__":
