@@ -160,16 +160,13 @@ class TestAscendOpsPrefillGraph(CustomTestCase):
     def test_prefill_capture_selects_capacity_allgather(self):
         dispatcher = AscendOpsDispatcher.__new__(AscendOpsDispatcher)
         dispatcher.tp_group = None
+        dispatcher.moe_ascend_ops_config = AscendOpsConfig(prefill="allgather")
         hidden_states = torch.zeros((8, 4))
         topk_weights, topk_ids, _ = self._topk_output(8)
 
         with (
             patch(
                 "sglang.srt.layers.moe.token_dispatcher.ascend_ops.is_in_prefill_graph_scope",
-                return_value=True,
-            ),
-            patch(
-                "sglang.srt.layers.moe.token_dispatcher.ascend_ops.get_is_capture_mode",
                 return_value=True,
             ),
             patch(
@@ -189,6 +186,35 @@ class TestAscendOpsPrefillGraph(CustomTestCase):
         )
         low_latency.assert_not_called()
 
+    # Guards the eager path: every rank must exchange its real row count, so
+    # capacity stays unset outside a prefill graph.
+    def test_eager_extend_keeps_row_exchange(self):
+        dispatcher = AscendOpsDispatcher.__new__(AscendOpsDispatcher)
+        dispatcher.tp_group = None
+        dispatcher.moe_ascend_ops_config = AscendOpsConfig(prefill="allgather")
+        hidden_states = torch.zeros((8, 4))
+        topk_weights, topk_ids, _ = self._topk_output(8)
+
+        with (
+            patch(
+                "sglang.srt.layers.moe.token_dispatcher.ascend_ops.is_in_prefill_graph_scope",
+                return_value=False,
+            ),
+            patch(
+                "sglang.srt.layers.moe.token_dispatcher.ascend_ops.get_is_extend_in_batch",
+                return_value=True,
+            ),
+            patch.object(
+                dispatcher, "_dispatch_allgather", return_value="allgather"
+            ) as allgather,
+        ):
+            result = dispatcher.dispatch(hidden_states, (topk_weights, topk_ids, None))
+
+        self.assertEqual(result, "allgather")
+        allgather.assert_called_once_with(
+            hidden_states, topk_weights, topk_ids, None, capacity=None
+        )
+
     # Guards the decode graph: capture mode is also set while a decode graph is
     # captured, so the prefill scope is what keeps that on the MC2 path.
     def test_decode_capture_keeps_low_latency(self):
@@ -201,10 +227,6 @@ class TestAscendOpsPrefillGraph(CustomTestCase):
             patch(
                 "sglang.srt.layers.moe.token_dispatcher.ascend_ops.is_in_prefill_graph_scope",
                 return_value=False,
-            ),
-            patch(
-                "sglang.srt.layers.moe.token_dispatcher.ascend_ops.get_is_capture_mode",
-                return_value=True,
             ),
             patch(
                 "sglang.srt.layers.moe.token_dispatcher.ascend_ops.get_is_extend_in_batch",

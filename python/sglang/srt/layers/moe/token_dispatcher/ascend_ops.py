@@ -32,7 +32,6 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
 )
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import AscendOpsConfig, DispatcherOutputDtype
-from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 from sglang.srt.model_executor.runner_utils.prefill_graph import (
     is_in_prefill_graph_scope,
 )
@@ -180,21 +179,17 @@ class AscendOpsDispatcher(BaseDispatcher):
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
     ) -> DispatchOutput:
         topk_weights, topk_ids, _ = topk_output
-        # Must precede the extend check: the prefill runner forces
-        # is_extend_in_batch False while capturing.  The scope is
-        # backend-agnostic; prefill graphs are not only breakable.
-        if is_in_prefill_graph_scope() and get_is_capture_mode():
-            return self._dispatch_allgather(
-                hidden_states,
-                topk_weights,
-                topk_ids,
-                self.tp_group,
-                capacity=hidden_states.shape[0],
-            )
-        if get_is_extend_in_batch():
+        in_prefill_graph = is_in_prefill_graph_scope()
+        # Capture forces is_extend_in_batch False; the scope term keeps a
+        # prefill graph on the prefill path instead of the decode MC2 path.
+        if get_is_extend_in_batch() or in_prefill_graph:
             if self.moe_ascend_ops_config.prefill == "allgather":
                 return self._dispatch_allgather(
-                    hidden_states, topk_weights, topk_ids, self.tp_group
+                    hidden_states,
+                    topk_weights,
+                    topk_ids,
+                    self.tp_group,
+                    capacity=hidden_states.shape[0] if in_prefill_graph else None,
                 )
             return self._dispatch_alltoallv(
                 hidden_states, topk_weights, topk_ids, self.tp_group
