@@ -161,6 +161,12 @@ class TestPhysisH3(CustomTestCase):
             valid = args()
             config.validate_server_args(valid)
             self.assertEqual(valid.attention_backend, "torch_sdpa")
+            tiled = PhysisH3PipelineConfig()
+            tiled.vae_config.use_tiling = True
+            tiled.validate_server_args(args())
+            tiled.vae_config.use_parallel_decode = True
+            with self.assertRaisesRegex(ValueError, "parallel VAE decode"):
+                tiled.validate_server_args(args())
             for overrides, message in (
                 ({"attention_backend": "fa"}, "torch_sdpa"),
                 ({"cache_dit_config": {}}, "cache-dit"),

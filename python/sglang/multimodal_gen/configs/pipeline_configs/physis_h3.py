@@ -83,6 +83,10 @@ class PhysisH3PipelineConfig(MiniMaxH3PipelineConfig):
             or server_args.minimax_h3_adaln_cache_path
         ):
             raise ValueError("Physis H3 requires eager, unquantized native DiT")
+        if self.vae_config.use_parallel_decode:
+            raise ValueError(
+                "Physis H3 decodes the VAE on one rank; parallel VAE decode is unsupported"
+            )
         if server_args.should_direct_gpu_weight_load_component("vae"):
             raise ValueError(
                 "Physis H3 VAE checkpoint conversion does not support direct GPU loading"

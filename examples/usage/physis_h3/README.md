@@ -71,7 +71,8 @@ Joint initialization also needs temporary KV for the opening group. Set
 `physis_bootstrap_chunks` no larger than `physis_history_chunks + 1`.
 
 The H3 VAE decodes the complete latent sequence once; this pipeline returns a
-completed video. The Ulysses example offloads the text encoder after use to leave
+completed video. VAE decoding runs on one GPU; parallel VAE decoding is unsupported.
+The Ulysses example offloads the text encoder after use to leave
 room for KV; pipeline modes keep it on the decoder GPU. GPU memory use grows with
 resolution and retained KV history.
 Eager execution is required; compilation, FSDP, quantization, LoRA and
