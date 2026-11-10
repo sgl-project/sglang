@@ -13,7 +13,8 @@
       "correction": {
         "enabled": true
       }
-    }
+    },
+    "tune_observations": "calibration/TP0.ais_observations.json"
   },
   "scheduler": {
     "tp_size": 1,

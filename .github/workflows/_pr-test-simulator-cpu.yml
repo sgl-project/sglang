@@ -100,3 +100,5 @@ jobs:
           python3 -m pytest -q tools/sglang-simulator/test/test_aisimulate_predictor.py
           python3 -m pytest -q tools/sglang-simulator/test/test_aisimulate_native.py
           python3 -m pytest -q tools/sglang-simulator/test/test_aisimulate_native_runner.py
+          python3 -m pytest -q tools/sglang-simulator/test/test_baseline_collection_export.py
+          python3 -m pytest -q tools/sglang-simulator/test/test_baseline_collection_ais_consumption.py

@@ -1,5 +1,7 @@
 """Snapshot model work before SGLang's run_batch can mutate prepared inputs."""
 
+from statistics import pvariance
+
 from sglang_simulator.time_predictor.base import ScheduleBatch, ScheduleRequest
 
 
@@ -66,3 +68,34 @@ def capture_batch_entry(batch) -> ScheduleBatch:
                 raise ValueError("Invalid scheduled token counts")
             rows.append(ScheduleRequest(extend, prior, "decode"))
     return ScheduleBatch(rows, mode)
+
+
+def batch_to_fpm_metrics(batch: ScheduleBatch) -> dict:
+    """Translate scheduled work to native FPM features (prior KV, not total length)."""
+    prefill, decode = [], []
+    if batch.forward_mode not in {"extend", "decode", "mixed"}:
+        raise ValueError("Prediction requires an extend/decode/mixed snapshot")
+    for req in batch.reqs:
+        phase = (
+            req.forward_mode if batch.forward_mode == "mixed" else batch.forward_mode
+        )
+        if phase not in {"extend", "decode"}:
+            raise ValueError("Mixed prediction requires per-request scheduler phases")
+        (prefill if phase == "extend" else decode).append(req)
+    lengths = [r.extend_length for r in prefill]
+    decode_kv = [r.past_kv_length for r in decode]
+    return {
+        "scheduled_requests": {
+            "num_prefill_requests": len(prefill),
+            "sum_prefill_tokens": sum(lengths),
+            "sum_prefill_kv_tokens": sum(r.past_kv_length for r in prefill),
+            "var_prefill_length": pvariance(lengths) if lengths else 0.0,
+            "num_decode_requests": len(decode),
+            "sum_decode_kv_tokens": sum(decode_kv),
+            "var_decode_kv_tokens": pvariance(decode_kv) if decode_kv else 0.0,
+            # Request-level SDK features need aligned arrays in scheduler order,
+            # including mixed batches; do not concatenate the phase groups.
+            "extend_lengths": [r.extend_length for r in batch.reqs],
+            "past_kv_lengths": [r.past_kv_length for r in batch.reqs],
+        }
+    }

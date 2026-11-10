@@ -6,14 +6,16 @@ import signal
 import socket
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
 import requests
 
 
-@pytest.fixture
-def collection_server(tmp_path):
+@contextmanager
+def collection_server(tmp_path, extra_args=()):
     simulator_root = Path(__file__).resolve().parents[1]
     model = tmp_path / "model"
     model.mkdir()
@@ -53,6 +55,7 @@ def collection_server(tmp_path):
         "--mem-fraction-static=0.1",
         "--host=127.0.0.1",
         f"--port={port}",
+        *extra_args,
     ]
     log_path = tmp_path / "server.log"
     with log_path.open("w") as log:
@@ -87,8 +90,14 @@ def collection_server(tmp_path):
                     server.wait()
 
 
-def test_baseline_collection(collection_server):
-    url, output, log_path = collection_server
+@pytest.fixture
+def default_collection_server(tmp_path):
+    with collection_server(tmp_path) as server:
+        yield server
+
+
+def test_baseline_collection(default_collection_server):
+    url, output, log_path = default_collection_server
 
     def post(path, payload=None):
         response = requests.post(url + path, json=payload or {}, timeout=60)
@@ -125,3 +134,77 @@ def test_baseline_collection(collection_server):
     assert {r["rid"] for step in steps for r in step["request_infos"]} == request_ids
     assert {step["forward_mode"] for step in steps} == {1, 2}  # Prefill and decode.
     assert all(step["iter_latency"] > 0 for step in steps)
+    # The AIS observation export is opt-in and absent by default.
+    assert not (output / "TP0.ais_observations.json").exists()
+
+
+def test_ais_observation_export_with_mixed_steps(tmp_path):
+    """--collection-export-ais-observations exports native AIS observations,
+    including real mixed-chunk steps (prefill chunk riding a running decode)."""
+    with collection_server(
+        tmp_path,
+        extra_args=("--collection-export-ais-observations", "--enable-mixed-chunk"),
+    ) as (url, output, log_path):
+
+        def post(path, payload=None):
+            response = requests.post(url + path, json=payload or {}, timeout=60)
+            assert response.ok, response.text + "\n" + log_path.read_text()
+            return response
+
+        post("/start_profile")
+        # The short request starts decoding while the long request's 1024
+        # tokens are still prefilling in 128-token chunks. future.result()
+        # propagates any request failure into this test.
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [
+                pool.submit(
+                    post,
+                    "/generate",
+                    {
+                        "input_ids": inputs,
+                        "sampling_params": {
+                            "max_new_tokens": max_new_tokens,
+                            "ignore_eos": True,
+                        },
+                    },
+                )
+                for inputs, max_new_tokens in (([10] * 64, 32), ([20] * 1024, 4))
+            ]
+            for future in futures:
+                future.result()
+        post("/stop_profile")
+
+        observations = json.loads((output / "TP0.ais_observations.json").read_text())
+        assert all(isinstance(obs, list) and len(obs) == 1 for obs in observations)
+        assert all(0 < obs[0]["wall_time"] for obs in observations)
+        kinds = [
+            "prefill"
+            if o["num_decode_requests"] == 0
+            else "decode"
+            if o["num_prefill_requests"] == 0
+            else "mixed"
+            for o in (obs[0]["scheduled_requests"] for obs in observations)
+        ]
+        # The observed scheduler work, not the submitted requests.
+        assert "prefill" in kinds and "decode" in kinds
+        assert kinds.count("mixed") >= 1
+        mixed = observations[kinds.index("mixed")][0]["scheduled_requests"]
+        assert mixed["num_prefill_requests"] >= 1
+        assert mixed["num_decode_requests"] >= 1
+        # Aligned per-request arrays cover both phases in scheduler order.
+        assert len(mixed["extend_lengths"]) == (
+            mixed["num_prefill_requests"] + mixed["num_decode_requests"]
+        )
+        assert len(mixed["past_kv_lengths"]) == len(mixed["extend_lengths"])
+
+        steps = [
+            json.loads(line)
+            for line in (output / "TP0.schedule_batch.jsonl").read_text().splitlines()
+        ]
+        assert any(step["forward_mode"] == 3 for step in steps)  # MIXED
+        raw = [
+            json.loads(line)
+            for line in (output / "TP0.raw_request.jsonl").read_text().splitlines()
+        ]
+        assert sorted(r["input_length"] for r in raw) == [64, 1024]
+        assert all(r["completed"] for r in raw)

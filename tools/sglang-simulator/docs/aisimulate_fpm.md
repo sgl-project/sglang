@@ -11,8 +11,8 @@ Select the mode in the configuration file's `predictor` section:
 | Use | `predictor` settings | Input |
 | --- | --- | --- |
 | Default op-level, no learned correction | Omit `estimation_mode` (or set `"op_level"`) | SDK systems database; no observation file |
-| Calibrated op-level | `estimation_mode: "op_level"`, `estimator_config: {"correction": {"enabled": true}}`, `tune_observations` | Prepared SDK-native observations JSON |
-| Regression | `estimation_mode: "fpm_regression"`, `tune_observations` | Prepared SDK-native observations JSON |
+| Calibrated op-level | `estimation_mode: "op_level"`, `estimator_config: {"correction": {"enabled": true}}`, `tune_observations` | Collected observations JSON |
+| Regression | `estimation_mode: "fpm_regression"`, `tune_observations` | Collected observations JSON |
 | Whole-forward interpolation | `estimation_mode: "fpm_interpolation"`, matching `systems_paths` | Materialized systems root |
 | Automatic selection | `estimation_mode: "auto"` | Inputs of whichever mode the SDK selects |
 
@@ -42,39 +42,71 @@ configuration's `platform` and `scheduler` sections — edit them to match the
 deployment. `--sim-config-path` and `SGLANG_SIMULATOR_CONFIG_PATH` are
 interchangeable.
 
-## Calibration observations
+## Collecting observations
 
-Calibration uses two files with different roles: your simulator
-configuration, passed to `--sim-config-path`, and a separate observations
-JSON file with measured data. The configuration's `predictor.tune_observations`
-names the observations file; observation paths are resolved relative to the
-configuration file's directory.
+Calibration connects two files with different roles:
 
-Prepare a matching observations file in the SDK's native iterations JSON
-format: one entry per observed forward pass, each holding the SDK's
-`scheduled_requests` metrics and a `wall_time` in seconds for that forward
-pass — not HTTP or serving latency. The data must match the model, hardware,
-precision and topology you simulate. Native observation preparation is
-external to this interface; the simulator only reads the finished file.
+- `/tmp/aisim-example/simulator_config.json` — your configuration. Copy the
+  repository's [aisimulate_corrected.json](../examples/sim_configs/aisimulate_corrected.json)
+  and edit it for your deployment. Pass it to `--sim-config-path`.
+- `/tmp/aisim-example/calibration/TP0.ais_observations.json` — generated
+  measurement data. The `sglang-simulator-collect` tool writes it at
+  `/stop_profile` when AIS export is enabled. The configuration's
+  `predictor.tune_observations` points to it, and the SDK reads it during
+  initialization.
 
-Copy [aisimulate_corrected.json](../examples/sim_configs/aisimulate_corrected.json)
-and edit it for your deployment. The bundled example enables correction but
-does not name an observations file; add `tune_observations` in your copy:
+Observation paths are resolved relative to the configuration file's
+directory, so the copied configuration's `tune_observations` value already
+references the collector output.
 
-```json
-{
-  "predictor": {
-    "name": "aisimulate",
-    "estimation_mode": "op_level",
-    "estimator_config": {"correction": {"enabled": true}},
-    "tune_observations": "calibration/observations.json"
-  }
-}
-```
+1. Copy and edit the configuration. The sample targets A100 80 GB, TP1, SOL;
+   edit `platform` and `scheduler` to match your accelerator, precision,
+   topology and SGLang version, and use the same model for collection and
+   simulation.
 
-For regression, keep the same observations file, set `estimation_mode` to
-`"fpm_regression"` and remove the `correction` setting. Regression reports an
-error if its data is not ready.
+   ```bash
+   mkdir -p /tmp/aisim-example
+   cp tools/sglang-simulator/examples/sim_configs/aisimulate_corrected.json \
+     /tmp/aisim-example/simulator_config.json
+   ```
+
+2. Start the collector with AIS export enabled. Use a fresh, empty output
+   directory and a fresh server per run:
+
+   ```bash
+   sglang-simulator-collect \
+     --collection-output-dir /tmp/aisim-example/calibration \
+     --model-path /path/to/model \
+     --collection-export-ais-observations \
+     --disable-overlap-schedule --host 127.0.0.1 --port 30000
+   ```
+
+   Follow the warmup → `/start_profile` → requests → `/stop_profile` sequence
+   in the [collect_baseline README](../src/sglang_simulator/tools/collect_baseline/README.md).
+   Starting the server alone produces no observations; the file is written
+   on successful `/stop_profile`. Cover the prefill, decode and mixed workloads
+   you want to predict; regression reports an error if its data is not ready.
+
+   Use one TP rank's file, normally `TP0`; do not combine duplicated ranks.
+   `wall_time` is synchronized `Scheduler.run_batch` time in seconds, including
+   CPU work inside that boundary, not HTTP latency or pure GPU kernel time.
+   Collection needs neither Dynamo nor AISimulate; the SDK is needed when
+   the simulator reads the observations.
+
+3. Stop the collector and launch the simulator with the configuration file:
+
+   ```bash
+   SGLANG_USE_CPU_ENGINE=1 CUDA_VISIBLE_DEVICES="" \
+   SGLANG_SIMULATOR_OUTPUT_MODE=OFFLINE \
+   python3 -m sglang_simulator.simulation.sglang.launch_server \
+     --model-path /path/to/model \
+     --sim-config-path /tmp/aisim-example/simulator_config.json \
+     --port 30001
+   ```
+
+For regression, keep the same `tune_observations` file, set
+`estimation_mode` to `"fpm_regression"` and remove the `correction` setting —
+no new measurement file or conversion is required.
 
 ## Interpolation profiles
 
@@ -91,9 +123,9 @@ python -m aisimulate_core.sdk.fpm_dataset /path/to/manifest.json PROFILE_KEY --c
 The manifest and profile key must match your deployment; see the bundled
 [DeepSeek-V4.1 TP4 example](https://github.com/ai-dynamo/aisimulate/blob/v0.13.0/python/aisimulate/src/aisimulate_core/systems/profiles/dsv41_fpm/four_gpu_hf_dataset.json).
 AISimulate v0.13's whole-forward profile collector supports only vLLM. This PR
-does not add an SGLang interpolation-profile collector. SOL still requires
-profile data; missing or out-of-domain data errors do not silently select
-another mode.
+does not add an SGLang interpolation-profile collector: the export above
+produces observations, not interpolation profiles. SOL still requires profile
+data; missing or out-of-domain data errors do not silently select another mode.
 
 ## Supported scope and configuration notes
 
