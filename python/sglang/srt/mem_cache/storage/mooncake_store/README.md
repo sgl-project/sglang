@@ -71,6 +71,195 @@ ranks 0 and 1 write two shards per page; ranks 2 and 3 read those same objects.
 Use matching model settings. KV format and host layout are not yet in the keys;
 use different `extra_backend_tag` values when these differ.
 
+## Mooncake Direct Linker with MNNVL EGM
+
+The unified-cache external linker connects SGLang's GPU KV cache directly to
+Mooncake without a host-cache tier:
+
+For the complete architecture, deployment, validation, stress-test, monitoring,
+and community contribution workflow, see
+[Mooncake MNNVL/EGM and SGLang Direct Linker Deployment and Validation Guide](./MNNVL_EGM_DIRECT_LINKER_DEPLOYMENT_AND_VALIDATION.md).
+
+```text
+SGLang GPU KV cache
+        ↓ offload
+Mooncake MNNVL EGM Store
+        ↓ lookup and load-back
+SGLang GPU KV cache
+```
+
+This integration uses the strict MNNVL EGM Store introduced by
+[kvcache-ai/Mooncake#5161](https://github.com/kvcache-ai/Mooncake/pull/5161).
+That Mooncake change provides the `mnnvl` and `nvlink_host` Store protocols,
+physical requester placement, and the `MC_PHYSICAL_GPU` interface.
+
+### Physical GPU identity
+
+Mooncake placement uses the host-local physical GPU ordinal. SGLang workers
+inherit the parent container environment and select their own CUDA logical
+devices, so the Direct Linker resolves and sets `MC_PHYSICAL_GPU` in every
+worker before Mooncake Store initialization.
+
+Numeric `CUDA_VISIBLE_DEVICES` mappings are resolved directly. For example:
+
+```text
+CUDA_VISIBLE_DEVICES=1,3
+
+cuda:0 → physical GPU 1
+cuda:1 → physical GPU 3
+```
+
+The same rule applies to any tensor-parallel size when every worker process
+selects one CUDA device. Non-contiguous and reordered visibility lists are
+supported:
+
+```text
+CUDA_VISIBLE_DEVICES=7,2,5,1,6,0,4,3
+
+cuda:0 → physical GPU 7
+cuda:1 → physical GPU 2
+cuda:2 → physical GPU 5
+cuda:3 → physical GPU 1
+cuda:4 → physical GPU 6
+cuda:5 → physical GPU 0
+cuda:6 → physical GPU 4
+cuda:7 → physical GPU 3
+```
+
+For GPU UUID or MIG visibility, set the physical ordinal explicitly in each
+worker environment:
+
+```bash
+export MC_PHYSICAL_GPU=<PHYSICAL_GPU_ORDINAL>
+```
+
+An explicit numeric `MC_PHYSICAL_GPU` must match the current worker's numeric
+`CUDA_VISIBLE_DEVICES` mapping.
+
+### Prerequisites
+
+1. Configure NVIDIA IMEX and verify that participating nodes are connected.
+2. Build Mooncake with TENT, CUDA, and the strict MNNVL EGM Store support from
+   [Mooncake PR #5161](https://github.com/kvcache-ai/Mooncake/pull/5161).
+3. Start a Mooncake Master and metadata service.
+4. Start one EGM owner process per physical GPU and mount every exported segment
+   into the same Mooncake memory pool.
+5. Use the same fabric domain, rack, and host identity across owners and SGLang
+   workers.
+
+Each owner must report:
+
+```text
+MNNVL_SEGMENT_READY
+exported=1
+metadata_published=1
+master_mounted=1
+OWNER_READY
+```
+
+### Environment
+
+Configure the SGLang container with the Mooncake package and native libraries
+built from Mooncake PR #5161:
+
+```bash
+export PYTHONPATH=<MOONCAKE_PYTHON_PACKAGE_PARENT>:$PYTHONPATH
+export LD_LIBRARY_PATH=<MOONCAKE_NATIVE_LIBRARY_DIR>:$LD_LIBRARY_PATH
+
+export MOONCAKE_STORE_BACKEND=cpp
+export MOONCAKE_PROTOCOL=mnnvl
+export MOONCAKE_MASTER=<MASTER_HOST>:<MASTER_PORT>
+export MOONCAKE_TE_META_DATA_SERVER=http://<METADATA_HOST>:<METADATA_PORT>/metadata
+export MOONCAKE_FABRIC_DOMAIN=<FABRIC_DOMAIN>
+export MC_RACK=<RACK>
+export MC_TRAY=<HOST_ID>
+export MOONCAKE_HOST_ID=<HOST_ID>
+export MC_USE_TENT=1
+export MC_ENABLE_MNNVL=1
+export MC_MNNVL_EGM=1
+```
+
+Keep the SGLang image's PyTorch and NCCL packages on the default Python path.
+Add only the Mooncake Python package and its native library directory.
+
+### Launch SGLang
+
+```bash
+python3 -m sglang.launch_server \
+  --model-path <MODEL_PATH> \
+  --served-model-name <MODEL_NAME> \
+  --host 0.0.0.0 \
+  --port 30000 \
+  --tp <TP_SIZE> \
+  --page-size 256 \
+  --enable-cache-report \
+  --enable-metrics \
+  --enable-unified-cache-external-linker \
+  --unified-cache-external-linker-backend mooncake \
+  --unified-cache-external-linker-config \
+    '{"enable_group_semantics":true,"protocol":"mnnvl"}'
+```
+
+Every worker logs its resolved identity before Mooncake Store initialization:
+
+```text
+Mooncake direct linker MNNVL rank identity:
+tp_rank=<RANK>/<TP_SIZE>, cuda_device=<LOGICAL_GPU>, physical_gpu=<PHYSICAL_GPU>
+```
+
+Successful initialization includes:
+
+```text
+Mooncake store setup successfully
+Mooncake store warmup successfully
+Mooncake direct linker storage topology
+MnnvlTransport: EGM host memory over NVLink enabled (strict)
+```
+
+### Validate offload and load-back
+
+Use a GPU KV pool that cannot retain two long, unrelated prefixes at once, then
+run this request sequence:
+
+1. Send long prefix A and confirm a cold request.
+2. Send unrelated long prefix B to evict A from the local GPU KV pool.
+3. Send prefix A again and confirm external cache recovery.
+
+The logs and API response provide the validation evidence:
+
+```text
+Mooncake direct linker offload: tokens=<TOKENS>
+Mooncake direct linker lookup hit: pages=<PAGES>
+cached_tokens_details.host = <PAGES> × <PAGE_SIZE>
+Mooncake Master Batch Get: success
+Mooncake Master ExistKey: success
+```
+
+### Select the transport protocol
+
+MNNVL EGM:
+
+```json
+{
+  "enable_group_semantics": true,
+  "protocol": "mnnvl"
+}
+```
+
+RDMA:
+
+```json
+{
+  "enable_group_semantics": true,
+  "protocol": "rdma",
+  "device_name": "mlx5_0,mlx5_1"
+}
+```
+
+The physical GPU identity setup runs only for the Store MNNVL protocols
+`mnnvl` and `nvlink_host`. TCP, RDMA, and classic `nvlink` keep their existing
+initialization paths.
+
 ## Install Mooncake
 
 **Method 1: with pip**

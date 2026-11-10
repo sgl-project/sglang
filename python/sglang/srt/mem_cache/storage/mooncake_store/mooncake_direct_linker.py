@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import threading
 from collections.abc import Iterator
 from concurrent.futures import Future, ThreadPoolExecutor, wait
@@ -51,6 +52,94 @@ def _storage_suffix(
     return "_".join(parts)
 
 
+def _uses_mnnvl(extra_config: dict) -> bool:
+    protocol = (
+        str(extra_config.get("protocol") or os.environ.get("MOONCAKE_PROTOCOL", ""))
+        .strip()
+        .lower()
+    )
+    return protocol in {"mnnvl", "nvlink_host"}
+
+
+def _resolve_mnnvl_physical_gpu(
+    logical_gpu: int,
+    visible_devices: str | None,
+    configured_physical_gpu: str | None,
+) -> int:
+    """Resolve a CUDA logical device to Mooncake's physical GPU ordinal.
+
+    Mooncake MNNVL placement requires a host-local physical GPU ordinal. SGLang
+    workers can share the same parent container environment while selecting
+    different CUDA devices, so the value must be resolved in each worker.
+
+    Numeric CUDA_VISIBLE_DEVICES mappings are resolved directly. UUID and MIG
+    mappings require an explicit MC_PHYSICAL_GPU because their physical ordinal
+    cannot be inferred safely without an external device inventory.
+    """
+
+    if logical_gpu < 0:
+        raise RuntimeError(
+            f"CUDA logical device must be non-negative; got {logical_gpu}."
+        )
+
+    visible_devices = (visible_devices or "").strip()
+    derived_physical_gpu = None
+    if visible_devices:
+        entries = [entry.strip() for entry in visible_devices.split(",")]
+        if logical_gpu >= len(entries):
+            raise RuntimeError(
+                f"CUDA logical device {logical_gpu} is outside "
+                f"CUDA_VISIBLE_DEVICES={visible_devices!r}."
+            )
+        mapped_device = entries[logical_gpu]
+        derived_physical_gpu = int(mapped_device) if mapped_device.isdigit() else None
+
+    configured = (configured_physical_gpu or "").strip()
+    if configured:
+        try:
+            physical_gpu = int(configured)
+        except ValueError as error:
+            raise RuntimeError(
+                f"MC_PHYSICAL_GPU must be a non-negative integer; got {configured!r}."
+            ) from error
+        if physical_gpu < 0:
+            raise RuntimeError(
+                f"MC_PHYSICAL_GPU must be a non-negative integer; got {configured!r}."
+            )
+        if derived_physical_gpu is not None and physical_gpu != derived_physical_gpu:
+            raise RuntimeError(
+                f"MC_PHYSICAL_GPU={physical_gpu} conflicts with CUDA logical "
+                f"device {logical_gpu}, which maps to physical GPU "
+                f"{derived_physical_gpu} through "
+                f"CUDA_VISIBLE_DEVICES={visible_devices!r}."
+            )
+        return physical_gpu
+
+    if not visible_devices:
+        return logical_gpu
+    if derived_physical_gpu is not None:
+        return derived_physical_gpu
+    raise RuntimeError(
+        "Mooncake MNNVL requires the physical GPU ordinal, but "
+        f"CUDA_VISIBLE_DEVICES maps logical device {logical_gpu} to "
+        f"{entries[logical_gpu]!r}. Set MC_PHYSICAL_GPU explicitly for "
+        "UUID/MIG device mappings."
+    )
+
+
+def _configure_mnnvl_physical_gpu(extra_config: dict) -> int | None:
+    if not _uses_mnnvl(extra_config):
+        return None
+    logical_gpu = torch.cuda.current_device()
+    physical_gpu = _resolve_mnnvl_physical_gpu(
+        logical_gpu,
+        os.environ.get("CUDA_VISIBLE_DEVICES"),
+        os.environ.get("MC_PHYSICAL_GPU"),
+    )
+    os.environ["MC_PHYSICAL_GPU"] = str(physical_gpu)
+    return physical_gpu
+
+
 class MooncakeDirectLinker(UnifiedCacheLinker):
     def __init__(
         self,
@@ -91,6 +180,16 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             1, int(extra_config.get("linker_load_threads", DEFAULT_LOAD_THREADS))
         )
         self.load_mode = extra_config.pop("load_mode", "layer_wise")
+        mnnvl_physical_gpu = _configure_mnnvl_physical_gpu(extra_config)
+        if mnnvl_physical_gpu is not None:
+            logger.info(
+                "Mooncake direct linker MNNVL rank identity: "
+                "tp_rank=%d/%d, cuda_device=%d, physical_gpu=%d",
+                tp_rank,
+                tp_size,
+                torch.cuda.current_device(),
+                mnnvl_physical_gpu,
+            )
         # TODO: unlike `HiCacheController._generate_storage_config`, this sets no
         # `dp_rank`. Aligning the storage-config producers changes persisted
         # storage keys, so it waits for a storage-key format change.
