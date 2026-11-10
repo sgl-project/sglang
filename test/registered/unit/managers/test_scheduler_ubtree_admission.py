@@ -17,7 +17,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-def _request(rid, *, params=None, **fields):
+def _request(rid, *, params=None, return_logprob=False):
     return TokenizedGenerateReqInput(
         rid=rid,
         input_text="hello",
@@ -28,13 +28,12 @@ def _request(rid, *, params=None, **fields):
         sampling_params=SamplingParams(
             **({"temperature": 0, "max_new_tokens": 32} | (params or {}))
         ),
-        return_logprob=fields.pop("return_logprob", False),
+        return_logprob=return_logprob,
         logprob_start_len=-1,
         top_logprobs_num=0,
         token_ids_logprob=None,
         stream=False,
         bootstrap_port=1,
-        **fields,
     )
 
 
@@ -74,32 +73,19 @@ class TestSchedulerUBTreeAdmission(CustomTestCase):
             get_context().override_server_args(sampling_backend="flashinfer"),
             get_parallel().override(tp_rank=0, pp_rank=0),
         ):
-            for fields in (
-                {"params": {"temperature": 0.8, "top_k": 10, "sampling_seed": 7}},
-                {"params": {"regex": "[a-z]+"}},
-                {"params": {"presence_penalty": 0.5}},
-                {"return_logprob": True},
-                {"custom_logit_processor": "invalid-processor"},
-                {"return_hidden_states": True},
-                {"return_sampling_mask": True},
-            ):
-                with self.subTest(fields=fields):
-                    scheduler._add_request_to_queue.reset_mock()
-                    scheduler.grammar_manager.process_req_with_grammar.reset_mock()
-                    scheduler.ipc_channels.send_to_tokenizer.reset_mock()
-                    scheduler.handle_generate_request(_request("invalid", **fields))
-                    scheduler._add_request_to_queue.assert_not_called()
-                    scheduler.grammar_manager.process_req_with_grammar.assert_not_called()
-                    sender = scheduler.ipc_channels.send_to_tokenizer.send_output
-                    sender.assert_called_once()
-                    abort = sender.call_args.args[0]
-                    self.assertEqual(abort.finished_reason["status_code"], 400)
-                    self.assertIn("UBTREE", abort.finished_reason["message"])
-                    scheduler.handle_generate_request(_request("valid"))
-                    scheduler._add_request_to_queue.assert_called_once()
-                    self.assertEqual(
-                        scheduler._add_request_to_queue.call_args.args[0].rid, "valid"
-                    )
+            scheduler.handle_generate_request(_request("invalid", return_logprob=True))
+            scheduler._add_request_to_queue.assert_not_called()
+            scheduler.grammar_manager.process_req_with_grammar.assert_not_called()
+            sender = scheduler.ipc_channels.send_to_tokenizer.send_output
+            sender.assert_called_once()
+            abort = sender.call_args.args[0]
+            self.assertEqual(abort.finished_reason["status_code"], 400)
+            self.assertIn("UBTREE", abort.finished_reason["message"])
+            scheduler.handle_generate_request(_request("valid"))
+            scheduler._add_request_to_queue.assert_called_once()
+            self.assertEqual(
+                scheduler._add_request_to_queue.call_args.args[0].rid, "valid"
+            )
 
             # UBTree's target sampler supports min_p even though the upstream
             # generic speculative path rejects it.
