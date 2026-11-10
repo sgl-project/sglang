@@ -32,8 +32,9 @@ class FakePool:
         if layer in self.skip_layers:
             return None
         ptrs = [[(row, layer)] for row in locations]
-        sizes = [[SLICE] for _ in locations]
-        offsets = [[layer * SLICE] for _ in locations]
+        # DevicePoolEntry shares these read-only rows across locations.
+        sizes = [[SLICE]] * len(locations)
+        offsets = [[layer * SLICE]] * len(locations)
         return ptrs, sizes, offsets
 
 
@@ -57,7 +58,11 @@ class FakeStore:
         time.sleep(self.delay(keys))
         with self.lock:
             self.calls.append(list(keys))
-            for key, key_ptrs, key_offsets in zip(keys, ptrs, offsets):
+            for key, key_ptrs, key_sizes, key_offsets in zip(
+                keys, ptrs, sizes, offsets
+            ):
+                assert len(key_ptrs) == len(key_sizes) == len(key_offsets)
+                assert all(size == SLICE for size in key_sizes)
                 for ptr, offset in zip(key_ptrs, key_offsets):
                     self.ranges.append((key, ptr, offset))
             self.events.append(("get", time.monotonic()))
