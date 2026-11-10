@@ -1,9 +1,8 @@
 # Physis H3 same-step inference
 
 This pipeline supports `Physis-AI/physisserve-minimaxh3_33b-same_step-ls-dev`
-with SGLang's native H3 DiT and Qwen3-VL text encoder. It uses the Diffusers
-`AutoencoderKLMiniMaxH3` decoder, requiring `diffusers>=0.40.0`. Install a
-Diffusers version compatible with the rest of your environment before launching.
+with SGLang's native H3 DiT, Qwen3-VL text encoder, and H3 VAE. The VAE loads
+the checkpoint's Diffusers-format weights through SGLang's native loader.
 The model directory name is detected automatically when it contains
 `physisserve-minimaxh3`.
 
@@ -76,4 +75,4 @@ completed video. The Ulysses example offloads the text encoder after use to leav
 room for KV; pipeline modes keep it on the decoder GPU. GPU memory use grows with
 resolution and retained KV history.
 Eager execution is required; compilation, FSDP, quantization, LoRA and
-layerwise offload are rejected.
+layerwise offload are rejected. Direct GPU loading of VAE weights is unsupported.

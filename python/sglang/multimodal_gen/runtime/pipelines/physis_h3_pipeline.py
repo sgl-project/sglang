@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Physis-AI H3 same-step checkpoint on SGLang's native encoder and DiT."""
+"""Physis-AI H3 same-step checkpoint on SGLang's native encoder, DiT and VAE."""
 
 import sys
 import time
@@ -358,13 +358,17 @@ class PhysisH3DecodingStage(PipelineStage):
             if vae is not None:
                 with self.use_declared_component(component_name="vae", module=vae):
                     latent = batch.latents.float()
-                    mean = latent.new_tensor(vae.config.latents_mean).view(
-                        1, -1, 1, 1, 1
-                    )
-                    std = latent.new_tensor(vae.config.latents_std).view(1, -1, 1, 1, 1)
+                    arch = server_args.pipeline_config.vae_config.arch_config
+                    mean = latent.new_tensor(arch.latents_mean).view(1, -1, 1, 1, 1)
+                    std = latent.new_tensor(arch.latents_std).view(1, -1, 1, 1, 1)
                     decode_dtype = resolve_decode_precision(server_args, "vae")
-                    with autocast_context(decode_dtype, server_args.disable_autocast):
-                        output = vae.decode(latent * std + mean).sample.float()
+                    with (
+                        set_forward_context(
+                            current_timestep=0, attn_metadata=None, forward_batch=batch
+                        ),
+                        autocast_context(decode_dtype, server_args.disable_autocast),
+                    ):
+                        output = vae.decode_base(latent * std + mean).float()
                     pixel_std = output.new_tensor((0.229, 0.224, 0.225)).view(
                         1, 3, 1, 1, 1
                     )
@@ -395,10 +399,6 @@ class PhysisH3Pipeline(ComposedPipelineBase):
     _required_config_modules = ["text_encoder", "tokenizer", "transformer", "vae"]
 
     def __init__(self, model_path, server_args, **kwargs):
-        import diffusers
-
-        if not hasattr(diffusers, "AutoencoderKLMiniMaxH3"):
-            raise RuntimeError("Physis H3 VAE requires diffusers>=0.40.0")
         rank = get_world_rank()
         parallel = server_args.causal_pipeline_mode != "off"
         self.decoder_rank = server_args.causal_pipeline_parallel_size if parallel else 0

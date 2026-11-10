@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from sglang.multimodal_gen import envs
+from sglang.multimodal_gen.configs.models.vaes.minimax_h3_video import (
+    MiniMaxH3VideoVAEConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
     MiniMaxH3PipelineConfig,
@@ -15,7 +18,12 @@ from sglang.multimodal_gen.runtime.platforms import (
 @dataclass
 class PhysisH3PipelineConfig(MiniMaxH3PipelineConfig):
     task_type: ModelTaskType = ModelTaskType.T2V
-    native_only_components: tuple[str, ...] = ("text_encoder", "transformer")
+    native_only_components: tuple[str, ...] = ("text_encoder", "transformer", "vae")
+    vae_config: MiniMaxH3VideoVAEConfig = field(
+        default_factory=lambda: MiniMaxH3VideoVAEConfig(
+            use_tiling=False, use_parallel_decode=False
+        )
+    )
     output_audio_sample_rate: int | None = None
     output_audio_channels: int | None = None
     output_av_drift_tolerance_s: float | None = None
@@ -75,6 +83,10 @@ class PhysisH3PipelineConfig(MiniMaxH3PipelineConfig):
             or server_args.minimax_h3_adaln_cache_path
         ):
             raise ValueError("Physis H3 requires eager, unquantized native DiT")
+        if server_args.should_direct_gpu_weight_load_component("vae"):
+            raise ValueError(
+                "Physis H3 VAE checkpoint conversion does not support direct GPU loading"
+            )
         if server_args.batching_max_size != 1:
             raise ValueError("Physis H3 requires one request at a time")
         if server_args.warmup_mode != "off":

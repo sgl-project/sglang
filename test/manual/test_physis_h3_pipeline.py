@@ -223,16 +223,14 @@ def rank_main(rank, port, folder):
     assert rolled_back == [True], "Component scope lost the forward exception"
 
     class VAE:
-        config = SimpleNamespace(latents_mean=[0.0], latents_std=[1.0])
-
         def __init__(self):
             self.fail = True
 
-        def decode(self, latent):
+        def decode_base(self, latent):
             assert not torch.is_autocast_enabled("cuda")
             if self.fail:
                 raise ValueError("injected VAE failure")
-            return SimpleNamespace(sample=torch.zeros(1, 3, 2, 4, 4, device="cuda"))
+            return torch.zeros(1, 3, 2, 4, 4, device="cuda")
 
     set_global_server_args(SimpleNamespace(comfyui_mode=False))
     vae = VAE()
@@ -244,7 +242,12 @@ def rank_main(rank, port, folder):
     args = SimpleNamespace(
         disable_autocast=True,
         component_precisions={},
-        pipeline_config=SimpleNamespace(vae_decode_precision="fp16"),
+        pipeline_config=SimpleNamespace(
+            vae_decode_precision="fp16",
+            vae_config=SimpleNamespace(
+                arch_config=SimpleNamespace(latents_mean=[0.0], latents_std=[1.0])
+            ),
+        ),
     )
     batch = Req(num_frames=2, fps=24)
     if rank == 3:

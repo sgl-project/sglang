@@ -62,6 +62,7 @@ class TestPhysisH3(CustomTestCase):
                 enable_breakable_cuda_graph=False,
                 use_fsdp_inference=False,
                 has_layerwise_offload_components=lambda: False,
+                should_direct_gpu_weight_load_component=lambda name: False,
                 lora_path=None,
                 comfyui_mode=False,
                 quantization=None,
@@ -95,6 +96,14 @@ class TestPhysisH3(CustomTestCase):
             for overrides, message in (
                 ({"attention_backend": "fa"}, "torch_sdpa"),
                 ({"cache_dit_config": {}}, "cache-dit"),
+                (
+                    {
+                        "should_direct_gpu_weight_load_component": lambda name: (
+                            name == "vae"
+                        )
+                    },
+                    "direct GPU loading",
+                ),
                 (
                     {"kv_cache_quant_config": SimpleNamespace(enabled=True)},
                     "KV quantization",
