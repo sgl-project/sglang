@@ -931,10 +931,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         return None
 
     def _publish_peer_registration(
-        self,
-        mooncake_session_id: str,
-        decode_kv_args: KVArgsRegisterInfo,
-        registration_error: Optional[str] = None,
+        self, mooncake_session_id: str, decode_kv_args: KVArgsRegisterInfo
     ) -> Optional[str]:
         """Record this peer's state-layout verdict, then publish its metadata.
 
@@ -943,8 +940,16 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         reason, if any.
         """
         kv_layout_mismatch = self._kv_layout_mismatch(decode_kv_args)
+        prepare = getattr(self.kv_args, "dcp_prepare_token_item_lens", None)
+        if prepare is not None and decode_kv_args.requires_dcp_relayout:
+            try:
+                decode_kv_args.dcp_token_item_lens = prepare(
+                    self.kv_args, decode_kv_args
+                )
+            except (ValueError, RuntimeError) as exc:
+                kv_layout_mismatch = str(exc)
         fully_checked, state_mismatch = self._validate_peer_state_layout(decode_kv_args)
-        mismatch = registration_error or kv_layout_mismatch or state_mismatch
+        mismatch = kv_layout_mismatch or state_mismatch
         self.check_peer_aux_buffer_count(
             mooncake_session_id, len(decode_kv_args.dst_aux_ptrs)
         )
@@ -1704,6 +1709,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         )
         if plan.empty():
             return 0
+
         target_src_kv_ptrs = src_kv_ptrs[:num_target]
         src_token_indices = plan.target_src_token_indices
         if pack_buffer is not None and src_token_indices.size:
@@ -3273,16 +3279,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         decode_kv_args.dst_dcp_size,
                         decode_kv_args.dst_dcp_rank,
                     )
-                    registration_error = None
-                    prepare = getattr(self.kv_args, "dcp_prepare_token_item_lens", None)
-                    if prepare is not None and decode_kv_args.requires_dcp_relayout:
-                        try:
-                            decode_kv_args.dcp_token_item_lens = prepare(
-                                self.kv_args, decode_kv_args
-                            )
-                        except (ValueError, RuntimeError) as exc:
-                            registration_error = str(exc)
-                    elif decode_kv_args.requires_dcp_relayout:
+                    if decode_kv_args.requires_dcp_relayout and not hasattr(
+                        self.kv_args, "dcp_prepare_token_item_lens"
+                    ):
                         num_entries = len(self.kv_args.kv_item_lens)
                         num_draft = self.kv_args.num_draft_entries
                         dst_item_lens: List[Optional[int]] = [
@@ -3297,7 +3296,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             decode_kv_args.dst_dcp_size, include_draft=True
                         )
                     layout_mismatch = self._publish_peer_registration(
-                        mooncake_session_id, decode_kv_args, registration_error
+                        mooncake_session_id, decode_kv_args
                     )
                     if layout_mismatch is not None:
                         logger.error(
