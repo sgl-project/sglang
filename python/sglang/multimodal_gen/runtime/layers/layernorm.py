@@ -61,9 +61,7 @@ if _is_cuda or _is_xpu:
 
 if _is_npu:
     import torch_npu
-    from sgl_kernel_npu.norm.rmsnorm_without_weight import (
-        fused_rmsnorm_without_weight,
-    )
+    from sgl_kernel_npu.operators.norm import fused_rmsnorm_without_weight
 
     try:
         import attentions  # noqa: F401
@@ -1301,7 +1299,7 @@ def tensor_parallel_rms_norm(x: torch.Tensor, norm: "RMSNorm") -> torch.Tensor:
     weight = norm.weight.tensor_split(tp_size)[tp_rank].float()
     x_fp32 = x.float()
     if _is_npu:
-        from sgl_kernel_npu.norm.rmsnorm_split import fused_rsqrt_mul, fused_variance
+        from sgl_kernel_npu.operators.norm import fused_rsqrt_mul, fused_variance
 
         variance = fused_variance(x_fp32)
     else:
