@@ -17,6 +17,7 @@
 
 import logging
 import re
+from collections import Counter
 from typing import Dict, Iterable, List, Optional, Sequence
 
 import torch
@@ -142,6 +143,10 @@ class LoRAManager:
             raise ValueError(
                 f"LoRA backend {lora_backend!r} does not support DP attention"
             )
+
+        # Target modules present in this rank's decoder layers that no LoRA
+        # wrapper covers; set by init_lora_modules.
+        self.unwrapped_target_modules: Optional[frozenset[str]] = None
 
         # Initialize mutable internal state of the LoRAManager.
         self.init_state(
@@ -743,6 +748,11 @@ class LoRAManager:
             )
 
         self.init_lora_modules()
+        for lora_id, lora_adapter in self.loras.items():
+            self._check_adapter_weights_are_applied(
+                lora_name=self.lora_refs[lora_id].lora_name,
+                lora_adapter=lora_adapter,
+            )
         self.init_memory_pool()
         self.update_lora_info()
 
@@ -941,6 +951,11 @@ class LoRAManager:
             embedding_layer_names=lora_adapter.embedding_layers.keys(),
             speculative_algorithm=self.speculative_algorithm,
         )
+        # Adapters loaded before init_lora_modules are checked in init_state.
+        if self.unwrapped_target_modules is not None:
+            self._check_adapter_weights_are_applied(
+                lora_name=lora_ref.lora_name, lora_adapter=lora_adapter
+            )
 
         self.loras[lora_ref.lora_id] = lora_adapter
 
@@ -965,7 +980,38 @@ class LoRAManager:
             embedding_layer_names=lora_adapter.embedding_layers.keys(),
             speculative_algorithm=self.speculative_algorithm,
         )
+        if self.unwrapped_target_modules is not None:
+            self._check_adapter_weights_are_applied(
+                lora_name=lora_ref.lora_name, lora_adapter=lora_adapter
+            )
         self.loras[lora_ref.lora_id] = lora_adapter
+
+    def _check_adapter_weights_are_applied(
+        self, lora_name: str, lora_adapter: LoRAAdapter
+    ) -> None:
+        # Such weights load into the memory pool as usual but no wrapper reads
+        # them, so the adapter is served at partial strength with no error.
+        adapter_targets = set()
+        for layer in lora_adapter.layers:
+            for weight_name in layer.weights:
+                try:
+                    adapter_targets.add(
+                        get_target_module_name(weight_name, self.target_modules)
+                    )
+                except ValueError:
+                    # Reported by the memory pool when the weights are loaded.
+                    continue
+        dropped = sorted(adapter_targets & self.unwrapped_target_modules)
+        if not dropped:
+            return
+        msg = (
+            f"LoRA adapter '{lora_name}' has weights for {dropped}, but the "
+            "model's should_apply_lora() rejected every module of that type on "
+            "this rank, so those weights have no effect on the output."
+        )
+        if self.lora_strict_loading:
+            raise ValueError(msg)
+        logger.warning(msg)
 
     def load_lora_adapter_from_tensors(
         self,
@@ -1096,7 +1142,13 @@ class LoRAManager:
 
         from sglang.srt.models.inkling_common.dense_mlp import InklingBatchDenseMLP
 
+        present_targets: set[str] = set()
         for module_name, module in self.base_model.named_modules():
+            if get_layer_id(module_name) is not None:
+                present_targets |= _matched_target_names(
+                    module_name, self.target_modules
+                )
+
             # Handle embed_tokens and lm_head before the should_apply_lora gate,
             # since VL models' should_apply_lora patterns only match language
             # model layers and would incorrectly skip these.
@@ -1197,6 +1249,19 @@ class LoRAManager:
                     lora_module.lora_use_virtual_experts = self.lora_use_virtual_experts
                 self.lora_modules[layer_id][module_name] = lora_module
 
+        wrapped_counts = Counter(
+            target
+            for layer_modules in self.lora_modules
+            for module_name in layer_modules
+            for target in _matched_target_names(module_name, self.target_modules)
+        )
+        logger.info(
+            "LoRA-wrapped modules per target: %s", dict(sorted(wrapped_counts.items()))
+        )
+        self.unwrapped_target_modules = frozenset(
+            present_targets - wrapped_counts.keys()
+        )
+
         # lora_* quant methods leave execution to the LoRA wrapper; reject
         # target sets that leave every MoE layer without one.
         backend = getattr(self, "moe_lora_runner_backend", None)
@@ -1210,6 +1275,12 @@ class LoRAManager:
                     "the LoRA target modules to include gate_up_proj and down_proj; "
                     "this adapter leaves the MoE experts without a runner"
                 )
+
+
+def _matched_target_names(module_name: str, target_modules: set[str]) -> set[str]:
+    # Same leaf / parent.leaf rule init_lora_modules uses to pick modules to wrap.
+    parts = module_name.split(".")
+    return {parts[-1], ".".join(parts[-2:])} & target_modules
 
 
 def init_lora_cuda_graph_moe_buffers(
