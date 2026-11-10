@@ -792,7 +792,10 @@ else:
         ),
     ]
 
-ONE_GPU_B200_CASES = ONE_GPU_MODELOPT_NVFP4_CASES + [
+# MiniMax-H3-Image weights are not public yet, so PR CI cannot download them.
+# Add these cases back to ONE_GPU_B200_CASES together with their B200
+# consistency GT and perf baselines once the checkpoint is published.
+MINIMAX_H3_IMAGE_B200_CASES = [
     DiffusionTestCase(
         f"minimax_h3_image_{task}",
         DiffusionServerArgs(
@@ -815,6 +818,8 @@ ONE_GPU_B200_CASES = ONE_GPU_MODELOPT_NVFP4_CASES + [
         ("edit", MINIMAX_H3_IMAGE_EDIT_sampling_params),
     )
 ]
+
+ONE_GPU_B200_CASES = ONE_GPU_MODELOPT_NVFP4_CASES
 
 MINIMAX_H3_FOUR_GPU_H100_CASES = [
     DiffusionTestCase(
