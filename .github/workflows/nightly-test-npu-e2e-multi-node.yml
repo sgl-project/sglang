@@ -64,6 +64,11 @@ on:
         type: string
         default: '{}'
         description: 'JSON run metadata {branch_label, workflow_name, create_time}, recorded once at workflow start'
+      accuracy_dataset:
+        required: false
+        type: string
+        default: ''
+        description: 'Accuracy dataset injected into pods as NPU_ACCURACY_DATASET (gsm8k on weekdays, gpqa_diamond on weekends)'
 
 concurrency:
   group: ascend-nightly-multi-node-${{ github.workflow_ref }}-${{ github.ref }}-${{ inputs.test_config_name }}
@@ -202,6 +207,15 @@ jobs:
             --kube-job-type ${kube_job_type} \
             --kube-job-name-prefix ${KUBE_JOB_NAME} \
             --run-id ${{ github.run_id }}"
+
+          accuracy_dataset="${{ inputs.accuracy_dataset }}"
+          case "${accuracy_dataset}" in
+            ""|gsm8k|gpqa_diamond) ;;
+            *) echo "Unsupported accuracy dataset: ${accuracy_dataset}"; exit 1 ;;
+          esac
+          if [ -n "${accuracy_dataset}" ]; then
+            CMD="${CMD} --accuracy-dataset ${accuracy_dataset}"
+          fi
 
           if [ "$prefill_decode_deployment" = "separation" ];then
             CMD="${CMD} \

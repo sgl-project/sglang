@@ -235,6 +235,13 @@ class TestNPUGLM5_3_W8A8_2P2D_PCP_GPQA(TestNpuAccuracyMultiNodePdSepTestCaseBase
     max_retries = 1
     accuracy = 0.912
     datasets = ["gpqa_diamond"]
+    # Weekend nightly runs gpqa_diamond, weekday (Mon-Fri) runs gsm8k with a
+    # 200-sample cap; the nightly pipeline selects one through
+    # NPU_ACCURACY_DATASET.
+    dataset_baselines = {
+        "gpqa_diamond": 0.912,
+        "gsm8k": 0.95,  # TODO: calibrate against the first weekday nightly run
+    }
     dataset_args = {
         "gpqa_diamond": {
             "filters": {"remove_until": "</think>"},

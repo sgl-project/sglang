@@ -75,6 +75,7 @@ jobs:
       image_a5: ${{ steps.set-vars.outputs.image_a5 }}
       skip_install_flag: ${{ steps.set-vars.outputs.skip_install_flag }}
       run_start_metadata: ${{ steps.set-vars.outputs.run_start_metadata }}
+      accuracy_dataset: ${{ steps.set-vars.outputs.accuracy_dataset }}
     steps:
       # When triggered by PR, no inputs parameters are used. The latest community code is tested by default.
       - name: Set image config
@@ -122,6 +123,16 @@ jobs:
           RUN_START_METADATA="$(python3 -c "import json,sys; print(json.dumps({'branch_label':sys.argv[1],'workflow_name':sys.argv[2],'create_time':sys.argv[3]}))" "$BRANCH_LABEL" "${{ github.workflow }}" "$(date -u -d '+8 hours' +%Y%m%d-%H%M)")"
           # Write to GITHUB_OUTPUT and print to the log in one command.
           echo "run_start_metadata=${RUN_START_METADATA}" | tee -a $GITHUB_OUTPUT
+          # Multi-node accuracy cases run gsm8k (200-sample cap) on weekdays and
+          # gpqa_diamond on weekends. The cron fires at 16:00 UTC, i.e. 00:00 the
+          # next day in Beijing, so resolve the weekday in Asia/Shanghai.
+          ACCURACY_DOW="$(TZ=Asia/Shanghai date +%u)"
+          if [ "${ACCURACY_DOW}" -le 5 ]; then
+            ACCURACY_DATASET="gsm8k"
+          else
+            ACCURACY_DATASET="gpqa_diamond"
+          fi
+          echo "accuracy_dataset=${ACCURACY_DATASET}" | tee -a $GITHUB_OUTPUT
 
   nightly-1-npu-a3:
     name: nightly-1-npu-a3
@@ -387,6 +398,7 @@ jobs:
       prefill_decode_deployment: ${{ matrix.test_config.prefill_decode_deployment }}
       transformers_version: ''
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
+      accuracy_dataset: ${{ matrix.test_config.test_type == 'accuracy' && needs.set-image-config.outputs.accuracy_dataset || '' }}
 
   nightly-poc-multi-node-mix-tests:
     name: multi-node-mix-poc
@@ -432,6 +444,7 @@ jobs:
       prefill_decode_deployment: 'mix'
       transformers_version: ''
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
+      accuracy_dataset: ${{ matrix.test_config.test_type == 'accuracy' && needs.set-image-config.outputs.accuracy_dataset || '' }}
 
   check-all-jobs:
     if: ${{ !cancelled() }}

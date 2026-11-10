@@ -105,6 +105,55 @@ def get_max_retries(datasets):
     return 1
 
 
+# Exported by the nightly pipeline to pick the dataset of multi-node accuracy
+# cases: gsm8k on weekdays (Mon-Fri) and gpqa_diamond on weekends. The test
+# case declares the matching baselines in `dataset_baselines`.
+ACCURACY_DATASET_ENV = "NPU_ACCURACY_DATASET"
+
+# Sample caps applied when the dataset is overridden, so the weekday gsm8k run
+# stays inside the multi-node job step budget. Cases may extend this mapping
+# through their own `dataset_limits`.
+ACCURACY_DATASET_LIMITS = {"gsm8k": 200}
+
+
+def apply_accuracy_dataset_override(test_cls):
+    """Apply the dataset selected by the nightly pipeline on `test_cls`.
+
+    No-op when NPU_ACCURACY_DATASET is unset (PR/full-test/manual runs keep the
+    dataset declared by the case itself). Cases opt in by declaring
+    `dataset_baselines`, so a missing baseline fails loudly instead of silently
+    gating against the wrong dataset.
+    """
+    dataset = os.environ.get(ACCURACY_DATASET_ENV, "").strip()
+    if not dataset:
+        return
+
+    baselines = getattr(test_cls, "dataset_baselines", None) or {}
+    if dataset not in baselines:
+        raise ValueError(
+            f"{test_cls.__name__} has no baseline for dataset '{dataset}'; "
+            f"declare dataset_baselines['{dataset}'] to enable the "
+            f"{ACCURACY_DATASET_ENV} override."
+        )
+
+    limits = {
+        **ACCURACY_DATASET_LIMITS,
+        **(getattr(test_cls, "dataset_limits", None) or {}),
+    }
+    test_cls.datasets = [dataset]
+    test_cls.accuracy = baselines[dataset]
+    test_cls.limit = limits.get(dataset, test_cls.limit)
+    # dataset_args (answer filters / system prompts) are dataset-specific; keep
+    # only the entry matching the selected dataset.
+    if getattr(test_cls, "dataset_args", None):
+        test_cls.dataset_args = test_cls.dataset_args.get(dataset)
+    logger.info(
+        f"[accuracy-dataset] {ACCURACY_DATASET_ENV}={dataset}: "
+        f"datasets={test_cls.datasets} accuracy={test_cls.accuracy} "
+        f"limit={test_cls.limit}"
+    )
+
+
 def run_evalscope(
     host,
     port,
@@ -566,6 +615,7 @@ class TestNpuAccuracyMultiNodePdMixTestCaseBase(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
+        apply_accuracy_dataset_override(cls)
         cls.local_ip = "127.0.0.1"
         cls.host = os.getenv("POD_IP")
         cls.port = SERVICE_PORT
@@ -638,6 +688,7 @@ class TestNpuAccuracyMultiNodePdSepTestCaseBase(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
+        apply_accuracy_dataset_override(cls)
         cls.process = None
         cls.local_ip = "127.0.0.1"
         cls.host = os.getenv("POD_IP")
