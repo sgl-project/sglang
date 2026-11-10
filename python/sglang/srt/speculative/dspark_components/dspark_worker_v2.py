@@ -108,6 +108,7 @@ from sglang.srt.utils import (
     is_npu,
 )
 from sglang.srt.utils.device import async_h2d
+from sglang.srt.utils.log_utils import log_info_on_rank0
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -545,13 +546,12 @@ class DSparkWorkerV2(BaseSpecWorker):
             or self.draft_model.confidence_head is not None
         ):
             return None
-        if get_parallel().tp_rank == 0:
-            logger.info(
-                "DSpark ragged-verify confidences come from the online acceptance "
-                "estimator (gamma=%d, refit every %d steps).",
-                self.gamma,
-                OnlineAcceptanceEstimator.REFIT_INTERVAL,
-            )
+        log_info_on_rank0(
+            logger,
+            "DSpark ragged-verify confidences come from the online acceptance "
+            f"estimator (gamma={self.gamma}, refit every "
+            f"{OnlineAcceptanceEstimator.REFIT_INTERVAL} steps).",
+        )
         return OnlineAcceptanceEstimator(
             num_positions=self.gamma,
             device=self.device,
