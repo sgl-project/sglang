@@ -22,6 +22,12 @@ logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 _FORCE_ROCM_MATH_SDPA = current_platform.is_rocm() and "gfx95" in str(
     torch.cuda.get_device_properties(0).gcnArchName
 )
+_rocm_flash_attn = None
+if _FORCE_ROCM_MATH_SDPA:
+    try:
+        from aiter import flash_attn_func as _rocm_flash_attn
+    except ImportError:
+        pass
 
 
 def _math_sdpa(query, key, value):
@@ -49,9 +55,23 @@ def _math_sdpa(query, key, value):
 
 
 def _sdpa_attention(query, key, value):
-    query, key, value = (t.transpose(1, 2) for t in (query, key, value))
+    """query/key/value: [B, S, H, D]."""
     if _FORCE_ROCM_MATH_SDPA:
+        # torch's fused SDPA corrupts this decoder on gfx950; half inputs take
+        # aiter's flash kernel (the fused class CUDA's SDPA picks, FP32
+        # accumulation), FP32 inputs the exact math replica.
+        device = query.device.type
+        if torch.is_autocast_enabled(device):
+            dtype = torch.get_autocast_dtype(device)
+            query, key, value = query.to(dtype), key.to(dtype), value.to(dtype)
+        if _rocm_flash_attn is not None and query.dtype in (
+            torch.float16,
+            torch.bfloat16,
+        ):
+            return _rocm_flash_attn(query, key, value, dropout_p=0.0, causal=False)
+        query, key, value = (t.transpose(1, 2) for t in (query, key, value))
         return _math_sdpa(query, key, value).transpose(1, 2)
+    query, key, value = (t.transpose(1, 2) for t in (query, key, value))
     out = F.scaled_dot_product_attention(query, key, value, dropout_p=0.0)
     return out.transpose(1, 2)
 

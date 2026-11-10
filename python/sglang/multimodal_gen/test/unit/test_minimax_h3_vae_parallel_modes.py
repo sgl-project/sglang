@@ -28,9 +28,13 @@ from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_vae_cuda_opt import (
 from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae import (
     AutoencoderKLLegacy,
 )
+from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae import (
+    attention as vit_attention,
+)
 from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.attention import (
     Attention,
     _apply_qk_norm,
+    _sdpa_attention,
 )
 from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.base_module import (
     RotaryEmbeddingND,
@@ -107,6 +111,51 @@ def test_vit_attention_uses_local_usp_backend_dispatch():
         AttentionBackendEnum.FA,
         AttentionBackendEnum.TORCH_SDPA,
     }
+
+
+def test_gfx950_vit_attention_takes_flash_for_half_and_math_for_fp32():
+    """gfx950's fused SDPA corrupts the decoder: half inputs (autocast
+    included) go to aiter's flash kernel as [B, S, H, D], FP32 to the math
+    replica."""
+    module = "sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.attention"
+    q, k, v = (torch.randn(1, 5, 2, 8) for _ in range(3))
+    flash = mock.Mock(side_effect=lambda q, k, v, **_: torch.full_like(q, 7.0))
+    with (
+        mock.patch(f"{module}._FORCE_ROCM_MATH_SDPA", True),
+        mock.patch(f"{module}._rocm_flash_attn", flash),
+    ):
+        out_half = _sdpa_attention(q.half(), k.half(), v.half())
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            _sdpa_attention(q, k, v)
+        out_fp32 = _sdpa_attention(q, k, v)
+
+    assert [c.args[0].dtype for c in flash.call_args_list] == [
+        torch.float16,
+        torch.bfloat16,
+    ]
+    assert flash.call_args.args[0].shape == q.shape
+    assert flash.call_args.kwargs == {"dropout_p": 0.0, "causal": False}
+    assert torch.equal(out_half, torch.full_like(out_half, 7.0))
+    ref = torch.nn.functional.scaled_dot_product_attention(
+        *(t.transpose(1, 2) for t in (q, k, v))
+    ).transpose(1, 2)
+    torch.testing.assert_close(out_fp32, ref)
+
+
+@pytest.mark.skipif(
+    vit_attention._rocm_flash_attn is None, reason="requires aiter on gfx950"
+)
+def test_gfx950_vit_flash_attention_matches_math_at_decoder_shape():
+    torch.manual_seed(0)
+    q, k, v = (
+        torch.randn(1, 1797, 32, 64, device="cuda", dtype=torch.float16)
+        for _ in range(3)
+    )
+    flash = _sdpa_attention(q, k, v)
+    with mock.patch.object(vit_attention, "_rocm_flash_attn", None):
+        math = _sdpa_attention(q, k, v)
+    # both accumulate in FP32; they differ by the FP16 rounding of the output
+    torch.testing.assert_close(flash, math, atol=2e-3, rtol=2e-3)
 
 
 def test_vit_qk_norm_supports_affine_free_rmsnorm():
