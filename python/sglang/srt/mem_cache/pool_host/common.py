@@ -524,12 +524,21 @@ def alloc_with_pin_memory(
     dtype: torch.dtype,
     device: str,
     pin_memory: bool,
-    allocator: None,
+    allocator: HostTensorAllocator | None,
     registration_granularity_bytes: int | None = None,
 ) -> torch.Tensor:
     """
     Allocate tensor using PyTorch's built-in pin_memory flag.
+
+    When pin_memory is off (SGLANG_HICACHE_DISABLE_NPU_HOST_PIN_MEMORY=1) the
+    storage allocator places the buffer instead. MooncakeHostTensorAllocator
+    goes through Mooncake's ShmHelper, which under MC_STORE_REGISTER_SPDK=1
+    forces HugeTLB backing and registers the range with SPDK, so the host pool
+    is hugepage-backed and the NoF (NVMe-oF) transport can DMA to it directly
+    instead of falling back to a staging copy.
     """
+    if not pin_memory and allocator is not None:
+        return allocator.allocate(dims, dtype=dtype, device=device)
     buffer = torch.empty(dims, dtype=dtype, device=device, pin_memory=pin_memory)
     return buffer
 
