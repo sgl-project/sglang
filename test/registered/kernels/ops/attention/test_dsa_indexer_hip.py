@@ -85,8 +85,7 @@ class TestDSAIndexerHip(CustomTestCase):
         loc[::50] = -1  # padded tokens write nothing
         key = torch.randn(loc.numel(), HEAD_DIM, device="cuda", generator=gen)
         key = key.bfloat16()
-        dcp_layout._dsa_shards_index_k = True
-        try:
+        with patch.object(dcp_layout, "_dsa_shards_index_k", True):
             for rank in (0, dcp_size - 1):
                 with self.subTest(rank=rank):
                     with published_topology(tp_size=dcp_size, dcp_size=dcp_size):
@@ -97,8 +96,6 @@ class TestDSAIndexerHip(CustomTestCase):
                         ref = _store(_make_pool(), loc[owned] // dcp_size, key[owned])
                     self.assertTrue(ref.any(), "no index-K row was stored")
                     self.assertTrue(torch.equal(got, ref))
-        finally:
-            dcp_layout._dsa_shards_index_k = False
 
     def test_verify_logits_match_per_row_call(self):
         num_reqs, next_n, req_pages = 3, 4, 8
@@ -327,8 +324,7 @@ class TestNoPEPrologueHip(CustomTestCase):
 
     def _check_same(self, indexer, mode, x, q_lora, loc, dcp_size):
         rank = dcp_size - 1
-        dcp_layout._dsa_shards_index_k = dcp_size > 1
-        try:
+        with patch.object(dcp_layout, "_dsa_shards_index_k", dcp_size > 1):
             with published_topology(tp_size=dcp_size, dcp_size=dcp_size):
                 with get_parallel().override(attn_dcp_rank=rank, dcp_rank=rank):
                     generic_pool, prologue_pool = _make_pool(), _make_pool()
@@ -338,8 +334,6 @@ class TestNoPEPrologueHip(CustomTestCase):
                     prologue = self._forward(
                         indexer, prologue_pool, mode, x, q_lora, loc, True
                     )
-        finally:
-            dcp_layout._dsa_shards_index_k = False
         q8, generic_q8 = prologue["q_fp8"], generic["q_fp8"]
         self.assertTrue(torch.equal(q8.view(torch.uint8), generic_q8.view(torch.uint8)))
         weights, generic_weights = prologue["weights"], generic["weights"]

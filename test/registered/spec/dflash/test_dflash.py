@@ -21,6 +21,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=894, stage="extra-a", runner_config="1-gpu-small")
+# backend-specific: ROCm serves DFLASH on the triton backend and runs the sampled-verify class.
 register_amd_ci(est_time=490, stage="extra-a", runner_config="1-gpu-small-amd")
 
 

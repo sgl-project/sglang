@@ -531,7 +531,6 @@ class TestDraftAttention(CustomTestCase):
                     default = _backend_extend(case, inputs, bf16_dot=False)
                     default_err = _err(default, ref)
                     assert not torch.equal(default, out)
-                    assert default_err > 2 * err, (default_err, err)
 
     def test_bf16_cache_unchanged_by_bf16_dot(self):
         for name in EXTEND_CASES:

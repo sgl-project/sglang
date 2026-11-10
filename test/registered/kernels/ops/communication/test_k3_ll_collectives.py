@@ -2,6 +2,7 @@
 
 import os
 import socket
+import time
 import unittest
 
 import torch
@@ -142,8 +143,14 @@ class TestK3LLCollectives(CustomTestCase):
             ]
             for p in procs:
                 p.start()
+            # one deadline for all ranks; a hung rank must not keep its GPU past it
+            deadline = time.monotonic() + 900
             for p in procs:
-                p.join(timeout=900)
+                p.join(timeout=max(0.0, deadline - time.monotonic()))
+            for p in procs:
+                if p.is_alive():
+                    p.kill()
+                    p.join()
             self.assertTrue(
                 all(p.exitcode == 0 for p in procs), "a rank crashed or hung"
             )
