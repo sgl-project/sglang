@@ -259,6 +259,54 @@ class TestVmmAtomicReservation(CustomTestCase):
         pool.occupied_chunks = []
         return pool
 
+    def test_stream_context_failure_returns_reservations(self):
+        """context setup failures must not strand capacity or active publishers"""
+        for failure_point in ("construct", "enter"):
+            with self.subTest(failure_point=failure_point):
+                pool = self.make_pool()
+                publisher = BoundedFeaturePublisher(pool, 1000, cpu_tensors=True)
+                publisher.copy_stream = object()
+                source = torch.ones(4)
+                output = MultimodalProcessorOutput(
+                    input_ids=[1],
+                    mm_items=[
+                        MultimodalDataItem(modality=Modality.IMAGE, feature=source)
+                        for _ in range(2)
+                    ],
+                )
+
+                def fail_context(*args):
+                    self.assertEqual(pool._active_publishers, 2)
+                    self.assertEqual(publisher.admission.pending_count, 1)
+                    raise RuntimeError("CUDA stream context failed")
+
+                context = MagicMock()
+                context.__enter__.side_effect = fail_context
+                try:
+                    with patch(
+                        "sglang.srt.multimodal.transport.publisher.torch.cuda.stream",
+                        side_effect=(
+                            fail_context if failure_point == "construct" else None
+                        ),
+                        return_value=context,
+                    ):
+                        with self.assertRaisesRegex(
+                            RuntimeError, "CUDA stream context failed"
+                        ):
+                            asyncio.run(publisher.prepare([output]))
+                    self.assertEqual(pool._active_publishers, 0)
+                    self.assertEqual(
+                        pool.available_chunks, [_CudaVmmMemoryChunk(0, 2048)]
+                    )
+                    self.assertEqual(pool.reclaimed_count, 2)
+                    self.assertEqual(publisher.admission.pending_count, 0)
+                    self.assertEqual(publisher.admission.pending_bytes, 0)
+                    self.assertTrue(
+                        all(item.feature is source for item in output.mm_items)
+                    )
+                finally:
+                    publisher.shutdown()
+
     def test_lifecycle_metrics_count_each_release_once(self):
         registry = CollectorRegistry()
 

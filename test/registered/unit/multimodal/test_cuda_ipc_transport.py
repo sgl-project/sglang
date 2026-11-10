@@ -13,6 +13,7 @@ import threading
 import time
 import unittest
 import weakref
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -30,6 +31,7 @@ from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
 from sglang.srt.multimodal.processors.executor import MultimodalProcessorExecutor
+from sglang.srt.multimodal.transport import memory_pool
 from sglang.srt.multimodal.transport.admission import MmMemoryOverloaded
 from sglang.srt.multimodal.transport.cuda_ipc import (
     CudaIpcTensorTransportProxy,
@@ -40,7 +42,7 @@ from sglang.srt.multimodal.transport.publisher import BoundedFeaturePublisher
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=54, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=72, stage="base-b", runner_config="1-gpu-small")
 
 
 class _PausedHFProcessor:
@@ -316,6 +318,195 @@ class TestCudaIpcTransport(CustomTestCase):
             publisher.shutdown()
             pool.shutdown()
             _pool_handle_cache_clear()
+
+    def test_stream_exit_failure_cancels_publication_and_recovers(self):
+        """failed context restoration must cancel proxies that never reached dispatch"""
+        pool = MmItemMemoryPool(1 << 20, 0.01, 0, 1)
+        publisher = BoundedFeaturePublisher(pool, 1000, cpu_tensors=False)
+        publisher.copy_stream = torch.cuda.Stream()
+        source = torch.arange(35, dtype=torch.float32, device="cuda").reshape(5, 7)
+        expected = source.cpu()
+        original_stream = torch.cuda.stream
+        leases = []
+
+        @contextmanager
+        def fail_restore(stream):
+            with original_stream(stream):
+                if stream is publisher.copy_stream:
+                    # keep copies in flight without a test-induced circular wait
+                    torch.cuda._sleep(500_000_000)
+                yield
+            if stream is publisher.copy_stream:
+                with pool._pool._lock:
+                    leases.extend(pool._pool._occupied.values())
+                raise RuntimeError("CUDA stream restore failed")
+
+        async def run():
+            output = MultimodalProcessorOutput(
+                input_ids=[1],
+                mm_items=[
+                    MultimodalDataItem(modality=Modality.IMAGE, feature=source)
+                    for _ in range(2)
+                ],
+            )
+            with patch.object(torch.cuda, "stream", fail_restore):
+                with self.assertRaisesRegex(RuntimeError, "CUDA stream restore failed"):
+                    await publisher.prepare([output])
+            self.assertEqual(len(leases), 2)
+            self.assertTrue(all(item.feature is source for item in output.mm_items))
+            self.assertEqual(publisher.admission.pending_count, 0)
+            self.assertEqual(publisher.admission.pending_bytes, 0)
+            deadline = time.monotonic() + 5
+            while pool.active_lease_count and time.monotonic() < deadline:
+                await asyncio.sleep(0.01)
+            self.assertEqual(pool.active_lease_count, 0)
+            self.assertEqual(pool._pool._copy_sources, {})
+            self.assertEqual(pool._pool.reclaimed_count, 2)
+            for lease in leases:
+                self.assertEqual(
+                    pool._pool._control_words[lease.slot].cpu().tolist(),
+                    [lease.generation, lease.generation],
+                )
+
+            # a subsequent real publication must survive cross-process reconstruction
+            await publisher.prepare([output])
+            proxies = [item.feature for item in output.mm_items]
+            ctx = mp.get_context("spawn")
+            results = ctx.Queue()
+            consumer = ctx.Process(
+                target=_consume_pooled_tensors, args=(proxies, expected, results)
+            )
+            consumer.start()
+            try:
+                self.assertIsNone(await asyncio.to_thread(results.get, True, 60))
+                await asyncio.to_thread(consumer.join, 10)
+                self.assertEqual(consumer.exitcode, 0)
+            finally:
+                if consumer.is_alive():
+                    consumer.terminate()
+                    consumer.join(10)
+                results.close()
+                results.join_thread()
+            deadline = time.monotonic() + 5
+            while pool.active_lease_count and time.monotonic() < deadline:
+                await asyncio.sleep(0.01)
+            self.assertEqual(pool.active_lease_count, 0)
+            self.assertEqual(pool.capacity_snapshot()["cpu_spills"], 0)
+
+        try:
+            asyncio.run(run())
+        finally:
+            publisher.shutdown()
+            pool.shutdown()
+            _pool_handle_cache_clear()
+
+    def test_stream_exit_cancel_failure_retains_failed_lease(self):
+        """one failed CUDA cancellation poisons its lease without skipping the rest"""
+        pool = MmItemMemoryPool(1 << 20, 0.01, 0, 1)
+        publisher = BoundedFeaturePublisher(pool, 1000, cpu_tensors=False)
+        publisher.copy_stream = torch.cuda.Stream()
+        source = torch.ones(32, device="cuda")
+        original_stream = torch.cuda.stream
+        original_wait = memory_pool.stream_wait_value32
+        leases, waits = [], []
+        cancel_error = RuntimeError("CUDA cancellation wait failed")
+
+        @contextmanager
+        def fail_restore(stream):
+            with original_stream(stream):
+                yield
+            if stream is publisher.copy_stream:
+                with pool._pool._lock:
+                    leases.extend(pool._pool._occupied.values())
+                raise RuntimeError("CUDA stream restore failed")
+
+        def fail_first_wait(device, address, generation, transport):
+            waits.append(address)
+            if len(waits) == 1:
+                raise cancel_error
+            return original_wait(device, address, generation, transport)
+
+        async def run():
+            output = MultimodalProcessorOutput(
+                input_ids=[1],
+                mm_items=[
+                    MultimodalDataItem(modality=Modality.IMAGE, feature=source)
+                    for _ in range(2)
+                ],
+            )
+            with (
+                patch.object(torch.cuda, "stream", fail_restore),
+                patch.object(memory_pool, "stream_wait_value32", fail_first_wait),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "CUDA stream restore failed"):
+                    await publisher.prepare([output])
+            self.assertEqual(len(leases), 2)
+            self.assertEqual(
+                waits,
+                [pool._pool.base_address + lease.ready_byte_offset for lease in leases],
+            )
+            self.assertIs(pool._pool._pool_error, cancel_error)
+            self.assertEqual(pool._pool._cancelling, {leases[0].slot})
+            self.assertEqual(publisher.admission.pending_bytes, 0)
+            self.assertEqual(publisher.admission.pending_count, 0)
+            self.assertTrue(all(item.feature is source for item in output.mm_items))
+            deadline = time.monotonic() + 5
+            while pool.active_lease_count > 1 and time.monotonic() < deadline:
+                await asyncio.sleep(0.01)
+            self.assertEqual(pool._pool._occupied, {leases[0].slot: leases[0]})
+            self.assertEqual(pool._pool.reclaimed_count, 1)
+            self.assertEqual(
+                pool._pool._control_words[leases[0].slot].cpu().tolist(),
+                [leases[0].generation, 0],
+            )
+            self.assertEqual(
+                pool._pool._control_words[leases[1].slot].cpu().tolist(),
+                [leases[1].generation, leases[1].generation],
+            )
+            with self.assertRaisesRegex(RuntimeError, "CUDA IPC feature pool failed"):
+                pool.try_reserve_batch([128])
+
+        try:
+            asyncio.run(run())
+        finally:
+            publisher.shutdown()
+            pool.shutdown()
+
+    def test_guarded_copy_failure_is_not_released_twice(self):
+        """the pool owns rollback once publication starts, even before a proxy exists"""
+        pool = MmItemMemoryPool(1 << 20, 0.01, 0, 1)
+        publisher = BoundedFeaturePublisher(pool, 1000, cpu_tensors=False)
+        source = torch.ones(32, device="cuda")
+        copy_error = RuntimeError("CUDA producer-ready write failed")
+        output = MultimodalProcessorOutput(
+            input_ids=[1],
+            mm_items=[
+                MultimodalDataItem(modality=Modality.IMAGE, feature=source)
+                for _ in range(2)
+            ],
+        )
+        try:
+            with patch.object(
+                memory_pool, "stream_write_value32", side_effect=copy_error
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "CUDA producer-ready write failed"
+                ) as raised:
+                    asyncio.run(publisher.prepare([output]))
+            self.assertIs(raised.exception, copy_error)
+            self.assertEqual(pool.active_lease_count, 0)
+            self.assertEqual(pool._pool._copy_sources, {})
+            self.assertEqual(pool._pool.reclaimed_count, 2)
+            self.assertEqual(
+                pool.capacity_snapshot()["free_bytes"], pool.publication_capacity
+            )
+            self.assertIsNone(pool._pool._pool_error)
+            self.assertEqual(publisher.admission.pending_count, 0)
+            self.assertEqual(publisher.admission.pending_bytes, 0)
+            self.assertTrue(all(item.feature is source for item in output.mm_items))
+        finally:
+            publisher.shutdown()
+            pool.shutdown()
 
     def test_proxy_construction_failure_reclaims_only_after_copy(self):
         pool = MmItemMemoryPool(1 << 20, 0.01, 0, 1)
