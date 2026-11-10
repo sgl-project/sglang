@@ -24,11 +24,7 @@ from sglang.srt.speculative.ubtree_components.config import (
     validate_runtime_config,
 )
 from sglang.srt.speculative.ubtree_components.selector import UBTreeSelector
-from sglang.srt.speculative.ubtree_components.tree import (
-    build_sglang_full_mask,
-    build_ubtree_batch,
-    compact_tree_values_to_front,
-)
+from sglang.srt.speculative.ubtree_components.tree import build_ubtree_batch
 from sglang.srt.speculative.ubtree_components.validation import validate_ubtree_request
 from sglang.srt.speculative.ubtree_components.vocab import vocab_parallel_topk
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -328,67 +324,6 @@ class TestUBTreeComponents(CustomTestCase):
                     siblings.append(child)
                     child = int(tree.retrieve_next_sibling[batch_index, child])
                 assert node in siblings
-
-    def test_sglang_mask_contains_prefix_and_only_ancestors(self):
-        candidates = torch.tensor([[[1, 2], [3, 4]]])
-        edges = torch.log_softmax(torch.randn(1, 2, 2, 2), dim=-1)
-        tree = build_ubtree_batch(
-            anchor_tokens=torch.tensor([0]),
-            candidate_ids=candidates,
-            edge_log_probs=edges,
-            budget=3,
-            supertree_width=2,
-        )
-        packed = build_sglang_full_mask(tree.visibility, [3])
-        mask = packed.view(tree.node_count, 3 + tree.node_count)
-        assert torch.all(mask[:, :3])
-        assert torch.equal(mask[:, 3:], tree.visibility[0])
-        device_only = build_sglang_full_mask(
-            tree.visibility, torch.tensor([3]), prefix_lens_sum=3
-        )
-        assert torch.equal(device_only, packed)
-
-    def test_compact_to_front_reuses_contiguous_storage_without_changing_values(self):
-        values = torch.arange(2 * 5 * 3).view(10, 3)
-        original = values.clone()
-        accept_index = torch.tensor([[2, 4, -1], [6, 9, 8]], dtype=torch.int32)
-        expected = original.clone()
-        expected.view(2, 5, 3)[:, :3].copy_(
-            original[accept_index.to(torch.int64).clamp_min(0).reshape(-1)].view(
-                2, 3, 3
-            )
-        )
-
-        output = compact_tree_values_to_front(
-            values,
-            accept_index,
-            batch_size=2,
-            node_count=5,
-        )
-
-        assert output.data_ptr() == values.data_ptr()
-        torch.testing.assert_close(output, expected, rtol=0, atol=0)
-
-    def test_compact_to_front_keeps_noncontiguous_fallback(self):
-        values = torch.arange(2 * 5 * 4).view(10, 4)[:, ::2]
-        original = values.clone()
-        accept_index = torch.tensor([[2, 4, -1], [6, 9, 8]], dtype=torch.int32)
-        expected = original.clone()
-        expected.view(2, 5, 2)[:, :3].copy_(
-            original[accept_index.to(torch.int64).clamp_min(0).reshape(-1)].view(
-                2, 3, 2
-            )
-        )
-
-        output = compact_tree_values_to_front(
-            values,
-            accept_index,
-            batch_size=2,
-            node_count=5,
-        )
-
-        assert output.is_contiguous()
-        torch.testing.assert_close(output, expected, rtol=0, atol=0)
 
 
 class TestUBTreeRuntimeConfig(CustomTestCase):

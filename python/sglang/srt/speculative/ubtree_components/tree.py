@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Sequence
 
 import torch
 import triton
@@ -36,28 +35,6 @@ class UBTreeBatch:
     @property
     def node_count(self) -> int:
         return int(self.tokens.shape[1])
-
-
-def compact_tree_values_to_front(
-    values: torch.Tensor,
-    accept_index: torch.Tensor,
-    *,
-    batch_size: int,
-    node_count: int,
-) -> torch.Tensor:
-    """Move each accepted path to the front without cloning contiguous input."""
-
-    width = accept_index.shape[1]
-    safe = accept_index.to(torch.int64).clamp_min(0).reshape(-1)
-    gathered = values[safe]
-    # Advanced indexing materializes ``gathered`` before the write, so source
-    # rows cannot be overwritten before they are read. Both runtime callers
-    # discard the original tree ordering after compaction.
-    output = values if values.is_contiguous() else values.contiguous()
-    output.view(batch_size, node_count, *values.shape[1:])[:, :width].copy_(
-        gathered.view(batch_size, width, *values.shape[1:])
-    )
-    return output
 
 
 @triton.jit
@@ -687,55 +664,7 @@ def build_ubtree_batch(
     )
 
 
-def build_sglang_full_mask(
-    visibility: torch.Tensor,
-    prefix_lens: Sequence[int] | torch.Tensor,
-    *,
-    prefix_lens_sum: int | None = None,
-) -> torch.Tensor:
-    """Pack SGLang's per-request ``[query, prefix + tree]`` allow masks."""
-
-    if isinstance(prefix_lens, torch.Tensor):
-        if prefix_lens.device == visibility.device and prefix_lens_sum is not None:
-            batch, nodes, _ = visibility.shape
-            lengths = prefix_lens.to(torch.int64)
-            total = nodes * (int(prefix_lens_sum) + batch * nodes)
-            mask = torch.ones(total, dtype=torch.bool, device=visibility.device)
-            starts = nodes * (
-                torch.cumsum(lengths, dim=0)
-                - lengths
-                + torch.arange(batch, device=visibility.device) * nodes
-            )
-            query = torch.arange(nodes, device=visibility.device)[None, :, None]
-            key = torch.arange(nodes, device=visibility.device)[None, None, :]
-            tree_indices = (
-                starts[:, None, None]
-                + query * (lengths[:, None, None] + nodes)
-                + lengths[:, None, None]
-                + key
-            )
-            mask.scatter_(0, tree_indices.reshape(-1), visibility.reshape(-1))
-            return mask
-        if prefix_lens.device.type != "cpu":
-            prefix_lens = prefix_lens.to(device="cpu")
-        prefix_lens = prefix_lens.tolist()
-    if len(prefix_lens) != visibility.shape[0]:
-        raise ValueError("prefix_lens must contain one length per tree")
-    masks = []
-    nodes = visibility.shape[1]
-    for batch_index, prefix_len in enumerate(prefix_lens):
-        if int(prefix_len) < 0:
-            raise ValueError("prefix lengths must be non-negative")
-        prefix = torch.ones(
-            (nodes, int(prefix_len)), dtype=torch.bool, device=visibility.device
-        )
-        masks.append(torch.cat((prefix, visibility[batch_index]), dim=1).reshape(-1))
-    return torch.cat(masks) if masks else visibility.new_empty((0,))
-
-
 __all__ = [
     "UBTreeBatch",
-    "build_sglang_full_mask",
     "build_ubtree_batch",
-    "compact_tree_values_to_front",
 ]
