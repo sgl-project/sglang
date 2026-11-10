@@ -50,7 +50,7 @@ uv pip install --upgrade pip
 uv run python/sglang/kernels/aot/setup_metal.py install
 
 # Install sglang python package along with diffusion support
-rm -f python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml
+cp python/pyproject_other.toml python/pyproject.toml
 uv pip install -e "python[all_mps]"
 ```
 
