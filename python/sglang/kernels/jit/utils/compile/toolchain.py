@@ -43,9 +43,7 @@ _SAIL_GPU_ARCHS = (
 def cuda_home() -> str:
     """CUDA install root, resolved the way tvm-ffi resolves it.
 
-    `arch._jit_cuda_version` resolves nvcc the same way for its own purposes;
-    the two must stay in agreement, since one picks the target and the other
-    compiles for it.
+    `arch._jit_cuda_version` probes this nvcc to pick the compile target.
     """
     configured = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
     if configured is not None:
@@ -177,7 +175,7 @@ def tvm_ffi_paths() -> Tuple[Tuple[str, ...], str, str]:
     return includes, str(lib.parent), lib.stem.removeprefix("lib")
 
 
-def target_flags() -> List[str]:
+def target_flags(kernel_name: str = "") -> List[str]:
     """The device flags that pin the build to this GPU.
 
     Emitted from the architecture sglang already detected, rather than left to
@@ -194,7 +192,7 @@ def target_flags() -> List[str]:
         return [f"--gpu-architecture={arch}"]
     if is_hip_runtime():
         return [f"--offload-arch={gpu_arch_name()}"]
-    arch = get_compile_arch()
+    arch = get_compile_arch(kernel_name)
     target = f"{arch.major}{arch.minor}{arch.suffix}"
     return [f"-gencode=arch=compute_{target},code=sm_{target}"]
 

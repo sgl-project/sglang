@@ -11,7 +11,8 @@ from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
     HiSparseTokenToKVPoolAllocator,
 )
-from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
+from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -196,14 +197,15 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         logical_allocator.reclaim_for_prealloc.return_value = None
 
         tree_cache = object()
-        self.assertIsNone(allocator.reclaim_for_prealloc(tree_cache, 512, 256))
+        demand = KVDemand(512, {"swa": 256})
+        self.assertIsNone(allocator.reclaim_for_prealloc(tree_cache, demand))
         logical_allocator.reclaim_for_prealloc.assert_called_once_with(
-            tree_cache, 512, 256
+            tree_cache, demand
         )
 
         logical_allocator.reclaim_for_prealloc.return_value = "SWA eviction short"
         self.assertEqual(
-            allocator.reclaim_for_prealloc(tree_cache, 512, 256),
+            allocator.reclaim_for_prealloc(tree_cache, demand),
             "SWA eviction short",
         )
 
@@ -216,7 +218,9 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
             full_available_size=MagicMock(return_value=512),
         )
         queue.token_to_kv_pool_allocator = SimpleNamespace(
-            logical_attn_allocator=logical_allocator, storage=None
+            logical_attn_allocator=logical_allocator,
+            storage=None,
+            pools_share_memory=False,
         )
         queue.scheduler = SimpleNamespace(enable_hisparse=True, last_batch=None)
         queue.retracted_queue = []
@@ -236,7 +240,7 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
 
         fill_len = 512
         sliding_window_size = 200
-        # _swa_tail_len floors the window start to a page boundary:
+        # The window tail floors the window start to a page boundary:
         # floor_align(512 - 200, 256) = 256, so the tail is one whole page.
         swa_tail_len = 256
         kv_loc = torch.arange(512, 512 + fill_len, dtype=torch.int64)
@@ -265,12 +269,21 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         allocator = SimpleNamespace(
             state=None,
             storage=None,
+            pools_share_memory=False,
+            # The window pool, keeping the scheduler's window.
+            window_pool_names=lambda: ("swa",),
+            target_window_pool=lambda: "swa",
+            get_kvcache=lambda: SimpleNamespace(request_window=None),
             device=torch.device("cpu"),
             page_size=256,
             available_size=MagicMock(return_value=fill_len),
             swa_available_size=MagicMock(return_value=swa_tail_len),
             alloc_extend_swa_tail=MagicMock(return_value=kv_loc),
             alloc_logical_only=MagicMock(return_value=kv_loc),
+        )
+        # The window pool keeps the scheduler's window.
+        kv_storage_of(req_to_token_pool, allocator).bind_window_retention(
+            sliding_window_size, None
         )
         regular_host_alloc = MagicMock(return_value=host_indices)
         coordinator = SimpleNamespace(
@@ -303,9 +316,7 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         _, kwargs = allocator.alloc_extend_swa_tail.call_args
         self.assertEqual(kwargs["extend_num_tokens"], fill_len)
         self.assertEqual(kwargs["swa_tail_len"], swa_tail_len)
-        self.assertEqual(
-            req.kv.get_evicted_seqlen(ComponentType.SWA), fill_len - swa_tail_len
-        )
+        self.assertEqual(req.kv.get_evicted_seqlen("swa"), fill_len - swa_tail_len)
         self.assertEqual(req.kv.kv_allocated_len, fill_len)
         self.assertEqual(req.kv.kv_committed_len, fill_len)
         self.assertEqual(req.extend_end, fill_len)

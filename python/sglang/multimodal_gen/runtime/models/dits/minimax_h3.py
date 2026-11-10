@@ -22,6 +22,10 @@ from sglang.kernels.ops.activation.activation import (
     silu_and_mul_with_activation_rounding,
     silu_and_mul_with_activation_rounding_,
 )
+from sglang.kernels.ops.activation.swiglu_mxfp8_swizzled import (
+    can_use_silu_mul_mxfp8,
+    silu_mul_mxfp8,
+)
 from sglang.kernels.ops.diffusion import (
     MINIMAX_H3_NORM_MODULATE,
     BitExactFusionGate,
@@ -29,9 +33,7 @@ from sglang.kernels.ops.diffusion import (
     can_use_aten_head_rmsnorm,
     can_use_aten_head_rmsnorm_rope,
     can_use_fused_inplace_qknorm_rope,
-    can_use_mxfp8_swizzled,
     can_use_rmsnorm_indexed_scale_shift,
-    can_use_silu_mul_mxfp8,
     fused_inplace_qknorm_rope,
     fused_qknorm_rope_out_of_place,
     indexed_gate_bf16,
@@ -42,10 +44,12 @@ from sglang.kernels.ops.diffusion import (
     indexed_scale_shift_fp32_,
     indexed_scale_shift_mxfp8_,
     rmsnorm_indexed_scale_shift,
-    silu_mul_mxfp8,
     tensors_equal,
 )
 from sglang.kernels.ops.layernorm.norm import fused_inplace_qknorm
+from sglang.kernels.ops.quantization.mxfp8_swizzled_triton import (
+    can_use_mxfp8_swizzled,
+)
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
     MINIMAX_H3_ADALN_MODALITY_NUM,
@@ -77,9 +81,14 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.sdpa import (
 from sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn_h3 import (
     vsa_h3_fold_gate,
 )
+from sglang.multimodal_gen.runtime.layers.attention.layer import (
+    PIPELINED_ATTENTION_BACKENDS,
+)
 from sglang.multimodal_gen.runtime.layers.attention.selector import (
+    ComponentAttentionBackendNotAppliedError,
     claim_deferred_component_attn_backend,
     get_attn_backend,
+    get_component_attn_backend_context,
     get_component_forced_attn_backend,
     get_global_forced_attn_backend,
 )
@@ -94,7 +103,11 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
 )
 from sglang.multimodal_gen.runtime.layers.usp import (
     _ring_attention_varlen,
+    _usp_all_gather,
+    _usp_input_all_to_all_packed_qkv,
+    _usp_output_all_to_all,
     ulysses_head_group_pipelined_attention,
+    uncached_a2a_staging,
 )
 from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 from sglang.multimodal_gen.runtime.managers.forward_context import (
@@ -223,6 +236,8 @@ _MINIMAX_H3_FP32_PARAM_NAMES_IN_MODEL_ORDER = (
     "final_layer.audio_out.bias",
 )
 MINIMAX_H3_FP32_PARAM_NAMES = frozenset(_MINIMAX_H3_FP32_PARAM_NAMES_IN_MODEL_ORDER)
+# The modules an audio-free checkpoint (``audio_enabled: false``) omits.
+_MINIMAX_H3_AUDIO_MODULES = ("audio_patch_proj", "final_layer.audio_out")
 MINIMAX_H3_FP32_BUFFER_NAMES = frozenset({"rope.inv_freq"})
 
 
@@ -769,12 +784,49 @@ def _minimax_h3_bind_attention_backend(
         )
 
 
-# FlashAttention on Hopper and cuDNN SDPA on Blackwell give a head group the
-# same bytes as those heads inside the full call (checked at H3's shapes)
-_PIPELINED_ATTENTION_BACKENDS = (
-    AttentionBackendEnum.FA,
-    AttentionBackendEnum.DYNAMIC_CUDNN_SDPA,
-)
+def _minimax_h3_pad_only_tail(
+    impl, cu_seqlens_host: tuple[int, ...] | None, max_seqlen: int
+) -> bool:
+    """Whether the packing ends in alignment rows (cu_seqlens ``[0, used,
+    total]``) that the pipelined group attention leaves zero."""
+    return (
+        isinstance(impl, DynamicCudnnSDPAImpl)
+        and cu_seqlens_host is not None
+        and len(cu_seqlens_host) == 3
+        and cu_seqlens_host[:2] == (0, max_seqlen)
+        and cu_seqlens_host[2] > max_seqlen
+    )
+
+
+def _minimax_h3_sequential_dense_attention(
+    attention: MiniMaxH3Attention,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    cu_seqlens: torch.Tensor,
+    cu_seqlens_host: tuple[int, ...] | None,
+    max_seqlen: int,
+) -> torch.Tensor:
+    """The exchange-attend-exchange the pipelined dense attention replaces."""
+    impl = attention._attention_impl
+    # once per shape: leave no staging behind that later calls never use
+    with uncached_a2a_staging():
+        q, k, v = _usp_input_all_to_all_packed_qkv(q, k, v)
+        out = impl.forward_varlen(
+            q,
+            k,
+            v,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+            cu_seqlens_host=cu_seqlens_host,
+        )
+        out = _usp_output_all_to_all(out[None], head_dim=2)[0]
+    if _minimax_h3_pad_only_tail(impl, cu_seqlens_host, max_seqlen):
+        # nothing reads the alignment rows, and the pipeline leaves them zero
+        _, rank = get_ulysses_ctx()
+        out[max(max_seqlen - rank * out.shape[0], 0) :].zero_()
+    return out
 
 
 def _minimax_h3_pipelined_dense_attention(
@@ -786,18 +838,21 @@ def _minimax_h3_pipelined_dense_attention(
     cu_seqlens: torch.Tensor,
     cu_seqlens_host: tuple[int, ...] | None,
     max_seqlen: int,
+    sequential,
     fill=None,
 ) -> torch.Tensor | None:
     """Dense attention with the Ulysses exchange pipelined over head groups.
 
     Returns None (caller keeps the sequential exchange) unless head-group
     pipelining is enabled and a dense backend that runs a head group exactly
-    as it runs those heads in the full call would serve it.
+    as it runs those heads in the full call would serve it. ``sequential()``
+    returns what the sequential exchange gives for this call; the first call
+    of each shape checks the pipeline against it.
     """
     groups = envs.SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS
     if groups in (0, 1) or torch.compiler.is_compiling():
         return None
-    if attention._attention_backend_enum not in _PIPELINED_ATTENTION_BACKENDS:
+    if attention._attention_backend_enum not in PIPELINED_ATTENTION_BACKENDS:
         return None
     impl = attention._attention_impl
     skip_softmax = getattr(impl, "_request_skip_softmax_threshold", None)
@@ -813,7 +868,20 @@ def _minimax_h3_pipelined_dense_attention(
         cu_seqlens_host=cu_seqlens_host,
         max_seqlen=max_seqlen,
     )
-    return ulysses_pipelined_attention(q, k, v, attend, groups, fill=fill)
+    return ulysses_pipelined_attention(
+        q,
+        k,
+        v,
+        attend,
+        groups,
+        fill=fill,
+        sequential=sequential,
+        signature=(
+            type(impl).__name__,
+            fill is not None,
+            _minimax_h3_pad_only_tail(impl, cu_seqlens_host, max_seqlen),
+        ),
+    )
 
 
 def _minimax_h3_group_attend(
@@ -830,13 +898,7 @@ def _minimax_h3_group_attend(
     per-segment call, written straight into the output when the backend can.
     """
     used = max_seqlen
-    pad_only_tail = (
-        isinstance(impl, DynamicCudnnSDPAImpl)
-        and cu_seqlens_host is not None
-        and len(cu_seqlens_host) == 3
-        and cu_seqlens_host[:2] == (0, used)
-        and cu_seqlens_host[2] > used
-    )
+    pad_only_tail = _minimax_h3_pad_only_tail(impl, cu_seqlens_host, max_seqlen)
 
     def attend(q_group, k_group, v_group):
         if not pad_only_tail:
@@ -940,6 +1002,31 @@ def _minimax_h3_qknorm_rope_pipelined_attention(
     cos_sin_cache, positions = rope_cache
     head_dim = attention.head_dim
     q_weight, k_weight = attention.q_norm.weight, attention.k_norm.weight
+    pipeline_kwargs = dict(
+        cu_seqlens=cu_seqlens,
+        cu_seqlens_host=cu_seqlens_host,
+        max_seqlen=max_seqlen,
+    )
+
+    def sequential():
+        # the caller's fallback: the in-place norm, then the sequential exchange
+        q_normed, k_normed = q.clone(), k.clone()
+        fused_inplace_qknorm_rope(
+            q_normed,
+            k_normed,
+            q_weight,
+            k_weight,
+            cos_sin_cache,
+            positions,
+            is_neox=True,
+            eps=attention.q_norm.eps,
+            head_dim=head_dim,
+            rope_dim=cos_sin_cache.shape[-1],
+            round_norm_before_rope=True,
+        )
+        return _minimax_h3_sequential_dense_attention(
+            attention, q_normed, k_normed, v, **pipeline_kwargs
+        )
 
     def fill(
         head_start: int, head_count: int, q_dst: torch.Tensor, k_dst: torch.Tensor
@@ -962,14 +1049,7 @@ def _minimax_h3_qknorm_rope_pipelined_attention(
         )
 
     return _minimax_h3_pipelined_dense_attention(
-        attention,
-        q,
-        k,
-        v,
-        cu_seqlens=cu_seqlens,
-        cu_seqlens_host=cu_seqlens_host,
-        max_seqlen=max_seqlen,
-        fill=fill,
+        attention, q, k, v, **pipeline_kwargs, sequential=sequential, fill=fill
     )
 
 
@@ -1003,7 +1083,14 @@ def _minimax_h3_attention_core_impl(
             max_seqlen=max_seqlen,
         )
         out = _minimax_h3_pipelined_dense_attention(
-            attention, q, k, v, **pipeline_kwargs
+            attention,
+            q,
+            k,
+            v,
+            **pipeline_kwargs,
+            sequential=lambda: _minimax_h3_sequential_dense_attention(
+                attention, q, k, v, **pipeline_kwargs
+            ),
         )
         if out is None:
             out = _minimax_h3_collective_pipelined_attention(
@@ -1013,12 +1100,6 @@ def _minimax_h3_attention_core_impl(
             return out
 
     if ulysses_active:
-        from sglang.multimodal_gen.runtime.layers.usp import (
-            _usp_all_gather,
-            _usp_input_all_to_all_packed_qkv,
-            _usp_output_all_to_all,
-        )
-
         q, k, v = _usp_input_all_to_all_packed_qkv(q, k, v)
 
     if attention._attention_backend_enum is AttentionBackendEnum.VIDEO_SPARSE_ATTN_H3:
@@ -1212,17 +1293,20 @@ class MiniMaxH3Attention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.out_proj",
         )
-        # VSA compression gate; stays bf16 and unquantized (zero gate == pure sparse).
+        # VSA compression gate; bf16 and unquantized (zero gate == pure sparse),
+        # unless a serialized checkpoint quantized it (FastVideo's Comfy INT8 file).
         self.to_gate_compress: ColumnParallelLinear | None = None
         if arch.has_gate_compress and prefix.startswith("blocks."):
+            gate_prefix = f"{prefix}.to_gate_compress"
+            markers = getattr(quant_config, "layer_markers", None) or {}
             self.to_gate_compress = ColumnParallelLinear(
                 arch.hidden_size,
                 self.inner_dim,
                 bias=False,
                 gather_output=False,
                 params_dtype=_BF16_DTYPE,
-                quant_config=None,
-                prefix=f"{prefix}.to_gate_compress",
+                quant_config=quant_config if gate_prefix in markers else None,
+                prefix=gate_prefix,
             )
         # VDN-H3: None for the dense model and for the token refiner
         self.hybrid = MiniMaxH3VDNHybridAttention.build(
@@ -1933,6 +2017,15 @@ class MiniMaxH3DiTBlock(nn.Module):
         )
 
 
+def _fp32_param_names_in_model_order(arch: MiniMaxH3DiTArchConfig) -> list[str]:
+    """The fp32 parameters in model order; audio-free checkpoints omit audio ones."""
+    return [
+        name
+        for name in _MINIMAX_H3_FP32_PARAM_NAMES_IN_MODEL_ORDER
+        if arch.audio_enabled or name.rsplit(".", 1)[0] not in _MINIMAX_H3_AUDIO_MODULES
+    ]
+
+
 class MiniMaxH3FinalLayer(nn.Module):
     def __init__(
         self,
@@ -1971,14 +2064,20 @@ class MiniMaxH3FinalLayer(nn.Module):
             quant_config=None,
             prefix=f"{prefix}.video_out",
         )
-        self.audio_out = ColumnParallelLinear(
-            arch.hidden_size,
-            arch.audio_latents_dim,
-            bias=True,
-            gather_output=False,
-            params_dtype=_FP32_DTYPE,
-            quant_config=None,
-            prefix=f"{prefix}.audio_out",
+        # An audio-free checkpoint has no audio head; `_project` returns
+        # zero-width audio rows.
+        self.audio_out = (
+            ColumnParallelLinear(
+                arch.hidden_size,
+                arch.audio_latents_dim,
+                bias=True,
+                gather_output=False,
+                params_dtype=_FP32_DTYPE,
+                quant_config=None,
+                prefix=f"{prefix}.audio_out",
+            )
+            if arch.audio_enabled
+            else None
         )
         # Parallel Decoding Distillation heads, one per denoise step, loaded by
         # `load_pdd_fused_heads`. None on every ordinary run.
@@ -1987,20 +2086,30 @@ class MiniMaxH3FinalLayer(nn.Module):
         self._pdd_device_heads: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
 
     def load_pdd_fused_heads(self, path: str) -> None:
-        """Swap the two output heads for a per-step stack (PDD).
+        """Swap the output heads for a per-step stack (PDD).
 
         PDD replicates the final linear layer once per time interval and lets one
         backbone evaluation advance a whole block of them; the per-block heads
         fuse into one because H3's euler-eta0 step is linear in the predicted
         velocity. `tools/fuse_minimax_h3_pdd_heads.py` does that fusion offline,
-        leaving one head per denoise step.
+        leaving one head per denoise step. An audio-free model takes only
+        ``video_out.{weight,bias}``.
         """
         from safetensors import safe_open
 
         with safe_open(path, "pt") as f:
             heads = {k: f.get_tensor(k) for k in f.keys()}
+        names = ("video_out",) if self.audio_out is None else ("video_out", "audio_out")
+        expected = {
+            f"{name}.{suffix}" for name in names for suffix in ("weight", "bias")
+        }
+        if set(heads) != expected:
+            raise ValueError(
+                f"MiniMax-H3 PDD heads must hold exactly {sorted(expected)}, "
+                f"got {sorted(heads)}"
+            )
         steps = heads["video_out.weight"].shape[0]
-        for name in ("video_out", "audio_out"):
+        for name in names:
             projection = getattr(self, name)
             for suffix, shape in (
                 ("weight", (steps, projection.output_size, projection.input_size)),
@@ -2015,7 +2124,15 @@ class MiniMaxH3FinalLayer(nn.Module):
         self._pdd_device_heads = {}
         logger.info("MiniMax-H3 PDD: %d fused output heads loaded from %s", steps, path)
 
-    def _pdd_project(self, h: torch.Tensor, name: str) -> torch.Tensor:
+    def _new_pdd_output(self, h: torch.Tensor, name: str) -> torch.Tensor:
+        out_features = self._pdd_heads[f"{name}.weight"].shape[1]
+        return h.new_empty((*h.shape[:-1], out_features))
+
+    # The PDD head follows the live denoising step in forward context.
+    @eager_on_graph(output_factory=_new_pdd_output, pass_output=True)
+    def _pdd_project(
+        self, h: torch.Tensor, name: str, out: torch.Tensor | None = None
+    ) -> torch.Tensor:
         heads = self._pdd_heads
         step = int(get_forward_context().current_timestep)
         stack = heads[f"{name}.weight"]
@@ -2032,12 +2149,21 @@ class MiniMaxH3FinalLayer(nn.Module):
                 heads[f"{name}.bias"].to(device=h.device, dtype=h.dtype),
             )
         weight, bias = self._pdd_device_heads[key]
-        return torch.nn.functional.linear(h, weight[step], bias[step])
+        result = torch.nn.functional.linear(h, weight[step], bias[step])
+        if out is None:
+            return result
+        out.copy_(result)
+        return out
 
     def _project(self, h: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if self._pdd_heads is not None:
-            return self._pdd_project(h, "video_out"), self._pdd_project(h, "audio_out")
-        video, _ = self.video_out(h)
+            video = self._pdd_project(h, "video_out")
+        else:
+            video, _ = self.video_out(h)
+        if self.audio_out is None:
+            return video, h.new_empty((h.shape[0], 0))
+        if self._pdd_heads is not None:
+            return video, self._pdd_project(h, "audio_out")
         audio, _ = self.audio_out(h)
         return video, audio
 
@@ -2318,7 +2444,11 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
             ("adaln_out_features", arch.adaln_out_features),
             ("final_adaln_out_features", arch.final_adaln_out_features),
             ("video_patch_output_dim", arch.latents_dim * math.prod(arch.patch_size)),
-            ("audio_patch_output_dim", arch.audio_latents_dim),
+            *(
+                (("audio_patch_output_dim", arch.audio_latents_dim),)
+                if arch.audio_enabled
+                else ()
+            ),
         ):
             if value % tp_size:
                 raise ValueError(
@@ -2375,10 +2505,17 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
         super().__init__(config=config, hf_config=hf_config)
         arch = self.config
         if (
-            adaln_cache_path is not None or adaln_weight_files is not None
-        ) and quant_config is not None:
+            (adaln_cache_path is not None or adaln_weight_files is not None)
+            and quant_config is not None
+            and not (
+                adaln_cache_path is None
+                and quant_config.get_name() in ("fp8", "mxfp8")
+                and not getattr(quant_config, "is_checkpoint_fp8_serialized", True)
+            )
+        ):
             raise ValueError(
-                "MiniMax H3 AdaLN cache is only compatible with unquantized weights"
+                "MiniMax H3 AdaLN cache requires unquantized weights or online "
+                "FP8 with AdaLN rebuilt from native checkpoint weights"
             )
         if arch.adaln_curve_grid is not None and (
             adaln_cache_path is not None or adaln_weight_files is not None
@@ -2417,14 +2554,18 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
             quant_config=None,
             prefix="video_patch_proj",
         )
-        self.audio_patch_proj = ColumnParallelLinear(
-            arch.audio_latents_dim,
-            arch.hidden_size,
-            bias=True,
-            gather_output=True,
-            params_dtype=_FP32_DTYPE,
-            quant_config=None,
-            prefix="audio_patch_proj",
+        self.audio_patch_proj = (
+            ColumnParallelLinear(
+                arch.audio_latents_dim,
+                arch.hidden_size,
+                bias=True,
+                gather_output=True,
+                params_dtype=_FP32_DTYPE,
+                quant_config=None,
+                prefix="audio_patch_proj",
+            )
+            if arch.audio_enabled
+            else None
         )
         self.condition_proj = ColumnParallelLinear(
             arch.text_dim,
@@ -2522,6 +2663,13 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
         # only that selection; process-wide overrides are resolved at first use.
         self._component_attention_backend_override = (
             claim_deferred_component_attn_backend()
+        )
+        component_context = get_component_attn_backend_context()
+        self._required_component_attention_backend = (
+            component_context.backend
+            if component_context is not None
+            and component_context.require_backend_selection
+            else None
         )
         self._resolved_attention_backend: AttentionBackendEnum | None = None
         self._mark_missing_params_required()
@@ -2638,6 +2786,12 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
             selected_attention_backend=selected_backend,
             attention_requirements=AttentionRequirements(packed_varlen=True),
         )
+        required_backend = self._required_component_attention_backend
+        if required_backend is not None and backend.get_enum() != required_backend:
+            raise ComponentAttentionBackendNotAppliedError(
+                f"MiniMax H3 deferred attention requires {required_backend.name.lower()}, "
+                f"but selected {backend.get_enum().name.lower()}"
+            )
         for module in self.modules():
             if isinstance(module, MiniMaxH3Attention):
                 module._set_attention_backend(backend)
@@ -2652,7 +2806,7 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
                 param.missing_param_init = "error"
 
     def post_load_weights(self) -> None:
-        fp32_param_names = list(_MINIMAX_H3_FP32_PARAM_NAMES_IN_MODEL_ORDER)
+        fp32_param_names = _fp32_param_names_in_model_order(self.arch)
         if self.adaln_t_table is not None:
             fp32_param_names = [
                 name
@@ -3016,6 +3170,11 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
         audio_pos = self._pos_ids(
             _required_kwarg(kwargs, "audio_pos_info"), "audio_pos_info"
         )
+        if not self.arch.audio_enabled and audio_pos.numel():
+            raise ValueError(
+                "this MiniMax H3 checkpoint is audio-free (audio_enabled: false) "
+                f"but the request packs {audio_pos.numel()} audio rows"
+            )
         text_pos = self._pos_ids(
             _required_kwarg(kwargs, "text_pos_info"),
             "text_pos_info",
@@ -3114,7 +3273,12 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
                 ),
             )
             self.release_mps_non_layer_weights("rope")
-        self.materialize_mps_non_layer_weights(*_MPS_EMBED_WEIGHT_PREFIXES)
+        embed_weight_prefixes = _MPS_EMBED_WEIGHT_PREFIXES
+        if not self.arch.audio_enabled:
+            embed_weight_prefixes = tuple(
+                p for p in embed_weight_prefixes if p != "audio_patch_proj"
+            )
+        self.materialize_mps_non_layer_weights(*embed_weight_prefixes)
         img_pos = img_pos.to(device)
         audio_pos = audio_pos.to(device)
         text_pos = text_pos.to(device)
@@ -3135,7 +3299,7 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
             refined_prompt_embeds_length=kwargs.get("refined_prompt_embeds_length"),
             local_embedding_layout=kwargs.get("local_embedding_layout"),
         )
-        self.release_mps_non_layer_weights(*_MPS_EMBED_WEIGHT_PREFIXES)
+        self.release_mps_non_layer_weights(*embed_weight_prefixes)
         # request-step AdaLN input shared by all blocks
         adaln_input = (
             t_emb
@@ -3275,10 +3439,15 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
         # rows have been removed. For hybrid TP+Ulysses, the preceding SP row
         # gather also carries only the TP-local output width.
         video_logits = video_logits.index_select(0, infer_out_pos.to(device))
-        audio_logits = audio_logits.index_select(0, audio_pos.to(device))
+        if self.arch.audio_enabled:
+            audio_logits = audio_logits.index_select(0, audio_pos.to(device))
+        else:
+            # No audio rows (checked above) and no audio head.
+            audio_logits = video_logits.new_empty((0, self.arch.audio_latents_dim))
         if get_tp_world_size() > 1:
             video_logits = tensor_model_parallel_all_gather(video_logits)
-            audio_logits = tensor_model_parallel_all_gather(audio_logits)
+            if self.arch.audio_enabled:
+                audio_logits = tensor_model_parallel_all_gather(audio_logits)
         if not skip_mask_out_condition:
             update_mask = update_mask.view(-1).to(device)
             if update_mask.shape[0] != video_logits.shape[0]:

@@ -1,5 +1,6 @@
 import unittest
 from array import array
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock
 
@@ -24,7 +25,10 @@ from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.invariant_checker import (
     SchedulerInvariantChecker,
 )
+from sglang.srt.managers.scheduler_components.pause_state import PauseState
+from sglang.srt.managers.scheduler_components.state_check import CheckPhase
 from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.scheduler_test_utils import empty_request_lists
@@ -74,7 +78,6 @@ def _invariant_checker(s):
         token_to_kv_pool_allocator=None,
         req_to_token_pool=None,
         pool_stats_observer=None,
-        get_last_batch=Mock(),
         scheduler_stage_metrics=None,
         get_request_lists=s.request_lists,
         get_chunked_req=lambda: s.chunked_req,
@@ -139,7 +142,7 @@ class TestRequestListsCheck(CustomTestCase):
     def setUp(self):
         super().setUp()
         self.s = _scheduler()
-        self.check = self.s.invariant_checker.maybe_check_request_lists
+        self.check = partial(self.s.invariant_checker.run, CheckPhase.LAUNCH)
         enter_scope(self, published_topology())
         enter_scope(self, envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.override(True))
 
@@ -279,7 +282,7 @@ class TestRunningReqsHooks(CustomTestCase):
         s._confidence_budget_prepare = None
         # Event loop
         s.gracefully_exit = False
-        s._engine_paused = False
+        s.pause_state = PauseState()
         s.increment_scheduler_iterations = Mock()
         s.ingest_requests = Mock(side_effect=[None, None, None, StopIteration])
         s.is_generation = True
@@ -327,7 +330,7 @@ class TestRunningReqsHooks(CustomTestCase):
 
         def process_batch_result(batch, result):
             _finish(done)
-            s._on_step_processed(batch)
+            s._on_step_processed(batch, result)
 
         s.run_batch = run_batch
         s.process_batch_result = process_batch_result
@@ -388,9 +391,12 @@ class TestRunningReqsHooks(CustomTestCase):
             model_runner=SimpleNamespace(attn_backend=SimpleNamespace())
         )
         s.get_prefill_adder_class = lambda: _Adder
+        s.request_retirer = None
         s.page_size = 1
         s.tree_cache = SimpleNamespace(buffer_pipeline=None)
-        s.token_to_kv_pool_allocator = SimpleNamespace(state_slots=None)
+        s.token_to_kv_pool_allocator = SimpleNamespace(
+            state_slots=None, pools_share_memory=False
+        )
         s.new_token_ratio_tracker = SimpleNamespace(current=0.0)
         s.max_prefill_tokens = 1 << 20
         s.is_mixed_chunk = False
@@ -399,6 +405,7 @@ class TestRunningReqsHooks(CustomTestCase):
         s.max_running_requests = 4
         s.enable_lora = False
         s.enable_hicache_storage = False
+        s.enable_unified_cache_external_linker = False
         s.enable_lmcache = False
         s.truncation_align_size = None
         s._add_request_to_queue = Mock()
@@ -427,6 +434,33 @@ class TestRunningReqsHooks(CustomTestCase):
             with self.assertRaisesRegex(RuntimeError, r"launched with \[\]"):
                 never_launched = _batch([_req("c")], ForwardMode.DECODE)
                 s.process_batch_result(never_launched, MagicMock())
+
+
+class TestPriorityPreemptionUnderUnifiedMemory(CustomTestCase):
+    """Priority preemption is off under unified memory, while priority
+    scheduling itself stays on."""
+
+    def _preemption(self, **fields):
+        override = get_context().override_server_args(
+            enable_priority_scheduling=True, **fields
+        )
+        override.install()
+        self.addCleanup(override.restore)
+        s = Scheduler.__new__(Scheduler)
+        s.schedule_policy = "fcfs"
+        s.tree_cache = MagicMock()
+        s.enable_hierarchical_cache = False
+        s.enable_priority_scheduling = True
+        s.schedule_low_priority_values_first = False
+        s.metrics_reporter = SimpleNamespace(enable_metrics=False)
+        Scheduler.init_schedule_policy(s)
+        return s.enable_priority_preemption
+
+    def test_off_with_unified_memory(self):
+        self.assertFalse(self._preemption(enable_unified_memory=True))
+
+    def test_on_without_it(self):
+        self.assertTrue(self._preemption(enable_unified_memory=False))
 
 
 if __name__ == "__main__":

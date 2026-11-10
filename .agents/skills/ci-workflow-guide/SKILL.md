@@ -40,6 +40,7 @@ The workflow files settle any disagreement with this guide. Counts that change w
 | `.github/workflows/pr-test-extra.yml` | Extra tier, gated by `run-ci` and `run-ci-nv-extra` |
 | `.github/workflows/nightly-test-nvidia.yml`, `weekly-test-nvidia.yml` | Scheduled tiers: one matrix row per runner config |
 | `.github/workflows/_pr-test-stage.yml`, `_pr-test-stage-cpu.yml` | Reusable stage: checkout, health check, install, `run_suite.py` per shard |
+| `.github/workflows/_diffusion-pr-test-stage.yml` | Reusable diffusion lane, called by `pr-test-multimodal-gen.yml`: the same steps for one `diffusion-*` runner_config, one job per case partition |
 | `.github/workflows/_pr-test-check-changes.yml` | Path filters, partitions, retry and continue-on-error flags |
 | `scripts/ci/utils/compute_partitions.py` | Shard count and `max_parallel` per suite |
 | `scripts/ci/runner_configs.yml` | `runner_config` -> runner label |
@@ -164,7 +165,7 @@ Retry classification: a failure matching `NON_RETRIABLE_PATTERNS` (import, synta
 
 Within a suite, `ci_register.py:auto_partition()` assigns files to shards with the LPT heuristic: sort by time descending (filename as tie-breaker), then give each file to the shard with the least total time.
 
-The `Compute partitions` step summary lists every suite's size and `max_parallel` for that run. Multimodal diffusion uses `python/sglang/multimodal_gen/test/run_suite.py`, not `test/run_suite.py`.
+The `Compute partitions` step summary lists every suite's size and `max_parallel` for that run. CUDA diffusion lanes also run `test/run_suite.py` (suites `base-b-test-diffusion-*`), but partition the 1-gpu and 2-gpu lanes by case with `compute_diffusion_partitions.py`; AMD diffusion jobs call `python/sglang/multimodal_gen/test/run_suite.py`.
 
 ---
 
