@@ -7,8 +7,10 @@ from sglang.srt.utils import is_cuda, is_musa, is_npu
 
 if is_npu():
     try:
-        from sgl_kernel_npu.sample import (
-            chain_speculative_sampling_triton,
+        from sgl_kernel_npu.operators.speculative import (
+            chain_speculative_sampling as chain_speculative_sampling_triton,
+        )
+        from sgl_kernel_npu.operators.speculative import (
             tree_speculative_sampling_target_only,
         )
     except ImportError:

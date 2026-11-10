@@ -4,6 +4,7 @@ from typing import Optional
 import torch
 from sgl_kernel_npu.fla.kda_gate import fused_kda_gate_npu
 from sgl_kernel_npu.fla.kda_target_verify import kda_target_verify_npu
+from sgl_kernel_npu.operators.mamba import causal_conv1d
 
 from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd
 from sglang.srt.layers.attention.linear.kda_backend import (
@@ -160,7 +161,7 @@ class AscendKDAAttnBackend(KDAAttnBackend):
         cache_indices = self.forward_metadata.mamba_cache_indices
 
         # setting activation_mode to 1 means using SiLU activation after conv.
-        qkv = torch.ops.npu.causal_conv1d(
+        qkv = causal_conv1d(
             mixed_qkv.contiguous(),
             self._get_conv_weights_t(layer, mixed_qkv.dtype),
             conv_states=conv_states,
@@ -261,7 +262,7 @@ class AscendKDAAttnBackend(KDAAttnBackend):
 
         kernel_size = layer.conv_weights.shape[-1]
         conv_states_for_prefill = conv_states[:, -(kernel_size - 1) :, :].contiguous()
-        mixed_qkv = torch.ops.npu.causal_conv1d(
+        mixed_qkv = causal_conv1d(
             mixed_qkv.contiguous(),
             self._get_conv_weights_t(layer, mixed_qkv.dtype),
             conv_states=conv_states_for_prefill,
@@ -392,7 +393,7 @@ class AscendKDAAttnBackend(KDAAttnBackend):
             dtype=torch.int32,
             device=mixed_qkv.device,
         )
-        processed_qkv = torch.ops.npu.causal_conv1d(
+        processed_qkv = causal_conv1d(
             dense_qkv.reshape(num_dense_tokens, -1).contiguous(),
             self._get_conv_weights_t(layer, mixed_qkv.dtype),
             conv_states=conv_states,

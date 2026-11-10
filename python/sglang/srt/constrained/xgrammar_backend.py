@@ -134,9 +134,9 @@ class XGrammarGrammar(BaseGrammarObject):
             else:
                 apply_token_bitmask_inplace_triton(logits, vocab_mask)
         elif logits.device.type == "npu":
-            import sgl_kernel_npu  # noqa: F401
+            from sgl_kernel_npu.operators.sampler import apply_token_bitmask
 
-            torch.ops.npu.apply_token_bitmask(logits, vocab_mask)
+            apply_token_bitmask(logits, vocab_mask)
         elif logits.device.type == "cpu":
             # Used by the MLX backend, which builds its additive mask rows
             # on the CPU before inserting them into the lazy graph.
@@ -305,9 +305,9 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
             else:
                 apply_token_bitmask_inplace_triton(logits, vocab_mask)
         elif logits.device.type == "npu":
-            import sgl_kernel_npu  # noqa: F401
+            from sgl_kernel_npu.operators.sampler import apply_token_bitmask
 
-            torch.ops.npu.apply_token_bitmask(logits, vocab_mask)
+            apply_token_bitmask(logits, vocab_mask)
         else:
             raise RuntimeError(f"Unsupported device: {logits.device.type}")
 
