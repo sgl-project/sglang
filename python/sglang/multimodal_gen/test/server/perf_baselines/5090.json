@@ -61,10 +61,10 @@
             "expected_e2e_ms": 18255.39,
             "expected_avg_denoise_ms": 338.78,
             "expected_median_denoise_ms": 345.95,
-            "load_peak_vram_mb": 1126.0,
-            "runtime_peak_vram_mb": 13180.0,
-            "load_peak_allocated_mb": 1019.0,
-            "runtime_peak_allocated_mb": 8912.0,
+            "load_peak_vram_mb": 15294.0,
+            "runtime_peak_vram_mb": 20238.0,
+            "load_peak_allocated_mb": 15290.36,
+            "runtime_peak_allocated_mb": 17798.0,
             "estimated_full_test_time_s": 94.0
         },
         "wan2_1_t2v_1.3b": {
