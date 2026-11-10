@@ -240,13 +240,25 @@ jobs:
           mkdir -p "${TEST_LOG_DIR}"
 
           # ---- Temporary: 1s host-resource sampling for perf-regression triage ----
-          # Records cgroup CPU throttling, cpufreq, runnable queue and top CPU
-          # consumers so a mid-run stall can be attributed afterwards.
+          # Records cgroup CPU throttling, cpufreq, runnable queue, top CPU
+          # consumers and NPU AICore utilisation so a mid-run stall can be
+          # attributed to host CPU, device compute, or an HCCL/sync wait.
           HOSTMON_DIR=/tmp/hostmon
           mkdir -p "${HOSTMON_DIR}"
           rm -f "${HOSTMON_DIR}/stop" "${HOSTMON_DIR}/cpu.log"
+
+          # One-shot environment snapshot: lets us compare CANN version and
+          # operator-compile cache state between the fast and slow nodes.
+          {
+            echo "cann_version: $(cat /usr/local/Ascend/ascend-toolkit/latest/version.cfg 2>/dev/null | tr '\n' ' ' || echo n/a)"
+            echo "op_cache: $(ls -ld /root/atc /root/.cache/ascend 2>/dev/null | tr '\n' ' ' || echo none)"
+            echo "npu_smi_version: $(npu-smi info 2>/dev/null | sed -n '2p' | tr -s ' ' || echo n/a)"
+          } > "${HOSTMON_DIR}/env.txt" 2>&1 || true
+
           (
+            i=0
             while [ ! -f "${HOSTMON_DIR}/stop" ]; do
+              i=$((i + 1))
               ts=$(date -u +%H:%M:%S)
               cg=$(grep -E 'nr_throttled|throttled_(usec|time)' /sys/fs/cgroup/cpu.stat /sys/fs/cgroup/cpu/cpu.stat 2>/dev/null | tr '\n' ',' | tr -d ' ' || true)
               cgmax=$(cat /sys/fs/cgroup/cpu.max 2>/dev/null || echo "q=$(cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us 2>/dev/null || echo n/a)/p=$(cat /sys/fs/cgroup/cpu/cpu.cfs_period_us 2>/dev/null || echo n/a)")
@@ -255,7 +267,18 @@ jobs:
               gov=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo n/a)
               vm=$(vmstat 1 2 2>/dev/null | tail -1 | awk '{print "r="$1",b="$2",sy="$13",id="$15}' || true)
               top=$(ps -eo pcpu=,comm= --sort=-pcpu 2>/dev/null | head -3 | tr -s ' ' | tr '\n' ';' || true)
-              echo "${ts} | ${cg} | quota=${cgmax} | gov=${gov} | freq_khz=${fmin}..${fmax} | ${vm} | top=${top}" \
+              # npu-smi takes a few hundred ms, so sample it every 3rd tick only.
+              if [ $((i % 3)) -eq 1 ]; then
+                npu=$(timeout 5 npu-smi info 2>/dev/null | awk -F'|' '
+                  /^[|] *[0-9]+ *[|]/ {
+                    gsub(/^ +| +$/, "", $3); split($3, f, " ");
+                    if (f[1] ~ /^[0-9]+$/) { s += f[1]; n++ }
+                  }
+                  END { if (n > 0) printf "%d", s / n; else printf "n/a" }' || true)
+              else
+                npu="-"
+              fi
+              echo "${ts} | ${cg} | quota=${cgmax} | gov=${gov} | freq_khz=${fmin}..${fmax} | ${vm} | npu_avg=${npu} | top=${top}" \
                 >> "${HOSTMON_DIR}/cpu.log" 2>&1
               sleep 1
             done
@@ -480,6 +503,13 @@ jobs:
             | awk -F'id=' '{split($2,a," "); if (a[1]+0 < 20) print}' | head -100 || true
           echo "--- cpufreq / governor transitions ---"
           grep -oE 'gov=[a-z]+ \| freq_khz=[0-9]+\.\.[0-9]+' "${HOSTMON_DIR}/cpu.log" 2>/dev/null | sort | uniq -c | sort -rn | head -10 || true
+          echo "--- environment snapshot (CANN / op cache / npu-smi) ---"
+          cat "${HOSTMON_DIR}/env.txt" 2>/dev/null || true
+          echo "--- NPU avg AICore% across chips (3s resolution) ---"
+          grep -oE 'npu_avg=[0-9]+' "${HOSTMON_DIR}/cpu.log" 2>/dev/null \
+            | awk -F= '{s+=$2; if(n==0||$2<mn)mn=$2; if($2>mx)mx=$2; n++} END{if(n>0) printf "n=%d min=%d mean=%.1f max=%d\n", n, mn, s/n, mx; else print "n/a (npu-smi unparsable)"}' || true
+          echo "--- samples where NPU avg AICore% == 0 (device idle: host/comm wait) ---"
+          grep -E 'npu_avg=0 \|' "${HOSTMON_DIR}/cpu.log" 2>/dev/null | head -80 || true
           echo "--- trace head (first 30 samples) ---"
           head -30 "${HOSTMON_DIR}/cpu.log" 2>/dev/null || true
           echo "..."
