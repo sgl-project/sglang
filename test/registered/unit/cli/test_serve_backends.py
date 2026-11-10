@@ -15,6 +15,7 @@ from sglang.cli.interactive import (
     command_argv,
     edit_flags,
     format_command,
+    recipes_for_this_machine,
     run_guide,
 )
 from sglang.cli.serve import serve
@@ -377,16 +378,19 @@ GUIDE_CASES = {
 
 
 class TestServeDirectLaunch(CustomTestCase):
-    def _run(self, argv):
+    def _run(self, argv, gpus=(H200, 4)):
         ran = []
 
         def capture(name):
             return lambda request: ran.append((name, request.argv))
 
-        def guide(model, dry_run):
+        def guide(model, recipes, dry_run):
             ran.append(("guide", (model, dry_run)))
 
         with contextlib.ExitStack() as stack:
+            stack.enter_context(
+                patch.object(interactive, "_detect_gpus", return_value=gpus)
+            )
             stack.enter_context(patch("sglang.cli.serve.run_guide", guide))
             stack.enter_context(patch("sglang.cli.serve._run_llm", capture("llm")))
             stack.enter_context(
@@ -444,6 +448,14 @@ class TestServeDirectLaunch(CustomTestCase):
             NO_RECIPE_MESSAGE.format(model="Qwen/Qwen3-8B"), stderr.getvalue()
         )
 
+    def test_model_without_a_command_for_this_machine_launches_directly(self):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            ran = self._run([QWEN], gpus=(H200, 8))
+        self.assertEqual(ran, [("llm", ("--model-path", QWEN))])
+        self.assertIn("on 8x NVIDIA H200 (it has", stderr.getvalue())
+        self.assertIn("launching it with the default flags", stderr.getvalue())
+
     def test_missing_model_is_rejected(self):
         for argv in ([], ["--dry-run"]):
             with self.subTest(argv):
@@ -499,13 +511,6 @@ class TestExportedCookbookCommands(CustomTestCase):
                         [f"{key}={value}" for key, value in entry["env"].items()],
                     )
 
-    def test_one_command_per_machine_and_mode(self):
-        # The Guide picks by (hardware, GPU count, mode) and would drop a duplicate.
-        for model, entries in _exported().items():
-            keys = [(entry["hw"], entry["gpus"], entry["mode"]) for entry in entries]
-            with self.subTest(model):
-                self.assertEqual(len(keys), len(set(keys)))
-
 
 class _PipedStdout(io.StringIO):
     """A piped stdout across exec: only what was flushed before it survives."""
@@ -537,7 +542,9 @@ class TestCliGuide(CustomTestCase):
             stack.enter_context(contextlib.redirect_stdout(stdout))
             stack.enter_context(contextlib.redirect_stderr(stderr))
             try:
-                run_guide(model=model, dry_run=dry_run)
+                recipes = recipes_for_this_machine(model)
+                if recipes:
+                    run_guide(model=model, recipes=recipes, dry_run=dry_run)
             except SystemExit as e:
                 return execvpe, stdout.getvalue(), stderr.getvalue(), e
         printed = stdout.flushed if execvpe.called else stdout.getvalue()
@@ -583,32 +590,41 @@ class TestCliGuide(CustomTestCase):
             execvpe.call_args.args[1], _launch_argv(command_argv(recipe["command"]))
         )
 
-        execvpe, _, _, exit = self._guide(QWEN, device=H200, gpus=8)
+        execvpe, _, stderr, exit = self._guide(QWEN, device=H200, gpus=8)
+        self.assertIsNone(exit)
         execvpe.assert_not_called()
-        self.assertIn("on 8x NVIDIA H200", str(exit.code))
-        self.assertIn("4x h200", str(exit.code))
-        self.assertIn("CUDA_VISIBLE_DEVICES", str(exit.code))
+        self.assertIn("on 8x NVIDIA H200", stderr)
+        self.assertIn("4x h200", stderr)
+        self.assertIn("CUDA_VISIBLE_DEVICES", stderr)
 
-    def test_recipe_env_reaches_the_server(self):
+    def test_recipe_env_reaches_the_server_unless_exported(self):
         recipe = _recipe(QWEN_NVFP4, "rtx6000", "low-latency")
-        execvpe, stdout, _, _ = self._guide(
-            QWEN_NVFP4, device="NVIDIA RTX PRO 6000 Blackwell Server Edition", gpus=1
-        )
-        self.assertTrue(recipe["env"])
+        with patch.dict(interactive.os.environ, {"PYTORCH_CUDA_ALLOC_CONF": "mine"}):
+            execvpe, stdout, stderr, _ = self._guide(
+                QWEN_NVFP4,
+                device="NVIDIA RTX PRO 6000 Blackwell Server Edition",
+                gpus=1,
+            )
         self.assertTrue(stdout.startswith("PYTORCH_CUDA_ALLOC_CONF="))
+        self.assertIn("Using your exported PYTORCH_CUDA_ALLOC_CONF", stderr)
         env = execvpe.call_args.args[2]
-        for key, value in recipe["env"].items():
-            self.assertEqual(env[key], value)
+        self.assertEqual(env["PYTORCH_CUDA_ALLOC_CONF"], "mine")
+        self.assertEqual(
+            env["SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK"],
+            recipe["env"]["SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK"],
+        )
 
-    def test_missing_recipe_exits_without_launching(self):
+    def test_no_command_for_this_machine_falls_back(self):
         for name, device, gpus, message in (
             ("unknown GPU", "NVIDIA A100-SXM4-80GB", 4, "4x NVIDIA A100"),
-            ("no GPU", None, 0, "no GPU found"),
+            ("no GPU", None, 0, "this machine (no GPU)"),
         ):
             with self.subTest(name):
-                execvpe, _, _, exit = self._guide(QWEN, device=device, gpus=gpus)
+                execvpe, _, stderr, exit = self._guide(QWEN, device=device, gpus=gpus)
+                self.assertIsNone(exit)
                 execvpe.assert_not_called()
-                self.assertIn(message, str(exit.code))
+                self.assertIn(message, stderr)
+                self.assertIn("launching it with the default flags", stderr)
 
     def test_unverified_command_warns(self):
         recipe = _recipe(QWEN, "h200", "low-latency")

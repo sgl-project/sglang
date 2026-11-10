@@ -4,9 +4,8 @@ import argparse
 import logging
 import os
 import shlex
-import sys
 
-from sglang.cli.interactive import NO_RECIPE_MESSAGE, has_recipes, run_guide
+from sglang.cli.interactive import recipes_for_this_machine, run_guide
 from sglang.cli.main import COOKBOOK_EPILOG
 from sglang.cli.serve_backends import (
     SERVE_BACKEND_API_VERSION,
@@ -174,7 +173,8 @@ def _print_general_help(registry: ServeBackendRegistry) -> None:
         "help.\n\n"
         "`sglang serve MODEL` with no other arguments runs the CLI Guide: it picks "
         "the Cookbook command for the visible GPUs, prints it, and launches it. "
-        "A model without a Cookbook command launches with the default flags.\n"
+        "Without a Cookbook command for those GPUs, it launches with the default "
+        "flags.\n"
         "--dry-run prints the command without launching it."
     )
 
@@ -231,10 +231,10 @@ def serve(args, extra_argv):
             and len(extra_argv) == 1
             and not extra_argv[0].startswith("-")
         ):
-            if has_recipes(extra_argv[0]):
-                run_guide(model=extra_argv[0], dry_run=dry_run)
+            recipes = recipes_for_this_machine(extra_argv[0])
+            if recipes:
+                run_guide(model=extra_argv[0], recipes=recipes, dry_run=dry_run)
                 return
-            print(NO_RECIPE_MESSAGE.format(model=extra_argv[0]), file=sys.stderr)
 
         if registered.backend.requires_model_path and request.model_path is None:
             get_model_path(request.argv)  # Raise the existing actionable CLI error.

@@ -7,7 +7,7 @@ import shlex
 import sys
 from importlib import resources
 
-from sglang.srt.utils.device import get_device_count, get_device_name
+from sglang.srt.utils.device import get_device_count, get_device_name, is_hip
 
 # Picked in this order when the user does not choose a mode.
 MODES = ("balanced", "low-latency", "high-throughput")
@@ -17,6 +17,10 @@ NO_MODE_MESSAGE = (
 )
 NO_RECIPE_MESSAGE = (
     "The Cookbook has no command for {model} yet; launching it with the default flags."
+)
+NO_MATCH_MESSAGE = (
+    "The Cookbook has no command for {model} on {machine} (it has {available}); "
+    "launching it with the default flags. To pick fewer GPUs, set {devices_env}."
 )
 EDIT_PROMPT = (
     'Change a flag ("--port 8000"), remove one ("!--port"), or press Enter to launch: '
@@ -41,17 +45,34 @@ _HARDWARE = (
 )
 
 
-def has_recipes(model: str) -> bool:
-    """Whether the Cookbook has any command for `model`."""
-    return bool(_load_recipes(model))
+def recipes_for_this_machine(model: str) -> list[dict]:
+    """Cookbook commands for `model` on the visible GPUs; says so when there are none."""
+    recipes = _load_recipes(model)
+    if not recipes:
+        _log(NO_RECIPE_MESSAGE.format(model=model))
+        return []
+    device_name, gpus = _detect_gpus()
+    hw = _hardware_id(device_name)
+    matching = [r for r in recipes if r["hw"] == hw and r["gpus"] == gpus]
+    if not matching:
+        machine = f"{gpus}x {device_name}" if gpus else "this machine (no GPU)"
+        available = ", ".join(sorted({f"{r['gpus']}x {r['hw']}" for r in recipes}))
+        devices_env = "HIP_VISIBLE_DEVICES" if is_hip() else "CUDA_VISIBLE_DEVICES"
+        _log(
+            NO_MATCH_MESSAGE.format(
+                model=model,
+                machine=machine,
+                available=available,
+                devices_env=devices_env,
+            )
+        )
+    return matching
 
 
-def run_guide(model: str, dry_run: bool) -> None:
-    """Print the Cookbook command for `model` on the visible GPUs, then exec it."""
+def run_guide(model: str, recipes: list[dict], dry_run: bool) -> None:
+    """Print the Cookbook command picked from `recipes`, then exec it."""
     interactive = _is_terminal()
-    recipe = _pick_mode(
-        recipes=_recipes_for_this_machine(model), interactive=interactive
-    )
+    recipe = _pick_mode(recipes=recipes, interactive=interactive)
     _log(f"Cookbook recipe: {recipe['url']}")
     if recipe["verified"] != "verified":
         _log(
@@ -66,6 +87,9 @@ def run_guide(model: str, dry_run: bool) -> None:
         argv = _ask_flag_edits(env=env, argv=argv, command=recipe["command"])
     else:
         print(recipe["command"])
+    yours = [key for key in env if os.environ.get(key, env[key]) != env[key]]
+    if yours:
+        _log(f"Using your exported {', '.join(yours)} instead of the Cookbook's.")
 
     _log(
         f'To change flags, run "sglang serve {model} --dry-run", '
@@ -76,7 +100,7 @@ def run_guide(model: str, dry_run: bool) -> None:
     os.execvpe(
         sys.executable,
         [sys.executable, "-m", "sglang.cli.main", "serve", *argv],
-        {**os.environ, **env},
+        {**env, **os.environ},
     )
 
 
@@ -122,22 +146,6 @@ def edit_flags(argv: list[str], edits: str) -> list[str]:
         else:
             raise ValueError(f'Expected a flag such as "--port 8000", got {flag!r}.')
     return [token for group in groups for token in group]
-
-
-def _recipes_for_this_machine(model: str) -> list[dict]:
-    recipes = _load_recipes(model)
-    device_name, gpus = _detect_gpus()
-    hw = _hardware_id(device_name)
-    matching = [r for r in recipes if r["hw"] == hw and r["gpus"] == gpus]
-    if not matching:
-        where = f"{gpus}x {device_name}" if gpus else "this machine (no GPU found)"
-        available = ", ".join(sorted({f"{r['gpus']}x {r['hw']}" for r in recipes}))
-        raise SystemExit(
-            f"No Cookbook recipe for {model} on {where}. The Cookbook has: "
-            f"{available}. To use fewer GPUs, set CUDA_VISIBLE_DEVICES; to launch "
-            "anyway, pass explicit flags."
-        )
-    return matching
 
 
 def _flag_groups(argv: list[str]) -> list[list[str]]:
