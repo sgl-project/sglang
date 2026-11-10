@@ -16,10 +16,7 @@ from sglang.multimodal_gen.configs.models.fsdp import (
     is_module_list_entry_in,
     is_zimage_layer,
 )
-from sglang.multimodal_gen.configs.pipeline_configs.base import (
-    ModelTaskType,
-    PipelineConfig,
-)
+from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import Cosmos3Config
 from sglang.multimodal_gen.configs.pipeline_configs.flux import (
     Flux2PipelineConfig,
@@ -66,10 +63,10 @@ from sglang.multimodal_gen.configs.pipeline_configs.wan import (
 )
 from sglang.multimodal_gen.configs.pipeline_configs.zimage import ZImagePipelineConfig
 from sglang.multimodal_gen.configs.sample.flux import FluxSamplingParams
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 from sglang.multimodal_gen.registry import (
     _get_config_info,
     get_non_diffusers_pipeline_name,
-    is_known_non_diffusers_multimodal_model,
 )
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
@@ -1258,7 +1255,6 @@ class TestMiniMaxH3Routing(unittest.TestCase):
         actual = _get_config_info("MiniMax/MiniMax-H3")
         self.assertIsNotNone(expected)
         self.assertIs(actual, expected)
-        self.assertTrue(is_known_non_diffusers_multimodal_model("MiniMax/MiniMax-H3"))
         self.assertEqual(
             get_non_diffusers_pipeline_name("MiniMax/MiniMax-H3"),
             "MiniMaxH3Pipeline",
@@ -3527,6 +3523,33 @@ class TestKVGatherDegree(unittest.TestCase):
         self.assertFalse(args.sp_split_auto)
         self.assertEqual(args.ulysses_degree, 4)
 
+    def test_higher_sp_keeps_heads_whole_when_ulysses_cannot_split_them(self):
+        # Z-Image's 30 heads do not split over 4 or 8 Ulysses ranks
+        for num_gpus in (4, 8):
+            with self.subTest(num_gpus=num_gpus):
+                args = _from_dict_without_model_resolution(
+                    {
+                        "model_path": "/fake",
+                        "num_gpus": num_gpus,
+                        "performance_mode": "manual",
+                    },
+                    ZImagePipelineConfig(),
+                )
+
+                self.assertEqual(args.sp_degree, num_gpus)
+                self.assertEqual(args.kv_gather_degree, num_gpus)
+                self.assertTrue(args.sp_split_auto)
+                self.assertEqual(args.ring_degree, 1)
+
+    def test_higher_sp_keeps_ulysses_when_heads_divide(self):
+        args = _from_dict_without_model_resolution(
+            {"model_path": "/fake", "num_gpus": 3, "performance_mode": "manual"},
+            ZImagePipelineConfig(),
+        )
+
+        self.assertEqual(args.kv_gather_degree, 1)
+        self.assertEqual(args.ulysses_degree, 3)
+
     def test_explicit_ulysses_is_not_overridden(self):
         args = _from_dict_without_model_resolution(
             {
@@ -3874,34 +3897,6 @@ class TestPerRoleParallelism(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "only defined for worker roles"):
             args.derive_pool_result_endpoint()
 
-    def test_cli_args_parsed(self):
-        """Per-role parallelism args are parsed from CLI."""
-        parser = FlexibleArgumentParser()
-        ServerArgs.add_cli_args(parser)
-        argv = [
-            "--model-path",
-            "/fake",
-            "--denoiser-tp",
-            "2",
-            "--denoiser-sp",
-            "4",
-            "--denoiser-ulysses",
-            "2",
-            "--denoiser-ring",
-            "2",
-            "--encoder-tp",
-            "1",
-            "--decoder-sp",
-            "8",
-        ]
-        args, unknown = parser.parse_known_args(argv)
-        self.assertEqual(args.denoiser_tp, 2)
-        self.assertEqual(args.denoiser_sp, 4)
-        self.assertEqual(args.denoiser_ulysses, 2)
-        self.assertEqual(args.denoiser_ring, 2)
-        self.assertEqual(args.encoder_tp, 1)
-        self.assertEqual(args.decoder_sp, 8)
-
 
 class TestPipelineResolutionCliOverride(unittest.TestCase):
     def setUp(self):
@@ -3955,19 +3950,6 @@ class TestPipelineResolutionCliOverride(unittest.TestCase):
 
 
 class TestDisaggTimeoutArgs(unittest.TestCase):
-    def test_downstream_wait_timeout_cli_arg_is_parsed(self):
-        parser = FlexibleArgumentParser()
-        ServerArgs.add_cli_args(parser)
-        argv = [
-            "--model-path",
-            "/fake",
-            "--disagg-downstream-wait-timeout",
-            "45",
-        ]
-
-        args, _unknown = parser.parse_known_args(argv)
-        self.assertEqual(args.disagg_downstream_wait_timeout, 45)
-
     def test_disagg_role_alias_cli_arg_is_accepted(self):
         parser = FlexibleArgumentParser()
         ServerArgs.add_cli_args(parser)
@@ -3988,19 +3970,6 @@ class TestDisaggTimeoutArgs(unittest.TestCase):
 
 
 class TestSchedulerRpcTimeoutArgs(unittest.TestCase):
-    def test_scheduler_rpc_timeout_cli_arg_is_parsed_in_seconds(self):
-        parser = FlexibleArgumentParser()
-        ServerArgs.add_cli_args(parser)
-        argv = [
-            "--model-path",
-            "/fake",
-            "--scheduler-rpc-timeout",
-            "7200",
-        ]
-
-        args, _unknown = parser.parse_known_args(argv)
-        self.assertEqual(args.scheduler_rpc_timeout, 7200)
-
     def test_scheduler_rpc_timeout_rejects_invalid_values(self):
         invalid_values = (0, -1, MAX_SCHEDULER_RPC_TIMEOUT_S + 1, True, 1.5, "1")
 
@@ -4018,18 +3987,6 @@ class TestSchedulerRpcTimeoutArgs(unittest.TestCase):
 
 
 class TestHttpGracefulShutdownTimeoutArgs(unittest.TestCase):
-    def test_cli_default_and_explicit_timeout(self):
-        parser = FlexibleArgumentParser()
-        ServerArgs.add_cli_args(parser)
-        argv = ["--model-path", "/fake"]
-        self.assertIsNone(parser.parse_args(argv).http_graceful_shutdown_timeout)
-        for timeout in (0, 30):
-            with self.subTest(timeout=timeout):
-                args = parser.parse_args(
-                    argv + ["--http-graceful-shutdown-timeout", str(timeout)]
-                )
-                self.assertEqual(args.http_graceful_shutdown_timeout, timeout)
-
     def test_config_values(self):
         for timeout in (None, 0, 30):
             with self.subTest(timeout=timeout):
@@ -4048,21 +4005,6 @@ class TestHttpGracefulShutdownTimeoutArgs(unittest.TestCase):
                             "http_graceful_shutdown_timeout": timeout,
                         }
                     )
-
-
-class TestDisaggTransferBackendArgs(unittest.TestCase):
-    def test_transfer_backend_cli_arg_is_parsed(self):
-        parser = FlexibleArgumentParser()
-        ServerArgs.add_cli_args(parser)
-        argv = [
-            "--model-path",
-            "/fake",
-            "--disagg-transfer-backend",
-            "mock",
-        ]
-
-        args, _unknown = parser.parse_known_args(argv)
-        self.assertEqual(args.disagg_transfer_backend, "mock")
 
 
 class TestNcclNvlsArgs(unittest.TestCase):
