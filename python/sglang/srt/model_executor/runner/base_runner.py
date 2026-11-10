@@ -428,7 +428,10 @@ class BaseRunner(ABC):
             )
 
         run_flashinfer_autotune_forward(
-            self.model_runner, forward_fn, run_lm_head=False
+            self.model_runner,
+            forward_fn,
+            run_lm_head=False,
+            prepare_decode_graph=True,
         )
 
     def _alloc_dummy_decode_buffers(

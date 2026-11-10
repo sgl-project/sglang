@@ -31,6 +31,7 @@ from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
+    get_flags,
     get_lora,
     get_model,
     get_parallel,
@@ -371,11 +372,35 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
 
 
 def run_flashinfer_autotune_forward(
-    model_runner: ModelRunner, forward_fn: Callable[[], None], *, run_lm_head: bool
+    model_runner: ModelRunner,
+    forward_fn: Callable[[], None],
+    *,
+    run_lm_head: bool,
+    prepare_decode_graph: bool = False,
 ) -> None:
     """Run flashinfer autotune forward."""
     with flashinfer_autotune_context(model_runner, run_lm_head=run_lm_head):
         forward_fn()
+
+    if (
+        prepare_decode_graph
+        and (scope := FlashInferGraphAutotune.for_model(model_runner)) is not None
+    ):
+        from sglang.srt.layers.logits_processor import autotune_dummy_run_mode
+
+        # Use the same startup inputs and stream before graph preparation changes
+        # allocation and execution context. The legacy winner remains separate.
+        previous = torch.cuda.current_stream()
+        model_runner.forward_stream.wait_stream(previous)
+        try:
+            with (
+                torch.cuda.stream(model_runner.forward_stream),
+                autotune_dummy_run_mode(run_lm_head=run_lm_head),
+                scope._context("tune"),
+            ):
+                forward_fn()
+        finally:
+            previous.wait_stream(model_runner.forward_stream)
 
 
 class FlashInferGraphAutotune:
@@ -387,19 +412,34 @@ class FlashInferGraphAutotune:
 
     @classmethod
     def create(cls, runner):
-        if not envs.SGLANG_ENABLE_FLASHINFER_GRAPH_AUTOTUNE.get():
-            return None
-
         from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
             FullCudaGraphBackend,
         )
 
-        mr = runner.model_runner
         if (
             not isinstance(runner.backend, FullCudaGraphBackend)
             or runner.capture_forward_mode != ForwardMode.DECODE
             or runner.enable_torch_compile
             or runner.enable_two_batch_overlap
+        ):
+            return None
+        return cls.for_model(runner.model_runner)
+
+    @classmethod
+    def for_model(cls, mr):
+        if not (
+            envs.SGLANG_ENABLE_FLASHINFER_GRAPH_AUTOTUNE.get()
+            and envs.SGLANG_FLASHINFER_AUTOTUNE_CACHE.get()
+        ):
+            return None
+        from sglang.srt.model_executor.cuda_graph_config import Backend
+
+        graph_config = get_exec().graph.cuda_graph_config
+        if (
+            graph_config is None
+            or graph_config.decode.backend != Backend.FULL
+            or get_flags().capture.enable_torch_compile
+            or get_exec().overlap.enable_two_batch_overlap
             or get_lora().enable_lora
             or not mr.is_generation
             or mr.is_draft_worker
@@ -428,14 +468,20 @@ class FlashInferGraphAutotune:
 
         cache_path = flashinfer_autotune_cache_path(mr)
         cache_root = cache_path.with_suffix(".decode_graph")
-        if not envs.SGLANG_FLASHINFER_AUTOTUNE_CACHE.get():
-            # Fresh results remain available across this runner's shapes and
-            # capture contexts without reading or replacing its stable store.
-            cache_root = (
-                cache_path.parent / "runs" / (f"{cache_root.name}.{uuid.uuid4().hex}")
-            )
         logger.info("FlashInfer decode graph autotune cache: %s", cache_root)
         return cls(cache_root, get_flashinfer_autotune_skip_ops(mr))
+
+    def _context(self, mode: str, **kwargs):
+        from flashinfer import autotune_v2
+
+        # Preserve operation measurement settings; only cache ownership changes.
+        return autotune_v2(
+            mode=mode,
+            cache_root=self.cache_root,
+            cache_scope="context",
+            skip_ops=self.skip_ops,
+            **kwargs,
+        )
 
     @contextlib.contextmanager
     def capture_context(
@@ -443,19 +489,10 @@ class FlashInferGraphAutotune:
         forward_fn: Callable[[], None],
         post_warmup_hook: Optional[Callable[[], None]],
     ):
-        from flashinfer import autotune_v2
-
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("FlashInfer graph tuning must precede CUDA capture")
-        # Preserve each operation's existing measurement settings. This scope
-        # changes cache ownership, not the profiling objective.
-        options = dict(
-            cache_root=self.cache_root,
-            cache_scope="context",
-            skip_ops=self.skip_ops,
-        )
         try:
-            with autotune_v2(mode="tune", **options):
+            with self._context("tune"):
                 forward_fn()
         finally:
             if post_warmup_hook is not None:
@@ -463,7 +500,7 @@ class FlashInferGraphAutotune:
         # The backend's eager warmups check coverage before it opens the CUDA
         # graph. Capture uses that same identity and cannot profile on a miss.
         # Context exit restores legacy lookup for eager serving.
-        with autotune_v2(mode="replay", strict_replay=True, **options):
+        with self._context("replay", strict_replay=True):
             yield
 
 
