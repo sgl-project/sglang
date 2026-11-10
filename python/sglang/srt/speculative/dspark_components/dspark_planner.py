@@ -155,8 +155,7 @@ class DSparkVerifyPlanner:
                     f"DSpark ragged-verify mode {self._ragged_verify_mode.value!r} "
                     f"schedules per-request verify lengths from draft confidences, but "
                     f"the draft has neither a confidence head nor the online "
-                    f"acceptance estimator. Use --speculative-confidence-source "
-                    f"online or auto, or run SGLANG_RAGGED_VERIFY_MODE=static."
+                    f"acceptance estimator. Run SGLANG_RAGGED_VERIFY_MODE=static."
                 )
             sps_table = build_sps_cost_table(
                 verify_num_draft_tokens=self.verify_num_draft_tokens,

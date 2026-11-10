@@ -543,7 +543,6 @@ class DSparkWorkerV2(BaseSpecWorker):
         if (
             read_ragged_verify_mode() is RaggedVerifyMode.STATIC
             or self.draft_model.confidence_head is not None
-            or get_spec().speculative_confidence_source == "head"
         ):
             return None
         if get_parallel().tp_rank == 0:

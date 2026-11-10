@@ -5,6 +5,7 @@ from unittest import mock
 import torch
 
 from sglang.kernels.ops.speculative.acceptance_estimator import MAX_LOG_ODDS
+from sglang.srt.environ import envs
 from sglang.srt.speculative.dspark_components import dspark_config
 from sglang.srt.speculative.dspark_components.dspark_worker_v2 import DSparkWorkerV2
 from sglang.srt.speculative.online_acceptance_estimator import (
@@ -188,16 +189,12 @@ class TestDSparkObserve(CustomTestCase):
 
 
 class TestConfidenceSource(CustomTestCase):
-    def _builds(self, *, source, mode, enable_field):
+    def _builds(self, *, mode, enable_field, force_online=False):
         config = SimpleNamespace()
         if enable_field is not None:
             config.enable_confidence_head = enable_field
         with (
-            mock.patch.object(
-                dspark_config,
-                "get_spec",
-                return_value=SimpleNamespace(speculative_confidence_source=source),
-            ),
+            envs.SGLANG_DSPARK_FORCE_ONLINE_ACCEPTANCE_ESTIMATOR.override(force_online),
             mock.patch.object(
                 dspark_config, "read_ragged_verify_mode", return_value=mode
             ),
@@ -205,20 +202,23 @@ class TestConfidenceSource(CustomTestCase):
             return dspark_config.builds_confidence_head(config)
 
     def test_static_mode_builds_no_head(self):
-        for source in ("auto", "head", "online"):
+        for force_online in (False, True):
             self.assertFalse(
                 self._builds(
-                    source=source, mode=RaggedVerifyMode.STATIC, enable_field=True
+                    mode=RaggedVerifyMode.STATIC,
+                    enable_field=True,
+                    force_online=force_online,
                 )
             )
 
     def test_source_selection(self):
         compact = RaggedVerifyMode.COMPACT
-        self.assertTrue(self._builds(source="auto", mode=compact, enable_field=True))
-        self.assertTrue(self._builds(source="auto", mode=compact, enable_field=None))
-        self.assertFalse(self._builds(source="auto", mode=compact, enable_field=False))
-        self.assertTrue(self._builds(source="head", mode=compact, enable_field=False))
-        self.assertFalse(self._builds(source="online", mode=compact, enable_field=True))
+        self.assertTrue(self._builds(mode=compact, enable_field=True))
+        self.assertTrue(self._builds(mode=compact, enable_field=None))
+        self.assertFalse(self._builds(mode=compact, enable_field=False))
+        self.assertFalse(
+            self._builds(mode=compact, enable_field=True, force_online=True)
+        )
 
 
 if __name__ == "__main__":

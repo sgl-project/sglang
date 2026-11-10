@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any, List, Optional
 import msgspec
 
 from sglang.srt.arg_groups.model_override_base import resolved_view
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     get_model,
     get_spec,
@@ -41,8 +42,7 @@ def builds_confidence_head(draft_hf_config: Any) -> bool:
     if read_ragged_verify_mode() is RaggedVerifyMode.STATIC:
         return False
     enabled = _cfg_get(draft_hf_config, "enable_confidence_head")
-    source = get_spec().speculative_confidence_source
-    if source == "online" or (source == "auto" and enabled is False):
+    if enabled is False or envs.SGLANG_DSPARK_FORCE_ONLINE_ACCEPTANCE_ESTIMATOR.get():
         return False
     if enabled is None:
         logger.warning(
