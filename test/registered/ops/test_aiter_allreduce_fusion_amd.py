@@ -10,6 +10,8 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.distributed.parallel_state import GroupCoordinator
+from sglang.srt.environ import envs
 from sglang.srt.layers.layer_boundary import UnreducedOutput
 from sglang.srt.layers.layer_boundary.fusions.allreduce import fused_attn_input
 from sglang.srt.layers.moe import utils as moe_utils
@@ -46,6 +48,8 @@ def _run_residual_accuracy_check():
         tensor_model_parallel_fused_allreduce_rmsnorm,
     )
     from sglang.srt.distributed.parallel_state import (
+        _FUSED_AR_RMS_1STAGE_MAX_READ_BYTES,
+        _FUSED_AR_RMS_1STAGE_MAX_TOKENS,
         destroy_distributed_environment,
         destroy_model_parallel,
         init_distributed_environment,
@@ -130,7 +134,12 @@ def _run_residual_accuracy_check():
         frac_nonzero = (diff > 0).float().mean().item()
 
         nbytes = m * n * dtype.itemsize
-        stage = "1-stage" if nbytes <= 128 * 1024 else "2-stage"
+        stage = (
+            "1-stage"
+            if m <= _FUSED_AR_RMS_1STAGE_MAX_TOKENS
+            and nbytes * world_size <= _FUSED_AR_RMS_1STAGE_MAX_READ_BYTES
+            else "2-stage"
+        )
         passed = max_diff <= ATOL
 
         if not passed:
@@ -491,6 +500,45 @@ class TestAiterAllreduceFusionGate(CustomTestCase):
                         forward_mode=mode,
                     )
                 )
+
+
+class TestFusedArRmsStageSelection(CustomTestCase):
+    """1-stage vs 2-stage choice for the aiter fused AR+RMSNorm, on CPU tensors."""
+
+    def _selects_1stage(self, m, n, world_size):
+        ca_comm = types.SimpleNamespace(
+            disabled=False, custom_fused_ar_rms=MagicMock(return_value=None)
+        )
+        group = types.SimpleNamespace(ca_comm=ca_comm, world_size=world_size)
+        x = torch.empty(m, n, dtype=torch.bfloat16)
+        GroupCoordinator.fused_allreduce_rmsnorm(group, x, x, x[0], 1e-6)
+        return ca_comm.custom_fused_ar_rms.call_args.args[4]
+
+    def setUp(self):
+        patcher = patch.dict(os.environ)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        envs.SGLANG_USE_1STAGE_ALLREDUCE.clear()
+
+    def test_read_budget_scales_with_world_size(self):
+        # 13 x 6144 bf16 is 156 KiB of payload.
+        self.assertTrue(self._selects_1stage(13, 6144, world_size=2))
+        self.assertTrue(self._selects_1stage(13, 6144, world_size=4))
+        self.assertFalse(self._selects_1stage(13, 6144, world_size=8))
+
+    def test_world_size_8_keeps_128_kib_payload(self):
+        self.assertTrue(self._selects_1stage(8, 8192, world_size=8))
+        self.assertFalse(self._selects_1stage(9, 8192, world_size=8))
+
+    def test_token_cap(self):
+        self.assertTrue(self._selects_1stage(80, 2048, world_size=2))
+        self.assertFalse(self._selects_1stage(81, 2048, world_size=2))
+
+    def test_env_overrides_selection(self):
+        with envs.SGLANG_USE_1STAGE_ALLREDUCE.override(True):
+            self.assertTrue(self._selects_1stage(131, 6144, world_size=8))
+        with envs.SGLANG_USE_1STAGE_ALLREDUCE.override(False):
+            self.assertFalse(self._selects_1stage(1, 6144, world_size=2))
 
 
 if __name__ == "__main__":

@@ -157,11 +157,6 @@ COSMOS3_MULTIVIEW_INFERENCE_DEFAULT_KEYS = frozenset(
         "normalize_cfg",
     }
 )
-# Written by the Sep/Oct-1 exporters, dropped by the Oct-7 contract (sglang never
-# read sigma_max; negative_metadata_mode is a request field).
-COSMOS3_MULTIVIEW_OPTIONAL_INFERENCE_DEFAULT_KEYS = frozenset(
-    {"sigma_max", "negative_metadata_mode"}
-)
 COSMOS3_MULTIVIEW_RESOLUTIONS = ("480", "720")
 
 # The V1.2 LiDAR tokenizer contract the joint checkpoints were exported with.

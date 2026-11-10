@@ -113,7 +113,7 @@ class UocrSchedulerRuntime:
         return self._prefetch.request_lists()
 
     def on_req_dropped(self, req: Req) -> None:
-        """Release reuse and prefetch state of a request aborted before running."""
+        """Release reuse and prefetch state of a dropped or aborted request."""
         self._reuse.on_req_dropped(req)
         self._prefetch.release_early(req.rid)
 
