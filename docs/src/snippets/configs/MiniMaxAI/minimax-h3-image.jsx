@@ -17,6 +17,7 @@ export const config = (() => {
     ["rtx3060", "RTX 3060", 12, 1],
   ];
   const profile = (hw) => hardware.find(([id]) => id === hw);
+  const fp8AttentionHardware = (hw) => ["dgx-spark", "rtxpro6000", "rtx5090", "rtx5080", "rtx5070ti", "rtx5070"].includes(hw);
   const maxRecipeGpus = (hw) => hw === "rtx3090" ? 2 : hw === "dgx-spark" || hw.startsWith("rtx") ? 1 : 8;
   // Whole-component placement must fit the encoder; layerwise placement streams
   // its blocks and keeps the native BF16 checkpoint usable on smaller cards.
@@ -107,6 +108,17 @@ export const config = (() => {
         { id: "mxfp8-dit", label: "MXFP8 DiT", flags: ["--quantization mxfp8"] },
         { id: "fp8-all", label: "FP8 DiT + encoder", flags: ["--quantization fp8", "--component-quantizations.text_encoder fp8"] },
         { id: "mxfp8-all", label: "MXFP8 DiT + encoder", flags: ["--quantization mxfp8", "--component-quantizations.text_encoder mxfp8"] },
+      ],
+    },
+    {
+      id: "attention", title: "Attention", scope: "serve", default: "native",
+      description: "Native FlashAttention preserves release precision. FP8 quantizes attention inputs and can change image details; it is independent of weight quantization. Restart to change this setting.",
+      options: [
+        { id: "native", label: "Native FlashAttention", recommended: true },
+        { id: "fp8", label: "FP8 attention", flags: ["--component-attention-backends.transformer fp8_fa_sm120"],
+          disabled: (s) => !fp8AttentionHardware(s.hw), disableReason: "FP8 attention requires an SM120/SM121 GPU.",
+          soft: (s) => s.hw !== "dgx-spark" || s.quantization !== "mxfp8-all",
+          softReason: "Measured on DGX Spark with MXFP8 DiT + encoder; other combinations remain unverified." },
       ],
     },
     {
@@ -243,6 +255,8 @@ export const config = (() => {
         if (Number(s.gpus_per_node) > maxRecipeGpus(s.hw)) errors.push("Default multi-GPU recipes require NVLink. This GPU is limited to a single-card recipe, or a two-card NVLink pair for RTX 3090.");
         if (s.quantization?.startsWith("mxfp8") && ["rtx6000ada", "rtx4090", "rtx4080", "rtx4060ti", "rtx4070", "rtx3090", "rtx3060"].includes(s.hw)) errors.push("Choose FP8 or Native BF16 on this GPU; MXFP8 requires Hopper or newer.");
         if (s.execution === "bcg" && s.warmup === "off") errors.push("Choose Prepare at startup to capture CUDA graphs.");
+        if (s.attention === "fp8" && !fp8AttentionHardware(s.hw)) errors.push("FP8 attention requires an SM120/SM121 GPU.");
+        if (s.attention === "fp8" && t.ring_degree > 1) errors.push("Ring parallelism requires Native FlashAttention.");
         if (profile(s.hw) && !encoderFits(s.hw, Number(s.gpus_per_node))) {
           if (s.placement !== "layerwise") errors.push("Choose Layerwise offload for this GPU capacity, or apply the derived recipe.");
           if (s.adaln !== "online") errors.push("Choose AdaLN Precompute for the small-GPU recipe.");
@@ -270,6 +284,9 @@ export const config = (() => {
           : s.hw === "b300" ? Number(s.gpus_per_node) <= 2
           : Number(s.gpus_per_node) === 1);
       const serveVerified = !!recipe && !recipe.unverified && !errors.length
+        && (s.attention !== "fp8" || (s.hw === "dgx-spark" && s.quantization === "mxfp8-all"
+          && s.placement === "auto" && s.adaln === "auto" && s.execution === "eager"
+          && s.warmup === "server" && s.conditioning === "on" && s.vae === "auto"))
         && ((!s.quantization || s.quantization === "native") || (s.adaln !== "resident" && (
           (Number(s.gpus_per_node) === 1 && (
             (s.hw === "b300" && (s.placement === "resident" || (s.placement === "layerwise" && s.quantization.endsWith("-all"))))
@@ -291,6 +308,9 @@ export const config = (() => {
       const verified = serveVerified && (s.conditioning === "off" ? uncachedWorkload(s)
         : s.vae === "local" ? localVaeWorkload(s) : measured2k || measured4k)
         && (s.png !== "none" || uncompressedPngWorkload(s))
+        && (s.attention !== "fp8" || (s.quality === "lossless" && (
+          (s.mode === "t2i" && ["2048x2048", "4736x3552"].includes(s.size))
+          || (s.mode === "edit" && s.size === "4096x4096" && s.references === "one"))))
         && (s.delivery !== "url" || fileUrlWorkload(s));
       const flags = ["--model-path {{MODEL_NAME}}", "--backend sglang"];
       if (Number(s.gpus_per_node) > 1) flags.push(`--num-gpus ${s.gpus_per_node}`, `--tp-size ${topology.tp_size}`, `--ulysses-degree ${topology.ulysses_degree}`, `--ring-degree ${topology.ring_degree}`);
