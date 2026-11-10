@@ -78,6 +78,7 @@ def _make_model_runner(
     disable_overlap_schedule=False,
     sliding_window_size=None,
     speculative_num_draft_tokens=None,
+    speculative_draft_window_kv=False,
     speculative_algorithm=None,
     speculative_num_steps=None,
     speculative_eagle_topk=None,
@@ -150,6 +151,7 @@ def _make_model_runner(
         chunked_prefill_size=chunked_prefill_size,
         disable_overlap_schedule=disable_overlap_schedule,
         speculative_num_draft_tokens=speculative_num_draft_tokens,
+        speculative_draft_window_kv=speculative_draft_window_kv,
         speculative_algorithm=speculative_algorithm,
         speculative_num_steps=speculative_num_steps,
         speculative_eagle_topk=speculative_eagle_topk,
@@ -1501,6 +1503,45 @@ class TestDflashDraftKvBudget(CustomTestCase):
             ),
             8,
         )
+
+    def test_private_draft_window_is_a_fixed_budget_even_after_token_cap(self):
+        from sglang.srt.model_executor.pool_configurator import DefaultPoolConfigurator
+
+        mr = _make_model_runner(
+            self,
+            num_layers=2,
+            page_size=4,
+            speculative_algorithm="DFLASH",
+            speculative_num_draft_tokens=4,
+            max_running_requests=3,
+            disaggregation_mode="decode",
+            disaggregation_decode_extra_slots=2,
+            speculative_draft_window_kv=True,
+        )
+        mr.spec_algorithm.is_dflash_family.return_value = True
+        mr.resolve_max_num_reqs.return_value = 3
+        mr.dflash_draft_cell_size_per_token = 100
+        mr.spec_aux_config = SimpleNamespace(
+            dflash_draft_num_layers=2,
+            draft_model_config=SimpleNamespace(
+                hf_text_config=SimpleNamespace(
+                    num_hidden_layers=2,
+                    layer_types=["sliding_attention"] * 2,
+                    sliding_window=7,
+                )
+            ),
+        )
+        with mock_cpu_env():
+            cfg = DefaultPoolConfigurator(mr)
+            # 5 owners, 20 rows each, plus one padding page: 104 draft rows.
+            for budget in (1_000_000, 2_000_000):
+                actual = cfg.calculate_pool_sizes(budget, 4)
+                expected = ((budget - 104 * 100) // 2048) // 4 * 4
+                self.assertEqual(actual.max_total_num_tokens, expected)
+                self.assertEqual(actual.draft_window_tokens, 100)
+            capped = cfg.calculate_pool_sizes_from_max_tokens(513, 4)
+            self.assertEqual(capped.max_total_num_tokens, 512)
+            self.assertEqual(capped.draft_window_tokens, 100)
 
     def test_hybrid_swa_budget_shrinks_by_draft_pool(self):
         """The HybridSWA budget must charge the DFLASH draft pool."""

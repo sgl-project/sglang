@@ -99,6 +99,7 @@ _PREPARED_STATE_TYPES = frozenset(
 _FLAT_STATE_TYPES = frozenset(
     (
         StateType.MAMBA,
+        StateType.DRAFT_WINDOW,
         StateType.DSA,
         StateType.QSA_PENDING,
         StateType.QSA_COMPRESSED,
@@ -830,7 +831,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
 
     def _state_component_is_whole_slot(self, *, state_type, decode_tp_size) -> bool:
         # Mirrors the dispatch in maybe_send_extra; the other layouts slice per rank.
-        if state_type == StateType.MAMBA:
+        if state_type in (StateType.MAMBA, StateType.DRAFT_WINDOW):
             return self.state_tp_size == decode_tp_size
         if state_type in (StateType.QSA_PENDING, StateType.QSA_COMPRESSED):
             return self.is_mla_backend or self.state_tp_size == decode_tp_size
@@ -3142,7 +3143,29 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             )
             dst_lids = dst_state_layer_ids[i] if i < len(dst_state_layer_ids) else []
 
-            if st == StateType.MAMBA:
+            if st == StateType.DRAFT_WINDOW:
+                # CP-TP sharing gives draft MHA the full state TP width even
+                # when the target MLA attention TP is one.
+                if self.state_tp_size != decode_tp_size or src_lens != dst_lens:
+                    raise ValueError(
+                        "Draft window transfer requires matching draft TP and dtype/layout"
+                    )
+                if len(src_indices) != len(dst_indices):
+                    raise ValueError(
+                        "Draft window transfer needs the complete aligned suffix"
+                    )
+                h = self._send_kvcache_generic(
+                    peer_name=peer_name,
+                    src_data_ptrs=src_ptrs,
+                    dst_data_ptrs=dst_ptrs,
+                    item_lens=src_lens,
+                    prefill_data_indices=np.asarray(src_indices, dtype=np.int32),
+                    dst_data_indices=np.asarray(dst_indices, dtype=np.int32),
+                    dst_gpu_id=dst_gpu_id,
+                    state_type=st,
+                    force_flat=True,
+                )
+            elif st == StateType.MAMBA:
                 if self.state_tp_size != decode_tp_size:
                     if 0 in src_dims:
                         raise RuntimeError(

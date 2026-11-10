@@ -406,6 +406,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         # Normalized in arg_groups.speculative_hook.handle_speculative_decoding.
         self.draft_window_size: Optional[int] = get_spec().speculative_draft_window_size
         self.use_compact_draft_cache = self.draft_window_size is not None
+        self.draft_window_layout = None
         self.device = target_worker.device
 
         self._warned_sampling_fallback = False
@@ -682,6 +683,41 @@ class DFlashWorkerV2(BaseSpecWorker):
         # enabled, the draft worker keeps a private compact req->token table
         # over the same global KV index space, so radix-cache/prefix-hit KV
         # remains reusable while draft attention sees only the recent window.
+        from sglang.srt.mem_cache.draft_window import (
+            DraftWindowLayout,
+            draft_window_size,
+        )
+        from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+
+        self.draft_window_layout = None
+        if get_spec().speculative_draft_window_kv:
+            if self._is_domino:
+                raise ValueError(
+                    "Draft window KV does not support multi-step Domino rollout"
+                )
+            window = draft_window_size(
+                self.model_runner.spec_aux_config.draft_model_config
+            )
+            if memory_pool_config.draft_window_tokens is not None:
+                unit = DraftWindowLayout(window, self.page_size, 2, self.block_size)
+                slots = memory_pool_config.draft_window_tokens // unit.capacity + 1
+                layout = DraftWindowLayout(
+                    window, self.page_size, slots, self.block_size
+                )
+                if req_to_token_pool.req_to_token.shape[0] > slots:
+                    raise ValueError(
+                        "Draft window budget does not cover the request table"
+                    )
+                self.draft_window_layout = layout
+                req_to_token_pool = ReqToTokenPool(
+                    size=slots - 1,
+                    max_context_len=layout.capacity,
+                    device=self.device,
+                    enable_memory_saver=False,
+                )
+                # This pool never allocates target-token slots. Its reads and
+                # writes are direct physical window locations.
+                token_to_kv_pool_allocator = None
         with draft_tp_context(self.draft_parallel_layout):
             self._draft_worker.alloc_memory_pool(
                 memory_pool_config=memory_pool_config,
@@ -689,6 +725,49 @@ class DFlashWorkerV2(BaseSpecWorker):
                     None if self.use_compact_draft_cache else req_to_token_pool
                 ),
                 token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+            )
+
+        pool = self._draft_worker.model_runner.token_to_kv_pool
+        if get_spec().speculative_draft_window_kv:
+            if (
+                pool.kv_cache_layout != "nhd"
+                or pool.dtype not in (torch.bfloat16, torch.float8_e4m3fn)
+                or getattr(pool, "k_scale_buffer", None) is not None
+            ):
+                raise ValueError(
+                    "Draft window KV requires contiguous NHD BF16 or tensor-scaled FP8 storage"
+                )
+            pool.draft_window_size = window
+        if self.draft_window_layout is not None:
+            layout = self.draft_window_layout
+            if pool.size != layout.usable_tokens or pool.page_size != layout.page_size:
+                raise ValueError(
+                    "Draft window allocation disagrees with its fixed budget"
+                )
+            from sglang.srt.mem_cache.draft_kv_budget import (
+                resolve_dflash_draft_cell_size,
+            )
+
+            cell = resolve_dflash_draft_cell_size(
+                draft_model_config=self.model_runner.spec_aux_config.draft_model_config,
+                draft_num_layers=len(self.draft_model.layers),
+                attn_tp_size=self.draft_parallel_layout.attn_tp_size,
+            )
+            if (
+                cell is None
+                or sum(pool.get_kv_size_bytes()) != layout.storage_tokens * cell
+            ):
+                raise ValueError(
+                    "Draft window physical bytes differ from the target's budget"
+                )
+            pool.draft_window_layout = layout
+            logger.info(
+                "Draft window KV: slots=%d, window=%d, rows/slot=%d, physical tokens=%d, dtype=%s",
+                layout.num_slots - 1,
+                layout.window,
+                layout.capacity,
+                layout.storage_tokens,
+                pool.dtype,
             )
 
     def init_attention_backends(self):
@@ -2489,12 +2568,33 @@ class DFlashWorkerV2(BaseSpecWorker):
                 ctx_lens,
                 int(sum(batch.extend_lens)),
             )
-            # The draft KV goes to the slots the target prefill just wrote.
+            cache_loc = self._draft_write_ids(iteration_ids)
+            target_hidden = logits_output.hidden_states
+            if self.draft_window_layout is not None:
+                layout = self.draft_window_layout
+                slots = torch.repeat_interleave(
+                    batch.req_pool_indices, ctx_lens, output_size=sum(batch.extend_lens)
+                )
+                ends = torch.repeat_interleave(
+                    batch.seq_lens, ctx_lens, output_size=sum(batch.extend_lens)
+                )
+                start = (ends - layout.window).clamp_min(0)
+                start = start // layout.page_size * layout.page_size
+                keep = positions >= start
+                cache_loc = layout.locations(slots[keep], positions[keep])
+                positions = positions[keep]
+                target_hidden = target_hidden[: keep.numel()][keep]
+                # D-side warmup has no cached hidden prefix to convolve.
+                ctx_lens = None
             self._append_target_hidden_to_draft_kv_by_loc(
-                target_hidden=logits_output.hidden_states,
-                cache_loc=self._draft_write_ids(iteration_ids),
-                swa_cache_loc=self._draft_write_ids(
-                    iteration_ids, IdSpaceKind.SLIDING_WINDOW
+                target_hidden=target_hidden,
+                cache_loc=cache_loc,
+                swa_cache_loc=(
+                    cache_loc
+                    if self.draft_window_layout is not None
+                    else self._draft_write_ids(
+                        iteration_ids, IdSpaceKind.SLIDING_WINDOW
+                    )
                 ),
                 positions=positions,
                 extend_lens=ctx_lens,
@@ -2686,7 +2786,28 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
 
         seq_lens_cpu = self._draft_seq_lens_cpu_buf[:bs]
-        if self.use_compact_draft_cache:
+        window_layout = self.draft_window_layout
+        draft_write_loc_2d = None
+        if window_layout is not None:
+            reads, draft_seq_lens, draft_write_loc_2d = window_layout.prepare(
+                batch.req_pool_indices, prefix_lens
+            )
+            self.draft_model_runner.req_to_token_pool.req_to_token.index_copy_(
+                0, batch.req_pool_indices.to(torch.int64), reads
+            )
+            host = batch.seq_lens_cpu
+            if host is None:
+                host = draft_input.nxt_kv_lens_cpu
+            if host is None:
+                seq_lens_cpu.fill_(
+                    window_layout.window + self.page_size - 1 + block_size
+                )
+            else:
+                seq_lens_cpu.copy_(host)
+                seq_lens_cpu.clamp_(max=window_layout.window + self.page_size - 1)
+                seq_lens_cpu.add_(block_size)
+            draft_seq_lens_sum = int(seq_lens_cpu.sum())
+        elif self.use_compact_draft_cache:
             # Rebuild the draft-local sliding-window view from committed target state.
             draft_prefix_lens = self._compute_compact_draft_seq_lens(prefix_lens)
             self._fill_compact_seq_lens_cpu_bound(
@@ -2730,7 +2851,11 @@ class DFlashWorkerV2(BaseSpecWorker):
             input_ids=block_ids.flatten(),
             req_pool_indices=batch.req_pool_indices,
             seq_lens=draft_seq_lens,
-            out_cache_loc=verify_out_cache_loc,
+            out_cache_loc=(
+                draft_write_loc_2d.reshape(-1)
+                if draft_write_loc_2d is not None
+                else verify_out_cache_loc
+            ),
             seq_lens_sum=draft_seq_lens_sum,
             seq_lens_cpu=seq_lens_cpu,
             positions=positions,
@@ -2759,6 +2884,14 @@ class DFlashWorkerV2(BaseSpecWorker):
             if self.use_compact_draft_cache
             else iteration_ids
         )
+        if window_layout is not None:
+            draft_plan = draft_translator.plan(
+                req_pool_indices=batch.req_pool_indices,
+                seq_lens=draft_seq_lens,
+                seq_lens_cpu=seq_lens_cpu,
+                write_virtual=draft_write_loc_2d.reshape(-1),
+                read_extent=block_size,
+            )
         draft_plan.bind(forward_batch, draft_translator)
 
         if self.selector is not None or self.lilicorr is not None:
@@ -3070,13 +3203,19 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         # Consume in this step: every decode graph size shares one aux output,
         # which the next target forward overwrites (resolve_aux_hidden_states_width).
-        cache_loc = self._draft_write_ids(iteration_ids)
+        cache_loc = (
+            draft_write_loc_2d.reshape(-1)
+            if draft_write_loc_2d is not None
+            else self._draft_write_ids(iteration_ids)
+        )
         self._append_target_hidden_to_draft_kv_by_loc(
             target_hidden=hidden.reshape(-1, hidden.shape[-1]),
             cache_loc=cache_loc,
             cache_loc_2d=cache_loc.view(verify_out_cache_loc_2d.shape),
-            swa_cache_loc=self._draft_write_ids(
-                iteration_ids, IdSpaceKind.SLIDING_WINDOW
+            swa_cache_loc=(
+                cache_loc
+                if window_layout is not None
+                else self._draft_write_ids(iteration_ids, IdSpaceKind.SLIDING_WINDOW)
             ),
             positions=positions,
             commit_lens=commit_lens,

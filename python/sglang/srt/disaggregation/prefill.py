@@ -407,7 +407,10 @@ class PrefillBootstrapQueue:
             else None
         )
         num_draft_entries = 0
-        if draft_kv_pool is not None:
+        if (
+            draft_kv_pool is not None
+            and getattr(draft_kv_pool, "draft_window_size", None) is None
+        ):
             # Draft KV shares target virtual ids. Unified target KV is transferred
             # with physical ids, so it needs a separate draft index vector.
             draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
@@ -1873,6 +1876,17 @@ class SchedulerDisaggregationPrefillMixin:
                 # request, addressed by the request-pool slot rather than KV pages.
                 return get_qsa_pending_state_indices(req)
 
+            def _draft_window_payload():
+                pool = self.disagg_prefill_bootstrap_queue.draft_token_to_kv_pool
+                from sglang.srt.mem_cache.draft_window import draft_window_transfer_rows
+
+                return draft_window_transfer_rows(
+                    pool,
+                    self.req_to_token_pool.req_to_token,
+                    req.kv.req_pool_idx,
+                    seq_len,
+                )
+
             def _swa_ring_payload():
                 # Unified_kv SWA ring rows (req_pool_idx*ring_stride + pos%ring_stride)
                 # for the last `window` positions, in ascending position order so
@@ -1908,6 +1922,7 @@ class SchedulerDisaggregationPrefillMixin:
                 StateType.MINIMAX_INDEX_K: _minimax_payload,
                 StateType.MINIMAX_DENSE_KV: _full_kv_pages_payload,
                 StateType.SWA_RING: _swa_ring_payload,
+                StateType.DRAFT_WINDOW: _draft_window_payload,
                 StateType.DSV4_REQUEST_STATE: _request_state_payload,
                 StateType.REQUEST_ROW: _request_row_payload,
                 StateType.BLOCK_SCALE: _full_kv_pages_payload,

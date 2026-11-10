@@ -53,6 +53,8 @@ struct PrefillServerInfo {
     /// Each stage's state entries, by stage, when the stages differ.
     #[serde(skip_serializing_if = "Option::is_none")]
     state_wires: Option<Vec<Option<serde_json::Value>>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    draft_window_kv_layout: Option<serde_json::Value>,
     follow_bootstrap_room: bool,
     enable_dsa_cache_layer_split: bool,
     stores_to_linker: bool,
@@ -126,6 +128,7 @@ struct Topology {
     /// Each pipeline stage's PD state entries (`state_wire`), as its ranks
     /// registered them; every rank of a stage registers the same ones.
     state_wire_by_stage: BTreeMap<i64, Option<serde_json::Value>>,
+    draft_window_kv_layout: Option<serde_json::Value>,
     follow_bootstrap_room: Option<bool>,
     enable_dsa_cache_layer_split: Option<bool>,
     stores_to_linker: Option<bool>,
@@ -223,6 +226,8 @@ struct Route {
     dsv41_spec_layout: Option<serde_json::Value>,
     #[serde(default)]
     spec_kv_layout: Option<serde_json::Value>,
+    #[serde(default)]
+    draft_window_kv_layout: Option<serde_json::Value>,
     #[serde(default, deserialize_with = "parse_int_opt")]
     prefill_http_port: Option<i64>,
     #[serde(default)]
@@ -255,6 +260,7 @@ async fn route_put(State(state): State<Arc<Registry>>, Json(body): Json<Route>) 
     let mut layout_mismatch = false;
     let mut spec_mismatch = false;
     let mut state_wire_mismatch = false;
+    let mut draft_window_layout_mismatch = false;
     state.topology.rcu(|current| {
         let mut topo = (**current).clone();
         layout_mismatch =
@@ -266,10 +272,13 @@ async fn route_put(State(state): State<Arc<Registry>>, Json(body): Json<Route>) 
             .state_wire_by_stage
             .get(&body.pp_rank)
             .is_some_and(|wire| *wire != body.state_wire);
-        if layout_mismatch || spec_mismatch || state_wire_mismatch {
+        draft_window_layout_mismatch =
+            topo.registered_count > 0 && topo.draft_window_kv_layout != body.draft_window_kv_layout;
+        if layout_mismatch || spec_mismatch || state_wire_mismatch || draft_window_layout_mismatch {
             return topo;
         }
         topo.dsv41_spec_layout = body.dsv41_spec_layout.clone();
+        topo.draft_window_kv_layout = body.draft_window_kv_layout.clone();
         if topo.spec_kv_layout.is_none() {
             topo.spec_kv_layout = body.spec_kv_layout.clone();
         }
@@ -309,6 +318,13 @@ async fn route_put(State(state): State<Arc<Registry>>, Json(body): Json<Route>) 
         topo.registered_count += 1;
         topo
     });
+
+    if draft_window_layout_mismatch {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "Inconsistent draft window KV layouts",
+        );
+    }
 
     if layout_mismatch {
         return json_error(
@@ -390,6 +406,7 @@ async fn route_get(
             // them answers, so an older decode reads a dense prefill's answer.
             state_wire: topo.state_wire().filter(truthy),
             state_wires: topo.state_wires().filter(|wires| !wires.is_empty()),
+            draft_window_kv_layout: topo.draft_window_kv_layout.clone(),
             follow_bootstrap_room: topo.follow_bootstrap_room.unwrap_or(true),
             enable_dsa_cache_layer_split: topo.enable_dsa_cache_layer_split.unwrap_or(false),
             stores_to_linker: topo.stores_to_linker.unwrap_or(false),
@@ -800,6 +817,48 @@ mod tests {
         }));
         assert_eq!(request(addr, "PUT", "/route", Some(&rank1)).0, 200);
         assert_eq!(sentinel_info(addr)["state_wire"], wire("window_4096", 4096));
+    }
+
+    #[test]
+    fn draft_window_layout_round_trip_and_rank_mismatch() {
+        let (_rt, addr) = start_on_free_port();
+        let layout = serde_json::json!({
+            "window": 2048, "dtype": "torch.float8_e4m3fn", "strides": [512, 512]
+        });
+        let spec_layout = serde_json::json!({"algorithm": "DFLASH", "num_draft_entries": 10});
+        let state_wire = serde_json::json!([["draft_window", null]]);
+        let body = put_route(serde_json::json!({
+            "draft_window_kv_layout": layout,
+            "spec_kv_layout": spec_layout,
+            "state_wire": state_wire,
+        }));
+        // Matching registrations remain compatible.
+        for _ in 0..2 {
+            assert_eq!(request(addr, "PUT", "/route", Some(&body)).0, 200);
+        }
+        let (status, body) = request(addr, "GET", SENTINEL, None);
+        assert_eq!(status, 200);
+        let info: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(info["draft_window_kv_layout"], layout);
+        assert_eq!(info["spec_kv_layout"], spec_layout);
+        assert_eq!(info["state_wire"], state_wire);
+
+        for incompatible in [
+            serde_json::Value::Null,
+            serde_json::json!({"window": 4096, "dtype": "torch.float8_e4m3fn", "strides": [512, 512]}),
+            serde_json::json!({"window": 2048, "dtype": "torch.bfloat16", "strides": [512, 512]}),
+            serde_json::json!({"window": 2048, "dtype": "torch.float8_e4m3fn", "strides": [1024, 1024]}),
+        ] {
+            let body = put_route(serde_json::json!({
+                "draft_window_kv_layout": incompatible,
+                "spec_kv_layout": spec_layout,
+                "state_wire": state_wire,
+            }));
+            assert_eq!(request(addr, "PUT", "/route", Some(&body)).0, 400);
+        }
+        let (_, body) = request(addr, "GET", SENTINEL, None);
+        let info: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(info["draft_window_kv_layout"], layout);
     }
 
     /// System-dp topology derivation: with `system_dp_size > 1` the dp axis
