@@ -1718,6 +1718,11 @@ class Envs:
     SGLANG_OPT_SPEC_RELAY_IN_PLACE = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # Spec v2 relay without top-k extras (DFlash, DSpark): gather the next step's
+    # committed lengths and bonus tokens in one launch, beside the length resolve.
+    SGLANG_OPT_SPEC_FUSED_RELAY_GATHER = EnvBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
     # Runtime optimizations that follow SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION. Each
     # still accepts its former name (deprecated_name) until the alias is removed.
     # The fused small-field copy gives each field its own blocks and moves aligned fields in 16 B units.

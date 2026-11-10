@@ -1,18 +1,24 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional, Sequence
 
 import msgspec
 import torch
 
-from sglang.kernels.ops.speculative.gather_spec_extras import gather_spec_extras
+from sglang.kernels.ops.speculative.gather_spec_extras import (
+    gather_seq_lens_and_bonus,
+    gather_spec_extras,
+)
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     get_exec,
     get_spec,
 )
 from sglang.srt.utils import is_cuda, is_hip, is_npu
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -386,6 +392,14 @@ class FutureMap:
             tuple[torch.Tensor, RelayPayload, EagleDraftInput]
         ] = None
         self._relay: Optional[FutureRelayBuffers] = None
+        # SGLANG_OPT_SPEC_FUSED_RELAY_GATHER: (future_indices, bonus_tokens) gathered
+        # with the committed lengths, taken by the next _resolve_spec_extras.
+        self.fused_relay_gather = envs.SGLANG_OPT_SPEC_FUSED_RELAY_GATHER.get()
+        self._pregathered_bonus: Optional[tuple[torch.Tensor, torch.Tensor]] = None
+        # The last stash left its bonus rows to the forward's in-graph relay, written
+        # before publish_ready: a gather behind that event reads them.
+        self._bonus_before_publish = False
+        self._logged_fused_relay_gather = False
         if (
             _offered_relay is not None
             and _offered_relay.new_seq_lens.shape[0] == self.req_pool_size
@@ -613,7 +627,7 @@ class FutureMap:
             if self.draft_probs_buf is not None:
                 draft_input.draft_probs = self.draft_probs_buf[indices]
         else:
-            draft_input.bonus_tokens = self.output_tokens_buf[indices]
+            draft_input.bonus_tokens = self._take_bonus_tokens(indices)
         if self.need_hidden_states and not self.need_topk:
             draft_input.hidden_states = self.hidden_states_buf[indices]
         if draft_input.future_dsa_topk_indices_available:
@@ -626,12 +640,40 @@ class FutureMap:
                 draft_input.bonus_tokens, self.output_tokens_buf, indices
             )
 
+    def _take_bonus_tokens(self, indices: torch.Tensor) -> torch.Tensor:
+        pregathered, self._pregathered_bonus = self._pregathered_bonus, None
+        if pregathered is None or pregathered[0] is not indices:
+            return self.output_tokens_buf[indices]
+        bonus_tokens = pregathered[1]
+        bonus_tokens.record_stream(
+            torch.get_device_module(self.device).current_stream()
+        )
+        return bonus_tokens
+
+    def _gathers_bonus_with_seq_lens(self, batch: ScheduleBatch) -> bool:
+        """The bonus gather of _resolve_spec_extras can run with the length gather,
+        behind publish_ready: the bonus rows were relayed in the forward's graph, no
+        stash is deferred, and no other extra is read."""
+        return (
+            self.fused_relay_gather
+            and self._bonus_before_publish
+            and self.publish_ready is not None
+            and self._deferred_relay is None
+            and not self.spec_algo.is_ngram()
+            and not self.need_topk
+            and not self.need_hidden_states
+            and self.dsa_topk_indices_buf is None
+            and batch.enable_overlap
+            and batch.prefill_input_ids_cpu is None
+        )
+
     def stash_bonus_tokens(
         self, indices: torch.Tensor, bonus_tokens: torch.Tensor
     ) -> None:
         """Write only output_tokens_buf rows; for relays carrying no draft
         extras (stash() would lazy-init the spec bufs from the payload)."""
         self.flush_deferred_relay()
+        self._bonus_before_publish = False
         self.output_tokens_buf[indices] = bonus_tokens.to(self.output_tokens_buf.dtype)
 
     def resolve_mixed_spec_tails(self, batch: ScheduleBatch) -> None:
@@ -705,7 +747,20 @@ class FutureMap:
                 self.publish_ready.synchronize()
             else:
                 self.publish_ready.wait()
-        batch.seq_lens = self.new_seq_lens_buf[fi]
+        self._pregathered_bonus = None
+        if self._gathers_bonus_with_seq_lens(batch):
+            batch.seq_lens, bonus_tokens = gather_seq_lens_and_bonus(
+                fi, self.new_seq_lens_buf, self.output_tokens_buf
+            )
+            self._pregathered_bonus = (fi, bonus_tokens)
+            if not self._logged_fused_relay_gather:
+                self._logged_fused_relay_gather = True
+                logger.info(
+                    "Spec relay: committed lengths and bonus tokens gathered in one "
+                    "launch (first step)."
+                )
+        else:
+            batch.seq_lens = self.new_seq_lens_buf[fi]
 
         if not self.needs_cpu_seq_lens:
             # GPU gather above is kept (SB.seq_lens must advance each verify);
@@ -789,7 +844,10 @@ class FutureMap:
         self._maybe_init_forward_bufs(payload)
         self._maybe_init_dsa_topk_indices_buf(payload)
         relay = self._relay
-        if relay is not None and payload.bonus_tokens is relay.published_bonus:
+        self._bonus_before_publish = (
+            relay is not None and payload.bonus_tokens is relay.published_bonus
+        )
+        if self._bonus_before_publish:
             relay.published_bonus = None
         else:
             self.output_tokens_buf[indices] = payload.bonus_tokens.to(
