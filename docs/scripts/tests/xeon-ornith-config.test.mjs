@@ -13,6 +13,7 @@ return { findCell, snapToValidCell, validateSelection, isOptionAvailable, render
 
 for (const [vendor, name, model, revision] of [
   ["deepreinforce-ai", "ornith-1.0", "Ornith-1.0-9B", "83dc1f5e24ef8527af019a6b3bf66ac0f1c2c999"],
+  ["ornith-ai", "ornith-1.5", "Ornith-1.5-9B", "489cb97981b8654bcfcf30ce1f94ed1b62e07b53"],
 ]) {
   const text = readFileSync(new URL(`../../src/snippets/configs/${vendor}/${name}.jsx`, import.meta.url), "utf8");
   const { config } = await import("data:text/javascript," + encodeURIComponent(text));
