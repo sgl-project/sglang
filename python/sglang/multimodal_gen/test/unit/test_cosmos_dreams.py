@@ -1268,6 +1268,11 @@ class TestCosmosDreamsRuntime(unittest.TestCase):
 
     @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA decode stream")
     def test_overlap_and_serial_vae_inputs_match(self):
+        from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import (
+            VaeFastPathGate,
+            register_vae_fast_path_gate,
+        )
+
         class IdentityVAE(torch.nn.Module):
             def __init__(self, dtype):
                 super().__init__()
@@ -1277,11 +1282,15 @@ class TestCosmosDreamsRuntime(unittest.TestCase):
                 self.config = SimpleNamespace(
                     latents_mean=[-0.7571, -0.7089], latents_std=[2.8184, 1.4541]
                 )
+                self.gate = VaeFastPathGate()
+                register_vae_fast_path_gate(self, self.gate)
+                self.seen_gates = []
 
             def reset_causal_decode_state(self):
                 self.cached_latents = None
 
             def causal_decode(self, latents):
+                self.seen_gates.append(self.gate.enabled)
                 self.cached_latents = latents.square()
                 return latents
 
@@ -1294,16 +1303,25 @@ class TestCosmosDreamsRuntime(unittest.TestCase):
                 stage._latents_mean = stage._latents_std = None
                 expected = stage._denormalize_latents(latents)
                 with self.assertRaisesRegex(RuntimeError, "injected rollout failure"):
-                    with CausalDecodeQueue(vae, device=torch.device("cuda")) as queue:
+                    with CausalDecodeQueue(
+                        vae, device=torch.device("cuda"), quality="lossless"
+                    ) as queue:
                         queue.submit(latents[:, :, :2])
                         raise RuntimeError("injected rollout failure")
+                self.assertEqual(vae.seen_gates, [True])
+                self.assertFalse(vae.gate.enabled)
                 self.assertIsNone(vae.cached_latents)
                 self.assertTrue(queue.stream.query())
                 self.assertEqual(queue.outputs, [])
-                for _ in range(2):
-                    with CausalDecodeQueue(vae, device=torch.device("cuda")) as queue:
+                for quality, enabled in (("lossless", True), ("exact", False)):
+                    vae.seen_gates.clear()
+                    with CausalDecodeQueue(
+                        vae, device=torch.device("cuda"), quality=quality
+                    ) as queue:
                         for chunk in latents.split(2, dim=2):
                             queue.submit(chunk)
+                    self.assertEqual(vae.seen_gates, [enabled, enabled])
+                    self.assertFalse(vae.gate.enabled)
                     self.assertIsNone(vae.cached_latents)
                     torch.testing.assert_close(
                         queue.finish(), expected.cpu(), rtol=0, atol=0

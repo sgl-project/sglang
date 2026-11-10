@@ -33,6 +33,7 @@ from sglang.multimodal_gen.configs.models.dits.cosmos_dreams import (
     CosmosDreamsUnifiedActionContract,
     load_unified_normalizer,
 )
+from sglang.multimodal_gen.configs.sample.sampling_params import quality_allows
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
@@ -46,6 +47,7 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos_dreams import (
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
+from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import use_vae_fast_path
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
@@ -851,8 +853,11 @@ class CausalDecodeQueue:
     then ``finish`` concatenates the completed frames.
     """
 
-    def __init__(self, vae: Any, *, device: torch.device) -> None:
+    def __init__(
+        self, vae: Any, *, device: torch.device, quality: str = "exact"
+    ) -> None:
         self.vae = vae
+        self.fast_path = quality_allows(quality, "lossless")
         self.device = device
         self.stream = torch.cuda.Stream(device=device)
         self.outputs: list[torch.Tensor] = []
@@ -887,7 +892,11 @@ class CausalDecodeQueue:
         self.stream.wait_stream(torch.cuda.current_stream(self.device))
         latents = latents.detach()
         latents.record_stream(self.stream)
-        with torch.cuda.stream(self.stream), torch.no_grad():
+        with (
+            torch.cuda.stream(self.stream),
+            torch.no_grad(),
+            use_vae_fast_path(self.vae, self.fast_path),
+        ):
             video = self.vae.causal_decode(self._denormalize(latents))
             host = torch.empty(
                 video.shape, dtype=video.dtype, device="cpu", pin_memory=True
@@ -1402,14 +1411,16 @@ class CosmosDreamsRolloutStage(PipelineStage):
                 batch.latents = self._rollout(batch)
         return batch
 
-    def _decode_queue(self, device: torch.device) -> "CausalDecodeQueue | None":
+    def _decode_queue(
+        self, device: torch.device, *, quality: str = "exact"
+    ) -> "CausalDecodeQueue | None":
         if (
             not self.overlap_vae_decode
             or device.type != "cuda"
             or self.server_args.should_start_component_on_cpu("vae")
         ):
             return None
-        return CausalDecodeQueue(self.vae, device=device)
+        return CausalDecodeQueue(self.vae, device=device, quality=quality)
 
     def _rollout(self, batch: Req) -> torch.Tensor:
         manifest = self.manifest
@@ -1451,7 +1462,7 @@ class CosmosDreamsRolloutStage(PipelineStage):
         selector: FrustumHistorySelector | None = batch.extra[EXTRA_FRUSTUM_SELECTOR]
         history: list[KVPair] | None = None
         latents: list[torch.Tensor] = []
-        decode_queue = self._decode_queue(device)
+        decode_queue = self._decode_queue(device, quality=batch.sampling_params.quality)
         with decode_queue or nullcontext():
             next_frame = 0
             if batch.image_latent is not None:
