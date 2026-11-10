@@ -168,7 +168,6 @@ jobs:
               - "python/sglang/kernels/**/!(*.md)"
               - "python/sglang/srt/**/!(*.md)"
               - "python/sglang/{utils,distributed,test}/**/!(*.md)"
-              - "python/sglang/multimodal_gen/test/conftest.py"
               - "test/registered/kernels/ops/diffusion/**"
             jit_kernel:
               - ".github/workflows/pr-test.yml"
