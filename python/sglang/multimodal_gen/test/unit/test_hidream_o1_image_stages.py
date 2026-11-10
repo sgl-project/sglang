@@ -44,7 +44,7 @@ CPU = torch.device("cpu")
 # constant because the tests pin the UniPC contract against it.
 HIDREAM_O1_FLOW_SHIFT = 3.0
 
-noise_scale = _VARIANT_DEFAULTS["dev"]["full"]
+noise_scale = _VARIANT_DEFAULTS["full"]["noise_scale_start"]
 
 
 class TestHiDreamO1PositionIds(unittest.TestCase):

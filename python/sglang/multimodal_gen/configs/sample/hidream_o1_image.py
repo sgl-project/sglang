@@ -4,9 +4,13 @@
 One pipeline serves all three checkpoints; the recipe is resolved per served
 model path in _adjust. The Dev checkpoints are guidance-distilled and run the
 official fixed 28-step flash schedule with per-variant noise scales; the full
-checkpoint runs the reference 50-step CFG 5.0 UniPC recipe. Noise scales for
-the Dev variants are a deliberate deployment deviation from the official
-README checkpoint table.
+checkpoint runs the reference 50-step CFG 5.0 UniPC recipe, in which the
+noise keys are inert (UniPC never draws per-step noise) but stay in the dict
+because _adjust resolves every recipe field from it.
+
+Per-variant values match the official repo: dev follows the main-branch
+inference.py (noise 7.5/7.5, clip 2.5) and dev-2604 follows the dev branch
+that serves that checkpoint (noise 8.0/8.0, clip 8.0, fp32 weights).
 """
 
 from dataclasses import dataclass, field
@@ -35,15 +39,15 @@ _VARIANT_DEFAULTS = {
         "scheduler_name": "flash",
         "noise_scale_start": 8.0,
         "noise_scale_end": 8.0,
-        "noise_clip_std": 2.5,
+        "noise_clip_std": 8.0,
         "num_inference_steps": 28,
     },
     "dev": {
         "guidance_scale": 0.0,
         "shift": 1.0,
         "scheduler_name": "flash",
-        "noise_scale_start": 8.0,
-        "noise_scale_end": 8.0,
+        "noise_scale_start": 7.5,
+        "noise_scale_end": 7.5,
         "noise_clip_std": 2.5,
         "num_inference_steps": 28,
     },
@@ -53,7 +57,7 @@ _VARIANT_DEFAULTS = {
         "scheduler_name": "default",
         "noise_scale_start": 8.0,
         "noise_scale_end": 8.0,
-        "noise_clip_std": 2.5,
+        "noise_clip_std": 0.0,
         "num_inference_steps": 50,
     },
 }
