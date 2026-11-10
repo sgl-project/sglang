@@ -9,7 +9,9 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
+import ctypes
 import errno
+import fcntl
 import mmap
 import os
 import shutil
@@ -31,7 +33,8 @@ from sglang.srt.mem_cache.hicache_storage import (
 from sglang.srt.mem_cache.memory_pool_host import LogicalHostPool
 from sglang.srt.mem_cache.storage import StorageBackendFactory
 from sglang.srt.mem_cache.storage.fast_file.direct_io import (
-    probe_direct_io_alignment,
+    DIRECT_IO_ALIGNMENT,
+    probe_direct_io,
 )
 from sglang.srt.mem_cache.storage.fast_file.fast_file_store import HiCacheFastFile
 from sglang.srt.mem_cache.storage.fast_file.lru_file_evictor import (
@@ -1132,9 +1135,7 @@ class _AlignedPageFirstPool(_FakePageFirstPool):
         )
 
 
-_PROBE_PATCH = (
-    "sglang.srt.mem_cache.storage.fast_file.fast_file_store.probe_direct_io_alignment"
-)
+_PROBE_PATCH = "sglang.srt.mem_cache.storage.fast_file.fast_file_store.probe_direct_io"
 
 
 def _spy_open(flags_seen: list, *, strip_direct=False, reject_direct=False):
@@ -1162,7 +1163,7 @@ class TestODirect(FastFileTestBase):
         default_backend = self.make_backend()
         self.assertEqual(default_backend._o_direct_alignment, 0)
         with (
-            mock.patch(_PROBE_PATCH, return_value=0),
+            mock.patch(_PROBE_PATCH, return_value=False),
             self.assertLogs(STORE_LOGGER, level="WARNING"),
         ):
             probe_failed_backend = self.make_backend(o_direct=True)
@@ -1178,9 +1179,9 @@ class TestODirect(FastFileTestBase):
             self.assertFalse(any(f & os.O_DIRECT for f in flags))
 
     def test_aligned_pool_pages_open_with_the_flag(self):
-        with mock.patch(_PROBE_PATCH, return_value=512):
+        with mock.patch(_PROBE_PATCH, return_value=True):
             b = self.make_backend(o_direct=True)
-        self.assertEqual(b._o_direct_alignment, 512)
+        self.assertEqual(b._o_direct_alignment, DIRECT_IO_ALIGNMENT)
         pool = _AlignedPageFirstPool()
         b.register_mem_pool_host(pool)
         self.assertTrue(b._pool_o_direct[PoolName.KV])
@@ -1199,13 +1200,13 @@ class TestODirect(FastFileTestBase):
         self.assertTrue(all(f & os.O_DIRECT for f in flags))
         self.assertTrue(torch.equal(pool.kv_buffer, expected))
 
-    def test_unaligned_page_segments_keep_buffered_io(self):
-        """A 2000-byte segment is not a multiple of the 512-byte alignment, so
-        that pool must not qualify even though its buffer base is page-aligned."""
-        with mock.patch(_PROBE_PATCH, return_value=512):
+    def test_segments_aligned_below_4_kib_keep_buffered_io(self):
+        """Segments that are 2 KiB-aligned but not 4 KiB-aligned (MLA at page size
+        16) must stay buffered: btrfs serves such requests through the page cache."""
+        with mock.patch(_PROBE_PATCH, return_value=True):
             b = self.make_backend(o_direct=True)
         b.register_mem_pool_host(_AlignedPageFirstPool())
-        side_pool = _AlignedPageFirstPool(size_per_token=1000)
+        side_pool = _AlignedPageFirstPool(size_per_token=1024)
         b.register_mem_host_pool_v2(side_pool, PoolName.SWA)
         self.assertTrue(b._pool_o_direct[PoolName.KV])
         self.assertFalse(b._pool_o_direct[PoolName.SWA])
@@ -1225,7 +1226,7 @@ class TestODirect(FastFileTestBase):
     def test_einval_falls_back_to_buffered_and_disables_the_pool(self):
         """A kernel that rejects O_DIRECT at open must cost one retry per pool,
         not a failed page: the write lands buffered and the pool stays buffered."""
-        with mock.patch(_PROBE_PATCH, return_value=512):
+        with mock.patch(_PROBE_PATCH, return_value=True):
             b = self.make_backend(o_direct=True)
         pool = _AlignedPageFirstPool()
         b.register_mem_pool_host(pool)
@@ -1262,14 +1263,13 @@ class TestODirect(FastFileTestBase):
         """A page published in either mode must read back through the other:
         O_DIRECT changes how the bytes move, not the file format, so a
         namespace can be shared by processes with and without the knob."""
-        alignment = probe_direct_io_alignment(self.tmpdir)
-        if alignment == 0:
+        if not probe_direct_io(self.tmpdir):
             self.skipTest("the test filesystem rejects O_DIRECT")
         direct = self.make_backend(o_direct=True, subdir="shared")
         buffered = self.make_backend(subdir="shared")
         self.assertEqual(direct.file_path, buffered.file_path)
-        direct_pool = _AlignedPageFirstPool(size_per_token=max(alignment, 4096))
-        buffered_pool = _AlignedPageFirstPool(size_per_token=max(alignment, 4096))
+        direct_pool = _AlignedPageFirstPool()
+        buffered_pool = _AlignedPageFirstPool()
         direct.register_mem_pool_host(direct_pool)
         buffered.register_mem_pool_host(buffered_pool)
         self.assertTrue(direct._pool_o_direct[PoolName.KV])
@@ -1292,16 +1292,15 @@ class TestODirect(FastFileTestBase):
         """Probe files must not accumulate in the namespace directory."""
         directory = os.path.join(self.tmpdir, "probe")
         os.makedirs(directory)
-        probe_direct_io_alignment(directory)
+        probe_direct_io(directory)
         self.assertEqual(os.listdir(directory), [])
 
     def test_real_o_direct_roundtrip_when_the_filesystem_allows_it(self):
-        alignment = probe_direct_io_alignment(self.tmpdir)
-        if alignment == 0:
+        if not probe_direct_io(self.tmpdir):
             self.skipTest("the test filesystem rejects O_DIRECT")
         b = self.make_backend(o_direct=True)
-        self.assertEqual(b._o_direct_alignment, alignment)
-        pool = _AlignedPageFirstPool(size_per_token=max(alignment, 4096))
+        self.assertEqual(b._o_direct_alignment, DIRECT_IO_ALIGNMENT)
+        pool = _AlignedPageFirstPool()
         b.register_mem_pool_host(pool)
         self.assertTrue(b._pool_o_direct[PoolName.KV])
 
@@ -1330,46 +1329,68 @@ class TestDirectIOProbe(CustomTestCase):
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     def test_filesystem_rejecting_the_flag_disables_direct_io(self):
-        """tmpfs before Linux 6.6 fails every O_DIRECT open with EINVAL; the probe
-        must report 0 and leave no file behind."""
-        real_open = os.open
+        """A filesystem without direct I/O (ramfs, tmpfs before 6.6) rejects the flag
+        only once the file exists; the probe must report False and leave no file."""
+        real_fcntl = fcntl.fcntl
 
-        def reject_direct(path, flags, *args, **kwargs):
-            if flags & os.O_DIRECT:
+        def reject_direct(fd, cmd, arg=0):
+            if cmd == fcntl.F_SETFL and arg & os.O_DIRECT:
                 raise OSError(errno.EINVAL, "Invalid argument")
-            return real_open(path, flags, *args, **kwargs)
+            return real_fcntl(fd, cmd, arg)
 
-        with mock.patch("os.open", side_effect=reject_direct):
-            self.assertEqual(probe_direct_io_alignment(self.tmpdir), 0)
+        with mock.patch("fcntl.fcntl", side_effect=reject_direct):
+            self.assertFalse(probe_direct_io(self.tmpdir))
         self.assertEqual(os.listdir(self.tmpdir), [])
 
     def test_write_failure_after_a_successful_open_disables_direct_io(self):
-        """Accepting the flag at open is not enough: a filesystem that fails the
-        direct write itself must leave the mode off."""
+        """Accepting the flag is not enough: a filesystem that fails the direct
+        write itself must leave the mode off."""
         with mock.patch(
             "os.pwrite", side_effect=OSError(errno.EINVAL, "Invalid argument")
         ):
-            self.assertEqual(probe_direct_io_alignment(self.tmpdir), 0)
+            self.assertFalse(probe_direct_io(self.tmpdir))
         self.assertEqual(os.listdir(self.tmpdir), [])
 
-    def test_probe_reports_the_smallest_granularity_the_kernel_accepts(self):
-        """The first granularity a direct read accepts is the alignment, and a
-        device that only takes whole 4 KiB blocks ends at 4096."""
-        if probe_direct_io_alignment(self.tmpdir) == 0:
+    def test_probe_reads_back_into_page_aligned_memory(self):
+        """Block queues with a 512-byte DMA alignment (virtio-blk) reject O_DIRECT
+        reads into the unaligned memory os.pread allocates; the read-back must go
+        through preadv into page-aligned buffers or the probe fails on such VMs."""
+        if not probe_direct_io(self.tmpdir):
             self.skipTest("the test filesystem rejects O_DIRECT")
         real_preadv = os.preadv
+        offsets_in_page = []
 
-        def reject_below(limit):
-            def fake_preadv(fd, buffers, offset):
-                if sum(len(b) for b in buffers) < limit:
-                    raise OSError(errno.EINVAL, "Invalid argument")
-                return real_preadv(fd, buffers, offset)
+        def spy(fd, buffers, offset):
+            for buffer in buffers:
+                address = ctypes.addressof(ctypes.c_char.from_buffer(buffer))
+                offsets_in_page.append(address % DIRECT_IO_ALIGNMENT)
+            return real_preadv(fd, buffers, offset)
 
-            return fake_preadv
+        with (
+            mock.patch("os.pread", side_effect=AssertionError("unaligned read-back")),
+            mock.patch("os.preadv", side_effect=spy),
+        ):
+            self.assertTrue(probe_direct_io(self.tmpdir))
+        self.assertEqual(offsets_in_page, [0])
 
-        for limit, expected in ((2048, 2048), (4096, 4096)):
-            with mock.patch("os.preadv", side_effect=reject_below(limit)):
-                self.assertEqual(probe_direct_io_alignment(self.tmpdir), expected)
+    def test_probe_falls_back_to_a_named_file_without_o_tmpfile(self):
+        """A filesystem without O_TMPFILE (EOPNOTSUPP) is probed through a named file
+        that is unlinked at once, with the same result and nothing left behind."""
+        real_open = os.open
+        named_opens = []
+
+        def no_tmpfile(path, flags, *args, **kwargs):
+            if flags & os.O_TMPFILE == os.O_TMPFILE:
+                raise OSError(errno.EOPNOTSUPP, "Operation not supported")
+            named_opens.append(path)
+            return real_open(path, flags, *args, **kwargs)
+
+        with mock.patch("os.open", side_effect=no_tmpfile):
+            fallback = probe_direct_io(self.tmpdir)
+        self.assertEqual(fallback, probe_direct_io(self.tmpdir))
+        self.assertTrue(named_opens)
+        self.assertTrue(all(p.startswith(self.tmpdir) for p in named_opens))
+        self.assertEqual(os.listdir(self.tmpdir), [])
 
 
 if __name__ == "__main__":

@@ -257,7 +257,7 @@ def main() -> None:
     alignment = max(r["alignment"] for r in rows)
     print(
         f"preset={args.preset} page={args.page_size} tokens = {page_mib:.2f} MiB, "
-        f"{args.pages} pages, median of {args.repeat} runs; probed alignment={alignment}"
+        f"{args.pages} pages, median of {args.repeat} runs; o_direct alignment={alignment}"
     )
     print(
         "write GB/s is what the kernel accepted (buffered) or what landed on the "

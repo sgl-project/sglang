@@ -38,9 +38,9 @@ Extra-config keys (``--hicache-storage-backend-extra-config``):
   stale_temp_age_s       age before abandoned temp files are removed at
                          startup, 0 = keep them (3600)
   o_direct               open page files with O_DIRECT for pools whose page
-                         segments meet the filesystem's direct-I/O alignment;
-                         other pools, the staged path and filesystems that
-                         reject the flag use buffered I/O (default false)
+                         segments are 4 KiB-aligned; other pools, the staged
+                         path and filesystems that fail the probe use
+                         buffered I/O (default false)
 
 Locking, eviction accounting and the metadata cache are process-local. Write
 completion means close plus rename rather than ``fsync``; ``o_direct`` moves
@@ -74,8 +74,9 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
 )
 from sglang.srt.mem_cache.storage.fast_file.direct_io import (
+    DIRECT_IO_ALIGNMENT,
     O_DIRECT,
-    probe_direct_io_alignment,
+    probe_direct_io,
 )
 from sglang.srt.mem_cache.storage.fast_file.lru_file_evictor import (
     LRUFileEvictor,
@@ -137,9 +138,11 @@ class HiCacheFastFile(HiCacheFile):
                 f"HiCacheFastFile read_workers must be at least 1, got {self.read_workers}."
             )
         self.o_direct = bool(setting(extra_config, "o_direct", False))
-        # 0 disables O_DIRECT: the knob is off, or the filesystem rejected the probe.
+        # 0 disables O_DIRECT: the knob is off, or the filesystem failed the probe.
         self._o_direct_alignment = (
-            probe_direct_io_alignment(self.file_path) if self.o_direct else 0
+            DIRECT_IO_ALIGNMENT
+            if self.o_direct and probe_direct_io(self.file_path)
+            else 0
         )
         if self.o_direct and not self._o_direct_alignment:
             logger.warning(
