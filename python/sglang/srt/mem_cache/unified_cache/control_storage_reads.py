@@ -21,7 +21,7 @@ from sglang.srt.managers.kv_control.contracts import (
     TargetOutcome,
     TokenRange,
 )
-from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
+from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle, DecLockRefParams
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 
 FULL = ComponentType.FULL
@@ -66,6 +66,12 @@ class _Demand:
 
 
 @dataclass
+class _AdmissionHold:
+    receipt: DecLockRefParams
+    users: int = 0
+
+
+@dataclass
 class _Interest:
     work: object
     job: _Read
@@ -87,7 +93,8 @@ class StorageCacheReads:
         self.interests: dict[str, _Interest] = {}
         self.demands: dict[CacheRequestHandle, _Demand] = {}
         self._joinable: dict[tuple, _Read] = {}
-        self._admission_holds = {}
+        self._admission_holds: dict[CacheRequestHandle, tuple[int, int]] = {}
+        self._admission_scopes: dict[tuple[int, int], _AdmissionHold] = {}
         self._admission_tokens = 0
         self._host_reclaim_retry_at = 0.0
         self.stats = dict(
@@ -156,24 +163,35 @@ class StorageCacheReads:
         ):
             return
         old = self._admission_holds.get(request)
-        previous_end = old[2] if old is not None else 0
+        previous_end = old[1] if old is not None else 0
         if end_token <= previous_end:
             return
+        scope = (node_id, end_token)
+        hold = self._admission_scopes.get(scope)
+        released = previous_end if old and self._admission_scopes[old].users == 1 else 0
         # Cache mode limits in-flight prefetch to half the pool. Leave
         # another quarter available for ordinary write-through and eviction.
         budget = self.cache.cache_controller.prefetch_capacity_limit // 2
-        if self._admission_tokens - previous_end + end_token > budget:
-            return
-        receipt = self.cache.inc_host_lock_ref(node_id).to_dec_params()
+        if hold is None:
+            if self._admission_tokens - released + end_token > budget:
+                return
+            hold = _AdmissionHold(self.cache.inc_host_lock_ref(node_id).to_dec_params())
+            self._admission_scopes[scope] = hold
+            self._admission_tokens += end_token
         self.release_admission(request)
-        self._admission_holds[request] = node_id, receipt, end_token
-        self._admission_tokens += end_token
+        hold.users += 1
+        self._admission_holds[request] = scope
 
     def release_admission(self, request):
-        hold = self._admission_holds.pop(request, None)
-        if hold is not None:
-            node_id, receipt, end_token = hold
-            self.cache.dec_host_lock_ref(node_id, receipt)
+        scope = self._admission_holds.pop(request, None)
+        if scope is None:
+            return
+        hold = self._admission_scopes[scope]
+        hold.users -= 1
+        if not hold.users:
+            node_id, end_token = scope
+            self.cache.dec_host_lock_ref(node_id, hold.receipt)
+            del self._admission_scopes[scope]
             self._admission_tokens -= end_token
 
     def clear_admission_holds(self):

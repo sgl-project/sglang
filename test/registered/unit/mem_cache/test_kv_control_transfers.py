@@ -963,6 +963,43 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                 assert_retired(cache, service)
                 cache.sanity_check()
 
+    def test_admission_budget_counts_shared_host_prefix_once(self):
+        from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
+
+        with hicache(self, namespace_keys=True, write_policy="write_through") as owner:
+            _, cache, service, dma = owner
+            shared = seed(cache)
+            other = seed(cache, tokens=(5, 6, 7, 8), salt="other")
+            for node in (shared, other):
+                persist_prefix(cache, service, dma, node)
+            reads = service.control.executor.storage_reads
+            first, second, independent = [
+                CacheRequestHandle(name, 0) for name in ("one", "two", "independent")
+            ]
+            try:
+                with patch.object(
+                    cache.cache_controller, "prefetch_capacity_limit", 16
+                ):
+                    reads.hold_for_admission(first, shared.id, 4)
+                    reads.hold_for_admission(second, shared.id, 4)
+                    self.assertEqual(reads.snapshot()["admission_held_tokens"], 4)
+                    reads.hold_for_admission(independent, other.id, 4)
+                    self.assertEqual(reads.snapshot()["admission_held_tokens"], 8)
+                    self.assertEqual(cache.evict_host(8), 0)
+
+                    cache.finish_storage_prefetch_admission(first, 4, None)
+                    self.assertEqual(cache.evict_host(8), 0)
+                    cache.release_aborted_request(second)
+                    self.assertEqual(cache.evict_host(8), 4)
+                    cache.finish_storage_prefetch_admission(independent, 4, None)
+                    self.assertEqual(cache.evict_host(8), 4)
+                    self.assertEqual(reads.snapshot()["admission_held_tokens"], 0)
+            finally:
+                for request in (first, second, independent):
+                    cache.release_aborted_request(request)
+            assert_retired(cache, service)
+            cache.sanity_check()
+
     def test_ordinary_read_does_not_wait_for_a_speculative_slot(self):
         from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 
