@@ -83,7 +83,7 @@ DEEPSEEK_V4_FLASH_W8A8_4P_OTHER_ARGS = [
     "--max-running-requests",
     192,
     "--dp-size",
-    2,
+    4,
     "--enable-dp-attention",
     "--moe-a2a-backend",
     "deepep",
