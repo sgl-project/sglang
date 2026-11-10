@@ -181,9 +181,7 @@ if _is_hip:
     from sglang.srt.models.minimax_common.amd import minimax_m3_hip as _hip
 
 if _is_npu:
-    from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope_pos_cache_half_npu import (
-        split_qkv_rmsnorm_rope_pos_cache_half_npu,
-    )
+    from sgl_kernel_npu.operators.norm import split_qkv_rmsnorm_rope_pos_cache_half_npu
 
     from sglang.srt.hardware_backend.npu.utils import (
         process_shared_expert,
