@@ -465,6 +465,39 @@ async fn lifecycle_prefetch_reports_readiness_without_overriding_worker_selectio
 }
 
 #[tokio::test]
+async fn external_prefetch_submits_without_waiting_for_a_poll_tick() {
+    let engine = Engine::start().await;
+    let router = router_with(
+        &[&engine],
+        false,
+        Some(OrchestrationConfig {
+            poll_ms: 30_000,
+            ..orchestration()
+        }),
+    )
+    .await;
+    start(&router, "first").await;
+    start(&router, "second").await;
+    let first = Arc::new(DelayedQuery::default());
+    engine.state.lock().unwrap().delayed_submit = Some(first.clone());
+    submit(&router, "first", "prepare", prefix(vec![1, 2, 3]), &engine).await;
+    tokio::time::timeout(Duration::from_secs(2), first.started.notified())
+        .await
+        .expect("external hint must submit before the first periodic tick");
+
+    let second = Arc::new(DelayedQuery::default());
+    engine.state.lock().unwrap().delayed_submit = Some(second.clone());
+    submit(&router, "second", "prepare", prefix(vec![4, 5, 6]), &engine).await;
+    assert_eq!(engine.state.lock().unwrap().operations.len(), 1);
+    first.release.notify_one();
+    tokio::time::timeout(Duration::from_secs(2), second.started.notified())
+        .await
+        .expect("completion of the first RPC must unblock the queued hint");
+    second.release.notify_one();
+    assert_eq!(engine.state.lock().unwrap().operations.len(), 2);
+}
+
+#[tokio::test]
 async fn slow_worker_control_does_not_delay_another_worker_or_inference() {
     for reorg in [false, true] {
         let slow = Engine::start().await;

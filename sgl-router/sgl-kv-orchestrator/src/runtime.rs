@@ -321,6 +321,10 @@ struct Job {
     polls: u64,
 }
 impl Job {
+    fn needs_first_prefetch(&self) -> bool {
+        self.action == "sglang.prefetch" && !self.attempted && !self.submitted && !self.quiescent
+    }
+
     fn has_final_demote_receipt(&self) -> bool {
         // A DEMOTE receipt records what happened, not current residency.
         // A queued operation can also be physically quiescent.
@@ -430,8 +434,10 @@ impl Actor {
                     None => break,
                 },
                 Some(poll) = self.polls.next(), if !self.polls.is_empty() => {
+                    let worker = poll.url.clone();
                     self.complete_poll(poll);
                     self.resume_pending();
+                    self.submit_next_prefetch(&worker);
                 }
                 _ = tick.tick() => self.pump(),
             }
@@ -631,12 +637,8 @@ impl Actor {
             "source":{"tier":"storage"}, "destination":{"tier":"host"}, "allow_partial":true,
             "target":{"kind":"request","request_id":request.request_id,"request_incarnation":request.incarnation},
         });
-        if let Err(reason) = self.submit(command, task, demand.clone(), Some(prefetch_end)) {
+        if let Err(reason) = self.submit(command, task, demand, Some(prefetch_end)) {
             tracing::debug!(%reason, "request prefetch unavailable");
-        } else if let Some(intent) = self.intents.get(&demand) {
-            for id in intent.jobs.clone() {
-                self.request_poll(&id);
-            }
         }
     }
     fn launch_poll(&mut self, url: &str, job: Option<Job>) {
@@ -723,6 +725,20 @@ impl Actor {
         let job = job.clone();
         let url = job.url.clone();
         self.launch_poll(&url, Some(job));
+    }
+    fn submit_next_prefetch(&mut self, worker: &str) {
+        if self.busy.contains_key(worker) {
+            return;
+        }
+        let next = self
+            .jobs
+            .values()
+            .filter(|job| job.url == worker && job.needs_first_prefetch())
+            .min_by_key(|job| job.deadline)
+            .map(|job| job.id.clone());
+        if let Some(id) = next {
+            self.request_poll(&id);
+        }
     }
     fn complete_poll(&mut self, poll: WorkerPoll) {
         self.busy.remove(&poll.url);
@@ -1445,7 +1461,11 @@ impl Actor {
                 .track_resource(&task, ResourceKind::Claim, id)
                 .map_err(|e| format!("{e:?}"))?;
         }
+        let mut prefetch_workers = BTreeSet::new();
         for (id, job) in planned {
+            if job.needs_first_prefetch() {
+                prefetch_workers.insert(job.url.clone());
+            }
             self.jobs_by_spec.insert(job.spec.clone(), id.clone());
             self.jobs.insert(id, job);
         }
@@ -1463,6 +1483,9 @@ impl Actor {
                 request_triggered: request_prefix_len.is_some(),
             },
         );
+        for url in prefetch_workers {
+            self.submit_next_prefetch(&url);
+        }
         Ok(if request_prefix_len.is_some() {
             Value::Null
         } else {
@@ -1585,7 +1608,7 @@ impl WorkerPoll {
             job.quiescent = true;
             return Ok(());
         }
-        if request_only && !job.attempted && !job.submitted {
+        if job.needs_first_prefetch() {
             if Instant::now() >= job.deadline {
                 job.quiescent = true;
                 return Err("expired before submission".into());
