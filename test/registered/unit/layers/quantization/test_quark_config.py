@@ -661,6 +661,83 @@ class TestQuarkMxfp4MoEPaddedTpLoading(CustomTestCase):
         self.assertIs(out, weight)
 
 
+class TestQuarkMxfp4MoEFlydslPadding(CustomTestCase):
+    """AITER's FlyDSL W4A4 MoE takes multiples of 128 intermediate columns: a
+    320-column shard pads to 384, not to the generic 512."""
+
+    def _create_weights(
+        self,
+        runner=None,
+        monokernel=False,
+        aiter_guard=True,
+        env=None,
+        serialized=True,
+        gfx95=True,
+        flydsl=True,
+    ):
+        scheme = object.__new__(QuarkW4A4MXFp4MoE)
+        scheme.dequantization_config = None
+        scheme.quantize_shared_expert_online = False
+        scheme.is_checkpoint_mxfp4_serialized = serialized
+        layer = torch.nn.Module()
+        layer.moe_runner_config = MoeRunnerConfig(**(runner or {}))
+        layer.use_presharded_weights = False
+        layer.moe_tp_size = 2
+        kernel = SimpleNamespace(enable_amd_monokernel=monokernel)
+        with (
+            patch.dict(os.environ, env or {}),
+            patch.object(quark_moe, "_use_aiter", True),
+            patch.object(quark_moe, "_is_gfx95", gfx95),
+            patch.object(quark_moe, "_aiter_k3_opt", False),
+            patch.object(quark_moe, "_use_triton_w4a16", False),
+            patch.object(
+                quark_moe, "get_exec", return_value=SimpleNamespace(kernel=kernel)
+            ),
+            patch.object(quark_moe, "_aiter_has_flydsl", return_value=flydsl),
+            patch.object(
+                quark_moe,
+                "_aiter_refuses_unaligned_cktile_mxfp4",
+                return_value=aiter_guard,
+            ),
+        ):
+            scheme.create_weights(
+                layer,
+                num_experts=2,
+                hidden_size=64,
+                intermediate_size_per_partition=320,
+                params_dtype=torch.bfloat16,
+            )
+        return layer
+
+    def test_flydsl_pads_to_a_multiple_of_128_columns(self):
+        layer = self._create_weights()
+
+        self.assertEqual(layer.intermediate_pad, 64)
+        self.assertEqual(tuple(layer.w13_weight.shape), (2, 768, 32))
+        self.assertEqual(tuple(layer.w2_weight.shape), (2, 64, 192))
+        self.assertEqual(tuple(layer.w2_weight_scale.shape), (2, 64, 12))
+
+    def test_other_paths_keep_the_generic_alignment(self):
+        cases = {
+            "amd_monokernel": {"monokernel": True},
+            "situ": {"runner": {"activation": "situ"}},
+            "swiglu_limit": {"runner": {"swiglu_limit": 10.0}},
+            "swiglu_oai_clamp": {
+                "runner": {"gemm1_alpha": 1.702, "gemm1_clamp_limit": 7.0}
+            },
+            "flydsl_not_forced": {"env": {"AITER_FLYDSL_FORCE": "0"}},
+            "flydsl_not_importable": {"flydsl": False},
+            "aiter_without_the_cktile_guard": {"aiter_guard": False},
+            "not_gfx95": {"gfx95": False},
+            "online_quantization": {"serialized": False},
+        }
+        for case, kwargs in cases.items():
+            with self.subTest(case=case):
+                layer = self._create_weights(**kwargs)
+                self.assertEqual(layer.intermediate_pad, 192)
+                self.assertEqual(tuple(layer.w2_weight_scale.shape), (2, 64, 16))
+
+
 _MXFP4_MOE_SPEC = {
     "weight": {
         "dtype": "fp4",
