@@ -318,7 +318,7 @@ class ExecKernel(msgspec.Struct):
         Optional[str],
         Arg(
             help="DSA (DeepSeek Sparse Attention) prefill backend. If not specified, auto-detects based on hardware and kv_cache_dtype. "
-            "'prims_ts': FlashInfer Prims-TS sparse MLA (SM100/SM103, fp8_e4m3 KV).",
+            "'prims_ts': FlashInfer Prims-TS sparse MLA (SM100/SM103/SM107, fp8_e4m3 KV).",
             choices=[
                 "flashmla_sparse",
                 "flashmla_sparse_q8",
@@ -383,7 +383,7 @@ class ExecKernel(msgspec.Struct):
         Optional[str],
         Arg(
             help="DSA (DeepSeek Sparse Attention) decode backend. If not specified, auto-detects based on hardware and kv_cache_dtype. "
-            "'prims_ts': FlashInfer Prims-TS sparse MLA (SM100/SM103, fp8_e4m3 KV).",
+            "'prims_ts': FlashInfer Prims-TS sparse MLA (SM100/SM103/SM107, fp8_e4m3 KV).",
             choices=[
                 "flashmla_sparse",
                 "flashmla_sparse_q8",
