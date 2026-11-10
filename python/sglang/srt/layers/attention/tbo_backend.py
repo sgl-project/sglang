@@ -32,6 +32,7 @@ class TboAttnBackend(AttentionBackend):
         self.extend_dummy_seqs_capped_by_req_pool = getattr(
             primary, "extend_dummy_seqs_capped_by_req_pool", False
         )
+        self.can_replan_padded_batch = getattr(primary, "can_replan_padded_batch", True)
 
     @property
     def supports_prefill_cuda_graph_max_context_size(self) -> bool:
