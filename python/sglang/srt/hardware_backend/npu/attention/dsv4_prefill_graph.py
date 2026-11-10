@@ -91,7 +91,7 @@ def _copy_table(dst: torch.Tensor, src: torch.Tensor, name: str) -> None:
 class Dsv4PrefillGraphMetadata:
     """Stable, capacity-sized metadata read by one captured prefill bucket."""
 
-    metadata: "ForwardMetadata"
+    metadata: ForwardMetadata
 
     def __init__(self) -> None:
         self.metadata = None
@@ -109,9 +109,9 @@ class Dsv4PrefillGraphMetadata:
         cls,
         *,
         backend,
-        seed: "ForwardMetadata",
+        seed: ForwardMetadata,
         num_tokens: int,
-    ) -> "Dsv4PrefillGraphMetadata":
+    ) -> Dsv4PrefillGraphMetadata:
         state = cls()
         state.metadata = seed
         state.num_tokens = num_tokens
@@ -183,8 +183,8 @@ class Dsv4PrefillGraphMetadata:
         self,
         *,
         backend,
-        live: "ForwardMetadata",
-        forward_batch: "ForwardBatch",
+        live: ForwardMetadata,
+        forward_batch: ForwardBatch,
     ) -> None:
         self.fill(backend=backend, live=live, forward_batch=forward_batch)
 
@@ -204,8 +204,8 @@ class Dsv4PrefillGraphMetadata:
         self,
         *,
         backend,
-        live: "ForwardMetadata",
-        forward_batch: Optional["ForwardBatch"],
+        live: ForwardMetadata,
+        forward_batch: Optional[ForwardBatch],
     ) -> None:
         capture = forward_batch is None
         real_tokens = None
@@ -270,7 +270,7 @@ class Dsv4PrefillGraphMetadata:
         )
         self._copy_kernel_metadata(rebuilt)
 
-    def _refresh_state_tables(self, backend, forward_batch: "ForwardBatch") -> None:
+    def _refresh_state_tables(self, backend, forward_batch: ForwardBatch) -> None:
         batch_size = forward_batch.batch_size
         if batch_size > self.max_reqs:
             raise RuntimeError(
@@ -310,7 +310,7 @@ class Dsv4PrefillGraphMetadata:
             if src.numel() < dst.numel():
                 dst[src.numel() :].zero_()
 
-    def _bind(self, metadata: "ForwardMetadata") -> None:
+    def _bind(self, metadata: ForwardMetadata) -> None:
         metadata.actual_seq_lengths_q = self.actual_q
         metadata.actual_seq_lengths_q_pa = self.actual_q_pa
         metadata.actual_seq_lengths_kv = self.actual_kv
