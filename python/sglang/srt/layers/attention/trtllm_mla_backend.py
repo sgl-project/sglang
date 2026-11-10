@@ -211,9 +211,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     # [bs, draft_token_num] layout in forward_extend; metadata stays uniform.
     supports_ragged_verify_graph: bool = True
 
-    # Sliding-window layers of a DFlash MLA draft run the verify window through
-    # trtllm-gen sparse MLA (_forward_sliding_window).
-    supports_dflash_sliding_window: bool = True
     # Log base of the LSE the DCP merge expects from this backend's partials
     # (is_mla_dcp_lse_base_on_e): trtllm-gen returns base 2.
     dcp_lse_base_on_e: bool = False
