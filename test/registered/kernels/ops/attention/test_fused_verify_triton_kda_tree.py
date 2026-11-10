@@ -352,9 +352,7 @@ def test_factorized_tree_raw_factor_commit_matches_serial_selected_state(
         atol=1e-5,
     )
 
-    # First continue from the committed prefix, then reuse the same state and
-    # scratch slots for another request with a different prefix. Stale sibling
-    # data and the previous request's factors must not participate in either.
+    # Stale siblings and the previous request's factors must not leak into reused slots.
     for reset_prefix in (False, True):
         state.copy_(committed_state[0])
         if reset_prefix:
@@ -642,9 +640,7 @@ def test_factorized_tree_cuda_graph_replay_reads_new_inputs(width):
 
     ref_query_factors = torch.empty_like(graph_query_factors)
     ref_value_factors = torch.empty_like(graph_value_factors)
-    # Replace proposal tensors as well as changing recurrent inputs. Refresh via
-    # both public paths: replay preparation and the post-draft plan-stream fixup.
-    # Eager uses the live proposal, so stale captured topology cannot pass.
+    # Eager reads the live proposal, so a replay of stale captured topology fails.
     for fanout in (3, 4):
         new_parents = [-1] + [(i - 1) // fanout for i in range(1, width)]
         new_depths = [0] * width
