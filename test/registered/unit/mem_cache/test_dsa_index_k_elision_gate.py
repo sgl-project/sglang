@@ -10,7 +10,9 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+from sglang.srt.managers import hisparse_coordinator
 from sglang.srt.mem_cache import kv_cache_configurator as kvcc
+from sglang.srt.mem_cache.index_key_cache import IndexKeyCache
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -92,6 +94,68 @@ class TestDSAIndexKElisionGate(CustomTestCase):
         self.assertTrue(self._elide(disagg="decode", hisparse=True))
         self.assertFalse(self._elide(disagg="prefill", hisparse=True))
         self.assertFalse(self._elide(disagg="null", hisparse=True))
+
+
+class TestDSAIndexKElisionVisibility(CustomTestCase):
+    def test_shared_layer_access_raises(self):
+        # A caller on a skip-topk layer must not read or write the 0-row buffer.
+        cache = IndexKeyCache.__new__(IndexKeyCache)
+        cache.pool = SimpleNamespace(skip_topk_layers=[False, True], start_layer=2)
+        cache._check_has_index_k(2)
+        with self.assertRaisesRegex(RuntimeError, "Layer 3 is a skip-topk layer"):
+            cache.get_k_and_scale(3, None, None, 0, 0)
+        with self.assertRaisesRegex(RuntimeError, "Layer 3 is a skip-topk layer"):
+            cache.store_quantized(3, None, None, None)
+
+    def test_startup_log_reports_saving_and_host_pool(self):
+        # GLM-5.2 at host_to_device_ratio=10: 656 B latent and 132 B index-K
+        # per layer, 21 of 78 layers keep an indexer. The per-row cost drops
+        # from 154,128 to 78,888 B, so the budget behind 338,752 rows held
+        # ~173,376 rows (page-floored) before elision.
+        device_pool = SimpleNamespace(
+            skip_topk_layers=[i >= 21 for i in range(78)],
+            index_bytes_per_token=132,
+            index_kpool=1,
+            size=338_752,
+            index_buf_size=3_387_520,
+            bytes_per_token=656,
+            page_size=64,
+            host_capacity_tokens=None,
+        )
+        with self.assertLogs(hisparse_coordinator.logger, level="INFO") as logs:
+            hisparse_coordinator._log_index_k_elision(device_pool, 10)
+        message = logs.output[0]
+        self.assertIn("57 of 78 layers", message)
+        self.assertIn("saving 7524 B per logical slot x 3387520 slots", message)
+        self.assertIn("from ~173376 to 338752 tokens", message)
+        # 3,387,584 host tokens (one padding page) x 51,168 B, as allocated.
+        self.assertIn("from ~88.71 GB to 173.34 GB", message)
+        self.assertIn(
+            "--max-total-tokens N (device KV tokens; the host pool needs "
+            "N x 511680 B, so N <= host_bytes / 511680)",
+            message,
+        )
+        self.assertIn("SGLANG_DISABLE_DSA_INDEXK_ELISION=1", message)
+
+    def test_startup_log_survives_all_shared_layers(self):
+        # The saving must not depend on a live buffer, so an all-shared pool
+        # still reports the bytes it would otherwise hold.
+        device_pool = SimpleNamespace(
+            skip_topk_layers=[True] * 8,
+            index_bytes_per_token=132,
+            index_kpool=1,
+            size=1_000_000,
+            index_buf_size=10_000_000,
+            bytes_per_token=656,
+            page_size=64,
+            host_capacity_tokens=None,
+        )
+        with self.assertLogs(hisparse_coordinator.logger, level="INFO") as logs:
+            hisparse_coordinator._log_index_k_elision(device_pool, 10)
+        self.assertIn(
+            "saving 1056 B per logical slot x 10000000 slots = 10.56 GB",
+            logs.output[0],
+        )
 
 
 if __name__ == "__main__":

@@ -120,6 +120,7 @@ from sglang.srt.disaggregation.utils import (
 from sglang.srt.distributed import bootstrap
 from sglang.srt.distributed.parallel_state import (
     abort_distributed_environment,
+    close_custom_all_reduce,
 )
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs
@@ -6844,5 +6845,6 @@ def run_scheduler_process(
             # and the synchronize() in destroy() could itself hang.
             if scheduler.gracefully_exit:
                 scheduler.release_host_resources()
+                close_custom_all_reduce()
                 # Last: anything above may still need a working communicator.
                 abort_distributed_environment()

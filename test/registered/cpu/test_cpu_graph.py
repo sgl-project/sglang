@@ -1063,6 +1063,127 @@ class TestCPUGraph(CustomTestCase):
         runner._prefill_uses_eager_logits_tail = False
         self.assertFalse(runner._can_run_prefill_graph(forward_batch))
 
+    def test_dynamic_prefill_multi_request_preserves_return_logprob(self):
+        runner = _make_cpu_graph_runner()
+        runner._prefill_uses_eager_logits_tail = True
+        runner.prefill_dynamic_graph = object()
+        runner.prefill_dynamic_batch_template = _make_cpu_prefill_forward_batch(
+            num_tokens=128, batch_size=2
+        )
+        runner.prefill_dynamic_batch_template.return_logprob = False
+        runner.dynamic_prefill_max_tokens = 1024
+        runner.enable_torch_compile = False
+
+        forward_batch = _make_cpu_prefill_forward_batch(num_tokens=300, batch_size=2)
+        forward_batch.return_logprob = True
+        forward_batch.extend_seq_lens_cpu = [150, 150]
+        forward_batch.extend_logprob_start_lens_cpu = [0, 0]
+        forward_batch.top_logprobs_nums = [2, 2]
+        forward_batch.token_ids_logprobs = [None, None]
+
+        # 1. Assert _prepare_dynamic_prefill_batch refreshes return_logprob
+        prepared = runner._prepare_dynamic_prefill_batch(forward_batch)
+        self.assertTrue(prepared.return_logprob)
+        self.assertEqual(prepared.extend_logprob_start_lens_cpu, [0, 0])
+        self.assertEqual(prepared.top_logprobs_nums, [2, 2])
+
+        # 2. Assert full _execute_prefill_graph with eager logits tail returns requested logprobs
+        runner.model_runner = SimpleNamespace(
+            attn_backend=SimpleNamespace(init_forward_metadata=lambda fb: None),
+            model=SimpleNamespace(),
+        )
+
+        fake_input_logprobs = torch.randn(300)
+
+        def model_forward(input_ids, positions, fb, **kwargs):
+            self.assertTrue(fb.return_logprob)
+            self.assertEqual(fb.batch_size, 2)
+            return LogitsProcessorOutput(
+                next_token_logits=torch.zeros(2, 4),
+                input_token_logprobs=fake_input_logprobs,
+                hidden_states=torch.randn(300, 16),
+            )
+
+        runner.model_runner.model.forward = model_forward
+        runner._prefill_forward_dispatcher = SimpleNamespace(
+            active_forward=None,
+            original_forward=None,
+        )
+
+        out = runner._execute_prefill_graph(forward_batch)
+        self.assertIs(out.input_token_logprobs, fake_input_logprobs)
+        # Assert lifecycle cleanup: heavy references on template are cleared
+        self.assertIsNone(runner.prefill_dynamic_batch_template.sampling_info)
+        self.assertIsNone(runner.prefill_dynamic_batch_template.spec_info)
+        self.assertIsNone(runner.prefill_dynamic_batch_template.rids)
+        self.assertIsNone(runner.prefill_dynamic_batch_template.token_ids_logprobs)
+        self.assertIsNone(runner.prefill_dynamic_batch_template.mm_inputs)
+
+        # 3. Assert toggling back to return_logprob=False is also preserved
+        forward_batch2 = _make_cpu_prefill_forward_batch(num_tokens=300, batch_size=2)
+        forward_batch2.return_logprob = False
+        prepared2 = runner._prepare_dynamic_prefill_batch(forward_batch2)
+        self.assertFalse(prepared2.return_logprob)
+
+    def test_prefill_graph_token_type_ids_padding_and_dynamic(self):
+        runner = _make_cpu_graph_runner()
+        runner.capture_num_tokens = [128, 256]
+        runner.prefill_graphs = {128: object()}
+        runner.prefill_dynamic_graph = object()
+        runner.prefill_dynamic_batch_template = _make_cpu_prefill_forward_batch(
+            num_tokens=128, batch_size=2
+        )
+        runner.dynamic_prefill_max_tokens = 1024
+        runner.enable_torch_compile = False
+
+        # 1. Padded prefill: token_type_ids is padded with 0 to bucket size
+        forward_batch_pad = _make_cpu_prefill_forward_batch(
+            num_tokens=100, batch_size=2
+        )
+        forward_batch_pad.token_type_ids = torch.ones(100, dtype=torch.int64)
+
+        captured = []
+
+        def run_prefill_once(compiled_fn, batch):
+            captured.append(batch)
+            return LogitsProcessorOutput(next_token_logits=torch.zeros(2, 4))
+
+        with patch.object(runner, "_run_prefill_once", side_effect=run_prefill_once):
+            runner._execute_prefill_graph(forward_batch_pad)
+
+        self.assertEqual(captured[0].token_type_ids.shape, (128,))
+        self.assertTrue(
+            torch.equal(
+                captured[0].token_type_ids[:100], torch.ones(100, dtype=torch.int64)
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                captured[0].token_type_ids[100:], torch.zeros(28, dtype=torch.int64)
+            )
+        )
+
+        # 2. Dynamic prefill: token_type_ids is passed through as-is
+        forward_batch_dyn = _make_cpu_prefill_forward_batch(
+            num_tokens=300, batch_size=2
+        )
+        forward_batch_dyn.token_type_ids = torch.full((300,), 2, dtype=torch.int64)
+
+        prepared_dyn = runner._prepare_dynamic_prefill_batch(forward_batch_dyn)
+        self.assertEqual(prepared_dyn.token_type_ids.shape, (300,))
+        self.assertTrue(
+            torch.equal(prepared_dyn.token_type_ids, forward_batch_dyn.token_type_ids)
+        )
+
+        # 3. Dynamic prefill reset: None resets the template attribute
+        forward_batch_none = _make_cpu_prefill_forward_batch(
+            num_tokens=300, batch_size=2
+        )
+        forward_batch_none.token_type_ids = None
+
+        prepared_none = runner._prepare_dynamic_prefill_batch(forward_batch_none)
+        self.assertIsNone(prepared_none.token_type_ids)
+
     def test_prefill_graph_forwards_extend_kwargs(self):
         runner = _make_cpu_graph_runner()
         runner._prefill_uses_eager_logits_tail = False

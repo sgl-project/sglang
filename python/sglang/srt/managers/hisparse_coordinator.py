@@ -127,6 +127,64 @@ def resolve_shared_index_layers(
     return pattern
 
 
+def _log_index_k_elision(device_pool, host_to_device_ratio) -> None:
+    """Report what elision saves on device and the host pool it leads to.
+
+    The freed device memory becomes more KV rows, and the host pool is sized as
+    a multiple of those rows, so elision also grows the pinned host pool. Runs
+    before the host allocation so an out-of-memory failure follows this line.
+    """
+    elided_layers = sum(device_pool.skip_topk_layers)
+    num_layers = len(device_pool.skip_topk_layers)
+    ratio = host_to_device_ratio
+    index_per_slot = device_pool.index_bytes_per_token // device_pool.index_kpool
+    # Index-K is sized by logical slots (index_buf_size), not by device KV rows.
+    saved_per_slot = elided_layers * index_per_slot
+    # Same device budget at the pre-elision per-row cost, so this is an estimate.
+    latent_per_row = device_pool.bytes_per_token * num_layers
+    page_size = device_pool.page_size
+    rows_off = (
+        device_pool.size
+        * (latent_per_row + (num_layers - elided_layers) * index_per_slot * ratio)
+        // (latent_per_row + num_layers * index_per_slot * ratio)
+        // page_size
+        * page_size
+    )
+    # Mirrors HostKVCache sizing: device tokens x ratio plus one padding page.
+    device_tokens = (
+        device_pool.size
+        if device_pool.host_capacity_tokens is None
+        else device_pool.host_capacity_tokens
+    )
+    host_tokens = (int(device_tokens * ratio) // page_size + 1) * page_size
+    # The host pool stores the latent row of every layer per token.
+    host_bytes_per_device_token = int(ratio * latent_per_row)
+    host_gb = host_tokens * latent_per_row / 1e9
+    host_off_gb = rows_off * host_bytes_per_device_token / 1e9
+    logger.info(
+        "DSA index-K elision: %d of %d layers reuse top-k and hold no index-K, "
+        "saving %d B per logical slot x %d slots = %.2f GB of device memory. "
+        "The device pool grows from ~%d to %d tokens, so the HiSparse host pool "
+        "(device tokens x %g) grows from ~%.2f GB to %.2f GB of pinned host "
+        "memory (+%.2f GB). If host memory runs short, cap the device pool with "
+        "--max-total-tokens N (device KV tokens; the host pool needs N x %d B, "
+        "so N <= host_bytes / %d), or set SGLANG_DISABLE_DSA_INDEXK_ELISION=1.",
+        elided_layers,
+        num_layers,
+        saved_per_slot,
+        device_pool.index_buf_size,
+        saved_per_slot * device_pool.index_buf_size / 1e9,
+        rows_off,
+        device_pool.size,
+        ratio,
+        host_off_gb,
+        host_gb,
+        host_gb - host_off_gb,
+        host_bytes_per_device_token,
+        host_bytes_per_device_token,
+    )
+
+
 def _build_prefetch_groups(
     is_shared_index_layer: List[bool],
 ) -> Tuple[Dict[int, List[int]], List[int]]:
@@ -640,6 +698,8 @@ class HiSparseCoordinator:
                 self.item_size_bytes = self.mem_pool_device.bytes_per_token_k
             else:
                 self.mem_pool_device: HiSparseDSATokenToKVPool = kvcache
+                if any(self.mem_pool_device.skip_topk_layers):
+                    _log_index_k_elision(self.mem_pool_device, host_to_device_ratio)
                 self.mem_pool_host = MLATokenToKVPoolHost(
                     buffer_info=self.mem_pool_device.get_device_pool_infos()[
                         0
