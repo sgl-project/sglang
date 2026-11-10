@@ -84,6 +84,15 @@ class BaseGrammarObject:
     def fill_vocab_mask(self, vocab_mask: torch.Tensor, idx: int) -> None:
         raise NotImplementedError()
 
+    def needs_vocab_mask(self) -> bool:
+        """Whether fill_vocab_mask can constrain anything from the current state.
+
+        Speculative verify walks the whole draft tree per request to build the
+        mask; a grammar that would leave every row unconstrained lets it skip
+        that walk and keep the rows at the allocation's all-allowed default.
+        """
+        return True
+
     @staticmethod
     def fill_vocab_mask_batched(
         entries: List[GrammarRow], vocab_mask: torch.Tensor
