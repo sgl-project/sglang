@@ -321,8 +321,8 @@ struct Job {
     polls: u64,
 }
 impl Job {
-    fn needs_first_prefetch(&self) -> bool {
-        self.action == "sglang.prefetch" && !self.attempted && !self.submitted && !self.quiescent
+    fn needs_first_submission(&self) -> bool {
+        !self.releasing_pin && !self.attempted && !self.submitted && !self.quiescent
     }
 
     fn has_final_demote_receipt(&self) -> bool {
@@ -386,6 +386,7 @@ struct Actor {
     intents: BTreeMap<DemandId, Intent>,
     caps: BTreeMap<String, Option<Capabilities>>,
     busy: BTreeMap<String, Option<String>>,
+    deferred_polls: BTreeMap<String, String>,
     polls: FuturesUnordered<BoxFuture<'static, WorkerPoll>>,
     pending: Vec<(WaitFor, Message)>,
     last_route: BTreeMap<SessionIdentity, (String, Instant)>,
@@ -412,6 +413,7 @@ impl Actor {
             intents: BTreeMap::new(),
             caps: BTreeMap::new(),
             busy: BTreeMap::new(),
+            deferred_polls: BTreeMap::new(),
             polls: FuturesUnordered::new(),
             pending: Vec::new(),
             last_route: BTreeMap::new(),
@@ -437,7 +439,7 @@ impl Actor {
                     let worker = poll.url.clone();
                     self.complete_poll(poll);
                     self.resume_pending();
-                    self.submit_next_prefetch(&worker);
+                    self.dispatch_next(&worker);
                 }
                 _ = tick.tick() => self.pump(),
             }
@@ -726,14 +728,21 @@ impl Actor {
         let url = job.url.clone();
         self.launch_poll(&url, Some(job));
     }
-    fn submit_next_prefetch(&mut self, worker: &str) {
+    fn dispatch_next(&mut self, worker: &str) {
         if self.busy.contains_key(worker) {
             return;
+        }
+        // A busy tick must still get a turn before further first submissions.
+        if let Some(id) = self.deferred_polls.remove(worker) {
+            self.request_poll(&id);
+            if self.busy.contains_key(worker) {
+                return;
+            }
         }
         let next = self
             .jobs
             .values()
-            .filter(|job| job.url == worker && job.needs_first_prefetch())
+            .filter(|job| job.url == worker && job.needs_first_submission())
             .min_by_key(|job| job.deadline)
             .map(|job| job.id.clone());
         if let Some(id) = next {
@@ -1461,11 +1470,9 @@ impl Actor {
                 .track_resource(&task, ResourceKind::Claim, id)
                 .map_err(|e| format!("{e:?}"))?;
         }
-        let mut prefetch_workers = BTreeSet::new();
+        let mut submission_workers = BTreeSet::new();
         for (id, job) in planned {
-            if job.needs_first_prefetch() {
-                prefetch_workers.insert(job.url.clone());
-            }
+            submission_workers.insert(job.url.clone());
             self.jobs_by_spec.insert(job.spec.clone(), id.clone());
             self.jobs.insert(id, job);
         }
@@ -1483,8 +1490,8 @@ impl Actor {
                 request_triggered: request_prefix_len.is_some(),
             },
         );
-        for url in prefetch_workers {
-            self.submit_next_prefetch(&url);
+        for url in submission_workers {
+            self.dispatch_next(&url);
         }
         Ok(if request_prefix_len.is_some() {
             Value::Null
@@ -1538,8 +1545,16 @@ impl Actor {
         self.resume_pending();
         let ids: Vec<_> = self.jobs.keys().cloned().collect();
         let offset = self.tick_cursor % ids.len().max(1);
+        let mut sampled = BTreeSet::new();
         for id in ids[offset..].iter().chain(&ids[..offset]) {
-            self.request_poll(id);
+            let job = &self.jobs[id];
+            if !job.has_final_demote_receipt() && sampled.insert(job.url.clone()) {
+                let url = job.url.clone();
+                self.deferred_polls
+                    .entry(url.clone())
+                    .or_insert_with(|| id.clone());
+                self.dispatch_next(&url);
+            }
         }
         let candidates = self.workers();
         if let Some(worker) = candidates.get(self.tick_cursor % candidates.len().max(1)) {
@@ -1608,7 +1623,7 @@ impl WorkerPoll {
             job.quiescent = true;
             return Ok(());
         }
-        if job.needs_first_prefetch() {
+        if job.needs_first_submission() {
             if Instant::now() >= job.deadline {
                 job.quiescent = true;
                 return Err("expired before submission".into());

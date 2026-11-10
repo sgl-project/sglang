@@ -465,7 +465,7 @@ async fn lifecycle_prefetch_reports_readiness_without_overriding_worker_selectio
 }
 
 #[tokio::test]
-async fn external_prefetch_submits_without_waiting_for_a_poll_tick() {
+async fn mixed_actions_submit_without_waiting_for_a_poll_tick() {
     let engine = Engine::start().await;
     let router = router_with(
         &[&engine],
@@ -478,23 +478,91 @@ async fn external_prefetch_submits_without_waiting_for_a_poll_tick() {
     .await;
     start(&router, "first").await;
     start(&router, "second").await;
+    start(&router, "third").await;
+    let first = Arc::new(DelayedQuery::default());
+    engine.state.lock().unwrap().delayed_submit = Some(first.clone());
+    api(
+        &router,
+        json!({"kind":"submit","task":task("first"),"message_id":"keep",
+        "action":"sglang.pin","target":prefix(vec![1,2,3]),"worker_url":engine.url,
+        "location":{"tier":"host"},"mode":"acquire","claim_id":"keep","revision":1,"priority":0}),
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(2), first.started.notified())
+        .await
+        .expect("PIN must submit before the first periodic tick");
+
+    let second = Arc::new(DelayedQuery::default());
+    engine.state.lock().unwrap().delayed_submit = Some(second.clone());
+    api(
+        &router,
+        json!({"kind":"submit","task":task("second"),"message_id":"demote",
+        "action":"sglang.demote","target":prefix(vec![4,5,6]),"worker_url":engine.url,
+        "source":{"tier":"host"},"destination":{"tier":"storage"}}),
+    )
+    .await;
+    submit(&router, "third", "prepare", prefix(vec![7, 8, 9]), &engine).await;
+    assert_eq!(engine.state.lock().unwrap().operations.len(), 1);
+    first.release.notify_one();
+    tokio::time::timeout(Duration::from_secs(2), second.started.notified())
+        .await
+        .expect("completion of the first RPC must unblock DEMOTE");
+    assert_eq!(engine.state.lock().unwrap().operations.len(), 2);
+    let third = Arc::new(DelayedQuery::default());
+    engine.state.lock().unwrap().delayed_submit = Some(third.clone());
+    second.release.notify_one();
+    tokio::time::timeout(Duration::from_secs(2), third.started.notified())
+        .await
+        .expect("completion of the second RPC must unblock PREFETCH");
+    third.release.notify_one();
+    let state = engine.state.lock().unwrap();
+    let actions: Vec<_> = state
+        .commands
+        .iter()
+        .filter(|c| c["kind"] == "submit")
+        .map(|c| c["envelope"]["actions"][0]["action_type"].as_str().unwrap())
+        .collect();
+    assert_eq!(actions, ["sglang.pin", "sglang.demote", "sglang.prefetch"]);
+}
+
+#[tokio::test]
+async fn a_tick_during_submission_still_observes_the_worker() {
+    let engine = Engine::start().await;
+    let router = router_with(
+        &[&engine],
+        false,
+        Some(OrchestrationConfig {
+            poll_ms: 50,
+            ..orchestration()
+        }),
+    )
+    .await;
+    start(&router, "first").await;
+    start(&router, "second").await;
     let first = Arc::new(DelayedQuery::default());
     engine.state.lock().unwrap().delayed_submit = Some(first.clone());
     submit(&router, "first", "prepare", prefix(vec![1, 2, 3]), &engine).await;
     tokio::time::timeout(Duration::from_secs(2), first.started.notified())
         .await
-        .expect("external hint must submit before the first periodic tick");
-
+        .unwrap();
+    // A periodic observation becomes due while the first submission owns the lane.
+    tokio::time::sleep(Duration::from_millis(150)).await;
     let second = Arc::new(DelayedQuery::default());
     engine.state.lock().unwrap().delayed_submit = Some(second.clone());
     submit(&router, "second", "prepare", prefix(vec![4, 5, 6]), &engine).await;
-    assert_eq!(engine.state.lock().unwrap().operations.len(), 1);
     first.release.notify_one();
     tokio::time::timeout(Duration::from_secs(2), second.started.notified())
         .await
-        .expect("completion of the first RPC must unblock the queued hint");
+        .unwrap();
     second.release.notify_one();
-    assert_eq!(engine.state.lock().unwrap().operations.len(), 2);
+    let state = engine.state.lock().unwrap();
+    let mut commands = state
+        .commands
+        .iter()
+        .filter(|c| c["kind"] == "submit" || c["kind"] == "query");
+    assert_eq!(commands.next().unwrap()["kind"], "submit");
+    assert_eq!(commands.next().unwrap()["kind"], "query");
+    assert_eq!(commands.next().unwrap()["kind"], "submit");
 }
 
 #[tokio::test]
