@@ -330,6 +330,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         self._verify_mask = None
         # Tree-mask scratch is fetched from the target backend only.
         self.is_draft_runner = model_runner.is_draft_worker
+        # The DFLASH worker attaches the draft KV ring after the backends exist.
+        self._draft_runner = model_runner if self.is_draft_runner else None
 
         # Fused KV-scatter + q-concat on the decode dense-loc path (one launch
         # instead of set_mla_kv_buffer + concat_mla_absorb_q). Disabled under
@@ -1457,6 +1459,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             self._window_index_cache = (cache[0], layer.layer_id, *cache[2:])
             return cache[2], cache[3]
         parallel = get_parallel()
+        ring = self._draft_runner.draft_kv_ring if self._draft_runner else None
         indices, counts = mla_window_sparse_indices(
             req_to_token=self.req_to_token,
             req_pool_indices=forward_batch.req_pool_indices,
@@ -1465,7 +1468,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             dcp_size=parallel.attn_dcp_size,
             dcp_rank=parallel.attn_dcp_rank,
             page_size=self.page_size,
-            v2p=self.runner_ids.full_v2p_table,
+            v2p=None if ring else self.runner_ids.full_v2p_table,
+            ring_rows_per_req=ring.rows_per_req if ring else 0,
+            min_pos=ring.min_pos if ring else None,
         )
         self._window_index_cache = (id(forward_batch), layer.layer_id, indices, counts)
         return indices, counts

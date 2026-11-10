@@ -442,6 +442,7 @@ def _handle_dflash(server_args: ServerArgs) -> None:
 
     _resolve_dflash_draft_attention_backend(server_args)
     _resolve_dflash_mla_draft_window(server_args)
+    _resolve_dflash_draft_kv_ring(server_args)
 
     if cfg.max_running_requests is None:
         declare_resolution(
@@ -1115,6 +1116,33 @@ def _resolve_dflash_mla_draft_window(server_args: ServerArgs) -> None:
             "_resolve_dflash_mla_draft_window",
             speculative_draft_window_size=None,
         )
+
+
+def _resolve_dflash_draft_kv_ring(server_args: ServerArgs) -> None:
+    """Settle SGLANG_DFLASH_DRAFT_KV_RING once, before any worker starts, so
+    every process agrees, including PP stages that own no draft: they still
+    register the ring's PD state slots. Runs after the draft backend and the
+    compact window are final."""
+    from sglang.srt.speculative.dflash_draft_ring import (
+        draft_kv_ring_unsupported_reason,
+    )
+
+    flag = envs.SGLANG_DFLASH_DRAFT_KV_RING
+    if not flag.get():
+        return
+    cfg = resolving_view(server_args)
+    reason = draft_kv_ring_unsupported_reason(
+        _load_draft_hf_config(cfg),
+        draft_backend=cfg.speculative_draft_attention_backend,
+        draft_window_size=cfg.speculative_draft_window_size,
+    )
+    if reason is None:
+        logger.info("DFLASH draft KV ring: on.")
+        return
+    if flag.is_set():
+        raise ValueError(f"SGLANG_DFLASH_DRAFT_KV_RING=1, but {reason}.")
+    logger.info("DFLASH draft KV ring: off, %s.", reason)
+    flag.set(False)
 
 
 def _handle_frozen_kv_mtp(server_args: ServerArgs) -> None:

@@ -140,9 +140,23 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _has_dflash_draft_kv(kvc: KVCacheConfigurator) -> bool:
+    """Whether the target's per-token budget carries a draft KV row. A DFLASH
+    draft KV ring is a small fixed pool instead, so it charges nothing here."""
+    from sglang.srt.speculative.dflash_draft_ring import draft_kv_ring_enabled
+
+    # DFLASH and DSPARK only build the draft on the final PP stage.
+    return (
+        not kvc.is_draft_worker
+        and kvc.spec_algorithm.is_dflash_family()
+        and (kvc.pp_size == 1 or kvc.pp_group.is_last_rank)
+        and not (kvc.spec_algorithm.is_dflash() and draft_kv_ring_enabled())
+    )
+
+
 def _dflash_draft_cell_size(kvc: KVCacheConfigurator) -> int:
     """Bytes/token the DFLASH draft KV pool adds per target row, 0 if none."""
-    if kvc.is_draft_worker or not kvc.spec_algorithm.is_dflash_family():
+    if not _has_dflash_draft_kv(kvc):
         return 0
     cell_size = kvc.dflash_draft_cell_size_per_token
     if cell_size is None or int(cell_size) <= 0:
@@ -394,7 +408,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
         # DFLASH/DSPARK: the draft's per-token KV cost can differ from the target's
         # (e.g. MLA target, per-head K/V draft), so size from the draft config.
-        if kvc.spec_algorithm.is_dflash_family() and not kvc.is_draft_worker:
+        if _has_dflash_draft_kv(kvc):
             from sglang.srt.speculative.dflash_utils import (
                 scale_kv_cell_size_per_token_for_dflash,
             )
