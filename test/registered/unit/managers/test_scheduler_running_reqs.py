@@ -150,12 +150,14 @@ class TestRequestListsCheck(CustomTestCase):
         self.s.running_batch = ScheduleBatch(reqs=reqs)
         self.s.running_reqs.join(reqs)
 
-    def test_fails_a_request_in_two_lists(self):
+    def test_fails_a_request_owned_by_another_list(self):
         req = _req("a")
         self.s.running_reqs.join([req])
-        self.s.waiting_queue.join([req])
+        req.owner_list = self.s.waiting_queue
 
-        with self.assertRaisesRegex(RuntimeError, "a is in both WAITING and DECODING"):
+        with self.assertRaisesRegex(
+            RuntimeError, "a is in DECODING but owned by WAITING"
+        ):
             self.check(ScheduleBatch(reqs=[]))
 
     def test_fails_a_launched_row_in_no_list(self):
@@ -360,6 +362,7 @@ class TestRunningReqsHooks(CustomTestCase):
         running_batch = ScheduleBatch(reqs=[victim, other])
         s.running_reqs.join(running_batch.reqs)
         waiting = SimpleNamespace(
+            owner_list=None,
             beam_group=None,
             init_next_round_input=Mock(),
             kv=SimpleNamespace(holds_mamba=False),

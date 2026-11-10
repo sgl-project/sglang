@@ -851,9 +851,8 @@ class HiSparseCoordinator:
             ),
         )
 
-    def admit_request_into_staging(self, req: Req, *, src: ReqList) -> None:
-        """Start the host copy of a prefilled request and move it from `src` into
-        staging."""
+    def admit_request_into_staging(self, req: Req) -> None:
+        """Start the host copy of a prefilled request and move it into staging."""
         req.hisparse_staging = True
 
         full_kv_indices = self.req_to_token_pool.req_to_token[
@@ -891,7 +890,7 @@ class HiSparseCoordinator:
             if device_indices.is_cuda:
                 device_indices.record_stream(self.write_staging_stream)
 
-        move([HiSparseAct(start_event, finish_event, req)], src, self.ack_staging_queue)
+        move([HiSparseAct(start_event, finish_event, req)], self.ack_staging_queue)
 
     def admit_request_direct(self, req: Req) -> None:
         """Direct-to-host path: KV data already resides in host pool via RDMA.
@@ -1100,7 +1099,7 @@ class HiSparseCoordinator:
                 group=self.tp_group,
             )
         finish_count = int(queue_size.item())
-        move([req for _, _, req in staged[:finish_count]], self.ack_staging_queue, dst)
+        move([req for _, _, req in staged[:finish_count]], dst)
         for _, _, req in staged[:finish_count]:
             # prepare device buffer and update req
             self.alloc_device_buffer(req)

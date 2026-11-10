@@ -9,6 +9,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     ListKind,
     ReqList,
+    move,
 )
 
 if TYPE_CHECKING:
@@ -51,7 +52,9 @@ class DeferredResponses:
             raise ValueError("only finished, unstreamed responses can be deferred")
         if any(held.rid == req.rid for held in self.held):
             raise ValueError(f"response {req.rid!r} is already deferred")
-        self.held.join([(req, completion)])
+        # A request deferred as it finishes leaves running before the step's
+        # finished requests do.
+        move([(req, completion)], self.held)
         req.defer_output = True
         self.output_streamer.defer_outputs = True
 
