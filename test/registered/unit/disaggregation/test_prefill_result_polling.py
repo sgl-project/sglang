@@ -133,6 +133,7 @@ def _sending(reqs=()):
 class _Scheduler(SchedulerDisaggregationPrefillMixin):
     """Run real scheduling and result handling with controlled intake and GPU events."""
 
+    chunked_req = Scheduler.chunked_req
     launch_batch_sample_if_needed = Scheduler.launch_batch_sample_if_needed
     _copy_result_to_cpu = Scheduler._copy_result_to_cpu
     pause_generation = Scheduler.pause_generation
@@ -185,7 +186,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
             output_streamer=None,
             send_abort=None,
         )
-        self.chunked_req = None
+        self.chunked_reqs = IndexedReqList(ListKind.CHUNKED)
         self.decode_offload_manager = None
         self.hisparse_coordinator = None
         self.running_batch = ScheduleBatch(reqs=[])
@@ -204,7 +205,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self.enable_async_d2h_copy = False
         self.enable_overlap_mlx = False
         self.disagg_prefill_bootstrap_queue = SimpleNamespace(
-            pop_bootstrapped=lambda: []
+            move_bootstrapped=lambda dst: []
         )
         self.ngram_embedding_manager = SimpleNamespace(
             prepare_for_forward=lambda batch, chunked_req: batch
@@ -324,15 +325,15 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         if batch is not None:
             self.actions.append((self.iteration, "prepare_batch", batch.forward_iter))
             self.waiting_queue.leave(batch.reqs)
+            self.prefill_launched_reqs.join(
+                req for req in batch.reqs if req is not batch.chunked_req
+            )
         return NextBatchPlan(batch_to_run=batch, running_batch=running_batch)
 
     def run_batch(self, batch):
         assert len(self.result_queue) < 2, "Overwrote a live forward's keep-alive slot"
         self.actions.append((self.iteration, "launch", batch.forward_iter))
         batch.add_inflight_step()
-        self.prefill_launched_reqs.join(
-            req for req in batch.reqs if req is not batch.chunked_req
-        )
         result = self.results[batch.forward_iter]
         if result.delay_sample_func is not None:
 
@@ -1175,7 +1176,7 @@ class TestPrefillResultPolling(CustomTestCase):
                     def run_batch(self, batch):
                         end = int(batch.forward_iter)
                         req.extend_end = end
-                        self.chunked_req = req if end < 12 else None
+                        self.chunked_reqs.replace([req] if end < 12 else [])
                         batch.chunked_req = self.chunked_req
                         batch.chunked_req = req if end < 12 else None
                         return super().run_batch(batch)
@@ -1251,7 +1252,7 @@ class TestPrefillResultPolling(CustomTestCase):
                     def run_batch(self, batch):
                         if req in batch.reqs:
                             req.extend_end = batch.forward_iter
-                            self.chunked_req = batch.chunked_req = req
+                            self.chunked_reqs.replace([req])
                             batch.chunked_req = req
                         return super().run_batch(batch)
 
@@ -1354,7 +1355,6 @@ class _EarlySendScheduler(SchedulerDisaggregationPrefillMixin):
     """Just enough Scheduler state for run_batch to reach the forward launch."""
 
     _on_step_launch = Scheduler._on_step_launch
-    _join_prefill_launched = Scheduler._join_prefill_launched
 
     def __init__(self):
         self.scheduler_stage_metrics = None
@@ -1367,9 +1367,6 @@ class _EarlySendScheduler(SchedulerDisaggregationPrefillMixin):
         self.profiler_manager = SimpleNamespace(_profile_batch_predicate=Mock())
         self.forward_sleep_time = None
         self.disaggregation_mode = DisaggregationMode.PREFILL
-        self.dllm_config = None
-        self.running_reqs = KeyedReqList(ListKind.DECODING)
-        self.prefill_launched_reqs = KeyedReqList(ListKind.PREFILL_LAUNCHED)
         self.enable_staging = False
         self.enable_overlap = False
         self.token_to_kv_pool_allocator = SimpleNamespace(page_size=64)
