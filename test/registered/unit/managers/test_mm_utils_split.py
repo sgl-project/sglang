@@ -16,6 +16,7 @@ import warnings
 from array import array
 from functools import partial
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import numpy as np
 import torch
@@ -29,6 +30,7 @@ from sglang.srt.managers.mm_utils import (
     get_new_expanded_mm_items,
     pad_mm_token_pairs,
     pad_mm_tokens,
+    strip_mm_features_for_pp_relay,
 )
 from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.models.ernie45_vl import Ernie4_5_VLMoeForConditionalGeneration
@@ -154,6 +156,92 @@ class TestGetNewExpandedMMItems(CustomTestCase):
 
         self.assertEqual(len(out), 1)
         self.assertIs(out[0], item)
+
+
+class TestSchedulerTokenizePadding(CustomTestCase):
+    def test_tokenize_returns_padded_int64s_and_releases_features_before_admission(
+        self,
+    ):
+        from sglang.srt.managers.io_struct import (
+            TokenizedGenerateReqInput,
+            TokenizeReqOutput,
+            msgpack_decode,
+            msgpack_encode,
+        )
+        from sglang.srt.managers.scheduler import Scheduler
+        from sglang.srt.sampling.sampling_params import SamplingParams
+
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.send_control_output = Mock()
+        scheduler._handle_generate_request = Mock(
+            side_effect=AssertionError("unexpected generation admission")
+        )
+        scheduler.max_req_input_len = 32
+        scheduler.pad_input_ids_func = Mock(wraps=pad_mm_tokens)
+        ids = array("q", [1, 7, 7, 7, 2])
+        for precomputed in (False, True):
+            with self.subTest(precomputed=precomputed):
+                item = MultimodalDataItem(
+                    modality=Modality.IMAGE, offsets=[(1, 3)], feature=torch.ones(3, 1)
+                )
+                item.set_identity(bytes(range(32)))
+                expected = [1, *item.padding_sequence(3), 2]
+                mm = MultimodalInputs(
+                    mm_items=[item],
+                    im_token_id=7,
+                    padded_input_ids=expected if precomputed else None,
+                )
+                recv = TokenizedGenerateReqInput(
+                    rid="media",
+                    input_text=None,
+                    input_ids=ids,
+                    input_embeds=None,
+                    mm_inputs=mm,
+                    token_type_ids=None,
+                    sampling_params=SamplingParams(max_new_tokens=1),
+                    return_logprob=False,
+                    logprob_start_len=-1,
+                    top_logprobs_num=0,
+                    token_ids_logprob=None,
+                    stream=False,
+                    tokenize_only=True,
+                )
+                self.assertEqual(strip_mm_features_for_pp_relay([recv]), [])
+                scheduler.pad_input_ids_func.reset_mock()
+                scheduler.handle_generate_request(recv)
+                reply, source = scheduler.send_control_output.call_args.args
+                self.assertIs(source, recv)
+                self.assertIsInstance(reply, TokenizeReqOutput)
+                self.assertEqual(
+                    list(msgpack_decode(msgpack_encode(reply)).input_ids), expected
+                )
+                self.assertEqual(
+                    scheduler.pad_input_ids_func.call_count, 0 if precomputed else 1
+                )
+                self.assertEqual(list(ids), [1, 7, 7, 7, 2])
+                self.assertIsNone(item.feature)
+        scheduler._handle_generate_request.assert_not_called()
+
+    def test_oversized_multimodal_tokenize_reports_error_before_admission(self):
+        from sglang.srt.managers.io_struct import AbortReq
+        from sglang.srt.managers.scheduler import Scheduler
+
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.send_control_output = Mock()
+        scheduler._handle_generate_request = Mock()
+        scheduler.max_req_input_len = 4
+        scheduler.pad_input_ids_func = lambda ids, mm: array("q", [1, 7, 7, 7, 2])
+        recv = SimpleNamespace(
+            rid="large",
+            input_ids=array("q", [1, 7, 2]),
+            mm_inputs=MultimodalInputs(mm_items=[]),
+            tokenize_only=True,
+        )
+        scheduler.handle_generate_request(recv)
+        reply, _ = scheduler.send_control_output.call_args.args
+        self.assertIsInstance(reply, AbortReq)
+        self.assertEqual(reply.finished_reason["status_code"], 400)
+        scheduler._handle_generate_request.assert_not_called()
 
 
 class TestMMPadding(CustomTestCase):

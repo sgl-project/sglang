@@ -29,6 +29,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.disaggregation.encoder.receiver import MMReceiverHTTP  # noqa: E402
 from sglang.srt.disaggregation.mode import DisaggregationMode  # noqa: E402
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry  # noqa: E402
 from sglang.srt.managers.io_struct import (  # noqa: E402
@@ -37,6 +38,7 @@ from sglang.srt.managers.io_struct import (  # noqa: E402
     EmbeddingReqInput,
     GenerateReqInput,
     RequestOutputStats,
+    TokenizeReqOutput,
 )
 from sglang.srt.managers.tokenizer_manager import (  # noqa: E402
     ReqState,
@@ -1025,6 +1027,319 @@ def _make_generate_obj(rid, is_single):
     if not is_single:
         obj.__getitem__.side_effect = lambda i: Mock()
     return obj
+
+
+class TestTokenizeRequestWithoutGeneration(unittest.IsolatedAsyncioTestCase):
+    async def test_single_releases_only_its_own_adapter_reference(self):
+        tm = _make_tm_for_generate(self, enable_lora=True)
+        counter = tm.lora_registry._counters["adapter"]
+        held = await tm.lora_registry.acquire("adapter")
+        obj = GenerateReqInput(
+            input_ids=[7, 8],
+            rid="tokenize",
+            lora_path="adapter",
+            sampling_params={"n": 3},
+        )
+
+        async def tokenize(request):
+            self.assertEqual(counter.value(), 2)
+            return SimpleNamespace(
+                input_ids=request.input_ids,
+                mm_inputs=None,
+                need_wait_for_mm_inputs=False,
+            )
+
+        tm._tokenize_one_request = AsyncMock(side_effect=tokenize)
+        tm._dispatch_to_scheduler = Mock()
+        self.assertEqual(await tm.tokenize_request(obj), [7, 8])
+        await asyncio.gather(*tm._lora_release_tasks)
+        self.assertEqual(counter.value(), 1)
+        await tm.lora_registry.release(held)
+        self.assertEqual(counter.value(), 0)
+        self.assertFalse(tm.rid_to_state)
+        tm._dispatch_to_scheduler.assert_not_called()
+
+    async def test_failure_or_cancellation_releases_acquired_adapter(self):
+        tm = _make_tm_for_generate(self, enable_lora=True)
+        tm._dispatch_to_scheduler = Mock()
+        for error in (ValueError("invalid input"), asyncio.CancelledError()):
+            with self.subTest(error=type(error).__name__):
+                obj = GenerateReqInput(input_ids=[3], rid="retry", lora_path="adapter")
+                tm._tokenize_one_request = AsyncMock(side_effect=error)
+                with self.assertRaises(type(error)):
+                    await tm.tokenize_request(obj)
+                await asyncio.gather(*tm._lora_release_tasks)
+                self.assertEqual(tm.lora_registry._counters["adapter"].value(), 0)
+                self.assertFalse(tm.rid_to_state)
+        tm._dispatch_to_scheduler.assert_not_called()
+
+    async def test_batch_tokenizes_each_prompt_once_for_parallel_samples(self):
+        tm = _make_tm_for_generate(self, enable_lora=True)
+        tm._dispatch_to_scheduler = Mock()
+        tokens = [[7], [8, 9]]
+        for batch_encode in (False, True):
+            with self.subTest(batch_encode=batch_encode):
+                obj = GenerateReqInput(
+                    input_ids=tokens,
+                    rid=["first", "second"],
+                    lora_path="adapter",
+                    sampling_params={"n": 3},
+                )
+                tm._should_use_batch_tokenization = Mock(return_value=batch_encode)
+
+                def tokenized(req):
+                    return SimpleNamespace(
+                        input_ids=req.input_ids,
+                        mm_inputs=None,
+                        need_wait_for_mm_inputs=False,
+                    )
+
+                tm._batch_tokenize_and_process = AsyncMock(
+                    side_effect=lambda size, req: [
+                        tokenized(req[i]) for i in range(size)
+                    ]
+                )
+                tm._tokenize_one_request = AsyncMock(side_effect=tokenized)
+
+                self.assertEqual(await tm.tokenize_request(obj), tokens)
+                self.assertEqual(
+                    tm._batch_tokenize_and_process.await_count, int(batch_encode)
+                )
+                self.assertEqual(
+                    tm._tokenize_one_request.await_count, 0 if batch_encode else 2
+                )
+                await asyncio.gather(*tm._lora_release_tasks)
+                self.assertEqual(tm.lora_registry._counters["adapter"].value(), 0)
+                self.assertFalse(tm.rid_to_state)
+        tm._dispatch_to_scheduler.assert_not_called()
+
+    async def test_cancel_while_paused_does_not_release_unacquired_adapter(self):
+        tm = _make_tm_for_generate(self, enable_lora=True)
+        tm.is_pause = True
+        tm.lora_registry.release = AsyncMock(wraps=tm.lora_registry.release)
+        obj = GenerateReqInput(text="hi", rid="paused", lora_path="adapter")
+        task = asyncio.create_task(tm.tokenize_request(obj))
+        await asyncio.sleep(0)
+        self.assertTrue(tm.rid_to_state[obj.rid].waiting_at_pause_gate)
+        self.assertEqual(tm.lora_registry._counters["adapter"].value(), 0)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        await asyncio.gather(*tm._lora_release_tasks)
+        tm.lora_registry.release.assert_not_called()
+        self.assertFalse(tm.rid_to_state)
+        self.assertEqual(tm.lora_registry._counters["adapter"].value(), 0)
+
+    async def test_multimodal_tokenize_uses_scheduler_prompt_for_each_backend(self):
+        tm = _make_tm_for_generate(self, enable_lora=True)
+        tm.is_generation = True
+        tm.max_req_input_len = 128
+        tm.model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["VLM"])
+        )
+        expanded = [1, 7, 7, 7, 2]
+        final_ids = array("q", [1, 2**58, 2**58 + 1, 2**58 + 2, 2])
+        mm = SimpleNamespace(input_ids=expanded, token_type_ids=None, mm_items=[])
+        tm.mm_processor = Mock(prefer_tokenized_input=True, mm_tokens=None)
+        tm.mm_processor.process_mm_data_async = AsyncMock(return_value=mm)
+        tm.mm_receiver = Mock()
+        tm.mm_receiver.recv_mm_data = AsyncMock(return_value=mm)
+        encode_thread = Mock()
+        dispatch_ready = Mock()
+        tm.mm_receiver.prepare_encode_request.return_value = (
+            encode_thread,
+            dispatch_ready,
+        )
+        tm._validate_one_request = Mock()
+        tm._create_tokenized_object = Mock(
+            side_effect=lambda obj, text, ids, embeds, mm_inputs, types: (
+                SimpleNamespace(
+                    rid=obj.rid,
+                    input_ids=ids,
+                    mm_inputs=mm_inputs,
+                    need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,
+                )
+            )
+        )
+
+        async def send(tokenized):
+            self.assertTrue(tokenized.tokenize_only)
+            tm._mark_state_dispatched(tokenized.rid)
+            ready = tm.encoder_dispatch_ready.pop(tokenized.rid, None)
+            if ready is not None:
+                ready.set()
+            tm._handle_tokenize_output(
+                TokenizeReqOutput(rid=tokenized.rid, input_ids=final_ids)
+            )
+
+        tm._send_one_request = AsyncMock(side_effect=send)
+        for backend in ("zmq_to_scheduler", "mooncake", "zmq_to_tokenizer"):
+            with (
+                self.subTest(backend=backend),
+                get_context().override_server_args(
+                    language_only=True, encoder_transfer_backend=backend
+                ),
+            ):
+                tm.mm_receiver.prepare_encode_request.reset_mock()
+                encode_thread.reset_mock()
+                tm.mm_receiver.recv_mm_data.reset_mock()
+                for field in ("image_data", "video_data", "audio_data"):
+                    obj = GenerateReqInput(
+                        input_ids=[1, 7, 2], lora_path="adapter", **{field: "media"}
+                    )
+                    self.assertEqual(await tm.tokenize_request(obj), list(final_ids))
+                batch = GenerateReqInput(
+                    input_ids=[[1, 7, 2], [3]], image_data=["image", None]
+                )
+                self.assertEqual(
+                    await tm.tokenize_request(batch), [list(final_ids), [3]]
+                )
+                if backend == "zmq_to_tokenizer":
+                    self.assertEqual(tm.mm_receiver.recv_mm_data.await_count, 4)
+                    tm.mm_receiver.prepare_encode_request.assert_not_called()
+                else:
+                    self.assertEqual(
+                        tm.mm_receiver.prepare_encode_request.call_count, 4
+                    )
+                    self.assertEqual(encode_thread.start.call_count, 4)
+                    tm.mm_receiver.recv_mm_data.assert_not_awaited()
+                await asyncio.gather(*tm._lora_release_tasks)
+                self.assertEqual(tm.lora_registry._counters["adapter"].value(), 0)
+                self.assertFalse(tm.encoder_dispatch_ready)
+                self.assertFalse(tm.rid_to_state)
+        tm.mm_processor.process_mm_data_async.assert_not_awaited()
+        # Generation uses local preprocessing for batches under adaptive dispatch.
+        tm.mm_receiver.prepare_encode_request.reset_mock()
+        with get_context().override_server_args(
+            language_only=True,
+            encoder_transfer_backend="zmq_to_scheduler",
+            enable_adaptive_dispatch_to_encoder=True,
+        ):
+            batch = GenerateReqInput(
+                input_ids=[[1, 7, 2], [3]], image_data=["image", None]
+            )
+            self.assertEqual(await tm.tokenize_request(batch), [list(final_ids), [3]])
+        tm.mm_receiver.prepare_encode_request.assert_not_called()
+        tm.mm_processor.process_mm_data_async.assert_awaited_once()
+
+    async def test_length_rejection_returns_undispatched_ipc_features(self):
+        tm = _make_tm_for_generate(self)
+        tm.max_req_input_len = 4
+        tm.model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["VLM"])
+        )
+        proxy = Mock(spec=CudaIpcTensorTransportProxy)
+        item = SimpleNamespace(feature=proxy, precomputed_embeddings=None)
+        tm.mm_processor = Mock(prefer_tokenized_input=True, mm_tokens=None)
+        tm.mm_processor.process_mm_data_async = AsyncMock(
+            return_value=SimpleNamespace(
+                input_ids=[1, 7, 7, 7, 2], token_type_ids=None, mm_items=[item]
+            )
+        )
+        tm.mm_processor.hash_executor.set_pad_values = AsyncMock()
+        tm._validate_one_request = Mock(side_effect=ValueError("over limit"))
+        tm._send_one_request = AsyncMock()
+        with self.assertRaisesRegex(ValueError, "over limit"):
+            await tm.tokenize_request(
+                GenerateReqInput(input_ids=[1, 7, 2], image_data="image")
+            )
+        tm.mm_processor.cudaipc_mmfeature_pool.cancel_proxy.assert_called_once_with(
+            proxy
+        )
+        tm._send_one_request.assert_not_awaited()
+        self.assertFalse(tm.rid_to_state)
+
+    async def test_epd_validation_failure_never_starts_encoder(self):
+        tm = _make_tm_for_generate(self, enable_lora=True)
+        encode_thread, ready = Mock(), Mock()
+        tm.mm_receiver = Mock()
+        tm.mm_receiver.prepare_encode_request.return_value = (encode_thread, ready)
+        tm._tokenize_one_request = AsyncMock(side_effect=ValueError("over limit"))
+        tm._send_one_request = AsyncMock()
+        obj = GenerateReqInput(
+            input_ids=[1], image_data="image", rid="bad-input", lora_path="adapter"
+        )
+        with get_context().override_server_args(
+            language_only=True, encoder_transfer_backend="mooncake"
+        ):
+            with self.assertRaisesRegex(ValueError, "over limit"):
+                await tm.tokenize_request(obj)
+        encode_thread.start.assert_not_called()
+        tm._send_one_request.assert_not_awaited()
+        ready.set.assert_called_once()
+        await asyncio.gather(*tm._lora_release_tasks)
+        self.assertEqual(tm.lora_registry._counters["adapter"].value(), 0)
+        self.assertFalse(tm.rid_to_state)
+        self.assertFalse(tm.encoder_dispatch_ready)
+
+    async def test_cancel_after_tokenize_dispatch_keeps_lora_until_scheduler_reply(
+        self,
+    ):
+        tm = _make_tm_for_generate(self, enable_lora=True)
+        tm._dispatch_to_scheduler = Mock()
+        obj = GenerateReqInput(
+            input_ids=[1], image_data="image", rid="cancel-media", lora_path="adapter"
+        )
+        tm._tokenize_one_request = AsyncMock(
+            return_value=SimpleNamespace(mm_inputs=object())
+        )
+        sent = asyncio.Event()
+
+        async def send(_):
+            tm._mark_state_dispatched(obj.rid)
+            sent.set()
+
+        tm._send_one_request = AsyncMock(side_effect=send)
+        task = asyncio.create_task(tm.tokenize_request(obj))
+        await sent.wait()
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertEqual(tm.lora_registry._counters["adapter"].value(), 1)
+        (abort,) = tm._dispatch_to_scheduler.call_args.args
+        self.assertIsInstance(abort, AbortReq)
+        self.assertEqual(abort.rid, obj.rid)
+        tm._handle_tokenize_output(
+            TokenizeReqOutput(rid=obj.rid, input_ids=array("q", [1]))
+        )
+        await asyncio.gather(*tm._lora_release_tasks)
+        self.assertEqual(tm.lora_registry._counters["adapter"].value(), 0)
+        self.assertFalse(tm.rid_to_state)
+
+    async def test_multimodal_tokenize_propagates_scheduler_error(self):
+        tm = _make_tm_for_generate(self, enable_lora=True)
+        obj = GenerateReqInput(
+            input_ids=[1],
+            image_data="image",
+            rid="bad-media",
+            lora_path="adapter",
+            stream=True,
+        )
+        tm._tokenize_one_request = AsyncMock(
+            return_value=SimpleNamespace(mm_inputs=object())
+        )
+
+        receiver = MMReceiverHTTP.__new__(MMReceiverHTTP)
+        receiver.scheduler = Mock()
+        receiver.scheduler.send_control_output.side_effect = lambda abort, _: (
+            tm._handle_abort_req(abort)
+        )
+        receiver.create_req = Mock()
+
+        async def reject(tokenized):
+            tm._mark_state_dispatched(obj.rid)
+            # Scheduler-bound EPD may fail before input_ids exist.
+            tokenized.rid = obj.rid
+            receiver._reject_waiting_request(tokenized, "encoder timed out", 408, [])
+
+        tm._send_one_request = AsyncMock(side_effect=reject)
+        with self.assertRaises(HTTPException) as error:
+            await tm.tokenize_request(obj)
+        self.assertEqual(error.exception.status_code, 408)
+        receiver.create_req.assert_not_called()
+        await asyncio.gather(*tm._lora_release_tasks)
+        self.assertEqual(tm.lora_registry._counters["adapter"].value(), 0)
+        self.assertFalse(tm.rid_to_state)
 
 
 class TestReleaseReqStatesOnFailure(CustomTestCase):

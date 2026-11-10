@@ -52,6 +52,7 @@ class TestSchedulerSamplingMaskValidation(CustomTestCase):
                 scheduler.send_abort_output = MagicMock()
                 scheduler.init_request_retirer()
                 recv_req = MagicMock(
+                    tokenize_only=False,
                     session_params=None,
                     session_id=None,
                     input_embeds=None,
@@ -120,6 +121,7 @@ class TestSchedulerSamplingMaskValidation(CustomTestCase):
                 session = scheduler.session_controller.get("s")
                 recv_req = MagicMock(
                     rid="r",
+                    tokenize_only=False,
                     input_ids=array("q", [5, 6, 7]),
                     input_text="",
                     mm_inputs=None,

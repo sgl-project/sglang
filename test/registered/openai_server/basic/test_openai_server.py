@@ -449,6 +449,76 @@ class TestOpenAIServer(CustomTestCase, AnthropicMessagesMixin):
             for parallel_sample_num in [1, 2]:
                 self.run_chat_completion_stream(logprobs, parallel_sample_num)
 
+    def _post_tokenize(
+        self, path: str, payload: dict, *, expected_status: int = 200
+    ) -> dict:
+        response = requests.post(
+            self.base_url + path,
+            headers={"Authorization": f"Bearer {self.api_key}"},
+            json=payload,
+            timeout=120,
+        )
+        self.assertEqual(response.status_code, expected_status, response.text)
+        return response.json()
+
+    def test_chat_tokenize_matches_chat_completion_prompt_tokens(self):
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": "You are a concise assistant."},
+                {"role": "user", "content": "Name one city in France."},
+            ],
+            "temperature": 0,
+        }
+        tokenize_body = self._post_tokenize("/chat/tokenize", payload)
+        completion = client.chat.completions.create(
+            **payload, max_tokens=1, extra_body={"return_token_ids": True}
+        )
+
+        self.assertEqual(tokenize_body["count"], completion.usage.prompt_tokens)
+        self.assertEqual(
+            tokenize_body["tokens"], completion.choices[0].prompt_token_ids
+        )
+
+    def test_completions_tokenize_matches_completion_prompt_tokens(self):
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+        payload = {
+            "model": self.model,
+            "prompt": "The capital of France is",
+            "temperature": 0,
+        }
+        tokenize_body = self._post_tokenize("/completions/tokenize", payload)
+        completion = client.completions.create(
+            **payload, max_tokens=1, extra_body={"return_token_ids": True}
+        )
+
+        self.assertEqual(tokenize_body["count"], completion.usage.prompt_tokens)
+        self.assertEqual(
+            tokenize_body["tokens"], completion.choices[0].prompt_token_ids
+        )
+
+    def test_tokenize_dispatches_and_rejects_ambiguous_body(self):
+        chat_payload = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+        completion_payload = {"model": self.model, "prompt": "hello"}
+        for path, payload in (
+            ("/chat/tokenize", chat_payload),
+            ("/completions/tokenize", completion_payload),
+        ):
+            with self.subTest(path=path):
+                self.assertEqual(
+                    self._post_tokenize("/tokenize", payload),
+                    self._post_tokenize(path, payload),
+                )
+
+        ambiguous = self._post_tokenize(
+            "/tokenize", chat_payload | completion_payload, expected_status=400
+        )
+        self.assertIn("Exactly one", ambiguous["message"])
+
     def test_regex(self):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
 

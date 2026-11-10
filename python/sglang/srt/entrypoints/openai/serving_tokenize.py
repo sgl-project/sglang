@@ -5,6 +5,8 @@ from typing import List, Optional, Union
 from fastapi import Request
 
 from sglang.srt.entrypoints.openai.protocol import (
+    ChatCompletionRequest,
+    CompletionRequest,
     DetokenizeRequest,
     DetokenizeResponse,
     ErrorResponse,
@@ -13,6 +15,8 @@ from sglang.srt.entrypoints.openai.protocol import (
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
+from sglang.srt.entrypoints.openai.serving_completions import OpenAIServingCompletion
+from sglang.srt.managers.io_struct import GenerateReqInput
 
 logger = logging.getLogger(__name__)
 
@@ -20,120 +24,79 @@ logger = logging.getLogger(__name__)
 class OpenAIServingTokenize(OpenAIServingBase):
     """Handler for /v1/tokenize requests"""
 
-    def __init__(self, tokenizer_manager, template_manager=None):
+    def __init__(
+        self,
+        tokenizer_manager,
+        chat_serving: OpenAIServingChat,
+        completion_serving: OpenAIServingCompletion,
+    ):
         super().__init__(tokenizer_manager)
-        self.chat_serving: Optional[OpenAIServingChat] = (
-            OpenAIServingChat(tokenizer_manager, template_manager)
-            if template_manager is not None
-            else None
-        )
+        self.chat_serving = chat_serving
+        self.completion_serving = completion_serving
 
     def _request_id_prefix(self) -> str:
         return "tok-"
 
     def _convert_to_internal_request(
-        self, request: TokenizeRequest, raw_request: Request
-    ) -> tuple[TokenizeRequest, TokenizeRequest]:
-        return request, request
+        self,
+        request: Union[TokenizeRequest, ChatCompletionRequest, CompletionRequest],
+        raw_request: Request,
+    ) -> tuple[GenerateReqInput, Union[ChatCompletionRequest, CompletionRequest]]:
+        add_special_tokens = True
+        if isinstance(request, TokenizeRequest):
+            if request.messages is not None:
+                request = request.to_chat_completion_request()
+            else:
+                add_special_tokens = request.add_special_tokens
+                request = CompletionRequest.model_validate(
+                    request.model_dump(exclude_unset=True, exclude_none=True)
+                )
+
+        if isinstance(request, ChatCompletionRequest):
+            if error := self.chat_serving._validate_request(request):
+                raise ValueError(error)
+            return self.chat_serving._convert_to_internal_request(request, raw_request)
+
+        if error := self.completion_serving._validate_request(request):
+            raise ValueError(error)
+        adapted, request = self.completion_serving._convert_to_internal_request(
+            request, raw_request
+        )
+        if not add_special_tokens and adapted.text is not None:
+            encode = self.tokenizer_manager.tokenizer.encode
+            if isinstance(adapted.text, str):
+                adapted.input_ids = encode(adapted.text, add_special_tokens=False)
+            else:
+                adapted.input_ids = [
+                    encode(text, add_special_tokens=False) for text in adapted.text
+                ]
+            adapted.text = None
+        return adapted, request
 
     async def _handle_non_streaming_request(
         self,
-        adapted_request: TokenizeRequest,
-        request: TokenizeRequest,
+        adapted_request: GenerateReqInput,
+        request: Union[ChatCompletionRequest, CompletionRequest],
         raw_request: Request,
-    ) -> Union[TokenizeResponse, ErrorResponse]:
-        try:
-            tokenizer = self.tokenizer_manager.tokenizer
-            max_model_len = getattr(tokenizer, "model_max_length", -1)
-            # ORJSON accepts signed negative and unsigned positive 64-bit integers.
-            if isinstance(max_model_len, int) and not (
-                -(2**63) <= max_model_len < 2**64
-            ):
-                max_model_len = self.tokenizer_manager.model_config.context_len
-
-            if request.messages is not None:
-                token_ids = self._tokenize_chat_request(request)
-                tokens = token_ids
-                count = len(token_ids)
-            elif isinstance(request.prompt, str):
-                token_ids = tokenizer.encode(
-                    request.prompt,
-                    add_special_tokens=request.add_special_tokens,
-                )
-                tokens = token_ids
-                count = len(token_ids)
-            elif isinstance(request.prompt, list):
-                token_ids_list = [
-                    tokenizer.encode(
-                        text, add_special_tokens=request.add_special_tokens
-                    )
-                    for text in request.prompt
-                ]
-                tokens = token_ids_list
-                count = [len(ids) for ids in token_ids_list]
-            else:
-                return self.create_error_response(
-                    f"Invalid prompt type: {type(request.prompt)}. Expected str or List[str]."
-                )
-
-            return TokenizeResponse(
-                tokens=tokens, count=count, max_model_len=max_model_len
-            )
-        except ValueError as e:
-            return self.create_error_response(str(e))
-        except Exception as e:
-            logger.error("Error during tokenization", exc_info=True)
-            return self.create_error_response(
-                f"Internal server error during tokenization: {e}",
-                err_type="InternalServerError",
-                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
-            )
-
-    def _tokenize_chat_request(self, request: TokenizeRequest) -> List[int]:
-        if self.chat_serving is None:
-            raise ValueError("Chat template tokenization requires a template manager.")
-
-        chat_request = request.to_chat_completion_request()
-        validation_error = self.chat_serving._validate_request(chat_request)
-        if validation_error:
-            raise ValueError(validation_error)
-        if chat_request._format_add_generation_prompt is not None:
-            if (
-                self.chat_serving.template_manager.chat_template_name is not None
-                or self.chat_serving.chat_encoding_spec is not None
-            ):
-                raise ValueError(
-                    "add_generation_prompt is supported only with a Jinja chat template."
-                )
-            if (
-                chat_request.continue_final_message
-                and not chat_request._format_add_generation_prompt
-            ):
-                raise ValueError(
-                    "continue_final_message needs add_generation_prompt to open the "
-                    "assistant turn."
-                )
-
-        is_multimodal = self.tokenizer_manager.model_config.is_multimodal
-        processed_messages = self.chat_serving._process_messages(
-            chat_request, is_multimodal
+    ) -> TokenizeResponse:
+        tokens = await self.tokenizer_manager.tokenize_request(
+            adapted_request, raw_request
         )
+        count = (
+            [len(ids) for ids in tokens]
+            if tokens and isinstance(tokens[0], list)
+            else len(tokens)
+        )
+        max_model_len = getattr(
+            self.tokenizer_manager.tokenizer, "model_max_length", -1
+        )
+        # ORJSON accepts signed negative and unsigned positive 64-bit integers.
+        if not isinstance(max_model_len, int) or not -(2**63) <= max_model_len < 2**64:
+            max_model_len = self.tokenizer_manager.model_config.context_len
+        return TokenizeResponse(tokens=tokens, count=count, max_model_len=max_model_len)
 
-        prompt_ids = processed_messages.prompt_ids
-        if isinstance(prompt_ids, list) and (
-            prompt_ids or not processed_messages.prompt
-        ):
-            return prompt_ids
-        if isinstance(prompt_ids, str):
-            return self.tokenizer_manager.tokenizer.encode(
-                prompt_ids, add_special_tokens=False
-            )
-        if processed_messages.prompt:
-            return self.tokenizer_manager.tokenizer.encode(
-                processed_messages.prompt, add_special_tokens=False
-            )
-
-        raise ValueError("Failed to render chat messages into token ids.")
+    # A generation payload with stream=true still has one tokenize response.
+    _handle_streaming_request = _handle_non_streaming_request
 
 
 class OpenAIServingDetokenize(OpenAIServingBase):

@@ -1707,13 +1707,18 @@ def strip_mm_features_for_pp_relay(reqs: List) -> List:
     Only the first PP rank embeds multimodal inputs; later ranks need just the pad
     values, which come from the item hash, so hashed items drop their feature tensor.
     """
-    return [_strip_mm_features(req) for req in reqs]
+    # Per-prompt tokenize replies finish on PP0. Later stages have no forward to run.
+    return [
+        _strip_mm_features(req)
+        for req in reqs
+        if not (isinstance(req, TokenizedGenerateReqInput) and req.tokenize_only)
+    ]
 
 
 def _strip_mm_features(req):
     if isinstance(req, BaseBatchReq):
         return msgspec.structs.replace(
-            req, batch=[_strip_mm_features(sub_req) for sub_req in req.batch]
+            req, batch=strip_mm_features_for_pp_relay(req.batch)
         )
     if not isinstance(req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)):
         return req
