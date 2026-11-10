@@ -13,6 +13,8 @@ with input scale before the route-weighted sum, which a combining MoE epilogue c
 
 from __future__ import annotations
 
+import importlib.util
+
 import torch
 
 from sglang.kernels.ops.moe.mxfp4_compact_a4_moe import MAX_ROWS as COMPACT_A4_MAX_ROWS
@@ -21,8 +23,21 @@ from sglang.kernels.ops.quantization.mxfp4_quant_rows import mxfp4_quant_rows
 from sglang.srt.environ import envs
 from sglang.srt.rocm_muse_spark import muse_moe_flydsl
 
-COMPACT_A4_ENABLED = envs.SGLANG_MUSE_COMPACT_A4_VERIFY.get()
-A4W4_ENABLED = envs.SGLANG_MUSE_A4W4_MOE.get()
+
+def _has_module(name: str) -> bool:
+    try:
+        return importlib.util.find_spec(name) is not None
+    except ImportError:  # a missing parent package
+        return False
+
+
+# Both paths finalize through aiter's FlyDSL Muse finalize (3rdparty/amd/muse_spark aiter patch 04); an
+# aiter without it keeps the Triton expert path.
+_HAS_AITER_MUSE_FINALIZE = _has_module("aiter.ops.flydsl.muse_moe_finalize")
+COMPACT_A4_ENABLED = (
+    envs.SGLANG_MUSE_COMPACT_A4_VERIFY.get() and _HAS_AITER_MUSE_FINALIZE
+)
+A4W4_ENABLED = envs.SGLANG_MUSE_A4W4_MOE.get() and _HAS_AITER_MUSE_FINALIZE
 A4W4_MIN_ROWS = 256
 # Stage-1 launch (tile_n, async copy, waves per EU), MI355X prefill widths.
 _S1_TILE_N = 128
