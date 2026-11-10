@@ -53,6 +53,10 @@ class _RecordingAllocator(SWATokenToKVPoolAllocator):
 class _Sender:
     """Transfers remain in flight until the test explicitly retires them."""
 
+    # No transfer engine: a page move waits for nothing of these sends.
+    kv_mgr = None
+    bootstrap_room = 0
+
     def __init__(self):
         self.in_flight = set()
         self.sends = []
@@ -79,7 +83,9 @@ def _scheduler(cache, allocator, pool):
     scheduler.kv_checksum_computer = None
     scheduler.disagg_metadata_buffers = SimpleNamespace(set_buf=lambda req: None)
     scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(
-        kv_manager=SimpleNamespace(kv_args=SimpleNamespace(state_types=[]))
+        kv_manager=SimpleNamespace(
+            kv_args=SimpleNamespace(state_types=[], state_sub_pools=[])
+        )
     )
     scheduler.disagg_prefill_pending_chunk_rids = set()
     return scheduler
@@ -267,7 +273,12 @@ class TestPrefillSendProtection(CustomTestCase):
                 scheduler = _scheduler(
                     SimpleNamespace(supports_prefix_sharing=lambda: sharing),
                     SimpleNamespace(
-                        page_size=4, translate_kv_indices_for_transfer=lambda x: x
+                        page_size=4,
+                        translate_kv_indices_for_transfer=lambda x: x,
+                        # A pool whose rows never move records no transfer.
+                        storage=SimpleNamespace(
+                            record_network_transfer=lambda *args, **kwargs: None
+                        ),
                     ),
                     SimpleNamespace(req_to_token=torch.arange(32).reshape(1, -1)),
                 )

@@ -81,6 +81,58 @@ class TestCpuOffloader(CustomTestCase):
         if self.device is None:
             self.skipTest("An accelerator is required to exercise CPU offload")
 
+    @unittest.skipUnless(
+        torch.cuda.is_available() and not torch.version.hip,
+        "CUDA GDN input projections",
+    )
+    def test_gdn_input_projections_after_cpu_offload(self) -> None:
+        """Offloaded GDN projections must not retain a host-only fused weight (#47896)."""
+        from sglang.srt.models.qwen3_5 import Qwen3_5GatedDeltaNet
+
+        class InputProjections(nn.Module):
+            forward = Qwen3_5GatedDeltaNet._forward_input_proj
+
+            def __init__(self, device):
+                super().__init__()
+                self._fused_in_proj_weight = None
+                self._fused_input_proj_cpu_enabled = SimpleNamespace(value=False)
+                self.alt_stream = None
+                for name, width in (("in_proj_qkvz", 8), ("in_proj_ba", 4)):
+                    projection = MergedColumnParallelLinear(
+                        4,
+                        [width],
+                        bias=False,
+                        params_dtype=torch.bfloat16,
+                        parallel_group="replicated",
+                    ).to(device)
+                    projection.weight.data.normal_()
+                    setattr(self, name, projection)
+
+        for offloaded in (
+            ("in_proj_qkvz",),
+            ("in_proj_ba",),
+            ("in_proj_qkvz", "in_proj_ba"),
+        ):
+            with self.subTest(offloaded=offloaded), torch.no_grad():
+                model = InputProjections(self.device)
+                inputs = torch.randn((2, 4), dtype=torch.bfloat16, device=self.device)
+                expected = model(inputs)
+                offloader = OffloaderV1(cpu_offload_max_bytes=1024**2)
+                projections = [model.get_submodule(name) for name in offloaded]
+                for projection in projections:
+                    offloader.maybe_offload_to_cpu(projection)
+
+                with patch(
+                    "sglang.srt.models.qwen3_5.get_lora",
+                    return_value=SimpleNamespace(enable_lora=False, lora_paths=None),
+                ):
+                    Qwen3_5GatedDeltaNet.finalize_fused_in_proj(model)
+
+                self.assertIsNone(model._fused_in_proj_weight)
+                torch.testing.assert_close(model(inputs), expected)
+                for projection in projections:
+                    self.assertEqual(projection.weight.device.type, "cpu")
+
     def test_cpu_offloaded_gemma_weight_fills_device_buffer(self) -> None:
         norm = GemmaRMSNorm(16).to(self.device)
         norm = OffloaderV1(cpu_offload_max_bytes=1024**2).maybe_offload_to_cpu(norm)
