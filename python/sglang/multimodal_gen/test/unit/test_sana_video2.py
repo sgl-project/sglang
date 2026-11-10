@@ -151,6 +151,30 @@ class TestSanaVideo2(unittest.TestCase):
             rebuilt = model(x, t * 2, y, mask)
         torch.testing.assert_close(steps, [first, rebuilt], rtol=0, atol=0)
 
+    def test_fused_rope_tables_follow_kernel_layout(self):
+        from sglang.multimodal_gen.runtime.models.dits.sana_video2 import (
+            _apply_rope,
+            _apply_rope_pair,
+            _rope_tables,
+        )
+
+        torch.manual_seed(19)
+        model = self.small_model()
+        for rope, head_dim in ((model.rope_linear, 12), (model.rope_softmax, 24)):
+            freqs = rope((2, 2, 2), torch.device("cpu"))
+            cos, sin = _rope_tables(freqs)
+            self.assertEqual(tuple(cos.shape), (1, 8, 1, head_dim))
+            self.assertEqual((cos.dtype, sin.dtype), (torch.float64, torch.float64))
+            self.assertTrue(cos.is_contiguous() and sin.is_contiguous())
+            parts = torch.view_as_real(freqs)[0, 0]
+            for column in (0, 1):
+                self.assertTrue(torch.equal(cos[0, :, 0, column::2], parts[..., 0]))
+                self.assertTrue(torch.equal(sin[0, :, 0, column::2], parts[..., 1]))
+            x = torch.randn(1, 2, 8, head_dim).to(torch.bfloat16)
+            q, k = _apply_rope_pair(q=x, k=x.flip(1), rope=(freqs, cos, sin))
+            self.assertTrue(torch.equal(q, _apply_rope(x, freqs)))
+            self.assertTrue(torch.equal(k, _apply_rope(x.flip(1), freqs)))
+
     def test_official_checkpoint_names_and_output_sign(self):
         torch.manual_seed(17)
         model = self.small_model()

@@ -10,6 +10,11 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from sglang.kernels.ops.diffusion import (
+    BitExactFusionGate,
+    fused_interleaved_rope_fp64,
+    tensors_equal,
+)
 from sglang.multimodal_gen.configs.models.dits.sana_video2 import SanaVideo2Config
 from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
 from sglang.multimodal_gen.runtime.models.dits.sana_wm_components import (
@@ -20,12 +25,67 @@ from sglang.multimodal_gen.runtime.models.dits.sana_wm_components import (
     WanRotaryPosEmbed,
     _RMSNorm,
 )
-from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
+_is_cuda = current_platform.is_cuda()
+_SANA_VIDEO2_ROPE = BitExactFusionGate("SANA-Video 2.0 fused RoPE", per_signature=True)
 
 
 def _apply_rope(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
     rotated = torch.view_as_complex(x.to(torch.float64).unflatten(-1, (-1, 2)))
     return torch.view_as_real(rotated * freqs).flatten(-2).type_as(x)
+
+
+def _rope_tables(freqs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    parts = torch.view_as_real(freqs)
+    tokens = freqs.shape[-2]
+    # fused_interleaved_rope_fp64 reads cos at even and sin at odd columns of [1, S, 1, D].
+    cos = parts[..., 0].repeat_interleave(2, dim=-1).reshape(1, tokens, 1, -1)
+    sin = parts[..., 1].repeat_interleave(2, dim=-1).reshape(1, tokens, 1, -1)
+    return cos.contiguous(), sin.contiguous()
+
+
+def _apply_rope_pair(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    rope: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    freqs, cos, sin = rope
+
+    def reference():
+        return _apply_rope(q, freqs), _apply_rope(k, freqs)
+
+    q_bshd, k_bshd = q.transpose(1, 2), k.transpose(1, 2)
+    if not (
+        _is_cuda
+        and q.is_cuda
+        and q.dtype is torch.bfloat16
+        and k.dtype is torch.bfloat16
+        and q_bshd.is_contiguous()
+        and k_bshd.is_contiguous()
+        and not torch.is_grad_enabled()
+    ):
+        return reference()
+
+    def fused():
+        q_out, k_out = fused_interleaved_rope_fp64(q_bshd, k_bshd, cos, sin)
+        return q_out.transpose(1, 2), k_out.transpose(1, 2)
+
+    sig = (
+        tuple(q.shape),
+        tuple(q.stride()),
+        tuple(k.stride()),
+        q.device.index,
+        cos.data_ptr(),
+    )
+    return _SANA_VIDEO2_ROPE.run(
+        fused, reference, sig=sig, equal=tensors_equal, logger=logger
+    )
 
 
 class SanaVideo2RotaryPosEmbed(WanRotaryPosEmbed):
@@ -72,8 +132,10 @@ class GatedLinearAttention(nn.Module):
         )
         v = v.transpose(-1, -2).reshape(batch, self.heads, self.dim, tokens)
         if rotary_emb is not None:
-            q = _apply_rope(q.transpose(-1, -2), rotary_emb).transpose(-1, -2)
-            k = _apply_rope(k.transpose(-1, -2), rotary_emb).transpose(-1, -2)
+            q, k = _apply_rope_pair(
+                q=q.transpose(-1, -2), k=k.transpose(-1, -2), rope=rotary_emb
+            )
+            q, k = q.transpose(-1, -2), k.transpose(-1, -2)
         beta = self.beta_proj(x).sigmoid().transpose(1, 2).unsqueeze(2)
         k = k * beta
         if self.fp32_attention:
@@ -104,7 +166,7 @@ class GatedSoftmaxAttention(nn.Module):
         k = self.k_norm(k).reshape(batch, tokens, self.heads, self.dim).transpose(1, 2)
         v = v.reshape(batch, tokens, self.heads, self.dim).transpose(1, 2)
         if rotary_emb is not None:
-            q, k = _apply_rope(q, rotary_emb), _apply_rope(k, rotary_emb)
+            q, k = _apply_rope_pair(q=q, k=k, rope=rotary_emb)
         if self.fp32_attention:
             q, k, v = q.float(), k.float(), v.float()
         out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0)
@@ -306,9 +368,11 @@ class SanaVideo2Transformer3DModel(BaseDiT):
         x = self.x_embedder(hidden_states.to(self.dtype))
         ropes_key = (frames, height, width, x.device)
         if ropes_key != self._ropes_key:
+            linear = self.rope_linear((frames, height, width), x.device)
+            softmax = self.rope_softmax((frames, height, width), x.device)
             self._ropes = {
-                "linear": self.rope_linear((frames, height, width), x.device),
-                "softmax": self.rope_softmax((frames, height, width), x.device),
+                "linear": (linear, *_rope_tables(linear)),
+                "softmax": (softmax, *_rope_tables(softmax)),
             }
             self._ropes_key = ropes_key
         ropes = self._ropes

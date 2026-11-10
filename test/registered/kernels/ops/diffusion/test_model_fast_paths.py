@@ -44,6 +44,7 @@ import sglang.multimodal_gen.runtime.models.dits.ltx_2 as ltx2_module
 import sglang.multimodal_gen.runtime.models.dits.qwen_image as qwen_image
 import sglang.multimodal_gen.runtime.models.dits.qwen_image21 as qwen_image21
 import sglang.multimodal_gen.runtime.models.dits.sana as sana
+import sglang.multimodal_gen.runtime.models.dits.sana_video2 as sana_video2
 from sglang.kernels.ops.diffusion import (
     FUSED_LN_MODULATE,
     HUNYUAN_QKNORM,
@@ -980,6 +981,84 @@ def test_longcat_qknorm_rope_is_bit_exact():
     assert torch.equal(k_out, k_ref)
     assert longcat_image._LONGCAT_QKNORM_ROPE.verified
     assert not longcat_image._LONGCAT_QKNORM_ROPE.disabled
+
+
+# -------------------------------------------------------------------------
+# SANA-Video 2.0 -- paired fp64 RoPE on the model's q/k views (bit-exact)
+# -------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("heads,head_dim", [(20, 128), (10, 256)])
+def test_sana_video2_rope_pair_is_bit_exact(heads, head_dim, monkeypatch):
+    torch.manual_seed(5)
+    gate = sana_video2._SANA_VIDEO2_ROPE
+    monkeypatch.setattr(gate, "disabled", False)
+    monkeypatch.setattr(gate, "verified", False)
+    monkeypatch.setattr(gate, "verified_sigs", set())
+    batch, frames, height, width = 2, 3, 4, 5
+    rope = sana_video2.SanaVideo2RotaryPosEmbed(head_dim, (1, 1, 1)).to("cuda")
+    freqs = rope((frames, height, width), torch.device("cuda"))
+    tables = (freqs, *sana_video2._rope_tables(freqs))
+    tokens = frames * height * width
+    x = torch.randn(
+        batch, tokens, heads * head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    q = x.reshape(batch, tokens, heads, head_dim).transpose(1, 2)
+    k = x.flip(1).reshape(batch, tokens, heads, head_dim).transpose(1, 2)
+    with torch.no_grad():
+        q_out, k_out = sana_video2._apply_rope_pair(q=q, k=k, rope=tables)
+        q_ref, k_ref = (
+            sana_video2._apply_rope(q, freqs),
+            sana_video2._apply_rope(k, freqs),
+        )
+    assert torch.equal(q_out, q_ref)
+    assert torch.equal(k_out, k_ref)
+    assert q_out.stride() == q_ref.stride()
+    assert k_out.stride() == k_ref.stride()
+    assert len(gate.verified_sigs) == 1
+    assert not gate.disabled
+    freqs2 = rope((frames + 1, height, width), torch.device("cuda"))
+    tokens2 = (frames + 1) * height * width
+    x2 = torch.randn(
+        batch, tokens2, heads * head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    q2 = x2.reshape(batch, tokens2, heads, head_dim).transpose(1, 2)
+    with torch.no_grad():
+        q2_out, _ = sana_video2._apply_rope_pair(
+            q=q2, k=q2, rope=(freqs2, *sana_video2._rope_tables(freqs2))
+        )
+    assert torch.equal(q2_out, sana_video2._apply_rope(q2, freqs2))
+    assert len(gate.verified_sigs) == 2
+    assert not gate.disabled
+    packed = torch.randn(
+        batch, tokens, 3 * heads * head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    q_strided = (
+        packed.reshape(batch, tokens, 3, heads * head_dim)
+        .unbind(2)[0]
+        .reshape(batch, tokens, heads, head_dim)
+        .transpose(1, 2)
+    )
+    assert not q_strided.transpose(1, 2).is_contiguous()
+    cases = [
+        (q_strided, q_strided, torch.no_grad()),
+        (q.float(), k.float(), torch.no_grad()),
+        (q, k, torch.enable_grad()),
+    ]
+    for q_case, k_case, mode in cases:
+        with (
+            mode,
+            patch.object(
+                sana_video2, "fused_interleaved_rope_fp64", side_effect=AssertionError
+            ),
+        ):
+            q_case_out, k_case_out = sana_video2._apply_rope_pair(
+                q=q_case, k=k_case, rope=tables
+            )
+        assert torch.equal(q_case_out, sana_video2._apply_rope(q_case, freqs))
+        assert torch.equal(k_case_out, sana_video2._apply_rope(k_case, freqs))
+    assert len(gate.verified_sigs) == 2
+    assert not gate.disabled
 
 
 # -------------------------------------------------------------------------
