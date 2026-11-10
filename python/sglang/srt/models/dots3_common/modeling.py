@@ -39,6 +39,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.batch_overlap.two_batch_overlap import (
     MaybeTboDeepEPDispatcher,
@@ -53,7 +54,7 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.attention.dsa.dsa_indexer import Indexer
+from sglang.srt.layers.attention.dsa.dsa_fp4_indexer import dsa_indexer_cls
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layer_boundary import (
     append_stages,
@@ -101,7 +102,7 @@ from sglang.srt.managers.mm_utils import (
 )
 from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
-from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc, window_write_locs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
@@ -679,7 +680,7 @@ class Dots3AttentionMLA(nn.Module):
             assert self.q_lora_rank is not None, (
                 "Dots3 NSA requires q_lora_rank to be set in the config."
             )
-            self.indexer = Indexer(
+            self.indexer = dsa_indexer_cls()(
                 hidden_size=self.hidden_size,
                 index_n_heads=config.index_n_heads,
                 index_head_dim=config.index_head_dim,
@@ -853,6 +854,7 @@ class Dots3AttentionMLA(nn.Module):
 
     def _get_kv_write_loc(self, forward_batch):
         swa_loc = None
+        backend = None
         if self.use_swa:
             backend = get_attn_backend()
             from sglang.srt.layers.attention.dots_hybrid_backend import (
@@ -879,7 +881,12 @@ class Dots3AttentionMLA(nn.Module):
                 swa_loc = backend.runner_ids.ids_in(
                     IdSpaceKind.SLIDING_WINDOW, out_cache_loc
                 )
-        return KVWriteLoc.for_batch(forward_batch, swa_loc=swa_loc)
+        return KVWriteLoc.for_batch(
+            forward_batch,
+            window_locs=window_write_locs(
+                None if backend is None else backend.runner_ids, swa_loc
+            ),
+        )
 
     def forward(
         self,
@@ -1780,6 +1787,7 @@ class Dots3LanguageModelForCausalLM(nn.Module):
                 if not (
                     self_attn.qk_nope_head_dim % weight_block_size[0] == 0
                     and self_attn.v_head_dim % weight_block_size[0] == 0
+                    and current_arch().is_sm(9)
                     and envs.SGLANG_USE_DEEPGEMM_BMM.get()
                 ):
                     # NOTE(xiaozhi): At this point, we do not requant but change to use BF16.
@@ -2307,8 +2315,12 @@ class Dots3LanguageModelForCausalLM(nn.Module):
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
+    @staticmethod
+    def sliding_layer_window_size(config):
+        return get_attention_sliding_window_size(config)
+
     def get_attention_sliding_window_size(self):
-        return get_attention_sliding_window_size(self.config)
+        return self.sliding_layer_window_size(self.config)
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):

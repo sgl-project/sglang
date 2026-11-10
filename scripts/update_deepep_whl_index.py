@@ -42,7 +42,7 @@ def update_wheel_index(
     wheel_dir: pathlib.Path,
     repository: pathlib.Path,
     package: str = "sgl-deep-ep",
-    release_tag_prefix: str = "v",
+    release_tag_prefix: str = "",
 ) -> None:
     if cuda_version not in SUPPORTED_CUDA_VERSIONS:
         raise ValueError(f"Unsupported CUDA version: {cuda_version}")
@@ -70,7 +70,7 @@ def update_wheel_index(
         if not match or suffix not in match.group("version"):
             continue
         public_version = match.group("version").split("+", 1)[0]
-        tag = f"{release_tag_prefix}{public_version}"
+        tag = f"{release_tag_prefix or package + '-v'}{public_version}"
         url = f"{release_base}/{tag}/{path.name}#sha256={_sha256(path)}"
         entries[path.name] = f'<a href="{url}">{path.name}</a><br>'
 
@@ -84,8 +84,9 @@ def main() -> None:
     parser.add_argument("--package", default="sgl-deep-ep", choices=SUPPORTED_PACKAGES)
     parser.add_argument(
         "--release-tag-prefix",
-        default="v",
-        help="Prefix of the sgl-project/whl release tag that holds the wheels",
+        default=None,
+        help="Prefix of the sgl-project/whl release tag that holds the wheels "
+        "(default: '<package>-v', e.g. 'sgl-deep-ep-v')",
     )
     parser.add_argument("--wheel-dir", type=pathlib.Path, default=pathlib.Path("dist"))
     parser.add_argument(

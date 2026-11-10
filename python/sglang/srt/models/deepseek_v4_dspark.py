@@ -141,7 +141,6 @@ class DSparkAttention(MqaAttentionBase):
             prefix=add_prefix("attn", prefix),
         )
 
-        self._use_fast_kernel = envs.SGLANG_DSPARK_FAST_KERNEL.get()
         self.alt_streams = alt_streams
         self._multi_stream_bs_limit = 128 if get_platform().is_blackwell else 64
         if _is_npu:
@@ -202,7 +201,7 @@ class DSparkAttention(MqaAttentionBase):
             if q_out is not None and q_out.dtype == torch.float8_e4m3fn:
                 fused_q_norm_rope(q, q_out, None, self.freqs_cis, positions)
                 return q_out
-            if self._use_fast_kernel and not _is_npu:
+            if not _is_npu:
                 fused_rope_inplace(
                     q[..., -self.rope_head_dim :],
                     None,
@@ -217,46 +216,35 @@ class DSparkAttention(MqaAttentionBase):
                 return q
             q_out.copy_(q)
             return q_out
-        if self._use_fast_kernel:
+        if not _is_npu:
             if q_out is None:
                 q_out = torch.empty_like(q)
             fused_q_norm_rope(q, q_out, self.eps, self.freqs_cis, positions)
             return q_out
-        else:
-            if _is_npu:
-                import torch_npu
+        import torch_npu
 
-                from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import (
-                    Dsv4NpuRoPE,
-                )
+        from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE
 
-                q = torch_npu.npu_rms_norm(q, self._q_post_norm_weight, self.eps)[0]
-                cos4, sin4 = Dsv4NpuRoPE.for_freqs(self.freqs_cis).get_cos_sin(
-                    positions,
-                    q.dtype,
-                    view_4d=True,
-                    inverse=False,
-                    allow_build=True,
-                    cache_dtype=torch.float32,
-                )
-                Dsv4NpuRoPE.apply_rotary_mul_inplace(
-                    q,
-                    None,
-                    cos4,
-                    sin4,
-                    qk_nope_dim=q.shape[-1] - self.rope_head_dim,
-                )
-            else:
-                q = q * torch.rsqrt(
-                    q.float().square().mean(-1, keepdim=True) + self.eps
-                ).to(q.dtype)
-                apply_rotary_emb(
-                    q[..., -self.rope_head_dim :], self.freqs_cis[positions]
-                )
-            if q_out is not None:
-                q_out.copy_(q)
-                return q_out
-            return q
+        q = torch_npu.npu_rms_norm(q, self._q_post_norm_weight, self.eps)[0]
+        cos4, sin4 = Dsv4NpuRoPE.for_freqs(self.freqs_cis).get_cos_sin(
+            positions,
+            q.dtype,
+            view_4d=True,
+            inverse=False,
+            allow_build=True,
+            cache_dtype=torch.float32,
+        )
+        Dsv4NpuRoPE.apply_rotary_mul_inplace(
+            q,
+            None,
+            cos4,
+            sin4,
+            qk_nope_dim=q.shape[-1] - self.rope_head_dim,
+        )
+        if q_out is not None:
+            q_out.copy_(q)
+            return q_out
+        return q
 
     def forward(
         self,
@@ -345,11 +333,11 @@ class DSparkAttention(MqaAttentionBase):
         if o.shape[1] != self.n_local_heads:
             o = o[:, : self.n_local_heads, :]
 
-        if self._use_fast_kernel:
+        if not _is_npu:
             fused_rope_inplace(
                 o[..., -rd:], None, self.freqs_cis, positions=positions, inverse=True
             )
-        elif _is_npu:
+        else:
             from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE
 
             cos4, sin4 = Dsv4NpuRoPE.for_freqs(self.freqs_cis).get_cos_sin(
@@ -367,8 +355,6 @@ class DSparkAttention(MqaAttentionBase):
                 sin4,
                 qk_nope_dim=o.shape[-1] - rd,
             )
-        else:
-            apply_rotary_emb(o[..., -rd:], self.freqs_cis[positions], inverse=True)
 
         o = o.view(
             o.shape[0],
@@ -376,7 +362,7 @@ class DSparkAttention(MqaAttentionBase):
             o.shape[1] * o.shape[2] // self.n_local_groups,
         )
         wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
-        if self._use_fast_kernel:
+        if not _is_npu:
             o = _apply_wo_a_bf16_matmul(
                 o,
                 wo_a,
