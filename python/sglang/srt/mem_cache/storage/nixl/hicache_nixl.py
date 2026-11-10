@@ -461,24 +461,7 @@ class HiCacheNixl(HiCacheStorage):
             # the prefetch and backup threads. The logical payload matches one
             # flat data page; the physical slot is padded to whole blocks when
             # the backend (O_DIRECT / DOCA_MEMOS) requires aligned transfers.
-            asymmetric_pool = (
-                self._get_asymmetric_pool(mem_pool_host)
-                if self.backend_selector.backend_name == "DOCA_MEMOS"
-                else None
-            )
-            if asymmetric_pool is not None:
-                page_numel = (
-                    asymmetric_pool.layer_num
-                    * asymmetric_pool.page_size
-                    * asymmetric_pool.head_num
-                    * (asymmetric_pool.head_dim + asymmetric_pool.v_head_dim)
-                )
-                page_dtype = asymmetric_pool.dtype
-            else:
-                sample = mem_pool_host.get_dummy_flat_data_page()
-                page_numel = sample.numel()
-                page_dtype = sample.dtype
-                del sample
+            page_numel, page_dtype = self._flat_page_shape(mem_pool_host)
             slot_numel = self._bounce_slot_numel(page_numel, page_dtype.itemsize)
             self._bounce_page_numel = page_numel
             self._bounce_page_bytes = slot_numel * page_dtype.itemsize
@@ -542,13 +525,10 @@ class HiCacheNixl(HiCacheStorage):
                 host_pool=host_pool, is_zero_copy=True
             )
         else:
-            sample = host_pool.get_dummy_flat_data_page()
-            page_numel = sample.numel()
             # Serialized index and Mamba pages can differ from the pool dtype.
-            page_dtype = sample.dtype
-            slot_numel = self._bounce_slot_numel(page_numel, sample.element_size())
-            slot_bytes = slot_numel * sample.element_size()
-            del sample
+            page_numel, page_dtype = self._flat_page_shape(host_pool)
+            slot_numel = self._bounce_slot_numel(page_numel, page_dtype.itemsize)
+            slot_bytes = slot_numel * page_dtype.itemsize
 
             pin_memory = bool(getattr(host_pool, "pin_memory", False))
             bounce_set = self._alloc_registered(
@@ -583,6 +563,26 @@ class HiCacheNixl(HiCacheStorage):
         if not isinstance(data_pool, AsymmetricMHATokenToKVPoolHost):
             return None
         return data_pool
+
+    def _flat_page_shape(self, host_pool: HostKVCache) -> tuple[int, torch.dtype]:
+        asymmetric_pool = (
+            self._get_asymmetric_pool(host_pool)
+            if self.backend_selector.backend_name == "DOCA_MEMOS"
+            else None
+        )
+        if asymmetric_pool is not None:
+            return (
+                asymmetric_pool.layer_num
+                * asymmetric_pool.page_size
+                * asymmetric_pool.head_num
+                * (asymmetric_pool.head_dim + asymmetric_pool.v_head_dim),
+                asymmetric_pool.dtype,
+            )
+        sample = host_pool.get_dummy_flat_data_page()
+        page_numel = sample.numel()
+        page_dtype = sample.dtype
+        del sample
+        return page_numel, page_dtype
 
     def _get_asymmetric_flat_data_page(
         self, asymmetric_pool: AsymmetricMHATokenToKVPoolHost, index: int
@@ -765,8 +765,17 @@ class HiCacheNixl(HiCacheStorage):
             return host_pool, [], [], [], 0
 
         if for_write:
+            asymmetric_pool = (
+                self._get_asymmetric_pool(host_pool)
+                if self.backend_selector.backend_name == "DOCA_MEMOS"
+                else None
+            )
             for i, page_offset in enumerate(page_offsets):
-                src = host_pool.get_data_page(page_offset, flat=True)
+                src = (
+                    self._get_asymmetric_flat_data_page(asymmetric_pool, page_offset)
+                    if asymmetric_pool is not None
+                    else host_pool.get_data_page(page_offset, flat=True)
+                )
                 self._copy_to_bounce_slot(bounce[i], src, ctx.bounce_page_numel)
 
         host_buffers = self._get_bounce_slot_buffers(
@@ -1215,15 +1224,23 @@ class HiCacheNixl(HiCacheStorage):
                 ctx = self._hybrid_pool_ctx[transfer.name]
                 page_results = self._page_results(transfer_results, key_multiplier)
                 if not ctx.is_zero_copy:
+                    asymmetric_pool = (
+                        self._get_asymmetric_pool(host_pool)
+                        if self.backend_selector.backend_name == "DOCA_MEMOS"
+                        else None
+                    )
                     for ok, page_offset, data_page in zip(
                         page_results, page_offsets, ctx.bounce_get
                     ):
                         if not ok:
                             break
-                        host_pool.set_from_flat_data_page(
-                            page_offset,
-                            data_page.reshape(-1)[: ctx.bounce_page_numel],
-                        )
+                        flat_page = data_page.reshape(-1)[: ctx.bounce_page_numel]
+                        if asymmetric_pool is not None:
+                            self._set_asymmetric_flat_data_page(
+                                asymmetric_pool, page_offset, flat_page
+                            )
+                        else:
+                            host_pool.set_from_flat_data_page(page_offset, flat_page)
                 pool_results.extend(page_results)
                 if not all(page_results):
                     break
