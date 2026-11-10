@@ -32,7 +32,6 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     SidecarPoolSpec,
 )
-from sglang.srt.mem_cache.kv.plan import TREE_WINDOW
 from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
@@ -110,15 +109,9 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
         )
         cache.sidecar_pool_specs = []
         cache.components = {}
-        cache._family_slot_ids = {}
+        cache._window_slots = ()
         scheduler.tree_cache = cache
         return scheduler
-
-    @staticmethod
-    def _attach_window(scheduler, slot, full_window_pages):
-        cache = scheduler.tree_cache
-        cache.components[slot] = SimpleNamespace(full_window_pages=full_window_pages)
-        cache._family_slot_ids[TREE_WINDOW] = slot
 
     def test_physical_primary_and_components_match_actual_write_keys(self):
         store = self._store(registered=(PoolName.SWA, PoolName.MAMBA, PoolName.INDEXER))
@@ -128,7 +121,10 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
         mamba.temporal_state_elem_size = 1
         mamba.get_page_buffer_meta = self._host_pool(3).get_page_buffer_meta
         scheduler = self._scheduler(store)
-        self._attach_window(scheduler, ComponentType.SWA, 3)
+        scheduler.tree_cache.components[ComponentType.SWA] = SimpleNamespace(
+            full_window_pages=3, pool_name=PoolName.SWA
+        )
+        scheduler.tree_cache._window_slots = (ComponentType.SWA,)
         scheduler.tree_cache.sidecar_pool_specs = [
             _sidecar(PoolName.INDEXER, PoolHitPolicy.ALL_PAGES)
         ]
@@ -175,6 +171,42 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
             ],
         )
 
+    def test_every_window_pool_keys_and_trails_by_its_own_name(self):
+        """Window host pools named by their sub-pools each get keys named by
+        the pool and a trailing-page hit of their own window."""
+        windows = {"window_4096": 2, "window_512": 5, "window": 3}
+        store = self._store(registered=tuple(windows))
+        store.mem_pool_host = self._host_pool()
+        scheduler = self._scheduler(store)
+        components = {}
+        for i, (name, pages) in enumerate(windows.items()):
+            ct = ComponentType.SWA if i == 0 else ComponentType.of(f"TEST_{name}")
+            components[ct] = SimpleNamespace(full_window_pages=pages, pool_name=name)
+        scheduler.tree_cache.components.update(components)
+        scheduler.tree_cache._window_slots = tuple(components)
+
+        layout = scheduler.get_hicache_l3_cache_layout(GetHiCacheL3LayoutReq()).layout
+        pools = layout["hicache_object_layout"]["pools"]
+        self.assertEqual([p["pool"] for p in pools], ["kv", *windows])
+        self.assertTrue(layout["enabled"])
+        for pool in pools[1:]:
+            with self.subTest(pool=pool["pool"]):
+                self.assertEqual(pool["hit_policy"], "trailing_pages")
+                self.assertEqual(pool["trailing_pages"], windows[pool["pool"]])
+                self.assertEqual(pool["suffixes"], [f"__{pool['pool']}"])
+        # A key names its own pool, so windows never share an object.
+        suffixes = [s for pool in pools for s in pool["suffixes"]]
+        self.assertEqual(len(set(suffixes)), len(suffixes))
+
+    def test_unknown_pool_name_has_no_keys(self):
+        """A registered pool that is neither a known pool nor a window pool
+        is refused rather than keyed as a window."""
+        store = self._store(registered=("not_a_pool",))
+        with self.assertRaisesRegex(ValueError, "Unsupported Mooncake hybrid pool"):
+            store._get_hybrid_page_component_keys(
+                ["page"], PoolTransfer(name="not_a_pool")
+            )
+
     def test_handler_and_startup_share_enabled_and_disabled_envelopes(self):
         store = self._store(registered=(PoolName.SWA,))
         for hierarchical, backend, pp_size, mla in (
@@ -194,7 +226,10 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
                 store.is_mla_backend = mla
                 store.registered_pools[PoolName.SWA].v_buffer = object()
                 scheduler = self._scheduler(backend, hierarchical=hierarchical)
-                self._attach_window(scheduler, ComponentType.SWA, 2)
+                scheduler.tree_cache.components[ComponentType.SWA] = SimpleNamespace(
+                    full_window_pages=2, pool_name=PoolName.SWA
+                )
+                scheduler.tree_cache._window_slots = (ComponentType.SWA,)
                 reply = scheduler.get_hicache_l3_cache_layout(GetHiCacheL3LayoutReq())
                 self.assertEqual(
                     reply.layout, scheduler.get_init_info()["hicache_object_layout"]
@@ -205,22 +240,6 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
                 )
                 if not reply.layout["enabled"]:
                     self.assertTrue(reply.layout["reason"])
-
-    def test_window_named_by_its_sub_pool_reports_its_trailing_pages(self):
-        """A unified window's slot is named by its sub-pool, not `SWA`; the
-        layout still finds it by family and reports its window."""
-        store = self._store(registered=(PoolName.SWA,))
-        store.registered_pools[PoolName.SWA].v_buffer = object()
-        scheduler = self._scheduler(store)
-        self._attach_window(scheduler, ComponentType.of("window_4096"), 4)
-
-        layout = scheduler.get_hicache_l3_cache_layout(GetHiCacheL3LayoutReq()).layout
-        self.assertTrue(layout["enabled"])
-        (window,) = [
-            p for p in layout["hicache_object_layout"]["pools"] if p["pool"] == "swa"
-        ]
-        self.assertEqual(window["hit_policy"], "trailing_pages")
-        self.assertEqual(window["trailing_pages"], 4)
 
     def test_cache_without_controller_does_not_break_startup(self):
         """Pure-SWA and unattached caches must return an unavailable layout."""
@@ -246,7 +265,7 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
                     PoolName.DEEPSEEK_V4_C4_STATE, PoolName.SWA, PoolHitPolicy.ALL_PAGES
                 ),
             ],
-            swa_trailing_pages=7,
+            window_trailing_pages={"swa": 7},
             page_size=64,
         )
         pools = layout["hicache_object_layout"]["pools"]
@@ -260,7 +279,9 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
                 layout = self._store(
                     registered=(PoolName.SWA,)
                 ).describe_l3_object_layout(
-                    sidecar_pool_specs=[], swa_trailing_pages=window, page_size=64
+                    sidecar_pool_specs=[],
+                    window_trailing_pages={"swa": window},
+                    page_size=64,
                 )
                 self.assertFalse(layout["enabled"])
                 self.assertIn("window", layout["reason"])
@@ -290,7 +311,7 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
                         sidecar_pool_specs=[
                             _sidecar(PoolName.DRAFT_SWA, PoolHitPolicy.TRAILING_PAGES)
                         ],
-                        swa_trailing_pages=2,
+                        window_trailing_pages={"swa": 2},
                         page_size=64,
                     )
                     self.assertEqual(layout["enabled"], enabled)
@@ -325,7 +346,7 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
                 _sidecar(PoolName.DEEPSEEK_V4_C4, PoolHitPolicy.ALL_PAGES),
                 _sidecar(PoolName.DEEPSEEK_V4_C4_STATE, PoolHitPolicy.TRAILING_PAGES),
             ],
-            swa_trailing_pages=2,
+            window_trailing_pages={"swa": 2},
             page_size=64,
         )
 
@@ -362,7 +383,7 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
                 _sidecar(PoolName.DEEPSEEK_V4_C4, PoolHitPolicy.ALL_PAGES),
                 _sidecar(PoolName.DEEPSEEK_V4_C128, PoolHitPolicy.ALL_PAGES),
             ],
-            swa_trailing_pages=None,
+            window_trailing_pages={},
             page_size=64,
         )
 
@@ -392,7 +413,9 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
             with self.subTest(prefix=prefix):
                 store.config_prefix = prefix
                 layout = store.describe_l3_object_layout(
-                    sidecar_pool_specs=specs, swa_trailing_pages=3, page_size=64
+                    sidecar_pool_specs=specs,
+                    window_trailing_pages={"swa": 3},
+                    page_size=64,
                 )
                 self.assertTrue(layout["enabled"])
                 objects = layout["hicache_object_layout"]
@@ -437,7 +460,7 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
         store = self._store()
         store.mem_pool_host = self._host_pool(4)
         layout = store.describe_l3_object_layout(
-            sidecar_pool_specs=(), swa_trailing_pages=None, page_size=64
+            sidecar_pool_specs=(), window_trailing_pages={}, page_size=64
         )
         self.assertTrue(layout["enabled"])
         self.assertEqual(
@@ -452,7 +475,7 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
     def test_rank_sharded_draft_and_empty_registration_are_unavailable(self):
         store = self._store()
         layout = store.describe_l3_object_layout(
-            sidecar_pool_specs=(), swa_trailing_pages=None, page_size=64
+            sidecar_pool_specs=(), window_trailing_pages={}, page_size=64
         )
         self.assertFalse(layout["enabled"])
         self.assertIn("No physical", layout["reason"])
@@ -463,7 +486,7 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
             with self.subTest(pool_type=pool_type.__name__):
                 store.registered_pools[PoolName.DRAFT] = pool_type.__new__(pool_type)
                 layout = store.describe_l3_object_layout(
-                    sidecar_pool_specs=(), swa_trailing_pages=None, page_size=64
+                    sidecar_pool_specs=(), window_trailing_pages={}, page_size=64
                 )
                 self.assertEqual(layout["enabled"], enabled)
                 if not enabled:
@@ -525,7 +548,7 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
             sidecar_pool_specs=[
                 _sidecar(PoolName.DEEPSEEK_V4_C4, PoolHitPolicy.ALL_PAGES)
             ],
-            swa_trailing_pages=None,
+            window_trailing_pages={},
             page_size=64,
         )
 

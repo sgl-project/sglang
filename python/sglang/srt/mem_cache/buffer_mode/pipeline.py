@@ -39,7 +39,6 @@ from sglang.srt.managers.cache_controller import HICACHE_WRITE_STAGING_POOL_FRAC
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     DecLockRefParams,
-    EvictParams,
     InitLoadBackParams,
     InsertParams,
     InsertResult,
@@ -51,6 +50,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     SidecarPoolSpec,
 )
+from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.mem_cache.pool_host.base import HostKVCache
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage_prefetch import (
@@ -616,7 +616,7 @@ class BufferModePipeline:
     @staticmethod
     def _pool_order(pool: PoolName) -> tuple[bool, str]:
         # KV first, then a fixed order: every rank must admit identically.
-        return (pool != PoolName.KV, pool.value)
+        return (pool != PoolName.KV, str(pool))
 
     def _write_intents(
         self, snapshot: BufferBackupSnapshot
@@ -1508,6 +1508,19 @@ class BufferModePipeline:
             )
             self._refetch_staged(f)
             return False
+        head_end = self._window_head_end(f)
+        if joint_len < head_end:
+            # Only the joint match vouches that the head is still resident: the
+            # hold pins FULL, not SWA.
+            logger.warning(
+                "HiCache staged prefetch deferred req=%s reason=window_head "
+                "joint=%d head_end=%d",
+                req.rid,
+                joint_len,
+                head_end,
+            )
+            self._refetch_staged(f)
+            return False
         self._set_request_device_prefix(req, key, matched_len, node_id)
         plan = self._build_staged_prefetch_plan(f, key, matched_len)
         if plan is None:
@@ -1523,6 +1536,19 @@ class BufferModePipeline:
         req.host_hit_is_storage = True
         req.staged_prefetch_plan = plan
         return True
+
+    def _window_head_end(self, f: _StagedPrefetch) -> int:
+        span_end = f.matched_len + f.num_tokens
+        head_end = 0
+        for component in self._swa_components():
+            staged_tokens = sum(
+                len(t.host_indices)
+                for t in f.aux_xfers
+                if t.name == component.pool_name and t.host_indices is not None
+            )
+            if 0 < staged_tokens < component.full_window_pages * self._cache.page_size:
+                head_end = max(head_end, span_end - staged_tokens)
+        return head_end
 
     def _set_request_device_prefix(
         self, req: Req, key: RadixKey, matched_len: int, node_id: NodeId
@@ -1887,18 +1913,16 @@ class BufferModePipeline:
         # Evict-before-alloc (mirrors _load_back_transfers): the budget gate
         # counts evictable pages, but cc.load draws from free slots only.
         cache = self._cache
-        if cache.supports_swa():
-            avail = cache.token_to_kv_pool_allocator.full_available_size()
-        else:
-            avail = cache.token_to_kv_pool_allocator.available_size()
-        if avail < load_tokens:
-            needed = load_tokens - avail
-            cache.evict_for_alloc(EvictParams(num_tokens=needed))
+        allocator = cache.token_to_kv_pool_allocator
+
+        def available() -> int:
             if cache.supports_swa():
-                avail = cache.token_to_kv_pool_allocator.full_available_size()
-            else:
-                avail = cache.token_to_kv_pool_allocator.available_size()
-            if avail < load_tokens:
+                return allocator.full_available_size()
+            return allocator.available_size()
+
+        if available() < load_tokens:
+            cache.evict_for_alloc(KVDemand(full_tokens=load_tokens))
+            if available() < load_tokens:
                 return False
         return True
 
