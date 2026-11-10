@@ -515,6 +515,14 @@ class DFlashMLAAttention(DeepseekV2AttentionMLA):
                     "--speculative-draft-attention-backend triton, trtllm_mla or "
                     f"cutedsl_mla, got {draft_attention_backend!r}."
                 )
+            if (
+                draft_attention_backend in DFLASH_MLA_ONLY_DRAFT_BACKENDS
+                and attn_type != AttentionType.DECODER
+            ):
+                raise ValueError(
+                    f"{draft_attention_backend} applies an MLA sliding window "
+                    "causally; this DFLASH draft sets is_causal=False."
+                )
         rope_theta, rope_scaling = get_rope_config(config)
         if rope_scaling is not None and rope_scaling.get(
             "rope_type", rope_scaling.get("type")

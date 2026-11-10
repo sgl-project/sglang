@@ -302,6 +302,12 @@ class TestDFlashMLA(CustomTestCase):
             with self.subTest(backend=backend), patch(resolve, return_value=backend):
                 attn = DFlashMLAAttention(config, layer_id=0)
                 self.assertEqual(attn.attn_mqa.sliding_window_size, 3)
+        config.is_causal = False
+        for backend in ("trtllm_mla", "cutedsl_mla"):
+            with self.subTest(backend=backend, causal=False):
+                with patch(resolve, return_value=backend):
+                    with self.assertRaisesRegex(ValueError, "causally"):
+                        DFlashMLAAttention(config, layer_id=0)
 
     def test_matches_specforge_reference(self):
         """Context-KV materialization and the block forward reproduce SpecForge's
