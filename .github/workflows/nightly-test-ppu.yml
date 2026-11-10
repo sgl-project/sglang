@@ -103,8 +103,8 @@ jobs:
             else
               echo 'Skipped JIT mtime pinning; JIT will recompile'
             fi
-            cd test
-            python3 run_suite.py --hw ppu --suite nightly-1-ppu --nightly --require-nonempty --continue-on-error --auto-partition-id 0 --auto-partition-size 2
+            export PPU_EVIDENCE_DIR="/wl_nas/devops/ppu-nightly-evidence/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}"
+            bash scripts/ci/ppu/run_nightly_suite.sh nightly-1-ppu 0 "$PPU_EVIDENCE_DIR" 6600
           container_options: |
             privileged: true
             host_ipc: true
@@ -112,6 +112,14 @@ jobs:
             shm_size: 8Gi
           timeout_minutes: 110
           cleanup_policy: always
+      - name: Upload PPU nightly evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-nightly-evidence-${{ github.run_id }}-${{ github.job }}
+          path: /wl_nas/devops/ppu-nightly-evidence/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}
+          if-no-files-found: error
+          retention-days: 14
 
   nightly-1b-ppu:
     needs: [prepare, nightly-1a-ppu]
@@ -165,8 +173,8 @@ jobs:
             echo 'Preloading Marlin JIT outside the per-test watchdog'
             timeout -k 30 1500 python3 -c 'import torch; from sglang.kernels.ops.moe.moe_wna16_marlin import _jit_moe_wna16_marlin_module; _jit_moe_wna16_marlin_module(torch.float16, False, False); _jit_moe_wna16_marlin_module(torch.bfloat16, False, False); print("Marlin JIT ready")' ||
               echo 'Marlin JIT preload did not finish; the test watchdog still applies'
-            cd test
-            python3 run_suite.py --hw ppu --suite nightly-1-ppu --nightly --require-nonempty --continue-on-error --auto-partition-id 1 --auto-partition-size 2
+            export PPU_EVIDENCE_DIR="/wl_nas/devops/ppu-nightly-evidence/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}"
+            bash scripts/ci/ppu/run_nightly_suite.sh nightly-1-ppu 1 "$PPU_EVIDENCE_DIR" 7500
           container_options: |
             privileged: true
             host_ipc: true
@@ -174,6 +182,14 @@ jobs:
             shm_size: 8Gi
           timeout_minutes: 125
           cleanup_policy: always
+      - name: Upload PPU nightly evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-nightly-evidence-${{ github.run_id }}-${{ github.job }}
+          path: /wl_nas/devops/ppu-nightly-evidence/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}
+          if-no-files-found: error
+          retention-days: 14
 
   nightly-2-ppu:
     needs: [prepare, nightly-1b-ppu]
@@ -213,8 +229,8 @@ jobs:
               /nas_aisw/datasets/checkpoints/LLM/Llama/v3.1/Llama-3.1-8B-Instruct \
               /nas_aisw/datasets/checkpoints/LLM/Llama/v3.2/Llama-3.2-1B-Instruct
             bash scripts/ci/ppu/ppu_install_dependency.sh
-            cd test
-            python3 run_suite.py --hw ppu --suite nightly-2-ppu --nightly --require-nonempty --continue-on-error
+            export PPU_EVIDENCE_DIR="/wl_nas/devops/ppu-nightly-evidence/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}"
+            bash scripts/ci/ppu/run_nightly_suite.sh nightly-2-ppu "" "$PPU_EVIDENCE_DIR" 8400
           container_options: |
             privileged: true
             host_ipc: true
@@ -222,6 +238,14 @@ jobs:
             shm_size: 8Gi
           timeout_minutes: 140
           cleanup_policy: always
+      - name: Upload PPU nightly evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-nightly-evidence-${{ github.run_id }}-${{ github.job }}
+          path: /wl_nas/devops/ppu-nightly-evidence/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}
+          if-no-files-found: error
+          retention-days: 14
 
   nightly-4-ppu:
     needs: [prepare, nightly-2-ppu]
@@ -260,8 +284,8 @@ jobs:
             bash scripts/ci/warm_page_cache.sh \
               /nas_aisw/datasets/checkpoints/LLM/Llama/v3.2/Llama-3.2-1B-Instruct
             bash scripts/ci/ppu/ppu_install_dependency.sh
-            cd test
-            python3 run_suite.py --hw ppu --suite nightly-4-ppu --nightly --require-nonempty --continue-on-error
+            export PPU_EVIDENCE_DIR="/wl_nas/devops/ppu-nightly-evidence/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}"
+            bash scripts/ci/ppu/run_nightly_suite.sh nightly-4-ppu "" "$PPU_EVIDENCE_DIR" 10200
           container_options: |
             privileged: true
             host_ipc: true
@@ -269,6 +293,14 @@ jobs:
             shm_size: 8Gi
           timeout_minutes: 170
           cleanup_policy: always
+      - name: Upload PPU nightly evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-nightly-evidence-${{ github.run_id }}-${{ github.job }}
+          path: /wl_nas/devops/ppu-nightly-evidence/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}
+          if-no-files-found: error
+          retention-days: 14
 
   # Restore the 8-PPU job only after real 8-PPU registrations pass hardware validation.
   nightly-test-ppu-finish:

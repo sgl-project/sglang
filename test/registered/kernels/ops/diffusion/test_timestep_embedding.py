@@ -20,6 +20,7 @@ register_cuda_ci(est_time=16, stage="base-b-kernel-unit", runner_config="1-gpu-l
 # Nightly is not redundant here: it sets SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1 to expand get_ci_test_range sweeps.
 register_cuda_ci(est_time=20, stage="nightly", runner_config="1-gpu-large")
 register_ppu_ci(est_time=27, suite="nightly-1-ppu", nightly=True)
+register_ppu_ci(est_time=16, suite="stage-b-kernel-test-1-gpu-ppu")
 
 CORRECTNESS_BATCH_SIZES = get_ci_test_range(
     [1, 2, 8, 128, 256, 512, 1536, 2048, 4096, 11008, 16384],

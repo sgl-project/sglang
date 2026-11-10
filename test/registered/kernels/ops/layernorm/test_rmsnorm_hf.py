@@ -21,6 +21,7 @@ register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-l
 # Nightly is not redundant here: it sets SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1 to expand get_ci_test_range sweeps.
 register_cuda_ci(est_time=100, stage="nightly", runner_config="1-gpu-large")
 register_ppu_ci(est_time=87, suite="nightly-1-ppu", nightly=True)
+register_ppu_ci(est_time=30, suite="stage-b-kernel-test-1-gpu-ppu")
 register_amd_ci(est_time=30, stage="jit-kernel-unit", runner_config="amd")
 
 EPS = 1e-5
