@@ -6,6 +6,8 @@ Covers:
 3. Edge cases: single shard, dominant LSE, equal LSE
 4. return_lse mode
 5. dcp_a2a_lse_reduce with pre-allocated CUDA graph buffers
+6. dcp_pack_a2a_send bit-exact send-slot layout (bf16/fp8, narrow and wide
+   heads_per_rank, DCP world sizes, spare batch rows)
 """
 
 import unittest
@@ -16,7 +18,7 @@ import torch
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=22, stage="base-b", runner_config="1-gpu-large")
 
 
 class TestLSECombineTritonVsCPU(CustomTestCase):
@@ -489,6 +491,92 @@ class TestDCPA2AReduceWithCUDAGraphBuffers(CustomTestCase):
 
         self.assertEqual(buffers["send_combined"].data_ptr(), send_ptr)
         self.assertEqual(buffers["recv_combined"].data_ptr(), recv_ptr)
+
+
+class TestDcpPackA2ASend(CustomTestCase):
+    """`dcp_pack_a2a_send` must reproduce the send slots bit for bit."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not torch.cuda.is_available():
+            raise unittest.SkipTest("CUDA required for Triton kernel tests")
+        cls.device = "cuda"
+
+    def _reference(self, x, lse, batch_pad, num_ranks):
+        """Build the send slots with slicing; mirrors the kernel's indexing."""
+        B, H, D = x.shape
+        N = num_ranks
+        hp = H // N
+        dst_o = torch.zeros(B + batch_pad, hp, N, D, dtype=x.dtype, device=x.device)
+        dst_lse = torch.zeros(
+            B + batch_pad, hp, N, dtype=torch.float32, device=x.device
+        )
+        for peer in range(N):
+            h = slice(peer * hp, (peer + 1) * hp)
+            dst_o[:B, :, peer] = x[:, h]
+            dst_lse[:B, :, peer] = lse[:, h]
+        return dst_o, dst_lse
+
+    def _check(self, heads, head_dim, dtype, batch=5, batch_pad=0, num_ranks=8):
+        from sglang.kernels.ops.attention.dcp_kernels import dcp_pack_a2a_send
+
+        torch.manual_seed(0)
+        x = torch.randn(batch, heads, head_dim, device=self.device, dtype=torch.float32)
+        x = x.to(dtype)
+        lse = torch.randn(batch, heads, device=self.device, dtype=torch.float32) * 3.0
+
+        ref_o, ref_lse = self._reference(x, lse, batch_pad, num_ranks)
+        # Same destination layout the callers use: [B, H//N, N, D] permuted to
+        # the transport's [N, B, H//N, D], i.e. non-contiguous on purpose.
+        got_o = torch.full_like(ref_o, float("nan"))
+        got_lse = torch.full_like(ref_lse, float("nan"))
+        dcp_pack_a2a_send(x, lse, got_o.permute(2, 0, 1, 3), got_lse.permute(2, 0, 1))
+
+        B = x.shape[0]
+        self.assertTrue(
+            torch.equal(got_o[:B], ref_o[:B]), "output slots differ from reference"
+        )
+        self.assertTrue(
+            torch.equal(got_lse[:B], ref_lse[:B]), "LSE slots differ from reference"
+        )
+        if batch_pad:
+            # Contract: rows past B belong to the caller and are not written.
+            self.assertTrue(torch.isnan(got_o[B:]).all(), "padding rows were written")
+            self.assertTrue(
+                torch.isnan(got_lse[B:]).all(), "padding LSE rows were written"
+            )
+
+    def test_pack_k3_bf16(self):
+        self._check(heads=96, head_dim=512, dtype=torch.bfloat16)
+
+    def test_pack_k3_fp8(self):
+        self._check(heads=96, head_dim=512, dtype=torch.float8_e4m3fn)
+
+    def test_pack_narrow_head_dim(self):
+        self._check(heads=96, head_dim=128, dtype=torch.bfloat16)
+
+    def test_pack_non_power_of_two_words(self):
+        # 384 bf16 -> 192 words with 48 heads/rank: the tile cap (4096 // 192)
+        # must be rounded to a power of two, since tl.arange requires it.
+        self._check(heads=96, head_dim=384, dtype=torch.bfloat16, num_ranks=2)
+
+    def test_pack_wide_heads_per_rank(self):
+        # 48 heads per rank: one program must loop over several head chunks.
+        self._check(heads=384, head_dim=512, dtype=torch.bfloat16)
+
+    def test_pack_spare_batch_capacity_untouched(self):
+        self._check(heads=96, head_dim=512, dtype=torch.bfloat16, batch_pad=3)
+
+    def test_pack_dcp_world_sizes(self):
+        # N=1 and N=2 also take the multi-chunk path (96 and 48 heads/rank).
+        for num_ranks in (1, 2, 4, 8):
+            with self.subTest(num_ranks=num_ranks):
+                self._check(
+                    heads=96,
+                    head_dim=512,
+                    dtype=torch.bfloat16,
+                    num_ranks=num_ranks,
+                )
 
 
 if __name__ == "__main__":
