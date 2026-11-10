@@ -15,9 +15,6 @@ pub struct OrchestrationConfig {
     pub rpc_timeout_ms: u64,
     pub poll_ms: u64,
     pub operation_ttl_ms: u64,
-    pub initial_prefetch_ms_per_token: f64,
-    pub lead_margin_ms: u64,
-    pub max_resume_prefetch_ms: u64,
     pub limits: SessionLimits,
 }
 impl std::fmt::Debug for OrchestrationConfig {
@@ -47,15 +44,8 @@ impl OrchestrationConfig {
                 && self.operation_ttl_ms > 0
                 && self.operation_ttl_ms <= 86_400_000
                 && self.rpc_timeout_ms <= 86_400_000
-                && self.poll_ms <= self.operation_ttl_ms
-                && self.lead_margin_ms <= 86_400_000
-                && self.max_resume_prefetch_ms <= 86_400_000,
+                && self.poll_ms <= self.operation_ttl_ms,
             "orchestration budgets must be positive"
-        );
-        anyhow::ensure!(
-            self.initial_prefetch_ms_per_token.is_finite()
-                && self.initial_prefetch_ms_per_token > 0.0,
-            "initial prefetch cost must be finite and positive"
         );
         anyhow::ensure!(
             self.limits.max_identifier_bytes >= 128 && self.limits.max_identifier_bytes <= 256,

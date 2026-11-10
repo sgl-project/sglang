@@ -8,9 +8,6 @@
   "rpc_timeout_ms": 5000,
   "poll_ms": 100,
   "operation_ttl_ms": 60000,
-  "initial_prefetch_ms_per_token": 0.15,
-  "lead_margin_ms": 250,
-  "max_resume_prefetch_ms": 500,
   "limits": {
     "max_sessions": 128,
     "max_branches": 512,

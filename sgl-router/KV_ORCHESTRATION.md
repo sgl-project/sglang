@@ -51,12 +51,11 @@ Send lifecycle events to `POST /v1/kv/session/events`:
 1. Send `task_started` and observe the actual rendered input via
    `request_observed` or the inference request's `kv_context`. This establishes
    logical association; it does not assert physical residency.
-2. On `tool_wait`, supply the intended source worker, `pressure: true` and
-   `expected_wait_ms` to request host-to-storage DEMOTE. If the application
-   wants to protect a hot prefix in L2 instead, it can explicitly submit PIN.
-3. Send `resume_expected` with the expected wait and desired destination worker
-   for storage-to-host PREFETCH. `tool_done` can advance pending preparation
-   for the matching scope. Send inference normally if the prefix is not ready.
+2. On `tool_wait`, supply the intended source worker and `pressure: true`
+   to request host-to-storage DEMOTE. Use PIN to protect a hot prefix in L2.
+3. Send `prepare` or `resume` when the application wants storage-to-host
+   PREFETCH to start. The event queues work without a predicted wait or timer.
+   Send inference at its normal time even if the prefix is still being read.
 4. Send `task_finished` or `task_cancelled` to release the task's interests.
    An ordinary inference completion does not end the task.
 

@@ -21,10 +21,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
+    sync::Arc,
     time::{Duration, Instant},
 };
 use tokio::sync::{mpsc, oneshot};
@@ -86,7 +83,6 @@ pub struct Runtime {
     tx: mpsc::Sender<Message>,
     published: Arc<RwLock<Published>>,
     config: OrchestrationConfig,
-    traffic: Arc<AtomicU64>,
 }
 impl Runtime {
     pub fn start(
@@ -96,14 +92,12 @@ impl Runtime {
     ) -> Arc<Self> {
         let (tx, rx) = mpsc::channel(config.queue_capacity);
         let published = Arc::new(RwLock::new(Published::default()));
-        let traffic = Arc::new(AtomicU64::new(0));
         let runtime = Arc::new(Self {
             tx,
             published: published.clone(),
             config: config.clone(),
-            traffic: traffic.clone(),
         });
-        let actor = Actor::new(config, Box::new(workers), auth, published, traffic);
+        let actor = Actor::new(config, Box::new(workers), auth, published);
         tokio::spawn(actor.run(rx));
         runtime
     }
@@ -185,9 +179,6 @@ impl Runtime {
             })
             .is_ok()
     }
-    pub fn note_dispatch(&self) {
-        self.traffic.fetch_add(1, Ordering::Relaxed);
-    }
     pub fn routed(&self, context: KvContext, worker: String) {
         let _ = self.tx.try_send(Message::Routed { context, worker });
     }
@@ -254,12 +245,14 @@ fn task(value: &Value, caller: &str) -> Result<SessionIdentity, String> {
 }
 fn validate_input(value: &Value) -> Result<(), String> {
     const MAX_TIME_MS: u64 = 86_400_000;
-    for key in ["expected_wait_ms", "available_ms", "delay_ms", "ttl_ms"] {
-        if let Some(number) = value.get(key) {
-            if number.as_u64().is_none_or(|n| n > MAX_TIME_MS) {
-                return Err(format!("{key} requires an integer in 0..86400000"));
-            }
-        }
+    if value
+        .get("ttl_ms")
+        .is_some_and(|v| v.as_u64().is_none_or(|n| n > MAX_TIME_MS))
+    {
+        return Err("ttl_ms requires an integer in 0..86400000".into());
+    }
+    if value.get("delay_ms").is_some() {
+        return Err("send prepare when the prefetch should start".into());
     }
     for key in ["revision", "branch_revision", "attempt"] {
         if let Some(number) = value.get(key) {
@@ -332,12 +325,8 @@ struct Job {
     releasing_pin: bool,
     cancel_sent: bool,
     quiescent: bool,
-    due: Instant,
     deadline: Instant,
     last_error: Option<String>,
-    started: Option<Instant>,
-    cost_recorded: bool,
-    traffic_at_start: u64,
     cache_watermark: Value,
     ready_end: u64,
     ready_at: Option<Instant>,
@@ -363,8 +352,6 @@ struct Actor {
     last_route: BTreeMap<SessionIdentity, String>,
     tick_cursor: usize,
     events: BTreeMap<DemandId, (String, Value)>,
-    cost_ms_per_token: f64,
-    traffic: Arc<AtomicU64>,
     feedback: FeedbackCache,
 }
 impl Actor {
@@ -373,7 +360,6 @@ impl Actor {
         workers: Box<dyn Fn() -> Vec<String> + Send>,
         auth: Option<HeaderValue>,
         published: Arc<RwLock<Published>>,
-        traffic: Arc<AtomicU64>,
     ) -> Self {
         Self {
             client: EngineClient::new(config.rpc_timeout_ms, config.max_engine_bytes, auth),
@@ -388,8 +374,6 @@ impl Actor {
             last_route: BTreeMap::new(),
             tick_cursor: 0,
             events: BTreeMap::new(),
-            cost_ms_per_token: config.initial_prefetch_ms_per_token,
-            traffic,
             feedback: FeedbackCache::new(
                 config.max_workers,
                 config.max_operations,
@@ -671,7 +655,7 @@ impl Actor {
             }
             if matches!(
                 value["event"].as_str(),
-                Some("tool_wait" | "resume_expected" | "tool_done")
+                Some("tool_wait" | "prepare" | "resume")
             ) && self.index.session_revision(&key.task).is_some_and(|r| {
                 value["revision"]
                     .as_u64()
@@ -695,7 +679,7 @@ impl Actor {
             if let Some(key) = event_key {
                 if matches!(
                     value["event"].as_str(),
-                    Some("tool_wait" | "resume_expected" | "tool_done")
+                    Some("tool_wait" | "prepare" | "resume")
                 ) {
                     let _ = self
                         .index
@@ -880,81 +864,23 @@ impl Actor {
                             .map_err(|e| format!("{e:?}"))?;
                         Ok(json!({"state":"request_unbound","task_state":"active"}))
                     }
-                    "tool_wait" | "resume_expected" | "tool_done" => {
-                        if self.index.session_revision(&task).is_none() {
-                            return Err("unknown task incarnation".into());
-                        }
-                        let target =
-                            self.resolve(value.get("target").unwrap_or(&Value::Null), &task)?;
-                        let tokens = target
-                            .known_scope()
-                            .iter()
-                            .map(|s| s.scope().end_token())
-                            .max()
-                            .unwrap_or(0);
-                        let cost = (tokens as f64 * self.cost_ms_per_token).ceil() as u64;
-                        let lead = cost.saturating_add(self.config.lead_margin_ms);
-                        if event == "tool_done"
-                            && cost
-                                > value["available_ms"]
-                                    .as_u64()
-                                    .unwrap_or(self.config.max_resume_prefetch_ms)
-                        {
-                            return Ok(
-                                json!({"state":"on_demand_fallback","estimated_ms":cost,"reason":"preparation too late"}),
-                            );
-                        }
-                        if event == "resume_expected"
-                            && value["expected_wait_ms"].as_u64().unwrap_or(0) < lead
-                        {
-                            return Ok(
-                                json!({"state":"on_demand_fallback","estimated_ms":cost,"reason":"insufficient preparation lead"}),
-                            );
-                        }
-                        if event == "tool_wait"
-                            && (!value["pressure"].as_bool().unwrap_or(false)
-                                || value["expected_wait_ms"].as_u64().unwrap_or(0)
-                                    < self.config.poll_ms)
-                        {
-                            return Ok(
-                                json!({"state":"skipped","reason":"insufficient pressure/wait evidence"}),
-                            );
-                        }
+                    "tool_wait" | "prepare" | "resume" => {
+                        let (action, source, destination) = if event == "tool_wait" {
+                            if value["pressure"] != true {
+                                return Ok(
+                                    json!({"state":"skipped","reason":"pressure not asserted"}),
+                                );
+                            }
+                            ("sglang.demote", "host", "storage")
+                        } else {
+                            ("sglang.prefetch", "storage", "host")
+                        };
                         let mut command = value.clone();
                         command["kind"] = json!("submit");
                         command["message_id"] = json!(id);
-                        if event == "resume_expected" {
-                            command["delay_ms"] = json!(value["expected_wait_ms"]
-                                .as_u64()
-                                .unwrap_or(0)
-                                .saturating_sub(lead));
-                        }
-                        command["action"] = json!(if event == "tool_wait" {
-                            "sglang.demote"
-                        } else {
-                            "sglang.prefetch"
-                        });
-                        command["source"] =
-                            json!({"tier":if event=="tool_wait"{"host"}else{"storage"}});
-                        command["destination"] =
-                            json!({"tier":if event=="tool_wait"{"storage"}else{"host"}});
-                        if event == "tool_done" {
-                            let ids: Vec<_> = self
-                                .intents
-                                .keys()
-                                .filter(|d| d.task == task)
-                                .cloned()
-                                .collect();
-                            for d in ids {
-                                for job in self.intents[&d].jobs.clone() {
-                                    if let Some(j) = self.jobs.get_mut(&job) {
-                                        if j.action == "sglang.prefetch" {
-                                            j.due = Instant::now();
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                        command["action"] = json!(action);
+                        command["source"] = json!({"tier":source});
+                        command["destination"] = json!({"tier":destination});
                         self.submit(command, task, demand).await
                     }
                     _ => Err("unsupported lifecycle signal".into()),
@@ -1035,13 +961,6 @@ impl Actor {
                 available.push((url, caps));
             }
         }
-        let due = Instant::now()
-            + Duration::from_millis(
-                value["delay_ms"]
-                    .as_u64()
-                    .unwrap_or(0)
-                    .min(self.config.operation_ttl_ms),
-            );
         let mut expires = Instant::now()
             + Duration::from_millis(
                 value["ttl_ms"]
@@ -1138,12 +1057,8 @@ impl Actor {
                         releasing_pin: false,
                         cancel_sent: false,
                         quiescent: false,
-                        due,
                         deadline: expires,
                         last_error: None,
-                        started: None,
-                        cost_recorded: false,
-                        traffic_at_start: 0,
                         cache_watermark: Value::Null,
                         ready_end: 0,
                         ready_at: None,
@@ -1324,9 +1239,6 @@ impl Actor {
             job.releasing_pin = true;
             job.result = Value::Null;
         }
-        if Instant::now() < job.due {
-            return Ok(());
-        }
         if !self.workers().iter().any(|w| *w == job.url) {
             return Err("worker unavailable".into());
         }
@@ -1345,10 +1257,6 @@ impl Actor {
             }
             // Stable IDs survive lost HTTP responses; retries submit the same
             // envelope/context. Never make a new physical attempt implicitly.
-            if job.started.is_none() {
-                job.started = Some(Instant::now());
-                job.traffic_at_start = self.traffic.load(Ordering::Relaxed);
-            }
             job.attempted = true;
             let reply=self.client.command(&job.url,&json!({"kind":"submit","context":job.context,"envelope":{"protocol_version":"0.1","message_id":job.message_id,
                 "actions":[{"action_id":"transfer","action_type":job.action,"action_version":"1.0","payload":job.payload}]}})).await?;
@@ -1410,17 +1318,6 @@ impl Actor {
                 .unwrap_or(Value::Null);
             job.ready_end = confirmed_end(&snapshot, &live, &job.prefix, tier)?;
             job.ready_at = Some(Instant::now());
-            if job.ready_end == job.prefix.end_token && !job.cost_recorded {
-                if let Some(start) = job
-                    .started
-                    .filter(|_| job.traffic_at_start == self.traffic.load(Ordering::Relaxed))
-                {
-                    let observed =
-                        start.elapsed().as_secs_f64() * 1000.0 / job.prefix.end_token as f64;
-                    self.cost_ms_per_token = 0.8 * self.cost_ms_per_token + 0.2 * observed;
-                    job.cost_recorded = true;
-                }
-            }
         }
         job.last_error = None;
         Ok(())

@@ -276,7 +276,6 @@ impl Drop for TestRouter {
 fn orchestration() -> OrchestrationConfig {
     serde_json::from_value(json!({"caller_id":"trusted-router","control_bearer":"test-control",
     "queue_capacity":32,"max_operations":64,"max_workers":4,"max_engine_bytes":1048576,"rpc_timeout_ms":1000,"poll_ms":50,"operation_ttl_ms":10000,
-    "initial_prefetch_ms_per_token":0.5,"lead_margin_ms":20,"max_resume_prefetch_ms":100,
     "limits":{"max_sessions":16,"max_branches":32,"max_history_revisions":64,"max_requests":64,"max_content_nodes":1024,"max_token_material_bytes":1048576,
         "max_tombstones":32,"max_claims":32,"max_intents":64,"max_identifier_bytes":128,"max_components":8}})).unwrap()
 }
@@ -592,7 +591,7 @@ async fn lost_submit_response_reuses_child_identity_and_cancel_waits_for_drain()
 }
 
 #[tokio::test]
-async fn changed_formal_route_releases_only_its_preparation_and_policy_refuses_late_work() {
+async fn changed_formal_route_releases_only_its_preparation() {
     let a = Engine::start().await;
     let b = Engine::start().await;
     let router = router(&[&a, &b], false, true).await;
@@ -613,9 +612,6 @@ async fn changed_formal_route_releases_only_its_preparation_and_policy_refuses_l
     assert_eq!(response.headers()["x-sgl-worker-url"], a.url);
     assert_eq!(query(&router, "task", "prepare").await["released"], true);
     assert_eq!(query(&router, "other", "prepare").await["released"], false);
-    let policy=api(&router,json!({"kind":"session_event","task":task("task"),"event_id":"resume","event":"resume_expected","revision":2,
-        "expected_wait_ms":1,"target":{"kind":"session"}})).await;
-    assert_eq!(policy["state"], "on_demand_fallback");
     assert!(a
         .state
         .lock()
@@ -660,14 +656,14 @@ async fn l2_pin_queries_claim_state_and_task_finish_releases_without_engine_task
 }
 
 #[tokio::test]
-async fn lifecycle_schedule_freezes_scope_and_tool_done_advances_only_preparation() {
+async fn explicit_prepare_freezes_scope_and_progresses_without_another_event() {
     let engine = Engine::start().await;
     let router = router(&[&engine], false, true).await;
     start(&router, "task").await;
     api(&router,json!({"kind":"session_event","task":task("task"),"event":"request_observed","event_id":"observed","revision":1,
         "branch_id":"main","branch_revision":1,"request_id":"r","request_incarnation":"one","input_ids":[1,2,3,4],"worker_url":engine.url})).await;
     let demote=api(&router,json!({"kind":"session_event","task":task("task"),"event":"tool_wait","event_id":"wait","revision":2,
-        "target":{"kind":"session"},"expected_wait_ms":1000,"pressure":true,"worker_url":engine.url})).await;
+        "target":{"kind":"session"},"pressure":true,"worker_url":engine.url})).await;
     assert_eq!(demote["operations"][0]["action"], "sglang.demote");
     query(&router, "task", "wait").await;
     assert!(engine.state.lock().unwrap().commands.iter().any(|c| {
@@ -676,29 +672,20 @@ async fn lifecycle_schedule_freezes_scope_and_tool_done_advances_only_preparatio
             && a["payload"]["source"]["tier"] == "host"
             && a["payload"]["destination"]["tier"] == "storage"
     }));
-    let resume=api(&router,json!({"kind":"session_event","task":task("task"),"event":"resume_expected","event_id":"resume","revision":3,
-        "target":{"kind":"session"},"expected_wait_ms":1000,"worker_url":engine.url})).await;
+    let resume=api(&router,json!({"kind":"session_event","task":task("task"),"event":"prepare","event_id":"resume","revision":3,
+        "target":{"kind":"session"},"worker_url":engine.url})).await;
     assert_eq!(resume["known_scope"].as_array().unwrap().len(), 1);
-    assert!(engine
-        .state
-        .lock()
-        .unwrap()
-        .commands
-        .iter()
-        .all(|c| c["envelope"]["actions"][0]["action_type"] != "sglang.prefetch"));
     api(&router,json!({"kind":"session_event","task":task("task"),"event":"request_observed","event_id":"other","revision":4,
         "branch_id":"other","branch_revision":1,"request_id":"r","request_incarnation":"two","input_ids":[1,2,3,5],"worker_url":engine.url})).await;
     let frozen = query(&router, "task", "resume").await;
     assert_eq!(frozen["snapshot_revision"], resume["snapshot_revision"]);
     assert_eq!(frozen["known_scope"].as_array().unwrap().len(), 1);
-    api(&router,json!({"kind":"session_event","task":task("task"),"event":"tool_done","event_id":"done","revision":5,
-        "target":{"kind":"branch","branch_id":"main"},"worker_url":engine.url})).await;
     let view = ready(&router, "task", "resume").await;
     assert_eq!(view["operations"][0]["ready_scope"]["end_token"], 4);
     let stale = reqwest::Client::new()
         .post(format!("{}/v1/kv/session/events", router.url))
         .bearer_auth("test-control")
-        .json(&json!({"task":task("task"),"event":"tool_done","event_id":"late","revision":2}))
+        .json(&json!({"task":task("task"),"event":"resume","event_id":"late","revision":2}))
         .send()
         .await
         .unwrap();
@@ -711,8 +698,8 @@ async fn hostile_time_revision_and_token_bounds_do_not_terminate_the_control_act
     let router = router(&[&engine], false, true).await;
     let client = reqwest::Client::new();
     for body in [
-        json!({"kind":"session_event","task":task("task"),"event":"resume_expected","event_id":"huge-time","revision":1,"expected_wait_ms":u64::MAX}),
-        json!({"kind":"session_event","task":task("task"),"event":"tool_done","event_id":"float-time","revision":1,"available_ms":1e200}),
+        json!({"kind":"session_event","task":task("task"),"event":"prepare","event_id":"huge-time","revision":1,"ttl_ms":u64::MAX}),
+        json!({"kind":"session_event","task":task("task"),"event":"resume","event_id":"float-time","revision":1,"ttl_ms":1e200}),
         json!({"kind":"session_event","task":task("task"),"event":"task_finished","event_id":"huge-revision","revision":u64::MAX}),
         json!({"kind":"session_event","task":task("task"),"event":"request_observed","event_id":"huge-input","revision":1,"input_ids":vec![1;65_537]}),
     ] {

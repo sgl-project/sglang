@@ -174,9 +174,6 @@ async fn dispatch<T: Transport>(
         decode,
         track_dispatch_timestamps,
     } = workers;
-    if let Some(runtime) = &ctx.orchestration {
-        runtime.note_dispatch();
-    }
     let decode_url_header = decode
         .as_ref()
         .and_then(|worker| parse_decode_url_header(&worker.url));
