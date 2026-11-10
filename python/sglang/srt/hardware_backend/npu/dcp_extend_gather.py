@@ -74,8 +74,21 @@ class NPUDecodeContextParallelMetadata(DecodeContextParallelMetadata):
     extend_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
     # Whether the gathered-KV operator may drop its causal crop (sparse_mode
     # 0), computed once at prepare: only when every prefix reaches index_topk.
-    # The token shard and the sparse operator read it per forward.
+    # The token shard, the packed read and the sparse operator read it.
     extend_crop_free: bool = False
+    # Per-forward state of the piece-path gather prefetch; owned by
+    # _DcpGatherPrefetch in deepseek_v2_attention_mla_npu.
+    gather_prefetch_state: Optional[object] = None
+    # The packed-read path runs its once-per-forward write plan on the first
+    # layer; this records that it has.
+    packed_write_planned: bool = False
+    # DcpPackedReadPlan for this forward, owned by dcp_packed_read_plan in
+    # layers/dcp/layout.py. None = packed read not applicable.
+    packed_read_plan: Optional[object] = None
+    # True once packed_read_plan has been computed for this forward.
+    packed_read_plan_done: bool = False
+    # Cached rank-major kv lens for the packed read; see dcp_packed_kv_lens.
+    packed_kv_lens: Optional[torch.Tensor] = None
 
 
 def dcp_extend_crop_free(prefix_lens: Sequence[int], index_topk: Optional[int]) -> bool:
