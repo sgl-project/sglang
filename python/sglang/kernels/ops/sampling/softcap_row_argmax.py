@@ -1,4 +1,4 @@
-"""Greedy token selection over softcapped logits of a vocab shard."""
+"""Greedy token selection over (optionally softcapped) logits of a vocab shard."""
 
 import torch
 import triton
@@ -16,6 +16,7 @@ def _softcap_row_argmax_kernel(
     valid_width,
     col_offset,
     softcapping_value,
+    HAS_SOFTCAP: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
@@ -25,9 +26,11 @@ def _softcap_row_argmax_kernel(
         cols = start + tl.arange(0, BLOCK_SIZE)
         mask = cols < valid_width
         x = tl.load(logits_ptr + row * row_stride + cols, mask=mask, other=0.0)
-        x = x / softcapping_value
-        x = libdevice.tanh(x)
-        x = x * softcapping_value
+        x = x.to(tl.float32)
+        if HAS_SOFTCAP:
+            x = x / softcapping_value
+            x = libdevice.tanh(x)
+            x = x * softcapping_value
         x = tl.where(mask, x, -float("inf"))
         block_val, block_idx = tl.max(
             x, axis=0, return_indices=True, return_indices_tie_break_left=True
@@ -128,11 +131,12 @@ def merge_row_argmax_shards(gathered):
 
 def softcap_row_argmax(logits, final_logit_softcapping, valid_width, col_offset):
     """Per row of a vocab shard: ``(max, first argmax + col_offset)`` of the
-    softcapped logits over the first ``valid_width`` columns, as fp32 ``[rows, 2]``."""
-    assert logits.dtype == torch.float32 and logits.stride(1) == 1
+    (optionally softcapped) logits over the first ``valid_width`` columns, as fp32 ``[rows, 2]``."""
+    assert logits.dtype in (torch.float32, torch.bfloat16, torch.float16)
+    assert logits.stride(1) == 1
     assert col_offset + logits.shape[1] < 2**24
     num_rows = logits.shape[0]
-    if not is_hip():
+    if not (is_hip() and final_logit_softcapping and logits.dtype == torch.float32):
         out = torch.empty(num_rows, 2, dtype=torch.float32, device=logits.device)
         _softcap_row_argmax_kernel[(num_rows,)](
             logits,
@@ -140,12 +144,14 @@ def softcap_row_argmax(logits, final_logit_softcapping, valid_width, col_offset)
             logits.stride(0),
             valid_width,
             col_offset,
-            final_logit_softcapping,
+            final_logit_softcapping or 1.0,
+            HAS_SOFTCAP=bool(final_logit_softcapping),
             BLOCK_SIZE=4096,
             num_warps=8,
         )
         return out
-    # ROCm: a verify has only bs x block rows; spreading each over chunks fills the GPU.
+    # ROCm, softcapped fp32 logits: a verify has only bs x block rows; spreading each over
+    # chunks fills the GPU.
     block = 4096
     nsplit = triton.next_power_of_2(max(1, triton.cdiv(valid_width, block)))
     part_val = torch.empty(num_rows, nsplit, dtype=torch.float32, device=logits.device)

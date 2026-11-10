@@ -4912,7 +4912,7 @@ class Scheduler(
         # The pages freed while the forward ran join the free lists. Every
         # result processor has already synchronized an event recorded behind
         # the step's `forward_done`: its `copy_done`, or on a pipeline stage its
-        # `d2h_event` (see `_pp_make_skip_output_result` for skipped outputs).
+        # `d2h_event` (see `_pp_result_done_event`).
         forward_steps = forward_steps_of(
             getattr(self, "token_to_kv_pool_allocator", None)
         )

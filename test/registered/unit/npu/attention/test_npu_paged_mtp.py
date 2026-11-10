@@ -43,6 +43,7 @@ def source_method(path, cls, method, namespace):
 @pytest.fixture
 def backend():
     obj = mod.AscendAttnBackend.__new__(mod.AscendAttnBackend)
+    obj.use_quant_flash_attn = False
     obj.use_paged_mtp = True
     obj.paged_mtp_attention_decode = Mock()
     obj.use_flash_mla = obj.use_mla = False
