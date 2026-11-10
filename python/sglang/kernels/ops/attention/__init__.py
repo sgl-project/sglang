@@ -337,6 +337,14 @@ register_kernel(
 )
 register_kernel(
     KernelSpec(
+        op="attention.flashmla_token_pack_prepare",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.dsa.flashmla_token_pack:flashmla_token_pack_prepare",
+        capabilities=CUDA_ONLY,
+    )
+)
+register_kernel(
+    KernelSpec(
         op="attention.topk_transform_kpool_v2",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.attention.dsv4.topk:topk_transform_kpool_v2",
