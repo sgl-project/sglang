@@ -509,6 +509,8 @@ class OpenAIServingChat(OpenAIServingBase):
         self.chat_encoding_spec = self._resolve_chat_encoding_spec()
         self.supports_inline_system = self._resolve_inline_system_support()
         self._encoding_adapter = self._build_chat_encoding_adapter()
+        # Logprob bytes for byte-level BPE token ids
+        self._byte_level_token_bytes: dict[int, list[int] | None] = {}
 
         # Per-request response parser for custom decoding (set by _encode_messages)
         self._response_parser: ResponseParserProtocol | None = None
@@ -3189,12 +3191,12 @@ class OpenAIServingChat(OpenAIServingBase):
         for token_idx, item in enumerate(output_token_logprobs):
             # item = (logprob, token_id, token_text)
             logprob, token_id, token_text = item
-            if is_byte_level:
-                token_bytes = token_id_to_bytes(tokenizer, token_id)
-            else:
-                token_bytes = None
-            if token_bytes is None:
-                token_bytes = list((token_text or "").encode("utf-8"))
+            token_bytes = self._token_bytes(
+                tokenizer=tokenizer,
+                is_byte_level=is_byte_level,
+                token_id=token_id,
+                token_text=token_text,
+            )
 
             top_logprobs: list[TopLogprob] = []
             if output_top_logprobs:
@@ -3203,16 +3205,15 @@ class OpenAIServingChat(OpenAIServingBase):
                     top_row = output_top_logprobs[token_idx]
                     if top_row is not None:
                         for top_logprob, top_id, top_text in top_row:
-                            if is_byte_level:
-                                top_bytes = token_id_to_bytes(tokenizer, top_id)
-                            else:
-                                top_bytes = None
-                            if top_bytes is None:
-                                top_bytes = list((top_text or "").encode("utf-8"))
                             top_logprobs.append(
                                 TopLogprob(
                                     token=top_text or "",
-                                    bytes=top_bytes,
+                                    bytes=self._token_bytes(
+                                        tokenizer=tokenizer,
+                                        is_byte_level=is_byte_level,
+                                        token_id=top_id,
+                                        token_text=top_text,
+                                    ),
                                     logprob=top_logprob,
                                 )
                             )
@@ -3227,6 +3228,24 @@ class OpenAIServingChat(OpenAIServingBase):
             )
 
         return token_logprobs
+
+    def _token_bytes(
+        self,
+        *,
+        tokenizer: Any,
+        is_byte_level: bool,
+        token_id: int,
+        token_text: str | None,
+    ) -> list[int]:
+        token_bytes = None
+        if is_byte_level:
+            cache = self._byte_level_token_bytes
+            if token_id not in cache:
+                cache[token_id] = token_id_to_bytes(tokenizer, token_id)
+            token_bytes = cache[token_id]
+        if token_bytes is None:
+            token_bytes = list((token_text or "").encode("utf-8"))
+        return token_bytes
 
     def _process_tool_call_id(
         self,
