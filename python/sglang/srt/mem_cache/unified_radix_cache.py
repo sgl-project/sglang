@@ -1509,11 +1509,15 @@ class UnifiedRadixCache(BasePrefixCache):
             session_id=req.session_id,
             rotation_base=req.kv_rotation_base,
             is_request_end=(
-                is_finished
-                or (
-                    get_disagg().disaggregation_mode == "prefill"
-                    and up_to >= len(req.origin_input_ids)
+                (
+                    is_finished
+                    or (
+                        get_disagg().disaggregation_mode == "prefill"
+                        and up_to >= len(req.origin_input_ids)
+                    )
                 )
+                if self._mamba_request_end_only
+                else None
             ),
         )
         effective_cache_len = len(token_ids)
@@ -2170,9 +2174,10 @@ class UnifiedRadixCache(BasePrefixCache):
             # backed up. Skip only when no transfer remains.
             if device_value.numel() == 0 and not comp_xfers:
                 continue
-            # WALK can queue KV before COMMIT attaches Mamba to the same node.
-            # Drain the old ack before replacing its lock receipt, also for
-            # incremental backups outside the selective request-end policy.
+            # A request-end retry can revisit a node whose KV backup is still
+            # in flight (it ended at a node that had KV but no Mamba). Drain
+            # before replacing its lock receipt; this syncs every pending
+            # write-through ack, not just this node's.
             if node_id in self.ongoing_write_through:
                 self.writing_check(write_back=True)
             sidecar_xfers = self._build_backup_sidecar(device_value, comp_xfers)
