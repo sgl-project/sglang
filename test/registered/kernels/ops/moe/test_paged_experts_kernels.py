@@ -19,15 +19,16 @@ E, K = 64, 16
 class _State:
     """Residency state on the GPU, slots starting with experts 0..K-1."""
 
-    def __init__(self):
+    def __init__(self, num_experts=E, num_slots=K):
+        self.num_experts, self.num_slots = num_experts, num_slots
         i32 = dict(dtype=torch.int32, device="cuda")
         self.step = torch.zeros(1, **i32)
-        self.slot_expert = torch.arange(K, **i32)
-        self.expert_slot = torch.full((E,), -1, **i32)
-        self.expert_slot[:K] = self.slot_expert
-        self.slot_lastuse = torch.zeros(K, **i32)
-        self.src = torch.zeros(K, **i32)
-        self.dst = torch.zeros(K, **i32)
+        self.slot_expert = torch.arange(num_slots, **i32)
+        self.expert_slot = torch.full((num_experts,), -1, **i32)
+        self.expert_slot[:num_slots] = self.slot_expert
+        self.slot_lastuse = torch.zeros(num_slots, **i32)
+        self.src = torch.zeros(num_slots, **i32)
+        self.dst = torch.zeros(num_slots, **i32)
         self.count = torch.zeros(1, **i32)
 
     def decide(self, topk, weights=None):
@@ -54,10 +55,11 @@ class _State:
 class _Reference:
     """The decision the kernel must make, in Python."""
 
-    def __init__(self):
+    def __init__(self, num_slots=K):
+        self.num_slots = num_slots
         self.step = 0
-        self.slot_expert = list(range(K))
-        self.slot_lastuse = [0] * K
+        self.slot_expert = list(range(num_slots))
+        self.slot_lastuse = [0] * num_slots
 
     def decide(self, topk):
         self.step += 1
@@ -68,7 +70,9 @@ class _Reference:
         for e in topk:
             if e < 0 or e in self.slot_expert:
                 continue
-            free = [s for s in range(K) if self.slot_lastuse[s] != self.step]
+            free = [
+                s for s in range(self.num_slots) if self.slot_lastuse[s] != self.step
+            ]
             victim = min(free, key=lambda s: (self.slot_lastuse[s], s))
             self.slot_expert[victim] = e
             self.slot_lastuse[victim] = self.step
@@ -76,8 +80,10 @@ class _Reference:
         return plan
 
 
-def _random_topk(generator, num_entries):
-    topk = torch.randint(0, E, (num_entries,), generator=generator, dtype=torch.int32)
+def _random_topk(generator, num_entries, num_experts=E):
+    topk = torch.randint(
+        0, num_experts, (num_entries,), generator=generator, dtype=torch.int32
+    )
     topk[torch.rand(num_entries, generator=generator) < 0.1] = -1  # padding
     return topk
 
@@ -90,7 +96,7 @@ class TestPagedExpertsKernels(CustomTestCase):
         self.assertEqual(got_plan, plan)
         self.assertEqual(state.slot_expert.tolist(), ref.slot_expert)
         self.assertEqual(state.slot_lastuse.tolist(), ref.slot_lastuse)
-        expert_slot = [-1] * E
+        expert_slot = [-1] * state.num_experts
         for s, e in enumerate(ref.slot_expert):
             expert_slot[e] = s
         self.assertEqual(state.expert_slot.tolist(), expert_slot)
@@ -123,6 +129,44 @@ class TestPagedExpertsKernels(CustomTestCase):
     def test_decide_rejects_more_entries_than_slots(self):
         with self.assertRaises(Exception):
             _State().decide(torch.zeros(K + 1, dtype=torch.int32, device="cuda"))
+
+    def test_decide_at_model_size(self):
+        """E=512/K=400/T=80, the shapes a decode step runs at: the block-wide staging and the
+        ballot compaction still decide the reference plan, page-in included."""
+        generator = torch.Generator().manual_seed(2)
+        state, ref = _State(512, 400), _Reference(400)
+        for _ in range(3):
+            topk = _random_topk(generator, 80, 512)  # most experts cold, a few padding
+            weights = torch.rand(80, generator=generator)
+            plan = ref.decide(topk.tolist())
+            _, run_w = state.decide(topk.cuda(), weights.cuda())
+            self.assert_state(state, ref, plan)
+            self.assertTrue(
+                torch.equal(run_w.cpu(), weights.masked_fill(topk < 0, 0.0))
+            )
+
+    def test_sum_top_k_falls_back_past_the_grid_y_limit(self):
+        """``moe_topk_sum`` grids over (..., M) and gridDim.y stops at 65,535, so a prefill chunk
+        that large must keep the general reduce instead of failing to launch."""
+        from sglang.srt.layers.moe.paged_experts.runners import MarlinContract
+
+        entries = torch.randn(65536, 1, 2560, device="cuda", dtype=torch.bfloat16)
+        out = torch.empty(65536, 2560, device="cuda", dtype=torch.bfloat16)
+        MarlinContract()._sum_top_k(entries, out, 1.3)
+        self.assertTrue(
+            torch.equal(out, (entries.float().sum(1) * 1.3).to(torch.bfloat16))
+        )
+
+    def test_gather_with_an_empty_plan_touches_nothing(self):
+        """Most decode steps page nothing; count = 0 must leave every slot as it was."""
+        hosts = [torch.randn(E, 8, dtype=torch.bfloat16).pin_memory()]
+        gpu = torch.randn(K, 8, dtype=torch.bfloat16, device="cuda")
+        before = gpu.clone()
+        src = torch.full((K,), 7, dtype=torch.int32, device="cuda")
+        dst = torch.full((K,), 3, dtype=torch.int32, device="cuda")
+        count = torch.zeros(1, dtype=torch.int32, device="cuda")
+        paged_experts_gather(*_gather_args(hosts, [gpu]), src, dst, count)
+        self.assertTrue(torch.equal(gpu, before))
 
     def test_gather_copies_the_plan_for_every_tensor(self):
         hosts = [
@@ -198,7 +242,10 @@ class TestPagedExpertsKernels(CustomTestCase):
         # Unregistering again must fail: the pages are no longer registered. In a thread of its
         # own, as CUDA keeps the error as the thread's last error for a later call to report.
         rc = []
-        unregister = lambda: rc.append(int(torch.cuda.cudart().cudaHostUnregister(ptr)))
+
+        def unregister():
+            rc.append(int(torch.cuda.cudart().cudaHostUnregister(ptr)))
+
         thread = threading.Thread(target=unregister)
         thread.start()
         thread.join()
