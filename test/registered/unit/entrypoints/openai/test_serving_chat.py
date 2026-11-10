@@ -58,6 +58,7 @@ from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.kimik3_format import TOOLS_CLOSE, TOOLS_OPEN
 from sglang.srt.function_call.kimik3_structural_tag import get_kimik3_structural_tag
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.multimodal.transport.admission import FeaturePublicationAdmission
 from sglang.srt.parser.jinja_template_utils import (
     jinja_template_may_reorder_tool_results,
 )
@@ -406,6 +407,114 @@ class TestPythonChatTemplateSegments(CustomTestCase):
 
 
 class ServingChatTestCase(CustomTestCase):
+    def test_publication_admission_errors_keep_status_in_chat_api(self):
+        """admission failures retain their status through either chat wire adapter"""
+
+        async def run():
+            for encoding in (None, "kimi_k3"):
+                _use_chat_encoding(self.chat, encoding)
+                for nbytes, status, error_type, message in (
+                    (
+                        2,
+                        413,
+                        "mm_memory_request_too_large",
+                        "Multimodal publication requires 2 bytes, but the worker "
+                        "pool can hold only 1 bytes",
+                    ),
+                    (
+                        1,
+                        429,
+                        "mm_memory_overloaded",
+                        "Timed out waiting for multimodal feature pool capacity",
+                    ),
+                ):
+
+                    async def generate(*args, **kwargs):
+                        gate = FeaturePublicationAdmission(1, 0)
+                        await gate.acquire(nbytes, lambda: None)
+                        yield  # admission must reject before a token is produced
+
+                    for request in (self.basic_req, self.stream_req):
+                        with self.subTest(
+                            encoding=encoding, status=status, stream=request.stream
+                        ):
+                            with (
+                                patch.object(self.tm, "generate_request", generate),
+                                patch.object(
+                                    self.chat,
+                                    "_process_messages",
+                                    return_value=MessageProcessingResult(
+                                        "Test prompt",
+                                        [1, 2, 3],
+                                        None,
+                                        None,
+                                        [],
+                                        [],
+                                        None,
+                                    ),
+                                ),
+                            ):
+                                response = await self.chat.handle_request(
+                                    request, self.fastapi_request
+                                )
+                            self.assertEqual(
+                                response.status_code, status, response.body
+                            )
+                            error = {
+                                "object": "error",
+                                "message": message,
+                                "type": error_type,
+                                "param": None,
+                                "code": status,
+                            }
+                            self.assertEqual(
+                                json.loads(response.body),
+                                {"error": error} if encoding else error,
+                            )
+
+        asyncio.run(run())
+
+    def test_generation_value_error_keeps_bad_request_response(self):
+        """ordinary generation errors keep their existing type and wire envelope"""
+
+        async def generate(*args, **kwargs):
+            raise ValueError("Request exceeds the context length")
+            yield
+
+        async def run():
+            for encoding in (None, "kimi_k3"):
+                for stream in (False, True):
+                    with self.subTest(encoding=encoding, stream=stream):
+                        _use_chat_encoding(self.chat, encoding)
+                        request = self.stream_req if stream else self.basic_req
+                        with (
+                            patch.object(self.tm, "generate_request", generate),
+                            patch.object(
+                                self.chat,
+                                "_process_messages",
+                                return_value=MessageProcessingResult(
+                                    "Test prompt", [1, 2, 3], None, None, [], [], None
+                                ),
+                            ),
+                        ):
+                            response = await self.chat.handle_request(
+                                request, self.fastapi_request
+                            )
+                        self.assertEqual(response.status_code, 400, response.body)
+                        error = {
+                            "object": "error",
+                            "message": "Request exceeds the context length",
+                            "type": "BadRequestError",
+                            "param": None,
+                            "code": 400,
+                        }
+                        self.assertEqual(
+                            json.loads(response.body),
+                            {"error": error} if encoding else error,
+                        )
+
+        asyncio.run(run())
+
     # ------------- common fixtures -------------
     def setUp(self):
         # The serving layer reads its config from the bags, so the fixture has
@@ -6288,7 +6397,7 @@ class TestStreamNullFieldsOutsideK3(CustomTestCase):
         self.assertNotIn("type", streamed)
 
 
-class K3StreamSpecConformanceTestCase(unittest.TestCase):
+class K3StreamSpecConformanceTestCase(CustomTestCase):
     _STUB = GENERATION_STUB_TOKENS
 
     def setUp(self):
@@ -6575,6 +6684,88 @@ class K3StreamSpecConformanceTestCase(unittest.TestCase):
                 self.assertEqual(
                     ends, {0: "server_interrupted", 1: "server_interrupted"}
                 )
+
+    def test_mid_stream_admission_errors_keep_wire_terminal_policy(self):
+        """typed errors stay error frames on OpenAI but close K3's open choices"""
+
+        async def run():
+            for encoding in (None, "kimi_k3"):
+                _use_chat_encoding(self.chat, encoding)
+                for nbytes, status, error_type, message in (
+                    (
+                        2,
+                        413,
+                        "mm_memory_request_too_large",
+                        "Multimodal publication requires 2 bytes, but the worker "
+                        "pool can hold only 1 bytes",
+                    ),
+                    (
+                        1,
+                        429,
+                        "mm_memory_overloaded",
+                        "Timed out waiting for multimodal feature pool capacity",
+                    ),
+                ):
+                    with self.subTest(encoding=encoding, status=status):
+                        gate = FeaturePublicationAdmission(1, 0)
+                        closed = []
+
+                        async def generate(*args, **kwargs):
+                            try:
+                                yield self._event(index=0, rid="r0", text="one")
+                                yield self._event(index=1, rid="r1", text="two")
+                                await gate.acquire(nbytes, lambda: None)
+                            finally:
+                                closed.append(True)
+
+                        request = self._req(n=2)
+                        wire = self.chat.chat_wire.new_response(request, created=0)
+                        with patch.object(self.tm, "generate_request", generate):
+                            chunks = [
+                                chunk
+                                async for chunk in self.chat._generate_chat_stream(
+                                    Mock(), request, self.fastapi_request, wire=wire
+                                )
+                            ]
+                        self.assertEqual(chunks[-1], "data: [DONE]\n\n")
+                        self.assertEqual(chunks.count("data: [DONE]\n\n"), 1)
+                        self.assertEqual(closed, [True])
+                        self.assertEqual(
+                            (gate.pending_count, gate.pending_bytes), (0, 0)
+                        )
+                        frames = self._frames(chunks)
+                        errors = [
+                            frame["error"] for frame in frames if "error" in frame
+                        ]
+                        ends = [
+                            (choice["index"], choice["finish_reason"])
+                            for frame in frames
+                            if "choices" in frame
+                            for choice in frame["choices"]
+                            if choice["finish_reason"]
+                        ]
+                        if encoding:
+                            self.assertEqual(errors, [])
+                            self.assertEqual(
+                                ends,
+                                [(0, "server_interrupted"), (1, "server_interrupted")],
+                            )
+                        else:
+                            self.assertEqual(ends, [])
+                            self.assertEqual(
+                                errors,
+                                [
+                                    {
+                                        "object": "error",
+                                        "message": message,
+                                        "type": error_type,
+                                        "param": None,
+                                        "code": status,
+                                    }
+                                ],
+                            )
+
+        asyncio.run(run())
 
     def test_non_streaming_abort_is_server_interrupted(self):
         self._engine(

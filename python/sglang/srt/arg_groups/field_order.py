@@ -564,5 +564,6 @@ POSITIONAL_FIELD_ORDER = (
     "disable_normalize_embedding",
     "log_schedule_decisions",
     "speculative_dspark_lm_head_dtype",
+    "mm_admission_timeout_ms",
 )
 # fmt: on

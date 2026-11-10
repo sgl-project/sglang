@@ -1,10 +1,10 @@
 """Every processor must reach preprocessing through the executor-backed helper.
 
-`process_and_combine_mm_data` is the function the multimodal processor worker
-pool actually runs. A processor that calls it directly can never use those
-workers: it will build the thread pool and its processor clones on startup and
-then route every request past them. That failure is silent -- the model just
-serves at one-worker speed -- so pin the call site instead of the symptom.
+`process_and_combine_mm_data_async` runs feature preparation on the worker pool
+and publishes transport leases only after receiving its result. Calling the
+synchronous helper directly bypasses those workers and their processor clones.
+That failure is silent -- the model just serves at one-worker speed -- so pin
+the call site instead of the symptom.
 
 `process_and_combine_mm_data_async` delegates straight to the sync function when
 no executor exists, so using it costs nothing until a model opts into

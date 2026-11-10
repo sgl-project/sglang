@@ -50,6 +50,7 @@ from sglang.srt.multimodal.transport.cuda_ipc import (
     get_mm_feature_pool_size_per_worker,
 )
 from sglang.srt.multimodal.transport.memory_pool import get_mm_feature_consumer_count
+from sglang.srt.multimodal.transport.publisher import BoundedFeaturePublisher
 from sglang.srt.runtime_context import (
     get_exec,
     get_mm,
@@ -231,6 +232,8 @@ def _forget_parent_executor_wakeups():
 
 
 class BaseMultimodalProcessor(ABC):
+    cuda_ipc_publisher = None
+    cudaipc_mmfeature_pool = None
     models = []
     gpu_image_decode = True  # Enable GPU decoding by default
     smart_rgb_conversion = False
@@ -257,7 +260,7 @@ class BaseMultimodalProcessor(ABC):
     # Processors opt out only when their preprocessing is not thread-safe. The
     # worker pool gives each thread its own `copy.deepcopy` of the HF processor
     # and injects it, and the single function it runs --
-    # `process_and_combine_mm_data` -- resolves that clone instead of
+    # `_process_and_combine_mm_data` -- resolves that clone instead of
     # `self._processor`, so isolation does not depend on the subclass.
     supports_mm_processor_concurrency = True
     # Placeholder tokens that the loader matches per modality; a processor without
@@ -476,6 +479,12 @@ class BaseMultimodalProcessor(ABC):
                 self.server_args.base_gpu_id,
                 get_mm_feature_consumer_count(),
             )
+            if get_mm().mm_admission_timeout_ms is not None:
+                self.cuda_ipc_publisher = BoundedFeaturePublisher(
+                    self.cudaipc_mmfeature_pool,
+                    get_mm().mm_admission_timeout_ms,
+                    cpu_tensors=False,
+                )
 
     @property
     def keep_mm_features_on_device(self) -> bool:
@@ -525,6 +534,8 @@ class BaseMultimodalProcessor(ABC):
         self.cpu_executor.shutdown(wait=False, cancel_futures=True)
         if self.mm_processor_executor is not None:
             self.mm_processor_executor.shutdown()
+        if self.cuda_ipc_publisher is not None:
+            self.cuda_ipc_publisher.shutdown()
 
     def _create_cpu_executor(self) -> concurrent.futures.ProcessPoolExecutor:
         start_method = "spawn" if self.mm_feature_transport == "cuda_vmm" else "fork"
@@ -1851,12 +1862,26 @@ class BaseMultimodalProcessor(ABC):
         processor=None,
         **kwargs,
     ) -> Tuple[List[MultimodalDataItem], torch.Tensor, dict]:
-        """
-        Process multimodal data and return the combined multimodal items and input_ids.
-        Supports mixed modalities (images and audio in the same request).
+        """preprocess and publish features for synchronous callers"""
+        items, input_ids, ret = self._process_and_combine_mm_data(
+            base_output, mm_tokens, processor=processor, **kwargs
+        )
+        if items:
+            items = self._prepare_mm_items_for_transport(items)
+        return items, input_ids, ret
 
-        Returns:
-            Tuple of (list of mm_items, input_ids)
+    def _process_and_combine_mm_data(
+        self,
+        base_output: BaseMultiModalProcessorOutput,
+        mm_tokens: MultimodalSpecialTokens,
+        processor=None,
+        **kwargs,
+    ) -> Tuple[List[MultimodalDataItem], torch.Tensor, dict]:
+        """
+        preprocess into request-owned tensors without publishing transport leases
+
+        a cancelled executor await may discard this result while the worker
+        finishes. IPC publication belongs to the receiving caller, not this worker.
         """
         processor_override = processor
         processor, tokenizer = self._resolve_processor(processor)
@@ -2004,11 +2029,9 @@ class BaseMultimodalProcessor(ABC):
         from sglang.srt.managers.mm_utils import get_new_expanded_mm_items
 
         all_collected_items = get_new_expanded_mm_items(all_collected_items)
-        all_collected_items = self._finalize_mm_items(
-            all_collected_items,
-            images=base_output.images,
+        all_collected_items = self._prepare_mm_item_features(
+            all_collected_items, images=base_output.images
         )
-
         return all_collected_items, input_ids, ret
 
     def _finalize_mm_items(
@@ -2017,6 +2040,17 @@ class BaseMultimodalProcessor(ABC):
         *,
         images: Optional[List[Any]],
     ) -> List[MultimodalDataItem]:
+        return self._prepare_mm_items_for_transport(
+            self._prepare_mm_item_features(mm_items, images=images)
+        )
+
+    def _prepare_mm_item_features(
+        self,
+        mm_items: List[MultimodalDataItem],
+        *,
+        images: Optional[List[Any]],
+    ) -> List[MultimodalDataItem]:
+        """finalize features and identity without publishing transport leases"""
         mm_items = self._postprocess_mm_items_before_transport(
             mm_items,
             images=images,
@@ -2030,7 +2064,7 @@ class BaseMultimodalProcessor(ABC):
                 item.set_pad_value()
 
         self._precompute_hashes_before_cpu_transfer(mm_items)
-        return self._prepare_mm_items_for_transport(mm_items)
+        return mm_items
 
     def _postprocess_mm_items_before_transport(
         self,
@@ -2066,7 +2100,7 @@ class BaseMultimodalProcessor(ABC):
         self, mm_items: List[MultimodalDataItem]
     ) -> List[MultimodalDataItem]:
         """Wrap final GPU features, rolling back every lease if one wrap fails."""
-        if not self.use_cuda_ipc:
+        if not self.use_cuda_ipc or self.cuda_ipc_publisher is not None:
             return mm_items
 
         for item in mm_items:
@@ -2118,9 +2152,13 @@ class BaseMultimodalProcessor(ABC):
         if self.mm_processor_executor is None:
             return self.process_and_combine_mm_data(base_output, mm_tokens, **kwargs)
 
-        return await self.mm_processor_executor.run(
-            self.process_and_combine_mm_data,
+        items, input_ids, ret = await self.mm_processor_executor.run(
+            self._process_and_combine_mm_data,
             base_output,
             mm_tokens,
             **kwargs,
         )
+        # publish only after the await succeeds, so cancellation cannot orphan leases
+        if items:
+            items = self._prepare_mm_items_for_transport(items)
+        return items, input_ids, ret

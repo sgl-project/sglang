@@ -1,17 +1,378 @@
 import asyncio
 import concurrent.futures
+import json
 import threading
 import unittest
 from contextlib import nullcontext
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
+import msgspec
 import torch
+from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
 
+from sglang.srt.entrypoints import http_server
+from sglang.srt.managers import tokenizer_manager
+from sglang.srt.managers.io_struct import GenerateReqInput, TokenizedGenerateReqInput
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
+from sglang.srt.multimodal.modality import Modality
+from sglang.srt.multimodal.transport.admission import (
+    FeaturePublicationAdmission,
+    MmMemoryRequestTooLarge,
+)
+from sglang.srt.multimodal.transport.cuda_ipc import CudaIpcTensorTransportProxy
+from sglang.srt.multimodal.transport.cuda_vmm import (
+    CudaVmmMemoryPool,
+    _CudaVmmMemoryChunk,
+)
+from sglang.srt.multimodal.transport.publisher import BoundedFeaturePublisher
+from sglang.srt.observability.metrics_collector import TokenizerMetricsCollector
+from sglang.srt.observability.req_time_stats import APIServerReqTimeStats
+from sglang.srt.runtime_context import get_context
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+
+
+class TestGuardedDispatchCleanup(CustomTestCase):
+    def test_cancelled_queued_copy_still_runs_and_releases(self):
+        unblock = threading.Event()
+        published, cancelled = [], []
+
+        def publish(*args):
+            published.append("proxy")
+            return ["proxy"]
+
+        pool = SimpleNamespace(
+            publication_capacity=1024,
+            set_capacity_callback=lambda callback: None,
+            publication_data_size=lambda tensors: tensors[0].numel() * 4,
+            reservation_size=lambda size: size,
+            try_reserve_batch=lambda sizes: sizes,
+            publish_reserved_batch=publish,
+            cancel_proxy=cancelled.append,
+        )
+        publisher = BoundedFeaturePublisher(pool, 1000, cpu_tensors=True)
+        blocker = publisher.executor.submit(unblock.wait, 5)
+
+        async def run():
+            output = MultimodalProcessorOutput(
+                input_ids=[1],
+                mm_items=[
+                    MultimodalDataItem(modality=Modality.IMAGE, feature=torch.ones(4))
+                ],
+            )
+            task = asyncio.create_task(publisher.prepare([output]))
+            await asyncio.sleep(0)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            self.assertEqual(publisher.admission.pending_bytes, 16)
+            self.assertEqual(published, [])
+            # leave the event loop closed before the native operation completes
+
+        try:
+            asyncio.run(run())
+        finally:
+            unblock.set()
+            blocker.result(5)
+            publisher.shutdown()
+        self.assertEqual(published, ["proxy"])
+        self.assertEqual(cancelled, ["proxy"])
+        self.assertEqual(publisher.admission.pending_bytes, 0)
+        self.assertEqual(publisher.admission.pending_count, 0)
+
+    def test_cancelled_failed_native_copy_drains_accounting(self):
+        started, finish = threading.Event(), threading.Event()
+
+        def fail_copy(*args):
+            started.set()
+            if not finish.wait(5):
+                raise TimeoutError("test did not unblock copy")
+            raise RuntimeError("native copy failed")
+
+        pool = SimpleNamespace(
+            publication_capacity=1024,
+            set_capacity_callback=lambda callback: None,
+            publication_data_size=lambda tensors: tensors[0].numel() * 4,
+            reservation_size=lambda size: size,
+            try_reserve_batch=lambda sizes: sizes,
+            publish_reserved_batch=fail_copy,
+        )
+        publisher = BoundedFeaturePublisher(pool, 1000, cpu_tensors=True)
+
+        async def run():
+            errors = []
+            asyncio.get_running_loop().set_exception_handler(
+                lambda loop, context: errors.append(context)
+            )
+            output = MultimodalProcessorOutput(
+                input_ids=[1],
+                mm_items=[
+                    MultimodalDataItem(modality=Modality.IMAGE, feature=torch.ones(4))
+                ],
+            )
+            task = asyncio.create_task(publisher.prepare([output]))
+            self.assertTrue(await asyncio.to_thread(started.wait, 5))
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            self.assertEqual(publisher.admission.pending_bytes, 16)
+            finish.set()
+            for _ in range(100):
+                if publisher.admission.pending_count == 0:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertEqual(publisher.admission.pending_bytes, 0)
+            self.assertEqual(errors, [])
+
+        try:
+            with self.assertLogs(
+                "sglang.srt.multimodal.transport.publisher", level="ERROR"
+            ):
+                asyncio.run(run())
+        finally:
+            finish.set()
+            publisher.shutdown()
+
+    def test_native_http_preserves_admission_errors_including_sse(self):
+        """Pool exhaustion is retryable overload, not malformed input or a 500."""
+
+        async def run():
+            for nbytes, status, kind in (
+                (2, 413, "mm_memory_request_too_large"),
+                (1, 429, "mm_memory_overloaded"),
+            ):
+
+                async def generate(*args):
+                    await FeaturePublicationAdmission(1, 0).acquire(
+                        nbytes, lambda: None
+                    )
+                    yield
+
+                manager = SimpleNamespace(
+                    generate_request=generate, create_abort_task=lambda obj: None
+                )
+                for stream in (False, True):
+                    with (
+                        self.subTest(status=status, stream=stream),
+                        patch.object(
+                            http_server,
+                            "_global_state",
+                            SimpleNamespace(tokenizer_manager=manager),
+                        ),
+                    ):
+                        response = await http_server.serve_generate_request(
+                            GenerateReqInput(text="hello", stream=stream), None
+                        )
+                        if stream:
+                            chunks = [chunk async for chunk in response.body_iterator]
+                            self.assertEqual(chunks[-1], b"data: [DONE]\n\n")
+                            payload = json.loads(chunks[0][len(b"data: ") :])
+                        else:
+                            self.assertEqual(response.status_code, status)
+                            payload = json.loads(response.body)
+                        self.assertEqual(payload["error"]["type"], kind)
+                        self.assertEqual(payload["error"]["code"], status)
+                        self.assertEqual(payload["error"]["retryable"], status == 429)
+
+        asyncio.run(run())
+
+    def test_serialized_dispatch_failure_still_releases_ipc(self):
+        """Pickling must not hide unpublished leases from failure cleanup."""
+        for batch in (False, True):
+            with self.subTest(batch=batch):
+                proxy = object.__new__(CudaIpcTensorTransportProxy)
+                item = MultimodalDataItem(modality=Modality.IMAGE, feature=proxy)
+                obj = TokenizedGenerateReqInput(
+                    rid="failed-dispatch",
+                    input_text="",
+                    input_ids=[1],
+                    input_embeds=None,
+                    mm_inputs=MultimodalProcessorOutput(input_ids=[1], mm_items=[item]),
+                    token_type_ids=None,
+                    sampling_params=SamplingParams(),
+                    return_logprob=False,
+                    logprob_start_len=-1,
+                    top_logprobs_num=0,
+                    token_ids_logprob=None,
+                    stream=False,
+                    time_stats=APIServerReqTimeStats(),
+                )
+                manager = object.__new__(tokenizer_manager.TokenizerManager)
+                manager.rid_to_state = {}
+                manager.encoder_dispatch_ready = {}
+                manager.mm_processor = SimpleNamespace(
+                    cuda_ipc_publisher=SimpleNamespace(
+                        prepare=AsyncMock(return_value=[item])
+                    ),
+                    cudaipc_mmfeature_pool=MagicMock(),
+                )
+                manager.cuda_vmm_feature_transport = MagicMock()
+                manager.cuda_vmm_feature_transport.prepare_for_dispatch_async = (
+                    AsyncMock(return_value=[])
+                )
+                manager.positional_embeds_transport = MagicMock()
+                manager.batch_tokenized_generate_req_type = lambda **kwargs: kwargs
+                manager.canary_info_hook = None
+
+                def fail_dispatch(_):
+                    # The real wire conversion has already pickled this field.
+                    self.assertIsInstance(
+                        obj.mm_inputs.mm_items[0].feature, msgspec.msgpack.Ext
+                    )
+                    raise RuntimeError("send failed")
+
+                manager._dispatch_to_scheduler = fail_dispatch
+                with (
+                    get_context().override_server_args(mm_admission_timeout_ms=0),
+                    patch("sglang.srt.managers.io_struct._USE_PICKLE_IPC", False),
+                    patch.object(
+                        tokenizer_manager, "wrap_shm_features", lambda obj: obj
+                    ),
+                    self.assertRaisesRegex(RuntimeError, "send failed"),
+                ):
+                    asyncio.run(
+                        manager._send_batch_request([obj])
+                        if batch
+                        else manager._send_one_request(obj)
+                    )
+                manager.mm_processor.cudaipc_mmfeature_pool.cancel_proxy.assert_called_once_with(
+                    proxy
+                )
+
+
+class TestVmmAtomicReservation(CustomTestCase):
+    def make_pool(self):
+        pool = object.__new__(CudaVmmMemoryPool)
+        pool.consumer_count = 1
+        pool.allocation_size = 2048
+        pool._lock = threading.Lock()
+        pool._publisher_condition = threading.Condition(pool._lock)
+        pool._active_publishers = 0
+        pool._closing = pool._closed = False
+        pool._pool_error = pool._fd_broker = None
+        pool.available_chunks = [_CudaVmmMemoryChunk(0, 2048)]
+        pool.occupied_chunks = []
+        return pool
+
+    def test_stream_context_failure_returns_reservations(self):
+        """context setup failures must not strand capacity or active publishers"""
+        for failure_point in ("construct", "enter"):
+            with self.subTest(failure_point=failure_point):
+                pool = self.make_pool()
+                publisher = BoundedFeaturePublisher(pool, 1000, cpu_tensors=True)
+                publisher.copy_stream = object()
+                source = torch.ones(4)
+                output = MultimodalProcessorOutput(
+                    input_ids=[1],
+                    mm_items=[
+                        MultimodalDataItem(modality=Modality.IMAGE, feature=source)
+                        for _ in range(2)
+                    ],
+                )
+
+                def fail_context(*args):
+                    self.assertEqual(pool._active_publishers, 2)
+                    self.assertEqual(publisher.admission.pending_count, 1)
+                    raise RuntimeError("CUDA stream context failed")
+
+                context = MagicMock()
+                context.__enter__.side_effect = fail_context
+                try:
+                    with patch(
+                        "sglang.srt.multimodal.transport.publisher.torch.cuda.stream",
+                        side_effect=(
+                            fail_context if failure_point == "construct" else None
+                        ),
+                        return_value=context,
+                    ):
+                        with self.assertRaisesRegex(
+                            RuntimeError, "CUDA stream context failed"
+                        ):
+                            asyncio.run(publisher.prepare([output]))
+                    self.assertEqual(pool._active_publishers, 0)
+                    self.assertEqual(
+                        pool.available_chunks, [_CudaVmmMemoryChunk(0, 2048)]
+                    )
+                    self.assertEqual(pool.reclaimed_count, 2)
+                    self.assertEqual(publisher.admission.pending_count, 0)
+                    self.assertEqual(publisher.admission.pending_bytes, 0)
+                    self.assertTrue(
+                        all(item.feature is source for item in output.mm_items)
+                    )
+                finally:
+                    publisher.shutdown()
+
+    def test_lifecycle_metrics_count_each_release_once(self):
+        registry = CollectorRegistry()
+
+        class Collector(TokenizerMetricsCollector):
+            _counter_cls = staticmethod(partial(Counter, registry=registry))
+            _gauge_cls = staticmethod(partial(Gauge, registry=registry))
+            _histogram_cls = staticmethod(partial(Histogram, registry=registry))
+
+        with get_context().override_server_args():
+            collector = Collector(labels={"model_name": "test"})
+        collector.init_mm_publication_metrics()
+        pool = self.make_pool()
+        chunks = pool.try_reserve_batch([256])
+        # published chunks become visible to the recycler and age gauge
+        pool.occupied_chunks.extend(chunks)
+        start = chunks[0].reserved_at
+        labels = {"model_name": "test", "transport": "cuda_vmm"}
+        with patch(
+            "sglang.srt.multimodal.transport.cuda_vmm.time.monotonic",
+            return_value=start + 2,
+        ):
+            collector.observe_mm_publication("cuda_vmm", pool, None, None, 0, 0)
+            self.assertEqual(
+                registry.get_sample_value(
+                    "sglang:mm_publication_oldest_lease_seconds", labels
+                ),
+                2,
+            )
+            pool.release_reserved_batch(chunks)
+            for _ in range(2):
+                collector.observe_mm_publication("cuda_vmm", pool, None, None, 0, 0)
+        self.assertEqual(
+            registry.get_sample_value(
+                "sglang:mm_publication_oldest_lease_seconds", labels
+            ),
+            0,
+        )
+        self.assertEqual(
+            registry.get_sample_value("sglang:mm_publication_reclaimed_total", labels),
+            1,
+        )
+        self.assertEqual(
+            registry.get_sample_value(
+                "sglang:mm_publication_reclaimed_lifetime_seconds_total", labels
+            ),
+            2,
+        )
+
+    def test_fragmentation_rolls_back_batch_and_publisher_count(self):
+        pool = self.make_pool()
+        chunks = pool.try_reserve_batch([256] * 4)
+        pool.release_reserved_batch([chunks[0], chunks[2]])
+        self.assertIsNone(pool.try_reserve_batch([256, 512]))
+        self.assertEqual(pool._active_publishers, 2)
+        self.assertEqual(
+            [(c.start, c.end) for c in pool.available_chunks], [(0, 512), (1024, 1536)]
+        )
+        pool.release_reserved_batch([chunks[1], chunks[3]])
+        self.assertEqual(pool._active_publishers, 0)
+        self.assertEqual(pool.available_chunks, [_CudaVmmMemoryChunk(0, 2048)])
+
+    def test_control_overhead_is_part_of_capacity(self):
+        pool = self.make_pool()
+        with self.assertRaises(MmMemoryRequestTooLarge):
+            pool.try_reserve_batch([2048])
+        self.assertEqual(pool._active_publishers, 0)
 
 
 class TestCudaVmmFeatureTransport(unittest.TestCase):
@@ -22,9 +383,7 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
             MultimodalProcessorOutput,
         )
         from sglang.srt.multimodal.modality import Modality
-        from sglang.srt.multimodal.transport.cuda_ipc import (
-            CudaIpcTensorTransportProxy,
-        )
+        from sglang.srt.multimodal.transport.cuda_ipc import CudaIpcTensorTransportProxy
 
         class FakeProxy(CudaIpcTensorTransportProxy):
             def __init__(self, *, fail_reconstruct=False, fail_release=False):
@@ -173,9 +532,7 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         get_model_architecture.assert_not_called()
 
     def test_disabled_transport_is_a_noop(self):
-        from sglang.srt.multimodal.transport.cuda_vmm import (
-            CudaVmmFeatureTransport,
-        )
+        from sglang.srt.multimodal.transport.cuda_vmm import CudaVmmFeatureTransport
         from sglang.srt.runtime_context import get_context
 
         # The transport choice is a bag leaf.
@@ -191,9 +548,7 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         self.assertIsNone(transport.pool)
 
     def test_vmm_transport_requires_processor(self):
-        from sglang.srt.multimodal.transport.cuda_vmm import (
-            CudaVmmFeatureTransport,
-        )
+        from sglang.srt.multimodal.transport.cuda_vmm import CudaVmmFeatureTransport
         from sglang.srt.runtime_context import get_context
 
         override = get_context().override_server_args(mm_feature_transport="cuda_vmm")
@@ -205,9 +560,7 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
     def test_image_features_are_packed_per_request(self):
         from sglang.srt.managers.req_types import MultimodalDataItem
         from sglang.srt.multimodal.modality import Modality
-        from sglang.srt.multimodal.transport.cuda_vmm import (
-            CudaVmmFeatureTransport,
-        )
+        from sglang.srt.multimodal.transport.cuda_vmm import CudaVmmFeatureTransport
 
         transport = object.__new__(CudaVmmFeatureTransport)
         transport.pool = MagicMock()
@@ -231,9 +584,7 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         from sglang.srt.multimodal.transport.cuda_ipc import (
             DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
         )
-        from sglang.srt.multimodal.transport.cuda_vmm import (
-            CudaVmmFeatureTransport,
-        )
+        from sglang.srt.multimodal.transport.cuda_vmm import CudaVmmFeatureTransport
 
         transport = object.__new__(CudaVmmFeatureTransport)
         transport.pool = MagicMock()
@@ -261,9 +612,7 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
     def test_tensor_containers_fail_closed(self):
         from sglang.srt.managers.req_types import MultimodalDataItem
         from sglang.srt.multimodal.modality import Modality
-        from sglang.srt.multimodal.transport.cuda_vmm import (
-            CudaVmmFeatureTransport,
-        )
+        from sglang.srt.multimodal.transport.cuda_vmm import CudaVmmFeatureTransport
 
         transport = object.__new__(CudaVmmFeatureTransport)
         transport.pool = MagicMock()
@@ -348,6 +697,7 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         manager.positional_embeds_transport = MagicMock()
 
         with (
+            get_context().override_server_args(mm_admission_timeout_ms=None),
             patch.object(tokenizer_manager, "wrap_shm_features", lambda obj: obj),
             self.assertRaisesRegex(RuntimeError, "send failed"),
         ):
@@ -387,6 +737,7 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         manager.positional_embeds_transport = MagicMock()
 
         with (
+            get_context().override_server_args(mm_admission_timeout_ms=None),
             patch.object(tokenizer_manager, "wrap_shm_features", lambda obj: obj),
             self.assertRaisesRegex(RuntimeError, "bookkeeping failed"),
         ):
@@ -401,9 +752,7 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
             MultimodalProcessorOutput,
         )
         from sglang.srt.multimodal.modality import Modality
-        from sglang.srt.multimodal.transport.cuda_vmm import (
-            CudaVmmFeatureTransport,
-        )
+        from sglang.srt.multimodal.transport.cuda_vmm import CudaVmmFeatureTransport
 
         transport = object.__new__(CudaVmmFeatureTransport)
         transport.pool = object()
@@ -459,9 +808,7 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
             transport._publisher_executor.shutdown(wait=True)
 
     def test_text_only_publication_bypasses_publisher_executor(self):
-        from sglang.srt.multimodal.transport.cuda_vmm import (
-            CudaVmmFeatureTransport,
-        )
+        from sglang.srt.multimodal.transport.cuda_vmm import CudaVmmFeatureTransport
 
         transport = object.__new__(CudaVmmFeatureTransport)
         transport.pool = object()
@@ -548,9 +895,7 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         self.assertEqual(pool.occupied_chunks, [vmm._CudaVmmMemoryChunk(64, 128)])
 
     def test_prepare_batch_cancels_prior_groups_on_failure(self):
-        from sglang.srt.multimodal.transport.cuda_vmm import (
-            CudaVmmFeatureTransport,
-        )
+        from sglang.srt.multimodal.transport.cuda_vmm import CudaVmmFeatureTransport
 
         transport = object.__new__(CudaVmmFeatureTransport)
         transport.pool = MagicMock()
@@ -571,9 +916,7 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         transport.cancel_for_dispatch.assert_called_once_with(item_groups[0])
 
     def test_prepare_batch_returns_flattened_items(self):
-        from sglang.srt.multimodal.transport.cuda_vmm import (
-            CudaVmmFeatureTransport,
-        )
+        from sglang.srt.multimodal.transport.cuda_vmm import CudaVmmFeatureTransport
 
         transport = object.__new__(CudaVmmFeatureTransport)
         transport.pool = MagicMock()
@@ -598,9 +941,7 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         from sglang.srt.entrypoints import engine as engine_module
         from sglang.srt.entrypoints.engine import Engine
         from sglang.srt.managers.tokenizer_manager import TokenizerManager
-        from sglang.srt.multimodal.transport.cuda_vmm import (
-            CudaVmmFeatureTransport,
-        )
+        from sglang.srt.multimodal.transport.cuda_vmm import CudaVmmFeatureTransport
 
         manager = object.__new__(TokenizerManager)
         transport = object.__new__(CudaVmmFeatureTransport)
@@ -629,9 +970,7 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         from sglang.srt.entrypoints.engine import Engine
         from sglang.srt.environ import envs
         from sglang.srt.managers.tokenizer_manager import TokenizerManager
-        from sglang.srt.multimodal.transport.cuda_vmm import (
-            CudaVmmFeatureTransport,
-        )
+        from sglang.srt.multimodal.transport.cuda_vmm import CudaVmmFeatureTransport
 
         # The pool is the Python server's TokenizerManager's, which Rust-server
         # mode never starts, so pin the mode against an inherited
@@ -687,9 +1026,7 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         self.assertIs(transport.pool, pool)
 
     def test_failed_pool_shutdown_remains_retryable(self):
-        from sglang.srt.multimodal.transport.cuda_vmm import (
-            CudaVmmFeatureTransport,
-        )
+        from sglang.srt.multimodal.transport.cuda_vmm import CudaVmmFeatureTransport
 
         transport = object.__new__(CudaVmmFeatureTransport)
         pool = MagicMock()
@@ -1111,9 +1448,7 @@ class TestVmmConsumerCount(unittest.TestCase):
         self.assertEqual(proxy._resolve_consumer_count(2), 2)
 
     def test_acknowledgement_ranges_include_cp_rank(self):
-        from sglang.srt.multimodal.transport.cuda_vmm import (
-            CudaVmmTensorTransportProxy,
-        )
+        from sglang.srt.multimodal.transport.cuda_vmm import CudaVmmTensorTransportProxy
         from sglang.srt.runtime_context import get_parallel
 
         proxy = object.__new__(CudaVmmTensorTransportProxy)

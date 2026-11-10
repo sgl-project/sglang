@@ -185,6 +185,10 @@ from sglang.srt.managers.tokenizer_manager import (
     TokenizerManager,
     get_tokenizer_worker_class,
 )
+from sglang.srt.multimodal.transport.admission import (
+    MmMemoryOverloaded,
+    MmMemoryRequestTooLarge,
+)
 from sglang.srt.observability.func_timer import enable_func_timer
 from sglang.srt.observability.http_request_metrics import (
     add_http_request_metrics_middleware,
@@ -1003,6 +1007,12 @@ async def serve_generate_request(obj: GenerateReqInput, request: Request):
                         "retryable": False,
                     }
                 }
+                if isinstance(e, (MmMemoryOverloaded, MmMemoryRequestTooLarge)):
+                    out["error"].update(
+                        type=e.error_code,
+                        code=e.status_code,
+                        retryable=isinstance(e, MmMemoryOverloaded),
+                    )
                 logger.error(f"[http_server] Error: {e}")
                 yield b"data: " + dumps_json(out) + b"\n\n"
             yield b"data: [DONE]\n\n"
@@ -2333,6 +2343,18 @@ async def vertex_generate(
 
 
 def _create_error_response(e):
+    if isinstance(e, (MmMemoryOverloaded, MmMemoryRequestTooLarge)):
+        return ORJSONResponse(
+            {
+                "error": {
+                    "message": str(e),
+                    "type": e.error_code,
+                    "code": e.status_code,
+                    "retryable": isinstance(e, MmMemoryOverloaded),
+                }
+            },
+            status_code=e.status_code,
+        )
     return ORJSONResponse(
         {"error": {"message": str(e)}},
         status_code=getattr(e, "status_code", HTTPStatus.BAD_REQUEST),

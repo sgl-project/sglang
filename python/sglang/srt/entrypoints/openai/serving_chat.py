@@ -113,6 +113,10 @@ from sglang.srt.function_call.utils import (
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.models.unlimited_ocr_v2_support.chat import ChatDocSplitter
+from sglang.srt.multimodal.transport.admission import (
+    MmMemoryOverloaded,
+    MmMemoryRequestTooLarge,
+)
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.hunyuan_reasoning import (
     normalize_hunyuan_reasoning_effort,
@@ -2370,6 +2374,9 @@ class OpenAIServingChat(OpenAIServingBase):
         # a proper HTTP 400 error response instead of streaming it as SSE payload.
         try:
             first_chunk = await generator.__anext__()
+        except (MmMemoryOverloaded, MmMemoryRequestTooLarge):
+            # the outer handler preserves the admission status in either wire format
+            raise
         except ValueError as e:
             return self.create_error_response(str(e))
 
@@ -2802,7 +2809,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 for chunk in end_frames(close_open_choices=True):
                     yield chunk
             else:
-                error = self.create_streaming_error_response(str(e))
+                error = self.create_streaming_error_response(e)
                 yield f"data: {error}\n\n"
         finally:
             # Closing generate_request runs its cleanup, which aborts the
@@ -2843,6 +2850,8 @@ class OpenAIServingChat(OpenAIServingBase):
             ret = await self.tokenizer_manager.generate_request(
                 adapted_request, raw_request
             ).__anext__()
+        except (MmMemoryOverloaded, MmMemoryRequestTooLarge):
+            raise
         except ValueError as e:
             return self.create_error_response(str(e))
 

@@ -29,6 +29,7 @@ class Mm(msgspec.Struct):
         Optional[bool],
         "Enable the multimodal functionality for the served model. If the model being served is not multimodal, nothing will happen",
     ] = None
+
     mm_attention_backend: A[
         Optional[str],
         Arg(
@@ -155,4 +156,11 @@ class Mm(msgspec.Struct):
             ),
             resolvable=True,
         ),
+    ] = None
+    mm_admission_timeout_ms: A[
+        Optional[int],
+        "Bounded wait for a complete GPU feature-pool reservation in milliseconds. "
+        "Unset preserves legacy pool-full CPU fallback; 0 rejects immediately. "
+        "When set, CUDA IPC/VMM never spill to CPU on pool exhaustion. "
+        "This limits publication backlog, not decode/preprocessing memory.",
     ] = None

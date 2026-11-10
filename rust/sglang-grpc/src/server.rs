@@ -308,6 +308,14 @@ fn terminal_error_status(error: TerminalError) -> Status {
     }
 }
 
+fn response_error_status(error: crate::bridge::ResponseError) -> Status {
+    match error.status_code {
+        413 => Status::invalid_argument(error.message),
+        429 => Status::resource_exhausted(error.message),
+        _ => Status::internal(error.message),
+    }
+}
+
 fn openai_status_code(meta_info: &HashMap<String, String>, default: i32) -> i32 {
     meta_info
         .get("status_code")
@@ -361,7 +369,7 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
                     }
                     Ok(Some(ResponseChunk::Error(msg))) => {
                         abort_guard.disarm();
-                        yield Err(Status::internal(msg));
+                        yield Err(response_error_status(msg));
                         break;
                     }
                     Ok(None) => {
@@ -431,7 +439,7 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
                     }
                     Ok(Some(ResponseChunk::Error(msg))) => {
                         abort_guard.disarm();
-                        yield Err(Status::internal(msg));
+                        yield Err(response_error_status(msg));
                         break;
                     }
                     Ok(None) => {
@@ -489,7 +497,7 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
                     meta_info: data.meta_info,
                 }))
             }
-            ResponseChunk::Error(msg) => Err(Status::internal(msg)),
+            ResponseChunk::Error(msg) => Err(response_error_status(msg)),
         }
     }
 
@@ -524,7 +532,7 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
                     meta_info: data.meta_info,
                 }))
             }
-            ResponseChunk::Error(msg) => Err(Status::internal(msg)),
+            ResponseChunk::Error(msg) => Err(response_error_status(msg)),
         }
     }
 
@@ -566,7 +574,7 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
                     meta_info: data.meta_info,
                 }))
             }
-            ResponseChunk::Error(msg) => Err(Status::internal(msg)),
+            ResponseChunk::Error(msg) => Err(response_error_status(msg)),
         }
     }
 
@@ -1012,7 +1020,7 @@ impl SglangServiceImpl {
                     }
                     Ok(Some(ResponseChunk::Error(msg))) => {
                         abort_guard.disarm();
-                        yield Err(Status::internal(msg));
+                        yield Err(response_error_status(msg));
                         break;
                     }
                     Ok(None) => {
@@ -1066,10 +1074,10 @@ impl SglangServiceImpl {
                 }))
             }
             ResponseChunk::Error(msg) => {
-                let error_json = serde_json::json!({"error": {"message": msg}});
+                let error_json = serde_json::json!({"error": {"message": msg.message}});
                 Ok(Response::new(proto::OpenAiResponse {
                     json_body: error_json.to_string().into_bytes(),
-                    status_code: 500,
+                    status_code: msg.status_code,
                 }))
             }
         }
@@ -1092,7 +1100,7 @@ async fn recv_json_response(
             String::from_utf8(bytes)
                 .map_err(|e| Status::internal(format!("Invalid UTF-8 in response: {}", e)))
         }
-        ResponseChunk::Error(msg) => Err(Status::internal(msg)),
+        ResponseChunk::Error(msg) => Err(response_error_status(msg)),
     }
 }
 

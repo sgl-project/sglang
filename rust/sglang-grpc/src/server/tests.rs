@@ -1,14 +1,30 @@
 use super::{
     DEFAULT_GRPC_MAX_MESSAGE_SIZE, openai_status_code, resolve_max_message_size,
-    terminal_error_status,
+    response_error_status, terminal_error_status,
 };
-use crate::bridge::TerminalError;
+use crate::bridge::{ResponseError, TerminalError};
 use std::collections::HashMap;
 use tonic::Code;
 
 // The metadata wire test starts a real server that reads SGLANG_TONIC_PAYLOAD.
 // Keep that read separate from the environment override test below.
 static PAYLOAD_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[test]
+fn native_admission_errors_distinguish_oversized_and_retryable_pressure() {
+    for (status_code, code) in [
+        (413, Code::InvalidArgument),
+        (429, Code::ResourceExhausted),
+        (500, Code::Internal),
+    ] {
+        let status = response_error_status(ResponseError {
+            message: "pool capacity".into(),
+            status_code,
+        });
+        assert_eq!(status.code(), code);
+        assert_eq!(status.message(), "pool capacity");
+    }
+}
 
 #[test]
 fn openai_status_code_uses_forwarded_status_when_present() {
