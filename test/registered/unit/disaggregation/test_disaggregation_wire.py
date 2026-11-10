@@ -1276,6 +1276,57 @@ class TestDsaIndexKTokenBytes(unittest.TestCase):
                 self.assertEqual(kv_args.dsa_index_k_token_bytes, expected)
 
 
+class TestDFlashDraftKVRingRegistration(unittest.TestCase):
+    """A DFLASH draft KV ring registers its rows and its floor after the
+    storage's entries, so prefill and decode pair them by position; a stage
+    without the draft keeps two empty slots."""
+
+    def _register(self, ring, *, ring_on):
+        from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+
+        pool = object.__new__(DSATokenToKVPool)
+        pool.start_layer = 0
+        pool.layer_num = 1
+        pool.index_head_dim = 128
+        pool.use_fp4_indexer = False
+        pool.index_bytes_per_token = DSATokenToKVPool.index_bytes_per_token_for(
+            128, False
+        )
+        pool.index_kpool = 1
+        pool.get_state_buf_infos = lambda: ([0x1000], [4096], [64 * 132])
+        pool.get_compress_tail_buf_infos = lambda: ([], [], [])
+        kv_args = KVArgs()
+        setup_state_kv_args(
+            kv_args, _static_storage(pool), draft_kv_ring=ring, draft_kv_ring_on=ring_on
+        )
+        return kv_args
+
+    def test_a_ring_registers_its_rows_and_floor_last(self):
+        ring = SimpleNamespace(
+            ring_buf_infos=lambda: ([0x2000, 0x3000], [5760, 5760], [576, 576]),
+            floor_buf_infos=lambda: ([0x4000], [136], [4]),
+        )
+        kv_args = self._register(ring, ring_on=True)
+        self.assertEqual(
+            kv_args.state_types,
+            [StateType.DSA, StateType.DRAFT_RING, StateType.REQUEST_ROW],
+        )
+        self.assertEqual(kv_args.state_data_ptrs[1:], [[0x2000, 0x3000], [0x4000]])
+        self.assertEqual(kv_args.state_item_lens[1:], [[576, 576], [4]])
+
+    def test_a_stage_without_the_ring_keeps_empty_slots(self):
+        kv_args = self._register(None, ring_on=True)
+        self.assertEqual(
+            kv_args.state_types,
+            [StateType.DSA, StateType.DRAFT_RING, StateType.REQUEST_ROW],
+        )
+        self.assertEqual(kv_args.state_data_ptrs[1:], [[], []])
+
+    def test_nothing_is_registered_with_the_ring_off(self):
+        kv_args = self._register(None, ring_on=False)
+        self.assertEqual(kv_args.state_types, [StateType.DSA])
+
+
 class TestCPReplicatedStateTransfer(unittest.TestCase):
     def test_only_nonzero_cp_ranks_without_layer_split_skip_state(self):
         # Under CP-TP group sharing each CP rank owns its own linear-attention

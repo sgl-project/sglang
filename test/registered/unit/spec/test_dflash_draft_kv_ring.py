@@ -15,13 +15,7 @@ import torch
 
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.arg_groups.speculative_hook import _resolve_dflash_draft_kv_ring
-from sglang.srt.disaggregation.base.conn import KVArgs, StateType
-from sglang.srt.disaggregation.utils import (
-    _append_draft_kv_ring_state,
-    append_state_component,
-)
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_context, get_spec
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dflash_draft_ring import (
     DFlashDraftKVRing,
@@ -273,61 +267,6 @@ class TestDraftKVRingPDTransfer(CustomTestCase):
         ptrs, lens, item_lens = ring.floor_buf_infos()
         self.assertEqual(ptrs, [ring.min_pos.data_ptr()])
         self.assertEqual((lens, item_lens), ([4 * 4], [4]))
-
-
-class TestDraftKVRingRegistration(CustomTestCase):
-    """The ring's two state entries go last, so prefill and decode pair them by
-    position; a side with the ring resolved on but no ring keeps empty slots."""
-
-    def _register(self, ring, *, ring_on):
-        kv_args = KVArgs()
-        for name in (
-            "state_types",
-            "state_sub_pools",
-            "state_wire_keys",
-            "state_data_ptrs",
-            "state_data_lens",
-            "state_item_lens",
-            "state_dim_per_tensor",
-            "state_conv_shard_groups",
-            "state_slice_outer_counts",
-            "state_layer_ids",
-        ):
-            setattr(kv_args, name, [])
-        append_state_component(kv_args, StateType.MAMBA, [1], [2], [3])
-        with (
-            get_context().override_server_args(),
-            get_spec().override(speculative_dflash_draft_kv_ring=ring_on),
-        ):
-            _append_draft_kv_ring_state(kv_args, ring)
-        return kv_args
-
-    def test_a_ring_registers_its_rows_and_floor_last(self):
-        pool = SimpleNamespace(
-            page_size=1,
-            get_contiguous_buf_infos=lambda: ([1000], [5760], [576]),
-        )
-        ring = _ring(8, pool=pool)
-        kv_args = self._register(ring, ring_on=True)
-        self.assertEqual(
-            kv_args.state_types,
-            [StateType.MAMBA, StateType.DRAFT_RING, StateType.REQUEST_ROW],
-        )
-        self.assertEqual(
-            kv_args.state_data_ptrs[1:], [[1000], [ring.min_pos.data_ptr()]]
-        )
-        self.assertEqual(kv_args.state_item_lens[1:], [[576], [4]])
-
-    def test_a_stage_without_the_ring_keeps_empty_slots(self):
-        kv_args = self._register(None, ring_on=True)
-        self.assertEqual(
-            kv_args.state_types[1:], [StateType.DRAFT_RING, StateType.REQUEST_ROW]
-        )
-        self.assertEqual(kv_args.state_data_ptrs[1:], [[], []])
-
-    def test_nothing_is_registered_with_the_ring_off(self):
-        kv_args = self._register(None, ring_on=False)
-        self.assertEqual(kv_args.state_types, [StateType.MAMBA])
 
 
 if __name__ == "__main__":

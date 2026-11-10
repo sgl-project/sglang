@@ -1792,10 +1792,13 @@ def setup_state_kv_args(
     total_kv_layers: Optional[int] = None,
     window_tails: Optional[Dict[str, int]] = None,
     draft_kv_ring: Optional[DFlashDraftKVRing] = None,
+    draft_kv_ring_on: bool = False,
 ) -> None:
     """Register the storage's state entries in its wire order, and the flags
     peers read from its token KV layout. ``window_tails`` gives the tail each
-    window sub-pool carries (`KVStorage.retained_window_lengths`); peers agree on it."""
+    window sub-pool carries (`KVStorage.retained_window_lengths`); peers agree on it.
+    ``draft_kv_ring_on`` is the resolved DFLASH draft KV ring; ``draft_kv_ring``
+    is this stage's ring, None on a stage without the draft."""
     from sglang.srt.disaggregation.base.conn import StateType
     from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
@@ -1864,7 +1867,8 @@ def setup_state_kv_args(
             if draft_token_to_kv_pool is not None
             else 0
         )
-    _append_draft_kv_ring_state(kv_args, draft_kv_ring)
+    if draft_kv_ring_on:
+        _append_draft_kv_ring_state(kv_args, draft_kv_ring)
 
 
 def _token_kv_view(token_to_kv_pool):
@@ -1885,7 +1889,7 @@ def _append_draft_kv_ring_state(
     if ring is not None:
         append_state_component(kv_args, StateType.DRAFT_RING, *ring.ring_buf_infos())
         append_state_component(kv_args, StateType.REQUEST_ROW, *ring.floor_buf_infos())
-    elif get_spec().speculative_dflash_draft_kv_ring:
+    else:
         append_state_component(kv_args, StateType.DRAFT_RING, [], [], [])
         append_state_component(kv_args, StateType.REQUEST_ROW, [], [], [])
 
