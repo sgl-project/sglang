@@ -1793,13 +1793,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 )
             forward_batch = self.model_runner.prepare_dummy_forward_batch(forward_batch)
             self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
-        # Local import keeps this shared runner free of the NPU-only module;
-        # the call is a no-op for every backend that binds no state.
-        from sglang.srt.hardware_backend.npu.moe.prefill_graph import (
-            install_capture_state,
-        )
-
-        install_capture_state(forward_batch)
         return forward_batch, self.model_runner.attn_backend
 
     def capture(self) -> None:
