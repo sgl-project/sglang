@@ -325,74 +325,6 @@ def _restrict_schema_type(
     return _with_root_definitions(result, root_schema)
 
 
-_PROPERTY_NAME_KEYWORDS = ("properties", "patternProperties", "dependentSchemas")
-# Definitions count only through a $ref, which the walk follows; literal keywords
-# hold values, and a non-ASCII value compiles fine.
-_NON_PROPERTY_KEYWORDS = (
-    "$defs",
-    "definitions",
-    "const",
-    "enum",
-    "default",
-    "examples",
-)
-
-
-def _declares_non_ascii_property(
-    schema: Any,
-    root: Optional[Dict[str, Any]] = None,
-    depth: int = 0,
-    seen_refs: Optional[Set[str]] = None,
-) -> bool:
-    """Whether a schema reachable from here declares a non-ASCII property name.
-
-    XGrammar clamps property-name literals to ASCII, so such a schema compiles
-    to a grammar that rejects every instance.
-    """
-    if depth > 64 or not isinstance(schema, (dict, list)):
-        return False
-    if isinstance(schema, list):
-        return any(
-            _declares_non_ascii_property(item, root, depth + 1, seen_refs)
-            for item in schema
-        )
-    if root is None:
-        root = schema
-
-    ref = schema.get("$ref")
-    if isinstance(ref, str):
-        seen_refs = set() if seen_refs is None else seen_refs
-        if ref not in seen_refs:
-            seen_refs.add(ref)
-            target = _resolve_local_ref(ref, root)
-            if target is not None and _declares_non_ascii_property(
-                target, root, depth + 1, seen_refs
-            ):
-                return True
-
-    for keyword in _PROPERTY_NAME_KEYWORDS:
-        names = schema.get(keyword)
-        if isinstance(names, dict) and any(not str(key).isascii() for key in names):
-            return True
-    required = schema.get("required")
-    if isinstance(required, list) and any(
-        isinstance(item, str) and not item.isascii() for item in required
-    ):
-        return True
-    dependent_required = schema.get("dependentRequired")
-    if isinstance(dependent_required, dict) and any(
-        not str(key).isascii()
-        or (isinstance(names, list) and any(not str(n).isascii() for n in names))
-        for key, names in dependent_required.items()
-    ):
-        return True
-    return any(
-        _declares_non_ascii_property(value, root, depth + 1, seen_refs)
-        for key, value in schema.items()
-        if key not in _NON_PROPERTY_KEYWORDS
-    )
-
-
 def _value_format(
     schema: Union[bool, Dict[str, Any]],
     json_type: str,
@@ -400,8 +332,6 @@ def _value_format(
 ) -> Format:
     if loose_string and json_type == "string":
         return AnyTextFormat()
-    if _declares_non_ascii_property(schema):
-        schema = {"type": json_type}
     # XGrammar 0.2.1 miscompiles a one-sided negative integer lower bound:
     # {"type": "integer", "minimum": -N} accepts the incomplete value "-"
     # and rejects every valid negative integer. Splitting the range at zero
