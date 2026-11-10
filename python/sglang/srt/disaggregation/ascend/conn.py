@@ -108,7 +108,7 @@ class AscendKVManager(MooncakeKVManager):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
 
     def _uses_page_interleaved_dcp(self) -> bool:
-        if getattr(self.kv_args, "dcp_transfer", None) is not None:
+        if getattr(self.kv_args, "dcp_num_replicated_entries", None) is not None:
             return False
         return (
             getattr(self.kv_args, "kv_buf_groups", 1) in (2, 3)

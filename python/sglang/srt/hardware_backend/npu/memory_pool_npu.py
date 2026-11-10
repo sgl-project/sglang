@@ -13,7 +13,7 @@ from sglang.srt.mem_cache.memory_pool import (
     get_tensor_size_bytes,
     unwrap_write_loc,
 )
-from sglang.srt.runtime_context import get_disagg, get_memory, get_parallel
+from sglang.srt.runtime_context import get_disagg, get_parallel
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.async_probe import maybe_detect_oob
 from sglang.srt.utils.device import is_npu
@@ -1011,30 +1011,59 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             for _, uses_global_slots in self._get_disagg_buffer_entries()
         ]
 
-    def get_pd_dcp_transfer_adapter(self):
+    def configure_pd_dcp(self, kv_args):
         if self.index_head_dim is None or self.is_draft_worker:
-            return None
+            return
         disagg = get_disagg()
-        if disagg.disaggregation_transfer_backend not in ("ascend", "mooncake"):
-            return None
+        backend = disagg.disaggregation_transfer_backend
+        if backend not in ("ascend", "mooncake"):
+            if self.dcp_size > 1 and backend != "fake":
+                raise ValueError(
+                    "NPU DSA DCP PD requires the Ascend or Mooncake transfer backend."
+                )
+            return
         if self.use_fia_nz and self.dcp_size > 1:
             raise ValueError("NPU DSA token PD requires a row-contiguous KV pool.")
-        if disagg.disaggregation_mode != "prefill":
-            return None
-        from sglang.srt.hardware_backend.npu.mooncake_dsa_dcp import (
-            build_dsa_token_dcp_transfer,
-        )
+        if disagg.disaggregation_mode == "prefill":
+            # Index-K and its scales precede the appended draft entries. All
+            # entries in this suffix keep allocator-global slots on Decode.
+            kv_args.dcp_num_replicated_entries = (
+                sum(self.get_dcp_remote_decode_layout()) + kv_args.num_draft_entries
+            )
+            kv_args.dcp_prepare_token_item_lens = self._prepare_pd_dcp_token_item_lens
 
-        return build_dsa_token_dcp_transfer(
-            {
-                buffer.data_ptr(): buffer
-                for buffer, uses_global_slots in self._get_disagg_buffer_entries()
-                if not uses_global_slots
-            },
-            supports_relayout=(
-                not self.use_fia_nz and not get_memory().enable_unified_memory
-            ),
+    def _prepare_pd_dcp_token_item_lens(self, kv_args, peer) -> list[int]:
+        from sglang.srt.disaggregation.utils import resolve_dcp_dst_entry_indices
+
+        if self.use_fia_nz or peer.dst_draft_rows_dcp_collapsed:
+            raise ValueError(
+                "NPU DSA token PD requires row-contiguous KV and replicated draft rows."
+            )
+        if len(peer.dst_kv_ptrs) != len(peer.dst_kv_item_lens):
+            raise ValueError("NPU DSA token DCP requires per-entry destination widths")
+        dst_entries = resolve_dcp_dst_entry_indices(
+            kv_args.kv_layer_ids,
+            peer.dst_kv_layer_ids,
+            len(kv_args.kv_data_ptrs),
+            len(peer.dst_kv_ptrs),
         )
+        num_target = len(kv_args.kv_item_lens) - kv_args.dcp_num_replicated_entries
+        widths = []
+        for i, (src_bytes, dst_entry) in enumerate(
+            zip(kv_args.kv_item_lens, dst_entries, strict=True)
+        ):
+            width, remainder = divmod(src_bytes, kv_args.page_size)
+            scale = 1 if i < num_target else peer.dst_dcp_size
+            if remainder or width <= 0 or dst_entry >= len(peer.dst_kv_item_lens):
+                raise ValueError("Invalid NPU DSA token DCP page geometry")
+            if peer.dst_kv_item_lens[dst_entry] != src_bytes * scale:
+                raise ValueError(
+                    f"NPU DSA token DCP entry {dst_entry} has incompatible page bytes: "
+                    f"prefill={src_bytes}, decode={peer.dst_kv_item_lens[dst_entry]}, "
+                    f"scale={scale}"
+                )
+            widths.append(width)
+        return widths
 
     def get_kv_layer_ids(self):
         return (

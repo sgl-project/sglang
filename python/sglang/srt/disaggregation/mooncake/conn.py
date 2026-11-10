@@ -8,7 +8,6 @@ import struct
 import threading
 import time
 from collections import defaultdict
-from functools import partial
 from typing import Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
@@ -1687,8 +1686,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 _, dst_kv_item_lens, _ = self.get_mla_kv_ptrs_with_pp(
                     self.kv_args.kv_item_lens, dst_kv_item_lens
                 )
-        num_draft = self.kv_args.num_draft_entries
-        num_target = len(src_kv_ptrs) - num_draft
+        num_replicated = getattr(
+            self.kv_args, "dcp_num_replicated_entries", self.kv_args.num_draft_entries
+        )
+        num_target = len(src_kv_ptrs) - num_replicated
 
         plan = build_dcp_token_transfer_plan(
             prefill_kv_indices,
@@ -1703,17 +1704,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         )
         if plan.empty():
             return 0
-        adapter = getattr(self.kv_args, "dcp_transfer", None)
-        if adapter is not None:
-            return adapter.send(
-                transfer_data=partial(self._transfer_data, mooncake_session_id),
-                plan=plan,
-                src_ptrs=src_kv_ptrs,
-                dst_ptrs=dst_kv_ptrs,
-                widths=dcp_token_item_lens,
-                pack_buffer=pack_buffer,
-            )
-
         target_src_kv_ptrs = src_kv_ptrs[:num_target]
         src_token_indices = plan.target_src_token_indices
         if pack_buffer is not None and src_token_indices.size:
@@ -1758,7 +1748,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             )
         sliced_draft_params = []
         draft_to_pack = []
-        if num_draft > 0 and plan.draft_src_token_indices.size:
+        if num_replicated > 0 and plan.draft_src_token_indices.size:
             if not dst_kv_item_lens and dst_attn_tp_size not in (
                 None,
                 self.attn_tp_size,
@@ -1770,7 +1760,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 plan.draft_src_token_indices,
                 plan.draft_dst_token_indices,
             )
-            for entry in range(num_target, num_target + num_draft):
+            for entry in range(num_target, len(src_kv_ptrs)):
                 src_width = dcp_token_item_lens[entry]
                 dst_width = src_width
                 if dst_kv_item_lens:
@@ -3284,18 +3274,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         decode_kv_args.dst_dcp_rank,
                     )
                     registration_error = None
-                    adapter = getattr(self.kv_args, "dcp_transfer", None)
-                    if adapter is not None and decode_kv_args.requires_dcp_relayout:
+                    prepare = getattr(self.kv_args, "dcp_prepare_token_item_lens", None)
+                    if prepare is not None and decode_kv_args.requires_dcp_relayout:
                         try:
-                            (
-                                decode_kv_args.dcp_token_item_lens,
-                                self._dcp_pack_buffers,
-                            ) = adapter.prepare(
-                                self.kv_args,
-                                decode_kv_args,
-                                pack_buffers=self._dcp_pack_buffers,
-                                num_workers=len(self.transfer_queues),
-                                register=self.engine.batch_register,
+                            decode_kv_args.dcp_token_item_lens = prepare(
+                                self.kv_args, decode_kv_args
                             )
                         except (ValueError, RuntimeError) as exc:
                             registration_error = str(exc)
