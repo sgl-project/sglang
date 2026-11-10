@@ -557,7 +557,9 @@ def init_dcp_push_combine(cp_group: "GroupCoordinator", num_heads: int) -> None:
     global _PUSH_COMBINE_COMM
     from sglang.srt.environ import envs
 
-    if _PUSH_COMBINE_COMM is not None or cp_group.world_size == 1:
+    # ROCm keeps the a2a reduce: this push plane's HIP VMM IPC exchange stalled
+    # MI355X DCP8 startup for minutes and left the node's RCCL degraded
+    if _is_hip or _PUSH_COMBINE_COMM is not None or cp_group.world_size == 1:
         return
     if not envs.SGLANG_ENABLE_DCP_PUSH_COMBINE.get() or num_heads % cp_group.world_size:
         return
