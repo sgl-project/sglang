@@ -341,15 +341,23 @@ def assert_metrics(self, metrics):
 
     if self.accuracy is not None:
         threshold = get_accuracy_threshold(self.datasets, self.accuracy)
+        # The dataset is part of the label: multi-node accuracy cases run
+        # gpqa_diamond on weekends and gsm8k on weekdays, and the two numbers
+        # must not land in the same metric series.
+        labels = {
+            "test_case": self.__class__.__name__,
+            "type": "accuracy",
+            "dataset": self.datasets[0] if self.datasets else "unknown",
+        }
         dump_metric(
             "accuracy",
             float(metrics["accuracy"]),
-            labels={"test_case": self.__class__.__name__, "type": "accuracy"},
+            labels=labels,
         )
         dump_metric(
             "accuracy_baseline",
             float(self.accuracy),
-            labels={"test_case": self.__class__.__name__, "type": "accuracy"},
+            labels=labels,
         )
         self.assertGreaterEqual(
             float(metrics["accuracy"]),
