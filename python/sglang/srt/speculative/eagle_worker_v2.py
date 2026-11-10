@@ -5,6 +5,7 @@ from typing import Callable, List, Optional
 
 import torch
 
+from sglang.kernels.ops.sampling import argmax as sampling_argmax
 from sglang.kernels.ops.speculative.topk1 import (
     draft_topk1_argmax_only,
     draft_topk1_postprocess,
@@ -1273,9 +1274,14 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             elif self.topk == 1:
                 # Gated to CUDA: see #26358 — ROCm's argmax tie-break corrupts
                 # MTP draft selection on FP8 logits.
-                ret_topk_index = torch.argmax(
-                    draft_logits_output.next_token_logits, dim=-1, keepdim=True
-                )
+                if envs.SGLANG_OPT_SPEC_DRAFT_TOP1_ARGMAX.get():
+                    ret_topk_index = sampling_argmax(
+                        draft_logits_output.next_token_logits
+                    ).unsqueeze(-1)
+                else:
+                    ret_topk_index = torch.argmax(
+                        draft_logits_output.next_token_logits, dim=-1, keepdim=True
+                    )
                 ret_topk_p = torch.ones_like(ret_topk_index, dtype=torch.float32)
             else:
                 probs = renorm_draft_probs(

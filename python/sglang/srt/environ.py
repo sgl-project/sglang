@@ -310,6 +310,11 @@ class Envs:
     SGLANG_OPT_HICACHE_GROUPED_DEVICE_FREES = EnvRuntimeBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # EAGLE draft extend, top-1: take the token with the sampler's split-row argmax
+    # (the verify's) instead of torch.argmax's one block per row; same token unless NaN.
+    SGLANG_OPT_SPEC_DRAFT_TOP1_ARGMAX = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
 
     # ===================================================================
     # Model configuration, discovery, and weight loading
