@@ -40,13 +40,21 @@ class OpenAIServingBase(ABC):
     def _parse_model_parameter(self, model: str) -> Tuple[str, Optional[str]]:
         """Parse 'base-model:adapter-name' syntax to extract LoRA adapter.
 
-        Returns (base_model, adapter_name), preserving an exact served model
-        name even when it contains colons (e.g. an object-storage URI).
+        A bare loaded adapter name, as listed by /v1/models, also selects that
+        adapter. Returns (base_model, adapter_name), preserving an exact served
+        model name even when it contains colons (e.g. an object-storage URI).
         """
+        served_model_name = self.tokenizer_manager.served_model_name
         if ":" not in model:
+            # /v1/models lists each loaded adapter under its bare name, so that
+            # name selects the adapter; the served model name keeps precedence.
+            if (
+                model != served_model_name
+                and self.tokenizer_manager.lora_registry.has_adapter(model)
+            ):
+                return served_model_name, model
             return model, None
 
-        served_model_name = self.tokenizer_manager.served_model_name
         if model == served_model_name:
             return model, None
 
