@@ -186,7 +186,9 @@ class SchedulerLoadInquirer:
         num_prealloc_ready_tokens = 0
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             mode_str = "prefill"
-            prefill_bootstrap = len(lists[ListKind.PD_BOOTSTRAP])
+            prefill_bootstrap = len(lists[ListKind.PD_BOOTSTRAP]) + len(
+                lists[ListKind.PD_ROOM_WAITERS]
+            )
             prefill_inflight = len(lists[ListKind.PD_SENDING])
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             mode_str = "decode"
