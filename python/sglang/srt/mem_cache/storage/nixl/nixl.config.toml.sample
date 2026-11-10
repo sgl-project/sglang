@@ -156,4 +156,4 @@ bucket = ""
 # active = true
 # device_name = "/dev/ng0n1"  # NVMe namespace character device
 # nguid = "00000000000000000000000000000000"
-# query_mem_mode = "actual"  # required for correct HiCache existence checks
+# num_tasks = "8192"         # max concurrent DOCA tasks

@@ -119,13 +119,30 @@ class HiCacheNixl(HiCacheStorage):
         sync_mode = getattr(
             nixlBind, "NIXL_THREAD_SYNC_RW", nixlBind.NIXL_THREAD_SYNC_STRICT
         )
-        agent_config = nixl_agent_config(backends=[])
+        # nixl 1.6.0 (upstream DOCA_MEMOS, #1717) renamed nixl_agent_config
+        # fields: enable_pthread -> enable_prog_thread, enable_listen ->
+        # enable_listen_thread, port -> listen_port. Enable the progress thread
+        # only there: its DOCA_MEMOS plugin runs a low-contention threaded
+        # progress engine off it, while the pre-upstream fork plugin ignores
+        # the flag and would only burn a busy-poll thread (pthrDelay == 0).
+        try:
+            agent_config = nixl_agent_config(backends=[], enable_prog_thread=True)
+            prog_thread = True
+        except TypeError:
+            agent_config = nixl_agent_config(backends=[])
+            prog_thread = agent_config.enable_pthread
         self.agent_name = f"hicache_nixl_{str(uuid.uuid4())}"
         self.agent = nixl_agent(self.agent_name, agent_config)
         bind_cfg = nixlBind.nixlAgentConfig()
-        bind_cfg.useProgThread = agent_config.enable_pthread
-        bind_cfg.useListenThread = agent_config.enable_listen
-        bind_cfg.listenPort = agent_config.port
+        bind_cfg.useProgThread = prog_thread
+        bind_cfg.useListenThread = getattr(
+            agent_config,
+            "enable_listen_thread",
+            getattr(agent_config, "enable_listen", False),
+        )
+        bind_cfg.listenPort = getattr(
+            agent_config, "listen_port", getattr(agent_config, "port", 0)
+        )
         bind_cfg.syncMode = sync_mode
         bind_cfg.pthrDelay = 0
         bind_cfg.lthrDelay = 100000

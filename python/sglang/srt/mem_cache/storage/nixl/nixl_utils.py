@@ -193,8 +193,10 @@ class NixlBackendSelection:
                 else {}
             )
             if self.backend_name == "DOCA_MEMOS":
-                # HiCache requires real existence checks rather than the
-                # plugin's assume-success default.
+                # Pre-upstream fork plugins default to assume-success existence
+                # checks; HiCache requires real ones. Upstream nixl (#1717)
+                # always issues a real EXIST per descriptor and ignores this
+                # parameter, so keep setting it for the fork at no cost.
                 initparams.setdefault("query_mem_mode", "actual")
 
             # Create backend and set memory type (S3 OBJ requires a bucket; DOCA_MEMOS does not)
