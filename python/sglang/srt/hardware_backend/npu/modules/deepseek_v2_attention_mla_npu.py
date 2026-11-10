@@ -9,6 +9,10 @@ import sglang.srt.layers.dcp.layout as dcp_layout
 import sglang.srt.model_executor.forward_context as forward_context
 import sglang.srt.runtime_context as runtime_context
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.npu.attention.dcp import (
+    forward_mla_attention_npu,
+    get_mla_dcp_backend,
+)
 from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     NPUFusedMLAPreprocess,
     is_fia_nz,
@@ -32,13 +36,18 @@ _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
 _is_npu_arch35 = is_npu_arch35()
 
 
-def _use_dsa_dcp_partial_attention(forward_batch: "ForwardBatch") -> bool:
-    return (
-        runtime_context.get_parallel().dcp_enabled
-        and not forward_context.get_attn_backend().is_draft_worker
-        and not dsa_use_prefill_cp(forward_batch)
-        and not forward_batch.forward_mode.is_idle()
+def init_modelslim_mla_kv(m: "DeepseekV2AttentionMLA", prefix: str):
+    quant_config = m.quant_config
+    if quant_config is None or quant_config.get_name() != "modelslim" or m.use_dsa:
+        return
+    scheme = quant_config.init_kv_cache(
+        m.attn_mqa,
+        prefix,
+        kv_lora_rank=m.kv_lora_rank,
+        qk_rope_head_dim=m.qk_rope_head_dim,
     )
+    if scheme is not None:
+        m.attn_mha.scheme = scheme
 
 
 # region MHA
@@ -50,6 +59,7 @@ def forward_mha_prepare_npu(
     zero_allocator: "BumpAllocator",
     input_on_attn_tp_slices: bool,
 ):
+    kv_quant_scheme = getattr(m.attn_mqa, "scheme", None)
     if m.q_lora_rank is not None:
         q, latent_cache = (
             get_attn_tp_context()
@@ -111,7 +121,11 @@ def forward_mha_prepare_npu(
             k_rope_cache,
             ckv_cache,
             k_rope_scale=None,
-            c_kv_scale=None,
+            c_kv_scale=(
+                kv_quant_scheme.k_inv_scale.view(1)
+                if kv_quant_scheme is not None
+                else None
+            ),
             k_rope_offset=None,
             c_kv_offset=None,
             epsilon=m.kv_a_layernorm.variance_epsilon,
@@ -127,7 +141,10 @@ def forward_mha_prepare_npu(
             q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
         # this is for model kimi-vl-a3B-instruct
         get_token_to_kv_pool().set_kv_buffer(
-            m, forward_batch.out_cache_loc, kv_a.unsqueeze(1), k_pe
+            m.attn_mqa if kv_quant_scheme is not None else m,
+            forward_batch.out_cache_loc,
+            kv_a.unsqueeze(1),
+            k_pe,
         )
 
     q[..., m.qk_nope_head_dim :] = q_pe
@@ -172,6 +189,8 @@ def forward_mla_prepare_npu(
     zero_allocator: "BumpAllocator",
     input_on_attn_tp_slices: bool,
 ):
+    kv_quant_scheme = getattr(m.attn_mqa, "scheme", None)
+    q_descale = None
     if is_mla_preprocess_enabled():
         if not hasattr(m, "mla_preprocess"):
             m.mla_preprocess = NPUFusedMLAPreprocess(
@@ -186,9 +205,14 @@ def forward_mla_prepare_npu(
                 m.qk_nope_head_dim,
                 m.qk_rope_head_dim,
                 m.v_head_dim,
+                kv_quant_scheme=kv_quant_scheme,
             )
-        outputs = m.mla_preprocess.forward(
-            positions, hidden_states, forward_batch, zero_allocator
+        outputs, q_descale = m.mla_preprocess.forward(
+            positions,
+            hidden_states,
+            forward_batch,
+            zero_allocator,
+            return_q_descale=True,
         )
         q_pe, k_pe, q_nope_out, k_nope = outputs[:4]
         topk_indices = None
@@ -274,6 +298,16 @@ def forward_mla_prepare_npu(
                 layer_id=m.layer_id,
             )
 
+        if kv_quant_scheme is not None:
+            q_nope_out, q_descale = kv_quant_scheme.quantize_query(q_nope_out)
+            q_pe = (q_pe.float() / (q_descale * kv_quant_scheme.k_scale)).to(
+                torch.bfloat16
+            )
+
+    backend = get_mla_dcp_backend(forward_context.get_attn_backend())
+    if backend.uses_dcp_partial_attention(forward_batch):
+        q_nope_out, q_pe = dcp_comm.all_gather_q_for_mla_decode(q_nope_out, q_pe)
+
     return (
         q_pe,
         k_pe,
@@ -283,6 +317,7 @@ def forward_mla_prepare_npu(
         zero_allocator,
         positions,
         topk_indices,
+        q_descale,
     )
 
 
@@ -296,22 +331,26 @@ def forward_mla_core_npu(
     zero_allocator: "BumpAllocator",
     positions: torch.Tensor,
     topk_indices: torch.Tensor,
+    q_descale: Optional[torch.Tensor],
     # Gated attention (Ling-V3 / BailingMoeV3): the subclass appends its gate
     # to inner_state, so every *_core dispatched from forward_core takes it as
     # a trailing arg. None everywhere else.
     gate: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    attn_output = m.attn_mqa(
+    attn_kwargs = dict(topk_indices=topk_indices) if topk_indices is not None else {}
+    if getattr(m.attn_mqa, "scheme", None) is not None:
+        attn_kwargs["q_descale"] = q_descale
+    backend = get_mla_dcp_backend(forward_context.get_attn_backend())
+    attn_output = forward_mla_attention_npu(
+        m,
+        backend,
+        forward_batch,
         q_nope_out,
         k_nope,
-        k_nope,
-        forward_batch,
-        q_rope=q_pe,
-        k_rope=k_pe,
-        **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
+        q_pe,
+        k_pe,
+        **attn_kwargs,
     )
-
-    attn_output = attn_output.view(-1, m.num_local_heads, m.kv_lora_rank)
 
     attn_output = attn_output.contiguous()
     if (
@@ -484,6 +523,7 @@ def forward_dsa_prepare_npu(
                 latent_cache, forward_batch, k_nope, k_pe
             )
 
+    backend = get_mla_dcp_backend(forward_context.get_attn_backend())
     if not m.skip_topk or (m.is_nextn and prev_topk_indices is None):
         topk_indices = m.indexer(
             hidden_states,
@@ -497,7 +537,7 @@ def forward_dsa_prepare_npu(
         # DSA layers that skip the indexer reuse ``prev_topk_indices``. Remap
         # only when a fresh global top-k is produced so shared-index layers do
         # not repeat the same DCP partitioning work.
-        if _use_dsa_dcp_partial_attention(forward_batch):
+        if backend.uses_dcp_partial_attention(forward_batch):
             parallel = runtime_context.get_parallel()
             topk_indices = dcp_layout.remap_dcp_sparse_indices(
                 topk_indices,
@@ -508,7 +548,7 @@ def forward_dsa_prepare_npu(
     else:
         topk_indices = prev_topk_indices
 
-    if _use_dsa_dcp_partial_attention(forward_batch):
+    if backend.uses_dcp_partial_attention(forward_batch):
         q_nope_out, q_pe = dcp_comm.all_gather_q_for_mla_decode(q_nope_out, q_pe)
 
     topk_indices = maybe_capture_indexer_topk(m.layer_id, topk_indices)
@@ -542,50 +582,31 @@ def forward_dsa_core_npu(
     # a trailing arg. None everywhere else.
     gate: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    use_dcp = _use_dsa_dcp_partial_attention(forward_batch)
-    attn = m.attn_mqa_for_dcp_decode if use_dcp else m.attn_mqa
-    attn_output = attn(
+    backend = get_mla_dcp_backend(forward_context.get_attn_backend())
+    attn_output = forward_mla_attention_npu(
+        m,
+        backend,
+        forward_batch,
         q_nope_out.contiguous(),
         k_nope.contiguous(),
-        k_nope.contiguous(),
-        forward_batch,
+        q_pe.contiguous(),
+        k_pe.contiguous(),
         save_kv_cache=not mla_preprocess_used,
-        q_rope=q_pe.contiguous(),
-        k_rope=k_pe.contiguous(),
         topk_indices=topk_indices,
     )
-    if use_dcp:
-        attn_output, lse = attn_output
-        attn_output = attn_output.view(
-            -1,
-            m.num_local_heads * runtime_context.get_parallel().attn_dcp_size,
-            m.kv_lora_rank,
-        )
-        attn_output = dcp_comm.cp_lse_ag_out_rs_mla_npu(
-            attn_output, lse, runtime_context.get_parallel().dcp_group
-        )
-    attn_output = attn_output.view(-1, m.num_local_heads, m.kv_lora_rank)
 
-    if _is_npu_arch35 or (
-        forward_batch.forward_mode.is_extend()
-        and not forward_batch.forward_mode.is_draft_extend_v2()
-        and not forward_batch.forward_mode.is_target_verify()
-    ):
-        attn_bmm_output = torch_npu.npu_transpose_batchmatmul(
-            attn_output,
-            m.w_vc,
-            perm_x1=(1, 0, 2),
-            perm_x2=(0, 1, 2),
-            perm_y=(1, 0, 2),
-        )
-    else:
-        attn_bmm_output = torch.empty(
-            (attn_output.shape[0], m.num_local_heads, m.v_head_dim),
-            dtype=attn_output.dtype,
-            device=attn_output.device,
-        )
-        attn_output = attn_output.contiguous()
-        torch.ops.npu.batch_matmul_transpose(attn_output, m.w_vc, attn_bmm_output)
+    perm_x1 = (1, 0, 2)
+    if not _is_npu_arch35 and m.num_local_heads * m.kv_lora_rank >= 65536:
+        # A2/A3's fused input transpose requires heads * kv_lora_rank < 65536.
+        attn_output = attn_output.transpose(0, 1).contiguous()
+        perm_x1 = (0, 1, 2)
+    attn_bmm_output = torch_npu.npu_transpose_batchmatmul(
+        attn_output,
+        m.w_vc,
+        perm_x1=perm_x1,
+        perm_x2=(0, 1, 2),
+        perm_y=(1, 0, 2),
+    )
 
     attn_bmm_output = attn_bmm_output.reshape(-1, m.num_local_heads * m.v_head_dim)
 
@@ -679,7 +700,7 @@ def npu_mla_preprocess(
                 [m.q_lora_rank, m.kv_lora_rank + m.qk_rope_head_dim], dim=-1
             )
             q_lora = m.q_a_layernorm(q)
-            torch.npu.current_stream().wait_event(m.alt_stream)
+            torch.npu.current_stream().wait_stream(m.alt_stream)
         else:
             (
                 q_pe,

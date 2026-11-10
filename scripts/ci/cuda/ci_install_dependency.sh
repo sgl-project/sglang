@@ -811,7 +811,7 @@ stabilize_flashinfer_jit_paths() {
 }
 
 install_extra_deps() {
-    MOONCAKE_VERSION="0.3.13.post1"
+    MOONCAKE_VERSION="0.3.14"
     NIXL_VERSION="1.3.0"
     MOONCAKE_PKG="mooncake-transfer-engine-cuda13==${MOONCAKE_VERSION}"
     MOONCAKE_STALE_PKG="mooncake-transfer-engine"
@@ -1003,11 +1003,6 @@ main() {
     setup_cargo_cache
     install_sglang
     release_cargo_cache_lock
-    # Diffusion B200 CI imports torch inside install_sglang_kernel after removing
-    # stale CUDA 12 NVIDIA wheels, so opt into one early LD_LIBRARY_PATH refresh.
-    if [ "${SGLANG_CI_EARLY_LD_LIBRARY_PATH:-0}" = "1" ]; then
-        setup_ld_library_path
-    fi
     install_sglang_kernel
     install_sglang_router
     install_flashinfer_cubin

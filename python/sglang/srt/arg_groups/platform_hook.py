@@ -7,22 +7,25 @@ import logging
 import os
 from typing import Any
 
-from sglang.srt.arg_groups.overrides import (
+from sglang.kernels.arch import current_arch
+from sglang.srt.arg_groups.model_override_base import (
     attention_backends_of,
-    declare_resolution,
     model_config_of,
-    record_foreign_defaults,
-    register_post_process,
     resolved_view,
     resolving_view,
-    run_post_process_pass,
     use_mla_backend,
+)
+from sglang.srt.arg_groups.overrides import (
+    declare_resolution,
+    record_foreign_defaults,
+    register_post_process,
+    run_post_process_pass,
 )
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils.common import is_host_cpu_arm64
+from sglang.srt.utils.device import is_host_cpu_arm64
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +68,11 @@ def handle_amd_specifics(server_args: Any):
         # GPU rather than staging it, and the MMU notifier on that registration
         # evicts our KFD queues once per tensor while weights load. In KB.
         os.environ.setdefault("GPU_PINNED_MIN_XFER_SIZE", str(4 * 1024 * 1024))
+        # gfx1250 lacks the fp4-activation WMMA scale instruction, so aiter's
+        # fused_moe has to run MXFP4 experts as a8w4 there; aiter reads this.
+        hip = current_arch().hip
+        if hip is not None and hip.gcn_arch == "gfx1250":
+            os.environ.setdefault("AITER_FORCE_A8W4", "1")
 
 
 def handle_nccl_pre_warm(server_args: Any):

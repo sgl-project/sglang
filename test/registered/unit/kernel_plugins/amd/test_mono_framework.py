@@ -34,7 +34,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     default_cuda_graph_config,
     with_phase,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
