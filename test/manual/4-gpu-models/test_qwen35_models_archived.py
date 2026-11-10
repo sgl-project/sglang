@@ -17,7 +17,7 @@ from sglang.test.kits.reasoning_kit import ReasoningTokenUsageMixin
 # This eval harness applies the chat_template, which is critical for qwen3.5
 # to get good accuracy on gsm8k
 from sglang.test.run_combined_tests import run_combined_tests
-from sglang.test.run_eval import run_eval
+from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -140,7 +140,6 @@ class TestQwen35FP4MTP(ReasoningTokenUsageMixin, CustomTestCase):
         args = SimpleNamespace(
             model=self.model,
             eval_name="gsm8k",
-            num_shots=5,
             num_examples=200,
             max_tokens=16000,
             num_threads=128,
@@ -152,7 +151,7 @@ class TestQwen35FP4MTP(ReasoningTokenUsageMixin, CustomTestCase):
             host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreaterEqual(metrics["score"], ACC_THRESHOLDS[self.model]["gsm8k"])
 

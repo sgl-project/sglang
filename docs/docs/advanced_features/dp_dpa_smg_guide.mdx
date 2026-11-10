@@ -80,14 +80,13 @@ For MoE models like DeepSeek, DPA is **often** paired with Expert Parallelism (E
 python -m sglang.launch_server \
     --model-path deepseek-ai/DeepSeek-V3 \
     --tp 8 \
-    --dp-size 8 \
+    --attn-dp-size 8 \
     --ep 8 \
-    --enable-dp-attention \
     --moe-a2a-backend deepep \
     --moe-runner-backend deep_gemm
 ```
 
-> **Note**: `--dp-size` must be explicitly set when using `--enable-dp-attention`. If `dp_size` is 1 (default), DPA will be disabled.
+> **Note**: `--attn-dp-size` sets the number of attention data-parallel groups inside the TP group. If `attn_dp_size` is 1 (default), DPA is disabled.
 
 For detailed EP configuration (DeepEP, Two-Batch Overlap, EPLB), see [Expert Parallelism](/docs/advanced_features/expert_parallelism).
 
@@ -106,21 +105,30 @@ DPA supports the following model architectures:
 
 For models like Llama, with standard GQA, standard DP, or TP is typically recommended.
 
-To enable DPA, add `--enable-dp-attention` to your server launch command.
+To enable DPA, add `--attn-dp-size N` (N > 1) to your server launch command.
 
 ### Activation Logic
 
-DPA is enabled explicitly via server arguments (CLI or config). You must set both `--dp-size` and `--enable-dp-attention`:
+DPA is enabled explicitly via server arguments (CLI or config) with `--attn-dp-size` (alias `--attention-data-parallel-size`). It creates N attention data-parallel groups inside the TP group, one scheduler each, while the FFN stays tensor parallel:
 
 ```bash
 python -m sglang.launch_server \
     --model-path deepseek-ai/DeepSeek-V3 \
     --tp 8 \
-    --dp-size 8 \
-    --enable-dp-attention
+    --attn-dp-size 8
 ```
 
-**Important**: `--dp-size` must be greater than 1 for DPA to work. When `dp_size == 1` (default), `--enable-dp-attention` is automatically disabled. The constraint `tp_size % dp_size == 0` must also be satisfied.
+**Important**: `--attn-dp-size` must be greater than 1 for DPA to work. When `attn_dp_size == 1` (default), DPA is disabled. The constraint `tp_size % attn_dp_size == 0` must also be satisfied. `--dp-size` only sets the number of data-parallel replicas of the model; combining replicas (`--dp-size` > 1) with DPA is not supported.
+
+> **Deprecated**: `--enable-dp-attention` still works: `--dp-size N --enable-dp-attention` resolves to `--attn-dp-size N --dp-size 1` and prints a deprecation warning. Use `--attn-dp-size N` instead. The flag will be removed after 2026-12-31.
+>
+> Under DeepSeek context parallelism (DSA, MLA, and DeepSeek-V4 prefill CP), `--dp-size N` alone still runs N attention-DP groups, and logs a deprecation warning; it will be rejected after 2026-12-31. Use `--attn-dp-size N` there too.
+
+**Elastic EP scale joiners.** A rank that joins an existing DPA deployment through elastic EP scale-up runs DPA even when it is launched with `--attn-dp-size 1`: its own attention DP group is one rank wide.
+
+**DP rank count.** The number of DP ranks (one scheduler each) is `dp_size × attn_dp_size`; one of the two is always 1.
+- `/server_info` reports `dp_size` (replicas) and `attn_dp_size` separately, so under DPA its `dp_size` is 1. Until the flag is removed, its deprecated `enable_dp_attention` field still reports whether DPA runs; new clients should read `attn_dp_size`.
+- Wire formats that predate `--attn-dp-size` keep the key `dp_size` for the DP rank count: KV-event descriptors, the PD prefill server info, and load snapshots.
 
 ### TP LMHead with all-to-all
 
@@ -135,8 +143,7 @@ python -m sglang.launch_server \
     --model-path MODEL_PATH \
     --disaggregation-mode decode \
     --tp 8 \
-    --dp-size 8 \
-    --enable-dp-attention
+    --attn-dp-size 8
 ```
 
 Prefill / colocated workers will fallback to TP LMHead with allgather, as well as other parallel strategies. More details can be found in [PR #32313](https://github.com/sgl-project/sglang/pull/32313).
@@ -505,7 +512,7 @@ For detailed metrics and monitoring setup, see [SGLang Model Gateway Documentati
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Cache-aware routing, high availability</td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong>DPA</strong> (<code>--dp-size N --enable-dp-attention</code>)</td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong>DPA</strong> (<code>--attn-dp-size N</code>)</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>DeepSeek/MLA models</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Eliminates KV cache duplication, improved throughput</td>
     </tr>
@@ -518,7 +525,7 @@ For detailed metrics and monitoring setup, see [SGLang Model Gateway Documentati
 </table>
 
 **Recommended production setup for DeepSeek:**
-1. Enable **DPA** for attention layers (`--dp-size 8 --enable-dp-attention`)
+1. Enable **DPA** for attention layers (`--attn-dp-size 8`)
 2. Enable **EP** for MoE layers (`--ep 8 --moe-a2a-backend deepep`)
 3. Use **SMG** with **cache_aware** policy
 

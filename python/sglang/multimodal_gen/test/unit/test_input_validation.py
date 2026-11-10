@@ -8,13 +8,13 @@ import torch
 from diffusers.pipelines.flux2.image_processor import Flux2ImageProcessor
 from PIL import Image
 
-from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.configs.pipeline_configs.flux import Flux2PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     WanI2V480PConfig,
     WanI2V720PConfig,
 )
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 from sglang.multimodal_gen.runtime.pipelines.flux_2 import Flux2Pipeline
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.input_validation import (
@@ -210,7 +210,7 @@ class TestFlux2ConditionImagePreprocess(unittest.TestCase):
         )
 
         self.assertEqual(processed_size, (expected_width, expected_height))
-        self.assertTrue(torch.equal(processed, expected))
+        self.assertTrue(torch.equal(processed.cpu(), expected))
 
     @patch.object(Flux2Pipeline, "add_standard_ti2i_stages")
     def test_runtime_pipeline_uses_flux2_image_processor(self, mock_add_stages):
@@ -262,6 +262,21 @@ class TestFlux2TI2ISizeResolution(unittest.TestCase):
         )
 
         self.assertEqual((batch.width, batch.height), (768, 512))
+
+
+class TestPerRequestTask(unittest.TestCase):
+    def test_image_preprocessing_uses_request_on_video_default(self):
+        config = _DummyTI2IConfig()
+        config.task_type = ModelTaskType.T2V
+        image = Image.new("RGB", (1255, 833))
+        batch = _make_batch(image)
+        batch.task_type = ModelTaskType.I2I
+        InputValidationStage().preprocess_condition_image(
+            batch, _make_server_args(config), image.width, image.height
+        )
+        self.assertEqual((batch.width, batch.height), (1248, 832))
+        self.assertIsInstance(batch.condition_image, list)
+        self.assertEqual(config.task_type, ModelTaskType.T2V)
 
 
 if __name__ == "__main__":

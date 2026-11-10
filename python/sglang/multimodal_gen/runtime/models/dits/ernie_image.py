@@ -25,8 +25,6 @@ from sglang.kernels.ops.activation.activation import (
 from sglang.kernels.ops.diffusion import (
     BitExactFusionGate,
     can_use_fused_rmsnorm_scale_shift,
-    can_use_fused_rope_rotate_half,
-    can_use_fused_scale_residual_rmsnorm_scale_shift,
     flashinfer_rmsnorm_diagnostic_hint,
     fused_rmsnorm_scale_shift_bitexact,
     fused_rope_rotate_half_bitexact,
@@ -39,7 +37,16 @@ from sglang.multimodal_gen.configs.models.dits.ernie_image import (
 )
 from sglang.multimodal_gen.configs.models.fsdp import is_layer
 from sglang.multimodal_gen.runtime.distributed import (
+    get_sp_world_size,
     get_tp_world_size,
+)
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_ring_parallel_world_size,
+)
+from sglang.multimodal_gen.runtime.distributed.sp_shard_utils import (
+    build_shard_plan,
+    gather_seq,
+    shard_seq_prefix,
 )
 from sglang.multimodal_gen.runtime.layers.attention.layer import (
     USPAttention,
@@ -89,33 +96,19 @@ def _ernie_norm_scale_shift(
     first call verifies ``torch.equal`` against the eager chain and disables
     the fast path permanently on any mismatch.
     """
-    verified = _ERNIE_NORM.verified
     if (
-        not _ERNIE_NORM.disabled
+        x.is_cuda
         and norm.variance_size_override is None
-        and can_use_fused_rmsnorm_scale_shift(x, norm.weight, scale, shift)
-        and (verified or _ERNIE_NORM.can_attempt_once())
+        and can_use_fused_rmsnorm_scale_shift(x.dtype, x.shape[-1])
     ):
-        try:
-            out = fused_rmsnorm_scale_shift_bitexact(
+        return _ERNIE_NORM.run(
+            lambda: fused_rmsnorm_scale_shift_bitexact(
                 x, norm.weight, scale, shift, norm.variance_epsilon
-            )
-        except Exception as exc:
-            _ERNIE_NORM.on_exception(exc, logger=logger)
-        else:
-            if verified:
-                return out
-            return _ERNIE_NORM.accept_or_fallback(
-                out,
-                _eager_norm_scale_shift(norm, x, scale, shift),
-                logger=logger,
-                mismatch_msg=(
-                    "ERNIE fused-norm fast path is not bit-exact against this "
-                    "platform's rmsnorm dispatch; falling back to eager"
-                ),
-                diagnostic_hint=flashinfer_rmsnorm_diagnostic_hint,
-            )
-
+            ),
+            lambda: _eager_norm_scale_shift(norm, x, scale, shift),
+            logger=logger,
+            diagnostic_hint=flashinfer_rmsnorm_diagnostic_hint,
+        )
     return _eager_norm_scale_shift(norm, x, scale, shift)
 
 
@@ -136,10 +129,9 @@ def _ernie_gated_norm_scale_shift(
     verified = _ERNIE_GATED_NORM.verified
     if (
         not _ERNIE_GATED_NORM.disabled
+        and residual.is_cuda
         and norm.variance_size_override is None
-        and can_use_fused_scale_residual_rmsnorm_scale_shift(
-            residual, update, gate, norm.weight, scale, shift
-        )
+        and can_use_fused_rmsnorm_scale_shift(residual.dtype, residual.shape[-1])
         and (verified or _ERNIE_GATED_NORM.can_attempt_once())
     ):
         try:
@@ -164,10 +156,6 @@ def _ernie_gated_norm_scale_shift(
                 (ref, res_ref),
                 equal=tensors_equal,
                 logger=logger,
-                mismatch_msg=(
-                    "ERNIE fused gated-norm fast path is not bit-exact against "
-                    "this platform's rmsnorm dispatch; falling back to eager"
-                ),
                 diagnostic_hint=flashinfer_rmsnorm_diagnostic_hint,
             )
 
@@ -270,14 +258,11 @@ class ErnieImageSelfAttention(nn.Module):
             self.norm_q = RMSNorm(head_dim, eps=eps)
             self.norm_k = RMSNorm(head_dim, eps=eps)
 
-        # The joint [image, text] stream is fully replicated, so the ulysses
-        # all-to-all would wrongly treat it as sharded and duplicate it. Skip
-        # SP until the stream is sharded (sp_shard + num_replicated_suffix).
         self.attn = USPAttention(
             num_heads=self.num_local_heads,
             head_size=head_dim,
             prefix=f"{prefix}.attn",
-            skip_sequence_parallel=True,
+            skip_sequence_parallel=get_ring_parallel_world_size() > 1,
         )
 
     def forward(
@@ -289,6 +274,8 @@ class ErnieImageSelfAttention(nn.Module):
         rope_positions: torch.Tensor,
         attn_mask: torch.Tensor | None = None,
         attn_mask_meta: dict | None = None,
+        num_replicated_suffix: int = 0,
+        use_sp: bool = False,
     ) -> torch.Tensor:
         B, S, H = x.shape
 
@@ -317,7 +304,13 @@ class ErnieImageSelfAttention(nn.Module):
             k = _ernie_rope(k, rope_cos, rope_sin)
 
         attn_out = self.attn(
-            q, k, v, attn_mask=attn_mask, attn_mask_meta=attn_mask_meta
+            q,
+            k,
+            v,
+            attn_mask=attn_mask,
+            attn_mask_meta=attn_mask_meta,
+            num_replicated_suffix=num_replicated_suffix,
+            skip_sequence_parallel_override=not use_sp,
         )
         attn_out = attn_out.reshape(B, S, self.num_local_heads * self.head_dim)
         out, _ = self.to_out[0](attn_out)
@@ -395,6 +388,8 @@ class ErnieImageSharedAdaLNBlock(nn.Module):
         gate_mlp: torch.Tensor,
         attn_mask: torch.Tensor | None = None,
         attn_mask_meta: dict | None = None,
+        num_replicated_suffix: int = 0,
+        use_sp: bool = False,
     ) -> torch.Tensor:
         residual = x
         x = _ernie_norm_scale_shift(self.adaLN_sa_ln, x, scale_msa, shift_msa)
@@ -406,6 +401,8 @@ class ErnieImageSharedAdaLNBlock(nn.Module):
             rope_positions,
             attn_mask=attn_mask,
             attn_mask_meta=attn_mask_meta,
+            num_replicated_suffix=num_replicated_suffix,
+            use_sp=use_sp,
         )
         x, residual = _ernie_gated_norm_scale_shift(
             self.adaLN_mlp_ln, residual, attn_out, gate_msa, scale_mlp, shift_mlp
@@ -458,28 +455,12 @@ def _ernie_rope(
     rounding boundary exactly; the first call still verifies ``torch.equal``
     against the eager chain and disables the fast path on any mismatch.
     """
-    verified = _ERNIE_ROPE.verified
-    if (
-        not _ERNIE_ROPE.disabled
-        and can_use_fused_rope_rotate_half(x, cos_, sin_)
-        and (verified or _ERNIE_ROPE.can_attempt_once())
-    ):
-        try:
-            out = fused_rope_rotate_half_bitexact(x, cos_, sin_)
-        except Exception as exc:
-            _ERNIE_ROPE.on_exception(exc, logger=logger)
-        else:
-            if verified:
-                return out
-            return _ERNIE_ROPE.accept_or_fallback(
-                out,
-                _apply_rotary_bshd_eager(x, cos_, sin_),
-                logger=logger,
-                mismatch_msg=(
-                    "ERNIE fused RoPE fast path is not bit-exact on this "
-                    "platform; falling back to eager"
-                ),
-            )
+    if x.is_cuda and x.dtype is torch.bfloat16:
+        return _ERNIE_ROPE.run(
+            lambda: fused_rope_rotate_half_bitexact(x, cos_, sin_),
+            lambda: _apply_rotary_bshd_eager(x, cos_, sin_),
+            logger=logger,
+        )
     return _apply_rotary_bshd_eager(x, cos_, sin_)
 
 
@@ -555,10 +536,6 @@ def _ernie_qknorm_rope(
                 ref,
                 equal=tensors_equal,
                 logger=logger,
-                mismatch_msg=(
-                    "ERNIE fused QKNorm+RoPE fast path is not bit-exact on "
-                    "this platform; falling back to split kernels"
-                ),
             )
 
     return _ernie_qknorm_rope_reference(
@@ -578,31 +555,17 @@ def _ernie_geglu(gate_up: torch.Tensor) -> torch.Tensor:
     to bf16 before the multiply exactly like the eager two-step; first call
     self-verifies like :func:`_ernie_rope`.
     """
-    verified = _ERNIE_GEGLU.verified
     if (
-        not _ERNIE_GEGLU.disabled
-        and gate_up.dtype in (torch.bfloat16, torch.float16)
+        gate_up.dtype in (torch.bfloat16, torch.float16)
         and gate_up.is_cuda
         and gate_up.is_contiguous()
         and gate_up.shape[-1] % 2 == 0
-        and (verified or _ERNIE_GEGLU.can_attempt_once())
     ):
-        try:
-            out = gelu_and_mul_with_activation_rounding(gate_up)
-        except Exception as exc:
-            _ERNIE_GEGLU.on_exception(exc, logger=logger)
-        else:
-            if verified:
-                return out
-            return _ERNIE_GEGLU.accept_or_fallback(
-                out,
-                _eager_geglu(gate_up),
-                logger=logger,
-                mismatch_msg=(
-                    "ERNIE fused GELU-mul fast path is not bit-exact on this "
-                    "platform; falling back to eager"
-                ),
-            )
+        return _ERNIE_GEGLU.run(
+            lambda: gelu_and_mul_with_activation_rounding(gate_up),
+            lambda: _eager_geglu(gate_up),
+            logger=logger,
+        )
     return _eager_geglu(gate_up)
 
 
@@ -733,6 +696,15 @@ class ErnieImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin)
         p = self.patch_size
         Hp, Wp = H // p, W // p
         N_img = Hp * Wp
+        sp_size = get_sp_world_size()
+        # The replicated suffix path requires an unmasked, evenly split image.
+        use_sp = (
+            sp_size > 1
+            and get_ring_parallel_world_size() == 1
+            and N_img % sp_size == 0
+            and encoder_hidden_states_mask is None
+        )
+        local_image_len = N_img // sp_size if use_sp else N_img
 
         img_tokens = self.x_embedder["proj"](hidden_states)  # [B, D, Hp, Wp]
         img_tokens = img_tokens.reshape(B, self.inner_dim, N_img).transpose(
@@ -781,6 +753,16 @@ class ErnieImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin)
         all_ids = torch.cat([image_ids, text_ids], dim=1)
         rotary_pos_emb = self.pos_embed(all_ids)
         rope_cos, rope_sin = _precompute_rope_cos_sin(rotary_pos_emb, dtype)
+        if use_sp:
+            plan = build_shard_plan(N_img)
+            x = shard_seq_prefix(x, N_img, plan, dim=1)
+            # Preserve global positions while sharding the image prefix.
+            rope_cos, rope_sin = (
+                shard_seq_prefix(
+                    rope.view(B, N_img + Tmax, -1), N_img, plan, dim=1
+                ).flatten(0, 1)
+                for rope in (rope_cos, rope_sin)
+            )
         rope_cache = torch.cat((rope_cos, rope_sin), dim=-1).contiguous()
         rope_positions = torch.arange(
             rope_cache.shape[0], device=device, dtype=torch.long
@@ -823,12 +805,16 @@ class ErnieImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin)
                 gate_mlp,
                 attn_mask=attn_mask,
                 attn_mask_meta=attn_mask_meta,
+                num_replicated_suffix=Tmax if use_sp else 0,
+                use_sp=use_sp,
             )
 
         scale, shift = self.final_norm["linear"](c).chunk(2, dim=-1)
         x = self.final_norm["norm"](x) * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
-        patches, _ = self.final_linear(x[:, :N_img, :])
+        patches, _ = self.final_linear(x[:, :local_image_len, :])
+        if use_sp:
+            patches = gather_seq(patches, N_img)
 
         output = patches.view(B, Hp, Wp, p, p, self.out_channels)
         output = output.permute(0, 5, 1, 3, 2, 4).contiguous()

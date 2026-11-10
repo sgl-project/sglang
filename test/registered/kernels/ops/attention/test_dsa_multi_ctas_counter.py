@@ -17,10 +17,11 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
     grow_multi_ctas_kv_counter_buffer_if_needed,
     make_persistent_multi_ctas_kv_counter_buffer,
 )
+from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 _NUM_Q_HEADS = 128
 _MAX_CTX_LEN = 64
@@ -35,7 +36,11 @@ def _make_backend(*, allocate_counter: bool = True):
     backend = object.__new__(DeepseekSparseAttnBackend)
     backend.device = "cuda"
     backend.num_q_heads = _NUM_Q_HEADS
-    backend.real_page_size = 64
+    backend.num_dcp_q_heads = _NUM_Q_HEADS
+    backend.physical_page_size = 64
+    backend.real_page_span = 64
+    backend.attn_dcp_size, backend.attn_dcp_rank = 1, 0
+    backend.dsa_shards_index_k = False
     backend.hisparse_coordinator = None
     backend.speculative_num_draft_tokens = _NUM_DRAFT_TOKENS
     backend.dsa_index_kpool = 1
@@ -43,6 +48,7 @@ def _make_backend(*, allocate_counter: bool = True):
     backend.dsa_topk_backend = SimpleNamespace(should_use_topk_v2=lambda: False)
     backend.dsa_index_topk = 2048
     backend.dsa_decode_impl = "trtllm"
+    backend._memory_saver_adapter = TorchMemorySaverAdapter.create(enable=False)
     backend.req_to_token = torch.zeros(
         8, _MAX_CTX_LEN, dtype=torch.int32, device="cuda"
     )

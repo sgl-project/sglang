@@ -19,6 +19,11 @@ from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
+from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
+    KeyedReqList,
+    ListKind,
+)
 from sglang.srt.managers.scheduler_pp_mixin import PPBatchMetadata
 from sglang.srt.managers.utils import GenerationBatchResult, get_logprob_from_pp_outputs
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
@@ -28,9 +33,10 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_test_utils import FakeReq
 from sglang.test.test_utils import published_topology
 
-register_cpu_ci(est_time=14, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 @dataclass
@@ -131,6 +137,7 @@ def test_sampling_mask_output_uses_generation_result_copy_path():
         token_ids=torch.tensor([[3, 5]], dtype=torch.int32),
         lengths=torch.tensor([2], dtype=torch.int32),
         selected_logprobs=torch.tensor([-0.5]),
+        support_logprobs=torch.tensor([[-0.5, -1.0]]),
         statuses=torch.tensor([SamplingMaskStatus.OK], dtype=torch.int32),
     )
     result = GenerationBatchResult(
@@ -148,8 +155,10 @@ def test_sampling_mask_output_uses_generation_result_copy_path():
     ) as copy_tensor:
         result.copy_to_cpu(return_logprob=False)
 
-    assert copy_tensor.call_count == 5
+    assert copy_tensor.call_count == 6
     assert sampling_output.token_ids.tolist() == [[3, 5]]
+    assert sampling_output.selected_logprobs.tolist() == [-0.5]
+    assert sampling_output.support_logprobs.tolist() == [[-0.5, -1.0]]
     assert sampling_output.lengths.tolist() == [2]
     assert sampling_output.statuses.tolist() == [SamplingMaskStatus.OK]
     assert result.copy_done.record_count == 1
@@ -160,6 +169,7 @@ def test_pipeline_sampling_mask_round_trip_without_logprobs():
         token_ids=torch.tensor([[3, 5]], dtype=torch.int32),
         lengths=torch.tensor([2], dtype=torch.int32),
         selected_logprobs=torch.tensor([-0.5]),
+        support_logprobs=torch.tensor([[-0.5, -1.0]]),
         statuses=torch.tensor([SamplingMaskStatus.OK], dtype=torch.int32),
     )
     result = GenerationBatchResult(
@@ -172,7 +182,13 @@ def test_pipeline_sampling_mask_round_trip_without_logprobs():
         object.__new__(Scheduler), result, SimpleNamespace(return_logprob=False)
     )
     output, _, _ = get_logprob_from_pp_outputs(PPProxyTensors(payload))
-    for name in ("token_ids", "lengths", "selected_logprobs", "statuses"):
+    for name in (
+        "token_ids",
+        "lengths",
+        "selected_logprobs",
+        "support_logprobs",
+        "statuses",
+    ):
         torch.testing.assert_close(
             getattr(output.sampling_mask_output, name), getattr(sampling_output, name)
         )
@@ -493,64 +509,6 @@ def test_scheduler_preserves_pipeline_parallel_output_for_transport():
     scheduler.device_module.Event.assert_not_called()
 
 
-def test_pdmux_split_prefill_schedules_auxiliary_output_copy():
-    device_output = DeviceOutput(torch.tensor([1.0]))
-    result = GenerationBatchResult(
-        logits_output=LogitsProcessorOutput(
-            next_token_logits=None,
-            auxiliary_device_output=device_output,
-        ),
-        next_token_ids=torch.tensor([7]),
-    )
-    copy_done = CopyDone()
-    scheduler = object.__new__(Scheduler)
-    scheduler.scheduler_stage_metrics = None
-    scheduler.metrics_reporter = Mock()
-    scheduler.forward_ct = 0
-    scheduler.processed_tokens_counter = 0
-    scheduler._sched_idled = False
-    scheduler.scripted_scheduler_hook = None
-    scheduler.profiler_manager = SimpleNamespace(_profile_batch_predicate=Mock())
-    scheduler.forward_sleep_time = None
-    scheduler.disaggregation_mode = None
-    scheduler.is_generation = True
-    scheduler.enable_overlap = False
-    scheduler.enable_pdmux = True
-    scheduler.tp_worker = SimpleNamespace(
-        forward_batch_split_prefill=Mock(return_value=result)
-    )
-    scheduler.future_map = object()
-    scheduler._relay_forward_payload = Mock()
-    scheduler.device_module = SimpleNamespace(Event=Mock(return_value=copy_done))
-    scheduler.enable_dp_attention = False
-    batch = SimpleNamespace(
-        forward_mode=SimpleNamespace(
-            is_prebuilt=lambda: False,
-            is_split_prefill=lambda: True,
-        ),
-        split_index=0,
-        reqs=[],
-        req_pool_indices=torch.tensor([3]),
-        input_ids=torch.tensor([5]),
-        extend_num_tokens=1,
-        return_logprob=False,
-        return_hidden_states=False,
-    )
-
-    with (
-        published_topology(),
-        patch(
-            "sglang.srt.managers.scheduler.resolve_forward_inputs"
-        ) as resolve_forward_inputs,
-    ):
-        output_result = Scheduler.run_batch(scheduler, batch)
-
-    resolve_forward_inputs.assert_called_once_with(batch, scheduler.future_map)
-    assert output_result is result
-    assert result.auxiliary_host_output.values.tolist() == [1.0]
-    assert copy_done.record_count == 1
-
-
 def test_disaggregated_prefill_consumes_auxiliary_output_after_commit():
     host_output = HostOutput(torch.tensor([1.0]))
     copy_done = SimpleNamespace(synchronize=Mock())
@@ -561,12 +519,12 @@ def test_disaggregated_prefill_consumes_auxiliary_output_after_commit():
         copy_done=copy_done,
         auxiliary_host_output=host_output,
     )
-    req = SimpleNamespace(
+    req = FakeReq(
         output_ids=[],
         finished_len=None,
         to_finish=None,
         finished_reason=None,
-        inflight_middle_chunks=0,
+        discard_output_reason=None,
         pending_bootstrap=False,
         return_logprob=False,
         return_sampling_mask=False,
@@ -578,6 +536,7 @@ def test_disaggregated_prefill_consumes_auxiliary_output_after_commit():
     )
     batch = SimpleNamespace(
         reqs=[req],
+        chunked_req=None,
         spec_info=None,
         prefill_stats=None,
         dp_cooperation_info=None,
@@ -589,25 +548,30 @@ def test_disaggregated_prefill_consumes_auxiliary_output_after_commit():
         move_logprobs_to_cpu=Mock(),
         consume_auxiliary_output=Mock(),
         snapshot_auxiliary_output_starts=snapshot_auxiliary_output_starts,
+        _maybe_collect_customized_info=Mock(),
     )
     scheduler = SimpleNamespace(
         batch_result_processor=processor,
         spec_algorithm=SimpleNamespace(is_eagle=lambda: False),
         tree_cache=object(),
-        disagg_prefill_inflight_queue=[],
+        disagg_prefill_transfer_queue=IndexedReqList(ListKind.PD_SENDING),
+        prefill_launched_reqs=KeyedReqList(ListKind.PREFILL_LAUNCHED),
+        checkpoint_disagg_prefill=Mock(),
         send_kv_chunk=Mock(),
         metrics_reporter=SimpleNamespace(report_prefill_stats=Mock()),
         maybe_send_health_check_signal=Mock(),
     )
 
-    with patch("sglang.srt.disaggregation.prefill.maybe_cache_unfinished_req"):
-        SchedulerDisaggregationPrefillMixin.process_batch_result_disagg_prefill(
-            scheduler,
-            batch,
-            result,
-        )
+    scheduler.prefill_launched_reqs.join([req])
+    SchedulerDisaggregationPrefillMixin.process_batch_result_disagg_prefill(
+        scheduler,
+        batch,
+        result,
+    )
 
     assert req.output_ids == [7]
+    scheduler.checkpoint_disagg_prefill.assert_called_once_with(req)
+    copy_done.synchronize.assert_called_once_with()
     snapshot_auxiliary_output_starts.assert_called_once_with(batch, result)
     processor.consume_auxiliary_output.assert_called_once_with(
         batch,

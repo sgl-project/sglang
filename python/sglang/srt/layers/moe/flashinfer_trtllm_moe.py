@@ -323,3 +323,63 @@ def trtllm_fp8_per_tensor_scale_moe_wrapper(
         kwargs["activation_type"] = ActivationType(activation_type)
 
     return trtllm_fp8_per_tensor_scale_moe(**kwargs)
+
+
+@register_custom_op(mutates_args=["output"])
+def trtllm_fp8_per_tensor_scale_routed_moe_out_wrapper(
+    topk_ids: torch.Tensor,
+    topk_weights: Optional[torch.Tensor],
+    hidden_states: torch.Tensor,
+    gemm1_weights: torch.Tensor,
+    output1_scales_scalar: torch.Tensor,
+    output1_scales_gate_scalar: torch.Tensor,
+    gemm2_weights: torch.Tensor,
+    output2_scales_scalar: torch.Tensor,
+    output: torch.Tensor,
+    num_experts: int,
+    top_k: int,
+    intermediate_size: int,
+    local_expert_offset: int,
+    local_num_experts: int,
+    routed_scaling_factor: Optional[float],
+    routing_method_type: int,
+    enable_pdl: Optional[bool] = None,
+    tune_max_num_tokens: int = 8192,
+    activation_type: Optional[int] = None,
+) -> None:
+    try:
+        from flashinfer.fused_moe import trtllm_fp8_per_tensor_scale_routed_moe
+    except ImportError as e:
+        raise ImportError(
+            "FlashInfer TRT-LLM per-tensor FP8 with materialized routing requires "
+            "trtllm_fp8_per_tensor_scale_routed_moe; use the pinned CUDA FlashInfer build."
+        ) from e
+
+    kwargs = dict(
+        topk_ids=topk_ids if topk_weights is None else (topk_ids, topk_weights),
+        routing_bias=None,
+        hidden_states=hidden_states,
+        gemm1_weights=gemm1_weights,
+        output1_scales_scalar=output1_scales_scalar,
+        output1_scales_gate_scalar=output1_scales_gate_scalar,
+        gemm2_weights=gemm2_weights,
+        output2_scales_scalar=output2_scales_scalar,
+        num_experts=num_experts,
+        top_k=top_k,
+        n_group=None,
+        topk_group=None,
+        intermediate_size=intermediate_size,
+        local_expert_offset=local_expert_offset,
+        local_num_experts=local_num_experts,
+        routed_scaling_factor=routed_scaling_factor,
+        use_routing_scales_on_input=False,
+        routing_method_type=routing_method_type,
+        output=output,
+        enable_pdl=enable_pdl,
+        tune_max_num_tokens=tune_max_num_tokens,
+    )
+    if activation_type is not None:
+        from flashinfer.fused_moe.core import ActivationType
+
+        kwargs["activation_type"] = ActivationType(activation_type)
+    trtllm_fp8_per_tensor_scale_routed_moe(**kwargs)

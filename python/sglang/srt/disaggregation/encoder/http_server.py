@@ -40,13 +40,15 @@ from sglang.srt.disaggregation.encoder.server import (
     MMEncoder,
     MMError,
 )
+from sglang.srt.entrypoints.server_utils import add_prometheus_middleware
 from sglang.srt.managers.io_struct import (
     ProfileReq,
     ProfileReqType,
     sock_send,
     wrap_as_pickle,
 )
-from sglang.srt.managers.schedule_batch import Modality
+from sglang.srt.multimodal.modality import Modality
+from sglang.srt.observability.trace import fastapi_telemetry_disabled_kwargs
 from sglang.srt.runtime_context import (
     get_disagg,
     get_observability,
@@ -55,10 +57,7 @@ from sglang.srt.runtime_context import (
     publish,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import (
-    add_prometheus_middleware,
-    configure_logger,
-)
+from sglang.srt.utils import configure_logger
 from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 
 logger = logging.getLogger(__name__)
@@ -100,7 +99,7 @@ async def _lifespan(app: FastAPI):
             await local_runtime.stop()
 
 
-app = FastAPI(lifespan=_lifespan)
+app = FastAPI(lifespan=_lifespan, **fastapi_telemetry_disabled_kwargs())
 
 
 def _register_encoder_url_with_bootstrap():
@@ -209,7 +208,7 @@ def launch_server(server_args: ServerArgs):
 
     configure_logger(server_args, prefix=" encode_server")
     publish(server_args, role="encoder")
-    if get_parallel().dp_size > 1:
+    if get_parallel().num_dp_ranks > 1:
         dp_dispatcher = launch_dp_runtime(server_args)
         # runtime initializes multiprocess metrics before spawning;
         # HTTP only exposes their endpoint.

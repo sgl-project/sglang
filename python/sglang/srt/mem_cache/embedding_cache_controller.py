@@ -16,8 +16,9 @@ try:
 except ImportError:
     transfer_embedding_ranges_direct = None
 
-from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.mem_cache.embedding_store import EmbeddingStore
+from sglang.srt.multimodal.modality import Modality
+from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
 
@@ -344,20 +345,18 @@ class EmbeddingInsertOperation:
 class EmbeddingCacheController:
     def __init__(
         self,
-        tp_rank,
-        tp_size,
         embedding_store: EmbeddingStore,
         max_pool_size_gb=4.0,
         hidden_dims: dict = None,
-        tp_group=None,
         all_rank_get=False,
         enable_eviction: bool = True,
         max_eviction_batch: int = 100,
         dtype: torch.dtype = torch.float32,
     ):
-        self.tp_world_size = tp_size
-        self.tp_group = tp_group
-        self.tp_rank = tp_rank
+        parallel = get_parallel()
+        self.tp_world_size = parallel.tp_size
+        self.tp_group = parallel.tp_group.cpu_group
+        self.tp_rank = parallel.tp_rank
         self.all_rank_get = all_rank_get
         self.hidden_dims = hidden_dims or {}
         # Pool dtype must match the model's embedding dtype so that pool views,
@@ -402,7 +401,9 @@ class EmbeddingCacheController:
         self.io_thread = threading.Thread(target=self._io_loop, daemon=True)
         self.io_thread.start()
 
-        if self.tp_world_size > 1:
+        # The rank-0-only encoder path coordinates masks in MMEncoder. Creating
+        # a group here would require ranks that do not own a controller to join.
+        if self.all_rank_get and self.tp_world_size > 1:
             if self.tp_group is None:
                 raise ValueError("tp_group must be provided when tp_size > 1")
             from sglang.srt.distributed.parallel_state import (

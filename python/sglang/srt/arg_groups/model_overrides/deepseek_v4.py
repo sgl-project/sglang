@@ -1,7 +1,4 @@
-"""Config-time override declarations for deepseek_v4.
-
-Architectures: DeepseekV4ForCausalLM.
-"""
+"""Config-time override declarations for deepseek_v4."""
 
 import logging
 from typing import Any, Dict
@@ -16,6 +13,11 @@ from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils import is_flashinfer_available
 
 logger = logging.getLogger(__name__)
+
+# The compressed-KV pool's page; its C128 sub-pool hardcodes 256-token pages.
+DSV4_PAGE_SIZE = 256
+# Used when --swa-full-tokens-ratio is at its default and cap mode is unusable.
+DSV4_DEFAULT_SWA_FULL_TOKENS_RATIO = 0.1
 
 
 @_register_for("DeepseekV4ForCausalLM")
@@ -48,10 +50,13 @@ def _deepseek_v4_overrides(server_args: Any, hf_config: Any) -> dict:
         cfg.swa_full_tokens_ratio is None
         and getattr(hf_config, "model_type", None) != "deepseek_v41"
     ):
-        overrides["swa_full_tokens_ratio"] = 0.1
-        logger.info(f"Setting swa_full_tokens_ratio to 0.1 for {model_arch}.")
+        overrides["swa_full_tokens_ratio"] = DSV4_DEFAULT_SWA_FULL_TOKENS_RATIO
+        logger.info(
+            f"Setting swa_full_tokens_ratio to "
+            f"{DSV4_DEFAULT_SWA_FULL_TOKENS_RATIO} for {model_arch}."
+        )
 
-    page_size = 256
+    page_size = DSV4_PAGE_SIZE
     if cfg.device == "npu":
         # NPU keeps the device-aware "dsv4" backend (the registry routes it to
         # the Ascend V4 subclass); only the pool geometry / dtype differ.

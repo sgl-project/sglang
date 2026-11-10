@@ -14,9 +14,9 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_adapter 
     RealtimeChunkInputs,
     build_realtime_sampling_params,
 )
+from sglang.multimodal_gen.runtime.entrypoints.openai.utils import request_model_kwargs
 from sglang.multimodal_gen.runtime.entrypoints.openai.video_api import (
     _build_video_sampling_params,
-    _video_request_model_kwargs,
     create_video,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
@@ -88,8 +88,8 @@ def test_ltx25_video_extensions_remain_model_specific():
         assert field_name not in base_fields
         assert field_name in ltx25_fields
 
-    assert _video_request_model_kwargs(request, LTX25SamplingParams) == field_values
-    assert _video_request_model_kwargs(request, SamplingParams) == {}
+    assert request_model_kwargs(request, LTX25SamplingParams, "video") == field_values
+    assert request_model_kwargs(request, SamplingParams, "video") == {}
 
 
 def test_ltx23_request_defaults_to_vae_decoder():

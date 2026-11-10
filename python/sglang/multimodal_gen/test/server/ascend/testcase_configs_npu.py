@@ -203,6 +203,7 @@ TWO_NPU_CASES: list[DiffusionTestCase] = [
                 "seed": 1101,
             },
         ),
+        pin_consistency_quality=False,
         run_perf_check=True,
         run_consistency_check=True,
         run_component_accuracy_check=False,

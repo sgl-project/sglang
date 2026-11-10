@@ -7,7 +7,6 @@ bit-exact vs the eager chain (``torch.equal``) and needs no quality gate.
 
 from __future__ import annotations
 
-import logging
 from typing import TYPE_CHECKING
 
 import torch
@@ -16,21 +15,19 @@ from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
-    from tvm_ffi.module import Module
+    from collections.abc import Callable
 
 
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
 _ALIGN_BYTES = 16
-_FAILED_RUNTIME_KEYS: set[tuple[int | None, torch.dtype]] = set()
-
-logger = logging.getLogger(__name__)
 
 
 @cache_once
-def _jit_modulate_scale_shift_module(dtype: torch.dtype) -> Module:
+def _jit_modulate_scale_shift_kernel(dtype: torch.dtype) -> Callable:
     if dtype not in _SUPPORTED_DTYPES:
         raise RuntimeError(f"Unsupported modulate_scale_shift dtype: {dtype}")
     args = make_cpp_args(dtype)
+    # Cache the exported function too, avoiding repeated FFI attribute lookup.
     return load_jit(
         "diffusion_modulate_scale_shift",
         *args,
@@ -41,7 +38,7 @@ def _jit_modulate_scale_shift_module(dtype: torch.dtype) -> Module:
                 f"modulate_scale_shift::ModulateScaleShiftKernel<{args}>::run",
             ),
         ],
-    )
+    ).modulate_scale_shift
 
 
 def _fake_impl(
@@ -55,12 +52,13 @@ def _fake_impl(
     mutates_args=[],
     fake_impl=_fake_impl,
 )
-def _modulate_scale_shift_custom_op(
+def modulate_scale_shift_cuda(
     x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor
 ) -> torch.Tensor:
+    """Fused ``x * (1 + scale[:, None]) + shift[:, None]``; validated by CUDA."""
     out = torch.empty_like(x)
-    module = _jit_modulate_scale_shift_module(x.dtype)
-    module.modulate_scale_shift(out, x, scale, shift)
+    kernel = _jit_modulate_scale_shift_kernel(x.dtype)
+    kernel(out, x, scale, shift)
     return out
 
 
@@ -72,7 +70,8 @@ def can_use_modulate_scale_shift_cuda(
     x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor
 ) -> bool:
     if (
-        x.dtype not in _SUPPORTED_DTYPES
+        torch.version.hip is not None
+        or x.dtype not in _SUPPORTED_DTYPES
         or scale.dtype != x.dtype
         or shift.dtype != x.dtype
         or not (x.is_cuda and scale.is_cuda and shift.is_cuda)
@@ -91,35 +90,12 @@ def can_use_modulate_scale_shift_cuda(
     )
 
 
-def modulate_scale_shift_cuda(
-    x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor
-) -> torch.Tensor:
-    """Fused ``x * (1 + scale[:, None]) + shift[:, None]`` (bit-exact vs eager)."""
-    if not can_use_modulate_scale_shift_cuda(x, scale, shift):
-        raise RuntimeError("unsupported input for modulate_scale_shift CUDA")
-    return _modulate_scale_shift_custom_op(x, scale, shift)
-
-
 def modulate_scale_shift(
     x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor
 ) -> torch.Tensor:
     """Use the bit-exact CUDA fast path when supported, otherwise eager."""
-    runtime_key = (x.device.index, x.dtype)
-    if runtime_key not in _FAILED_RUNTIME_KEYS and can_use_modulate_scale_shift_cuda(
-        x, scale, shift
-    ):
-        try:
-            return modulate_scale_shift_cuda(x, scale, shift)
-        except Exception as exc:
-            if torch.compiler.is_compiling():
-                raise
-            _FAILED_RUNTIME_KEYS.add(runtime_key)
-            logger.warning(
-                "Disabling diffusion modulate CUDA fast path on %s/%s: %s",
-                x.device,
-                x.dtype,
-                exc,
-            )
+    if can_use_modulate_scale_shift_cuda(x, scale, shift):
+        return modulate_scale_shift_cuda(x, scale, shift)
     return x * (1 + scale[:, None]) + shift[:, None]
 
 

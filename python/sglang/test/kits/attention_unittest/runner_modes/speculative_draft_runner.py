@@ -7,13 +7,11 @@ from unittest.mock import patch
 import torch
 from torch import nn
 
+from sglang.srt.configs.shared_experts import SharedExpertsConfig
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig, PhaseConfig
-from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
-    ForwardBatch,
-    ForwardMode,
-)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.model_executor.input_buffers import _forward_input_buffer_pool
 from sglang.srt.model_executor.runner import set_global_graph_memory_pool
 from sglang.srt.runtime_context import get_parallel
@@ -22,6 +20,7 @@ from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
 )
 from sglang.srt.speculative.eagle_info import EagleDraftInput
+from sglang.srt.speculative.eagle_megakernel import STOCK_EAGLE_DRAFT_RUNTIME
 from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
 from sglang.srt.speculative.frozen_kv_mtp_cuda_graph_runner import (
     FrozenKVMTPCudaGraphRunner,
@@ -32,6 +31,9 @@ from sglang.srt.speculative.frozen_kv_mtp_info import (
 )
 from sglang.srt.speculative.frozen_kv_mtp_worker_v2 import FrozenKVMTPDraftWorker
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.test.kits.attention_unittest.attention_methods.dense_attention import (
+    _token_loc as _dsa_token_loc,
+)
 
 from ..attention_methods.dense_attention import (
     DEFAULT_DEVICE,
@@ -54,9 +56,6 @@ from ..attention_methods.dsa_attention import (
     DSA_SPARSE_INDEX_TOPK,
     DSA_SPARSE_RTOL,
     DSAAttentionCase,
-)
-from ..attention_methods.dsa_attention import _token_loc as _dsa_token_loc
-from ..attention_methods.dsa_attention import (
     build_dsa_sparse_attention_fixture,
 )
 from ..attention_methods.dsv4_attention import (
@@ -153,6 +152,10 @@ class _DummyTpGroup:
 
 
 class _TinyDraftModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.shared_experts_config = SharedExpertsConfig()
+
     def forward(self, *args, **kwargs):
         raise RuntimeError("EAGLEDraftCudaGraphRunner should call worker.draft_forward")
 
@@ -175,6 +178,7 @@ class _EagleDraftWorkerHarness:
         self.model_config = fixture.runner.model_config
         self.speculative_algorithm = SpeculativeAlgorithm.EAGLE
         self.hot_token_id = None
+        self.draft_runtime = STOCK_EAGLE_DRAFT_RUNTIME
         self.model_runner.forward = model_forward
         self.draft_forward = MethodType(EagleDraftWorker.draft_forward, self)
         # draft_forward's topk=1 fast path reads these prealloc buffers (built
@@ -310,7 +314,6 @@ def _configure_runner_for_eagle_draft(
         "enable_cudagraph_gc": True,
         "enable_dp_lm_head": False,
         "enable_memory_saver": False,
-        "enable_pdmux": False,
         "enable_profile_cuda_graph": False,
         "enable_torch_compile": False,
         "enable_two_batch_overlap": False,
@@ -335,7 +338,6 @@ def _configure_runner_for_eagle_draft(
     runner.spec_algorithm = SpeculativeAlgorithm.EAGLE
     runner.is_draft_worker = True
     runner.model = _TinyDraftModel()
-    runner.tp_group = _DummyTpGroup()
     runner.device_timer = None
     runner.model_config.spec_hidden_size = settings.hidden_size
     runner.model_config.dtype = runner.dtype
@@ -445,7 +447,7 @@ def _capture_eagle_draft_graph_runner(
             "sglang.srt.model_executor.runner.decode_cuda_graph_runner.get_available_gpu_memory",
             lambda *args, **kwargs: 0.0,
         ),
-        get_parallel().override(attn_cp_size=1, tp_rank=0),
+        get_parallel().override(attn_cp_size=1, tp_rank=0, tp_group=_DummyTpGroup()),
     ):
         _reset_cuda_graph_test_buffers()
         return EAGLEDraftCudaGraphRunner(
@@ -467,7 +469,7 @@ def _capture_frozen_kv_mtp_graph_runner(
             "sglang.srt.model_executor.runner.decode_cuda_graph_runner.get_available_gpu_memory",
             lambda *args, **kwargs: 0.0,
         ),
-        get_parallel().override(attn_cp_size=1, tp_rank=0),
+        get_parallel().override(attn_cp_size=1, tp_rank=0, tp_group=_DummyTpGroup()),
     ):
         _reset_cuda_graph_test_buffers()
         return FrozenKVMTPCudaGraphRunner(worker)
@@ -511,6 +513,7 @@ def run_eagle_draft_cuda_graph_runner_case(
         )
         adapter.prepare_replay_state(eager_fixture, case, draft_inputs, settings)
         eager_batch = adapter.make_forward_batch(case, draft_inputs, settings)
+        eager_fixture.runner.runner_ids.bind_own_plan(eager_batch)
         expected = _run_eagle_draft_eager(
             eager_worker,
             eager_batch,
@@ -527,6 +530,7 @@ def run_eagle_draft_cuda_graph_runner_case(
         )
         adapter.prepare_replay_state(graph_fixture, case, draft_inputs, settings)
         graph_batch = adapter.make_forward_batch(case, draft_inputs, settings)
+        graph_fixture.runner.runner_ids.bind_own_plan(graph_batch)
         graph_runner = _capture_eagle_draft_graph_runner(
             graph_worker,
             graph_backend,
@@ -566,6 +570,7 @@ def run_frozen_kv_mtp_cuda_graph_runner_case(
         )
         adapter.prepare_replay_state(eager_fixture, case, draft_inputs, settings)
         eager_batch = adapter.make_forward_batch(case, draft_inputs, settings)
+        eager_fixture.runner.runner_ids.bind_own_plan(eager_batch)
         expected = _run_frozen_kv_mtp_eager(eager_worker, eager_batch)
 
         graph_fixture, graph_worker, _ = _build_frozen_kv_mtp_fixture(
@@ -577,6 +582,7 @@ def run_frozen_kv_mtp_cuda_graph_runner_case(
         )
         adapter.prepare_replay_state(graph_fixture, case, draft_inputs, settings)
         graph_batch = adapter.make_forward_batch(case, draft_inputs, settings)
+        graph_fixture.runner.runner_ids.bind_own_plan(graph_batch)
         graph_runner = _capture_frozen_kv_mtp_graph_runner(graph_worker)
         adapter.prepare_replay_state(graph_fixture, case, draft_inputs, settings)
 

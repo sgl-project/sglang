@@ -1,7 +1,4 @@
-"""Config-time override declarations for gemma4.
-
-Architectures: Gemma4ForCausalLM, Gemma4ForConditionalGeneration, Gemma4UnifiedForConditionalGeneration.
-"""
+"""Config-time override declarations for gemma4."""
 
 import logging
 from typing import Any, Dict

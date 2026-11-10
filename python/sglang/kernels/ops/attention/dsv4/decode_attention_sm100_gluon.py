@@ -6,11 +6,27 @@ from triton.experimental.gluon.language.nvidia.blackwell import (
     TensorMemoryLayout,
     allocate_tensor_memory,
     fence_async_shared,
-    get_tmem_reg_layout,
     mbarrier,
     tcgen05_commit,
     tcgen05_mma,
 )
+
+try:
+    # Triton 3.7.1 API
+    from triton.experimental.gluon.language.nvidia.blackwell import get_tmem_reg_layout
+except ImportError:
+    # Triton 3.8 moved this onto the descriptor type (triton-lang/triton#9594)
+    # TODO: once ROCm leaves triton 3.7 (swapab_gluon_hip imports _load_v4
+    # from here), drop the try import above and call get_reg_layout directly.
+    from triton.experimental.gluon.language.nvidia.blackwell import (
+        tensor_memory_descriptor_type,
+    )
+    from triton.runtime.jit import constexpr_function
+
+    @constexpr_function
+    def get_tmem_reg_layout(element_ty, shape, layout, num_warps):
+        ty = tensor_memory_descriptor_type(element_ty, shape, layout, shape)
+        return ty.get_reg_layout(num_warps=num_warps)
 
 
 @gluon.jit
@@ -82,9 +98,12 @@ def partial_gluon(
     DATA_BYTES: gl.constexpr,
     SCALE_BYTES: gl.constexpr,
     TILE: gl.constexpr,
+    HG: gl.constexpr = 1,
 ):
-    gl.static_assert(SWAP_AB and H == 16 and (BT == 64 or BT == 128))
+    gl.static_assert(SWAP_AB and H == 16 and (BT == 64 or BT == 128) and HG >= 1)
+    HT: gl.constexpr = H * HG
     b, t = gl.program_id(0), gl.program_id(1)
+    h0 = gl.program_id(2) * H
     kv_layout: gl.constexpr = gl.BlockedLayout([1, 8], [4, 8], [4, 1], [1, 0])
     n = gl.arange(0, BT, gl.SliceLayout(1, kv_layout))
     if t < KT:
@@ -121,7 +140,7 @@ def partial_gluon(
         )
     qh = gl.arange(0, H, gl.SliceLayout(1, kv_layout))
     qd = gl.arange(0, 512, gl.SliceLayout(0, kv_layout))
-    q = gl.load(Q + b * QS + qh[:, None] * QH + qd[None, :])
+    q = gl.load(Q + b * QS + (h0 + qh[:, None]) * QH + qd[None, :])
     q_smem = gl.allocate_shared_memory(
         gl.bfloat16,
         [H, 512],
@@ -183,8 +202,8 @@ def partial_gluon(
     value_hd = gl.convert_layout(value.permute((1, 0)), hd_layout)
     h = gl.arange(0, H, gl.SliceLayout(1, hd_layout))
     d = gl.arange(0, 512, gl.SliceLayout(0, hd_layout))
-    gl.store(PART + ((b * NT + t) * H + h[:, None]) * 512 + d[None, :], value_hd)
+    gl.store(PART + ((b * NT + t) * HT + h0 + h[:, None]) * 512 + d[None, :], value_hd)
     stat_layout: gl.constexpr = gl.BlockedLayout([1], [32], [4], [0])
     hs = gl.arange(0, H, stat_layout)
-    gl.store(MAX + (b * NT + t) * H + hs, gl.convert_layout(mx, stat_layout))
-    gl.store(SUM + (b * NT + t) * H + hs, gl.convert_layout(denom, stat_layout))
+    gl.store(MAX + (b * NT + t) * HT + h0 + hs, gl.convert_layout(mx, stat_layout))
+    gl.store(SUM + (b * NT + t) * HT + h0 + hs, gl.convert_layout(denom, stat_layout))
