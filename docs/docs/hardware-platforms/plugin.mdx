@@ -91,9 +91,11 @@ Add `--enable-nvidia-megakernel` to a server launch configured as above, with
 prepared TP embedding, B1/B2 tiny GEMM and B1–8 L2 weight prefetch.
 `k3_native_mla` selects the same executor with SGLang's native MLA/DCP attention
 and does not need TokenSpeed. Select exactly one profile. The full-decode extra
-pins `tokenspeed-mla==2.0.3`; CuTe and `apache-tvm-ffi==0.1.11` are already SGLang
-dependencies. Preparation checks dependency ABI and model geometry before
-allocating specialized resources and sizing the KV cache.
+pins `tokenspeed-mla==2.0.3`; SGLang also pins
+`nvidia-cutlass-dsl[cu13]==4.8.0` and `apache-tvm-ffi==0.1.11`. Reusing an older
+environment is not sufficient: CuTe 4.6.2 lacks the `cutlass.experimental`
+primitives imported by these kernels. Preparation checks dependency ABI and model
+geometry before allocating specialized resources and sizing the KV cache.
 
 Adding `k3_flashinfer_mla_value` to the slot list (for example
 `k3_native_mla,k3_flashinfer_mla_value`) runs the MLA value projection and sigmoid
@@ -132,6 +134,12 @@ binds CuTe views and prefetch ranges to the final weight storage before graph
 capture. Prefetch ranges update the existing table in place, preserving its
 CuTe and driver pointers. Layout changes are rejected; replay does not rebind
 addresses or allocate replacement tables.
+
+Online weight updates are rejected before the weight updater writes any model
+weights. The specialized providers retain derived weights and captured addresses;
+the native K3 reload fixes do not refresh those additional resources. Restart the
+server to change weights while using these profiles. Use the native model path
+when online weight updates are required.
 
 ### Correctness and measurement scope
 
