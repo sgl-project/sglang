@@ -74,7 +74,6 @@ from sglang.srt.utils.device import is_pin_memory_available
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
-    from sglang.srt.hardware_backend.npu.moe.prefill_graph import MoePrefillGraphState
     from sglang.srt.layers.cp.base import BaseContextParallelMetadata
     from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
     from sglang.srt.layers.engram_staging import StagedRows
@@ -573,9 +572,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Full prefill graph capture uses a fixed request axis whose inactive slots
     # must not participate in data-dependent row selection.
     full_prefill_cuda_graph_capture: bool = False
-    # Marks a captured prefill forward so the MoE dispatcher takes its
-    # fixed-width path; None keeps the layer's own runtime dispatch.
-    moe_prefill_graph_state: Optional[MoePrefillGraphState] = None
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False
 

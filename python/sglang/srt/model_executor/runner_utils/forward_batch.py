@@ -37,11 +37,6 @@ def get_forward_batch() -> "ForwardBatch":
     return batch
 
 
-def try_get_forward_batch() -> "ForwardBatch | None":
-    """Return the published batch, or None outside a runner-owned forward."""
-    return _current_batch.get()
-
-
 @contextmanager
 def set_forward_batch(forward_batch: "ForwardBatch") -> Iterator[None]:
     """Publish the current batch and restore the previous one on scope exit."""
