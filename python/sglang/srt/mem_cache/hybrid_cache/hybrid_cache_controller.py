@@ -1918,6 +1918,8 @@ class HybridCacheController(BaseHiCacheController):
             )
             success = self.page_set_func(batch_hashes, batch_host_indices, extra_info)
             if not success:
+                operation.failed = True
+                operation.unwritten_pages = len(operation.hash_value) - start
                 logger.warning(
                     f"Write page to storage: {len(batch_hashes)} pages failed."
                 )
@@ -1963,6 +1965,19 @@ class HybridCacheController(BaseHiCacheController):
                 )
             pool_hits = count_pool_hits(results)
             operation.pool_storage_result.update_extra_pool_hit_pages(pool_hits)
+            for transfer in backup_transfers:
+                expected = len(transfer.keys or [])
+                if expected == 0 and transfer.host_indices is not None:
+                    expected = int(transfer.host_indices.numel())
+                written = sum(
+                    bool(ok) for ok in results.get(transfer.name, [])[:expected]
+                )
+                if written < expected:
+                    operation.sidecar_unwritten_by_pool[transfer.name] = (
+                        expected - written
+                    )
+            if operation.sidecar_unwritten_by_pool:
+                operation.failed = True
 
         if not self.backup_skip:
             self._page_backup_kv_with_trace(operation)

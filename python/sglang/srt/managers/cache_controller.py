@@ -248,6 +248,12 @@ class StorageOperation:
         self.completed_tokens = 0
         self.hash_value = hash_value if hash_value is not None else []
         self.prefix_keys = prefix_keys
+        # Backup outcome, set by the backup worker for the ack consumer.
+        self.failed = False
+        # Primary KV pages this rank should have written but did not.
+        self.unwritten_pages = 0
+        # Sidecar pool name -> pages not written.
+        self.sidecar_unwritten_by_pool: dict[str, int] = {}
         # Full queried page-hash chain, set by _storage_hit_query before
         # hash_value is truncated to the hit boundary; the tail is the
         # absence signal that invalidates buffer-mode existence beliefs.
@@ -1577,6 +1583,8 @@ class HiCacheController:
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
             success = self.page_set_func(batch_hashes, batch_host_indices, extra_info)
             if not success:
+                operation.failed = True
+                operation.unwritten_pages = len(operation.hash_value) - i
                 logger.warning(
                     f"Write page to storage: {len(batch_hashes)} pages failed."
                 )
@@ -1590,6 +1598,12 @@ class HiCacheController:
         try:
             self._page_backup(operation)
         except Exception:
+            operation.failed = True
+            if not self.backup_skip:
+                operation.unwritten_pages = (
+                    len(operation.hash_value)
+                    - operation.completed_tokens // self.page_size
+                )
             logger.exception(
                 "HiCache backup failed after %d tokens", operation.completed_tokens
             )
