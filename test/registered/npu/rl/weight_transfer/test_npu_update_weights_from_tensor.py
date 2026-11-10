@@ -10,7 +10,9 @@ import unittest
 
 import requests
 import torch
-from conftest import (
+
+from sglang.test.ascend.test_ascend_utils import QWEN3_0_6B_WEIGHTS_PATH
+from sglang.test.ascend.test_npu_rl_utils import (
     begin_weight_update,
     checkpoint_tensor_index,
     end_weight_update,
@@ -24,8 +26,6 @@ from conftest import (
     update_weights_from_flattened_bucket,
     update_weights_from_tensor,
 )
-
-from sglang.test.ascend.test_ascend_utils import QWEN3_0_6B_WEIGHTS_PATH
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import CustomTestCase
 

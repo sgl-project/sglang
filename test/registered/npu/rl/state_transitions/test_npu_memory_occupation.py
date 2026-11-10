@@ -9,7 +9,9 @@ import os
 import unittest
 
 import requests
-from conftest import (
+
+from sglang.test.ascend.test_ascend_utils import QWEN3_0_6B_WEIGHTS_PATH
+from sglang.test.ascend.test_npu_rl_utils import (
     checkpoint_weight_bytes,
     generate,
     generation_signature,
@@ -21,8 +23,6 @@ from conftest import (
     release_memory,
     resume_memory,
 )
-
-from sglang.test.ascend.test_ascend_utils import QWEN3_0_6B_WEIGHTS_PATH
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import CustomTestCase
 
