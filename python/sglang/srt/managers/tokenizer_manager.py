@@ -18,9 +18,11 @@ from __future__ import annotations
 import asyncio
 import copy
 import dataclasses
+import gc
 import json
 import logging
 import os
+import pickle
 import signal
 import socket
 import sys
@@ -196,12 +198,12 @@ from sglang.srt.sampling.custom_logit_processor import (
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.sampling.watermarking.core import (
-    redact_watermark_secrets,
     resolve_watermark_request,
 )
 from sglang.srt.server_args import (
     PortArgs,
     ServerArgs,
+    redact_server_args_secrets,
 )
 from sglang.srt.speculative.spec_decoding_metrics import (
     populate_spec_info,
@@ -212,6 +214,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_or_create_event_loop,
     kill_process_tree,
+    print_warning_once,
 )
 from sglang.srt.utils.aio_rwlock import RWLock
 from sglang.srt.utils.common import TypeBasedDispatcher
@@ -796,7 +799,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             "hidden_states",
         ]
         self.dump_request_list: List[Tuple] = []
-        self.crash_dump_request_list: deque[Tuple] = deque()
+        # (finish time, pickled (obj, out_dict, created time, finish time))
+        self.crash_dump_request_list: deque[Tuple[float, bytes]] = deque()
         self.crash_dump_performed = False  # Flag to ensure dump is only called once
 
         # Initialize performance metrics loggers with proper skip names
@@ -2196,6 +2200,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 yield out
                 break
 
+            if (
+                request is not None
+                and not obj.background
+                and await request.is_disconnected()
+            ):
+                # Abort the request for disconnected requests (running)
+                self.abort_request(obj.rid)
+                # Use exception to kill the whole call stack and asyncio task
+                raise ValueError(
+                    f"Request is disconnected from the client side (type 3). Abort request {obj.rid=}"
+                )
+
             if is_stream:
                 # Record response sent time right before we send response.
                 if not state.time_stats.response_sent_to_client_time:
@@ -2204,18 +2220,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         state.time_stats.get_response_sent_to_client_realtime()
                     )
                 yield out
-            else:
-                if (
-                    request is not None
-                    and not obj.background
-                    and await request.is_disconnected()
-                ):
-                    # Abort the request for disconnected requests (non-streaming, running)
-                    self.abort_request(obj.rid)
-                    # Use exception to kill the whole call stack and asyncio task
-                    raise ValueError(
-                        f"Request is disconnected from the client side (type 3). Abort request {obj.rid=}"
-                    )
 
     async def _handle_batch_request(
         self,
@@ -2538,7 +2542,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         part that cannot be reconstructed afterwards.
         """
         try:
-            return redact_watermark_secrets(
+            return redact_server_args_secrets(
                 self.resolved_config_dict(self.server_args.resolved_dict())
             )
         except Exception as e:
@@ -2547,9 +2551,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
     def _server_args_for_dump(self) -> Optional[Dict[str, Any]]:
         # Redact even with watermarking off: the Python API accepts a server
-        # key without --enable-watermark.
+        # key without --enable-watermark. The request dump pickles this as is;
+        # `write_crash_dump` redacts again on its own.
         try:
-            return redact_watermark_secrets(self.server_args.resolved_dict())
+            return redact_server_args_secrets(self.server_args.resolved_dict())
         except Exception as e:
             logger.error(f"Failed to snapshot server_args for the dump: {e!r}")
             return None
@@ -3505,28 +3510,30 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
     def record_request_for_crash_dump(self, state: ReqState, out_dict: dict):
         current_time = real_time()
-        request = state.obj
-        input_ids = request.input_ids
-        if isinstance(input_ids, list):
-            # Keep replay data intact without making full GC traverse every token.
-            request = copy.copy(request)
-            request.input_ids = (
-                tuple(tuple(row) for row in input_ids)
-                if input_ids and isinstance(input_ids[0], list)
-                else tuple(input_ids)
-            )
-        self.crash_dump_request_list.append(
-            (
-                request,
-                out_dict,
-                convert_time_to_realtime(state.time_stats.created_time),
-                current_time,
-            )
+        record = (
+            state.obj,
+            out_dict,
+            convert_time_to_realtime(state.time_stats.created_time),
+            current_time,
         )
+        # Keep the record pickled: bytes are not tracked by the cyclic GC. As live
+        # objects, five minutes of finished requests under load are a large number
+        # of tracked objects, and every gen2 collection walks them all, stalling
+        # this event loop for the whole walk.
+        try:
+            blob = pickle.dumps(record, protocol=pickle.HIGHEST_PROTOCOL)
+        except Exception as e:
+            # The crash dump pickles the same tuple, so it could not hold this one.
+            print_warning_once(
+                "Leaving a finished request out of the crash dump history: "
+                f"it does not pickle ({type(e).__name__})."
+            )
+            return
+        self.crash_dump_request_list.append((current_time, blob))
         # Remove requests older than 5 minutes based on finish time
         while (
             self.crash_dump_request_list
-            and current_time - self.crash_dump_request_list[0][3] >= 300
+            and current_time - self.crash_dump_request_list[0][0] >= 300
         ):
             self.crash_dump_request_list.popleft()
 
@@ -3562,10 +3569,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if self.crash_dump_folder:
             logger.error(f"Dumping requests before crash. {self.crash_dump_folder=}")
 
-            # Add finished requests from crash_dump_request_list
-            data_to_dump = []
-            if self.crash_dump_request_list:
-                data_to_dump.extend(self.crash_dump_request_list)
+            # Add finished requests from crash_dump_request_list (kept pickled). GC is
+            # paused while they are rebuilt: each record becomes several tracked
+            # objects, and every full collection would walk all of them built so far.
+            gc_enabled = gc.isenabled()
+            gc.disable()
+            try:
+                data_to_dump = [
+                    pickle.loads(blob) for _, blob in self.crash_dump_request_list
+                ]
+            finally:
+                if gc_enabled:
+                    gc.enable()
 
             # Add unfinished requests from rid_to_state
             unfinished_requests = []

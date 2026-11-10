@@ -185,7 +185,7 @@ class TestNPUGLM5_3_W8A8_2P2D_32P_In128k_Out1k_Prefix90_20ms(
     repeat_rate = 0.9
     dp = 32
     tpot = 20
-    output_token_throughput = 620
+    output_token_throughput = 800
 
     def test_npu_glm_5_3_w8a8_2p2d_32p_in128k_out1k_prefix90_20ms(self):
         """Run NPU performance test for GLM-5.3-w8a8 PD separation"""
