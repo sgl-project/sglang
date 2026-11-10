@@ -26,7 +26,7 @@ register_amd_ci(est_time=20, stage="stage-b", runner_config="1-gpu-small-amd-mi3
 _FRONT_N, _FRONT_K = 6016, 7168
 # Inside the default window; its tuned row is a split-K kernel, the noisiest one.
 _IN_WINDOW_M = 64
-# Last contiguous tuned row in ROCm/aiter#6411, the AITER pinned in docker/rocm.Dockerfile.
+# Last contiguous tuned row (ROCm/aiter#4834) in the AITER pinned in docker/rocm.Dockerfile.
 _LAST_TUNED_M = 128
 # Measured 4e-3..8e-3 over 5 seeds on AITER 285579b62, from bf16 output rounding;
 # a transposed weight gives ~1.5.

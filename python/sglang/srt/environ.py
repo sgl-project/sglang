@@ -2334,7 +2334,7 @@ class Envs:
     # engages only for the TP8 front shape (6016, 7168) on a 256-CU gfx950.
     SGLANG_OPT_HIP_K3_TUNED_MOE_FRONT = EnvBool(False)
     SGLANG_OPT_HIP_K3_TUNED_MOE_FRONT_MIN_TOKENS = EnvInt(1)
-    # 128 is the last contiguous tuned row in ROCm/aiter#6411; raise to 192 with ROCm/aiter#6820.
+    # 128 is the last contiguous tuned row in ROCm/aiter#4834; raise to 192 with ROCm/aiter#6820.
     SGLANG_OPT_HIP_K3_TUNED_MOE_FRONT_MAX_TOKENS = EnvInt(128)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MIN_HITS = EnvInt(2)
