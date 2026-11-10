@@ -187,7 +187,13 @@ class BaselineConfig:
         for prefix, overrides in data.get("runner_overrides", {}).items():
             if runner_name.startswith(prefix):
                 for name, metrics in overrides.items():
-                    data["scenarios"][name].update(metrics)
+                    scenario = data["scenarios"][name]
+                    for key, value in metrics.items():
+                        # merge per-stage/per-step maps so unlisted entries keep their guard
+                        if isinstance(value, dict):
+                            scenario[key] = {**scenario[key], **value}
+                        else:
+                            scenario[key] = value
                 print(f"--- Performance Runner Baseline: {prefix} ---")
                 break
 

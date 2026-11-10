@@ -37,9 +37,9 @@ BATCH_TOKENS = SEQS_PER_BATCH * SEQ_TOKENS
 class SlotOnlyHostPool(HostKVCache):
     """The real host-pool slot accounting, without KV buffers."""
 
-    def __init__(self, size: int):
+    def __init__(self, size: int, page_size: int = PAGE):
         self.size = size
-        self.page_size = PAGE
+        self.page_size = page_size
         self.dcp_size = 1
         self.layout = "page_first"
         self.device = "cpu"
@@ -175,31 +175,38 @@ def write_back_cache(
     device_tokens: int,
     host_tokens: int,
     enable_kv_cache_events: bool = False,
+    allocator=None,
+    req_to_token_pool=None,
+    components=(ComponentType.FULL,),
+    page_size: int = PAGE,
 ):
     """A Full-only write-back UnifiedRadixCache on ``tree_core_backend``:
-    ``device_tokens`` of paged device KV, a slot-only host pool of
-    ``host_tokens`` and an InstantWriteBackController. Returns the cache, its
-    device allocator and its host pool."""
-    allocator = PagedTokenToKVPoolAllocator(
-        size=device_tokens,
-        page_size=PAGE,
-        dtype=torch.float16,
-        device="cpu",
-        kvcache=None,
-        need_sort=False,
-    )
+    ``device_tokens`` of paged device KV (or the given device ``allocator``),
+    a slot-only host pool of ``host_tokens`` and an
+    InstantWriteBackController. With ``components`` beyond FULL (a FULL+Mamba
+    cache over a given ``allocator``) only FULL has a host pool. Returns the
+    cache, its device allocator and its host pool."""
+    if allocator is None:
+        allocator = PagedTokenToKVPoolAllocator(
+            size=device_tokens,
+            page_size=PAGE,
+            dtype=torch.float16,
+            device="cpu",
+            kvcache=None,
+            need_sort=False,
+        )
     cache = UnifiedRadixCache(
         params=CacheInitParams(
-            req_to_token_pool=None,
+            req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=allocator,
-            page_size=PAGE,
+            page_size=page_size,
             disable=False,
-            tree_slots=tree_slots_of((ComponentType.FULL,)),
+            tree_slots=tree_slots_of(components),
             tree_core_backend=tree_core_backend,
             enable_kv_cache_events=enable_kv_cache_events,
         )
     )
-    host_pool = SlotOnlyHostPool(host_tokens)
+    host_pool = SlotOnlyHostPool(host_tokens, page_size)
     host_group = HostPoolGroup(
         [
             PoolEntry(
