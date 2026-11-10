@@ -208,6 +208,7 @@ from sglang.srt.utils import (
     kill_process_tree,
 )
 from sglang.srt.utils.auth import AuthLevel, app_has_admin_force_endpoints, auth_level
+from sglang.srt.utils.cudacore_pyspy_dump_utils import pyspy_dump_all_sglang_processes
 from sglang.srt.utils.json_response import (
     SGLangORJSONResponse,
     dumps_json,
@@ -224,6 +225,9 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 # Global constants
 HEALTH_CHECK_TIMEOUT = int(os.getenv("SGLANG_HEALTH_CHECK_TIMEOUT", 20))
 WAIT_WEIGHTS_READY_TIMEOUT = int(os.getenv("SGLANG_WAIT_WEIGHTS_READY_TIMEOUT", 120))
+
+# In-flight /health failure py-spy dump; later failing probes wait for it.
+_health_fail_pyspy_dump: Optional[asyncio.Future] = None
 
 
 # Store global states
@@ -803,9 +807,63 @@ async def health_generate(request: Request) -> Response:
         f"{HEALTH_CHECK_TIMEOUT} seconds. tic start time: {tic_time}. "
         f"last_heartbeat time: {last_receive_time}"
     )
-    _global_state.tokenizer_manager.rid_to_state.pop(rid, None)
-    _global_state.tokenizer_manager.server_status = ServerStatus.UnHealthy
+
+    # The state flips only after the dump: with the status UnHealthy a SIGTERM
+    # force-exits and kills py-spy mid-dump; the live health rid keeps it graceful.
+    def _mark_unhealthy() -> None:
+        tokenizer_manager = _global_state.tokenizer_manager
+        tokenizer_manager.rid_to_state.pop(rid, None)
+        # A newer probe may have succeeded while the dump ran; its Up wins.
+        if tokenizer_manager.last_receive_tstamp <= tic:
+            tokenizer_manager.server_status = ServerStatus.UnHealthy
+
+    try:
+        await _maybe_pyspy_dump_on_health_fail()
+    finally:
+        _run_after_health_fail_dump(_mark_unhealthy)
     return Response(status_code=503)
+
+
+async def _maybe_pyspy_dump_on_health_fail() -> None:
+    global _health_fail_pyspy_dump
+    if _health_fail_pyspy_dump is None:
+        try:
+            interval = envs.SGLANG_DEBUG_HEALTH_FAIL_PYSPY_DUMP_INTERVAL_SECS.get()
+            if interval <= 0:
+                return
+            fut = asyncio.get_running_loop().run_in_executor(
+                None,
+                partial(pyspy_dump_all_sglang_processes, min_interval_secs=interval),
+            )
+        except Exception:
+            logger.exception("py-spy dump on /health failure could not start")
+            return
+        _health_fail_pyspy_dump = fut
+
+        def _clear(_: asyncio.Future) -> None:
+            global _health_fail_pyspy_dump
+            if _health_fail_pyspy_dump is fut:
+                _health_fail_pyspy_dump = None
+            if not fut.cancelled() and fut.exception() is not None:
+                logger.error(
+                    "py-spy dump on /health failure raised", exc_info=fut.exception()
+                )
+
+        fut.add_done_callback(_clear)
+    try:
+        # shield: a cancelled probe must not cancel the shared dump.
+        await asyncio.shield(_health_fail_pyspy_dump)
+    except Exception:
+        pass  # logged once by _clear
+
+
+def _run_after_health_fail_dump(fn: Callable[[], None]) -> None:
+    # A probe cancelled mid-await still must not flip the state under py-spy.
+    fut = _health_fail_pyspy_dump
+    if fut is None or fut.done():
+        fn()
+    else:
+        fut.add_done_callback(lambda _: fn())
 
 
 @app.get("/get_model_info")

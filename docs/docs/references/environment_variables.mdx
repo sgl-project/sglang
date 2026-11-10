@@ -1174,6 +1174,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DEBUG_HEALTH_FAIL_PYSPY_DUMP_INTERVAL_SECS</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>When <code>/health</code> times out, py-spy dump every <code>sglang::</code> process of the server (launcher, scheduler ranks, detokenizer, tokenizer workers) into the server log, without waiting for SIGTERM. Value is the minimum seconds between two dumps; <code>0</code> disables. The failing probe's 503 and the unhealthy state are delayed by the dump, up to 30 s (in a multi-worker setup up to ~60 s: a probe may first wait out another worker's in-flight dump, then run its own). py-spy needs root or <code>CAP_SYS_PTRACE</code>, or <code>kernel.yama.ptrace_scope=0</code> with the same uid.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>0</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_CUDA_COREDUMP</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable CUDA coredump generation (auto-injects the required <code>CUDA_*</code> env vars).</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
