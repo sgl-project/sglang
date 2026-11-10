@@ -144,9 +144,6 @@ class DSAIndexerPoolHost(HostKVCache):
         if self.indexer_page_stride_size % self.page_size:
             raise ValueError("DSA index page bytes must split into whole token bytes")
         self.indexer_layout_dim = self.indexer_page_stride_size * self.layer_num
-        self.page_bytes = self.indexer_layout_dim * self.indexer_dtype.itemsize
-        align = self.storage_page_align
-        self.page_stride_bytes = -(-self.page_bytes // align) * align
         self.indexer_page_num = (self.size + self.page_size + 1) // self.page_size
         self.size_per_token = self.indexer_layout_dim // self.page_size
         self.can_use_jit = False
@@ -213,8 +210,19 @@ class DSAIndexerPoolHost(HostKVCache):
     def get_ksize_per_token(self):
         return self.get_size_per_token()
 
+    @property
+    def page_bytes(self) -> int:
+        return (
+            self.layer_num * self.indexer_page_stride_size * self.indexer_dtype.itemsize
+        )
+
+    @property
+    def page_stride_bytes(self) -> int:
+        align = self.storage_page_align
+        return -(-self.page_bytes // align) * align
+
     def get_mapping_lengths(self) -> list[int]:
-        return [self.indexer_page_num * self.layer_num * self.indexer_page_stride_size]
+        return [self.indexer_page_num * self.page_stride_bytes]
 
     def _is_device_layer_owned(self, device_pool, layer_id: int) -> bool:
         return layer_id in self._device_to_host_layer

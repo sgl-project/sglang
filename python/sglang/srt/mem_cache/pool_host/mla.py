@@ -329,7 +329,18 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
     def get_ksize_per_token(self):
         return self.get_size_per_token()
 
+    @property
+    def page_bytes(self) -> int:
+        return self.page_size * self.layer_num * self.kv_cache_dim * self.dtype.itemsize
+
+    @property
+    def page_stride_bytes(self) -> int:
+        align = self.storage_page_align
+        return -(-self.page_bytes // align) * align
+
     def get_mapping_lengths(self) -> list[int]:
+        if self.page_stride_bytes != self.page_bytes:
+            return [self.page_num * self.page_stride_bytes]
         if self.layout != "page_first_kv_split" or self._native_buffers is None:
             return super().get_mapping_lengths()
         native = self._native_buffers
@@ -475,9 +486,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             raise ValueError(f"Unsupported layout: {self.layout}")
         self.token_stride_size = self.kv_cache_dim * self.dtype.itemsize
         self.layout_dim = self.token_stride_size * self.layer_num
-        page_bytes = self.page_size * self.layout_dim
-        align = self.storage_page_align
-        self.page_stride_bytes = -(-page_bytes // align) * align
+        page_bytes = self.page_bytes
 
         alloc_func = ALLOC_MEMORY_FUNCS[self._transfer_device.type]
         if self.page_stride_bytes != page_bytes:
@@ -1407,7 +1416,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 kv_buffer_data_ptr + index // self.page_size * self.page_stride_bytes
                 for index in page_starts
             ]
-            element_size_list = [self.page_size * self.layout_dim] * len(ptr_list)
+            element_size_list = [self.page_bytes] * len(ptr_list)
         elif self.layout == "page_first":
             for index in page_starts:
                 k_ptr = (
