@@ -108,6 +108,7 @@ export const Gemma4Deployment = () => {
 
   const xeonQatConfigs = {
     e2b: { tp: 4, revision: '6befbaca7398925921802abd1f277b495b78b738' },
+    e4b: { tp: 4, revision: '476025a01dbf99361c062bbeca3d6a76bb4c4566' },
   };
 
   const generateCommand = (values) => {
