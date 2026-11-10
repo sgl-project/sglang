@@ -10,7 +10,8 @@ from sglang.srt.arg_groups.speculative_hook import _handle_dflash
 from sglang.srt.environ import envs
 from sglang.srt.layers import linear, vocab_parallel_embedding
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative import dflash_info
 from sglang.srt.speculative.dflash_dp import gather_draft_embedding

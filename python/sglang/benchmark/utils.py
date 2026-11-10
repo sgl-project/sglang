@@ -13,6 +13,11 @@ from transformers import (
     PreTrainedTokenizerFast,
 )
 
+from sglang.srt.utils.hf_transformers_patches import apply_all_hf_patches
+
+# This module loads tokenizers and processors straight from transformers.
+apply_all_hf_patches()
+
 
 def remove_prefix(text: str, prefix: str) -> str:
     return text[len(prefix) :] if text.startswith(prefix) else text
@@ -49,7 +54,7 @@ def get_tokenizer(
         and pretrained_model_name_or_path != ""
     )
     if pretrained_model_name_or_path.endswith((".json", ".model", ".gguf")):
-        from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+        from sglang.srt.hf_transformers import get_tokenizer
 
         return get_tokenizer(pretrained_model_name_or_path)
 
@@ -70,9 +75,7 @@ def get_processor(
         and pretrained_model_name_or_path != ""
     )
 
-    from sglang.srt.utils.hf_transformers_utils import (
-        get_processor as _srt_get_processor,
-    )
+    from sglang.srt.hf_transformers import get_processor as _srt_get_processor
 
     if not pretrained_model_name_or_path.endswith(
         (".json", ".model")

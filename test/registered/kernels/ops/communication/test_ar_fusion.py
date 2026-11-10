@@ -6,7 +6,8 @@ NCCL, bit-exact on small-int bf16 inputs; the fused-RMSNorm pull against a
 torch reference; the pull tuning knobs (num_blocks, unroll) on sizes whose
 shard split is uneven; plus a CUDA-graph capture/replay pass and a mixed
 stress loop exercising the push phase double-buffering and the pull
-semaphore window cycling.
+semaphore window cycling. On SM100, it also checks FlashInfer's MNNVL
+deferred-MoE finalize against EP-local ``-1`` route indices.
 
 Usage::
 
@@ -29,6 +30,9 @@ from sglang.kernels.ops.communication import all_reduce_residual as all_reduce
 from sglang.srt.distributed.comm_cleanup import register_comm_cleanup
 from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
     CustomAllReduceV2,
+)
+from sglang.srt.layers.flashinfer_mnnvl_cutedsl import (
+    FlashInferMNNVLCuteDSLARFusion,
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -248,6 +252,9 @@ def test_ar_fusion_push_norm(num_tokens: int, rows_per_token: int):
 
 
 FIN_TOPK = 16
+FLASHINFER_H = 4096
+FLASHINFER_TOPK = 10
+FLASHINFER_EPS = 1e-6
 
 
 def _build_permuted_layout(
@@ -299,6 +306,88 @@ def _finalize_norm_ref(gemm2, idx, weights, norm_w, eps: float) -> torch.Tensor:
         total += gathered[r].float()
     factor = torch.rsqrt(total.square().mean(dim=-1, keepdim=True) + eps)
     return (total * factor * norm_w.float()).to(torch.bfloat16)
+
+
+@cache_once
+def _init_flashinfer_mnnvl_fusion() -> FlashInferMNNVLCuteDSLARFusion:
+    return FlashInferMNNVLCuteDSLARFusion(
+        hidden_size=FLASHINFER_H,
+        top_k=FLASHINFER_TOPK,
+        max_m=704,
+        rms_epsilon=FLASHINFER_EPS,
+        weight_bias=0.0,
+        process_group=_init_nccl_group(),
+        device=_device(),
+        include_shared_expert=False,
+    )
+
+
+def _ep_finalize_inputs(m: int):
+    rank, world = dist.get_rank(), dist.get_world_size()
+    route = torch.arange(m * FLASHINFER_TOPK, device=_device()).view(m, FLASHINFER_TOPK)
+    local = (route % world) == rank
+    permuted = torch.where(local, route, -1).to(torch.int32)
+    generator = torch.Generator(device=_device()).manual_seed(1709 * m + rank)
+    storage = torch.empty(
+        m * FLASHINFER_TOPK + 1, FLASHINFER_H, dtype=torch.bfloat16, device=_device()
+    )
+    storage[0].fill_(64)
+    routed = storage[1:]
+    routed.normal_(generator=generator).mul_(0.125)
+    routed[(~local).flatten()] = 64
+    common = torch.Generator(device=_device()).manual_seed(7919 * m)
+    weights = torch.rand(
+        m, FLASHINFER_TOPK, device=_device(), generator=common
+    ).bfloat16()
+    residual = torch.randn(
+        m, FLASHINFER_H, device=_device(), generator=common
+    ).bfloat16()
+    gamma = (
+        torch.rand(FLASHINFER_H, device=_device(), generator=common) + 0.5
+    ).bfloat16()
+    return storage, routed, weights, permuted, residual, gamma
+
+
+def _ep_finalize_reference(routed, weights, permuted, residual, gamma):
+    local = torch.zeros_like(residual, dtype=torch.float32)
+    for k in range(FLASHINFER_TOPK):
+        row = permuted[:, k].long()
+        selected = torch.where(
+            (row >= 0)[:, None], routed[row.clamp_min(0)].float(), 0.0
+        )
+        local += selected * weights[:, k, None].float()
+    gathered = [torch.empty_like(residual) for _ in range(dist.get_world_size())]
+    dist.all_gather(gathered, local.bfloat16(), group=_init_nccl_group())
+    residual_out = (sum(x.float() for x in gathered) + residual.float()).bfloat16()
+    inverse_rms = torch.rsqrt(
+        residual_out.float().square().mean(-1, keepdim=True) + FLASHINFER_EPS
+    )
+    return (residual_out.float() * inverse_rms * gamma.float()).bfloat16(), residual_out
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10,
+    reason="FlashInfer MNNVL CuTe DSL finalize requires an SM100 NVLink domain",
+)
+@pytest.mark.parametrize("m", [32])
+@torch.inference_mode()
+def test_flashinfer_ep_finalize_skips_nonlocal_routes(m: int):
+    """The optimized EP finalize matches stock reduction and RMS normalization."""
+    _init_world()
+    fusion = _init_flashinfer_mnnvl_fusion()
+    _, routed, weights, permuted, residual, gamma = _ep_finalize_inputs(m)
+    expected = _ep_finalize_reference(routed, weights, permuted, residual, gamma)
+    actual = fusion.moe_finalize_all_reduce_rms_norm(
+        routed_output=routed,
+        expert_weights=weights,
+        permuted_indices=permuted,
+        gated_shared_output=None,
+        residual=residual,
+        gamma=gamma,
+    )
+    torch.cuda.synchronize()
+    for got, want, atol in zip(actual, expected, (1e-1, 2e-2)):
+        torch.testing.assert_close(got, want, atol=atol, rtol=2e-2)
 
 
 @pytest.mark.parametrize("w_dtype", [torch.float32, torch.bfloat16])

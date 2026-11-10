@@ -8,9 +8,11 @@ resident-set trimmer measures only its own mapping, drops its pages once over
 budget without losing what was written through them, and is off when the budget
 is zero or the mapping is pinned.
 
-GPU part (skipped unless the device reads pageable host memory through the host
-page tables, i.e. unified-memory parts such as GB10): the production Triton
-gather kernel reading from the file-backed table matches a torch gather.
+The device check asks for cudaDevAttrPageableMemoryAccess, which GB10 (host
+page tables) and a discrete GPU with HMM both report.
+
+GPU part (skipped unless the device reads pageable host memory): the production
+Triton gather kernel reading from the file-backed table matches a torch gather.
 """
 
 import os
@@ -25,16 +27,18 @@ from sglang.srt.models.qwen4_exp_ple_table import (
     PleFileRssTrimmer,
     _mapping_rss_bytes,
     allocate_ple_host_table,
+    check_file_backend_supported,
     default_ple_table_dir,
-    device_uses_host_page_tables,
+    device_reads_pageable_memory,
     make_ple_file_prefetcher,
     make_ple_file_rss_trimmer,
     ple_table_file_name,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-small")
 
 
 class TestPleFileTableAllocator(CustomTestCase):
@@ -295,9 +299,45 @@ class TestPleFileRssTrimmer(CustomTestCase):
             self.assertFalse(trimmer._thread.is_alive())
 
 
+class _FakeCudart:
+    """cudaDeviceGetAttribute answering from ``attributes`` (cudaDeviceAttr -> value)."""
+
+    def __init__(self, attributes):
+        self.attributes = attributes
+
+    def cudaDeviceGetAttribute(self, value, attribute, device):
+        value._obj.value = self.attributes[attribute.value]
+        return 0
+
+
+class TestFileBackendDeviceCheck(CustomTestCase):
+    PAGEABLE, USES_HOST_PAGE_TABLES = 88, 100  # cudaDeviceAttr
+
+    def _check(self, attributes):
+        with (
+            mock.patch("ctypes.util.find_library", return_value="libcudart.so"),
+            mock.patch("ctypes.CDLL", return_value=_FakeCudart(attributes)),
+        ):
+            check_file_backend_supported(0)
+
+    def test_pageable_access_accepted_with_or_without_host_page_tables(self):
+        for uses_host_page_tables in (1, 0):  # GB10, HMM
+            with self.subTest(uses_host_page_tables=uses_host_page_tables):
+                self._check(
+                    {
+                        self.PAGEABLE: 1,
+                        self.USES_HOST_PAGE_TABLES: uses_host_page_tables,
+                    }
+                )
+
+    def test_no_pageable_access_refused(self):
+        with self.assertRaisesRegex(ValueError, "--ple-offload-backend pinned"):
+            self._check({self.PAGEABLE: 0, self.USES_HOST_PAGE_TABLES: 0})
+
+
 @unittest.skipUnless(
-    torch.cuda.is_available() and device_uses_host_page_tables(0) is True,
-    "needs a device that reads pageable host memory through the host page tables",
+    torch.cuda.is_available() and device_reads_pageable_memory(0) is True,
+    "needs a device that reads pageable host memory",
 )
 class TestPleFileTableGatherOnDevice(CustomTestCase):
     def test_triton_gather_reads_file_backed_table(self):

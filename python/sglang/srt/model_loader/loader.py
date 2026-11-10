@@ -55,6 +55,7 @@ from sglang.srt.runtime_context import (
     get_model,
     get_parallel,
     get_server_args,
+    get_spec,
 )
 from sglang.srt.utils import get_available_gpu_memory
 
@@ -95,6 +96,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from sglang.srt.layers.quantization.unquant import finalize_gfx115_weight_padding
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     trigger_transferring_weights_request,
@@ -103,13 +105,14 @@ from sglang.srt.model_loader.utils import (
     get_model_architecture,
     set_default_torch_dtype,
 )
-from sglang.srt.utils.common import is_cuda_alike
+from sglang.srt.utils.device import is_cuda_alike
 
 # Constants for memory management
 DEFAULT_GPU_MEMORY_FRACTION_FOR_CALIBRATION = (
     0.8  # Reserve 20% GPU memory headroom for ModelOpt calibration
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.utils.common import set_weight_attrs
 from sglang.srt.model_loader.weight_utils import (
     CheckpointFilePrefetchHandle,
     _prefetch_all_checkpoints,
@@ -139,7 +142,6 @@ from sglang.srt.utils import (
     is_npu,
     is_pin_memory_available,
     rank0_log,
-    set_weight_attrs,
 )
 
 if TYPE_CHECKING:
@@ -169,6 +171,20 @@ def device_loading_context(module: torch.nn.Module, target_device: torch.device)
 
 
 logger = logging.getLogger(__name__)
+
+# The checkpoint files the default loader read, as (folder, files), by the weight source's
+# (model id or path, revision): state derived from the loaded weights (Paged Experts' expert
+# cache) keys on the files this start read, wherever they were found (a hub cache,
+# --download-dir, ModelScope).
+_checkpoint_files: Dict[Tuple[str, Optional[str]], Tuple[str, Tuple[str, ...]]] = {}
+
+
+def loaded_checkpoint_files(
+    model_or_path: str, revision: Optional[str]
+) -> Optional[Tuple[str, Tuple[str, ...]]]:
+    """The folder and the files the default loader read the weights of ``model_or_path`` at
+    ``revision`` from in this process, or None if it did not load them."""
+    return _checkpoint_files.get((model_or_path, revision))
 
 
 def _get_quantization_config(
@@ -218,6 +234,14 @@ def _get_quantization_config(
         # (yizhang2077) workaround for nvidia/Llama-4-Maverick-17B-128E-Eagle3
         if quant_config is None:
             return None
+        if _is_npu and model_config.quantization == "modelslim":
+            draft_kv_cache_dtype = get_spec().speculative_draft_kv_cache_dtype
+            requested_dtype = (
+                draft_kv_cache_dtype
+                if model_config.is_draft_model and draft_kv_cache_dtype is not None
+                else get_model().kv_cache_dtype
+            )
+            quant_config.configure_kv_cache_quantization(requested_dtype)
         from sglang.srt.layers.quantization.fp8 import Fp8Config
 
         if isinstance(quant_config, Fp8Config):
@@ -630,6 +654,10 @@ class DefaultModelLoader(BaseModelLoader):
             hf_folder = resolved_source.hf_folder
             hf_weights_files = list(resolved_source.weight_files)
             use_safetensors = resolved_source.use_safetensors
+        _checkpoint_files[(source.model_or_path, source.revision)] = (
+            hf_folder,
+            tuple(hf_weights_files),
+        )
 
         if self.load_config.load_format == LoadFormat.NPCACHE:
             # Currently np_cache only support *.bin checkpoints
@@ -933,7 +961,7 @@ class DefaultModelLoader(BaseModelLoader):
                 local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
             )
         except (KeyError, ValueError):
-            from sglang.srt.utils.hf_transformers_utils import get_config
+            from sglang.srt.hf_transformers import get_config
 
             hf_config = get_config(
                 model_config.model_path,
@@ -1087,6 +1115,7 @@ class DefaultModelLoader(BaseModelLoader):
             # parameters onto device for processing and back off after.
             with device_loading_context(module, target_device):
                 quant_method.process_weights_after_loading(module)
+        finalize_gfx115_weight_padding(model)
 
     @staticmethod
     def restore_weights_before_loading(model, target_device):

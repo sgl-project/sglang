@@ -75,6 +75,14 @@ and FP8/NVFP4 producers can belong to the selected model or deployment path.
 The request `quality` tier neither selects nor disables those independent
 choices.
 
+SANA-Video's depthwise convolution/GLU fusion reuses input rows and avoids
+materializing the convolution output. It is enabled for large (`numel >= 2**24`)
+channels-last BF16 inputs with cuDNN enabled on SM120, after an exact comparison with the existing
+cuDNN convolution and rounded post-ops. Each shape/cuDNN-policy signature is
+verified before graph capture; an unverified capture or numerical mismatch uses
+the existing path. Autograd and `torch.compile` retain that path as well.
+SANA-WM uses a different convolution/bias rounding contract and is unchanged.
+
 SANA-Video's quality-gated linear-attention site keeps BF16 inputs for the
 first GEMM while requesting FP32 accumulation/output, then runs the second
 GEMM in FP32. The default path still promotes Q/K/V before both GEMMs.
@@ -118,10 +126,9 @@ Keep that convention explicit at their call sites; do not add it to direct
 kernel entry points.
 
 A kernel that is only built or validated for one architecture generation gates
-on `common.platform.is_cuda_sm_at_least(min_sm, x.device)` inside its
-`can_use_*` predicate. That predicate checks for a CUDA build before comparing
-the compute capability, because ROCm reports a gfx-derived capability that
-would otherwise clear a plain `>= (10, 0)` test. Kernel-level predicates stop
+on `sglang.kernels.arch.current_arch().is_sm_at_least(major, minor)` inside its
+`can_use_*` predicate. That query is false off NVIDIA CUDA, because ROCm reports
+a gfx-derived capability that would otherwise clear a plain `>= (10, 0)` test. Kernel-level predicates stop
 at the tensor contract, the architecture floor and
 `torch.compiler.is_compiling()`; grad mode and stream capture are the model
 gate's business.
@@ -158,6 +165,7 @@ Several norms look interchangeable and are not. Start here.
 | `channel_rmsnorm_silu_nhwc` | JIT CUDA | close (own fp32 reduction over C in a lane group sized from C; optional fused conv bias with aten rounding) | Qwen-Image 2.1 VAE under `quality=extra-high`/`high`; dense channels_last, even `C <= 2048` |
 | `rmsnorm_scale` / `rmsnorm_tanh_residual` | Triton | bf16-native statistics | Z-Image (matches its own reference exactly), Ideogram 4 (gated) |
 | `zimage_qk_rmsnorm_native` | Triton | bit-exact | Z-Image per-head QK RMSNorm |
+| `aten_head_rmsnorm` | Triton | bit-exact vs ROCm aten `rms_norm` (`vectorized_layer_norm_kernel` fold order) | **ROCm only**; bf16 `[..., heads, 128]` views with packed heads (MiniMax-H3 QK norm), optionally fused with the bf16 NeoX `rotary_embedding` that follows |
 | `fused_qk_head_layernorm` | Triton | bit-exact | per-head LN on q/k, `dim_head % 4 == 0`, `<= 128` |
 | `triton_one_pass_rms_norm` | Triton | close | standalone RMSNorm, one pass |
 
@@ -166,12 +174,16 @@ Several norms look interchangeable and are not. Start here.
 | Entry point | Backend | Contract | Applies to |
 |---|---|---|---|
 | `bias_residual_add` | JIT CUDA | bit-exact `(y + bias[c]) + h` with aten's per-op bf16 rounding, for a conv that skipped its bias pass | channels_last-dense (`C % 8 == 0`) or NCHW/NCDHW contiguous (spatial `% 8 == 0`) bf16; `h` shares `y`'s layout (Qwen-Image 2.1 VAE residual blocks) |
+| `fused_depthwise_conv3x3_bias_glu` | KDA (Triton) | preserves separate BF16 convolution, bias, and SiLU rounding | channels-last BF16 CUDA depthwise 3x3, stride/padding one; SANA-Video inference on SM120, first-use verification per shape and cuDNN policy |
 | `residual_gate_add` | JIT CUDA (contiguous), Triton (transposed) | bit-exact `residual + update * gate` | contiguous tensors, or a transposed-dense `[B, tokens, hidden]` residual/output with contiguous update and row-broadcast gate (SANA-Video) |
 | `residual_gate_fp32` | Triton | separate FP32 multiply/add, then cast to input dtype | contiguous `[B,S,D]`, strided `[B or 1,1,D]` gate; Kandinsky6 |
 | `indexed_gate_bf16` / `indexed_gate_fp32` (`_` in place) | Triton | bit-exact vs `x + gate[idx] * other`: bf16 rounds the product, fp32 keeps a separate FP32 multiply/add | bf16 rows, per-row index into a `[n, D]` gate table (MiniMax-H3) |
 
 These contracts differ: `residual_gate_fp32` does not round the product to
 BF16/FP16, and disables FMA to preserve the eager FP32 rounding boundary.
+
+Anima uses `residual_gate_add` during BCG warmup and capture. Its eager and
+compiled paths keep the original expression to avoid fusion dispatch overhead.
 
 The transposed-dense path tiles along the physical stride-1 token dimension
 for coalesced residual reads and output writes. The contiguous layouts use
@@ -194,7 +206,8 @@ tensor copy at each residual site.
 | `try_fused_flux2_qkv_epilogue` | KDA (JIT CUDA) | bit-exact vs the selected BF16 chain | FLUX.2 QK RMSNorm + RoPE + joint QKV packing |
 | `try_fused_qwen_qkv_epilogue` | JIT CUDA | bit-exact vs the selected BF16 chain | Qwen-Image QK RMSNorm + RoPE + joint QKV writes; SM90+ |
 | `rmsnorm_cast_before_weight_rope_bitexact` | Triton | ATen-ordered RMSNorm plus exact BF16 rotate-half RoPE, MOSS-Image width 128 |
-| `fused_rope_rotate_half_bitexact` | Triton | bit-exact (elementwise only) |
+| `fused_rope_rotate_half_bitexact` | Triton | separate BF16 rounding after each product and the sum; HiDream-O1-Image reuses it for contiguous Q/K with first-call verification and eager fallback |
+| `fused_rope_rotate_half_fp32` | Triton | paired split-half Q/K RoPE with separately rounded FP32 products and sum before the FP16/BF16 cast; Anima verifies each new signature against eager |
 | `flux3_video_qknorm_rope` | Triton | bit-exact vs affine-free ``nn.RMSNorm`` (head dim 64) plus eager rotate-half RoPE; FLUX 3 video VAE, ``eps=1e-5`` |
 | `fused_complex_rope` | Triton | preserves CUDA complex64 multiply rounding for contiguous BSHD inputs; Qwen-Image 2.1 verifies its first call against eager |
 | `rmsnorm_preserve_reduction` | Triton + aten | preserves the FP32 mean reduction and cast-before-weight rounding; fuses only pointwise work for FP16/BF16 inputs and materializes strided inputs as contiguous; Qwen-Image 2.1 verifies its first call |
@@ -250,9 +263,10 @@ existing two kernels and the fusion, both alone and with the same FP8 GEMM.
 
 ### MXFP8 producers (online `mxfp8`, cuBLASLt block-scaled GEMM on SM100)
 
-Defined in `sglang.kernels.ops.quantization.mxfp8_swizzled_triton` (`silu_mul_mxfp8` in
-`sglang.kernels.ops.activation.swiglu_mxfp8_swizzled`, `indexed_scale_shift_mxfp8_` in
-`modulate/indexed_scale_shift_mxfp8_triton.py`) and re-exported here.
+`mxfp8_quantize_swizzled` lives in `sglang.kernels.ops.quantization.mxfp8_swizzled_triton`
+and `silu_mul_mxfp8` in `sglang.kernels.ops.activation.swiglu_mxfp8_swizzled`; import them
+from there. `indexed_scale_shift_mxfp8_` (`modulate/indexed_scale_shift_mxfp8_triton.py`) is
+exported here.
 
 | Entry point | Backend | Contract |
 |---|---|---|

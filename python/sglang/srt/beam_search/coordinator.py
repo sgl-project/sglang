@@ -56,13 +56,12 @@ from sglang.srt.beam_search.fork import (
 from sglang.srt.beam_search.joint_select import joint_select, select_final_topk
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
-from sglang.srt.managers.schedule_batch import (
+from sglang.srt.managers.req_types import (
     FINISH_ABORT,
     FINISH_LENGTH,
     FINISH_MATCHED_TOKEN,
-    Req,
-    ScheduleBatch,
 )
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.srt.runtime_context import (
     get_disagg,
@@ -323,8 +322,6 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         """Deferred half of the leader's prefill tick: fold the staged selection
         into the DAG (the designated D2H point) and apply finish/abort."""
         group: BeamGroup = req.beam_group
-        if group.retired:
-            return
         if req.to_finish is not None:
             self._abort_group(group)
             return
@@ -379,29 +376,24 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             )
             self._apply_survivors(group, next_tokens, parent_idx, batch.forward_iter)
 
-    def commit_decode(self, batch: ScheduleBatch) -> set:
+    def commit_decode(self, reqs: List[Req], forward_iter: int) -> None:
         """Deferred half: fold staged selections into the DAG and apply
-        finish/abort. Returns groups finished by THIS call -- under overlap a
-        finished leader reappears for one overshoot tick, so the caller runs the
-        shared finish machinery only on the committing tick."""
-        newly_finished = set()
+        finish/abort, on ``reqs``, the requests the step at ``forward_iter``
+        commits on."""
         if self._num_live_groups == 0:
-            return newly_finished
-        for req in batch.reqs:
+            return
+        for req in reqs:
             group = req.beam_group
-            if group is None or group.retired:
+            if group is None:
                 continue
             # Reclaim even if the DAG commit is discarded: the launch path
             # already mutated req_to_token, so the orphans are real either way.
-            self._reclaim_orphans(group, batch.forward_iter)
+            self._reclaim_orphans(group, forward_iter)
             if req.to_finish is not None:
                 self._abort_group(group)
-                newly_finished.add(id(group))
                 continue
-            if group.commit_pending(batch.forward_iter):
+            if group.commit_pending(forward_iter):
                 self._finish_group(group)
-                newly_finished.add(id(group))
-        return newly_finished
 
     def _select_group(
         self,
@@ -487,9 +479,9 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         top = group.final_results[0]
         leader = group.leader
         if top.matched_token is not None:
-            leader.finished_reason = FINISH_MATCHED_TOKEN(matched=top.matched_token)
+            leader.finish_outside_step(FINISH_MATCHED_TOKEN(matched=top.matched_token))
         else:
-            leader.finished_reason = FINISH_LENGTH(length=group.num_committed)
+            leader.finish_outside_step(FINISH_LENGTH(length=group.num_committed))
         self._free_member_rows(group)
         self._retire_group(group)
 
@@ -497,8 +489,10 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         group.state = BeamGroupState.FINISHED
         group.final_results = []
         leader = group.leader
-        leader.finished_reason = leader.to_finish or FINISH_ABORT("Beam group aborted.")
-        leader.to_finish = None
+        # The group takes over the leader's requested finish as its reason.
+        reason = leader.to_finish or FINISH_ABORT("Beam group aborted.")
+        leader.clear_requested_finish()
+        leader.finish_outside_step(reason)
         self._free_member_rows(group)
         self._retire_group(group)
 

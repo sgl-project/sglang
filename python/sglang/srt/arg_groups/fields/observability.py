@@ -16,8 +16,8 @@ import msgspec
 from sglang.srt.arg_groups.arg_utils import (
     A,
     Arg,
+    json_list_type,
 )
-from sglang.srt.utils.common import json_list_type
 
 
 class Observability(msgspec.Struct):
@@ -164,7 +164,7 @@ class Observability(msgspec.Struct):
     enable_trace: A[bool, "Enable opentelemetry trace"] = False
     trace_modules: A[
         str,
-        "Select the components to trace. Available options are 'request' and 'mooncake'. Format: <module1 name>,<module2 name>,...",
+        "Select the components to trace. Available options are 'request', 'mooncake', and 'hicache'. Format: <module1 name>,<module2 name>,...",
     ] = "request"
     otlp_traces_endpoint: A[
         str,

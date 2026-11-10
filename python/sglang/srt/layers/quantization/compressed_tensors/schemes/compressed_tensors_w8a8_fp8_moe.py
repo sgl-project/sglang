@@ -26,7 +26,8 @@ from sglang.srt.layers.quantization.utils import (
     per_tensor_dequantize,
     swap_w13_to_w31,
 )
-from sglang.srt.utils import get_bool_env_var, is_hip, set_weight_attrs
+from sglang.srt.layers.utils.common import set_weight_attrs
+from sglang.srt.utils import get_bool_env_var, is_hip
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
@@ -311,7 +312,11 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                 max_w13_scales, requires_grad=False
             )
 
-        if self.weight_quant.strategy == QuantizationStrategy.CHANNEL and _use_aiter:
+        if (
+            self.weight_quant.strategy == QuantizationStrategy.CHANNEL
+            and _use_aiter
+            and self.runner.runner_backend.is_aiter()
+        ):
             with torch.no_grad():
                 # Pre-shuffle weights
                 layer.w13_weight = torch.nn.Parameter(
@@ -417,27 +422,22 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                     activation_type=activation_type,
                 )
             else:
-                quant_info = TritonMoeQuantInfo(
-                    w13_weight=layer.w13_weight,
-                    w2_weight=layer.w2_weight,
-                    use_fp8_w8a8=True,
-                    w13_scale=layer.w13_weight_scale,
-                    w2_scale=layer.w2_weight_scale,
-                    a13_scale=layer.w13_input_scale,
-                    a2_scale=layer.w2_input_scale,
-                    block_shape=self.weight_block_size,
-                )
+                quant_info = self.get_triton_quant_info(layer)
             return self.runner.run(dispatch_output, quant_info)
         else:
-            quant_info = TritonMoeQuantInfo(
-                w13_weight=layer.w13_weight,
-                w2_weight=layer.w2_weight,
-                use_fp8_w8a8=True,
-                per_channel_quant=self.weight_quant.strategy
-                == QuantizationStrategy.CHANNEL,
-                w13_scale=layer.w13_weight_scale,
-                w2_scale=layer.w2_weight_scale,
-                a13_scale=layer.w13_input_scale,
-                a2_scale=layer.w2_input_scale,
-            )
-            return self.runner.run(dispatch_output, quant_info)
+            return self.runner.run(dispatch_output, self.get_triton_quant_info(layer))
+
+    def get_triton_quant_info(self, layer: torch.nn.Module) -> TritonMoeQuantInfo:
+        # Shared with FusedMoEWithLoRA so both runners use the same base quantization.
+        return TritonMoeQuantInfo(
+            w13_weight=layer.w13_weight,
+            w2_weight=layer.w2_weight,
+            use_fp8_w8a8=True,
+            per_channel_quant=self.weight_quant.strategy
+            == QuantizationStrategy.CHANNEL,
+            w13_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+            a13_scale=layer.w13_input_scale,
+            a2_scale=layer.w2_input_scale,
+            block_shape=self.weight_block_size,
+        )

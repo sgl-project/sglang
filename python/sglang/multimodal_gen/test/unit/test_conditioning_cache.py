@@ -111,6 +111,49 @@ def test_content_masks_model_identity_and_copy_isolation():
 
 
 @torch.no_grad()
+def test_h3_reference_rows_are_cached_per_image_not_per_tile():
+    """A reference re-sent in a later request must skip the whole tiled VAE
+    encode, even when it has more tiles than the cache holds entries."""
+    from PIL import Image
+
+    from sglang.multimodal_gen.configs.models.vaes.minimax_h3_video import (
+        MiniMaxH3VideoVAEArchConfig,
+    )
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.keyframe_encoding import (
+        minimax_h3_encode_keyframe_cond_rows,
+    )
+
+    class TiledVAE(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.zeros(()))
+            self.parallel_tiling = False
+            self.calls = 0
+
+        def encode_images(self, image, use_fp16_latent):
+            self.calls += 1
+            for _ in range(200):  # more tiles than the cache's 128 entries
+                self.encode(torch.zeros(1))
+            return [torch.full((24, 1, 4, 4), float(image.getpixel((0, 0))[0]))]
+
+        @cached_vae_encode
+        def encode(self, x):
+            return x
+
+    arch = MiniMaxH3VideoVAEArchConfig(latents_mean=[0.0] * 24, latents_std=[1.0] * 24)
+    vae = TiledVAE().eval()
+    red, blue = Image.new("RGB", (64, 64), "red"), Image.new("RGB", (64, 64), "blue")
+    cache = ConditioningCache(1024 * 1024)
+    with cache.scope():
+        first = minimax_h3_encode_keyframe_cond_rows(vae, red, arch)
+    with cache.scope():
+        again = minimax_h3_encode_keyframe_cond_rows(vae, red.copy(), arch)
+        minimax_h3_encode_keyframe_cond_rows(vae, blue, arch)
+    assert vae.calls == 2
+    torch.testing.assert_close(again, first, rtol=0, atol=0)
+
+
+@torch.no_grad()
 def test_lru_budget_and_oversized_outputs():
     cache = ConditioningCache(32)
     model = Encoder().eval()

@@ -30,6 +30,10 @@ from sglang.srt.layers.attention.linear.kda_prefill_graph import (
     build_track_rows,
 )
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
+from sglang.srt.layers.attention.linear.kernels.state_pool_io import (
+    stage_pool_states,
+    unstage_pool_states,
+)
 from sglang.srt.layers.attention.linear.utils import (
     LinearAttnBackends,
     LinearAttnKernelBackend,
@@ -37,10 +41,12 @@ from sglang.srt.layers.attention.linear.utils import (
     pp_spec_stable_rows_enabled,
     select_verify_intermediate_state_indices,
 )
+from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
-from sglang.srt.mem_cache.kv.router import STATE_PART
+from sglang.srt.mem_cache.kv.decl import STATE_PART
 from sglang.srt.mem_cache.memory_pool import MambaPool
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import (
     get_exec,
@@ -49,7 +55,8 @@ from sglang.srt.runtime_context import (
     mamba_cache_chunk_size,
 )
 from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu, is_xpu
-from sglang.srt.utils.common import is_pin_memory_available, rank0_log
+from sglang.srt.utils.device import is_pin_memory_available
+from sglang.srt.utils.log_utils import rank0_log
 
 _is_hip = is_hip()
 
@@ -77,6 +84,16 @@ _fused_decode_verify_real_tensors = (
 )
 
 
+class GDNMISBatchTensors(msgspec.Struct, frozen=True):
+    """Batch-owned slot maps and masks reused by every GDN layer."""
+
+    query_cache_indices: torch.Tensor
+    item_ssm_indices: torch.Tensor
+    item_conv_indices: torch.Tensor
+    query_has_initial_states: torch.Tensor
+    item_has_initial_states: torch.Tensor
+
+
 class GDNMISMetadata(msgspec.Struct, frozen=True):
     query_token_indices: torch.Tensor
     query_cu_seqlens: torch.Tensor
@@ -86,9 +103,44 @@ class GDNMISMetadata(msgspec.Struct, frozen=True):
     item_cu_seqlens: torch.Tensor
     item_seq_lens_cpu: list[int]
     item_request_indices: torch.Tensor
+    batch_tensors: Optional[GDNMISBatchTensors] = None
 
 
-def build_gdn_mis_metadata(forward_batch: ForwardBatch) -> GDNMISMetadata:
+def _build_gdn_mis_batch_tensors(
+    *,
+    cache_indices: torch.Tensor,
+    query_requests: torch.Tensor,
+    item_requests: torch.Tensor,
+    num_requests: int,
+    device: torch.device,
+) -> GDNMISBatchTensors:
+    if (
+        cache_indices.ndim != 1
+        or cache_indices.numel() != num_requests
+        or cache_indices.device != device
+        or cache_indices.dtype not in (torch.int32, torch.int64)
+    ):
+        raise ValueError("GDN MIS requires device cache_indices for every request")
+    return GDNMISBatchTensors(
+        query_cache_indices=cache_indices[query_requests],
+        item_ssm_indices=cache_indices[item_requests],
+        item_conv_indices=torch.arange(
+            item_requests.numel(), dtype=cache_indices.dtype, device=device
+        ),
+        query_has_initial_states=torch.zeros(
+            query_requests.numel(), dtype=torch.bool, device=device
+        ),
+        item_has_initial_states=torch.ones(
+            item_requests.numel(), dtype=torch.bool, device=device
+        ),
+    )
+
+
+def build_gdn_mis_metadata(
+    forward_batch: ForwardBatch,
+    *,
+    cache_indices: Optional[torch.Tensor] = None,
+) -> GDNMISMetadata:
     """Build compact query/item segments from request-local MIS delimiters."""
     if not forward_batch.is_prefill_only:
         raise ValueError("GDN MIS is only supported for prefill-only requests")
@@ -163,15 +215,27 @@ def build_gdn_mis_metadata(forward_batch: ForwardBatch) -> GDNMISMetadata:
             )
         return result
 
+    query_requests = _indices(query_request_indices, torch.int64)
+    item_requests = _indices(item_request_indices, torch.int64)
+    batch_tensors = None
+    if cache_indices is not None:
+        batch_tensors = _build_gdn_mis_batch_tensors(
+            cache_indices=cache_indices,
+            query_requests=query_requests,
+            item_requests=item_requests,
+            num_requests=len(seq_lens),
+            device=device,
+        )
     return GDNMISMetadata(
         query_token_indices=_indices(query_token_indices, torch.int64),
         query_cu_seqlens=_cu_seqlens(query_seq_lens_cpu),
         query_seq_lens_cpu=query_seq_lens_cpu,
-        query_request_indices=_indices(query_request_indices, torch.int64),
+        query_request_indices=query_requests,
         item_token_indices=_indices(item_token_indices, torch.int64),
         item_cu_seqlens=_cu_seqlens(item_seq_lens_cpu),
         item_seq_lens_cpu=item_seq_lens_cpu,
-        item_request_indices=_indices(item_request_indices, torch.int64),
+        item_request_indices=item_requests,
+        batch_tensors=batch_tensors,
     )
 
 
@@ -548,6 +612,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
     # forward_extend then runs the graph-safe chain on these static tables.
     prefill_graph_metadata: Optional[GDNPrefillGraphMetadata] = None
 
+    def _create_kernel_dispatcher(self, backends):
+        return GDNKernelDispatcher(backends.decode, backends.prefill, backends.verify)
+
     def __init__(self, model_runner: ModelRunner):
         _validate_gdn_linear_attn_backends(model_runner.linear_attn_backends)
         super().__init__(model_runner)
@@ -562,9 +629,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         backends = model_runner.linear_attn_backends
         validate_gdn_mis_backend(backends.prefill)
         self.linear_attn_backends = backends
-        self.kernel_dispatcher = GDNKernelDispatcher(
-            backends.decode, backends.prefill, backends.verify
-        )
+        self.kernel_dispatcher = self._create_kernel_dispatcher(backends)
         # Sized past the pool for attn_tp-padded warmup/MLP-sync batches (see helper).
         self.verify_intermediate_state_indices = (
             build_verify_intermediate_state_indices(
@@ -678,7 +743,18 @@ class GDNAttnBackend(MambaAttnBackendBase):
             extend_prefix_lens=forward_batch.extend_prefix_lens,
             track_rows=track_rows,
         )
+        if track_rows is None and forward_batch.mamba_track_indices is not None:
+            meta.track_dst[: forward_batch.batch_size].copy_(
+                forward_batch.mamba_track_indices
+            )
         self.prefill_graph_metadata = meta
+        self.forward_metadata = ForwardMetadata(
+            query_start_loc=meta.cu_seqlens,
+            mamba_cache_indices=meta.cache_indices,
+            mamba_track_indices=None
+            if forward_batch.mamba_track_indices is None
+            else meta.track_dst[: forward_batch.batch_size],
+        )
 
     def _prefill_graph_track_rows(
         self, forward_batch: ForwardBatch
@@ -721,7 +797,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
         if forward_batch.multi_item_delimiter_indices is not None:
             if not self.enable_mis:
                 raise ValueError("GDN MIS metadata requires --enable-mis")
-            self.mis_metadata = build_gdn_mis_metadata(forward_batch)
+            self.mis_metadata = build_gdn_mis_metadata(
+                forward_batch,
+                cache_indices=self.forward_metadata.mamba_cache_indices,
+            )
         if self.forward_metadata.has_mamba_track_mask:
             if getattr(self.forward_metadata, "mamba_track_mask_indices", None) is None:
                 self.forward_metadata.mamba_track_mask_indices = (
@@ -1261,8 +1340,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
         # Page-major envelope: the prefill kernels (CUDA causal_conv1d_fwd,
         # chunk_gated_delta_rule) write state back in place assuming a contiguous
         # slot layout, so they silently drop the write to the strided envelope
-        # pool. Run them on contiguous per-sequence copies (identity-indexed) and
-        # scatter the result back. No-op for the default contiguous pool.
+        # pool. Run them on contiguous per-sequence copies and scatter the result
+        # back. No-op for the default contiguous pool.
         # CPU kernels (causal_conv1d_fwd_cpu, chunk_gated_delta_rule_cpu) use
         # proper indexed writes and handle non-contiguous pools directly via
         # cache_indices, so the gather/scatter round-trip is unnecessary on CPU.
@@ -1276,13 +1355,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
             and (not conv_states.is_contiguous() or not ssm_states.is_contiguous())
         )
         if needs_state_gather:
-            conv_states_contig = conv_states[cache_indices].contiguous()
-            ssm_states_contig = ssm_states[cache_indices].contiguous()
-            state_cache_indices = torch.arange(
-                cache_indices.shape[0],
-                device=cache_indices.device,
-                dtype=cache_indices.dtype,
-            )
+            # Row 0 of the copies is the padding sink, as in the pool: the
+            # prefill kernels treat state index 0 as padding.
+            (
+                (conv_states_contig, ssm_states_contig),
+                state_cache_indices,
+                staged_pool_rows,
+            ) = stage_pool_states((conv_states, ssm_states), cache_indices)
         else:
             conv_states_contig = conv_states
             ssm_states_contig = ssm_states
@@ -1463,8 +1542,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
             if needs_state_gather:
                 # Scatter the in-place-updated contiguous copies back to the
                 # strided envelope pool (advanced indexing handles the strides).
-                conv_states[cache_indices] = conv_states_contig
-                ssm_states[cache_indices] = ssm_states_contig
+                unstage_pool_states(
+                    (conv_states, ssm_states),
+                    (conv_states_contig, ssm_states_contig),
+                    staged_pool_rows,
+                )
 
             if forward_metadata.has_mamba_track_mask:
                 self._track_mamba_state_extend(
@@ -1490,6 +1572,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
     ) -> torch.Tensor:
         metadata = self.mis_metadata
         assert metadata is not None
+        batch_tensors = metadata.batch_tensors
+        if batch_tensors is None:
+            raise ValueError("GDN MIS batch tensors must be prepared before execution")
 
         conv_states[cache_indices] = 0
         ssm_states[cache_indices] = 0
@@ -1498,53 +1583,40 @@ class GDNAttnBackend(MambaAttnBackendBase):
         )
 
         if metadata.query_token_indices.numel() > 0:
-            query_cache_indices = cache_indices[metadata.query_request_indices]
-            query_output = self._forward_mis_segments(
+            self._forward_mis_segments(
                 layer=layer,
                 mixed_qkv=mixed_qkv[metadata.query_token_indices],
                 a=a[metadata.query_token_indices],
                 b=b[metadata.query_token_indices],
                 conv_states=conv_states,
-                conv_cache_indices=query_cache_indices,
-                has_initial_states=torch.zeros(
-                    len(metadata.query_seq_lens_cpu),
-                    dtype=torch.bool,
-                    device=mixed_qkv.device,
-                ),
+                conv_cache_indices=batch_tensors.query_cache_indices,
+                has_initial_states=batch_tensors.query_has_initial_states,
                 query_start_loc=metadata.query_cu_seqlens,
                 seq_lens_cpu=metadata.query_seq_lens_cpu,
                 ssm_states=ssm_states,
-                ssm_cache_indices=query_cache_indices,
+                ssm_cache_indices=batch_tensors.query_cache_indices,
                 inplace_update=True,
+                out=output,
+                output_indices=metadata.query_token_indices,
             )
-            output[:, metadata.query_token_indices] = query_output
 
-        item_ssm_indices = cache_indices[metadata.item_request_indices]
-        item_conv_states = conv_states[item_ssm_indices]
-        item_conv_indices = torch.arange(
-            item_ssm_indices.shape[0],
-            dtype=cache_indices.dtype,
-            device=cache_indices.device,
-        )
-        item_output = self._forward_mis_segments(
+        item_conv_states = conv_states[batch_tensors.item_ssm_indices]
+        self._forward_mis_segments(
             layer=layer,
             mixed_qkv=mixed_qkv[metadata.item_token_indices],
             a=a[metadata.item_token_indices],
             b=b[metadata.item_token_indices],
             conv_states=item_conv_states,
-            conv_cache_indices=item_conv_indices,
-            has_initial_states=torch.ones(
-                len(metadata.item_seq_lens_cpu),
-                dtype=torch.bool,
-                device=mixed_qkv.device,
-            ),
+            conv_cache_indices=batch_tensors.item_conv_indices,
+            has_initial_states=batch_tensors.item_has_initial_states,
             query_start_loc=metadata.item_cu_seqlens,
             seq_lens_cpu=metadata.item_seq_lens_cpu,
             ssm_states=ssm_states,
-            ssm_cache_indices=item_ssm_indices,
+            ssm_cache_indices=batch_tensors.item_ssm_indices,
             inplace_update=False,
+            out=output,
+            output_indices=metadata.item_token_indices,
         )
-        output[:, metadata.item_token_indices] = item_output
         return output
 
     def _forward_mis_segments(
@@ -1562,6 +1634,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
         ssm_states: torch.Tensor,
         ssm_cache_indices: torch.Tensor,
         inplace_update: bool,
+        out: Optional[torch.Tensor] = None,
+        output_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         mixed_qkv = causal_conv1d_fn(
             mixed_qkv.transpose(0, 1),
@@ -1576,6 +1650,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         ).transpose(0, 1)
 
         qkv_dim = layer.q_dim + layer.k_dim + layer.v_dim
+        qk_normalized = False
         if (is_cuda() or is_hip()) and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM:
             query, key, value = fused_qkv_split_gdn_prefill(
                 mixed_qkv,
@@ -1585,7 +1660,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 layer.head_q_dim,
                 layer.head_k_dim,
                 layer.head_v_dim,
+                normalize_qk=True,
             )
+            qk_normalized = True
         else:
             query, key, value = torch.split(
                 mixed_qkv, [layer.q_dim, layer.k_dim, layer.v_dim], dim=-1
@@ -1606,6 +1683,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
             cache_indices=ssm_cache_indices,
             query_start_loc=query_start_loc,
             inplace_update=inplace_update,
+            out=out,
+            output_indices=output_indices,
+            use_qk_l2norm_in_kernel=not qk_normalized,
         )
         return output
 

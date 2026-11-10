@@ -136,6 +136,9 @@ jobs:
             multimodal_gen:
               - ".github/workflows/pr-test.yml"
               - ".github/workflows/pr-test-multimodal-gen.yml"
+              - ".github/workflows/_diffusion-pr-test-stage.yml"
+              - "scripts/ci/cuda/ci_install_dependency_diffusion.sh"
+              - "scripts/ci/runner_configs.yml"
               - "python/pyproject.toml"
               - "python/sglang/multimodal_gen/**/!(*.md|*.ipynb)"
               - "python/sglang/srt/model_executor/runner_backend_utils/breakable_cuda_graph/**"

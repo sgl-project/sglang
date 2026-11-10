@@ -6,6 +6,7 @@ import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
@@ -15,6 +16,7 @@ import sglang.kernels.selector as sel
 from sglang.kernels import KernelBackend, PlatformInfo
 from sglang.kernels.spec import CapabilityRequirement as Cap
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=26, suite="base-a-test-cpu")
 
@@ -155,7 +157,7 @@ def test_platform_detection_distinguishes_musa_cuda_alias(
     if musa_available is not None:
         torch.musa = SimpleNamespace(is_available=lambda: musa_available)
     monkeypatch.setitem(sys.modules, "torch", torch)
-    assert PlatformInfo.detect().device_type == expected_device
+    assert PlatformInfo.detect(use_cache=False).device_type == expected_device
 
 
 def test_capabilities_or_semantics():
@@ -164,13 +166,107 @@ def test_capabilities_or_semantics():
     assert K.capabilities_satisfied(both, _HIP)
     assert not K.capabilities_satisfied(both, _CPU)
     assert K.capabilities_satisfied((), _CPU)  # empty = unrestricted
-    assert K.capabilities_satisfied(Cap.CUDA, _SM90)  # single tolerated
+
+
+class TestCakeSoftmaxCapability(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        from sglang.kernels.cake_kernels import sampling as cake_sampling
+
+        self.cake_sampling = cake_sampling
+        self.cake_sampling._device_supported.cache_clear()
+
+    def tearDown(self):
+        self.cake_sampling._device_supported.cache_clear()
+        super().tearDown()
+
+    @staticmethod
+    def _logits(shape, dtype):
+        return SimpleNamespace(
+            is_cuda=True,
+            dtype=dtype,
+            ndim=len(shape),
+            shape=shape,
+            is_contiguous=lambda: True,
+            device=SimpleNamespace(index=0),
+        )
+
+    def test_sampling_softmax_uses_cake_for_qualified_sm100_inputs(self):
+        import torch
+
+        from sglang.kernels.ops import sampling as sampling_ops
+
+        logits = self._logits((1, 131072), torch.float32)
+        cake_result = object()
+        fallback_result = object()
+        with (
+            patch("torch.cuda.get_device_capability", return_value=(10, 0)),
+            patch.object(self.cake_sampling, "find_spec", return_value=object()),
+            patch.object(torch.version, "cuda", "13.0"),
+            patch.object(sampling_ops, "cake_softmax", return_value=cake_result),
+            patch.object(torch, "softmax", return_value=fallback_result) as fallback,
+        ):
+            result = sampling_ops.softmax(logits)
+
+        self.assertIs(result, cake_result)
+        fallback.assert_not_called()
+
+    def test_sampling_softmax_falls_back_outside_qualified_domain(self):
+        import torch
+
+        from sglang.kernels.ops import sampling as sampling_ops
+
+        for arch, shape in (
+            ((10, 2), (1, 131072)),
+            ((10, 0), (65, 131072)),
+        ):
+            with self.subTest(arch=arch, shape=shape):
+                self.cake_sampling._device_supported.cache_clear()
+                logits = self._logits(shape, torch.float32)
+                cake_result = object()
+                fallback_result = object()
+                with (
+                    patch("torch.cuda.get_device_capability", return_value=arch),
+                    patch.object(
+                        self.cake_sampling, "find_spec", return_value=object()
+                    ),
+                    patch.object(torch.version, "cuda", "13.0"),
+                    patch.object(
+                        sampling_ops, "cake_softmax", return_value=cake_result
+                    ) as cake,
+                    patch.object(
+                        torch, "softmax", return_value=fallback_result
+                    ) as fallback,
+                ):
+                    result = sampling_ops.softmax(logits)
+
+                self.assertIs(result, fallback_result)
+                cake.assert_not_called()
+                fallback.assert_called_once_with(logits, dim=-1)
+
+    def test_sampling_softmax_registry_matches_supported_architectures(self):
+        spec = K.select_kernel("sampling.softmax", backend=KernelBackend.CAKE)
+        supported = ((10, 0), (10, 3))
+        unsupported = ((9, 0), (10, 1), (10, 2), (12, 0))
+
+        for arch in supported:
+            platform = PlatformInfo(
+                device_type="cuda", cuda_arch_major=arch[0], cuda_arch_minor=arch[1]
+            )
+            self.assertTrue(spec.is_available(platform), arch)
+        for arch in unsupported:
+            platform = PlatformInfo(
+                device_type="cuda", cuda_arch_major=arch[0], cuda_arch_minor=arch[1]
+            )
+            self.assertFalse(spec.is_available(platform), arch)
+        self.assertFalse(spec.is_available(_CPU))
+        self.assertFalse(spec.is_available(_HIP))
 
 
 @pytest.mark.parametrize(
     "relative_path",
     (
-        "srt/utils/common.py",
+        "srt/utils/device.py",
         "multimodal_gen/runtime/utils/common.py",
     ),
 )
@@ -216,6 +312,7 @@ def test_import_stays_metadata_only():
         "'sglang.kernels.ops.activation.softcap', "
         "'sglang.kernels.ops.attention.dllm_kv_pack', "
         "'sglang.kernels.ops.attention.flash_attention_v4', "
+        "'sglang.kernels.ops.attention.dsv4.cute_sparse_mla_h16', "
         "'sglang.kernels.ops.attention.gemma_qkv_norm_rope', "
         "'sglang.kernels.ops.layernorm.rmsnorm_fanout', "
         "'sglang.kernels.ops.speculative.row_argmax')) or any("
@@ -307,17 +404,62 @@ def test_backend_directories_register_their_backend():
             assert spec.backend is expected, spec
 
 
-def test_inventory_targets_survive_module_moves():
-    """Moving a module without its lazy target otherwise breaks only on first call."""
-    root = Path(K.__file__).resolve().parents[3] / "python"
+def _module_file(module: str) -> Path | None:
+    kernels = Path(K.__file__).resolve().parent
+    package, *_ = module.split(".")
+    # sgl_kernel resolves to the in-tree AOT package so the check needs no GPU build.
+    root = kernels / "aot/python" if package == "sgl_kernel" else kernels.parents[1]
+    path = root.joinpath(*module.split("."))
+    for candidate in (path.with_suffix(".py"), path / "__init__.py"):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _module_level_names(module: str) -> dict[str, ast.AST]:
+    """Names a module binds at top level, including under if/try and via `import *`."""
+    names = {}
+    pending = list(ast.parse(_module_file(module).read_text()).body)
+    while pending:
+        node = pending.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names[node.name] = node
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                for name in ast.walk(target):
+                    if isinstance(name, ast.Name):
+                        names[name.id] = node
+        elif isinstance(node, ast.ImportFrom) and node.names[0].name == "*":
+            names.update(_module_level_names(node.module))
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                names[(alias.asname or alias.name).split(".")[0]] = node
+        elif isinstance(node, (ast.If, ast.Try)):
+            pending += node.body + node.orelse
+            if isinstance(node, ast.Try):
+                pending += node.finalbody
+                pending += [stmt for handler in node.handlers for stmt in handler.body]
+    return names
+
+
+def test_inventory_targets_resolve():
+    """A lazy target whose module or attribute is gone otherwise breaks only on first call."""
     for spec in K.registry.all_specs():
-        module, _ = spec.target.split(":", 1)
-        if not module.startswith("sglang.kernels.ops."):
+        module, attr = spec.target.split(":", 1)
+        owner, *members = attr.split(".")
+        assert _module_file(module) is not None, spec
+        if _module_file(f"{module}.{owner}") is not None:
             continue
-        path = root.joinpath(*module.split("."))
-        assert path.with_suffix(".py").is_file() or (path / "__init__.py").is_file(), (
-            spec
-        )
+        names = _module_level_names(module)
+        assert owner in names, spec
+        if members and isinstance(names[owner], ast.ClassDef):
+            methods = {
+                node.name
+                for node in names[owner].body
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            }
+            assert members[0] in methods, spec
 
 
 def test_reclassified_public_entry_points_are_inventoried():
@@ -332,6 +474,7 @@ def test_reclassified_public_entry_points_are_inventoried():
         "attention.dsa.kpool_topk_transform",
         "attention.dsa.indexer_k",
         "attention.dsv4.wo_a",
+        "attention.dsv4.cute_sparse_mla_h16",
         "attention.helion.kda_replayssm",
         "attention.helion.kda_verify",
         "attention.minimax_sparse.common.index",
@@ -352,7 +495,6 @@ def test_reclassified_public_entry_points_are_inventoried():
         "gemm.sm120_fp8_gemv",
         "gemm.fp8_blockwise_gemm",
         "gemm.gptq_marlin",
-        "layernorm.rmsnorm_hf",
         "layernorm.rmsnorm_fanout",
         "layernorm.grouped_gemma_rmsnorm",
         "moe.dsv4",
@@ -422,7 +564,6 @@ def _module_defines(module: str, attr: str) -> bool:
         ("communication.all_gather_matmul", {"cute_dsl"}),
         ("communication.matmul_reduce_scatter", {"cute_dsl"}),
         ("elementwise.row_sum", {"jit"}),
-        ("gemm.muse_spark_router_gemm", {"jit"}),
         ("gemm.muse_spark_router_gemv", {"cute_dsl"}),
         ("layernorm.muse_spark_norm_gate", {"torch", "jit", "helion", "triton"}),
         ("layernorm.muse_spark_norm_residual", {"torch", "jit", "triton"}),
@@ -464,6 +605,7 @@ def test_muse_spark_kernels_are_inventoried_by_operator(op, backends):
         ("attention.deep_select_topk", (10, 0), True),
         ("attention.deep_select_topk", (10, 1), False),
         ("attention.deep_select_topk", (10, 3), True),
+        ("attention.deep_select_topk", (10, 7), True),
         ("attention.deep_select_topk", (12, 0), False),
         ("attention.chunk_kda_fwd", (9, 0), False),
         ("attention.chunk_kda_fwd", (10, 0), True),
@@ -488,6 +630,20 @@ def test_registered_architecture_boundaries(op, sm, expected):
     )
     assert K.capabilities_satisfied(spec.capabilities, platform) is expected
     assert not K.capabilities_satisfied(spec.capabilities, _CPU)
+
+
+def test_native_h16_registry_is_sm90_only():
+    spec = K.select_kernel("attention.cute_sparse_mla_h16_fwd")
+    assert spec.backend is KernelBackend.CUTE_DSL
+    assert spec.is_available(_SM90)
+    for platform in (_CPU, _HIP, _MUSA, _SM100):
+        assert not spec.is_available(platform)
+    for major, minor in ((8, 9), (9, 1)):
+        assert not spec.is_available(
+            PlatformInfo(
+                device_type="cuda", cuda_arch_major=major, cuda_arch_minor=minor
+            )
+        )
 
 
 def test_convrot_int8_specs_match_wrapper_capabilities():

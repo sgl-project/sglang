@@ -49,6 +49,27 @@ decode on the worker).
 3. **Sample**: Connect the loaded model to standard ComfyUI samplers. Each step is packed by a model adapter and sent to the SGLang scheduler.
 4. **LoRA Support**: Use the `SGLDiffusion LoRA Loader` for native LoRA integration.
 
+The LoRA loader's `merge_mode` defaults to `auto`, including workflows saved
+before this option existed. Chain loader nodes to combine adapters; each keeps
+its own strength and training alpha/rank. All loaders chained on one MODEL must
+use the same mode. Separate MODEL branches can use different modes: immediately
+before sampling, the shared worker switches to that branch's adapters and mode.
+Sampling the original model disables the previous branch's LoRAs.
+
+- `auto`: a single LoRA is merged into the base weights, unless the weights
+  cannot be merged or a BF16 merge would round away most of its update (common
+  for distilled Turbo LoRAs), in which case it stays dynamic. A chain of LoRAs
+  runs dynamically: re-merging the whole combination whenever it changes costs
+  more than the per-step adapter work it saves.
+- `dynamic`: leaves base weights unchanged and computes each adapter's update
+  during every forward. This avoids BF16 weight-merge rounding and suits
+  workflows that switch adapters, at the cost of per-step adapter work.
+- `merge`: folds the combination into base weights before sampling, saving the
+  per-step adapter computation. Switching restores the original weights first.
+  Merging into BF16 can round away small updates, so it need not produce the
+  same output as dynamic. Quantized weights that cannot be merged require dynamic.
+
+
 ### Options
 
 `SGLDiffusion Options` keeps `model_type` and `num_gpus` on
@@ -141,6 +162,27 @@ SGLang's optimized kernels and parallelism (TP / SP, compile, cache) run on the
 DiT only. Text encoding and VAE stay in ComfyUI.
 
 Start ComfyUI with `--disable-cuda-malloc` for integrated mode. ComfyUI's default `cudaMallocAsync` pool cannot export CUDA IPC handles, so per-step tensors (latents, ControlNet residuals) then go through a host copy; with the flag they are shared on the GPU. Flux + ControlNet at 1024x1024 on an H100 drops from 13.1s to 4.7s for 25 steps.
+
+## Worker Status Node
+
+`SGLDiffusion Worker Status` (category `SGLDiffusion`) takes the SGLD `MODEL`
+and prints the model, worker liveness, and the worker's own `RequestMetrics` for
+the last DiT call: forward time and peak VRAM for one sampler step (with CFG,
+one of the step's two calls), not the whole run. It is never served from
+ComfyUI's cache. Run it on its own to check loader settings and worker
+readiness before generating, or wire the sampler's `LATENT` into the optional
+`after_sampling` input so it runs after that sampler and reports its metrics.
+The node's text box also refreshes after every DiT call while a sampler runs.
+
+Settings use the `SGLDOptions` widget names and values and come in two groups.
+Loader settings (model type, parallel layout, attention, quantization, execution
+and memory mode) are what the worker is running and stay fixed until it
+restarts; fields that do not apply to the chosen mode, such as
+`resident_layers` with `memory_mode=resident`, are left out. Per-run settings
+(`cache_mode`, `cache_dit_params`) apply to the next request.
+
+For per-stage timing set `SGLANG_DIFFUSION_STAGE_LOGGING=1`; for Prometheus
+metrics start the worker with `enable_metrics`.
 
 ## Architecture
 

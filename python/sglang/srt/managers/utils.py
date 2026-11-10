@@ -10,6 +10,7 @@ import msgspec
 import torch
 
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import ExpertDistributionMetrics
 from sglang.srt.layers.logits_processor import (
     LogitsProcessorOutput,
@@ -17,12 +18,19 @@ from sglang.srt.layers.logits_processor import (
 )
 from sglang.srt.managers import io_struct
 from sglang.srt.managers.auxiliary_output import append_auxiliary_output
-from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.io_struct import AbortReq, FinishReasonDict
+from sglang.srt.mem_cache.kv_weight_version_tracker import KvWeightVersionRecord
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
-from sglang.srt.runtime_context import get_spec, max_speculative_num_draft_tokens
+from sglang.srt.runtime_context import (
+    get_serving,
+    get_spec,
+    max_speculative_num_draft_tokens,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.state_capturer.base import TopkCaptureOutput
-from sglang.srt.utils.common import async_d2h as _async_d2h
+from sglang.srt.utils.device import async_d2h as _async_d2h
+from sglang.srt.utils.device import is_cuda
+from sglang.srt.utils.weight_versions import compute_weight_version_spans
 
 if TYPE_CHECKING:
     from sglang.srt.managers.async_d2h_copy_worker import HostCopyDone
@@ -30,7 +38,8 @@ if TYPE_CHECKING:
         DeviceAuxiliaryOutput,
         HostAuxiliaryOutput,
     )
-    from sglang.srt.managers.scheduler import GenerationBatchResult
+    from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.mem_cache.kv.alloc.forward_steps import ForwardLaunch
     from sglang.srt.mem_cache.kv.alloc.iteration_ids import IterationIds
     from sglang.srt.observability.forward_pass_metrics import (
         FpmTiming,
@@ -54,6 +63,15 @@ def allocate_distinct_stream(device_module, avoid_streams):
         if stream.cuda_stream not in avoid:
             return stream
     raise RuntimeError("Unable to allocate a distinct stream")
+
+
+def is_war_barrier_enabled() -> bool:
+    # FIXME: off CUDA (ROCm included) the barrier is off unless
+    # SGLANG_ENABLE_WAR_BARRIER is set. Unified memory frees ids and rewrites
+    # request rows on the schedule stream at once and relies on this barrier to
+    # order those writes after the overlapped forward's shared reads; without
+    # it that forward can read unbound or rebound mappings.
+    return is_cuda() or envs.SGLANG_ENABLE_WAR_BARRIER.get()
 
 
 @dataclasses.dataclass
@@ -83,7 +101,12 @@ class GenerationBatchResult:
 
     # For overlap scheduling
     copy_done: Optional[Union[torch.cuda.Event, HostCopyDone]] = None
+    # The unified pool's record of this forward; processing the result retires
+    # it, so page moves stop treating its pages as in flight.
+    unified_forward_done: Optional[torch.cuda.Event] = None
     delay_sample_func: Optional[callable] = None
+    # The step's launch record, for the unified pool's processing.
+    forward_launch: Optional[ForwardLaunch] = None
     future_indices: Optional[torch.Tensor] = None
     speculative_num_draft_tokens: Optional[int] = None
     # Padded row width in flattened speculative output. Existing algorithms
@@ -137,9 +160,8 @@ class GenerationBatchResult:
     # Every stage holds the KV for its own layers, so every stage has to compact
     # that path into its committed prefix; only the last stage can compute it.
     accept_index: Optional[torch.Tensor] = None
-    prepared_draft_extend_inputs: Optional[
-        tuple[torch.Tensor, torch.Tensor, torch.Tensor]
-    ] = None
+    # The optional fourth item is the prepared draft-extend layout.
+    prepared_draft_extend_inputs: Optional[tuple] = None
 
     # Refs the worker wants scheduler to keep alive for the same 2-iter window
     # as batch_record_buf. Used for cross-stream tensor lifetime (e.g. a spec
@@ -149,6 +171,7 @@ class GenerationBatchResult:
     # Routed experts: pending async D2H for overlap scheduling
     routed_experts_output: Optional[TopkCaptureOutput] = None
     indexer_topk_output: Optional[TopkCaptureOutput] = None
+    kv_weight_version_record: Optional[KvWeightVersionRecord] = None
 
     # metrics
     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
@@ -227,6 +250,7 @@ class GenerationBatchResult:
             sampling_mask_output,
             self.routed_experts_output,
             self.indexer_topk_output,
+            self.kv_weight_version_record,
             self.expert_distribution_metrics,
         ):
             if holder is not None:
@@ -400,13 +424,18 @@ class EmbeddingBatchResult:
             only when the batch contained ``return_pooled_hidden_states=True``
             requests.  Tensor (uniform shapes) or list of tensors (MIS).
         copy_done: CUDA event recorded after the async CPU copy completes.
+        unified_forward_done: The unified pool's record of an overlapped
+            forward; processing the result retires it.
     """
 
     embeddings: torch.Tensor
     pooled_hidden_states: Optional[torch.Tensor] = None
     copy_done: Optional[Union[torch.cuda.Event, HostCopyDone]] = None
+    unified_forward_done: Optional[torch.cuda.Event] = None
     can_run_cuda_graph: bool = False
     fpm_timing: Optional[FpmTiming] = None
+    # The step's launch record, for the unified pool's processing.
+    forward_launch: Optional[ForwardLaunch] = None
 
     @torch.profiler.record_function("copy_embedding_to_cpu")
     def copy_to_cpu(self):
@@ -506,4 +535,19 @@ def compute_num_reserved_tokens() -> int:
     return max(
         spec.speculative_eagle_topk * spec.speculative_num_steps,
         max_speculative_num_draft_tokens(),
+    )
+
+
+def make_abort_req(
+    req: Req, finished_reason: Optional[FinishReasonDict] = None
+) -> AbortReq:
+    return AbortReq(
+        rid=req.rid,
+        finished_reason=finished_reason,
+        weight_versions=compute_weight_version_spans(
+            req.weight_version_events,
+            current_version=get_serving().weight_version,
+            num_output_tokens=len(req.output_ids),
+        ),
+        prefill_weight_versions=req.prefill_weight_versions,
     )

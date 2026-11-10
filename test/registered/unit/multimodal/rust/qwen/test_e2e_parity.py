@@ -10,6 +10,7 @@ is reproduced exactly.
 
 import asyncio
 import base64
+import hashlib
 import sys
 import tempfile
 import unittest
@@ -110,7 +111,26 @@ class TestQwenE2eParity(CustomTestCase):
             buffers[f"mm.feature.{index}"] = features[
                 row * spec.feature_dim : (row + n) * spec.feature_dim
             ].reshape(n, spec.feature_dim)
+            feature = buffers[f"mm.feature.{index}"]
+            # Match the native worker sidecar, which commits to its actual
+            # model-facing tensor and geometry, not the old source hash hint.
+            metadata = msgspec.msgpack.encode(
+                (
+                    "image",
+                    "f32",
+                    sys.byteorder == "little",
+                    list(feature.shape),
+                    {"image_grid_thw": list(grids[index])},
+                )
+            )
+            digest = hashlib.sha256(b"sglang-rust-mm-output-v1")
+            digest.update(len(metadata).to_bytes(8, "big"))
+            digest.update(metadata)
+            digest.update(feature.nbytes.to_bytes(8, "big"))
+            digest.update(memoryview(feature).cast("B"))
+            meta["items"][index]["identity"] = list(digest.digest())
             row += n
+        buffers["mm.meta"] = np.frombuffer(msgspec.msgpack.encode(meta), dtype=np.uint8)
         return snapshot(ids, RustMmProcessor.wrap_encoded(spec, buffers))
 
     def run_python(self, sources):

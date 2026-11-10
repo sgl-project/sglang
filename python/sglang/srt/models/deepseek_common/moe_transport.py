@@ -228,10 +228,30 @@ class MoeRowTransport(ComputeTransport):
         if _use_cp and get_moe_a2a_backend().is_none():
             if self.cp_return_contiguous:
                 parallel = get_parallel()
-                hidden_states = parallel.tp_group.all_reduce(hidden_states)
-                hidden_states = hidden_states.tensor_split(parallel.attn_cp_size)[
-                    parallel.attn_cp_rank
-                ].contiguous()
+                cp_size = parallel.attn_cp_size
+                rows = hidden_states.shape[0]
+                if (
+                    hidden_states.is_cuda
+                    and not _is_hip
+                    and parallel.tp_size == cp_size
+                    and parallel.tp_group.world_size == cp_size
+                    and rows > 0
+                    and rows % cp_size == 0
+                ):
+                    # CP and TP rank order coincide when CP spans the whole TP
+                    # group. Return only this rank's reduced contiguous rows.
+                    local = hidden_states.new_empty(
+                        (rows // cp_size, *hidden_states.shape[1:])
+                    )
+                    parallel.tp_group.reduce_scatter_tensor(
+                        local, hidden_states.contiguous()
+                    )
+                    hidden_states = local
+                else:
+                    hidden_states = parallel.tp_group.all_reduce(hidden_states)
+                    hidden_states = hidden_states.tensor_split(cp_size)[
+                        parallel.attn_cp_rank
+                    ].contiguous()
             else:
                 hidden_states = attn_cp_interleave_reduce_scatter(hidden_states)
         elif _use_tp_moe_gather:

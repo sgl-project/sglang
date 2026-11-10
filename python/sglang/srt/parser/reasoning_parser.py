@@ -485,6 +485,40 @@ class Qwen3Detector(BaseReasoningFormatDetector):
         )
 
 
+class Ernie5_5ReasoningDetector(BaseReasoningFormatDetector):
+    """Reasoning of ERNIE 5.5 Flash: ``<ernie:think> ... </ernie:think>``.
+
+    A tool-call start inside the think block closes it implicitly.
+    """
+
+    def __init__(
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = False,
+        continue_final_message: bool = False,
+        previous_content: str = "",
+        force_nonempty_content: bool = False,
+    ):
+        super().__init__(
+            "<ernie:think>",
+            "</ernie:think>",
+            think_excluded_tokens=[
+                "<ernie:tool_call>",
+                "</ernie:tool_call>",
+                "<|ernie:im_end|>",
+                "<|ERNIE_MASK|>",
+            ],
+            force_reasoning=force_reasoning,
+            stream_reasoning=stream_reasoning,
+            tool_start_token="<ernie:tool_call>",
+            continue_final_message=continue_final_message,
+            previous_content=previous_content,
+            thinks_internally=True,
+            reasoning_default="enable_thinking",
+            force_nonempty_content=force_nonempty_content,
+        )
+
+
 class KimiDetector(BaseReasoningFormatDetector):
     """
     Detector for Kimi Thinking model.
@@ -1586,6 +1620,42 @@ class _PoolsideV1Detector(Qwen3Detector):
         self.reasoning_default = "explicit_enable_thinking"
 
 
+class Xing4_0Detector(Qwen3Detector):
+    """Detector for Xing4_0 models.
+
+    Xing4_0 reuses Qwen3's reasoning markers, injected into the prompt via
+    the template's ``enable_thinking`` parameter, and emits Qwen3-compatible
+    tool-call tokens, so Qwen3Detector's parsing rules apply unchanged.
+
+    When ``enable_thinking=True``:
+      The model generates reasoning content followed by the close marker and
+      then the answer.
+
+    When ``enable_thinking=False``:
+      The model generates the answer directly without any markers.
+
+    ``force_nonempty_content=True`` acts as a safety net: if the model omits
+    the close tag, the accumulated reasoning is reclassified as normal text
+    so the answer is never lost in the text field.
+    """
+
+    def __init__(
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = False,
+        continue_final_message: bool = False,
+        previous_content: str = "",
+        force_nonempty_content: bool = True,
+    ):
+        super().__init__(
+            stream_reasoning=stream_reasoning,
+            force_reasoning=force_reasoning,
+            continue_final_message=continue_final_message,
+            previous_content=previous_content,
+            force_nonempty_content=force_nonempty_content,
+        )
+
+
 class Apertus2509Detector(BaseReasoningFormatDetector):
     """
     Detector for Apertus 2509 models
@@ -2296,6 +2366,7 @@ class ReasoningParser:
         "poolside_v1": _PoolsideV1Detector,
         "qwen3": Qwen3Detector,
         "qwen3-thinking": Qwen3Detector,
+        "ernie55": Ernie5_5ReasoningDetector,
         "minimax": Qwen3Detector,
         "minimax-append-think": MiniMaxAppendThinkDetector,
         "minimax-m3": MiniMaxM3Detector,
@@ -2313,6 +2384,7 @@ class ReasoningParser:
         "flint": _FlintDetector,
         "cohere_command4": CohereCommand4Detector,
         "response_template": ResponseTemplateReasoningDetector,
+        "xing4_0": Xing4_0Detector,
     }
 
     def __init__(

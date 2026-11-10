@@ -1,0 +1,151 @@
+name: PR Test Stage (Diffusion)
+
+# One diffusion lane: run the `base-b-test-<runner_config>` suite on the runner
+# and with the install that scripts/ci/runner_configs.yml gives runner_config.
+# Called by pr-test-multimodal-gen.yml, which owns the per-lane gating.
+
+on:
+  workflow_call:
+    inputs:
+      runner_config:
+        description: 'Key in scripts/ci/runner_configs.yml; the suite run is base-b-test-<runner_config>. Also names the lane in artifact names.'
+        required: true
+        type: string
+      caller_inputs:
+        description: 'toJson(inputs) from pr-test-multimodal-gen.yml. Read via fromJson(...).runs_on_map / sgl_kernel / continue_on_error / git_ref / skip_pr_test_health_check.'
+        required: true
+        type: string
+      job_timeout_minutes:
+        description: 'Timeout of the whole job, covering install, pre-suite commands, and the suite.'
+        required: true
+        type: number
+      run_timeout_minutes:
+        description: 'Timeout of the suite step, also the per-file timeout.'
+        required: true
+        type: number
+      partition_plan:
+        description: 'Plan JSON from compute_diffusion_partitions.py; one job per partitions[].part. Empty runs one unpartitioned job.'
+        required: false
+        type: string
+        default: ''
+      pre_suite_commands:
+        description: 'Commands run from the repo root after install, before the suite.'
+        required: false
+        type: string
+        default: ''
+      pre_suite_timeout_minutes:
+        description: 'Timeout of the pre-suite commands step.'
+        required: false
+        type: number
+        default: 10
+      retry_deadline_seconds:
+        description: 'Seconds from job start after which diffusion case retries stop; 0 for none.'
+        required: false
+        type: number
+        default: 0
+
+# Workflow-level env is NOT inherited from the caller in reusable workflows.
+env:
+  SGLANG_IS_IN_CI: true
+  NCCL_NVLS_ENABLE: "0"
+  SGLANG_CUDA_COREDUMP: "1"
+  PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
+  SKIP_PR_TEST_HEALTH_CHECK: ${{ fromJson(inputs.caller_inputs).skip_pr_test_health_check == 'true' }}
+
+jobs:
+  run:
+    name: ${{ inputs.runner_config }} (${{ matrix.part }})
+    runs-on: ${{ fromJson(fromJson(inputs.caller_inputs).runs_on_map)[inputs.runner_config] }}
+    timeout-minutes: ${{ inputs.job_timeout_minutes }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # One job per plan part; an unpartitioned lane runs as a single part 0.
+        part: ${{ fromJson(inputs.partition_plan || '{"partitions":[{"part":0}]}').partitions.*.part }}
+    steps:
+      - name: Record retry deadline
+        if: inputs.retry_deadline_seconds > 0
+        run: echo "SGLANG_DIFFUSION_RETRY_DEADLINE=$(( $(date +%s) + ${{ inputs.retry_deadline_seconds }} ))" >> "$GITHUB_ENV"
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ fromJson(inputs.caller_inputs).git_ref || github.sha }}
+
+      - name: Resolve runner_config
+        id: rc
+        run: python3 scripts/ci/runner_configs.py '${{ inputs.runner_config }}' >> "$GITHUB_OUTPUT"
+
+      - uses: ./.github/actions/check-pr-test-health
+
+      - uses: ./.github/actions/check-maintenance
+
+      - name: Download artifacts (v4)
+        if: fromJson(inputs.caller_inputs).sgl_kernel == 'true' && steps.rc.outputs.artifact_version == 'v4'
+        uses: actions/download-artifact@v4
+        with:
+          path: python/sglang/kernels/aot/dist/
+          merge-multiple: true
+          pattern: wheel-python3.11-cuda*
+
+      - name: Download artifacts (v6)
+        if: fromJson(inputs.caller_inputs).sgl_kernel == 'true' && steps.rc.outputs.artifact_version == 'v6'
+        uses: actions/download-artifact@v6
+        with:
+          path: python/sglang/kernels/aot/dist/
+          merge-multiple: true
+          pattern: wheel-python3.11-cuda*
+
+      - name: Install dependencies
+        timeout-minutes: ${{ fromJson(steps.rc.outputs.install_timeout) }}
+        run: |
+          CUSTOM_BUILD_SGL_KERNEL=${{ fromJson(inputs.caller_inputs).sgl_kernel }} bash ${{ steps.rc.outputs.install }}
+
+      - name: Run pre-suite commands
+        if: inputs.pre_suite_commands != ''
+        timeout-minutes: ${{ inputs.pre_suite_timeout_minutes }}
+        run: ${{ inputs.pre_suite_commands }}
+
+      - name: Run diffusion suite
+        timeout-minutes: ${{ inputs.run_timeout_minutes }}
+        env:
+          HF_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN || secrets.HF_TOKEN }}
+          HUGGING_FACE_HUB_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN || secrets.HF_TOKEN }}
+          RUNAI_STREAMER_MEMORY_LIMIT: 0
+          DIFFUSION_CONTINUE_ON_ERROR: ${{ fromJson(inputs.caller_inputs).continue_on_error }}
+          # Empty when unpartitioned, so diffusion_suite_bridge.py omits the flags;
+          # format() keeps part 0 from reading as false.
+          DIFFUSION_PARTITION_ID: ${{ inputs.partition_plan != '' && format('{0}', matrix.part) || '' }}
+          DIFFUSION_TOTAL_PARTITIONS: ${{ inputs.partition_plan != '' && format('{0}', fromJson(inputs.partition_plan).partition_count) || '' }}
+          DIFFUSION_PARTITION_PLAN_JSON: ${{ inputs.partition_plan }}
+          SGLANG_DIFFUSION_ARTIFACT_DIR: ${{ github.workspace }}/diffusion-failures
+        run: |
+          python3 test/run_suite.py \
+            --hw cuda \
+            --suite base-b-test-${{ inputs.runner_config }} \
+            --timeout-per-file $(( ${{ inputs.run_timeout_minutes }} * 60 ))
+
+      - name: Upload execution report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diffusion-report-${{ inputs.runner_config }}-${{ matrix.part }}-${{ github.run_attempt }}
+          path: |
+            python/sglang/multimodal_gen/test/execution_report_*.json
+            python/diffusion-results.json
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Upload diffusion failure artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diffusion-failures-${{ inputs.runner_config }}-${{ matrix.part }}-${{ github.run_attempt }}
+          path: diffusion-failures/
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - uses: ./.github/actions/upload-cuda-coredumps
+        if: failure()
+        with:
+          artifact-suffix: ${{ inputs.runner_config }}-${{ matrix.part }}

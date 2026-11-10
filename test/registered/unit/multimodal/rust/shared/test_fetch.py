@@ -2,7 +2,7 @@
 
 Covers ``fetch_bytes`` in ``rust/sglang-mm/src/common/fetch.rs`` (via the
 ``_core.common.fetch_bytes`` binding), against the Python reference
-``sglang.srt.utils.common.get_image_bytes``.
+``sglang.srt.multimodal.media_io.get_image_bytes``.
 """
 
 import base64
@@ -13,7 +13,7 @@ import threading
 import unittest
 from pathlib import Path
 
-from sglang.srt.utils.common import get_image_bytes
+from sglang.srt.multimodal.media_io import get_image_bytes
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 

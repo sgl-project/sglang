@@ -23,6 +23,10 @@ def start_cpu_monitor_thread(component: str, interval: float = 5.0) -> threading
             delta = (curr_times.user - last_times.user) + (
                 curr_times.system - last_times.system
             )
+            if delta < 0:
+                # CRIU restore restarts the process CPU clock near zero. Its
+                # current reading is CPU time since restore, not a decrement.
+                delta = curr_times.user + curr_times.system
             cpu_seconds_total.labels(component=component).inc(delta)
             last_times = curr_times
 

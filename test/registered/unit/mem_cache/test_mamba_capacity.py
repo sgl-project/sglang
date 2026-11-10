@@ -7,6 +7,10 @@ from sglang.srt.disaggregation.decode import (
     DecodeReqToTokenPool,
     HybridMambaDecodeReqToTokenPool,
 )
+from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
+    ListKind,
+)
 from sglang.srt.mem_cache.allocation import alloc_req_slots, ensure_mamba_capacity
 from sglang.srt.mem_cache.allocation_sizing import get_mamba_tracking_slots
 from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
@@ -14,6 +18,7 @@ from sglang.srt.mem_cache.kv.state_storage import StateStorage
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.mem_cache.static_kv_storage import StaticKVStorage
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_test_utils import FakeReq, decode_queue
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -157,9 +162,10 @@ class TestMambaCapacity(unittest.TestCase):
                 )
                 self.assertGreaterEqual(pool.mamba_allocator.available_size(), 3)
                 if expected_eviction:
+                    # The cache is asked for the whole demand, not the shortfall.
                     self.assertEqual(
-                        cache.evict_for_alloc.call_args.args[0].mamba_num,
-                        expected_eviction,
+                        cache.evict_for_alloc.call_args.args[0].state_slots,
+                        free + expected_eviction,
                     )
                 else:
                     cache.evict_for_alloc.assert_not_called()
@@ -180,7 +186,7 @@ class TestMambaCapacity(unittest.TestCase):
         cache = make_cache(pool, held, 1)
         reqs = [make_req(), make_req(holds_mamba=True, has_buffer=True)]
         self.assertTrue(ensure_mamba_capacity(pool, pool.state, reqs, cache))
-        self.assertEqual(cache.evict_for_alloc.call_args.args[0].mamba_num, 1)
+        self.assertEqual(cache.evict_for_alloc.call_args.args[0].state_slots, 3)
 
         for holds_mamba, has_buffer, free, release, expected_eviction in [
             (True, False, 1, 1, 1),
@@ -193,9 +199,10 @@ class TestMambaCapacity(unittest.TestCase):
                 req = make_req(holds_mamba=holds_mamba, has_buffer=has_buffer)
                 self.assertTrue(ensure_mamba_capacity(pool, pool.state, [req], cache))
                 if expected_eviction:
+                    # The cache is asked for the whole demand, not the shortfall.
                     self.assertEqual(
-                        cache.evict_for_alloc.call_args.args[0].mamba_num,
-                        expected_eviction,
+                        cache.evict_for_alloc.call_args.args[0].state_slots,
+                        free + expected_eviction,
                     )
                 else:
                     cache.evict_for_alloc.assert_not_called()
@@ -204,12 +211,12 @@ class TestMambaCapacity(unittest.TestCase):
         pool, held = make_pool(1, lazy=True)
         cache = make_cache(pool, held, 1)
         self.assertTrue(ensure_mamba_capacity(pool, pool.state, [make_req()], cache))
-        self.assertEqual(cache.evict_for_alloc.call_args.args[0].mamba_num, 1)
+        self.assertEqual(cache.evict_for_alloc.call_args.args[0].state_slots, 2)
 
         pool, held = make_pool(1, track_buffer_size=1)
         cache = make_cache(pool, held, 1)
         self.assertTrue(ensure_mamba_capacity(pool, pool.state, [make_req()], cache))
-        self.assertEqual(cache.evict_for_alloc.call_args.args[0].mamba_num, 1)
+        self.assertEqual(cache.evict_for_alloc.call_args.args[0].state_slots, 2)
 
         pool, held = make_pool(1, extra_buffer=False)
         cache = make_cache(pool, held, 0)
@@ -226,7 +233,7 @@ class TestMambaCapacity(unittest.TestCase):
     def test_pd_preallocation_leaves_blocked_request_queued(self):
         pool, held = make_pool(1)
         cache = make_cache(pool, held, 0)
-        req = SimpleNamespace(
+        req = FakeReq(
             rid="blocked",
             origin_input_ids=[1],
             output_ids=[],
@@ -239,9 +246,10 @@ class TestMambaCapacity(unittest.TestCase):
         )
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
         queue.pp_size = 1
-        queue.queue = [decode_req]
+        queue.queue = decode_queue(ListKind.PD_PREALLOC, [decode_req])
         queue.pending_reqs = []
-        queue.retracted_queue = [req]
+        queue.retracted_queue = IndexedReqList(ListKind.PD_RETRACTED)
+        queue.retracted_queue.join([req])
         queue.req_to_token_pool = pool
         queue.token_to_kv_pool_allocator = SimpleNamespace(state=pool.state)
         queue.req_to_metadata_buffer_idx_allocator = SimpleNamespace(
@@ -270,16 +278,14 @@ class TestMambaCapacity(unittest.TestCase):
             ),
         ):
             self.assertEqual(queue.pop_preallocated(), ([], []))
-        self.assertEqual(queue.queue, [decode_req])
+        self.assertEqual(list(queue.queue.items()), [decode_req])
         queue._match_prefix_and_lock.assert_not_called()
         queue._pre_alloc.assert_not_called()
         self.assertIsNone(req.kv.req_pool_idx)
 
-        queue._prealloc_required_tokens = MagicMock(return_value=(1, 0))
-        queue._prealloc_reservation_fits = MagicMock(return_value=True)
-        queue.token_to_kv_pool_allocator = SimpleNamespace(
-            state=pool.state, prealloc_fits_assumes_reclaim=lambda: False
-        )
+        queue._prealloc_required = MagicMock(return_value=(1, {}))
+        queue._admit_preallocation = MagicMock(return_value=True)
+        queue.token_to_kv_pool_allocator = SimpleNamespace(state=pool.state)
         with patch(
             "sglang.srt.disaggregation.decode.get_disagg",
             return_value=SimpleNamespace(
@@ -287,7 +293,7 @@ class TestMambaCapacity(unittest.TestCase):
             ),
         ):
             self.assertEqual(queue.resume_retracted_reqs(), [])
-        self.assertEqual(queue.retracted_queue, [req])
+        self.assertEqual(list(queue.retracted_queue), [req])
         self.assertTrue(req.is_retracted)
         queue._pre_alloc.assert_not_called()
 

@@ -43,6 +43,14 @@ register_kernel(
 )
 register_kernel(
     KernelSpec(
+        op="memory.gpu_tensor_blake3",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.memory.gpu_tensor_hash_blake3:gpu_tensor_blake3",
+        capabilities=CUDA_ONLY,
+    )
+)
+register_kernel(
+    KernelSpec(
         op="memory.memcpy_triton",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.memory.memcpy_triton:memcpy_triton",
@@ -51,6 +59,15 @@ register_kernel(
 
 
 # Public entry points inventoried by logical operator group (RFC #29630).
+register_kernel(
+    KernelSpec(
+        op="memory.gpu_tensors_blake3",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.memory.gpu_tensor_hash_blake3:gpu_tensors_blake3",
+        capabilities=CUDA_ONLY,
+    )
+)
+
 register_kernel(
     KernelSpec(
         op="memory.adler32_strided_checksum",
@@ -63,7 +80,7 @@ register_kernel(
     KernelSpec(
         op="memory.small_field_copy",
         backend=KernelBackend.JIT,
-        target="sglang.kernels.ops.memory.small_field_copy:small_field_copy",
+        target="sglang.kernels.ops.memory.small_field_copy:SmallFieldCopyPlan",
         capabilities=CUDA_ONLY,
     )
 )
@@ -73,5 +90,13 @@ register_kernel(
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.memory.row_compact:row_compact_bf16",
         capabilities=CUDA_ONLY,
+    )
+)
+
+register_kernel(
+    KernelSpec(
+        op="memory.interleave_rows",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.memory.interleave_rows:interleave_rows",
     )
 )

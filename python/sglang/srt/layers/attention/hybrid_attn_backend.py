@@ -10,7 +10,8 @@ from sglang.srt.layers.attention.base_attn_backend import (
 )
 from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import BaseIndexerMetadata
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import (
     get_exec,
@@ -18,6 +19,7 @@ from sglang.srt.runtime_context import (
 )
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.attention.graph_variants import AttentionGraphVariants
     from sglang.srt.layers.attention.verify_mask import VerifyMask
     from sglang.srt.speculative.spec_info import SpecInput
 
@@ -52,6 +54,9 @@ class HybridAttnBackend(AttentionBackend):
         self.extend_dummy_seqs_capped_by_req_pool = getattr(
             prefill_backend, "extend_dummy_seqs_capped_by_req_pool", False
         )
+
+    def window_capacity_children(self) -> list:
+        return [self.prefill_backend, self.decode_backend]
 
     @property
     def supports_ragged_verify_graph(self) -> bool:
@@ -88,13 +93,18 @@ class HybridAttnBackend(AttentionBackend):
     def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
         return self._select_backend(fm).shared_read_ends(fm)
 
+    def get_decode_graph_variants(
+        self, capture_forward_mode: ForwardMode, captured_req_width: int
+    ) -> Optional[AttentionGraphVariants]:
+        return self._select_backend(capture_forward_mode).get_decode_graph_variants(
+            capture_forward_mode, captured_req_width
+        )
+
     def _snapshot_prefill_shared_reads(
-        self, forward_batch: ForwardBatch, *, num_qo_tokens: int
+        self, forward_batch: ForwardBatch
     ) -> SharedReadEnds:
         backend = self._select_backend(forward_batch.forward_mode)
-        return backend._snapshot_prefill_shared_reads(
-            forward_batch, num_qo_tokens=num_qo_tokens
-        )
+        return backend._snapshot_prefill_shared_reads(forward_batch)
 
     def get_fused_kv_write_buffers(self, layer, forward_batch):
         return self._select_backend(

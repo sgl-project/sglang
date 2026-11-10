@@ -1,14 +1,12 @@
-"""K3 column-parallel up_proj + multicast all-gather + add3 (bf16, TP8).
+"""K3 column-parallel up_proj + multicast all-gather + add3 (bf16, TP2/4/8).
 
-One entry point over ``csrc/kimi_k3/comm/gemm_ag.cuh``: for the latent MoE
-up_proj ([M, 3584] x [3584, 7168]) at small decode M, every rank computes
-only its 896-column slice of the replicated GEMM (the C++ side slices the
-full weight itself), multicast-stores it into the CustomAllReduceV2 push
-workspace (one more user of its double-buffer phase protocol), and a
-Lamport-spin consumer assembles ``out = up_proj(x) + b (+ c)`` — reading
-1/8 of the weight bytes per rank instead of all of them. Needs
-:func:`sglang.kernels.ops.communication.all_reduce_residual.register_comm` once beforehand
-(the same registration the push all-reduce uses).
+Each rank produces its ``7168 / world``-column slice of the latent MoE up_proj
+([M, 3584] x [3584, 7168]) and multicast-stores it into the CustomAllReduceV2
+push workspace, where a Lamport-spin consumer assembles
+``out = up_proj(x) + b (+ c)``. :func:`gemm_ag_up_proj` fuses a GEMV producer;
+:func:`gather_add3` takes a slice the caller computed. Needs
+:func:`sglang.kernels.ops.communication.all_reduce_residual.register_comm` once
+beforehand (the same registration the push all-reduce uses).
 """
 
 from __future__ import annotations
@@ -34,21 +32,23 @@ if TYPE_CHECKING:
 K = 3584
 N = 7168
 
-# Largest decode batch the kernel wins at (crossover vs the replicated
-# cublas GEMM + add3 tail is ~13-14 tokens on B200x8); also the GEMV
-# function-table size.
-MAX_TOKENS = 12
+WORLD_SIZES = (2, 4, 8)
+
+# Largest decode batch the fused GEMV producer serves (crossover vs the
+# replicated cublas GEMM + add3 tail is ~13-14 tokens on B200x8); also the
+# GEMV function-table size.
+GEMV_MAX_TOKENS = 12
 
 
 @cache_once
-def _jit_module() -> Module:
-    args = make_cpp_args(K, N, MAX_TOKENS, is_arch_support_pdl())
+def _jit_module(world_size: int) -> Module:
+    args = make_cpp_args(K, N, world_size, GEMV_MAX_TOKENS, is_arch_support_pdl())
     cls = f"GEMMAGKernel<{args}>"
     return load_jit(
         "kimi_k3_gemm_ag",
         *args,
         cuda_files=["kimi_k3/comm/gemm_ag.cuh"],
-        cuda_wrappers=[("run", f"{cls}::run")],
+        cuda_wrappers=[("run", f"{cls}::run"), ("gather", f"{cls}::gather")],
         extra_cuda_cflags=["-O3"],
     )
 
@@ -62,7 +62,18 @@ def _gemm_ag_op(
     c: Optional[torch.Tensor],
     out: torch.Tensor,
 ) -> None:
-    _jit_module().run(_COMM_MAP[world_size], x, weight, b, c, out)
+    _jit_module(world_size).run(_COMM_MAP[world_size], x, weight, b, c, out)
+
+
+@register_custom_op(mutates_args=["out"])
+def _gather_add3_op(
+    world_size: int,
+    local: torch.Tensor,
+    b: torch.Tensor,
+    c: Optional[torch.Tensor],
+    out: torch.Tensor,
+) -> None:
+    _jit_module(world_size).gather(_COMM_MAP[world_size], local, b, c, out)
 
 
 def gemm_ag_up_proj(
@@ -75,9 +86,27 @@ def gemm_ag_up_proj(
 ) -> torch.Tensor:
     """``out = x @ weight.T (allgathered) + b (+ c)``, all bf16.
 
-    ``x`` is [M, 3584] with M in [1, MAX_TOKENS]; ``weight`` is the FULL
+    ``x`` is [M, 3584] with M in [1, GEMV_MAX_TOKENS]; ``weight`` is the FULL
     replicated [7168, 3584] up_proj weight (each rank reads only its own
     row block); ``b`` / ``c`` / ``out`` are [M, 7168] (``out`` is
     output-only)."""
     _gemm_ag_op(world_size, x, weight, b, c, out)
+    return out
+
+
+def gather_add3(
+    world_size: int,
+    local: torch.Tensor,
+    b: torch.Tensor,
+    c: Optional[torch.Tensor],
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """``out = allgather(local) + b (+ c)``, all bf16.
+
+    ``local`` is this rank's contiguous [M, 7168 / world] column slice of
+    ``x @ weight.T`` (rank r holds columns ``[r * 7168 / world, (r + 1) *
+    7168 / world)``); ``b`` / ``c`` / ``out`` are [M, 7168] (``out`` is
+    output-only). The add order matches :func:`gemm_ag_up_proj` and the
+    replicated ``bf16(up_proj + b) + c`` tail."""
+    _gather_add3_op(world_size, local, b, c, out)
     return out

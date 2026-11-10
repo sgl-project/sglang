@@ -1,4 +1,5 @@
 import logging
+import math
 from array import array
 from contextlib import nullcontext
 from typing import Iterable, List, Optional, Tuple, Union
@@ -7,6 +8,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from sglang.kernels.ops.attention import kda_fused_decode
 from sglang.kernels.ops.attention.fla.fused_norm_gate import FusedRMSNormGated
 from sglang.kernels.ops.layernorm.mhc import hc_contract
 from sglang.kernels.ops.layernorm.mhc import hc_post as _hc_post_fn
@@ -60,7 +62,8 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
-from sglang.srt.layers.utils.common import PPMissingLayer
+from sglang.srt.layers.utils.common import PPMissingLayer, add_prefix, set_weight_attrs
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -71,7 +74,7 @@ from sglang.srt.managers.mm_utils import (
     pad_mm_tokens,
     prepare_mm_inputs,
 )
-from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -109,7 +112,7 @@ from sglang.srt.models.glm_ocr import (
     GlmOcrVisionPatchEmbed,
     GlmOcrVisionPatchMerger,
 )
-from sglang.srt.models.utils import WeightsMapper
+from sglang.srt.models.utils import WeightsMapper, bind_or_assign
 from sglang.srt.multimodal.mm_utils import (
     run_dp_presharded_mrope_vision_model,
     run_dp_sharded_mrope_vision_model,
@@ -123,14 +126,8 @@ from sglang.srt.runtime_context import (
     linear_attn_tp_size,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.utils.common import (
-    BumpAllocator,
-    LazyValue,
-    add_prefix,
-    log_info_on_rank0,
-    make_pp_layers,
-    set_weight_attrs,
-)
+from sglang.srt.utils.common import BumpAllocator, LazyValue
+from sglang.srt.utils.log_utils import log_info_on_rank0
 
 if _use_aiter_gfx95:
     from sglang.srt.layers.rocm_linear_utils import (
@@ -147,6 +144,11 @@ _MHC_POST_MULT_VALUE = 2.0
 # hidden_size=4096 the fusion wins to 16 tokens and reaches parity at 24, with
 # 17-23 unmeasured. Past it the pre-norm GEMM drops mhc_pre's split-K kernel.
 _MHC_FUSED_BOUNDARY_MAX_TOKENS = 16
+
+# Measured at 8 and 16 KDA heads per rank: on H200 the fused decode kernel wins
+# below this many (token, head) blocks and the unfused packed chain streams the
+# fp32 state faster from here on; on B200 the fused kernel wins up to 256 tokens.
+_KDA_FUSED_DECODE_MAX_BLOCKS_SM90 = 2048
 
 
 @torch.compile
@@ -593,6 +595,62 @@ class Glm5NextLinearAttention(nn.Module):
         )
 
         self.attn.lower_bound = config.linear_attn_config.get("gate_lower_bound", None)
+        # Set by _prepare_fused_decode() once weights are loaded: decode batches
+        # below the cap offer the fused KDA kernel, 0 keeps the unfused chain.
+        self.attn._k3_fused_decode_args = None
+        self._kda_fused_decode_max_tokens = 0
+        self._direct_weight_update_error = None
+
+    def _prepare_fused_decode(self) -> None:
+        """Static inputs of the fused KDA decode kernel, stashed on the attention
+        layer for the KDA backend: per-segment transposed fp32 conv weights, dense
+        conv bias and fp32 output-norm weight. Rebuilt in place on later weight
+        loads, since captured CUDA graphs hold these buffers."""
+        layer = self.attn
+        seg = self.local_num_heads * self.head_dim
+        if (
+            not _is_cuda
+            # The kernel stages the state with TMA (a trap below SM90) and was
+            # measured on Hopper and datacenter Blackwell only.
+            or _device_sm // 10 not in (9, 10)
+            or self.local_num_heads not in kda_fused_decode.SUPPORTED_HEADS
+            or self.head_dim != 128
+            or self.conv_size != 4
+            or layer.lower_bound is None
+            or layer.conv_weights.dtype != torch.float32
+        ):
+            return
+        wt = layer.conv_weights.t()  # [4, 3 * seg]
+        conv_bias = (
+            layer.bias.float()
+            if layer.bias is not None
+            else torch.zeros(3 * seg, dtype=torch.float32, device=wt.device)
+        )
+        fresh = (
+            wt[:, :seg].contiguous(),
+            wt[:, seg : 2 * seg].contiguous(),
+            wt[:, 2 * seg :].contiguous(),
+            conv_bias.contiguous(),
+            layer.A_log.detach().reshape(-1),
+            self.o_norm.weight.data.float().contiguous(),
+        )
+        old = layer._k3_fused_decode_args
+        layer._k3_fused_decode_args = (
+            *(
+                bind_or_assign(None if old is None else old[i], t)
+                for i, t in enumerate(fresh)
+            ),
+            float(self.o_norm.eps),
+        )
+        self._kda_fused_decode_max_tokens = (
+            _KDA_FUSED_DECODE_MAX_BLOCKS_SM90 // self.local_num_heads
+            if _device_sm // 10 == 9
+            else math.inf
+        )
+        self._direct_weight_update_error = (
+            "load_format='direct' does not refresh the GLM-5.3-Flash fused KDA "
+            "decode buffers; update weights with the default load format."
+        )
 
     def forward_qkvbfg(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch):
         qkv, _ = self.qkv_proj(hidden_states)
@@ -663,6 +721,17 @@ class Glm5NextLinearAttention(nn.Module):
             forget_gate = forget_gate.unsqueeze(0)
         beta = beta.unsqueeze(0)
 
+        # Offer the output-norm gate to the fused decode kernel (the same
+        # attempt-and-verify handoff as Kimi-K3); an unconsumed stash means the
+        # backend ran the unfused chain and o_norm is applied here.
+        fused_onorm = (
+            forward_batch.forward_mode.is_decode()
+            and mixed_qkv.shape[0] < self._kda_fused_decode_max_tokens
+        )
+        if fused_onorm:
+            self.attn._k3_onorm_gate = g_proj_states
+            self.attn._k3_onorm_consumed = False
+
         core_attn_out = self.attn(
             forward_batch,
             mixed_qkv=mixed_qkv,
@@ -670,8 +739,12 @@ class Glm5NextLinearAttention(nn.Module):
             b=beta,
         )
 
-        norm_gate = g_proj_states.unflatten(-1, (-1, self.head_dim))
-        core_attn_out = self.o_norm(core_attn_out, norm_gate)
+        if fused_onorm:
+            self.attn._k3_onorm_gate = None
+            fused_onorm = self.attn._k3_onorm_consumed
+        if not fused_onorm:
+            norm_gate = g_proj_states.unflatten(-1, (-1, self.head_dim))
+            core_attn_out = self.o_norm(core_attn_out, norm_gate)
         core_attn_out = core_attn_out.squeeze(0).flatten(-2)
 
         return cp_sequence_to_interleave_order(
@@ -1916,6 +1989,10 @@ class Glm5NextForConditionalGeneration(nn.Module):
                     )
                     weight_loader(param, loaded_weight)
 
+        # Weight-loading unit tests run this unbound on a stand-in with no decoder stack.
+        if not is_nextn and isinstance(self, Glm5NextForConditionalGeneration):
+            self._prepare_fused_decode_layers()
+
         if getattr(self, "encoder_only", False):
             run_post = False
         elif is_nextn:
@@ -1934,6 +2011,19 @@ class Glm5NextForConditionalGeneration(nn.Module):
         DeepseekV2WeightLoaderMixin.post_load_weights(
             self, is_nextn=is_nextn, weight_names=weight_names
         )
+        # Loaders that skip load_weights (dummy, sharded state, remote instance)
+        # call only this.
+        if not is_nextn:
+            self._prepare_fused_decode_layers()
+
+    def _prepare_fused_decode_layers(self) -> None:
+        if self.model is None:
+            return
+        for layer in self.model.layers:
+            if not isinstance(layer, PPMissingLayer) and isinstance(
+                layer.self_attn, Glm5NextLinearAttention
+            ):
+                layer.self_attn._prepare_fused_decode()
 
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
         if self.model is None:

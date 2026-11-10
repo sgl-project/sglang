@@ -1,18 +1,16 @@
 """gfx950 one-launch Qwen3.5 MoE router for 1..8 tokens: gate GEMV (routed logits rounded to bf16, as today) +
 softmax top-10 + renormalize + fused shared-expert slot, written as the [M, 11] int32 ids / fp32 weights that
-smallm_moe_gfx950 consumes. SGLANG_ROCM_SMALLM_ROUTER=0 disables it; a build/load failure disables it too."""
+smallm_moe_gfx950 consumes. A build/load failure disables it."""
 
 import ctypes
 import logging
 import os
 import subprocess
-import tempfile
 
 import torch
 
-from sglang.kernels.jit.utils.hipcc import HipKernel, check_hip, hip_lib, hipcc_path
-from sglang.srt.environ import envs
-from sglang.srt.utils import is_gfx95_supported
+from sglang.kernels.arch import current_arch
+from sglang.kernels.jit.utils.hipcc import HipKernel, build_gfx950_module
 
 _SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "smallm_router.hip")
 MAX_TOK = 8  # MAX_TOK in smallm_router.hip; from 9 tokens the unfused path is faster
@@ -35,10 +33,11 @@ class Args(ctypes.Structure):
 
 
 def smallm_router_supported(x: torch.Tensor) -> bool:
+    hip = current_arch().hip
     return (
         not _disabled
-        and envs.SGLANG_ROCM_SMALLM_ROUTER.get()
-        and is_gfx95_supported()
+        and hip is not None
+        and hip.gcn_arch == "gfx950"
         and 1 <= x.shape[0] <= MAX_TOK
         and x.dtype == torch.bfloat16
         and x.shape[1] == 4096
@@ -61,12 +60,8 @@ def smallm_router(x, gate_weight, shared_gate_weight, scale=1.0):
             torch.zeros(64 * 17, dtype=torch.int32, device=x.device),
         )
     if not _kernels:
-        co = os.path.join(tempfile.mkdtemp(prefix="sglang_smallm_router_"), "r.co")
-        cmd = [hipcc_path(), "--genco", "--offload-arch=gfx950", "-O3", "-o", co, _SRC]
         try:
-            subprocess.run(cmd, check=True, capture_output=True)
-            mod = ctypes.c_void_p()
-            check_hip(hip_lib().hipModuleLoad(ctypes.byref(mod), co.encode()), "load")
+            mod = build_gfx950_module(_SRC, "sglang_smallm_router_")
             _kernels.update({r: HipKernel(mod, f"smallm_router_r{r}") for r in (1, 2)})
         except (OSError, subprocess.CalledProcessError, RuntimeError) as e:
             logger.warning("smallm_router disabled: %s", e)
@@ -81,54 +76,3 @@ def smallm_router(x, gate_weight, shared_gate_weight, scale=1.0):
     stream = torch.cuda.current_stream().cuda_stream
     _kernels[rows].launch(512 // rows + 1, args, stream)
     return wts, ids
-
-
-def qwen_moe_topk_output(block, hidden_states):
-    """StandardTopKOutput for Qwen2MoeSparseMoeBlock with fused shared expert, or None (unfused path)."""
-    from sglang.srt.eplb.expert_distribution import (
-        get_global_expert_distribution_recorder,
-    )
-    from sglang.srt.layers.moe import get_moe_runner_backend
-    from sglang.srt.layers.moe.topk import (
-        StandardTopKOutput,
-        capture_routed_experts_if_allowed,
-        is_expert_remapping_enabled,
-    )
-    from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph.context_manager import (
-        is_in_tc_piecewise_cuda_graph,
-    )
-    from sglang.srt.runtime_context import get_parallel
-
-    gw, sw = block.gate.weight, block.shared_expert_gate.weight
-    ok = getattr(block, "_smallm_router_ok", None)
-    if ok is None:
-        cfg, backend = block.topk.topk_config, get_moe_runner_backend()
-        ok = block._smallm_router_ok = (
-            block.num_fused_shared_experts == 1
-            and get_parallel().moe_ep_size == 1
-            and (backend.is_auto() or backend.is_aiter())
-            and cfg.top_k == 10
-            and cfg.renormalize
-            and type(gw.data) is torch.Tensor
-            and gw.dtype == sw.dtype == torch.bfloat16
-            and gw.shape == (512, 4096)
-            and sw.shape == (1, 4096)
-            and gw.is_contiguous()
-            and sw.is_contiguous()
-            and not envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
-            and not envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
-            and not is_expert_remapping_enabled()
-        )
-    if (
-        not ok
-        or not smallm_router_supported(hidden_states)
-        or is_in_tc_piecewise_cuda_graph()
-    ):
-        return None
-    out = smallm_router(hidden_states, gw, sw, block._shared_expert_scale())
-    if out is None:
-        return None
-    routed = out[1][:, :10]
-    capture_routed_experts_if_allowed(block.topk.topk_config, block.layer_id, routed)
-    get_global_expert_distribution_recorder().on_select_experts(topk_ids=routed)
-    return StandardTopKOutput(out[0], out[1], None)

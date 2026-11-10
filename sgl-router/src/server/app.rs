@@ -155,6 +155,9 @@ async fn access_log_and_record(
                 .unwrap_or(""),
             model = log_ctx.map(|c| c.model_id.as_str()).unwrap_or(""),
             stream = log_ctx.is_some_and(|c| c.streaming),
+            images = log_ctx.map_or(0, |c| c.media.images),
+            videos = log_ctx.map_or(0, |c| c.media.videos),
+            audios = log_ctx.map_or(0, |c| c.media.audios),
             latency_ms,
             "http_request",
         );
@@ -303,7 +306,7 @@ pub fn build_router(ctx: Arc<AppContext>) -> Router {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server::metrics::RequestOutcome;
+    use crate::server::metrics::{MediaCounts, RequestOutcome};
     use axum::body::Body;
     use axum::http::Request;
     use std::sync::Mutex;
@@ -504,6 +507,11 @@ mod tests {
                         streaming: false,
                         outcome: RequestOutcome::Cancelled,
                         engine_rid: Some("1f0c2b7a4e9d4f3ab6c5d8e7f0a1b2c3".into()),
+                        media: MediaCounts {
+                            images: 2,
+                            videos: 0,
+                            audios: 1,
+                        },
                     });
                     resp
                 }),
@@ -530,6 +538,10 @@ mod tests {
             logs.contains("engine_rid=\"1f0c2b7a4e9d4f3ab6c5d8e7f0a1b2c3\"")
                 && logs.contains("request_id="),
             "the minted rid must be logged beside the caller's request id; captured:\n{logs}",
+        );
+        assert!(
+            logs.contains("images=2") && logs.contains("videos=0") && logs.contains("audios=1"),
+            "a routed request must be logged with its media counts; captured:\n{logs}",
         );
         // The handler's outcome must win over the status-derived fallback —
         // otherwise the log and `worker_requests_total` can disagree about a

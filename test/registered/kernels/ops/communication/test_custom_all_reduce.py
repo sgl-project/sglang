@@ -227,7 +227,8 @@ def _check_custom_all_reduce(
         graph_inp = torch.zeros((TEST_LAYERS, size), dtype=dtype, device=device)
         outs: list[torch.Tensor] = []
         with comm.capture():
-            with torch.cuda.graph(graph):
+            # the reference NCCL group's watchdog thread queries events meanwhile
+            with torch.cuda.graph(graph, capture_error_mode="thread_local"):
                 for i in range(TEST_LAYERS):
                     outs.append(comm.custom_all_reduce(graph_inp[i]))
                 out_jit_stack = torch.stack(outs)

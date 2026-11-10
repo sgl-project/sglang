@@ -278,6 +278,7 @@ class _Block(nn.Module):
             if model_parallel_is_initialized() and get_sp_world_size() > 1
             else LocalAttention
         )
+        # No pinned default: sm_10x then gets the platform's dynamic cuDNN SDPA.
         self.attention = attention_cls(
             num_heads=heads,
             head_size=dim // heads,
@@ -285,7 +286,6 @@ class _Block(nn.Module):
                 AttentionBackendEnum.FA,
                 AttentionBackendEnum.TORCH_SDPA,
             },
-            default_attention_backend=AttentionBackendEnum.FA,
             compute_dtype=torch.bfloat16,
         )
         self.norm1, self.norm2 = _RMSNorm(dim), _RMSNorm(dim)

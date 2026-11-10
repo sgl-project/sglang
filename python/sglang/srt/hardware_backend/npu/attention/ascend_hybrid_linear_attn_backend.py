@@ -15,7 +15,7 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
 from sglang.srt.layers.attention.mamba.mamba2_metadata import (
     ForwardMetadata,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
@@ -133,9 +133,14 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
         num_padding: Optional[int] = None,
         in_capture: bool = False,
         mamba_track_indices: Optional[torch.Tensor] = None,
+        ragged_verify_layout=None,
         *args,
         **kwargs,
     ):
+        if ragged_verify_layout is not None:
+            raise NotImplementedError(
+                "Ascend hybrid linear attention does not support ragged verify"
+            )
         # out_graph passes seq_lens_cpu=None at capture; mirror the base guard.
         if seq_lens_cpu is None:
             num_padding = 0

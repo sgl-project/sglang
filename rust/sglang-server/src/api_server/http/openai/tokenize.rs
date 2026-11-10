@@ -296,9 +296,12 @@ mod tests {
                     startup_ready: true,
                     is_disaggregation: false,
                     mm_limits: Default::default(),
+                    multimodal: false,
                     peer_endpoints: Vec::new(),
                     metadata: CoreMetadata::from(server_args.as_ref()),
                     metrics: None,
+                    request_log: None,
+                    generate_validator: None,
                 },
             ),
             generation_policy: crate::message::request::GenerationPolicy::from(

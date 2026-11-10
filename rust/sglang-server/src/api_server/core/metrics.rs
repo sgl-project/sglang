@@ -15,13 +15,13 @@ use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::message::config::{DisaggregationMode, MetricsConfig};
 use crate::message::finish_reason::FinishReason;
 use crate::message::request::GenerateRequest;
-use crate::message::response::{ChunkEvent, ResponseItem};
+use crate::message::response::{CachedTokensSplit, ChunkEvent, ResponseItem};
 use crate::utils::prometheus::{self, Entry};
 
 /// How often the frontend's files are rewritten for other readers of the
@@ -51,6 +51,8 @@ const TOKEN_COUNT_BUCKETS: &[f64] = &[
     800000.0, 1000000.0, 1100000.0,
 ];
 const GET_LOADS_BUCKETS: &[f64] = &[0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0];
+/// The `cache_source` label of `sglang:cached_tokens_total`, by cache tier.
+const CACHE_SOURCES: [&str; 3] = ["device", "host", "storage"];
 
 type Labels = Vec<(String, String)>;
 /// What tells one request's label set from another's: the priority (when it
@@ -150,6 +152,124 @@ impl CounterFamily {
     }
 }
 
+/// Every [`ExtensionCounter`] registered in this process.
+static EXTENSION_COUNTERS: Mutex<Vec<&'static ExtensionCounter>> = Mutex::new(Vec::new());
+
+/// Every [`ExtensionHistogram`] registered in this process.
+static EXTENSION_HISTOGRAMS: Mutex<Vec<&'static ExtensionHistogram>> = Mutex::new(Vec::new());
+
+/// A counter family recorded by code built on this frontend, such as an
+/// external multimodal processor. With metrics enabled, it is written with
+/// the frontend's own counters, so `/metrics` exports it summed over processes.
+pub struct ExtensionCounter(CounterFamily);
+
+impl ExtensionCounter {
+    /// Register a family; prometheus_client names counters `*_total`. A name
+    /// registered again returns the first registration (and its help). The
+    /// family lives for the rest of the process.
+    pub fn register(name: &'static str, help: &'static str) -> &'static Self {
+        let mut counters = EXTENSION_COUNTERS.lock().unwrap();
+        if let Some(counter) = counters.iter().find(|counter| counter.0.name == name) {
+            return counter;
+        }
+        let counter: &'static Self = Box::leak(Box::new(Self(CounterFamily::new(name, help))));
+        counters.push(counter);
+        counter
+    }
+
+    /// Add one to the series with these labels.
+    pub fn inc(&self, labels: &[(&str, &str)]) {
+        self.0.series(&owned_labels(labels)).inc(1);
+    }
+
+    /// Create the series with these labels at zero, as prometheus_client's
+    /// `labels()` does: a rate over it then starts from a zero series, not a
+    /// missing one.
+    pub fn init_series(&self, labels: &[(&str, &str)]) {
+        self.0.series(&owned_labels(labels));
+    }
+
+    /// The count of the series with these labels; `None` when there is no
+    /// such series. Reading creates none.
+    pub fn value(&self, labels: &[(&str, &str)]) -> Option<u64> {
+        existing_series(&self.0.series, labels).map(|counter| counter.0.load(Ordering::Relaxed))
+    }
+}
+
+/// A histogram family recorded by code built on this frontend, written with
+/// the frontend's own histograms (see [`ExtensionCounter`]).
+pub struct ExtensionHistogram(HistogramFamily);
+
+impl ExtensionHistogram {
+    /// Register a family with `buckets` as prometheus_client's `Histogram`
+    /// takes them (see [`HistogramFamily::new`]). A name registered again
+    /// returns the first registration (and its help and buckets). The family
+    /// lives for the rest of the process.
+    pub fn register(
+        name: &'static str,
+        help: &'static str,
+        buckets: &[f64],
+    ) -> Result<&'static Self, String> {
+        let mut histograms = EXTENSION_HISTOGRAMS.lock().unwrap();
+        if let Some(histogram) = histograms.iter().find(|histogram| histogram.0.name == name) {
+            return Ok(histogram);
+        }
+        let histogram: &'static Self =
+            Box::leak(Box::new(Self(HistogramFamily::new(name, help, buckets)?)));
+        histograms.push(histogram);
+        Ok(histogram)
+    }
+
+    /// Observe `value` in the series with these labels.
+    pub fn observe(&self, labels: &[(&str, &str)], value: f64) {
+        self.0.series(&owned_labels(labels)).observe(value);
+    }
+
+    /// The number of observations in the series with these labels; `None`
+    /// when there is no such series. Reading creates none.
+    pub fn count(&self, labels: &[(&str, &str)]) -> Option<u64> {
+        existing_series(&self.0.series, labels).map(|histogram| {
+            histogram
+                .buckets
+                .iter()
+                .map(|bucket| bucket.load(Ordering::Relaxed))
+                .sum()
+        })
+    }
+
+    /// The sum of the observations in the series with these labels; `None`
+    /// when there is no such series. Reading creates none.
+    pub fn sum(&self, labels: &[(&str, &str)]) -> Option<f64> {
+        existing_series(&self.0.series, labels)
+            .map(|histogram| f64::from_bits(histogram.sum.load(Ordering::Relaxed)))
+    }
+}
+
+/// An extension's labels as a series key: sorted by name, as the written key
+/// sorts them, so one label set in any order is one series.
+fn owned_labels(labels: &[(&str, &str)]) -> Labels {
+    let mut labels: Labels = labels
+        .iter()
+        .map(|&(name, value)| (name.to_owned(), value.to_owned()))
+        .collect();
+    labels.sort();
+    labels
+}
+
+/// The series with these labels, if there is one.
+fn existing_series<T>(
+    series: &Mutex<Vec<(Labels, Arc<T>)>>,
+    labels: &[(&str, &str)],
+) -> Option<Arc<T>> {
+    let labels = owned_labels(labels);
+    series
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(l, _)| *l == labels)
+        .map(|(_, series)| series.clone())
+}
+
 impl HistogramFamily {
     /// `buckets` as prometheus_client's `Histogram` takes them: sorted, and
     /// `+Inf` appended unless already last.
@@ -219,10 +339,9 @@ struct RequestSeries {
     prompt_tokens: Arc<Counter>,
     generation_tokens: Arc<Counter>,
     num_so_requests: Arc<Counter>,
-    /// Every cached token counts as `cache_source="device"`: the frames carry
-    /// the total, which Python splits further only with a host or storage
-    /// cache tier.
-    cached_tokens: Arc<Counter>,
+    /// Cached tokens by [`CACHE_SOURCES`], each series registered at its
+    /// source's first hit, as Python labels a source only once it counts one.
+    cached_tokens: [OnceLock<Arc<Counter>>; 3],
     prompt_tokens_histogram: Arc<Histogram>,
     uncached_prompt_tokens_histogram: Arc<Histogram>,
     generation_tokens_histogram: Arc<Histogram>,
@@ -231,6 +350,8 @@ struct RequestSeries {
     time_to_first_token: Option<Arc<Histogram>>,
     time_per_output_token: Option<Arc<Histogram>>,
     inter_token_latency: Option<Arc<Histogram>>,
+    /// The label set, which `cached_tokens` extends with its `cache_source`.
+    labels: Labels,
 }
 
 /// The frontend's metric families and where they are written.
@@ -393,6 +514,7 @@ impl FrontendMetrics {
             last_completion_tokens: 0,
             prompt_tokens: 0,
             cached_tokens: 0,
+            cached_tokens_split: CachedTokensSplit::default(),
             terminal: false,
         }
     }
@@ -419,15 +541,13 @@ impl FrontendMetrics {
         }
         let mut stream_labels = labels.clone();
         stream_labels.push(("is_streaming".into(), stream.to_string()));
-        let mut cache_labels = labels.clone();
-        cache_labels.push(("cache_source".into(), "device".into()));
         let decodes = !self.prefill;
         let series = Arc::new(RequestSeries {
             num_requests: self.num_requests.series(&stream_labels),
             prompt_tokens: self.prompt_tokens.series(&stream_labels),
             generation_tokens: self.generation_tokens.series(&stream_labels),
             num_so_requests: self.num_so_requests.series(&labels),
-            cached_tokens: self.cached_tokens.series(&cache_labels),
+            cached_tokens: Default::default(),
             prompt_tokens_histogram: self.prompt_tokens_histogram.series(&labels),
             uncached_prompt_tokens_histogram: self.uncached_prompt_tokens_histogram.series(&labels),
             generation_tokens_histogram: self.generation_tokens_histogram.series(&labels),
@@ -436,6 +556,7 @@ impl FrontendMetrics {
             time_per_output_token: decodes
                 .then(|| self.time_per_output_token.series(&stream_labels)),
             inter_token_latency: decodes.then(|| self.inter_token_latency.series(&labels)),
+            labels,
         });
         self.by_label_set
             .write()
@@ -472,15 +593,24 @@ impl FrontendMetrics {
     /// Write the current values as this process's multiprocess files, each
     /// only if it changed since the last write.
     pub(crate) fn flush(&self) -> io::Result<()> {
+        // Held from the snapshot through the write, so a scrape-triggered
+        // flush racing the periodic one cannot write an older snapshot over
+        // a newer one.
+        let mut written = self.written.lock().unwrap();
         let mut counters = Vec::new();
         for family in self.counters() {
             family.entries(&mut counters);
+        }
+        for counter in EXTENSION_COUNTERS.lock().unwrap().iter() {
+            counter.0.entries(&mut counters);
         }
         let mut histograms = Vec::new();
         for family in self.histograms() {
             family.entries(&mut histograms);
         }
-        let mut written = self.written.lock().unwrap();
+        for histogram in EXTENSION_HISTOGRAMS.lock().unwrap().iter() {
+            histogram.0.entries(&mut histograms);
+        }
         for (file, entries) in [
             (&self.counter_file, counters),
             (&self.histogram_file, histograms),
@@ -529,6 +659,8 @@ pub(crate) struct RequestMetrics {
     last_completion_tokens: u64,
     prompt_tokens: u32,
     cached_tokens: u32,
+    /// `cached_tokens` by cache tier.
+    cached_tokens_split: CachedTokensSplit,
     /// A terminal item (or the end of the stream) was seen; dropping the call
     /// before that aborts the request (see [`Self::call_dropped`]).
     terminal: bool,
@@ -556,6 +688,19 @@ impl RequestMetrics {
         self.completion_tokens += chunk.completion_tokens;
         self.prompt_tokens = chunk.prompt_tokens;
         self.cached_tokens = chunk.cached_tokens;
+        self.cached_tokens_split = extras
+            .and_then(|extras| extras.cached_tokens_details.as_ref())
+            .map_or(
+                CachedTokensSplit {
+                    device: chunk.cached_tokens,
+                    ..Default::default()
+                },
+                |details| CachedTokensSplit {
+                    device: details.device,
+                    host: details.host,
+                    storage: details.storage.unwrap_or(0),
+                },
+            );
         let first_output_at = *self.first_output_at.get_or_insert(now);
         let finish_type = chunk
             .finish_reason
@@ -618,7 +763,27 @@ impl RequestMetrics {
         series.prompt_tokens.inc(u64::from(self.prompt_tokens));
         series.generation_tokens.inc(self.completion_tokens);
         if self.cached_tokens > 0 {
-            series.cached_tokens.inc(u64::from(self.cached_tokens));
+            let CachedTokensSplit {
+                device,
+                host,
+                storage,
+            } = self.cached_tokens_split;
+            for ((counter, source), count) in series
+                .cached_tokens
+                .iter()
+                .zip(CACHE_SOURCES)
+                .zip([device, host, storage])
+            {
+                if count > 0 {
+                    counter
+                        .get_or_init(|| {
+                            let mut labels = series.labels.clone();
+                            labels.push(("cache_source".into(), source.into()));
+                            self.metrics.cached_tokens.series(&labels)
+                        })
+                        .inc(u64::from(count));
+                }
+            }
         }
         series.num_requests.inc(1);
         if self.has_grammar {
@@ -992,6 +1157,57 @@ mod tests {
         );
     }
 
+    /// Each request of the fixture's cache-tier frames
+    /// (`testdata/frame_metadata.json`) adds its cached tokens under the
+    /// `cache_source` labels Python's collector increments for it, and only
+    /// those: a source is labelled once it has a hit.
+    #[test]
+    fn cached_tokens_split_by_source_matches_python() {
+        use crate::message::response::{for_each_chunk, frame_decode_batch_cols};
+
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../../testdata/frame_metadata.json")).unwrap();
+        let bytes = |hex: &serde_json::Value| -> Vec<u8> {
+            let hex = hex.as_str().unwrap();
+            (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+                .collect()
+        };
+        for name in ["host_tier", "storage_tier"] {
+            let batch = &fixture[name];
+            let framed =
+                frame_decode_batch_cols(&bytes(&batch["header"]), &[&bytes(&batch["data"])]);
+            let mut events = Vec::new();
+            assert!(for_each_chunk(&framed[1..], |event| events.push(event)).ok);
+            for event in events {
+                let rid = event.rid.as_str().to_owned();
+                // Never flushed, so the directory is not written.
+                let config = config(&std::env::temp_dir(), BTreeMap::new());
+                let metrics =
+                    Arc::new(FrontendMetrics::new(&config, DisaggregationMode::Null).unwrap());
+                let mut observed = metrics.start_request(&request(false, None), Instant::now());
+                observed.observe(Some(&ResponseItem::Done(event)));
+                let counted: serde_json::Map<String, serde_json::Value> = metrics
+                    .cached_tokens
+                    .series
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|(labels, counter)| {
+                        let (_, source) = labels.iter().find(|(k, _)| k == "cache_source").unwrap();
+                        (source.clone(), counter.0.load(Ordering::Relaxed).into())
+                    })
+                    .collect();
+                assert_eq!(
+                    serde_json::Value::Object(counted),
+                    batch["cached_tokens_total"][&rid],
+                    "{name} {rid}"
+                );
+            }
+        }
+    }
+
     /// An abort finish counts the request but no first-token time; a request
     /// the scheduler ended outside the output stream counts nothing, as
     /// Python's `_handle_abort_req`; a PD prefill server never records
@@ -1080,5 +1296,93 @@ mod tests {
         config.bucket_time_to_first_token = Some(vec![2.0, 1.0]);
         assert!(FrontendMetrics::new(&config, DisaggregationMode::Null).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Registered extension families are written with the frontend's own: a
+    /// counter series created before its first increment reads zero, and a
+    /// histogram keeps its own buckets.
+    #[test]
+    fn extension_families_are_exported() {
+        let dir = temp_dir("extension");
+        let metrics =
+            FrontendMetrics::new(&config(&dir, BTreeMap::new()), DisaggregationMode::Null).unwrap();
+        let counter = ExtensionCounter::register(
+            "sglang:test_extension_events_total",
+            "Events counted by a test extension.",
+        );
+        counter.inc(&[("reason", "a"), ("kind", "x")]);
+        // The same label set in another order is the same series.
+        counter.inc(&[("kind", "x"), ("reason", "a")]);
+        counter.init_series(&[("reason", "b"), ("kind", "x")]);
+        assert_eq!(counter.value(&[("reason", "a"), ("kind", "x")]), Some(2));
+        assert_eq!(counter.value(&[("kind", "x"), ("reason", "b")]), Some(0));
+        // A read creates no series.
+        assert_eq!(counter.value(&[("kind", "x"), ("reason", "c")]), None);
+        let again = ExtensionCounter::register("sglang:test_extension_events_total", "Other help.");
+        assert!(std::ptr::eq(again, counter));
+
+        let histogram = ExtensionHistogram::register(
+            "sglang:test_extension_seconds",
+            "Durations observed by a test extension.",
+            &[0.1, 1.0],
+        )
+        .unwrap();
+        histogram.observe(&[("phase", "load")], 0.0625);
+        histogram.observe(&[("phase", "load")], 0.5);
+        histogram.observe(&[("phase", "load")], 4.0);
+        assert_eq!(histogram.count(&[("phase", "load")]), Some(3));
+        assert_eq!(histogram.sum(&[("phase", "load")]), Some(4.5625));
+        assert_eq!(histogram.count(&[("phase", "never")]), None);
+        assert_eq!(histogram.sum(&[("phase", "never")]), None);
+        let again =
+            ExtensionHistogram::register("sglang:test_extension_seconds", "Other help.", &[2.0])
+                .unwrap();
+        assert!(std::ptr::eq(again, histogram));
+        assert!(
+            ExtensionHistogram::register("sglang:test_unsorted_seconds", "Unsorted.", &[2.0, 1.0])
+                .is_err()
+        );
+
+        let text = rendered(&metrics, &dir);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(
+            text.contains("# TYPE sglang:test_extension_events_total counter"),
+            "{text}"
+        );
+        assert_eq!(
+            sample(
+                &text,
+                r#"sglang:test_extension_events_total{kind="x",reason="a"}"#
+            ),
+            Some(2.0)
+        );
+        assert_eq!(
+            sample(
+                &text,
+                r#"sglang:test_extension_events_total{kind="x",reason="b"}"#
+            ),
+            Some(0.0)
+        );
+        let events = text
+            .lines()
+            .filter(|line| line.starts_with("sglang:test_extension_events_total{"))
+            .count();
+        assert_eq!(events, 2, "{text}");
+        assert!(
+            text.contains("# TYPE sglang:test_extension_seconds histogram"),
+            "{text}"
+        );
+        for (le, count) in [("0.1", 1.0), ("1.0", 2.0), ("+Inf", 3.0)] {
+            let bucket =
+                format!(r#"sglang:test_extension_seconds_bucket{{le="{le}",phase="load"}}"#);
+            assert_eq!(sample(&text, &bucket), Some(count), "{bucket}: {text}");
+        }
+        assert_eq!(
+            sample(
+                &text,
+                r#"sglang:test_extension_seconds_count{phase="load"}"#
+            ),
+            Some(3.0)
+        );
     }
 }

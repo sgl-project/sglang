@@ -21,6 +21,10 @@ struct FusedStoreCacheParam {
   void* __restrict__ cache;
   const void* __restrict__ indices;
   uint32_t num_tokens;
+  // DCP: indices are widened slots; this rank stores slot / dcp_size of the
+  // slots it owns (slot % dcp_size == dcp_rank) and skips the others
+  int64_t dcp_size;
+  int64_t dcp_rank;
 };
 
 [[maybe_unused]]
@@ -42,7 +46,7 @@ __global__ void fused_store_indexer_cache(const __grid_constant__ FusedStoreCach
   constexpr int64_t kPageBytes = 132 << kPageBits;
 
   // each warp handles 128 elements, each block handles multiple rows
-  const auto& [input, cache, indices, num_tokens] = param;
+  const auto& [input, cache, indices, num_tokens, dcp_size, dcp_rank] = param;
   const auto global_tid = blockIdx.x * blockDim.x + threadIdx.x;
   const auto global_wid = global_tid / 32;
   const auto lane_id = threadIdx.x % 32;
@@ -52,7 +56,10 @@ __global__ void fused_store_indexer_cache(const __grid_constant__ FusedStoreCach
   PDLWaitPrimary<kUsePDL>();  // wait for primary kernel
 
   // prefetch the index
-  const auto index = static_cast<const IndicesT*>(indices)[global_wid];
+  auto index = static_cast<const IndicesT*>(indices)[global_wid];
+  if (dcp_size > 1) {
+    index = (index >= 0 && index % dcp_size == dcp_rank) ? index / dcp_size : IndicesT(-1);
+  }
   // always load the value from input (don't store if invalid)
   using KeyT2 = packed_t<KeyT>;
   using InStorage = AlignedVector<KeyT2, 2>;
@@ -65,16 +72,19 @@ __global__ void fused_store_indexer_cache(const __grid_constant__ FusedStoreCach
   // use normal fp32 scale
   const auto scale = fmaxf(1e-4f, abs_max) / kFP8E4M3Max;
   const auto inv_scale = 1.0f / scale;
-  const int32_t page = index >> kPageBits;
-  const int32_t offset = index & ((1 << kPageBits) - 1);
-  const auto page_ptr = pointer::offset(cache, page * kPageBytes);
-  const auto value_ptr = pointer::offset(page_ptr, offset * 128);
-  const auto scale_ptr = pointer::offset(page_ptr, 128 << kPageBits, offset * 4);
-  OutStorage result;
-  result[0] = pack_fp8(x0 * inv_scale, x1 * inv_scale);
-  result[1] = pack_fp8(y0 * inv_scale, y1 * inv_scale);
-  static_cast<OutStorage*>(value_ptr)[lane_id] = result;
-  static_cast<float*>(scale_ptr)[0] = scale;
+  // a negative index skips the store (e.g. a token owned by another DCP rank)
+  if (index >= 0) {
+    const int32_t page = index >> kPageBits;
+    const int32_t offset = index & ((1 << kPageBits) - 1);
+    const auto page_ptr = pointer::offset(cache, page * kPageBytes);
+    const auto value_ptr = pointer::offset(page_ptr, offset * 128);
+    const auto scale_ptr = pointer::offset(page_ptr, 128 << kPageBits, offset * 4);
+    OutStorage result;
+    result[0] = pack_fp8(x0 * inv_scale, x1 * inv_scale);
+    result[1] = pack_fp8(y0 * inv_scale, y1 * inv_scale);
+    static_cast<OutStorage*>(value_ptr)[lane_id] = result;
+    static_cast<float*>(scale_ptr)[0] = scale;
+  }
 
   PDLTriggerSecondary<kUsePDL>();  // launch secondary kernel
 }
@@ -89,12 +99,17 @@ struct FusedStoreCacheIndexerKernel {
   static_assert(std::has_single_bit(kPageSize), "kPageSize must be a power of 2");
   static_assert(1 << kLogSize == kPageSize);
 
-  static void run(tvm::ffi::TensorView input, tvm::ffi::TensorView cache, tvm::ffi::TensorView indices) {
+  static void
+  run(tvm::ffi::TensorView input,
+      tvm::ffi::TensorView cache,
+      tvm::ffi::TensorView indices,
+      int64_t dcp_size,
+      int64_t dcp_rank) {
     using namespace host;
 
     auto N = SymbolicSize{"num_tokens"};
     auto device_ = SymbolicDevice{};
-    device_.set_options<kDLCUDA>();
+    device_.set_options<kDLGPU>();
     TensorMatcher({N, 128})  // input
         .with_dtype<KeyT>()
         .with_device(device_)
@@ -108,12 +123,16 @@ struct FusedStoreCacheIndexerKernel {
         .with_dtype<IndicesT>()
         .with_device(device_)
         .verify(indices);
+    RuntimeCheck(
+        dcp_size >= 1 && dcp_rank >= 0 && dcp_rank < dcp_size, "invalid dcp_size/dcp_rank: ", dcp_size, ", ", dcp_rank);
     const auto num_tokens = static_cast<uint32_t>(N.unwrap());
     const auto params = FusedStoreCacheParam{
         .input = input.data_ptr(),
         .cache = cache.data_ptr(),
         .indices = indices.data_ptr(),
         .num_tokens = num_tokens,
+        .dcp_size = dcp_size,
+        .dcp_rank = dcp_rank,
     };
     const auto kBlockSize = 128;
     const auto num_blocks = div_ceil(num_tokens * 32, kBlockSize);

@@ -115,12 +115,21 @@ def cp_interleave_to_sequence_order(hidden_states, forward_batch):
         if metadata.graph_num_tokens is not None
         else metadata.total_seq_lens
     )
+    if _use_interleave_rows(hidden_states):
+        from sglang.kernels.ops.memory.interleave_rows import interleave_rows
+
+        return interleave_rows(hidden_states, size, num_tokens)
     return (
         hidden_states.reshape(size, rows, *hidden_states.shape[1:])
         .transpose(0, 1)
         .flatten(0, 1)[:num_tokens]
         .contiguous()
     )
+
+
+def _use_interleave_rows(x) -> bool:
+    """interleave_rows is a Triton kernel: any GPU device, contiguous rows."""
+    return x.device.type != "cpu" and x.is_contiguous()
 
 
 def cp_sequence_to_interleave_order(hidden_states, forward_batch, gathered_rows):
@@ -134,11 +143,15 @@ def cp_sequence_to_interleave_order(hidden_states, forward_batch, gathered_rows)
     if not is_interleave_extend(forward_batch):
         return hidden_states
     metadata = forward_batch.attn_cp_metadata
+    size = get_parallel().attn_cp_size
+    if metadata.gather_index is None and _use_interleave_rows(hidden_states):
+        from sglang.kernels.ops.memory.interleave_rows import interleave_rows
+
+        return interleave_rows(hidden_states, size, gathered_rows, to_rank_major=True)
     padded = hidden_states.new_zeros((gathered_rows, *hidden_states.shape[1:]))
     if metadata.gather_index is not None:
         return padded.index_copy_(0, metadata.gather_index, hidden_states)
     padded[: hidden_states.shape[0]] = hidden_states
-    size = get_parallel().attn_cp_size
     return (
         padded.reshape(-1, size, *hidden_states.shape[1:])
         .transpose(0, 1)
@@ -325,6 +338,10 @@ class InterleaveCPStrategy(ContextParallelStrategy):
         if total_tokens == self.cp_size * physical_rank_len and all(
             int(n) == physical_rank_len for n in actual
         ):
+            if _use_interleave_rows(gathered):
+                from sglang.kernels.ops.memory.interleave_rows import interleave_rows
+
+                return interleave_rows(gathered, self.cp_size, total_tokens)
             return (
                 gathered.view(self.cp_size, physical_rank_len, *x.shape[1:])
                 .transpose(0, 1)
@@ -375,7 +392,7 @@ class InterleaveCPStrategy(ContextParallelStrategy):
         layer: Any = None,
         k: Any = None,
         v: Any = None,
-        swa_loc: Optional[Any] = None,
+        window_locs: Optional[Any] = None,
     ) -> Any:
         raise NotImplementedError(
             f"{self.name} strategy does not support dense K/V materialization"

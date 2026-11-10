@@ -1,3 +1,5 @@
+import logging
+
 import torch
 from transformers import (
     AutoConfig,
@@ -11,7 +13,8 @@ from sglang.srt.configs.qwen3_omni import Qwen3OmniMoeAudioEncoderConfig
 from sglang.srt.multimodal.customized_mm_processor_utils import (
     register_customized_processor,
 )
-from sglang.utils import logger
+
+logger = logging.getLogger(__name__)
 
 
 class Qwen3ASRProcessor(ProcessorMixin):

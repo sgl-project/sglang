@@ -764,6 +764,28 @@ class TestFunctionDeferLoading(unittest.TestCase):
         )
         self.assertFalse(tool.function.defer_loading)
 
+    def test_tool_without_defer_loading_dumps_client_fields_only(self):
+        """The dict passed to chat templates must not gain a null field."""
+        raw = {
+            "type": "function",
+            "function": {
+                "name": "search_db",
+                "description": "Search the database.",
+                "parameters": {"type": "object"},
+            },
+        }
+        tool = Tool.model_validate(raw)
+        self.assertEqual(tool.model_dump(), raw)
+        self.assertEqual(json.loads(tool.model_dump_json()), raw)
+
+    def test_tool_level_defer_loading_is_kept_when_set(self):
+        for value in (True, False):
+            data = Tool(
+                defer_loading=value, function={"name": "search_db"}
+            ).model_dump()
+            self.assertIs(data["defer_loading"], value)
+            self.assertIs(data["function"]["defer_loading"], value)
+
     def test_tool_reference_content_part_accepted(self):
         """Chat completion should accept tool_reference content on tool-role
         messages (GLM-specific extension consumed by the chat template)."""

@@ -9,11 +9,8 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind, WindowRead
 from sglang.srt.mem_cache.kv.alloc.iteration_ids import Cols, IterationIds
 from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
-from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
-    ForwardBatch,
-    ForwardMode,
-)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.utils import is_npu
 
@@ -47,6 +44,8 @@ class DFlashVerifyInput(SpecInput):
     # Shape info for padding (e.g., DP attention / CUDA graph).
     num_tokens_per_req: int = -1
 
+    # Seed for ForwardBatch.ragged_verify_layout (handed over in
+    # prepare_for_verify); set at construction, never reassigned after.
     ragged_verify_layout: Optional[RaggedVerifyLayout] = None
     # Committed/live lengths before the verify caller temporarily expands
     # batch.seq_lens_cpu to the target-attention KV lengths.
@@ -108,6 +107,7 @@ class DFlashVerifyInput(SpecInput):
             target_worker.model_runner,
             capture_hidden_mode=self.capture_hidden_mode,
             return_hidden_states_before_norm=False,
+            ragged_verify_layout=self.ragged_verify_layout,
             iteration_ids=self.iteration_ids,
             write_cols=self.iteration_cols,
         )

@@ -149,12 +149,8 @@ class MiniMaxH3VDNHybridAttention(nn.Module):
             ulysses_active=ulysses_active,
         )
         if attention.bcg_breakpoint and is_in_breakable_cuda_graph():
-            softmax_out, linear_out = _new_hybrid_core_outputs(q, total, ulysses_active)
-            _hybrid_attention_core_bcg(
-                *core_args,
-                softmax_out=softmax_out,
-                linear_out=linear_out,
-                **core_kwargs,
+            softmax_out, linear_out = _hybrid_attention_core_bcg(
+                *core_args, **core_kwargs
             )
         else:
             softmax_out, linear_out = _minimax_h3_hybrid_attention_core_impl(
@@ -570,7 +566,7 @@ def _hybrid_attention_metadata() -> HybridWindowAttentionH3Metadata:
 
 
 def _new_hybrid_core_outputs(
-    q: torch.Tensor, total: int, ulysses_active: bool
+    attention, x, q, k, v, softmax_gate, beta, gate_hidden, *, ulysses_active, **kwargs
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """The core's softmax and linear outputs, allocated before its graph break."""
     meta = _hybrid_attention_metadata()
@@ -578,29 +574,13 @@ def _new_hybrid_core_outputs(
         return q.new_empty(q.shape), None
     # the single-rank readout covers the video rows only
     layout = meta.layout
-    rows = total if ulysses_active else layout.video_end - layout.video_start
+    rows = x.shape[0] if ulysses_active else layout.video_end - layout.video_start
     return q.new_empty(q.shape), q.new_empty((rows, q.shape[1] * q.shape[2]))
 
 
-@eager_on_graph
-def _hybrid_attention_core_bcg(
-    *args,
-    softmax_out: torch.Tensor,
-    linear_out: torch.Tensor | None,
-    **kwargs,
-) -> None:
-    results = _minimax_h3_hybrid_attention_core_impl(*args, **kwargs)
-    for dst, src in zip((softmax_out, linear_out), results, strict=True):
-        if dst is None and src is None:
-            continue
-        # copy_ would broadcast a mispredicted shape or cast a dtype silently.
-        assert (
-            dst is not None
-            and src is not None
-            and dst.shape == src.shape
-            and dst.dtype == src.dtype
-        ), "VDN-H3 hybrid attention output mispredicted"
-        dst.copy_(src)
+_hybrid_attention_core_bcg = eager_on_graph(
+    _minimax_h3_hybrid_attention_core_impl, output_factory=_new_hybrid_core_outputs
+)
 
 
 def prepare_hybrid_attention_metadata(

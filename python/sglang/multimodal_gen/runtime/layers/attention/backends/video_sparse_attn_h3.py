@@ -157,24 +157,6 @@ def _h3_segment_tile_geometry(
     )
 
 
-def _h3_tile_geometry(
-    prefix_segments: tuple[int, ...],
-    dit_seq_shape: tuple[int, int, int],
-    device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
-    """Segment-pure prefix chunks, then the generated video's 64-token tiles.
-
-    Returns (variable_block_sizes, pack_index, unpack_index,
-    num_prefix_tiles, num_video_tiles).
-    """
-    sizes, pack_index, unpack_index, num_prefix_tiles, spans = (
-        _h3_segment_tile_geometry(
-            (*prefix_segments, tuple(dit_seq_shape)), VSA_H3_TILE_SHAPE, device
-        )
-    )
-    return sizes, pack_index, unpack_index, num_prefix_tiles, spans[0][1] - spans[0][0]
-
-
 class VideoSparseAttentionH3Backend(AttentionBackend):
     accept_output_buffer: bool = True
 

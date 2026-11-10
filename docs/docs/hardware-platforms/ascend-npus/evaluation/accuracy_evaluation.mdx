@@ -23,7 +23,7 @@ Ensure sufficient disk space before proceeding. The Docker image requires at lea
 First, launch the SGLang environment using the provided container image:
 
 <Tabs>
-  <Tab title="Ascend A3 Series">
+  <Tab title="A3 Series">
 
 ```shell Command
 export IMAGE=swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-B105

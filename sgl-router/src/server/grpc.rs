@@ -20,8 +20,8 @@ use crate::workers::GRPC_MAX_MESSAGE_BYTES;
 use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use bytes::Bytes;
 use futures::StreamExt;
-use sglang_api_types::runtime::v1 as proto;
-use sglang_api_types::runtime::v1::sglang_service_server::{SglangService, SglangServiceServer};
+use sglang_runtime_v1_types as proto;
+use sglang_runtime_v1_types::sglang_service_server::{SglangService, SglangServiceServer};
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
@@ -107,6 +107,9 @@ fn log_call(
             .unwrap_or(""),
         model = log_context.map(|c| c.model_id.as_str()).unwrap_or(""),
         stream = log_context.is_some_and(|c| c.streaming),
+        images = log_context.map_or(0, |c| c.media.images),
+        videos = log_context.map_or(0, |c| c.media.videos),
+        audios = log_context.map_or(0, |c| c.media.audios),
         latency_ms = started.elapsed().as_millis() as u64,
         "grpc_request",
     );

@@ -27,9 +27,11 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
+from sglang.srt.mem_cache.kv.plan import TREE_WINDOW
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
-from sglang.srt.mem_cache.unified_radix_cache import NodeId, UnifiedRadixCache
+from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import NodeId
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -70,7 +72,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             req_to_token_pool=self.req_to_token_pool,
             tree_components=self.tree_components,
             mamba_component=self._mamba_component,
-            sliding_window_size=self._sliding_window_size,
+            sliding_window_size=self.sliding_window_size,
         )
         self._external_flows: dict[str, LMCacheExternalFlow] = {}
         self._forward_stream = forward_stream
@@ -145,13 +147,11 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                 last_host_node=result.last_device_node,
                 best_match_node=result.last_device_node,
                 host_hit_length=external_hit,
-                swa_host_hit_length=(
-                    min(
-                        external_hit,
-                        self.lmcache_connector.aligned_swa_window_size(),
-                    )
+                window_host_hit_lengths=dict.fromkeys(
+                    (name for name, _ in self.window_sub_pools()),
+                    min(external_hit, self.lmcache_connector.aligned_swa_window_size())
                     if self.is_swa_enabled
-                    else 0
+                    else 0,
                 ),
                 mamba_host_hit_length=(1 if self._mamba_component is not None else 0),
                 mamba_branching_seqlen=None,
@@ -165,7 +165,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             last_host_node=result.last_device_node,
             best_match_node=result.last_device_node,
             host_hit_length=0,
-            swa_host_hit_length=0,
+            window_host_hit_lengths={},
             mamba_host_hit_length=0,
             mamba_branching_seqlen=None,
             full_kv_hit_length=max(result.full_kv_hit_length, total_hit),
@@ -261,7 +261,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
     def on_release(self, req: Req, *, checkpointed: bool) -> None:
         super().on_release(req, checkpointed=checkpointed)
         if not checkpointed:
-            self.release_aborted_request(req.cache_request_handle)
+            self._abandon_attempt(req.cache_request_handle)
 
     def checkpoint(self, req: Req, *, up_to: int, **kwargs) -> None:
         self._publish_external_loaded_prefix(req, token_ids_len=up_to)
@@ -319,7 +319,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
     def has_pending_cache_operations(self) -> bool:
         return bool(self._external_flows or self._pending_stores)
 
-    def release_aborted_request(self, handle: CacheRequestHandle) -> None:
+    def _abandon_attempt(self, handle: CacheRequestHandle) -> None:
         rid = handle.rid
         self.prefetch_loaded_tokens_by_reqid.pop(handle, None)
         self.prefetch_loaded_storage_start_by_reqid.pop(handle, None)
@@ -362,7 +362,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         if loaded_len is None:
             req.storage_hit_length = 0
             req.host_hit_length = 0
-            req.swa_host_hit_length = 0
+            req.matched_window_host_hit_lengths = {}
             req.mamba_host_hit_length = 0
             self.prefetch_loaded_tokens_by_reqid.pop(req.cache_request_handle, None)
             self.prefetch_loaded_storage_start_by_reqid.pop(
@@ -484,7 +484,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             return allocator.alloc(num_tokens)
 
         # Allocate SWA only for the trailing window; older pages use dummy page 0.
-        assert self._sliding_window_size is not None
+        assert self.sliding_window_size is not None
         swa_tail_tokens = min(
             num_tokens,
             self.lmcache_connector.aligned_swa_window_size(),
@@ -494,7 +494,9 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         if full_allocator.available_size() < num_tokens:
             self.evict(EvictParams(num_tokens=num_tokens))
         if swa_allocator.available_size() < swa_tail_tokens:
-            self.evict(EvictParams(swa_num_tokens=swa_tail_tokens))
+            # Only the tree's window slot is allocated here: evict from it alone.
+            target = self.window_sub_pool_of_slot(self.slot_id(TREE_WINDOW))
+            self.evict(EvictParams(window_num_tokens={target: swa_tail_tokens}))
 
         full_indices = full_allocator.alloc(num_tokens)
         if full_indices is None:
@@ -761,16 +763,16 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         if flow is None or flow.load is None:
             return
         tree_owned_len = flow.load.local_hit_tokens + flow.loaded_skip_tokens
-        req.kv.cache_protected_len = min(req.kv.cache_protected_len, tree_owned_len)
+        req.kv.protect_prefix(min(req.kv.cache_protected_len, tree_owned_len))
         if self.is_swa_enabled:
             external_tokens = len(flow.load.device_indices)
             swa_missing_end = flow.load.local_hit_tokens + max(
                 external_tokens - self.lmcache_connector.aligned_swa_window_size(),
                 0,
             )
+            name = self.component_of(TREE_WINDOW).window_sub_pool
             req.kv.set_evicted_seqlen(
-                ComponentType.SWA,
-                max(req.kv.get_evicted_seqlen(ComponentType.SWA), swa_missing_end),
+                name, max(req.kv.get_evicted_seqlen(name), swa_missing_end)
             )
 
     def _publish_external_loaded_prefix(self, req: Req, *, token_ids_len: int) -> None:
@@ -809,7 +811,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                 value=kv_indices[:total_hit].to(dtype=torch.int64, copy=True),
                 mamba_value=checkpoint,
                 prev_prefix_len=prev_prefix_len,
-                component_evicted_seqlens=req.kv.component_evicted_seqlens.copy(),
+                component_evicted_seqlens=self.insert_window_cursors(req.kv),
                 inserted_len=len(key),
                 priority=req.priority or 0,
             )
@@ -839,7 +841,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         # Move the request lock to the published boundary.
         self.unlock(req.lock)
         req.lock = self.lock(matched.last_device_node)
-        req.kv.cache_protected_len = total_hit
+        req.kv.protect_prefix(total_hit)
         req.last_node = matched.last_device_node
         flow.request_mamba_value = None
         flow.allocated_request_mamba_for_load = False

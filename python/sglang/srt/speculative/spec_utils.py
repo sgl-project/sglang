@@ -10,21 +10,16 @@ from typing import TYPE_CHECKING, Any, Callable, List, Literal, Optional, Tuple
 import torch
 from huggingface_hub import snapshot_download
 
+from sglang.kernels.ops.sampling import argmax as sampling_argmax
 from sglang.kernels.ops.sampling import softmax as sampling_softmax
 from sglang.kernels.ops.speculative.cache_locs import (
-    fill_front_out_cache_loc_func as fill_front_out_cache_loc_func,
-)
-from sglang.kernels.ops.speculative.cache_locs import (
-    generate_draft_decode_kv_indices as generate_draft_decode_kv_indices,
-)
-from sglang.kernels.ops.speculative.cache_locs import (
-    generate_draft_decode_window_kv_indices as generate_draft_decode_window_kv_indices,
+    fill_front_out_cache_loc_func,
+    generate_draft_decode_window_kv_indices,
 )
 from sglang.kernels.ops.speculative.eagle import (
-    fill_accept_out_cache_loc_func as fill_accept_out_cache_loc_func,
+    fill_accept_out_cache_loc_func,
 )
-from sglang.kernels.ops.speculative.row_argmax import row_argmax
-from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.configs.draft_parallel import DraftParallelLayout
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.constrained.base_grammar_backend import GrammarMask
@@ -37,12 +32,8 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
 from sglang.srt.layers.cp.base import disable_cp_strategy
 from sglang.srt.managers.schedule_batch import set_mamba_track_indices_from_reqs
-from sglang.srt.managers.utils import _async_d2h
-from sglang.srt.mem_cache.allocation import (
-    assign_req_to_token_pool_func as assign_req_to_token_pool_func,
-)
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
-from sglang.srt.mem_cache.kv.router import STATE_PART
+from sglang.srt.mem_cache.kv.decl import STATE_PART
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
@@ -60,6 +51,7 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.async_probe import maybe_detect_oob
 from sglang.srt.utils.common import fast_topk
+from sglang.srt.utils.device import async_d2h as _async_d2h
 from sglang.srt.utils.nvtx_utils import profile_range
 
 _is_cuda = is_cuda()
@@ -195,11 +187,8 @@ def fast_sample(
         scores = probs.float() / q
 
     if num_samples == 1:
-        # row_argmax is FP32-only; the seeded path keeps float64 scores.
-        if scores.dtype == torch.float32:
-            sample_index = row_argmax(scores).unsqueeze(-1)
-        else:
-            sample_index = scores.argmax(dim=-1, keepdim=True)
+        # The seeded path's float64 scores fall back to torch.argmax.
+        sample_index = sampling_argmax(scores).unsqueeze(-1)
     else:
         sample_index = scores.topk(num_samples, dim=-1).indices
     sample_p = probs.gather(1, sample_index)
@@ -279,6 +268,17 @@ def sample_draft_proposal(
 SIMULATE_ACC_LEN = envs.SGLANG_SIMULATE_ACC_LEN.get()  # turn off if < 0
 SIMULATE_ACC_METHOD = envs.SGLANG_SIMULATE_ACC_METHOD.get()
 SIMULATE_ACC_TOKEN_MODE = envs.SGLANG_SIMULATE_ACC_TOKEN_MODE.get()
+
+# XORed into the server seed so these draws differ from other samplers'.
+_SIM_ACC_LEN_DOMAIN = 0x0F3D6B8C2A915E47
+
+
+def simulated_acc_len_generator(seed: int) -> torch.Generator:
+    """The generator of the SGLANG_SIMULATE_ACC_LEN draws (forced lengths, and
+    DSpark's bonus seed), seeded alike on every rank from the server seed."""
+    return torch.Generator().manual_seed(
+        (int(seed) ^ _SIM_ACC_LEN_DOMAIN) & 0x7FFFFFFFFFFFFFFF
+    )
 
 
 def check_simulate_acc_token_mode() -> None:
@@ -372,7 +372,7 @@ def fill_draft_window_rail(
     """Emit every draft step's window-clipped read ids into the per-step rows
     of ``window_kv_indices`` and their indptr into ``window_kv_indptr``: step
     i of a branch reads the last ``min(seq_len + i + 1, window)`` of its
-    tokens, from the storage window layers use (``runner_ids.window_kv_kind``).
+    tokens, from the storage window layers use (``runner_ids.window_storage``).
     ``window`` is the number of tokens the backend's window layers attend."""
     num_seqs = forward_batch.batch_size
     width = num_seqs * topk * window
@@ -384,7 +384,7 @@ def fill_draft_window_rail(
         forward_batch.iteration_ids,
         req_pool_indices=forward_batch.req_pool_indices,
         bs=num_seqs,
-        kind=runner_ids.window_kv_kind,
+        kind=runner_ids.window_storage,
     )
     generate_draft_decode_window_kv_indices[(num_steps, num_seqs, topk)](
         src.row_ids,
@@ -405,15 +405,12 @@ def fill_draft_window_rail(
         v2p=src.v2p,
         TRANSLATE=src.v2p is not None,
     )
-    if (
-        not src.is_translated
-        and runner_ids.window_kv_kind == IdSpaceKind.SLIDING_WINDOW
-    ):
+    if not src.is_translated and runner_ids.window_storage != IdSpaceKind.FULL:
         # Static pool: the legacy full->swa translate, as the target's window
         # reads apply it.
         for i in range(num_steps):
             row = window_kv_indices[i][:width]
-            row.copy_(runner_ids.ids_in(IdSpaceKind.SLIDING_WINDOW, row))
+            row.copy_(runner_ids.ids_in(runner_ids.window_storage, row))
 
 
 def record_stream_each(tensors, stream):
@@ -1060,9 +1057,11 @@ def _versions(*tensors: torch.Tensor) -> Optional[tuple[int, ...]]:
     return tuple(t._version for t in tensors)
 
 
-# SGLANG_Q35MF_MKH_N3B: the verify rounds of this process reuse the last indices.
+# SGLANG_OPT_SPEC_VERIFY_REUSE_STAGED_INPUTS: the verify rounds of this process reuse the last indices.
 _VERIFY_TRACK_INDICES: Optional[VerifyTrackIndices] = (
-    VerifyTrackIndices() if envs.SGLANG_Q35MF_MKH_N3B.get() else None
+    VerifyTrackIndices()
+    if envs.SGLANG_OPT_SPEC_VERIFY_REUSE_STAGED_INPUTS.get()
+    else None
 )
 
 
@@ -1184,6 +1183,15 @@ def commit_mamba_states_after_verify(
     if mambaish_config(model_runner.model_config) is None:
         return
 
+    # FIXME: when the target runner is the forward's last shared reader, this
+    # ReplaySSM branch reads the request pool's Mamba indices and the state map
+    # after the declared shared-read end. The schedule stream may then reuse and
+    # rewrite a finished request's row or state slot while this commit still
+    # reads it. Declare a later read end for this path, or gather the indices
+    # during metadata preparation. The same holds for EAGLE v2's post-verify
+    # graphs: they replay this commit on a side stream joined only after draft
+    # extend, while draft extend's declared read end (pre-, in- or post-replay)
+    # is recorded before that join; only its whole-forward fallback covers it.
     # ReplaySSM spec-verify path (Part B of #28511): the accepted drafts already
     # live in the per-slot circular ring (written during verify). Instead of
     # scattering an intermediate full SSM state into `temporal`, advance the
@@ -1198,6 +1206,21 @@ def commit_mamba_states_after_verify(
     src_indices_raw = (
         batch.req_pool_indices[:bs] if pp_spec_stable_rows_enabled() else None
     )
+
+    replay_state_indices = replay_track_indices = None
+    if mamba_pool is not None and (
+        mamba_pool.replayssm_spec_fold or mamba_pool.replayssm_cache_base is not None
+    ):
+        if batch.forward_mode.is_idle() or accept_index.numel() == 0:
+            return
+        # Persistent destinations follow state relocation; replay/scratch rows
+        # still index requests, and the scheduler keeps owning virtual state IDs.
+        state_ids = model_runner.runner_ids.state_ids(req_pool.state_sub_pool)
+        replay_state_indices = state_ids.ids(
+            req_pool.get_mamba_indices(batch.req_pool_indices)
+        )
+        if batch.mamba_track_indices is not None:
+            replay_track_indices = state_ids.ids(batch.mamba_track_indices)
 
     # Fold-every-commit: replay the accepted prefix from the ring into
     # `temporal`; the same fold stores the interval-crossing state to the
@@ -1214,7 +1237,7 @@ def commit_mamba_states_after_verify(
         )
 
         spec_state = mamba_pool.get_speculative_mamba2_params_all_layers()
-        state_batch_indices = req_pool.get_mamba_indices(batch.req_pool_indices)
+        state_batch_indices = replay_state_indices
         if prepared_step_indices is None:
             last_correct_step_indices, mamba_steps_to_track = (
                 _verify_commit_step_indices(
@@ -1231,7 +1254,7 @@ def commit_mamba_states_after_verify(
             state_batch_indices=state_batch_indices,
             accept_lens=accept_lens,
             last_correct_step_indices=last_correct_step_indices,
-            mamba_track_indices=batch.mamba_track_indices,
+            mamba_track_indices=replay_track_indices,
             mamba_steps_to_track=mamba_steps_to_track,
             src_indices_raw=src_indices_raw,
             null_block_id=-1,
@@ -1254,7 +1277,7 @@ def commit_mamba_states_after_verify(
         )
 
         spec_state = mamba_pool.get_speculative_mamba2_params_all_layers()
-        state_batch_indices = req_pool.get_mamba_indices(batch.req_pool_indices)
+        state_batch_indices = replay_state_indices
         replay_indices = batch.req_pool_indices
         if prepared_step_indices is None:
             last_correct_step_indices, mamba_steps_to_track = (
@@ -1295,7 +1318,7 @@ def commit_mamba_states_after_verify(
             cache_base=mamba_pool.replayssm_cache_base,
             is_flush=mamba_pool.replayssm_is_flush,
             accept_lens=accept_lens,
-            mamba_track_indices=batch.mamba_track_indices,
+            mamba_track_indices=replay_track_indices,
             mamba_steps_to_track=mamba_steps_to_track,
             null_block_id=-1,
         )
@@ -1311,7 +1334,7 @@ def commit_mamba_states_after_verify(
             fused_conv_window_scatter_with_mask(
                 spec_state.conv[0],
                 spec_state.intermediate_conv_window[0],
-                batch.mamba_track_indices,
+                replay_track_indices,
                 mamba_steps_to_track,
                 src_indices_raw,
             )
@@ -1335,7 +1358,7 @@ def commit_mamba_states_after_verify(
         )
 
         spec_state = mamba_pool.get_speculative_mamba2_params_all_layers()
-        state_batch_indices = req_pool.get_mamba_indices(batch.req_pool_indices)
+        state_batch_indices = replay_state_indices
         accept_indices_offset = torch.arange(
             0,
             bs * draft_token_num,
@@ -1352,7 +1375,7 @@ def commit_mamba_states_after_verify(
         # the track ping-pong slot (mirrors the regular commit's
         # mamba_steps_to_track); commit_kda_replayssm_spec folds it in one pass, so
         # `temporal` stays current and no device-side force-flush is needed.
-        mamba_track_indices = batch.mamba_track_indices
+        mamba_track_indices = replay_track_indices
         mamba_steps_to_track = None
         if mamba_track_indices is not None:
             ti = mamba_track_grid(batch.tree_cache.page_size)
@@ -1367,6 +1390,9 @@ def commit_mamba_states_after_verify(
             mamba_steps_to_track = torch.where(
                 to_track_mask, candidate, torch.full_like(candidate, -1)
             )
+        ring_indices = None
+        if mamba_pool.replayssm_request_ring:
+            ring_indices = batch.req_pool_indices[: state_batch_indices.shape[0]]
         commit_kda_replayssm_after_verify(
             spec_state=spec_state,
             state_batch_indices=state_batch_indices,
@@ -1376,6 +1402,7 @@ def commit_mamba_states_after_verify(
             mamba_steps_to_track=mamba_steps_to_track,
             src_indices_raw=src_indices_raw,
             null_block_id=-1,  # SGLang: valid slots >= 0, padding == -1
+            ring_indices=ring_indices,
         )
         return
 

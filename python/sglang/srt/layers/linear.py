@@ -41,8 +41,9 @@ from sglang.srt.layers.parameter import (
     _ColumnvLLMParameter,
 )
 from sglang.srt.layers.utils import pad_or_narrow_weight
+from sglang.srt.layers.utils.common import set_weight_attrs
 from sglang.srt.runtime_context import get_exec, get_forward, get_parallel
-from sglang.srt.utils import get_bool_env_var, is_cpu, is_hip, is_npu, set_weight_attrs
+from sglang.srt.utils import get_bool_env_var, is_cpu, is_hip, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state import GroupCoordinator
@@ -685,6 +686,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         *,
         use_presharded_weights: bool = False,
         parallel_group: Optional[LinearParallelGroup] = None,
+        skip_block_quant_check: bool = False,
     ):
         self.with_bias = bias
         self.output_sizes = output_sizes
@@ -704,6 +706,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             tp_group=tp_group,
             parallel_group=parallel_group,
             use_presharded_weights=use_presharded_weights,
+            skip_block_quant_check=skip_block_quant_check,
         )
         self.prefix = prefix
 
@@ -1593,6 +1596,7 @@ class RowParallelLinear(LinearBase):
         use_presharded_weights: bool = False,
         use_dp_attention_reduce: bool = False,
         parallel_group: Optional[LinearParallelGroup] = None,
+        skip_block_quant_check: bool = False,
     ):
         self.tp_group = _resolve_linear_group(parallel_group)
         self.parallel_group = parallel_group
@@ -1621,6 +1625,7 @@ class RowParallelLinear(LinearBase):
             input_size=self.input_size,
             output_size=self.output_size,
             params_dtype=self.params_dtype,
+            **({"skip_block_quant_check": True} if skip_block_quant_check else {}),
             weight_loader=(
                 self.weight_loader_v2
                 if (
@@ -1779,7 +1784,10 @@ class RowParallelLinear(LinearBase):
             symm_ctx = use_symmetric_memory(get_parallel().attn_tp_group)
         else:
             symm_ctx = use_symmetric_memory(
-                get_parallel().tp_group, disabled=not is_allocation_symmetric()
+                get_parallel().tp_group,
+                # Replicated modules have no TP group and produce complete
+                # local outputs; they do not need a collective memory window.
+                disabled=self.tp_group is None or not is_allocation_symmetric(),
             )
         with symm_ctx:
             if output_tensor is None:
