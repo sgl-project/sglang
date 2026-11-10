@@ -897,7 +897,7 @@ class HybridCacheController(BaseHiCacheController):
             elif transfer.hit_policy == PoolHitPolicy.BLOCK_GROUPS:
                 # One buffer page per complete block of the hit.
                 block = max(1, int(transfer.block_pages))
-                num_pages = min(num_pages or 1, sidecar_hit_pages // block)
+                num_pages = min(num_pages, sidecar_hit_pages // block)
             requests.append((transfer.name, num_pages * entry.host_pool.page_size))
             independent_transfers.append(transfer)
         return requests, independent_transfers
