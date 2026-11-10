@@ -1,6 +1,6 @@
 ---
 title: Jais 3
-description: "Deploy the IFM Jais 3 family with SGLang — BF16 recipes for six dense and Mixture-of-Experts checkpoints on NVIDIA H100 GPUs."
+description: "Deploy the IFM Jais 3 family with SGLang — BF16 recipes on NVIDIA H100 GPUs and a 0.9B recipe on Intel Xeon CPUs."
 tag: NEW
 ---
 
@@ -21,7 +21,9 @@ For other install methods, see [Install](/docs/get-started/install).
 
 </Accordion>
 
-Choose a model size to generate its H100 launch command. Five checkpoints run on a single node; 375B-A23B needs two. The recipes serve each repository's `main` branch.
+Choose hardware and a model size to generate its launch command. On H100, five checkpoints run on a single node; 375B-A23B needs two. The H100 recipes serve each repository's `main` branch.
+
+The **XEON** recipe covers `IFM/Jais-3-0.9B` only. Basic chat generation passed on Intel Xeon CPUs (6972P, TP6) with unmodified SGLang revision `99fd01047d67bb249641a8e50282a1a5218afc63`. It pins the tested checkpoint and an 8,192-token cache; full-context capacity, dataset accuracy, and performance were not evaluated on CPU. Use an installed SGLang CPU environment with its OpenMP and allocator setup.
 
 import { Deployment } from "/src/snippets/_deployment.jsx";
 import { config }     from "/src/snippets/configs/IFM/jais-3.jsx";
@@ -29,11 +31,11 @@ import { benchmarks } from "/src/snippets/configs/IFM/jais-3-benchmarks.jsx";
 
 <Deployment config={config} benchmarks={benchmarks} />
 
-Each accuracy value in the benchmark cards is the arithmetic mean of two full evaluation runs. Speed values come from a single run.
+Each H100 accuracy value in the benchmark cards is the arithmetic mean of two full evaluation runs. Speed values come from a single run. No Xeon benchmark values are reported.
 
 ## Playground
 
-The base recipes enable the `k2_horizon` reasoning parser. Use the Playground to configure the `k2_horizon` tool-call parser, TP and MoE expert-parallel overrides, NGRAM speculative decoding, PD disaggregation, and HiCache. A separate validation pass functionally exercised the tool-call parser on all six checkpoints; every other Playground override remains unverified.
+The H100 base recipes enable the `k2_horizon` reasoning parser. Use the Playground to configure the `k2_horizon` tool-call parser, TP and MoE expert-parallel overrides, NGRAM speculative decoding, PD disaggregation, and HiCache. A separate validation pass functionally exercised the tool-call parser on all six checkpoints; every other Playground override remains unverified. Xeon keeps the validated base command unchanged: parser separation, speculative decoding, expert parallelism, PD disaggregation, HiCache, and alternative TP settings are not enabled.
 
 import { Playground } from "/src/snippets/_playground.jsx";
 
@@ -102,16 +104,16 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 ## 2. Configuration tips
 
-- **Hardware and precision:** The current matrix covers NVIDIA H100 GPUs and BF16 checkpoints only.
-- **Parallelism:** Use TP1 for 0.9B, 3.7B, and 7B; TP2 for 32B; TP2 with expert parallelism (`--ep 2`) for MoVA-36B-A4B; and TP16 with `--ep 16` across two eight-GPU nodes for 375B-A23B. Every other recipe stays within one node.
-- **Attention:** The verified base recipes select FlashAttention-3 with `--attention-backend fa3`.
-- **Parsers:** The base recipes enable reasoning with `--reasoning-parser k2_horizon`. Enable `--tool-call-parser k2_horizon` from the **Parsers** card in the [Playground](#playground) when you need tool calling.
+- **Hardware and precision:** The matrix covers NVIDIA H100 GPUs and Intel Xeon CPUs with BF16 checkpoints. Xeon is limited to the validated 0.9B checkpoint.
+- **Parallelism:** On H100, use TP1 for 0.9B, 3.7B, and 7B; TP2 for 32B; TP2 with expert parallelism (`--ep 2`) for MoVA-36B-A4B; and TP16 with `--ep 16` across two eight-GPU nodes for 375B-A23B. Xeon uses single-node TP6. Every other recipe stays within one node.
+- **Attention:** The H100 recipes select FlashAttention-3 with `--attention-backend fa3`; Xeon uses the native CPU backend.
+- **Parsers:** The H100 recipes enable reasoning with `--reasoning-parser k2_horizon`. Enable `--tool-call-parser k2_horizon` from the **Parsers** card in the [Playground](#playground) when you need tool calling.
 - **MoVA-36B-A4B router provenance:** The MoVA-36B-A4B checkpoint's source xLLM router used two GEMM partitions. `--json-model-override-args '{"xllm_source_router_gemm_partitions":2}'` preserves its BF16 partial-GEMM rounding and FP32 reduction order; SGLang does not infer this source topology from runtime TP.
 - **375B-A23B memory:** The BF16 weights take about 760 GB. One node of eight H100 80 GB GPUs holds 640 GB, so the checkpoint does not fit on a single node; the recipe uses two nodes (16 GPUs, 1,280 GB). Run the generated command on both nodes, with node rank 0 on the head node and 1 on the other.
 - **375B-A23B loading:** The 375B-A23B recipe disables multithreaded weight loading with `--model-loader-extra-config '{"enable_multithread_load":false}'`.
 - **Playground features:** TP and EP settings other than the base recipes', NGRAM, PD disaggregation, and HiCache are optional, unverified command overrides. The tool-call parser was functionally exercised separately.
 - **Deliberate omissions:** Context parallelism is unsupported or unvalidated for xLLM. DP-attention and alternate MoE backend selectors are not exposed until they are validated.
-- **Validation:** All six recipes completed two full GSM8K evaluation runs on H100; see [Benchmark results](#3-benchmark-results).
+- **Validation:** All six H100 recipes completed two full GSM8K evaluation runs on H100; see [Benchmark results](#3-benchmark-results). Xeon passed a basic generation check only.
 
 ## 3. Benchmark results
 
@@ -134,7 +136,7 @@ Each checkpoint was evaluated twice, and the table shows both runs and their mea
 
 ### 4.1 Reasoning
 
-The base recipes include `--reasoning-parser k2_horizon`. The parser returns thinking in `reasoning_content` and the final answer in `content`.
+The H100 recipes include `--reasoning-parser k2_horizon`. The parser returns thinking in `reasoning_content` and the final answer in `content`. The Xeon recipe does not enable parser separation.
 
 The example output below was captured with the MoVA-36B-A4B checkpoint and both parser flags enabled.
 
