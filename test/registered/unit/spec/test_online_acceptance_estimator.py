@@ -214,7 +214,7 @@ class TestConfidenceSource(CustomTestCase):
     def test_source_selection(self):
         compact = RaggedVerifyMode.COMPACT
         self.assertTrue(self._builds(mode=compact, enable_field=True))
-        self.assertTrue(self._builds(mode=compact, enable_field=None))
+        self.assertFalse(self._builds(mode=compact, enable_field=None))
         self.assertFalse(self._builds(mode=compact, enable_field=False))
         self.assertFalse(self._builds(mode=compact, enable_field=True, use_online=True))
 

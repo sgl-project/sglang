@@ -37,19 +37,14 @@ def get_dspark_sample_from_anchor(draft_hf_config: Any) -> bool:
 
 
 def builds_confidence_head(draft_hf_config: Any) -> bool:
-    """Whether the draft builds its trained confidence head; ragged verify
-    without one takes its confidences from the online acceptance estimator."""
+    """Whether the draft builds its trained confidence head: only when its config
+    sets enable_confidence_head; ragged verify without one takes its confidences
+    from the online acceptance estimator."""
     if read_ragged_verify_mode() is RaggedVerifyMode.STATIC:
         return False
-    enabled = _cfg_get(draft_hf_config, "enable_confidence_head")
-    if enabled is False or envs.SGLANG_DSPARK_USE_ONLINE_ESTIMATOR.get():
+    if envs.SGLANG_DSPARK_USE_ONLINE_ESTIMATOR.get():
         return False
-    if enabled is None:
-        logger.warning(
-            "DSpark draft config has no enable_confidence_head field; treating the "
-            "confidence head as enabled."
-        )
-    return True
+    return bool(_cfg_get(draft_hf_config, "enable_confidence_head", False))
 
 
 def draft_uses_compressed_kv_attention() -> bool:
