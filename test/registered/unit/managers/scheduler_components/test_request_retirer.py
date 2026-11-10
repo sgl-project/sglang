@@ -9,7 +9,7 @@ from sglang.srt.managers.req_types import FINISH_ABORT, FINISH_LENGTH
 from sglang.srt.managers.scheduler_components import request_retirer
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.scheduler_test_utils import release_only_retirer
+from sglang.test.scheduler_test_utils import FakeReq, release_only_retirer
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
@@ -60,7 +60,7 @@ class TestReleaseStepsLiveInRequestRetirer(CustomTestCase):
 
 
 def _req(finished_reason, calls):
-    return SimpleNamespace(
+    return FakeReq(
         finished_reason=finished_reason,
         cache_request_handle=object(),
         session=SimpleNamespace(

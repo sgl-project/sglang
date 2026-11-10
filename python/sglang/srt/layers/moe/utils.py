@@ -42,7 +42,7 @@ class MoeA2ABackend(Enum):
     MORI = "mori"
     ASCEND_FUSEEP = "ascend_fuseep"
     ASCEND_OPS = "ascend_ops"
-    FLASHINFER = "flashinfer"
+    FLASHINFER = "flashinfer_nvlink_one_sided"
     MEGAMOE = "megamoe"
     DEEPEP_V2 = "deepep_v2"
     PPLX = "pplx"
@@ -53,6 +53,8 @@ class MoeA2ABackend(Enum):
     def _missing_(cls, value):
         if value is None:
             return cls.NONE
+        if value == "flashinfer":  # Deprecated alias for FLASHINFER.
+            return cls.FLASHINFER
         for member in cls:
             if value == member.value:
                 return member
@@ -1175,3 +1177,11 @@ def get_moe_weight_sizes(inter_dim, is_concat, is_packed, is_aiter_moe):
             w13_up_dim *= 2
 
     return (w13_up_dim, w2_down_dim, False if not is_aiter_moe else is_padded)
+
+
+def route_dropped_experts_to_local(
+    topk_weights: torch.Tensor, topk_ids: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Map -1 ids (EP-dropped, padded) to expert 0 at weight 0 for sgl-kernel-xpu."""
+    dropped = topk_ids < 0
+    return topk_weights.masked_fill(dropped, 0), topk_ids.masked_fill(dropped, 0)
