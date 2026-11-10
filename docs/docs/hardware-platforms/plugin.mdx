@@ -190,13 +190,27 @@ and memory budget.
 - Measure TTFT, decode latency/throughput, peak memory and retained KV capacity.
   Repeat representative points and separate prefill, decode and restore time.
 
-<Accordion title="Historical integrated-build comparison before the fixes">
+### Historical integrated-build comparison before the fixes
 
 ![Historical pre-fix integrated-build throughput and p95 time to first token](/images/kimi-k3-specialized-decode/integrated-comparison.png)
 
-This earlier integrated-build/profile comparison measured 595.606 to 660.974
-output tokens/s and p95 TTFT from 24.993 to 22.730 seconds. These measurements
-apply to the earlier integrated builds, before the AttnRes and Unicode fixes.
+The 2026-11-04 UTC integrated-build/profile comparison recorded the following
+results before the AttnRes and Unicode fixes.
+
+| Metric | Feature OFF | Feature ON + runtime profile | Change |
+| --- | ---: | ---: | ---: |
+| Output throughput | 595.606 tokens/s | 660.974 tokens/s | +10.97% |
+| p95 TTFT | 24.993 s | 22.730 s | −9.05% |
+
+The recorded OFF runtime revision was `c986a255`, using profile
+`k3-specialized-c986a255-8544b239-off-20261104`. The ON runtime revision was
+`7f3128d2`, using profile
+`k3-specialized-repair3-7f3128d2-5f6bb926-capacity133-on-20261105`.
+The ON memory plan changed `mem_fraction_static` from 0.90 to 0.909 and set
+`max-total-tokens=1144704` physical rows per rank and
+`max-mamba-cache-size=533` to retain the cache capacity and admission limit.
+These measurements apply to the earlier integrated builds. Full-model
+acceptance and matched performance for the current PR head remain pending.
 
 Each arm used three warmups and 128 formal requests, 32,768 input tokens with a
 27,648-token reused prefix, 300 output tokens including reasoning, and concurrency
@@ -210,7 +224,6 @@ The [original conditions and data](/images/kimi-k3-specialized-decode/measuremen
 plot source in `docs/images/kimi-k3-specialized-decode/plot_measurements.py` are
 preserved for reproduction.
 
-</Accordion>
 
 ## Architecture
 
