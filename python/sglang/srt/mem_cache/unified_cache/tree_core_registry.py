@@ -111,8 +111,7 @@ def _rust_fallback_reason(params: CacheInitParams) -> Optional[str]:
             return "the requested Rust TreeCore source build has no sources"
         return "this installation contains neither the Rust TreeCore extension nor its sources"
     # Even a cached source build needs these version queries for its fingerprint.
-    # Run the loader's probe under its lock, so schedulers that start together
-    # take turns and only one of them can install the pinned toolchain.
+    # The loader's probe and lock make concurrent schedulers install the toolchain once.
     from sglang.srt.rust_extensions.loader import (
         probe_rust_toolchain,
         toolchain_lock_path,
