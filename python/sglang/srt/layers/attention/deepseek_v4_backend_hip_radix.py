@@ -2368,7 +2368,7 @@ class DeepseekV4HipRadixBackend(
                     tail_lens.to(torch.int64),
                 )
                 metadata.low_ratio_req_indices = torch.cat(
-                    [req, req[-1:].expand(cap - real_rows)]
+                    [req, req.new_zeros(cap - real_rows)]
                 )
                 metadata.low_ratio_pos_i64 = pos_buf.to(torch.int64)
             metadata.late_layer_tail = LateLayerTail(

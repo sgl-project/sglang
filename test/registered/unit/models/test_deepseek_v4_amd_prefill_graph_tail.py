@@ -138,7 +138,7 @@ class TestHipPrefillGraphTail(CustomTestCase):
         )
         torch.testing.assert_close(
             metadata.low_ratio_req_indices,
-            torch.cat([req, req[-1:].expand(512 - real)]),
+            torch.cat([req, req.new_zeros(512 - real)]),
         )
         torch.testing.assert_close(metadata.low_ratio_pos_i64, tail.positions.long())
 
