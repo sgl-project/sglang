@@ -27,6 +27,7 @@ from sglang.kernels.ops.kvcache.dsa_fused_store_index_cache import (
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa import mqa_logits_fused_topk
 from sglang.srt.layers.attention.dsa.dsa_dcp import (
     dcp_all_gather_rows_,
     dcp_split_rows,
@@ -639,6 +640,16 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if self.use_aiter_fused_fp8_writer and not _FUSED_FP8_WRITER_LOGGED:
             logger.info("Enabled AITER fused FP8 DSA indexer writer")
             _FUSED_FP8_WRITER_LOGGED = True
+
+        self.init_mqa_logits_fused_topk()
+
+    def init_mqa_logits_fused_topk(self):
+        self.use_mqa_logits_fused_topk = (
+            _is_cuda
+            and mqa_logits_fused_topk.resolve_indexer_gate(
+                self,
+            )
+        )
 
     def _can_use_dsa_indexer_fusion(self, config, is_neox_style: bool) -> bool:
         return (
@@ -1922,6 +1933,21 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 topk_result[:q_offset],
             )
             return topk_result
+
+        if self.use_mqa_logits_fused_topk:
+            fused_topk_result = mqa_logits_fused_topk.mqa_logits_fused_topk(
+                self,
+                metadata,
+                q=q_fp8[:q_offset],
+                q_sf=None,
+                kv=kv_fp8,
+                weights=weights[:q_offset],
+                out=topk_result,
+                forward_batch=forward_batch,
+            )
+            if fused_topk_result is not None:
+                return fused_topk_result
+
         # Every DCP rank holds the whole index K: score 1/W of the rows each, then
         # all-gather the top-k.
         split = _is_hip and getattr(metadata, "dcp_size", 1) > 1

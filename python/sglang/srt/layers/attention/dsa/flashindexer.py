@@ -147,6 +147,8 @@ def attach_flashindexer_gate(indexer: nn.Module) -> None:
     indexer.flashindexer_bias = nn.Parameter(
         torch.zeros(n_heads, dtype=torch.float32), requires_grad=False
     )
+    if callable(getattr(indexer, "init_mqa_logits_fused_topk", None)):
+        indexer.init_mqa_logits_fused_topk()
 
 
 def flashindexer_select_heads(

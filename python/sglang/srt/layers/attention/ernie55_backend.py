@@ -136,6 +136,11 @@ class Ernie5_5MlaAttnBackend(DeepseekSparseAttnBackend):
             ks, ke = k_range
             lengths = lengths.masked_fill(~keep, 0)
             k_range = (ks, torch.where(keep, ke, ks))
+        if k_range is not None:
+            # exclude sliding_window tokens
+            ks, ke = k_range
+            ke = torch.max(ke - self.window, ks)
+            k_range = (ks, ke)
         return dataclasses.replace(
             metadata,
             attn_metadata=dataclasses.replace(

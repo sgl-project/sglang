@@ -37,7 +37,9 @@ class TestAttachFlashIndexerGate(CustomTestCase):
 
     def test_builds_the_checkpoint_params(self):
         indexer = _indexer()
+        indexer.init_mqa_logits_fused_topk = mock.Mock()
         attach_flashindexer_gate(indexer)
+        indexer.init_mqa_logits_fused_topk.assert_called_once_with()
         params = dict(indexer.named_parameters())
         gate = params[FLASHINDEXER_GATE_PARAM_SUFFIX]
         bias = params[FLASHINDEXER_BIAS_PARAM_SUFFIX]
