@@ -11,6 +11,9 @@ from sglang.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
     SharedReadEnds,
 )
+from sglang.srt.layers.attention.minimax_sparse_ops.msa_indexer_decode_cp import (
+    make_msa_v1_indexer_decode_cp,
+)
 from sglang.srt.layers.attention.minimax_sparse_ops.msa_plan import (
     MSAV1DecodeAttentionPlan,
     MSAV1DecodeIndexerPlan,
@@ -20,7 +23,7 @@ from sglang.srt.layers.attention.minimax_sparse_ops.msa_plan import (
 )
 from sglang.srt.mem_cache.minimax_m3_nvfp4_pool import MiniMaxM3Nvfp4KVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.runtime_context import get_parallel, get_spec
+from sglang.srt.runtime_context import get_exec, get_parallel, get_spec
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +89,15 @@ class MiniMaxSparseNvfp4AttnBackend(AttentionBackend):
                 dtype=torch.float8_e4m3fn,
                 device=runner.device,
             )
+        graph_config = get_exec().graph.cuda_graph_config
+        self._msa_v1_indexer_cp = make_msa_v1_indexer_decode_cp(
+            num_local_index_heads=self._msa_v1_num_index_heads,
+            max_rows=(graph_config.decode.max_bs if graph_config is not None else 0)
+            * (self.speculative_num_draft_tokens or 1),
+            max_pages=(self.max_context_len + self.page_size - 1) // self.page_size,
+            qmul4_available=self._msa_v1_qmul4_available,
+            device=runner.device,
+        )
         self._msa_v1_attention_workspace = None
         self._msa_v1_cuda_graph_plans = {}
         self._msa_v1_cuda_graph_attention_plans = {}
@@ -241,6 +253,7 @@ class MiniMaxSparseNvfp4AttnBackend(AttentionBackend):
                     num_index_heads=self._msa_v1_num_index_heads,
                     prefer_qmul4=self._msa_v1_qmul4_available,
                     fp8_fallback_scratch=self._msa_v1_index_fp8_scratch,
+                    indexer_cp=self._msa_v1_indexer_cp,
                 )
                 self._msa_v1_cuda_graph_plans[key] = plan
             attention_plan = self._msa_v1_cuda_graph_attention_plans.get(key)

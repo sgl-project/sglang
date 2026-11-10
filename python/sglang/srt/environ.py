@@ -2501,6 +2501,10 @@ class Envs:
     # Opt-in decode indexer context partitioning (gfx950 TP4, SM90 TP4/TP8). Keeps
     # the index cache replicated; gathers Q and exchanges local top-k candidates.
     SGLANG_MINIMAX_M3_INDEXER_CP = EnvBool(False)
+    # M3.1 NVFP4 (MSA-v1 Q8KV4) decode indexer context-parallel over attention TP2:
+    # each rank scores all index heads on half the pages; top-k is bit-identical.
+    # Set False to fall back to the replicated stock indexer.
+    SGLANG_OPT_MSA_V1_INDEXER_DECODE_CP = EnvBool(True)
     # gfx95: lightning-indexer K cache in fp8_e4m3fn (bf16 q x fp8 k in the scorers);
     # main attention K/V keep kv_cache_dtype.
     SGLANG_OPT_MINIMAX_M3_FP8_INDEX_CACHE = EnvBool(True)
