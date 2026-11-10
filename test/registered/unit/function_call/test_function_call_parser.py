@@ -3597,6 +3597,20 @@ class TestGlm47MoeDetector(unittest.TestCase):
         )
         self.assertEqual(result.normal_text, "")
 
+    def test_unclosed_trailing_calls_stay_in_normal_text(self):
+        """Openers left unclosed after the last complete call form no call, and
+        the text from the first of them is kept as normal text."""
+        call = (
+            "<tool_call>get_weather"
+            "<arg_key>city</arg_key><arg_value>Beijing</arg_value>"
+            "<arg_key>date</arg_key><arg_value>2024-06-27</arg_value>"
+            "</tool_call>"
+        )
+        tail = "<tool_call>get_weather<arg_key>city" * 3
+        result = self.detector.detect_and_parse(f"lead {call} mid {tail}", self.tools)
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.normal_text, f"lead  mid {tail}")
+
     def test_streaming_multiple_tool_calls(self):
         """Test streaming incremental parsing of multiple tool calls."""
         chunks = [
