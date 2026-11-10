@@ -5,7 +5,7 @@
 #   1. Rust radix TreeCore   built by pip install -e "python" (needs .git: setuptools-scm version)
 #   2. FlashInfer DynBlock   TRT-LLM MoE routing modules rebuilt for 1024 experts (K3.1 has 896)
 # verify_image.py fails the build if either fell back. Two more parts back opt-in paths:
-#   3. FlashInfer Prims-TS   main 26bb6dc9's prims_ts/ over 0.7.2, for --dsa-*-backend prims_ts
+#   3. FlashInfer Prims-TS   main 784bfaf5's prims_ts/ over 0.7.2, for --dsa-*-backend prims_ts
 #   4. Dynamo 1.6.0          ai-dynamo-runtime rebuilt with the session-affinity patches and the
 #                            K3.1 edits to dynamo.sglang, so Dynamo+SGLang serves K3.1 as is
 # FlashMLA and DeepGEMM come from the sgl-flash-mla and sgl-deep-gemm wheels python/pyproject.toml pins.
