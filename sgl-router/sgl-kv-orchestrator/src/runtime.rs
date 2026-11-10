@@ -325,10 +325,10 @@ impl Job {
         !self.releasing_pin && !self.attempted && !self.submitted && !self.quiescent
     }
 
-    fn has_final_demote_receipt(&self) -> bool {
-        // A DEMOTE receipt records what happened, not current residency.
+    fn has_final_transfer_receipt(&self) -> bool {
+        // A terminal transfer receipt is independent of current residency.
         // A queued operation can also be physically quiescent.
-        self.action == "sglang.demote"
+        matches!(self.action.as_str(), "sglang.prefetch" | "sglang.demote")
             && self.submitted
             && self.quiescent
             && matches!(
@@ -498,7 +498,12 @@ impl Actor {
                                 .jobs
                                 .iter()
                                 .filter_map(|id| {
-                                    self.jobs.get(id).map(|job| (id.clone(), job.polls + 1))
+                                    self.jobs
+                                        .get(id)
+                                        .filter(|job| {
+                                            !intent.released || !job.has_final_transfer_receipt()
+                                        })
+                                        .map(|job| (id.clone(), job.polls + 1))
                                 })
                                 .collect(),
                         )
@@ -558,11 +563,16 @@ impl Actor {
             WaitFor::Jobs(jobs) => {
                 let mut ready = true;
                 for (id, target) in jobs {
-                    let satisfied =
-                        |job: &Job| job.polls >= *target || job.has_final_demote_receipt();
-                    if !self.jobs.get(id).is_none_or(satisfied) {
+                    if !self
+                        .jobs
+                        .get(id)
+                        .is_none_or(|job| job.polls >= *target || self.needs_receipt_only(job))
+                    {
                         self.request_poll(id);
-                        ready &= self.jobs.get(id).is_none_or(satisfied);
+                        ready &= self
+                            .jobs
+                            .get(id)
+                            .is_none_or(|job| job.polls >= *target || self.needs_receipt_only(job));
                     }
                 }
                 ready
@@ -709,13 +719,14 @@ impl Actor {
         }));
     }
     fn request_poll(&mut self, id: &str) {
-        let Some(job) = self.jobs.get_mut(id) else {
+        let Some(job) = self.jobs.get(id) else {
             return;
         };
-        if job.has_final_demote_receipt() || self.busy.contains_key(&job.url) {
+        if self.needs_receipt_only(job) || self.busy.contains_key(&job.url) {
             return;
         }
         if !(self.workers)().contains(&job.url) {
+            let job = self.jobs.get_mut(id).expect("job exists");
             job.polls += 1;
             job.ready_end = 0;
             job.ready_at = None;
@@ -754,7 +765,13 @@ impl Actor {
         self.feedback.merge_worker(poll.feedback);
         self.invalidate_feedback(&poll.url, poll.effect);
         self.caps.insert(poll.url, poll.caps);
-        if let Some(job) = poll.job {
+        if let Some(job) = poll.job.filter(|job| {
+            // A terminal receipt may be acknowledged during a read-only poll.
+            // A late observation must not bring back an acknowledged job.
+            self.jobs
+                .get(&job.id)
+                .is_some_and(|current| Arc::ptr_eq(&current.prefix, &job.prefix))
+        }) {
             if job.quiescent {
                 let _ = self.book.mark_quiescent(&job.id);
             }
@@ -785,7 +802,15 @@ impl Actor {
                     .is_some_and(|b| !b.interests.is_empty())
         })
     }
+    fn needs_receipt_only(&self, job: &Job) -> bool {
+        job.has_final_transfer_receipt()
+            && (job.action == "sglang.demote"
+                || self.book.job(&job.id).is_some_and(|b| b.cancel_requested))
+    }
     fn drained(&self, job: &Job) -> bool {
+        if job.has_final_transfer_receipt() {
+            return true;
+        }
         self.busy.get(&job.url).and_then(Option::as_ref) != Some(&job.id)
             && job.quiescent
             && (job.action != "sglang.pin"
@@ -1548,7 +1573,7 @@ impl Actor {
         let mut sampled = BTreeSet::new();
         for id in ids[offset..].iter().chain(&ids[..offset]) {
             let job = &self.jobs[id];
-            if !job.has_final_demote_receipt() && sampled.insert(job.url.clone()) {
+            if !self.needs_receipt_only(job) && sampled.insert(job.url.clone()) {
                 let url = job.url.clone();
                 self.deferred_polls
                     .entry(url.clone())
@@ -1696,7 +1721,7 @@ impl WorkerPoll {
                 }
             }
         }
-        if job.has_final_demote_receipt() {
+        if job.action == "sglang.demote" && job.has_final_transfer_receipt() {
             job.last_error = None;
             return Ok(());
         }

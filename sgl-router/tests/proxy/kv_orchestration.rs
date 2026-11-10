@@ -419,6 +419,57 @@ async fn ready(router: &TestRouter, id: &str, message: &str) -> Value {
 }
 
 #[tokio::test]
+async fn completed_prefetch_can_be_acknowledged_during_shared_residency_query() {
+    let engine = Engine::start().await;
+    let router = router(&[&engine], false, true).await;
+    let target = prefix(vec![1, 2, 3, 4]);
+    for id in ["finished", "live"] {
+        start(&router, id).await;
+        submit(&router, id, "prepare", target.clone(), &engine).await;
+    }
+    let complete = ready(&router, "finished", "prepare").await;
+    assert_eq!(
+        complete["operations"][0]["result"]["update"]["status"],
+        "completed"
+    );
+    let live = ready(&router, "live", "prepare").await;
+    assert_eq!(
+        complete["operations"][0]["child_id"],
+        live["operations"][0]["child_id"]
+    );
+    event(&router, "finished", "task_finished", 1, "end").await;
+    assert_eq!(
+        query(&router, "finished", "prepare").await["quiescent"],
+        true
+    );
+
+    let delayed = Arc::new(DelayedQuery::default());
+    engine.state.lock().unwrap().delayed_query = Some(delayed.clone());
+    let observation = query(&router, "live", "prepare");
+    tokio::pin!(observation);
+    tokio::select! {
+        _ = &mut observation => panic!("residency query must wait for the worker"),
+        r = tokio::time::timeout(Duration::from_secs(2), delayed.started.notified()) => r.unwrap(),
+    }
+    let response = reqwest::Client::new()
+        .post(format!("{}/v1/kv/control", router.url))
+        .bearer_auth("test-control")
+        .json(&json!({"kind":"ack","task":task("finished"),"message_id":"prepare"}))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    delayed.release.notify_one();
+    assert_eq!(response["success"], true, "{response}");
+    assert_eq!(
+        observation.await["operations"][0]["ready_scope"]["end_token"],
+        4
+    );
+}
+
+#[tokio::test]
 async fn lifecycle_prefetch_reports_readiness_without_overriding_worker_selection() {
     for reorg in [false, true] {
         let a = Engine::start().await;
