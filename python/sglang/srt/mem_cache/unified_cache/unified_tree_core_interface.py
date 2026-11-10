@@ -529,6 +529,15 @@ class UnifiedTreeCoreInterface(ABC):
         ...
 
     @abstractmethod
+    def full_host_occupancy(self, include_duplicates: bool) -> tuple[int, int]:
+        """(host tokens whose node is still on the device, host tokens host
+        eviction can reclaim now). Reclaimable counts host-only nodes whose
+        whole subtree host eviction can take and, with ``include_duplicates``,
+        the device-resident nodes' host copies the write-back duplicate
+        reclaim frees. Walks the whole tree; not for scheduling paths."""
+        ...
+
+    @abstractmethod
     def all_values_flatten(self) -> torch.Tensor: ...
 
     @abstractmethod

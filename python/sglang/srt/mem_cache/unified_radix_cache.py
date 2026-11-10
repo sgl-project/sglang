@@ -514,6 +514,9 @@ class UnifiedRadixCache(BasePrefixCache):
         ] = {}
         self.storage_prefetch_retries = StoragePrefetchRetries()
         self.ongoing_backup: dict[int, tuple[NodeId, DecLockRefParams]] = {}
+        # host_tier_occupancy walks the tree; metrics read it at most this often.
+        self._host_tier_occupancy: tuple[int, int, int] = (0, 0, 0)
+        self._host_tier_occupancy_at = float("-inf")
         if self.buffer_pipeline is not None:
             self.buffer_pipeline.reset()
             # The dropped writes' content no longer reaches a storage ack.
@@ -1303,6 +1306,7 @@ class UnifiedRadixCache(BasePrefixCache):
                                 node_id,
                             )
                         else:
+                            self._record_write_back_backup_blocked(backup_kv)
                             logger.warning(
                                 "write_back: backup failed under host memory "
                                 "pressure but subtree drop declined (node "
@@ -1394,6 +1398,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 node_id,
             )
         else:
+            self._record_write_back_backup_blocked(backup_kv)
             logger.warning(
                 "write_back: backup failed under host memory pressure but "
                 "subtree drop declined (node locked); root node %d stays "
@@ -1407,6 +1412,19 @@ class UnifiedRadixCache(BasePrefixCache):
             and self.cache_controller is not None
             and self.cache_controller.write_policy == "write_through"
         )
+
+    def _record_write_back_backup_blocked(self, backup_kv: BackupKV) -> None:
+        """Count device tokens a write-back eviction could neither back up nor drop."""
+        if self.metrics_collector is None:
+            return
+        blocked_tokens = sum(
+            self.tree_core.build_backup_spec(node_id)[0].numel()
+            for node_id in backup_kv.node_ids
+        )
+        if blocked_tokens > 0:
+            self.metrics_collector.increment_write_back_backup_blocked_tokens(
+                blocked_tokens
+            )
 
     def _record_dropped_tokens(self, dropped_tokens: int, reason: str) -> None:
         """Record logical KV tokens irreversibly dropped without a host backup."""
@@ -2656,6 +2674,13 @@ class UnifiedRadixCache(BasePrefixCache):
             return
         if not buffer_mode and self.cache_controller.prefetch_rate_limited():
             stats["declined_rate_limited"] += 1
+            if (
+                self.enable_storage_metrics
+                and self.storage_metrics_collector is not None
+            ):
+                self.storage_metrics_collector.log_storage_prefetch_rate_limited_tokens(
+                    prefetch_length
+                )
             # Paced: the limiter clears as transfers finish, not on the next pass.
             self.storage_prefetch_retries.poll_miss(req_id, storage_hit_end)
             return
@@ -3441,6 +3466,25 @@ class UnifiedRadixCache(BasePrefixCache):
         stats["l3_demand_requests"] += 1
         stats["l1l2_miss_tokens"] += requested
         stats["l3_miss_tokens"] += miss
+
+    def host_tier_occupancy(self, max_age_s: float = 1.0) -> tuple[int, int, int]:
+        """Full host-tier breakdown: (host copies of device-resident KV, L3->L2
+        prefetch staging, room a storage prefetch could obtain now). The tree
+        walk is refreshed at most every ``max_age_s`` seconds."""
+        cc = self.cache_controller
+        if cc is None:
+            return 0, 0, 0
+        now = time.monotonic()
+        if now - self._host_tier_occupancy_at >= max_age_s:
+            mirror, reclaimable = self.tree_core.full_host_occupancy(
+                self.is_write_back
+                and not envs.SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM.get()
+            )
+            staging = cc.prefetch_tokens_occupied if self.enable_storage else 0
+            room = cc.mem_pool_host.available_size() + reclaimable
+            self._host_tier_occupancy = (mirror, staging, room)
+            self._host_tier_occupancy_at = now
+        return self._host_tier_occupancy
 
     def prefetch_outcome_stats_snapshot(self) -> dict:
         return self._prefetch_outcome_stats.copy()

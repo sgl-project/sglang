@@ -863,6 +863,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
     def total_size(self) -> tuple[int, int]:
         return self._binding.total_size()
 
+    def full_host_occupancy(self, include_duplicates: bool) -> tuple[int, int]:
+        return self._binding.full_host_occupancy(include_duplicates)
+
     def all_values_flatten(self) -> torch.Tensor:
         return self._binding.all_values_flatten()
 
