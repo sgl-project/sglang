@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
@@ -191,13 +192,28 @@ class SchedulePolicy:
         enable_hierarchical_cache: bool,
         enable_priority_scheduling: bool,
         schedule_low_priority_values_first: bool,
+        shortest_prefill_aging_factor: float = 0.0,
     ):
         self.policy = self._validate_and_adjust_policy(policy, tree_cache)
+        if not math.isfinite(shortest_prefill_aging_factor) or (
+            shortest_prefill_aging_factor < 0
+        ):
+            raise ValueError(
+                f"shortest_prefill_aging_factor must be finite and >= 0, got {shortest_prefill_aging_factor}"
+            )
+        if (
+            shortest_prefill_aging_factor
+            and self.policy != CacheAwarePolicy.SHORTEST_PREFILL_FIRST
+        ):
+            raise ValueError(
+                "shortest_prefill_aging_factor requires schedule_policy=shortest-prefill-first"
+            )
         self.tree_cache = tree_cache
         self.enable_hierarchical_cache = enable_hierarchical_cache
         self.enable_priority_scheduling = enable_priority_scheduling
         self.schedule_low_priority_values_first = schedule_low_priority_values_first
         self.priority_sign = 1 if schedule_low_priority_values_first else -1
+        self.shortest_prefill_aging_factor = shortest_prefill_aging_factor
         self._shortest_prefill_calls = 0
         self._waiting_prefix_refresh_calls = 0
 
@@ -245,7 +261,11 @@ class SchedulePolicy:
                     waiting_queue, temporary_deprioritized, processed_tokens
                 )
             elif policy == CacheAwarePolicy.SHORTEST_PREFILL_FIRST:
-                self._sort_by_shortest_prefill(waiting_queue, temporary_deprioritized)
+                self._sort_by_shortest_prefill(
+                    waiting_queue,
+                    temporary_deprioritized,
+                    processed_tokens=processed_tokens,
+                )
                 self._shortest_prefill_calls += 1
                 if waiting_queue and self._shortest_prefill_calls % 128 == 1:
                     logger.info(
@@ -420,20 +440,39 @@ class SchedulePolicy:
         )
         return max(1, len(r.origin_input_ids) + len(r.output_ids) - cached)
 
+    def _shortest_prefill_rank(self, r: Req, processed_tokens: int) -> float:
+        # Aging lowers the rank by the prefill work done while the request
+        # waited, bounding its wait to about work / factor processed tokens.
+        waited_tokens = max(0, processed_tokens - r.arrival_processed_tokens)
+        return (
+            self._shortest_prefill_work(r)
+            - self.shortest_prefill_aging_factor * waited_tokens
+        )
+
     def _sort_by_shortest_prefill(
-        self, waiting_queue: List[Req], temporary_deprioritized: Set[int]
+        self,
+        waiting_queue: List[Req],
+        temporary_deprioritized: Set[int],
+        *,
+        processed_tokens: int,
     ) -> None:
         # Prioritize short uncached prefills while deferring duplicate prefixes.
         waiting_queue.sort(
             key=lambda r: (
                 r.rid in temporary_deprioritized,
-                self._shortest_prefill_work(r),
+                self._shortest_prefill_rank(r, processed_tokens),
                 r.time_stats.wait_queue_entry_time,
             )
         )
 
     def shortest_prefill_chunk_limit(
-        self, chunked_req: Req, waiting_queue: List[Req], budget: int, page_size: int
+        self,
+        chunked_req: Req,
+        waiting_queue: List[Req],
+        budget: int,
+        page_size: int,
+        *,
+        processed_tokens: int,
     ) -> Optional[int]:
         """Cap the active prefill chunk to reserve tokens for shorter waiting requests."""
         if (
@@ -442,11 +481,16 @@ class SchedulePolicy:
         ):
             return None
         remaining = len(chunked_req.full_untruncated_fill_ids) - chunked_req.prefix_len
+        chunked_waited = max(0, processed_tokens - chunked_req.arrival_processed_tokens)
+        chunked_rank = remaining - self.shortest_prefill_aging_factor * chunked_waited
         reserved = 0
         for req in waiting_queue:
             work = self._shortest_prefill_work(req)
             charge = _ceil_div(work, page_size) * page_size
-            if work >= remaining or reserved + charge > budget - page_size:
+            if (
+                self._shortest_prefill_rank(req, processed_tokens) >= chunked_rank
+                or reserved + charge > budget - page_size
+            ):
                 break
             reserved += charge
         if not reserved:

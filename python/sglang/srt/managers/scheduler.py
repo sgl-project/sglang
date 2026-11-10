@@ -1530,6 +1530,7 @@ class Scheduler(
             self.enable_hierarchical_cache,
             self.enable_priority_scheduling,
             self.schedule_low_priority_values_first,
+            shortest_prefill_aging_factor=get_schedule().shortest_prefill_aging_factor,
         )
         self.prefill_delayer: Optional[PrefillDelayer] = None
         self.prefill_bs_tracker = RecentPrefillBatchSizeTracker(
@@ -4623,6 +4624,7 @@ class Scheduler(
                 self.waiting_queue,
                 adder.rem_chunk_tokens or 0,
                 self.page_size,
+                processed_tokens=self.processed_tokens_counter,
             )
             if adder.add_chunked_req(resumed_req) is None:
                 # Its last chunk is in this batch.
@@ -5010,8 +5012,9 @@ class Scheduler(
         batch.after_idle_gap = self._sched_idled
         self._sched_idled = False
 
-        # Accumulate the prefill-token counter used by the HRRN scheduling policy. Decode / prebuilt batches contribute 0.
-        if batch.extend_num_tokens:
+        # Accumulate the prefill-token counter used for HRRN and shortest-prefill-first aging.
+        # A batch reused for decode keeps its stale extend_num_tokens, so count extend batches only.
+        if batch.forward_mode.is_extend() and batch.extend_num_tokens:
             self.processed_tokens_counter += batch.extend_num_tokens
 
         if self.scripted_scheduler_hook is not None:
