@@ -192,6 +192,34 @@ class TestFlashAttentionPagedMHA(unittest.TestCase):
             self.assertTrue(torch.equal(k_descale, torch.full((2, 1), 2.0)))
             self.assertTrue(torch.equal(v_descale, torch.full((2, 1), 4.0)))
 
+    def test_kvcache_descales_follow_each_calls_batch_layout(self):
+        # topk > 1 target verify: the cascade's suffix call runs every draft
+        # token as its own sequence (B=1, 12 draft tokens -> 12 sequences), while
+        # the descales were built for the request batch.
+        backend = _backend()
+        kernel = Mock(return_value="out")
+        backend._fa_kernels = {4: (None, kernel)}
+        k_descale = torch.full((1, 4), 2.0)
+        v_descale = torch.full((1, 4), 4.0)
+        for num_seqs in (1, 12):
+            out = backend.flash_attn_with_kvcache(
+                q="q",
+                cu_seqlens_q=torch.arange(num_seqs + 1, dtype=torch.int32),
+                k_descale=k_descale,
+                v_descale=v_descale,
+                ver=4,
+            )
+            self.assertEqual(out, "out")
+            sent = kernel.call_args.kwargs
+            self.assertTrue(
+                torch.equal(sent["k_descale"], torch.full((num_seqs, 4), 2.0))
+            )
+            self.assertTrue(
+                torch.equal(sent["v_descale"], torch.full((num_seqs, 4), 4.0))
+            )
+        backend.flash_attn_with_kvcache(q="q", cu_seqlens_q=torch.arange(3), ver=4)
+        self.assertNotIn("k_descale", kernel.call_args.kwargs)
+
 
 def _fa3_backend():
     backend = _backend()
