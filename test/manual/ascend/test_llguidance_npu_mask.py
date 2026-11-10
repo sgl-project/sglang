@@ -13,7 +13,7 @@ documents the skip so the module still collects and passes on this machine.
 import math
 import sys
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 try:
     import torch
@@ -70,10 +70,16 @@ class _FakeNpuOps:
 def _install_npu_mock(test_case):
     """Replace the sampler module for this test case."""
     fake_ops = _FakeNpuOps()
-    sampler = MagicMock(apply_token_bitmask=fake_ops.apply_token_bitmask)
-    patcher = patch.dict(sys.modules, {"sgl_kernel_npu.operators.sampler": sampler})
-    patcher.start()
-    test_case.addCleanup(patcher.stop)
+    module_name = "sgl_kernel_npu.operators.sampler"
+    if module_name in sys.modules:
+        test_case.addCleanup(
+            sys.modules.__setitem__, module_name, sys.modules[module_name]
+        )
+    else:
+        test_case.addCleanup(sys.modules.pop, module_name, None)
+    sys.modules[module_name] = MagicMock(
+        apply_token_bitmask=fake_ops.apply_token_bitmask
+    )
     return fake_ops
 
 
