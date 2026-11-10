@@ -2696,7 +2696,7 @@ class FlashInferMultiStepDraftBackend:
             else None
         )
         self.cuda_graph_window_kv_indices = None
-        self.attn_backends: List[FlashInferAttnBackend] = []
+        self.attn_backends: List[AttentionBackend] = []
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends.append(
                 FlashInferAttnBackend(
