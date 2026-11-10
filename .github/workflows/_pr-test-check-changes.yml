@@ -142,6 +142,7 @@ jobs:
               - ".github/workflows/_pr-test-check-changes.yml"
               - ".github/workflows/pr-test-multimodal-gen.yml"
               - ".github/workflows/_diffusion-pr-test-stage.yml"
+              - "scripts/ci/cuda/ci_install_dependency.sh"
               - "scripts/ci/cuda/ci_install_dependency_diffusion.sh"
               - "scripts/ci/runner_configs.yml"
               - "python/pyproject.toml"
