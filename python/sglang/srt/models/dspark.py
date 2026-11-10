@@ -19,7 +19,7 @@ from sglang.srt.distributed.device_communicators.vocab_gather import make_vocab_
 from sglang.srt.environ import envs
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
-from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc, layer_window_locs
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dflash import DFlashDraftModel, DFlashMLAAttention
 from sglang.srt.runtime_context import get_parallel
@@ -741,6 +741,12 @@ class DSparkDraftMixin:
             hasattr(pool, "get_key_buffer") and hasattr(pool, "get_value_buffer")
         ):
             return None
+        # The fused kernel shares one location vector across every layer.
+        if any(
+            not pool.layer_router.layer(layer.self_attn.attn.layer_id).owner
+            for layer in layers
+        ):
+            return None
         k_norm_weights = self._fused_k_norm_weights()
         attn0 = layers[0].self_attn
         head_dim = attn0.head_dim
@@ -851,9 +857,7 @@ class DSparkDraftMixin:
         cache_loc_2d: Optional[torch.Tensor] = None,
         commit_lens: Optional[torch.Tensor] = None,
         target_hidden_is_projected: bool = False,
-        swa_write_ids: Optional[
-            Callable[[torch.Tensor], Optional[torch.Tensor]]
-        ] = None,
+        swa_loc: Optional[torch.Tensor] = None,
     ) -> None:
         ctx_hidden = (
             target_hidden
@@ -861,32 +865,18 @@ class DSparkDraftMixin:
             else self.project_target_hidden(target_hidden)
         )
 
-        prefix_valid = cache_loc_2d is not None and commit_lens is not None
-        if prefix_valid:
-            columns = torch.arange(cache_loc_2d.shape[1], device=cache_loc_2d.device)
-            committed = columns[None, :] < commit_lens[:, None]
-            # Rejected rows may hold invalid ids; mask them before any table gather.
-            full_loc = torch.where(committed, cache_loc_2d, 0)
-        else:
-            full_loc = cache_loc
-        swa_loc = None if swa_write_ids is None else swa_write_ids(full_loc)
-        write_loc = KVWriteLoc(full_loc, swa_loc=swa_loc, physical=True)
-
-        # The fused writer takes one location vector for every layer. A routed
-        # SWA pool needs a different vector for its non-owner layers, so use the
-        # per-layer router whenever a secondary location was resolved.
-        bundle = None if swa_loc is not None else self._fused_kv_write_bundle(pool)
+        bundle = self._fused_kv_write_bundle(pool)
         if bundle is not None:
             from sglang.kernels.ops.speculative.dspark.fused_kv_write import (
                 fused_kv_norm_rope_write,
             )
 
-            if prefix_valid:
-                locs = full_loc.reshape(-1)
+            if cache_loc_2d is not None and commit_lens is not None:
+                locs = cache_loc_2d.reshape(-1)
                 write_commit_lens = commit_lens
                 locs_row_width = cache_loc_2d.shape[1]
             else:
-                locs = full_loc
+                locs = cache_loc
                 write_commit_lens = None
                 locs_row_width = None
             fused_kv_norm_rope_write(
@@ -920,6 +910,7 @@ class DSparkDraftMixin:
                     positions=positions,
                     hidden_states=ctx_hidden,
                     cache_loc=cache_loc,
+                    swa_cache_loc=swa_loc,
                     cache_loc_2d=cache_loc_2d,
                     commit_lens=commit_lens,
                 )
@@ -933,21 +924,36 @@ class DSparkDraftMixin:
                 k = attn.apply_k_rope(positions, k)
                 k = k.view(-1, attn.num_kv_heads, attn.head_dim)
                 v = v.view(-1, attn.num_kv_heads, attn.head_dim)
-            route = pool.layer_router.layer(attn.attn.layer_id)
-            if prefix_valid:
-                route.store_prefix_valid(
-                    layer=attn.attn,
-                    loc_info=write_loc,
-                    commit_lens=commit_lens,
-                    cache_k=k,
-                    cache_v=v,
-                    k_scale=attn.attn.k_scale,
-                    v_scale=attn.attn.v_scale,
+            if cache_loc_2d is not None and commit_lens is not None:
+                pool.layer_router.layer(attn.attn.layer_id).store_prefix(
+                    attn.attn,
+                    KVWriteLoc(
+                        cache_loc_2d,
+                        window_locs=layer_window_locs(
+                            pool,
+                            attn.attn.layer_id,
+                            None if swa_loc is None else swa_loc.view_as(cache_loc_2d),
+                        ),
+                        physical=True,
+                    ),
+                    commit_lens,
+                    k,
+                    v,
+                    attn.attn.k_scale,
+                    attn.attn.v_scale,
                 )
             else:
-                route.store(
+                # `cache_loc` comes from `TargetHiddenKvInjector.ids_for`,
+                # already in the ids the draft pool indexes.
+                pool.layer_router.layer(attn.attn.layer_id).store(
                     attn.attn,
-                    write_loc,
+                    KVWriteLoc(
+                        cache_loc,
+                        window_locs=layer_window_locs(
+                            pool, attn.attn.layer_id, swa_loc
+                        ),
+                        physical=True,
+                    ),
                     k,
                     v,
                     attn.attn.k_scale,
@@ -997,14 +1003,12 @@ class DSparkDraftMixin:
 
 
 class DSparkDraftModel(DSparkDraftMixin, DFlashDraftModel):
-    context_kv_output_projection = "o_proj"
-
     def prune_to_ctx_kv_injection(self) -> None:
         self.markov_head = None
         self.confidence_head = None
         for layer in self.layers:
             layer.mlp = None
-            setattr(layer.self_attn, self.context_kv_output_projection, None)
+            layer.self_attn.o_proj = None
         torch.cuda.empty_cache()
 
 

@@ -13,6 +13,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
 from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
+from sglang.srt.mem_cache.kv.decl import window_sub_pool_name
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec, MHAView
 from sglang.srt.mem_cache.kv.routed_cache import RoutedKVCache
 from sglang.srt.mem_cache.layout.fused_draft import (
@@ -24,24 +25,17 @@ from sglang.srt.mem_cache.layout.fused_draft import (
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_draft_pool import bind_fused_draft
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
-from sglang.srt.model_executor.pool_configurator import HybridSWAPoolConfigurator
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.models.spark2_5 import Spark2_5ForCausalLM
 from sglang.srt.models.spark2_5_dspark import DSparkSpark25DraftModel
-from sglang.srt.runtime_context import (
-    get_context,
-    get_memory,
-    get_parallel,
-    get_schedule,
-)
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.speculative.dspark_components.dspark_config import (
     parse_dspark_draft_config,
 )
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
     TargetHiddenKvInjector,
 )
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.unified_allocator_fixtures import arena_of, plan_stand_in
@@ -107,26 +101,40 @@ def _fused_pool(draft, *, page_size, target_window):
         _runtime_config(draft.config, is_draft=True),
         num_layers=2,
         attn_tp_size=1,
+        window=draft.sliding_layer_window_size(draft.config),
     )
     assert set(profile.kinds) == {LAYER_WINDOW}
     placement = place_fused_draft(
         profile=profile,
         num_runners=1,
-        ctx=PlacementContext(host_names=("full", "swa"), target_window=target_window),
+        ctx=PlacementContext(
+            host_names=("full", window_sub_pool_name(target_window)),
+            target_windows=(target_window,),
+        ),
         store_dtype=torch.float32,
     ).placement
-    assert placement.hosts() == (("swa",) if target_window >= 2 else ("full",))
+    draft_window = draft.sliding_layer_window_size(draft.config)
+    draft_host = window_sub_pool_name(draft_window)
+    target_host = window_sub_pool_name(target_window)
+    assert placement.hosts() == (draft_host,)
+    windows = tuple(dict.fromkeys((target_host, draft_host)))
     specs = [
         MHASubPoolSpec(
             name=name,
-            layer_num=1,
+            layer_num=0 if name in placement.new_bands else 1,
             head_num=1,
             head_dim=4,
             store_dtype=torch.float32,
             grow_direction=direction,
             draft_region=placement.region(name),
         )
-        for name, direction in (("full", "up"), ("swa", "down"))
+        for name, direction in (
+            ("full", "up"),
+            *(
+                (name, "down" if i == len(windows) - 1 else "float")
+                for i, name in enumerate(windows)
+            ),
+        )
     ]
     arena = arena_of(
         total_bytes=64 * page_size * sum(s.entry_bytes() for s in specs),
@@ -136,13 +144,23 @@ def _fused_pool(draft, *, page_size, target_window):
         fused_draft=placement,
     )
     views = {
-        s.name: MHAView(arena=arena, spec=s, page_size=page_size, model_layer_ids=(i,))
+        s.name: MHAView(
+            arena=arena,
+            spec=s,
+            page_size=page_size,
+            model_layer_ids=() if s.layer_num == 0 else (i,),
+        )
         for i, s in enumerate(specs)
     }
     target_pool = RoutedKVCache(
         arena=arena,
         owner="full",
-        layer_maps=[("full", views["full"], {0: 0}), ("swa", views["swa"], {1: 0})],
+        layer_maps=[
+            ("full", views["full"], {0: 0}),
+            (target_host, views[target_host], {1: 0}),
+        ],
+        windows={target_host: target_window},
+        roles={"swa": target_host},
         page_size=page_size,
         start_layer=0,
         end_layer=1,
@@ -151,7 +169,7 @@ def _fused_pool(draft, *, page_size, target_window):
         head_dim=4,
     )
     allocator = ChainAllocator(
-        roles=ChainRoles(owner="full", window="swa"),
+        roles=ChainRoles(owner="full", window=target_host, windows=windows),
         arena=arena,
         kvcache=target_pool,
         views=views,
@@ -188,11 +206,10 @@ def _swa_pool(draft, *, unified, page_size, target_window=2):
         allocator.full_attn_allocator.ids.bind(
             virtual // page_size, full_loc // page_size
         )
-        allocator.swa_attn_allocator.ids.bind(
+        host = pool.layer_router.storage_name(pool.layer_router.route(0).sub_pool)
+        allocator.window_allocators[host].ids.bind(
             virtual // page_size, swa_loc // page_size
         )
-        if target_window < 2:
-            swa_loc = full_loc
     else:
         pool = SWAKVPool(
             size=32 * page_size,
@@ -297,6 +314,8 @@ class TestSpark25DSpark(CustomTestCase):
         self.enterContext(
             patch("sglang.srt.layers.rotary_embedding.base._is_cpu", True)
         )
+        for name in ("_is_cuda", "_is_hip", "_cpu_has_amx_support"):
+            self.enterContext(patch(f"sglang.srt.mem_cache.memory_pool.{name}", False))
 
     def test_bundled_config_keeps_target_and_draft_attention_independent(self):
         target = _config()
@@ -340,7 +359,7 @@ class TestSpark25DSpark(CustomTestCase):
                     block_pos_offsets=torch.arange(2),
                 )
                 torch.testing.assert_close(
-                    reader.ids_in(reader.window_kv_kind, reader.req_to_token.flatten()),
+                    reader.ids_in(reader.window_storage, reader.req_to_token.flatten()),
                     swa_loc,
                 )
                 for commits in (None, torch.tensor([1, 1]), torch.tensor([0, 0])):
@@ -361,6 +380,12 @@ class TestSpark25DSpark(CustomTestCase):
                             ).flatten()
                             locations.flatten()[~valid] = 999999
                             indices = valid.nonzero().flatten()
+                        plan = reader.plan(
+                            req_pool_indices=torch.arange(2),
+                            seq_lens=torch.tensor([2, 2]),
+                            seq_lens_cpu=torch.tensor([2, 2]),
+                            write_virtual=reader.req_to_token.flatten(),
+                        )
                         injector.inject_target_hidden(
                             target_hidden=hidden,
                             target_hidden_is_projected=True,
@@ -368,6 +393,7 @@ class TestSpark25DSpark(CustomTestCase):
                             positions=positions,
                             cache_loc_2d=locations if commits is not None else None,
                             commit_lens=commits,
+                            iteration_ids=plan,
                         )
                         for layer_id, layer in enumerate(draft.layers):
                             qkv = F.linear(hidden, layer.self_attn.q_k_v_proj.weight)
@@ -400,7 +426,7 @@ class TestSpark25DSpark(CustomTestCase):
                 model_runner=SimpleNamespace(
                     device="cpu",
                     runner_ids=reader,
-                    prefill_attention_backend_str="triton",
+                    prefill_attention_backend_str="torch_native",
                 ),
                 device="cpu",
                 verify_num_draft_tokens=2,
@@ -435,18 +461,8 @@ class TestSpark25DSpark(CustomTestCase):
                         iteration_ids=plan,
                     )
                 else:
-                    mapping = (
-                        reader.space(reader.window_kv_kind).table
-                        if unified
-                        else pool.full_to_swa_index_mapping
-                    )
-                    saved_mapping = mapping.clone()
-                    mapping.zero_()
-                    try:
-                        placement = injector.place_prefill(batch)
-                    finally:
-                        mapping.copy_(saved_mapping)
-                    self.assertIsNone(placement.swa_loc)
+                    placement = injector.place_prefill(batch)
+                    torch.testing.assert_close(placement.swa_loc, swa_loc)
                     positions = torch.tensor([0, 1, 0, 1])
                     indices = torch.tensor([0, 2])
                     injector.inject_prefill(
@@ -470,37 +486,6 @@ class TestSpark25DSpark(CustomTestCase):
                     torch.testing.assert_close(
                         pool.get_value_buffer(layer_id), expected_v
                     )
-
-    def test_private_swa_draft_budget_scales_with_swa_capacity(self):
-        target = _runtime_config(_config(), is_draft=False)
-        draft = _runtime_config(configure_spark25_dspark(_config()), is_draft=True)
-        self.enterContext(get_memory().override(enable_unified_memory=False))
-        self.enterContext(get_schedule().override(swa_full_tokens_ratio=0.25))
-        configurator = HybridSWAPoolConfigurator(
-            SimpleNamespace(
-                model_config=target,
-                kv_cache_dtype=torch.float32,
-                kv_cache_dtype_str="auto",
-                layer_info=SimpleNamespace(
-                    full_attention_layer_ids=[3], swa_attention_layer_ids=[0, 1, 2]
-                ),
-                spec_algorithm=SpeculativeAlgorithm.DSPARK,
-                is_draft_worker=False,
-                spec_aux_config=SimpleNamespace(
-                    draft_model_config=draft, dflash_draft_num_layers=2
-                ),
-                dflash_draft_cell_size_per_token=64,
-                draft_attn_tp_size=1,
-                sliding_window_size=2,
-                page_size=1,
-                fused_entry_bytes=lambda _: None,
-            )
-        )
-        # One target FULL layer and three target + two draft SWA layers, 32 B/row.
-        sizes = configurator.calculate_pool_sizes(128 * 32 + 32 * 5 * 32, page_size=1)
-        self.assertEqual(
-            (sizes.full_max_total_num_tokens, sizes.swa_max_total_num_tokens), (128, 32)
-        )
 
     def test_bundled_loader_and_shared_embedding(self):
         target = Spark2_5ForCausalLM(config=_config())
@@ -559,9 +544,15 @@ class TestSpark25DSpark(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "target hidden shape"):
             draft.project_target_hidden(hidden[:, :8])
 
-    def test_context_kv_uses_sliding_rope_and_committed_physical_rows(self):
+    def test_pruned_context_kv_uses_sliding_rope_and_committed_rows(self):
         draft = DSparkSpark25DraftModel(config=configure_spark25_dspark(_config()))
         _initialize(draft)
+        draft.prune_to_ctx_kv_injection()
+        self.assertIsNone(draft.markov_head)
+        self.assertIsNone(draft.confidence_head)
+        for layer in draft.layers:
+            self.assertIsNone(layer.mlp)
+            self.assertIsNone(layer.self_attn.out_proj)
         pool = MHATokenToKVPool(
             size=16,
             page_size=1,

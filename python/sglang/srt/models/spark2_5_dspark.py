@@ -1,4 +1,4 @@
-from typing import Callable, Iterable, Optional, Tuple
+from typing import Iterable, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -9,7 +9,7 @@ from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.radix_attention import AttentionType
-from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc, layer_window_locs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.dspark import DSparkDraftModel
 from sglang.srt.models.spark2_5 import Spark2_5Attention, Spark2_5DecoderLayer
@@ -47,7 +47,6 @@ class Spark2_5DSparkDecoderLayer(Spark2_5DecoderLayer):
 class DSparkSpark25DraftModel(DSparkDraftModel):
     decoder_layer_cls = Spark2_5DSparkDecoderLayer
     supports_fused_context_kv = False
-    context_kv_output_projection = "out_proj"
 
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
         with layer_stack():
@@ -57,6 +56,14 @@ class DSparkSpark25DraftModel(DSparkDraftModel):
             RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
             for _ in range(self.num_context_features)
         )
+
+    def prune_to_ctx_kv_injection(self) -> None:
+        self.markov_head = None
+        self.confidence_head = None
+        for layer in self.layers:
+            layer.mlp = None
+            layer.self_attn.out_proj = None
+        torch.cuda.empty_cache()
 
     @torch.no_grad()
     def forward(
@@ -112,12 +119,10 @@ class DSparkSpark25DraftModel(DSparkDraftModel):
         pool,
         positions: torch.Tensor,
         cache_loc: torch.Tensor,
-        swa_write_ids: Optional[
-            Callable[[torch.Tensor], Optional[torch.Tensor]]
-        ] = None,
         cache_loc_2d: Optional[torch.Tensor] = None,
         commit_lens: Optional[torch.Tensor] = None,
         target_hidden_is_projected: bool = False,
+        swa_loc: Optional[torch.Tensor] = None,
     ) -> None:
         ctx_hidden = (
             target_hidden
@@ -125,15 +130,9 @@ class DSparkSpark25DraftModel(DSparkDraftModel):
             else self.project_target_hidden(target_hidden)
         )
         prefix_valid = cache_loc_2d is not None and commit_lens is not None
-        if prefix_valid:
-            columns = torch.arange(cache_loc_2d.shape[1], device=cache_loc_2d.device)
-            committed = columns[None, :] < commit_lens[:, None]
-            # Rejected rows may hold invalid ids; mask them before any table gather.
-            full_loc = torch.where(committed, cache_loc_2d, 0)
-        else:
-            full_loc = cache_loc
-        swa_loc = None if swa_write_ids is None else swa_write_ids(full_loc)
-        write_loc = KVWriteLoc(full_loc, swa_loc=swa_loc, physical=True)
+        loc = cache_loc_2d if prefix_valid else cache_loc
+        if prefix_valid and swa_loc is not None:
+            swa_loc = swa_loc.view_as(cache_loc_2d)
         for layer in self.layers:
             attn = layer.self_attn
             qkv, _ = attn.q_k_v_proj(ctx_hidden)
@@ -143,15 +142,20 @@ class DSparkSpark25DraftModel(DSparkDraftModel):
             k = k.view(-1, attn.num_kv_heads, attn.head_dim)
             v = v.view(-1, attn.num_kv_heads, attn.head_dim)
             route = pool.layer_router.layer(attn.attn.layer_id)
+            write_loc = KVWriteLoc(
+                loc,
+                window_locs=layer_window_locs(pool, attn.attn.layer_id, swa_loc),
+                physical=True,
+            )
             if prefix_valid:
-                route.store_prefix_valid(
-                    layer=attn.attn,
-                    loc_info=write_loc,
-                    commit_lens=commit_lens,
-                    cache_k=k,
-                    cache_v=v,
-                    k_scale=attn.attn.k_scale,
-                    v_scale=attn.attn.v_scale,
+                route.store_prefix(
+                    attn.attn,
+                    write_loc,
+                    commit_lens,
+                    k,
+                    v,
+                    attn.attn.k_scale,
+                    attn.attn.v_scale,
                 )
             else:
                 route.store(

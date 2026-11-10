@@ -5,7 +5,7 @@ from unittest import mock
 import torch
 
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
-from sglang.srt.mem_cache.kv.router import KVLayerRouter, PlainPoolRouter
+from sglang.srt.mem_cache.kv.router import PlainPoolRouter
 from sglang.srt.models.dspark import DSparkDraftMixin
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
@@ -78,69 +78,6 @@ class DSparkTargetHiddenProjectionTest(CustomTestCase):
             worker.spec_v2_attn_backends, (target.model_runner.attn_backend,)
         )
 
-    def test_non_spark_writer_routes_swa_locations(self) -> None:
-        """Base DSpark writes must carry locations for routed SWA layers."""
-        attention = _Attention()
-        draft_model = object.__new__(DSparkDraftMixin)
-        draft_model.layers = [SimpleNamespace(self_attn=attention)]
-        draft_model.project_target_hidden = lambda hidden: hidden
-        draft_model._fused_kv_write_bundle = lambda _pool: None
-        draft_model._stacked_ctx_kv_params = lambda: None
-
-        writes = {}
-
-        class _View:
-            def set_kv_buffer(self, _layer, loc, *_args, **_kwargs):
-                writes["loc"] = loc
-
-            def set_kv_buffer_prefix_valid(
-                self, _layer, loc, _commit_lens, *_args, **_kwargs
-            ):
-                writes["prefix_loc"] = loc
-
-        pool = SimpleNamespace()
-        pool.layer_router = KVLayerRouter.from_layer_maps(
-            pool,
-            [
-                ("full", _View(), {1: 0}),
-                (IdSpaceKind.SLIDING_WINDOW, _View(), {0: 0}),
-            ],
-            owner="full",
-        )
-        runner_ids = SimpleNamespace(
-            swa_write_ids=mock.Mock(side_effect=lambda full_loc: full_loc + 48)
-        )
-        injector = TargetHiddenKvInjector(
-            draft_model=draft_model,
-            draft_model_runner=SimpleNamespace(
-                token_to_kv_pool=pool, runner_ids=runner_ids
-            ),
-            model_runner=SimpleNamespace(device=torch.device("cpu")),
-            device=torch.device("cpu"),
-            verify_num_draft_tokens=2,
-            block_pos_offsets=torch.arange(2),
-        )
-
-        injector.inject_target_hidden(
-            target_hidden=torch.zeros(2, 3),
-            cache_loc=torch.tensor([2, 4]),
-            positions=torch.arange(2),
-            target_hidden_is_projected=True,
-        )
-        self.assertEqual(writes["loc"].loc.tolist(), [50, 52])
-        self.assertTrue(writes["loc"].physical)
-
-        injector.inject_target_hidden(
-            target_hidden=torch.zeros(4, 3),
-            cache_loc=torch.tensor([2, 4, 6, 8]),
-            cache_loc_2d=torch.tensor([[2, 4], [6, 8]]),
-            commit_lens=torch.tensor([1, 2]),
-            positions=torch.arange(4),
-            target_hidden_is_projected=True,
-        )
-        self.assertEqual(writes["prefix_loc"].tolist(), [[50, 48], [54, 56]])
-        self.assertEqual(runner_ids.swa_write_ids.call_count, 2)
-
     def test_preprojected_hidden_is_not_projected_again(self) -> None:
         attention = _Attention()
         draft_model = SimpleNamespace(
@@ -159,7 +96,7 @@ class DSparkTargetHiddenProjectionTest(CustomTestCase):
             draft_model=draft_model,
             draft_model_runner=SimpleNamespace(
                 token_to_kv_pool=pool,
-                runner_ids=SimpleNamespace(swa_write_ids=mock.Mock(return_value=None)),
+                runner_ids=SimpleNamespace(),
             ),
             model_runner=SimpleNamespace(device=torch.device("cpu")),
             device=torch.device("cpu"),
