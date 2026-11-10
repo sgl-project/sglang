@@ -8,7 +8,12 @@ import torch
 from diffusers.models.embeddings import Timesteps
 from torch import nn
 
-from sglang.kernels.ops.diffusion import BitExactFusionGate, tensors_equal
+from sglang.kernels.ops.diffusion import (
+    BitExactFusionGate,
+    modulate_scale_shift,
+    residual_gate_add,
+    tensors_equal,
+)
 from sglang.multimodal_gen.configs.models.dits.anima import AnimaDiTConfig
 from sglang.multimodal_gen.configs.models.fsdp import is_module_list_entry_in
 from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
@@ -30,6 +35,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    is_in_breakable_cuda_graph,
+)
 
 logger = init_logger(__name__)
 
@@ -60,28 +68,25 @@ def _anima_rope(q, k, cos, sin):
         )
 
         if can_use_fused_rope_rotate_half_fp32(q, k, cos, sin):
-            sig = (q.device, q.dtype, q.shape)
-            verified = _ANIMA_ROPE.is_verified(sig)
-            if verified or not torch.cuda.is_current_stream_capturing():
-                try:
-                    out = fused_rope_rotate_half_fp32(q, k, cos, sin)
-                except Exception as exc:
-                    _ANIMA_ROPE.on_exception(exc, logger=logger)
-                else:
-                    if verified:
-                        return out
-                    return _ANIMA_ROPE.accept_or_fallback(
-                        out,
-                        _anima_rope_eager(q, k, cos, sin),
-                        sig=sig,
-                        equal=tensors_equal,
-                        logger=logger,
-                    )
+            return _ANIMA_ROPE.run(
+                lambda: fused_rope_rotate_half_fp32(q, k, cos, sin),
+                lambda: _anima_rope_eager(q, k, cos, sin),
+                sig=(q.device, q.dtype, q.shape),
+                equal=tensors_equal,
+                logger=logger,
+            )
     return _anima_rope_eager(q, k, cos, sin)
 
 
 def _is_anima_block(name, module):
     return is_module_list_entry_in(name, ("transformer_blocks",))
+
+
+def _anima_residual_add(residual, update, gate):
+    # Fuse in BCG warmup/capture; dispatch overhead outweighs the savings in eager.
+    if is_in_breakable_cuda_graph() and not torch.compiler.is_compiling():
+        return residual_gate_add(residual, update, gate)
+    return residual + gate * update
 
 
 class AnimaPatchEmbed(nn.Module):
@@ -164,7 +169,23 @@ class AnimaAdaLayerNorm(nn.Module):
         modulation = self.linear_2(modulation)[0]
         modulation = modulation + temb[..., : modulation.shape[-1]]
         values = modulation.unsqueeze(1).chunk(3 if self.gated else 2, dim=-1)
-        out = self.norm(x) * (1 + values[1]) + values[0]
+        norm_x = self.norm(x)
+        if (
+            norm_x.is_cuda
+            and norm_x.dtype in (torch.float16, torch.bfloat16)
+            and not torch.compiler.is_compiling()
+        ):
+            # Batched chunk views are strided; only copy the small [B, D]
+            # modulation rows, never the [B, S, D] activation.
+            out = modulate_scale_shift(
+                norm_x,
+                values[1].squeeze(1).contiguous(),
+                values[0].squeeze(1).contiguous(),
+            )
+        else:
+            # Keep the original graph for torch.compile: the CUDA dispatch
+            # checks pointer alignment, which cannot be traced in a full graph.
+            out = norm_x * (1 + values[1]) + values[0]
         return (out, values[2]) if self.gated else out
 
 
@@ -278,15 +299,15 @@ class AnimaTransformerBlock(nn.Module):
         attn_mask_meta=None,
     ):
         x, gate = self.norm1(hidden_states, embedded_timestep, temb)
-        hidden_states = hidden_states + gate * self.attn1(
-            x, rope=rope, attn_mask_meta=attn_mask_meta
+        hidden_states = _anima_residual_add(
+            hidden_states, self.attn1(x, rope=rope, attn_mask_meta=attn_mask_meta), gate
         )
         x, gate = self.norm2(hidden_states, embedded_timestep, temb)
-        hidden_states = hidden_states + gate * self.attn2(
-            x, context=encoder_hidden_states
+        hidden_states = _anima_residual_add(
+            hidden_states, self.attn2(x, context=encoder_hidden_states), gate
         )
         x, gate = self.norm3(hidden_states, embedded_timestep, temb)
-        return hidden_states + gate * self.ff(x)
+        return _anima_residual_add(hidden_states, self.ff(x), gate)
 
 
 class AnimaTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):

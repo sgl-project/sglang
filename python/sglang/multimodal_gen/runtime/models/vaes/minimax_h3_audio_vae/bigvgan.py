@@ -49,7 +49,6 @@ class SnakeBeta(nn.Module):
 
         self.alpha.requires_grad = alpha_trainable
         self.beta.requires_grad = alpha_trainable
-        self.no_div_by_zero = 0.000000001
 
     def forward(self, x):
         alpha = self.alpha.unsqueeze(0).unsqueeze(-1)

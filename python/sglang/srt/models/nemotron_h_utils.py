@@ -37,15 +37,18 @@ def _declaration(pattern: str, layer_idx: int):
     )
 
 
+def stage_facts(pattern: str, layer_idx: int):
+    """The one stage each Nemotron-H layer declares, from the pattern alone:
+    the model's shared declaration function, which its layers declare with
+    too (see make_layers)."""
+    return (_declaration(pattern, layer_idx),)
+
+
 def make_stage_boundary(layer_norm: RMSNorm, *, pattern: str, layer_idx: int):
     from sglang.srt.layers import layernorm_sp
 
     if get_parallel().attn_cp_size > 1 or layernorm_sp.layernorm_sp_enabled():
         raise NotImplementedError("a Nemotron stage with attention CP or LayerNorm SP")
-    (boundary,) = append_stages(
-        (
-            _declaration(pattern, layer_idx),
-            layer_norm,
-        ),
-    )
+    (declaration,) = stage_facts(pattern, layer_idx)
+    (boundary,) = append_stages((declaration, layer_norm))
     return boundary

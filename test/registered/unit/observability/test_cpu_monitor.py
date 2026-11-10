@@ -2,12 +2,12 @@ import threading
 import time
 import unittest
 from collections import namedtuple
-from unittest.mock import MagicMock, patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=60, suite="base-a-test-cpu", nightly=True)
-register_cpu_ci(est_time=5, suite="stage-b-test-cpu-intel")
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestCpuMonitor(unittest.TestCase):
@@ -37,64 +37,69 @@ class TestCpuMonitor(unittest.TestCase):
         self.assertIsNotNone(value)
         self.assertGreater(value, 0)
 
+    def test_repeated_cpu_clock_resets_preserve_counter(self):
+        """CPU clock resets must keep the monitor running and its counter growing."""
+        from prometheus_client import CollectorRegistry, Counter
 
-class TestCpuMonitorMocked(unittest.TestCase):
-    """Fast, deterministic tests for start_cpu_monitor_thread using mocks."""
-
-    @patch("prometheus_client.Counter")
-    @patch("sglang.srt.observability.cpu_monitor.psutil.Process")
-    @patch("sglang.srt.observability.cpu_monitor.time.sleep")
-    def test_delta_calculation_over_two_iterations(
-        self, mock_sleep, MockProcess, MockCounter
-    ):
-        """Verify delta=(user_diff+system_diff) and last_times update across iterations."""
         from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 
+        registry = CollectorRegistry()
+        counter = Counter(
+            "test_process_cpu_seconds_total",
+            "CPU time",
+            ["component"],
+            registry=registry,
+        )
+        labeled = counter.labels(component="restored")
         CpuTimes = namedtuple("CpuTimes", ["user", "system"])
-        mock_process = MockProcess.return_value
-        mock_process.cpu_times.side_effect = [
-            CpuTimes(user=1.0, system=0.5),  # initial (L18)
-            CpuTimes(user=2.5, system=1.0),  # iteration 1 (L22)
-            CpuTimes(user=4.0, system=2.0),  # iteration 2 (L22)
+        readings = [
+            CpuTimes(10.0, 5.0),
+            CpuTimes(10.25, 5.25),  # Normal increment.
+            CpuTimes(0.1, 0.05),  # First restore.
+            CpuTimes(0.3, 0.15),  # Increment from the new baseline.
+            CpuTimes(0.01, 0.02),  # Second restore.
+            CpuTimes(0.11, 0.12),
         ]
+        test_thread = threading.current_thread()
+        sleep = Mock(side_effect=[None] * 5 + [SystemExit])
 
-        # Allow 2 loop iterations, then stop the thread.
-        # Override threading.excepthook to suppress the pytest warning from
-        # the intentional exception used to terminate the monitor loop.
-        remaining = [2]
-        orig_hook = threading.excepthook
+        def monitor_sleep(interval):
+            if threading.current_thread() is test_thread:
+                return sleep(interval)
+            # The smoke test leaves a daemon monitor running in this process.
+            time.sleep(interval)
 
-        def controlled_sleep(seconds):
-            if remaining[0] <= 0:
-                raise SystemExit
-            remaining[0] -= 1
+        with (
+            patch("prometheus_client.Counter", return_value=counter),
+            patch(
+                "sglang.srt.observability.cpu_monitor.psutil.Process"
+            ) as mock_process,
+            patch(
+                "sglang.srt.observability.cpu_monitor.time",
+                SimpleNamespace(sleep=monitor_sleep),
+            ),
+            patch(
+                "sglang.srt.observability.cpu_monitor.threading.Thread"
+            ) as mock_thread,
+            patch.object(labeled, "inc", wraps=labeled.inc) as increment,
+        ):
+            mock_process.return_value.cpu_times.side_effect = readings
+            start_cpu_monitor_thread("restored")
+            # Run the monitor synchronously so any counter error fails the test.
+            with self.assertRaises(SystemExit):
+                mock_thread.call_args.kwargs["target"]()
 
-        mock_sleep.side_effect = controlled_sleep
-        threading.excepthook = lambda args: None
-
-        mock_labeled = MagicMock()
-        MockCounter.return_value.labels.return_value = mock_labeled
-
-        thread = start_cpu_monitor_thread("my_component", interval=3.0)
-        thread.join(timeout=1.0)
-        threading.excepthook = orig_hook
-
-        # Thread is daemon (L29)
-        self.assertTrue(thread.daemon)
-
-        # Sleep called with correct interval (L21)
-        mock_sleep.assert_called_with(3.0)
-
-        # Counter labeled with component (L26)
-        MockCounter.return_value.labels.assert_called_with(component="my_component")
-
-        # Delta calculation (L23-24) and counter increment (L26)
-        inc_calls = mock_labeled.inc.call_args_list
-        self.assertEqual(len(inc_calls), 2)
-        # Iteration 1: (2.5 - 1.0) + (1.0 - 0.5) = 2.0
-        self.assertAlmostEqual(inc_calls[0].args[0], 2.0)
-        # Iteration 2: (4.0 - 2.5) + (2.0 - 1.0) = 2.5 (proves last_times updated)
-        self.assertAlmostEqual(inc_calls[1].args[0], 2.5)
+        self.assertEqual(increment.call_count, 5)
+        for call, expected in zip(
+            increment.call_args_list, (0.5, 0.15, 0.3, 0.03, 0.2)
+        ):
+            self.assertAlmostEqual(call.args[0], expected)
+        self.assertAlmostEqual(
+            registry.get_sample_value(
+                "test_process_cpu_seconds_total", {"component": "restored"}
+            ),
+            1.18,
+        )
 
 
 if __name__ == "__main__":

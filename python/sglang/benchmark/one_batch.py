@@ -64,11 +64,8 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
-from sglang.srt.arg_groups.overrides import (
-    declare_resolution,
-    resolution_result,
-    resolving_view,
-)
+from sglang.srt.arg_groups.model_override_base import resolving_view
+from sglang.srt.arg_groups.overrides import declare_resolution, resolution_result
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed import bootstrap
@@ -78,9 +75,12 @@ from sglang.srt.distributed.parallel_state import (
 )
 from sglang.srt.entrypoints.engine import _set_envs_and_config
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
+from sglang.srt.hf_transformers import get_tokenizer
+from sglang.srt.layers.dp_attention import require_mlp_sync, require_mlp_tp_gather
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
+from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler_components.dp_attn import prepare_mlp_sync_batch_raw
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
@@ -107,12 +107,9 @@ from sglang.srt.utils import (
     get_bool_env_var,
     kill_process_tree,
     maybe_reindex_device_id,
-    require_mlp_sync,
-    require_mlp_tp_gather,
     set_gpu_proc_affinity,
     suppress_other_loggers,
 )
-from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 
 
 def _init_process_global_configs() -> None:
@@ -123,6 +120,7 @@ def _init_process_global_configs() -> None:
     """
     initialize_moe_config()
     initialize_fp8_gemm_config()
+    initialize_bf16_gemm_config()
     initialize_fp4_gemm_config()
 
 
@@ -424,7 +422,7 @@ def prepare_inputs_for_correctness_test(bench_args, tokenizer, custom_prompts):
         )
         req.full_untruncated_fill_ids = req.origin_input_ids
         req.logprob_start_len = -1
-        req.set_extend_range(len(req.prefix_indices), len(req.origin_input_ids))
+        req.extend_end = len(req.origin_input_ids)
         reqs.append(req)
 
     return input_ids, reqs
@@ -438,13 +436,10 @@ def prepare_extend_inputs_for_correctness_test(
         req.full_untruncated_fill_ids.extend(input_ids[i][bench_args.cut_len :])
         if model_runner is not None:
             # Use req.kv.req_pool_idx instead of i to handle slot 0 padding correctly
-            req.prefix_indices = model_runner.req_to_token_pool.req_to_token[
-                req.kv.req_pool_idx, : bench_args.cut_len
-            ].to(req.prefix_indices.dtype)
+            # The cut prefix is already in the request's row from the first extend.
+            req.prefix_len = bench_args.cut_len
             req.logprob_start_len = -1
-        req.set_extend_range(
-            len(req.prefix_indices), len(req.full_untruncated_fill_ids)
-        )
+        req.extend_end = len(req.full_untruncated_fill_ids)
     return reqs
 
 
@@ -471,7 +466,7 @@ def prepare_synthetic_inputs_for_latency_test(
         )
         req.full_untruncated_fill_ids = req.origin_input_ids
         req.logprob_start_len = -1
-        req.set_extend_range(len(req.prefix_indices), len(req.origin_input_ids))
+        req.extend_end = len(req.origin_input_ids)
         reqs.append(req)
 
     return reqs
@@ -500,6 +495,7 @@ def extend(reqs, model_runner):
     dummy_tree_cache = TreeCacheNamespace(
         page_size=get_schedule().page_size,
         device=model_runner.device,
+        req_to_token_pool=model_runner.req_to_token_pool,
         token_to_kv_pool_allocator=model_runner.token_to_kv_pool_allocator,
     )
 

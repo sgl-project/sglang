@@ -13,12 +13,14 @@ The copy kernels are CUDA-only, so the two conv/temporal helpers are stubbed and
 the side-state legs are exercised at their real call sites on CPU tensors.
 """
 
+import math
 import unittest
 from types import SimpleNamespace
 from unittest import mock
 
 import torch
 
+from sglang.srt.mem_cache.device_pool_info import MambaStateBufferInfo
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -78,6 +80,10 @@ def _make_pools(with_side_state: bool):
 
     host = MambaPoolHost.__new__(MambaPoolHost)
     host.device_pool = device_pool
+    host.buffer_info = MambaStateBufferInfo(
+        temporal=device_pool.mamba_cache.temporal,
+        conv=tuple(device_pool.mamba_cache.conv),
+    )
     host.page_size = 1
     host.layout = "page_first"
     host.device = "cpu"
@@ -141,6 +147,24 @@ class TestHiCacheMambaSlotSideStates(CustomTestCase):
             with_side.get_size_per_token(),
             without_side.get_size_per_token() + side_bytes,
         )
+
+    def test_mapping_lengths_carry_each_side_state_buffer(self):
+        # Each side state is its own mmap (init_kv_buffer), so the budget books
+        # it the way it is mapped: rounding up to a whole hugepage on its own,
+        # like the temporal and conv buffers.
+        token_layer_slots = NUM_HOST_SLOTS * NUM_LAYERS
+        with_side, _ = _make_pools(True)
+        self.assertEqual(
+            with_side.get_mapping_lengths(),
+            [
+                token_layer_slots * math.prod(TEMPORAL_SHAPE) * 2,
+                token_layer_slots * math.prod(CONV_SHAPE) * 2,
+                NUM_HOST_SLOTS * math.prod(SIDE_CONV_SHAPE) * 2,
+                NUM_HOST_SLOTS * NGRAM_WIDTH * 8,
+            ],
+        )
+        without_side, _ = _make_pools(False)
+        self.assertEqual(len(without_side.get_mapping_lengths()), 2)
 
     def test_side_state_survives_the_host_round_trip(self):
         host, device_pool = _make_pools(True)

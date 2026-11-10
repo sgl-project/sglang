@@ -19,7 +19,8 @@ from sglang.srt.layers.quantization.fp8_utils import (
 )
 from sglang.srt.layers.quantization.quark.schemes import QuarkLinearScheme
 from sglang.srt.layers.quantization.utils import requantize_with_max_scale
-from sglang.srt.utils import get_bool_env_var, is_hip, set_weight_attrs
+from sglang.srt.layers.utils.common import set_weight_attrs
+from sglang.srt.utils import get_bool_env_var, is_hip
 
 __all__ = ["QuarkW8A8Fp8"]
 
@@ -28,6 +29,8 @@ _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
+
+    from sglang.kernels.ops.gemm.smallm_fp8_gfx950 import smallm_fp8_gemm_enabled
 
 
 class QuarkW8A8Fp8(QuarkLinearScheme):
@@ -192,6 +195,18 @@ class QuarkW8A8Fp8(QuarkLinearScheme):
         # Activations must be a plain bf16 tensor: per-channel FP8 (weight_scale
         # [N, 1]) is gated off the aiter fused RMSNorm+quant kernel upstream by
         # _is_block_scale_fp8, so the per-token quant happens in apply_fp8_linear.
+        # The one exception is the per-token (fp8, scale [M, 1]) pair that the
+        # Qwen3.5 producers send to the gfx950 small-M FP8 GEMM (smallm_fp8_gfx950).
+        input_scale = layer.input_scale
+        if isinstance(x, tuple) and _use_aiter and smallm_fp8_gemm_enabled():
+            x, input_scale = x
+            assert (
+                self.per_token
+                and layer.weight_scale is not None
+                and x.dtype == torch.float8_e4m3fn
+                and input_scale.dtype == torch.float32
+                and input_scale.numel() == x.shape[0]
+            ), "quark W8A8 FP8 only accepts a per-token (fp8, scale) tuple"
         assert not isinstance(x, tuple), (
             "quark W8A8 FP8 linear received a pre-quantized tuple; a fused "
             "RMSNorm+quant producer was not gated off by _is_block_scale_fp8 "
@@ -206,7 +221,7 @@ class QuarkW8A8Fp8(QuarkLinearScheme):
             x,
             layer.weight,
             layer.weight_scale,
-            input_scale=layer.input_scale,
+            input_scale=input_scale,
             bias=bias,
             cutlass_fp8_supported=self.cutlass_fp8_supported,
             use_per_token_if_dynamic=self.per_token,

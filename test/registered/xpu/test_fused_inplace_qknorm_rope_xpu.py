@@ -14,7 +14,7 @@ import torch
 from sglang.srt.utils import is_xpu
 from sglang.test.ci.ci_register import register_xpu_ci
 
-register_xpu_ci(est_time=10, suite="nightly-xpu-1-gpu", nightly=True)
+register_xpu_ci(est_time=10, suite="nightly-xpu-kernel-main-1-gpu", nightly=True)
 
 if is_xpu():
     from sgl_kernel import fused_inplace_qknorm_rope

@@ -9,10 +9,11 @@ across the token chain, a single-token step streams one at a time.
 
 import cuda.bindings.driver as cuda
 import cutlass
-import cutlass.cute as cute
+from cutlass import cute
 from cutlass._mlir.dialects import nvvm
 from cutlass.cute.nvgpu import cpasync
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.cute_aot_cache import get_jit_cache
 
 WARP_SIZE = 32
@@ -47,9 +48,6 @@ P2_LANES_STREAM = 16
 
 HEAD_DIM = TILE_K
 VEC_SIZE = HEAD_DIM // WARP_SIZE
-# Conv weights live in one smem array: [W, K] for q/k, then [W, V] for v.
-V_WEIGHT_BASE = KERNEL_WIDTH * HEAD_DIM
-CONV_WEIGHT_ELEMS = 2 * V_WEIGHT_BASE
 
 
 def _stream_state(*, block_threads: int, num_spec: int) -> bool:
@@ -111,6 +109,24 @@ def _state_tile_v(*, block_threads: int, num_spec: int) -> int:
         # the q/k/decay register arrays and LDS sequence.
         return max(min_rows, 32)
     return max(min_rows, HEAD_DIM // NUM_STATE_STAGES)
+
+
+def _ld_p1(invariant, x, coord):
+    """Load one phase-1 input element, optionally as ld.global.nc."""
+    if not invariant:
+        return cutlass.Float32(x[coord])
+    atom = cute.make_copy_atom(
+        cute.nvgpu.CopyG2ROp(),
+        x.element_type,
+        num_bits_per_copy=x.element_type.width,
+        invariant=True,
+    )
+    src = cute.make_tensor(
+        x.iterator + cute.crd2idx(coord, x.layout), cute.make_layout((1,))
+    )
+    dst = cute.make_rmem_tensor(cute.make_layout((1,)), x.element_type)
+    cute.copy(atom, src, dst)
+    return cutlass.Float32(dst[0])
 
 
 def _issue_state_tile(
@@ -209,6 +225,9 @@ def kda_decode_mtp_kernel(
     # block width signals -- see _block_threads).
     STREAM_STATE = _stream_state(block_threads=BLOCK_THREADS, num_spec=NUM_SPEC)
     TILES_PER_PASS = 1 if STREAM_STATE else NUM_V_TILES
+    # Read-only phase-1 inputs may then be scheduled ahead of the scratch/ring
+    # stores. Narrow block only: on the wide block the early loads lose.
+    P1_NC = BLOCK_THREADS == BLOCK_THREADS_NARROW
     smem = cutlass.utils.SmemAllocator()
     sQ = smem.allocate_tensor(cutlass.Float32, smem_qk_layout, 16)
     sK = smem.allocate_tensor(cutlass.Float32, smem_qk_layout, 16)
@@ -217,12 +236,7 @@ def kda_decode_mtp_kernel(
     sVall = smem.allocate_tensor(
         cutlass.Float32, cute.make_layout((T_LOOP * HEAD_DIM,)), 16
     )
-    sConvW = smem.allocate_tensor(
-        cutlass.Float32,
-        cute.make_layout((CONV_WEIGHT_ELEMS,)),
-        16,
-    )
-    sState = smem.allocate_tensor(cutlass.Float32, smem_state_layout, 16)
+    sState = smem.allocate_tensor(h0.element_type, smem_state_layout, 16)
     if cutlass.const_expr(APPLY_ONORM):
         sOall = smem.allocate_tensor(
             cutlass.Float32, cute.make_layout((T_LOOP * HEAD_DIM,)), 16
@@ -231,6 +245,13 @@ def kda_decode_mtp_kernel(
         # Compile-time-dead placeholder; avoids charging the non-norm path
         # for an output tile it never touches.
         sOall = sVall
+    if cutlass.const_expr(APPLY_ONORM):
+        sOnormGate = smem.allocate_tensor(
+            cutlass.Float32, cute.make_layout((T_LOOP * HEAD_DIM,)), 16
+        )
+        sOnormWeight = smem.allocate_tensor(
+            cutlass.Float32, cute.make_layout((HEAD_DIM,)), 16
+        )
     r_q = cute.make_rmem_tensor(
         cute.make_layout((P2_VEC,), stride=(1,)), cutlass.Float32
     )
@@ -307,19 +328,17 @@ def kda_decode_mtp_kernel(
                         cutlass.Float32(cs_k[slot, head_off + k_idx, w])
                     )
 
-    if tidx < HEAD_DIM:
-        cute.autovec_copy(w_k[(head_off + tidx, None)], r_w4)
-        for w in range(KERNEL_WIDTH):
-            sConvW[w * HEAD_DIM + tidx] = r_w4[w]
-    if tidx < HEAD_DIM:
-        cute.autovec_copy(w_v[(head_off + tidx, None)], r_w4)
-        for w in range(KERNEL_WIDTH):
-            sConvW[V_WEIGHT_BASE + w * HEAD_DIM + tidx] = r_w4[w]
-    if warp_idx < P1_QKG_WARPS and warp_idx % P1_NUM_JOBS == 0:
-        for i in range(VEC_SIZE):
-            cute.autovec_copy(w_q[(head_off + i * 32 + in_warp_tid, None)], r_w4)
-            for w in range(KERNEL_WIDTH):
-                r_wq[w * VEC_SIZE + i] = r_w4[w]
+    if warp_idx < P1_QKG_WARPS:
+        if p1_job == 0:
+            for i in range(VEC_SIZE):
+                cute.autovec_copy(w_q[(head_off + i * 32 + in_warp_tid, None)], r_w4)
+                for w in range(KERNEL_WIDTH):
+                    r_wq[w * VEC_SIZE + i] = r_w4[w]
+        elif p1_job == 1:
+            for i in range(VEC_SIZE):
+                cute.autovec_copy(w_k[(head_off + i * 32 + in_warp_tid, None)], r_w4)
+                for w in range(KERNEL_WIDTH):
+                    r_wq[w * VEC_SIZE + i] = r_w4[w]
 
     # The 128-bit copy atom maps each thread to coalesced K vectors.
     gState = h0[(slot, i_hv, None, None)]
@@ -338,200 +357,36 @@ def kda_decode_mtp_kernel(
     scratch_row = intermediate_state_indices[i_n]
     r_exp_A = cutlass.Float32(0.0)
 
-    cute.arch.barrier()
+    # Private weights remove the initial cross-warp dependency.
 
     if warp_idx < P1_QKG_WARPS:
         if p1_job == 2:
             r_exp_A = cute.math.exp(cutlass.Float32(A_log[i_hv]), fastmath=True)
+            # The gate warps do not use conv-window registers. Hold invariant
+            # bias values there until phase 2 overwrites the state registers.
+            for i in range(VEC_SIZE):
+                r_state[i] = cutlass.Float32(
+                    dt_bias[i_hv * HEAD_DIM + i * WARP_SIZE + in_warp_tid]
+                )
         # Warp starting at token p1_par needs its window advanced that
         # many steps; the g path is pointwise and needs none.
         if p1_job == 0:
-            for _pi in cutlass.range(cutlass.min(p1_par, n_tok)):
-                for i in range(VEC_SIZE):
-                    _xn = cutlass.Float32(x_q[0, bos + _pi, i_hv, i * 32 + in_warp_tid])
-                    r_state[0 * VEC_SIZE + i] = r_state[1 * VEC_SIZE + i]
-                    r_state[1 * VEC_SIZE + i] = r_state[2 * VEC_SIZE + i]
-                    r_state[2 * VEC_SIZE + i] = _xn
-        elif p1_job == 1:
-            for _pi in cutlass.range(cutlass.min(p1_par, n_tok)):
-                for i in range(VEC_SIZE):
-                    _xn = cutlass.Float32(x_k[0, bos + _pi, i_hv, i * 32 + in_warp_tid])
-                    r_state[(KERNEL_WIDTH - 1) * VEC_SIZE + 0 * VEC_SIZE + i] = r_state[
-                        (KERNEL_WIDTH - 1) * VEC_SIZE + 1 * VEC_SIZE + i
-                    ]
-                    r_state[(KERNEL_WIDTH - 1) * VEC_SIZE + 1 * VEC_SIZE + i] = r_state[
-                        (KERNEL_WIDTH - 1) * VEC_SIZE + 2 * VEC_SIZE + i
-                    ]
-                    r_state[(KERNEL_WIDTH - 1) * VEC_SIZE + 2 * VEC_SIZE + i] = _xn
-        for i_t in cutlass.range(p1_par, T_LOOP, P1_JOB_WARPS):
-            token = bos + cutlass.min(i_t, n_tok - 1)
-            if p1_job == 0:
-                for i_pair in range(VEC_SIZE // 2):
-                    i0 = i_pair * 2
-                    i1 = i_pair * 2 + 1
-                    k_idx0 = i0 * 32 + in_warp_tid
-                    k_idx1 = i1 * 32 + in_warp_tid
-                    r_conv_0 = 0.0
-                    r_conv_1 = 0.0
-                    for w in range(KERNEL_WIDTH - 1):
-                        r_conv_0 += r_state[w * VEC_SIZE + i0] * r_wq[w * VEC_SIZE + i0]
-                        r_conv_1 += r_state[w * VEC_SIZE + i1] * r_wq[w * VEC_SIZE + i1]
-                    r_xq_0 = cutlass.Float32(x_q[0, token, i_hv, k_idx0])
-                    r_xq_1 = cutlass.Float32(x_q[0, token, i_hv, k_idx1])
-                    _cwq_last_0 = r_wq[(KERNEL_WIDTH - 1) * VEC_SIZE + i0]
-                    _cwq_last_1 = r_wq[(KERNEL_WIDTH - 1) * VEC_SIZE + i1]
-                    r_conv_0 += r_xq_0 * _cwq_last_0
-                    r_conv_1 += r_xq_1 * _cwq_last_1
-                    e0 = cute.math.exp(-r_conv_0, fastmath=True)
-                    e1 = cute.math.exp(-r_conv_1, fastmath=True)
-                    sig_0 = cute.arch.rcp_approx(cutlass.Float32(1.0) + e0)
-                    sig_1 = cute.arch.rcp_approx(cutlass.Float32(1.0) + e1)
-                    r_q[i0] = r_conv_0 * sig_0
-                    r_q[i1] = r_conv_1 * sig_1
-                    r_state[0 * VEC_SIZE + i0] = r_state[1 * VEC_SIZE + i0]
-                    r_state[0 * VEC_SIZE + i1] = r_state[1 * VEC_SIZE + i1]
-                    r_state[1 * VEC_SIZE + i0] = r_state[2 * VEC_SIZE + i0]
-                    r_state[1 * VEC_SIZE + i1] = r_state[2 * VEC_SIZE + i1]
-                    r_state[2 * VEC_SIZE + i0] = r_xq_0
-                    r_state[2 * VEC_SIZE + i1] = r_xq_1
-                sum_q = 0.0
-                for i in range(VEC_SIZE):
-                    sum_q += r_q[i] * r_q[i]
-                for offset in [16, 8, 4, 2, 1]:
-                    sum_q += cute.arch.shuffle_sync_bfly(
-                        sum_q, offset=offset, mask=-1, mask_and_clamp=31
-                    )
-                rnorm_q_scaled = cute.math.rsqrt(sum_q + 1e-06, fastmath=True) * scale
-                for i in range(VEC_SIZE):
-                    r_q[i] = r_q[i] * rnorm_q_scaled
-                for i in range(VEC_SIZE):
-                    k_idx = i * WARP_SIZE + in_warp_tid
-                    qk_grp = k_idx % P2_LANES_K
-                    qk_j = k_idx // P2_LANES_K
-                    sQ[
-                        i_t,
-                        qk_grp,
-                        qk_j // 4,
-                        qk_j % 4,
-                    ] = r_q[i]
-            elif p1_job == 1:
-                r_b_raw = cutlass.Float32(0.0)
-                if in_warp_tid == 0:
-                    r_b_raw = cutlass.Float32(beta[0, token, i_hv])
-                for i in range(VEC_SIZE):
-                    k_idx = i * 32 + in_warp_tid
-                    r_conv = (
-                        r_state[(KERNEL_WIDTH - 1) * VEC_SIZE + 0 * VEC_SIZE + i]
-                        * sConvW[0 * HEAD_DIM + i * 32 + in_warp_tid]
-                    )
-                    r_conv += (
-                        r_state[(KERNEL_WIDTH - 1) * VEC_SIZE + 1 * VEC_SIZE + i]
-                        * sConvW[1 * HEAD_DIM + i * 32 + in_warp_tid]
-                    )
-                    r_conv += (
-                        r_state[(KERNEL_WIDTH - 1) * VEC_SIZE + 2 * VEC_SIZE + i]
-                        * sConvW[2 * HEAD_DIM + i * 32 + in_warp_tid]
-                    )
-                    r_xk = cutlass.Float32(x_k[0, token, i_hv, k_idx])
-                    r_conv += (
-                        r_xk
-                        * sConvW[(KERNEL_WIDTH - 1) * HEAD_DIM + i * 32 + in_warp_tid]
-                    )
-                    r_conv = r_conv * cute.arch.rcp_approx(
-                        cutlass.Float32(1.0) + cute.math.exp(-r_conv, fastmath=True)
-                    )
-                    r_k[i] = r_conv
-                    if cutlass.const_expr(CACHE_RING):
-                        ring_rawk[slot, i_hv, i_t, k_idx] = cutlass.BFloat16(r_conv)
-                    r_state[(KERNEL_WIDTH - 1) * VEC_SIZE + 0 * VEC_SIZE + i] = r_state[
-                        (KERNEL_WIDTH - 1) * VEC_SIZE + 1 * VEC_SIZE + i
-                    ]
-                    r_state[(KERNEL_WIDTH - 1) * VEC_SIZE + 1 * VEC_SIZE + i] = r_state[
-                        (KERNEL_WIDTH - 1) * VEC_SIZE + 2 * VEC_SIZE + i
-                    ]
-                    r_state[(KERNEL_WIDTH - 1) * VEC_SIZE + 2 * VEC_SIZE + i] = r_xk
-                sum_k = 0.0
-                for i in range(VEC_SIZE):
-                    sum_k += r_k[i] * r_k[i]
-                for offset in [16, 8, 4, 2, 1]:
-                    sum_k += cute.arch.shuffle_sync_bfly(
-                        sum_k, offset=offset, mask=-1, mask_and_clamp=31
-                    )
-                rnorm_k = cute.math.rsqrt(sum_k + 1e-06, fastmath=True)
-                for i in range(VEC_SIZE):
-                    r_k[i] = r_k[i] * rnorm_k
-                for i in range(VEC_SIZE):
-                    k_idx = i * WARP_SIZE + in_warp_tid
-                    qk_grp = k_idx % P2_LANES_K
-                    qk_j = k_idx // P2_LANES_K
-                    sK[
-                        i_t,
-                        qk_grp,
-                        qk_j // 4,
-                        qk_j % 4,
-                    ] = r_k[i]
-                if in_warp_tid == 0:
-                    sBeta[i_t] = cute.arch.rcp_approx(
-                        cutlass.Float32(1.0) + cute.math.exp(-r_b_raw, fastmath=True)
-                    )
-                    if cutlass.const_expr(CACHE_RING):
-                        ring_beta[slot, i_hv, i_t] = sBeta[i_t]
-            else:
-                for i in range(VEC_SIZE):
-                    k_idx = i * 32 + in_warp_tid
-                    r_g_raw = cutlass.Float32(g[0, token, i_hv, k_idx])
-                    r_g_raw = r_g_raw + cutlass.Float32(
-                        dt_bias[i_hv * HEAD_DIM + k_idx]
-                    )
-                    exp_A_x = r_exp_A * r_g_raw
-                    sigmoid_val = cute.arch.rcp_approx(
-                        cutlass.Float32(1.0) + cute.math.exp(-exp_A_x, fastmath=True)
-                    )
-                    r_gk = lower_bound * sigmoid_val
-                    qk_grp = k_idx % P2_LANES_K
-                    qk_j = k_idx // P2_LANES_K
-                    sG[
-                        i_t,
-                        qk_grp,
-                        qk_j // 4,
-                        qk_j % 4,
-                    ] = cute.math.exp(r_gk, fastmath=True)
-                    if cutlass.const_expr(CACHE_RING):
-                        ring_g[slot, i_hv, i_t, k_idx] = r_gk
-            if p1_job == 0:
-                for i in range(VEC_SIZE):
-                    k_idx = i * 32 + in_warp_tid
-                    for w in range(KERNEL_WIDTH - 1):
-                        intermediate_conv_q[scratch_row, i_t, head_off + k_idx, w] = (
-                            cutlass.BFloat16(r_state[w * VEC_SIZE + i])
-                        )
-            elif p1_job == 1:
-                for i in range(VEC_SIZE):
-                    k_idx = i * 32 + in_warp_tid
-                    for w in range(KERNEL_WIDTH - 1):
-                        intermediate_conv_k[scratch_row, i_t, head_off + k_idx, w] = (
-                            cutlass.BFloat16(
-                                r_state[
-                                    (KERNEL_WIDTH - 1) * VEC_SIZE + w * VEC_SIZE + i
-                                ]
-                            )
-                        )
-            # Reach token i_t + P1_JOB_WARPS. The conv body already
-            # advanced one step; clamp the rest so the final iteration's
-            # unread advance stays in bounds at the last request.
-            if p1_job == 0:
-                for _a in range(P1_JOB_WARPS - 1):
-                    _nx = bos + cutlass.min(i_t + 1 + _a, T_LOOP - 1)
+            for _pi in cutlass.range_constexpr(P1_JOB_WARPS - 1):
+                if _pi < cutlass.min(p1_par, n_tok):
                     for i in range(VEC_SIZE):
-                        _xn = cutlass.Float32(x_q[0, _nx, i_hv, i * 32 + in_warp_tid])
+                        _xn = _ld_p1(
+                            P1_NC, x_q, (0, bos + _pi, i_hv, i * 32 + in_warp_tid)
+                        )
                         r_state[0 * VEC_SIZE + i] = r_state[1 * VEC_SIZE + i]
                         r_state[1 * VEC_SIZE + i] = r_state[2 * VEC_SIZE + i]
                         r_state[2 * VEC_SIZE + i] = _xn
-            elif p1_job == 1:
-                for _a in range(P1_JOB_WARPS - 1):
-                    _nx = bos + cutlass.min(i_t + 1 + _a, T_LOOP - 1)
+        elif p1_job == 1:
+            for _pi in cutlass.range_constexpr(P1_JOB_WARPS - 1):
+                if _pi < cutlass.min(p1_par, n_tok):
                     for i in range(VEC_SIZE):
-                        _xn = cutlass.Float32(x_k[0, _nx, i_hv, i * 32 + in_warp_tid])
+                        _xn = _ld_p1(
+                            P1_NC, x_k, (0, bos + _pi, i_hv, i * 32 + in_warp_tid)
+                        )
                         r_state[(KERNEL_WIDTH - 1) * VEC_SIZE + 0 * VEC_SIZE + i] = (
                             r_state[(KERNEL_WIDTH - 1) * VEC_SIZE + 1 * VEC_SIZE + i]
                         )
@@ -539,16 +394,248 @@ def kda_decode_mtp_kernel(
                             r_state[(KERNEL_WIDTH - 1) * VEC_SIZE + 2 * VEC_SIZE + i]
                         )
                         r_state[(KERNEL_WIDTH - 1) * VEC_SIZE + 2 * VEC_SIZE + i] = _xn
+        # One straight-line block per job, so the warp's token chains interleave.
+        for _job in cutlass.range_constexpr(P1_NUM_JOBS):
+            if p1_job == _job:
+                for producer_step in cutlass.range_constexpr(
+                    (T_LOOP + P1_JOB_WARPS - 1) // P1_JOB_WARPS
+                ):
+                    i_t = p1_par + producer_step * P1_JOB_WARPS
+                    if cutlass.const_expr(T_LOOP % P1_JOB_WARPS == 0) or i_t < T_LOOP:
+                        token = bos + cutlass.min(i_t, n_tok - 1)
+                        if cutlass.const_expr(_job == 0):
+                            for i_pair in range(VEC_SIZE // 2):
+                                i0 = i_pair * 2
+                                i1 = i_pair * 2 + 1
+                                k_idx0 = i0 * 32 + in_warp_tid
+                                k_idx1 = i1 * 32 + in_warp_tid
+                                r_conv_0 = 0.0
+                                r_conv_1 = 0.0
+                                for w in range(KERNEL_WIDTH - 1):
+                                    r_conv_0 += (
+                                        r_state[w * VEC_SIZE + i0]
+                                        * r_wq[w * VEC_SIZE + i0]
+                                    )
+                                    r_conv_1 += (
+                                        r_state[w * VEC_SIZE + i1]
+                                        * r_wq[w * VEC_SIZE + i1]
+                                    )
+                                r_xq_0 = _ld_p1(P1_NC, x_q, (0, token, i_hv, k_idx0))
+                                r_xq_1 = _ld_p1(P1_NC, x_q, (0, token, i_hv, k_idx1))
+                                _cwq_last_0 = r_wq[(KERNEL_WIDTH - 1) * VEC_SIZE + i0]
+                                _cwq_last_1 = r_wq[(KERNEL_WIDTH - 1) * VEC_SIZE + i1]
+                                r_conv_0 += r_xq_0 * _cwq_last_0
+                                r_conv_1 += r_xq_1 * _cwq_last_1
+                                e0 = cute.math.exp(-r_conv_0, fastmath=True)
+                                e1 = cute.math.exp(-r_conv_1, fastmath=True)
+                                sig_0 = cute.arch.rcp_approx(cutlass.Float32(1.0) + e0)
+                                sig_1 = cute.arch.rcp_approx(cutlass.Float32(1.0) + e1)
+                                r_q[i0] = r_conv_0 * sig_0
+                                r_q[i1] = r_conv_1 * sig_1
+                                r_state[0 * VEC_SIZE + i0] = r_state[1 * VEC_SIZE + i0]
+                                r_state[0 * VEC_SIZE + i1] = r_state[1 * VEC_SIZE + i1]
+                                r_state[1 * VEC_SIZE + i0] = r_state[2 * VEC_SIZE + i0]
+                                r_state[1 * VEC_SIZE + i1] = r_state[2 * VEC_SIZE + i1]
+                                r_state[2 * VEC_SIZE + i0] = r_xq_0
+                                r_state[2 * VEC_SIZE + i1] = r_xq_1
+                            sum_q = 0.0
+                            for i in range(VEC_SIZE):
+                                sum_q += r_q[i] * r_q[i]
+                            for offset in [16, 8, 4, 2, 1]:
+                                sum_q += cute.arch.shuffle_sync_bfly(
+                                    sum_q, offset=offset, mask=-1, mask_and_clamp=31
+                                )
+                            rnorm_q_scaled = (
+                                cute.math.rsqrt(sum_q + 1e-06, fastmath=True) * scale
+                            )
+                            for i in range(VEC_SIZE):
+                                r_q[i] = r_q[i] * rnorm_q_scaled
+                            for i in range(VEC_SIZE):
+                                k_idx = i * WARP_SIZE + in_warp_tid
+                                qk_grp = k_idx % P2_LANES_K
+                                qk_j = k_idx // P2_LANES_K
+                                sQ[
+                                    i_t,
+                                    qk_grp,
+                                    qk_j // 4,
+                                    qk_j % 4,
+                                ] = r_q[i]
+                        elif cutlass.const_expr(_job == 1):
+                            r_b_raw = cutlass.Float32(0.0)
+                            if in_warp_tid == 0:
+                                r_b_raw = _ld_p1(P1_NC, beta, (0, token, i_hv))
+                            for i in range(VEC_SIZE):
+                                k_idx = i * 32 + in_warp_tid
+                                r_conv = (
+                                    r_state[
+                                        (KERNEL_WIDTH - 1) * VEC_SIZE + 0 * VEC_SIZE + i
+                                    ]
+                                    * r_wq[0 * VEC_SIZE + i]
+                                )
+                                r_conv += (
+                                    r_state[
+                                        (KERNEL_WIDTH - 1) * VEC_SIZE + 1 * VEC_SIZE + i
+                                    ]
+                                    * r_wq[1 * VEC_SIZE + i]
+                                )
+                                r_conv += (
+                                    r_state[
+                                        (KERNEL_WIDTH - 1) * VEC_SIZE + 2 * VEC_SIZE + i
+                                    ]
+                                    * r_wq[2 * VEC_SIZE + i]
+                                )
+                                r_xk = _ld_p1(P1_NC, x_k, (0, token, i_hv, k_idx))
+                                r_conv += r_xk * r_wq[(KERNEL_WIDTH - 1) * VEC_SIZE + i]
+                                r_conv = r_conv * cute.arch.rcp_approx(
+                                    cutlass.Float32(1.0)
+                                    + cute.math.exp(-r_conv, fastmath=True)
+                                )
+                                r_k[i] = r_conv
+                                r_state[
+                                    (KERNEL_WIDTH - 1) * VEC_SIZE + 0 * VEC_SIZE + i
+                                ] = r_state[
+                                    (KERNEL_WIDTH - 1) * VEC_SIZE + 1 * VEC_SIZE + i
+                                ]
+                                r_state[
+                                    (KERNEL_WIDTH - 1) * VEC_SIZE + 1 * VEC_SIZE + i
+                                ] = r_state[
+                                    (KERNEL_WIDTH - 1) * VEC_SIZE + 2 * VEC_SIZE + i
+                                ]
+                                r_state[
+                                    (KERNEL_WIDTH - 1) * VEC_SIZE + 2 * VEC_SIZE + i
+                                ] = r_xk
+                            # Complete independent key chains before raw-ring stores.
+                            if cutlass.const_expr(CACHE_RING):
+                                for i in range(VEC_SIZE):
+                                    k_idx = i * WARP_SIZE + in_warp_tid
+                                    ring_rawk[slot, i_hv, i_t, k_idx] = (
+                                        cutlass.BFloat16(r_k[i])
+                                    )
+                            sum_k = 0.0
+                            for i in range(VEC_SIZE):
+                                sum_k += r_k[i] * r_k[i]
+                            for offset in [16, 8, 4, 2, 1]:
+                                sum_k += cute.arch.shuffle_sync_bfly(
+                                    sum_k, offset=offset, mask=-1, mask_and_clamp=31
+                                )
+                            rnorm_k = cute.math.rsqrt(sum_k + 1e-06, fastmath=True)
+                            for i in range(VEC_SIZE):
+                                r_k[i] = r_k[i] * rnorm_k
+                            for i in range(VEC_SIZE):
+                                k_idx = i * WARP_SIZE + in_warp_tid
+                                qk_grp = k_idx % P2_LANES_K
+                                qk_j = k_idx // P2_LANES_K
+                                sK[
+                                    i_t,
+                                    qk_grp,
+                                    qk_j // 4,
+                                    qk_j % 4,
+                                ] = r_k[i]
+                            if in_warp_tid == 0:
+                                sBeta[i_t] = cute.arch.rcp_approx(
+                                    cutlass.Float32(1.0)
+                                    + cute.math.exp(-r_b_raw, fastmath=True)
+                                )
+                                if cutlass.const_expr(CACHE_RING):
+                                    ring_beta[slot, i_hv, i_t] = sBeta[i_t]
+                        else:
+                            # Gate warps do not otherwise use r_q in this phase.
+                            for i in range(VEC_SIZE):
+                                r_q[i] = _ld_p1(
+                                    P1_NC, g, (0, token, i_hv, i * 32 + in_warp_tid)
+                                )
+                            for i in range(VEC_SIZE):
+                                k_idx = i * 32 + in_warp_tid
+                                r_g_raw = r_q[i] + r_state[i]
+                                exp_A_x = r_exp_A * r_g_raw
+                                sigmoid_val = cute.arch.rcp_approx(
+                                    cutlass.Float32(1.0)
+                                    + cute.math.exp(-exp_A_x, fastmath=True)
+                                )
+                                r_gk = lower_bound * sigmoid_val
+                                qk_grp = k_idx % P2_LANES_K
+                                qk_j = k_idx // P2_LANES_K
+                                sG[
+                                    i_t,
+                                    qk_grp,
+                                    qk_j // 4,
+                                    qk_j % 4,
+                                ] = cute.math.exp(r_gk, fastmath=True)
+                                if cutlass.const_expr(CACHE_RING):
+                                    ring_g[slot, i_hv, i_t, k_idx] = r_gk
+                        if cutlass.const_expr(_job == 0):
+                            for i in range(VEC_SIZE):
+                                k_idx = i * 32 + in_warp_tid
+                                for w in range(KERNEL_WIDTH - 1):
+                                    intermediate_conv_q[
+                                        scratch_row, i_t, head_off + k_idx, w
+                                    ] = cutlass.BFloat16(r_state[w * VEC_SIZE + i])
+                        elif cutlass.const_expr(_job == 1):
+                            for i in range(VEC_SIZE):
+                                k_idx = i * 32 + in_warp_tid
+                                for w in range(KERNEL_WIDTH - 1):
+                                    intermediate_conv_k[
+                                        scratch_row, i_t, head_off + k_idx, w
+                                    ] = cutlass.BFloat16(
+                                        r_state[
+                                            (KERNEL_WIDTH - 1) * VEC_SIZE
+                                            + w * VEC_SIZE
+                                            + i
+                                        ]
+                                    )
+                        # Reach token i_t + P1_JOB_WARPS. The conv body already
+                        # advanced one step; clamp the rest so the final iteration's
+                        # unread advance stays in bounds at the last request.
+                        if cutlass.const_expr(_job == 0):
+                            for _a in range(P1_JOB_WARPS - 1):
+                                _nx = bos + cutlass.min(i_t + 1 + _a, T_LOOP - 1)
+                                for i in range(VEC_SIZE):
+                                    _xn = _ld_p1(
+                                        P1_NC,
+                                        x_q,
+                                        (0, _nx, i_hv, i * 32 + in_warp_tid),
+                                    )
+                                    r_state[0 * VEC_SIZE + i] = r_state[
+                                        1 * VEC_SIZE + i
+                                    ]
+                                    r_state[1 * VEC_SIZE + i] = r_state[
+                                        2 * VEC_SIZE + i
+                                    ]
+                                    r_state[2 * VEC_SIZE + i] = _xn
+                        elif cutlass.const_expr(_job == 1):
+                            for _a in range(P1_JOB_WARPS - 1):
+                                _nx = bos + cutlass.min(i_t + 1 + _a, T_LOOP - 1)
+                                for i in range(VEC_SIZE):
+                                    _xn = _ld_p1(
+                                        P1_NC,
+                                        x_k,
+                                        (0, _nx, i_hv, i * 32 + in_warp_tid),
+                                    )
+                                    r_state[
+                                        (KERNEL_WIDTH - 1) * VEC_SIZE + 0 * VEC_SIZE + i
+                                    ] = r_state[
+                                        (KERNEL_WIDTH - 1) * VEC_SIZE + 1 * VEC_SIZE + i
+                                    ]
+                                    r_state[
+                                        (KERNEL_WIDTH - 1) * VEC_SIZE + 1 * VEC_SIZE + i
+                                    ] = r_state[
+                                        (KERNEL_WIDTH - 1) * VEC_SIZE + 2 * VEC_SIZE + i
+                                    ]
+                                    r_state[
+                                        (KERNEL_WIDTH - 1) * VEC_SIZE + 2 * VEC_SIZE + i
+                                    ] = _xn
     else:
         for _c in range(V_CH_PER_THREAD):
             _v_idx = (tidx - P1_QKG_WARPS * 32) + _c * (HEAD_DIM // V_CH_PER_THREAD)
             _csv0 = cutlass.Float32(cs_v[slot, head_off + _v_idx, 0])
             _csv1 = cutlass.Float32(cs_v[slot, head_off + _v_idx, 1])
             _csv2 = cutlass.Float32(cs_v[slot, head_off + _v_idx, 2])
-            _wv = [
-                sConvW[V_WEIGHT_BASE + w * HEAD_DIM + _v_idx]
-                for w in range(KERNEL_WIDTH)
-            ]
+            cute.autovec_copy(w_v[(head_off + _v_idx, None)], r_w4)
+            _wv = [r_w4[w] for w in range(KERNEL_WIDTH)]
+            # The v warps finish precompute early. Use their spare interval
+            # to stage the independent onorm inputs before the existing barrier.
+            if cutlass.const_expr(APPLY_ONORM):
+                sOnormWeight[_v_idx] = cutlass.Float32(onorm_weight[_v_idx])
             # Sliding conv window, oldest -> newest.
             _win = [_csv0, _csv1, _csv2]
             for _t in cutlass.range_constexpr(T_LOOP):
@@ -565,6 +652,15 @@ def kda_decode_mtp_kernel(
                     cutlass.Float32(1.0) + cute.math.exp(-_vconv, fastmath=True)
                 )
                 sVall[_t * HEAD_DIM + _v_idx] = _vconv
+                if cutlass.const_expr(APPLY_ONORM):
+                    gate_raw = _ld_p1(
+                        P1_NC,
+                        onorm_g,
+                        (0, bos + cutlass.min(_t, n_tok - 1), i_hv, _v_idx),
+                    )
+                    sOnormGate[_t * HEAD_DIM + _v_idx] = cute.arch.rcp_approx(
+                        cutlass.Float32(1.0) + cute.math.exp(-gate_raw, fastmath=True)
+                    )
                 if cutlass.const_expr(CACHE_RING):
                     ring_rawv[slot, i_hv, _t, _v_idx] = cutlass.BFloat16(_vconv)
                 for _w in cutlass.range_constexpr(KERNEL_WIDTH - 1):
@@ -577,7 +673,11 @@ def kda_decode_mtp_kernel(
 
     staged = cutlass.const_expr(STATE_STAGES < NUM_V_TILES)
     if cutlass.const_expr(not staged):
+        # State-copy writers and consumers belong to the same warp.
         cute.arch.cp_async_wait_group(0)
+        cute.arch.sync_warp()
+    else:
+        # Publish the cross-warp precompute before streamed recurrence.
         cute.arch.barrier()
     r_beta_val = cutlass.Float32(0.0)
     for i_p in cutlass.range_constexpr(NUM_V_TILES // TILES_PER_PASS):
@@ -587,7 +687,7 @@ def kda_decode_mtp_kernel(
                 cute.arch.cp_async_wait_group(
                     min(STATE_STAGES + i_v, NUM_V_TILES) - 1 - i_v
                 )
-                cute.arch.barrier()
+                cute.arch.sync_warp()
             for b in range(P2_BATCHES):
                 _st = (i_l * P2_BATCHES + b) * P2_VEC
                 _row = warp_idx * NUM_V_ROWS + b * P2_ROWS_LANE + row_grp
@@ -600,7 +700,7 @@ def kda_decode_mtp_kernel(
                         ]
                     )
             if cutlass.const_expr(staged) and i_v + STATE_STAGES < NUM_V_TILES:
-                cute.arch.barrier()
+                cute.arch.sync_warp()
                 _issue_state_tile(
                     state_g2s_copy,
                     thr_state_copy,
@@ -610,6 +710,9 @@ def kda_decode_mtp_kernel(
                     STATE_STAGES,
                 )
         if cutlass.const_expr(i_p == NUM_V_TILES // TILES_PER_PASS - 1):
+            if cutlass.const_expr(not staged):
+                # State loads can precede the cross-warp precompute barrier.
+                cute.arch.barrier()
             # Every global read this block makes has now landed in registers.
             cute.arch.griddepcontrol_launch_dependents()
 
@@ -700,13 +803,23 @@ def kda_decode_mtp_kernel(
                         _st = (i_l * P2_BATCHES + b) * P2_VEC
                         v_row = warp_idx * NUM_V_ROWS + b * P2_ROWS_LANE + row_grp
                         for j in range(P2_VEC):
-                            ht[
-                                scratch_row,
-                                i_t,
-                                i_hv,
-                                v_base + v_row,
-                                j * P2_LANES_K + k_grp,
-                            ] = r_state[_st + j]
+                            if cutlass.const_expr(ht.element_type == cutlass.Float32):
+                                ht[
+                                    scratch_row,
+                                    i_t,
+                                    i_hv,
+                                    v_base + v_row,
+                                    j * P2_LANES_K + k_grp,
+                                ] = r_state[_st + j]
+                            else:
+                                # Narrow (bf16 state) snapshot; compute stays fp32.
+                                ht[
+                                    scratch_row,
+                                    i_t,
+                                    i_hv,
+                                    v_base + v_row,
+                                    j * P2_LANES_K + k_grp,
+                                ] = ht.element_type(r_state[_st + j])
 
     if cutlass.const_expr(APPLY_ONORM):
         cute.arch.barrier()
@@ -725,14 +838,11 @@ def kda_decode_mtp_kernel(
             for i in range(VEC_SIZE):
                 v_idx = i * 32 + in_warp_tid
                 raw_o = sOall[i_t * HEAD_DIM + v_idx]
-                _tok = bos + cutlass.min(i_t, n_tok - 1)
-                gate_raw = cutlass.Float32(onorm_g[0, _tok, i_hv, v_idx])
-                gate = cute.arch.rcp_approx(
-                    cutlass.Float32(1.0) + cute.math.exp(-gate_raw, fastmath=True)
-                )
+                gate = sOnormGate[i_t * HEAD_DIM + v_idx]
+                weight = sOnormWeight[v_idx]
                 if i_t < n_tok:
                     o[0, bos + i_t, i_hv, v_idx] = cutlass.BFloat16(
-                        raw_o * rms * cutlass.Float32(onorm_weight[v_idx]) * gate
+                        raw_o * rms * weight * gate
                     )
 
 
@@ -801,9 +911,12 @@ def _run_kda_decode_mtp_dspark(
         if NUM_SPEC == 0 and BLOCK_THREADS == BLOCK_THREADS_WIDE
         else cpasync.LoadCacheMode.GLOBAL
     )
+    # 128-bit cp.async: 4 fp32 or 8 bf16 state elements per copy.
+    state_dtype = h0.element_type
+    state_vec = 128 // state_dtype.width
     state_copy_atom = cute.make_copy_atom(
         cpasync.CopyG2SOp(cache_mode=state_cache_mode),
-        cutlass.Float32,
+        state_dtype,
         num_bits_per_copy=128,
     )
     state_g2s_copy = cute.make_tiled_copy_tv(
@@ -812,15 +925,16 @@ def _run_kda_decode_mtp_dspark(
             (TILE_V, BLOCK_THREADS // TILE_V),
             stride=(BLOCK_THREADS // TILE_V, 1),
         ),
-        val_layout=cute.make_layout((1, 4)),
+        val_layout=cute.make_layout((1, state_vec)),
     )
     t_loop = 1 + NUM_SPEC
     smem_bytes = (
-        # sQ, sK, sG, sBeta, sVall, and sConvW.
-        (3 * t_loop * qk_elems + t_loop + t_loop * TILE_K + 8 * TILE_K) * 4
+        # sQ, sK, sG, sBeta, and sVall.
+        (3 * t_loop * qk_elems + t_loop + t_loop * TILE_K) * 4
         # State stages and the raw output tile for normalization.
-        + state_smem_elems * 4
+        + state_smem_elems * (state_dtype.width // 8)
         + (t_loop * TILE_K * 4 if cutlass.const_expr(APPLY_ONORM) else 0)
+        + ((t_loop + 1) * TILE_K * 4 if APPLY_ONORM else 0)
         + 256
     )
     kda_decode_mtp_kernel(
@@ -884,11 +998,7 @@ def _block_threads(*, H: int, N: int) -> int:
     Measured on GB300 (152 SMs, H=12, num_spec=5): N=1 -8.8%, N=8 -11.3%,
     but N=64 +47.3%.
     """
-    import torch
-
-    num_sms = torch.cuda.get_device_properties(
-        torch.cuda.current_device()
-    ).multi_processor_count
+    num_sms = current_arch().num_sms
     return BLOCK_THREADS_WIDE if H * N <= num_sms else BLOCK_THREADS_NARROW
 
 
@@ -1015,15 +1125,23 @@ def fused_kda_decode_mtp_dspark(
     num_spec = T // N - 1
     if recurrent_state.shape[1:] != (H, TILE_K, TILE_K):
         raise ValueError("expected recurrent state layout [pool, H, V=128, K=128]")
+    # 16-byte cp.async: slot pitch / offset must be a multiple of 4 fp32 or
+    # 8 bf16 elements.
+    state_align = 16 // recurrent_state.element_size()
     if (
-        recurrent_state.dtype != torch.float32
+        recurrent_state.dtype not in (torch.float32, torch.bfloat16)
         or tuple(recurrent_state.stride()[-3:]) != (TILE_K * TILE_K, TILE_K, 1)
-        or recurrent_state.stride(0) % 4 != 0
-        or recurrent_state.storage_offset() % 4 != 0
+        or recurrent_state.stride(0) % state_align != 0
+        or recurrent_state.storage_offset() % state_align != 0
     ):
         raise ValueError(
-            "cp.async recurrent state requires fp32 contiguous [H, V, K] "
+            "cp.async recurrent state requires fp32/bf16 contiguous [H, V, K] "
             "inner layout and 16-byte-aligned slot offsets"
+        )
+    if intermediate_ssm is not None and intermediate_ssm.dtype != recurrent_state.dtype:
+        raise ValueError(
+            "intermediate_ssm dtype must match the recurrent state dtype, got "
+            f"{intermediate_ssm.dtype} vs {recurrent_state.dtype}"
         )
     rings = (replayssm_rawv, replayssm_rawk, replayssm_g, replayssm_beta)
     cache_ring = all(ring is not None for ring in rings)
@@ -1112,8 +1230,9 @@ def fused_kda_decode_mtp_dspark(
         onorm_weight if apply_onorm else dt_bias,
     )
     fits_32bit = tuple(_fits_32bit_stride(tensor) for tensor in args)
+    cuda_arch = current_arch().cuda
     key = (
-        torch.cuda.get_device_capability(),
+        cuda_arch.capability,
         H,
         N,
         num_spec,

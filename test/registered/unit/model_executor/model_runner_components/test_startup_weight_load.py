@@ -706,6 +706,7 @@ class _SchedulerWorker:
             forward_stream=object(),
             prewarm_sampling=lambda: trace.append("prewarm"),
             token_to_kv_pool=SimpleNamespace(post_capture_active=post_capture_active),
+            token_to_kv_pool_allocator=None,
             post_capture_resize_kv_pool=Mock(
                 side_effect=lambda *, draft_runners: trace.append("resize")
             ),
@@ -739,6 +740,7 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
         )
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.enable_overlap = enable_overlap
+        scheduler.enable_unified_memory = False
         scheduler.init_tp_model_worker = lambda: setattr(scheduler, "tp_worker", worker)
         scheduler.maybe_init_draft_worker = lambda: setattr(
             scheduler, "draft_worker", draft_worker

@@ -12,7 +12,8 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     HiSparseC4DevicePool,
 )
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
-from sglang.srt.utils.common import get_num_new_pages
+from sglang.srt.mem_cache.utils import get_num_new_pages
+from sglang.srt.platforms import current_platform
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
@@ -37,8 +38,13 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.device = device
         self.page_size = page_size
         self.need_sort = need_sort
+        self._spec_scratch_capacity = 0
+        self._spec_device_buffer_size = 0
 
-        self.logical_attn_allocator = PagedTokenToKVPoolAllocator(
+        paged_allocator_cls = (
+            current_platform.get_paged_allocator_cls() or PagedTokenToKVPoolAllocator
+        )
+        self.logical_attn_allocator = paged_allocator_cls(
             self._size_full,
             self.page_size,
             self.dtype,
@@ -46,7 +52,7 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             kvcache,
             need_sort,
         )
-        self.hisparse_attn_allocator = PagedTokenToKVPoolAllocator(
+        self.hisparse_attn_allocator = paged_allocator_cls(
             self._size_hisparse,
             self.page_size,
             self.dtype,
@@ -72,6 +78,29 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self._kvcache.register_mapping(
             weakref.proxy(self.full_to_hisparse_device_index_mapping)
         )
+
+    def configure_spec_scratch(
+        self, capacity: int, *, device_buffer_size: int = 0
+    ) -> None:
+        if any(
+            size < 0 or size % self.page_size for size in (capacity, device_buffer_size)
+        ):
+            raise ValueError(
+                "HiSparse spec scratch and device buffer sizes must be "
+                f"non-negative multiples of page_size={self.page_size}."
+            )
+        self._spec_scratch_capacity = capacity
+        self._spec_device_buffer_size = device_buffer_size if capacity else 0
+
+    def request_slot_reserve(
+        self, *, has_req_pool_slot: bool, prefill_tokens: int = 0
+    ) -> int:
+        paged_prefill = -(-prefill_tokens // self.page_size) * self.page_size
+        # Prefill KV is reused by the persistent buffer. Charge only its
+        # missing slots, including on chunks whose scratch was already allocated.
+        buffer_reserve = max(self._spec_device_buffer_size - paged_prefill, 0)
+        scratch_reserve = 0 if has_req_pool_slot else self._spec_scratch_capacity
+        return buffer_reserve + scratch_reserve
 
     @property
     def size_full(self) -> int:
@@ -165,7 +194,10 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return buffer_indices
 
     def free_hisparse_indices(self, buffer_indices: torch.Tensor):
-        self.hisparse_attn_allocator.free(buffer_indices[buffer_indices > 0])
+        # Page zero is the padding sink and is never owned by a request.
+        self.hisparse_attn_allocator.free(
+            buffer_indices[buffer_indices >= self.page_size]
+        )
 
     def get_last_loc_compressed(self, last_locs: torch.Tensor):
         return last_locs
@@ -268,6 +300,11 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
 
 class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
+    @property
+    def has_window_pool(self) -> bool:
+        # Wraps an SWA allocator and exposes its full interface.
+        return True
+
     def __init__(
         self,
         logical_attn_allocator: BaseTokenToKVPoolAllocator,
@@ -291,7 +328,10 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         self.logical_attn_allocator = logical_attn_allocator
         self._kvcache = logical_attn_allocator._kvcache
-        self.hisparse_attn_allocator = PagedTokenToKVPoolAllocator(
+        paged_allocator_cls = (
+            current_platform.get_paged_allocator_cls() or PagedTokenToKVPoolAllocator
+        )
+        self.hisparse_attn_allocator = paged_allocator_cls(
             self._size_hisparse,
             self.hisparse_page_size,
             self.dtype,
@@ -373,6 +413,10 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             (swa_capacity, self.swa_available_size()),
         )
 
+    def owner_available_size(self):
+        """What the token pool can serve now: its full-attention side."""
+        return self.full_available_size()
+
     def full_available_size(self):
         return min(
             self.logical_attn_allocator.full_available_size(),
@@ -382,13 +426,12 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def swa_available_size(self):
         return self.logical_attn_allocator.swa_available_size()
 
-    def reclaim_for_prealloc(
-        self, tree_cache, full_tokens: int, swa_tokens: int
-    ) -> str | None:
+    def window_pool_names(self):
+        return self.logical_attn_allocator.window_pool_names()
+
+    def reclaim_for_prealloc(self, tree_cache, demand) -> str | None:
         # C4 needs no reclaim here: full_available_size prices it into the budget.
-        return self.logical_attn_allocator.reclaim_for_prealloc(
-            tree_cache, full_tokens, swa_tokens
-        )
+        return self.logical_attn_allocator.reclaim_for_prealloc(tree_cache, demand)
 
     def free_swa(self, free_indices: torch.Tensor):
         self.logical_attn_allocator.free_swa(free_indices)
@@ -507,7 +550,9 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return buffer_indices
 
     def free_hisparse_indices(self, buffer_indices: torch.Tensor):
-        self.hisparse_attn_allocator.free(buffer_indices[buffer_indices > 0])
+        self.hisparse_attn_allocator.free(
+            buffer_indices[buffer_indices >= self.hisparse_page_size]
+        )
 
     def get_last_loc_compressed(self, last_locs: torch.Tensor):
         # Last complete C4 block of a prefix of last_loc + 1 tokens; -1 stays -1.
