@@ -52,6 +52,7 @@ from sglang.srt.disaggregation.mooncake.utils import (
     check_mooncake_custom_mem_pool_enabled,
 )
 from sglang.srt.disaggregation.utils import (
+    align_window_tails,
     build_dsa_tail_transfer_blocks,
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
@@ -253,9 +254,7 @@ def _uses_flat_entry_layout(
     even on an MHA backend.
     """
     is_single_region_swa = (
-        state_type in (StateType.SWA, StateType.AUXILIARY_SWA)
-        and num_src_entries == 1
-        and num_dst_entries == 1
+        state_type == StateType.SWA and num_src_entries == 1 and num_dst_entries == 1
     )
     return mla_backend or force_flat or has_layer_ids or is_single_region_swa
 
@@ -1556,21 +1555,24 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         src_ptrs, dst_ptrs, page_bytes = dsa_index_k
         page_size = self.kv_args.page_size
         value_bytes, scale_bytes = self.kv_args.dsa_index_k_token_bytes
-        if page_bytes % value_bytes or (page_size * value_bytes) % scale_bytes:
+        if (
+            page_bytes != page_size * (value_bytes + scale_bytes)
+            or (page_size * value_bytes) % scale_bytes
+        ):
             raise ValueError(
                 f"DSA index-K page of {page_bytes} bytes does not split into "
                 f"{value_bytes}-byte keys and {scale_bytes}-byte scales"
             )
         params = []
         for width, offset in ((value_bytes, 0), (scale_bytes, page_size * value_bytes)):
-            pages_per_unit = page_bytes // width
+            units_per_page = page_bytes // width
             src_units = (
-                src_rows // page_size * pages_per_unit
+                src_rows // page_size * units_per_page
                 + (offset // width)
                 + src_rows % page_size
             )
             dst_units = (
-                dst_rows // page_size * pages_per_unit
+                dst_rows // page_size * units_per_page
                 + (offset // width)
                 + dst_rows % page_size
             )
@@ -1600,7 +1602,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
     ) -> Optional[Tuple[List[int], List[int], int]]:
         """The DSA index-K a PD DCP relayout moves with the KV: (source,
         destination buffers, page bytes), or None when the pool has none."""
-        state_types = getattr(self.kv_args, "state_types", [])
+        state_types = self.kv_args.state_types
         if StateType.DSA not in state_types:
             return None
         if self.kv_args.dsa_index_k_token_bytes is None:
@@ -2180,7 +2182,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         (not the mamba-state path); subclasses extend for hardware components."""
         return st in (
             StateType.SWA,
-            StateType.AUXILIARY_SWA,
             StateType.DSA,
             StateType.QSA_PENDING,
             StateType.QSA_COMPRESSED,
@@ -2227,6 +2228,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
     ):
         rc = 0
         state_types = getattr(self.kv_args, "state_types", [])
+        prefill_state_indices = align_window_tails(
+            self.kv_args, prefill_state_indices, req.dst_state_indices
+        )
         for i, st in enumerate(state_types):
             indices = (
                 prefill_state_indices[i] if i < len(prefill_state_indices) else None
@@ -2377,10 +2381,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     and not self.is_hybrid_mla_backend
                     and not is_qwen4_qsa_state
                 )
-                if slice_kv_heads and st not in (
-                    StateType.SWA,
-                    StateType.AUXILIARY_SWA,
-                ):
+                if slice_kv_heads and st != StateType.SWA:
                     raise RuntimeError(
                         f"PD Disaggregation does NOT support PD different TP sizes for non-MLA {st.upper()} hybrid models yet."
                     )
@@ -3162,7 +3163,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 if staging_deferred:
                     continue
 
-                self._staging_outstanding[kv_chunk.room] -= 1
+                # A room started anew since this chunk was counted no longer
+                # counts it: the decrement and the report find nothing.
+                if kv_chunk.room in self._staging_outstanding:
+                    self._staging_outstanding[kv_chunk.room] -= 1
+                self.note_send_finished(kv_chunk.room, kv_chunk.send_record)
                 if self.enable_deferred_decode_kv_release:
                     # In-flight write finished; if aborted and nothing outstanding,
                     # the pages are idle -> release the held ack.
@@ -3199,6 +3204,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
                 if kv_chunk is not None:
                     self.poison_deferred_ack_room(kv_chunk.room)
+                    # The worker stops: fail its room so that no page move
+                    # waits for a send it will never finish.
+                    self.record_failure(kv_chunk.room, f"Transfer worker failed: {e}")
+                    self.update_status(kv_chunk.room, KVPoll.Failed)
                 raise RuntimeError(
                     f"Transfer thread failed because of {e}. Prefill instance with bootstrap_port={self.bootstrap_port} is dead."
                 )
@@ -3451,8 +3460,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 trace_ctx=trace_ctx,
                 wait_event=wait_event,
                 indices_event=indices_event,
+                send_record=self.send_record(bootstrap_room),
             )
         )
+        self.note_send_enqueued(bootstrap_room)
 
     def get_session_id(self):
         return self.engine.get_session_id()

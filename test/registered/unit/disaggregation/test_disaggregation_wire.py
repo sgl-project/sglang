@@ -138,6 +138,40 @@ class TestBatchStagingReservations(CustomTestCase):
         run(scheduler, batch)
 
 
+class TestRequestWindowRetention(CustomTestCase):
+    """DeepSeek-V4.1 encoder replay keeps SWA in per-request window rows over a
+    plain paged allocator, which keeps no window pool: the window entry's kept
+    tail still comes from the pool's window."""
+
+    def test_request_window_over_a_paged_allocator_keeps_the_window(self):
+        page_size, window = 4, 8
+        calls = []
+
+        class _Rows:
+            def page_indices(self, slot, start, end):
+                calls.append((slot, start, end))
+                return list(range(start // page_size, -(-end // page_size)))
+
+        pool = object.__new__(DeepSeekV4TokenToKVPool)
+        pool.request_window = _Rows()
+        pool.sliding_window = window
+        pool.page_size = page_size
+        allocator = SimpleNamespace(
+            storage=None,
+            state=None,
+            page_size=page_size,
+            get_kvcache=lambda: pool,
+            window_pool_names=lambda: (),
+        )
+        storage = StaticKVStorage(None, allocator)
+        self.assertEqual(storage.retained_window_lengths(), {"swa": window})
+        req = SimpleNamespace(kv=SimpleNamespace(req_pool_idx=3))
+        units = storage.resume_units("swa", req, token_start=0, token_boundary=21)
+        self.assertEqual(calls, [(3, 12, 21)])
+        self.assertEqual(units.token_start, 12)
+        self.assertEqual(units.unit_ids.tolist(), [3, 4, 5])
+
+
 class TestMixedSWAKVBlockScales(CustomTestCase):
     def test_swa_block_scales_follow_each_subpools_dtype(self):
         from sglang.srt.mem_cache.memory_pool import (
@@ -1184,6 +1218,35 @@ class TestPollCollectives(CustomTestCase):
             result = poll_and_all_reduce([poller], object())
         self.assertEqual(result, [KVPoll.Failed])
         all_reduce.assert_not_called()
+
+
+class TestDsaIndexKTokenBytes(unittest.TestCase):
+    def test_static_dsa_pool_reports_its_key_and_scale_bytes(self):
+        from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+
+        for use_fp4_indexer, kpool, expected in (
+            (False, 1, (128, 4)),
+            (True, 1, (64, 4)),
+            (False, 4, None),
+        ):
+            with self.subTest(use_fp4_indexer=use_fp4_indexer, kpool=kpool):
+                pool = object.__new__(DSATokenToKVPool)
+                pool.start_layer = 0
+                pool.layer_num = 1
+                pool.index_head_dim = 128
+                pool.use_fp4_indexer = use_fp4_indexer
+                pool.index_bytes_per_token = DSATokenToKVPool.index_bytes_per_token_for(
+                    128, use_fp4_indexer
+                )
+                pool.index_kpool = kpool
+                pool.get_state_buf_infos = lambda: ([0x1000], [4096], [64 * 132])
+                pool.get_compress_tail_buf_infos = lambda: ([], [], [])
+
+                kv_args = KVArgs()
+                setup_state_kv_args(kv_args, _static_storage(pool))
+
+                self.assertEqual(kv_args.state_types, [StateType.DSA])
+                self.assertEqual(kv_args.dsa_index_k_token_bytes, expected)
 
 
 class TestCPReplicatedStateTransfer(unittest.TestCase):

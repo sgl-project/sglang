@@ -143,14 +143,18 @@ class TestFilterDcpLocalChunkKvIndices(CustomTestCase):
 
 
 class TestDsaIndexKPageTokens(CustomTestCase):
-    def test_replicated_or_no_dcp_keeps_the_pool_page(self):
-        for dcp_size, shards_index_k in ((8, False), (1, True)):
+    def test_sharded_index_k_pages_span_the_dcp_group(self):
+        for dcp_size, shards_index_k, expected in (
+            (8, True, 512),
+            (8, False, 64),
+            (1, True, 64),
+        ):
             with self.subTest(dcp_size=dcp_size, shards_index_k=shards_index_k):
                 with (
                     patch.object(dcp_layout, "_dsa_shards_index_k", shards_index_k),
                     rc.get_parallel().override(attn_dcp_size=dcp_size),
                 ):
-                    self.assertEqual(dsa_index_k_page_tokens(64), 64)
+                    self.assertEqual(dsa_index_k_page_tokens(64), expected)
 
 
 class TestGetDcpLens(CustomTestCase):

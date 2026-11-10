@@ -242,6 +242,12 @@ def _kimi_k31_dcp_overrides(cfg: Any) -> dict:
             "(--dsa-topk-backend sgl-kernel, SGLANG_OPT_USE_TOPK_V2 and "
             "SGLANG_DSA_FUSE_TOPK on)."
         )
+    if cfg.enable_return_indexer_topk or envs.SGLANG_DSA_TOPK_BROADCAST.get():
+        # the sharded indexer returns only this rank's local KV slots
+        raise ValueError(
+            "Kimi-K3.1 DCP does not support --enable-return-indexer-topk "
+            "or SGLANG_DSA_TOPK_BROADCAST."
+        )
     overrides = _dcp_replicate_q_proj_default(cfg, "Kimi-K3.1")
     if cfg.speculative_algorithm == "DFLASH":
         overrides["speculative_draft_attention_backend"] = "cutedsl_mla"
