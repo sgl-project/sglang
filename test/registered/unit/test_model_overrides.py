@@ -4595,6 +4595,7 @@ class TestKimiK31DcpOverrides(CustomTestCase):
             enable_prefill_cp=False,
             attn_cp_size=None,
             dsa_topk_backend="sgl-kernel",
+            enable_return_indexer_topk=False,
         )
         for name, value in fields.items():
             setattr(cfg, name, value)
