@@ -283,9 +283,7 @@ def _map_kimi_k3_effort(reasoning_effort: Any, level_by_tier: dict) -> Optional[
     )
 
 
-def _validate_kimi_k3_request(
-    request: ChatCompletionRequest, level_by_tier: dict
-) -> str | None:
+def _validate_kimi_k3_request(request: ChatCompletionRequest) -> str | None:
     """Request rules of the K3 serving contract that the encoder cannot enforce."""
     error = _validate_kimi_k3_message_tools(request)
     if error:
@@ -296,13 +294,9 @@ def _validate_kimi_k3_request(
         isinstance(thinking, dict) and thinking.get("type") in _KIMI_K3_THINKING_TYPES
     ):
         return (
-            f"invalid thinking: {thinking!r}; expected an object whose type is "
-            "'enabled', 'disabled' or 'adaptive'."
+            f"invalid thinking: {thinking!r}; expected an object whose type, if "
+            "set, is 'enabled', 'disabled' or 'adaptive'."
         )
-    try:
-        _map_kimi_k3_effort(request.reasoning_effort, level_by_tier)
-    except ValueError as exc:
-        return str(exc)
     return None
 
 
@@ -742,7 +736,6 @@ class OpenAIServingChat(OpenAIServingBase):
         return "chatcmpl-"
 
     def _kimi_k3_level_by_tier(self) -> dict:
-        """K3.1 adds a native "medium" thinking level on top of K3's three."""
         if self.tokenizer_manager.model_config.hf_config.model_type == "kimi_k31":
             return _KIMI_K31_LEVEL_BY_TIER
         return _KIMI_K3_LEVEL_BY_TIER
@@ -861,6 +854,7 @@ class OpenAIServingChat(OpenAIServingBase):
             template_kwargs.pop("tokenize", None)
             template_kwargs.pop("return_dict", None)
             template_kwargs.pop("image_prompts", None)
+            # The encoder call below always passes add_generation_prompt=True.
             template_kwargs.pop("add_generation_prompt", None)
             for key in ("conversation", "tools"):
                 if key in template_kwargs:
@@ -1246,7 +1240,7 @@ class OpenAIServingChat(OpenAIServingBase):
             if m3_error:
                 return m3_error
         if self.chat_encoding_spec == "kimi_k3":
-            k3_error = _validate_kimi_k3_request(request, self._kimi_k3_level_by_tier())
+            k3_error = _validate_kimi_k3_request(request)
             if k3_error:
                 return k3_error
         if request.return_flat_raw_output_top_logprobs and not request.return_meta_info:

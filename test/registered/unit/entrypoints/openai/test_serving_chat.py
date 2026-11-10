@@ -6520,12 +6520,6 @@ class KimiK3ThinkingTestCase(unittest.TestCase):
             with self.subTest(key=key), self.assertRaisesRegex(ValueError, key):
                 self._template_kwargs(chat_template_kwargs={key: []})
 
-    def test_unsupported_effort_is_reported_by_validation(self):
-        request = ChatCompletionRequest(
-            model="x", messages=self.MESSAGES, reasoning_effort=0.5
-        )
-        self.assertIn("reasoning_effort", self.chat._validate_request(request))
-
     def test_float_effort_is_a_client_error(self):
         with self.assertRaises(ValueError):
             self._template_kwargs(reasoning_effort=0.5)
