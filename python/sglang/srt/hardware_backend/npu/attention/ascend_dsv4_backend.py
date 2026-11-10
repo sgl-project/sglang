@@ -1052,12 +1052,15 @@ class DeepseekV4AscendAttnBackend(
         if self.is_draft_worker:
             return False
         parallel = get_parallel()
-        if is_npu_arch35() or parallel.attn_cp_size != 1 or parallel.attn_dcp_size != 1:
+        if parallel.attn_cp_size != 1 or parallel.attn_dcp_size != 1:
             raise ValueError(
                 "DSV4 breakable prefill graph captures the compressor and "
-                "indexer and requires an A3 model without CP/DCP. Disable "
+                "indexer and requires a model without CP/DCP. Disable "
                 "--cuda-graph-backend-prefill=breakable for this model."
             )
+        # Ascend 950 shares the explicit cache_mode=2 compressor state table
+        # and npu.compressor with A3; its arch-specific KV / indexer fused
+        # epilogs write through the same fixed loc buffers inside the segment.
         return True
 
     def _is_dspark_draft_block(self, forward_batch: ForwardBatch) -> bool:
