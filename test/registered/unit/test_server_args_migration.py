@@ -194,6 +194,30 @@ class TestServerArgsAnnotatedCli(CustomTestCase):
                 self.assertIn(f"'{flag}' is deprecated", "\n".join(logs.output))
                 self.assertEqual(vars(args), baseline)
 
+    def test_no_op_python_inputs_still_construct_and_warn(self):
+        """Engine kwargs reach the ServerArgs constructor without CLI parsing."""
+        with self.assertNoLogs("sglang.srt.server_args", level="WARNING"):
+            baseline = ServerArgs(model_path="dummy").resolved_dict()
+        for name in (
+            "disable_outlines_disk_cache",
+            "show_time_cost",
+            "triton_attention_reduce_in_fp32",
+        ):
+            for value in (True, False):
+                with self.subTest(name=name, value=value):
+                    with self.assertLogs(
+                        "sglang.srt.server_args", level="WARNING"
+                    ) as logs:
+                        sa = ServerArgs(model_path="dummy", **{name: value})
+                    self.assertIn(
+                        f"'{name}' is deprecated and has no effect",
+                        "\n".join(logs.output),
+                    )
+                    self.assertIs(getattr(sa, name), value)
+                    resolved = sa.resolved_dict()
+                    resolved[name] = baseline[name]
+                    self.assertEqual(resolved, baseline)
+
     def test_retired_compressed_backend_names_its_replacement(self):
         """The removed `compressed` alias stops the launch with a message naming
         `dsv4`, not argparse's generic invalid-choice list."""

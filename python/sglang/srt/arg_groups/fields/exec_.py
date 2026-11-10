@@ -59,6 +59,9 @@ class ExecFeatures(msgspec.Struct):
     """Namespace ``exec.features``."""
 
     _NS_PATH = "exec.features"
+    disable_outlines_disk_cache: A[
+        Optional[bool], Arg(help="Deprecated. Has no effect.", no_cli=True)
+    ] = None
     enable_fp32_lm_head: A[
         bool,
         "If set, the LM head outputs (logits) are in FP32.",
@@ -221,6 +224,9 @@ class ExecKernel(msgspec.Struct):
     """Namespace ``exec.kernel``."""
 
     _NS_PATH = "exec.kernel"
+    triton_attention_reduce_in_fp32: A[
+        Optional[bool], Arg(help="Deprecated. Has no effect.", no_cli=True)
+    ] = None
 
     # -------------------------------------------------------------------------
     # Kernel backend

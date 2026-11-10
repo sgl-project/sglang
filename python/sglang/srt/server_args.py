@@ -229,6 +229,17 @@ class ServerArgs:
 
     def __post_init__(self):
         """Leave construction unresolved; launchers and publishers call ``resolve_once``."""
+        for name in (
+            "disable_outlines_disk_cache",
+            "show_time_cost",
+            "triton_attention_reduce_in_fp32",
+        ):
+            if getattr(self, name) is not None:
+                logger.warning(
+                    "'%s' is deprecated and has no effect. It will be removed "
+                    "in a future release.",
+                    name,
+                )
 
     def resolve_once(self) -> None:
         """Resolve once, preserving declarations across pickling to child processes.

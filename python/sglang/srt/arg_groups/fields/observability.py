@@ -24,6 +24,9 @@ class Observability(msgspec.Struct):
     """Namespace ``observability``."""
 
     _NS_PATH = "observability"
+    show_time_cost: A[
+        Optional[bool], Arg(help="Deprecated. Has no effect.", no_cli=True)
+    ] = None
 
     # -------------------------------------------------------------------------
     # Logging, metrics, and tracing
