@@ -15,6 +15,7 @@ from sglang.srt.layers.quantization.mxfp4 import Mxfp4Config, Mxfp4MoEMethod
 from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.runtime_context import get_context, get_flags, get_parallel
 from sglang.srt.utils import is_hip
+from sglang.srt.utils.triton_utils import is_triton_kernels_available
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.layer_ut_utils import assert_output_close, init_single_process_dist
 from sglang.test.test_utils import CustomTestCase
@@ -23,6 +24,11 @@ register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 E, H, INTERMEDIATE, TOPK = 8, 512, 512, 2
 TOKENS = (1, 33)
+
+# The Triton runner upcasts MXFP4 weights with triton_kernels at load time.
+requires_triton_kernels = unittest.skipUnless(
+    is_triton_kernels_available(), "requires triton_kernels"
+)
 
 
 def _checkpoint():
@@ -118,6 +124,7 @@ class TestMxfp4MoELayout(CustomTestCase):
                 outputs.append(experts.forward(x, topk).float())
             return experts, outputs
 
+    @requires_triton_kernels
     def test_explicit_triton_ignores_aiter_env(self):
         # The Triton runner consumes bf16 weights upcast from the checkpoint.
         w13_shape = (E, 2 * INTERMEDIATE, H)
@@ -128,6 +135,7 @@ class TestMxfp4MoELayout(CustomTestCase):
             for out, ref in zip(outputs, reference):
                 torch.testing.assert_close(out, ref)
 
+    @requires_triton_kernels
     def test_explicit_aiter_matches_triton(self):
         _, reference = self._run(MoeRunnerBackend.TRITON, use_aiter=False)
         experts, outputs = self._run(MoeRunnerBackend.AITER, use_aiter=True)
@@ -142,6 +150,7 @@ class TestMxfp4MoELayout(CustomTestCase):
         for out, ref in zip(outputs, reference):
             torch.testing.assert_close(out, ref)
 
+    @requires_triton_kernels
     def test_auto_without_aiter_env_matches_explicit_triton(self):
         _, reference = self._run(MoeRunnerBackend.TRITON, use_aiter=False)
         experts, outputs = self._run(MoeRunnerBackend.AUTO, use_aiter=False)
