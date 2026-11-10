@@ -34,6 +34,71 @@ register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
 class TestPhysisH3(CustomTestCase):
+    def test_serve_warmup_default_and_explicit_modes(self):
+        """Serving selects a supported default while preserving explicit requests."""
+        import json
+        import sys
+        import tempfile
+        from pathlib import Path
+
+        from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
+        from sglang.multimodal_gen.runtime.entrypoints.cli.serve import (
+            add_multimodal_gen_serve_args,
+            execute_serve_cmd,
+        )
+        from sglang.multimodal_gen.runtime.utils.argparse import FlexibleArgumentParser
+        from sglang.multimodal_gen.test.unit.conftest import mock_cuda_platform
+
+        cases = [("default", None)] + [
+            (source, mode)
+            for source in ("cli", "config")
+            for mode in ("off", "server", "request")
+        ]
+        cases.extend([("frames", None), ("resolution", None)])
+        with tempfile.TemporaryDirectory() as folder:
+            for source, mode in cases:
+                argv = ["--model-path", "/fake", "--performance-mode", "manual"]
+                if source == "cli":
+                    argv.extend(["--warmup-mode", mode])
+                elif source == "config":
+                    config_path = Path(folder, "server.json")
+                    config_path.write_text(json.dumps({"warmup_mode": mode}))
+                    argv.extend(["--config", str(config_path)])
+                elif source == "frames":
+                    argv.extend(["--warmup-num-frames", "22"])
+                elif source == "resolution":
+                    argv.extend(["--warmup-resolutions", "256x256"])
+                parser = FlexibleArgumentParser()
+                add_multimodal_gen_serve_args(parser)
+                with (
+                    self.subTest(source=source, mode=mode),
+                    mock_cuda_platform(),
+                    patch.object(sys, "argv", ["sglang", "serve", *argv]),
+                    patch.object(
+                        PipelineConfig,
+                        "from_kwargs",
+                        return_value=PhysisH3PipelineConfig(),
+                    ),
+                    patch(
+                        "sglang.multimodal_gen.runtime.entrypoints.cli.serve.dispatch_launch"
+                    ) as launch,
+                ):
+                    parsed, unknown = parser.parse_known_args(argv)
+                    if mode in ("server", "request") or source in (
+                        "frames",
+                        "resolution",
+                    ):
+                        with self.assertRaisesRegex(ValueError, "warmup-mode off"):
+                            execute_serve_cmd(parsed, unknown)
+                    else:
+                        execute_serve_cmd(parsed, unknown)
+                        args = launch.call_args.args[0]
+                        self.assertEqual(args.warmup_mode, "off")
+                        self.assertEqual(
+                            args.is_arg_explicitly_set("warmup_mode"),
+                            source != "default",
+                        )
+
     def test_seed_validation_precedes_device_sampling(self):
         """Out-of-range seeds must fail before rank-local generator overflow."""
         params = PhysisH3SamplingParams()
@@ -71,6 +136,9 @@ class TestPhysisH3(CustomTestCase):
                 minimax_h3_adaln_cache_path=None,
                 batching_max_size=1,
                 warmup_mode="off",
+                warmup_resolutions=None,
+                warmup_num_frames=None,
+                is_arg_explicitly_set=lambda name: name == "warmup_mode",
             )
             values.update(overrides)
             return SimpleNamespace(**values)

@@ -89,6 +89,12 @@ class PhysisH3PipelineConfig(MiniMaxH3PipelineConfig):
             )
         if server_args.batching_max_size != 1:
             raise ValueError("Physis H3 requires one request at a time")
+        if (
+            not server_args.is_arg_explicitly_set("warmup_mode")
+            and server_args.warmup_resolutions is None
+            and server_args.warmup_num_frames is None
+        ):
+            server_args.warmup_mode = "off"
         if server_args.warmup_mode != "off":
             raise ValueError(
                 "Physis H3 requires --warmup-mode off; warm with a real request"
