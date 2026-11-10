@@ -114,9 +114,8 @@ def copy_to_cpu(allocator, indices, *, state_indices, request_row):
                 )
         bands[band.sub_pool_name] = snapshot
     request = {}
-    storage = allocator.storage
-    if storage is not None and request_row is not None:
-        memory = storage.request_memory
+    if request_row is not None:
+        memory = allocator.request_memory
         if memory is not None:
             for part in memory.parts:
                 tensor = memory.tensors[part.name]
@@ -169,7 +168,7 @@ def restore_from_cpu(allocator, snapshot, indices, *, state_indices, request_row
     if snapshot.request_parts:
         if request_row is None:
             raise ValueError("restoring request parts requires the new request row")
-        memory = allocator.storage.request_memory
+        memory = allocator.request_memory
         for part in memory.parts:
             tensor = memory.tensors[part.name]
             _scatter_from_cpu(
