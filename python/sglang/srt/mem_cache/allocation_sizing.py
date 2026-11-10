@@ -114,7 +114,7 @@ def _spec_decode_headroom_pages(hisparse: bool) -> int:
                 "SGLANG_OPT_SPEC_DECODE_HEADROOM_PAGES is ignored under HiSparse."
             )
         return 0
-    return min(max(pages, 2), 8)
+    return min(pages, 8)
 
 
 def add_spec_decode_headroom_pages(
