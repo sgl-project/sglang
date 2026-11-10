@@ -1,7 +1,7 @@
 name: PR Test (Megakernel)
 run-name: "Megakernel: sgl-nvidia-mega#${{ inputs.mega_pr }} ${{ inputs.mega_sha }} (${{ inputs.dispatch_id }})"
 
-# Runs an sgl-nvidia-mega PR's tests against SGLang main on the GB300 runners.
+# Runs an sgl-nvidia-mega PR's end-to-end tests against SGLang main on GB300.
 # A maintainer starts it by adding the run-ci-sglang label to the PR in
 # sgl-project/sgl-nvidia-mega, whose run-ci-sglang.yml dispatches this workflow,
 # waits for this run and reports its outcome on the PR. This workflow uses no
@@ -37,7 +37,7 @@ concurrency:
 jobs:
   test:
     runs-on: 4-gpu-gb300
-    timeout-minutes: 300
+    timeout-minutes: 210
     steps:
       - name: Validate inputs
         env:
@@ -70,20 +70,9 @@ jobs:
         run: |
           python3 -m pip install --no-deps -e ./sgl-nvidia-mega
 
-      - name: Run unit tests
-        timeout-minutes: 15
-        working-directory: sgl-nvidia-mega
-        run: |
-          python3 -m pytest test/unit -v -rfE
-
-      # The GPU tests cover DeepSeek-V4.1-Flash only for now: it runs TP4 on one
-      # 4-GPU runner. The Qwen3.5 end-to-end tests need TP8 across two GB300 trays.
-      - name: Run kernel tests
-        timeout-minutes: 60
-        working-directory: sgl-nvidia-mega
-        run: |
-          python3 -m pytest test/kernels/test_deepseek_v41_*.py -v -rfE
-
+      # End-to-end tests only for now, and DeepSeek-V4.1-Flash only: it runs TP4
+      # on one 4-GPU runner. The Qwen3.5 tests need TP8 across two GB300 trays.
+      # sgl-nvidia-mega runs its unit tests in its own CI.
       - name: Run end-to-end tests
         timeout-minutes: 180
         working-directory: sgl-nvidia-mega
