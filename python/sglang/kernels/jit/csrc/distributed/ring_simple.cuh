@@ -55,8 +55,9 @@ struct RingHop {
 /// `ready` (slices the predecessor published here), `drained` (slices the
 /// successor consumed) and `packet` (this rank's own count). A slice is plain
 /// data, published once all its stores have completed, so the receiver polls
-/// one counter and reads the payload once. FIFO payload moves as streaming
-/// loads and system-scope stores; the input and output take plain accesses.
+/// one counter and reads the payload once. FIFO payload moves as device-scope
+/// loads and batched system-scope stores; the input and output take plain
+/// accesses.
 ///
 /// A channel is one block of 8 waves, at most 2 per SIMD; `amdgpu_waves_per_eu`
 /// says so, or the compiler budgets registers for more.
@@ -141,7 +142,7 @@ __global__ __launch_bounds__(kRingSimpleThreads, 1) __attribute__((
         }
 #pragma unroll
         for (uint32_t u = 0; u < kUnroll; ++u) {
-          if constexpr (kRecv) ptx::ld_nt_16B(vecs[u], recv_slot, j + u * kStride);
+          if constexpr (kRecv) ptx::ld_relaxed_16B(vecs[u], recv_slot, j + u * kStride);
         }
         // keep every load ahead of the first use: left alone, the scheduler pulls
         // each reduction up behind its two loads and waits there, to save registers
@@ -165,11 +166,11 @@ __global__ __launch_bounds__(kRingSimpleThreads, 1) __attribute__((
         }
         if constexpr (kSend) {
           if constexpr (kUnroll % 8 == 0) {
-            ptx::st_relaxed_nt_run_16B<kStride, kUnroll>(vecs, send_at);
+            ptx::st_relaxed_run_16B<kStride, kUnroll>(vecs, send_at);
           } else {
 #pragma unroll
             for (uint32_t u = 0; u < kUnroll; ++u)
-              ptx::st_relaxed_nt_16B(vecs[u], send_at, u * kStride);
+              ptx::st_relaxed_16B(vecs[u], send_at, u * kStride);
           }
         }
       };
