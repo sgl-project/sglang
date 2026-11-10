@@ -151,6 +151,16 @@ class HiCacheNixl(HiCacheStorage):
         if not self.backend_selector.create_backend(self.agent):
             raise RuntimeError("Failed to create NIXL backend")
 
+        convert_key = str(
+            nixlconfig.get_backend_initparams(self.backend_selector.backend_name).get(
+                "convert_key_to_128bit", ""
+            )
+        ).lower()
+        self._backend_converts_key = (
+            self.backend_selector.backend_name == "DOCA_MEMOS"
+            and convert_key in ("y", "yes", "on", "1", "true", "enable")
+        )
+
         self.registry = NixlRegistry(
             self.agent,
             self.backend_selector.mem_type,
@@ -205,6 +215,8 @@ class HiCacheNixl(HiCacheStorage):
 
     def _format_key(self, key: str) -> str:
         if self.backend_selector.backend_name == "DOCA_MEMOS":
+            if self._backend_converts_key:
+                return key
             return hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
         if self.backend_selector.mem_type == "FILE":
             return self.file_manager.get_file_path(key)

@@ -1075,6 +1075,7 @@ class TestDocaMemosNixl(unittest.TestCase):
         dummy.needs_page_alignment = True
         dummy.config_suffix = "@test"
         dummy.tp_config_suffix = "@test_tp0"
+        dummy._backend_converts_key = False
         dummy._hybrid_pool_ctx = {}
         dummy.registered_pools = {}
         dummy._pre_register_host = MagicMock()
@@ -1091,36 +1092,45 @@ class TestDocaMemosNixl(unittest.TestCase):
     def test_mamba_without_temporal_state_round_trip(self):
         from unittest.mock import patch
 
-        dummy = self._make_registration_target()
-        host = self._make_hybrid_pool(expose_zero_copy=False, has_temporal=False)
-        with patch(
-            "sglang.srt.mem_cache.storage.nixl.hicache_nixl.tensor_uses_hugepage",
-            return_value=True,
-        ):
-            dummy.register_mem_host_pool_v2(host, PoolName.MAMBA)
-        ctx = dummy._hybrid_pool_ctx[PoolName.MAMBA]
-        stored_page = None
+        for backend_converts_key in (False, True):
+            with self.subTest(backend_converts_key=backend_converts_key):
+                dummy = self._make_registration_target()
+                dummy._backend_converts_key = backend_converts_key
+                host = self._make_hybrid_pool(
+                    expose_zero_copy=False, has_temporal=False
+                )
+                with patch(
+                    "sglang.srt.mem_cache.storage.nixl.hicache_nixl.tensor_uses_hugepage",
+                    return_value=True,
+                ):
+                    dummy.register_mem_host_pool_v2(host, PoolName.MAMBA)
+                ctx = dummy._hybrid_pool_ctx[PoolName.MAMBA]
+                stored_page = None
 
-        def fake_xfer(keys, key_strs, host_buffers, direction):
-            nonlocal stored_page
-            self.assertEqual(len(dummy._format_key(key_strs[0])), 32)
-            if direction == "WRITE":
-                stored_page = ctx.bounce_set[0].clone()
-            else:
-                ctx.bounce_get[0].copy_(stored_page)
-            return [True] * len(key_strs)
+                def fake_xfer(keys, key_strs, host_buffers, direction):
+                    nonlocal stored_page
+                    formatted = dummy._format_key(key_strs[0])
+                    if backend_converts_key:
+                        self.assertEqual(formatted, key_strs[0])
+                    else:
+                        self.assertEqual(len(formatted), 32)
+                    if direction == "WRITE":
+                        stored_page = ctx.bounce_set[0].clone()
+                    else:
+                        ctx.bounce_get[0].copy_(stored_page)
+                    return [True] * len(key_strs)
 
-        transfer = PoolTransfer(
-            name=PoolName.MAMBA,
-            keys=["conv-only"],
-            host_indices=torch.tensor([0], dtype=torch.int64),
-        )
-        host.conv_buffer[0][0].fill_(7)
-        dummy._batch_xfer = fake_xfer
-        dummy.batch_set_v2([transfer])
-        host.conv_buffer[0][0].zero_()
-        dummy.batch_get_v2([transfer])
-        self.assertTrue(torch.all(host.conv_buffer[0][0] == 7))
+                transfer = PoolTransfer(
+                    name=PoolName.MAMBA,
+                    keys=["conv-only"],
+                    host_indices=torch.tensor([0], dtype=torch.int64),
+                )
+                host.conv_buffer[0][0].fill_(7)
+                dummy._batch_xfer = fake_xfer
+                dummy.batch_set_v2([transfer])
+                host.conv_buffer[0][0].zero_()
+                dummy.batch_get_v2([transfer])
+                self.assertTrue(torch.all(host.conv_buffer[0][0] == 7))
 
     def test_batch_set_get_v2_rejects_mismatched_indices_before_chunking(self):
         from unittest.mock import patch
