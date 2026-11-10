@@ -109,7 +109,7 @@ from sglang.srt.model_loader.checkpoint_quantization import (
 
 logger = init_logger(__name__)
 
-_ONLINE_ENCODER_QUANTIZATIONS = frozenset({"fp8", "convrot_int8", "mxfp4"})
+_ONLINE_ENCODER_QUANTIZATIONS = frozenset({"fp8", "mxfp8", "convrot_int8", "mxfp4"})
 
 _TRANSFORMERS_ENCODER_ONLY_CLASSES = {
     "T5EncoderModel": transformers.T5EncoderModel,
