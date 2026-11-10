@@ -20,12 +20,6 @@ For the design details, please refer to [link](https://docs.google.com/document/
 
 Currently, we support Mooncake and NIXL as the transfer engine.
 
-## KV Transfer Checksum Verification
-
-To check KV integrity across PD transfer, add `--disaggregation-enable-kv-checksum` to **both** the prefill and decode server commands. Prefill computes an Adler-32 checksum for each request's KV pages and sends it with the transfer metadata. Decode recomputes the checksum after receiving the KV and verifies it before scheduling the request. A mismatch aborts that request; checksum verification is disabled by default.
-
-CUDA uses the existing checksum kernel. Ascend NPU deployments also need a matching `sgl-kernel-npu` package that provides the checksum operator.
-
 ## Profiling in PD Disaggregation Mode
 
 When you need to profile prefill or decode workers in PD disaggregation mode, please refer to the [Profile In PD Disaggregation Mode](../developer_guide/benchmark_and_profiling#profile-in-pd-disaggregation-mode) section in the Benchmark and Profiling guide. Due to torch profiler limitations, prefill and decode workers must be profiled separately using dedicated command-line options.
@@ -276,7 +270,16 @@ Please be aware that this setting will cause prefill instances to take a longer 
   <tbody>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>**`SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL`**</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Interval (seconds) between health checks to prefi…155 tokens truncated…ackgroundColor: "rgba(255,255,255,0.02)"}}>**`SGLANG_DISAGGREGATION_WAITING_TIMEOUT`**</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Interval (seconds) between health checks to prefill bootstrap servers</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`5.0`</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>**`SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE`**</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Consecutive heartbeat failures before marking prefill server offline</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`2`</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>**`SGLANG_DISAGGREGATION_WAITING_TIMEOUT`**</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Timeout (seconds) for receiving KV Cache after request initialization</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`300`</td>
     </tr>
