@@ -208,8 +208,8 @@ fn validate_target(target: &Value) -> Result<(), Error> {
             serde_json::from_value(target.clone()).map_err(|_| Error::InvalidPayload)?;
         let c = &p.compatibility;
         if c.components.iter().collect::<HashSet<_>>().len() != c.components.len()
-            || !p.start_token.is_multiple_of(c.page_size)
-            || !p.end_token.is_multiple_of(c.page_size)
+            || p.start_token % c.page_size != 0
+            || p.end_token % c.page_size != 0
             || p.token_ids
                 .as_ref()
                 .is_some_and(|tokens| tokens.len() as u64 != p.end_token)

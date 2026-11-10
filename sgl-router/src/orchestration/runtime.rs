@@ -12,13 +12,9 @@ use bytes::Bytes;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sgl_kv_orchestrator::backend_protection::{
-    BackendProtectionOwner, ClaimIdentity, ClaimMode, ProtectionRequest,
-};
 use sgl_kv_orchestrator::{
     models::{PrefixTarget, SessionIdentity},
-    operations::{BookError, DemandBook, DemandId},
-    preparation::{Estimate, PreparationCosts},
+    operations::{DemandBook, DemandId},
     protocol::{parse_action, Action},
     session_index::{
         Association, AssociationProvenance, ContentKey, ContentRegistration, RequestIdentity,
@@ -75,7 +71,7 @@ struct Published {
     ready: Vec<Ready>,
 }
 enum Message {
-    Api(Value, Instant, oneshot::Sender<Value>),
+    Api(Value, oneshot::Sender<Value>),
     Request {
         context: KvContext,
         tokens: Vec<u32>,
@@ -124,11 +120,7 @@ impl Runtime {
     }
     pub async fn api(&self, value: Value) -> Value {
         let (tx, rx) = oneshot::channel();
-        if self
-            .tx
-            .try_send(Message::Api(value, Instant::now(), tx))
-            .is_err()
-        {
+        if self.tx.try_send(Message::Api(value, tx)).is_err() {
             return error("capacity", "orchestration queue full");
         }
         match tokio::time::timeout(
@@ -252,16 +244,6 @@ fn digest(value: &impl Serialize) -> String {
         )
     )
 }
-fn preparation_owner(url: &str, caps: &Capabilities) -> String {
-    digest(&(
-        url,
-        &caps.engine_id,
-        &caps.epoch,
-        &caps.compatibility,
-        &caps.public["storage_backend"],
-        &caps.public["backend_namespace"],
-    ))
-}
 fn task(value: &Value, caller: &str) -> Result<SessionIdentity, String> {
     Ok(SessionIdentity {
         caller_id: caller.into(),
@@ -364,53 +346,6 @@ struct Job {
     cache_watermark: Value,
     ready_end: u64,
     ready_at: Option<Instant>,
-    preparation_estimate: Option<Estimate>,
-    ready_pin_eligible: bool,
-    ready_pin: Option<Box<Job>>,
-    ready_pin_error: Option<String>,
-    late_before_submit: bool,
-}
-impl Job {
-    fn material_bytes(&self) -> usize {
-        let tokens = self.prefix.token_ids.as_ref().map_or(0, Vec::len)
-            + self.payload["target"]["token_ids"]
-                .as_array()
-                .map_or(0, Vec::len);
-        tokens.saturating_mul(4).saturating_add(
-            self.ready_pin
-                .as_ref()
-                .map_or(0, |pin| pin.material_bytes()),
-        )
-    }
-
-    fn pin_inactive(&self) -> bool {
-        self.quiescent
-            && ((!self.attempted && !self.releasing_pin)
-                || (self.last_error.is_none()
-                    && (self.pin_refused()
-                        || matches!(
-                            self.claim_view["state"].as_str(),
-                            Some("released" | "expired" | "invalidated")
-                        ))))
-    }
-
-    fn pin_refused(&self) -> bool {
-        // Only internal children use a fresh claim key for each episode.
-        // A refused explicit renewal can still have an older active claim.
-        self.id.starts_with("ready-pin-")
-            && self.quiescent
-            && !self.releasing_pin
-            && matches!(
-                self.result["update"]["status"].as_str(),
-                Some("missing" | "deferred" | "unsupported" | "failed" | "cancelled")
-            )
-            && self.result["public_result"]["claim"].is_null()
-    }
-}
-struct ReadObservation {
-    result: Option<Value>,
-    scope: Option<Value>,
-    after: Option<Value>,
 }
 struct Intent {
     fingerprint: String,
@@ -418,18 +353,7 @@ struct Intent {
     jobs: Vec<String>,
     frozen: FrozenTarget,
     expires: Instant,
-    resume_at: Option<Instant>,
     released: bool,
-    claims: Vec<ClaimIdentity>,
-}
-struct ClaimRecord {
-    task: SessionIdentity,
-    request: ProtectionRequest,
-    view: Value,
-    release_requested: bool,
-    interests: BTreeSet<DemandId>,
-    feedback_unknown: Option<String>,
-    error: Option<String>,
 }
 struct Actor {
     config: OrchestrationConfig,
@@ -444,17 +368,9 @@ struct Actor {
     caps: BTreeMap<String, Capabilities>,
     last_route: BTreeMap<SessionIdentity, String>,
     tick_cursor: usize,
-    job_rr_cursor: usize,
-    last_job_priority: bool,
-    wire_incarnation: String,
-    next_wire_message: u64,
     events: BTreeMap<DemandId, (String, Value)>,
     cost_ms_per_token: f64,
-    preparation_costs: Option<PreparationCosts>,
     traffic: Arc<AtomicU64>,
-    backend_owner: Option<BackendProtectionOwner>,
-    backend_error: Option<String>,
-    claims: BTreeMap<ClaimIdentity, ClaimRecord>,
     feedback: FeedbackCache,
 }
 impl Actor {
@@ -479,20 +395,9 @@ impl Actor {
             caps: BTreeMap::new(),
             last_route: BTreeMap::new(),
             tick_cursor: 0,
-            job_rr_cursor: 0,
-            last_job_priority: false,
-            wire_incarnation: uuid::Uuid::new_v4().to_string(),
-            next_wire_message: 0,
             events: BTreeMap::new(),
             cost_ms_per_token: config.initial_prefetch_ms_per_token,
-            preparation_costs: config
-                .preparation_policy
-                .clone()
-                .map(|policy| PreparationCosts::new(policy).expect("validated preparation config")),
             traffic,
-            backend_owner: None,
-            backend_error: None,
-            claims: BTreeMap::new(),
             feedback: FeedbackCache::new(
                 config.max_workers,
                 config.max_operations,
@@ -501,23 +406,12 @@ impl Actor {
         }
     }
     async fn run(mut self, mut rx: mpsc::Receiver<Message>) {
-        match super::protection::start(
-            &self.config,
-            self.registry.clone(),
-            self.model.clone(),
-            self.client.clone(),
-        )
-        .await
-        {
-            Ok(owner) => self.backend_owner = owner,
-            Err(reason) => self.backend_error = Some(reason),
-        }
         let mut tick = tokio::time::interval(Duration::from_millis(self.config.poll_ms));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 message=rx.recv()=>match message {
-                    Some(Message::Api(value,received_at,reply))=> { let result=self.api(value,received_at).await;let _=reply.send(result); }
+                    Some(Message::Api(value,reply))=> { let result=self.api(value).await;let _=reply.send(result); }
                     Some(Message::Request {context,tokens,salt,worker})=> { if let Err(reason)=self.record(context,tokens,salt,worker).await { tracing::debug!(%reason,"KV association unavailable"); } }
                     Some(Message::Routed {context,worker})=> { self.changed_route(&context.task(&self.config.caller_id),&worker); }
                     None=>break,
@@ -546,10 +440,27 @@ impl Actor {
     }
     async fn refresh(&mut self, url: &str) -> Result<Capabilities, String> {
         match self.client.capabilities(url).await {
-            Ok(caps) => Ok(self.bind_caps(url, caps)),
+            Ok(caps) => {
+                let effect = self.feedback.bind(url, &caps);
+                self.invalidate_feedback(url, effect);
+                if self.caps.get(url).is_some_and(|old| {
+                    old.epoch != caps.epoch
+                        || old.generation != caps.generation
+                        || old.compatibility != caps.compatibility
+                }) {
+                    for job in self.jobs.values_mut().filter(|j| j.url == url) {
+                        job.ready_end = 0;
+                        job.ready_at = None;
+                    }
+                }
+                if self.caps.contains_key(url) || self.caps.len() < self.config.max_workers {
+                    self.caps.insert(url.into(), caps.clone());
+                }
+                Ok(caps)
+            }
             Err(e) => {
                 let effect = self.feedback.fail(url, "capabilities unavailable");
-                self.invalidate_feedback(url, effect, "capabilities unavailable");
+                self.invalidate_feedback(url, effect);
                 self.caps.remove(url);
                 for job in self.jobs.values_mut().filter(|j| j.url == url) {
                     job.ready_end = 0;
@@ -559,25 +470,7 @@ impl Actor {
             }
         }
     }
-    fn bind_caps(&mut self, url: &str, caps: Capabilities) -> Capabilities {
-        let effect = self.feedback.bind(url, &caps);
-        self.invalidate_feedback(url, effect, "discovered owner/source change");
-        if self.caps.get(url).is_some_and(|old| {
-            old.epoch != caps.epoch
-                || old.generation != caps.generation
-                || old.compatibility != caps.compatibility
-        }) {
-            for job in self.jobs.values_mut().filter(|j| j.url == url) {
-                job.ready_end = 0;
-                job.ready_at = None;
-            }
-        }
-        if self.caps.contains_key(url) || self.caps.len() < self.config.max_workers {
-            self.caps.insert(url.into(), caps.clone());
-        }
-        caps
-    }
-    fn invalidate_feedback(&mut self, url: &str, effect: Effect, reason: &str) {
+    fn invalidate_feedback(&mut self, url: &str, effect: Effect) {
         for job in self.jobs.values_mut().filter(|job| job.url == url) {
             if effect.ready {
                 job.ready_end = 0;
@@ -587,151 +480,34 @@ impl Actor {
                 job.claim_view = Value::Null;
             }
         }
-        if effect.storage {
-            for claim in self.claims.values_mut() {
-                claim.feedback_unknown = Some(reason.into());
-                suppress_protection(&mut claim.view);
-            }
-        }
         // Both normal routing paths read this publication. No I/O holds its lock.
         self.publish();
     }
     async fn poll_feedback(&mut self, url: &str, caps: &Capabilities) -> Result<(), String> {
-        let limit = self.config.queue_capacity.clamp(1, 256);
-        let result = match self
+        let limit = self.config.queue_capacity.min(256).max(1);
+        let request = self
             .feedback
-            .command(url, caps.context(&self.config.caller_id), limit)
-        {
+            .command(url, caps.context(&self.config.caller_id), limit);
+        let result = match request {
             Ok(None) => return Ok(()),
-            Ok(Some(command)) => self.client.command(url, &command).await,
+            Ok(Some(command)) => match self.client.command(url, &command).await {
+                Ok(page) => self
+                    .feedback
+                    .apply(url, &self.config.caller_id, &page, limit),
+                Err(reason) => Err(reason),
+            },
             Err(reason) => Err(reason),
         };
         match result {
-            Ok(page) => self.apply_feedback_page(url, &page),
-            Err(reason) => {
-                let effect = self.feedback.fail(url, &reason);
-                self.invalidate_feedback(url, effect, &reason);
-                Err(reason)
-            }
-        }
-    }
-    fn apply_feedback_page(&mut self, url: &str, page: &Value) -> Result<(), String> {
-        let limit = self.config.queue_capacity.clamp(1, 256);
-        let result = self
-            .feedback
-            .apply(url, &self.config.caller_id, page, limit);
-        match result {
             Ok(effect) => {
-                self.invalidate_feedback(url, effect, "feedback invalidation/gap");
+                self.invalidate_feedback(url, effect);
                 Ok(())
             }
             Err(reason) => {
                 let effect = self.feedback.fail(url, &reason);
-                self.invalidate_feedback(url, effect, &reason);
+                self.invalidate_feedback(url, effect);
                 Err(reason)
             }
-        }
-    }
-    async fn read_observation(
-        &mut self,
-        job: &mut Job,
-        live: &mut Capabilities,
-        reuse_result: bool,
-        cancel: bool,
-    ) -> Result<ReadObservation, String> {
-        let scope = if job.action == "sglang.pin" && !job.pin_refused() {
-            Some(json!({"kind":"claim","context":job.context,"claim_id":job.payload["claim_id"]}))
-        } else if job.action == "sglang.prefetch" && !cancel {
-            Some(EngineClient::residency_command(
-                live,
-                &self.config.caller_id,
-                &job.prefix,
-                job.payload["destination"]["tier"]
-                    .as_str()
-                    .unwrap_or("host"),
-            ))
-        } else {
-            None
-        };
-        let limit = self.config.queue_capacity.clamp(1, 256);
-        let events = self
-            .feedback
-            .command(&job.url, job.context.clone(), limit)?;
-        let mut queries = vec![json!({"kind":"capabilities"})];
-        queries.extend(events.clone());
-        if !reuse_result {
-            queries.push(json!({"kind":"query","context":job.context,"message_id":job.message_id}));
-        }
-        queries.extend(scope.clone());
-        if scope.is_some() {
-            queries.extend(events.clone());
-        }
-        let mut results = self
-            .client
-            .read_batch(&job.url, &job.context, queries)
-            .await?
-            .into_iter();
-        *live = self.bind_caps(
-            &job.url,
-            Capabilities::parse(results.next().ok_or("batch capabilities absent")?)?,
-        );
-        if live.engine_id != job.caps.engine_id
-            || live.epoch != job.caps.epoch
-            || live.compatibility != job.caps.compatibility
-        {
-            return Err("owner epoch/compatibility changed during read batch".into());
-        }
-        job.caps.generation = live.generation;
-        if events.is_some() {
-            let page = results.next().ok_or("batch feedback absent")?;
-            self.apply_feedback_page(&job.url, &page)?;
-            Self::batch_feedback_complete(&page)?;
-        }
-        Ok(ReadObservation {
-            result: (!reuse_result).then(|| results.next()).flatten(),
-            scope: scope.is_some().then(|| results.next()).flatten(),
-            after: (scope.is_some() && events.is_some())
-                .then(|| results.next())
-                .flatten(),
-        })
-    }
-    fn batch_feedback_complete(page: &Value) -> Result<(), String> {
-        // Both event reads use the same prior cursor. A truncated/filtered page
-        // cannot prove that post-query history was consumed; repair separately.
-        if page["gap"] != false
-            || page["next_cursor"]["sequence"]
-                .as_u64()
-                .zip(page["latest_sequence"].as_u64())
-                .is_none_or(|(next, latest)| next != latest)
-        {
-            return Err("read batch feedback requires catch-up".into());
-        }
-        Ok(())
-    }
-    async fn finish_observation(
-        &mut self,
-        job: &mut Job,
-        live: &Capabilities,
-        batch: &mut Option<ReadObservation>,
-    ) -> Result<(), String> {
-        if let Some(observation) = batch {
-            if let Some(page) = observation.after.take() {
-                self.apply_feedback_page(&job.url, &page)?;
-                Self::batch_feedback_complete(&page)?;
-            }
-            Ok(())
-        } else {
-            self.poll_feedback(&job.url, live).await
-        }
-    }
-    async fn repair_batch_failure(&mut self, job: &mut Job, reason: &str) {
-        job.ready_end = 0;
-        job.ready_at = None;
-        job.claim_view = Value::Null;
-        let effect = self.feedback.fail(&job.url, reason);
-        self.invalidate_feedback(&job.url, effect, reason);
-        if let Ok(caps) = self.refresh(&job.url).await {
-            let _ = self.poll_feedback(&job.url, &caps).await;
         }
     }
     async fn record(
@@ -824,14 +600,6 @@ impl Actor {
         self.book.release(demand);
         if let Some(intent) = self.intents.get_mut(demand) {
             intent.released = true;
-            for identity in &intent.claims {
-                if let Some(claim) = self.claims.get_mut(identity) {
-                    claim.interests.remove(demand);
-                    if claim.interests.is_empty() {
-                        claim.release_requested = true;
-                    }
-                }
-            }
         }
         let _ = self
             .index
@@ -892,7 +660,7 @@ impl Actor {
         };
         Ok(self.index.resolve(selector))
     }
-    async fn api(&mut self, value: Value, received_at: Instant) -> Value {
+    async fn api(&mut self, value: Value) -> Value {
         if let Err(reason) = validate_input(&value) {
             return error("invalid_payload", reason);
         }
@@ -930,7 +698,7 @@ impl Actor {
                 return error("conflict", "stale lifecycle revision");
             }
         }
-        let result = match self.apply(value.clone(), received_at).await {
+        let result = match self.apply(value.clone()).await {
             Ok(data) => ok(data),
             Err(e) => error(
                 if e.to_lowercase().contains("capacity") {
@@ -956,22 +724,21 @@ impl Actor {
         }
         result
     }
-    async fn apply(&mut self, value: Value, received_at: Instant) -> Result<Value, String> {
+    async fn apply(&mut self, value: Value) -> Result<Value, String> {
         let kind = value["kind"].as_str().ok_or("kind required")?;
         if kind == "feedback" {
             return Ok(self.feedback.view());
         }
         if kind == "capabilities" {
-            let backend = match &self.backend_owner {
-                Some(owner) => {
-                    serde_json::to_value(owner.query(None).await.map_err(|e| e.to_string())?)
-                        .map_err(|e| e.to_string())?
-                }
-                None => Value::Null,
-            };
-            return Ok(
-                json!({"enabled":true,"caller_id":self.config.caller_id,"engine_session_required":false,"lifecycle":"explicit","protection_owner":if self.backend_owner.is_some(){"configured"}else{"unavailable"},"backend_protection":backend,"protection_error":self.backend_error,"feedback":self.feedback.view(),"prefetch_ms_per_token":self.cost_ms_per_token,"preparation_policy":self.config.preparation_policy,"preparation_cost_groups":self.preparation_costs.as_ref().map(|model|model.groups()),"index":format!("{:?}",self.index.usage())}),
-            );
+            return Ok(json!({
+                "enabled": true,
+                "caller_id": self.config.caller_id,
+                "engine_session_required": false,
+                "lifecycle": "explicit",
+                "pin_tier": "host",
+                "feedback": self.feedback.view(),
+                "index": format!("{:?}", self.index.usage())
+            }));
         }
         let task = task(value.get("task").unwrap_or(&value), &self.config.caller_id)?;
         let id = value["message_id"]
@@ -996,11 +763,6 @@ impl Actor {
                 for id in jobs {
                     self.poll_job(&id).await;
                 }
-                if let Some(intent) = self.intents.get(&demand) {
-                    for identity in intent.claims.clone() {
-                        self.poll_claim(&identity).await;
-                    }
-                }
                 Ok(self.intent_view(&demand))
             }
             "cancel" => {
@@ -1018,12 +780,11 @@ impl Actor {
                     .jobs
                     .clone();
                 if !self.intents[&demand].released
-                    && (!self.intents[&demand].claims.is_empty()
-                        || ids.iter().any(|id| {
-                            self.jobs.get(id).is_some_and(|job| {
-                                job.action == "sglang.pin" && job.payload["mode"] != "release"
-                            })
-                        }))
+                    && ids.iter().any(|id| {
+                        self.jobs.get(id).is_some_and(|job| {
+                            job.action == "sglang.pin" && job.payload["mode"] != "release"
+                        })
+                    })
                 {
                     return Err("cancel or release the PIN intent before acknowledging".into());
                 }
@@ -1031,18 +792,9 @@ impl Actor {
                 for id in &ids {
                     self.poll_job(id).await;
                 }
-                let identities = self.intents[&demand].claims.clone();
-                for identity in &identities {
-                    self.poll_claim(identity).await;
-                }
                 if ids
                     .iter()
-                    .any(|id| self.jobs.get(id).is_some_and(|j| !self.job_quiescent(j)))
-                    || identities.iter().any(|id| {
-                        self.claims
-                            .get(id)
-                            .is_some_and(|c| c.view["backend_quiescent"] != true)
-                    })
+                    .any(|id| self.jobs.get(id).is_some_and(|j| !j.quiescent))
                 {
                     return Err("operation/claim not quiescent".into());
                 }
@@ -1081,13 +833,6 @@ impl Actor {
                         for ended in &cleanup.tasks {
                             self.book.release_task(ended);
                             self.last_route.remove(ended);
-                            for claim in self
-                                .claims
-                                .values_mut()
-                                .filter(|claim| &claim.task == ended)
-                            {
-                                claim.release_requested = true;
-                            }
                             for (d, i) in self.intents.iter_mut().filter(|(d, _)| &d.task == ended)
                             {
                                 let _ = d;
@@ -1154,99 +899,31 @@ impl Actor {
                         Ok(json!({"state":"request_unbound","task_state":"active"}))
                     }
                     "tool_wait" | "resume_expected" | "tool_done" => {
-                        // Keep the original Value for replay identity. The local
-                        // absolute window also covers mailbox and discovery waits.
-                        let resume_at = self.preparation_costs.as_ref().and_then(|_| {
-                            let millis = if event == "tool_done" {
-                                value["available_ms"].as_u64()
-                            } else {
-                                value["expected_wait_ms"].as_u64()
-                            };
-                            millis.map(|ms| received_at + Duration::from_millis(ms))
-                        });
-                        let remaining_ms = resume_at.map(|at| {
-                            at.saturating_duration_since(Instant::now()).as_millis() as u64
-                        });
                         if self.index.session_revision(&task).is_none() {
                             return Err("unknown task incarnation".into());
                         }
                         let target =
                             self.resolve(value.get("target").unwrap_or(&Value::Null), &task)?;
-                        if event == "tool_done" && self.preparation_costs.is_some() {
-                            let prefixes: Vec<_> = target
-                                .known_scope()
-                                .iter()
-                                .filter_map(|scope| self.index.materialize(scope.scope()).ok())
-                                .collect();
-                            for (demand, intent) in &self.intents {
-                                if demand.task != task || intent.released {
-                                    continue;
-                                }
-                                for id in &intent.jobs {
-                                    if let Some(job) = self.jobs.get_mut(id) {
-                                        if !job.quiescent
-                                            && job.action == "sglang.prefetch"
-                                            && value["worker_url"]
-                                                .as_str()
-                                                .is_none_or(|url| url == job.url)
-                                            && prefixes.iter().any(|prefix| {
-                                                prefix.compatibility == job.prefix.compatibility
-                                                    && prefix.token_ids == job.prefix.token_ids
-                                            })
-                                        {
-                                            job.due = Instant::now();
-                                        }
-                                    }
-                                }
-                            }
-                        }
                         let tokens = target
                             .known_scope()
                             .iter()
                             .map(|s| s.scope().end_token())
                             .max()
                             .unwrap_or(0);
-                        let owner = value["worker_url"]
-                            .as_str()
-                            .or_else(|| self.last_route.get(&task).map(String::as_str))
-                            .and_then(|url| {
-                                self.caps.get(url).map(|caps| preparation_owner(url, caps))
-                            })
-                            .unwrap_or_default();
-                        let estimate = self.preparation_costs.as_ref().map(|model| {
-                            model.estimate(
-                                &owner,
-                                tokens,
-                                self.config.initial_prefetch_ms_per_token,
-                                self.config.lead_margin_ms,
-                            )
-                        });
-                        let cost = estimate.map_or_else(
-                            || (tokens as f64 * self.cost_ms_per_token).ceil() as u64,
-                            |estimate| estimate.preparation_ms,
-                        );
-                        let lead = estimate.map_or_else(
-                            || cost.saturating_add(self.config.lead_margin_ms),
-                            |estimate| estimate.lead_ms,
-                        );
+                        let cost = (tokens as f64 * self.cost_ms_per_token).ceil() as u64;
+                        let lead = cost.saturating_add(self.config.lead_margin_ms);
                         if event == "tool_done"
                             && cost
-                                > remaining_ms.unwrap_or_else(|| {
-                                    value["available_ms"]
-                                        .as_u64()
-                                        .unwrap_or(self.config.max_resume_prefetch_ms)
-                                })
+                                > value["available_ms"]
+                                    .as_u64()
+                                    .unwrap_or(self.config.max_resume_prefetch_ms)
                         {
                             return Ok(
                                 json!({"state":"on_demand_fallback","estimated_ms":cost,"reason":"preparation too late"}),
                             );
                         }
                         if event == "resume_expected"
-                            && (remaining_ms
-                                .unwrap_or_else(|| value["expected_wait_ms"].as_u64().unwrap_or(0))
-                                == 0
-                                || (self.preparation_costs.is_none()
-                                    && value["expected_wait_ms"].as_u64().unwrap_or(0) < lead))
+                            && value["expected_wait_ms"].as_u64().unwrap_or(0) < lead
                         {
                             return Ok(
                                 json!({"state":"on_demand_fallback","estimated_ms":cost,"reason":"insufficient preparation lead"}),
@@ -1257,15 +934,13 @@ impl Actor {
                             let pin_id = format!("policy-pin-{}", digest(&(&task, id)));
                             let pin = json!({"kind":"submit","task":value.get("task").unwrap_or(&value),"message_id":pin_id,
                                 "action":"sglang.pin","target":value.get("target").cloned().unwrap_or(Value::Null),
-                                "location":{"tier":retention["tier"]},"mode":"acquire","claim_id":pin_id,"revision":revision,
+                                "location":{"tier":"host"},"mode":"acquire","claim_id":pin_id,"revision":revision,
                                 "ttl_seconds":retention["ttl_seconds"],"required_protection":retention["required_protection"]});
                             let pin_demand = DemandId {
                                 task: task.clone(),
                                 id: pin_id,
                             };
-                            let retained = self
-                                .submit(pin, task.clone(), pin_demand, None, false)
-                                .await;
+                            let retained = self.submit(pin, task.clone(), pin_demand).await;
                             if !value["pressure"].as_bool().unwrap_or(false) {
                                 return Ok(
                                     json!({"retention":retained.unwrap_or_else(|e|error("unsupported",e)),"demote":"skipped_no_pressure"}),
@@ -1273,29 +948,9 @@ impl Actor {
                             }
                         }
                         if event == "tool_wait"
-                            && value["source"]["tier"] == "host"
-                            && self
-                                .config
-                                .preparation_policy
-                                .as_ref()
-                                .is_some_and(|policy| {
-                                    remaining_ms
-                                        .unwrap_or_else(|| {
-                                            value["expected_wait_ms"].as_u64().unwrap_or(0)
-                                        })
-                                        .saturating_sub(lead)
-                                        <= policy.min_cold_residency_ms
-                                })
-                        {
-                            return Ok(
-                                json!({"state":"skipped","reason":"insufficient expected cold residency","estimated_preparation_ms":cost}),
-                            );
-                        }
-                        if event == "tool_wait"
                             && (!value["pressure"].as_bool().unwrap_or(false)
-                                || remaining_ms.unwrap_or_else(|| {
-                                    value["expected_wait_ms"].as_u64().unwrap_or(0)
-                                }) < self.config.poll_ms)
+                                || value["expected_wait_ms"].as_u64().unwrap_or(0)
+                                    < self.config.poll_ms)
                         {
                             return Ok(
                                 json!({"state":"skipped","reason":"insufficient pressure/wait evidence"}),
@@ -1315,18 +970,11 @@ impl Actor {
                         } else {
                             "sglang.prefetch"
                         });
-                        let demote_source = if self.preparation_costs.is_some()
-                            && value["source"]["tier"] == "host"
-                        {
-                            "host"
-                        } else {
-                            "gpu"
-                        };
                         command["source"] =
-                            json!({"tier":if event=="tool_wait"{demote_source}else{"storage"}});
+                            json!({"tier":if event=="tool_wait"{"host"}else{"storage"}});
                         command["destination"] =
                             json!({"tier":if event=="tool_wait"{"storage"}else{"host"}});
-                        if event == "tool_done" && self.preparation_costs.is_none() {
+                        if event == "tool_done" {
                             let ids: Vec<_> = self
                                 .intents
                                 .keys()
@@ -1343,21 +991,12 @@ impl Actor {
                                 }
                             }
                         }
-                        let mut result =
-                            self.submit(command, task, demand, resume_at, true).await?;
-                        if self.preparation_costs.is_some() {
-                            result["preparation_estimate"] = result["operations"]
-                                .as_array()
-                                .and_then(|jobs| jobs.first())
-                                .map(|job| job["preparation_estimate"].clone())
-                                .unwrap_or(Value::Null);
-                        }
-                        Ok(result)
+                        self.submit(command, task, demand).await
                     }
                     _ => Err("unsupported lifecycle signal".into()),
                 }
             }
-            "submit" => self.submit(value, task, demand, None, false).await,
+            "submit" => self.submit(value, task, demand).await,
             _ => Err("unsupported Router control kind".into()),
         }
     }
@@ -1366,10 +1005,7 @@ impl Actor {
         value: Value,
         task: SessionIdentity,
         demand: DemandId,
-        resume_at: Option<Instant>,
-        lifecycle_event: bool,
     ) -> Result<Value, String> {
-        let admitted_at = Instant::now();
         let fingerprint = digest(&value);
         if let Some(intent) = self.intents.get(&demand) {
             return if intent.fingerprint == fingerprint {
@@ -1414,20 +1050,11 @@ impl Actor {
         if !matches!(action, "sglang.prefetch" | "sglang.demote" | "sglang.pin") {
             return Err("unsupported action".into());
         }
-        let automatic_prefetch = self.preparation_costs.is_some()
-            && lifecycle_event
-            && action == "sglang.prefetch"
-            && matches!(
-                value["event"].as_str(),
-                Some("resume_expected" | "tool_done")
-            );
         let source = value["source"]["tier"].as_str().unwrap_or("storage");
         let destination = value["destination"]["tier"].as_str().unwrap_or("host");
         let pin_tier = value["location"]["tier"].as_str().unwrap_or("host");
-        if action == "sglang.pin" && pin_tier == "storage" {
-            return self
-                .submit_l3(value, task, demand, fingerprint, frozen)
-                .await;
+        if action == "sglang.pin" && pin_tier != "host" {
+            return Err("only host PIN is supported".into());
         }
         let mut workers = self.workers();
         if let Some(url) = value["worker_url"].as_str() {
@@ -1440,12 +1067,6 @@ impl Actor {
         }
         let mut available = Vec::new();
         for w in workers {
-            // Planning may reuse discovery; the first write still refreshes
-            // and checks the frozen owner epoch and compatibility in advance.
-            if let Some(caps) = self.caps.get(&w.url).filter(|_| automatic_prefetch) {
-                available.push((w.url.clone(), caps.clone()));
-                continue;
-            }
             if let Ok(caps) = self.refresh(&w.url).await {
                 available.push((w.url.clone(), caps));
             }
@@ -1473,7 +1094,6 @@ impl Actor {
             }
         }
         let mut planned = BTreeMap::new();
-        let mut due_updates = BTreeMap::new();
         let mut ids = BTreeSet::new();
         let mut missing = Vec::new();
         for resolved in frozen.known_scope() {
@@ -1497,37 +1117,6 @@ impl Actor {
                 missing.push("no healthy compatible executable worker".into());
                 continue;
             };
-            let preparation_estimate = self.preparation_costs.as_ref().and_then(|model| {
-                (action == "sglang.prefetch"
-                    && source == "storage"
-                    && destination == "host"
-                    && value["event"] == "resume_expected")
-                    .then(|| {
-                        model.estimate(
-                            &preparation_owner(url, caps),
-                            prefix.end_token,
-                            self.config.initial_prefetch_ms_per_token,
-                            self.config.lead_margin_ms,
-                        )
-                    })
-            });
-            let job_due = preparation_estimate.map_or(due, |estimate| {
-                resume_at.map_or_else(
-                    || {
-                        admitted_at
-                            + Duration::from_millis(
-                                value["expected_wait_ms"]
-                                    .as_u64()
-                                    .unwrap_or(0)
-                                    .saturating_sub(estimate.lead_ms),
-                            )
-                    },
-                    |at| {
-                        at.checked_sub(Duration::from_millis(estimate.lead_ms))
-                            .unwrap_or(admitted_at)
-                    },
-                )
-            });
             let mut src = value["source"].clone();
             let mut dst = value["destination"].clone();
             for location in [&mut src, &mut dst] {
@@ -1565,35 +1154,7 @@ impl Actor {
                 ))
             );
             ids.insert(id.clone());
-            let future = self.has_future_demand(&id);
-            if self.preparation_costs.is_some() && resume_at.is_none_or(|at| Instant::now() < at) {
-                if let Some(job) = self.jobs.get(&id).filter(|job| {
-                    !job.attempted
-                        && !job.submitted
-                        && (job.preparation_estimate.is_some() || job.late_before_submit)
-                }) {
-                    due_updates.insert(
-                        id.clone(),
-                        if future {
-                            job.due.min(job_due)
-                        } else {
-                            job_due
-                        },
-                    );
-                }
-            }
             if !self.jobs.contains_key(&id) {
-                // Concurrent interests share the logical job. A new lifecycle
-                // episode needs a fresh Engine envelope, while lost replies
-                // must retry the same envelope within this episode.
-                self.next_wire_message = self
-                    .next_wire_message
-                    .checked_add(1)
-                    .ok_or("wire message sequence exhausted")?;
-                let message_id = format!(
-                    "op-{}",
-                    digest(&(&self.wire_incarnation, &id, self.next_wire_message))
-                );
                 planned.insert(
                     id.clone(),
                     Job {
@@ -1609,11 +1170,11 @@ impl Actor {
                         claim_view: Value::Null,
                         submitted: false,
                         attempted: false,
-                        message_id,
+                        message_id: id.clone(),
                         releasing_pin: false,
                         cancel_sent: false,
                         quiescent: false,
-                        due: job_due,
+                        due,
                         deadline: expires,
                         last_error: None,
                         started: None,
@@ -1622,11 +1183,6 @@ impl Actor {
                         cache_watermark: Value::Null,
                         ready_end: 0,
                         ready_at: None,
-                        preparation_estimate,
-                        ready_pin_eligible: false,
-                        ready_pin: None,
-                        ready_pin_error: None,
-                        late_before_submit: false,
                     },
                 );
             }
@@ -1644,18 +1200,9 @@ impl Actor {
             .jobs
             .values()
             .chain(planned.values())
-            .map(Job::material_bytes)
+            .map(|j| j.prefix.token_ids.as_ref().map_or(0, |t| t.len() * 4))
             .sum();
-        if bytes > self.config.limits.max_token_material_bytes
-            || self.jobs.len()
-                + planned.len()
-                + self
-                    .jobs
-                    .values()
-                    .filter(|job| job.ready_pin.is_some())
-                    .count()
-                > self.config.max_operations
-        {
+        if bytes > self.config.limits.max_token_material_bytes {
             return Err("operation token material capacity".into());
         }
         let pin_claims: Vec<_> = planned
@@ -1674,23 +1221,9 @@ impl Actor {
         {
             return Err("Router claim capacity".into());
         }
-        match self.book.attach(demand.clone(), ids.clone()) {
-            Ok(()) => {}
-            Err(BookError::Conflict)
-                if automatic_prefetch
-                    && self.book.jobs_for(&demand).is_none()
-                    && ids
-                        .iter()
-                        .any(|id| self.book.job(id).is_some_and(|job| job.cancel_requested)) =>
-            {
-                // A cancelled episode cannot accept new interests. Automatic
-                // preparation falls back while its original owner drains/acks.
-                return Ok(
-                    json!({"state":"on_demand_fallback","reason":"cancelled_preparation_draining"}),
-                );
-            }
-            Err(error) => return Err(format!("{error:?}")),
-        }
+        self.book
+            .attach(demand.clone(), ids.clone())
+            .map_err(|e| format!("{e:?}"))?;
         if let Err(e) = self
             .index
             .track_resource(&task, ResourceKind::Intent, demand.id.clone())
@@ -1708,32 +1241,6 @@ impl Actor {
                 .map_err(|e| format!("{e:?}"))?;
         }
         self.jobs.extend(planned);
-        // Admission is atomic across children: a rejected fanout must not
-        // reschedule another task's already admitted preparation.
-        for (id, due) in due_updates {
-            if ids.contains(&id) {
-                self.jobs.get_mut(&id).unwrap().due = due;
-            }
-        }
-        if self
-            .config
-            .preparation_policy
-            .as_ref()
-            .is_some_and(|policy| {
-                policy.ready_pin_ttl_ms > 0
-                    && action == "sglang.prefetch"
-                    && source == "storage"
-                    && destination == "host"
-                    && matches!(
-                        value["event"].as_str(),
-                        Some("resume_expected" | "tool_done")
-                    )
-            })
-        {
-            for id in &ids {
-                self.jobs.get_mut(id).unwrap().ready_pin_eligible = true;
-            }
-        }
         self.intents.insert(
             demand.clone(),
             Intent {
@@ -1742,186 +1249,10 @@ impl Actor {
                 jobs: ids.into_iter().collect(),
                 frozen,
                 expires,
-                resume_at,
                 released: false,
-                claims: Vec::new(),
             },
         );
         Ok(self.intent_view(&demand))
-    }
-    async fn submit_l3(
-        &mut self,
-        value: Value,
-        task: SessionIdentity,
-        demand: DemandId,
-        fingerprint: String,
-        frozen: FrozenTarget,
-    ) -> Result<Value, String> {
-        let owner = self.backend_owner.clone().ok_or_else(|| {
-            self.backend_error
-                .clone()
-                .unwrap_or("L3 owner not configured".into())
-        })?;
-        let mode = match value["mode"].as_str() {
-            Some("acquire") => ClaimMode::Acquire,
-            Some("renew") => ClaimMode::Renew,
-            Some("release") => ClaimMode::Release,
-            _ => return Err("pin mode required".into()),
-        };
-        let revision = value["revision"]
-            .as_u64()
-            .ok_or("claim revision required")?;
-        let claim_id = value["claim_id"]
-            .as_str()
-            .filter(|s| !s.is_empty() && s.len() <= self.config.limits.max_identifier_bytes)
-            .ok_or("claim_id required")?;
-        let mut requests = Vec::new();
-        for scope in frozen.known_scope() {
-            let prefix = self
-                .index
-                .materialize(scope.scope())
-                .map_err(|g| format!("{g:?}"))?;
-            let identity = ClaimIdentity {
-                caller_id: self.config.caller_id.clone(),
-                task_incarnation: digest(&task),
-                claim_id: digest(&(claim_id, &prefix)),
-            };
-            requests.push(ProtectionRequest {
-                identity,
-                revision,
-                mode,
-                target: prefix,
-                ttl_seconds: value["ttl_seconds"].as_f64(),
-                required_protection: value["required_protection"]
-                    .as_str()
-                    .unwrap_or("eviction_exclusion")
-                    .into(),
-            });
-        }
-        if !frozen.missing_scope().is_empty() || requests.is_empty() {
-            return Err("L3 target scope incomplete".into());
-        }
-        let new = requests
-            .iter()
-            .filter(|r| !self.claims.contains_key(&r.identity))
-            .count();
-        if self.claims.len() + new > self.config.limits.max_claims {
-            return Err("Router claim capacity".into());
-        }
-        let retained: usize = self
-            .claims
-            .values()
-            .map(|c| {
-                c.request
-                    .target
-                    .token_ids
-                    .as_ref()
-                    .map_or(0, |t| t.len() * 4)
-            })
-            .sum();
-        let incoming: usize = requests
-            .iter()
-            .filter(|r| !self.claims.contains_key(&r.identity))
-            .map(|r| r.target.token_ids.as_ref().map_or(0, |t| t.len() * 4))
-            .sum();
-        if retained.saturating_add(incoming) > self.config.limits.max_token_material_bytes {
-            return Err("claim token material capacity".into());
-        }
-        self.index
-            .track_resource(&task, ResourceKind::Intent, demand.id.clone())
-            .map_err(|e| format!("{e:?}"))?;
-        let mut identities = Vec::new();
-        for request in requests {
-            let identity = request.identity.clone();
-            let tracked =
-                self.index
-                    .track_resource(&task, ResourceKind::Claim, identity.claim_id.clone());
-            if tracked.is_err() {
-                return Err("task claim tracking capacity".into());
-            }
-            let mut interests = self
-                .claims
-                .get(&identity)
-                .map_or_else(BTreeSet::new, |c| c.interests.clone());
-            if request.mode == ClaimMode::Release {
-                interests.clear();
-            } else {
-                interests.insert(demand.clone());
-            }
-            let (view, error) = match owner.submit(request.clone()).await {
-                Ok(view) => (serde_json::to_value(view).map_err(|e| e.to_string())?, None),
-                Err(e) => (Value::Null, Some(e.to_string())),
-            };
-            self.claims.insert(
-                identity.clone(),
-                ClaimRecord {
-                    task: task.clone(),
-                    request,
-                    view,
-                    release_requested: false,
-                    interests,
-                    feedback_unknown: self
-                        .claims
-                        .get(&identity)
-                        .and_then(|claim| claim.feedback_unknown.clone()),
-                    error,
-                },
-            );
-            identities.push(identity);
-        }
-        self.intents.insert(
-            demand.clone(),
-            Intent {
-                fingerprint,
-                admission_gaps: vec![],
-                jobs: vec![],
-                frozen,
-                expires: Instant::now()
-                    + value["ttl_seconds"]
-                        .as_f64()
-                        .filter(|ttl| ttl.is_finite() && *ttl > 0.0 && *ttl <= 31_536_000.0)
-                        .map(Duration::from_secs_f64)
-                        .unwrap_or(Duration::from_millis(self.config.operation_ttl_ms)),
-                resume_at: None,
-                released: false,
-                claims: identities,
-            },
-        );
-        Ok(self.intent_view(&demand))
-    }
-    async fn poll_claim(&mut self, identity: &ClaimIdentity) {
-        let Some(owner) = self.backend_owner.clone() else {
-            return;
-        };
-        let Some(mut claim) = self.claims.remove(identity) else {
-            return;
-        };
-        if claim.release_requested && claim.request.mode != ClaimMode::Release {
-            let mut release = claim.request.clone();
-            release.mode = ClaimMode::Release;
-            release.ttl_seconds = None;
-            release.revision = release.revision.saturating_add(1);
-            match owner.submit(release.clone()).await {
-                Ok(view) => {
-                    claim.request = release;
-                    claim.view = serde_json::to_value(view).unwrap_or(Value::Null);
-                    claim.error = None;
-                }
-                Err(e) => claim.error = Some(e.to_string()),
-            }
-        }
-        match owner.query(Some(identity.clone())).await {
-            Ok(snapshot) => {
-                if let Some(view) = snapshot.claim {
-                    claim.view = serde_json::to_value(view).unwrap_or(Value::Null);
-                }
-            }
-            Err(e) => claim.error = Some(e.to_string()),
-        }
-        if claim.feedback_unknown.is_some() {
-            suppress_protection(&mut claim.view);
-        }
-        self.claims.insert(identity.clone(), claim);
     }
     fn intent_view(&self, demand: &DemandId) -> Value {
         let Some(intent) = self.intents.get(demand) else {
@@ -1932,11 +1263,10 @@ impl Actor {
             "known_scope":intent.frozen.known_scope().iter().map(|s|json!({"branch":s.snapshot().map(|b|b.id().branch_id.clone()),"end_token":s.scope().end_token(),"content":s.scope().key().digest()})).collect::<Vec<_>>(),
             "missing_scope":intent.frozen.missing_scope().iter().map(|s|format!("{s:?}")).collect::<Vec<_>>(),
             "materialization_required":intent.frozen.materialization_required().iter().map(|s|format!("{s:?}")).collect::<Vec<_>>(),
-            "admission_gaps":intent.admission_gaps,"claims":intent.claims.iter().filter_map(|id|self.claims.get(id)).map(|c|json!({"claim":c.view,"error":c.error,"feedback_unknown":c.feedback_unknown,"release_requested":c.release_requested})).collect::<Vec<_>>(),
-            "released":intent.released,"quiescent":intent.claims.iter().all(|id|self.claims.get(id).is_none_or(|c|c.view["backend_quiescent"]==true)) && intent.jobs.iter().all(|id|self.jobs.get(id).is_none_or(|j|self.job_quiescent(j))),
+            "admission_gaps":intent.admission_gaps,
+            "released":intent.released,"quiescent":intent.jobs.iter().all(|id|self.jobs.get(id).is_none_or(|j|j.quiescent)),
             "operations":intent.jobs.iter().filter_map(|id|self.jobs.get(id)).map(|j|json!({"child_id":j.id,"worker_url":j.url,"engine_id":j.caps.engine_id,"owner_epoch":j.caps.epoch,
-                "action":j.action,"result":j.result,"policy_fallback":j.late_before_submit.then_some("late_before_submit"),"preparation_estimate":j.preparation_estimate,"cache_watermark":j.cache_watermark,"observation_age_ms":j.ready_at.map(|at|at.elapsed().as_millis()),"claim":j.claim_view,"error":j.last_error,"quiescent":self.job_quiescent(j),"cancel_requested":self.book.job(&j.id).is_some_and(|b|b.cancel_requested),
-                "auto_pin":j.ready_pin.as_ref().map(|pin|json!({"child_id":pin.id,"result":pin.result,"state":if pin.pin_refused(){json!("not_acquired")}else{pin.claim_view["state"].clone()},"claim":pin.claim_view,"error":pin.last_error,"quiescent":self.job_quiescent(j),"release_requested":self.book.job(&j.id).is_some_and(|b|b.cancel_requested)||now>=pin.deadline})),"auto_pin_error":j.ready_pin_error,
+                "action":j.action,"result":j.result,"cache_watermark":j.cache_watermark,"observation_age_ms":j.ready_at.map(|at|at.elapsed().as_millis()),"claim":j.claim_view,"error":j.last_error,"quiescent":j.quiescent,"cancel_requested":self.book.job(&j.id).is_some_and(|b|b.cancel_requested),
                 "ready_scope":if !intent.released && self.feedback.current(&j.url,&j.cache_watermark) && j.ready_at.is_some_and(|at|now.duration_since(at)<Duration::from_millis(self.config.poll_ms*2)) && j.ready_end>0 {json!({"start_token":0,"end_token":j.ready_end,"tier":j.payload["destination"]["tier"],"provenance":"engine_scoped_query"})}else{Value::Null}})).collect::<Vec<_>>()})
     }
     async fn pump(&mut self) {
@@ -1951,14 +1281,6 @@ impl Actor {
             self.release(&d);
         }
         self.tick_cursor = self.tick_cursor.wrapping_add(1);
-        if let Some(identity) = self
-            .claims
-            .keys()
-            .nth(self.tick_cursor % self.claims.len().max(1))
-            .cloned()
-        {
-            self.poll_claim(&identity).await;
-        }
         let healthy: BTreeSet<_> = self.workers().into_iter().map(|w| w.url.clone()).collect();
         self.caps.retain(|url, _| healthy.contains(url));
         for job in self.jobs.values_mut().filter(|j| !healthy.contains(&j.url)) {
@@ -1966,273 +1288,38 @@ impl Actor {
             job.ready_at = None;
             job.last_error = Some("worker unavailable".into());
         }
-        let next = self.next_job(&healthy);
-        if let Some((id, true)) = &next {
-            self.poll_job(id).await;
-        }
         let candidates = self.workers();
         if let Some(worker) = candidates.get(self.tick_cursor % candidates.len().max(1)) {
             if let Ok(caps) = self.refresh(&worker.url).await {
                 let _ = self.poll_feedback(&worker.url, &caps).await;
             }
         }
-        if let Some((id, false)) = next {
+        let ids: Vec<_> = self.jobs.keys().cloned().collect();
+        if !ids.is_empty() {
+            let id = ids[self.tick_cursor % ids.len()].clone();
             self.poll_job(&id).await;
         }
-    }
-    fn next_job(&mut self, healthy: &BTreeSet<String>) -> Option<(String, bool)> {
-        let now = Instant::now();
-        let priority = self.preparation_costs.is_some() && !self.last_job_priority;
-        let urgent = self
-            .jobs
-            .values()
-            .filter(|job| {
-                priority
-                    && job.due <= now
-                    && !job.attempted
-                    && !job.submitted
-                    && job.action == "sglang.prefetch"
-                    && job.payload["source"]["tier"] == "storage"
-                    && job.payload["destination"]["tier"] == "host"
-                    && healthy.contains(&job.url)
-                    && self.book.job(&job.id).is_some_and(|b| !b.cancel_requested)
-                    && self.has_future_demand(&job.id)
-            })
-            .min_by_key(|job| job.due)
-            .map(|job| job.id.clone());
-        self.last_job_priority = urgent.is_some();
-        if let Some(id) = urgent {
-            return Some((id, true));
-        }
-        // A separate cursor gives every job a turn despite intervening priority
-        // work, including cancellation, PIN expiry and uncertain I/O drainage.
-        let measured = self.preparation_costs.is_some();
-        let cursor = if measured {
-            self.job_rr_cursor
-        } else {
-            self.tick_cursor
-        };
-        let count = self.jobs.len().max(1);
-        let id = self.jobs.keys().nth(cursor % count)?.clone();
-        if measured {
-            self.job_rr_cursor = self.job_rr_cursor.wrapping_add(1);
-        }
-        Some((id, false))
     }
     async fn poll_job(&mut self, id: &str) {
         let Some(mut job) = self.jobs.remove(id) else {
             return;
         };
-        let cancel = self.book.job(id).is_some_and(|b| b.cancel_requested);
-        // Explicit queries and the background pump can observe the same job
-        // within one poll period. Reuse its timestamped advisory observation;
-        // cancellation and child protection still advance independently below.
-        let fresh = self.preparation_costs.is_some()
-            && !cancel
-            && job.quiescent
-            && job.last_error.is_none()
-            && job.action == "sglang.prefetch"
-            && job.ready_end == job.prefix.end_token
-            && job
-                .ready_at
-                .is_some_and(|at| at.elapsed() < Duration::from_millis(self.config.poll_ms))
-            && self.feedback.current(&job.url, &job.cache_watermark)
-            && self.workers().iter().any(|worker| worker.url == job.url);
-        let result = if fresh {
-            Ok(())
-        } else {
-            self.advance(&mut job, cancel, None).await
-        };
+        let result = self.advance(&mut job).await;
         if let Err(e) = result {
             job.last_error = Some(e);
             job.ready_end = 0;
             job.ready_at = None;
             job.claim_view = Value::Null;
         }
-        self.poll_ready_pin(&mut job, cancel).await;
-        if job
-            .ready_pin
-            .as_ref()
-            .is_some_and(|pin| pin.pin_refused() && pin.result["update"]["status"] == "missing")
-        {
-            job.ready_end = 0;
-            job.ready_at = None;
-        }
-        if self.job_quiescent(&job) {
+        if job.quiescent {
             let _ = self.book.mark_quiescent(id);
         }
         self.jobs.insert(id.into(), job);
     }
-    fn job_quiescent(&self, job: &Job) -> bool {
-        job.quiescent
-            && job.ready_pin.as_ref().is_none_or(|pin| {
-                pin.pin_inactive()
-                    || (pin.quiescent
-                        && pin.last_error.is_none()
-                        && Instant::now() < pin.deadline
-                        && !self
-                            .book
-                            .job(&job.id)
-                            .is_some_and(|book| book.cancel_requested))
-            })
-    }
-
-    fn has_future_demand(&self, id: &str) -> bool {
-        let now = Instant::now();
-        self.book.job(id).is_some_and(|job| {
-            job.interests.iter().any(|demand| {
-                self.intents.get(demand).is_some_and(|intent| {
-                    !intent.released
-                        && now < intent.expires
-                        && intent.resume_at.is_none_or(|at| now < at)
-                })
-            })
-        })
-    }
-    fn defer_late_preparation(&mut self, job: &mut Job) -> bool {
-        if self.preparation_costs.is_none()
-            || job.action != "sglang.prefetch"
-            || job.attempted
-            || job.submitted
-        {
-            return false;
-        }
-        if self.has_future_demand(&job.id) {
-            if job.late_before_submit {
-                // Only a never-attempted predicted preparation may resume.
-                // The book rejects cancelled jobs and preserves their drain.
-                if self.book.mark_running(&job.id).is_err() {
-                    return true;
-                }
-                job.late_before_submit = false;
-                job.quiescent = false;
-            }
-            return false;
-        }
-        job.late_before_submit = true;
-        job.quiescent = true;
-        job.ready_end = 0;
-        job.ready_at = None;
-        job.last_error = None;
-        true
-    }
-    async fn poll_ready_pin(&mut self, job: &mut Job, cancel: bool) {
-        if job.ready_pin_eligible
-            && self.has_future_demand(&job.id)
-            && job.ready_pin.is_none()
-            && !cancel
-            && job.last_error.is_none()
-            && job.quiescent
-            && job.result["update"]["status"] == "completed"
-            && job.ready_end == job.prefix.end_token
-        {
-            job.ready_pin_eligible = false;
-            let policy = self.config.preparation_policy.as_ref().unwrap();
-            let reserved: u64 = self
-                .jobs
-                .values()
-                .filter_map(|j| j.ready_pin.as_ref())
-                .filter(|pin| !pin.pin_inactive())
-                .map(|pin| pin.prefix.end_token)
-                .sum();
-            let material: usize = self.jobs.values().map(Job::material_bytes).sum();
-            let children = self.jobs.values().filter(|j| j.ready_pin.is_some()).count();
-            if reserved.saturating_add(job.prefix.end_token) > policy.auto_pin_max_tokens {
-                job.ready_pin_error = Some("auto PIN token capacity".into());
-            } else if material
-                .saturating_add(job.material_bytes())
-                .saturating_add(job.prefix.end_token as usize * 8)
-                > self.config.limits.max_token_material_bytes
-                || self.jobs.len() + children + 2 > self.config.max_operations
-                || self.index.usage().claims + children + 1 > self.config.limits.max_claims
-            {
-                job.ready_pin_error = Some("auto PIN operation/material/claim capacity".into());
-            } else {
-                let id = format!("ready-pin-{}", digest(&job.message_id));
-                let ttl_ms = policy.ready_pin_ttl_ms;
-                let now = Instant::now();
-                job.ready_pin = Some(Box::new(Job {
-                    id: id.clone(),
-                    url: job.url.clone(),
-                    caps: job.caps.clone(),
-                    prefix: job.prefix.clone(),
-                    action: "sglang.pin".into(),
-                    payload: json!({"target":job.prefix,"location":{"tier":"host","engine_id":job.caps.engine_id},"mode":"acquire",
-                        "claim_id":id,"revision":1,"ttl_seconds":ttl_ms as f64/1000.0,"required_protection":"eviction_exclusion"}),
-                    context: job.context.clone(),
-                    result: Value::Null,
-                    operation_ref: None,
-                    claim_view: Value::Null,
-                    submitted: false,
-                    attempted: false,
-                    message_id: id,
-                    releasing_pin: false,
-                    cancel_sent: false,
-                    quiescent: false,
-                    due: now,
-                    deadline: now + Duration::from_millis(ttl_ms),
-                    last_error: None,
-                    started: None,
-                    cost_recorded: false,
-                    traffic_at_start: 0,
-                    cache_watermark: Value::Null,
-                    ready_end: 0,
-                    ready_at: None,
-                    preparation_estimate: None,
-                    ready_pin_eligible: false,
-                    ready_pin: None,
-                    ready_pin_error: None,
-                    late_before_submit: false,
-                }));
-            }
-        }
-        if let Some(pin) = &mut job.ready_pin {
-            if pin.pin_inactive() {
-                return;
-            }
-            let release = cancel || Instant::now() >= pin.deadline;
-            if let Err(error) = self.advance(pin, release, Some(&job.id)).await {
-                pin.last_error = Some(error);
-                pin.claim_view = Value::Null;
-            }
-        }
-    }
-    async fn advance(
-        &mut self,
-        job: &mut Job,
-        cancel: bool,
-        parent: Option<&str>,
-    ) -> Result<(), String> {
-        let negotiated = self.preparation_costs.is_some()
-            && self
-                .caps
-                .get(&job.url)
-                .is_some_and(Capabilities::supports_read_batch);
-        let result = self.advance_inner(job, cancel, parent).await;
-        if let Err(reason) = &result {
-            if negotiated
-                || (self.preparation_costs.is_some()
-                    && self
-                        .caps
-                        .get(&job.url)
-                        .is_some_and(Capabilities::supports_read_batch))
-            {
-                self.repair_batch_failure(job, reason).await;
-            }
-        }
-        result
-    }
-    async fn advance_inner(
-        &mut self,
-        job: &mut Job,
-        cancel: bool,
-        parent: Option<&str>,
-    ) -> Result<(), String> {
-        if !job.submitted && !job.attempted && !job.releasing_pin && cancel {
+    async fn advance(&mut self, job: &mut Job) -> Result<(), String> {
+        let cancel = self.book.job(&job.id).is_some_and(|b| b.cancel_requested);
+        if !job.submitted && !job.attempted && cancel {
             job.quiescent = true;
-            return Ok(());
-        }
-        if self.defer_late_preparation(job) {
             return Ok(());
         }
         if cancel
@@ -2253,15 +1340,11 @@ impl Actor {
                 return Ok(());
             }
             let current = self.client.command(&job.url, &json!({"kind":"claim","context":job.context,"claim_id":job.payload["claim_id"]})).await?;
-            if current["owner_epoch"] != job.caps.epoch {
-                return Err("stale claim owner epoch".into());
-            }
             if matches!(
                 current["state"].as_str(),
                 Some("released" | "expired" | "invalidated")
             ) {
                 job.claim_view = current;
-                job.last_error = None;
                 return Ok(());
             }
             job.payload["mode"] = json!("release");
@@ -2283,72 +1366,15 @@ impl Actor {
         if !self.workers().iter().any(|w| w.url == job.url) {
             return Err("worker unavailable".into());
         }
-        let cached = self
-            .caps
-            .get(&job.url)
-            .filter(|caps| {
-                self.preparation_costs.is_some()
-                    && job.submitted
-                    && job.last_error.is_none()
-                    && caps.supports_read_batch()
-            })
-            .cloned();
-        let mut live = if let Some(caps) = cached {
-            caps
-        } else {
-            self.refresh(&job.url).await?
-        };
-        if live.engine_id != job.caps.engine_id
-            || live.epoch != job.caps.epoch
-            || live.compatibility != job.caps.compatibility
-        {
+        let live = self.refresh(&job.url).await?;
+        if live.epoch != job.caps.epoch || live.compatibility != job.caps.compatibility {
             return Err(
                 "owner epoch/compatibility changed; reconcile old operation separately".into(),
             );
         }
-        // A failed aggregate read may hide an operation update behind a missing
-        // claim. One existing serial observation repairs that state before retry.
-        let use_batch = self.preparation_costs.is_some()
-            && job.last_error.is_none()
-            && live.supports_read_batch();
-        if !use_batch {
-            self.poll_feedback(&job.url, &live).await?;
-        }
+        self.poll_feedback(&job.url, &live).await?;
         job.caps.generation = live.generation;
-        // Reuse a drained terminal receipt, not its historical location/claim.
-        // New submissions (including PIN release) still query their new ID.
-        let reuse_result = self.preparation_costs.is_some()
-            && job.submitted
-            && job.quiescent
-            && matches!(
-                job.result["update"]["status"].as_str(),
-                Some(
-                    "completed"
-                        | "partial"
-                        | "deferred"
-                        | "missing"
-                        | "unsupported"
-                        | "rejected"
-                        | "failed"
-                        | "cancelled"
-                        | "unconsumed"
-                )
-            );
         if !job.submitted {
-            // A new child claim has no effect yet. Existing/uncertain claims
-            // and releases still use their original wire identity and drain.
-            if !job.attempted
-                && !job.releasing_pin
-                && parent.is_some_and(|id| !self.has_future_demand(id))
-            {
-                job.quiescent = true;
-                job.last_error = None;
-                return Ok(());
-            }
-            // Discovery may have consumed the remaining prediction window.
-            if self.defer_late_preparation(job) {
-                return Ok(());
-            }
             if !job.attempted && !job.releasing_pin && Instant::now() >= job.deadline {
                 job.quiescent = true;
                 return Err("expired before submission".into());
@@ -2377,50 +1403,23 @@ impl Actor {
                 }
             }
         }
-        let mut batch = if use_batch {
-            Some(
-                self.read_observation(job, &mut live, reuse_result, cancel)
-                    .await?,
+        let reply = self
+            .client
+            .command(
+                &job.url,
+                &json!({"kind":"query","context":job.context,"message_id":job.message_id}),
             )
-        } else {
-            None
-        };
-        if !reuse_result {
-            let reply = if let Some(observation) = &mut batch {
-                observation
-                    .result
-                    .take()
-                    .ok_or("batch operation result absent")?
-            } else {
-                self.client
-                    .command(
-                        &job.url,
-                        &json!({"kind":"query","context":job.context,"message_id":job.message_id}),
-                    )
-                    .await?
-            };
-            self.update_result(job, reply)?;
-        }
+            .await?;
+        self.update_result(job, reply)?;
         job.ready_end = 0;
         job.ready_at = None;
         if job.action == "sglang.pin" {
-            // A terminal refusal establishes that no claim was acquired. The
-            // Engine returns the operation result, without a claim to query.
-            if job.pin_refused() {
-                job.claim_view = Value::Null;
-                job.last_error = None;
-                return Ok(());
-            }
             let ticket = self.feedback.ticket(&job.url)?;
-            let claim = if let Some(observation) = &mut batch {
-                observation.scope.take().ok_or("batch claim absent")?
-            } else {
-                self.client.command(&job.url,&json!({"kind":"claim","context":job.context,"claim_id":job.payload["claim_id"]})).await?
-            };
+            let claim=self.client.command(&job.url,&json!({"kind":"claim","context":job.context,"claim_id":job.payload["claim_id"]})).await?;
             if claim["owner_epoch"] != job.caps.epoch {
                 return Err("stale claim owner epoch".into());
             }
-            self.finish_observation(job, &live, &mut batch).await?;
+            self.poll_feedback(&job.url, &live).await?;
             if !self.feedback.accept_claim(&job.url, &ticket) {
                 return Err("claim query crossed feedback invalidation".into());
             }
@@ -2430,68 +1429,33 @@ impl Actor {
             // A terminal result alone cannot establish current location.
             let tier = job.payload["destination"]["tier"]
                 .as_str()
-                .unwrap_or("host")
-                .to_owned();
+                .unwrap_or("host");
             let ticket = self.feedback.ticket(&job.url)?;
-            let snapshot = if let Some(observation) = &mut batch {
-                observation.scope.take().ok_or("batch residency absent")?
-            } else {
-                self.client
-                    .residency(&job.url, &live, &self.config.caller_id, &job.prefix, &tier)
-                    .await?
-            };
-            self.finish_observation(job, &live, &mut batch).await?;
+            let snapshot = self
+                .client
+                .residency(&job.url, &live, &self.config.caller_id, &job.prefix, tier)
+                .await?;
+            self.poll_feedback(&job.url, &live).await?;
             let effect =
                 self.feedback
                     .accept_query(&job.url, &ticket, &snapshot["cache_watermark"])?;
-            self.invalidate_feedback(&job.url, effect, "newer scoped query watermark");
+            self.invalidate_feedback(&job.url, effect);
             job.cache_watermark = snapshot
                 .get("cache_watermark")
                 .cloned()
                 .unwrap_or(Value::Null);
-            job.ready_end = confirmed_end(&snapshot, &live, &job.prefix, &tier)?;
+            job.ready_end = confirmed_end(&snapshot, &live, &job.prefix, tier)?;
             job.ready_at = Some(Instant::now());
             if job.ready_end == job.prefix.end_token && !job.cost_recorded {
-                if let Some(start) = job.started {
-                    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-                    if let Some(model) = &mut self.preparation_costs {
-                        if job.payload["source"]["tier"] == "storage"
-                            && job.payload["destination"]["tier"] == "host"
-                            && job.result["update"]["status"] == "completed"
-                        {
-                            model.observe(
-                                &preparation_owner(&job.url, &job.caps),
-                                job.prefix.end_token,
-                                elapsed_ms,
-                            );
-                            job.cost_recorded = true;
-                        }
-                    }
-                    if self.preparation_costs.is_none()
-                        && job.traffic_at_start == self.traffic.load(Ordering::Relaxed)
-                    {
-                        let observed = elapsed_ms / job.prefix.end_token as f64;
-                        self.cost_ms_per_token = 0.8 * self.cost_ms_per_token + 0.2 * observed;
-                        job.cost_recorded = true;
-                    }
+                if let Some(start) = job
+                    .started
+                    .filter(|_| job.traffic_at_start == self.traffic.load(Ordering::Relaxed))
+                {
+                    let observed =
+                        start.elapsed().as_secs_f64() * 1000.0 / job.prefix.end_token as f64;
+                    self.cost_ms_per_token = 0.8 * self.cost_ms_per_token + 0.2 * observed;
+                    job.cost_recorded = true;
                 }
-            }
-        }
-        if !cancel
-            && job.quiescent
-            && !job.cost_recorded
-            && job.action == "sglang.prefetch"
-            && job.payload["source"]["tier"] == "storage"
-            && job.payload["destination"]["tier"] == "host"
-            && job.result["update"]["status"] != "completed"
-        {
-            if let (Some(model), Some(start)) = (&mut self.preparation_costs, job.started) {
-                model.observe_incomplete(
-                    &preparation_owner(&job.url, &job.caps),
-                    job.prefix.end_token,
-                    start.elapsed().as_secs_f64() * 1000.0,
-                );
-                job.cost_recorded = true;
             }
         }
         job.last_error = None;
@@ -2551,31 +1515,6 @@ impl Actor {
         *self.published.write() = Published { ready };
     }
 }
-
-#[cfg(test)]
-mod tests;
 fn task_fn(value: &Value, caller: &str) -> Result<SessionIdentity, String> {
     task(value, caller)
-}
-
-/// Keep cleanup/drain identities, suppress any positive protection after missing
-/// backend history. Querying a cached backend-owner receipt does not re-probe
-/// the underlying objects and cannot repair such an invalidation by itself.
-fn suppress_protection(view: &mut Value) {
-    if !view.is_object() {
-        return;
-    }
-    if matches!(view["phase"].as_str(), Some("released" | "expired")) {
-        return;
-    }
-    view["phase"] = json!("unknown");
-    view["uncertain"] = json!(true);
-    view["effective_protection"] = Value::Null;
-    view["confirmed_remaining_ms"] = Value::Null;
-    if let Some(scopes) = view["scopes"].as_array_mut() {
-        for scope in scopes {
-            scope["uncertain"] = json!(true);
-            scope["confirmed_remaining_ms"] = Value::Null;
-        }
-    }
 }

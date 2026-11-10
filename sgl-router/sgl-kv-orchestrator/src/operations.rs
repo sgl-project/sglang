@@ -104,16 +104,6 @@ impl DemandBook {
         self.jobs.get_mut(id).ok_or(BookError::Unknown)?.quiescent = true;
         Ok(())
     }
-    /// Reopen a never-started preparation after its caller adds new demand.
-    /// Cancellation is monotonic and cannot be undone by new interest.
-    pub fn mark_running(&mut self, id: &str) -> Result<(), BookError> {
-        let job = self.jobs.get_mut(id).ok_or(BookError::Unknown)?;
-        if job.cancel_requested {
-            return Err(BookError::Conflict);
-        }
-        job.quiescent = false;
-        Ok(())
-    }
     /// Only drain receipts allow forgotten physical bookkeeping.
     pub fn forget_job(&mut self, id: &str) -> bool {
         if self
@@ -150,21 +140,6 @@ mod tests {
             },
             id: "prepare".into(),
         }
-    }
-    #[test]
-    fn reopening_pending_work_clears_quiescence_but_never_cancellation() {
-        let mut book = DemandBook::new(2, 1);
-        let a = demand("a");
-        book.attach(a.clone(), BTreeSet::from(["job".into()]))
-            .unwrap();
-        book.mark_quiescent("job").unwrap();
-        book.mark_running("job").unwrap();
-        assert!(!book.job("job").unwrap().quiescent);
-        book.mark_quiescent("job").unwrap();
-        book.release(&a);
-        assert_eq!(book.mark_running("job"), Err(BookError::Conflict));
-        assert!(book.job("job").unwrap().cancel_requested);
-        assert!(book.job("job").unwrap().quiescent);
     }
     #[test]
     fn shared_work_drains_only_after_every_interest_is_released() {

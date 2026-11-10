@@ -29,8 +29,8 @@ The executable profile requires one TP/PP/CP/DP owner, the built-in unified
 cache, and ordinary text generation. Priority control supports FULL, SWA and
 Mamba components through the Python tree backend. Copy and move require FULL
 attention, persistent-host HiCache, and `--disable-overlap-schedule`. Enable
-HiCache with `--enable-hierarchical-cache`; file-backed transfers additionally
-require `--hicache-storage-backend file`.
+HiCache with `--enable-hierarchical-cache`; storage transfers use `--hicache-storage-backend mooncake` or `file` with the
+matching backend configuration.
 
 Remote engines, buffer-only/direct-linker transfers, speculative decoding, PD
 disaggregation, LoRA, multimodal and streaming-session control are unsupported.
@@ -43,21 +43,6 @@ Use `GET /v1/kv/capabilities` for discovery and `POST /v1/kv/control` for comman
 The Python engine exposes `kv_control(command)` and `async_kv_control(command)`.
 An inference request can attach the existing `KvHintsEnvelope` through
 `kv_hints`; other consumers' actions remain available to those consumers.
-
-Capability discovery advertises `read_batch` version `1.0` with `max_queries: 8`.
-Its `commands` list contains `capabilities`, `query`, `residency`, `claim`, and
-`events`. Submit `{"kind":"read_batch","context":CONTEXT,"version":"1.0",
-"queries":[QUERY,...]}` to execute 1–8 typed read queries in order during one
-owner turn. Every child carrying a context must exactly match the batch context,
-including caller, binding and owner epoch. Writes and nested batches are rejected
-before execution. A `capabilities` child has no context; the other four require it.
-The reply data is `{"version":"1.0","results":[DATA,...]}`,
-using each command's existing data format. Any child error returns the usual
-error for the whole batch; preceding reads may already have progressed state.
-This is not a global atomic snapshot: `events` can advance owner state, and
-clients must retain the existing watermark and invalidation checks. Existing
-transport response byte limits apply to the entire reply. Clients must negotiate
-this capability; older Engines reject `read_batch` and require single queries.
 
 Control commands use `engine_id`, `engine_epoch` and `namespace` from discovery,
 a caller-supplied `caller_id`, and a versioned envelope:
@@ -109,7 +94,7 @@ Priorities are soft: active request/transfer references remain protected, and
 memory pressure can evict any unreferenced copy. Explicit priorities take
 precedence over session eviction preferences. Expiry, copy
 eviction and cache generation changes end a claim; cache hits do not renew it.
-There is no public pin operation.
+PIN is a separate finite L2 eviction protection claim, not a copy priority.
 
 Use `query`, `ack` and `cancel` commands with the returned operation references.
 Message replay is idempotent within bounded retention; changed payloads conflict.

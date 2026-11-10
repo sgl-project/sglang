@@ -13,9 +13,7 @@ pub struct Capabilities {
     pub compatibility: Compatibility,
     pub public: Value,
     pub generation: Option<u64>,
-    pub salt_encoding: String,
     pub feedback: Option<Value>,
-    read_batch: Value,
 }
 impl Capabilities {
     pub fn parse(value: Value) -> Result<Self, String> {
@@ -55,30 +53,10 @@ impl Capabilities {
                 .ok_or("epoch absent")?
                 .into(),
             generation: value["executor"]["cache_generation"].as_u64(),
-            salt_encoding: match value["cache_salt_encoding"].as_str().unwrap_or("") {
-                r#"sha256 of compact UTF-8 JSON ["sglang.kv.weight.v1", namespace, original_salt_or_null]"# => "sglang.kv.weight.v1",
-                "sglang.kv.weight.v1" => "sglang.kv.weight.v1",
-                "owner_assertion" => "owner_assertion",
-                _ => "unsupported",
-            }.into(),
-            feedback:value.get("feedback").filter(|v|!v.is_null()).cloned(),
-            read_batch: value["read_batch"].clone(),
+            feedback: value.get("feedback").filter(|v| !v.is_null()).cloned(),
             compatibility,
             public,
         })
-    }
-    pub fn supports_read_batch(&self) -> bool {
-        self.read_batch["version"] == "1.0"
-            && self.read_batch["max_queries"]
-                .as_u64()
-                .is_some_and(|n| (5..=8).contains(&n))
-            && self.read_batch["commands"]
-                .as_array()
-                .is_some_and(|commands| {
-                    ["capabilities", "query", "residency", "claim", "events"]
-                        .iter()
-                        .all(|kind| commands.iter().any(|value| value == kind))
-                })
     }
     pub fn context(&self, caller: &str) -> Value {
         json!({"engine_id":self.engine_id,"engine_epoch":self.epoch,"namespace":self.compatibility.namespace,"caller_id":caller,"binding_id":null})
@@ -156,42 +134,6 @@ impl EngineClient {
     pub async fn command(&self, url: &str, body: &Value) -> Result<Value, String> {
         self.request(url, Some(body)).await
     }
-    pub async fn read_batch(
-        &self,
-        url: &str,
-        context: &Value,
-        queries: Vec<Value>,
-    ) -> Result<Vec<Value>, String> {
-        let count = queries.len();
-        if !(1..=8).contains(&count) {
-            return Err("read batch query capacity".into());
-        }
-        let reply = self
-            .command(
-                url,
-                &json!({"kind":"read_batch","context":context,"version":"1.0","queries":queries}),
-            )
-            .await?;
-        if reply["version"] != "1.0" {
-            return Err("read batch version mismatch".into());
-        }
-        reply["results"]
-            .as_array()
-            .filter(|results| results.len() == count)
-            .cloned()
-            .ok_or_else(|| "incomplete read batch results".into())
-    }
-    pub fn residency_command(
-        caps: &Capabilities,
-        caller: &str,
-        prefix: &PrefixTarget,
-        tier: &str,
-    ) -> Value {
-        json!({"kind":"residency","context":caps.context(caller),"limit":256,
-            "target":{"kind":"tokens","namespace":prefix.compatibility.namespace,"token_ids":prefix.token_ids,
-                "cache_salt":prefix.compatibility.cache_salt,"layout_id":prefix.compatibility.layout_id},
-            "location":{"tier":tier,"engine_id":caps.engine_id}})
-    }
     /// Logical TokensTarget is understood by residency; public PrefixTarget is
     /// normalized only on submit. No Engine-local session binding is required.
     pub async fn residency(
@@ -202,8 +144,10 @@ impl EngineClient {
         prefix: &PrefixTarget,
         tier: &str,
     ) -> Result<Value, String> {
-        self.command(url, &Self::residency_command(caps, caller, prefix, tier))
-            .await
+        self.command(url,&json!({"kind":"residency","context":caps.context(caller),"limit":256,
+            "target":{"kind":"tokens","namespace":prefix.compatibility.namespace,"token_ids":prefix.token_ids,
+                "cache_salt":prefix.compatibility.cache_salt,"layout_id":prefix.compatibility.layout_id},
+            "location":{"tier":tier,"engine_id":caps.engine_id}})).await
     }
 }
 
@@ -269,12 +213,11 @@ pub fn confirmed_end(
 mod tests {
     use super::*;
     #[test]
-    fn live_engine_salt_declaration_maps_to_description_scheme_without_transforming_salt() {
+    fn live_engine_owns_salt_transformation() {
         let value = json!({"engine_id":"worker-a","engine_epoch":"epoch","namespace":"weights",
             "cache_salt_encoding":r#"sha256 of compact UTF-8 JSON ["sglang.kv.weight.v1", namespace, original_salt_or_null]"#,
             "public_protocol":{"prefix":{"layout_id":"full:p64","page_size":64,"components":["full"],"hash_scheme":"sglang.sha256.u32le.i64.v1"}}});
         let caps = Capabilities::parse(value).unwrap();
-        assert_eq!(caps.salt_encoding, "sglang.kv.weight.v1");
         let mut c = caps.compatibility.clone();
         c.cache_salt = Some("raw-trial-salt".into());
         let prefix = PrefixTarget {

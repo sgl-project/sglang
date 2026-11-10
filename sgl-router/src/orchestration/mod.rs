@@ -2,12 +2,9 @@
 //! only the background actor performs discovery, Engine control and reconciliation.
 mod client;
 mod feedback;
-mod protection;
 mod runtime;
-pub use protection::BackendOwnerConfig;
 pub use runtime::{KvContext, Runtime};
 use serde::Deserialize;
-use sgl_kv_orchestrator::preparation::PreparationConfig;
 use sgl_kv_orchestrator::session_index::SessionLimits;
 
 #[derive(Clone, Deserialize)]
@@ -28,10 +25,6 @@ pub struct OrchestrationConfig {
     pub lead_margin_ms: u64,
     pub max_resume_prefetch_ms: u64,
     pub limits: SessionLimits,
-    pub backend_owner: Option<BackendOwnerConfig>,
-    /// Opt-in measured preparation policy. Absence preserves legacy timing.
-    #[serde(default)]
-    pub preparation_policy: Option<PreparationConfig>,
 }
 impl std::fmt::Debug for OrchestrationConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -39,15 +32,11 @@ impl std::fmt::Debug for OrchestrationConfig {
             .field("caller_id", &self.caller_id)
             .field("queue_capacity", &self.queue_capacity)
             .field("max_operations", &self.max_operations)
-            .field("backend_owner", &self.backend_owner)
             .finish_non_exhaustive()
     }
 }
 impl OrchestrationConfig {
     pub fn validate(&self) -> anyhow::Result<()> {
-        if let Some(policy) = &self.preparation_policy {
-            policy.validate().map_err(anyhow::Error::msg)?;
-        }
         anyhow::ensure!(
             !self.caller_id.is_empty()
                 && self.caller_id.len() <= 128

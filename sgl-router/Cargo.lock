@@ -3625,11 +3625,9 @@ name = "sgl-kv-orchestrator"
 version = "0.1.0"
 dependencies = [
  "jsonschema",
- "reqwest",
  "serde",
  "serde_json",
  "sha2",
- "tokio",
 ]
 
 [[package]]

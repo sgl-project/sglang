@@ -9,7 +9,7 @@ import threading
 import time
 import uuid
 from dataclasses import replace
-from typing import Annotated, Literal
+from typing import Annotated
 
 import msgspec
 
@@ -207,15 +207,6 @@ class Events(Value, tag="events", tag_field="kind"):
     limit: PageSize = 256
 
 
-class ReadBatch(Value, tag="read_batch", tag_field="kind"):
-    context: ControlContext
-    queries: Annotated[
-        tuple[Capabilities | Query | Residency | Claim | Events, ...],
-        msgspec.Meta(min_length=1, max_length=8),
-    ]
-    version: Literal["1.0"] = "1.0"
-
-
 class BindRequest(Value, tag="bind_request", tag_field="kind"):
     context: ControlContext
     binding_id: Identifier
@@ -236,7 +227,6 @@ Command = (
     | Claim
     | ClaimEvents
     | Events
-    | ReadBatch
     | BindRequest
 )
 
@@ -469,11 +459,6 @@ class KVControlService:
         executor = self.control.executor.capabilities()
         return {
             "enabled": True,
-            "read_batch": {
-                "version": "1.0",
-                "max_queries": 8,
-                "commands": ("capabilities", "query", "residency", "claim", "events"),
-            },
             "public_protocol": public_capabilities(executor),
             "feedback": {
                 **self.feedback.describe(),
@@ -502,7 +487,6 @@ class KVControlService:
         reads = self.control.executor.storage_reads
         return (
             self.control.registry.capacity()["active"] != 0
-            or bool(getattr(self.control.executor, "preparations", ()))
             or (reads is not None and bool(reads.demands))
         )
 
@@ -681,20 +665,6 @@ class KVControlService:
             command.ref.context if isinstance(command, Cancel) else command.context
         )
         registry.validate_context(context)
-        if isinstance(command, ReadBatch):
-            # Validate every child before executing any query, including Events
-            # which may advance owner state through the existing progress path.
-            if any(
-                not isinstance(query, Capabilities) and query.context != context
-                for query in command.queries
-            ):
-                raise ControlError(
-                    "invalid_payload", "Read batch query context differs"
-                )
-            return {
-                "version": "1.0",
-                "results": [self.execute(query) for query in command.queries],
-            }
         if isinstance(command, Events):
             self.progress()
             return self.feedback.query(

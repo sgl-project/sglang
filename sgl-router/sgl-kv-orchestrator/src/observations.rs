@@ -53,8 +53,8 @@ impl ActualScope {
             || end_token > requested.end_token()
             || start_token >= end_token
             || end_token > MAX_INTEGER
-            || !start_token.is_multiple_of(compatibility.page_size)
-            || !end_token.is_multiple_of(compatibility.page_size)
+            || start_token % compatibility.page_size != 0
+            || end_token % compatibility.page_size != 0
             || components.is_empty()
             || components.windows(2).any(|p| p[0] == p[1])
             || components

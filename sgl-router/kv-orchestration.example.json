@@ -23,6 +23,5 @@
     "max_intents": 256,
     "max_identifier_bytes": 128,
     "max_components": 64
-  },
-  "backend_owner": null
+  }
 }

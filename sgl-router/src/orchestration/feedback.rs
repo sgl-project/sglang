@@ -242,7 +242,7 @@ impl FeedbackCache {
             return Err("feedback source unavailable".into());
         }
         Ok(Some(
-            json!({"kind":"events","context":context,"cursor":owner.cursor,"limit":limit.clamp(1, 256)}),
+            json!({"kind":"events","context":context,"cursor":owner.cursor,"limit":limit.min(256).max(1)}),
         ))
     }
     pub fn apply(

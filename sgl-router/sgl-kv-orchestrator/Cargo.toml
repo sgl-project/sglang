@@ -10,8 +10,3 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 jsonschema = { version = "0.58.6", default-features = false }
-tokio = { version = "1.42", features = ["rt", "sync", "time", "macros"] }
-reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
-
-[dev-dependencies]
-tokio = { version = "1.42", features = ["rt-multi-thread", "test-util", "net", "io-util"] }
