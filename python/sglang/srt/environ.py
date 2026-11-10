@@ -299,6 +299,10 @@ class Envs:
     SGLANG_OPT_SPEC_DRAFT_TOP1_ARGMAX = EnvRuntimeBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # Host-only Mamba checkpoints: fetch a state beside its anchor's in-flight load.
+    SGLANG_OPT_MAMBA_HOST_ONLY_CONCURRENT_FETCH = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
 
     # ===================================================================
     # Model configuration, discovery, and weight loading
