@@ -209,7 +209,11 @@ class TestNpuUpdateWeightsFromDistributed(CustomTestCase):
         except Exception:
             pass
 
-        self.assertNotEqual(response.status_code, 200, "a missing group was accepted")
+        self.assertEqual(response.status_code, 400, response.text)
+        payload = response.json()
+        self.assertFalse(payload.get("success"))
+        self.assertIn("missing_group", payload.get("message", ""))
+        self.assertIn("init_weights_update_group", payload.get("message", ""))
         self.assertTrue(health(base_url))
 
     def test_04_destroy_group_twice_is_safe(self):
@@ -229,9 +233,10 @@ class TestNpuUpdateWeightsFromDistributed(CustomTestCase):
             json={"group_name": group_name},
             timeout=120,
         )
-        self.assertNotEqual(
-            second.status_code, 500, "destroying twice crashed the server"
-        )
+        self.assertEqual(second.status_code, 400, second.text)
+        payload = second.json()
+        self.assertFalse(payload.get("success"))
+        self.assertIn("does not exist", payload.get("message", ""))
         self.assertTrue(health(base_url))
 
 

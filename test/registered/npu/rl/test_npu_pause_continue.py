@@ -281,7 +281,7 @@ class TestNpuPauseContinue(CustomTestCase):
             json={"mode": "abort"},
             timeout=120,
         )
-        self.assertNotEqual(second.status_code, 500, "second pause crashed the server")
+        self.assertEqual(second.status_code, 200, second.text)
         continue_generation(self.base_url)
         self.assertTrue(generate(self.base_url, SHORT_PROMPT, max_new_tokens=4))
 
