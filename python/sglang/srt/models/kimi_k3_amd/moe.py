@@ -48,7 +48,7 @@ _COLUMN_TAIL_PARTIALS_MAX_TOKENS = 64
 # shared-expert all-reduce.
 _UP_PROJ_COLUMN_SPLIT_MIN_TOKENS = 2048
 _ROW_SHARDED_TAIL_MIN_TOKENS = 4096
-# Crossover vs AITER's A8W4 fused_moe on one MI350X: even at 1K tokens, faster from 2K.
+# from here sglang's A8W4 GEMMs beat AITER's fused_moe (MI350X)
 _A8W4_MOE_MIN_TOKENS = 2048
 
 

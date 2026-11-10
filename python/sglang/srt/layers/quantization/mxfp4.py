@@ -160,13 +160,8 @@ def _aiter_situ_uses_gu_interleaved_weights() -> bool:
 
 
 def _situ_gate_mode_kwargs(layer) -> Optional[dict]:
-    """fused_moe kwargs naming the gate/up layout of a K3 SiTU layer's w13.
-
-    The preshuffled A8W4 / A16W4 w13 is GU-interleaved; AITER's mxmoe stage1
-    kernels read it by ``gate_mode`` (the older "gui" kernels ignore it).
-    gfx95 only: on other archs (gfx1250) INTERLEAVE selects AITER kernels that
-    read a different interleaved layout, so the runner keeps its default there.
-    """
+    """``gate_mode`` for a K3 SiTU w13 preshuffled GU-interleaved; gfx95 only (gfx1250
+    INTERLEAVE reads another layout)."""
     if not getattr(layer, "situ_gate_up_interleaved", False):
         return None
     if not is_gfx95_supported():

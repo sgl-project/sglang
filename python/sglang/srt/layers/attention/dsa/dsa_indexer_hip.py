@@ -269,9 +269,7 @@ def hist_topk_paged(
 
 
 def fuse_index_k_norm(indexer, forward_batch, dcp_size: int) -> bool:
-    """Whether this call's index-K store also applies k_norm (one launch): aiter's
-    preshuffled page-64 ue8m0 cache, a fp32 LayerNorm k_norm, no rope after it,
-    decode or verify, DCP 1, no layer-split pool."""
+    """Whether this call's index-K store also applies k_norm (one launch)."""
     from sglang.srt.layers.cp.utils import is_cp_active
     from sglang.srt.layers.layernorm import LayerNorm
     from sglang.srt.mem_cache.dsa_cache_layer_split import LayerSplitDSATokenToKVPool

@@ -65,8 +65,7 @@ from sglang.srt.utils import BumpAllocator
 logger = logging.getLogger(__name__)
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 _ENABLE_DSA_Q8KV8_BORN_FP8_Q = envs.SGLANG_ENABLE_DSA_Q8KV8_BORN_FP8_Q.get()
-# ROCm defaults to 32: over xGMI the unprojected exchange bottlenecks bs48 (5x tok/s
-# at 32 vs 512 rows, measured on MI350X DCP8).
+# over xGMI the unprojected DCP exchange bottlenecks decode-sized batches on ROCm
 _DCP_V_PREPROJECT_MIN_ROWS = 32 if _is_hip else 512
 _ENABLE_DSA_Q8KV8_QPREP_OVERLAP = envs.SGLANG_ENABLE_DSA_Q8KV8_QPREP_OVERLAP.get()
 
@@ -222,7 +221,6 @@ class DeepseekMLAForwardMixin:
         if not get_parallel().dcp_replicate_q_proj or self.dcp_size == 1:
             return False
         mode = forward_batch.forward_mode
-        # the ROCm DSA extend attends the gathered KV with this rank's heads
         return mode.is_decode() or mode.is_target_verify()
 
     def init_mla_forward(self: DeepseekV2AttentionMLA):

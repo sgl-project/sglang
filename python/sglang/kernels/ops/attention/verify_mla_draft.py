@@ -184,11 +184,8 @@ def _verify_mla_prefix_stage1(
             qk *= sm_scale * k_scale
             qk = tl.where(n_mask[None, :], qk, float("-inf"))
             if WINDOW > 0:
-                # extend_attention_fwd's prefix window: draft row l sits at
-                # (rail length + l) and keeps rail key n iff q <= n + WINDOW.
-                # On the shortened rail it masks at most L_EXT - 1 keys at its
-                # start, inside the first tile of split 0, so no row loses a
-                # whole tile.
+                # extend_attention_fwd's window: row l at (rail length + l) keeps key n iff q <= n + WINDOW
+                # its masked keys sit in split 0's first tile, so no row loses a whole tile
                 q_pos = cur_batch_seq_len + tl.reshape(
                     offs_h[:, None] * 0 + offs_l[None, :], (R,)
                 )

@@ -1306,11 +1306,7 @@ def _triton_sparse_mla_fwd_splitk(
 # ---------------------------------------------------------------------------
 
 
-# Verify-sized batches (target verify at TP8: bs x 6 rows) of [16, 512] rows go to the gfx950
-# HIP kernel's split-K form (MI355X, 12 heads, top-2048, us Triton -> HIP: 24 rows 28.6 -> 20.5,
-# 96 rows 89.5 -> 31.2, 192 rows 239 -> 46.3, 288 rows 103 (single-CTA HIP) -> 70.8); at 6 / 12
-# rows the Triton split-K is faster (12.8 / 17.8 vs 18.4 / 19.5), and above 512 the single-CTA
-# HIP kernel fills the GPU on its own.
+# 16..512 verify rows take the gfx950 HIP split-K (faster on MI355X); fewer stay on Triton split-K
 _HIP_SPLIT_MIN_ROWS = 16
 _HIP_SPLIT_MAX_ROWS = 512
 

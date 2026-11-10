@@ -1072,9 +1072,7 @@ class Envs:
     # Enabled by default for supported configurations; set to 0 to disable.
     SGLANG_M3_USE_AITER_FUSED_QKNORM = EnvBool(True)
     SGLANG_USE_AITER_AG = EnvBool(True)
-    # triton_sparse_mla_fwd calls of 16..512 query rows (TP8 target verify, bs x 6 rows;
-    # H <= 16) on that HIP kernel's split-K form: each row's top-k over
-    # sparse_mla_decode_splits(rows) CTAs and an fp32 log-sum-exp combine.
+    # ROCm: 16..512-row triton_sparse_mla_fwd calls (target verify) run the HIP split-K kernel
     SGLANG_ROCM_SPARSE_MLA_DECODE_HIP = EnvBool(True)
     # Kimi-K3 prefill on gfx950, on top of the row-sharded MoE tail: run the MoE front
     # (router top-k, latent down-proj) and the shared experts on this rank's rows, from full

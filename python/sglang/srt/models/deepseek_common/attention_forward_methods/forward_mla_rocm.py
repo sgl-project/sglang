@@ -767,10 +767,11 @@ class DeepseekMLARocmForwardMixin:
         )
 
         if pre_qn is not None:
-            # [T, H, kv_lora]: what the transpose below leaves the bmm's output as
+            # the plugin's q_nope @ w_kc, already token-major
             q_nope_out = pre_qn
         elif q_replicate_active and not is_in_tc_piecewise_cuda_graph():
-            # bmm writes [H, T, D] through the transposed view of a [T, H, D] buffer
+            # Write token-major directly; a head-major result would need a full
+            # [T, H, kv_lora_rank] transpose copy before attention.
             q_nope_out = q_nope.new_empty(
                 (q_nope.shape[0], q_nope.shape[1], self.w_kc_qrep.shape[-1])
             )

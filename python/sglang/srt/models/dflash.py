@@ -1054,11 +1054,8 @@ class DFlashDecoderLayer(nn.Module):
         return self.mlp_conv.finish(hidden_states, mlp_kernel), residual, None
 
 
-# On ROCm, from this many rows (prefill chunks) each rank projects only its 1/TP
-# of the target hidden rows: the replicated [6 x 7168 -> 7168] fc took 7.6 ms of
-# a 16K-token DCP8 prefill step on MI355X, against ~0.6 ms for the all-gather.
-# CUDA keeps the replicated fc: its DFLASH aux graph can capture this projection
-# and replay it on a side stream beside other collectives.
+# ROCm prefill: each rank projects its 1/TP of the rows, then all-gathers;
+# CUDA keeps the replicated fc, which its DFLASH aux graph overlaps on a side stream
 _FC_ROW_SHARD_MIN_ROWS = 4096
 
 

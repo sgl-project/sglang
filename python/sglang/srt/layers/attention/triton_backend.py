@@ -651,8 +651,7 @@ class TritonAttnBackend(AttentionBackend):
         kv_indptr[1:] = torch.cumsum(seq_lens, dim=0)
         if kv_indices is None:
             return kv_indptr
-        # On ROCm one program per request crawls its whole row (~195 us a step at
-        # 131K on MI350X), so let the translator tile the gather there.
+        # ROCm: one program per request crawls its whole row, so tile the gather
         self.runner_ids.pack_read_stream(
             plan,
             req_pool_indices=req_pool_indices,

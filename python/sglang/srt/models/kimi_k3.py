@@ -2292,8 +2292,6 @@ class KimiK3DeltaAttention(nn.Module):
         that a raw row-cat would silently drop."""
         if not (_is_hip and envs.SGLANG_ROCM_K3_FUSE_KDA_INPROJ.get()):
             return False
-        # The wide [q, k, v, g] projection exists whenever the gate is full rank; a
-        # model-level quant config (MXFP4 experts) leaves it bf16, as checked below.
         if not self.use_full_rank_gate:
             return False
         # Block-FP8 in-proj needs dequantized BF16 buffers; a raw row-cat

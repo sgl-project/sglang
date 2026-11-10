@@ -2426,12 +2426,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     )
             return
 
-        # K3.1 shards index-K like the MLA KV under DCP; only the fused store
-        # maps the widened write loc to this rank's row (slot // N) and skips
-        # the tokens of other ranks.
-        # AITER's store does too, on the rows of dcp_local_store_loc below.
+        # K3.1 shards index-K under DCP; the CUDA fused store and AITER's write only this rank's rows
         assert dcp_size == 1 or _use_aiter, (
-            "DSA index-K writes under DCP need the CUDA fused store"
+            "DSA index-K writes under DCP need the CUDA fused store or AITER"
         )
 
         # Fast path: AITER fused quant + cache store

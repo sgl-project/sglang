@@ -44,9 +44,7 @@ logger = logging.getLogger(__name__)
 # most (token, expert) pairs for which the patched sort (+ stage-1 quant) runs; aiter sorts
 # and quantizes larger batches itself
 _SMALL_SORT_MAX_PAIRS = 256
-# Kimi-K3's (num_experts, topk) runs it up to 1024 pairs. At E=896 / top-16 / block_m 32 on
-# MI355X the sorted variant beats aiter's opus sort + quant by 31-46% up to 960 pairs and
-# ties from 1152 (its bitonic width doubles past 1024); other shapes are unmeasured there.
+# Kimi-K3's (E=896, top-16) shape beats aiter's sort + quant up to 1024 pairs on MI355X
 _KIMI_K3_MOE_SHAPE = (896, 16)
 _KIMI_K3_SMALL_SORT_MAX_PAIRS = 1024
 
