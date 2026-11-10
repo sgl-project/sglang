@@ -223,8 +223,6 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS = [
     "npu_memcache",
     "--hicache-storage-backend-extra-config",
     HICACHE_STORAGE_EXTRA_CONFIG,
-    "--nnodes",
-    2,
 ]
 
 
