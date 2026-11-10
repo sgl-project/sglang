@@ -662,6 +662,34 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         cache.sanity_check()
 
     @requires_full_swa_ps1_window4
+    def test_swa_recompute_evicts_another_window_when_the_pool_is_short(self):
+        """With too few free SWA rows for the replay, binding evicts another
+        prefix's window and still publishes the recomputed prefix."""
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        cache.swa_recompute_len = 8
+        window_pool = cache.window_sub_pool_of_slot(cache.slot_id(TREE_WINDOW))
+        tokens = self._make_seq(1, 32)
+        self._insert(cache, allocator, req_to_token_pool, tokens)
+        cache.evict(EvictParams(window_num_tokens={window_pool: len(tokens)}))
+        self._insert(cache, allocator, req_to_token_pool, self._make_seq(1000, 32))
+        held = allocator.swa_attn_allocator.alloc(allocator.swa_available_size() - 2)
+        self.assertEqual(allocator.swa_available_size(), 2)
+        prefix_len = len(tokens) - self.cfg.sliding_window_size
+        match = match_prefix(cache, tokens)
+        key = RadixKey(array("q", tokens))
+        req = SimpleNamespace(
+            prefix_len=0, last_node=match.last_device_node, swa_recompute=None
+        )
+
+        gained, _, req.swa_recompute = init_swa_recompute(cache, req, key)
+
+        self.assertEqual(gained, prefix_len)
+        self.assertEqual(match_prefix(cache, tokens).device_prefix_len, prefix_len)
+        release_swa_recompute_workspace(cache, req)
+        allocator.swa_attn_allocator.free(held)
+        cache.sanity_check()
+
+    @requires_full_swa_ps1_window4
     def test_swa_recompute_reopens_a_full_prefix_past_its_window(self):
         """A FULL prefix whose window was evicted reports a replay hit, and binding
         the replay rows lets later matches reach its end."""

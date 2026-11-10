@@ -9,7 +9,8 @@ import msgspec
 import torch
 
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
-from sglang.srt.mem_cache.base_prefix_cache import EvictParams, MatchPrefixParams
+from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
+from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.mem_cache.kv.plan import TREE_WINDOW
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.utils.common import ceil_align
@@ -112,10 +113,9 @@ def init_swa_recompute(
 
     tree_core.inc_full_pin(node_id)
     try:
-        shortfall = replay_len - allocator.swa_available_size()
-        if shortfall > 0:
+        if allocator.swa_available_size() < replay_len:
             cache.evict_for_alloc(
-                EvictParams(window_num_tokens={_window_sub_pool(cache): shortfall})
+                KVDemand(window_tokens={_window_sub_pool(cache): replay_len})
             )
         if allocator.swa_available_size() < replay_len:
             return None
