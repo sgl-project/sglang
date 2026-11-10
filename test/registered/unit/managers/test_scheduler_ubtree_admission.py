@@ -110,9 +110,9 @@ class TestSchedulerUBTreeAdmission(CustomTestCase):
             )
             scheduler.ipc_channels.send_to_tokenizer.send_output.assert_not_called()
             scheduler._add_request_to_queue.assert_called_once()
-            self.assertEqual(
-                scheduler._add_request_to_queue.call_args.args[0].rid, "valid-min-p"
-            )
+            queued = scheduler._add_request_to_queue.call_args.args[0]
+            self.assertEqual(queued.rid, "valid-min-p")
+            self.assertIsNone(queued.to_finish)
 
 
 if __name__ == "__main__":
