@@ -686,7 +686,13 @@ class DSparkDraftMixin:
             name for name in params_dict if name.startswith("confidence_head.")
         }
         missing = confidence_param_names - loaded_names
-        if missing:
+        if missing == confidence_param_names:
+            logger.info(
+                "DSpark draft checkpoint ships no confidence head weights; ragged "
+                "verify takes its confidences from the online acceptance estimator."
+            )
+            self.confidence_head = None
+        elif missing:
             raise ValueError(
                 f"DSpark confidence head is enabled but the checkpoint is missing "
                 f"{sorted(missing)}. Provide a checkpoint with trained confidence weights, "
