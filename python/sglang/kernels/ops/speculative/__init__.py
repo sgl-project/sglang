@@ -15,6 +15,8 @@ from sglang.kernels.spec import (
 
 # (module, public_fn) migrated from speculative/triton_ops.
 _TRITON_KERNELS = [
+    ("acceptance_estimator", "max_log_odds"),
+    ("acceptance_estimator", "observe_acceptance"),
     ("cache_locs", "assign_draft_cache_locs_contiguous_func"),
     ("cache_locs", "assign_extend_cache_locs_func"),
     ("cache_locs", "assign_extend_cache_locs_uniform_func"),
