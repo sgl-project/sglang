@@ -15,7 +15,7 @@ from pathlib import Path
 import torch
 
 # A changed upstream implementation must be reviewed, never best-effort patched.
-SOURCE_SHA256 = "df8d50e6dbe07dfc8fc65c583cd965c6e4b502004eb9cce918cb785663b170fb"
+SOURCE_SHA256 = "315146e534b1d0f9aecf1acd20c84f72de9442118dea0798a9c40e6edbe2b84f"
 
 
 def bind_with_globals(instance, name, overrides):
