@@ -195,7 +195,7 @@ class TestHummingFp8Dispatch(CustomTestCase):
                 with (
                     patch.object(
                         runner,
-                        "apply_activation",
+                        "_prepare_down_input",
                         side_effect=AssertionError("SiLU fused path was not selected"),
                     ) as fallback_activation,
                     patch(
