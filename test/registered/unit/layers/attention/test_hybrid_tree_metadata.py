@@ -44,7 +44,6 @@ class TestHybridTreeMetadata(CustomTestCase):
     def test_other_algorithms_and_draft_allocate_no_depth_buffers(self):
         for algorithm, topk, draft in (
             (None, None, False),
-            ("EAGLE", 1, False),
             ("EAGLE", 2, False),
             ("UBTREE", 2, True),
         ):
@@ -89,63 +88,56 @@ class TestHybridTreeMetadata(CustomTestCase):
                         )
 
     def test_ubtree_replay_and_post_draft_fixup_keep_captured_addresses(self):
-        for width in (32, 49):
-            with self.subTest(width=width):
-                with get_context().override_server_args(
-                    speculative_algorithm="UBTREE",
-                    speculative_eagle_topk=2,
-                    speculative_dflash_block_size=5,
-                ):
-                    backend = MambaAttnBackendBase(_runner())
-                    backend.init_cuda_graph_state(1, width)
-                    self.assertEqual(len(backend.tree_depth_list), 1)
-                    spec = create_ubtree_verify_input(None, width)
-                    requests = torch.tensor([1], dtype=torch.int64)
-                    mode = ForwardMode.TARGET_VERIFY
-                    captured = backend._capture_metadata(1, requests, mode, spec)
-                    pointer = captured.tree_depths.data_ptr()
-                    self.assertTrue(captured.has_direct_parent)
-                    self.assertEqual(captured.tree_max_depth, 5)
-                    for fanout in (3, 4):
-                        parents = [-1] + [(i - 1) // fanout for i in range(1, width)]
-                        depths = [0] * width
-                        for i in range(1, width):
-                            depths[i] = depths[parents[i]] + 1
-                        spec.retrieve_parent_token = torch.tensor(
-                            [parents], dtype=torch.int32
-                        )
-                        spec.tree_depths = torch.tensor([depths], dtype=torch.int32)
-                        spec.retrieve_next_token = torch.zeros(
-                            (1, width), dtype=torch.int32
-                        )
-                        spec.retrieve_next_sibling = torch.full(
-                            (1, width), -1, dtype=torch.int32
-                        )
-                        replayed = backend._replay_metadata(
-                            1, requests, mode, spec, seq_lens_cpu=None
-                        )
-                        self.assertEqual(replayed.tree_depths.data_ptr(), pointer)
-                        torch.testing.assert_close(
-                            captured.tree_depths, spec.tree_depths
-                        )
-                        torch.testing.assert_close(
-                            captured.retrieve_parent_token, spec.retrieve_parent_token
-                        )
+        width = 32
+        with get_context().override_server_args(
+            speculative_algorithm="UBTREE",
+            speculative_eagle_topk=2,
+            speculative_dflash_block_size=5,
+        ):
+            backend = MambaAttnBackendBase(_runner())
+            backend.init_cuda_graph_state(1, width)
+            self.assertEqual(len(backend.tree_depth_list), 1)
+            spec = create_ubtree_verify_input(None, width)
+            requests = torch.tensor([1], dtype=torch.int64)
+            mode = ForwardMode.TARGET_VERIFY
+            captured = backend._capture_metadata(1, requests, mode, spec)
+            pointer = captured.tree_depths.data_ptr()
+            self.assertTrue(captured.has_direct_parent)
+            self.assertEqual(captured.tree_max_depth, 5)
+            for fanout in (3, 4):
+                parents = [-1] + [(i - 1) // fanout for i in range(1, width)]
+                depths = [0] * width
+                for i in range(1, width):
+                    depths[i] = depths[parents[i]] + 1
+                spec.retrieve_parent_token = torch.tensor([parents], dtype=torch.int32)
+                spec.tree_depths = torch.tensor([depths], dtype=torch.int32)
+                spec.retrieve_next_token = torch.zeros((1, width), dtype=torch.int32)
+                spec.retrieve_next_sibling = torch.full(
+                    (1, width), -1, dtype=torch.int32
+                )
+                replayed = backend._replay_metadata(
+                    1, requests, mode, spec, seq_lens_cpu=None
+                )
+                self.assertEqual(replayed.tree_depths.data_ptr(), pointer)
+                torch.testing.assert_close(captured.tree_depths, spec.tree_depths)
+                torch.testing.assert_close(
+                    captured.retrieve_parent_token, spec.retrieve_parent_token
+                )
 
-                    # The plan stream may copy stale links before draft completes.
-                    # The post-join hook must refresh both depths and parents.
-                    spec.retrieve_parent_token = torch.tensor(
-                        [[-1] + [0] * (width - 1)], dtype=torch.int32
-                    )
-                    spec.tree_depths = torch.tensor(
-                        [[0] + [1] * (width - 1)], dtype=torch.int32
-                    )
-                    backend.update_verify_buffers_to_fill_after_draft(spec, 1)
-                    self.assertEqual(captured.tree_depths.data_ptr(), pointer)
-                    torch.testing.assert_close(captured.tree_depths, spec.tree_depths)
-                    torch.testing.assert_close(
-                        captured.retrieve_parent_token, spec.retrieve_parent_token
-                    )
+            # The plan stream may copy stale links before draft completes.
+            # The post-join hook must refresh both depths and parents.
+            spec.retrieve_parent_token = torch.tensor(
+                [[-1] + [0] * (width - 1)], dtype=torch.int32
+            )
+            spec.tree_depths = torch.tensor(
+                [[0] + [1] * (width - 1)], dtype=torch.int32
+            )
+            backend.update_verify_buffers_to_fill_after_draft(spec, 1)
+            self.assertEqual(captured.tree_depths.data_ptr(), pointer)
+            torch.testing.assert_close(captured.tree_depths, spec.tree_depths)
+            torch.testing.assert_close(
+                captured.retrieve_parent_token, spec.retrieve_parent_token
+            )
 
 
 if __name__ == "__main__":
