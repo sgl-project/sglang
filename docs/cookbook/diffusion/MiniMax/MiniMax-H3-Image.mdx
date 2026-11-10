@@ -11,7 +11,7 @@ import { config } from "/src/snippets/configs/MiniMaxAI/minimax-h3-image.jsx";
 
 ## 1. Quick start
 
-Use the [integration branch](https://github.com/mickqian/sglang/tree/codex/h3-image-day0)
+Use the [SGLang main branch](https://github.com/sgl-project/sglang/tree/main)
 with the [diffusion installation guide](/docs/sglang-diffusion/installation),
 then install its diffusion dependencies from the repository root:
 
@@ -19,14 +19,17 @@ then install its diffusion dependencies from the repository root:
 python3 -m pip install -e 'python[diffusion]'
 ```
 
-Use an authenticated Hugging Face environment with access to both
-`MiniMaxAI/MiniMax-H3-Image` and its `MiniMaxAI/MiniMax-H3` text encoder.
+The public checkpoints are `MiniMaxAI/MiniMax-H3-Image` and its
+`MiniMaxAI/MiniMax-H3` text encoder.
 Run the commands from the same checkout and Python environment. The picker
-saves the returned image as `generated.png`. These recipes use a source
-installation; a stock container image has not been verified for this branch.
-These are Linux CUDA recipes.
+saves the returned image as `generated.png`. These recipes use Linux CUDA and
+a source installation; DGX Spark uses the [ARM64 environment below](#dgx-spark-128-gb).
 
 <Deployment config={config} />
+
+For the lowest measured latency, see the [recipe summary](#measured-text-to-image-summary):
+two B300s generate a 4K image in 2.654 s at native precision or 2.065 s with
+opt-in MXFP8. These are warm pipeline times; quantization can change image quality.
 
 Server warmup runs a valid prefix of the PDD schedule; real requests always
 run all six steps. With online AdaLN and enough cache slots, warmup prepares
@@ -227,7 +230,7 @@ docker run --platform linux/arm64 --gpus all \
   -e HF_TOKEN -it \
   lmsysorg/sglang@sha256:d4a56f6f9356539957974bb4008161b4c08d14a712805ff63eae526f36dbda71 bash
 
-# Inside the container, from the integration checkout:
+# Inside the container, from the SGLang checkout:
 cd /workspace/sglang
 export CARGO_TARGET_DIR=/tmp/h3-image-spark-build
 python3 -m pip install setuptools-rust setuptools-scm wheel
@@ -248,6 +251,33 @@ serving/request commands in this environment. The measured container uses 12
 CPU cores; the host's 128 GB is a shared pool, not 128 GB of additional VRAM.
 
 ## 4. Measured recipes
+
+### Measured text-to-image summary
+
+The native rows keep the checkpoint's release precision. FP8 and MXFP8 quantize
+the DiT and text encoder; they can change image details and reference identity.
+Here, 2K is 2048 × 2048 and 4K is 4736 × 3552.
+
+| Hardware | Precision | 2K | 4K |
+| --- | --- | --- | --- |
+| 2 × B300 | Native | 0.604 s | 2.654 s |
+| 2 × B300 | MXFP8 | 0.451 s | 2.065 s |
+| 2 × H200 | Native | 1.123 s | 5.465 s |
+| 1 × H200 | Native | 1.934 s | 10.133 s |
+| 1 × RTX PRO 6000 Blackwell | Native | 3.434 s | 18.544 s |
+| 1 × RTX PRO 6000 Blackwell | FP8 | 2.338 s | 14.445 s |
+| 1 × DGX Spark | Native | 16.21 s | 84.96 s |
+
+In the picker, use **Ulysses2** and encoder **Fold** for two GPUs. Choose **Auto**
+placement for native two-GPU and Spark recipes, or **Resident** for the other rows.
+Select **FP8 DiT + encoder** or **MXFP8 DiT + encoder** only for the quantized rows.
+
+All rows run the full six-step schedule with lossless quality, eager execution,
+native AdaLN precomputation and warm conditioning caches. Times are medians of
+warm server pipeline requests, excluding startup, HTTP transport, PNG encoding
+and client saving; they are not first-request or end-to-end latency.
+See the sections below for source revisions, checkpoints, sample counts and
+environments.
 
 ### DGX Spark at 2K and 4K
 
