@@ -140,15 +140,22 @@ jobs:
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
-      # Miles tests download and convert checkpoints into the hard-coded /root/models. In the
-      # container's writable layer that adds hundreds of GB per job on the node's local disk,
-      # and the runner pod drops mid-suite with no error. Keep it on the persistent /sgl-data
-      # cache instead, as miles' own CI mounts a host directory at /root/models; its download
-      # and convert helpers lock each path, so concurrent jobs can share it.
-      - name: Keep /root/models on /sgl-data
+      # Miles tests download and convert checkpoints into the hard-coded /root/models, and
+      # datasets into /root/datasets. In the container's writable layer that adds hundreds of
+      # GB per job on the node's local disk, and the runner pod drops mid-suite with no error.
+      # Keep both on the persistent /sgl-data cache instead, as miles' own CI mounts host
+      # directories there; its download and convert helpers lock each path, so concurrent
+      # jobs can share them.
+      - name: Keep /root/models and /root/datasets on /sgl-data
         run: |
-          bash scripts/ci/amd/amd_ci_exec.sh bash -c \
-            'mkdir -p /sgl-data/miles-models && rm -rf /root/models && ln -s /sgl-data/miles-models /root/models && ls -ld /root/models'
+          bash scripts/ci/amd/amd_ci_exec.sh bash -c '
+            set -e
+            for d in models datasets; do
+              mkdir -p "/sgl-data/miles-${d}"
+              rm -rf "/root/${d}"
+              ln -s "/sgl-data/miles-${d}" "/root/${d}"
+              ls -ld "/root/${d}"
+            done'
 
       - name: Skip tests left out on MI300
         if: matrix.skip_tests != ''
