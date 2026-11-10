@@ -59,10 +59,8 @@ export const config = {
     return config.sizeOf(config.cellFor(s), "--pp-size") > 1;
   },
   // Throughput shapes verify K = 5 (block 6): at large batch the verify rows (requests ×
-  // block) dominate a step. The High-Throughput decode uses block 6; everything else runs K = 7
-  // (block 8). MI35x verifies K = 7 (block 8) at 1-4 agents and K = 4 (block 5) on every
-  // High-Throughput cell, PD included (a PD prefill must match its decode): from 48 requests the
-  // shorter verify outweighs its lower acceptance.
+  // block) dominate a step. The High-Throughput decode uses block 6, everything else block 8.
+  // MI35x uses block 8 at 1-4 agents and block 5 on every High-Throughput cell, PD included.
   dflashBlock(s) {
     if (config.isAmd(s)) return s.strategy === "low-latency" ? 8 : 5;
     return s.pdMode === "decode" && s.strategy === "high-throughput" ? 6 : 8;
@@ -286,8 +284,7 @@ export const config = {
   },
   // MI35x PD roles take the host network and RDMA flags for the bootstrap ports and Mooncake.
   dockerHostNetworkWhen: (s) => config.isAmd(s) && ["prefill", "decode"].includes(s.pdMode),
-  // The MI35x image registers no AMD Pollara (Ionic) verbs provider, so Mooncake finds no NIC and
-  // falls back to TCP; libibverbs loads the host's provider only through its driver entry.
+  // The MI35x image has no Ionic (AMD Pollara) verbs provider; without the host's, Mooncake uses TCP.
   dockerMounts: (s) =>
     config.isAmd(s) && ["prefill", "decode"].includes(s.pdMode)
       ? [
@@ -1070,8 +1067,6 @@ sgl-router \\
         "SGLANG_ROCM_RUNTIME_RESERVE_GB=6",
         "SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1",
         "HSA_USERPTR_FOR_PAGED_MEM=0",
-        // The MoE front and residual stream on row shards in prefill (no extra memory) and a
-        // draft block's ring locations in one launch.
         "SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_ROUTED_FRONT=1",
         "SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM=1",
         "SGLANG_OPT_DFLASH_RING_LOCS_FUSED=1",
@@ -1082,7 +1077,6 @@ sgl-router \\
         "--tp-size 8",
         "--mem-fraction-static 0.85",
         "--chunked-prefill-size 16384",
-        // At 1 agent the recipe runs 1 request, so an agent's parallel tool calls queue.
         "--max-running-requests 4",
         "--cuda-graph-max-bs-decode 4",
         "--schedule-policy lpm",
@@ -1116,8 +1110,6 @@ sgl-router \\
         "SGLANG_ROCM_RUNTIME_RESERVE_GB=10",
         "SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1",
         "HSA_USERPTR_FOR_PAGED_MEM=0",
-        // The MoE front and residual stream on row shards in prefill (no extra memory) and a
-        // draft block's ring locations in one launch.
         "SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_ROUTED_FRONT=1",
         "SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM=1",
         "SGLANG_OPT_DFLASH_RING_LOCS_FUSED=1",
@@ -1133,8 +1125,6 @@ sgl-router \\
         "--max-running-requests 48",
         "--cuda-graph-max-bs-decode 48",
         "--schedule-policy lpm",
-        // Below 48 agents the recipe runs 16k chunks with 6, 8, 13 and 20 running requests at 8,
-        // 16, 24 and 32 agents, and verifies block 6 at 8 agents.
         "--prefill-decode-interval 32",
         "--mamba-full-memory-ratio 0.65",
         "--mamba-radix-cache-strategy extra_buffer_lazy",
@@ -1164,14 +1154,10 @@ sgl-router \\
         "SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1",
         "HSA_USERPTR_FOR_PAGED_MEM=0",
         "SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION=0.1",
-        // The MoE front and residual stream on row shards (no extra memory) and a draft block's
-        // ring locations in one launch.
         "SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_ROUTED_FRONT=1",
         "SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM=1",
         "SGLANG_OPT_DFLASH_RING_LOCS_FUSED=1",
-        // Every rank commits rank 0's greedy accept; a rank that diverges hangs the batch.
         "SGLANG_SPEC_TP_SYNC=init,dflash-accept-greedy",
-        // Outlasts the router's pooled connections while they idle.
         "SGLANG_TIMEOUT_KEEP_ALIVE=7200",
         "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=3600",
         "SGLANG_DISAGGREGATION_WAITING_TIMEOUT=3600",
@@ -1190,11 +1176,8 @@ sgl-router \\
         "--max-prefill-tokens 16384",
         "--schedule-policy shortest-prefill-first",
         "--disaggregation-decode-allocation-policy early",
-        // MXFP4 index keys; the decode must run them too.
         "--enable-dsa-fp4-indexer",
         "--mamba-full-memory-ratio 0.65",
-        // One KDA state per radix path, checkpointed every 64 tokens: a resumed turn misses at
-        // most 63 cached tokens.
         "--mamba-max-states-per-path 1",
         "--mamba-track-interval 64",
         "--mamba-radix-cache-strategy extra_buffer",
@@ -1223,12 +1206,10 @@ sgl-router \\
         "SGLANG_AITER_K3_OPT=1",
         "AITER_FLYDSL_FORCE=1",
         "AITER_SITUV2_A8W4=1",
-        // Decode graphs past ~96 at memory fraction 0.92 abort when the allocator collects during capture.
         "PYTORCH_HIP_ALLOC_CONF=garbage_collection_threshold:0.99",
         "SGLANG_ROCM_RUNTIME_RESERVE_GB=10",
         "SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1",
         "SGLANG_OPT_DFLASH_RING_LOCS_FUSED=1",
-        // Every rank commits rank 0's greedy accept; a rank that diverges hangs the batch.
         "SGLANG_SPEC_TP_SYNC=init,dflash-accept-greedy",
         "SGLANG_TIMEOUT_KEEP_ALIVE=7200",
         "RUSTUP_TOOLCHAIN=stable",
@@ -1246,7 +1227,6 @@ sgl-router \\
         "--dcp-comm-backend a2a",
         "--mem-fraction-static 0.92",
         "--enable-dsa-fp4-indexer",
-        // Running requests and decode graphs at the concurrency plus 16.
         "--max-running-requests 160",
         "--cuda-graph-max-bs-decode 160",
         "--mamba-radix-cache-strategy extra_buffer",
@@ -1279,8 +1259,6 @@ sgl-router \\
         "SGLANG_ROCM_RUNTIME_RESERVE_GB=6",
         "SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1",
         "HSA_USERPTR_FOR_PAGED_MEM=0",
-        // The MoE front and residual stream on row shards in prefill (no extra memory) and a
-        // draft block's ring locations in one launch.
         "SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_ROUTED_FRONT=1",
         "SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM=1",
         "SGLANG_OPT_DFLASH_RING_LOCS_FUSED=1",
@@ -1291,7 +1269,6 @@ sgl-router \\
         "--tp-size 8",
         "--mem-fraction-static 0.85",
         "--chunked-prefill-size 16384",
-        // At 1 agent the recipe runs 1 request, so an agent's parallel tool calls queue.
         "--max-running-requests 4",
         "--cuda-graph-max-bs-decode 4",
         "--schedule-policy lpm",
@@ -1325,8 +1302,6 @@ sgl-router \\
         "SGLANG_ROCM_RUNTIME_RESERVE_GB=10",
         "SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1",
         "HSA_USERPTR_FOR_PAGED_MEM=0",
-        // The MoE front and residual stream on row shards in prefill (no extra memory) and a
-        // draft block's ring locations in one launch.
         "SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_ROUTED_FRONT=1",
         "SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM=1",
         "SGLANG_OPT_DFLASH_RING_LOCS_FUSED=1",
@@ -1342,8 +1317,6 @@ sgl-router \\
         "--max-running-requests 48",
         "--cuda-graph-max-bs-decode 48",
         "--schedule-policy lpm",
-        // Below 48 agents the recipe runs 16k chunks with 6, 8, 13 and 20 running requests at 8,
-        // 16, 24 and 32 agents, and verifies block 6 at 8 agents.
         "--prefill-decode-interval 32",
         "--mamba-full-memory-ratio 0.65",
         "--mamba-radix-cache-strategy extra_buffer_lazy",
@@ -1373,14 +1346,10 @@ sgl-router \\
         "SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1",
         "HSA_USERPTR_FOR_PAGED_MEM=0",
         "SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION=0.1",
-        // The MoE front and residual stream on row shards (no extra memory) and a draft block's
-        // ring locations in one launch.
         "SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_ROUTED_FRONT=1",
         "SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM=1",
         "SGLANG_OPT_DFLASH_RING_LOCS_FUSED=1",
-        // Every rank commits rank 0's greedy accept; a rank that diverges hangs the batch.
         "SGLANG_SPEC_TP_SYNC=init,dflash-accept-greedy",
-        // Outlasts the router's pooled connections while they idle.
         "SGLANG_TIMEOUT_KEEP_ALIVE=7200",
         "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=3600",
         "SGLANG_DISAGGREGATION_WAITING_TIMEOUT=3600",
@@ -1399,11 +1368,8 @@ sgl-router \\
         "--max-prefill-tokens 16384",
         "--schedule-policy shortest-prefill-first",
         "--disaggregation-decode-allocation-policy early",
-        // MXFP4 index keys; the decode must run them too.
         "--enable-dsa-fp4-indexer",
         "--mamba-full-memory-ratio 0.65",
-        // One KDA state per radix path, checkpointed every 64 tokens: a resumed turn misses at
-        // most 63 cached tokens.
         "--mamba-max-states-per-path 1",
         "--mamba-track-interval 64",
         "--mamba-radix-cache-strategy extra_buffer",
@@ -1432,12 +1398,10 @@ sgl-router \\
         "SGLANG_AITER_K3_OPT=1",
         "AITER_FLYDSL_FORCE=1",
         "AITER_SITUV2_A8W4=1",
-        // Decode graphs past ~96 at memory fraction 0.92 abort when the allocator collects during capture.
         "PYTORCH_HIP_ALLOC_CONF=garbage_collection_threshold:0.99",
         "SGLANG_ROCM_RUNTIME_RESERVE_GB=10",
         "SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1",
         "SGLANG_OPT_DFLASH_RING_LOCS_FUSED=1",
-        // Every rank commits rank 0's greedy accept; a rank that diverges hangs the batch.
         "SGLANG_SPEC_TP_SYNC=init,dflash-accept-greedy",
         "SGLANG_TIMEOUT_KEEP_ALIVE=7200",
         "RUSTUP_TOOLCHAIN=stable",
@@ -1455,7 +1419,6 @@ sgl-router \\
         "--dcp-comm-backend a2a",
         "--mem-fraction-static 0.92",
         "--enable-dsa-fp4-indexer",
-        // Running requests and decode graphs at the concurrency plus 16.
         "--max-running-requests 160",
         "--cuda-graph-max-bs-decode 160",
         "--mamba-radix-cache-strategy extra_buffer",

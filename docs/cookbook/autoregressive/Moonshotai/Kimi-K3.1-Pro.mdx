@@ -107,11 +107,10 @@ Agentic workloads, such as coding agents and other multi-turn, tool-using assist
 
 On MI355X:
 
-- **Shape.** Up to 56 agents, one SGLang server on one node: TP8 for 1 and 4 agents, TP8 · DCP8 from 8; 1 and 4 agents also run the decode monokernel (`--enable-amd-monokernel` with `SGLANG_AMD_MONO_K31_WIDE=1`). `--max-running-requests` is 1 at 1 agent, 4 at 4, 6, 8, 13 and 20 at 8, 16, 24 and 32 agents, and the agent count from 48; `--cuda-graph-max-bs-decode` is 4 up to 4 agents and matches it from 8. At 128 and 144 agents, the Deploy panel's `High-Throughput` prefill and decode run as a 1P1D on two nodes behind the SGLang router.
-- **KV offload.** From 8 agents, HiCache in host DRAM (write-back), with the no-offload tier derived; at 1 and 4 agents, none, since the monokernel does not accept KV offload. A Mooncake store has not run on MI355X.
-- **Container image.** The points below ran `lmsysorg/sglang:dev-kimi-k31-pro-mi35x` at `sha256:5901db14` ([InferenceX run 42695979942](https://github.com/SemiAnalysisAI/InferenceX/actions/runs/42695979942), 3600 s each). That build registers no AMD Pollara (Ionic) verbs provider, so the PD commands mount the host's provider and its driver entry; without them Mooncake finds no NIC and moves KV over TCP.
+- **Shape.** One node up to 56 agents: TP8 on the monokernel for 1 and 4, TP8 · DCP8 with HiCache from 8. The 1P1D runs on two nodes.
+- **Image.** `lmsysorg/sglang:dev-kimi-k31-pro-mi35x` at `sha256:5901db14`, measured in [InferenceX run 42695979942](https://github.com/SemiAnalysisAI/InferenceX/actions/runs/42695979942).
 
-The measured MI355X points; tok/s/user is the P90 interactivity, TTFT is p50 / p90, and the prefix hit is the servers' overall cache hit:
+Measured points (3600 s); tok/s/user is the P90 interactivity and TTFT is p50 / p90:
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
@@ -134,44 +133,12 @@ The measured MI355X points; tok/s/user is the P90 interactivity, TTFT is p50 / p
   </thead>
   <tbody>
     <tr style={{backgroundColor: "rgba(255,255,255,0.02)"}}>
-      <td style={{padding: "9px 12px"}}>1</td>
-      <td style={{padding: "9px 12px"}}>1×8</td>
-      <td style={{padding: "9px 12px"}}>2,193</td>
-      <td style={{padding: "9px 12px"}}>250.4</td>
-      <td style={{padding: "9px 12px"}}>0.53 / 2.5</td>
-      <td style={{padding: "9px 12px"}}>97.3%</td>
-    </tr>
-    <tr style={{backgroundColor: "rgba(255,255,255,0.05)"}}>
-      <td style={{padding: "9px 12px"}}>4</td>
-      <td style={{padding: "9px 12px"}}>1×8</td>
-      <td style={{padding: "9px 12px"}}>3,258</td>
-      <td style={{padding: "9px 12px"}}>149.2</td>
-      <td style={{padding: "9px 12px"}}>0.46 / 1.6</td>
-      <td style={{padding: "9px 12px"}}>94.0%</td>
-    </tr>
-    <tr style={{backgroundColor: "rgba(255,255,255,0.02)"}}>
-      <td style={{padding: "9px 12px"}}>8</td>
-      <td style={{padding: "9px 12px"}}>1×8</td>
-      <td style={{padding: "9px 12px"}}>5,367</td>
-      <td style={{padding: "9px 12px"}}>102.3</td>
-      <td style={{padding: "9px 12px"}}>0.51 / 1.9</td>
-      <td style={{padding: "9px 12px"}}>96.7%</td>
-    </tr>
-    <tr style={{backgroundColor: "rgba(255,255,255,0.05)"}}>
       <td style={{padding: "9px 12px"}}>16</td>
       <td style={{padding: "9px 12px"}}>1×8</td>
       <td style={{padding: "9px 12px"}}>9,132</td>
       <td style={{padding: "9px 12px"}}>82.6</td>
       <td style={{padding: "9px 12px"}}>1.4 / 6.5</td>
       <td style={{padding: "9px 12px"}}>96.6%</td>
-    </tr>
-    <tr style={{backgroundColor: "rgba(255,255,255,0.02)"}}>
-      <td style={{padding: "9px 12px"}}>24</td>
-      <td style={{padding: "9px 12px"}}>1×8</td>
-      <td style={{padding: "9px 12px"}}>13,018</td>
-      <td style={{padding: "9px 12px"}}>65.7</td>
-      <td style={{padding: "9px 12px"}}>2.3 / 14.5</td>
-      <td style={{padding: "9px 12px"}}>96.5%</td>
     </tr>
     <tr style={{backgroundColor: "rgba(255,255,255,0.05)"}}>
       <td style={{padding: "9px 12px"}}>32</td>
@@ -198,14 +165,6 @@ The measured MI355X points; tok/s/user is the P90 interactivity, TTFT is p50 / p
       <td style={{padding: "9px 12px"}}>95.8%</td>
     </tr>
     <tr style={{backgroundColor: "rgba(255,255,255,0.02)"}}>
-      <td style={{padding: "9px 12px"}}>128</td>
-      <td style={{padding: "9px 12px"}}>1P1D, 2×8</td>
-      <td style={{padding: "9px 12px"}}>20,638</td>
-      <td style={{padding: "9px 12px"}}>33.4</td>
-      <td style={{padding: "9px 12px"}}>4.4 / 14.3</td>
-      <td style={{padding: "9px 12px"}}>94.6%</td>
-    </tr>
-    <tr style={{backgroundColor: "rgba(255,255,255,0.05)"}}>
       <td style={{padding: "9px 12px"}}>144</td>
       <td style={{padding: "9px 12px"}}>1P1D, 2×8</td>
       <td style={{padding: "9px 12px"}}>21,605</td>
@@ -283,21 +242,10 @@ Kimi K3.1 Pro always thinks; set the depth with the top-level `reasoning_effort`
 
 ### AMD MI350X / MI355X
 
-- Requires ROCm 10; the recipes have not run on ROCm 7 images.
-- **Environment.** Every MI350X / MI355X cell sets `SGLANG_USE_AITER=1 SGLANG_AITER_K3_OPT=1 AITER_FLYDSL_FORCE=1 AITER_SITUV2_A8W4=1`, as on [Kimi-K3](/cookbook/autoregressive/Moonshotai/Kimi-K3#amd-env): the AITER ROCm path, its K3 fused kernels, the FlyDSL MoE kernels and the SiTU v2 MoE with A8W4 activation quantization. SGLang keeps the MoE combine and the all-reduce in BF16 for Kimi K3.1 on ROCm. Every cell also runs the row-sharded prefill (`SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_ROUTED_FRONT=1`, `SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM=1`) with `SGLANG_OPT_DFLASH_RING_LOCS_FUSED=1`.
-- **Pick the recipe by agent count.**
-  - 1 to 4: `Unified` `Low-Latency (TP8)`, on the monokernel.
-  - 8 to 56: `Unified` `High-Throughput (DCP8)` with HiCache. The cell is the 48-agent shape: 32k prefill chunks every 32 decode steps and block 5, with `--max-running-requests` and `--cuda-graph-max-bs-decode` at the agent count. From 8 to 32 agents, use `--chunked-prefill-size 16384` and 6, 8, 13 and 20 running requests at 8, 16, 24 and 32 agents; 8 agents verify block 6.
-  - Past 56: the 1P1D, `High-Throughput` prefill and decode on two nodes (see [On AMD MI355X](#pd-amd)).
-- **DFLASH** runs on the Triton draft attention backend: 7 draft tokens (block 8) at 1 and 4 agents, 5 (block 6) at 8, and 4 (block 5) from 16 agents and on both PD roles, with ReplaySSM on every role but the PD prefill. Every cell adds `--speculative-use-block-verification`, which the measured acceptance used for sampled drafts.
-- **Monokernel (1 to 4 agents).** `--enable-amd-monokernel` with `SGLANG_AMD_MONO_K31_WIDE=1` runs decode and verify steps through the persistent kernels of `sgl-amd-mono` (in the image); other steps use the standard forward. It takes TP8 or DCP8 with DFLASH but not HiCache, and SGLang stops at startup with the reasons if a setup is outside what it supports. The log shows `[k31 wide] first wide step` once it engages. The `Low-Latency` cell keeps 150 KDA state slots (`--max-mamba-cache-size 150`) so agent sessions' prefixes stay cached.
-- **HiCache.** `L1+L2 (host)` is the default: write-back, `--hicache-ratio 2.5` and `SGLANG_HICACHE_MAMBA_HOST_RATIO=10` on a single node, 4.0 and 5 on the PD prefill. Low-Latency and the PD decode run without it.
-  - On agentic replay the host KDA-state slots bound the prefix hit rate before the host KV does, so `SGLANG_HICACHE_MAMBA_HOST_RATIO` sizes them apart from `--hicache-ratio`. The single-node recipes keep every KDA state per path (`--mamba-max-states-per-path 1` lowered their hit rate); the PD prefill keeps one state per path and checkpoints it every 64 tokens (`--mamba-track-interval 64`).
-  - The host pools pin 170-185 GB per GPU at DCP8, and the node's 8 ranks share its GTT limit (half of RAM, 1511 GiB on MI355X). At ratio 12 they overflowed it at 32 agents, and `hipHostMalloc` failed at startup. `HSA_USERPTR_FOR_PAGED_MEM=0` backs them with `hipHostMalloc` (GTT memory, which never migrates); page migration in registered host memory stalls every GPU queue.
-  - L3 has not run on MI350X / MI355X.
-- **Memory.** `SGLANG_ROCM_RUNTIME_RESERVE_GB` (10 at DCP8, 6 at TP8) keeps GPU memory free for the HIP queues' scratch, which is allocated outside torch. `--mem-fraction-static` 0.87 or 0.88 overflowed GTT at startup or ran slower on the single-node recipe.
-- **`--prefill-decode-interval`** sets how many decode steps run after each prefill batch before the next prefill. The single-node `High-Throughput` cell runs 32, with 32k prefill chunks from 48 agents and 16k chunks below; the `Low-Latency` cell runs 16.
-- **MI350X** runs the MI355X commands, single-node and 1P1D.
+- **ROCm 10** only. MI350X runs the MI355X commands.
+- **By agent count.** 1-4: `Unified` `Low-Latency`, on the monokernel (no HiCache). 8-56: `Unified` `High-Throughput` with HiCache, at its 48-agent shape; below 48, use 16k chunks and fewer running requests (6, 8, 13 and 20 at 8, 16, 24 and 32 agents). Beyond that, the 1P1D (see [On AMD MI355X](#pd-amd)).
+- **DFLASH.** Triton draft attention and block verification; block 8 at 1-4 agents, 5 from 16 agents and on both PD roles.
+- **HiCache.** The pinned host pools share the node's GTT limit (1511 GiB on MI355X); larger ratios fail at startup. L3 has not run on MI35x.
 
 ## 3. Advanced Usage
 
@@ -437,7 +385,7 @@ sgl-router \
 
 #### On AMD MI355X
 
-- **Container**: add `--device=/dev/infiniband --cap-add=IPC_LOCK --ulimit memlock=-1 --network=host` to the usual ROCm flags; Mooncake runs over RDMA and finds the RoCE NICs itself. On AMD Pollara (Ionic) NICs also mount the host's `/usr/lib/x86_64-linux-gnu/libibverbs/libionic-rdmav34.so` and `/etc/libibverbs.d/ionic.driver` (the Deploy panel's PD commands do): the image has no Ionic provider, and without them Mooncake logs `Found 0 HCAs` and moves KV over TCP (16,321 against 20,638 tok/s per GPU at concurrency 128).
+- **Container**: add `--device=/dev/infiniband --cap-add=IPC_LOCK --ulimit memlock=-1 --network=host`. On Pollara (Ionic) NICs also mount the host's `libionic-rdmav34.so` and `/etc/libibverbs.d/ionic.driver`, as the panel's commands do; without them Mooncake moves KV over TCP.
 - **Prefill host tier**: HiCache's host pools are pinned and count against the node's GTT limit, so a tier larger than that fails at startup. If yours does, lower `--hicache-ratio` or `SGLANG_HICACHE_MAMBA_HOST_RATIO`.
 - **Router**: the panel's MI355X router (`sglang_router` from the ROCm image) is the one measured.
 
