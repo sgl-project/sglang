@@ -1816,6 +1816,7 @@ jobs:
           ENABLE_CACHE_HOST: "1"
 
       - name: Install dependencies
+        id: install-dependencies
         run: |
           bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
           # Install tabulate for run_suite.py (missing in MI35x container)
@@ -1835,13 +1836,13 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
       # Shares the job with the eval above so the checkpoint is already cached
-      # and only one 8-GPU MI35x slot is consumed. Step ordering is also the
-      # accuracy gate: a failed eval fails the job before this runs, so
-      # throughput is never measured on a build that got the tokens wrong.
+      # and only one 8-GPU MI35x slot is consumed. Keep performance diagnostics
+      # after a failed eval, but only when setup succeeded. These measurements
+      # do not establish that accuracy passed.
       # continue-on-error matches every other combined accuracy + perf job here,
       # so a perf hiccup cannot turn the accuracy result red.
       - name: Performance Test MI35x ROCm (8-GPU Kimi-K3.1-Pro)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.install-dependencies.outcome == 'success' }}
         timeout-minutes: 300
         continue-on-error: true
         run: |
