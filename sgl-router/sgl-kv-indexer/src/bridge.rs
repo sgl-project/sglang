@@ -6,10 +6,10 @@
 //! Subscribes to a worker's ZMQ KV-event stream, decodes each batch, and
 //! forwards it to the indexer over gRPC.
 //!
-//! Configured publisher epochs are registered with a trusted CAS and each
-//! bounded RPC carries publisher batch/chunk coordinates. Reconnects and gaps
-//! conservatively invalidate observations. This is not durable replay or a
-//! complete snapshot; legacy epoch-less streams always remain unknown.
+//! It keeps a reconnect supervisor but does not recover data: no sequence
+//! tracking, no replay of missed batches, no incarnation token, no liveness
+//! heartbeat. A sequence gap is logged and ignored, and events produced while
+//! the bridge is disconnected are lost.
 
 use std::io::Cursor;
 use std::time::Duration;
@@ -24,8 +24,7 @@ use zeromq::{Socket, SocketRecv, SubSocket};
 use crate::lora::{LoraIndex, LoraStore};
 use crate::pb::kv_indexer_client::KvIndexerClient;
 use crate::pb::{
-    ApplyExternalKvBatchRequest, CacheWatermark, ExternalKvAction, ExternalKvActionType,
-    RegisterSourceRequest, TierType, WorkerCacheSpec,
+    ApplyExternalKvBatchRequest, ExternalKvAction, ExternalKvActionType, TierType, WorkerCacheSpec,
 };
 use crate::service::{component_bit, COMPONENT_SWA, MAX_ACTIONS_PER_BATCH, MAX_HASHES_PER_REQUEST};
 
@@ -48,10 +47,6 @@ pub struct BridgeConfig {
     /// The worker's component cache spec, forwarded on every apply batch. `None`
     /// for a legacy / full-only worker that reports no component metadata.
     pub cache_spec: Option<WorkerCacheSpec>,
-    /// Trusted lifecycle configuration for this publisher stream. It must change
-    /// on worker publisher restart, independently of operation/feedback epochs.
-    pub source_epoch: Option<String>,
-    pub previous_source_epoch: Option<String>,
 }
 
 impl BridgeConfig {
@@ -79,8 +74,6 @@ impl BridgeConfig {
             indexer_endpoint,
             clear_tiers,
             cache_spec,
-            source_epoch: std::env::var("KV_INDEXER_SOURCE_EPOCH").ok(),
-            previous_source_epoch: std::env::var("KV_INDEXER_PREVIOUS_SOURCE_EPOCH").ok(),
         })
     }
 }
@@ -162,7 +155,6 @@ enum Action {
         hashes: Vec<i64>,
         masks: Vec<Option<u32>>,
         block_sizes: Vec<Option<u32>>,
-        session_id: Option<String>,
     },
     Revoke {
         tier: i32,
@@ -174,8 +166,6 @@ enum Action {
 #[derive(Debug, Default)]
 struct EventActions {
     actions: Vec<Action>,
-    incomplete: bool,
-    cache_watermark: Option<CacheWatermark>,
 }
 
 impl EventActions {
@@ -190,7 +180,6 @@ impl EventActions {
         hashes: Vec<i64>,
         mask: Option<u32>,
         block_size: Option<u32>,
-        session_id: Option<String>,
     ) {
         if hashes.is_empty() {
             return;
@@ -202,13 +191,9 @@ impl EventActions {
             hashes: last,
             masks,
             block_sizes,
-            session_id: last_session,
         }) = self.actions.last_mut()
         {
-            if *last_tier == tier
-                && parent_block_hash == last.last().copied()
-                && *last_session == session_id
-            {
+            if *last_tier == tier && parent_block_hash == last.last().copied() {
                 last.extend(hashes);
                 masks.extend(std::iter::repeat_n(mask, n));
                 block_sizes.extend(std::iter::repeat_n(block_size, n));
@@ -221,7 +206,6 @@ impl EventActions {
             hashes,
             masks: vec![mask; n],
             block_sizes: vec![block_size; n],
-            session_id,
         });
     }
 
@@ -320,18 +304,7 @@ async fn connect(
         .timeout(GRPC_REQUEST_TIMEOUT)
         .connect()
         .await?;
-    let mut client = KvIndexerClient::new(channel);
-    if let Some(epoch) = &config.source_epoch {
-        client
-            .register_source(RegisterSourceRequest {
-                worker_id: config.worker_id.clone(),
-                source_epoch: epoch.clone(),
-                previous_epoch: config.previous_source_epoch.clone(),
-                tiers: config.clear_tiers.clone(),
-            })
-            .await
-            .map_err(classify_rpc)?;
-    }
+    let client = KvIndexerClient::new(channel);
     let mut subscriber = SubSocket::new();
     subscriber.subscribe(&config.event_topic).await?;
     subscriber.connect(&config.event_endpoint).await?;
@@ -348,11 +321,8 @@ async fn run_session(
     mut subscriber: SubSocket,
     lora: &mut LoraIndex,
 ) -> Result<(), BridgeError> {
-    // Local duplicate filtering protects the LoRA translation state. The server
-    // independently gates registered publisher epochs and chunk coordinates.
+    // Tracked only to log a discontinuity. Nothing acts on it.
     let mut last_seq: Option<u64> = None;
-    let mut connection_gap = true;
-    lora.clear();
 
     loop {
         let message = tokio::select! {
@@ -372,48 +342,17 @@ async fn run_session(
         };
 
         if let Some(previous) = last_seq {
-            if seq <= previous {
-                if seq < previous {
-                    lora.clear();
-                    let mut request = build_apply_request(
-                        config,
-                        seq,
-                        EventActions {
-                            actions: if config.source_epoch.is_none() {
-                                vec![Action::ClearAll]
-                            } else {
-                                vec![]
-                            },
-                            incomplete: true,
-                            ..Default::default()
-                        },
-                    );
-                    request.observation_gap = true;
-                    client
-                        .apply_external_kv_batch(request)
-                        .await
-                        .map_err(classify_rpc)?;
-                }
-                debug!(
-                    seq,
-                    previous, "ignoring duplicate/old publisher batch in this bridge session"
-                );
-                continue;
-            }
             if seq != previous.wrapping_add(1) {
-                connection_gap = true;
-                lora.clear();
                 warn!(
                     previous,
                     actual = seq,
-                    "SGLang KV event sequence gap; invalidating affected source observations"
+                    "SGLang KV event sequence is not contiguous; this build does not recover the gap"
                 );
             }
         }
         last_seq = Some(seq);
 
-        forward_raw_batch(config, &mut client, seq, &payload, lora, connection_gap).await?;
-        connection_gap = false;
+        forward_raw_batch(config, &mut client, seq, &payload, lora).await?;
     }
 }
 fn parse_zmq_frames(frames: &[bytes::Bytes]) -> Result<(u64, &[u8]), BridgeError> {
@@ -441,40 +380,16 @@ async fn forward_raw_batch(
     seq: u64,
     payload: &[u8],
     lora: &mut LoraIndex,
-    connection_gap: bool,
 ) -> Result<(), BridgeError> {
     let actions = match decode_event_batch_with_lora(payload, true, lora) {
         Ok(actions) => actions,
         Err(error) => {
             warn!(seq, %error, "skipping undecodable event batch");
-            EventActions {
-                actions: Vec::new(),
-                incomplete: true,
-                ..Default::default()
-            }
+            return Ok(());
         }
     };
 
-    let mut request = build_apply_request(config, seq, actions);
-    // Reconnect can miss publisher events. Reconstructed stream starts unknown;
-    // it cannot claim complete replay based only on a successful SUB connection.
-    request.observation_gap |= connection_gap;
-    if request.observation_gap {
-        lora.clear();
-    }
-    if config.source_epoch.is_none() && request.observation_gap {
-        let mut clears: Vec<_> = config
-            .clear_tiers
-            .iter()
-            .map(|tier| ExternalKvAction {
-                r#type: ExternalKvActionType::ActionClearAllAtTier as i32,
-                tier: *tier,
-                ..Default::default()
-            })
-            .collect();
-        clears.append(&mut request.actions);
-        request.actions = clears;
-    }
+    let request = build_apply_request(config, seq, actions);
     // One ZMQ batch can hold more mutations than a single apply RPC admits, so
     // send the parts in order. A later failure leaves an applied prefix, which
     // beats rejecting and losing the whole event batch.
@@ -504,7 +419,6 @@ fn build_apply_request(
                 hashes,
                 masks,
                 block_sizes,
-                session_id,
             } => actions.push(ExternalKvAction {
                 r#type: ExternalKvActionType::ActionReport as i32,
                 tier,
@@ -515,7 +429,6 @@ fn build_apply_request(
                 component_masks: encode_component_masks(&masks),
                 block_sizes: encode_block_sizes(&block_sizes),
                 parent_block_hash,
-                session_id,
             }),
             Action::Revoke { tier, hashes } => actions.push(ExternalKvAction {
                 r#type: ExternalKvActionType::ActionRevoke as i32,
@@ -524,7 +437,6 @@ fn build_apply_request(
                 component_masks: Vec::new(),
                 block_sizes: Vec::new(),
                 parent_block_hash: None,
-                ..Default::default()
             }),
             Action::ClearAll => {
                 for tier in &config.clear_tiers {
@@ -535,7 +447,6 @@ fn build_apply_request(
                         component_masks: Vec::new(),
                         block_sizes: Vec::new(),
                         parent_block_hash: None,
-                        ..Default::default()
                     });
                 }
             }
@@ -548,19 +459,15 @@ fn build_apply_request(
         actions,
         worker_address: config.worker_address.clone(),
         cache_spec: config.cache_spec,
-        source_epoch: config.source_epoch.clone(),
-        chunk_index: 0,
-        chunk_count: if config.source_epoch.is_some() { 1 } else { 0 },
-        observation_gap: events.incomplete,
-        cache_watermark: events.cache_watermark,
     }
 }
 
 /// Splits one decoded ZMQ batch into apply RPCs within the service's action and
 /// hash bounds, preserving action order and per-hash index alignment.
 ///
-/// Every part reuses publisher `seq` and carries a distinct chunk index/count.
-/// An epoch-less legacy request keeps zero chunk coordinates.
+/// Every part reuses the source `seq`, which is safe because `seq` is
+/// observability only (see the proto): applies are never deduplicated or fenced,
+/// so a repeated `seq` cannot get a part dropped as stale.
 fn split_apply_request(request: ApplyExternalKvBatchRequest) -> Vec<ApplyExternalKvBatchRequest> {
     let mut template = request;
     let actions = std::mem::take(&mut template.actions);
@@ -592,19 +499,6 @@ fn split_apply_request(request: ApplyExternalKvBatchRequest) -> Vec<ApplyExterna
         current.push(action);
     }
     flush(&mut current, &mut batches);
-    if batches.is_empty() {
-        batches.push(template.clone());
-    }
-    let count = batches.len() as u32;
-    for (index, batch) in batches.iter_mut().enumerate() {
-        if batch.source_epoch.is_some() {
-            batch.chunk_index = index as u32;
-            batch.chunk_count = count;
-        }
-        if index != 0 {
-            batch.observation_gap = false;
-        }
-    }
     batches
 }
 
@@ -623,7 +517,6 @@ fn split_action(action: ExternalKvAction) -> Vec<ExternalKvAction> {
                 hashes: action.hashes[start..end].to_vec(),
                 component_masks: slice_or_empty(&action.component_masks, start, end),
                 block_sizes: slice_or_empty(&action.block_sizes, start, end),
-                session_id: action.session_id.clone(),
                 parent_block_hash: if action.r#type == ExternalKvActionType::ActionReport as i32 {
                     if start == 0 {
                         action.parent_block_hash
@@ -697,31 +590,8 @@ fn decode_event_batch_with_lora(
 
     let events = expect_array(&batch[1], "KVEventBatch.events")?;
     let mut actions = EventActions::default();
-    if let Some(Value::Map(fields)) = batch.get(3) {
-        let unsigned = |name: &str| -> Result<u64, BridgeError> {
-            required_map_field(fields, name)?
-                .as_u64()
-                .ok_or_else(|| BridgeError::Decode(format!("cache watermark {name} must be u64")))
-        };
-        actions.cache_watermark = Some(CacheWatermark {
-            source_id: expect_str(required_map_field(fields, "source_id")?, "cache source_id")?
-                .into(),
-            source_epoch: expect_str(
-                required_map_field(fields, "source_epoch")?,
-                "cache source_epoch",
-            )?
-            .into(),
-            generation: unsigned("generation")?,
-            version: unsigned("version")?,
-        });
-    } else if batch.get(3).is_some_and(|v| !v.is_nil()) {
-        return Err(BridgeError::Decode(
-            "cache watermark must be map or nil".into(),
-        ));
-    }
     for (event_index, event) in events.iter().enumerate() {
         if let Err(error) = decode_event(event, &mut actions, lora) {
-            actions.incomplete = true;
             if log_event_errors {
                 warn!(
                     event_index,
@@ -763,8 +633,8 @@ fn required_map_field<'a>(
 
 /// Decodes one tagged-map event: `{"type": ..., "<field>": ...}`. Optional
 /// fields may be absent (msgspec omits `None` defaults) or present as nil.
-/// Session attribution is retained on reports; it never creates an additional
-/// physical placement. LoRA tokens/salt are handled only by the layout adapter.
+/// Keys the indexer does not use (`token_ids`, `lora_id`, `cache_salt`,
+/// `session_id`) are ignored.
 fn decode_event_map(
     entries: &[(Value, Value)],
     actions: &mut EventActions,
@@ -796,17 +666,6 @@ fn decode_event_map(
                 Some(value) => decode_optional_hash(value, "BlockStored.parent_block_hash")?,
                 None => None,
             };
-            let session_id = match map_field(entries, "session_id") {
-                Some(value) => expect_optional_str(value, "BlockStored.session_id")?
-                    .filter(|v| !v.is_empty())
-                    .map(str::to_string),
-                None => None,
-            };
-            if session_id.as_ref().is_some_and(|s| s.len() > 256) {
-                return Err(BridgeError::Decode(
-                    "session attribution exceeds 256 bytes".into(),
-                ));
-            }
             let hashes = decode_hashes(required_map_field(entries, "block_hashes")?)?;
             let name = map_field(entries, "lora_name")
                 .and_then(Value::as_str)
@@ -851,20 +710,12 @@ fn decode_event_map(
                                 stored.hashes.clone(),
                                 stored.component_mask,
                                 stored.component_mask.map(|_| stored.block_size as u32),
-                                session_id.clone(),
                             );
                         }
                     }
                 }
             } else {
-                actions.report(
-                    tier,
-                    parent_block_hash,
-                    hashes,
-                    mask,
-                    block_size,
-                    session_id,
-                );
+                actions.report(tier, parent_block_hash, hashes, mask, block_size);
             }
         }
         "BlockRemoved" => {
@@ -1182,7 +1033,6 @@ mod tests {
             hashes: hashes.iter().map(|h| h.parse().unwrap()).collect(),
             masks: vec![None; hashes.len()],
             block_sizes: vec![None; hashes.len()],
-            session_id: None,
         }
     }
 
@@ -1220,7 +1070,7 @@ mod tests {
     }
 
     #[test]
-    fn session_attribution_is_retained_without_decoding_raw_salt() {
+    fn attribution_keys_are_ignored() {
         assert_eq!(
             actions_of(vec![stored_with_extra(
                 &[2, 3],
@@ -1231,13 +1081,7 @@ mod tests {
                     ("session_id", Value::String("session-a".into())),
                 ],
             )]),
-            vec![{
-                let mut report = rep_with_parent(hbm(), Some(1), &["2", "3"]);
-                if let Action::Report { session_id, .. } = &mut report {
-                    *session_id = Some("session-a".into());
-                }
-                report
-            }]
+            vec![rep_with_parent(hbm(), Some(1), &["2", "3"])]
         );
     }
 
@@ -1350,8 +1194,6 @@ mod tests {
             indexer_endpoint: "http://[::1]:50051".to_string(),
             clear_tiers,
             cache_spec: None,
-            source_epoch: None,
-            previous_source_epoch: None,
         }
     }
 
@@ -1372,7 +1214,6 @@ mod tests {
             component_masks: Vec::new(),
             block_sizes: Vec::new(),
             parent_block_hash: None,
-            ..Default::default()
         }
     }
 
@@ -1384,7 +1225,6 @@ mod tests {
             component_masks: Vec::new(),
             block_sizes: Vec::new(),
             parent_block_hash: None,
-            ..Default::default()
         }
     }
 
@@ -1396,7 +1236,6 @@ mod tests {
             component_masks: Vec::new(),
             block_sizes: Vec::new(),
             parent_block_hash: None,
-            ..Default::default()
         }
     }
 
@@ -1441,11 +1280,9 @@ mod tests {
                 component_masks: (0..count as u32).collect(),
                 block_sizes: (0..count as u32).map(|index| index + 1).collect(),
                 parent_block_hash: None,
-                ..Default::default()
             }],
             worker_address: "http://worker-1".into(),
             cache_spec: None,
-            ..Default::default()
         };
 
         let batches = split_apply_request(request);
@@ -1482,7 +1319,6 @@ mod tests {
                 .collect(),
             worker_address: "http://worker-1".into(),
             cache_spec: None,
-            ..Default::default()
         };
 
         let batches = split_apply_request(request);
@@ -1810,7 +1646,6 @@ mod tests {
                     crate::service::COMPONENT_FULL | crate::service::COMPONENT_SWA
                 )],
                 block_sizes: vec![Some(64)],
-                session_id: None,
             }]
         );
     }
@@ -1874,104 +1709,5 @@ mod tests {
         assert_eq!(component_bit("full"), Some(crate::service::COMPONENT_FULL));
         assert_eq!(component_bit("swa"), Some(COMPONENT_SWA));
         assert_eq!(component_bit("bogus"), None);
-    }
-    #[tokio::test]
-    async fn sequenced_oversized_publisher_batch_keeps_both_chunks_and_attribution() {
-        use crate::pb::{MatchExternalKvRequest, RegisterSourceRequest};
-        use crate::{InMemoryKvIndexerBackend, KvIndexerBackend};
-        let mut config = test_config(vec![hbm()]);
-        config.source_epoch = Some("publisher-epoch".into());
-        let mut events = EventActions::default();
-        events.report(
-            hbm(),
-            None,
-            (0..MAX_HASHES_PER_REQUEST as i64 + 2).collect(),
-            None,
-            None,
-            Some("session-a".into()),
-        );
-        let chunks = split_apply_request(build_apply_request(&config, 42, events));
-        assert_eq!(chunks.len(), 2);
-        assert_eq!((chunks[0].chunk_index, chunks[0].chunk_count), (0, 2));
-        assert_eq!((chunks[1].chunk_index, chunks[1].chunk_count), (1, 2));
-        let backend = InMemoryKvIndexerBackend::new();
-        backend
-            .register_source(RegisterSourceRequest {
-                worker_id: config.worker_id.clone(),
-                source_epoch: "publisher-epoch".into(),
-                tiers: vec![hbm()],
-                previous_epoch: None,
-            })
-            .await
-            .unwrap();
-        backend
-            .apply_external_kv_batch(chunks[0].clone())
-            .await
-            .unwrap();
-        assert!(
-            backend
-                .apply_external_kv_batch(chunks[0].clone())
-                .await
-                .unwrap()
-                .duplicate_chunk
-        );
-        backend
-            .apply_external_kv_batch(chunks[1].clone())
-            .await
-            .unwrap();
-        let q = backend
-            .match_external_kv(MatchExternalKvRequest {
-                hashes: vec![0, MAX_HASHES_PER_REQUEST as i64 + 1],
-                count_as_hit: false,
-            })
-            .await
-            .unwrap();
-        assert_eq!(q.matches[0].hashes_by_tier[0].hashes.len(), 2);
-        assert_eq!(
-            q.matches[0].hashes_by_tier[0].session_ids,
-            vec!["session-a", "session-a"]
-        );
-        assert_eq!(q.observation.unwrap().sources[0].watermark_seq, Some(42));
-    }
-    #[test]
-    fn session_attribution_prevents_unrelated_report_coalescing() {
-        let mut config = test_config(vec![hbm()]);
-        config.source_epoch = Some("e".into());
-        let mut a = stored(&[1], "GPU");
-        if let Value::Map(ref mut fields) = a {
-            fields.push((
-                Value::String("session_id".into()),
-                Value::String("session-a".into()),
-            ));
-        }
-        let request = request_of(&config, 1, vec![a]);
-        assert_eq!(request.actions[0].session_id.as_deref(), Some("session-a"));
-        let mut events = EventActions::default();
-        events.report(hbm(), None, vec![1], None, None, Some("a".into()));
-        events.report(hbm(), Some(1), vec![2], None, None, Some("b".into()));
-        assert_eq!(events.actions.len(), 2);
-    }
-
-    #[test]
-    fn optional_native_cache_watermark_tail_is_preserved_and_old_batches_still_decode() {
-        let config = test_config(vec![hbm()]);
-        let old = decode_event_batch(&batch(vec![stored(&[1], "GPU")])).unwrap();
-        assert!(old.cache_watermark.is_none());
-        let value = Value::Array(vec![
-            Value::F64(1.0),
-            Value::Array(vec![stored(&[1], "GPU")]),
-            Value::Nil,
-            map_event(vec![
-                ("source_id", Value::String("cache:one".into())),
-                ("source_epoch", Value::String("native-cache-epoch".into())),
-                ("generation", Value::from(2u64)),
-                ("version", Value::from(99u64)),
-            ]),
-        ]);
-        let mut payload = Vec::new();
-        rmpv::encode::write_value(&mut payload, &value).unwrap();
-        let request = build_apply_request(&config, 7, decode_event_batch(&payload).unwrap());
-        assert_eq!(request.seq, 7);
-        assert_eq!(request.cache_watermark.unwrap().version, 99);
     }
 }

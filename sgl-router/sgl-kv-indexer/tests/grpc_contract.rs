@@ -331,9 +331,7 @@ async fn validation_errors_map_to_invalid_argument_over_grpc() {
             component_masks: Vec::new(),
             block_sizes: Vec::new(),
             parent_block_hash: None,
-            ..Default::default()
         }],
-        ..Default::default()
     };
     let err = c
         .apply_external_kv_batch(unmapped_action_type)
@@ -610,93 +608,4 @@ async fn router_client_publishes_its_deadline_on_the_wire() {
         value > 0,
         "a budget of zero would shed every query: {raw:?}"
     );
-}
-
-#[tokio::test]
-async fn source_lifecycle_and_query_evidence_cross_real_grpc() {
-    use sgl_kv_indexer::pb::{ReconcileSourceRequest, RegisterSourceRequest};
-    let mut client = start().await;
-    let registered = client
-        .register_source(RegisterSourceRequest {
-            worker_id: "trusted-source".into(),
-            source_epoch: "epoch-one".into(),
-            previous_epoch: None,
-            tiers: vec![hbm()],
-        })
-        .await
-        .unwrap()
-        .into_inner()
-        .source
-        .unwrap();
-    assert!(!registered.complete);
-    client
-        .reconcile_source(ReconcileSourceRequest {
-            worker_id: "trusted-source".into(),
-            source_epoch: "epoch-one".into(),
-            expected_source_version: registered.source_version,
-            expected_indexer_epoch: registered.indexer_epoch.clone(),
-            confirmed_empty: true,
-            next_seq: 5,
-            evidence_id: "external empty-cache receipt".into(),
-        })
-        .await
-        .unwrap();
-    let mut request = apply_request(
-        "trusted-source",
-        "http://trusted-source",
-        5,
-        vec![action(ExternalKvActionType::ActionReport, hbm(), &[700])],
-    );
-    request.source_epoch = Some("epoch-one".into());
-    request.chunk_count = 1;
-    let receipt = client
-        .apply_external_kv_batch(request.clone())
-        .await
-        .unwrap()
-        .into_inner();
-    assert!(receipt.source.unwrap().complete);
-    assert!(
-        client
-            .apply_external_kv_batch(request)
-            .await
-            .unwrap()
-            .into_inner()
-            .duplicate_chunk
-    );
-    let q = client
-        .match_external_kv_prefix(MatchExternalKvPrefixRequest {
-            hashes: vec![700],
-            max_blocks: 0,
-        })
-        .await
-        .unwrap()
-        .into_inner();
-    let metadata = q.observation.unwrap();
-    assert!(metadata.scope_only);
-    assert!(!metadata.full_snapshot);
-    assert_eq!(metadata.sources[0].watermark_seq, Some(5));
-    assert!(metadata.sources[0].complete);
-    assert_eq!(
-        client
-            .register_source(RegisterSourceRequest {
-                worker_id: "trusted-source".into(),
-                source_epoch: "epoch-two".into(),
-                previous_epoch: Some("wrong".into()),
-                tiers: vec![hbm()]
-            })
-            .await
-            .unwrap_err()
-            .code(),
-        Code::FailedPrecondition
-    );
-    let bad = client
-        .register_source(RegisterSourceRequest {
-            worker_id: "trusted-source".into(),
-            source_epoch: "".into(),
-            previous_epoch: None,
-            tiers: vec![hbm()],
-        })
-        .await
-        .unwrap_err();
-    assert_eq!(bad.code(), Code::InvalidArgument);
 }

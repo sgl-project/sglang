@@ -15,15 +15,13 @@ pub mod pb {
 
 mod admission;
 mod memory_backend;
-mod recovery;
-pub use recovery::SourceLimits;
 mod service;
 mod shutdown;
 
 pub use admission::stamp_arrival;
 pub use client::{
-    GrpcPrefixIndex, InvalidEndpoint, ObservedPrefixOutcome, PrefixIndex, PrefixIndexConfig,
-    PrefixIndexError, PrefixMatch, PrefixOutcome, DEFAULT_QUERY_MAX_INFLIGHT,
+    GrpcPrefixIndex, InvalidEndpoint, PrefixIndex, PrefixIndexConfig, PrefixIndexError,
+    PrefixMatch, PrefixOutcome, DEFAULT_QUERY_MAX_INFLIGHT,
 };
 pub use memory_backend::InMemoryKvIndexerBackend;
 pub use service::{

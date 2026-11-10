@@ -27,109 +27,29 @@ SGLang worker ── ZMQ PUB ──> bridge ── gRPC ──> in-memory indexe
 Each apply RPC is ordered and atomic within the process, and a query sees a
 consistent snapshot. The bridge splits larger worker event batches into
 ordered RPCs of at most 16,384 hashes and 256 actions while keeping per-hash
-metadata aligned. If a later RPC fails, earlier chunks remain committed and the query reports
-`pending_seq`/incomplete coverage. Each registered chunk has its own index, so
-several RPCs sharing one publisher sequence are all retained. Placement mutation,
-source sequence state and query evidence use the same read/write lock.
+metadata aligned. If a later RPC fails, earlier chunks may already be applied;
+there is no rollback or replay. There is no persistence, replication, or state
+sharing between Indexer servers.
 
-## Operational contract and recovery capabilities
+## Operational contract
 
-Run one Indexer server. State is process-local and is lost on restart. The
-mutation endpoint is a **trusted administrative interface**: this build adds no
-authentication or authorization layer. Isolate it to the bridges and source
-lifecycle authority. An epoch string is an opaque identity, never a timestamp or
-an ordering key.
+Run exactly one Indexer server for a deployment. Multiple bridge processes and
+workers may report to it, but active-active Indexer servers have independent
+state and must not be treated as replicas.
 
-| Capability | Guarantee |
-| --- | --- |
-| Registered sources | Explicit epoch CAS, per-batch/chunk sequence gates, bounded duplicate receipts |
-| Sequence/chunk gap | Clear only that worker's registered tiers before accepting later chunk-zero data; coverage stays incomplete |
-| Chunk failure | Earlier committed chunks remain visible; no rollback or complete-batch claim |
-| Epoch replacement | `RegisterSource` must match `previous_epoch`; retired epochs cannot register again |
-| Reset evidence | Only trusted `ReconcileSource(confirmed_empty=true)` at an explicit publisher sequence cut restores completeness |
-| Worker death | Trusted `ReconcileSource(confirmed_empty=false)` clears registered tiers and suspends applies |
-| Query evidence | Epoch, completed publisher watermark, pending chunk, completeness, native cache watermark and scope-only response |
-| Legacy clients | Accepted with `legacy_unknown`; their placements remain advisory |
-| Restart/reconnect | Empty/unknown state, no durable replay or automatic complete recovery |
+This build has no sequence gate, incarnation fencing, replay recovery, worker
+liveness TTL, or restart recovery:
 
-Register one source per independent worker/rank publisher stream, with unique
-worker IDs. `RegisterSource(worker_id, source_epoch, previous_epoch, tiers)` is
-idempotent for the current epoch and same tier set. Replacing an epoch clears the
-union of old and new registered tiers. A stale epoch or mismatched CAS fails
-without replacing the current source. Registration alone starts **unknown**;
-it does not prove an empty cache or reconstruct events missed before subscribe.
-After Indexer restart an expected previous epoch is absent, so replacement CAS
-fails until the lifecycle authority explicitly reconciles that restart. Initial
-registration without a previous epoch is an explicit authority assertion; it
-still grants no complete coverage.
+- An Indexer restart starts with an empty index.
+- A worker death is not detected; its last placements remain until revoked or
+  until the Indexer restarts.
+- Events published while a bridge is disconnected are not replayed.
+- A publisher sequence gap is logged and otherwise ignored.
+- Redelivered or reordered batches are applied again in arrival order.
 
-`ReconcileSource` requires the current Indexer instance epoch, source version,
-source epoch, a bounded external
-`evidence_id`, and `next_seq`. With `confirmed_empty=true`, the authority asserts
-that **all registered tiers were empty at the exact publisher sequence cut**;
-the backend clears its records and admits contiguous batches from that cut.
-The cut must follow all observed batches. Ordinary `CLEAR_ALL_AT_TIER` events
-cannot restore completeness after a gap. With `confirmed_empty=false`, the
-source is invalidated and suspended. This supports an external worker registry's
-death signal; there is no automatic heartbeat or liveness TTL.
-
-Lost PUB events are not replayed. A missing or out-of-order chunk clears the
-source domain, and processing can resume at a later chunk-zero boundary while
-coverage remains incomplete. Older completed sequences are duplicate historical
-replay only within the same registered epoch; they never recreate cleared
-placements. Exact recent chunk payloads are fingerprinted for idempotence.
-The active and last-completed batch each retain at most 1,024 fingerprints,
-without unbounded event history. A very late replay outside that payload window
-can only receive a duplicate receipt, never be re-applied.
-
-Source limits default to 4,096 registered sources, 4,096 worker records and
-8,192 retired epochs.
-Library deployments may use `InMemoryKvIndexerBackend::with_source_limits`.
-Retired epoch fences are never silently evicted; exhaustion refuses admission.
-Placement bytes are still governed by the existing in-memory metadata deployment
-budget, not a new persistent store.
-
-The bridge optionally takes `KV_INDEXER_SOURCE_EPOCH` and
-`KV_INDEXER_PREVIOUS_SOURCE_EPOCH`. These identify the controlled **location
-publisher lifecycle**, independently of control-operation and feedback epochs.
-The epoch must rotate when that worker publisher restarts. Bridge connection
-registration uses the configured CAS; mismatch stops rather than replacing a
-newer source. A reconnect invalidates coverage and does not call the empty-cache
-recovery API. Epoch-less native streams remain compatible and unknown. For those
-streams, reconnect/gap detection clears configured tiers before new reports, and
-lower sequences are discarded. Silence, a malformed frame with no usable
-sequence and worker death require an external invalidation signal; this build
-cannot infer a complete live view from an idle PUB socket.
-
-The optional fourth `KVEventBatch` array slot carries native
-`cache_watermark={source_id,source_epoch,generation,version}`. The bridge retains
-it separately from the ZMQ frame's publisher sequence. It becomes a source
-watermark only after the complete batch commits. Native generation changes clear
-old placements and mark coverage incomplete. An unexpected native cache source
-epoch change clears/suspends the source until trusted reconciliation; epochs are
-never selected by arrival time. Old three-slot batches continue to decode.
-
-`MatchExternalKv` and `MatchExternalKvPrefix` return `observation.scope_only=true`
-and `full_snapshot=false`; they describe only requested hashes. `complete` refers
-to that source's registered tier domain, not every tier or the whole deployment.
-A worker missing from metadata is unknown. A partial scope query is never proof
-that the full cache was reconstructed. Consumers must check the epoch, required
-tiers and completeness before promoting an observation. The existing routing
-`PrefixIndex` API retains advisory matching; new orchestration can use
-`GrpcPrefixIndex::match_prefix_observed` and
-`confirmed_matches_for_tiers(required_tiers)`, or query the execution owner for a
-scope-specific observation. Prefix results aggregate tiers without per-block
-provenance, so that helper conservatively requires complete coverage of all
-three indexer tiers; a partial-tier source uses diagnostic per-tier scope query
-metadata instead. Metadata absent from an older server is unknown. Every query and source receipt
-also carries a random `indexer_epoch`; compare it by equality when retaining
-observations across calls. A response from a retired Indexer instance cannot
-restore a newer instance's state. Reconciliation also CAS-checks this epoch, so
-a stale reset receipt cannot exploit source-version reuse after restart.
-
-There is no full snapshot RPC, persistent source authority, durable replay,
-replication or multi-server failover. These conservative recovery rules reduce
-false confirmations; they do not provide full high availability.
+Individual report, revoke, and clear mutations are idempotent. A future
+Snapshot plus event-replay mechanism is required before production high
+availability can rebuild state safely after restart or event loss.
 
 ## In-memory data model
 
@@ -143,9 +63,6 @@ Component masks are `FULL=1`, `SWA=2`, `MAMBA=4`, and `0` for legacy
 whole-block events. `REPORT` replaces the component snapshot for one
 `(worker, tier, block)` placement. `REVOKE` removes that placement, and
 `CLEAR_ALL_AT_TIER` removes every placement for the worker at that tier.
-Optional `session_id` is retained as latest report attribution per placement and
-returned aligned with diagnostic hashes. It does not create session claims or
-duplicate the physical report; it is not a history of every associated session.
 
 ## Build
 
@@ -237,10 +154,8 @@ whole-block matching.
 
 The protobuf service in `proto/kv_indexer.proto` provides:
 
-- `RegisterSource`: trusted source epoch/tier registration with previous-epoch CAS.
-- `ReconcileSource`: explicit empty-cache recovery or source invalidation.
-- `ApplyExternalKvBatch`: placement reports, revocations and clears with optional
-  source epoch and bounded batch chunk coordinates.
+- `ApplyExternalKvBatch`: ordered placement reports, revocations, and clears.
+  The request `seq` is carried for observability only.
 - `MatchExternalKv`: workers and tiers holding requested block hashes.
 - `MatchExternalKvPrefix`: per-worker longest contiguous reusable prefix.
 - `GetExternalKvHitCounts`: per-block hit counters.
@@ -322,8 +237,6 @@ linearly with sustained overload.
 
 Required or commonly used bridge variables:
 
-- `KV_INDEXER_SOURCE_EPOCH`: optional trusted location-publisher lifecycle ID
-- `KV_INDEXER_PREVIOUS_SOURCE_EPOCH`: explicit previous epoch CAS for replacement
 - `KV_INDEXER_WORKER_ID`: unique ID for the worker event stream
 - `KV_INDEXER_WORKER_ADDRESS`: Router-facing worker URL
 - `KV_INDEXER_ENDPOINT`: Indexer endpoint, default `http://[::1]:50051`

@@ -13,9 +13,7 @@ use crate::pb::{
     ApplyExternalKvBatchRequest, ApplyExternalKvBatchResponse, ExternalKvAction,
     ExternalKvActionType, ExternalKvPrefixMatch, GetExternalKvHitCountsRequest,
     GetExternalKvHitCountsResponse, MatchExternalKvPrefixRequest, MatchExternalKvPrefixResponse,
-    MatchExternalKvRequest, MatchExternalKvResponse, ReconcileSourceRequest,
-    ReconcileSourceResponse, RegisterSourceRequest, RegisterSourceResponse, TierType,
-    WorkerCacheSpec,
+    MatchExternalKvRequest, MatchExternalKvResponse, TierType, WorkerCacheSpec,
 };
 
 /// Protocol-level resource bounds, enforced before a backend sees the request so
@@ -50,22 +48,9 @@ static OVERLOAD_LOG: RejectionLog = RejectionLog::new();
 /// dyn-safe so the server can hold it as `Arc<dyn KvIndexerBackend>`.
 #[tonic::async_trait]
 pub trait KvIndexerBackend: Send + Sync + 'static {
-    async fn register_source(
-        &self,
-        _: RegisterSourceRequest,
-    ) -> Result<RegisterSourceResponse, Status> {
-        Err(Status::unimplemented("source registration unavailable"))
-    }
-    async fn reconcile_source(
-        &self,
-        _: ReconcileSourceRequest,
-    ) -> Result<ReconcileSourceResponse, Status> {
-        Err(Status::unimplemented("source reconciliation unavailable"))
-    }
-
     /// Applies a whole SGLang KVEventBatch. The actions are pre-validated and
-    /// must be applied in order. Registered sources enforce epoch/sequence/chunk
-    /// gates atomically with placements; legacy sources retain unknown coverage.
+    /// must be applied in order. Applies are unconditional: the request `seq` is
+    /// informational only and a redelivered batch is applied again.
     async fn apply_external_kv_batch(
         &self,
         request: ApplyExternalKvBatchRequest,
@@ -128,19 +113,6 @@ pub trait KvIndexerBackend: Send + Sync + 'static {
 /// `Arc<dyn KvIndexerBackend>` and still satisfy `KvIndexerService<B>`.
 #[tonic::async_trait]
 impl KvIndexerBackend for std::sync::Arc<dyn KvIndexerBackend> {
-    async fn register_source(
-        &self,
-        r: RegisterSourceRequest,
-    ) -> Result<RegisterSourceResponse, Status> {
-        (**self).register_source(r).await
-    }
-    async fn reconcile_source(
-        &self,
-        r: ReconcileSourceRequest,
-    ) -> Result<ReconcileSourceResponse, Status> {
-        (**self).reconcile_source(r).await
-    }
-
     async fn apply_external_kv_batch(
         &self,
         request: ApplyExternalKvBatchRequest,
@@ -234,44 +206,6 @@ impl<B> KvIndexer for KvIndexerService<B>
 where
     B: KvIndexerBackend,
 {
-    async fn register_source(
-        &self,
-        request: Request<RegisterSourceRequest>,
-    ) -> Result<Response<RegisterSourceResponse>, Status> {
-        let r = request.into_inner();
-        validate_worker_id(&r.worker_id)?;
-        validate_epoch(&r.source_epoch)?;
-        if let Some(previous) = &r.previous_epoch {
-            validate_epoch(previous)?;
-        }
-        if r.tiers.is_empty() || r.tiers.len() > 3 {
-            return Err(Status::invalid_argument(
-                "source tiers must contain 1..3 tiers",
-            ));
-        }
-        let mut seen = std::collections::HashSet::new();
-        for tier in &r.tiers {
-            validate_tier(*tier)?;
-            if !seen.insert(*tier) {
-                return Err(Status::invalid_argument("duplicate source tier"));
-            }
-        }
-        Ok(Response::new(self.backend.register_source(r).await?))
-    }
-    async fn reconcile_source(
-        &self,
-        request: Request<ReconcileSourceRequest>,
-    ) -> Result<Response<ReconcileSourceResponse>, Status> {
-        let r = request.into_inner();
-        validate_worker_id(&r.worker_id)?;
-        validate_epoch(&r.source_epoch)?;
-        if r.evidence_id.is_empty() || r.evidence_id.len() > 1024 {
-            return Err(Status::invalid_argument(
-                "bounded reconciliation evidence required",
-            ));
-        }
-        Ok(Response::new(self.backend.reconcile_source(r).await?))
-    }
     async fn match_external_kv(
         &self,
         request: Request<MatchExternalKvRequest>,
@@ -322,58 +256,14 @@ where
         let request = request.into_inner();
         validate_worker_id(&request.worker_id)?;
         validate_actions(&request.actions)?;
-        validate_source_apply(&request)?;
         let response = self.backend.apply_external_kv_batch(request).await?;
         Ok(Response::new(response))
     }
 }
 
 fn validate_worker_id(worker_id: &str) -> Result<(), Status> {
-    if worker_id.is_empty() || worker_id.len() > 256 {
+    if worker_id.is_empty() {
         return Err(Status::invalid_argument("worker_id must not be empty"));
-    }
-    Ok(())
-}
-
-pub(crate) fn validate_epoch(epoch: &str) -> Result<(), Status> {
-    if epoch.is_empty() || epoch.len() > 256 {
-        return Err(Status::invalid_argument(
-            "source_epoch must contain 1..256 bytes",
-        ));
-    }
-    Ok(())
-}
-pub(crate) fn validate_source_apply(r: &ApplyExternalKvBatchRequest) -> Result<(), Status> {
-    if r.cache_watermark.as_ref().is_some_and(|w| {
-        w.source_id.is_empty()
-            || w.source_id.len() > 256
-            || w.source_epoch.is_empty()
-            || w.source_epoch.len() > 256
-    }) {
-        return Err(Status::invalid_argument(
-            "invalid bounded cache watermark identity",
-        ));
-    }
-    if r.worker_address.len() > 4096 {
-        return Err(Status::invalid_argument(
-            "worker address exceeds 4096 bytes",
-        ));
-    }
-    match &r.source_epoch {
-        Some(epoch) => {
-            validate_epoch(epoch)?;
-            if r.chunk_count == 0 || r.chunk_count > 1024 || r.chunk_index >= r.chunk_count {
-                return Err(Status::invalid_argument(
-                    "invalid bounded chunk coordinates",
-                ));
-            }
-        }
-        None if r.chunk_index != 0 || r.chunk_count != 0 => {
-            return Err(Status::invalid_argument(
-                "chunk coordinates require source epoch",
-            ))
-        }
-        None => {}
     }
     Ok(())
 }
@@ -410,7 +300,7 @@ fn validate_tier(tier: i32) -> Result<(), Status> {
     }
 }
 
-pub(crate) fn validate_actions(actions: &[ExternalKvAction]) -> Result<(), Status> {
+fn validate_actions(actions: &[ExternalKvAction]) -> Result<(), Status> {
     // An empty actions list is a no-op that only refreshes the worker's recorded
     // address. Non-empty batches still have every action validated below.
     if actions.len() > MAX_ACTIONS_PER_BATCH {
@@ -427,15 +317,6 @@ pub(crate) fn validate_actions(actions: &[ExternalKvAction]) -> Result<(), Statu
     }
     for action in actions {
         validate_tier(action.tier)?;
-        if action
-            .session_id
-            .as_ref()
-            .is_some_and(|s| s.is_empty() || s.len() > 256)
-        {
-            return Err(Status::invalid_argument(
-                "session attribution must contain 1..256 bytes",
-            ));
-        }
         match ExternalKvActionType::try_from(action.r#type) {
             Ok(ExternalKvActionType::ActionReport) | Ok(ExternalKvActionType::ActionRevoke) => {
                 validate_hashes_bounded(&action.hashes)?;
@@ -783,7 +664,6 @@ pub(crate) fn assemble_prefix_response(
         matches,
         best_prefix_blocks,
         blocks_read,
-        observation: None,
     }
 }
 
@@ -912,7 +792,6 @@ mod tests {
             component_masks: Vec::new(),
             block_sizes: Vec::new(),
             parent_block_hash: None,
-            ..Default::default()
         }
     }
 

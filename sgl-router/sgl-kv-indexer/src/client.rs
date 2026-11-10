@@ -14,7 +14,7 @@ use tokio::sync::{Semaphore, SemaphorePermit};
 use tonic::transport::{Channel, Endpoint};
 
 use crate::pb::kv_indexer_client::KvIndexerClient;
-use crate::pb::{MatchExternalKvPrefixRequest, MatchExternalKvPrefixResponse, QueryObservation};
+use crate::pb::MatchExternalKvPrefixRequest;
 use crate::service::MAX_GRPC_DECODING_MESSAGE_SIZE;
 
 /// Default per-query deadline. Indexer failures are request failures, so this
@@ -104,45 +104,6 @@ pub enum PrefixOutcome {
     Empty,
 }
 
-/// A requested-scope query plus source evidence from the same backend read lock.
-/// Missing metadata from an older server is unknown, never complete.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ObservedPrefixOutcome {
-    pub outcome: PrefixOutcome,
-    pub observation: Option<QueryObservation>,
-}
-impl ObservedPrefixOutcome {
-    /// Prefix results aggregate tiers without per-block provenance. Until that
-    /// provenance is added, require the source domain to cover every indexer
-    /// tier as well as the caller's requested tiers. Partial-domain consumers
-    /// can use MatchExternalKv's explicit per-tier scope instead.
-    pub fn confirmed_matches_for_tiers(&self, required_tiers: &[i32]) -> Vec<&PrefixMatch> {
-        if required_tiers.is_empty() {
-            return vec![];
-        }
-        let Some(metadata) = &self.observation else {
-            return vec![];
-        };
-        let PrefixOutcome::Matched { matches, .. } = &self.outcome else {
-            return vec![];
-        };
-        matches
-            .iter()
-            .filter(|m| {
-                metadata.sources.iter().any(|s| {
-                    s.worker_id == m.worker_id
-                        && !s.source_epoch.is_empty()
-                        && s.complete
-                        && !s.suspended
-                        && s.pending_seq.is_none()
-                        && [1, 2, 3].iter().all(|tier| s.tiers.contains(tier))
-                        && required_tiers.iter().all(|tier| s.tiers.contains(tier))
-                })
-            })
-            .collect()
-    }
-}
-
 /// Client configuration.
 #[derive(Debug, Clone)]
 pub struct PrefixIndexConfig {
@@ -209,41 +170,13 @@ fn truncate_prefix_query(hashes: &mut Vec<i64>) -> Option<usize> {
     (hashes.len() != total).then_some(total)
 }
 
-impl GrpcPrefixIndex {
-    pub async fn match_prefix_observed(
-        &self,
-        hashes: Vec<i64>,
-    ) -> Result<ObservedPrefixOutcome, PrefixIndexError> {
-        let response = self.query_prefix_response(hashes).await?;
-        let observation = response.observation;
-        let outcome = if response.matches.is_empty() {
-            PrefixOutcome::Empty
-        } else {
-            PrefixOutcome::Matched {
-                matches: response
-                    .matches
-                    .into_iter()
-                    .map(|m| PrefixMatch {
-                        address: m.worker_address,
-                        matched_prefix_blocks: m.matched_prefix_blocks,
-                        worker_id: m.worker_id,
-                    })
-                    .collect(),
-                best_prefix_blocks: response.best_prefix_blocks,
-            }
-        };
-        Ok(ObservedPrefixOutcome {
-            outcome,
-            observation,
-        })
-    }
-    async fn query_prefix_response(
-        &self,
-        mut hashes: Vec<i64>,
-    ) -> Result<MatchExternalKvPrefixResponse, PrefixIndexError> {
+#[tonic::async_trait]
+impl PrefixIndex for GrpcPrefixIndex {
+    async fn match_prefix(&self, mut hashes: Vec<i64>) -> Result<PrefixOutcome, PrefixIndexError> {
         if hashes.is_empty() {
-            return Ok(MatchExternalKvPrefixResponse::default());
+            return Ok(PrefixOutcome::Empty);
         }
+
         if let Some(total_hashes) = truncate_prefix_query(&mut hashes) {
             tracing::warn!(
                 total_hashes,
@@ -251,24 +184,45 @@ impl GrpcPrefixIndex {
                 "KV Indexer query truncated to the gRPC message-size limit"
             );
         }
+
         let _permit = self.try_acquire_prefix_query()?;
+
         let mut client = KvIndexerClient::new(self.channel.clone());
         let mut request = tonic::Request::new(MatchExternalKvPrefixRequest {
             hashes,
+            // The policy retains the full query length as its denominator, so a
+            // transport-limited prefix cannot turn a partial scan into a perfect
+            // hit.
             max_blocks: 0,
         });
+        // On the wire so the indexer can drop a query this caller already stopped
+        // waiting for. The local timeout below stays the hard stop, since it also
+        // covers a stall before the channel applies its own deadline.
         request.set_timeout(self.deadline);
+
         match tokio::time::timeout(self.deadline, client.match_external_kv_prefix(request)).await {
             Err(_) => Err(PrefixIndexError::Timeout),
             Ok(Err(status)) => Err(classify(status.code())),
-            Ok(Ok(response)) => Ok(response.into_inner()),
+            Ok(Ok(response)) => {
+                let response = response.into_inner();
+                if response.matches.is_empty() {
+                    return Ok(PrefixOutcome::Empty);
+                }
+                let matches = response
+                    .matches
+                    .into_iter()
+                    .map(|m| PrefixMatch {
+                        address: m.worker_address,
+                        matched_prefix_blocks: m.matched_prefix_blocks,
+                        worker_id: m.worker_id,
+                    })
+                    .collect();
+                Ok(PrefixOutcome::Matched {
+                    matches,
+                    best_prefix_blocks: response.best_prefix_blocks,
+                })
+            }
         }
-    }
-}
-#[tonic::async_trait]
-impl PrefixIndex for GrpcPrefixIndex {
-    async fn match_prefix(&self, hashes: Vec<i64>) -> Result<PrefixOutcome, PrefixIndexError> {
-        Ok(self.match_prefix_observed(hashes).await?.outcome)
     }
 }
 
@@ -434,41 +388,5 @@ mod tests {
 
         drop(permit);
         assert!(index.try_acquire_prefix_query().is_ok());
-    }
-    #[test]
-    fn confirmed_queries_require_source_evidence_for_every_required_tier() {
-        let outcome = PrefixOutcome::Matched {
-            matches: vec![PrefixMatch {
-                address: "http://w".into(),
-                matched_prefix_blocks: 1,
-                worker_id: "w".into(),
-            }],
-            best_prefix_blocks: 1,
-        };
-        let unknown = ObservedPrefixOutcome {
-            outcome: outcome.clone(),
-            observation: None,
-        };
-        assert!(unknown.confirmed_matches_for_tiers(&[1]).is_empty());
-        let mut observed = ObservedPrefixOutcome {
-            outcome,
-            observation: Some(QueryObservation {
-                scope_only: true,
-                full_snapshot: false,
-                indexer_epoch: "indexer-e".into(),
-                sources: vec![crate::pb::SourceObservation {
-                    worker_id: "w".into(),
-                    source_epoch: "e".into(),
-                    tiers: vec![1],
-                    complete: true,
-                    ..Default::default()
-                }],
-            }),
-        };
-        assert!(observed.confirmed_matches_for_tiers(&[1]).is_empty());
-        observed.observation.as_mut().unwrap().sources[0].tiers = vec![1, 2, 3];
-        assert_eq!(observed.confirmed_matches_for_tiers(&[1]).len(), 1);
-        observed.observation.as_mut().unwrap().sources[0].complete = false;
-        assert!(observed.confirmed_matches_for_tiers(&[1]).is_empty());
     }
 }

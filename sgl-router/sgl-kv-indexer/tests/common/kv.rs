@@ -30,7 +30,6 @@ pub fn action_with_parent(
         component_masks: Vec::new(),
         block_sizes: Vec::new(),
         parent_block_hash,
-        ..Default::default()
     }
 }
 
@@ -61,7 +60,6 @@ pub fn component_report_with_parent(
         component_masks: masks.to_vec(),
         block_sizes: block_sizes.to_vec(),
         parent_block_hash,
-        ..Default::default()
     }
 }
 
@@ -77,6 +75,5 @@ pub fn apply_request(
         actions,
         worker_address: address.to_string(),
         cache_spec: None,
-        ..Default::default()
     }
 }
