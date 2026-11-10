@@ -296,6 +296,10 @@ class SWAKVPool(BaseSWAKVPool):
         else:
             return self.full_kv_pool.get_kv_scale_buffer(layer_id_pool)
 
+    def get_raw_kv_buffer(self, layer_id: int):
+        kv = self.layer_router.read(layer_id)
+        return kv.view.get_raw_kv_buffer(kv.view_layer_id)
+
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor) -> torch.Tensor:
         assert self.full_to_swa_index_mapping is not None
         # -1 in kv_indices maps to -1 via the sentinel appended to the mapping.
@@ -336,8 +340,11 @@ class SWAKVPool(BaseSWAKVPool):
                 layer_id_override=layer_id_pool,
             )
         else:
+            # Quantized pools index per-layer global scales by layer.layer_id
+            # and buffers by layer_id_override.
+            quantized = getattr(pool, "is_quantized_kv_cache", False)
             pool.set_kv_buffer(
-                None,
+                layer if quantized else None,
                 loc,
                 cache_k,
                 cache_v,
