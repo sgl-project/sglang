@@ -214,6 +214,12 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset], ...] = (
         _HIP,
     ),
     (
+        "diffusion.conv1d_fp64acc",
+        KernelBackend.TRITON,
+        "conv.conv1d_fp64acc_triton:conv1d_fp64acc",
+        _HIP,
+    ),
+    (
         "diffusion.rmsnorm_scale",
         KernelBackend.TRITON,
         "norm.native_bf16_rmsnorm_triton:rmsnorm_scale",
@@ -757,6 +763,7 @@ _EXPORTS: dict[str, str] = {
     "wan_rmsnorm_silu": "norm.wan_rmsnorm_silu_triton",
     "can_use_qk_rmsnorm_native": "norm.zimage_qk_rmsnorm_triton",
     "zimage_qk_rmsnorm_native": "norm.zimage_qk_rmsnorm_triton",
+    "conv1d_fp64acc": "conv.conv1d_fp64acc_triton",
     "aten_head_rmsnorm": "norm.aten_head_rmsnorm_triton",
     "can_use_aten_head_rmsnorm": "norm.aten_head_rmsnorm_triton",
     "can_use_aten_head_rmsnorm_rope": "norm.aten_head_rmsnorm_triton",

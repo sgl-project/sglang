@@ -236,6 +236,44 @@ def test_audio_vae_attention_defaults_to_local_sdpa_and_allows_fa():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm conv1d replica")
+@pytest.mark.parametrize(
+    "channels, taps, dilation", [(8, 11, 5), (16, 7, 3), (64, 3, 1)]
+)
+def test_rocm_bigvgan_conv1d_replays_fp64_naive_order(channels, taps, dilation):
+    """The Triton conv1d sums x * w in FP64, input channel outer and tap inner,
+    then rounds once; an FP64 loop in that order gives the same bytes, and the
+    gated BigVGAN conv returns the eager conv's bytes either way."""
+    from torch.nn.utils.parametrizations import weight_norm
+
+    from sglang.kernels.ops.diffusion import conv1d_fp64acc
+    from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_audio_vae import (
+        bigvgan,
+    )
+
+    torch.manual_seed(0)
+    padding = dilation * (taps - 1) // 2
+    x = torch.randn(2, channels, 4099, device="cuda")
+    conv = weight_norm(
+        nn.Conv1d(channels, channels, taps, padding=padding, dilation=dilation)
+    ).cuda()
+    w = conv.weight.detach()
+
+    xp = nn.functional.pad(x, (padding, padding)).double()
+    ref = torch.zeros(2, channels, x.shape[-1], dtype=torch.float64, device="cuda")
+    for ic in range(channels):
+        for tap in range(taps):
+            start = tap * dilation
+            window = xp[:, ic : ic + 1, start : start + x.shape[-1]]
+            ref += window * w[None, :, ic, tap, None].double()
+    out = conv1d_fp64acc(x, w, padding=padding, dilation=dilation)
+    assert torch.equal(out, ref.float())
+
+    with torch.inference_mode():
+        assert torch.equal(bigvgan._conv1d(conv, x), conv(x))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_audio_snake_first_call_matches_repeated_calls():
     # a fresh process prevents earlier tests from warming a profiling JIT graph
     subprocess.run(
