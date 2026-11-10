@@ -3252,12 +3252,6 @@ class Scheduler(
         *,
         mm_input_error: Optional[str] = None,
     ):
-        # Pass policy through the factory so custom Req subclasses inherit it.
-        req_factory = partial(
-            self._create_generation_req,
-            recv_req,
-            use_model_stop_tokens=not get_serving().disable_model_stop_tokens,
-        )
         # Route: normal request / session request / session-not-found
         session_id = (
             recv_req.session_params.id if recv_req.session_params is not None else None
@@ -3277,7 +3271,8 @@ class Scheduler(
                 recv_req.input_ids = array("q", [1]) * seq_length
 
             is_beam = BeamCoordinator.request_beam_width(recv_req) > 1
-            req = req_factory(
+            req = self._create_generation_req(
+                recv_req,
                 recv_req.rid,
                 recv_req.input_text,
                 recv_req.input_ids,
@@ -3301,6 +3296,7 @@ class Scheduler(
                 routed_experts_start_len=recv_req.routed_experts_start_len,
                 return_indexer_topk=recv_req.return_indexer_topk,
                 eos_token_ids=self.model_config.hf_eos_token_id,
+                use_model_stop_tokens=not get_serving().disable_model_stop_tokens,
                 bootstrap_host=recv_req.bootstrap_host,
                 bootstrap_port=recv_req.bootstrap_port,
                 bootstrap_room=recv_req.bootstrap_room,
@@ -3365,8 +3361,9 @@ class Scheduler(
                 self.tokenizer,
                 self.model_config.vocab_size,
                 eos_token_ids=self.model_config.hf_eos_token_id,
+                use_model_stop_tokens=not get_serving().disable_model_stop_tokens,
                 disagg_mode=self.disaggregation_mode,
-                req_factory=req_factory,
+                req_factory=partial(self._create_generation_req, recv_req),
             )
             if self.enable_session_radix_cache:
                 req.session_generation = self.tree_cache.ensure_session_generation(
@@ -3388,11 +3385,13 @@ class Scheduler(
                 )
             else:
                 error_msg = f"Invalid request: session id {session_id} does not exist"
-            req = req_factory(
+            req = self._create_generation_req(
+                recv_req,
                 recv_req.rid,
                 recv_req.input_text,
                 recv_req.input_ids,
                 recv_req.sampling_params,
+                use_model_stop_tokens=not get_serving().disable_model_stop_tokens,
                 vocab_size=self.model_config.vocab_size,
                 http_worker_ipc=recv_req.http_worker_ipc,
             )
