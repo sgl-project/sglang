@@ -131,6 +131,16 @@ class SchedulerStats:
     mamba_evictable_tokens: int = 0
     mamba_used_tokens: int = 0
 
+    # HiSparse keeps a bounded working set on the device and the complete
+    # sparse KV pool on the host. These capacities have different accounting
+    # domains and must not be combined into the generic KV pool metrics.
+    hisparse_device_used_tokens: int = 0
+    hisparse_device_total_tokens: int = 0
+    hisparse_device_token_usage: float = 0.0
+    hisparse_host_used_tokens: int = 0
+    hisparse_host_total_tokens: int = 0
+    hisparse_host_token_usage: float = 0.0
+
     # Speculative decoding
     spec_accept_length: float = 0.0
     spec_accept_rate: float = 0.0
@@ -368,6 +378,9 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self.enable_lora = enable_lora
         self.enable_hierarchical_cache = enable_hierarchical_cache
         self.enable_streaming_session = enable_streaming_session
+        self.enable_hisparse = bool(
+            server_args is not None and server_args.enable_hisparse
+        )
         self.last_log_time = time.perf_counter()
         self._known_priorities: Set[int] = set()
         # Window pool series carry the window's name (`window_<length>`); a
@@ -475,6 +488,43 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
+        if self.enable_hisparse:
+            self.hisparse_device_used_tokens = Gauge(
+                name="sglang:hisparse_device_used_tokens",
+                documentation="Number of used token slots in the HiSparse device buffer.",
+                labelnames=labels.keys(),
+                multiprocess_mode="mostrecent",
+            )
+            self.hisparse_device_total_tokens = Gauge(
+                name="sglang:hisparse_device_total_tokens",
+                documentation="Total capacity of the HiSparse device buffer in tokens.",
+                labelnames=labels.keys(),
+                multiprocess_mode="mostrecent",
+            )
+            self.hisparse_device_token_usage = Gauge(
+                name="sglang:hisparse_device_token_usage",
+                documentation="Usage ratio of the HiSparse device buffer.",
+                labelnames=labels.keys(),
+                multiprocess_mode="mostrecent",
+            )
+            self.hisparse_host_used_tokens = Gauge(
+                name="sglang:hisparse_host_used_tokens",
+                documentation="Number of used token slots in the HiSparse host pool.",
+                labelnames=labels.keys(),
+                multiprocess_mode="mostrecent",
+            )
+            self.hisparse_host_total_tokens = Gauge(
+                name="sglang:hisparse_host_total_tokens",
+                documentation="Total capacity of the HiSparse host pool in tokens.",
+                labelnames=labels.keys(),
+                multiprocess_mode="mostrecent",
+            )
+            self.hisparse_host_token_usage = Gauge(
+                name="sglang:hisparse_host_token_usage",
+                documentation="Usage ratio of the HiSparse host pool.",
+                labelnames=labels.keys(),
+                multiprocess_mode="mostrecent",
+            )
         self.window_available_tokens = Gauge(
             name="sglang:window_available_tokens",
             documentation="Number of free token slots in each sliding-window KV pool, by window.",
@@ -1731,6 +1781,25 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self._log_gauge(self.kv_available_tokens, stats.kv_available_tokens)
         self._log_gauge(self.kv_evictable_tokens, stats.kv_evictable_tokens)
         self._log_gauge(self.kv_used_tokens, stats.kv_used_tokens)
+        if self.enable_hisparse:
+            self._log_gauge(
+                self.hisparse_device_used_tokens, stats.hisparse_device_used_tokens
+            )
+            self._log_gauge(
+                self.hisparse_device_total_tokens, stats.hisparse_device_total_tokens
+            )
+            self._log_gauge(
+                self.hisparse_device_token_usage, stats.hisparse_device_token_usage
+            )
+            self._log_gauge(
+                self.hisparse_host_used_tokens, stats.hisparse_host_used_tokens
+            )
+            self._log_gauge(
+                self.hisparse_host_total_tokens, stats.hisparse_host_total_tokens
+            )
+            self._log_gauge(
+                self.hisparse_host_token_usage, stats.hisparse_host_token_usage
+            )
         self._log_window_gauge(
             self.window_available_tokens, stats.window_available_tokens
         )

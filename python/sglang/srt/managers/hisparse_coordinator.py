@@ -85,8 +85,10 @@ class HiSparseAct(NamedTuple):
 
 class HiSparseTokenStats(NamedTuple):
     device_tokens: int
+    device_capacity: int
     device_token_usage: float
     host_tokens: int
+    host_capacity: int
     host_token_usage: float
 
 
@@ -841,10 +843,12 @@ class HiSparseCoordinator:
         host_tokens = host_capacity - self.mem_pool_host.available_size()
         return HiSparseTokenStats(
             device_tokens=device_tokens,
+            device_capacity=device_capacity,
             device_token_usage=(
                 device_tokens / device_capacity if device_capacity > 0 else 0.0
             ),
             host_tokens=host_tokens,
+            host_capacity=host_capacity,
             host_token_usage=(
                 host_tokens / host_capacity if host_capacity > 0 else 0.0
             ),
