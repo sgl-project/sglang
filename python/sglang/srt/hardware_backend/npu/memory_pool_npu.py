@@ -5,6 +5,10 @@ import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.npu.kv_capability import (
+    PackedQuantKvCapability,
+    resolve_npu_kv_capability,
+)
 from sglang.srt.layers.dcp.layout import localize_dcp_indices
 from sglang.srt.mem_cache.kv_cache_dtype import QUANT_MODE_TOKEN_INT8
 from sglang.srt.mem_cache.memory_pool import (
@@ -747,6 +751,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         kv_scale_ue8m0: bool = False,
         use_fp4_indexer: bool = False,
         modelslim_cache_layout=None,
+        kv_capability: Optional[PackedQuantKvCapability] = None,
     ):
         if use_fp4_indexer:
             raise ValueError("FP4 indexer KV cache is not supported on NPU.")
@@ -800,17 +805,30 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             self.start_layer <= i < self.start_layer + self.layer_num
             for i in self.indexer_layer_ids
         )
-        requested_kv_cache_dim = kv_cache_dim
+        # The capability describes the DSA layout; a pool without an indexer
+        # (dense MLA, ModelSlim KV) never uses the packed record.
+        if index_head_dim is None:
+            kv_capability = None
+        elif kv_capability is None:
+            kv_capability = resolve_npu_kv_capability(dtype)
+        if kv_capability is not None:
+            if not kv_capability.supported:
+                raise ValueError(kv_capability.unsupported_reason)
+            assert kv_capability.kv_cache_dtype == dtype
+        self.kv_capability = kv_capability
+        # True whenever the DSA main KV is the packed one-byte quantized record
+        # (latent | bf16 rope | scales).
         self.dsa_kv_cache_store_fp8 = (
-            index_head_dim is not None
-            and dtype == torch.float8_e4m3fn
-            and requested_kv_cache_dim is not None
+            kv_capability is not None and kv_capability.main_kv_packed
         )
         if self.dsa_kv_cache_store_fp8:
+            assert dtype.itemsize == 1
             assert index_head_dim == 128 and kv_lora_rank % 128 == 0
-            assert requested_kv_cache_dim == (
-                kv_lora_rank + kv_lora_rank // 128 * 4 + qk_rope_head_dim * 2
-            )
+            assert kv_cache_dim == (
+                kv_lora_rank
+                + kv_lora_rank // 128 * kv_capability.main_kv_scale_dtype.itemsize
+                + qk_rope_head_dim * 2
+            ), f"packed DSA KV cache needs kv_cache_dim, got {kv_cache_dim}"
             self.store_dtype = dtype
         if modelslim_cache_layout is not None:
             self.store_dtype = modelslim_cache_layout.key_dtype
@@ -818,7 +836,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         else:
             self.rope_dtype = self.store_dtype
         self.kv_cache_dim = (
-            requested_kv_cache_dim if self.dsa_kv_cache_store_fp8 else kv_lora_rank
+            kv_cache_dim if self.dsa_kv_cache_store_fp8 else kv_lora_rank
         )
         self.kr_cache_dim = 0 if self.dsa_kv_cache_store_fp8 else qk_rope_head_dim
 
@@ -836,13 +854,24 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             and not self.dsa_kv_cache_store_fp8
             and index_head_dim is not None
         )
+        # The capability owns the DSA indexer layout; the INT8 indexer K cache
+        # recipe overrides it on an unpacked pool.
+        self.indexer_quant = self.indexer_kv_store_int8 or (
+            kv_capability is not None and kv_capability.indexer_quant
+        )
         if self.indexer_kv_store_int8:
+            self.index_k_kv_dtype = torch.int8
             self.index_k_store_dtype = torch.int8
             self.index_k_scale_dtype = torch.float16
         else:
-            self.index_k_store_dtype = self.store_dtype
+            self.index_k_kv_dtype = (
+                dtype if kv_capability is None else kv_capability.indexer_kv_dtype
+            )
+            self.index_k_store_dtype = (
+                self.index_k_kv_dtype if self.indexer_quant else self.store_dtype
+            )
             self.index_k_scale_dtype = (
-                torch.float32 if self.dsa_kv_cache_store_fp8 else None
+                kv_capability.indexer_scale_dtype if self.indexer_quant else None
             )
         logger.info(
             f"Indexer K Cache type {self.index_k_store_dtype} scale type {self.index_k_scale_dtype}"
@@ -974,9 +1003,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                     dtype=self.index_k_store_dtype,
                     device=self.device,
                 )
-                if (
-                    self.dsa_kv_cache_store_fp8 or self.indexer_kv_store_int8
-                ) and self.num_indexer_layers > 0:
+                if self.indexer_quant and self.num_indexer_layers > 0:
                     from sglang.srt.layers.attention.dsa.dsa_npu_indexer import (
                         create_npu_hadamard_128,
                     )
@@ -1183,9 +1210,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         if getattr(self, "index_k_buffer", None) is None:
             raise RuntimeError("NPU MLA index KV cache is not allocated.")
 
-        if self.store_dtype != self.dtype:
+        if self.index_k_store_dtype != self.index_k_kv_dtype:
             return self.index_k_buffer[self._get_indexer_slot(layer_id)].view(
-                self.dtype
+                self.index_k_kv_dtype
             )
         return self.index_k_buffer[self._get_indexer_slot(layer_id)]
 
@@ -1408,11 +1435,11 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 f"index_k.dtype has to be {self.index_k_store_dtype=} but it is {index_k.dtype=}"
             )
         else:
-            if index_k.dtype != self.dtype:
-                index_k = index_k.to(self.dtype)
+            if index_k.dtype != self.index_k_kv_dtype:
+                index_k = index_k.to(self.index_k_kv_dtype)
 
-            if self.store_dtype != self.dtype:
-                index_k = index_k.view(self.store_dtype)
+            if self.index_k_store_dtype != self.index_k_kv_dtype:
+                index_k = index_k.view(self.index_k_store_dtype)
 
         torch_npu.npu_scatter_nd_update_(
             self.index_k_buffer[self._get_indexer_slot(layer_id)].view(

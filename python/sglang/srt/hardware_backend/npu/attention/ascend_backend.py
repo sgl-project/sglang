@@ -1933,7 +1933,8 @@ class AscendAttnBackend(AttentionBackend):
         actual_seq_lengths_kv,
     ):
         assert q_nope.dtype == q_pe.dtype == torch.bfloat16
-        packed = packed_kv.view(torch.float8_e4m3fn)
+        # The record is stored in the pool's one-byte dtype.
+        packed = packed_kv.view(self.token_to_kv_pool.store_dtype)
         return torch_npu.npu_kv_quant_sparse_flash_attention(
             query=torch.cat((q_nope, q_pe), dim=-1).contiguous(),
             key=packed,
@@ -2170,7 +2171,8 @@ class AscendAttnBackend(AttentionBackend):
                     scaling=layer.scaling,
                     fp8_attention=self.dcp_fp8_sparse_attention,
                 )
-            if self.kv_cache_dtype == torch.float8_e4m3fn:
+            # The pool decides the layout: k_nope is then the packed record.
+            if self.token_to_kv_pool.dsa_kv_cache_store_fp8:
                 attn_out = self._forward_fp8_sparse(
                     q_nope,
                     q_pe,
