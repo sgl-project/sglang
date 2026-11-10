@@ -6,14 +6,17 @@ from sglang.test.ascend.e2e.test_npu_performance_utils import (
     GLM_5_3_W8A8_MODEL_PATH,
     TestNpuPerfMultiNodePdSepTestCaseBase,
 )
+from sglang.test.ascend.e2e.test_npu_dual_pass import assert_no_regression, record_pass1
 from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(
-    est_time=5400,
+    est_time=10800,
     suite="",
     nightly=True,
     disabled="performance testcase",
 )
+
+CASE_ID = "test_npu_glm_5_3_w8a8_2p2d_32p_in128k_out1k_prefix90_20ms"
 
 GLM_5_3_PD_SEP_PREFILL_ENVS = {
     "SGLANG_SET_CPU_AFFINITY": "1",
@@ -172,13 +175,35 @@ GLM_5_3_PD_SEP_MODEL_CONFIG = {
     "router_envs": {},
 }
 
+# Pass 1: ASCEND_USE_FIA left unset (image default), CPU seq_lens mirror kept (1).
+GLM_5_3_PD_SEP_MODEL_CONFIG_PASS1 = {
+    **GLM_5_3_PD_SEP_MODEL_CONFIG,
+    # launch_pd_separation_node extends the arg lists in place on each pd pod;
+    # pass 1 needs its own copies or pass 2 boots with pass 1's rank/addr flags.
+    "prefill_args": list(GLM_5_3_PD_SEP_PREFILL_ARGS),
+    "decode_args": list(GLM_5_3_PD_SEP_DECODE_ARGS),
+    "prefill_envs": {
+        **{
+            k: v
+            for k, v in GLM_5_3_PD_SEP_PREFILL_ENVS.items()
+            if k != "ASCEND_USE_FIA"
+        },
+        "SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS": "1",
+    },
+    "decode_envs": {
+        **{
+            k: v for k, v in GLM_5_3_PD_SEP_DECODE_ENVS.items() if k != "ASCEND_USE_FIA"
+        },
+        "SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS": "1",
+    },
+}
 
-class TestNPUGLM5_3_W8A8_2P2D_32P_In128k_Out1k_Prefix90_20ms(
+
+class GLM5_3W8A8_2P2D_32PIn128kOut1kPrefix90_20msBase(
     TestNpuPerfMultiNodePdSepTestCaseBase
 ):
-    """Test NPU performance for GLM-5.3-w8a8 PD separation 2p2d in128k out1k prefix90"""
+    """Shared config for the two-pass (FIA unset vs FIA=0) throughput comparison. GLM-5.3-w8a8 PD separation 2p2d in128k out1k prefix90"""
 
-    model_config = GLM_5_3_PD_SEP_MODEL_CONFIG
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
     dataset_name = "generated-shared-prefix"
     max_concurrency = 64
@@ -187,12 +212,34 @@ class TestNPUGLM5_3_W8A8_2P2D_32P_In128k_Out1k_Prefix90_20ms(
     output_len = 1024
     repeat_rate = 0.9
     dp = 32
-    tpot = 20
-    output_token_throughput = 620
+    # tpot baseline commented out; +/-2% comparison is the gate
+    # output_token_throughput baseline commented out; +/-2% comparison is the gate
 
-    def test_npu_glm_5_3_w8a8_2p2d_32p_in128k_out1k_prefix90_20ms(self):
-        """Run NPU performance test for GLM-5.3-w8a8 PD separation"""
+
+class TestNPUGLM5_3_W8A8_2P2D_32P_In128k_Out1k_Prefix90_20msPass1(
+    GLM5_3W8A8_2P2D_32PIn128kOut1kPrefix90_20msBase
+):
+    """Pass 1: SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS=1, ASCEND_USE_FIA unset."""
+
+    model_config = GLM_5_3_PD_SEP_MODEL_CONFIG_PASS1
+
+    def test_npu_glm_5_3_w8a8_2p2d_32p_in128k_out1k_prefix90_20ms_pass1(self):
+        """Run pass-1 throughput and record the baseline metrics."""
         self.run_throughput()
+        record_pass1(CASE_ID, self.last_metrics)
+
+
+class TestNPUGLM5_3_W8A8_2P2D_32P_In128k_Out1k_Prefix90_20msPass2(
+    GLM5_3W8A8_2P2D_32PIn128kOut1kPrefix90_20msBase
+):
+    """Pass 2: SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS=0, ASCEND_USE_FIA=0."""
+
+    model_config = GLM_5_3_PD_SEP_MODEL_CONFIG
+
+    def test_npu_glm_5_3_w8a8_2p2d_32p_in128k_out1k_prefix90_20ms_pass2(self):
+        """Run pass-2 throughput and assert no regression vs pass 1."""
+        self.run_throughput()
+        assert_no_regression(self, CASE_ID, self.last_metrics)
 
 
 if __name__ == "__main__":
