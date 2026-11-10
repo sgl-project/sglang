@@ -296,6 +296,62 @@ class InputMessageConstructionTestCase(CustomTestCase):
             self.assertEqual(item.phase, phase)
             self.assertEqual(item.content[0].text, "answer")
 
+    def test_commentary_preamble_and_its_tool_calls_render_as_one_turn(self):
+        # A client such as Codex replays a turn as reasoning, a commentary
+        # preamble, then the function calls it announced. Rendering the
+        # preamble as its own finished assistant turn teaches the model to stop
+        # after the preamble without calling a tool.
+        serving = make_serving()
+        request = ResponsesRequest(
+            model="x",
+            input=[
+                {"role": "user", "content": "fix the failing tests"},
+                {
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "run tests"}],
+                },
+                {
+                    "role": "assistant",
+                    "content": "I'll run the tests first.",
+                    "phase": "commentary",
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "exec_command",
+                    "arguments": '{"cmd": "pytest"}',
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_2",
+                    "name": "exec_command",
+                    "arguments": '{"cmd": "git status"}',
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "2 failed",
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_2",
+                    "output": "clean",
+                },
+            ],
+            store=False,
+        )
+        messages = serving._construct_input_messages(request)
+        assistant = [m for m in messages if m.get("role") == "assistant"]
+        self.assertEqual(len(assistant), 1)
+        turn = assistant[0]
+        self.assertEqual(turn["phase"], "commentary")
+        self.assertEqual(turn["content"], "I'll run the tests first.")
+        self.assertEqual(turn["reasoning_content"], "run tests")
+        self.assertEqual([c["id"] for c in turn["tool_calls"]], ["call_1", "call_2"])
+        self.assertEqual(
+            [m["role"] for m in messages], ["user", "assistant", "tool", "tool"]
+        )
+
     def test_replay_preserves_reasoning_and_assistant_phases(self):
         serving = make_serving()
         request = ResponsesRequest(
