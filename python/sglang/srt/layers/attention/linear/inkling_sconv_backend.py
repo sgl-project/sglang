@@ -52,7 +52,10 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     ShortConvHybridAttnBackend,
 )
 from sglang.srt.layers.attention.linear.short_conv_backend import ShortConvAttnBackend
-from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
+from sglang.srt.layers.attention.mamba.mamba2_metadata import (
+    ForwardMetadata,
+    ForwardStateSlots,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.inkling_common.kernels.sconv import (
     HIS_ONES,
@@ -108,12 +111,12 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
         super().__init__(model_runner)
         # Pool-wide, bound at pool construction: conv[stream] is
         # [n_layers, n_slots, conv_kernel - 1, conv_dim].
-        self._mamba_cache = self.req_to_token_pool.mamba_pool.mamba_cache
+        self._mamba_cache = self.state_pool.mamba_cache
         self.conv_state_len: int = self.conv_states_shape[2]
         self.mamba_cache_chunk_size = mamba_cache_chunk_size()
         # Both identity and unified v2p gathers are recordable. The allocator
         # updates the stable device table in place, including after compaction.
-        self._slot_gather_recordable = self.req_to_token_pool.mamba_translate_is_fusable
+        self._slot_gather_recordable = True
 
         self.sconv_metadata = InklingShortConvMetadata()
 
@@ -234,6 +237,10 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
         if self._phase_records_metadata(forward_batch):
             if not self._slot_gather_recordable:
                 self._prepare_slot_indices(forward_batch)
+            elif forward_batch.forward_mode.is_target_verify():
+                # A speculative verify graph records no checkpoint slots, which
+                # only its commit writes (`forward_state_slots`): resolve them.
+                self._prepare_track_indices(forward_batch)
             return
         self._prepare_slot_indices(forward_batch)
         self._refresh_sconv_metadata(forward_batch, on_graph_path=True)
@@ -270,7 +277,7 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
                 out_state_indices=buf,
                 valid_bs=n,
                 total_bs=n,
-                v2p=pool.mamba_v2p_table,
+                v2p=self._state_ids.read_v2p,
             )
             self._cache_indices = buf[:n]
             self.forward_metadata = ForwardMetadata(
@@ -284,8 +291,7 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
         # Every metadata view must explicitly provide virtual IDs or None.
         indices = forward_batch.mamba_track_indices
         if indices is None or (
-            self._slot_gather_recordable
-            and self.req_to_token_pool.mamba_v2p_table is None
+            self._slot_gather_recordable and self._state_ids.read_v2p is None
         ):
             self.sconv_metadata.track_cache_indices = indices
             return
@@ -547,32 +553,46 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
             out[live:].zero_()
         self.sconv_metadata.track_conv_indices = out
 
+    def forward_state_slots(
+        self, num_requests: int, track_ids: Optional[torch.Tensor]
+    ) -> ForwardStateSlots:
+        """The step's slots from the buffers its metadata prep refills in place;
+        a replay does not rebind ``_cache_indices``, so it may name an older step's."""
+        buf = self._cache_indices_buf
+        if buf is not None and num_requests <= buf.shape[0]:
+            working = buf[:num_requests]
+        else:
+            # Past the buffer only an eager step runs, on a fresh tensor.
+            working = self._cache_indices[:num_requests]
+        track = None
+        if track_ids is not None:
+            if self._slot_gather_recordable and self._state_ids.read_v2p is None:
+                # Virtual slot ids are the physical ones: the forward used
+                # these very ids and read no table for them.
+                track = track_ids[:num_requests]
+            else:
+                track = self._graph_track_indices[:num_requests]
+        return ForwardStateSlots(working, track)
+
     def commit_conv_state_after_mtp_verify(
         self,
         *,
-        req_pool_indices: torch.Tensor,
         last_correct_step_indices: torch.Tensor,
         mamba_track_indices: Optional[torch.Tensor],
         mamba_steps_to_track: Optional[torch.Tensor],
+        state_slots: Optional[ForwardStateSlots] = None,
     ) -> None:
-        """Commit the TARGET_VERIFY conv windows at each request's last accepted step."""
-        pool = self.req_to_token_pool
-        bs = req_pool_indices.shape[0]
-        if self._slot_gather_recordable:
-            assert (
-                self._cache_indices_buf is not None
-                and self._cache_indices_buf.shape[0] >= bs
-            )
-            slot_ids = self._cache_indices_buf[:bs]
-        else:
-            slot_ids = self._translate_mamba_indices(
-                pool.get_mamba_indices(req_pool_indices)
-            )
+        """Commit the TARGET_VERIFY conv windows at each request's last accepted
+        step, into ``state_slots``: the verify forward's own by default."""
+        bs = last_correct_step_indices.shape[0]
+        if state_slots is None:
+            state_slots = self.forward_state_slots(bs, mamba_track_indices)
         if mamba_track_indices is not None:
-            mamba_track_indices = self._translate_mamba_indices(mamba_track_indices)
+            assert state_slots.track is not None
+            mamba_track_indices = state_slots.track[:bs]
         scatter_mamba_states_after_mtp_verify(
-            pool.get_speculative_mamba2_params_all_layers(),
-            slot_ids,
+            self.state_pool.get_speculative_mamba2_params_all_layers(),
+            state_slots.working[:bs],
             last_correct_step_indices,
             mamba_track_indices,
             mamba_steps_to_track,
@@ -587,12 +607,12 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
 
     def sconv_state(self, *, layer_id: int, stream: int) -> torch.Tensor:
         """``layer_id``'s conv state for one ``SconvType`` stream."""
-        pool_layer = self.req_to_token_pool.mamba2_layer_index(layer_id)
+        pool_layer = self.state_layer(layer_id).view_layer_id
         return self._mamba_cache.conv[stream][pool_layer]
 
     def sconv_intermediate_window(self, *, layer_id: int, stream: int) -> torch.Tensor:
         """One stream's per-draft-token conv windows. TARGET_VERIFY only."""
-        pool_layer = self.req_to_token_pool.mamba2_layer_index(layer_id)
+        pool_layer = self.state_layer(layer_id).view_layer_id
         return self._mamba_cache.intermediate_conv_window[stream][pool_layer]
 
 
@@ -667,19 +687,15 @@ class InklingShortConvHybridAttnBackend(ShortConvHybridAttnBackend):
         mamba_steps_to_track: Optional[torch.Tensor],
         model=None,
         req_pool_indices: Optional[torch.Tensor] = None,
+        state_slots: Optional[ForwardStateSlots] = None,
     ):
-        """Overrides the generic mamba scatter, which sources slot ids from
-        ``forward_metadata`` -- stale once the forward context has exited."""
-        del model
-        assert req_pool_indices is not None, (
-            "Inkling's conv-state commit needs req_pool_indices; the caller must "
-            "pass the verify batch's request slots."
-        )
+        """Inkling's own commit: conv windows only, with no SSM state to scatter."""
+        del model, req_pool_indices
         self.short_conv_backend.commit_conv_state_after_mtp_verify(
-            req_pool_indices=req_pool_indices,
             last_correct_step_indices=last_correct_step_indices,
             mamba_track_indices=mamba_track_indices,
             mamba_steps_to_track=mamba_steps_to_track,
+            state_slots=state_slots,
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):

@@ -134,7 +134,7 @@ struct LTX25DecoderRopeKernel {
     auto A = SymbolicSize{"heads"};
     auto D = SymbolicSize{"head_dim"};
     auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
     TensorMatcher({B, F, H, W, A, D})
         .with_dtype<T>()
         .with_device(device)

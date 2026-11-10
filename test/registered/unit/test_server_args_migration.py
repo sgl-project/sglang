@@ -8,9 +8,9 @@ import argparse
 import unittest
 
 from sglang.srt.arg_groups.overrides import resolution_result
+from sglang.srt.multimodal.media_io import configure_media_url_security
 from sglang.srt.runtime_context import get_model, publish, reset_context
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils.common import configure_media_url_security
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
