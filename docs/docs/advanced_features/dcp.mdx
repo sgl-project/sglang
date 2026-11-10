@@ -195,6 +195,12 @@ sglang serve \
   --speculative-num-draft-tokens 6
 ```
 
+#### SM90 (H100, H200)
+
+The `trtllm` DSA kernels need SM100, so on SM90 GLM-5 DSA also token-shards the **index-K cache**, the layout Kimi K3.1 uses. Each rank scores only the positions it owns, the ranks all-gather their local top-k and merge an exact global top-k, and decode, target verify and MTP draft extend attend the owned KV and merge partial outputs by LSE. Prefill gathers the prefix KV from the DCP group. The MTP draft shards its KV like the target.
+
+Requirements on SM90: `--dsa-prefill-backend flashmla_sparse_q8` or `flashmla_kv`, `--dsa-decode-backend flashmla_kv`, an `fp8_e4m3` KV cache, `attn_tp_size % dcp_size == 0` and `--context-length 1047552` or less, since the deterministic top-k merge takes rows of at most 2^20 scores. Validated on GLM-5.3 FP8 with PP4 × TP4 × DCP4 over two 8×H100 nodes, with and without MTP.
+
 ## References
 
 - [DCP and Helix Parallelism roadmap](https://github.com/sgl-project/sglang/issues/29736)

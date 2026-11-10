@@ -188,6 +188,7 @@ class DeepseekMLAForwardMixin:
         return (
             mode.is_decode()
             or mode.is_target_verify()
+            or (self.use_dsa and dsa_shards_index_k() and mode.is_draft_extend_v2())
             or (
                 self.use_dsa
                 # ROCm only: the draft shards its KV like the target, so its
@@ -204,6 +205,8 @@ class DeepseekMLAForwardMixin:
             return False
         mode = forward_batch.forward_mode
         if mode.is_decode() or mode.is_target_verify():
+            return True
+        if self.use_dsa and dsa_shards_index_k() and mode.is_draft_extend_v2():
             return True
         # DSA extend on HIP merges owned partials like decode, so replicating
         # q_b_proj replaces the per-layer [T, H, 576] Q all-gather there too.

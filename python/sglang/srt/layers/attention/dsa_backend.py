@@ -1251,7 +1251,7 @@ class DeepseekSparseAttnBackend(
             and get_platform().is_sm100
             and not envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
         )
-        if forward_mode.is_target_verify() and self.dsa_shards_index_k:
+        if self._attends_local_kv_shard(forward_mode):
             lens = _to_2d_context_lens(seqlens_expanded, batch_size)
             if dg_native_verify and lens.numel() == batch_size * next_n:
                 lens = lens.view(batch_size, next_n)
@@ -1262,6 +1262,14 @@ class DeepseekSparseAttnBackend(
             return _to_2d_context_lens(seqlens_expanded, batch_size)
         return self._dcp_local_ctx_lens(
             _to_2d_context_lens(cache_seqlens_int32, batch_size)
+        )
+
+    def _attends_local_kv_shard(self, forward_mode: ForwardMode) -> bool:
+        # Under split index-K, multi-token verify and draft extend attend only
+        # this rank's KV shard and return (o, lse) partials for forward_mla to
+        # merge; other extends gather the full KV first.
+        return self.dsa_shards_index_k and (
+            forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2()
         )
 
     def _dcp_local_ctx_lens(self, ctx_lens: torch.Tensor) -> torch.Tensor:
@@ -1290,7 +1298,11 @@ class DeepseekSparseAttnBackend(
         # the sharded indexer writes each query row's local top-k count here
         if not (
             self.dsa_shards_index_k
-            and (forward_mode.is_decode_or_idle() or forward_mode.is_target_verify())
+            and (
+                forward_mode.is_decode_or_idle()
+                or forward_mode.is_target_verify()
+                or forward_mode.is_draft_extend_v2()
+            )
         ):
             return None
         return seqlens_expanded.new_empty(seqlens_expanded.shape[0])
@@ -1385,6 +1397,15 @@ class DeepseekSparseAttnBackend(
         if metadata.page_table_1 is not None:
             return metadata.page_table_1.shape[1]
         return self.req_to_token.shape[1]
+
+    def _ragged_prefix_kv_rows(self) -> torch.Tensor:
+        rows = self.forward_metadata.page_table_1_flattened
+        assert rows is not None
+        if self.dsa_shards_index_k:
+            # dcp_gather_kv_cache already returns the KV in ragged order; the
+            # flattened table holds DCP-widened slots, not rows of that buffer.
+            return self.get_device_int32_arange(rows.shape[0])
+        return rows
 
     def dcp_gather_kv_cache(
         self, kv_cache: torch.Tensor, forward_batch: ForwardBatch, metadata: DSAMetadata
@@ -2650,9 +2671,8 @@ class DeepseekSparseAttnBackend(
 
         # Do absorbed multi-latent attention (MLA path)
         kv_cache = self.kv_layers.read(layer.layer_id).key()
-        if (
-            self.dsa_shards_index_k
-            and not forward_batch.forward_mode.is_target_verify()
+        if self.dsa_shards_index_k and not self._attends_local_kv_shard(
+            forward_batch.forward_mode
         ):
             kv_cache = self.dcp_gather_kv_cache(kv_cache, forward_batch, metadata)
 
@@ -2800,10 +2820,7 @@ class DeepseekSparseAttnBackend(
                 # batches hand over the paged cache as-is, others pass fresh bf16 KV.
                 if dsa_impl == "flashmla_sparse_q8":
                     if _has_prefix:
-                        page_table_1_flattened = (
-                            self.forward_metadata.page_table_1_flattened
-                        )
-                        assert page_table_1_flattened is not None
+                        page_table_1_flattened = self._ragged_prefix_kv_rows()
                         return self._forward_flashmla_sparse_q8kv8(
                             q_nope=q_nope,
                             q_rope=q_rope,
@@ -2849,12 +2866,8 @@ class DeepseekSparseAttnBackend(
                 # same inputs (concatenated q, dequantized bf16 KV, top-k list
                 # as the slot table) and differ only in the kernel they call.
                 if _has_prefix:
-                    page_table_1_flattened = (
-                        self.forward_metadata.page_table_1_flattened
-                    )
-                    assert page_table_1_flattened is not None
                     kv_cache = dequantize_k_cache_paged_dsa(
-                        kv_cache, page_table_1_flattened
+                        kv_cache, self._ragged_prefix_kv_rows()
                     )
                 else:
                     kv_cache = _cat([k, k_rope], dim=-1)
@@ -2906,8 +2919,7 @@ class DeepseekSparseAttnBackend(
                 metadata=metadata,
                 page_table_1=page_table_1,
                 forward_batch=forward_batch,
-                dcp_partial=self.dsa_shards_index_k
-                and forward_batch.forward_mode.is_target_verify(),
+                dcp_partial=self._attends_local_kv_shard(forward_batch.forward_mode),
             )
         elif dsa_impl == "fa3":
             return self._forward_fa3(

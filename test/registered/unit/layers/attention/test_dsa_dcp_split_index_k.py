@@ -1,0 +1,93 @@
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import pytest
+import torch
+
+from sglang.srt.configs.model_config import (
+    dsa_draft_shards_under_dcp,
+    glm_dsa_shards_index_k,
+)
+from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
+from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla import (
+    DeepseekMLAForwardMixin,
+)
+from sglang.srt.runtime_context import override_platform
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+FORWARD_MLA = "sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla"
+MODES = [
+    ForwardMode.EXTEND,
+    ForwardMode.DECODE,
+    ForwardMode.TARGET_VERIFY,
+    ForwardMode.DRAFT_EXTEND_V2,
+]
+
+
+def _config(arch: str):
+    return SimpleNamespace(architectures=[arch], index_topk=2048)
+
+
+def _backend(*, shards_index_k: bool, page_table_1_flattened=None):
+    backend = DeepseekSparseAttnBackend.__new__(DeepseekSparseAttnBackend)
+    backend.dsa_shards_index_k = shards_index_k
+    backend.device = torch.device("cpu")
+    backend._arange_buf = torch.arange(0, dtype=torch.int32)
+    backend.forward_metadata = SimpleNamespace(
+        page_table_1_flattened=page_table_1_flattened
+    )
+    return backend
+
+
+@pytest.mark.parametrize(
+    "arch,is_sm90,dcp_size,expected",
+    [
+        ("GlmMoeDsaForCausalLM", True, 4, True),
+        ("GlmMoeDsaForCausalLMNextN", True, 4, True),
+        # Blackwell keeps the replicated index-K DCP path on the trtllm kernels.
+        ("GlmMoeDsaForCausalLM", False, 4, False),
+        ("GlmMoeDsaForCausalLM", True, 1, False),
+        ("DeepseekV32ForCausalLM", True, 4, False),
+    ],
+)
+def test_glm_shards_index_k_only_under_dcp_on_sm90(arch, is_sm90, dcp_size, expected):
+    with override_platform(is_sm90=is_sm90, is_sm100=not is_sm90):
+        assert glm_dsa_shards_index_k(_config(arch), dcp_size) is expected
+        # The draft must shard exactly when its target does, or its extend
+        # attends a replicated pool while the target's KV is token-sharded.
+        assert dsa_draft_shards_under_dcp(_config(arch), dcp_size) is expected
+
+
+def test_prefix_rows_index_the_ragged_gathered_kv_under_split_index_k():
+    """Under split index-K, dcp_gather_kv_cache returns each request's KV in
+    position order, but page_table_1_flattened holds DCP-widened slot ids;
+    indexing the gathered buffer with those slots read the wrong rows (and
+    out of bounds on long contexts)."""
+    widened_slots = torch.tensor([8, 9, 10, 40, 41], dtype=torch.int32)
+    gathered = torch.arange(len(widened_slots)) * 10
+    backend = _backend(shards_index_k=True, page_table_1_flattened=widened_slots)
+    assert torch.equal(gathered[backend._ragged_prefix_kv_rows()], gathered)
+
+
+def test_prefix_rows_stay_the_slot_table_without_split_index_k():
+    slots = torch.tensor([3, 4, 7], dtype=torch.int32)
+    backend = _backend(shards_index_k=False, page_table_1_flattened=slots)
+    assert torch.equal(backend._ragged_prefix_kv_rows(), slots)
+
+
+@pytest.mark.parametrize("mode", MODES, ids=lambda m: m.name)
+def test_every_mode_returning_dcp_partials_is_merged_by_forward_mla(mode):
+    """A mode whose backend returns (o, lse) partials must be one that
+    forward_mla merges across DCP ranks; draft extend once returned partials
+    to a layer that expected a plain tensor."""
+    backend = _backend(shards_index_k=True)
+    layer = SimpleNamespace(dcp_size=4, use_dsa=True)
+    with patch(f"{FORWARD_MLA}.dsa_shards_index_k", return_value=True):
+        merged = DeepseekMLAForwardMixin.is_dcp_mla_decode_phase(
+            layer, SimpleNamespace(forward_mode=mode)
+        )
+    if backend._attends_local_kv_shard(mode):
+        assert merged

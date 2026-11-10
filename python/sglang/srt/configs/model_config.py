@@ -222,13 +222,24 @@ def is_deepseek_dsa(config) -> bool:
     ) or is_kimi_k31(config)
 
 
+def glm_dsa_shards_index_k(config, dcp_size: int) -> bool:
+    # The replicated index-K DCP path needs the SM100 trtllm DSA kernels, so on
+    # SM90 GLM-5 DSA token-shards index-K under DCP instead, like Kimi-K3.1.
+    return dcp_size > 1 and is_glm_moe_dsa(config) and get_platform().is_sm90
+
+
 def dsa_draft_shards_under_dcp(config, dcp_size: int) -> bool:
     """Whether a DSA EAGLE/NEXTN draft shards its KV like the DCP target.
 
-    Only on ROCm; elsewhere the draft keeps a replicated pool and attends it
-    with dcp_size 1.
+    On ROCm, and where the target token-shards its index-K (GLM-5 DSA on
+    SM90); elsewhere the draft keeps a replicated pool and attends it with
+    dcp_size 1.
     """
-    return dcp_size > 1 and is_hip() and is_deepseek_dsa(config)
+    return (
+        dcp_size > 1
+        and is_deepseek_dsa(config)
+        and (is_hip() or glm_dsa_shards_index_k(config, dcp_size))
+    )
 
 
 def mla_attention_dcp_size(config, *, dcp_size: int, is_nextn: bool) -> int:

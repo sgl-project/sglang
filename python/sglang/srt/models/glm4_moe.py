@@ -27,6 +27,7 @@ from transformers import PretrainedConfig
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.batch_overlap.single_batch_overlap import SboFlags
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_stages
+from sglang.srt.configs.model_config import glm_dsa_shards_index_k
 from sglang.srt.distributed import (
     get_pp_indices,
 )
@@ -39,6 +40,7 @@ from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.hf_transformers import get_rope_config
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
+from sglang.srt.layers.dcp.layout import set_dsa_shards_index_k
 from sglang.srt.layers.dp_attention import (
     is_allocation_symmetric,
     is_dp_attention_enabled,
@@ -1287,6 +1289,17 @@ class Glm4MoeForCausalLM(nn.Module):
 
 class GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM):
     fused_shared_experts_architecture = "GlmMoeDsaForCausalLM"
+
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
+        # Must run before the KV pools and attention backends are built.
+        if glm_dsa_shards_index_k(config, get_parallel().attn_dcp_size):
+            set_dsa_shards_index_k()
+        super().__init__(config=config, quant_config=quant_config, prefix=prefix)
 
     @classmethod
     def num_fusable_shared_experts(cls, hf_config) -> int:

@@ -1446,7 +1446,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             dcp_size == 1
             or forward_batch.forward_mode.is_decode_or_idle()
             or forward_batch.forward_mode.is_target_verify()
-        ), "DSA DCP runs the paged top-k in decode and target verify only"
+            or forward_batch.forward_mode.is_draft_extend_v2()
+        ), "DSA DCP runs the paged top-k in decode, target verify and draft extend only"
         use_cute_dsl = (
             self.paged_mqa_logits_backend.is_cutedsl()
             and not forward_batch.forward_mode.is_draft_extend_v2()
