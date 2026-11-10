@@ -10,9 +10,9 @@ and the sigmoid-gated output RMSNorm.
 Kernel body vendored from the NVIDIA x Moonshot Kimi K3 optimization package
 (see csrc/attention/kda_fused_decode.cuh for provenance and the list of
 integration patches). Specialized for the K3 KDA decode regime:
-K = V = 128, kernel width 4, no lower bound, T = 1 per request.
-The JIT currently instantiates local head counts H = HV in {12, 6, 3}
-(TP8, TP16, and TP32).
+K = V = 128, kernel width 4, T = 1 per request, with or without the gate
+lower bound. The JIT instantiates local head counts H = HV in {12, 6, 3}
+(K3 at TP8, TP16, TP32) and {16, 8} (GLM-5.3-Flash at TP4, TP8).
 
 The model must hand off the output-norm gate (attempt-and-verify stash on the
 attention layer, see kimi_k3.py), and a covered() check gates supported inputs.
@@ -35,7 +35,7 @@ from sglang.kernels.jit.utils import (
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
-SUPPORTED_HEADS = {3, 6, 12}
+SUPPORTED_HEADS = {3, 6, 8, 12, 16}
 _CONV_STATE_W = 3  # kernel width 4 -> 3 cached tokens
 
 
