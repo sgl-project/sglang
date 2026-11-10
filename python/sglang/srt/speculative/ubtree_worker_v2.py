@@ -64,6 +64,11 @@ class UBTreeWorkerV2(DFlashWorkerV2):
         nccl_port: int,
         target_worker: TpModelWorker,
     ) -> None:
+        if get_spec().speculative_eagle_topk < 2:
+            raise ValueError(
+                "UBTREE target tree verification requires speculative_eagle_topk "
+                "above 1, or the FA3 and KDA target backends verify a chain"
+            )
         # The target runner needs ``topk > 1`` to select SGLang's parent-aware
         # tree-verification attention path.  The DFlash draft is a linear
         # 16-slot block, however, and its ``custom_mask`` is intentionally
