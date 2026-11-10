@@ -115,6 +115,7 @@ __all__ = [
     "is_gfx115_supported",
     "use_gfx115_kernels",
     "is_gfx1250_supported",
+    "is_gfx1151_supported",
     "get_hip_version",
     "get_nvidia_driver_version",
     "get_nvidia_driver_version_str",
@@ -1342,6 +1343,18 @@ def is_gfx1250_supported():
     if is_hip():
         gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
         return any(gfx in gcn_arch for gfx in ["gfx1250"])
+    else:
+        return False
+
+
+@lru_cache(maxsize=1)
+def is_gfx1151_supported():
+    """
+    Returns whether the current platform is AMD RDNA3.5 gfx1151 (Strix Halo APU).
+    """
+    if is_hip():
+        gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
+        return "gfx1151" in gcn_arch
     else:
         return False
 
