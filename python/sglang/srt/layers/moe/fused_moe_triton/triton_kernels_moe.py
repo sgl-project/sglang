@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import contextlib
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -25,6 +26,19 @@ from sglang.srt.utils import is_cuda
 if get_platform().is_sm120:
     # use the regular gather/scatter implementation for unsupported devices.
     update_opt_flags_constraints({"is_persistent": False})
+
+
+def _scatter_matmul_constraints():
+    # Intel triton_kernels v3.8.0 picks split_k > 1 without honoring can_use_split_k,
+    # then asserts split_k == 1 with scatter_indx; drop once the pin honors it.
+    if get_platform().is_xpu:
+        from triton_kernels.matmul_details.opt_flags import (
+            scoped_opt_flags_constraints,
+        )
+
+        return scoped_opt_flags_constraints({"split_k": 1})
+    return contextlib.nullcontext()
+
 
 if is_cuda():
     from sglang.kernels.ops.activation.activation import gelu_and_mul, silu_and_mul
@@ -191,14 +205,15 @@ def triton_kernel_fused_experts(
     else:
         raise ValueError(f"Unsupported FusedMoe activation: {activation}")
 
-    intermediate_cache3 = matmul(
-        intermediate_cache2,
-        w2,
-        None,
-        a_ragged_metadata=a_ragged_metadata,
-        scatter_indx=scatter_indx,
-        gammas=None if apply_router_weight_on_input else gate_scal,
-    )
+    with _scatter_matmul_constraints():
+        intermediate_cache3 = matmul(
+            intermediate_cache2,
+            w2,
+            None,
+            a_ragged_metadata=a_ragged_metadata,
+            scatter_indx=scatter_indx,
+            gammas=None if apply_router_weight_on_input else gate_scal,
+        )
 
     return intermediate_cache3
 
@@ -351,13 +366,14 @@ def triton_kernel_fused_experts_with_bias(
         fused_activation=act,
     )
 
-    output = matmul(
-        intermediate_cache.view(M * n_expts_act, N // 2),
-        w2,
-        b2,
-        a_ragged_metadata=a_ragged_metadata,
-        scatter_indx=scatter_indx,
-        precision_config=w2_pcg,
-        gammas=None if apply_router_weight_on_input else gate_scal,
-    )
+    with _scatter_matmul_constraints():
+        output = matmul(
+            intermediate_cache.view(M * n_expts_act, N // 2),
+            w2,
+            b2,
+            a_ragged_metadata=a_ragged_metadata,
+            scatter_indx=scatter_indx,
+            precision_config=w2_pcg,
+            gammas=None if apply_router_weight_on_input else gate_scal,
+        )
     return output.view(-1, K)
