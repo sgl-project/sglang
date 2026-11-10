@@ -223,7 +223,11 @@ def _placeholder_mismatch_error(
     )
 
 
-def _forget_parent_executor_wakeups():
+def _init_cpu_preprocess_worker():
+    # A forked worker inherits the parent's tokenizers thread pool state but none
+    # of its threads, so a parallel encode here could wait forever. Keep this
+    # process serial; `get_parallelism` re-reads the variable on every call.
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
     # A forked worker inherits the parent's executor wakeups, whose locks a parent
     # thread may hold at fork time; since Python 3.12.8 / 3.13.1 the worker's exit
     # hook takes those locks, so the worker would never exit.
@@ -531,7 +535,7 @@ class BaseMultimodalProcessor(ABC):
         return concurrent.futures.ProcessPoolExecutor(
             mp_context=mp.get_context(start_method),
             max_workers=int(os.environ.get("SGLANG_CPU_WORKERS", os.cpu_count())),
-            initializer=_forget_parent_executor_wakeups,
+            initializer=_init_cpu_preprocess_worker,
         )
 
     def _replace_broken_cpu_executor(
