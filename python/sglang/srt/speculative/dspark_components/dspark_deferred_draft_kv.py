@@ -1,24 +1,15 @@
-"""The draft KV store of a static verify's committed tokens, split around the accept
-(SGLANG_DSPARK_DEFER_CONTEXT_KV).
+"""Defers the draft KV store of a static verify's committed tokens to the next
+draft graph (SGLANG_DSPARK_DEFER_CONTEXT_KV).
 
-It projects the committed rows' target hidden into each draft stage's KV
-(GEMMs, independent of the accept) and stores the committed rows (needs the accept's
-commit lengths). In a static verify graph the projection is forked onto a side stream
-at the target's logits processor (a forward pre-hook, which SGLang's forward and a
-megakernel's head both call), so it overlaps the LM head and the accept; the static
-epilogue joins it and stages the store's arguments (write locations, positions, gated
-commit lengths, ring slots). The next captured draft graph runs the stores on a side
-stream forked at its head (a capture head hook); the draft's first KV store joins
-them (``join``, from the draft attention backend's ``get_swa_out_cache_loc``, which
-SGLang's draft attention and a megakernel's both reach on the store's stream). An
-eager draft, or a draft graph that would not run them all, runs them eagerly first.
+The projection of the committed rows' target hidden forks onto a side stream at the
+target's logits processor, overlapping the LM head and the accept; the static
+epilogue joins it and stages the store. The next draft graph runs the store on a
+side stream forked at its head and joined at its first KV store; an eager draft, or
+a graph that would not cover every staged row, writes it eagerly first.
 
-Contract:
-
-- A draft forward writes only the staged rows of the requests it carries and
-  that were not retracted since, so a step touches only its own requests; a
-  prefill in between leaves the staging pending.
-- Every write disarms the staging (commit lengths 0), so a staging is written once.
+A draft forward writes only the staged rows of the requests it carries and that were
+not retracted since; a prefill in between leaves the staging pending. Every write
+disarms the staging (commit lengths 0), so a staging is written once.
 """
 
 from __future__ import annotations
@@ -70,8 +61,7 @@ class DeferredDraftKVStore:
         self._proj_done: Optional[torch.cuda.Event] = None
         self._store_stream: Optional[torch.cuda.Stream] = None
         self._store_done: Optional[torch.cuda.Event] = None
-        # Host: the requests a static verify staged since the last write, by row,
-        # with their `retraction_count` at staging (empty: nothing pending).
+        # Host: (req, retraction_count) per staged row; empty: nothing pending.
         self._staged_reqs: tuple = ()
         # Host: a forked projection the static epilogue has not joined yet.
         self._proj_unjoined = False

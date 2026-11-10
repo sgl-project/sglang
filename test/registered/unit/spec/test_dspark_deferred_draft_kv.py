@@ -1,9 +1,5 @@
-"""SGLANG_DSPARK_DEFER_CONTEXT_KV: the staged draft KV stores replay exactly the
-stores the static verify graph would have run (same projected KV, same locations from
-the same commit lengths), once, and run before any draft forward that would not run
-them itself (eager, a graph without the fork, or a graph whose rows miss staged ones),
-only for the requests that draft forward carries; a static epilogue whose graph
-forked no projection keeps the inline commit."""
+"""SGLANG_DSPARK_DEFER_CONTEXT_KV: the staged draft KV store writes what the static
+verify would have, once, and only the rows of the requests the draft carries."""
 
 import os
 import unittest
@@ -135,8 +131,7 @@ class TestDeferredCommit(CustomTestCase):
                 self.assertFalse(deferred_draft_kv.pending)
 
     def test_only_rows_of_the_requests_the_draft_carries_are_written(self):
-        """The draft batch is in its own order; a staged request it leaves out,
-        or one retracted and admitted again since, keeps its row unwritten."""
+        """Left-out or retracted rows stay unwritten, in any draft batch order."""
         for case in ("left out", "readmitted"):
             for graph_bs in (None, MAX_BS):
                 with self.subTest(case=case, graph_bs=graph_bs):
