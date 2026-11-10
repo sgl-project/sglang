@@ -1091,7 +1091,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                     weight_loader(param, loaded_weight)
                     loaded_params.add(mapped)
 
-        self._resolve_confidence_head(
+        self._assert_confidence_head_loaded(
             params_dict=params_dict, loaded_params=loaded_params
         )
         self.post_load_weights()
@@ -1100,7 +1100,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         for stage in self.stages:
             stage.refresh_mhc_norm_weight_cache()
 
-    def _resolve_confidence_head(
+    def _assert_confidence_head_loaded(
         self, *, params_dict: dict, loaded_params: set
     ) -> None:
         if self.confidence_head is None:
@@ -1109,13 +1109,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             name for name in params_dict if name.startswith("confidence_head.")
         }
         missing = confidence_param_names - loaded_params
-        if missing == confidence_param_names:
-            logger.info(
-                "DSpark draft checkpoint ships no confidence head weights; ragged "
-                "verify takes its confidences from the online acceptance estimator."
-            )
-            self.confidence_head = None
-        elif missing:
+        if missing:
             raise ValueError(
                 f"DSpark V4 confidence head is enabled but the checkpoint is missing "
                 f"{sorted(missing)}. Provide a checkpoint with trained confidence weights, "
