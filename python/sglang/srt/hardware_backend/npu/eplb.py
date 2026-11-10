@@ -68,7 +68,7 @@ def update_expert_weights_with_staging(
     for layer, old_placement, new_placement, local_changed in local_update_plan:
         weights = weights_by_layer[layer]
         if not temp_buffers:
-            temp_buffers = staging.create_temp_buffers(weights)
+            temp_buffers = staging.create_temp_buffers()
         migration_weights = staging.load(weights)
         missing_experts = []
         update_layer_fn(
@@ -150,50 +150,58 @@ def _rank_may_send_experts(old_placement, new_placement, local_slots):
 
 def _validate_migration_weights(
     weights_by_layer: dict[int, list[torch.Tensor]], layer_ids: list[int], rank: int
-) -> list[bool]:
-    """Validate chunk compatibility and identify tensors needing storage snapshots."""
-    import torch_npu
-
-    def specification(weights):
-        return [
-            (
-                tuple(t.shape),
-                t.dtype,
-                t.device,
-                torch_npu.get_npu_format(t) not in _BASE_FORMATS
-                or not t.is_contiguous(),
-            )
-            for t in weights
-        ]
-
+) -> list[_ExpertStorageLayout]:
+    """Validate the whole chunk once and return reusable per-weight layouts."""
     sample_layer = layer_ids[0]
-    expected = specification(weights_by_layer[sample_layer])
-    if not expected:
+    num_weights = len(weights_by_layer[sample_layer])
+    if not num_weights:
         raise ValueError(
             f"[NPU EPLB] rank={rank} layer={sample_layer}: no expert weights"
         )
-    for layer in layer_ids[1:]:
-        if specification(weights_by_layer[layer]) != expected:
+    layouts = []
+    for layer_index, layer in enumerate(layer_ids):
+        weights = weights_by_layer[layer]
+        if len(weights) != num_weights:
             raise ValueError(
-                f"[NPU EPLB] rank={rank} layer={layer}: migration weights must match "
-                f"layer {sample_layer} in tensor count, shape, dtype, device, "
-                "and storage snapshot requirements"
+                f"[NPU EPLB] rank={rank} layer={layer}: expected {num_weights} "
+                f"weight tensors as in layer {sample_layer}, got {len(weights)}"
             )
-    return [needs_snapshot for _, _, _, needs_snapshot in expected]
+        for weight_index, weight in enumerate(weights):
+            try:
+                layout = _expert_storage_layout(weight)
+            except ValueError as error:
+                raise ValueError(
+                    f"[NPU EPLB] rank={rank} layer={layer} "
+                    f"weight_index={weight_index}: {error}"
+                ) from error
+            if layer_index == 0:
+                layouts.append(layout)
+            elif layout != layouts[weight_index]:
+                raise ValueError(
+                    f"[NPU EPLB] rank={rank} layer={layer} "
+                    f"weight_index={weight_index}: storage layout {layout} "
+                    f"does not match layer {sample_layer}: {layouts[weight_index]}"
+                )
+    return layouts
 
 
 class _ExpertStorageLayout(NamedTuple):
-    """Physical storage of the full tensor, including shared experts and NZ padding."""
+    """Logical and physical metadata required to reuse a chunk's byte buffers."""
 
+    shape: tuple[int, ...]
+    dtype: torch.dtype
+    device: torch.device
     total_experts: int
     storage_elements: int
     npu_format: int
+    needs_snapshot: bool
 
-    def expert_byte_shape(self, weight: torch.Tensor) -> tuple[int, int]:
+    @property
+    def expert_byte_shape(self) -> tuple[int, int]:
         """Return [routed experts, physical bytes per expert] for uint8 transport."""
         elements_per_expert = self.storage_elements // self.total_experts
-        bytes_per_expert = elements_per_expert * weight.element_size()
-        return weight.shape[0], bytes_per_expert
+        bytes_per_expert = elements_per_expert * self.dtype.itemsize
+        return self.shape[0], bytes_per_expert
 
 
 def _validated_weight_owner(weight: torch.Tensor) -> torch.Tensor:
@@ -262,7 +270,15 @@ def _expert_storage_layout(weight: torch.Tensor) -> _ExpertStorageLayout:
             "NPU EPLB padded NZ weights must "
             "retain their full parameter base through the routed-expert slice."
         )
-    return _ExpertStorageLayout(owner.shape[0], storage_elements, npu_format)
+    return _ExpertStorageLayout(
+        shape=tuple(weight.shape),
+        dtype=weight.dtype,
+        device=weight.device,
+        total_experts=owner.shape[0],
+        storage_elements=storage_elements,
+        npu_format=npu_format,
+        needs_snapshot=npu_format not in _BASE_FORMATS or not weight.is_contiguous(),
+    )
 
 
 class _ExpertWeightStaging:
@@ -282,30 +298,9 @@ class _ExpertWeightStaging:
         layer_ids: list[int],
         rank: int,
     ):
-        self._needs_snapshot = _validate_migration_weights(
-            weights_by_layer, layer_ids, rank
-        )
+        self._layouts = _validate_migration_weights(weights_by_layer, layer_ids, rank)
         self._completion_events = deque(maxlen=2)
-        self._layouts: list[_ExpertStorageLayout] = []
         self._storage_snapshots: list[tuple[torch.Tensor, torch.Tensor]] = []
-        for layer_index, layer in enumerate(layer_ids):
-            for weight_index, weight in enumerate(weights_by_layer[layer]):
-                try:
-                    layout = _expert_storage_layout(weight)
-                except ValueError as error:
-                    raise ValueError(
-                        f"[NPU EPLB] rank={rank} layer={layer} "
-                        f"weight_index={weight_index}: {error}"
-                    ) from error
-                if layer_index == 0:
-                    self._layouts.append(layout)
-                elif layout != self._layouts[weight_index]:
-                    raise ValueError(
-                        f"[NPU EPLB] rank={rank} layer={layer} "
-                        f"weight_index={weight_index}: storage layout {layout} "
-                        f"does not match layer {layer_ids[0]}: "
-                        f"{self._layouts[weight_index]}"
-                    )
 
     def _begin_layer(self) -> None:
         # Bound queued work before allocating this layer's staging storage.
@@ -318,41 +313,39 @@ class _ExpertWeightStaging:
         previous_layer_done.record()
         self._completion_events.append(previous_layer_done)
 
-    def create_temp_buffers(self, weights: list[torch.Tensor]) -> list[torch.Tensor]:
+    def create_temp_buffers(self) -> list[torch.Tensor]:
         return [
             torch.empty(
-                layout.expert_byte_shape(weight),
+                layout.expert_byte_shape,
                 dtype=torch.uint8,
-                device=weight.device,
+                device=layout.device,
             )
-            for weight, layout in zip(weights, self._layouts, strict=True)
+            for layout in self._layouts
         ]
 
     def load(self, weights: list[torch.Tensor]) -> list[torch.Tensor]:
         self._begin_layer()
         self._storage_snapshots.clear()
         migration_weights = []
-        for weight, layout, needs_snapshot in zip(
-            weights, self._layouts, self._needs_snapshot, strict=True
-        ):
+        for weight, layout in zip(weights, self._layouts, strict=True):
             storage = weight
-            if needs_snapshot:
+            if layout.needs_snapshot:
                 # Preserve the full parameter, including its shared-expert suffix.
                 owner = weight if weight._base is None else weight._base
                 storage = torch.empty(
-                    layout.storage_elements, dtype=weight.dtype, device=weight.device
+                    layout.storage_elements, dtype=layout.dtype, device=layout.device
                 )
                 torch.ops.npu.copy_memory_(storage, owner, non_blocking=True)
                 self._storage_snapshots.append((owner, storage))
             # Reinterpret bytes; a dtype conversion would alter FP4/FP8 values.
             # Contiguous base formats alias model storage; only routed rows move.
-            routed_experts, bytes_per_expert = layout.expert_byte_shape(weight)
+            routed_experts, bytes_per_expert = layout.expert_byte_shape
             expert_bytes = storage.view(torch.uint8).view(-1, bytes_per_expert)
             migration_weights.append(expert_bytes[:routed_experts])
         return migration_weights
 
     def store(self) -> None:
         # Direct byte views already updated model storage. Snapshots also retain
-        # the shared-expert suffix, which is outside migration_weights.
+        # the shared-expert suffix, which is not exposed to the updater.
         for owner, snapshot in self._storage_snapshots:
             torch.ops.npu.copy_memory_(owner, snapshot, non_blocking=True)
