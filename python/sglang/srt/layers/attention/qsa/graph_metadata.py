@@ -1,9 +1,11 @@
 """GPU builders for QSA CUDA-graph replay metadata.
 
-Compressed addressing is pure arithmetic over the page-aligned full-KV cache:
-a group's compressed slot is any of its raw slots floor-divided by the compress ratio,
-so per-row graph buffers are rebuilt from request lengths and ``req_to_token`` alone;
-accept-dependent speculative lengths never need the host.
+Compressed addressing is pure arithmetic over the page-aligned full-KV
+cache (the DSV4 scheme): a group's compressed slot is any of its raw slots
+floor-divided by the compress ratio, so the kernels rebuild the per-row
+graph buffers from request lengths plus ``req_to_token`` alone — no
+allocation, no ownership state, and accept-dependent speculative lengths
+never need the host.
 
 Decode and target verify build row layout and compressed metadata in one kernel.
 Draft extend first builds its variable-length row layout, then derives metadata
@@ -83,6 +85,7 @@ def _qsa_graph_row_metadata_kernel(
     req_to_token_row_stride,
     max_pages,
     RATIO: tl.constexpr,
+    RING: tl.constexpr,
     FULL_PAGE: tl.constexpr,  # full-KV tokens per page
     PAGE_BLOCK: tl.constexpr,
     seq_lens_ptr,
@@ -128,11 +131,14 @@ def _qsa_graph_row_metadata_kernel(
         tl.store(write_locs_ptr + row, write_loc)
 
         tl.store(logical_positions_ptr + row, current)
-        tl.store(state_slots_ptr + row, req * RATIO + (current % RATIO).to(tl.int64))
+        # Ring addressing spans the whole allocated ring, not one group: a
+        # verify window publishes RATIO + rows - 1 positions before it reads
+        # any of them back.
+        tl.store(state_slots_ptr + row, req * RING + (current % RING).to(tl.int64))
         ring_base = row.to(tl.int64) * RATIO
         for k in tl.static_range(RATIO):
             member = tl.maximum(current - (RATIO - 1 - k), 0)
-            slot = req * RATIO + (member % RATIO).to(tl.int64)
+            slot = req * RING + (member % RING).to(tl.int64)
             tl.store(ring_locs_ptr + ring_base + k, slot.to(tl.int32))
 
     # Page-table entries are the request's FULL-KV page ids, read from the
@@ -170,6 +176,11 @@ def launch_graph_metadata(
     pool,
     seq_offset=0,
 ) -> None:
+    """Launch the two metadata kernels for one graph bucket.
+
+    Used both for the eager capture-warmup launch and for recording the
+    kernels into the main CUDA graph (``init_forward_metadata_in_graph``).
+    """
 
     indexer = metadata.indexer_metadata
     max_pages = indexer.graph_compressed_page_table.shape[1]
@@ -207,6 +218,7 @@ def launch_graph_metadata(
         req_to_token.stride(0),
         max_pages,
         RATIO=indexer.compress_ratio,
+        RING=pool.qsa_ring_size,
         FULL_PAGE=pool.qsa_compressed_page_size * indexer.compress_ratio,
         PAGE_BLOCK=128,
         seq_lens_ptr=seq_lens,
@@ -232,6 +244,7 @@ def _qsa_draft_graph_metadata_kernel(
     num_padding,
     MAX_PAGES: tl.constexpr,
     RATIO: tl.constexpr,
+    RING: tl.constexpr,
     FULL_PAGE: tl.constexpr,
 ):
     for step in tl.static_range(len(buffers)):
@@ -250,6 +263,7 @@ def _qsa_draft_graph_metadata_kernel(
                 row_stride,
                 MAX_PAGES,
                 RATIO,
+                RING,
                 FULL_PAGE,
                 128,
                 seq_lens,
@@ -284,12 +298,13 @@ def prepare_draft_graph_metadata(metadata, req_to_token, pool):
         req_to_token.stride(0),
         metadata[0].indexer_metadata.graph_compressed_page_table.shape[1],
         pool.qsa_compress_ratio,
+        pool.qsa_ring_size,
         pool.qsa_compressed_page_size * pool.qsa_compress_ratio,
     )
 
 
 def launch_draft_graph_metadata(args, seq_lens, req_pool_indices, bs, num_padding):
-    buffers, req_to_token, row_stride, max_pages, ratio, full_page = args
+    buffers, req_to_token, row_stride, max_pages, ratio, ring, full_page = args
     if bs == 0:
         return
     _qsa_draft_graph_metadata_kernel[(bs, triton.cdiv(max_pages, 128), len(buffers))](
@@ -302,6 +317,7 @@ def launch_draft_graph_metadata(args, seq_lens, req_pool_indices, bs, num_paddin
         max(0, min(int(num_padding or 0), bs)),
         max_pages,
         ratio,
+        ring,
         full_page,
         num_warps=1,
     )

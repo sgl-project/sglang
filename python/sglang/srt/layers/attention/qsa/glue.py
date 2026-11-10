@@ -1,8 +1,17 @@
-"""Assembly helpers shared by models that carry a QSA indexer."""
+"""Assembly helpers shared by models that carry a QSA indexer.
+
+Models stay free of backend-wrapping details: they build their indexer via
+``build_qsa_indexer`` and fetch per-forward indexer metadata through
+``get_qsa_indexer_metadata``.  Hybrid wrappers expose ``get_indexer_metadata``
+themselves; the unwrap here only remains as a compatibility fallback.
+"""
 
 from __future__ import annotations
 
-from sglang.srt.layers.attention.qsa.config import parse_qsa_profile
+from sglang.srt.layers.attention.qsa.config import (
+    QSA_VARIANT_COMPRESSED,
+    parse_qsa_profile,
+)
 
 
 def build_qsa_indexer(
@@ -13,27 +22,44 @@ def build_qsa_indexer(
     prefix: str = "",
     rotary_emb=None,
 ):
+    """Construct the indexer module matching ``config``'s QSA profile."""
 
     profile = parse_qsa_profile(config)
     if profile is None:
         raise ValueError(
             "build_qsa_indexer requires a config with a QSA indexer schema"
         )
-    from sglang.srt.layers.attention.qsa.qsa_indexer import QSAIndexer
+    if profile.variant == QSA_VARIANT_COMPRESSED:
+        # Compressed indexer reuses the layer's Qwen4-Exp RoPE (mrope).
+        from sglang.srt.layers.attention.qsa.qsa_indexer import QSAIndexer
 
-    return QSAIndexer(
+        return QSAIndexer(
+            config=config,
+            layer_id=layer_id,
+            quant_config=quant_config,
+            prefix=prefix,
+            rotary_emb=rotary_emb,
+        )
+    # Tokenwise (Qwen3Next-DSA): the Lightning Indexer owns its plain RoPE.
+    from sglang.srt.layers.attention.qsa.dsa_indexer import QwenDSAIndexer
+
+    return QwenDSAIndexer(
         config=config,
         layer_id=layer_id,
         quant_config=quant_config,
         prefix=prefix,
-        rotary_emb=rotary_emb,
     )
 
 
 def resolve_qsa_sparse_backend(attn_backend):
-    """Backend owning the QSA MTP sparse-selection hooks;
-    a hybrid wrapper keeps them on its full-attention side.
-    ``set_mtp_shared_sparse_indices`` is the probe, the one hook all owners define."""
+    """Backend owning the QSA MTP sparse-selection hooks.
+
+    The draft-extend backend is the runner's hybrid wrapper; the MTP shared
+    selection lives on its full-attention side, so hook callers resolve
+    through the same unwrap as ``get_qsa_indexer_metadata``.  The sentinel is
+    the state setter -- the one hook every owner (per-step backend and
+    multi-step container alike) defines.
+    """
 
     if hasattr(attn_backend, "set_mtp_shared_sparse_indices"):
         return attn_backend
@@ -46,7 +72,12 @@ def resolve_qsa_sparse_backend(attn_backend):
 
 
 def get_qsa_indexer_metadata(attn_backend, layer_id: int, forward_batch):
-    """Fetch indexer metadata from a (possibly hybrid-wrapped) backend."""
+    """Fetch indexer metadata from a (possibly hybrid-wrapped) backend.
+
+    Hybrid wrappers forward ``get_indexer_metadata`` to their full-attention
+    side for full-attention layers; unwrapping here is only a compatibility
+    fallback for backends that predate that passthrough.
+    """
 
     metadata = None
     get_metadata = getattr(attn_backend, "get_indexer_metadata", None)

@@ -10,7 +10,6 @@ from typing import Optional, Tuple
 
 import msgspec
 import torch
-
 from sglang.srt.layers.attention.qsa.kernel import (
     gather_qsa_compressed_keys,
     qsa_fast_topk,
@@ -73,10 +72,13 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
     compress_ratio: int
     block_topk: int
     req_pool_indices: Optional[torch.Tensor] = None
-    # Parallel per-group arrays for the groups compressed this forward:
-    # slot, sequence-local group-end position, and owning metadata row.
-    # The first member's token row in this forward's packed tensors is extend only,
-    # where group-aligned chunks keep every member in-chunk; None on paged forwards.
+    # One entry per compressed group to (re)write this forward: the
+    # slot, the group-end token position (sequence-local) and the metadata
+    # row owning it. For extend forwards, compress_member_rows additionally
+    # holds each group's first member as a token-row index into this
+    # forward's packed tensors (extend chunks are group-aligned, so every
+    # member is in-chunk); paged forwards leave it None and source members
+    # from the per-request pending ring instead.
     write_locs: Optional[torch.Tensor] = None
     compress_group_positions: Optional[torch.Tensor] = None
     compress_sequence_ids: Optional[torch.Tensor] = None
@@ -150,9 +152,14 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Gather packed compressed K and ragged ranges for prefill MQA.
 
+        Compressed slots come straight from the token-slot rows: each
+        sequence's complete blocks live at ``page * page_size + offset`` of
+        its assigned pages, in block order.
+
         ``query_sequence_ids`` overrides ``token_to_batch_idx`` for callers that
         score a subset of the batch's rows (prefill CP: this rank's zigzag rows);
-        ``positions`` must then be those rows' logical positions."""
+        ``positions`` must then be those rows' logical positions.
+        """
 
         pool = self.token_to_kv_pool
         ratio = self.compress_ratio
@@ -190,7 +197,12 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
     def get_decode_mqa_inputs(
         self, layer_id: int
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
-        """Paged compressed-K cache inputs for decode MQA, one row per query row."""
+        """Return the paged compressed-K cache inputs used by decode MQA.
+
+        Both the page table and the context lengths are built per query row
+        (one row per ``sequence_lengths`` entry), matching the per-query-row
+        layout of the sparse-attention inputs that consume their output.
+        """
 
         pool = self.token_to_kv_pool
         num_rows = self.sequence_lengths.numel()
@@ -247,19 +259,27 @@ def build_pending_ring_slots(
     sequence_lengths: torch.Tensor,
     logical_positions: torch.Tensor,
     compress_ratio: int,
+    ring_size: int,
     is_extend: bool,
 ) -> torch.Tensor:
-    """Pending-ring slot ``req_pool_idx * ratio + position % ratio`` per token.
-    On extend, tokens before the pending tail dump into rows [0, ratio),
-    which no request owns (request slot 0 is never allocated); CUDA-graph safe."""
+    """Address a pending key by request and position modulo the allocated ring.
+
+    ``req_pool_idx * ring + position % ring``: ``ring`` is a power of two at
+    least ``ratio + rows - 1`` wide, so every row of a speculative window and
+    the retained prefix members its completed groups reach back for occupy
+    distinct slots. On extend forwards compression sources members from the
+    chunk itself, so only the pending tail must survive the forward; older
+    tokens dump into ring rows [0, ring) -- request slot 0 is never allocated.
+    Pure tensor arithmetic, CUDA-graph safe.
+    """
     rows = token_to_batch_idx.long()[: logical_positions.numel()]
     requests = req_pool_indices.long()[rows]
     positions = logical_positions.long()
-    slots = requests * compress_ratio + positions % compress_ratio
+    slots = requests * ring_size + positions % ring_size
     if is_extend:
         lengths = sequence_lengths.long()[rows]
         pending = positions >= (lengths // compress_ratio) * compress_ratio
-        slots = torch.where(pending, slots, positions % compress_ratio)
+        slots = torch.where(pending, slots, positions % ring_size)
     return slots
 
 
@@ -269,6 +289,7 @@ def build_group_ring_slots(
     group_end_positions: torch.Tensor,
     sequence_ids: torch.Tensor,
     compress_ratio: int,
+    ring_size: int,
 ) -> torch.Tensor:
     """Ring slots of a planned group's members, oldest first."""
     requests = req_pool_indices.long()[sequence_ids]
@@ -280,7 +301,7 @@ def build_group_ring_slots(
         dtype=torch.long,
     )
     positions = (group_end_positions[:, None] - offsets[None, :]).clamp_min(0)
-    return requests[:, None] * compress_ratio + positions % compress_ratio
+    return requests[:, None] * ring_size + positions % ring_size
 
 
 def build_rope_position_matrix(

@@ -153,6 +153,7 @@ class WaveAttnBackend(AttentionBackend):
             self.num_kv_head,
             self.max_kv_splits,
             self.device_core_count,
+            0,
             MAX_NUM_SEQ=SCHEDULE_SEQ,
         )
 

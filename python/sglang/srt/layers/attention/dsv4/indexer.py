@@ -611,6 +611,13 @@ class C4IndexerBackendMixin:
         # indexer cache layout. Explicitly reject HIP, NPU, and other devices.
         if not is_cuda() or is_hip():
             return False
+        # DeepGEMM fp8_mqa_logits is Hopper/Blackwell; SM70 stays on the paged torch path.
+        if not (
+            get_platform().is_sm90
+            or get_platform().is_sm100
+            or get_platform().is_sm120
+        ):
+            return False
         # The gather plan is built from eager, child-local ForwardBatch metadata.
         # Rewritten, TBO-split, and graph-backed batches must use the paged path.
         if (
@@ -852,8 +859,18 @@ class C4IndexerBackendMixin:
         else:
             assert len(weights.shape) == 3
             weights = weights.squeeze(2)
+        _deep_gemm_indexer = (
+            get_platform().is_sm90
+            or get_platform().is_sm100
+            or get_platform().is_sm120
+        )
         if use_fp4_indexer and not use_aiter_fp4:
             weights = weights.float()
+            if not _deep_gemm_indexer:
+                raise RuntimeError(
+                    "DeepSeek V4 FP4 indexer requires SM90/SM100/SM120 DeepGEMM; "
+                    "SM70 uses the torch FP8 indexer."
+                )
             if envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
                 raise RuntimeError("DeepSeek V4 FP4 indexer requires DeepGEMM indexer.")
             from deep_gemm import fp8_fp4_paged_mqa_logits as fn
@@ -865,7 +882,7 @@ class C4IndexerBackendMixin:
             )
         elif is_hip():
             fn = _aiter_fp8_paged_mqa_logits
-        elif envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
+        elif envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get() or not _deep_gemm_indexer:
             if get_platform().is_sm120:
                 fn = fp8_paged_mqa_logits_torch_sm120
             else:
@@ -902,7 +919,11 @@ class C4IndexerBackendMixin:
         )
         _use_aiter = is_hip() and not use_fp4_indexer
         _use_torch_fn = (
-            envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get() and not use_fp4_indexer
+            (
+                envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
+                or not _deep_gemm_indexer
+            )
+            and not use_fp4_indexer
         )
         if (
             _c4sl.dim() == 1

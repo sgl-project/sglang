@@ -259,7 +259,8 @@ def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
 
 
 def _create_flashmla_metadata():
-    if get_platform().is_sm120 or _is_xpu:
+    # FlashMLA is Hopper/Blackwell. SM70 uses CSA2; SM120/XPU also skip.
+    if get_platform().is_sm70 or get_platform().is_sm120 or _is_xpu:
         return None
     from sglang.kernels.ops.attention.flash_mla_interface import get_mla_metadata
 
@@ -1621,7 +1622,11 @@ class DeepseekV4AttnBackend(
             compressed_page_size=index_page_size or self.page_size // compress_ratio,
             page_table=page_table,
             compressed_seq_lens=c_seq_lens,
-            use_topk_v2=self.dsa_topk_backend.should_use_topk_v2() and not _is_xpu,
+            use_topk_v2=(
+                self.dsa_topk_backend.should_use_topk_v2()
+                and not _is_xpu
+                and not get_platform().is_sm70
+            ),
             # The SM120 FP4 kernel schedules split_kv=128, while the generic
             # JIT metadata planner encodes split_kv=256.
             force_deep_gemm_metadata=(
@@ -3517,6 +3522,14 @@ class DeepseekV4AttnBackend(
         return 1
 
     def on_after_cuda_graph_warmup(self):
+        st = getattr(self, "_sm70_csa2", None)
+        if st is not None:
+            st.clear_sequence()
+        from sglang.srt.layers.attention.dsv4.sm70_csa2_boundary import (
+            csa2_boundary_clear,
+        )
+
+        csa2_boundary_clear(self)
         metadata = self.forward_metadata
         if isinstance(metadata, DSV4Metadata) and isinstance(
             metadata.core_attn_metadata, DSV4AttnMetadata
@@ -3552,6 +3565,14 @@ class DeepseekV4AttnBackend(
         run_indexer: bool = True,
     ) -> None:
         """Runs on every ratio 1/2 layer before its attention."""
+        if get_platform().is_sm70:
+            from sglang.srt.layers.attention.dsv4.sm70_csa2 import (
+                sm70_forward_low_ratio_sources,
+            )
+
+            return sm70_forward_low_ratio_sources(
+                self, layer, x, q_lora, positions, forward_batch
+            )
         if forward_batch.forward_mode.is_idle():
             return
         if forward_batch.encoder_swa_replay:
@@ -4343,6 +4364,22 @@ class DeepseekV4AttnBackend(
             return q.new_empty(
                 (q.shape[0], q.shape[1], layer.v_head_dim),
                 dtype=torch.bfloat16 if self.trtllm_attn else q.dtype,
+            )
+
+        if get_platform().is_sm70 and compress_ratio in (0, 1, 2):
+            from sglang.srt.layers.attention.dsv4.sm70_csa2 import (
+                sm70_forward_sparse,
+            )
+
+            # Ratio 0 still needs CSA2 rings packed before sparse.
+            # Hopper FlashMLA is not a SM70 fallback.
+            return sm70_forward_sparse(
+                self, q, layer, forward_batch, int(compress_ratio), attn_sink
+            )
+        if compress_ratio in (1, 2):
+            raise NotImplementedError(
+                "DeepSeek-V4.1 ratio-1/2 CSA2 decode/prefill is SM70-only "
+                "in this tree. Hopper/DeepGEMM stay gated off."
             )
 
         assert k is v, "DeepseekV4 shares k and v"

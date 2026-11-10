@@ -2063,6 +2063,9 @@ class Envs:
     # Unset: bf16 on SM100 (with bf16 head weights), fp32 elsewhere.
     SGLANG_OPT_DSV41_BF16_INDEX_LOGITS = EnvBool(None)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
+    # SM70 (V100) QSA: no-prefix prefill up to this many tokens attends densely with
+    # flash-attn-v100 instead of the latency-bound Triton gather (0 disables).
+    SGLANG_SM70_QSA_DENSE_PREFILL_MAX_TOKENS = EnvInt(8192)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
     # gfx950 DeepSeek-V4.1 prefill: attend with aiter's OPUS sparse kernel over a bf16
     # dequant of the chunk's SWA and compressed history, instead of the decode kernel.

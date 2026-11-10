@@ -212,8 +212,17 @@ class PagedIndexerMetadata:
     )
 
     def __post_init__(self):
+        from sglang.srt.runtime_context import get_platform
+
+        platform = get_platform()
+        deep_gemm_arch = (
+            platform.is_sm90 or platform.is_sm100 or platform.is_sm120 or _IS_SM120
+        )
         if (
-            is_hip() or is_xpu() or envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
+            is_hip()
+            or is_xpu()
+            or envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
+            or not deep_gemm_arch
         ) and not self.force_deep_gemm_metadata:
             self.deep_gemm_metadata = None
         else:
@@ -305,7 +314,11 @@ class PagedIndexerMetadata:
 
             assert isinstance(self.deep_gemm_metadata, (torch.Tensor, list))
 
-        if self.use_topk_v2:
+        # topk_v2 is a persistent thread-block cluster kernel (Hopper+).
+        topk_v2_arch = (
+            platform.is_sm90 or platform.is_sm100 or platform.is_sm120 or _IS_SM120
+        )
+        if self.use_topk_v2 and topk_v2_arch:
             from sglang.kernels.ops.attention.dsv4 import plan_topk_v2
 
             self.topk_metadata = plan_topk_v2(self.compressed_seq_lens)

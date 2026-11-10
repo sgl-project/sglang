@@ -50,7 +50,7 @@ def qsa_fast_topk(
         if topk == 512:
             # Prefer the JIT kernel: it ships with the sglang python package,
             # so top-k 512 works regardless of the installed sgl_kernel version.
-            from sglang.kernels.ops.attention.fast_topk import fast_topk
+            from sglang.srt.layers.elementwise.fast_topk import fast_topk
 
             return fast_topk(logits, lengths, topk=512, row_starts=starts)
 
@@ -61,10 +61,15 @@ def qsa_fast_topk(
             return top_k_module.fast_topk_v2(
                 logits, lengths, topk=topk, row_starts=starts
             )
-        raise ValueError(
-            f"QSA top-k {topk} is unsupported by sgl_kernel; "
-            f"supported values are {supported_topk}"
+        if topk != 512 or 2048 not in supported_topk:
+            raise ValueError(
+                f"QSA top-k {topk} is unsupported by sgl_kernel; "
+                f"supported values are {supported_topk}"
+            )
+        candidates = top_k_module.fast_topk_v2(
+            logits, lengths, topk=2048, row_starts=starts
         )
+        return _rerank_qsa_topk_candidates(logits, candidates, starts, topk)
 
     # CPU/reference path mirrors the CUDA operator's fixed-width, relative output.
     output = torch.full(
@@ -82,6 +87,23 @@ def qsa_fast_topk(
                 logits[row, start : start + length], width
             ).indices.to(torch.int32)
     return output
+
+
+def _rerank_qsa_topk_candidates(
+    logits: torch.Tensor,
+    candidates: torch.Tensor,
+    row_starts: torch.Tensor,
+    topk: int,
+) -> torch.Tensor:
+    """Rerank relative candidate indices with their original logits."""
+
+    valid = candidates >= 0
+    absolute = candidates.long() + row_starts.long().unsqueeze(1)
+    safe_absolute = absolute.clamp(min=0, max=max(logits.shape[1] - 1, 0))
+    scores = torch.gather(logits, 1, safe_absolute)
+    scores = scores.masked_fill(~valid, float("-inf"))
+    selected = torch.topk(scores, k=topk, dim=1).indices
+    return torch.gather(candidates, 1, selected).to(torch.int32)
 
 
 def torch_expand_qsa_block_indices(

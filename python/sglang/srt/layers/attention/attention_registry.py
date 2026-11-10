@@ -253,6 +253,7 @@ def create_triton_backend(runner):
         "Cross attention is not supported in the triton attention backend. "
         "Please use `--attention-backend flashinfer`."
     )
+
     from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 
     return TritonAttnBackend(runner)
@@ -266,6 +267,26 @@ def create_unlimited_ocr_v2_backend(runner):
     )
 
     return UnlimitedOCRV2AttnBackend(runner)
+
+
+@register_attention_backend("tilelang_fa_v100")
+def create_tilelang_fa_v100_backend(runner):
+    """Primary name for SGLang's self-contained SM70 TileLang backend."""
+    assert not runner.model_config.is_encoder_decoder, (
+        "Cross attention is not supported in the tilelang_fa_v100 backend."
+    )
+
+    from sglang.srt.layers.attention.flash_attn_v100_backend import (
+        FlashAttnV100Backend,
+    )
+
+    return FlashAttnV100Backend(runner)
+
+
+@register_attention_backend("flash_attn_v100")
+def create_flash_attn_v100_backend(runner):
+    """Compatibility alias for launch commands created before the rename."""
+    return create_tilelang_fa_v100_backend(runner)
 
 
 @register_attention_backend("torch_native")
@@ -555,6 +576,9 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
             linear_attn_backend = _create_linear_attention_backend(
                 runner, GDNAttnBackend
             )
+            # Qwen4-Exp is a hybrid of GDN linear-attention layers and sparse
+            # full-attention (QSA) layers, so its full-attn backend is replaced
+            # rather than left at the generic one picked above.
             from sglang.srt.layers.attention.qsa.config import is_qwen_qsa
 
             if is_qwen_qsa(runner.model_config.hf_config):

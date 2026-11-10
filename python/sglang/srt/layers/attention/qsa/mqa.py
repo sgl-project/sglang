@@ -1,11 +1,24 @@
-"""Weight-free TileLang MQA operators for the simple QSA indexer;
-the torch implementations are the fallback and the reference."""
+"""Weight-free TileLang MQA operators for the simple QSA indexer.
+
+The CUDA kernels are reduced versions of the previously validated Qwen MQA
+kernels: the per-head weight input and all unrelated feature branches are
+removed. Torch implementations are kept as the only fallback and reference.
+"""
 
 import functools
 import math
 from typing import Optional
 
 import torch
+from sglang.srt.utils import get_device_capability
+
+
+def _qsa_mqa_kernel_dtype(device: torch.device) -> str:
+    """SM70 tilelang MMA only supports FP16; newer archs use bf16."""
+    if device.type == "cuda" and get_device_capability(device.index)[0] < 8:
+        return "float16"
+    return "bfloat16"
+
 
 from sglang.srt.utils.device import is_hip
 
@@ -112,6 +125,7 @@ def torch_qsa_mqa_decode(
 # TileLang dtype names of the scoring-kernel operands. The logits stay fp32.
 _TILELANG_DTYPES = {
     torch.bfloat16: "bfloat16",
+    torch.float16: "float16",
     torch.float8_e4m3fn: "float8_e4m3fn",
 }
 
@@ -125,6 +139,8 @@ def _scoring_dtype(q: torch.Tensor, k: torch.Tensor) -> torch.dtype:
                 f"got q={q.dtype} k={k.dtype}"
             )
         return torch.float8_e4m3fn
+    if _qsa_mqa_kernel_dtype(q.device) == "float16":
+        return torch.float16
     return torch.bfloat16
 
 
@@ -156,6 +172,7 @@ if HAS_TILELANG:
             Logits: T.Tensor([rows, keys], T.float32),  # type: ignore
             Starts: T.Tensor([rows], T.int32),  # type: ignore
             Ends: T.Tensor([rows], T.int32),  # type: ignore
+            Scale: T.float32,
         ):
             with T.Kernel(T.ceildiv(rows, block_q), threads=threads) as bx:
                 q_shared = T.alloc_shared([block_q * heads, head_dim], dtype)
@@ -189,9 +206,9 @@ if HAS_TILELANG:
                         scores_3d[n, qi, head] = T.max(scores_3d[n, qi, head], 0.0)
                     T.reduce_sum(scores_3d, reduced, dim=-1, clear=True)
                     for qi, n in T.Parallel(block_q, block_n):
-                        Logits[row_base + qi, start_min + ni * block_n + n] = reduced[
-                            n, qi
-                        ]
+                        Logits[row_base + qi, start_min + ni * block_n + n] = (
+                            reduced[n, qi] / Scale
+                        )
 
         return kernel
 
@@ -312,8 +329,9 @@ if HAS_TILELANG:
         threads: int = 128,
         dtype: str = "bfloat16",
     ):
-        # The MMA layout needs 64 GEMM rows; a compressed page has full_page // ratio,
-        # so pages are packed as sub-pages of one 64-row tile.
+        # The validated MMA layout wants 64 GEMM rows; pages narrower than
+        # that (full_page // ratio compressed views) are packed in sub-page
+        # quadrants of one 64-row tile.
         GROUP = 64
         assert GROUP % page_size == 0, page_size
         sub_pages = GROUP // page_size
@@ -406,9 +424,10 @@ def tilelang_qsa_mqa_prefill(
     block_q = max(1, 128 // heads)
     padding = (-rows) % block_q
     padded_rows = rows + padding
-    # A torch.cat of the padding rows would copy the whole [rows, keys] fp32 matrix,
-    # doubling the dominant prefill buffer; allocate pre-padded instead.
-    logits = torch.zeros((padded_rows, keys), dtype=torch.float32, device=q.device)
+    # Allocate the padded output once. Appending even a few padding rows with
+    # torch.cat would allocate and copy the entire [rows, keys] FP32 matrix,
+    # temporarily doubling the dominant prefill buffer for long contexts.
+    logits = torch.empty((padded_rows, keys), dtype=torch.float32, device=q.device)
     scoring_dtype = _scoring_dtype(q, k)
     q_padded = q.to(scoring_dtype).contiguous()
     starts = row_starts.to(device=q.device, dtype=torch.int32).contiguous()
@@ -429,11 +448,11 @@ def tilelang_qsa_mqa_prefill(
         logits,
         starts,
         ends,
+        float(score_scale or math.sqrt(head_dim)),
     )
     # A leading-dimension slice that retains every column is already
     # contiguous, so do not copy this large matrix again when removing padding.
     logits = logits[:rows]
-    logits.div_(score_scale or math.sqrt(head_dim))
     _tilelang_qsa_mqa_mask_kernel()(logits, starts[:rows], ends[:rows])
     return logits
 
@@ -575,10 +594,13 @@ def tilelang_qsa_mqa_decode(
         raise RuntimeError("TileLang is unavailable")
     _validate_decode_inputs(q, k_cache, page_table, context_lens)
     page_size = int(k_cache.shape[1])
-    if page_size < 8 or 64 % page_size != 0:
+    # SM70 fork: the model's KV page is 16 and the QSA compress ratio is 4,
+    # so the compressed page is 4; sub-page packing supports any divisor of
+    # the 64-row GEMM tile (4/8/16/32/64).
+    if page_size < 4 or 64 % page_size != 0:
         raise ValueError(
             "TileLang QSA decode requires a compressed page size of "
-            f"8/16/32/64 (64-row GEMM sub-page packing), got {page_size}"
+            f"4/8/16/32/64 (64-row GEMM sub-page packing), got {page_size}"
         )
     if min_scored_len > 0:
         logits = torch.empty(
@@ -593,14 +615,16 @@ def tilelang_qsa_mqa_decode(
         )
     if not q.shape[0] or not max_model_len:
         return logits
-    # CUDA MMA accepts an eight-wide N dimension, while ROCm MFMA requires
-    # sixteen. Zero-padding preserves the weight-free head sum on both paths.
+    # CUDA MMA accepts an eight-wide N dimension. ROCm MFMA and the
+    # SM70 (V100) MMA path need sixteen. Zero-padding preserves the
+    # weight-free head sum. The kernel dtype is fp16 on SM70.
     query_heads, head_dim = q.shape[1:]
-    head_alignment = 16 if is_hip() else 8
-    kernel_heads = max(
-        head_alignment,
-        ((query_heads + head_alignment - 1) // head_alignment) * head_alignment,
+    align = (
+        16
+        if is_hip() or get_device_capability(q.device.index)[0] < 8
+        else 8
     )
+    kernel_heads = max(align, ((query_heads + align - 1) // align) * align)
     scoring_dtype = _scoring_dtype(q, k_cache)
     q_kernel = q.to(scoring_dtype)
     if kernel_heads != query_heads:
@@ -669,6 +693,28 @@ def qsa_mqa_decode(
     *,
     min_scored_len: int = 0,
 ) -> torch.Tensor:
+    if (
+        q.is_cuda
+        and get_device_capability(q.device.index) == (7, 0)
+        and q.dtype == torch.float16
+        and q.shape[0] > 0
+        and q.shape[1:] == (4, 128)
+        and k_cache.dtype == torch.float16
+        and k_cache.ndim == 4
+        and k_cache.shape[1:] == (4, 1, 128)
+    ):
+        from sglang.srt.layers.attention.tilelang_fa_v100._decode_cuda import (
+            sm70_cuda_qsa_indexer_decode,
+        )
+
+        return sm70_cuda_qsa_indexer_decode(
+            q,
+            k_cache,
+            page_table,
+            context_lens,
+            max_model_len,
+            score_scale or math.sqrt(q.shape[-1]),
+        )
     if q.is_cuda and HAS_TILELANG:
         return tilelang_qsa_mqa_decode(
             q,

@@ -191,7 +191,22 @@ def kpool_build_ragged_layout(
     return concat_page_table, q_ks, q_ke
 
 
-@triton.jit
+# Its inputs are slices of one packed int32 buffer, so pointer alignment and
+# the table width change per batch; one variant lets startup warmup load it.
+@triton.jit(
+    do_not_specialize=[
+        "full_page_table_ptr",
+        "cu_pages_excl_ptr",
+        "ragged_pool_pages_ptr",
+        "cu_q_len_excl_ptr",
+        "ragged_q_len_ptr",
+        "pooled_seq_lens_ptr",
+        "concat_page_table_ptr",
+        "q_ks_ptr",
+        "q_ke_ptr",
+        "MAX_POOL_PAGES",
+    ]
+)
 def _kpool_build_ragged_layout_kernel(
     full_page_table_ptr,
     cu_pages_excl_ptr,
@@ -928,6 +943,25 @@ def kpool_softmax_rotate_write_cache(
     return_compressed: bool = False,
     write_cache: bool = True,
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    if slot_k.is_cuda and torch.cuda.get_device_capability(slot_k.device) == (7, 0):
+        from sglang.kernels.ops.attention.kpool_sm70 import (
+            kpool_softmax_rotate_write_cache_sm70,
+        )
+
+        return kpool_softmax_rotate_write_cache_sm70(
+            pool,
+            buf,
+            slot_k,
+            slot_score,
+            ape,
+            loc,
+            write_mask,
+            round_scale,
+            return_compressed,
+            write_cache,
+            has_write_mask=write_mask is not None,
+        )
+
     assert slot_k.ndim == 3
     assert slot_score.shape == slot_k.shape
     assert ape.shape == slot_k.shape[1:]
@@ -1027,6 +1061,28 @@ def kpool_decode_update_and_maybe_write_cache(
     out_cache_loc: torch.Tensor,
     round_scale: bool = False,
 ) -> None:
+    if key.is_cuda and torch.cuda.get_device_capability(key.device) == (7, 0):
+        from sglang.kernels.ops.attention.kpool_sm70 import (
+            kpool_decode_update_and_maybe_write_cache_sm70,
+        )
+
+        kpool_decode_update_and_maybe_write_cache_sm70(
+            pool,
+            buf,
+            tail_k,
+            tail_score,
+            key,
+            slot_score,
+            ape,
+            block_tables,
+            req_pool_indices,
+            positions,
+            seq_lens,
+            out_cache_loc,
+            round_scale,
+        )
+        return
+
     assert tail_k.ndim == 3
     assert tail_score.shape == tail_k.shape
     assert tail_k.shape[1] == pool.index_kpool + pool.tail_extra_slots
@@ -1540,6 +1596,30 @@ def kpool_assemble_softmax_rotate_write_cache(
     round_scale: bool = False,
 ) -> None:
     kpool = pool.index_kpool
+    if chunk_k.is_cuda and torch.cuda.get_device_capability(chunk_k.device) == (7, 0):
+        from sglang.kernels.ops.attention.kpool_sm70 import (
+            kpool_assemble_softmax_rotate_write_cache_sm70,
+        )
+
+        kpool_assemble_softmax_rotate_write_cache_sm70(
+            pool,
+            buf,
+            chunk_k,
+            chunk_score,
+            tail_k,
+            tail_score,
+            req_pool_idx,
+            n_from_tail,
+            chunk_src_start,
+            tail_logical_base,
+            ape,
+            loc,
+            write_mask,
+            round_scale,
+            has_write_mask=write_mask is not None,
+        )
+        return
+
     n_pools = req_pool_idx.shape[0]
     if n_pools == 0:
         return
@@ -1602,6 +1682,22 @@ def scatter_kpool_tail_updates(
     n_write: torch.Tensor,
 ) -> None:
     kpool = pool.index_kpool
+    if chunk_k.is_cuda and torch.cuda.get_device_capability(chunk_k.device) == (7, 0):
+        from sglang.kernels.ops.attention.kpool_sm70 import scatter_kpool_tail_updates_sm70
+
+        scatter_kpool_tail_updates_sm70(
+            chunk_k,
+            chunk_score,
+            tail_k,
+            tail_score,
+            req_pool_idx,
+            dst_logical_start,
+            chunk_src_start,
+            n_write,
+            pool.index_kpool,
+        )
+        return
+
     n_rows = req_pool_idx.shape[0]
     if n_rows == 0:
         return
@@ -1931,6 +2027,29 @@ def kpool_write_tail_and_maybe_compress(
     assert tail_k.shape == tail_score.shape
     assert tail_k.shape[1] == pool.index_kpool + pool.tail_extra_slots
     assert tail_k.shape[2] == INDEX_HEAD_DIM
+    if key.is_cuda and torch.cuda.get_device_capability(key.device) == (7, 0):
+        from sglang.kernels.ops.attention.kpool_sm70 import (
+            kpool_write_tail_and_maybe_compress_sm70,
+        )
+
+        kpool_write_tail_and_maybe_compress_sm70(
+            pool,
+            buf,
+            key,
+            score,
+            tail_k,
+            tail_score,
+            ape,
+            req_pool_indices,
+            write_start,
+            tail_logical_start,
+            write_loc,
+            out_cache_loc,
+            num_draft_tokens,
+            round_scale,
+            effective_n_per_batch,
+        )
+        return
     assert key.dtype == torch.bfloat16
     assert score.dtype in KPOOL_SCORE_DTYPES
     assert tail_k.dtype == torch.bfloat16

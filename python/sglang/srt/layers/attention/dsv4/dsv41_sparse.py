@@ -23,8 +23,14 @@ from sglang.kernels.ops.quantization.fp4_fake_quant import (
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.runtime_context import get_platform
 from sglang.srt.speculative.ragged_verify import ragged_verify_token_rows
 from sglang.srt.utils import is_gfx95_supported
+
+
+def _param_dtype() -> torch.dtype:
+    """Hopper keeps these projections in bf16; SM70 has no bf16 compute."""
+    return torch.float16 if get_platform().is_sm70 else torch.bfloat16
 
 
 def _fused_dsv41_kernels(x: torch.Tensor) -> bool:
@@ -148,15 +154,15 @@ class DeepseekV41Compressor(nn.Module):
         self.use_fused_gate = compress_ratio > 1 and self.use_fused_compress
         if self.use_fused_gate:
             self.wkv_gate = nn.Linear(
-                hidden_size, 2 * head_dim, bias=False, dtype=torch.bfloat16
+                hidden_size, 2 * head_dim, bias=False, dtype=_param_dtype()
             )
         else:
             self.wkv = nn.Linear(
-                hidden_size, head_dim, bias=False, dtype=torch.bfloat16
+                hidden_size, head_dim, bias=False, dtype=_param_dtype()
             )
             if compress_ratio > 1:
                 self.wgate = nn.Linear(
-                    hidden_size, head_dim, bias=False, dtype=torch.bfloat16
+                    hidden_size, head_dim, bias=False, dtype=_param_dtype()
                 )
 
     def project(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -177,7 +183,7 @@ class DeepseekV41Compressor(nn.Module):
         return linear_bf16_fp32(x, self.wkv_gate.weight)
 
     def finish(self, kv: torch.Tensor) -> torch.Tensor:
-        return self.norm(kv.to(torch.bfloat16))
+        return self.norm(kv.to(self.norm.weight.dtype))
 
     @staticmethod
     def pool_pairs(kv2: torch.Tensor, score2: torch.Tensor) -> torch.Tensor:
@@ -232,14 +238,14 @@ class DeepseekV41Indexer(nn.Module):
             self.n_heads * self.index_head_dim,
             bias=False,
             quant_config=quant_config,
-            params_dtype=torch.bfloat16,
+            params_dtype=_param_dtype(),
             prefix=add_prefix("wq_b", prefix),
         )
         self.weights_proj = ReplicatedLinear(
             config.hidden_size,
             self.n_heads,
             bias=False,
-            params_dtype=torch.bfloat16,
+            params_dtype=_param_dtype(),
             quant_config=None,
             prefix=add_prefix("weights_proj", prefix),
         )
@@ -253,7 +259,7 @@ class DeepseekV41Indexer(nn.Module):
         )
         if self.owns_k:
             self.wk = nn.Linear(
-                head_dim, self.index_head_dim, bias=False, dtype=torch.bfloat16
+                head_dim, self.index_head_dim, bias=False, dtype=_param_dtype()
             )
             self.k_norm = RMSNorm(self.index_head_dim, config.rms_norm_eps)
             self.wk_small_max_m = _tiny_gemm_max_m(self.index_head_dim, head_dim)

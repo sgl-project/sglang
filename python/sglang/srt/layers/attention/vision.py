@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import logging
 import math
 import warnings
 from functools import lru_cache, partial
@@ -49,6 +50,8 @@ _is_npu = is_npu()
 _is_hip = is_hip()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_xpu = is_xpu()
+
+logger = logging.getLogger(__name__)
 
 if _is_cuda:
     from sglang.kernels.ops.attention.flash_attention import flash_attn_varlen_func
@@ -581,6 +584,150 @@ class VisionTritonAttention(nn.Module):
         )
 
         return output
+
+
+@functools.lru_cache(maxsize=1)
+def _load_flash_v100_varlen() -> Optional[Callable]:
+    """Import the optional ai-bond Flash-V100 varlen entry point once.
+
+    ``None`` means the package is absent -- or was built against another Torch
+    ABI -- so ``VisionFlashV100Attention`` must not be selected.
+    """
+    try:
+        from flash_attn_v100 import flash_attn_varlen_func
+    except Exception:  # pragma: no cover - optional dependency / ABI mismatch
+        return None
+    return flash_attn_varlen_func
+
+
+def flash_v100_vision_available() -> bool:
+    """Whether the optional SM70 FlashAttention vision kernel can serve this GPU.
+
+    The ViT CUDA-graph runner captures the in-tree backends only, and the kernel
+    itself is FP16/SM70-only, so anything else keeps the current backend.
+    """
+    if not _is_cuda or envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
+        return False
+    try:
+        if get_device_capability() != (7, 0):
+            return False
+    except Exception:  # pragma: no cover - driver/device query failures
+        return False
+    return _load_flash_v100_varlen() is not None
+
+
+class VisionFlashV100Attention(nn.Module):
+    """Non-causal varlen attention using the optional SM70 FlashAttention build.
+
+    Selected by ``SGLANG_SM70_VISION_ATTENTION`` or
+    ``--mm-attention-backend fa2_v100``. The kernel runs FP16 on V100 and accepts
+    16/32/64/128/256-wide heads only, so Qwen3.8's 72-wide vision heads are
+    zero-padded to 128 (zero padding preserves the dot products) while the
+    softmax keeps the scale of the original width, and the output is cropped.
+    """
+
+    def __init__(
+        self,
+        **kwargs,
+    ):
+        super().__init__()
+        if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
+            raise ValueError(
+                "fa2_v100 vision attention requires eager vision execution"
+            )
+        varlen = _load_flash_v100_varlen()
+        if varlen is None:
+            raise ImportError(
+                "fa2_v100 vision attention requires the optional flash_attn_v100 "
+                "package; install it or keep the in-tree vision backend"
+            )
+
+        self.varlen = varlen
+        self.scale = kwargs.get("softmax_scale")
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cu_seqlens: torch.Tensor | SingletonCache | None,
+        bsz: int,
+        seq_len: int,
+        softmax_scale: Optional[float] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        r"""
+        Args:
+            cu_seqlens: [b]
+        Returns:
+             [b * s, h, head_size]
+        """
+        if (
+            not q.is_cuda
+            or q.dtype != torch.float16
+            or k.dtype != q.dtype
+            or v.dtype != q.dtype
+            or torch.cuda.get_device_capability(q.device) != (7, 0)
+        ):
+            raise ValueError("fa2_v100 vision attention requires SM70 and FP16 Q/K/V")
+        if kwargs.get("s_aux") is not None or kwargs.get("attention_mask") is not None:
+            raise ValueError(
+                "fa2_v100 does not support attention sinks or arbitrary masks"
+            )
+        if (
+            q.ndim != 3
+            or k.ndim != 3
+            or v.ndim != 3
+            or not (q.shape[0] == k.shape[0] == v.shape[0])
+        ):
+            raise ValueError(
+                "fa2_v100 vision attention requires packed self-attention Q/K/V"
+            )
+        if q.shape[0] == 0:
+            return torch.empty_like(q)
+        head_dim = q.shape[-1]
+        if (
+            not (0 < head_dim <= 256)
+            or k.shape[-1] != head_dim
+            or v.shape[-1] != head_dim
+        ):
+            raise ValueError(
+                "fa2_v100 requires matching Q/K/V head dimensions up to 256"
+            )
+        scale = softmax_scale if softmax_scale is not None else self.scale
+        if scale is None:
+            scale = head_dim**-0.5
+        padded_dim = next(d for d in (16, 32, 64, 128, 256) if d >= head_dim)
+        if padded_dim != head_dim:
+            # Qwen3.8 vision uses 72-wide heads. Zero padding preserves its
+            # dot products; the scale must still use the original dimension.
+            q, k, v = [F.pad(t, (0, padded_dim - head_dim)) for t in (q, k, v)]
+        forward_metadata = kwargs.get("forward_metadata")
+        if forward_metadata is not None:
+            # The encoder computes the segment metadata once before its layer
+            # loop; reusing it keeps this path free of per-layer syncs.
+            lengths = forward_metadata.cu_seqlens
+            max_length = forward_metadata.max_seqlen
+        else:
+            lengths = resolve_seqlens(cu_seqlens, bsz, seq_len, device=q.device)
+            max_length = resolve_precomputed_max_seqlen(
+                lengths, kwargs.get("max_seqlen")
+            )
+        lengths = lengths.to(device=q.device, dtype=torch.int32).contiguous()
+        output = self.varlen(
+            q,
+            k,
+            v,
+            cu_seqlens_q=lengths,
+            cu_seqlens_k=lengths,
+            max_seqlen_q=max_length,
+            max_seqlen_k=max_length,
+            dropout_p=0.0,
+            softmax_scale=scale,
+            causal=False,
+            window_size=kwargs.get("window_size", (-1, -1)),
+        )
+        return output[..., :head_dim].contiguous()
 
 
 class VisionFlash3Attention(nn.Module):
@@ -1120,6 +1267,7 @@ class VisionIntelXPUAttention(nn.Module):
 
 QKV_BACKEND_IMPL = {
     "triton_attn": VisionTritonAttention,
+    "fa2_v100": VisionFlashV100Attention,
     "sdpa": VisionSdpaAttention,
     "fa3": VisionFlash3Attention,
     "fa4": VisionFlash4Attention,
@@ -1349,7 +1497,8 @@ class VisionAttention(nn.Module):
     def _determine_attention_backend(self, passed_backend: Optional[str]) -> str:
         """Decide the multimodal attention backend string.
 
-        Priority: server args override > constructor arg > platform default.
+        Priority: server args override > constructor arg > SM70 vision opt-in >
+        platform default.
 
         Platform defaults:
         - CUDA (Hopper SM90): "fa3"
@@ -1357,7 +1506,38 @@ class VisionAttention(nn.Module):
         - CUDA (other): "triton_attn"
         - Ascend NPU: "ascend_attn"
         - Other platforms: device-specific optimized backend or "sdpa"
+
+        ``SGLANG_SM70_VISION_ATTENTION`` only replaces the platform default; an
+        explicit backend (server args or model) still wins. When the optional
+        ``flash_attn_v100`` package is missing, or vision runs under its CUDA
+        graph, the platform default is kept unchanged.
         """
+
+        def platform_default() -> str:
+            if is_cuda():
+                major, _ = get_device_capability()
+                if major == 9:
+                    return "fa3"
+                elif major == 10:
+                    return "fa4"
+                else:
+                    return "triton_attn"
+            elif _is_npu:
+                return "ascend_attn"
+            elif _is_musa:
+                if get_device_capability() >= (3, 1):
+                    return "fa3"
+                return "triton_attn"
+            elif _is_hip:
+                if get_device_capability() >= (9, 4) and _use_aiter:
+                    return "aiter_attn"
+                return "triton_attn"
+            elif _is_cpu and _is_cpu_amx_available:
+                return "amx_attn"
+            elif _is_xpu:
+                return "xpu_attn"
+            return "sdpa"
+
         try:
             override_backend = get_mm().mm_attention_backend
         except ValueError:
@@ -1366,36 +1546,33 @@ class VisionAttention(nn.Module):
             ):
                 raise
             override_backend = None
+
         if override_backend is not None:
             backend = override_backend
         elif passed_backend is not None:
             backend = passed_backend
-        elif is_cuda():
-            major, _ = get_device_capability()
-            if major == 9:
-                backend = "fa3"
-            elif major == 10:
-                backend = "fa4"
+        elif envs.SGLANG_SM70_VISION_ATTENTION.get():
+            if flash_v100_vision_available():
+                backend = "fa2_v100"
             else:
-                backend = "triton_attn"
-        elif _is_npu:
-            backend = "ascend_attn"
-        elif _is_musa:
-            if get_device_capability() >= (3, 1):
-                backend = "fa3"
-            else:
-                backend = "triton_attn"
-        elif _is_hip:
-            if get_device_capability() >= (9, 4) and _use_aiter:
-                backend = "aiter_attn"
-            else:
-                backend = "triton_attn"
-        elif _is_cpu and _is_cpu_amx_available:
-            backend = "amx_attn"
-        elif _is_xpu:
-            backend = "xpu_attn"
+                backend = platform_default()
+                logger.info_once(
+                    "SGLANG_SM70_VISION_ATTENTION is set but the optional "
+                    "flash_attn_v100 vision kernel is unavailable (install it, or "
+                    "drop ViT CUDA graphs on SM70); keeping %s.",
+                    backend,
+                )
         else:
-            backend = "sdpa"
+            backend = platform_default()
+
+        if backend == "fa2_v100" and not flash_v100_vision_available():
+            fallback = platform_default()
+            logger.info_once(
+                "Multimodal backend fa2_v100 needs the optional flash_attn_v100 "
+                "package on an SM70 GPU with eager vision execution; using %s.",
+                fallback,
+            )
+            backend = fallback
         if backend == "fa3" and get_platform().is_blackwell:
             raise ValueError("The 'fa3' backend is not supported on Blackwell GPUs")
 
