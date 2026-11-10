@@ -3,11 +3,17 @@
 import unittest
 from queue import Queue
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
+from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
+from sglang.srt.mem_cache.unified_radix_cache import (
+    UnifiedRadixCache,
+    _OngoingPrefetch,
+    _StoragePrefetchWait,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -23,6 +29,10 @@ class TestUnifiedPPSyncBatching(unittest.TestCase):
         cache.pp_rank = pp_rank
         cache.pp_size = 2
         cache.host_memory_mode = "cache"
+        # The per-tick deadline vote runs under storage; no live prefetch
+        # means it issues no collective, which the asserts below pin.
+        cache.prefetch_stop_policy = "timeout"
+        cache.ongoing_prefetch = {}
         cache.enable_storage_metrics = False
         cache.storage_metrics_collector = None
         cache.buffer_pipeline = None
@@ -47,6 +57,79 @@ class TestUnifiedPPSyncBatching(unittest.TestCase):
             ],
         )
         return cache
+
+    def _arm_live_prefetch(self, cache):
+        """Cache-mode storage with one live prefetch on this PP stage."""
+        cache.tree_core.enable_storage = True
+        cache._drain_storage_control_queues_impl = MagicMock()
+        cache.storage_prefetch_retries = StoragePrefetchRetries()
+        cache._storage_prefetch_wait = {}
+        cc = cache.cache_controller
+        for name in (
+            "prefetch_hit_queue",
+            "ack_prefetch_queue",
+            "ack_backup_queue",
+            "host_mem_release_queue",
+        ):
+            setattr(cc, name, Queue())
+        cc.extra_host_mem_release_queues = {}
+        cc.terminate_prefetch = MagicMock()
+        handle = CacheRequestHandle("r", 0)
+        operation = SimpleNamespace(
+            handle=handle,
+            deadline_expired=False,
+            host_indices=None,
+            hash_value=[],
+            completed_tokens=0,
+        )
+        cache.ongoing_prefetch[handle] = _OngoingPrefetch(
+            0, None, None, operation, None, {}
+        )
+        return handle, operation
+
+    def test_pp_relays_the_deadline_vote_after_the_counts(self):
+        """PP0 evaluates the clocks and votes; a follower contributes zeros,
+        receives the verdict through the same tag after the counts, and marks
+        and terminates the operation without reading its own clock."""
+        leader = self._make_cache(0, [True], [True])
+        handle, operation = self._arm_live_prefetch(leader)
+        wait = _StoragePrefetchWait(timeout_s=1.0)
+        with patch("time.perf_counter", return_value=100.0):
+            wait.timer.observe(ready=False)
+        leader._storage_prefetch_wait[handle] = wait
+        with patch("time.perf_counter", return_value=103.0):
+            leader.check_hicache_events()
+
+        counts, vote = leader._all_reduce.call_args_list
+        self.assertIs(counts.args[1], torch.distributed.ReduceOp.MIN)
+        self.assertEqual(vote.args[0].tolist(), [1])
+        self.assertIs(vote.args[1], torch.distributed.ReduceOp.MAX)
+        self.assertTrue(wait.expired)
+        self.assertTrue(operation.deadline_expired)
+        leader.cache_controller.terminate_prefetch.assert_called_once_with(operation)
+
+        follower = self._make_cache(1, [True], [True])
+        handle, operation = self._arm_live_prefetch(follower)
+        follower._prefetch_deadline_expired = MagicMock()
+        relayed = []
+
+        def relay_from_pp0(data, _):
+            relayed.append(data.tolist())
+            if len(relayed) == 1:
+                data[0], data[1] = 1, 1  # counts; digest slots stay local
+            else:
+                data.fill_(1)  # PP0's verdict
+
+        follower._all_reduce.side_effect = relay_from_pp0
+        follower.check_hicache_events()
+
+        self.assertEqual(relayed[1], [0])
+        self.assertEqual(follower._all_reduce.call_count, 2)
+        follower._prefetch_deadline_expired.assert_not_called()
+        self.assertTrue(follower._storage_prefetch_wait[handle].expired)
+        self.assertTrue(operation.deadline_expired)
+        follower.cache_controller.terminate_prefetch.assert_called_once_with(operation)
+        follower.writing_check.assert_called_once_with(finish_count=1)
 
     def test_pp_batches_write_and_load_counts_once(self):
         leader = self._make_cache(0, [True, False], [True, True])
