@@ -5,7 +5,7 @@ causal (target-verify) path. These tests check:
   (a) numerical parity with ``extend_attention_fwd`` on the pure-causal path
       (the operative case at topk=1), across head dims / GQA ratios / prefix
       lengths / extend lengths / KV scales / attention sinks / fp8 KV buffers /
-      splits left without keys;
+      splits left without keys / an empty prefix;
   (b) ``can_handle()`` rejects cases the kernel cannot serve bit-equivalently
       (non-causal, sliding-window, logit-cap, ragged extend, mis-shaped
       sinks), so the backend falls back to ``extend_attention_fwd``.
@@ -273,6 +273,10 @@ class TestVerifySplitKV(CustomTestCase):
         stale NaN in their scratch must not reach the output."""
         # At 16 splits of at least 32 keys, 15 and 5 splits get no keys here.
         self._run_parity([4, 700], poisoned_n_splits=16)
+
+    def test_numerics_empty_prefix(self):
+        """A sequence with no prefix keys attends to its draft keys only."""
+        self._run_parity([0, 700])
 
     # --- fallback: can_handle() must reject what the kernel can't serve --------
     # (topk>1 is gated off in the backend, not here -- can_handle never inspects
