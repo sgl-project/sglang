@@ -5,6 +5,7 @@ export const InternS2PreviewDeployment = () => {
       title: 'Hardware Platform',
       items: [
         { id: 'h200', label: 'H200', default: true },
+        { id: 'xeon', label: 'XEON', default: false },
       ],
     },
     reasoning: {
@@ -64,10 +65,32 @@ export const InternS2PreviewDeployment = () => {
   }, []);
 
   const handleRadioChange = (optionName, value) => {
-    setValues((prev) => ({ ...prev, [optionName]: value }));
+    setValues((prev) => {
+      if (prev.hardware === 'xeon' && optionName !== 'hardware') return prev;
+      const next = { ...prev, [optionName]: value };
+      if (optionName === 'hardware' && value === 'xeon') {
+        next.reasoning = 'disabled';
+        next.toolcall = 'disabled';
+        next.mtp = 'disabled';
+      }
+      return next;
+    });
   };
 
   const generateCommand = () => {
+    if (values.hardware === 'xeon') {
+      return `SGLANG_USE_CPU_ENGINE=1 sglang serve \\
+  --model internLM/Intern-S2-Preview \\
+  --device cpu \\
+  --disable-overlap-schedule \\
+  --revision 4f57cab513689b089019fce4ad24e26520df183c \\
+  --trust-remote-code \\
+  --tp 4 \\
+  --dtype bfloat16 \\
+  --max-total-tokens 8192 \\
+  --host 0.0.0.0 \\
+  --port 30000`;
+    }
     const { reasoning, toolcall, mtp } = values;
     const tpValue = 8;
 
@@ -147,13 +170,19 @@ export const InternS2PreviewDeployment = () => {
           <div style={itemsStyle}>
             {option.items.map((item) => {
               const isChecked = values[option.name] === item.id;
+              const isDisabled = values.hardware === 'xeon' && key !== 'hardware';
               return (
-                <label key={item.id} style={{ ...labelBaseStyle, ...(isChecked ? checkedStyle : {}) }}>
+                <label
+                  key={item.id}
+                  title={isDisabled ? 'Only basic text generation has been validated on Intel Xeon CPUs; parsers and MTP are not enabled.' : undefined}
+                  style={{ ...labelBaseStyle, ...(isChecked ? checkedStyle : {}), ...(isDisabled ? { opacity: 0.5, cursor: 'not-allowed' } : {}) }}
+                >
                   <input
                     type="radio"
                     name={option.name}
                     value={item.id}
                     checked={isChecked}
+                    disabled={isDisabled}
                     onChange={() => handleRadioChange(option.name, item.id)}
                     style={{ display: 'none' }}
                   />
