@@ -563,6 +563,7 @@ POSITIONAL_FIELD_ORDER = (
     "paged_experts_enable_disk",
     "disable_normalize_embedding",
     "log_schedule_decisions",
+    "speculative_dspark_lm_head_dtype",
     "mm_admission_timeout_ms",
 )
 # fmt: on
