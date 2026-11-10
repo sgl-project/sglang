@@ -304,6 +304,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
     _MQA_LOGITS_MAX_BYTES_ROCM = MQA_LOGITS_MAX_BYTES_ROCM
     # Index-K bytes per token: 128 FP8 values and one FP32 scale.
     _HEAD_DIM_WITH_SF = 132
+    # the gfx950 monokernel's fused histogram top-k workspace; None elsewhere
+    _hist_topk = None
     # One measured budget per device for the process lifetime.
     _mqa_logits_budget_bytes: Dict[int, int] = {}
 
@@ -1633,8 +1635,19 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 )
             return torch.cat(logits_chunks, dim=0)
 
-        if _use_aiter_preshuffle and dsa_indexer_hip.verify_shares_index_k(
-            forward_batch, q_fp8, block_tables, page_size, q_offset, B, next_n, dcp_size
+        if (
+            _use_aiter
+            and _use_aiter_preshuffle
+            and dsa_indexer_hip.verify_shares_index_k(
+                forward_batch,
+                q_fp8,
+                block_tables,
+                page_size,
+                q_offset,
+                B,
+                next_n,
+                dcp_size,
+            )
         ):
             logits = dsa_indexer_hip.verify_paged_mqa_logits(
                 forward_batch,
