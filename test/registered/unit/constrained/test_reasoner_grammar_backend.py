@@ -1106,9 +1106,12 @@ class TestImplicitToolStartOnRealBackends(CustomTestCase):
         compiled = xgr.GrammarCompiler(info).compile_regex(regex)
         return XGrammarGrammar(xgr.GrammarMatcher(compiled), 5, compiled, None)
 
-    def _wrap(self, inner):
+    def _wrap(self, inner, token_filter_fn=None):
         wrapper = ReasonerGrammarObject(
-            inner, think_end_ids=[self.THINK_END], tool_start_ids=[self.TOOL]
+            inner,
+            think_end_ids=[self.THINK_END],
+            tool_start_ids=[self.TOOL],
+            token_filter_fn=token_filter_fn,
         )
         wrapper.maybe_init_reasoning(True)
         return wrapper
@@ -1163,6 +1166,78 @@ class TestImplicitToolStartOnRealBackends(CustomTestCase):
                 self.assertTrue(
                     wrapper.grammar.try_accept_tokens([self.LBRACE, self.RBRACE])
                 )
+
+    def _xgrammar_reasoner(self, regex):
+        reasoner = ReasonerGrammarBackend(
+            XGrammarGrammarBackend(self.hf_tokenizer, 5),
+            SimpleNamespace(detector=Qwen3Detector(force_reasoning=True)),
+            self.hf_tokenizer,
+        )
+        return reasoner._init_value_dispatch(("regex", regex), True)
+
+    def _constrained_tokens(self, wrapper, tokens):
+        """Tokens the inner grammar constrains when `tokens` are generated, or None
+        if the thinking-phase mask rejects one; the inner grammar checks the rest."""
+        constrained = None
+        for token in tokens:
+            was_thinking = wrapper._is_thinking()
+            if was_thinking:
+                mask = wrapper.allocate_vocab_mask(5, 1, "cpu")
+                wrapper.fill_vocab_mask(mask, 0)
+                if mask.dtype == torch.bool:
+                    allowed = not bool(mask[0, token])
+                else:
+                    allowed = bool((int(mask[0, token // 32]) >> (token % 32)) & 1)
+                if not allowed:
+                    return None
+            wrapper.accept_token(token)
+            if constrained is not None:
+                constrained.append(token)
+            elif was_thinking and wrapper._is_generation():
+                # A tool marker belongs to the constraint; the think end does not.
+                constrained = [] if token == self.THINK_END else [token]
+        return constrained
+
+    def test_generated_output_splits_where_the_grammar_released_it(self):
+        """Whatever the masks let a request generate, the reasoning parser's
+        content is exactly the text the constraint governed. A marker the
+        constraint cannot start with would end reasoning in the parser while the
+        grammar kept it as reasoning, so it must not be generated while thinking;
+        one the constraint accepts still ends reasoning on both sides."""
+        from sglang.srt.constrained.llguidance_backend import GuidanceBackend
+        from sglang.srt.constrained.outlines_backend import OutlinesGrammarBackend
+
+        wrappers = {
+            "xgrammar": self._xgrammar_reasoner,
+            "llguidance": lambda regex: self._wrap(
+                self._llguidance(regex), GuidanceBackend.set_token_filter
+            ),
+            "outlines": lambda regex: self._wrap(
+                self._outlines(regex), OutlinesGrammarBackend.set_token_filter
+            ),
+        }
+        tool, end, lbrace, rbrace = self.TOOL, self.THINK_END, self.LBRACE, self.RBRACE
+        text = {tool: "<tool_call>", end: "</think>", lbrace: "{", rbrace: "}"}
+        cases = (
+            (r"\{\}", [tool, end, lbrace, rbrace], False),
+            (r"\{\}", [end, lbrace, rbrace], True),
+            (r"<tool_call>\{\}", [tool, lbrace, rbrace], True),
+            (r"<tool_call>\{\}", [end, tool, lbrace, rbrace], True),
+        )
+        for name, make_wrapper in wrappers.items():
+            for regex, tokens, generated in cases:
+                with self.subTest(backend=name, regex=regex, tokens=tokens):
+                    constrained = self._constrained_tokens(make_wrapper(regex), tokens)
+                    self.assertEqual(constrained is not None, generated)
+                    if constrained is None:
+                        continue
+                    parsed = Qwen3Detector(force_reasoning=True).detect_and_parse(
+                        "".join(text[token] for token in tokens)
+                    )
+                    self.assertEqual(
+                        parsed.normal_text,
+                        "".join(text[token] for token in constrained),
+                    )
 
 
 class TestReasonerGrammarObjectRollback(CustomTestCase):

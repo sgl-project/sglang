@@ -155,6 +155,16 @@ class OutlinesGrammarBackend(BaseGrammarBackend):
             )
         self.whitespace_pattern = whitespace_pattern
 
+    @staticmethod
+    def set_token_filter(
+        vocab_mask, token_ids, batch_idx, is_allowed=True, reset_vocab_mask=True
+    ):
+        # True masks a token out in this backend's boolean mask.
+        row = vocab_mask[batch_idx]
+        if reset_vocab_mask:
+            row.fill_(is_allowed)
+        row[token_ids] = not is_allowed
+
     def _compile_regex(self, regex: str) -> BaseGrammarObject:
         try:
             if hasattr(RegexGuide, "from_regex"):

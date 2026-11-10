@@ -93,6 +93,7 @@ class ReasonerGrammarObject(BaseGrammarObject):
         # Unlike </think>, a tool-start marker belongs to the inner grammar.
         # Track the replay separately from tokens emitted after the boundary.
         self._tool_start_prefix_len = 0
+        self._tool_start_rejected: Optional[bool] = None
 
     def maybe_init_reasoning(self, reasoning: bool):
         self._matched_think_end_tokens = 0
@@ -210,6 +211,22 @@ class ReasonerGrammarObject(BaseGrammarObject):
             or self.grammar is None
             or self.grammar.try_accept_tokens(list(self.tool_start_ids))
         )
+
+    def _can_complete_rejected_tool_start(self) -> bool:
+        if (
+            self._tool_start_matcher is None
+            or self.reasoning_in_grammar
+            or self.grammar is None
+            or self._matched_tool_start_tokens != len(self.tool_start_ids) - 1
+        ):
+            return False
+        if self._tool_start_rejected is None:
+            # While thinking the inner grammar has consumed nothing, so a copy
+            # probes its start state without touching it.
+            self._tool_start_rejected = not self.grammar.copy().try_accept_tokens(
+                list(self.tool_start_ids)
+            )
+        return self._tool_start_rejected
 
     def rollback_state(self):
         if self._is_thinking():
@@ -329,22 +346,31 @@ class ReasonerGrammarObject(BaseGrammarObject):
                 self._filter_reasoning_in_grammar(vocab_mask, idx)
             return
         if self._is_thinking():
-            if not self.enable_token_filter:
-                return
-            if self._can_think_more():
-                if self.think_excluded_token_ids is not None:
+            if self.enable_token_filter:
+                if self._can_think_more():
+                    if self.think_excluded_token_ids is not None:
+                        self._do_token_filter(
+                            vocab_mask,
+                            self.think_excluded_token_ids,
+                            idx,
+                            is_allowed=False,
+                        )
+                else:
                     self._do_token_filter(
                         vocab_mask,
-                        self.think_excluded_token_ids,
+                        [self.think_end_ids[self._matched_think_end_tokens]],
                         idx,
-                        is_allowed=False,
+                        is_allowed=True,
                     )
-            else:
-                self._do_token_filter(
+            if self._can_complete_rejected_tool_start():
+                # The reasoning parser ends reasoning at the marker, but a constraint
+                # that cannot start with it would keep it as reasoning here.
+                self.token_filter_fn(
                     vocab_mask,
-                    [self.think_end_ids[self._matched_think_end_tokens]],
+                    [self.tool_start_ids[-1]],
                     idx,
-                    is_allowed=True,
+                    is_allowed=False,
+                    reset_vocab_mask=False,
                 )
             return
         if self._is_generation() and self.grammar is not None:
@@ -392,6 +418,7 @@ class ReasonerGrammarObject(BaseGrammarObject):
         new_obj._matched_tool_start_tokens = self._matched_tool_start_tokens
         new_obj._tool_start_match_history = list(self._tool_start_match_history)
         new_obj._tool_start_prefix_len = self._tool_start_prefix_len
+        new_obj._tool_start_rejected = self._tool_start_rejected
         new_obj._finished = self._finished
         new_obj.current_token = self.current_token
         new_obj.reasoning_in_grammar = self.reasoning_in_grammar
@@ -492,9 +519,7 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
                 "support token filtering. Use a grammar backend that supports token "
                 "filtering (e.g., xgrammar) or disable strict reasoning mode."
             )
-        self._token_filter_fn = (
-            self.grammar_backend.set_token_filter if self.enable_token_filter else None
-        )
+        self._token_filter_fn = self.grammar_backend.set_token_filter
 
     def _get_think_excluded_token_ids(
         self,
