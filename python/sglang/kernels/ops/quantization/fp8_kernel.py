@@ -598,7 +598,9 @@ def _run_per_token_group_quant_8bit_kernel(
         scale_ue8m0
         and x_s.dtype == torch.float32
         and not (
-            x.dtype == torch.bfloat16
+            # The trait kernel (per_token_group_quant) is CUDA-only JIT; ROCm stays on v2.
+            _is_cuda
+            and x.dtype == torch.bfloat16
             and x.ndim == 2
             and x_s.is_contiguous()
             and x_q.dtype == fp8_dtype
