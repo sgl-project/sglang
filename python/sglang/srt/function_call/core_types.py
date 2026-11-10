@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from typing import Callable, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 
 class ToolCallItem(BaseModel):
@@ -10,7 +10,6 @@ class ToolCallItem(BaseModel):
     tool_index: int
     name: Optional[str] = None
     parameters: str  # JSON string
-    source_text: Optional[str] = Field(default=None, exclude=True)
 
 
 class StreamingParseResult(BaseModel):

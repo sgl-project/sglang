@@ -19,7 +19,6 @@ from sglang.srt.function_call.kimik3_format import (
     ARGUMENT_CLOSE,
     CALL_CLOSE,
     MESSAGE_CLOSE,
-    RESPONSE_CLOSE,
     THINK_CLOSE,
     TOOLS_CLOSE,
     TOOLS_OPEN,
@@ -99,19 +98,12 @@ def _tools_section(*calls):
     return TOOLS_OPEN + "".join(calls) + TOOLS_CLOSE
 
 
-def _grammar(
-    tools,
-    tool_choice="auto",
-    thinking_mode=False,
-    parallel_tool_calls=True,
-    response_channel_open=False,
-):
+def _grammar(tools, tool_choice="auto", thinking_mode=False, parallel_tool_calls=True):
     structural_tag = get_kimik3_structural_tag(
         tools,
         tool_choice=tool_choice,
         thinking_mode=thinking_mode,
         parallel_tool_calls=parallel_tool_calls,
-        response_channel_open=response_channel_open,
     )
     return xgr.Grammar.from_structural_tag(structural_tag)
 
@@ -209,34 +201,6 @@ def test_required_allows_response_prefix_but_requires_tools():
     response = "<|open|>response<|sep|>Checking.<|close|>response<|sep|>"
 
     assert _accepts(grammar, response + _tools_section(_valid_weather_call()))
-    assert not _accepts(grammar, response)
-
-
-def test_required_inside_an_open_response_channel_must_close_it_first():
-    """With reasoning off the generation prompt leaves the response channel open.
-
-    Free text there is a trap: the model answers in that channel, never reaches
-    the tools section the grammar still requires, and so cannot stop either --
-    generation runs to max_tokens with no tool call.
-    """
-    grammar = _grammar([_tool()], tool_choice="required", response_channel_open=True)
-    call = _tools_section(_valid_weather_call())
-
-    assert _accepts(grammar, RESPONSE_CLOSE + call)
-    assert not _accepts(grammar, "Checking." + RESPONSE_CLOSE + call)
-    assert not _accepts(grammar, call)
-    assert not _accepts(grammar, RESPONSE_CLOSE)
-
-
-def test_required_without_an_open_response_channel_is_unchanged():
-    """Reasoning on: the model closes think itself, and a complete response block
-    before the call stays legitimate."""
-    grammar = _grammar([_tool()], tool_choice="required", response_channel_open=False)
-    response = "<|open|>response<|sep|>Checking.<|close|>response<|sep|>"
-    call = _tools_section(_valid_weather_call())
-
-    assert _accepts(grammar, response + call)
-    assert _accepts(grammar, call)
     assert not _accepts(grammar, response)
 
 
@@ -432,8 +396,6 @@ def _accepts_value(grammar, value):
 
 
 def test_strict_schema_resolves_refs_into_the_root_structure():
-    """Each argument compiles as its own schema, so refs into the root's
-    properties (kvv TestReferences) must still resolve there."""
     sibling = _grammar(
         [
             _value_tool(
@@ -468,7 +430,6 @@ def test_strict_schema_resolves_refs_into_the_root_structure():
     assert _accepts_value(items, '{"list":["a"],"one":"b"}')
     assert not _accepts_value(items, '{"one":2}')
 
-    # A ref chain through both a definition pool and the root structure.
     chained = _grammar(
         [
             _value_tool(
@@ -590,8 +551,6 @@ def test_strict_schema_handles_one_sided_negative_integer_minimum():
 
 
 def test_strict_schema_relaxes_non_ascii_property_names():
-    """A declared non-ASCII property name is unsatisfiable in xgrammar, so the
-    argument falls back to the bare type instead of an impossible grammar."""
     key = "abc\U0001f60a"
     tool = Tool(
         type="function",

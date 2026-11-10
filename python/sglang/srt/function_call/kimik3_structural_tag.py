@@ -326,11 +326,8 @@ def _restrict_schema_type(
 
 
 _PROPERTY_NAME_KEYWORDS = ("properties", "patternProperties", "dependentSchemas")
-# Definition pools are only reachable through a $ref, which the walk follows, so
-# scanning them directly would let an unreferenced definition speak for the whole
-# schema. Literal keywords hold values, not property names: a non-ASCII enum or
-# const compiles fine (only its \u-escaped spelling is refused, and models emit
-# raw UTF-8), so they are not a source of unsatisfiable grammars.
+# Definitions count only through a $ref, which the walk follows; literal keywords
+# hold values, and a non-ASCII value compiles fine.
 _NON_PROPERTY_KEYWORDS = (
     "$defs",
     "definitions",
@@ -347,18 +344,10 @@ def _declares_non_ascii_property(
     depth: int = 0,
     seen_refs: Optional[Set[str]] = None,
 ) -> bool:
-    """Does this schema declare a property name xgrammar cannot express?
+    """Whether a schema reachable from here declares a non-ASCII property name.
 
-    XGrammar builds a literal matcher for each declared property name and clamps
-    it to ASCII, so an object schema naming a non-ASCII property (an emoji or CJK
-    key) compiles to a grammar that rejects every instance -- a forced tool call
-    on it can only fail. Drop back to the bare type constraint for that argument
-    instead: an unconstrained object still admits the key, raw or escaped.
-
-    Only what this argument can actually reach counts. ``_restrict_schema_type``
-    copies the root ``$defs`` onto every argument, so walking them blindly would
-    strip the constraints off every argument of the tool because of one key in a
-    definition none of them reference.
+    XGrammar clamps property-name literals to ASCII, so such a schema compiles
+    to a grammar that rejects every instance.
     """
     if depth > 64 or not isinstance(schema, (dict, list)):
         return False
@@ -776,16 +765,7 @@ def get_kimik3_structural_tag(
     tool_choice: Union[ToolChoice, Literal["auto", "required", "none"]] = "auto",
     thinking_mode: bool = False,
     parallel_tool_calls: bool = True,
-    response_channel_open: bool = False,
 ) -> StructuralTag:
-    """Build the K3 tool-call constraint.
-
-    ``response_channel_open`` says the generation prompt already opened the
-    response channel, which is what the encoder emits when thinking is off. It
-    decides how a forced call reaches the tools section: from inside an open
-    response channel the model must close it first, otherwise the tools section
-    comes immediately.
-    """
     if tool_choice == "none":
         # The K3 prompt still lists the tools, so forbid the tools section
         # instead of letting raw call markup reach the content.
@@ -799,23 +779,12 @@ def get_kimik3_structural_tag(
     call_tags = [_tool_call_tag(tool) for tool in selected_tools]
     tools_tag = _tool_calls_tag(call_tags, parallel_tool_calls)
     if at_least_one:
-        # Inside an already-open response channel the model must close it before
-        # the tools section, and the close comes first: left free, the model
-        # answers in that channel and never reaches the tools section, and since
-        # the grammar still requires one it cannot stop either -- generation runs
-        # to max_tokens with no tool call at all. With the channel not yet open
-        # (reasoning on, so the model closes think first) a complete response
-        # block before the call is legitimate and stays allowed.
         suffix: Format = SequenceFormat(
             elements=[
-                (
-                    ConstStringFormat(value=RESPONSE_CLOSE)
-                    if response_channel_open
-                    # Only a response may precede the tools section, so a model
-                    # that decides no tool is needed cannot close the message or
-                    # end the turn without making the call.
-                    else OptionalFormat(content=_RESPONSE)
-                ),
+                # Only a response may precede the tools section, so a model that
+                # decides no tool is needed cannot close the message or end the
+                # turn without making the call.
+                OptionalFormat(content=_RESPONSE),
                 tools_tag,
                 _OPTIONAL_MESSAGE_CLOSE,
             ]

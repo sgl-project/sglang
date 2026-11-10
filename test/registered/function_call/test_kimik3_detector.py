@@ -252,10 +252,6 @@ def test_detector_capabilities_and_registration() -> None:
     assert parser.get_structure_constraint("required") is not None
 
 
-if __name__ == "__main__":
-    sys.exit(pytest.main([__file__]))
-
-
 @pytest.mark.parametrize("size", [1, 7, 23, 4096])
 def test_streamed_arguments_match_non_streaming(size):
     args = {
@@ -294,3 +290,22 @@ def test_arguments_are_emitted_before_argument_and_call_close():
     assert "second" in "".join(c.parameters for c in second.calls)
     assert detector.incomplete_tool_call_indices == {0}
     assert all(c.name is None for c in second.calls)
+
+
+def test_nameless_call_is_skipped_like_non_streaming():
+    text = (
+        TOOLS_OPEN
+        + _call_block("", 1, {"x": ("string", "a")})
+        + _call_block("python", 2, {"y": ("string", "b")})
+        + TOOLS_CLOSE
+    )
+    detector = KimiK3Detector()
+    _, calls = _stream(detector, _chunks(text, 5), [_make_tool("python")])
+    expected = detector.detect_and_parse(text, []).calls
+    assert [c.name for c in calls if c.name] == [c.name for c in expected]
+    actual = "".join(c.parameters for c in calls)
+    assert json.loads(actual) == json.loads(expected[0].parameters)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__]))

@@ -3424,6 +3424,34 @@ class ServingChatTestCase(CustomTestCase):
             "Should not include finish_reason in completion chunk",
         )
 
+    def test_unstreamed_tool_args_skip_a_call_that_never_closed(self):
+        mock_parser = Mock()
+        mock_parser.detector = Mock(
+            incomplete_tool_call_indices={0},
+            prev_tool_call_arr=[
+                {
+                    "name": "get_weather",
+                    "arguments": {"location": "San Francisco", "unit": "celsius"},
+                }
+            ],
+            streamed_args_for_tool=['{"location": "San Francisco"'],
+        )
+        request = ChatCompletionRequest(
+            model="test",
+            messages=[{"role": "user", "content": "What's the weather?"}],
+            tools=[{"type": "function", "function": {"name": "get_weather"}}],
+        )
+
+        result = self.chat._check_for_unstreamed_tool_args(
+            parser=mock_parser,
+            content={"meta_info": {"id": "chatcmpl-test123"}},
+            request=request,
+            index=0,
+            created=123,
+        )
+
+        self.assertIsNone(result)
+
     def test_unstreamed_tool_args_no_completion_needed(self):
         """Test that no completion chunk is sent when all arguments were already streamed."""
 
@@ -6311,76 +6339,6 @@ class TestProcessToolCallsWithRequiredToolChoice(unittest.TestCase):
         )
 
         self.assertIsNone(tool_calls)
-
-
-class KimiK3ToolConstraintTestCase(unittest.TestCase):
-    """The K3 tool-call constraint's view of the prompt the encoder renders."""
-
-    MESSAGES = [{"role": "user", "content": "hi"}]
-
-    def setUp(self):
-        reset_context()
-        self.addCleanup(reset_context)
-        publish(
-            ServerArgs(
-                model_path="dummy",
-                tool_call_parser="kimi_k3",
-                reasoning_parser="kimi_k3",
-                default_chat_template_kwargs=None,
-            ),
-            role="tokenizer",
-        )
-        self.tm = _MockTokenizerManager()
-        self.tm.server_args.tool_call_parser = "kimi_k3"
-        self.tm.server_args.reasoning_parser = "kimi_k3"
-        self.tm.chat_template_name = None
-        self.tm.tokenizer.apply_chat_template = Mock(return_value=[1, 2, 3])
-        template_manager = _MockTemplateManager()
-        template_manager.chat_template_name = None
-        template_manager.jinja_template_content_format = "string"
-        self.chat = OpenAIServingChat(self.tm, template_manager)
-        self.chat.chat_encoding_spec = "kimi_k3"
-        self.chat.tool_call_parser = "kimi_k3"
-
-    def test_response_channel_flag_tracks_the_resolved_thinking_mode(self):
-        """The constraint has to know which channel the prompt left open."""
-        for kwargs, expected in (
-            ({"chat_template_kwargs": {"thinking": False}}, True),
-            ({"chat_template_kwargs": {"thinking": True}}, False),
-            ({}, False),
-        ):
-            with self.subTest(request=kwargs):
-                request = ChatCompletionRequest(
-                    model="x",
-                    messages=self.MESSAGES,
-                    tools=[
-                        {
-                            "type": "function",
-                            "function": {
-                                "name": "f",
-                                "parameters": {"type": "object", "properties": {}},
-                            },
-                        }
-                    ],
-                    tool_choice="required",
-                    **kwargs,
-                )
-                with patch(
-                    "sglang.srt.entrypoints.openai.serving_chat.FunctionCallParser"
-                ) as ParserMock:
-                    # a plain detector class: no response-template detokenization
-                    ParserMock.ToolCallParserEnum.get.return_value = object
-                    parser = ParserMock.return_value
-                    parser.get_structure_constraint.return_value = None
-                    parser.detector.parses_required_natively.return_value = False
-                    parser.detector.eot_token = "<|close|>tools<|sep|>"
-                    self.chat._process_messages(request, is_multimodal=False)
-                self.assertEqual(
-                    parser.get_structure_constraint.call_args.kwargs[
-                        "response_channel_open"
-                    ],
-                    expected,
-                )
 
 
 class TestNormalizeToolContent(unittest.TestCase):
