@@ -1,6 +1,11 @@
-"""Per-request PLE side states (short-conv window, N-gram context),
-addressed by the request's MambaPool slot and registered on that pool,
-so every slot lifecycle event carries them along."""
+"""Per-request side states that live alongside a MambaPool slot.
+
+Qwen4-Exp's PLE keeps two states per request — a short-conv window and an
+N-gram token context — addressed by the request's mamba slot index. They are
+registered on the owning ``MambaPool`` via ``register_slot_state`` so every
+slot lifecycle event (deferred clear, radix COW, host offload round-trip)
+carries them along and a slot never changes owner with a stale sibling row.
+"""
 
 from __future__ import annotations
 
@@ -8,7 +13,6 @@ from contextlib import nullcontext
 from typing import Any, List, Optional, Protocol, Tuple
 
 import torch
-
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.mem_cache.utils import maybe_init_custom_mem_pool
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -24,9 +28,15 @@ NGRAM_PART = "ngram"
 
 
 class SlotIndexedState(Protocol):
-    """Per-request state addressed by MambaPool slot index,
-    carried through every slot handoff;
-    every method must be a no-op when the backing tensor is None (a disabled pool)."""
+    """Per-request state owned by a MambaPool slot but not layer-major.
+
+    Qwen4-Exp's PLE side states are addressed by the *mamba slot index*
+    (`get_ngram_indices` / `get_short_conv_indices` both forward to
+    `get_mamba_indices`), so anything that hands out, duplicates or persists a
+    slot must carry them too. Implementers own their own shapes, and every
+    method must be a no-op when the backing tensor is None so a disabled pool
+    can register safely.
+    """
 
     def reset_slots(self, indices: torch.Tensor) -> None: ...
 
@@ -57,15 +67,16 @@ class ShortConvPool:
         self.layer_map = {layer_id: i for i, layer_id in enumerate(layer_ids)}
         self.conv_state = None
         self.intermediate_conv_state = None
-        if not layer_ids or state_shape is None:
-            return
-
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
         )
         self.enable_custom_mem_pool, self.custom_mem_pool, _ = (
             maybe_init_custom_mem_pool(device=self.device)
         )
+
+        if not layer_ids or state_shape is None:
+            return
+
         with (
             self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE),
             (
@@ -161,15 +172,15 @@ class NGramPool:
         self.device = device
         self.context = None
         self.intermediate_context = None
-        if context_len <= 0:
-            return
-
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
         )
         self.enable_custom_mem_pool, self.custom_mem_pool, _ = (
             maybe_init_custom_mem_pool(device=self.device)
         )
+        if context_len <= 0:
+            return
+
         with (
             self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE),
             (

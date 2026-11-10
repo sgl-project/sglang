@@ -956,6 +956,7 @@ class HiCacheFile(HiCacheStorage):
                 self.metadata_cache.remove if self.metadata_cache is not None else None
             ),
         )
+        self._mismatched_pages_removed = 0
 
     def _validate_unified_page_bytes(self, page_bytes: int) -> None:
         if self._unified_chunk_spans is not None:
@@ -1052,20 +1053,51 @@ class HiCacheFile(HiCacheStorage):
         try:
             expected = target_location.numel() * target_location.element_size()
             with open(tensor_path, "rb", buffering=0) as f:
-                if os.fstat(f.fileno()).st_size != expected:
-                    raise IOError(f"Incorrect object size for {suffixed}")
-                buf = memoryview(target_location.view(torch.uint8).contiguous().numpy())
-                if f.readinto(buf) != expected:
-                    raise IOError(f"Short read for {suffixed}")
+                stored = os.fstat(f.fileno()).st_size
+                if stored == expected:
+                    buf = memoryview(
+                        target_location.view(torch.uint8).contiguous().numpy()
+                    )
+                    if f.readinto(buf) != expected:
+                        raise IOError(f"Short read for {suffixed}")
+            if stored != expected:
+                # SM70: page layouts differ across builds (QSA/PD page stride),
+                # so drop the stale page instead of failing this key forever;
+                # the scheduler recomputes and re-stores it.
+                self._remove_mismatched_page(suffixed, tensor_path, stored, expected)
+                return None
             self._evictor.touch(suffixed, tensor_path)
             if self.metadata_cache is not None:
                 self.metadata_cache.add(suffixed)
             return target_location
-        except OSError:
+        except OSError as e:
+            # A raise here would end the prefetch IO thread; a miss is recomputed.
             if self.metadata_cache is not None:
                 self.metadata_cache.remove(suffixed)
-            logger.warning(f"Failed to fetch {suffixed} from HiCacheFile storage.")
+            logger.warning(f"Failed to fetch {suffixed} from HiCacheFile storage: {e}")
             return None
+
+    def _remove_mismatched_page(
+        self, suffixed: str, tensor_path: str, stored: int, expected: int
+    ) -> None:
+        # The file has the size of another build's page layout, so its bytes cannot
+        # be this page. set() never overwrites an existing key, so remove it.
+        try:
+            os.remove(tensor_path)
+        except FileNotFoundError:
+            pass
+        self._evictor.forget(suffixed)
+        if self.metadata_cache is not None:
+            self.metadata_cache.remove(suffixed)
+        self._mismatched_pages_removed += 1
+        removed = self._mismatched_pages_removed
+        # Logs the 1st, 2nd, 4th, 8th, ... removal.
+        if removed & (removed - 1) == 0:
+            logger.warning(
+                f"HiCacheFile: removed {removed} stored page(s) whose size does not "
+                f"match this build's page layout (latest {suffixed}.bin: {stored} "
+                f"bytes, expected {expected}). They are recomputed and stored again."
+            )
 
     def batch_get(
         self,

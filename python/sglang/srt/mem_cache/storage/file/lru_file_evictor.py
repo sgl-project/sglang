@@ -15,6 +15,7 @@ A backend constructs one evictor and drives it through a small lifecycle::
     reserve(key, n_bytes) -> bool    # admit a new write, evicting if needed
         commit(key)                  #   write landed on disk
         abort(key)                   #   write failed; release the reservation
+    forget(key)                      # backend removed an unreadable file
     clear()                          # backend wiped all files
 
 When eviction is not configured the evictor is inert: ``reserve`` always admits
@@ -220,6 +221,10 @@ class LRUFileEvictor:
             self._pending_writes.discard(suffixed_key)
             if cur is not None:
                 self._total_bytes -= cur
+
+    def forget(self, suffixed_key: str) -> None:
+        """Drop a key whose file the backend removed and refund its bytes."""
+        self.abort(suffixed_key)
 
     def touch(self, suffixed_key: str, tensor_path: str) -> None:
         """Mark key as MRU, adopting an untracked on-disk file if needed."""

@@ -55,8 +55,17 @@ def compile_in_capture_mode(func):
     Used by model code (e.g. DeepSeek-V4) to opt nested helpers into
     torch.compile during cuda-graph capture without paying the
     compilation cost in the eager forward path.
+
+    Breakable CUDA graphs already split at eager_on_graph markers.
+    torch.compile inside a BCG capture records a second graph over
+    mHC helpers and replays as NaN (DSV41 V100: finite CSA2 L0, NaN
+    from L1 q_proj onward).
     """
-    if is_capture_mode and not is_gfx1250_supported():
+    if (
+        is_capture_mode
+        and not is_gfx1250_supported()
+        and not is_in_breakable_cuda_graph()
+    ):
         return torch.compile(func)
     return func
 

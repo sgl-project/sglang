@@ -58,6 +58,7 @@ from sglang.srt.runtime_context import (
     get_memory,
     get_model,
     get_parallel,
+    get_platform,
     get_schedule,
     get_spec,
     max_speculative_num_draft_tokens,
@@ -1248,7 +1249,18 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             self.indexer_head_dim, use_fp4_indexer=True
         )
 
-        # kvc.sliding_window_size is None on a runner without SWA layers.
+        # SM70 V4.1 attention writes SWA into CSA2 rings, not the paged SWA
+        # pool. Charging swa_ratio·layers here is what pinned DSpark to ~135k
+        # tokens on 32 GiB (2394 B/tok). Skip that charge. The pool still
+        # exists (allocator API), but DeepSeekV4TokenToKVPool marks it a
+        # per-request ring so chunked prefill is not billed 1:1 into the floor.
+        self._sm70_csa2_skip_paged_swa = bool(get_platform().is_sm70)
+        chunk = get_schedule().chunked_prefill_size
+        self._chunked_prefill_size = int(chunk) if chunk and chunk > 0 else 0
+        self._sm70_swa_chunks_in_flight = (
+            1 if get_schedule().disable_overlap_schedule else 2
+        )
+        # swa_page_size is the model's sliding window (cfg.window_size).
         self._swa_ring_size = get_swa_ring_size(cfg.window_size, self.is_speculative)
         self._spec_infl = 1.0
 
@@ -1560,10 +1572,41 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         swa_ratio = (
             0 if self._unified or self.swa_cap_tokens is not None else self.swa_ratio
         )
-        return swa_ratio * self.bytes_per_swa_token + sum(
+        charge_paged_swa = not getattr(self, "_sm70_csa2_skip_paged_swa", False)
+        effective_swa_ratio = swa_ratio if charge_paged_swa else 0
+        bpft = effective_swa_ratio * self.bytes_per_swa_token + sum(
             self._compressed_bytes_per_full_token(ratio) * len(layers)
             for ratio, layers in self.stage_owner_layers.items()
         )
+        # V4.1 on SM70 has no c4/c128 layers. A zero coeff would make
+        # available/bpft blow up; 64 B/tok is a scheduler placeholder.
+        if getattr(self, "_sm70_csa2_skip_paged_swa", False):
+            bpft = max(bpft, 64.0)
+        return bpft
+
+    def _sm70_vestigial_swa_tokens(self, page_size: int) -> int:
+        """Fixed paged-SWA floor for SM70 CSA2.
+
+        Attention does not read this pool. The allocator treats it as a
+        per-request ring (see DeepSeekV4TokenToKVPool), so a long prefill is
+        not charged one SWA token per prompt token. The floor stays large
+        enough for a 2048-token chunk in case a caller still pages it:
+        a window-only 2-req floor (1024 at page=256) cannot admit
+        chunked_prefill_size=2048 (relaunch148).
+        """
+        window = int(self.sliding_window_size or 128)
+        # 2-req floor (sticky pin + running) at window+page each, plus slack.
+        floor = 2 * (window + page_size) + page_size
+        chunk = int(getattr(self, "_chunked_prefill_size", 0) or 0)
+        if chunk > 0:
+            chunks_in_flight = int(
+                getattr(self, "_sm70_swa_chunks_in_flight", 2) or 2
+            )
+            floor = max(
+                floor,
+                chunks_in_flight * chunk + 2 * (window + page_size) + page_size,
+            )
+        return floor // page_size * page_size
 
     def _get_swa_fixed_bytes(self) -> float:
         """Bias bytes of the encoder-replay request window plus the cap-mode pool."""
@@ -1582,30 +1625,36 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
 
     def _compute_dsv4_sizes(self, full_token: int, page_size: int) -> _DSV4PoolSizes:
         full_token = full_token // page_size * page_size
-        swa_tokens = self._get_swa_tokens(full_token, page_size)
-        if self.swa_cap_tokens is None:
-            # Only ratio sizing can under-size a request: cap mode sizes from the
-            # request floor, and encoder replay deliberately runs swa_tokens == 0.
-            if not self._unified:
-                self.validate_swa_pool_size(
-                    swa_tokens, self.sliding_window_size, page_size
-                )
-            source = "explicit" if self.operator_swa_ratio is not None else "default"
-            mode = (
-                "ring (paged swa_tokens vestigial)"
-                if self._unified
-                else f"ratio ({source})"
-            )
+        if getattr(self, "_sm70_csa2_skip_paged_swa", False):
+            swa_tokens = self._sm70_vestigial_swa_tokens(page_size)
             logger.info(
-                f"DSV4 SWA sizing: mode={mode}, swa_tokens={swa_tokens}, "
-                f"swa_full_tokens_ratio={self.swa_ratio}"
+                f"DSV4 SWA sizing: mode=sm70-csa2-vestigial, swa_tokens={swa_tokens}"
             )
         else:
-            logger.info(
-                f"DSV4 SWA sizing: mode=cap, swa_tokens={swa_tokens}, "
-                f"request_cap+headroom={self.swa_cap_tokens}, "
-                f"prefix_tails={self.swa_prefix_tails}"
-            )
+            swa_tokens = self._get_swa_tokens(full_token, page_size)
+            if self.swa_cap_tokens is None:
+                # Only ratio sizing can under-size a request: cap mode sizes from the
+                # request floor, and encoder replay deliberately runs swa_tokens == 0.
+                if not self._unified:
+                    self.validate_swa_pool_size(
+                        swa_tokens, self.sliding_window_size, page_size
+                    )
+                source = "explicit" if self.operator_swa_ratio is not None else "default"
+                mode = (
+                    "ring (paged swa_tokens vestigial)"
+                    if self._unified
+                    else f"ratio ({source})"
+                )
+                logger.info(
+                    f"DSV4 SWA sizing: mode={mode}, swa_tokens={swa_tokens}, "
+                    f"swa_full_tokens_ratio={self.swa_ratio}"
+                )
+            else:
+                logger.info(
+                    f"DSV4 SWA sizing: mode=cap, swa_tokens={swa_tokens}, "
+                    f"request_cap+headroom={self.swa_cap_tokens}, "
+                    f"prefix_tails={self.swa_prefix_tails}"
+                )
         return _DSV4PoolSizes(
             full_max_total_num_tokens=full_token,
             swa_max_total_num_tokens=swa_tokens,

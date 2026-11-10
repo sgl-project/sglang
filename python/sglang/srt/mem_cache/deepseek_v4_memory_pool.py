@@ -1377,6 +1377,25 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
         self._init_paged_compress_states(enable_memory_saver)
 
+        # Upstream now owns the V4.1 RequestWindow (built above); the SM70
+        # layer here is only the paged-SWA accounting below.
+        #
+        # SM70 CSA2 never reads these pages. Without this, the hybrid
+        # allocator bills SWA 1:1 with each prefill chunk, the 5120-token
+        # floor fills, later chunks shrink, and a ~23k first prompt is
+        # aborted by the client before it can be pinned.
+        if (
+            get_platform().is_sm70
+            and self.swa_kv_pool is not None
+            and self.swa_req_ring_size is None
+        ):
+            self.swa_req_ring_size = int(self.sliding_window or self.swa_page_size)
+            logger.info(
+                "SM70 CSA2 paged SWA is vestigial; per-request ring accounting "
+                "ring_size=%d (chunked prefill is not charged 1:1)",
+                self.swa_req_ring_size,
+            )
+
     def get_unified_kv(self, layer_id: int) -> torch.Tensor:
         # Under HiCache the compressed region is loaded H->D per layer; wait for this
         # layer's transfer before attention reads it. No-op when HiCache is off.
@@ -1989,6 +2008,10 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
         for idx in range(self._stage_start, self._stage_end):
             ratio = self.compression_ratios[idx]
+            # V4.1 ratios 1/2 keep pending/packed rows on the CSA2 path, not
+            # the V4 Pro c4/c128 CompressStatePool.
+            if ratio not in self.compressed_pool_configs:
+                continue
             if ratio in (0, 1):
                 continue
 
@@ -2022,7 +2045,14 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         return max(sources)
 
     def _init_compressed_layer_mapping(self):
-        layer_counts = {0: 0, **{ratio: 0 for ratio in self.kv_pools}}
+        # 0 = uncompressed / SWA-only; 1/2 = V4.1 CSA2 (no c4/c128 pool);
+        # 4/128 = V4 Pro compressed pools in kv_pools.
+        layer_counts = {
+            0: 0,
+            1: 0,
+            2: 0,
+            **{ratio: 0 for ratio in self.kv_pools},
+        }
         total_L = len(self.compression_ratios)
         self.layer_mapping: List[Optional[DeepSeekV4LayerItem]] = [None] * total_L
 

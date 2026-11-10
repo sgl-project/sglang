@@ -205,12 +205,23 @@ def get_allocator_class_from_storage(
 
 
 def _cuda_host_register(
-    buffer: torch.Tensor, registration_granularity_bytes: int | None = None
+    buffer: torch.Tensor,
+    registration_granularity_bytes: int | None = None,
+    *,
+    flags: int = 0,
+    nbytes: int | None = None,
 ) -> None:
     # Avoid oversized cudaHostRegister calls on large host pools.
     cudart = torch.cuda.cudart()
     base = buffer.data_ptr()
     total = buffer.numel() * buffer.element_size()
+    if nbytes is not None:
+        if nbytes < total:
+            raise ValueError(
+                f"cudaHostRegister nbytes={nbytes} is smaller than the tensor "
+                f"({total})"
+            )
+        total = nbytes
     # cudaHostRegister requires hugetlb-backed ranges whose base or size are
     # hugepage-aligned, so round the size up to the hugepage size.
     hugepage_size = hugepage_size_requested() if tensor_uses_hugepage(buffer) else 0
@@ -246,7 +257,7 @@ def _cuda_host_register(
         while offset < total:
             size = min(chunk_bytes, total - offset)
             ptr = base + offset
-            rc = int(cudart.cudaHostRegister(ptr, size, 0))
+            rc = int(cudart.cudaHostRegister(ptr, size, flags))
             if rc != 0:
                 raise RuntimeError(
                     f"cudaHostRegister failed (rc={rc}, "
@@ -303,8 +314,13 @@ def _cuda_host_unregister(buffer: torch.Tensor) -> None:
     if not registered_ranges:
         return
 
+    # Clear in place before unregistering. A hugepage tensor's free-time
+    # finalizer shares this list and must not unregister a second time.
+    snapshot = list(registered_ranges)
+    if isinstance(registered_ranges, list):
+        registered_ranges.clear()
     remaining_ranges = _cuda_host_unregister_ranges(
-        cudart, registered_ranges, operation="host-pool destroy"
+        cudart, snapshot, operation="host-pool destroy"
     )
     setattr(buffer, _CUDA_HOST_REGISTERED_RANGES_ATTR, remaining_ranges)
     if not remaining_ranges:
@@ -515,6 +531,22 @@ def alloc_with_host_register(
         assert device == "cpu", f"HiCache host pools are CPU memory; got {device!r}"
         _log_hip_owned_host_pool()
         return _alloc_hip_host_tensor(dims=dims, dtype=dtype)
+    if pin_memory and type(allocator) is HostTensorAllocator:
+        # Local import: host_hugepage registers through this module.
+        from sglang.srt.mem_cache.host_hugepage import (
+            qwen_host_hugepage_preferred,
+            try_alloc_pinned_1g_hugepage,
+        )
+
+        if qwen_host_hugepage_preferred():
+            huge = try_alloc_pinned_1g_hugepage(
+                dims,
+                dtype,
+                purpose="HiCache host pool",
+                registration_granularity_bytes=registration_granularity_bytes,
+            )
+            if huge is not None:
+                return huge
     buffer = allocator.allocate(dims, dtype=dtype, device=device)
     if pin_memory:
         _cuda_host_register(buffer, registration_granularity_bytes)

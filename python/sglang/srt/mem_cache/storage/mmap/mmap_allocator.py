@@ -273,6 +273,22 @@ def tensor_uses_hugepage(tensor) -> bool:
     return untyped_storage().data_ptr() in _hugepage_storage_keys
 
 
+def alloc_1g_hugepage(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
+    """Allocate ``dims`` from the 1 GiB hugetlb pool. Raises ``OSError`` if it cannot.
+
+    The caller chooses the NUMA policy before this mmap. The tensor owns the
+    mapping; munmap runs when the tensor is freed. ``n_bytes`` may be shorter
+    than the rounded mapping; the extra page stays reserved until then.
+    """
+    if _libc is None:
+        raise OSError("libc mmap is unavailable")
+    n_bytes = math.prod(dims) * torch.empty([], dtype=dtype).element_size()
+    page_size = 1024 * 1024 * 1024
+    alloc_bytes = math.ceil(n_bytes / page_size) * page_size
+    array = _alloc_hugepage(n_bytes, alloc_bytes, _MAP_HUGETLB | _MAP_HUGE_1GB)
+    return torch.frombuffer(array, dtype=dtype, count=math.prod(dims)).reshape(dims)
+
+
 def alloc_mmap(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
     """Allocate a host tensor via anonymous mmap.
 

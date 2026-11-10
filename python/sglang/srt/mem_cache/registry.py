@@ -14,6 +14,7 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.layers.cp.base import is_cp_sharded_padded
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
@@ -324,14 +325,26 @@ def create_tree_cache(ctx: TreeCacheBuildContext) -> BasePrefixCache:
             "at https://github.com/sgl-project/sglang if you need this."
         )
 
+    sticky_wrapped = False
+    if (
+        envs.SGLANG_DSV41_STICKY_LAST_SEQ.get()
+        and not get_serving().enable_streaming_session
+        and not cache.supports_prefix_sharing()
+    ):
+        from sglang.srt.mem_cache.sticky_last_sequence import StickyLastSequenceCache
+
+        cache = StickyLastSequenceCache(cache)
+        sticky_wrapped = True
+
     hicache_attached = cache.cache_controller is not None
     logger.info(
         "Tree cache initialized: source=%s impl=%s hybrid_swa=%s hybrid_ssm=%s "
-        "hicache_attached=%s",
+        "hicache_attached=%s sticky_wrapped=%s",
         source,
         type(cache).__name__,
         ctx.is_hybrid_swa,
         ctx.is_hybrid_ssm,
         hicache_attached,
+        sticky_wrapped,
     )
     return cache

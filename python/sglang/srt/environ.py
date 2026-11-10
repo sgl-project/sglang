@@ -1667,6 +1667,16 @@ class Envs:
     SGLANG_CUSTOM_ALL_REDUCE_V2_MAX_SIZE_KB = EnvInt(16 * 1024)
     SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PULL_SIZE_KB = EnvInt(None)
     SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PUSH_SIZE_KB = EnvInt(None)
+
+    # ===================================================================
+    # SM70 / V100 (Volta) adaptations
+    # ===================================================================
+    # Volta has no bfloat16, so weights and compute are forced to fp16. Set to
+    # 0 to keep the requested dtype for models whose linear-attention/GDN path
+    # was tuned in bf16 (upcast on read). This branch owns only the fp16 switch;
+    # the env/docs branch carries the rest of the SM70 block.
+    SGLANG_SM70_FORCE_FP16 = EnvBool(True)
+
     # See docs/references/environment_variables.
     SGLANG_ENABLE_PCIE_IPC_ALLREDUCE = EnvBool(False)
     SGLANG_PCIE_IPC_MAX_NUMEL = EnvInt(0)

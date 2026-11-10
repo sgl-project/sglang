@@ -27,6 +27,7 @@ from sglang.srt.debug_utils.tensor_dump_forward_hook import (
     register_forward_hook_for_model,
 )
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
+from sglang.srt.environ import envs
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.model_loader.loader import get_model_loader
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
@@ -123,17 +124,47 @@ class LoadedModel(msgspec.Struct, frozen=True, kw_only=True):
 
 
 def maybe_downgrade_dtype_for_legacy_gpu(*, model_config: ModelConfig) -> None:
-    if torch.cuda.get_device_capability()[0] < 8:
-        logger.info(
-            "Compute capability below sm80. Use float16 due to lack of bfloat16 support."
-        )
+    capability = torch.cuda.get_device_capability()
+    if capability[0] >= 8:
+        return
+    # sm70 (Volta / V100) is supported by this fork's TileLang + TurboMind
+    # kernels; upstream's floor is sm75.
+    if capability < (7, 0):
+        raise RuntimeError("SGLang only supports sm70 and above.")
 
-        # Device-driven, so every runner in the process resolves the same way;
-        # the per-runner truth is model_config.dtype, this is the record.
-        get_context().override("ModelRunner._sm80_dtype_fallback", dtype="float16")
-        model_config.dtype = torch.float16
-        if torch.cuda.get_device_capability()[1] < 5:
-            raise RuntimeError("SGLang only supports sm75 and above.")
+    if not envs.SGLANG_SM70_FORCE_FP16.get():
+        logger.info(
+            "Compute capability below sm80, but SGLANG_SM70_FORCE_FP16=0: keeping "
+            "the requested dtype %s. Models whose linear-attention/GDN path was "
+            "tuned in bf16 use this to opt out of the blanket downgrade.",
+            model_config.dtype,
+        )
+        return
+
+    logger.info(
+        "Compute capability below sm80. Use float16 due to lack of bfloat16 support."
+    )
+    # Device-driven, so every runner in the process resolves the same way;
+    # the per-runner truth is model_config.dtype, this is the record.
+    get_context().override("ModelRunner._sm80_dtype_fallback", dtype="float16")
+    model_config.dtype = torch.float16
+
+
+def cast_bf16_parameters_for_sm70(model) -> None:
+    """BF16 matmul is not implemented on Volta. Checkpoint tensors that stay
+    BF16 (the indexer compress gate is allocated that way) have to follow the
+    FP16 activation dtype after they are loaded."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] >= 8:
+        return
+    if not envs.SGLANG_SM70_FORCE_FP16.get():
+        return
+    converted = 0
+    for param in model.parameters():
+        if param.dtype == torch.bfloat16:
+            param.data = param.data.to(torch.float16)
+            converted += 1
+    if converted:
+        logger.info("SM70: cast %d BF16 parameters to FP16", converted)
 
 
 def maybe_trigger_remote_instance_nccl_send_group(
@@ -439,6 +470,7 @@ def load_model_with_memory_saver(
                 model_config=model_config,
                 device_config=device_config,
             )
+            cast_bf16_parameters_for_sm70(model)
         if hasattr(loader, "remote_instance_transfer_engine_weight_info"):
             remote_instance_weight_info = (
                 loader.remote_instance_transfer_engine_weight_info

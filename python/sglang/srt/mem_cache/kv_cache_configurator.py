@@ -1633,7 +1633,17 @@ class KVCacheConfigurator:
         extra_max_context_len: int,
     ) -> ReqToTokenPool:
         self._validate_replay_spec_algorithm()
-        req_to_token_pool = HybridReqToTokenPool(
+        # Qwen4-Exp additionally carries per-request PLE n-gram history and
+        # short-conv state whose lifetime is the mamba slot's; they need a pool
+        # that drags them through clear / copy / host round-trip in lockstep.
+        from sglang.srt.configs.qwen4_exp import Qwen4ExpTextConfig
+
+        pool_cls = HybridReqToTokenPool
+        if isinstance(self.mambaish_config, Qwen4ExpTextConfig):
+            from sglang.srt.mem_cache.qwen4_exp_pools import Qwen4ExpReqToTokenPool
+
+            pool_cls = Qwen4ExpReqToTokenPool
+        req_to_token_pool = pool_cls(
             size=max_num_reqs,
             mamba_size=get_schedule().max_mamba_cache_size,
             mamba_spec_state_size=max_num_reqs,
@@ -2597,6 +2607,23 @@ class KVCacheConfigurator:
         mla_pool_class: type,
         dsa_pool_class: type,
     ) -> KVCache:
+        from sglang.srt.layers.attention.qsa.config import parse_qsa_profile
+
+        try:
+            from sglang.srt.layers.attention.qsa.config import (
+                QSA_VARIANT_COMPRESSED,
+                QSA_VARIANT_TOKENWISE,
+            )
+        except ImportError:  # variant dispatch arrives with the attention cluster
+            QSA_VARIANT_COMPRESSED = "compressed"
+            QSA_VARIANT_TOKENWISE = "tokenwise"
+
+        from sglang.srt.mem_cache.qsa_kv_pool import (
+            QSATokenToKVPool,
+            QwenDSATokenToKVPool,
+            resolve_qsa_indexer_dtype,
+        )
+
         full_attention_layer_ids = (
             [0]
             if self.is_draft_worker
@@ -2651,41 +2678,13 @@ class KVCacheConfigurator:
             mla_pool_class=mla_pool_class,
             dsa_pool_class=dsa_pool_class,
         )
-        from sglang.srt.layers.attention.qsa.config import (
-            parse_qsa_profile,
-        )
-        from sglang.srt.mem_cache.qsa_kv_pool import (
-            QSATokenToKVPool,
-            resolve_qsa_indexer_dtype,
-        )
-
-        qsa_profile = parse_qsa_profile(self.model_config.hf_config)
-        qsa_indexer_dtype = get_model().qsa_indexer_dtype
-        if qsa_indexer_dtype != "auto" and qsa_profile is None:
-            raise ValueError(
-                f"--qsa-indexer-dtype {qsa_indexer_dtype} needs a model with a "
-                "compressed QSA indexer (Qwen4-Exp); this model has none"
-            )
-        if qsa_profile is None:
-            pool_class = HybridLinearKVPool
-            extra_args["use_mla"] = self.use_mla_backend
-        else:
-            pool_class = QSATokenToKVPool
-            extra_args.update(
-                qsa_index_kv_heads=qsa_profile.kv_heads,
-                qsa_index_head_dim=qsa_profile.head_dim,
-                qsa_compress_ratio=qsa_profile.compress_ratio,
-                qsa_token_topk=qsa_profile.budget,
-                num_request_slots=req_to_token_pool.req_to_token.shape[0],
-                qsa_indexer_dtype=resolve_qsa_indexer_dtype(qsa_indexer_dtype),
-            )
         if self.modelslim_cache_layout is not None:
             full_pool_class = partial(
                 full_pool_class,
                 modelslim_cache_layout=self.modelslim_cache_layout,
                 is_draft_worker=self.is_draft_worker,
             )
-        token_to_kv_pool = pool_class(
+        common_kwargs = dict(
             page_size=self.pool_page_size,
             size=max_total_num_tokens,
             dtype=self.kv_cache_dtype,
@@ -2703,6 +2702,58 @@ class KVCacheConfigurator:
             full_kv_pool_class=full_pool_class,
             quant_method=quant_method,
             post_capture_active=self.post_capture_kv_active and quant_method is None,
+        )
+
+        qsa_profile = parse_qsa_profile(self.model_config.hf_config)
+        # The variant split ships with the attention cluster; a tree whose
+        # parse_qsa_profile predates it only ever returns compressed profiles.
+        qsa_variant = getattr(qsa_profile, "variant", QSA_VARIANT_COMPRESSED)
+        qsa_indexer_dtype = get_model().qsa_indexer_dtype
+        if qsa_indexer_dtype != "auto" and qsa_variant != QSA_VARIANT_COMPRESSED:
+            raise ValueError(
+                f"--qsa-indexer-dtype {qsa_indexer_dtype} needs a model with a "
+                "compressed QSA indexer (Qwen4-Exp); this model has none"
+            )
+        if qsa_profile is not None and qsa_variant == QSA_VARIANT_COMPRESSED:
+            # Qwen4-Exp's sparse full-attention layers need the compressed index
+            # caches; the plain hybrid pool carries none of the qsa_* buffers and
+            # the QSA backend reads pool.qsa_compressed_page_size directly. The
+            # MTP layer is itself a QSA layer, so draft workers get this pool too
+            # rather than a bare hybrid one. QSA is never MLA, so use_mla and the
+            # MLA extra_args do not apply.
+            return QSATokenToKVPool(
+                **common_kwargs,
+                qsa_index_kv_heads=qsa_profile.kv_heads,
+                qsa_index_head_dim=qsa_profile.head_dim,
+                qsa_compress_ratio=qsa_profile.compress_ratio,
+                qsa_token_topk=qsa_profile.budget,
+                # The pending ring keeps a whole speculative verify/draft-extend
+                # window plus the retained prefix members it reads back.
+                qsa_max_rows_per_request=(max_speculative_num_draft_tokens() or 1),
+                # The indexer's RMSNorm runs in the model dtype; the full-KV
+                # cache may be fp8, so this must not follow kv_cache_dtype.
+                index_state_dtype=self.model_config.dtype,
+                num_request_slots=req_to_token_pool.req_to_token.shape[0],
+                # The fused index-Q/K kernels store either the compute dtype or
+                # fp8, so "auto" follows the model dtype (fp16 on SM70).
+                qsa_indexer_dtype=(
+                    self.model_config.dtype
+                    if qsa_indexer_dtype == "auto"
+                    else resolve_qsa_indexer_dtype(qsa_indexer_dtype)
+                ),
+            )
+
+        if qsa_profile is not None and qsa_variant == QSA_VARIANT_TOKENWISE:
+            return QwenDSATokenToKVPool(
+                **common_kwargs,
+                qsa_index_kv_heads=qsa_profile.kv_heads,
+                qsa_index_head_dim=qsa_profile.head_dim,
+                qsa_token_budget=qsa_profile.budget,
+            )
+
+        token_to_kv_pool = HybridLinearKVPool(
+            **common_kwargs,
+            use_mla=self.use_mla_backend,
             **extra_args,
         )
         return token_to_kv_pool
@@ -3136,6 +3187,13 @@ class KVCacheConfigurator:
         else:
             requested_per_worker = None
             max_num_reqs = min(estimated, token_capacity // 2)
+        if (
+            envs.SGLANG_DSV41_STICKY_LAST_SEQ.get()
+            and get_memory().disable_radix_cache
+        ):
+            # One extra req row so the idle pin and the next HTTP turn coexist
+            # until match_prefix reuses or drops the pin.
+            max_num_reqs += 1
 
         capped_by_mamba = False
         if self.mambaish_config is not None:

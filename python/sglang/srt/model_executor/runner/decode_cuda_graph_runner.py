@@ -1290,6 +1290,33 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
 
     def _capture(self) -> None:
+        # D15-1: land_ids must already be T=γ+1 before the first captured
+        # page_in. Warmup at T=1 would otherwise freeze a length-2 buffer.
+        # The expert-spill buffers ship with the MoE cluster; fall back to the
+        # upstream capture path when that module is not in this tree.
+        try:
+            from sglang.srt.layers.moe import dsv41_expert_spill
+        except ImportError:
+            dsv41_expert_spill = None
+        if (
+            dsv41_expert_spill is not None
+            and dsv41_expert_spill.spill_landing_slots() > 0
+        ):
+            k = 6
+            hf = getattr(self.model_runner.model_config, "hf_config", None)
+            if hf is not None:
+                k = int(getattr(hf, "num_experts_per_tok", None) or k)
+            dsv41_expert_spill.warmup_spill_landing_for_capture(
+                self.model_runner.model,
+                int(self.captured_req_width),
+                k,
+                torch.device(self.model_runner.device),
+            )
+        # Allocate DSpark aux [n_layers, T, H] before capture; store must not
+        # allocate inside a graph.
+        alloc_aux = getattr(self.model_runner.model, "alloc_dspark_aux_hidden", None)
+        if callable(alloc_aux):
+            alloc_aux(int(self.captured_req_width))
         # Warm up + autotune kernels once before capture (run-once across the
         # decode + prefill runners; see BaseRunner.warmup).
         self.warmup()
@@ -2072,6 +2099,19 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         with self.model_context(), timer_ctx, self.backend.replay_session():
             if not self.backend.prepare_replay(forward_batch):
                 self.load_batch(forward_batch, pp_proxy_tensors)
+                if envs.SGLANG_DSV41_PREFILL_SYNC.get():
+                    ids = forward_batch.input_ids
+                    pos = forward_batch.positions
+                    logger.info(
+                        "DSV41 decode graph probe ids=[%s,%s] pos=[%s,%s] "
+                        "n_ids=%s n_pos=%s",
+                        int(ids.min().item()) if ids.numel() else None,
+                        int(ids.max().item()) if ids.numel() else None,
+                        int(pos.min().item()) if pos.numel() else None,
+                        int(pos.max().item()) if pos.numel() else None,
+                        tuple(ids.shape),
+                        tuple(pos.shape),
+                    )
             if envs.SGLANG_LOG_DECODE_GRAPH_KEY.get():
                 logger.info(
                     "Decode graph replay: worker=%s key_size=%s (%s) mode=%s raw_bs=%d "
@@ -2101,6 +2141,20 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
             output = self._process_output_after_replay(output, forward_batch)
 
+        if envs.SGLANG_DSV41_PREFILL_SYNC.get():
+            logger.info("DSV41 decode execute left replay_session")
+            torch.cuda.synchronize()
+            lg = getattr(output, "next_token_logits", None)
+            if torch.is_tensor(lg) and lg.numel():
+                logger.info(
+                    "DSV41 decode execute logits finite=%s/%s peek=%s raw_n=%s",
+                    int(torch.isfinite(lg).sum().item()),
+                    lg.numel(),
+                    float(lg.reshape(-1)[0].item()),
+                    self.raw_num_token,
+                )
+            logger.info("DSV41 decode execute post-replay inspect ok")
+
         if isinstance(output, LogitsProcessorOutput):
             if self.is_dllm:
                 next_token_logits = None
@@ -2122,6 +2176,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 output,
                 next_token_logits=next_token_logits,
                 full_logits=full_logits,
+                greedy_token_ids=(
+                    output.greedy_token_ids[: self.raw_num_token]
+                    if output.greedy_token_ids is not None
+                    else None
+                ),
                 hidden_states=(
                     output.hidden_states[: self.raw_num_token]
                     if output.hidden_states is not None
@@ -2132,6 +2191,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     if output.last_hidden_states is not None
                     else None
                 ),
+            )
+        if torch.is_tensor(output):
+            return LogitsProcessorOutput(
+                next_token_logits=None,
+                hidden_states=output[: self.raw_num_token],
             )
         else:
             assert isinstance(output, PPProxyTensors)
