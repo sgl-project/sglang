@@ -14,9 +14,7 @@ from sglang.test.ascend.e2e.test_npu_performance_utils import (
 )
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.ascend.e2e.test_npu_multi_node_utils import (
-    NIC_NAME,
     build_meta_service_config,
-    resolve_prefill_instance_master_ip,
 )
 
 logger = logging.getLogger(__name__)
@@ -90,14 +88,8 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_COMMON_ENVS = {
     "STREAMS_PER_DEVICE": "32",
     "INF_NAN_MODE_FORCE_DISABLE": "1",
     "SGLANG_SET_CPU_AFFINITY": "1",
-    # The prefill instance spans 2 pods (--nnodes 2), so both the HCCL and the
-    # gloo CPU process group must bind the real NIC instead of loopback: with
-    # GLOO_SOCKET_IFNAME=lo every rank advertises 127.0.0.1 to its peers and
-    # cross-node connectFullMesh fails with "Connection refused".
-    "HCCL_SOCKET_IFNAME": NIC_NAME,
-    "GLOO_SOCKET_IFNAME": NIC_NAME,
-    # Two pods may share a host (hostNetwork); let HCCL pick free host ports.
-    "HCCL_HOST_SOCKET_PORT_RANGE": "auto",
+    "HCCL_SOCKET_IFNAME": "lo",
+    "GLOO_SOCKET_IFNAME": "lo",
     "HCCL_OP_EXPANSION_MODE": "AIV",
     # skip gpu branch
     "SGLANG_OPT_FP8_WO_A_GEMM": "0",
@@ -229,13 +221,6 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS = [
 ]
 
 
-def _override_meta_service_config(meta_cfg):
-    """Point the prefill launch args at the resolved MetaService endpoints."""
-    prefill_args = DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS
-    args_index = prefill_args.index("--hicache-storage-backend-extra-config")
-    prefill_args[args_index + 1] = _build_hicache_storage_extra_config(meta_cfg)
-
-
 # Decode node launch arguments.
 DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_DECODE_ARGS = [
     "--page-size",
@@ -359,27 +344,12 @@ class TestNPUDeepSeekV4Flash0731W8A8PDSEPGPQAHigh(
                         description,
                         result.returncode,
                     )
-
-            # Resolve the prefill instance master from the ConfigMap so every
-            # prefill pod targets the same MetaService. Must happen before
-            # super().setUpClass(), which starts the MetaService and the model
-            # server. Falls back to the local POD_IP outside k8s and for
-            # single-pod prefill (the master is this pod).
-            last_part = os.environ.get("HOSTNAME", "").rsplit("-", 1)[-1]
-            if last_part.isdigit():
-                master_ip = resolve_prefill_instance_master_ip(
-                    int(last_part), cls.model_config["prefill_args"]
-                )
-                if master_ip:
-                    meta_cfg = build_meta_service_config(master_ip)
-                    cls.meta_service_config = meta_cfg
-                    _override_meta_service_config(meta_cfg)
         super().setUpClass()
 
     model_config = DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_MODEL_CONFIG
-    # Start the npu_memcache MetaService on the prefill instance master before
-    # the model server, as required by the L3 cache backend. The endpoint is
-    # resolved from the ConfigMap in setUpClass (see METASERVICE_CONFIG above).
+    # The base class starts the npu_memcache MetaService before the model
+    # server (L3 backend requirement) and, for a multi-pod prefill instance,
+    # retargets it at the instance master resolved from the ConfigMap.
     meta_service_config = METASERVICE_CONFIG
     # (reference: Flash W8A8 GPQA Diamond baseline is 0.874).
     accuracy = 0.874

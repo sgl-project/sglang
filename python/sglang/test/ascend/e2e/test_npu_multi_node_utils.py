@@ -468,6 +468,52 @@ def resolve_prefill_instance_master_ip(
     )
 
 
+def resolve_meta_service_config(meta_service_config, prefill_args, role):
+    """Point every pod of a multi-pod prefill instance at its instance master.
+
+    The MetaService is hosted by the first pod of the instance, so the other
+    pods must talk to the master's IP instead of their own POD_IP. The L3
+    backend extra config baked into ``prefill_args`` is rewritten as well, so
+    the model server and the test agree on the same endpoints.
+
+    Returns the effective config for this pod: the input config for decode
+    pods, single-pod prefill instances or runs outside k8s.
+    """
+    if (
+        not meta_service_config
+        or role != "prefill"
+        or not (NAMESPACE and CONFIGMAP_NAME)
+    ):
+        return meta_service_config
+
+    last_part = os.getenv("HOSTNAME", "").rsplit("-", 1)[-1]
+    if not last_part.isdigit():
+        return meta_service_config
+
+    nnodes = _get_nnodes_from_args(prefill_args or []) or 1
+    if nnodes <= 1:
+        return meta_service_config
+
+    master_ip = resolve_prefill_instance_master_ip(int(last_part), prefill_args)
+    resolved = build_meta_service_config(master_ip)
+    _rewrite_storage_extra_config(prefill_args, resolved)
+    return resolved
+
+
+def _rewrite_storage_extra_config(prefill_args, meta_service_config):
+    """Replace the MetaService endpoints in the L3 backend extra config."""
+    flag = "--hicache-storage-backend-extra-config"
+    if flag not in prefill_args:
+        return
+
+    value_index = prefill_args.index(flag) + 1
+    extra_config = json.loads(prefill_args[value_index])
+    for key in ("meta_service_url", "config_store_url", "metrics_url"):
+        if key in extra_config and key in meta_service_config:
+            extra_config[key] = meta_service_config[key]
+    prefill_args[value_index] = json.dumps(extra_config)
+
+
 def check_role(allowed_roles: Union[str, Iterable[str]]):
     if isinstance(allowed_roles, str):
         allowed_roles = {allowed_roles}
