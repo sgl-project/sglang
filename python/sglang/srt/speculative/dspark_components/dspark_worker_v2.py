@@ -1,4 +1,5 @@
 import logging
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, Callable, Optional, Protocol, runtime_checkable
 
 import torch
@@ -219,7 +220,49 @@ class DSparkWorkerV2(BaseSpecWorker):
         # Inside the draft scope the context answers the draft's narrowed rank.
         self._target_tp_rank = get_parallel().tp_rank
         load_group = get_pp_stage_load_group()
-        with draft_pp_context(), self._draft_context():
+        quarot_scope = nullcontext()
+        quarot_config = None
+        apply_quarot_to_draft = envs.SGLANG_NPU_GLM_DSPARK_APPLY_QUAROT_TO_DRAFT.get()
+        if apply_quarot_to_draft and not _is_npu:
+            logger.warning_once(
+                "SGLANG_NPU_GLM_DSPARK_APPLY_QUAROT_TO_DRAFT=true was not "
+                "applied because this is not an NPU runtime."
+            )
+        elif apply_quarot_to_draft and self._draft_is_moe:
+            logger.warning_once(
+                "SGLANG_NPU_GLM_DSPARK_APPLY_QUAROT_TO_DRAFT=true was not "
+                "applied because the QuaRot adapter supports dense drafts only."
+            )
+        elif apply_quarot_to_draft:
+            from sglang.srt.hardware_backend.npu.dspark_quarot import (
+                build_glm_dspark_quarot_config,
+                glm_dspark_quarot_scope,
+                validate_glm_dspark_quarot_draft_loader,
+            )
+
+            quarot_config = build_glm_dspark_quarot_config(
+                device=self.device,
+                enabled=apply_quarot_to_draft,
+                target_model_config=target_worker.model_runner.model_config,
+                target_model=target_worker.model_runner.model,
+            )
+            if quarot_config is None:
+                logger.warning_once(
+                    "SGLANG_NPU_GLM_DSPARK_APPLY_QUAROT_TO_DRAFT=true was not "
+                    "applied because the target is not a supported GLM DSA "
+                    "ModelSlim model."
+                )
+            else:
+                validate_glm_dspark_quarot_draft_loader(
+                    load_format=(
+                        server_args.speculative_draft_load_format
+                        or server_args.load_format
+                    ),
+                    weight_cache_mode=server_args.weight_cache_mode,
+                )
+            quarot_scope = glm_dspark_quarot_scope(quarot_config)
+
+        with draft_pp_context(), self._draft_context(), quarot_scope:
             bundle = build_draft_tp_worker(
                 server_args=server_args,
                 gpu_id=gpu_id,
@@ -237,6 +280,16 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.draft_model_runner = bundle.draft_model_runner
         self.draft_model = bundle.draft_model
         self._draft_sampler = None
+
+        if _is_npu:
+            from sglang.srt.hardware_backend.npu.dspark_quarot import (
+                log_glm_dspark_quarot_runtime_status,
+            )
+
+            log_glm_dspark_quarot_runtime_status(
+                requested=apply_quarot_to_draft,
+                draft_model=self.draft_model,
+            )
 
         # The mask token is input-only (it is embedded, never sampled), so its
         # bound is the embedding-table row count: the PADDED vocab when the
@@ -328,11 +381,24 @@ class DSparkWorkerV2(BaseSpecWorker):
             verify_num_draft_tokens=self.verify_num_draft_tokens,
             tp_sync=self._tp_sync,
         )
+        self._npu_glm_compact_dp = (
+            self._verify_planner._npu_glm_target
+            and get_parallel().attn_dp_enabled
+            and self._verify_planner.is_compact_mode
+        )
+        if self._npu_glm_compact_dp and get_parallel().tp_rank == 0:
+            logger.info(
+                "GLM DSpark compact attention DP enabled (attn_dp=%d, attn_tp=%d, "
+                "budget_sync=attention-tp, target_tier_sync=tp-cpu).",
+                get_parallel().attn_dp_size,
+                get_parallel().attn_tp_size,
+            )
         if (
             get_parallel().attn_dp_enabled
             and not self._draft_is_moe
             and self._verify_planner.is_compact_mode
             and self._decode_graph_allowed
+            and not self._npu_glm_compact_dp
         ):
             raise ValueError(
                 "DSpark dense-draft compact verify under attention DP does not "
@@ -934,8 +1000,17 @@ class DSparkWorkerV2(BaseSpecWorker):
                     coordination_plan.apply(
                         batch, "target", rank, local_only=target_local_only
                     )
+                idle_layout = self._idle_verify_ragged_layout(batch)
+                if self._npu_glm_compact_dp:
+                    from sglang.srt.hardware_backend.npu.dspark_dp import (
+                        coordinate_compact_dp_layout,
+                    )
+
+                    idle_layout = coordinate_compact_dp_layout(
+                        batch=batch, layout=None, model_runner=self.model_runner
+                    )
                 self._verify_executor.run_idle_participation(
-                    batch=batch, idle_layout=self._idle_verify_ragged_layout(batch)
+                    batch=batch, idle_layout=idle_layout
                 )
             return self._decode_idle_result(on_publish=on_publish)
 
@@ -1039,6 +1114,14 @@ class DSparkWorkerV2(BaseSpecWorker):
             global_num_reqs=global_num_reqs,
             dp_tier_num_tokens=self._dp_verify_tier_num_tokens(batch),
         )
+        if self._npu_glm_compact_dp:
+            from sglang.srt.hardware_backend.npu.dspark_dp import (
+                coordinate_compact_dp_layout,
+            )
+
+            layout = coordinate_compact_dp_layout(
+                batch=batch, layout=layout, model_runner=self.model_runner
+            )
         run_compact = self._verify_planner.should_run_compact(layout=layout)
 
         verify_ids_2d = proposal.verify_ids

@@ -68,7 +68,7 @@ from sglang.srt.speculative.spec_utils import (
     sample_simulated_acc_len,
     simulated_acc_len_generator,
 )
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import is_device_stream_capturing, is_npu
 from sglang.srt.utils.invariants import Bucket, Invariant, NotNaN, expect
 
 logger = logging.getLogger(__name__)
@@ -280,19 +280,33 @@ class TargetVerifyExecutor:
         )
         if idle_layout is not None:
             num_dummy_slots = int(idle_layout.verify_lens.numel())
-            batch.seq_lens = torch.ones(
-                (num_dummy_slots,), dtype=torch.int64, device=device
+            glm_idle = _is_npu and getattr(
+                self.model_runner.attn_backend, "_dspark_dsa_ragged_verify", False
+            )
+            batch.seq_lens = torch.full(
+                (num_dummy_slots,),
+                0 if glm_idle else 1,
+                dtype=torch.int64,
+                device=device,
             )
             batch.req_pool_indices = torch.zeros(
                 (num_dummy_slots,), dtype=torch.int64, device=device
             )
-            batch.seq_lens_cpu = torch.ones((num_dummy_slots,), dtype=torch.int64)
-            batch.seq_lens_sum = num_dummy_slots
+            batch.seq_lens_cpu = torch.full(
+                (num_dummy_slots,), 0 if glm_idle else 1, dtype=torch.int64
+            )
+            batch.seq_lens_sum = 0 if glm_idle else num_dummy_slots
             batch.forward_mode = ForwardMode.TARGET_VERIFY
         verify_input.live_seq_lens_cpu = batch.seq_lens_cpu
         verify_forward_batch, _ = verify_input.prepare_for_verify(
             batch, self.target_worker
         )
+        if _is_npu:
+            from sglang.srt.hardware_backend.npu.dspark_dp import (
+                prepare_compact_dp_forward_batch,
+            )
+
+            prepare_compact_dp_forward_batch(verify_forward_batch, self.model_runner)
         self.target_worker.forward_batch_generation(
             batch=None,
             forward_batch=verify_forward_batch,
@@ -372,6 +386,12 @@ class TargetVerifyExecutor:
         batch.seq_lens_cpu = seq_lens_cpu_backup
         batch.seq_lens_sum = seq_lens_sum_backup
 
+        if _is_npu:
+            from sglang.srt.hardware_backend.npu.dspark_dp import (
+                prepare_compact_dp_forward_batch,
+            )
+
+            prepare_compact_dp_forward_batch(verify_forward_batch, self.model_runner)
         target_out = self.target_worker.forward_batch_generation(
             batch=None,
             forward_batch=verify_forward_batch,
@@ -454,7 +474,10 @@ class TargetVerifyExecutor:
         batch.out_cache_loc = ragged_window.verify_cache_loc
         seq_lens_cpu_backup = batch.seq_lens_cpu
         seq_lens_sum_backup = batch.seq_lens_sum
-        if seq_lens_cpu_backup is not None:
+        npu_device_metadata = _is_npu and getattr(
+            self.model_runner.attn_backend, "_dspark_dsa_ragged_verify", False
+        )
+        if seq_lens_cpu_backup is not None and not npu_device_metadata:
             verify_lens_cpu = (
                 layout.verify_lens_cpu
                 if layout.verify_lens_cpu is not None
@@ -974,7 +997,7 @@ class DsparkVerifyEpilogue:
             and buf.shape[1] == compact.shape[1]
         ):
             return buf
-        assert not torch.get_device_module().is_current_stream_capturing(), (
+        assert not is_device_stream_capturing(compact.device), (
             "DsparkVerifyEpilogue output buffers must be allocated during "
             "warmup, not inside graph capture (pool memory is unreadable "
             "post-replay)."

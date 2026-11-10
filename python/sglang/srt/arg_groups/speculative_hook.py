@@ -668,6 +668,34 @@ def _target_checkpoint_dspark_subfolder(
     return os.path.join(snapshot, _DSPARK_DRAFT_SUBFOLDER)
 
 
+def _validate_npu_glm_dspark_compact(cfg) -> None:
+    """Fail before model loading for execution paths not covered by this port."""
+    unsupported = []
+    if cfg.cuda_graph_config.decode.backend not in ("disabled", "full"):
+        unsupported.append("decode graph backend full or disabled")
+    if cfg.dp_size != 1:
+        unsupported.append("replica DP size 1 (attention DP is supported)")
+    if cfg.attn_dp_size > 1:
+        if not cfg.enable_dp_lm_head:
+            unsupported.append("--enable-dp-lm-head for attention DP")
+        if cfg.tp_size % cfg.attn_dp_size:
+            unsupported.append("TP size divisible by attention DP size")
+        if envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get():
+            unsupported.append(
+                "DP MLP synchronization and scheduler all-gather enabled"
+            )
+        if envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get():
+            unsupported.append("DP speculative prefill coordination disabled")
+    if cfg.attn_cp_size != 1 or cfg.pp_size != 1:
+        unsupported.append("attention CP size 1 and PP size 1")
+    if cfg.dcp_size != 1:
+        unsupported.append("decode context parallel size 1")
+    if cfg.disaggregation_mode != "null":
+        unsupported.append("colocated serving (--disaggregation-mode null)")
+    if unsupported:
+        raise ValueError("NPU DSpark compact requires " + ", ".join(unsupported) + ".")
+
+
 def _handle_dspark(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
     _is_npu = cfg.device.startswith("npu")
@@ -875,6 +903,11 @@ def _handle_dspark(server_args: ServerArgs) -> None:
     )
 
     ragged_mode = read_ragged_verify_mode()
+    if _is_npu and ragged_mode is RaggedVerifyMode.COMPACT:
+        from sglang.srt.configs.model_config import is_glm_moe_dsa
+
+        if is_glm_moe_dsa(model_config_of(server_args).hf_config):
+            _validate_npu_glm_dspark_compact(cfg)
     if (
         cfg.speculative_dspark_align_verify_tokens_to_graph_tier
         and ragged_mode is not RaggedVerifyMode.COMPACT

@@ -205,7 +205,14 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
 
     def prepare_replay(self, forward_batch):
         runner = self._decode_runner
-        if runner is None or forward_batch.needs_forward_metadata_init():
+        if (
+            runner is None
+            or forward_batch.needs_forward_metadata_init()
+            or (
+                runner.ragged_verify_mode
+                and forward_batch.ragged_verify_layout is not None
+            )
+        ):
             return False
         if not runner.model_runner.spec_algorithm.is_dflash():
             # Preserve the NPU pre-planned path without refreshing metadata
