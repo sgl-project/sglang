@@ -144,7 +144,7 @@ class PhysisH3Denoiser:
         return latent, hidden
 
     def bootstrap(self, num_frames=1, owned_slices=None):
-        """Denoise the opening prefix jointly and retain KV for the owned slices."""
+        """Yield after each opening step and sink setup; the final value is the prefix."""
         if not 1 <= num_frames <= self.context.history + 1:
             raise ValueError("Bootstrap must fit in the H3 history window")
         prefix = self
@@ -165,6 +165,7 @@ class PhysisH3Denoiser:
             latent, _ = prefix.run_slice(
                 latent, None, 0, step, 0, len(self.model.blocks)
             )
+            yield None
         pages = prefix.context.caches
         prefix.context.caches = {}
         # The sink forward is conditioned at sigma=0.001, so its input must
@@ -182,7 +183,8 @@ class PhysisH3Denoiser:
         self.context.caches.clear()
         self.context.sink_only = False
         if num_frames == 1:
-            return latent
+            yield latent
+            return
         owned = (
             {
                 (part.timestep, layer)
@@ -204,7 +206,7 @@ class PhysisH3Denoiser:
             cache = self.context._new_cache(k[0])
             cache.update_and_get_attention_kv(key=k, value=v, current_chunk_start=0)
             self.context.caches[key] = cache
-        return latent
+        yield latent
 
     def run_chunk(self, chunk, slices, latent=None, hidden=None):
         if latent is None:

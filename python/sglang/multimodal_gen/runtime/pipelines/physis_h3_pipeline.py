@@ -3,7 +3,7 @@
 
 import sys
 import time
-from contextlib import ExitStack, contextmanager, nullcontext
+from contextlib import ExitStack, closing, contextmanager, nullcontext
 
 import torch
 import torch.distributed as dist
@@ -158,13 +158,17 @@ class PhysisH3TextStage(PipelineStage):
         return batch
 
 
-def _run_wavefront(runner, plan, rank, num_chunks, start_chunk=1):
+def _run_wavefront(
+    runner, plan, rank, num_chunks, start_chunk=1, *, check_cancelled=None
+):
     """All ranks, including the decoder, agree before each bounded transfer."""
     slices = plan.slices(rank) if rank < plan.degree else ()
     latent, hidden = None, None
     finished = []
     group = get_world_group().device_group
     for tick in range(num_chunks - start_chunk + plan.degree - 1):
+        if check_cancelled is not None:
+            check_cancelled()
         chunk = tick - rank + start_chunk
         active = rank < plan.degree and start_chunk <= chunk < num_chunks
         operations = []
@@ -253,7 +257,7 @@ class PhysisH3DenoisingStage(PipelineStage):
         bootstrap_frames = min(
             server_args.pipeline_config.physis_bootstrap_chunks, num_chunks
         )
-        runner = opening = None
+        runner = opening = bootstrap = None
         scope = (
             self.use_declared_component(component_name="transformer", module=model)
             if model is not None
@@ -284,7 +288,7 @@ class PhysisH3DenoisingStage(PipelineStage):
                         sp_size=sp.world_size,
                         sp_rank=sp.rank_in_group,
                     )
-                    opening = runner.bootstrap(
+                    bootstrap = runner.bootstrap(
                         bootstrap_frames,
                         owned_slices=plan.slices(rank if parallel else 0),
                     )
@@ -294,9 +298,29 @@ class PhysisH3DenoisingStage(PipelineStage):
                     raise
                 error = str(exc)
             _raise_if_any_rank_failed(error)
+            with (
+                closing(bootstrap) if bootstrap is not None else nullcontext() as steps
+            ):
+                for _ in range(plan.num_steps + 1):
+                    self.check_cancelled(batch)
+                    error = None
+                    try:
+                        if steps is not None:
+                            opening = next(steps)
+                        torch.cuda.synchronize()
+                    except Exception as exc:
+                        if not parallel:
+                            raise
+                        error = str(exc)
+                    _raise_if_any_rank_failed(error)
             if parallel:
                 chunks = _run_wavefront(
-                    runner, plan, rank, num_chunks, start_chunk=bootstrap_frames
+                    runner,
+                    plan,
+                    rank,
+                    num_chunks,
+                    start_chunk=bootstrap_frames,
+                    check_cancelled=lambda: self.check_cancelled(batch),
                 )
                 latents = None
                 error = None
@@ -310,10 +334,15 @@ class PhysisH3DenoisingStage(PipelineStage):
                     latents, src=plan.degree - 1, dst=self.pipeline.decoder_rank
                 )
             else:
-                chunks = [
-                    runner.run_chunk(chunk, plan.slices(0))[0]
-                    for chunk in range(bootstrap_frames, num_chunks)
-                ]
+                chunks = []
+                for chunk in range(bootstrap_frames, num_chunks):
+                    latent = hidden = None
+                    for part in plan.slices(0):
+                        self.check_cancelled(batch)
+                        latent, hidden = runner.run_chunk(
+                            chunk, (part,), latent, hidden
+                        )
+                    chunks.append(latent)
                 if rank == 0:
                     batch.latents = torch.cat([opening, *chunks], dim=2)
             del runner

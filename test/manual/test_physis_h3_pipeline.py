@@ -25,10 +25,17 @@ from sglang.multimodal_gen.runtime.distributed.causal_pipeline import CausalPipe
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_world_group,
     init_distributed_environment,
+    initialize_model_parallel,
+)
+from sglang.multimodal_gen.runtime.managers import request_cancel
+from sglang.multimodal_gen.runtime.managers.request_cancel_error import (
+    RequestCancelledError,
 )
 from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
+from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import MiniMaxH3Rope
 from sglang.multimodal_gen.runtime.pipelines.physis_h3_pipeline import (
     PhysisH3DecodingStage,
+    PhysisH3DenoisingStage,
     _distribute_tensor,
     _run_wavefront,
     _synchronized_component_scope,
@@ -263,7 +270,131 @@ def rank_main(rank, port, folder):
     dist.destroy_process_group()
 
 
+class TinyModel:
+    arch = SimpleNamespace(latents_dim=1, hidden_size=8, patch_size=(1, 2, 2))
+
+    def __init__(self):
+        self.rope = MiniMaxH3Rope(1).cuda()
+        self.blocks = [lambda hidden, **kwargs: hidden for _ in range(3)]
+
+    def refine_prompt_embeds(self, embeds, *args, **kwargs):
+        return embeds
+
+    def _time_embedding(self, timestep):
+        return timestep.new_zeros((1, 8))
+
+    def video_patch_proj(self, rows):
+        return rows.new_zeros((rows.shape[0], 8)), None
+
+    def final_layer(self, hidden, **kwargs):
+        return hidden.new_zeros((hidden.shape[0], 4)), None
+
+
+def rank_cancel_main(rank, port, folder, mode):
+    os.environ["LOCAL_RANK"] = str(rank)
+    torch.cuda.set_device(rank)
+    init_distributed_environment(
+        world_size=4,
+        rank=rank,
+        local_rank=rank,
+        backend="nccl",
+        distributed_init_method=f"tcp://127.0.0.1:{port}",
+        device_id=torch.device("cuda", rank),
+    )
+    parallel = mode != "off"
+    initialize_model_parallel(
+        sequence_parallel_degree=1 if parallel else 4,
+        ulysses_degree=1 if parallel else 4,
+        pipeline_parallel_degree=4 if parallel else 1,
+        separate_decode_ranks=parallel,
+    )
+    args = SimpleNamespace(
+        comfyui_mode=False,
+        causal_pipeline_mode=mode,
+        causal_pipeline_parallel_size=3 if parallel else 1,
+        pipeline_config=SimpleNamespace(
+            physis_bootstrap_chunks=5, physis_history_chunks=18
+        ),
+    )
+    set_global_server_args(args)
+    model = TinyModel() if not parallel or rank < 3 else None
+    pipeline = SimpleNamespace(
+        decoder_rank=3 if parallel else 0,
+        get_module=lambda name: model,
+    )
+    stage = PhysisH3DenoisingStage(pipeline)
+    original_check = stage.check_cancelled
+    checks = 0
+
+    def check(batch):
+        nonlocal checks
+        checks += 1
+        original_check(batch)
+
+    stage.check_cancelled = check
+    for cancel_at in (3, 5, 8, None):
+        checks = 0
+        batch = Req(
+            num_frames=22,
+            height=32,
+            width=32,
+            seed=42,
+            request_id="cancel-test",
+            cancellable=True,
+        )
+        batch.prompt_embeds = [torch.ones(2, 8, device="cuda", dtype=torch.bfloat16)]
+        listener = SimpleNamespace(
+            is_cancelled=lambda ids: cancel_at is not None and checks >= cancel_at
+        )
+        with (
+            patch.object(request_cancel, "_enabled", True),
+            patch.object(request_cancel, "_listener", listener if rank == 0 else None),
+        ):
+            if cancel_at is None:
+                result = stage.forward(batch, args)
+                if rank == pipeline.decoder_rank:
+                    assert tuple(result.latents.shape) == (1, 1, 7, 2, 2)
+            else:
+                try:
+                    stage.forward(batch, args)
+                except RequestCancelledError:
+                    assert checks == cancel_at, (rank, checks, cancel_at)
+                else:
+                    raise AssertionError("Physis denoising ignored cancellation")
+        get_world_group().barrier()
+    Path(folder, f"finished-{rank}").touch()
+    dist.destroy_process_group()
+
+
 class TestPhysisPipelineFailures(CustomTestCase):
+    @unittest.skipUnless(torch.cuda.device_count() >= 4, "requires four CUDA GPUs")
+    def test_cancellation_at_sampling_boundaries(self):
+        """Every rank stops together during bootstrap, sink setup and later sampling."""
+        for mode in ("off", "block"):
+            with self.subTest(mode=mode), socket.socket() as sock:
+                sock.bind(("127.0.0.1", 0))
+                port = sock.getsockname()[1]
+            with tempfile.TemporaryDirectory(prefix="physis-cancel-") as folder:
+                context = mp.spawn(
+                    rank_cancel_main, args=(port, folder, mode), nprocs=4, join=False
+                )
+                try:
+                    deadline = time.monotonic() + 120
+                    while not context.join(timeout=1):
+                        self.assertLess(
+                            time.monotonic(), deadline, "cancellation hung a rank"
+                        )
+                    self.assertEqual(len(list(Path(folder).glob("finished-*"))), 4)
+                finally:
+                    for process in context.processes:
+                        if process.is_alive():
+                            process.terminate()
+                    for process in context.processes:
+                        process.join(timeout=5)
+                        if process.is_alive():
+                            process.kill()
+                            process.join(timeout=5)
+
     @unittest.skipUnless(torch.cuda.device_count() >= 4, "requires four CUDA GPUs")
     def test_rank_local_failure_then_success(self):
         with socket.socket() as sock:
