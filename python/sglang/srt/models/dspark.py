@@ -26,7 +26,6 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dflash_utils import can_dflash_slice_qkv_weight
 from sglang.srt.speculative.dspark_components.dspark_config import (
     builds_confidence_head,
-    drops_unloaded_confidence_head,
     get_dspark_sample_from_anchor,
     parse_dspark_draft_config,
 )
@@ -683,13 +682,16 @@ class DSparkDraftMixin:
             weight_loader(param, loaded_weight)
             loaded_names.add(name)
 
-        drops_unloaded_confidence_head(
-            self,
-            param_names={
-                name for name in params_dict if name.startswith("confidence_head.")
-            },
-            loaded_names=loaded_names,
-        )
+        confidence_param_names = {
+            name for name in params_dict if name.startswith("confidence_head.")
+        }
+        missing = confidence_param_names - loaded_names
+        if missing:
+            raise ValueError(
+                f"DSpark confidence head is enabled but the checkpoint is missing "
+                f"{sorted(missing)}. Provide a checkpoint with trained confidence weights, "
+                f"or set SGLANG_DSPARK_USE_ONLINE_ESTIMATOR=1."
+            )
 
     def _fused_kv_write_bundle(self, pool):
         cached = self._fused_kv_write_cache

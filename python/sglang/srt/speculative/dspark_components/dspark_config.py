@@ -38,45 +38,18 @@ def get_dspark_sample_from_anchor(draft_hf_config: Any) -> bool:
 
 def builds_confidence_head(draft_hf_config: Any) -> bool:
     """Whether the draft builds its trained confidence head; ragged verify
-    without one takes its confidences from the online acceptance estimator. A
-    config without enable_confidence_head builds it, and the first load drops it
-    when the checkpoint has no head weights (drops_unloaded_confidence_head)."""
+    without one takes its confidences from the online acceptance estimator."""
     if read_ragged_verify_mode() is RaggedVerifyMode.STATIC:
         return False
-    if envs.SGLANG_DSPARK_USE_ONLINE_ESTIMATOR.get():
-        return False
     enabled = _cfg_get(draft_hf_config, "enable_confidence_head")
-    return enabled is None or bool(enabled)
-
-
-def drops_unloaded_confidence_head(
-    model: Any, *, param_names: set, loaded_names: set
-) -> bool:
-    """Checks a built confidence head against its model's first weight load and
-    sets model.confidence_head to None when the config does not set
-    enable_confidence_head and the checkpoint has none of the head's weights.
-    Any other missing head weight on the first load raises; later loads, such as
-    partial weight updates, leave the head alone."""
-    first_load = not getattr(model, "_confidence_head_checked", False)
-    model._confidence_head_checked = True
-    missing = param_names - loaded_names
-    if not first_load or model.confidence_head is None or not missing:
+    if enabled is False or envs.SGLANG_DSPARK_USE_ONLINE_ESTIMATOR.get():
         return False
-    if (
-        missing == param_names
-        and _cfg_get(model.config, "enable_confidence_head") is None
-    ):
-        logger.info(
-            "DSpark draft checkpoint has no confidence head weights; ragged verify "
-            "takes its confidences from the online acceptance estimator."
+    if enabled is None:
+        logger.warning(
+            "DSpark draft config has no enable_confidence_head field; treating the "
+            "confidence head as enabled."
         )
-        model.confidence_head = None
-        return True
-    raise ValueError(
-        f"DSpark confidence head is enabled but the checkpoint is missing "
-        f"{sorted(missing)}. Provide a checkpoint with trained confidence weights, "
-        f"or set SGLANG_DSPARK_USE_ONLINE_ESTIMATOR=1."
-    )
+    return True
 
 
 def draft_uses_compressed_kv_attention() -> bool:
