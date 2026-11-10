@@ -1416,6 +1416,9 @@ class TestDeclaredParts(CustomTestCase):
         from unittest.mock import patch
 
         from sglang.srt.configs.qwen3_next import Qwen3NextConfig
+        from sglang.srt.layers.attention.mamba.mamba2_metadata import (
+            ForwardStateSlots,
+        )
         from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
         from sglang.srt.model_executor.forward_mode import ForwardMode
         from sglang.srt.speculative.spec_utils import commit_mamba_states_after_verify
@@ -1466,6 +1469,15 @@ class TestDeclaredParts(CustomTestCase):
                         page_size=4,
                         device="cpu",
                     ),
+                )
+                # The verify forward's metadata preparation resolved its slots.
+                state_ids = runner.runner_ids.state_ids(req.state_sub_pool)
+                forward_slots = ForwardStateSlots(
+                    state_ids.ids(req.get_mamba_indices(batch.req_pool_indices)),
+                    state_ids.ids(track),
+                )
+                runner.attn_backend = SimpleNamespace(
+                    forward_state_slots=lambda n, track_ids: forward_slots
                 )
                 outputs, conv_destinations = [], []
 
