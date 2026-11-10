@@ -239,6 +239,32 @@ jobs:
           TEST_LOG_DIR="/tmp/test-logs"
           mkdir -p "${TEST_LOG_DIR}"
 
+          # ---- Temporary: 1s host-resource sampling for perf-regression triage ----
+          # Records cgroup CPU throttling, cpufreq, runnable queue and top CPU
+          # consumers so a mid-run stall can be attributed afterwards.
+          HOSTMON_DIR=/tmp/hostmon
+          mkdir -p "${HOSTMON_DIR}"
+          rm -f "${HOSTMON_DIR}/stop" "${HOSTMON_DIR}/cpu.log"
+          (
+            while [ ! -f "${HOSTMON_DIR}/stop" ]; do
+              ts=$(date -u +%H:%M:%S)
+              cg=$(grep -E 'nr_throttled|throttled_(usec|time)' /sys/fs/cgroup/cpu.stat /sys/fs/cgroup/cpu/cpu.stat 2>/dev/null | tr '\n' ',' | tr -d ' ' || true)
+              cgmax=$(cat /sys/fs/cgroup/cpu.max 2>/dev/null || echo "q=$(cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us 2>/dev/null || echo n/a)/p=$(cat /sys/fs/cgroup/cpu/cpu.cfs_period_us 2>/dev/null || echo n/a)")
+              fmin=$(cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq 2>/dev/null | sort -n | head -1 || true)
+              fmax=$(cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq 2>/dev/null | sort -n | tail -1 || true)
+              gov=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo n/a)
+              vm=$(vmstat 1 2 2>/dev/null | tail -1 | awk '{print "r="$1",b="$2",sy="$13",id="$15}' || true)
+              top=$(ps -eo pcpu=,comm= --sort=-pcpu 2>/dev/null | head -3 | tr -s ' ' | tr '\n' ';' || true)
+              echo "${ts} | ${cg} | quota=${cgmax} | gov=${gov} | freq_khz=${fmin}..${fmax} | ${vm} | top=${top}" \
+                >> "${HOSTMON_DIR}/cpu.log" 2>&1
+              sleep 1
+            done
+          ) &
+          HOSTMON_PID=$!
+          # Preserve the step's real exit code: an EXIT trap without an explicit
+          # `exit` would otherwise make a failed test look green.
+          trap 'rc=$?; touch "${HOSTMON_DIR}/stop"; wait "${HOSTMON_PID}" 2>/dev/null || true; exit ${rc}' EXIT
+
           sglang_source_path=$(pwd)
           echo "Source code path: ${sglang_source_path}"
           ln -sf ${sglang_source_path} /root/sglang
@@ -440,6 +466,26 @@ jobs:
           ${PYTHON_FOR_SGLANG} -u run_suite.py --hw npu --suite ${test_suite} ${NIGHTLY_FLAG} ${PARTITION_ARGS} ${ONLY_FILE_ARGS} ${TIMEOUT_FLAG} --enable-retry --max-attempts 1 --timeout-per-file 7200 2>&1 | tee "${LOG_TEE_TARGETS[@]}" || test_exit_code=$?
 
           echo "Finished test: ${tc_name}"
+
+          # ---- Temporary: stop sampler and dump host-resource evidence ----
+          touch "${HOSTMON_DIR}/stop"
+          wait "${HOSTMON_PID}" 2>/dev/null || true
+          echo "===== HOST MONITOR SUMMARY (1s sampling) ====="
+          echo "samples: $(wc -l < "${HOSTMON_DIR}/cpu.log" 2>/dev/null || echo 0)"
+          echo "--- cgroup CPU throttling delta over the run ---"
+          grep -oE 'nr_throttled=[0-9]+,throttled_(usec|time)=[0-9]+' "${HOSTMON_DIR}/cpu.log" 2>/dev/null \
+            | awk -F'[=,]' 'NR==1{n0=$2;t0=$4} {n1=$2;t1=$4} END{if(NR>0) print "nr_throttled +"(n1-n0)", throttled_time +"(t1-t0)" us"; else print "n/a (cpu.stat not readable)"}' || true
+          echo "--- samples with system idle% < 20 (CPU starvation) ---"
+          grep -E 'id=[0-9]+' "${HOSTMON_DIR}/cpu.log" 2>/dev/null \
+            | awk -F'id=' '{split($2,a," "); if (a[1]+0 < 20) print}' | head -100 || true
+          echo "--- cpufreq / governor transitions ---"
+          grep -oE 'gov=[a-z]+ \| freq_khz=[0-9]+\.\.[0-9]+' "${HOSTMON_DIR}/cpu.log" 2>/dev/null | sort | uniq -c | sort -rn | head -10 || true
+          echo "--- trace head (first 30 samples) ---"
+          head -30 "${HOSTMON_DIR}/cpu.log" 2>/dev/null || true
+          echo "..."
+          echo "--- trace tail (last 60 samples) ---"
+          tail -60 "${HOSTMON_DIR}/cpu.log" 2>/dev/null || true
+          echo "===== END HOST MONITOR ====="
 
           if [ "${test_exit_code}" = "0" ]; then
             test_status="pass"
