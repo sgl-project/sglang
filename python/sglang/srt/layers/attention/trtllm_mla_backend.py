@@ -299,7 +299,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         self.num_draft_tokens = get_spec().speculative_num_draft_tokens
         # Per-row window indices, built at the first sliding layer of a forward
-        # and reused by the next ones: (forward_batch, layer_id, indices, counts).
+        # and reused by the next ones: (id(forward_batch), layer_id, indices,
+        # counts). An id reused by a later batch cannot match: its forward
+        # starts at a layer id no greater than the cached one.
         self._window_index_cache = None
         self._window_counter_buffer = None
         self._window_row_indptr = None
@@ -1449,10 +1451,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         cache = self._window_index_cache
         if (
             cache is not None
-            and cache[0] is forward_batch
+            and cache[0] == id(forward_batch)
             and cache[1] == layer.layer_id - 1
         ):
-            self._window_index_cache = (forward_batch, layer.layer_id, *cache[2:])
+            self._window_index_cache = (cache[0], layer.layer_id, *cache[2:])
             return cache[2], cache[3]
         parallel = get_parallel()
         indices, counts = mla_window_sparse_indices(
@@ -1465,7 +1467,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             page_size=self.page_size,
             v2p=self.runner_ids.full_v2p_table,
         )
-        self._window_index_cache = (forward_batch, layer.layer_id, indices, counts)
+        self._window_index_cache = (id(forward_batch), layer.layer_id, indices, counts)
         return indices, counts
 
     def _forward_sliding_window(
