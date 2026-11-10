@@ -1862,6 +1862,7 @@ def setup_state_kv_args(
             if draft_token_to_kv_pool is not None
             else 0
         )
+    _append_draft_kv_ring_state(kv_args)
 
 
 def _token_kv_view(token_to_kv_pool):
@@ -1869,6 +1870,28 @@ def _token_kv_view(token_to_kv_pool):
     a pool wrapping one beside recurrent state (a hybrid draft) holds its
     layers in, else the pool itself."""
     return token_to_kv_pool.layer_router.wrapped_view() or token_to_kv_pool
+
+
+def _append_draft_kv_ring_state(kv_args: KVArgs) -> None:
+    """A DFLASH draft KV ring ships its last window and its floor, last on both
+    sides so the component order matches. A PP stage without the draft keeps
+    empty slots and sends nothing for them."""
+    from sglang.srt.disaggregation.base.conn import StateType
+    from sglang.srt.speculative.dflash_draft_ring import (
+        draft_kv_ring_enabled,
+        get_draft_kv_ring,
+    )
+
+    ring = get_draft_kv_ring()
+    if ring is not None:
+        append_state_component(kv_args, StateType.DRAFT_RING, *ring.ring_buf_infos())
+        append_state_component(kv_args, StateType.REQUEST_ROW, *ring.floor_buf_infos())
+    elif (
+        str(get_spec().speculative_algorithm).upper() == "DFLASH"
+        and draft_kv_ring_enabled()
+    ):
+        append_state_component(kv_args, StateType.DRAFT_RING, [], [], [])
+        append_state_component(kv_args, StateType.REQUEST_ROW, [], [], [])
 
 
 def get_dsv41_spec_layout(kv_args: KVArgs) -> Optional[dict]:

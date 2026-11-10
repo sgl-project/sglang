@@ -110,6 +110,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
 )
+from sglang.srt.speculative.dflash_draft_ring import get_draft_kv_ring
 from sglang.srt.utils import is_npu, rank_consensus_checker
 from sglang.srt.utils.device import async_d2h
 
@@ -1888,6 +1889,12 @@ class SchedulerDisaggregationPrefillMixin:
                     int(req.kv.req_pool_idx), c128_seq_len
                 )
 
+            def _draft_ring_payload():
+                ring = get_draft_kv_ring()
+                if ring is None:
+                    return None
+                return ring.transfer_rows(int(req.kv.req_pool_idx), seq_len)
+
             def _request_row_payload():
                 return np.array([req.kv.req_pool_idx], dtype=np.int32)
 
@@ -1904,6 +1911,7 @@ class SchedulerDisaggregationPrefillMixin:
                 StateType.MINIMAX_INDEX_K: _minimax_payload,
                 StateType.MINIMAX_DENSE_KV: _full_kv_pages_payload,
                 StateType.SWA_RING: _swa_ring_payload,
+                StateType.DRAFT_RING: _draft_ring_payload,
                 StateType.DSV4_REQUEST_STATE: _request_state_payload,
                 StateType.REQUEST_ROW: _request_row_payload,
                 StateType.BLOCK_SCALE: _full_kv_pages_payload,

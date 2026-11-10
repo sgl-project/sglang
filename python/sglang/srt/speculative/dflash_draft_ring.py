@@ -16,10 +16,16 @@ Row 0 is the write sink. The window kernel computes the same rows directly
 A request's ring holds no positions from before its first prefill chunk (its
 prefix-cache hit) or from a previous request in the same req pool slot;
 ``min_pos`` floors the window there.
+
+Under PD disaggregation prefill sends a request's last window of ring rows
+(``transfer_rows``, positionally matched like DeepSeek-V4's SWA ring) and its
+``min_pos`` row; a decode rank keeps the positions it owns.
 """
 
-from typing import Any, Callable, Dict, Optional
+from contextlib import nullcontext
+from typing import Dict, List, Optional, Tuple
 
+import numpy as np
 import torch
 
 from sglang.kernels.ops.speculative.dflash_ring_locs import dflash_ring_block_locs
@@ -110,12 +116,22 @@ class DFlashDraftKVRing:
         dcp_size: int,
         req_pool_rows: int,
         device: torch.device,
+        window_left: int = 0,
+        dcp_rank: int = 0,
+        pool=None,
+        mem_pool: Optional[torch.cuda.MemPool] = None,
     ):
         self.rows_per_req = rows_per_req
         self.dcp_size = dcp_size
+        self.window_left = window_left
+        self.dcp_rank = dcp_rank
+        self.pool = pool
         # Positions a ring holds without wrapping onto each other.
         self.span = rows_per_req * dcp_size
-        self.min_pos = torch.zeros(req_pool_rows, dtype=torch.int32, device=device)
+        # PD writes min_pos rows remotely; Mooncake's NVLink transport only
+        # reaches memory from the KV pools' cuMemCreate pool.
+        with torch.cuda.use_mem_pool(mem_pool) if mem_pool else nullcontext():
+            self.min_pos = torch.zeros(req_pool_rows, dtype=torch.int32, device=device)
         self._floor_rids: Dict[int, str] = {}
 
     def locs(
@@ -183,3 +199,49 @@ class DFlashDraftKVRing:
             ] = torch.tensor(floors, dtype=torch.int32).to(
                 self.min_pos.device, non_blocking=True
             )
+
+    def transfer_rows(self, req_pool_idx: int, seq_len: int) -> np.ndarray:
+        """This rank's ring rows of the last window before ``seq_len``, in
+        position order; row 0 (the sink) for a position another rank owns."""
+        positions = np.arange(
+            max(0, seq_len - self.window_left - 1), seq_len, dtype=np.int64
+        )
+        rows = (
+            1
+            + req_pool_idx * self.rows_per_req
+            + (positions // self.dcp_size) % self.rows_per_req
+        )
+        rows[positions % self.dcp_size != self.dcp_rank] = 0
+        return rows.astype(np.int32)
+
+    def reset_floor(self, req_pool_idx: int, seq_len: int) -> None:
+        """PD decode, at preallocation: no draft context until prefill's floor
+        row lands, so a prefill that ships no ring leaves an empty window
+        rather than a stale one."""
+        self.min_pos[req_pool_idx].fill_(seq_len)
+
+    def ring_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
+        """The draft pool's buffers with one item per ring row."""
+        ptrs, lens, item_lens = self.pool.get_contiguous_buf_infos()
+        return ptrs, lens, [n // self.pool.page_size for n in item_lens]
+
+    def floor_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
+        """``min_pos`` with one item per req pool row."""
+        return (
+            [self.min_pos.data_ptr()],
+            [self.min_pos.nbytes],
+            [self.min_pos.element_size()],
+        )
+
+
+_active_ring: Optional[DFlashDraftKVRing] = None
+
+
+def set_draft_kv_ring(ring: Optional[DFlashDraftKVRing]) -> None:
+    global _active_ring
+    _active_ring = ring
+
+
+def get_draft_kv_ring() -> Optional[DFlashDraftKVRing]:
+    """This process's draft KV ring, for PD state registration and payloads."""
+    return _active_ring

@@ -30,6 +30,10 @@ class StateType(str, enum.Enum):
     # DeepSeek-V4 unified_kv SWA ring: addressed per-row by ring slot
     # (req_pool_idx * ring_stride + pos % ring_stride), needs its own component.
     SWA_RING = "swa_ring"
+    # DFLASH draft KV ring: one item per ring row, the request's last window in
+    # position order; row 0 marks a position the sending or receiving rank does
+    # not own under DCP.
+    DRAFT_RING = "draft_ring"
     # DeepSeek-V4 request-scoped compression state; preserve the legacy wire value.
     DSV4_REQUEST_STATE = "c128_state"
     # One item per request row (req_pool_idx), sent row to row: the DeepSeek-V4
