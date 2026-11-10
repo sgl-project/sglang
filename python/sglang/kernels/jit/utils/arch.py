@@ -102,8 +102,15 @@ def _cuda_arch_suffix(major: int, minor: int) -> str:
     return ""
 
 
+# JIT modules that build against FlashInfer's bundled CUTLASS. On CC 10.7 they
+# build the sm_100f family target until that CUTLASS declares Sm107: against it an
+# sm_107a build compiles, but CuTe's TMA copies and setmaxnreg compile out (#45911).
+# Every other module builds sm_107a (sm_100f also caps static smem at 48 KB, #49385).
+MODULE_USES_CUTLASS = ["deep_select_topk"]
+
+
 @cache_once
-def get_compile_arch() -> CompileArch:
+def get_compile_arch(kernel_name: str = "") -> CompileArch:
     """The target JIT builds compile for: the local GPU, with its a/f suffix.
 
     Only the build pipeline reads this; kernels branch on `sglang.kernels.arch`.
@@ -125,7 +132,7 @@ def get_compile_arch() -> CompileArch:
         suffix = _sail_arch_suffix(major, minor)
     else:
         suffix = _cuda_arch_suffix(major, minor)
-        if (major, minor) == (10, 7):
+        if (major, minor) == (10, 7) and kernel_name in MODULE_USES_CUTLASS:
             from flashinfer.compilation_context import cutlass_supports_sm107
 
             if not cutlass_supports_sm107():
