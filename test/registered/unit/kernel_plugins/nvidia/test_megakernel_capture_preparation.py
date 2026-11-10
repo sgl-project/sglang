@@ -38,7 +38,7 @@ class TestCapturePreparation(unittest.TestCase):
             context.start()
             self.addCleanup(context.stop)
         context = patch(
-            "sglang.srt.utils.common.get_cuda_graph_batch_size_alignment",
+            "sglang.srt.layers.dp_attention.get_cuda_graph_batch_size_alignment",
             return_value=1,
         )
         self.alignment = context.start()

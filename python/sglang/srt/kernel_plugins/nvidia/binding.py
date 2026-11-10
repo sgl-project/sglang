@@ -1191,7 +1191,7 @@ def _kimi_build_widths(
     widths = tuple(range(tokens, max_rows + 1, tokens))
     if is_draft or tuple(architectures or ()) != ("KimiK3ForConditionalGeneration",):
         return widths
-    from sglang.srt.utils.common import get_cuda_graph_batch_size_alignment
+    from sglang.srt.layers.dp_attention import get_cuda_graph_batch_size_alignment
 
     config, parallel, disagg = get_spec(), get_parallel(), get_disagg()
     graph = get_exec().graph.cuda_graph_config
