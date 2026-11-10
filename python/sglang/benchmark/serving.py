@@ -120,6 +120,8 @@ class RequestFuncOutput:
     spec_cap_length: float = 0.0
     spec_block_accept_length: float = 0.0
     spec_cap_lens_histogram: List[int] = field(default_factory=list)
+    status_code: Optional[int] = None
+    finish_reason: Optional[str] = None
 
     @staticmethod
     def init_new(request_func_input: RequestFuncInput):
@@ -207,6 +209,7 @@ async def async_request_trt_llm(
         most_recent_timestamp = st
         try:
             async with session.post(url=api_url, json=payload) as response:
+                output.status_code = response.status
                 if response.status == 200:
                     async for chunk_bytes in response.content:
                         chunk_bytes = chunk_bytes.strip()
@@ -346,6 +349,7 @@ async def async_request_openai_completions(
             async with session.post(
                 url=api_url, json=payload, headers=headers
             ) as response:
+                output.status_code = response.status
                 if response.status == 200:
                     async for chunk_bytes in response.content:
                         chunk_bytes = chunk_bytes.strip()
@@ -366,7 +370,14 @@ async def async_request_openai_completions(
                             # NOTE: Some completion API might have a last
                             # usage summary response without a token so we
                             # want to check a token was generated
-                            if data["choices"][0]["text"]:
+                            choices = data.get("choices") or []
+                            if not choices:
+                                continue
+                            choice = choices[0]
+                            output.finish_reason = (
+                                choice.get("finish_reason") or output.finish_reason
+                            )
+                            if choice.get("text"):
                                 timestamp = time.perf_counter()
                                 # First token
                                 if ttft == 0.0:
@@ -502,10 +513,14 @@ async def async_request_openai_chat_completions(
             async with session.post(
                 url=api_url, json=payload, headers=headers
             ) as response:
+                output.status_code = response.status
                 if response.status == 200:
                     if args.disable_stream:
                         # Non-streaming response
                         response_json = await response.json()
+                        output.finish_reason = response_json["choices"][0].get(
+                            "finish_reason"
+                        )
                         message = response_json["choices"][0]["message"]
                         output.generated_text = _combine_openai_chat_content(message)
                         output.success = True
@@ -558,6 +573,10 @@ async def async_request_openai_chat_completions(
                                 choices = data.get("choices") or []
                                 if not choices:
                                     continue
+                                output.finish_reason = (
+                                    choices[0].get("finish_reason")
+                                    or output.finish_reason
+                                )
 
                                 # Reasoning models stream thoughts via
                                 # `reasoning_content`; count them like content.
@@ -640,6 +659,7 @@ async def async_request_truss(
             async with session.post(
                 url=api_url, json=payload, headers=headers
             ) as response:
+                output.status_code = response.status
                 if response.status == 200:
                     async for chunk_bytes in response.content:
                         chunk_bytes = chunk_bytes.strip()
@@ -656,7 +676,14 @@ async def async_request_truss(
                             # NOTE: Some completion API might have a last
                             # usage summary response without a token so we
                             # want to check a token was generated
-                            if data["choices"][0]["text"]:
+                            choices = data.get("choices") or []
+                            if not choices:
+                                continue
+                            choice = choices[0]
+                            output.finish_reason = (
+                                choice.get("finish_reason") or output.finish_reason
+                            )
+                            if choice.get("text"):
                                 timestamp = time.perf_counter()
                                 # First token
                                 if ttft == 0.0:
@@ -740,6 +767,7 @@ async def async_request_sglang_generate(
             async with session.post(
                 url=api_url, json=payload, headers=headers
             ) as response:
+                output.status_code = response.status
                 if response.status == 200:
                     async for chunk_bytes in response.content:
                         chunk_bytes = chunk_bytes.strip()
@@ -760,6 +788,9 @@ async def async_request_sglang_generate(
                             data = orjson.loads(sse_data)
 
                             _meta_info = data.get("meta_info") or {}
+                            finish_reason = _meta_info.get("finish_reason")
+                            if finish_reason:
+                                output.finish_reason = finish_reason["type"]
                             if _meta_info.get("spec_accept_length") is not None:
                                 output.spec_accept_length = _meta_info[
                                     "spec_accept_length"
@@ -849,6 +880,7 @@ async def async_request_openai_embeddings(
             async with session.post(
                 url=api_url, json=payload, headers=headers
             ) as response:
+                output.status_code = response.status
                 if response.status == 200:
                     await response.json()
                     output.latency = time.perf_counter() - st
@@ -1949,6 +1981,8 @@ async def benchmark(
         "itls": [output.itl for output in outputs],
         "generated_texts": [output.generated_text for output in outputs],
         "errors": [output.error for output in outputs],
+        "status_codes": [output.status_code for output in outputs],
+        "finish_reasons": [output.finish_reason for output in outputs],
     }
 
     if args.cache_report:
@@ -2489,7 +2523,9 @@ def cli_main():
     )
     parser.add_argument("--output-file", type=str, help="Output JSONL file name.")
     parser.add_argument(
-        "--output-details", action="store_true", help="Output details of benchmarking."
+        "--output-details",
+        action="store_true",
+        help="Include per-request latency, errors, HTTP status codes, and finish reasons.",
     )
     parser.add_argument(
         "--goodput",
