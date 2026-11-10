@@ -1,9 +1,10 @@
 export const config = {
   modelName: "Muse Glimmer",
 
-  supportedHardware: ["b200", "h200", "rtx5090", "rtx6000", "dgx-spark", "mac"],
+  supportedHardware: ["b200", "h200", "rtx5090", "rtx6000", "dgx-spark", "mac", "xeon"],
 
   hardware: [
+    { id: "xeon", label: "XEON", vram: "CPU", vendor: "cpu" },
     // RTX 5090 and RTX PRO 6000 are Blackwell-generation but not in the shared
     // HARDWARE_CATALOG (consumer/workstation cards, not the datacenter SKUs
     // that catalog covers), so they need a local vendor override here.
@@ -32,7 +33,7 @@ export const config = {
   ],
 
   // No Docker path on Apple Silicon — the MLX backend runs native-only.
-  runModes: (s) => (s.hw === "mac" ? ["python"] : ["python", "docker"]),
+  runModes: (s) => (s.hw === "mac" || s.hw === "xeon" ? ["python"] : ["python", "docker"]),
 
   strategies: [
     { id: "standard", label: "Standard" },
@@ -47,7 +48,7 @@ export const config = {
       title: "Modality",
       default: "text",
       // GGUF and every MLX artifact are text-only; no modality choice there.
-      showWhen: (s) => s.quant !== "gguf" && !(s.quant || "").startsWith("mlx-"),
+      showWhen: (s) => s.hw !== "xeon" && s.quant !== "gguf" && !(s.quant || "").startsWith("mlx-"),
       options: [
         // NVFP4 ships with no vision weights despite config.json declaring
         // vision_config, so "Image + text" only shows for bf16.
@@ -115,13 +116,16 @@ export const config = {
   },
 
   playgroundFeatures: {
+    normalizeDeltas: (deltas, derived, base) => base.hw === "xeon" ? {} : deltas,
     attention: {
+      showWhen: (base) => base.hw !== "xeon",
       knobs: [
         { id: "tp", label: "TP", values: [null, 1, 2] },
       ],
     },
 
     speculative: {
+      showWhen: (base) => base.hw !== "xeon",
       options: [
         { id: "current", label: "Inherited from base" },
         { id: "off",     label: "Off" },
@@ -133,6 +137,29 @@ export const config = {
   },
 
   cells: [
+    {
+      match: { hw: "xeon", variant: "default", quant: "bf16", strategy: "standard", nodes: "single" },
+      verified: true,
+      warn: "Quick text generation verified on Intel Xeon 6972P at TP6. The 8,192-token cache does not cover the full context. Vision, parsers, Playground overrides, dataset accuracy, and performance are unverified.",
+      env: [
+        "SGLANG_USE_CPU_ENGINE=1",
+        "RAYON_NUM_THREADS=1",
+        "TOKENIZERS_PARALLELISM=false",
+        "OPENBLAS_NUM_THREADS=1",
+      ],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--revision cec94fcfd6512f2cfe708138c32533b346ea4f69",
+        "--device cpu",
+        "--disable-overlap-schedule",
+        "--trust-remote-code",
+        "--tp 6",
+        "--dtype bfloat16",
+        "--max-total-tokens 8192",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
     {
       match: { hw: "rtx5090", variant: "default", quant: "gguf", strategy: "standard", nodes: "single" },
       verified: true,
