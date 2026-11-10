@@ -6,12 +6,12 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any, Mapping
 
+import msgspec
 
-@dataclass(frozen=True)
-class UBTreeConfig:
+
+class UBTreeConfig(msgspec.Struct, frozen=True):
     block_size: int
     candidate_k: int
     tree_budget: int

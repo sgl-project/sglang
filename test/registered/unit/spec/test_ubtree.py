@@ -6,11 +6,11 @@
 
 import inspect
 import unittest
-from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
+from msgspec.structs import replace
 
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm

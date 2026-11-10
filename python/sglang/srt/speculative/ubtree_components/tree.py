@@ -6,15 +6,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
+import msgspec
 import torch
 import triton
 import triton.language as tl
 
 
-@dataclass
-class UBTreeBatch:
+class UBTreeBatch(msgspec.Struct):
     tokens: torch.Tensor
     parent_ids: torch.Tensor
     depths: torch.Tensor

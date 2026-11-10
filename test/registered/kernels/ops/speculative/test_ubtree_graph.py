@@ -299,8 +299,8 @@ def _make_selector_graph_components(device):
 
 
 def _assert_tree_batches_equal(actual, expected):
-    assert actual.__dict__.keys() == expected.__dict__.keys()
-    for name in actual.__dict__:
+    assert actual.__struct_fields__ == expected.__struct_fields__
+    for name in actual.__struct_fields__:
         actual_value = getattr(actual, name)
         expected_value = getattr(expected, name)
         if expected_value is None or actual_value is None:

@@ -7,9 +7,9 @@
 from __future__ import annotations
 
 from copy import copy
-from dataclasses import dataclass
 from typing import Iterable
 
+import msgspec
 import torch
 
 from sglang.srt.distributed.parallel_state import graph_capture
@@ -21,8 +21,7 @@ from sglang.srt.model_executor.runner_utils.pool import (
 from sglang.srt.models.dflash import DFlashDraftModel
 
 
-@dataclass
-class _CapturedFullDraftBucket:
+class _CapturedFullDraftBucket(msgspec.Struct):
     input_ids: torch.Tensor
     positions: torch.Tensor
     out_cache_loc: torch.Tensor

@@ -6,9 +6,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Callable, Optional
 
+import msgspec
 import torch
 
 from sglang.kernels.ops.attention.linear.kda_replayssm_spec_decode import (
@@ -24,8 +24,7 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.ubtree_info import UBTreeVerifyInput
 
 
-@dataclass(frozen=True)
-class UBTreeVerifyResult:
+class UBTreeVerifyResult(msgspec.Struct, frozen=True):
     predict: torch.Tensor
     accept_lens: torch.Tensor
     accept_index: torch.Tensor

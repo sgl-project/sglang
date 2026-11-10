@@ -6,10 +6,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
+import msgspec
 import torch
 
 from sglang.srt.distributed.parallel_state import graph_capture
@@ -65,8 +65,7 @@ def _sample_target_tokens(
     return target_predict.to(torch.int64).view(1, node_count)
 
 
-@dataclass
-class _CapturedSamplingGraph:
+class _CapturedSamplingGraph(msgspec.Struct):
     graph: torch.cuda.CUDAGraph
     # Retain the external model outputs and target Graph metadata whose
     # addresses the tail captured, as well as its private sampling buffers.
