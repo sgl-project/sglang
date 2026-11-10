@@ -15,7 +15,7 @@ from sglang.kernels.ops.attention.dsa.dcp_topk_hip import (
     dcp_local_candidates_hip,
     supports_dcp_topk_hip,
 )
-from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.runtime_context import get_parallel
 
 
 def _local_candidates(
@@ -66,10 +66,7 @@ def dcp_global_topk(
     rows, topk = out.shape
     if all_gather is None:
         all_gather = partial(parallel.dcp_group.all_gather, dim=0)
-    # indexer top-k capture needs every rank's slots
-    if supports_dcp_topk_hip(topk, world) and not (
-        get_exec().features.enable_return_indexer_topk
-    ):
+    if supports_dcp_topk_hip(topk, world):
         # only the scores travel: every rank selects the same winners from them and
         # emits its own, which is all dcp_localize_compact keeps
         scores, positions = dcp_local_candidates_hip(

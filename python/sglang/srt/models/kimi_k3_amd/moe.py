@@ -29,8 +29,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context
     is_in_breakable_cuda_graph,
 )
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import is_gfx95_supported, is_hip
-from sglang.srt.utils import print_info_once
+from sglang.srt.utils import is_gfx95_supported, is_hip, print_info_once
 from sglang.srt.utils.common import cdiv, get_bool_env_var
 
 if TYPE_CHECKING:
@@ -606,7 +605,7 @@ class KimiK3MoEHipMixin:
         method = experts.quant_method
         if not (
             _aiter_situ_uses_a8w4()
-            and "gfx950" in torch.cuda.get_device_properties(0).gcnArchName
+            and _is_gfx95
             and isinstance(method, Mxfp4MoEMethod)
             and experts.moe_runner_config.activation == "situ"
             and experts.num_local_experts == experts.num_experts

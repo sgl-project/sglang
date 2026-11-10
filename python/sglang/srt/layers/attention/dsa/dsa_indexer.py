@@ -2373,13 +2373,11 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if hasattr(pool, "_is_layer_owned") and not pool._is_layer_owned(layer_id):
             return
         if prenorm:
-            # key is k_norm's input: the fused store, or k_norm here
-            if _index_k_dcp()[0] == 1:
-                dsa_indexer_hip.index_k_norm_store_into(
-                    self, pool, layer_id, key, out_cache_loc
-                )
-                return
-            key = self.k_norm(key)
+            # key is k_norm's input; the fused store applies k_norm
+            dsa_indexer_hip.index_k_norm_store_into(
+                self, pool, layer_id, key, out_cache_loc
+            )
+            return
         self._write_index_k_cache(
             forward_batch, pool, layer_id, key, act_quant, out_cache_loc
         )

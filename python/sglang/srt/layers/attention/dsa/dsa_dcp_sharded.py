@@ -439,7 +439,7 @@ def dcp_global_topk(
     every rank in one process). Every rank must call this with the same number
     of rows, also when it has no local keys.
 
-    With ``DcpTopKMerge``, and on ROCm without indexer top-k capture, the result
+    With ``DcpTopKMerge``, and on ROCm, the result
     holds only this rank's slots, which is all ``dcp_localize_compact`` keeps.
     """
     parallel = get_parallel()
@@ -611,9 +611,7 @@ def dcp_gather_request_rows(
     parallel.dcp_group.all_gather_into_tensor(gathered, send.view(torch.uint8))
     num_rows = recv_idx.shape[0]
     out = local_rows.new_empty((num_rows + (-num_rows % page_size), width))
-    torch.index_select(
-        _as_words(gathered), 0, recv_idx, out=_as_words(out)[:num_rows]
-    )
+    torch.index_select(_as_words(gathered), 0, recv_idx, out=_as_words(out)[:num_rows])
     out[num_rows:].zero_()
     return out
 
