@@ -95,15 +95,16 @@ class TestDynamicLoRAMultiTokenizerGuard(CustomTestCase):
             )
         self._assert_rejected(manager, result)
 
-    def test_guard_still_fires_when_dp_attention_allows_dp_size_above_one(self):
-        """dp attention relaxed the neighboring dp_size check; tokenizer
-        registries remain per-process, so the multi-worker guard must still
-        reject."""
+    def test_guard_still_fires_with_attention_dp(self):
+        """Attention DP (`attn_dp_size>1`) is orthogonal to replica `dp_size`.
+        Tokenizer registries remain per-process, so the multi-worker guard
+        must still reject even when attention DP is active."""
         manager = _manager()
         with get_context().override_server_args(
             enable_lora=True,
-            dp_size=2,
-            enable_dp_attention=True,
+            dp_size=1,
+            tp_size=2,
+            attn_dp_size=2,
             tokenizer_worker_num=2,
         ):
             result = asyncio.run(
