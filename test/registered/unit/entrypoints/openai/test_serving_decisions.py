@@ -1334,10 +1334,11 @@ class TestSystemOne(unittest.IsolatedAsyncioTestCase):
                         }
                     ],
                 )
-                decisions = await validation_exception_handler(
-                    request(root_path, "/v1/decisions"), error
-                )
-                self.assertEqual(decisions.status_code, 400)
+                for path in ["/v1/decisions", "/v1/chat/completions"]:
+                    response = await validation_exception_handler(
+                        request(root_path, path), error
+                    )
+                    self.assertEqual(response.status_code, 400)
 
     async def test_levels_the_legend_cannot_return_are_refused_before_scoring(self):
         def nested(depth):
