@@ -605,6 +605,11 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                 hybrid_backend_cls = ShortConvHybridAttnBackend
             else:
                 linear_attn_backend = Mamba2AttnBackend(runner)
+        # Unlike the hybrid GDN arm above, the KDA arms (kimi_linear / glm5_next)
+        # declare no per-arch backend set, so a prefill choice this kernel cannot
+        # serve would only surface inside the forward. fa4 on consumer Blackwell
+        # is refused at launch instead, by
+        # arg_groups/overrides.py::_hybrid_kda_fa4_backend_constraint.
         elif kimi_linear_config(runner.model_config) is not None:
             if _is_npu:
                 from sglang.srt.hardware_backend.npu.attention.ascend_kda_backend import (
