@@ -77,6 +77,8 @@ def branching_checkpoint_depth(
 class MambaComponent(TreeComponent):
     component_type = ComponentType.MAMBA
     family = TREE_STATE
+    # Subclasses that skip this __init__ (MLX auxiliary state) keep the LRU walk.
+    gds: Optional[GDSStrategy] = None
 
     def __init__(
         self, cache: UnifiedRadixCache, params: CacheInitParams, slot: TreeSlot
@@ -101,7 +103,7 @@ class MambaComponent(TreeComponent):
         )
         self.mamba_max_states_per_path = get_exec().mamba.mamba_max_states_per_path
         # --radix-eviction-policy gds: None keeps the LRU walk.
-        self.gds: Optional[GDSStrategy] = (
+        self.gds = (
             GDSStrategy(**(params.eviction_policy_config or {}))
             if params.eviction_policy.lower() == "gds"
             else None
