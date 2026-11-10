@@ -697,6 +697,53 @@ async fn shared_interests_cleanup_partial_and_unavailable_queries_preserve_uncer
 }
 
 #[tokio::test]
+async fn a_new_demote_can_run_before_the_previous_receipt_is_acknowledged() {
+    let engine = Engine::start().await;
+    let router = router(&[&engine], false, true).await;
+    let body = |id| {
+        json!({"kind":"submit","task":task(id),"message_id":"demote","action":"sglang.demote",
+            "target":prefix(vec![1,2,3,4]),"worker_url":engine.url,
+            "source":{"tier":"host"},"destination":{"tier":"storage"}})
+    };
+    for id in ["old", "next", "shared"] {
+        start(&router, id).await;
+    }
+    let old = api(&router, body("old")).await;
+    let receipt = query(&router, "old", "demote").await;
+    assert_eq!(
+        receipt["operations"][0]["result"]["update"]["status"],
+        "completed"
+    );
+    event(&router, "old", "task_finished", 1, "finish").await;
+
+    let next = api(&router, body("next")).await;
+    assert_ne!(
+        next["operations"][0]["child_id"],
+        old["operations"][0]["child_id"]
+    );
+    assert_eq!(
+        query(&router, "old", "demote").await["operations"][0]["result"],
+        receipt["operations"][0]["result"]
+    );
+    api(
+        &router,
+        json!({"kind":"ack","task":task("old"),"message_id":"demote"}),
+    )
+    .await;
+    let shared = api(&router, body("shared")).await;
+    assert_eq!(
+        shared["operations"][0]["child_id"],
+        next["operations"][0]["child_id"]
+    );
+    let next_receipt = query(&router, "next", "demote").await;
+    assert_ne!(
+        next_receipt["operations"][0]["result"]["ref"]["message_id"],
+        receipt["operations"][0]["result"]["ref"]["message_id"]
+    );
+    assert_eq!(engine.state.lock().unwrap().operations.len(), 2);
+}
+
+#[tokio::test]
 async fn rendered_generate_association_strips_metadata_freezes_branches_and_task_lifetime_is_explicit(
 ) {
     let engine = Engine::start().await;

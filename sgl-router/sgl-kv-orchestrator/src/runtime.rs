@@ -296,6 +296,7 @@ fn validate_input(value: &Value) -> Result<(), String> {
 #[derive(Clone)]
 struct Job {
     id: String,
+    spec: String,
     url: String,
     caps: Capabilities,
     prefix: Arc<PrefixTarget>,
@@ -377,6 +378,7 @@ struct Actor {
     index: SessionIndex,
     book: DemandBook,
     jobs: BTreeMap<String, Job>,
+    jobs_by_spec: BTreeMap<String, String>,
     intents: BTreeMap<DemandId, Intent>,
     caps: BTreeMap<String, Option<Capabilities>>,
     busy: BTreeMap<String, Option<String>>,
@@ -402,6 +404,7 @@ impl Actor {
             workers,
             dropped_routes,
             jobs: BTreeMap::new(),
+            jobs_by_spec: BTreeMap::new(),
             intents: BTreeMap::new(),
             caps: BTreeMap::new(),
             busy: BTreeMap::new(),
@@ -875,7 +878,11 @@ impl Actor {
         if let Some(intent) = self.intents.remove(demand) {
             for id in intent.jobs {
                 if self.book.forget_job(&id) {
-                    self.jobs.remove(&id);
+                    if let Some(job) = self.jobs.remove(&id) {
+                        if self.jobs_by_spec.get(&job.spec) == Some(&id) {
+                            self.jobs_by_spec.remove(&job.spec);
+                        }
+                    }
                 }
             }
         }
@@ -1333,24 +1340,29 @@ impl Actor {
                 payload: payload.clone(),
             };
             parse_action(&parsed).map_err(|e| format!("{e:?}"))?;
-            // Exact immutable spec + owner epoch coalesces across tasks. PINs
-            // retain their claim identity, so different claims never merge.
-            let id = format!(
-                "job-{}",
-                digest(&(
-                    url,
-                    &caps.epoch,
-                    action,
-                    &payload,
-                    value["attempt"].as_u64().unwrap_or(0)
-                ))
-            );
+            // Share the live job for this spec, never a released job's receipt.
+            // A fresh job gets its own Engine message identity, even while a
+            // previous task still holds an unacknowledged receipt.
+            let spec = digest(&(
+                url,
+                &caps.epoch,
+                action,
+                &payload,
+                value["attempt"].as_u64().unwrap_or(0),
+            ));
+            let id = self
+                .jobs_by_spec
+                .get(&spec)
+                .filter(|id| self.book.job(id).is_some_and(|j| !j.cancel_requested))
+                .cloned()
+                .unwrap_or_else(|| format!("job-{}", digest(&(&spec, &demand.task, &demand.id))));
             ids.insert(id.clone());
             if !self.jobs.contains_key(&id) {
                 planned.insert(
                     id.clone(),
                     Job {
                         id: id.clone(),
+                        spec,
                         url: url.clone(),
                         caps: (*caps).clone(),
                         prefix: Arc::new(prefix),
@@ -1433,7 +1445,10 @@ impl Actor {
                 .track_resource(&task, ResourceKind::Claim, id)
                 .map_err(|e| format!("{e:?}"))?;
         }
-        self.jobs.extend(planned);
+        for (id, job) in planned {
+            self.jobs_by_spec.insert(job.spec.clone(), id.clone());
+            self.jobs.insert(id, job);
+        }
         self.intents.insert(
             demand.clone(),
             Intent {
