@@ -236,7 +236,7 @@ class Serving(msgspec.Struct):
             choices=["openai", "model"],
         ),
     ] = "model"
-    disable_model_eos_stop: A[
+    disable_model_stop_tokens: A[
         bool,
         "Don't finish requests on the model's EOS tokens: eos_token_id from the HF config, generation_config.json and the tokenizer, and the tokenizer's additional stop tokens. Requests then stop only on their own stop_token_ids, stop strings and max_new_tokens.",
     ] = False

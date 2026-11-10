@@ -7,7 +7,7 @@ from sglang.srt.utils.device import is_pin_memory_available
 def _stop_token_ids(req) -> set:
     stop_ids = set(req.sampling_params.stop_token_ids or ())
     # Grammar completion still ends the request when model EOS stopping is off.
-    if req.stop_on_model_eos or req.grammar is not None:
+    if req.use_model_stop_tokens or req.grammar is not None:
         stop_ids |= req.eos_token_ids or set()
         stop_ids |= req.tokenizer.additional_stop_token_ids or set()
         stop_ids.add(req.tokenizer.eos_token_id)

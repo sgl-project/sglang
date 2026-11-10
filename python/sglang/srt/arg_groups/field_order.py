@@ -563,6 +563,6 @@ POSITIONAL_FIELD_ORDER = (
     "paged_experts_enable_disk",
     "disable_normalize_embedding",
     "log_schedule_decisions",
-    "disable_model_eos_stop",
+    "disable_model_stop_tokens",
 )
 # fmt: on

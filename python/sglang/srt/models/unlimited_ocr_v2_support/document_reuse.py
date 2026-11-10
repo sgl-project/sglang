@@ -537,7 +537,7 @@ def _doc_params(req) -> Optional[dict]:
 
 def _stop_ids(req) -> set:
     ids = set()
-    if req.stop_on_model_eos:
+    if req.use_model_stop_tokens:
         ids.update(req.eos_token_ids or ())
         tok = req.tokenizer
         # Tokenizer backends are duck-typed; not every one exposes eos_token_id.

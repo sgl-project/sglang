@@ -114,11 +114,11 @@ class TestRequestClassOverridePoints(CustomTestCase):
                     with (
                         self.subTest(
                             scheduler=scheduler_cls.__name__,
-                            disable_model_eos_stop=disable,
+                            disable_model_stop_tokens=disable,
                             path=name,
                         ),
                         get_context().override_server_args(
-                            disable_model_eos_stop=disable
+                            disable_model_stop_tokens=disable
                         ),
                         get_parallel().override(tp_rank=0),
                     ):
@@ -135,7 +135,7 @@ class TestRequestClassOverridePoints(CustomTestCase):
                         if isinstance(req, _TaggedReq):
                             self.assertEqual(req.source_rid, recv.rid)
                         self.assertEqual(req.rid, recv.rid)
-                        self.assertIs(req.stop_on_model_eos, not disable)
+                        self.assertIs(req.use_model_stop_tokens, not disable)
 
     def test_tokenizer_manager_emits_the_subclass_wire_types(self):
         """Single and batched dispatch hand the subclass types to the scheduler."""

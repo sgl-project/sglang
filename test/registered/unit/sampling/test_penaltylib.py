@@ -377,11 +377,11 @@ class TestBatchedMinNewTokensPenalizer(CustomTestCase):
         self.assertFalse(blocked[1].any())
 
     def test_model_eos_not_blocked_when_not_a_stop(self):
-        """Without stop_on_model_eos only the request's stop_token_ids end it, so only
+        """Without use_model_stop_tokens only the request's stop_token_ids end it, so only
         they are blocked, and the tokenizer is never read (it may be None)."""
         req = _make_req(min_tokens=3, stop_ids={5})
         req.eos_token_ids = {6}
-        req.stop_on_model_eos = False
+        req.use_model_stop_tokens = False
         req.tokenizer = None
         batch = _make_batch([req])
         orch = BatchedPenalizerOrchestrator(
@@ -394,7 +394,7 @@ class TestBatchedMinNewTokensPenalizer(CustomTestCase):
         self.assertTrue(torch.isneginf(logits[0, 5]))
         self.assertEqual(logits[0, 6].item(), 0.0)
 
-    def test_grammar_eos_respects_min_tokens_when_model_eos_stop_is_disabled(self):
+    def test_grammar_eos_respects_min_tokens_without_model_stops(self):
         """Grammar EOS must not end JSON output before min_new_tokens, even
         when ordinary model EOS stopping is disabled."""
         import xgrammar as xgr
@@ -403,11 +403,11 @@ class TestBatchedMinNewTokensPenalizer(CustomTestCase):
         compiled = xgr.GrammarCompiler(tokenizer_info).compile_json_schema(
             {"type": "integer"}
         )
-        for stop_on_model_eos in (True, False):
-            with self.subTest(stop_on_model_eos=stop_on_model_eos):
+        for use_model_stop_tokens in (True, False):
+            with self.subTest(use_model_stop_tokens=use_model_stop_tokens):
                 req = _make_req(min_tokens=5, eos_id=1)
                 req.eos_token_ids = {1}
-                req.stop_on_model_eos = stop_on_model_eos
+                req.use_model_stop_tokens = use_model_stop_tokens
                 req.grammar = xgr.GrammarMatcher(compiled)
                 batch = _make_batch([req])
                 orch = BatchedPenalizerOrchestrator(

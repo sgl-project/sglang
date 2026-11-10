@@ -3256,7 +3256,7 @@ class Scheduler(
         req_factory = partial(
             self._create_generation_req,
             recv_req,
-            stop_on_model_eos=not get_serving().disable_model_eos_stop,
+            use_model_stop_tokens=not get_serving().disable_model_stop_tokens,
         )
         # Route: normal request / session request / session-not-found
         session_id = (
