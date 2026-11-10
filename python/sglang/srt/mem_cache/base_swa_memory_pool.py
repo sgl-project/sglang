@@ -21,7 +21,8 @@ class BaseSWAKVPool(KVCache):
     """
 
     # The name these pools' one sliding-window sub-pool goes by: in their id
-    # spaces, eviction counts and the storage view over them.
+    # spaces, a write loc's ``window_locs``, admission demands and the storage
+    # view over them.
     WINDOW_SUB_POOL = "swa"
 
     swa_kv_pool: KVCache
