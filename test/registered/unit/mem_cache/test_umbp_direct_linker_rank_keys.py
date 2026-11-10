@@ -146,7 +146,7 @@ class TestLoadReadyEvents(CustomTestCase):
         order = mock.MagicMock()
         linker.record_transfer_ready = order.record_transfer_ready
         order.record_transfer_ready.return_value = unified_cache_linker.TransferReady(
-            [order.indices_ready, order.forward_done]
+            order.indices_ready, order.forward_done
         )
         linker._gc_frozen = True
         linker._pending = {"rid": ["transfer"]}

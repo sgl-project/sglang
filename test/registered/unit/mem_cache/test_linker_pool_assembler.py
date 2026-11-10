@@ -75,6 +75,23 @@ class TestDevicePoolEntry(CustomTestCase):
         self.assertEqual(sizes, [[10], [22], [10], [22]])
         self.assertEqual(offsets, [[6], [14], [6], [14]])
 
+        # One grouped read carries every mapped layer of a component item.
+        pointers, sizes, offsets = pool.get_prepared_layers_range_meta(
+            locations, range(3)
+        )
+        self.assertEqual(
+            pointers,
+            [
+                [k0[0].data_ptr(), k2[0].data_ptr()],
+                [v0[0].data_ptr(), v2[0].data_ptr()],
+                [k0[4].data_ptr(), k2[4].data_ptr()],
+                [v0[4].data_ptr(), v2[4].data_ptr()],
+            ],
+        )
+        self.assertEqual(sizes, [[6, 10], [14, 22]] * 2)
+        self.assertEqual(offsets, [[0, 6], [0, 14]] * 2)
+        self.assertIsNone(pool.get_prepared_layers_range_meta(locations, [1, 3]))
+
     def test_layer_ranges_preserve_layout_and_row_order(self):
         buffers = [torch.zeros((6, width), dtype=torch.uint8) for width in (3, 5)]
         for packed in (True, False):
@@ -100,6 +117,70 @@ class TestDevicePoolEntry(CustomTestCase):
                         self.assertEqual(
                             pool.get_prepared_layer_range_meta(locations, 0), expected
                         )
+
+    def test_grouped_ranges_match_per_layer_concatenation(self):
+        def make_buffers(widths):
+            return [torch.zeros((6, width), dtype=torch.uint8) for width in widths]
+
+        cases = {
+            # Layer 2 maps two buffers; layer 3 is a sharer hole.
+            "packed": (
+                [make_buffers((3, 4, 5, 6))],
+                {0: 0, 1: 1, 2: (2, 3), 4: 0},
+                True,
+            ),
+            "unpacked": (
+                [make_buffers((3, 4, 5)), make_buffers((7, 8, 9))],
+                {0: 0, 1: 1, 2: 2},
+                False,
+            ),
+        }
+        for name, (components, layer_mapping, packed) in cases.items():
+            pool = DevicePoolEntry(
+                name=PoolName.KV,
+                indices_from_pool=PoolName.KV,
+                device_pool=None,
+                components=components,
+                layer_mapping=layer_mapping,
+                page_size=1,
+                rows_are_pages=True,
+                packed=packed,
+            )
+            locations = [5, 0, 3, 0]
+            for group in (range(0, 3), range(2, 5), range(3, 4)):
+                expected = None
+                for layer in group:
+                    meta = pool.get_prepared_layer_range_meta(locations, layer)
+                    if meta is None:
+                        continue
+                    if expected is None:
+                        expected = tuple([list(row) for row in rows] for rows in meta)
+                        continue
+                    for merged_rows, rows in zip(expected, meta):
+                        for merged_row, row in zip(merged_rows, rows):
+                            merged_row.extend(row)
+                with self.subTest(name=name, group=group):
+                    self.assertEqual(
+                        pool.get_prepared_layers_range_meta(locations, group),
+                        expected,
+                    )
+
+    def test_grouped_ranges_reject_unpacked_buffer_count_mismatch(self):
+        pool = DevicePoolEntry(
+            name=PoolName.KV,
+            indices_from_pool=PoolName.KV,
+            device_pool=None,
+            components=[
+                [torch.zeros((4, width), dtype=torch.uint8) for width in (3, 4, 5)]
+            ],
+            layer_mapping={0: 0, 1: (1, 2)},
+            page_size=1,
+            rows_are_pages=True,
+            packed=False,
+        )
+        self.assertIsNotNone(pool.get_prepared_layers_range_meta([0], [1]))
+        with self.assertRaisesRegex(ValueError, "different number of buffers"):
+            pool.get_prepared_layers_range_meta([0], [0, 1])
 
     def test_rejects_invalid_pages_and_empty_buffers(self):
         with self.assertRaisesRegex(ValueError, "has no storage buffers"):

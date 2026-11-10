@@ -141,15 +141,25 @@ class LayerWiseLoadCounter:
 
 
 class TransferReady(NamedTuple):
-    events: list[torch.cuda.Event]
+    """What a transfer waits on: the page indices, then the forward using the pages."""
+
+    indices_ready: torch.cuda.Event
+    # None when the current stream is the only one using the pages.
+    forward_done: Optional[torch.cuda.Event] = None
+
+    def synchronize_indices(self) -> None:
+        """Wait only until the page indices exist; the pages may still be in use."""
+        self.indices_ready.synchronize()
 
     def synchronize(self) -> None:
-        for event in self.events:
-            event.synchronize()
+        self.indices_ready.synchronize()
+        if self.forward_done is not None:
+            self.forward_done.synchronize()
 
     def wait(self, stream: torch.cuda.Stream) -> None:
-        for event in self.events:
-            stream.wait_event(event)
+        stream.wait_event(self.indices_ready)
+        if self.forward_done is not None:
+            stream.wait_event(self.forward_done)
 
 
 class UnifiedCacheLinker(ABC):
@@ -177,12 +187,11 @@ class UnifiedCacheLinker(ABC):
         """
         indices_ready = device_module.Event()
         indices_ready.record()
-        events = [indices_ready]
-        if self.forward_stream is not None:
-            forward_done = device_module.Event()
-            forward_done.record(self.forward_stream)
-            events.append(forward_done)
-        return TransferReady(events)
+        if self.forward_stream is None:
+            return TransferReady(indices_ready)
+        forward_done = device_module.Event()
+        forward_done.record(self.forward_stream)
+        return TransferReady(indices_ready, forward_done)
 
     def prefetch(self, transfers: list[PoolTransfer]) -> Future[bool] | None:
         """Read all layers; the future completes after all device writes stop."""
