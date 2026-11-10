@@ -372,17 +372,9 @@ class MambaAttnBackendBase(AttentionBackend):
                     )
                     if direct_parent is not None:
                         retrieve_parent_token = direct_parent
-                        tree_depths = getattr(
-                            forward_batch.spec_info, "tree_depths", None
-                        )
-                        tree_max_depth = int(
-                            getattr(forward_batch.spec_info, "max_tree_depth", 0)
-                        )
-                        has_direct_parent = bool(
-                            getattr(
-                                forward_batch.spec_info, "uses_direct_parent", False
-                            )
-                        )
+                        tree_depths = forward_batch.spec_info.tree_depths
+                        tree_max_depth = forward_batch.spec_info.max_tree_depth
+                        has_direct_parent = forward_batch.spec_info.uses_direct_parent
                     elif retrieve_next_token is not None:
                         retrieve_parent_token = torch.empty_like(retrieve_next_token)
             else:
@@ -501,7 +493,7 @@ class MambaAttnBackendBase(AttentionBackend):
             self.retrieve_parent_token_list[cuda_graph_bs - 1][:bs_without_pad].copy_(
                 direct_parent
             )
-            live_depths = getattr(spec_info, "tree_depths", None)
+            live_depths = spec_info.tree_depths
             if self.tree_depth_list is not None and live_depths is not None:
                 self.tree_depth_list[cuda_graph_bs - 1][:bs_without_pad].copy_(
                     live_depths
@@ -1082,7 +1074,7 @@ class MambaAttnBackendBase(AttentionBackend):
                     self.retrieve_parent_token_list[bs - 1][:bs_without_pad].copy_(
                         direct_parent
                     )
-                    live_depths = getattr(spec_info, "tree_depths", None)
+                    live_depths = spec_info.tree_depths
                     if self.tree_depth_list is not None and live_depths is not None:
                         self.tree_depth_list[bs - 1][:bs_without_pad].copy_(live_depths)
             return ForwardMetadata(

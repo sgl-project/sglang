@@ -906,7 +906,7 @@ class MambaPool:
             tree_state = {}
             if self.factorized_kda_tree:
                 hv, v_dim, k_dim = temporal_state_shape
-                h_k = getattr(cache_params.shape, "num_k_heads_per_tp", hv)
+                h_k = cache_params.shape.num_k_heads_per_tp
                 tree_width = speculative_num_draft_tokens
                 tree_state = dict(
                     tree_rawv=torch.zeros(
