@@ -2478,6 +2478,55 @@ class TestPrefillAdder(CustomTestCase):
         req.sampling_params.ignore_eos = False
         return req
 
+    def _swa_recompute_case(self, *, chunk_tokens, bind):
+        """A request whose 4096-token resident FULL prefix needs a 512-token replay."""
+        self.mock_token_allocator.available_size.return_value = 100_000
+        self.mock_tree_cache.swa_recompute_len = 512
+        node = MagicMock()
+        self.mock_tree_cache.init_swa_recompute.return_value = (
+            (4096, node, SimpleNamespace(start=3584)) if bind else None
+        )
+        adder = self.create_adder(
+            self.create_running_batch(), page_size=256, rem_chunk_tokens=chunk_tokens
+        )
+        req = self._create_delayer_req(4096 + 512, rid="recompute")
+        req.swa_recompute_hit_length = 4096
+        req.swa_recompute_key = object()
+        req.swa_recompute = None
+        return adder, req, node
+
+    def test_swa_recompute_charges_the_replay_to_the_prefill_budgets(self):
+        adder, req, node = self._swa_recompute_case(chunk_tokens=8192, bind=True)
+
+        adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None)
+
+        self.assertEqual(adder.can_run_list, [req])
+        self.assertEqual((req.prefix_len, req.extend_end), (4096, 4608))
+        self.assertIs(req.last_node, node)
+        self.assertEqual(adder.rem_chunk_tokens, 8192 - 512 - 512)
+        self.assertEqual(adder.rem_input_tokens, 10000 - 512 - 512)
+        self.assertEqual(adder.log_replay_tokens, 512)
+
+    def test_swa_recompute_bind_failure_admits_without_the_gain(self):
+        adder, req, _ = self._swa_recompute_case(chunk_tokens=8192, bind=False)
+
+        adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None)
+
+        self.assertEqual(adder.can_run_list, [req])
+        self.assertEqual((req.prefix_len, req.extend_end), (0, 4608))
+        self.assertEqual(adder.rem_chunk_tokens, 8192 - 4608)
+        self.assertEqual(adder.log_replay_tokens, 0)
+
+    def test_swa_recompute_skipped_when_the_replay_cannot_fit_a_chunk(self):
+        adder, req, _ = self._swa_recompute_case(chunk_tokens=512, bind=True)
+
+        adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None)
+
+        self.mock_tree_cache.init_swa_recompute.assert_not_called()
+        self.assertEqual(adder.can_run_list, [req])
+        self.assertEqual((req.prefix_len, req.extend_end), (0, 512))
+        self.assertEqual(adder.log_replay_tokens, 0)
+
     def test_add_chunked_req_non_hybrid_no_swa_reservation(self):
         # Non-hybrid path: the SWA-pool reservation must NOT apply, otherwise
         # the fix would regress non-SWA models.

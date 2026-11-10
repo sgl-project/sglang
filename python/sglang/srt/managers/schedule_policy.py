@@ -1028,6 +1028,8 @@ class PrefillAdder:
             self.reprocessed_log_input_tokens += raw_extend_input_len
 
     def _replay_len(self, req: Req, prefix_len: int) -> int:
+        if req.swa_recompute_hit_length:
+            return self.tree_cache.swa_recompute_len
         if (
             get_exec().features.enable_encoder_swa_bounded_replay
             and encoder_swa_replay.resets_swa_window(req)
@@ -1593,6 +1595,17 @@ class PrefillAdder:
 
         # The temporary pin excludes this prefix from the evictable budget.
         # Selection itself neither allocates slots nor materializes host hits.
+        if (
+            req.swa_recompute_hit_length
+            and not self.can_run_list
+            and self.rem_chunk_tokens is not None
+            and self.rem_chunk_tokens
+            < self.tree_cache.swa_recompute_len + self.page_size
+        ):
+            # Even a fresh chunk cannot hold the replay; prefill the prefix instead.
+            req.swa_recompute_hit_length = 0
+            req.swa_recompute_key = None
+
         with self._lock_node(req.last_node):
             # A replay reuses resident FULL like a host hit and needs window
             # rows for the whole replayed span.
@@ -1742,6 +1755,21 @@ class PrefillAdder:
                 if self.tree_cache.load_back_is_cache_owned():
                     req.kv.protect_prefix(req.prefix_len)
 
+            if (
+                self.kv_shard_scratch_spec is not None
+                and (admission.prefix_len, admission.extend_len) != reserved_for
+            ):
+                # No FULL was loaded (sharded trees have no aux components),
+                # so deferring here leaves no H2D without its consumer.
+                self.kv_shard_block_bound_pages, self.kv_shard_chunk_pages = (
+                    scratch_mark
+                )
+                if not self._kv_shard_reserve_scratch(
+                    prefix_len=admission.prefix_len, extend_len=admission.extend_len
+                ):
+                    return AddReqResult.OTHER
+
+            # Bind last: the published window holds no data until this batch runs.
             if req.swa_recompute_hit_length:
                 recomputed = self.tree_cache.init_swa_recompute(
                     req, req.swa_recompute_key
@@ -1764,20 +1792,6 @@ class PrefillAdder:
                     gained_len, req.last_node, req.swa_recompute = recomputed
                     req.prefix_len += gained_len
                     req.kv.protect_prefix(req.prefix_len)
-
-            if (
-                self.kv_shard_scratch_spec is not None
-                and (admission.prefix_len, admission.extend_len) != reserved_for
-            ):
-                # No FULL was loaded (sharded trees have no aux components),
-                # so deferring here leaves no H2D without its consumer.
-                self.kv_shard_block_bound_pages, self.kv_shard_chunk_pages = (
-                    scratch_mark
-                )
-                if not self._kv_shard_reserve_scratch(
-                    prefix_len=admission.prefix_len, extend_len=admission.extend_len
-                ):
-                    return AddReqResult.OTHER
 
             self._commit_prefill_admission(req, admission, state_slots)
 
