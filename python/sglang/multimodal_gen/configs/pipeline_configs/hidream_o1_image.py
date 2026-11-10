@@ -54,10 +54,13 @@ class HiDreamO1ImagePipelineConfig(ImagePipelineConfig):
 
     def update_config_from_dict(self, args, prefix: str = "") -> None:
         super().update_config_from_dict(args, prefix)
-        # model_path is only populated here in the serving path; Dev checkpoints
-        # are guidance-distilled and must run the DiT in fp32.
-        if _resolve_variant(self.model_path) != "full":
-            self.dit_precision = "fp32"
+        # model_path is only populated here in the serving path. The weight
+        # dtype is fixed by the checkpoint -- fp32 for the distilled Dev
+        # variants, bf16 for the full model -- so a CLI --dit-precision value
+        # cannot move it in either direction.
+        self.dit_precision = (
+            "fp32" if _resolve_variant(self.model_path) != "full" else "bf16"
+        )
 
     def validate_server_args(self, server_args: Any) -> None:
         # The pipeline builds its scheduler with the reference flow shift, so

@@ -163,9 +163,7 @@ class TestHiDreamO1Noise(unittest.TestCase):
 
         def reference(seed: int) -> torch.Tensor:
             generator = torch.Generator("cpu").manual_seed(seed)
-            noise = noise_scale * torch.randn(
-                (1, 3, 64, 64), generator=generator
-            )
+            noise = noise_scale * torch.randn((1, 3, 64, 64), generator=generator)
             return patchify_pixels(noise, PATCH_SIZE)
 
         self.assertTrue(torch.equal(latents, reference(42)))
