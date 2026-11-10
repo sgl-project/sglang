@@ -232,9 +232,9 @@ class TestAdmissionMatchedPrefixTokens(CustomTestCase):
     """The admission re-match must record num_matched_prefix_tokens.
 
     Cache-agnostic policies (fcfs, lof, random, routing-key) skip the
-    sort-time match, so this is the only place their requests record it; a
-    request left at 0 makes load snapshots and cache-hit reporting read zero
-    reuse (#43094).
+    sort-time match unless the tree supports fast matching, so this is the only
+    place their requests record it; a request left at 0 makes load snapshots and
+    cache-hit reporting read zero reuse (#43094).
     """
 
     PREFIX = list(range(64))
