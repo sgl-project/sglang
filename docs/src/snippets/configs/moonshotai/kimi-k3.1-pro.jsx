@@ -1061,7 +1061,9 @@ sgl-router \\
       verified: true,
       verificationStatus: (s) => (s.spec === "dflash" ? "verified" : "in-progress"),
       env: [
+        "SGLANG_USE_AITER=1",
         "SGLANG_AITER_K3_OPT=1",
+        "AITER_FLYDSL_FORCE=1",
         "AITER_SITUV2_A8W4=1",
         "SGLANG_AMD_MONO_K31_WIDE=1",
         "PYTORCH_HIP_ALLOC_CONF=garbage_collection_threshold:0.95",
@@ -1106,7 +1108,9 @@ sgl-router \\
       verified: true,
       verificationStatus: (s) => (s.spec === "dflash" && s.hicache === "amd-l2" ? "verified" : "in-progress"),
       env: [
+        "SGLANG_USE_AITER=1",
         "SGLANG_AITER_K3_OPT=1",
+        "AITER_FLYDSL_FORCE=1",
         "AITER_SITUV2_A8W4=1",
         "PYTORCH_HIP_ALLOC_CONF=garbage_collection_threshold:0.95",
         "SGLANG_ROCM_RUNTIME_RESERVE_GB=10",
@@ -1151,7 +1155,9 @@ sgl-router \\
       verified: true,
       verificationStatus: (s) => (s.spec === "dflash" && s.hicache === "amd-l2" ? "verified" : "in-progress"),
       env: [
+        "SGLANG_USE_AITER=1",
         "SGLANG_AITER_K3_OPT=1",
+        "AITER_FLYDSL_FORCE=1",
         "AITER_SITUV2_A8W4=1",
         "PYTORCH_HIP_ALLOC_CONF=garbage_collection_threshold:0.95",
         "SGLANG_ROCM_RUNTIME_RESERVE_GB=10",
@@ -1213,7 +1219,9 @@ sgl-router \\
       verified: true,
       verificationStatus: (s) => (s.spec === "dflash" ? "verified" : "in-progress"),
       env: [
+        "SGLANG_USE_AITER=1",
         "SGLANG_AITER_K3_OPT=1",
+        "AITER_FLYDSL_FORCE=1",
         "AITER_SITUV2_A8W4=1",
         // Decode graphs past ~96 at memory fraction 0.92 abort when the allocator collects during capture.
         "PYTORCH_HIP_ALLOC_CONF=garbage_collection_threshold:0.99",
@@ -1262,7 +1270,9 @@ sgl-router \\
       verified: true,
       verificationStatus: (s) => (s.spec === "dflash" ? "verified" : "in-progress"),
       env: [
+        "SGLANG_USE_AITER=1",
         "SGLANG_AITER_K3_OPT=1",
+        "AITER_FLYDSL_FORCE=1",
         "AITER_SITUV2_A8W4=1",
         "SGLANG_AMD_MONO_K31_WIDE=1",
         "PYTORCH_HIP_ALLOC_CONF=garbage_collection_threshold:0.95",
@@ -1307,7 +1317,9 @@ sgl-router \\
       verified: true,
       verificationStatus: (s) => (s.spec === "dflash" && s.hicache === "amd-l2" ? "verified" : "in-progress"),
       env: [
+        "SGLANG_USE_AITER=1",
         "SGLANG_AITER_K3_OPT=1",
+        "AITER_FLYDSL_FORCE=1",
         "AITER_SITUV2_A8W4=1",
         "PYTORCH_HIP_ALLOC_CONF=garbage_collection_threshold:0.95",
         "SGLANG_ROCM_RUNTIME_RESERVE_GB=10",
@@ -1352,7 +1364,9 @@ sgl-router \\
       verified: true,
       verificationStatus: (s) => (s.spec === "dflash" && s.hicache === "amd-l2" ? "verified" : "in-progress"),
       env: [
+        "SGLANG_USE_AITER=1",
         "SGLANG_AITER_K3_OPT=1",
+        "AITER_FLYDSL_FORCE=1",
         "AITER_SITUV2_A8W4=1",
         "PYTORCH_HIP_ALLOC_CONF=garbage_collection_threshold:0.95",
         "SGLANG_ROCM_RUNTIME_RESERVE_GB=10",
@@ -1414,7 +1428,9 @@ sgl-router \\
       verified: true,
       verificationStatus: (s) => (s.spec === "dflash" ? "verified" : "in-progress"),
       env: [
+        "SGLANG_USE_AITER=1",
         "SGLANG_AITER_K3_OPT=1",
+        "AITER_FLYDSL_FORCE=1",
         "AITER_SITUV2_A8W4=1",
         // Decode graphs past ~96 at memory fraction 0.92 abort when the allocator collects during capture.
         "PYTORCH_HIP_ALLOC_CONF=garbage_collection_threshold:0.99",
