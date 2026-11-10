@@ -293,6 +293,13 @@ def triton_sparse_mla_decode_splitk(
     return (out.unsqueeze(0), lse) if return_lse else out.unsqueeze(0)
 
 
+def lse_base2_for_dcp_merge(lse: torch.Tensor) -> torch.Tensor:
+    """The natural-log LSE returned above, as the replicated-index-K DCP merge reads it:
+    base 2, and a finite floor for a row with no key (the merge weights a rank by
+    exp2(lse - max), which is NaN when every rank of a row is -inf)."""
+    return torch.where(torch.isfinite(lse), lse * _LOG2E, -1073741824.0)
+
+
 # ---------------------------------------------------------------------------
 # Convenience: auto-select best variant
 # ---------------------------------------------------------------------------
