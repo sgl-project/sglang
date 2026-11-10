@@ -15,14 +15,10 @@ eager draft, or a draft graph that would not run them all, runs them eagerly fir
 
 Contract:
 
-- Only a draft forward writes the staging, and only the rows of the requests it
-  carries: a step touches only its own requests, so their releases already wait
-  for it. A row of a request retracted since the staging is not written either:
-  its staged locations are pages it no longer holds.
+- A draft forward writes only the staged rows of the requests it carries and
+  that were not retracted since, so a step touches only its own requests; a
+  prefill in between leaves the staging pending.
 - Every write disarms the staging (commit lengths 0), so a staging is written once.
-- A prefill between the verify and the next draft forward leaves the staging
-  pending: a row written later belongs to a request that held its pages
-  throughout, so the prefill neither writes nor reads them.
 """
 
 from __future__ import annotations

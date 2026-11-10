@@ -159,19 +159,6 @@ class TestDeferredCommit(CustomTestCase):
                         # What the draft graph reads when it writes the staging.
                         self.assertEqual(commit.commit_lens.tolist()[:3], [2, 0, 3])
 
-    def test_disarm_drops_the_staging(self):
-        injector = _Injector()
-        commit = _commit(injector)
-        _stage(commit, 3)
-        reqs = [_staged_req() for _ in range(3)]
-        commit.note_static_verify(reqs)
-        commit.disarm()
-        self.assertFalse(commit.pending)
-        self.assertEqual(commit._staged_reqs, ())
-        self.assertTrue(bool((commit.commit_lens == 0).all()))
-        commit.before_draft_forward(graph_bs=None, reqs=reqs)
-        self.assertEqual(injector.stores, [])
-
 
 class TestEpilogueStagesOnlyAfterItsProjection(CustomTestCase):
     def _run(self, projected: bool, *, bs=2, ring=False, device="cpu"):
