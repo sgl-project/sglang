@@ -24,7 +24,9 @@ from sglang.kernels.ops.attention.extend_attention import (
     extend_attention_fwd,
 )
 from sglang.kernels.ops.attention.verify_splitkv import (
+    _get_vk,
     can_handle,
+    choose_n_splits,
     verify_splitkv_fwd,
 )
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
@@ -170,6 +172,19 @@ class TestVerifySplitKV(CustomTestCase):
         # Exercise the k_scale/v_scale dequant-multiplier path (same multipliers
         # the fp8 KV-cache path applies); both kernels must apply them identically.
         self._run_parity([1024, 2048], k_scale=0.5, v_scale=0.25)
+
+    def test_empty_splits_ignore_stale_scratch(self):
+        """A split with no prefix keys must not read the reused scratch buffer;
+        stale nan/inf there used to reach the output through its zero weight."""
+        device = torch.empty(0, device="cuda").device
+        # Splits hold whole 32-key blocks, so a 100-key prefix fills 4 of 16 splits
+        # and a 64-key one 2 of 4; the remaining splits are empty.
+        for prefix_lens in ([64], [16384, 100]):
+            with self.subTest(prefix_lens=prefix_lens):
+                n_splits = choose_n_splits(sum(prefix_lens) / len(prefix_lens))
+                vk = _get_vk(len(prefix_lens), 16, 2, 256, 256, 4, device, n_splits)
+                vk.att_out.fill_(float("nan"))
+                self._run_parity(prefix_lens)
 
     # --- fallback: can_handle() must reject what the kernel can't serve --------
     # (topk>1 is gated off in the backend, not here -- can_handle never inspects

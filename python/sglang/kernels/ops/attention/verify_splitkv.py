@@ -348,9 +348,14 @@ def _verify_combine_stage2(
         + offs_l[None, :, None] * stride_ol
         + offs_dv[None, None, :]
     )
+    # Empty splits never write Att_Out and the scratch is reused across calls;
+    # 0 * inf/nan is nan, so mask the stale rows rather than rely on w == 0.
+    valid_s = lse > float("-inf")  # [N_SPLITS, L_EXT]
     ao = tl.load(
         offs_ao + Att_Out,
-        mask=mask_l[None, :, None] & (offs_dv[None, None, :] < V_HEAD_DIM),
+        mask=valid_s[:, :, None]
+        & mask_l[None, :, None]
+        & (offs_dv[None, None, :] < V_HEAD_DIM),
         other=0.0,
     )  # [N_SPLITS, L_EXT, Dv]
     o_prefix = tl.sum(ao * w[:, :, None], 0)  # [L_EXT, Dv]
