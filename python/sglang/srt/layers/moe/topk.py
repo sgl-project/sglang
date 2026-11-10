@@ -848,11 +848,15 @@ class TopK(BaseFusedOp):
             return
         if runner_backend is not None and runner_backend.is_triton_kernels():
             output_format = TopKOutputFormat.TRITON_KERNEL
+        # TRT-LLM's in-kernel routing hides expert IDs from the distribution
+        # recorder, so materialize top-k routes while recording is enabled.
         elif runner_backend is not None and (
-            runner_backend.is_flashinfer_trtllm()
-            and _can_bypass_trtllm_routing(self.topk_config)
-            or runner_backend.is_flashinfer_mxfp4()
-            and not self.is_fp4_experts
+            (
+                runner_backend.is_flashinfer_trtllm()
+                and _can_bypass_trtllm_routing(self.topk_config)
+                and get_exec().moe.expert_distribution_recorder_mode is None
+            )
+            or (runner_backend.is_flashinfer_mxfp4() and not self.is_fp4_experts)
         ):
             output_format = (
                 TopKOutputFormat.STANDARD
