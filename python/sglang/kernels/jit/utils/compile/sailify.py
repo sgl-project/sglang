@@ -79,7 +79,9 @@ def _ppu_sdk_version() -> str:
 
 
 def _sailify_root() -> pathlib.Path:
-    configured = envs.SGLANG_JIT_CACHE_DIR.get() or "~/.cache/sglang/jit"
+    configured = envs.SGLANG_JIT_CACHE_DIR.get() or os.path.join(
+        envs.SGLANG_CACHE_DIR.get(), "jit"
+    )
     return pathlib.Path(configured).expanduser() / "sailified"
 
 
