@@ -8,6 +8,7 @@ import torch
 
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.base_prefix_cache import (
+    CacheRequestHandle,
     IncLockRefResult,
     InsertResult,
     MatchResult,
@@ -142,6 +143,68 @@ def test_mamba_publication_snapshots_component_cursors(cache_class, swa_enabled)
     assert req.lock.receipt.node_id == 42
     assert flow.prefix_published
     assert flow.mamba_value is None
+
+
+@pytest.mark.parametrize("first_completed", ["load", "store", "no_store"])
+@pytest.mark.parametrize("load_success", [True, False])
+def test_aborted_request_waits_for_load_and_store(
+    cache_class, first_completed, load_success
+):
+    cache, req, flow = _cache_and_request(cache_class, swa_enabled=False)
+    handle = CacheRequestHandle(rid=req.rid, attempt_id=0)
+    req.cache_request_handle = handle
+    flow.lookup = SimpleNamespace(request_id=req.rid)
+    flow.load_req = req
+    flow.load_completed = False
+    flow.released_skip_tokens = 0
+    flow.anchor_node = flow.anchor_lock = None
+    flow.load.ready = False
+    flow.load.result = None
+    cache.prefetch_loaded_tokens_by_reqid = {}
+    cache.prefetch_loaded_storage_start_by_reqid = {}
+    cache._session_finish_requested = set()
+    store = SimpleNamespace(request_id=req.rid, ready=False)
+    has_store = first_completed != "no_store"
+    cache._pending_stores = (
+        [SimpleNamespace(operation=store, node_id=42, lock_params=object())]
+        if has_store
+        else []
+    )
+    cache._pending_store_counts = {req.rid: 1} if has_store else {}
+    cache.token_to_kv_pool_allocator = mock.Mock()
+    cache.dec_lock_ref = mock.Mock()
+    connector = cache.lmcache_connector = mock.Mock()
+    connector.ready_prefix_count.side_effect = lambda operations: sum(
+        op.ready for op in operations
+    )
+
+    def complete_load(operation):
+        operation.result = load_success
+        return load_success
+
+    connector.complete_load.side_effect = complete_load
+    with mock.patch.object(UnifiedRadixCache, "on_release"):
+        cache.on_release(req, checkpointed=False)
+    cache.check_hicache_events()
+    connector.finish_request.assert_not_called()
+    cache.token_to_kv_pool_allocator.free.assert_not_called()
+
+    if has_store:
+        first = flow.load if first_completed == "load" else store
+        first.ready = True
+        cache.check_hicache_events()
+        connector.finish_request.assert_not_called()
+    flow.load.ready = store.ready = True
+    cache.check_hicache_events()
+    cache.check_hicache_events()
+    connector.finish_request.assert_called_once_with(req.rid)
+    connector.complete_load.assert_called_once_with(flow.load)
+    cache.token_to_kv_pool_allocator.free.assert_called_once()
+    torch.testing.assert_close(
+        cache.token_to_kv_pool_allocator.free.call_args.args[0],
+        flow.load.device_indices,
+    )
+    assert not cache.has_pending_cache_operations()
 
 
 if __name__ == "__main__":
