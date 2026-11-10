@@ -26,6 +26,48 @@ def test_default_runner_baseline(monkeypatch, runner):
     )
 
 
+@pytest.mark.parametrize("phase", ["load", "runtime"])
+def test_turbowan_host_budget_has_a_bounded_environment_allowance(monkeypatch, phase):
+    monkeypatch.setattr(current_platform, "is_hip", lambda: False)
+    monkeypatch.delenv("RUNNER_NAME", raising=False)
+    config = BaselineConfig.load(get_perf_baseline_path("5090"))
+    scenario = config.scenarios["turbo_wan2_1_t2v_1.3b"]
+    assert config.tolerances.host_anon == 0.02
+    assert scenario.host_anon_tolerance == 0.05
+    validator = PerformanceValidator(scenario, config.tolerances, config.step_fractions)
+    limit = scenario.load_peak_host_anon_mb * 1.05
+    summary = PerformanceSummary(0, 0, 0, {}, [], {}, {})
+    summary.load_peak_host_anon_mb = 7050.67
+    summary.runtime_peak_host_anon_mb = 7050.67
+    validator.validate_peak_host_anon(
+        summary, scenario.load_peak_host_anon_mb, scenario.runtime_peak_host_anon_mb
+    )
+    if phase == "load":
+        summary.load_peak_host_anon_mb = limit + 1
+    else:
+        summary.runtime_peak_host_anon_mb = limit + 1
+    with pytest.raises(AssertionError, match="Peak Host Anon"):
+        validator.validate_peak_host_anon(
+            summary, scenario.load_peak_host_anon_mb, scenario.runtime_peak_host_anon_mb
+        )
+
+
+def test_consumer_host_budget_keeps_the_profile_tolerance(monkeypatch):
+    monkeypatch.setattr(current_platform, "is_hip", lambda: False)
+    monkeypatch.delenv("RUNNER_NAME", raising=False)
+    config = BaselineConfig.load(get_perf_baseline_path("5090"))
+    scenario = config.scenarios["minimax_h3_t2va_consumer_budget_1gpu_5090"]
+    assert scenario.host_anon_tolerance is None
+    validator = PerformanceValidator(scenario, config.tolerances, config.step_fractions)
+    summary = PerformanceSummary(0, 0, 0, {}, [], {}, {})
+    summary.load_peak_host_anon_mb = scenario.load_peak_host_anon_mb * 1.02 + 1
+    summary.runtime_peak_host_anon_mb = scenario.runtime_peak_host_anon_mb
+    with pytest.raises(AssertionError, match="Load Peak Host Anon"):
+        validator.validate_peak_host_anon(
+            summary, scenario.load_peak_host_anon_mb, scenario.runtime_peak_host_anon_mb
+        )
+
+
 @pytest.mark.parametrize(
     "runner,qwen",
     [

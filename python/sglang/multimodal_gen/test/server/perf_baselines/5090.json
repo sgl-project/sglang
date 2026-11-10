@@ -120,6 +120,7 @@
             "runtime_peak_allocated_mb": 6925.0,
             "load_peak_host_anon_mb": 6759.33,
             "runtime_peak_host_anon_mb": 6759.33,
+            "host_anon_tolerance": 0.05,
             "estimated_full_test_time_s": 200.3
         },
         "zimage_image_t2i": {
