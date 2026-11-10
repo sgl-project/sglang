@@ -18,7 +18,7 @@ import unittest
 import torch
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 
-from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+from sglang.srt.hf_transformers import get_tokenizer
 from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.runners import TEST_RERANK_QUERY_DOCS, HFRunner, SRTRunner
 from sglang.test.test_utils import CustomTestCase, empty_gpu_cache

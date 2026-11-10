@@ -5,25 +5,23 @@ from sglang.srt.managers.schedule_batch import (
     Req,
 )
 from sglang.srt.mem_cache.base_prefix_cache import (
-    EvictParams,
     InsertParams,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.unified_cache.components.base import (
-    ComponentType,
-    EvictLayer,
-    TreeComponent,
-)
+from sglang.srt.mem_cache.static_kv_storage import acquire_rows
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.mem_cache.unified_cache.components.base import EvictLayer, TreeComponent
 from sglang.srt.mem_cache.unified_cache.components.full import FullComponent
-from sglang.srt.mem_cache.unified_radix_cache import (
-    COMPONENT_REGISTRY,
+from sglang.srt.mem_cache.unified_cache.unified_tree_core import (
     UnifiedLRUList,
     UnifiedTreeNode,
 )
+from sglang.srt.mem_cache.unified_radix_cache import COMPONENT_REGISTRY
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.kits.unified_radix_cache.config import (
     CacheConfig,
@@ -35,6 +33,7 @@ from sglang.test.kits.unified_radix_cache.fixtures import (
 )
 from sglang.test.kits.unified_radix_cache.mixins import UnifiedRadixCacheFixtures
 from sglang.test.mem_cache_utils import finish_req
+from sglang.test.tree_slots import FAMILY_OF, tree_slots_of
 
 
 def session_radix_cache_test_values() -> tuple[bool, ...]:
@@ -51,7 +50,12 @@ class FakeFullComponent(TreeComponent):
         return None
 
     def evict_component(
-        self, node, device_frees, host_frees, target: EvictLayer = EvictLayer.DEVICE
+        self,
+        node,
+        device_frees,
+        host_frees,
+        cache_actions,
+        target: EvictLayer = EvictLayer.DEVICE,
     ) -> tuple[int, int]:
         return 0, 0
 
@@ -64,7 +68,7 @@ class FakeFullComponent(TreeComponent):
     def _evict_device_start(self, request_cnt) -> None:
         pass
 
-    def _evict_device_next_node(self, tracker, device_frees, host_frees):
+    def _evict_device_next_node(self, tracker, device_frees, host_frees, cache_actions):
         return None
 
     def _evict_device_end(self) -> None:
@@ -81,9 +85,7 @@ class FakeFullComponent(TreeComponent):
 
 
 class PagedFullComponent(FullComponent):
-    """FULL component whose device values are not backed one-to-one by pool
-    rows: a value lists two entries per row, and the component can hand rows
-    of a node back to the allocator while the value stays on device."""
+    """FULL component whose device values are not backed one-to-one by pool rows."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -94,8 +96,7 @@ class PagedFullComponent(FullComponent):
 
 
 def component_with_cache(component_type, cache):
-    """A registry component instance bound to a (mock) cache and its tree_core."""
-    component = object.__new__(COMPONENT_REGISTRY[component_type])
+    component = object.__new__(COMPONENT_REGISTRY[FAMILY_OF[component_type]])
     component.cache = cache
     component.tree_core = cache.tree_core
     return component
@@ -113,8 +114,10 @@ class DisabledUnifiedRadixCacheFixtures:
             token_to_kv_pool_allocator=None,
             page_size=1,
             disable=disable,
-            tree_components=(ComponentType.FULL,),
-            component_registry_override={ComponentType.FULL: FakeFullComponent},
+            tree_slots=tree_slots_of((ComponentType.FULL,)),
+            component_registry_override={
+                FAMILY_OF[ComponentType.FULL]: FakeFullComponent
+            },
             enable_kv_cache_events=True,
             eviction_policy="lru",
             eviction_policy_config={"not_an_lru_option": 1},
@@ -136,7 +139,7 @@ class UnifiedRadixAllocationEvictionRealComponentsFixtures:
                 origin_input_ids=array("q"),
                 sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
             )
-            req_to_token_pool.alloc([req])
+            acquire_rows(req_to_token_pool, req_to_token_pool.state, [req])
             params.mamba_value = req.kv.mamba_pool_idx.unsqueeze(0)
         cache.insert(params)
 
@@ -178,7 +181,7 @@ class UnifiedRadixAllocationEvictionRealComponentsFixtures:
     def _evict_for_alloc_after_first_drain(self, cache, component_type):
         capacity = {"available": 0}
         auxiliary_drains = {"count": 0}
-        real_available_size = cache._component_available_size
+        real_available_size = cache._pool_available
         real_free_values = cache._free_values
 
         def available_size(requested_type):
@@ -194,14 +197,16 @@ class UnifiedRadixAllocationEvictionRealComponentsFixtures:
                 capacity["available"] = self._SHORTFALL
 
         params = (
-            EvictParams(swa_num_tokens=self._SHORTFALL)
+            KVDemand(
+                window_tokens={
+                    cache.window_sub_pool_of_slot(component_type): self._SHORTFALL
+                }
+            )
             if component_type is ComponentType.SWA
-            else EvictParams(mamba_num=self._SHORTFALL)
+            else KVDemand(state_slots=self._SHORTFALL)
         )
         with (
-            mock.patch.object(
-                cache, "_component_available_size", side_effect=available_size
-            ),
+            mock.patch.object(cache, "_pool_available", side_effect=available_size),
             mock.patch.object(cache, "_free_values", side_effect=free_values),
         ):
             result = cache.evict_for_alloc(params)
@@ -264,7 +269,7 @@ class UnifiedMambaLRUMatchRefreshFixtures:
             origin_input_ids=array("q"),
             sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
         )
-        req_to_token_pool.alloc([req])
+        acquire_rows(req_to_token_pool, req_to_token_pool.state, [req])
         return req
 
 
@@ -286,7 +291,7 @@ class MambaCheckpointGridFixtures:
                 origin_input_ids=array("q"),
                 sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
             )
-            req_to_token_pool.alloc([req])
+            acquire_rows(req_to_token_pool, req_to_token_pool.state, [req])
             cache.insert(
                 InsertParams(
                     key=RadixKey(array("q", sequence)),
@@ -332,7 +337,7 @@ class UnifiedRadixCacheInt8MambaCheckpointFixtures:
             origin_input_ids=array("q", tokens),
             sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
         )
-        req_to_token_pool.alloc([req])
+        acquire_rows(req_to_token_pool, req_to_token_pool.state, [req])
         req.output_ids = array("q")
         req.kv.kv_committed_len = len(tokens)
         req.kv.kv_allocated_len = len(tokens)
@@ -363,7 +368,7 @@ class SWADraftHistoryFixtures:
             origin_input_ids=tokens,
             sampling_params=SamplingParams(temperature=0, max_new_tokens=16),
         )
-        pool.alloc([req])
+        acquire_rows(pool, pool.state, [req])
         req.output_ids = []
         req.full_untruncated_fill_ids = tokens
         req.extend_end = len(tokens)

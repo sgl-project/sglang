@@ -26,6 +26,7 @@ Warp specialization (8 warps, 256 threads/CTA; warp 3 idle):
 
 from __future__ import annotations
 
+import bisect
 from typing import List, NamedTuple, Optional, Tuple, Type
 
 import cuda.bindings.driver as cuda
@@ -38,9 +39,10 @@ from cutlass.cute import experimental as cute_ext
 from cutlass.cute.nvgpu import tcgen05
 from cutlass.cute.runtime import from_dlpack, make_fake_stream
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.kernel_api_logging import debug_kernel_api
-from sglang.srt.utils import get_device_core_count, is_sm100_supported
-from sglang.srt.utils.common import direct_register_custom_op
+from sglang.srt.utils import is_sm100_supported
+from sglang.srt.utils.custom_op import direct_register_custom_op
 
 # Tuple format: (cta_m, cta_n, num_ab_stage, use_2cta); cta_k is fixed at
 # 128. Sorted within each use_2cta block by (cta_m, cta_n, num_ab_stage).
@@ -1313,8 +1315,12 @@ def _grid_ctas(m: int, n: int, cta_m: int, cta_n: int, num_mma_ctas: int) -> int
 
 
 def _pick_tactic(m: int, n: int, k: int) -> int:
-    """Pick the first ladder tactic whose grid fits one wave of the SMs."""
-    num_sms = get_device_core_count(torch.cuda.current_device())
+    """The tactic a model registered for this m (register_tgv_m_ranges), else
+    the first ladder tactic whose grid fits one wave of the SMs."""
+    tactic = _model_tgv_tactic(m, n, k)
+    if tactic is not None:
+        return tactic
+    num_sms = current_arch().num_sms
     best, best_ctas = None, None
     for tactic, cta_m, cta_n, num_mma_ctas in _TGV_TACTIC_LADDER:
         ctas = _grid_ctas(m, n, cta_m, cta_n, num_mma_ctas)
@@ -1341,8 +1347,91 @@ _K3_TGV_WIN_SHAPES = frozenset(
         (3584, 7168),  # MoE latent down (unfused fallback)
         (7168, 3584),  # MoE latent up
         (7168, 768),  # shared down
+        (7168, 1792),  # DSpark draft down
+        (7168, 512),  # DSpark draft o_proj
+        (8448, 7168),  # dense MLP gate_up
     }
 )
+
+_K3_FRONT_WARP_SPLITK = {
+    8: (8, 11),
+    16: (16, 9),
+    32: (32, 6),
+}
+
+
+class TGVMRanges:
+    """Sorted, disjoint m ranges of one dense-GEMM shape that take TGV, each
+    with a tactic (None: the ladder pick). ``m in ranges`` says whether m takes
+    TGV; ``ranges(m)`` returns its tactic."""
+
+    def __init__(self) -> None:
+        self._m_lo: list[int] = []
+        self._m_hi: list[int] = []
+        self._tactic: list[Optional[int]] = []
+
+    def append(self, m_lo: int, m_hi: int, tactic: Optional[int]) -> None:
+        """Insert in m order; re-adding an existing range is a no-op, any other
+        overlap raises."""
+        i = bisect.bisect_left(self._m_lo, m_lo)
+        n = len(self._m_lo)
+        if i < n and (self._m_lo[i], self._m_hi[i], self._tactic[i]) == (
+            m_lo,
+            m_hi,
+            tactic,
+        ):
+            return
+        if (
+            not 0 < m_lo <= m_hi
+            or (i > 0 and self._m_hi[i - 1] >= m_lo)
+            or (i < n and self._m_lo[i] <= m_hi)
+        ):
+            raise ValueError(
+                f"TGV m range [{m_lo}, {m_hi}] overlaps "
+                f"{list(zip(self._m_lo, self._m_hi))}"
+            )
+        if tactic is not None:
+            _resolve_tactic(tactic)
+        self._m_lo.insert(i, m_lo)
+        self._m_hi.insert(i, m_hi)
+        self._tactic.insert(i, tactic)
+
+    def _index(self, m: int) -> int:
+        """The index of the range holding m, or -1."""
+        i = bisect.bisect_right(self._m_lo, m) - 1
+        return i if i >= 0 and m <= self._m_hi[i] else -1
+
+    def __contains__(self, m: int) -> bool:
+        return self._index(m) >= 0
+
+    def __call__(self, m: int) -> Optional[int]:
+        i = self._index(m)
+        return self._tactic[i] if i >= 0 else None
+
+
+# (n, k) -> the m ranges a model measured; filled by register_tgv_m_ranges.
+_MODEL_TGV_M_RANGES: dict[tuple[int, int], TGVMRanges] = {}
+
+
+def register_tgv_m_ranges(
+    shapes: dict[tuple[int, int], tuple[tuple[int, int, Optional[int]], ...]],
+) -> None:
+    """Route a model's dense-GEMM shapes ``(n, k)`` to TGV for the given
+    ``(m_lo, m_hi, tactic)`` ranges, for every caller of the shape."""
+    for shape, ranges in shapes.items():
+        m_ranges = _MODEL_TGV_M_RANGES.setdefault(shape, TGVMRanges())
+        for m_lo, m_hi, tactic in ranges:
+            m_ranges.append(m_lo=m_lo, m_hi=m_hi, tactic=tactic)
+
+
+def _model_takes_tgv(m: int, n: int, k: int) -> bool:
+    m_ranges = _MODEL_TGV_M_RANGES.get((n, k))
+    return m_ranges is not None and m in m_ranges
+
+
+def _model_tgv_tactic(m: int, n: int, k: int) -> Optional[int]:
+    m_ranges = _MODEL_TGV_M_RANGES.get((n, k))
+    return None if m_ranges is None else m_ranges(m)
 
 
 # MuseSpark TP4/TP8 projections using TGV on GB300; other M use cuBLAS.
@@ -1357,6 +1446,9 @@ _MUSE_SPARK_TGV_M_RANGES = {
     (8192, 1024): (1, 64),  # TP8 o_proj
     (512, 8192): (256, 512),  # TP8 pooler slice
     (1024, 4096): (1, 512),  # TP8 unpooler slice
+    (14336, 8192): (24, 32),  # hidden 8192 / inter 28672 TP4 gate_up (DFLASH draft)
+    (50512, 8192): (17, 32),  # DFLASH draft TP4 candidate head
+    (7168, 8192): (24, 32),  # hidden 8192 / inter 28672 TP8 gate_up (DFLASH draft)
 }
 
 
@@ -1374,7 +1466,19 @@ def use_cutedsl_bf16_gemm(m: int, n: int, k: int) -> bool:
     m_range = _MUSE_SPARK_TGV_M_RANGES.get((n, k))
     if m_range is not None:
         return m_range[0] <= m <= m_range[1]
+    if (
+        current_arch().is_sm(10, 7)
+        and m in _K3_FRONT_WARP_SPLITK
+        and (n, k)
+        == (
+            6016,
+            7168,
+        )
+    ):
+        return True
     if m <= 8 and (n, k) in _K3_TGV_WIN_SHAPES:
+        return True
+    if _model_takes_tgv(m, n, k):
         return True
     if n < 1024 or k < 2048 or k > 6144:
         return False
@@ -1400,6 +1504,7 @@ def _tgv_bf16_gemm_run(
     x: torch.Tensor,
     weight: torch.Tensor,
     bias: Optional[torch.Tensor],
+    tactic: Optional[int] = None,
 ) -> torch.Tensor:
     if not is_sm100_supported():
         raise RuntimeError("cutedsl_bf16_gemm requires an SM10x GPU")
@@ -1413,14 +1518,9 @@ def _tgv_bf16_gemm_run(
         # Match cuBLAS/F.linear semantics for empty batches; a 0-CTA launch
         # would fail with CUDA_ERROR_INVALID_VALUE.
         return out
-    return _run_tgv(
-        x,
-        weight.t(),
-        bias,
-        out,
-        pdl=True,
-        tactic=_pick_tactic(x.shape[0], weight.shape[0], weight.shape[1]),
-    )
+    if tactic is None:
+        tactic = _pick_tactic(x.shape[0], weight.shape[0], weight.shape[1])
+    return _run_tgv(x, weight.t(), bias, out, pdl=True, tactic=tactic)
 
 
 def _tgv_bf16_gemm_out_run(
@@ -1439,6 +1539,36 @@ def _tgv_bf16_gemm_out_run(
     assert out.is_contiguous() and out.shape == (x.shape[0], weight.shape[0])
     if x.shape[0] == 0:
         return None
+    if (
+        current_arch().is_sm(10, 7)
+        and x.shape[0] in _K3_FRONT_WARP_SPLITK
+        and x.shape[1] == 7168
+        and weight.shape == (6016, 7168)
+        and out.dtype == torch.float32
+        and bias is None
+    ):
+        # Temporary vendored copy of FlashInfer's warp split-K kernel with an
+        # FP32 output path; switch to flashinfer.gemm once it accepts FP32 out.
+        from sglang.kernels.ops.gemm.dense_bf16_gemm_warp_splitk import (
+            WarpSplitKTactic,
+            run_warp_splitk_dense,
+        )
+
+        token_tile, stages = _K3_FRONT_WARP_SPLITK[x.shape[0]]
+        run_warp_splitk_dense(
+            x,
+            weight.t(),
+            out,
+            pdl=True,
+            tactic=WarpSplitKTactic(
+                output_tile=32,
+                token_tile=token_tile,
+                k_tile=256,
+                stages=stages,
+                b_loader_warps=2,
+            ),
+        )
+        return None
     _run_tgv(
         x,
         weight.t(),
@@ -1454,6 +1584,7 @@ def _tgv_bf16_gemm_fake(
     x: torch.Tensor,
     weight: torch.Tensor,
     bias: Optional[torch.Tensor],
+    tactic: Optional[int] = None,
 ) -> torch.Tensor:
     return x.new_empty((x.shape[0], weight.shape[0]))
 
@@ -1487,9 +1618,11 @@ def cutedsl_bf16_gemm(
     x: torch.Tensor,
     weight: torch.Tensor,
     bias: torch.Tensor | None = None,
+    tactic: int | None = None,
 ) -> torch.Tensor:
-    """out[M, N] = x[M, K] @ weight[N, K].T (+ bias[N]), all bf16, fp32 accum."""
-    return torch.ops.sglang.cutedsl_tgv_bf16_gemm(x, weight, bias)
+    """out[M, N] = x[M, K] @ weight[N, K].T (+ bias[N]), all bf16, fp32 accum;
+    ``tactic`` (an index into _TGV_CUTE_EXT_TACTIC_CONFIGS) overrides _pick_tactic."""
+    return torch.ops.sglang.cutedsl_tgv_bf16_gemm(x, weight, bias, tactic)
 
 
 @debug_kernel_api
