@@ -484,6 +484,7 @@ class TestOptimisticPrefillMambaRetryRelease(CustomTestCase):
             processed_tokens_counter=0,
             prefill_launched_reqs=KeyedReqList(ListKind.PREFILL_LAUNCHED),
         )
+        scheduler.prefill_launched_reqs.join([req])
         with patch(
             "sglang.srt.disaggregation.prefill.get_disagg",
             return_value=SimpleNamespace(optimistic_prefill_attempts=3),
@@ -571,6 +572,7 @@ class TestOptimisticPrefillWriteThroughRetryPublish(CustomTestCase):
             processed_tokens_counter=0,
             prefill_launched_reqs=KeyedReqList(ListKind.PREFILL_LAUNCHED),
         )
+        scheduler.prefill_launched_reqs.join([req])
         with (
             patch(
                 "sglang.srt.disaggregation.prefill.get_disagg",
