@@ -25,6 +25,8 @@ class PartRoute(msgspec.Struct, frozen=True, kw_only=True):
     part: str
     # 0-based position of the layer among the layers the part's view holds.
     index: int
+    # The attention window the layer reads over, when its sub-pool keeps one.
+    window: Optional[int] = None
 
 
 class KVLayer(msgspec.Struct, frozen=True, kw_only=True):
@@ -37,7 +39,8 @@ class KVLayer(msgspec.Struct, frozen=True, kw_only=True):
     # pass it today: a composite's local index, or a plain pool's model layer id.
     view_layer_id: int
     # Whether the layer's sub-pool is the router's owner, whose write ids are the
-    # request's token ids; another token sub-pool writes at the batch's `swa_loc`.
+    # request's token ids; another token sub-pool writes at its own entry of the
+    # batch's `window_locs`.
     owner: bool = True
     # A plain pool's own layer: the view is the pool, which takes the write loc
     # as the backend hands it and resolves it itself.
@@ -61,8 +64,8 @@ class KVLayer(msgspec.Struct, frozen=True, kw_only=True):
 
     def store(self, layer, loc_info, cache_k, cache_v, *args, **kwargs) -> None:
         """Writes the layer's K and V at the ids of its sub-pool: the owner's
-        (`full_loc`, else `loc`) or the window's (`swa_loc`), as the attention
-        backend bound them for the batch."""
+        (`full_loc`, else `loc`) or its window sub-pool's entry of
+        `window_locs`, as the attention backend bound them for the batch."""
         if self.plain:
             self.view.set_kv_buffer(layer, loc_info, cache_k, cache_v, *args, **kwargs)
             return
@@ -134,15 +137,17 @@ class KVLayer(msgspec.Struct, frozen=True, kw_only=True):
             write_loc_is_physical,
         )
 
-        loc, window_loc, owner_loc = unwrap_write_loc(loc_info)
+        loc, window_locs, owner_loc = unwrap_write_loc(loc_info)
         if self.owner:
             ids = owner_loc if owner_loc is not None else loc
         else:
-            assert window_loc is not None, (
-                f"layer {layer.layer_id} writes sub-pool {self.route.sub_pool!r}, "
-                "but the attention backend bundled no swa_loc for it"
+            # A window layer writes at its own sub-pool's write ids.
+            assert window_locs is not None and self.route.sub_pool in window_locs, (
+                f"layer {layer.layer_id} writes window sub-pool "
+                f"{self.route.sub_pool!r}, but the attention backend bundled "
+                f"write ids for {sorted(window_locs or ())}"
             )
-            ids = window_loc
+            ids = window_locs[self.route.sub_pool]
         return KVWriteLoc(ids, physical=write_loc_is_physical(loc_info))
 
     def read_mla(self, layer, loc, dst_dtype=None):
@@ -158,6 +163,8 @@ class PublicSubPool(msgspec.Struct, frozen=True, kw_only=True):
     name: str
     # Model layer ids routed to this sub-pool, in the order the pool declares them.
     layer_ids: Tuple[int, ...]
+    # The attention window its layers read over, when it keeps one.
+    window: Optional[int] = None
 
 
 class KVLayerRouter:
@@ -199,20 +206,27 @@ class KVLayerRouter:
         *,
         owner: Optional[str] = None,
         roles: Optional[Dict[str, str]] = None,
+        windows: Optional[Dict[str, Optional[int]]] = None,
     ) -> KVLayerRouter:
         """A composite's router: per sub-pool, in plan order, its name, its
         view, and each routed model layer's index in that view, which is also
         the id the composite passes the view today. ``owner`` names the
         sub-pool whose write ids are the request's token ids (default: the
-        first). No layer maps build a router without token KV, for parts to be
-        bound to."""
+        first); ``windows`` the attention window of each window sub-pool. No
+        layer maps build a router without token KV, for parts to be bound to."""
         if owner is None and layer_maps:
             owner = layer_maps[0][0]
+        windows = windows or {}
         layers: Dict[int, KVLayer] = {}
         for name, view, indices in layer_maps:
             for layer_id, index in indices.items():
                 layers[layer_id] = KVLayer(
-                    route=PartRoute(sub_pool=name, part=KV_PART, index=index),
+                    route=PartRoute(
+                        sub_pool=name,
+                        part=KV_PART,
+                        index=index,
+                        window=windows.get(name),
+                    ),
                     view=view,
                     view_layer_id=index,
                     owner=name == owner,
@@ -220,7 +234,9 @@ class KVLayerRouter:
         return cls(
             pool,
             sub_pools=tuple(
-                PublicSubPool(name=name, layer_ids=tuple(indices))
+                PublicSubPool(
+                    name=name, layer_ids=tuple(indices), window=windows.get(name)
+                )
                 for name, _, indices in layer_maps
             ),
             views={name: view for name, view, _ in layer_maps},

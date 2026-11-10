@@ -416,6 +416,7 @@ class KVCacheConfigurator:
     draft_model_idx: Optional[int] = None
     kv_cache_dtype_str: Optional[str] = None
     extra_mamba_cache_bytes_per_req: int = 0
+    allocate_intermediate_ssm: bool = True
     mambaish_config: Optional[Any] = field(init=False)
     hybrid_gdn_config: Optional[Any] = field(init=False)
     hybrid_kda_config: Optional[Any] = field(init=False)
@@ -768,7 +769,7 @@ class KVCacheConfigurator:
                         placement=placement,
                         runner=runner,
                         arena=alloc.arena,
-                        plan=alloc.storage.plan,
+                        plan=alloc.plan,
                         owner=alloc.roles.owner,
                         target_state=alloc.state,
                         model=self.model,
@@ -925,7 +926,7 @@ class KVCacheConfigurator:
             self.spec_algorithm.is_eagle() or self.spec_algorithm.is_dflash_family()
         ):
             return None
-        placement = alloc.storage.plan.fused_draft
+        placement = alloc.plan.fused_draft
         if placement is None:
             raise ValueError(
                 "The unified target storage plan must declare the draft payload "
@@ -1243,6 +1244,22 @@ class KVCacheConfigurator:
             )
         )
 
+    @staticmethod
+    def _draft_sliding_layer_window(draft_model_config):
+        """The window the draft's sliding-window layers attend over, as its runner
+        will resolve it once loaded; None without sliding-window layers."""
+        from sglang.srt.mem_cache.layout.fused_draft import draft_swa_layer_ids
+
+        if not draft_swa_layer_ids(draft_model_config):
+            return None
+        from sglang.srt.model_executor.model_runner_components.load_model_utils import (
+            resolve_sliding_layer_window_size,
+        )
+        from sglang.srt.model_loader.utils import get_model_architecture
+
+        model_cls, _ = get_model_architecture(draft_model_config)
+        return resolve_sliding_layer_window_size(model_cls, draft_model_config)
+
     def _fused_draft_decision(self):
         """Place each draft kind by lifetime and price its own row geometry.
 
@@ -1318,6 +1335,7 @@ class KVCacheConfigurator:
             # A DFLASH-family draft config inherits the target's NEXTN depth
             # count; its draft is one block, replicated per runner.
             num_depths=None if self.spec_algorithm.is_eagle() else 1,
+            window=self._draft_sliding_layer_window(aux.draft_model_config),
         )
         num_runners = (
             int(get_spec().speculative_num_steps)
@@ -1354,8 +1372,7 @@ class KVCacheConfigurator:
             num_runners=num_runners,
             ctx=PlacementContext(
                 host_names=self._unified_host_names(),
-                target_window=self.model_config.sliding_window_size,
-                target_window_sub_pool=self.target_window_sub_pool(),
+                target_windows=self._unified_target_windows(),
                 dcp_size=get_parallel().attn_dcp_size,
             ),
             store_dtype=_store_dtype_for(region_kv_dtype),
@@ -1582,6 +1599,7 @@ class KVCacheConfigurator:
             replayssm_request_ring=(
                 host_only_mamba_checkpoint() and self.hybrid_kda_config is not None
             ),
+            allocate_intermediate_ssm=self.allocate_intermediate_ssm,
         )
         return req_to_token_pool
 
@@ -1652,6 +1670,7 @@ class KVCacheConfigurator:
             replayssm_request_ring=(
                 host_only_mamba_checkpoint() and self.hybrid_kda_config is not None
             ),
+            allocate_intermediate_ssm=self.allocate_intermediate_ssm,
         )
         return req_to_token_pool
 
@@ -2065,11 +2084,8 @@ class KVCacheConfigurator:
         if not self.is_draft_worker:
             # Fresh rows include beam slots and PD preallocation. Reused rows
             # retain their current history; retraction has its own replay reset.
-            # FIXME: the ring and request-window rows are reset on the schedule
-            # stream when a row is reused, while the forward of the row's
-            # previous request may still read or write them (the write-after-read
-            # barrier orders only shared reads). Order the reset after that
-            # forward.
+            # TODO(ch-wan): these C4 ring and request-window resets race the row's
+            # previous forward; run them in the next forward, as `reset_new_rows` does.
             def reset_request_rows(rows):
                 if token_to_kv_pool._unified_kv:
                     token_to_kv_pool.clear_c4_req_states(rows)
@@ -2249,6 +2265,7 @@ class KVCacheConfigurator:
             enable_memory_saver=get_exec().features.enable_memory_saver,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
+            modelslim_cache_layout=self.modelslim_cache_layout,
         )
         return token_to_kv_pool
 
@@ -3313,10 +3330,6 @@ class KVCacheConfigurator:
                 ),
                 frozen=frozen,
             )
-        # PP stages select batches independently, so the synchronized share is
-        # also a live admission cap, even on the stage already at the minimum.
-        full_cap = full if get_parallel().pp_size > 1 else None
-        sized = msgspec.structs.replace(sized, full_cap_tokens=full_cap)
         self._unified_sized = sized
         return MemoryPoolConfig(
             max_total_num_tokens=sized.full_tokens,
@@ -3429,6 +3442,7 @@ class KVCacheConfigurator:
             has_spec_dec
             and not replayssm_active
             and not _pd_prefill_skips_mamba_spec_state()
+            and self.allocate_intermediate_ssm
         )
         if has_spec_dec:
             assert get_spec().speculative_num_draft_tokens is not None

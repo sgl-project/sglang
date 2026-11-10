@@ -1,73 +1,69 @@
-"""Each window sub-pool is named by its own length.
+"""Windows of different lengths are separate sub-pools named by their length.
 
-The target's window and a draft's window of another length are sub-pools named
-by the window they keep. The target's window keeps the host pool, PD state
-type and metrics names of a model's window, and consumers that ask for "the
-window" by the sliding-window role find it whatever it is named.
+A plan may declare several windows, each a sub-pool named by its own length.
+Its prefix tree slot is named by its sub-pool. Storage, sizing, the allocator,
+the prefix tree and PD peers hold any number of windows; host stores carry one
+further window and refuse more where they read it.
 """
 
+import random
 import unittest
+from array import array
+from types import SimpleNamespace
 
 import torch
+from test_unified_chain_realize import _live_bytes, _page_bytes
 
-from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
+from sglang.srt.mem_cache.base_prefix_cache import evictable_by_sub_pool
+from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
+from sglang.srt.mem_cache.kv.alloc.pricing import feasible, first_plan
 from sglang.srt.mem_cache.kv.build import UnifiedBuildContext, build_kv_storage
 from sglang.srt.mem_cache.kv.decl import (
     MHAGeometry,
-    WindowLifetime,
+    MLAGeometry,
+    WindowLayers,
     kv_layer_decls,
-    primary_window,
     window_sub_pool_name,
 )
-from sglang.srt.mem_cache.kv.plan import plan_kv_storage, sub_pool_names
-from sglang.srt.mem_cache.kv.sizing import KVSizingInputs, size_plan
-from sglang.srt.mem_cache.layout.fused_draft import (
-    DraftKVGeometry,
-    DraftKVProfile,
-    DraftLayerSet,
-    PlacementContext,
-    place_fused_draft,
+from sglang.srt.mem_cache.kv.plan import (
+    SubPoolExternal,
+    plan_kv_storage,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.srt.mem_cache.kv.sizing import KVSizingInputs, size_plan
+from sglang.srt.mem_cache.unified_cache.component_type import tree_slot_ids
+from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.unified_allocator_fixtures import setup_allocator_context
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=20, suite="base-a-test-cpu")
+register_cuda_ci(est_time=20, stage="extra-a", runner_config="1-gpu-small")
 
 _MHA = MHAGeometry(head_num=1, head_dim=8, v_head_dim=8, kv_cache_dtype=torch.bfloat16)
+_MLA = MLAGeometry(kv_lora_rank=16, qk_rope_head_dim=8, kv_cache_dtype=torch.bfloat16)
 
 
-def _decls(window):
+def _decls(windows, geometry=_MHA):
     return kv_layer_decls(
         full_layer_ids=(0,),
-        full_geometry=_MHA,
-        window_layer_ids=(1,),
-        window_geometry=_MHA,
-        window=window,
+        full_geometry=geometry,
+        windows=[
+            WindowLayers(layer_ids=(i + 1,), geometry=geometry, window=w)
+            for i, w in enumerate(windows)
+        ],
     )
 
 
-def _draft_placement(decls, *, target_window, draft_window):
-    return place_fused_draft(
-        profile=DraftKVProfile(
-            num_layers=1,
-            kinds={
-                "window": DraftLayerSet(
-                    layer_ids=(0,),
-                    window=draft_window,
-                    geometry=DraftKVGeometry(head_num=1, head_dim=8, v_head_dim=8),
-                )
-            },
-        ),
-        num_runners=1,
-        ctx=PlacementContext(
-            host_names=sub_pool_names(decls), target_window=target_window
-        ),
-        store_dtype=torch.bfloat16,
-    ).placement
+def _plan(windows, geometry=_MHA):
+    return plan_kv_storage(_decls(windows, geometry), page_size=4)
 
 
-def _storage(plan):
+def _storage(windows, *, geometry=_MHA, device="cpu", lazy=True):
+    return _build(
+        _plan(windows, geometry), end_layer=len(windows) + 1, device=device, lazy=lazy
+    )
+
+
+def _build(plan, *, end_layer, device="cpu", lazy=True):
     setup_allocator_context()
     sized = size_plan(
         plan,
@@ -81,14 +77,14 @@ def _storage(plan):
         ),
     )
     ctx = UnifiedBuildContext(
-        device="cpu",
+        device=device,
         start_layer=0,
-        end_layer=2,
+        end_layer=end_layer,
         enable_memory_saver=False,
         need_sort=False,
         max_num_reqs=3,
         model_context_len=64,
-        lazy_compaction=True,
+        lazy_compaction=lazy,
     )
     return build_kv_storage(plan, sized, ctx)
 
@@ -99,162 +95,188 @@ class TestWindowNames(CustomTestCase):
         self.assertEqual(window_sub_pool_name(4096), "window_4096")
         # A window whose length the model does not state.
         self.assertEqual(window_sub_pool_name(None), "window")
-        plan = plan_kv_storage(_decls(16), page_size=4)
-        self.assertEqual({s.name for s in plan.sub_pools}, {"full", "window_16"})
-        self.assertEqual(plan.primary_window().name, "window_16")
-        self.assertEqual(sub_pool_names(_decls(16)), ("full", "window_16"))
+        plan = _plan((64, 16, 8))
         self.assertEqual(
-            plan_kv_storage(_decls(None), page_size=4).primary_window().name, "window"
+            {s.name for s in plan.sub_pools},
+            {"full", "window_64", "window_16", "window_8"},
         )
-
-    def test_the_longest_window_is_primary(self):
-        self.assertIsNone(primary_window(()))
-        self.assertEqual(primary_window((16, 64, 8)), 64)
-        # A window that states no length counts as longest.
-        self.assertIsNone(primary_window((16, None)))
-
-    def test_a_plan_asks_for_its_window_by_rule(self):
-        plan = plan_kv_storage(_decls(16), page_size=4)
-        with self.assertRaises(AssertionError):
-            plan.of_lifetime(WindowLifetime)
-
-    def test_external_names_of_the_target_window(self):
-        # The target's window keeps the names the host pools, PD peers and
-        # metrics use for a model's window.
-        plan = plan_kv_storage(_decls(16), page_size=4)
-        external = plan.sub_pool("window_16").external
         self.assertEqual(
-            (
-                external.host_pool,
-                external.tree_component,
-                external.metrics,
-                external.wire,
+            [s.name for s in plan.windows()], ["window_64", "window_16", "window_8"]
+        )
+        self.assertEqual(plan.primary_window().name, "window_64")
+        # A window's name does not depend on the other windows.
+        self.assertEqual(_plan((16,)).primary_window().name, "window_16")
+
+    def test_external_names_follow_sub_pools_and_window_slots(self):
+        # A window's prefix tree slot and host pool are named by its sub-pool.
+        # PD peers carry every window as the window state type, told apart by
+        # sub-pool.
+        first = SubPoolExternal(
+            host_pool="window_16",
+            tree_component="WINDOW_16",
+            metrics="window",
+            label="window_16",
+            wire="swa",
+            wire_key="window_16",
+        )
+        self.assertEqual(_plan((16,)).sub_pool("window_16").external, first)
+        two = _plan((16, 64))
+        self.assertEqual(
+            two.sub_pool("window_64").external,
+            SubPoolExternal(
+                host_pool="window_64",
+                tree_component="WINDOW_64",
+                metrics="window",
+                label="window_64",
+                wire="swa",
+                wire_key="window_64",
             ),
-            ("swa", "WINDOW_16", "swa", "swa"),
         )
         self.assertEqual(
-            [slot.component for slot in plan.tree_slots()], ["FULL", "WINDOW_16"]
+            two.sub_pool("window_16").external,
+            SubPoolExternal(
+                host_pool="window_16",
+                tree_component="WINDOW_16",
+                metrics="window",
+                label="window_16",
+                wire="swa",
+                wire_key="window_16",
+            ),
+        )
+        slots = two.tree_slots()
+        self.assertEqual(
+            [slot.component for slot in slots], ["FULL", "WINDOW_64", "WINDOW_16"]
         )
         self.assertEqual(
-            [(e.sub_pool, e.state_type) for e in plan.wire_entries()],
-            [("window_16", "swa")],
+            [slot.host_pool for slot in slots], ["kv", "window_64", "window_16"]
         )
+        self.assertEqual([slot.window for slot in slots][1:], [64, 16])
+        # Every window slot goes by its own name, a single window's too: a
+        # boundary keeping one window maps it to its own id itself.
+        self.assertEqual(
+            [ct.name for ct in tree_slot_ids(slots).values()],
+            ["FULL", "WINDOW_64", "WINDOW_16"],
+        )
+        self.assertEqual(
+            [ct.name for ct in tree_slot_ids(_plan((64,)).tree_slots()).values()],
+            ["FULL", "WINDOW_64"],
+        )
+        self.assertEqual(
+            [(e.sub_pool, e.state_type) for e in two.wire_entries()],
+            [("window_16", "swa"), ("window_64", "swa")],
+        )
+        # A prefix tree and PD peers keep every window.
+        three = _plan((64, 16, 8))
+        self.assertEqual(
+            [(slot.component, slot.window) for slot in three.tree_slots()],
+            [("FULL", None), ("WINDOW_64", 64), ("WINDOW_16", 16), ("WINDOW_8", 8)],
+        )
+        self.assertEqual(three.sub_pool("window_8").external.host_pool, "window_8")
+        # Peers list entries of one state type by sub-pool name, whatever order
+        # the plan holds the windows in.
+        self.assertEqual(
+            [(e.sub_pool, e.state_type) for e in three.wire_entries()],
+            [("window_16", "swa"), ("window_64", "swa"), ("window_8", "swa")],
+        )
+        self.assertEqual(_plan((8, 64, 16)).wire_entries(), three.wire_entries())
 
 
-class TestDraftWindowNames(CustomTestCase):
-    def test_a_draft_window_of_the_target_length_rides_in_the_target_window(self):
-        decls = _decls(16)
-        placement = _draft_placement(decls, target_window=16, draft_window=16)
-        self.assertEqual(placement.hosts(), ("window_16",))
-        self.assertEqual(placement.new_bands, {})
-        plan = plan_kv_storage(decls, page_size=4, fused_draft=placement)
-        self.assertEqual(
-            [s.name for s in plan.sub_pools if s.spec.draft_region is not None],
-            ["window_16"],
-        )
-
-    def test_a_draft_window_of_another_length_is_named_by_it(self):
-        decls = _decls(16)
-        placement = _draft_placement(decls, target_window=16, draft_window=32)
-        self.assertEqual(set(placement.new_bands), {"window_32"})
-        plan = plan_kv_storage(decls, page_size=4, fused_draft=placement)
-        self.assertEqual(
-            {s.name for s in plan.sub_pools}, {"full", "window_16", "window_32"}
-        )
-        # The target's window stays the primary one; the draft's goes by the
-        # second window entry of the host pools and PD peers, and the prefix
-        # tree names each window by its sub-pool.
-        self.assertEqual(plan.primary_window().name, "window_16")
-        external = plan.sub_pool("window_32").external
-        self.assertEqual(
-            (external.host_pool, external.tree_component, external.wire),
-            ("auxiliary_swa", "WINDOW_32", "auxiliary_swa"),
-        )
-        self.assertEqual(
-            plan.sub_pool("window_16").external.tree_component, "WINDOW_16"
-        )
-
-    def test_a_draft_window_without_a_target_window_takes_the_window_names(self):
-        decls = kv_layer_decls(full_layer_ids=(0,), full_geometry=_MHA)
-        placement = _draft_placement(decls, target_window=None, draft_window=32)
-        self.assertEqual(set(placement.new_bands), {"window_32"})
-        plan = plan_kv_storage(decls, page_size=4, fused_draft=placement)
-        self.assertEqual(plan.primary_window().name, "window_32")
-        self.assertEqual(
-            plan.sub_pool("window_32").external.tree_component, "WINDOW_32"
-        )
-
-    def test_a_draft_band_cannot_take_a_target_name(self):
+class TestDraftWindowFusesByLifetime(CustomTestCase):
+    def test_draft_window_rides_in_the_target_window_of_its_length(self):
+        """A draft window equal to any target window shares that window's
+        entries; one equal to none gets a band of its own, named by its length
+        as a target window of that length would be."""
+        from sglang.srt.mem_cache.kv.plan import sub_pool_names
         from sglang.srt.mem_cache.layout.fused_draft import (
-            DenseDraftRegion,
-            DraftBand,
-            FusedDraftPlacement,
+            DraftKVGeometry,
+            DraftKVProfile,
+            DraftLayerSet,
+            PlacementContext,
+            place_fused_draft,
         )
 
-        placement = FusedDraftPlacement.from_counts(
-            counts={"window_16": [1]},
-            regions={
-                "window_16": DenseDraftRegion(
-                    lane_num=1, head_num=1, head_dim=8, store_dtype=torch.bfloat16
+        target_windows = (64, 16)
+        decls = _decls(target_windows)
+        for draft_window, host, new_band in (
+            (64, "window_64", False),
+            (16, "window_16", False),
+            (8, "window_8", True),
+        ):
+            with self.subTest(draft_window=draft_window):
+                placement = place_fused_draft(
+                    profile=DraftKVProfile(
+                        num_layers=1,
+                        kinds={
+                            "window": DraftLayerSet(
+                                layer_ids=(0,),
+                                window=draft_window,
+                                geometry=DraftKVGeometry(
+                                    head_num=1, head_dim=8, v_head_dim=8
+                                ),
+                            )
+                        },
+                    ),
+                    num_runners=1,
+                    ctx=PlacementContext(
+                        host_names=sub_pool_names(decls),
+                        target_windows=target_windows,
+                    ),
+                    store_dtype=torch.bfloat16,
+                ).placement
+                self.assertEqual(placement.hosts(), (host,))
+                self.assertEqual(host in placement.new_bands, new_band)
+                self.assertEqual(placement.host_kind(host).name, "window")
+                plan = plan_kv_storage(decls, page_size=4, fused_draft=placement)
+                carriers = [
+                    s.name for s in plan.sub_pools if s.spec.draft_region is not None
+                ]
+                self.assertEqual(carriers, [host])
+                self.assertEqual(
+                    len(plan.windows()), len(target_windows) + int(new_band)
                 )
-            },
-            new_bands={"window_16": DraftBand(kind="window", window=32)},
-        )
-        with self.assertRaisesRegex(ValueError, "takes a target sub-pool's name"):
-            plan_kv_storage(_decls(16), page_size=4, fused_draft=placement)
-
-
-class TestWindowRole(CustomTestCase):
-    def test_the_sliding_window_role_finds_the_target_window(self):
-        storage = _storage(plan_kv_storage(_decls(16), page_size=4))
-        router = storage.allocator.get_kvcache().layer_router
-        self.assertEqual(router.sub_pool(IdSpaceKind.SLIDING_WINDOW).name, "window_16")
-        self.assertIs(router.view(IdSpaceKind.SLIDING_WINDOW), router.view("window_16"))
-        self.assertTrue(router.plays(1, IdSpaceKind.SLIDING_WINDOW))
-        self.assertFalse(router.plays(0, IdSpaceKind.SLIDING_WINDOW))
-        self.assertEqual(router.route(1).sub_pool, "window_16")
-        # Id spaces are keyed by sub-pool name only.
-        self.assertNotIn(IdSpaceKind.SLIDING_WINDOW, storage.allocator.id_spaces())
-
-    def test_runner_ids_resolve_the_role_to_the_target_window(self):
-        from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
-
-        storage = _storage(plan_kv_storage(_decls(16), page_size=4))
-        alloc = storage.allocator
-        runner = RunnerIds(
-            req_to_token=storage.requests.req_to_token,
-            token_to_kv_pool_allocator=alloc,
-            token_to_kv_pool=alloc.get_kvcache(),
-            page_size=4,
-            device="cpu",
-        )
-        self.assertEqual(runner.sub_pool_name(IdSpaceKind.SLIDING_WINDOW), "window_16")
-        self.assertIs(
-            runner.space(IdSpaceKind.SLIDING_WINDOW), runner.space("window_16")
-        )
-        self.assertEqual(runner.window_kv_kind, IdSpaceKind.SLIDING_WINDOW)
-        ids = alloc.alloc(8)
-        torch.testing.assert_close(
-            runner.ids_in(IdSpaceKind.SLIDING_WINDOW, ids),
-            alloc.id_spaces()["window_16"].ids(ids),
-        )
 
     def test_a_fused_draft_names_its_window_host_by_role(self):
+        """The draft's pool routes its window layer by its host's name and
+        maps the sliding-window role to that host, as the target's pool maps
+        it to its primary window; RunnerIds reads both through one rule."""
+        from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
         from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
+        from sglang.srt.mem_cache.kv.plan import sub_pool_names
+        from sglang.srt.mem_cache.layout.fused_draft import (
+            DraftKVGeometry,
+            DraftKVProfile,
+            DraftLayerSet,
+            PlacementContext,
+            place_fused_draft,
+        )
         from sglang.srt.mem_cache.unified_draft_pool import routed_draft_pool
 
-        # A draft window equal to the target's rides in the target's window
-        # sub-pool; one of another length gets a band of its own. Either way
-        # the draft's pool routes its layer by the host's name and maps the
-        # sliding-window role to that host, as the target's pool does.
+        target_windows = (16,)
+        decls = _decls(target_windows)
         for draft_window, host in ((16, "window_16"), (32, "window_32")):
             with self.subTest(draft_window=draft_window):
-                decls = _decls(16)
-                placement = _draft_placement(
-                    decls, target_window=16, draft_window=draft_window
-                )
+                placement = place_fused_draft(
+                    profile=DraftKVProfile(
+                        num_layers=1,
+                        kinds={
+                            "window": DraftLayerSet(
+                                layer_ids=(0,),
+                                window=draft_window,
+                                geometry=DraftKVGeometry(
+                                    head_num=1, head_dim=8, v_head_dim=8
+                                ),
+                            )
+                        },
+                    ),
+                    num_runners=1,
+                    ctx=PlacementContext(
+                        host_names=sub_pool_names(decls),
+                        target_windows=target_windows,
+                    ),
+                    store_dtype=torch.bfloat16,
+                ).placement
                 plan = plan_kv_storage(decls, page_size=4, fused_draft=placement)
-                storage = _storage(plan)
+                storage = _build(plan, end_layer=len(target_windows) + 1)
                 alloc = storage.allocator
                 pool = routed_draft_pool(
                     arena=alloc.arena,
@@ -267,7 +289,6 @@ class TestWindowRole(CustomTestCase):
                 self.assertEqual([p.name for p in router.sub_pools()], [host])
                 self.assertEqual(router.route(0).sub_pool, host)
                 self.assertEqual(router.sub_pool(IdSpaceKind.SLIDING_WINDOW).name, host)
-                self.assertTrue(router.plays(0, IdSpaceKind.SLIDING_WINDOW))
                 runner = RunnerIds(
                     req_to_token=storage.requests.req_to_token,
                     token_to_kv_pool_allocator=alloc,
@@ -278,14 +299,761 @@ class TestWindowRole(CustomTestCase):
                 )
                 self.assertTrue(runner.is_fused_draft)
                 self.assertEqual(runner.sub_pool_name(IdSpaceKind.SLIDING_WINDOW), host)
-                self.assertIs(
-                    runner.space(IdSpaceKind.SLIDING_WINDOW), runner.space(host)
-                )
                 ids = alloc.alloc(8)
                 torch.testing.assert_close(
                     runner.ids_in(IdSpaceKind.SLIDING_WINDOW, ids),
                     alloc.id_spaces()[host].ids(ids),
                 )
+
+
+class TestEveryWindowBudget(CustomTestCase):
+    """A decode preallocation is priced against every window's budget by name:
+    a further window that cannot hold its running growth refuses the request."""
+
+    def _allocator(self):
+        storage = _storage((16, 8))
+        return storage.allocator
+
+    def _fits(self, allocator, held_back):
+        """A one-page request beside what each window's budget holds back
+        (a pool sharing memory counts its budgets from zero)."""
+        page = allocator.page_size
+        names = allocator.window_pool_names()
+        demand = KVDemand(page, dict.fromkeys(names, page), 0)
+        return allocator.prealloc_fits(
+            demand,
+            evictable={},
+            full_budget_tokens=0,
+            window_budget_tokens={name: -tokens for name, tokens in held_back.items()},
+        )
+
+    def _room(self, allocator, window):
+        """The most tokens ``window`` can hold back beside the request."""
+        page = allocator.page_size
+        names = allocator.window_pool_names()
+        low, high = 0, allocator.size_swa // page + 1
+        while low < high:
+            mid = (low + high + 1) // 2
+            windows = dict.fromkeys(names, page)
+            windows[window] += mid * page
+            if allocator.admits(KVDemand(page, windows, 0), evictable={}):
+                low = mid
+            else:
+                high = mid - 1
+        return low * page
+
+    def test_a_further_window_holding_back_its_growth_refuses(self):
+        allocator = self._allocator()
+        target = allocator.target_window_pool()
+        (further,) = [n for n in allocator.window_pool_names() if n != target]
+        page = allocator.page_size
+        room = self._room(allocator, further)
+        self.assertGreater(room, 0)
+        # Holding nothing back, or all the room it has, the further window
+        # admits the request ...
+        self.assertTrue(self._fits(allocator, {}))
+        self.assertTrue(self._fits(allocator, {further: room}))
+        # ... and holding back one page more for running requests' growth
+        # refuses it, though the target's window could serve.
+        self.assertFalse(self._fits(allocator, {further: room + page}))
+        # A budget above zero holds nothing back.
+        self.assertTrue(self._fits(allocator, {further: -page}))
+
+
+class TestSharedBytesServeEitherSide(CustomTestCase):
+    """Regression: with every row cached and nothing free, a decode preallocation
+    whose owner tokens need reclaimed window bytes must be admitted."""
+
+    def test_window_entries_make_owner_room(self):
+        from sglang.test.unified_allocator_fixtures import (
+            UnifiedGeometry,
+            build_unified_bundle,
+            setup_allocator_context,
+        )
+
+        setup_allocator_context()
+        allocator = build_unified_bundle(
+            UnifiedGeometry(
+                chain="swa",
+                full_layer_ids=(0,),
+                swa_layer_ids=(1,),
+                page_size=4,
+                full_tokens=256,
+                swa_tokens=256,
+                context_len=256,
+            )
+        ).token_to_kv_pool_allocator
+        (window,) = allocator.window_pool_names()
+        held = 0
+        while allocator.alloc(4) is not None:
+            held += 4
+        owner = allocator.full_attn_allocator.sub_pool_name
+        # Every row is a cached entry the prefix cache could evict.
+        evictable = {owner: held, window: held}
+        # More owner tokens than evicting the owner's own entries frees.
+        demand = KVDemand(held + held // 2, {window: 4}, 0)
+        self.assertTrue(allocator.admits(demand, evictable=evictable))
+        # Budgets holding nothing back (counted from zero) admit it too.
+        self.assertTrue(
+            allocator.prealloc_fits(
+                demand,
+                evictable=evictable,
+                full_budget_tokens=0,
+                window_budget_tokens={window: 0},
+            )
+        )
+
+
+class _Backend:
+    """An attention backend as the runner binds it."""
+
+    def __init__(self, max_window_sub_pools):
+        self.max_window_sub_pools = max_window_sub_pools
+        self.runner_ids = None
+
+
+class _MultiStepWrapper:
+    """A multi-step draft wrapper as the draft worker binds it: no attention
+    backend itself, one backend per draft step."""
+
+    def __init__(self, steps):
+        self.attn_backends = steps
+        self.runner_ids = None
+
+
+class TestRunnerAddressesEveryWindow(CustomTestCase):
+    def _runner(self, storage, req_to_token):
+        from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
+
+        allocator = storage.allocator
+        return RunnerIds(
+            req_to_token=req_to_token,
+            token_to_kv_pool_allocator=allocator,
+            token_to_kv_pool=allocator.get_kvcache(),
+            page_size=4,
+            device="cpu",
+        )
+
+    def test_each_window_writes_and_reads_its_own_rows(self):
+        """A runner over several window sub-pools names each one's write ids
+        and page table through that sub-pool's own pages."""
+        from test_runner_ids import _FakeForwardBatch
+
+        for windows in ((64, 16), (64, 16, 8)):
+            with self.subTest(windows=windows):
+                storage = _storage(windows)
+                allocator = storage.allocator
+                names = sorted(window_sub_pool_name(w) for w in windows)
+                held = allocator.alloc(8)
+                virt = allocator.alloc(8)
+                req_to_token = torch.zeros((3, 64), dtype=torch.int32)
+                req_to_token[0, :16] = torch.cat([held, virt]).to(torch.int32)
+                runner = self._runner(storage, req_to_token)
+                self.assertEqual(runner.window_sub_pools, tuple(names))
+                batch = _FakeForwardBatch(
+                    req_pool_indices=torch.tensor([0]),
+                    seq_lens=torch.tensor([16]),
+                    seq_lens_cpu=torch.tensor([16]),
+                    out_cache_loc=virt,
+                )
+                plan = runner.own_plan(batch)
+                rows = set()
+                for name in names:
+                    band = allocator.window_allocators[name]
+                    pages = band.ids.virtual_to_physical
+                    want = pages[virt // 4] * 4 + virt % 4
+                    got = plan.write_ids(runner, kind=name)
+                    self.assertTrue(torch.equal(got, want), name)
+                    table = plan.read_table(kind=name, reader=runner)
+                    page_ids = table.ids[table.row_ids[0], :4]
+                    want_pages = pages[req_to_token[0, :16:4].long() // 4]
+                    self.assertTrue(torch.equal(page_ids.long(), want_pages), name)
+                    rows.add((name, tuple(want.tolist())))
+                self.assertEqual(len(rows), len(names))
+
+    def test_backends_bind_only_as_many_windows_as_they_serve(self):
+        """Backends build window metadata per runner: one that serves fewer
+        window sub-pools than the runner's layers read is refused by name."""
+        for windows, refused in (((64,), False), ((64, 16), True)):
+            with self.subTest(windows=windows):
+                runner = self._runner(
+                    _storage(windows), torch.zeros((3, 64), dtype=torch.int32)
+                )
+                backend = _Backend(max_window_sub_pools=1)
+                if refused:
+                    with self.assertRaisesRegex(
+                        NotImplementedError, "_Backend.*window_16|window_16.*_Backend"
+                    ):
+                        runner.bind_and_verify_backends([backend])
+                    self.assertIsNone(backend.runner_ids)
+                else:
+                    runner.bind_and_verify_backends([backend])
+                    self.assertIs(backend.runner_ids, runner)
+                wide = _Backend(max_window_sub_pools=len(windows))
+                runner.bind_and_verify_backends([wide])
+                self.assertIs(wide.runner_ids, runner)
+
+    def test_multi_step_wrappers_answer_through_their_step_backends(self):
+        """A multi-step draft wrapper carries no window capability of its own:
+        it binds when every step backend serves the runner's windows, and is
+        refused, naming the step backend, when one does not."""
+        for windows, step_capacity, refused in (
+            ((64,), 1, False),
+            ((64, 16), 1, True),
+            ((64, 16), 2, False),
+        ):
+            with self.subTest(windows=windows, step_capacity=step_capacity):
+                runner = self._runner(
+                    _storage(windows), torch.zeros((3, 64), dtype=torch.int32)
+                )
+                steps = [_Backend(max_window_sub_pools=step_capacity) for _ in range(3)]
+                wrapper = _MultiStepWrapper(steps)
+                bound = [wrapper, *steps]
+                if refused:
+                    with self.assertRaisesRegex(NotImplementedError, "_Backend"):
+                        runner.bind_and_verify_backends(bound)
+                    self.assertIsNone(wrapper.runner_ids)
+                    continue
+                runner.bind_and_verify_backends(bound)
+                for backend in bound:
+                    self.assertIs(backend.runner_ids, runner)
+        # A one-step draft wraps no step backend; it still binds.
+        runner = self._runner(_storage((64,)), torch.zeros((3, 64), dtype=torch.int32))
+        empty = _MultiStepWrapper([])
+        runner.bind_and_verify_backends([empty])
+        self.assertIs(empty.runner_ids, runner)
+
+
+class TestSeveralWindowsAllocate(CustomTestCase):
+    def _check(self, device, seed, count):
+        rng = random.Random(seed)
+        realized = 0
+        cases = (((64, 16), _MHA), ((64, 16), _MLA), ((64, 16, 8), _MHA))
+        while realized < count:
+            windows, geometry = cases[realized % len(cases)]
+            storage = _storage(windows, geometry=geometry, device=device)
+            allocator = storage.allocator
+            self.assertEqual(
+                set(allocator.window_allocators),
+                {window_sub_pool_name(w) for w in windows},
+            )
+            raw = allocator.arena.raw
+            raw.copy_(torch.randint(0, 256, raw.shape, dtype=torch.uint8))
+            held = [allocator.alloc(rng.randint(1, 8) * 4) for _ in range(4)]
+            for ids in held:
+                if ids is not None and rng.random() < 0.4:
+                    allocator.free(ids)
+            snapshot = allocator.pricing_snapshot()
+            demands = {b.name: rng.choice((0, 1, 2, 4)) for b in snapshot.bands}
+            if not feasible(snapshot, demands):
+                continue
+            before = _live_bytes(allocator)
+            taken = allocator.realize(first_plan(snapshot, demands))
+            realized += 1
+            after = _live_bytes(allocator)
+            self.assertEqual(before.keys(), after.keys())
+            for key, payload in before.items():
+                self.assertTrue(torch.equal(payload, after[key]), key)
+            for name, pages in demands.items():
+                self.assertEqual(0 if name not in taken else taken[name].numel(), pages)
+            ranges = _page_bytes(allocator, taken)
+            for (_, end, a), (start, _, b) in zip(ranges, ranges[1:]):
+                self.assertLessEqual(end, start, (a, b))
+
+    def test_several_windows_build_and_realize_on_cpu(self):
+        self._check("cpu", seed=3, count=60)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+    def test_several_windows_build_and_realize_on_cuda(self):
+        self._check("cuda", seed=4, count=12)
+
+
+class TestTwoTargetWindowsRetire(CustomTestCase):
+    def test_decode_retires_each_window_by_its_length(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.managers.schedule_batch import ReqKvInfo, ScheduleBatch
+        from sglang.srt.mem_cache.base_prefix_cache import (
+            EvictParams,
+            InsertParams,
+            MatchPrefixParams,
+        )
+        from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+        from sglang.srt.mem_cache.radix_cache import RadixKey
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+        from sglang.srt.model_executor.forward_mode import ForwardMode
+
+        long_window, short_window = 16, 8
+        with (
+            envs.SGLANG_OPT_RELEASE_PREFILL_SWA.override(True),
+            envs.SGLANG_SWA_EVICTION_INTERVAL.override(1),
+        ):
+            storage = _storage((long_window, short_window))
+            a = storage.allocator
+            cache = UnifiedRadixCache(
+                CacheInitParams(
+                    disable=False,
+                    req_to_token_pool=storage.requests,
+                    token_to_kv_pool_allocator=a,
+                    page_size=4,
+                    sliding_window_size=long_window,
+                    tree_slots=storage.tree_slots(),
+                    tree_core_backend="python",
+                )
+            )
+            prefix = a.alloc(16)
+            self.assertIsNotNone(prefix)
+            key = RadixKey(array("q", range(16)))
+            cache.insert(InsertParams(key=key, value=prefix.clone()))
+            node_id = cache.match_prefix(MatchPrefixParams(key=key)).last_device_node
+            lock = cache.lock(node_id)
+            req = SimpleNamespace(
+                session=None,
+                lock=lock,
+                seqlen=17,
+                decode_batch_idx=0,
+                kv=ReqKvInfo(req_pool_idx=1, cache_protected_len=16),
+            )
+            storage.requests.req_to_token[1, :16] = prefix
+            batch = ScheduleBatch(
+                reqs=[req],
+                tree_cache=cache,
+                req_to_token_pool=storage.requests,
+                token_to_kv_pool_allocator=a,
+                forward_mode=ForwardMode.DECODE,
+            )
+            node = cache.tree_core.node_by_id(node_id)
+            for frontier in range(20, 49, 4):
+                ids = a.alloc(4)
+                self.assertIsNotNone(ids, frontier)
+                storage.requests.req_to_token[1, frontier - 4 : frontier] = ids
+                req.seqlen = frontier + 1
+                req.decode_batch_idx = frontier - 16
+                batch.maybe_evict_swa()
+                long, short = cache.window_slots()
+                cache.evict(
+                    EvictParams(window_num_tokens={"window_16": 80, "window_8": 80})
+                )
+                for ct, window in (
+                    (long, long_window),
+                    (short, short_window),
+                ):
+                    self.assertEqual(
+                        node.component_data[ct].lock_ref,
+                        int(req.decode_batch_idx < window),
+                        (frontier, ct),
+                    )
+            for name, window in (
+                ("window_16", long_window),
+                ("window_8", short_window),
+            ):
+                self.assertEqual(a.window_allocators[name].allocated_count(), window)
+            cache.free_kv_row(req.kv, [(16, 48)])
+            cache.unlock(lock)
+            cache.evict(
+                EvictParams(
+                    num_tokens=80,
+                    window_num_tokens={"window_16": 80, "window_8": 80},
+                )
+            )
+            self.assertEqual(storage.accounting_violations(), [])
+            self.assertTrue(all(b.allocated_count() == 0 for b in a.members))
+
+
+class TestThreeWindowTree(CustomTestCase):
+    """A prefix tree keeps one slot per window sub-pool: each window's values,
+    locks and evictions are its own."""
+
+    def _cache(self):
+        from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        storage = _storage((16, 8, 4))
+        cache = UnifiedRadixCache(
+            CacheInitParams(
+                disable=False,
+                req_to_token_pool=storage.requests,
+                token_to_kv_pool_allocator=storage.allocator,
+                page_size=4,
+                sliding_window_size=16,
+                tree_slots=storage.tree_slots(),
+                tree_core_backend="python",
+            )
+        )
+        return storage, cache
+
+    def test_each_window_slot_matches_locks_and_evicts_alone(self):
+        from sglang.srt.mem_cache.base_prefix_cache import (
+            EvictParams,
+            InsertParams,
+            MatchPrefixParams,
+        )
+        from sglang.srt.mem_cache.radix_cache import RadixKey
+
+        storage, cache = self._cache()
+        a = storage.allocator
+        swa, swa_8, swa_4 = cache.window_slots()
+        # No window plays a role: each slot goes by its own name.
+        self.assertEqual(
+            [ct.name for ct in (swa, swa_8, swa_4)],
+            ["WINDOW_16", "WINDOW_8", "WINDOW_4"],
+        )
+        self.assertEqual(
+            [
+                (name, cache.window_slot_of(name), window)
+                for name, window in cache.window_sub_pools()
+            ],
+            [("window_16", swa, 16), ("window_8", swa_8, 8), ("window_4", swa_4, 4)],
+        )
+        self.assertEqual(
+            [
+                cache.window_retain_size(n)
+                for n in ("window_16", "window_8", "window_4")
+            ],
+            [16, 8, 4],
+        )
+
+        key = RadixKey(array("q", range(16)))
+        cache.insert(InsertParams(key=key, value=a.alloc(16).clone()))
+        match = cache.match_prefix(MatchPrefixParams(key=key))
+        self.assertEqual(match.device_prefix_len, 16)
+        node = cache.tree_core.node_by_id(match.last_device_node)
+        for ct in (swa, swa_8, swa_4):
+            self.assertEqual(
+                cache.window_evictable_size(cache.window_sub_pool_of_slot(ct)), 16
+            )
+            self.assertIsNotNone(node.component_data[ct].value)
+
+        # A lock holds each window slot's own trailing window of the prefix.
+        lock = cache.lock(match.last_device_node)
+        for ct in (swa, swa_8, swa_4):
+            self.assertEqual(node.component_data[ct].lock_ref, 1)
+        self.assertEqual(
+            [
+                cache.window_evictable_size(n)
+                for n in ("window_16", "window_8", "window_4")
+            ],
+            [0, 8, 12],
+        )
+        # Each further window evicts what lies before its own window, alone.
+        result = cache.evict(
+            EvictParams(window_num_tokens={"window_8": 16, "window_4": 16})
+        )
+        self.assertEqual(
+            result.window_num_tokens_evicted,
+            {"window_16": 0, "window_8": 8, "window_4": 12},
+        )
+        self.assertEqual(result.num_tokens_evicted, 0)
+        self.assertEqual(
+            {b.sub_pool_name: b.allocated_count() for b in a.bands},
+            {"full": 16, "window_16": 16, "window_8": 8, "window_4": 4},
+        )
+        # Every window still holds its trailing tokens: the prefix matches whole.
+        self.assertEqual(
+            cache.match_prefix(MatchPrefixParams(key=key)).device_prefix_len, 16
+        )
+        cache.unlock(lock)
+
+        cache.evict(
+            EvictParams(
+                num_tokens=64,
+                window_num_tokens={"window_16": 64, "window_8": 64, "window_4": 64},
+            )
+        )
+        self.assertTrue(all(b.allocated_count() == 0 for b in a.members))
+        self.assertEqual(storage.accounting_violations(), [])
+
+    def test_every_window_releases_its_prefix_lock_alike(self):
+        """Each window releases a request's prefix lock once the request has
+        decoded past it, the first window like the others; the token lock
+        stays until the request's final unlock."""
+        from types import SimpleNamespace
+
+        from sglang.srt.managers.schedule_batch import ReqKvInfo
+        from sglang.srt.mem_cache.base_prefix_cache import (
+            InsertParams,
+            MatchPrefixParams,
+        )
+        from sglang.srt.mem_cache.radix_cache import RadixKey
+        from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+
+        storage, cache = self._cache()
+        a = storage.allocator
+        w16, w8, w4 = cache.window_slots()
+        key = RadixKey(array("q", range(16)))
+        cache.insert(InsertParams(key=key, value=a.alloc(16).clone()))
+        match = cache.match_prefix(MatchPrefixParams(key=key))
+        node = cache.tree_core.node_by_id(match.last_device_node)
+        lock = cache.lock(match.last_device_node)
+        req = SimpleNamespace(
+            session=None,
+            lock=lock,
+            decode_batch_idx=10,
+            kv=ReqKvInfo(req_pool_idx=1, cache_protected_len=16),
+        )
+
+        def held():
+            return [node.component_data[ct].lock_ref for ct in (w16, w8, w4)]
+
+        # Past the 8- and 4-token windows only: those two let go.
+        cache.release_swa_prefix_lock(req)
+        self.assertEqual(held(), [1, 0, 0])
+        # Past the first window too: it lets go the same way.
+        req.decode_batch_idx = 16
+        cache.release_swa_prefix_lock(req)
+        self.assertEqual(held(), [0, 0, 0])
+        self.assertFalse(lock.swa_released)
+        self.assertTrue({w16, w8, w4} <= set(lock.receipt.skipped_lock_components))
+        full = node.component_data[ComponentType.FULL]
+        self.assertEqual(full.lock_ref, 1)
+        # Released once: a later call changes nothing.
+        cache.release_swa_prefix_lock(req)
+        self.assertEqual(held(), [0, 0, 0])
+        cache.unlock(lock)
+        self.assertEqual(full.lock_ref, 0)
+        cache.sanity_check()
+
+    def test_first_window_is_one_window_among_others(self):
+        """The tree's first window is read, evicted and reclaimed through the
+        same per-slot interface as every further window."""
+        from sglang.srt.mem_cache.base_prefix_cache import (
+            EvictParams,
+            InsertParams,
+            MatchPrefixParams,
+        )
+        from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
+        from sglang.srt.mem_cache.radix_cache import RadixKey
+
+        lengths = {"window_16": 16, "window_8": 8, "window_4": 4}
+        for victim in range(3):
+            with self.subTest(victim=victim):
+                storage, cache = self._cache()
+                a = storage.allocator
+                slots = cache.window_slots()
+                names = [name for name, _ in cache.window_sub_pools()]
+                evictable = evictable_by_sub_pool(cache)
+                for name, slot in zip(names, slots):
+                    self.assertEqual(cache.window_slot_of(name), slot)
+                    self.assertEqual(evictable[name], cache.window_evictable_size(name))
+                key = RadixKey(array("q", range(32)))
+                cache.insert(InsertParams(key=key, value=a.alloc(32).clone()))
+                match = cache.match_prefix(MatchPrefixParams(key=key))
+                lock = cache.lock(match.last_device_node)
+                # A lock holds each window's own trailing window: the rest of
+                # the prefix is each window's evictable history.
+                self.assertEqual(
+                    [cache.window_evictable_size(name) for name in names],
+                    [32 - lengths[name] for name in names],
+                )
+                for ct, name in zip(slots, names):
+                    self.assertEqual(
+                        cache.window_available_size(name),
+                        a.estimated_units_available(name),
+                    )
+                ct, name = slots[victim], names[victim]
+                before = {
+                    c: cache.window_evictable_size(n) for c, n in zip(slots, names)
+                }
+                result = cache.evict(EvictParams(window_num_tokens={name: 64}))
+                self.assertEqual(result.num_tokens_evicted, 0)
+                # The victim's whole history goes; another window's entries
+                # on the same nodes go with it (up to that window's own
+                # history), whichever window is the victim.
+                self.assertEqual(
+                    result.window_num_tokens_evicted,
+                    {
+                        cache.window_sub_pool_of_slot(c): min(before[c], before[ct])
+                        for c in slots
+                    },
+                )
+                self.assertEqual(cache.window_evictable_size(name), 0)
+                cache.unlock(lock)
+                # A demand on this window alone is reclaimed for it alone.
+                held = {b.sub_pool_name: b.allocated_count() for b in a.bands}
+                # More than the estimate, an upper bound: only a reclaim fits it.
+                pages = -(-a.estimated_units_available(name) // 4) + 1
+                cache.evict_for_alloc(KVDemand(window_tokens={name: pages * 4}))
+                self.assertTrue(a.units_fit({name: pages}))
+                after = {b.sub_pool_name: b.allocated_count() for b in a.bands}
+                self.assertLess(after[name], held[name])
+                self.assertEqual(storage.accounting_violations(), [])
+
+    def test_reclaim_evicts_a_further_window_for_its_own_demand(self):
+        from sglang.srt.mem_cache.base_prefix_cache import InsertParams
+        from sglang.srt.mem_cache.radix_cache import RadixKey
+
+        storage, cache = self._cache()
+        a = storage.allocator
+        # Fill the pool with cached prefixes.
+        start = 1000
+        while (ids := a.alloc(16)) is not None:
+            key = RadixKey(array("q", range(start, start + 16)))
+            cache.insert(InsertParams(key=key, value=ids.clone()))
+            start += 16
+        evictable = evictable_by_sub_pool(cache)
+        pages = next(
+            (
+                n
+                for n in range(1, 64)
+                if not a.units_fit({"window_4": n})
+                and a.admits(cache._units_demand({"window_4": n}), evictable=evictable)
+            ),
+            None,
+        )
+        self.assertIsNotNone(pages)
+        full_before = cache.full_evictable_size()
+        own_before = cache.window_evictable_size("window_4")
+        self.assertTrue(cache.reclaim({"window_4": pages}))
+        # The window's own entries go first and suffice: no token entry goes.
+        self.assertLess(cache.window_evictable_size("window_4"), own_before)
+        self.assertEqual(cache.full_evictable_size(), full_before)
+        self.assertEqual(storage.accounting_violations(), [])
+
+    def test_rust_tree_core_defers_several_windows_to_python(self):
+        from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+        from sglang.srt.mem_cache.unified_cache.tree_core_registry import (
+            _rust_fallback_reason,
+        )
+
+        storage = _storage((16, 8, 4))
+        params = CacheInitParams(
+            disable=False,
+            req_to_token_pool=storage.requests,
+            token_to_kv_pool_allocator=storage.allocator,
+            page_size=4,
+            tree_slots=storage.tree_slots(),
+        )
+        self.assertIn("several window slots", _rust_fallback_reason(params))
+
+
+class TestWindowCapacityThroughWrappers(CustomTestCase):
+    """REGRESSION: a wrapper backend's window capacity is that of the children it
+    names; a refusal names the child and the wrapper it sits behind."""
+
+    class _Leaf:
+        def __init__(self, cap):
+            self.max_window_sub_pools = cap
+
+        def window_capacity_children(self):
+            return []
+
+    class _Hybrid(_Leaf):
+        def __init__(self, prefill, decode):
+            super().__init__(1)
+            self.prefill_backend, self.decode_backend = prefill, decode
+
+        def window_capacity_children(self):
+            return [self.prefill_backend, self.decode_backend]
+
+    class _Tbo(_Leaf):
+        def __init__(self, primary, children):
+            super().__init__(1)
+            self.primary, self.children = primary, children
+
+        def window_capacity_children(self):
+            return [self.primary, *self.children]
+
+    class _HybridLinear(_Leaf):
+        def __init__(self, full, linear):
+            super().__init__(1)
+            self.full_attn_backend, self.linear_attn_backend = full, linear
+
+        def window_capacity_children(self):
+            return [self.full_attn_backend]
+
+    def test_wrapped_leaves_answer_for_their_wrappers(self):
+        from sglang.srt.mem_cache.kv.alloc.runner_ids import check_window_capacity
+
+        windows = ("window_4096", "window_128")
+        several = self._Leaf(8)
+        for wrapper in (
+            self._Hybrid(several, several),
+            self._Tbo(several, [several, several]),
+            self._HybridLinear(several, self._Leaf(1)),
+            self._Tbo(self._Hybrid(several, several), [several]),
+        ):
+            with self.subTest(wrapper=type(wrapper).__name__):
+                check_window_capacity(windows, wrapper)
+
+    def test_a_leaf_naming_its_kernels_like_a_wrapper_is_a_leaf(self):
+        """REGRESSION: a leaf with a wrapper's attribute names (`prefill_backend =
+        "fa2"`) is still a leaf; only the children a backend names count."""
+        from sglang.srt.mem_cache.kv.alloc.runner_ids import check_window_capacity
+
+        leaf = self._Leaf(1)
+        leaf.prefill_backend, leaf.decode_backend = "fa2", "fa2"
+        check_window_capacity(("window_4096",), leaf)
+        with self.assertRaisesRegex(NotImplementedError, r"but _Leaf reads at most 1"):
+            check_window_capacity(("window_4096", "window_128"), leaf)
+
+    def test_a_wrapped_leaf_of_one_window_refuses_by_name(self):
+        from sglang.srt.mem_cache.kv.alloc.runner_ids import check_window_capacity
+
+        wrapper = self._Hybrid(self._Leaf(8), self._Leaf(1))
+        with self.assertRaisesRegex(
+            NotImplementedError, r"_Leaf \(behind _Hybrid\) reads at most 1"
+        ):
+            check_window_capacity(("window_4096", "window_128"), wrapper)
+
+
+class TestBackendsNameTheirWindowChildren(CustomTestCase):
+    """The wrapper backends name the children whose window capacity binds."""
+
+    def test_each_wrapper_names_its_children(self):
+        from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+        from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
+        from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+            HybridLinearAttnBackend,
+        )
+        from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
+
+        a, b, c = object(), object(), object()
+        hybrid = object.__new__(HybridAttnBackend)
+        hybrid.prefill_backend, hybrid.decode_backend = a, b
+        tbo = object.__new__(TboAttnBackend)
+        tbo.primary, tbo.children = a, [b, c]
+        linear = object.__new__(HybridLinearAttnBackend)
+        linear.full_attn_backend, linear.linear_attn_backend = a, b
+        self.assertEqual(hybrid.window_capacity_children(), [a, b])
+        self.assertEqual(tbo.window_capacity_children(), [a, b, c])
+        self.assertEqual(linear.window_capacity_children(), [a])
+        self.assertEqual(AttentionBackend.window_capacity_children(None), [])
+
+
+class TestTritonWindowLengths(CustomTestCase):
+    """REGRESSION: Triton window rails take the windows the runner's sub-pools
+    state, whatever the model's sliding window (even unset); a sub-pool stating
+    none is refused."""
+
+    def _lengths(self, declared, model_window):
+        from types import SimpleNamespace
+
+        from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
+
+        backend = SimpleNamespace(
+            sliding_window_size=model_window,
+            runner_ids=SimpleNamespace(
+                window_sub_pools=tuple(declared), window_storage="full"
+            ),
+        )
+        router = SimpleNamespace(
+            sub_pool=lambda name: SimpleNamespace(window=declared.get(name))
+        )
+        runner = SimpleNamespace(token_to_kv_pool=SimpleNamespace(layer_router=router))
+        return TritonAttnBackend._window_lengths(backend, runner)
+
+    def test_declared_windows_without_a_model_window(self):
+        declared = {"window_8": 8, "window_64": 64}
+        self.assertEqual(self._lengths(declared, None), declared)
+
+    def test_the_model_window_does_not_replace_a_declared_one(self):
+        declared = {"window_8": 8, "window_64": 64}
+        self.assertEqual(self._lengths(declared, 32), declared)
+
+    def test_an_unstated_window_is_refused(self):
+        for model_window in (None, 32):
+            with self.subTest(model_window=model_window):
+                with self.assertRaisesRegex(ValueError, "state no window"):
+                    self._lengths({"window_8": 8, "window_x": None}, model_window)
 
 
 if __name__ == "__main__":
