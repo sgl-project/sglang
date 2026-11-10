@@ -32,6 +32,13 @@ from flydsl.expr import math as fmath
 from flydsl.expr import range_constexpr
 from flydsl.expr.typing import T
 
+# The 64-bit address path needs aiter FlyDSL helpers newer than some pinned aiter builds; without
+# them the module is unavailable and the backend keeps its Triton verify kernels.
+if not all(hasattr(buffer_ops, n) for n in ("extract_base_index", "create_llvm_ptr")):
+    raise ImportError(
+        "aiter.ops.flydsl.kernels.buffer_ops lacks extract_base_index / create_llvm_ptr"
+    )
+
 QL = 8
 GQA = 8
 HD = 64
