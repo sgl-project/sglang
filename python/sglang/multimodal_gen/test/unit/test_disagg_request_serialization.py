@@ -142,6 +142,12 @@ def test_reject_unsafe_globals_including_nested_torch_load(obj):
         ).load()
 
 
+def test_reject_file_references_inside_diffusion_package():
+    payload = b"csglang.multimodal_gen.runtime.ipc_array\nNumpyArrayFileRef\n."
+    with pytest.raises(RuntimeError, match="Blocked unsafe global"):
+        RequestUnpickler(payload, request_pickle_globals(SamplingParams)).load()
+
+
 if __name__ == "__main__":
     import sys
 
