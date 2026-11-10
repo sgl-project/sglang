@@ -11,6 +11,9 @@ from packaging.version import Version
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
+from sglang.kernels.arch import current_arch
+from sglang.kernels.ops.moe import mxfp4_decode_moe
+from sglang.kernels.ops.moe.moe_finalize_fuse_shared import moe_finalize_fuse_shared
 from sglang.kernels.ops.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
     scaled_fp8_quant,
@@ -43,6 +46,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
 )
 from sglang.srt.utils.device import is_flashinfer_available
+from sglang.srt.utils.log_utils import print_info_once
 from sglang.srt.utils.triton_utils import next_power_of_2
 
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
@@ -352,6 +356,9 @@ def select_trtllm_routed_body(
         and method.moe_runner_config.activation == "situ"
         and method.hidden_size == x.shape[-1]
     ) or _flashinfer_lacks_sm107_moe_fixes(x.device):
+        return None
+    # The CUDA MXFP4 decode MoE kernels route from the packed top-k themselves.
+    if layer.use_cuda_mxfp4_decode_moe and x.shape[0] <= mxfp4_decode_moe.MAX_TOKENS:
         return None
     try:
         from flashinfer.autotuner import AutoTuner
@@ -1403,6 +1410,147 @@ class FlashInferTrtllmGenMxfp4MoeQuantInfo(MoeQuantInfo):
     hidden_size: int
     flashinfer_mxfp4_moe_precision: str
     routing_bias: Optional[torch.Tensor] = None
+    # CUDA MXFP4 decode MoE kernels usable for this layer (cuda_mxfp4_decode_moe_supported)
+    use_cuda_mxfp4_decode_moe: bool = False
+
+
+def _cuda_mxfp4_decode_moe_mismatch(
+    layer: torch.nn.Module,
+    activation: str,
+    intermediate_size: int,
+    hidden_size: int,
+    with_bias: bool,
+    precision: str,
+) -> Optional[str]:
+    """The first requirement of the CUDA MXFP4 decode MoE kernels that the layer
+    misses, or None. `activation` is the one the caller's flashinfer call applies."""
+    cfg = layer.moe_runner_config
+    if activation == "situ":
+        # beta = gemm1_alpha, linear_beta = gemm1_clamp_limit (flashinfer's SiTU)
+        if (
+            cfg.activation != "situ"
+            or cfg.gemm1_alpha is None
+            or cfg.gemm1_clamp_limit is None
+        ):
+            return f"activation {cfg.activation}, SiTU constants ({cfg.gemm1_alpha}, {cfg.gemm1_clamp_limit})"
+    elif (
+        cfg.activation != "silu"
+        or cfg.swiglu_limit is None
+        or cfg.gemm1_alpha is not None
+        or cfg.gemm1_beta is not None
+    ):
+        return f"activation {cfg.activation}, swiglu_limit {cfg.swiglu_limit}"
+    if with_bias:
+        return "expert bias"
+    if precision != "default":
+        return f"{precision} activations, not MXFP8"
+    if not mxfp4_decode_moe.is_supported_shape(
+        layer.num_local_experts, cfg.top_k, hidden_size, intermediate_size
+    ):
+        return "shape not supported"
+    arch = current_arch()
+    if not (arch.is_sm(10, 0) or arch.is_sm(10, 3)):
+        return "not SM100 / SM103"
+    return None
+
+
+def cuda_mxfp4_decode_moe_supported(
+    layer: torch.nn.Module,
+    activation: str,
+    intermediate_size: int,
+    hidden_size: int,
+    with_bias: bool,
+    precision: str,
+) -> bool:
+    """Whether this layer runs the CUDA MXFP4 decode MoE kernels
+    (SGLANG_USE_CUDA_MXFP4_DECODE_MOE); decided once, after the flashinfer_mxfp4
+    weights are prepared."""
+    if not envs.SGLANG_USE_CUDA_MXFP4_DECODE_MOE.get():
+        return False
+    mismatch = _cuda_mxfp4_decode_moe_mismatch(
+        layer, activation, intermediate_size, hidden_size, with_bias, precision
+    )
+    if mismatch is not None:
+        print_info_once(f"SGLANG_USE_CUDA_MXFP4_DECODE_MOE: not used ({mismatch})")
+    return mismatch is None
+
+
+def run_cuda_mxfp4_decode_moe(
+    x_quant: torch.Tensor,
+    x_scale: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: Optional[torch.Tensor],
+    w13: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w2: torch.Tensor,
+    w2_scale: torch.Tensor,
+    *,
+    activation: str,
+    activation_constants: tuple[float, ...],
+    expert_offset: int,
+    out: Optional[torch.Tensor],
+) -> Optional[FlashInferTrtllmDeferredFinalizeOutput]:
+    """The flashinfer trtllm MXFP4 MoE contract on the CUDA decode kernels. With
+    `topk_weights` None, `topk_ids` is the packed (id << 16) | bf16(weight) form.
+    With `out`, finalizes into it (as flashinfer's do_finalize with
+    routed_scaling_factor None) and returns None; else returns the deferred output."""
+    packed = topk_weights is None
+    top_k = topk_ids.shape[1]
+    gemm2_out, expanded_idx, packed_weights = mxfp4_decode_moe.mxfp4_decode_moe(
+        x_quant,
+        # the linear [T, H / 32] E8M0 bytes, whatever dtype the quant produced them in
+        x_scale.view(torch.uint8).view(x_quant.shape[0], -1),
+        topk_ids,
+        w13,
+        w13_scale,
+        w2,
+        w2_scale,
+        activation=activation,
+        activation_constants=activation_constants,
+        expert_offset=expert_offset,
+        packed=packed,
+    )
+    weights = packed_weights if packed else topk_weights
+    if out is not None:
+        moe_finalize_fuse_shared(
+            gemm2_out, expanded_idx, weights, None, top_k, enable_pdl=True, out=out
+        )
+        return None
+    return FlashInferTrtllmDeferredFinalizeOutput(
+        gemm2_out=gemm2_out,
+        expert_weights=weights,
+        expanded_idx_to_permuted_idx=expanded_idx,
+        top_k=top_k,
+    )
+
+
+def _run_cuda_mxfp4_decode_moe(
+    x_quant: torch.Tensor,
+    x_scale: torch.Tensor,
+    packed_topk: Optional[torch.Tensor],
+    topk_output,
+    quant_info: FlashInferTrtllmGenMxfp4MoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    out: Optional[torch.Tensor],
+) -> Optional[FlashInferTrtllmDeferredFinalizeOutput]:
+    packed = packed_topk is not None
+    return run_cuda_mxfp4_decode_moe(
+        x_quant,
+        x_scale,
+        packed_topk if packed else topk_output.topk_ids,
+        None if packed else topk_output.topk_weights,
+        quant_info.w13_weight,
+        quant_info.w13_weight_scale,
+        quant_info.w2_weight,
+        quant_info.w2_weight_scale,
+        activation="situ",
+        activation_constants=(
+            runner_config.gemm1_alpha,
+            runner_config.gemm1_clamp_limit,
+        ),
+        expert_offset=quant_info.local_expert_offset,
+        out=out,
+    )
 
 
 def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
@@ -1461,6 +1609,29 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
         top_k = topk_output.topk_config.top_k
         router_logits = topk_output.router_logits
 
+    use_cuda_decode_moe = (
+        quant_info.use_cuda_mxfp4_decode_moe
+        and is_standard
+        and x_quant.shape[0] <= mxfp4_decode_moe.MAX_TOKENS
+    )
+    if quant_info.use_cuda_mxfp4_decode_moe and not use_cuda_decode_moe:
+        print_info_once(
+            "SGLANG_USE_CUDA_MXFP4_DECODE_MOE: calls with a non-standard top-k or "
+            "more than 256 tokens fall back to flashinfer"
+        )
+    if use_cuda_decode_moe and _deferred_finalize_enabled.get():
+        return StandardCombineInput(
+            hidden_states=_run_cuda_mxfp4_decode_moe(
+                x_quant,
+                x_scale,
+                prepared_packed_topk,
+                topk_output,
+                quant_info,
+                runner_config,
+                None,
+            )
+        )
+
     num_tokens = x_quant.shape[0]
     from sglang.srt.layers import zero_copy_context
 
@@ -1479,6 +1650,18 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
                 dtype=torch.bfloat16,
                 device=x_quant.device,
             )
+
+    if use_cuda_decode_moe:
+        _run_cuda_mxfp4_decode_moe(
+            x_quant,
+            x_scale,
+            prepared_packed_topk,
+            topk_output,
+            quant_info,
+            runner_config,
+            symm_output,
+        )
+        return StandardCombineInput(hidden_states=symm_output)
 
     if runner_config.activation == "situ":
         from flashinfer import trtllm_fp4_block_scale_moe
@@ -2209,8 +2392,8 @@ def fused_experts_none_to_flashinfer_trtllm_routed(
     )
 
 
-@register_fused_func("flashinfer", "flashinfer_trtllm")
-@register_fused_func("flashinfer", "flashinfer_trtllm_routed")
+@register_fused_func("flashinfer_nvlink_one_sided", "flashinfer_trtllm")
+@register_fused_func("flashinfer_nvlink_one_sided", "flashinfer_trtllm_routed")
 def fused_experts_flashinfer_to_flashinfer_trtllm(
     dispatch_output: FlashinferDispatchOutput | StandardDispatchOutput,
     quant_info: MoeQuantInfo,

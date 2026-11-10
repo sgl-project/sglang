@@ -85,6 +85,15 @@ register_kernel(
 
 register_kernel(
     KernelSpec(
+        op="attention.dcp_push_combine",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.dcp_push_combine:dcp_push_combine",
+        capabilities=CUDA_ONLY,
+    )
+)
+
+register_kernel(
+    KernelSpec(
         op="attention.kda_qwen38_qsa_sm121",
         backend=KernelBackend.KDA,
         target=("sglang.kernels.kda_kernels.qwen38_qsa_sm121:qwen38_qsa_sm121"),
@@ -323,6 +332,14 @@ register_kernel(
         op="attention.fast_kpool_topk_transform_fused",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.attention.dsa.kpool_topk_transform:fast_kpool_topk_transform_fused",
+        capabilities=CUDA_ONLY,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="attention.flashmla_token_pack_prepare",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.dsa.flashmla_token_pack:flashmla_token_pack_prepare",
         capabilities=CUDA_ONLY,
     )
 )

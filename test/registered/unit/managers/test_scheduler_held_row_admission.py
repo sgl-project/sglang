@@ -31,7 +31,7 @@ class _Req:
         self.beam_group = None
         self.token_indices_to_pool = None
 
-    def init_next_round_input(self, tree_cache=None):
+    def init_next_round_input(self, tree_cache=None, **_):
         pass
 
 
@@ -71,6 +71,7 @@ class TestHeldRowAdmission(CustomTestCase):
         s.chunked_reqs = IndexedReqList(ListKind.CHUNKED)
         s.chunked_req = final_chunk
         s.min_free_slots_delayer = None
+        s.invariant_checker = Mock()
         s.policy = Mock(calc_priority=lambda waiting, *args, **kwargs: list(waiting))
         s.policy.shortest_prefill_chunk_limit.return_value = None
         s.processed_tokens_counter = 0
@@ -85,7 +86,9 @@ class TestHeldRowAdmission(CustomTestCase):
         s.tree_cache = SimpleNamespace(
             buffer_pipeline=None, storage_prefetch_retries=None
         )
-        s.token_to_kv_pool_allocator = SimpleNamespace(state_slots=None)
+        s.token_to_kv_pool_allocator = SimpleNamespace(
+            state_slots=None, pools_share_memory=False
+        )
         s.new_token_ratio_tracker = SimpleNamespace(current=0.0)
         s.max_prefill_tokens = 1 << 20
         s.is_mixed_chunk = False

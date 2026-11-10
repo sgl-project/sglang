@@ -88,7 +88,10 @@ from sglang.srt.layers.joint_schema_head import (
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
 from sglang.srt.managers.disagg_service import start_disagg_service
-from sglang.srt.managers.embed_types import PositionalEmbeds
+from sglang.srt.managers.embed_types import (
+    PositionalEmbeds,
+    validate_positional_embed_overrides,
+)
 from sglang.srt.managers.io_struct import (
     AbortReq,
     ActiveRanksOutput,
@@ -198,12 +201,12 @@ from sglang.srt.sampling.custom_logit_processor import (
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.sampling.watermarking.core import (
-    redact_watermark_secrets,
     resolve_watermark_request,
 )
 from sglang.srt.server_args import (
     PortArgs,
     ServerArgs,
+    redact_server_args_secrets,
 )
 from sglang.srt.speculative.spec_decoding_metrics import (
     populate_spec_info,
@@ -1456,6 +1459,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Validate generation-specific fields
         if isinstance(obj, GenerateReqInput):
             self._validate_token_ids_logprob(obj)
+            self._validate_top_logprobs_num(obj)
             requested_hidden_mode = get_request_return_hidden_states_mode(
                 obj.return_hidden_states
             )
@@ -1596,6 +1600,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     f"{token_id}; valid range is [0, {vocab_size})."
                 )
 
+    def _validate_top_logprobs_num(self, obj: GenerateReqInput) -> None:
+        # Invalid counts can corrupt the batch or fail torch.topk past the vocab size.
+        top_logprobs_num = obj.top_logprobs_num
+        if not obj.return_logprob or top_logprobs_num is None:
+            return
+        vocab_size = self.model_config.vocab_size
+        if type(top_logprobs_num) is not int or not 0 <= top_logprobs_num <= vocab_size:
+            raise ValueError(
+                f"top_logprobs must be an integer in [0, {vocab_size}], "
+                f"got {top_logprobs_num!r}."
+            )
+
     def _create_tokenized_object(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
@@ -1647,6 +1663,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 bootstrap_room = self.fake_bootstrap_room_counter
                 self.fake_bootstrap_room_counter += 1
 
+            if obj.positional_embed_overrides is not None:
+                validate_positional_embed_overrides(
+                    obj.positional_embed_overrides,
+                    hidden_size=self.model_config.hidden_size,
+                )
+
             tokenized_obj = self.tokenized_generate_req_type(
                 input_text=input_text,
                 input_ids=input_ids_arr,
@@ -1654,7 +1676,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 sampling_params=sampling_params,
                 return_logprob=obj.return_logprob,
                 logprob_start_len=obj.logprob_start_len,
-                top_logprobs_num=obj.top_logprobs_num,
+                # A logprob batch gathers every request's count, including disabled ones.
+                top_logprobs_num=obj.top_logprobs_num if obj.return_logprob else 0,
                 token_ids_logprob=obj.token_ids_logprob,
                 return_sampling_mask=obj.return_sampling_mask,
                 sampling_logprobs_mode=obj.sampling_logprobs_mode or "selected",
@@ -1701,6 +1724,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             ):
                 positional_embed_overrides = self._resolve_embed_overrides(
                     input_ids_arr, obj.embed_override_token_id, obj.embed_overrides
+                )
+
+            if positional_embed_overrides is not None:
+                validate_positional_embed_overrides(
+                    positional_embed_overrides,
+                    hidden_size=self.model_config.hidden_size,
                 )
 
             tokenized_obj = TokenizedEmbeddingReqInput(
@@ -2200,6 +2229,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 yield out
                 break
 
+            if (
+                request is not None
+                and not obj.background
+                and await request.is_disconnected()
+            ):
+                # Abort the request for disconnected requests (running)
+                self.abort_request(obj.rid)
+                # Use exception to kill the whole call stack and asyncio task
+                raise ValueError(
+                    f"Request is disconnected from the client side (type 3). Abort request {obj.rid=}"
+                )
+
             if is_stream:
                 # Record response sent time right before we send response.
                 if not state.time_stats.response_sent_to_client_time:
@@ -2208,18 +2249,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         state.time_stats.get_response_sent_to_client_realtime()
                     )
                 yield out
-            else:
-                if (
-                    request is not None
-                    and not obj.background
-                    and await request.is_disconnected()
-                ):
-                    # Abort the request for disconnected requests (non-streaming, running)
-                    self.abort_request(obj.rid)
-                    # Use exception to kill the whole call stack and asyncio task
-                    raise ValueError(
-                        f"Request is disconnected from the client side (type 3). Abort request {obj.rid=}"
-                    )
 
     async def _handle_batch_request(
         self,
@@ -2542,7 +2571,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         part that cannot be reconstructed afterwards.
         """
         try:
-            return redact_watermark_secrets(
+            return redact_server_args_secrets(
                 self.resolved_config_dict(self.server_args.resolved_dict())
             )
         except Exception as e:
@@ -2551,9 +2580,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
     def _server_args_for_dump(self) -> Optional[Dict[str, Any]]:
         # Redact even with watermarking off: the Python API accepts a server
-        # key without --enable-watermark.
+        # key without --enable-watermark. The request dump pickles this as is;
+        # `write_crash_dump` redacts again on its own.
         try:
-            return redact_watermark_secrets(self.server_args.resolved_dict())
+            return redact_server_args_secrets(self.server_args.resolved_dict())
         except Exception as e:
             logger.error(f"Failed to snapshot server_args for the dump: {e!r}")
             return None

@@ -33,7 +33,7 @@ from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
 from sglang.srt.layers.cp.base import disable_cp_strategy
 from sglang.srt.managers.schedule_batch import set_mamba_track_indices_from_reqs
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
-from sglang.srt.mem_cache.kv.router import STATE_PART
+from sglang.srt.mem_cache.kv.decl import STATE_PART
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
@@ -62,6 +62,7 @@ _is_xpu = is_xpu()
 
 if TYPE_CHECKING:
     from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
+    from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardStateSlots
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -372,7 +373,7 @@ def fill_draft_window_rail(
     """Emit every draft step's window-clipped read ids into the per-step rows
     of ``window_kv_indices`` and their indptr into ``window_kv_indptr``: step
     i of a branch reads the last ``min(seq_len + i + 1, window)`` of its
-    tokens, from the storage window layers use (``runner_ids.window_kv_kind``).
+    tokens, from the storage window layers use (``runner_ids.window_storage``).
     ``window`` is the number of tokens the backend's window layers attend."""
     num_seqs = forward_batch.batch_size
     width = num_seqs * topk * window
@@ -384,7 +385,7 @@ def fill_draft_window_rail(
         forward_batch.iteration_ids,
         req_pool_indices=forward_batch.req_pool_indices,
         bs=num_seqs,
-        kind=runner_ids.window_kv_kind,
+        kind=runner_ids.window_storage,
     )
     generate_draft_decode_window_kv_indices[(num_steps, num_seqs, topk)](
         src.row_ids,
@@ -405,15 +406,12 @@ def fill_draft_window_rail(
         v2p=src.v2p,
         TRANSLATE=src.v2p is not None,
     )
-    if (
-        not src.is_translated
-        and runner_ids.window_kv_kind == IdSpaceKind.SLIDING_WINDOW
-    ):
+    if not src.is_translated and runner_ids.window_storage != IdSpaceKind.FULL:
         # Static pool: the legacy full->swa translate, as the target's window
         # reads apply it.
         for i in range(num_steps):
             row = window_kv_indices[i][:width]
-            row.copy_(runner_ids.ids_in(IdSpaceKind.SLIDING_WINDOW, row))
+            row.copy_(runner_ids.ids_in(runner_ids.window_storage, row))
 
 
 def record_stream_each(tensors, stream):
@@ -1170,6 +1168,7 @@ def commit_mamba_states_after_verify(
     accept_index: torch.Tensor,
     draft_token_num: int,
     prepared_step_indices: Optional[Tuple[torch.Tensor, Optional[torch.Tensor]]] = None,
+    state_slots: Optional[ForwardStateSlots] = None,
 ) -> None:
     """Commit accepted per-step mamba states into the persistent caches.
 
@@ -1178,6 +1177,9 @@ def commit_mamba_states_after_verify(
     conv/ssm caches. After acceptance, the state of each request's last
     accepted step is committed back, plus the interval-crossing state used
     for prefix-cache tracking (mamba extra_buffer mode).
+
+    Writes ``state_slots``, the verify forward's resolved slots by default, and
+    looks up no table: it may run after the scheduler reused a finished row.
 
     No-op for models without mamba-style state or backends without the
     commit hook.
@@ -1194,7 +1196,6 @@ def commit_mamba_states_after_verify(
     # still needs its usual accept-rollback, so we keep the conv-window scatter and
     # skip only the SSM scatter. GDN-only + linear-chain (topk<=1) -- the runtime
     # ring is allocated only then; KDA never allocates the cursors.
-    req_pool = model_runner.req_to_token_pool
     mamba_pool = model_runner.token_to_kv_pool.layer_router.part_view(STATE_PART)
     bs = accept_lens.shape[0]
     src_indices_raw = (
@@ -1217,14 +1218,15 @@ def commit_mamba_states_after_verify(
     if mamba_pool is not None and (
         mamba_pool.replayssm_spec_fold or mamba_pool.replayssm_cache_base is not None
     ):
-        # Persistent destinations follow state relocation; replay/scratch rows
-        # still index requests, and the scheduler keeps owning virtual state IDs.
-        state_ids = model_runner.runner_ids.state_ids(req_pool.state_sub_pool)
-        replay_state_indices = state_ids.ids(
-            req_pool.get_mamba_indices(batch.req_pool_indices)
-        )
+        # Persistent destinations are state slots; replay/scratch rows still
+        # index requests.
+        if state_slots is None:
+            state_slots = model_runner.attn_backend.forward_state_slots(
+                bs, batch.mamba_track_indices
+            )
+        replay_state_indices = state_slots.working[:bs]
         if batch.mamba_track_indices is not None:
-            replay_track_indices = state_ids.ids(batch.mamba_track_indices)
+            replay_track_indices = state_slots.track[:bs]
 
     # Fold-every-commit: replay the accepted prefix from the ring into
     # `temporal`; the same fold stores the interval-crossing state to the
@@ -1361,7 +1363,29 @@ def commit_mamba_states_after_verify(
             mamba_steps_to_track=mamba_steps_to_track,
             model=model_runner.model,
             req_pool_indices=batch.req_pool_indices[:bs],
+            state_slots=state_slots,
         )
+
+
+def relayed_commit_state_slots(
+    target_worker: TpModelWorker, batch: ScheduleBatch
+) -> Optional[ForwardStateSlots]:
+    """The slots a PP stage's relayed verify commit writes, resolved when it runs:
+    the rows still belong to the batch, but a compaction may have moved the slots."""
+    from sglang.srt.layers.attention.mamba.mamba2_metadata import (
+        ForwardStateSlots,
+    )
+
+    model_runner = target_worker.model_runner
+    if mambaish_config(model_runner.model_config) is None:
+        return None
+    req_pool = model_runner.req_to_token_pool
+    state_ids = model_runner.runner_ids.state_ids(req_pool.state_sub_pool)
+    track = batch.mamba_track_indices
+    return ForwardStateSlots(
+        state_ids.ids(req_pool.get_mamba_indices(batch.req_pool_indices)),
+        None if track is None else state_ids.ids(track),
+    )
 
 
 def spec_prepare_for_decode(batch: ScheduleBatch) -> None:

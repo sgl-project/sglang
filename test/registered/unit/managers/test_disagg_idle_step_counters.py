@@ -20,6 +20,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.pause_state import PauseState
 from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     KeyedReqList,
@@ -210,6 +211,8 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
                             self.run_and_check(
                                 scheduler, event_loop, mode, pattern == "idle_cycle"
                             )
+                        # Each launched micro-batch gets its write-after-read barrier.
+                        self.assertEqual(scheduler._apply_war_barrier.call_count, 4)
                         # Transfers suppress housekeeping, not the idle flag.
                         self.assertEqual(
                             scheduler.on_idle.call_count,
@@ -394,7 +397,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
 
         self.assertEqual(scheduler.total_prefill_busy_us, total_us([14.0 - 6.25]))
         # Every window ended before this step's end, so none is kept.
-        self.assertEqual(len(scheduler._pause_intervals), 0)
+        self.assertEqual(scheduler.pause_state.consume_paused_time(0.0, 14.0), 0.0)
 
     def test_pause_inside_an_idle_gap_is_not_subtracted_from_the_next_prefill(self):
         scheduler = self.make_scheduler([])
@@ -414,11 +417,14 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         self.pause(scheduler, 1.0)
         self.pause(scheduler, 2.0)
         self.resume(scheduler, 3.0)
-        self.assertEqual(list(scheduler._pause_intervals), [(1.0, 3.0)])
+        # One window, [1.0, 3.0].
+        self.assertEqual(scheduler.pause_state.consume_paused_time(0.0, 1.5), 0.5)
+        self.assertEqual(scheduler.pause_state.consume_paused_time(0.0, 4.0), 2.0)
 
     def pause(self, scheduler, paused_at):
         with patch(
-            "sglang.srt.managers.scheduler.time.monotonic", return_value=paused_at
+            "sglang.srt.managers.scheduler_components.pause_state.time.monotonic",
+            return_value=paused_at,
         ):
             Scheduler.pause_generation(
                 scheduler, PauseGenerationReqInput(mode="in_place")
@@ -426,7 +432,8 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
 
     def resume(self, scheduler, resumed_at):
         with patch(
-            "sglang.srt.managers.scheduler.time.monotonic", return_value=resumed_at
+            "sglang.srt.managers.scheduler_components.pause_state.time.monotonic",
+            return_value=resumed_at,
         ):
             Scheduler.continue_generation(
                 scheduler, ContinueGenerationReqInput(torch_empty_cache=False)
@@ -558,13 +565,10 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
             else get_parallel().tp_size
         )
         scheduler.gracefully_exit = False
-        scheduler._engine_paused = False
-        scheduler._deferred_input_requests = []
+        scheduler.pause_state = PauseState()
         scheduler._sched_idled = False
         scheduler._prev_step = None
         scheduler._prev_prefill_end_ts = None
-        scheduler._pause_intervals = deque(maxlen=scheduler_module.PAUSE_WINDOWS_MAX)
-        scheduler._pause_started_at = None
         scheduler.forward_ct = 0
         scheduler.processed_tokens_counter = 0
         scheduler.spec_algorithm = SpeculativeAlgorithm.NONE
@@ -630,6 +634,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
     def prepare_pp_scheduler(self, scheduler):
         enter_scope(self, get_parallel().override(pp_size=2, pp_rank=0))
         scheduler.pp_group = SimpleNamespace(is_last_rank=True)
+        scheduler.token_to_kv_pool_allocator = None
         scheduler.forward_stream_ctx = nullcontext()
         scheduler.forward_stream = Mock()
         scheduler.schedule_stream = Mock()

@@ -27,8 +27,7 @@ from sglang.srt.layers.attention.dsa.dsa_dcp import (
 )
 from sglang.srt.layers.attention.dsa.dsa_dcp_sharded import (
     dcp_gather_request_rows,
-    dcp_global_topk,
-    dcp_select_all_slots,
+    dcp_local_topk,
 )
 from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import BaseIndexerMetadata
 from sglang.srt.layers.attention.dsa.dsa_npu_indexer import DSANPUIndexerMixin
@@ -401,7 +400,14 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 self.hidden_size,
                 self.n_heads,
                 bias=False,
-                params_dtype=torch.bfloat16,
+                params_dtype=(
+                    torch.float32
+                    if _is_npu
+                    and config is not None
+                    and config.architectures[0]
+                    in ("LongcatFlashForCausalLM", "LongcatFlashForCausalLMNextN")
+                    else torch.bfloat16
+                ),
                 prefix=add_prefix("weights_proj", prefix),
             )
         k_norm_eps_kwargs = {} if k_norm_eps is None else {"eps": k_norm_eps}
@@ -936,6 +942,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         # Decode/idle.
         if fb.forward_mode.is_decode_or_idle():
+            if dsa_shards_index_k():
+                # the sharded indexer's global top-k handles short rows itself
+                return False
             if get_is_capture_mode():
                 # Graph replay freezes this branch; use the capture variant,
                 # not capture-time sequence lengths.
@@ -1409,9 +1418,11 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         B = metadata.get_seqlens_int32().shape[0]
         next_n = q_offset // B if B > 0 else 0
         dcp_size, _ = _index_k_dcp()
-        assert dcp_size == 1 or forward_batch.forward_mode.is_decode_or_idle(), (
-            "DSA DCP runs the paged top-k in decode only"
-        )
+        assert (
+            dcp_size == 1
+            or forward_batch.forward_mode.is_decode_or_idle()
+            or forward_batch.forward_mode.is_target_verify()
+        ), "DSA DCP runs the paged top-k in decode and target verify only"
         use_cute_dsl = (
             self.paged_mqa_logits_backend.is_cutedsl()
             and not forward_batch.forward_mode.is_draft_extend_v2()
@@ -1519,10 +1530,22 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             return torch.cat(logits_chunks, dim=0)
 
         if self.paged_mqa_logits_backend.is_aiter():
+            if q_offset == 0:
+                # Aiter's SplitKV scheduling divides by the query count.
+                # An empty rank needs only invalid top-k indices, no kernels.
+                return torch.full(
+                    (q_fp8.shape[0], self.index_topk),
+                    -1,
+                    dtype=torch.int32,
+                    device=q_fp8.device,
+                )
+            # DP-attention can pad q/weights beyond the real metadata rows.
+            # Aiter has no q_offset argument, so trim its inputs explicitly;
+            # top-k padding is restored below for the downstream consumer.
             logits = aiter_paged_mqa_logits(
-                q_fp8,
+                q_fp8[:q_offset],
                 kv_cache_fp8,
-                weights,
+                weights[:q_offset],
                 seqlens_32,
                 block_tables,
                 max_seq_len,
@@ -1587,7 +1610,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             )
 
         if dcp_size > 1:
-            topk_result = dcp_global_topk(
+            # attention reads local KV slots and their counts
+            topk_result = dcp_local_topk(
                 logits[:q_offset],
                 seqlens_32_2d.view(-1)[:q_offset],
                 seqlens_32.view(-1)[:q_offset],
@@ -1595,13 +1619,14 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 self.index_topk,
                 page_size,
                 metadata.attn_metadata.topk_v2_plan,
+                metadata.attn_metadata.dcp_topk_length,
             )
         else:
             # NOTE(dark): logits should be cleaned in topk_transform
             self._mask_init_and_local_tokens(logits, seqlens_32)
             topk_result = metadata.topk_transform(logits, self.index_topk)
         # Restore possible padding exist in the hidden states.
-        if not _is_hip and q_offset < q_fp8.shape[0]:
+        if q_offset < q_fp8.shape[0]:
             pad_len = q_fp8.shape[0] - q_offset
             padding = torch.full(
                 (pad_len, topk_result.shape[1]),
@@ -1982,21 +2007,14 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         # MLA: use dummy logits with topk kernel's fast path to generate indices
         # When length <= 2048, naive_topk_cuda directly generates [0,1,...,length-1,-1,...]
         seq_lens_expanded = metadata.get_seqlens_expanded()
-        if dsa_shards_index_k() and forward_batch.forward_mode.is_decode_or_idle():
-            raw_topk_result = dcp_select_all_slots(
-                seq_lens_expanded,
-                metadata.get_page_table_64(),
-                self.index_topk,
-                get_token_to_kv_pool().page_size,
-            )
-        else:
-            dummy_logits = torch.zeros(
-                seq_lens_expanded.shape[0],
-                self.index_topk,
-                dtype=torch.float32,
-                device=x_meta.device,
-            )
-            raw_topk_result = metadata.topk_transform(dummy_logits, self.index_topk)
+        # TODO(dark): replace the stupid transform with 1 kernel launch here
+        dummy_logits = torch.zeros(
+            seq_lens_expanded.shape[0],
+            self.index_topk,
+            dtype=torch.float32,
+            device=x_meta.device,
+        )
+        raw_topk_result = metadata.topk_transform(dummy_logits, self.index_topk)
         if topk_result is not None:
             # PCG/BCG: fill the valid prefix of the padded static buffer and
             # leave padded rows at the -1 sentinel.

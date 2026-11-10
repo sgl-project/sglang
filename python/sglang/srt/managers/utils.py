@@ -22,6 +22,7 @@ from sglang.srt.managers.io_struct import AbortReq, FinishReasonDict
 from sglang.srt.mem_cache.kv_weight_version_tracker import KvWeightVersionRecord
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.runtime_context import (
+    get_memory,
     get_serving,
     get_spec,
     max_speculative_num_draft_tokens,
@@ -39,6 +40,7 @@ if TYPE_CHECKING:
         HostAuxiliaryOutput,
     )
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.mem_cache.kv.alloc.forward_steps import ForwardLaunch
     from sglang.srt.mem_cache.kv.alloc.iteration_ids import IterationIds
     from sglang.srt.observability.forward_pass_metrics import (
         FpmTiming,
@@ -65,7 +67,13 @@ def allocate_distinct_stream(device_module, avoid_streams):
 
 
 def is_war_barrier_enabled() -> bool:
-    return is_cuda() or envs.SGLANG_ENABLE_WAR_BARRIER.get()
+    # On by default on CUDA. Unified memory frees ids and rewrites request rows on the
+    # schedule stream at once, so it needs the barrier on every device.
+    return (
+        is_cuda()
+        or get_memory().enable_unified_memory
+        or envs.SGLANG_ENABLE_WAR_BARRIER.get()
+    )
 
 
 @dataclasses.dataclass
@@ -95,7 +103,12 @@ class GenerationBatchResult:
 
     # For overlap scheduling
     copy_done: Optional[Union[torch.cuda.Event, HostCopyDone]] = None
+    # The unified pool's record of this forward; processing the result retires
+    # it, so page moves stop treating its pages as in flight.
+    unified_forward_done: Optional[torch.cuda.Event] = None
     delay_sample_func: Optional[callable] = None
+    # The step's launch record, for the unified pool's processing.
+    forward_launch: Optional[ForwardLaunch] = None
     future_indices: Optional[torch.Tensor] = None
     speculative_num_draft_tokens: Optional[int] = None
     # Padded row width in flattened speculative output. Existing algorithms
@@ -413,13 +426,18 @@ class EmbeddingBatchResult:
             only when the batch contained ``return_pooled_hidden_states=True``
             requests.  Tensor (uniform shapes) or list of tensors (MIS).
         copy_done: CUDA event recorded after the async CPU copy completes.
+        unified_forward_done: The unified pool's record of an overlapped
+            forward; processing the result retires it.
     """
 
     embeddings: torch.Tensor
     pooled_hidden_states: Optional[torch.Tensor] = None
     copy_done: Optional[Union[torch.cuda.Event, HostCopyDone]] = None
+    unified_forward_done: Optional[torch.cuda.Event] = None
     can_run_cuda_graph: bool = False
     fpm_timing: Optional[FpmTiming] = None
+    # The step's launch record, for the unified pool's processing.
+    forward_launch: Optional[ForwardLaunch] = None
 
     @torch.profiler.record_function("copy_embedding_to_cpu")
     def copy_to_cpu(self):

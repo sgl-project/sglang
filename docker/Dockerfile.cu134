@@ -11,8 +11,8 @@ ARG SGL_WHEELS_SOURCE=source
 ARG SGL_KERNEL_VERSION=0.4.10
 # Wheel build args
 ARG MANYLINUX_IMAGE=pytorch/manylinuxaarch64-builder:cuda13.4
-ARG DEEPGEMM_REF=v0.2.6
-ARG SGL_DEEP_GEMM_VERSION=0.2.6
+ARG DEEPGEMM_REF=v0.2.7
+ARG SGL_DEEP_GEMM_VERSION=0.2.7
 ARG DEEPEP_SOURCE_REF=sgl-deepep
 ARG SGL_DEEP_EP_VERSION=0.1.2.post1
 # MSA has no versioned release yet; pin a commit with the multi-head q8kv4 indexer,
@@ -894,9 +894,6 @@ ARG CUDA_VERSION
 ARG SGL_VERSION
 ARG USE_LATEST_SGLANG
 
-# TODO(Jialin): Set SGLANG_RUST_BUILD_MODE=never after Rust TreeCore supports
-# the PyTorch 2.15 used by this preview image.
-
 WORKDIR /sgl-workspace
 
 COPY --from=local_src /src /tmp/local_src
@@ -912,13 +909,19 @@ RUN if [ "$BRANCH_TYPE" = "local" ]; then \
     && rm -rf /tmp/local_src
 
 # Editable install (fast - dependencies already installed via constraints)
+# --no-build-isolation builds the Rust extensions (including the Rust TreeCore,
+# which links libtorch) against the image's torch==${TORCH_VERSION}; an isolated
+# build would compile them against python/pyproject.toml's [build-system] torch pin.
 # Clean up __pycache__/tests/pyc in same RUN to avoid writing ~28k files to layer
 RUN --mount=type=cache,target=/root/.cache/pip \
     cd /sgl-workspace/sglang \
-    && python3 -m pip install --no-deps -e "python[${BUILD_TYPE}]" \
+    && python3 -m pip install "setuptools>=61.0" "setuptools-rust>=1.11" "setuptools-scm>=8.0" wheel \
+    && python3 -m pip install --no-deps --no-build-isolation -e "python[${BUILD_TYPE}]" \
     && mkdir -p /root/.cache/huggingface /root/.cache/sglang \
     && ( find /opt/sglang/lib/python3.12/site-packages -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true )
 
+# Use the Rust extensions built above; never rebuild them at runtime.
+ENV SGLANG_RUST_BUILD_MODE=never
 
 # Install pre-built gateway artifacts from parallel builder
 COPY --from=gateway_builder /build/sgl-model-gateway-bin /opt/sglang/bin/sgl-model-gateway

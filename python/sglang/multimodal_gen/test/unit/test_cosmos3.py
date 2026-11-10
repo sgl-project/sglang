@@ -1753,7 +1753,7 @@ class TestCosmos3Transfer(unittest.TestCase):
         self.assertTrue(torch.allclose(out, torch.full((1,), 56.0)))
 
     def test_control_cfg_parallel_distribution(self):
-        """Round-robin branch distribution + all-reduce equals the serial blend."""
+        """Round-robin branches are all-gathered and combined in serial order."""
         stage = Cosmos3DenoisingStage.__new__(Cosmos3DenoisingStage)
         seen = {}
 
@@ -1796,28 +1796,53 @@ class TestCosmos3Transfer(unittest.TestCase):
 
         target = (
             "sglang.multimodal_gen.runtime.pipelines_core.stages."
-            "model_specific_stages.cosmos3.cfg_model_parallel_all_reduce"
+            "model_specific_stages.cosmos3.cfg_model_parallel_all_gather"
         )
-        # Stand in for the all-reduce with identity so each rank returns its own
-        # partial; summing them mimics the cross-rank reduction.
-        with mock.patch(target, side_effect=lambda x: x):
-            # 2 ranks: rank 0 runs the two control-in forwards (cond_full +
-            # uncond), rank 1 runs only the control-dropped cond_nc.
-            r0 = run(0, 2)
-            r1 = run(1, 2)
-            self.assertEqual(seen[0], ["cond", "uncond"])
-            self.assertEqual(seen[1], ["cond_nc"])
-            self.assertTrue(torch.allclose(r0 + r1, torch.full((1,), 86.0)))
+        values = {"cond": 20.0, "cond_nc": 10.0, "uncond": 2.0}
+        branch_order = ["cond", "cond_nc", "uncond"]
+        sent = []
 
-            seen.clear()
-            # 4 ranks for 3 branches: rank 3 is idle and contributes zeros.
-            parts = [run(r, 4) for r in range(4)]
-            self.assertEqual(seen[0], ["cond"])
-            self.assertEqual(seen[1], ["cond_nc"])
-            self.assertEqual(seen[2], ["uncond"])
-            self.assertEqual(seen[3], [])
-            self.assertTrue(torch.allclose(parts[3], torch.zeros(1)))
-            self.assertTrue(torch.allclose(sum(parts), torch.full((1,), 86.0)))
+        def fake_gather(world):
+            # Return what every rank would send for the same slot, so each
+            # rank combines all branches as a real all-gather would let it.
+            def gather(pred, dim, separate_tensors):
+                sent.append(pred)
+                slot = len(sent) - 1
+                bids = [slot * world + r for r in range(world)]
+                return [
+                    (
+                        torch.full_like(pred, values[branch_order[bid]])
+                        if bid < len(branch_order)
+                        else torch.zeros_like(pred)
+                    )
+                    for bid in bids
+                ]
+
+            return gather
+
+        # 2 ranks: rank 0 runs the two control-in forwards (cond_full +
+        # uncond), rank 1 runs only the control-dropped cond_nc.
+        for rank in range(2):
+            sent.clear()
+            with mock.patch(target, side_effect=fake_gather(2)):
+                out = run(rank, 2)
+            self.assertTrue(torch.allclose(out, torch.full((1,), 86.0)))
+        self.assertEqual(seen[0], ["cond", "uncond"])
+        self.assertEqual(seen[1], ["cond_nc"])
+        self.assertTrue(torch.equal(sent[1], torch.zeros(1)))
+
+        seen.clear()
+        # 4 ranks for 3 branches: rank 3 is idle and sends zeros.
+        for rank in range(4):
+            sent.clear()
+            with mock.patch(target, side_effect=fake_gather(4)):
+                out = run(rank, 4)
+            self.assertTrue(torch.allclose(out, torch.full((1,), 86.0)))
+        self.assertEqual(seen[0], ["cond"])
+        self.assertEqual(seen[1], ["cond_nc"])
+        self.assertEqual(seen[2], ["uncond"])
+        self.assertEqual(seen[3], [])
+        self.assertTrue(torch.equal(sent[0], torch.zeros(1)))
 
     def test_single_hint_defaults_applied(self):
         sp = Cosmos3SamplingParams(
