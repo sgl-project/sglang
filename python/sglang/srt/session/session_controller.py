@@ -355,22 +355,13 @@ class SessionController:
 
     def _close(self, session_id: str):
         session = self.sessions[session_id]
-        req = None
-        has_unfinished_request = False
-        if session.streaming and session._inflight:
-            has_unfinished_request = True
-        elif session.streaming and session.turns:
-            assert len(session.turns) == 1
-            [req] = session.turns.values()
-            if not req.finished():
-                has_unfinished_request = True
-
-        if has_unfinished_request:
-            # An in-flight request is still decoding on this session's KV
-            # memory. Freeing now would corrupt the scheduler. Mark the
-            # session for deferred cleanup: the request keeps its session
-            # reference so release_kv_cache takes the streaming path,
-            # and we schedule release_session for after it completes.
+        if self._has_live_readers(session):
+            # A request still reads what the close frees: a streaming turn
+            # decodes on the session's KV memory, or an unfinished turn holds
+            # the session's media. Mark the session for deferred cleanup: the
+            # request keeps its session reference so release_kv_cache takes
+            # the streaming path, and maybe_reap closes the session once no
+            # request reads it.
             session.close_on_finish = True
             logger.info(
                 "Deferring session close for %s (unfinished request)",
@@ -378,7 +369,7 @@ class SessionController:
             )
             return
 
-        # No owning request -- safe to release immediately.
+        # No reader left -- safe to release immediately.
         if session.streaming and session.turns:
             req = next(iter(session.turns.values()))
             req.session = None
@@ -406,32 +397,37 @@ class SessionController:
         if now - self._last_reap_time > interval:
             self._last_reap_time = now
 
-            # Finish deferred closes for sessions whose requests completed.
+            # Finish deferred closes for sessions no request reads anymore.
             pending = [
                 sid
                 for sid, session in self.sessions.items()
-                if session.close_on_finish and self._all_requests_finished(session)
+                if session.close_on_finish and not self._has_live_readers(session)
             ]
             for sid in pending:
                 log_info_on_rank0(
                     logger, f"Deferred close ready for session {sid}, releasing."
                 )
-                # Reset close_on_finish so _close proceeds with the release.
-                self.sessions[sid].close_on_finish = False
                 self._close(sid)
 
+            # A deferred close is already pending; closing it again each
+            # second would only repeat its log lines.
             timed_out = [
-                sid for sid, session in self.sessions.items() if session.is_timed_out()
+                sid
+                for sid, session in self.sessions.items()
+                if session.is_timed_out() and not session.close_on_finish
             ]
             for sid in timed_out:
                 log_info_on_rank0(logger, f"Session {sid} timed out, closing.")
                 self._close(sid)
 
     @staticmethod
-    def _all_requests_finished(session: Session) -> bool:
-        if not session.turns:
-            return True
-        return all(turn.finished() for turn in session.turns.values())
+    def _has_live_readers(session: Session) -> bool:
+        """Whether a request still reads what closing `session` frees: the
+        streaming turn in flight, or an unfinished turn that holds media."""
+        return session._inflight or any(
+            not turn.finished() and turn.multimodal_inputs is not None
+            for turn in session.turns.values()
+        )
 
     @staticmethod
     def adjust_mm_offsets(recv_req: TokenizedGenerateReqInput, req: Req, image_inputs):

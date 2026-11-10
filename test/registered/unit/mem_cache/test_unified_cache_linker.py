@@ -2345,9 +2345,8 @@ class TestTransferReadyEvents(CustomTestCase):
                 linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
                 order = MagicMock()
                 linker.record_transfer_ready = order.record_transfer_ready
-                order.record_transfer_ready.return_value = TransferReady(
-                    [order.indices_ready, order.forward_done]
-                )
+                ready = TransferReady([order.indices_ready, order.forward_done])
+                order.record_transfer_ready.return_value = ready
                 linker.load_layer_wise = order.load_layer_wise
                 linker.load_all_layers = order.load_all_layers
                 order.load_all_layers.return_value = True
@@ -2369,18 +2368,23 @@ class TestTransferReadyEvents(CustomTestCase):
                     self.assertEqual(linker.start_layer_wise_loading(), 3)
                 linker.load_queue.put(None)
                 linker.load_thread_func()
+                # Layer-wise loads defer the wait into `load_layer_wise`, before
+                # their get sessions start.
                 self.assertEqual(
                     order.mock_calls,
-                    [
-                        call.record_transfer_ready(),
-                        call.indices_ready.synchronize(),
-                        call.forward_done.synchronize(),
-                        (
-                            call.load_all_layers(["transfer"])
-                            if prefetch
-                            else call.load_layer_wise(3, [["transfer"]])
-                        ),
-                    ],
+                    (
+                        [
+                            call.record_transfer_ready(),
+                            call.indices_ready.synchronize(),
+                            call.forward_done.synchronize(),
+                            call.load_all_layers(["transfer"]),
+                        ]
+                        if prefetch
+                        else [
+                            call.record_transfer_ready(),
+                            call.load_layer_wise(3, [["transfer"]], ready),
+                        ]
+                    ),
                 )
                 if prefetch:
                     self.assertTrue(completion.result())

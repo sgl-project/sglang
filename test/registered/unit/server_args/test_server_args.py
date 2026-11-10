@@ -2112,7 +2112,6 @@ class TestFa4PageSizeAutoForce(CustomTestCase):
         # real model_config. Pre-set the attribute so get_model_config returns
         # early without touching ModelConfig.from_server_args.
         args._model_config = MagicMock()
-        args._model_config.hf_config.dual_chunk_attention_config = None
         return args
 
     @override_platform(is_sm100=True)
