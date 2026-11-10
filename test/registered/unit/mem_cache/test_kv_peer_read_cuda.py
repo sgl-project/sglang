@@ -74,9 +74,8 @@ class TestKvPeerReadCuda(CustomTestCase):
         if torch.cuda.device_count() >= 2 and get_gpu_fabric_clique(0) is not None:
             return
         reason = "needs two GPUs in an NVLink fabric clique"
-        if (
-            is_in_ci()
-        ):  # the registered runner has one: a skip there hides a broken setup
+        # The registered runner has one: a skip there hides a broken setup.
+        if is_in_ci():
             raise RuntimeError(reason)
         raise unittest.SkipTest(reason)
 

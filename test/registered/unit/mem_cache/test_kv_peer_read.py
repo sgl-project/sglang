@@ -329,26 +329,37 @@ class TestInFlightRanges(PeerReadTestBase):
         self.reader.wait(again)
         self.reader.release(again)
 
-    def test_growing_a_destination_over_an_in_flight_one(self):
-        def single(dst_base, capacity, page):
-            buffer = PeerBuffer(
-                src_region=self.region,
-                src_offset=0,
-                dst_base=dst_base,
-                page_bytes=PAGE,
-                dst_num_pages=capacity,
-            )
-            return ReadGroup(
-                buffers=(buffer,), src_pages=np.array([0]), dst_pages=np.array([page])
-            )
+    def single(self, dst_base, capacity, page):
+        buffer = PeerBuffer(
+            src_region=self.region,
+            src_offset=0,
+            dst_base=dst_base,
+            page_bytes=PAGE,
+            dst_num_pages=capacity,
+        )
+        return ReadGroup(
+            buffers=(buffer,), src_pages=np.array([0]), dst_pages=np.array([page])
+        )
 
+    def test_growing_a_destination_over_an_in_flight_one(self):
         self.ops.hold = True
         base = self.dst[0]
-        self.reader.read([single(base, 1, 0)])
-        self.reader.read([single(base + 2 * PAGE, 1, 0)])
+        self.reader.read([self.single(base, 1, 0)])
+        self.reader.read([self.single(base + 2 * PAGE, 1, 0)])
         # Same (base, page size) as the first, but now reaching into the second.
         with self.assertRaises(PeerReadBusy):
-            self.reader.read([single(base, 4, 2)])
+            self.reader.read([self.single(base, 4, 2)])
+
+    def test_self_overlap_is_a_caller_error_behind_an_in_flight_batch(self):
+        """A batch whose own destinations overlap raises ValueError even when it also
+        overlaps a batch in flight: an uncertain one would make PeerReadBusy permanent."""
+        self.ops.hold = True
+        base = self.dst[0]
+        self.reader.read([self.single(base, 4, 0)])
+        with self.assertRaises(ValueError):
+            self.reader.read(
+                [self.single(base, 4, 1), self.single(base + 2 * PAGE, 2, 0)]
+            )
 
     def test_finished_but_unpolled_batch_does_not_block(self):
         first = self.reader.read([self.group([0], [0])])  # done, nobody asked

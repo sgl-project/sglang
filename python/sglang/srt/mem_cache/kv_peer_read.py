@@ -507,6 +507,16 @@ def _first_overlap(ends: dict):
     return None
 
 
+def _shares_pages(plans, busy_groups, shared) -> bool:
+    """Whether any planned group writes a page some in-flight group of one batch writes."""
+    return any(
+        not plan.buffer_set.dst_ends.keys().isdisjoint(busy_set.dst_ends)
+        and shared(plan.dst_sorted, busy_pages)
+        for busy_set, busy_pages in busy_groups
+        for plan in plans
+    )
+
+
 def _page_info(value, name: str, cache: dict):
     """Validate a page-id array once per read: ``(pages, sorted pages, max)``."""
     hit = cache.get(id(value))
@@ -806,20 +816,11 @@ class KvPeerReader:
                     raise ValueError("overlapping destination pages within the batch")
         self._check_new_geometry(plans)
         for batch_id, groups in list(self._busy_groups.items()):
-            for busy_set, busy_pages in groups:
-                for plan in plans:
-                    if plan.buffer_set.dst_ends.keys().isdisjoint(busy_set.dst_ends):
-                        continue
-                    if not shared(plan.dst_sorted, busy_pages):
-                        continue
-                    batch = self._batches[batch_id]
-                    self._poll(batch)  # it may have finished since anyone looked
-                    if batch_id in self._busy_groups:
-                        raise PeerReadBusy("destination pages of a batch in flight")
-                    break
-                else:
-                    continue
-                break
+            if _shares_pages(plans, groups, shared):
+                batch = self._batches[batch_id]
+                self._poll(batch)  # it may have finished since anyone looked
+                if batch_id in self._busy_groups:
+                    raise PeerReadBusy("destination pages of a batch in flight")
 
     def _check_new_geometry(self, plans, *, polled: bool = False) -> None:
         """Partial overlaps can only come from a (base, page size) not in use yet,
@@ -835,14 +836,17 @@ class KvPeerReader:
         }
         if not fresh:
             return
+        # Alone first: an uncertain batch never retires, so a self-overlap found
+        # against it would stay PeerReadBusy instead of the caller's ValueError.
+        if _first_overlap(ends) is not None:
+            raise ValueError("overlapping destination ranges within the batch")
+        if not self._busy_keys:
+            return
         merged = {k: v[0] for k, v in self._busy_keys.items()}
         for key, end in fresh.items():
             merged[key] = max(end, merged.get(key, 0))
-        pair = _first_overlap(merged)
-        if pair is None:
+        if _first_overlap(merged) is None:
             return
-        if pair[0] in fresh and pair[1] in fresh:
-            raise ValueError("overlapping destination ranges within the batch")
         if not polled:  # batches may have finished since anyone looked
             for batch_id in list(self._busy_groups):
                 self._poll(self._batches[batch_id])
@@ -858,6 +862,8 @@ class KvPeerReader:
         for buffer_set, _ in batch.destinations:
             for key, end in buffer_set.dst_ends.items():
                 entry = self._busy_keys.setdefault(key, [end, 0])
+                # Kept until the key's last batch retires: neighbours may see a
+                # false PeerReadBusy meanwhile, never a missed overlap.
                 entry[0] = max(entry[0], end)
                 entry[1] += 1
 
