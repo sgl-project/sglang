@@ -37,14 +37,14 @@ register_cuda_ci(est_time=150, stage="nightly", runner_config="1-gpu-small")
 
 BASE_MODEL = "Qwen/Qwen3.5-0.8B"
 # HF+PEFT target names in Qwen3.5's language model, one adapter per group.
-# q/k/v share one adapter: main's qkv normalization requires q_proj and v_proj
-# together (single-branch adapters are sgl-project/sglang#28199).
+# Fused projections are tested whole: main stacks q/k/v only when q_proj and
+# v_proj are both present (sgl-project/sglang#28199), and an up_proj-only
+# adapter fails to load (sgl-project/sglang#48608).
 ADAPTER_TARGETS = {
     "attn_qkv": ["q_proj", "k_proj", "v_proj"],
     "o_proj": ["o_proj"],
     "out_proj": ["out_proj"],
-    "gate_proj": ["gate_proj"],
-    "up_proj": ["up_proj"],
+    "mlp_gate_up": ["gate_proj", "up_proj"],
     "down_proj": ["down_proj"],
 }
 LORA_RANK = 8
