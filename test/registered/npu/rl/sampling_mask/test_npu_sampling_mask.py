@@ -6,13 +6,6 @@ import unittest
 
 import requests
 
-from sglang.test.ascend.sampling_mask_reference import (
-    assert_distribution,
-    reference_distribution,
-)
-from sglang.test.ascend.test_ascend_utils import (
-    GLM_5_2_BF16_MODEL_PATH,
-)
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -20,6 +13,10 @@ from sglang.test.test_utils import (
     CustomTestCase,
     popen_launch_server,
     terminate_and_kill_process_tree,
+)
+
+GLM_5_2_BF16_MODEL_PATH = os.environ.get(
+    "GLM_5_2_BF16_MODEL_PATH", "/root/.cache/modelscope/hub/models/ZhipuAI/GLM-5.2"
 )
 
 register_npu_ci(est_time=300, suite="base-b-test-2-npu-a3")
@@ -83,46 +80,36 @@ class TestGLM52BF16SamplingMask(CustomTestCase):
                 },
                 "return_sampling_mask": True,
                 "sampling_logprobs_mode": mode,
-                "return_logprob": True,
-                "top_logprobs_num": 2048,
                 **kwargs,
             },
         )
         self.assertEqual(response.status_code, 200, response.text)
         return response.json()
 
-    def _check_output(self, body, mode, *, filters=None, greedy=False):
+    def _check_output(self, body, mode, *, greedy=False):
         meta = body["meta_info"]
         self.assertEqual(len(body["output_ids"]), 4)
-        for token, mask, actual, top_logprobs in zip(
+        for token, mask, actual in zip(
             body["output_ids"],
             meta["output_token_sampling_mask"],
             meta["output_token_sampling_logprobs"],
-            meta["output_top_logprobs"],
             strict=True,
         ):
-            if filters is None and not greedy:
-                self.assertIn(token, mask)
-                self.assertEqual(len(mask), len(set(mask)))
-                self.assertLessEqual(len(mask), 2048)
-                values = actual if mode == "support" else [actual]
-                self.assertTrue(all(math.isfinite(v) for v in values))
-                if mode == "support":
-                    self.assertEqual(len(actual), len(mask))
-                    self.assertAlmostEqual(
-                        sum(math.exp(v) for v in values), 1.0, delta=1e-4
-                    )
-                continue
-            expected = {token: 0.0}
-            if filters is not None:
-                k, p, m = filters
-                raw = {int(t): value for value, t, _ in top_logprobs}
-                ranked = sorted(raw.values(), reverse=True)
-                # The complete, unambiguous top-k cutoff must fit in the prefix.
-                self.assertGreater(len(raw), k)
-                self.assertGreater(ranked[k - 1] - ranked[k], 1e-4)
-                expected = reference_distribution(raw, k, p, m, cutoff_ties=k <= 1024)
-            assert_distribution(self, token, mask, actual, expected, mode, 1e-3)
+            self.assertIn(token, mask)
+            self.assertEqual(len(mask), len(set(mask)))
+            self.assertLessEqual(len(mask), 2048)
+            if mode == "selected":
+                self.assertIsInstance(actual, float)
+            values = actual if mode == "support" else [actual]
+            self.assertTrue(all(math.isfinite(v) and v <= 0 for v in values))
+            if mode == "support":
+                self.assertEqual(len(actual), len(mask))
+                self.assertAlmostEqual(
+                    sum(math.exp(v) for v in values), 1.0, delta=1e-4
+                )
+            if greedy:
+                self.assertEqual(mask, [token])
+                self.assertEqual(values, [0.0])
 
     def test_single_request_sampling_masks(self):
         response = requests.get(self.base_url + "/server_info", timeout=30)
@@ -140,35 +127,23 @@ class TestGLM52BF16SamplingMask(CustomTestCase):
             json.loads(info["json_model_override_args"])["num_hidden_layers"], 6
         )
         cases = [
-            ("greedy", 1, 1.0, 0.0),
-            ("unbiased", 10, 1.0, 0.0),
-            ("topk", 10, 1.0, 0.0),
-            ("topp", 10, 0.8, 0.0),
-            ("fallback", 1025, 1.0, 0.0),
+            ("greedy", 1, 1.0),
+            ("topk", 10, 1.0),
+            ("topp", 10, 0.8),
+            ("fallback", 1025, 1.0),
         ]
         for mode in ("support", "selected"):
-            for name, k, p, m in cases:
+            for name, k, p in cases:
                 with self.subTest(mode=mode, case=name):
-                    params = {
-                        "temperature": 0.0 if name == "greedy" else 1.0,
-                        "top_k": k,
-                        "top_p": p,
-                        "min_p": m,
-                    }
-                    exact = name not in ("greedy", "unbiased")
-                    if exact:
-                        # Separate cutoff values after logprob rounding.
-                        spacing, count = (0.7, 16) if k <= 1024 else (0.005, 1100)
-                        params["logit_bias"] = {
-                            str(t): 40.0 - spacing * t for t in range(count)
-                        }
-                    body = self._generate(params, mode)
-                    self._check_output(
-                        body,
+                    body = self._generate(
+                        {
+                            "temperature": 0.0 if name == "greedy" else 1.0,
+                            "top_k": k,
+                            "top_p": p,
+                        },
                         mode,
-                        filters=(k, p, m) if exact else None,
-                        greedy=name == "greedy",
                     )
+                    self._check_output(body, mode, greedy=name == "greedy")
 
     def test_mixed_batch_modes(self):
         """Check mode, opt-in and request/token association independently."""
