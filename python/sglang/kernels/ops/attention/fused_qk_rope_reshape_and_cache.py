@@ -4,22 +4,49 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.utils import is_gfx1250_supported
 
-# Tiled prefill path (6004): one program per (BLOCK_T tokens, HB q heads) and one
-# per BLOCK_T tokens for K rope + KV cache write, instead of one 1-warp program per
-# (token, q head). Used for T >= _TILED_MIN_T; SGLANG_FUSED_ROPE_KV_TILED=0 disables it.
+# Large-T path: one program per (BLOCK_T tokens, HB q heads) and one per
+# BLOCK_T tokens for the K rope and the KV cache write, instead of one 1-warp
+# program per (token, q head). On by default for gfx1250 when T >= _TILED_MIN_T.
+# SGLANG_FUSED_ROPE_KV_TILED=0 keeps the original kernel.
 _TILED_ENABLED = os.environ.get("SGLANG_FUSED_ROPE_KV_TILED", "1") != "0"
 _TILED_MIN_T = int(os.environ.get("SGLANG_FUSED_ROPE_KV_TILED_MIN_T", "256"))
 _TILED_BLOCK_T = int(os.environ.get("SGLANG_FUSED_ROPE_KV_TILED_BLOCK_T", "16"))
 _TILED_HB = int(os.environ.get("SGLANG_FUSED_ROPE_KV_TILED_HB", "8"))
 _TILED_WARPS = int(os.environ.get("SGLANG_FUSED_ROPE_KV_TILED_WARPS", "4"))
+_TILED_QK_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
 
 def _use_tiled(
-    t, t_slot, qh, kh, d, flash_layout, is_neox, reuse_freqs_front_part,
-    zeros_out, q, k, v, q_out, k_out, key_cache, value_cache, cos_sin,
+    t,
+    t_slot,
+    qh,
+    kh,
+    flash_layout,
+    is_neox,
+    reuse_freqs_front_part,
+    zeros_out,
+    q,
+    k,
+    v,
+    q_out,
+    k_out,
+    key_cache,
+    value_cache,
+    cos_sin,
 ):
-    if not (_TILED_ENABLED and t >= _TILED_MIN_T and t_slot == t):
+    # A non-fp32 table, or Q/K outside bf16, fp16, and fp32, rounds
+    # differently from the untiled kernel.
+    if not (
+        _TILED_ENABLED
+        and is_gfx1250_supported()
+        and t >= _TILED_MIN_T
+        and t_slot == t
+        and cos_sin.dtype == torch.float32
+        and q.dtype in _TILED_QK_DTYPES
+        and k.dtype in _TILED_QK_DTYPES
+    ):
         return False
     if not (flash_layout and is_neox and reuse_freqs_front_part and zeros_out is None):
         return False
@@ -856,21 +883,64 @@ def fused_qk_rope_reshape_and_cache(
         zeros_out = None
 
     if _use_tiled(
-        t, t_slot, qh, kh, d, flash_layout, is_neox, reuse_freqs_front_part,
-        zeros_out, q, k, v, q_out, k_out, key_cache, value_cache, cos_sin,
+        t,
+        t_slot,
+        qh,
+        kh,
+        flash_layout,
+        is_neox,
+        reuse_freqs_front_part,
+        zeros_out,
+        q,
+        k,
+        v,
+        q_out,
+        k_out,
+        key_cache,
+        value_cache,
+        cos_sin,
     ):
         hb = _TILED_HB if qh % _TILED_HB == 0 else kh
         grid = (triton.cdiv(t, _TILED_BLOCK_T), qh // hb + 1)
         _fused_qk_rope_cache_tiled_kernel[grid](
-            q, k, v, pos, cos_sin, offs, key_cache, value_cache,
-            slot_mapping, swa_slot_mapping, q_out, k_out, t,
-            q.stride(0), q.stride(1), k.stride(0), k.stride(1),
-            v.stride(0), v.stride(1), cos_sin.stride(0),
-            q_out.stride(0), q_out.stride(1), k_out.stride(0), k_out.stride(1),
-            key_cache.stride(0), key_cache.stride(1), key_cache.stride(2),
-            value_cache.stride(0), value_cache.stride(1), value_cache.stride(2),
-            k_scale, v_scale,
-            QH=qh, KH=kh, HB=hb, BLOCK_T=_TILED_BLOCK_T, D=d, BLOCK_SIZE=block_size,
+            q,
+            k,
+            v,
+            pos,
+            cos_sin,
+            offs,
+            key_cache,
+            value_cache,
+            slot_mapping,
+            swa_slot_mapping,
+            q_out,
+            k_out,
+            t,
+            q.stride(0),
+            q.stride(1),
+            k.stride(0),
+            k.stride(1),
+            v.stride(0),
+            v.stride(1),
+            cos_sin.stride(0),
+            q_out.stride(0),
+            q_out.stride(1),
+            k_out.stride(0),
+            k_out.stride(1),
+            key_cache.stride(0),
+            key_cache.stride(1),
+            key_cache.stride(2),
+            value_cache.stride(0),
+            value_cache.stride(1),
+            value_cache.stride(2),
+            k_scale,
+            v_scale,
+            QH=qh,
+            KH=kh,
+            HB=hb,
+            BLOCK_T=_TILED_BLOCK_T,
+            D=d,
+            BLOCK_SIZE=block_size,
             HAVE_POS=(offs is not None),
             HAVE_K_SCALE=(k_scale is not None and apply_scale),
             HAVE_V_SCALE=(v_scale is not None and apply_scale),
