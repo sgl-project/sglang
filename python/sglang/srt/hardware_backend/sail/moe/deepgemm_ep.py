@@ -26,7 +26,10 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.sail.deep_gemm import entrypoint as sail_entrypoint
-from sglang.srt.hardware_backend.sail.moe.activations import apply_oai_swiglu
+from sglang.srt.hardware_backend.sail.moe.activations import (
+    apply_oai_swiglu,
+    silu_and_mul_masked_fwd,
+)
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
@@ -1342,8 +1345,6 @@ class SailDeepGemmEpRunnerCore(DeepGemmRunnerCore):
         quant_info: DeepGemmMoeQuantInfo,
         running_state: dict,
     ) -> torch.Tensor:
-        from sglang.kernels.ops.moe.ep_moe_kernels import silu_and_mul_masked_fwd
-
         assert self.swiglu_limit is None
 
         # DeepGEMM's W4A16 masked kernel has no SBO entry point: it takes no
@@ -1439,8 +1440,6 @@ class SailDeepGemmEpRunnerCore(DeepGemmRunnerCore):
         over SiTU's betas instead of its tanh clip. Branch on the activation
         here, like the other masked forks.
         """
-        from sglang.kernels.ops.moe.ep_moe_kernels import silu_and_mul_masked_fwd
-
         hidden_states = runner_input.hidden_states
         masked_m = runner_input.masked_m
         expected_m = runner_input.expected_m

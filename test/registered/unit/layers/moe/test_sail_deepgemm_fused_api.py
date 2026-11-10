@@ -251,6 +251,7 @@ class TestDeepGemmMaskedActivationContract(CustomTestCase):
         """BF16, channel FP8/INT8 and W4A16 must propagate the activation protocol
         down to the actual launch."""
         from sglang.kernels.ops.moe import ep_moe_kernels as kernels
+        from sglang.srt.hardware_backend.sail.moe import activations as sail_activations
         from sglang.srt.hardware_backend.sail.moe import deepgemm_ep as ep_module
         from sglang.srt.layers.moe.moe_runner import deep_gemm as runner_module
         from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
@@ -319,12 +320,14 @@ class TestDeepGemmMaskedActivationContract(CustomTestCase):
                         )
                     )
                     stack.enter_context(patch.object(kernels, "_is_sail", True))
-                    kernel = (
-                        "_silu_and_mul_post_quant_kernel"
+                    kernel_module, kernel = (
+                        (kernels, "_silu_and_mul_post_quant_kernel")
                         if variant in ("channel", "int8")
-                        else "_silu_and_mul_kernel"
+                        else (sail_activations, "_silu_and_mul_masked_kernel")
                     )
-                    stack.enter_context(patch.object(kernels, kernel, LaunchBoundary()))
+                    stack.enter_context(
+                        patch.object(kernel_module, kernel, LaunchBoundary())
+                    )
                     payload = runner_module.DeepGemmRunnerInput(
                         torch.empty(
                             (2, 3, 64),
@@ -357,7 +360,6 @@ class TestDeepGemmMaskedActivationContract(CustomTestCase):
         reach the SiTU kernel instead of the oai-swiglu branch of
         ``silu_and_mul_masked_fwd``."""
         from sglang.kernels.ops import activation as activation_ops
-        from sglang.kernels.ops.moe import ep_moe_kernels as kernels
         from sglang.srt.hardware_backend.sail.moe import deepgemm_ep as ep_module
         from sglang.srt.layers.moe.moe_runner import deep_gemm as runner_module
         from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
@@ -411,7 +413,7 @@ class TestDeepGemmMaskedActivationContract(CustomTestCase):
             stack.enter_context(
                 patch.object(activation_ops, "situ_and_mul_masked", situ_masked)
             )
-            stack.enter_context(patch.object(kernels, "silu_and_mul_masked_fwd", oai))
+            stack.enter_context(patch.object(ep_module, "silu_and_mul_masked_fwd", oai))
             payload = runner_module.DeepGemmRunnerInput(
                 torch.empty((2, 3, 64), dtype=torch.bfloat16),
                 torch.ones((2, 3, 1)),

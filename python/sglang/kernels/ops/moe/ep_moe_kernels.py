@@ -1121,8 +1121,6 @@ def _silu_and_mul_kernel(
     size_n,
     BLOCK_N: tl.constexpr,
     NUM_STAGE: tl.constexpr,
-    GEMM1_ALPHA: tl.constexpr,
-    GEMM1_CLAMP_LIMIT: tl.constexpr,
 ):
     expert_id = tl.program_id(2)
     token_id = tl.program_id(1)
@@ -1154,16 +1152,10 @@ def _silu_and_mul_kernel(
             mask=offs_in_d < size_n,
             other=0.0,
         ).to(tl.float32)
-        if GEMM1_ALPHA > 0:
-            # Keep the same oai-swiglu formula and FP32 intermediates as the
-            # quantized activation.
-            gate = tl.minimum(gate, GEMM1_CLAMP_LIMIT)
-            up = tl.clamp(up, -GEMM1_CLAMP_LIMIT, GEMM1_CLAMP_LIMIT)
-            gate_up = gate * tl.sigmoid(gate * GEMM1_ALPHA) * (up + 1)
-        else:
-            gate = gate / (1 + tl.exp(-gate))
-            gate_up = up * gate
-        # The activation is computed in FP32 and cast back to the input dtype.
+        gate = gate / (1 + tl.exp(-gate))
+        gate_up = up * gate
+        # Compute SiLU in fp32 for better precision, then cast back to the
+        # input dtype.
         gate_up = gate_up.to(input_ptr.dtype.element_ty)
         tl.store(
             output_ptr_offs + token_index * stride_output_1,
@@ -1176,16 +1168,11 @@ def silu_and_mul_masked_fwd(
     input: torch.Tensor,
     output: torch.Tensor,
     masked_m: torch.Tensor,
-    gemm1_alpha: float = 0.0,
-    gemm1_clamp_limit: float = 0.0,
 ):
     """
     input shape [expert_num, token_num_padded, hidden_dim], dtype bf16
     output shape [expert_num, token_num_padded, hidden_dim // 2], dtype bf16
     masked_m shape [expert_num]
-
-    When gemm1_alpha > 0 this runs oai-swiglu: gate is only bounded from above,
-    up is clamped on both sides and then offset by 1.
     """
 
     assert input.is_contiguous()
@@ -1225,8 +1212,6 @@ def silu_and_mul_masked_fwd(
         size_n,
         BLOCK_N=BLOCK_N,
         NUM_STAGE=NUM_STAGES,
-        GEMM1_ALPHA=gemm1_alpha if gemm1_alpha is not None else 0.0,
-        GEMM1_CLAMP_LIMIT=gemm1_clamp_limit if gemm1_clamp_limit is not None else 0.0,
         num_warps=num_warps,
     )
     return output
@@ -2547,31 +2532,22 @@ def moe_ep_deepgemm_preprocess(
         topk_ids, num_local_experts, m_max, expert_start=expert_start
     )
 
-    if output_dtype == torch.uint8:
-        # mxfp4
-        gateup_input = torch.empty(
-            (num_local_experts, m_max, hidden_states.size(1) // 2),
-            device=hidden_states.device,
-            dtype=output_dtype,
-        )
-    else:
-        gateup_input = torch.empty(
-            (num_local_experts, m_max, hidden_states.size(1)),
-            device=hidden_states.device,
-            dtype=output_dtype,
-        )
+    gateup_input = torch.empty(
+        (num_local_experts, m_max, hidden_states.size(1)),
+        device=hidden_states.device,
+        dtype=output_dtype,
+    )
 
+    if block_shape is None:
+        block_shape = [128, 128]
+    assert len(block_shape) == 2
+    block_n, block_k = block_shape[0], block_shape[1]
     is_fp8 = output_dtype == torch.float8_e4m3fn
     # Quantize FP8 values with the UE8M0 scale directly. Rounding only the
     # scale afterward can change the represented activation by up to 2x.
     from sglang.srt.layers import deep_gemm_wrapper
 
     if is_fp8 and (use_mxfp8 or deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0):
-        if block_shape is None:
-            block_shape = [128, 128]
-        assert len(block_shape) == 2
-        block_k = block_shape[1]
-
         from sglang.kernels.ops.moe.minimax_quant_ue8m0 import (
             per_token_quant_fp8_ue8m0_scatter,
         )
@@ -2593,45 +2569,13 @@ def moe_ep_deepgemm_preprocess(
             group_size=block_k,
         )
         gateup_input_scale = gateup_input_scale.transpose(1, 2)
-    else:
-        # Quantize hidden_states based on output_dtype
-        if output_dtype == torch.float8_e4m3fn:
-            # SAIL quantizes channel-wise (one scale per token); every other
-            # target keeps upstream's 128-wide group when no block shape is set.
-            if block_shape is None:
-                block_k = hidden_states.size(-1) if _is_sail else 128
-            else:
-                assert len(block_shape) == 2
-                block_k = block_shape[1]
-            hidden_states, scale = per_token_group_quant_fp8(hidden_states, block_k)
-        elif output_dtype == torch.int8:
-            from sglang.kernels.ops.quantization.int8_kernel import (
-                per_token_quant_int8,
-            )
-
-            assert block_shape is None
-            hidden_states, scale = per_token_quant_int8(hidden_states)
-        elif output_dtype == torch.uint8:
-            # mxfp4. `triton_kernels` is an optional dependency, so it is only
-            # imported when this SAIL-only format is actually requested.
-            from triton_kernels.numerics_details.mxfp import downcast_to_mxfp
-
-            hidden_states, scale = downcast_to_mxfp(hidden_states, torch.uint8, axis=1)
-        elif output_dtype == torch.bfloat16:
-            scale = None
-            gateup_input_scale = None
-        else:
-            raise NotImplementedError
-
-        # Allocate gateup_input_scale for quantized types
-        is_quantized = output_dtype != torch.bfloat16
-        if is_quantized:
-            gateup_input_scale = torch.empty(
-                (gateup_input.size(0), gateup_input.size(1), scale.size(1)),
-                device=hidden_states.device,
-                dtype=scale.dtype,
-            )
-
+    elif is_fp8:
+        hidden_states, scale = per_token_group_quant_fp8(hidden_states, block_k)
+        gateup_input_scale = torch.empty(
+            (gateup_input.size(0), gateup_input.size(1), scale.size(1)),
+            device=hidden_states.device,
+            dtype=scale.dtype,
+        )
         fill_gateup_input_triton_kernel[(hidden_states.shape[0],)](
             hidden_states,
             scale,
@@ -2641,12 +2585,32 @@ def moe_ep_deepgemm_preprocess(
             topk_ids,
             top_k,
             hidden_states.size(1),
-            scale.size(1) if is_quantized else 0,
+            scale.size(1),
             m_max,
-            scale.stride(0) if is_quantized else 0,
-            scale.stride(1) if is_quantized else 0,
+            scale.stride(0),
+            scale.stride(1),
             BLOCK_SIZE=1024,
-            IS_FP8=is_quantized,
+            IS_FP8=True,
+            SCALE_MN_MAJOR=False,
+        )
+    else:
+        scale = None
+        gateup_input_scale = None
+        fill_gateup_input_triton_kernel[(hidden_states.shape[0],)](
+            hidden_states,
+            scale,
+            gateup_input,
+            gateup_input_scale,
+            src2dst,
+            topk_ids,
+            top_k,
+            hidden_states.size(1),
+            0,
+            m_max,
+            0,
+            0,
+            BLOCK_SIZE=1024,
+            IS_FP8=False,
             SCALE_MN_MAJOR=False,
         )
 
