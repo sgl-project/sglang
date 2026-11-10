@@ -878,8 +878,12 @@ class MambaAttnBackendBase(AttentionBackend):
                     if self.tree_depth_list is not None
                     else None
                 ),
-                tree_max_depth=int(getattr(spec_info, "max_tree_depth", 0)),
-                has_direct_parent=bool(getattr(spec_info, "uses_direct_parent", False)),
+                tree_max_depth=(
+                    spec_info.max_tree_depth if self.tree_depth_list is not None else 0
+                ),
+                has_direct_parent=(
+                    self.tree_depth_list is not None and spec_info.uses_direct_parent
+                ),
                 replayssm_write_pos=replayssm_write_pos,
                 replayssm_force_flush=replayssm_force_flush,
                 replayssm_ring_indices=replayssm_ring_indices,
@@ -1093,8 +1097,12 @@ class MambaAttnBackendBase(AttentionBackend):
                     if self.tree_depth_list is not None
                     else None
                 ),
-                tree_max_depth=int(getattr(spec_info, "max_tree_depth", 0)),
-                has_direct_parent=bool(getattr(spec_info, "uses_direct_parent", False)),
+                tree_max_depth=(
+                    spec_info.max_tree_depth if self.tree_depth_list is not None else 0
+                ),
+                has_direct_parent=(
+                    self.tree_depth_list is not None and spec_info.uses_direct_parent
+                ),
                 replayssm_write_pos=replayssm_write_pos,
                 replayssm_force_flush=replayssm_force_flush,
                 replayssm_ring_indices=self._fill_replayssm_ring_indices(
