@@ -9,7 +9,7 @@ import logging
 import jinja2
 import transformers.utils.chat_template_utils as hf_chat_utils
 
-from sglang.srt.utils import GLM_MEDIA_CONFIG_KEYS, ImageData, VideoData
+from sglang.srt.multimodal.media_io import GLM_MEDIA_CONFIG_KEYS, ImageData, VideoData
 
 logger = logging.getLogger(__name__)
 
@@ -178,6 +178,38 @@ def jinja_template_may_reorder_tool_results(chat_template: str) -> bool:
             return True
 
     return False
+
+
+def jinja_template_reads_reasoning_content(chat_template: str) -> bool:
+    if not isinstance(chat_template, str):
+        return False
+
+    jinja_ast = _try_extract_ast(chat_template)
+    if jinja_ast is None:
+        return False
+
+    def is_reasoning_content(node: jinja2.nodes.Node) -> bool:
+        return (
+            isinstance(node, jinja2.nodes.Const) and node.value == "reasoning_content"
+        )
+
+    return (
+        any(
+            node.attr == "reasoning_content"
+            for node in jinja_ast.find_all(jinja2.nodes.Getattr)
+        )
+        or any(
+            is_reasoning_content(node.arg)
+            for node in jinja_ast.find_all(jinja2.nodes.Getitem)
+        )
+        or any(
+            isinstance(call.node, jinja2.nodes.Getattr)
+            and call.node.attr == "get"
+            and call.args
+            and is_reasoning_content(call.args[0])
+            for call in jinja_ast.find_all(jinja2.nodes.Call)
+        )
+    )
 
 
 def process_content_for_template_format(

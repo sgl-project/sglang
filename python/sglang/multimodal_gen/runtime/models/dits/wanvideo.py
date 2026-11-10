@@ -14,6 +14,7 @@ from sglang.kernels.ops.diffusion import (
     NVFP4_BIAS_GELU,
     BitExactFusionGate,
     can_use_linear_gelu,
+    flashinfer_rmsnorm_diagnostic_hint,
     fused_linear_gelu_tanh,
     fused_temb_table_slices,
     tensors_equal,
@@ -45,6 +46,8 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     RowParallelLinear,
     UnquantizedLinearMethod,
     apply_unquantized_linear,
+    pack_rows_into_one_buffer,
+    rows_of_one_buffer,
 )
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
@@ -66,6 +69,7 @@ from sglang.multimodal_gen.runtime.layers.visual_embedding import (
 from sglang.multimodal_gen.runtime.managers.forward_context import (
     DENOISING_LOOP_STATE,
     get_forward_context,
+    request_allows_lossless,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
@@ -78,24 +82,19 @@ from sglang.multimodal_gen.runtime.platforms import (
 from sglang.multimodal_gen.runtime.platforms.aiter import USE_AITER
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.srt.utils import add_prefix, is_device_stream_capturing
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.utils import is_device_stream_capturing
 
-if current_platform.is_xpu():
-    # CuTe DSL (cutlass) is unavailable on XPU; use the unfused q/k norm path.
-    can_use_fused_rmsnorm_interleaved_rope = lambda *args, **kwargs: False
-    fused_rmsnorm_interleaved_rope_ = None
-    fused_rmsnorm_interleaved_rope_into_blocks = None
-    rmsnorm_interleaved_rope_block_cols = None
-else:
+logger = init_logger(__name__)
+_is_cuda = current_platform.is_cuda()
+
+if _is_cuda:
     from sglang.kernels.ops.diffusion import (
         can_use_fused_rmsnorm_interleaved_rope,
         fused_rmsnorm_interleaved_rope_,
         fused_rmsnorm_interleaved_rope_into_blocks,
         rmsnorm_interleaved_rope_block_cols,
     )
-
-logger = init_logger(__name__)
-_is_cuda = current_platform.is_cuda()
 
 if USE_AITER:
     from aiter.ops.rope import rope_cached_2c_fwd_inplace
@@ -409,6 +408,7 @@ class WanI2VCrossAttention(WanSelfAttention):
 
 
 _WAN_TEMB_SLICES = BitExactFusionGate("Wan fused temb-table slices")
+_WAN_QK_NORM_ROPE = BitExactFusionGate("Wan fused q/k RMSNorm+RoPE")
 
 
 def _eager_temb_table_slices(
@@ -444,26 +444,6 @@ def _wan_temb_table_slices(
     return _eager_temb_table_slices(table, temb)
 
 
-def _rows_of_one_buffer(parts: list[torch.Tensor]) -> torch.Tensor | None:
-    """``torch.cat(parts)`` without a copy, when the parts are consecutive equal-shape
-    rows of one buffer"""
-    first = parts[0]
-    start, nbytes = first.data_ptr(), first.nbytes
-    storage = first.untyped_storage()
-    if start + len(parts) * nbytes > storage.data_ptr() + storage.nbytes():
-        return None
-    for i, part in enumerate(parts):
-        if (
-            part.data_ptr() != start + i * nbytes
-            or part.shape != first.shape
-            or not part.is_contiguous()
-        ):
-            return None
-    return first.as_strided(
-        (len(parts) * first.shape[0], *first.shape[1:]), first.stride()
-    )
-
-
 class WanTransformerBlock(nn.Module):
     def __init__(
         self,
@@ -483,11 +463,15 @@ class WanTransformerBlock(nn.Module):
         super().__init__()
 
         # 1. Self-attention
+        # FlyDSL lowers FP32 modulation operands to BF16, so the denoising
+        # stage enables these sites only for quality="high" requests.
+        # SGLANG_USE_ROCM_FLYDSL=1 opts in; the quality gate still applies.
         self.norm1 = LayerNormScaleShift(
             dim,
             eps=eps,
             elementwise_affine=False,
             dtype=torch.float32,
+            rocm_flydsl_high_only=True,
         )
         self.to_q = ColumnParallelLinear(
             dim,
@@ -609,6 +593,7 @@ class WanTransformerBlock(nn.Module):
             eps=eps,
             elementwise_affine=True,
             dtype=torch.float32,
+            rocm_flydsl_high_only=True,
         )
 
         # 2. Cross-attention
@@ -642,6 +627,7 @@ class WanTransformerBlock(nn.Module):
             eps=eps,
             elementwise_affine=False,
             dtype=torch.float32,
+            rocm_flydsl_high_only=True,
         )
 
         # 3. Feed-forward
@@ -658,6 +644,7 @@ class WanTransformerBlock(nn.Module):
             eps=eps,
             elementwise_affine=False,
             dtype=torch.float32,
+            rocm_flydsl_high_only=True,
         )
 
         self.scale_shift_table = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
@@ -680,13 +667,8 @@ class WanTransformerBlock(nn.Module):
         )
         if not self.qkv_fusable:
             return
-        with torch.no_grad():
-            weight = torch.cat([layer.weight for layer in layers])
-            bias = torch.cat([layer.bias for layer in layers])
-        rows = self.to_q.weight.shape[0]
-        for i, layer in enumerate(layers):
-            layer.weight.data = weight[i * rows : (i + 1) * rows]
-            layer.bias.data = bias[i * rows : (i + 1) * rows]
+        pack_rows_into_one_buffer([layer.weight for layer in layers])
+        pack_rows_into_one_buffer([layer.bias for layer in layers])
 
     def _fused_qkv(
         self, device: torch.device
@@ -703,8 +685,8 @@ class WanTransformerBlock(nn.Module):
             or self.to_q.weight.device != device
         ):
             return None
-        weight = _rows_of_one_buffer([layer.weight for layer in layers])
-        bias = _rows_of_one_buffer([layer.bias for layer in layers])
+        weight = rows_of_one_buffer([layer.weight for layer in layers])
+        bias = rows_of_one_buffer([layer.bias for layer in layers])
         if weight is None or bias is None:
             return None
         return weight, bias
@@ -729,7 +711,13 @@ class WanTransformerBlock(nn.Module):
     def _project_qkv(
         self, norm_hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        fused = self._fused_qkv(norm_hidden_states.device)
+        # one GEMM over the packed rows rounds apart from the three projections
+        # at some shapes (cuBLAS split-K at small token counts)
+        fused = (
+            self._fused_qkv(norm_hidden_states.device)
+            if request_allows_lossless()
+            else None
+        )
         if fused is not None:
             qkv = apply_unquantized_linear(norm_hidden_states, *fused)
             return qkv.split(self.to_q.weight.shape[0], dim=-1)
@@ -745,7 +733,8 @@ class WanTransformerBlock(nn.Module):
         rope_cos_sin_cache: torch.Tensor | None,
     ) -> bool:
         return (
-            rope_cos_sin_cache is not None
+            _is_cuda
+            and rope_cos_sin_cache is not None
             and self.fuse_qk_norm_rope
             and not torch.compiler.is_compiling()
             and all(
@@ -757,7 +746,54 @@ class WanTransformerBlock(nn.Module):
                 )
                 for x, norm in ((query, self.norm_q), (key, self.norm_k))
             )
+            and self._qk_norm_rope_verified(query, key, rope_cos_sin_cache)
         )
+
+    def _qk_norm_rope_verified(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        rope_cos_sin_cache: torch.Tensor,
+    ) -> bool:
+        """Whether the fused q/k norm + RoPE gives the bits of the norm then the
+        RoPE; the first call compares them on copies of this call's q/k."""
+        gate = _WAN_QK_NORM_ROPE
+        if gate.disabled or gate.verified:
+            return not gate.disabled
+        if not gate.can_attempt_once():
+            return False
+        qk_norms = ((query, self.norm_q), (key, self.norm_k))
+
+        def fused():
+            return [
+                fused_rmsnorm_interleaved_rope_(
+                    x.reshape(-1, x.shape[-1]).clone(),
+                    norm.weight,
+                    rope_cos_sin_cache,
+                    norm.variance_epsilon,
+                    self.dim_head,
+                )
+                for x, norm in qk_norms
+            ]
+
+        def reference():
+            q, k = (
+                norm(x).squeeze(1).unflatten(2, (-1, self.dim_head))
+                for x, norm in qk_norms
+            )
+            q, k = apply_flashinfer_rope_qk_inplace(
+                q, k, rope_cos_sin_cache, is_neox=False
+            )
+            return [x.reshape(-1, x.shape[-2] * x.shape[-1]) for x in (q, k)]
+
+        gate.run(
+            fused,
+            reference,
+            equal=tensors_equal,
+            logger=logger,
+            diagnostic_hint=flashinfer_rmsnorm_diagnostic_hint,
+        )
+        return gate.verified
 
     def _attend_qk_filled(
         self,
@@ -778,35 +814,34 @@ class WanTransformerBlock(nn.Module):
         q2d, k2d = (x.view(-1, x.shape[-1]) for x in (query, key))
         block_cols = rmsnorm_interleaved_rope_block_cols(q2d.shape[-1])
 
-        def fill_all(blocks) -> None:
+        def fill_all(blocks, part: int) -> None:
+            x, norm = ((q2d, self.norm_q), (k2d, self.norm_k))[part]
             tables = self._qk_block_tables(blocks, block_cols, q2d.shape[-1])
             if tables is None:
                 # blocks the kernel cannot address: norm in place, then copy them
-                for x, norm in ((q2d, self.norm_q), (k2d, self.norm_k)):
-                    fused_rmsnorm_interleaved_rope_(
-                        x,
-                        norm.weight,
-                        rope_cos_sin_cache,
-                        norm.variance_epsilon,
-                        self.dim_head,
-                    )
-                for head_start, head_count, q_dst, k_dst in blocks:
-                    cols = slice(
-                        head_start * self.dim_head,
-                        (head_start + head_count) * self.dim_head,
-                    )
-                    q_dst.copy_(q2d[:, cols].view_as(q_dst))
-                    k_dst.copy_(k2d[:, cols].view_as(k_dst))
-                return
-            for x, norm, table in zip((q2d, k2d), (self.norm_q, self.norm_k), tables):
-                fused_rmsnorm_interleaved_rope_into_blocks(
+                fused_rmsnorm_interleaved_rope_(
                     x,
                     norm.weight,
                     rope_cos_sin_cache,
                     norm.variance_epsilon,
                     self.dim_head,
-                    table,
                 )
+                for block in blocks:
+                    head_start, head_count, dst = block[0], block[1], block[2 + part]
+                    cols = slice(
+                        head_start * self.dim_head,
+                        (head_start + head_count) * self.dim_head,
+                    )
+                    dst.copy_(x[:, cols].view_as(dst))
+                return
+            fused_rmsnorm_interleaved_rope_into_blocks(
+                x,
+                norm.weight,
+                rope_cos_sin_cache,
+                norm.variance_epsilon,
+                self.dim_head,
+                tables[part],
+            )
 
         return self.attn1.forward_qk_filled(
             *(
@@ -1388,6 +1423,12 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             eps=config.eps,
             elementwise_affine=False,
             dtype=torch.float32,
+            # norm_out is shared with the VSA block, which has not been validated
+            # with FlyDSL; keep its previous default until that path is tested.
+            rocm_flydsl_high_only=(
+                (get_global_server_args().attention_backend or "").lower()
+                != "video_sparse_attn"
+            ),
         )
         self.proj_out = ColumnParallelLinear(
             inner_dim,

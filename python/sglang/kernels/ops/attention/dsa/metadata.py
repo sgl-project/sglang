@@ -233,6 +233,7 @@ def _fused_dsa_target_verify_metadata_kernel(
     paged_mqa_ctx_lens_stride_1: tl.constexpr,
     bs: tl.constexpr,
     max_seqlen_k,
+    max_splits,
     dsa_index_topk: tl.constexpr,
     physical_page_size: tl.constexpr,
     next_n: tl.constexpr,
@@ -286,13 +287,14 @@ def _fused_dsa_target_verify_metadata_kernel(
             )
         return
 
-    num_col_blocks = tl.cdiv(max_seqlen_k, BLOCK_N)
+    # A bounded number of programs per row walks only its live KV prefix.
+    # Launching one program per max-context block otherwise costs millions of
+    # empty CTAs for short requests in a long-context server. max_splits grows
+    # when there are few rows, so a small batch of long requests keeps the grid busy.
+    num_col_blocks = tl.minimum(tl.cdiv(max_seqlen_k, BLOCK_N), max_splits)
     page_pid = pid - 1
     out_row = page_pid // num_col_blocks
     col_block = page_pid - out_row * num_col_blocks
-    offs_n = col_block * BLOCK_N + tl.arange(0, BLOCK_N)
-    mask = (out_row < expanded_size) & (offs_n < max_seqlen_k)
-
     req_row = out_row // next_n
     req_idx = tl.load(
         req_pool_indices + req_row * req_pool_indices_stride,
@@ -311,34 +313,37 @@ def _fused_dsa_target_verify_metadata_kernel(
         ).to(tl.int32)
         + next_n
     )
-    if col_block * BLOCK_N >= kv_len:
-        return
-    vals = tl.load(
-        req_to_token + req_idx * req_to_token_stride_0 + offs_n * req_to_token_stride_1,
-        mask=mask,
-        other=0,
-    ).to(tl.int32)
-    # Write the wide page_size=1 table only when the caller provides it (see
-    # fused_dsa_decode_metadata for the optional-page_table_1 contract).
-    if HAS_PAGE_TABLE_1:
-        tl.store(
-            page_table_1
-            + out_row.to(tl.int64) * page_table_stride_0
-            + offs_n * page_table_stride_1,
-            vals,
+    for start in range(
+        col_block * BLOCK_N, tl.minimum(kv_len, max_seqlen_k), num_col_blocks * BLOCK_N
+    ):
+        offs_n = start + tl.arange(0, BLOCK_N)
+        mask = (out_row < expanded_size) & (offs_n < max_seqlen_k)
+        vals = tl.load(
+            req_to_token
+            + req_idx * req_to_token_stride_0
+            + offs_n * req_to_token_stride_1,
             mask=mask,
-        )
+            other=0,
+        ).to(tl.int32)
+        if HAS_PAGE_TABLE_1:
+            tl.store(
+                page_table_1
+                + out_row.to(tl.int64) * page_table_stride_0
+                + offs_n * page_table_stride_1,
+                vals,
+                mask=mask,
+            )
 
-    if HAS_REAL_PAGE_TABLE:
-        real_mask = mask & ((offs_n % physical_page_size) == 0)
-        real_cols = offs_n // physical_page_size
-        tl.store(
-            real_page_table
-            + out_row.to(tl.int64) * real_page_table_stride_0
-            + real_cols * real_page_table_stride_1,
-            vals // physical_page_size,
-            mask=real_mask,
-        )
+        if HAS_REAL_PAGE_TABLE:
+            real_mask = mask & ((offs_n % physical_page_size) == 0)
+            real_cols = offs_n // physical_page_size
+            tl.store(
+                real_page_table
+                + out_row.to(tl.int64) * real_page_table_stride_0
+                + real_cols * real_page_table_stride_1,
+                vals // physical_page_size,
+                mask=real_mask,
+            )
 
 
 def fused_dsa_target_verify_metadata(
@@ -404,8 +409,10 @@ def fused_dsa_target_verify_metadata(
     expanded_size = bs * next_n
     block_bs = triton.next_power_of_2(bs)
     block_expanded = triton.next_power_of_2(expanded_size)
-    block_n = 128
-    num_col_blocks = triton.cdiv(max_seqlen_k, block_n)
+    block_n = 512
+    # At least 16 programs per row; with few rows, spread about 8192 programs.
+    max_splits = max(16, triton.cdiv(8192, expanded_size))
+    num_col_blocks = min(triton.cdiv(max_seqlen_k, block_n), max_splits)
     grid = (1 + expanded_size * num_col_blocks,)
 
     _fused_dsa_target_verify_metadata_kernel[grid](
@@ -432,6 +439,7 @@ def fused_dsa_target_verify_metadata(
         paged_mqa_ctx_lens_2d.stride(1) if has_paged_mqa_ctx_lens else 0,
         bs,
         max_seqlen_k,
+        max_splits,
         dsa_index_topk,
         physical_page_size,
         next_n,

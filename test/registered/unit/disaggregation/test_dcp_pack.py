@@ -11,13 +11,43 @@ from sglang.srt.disaggregation.common.dcp_pack import (
     dcp_pack_buffer_bytes,
     init_dcp_pack_buffers,
 )
+from sglang.srt.disaggregation.common.utils import build_dcp_token_transfer_plan
 from sglang.srt.disaggregation.nixl.conn import NixlKVManager, NixlKVSender
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+
+
+def _plan(*, src, dst, page_size, dcp_size, dcp_rank, **kwargs):
+    return build_dcp_token_transfer_plan(
+        np.asarray(src, dtype=np.int32),
+        np.asarray(dst, dtype=np.int32),
+        physical_page_size=page_size,
+        dcp_size=dcp_size,
+        dcp_rank=dcp_rank,
+        **kwargs,
+    )
+
+
+class TestDcpCollapsedDraftPlan(CustomTestCase):
+    def test_collapsed_draft_takes_the_target_rows(self):
+        plan = _plan(
+            src=[5, 2, 11, 4],
+            dst=[7],
+            page_size=2,
+            dcp_size=4,
+            dcp_rank=2,
+            num_kv_tokens=8,
+            draft_rows_collapsed=True,
+        )
+        self.assertEqual(plan.target_src_token_indices.tolist(), [4, 8])
+        self.assertEqual(plan.target_dst_token_indices.tolist(), [14, 15])
+        self.assertEqual(plan.draft_src_token_indices.tolist(), [4, 8])
+        self.assertEqual(plan.draft_dst_token_indices.tolist(), [14, 15])
 
 
 class TestDcpCachedPrefixSend(CustomTestCase):
@@ -31,6 +61,8 @@ class TestDcpCachedPrefixSend(CustomTestCase):
             page_size=page_size,
             gpu_id=0,
             state_types=[StateType.MAMBA],
+            dsa_index_k_token_bytes=None,
+            state_sub_pools=[None],
         )
         mgr._dcp_pack_buffers = None
         mgr._dcp_pack_max_tokens = None
@@ -90,15 +122,16 @@ class TestDcpCachedPrefixSend(CustomTestCase):
                     token_to_kv_pool_allocator=SimpleNamespace(
                         page_size=page_size,
                         translate_kv_indices_for_transfer=lambda x: x,
+                        state_ids=lambda sub_pool: IdSpace(key=(sub_pool, None)),
+                        storage=None,
                     ),
                     req_to_token_pool=SimpleNamespace(
                         req_to_token=torch.arange(total).reshape(1, -1),
                         req_index_to_mamba_index_mapping=torch.tensor([17]),
-                        translate_mamba_indices=lambda x: x,
+                        state_sub_pool="mamba",
                     ),
                     disagg_metadata_buffers=Mock(),
                     disagg_prefill_bootstrap_queue=SimpleNamespace(kv_manager=mgr),
-                    disagg_prefill_pending_chunk_rids=set(),
                 )
                 SchedulerDisaggregationPrefillMixin._send_kv_chunk(
                     scheduler, req, last_chunk=True
@@ -130,6 +163,68 @@ class TestDcpCachedPrefixSend(CustomTestCase):
                 self.assertEqual(int(calls[-1].kwargs["state_indices"][0][0]), 17)
 
 
+class TestHostTensorIndicesEvent(CustomTestCase):
+    def test_indices_event_comes_from_the_scheduler_device_module(self):
+        """The D2H indices event is created and recorded on the scheduler's device.
+
+        A sender that takes host-tensor indices gets a pinned host copy plus an
+        event the transfer worker waits on. Building that event with torch.cuda
+        crashes every non-CUDA prefill scheduler on its first KV send.
+        """
+        page_size, total = 64, 128
+        stream = object()
+
+        class _Event:
+            def record(self, recorded_on):
+                self.recorded_on = recorded_on
+
+        sender = SimpleNamespace(
+            supports_host_tensor_indices=True,
+            kv_mgr=SimpleNamespace(enable_all_cp_ranks_for_transfer=False),
+            get_max_transfer_tokens=lambda: None,
+            should_send_kv_chunk=lambda num_pages, is_last: True,
+            send=Mock(),
+        )
+        req = SimpleNamespace(
+            rid="host-indices",
+            kv=SimpleNamespace(req_pool_idx=0, cache_protected_len=total),
+            skip_radix_cache_insert=False,
+            origin_input_ids=[0] * total,
+            extend_end=total,
+            start_send_idx=0,
+            disagg_decode_prefix_len=0,
+            disagg_kv_sender=sender,
+        )
+        scheduler = SimpleNamespace(
+            enable_staging=False,
+            tree_cache=SimpleNamespace(supports_prefix_sharing=lambda: True),
+            device_module=SimpleNamespace(Event=_Event, current_stream=lambda: stream),
+            token_to_kv_pool_allocator=SimpleNamespace(
+                page_size=page_size,
+                translate_kv_indices_for_transfer=lambda x: x,
+                storage=None,
+            ),
+            req_to_token_pool=SimpleNamespace(
+                req_to_token=torch.arange(total).reshape(1, -1)
+            ),
+        )
+        real_empty = torch.empty
+
+        def empty_unpinned(*args, pin_memory=False, **kwargs):
+            # Pinned host memory needs an accelerator, which the CPU runner lacks.
+            return real_empty(*args, **kwargs)
+
+        with patch("torch.empty", side_effect=empty_unpinned):
+            SchedulerDisaggregationPrefillMixin._send_kv_chunk(
+                scheduler, req, last_chunk=False
+            )
+
+        event = sender.send.call_args.kwargs["indices_event"]
+        self.assertIsInstance(event, _Event)
+        self.assertIs(event.recorded_on, stream)
+        np.testing.assert_array_equal(sender.send.call_args.args[0], [0, 1])
+
+
 class TestDcpPackBufferBytes(CustomTestCase):
     def test_sizes_fixed_regions_for_each_dcp_rank(self):
         self.assertEqual(
@@ -155,7 +250,11 @@ class TestInitDcpPackBuffers(CustomTestCase):
     still get them, not silently fall back."""
 
     _KV_ARGS = SimpleNamespace(
-        kv_item_lens=[64 * 16], page_size=64, num_draft_entries=0, gpu_id=3
+        kv_item_lens=[64 * 16],
+        page_size=64,
+        num_draft_entries=0,
+        gpu_id=3,
+        dsa_index_k_token_bytes=None,
     )
 
     def test_non_triton_device_gets_no_buffers(self):

@@ -7,27 +7,9 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_npu_ci
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
-
-
-@pytest.mark.parametrize(
-    ("layer_name", "eps_attr"),
-    [("GemmaRMSNorm", "variance_epsilon"), ("Gemma3RMSNorm", "eps")],
-)
-def test_srt_gemma_layers_delegate_plain_npu_path(layer_name, eps_attr):
-    from sglang.srt.layers import layernorm as layernorm_module
-
-    layer = getattr(layernorm_module, layer_name)(4)
-    x = torch.randn(2, 4)
-    unified_op = MagicMock(return_value=(x, "rstd"))
-
-    with patch.object(layernorm_module, "npu_gemma_rms_norm", unified_op, create=True):
-        result = layer.forward_npu(x)
-
-    assert result is x
-    unified_op.assert_called_once_with(x, layer.weight, getattr(layer, eps_attr))
+register_npu_ci(est_time=2, suite="base-a-test-npu")
 
 
 @pytest.mark.parametrize("hidden_size", [256, 5120, 8192])

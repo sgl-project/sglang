@@ -35,6 +35,7 @@ from sglang.srt.disaggregation.encoder.server import (
     await_task_completion_on_cancel,
     launch_encoder,
 )
+from sglang.srt.entrypoints.server_utils import set_prometheus_multiproc_dir
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     ProfileReq,
@@ -44,7 +45,7 @@ from sglang.srt.managers.io_struct import (
     sock_send,
     wrap_as_pickle,
 )
-from sglang.srt.managers.schedule_batch import Modality
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.observability.metrics_collector import EncoderMetricsCollector
 from sglang.srt.observability.req_time_stats import EncoderReqTimeStats
 from sglang.srt.observability.trace import (
@@ -59,8 +60,8 @@ from sglang.srt.runtime_context import (
     publish,
 )
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils import configure_logger, random_uuid, set_prometheus_multiproc_dir
-from sglang.srt.utils.common import maybe_reindex_device_id
+from sglang.srt.utils import configure_logger, random_uuid
+from sglang.srt.utils.device import maybe_reindex_device_id
 from sglang.srt.utils.network import NetworkAddress, get_free_port, get_zmq_socket
 
 logger = logging.getLogger(__name__)

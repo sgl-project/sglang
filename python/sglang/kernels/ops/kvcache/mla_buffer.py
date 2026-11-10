@@ -329,6 +329,38 @@ def set_mla_kv_buffer_dcp_sharded_triton(
     )
 
 
+def set_mla_kv_buffer_cast_triton(
+    kv_buffer: torch.Tensor,
+    loc: torch.Tensor,
+    cache_k_nope: torch.Tensor,
+    cache_k_rope: torch.Tensor,
+    *,
+    dcp_world_size: int,
+    dcp_rank: int,
+    reserved_skip_index: int = 0,
+):
+    """Scatter bf16 rows into a lower-precision buffer (raw fp8), casting on
+    store: one kernel instead of a cast per input plus the copy."""
+    nope_dim, rope_dim = cache_k_nope.shape[-1], cache_k_rope.shape[-1]
+    pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
+    set_mla_kv_buffer_kernel[(loc.numel(), 1)](
+        kv_buffer,
+        cache_k_nope,
+        cache_k_rope,
+        loc,
+        reserved_skip_index,
+        kv_buffer.stride(0),
+        cache_k_nope.stride(0),
+        cache_k_rope.stride(0),
+        nope_dim,
+        rope_dim,
+        BLOCK=triton.next_power_of_2(nope_dim + rope_dim),
+        DCP_RANK=dcp_rank,
+        DCP_WORLD_SIZE=dcp_world_size,
+        **pdl_kwargs,
+    )
+
+
 @triton.jit
 def set_mla_kv_buffer_fp8_quant_kernel(
     kv_buffer_fp8_ptr,
@@ -342,6 +374,8 @@ def set_mla_kv_buffer_fp8_quant_kernel(
     nope_dim: tl.constexpr,
     rope_dim: tl.constexpr,
     BLOCK: tl.constexpr,
+    DCP_RANK: tl.constexpr = 0,
+    DCP_WORLD_SIZE: tl.constexpr = 1,
     USE_GDC: tl.constexpr = False,
 ):
     """Fuse BF16/FP16->FP8 cast with paged KV write."""
@@ -357,8 +391,9 @@ def set_mla_kv_buffer_fp8_quant_kernel(
         tl.extra.cuda.gdc_wait()
 
     loc = tl.load(loc_ptr + pid_loc).to(tl.int64)
-    is_valid = loc != reserved_skip_index
+    is_valid = (loc != reserved_skip_index) & (loc % DCP_WORLD_SIZE == DCP_RANK)
     safe_loc = tl.where(is_valid, loc, 0)
+    safe_loc = safe_loc // DCP_WORLD_SIZE
     dst_ptr = kv_buffer_fp8_ptr + safe_loc * buffer_stride + offs
 
     if base + BLOCK <= nope_dim:
@@ -403,10 +438,14 @@ def set_mla_kv_buffer_triton_fp8_quant(
     fp8_dtype: torch.dtype,
     *,
     reserved_skip_index: int = 0,
+    dcp_world_size: int = 1,
+    dcp_rank: int = 0,
 ):
     """Fuse BF16/FP16 MLA K quantization with paged KV write.
 
     Writes targeting ``reserved_skip_index`` are skipped. Pass -1 to disable.
+    With ``dcp_world_size > 1`` the locs are DCP-widened: only this rank's slots
+    are written, at row ``loc // dcp_world_size``.
     """
     kv_buffer_fp8 = kv_buffer.view(fp8_dtype)
 
@@ -431,6 +470,8 @@ def set_mla_kv_buffer_triton_fp8_quant(
         nope_dim,
         rope_dim,
         BLOCK=BLOCK,
+        DCP_RANK=dcp_rank,
+        DCP_WORLD_SIZE=dcp_world_size,
         **pdl_kwargs,
     )
 
