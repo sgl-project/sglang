@@ -1,6 +1,6 @@
 ---
 title: K2 Horizon
-description: "Deploy the IFM K2 Horizon family with SGLang — BF16 recipes on NVIDIA H200 GPUs and 0.9B/3.7B/7B recipes on Intel Xeon CPUs."
+description: "Deploy the IFM K2 Horizon family with SGLang — BF16 recipes on NVIDIA H200 GPUs and 0.9B/3.7B/7B/32B recipes on Intel Xeon CPUs."
 tag: NEW
 ---
 
@@ -23,7 +23,7 @@ For general source-install guidance, see [Install → Method 2: From source](/do
 
 Choose hardware and a model size to generate its single-node launch command. The serving settings in all six H200 recipes completed two independent H200 benchmark launches at the pinned model revisions using the K2 Horizon runtime support in [PR #37654](https://github.com/sgl-project/sglang/pull/37654).
 
-The **XEON** recipes cover `IFM/K2-Horizon-0.9B`, `IFM/K2-Horizon-3.7B`, and `IFM/K2-Horizon-7B`. Basic chat generation passed on Intel Xeon CPUs (6972P, TP6) with unmodified SGLang revisions `ad6ca42dea36ffad53fa033dab400f40ffa677f7` (0.9B) and `99fd01047d67bb249641a8e50282a1a5218afc63` (3.7B and 7B). Each recipe pins its tested checkpoint and a bounded cache: 4,096 tokens for 0.9B and 8,192 for 3.7B and 7B. Full-context capacity, dataset accuracy, and performance were not evaluated on CPU. Use an installed SGLang CPU environment with its OpenMP and allocator setup.
+The **XEON** recipes cover `IFM/K2-Horizon-0.9B`, `IFM/K2-Horizon-3.7B`, `IFM/K2-Horizon-7B`, and `IFM/K2-Horizon-32B`. Basic chat generation passed on Intel Xeon CPUs (6972P, TP6) with unmodified SGLang revisions `ad6ca42dea36ffad53fa033dab400f40ffa677f7` (0.9B) and `99fd01047d67bb249641a8e50282a1a5218afc63` (3.7B, 7B and 32B). Each recipe pins its tested checkpoint and a bounded cache: 4,096 tokens for 0.9B and 8,192 for the other three sizes. Full-context capacity, dataset accuracy, and performance were not evaluated on CPU. Use an installed SGLang CPU environment with its OpenMP and allocator setup.
 
 import { Deployment } from "/src/snippets/_deployment.jsx";
 import { config }     from "/src/snippets/configs/IFM/k2-horizon.jsx";
@@ -108,7 +108,7 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 ## 2. Configuration tips
 
-- **Hardware and precision:** The matrix covers NVIDIA H200 GPUs and Intel Xeon CPUs with BF16 checkpoints. Xeon is limited to the validated 0.9B, 3.7B, and 7B checkpoints.
+- **Hardware and precision:** The matrix covers NVIDIA H200 GPUs and Intel Xeon CPUs with BF16 checkpoints. Xeon is limited to the validated 0.9B, 3.7B, 7B and 32B checkpoints.
 - **Parallelism:** On H200, use TP1 for 0.9B, 3.7B, and 7B; TP2 for 32B and MoVA-36B-A4B; and TP8 for 375B-A23B. Xeon uses TP6. Each recipe stays within one node.
 - **Attention:** The H200 recipes select FlashAttention-3 with `--attention-backend fa3`; Xeon uses the native CPU backend.
 - **Revisions:** The recipes pin revisions `6fbc54f7e4dc9d9cd671351f51498a1958dd2a01` (0.9B), `fe504ef19c7efa3120a9352bcfa180aa133946de` (3.7B), `85d46bbaf6ecd844a8ef61991f6e492d4faf4179` (7B), `eff3d24a3a40360c6fd1a1dd5723ce6329d93484` (32B), `e5c131d4d0ae196f5041284a0f9262d713083901` (MoVA-36B-A4B), and `70d7c58c1f8a2fc523c861c2cf7d2d339d7a8a0c` (375B-A23B).
