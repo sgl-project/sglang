@@ -14,7 +14,12 @@ from sglang.test.test_utils import find_available_port
 
 
 class MooncakeTestServices:
-    """Lifecycle for a local Mooncake master and external storage client."""
+    """Lifecycle for a local Mooncake master and external storage client.
+
+    With ``p2p_handshake``, servers exchange engine metadata by P2P handshake
+    and provide the store segments themselves, as when no metadata service is
+    deployed. Only the master runs then.
+    """
 
     def __init__(
         self,
@@ -23,8 +28,10 @@ class MooncakeTestServices:
         store_segment_size: int = 4 * 1024**3,
         device: str | None = None,
         local_hostname: str | None = None,
+        p2p_handshake: bool = False,
     ):
         self.protocol = protocol
+        self.p2p_handshake = p2p_handshake
         self.store_segment_size = store_segment_size
         self.device = device if device is not None else self._default_device(protocol)
         self.local_hostname = local_hostname or socket.gethostbyname(
@@ -52,18 +59,19 @@ class MooncakeTestServices:
         return ""
 
     def start(self):
-        self.metadata_process = self._launch(
-            "metadata service",
-            [
-                "python3",
-                "-m",
-                "mooncake.http_metadata_server",
-                "--host",
-                "127.0.0.1",
-                "--port",
-                str(self.metadata_port),
-            ],
-        )
+        if not self.p2p_handshake:
+            self.metadata_process = self._launch(
+                "metadata service",
+                [
+                    "python3",
+                    "-m",
+                    "mooncake.http_metadata_server",
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    str(self.metadata_port),
+                ],
+            )
         try:
             self.master_process = self._launch(
                 "master service",
@@ -76,6 +84,8 @@ class MooncakeTestServices:
                 ],
             )
             self._wait_for_core_services()
+            if self.p2p_handshake:
+                return
             self.store_process = self._launch(
                 "store service",
                 [
@@ -106,16 +116,20 @@ class MooncakeTestServices:
             setattr(self, name, None)
 
     def server_env(self) -> dict[str, str]:
+        if self.p2p_handshake:
+            metadata_server = "P2PHANDSHAKE"
+            global_segment_size = str(self.store_segment_size)
+        else:
+            metadata_server = f"http://127.0.0.1:{self.metadata_port}/metadata"
+            global_segment_size = "0"
         return {
             "MOONCAKE_MASTER": f"127.0.0.1:{self.master_port}",
             "MOONCAKE_PROTOCOL": self.protocol,
             "MC_MS_AUTO_DISC": "0",
             "MOONCAKE_DEVICE": self.device,
             "MOONCAKE_LOCAL_HOSTNAME": self.local_hostname,
-            "MOONCAKE_TE_META_DATA_SERVER": (
-                f"http://127.0.0.1:{self.metadata_port}/metadata"
-            ),
-            "MOONCAKE_GLOBAL_SEGMENT_SIZE": "0",
+            "MOONCAKE_TE_META_DATA_SERVER": metadata_server,
+            "MOONCAKE_GLOBAL_SEGMENT_SIZE": global_segment_size,
         }
 
     def master_metric(self, name: str) -> float:
@@ -148,13 +162,15 @@ class MooncakeTestServices:
         deadline = time.monotonic() + timeout
         master_ready_at = time.monotonic() + 3
         while time.monotonic() < deadline:
-            self._raise_if_exited(self.metadata_process, "metadata service")
+            if self.metadata_process is not None:
+                self._raise_if_exited(self.metadata_process, "metadata service")
             self._raise_if_exited(self.master_process, "master service")
             try:
-                requests.get(
-                    f"http://127.0.0.1:{self.metadata_port}/metadata",
-                    timeout=2,
-                )
+                if self.metadata_process is not None:
+                    requests.get(
+                        f"http://127.0.0.1:{self.metadata_port}/metadata",
+                        timeout=2,
+                    )
                 if time.monotonic() >= master_ready_at:
                     return
             except requests.RequestException:

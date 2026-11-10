@@ -23,7 +23,7 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
 )
 from sglang.test.test_utils import is_in_ci, unified_radix_tree_server_env
 
-register_cuda_ci(est_time=300, stage="extra-b", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=480, stage="extra-b", runner_config="4-gpu-h100")
 
 MODEL = "yujiepan/kimi-linear-tiny-random"
 TRACK_INTERVAL = 128
@@ -52,17 +52,26 @@ SERVER_ARGS = [
 class TestDisaggregationDecodeRadixLinker(PDDisaggregationServerBase):
     extra_prefill_args = SERVER_ARGS
     extra_decode_args = [*SERVER_ARGS, "--disaggregation-decode-enable-radix-cache"]
+    mooncake_p2p_handshake = False
 
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
         cls.model = MODEL
-        cls.mooncake = MooncakeTestServices(protocol="rdma" if is_in_ci() else "tcp")
+        cls.mooncake = MooncakeTestServices(
+            protocol="rdma" if is_in_ci() else "tcp",
+            p2p_handshake=cls.mooncake_p2p_handshake,
+        )
         cls.mooncake.start()
-        env = unified_radix_tree_server_env("python", **cls.mooncake.server_env())
-        cls.extra_prefill_env = env
-        cls.extra_decode_env = env
+        cls.extra_prefill_env = cls._server_env(range(cls.prefill_tp_size))
+        cls.extra_decode_env = cls._server_env(
+            range(cls.decode_base_gpu_id, cls.decode_base_gpu_id + cls.decode_tp_size)
+        )
         cls.launch_all()
+
+    @classmethod
+    def _server_env(cls, gpu_indices) -> dict[str, str]:
+        return unified_radix_tree_server_env("python", **cls.mooncake.server_env())
 
     @classmethod
     def tearDownClass(cls):
@@ -118,6 +127,40 @@ class TestDisaggregationDecodeRadixLinker(PDDisaggregationServerBase):
                 history.extend(suffixes[round_idx])
                 time.sleep(2)
                 self._flush_device_caches()
+
+
+class TestDisaggregationDecodeRadixLinkerSharedEngine(
+    TestDisaggregationDecodeRadixLinker
+):
+    """The same flow with each store running on its server's PD transfer engine.
+
+    With the default P2P handshake and the PD IB device named for the store too,
+    as RDMA deployments configure it, the store reuses the PD transfer engine,
+    so the linker and PD transfer register the same GPU KV memory on it.
+    """
+
+    mooncake_p2p_handshake = True
+    capture_per_side_logs = True
+
+    @classmethod
+    def _server_env(cls, gpu_indices) -> dict[str, str]:
+        env = super()._server_env(gpu_indices)
+        ib_device_args = cls.rdma_devices_for(gpu_indices)
+        if ib_device_args:
+            env["MOONCAKE_DEVICE"] = ib_device_args[1]
+        return env
+
+    @unittest.skipUnless(is_in_ci(), "the store reuses the PD engine only over RDMA")
+    def test_stores_reuse_pd_transfer_engine(self):
+        for side, stdout, stderr in (
+            ("prefill", self._prefill_stdout_buf, self._prefill_stderr_buf),
+            ("decode", self._decode_stdout_buf, self._decode_stderr_buf),
+        ):
+            self.assertIn(
+                "Reuse initialized mooncake transfer engine",
+                stdout.getvalue() + stderr.getvalue(),
+                f"{side} store did not run on the PD transfer engine",
+            )
 
 
 if __name__ == "__main__":

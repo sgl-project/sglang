@@ -30,6 +30,7 @@ from sglang.srt.disaggregation.encoder.server import (
     meta_registry,
 )
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
+    MooncakeMemoryRegistry,
     MooncakeTransferEngine,
 )
 from sglang.srt.managers.io_struct import unwrap_from_pickle
@@ -661,17 +662,20 @@ class TestMooncakeRegistration(CustomTestCase):
     def setUp(self):
         self.engine = MooncakeTransferEngine.__new__(MooncakeTransferEngine)
         self.engine.engine = unittest.mock.Mock()
+        self.engine.memory_registry = MooncakeMemoryRegistry(self.engine.engine)
         self.engine.ib_device = "mlx5_0"
 
     def test_register_raises_on_nonzero_status(self):
-        self.engine.engine.register_memory.return_value = -1
+        self.engine.engine.batch_register_memory.return_value = -1
 
         with self.assertRaisesRegex(RuntimeError, "registration failed.*ret=-1"):
             self.engine.register(1234, 4096)
 
     def test_deregister_preserves_backend_failure(self):
+        self.engine.engine.batch_register_memory.return_value = 0
+        self.engine.register(1234, 4096)
         backend_error = OSError("backend failed")
-        self.engine.engine.unregister_memory.side_effect = backend_error
+        self.engine.engine.batch_unregister_memory.side_effect = backend_error
 
         with self.assertRaisesRegex(RuntimeError, "deregistration failed") as ctx:
             self.engine.deregister(1234)
@@ -684,11 +688,21 @@ class TestMooncakeRegistration(CustomTestCase):
         with self.assertRaises(RuntimeError):
             self.engine.batch_register([0x10000], [0x1000])
 
-    def test_batch_register_tolerates_already_registered(self):
+    def test_batch_register_rejects_untracked_overlap(self):
         self.engine.engine.batch_register_memory.return_value = -7
 
-        with self.assertLogs(level="ERROR"):
+        with self.assertRaisesRegex(RuntimeError, "registration failed.*ret=-7"):
             self.engine.batch_register([0x10000], [0x1000])
+
+    def test_batch_register_shares_already_registered_region(self):
+        self.engine.engine.batch_register_memory.return_value = 0
+
+        self.engine.batch_register([0x10000], [0x1000])
+        self.engine.batch_register([0x10000], [0x1000])
+
+        self.engine.engine.batch_register_memory.assert_called_once_with(
+            [0x10000], [0x1000]
+        )
 
 
 if __name__ == "__main__":

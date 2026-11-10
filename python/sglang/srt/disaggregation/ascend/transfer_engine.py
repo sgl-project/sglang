@@ -92,6 +92,15 @@ class AscendTransferEngine(MooncakeTransferEngine):
         if ret_value != 0:
             logger.debug(f"Ascend memory registration for ptr {ptrs} failed.")
 
+    def batch_deregister(self, ptrs: List[int]):
+        try:
+            ret_value = self.engine.batch_unregister_memory(ptrs)
+        except Exception:
+            # Mark deregister as failed
+            ret_value = -1
+        if ret_value != 0:
+            logger.debug(f"Ascend memory deregistration for ptr {ptrs} failed.")
+
     @staticmethod
     def _get_transfer_protocol() -> str:
         protocol = os.getenv("ASCEND_MF_TRANSFER_PROTOCOL")

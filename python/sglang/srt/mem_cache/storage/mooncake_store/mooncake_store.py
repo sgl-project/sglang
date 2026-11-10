@@ -286,6 +286,8 @@ class MooncakeBaseStore:
     def __init__(self):
         self.store = None
         self.config = None
+        # The transfer engine shared with other components, when the store runs on it.
+        self._shared_mooncake_transfer_engine = None
 
     def _import_mooncake_store(self):
         try:
@@ -347,19 +349,26 @@ class MooncakeBaseStore:
         return config
 
     def register_buffer(self, tensor: torch.Tensor):
-        if self.store is None:
-            raise RuntimeError("Mooncake store is not initialized.")
-        ptr = tensor.data_ptr()
         size = tensor.numel() * tensor.element_size()
         if size == 0:
             # conv-only models have a 0-element ssm state; nothing to register
             return
+        self.register_memory(tensor.data_ptr(), size)
+
+    def register_memory(self, ptr: int, size: int) -> None:
+        if self.store is None:
+            raise RuntimeError("Mooncake store is not initialized.")
         ret_code = self.store.register_buffer(ptr, size)
         if ret_code != 0:
             logger.error(f"Failed to register buffer, error code: {ret_code}")
             raise RuntimeError(
                 f"Failed to register buffer to Mooncake Store, error code: {ret_code}"
             )
+        # Other users of the shared engine may need the same region, e.g. PD
+        # transfer of the GPU KV pool the linker registered.
+        shared_engine = self._shared_mooncake_transfer_engine
+        if shared_engine is not None:
+            shared_engine.memory_registry.adopt_store_registration(ptr, size)
 
     @cached_property
     def _has_request_context_support(self) -> bool:
@@ -609,28 +618,24 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                         get_mooncake_transfer_engine,
                     )
 
-                    self._shared_mooncake_transfer_engine = (
-                        get_mooncake_transfer_engine()
-                    )
+                    shared_engine = get_mooncake_transfer_engine()
                 except Exception:
-                    self._shared_mooncake_transfer_engine = None
+                    shared_engine = None
                     logger.debug("Failed to reuse initialized mooncake transfer engine")
 
                 # Only reuse the shared MooncakeTransferEngine when its
                 # configuration matches the one used by MooncakeStore.
                 if (
-                    self._shared_mooncake_transfer_engine is not None
-                    and device_name
-                    == self._shared_mooncake_transfer_engine.get_ib_device()
+                    shared_engine is not None
+                    and device_name == shared_engine.get_ib_device()
                     and self.config.metadata_server == "P2PHANDSHAKE"
                     and self.config.protocol == "rdma"
                 ):
-                    client_hostname = (
-                        self._shared_mooncake_transfer_engine.get_session_id()
-                    )
-                    transfer_engine = self._shared_mooncake_transfer_engine.get_engine()
+                    self._shared_mooncake_transfer_engine = shared_engine
+                    client_hostname = shared_engine.get_session_id()
+                    transfer_engine = shared_engine.get_engine()
                     logger.info(
-                        f"Reuse initialized mooncake transfer engine: {self._shared_mooncake_transfer_engine}"
+                        f"Reuse initialized mooncake transfer engine: {shared_engine}"
                     )
                 else:
                     client_hostname = self.config.local_hostname
