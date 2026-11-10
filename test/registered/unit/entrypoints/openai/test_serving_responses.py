@@ -1708,19 +1708,18 @@ class ChatEncodingAdapterDispatchTestCase(CustomTestCase):
                 reasoning_parser="inkling",
                 tool_call_parser="inkling",
                 chat_hooks=self._hooks(),
-                hf_config=None,
+                hf_config=SimpleNamespace(model_type="kimi_k3"),
                 model_path="model",
                 revision=None,
             )
 
         with patch.dict(sys.modules, {"tml_renderers": None}):
-            for encoding in ("kimi_k3", "dsv32"):
-                with self.subTest(encoding=encoding):
-                    self.assertIsNone(
-                        chat_encoding_adapters.build_chat_encoding_adapter(
-                            ctx(encoding)
-                        )
-                    )
+            self.assertIsNone(
+                chat_encoding_adapters.build_chat_encoding_adapter(ctx("dsv32"))
+            )
+            self.assertIsNotNone(
+                chat_encoding_adapters.build_chat_encoding_adapter(ctx("kimi_k3"))
+            )
             with self.assertRaises(ImportError):
                 chat_encoding_adapters.build_chat_encoding_adapter(ctx("inkling"))
 
