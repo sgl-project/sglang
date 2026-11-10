@@ -7,18 +7,23 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
-from diffusers.utils import logging
 
+from sglang.kernels.ops.diffusion import (
+    BitExactFusionGate,
+    aten_rms_norm_rocm,
+    can_use_aten_rms_norm_rocm,
+)
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 from .vit_utils import apply_rotary_pos_emb_qk
 
-logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
+logger = init_logger(__name__)
 _FORCE_ROCM_MATH_SDPA = current_platform.is_rocm() and "gfx95" in str(
     torch.cuda.get_device_properties(0).gcnArchName
 )
@@ -76,6 +81,13 @@ def _sdpa_attention(query, key, value):
     return out.transpose(1, 2)
 
 
+# ROCm runs these affine-free per-head RMSNorms one 256-thread block per
+# 64-wide row after a contiguous copy; the Triton replica gives the same bytes
+_ROCM_QK_RMS_NORM = BitExactFusionGate(
+    "H3 VAE qk RMSNorm (ROCm aten replica)", per_signature=True
+)
+
+
 def _vit_norm_input(module, hidden_states):
     if envs.MINIMAX_H3_VAE_DECODER_VIT_FP32_NORM:
         return hidden_states.float()
@@ -97,8 +109,23 @@ def _apply_qk_norm(module, hidden_states):
         # CUDA LayerNorm/RMSNorm accumulates half/bfloat16 inputs in FP32.
         # With no affine parameters its half output is bit-identical to the
         # released FP32-norm-then-cast recipe, without two full-tensor casts.
-        with torch.autocast("cuda", enabled=False):
-            return module(hidden_states)
+        def eager():
+            with torch.autocast("cuda", enabled=False):
+                return module(hidden_states)
+
+        if isinstance(module, nn.RMSNorm) and can_use_aten_rms_norm_rocm(hidden_states):
+            sig = (hidden_states.shape[-1], hidden_states.dtype)
+            if _ROCM_QK_RMS_NORM.can_attempt(sig):
+                eps = module.eps
+                if eps is None:
+                    eps = torch.finfo(hidden_states.dtype).eps
+                return _ROCM_QK_RMS_NORM.run(
+                    lambda: aten_rms_norm_rocm(hidden_states, eps),
+                    eager,
+                    sig=sig,
+                    logger=logger,
+                )
+        return eager()
     return module(_vit_norm_input(module, hidden_states)).to(hidden_states.dtype)
 
 

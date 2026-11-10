@@ -208,6 +208,12 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset], ...] = (
         _CUDA,
     ),
     (
+        "diffusion.aten_rms_norm_rocm",
+        KernelBackend.TRITON,
+        "norm.aten_rms_norm_rocm_triton:aten_rms_norm_rocm",
+        _HIP,
+    ),
+    (
         "diffusion.aten_head_rmsnorm",
         KernelBackend.TRITON,
         "norm.aten_head_rmsnorm_triton:aten_head_rmsnorm",
@@ -758,6 +764,8 @@ _EXPORTS: dict[str, str] = {
     "can_use_qk_rmsnorm_native": "norm.zimage_qk_rmsnorm_triton",
     "zimage_qk_rmsnorm_native": "norm.zimage_qk_rmsnorm_triton",
     "aten_head_rmsnorm": "norm.aten_head_rmsnorm_triton",
+    "aten_rms_norm_rocm": "norm.aten_rms_norm_rocm_triton",
+    "can_use_aten_rms_norm_rocm": "norm.aten_rms_norm_rocm_triton",
     "can_use_aten_head_rmsnorm": "norm.aten_head_rmsnorm_triton",
     "can_use_aten_head_rmsnorm_rope": "norm.aten_head_rmsnorm_triton",
     "can_use_rmsnorm_scale_shift_per_token": "norm.rmsnorm_scale_shift_triton",

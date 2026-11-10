@@ -426,3 +426,23 @@ def test_fused_decoder_is_disabled_off_nvidia():
     ):
         decoder(latent)
     scale_add.assert_not_called()
+
+
+@pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm aten replica")
+@pytest.mark.parametrize("width", [64, 128, 256])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_rocm_qk_rms_norm_replays_aten(width, dtype):
+    """Strided per-head rows of a fused qkv normalize to aten's RMSNorm bytes,
+    and the VAE's qk norm returns them through the gate."""
+    from sglang.kernels.ops.diffusion import aten_rms_norm_rocm
+
+    torch.manual_seed(0)
+    qkv = torch.randn(1, 777, 8, 3 * width, device="cuda") * 3
+    qkv = (qkv + torch.randn(1, 777, 8, 1, device="cuda")).to(dtype)
+    q = qkv[..., :width]
+    ref = nn.functional.rms_norm(q, (width,), eps=1e-5)
+    assert torch.equal(aten_rms_norm_rocm(q, 1e-5), ref)
+
+    norm = nn.RMSNorm(width, eps=1e-5, elementwise_affine=False)
+    with torch.inference_mode():
+        assert torch.equal(_apply_qk_norm(norm, q), ref)
