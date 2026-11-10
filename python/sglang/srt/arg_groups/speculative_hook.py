@@ -1062,9 +1062,8 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
 
 
 def _resolve_dflash_mla_draft_window(server_args: ServerArgs) -> None:
-    """Keep the compact draft table (``--speculative-draft-window-size``) off
-    the MLA-only draft backends where it cannot be read; see
-    ``resolve_mla_draft_compact_window``. Runs after the draft backend is final."""
+    """Drop or reject ``--speculative-draft-window-size`` on the MLA-only draft
+    backends. Runs after the draft backend is final."""
     from sglang.srt.speculative.dflash_utils import (
         is_dflash_mla_draft_config,
         resolve_mla_draft_compact_window,

@@ -488,20 +488,11 @@ class DFlashAttention(nn.Module):
 
 
 class DFlashMLAAttention(DeepseekV2AttentionMLA):
-    """SpecForge MLA draft attention served by the target's absorbed MLA path.
-
-    SpecForge exports DeepSeek's MLA parameter names and RoPE conventions, so
-    only the DFlash layer causality, context-KV writes and loading differ.
-    """
-
     def __init__(
         self, config, layer_id: int, quant_config=None, prefix: str = ""
     ) -> None:
         if quant_config is not None:
             raise ValueError("DFLASH mla drafts require unquantized draft weights.")
-        # Under DCP the draft pool keeps DCP owner rows like the target's
-        # (draft_loc_space_scale is 1), so the layer runs the target's DCP
-        # decode path: gathered q, rank-local KV, LSE merge.
         sliding_window_size, attn_type = _get_dflash_layer_attention_params(
             config, layer_id
         )

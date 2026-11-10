@@ -1446,8 +1446,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     def _window_sparse_indices(
         self, layer: RadixAttention, forward_batch: ForwardBatch
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """This rank's window indices / counts for every query row; built once
-        per forward and reused by the following sliding layers (one window)."""
+        """This rank's window indices and counts per query row, shared by the
+        sliding layers of one forward."""
         cache = self._window_index_cache
         if (
             cache is not None
@@ -1478,11 +1478,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         forward_batch: ForwardBatch,
         metadata: TRTLLMMLADecodeMetadata,
     ):
-        """A sliding-window layer of a dense ``[bs, q_len]`` query window:
-        each row (position p) attends [p - sliding_window_size, p] through
-        trtllm-gen sparse MLA over its own index list. Under DCP the lists hold
-        this rank's keys and the rank-local (out, lse) goes to the caller's
-        merge, like the dense DCP path."""
+        """Row p attends [p - sliding_window_size, p] via trtllm-gen sparse MLA;
+        under DCP returns the rank-local (out, lse) for the caller's merge."""
         from sglang.srt.layers.attention.dsa.dsa_dcp import (
             dcp_trtllm_sparse_attention,
         )
@@ -1493,9 +1490,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         bs, q_len, heads, head_dim = q.shape
         rows = bs * q_len
         if get_in_autotune_dummy_run():
-            # The autotune dummy discards attention, and its synthetic metadata
-            # overflows the trtllm-gen workspace for full-head windows (no DCP),
-            # as for the DCP decode.
+            # Autotune discards attention; its metadata overflows the workspace.
             out, lse = self._dummy_dcp_decode_for_autotune(
                 q.reshape(rows, heads, head_dim), layer
             )

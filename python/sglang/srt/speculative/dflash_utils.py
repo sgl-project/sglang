@@ -609,26 +609,9 @@ def resolve_mla_draft_compact_window(
     dcp_size: int,
 ) -> Optional[int]:
     """The ``--speculative-draft-window-size`` an MLA draft keeps on trtllm_mla
-    or cutedsl_mla, or None to serve the draft without the compact table.
-
-    These backends read the draft's ``req_to_token`` rows as the target lays
-    them out, by absolute position: a sliding_attention layer lists each query
-    row's window keys at positions ``[p - window_left, p]``
-    (``mla_window_sparse_indices``), and under DCP the page table walks pages of
-    ``page_size * dcp_size`` positions from position 0
-    (``create_mla_kv_page_table_for_dcp``). The compact draft table holds the
-    window starting at row 0 instead, so neither path can read it.
-
-    - Every layer slides and the compact window covers each query row's window
-      (``window_left <= window_size``): the compact table changes nothing the
-      draft attends to, so it is dropped. Triton over the compact table and the
-      native window over the full table both attend ``[p - window_left, p]``.
-    - A native window wider than the compact one: rejected.
-    - Mixed full and sliding layers: the compact table narrows the full layers,
-      which these backends cannot reproduce, so this is rejected.
-    - No sliding layer: the compact table works without DCP (its rows start on
-      a page boundary) and is kept; under DCP it is rejected.
-    """
+    or cutedsl_mla, or None to drop it. These backends read ``req_to_token`` by
+    absolute position, so the compact draft table is kept only where it reads
+    the same keys; otherwise this raises."""
     if window_size is None:
         return None
     layer_types = get_dflash_layer_types(draft_hf_config)
