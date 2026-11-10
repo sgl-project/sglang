@@ -126,10 +126,11 @@ def test_factorized_tree_raw_factor_commit_matches_serial_selected_state(
     num_query_heads = num_value_heads = 4
     key_dim = value_dim = 32
 
-    # Exercise a full B16 accept path when the width permits it, with unrelated
-    # branches hanging from different ancestors of that path.
-    parent_values = [-1] + [
-        node - 1 if node < 16 else (node - 16) % 15 for node in range(1, width)
+    # Accept up to 16 nodes on a path that skips node 1, branching off its ancestors.
+    path = [0, *range(2, min(width, 17))]
+    parent_values = [-1, 0] + [
+        path[path.index(node) - 1] if node in path else path[(node - 17) % 15]
+        for node in range(2, width)
     ]
     parents = torch.tensor(
         [parent_values[:width]] * batch_size, dtype=torch.int32, device=device
@@ -262,7 +263,6 @@ def test_factorized_tree_raw_factor_commit_matches_serial_selected_state(
         assert not torch.isnan(tree_g[factor_slot, :, :width]).any()
         assert not torch.isnan(tree_beta[factor_slot, :, :width]).any()
 
-    path = list(range(min(width, 16)))
     # Unrelated candidates must not affect this path, even if their raw commit
     # entries are subsequently poisoned. Keep every ancestor on the path intact.
     reject_nodes = torch.tensor(
