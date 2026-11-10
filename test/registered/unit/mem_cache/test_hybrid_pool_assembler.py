@@ -1614,7 +1614,7 @@ class TestFusedDraftHiCacheValidation(CustomTestCase):
                 placement = FusedDraftPlacement.from_counts(
                     counts={host: [1]},
                     regions={host: region},
-                    hosted={"window": "swa"} if host == "window" else None,
+                    hosted=None,
                 )
                 bundle = _build_unified_swa_pool(fused_draft=placement)
                 draft = DraftMHAView(
@@ -2049,9 +2049,9 @@ class TestMambaSwaStackMatchesOtherStacks(CustomTestCase):
 
 
 class TestHostLoadEvictsTheTargetWindowOnly(CustomTestCase):
-    """A host load of the target window evicts only the target's shortfall,
-    from the target's entries: a fused draft's own window, which a target
-    load never writes, keeps its entries."""
+    """A host load of the target window evicts only the target's shortfall:
+    its demand names the target alone, so a fused draft's own window, which a
+    target load never writes, keeps its entries."""
 
     def test_a_short_target_beside_a_draft_window(self):
         evicted = []
@@ -2061,6 +2061,7 @@ class TestHostLoadEvictsTheTargetWindowOnly(CustomTestCase):
                     primary_window=lambda: SimpleNamespace(name="window_4096")
                 )
             ),
+            target_window_pool=lambda: "window_4096",
             swa_available_size=lambda: 10,
             window_pool_names=lambda: ("window_4096", "window_128"),
         )
@@ -2069,11 +2070,9 @@ class TestHostLoadEvictsTheTargetWindowOnly(CustomTestCase):
             evict_for_alloc=lambda params: evicted.append(params),
         )
         hybrid_pool_assembler._evict_swa_for_device_alloc(cache, 16)
+        # The cache measures the shortfall on the target's own room.
         self.assertEqual(len(evicted), 1)
-        self.assertEqual(evicted[0].window_num_tokens, {"window_4096": 6})
-        evicted.clear()
-        hybrid_pool_assembler._evict_swa_for_device_alloc(cache, 10)
-        self.assertEqual(evicted, [])
+        self.assertEqual(evicted[0].window_tokens, {"window_4096": 16})
 
 
 if __name__ == "__main__":
