@@ -3436,7 +3436,7 @@ class KVCacheConfigurator:
         stage_per_req = int(per_req * pp_layer_scale)
 
         has_spec_dec = not self.spec_algorithm.is_none()
-        ubtree_factorized = use_ubtree_factorized_kda(
+        ubtree_factorized = has_spec_dec and use_ubtree_factorized_kda(
             enabled=(
                 get_spec().speculative_algorithm == "UBTREE"
                 and not self.is_draft_worker
