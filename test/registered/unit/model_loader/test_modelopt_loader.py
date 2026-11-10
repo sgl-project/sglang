@@ -30,6 +30,7 @@ from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp4LinearMethod,
     ModelOptFp8Config,
+    ModelOptFp8LinearMethod,
     ModelOptMixedPrecisionConfig,
     ModelOptNvFp4A16LinearMethod,
 )
@@ -42,7 +43,9 @@ from sglang.srt.model_loader.weight_utils import (
     _modelopt_quant_section,
     get_quant_config,
 )
+from sglang.srt.models.llama import LlamaForCausalLM
 from sglang.srt.models.minimax_m3 import MiniMaxM3SparseForCausalLM
+from sglang.srt.models.mistral import Mistral3ForConditionalGeneration
 from sglang.srt.models.muse_glimmer import MuseGlimmerForConditionalGeneration
 from sglang.srt.models.nano_nemotron_vl import NemotronH_Omni_Reasoning_V3
 from sglang.srt.models.utils import WeightsMapper
@@ -413,6 +416,50 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
             ),
             "FP8",
         )
+
+    def test_llama_family_mixed_precision_resolves_fused_projections(self):
+        # nvidia/Mistral-Medium-3.5-128B-NVFP4 lists q/k/v and gate/up per layer
+        # (FP8 attention; FP8 MLPs in layers 0-3, NVFP4 from layer 4) while
+        # SGLang builds qkv_proj and gate_up_proj.
+        def layers(base):
+            out = {}
+            for i, mlp_algo in ((0, "FP8"), (4, "NVFP4")):
+                for proj in ("q_proj", "k_proj", "v_proj", "o_proj"):
+                    out[f"{base}.layers.{i}.self_attn.{proj}"] = {"quant_algo": "FP8"}
+                for proj in ("gate_proj", "up_proj", "down_proj"):
+                    out[f"{base}.layers.{i}.mlp.{proj}"] = {"quant_algo": mlp_algo}
+            return out
+
+        linear = ReplicatedLinear.__new__(ReplicatedLinear)
+        for model_cls, base, runtime in (
+            (
+                Mistral3ForConditionalGeneration,
+                "model.language_model",
+                "language_model.model",
+            ),
+            (LlamaForCausalLM, "model", "model"),
+        ):
+            quant_config = ModelOptMixedPrecisionConfig.from_config(
+                {
+                    "quant_algo": "MIXED_PRECISION",
+                    "quantized_layers": layers(base),
+                    # as _get_quantization_config reads it
+                    "packed_modules_mapping": getattr(
+                        model_cls, "packed_modules_mapping", {}
+                    ),
+                }
+            )
+            for prefix, method in (
+                (f"{runtime}.layers.0.self_attn.qkv_proj", ModelOptFp8LinearMethod),
+                (f"{runtime}.layers.0.mlp.gate_up_proj", ModelOptFp8LinearMethod),
+                (f"{runtime}.layers.4.self_attn.qkv_proj", ModelOptFp8LinearMethod),
+                (f"{runtime}.layers.4.mlp.gate_up_proj", ModelOptFp4LinearMethod),
+                (f"{runtime}.layers.4.mlp.down_proj", ModelOptFp4LinearMethod),
+            ):
+                with self.subTest(model=model_cls.__name__, prefix=prefix):
+                    self.assertIsInstance(
+                        quant_config.get_quant_method(linear, prefix), method
+                    )
 
     def test_fp8_pb_wo_dispatches_to_native_block_fp8(self):
         quant_config = ModelOptMixedPrecisionConfig.from_config(
