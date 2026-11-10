@@ -173,6 +173,7 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
         for architecture, disabled in (
             ("BertModel", True),
             ("XLMRobertaModel", True),
+            ("Lfm2BidirectionalModel", True),
             ("BertForSequenceClassification", True),
             ("XLMRobertaForSequenceClassification", True),
             ("CLIPModel", True),

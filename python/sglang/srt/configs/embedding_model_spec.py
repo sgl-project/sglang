@@ -128,6 +128,11 @@ _EMBEDDING_ARCHITECTURES = {
         EmbeddingExecution.ENCODER_ONLY,
         PoolingStrategy.MODEL_DEFINED,
     ),
+    "Lfm2BidirectionalModel": (
+        "lfm2_bidirectional",
+        EmbeddingExecution.ENCODER_ONLY,
+        PoolingStrategy.CLS,
+    ),
     "LlamaEmbeddingModel": (
         "llama_embedding",
         EmbeddingExecution.DECODER_POOLING,
