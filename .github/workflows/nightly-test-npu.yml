@@ -293,6 +293,9 @@ jobs:
       test_suite: nightly-acc-2-npu-a3
       is_nightly_pipeline_job: true
       partitions: '{"size":4,"arr":[0,1,2,3]}'
+      # All four shards land on agents of the same host and crashed on locked
+      # memory when started together, so run them one at a time.
+      serialize_partitions: true
       skip_pr_test_health_check: 'true'
       image: ${{ needs.set-image-config.outputs.image_a3 }}
       install_sglang_deps: false
@@ -330,6 +333,7 @@ jobs:
        install_sglang_deps: false
        device_type_for_deps: 'a5'
        run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
+  
   nightly-poc-multi-node-tests:
     name: multi-node-poc
     if: ${{ !cancelled() }}

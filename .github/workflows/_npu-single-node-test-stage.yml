@@ -54,6 +54,10 @@ on:
         description: 'Partition config to parallelize a suite across jobs, e.g. {"size":3,"arr":[0,1,2]}. Each element of arr is a partition id; the template expands one matrix job per element. size is passed to run_suite.py --auto-partition-size.'
         type: string
         default: '{"size":1,"arr":[0]}'
+      serialize_partitions:
+        description: 'Run partition jobs one at a time. Use when the shards share a host resource budget (e.g. locked memory) and must not start concurrently.'
+        type: boolean
+        default: false
       ref:
         description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the event SHA.'
         type: string
@@ -88,6 +92,8 @@ jobs:
     name: ${{ inputs.test_suite }}${{ inputs.use_coverage_runner && format(' ({0})', matrix.partition) || '' }}
     strategy:
       fail-fast: false
+      # Shards sharing one host's locked-memory budget must not start together.
+      max-parallel: ${{ inputs.serialize_partitions && 1 || fromJson(inputs.partitions).size }}
       matrix:
         partition: ${{ fromJson(inputs.partitions).arr }}
     runs-on: ${{ inputs.runner }}
