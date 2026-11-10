@@ -1175,6 +1175,10 @@ class OpenAIServingChat(OpenAIServingBase):
         if not request.messages:
             return "Messages cannot be empty."
 
+        n_error = self._parallel_sample_num_error(request.n)
+        if n_error:
+            return n_error
+
         if (
             request.chat_template_kwargs
             and "chat_template" in request.chat_template_kwargs

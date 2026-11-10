@@ -1741,6 +1741,36 @@ class TestPriorityRange(CustomTestCase):
                         tm._init_req_state.assert_not_called()
 
 
+class TestParallelSampleNumLimit(CustomTestCase):
+    """An oversized `n` fans out into one rid and one scheduler request per
+    sample, which wedges the server; it is rejected before normalization."""
+
+    def test_out_of_range_n_is_rejected_before_fan_out(self):
+        for sampling_params in (
+            {"n": 1025},
+            {"n": 0},
+            {"n": -1},
+            [{"n": 2}, {"n": 1025}],
+        ):
+            with self.subTest(sampling_params=sampling_params):
+                tm = _make_tm_for_generate(self)
+                batch = isinstance(sampling_params, list)
+                obj = GenerateReqInput(
+                    text=["a", "b"] if batch else "a",
+                    sampling_params=sampling_params,
+                )
+                obj.normalize_batch_and_arguments = Mock()
+                with self.assertRaisesRegex(
+                    ValueError, r"n must be an integer in \[1, 1024\]"
+                ):
+                    asyncio.run(tm.generate_request(obj).__anext__())
+                obj.normalize_batch_and_arguments.assert_not_called()
+
+    def test_n_at_the_limit_is_accepted(self):
+        obj = GenerateReqInput(text="a", sampling_params={"n": 1024})
+        obj.validate_parallel_sample_num(1024)
+
+
 class TestChatDisconnectAbort(CustomTestCase):
     """Regression tests for Issue #46517: Disconnected chat requests must abort on scheduler."""
 

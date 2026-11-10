@@ -1788,6 +1788,20 @@ class ServingChatTestCase(CustomTestCase):
             with self.subTest(field=field), self.assertRaisesRegex(ValueError, field):
                 self.chat._convert_to_internal_request(req, self.fastapi_request)
 
+    def test_validate_request_bounds_n(self):
+        """n outside [1, --max-parallel-sample-num] must be a 400 before the
+        request fans out into one scheduler request per sample."""
+        for n, ok in ((0, False), (1025, False), (56_442_861, False), (1024, True)):
+            with self.subTest(n=n):
+                req = ChatCompletionRequest(
+                    model="x", messages=[{"role": "user", "content": "Hi?"}], n=n
+                )
+                error = self.chat._validate_request(req)
+                if ok:
+                    self.assertIsNone(error)
+                else:
+                    self.assertRegex(error, r"n must be an integer in \[1, 1024\]")
+
     def test_validate_request_rejects_sampling_mask_without_meta_info(self):
         req = ChatCompletionRequest(
             model="x",

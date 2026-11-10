@@ -13,9 +13,13 @@ from fastapi.responses import ORJSONResponse, StreamingResponse
 
 from sglang.srt.entrypoints.openai.encoding_dsv32 import DS32EncodingError
 from sglang.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingRequest
-from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
+from sglang.srt.managers.io_struct import (
+    EmbeddingReqInput,
+    GenerateReqInput,
+    parallel_sample_num_error,
+)
 from sglang.srt.observability.req_time_stats import monotonic_time
-from sglang.srt.runtime_context import get_observability
+from sglang.srt.runtime_context import get_observability, get_serving
 from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
@@ -197,6 +201,9 @@ class OpenAIServingBase(ABC):
             err_type="NotImplementedError",
             status_code=501,
         )
+
+    def _parallel_sample_num_error(self, n: Optional[int]) -> Optional[str]:
+        return parallel_sample_num_error(n, get_serving().max_parallel_sample_num)
 
     def _validate_request(self, _: OpenAIServingRequest) -> Optional[str]:
         """Validate request"""

@@ -173,6 +173,11 @@ class Serving(msgspec.Struct):
         str,
         "Version identifier for the model weights. Defaults to 'default' if not specified.",
     ] = "default"
+    max_parallel_sample_num: A[
+        int,
+        "Maximum `n` (parallel samples per prompt) a request may ask for. Larger "
+        "requests are rejected with HTTP 400 before they fan out into per-sample requests.",
+    ] = 1024
     chat_template: A[
         Optional[str],
         "The buliltin chat template name or the path of the chat template file. This is only used for OpenAI-compatible API server.",
