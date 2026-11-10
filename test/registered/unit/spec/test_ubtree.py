@@ -374,6 +374,32 @@ class TestUBTreeRuntimeConfig(CustomTestCase):
         with self.assertRaises(ValueError):
             resolve_verify_width(replace(config, tree_budget=31), 49)
 
+    def test_startup_rejects_draft_for_another_target_or_block_contract(self):
+        from sglang.srt.arg_groups import speculative_hook
+        from sglang.srt.server_args import ServerArgs
+
+        with self.assertRaisesRegex(ValueError, "dflash_contract"):
+            parse_ubtree_config(
+                SimpleNamespace(**vars(_config()), dflash_contract="other")
+            )
+        args = ServerArgs(
+            model_path="dummy",
+            speculative_algorithm="UBTREE",
+            speculative_draft_model_path="draft",
+        )
+        args._model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["BailingMoeV3ForCausalLM"]),
+            vocab_size=18,
+        )
+        with (
+            patch.object(
+                speculative_hook.current_platform, "is_cuda", return_value=True
+            ),
+            patch("sglang.srt.hf_transformers.get_config", return_value=_config()),
+            self.assertRaisesRegex(ValueError, "vocab_size 17 must match"),
+        ):
+            speculative_hook._handle_ubtree(args)
+
     def test_builtin_identity_and_capabilities_preserve_plugin_protocol(self):
         algo = SpeculativeAlgorithm.from_string("ubtree")
         self.assertIs(algo, SpeculativeAlgorithm.UBTREE)

@@ -107,6 +107,12 @@ def parse_ubtree_config(config: Any) -> UBTreeConfig:
         raise ValueError(
             "The initial SGLang UBTree path supports shared projection only"
         )
+    contract = root.get("dflash_contract", dflash.get("contract"))
+    if contract not in (None, "flashflow_anchor_inclusive_v1"):
+        raise ValueError(
+            "UBTree serving runs the flashflow_anchor_inclusive_v1 draft block, "
+            f"got dflash_contract {contract!r}. Re-export the draft with it."
+        )
     return parsed
 
 

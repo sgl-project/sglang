@@ -473,8 +473,8 @@ def _handle_ubtree(server_args: ServerArgs) -> None:
         raise ValueError("UBTREE requires --speculative-draft-model-path")
     if attn_dp_enabled_of(cfg):
         raise ValueError("UBTREE does not support DP attention")
-    target_archs = model_config_of(server_args).hf_config.architectures
-    if "BailingMoeV3ForCausalLM" not in target_archs:
+    target = model_config_of(server_args)
+    if "BailingMoeV3ForCausalLM" not in target.hf_config.architectures:
         raise ValueError("UBTREE currently supports Ling3 BailingMoeV3 targets")
 
     draft = get_config(
@@ -484,6 +484,12 @@ def _handle_ubtree(server_args: ServerArgs) -> None:
         model_override_args=json.loads(cfg.json_model_override_args),
     )
     tree = parse_ubtree_config(draft)
+    if draft.vocab_size != target.vocab_size:
+        raise ValueError(
+            f"UBTREE draft vocab_size {draft.vocab_size} must match the target "
+            f"vocab_size {target.vocab_size}. Use the UBTree draft exported for "
+            "this target checkpoint."
+        )
     width = resolve_verify_width(tree, cfg.speculative_num_draft_tokens)
     if cfg.speculative_dflash_block_size not in (None, tree.block_size):
         raise ValueError("UBTREE draft block size does not match the checkpoint")
