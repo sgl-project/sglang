@@ -1,12 +1,15 @@
 from typing import Optional, Tuple, Union
 
 import torch
-from sgl_kernel_npu.fla.fused_gdn_gating import (
-    fused_gdn_gating_kernel_without_sigmoid,
-)
+from sgl_kernel_npu.fla.fused_gdn_gating import fused_gdn_gating_kernel_without_sigmoid
 from sgl_kernel_npu.fla.l2norm import l2norm_fwd
 from sgl_kernel_npu.fla.utils import prepare_chunk_indices
-from sgl_kernel_npu.operators.attention.gdn import fused_gdn_gating
+from sgl_kernel_npu.operators.attention.gdn import (
+    chunk_gated_delta_rule,
+    fused_gdn_gating,
+    recurrent_gated_delta_rule,
+)
+from sgl_kernel_npu.operators.mamba import causal_conv1d
 
 from sglang.srt.hardware_backend.npu.attention.ascend_hybrid_linear_attn_backend import (
     AscendMambaAttnBackendBase,
@@ -126,7 +129,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
         cache_indices = self.forward_metadata.mamba_cache_indices
 
         assert isinstance(mixed_qkv, torch.Tensor)
-        mixed_qkv = torch.ops.npu.causal_conv1d(
+        mixed_qkv = causal_conv1d(
             mixed_qkv,
             self._get_conv_weights_t(layer),
             conv_states=conv_states,
@@ -221,7 +224,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                 dtype=torch.int32,
                 device=mixed_qkv.device,
             )
-            mixed_qkv = torch.ops.npu.causal_conv1d(
+            mixed_qkv = causal_conv1d(
                 mixed_qkv,
                 self._get_conv_weights_t(layer),
                 conv_states=conv_states,
@@ -243,7 +246,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             conv_states_for_prefill = conv_states[
                 :, -(kernel_size - 1) :, :
             ].contiguous()
-            mixed_qkv = torch.ops.npu.causal_conv1d(
+            mixed_qkv = causal_conv1d(
                 mixed_qkv,
                 self._get_conv_weights_t(layer),
                 conv_states=conv_states_for_prefill,
@@ -354,7 +357,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             len(chunk_indices), v.shape[-2], v.shape[-1], k.shape[-1]
         )  # [NT, NH, DV, Dk]
 
-        core_attn_out, last_recurrent_state = torch.ops.npu.chunk_gated_delta_rule(
+        core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
             q,
             k,
             v,
@@ -404,7 +407,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             actual_seq_lengths = self.actual_seq_lengths
             ssm_state_indices = self.ssm_state_indices
 
-        attn_core_out = torch.ops.npu.recurrent_gated_delta_rule(
+        attn_core_out = recurrent_gated_delta_rule(
             mix_qkv,
             recurrent_state,
             beta=beta,

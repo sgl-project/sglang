@@ -194,9 +194,9 @@ class GuidanceGrammar(BaseGrammarObject):
     @staticmethod
     def apply_vocab_mask(logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
         if logits.device.type == "npu":
-            import sgl_kernel_npu  # noqa: F401
+            from sgl_kernel_npu.operators.sampler import apply_token_bitmask
 
-            torch.ops.npu.apply_token_bitmask(logits, vocab_mask)
+            apply_token_bitmask(logits, vocab_mask)
         else:
             apply_token_bitmask_inplace(logits, vocab_mask)
 

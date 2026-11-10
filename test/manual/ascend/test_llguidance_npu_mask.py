@@ -4,7 +4,8 @@ Manual Ascend suite (not registered to CPU CI). Verifies that
 ``GuidanceGrammar.apply_vocab_mask`` dispatches to the NPU kernel when logits
 are on an NPU device, and falls back to the generic ``llguidance``
 implementation otherwise. The NPU path is exercised via a mocked
-``torch.ops.npu.apply_token_bitmask`` so the tests can run without Ascend HW.
+``sgl_kernel_npu.operators.sampler.apply_token_bitmask`` so the tests can run
+without NPU hardware.
 
 Requires: torch, llguidance.  When either is unavailable, a placeholder test
 documents the skip so the module still collects and passes on this machine.
@@ -55,7 +56,7 @@ def _apply_ref_cpu(logits, vocab_mask):
 
 
 class _FakeNpuOps:
-    """Minimal stand-in for ``torch.ops.npu`` capturing the last call."""
+    """Stand-in for the NPU bitmask operator that captures the last call."""
 
     def __init__(self):
         self.last_call = None
@@ -69,13 +70,15 @@ class _FakeNpuOps:
 
 
 def _install_npu_mock():
-    """Install a fake ``sgl_kernel_npu`` and ``torch.ops.npu`` for testing."""
+    """Install a fake ``sgl_kernel_npu`` and sampler module for testing."""
     fake_ops = _FakeNpuOps()
 
     if not hasattr(torch, "npu"):
         torch.npu = types.ModuleType("torch_npu_mock")
     torch.npu.is_available = lambda: True
-    torch.ops.npu = fake_ops  # type: ignore[attr-defined]
+    sys.modules["sgl_kernel_npu.operators.sampler"] = MagicMock(
+        apply_token_bitmask=fake_ops.apply_token_bitmask
+    )
 
     if "sgl_kernel_npu" not in sys.modules:
         sys.modules["sgl_kernel_npu"] = MagicMock()
