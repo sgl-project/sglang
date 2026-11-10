@@ -95,6 +95,17 @@ runs:
               core.info(`[health-check] Filtered out multimodal-gen NPU job: ${j.name}`);
               return false;
             }
+            // a base-b wait can fail solely because health checks stopped its producers
+            if (baseName === 'wait-for-base-b') {
+              const failedProducers = failedJobs.filter(job => job.name.startsWith('base-b-test-'));
+              if (failedProducers.length > 0 && failedProducers.every(job => {
+                const failedStep = (job.steps || []).find(s => s.conclusion === 'failure');
+                return failedStep && (failedStep.name.includes('check-pr-test-health') || failedStep.name.includes('Check PR test health'));
+              })) {
+                core.info(`[health-check] Filtered out cascade wait summary: ${j.name}`);
+                return false;
+              }
+            }
             // coverage is a downstream summary; its prior failure must not block producer retries
             if (j.name.split(' / ').pop() === 'diffusion-coverage-check') {
               core.info(`[health-check] Filtered out coverage summary: ${j.name}`);
