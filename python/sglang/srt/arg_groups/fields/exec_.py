@@ -893,7 +893,8 @@ class ExecMoe(msgspec.Struct):
             "nixl",
             "mori",
             "ascend_fuseep",
-            "flashinfer",
+            "flashinfer_nvlink_one_sided",
+            "flashinfer",  # Deprecated alias for "flashinfer_nvlink_one_sided"
             "megamoe",
             "deepep_v2",
             "ascend_ops",
@@ -901,7 +902,9 @@ class ExecMoe(msgspec.Struct):
             "flashinfer_megamoe",
         ],
         Arg(
-            help="Choose the backend for MoE A2A.",
+            help="Choose the backend for MoE A2A. 'flashinfer_nvlink_one_sided' is "
+            "FlashInfer's NVLink one-sided all-to-all; 'flashinfer' is a deprecated "
+            "alias for it.",
             choices=[
                 "none",
                 "deepep",
@@ -909,7 +912,8 @@ class ExecMoe(msgspec.Struct):
                 "nixl",
                 "mori",
                 "ascend_fuseep",
-                "flashinfer",
+                "flashinfer_nvlink_one_sided",
+                "flashinfer",  # Deprecated alias for "flashinfer_nvlink_one_sided"
                 "megamoe",
                 "deepep_v2",
                 "pplx",
