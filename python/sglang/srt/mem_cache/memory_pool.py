@@ -30,7 +30,7 @@ import math
 import os
 import time
 from contextlib import contextmanager, nullcontext
-from dataclasses import dataclass, fields
+from dataclasses import KW_ONLY, dataclass, fields
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
 
@@ -117,6 +117,8 @@ logger = logging.getLogger(__name__)
 _MAMBA_DEBUG_ASSERTS = os.environ.get("SGLANG_MAMBA_DEBUG_ASSERTS", "0") == "1"
 
 GB = 1024 * 1024 * 1024
+# Arbitrary; no evidence this is the best chunk size for temporal state copies.
+_MAMBA_TEMPORAL_COPY_CHUNK_BYTES = 64 * 1024 * 1024
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_cpu = is_cpu()
@@ -663,6 +665,7 @@ class MambaPool:
         envelope_layout: bool = False,
         enable_linear_replayssm_spec: bool = False,
         replayssm_request_ring: bool = False,
+        allocate_intermediate_ssm: bool = True,
     ):
         conv_state_shape = cache_params.shape.conv
         temporal_state_shape = cache_params.shape.temporal
@@ -898,7 +901,7 @@ class MambaPool:
                 # KDA verify kernel takes intermediate_states_buffer=None (skips the
                 # per-step write, CACHE_INTERMEDIATE_STATES=False) and the commit
                 # replays the ring into the checkpoint instead. This is the memory win.
-                if enable_linear_replayssm_spec:
+                if enable_linear_replayssm_spec or not allocate_intermediate_ssm:
                     intermediate_ssm_state_cache = None
                 else:
                     intermediate_ssm_state_cache = torch.zeros(
@@ -1183,6 +1186,30 @@ class MambaPool:
         if temporal.numel() > 0:
             temporal.index_fill_(1, idx64, 0)
 
+    def _copy_temporal_slots(
+        self, *, src_indices: torch.Tensor, dst_indices: torch.Tensor
+    ) -> None:
+        temporal = self.mamba_cache.temporal
+        if temporal.numel() == 0:
+            return
+        num_slots = dst_indices.shape[0]
+        slot_bytes = temporal.element_size() * (temporal.numel() // temporal.shape[1])
+        step = max(1, _MAMBA_TEMPORAL_COPY_CHUNK_BYTES // slot_bytes)
+        if num_slots <= step:
+            temporal[:, dst_indices] = temporal[:, src_indices]
+            return
+        # A batched gather allocates num_slots * slot_bytes at once and can OOM
+        # under admission bursts; chunking requires disjoint src/dst slots.
+        if envs.SGLANG_DEBUG_MEMORY_POOL.get():
+            overlap = set(src_indices.tolist()) & set(dst_indices.tolist())
+            assert not overlap, (
+                "chunked temporal copy requires disjoint src/dst slots; "
+                f"overlap={sorted(overlap)}"
+            )
+        for start in range(0, num_slots, step):
+            chunk = slice(start, start + step)
+            temporal[:, dst_indices[chunk]] = temporal[:, src_indices[chunk]]
+
     def copy_from(self, src_indices: torch.Tensor, dst_indices: torch.Tensor):
         """Clone mamba state (conv + temporal) from src slots into dst slots.
 
@@ -1212,17 +1239,13 @@ class MambaPool:
                     f"overlap={sorted(overlap)}"
                 )
             fused_copy_conv_slots(self._conv_slot_desc, src_indices, dst_indices)
-            temporal = self.mamba_cache.temporal
-            if temporal.numel() > 0:
-                temporal[:, dst_indices] = temporal[:, src_indices]
+            self._copy_temporal_slots(src_indices=src_indices, dst_indices=dst_indices)
         else:
             for i in range(len(self.mamba_cache.conv)):
                 self.mamba_cache.conv[i][:, dst_indices] = self.mamba_cache.conv[i][
                     :, src_indices
                 ]
-            self.mamba_cache.temporal[:, dst_indices] = self.mamba_cache.temporal[
-                :, src_indices
-            ]
+            self._copy_temporal_slots(src_indices=src_indices, dst_indices=dst_indices)
         if self.replayssm_write_pos is not None:
             self.replayssm_write_pos[dst_indices] = 0
         for sibling in self._slot_siblings:
@@ -1405,6 +1428,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         linear_replayssm_cache_len: int = 16,
         mamba_envelope_layout: bool = False,
         enable_linear_replayssm_spec: bool = False,
+        allocate_intermediate_ssm: bool = True,
         short_conv_layer_ids: Optional[List[int]] = None,
         short_conv_state_shape: Optional[Tuple[int, int]] = None,
         ngram_context_len: int = 0,
@@ -1444,6 +1468,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             linear_replayssm_cache_len=linear_replayssm_cache_len,
             mamba_envelope_layout=mamba_envelope_layout,
             enable_linear_replayssm_spec=enable_linear_replayssm_spec,
+            allocate_intermediate_ssm=allocate_intermediate_ssm,
             short_conv_layer_ids=short_conv_layer_ids,
             short_conv_state_shape=short_conv_state_shape,
             ngram_context_len=ngram_context_len,
@@ -1465,6 +1490,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         linear_replayssm_cache_len: int = 16,
         mamba_envelope_layout: bool = False,
         enable_linear_replayssm_spec: bool = False,
+        allocate_intermediate_ssm: bool = True,
         short_conv_layer_ids: Optional[List[int]] = None,
         short_conv_state_shape: Optional[Tuple[int, int]] = None,
         ngram_context_len: int = 0,
@@ -1486,6 +1512,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             envelope_layout=mamba_envelope_layout,
             enable_linear_replayssm_spec=enable_linear_replayssm_spec,
             replayssm_request_ring=replayssm_request_ring,
+            allocate_intermediate_ssm=allocate_intermediate_ssm,
         )
         self.mamba_allocator = MambaSlotAllocator(
             size=mamba_size,
@@ -1724,14 +1751,13 @@ class KVWriteLoc:
     - ``loc``: the generic per-token write location (``out_cache_loc``).
       PHYSICAL on every pool: by allocation on non-unified pools, the
       iteration's plan's write ids on the unified pool (``IterationIds.bind``).
-    - ``swa_loc``: the SWA-sub-pool location for hybrid SWA pools (``None``
-      otherwise): the same plan's write ids in the sliding-window sub-pool
-      (``RunnerIds.write_ids``).
+    - ``window_locs``: the write ids of each window sub-pool the layers write,
+      keyed by sub-pool name (``window_write_locs``), resolved by the same
+      plan (``RunnerIds.write_ids``); ``None`` when the layers write no
+      window sub-pool. A window layer writes at its own sub-pool's entry.
     - ``full_loc``: OPTIONAL full-attention-sub-pool location, in the same id
       space as ``loc``; pools fall back to ``loc`` when it is ``None``.
 
-    ``swa_loc`` and ``full_loc`` are the parallel pair (each a pre-resolved
-    loc into its sub-pool, mirroring ``swa_kv_pool`` / ``full_kv_pool``);
     ``loc`` is the generic fallback. Bundling them lets a backend issue one
     ``set_kv_buffer`` call regardless of pool type.
 
@@ -1742,28 +1768,29 @@ class KVWriteLoc:
     """
 
     loc: torch.Tensor
-    swa_loc: Optional[torch.Tensor] = None
+    _: KW_ONLY
     full_loc: Optional[torch.Tensor] = None
     physical: bool = False
+    window_locs: Optional[Dict[str, torch.Tensor]] = None
 
     @classmethod
     def for_batch(
         cls,
         forward_batch,
         *,
-        swa_loc: Optional[torch.Tensor] = None,
         full_loc: Optional[torch.Tensor] = None,
+        window_locs: Optional[Dict[str, torch.Tensor]] = None,
     ) -> KVWriteLoc:
         """The batch's ``out_cache_loc`` as a write loc, carrying the batch's
-        physical mark. A ``swa_loc`` or ``full_loc`` passed here travels under
-        the same mark, so it must come from the same plan (as
-        ``RunnerIds.write_ids`` does); a loc produced separately states
-        its own mark with ``KVWriteLoc(loc, physical=...)``."""
+        physical mark. A ``full_loc`` or ``window_locs`` passed here travels
+        under the same mark, so it must come from the same plan (as
+        ``RunnerIds.write_ids`` does); a loc produced separately states its
+        own mark with ``KVWriteLoc(loc, physical=...)``."""
         return cls(
             forward_batch.out_cache_loc,
-            swa_loc,
-            full_loc,
+            full_loc=full_loc,
             physical=forward_batch.out_cache_loc_is_physical,
+            window_locs=window_locs,
         )
 
     @classmethod
@@ -1772,29 +1799,48 @@ class KVWriteLoc:
         forward_batch,
         layer,
         *,
-        swa_loc: Optional[torch.Tensor] = None,
         full_loc: Optional[torch.Tensor] = None,
+        window_locs: Optional[Dict[str, torch.Tensor]] = None,
     ) -> KVWriteLoc:
         """``layer``'s write loc: the batch's, or for a cross-attention layer
         ``encoder_out_cache_loc``, which nothing translates and so is never
         marked physical."""
         if layer.is_cross_attention:
-            return cls(forward_batch.encoder_out_cache_loc, swa_loc, full_loc)
-        return cls.for_batch(forward_batch, swa_loc=swa_loc, full_loc=full_loc)
+            return cls(
+                forward_batch.encoder_out_cache_loc,
+                full_loc=full_loc,
+                window_locs=window_locs,
+            )
+        return cls.for_batch(forward_batch, full_loc=full_loc, window_locs=window_locs)
 
     def __post_init__(self):
-        # swa_loc / full_loc are resolved once at metadata-init from the full
-        # (padded) out_cache_loc; piecewise/DP-padded paths later narrow loc per
-        # layer, so slice these pre-resolved locs to match (same per-token order).
-        # A multi-step draft step's slice is NOT a prefix of the all-steps loc;
-        # its backend derives per-step locs and never relies on this.
-        if self.swa_loc is not None and self.swa_loc.shape[0] != self.loc.shape[0]:
-            self.swa_loc = self.swa_loc[: self.loc.shape[0]]
+        # full_loc / window_locs are resolved once at metadata-init from the
+        # full (padded) out_cache_loc; piecewise/DP-padded paths later narrow
+        # loc per layer, so slice these pre-resolved locs to match (same
+        # per-token order). A multi-step draft step's slice is NOT a prefix of
+        # the all-steps loc; its backend derives per-step locs and never
+        # relies on this.
         if self.full_loc is not None and self.full_loc.shape[0] != self.loc.shape[0]:
             self.full_loc = self.full_loc[: self.loc.shape[0]]
+        if self.window_locs is not None:
+            n = self.loc.shape[0]
+            self.window_locs = {
+                name: ids if ids.shape[0] == n else ids[:n]
+                for name, ids in self.window_locs.items()
+            }
         _check_dense_loc(self.loc, "loc")
-        _check_dense_loc(self.swa_loc, "swa_loc")
         _check_dense_loc(self.full_loc, "full_loc")
+        for name, ids in (self.window_locs or {}).items():
+            _check_dense_loc(ids, f"window_locs[{name!r}]")
+
+    def window_loc(self, sub_pool: str) -> torch.Tensor:
+        """The write ids of window sub-pool ``sub_pool``."""
+        if self.window_locs is None or sub_pool not in self.window_locs:
+            raise KeyError(
+                f"the write loc carries no ids for window sub-pool {sub_pool!r} "
+                f"(it carries {sorted(self.window_locs or ())})"
+            )
+        return self.window_locs[sub_pool]
 
 
 def _check_dense_loc(loc: Optional[torch.Tensor], name: str) -> None:
@@ -1806,10 +1852,38 @@ def _check_dense_loc(loc: Optional[torch.Tensor], name: str) -> None:
         )
 
 
+def window_write_locs(
+    runner_ids, ids: Optional[torch.Tensor]
+) -> Optional[Dict[str, torch.Tensor]]:
+    """``ids``, a one-rail backend's window write ids, keyed by its runner's
+    ``window_storage`` (a static pool's window sub-pool without RunnerIds)."""
+    if ids is None:
+        return None
+    if runner_ids is None:
+        from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+
+        name = SWAKVPool.WINDOW_SUB_POOL
+    else:
+        name = runner_ids.window_storage
+    return {getattr(name, "value", name): ids}
+
+
+def layer_window_locs(
+    pool, layer_id: int, ids: Optional[torch.Tensor]
+) -> Optional[Dict[str, torch.Tensor]]:
+    """``ids``, the write ids of the window sub-pool layer ``layer_id`` writes in
+    ``pool``, keyed by that sub-pool's name as the layer's route gives it; None
+    when ``ids`` is."""
+    if ids is None:
+        return None
+    sub_pool = pool.layer_router.route(layer_id).sub_pool
+    return {getattr(sub_pool, "value", sub_pool): ids}
+
+
 def unwrap_write_loc(loc_info):
-    """Return ``(loc, swa_loc, full_loc)`` from a ``KVWriteLoc`` or a bare loc."""
+    """Return ``(loc, window_locs, full_loc)`` from a ``KVWriteLoc`` or a bare loc."""
     if isinstance(loc_info, KVWriteLoc):
-        return loc_info.loc, loc_info.swa_loc, loc_info.full_loc
+        return loc_info.loc, loc_info.window_locs, loc_info.full_loc
     _check_dense_loc(loc_info, "loc")
     return loc_info, None, None
 
@@ -1857,6 +1931,7 @@ class KvBufferDesc:
 class KVCache(abc.ABC):
     layer_shard_enabled: bool = False
     post_capture_active: bool = False
+    rows_are_dcp_collapsed: bool = False
 
     @property
     def backing_owner(self):
@@ -2921,6 +2996,31 @@ class MHATokenToKVPool(KVCache, MHAKVView):
                 cache_v,
                 k_scale,
                 v_scale,
+            )
+            return
+
+        if (
+            self.kv_cache_layout == "vectorized_5d"
+            and not self.use_hnd
+            and dcp_kv_mask is None
+            and cache_k.dtype != self.dtype
+            and self.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+        ):
+            # The 5D writer divides by the scales, saturates and casts as it
+            # writes, in place of the two divisions and two casts below.
+            from sglang.kernels.ops.kvcache.shuffle_5d_cache import (
+                launch_reshape_and_cache_shuffle_5d,
+            )
+
+            layer_idx = layer_id - self.start_layer
+            launch_reshape_and_cache_shuffle_5d(
+                cache_k,
+                cache_v,
+                self.k_buffer[layer_idx].view(self.dtype),
+                self.v_buffer[layer_idx].view(self.dtype),
+                loc,
+                k_scale=k_scale,
+                v_scale=v_scale,
             )
             return
 
@@ -4156,6 +4256,7 @@ class HybridLinearKVPool(KVCache):
         full_kv_pool: Optional[KVCache] = None,
         post_capture_active: bool = False,
         use_fp4_indexer: bool = False,
+        use_combined_kv_buffer: bool = False,
     ):
         self.size = size
         self.dtype = dtype
@@ -4245,6 +4346,7 @@ class HybridLinearKVPool(KVCache):
                 kv_lora_rank=kv_lora_rank,
                 qk_rope_head_dim=qk_rope_head_dim,
                 enable_memory_saver=enable_memory_saver,
+                **({"use_combined_kv_buffer": True} if use_combined_kv_buffer else {}),
             )
         if isinstance(self.full_kv_pool, MHATokenToKVPool):
             # Only the hybrid root knows the model IDs of its compact child.
@@ -4376,6 +4478,12 @@ class HybridLinearKVPool(KVCache):
     def _wait_for_layer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+
+    def get_combined_kv_buffer(self, layer_id: int):
+        self._wait_for_layer(layer_id)
+        return self.full_kv_pool.get_combined_kv_buffer(
+            self._transfer_full_attention_id(layer_id)
+        )
 
     def _build_layer_router(self) -> KVLayerRouter:
         # Only the full-attention layers hold KV here; the KV cache
@@ -4863,6 +4971,10 @@ class MLATokenToKVPool(KVCache, MLAKVView):
     # the plan's write translation (`translate_write_loc`) and flips this.
     write_loc_is_dcp_resolved = False
     dcp_replicated = False
+
+    @property
+    def rows_are_dcp_collapsed(self) -> bool:
+        return get_parallel().dcp_enabled and not self.dcp_replicated
 
     @property
     def _write_loc_dcp_span(self) -> int:

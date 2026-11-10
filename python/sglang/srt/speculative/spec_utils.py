@@ -33,7 +33,7 @@ from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
 from sglang.srt.layers.cp.base import disable_cp_strategy
 from sglang.srt.managers.schedule_batch import set_mamba_track_indices_from_reqs
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
-from sglang.srt.mem_cache.kv.router import STATE_PART
+from sglang.srt.mem_cache.kv.decl import STATE_PART
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
@@ -372,7 +372,7 @@ def fill_draft_window_rail(
     """Emit every draft step's window-clipped read ids into the per-step rows
     of ``window_kv_indices`` and their indptr into ``window_kv_indptr``: step
     i of a branch reads the last ``min(seq_len + i + 1, window)`` of its
-    tokens, from the storage window layers use (``runner_ids.window_kv_kind``).
+    tokens, from the storage window layers use (``runner_ids.window_storage``).
     ``window`` is the number of tokens the backend's window layers attend."""
     num_seqs = forward_batch.batch_size
     width = num_seqs * topk * window
@@ -384,7 +384,7 @@ def fill_draft_window_rail(
         forward_batch.iteration_ids,
         req_pool_indices=forward_batch.req_pool_indices,
         bs=num_seqs,
-        kind=runner_ids.window_kv_kind,
+        kind=runner_ids.window_storage,
     )
     generate_draft_decode_window_kv_indices[(num_steps, num_seqs, topk)](
         src.row_ids,
@@ -405,15 +405,12 @@ def fill_draft_window_rail(
         v2p=src.v2p,
         TRANSLATE=src.v2p is not None,
     )
-    if (
-        not src.is_translated
-        and runner_ids.window_kv_kind == IdSpaceKind.SLIDING_WINDOW
-    ):
+    if not src.is_translated and runner_ids.window_storage != IdSpaceKind.FULL:
         # Static pool: the legacy full->swa translate, as the target's window
         # reads apply it.
         for i in range(num_steps):
             row = window_kv_indices[i][:width]
-            row.copy_(runner_ids.ids_in(IdSpaceKind.SLIDING_WINDOW, row))
+            row.copy_(runner_ids.ids_in(runner_ids.window_storage, row))
 
 
 def record_stream_each(tensors, stream):
@@ -1186,6 +1183,15 @@ def commit_mamba_states_after_verify(
     if mambaish_config(model_runner.model_config) is None:
         return
 
+    # FIXME: when the target runner is the forward's last shared reader, this
+    # ReplaySSM branch reads the request pool's Mamba indices and the state map
+    # after the declared shared-read end. The schedule stream may then reuse and
+    # rewrite a finished request's row or state slot while this commit still
+    # reads it. Declare a later read end for this path, or gather the indices
+    # during metadata preparation. The same holds for EAGLE v2's post-verify
+    # graphs: they replay this commit on a side stream joined only after draft
+    # extend, while draft extend's declared read end (pre-, in- or post-replay)
+    # is recorded before that join; only its whole-forward fallback covers it.
     # ReplaySSM spec-verify path (Part B of #28511): the accepted drafts already
     # live in the per-slot circular ring (written during verify). Instead of
     # scattering an intermediate full SSM state into `temporal`, advance the

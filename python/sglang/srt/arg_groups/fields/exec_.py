@@ -871,7 +871,8 @@ class ExecMoe(msgspec.Struct):
             "nixl",
             "mori",
             "ascend_fuseep",
-            "flashinfer",
+            "flashinfer_nvlink_one_sided",
+            "flashinfer",  # Deprecated alias for "flashinfer_nvlink_one_sided"
             "megamoe",
             "deepep_v2",
             "ascend_ops",
@@ -879,7 +880,9 @@ class ExecMoe(msgspec.Struct):
             "flashinfer_megamoe",
         ],
         Arg(
-            help="Choose the backend for MoE A2A.",
+            help="Choose the backend for MoE A2A. 'flashinfer_nvlink_one_sided' is "
+            "FlashInfer's NVLink one-sided all-to-all; 'flashinfer' is a deprecated "
+            "alias for it.",
             choices=[
                 "none",
                 "deepep",
@@ -887,7 +890,8 @@ class ExecMoe(msgspec.Struct):
                 "nixl",
                 "mori",
                 "ascend_fuseep",
-                "flashinfer",
+                "flashinfer_nvlink_one_sided",
+                "flashinfer",  # Deprecated alias for "flashinfer_nvlink_one_sided"
                 "megamoe",
                 "deepep_v2",
                 "pplx",
@@ -1053,6 +1057,12 @@ class ExecMoe(msgspec.Struct):
             type_parser=_paged_experts_num_resident,
         ),
     ] = None
+    paged_experts_enable_disk: A[
+        bool,
+        "Let Paged Experts write to disk under $SGLANG_CACHE_DIR/paged_experts: each MoE "
+        "layer's experts are kept there (about the size of the experts), so that later starts "
+        "read them instead of loading and repacking them. Requires --enable-paged-experts.",
+    ] = False
 
     # -------------------------------------------------------------------------
     # Ktransformers/AMX expert parallelism
@@ -1146,7 +1156,7 @@ class ExecOffload(msgspec.Struct):
             "directly; use it on unified-memory devices (e.g. GB10 / DGX Spark) "
             "where pinned host memory comes out of the same pool as the model "
             "weights. Requires a device that reports "
-            "cudaDevAttrPageableMemoryAccessUsesHostPageTables.",
+            "cudaDevAttrPageableMemoryAccess (GB10, or HMM).",
             choices=["pinned", "file"],
         ),
     ] = "pinned"

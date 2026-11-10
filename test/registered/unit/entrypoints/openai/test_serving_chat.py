@@ -915,6 +915,45 @@ class ServingChatTestCase(CustomTestCase):
         )
         self.assertIsNone(self.chat._validate_request(multimodal_request))
 
+    def test_output_limit_precedence_preserves_zero_during_validation(self):
+        """A zero completion limit must not fall back during context validation."""
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.get_model",
+            return_value=Mock(context_length=4),
+        ):
+            zero_limit = ChatCompletionRequest(
+                messages=[{"role": "user", "content": "Hello"}],
+                max_completion_tokens=0,
+                max_tokens=5,
+            )
+            self.assertIsNone(self.chat._validate_request(zero_limit))
+
+            excessive_limit = ChatCompletionRequest(
+                messages=[{"role": "user", "content": "Hello"}],
+                max_completion_tokens=5,
+                max_tokens=0,
+            )
+            self.assertIn("too large", self.chat._validate_request(excessive_limit))
+
+    def test_output_limit_boundary_and_auto_truncate_during_validation(self):
+        """Only a limit above the context length is rejected, unless auto-truncating."""
+        messages = [{"role": "user", "content": "Hello"}]
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.get_model",
+            return_value=Mock(context_length=4),
+        ):
+            at_limit = ChatCompletionRequest(messages=messages, max_completion_tokens=4)
+            self.assertIsNone(self.chat._validate_request(at_limit))
+
+            above_limit = ChatCompletionRequest(
+                messages=messages, max_completion_tokens=5
+            )
+            with patch(
+                "sglang.srt.entrypoints.openai.serving_chat.get_serving",
+                return_value=Mock(allow_auto_truncate=True),
+            ):
+                self.assertIsNone(self.chat._validate_request(above_limit))
+
     # ------------- conversion tests -------------
     def test_convert_to_internal_request_single(self):
         with (
@@ -3144,7 +3183,7 @@ class ServingChatTestCase(CustomTestCase):
 
         # Mock FunctionCallParser with detector that has partial tool call data
         mock_parser = Mock()
-        mock_detector = Mock()
+        mock_detector = Mock(incomplete_tool_call_indices=set())
 
         # Simulate a tool call that was partially streamed
         mock_detector.prev_tool_call_arr = [
@@ -3197,12 +3236,40 @@ class ServingChatTestCase(CustomTestCase):
             "Should not include finish_reason in completion chunk",
         )
 
+    def test_unstreamed_tool_args_skip_a_call_that_never_closed(self):
+        mock_parser = Mock()
+        mock_parser.detector = Mock(
+            incomplete_tool_call_indices={0},
+            prev_tool_call_arr=[
+                {
+                    "name": "get_weather",
+                    "arguments": {"location": "San Francisco", "unit": "celsius"},
+                }
+            ],
+            streamed_args_for_tool=['{"location": "San Francisco"'],
+        )
+        request = ChatCompletionRequest(
+            model="test",
+            messages=[{"role": "user", "content": "What's the weather?"}],
+            tools=[{"type": "function", "function": {"name": "get_weather"}}],
+        )
+
+        result = self.chat._check_for_unstreamed_tool_args(
+            parser=mock_parser,
+            content={"meta_info": {"id": "chatcmpl-test123"}},
+            request=request,
+            index=0,
+            created=123,
+        )
+
+        self.assertIsNone(result)
+
     def test_unstreamed_tool_args_no_completion_needed(self):
         """Test that no completion chunk is sent when all arguments were already streamed."""
 
         # Mock FunctionCallParser with detector that has complete tool call data
         mock_parser = Mock()
-        mock_detector = Mock()
+        mock_detector = Mock(incomplete_tool_call_indices=set())
 
         # Simulate a tool call that was completely streamed
         mock_detector.prev_tool_call_arr = [
@@ -3241,7 +3308,7 @@ class ServingChatTestCase(CustomTestCase):
         """Test raw JSON string arguments are not JSON-encoded again at finish."""
 
         mock_parser = Mock()
-        mock_detector = Mock()
+        mock_detector = Mock(incomplete_tool_call_indices=set())
         mock_detector.prev_tool_call_arr = [
             {"name": "report_template_recognition_commit", "arguments": "{}"}
         ]
@@ -3279,7 +3346,7 @@ class ServingChatTestCase(CustomTestCase):
         """Test remaining raw JSON string arguments are sent at finish."""
 
         mock_parser = Mock()
-        mock_detector = Mock()
+        mock_detector = Mock(incomplete_tool_call_indices=set())
         mock_detector.prev_tool_call_arr = [
             {
                 "name": "get_weather",
@@ -3319,7 +3386,7 @@ class ServingChatTestCase(CustomTestCase):
 
         # Mock FunctionCallParser with empty detector
         mock_parser = Mock()
-        mock_detector = Mock()
+        mock_detector = Mock(incomplete_tool_call_indices=set())
         mock_detector.prev_tool_call_arr = []
         mock_detector.streamed_args_for_tool = []
         mock_parser.detector = mock_detector
