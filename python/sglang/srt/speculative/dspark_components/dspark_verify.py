@@ -197,7 +197,6 @@ class TargetVerifyExecutor:
         override drawn by begin_simulated_step.
         """
         if folded_accept:
-            self.verify_epilogue.note_static_verify(bs)
             return self.verify_epilogue.read_accept(bs)
 
         correct_len, bonus, cap_trim_lens = accept_draft_tokens(
@@ -904,11 +903,6 @@ class DsparkVerifyEpilogue:
             bs,
             "sim-fold" if self.simulate_fold else "argmax",
         )
-
-    def note_static_verify(self, bs: int) -> None:
-        """Host, after a static verify graph replayed ``bs`` requests."""
-        if self.deferred_commit is not None:
-            self.deferred_commit.note_static_verify(bs)
 
     def _commit_engram_history(
         self, candidates, req_pool_indices, commit_lens, verify_lens, gate

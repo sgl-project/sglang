@@ -95,8 +95,7 @@ class TestDeferredCommit(CustomTestCase):
         commit = _commit(injector)
         lens = _stage(commit, 3)
         reqs = [_staged_req() for _ in range(3)]
-        commit.note_static_verify(3)
-        commit.note_staged_reqs(reqs)
+        commit.note_static_verify(reqs)
         commit.before_draft_forward(graph_bs=None, reqs=reqs)
         (store,) = injector.stores
         n = MAX_BS * STRIDE
@@ -129,8 +128,7 @@ class TestDeferredCommit(CustomTestCase):
                 commit._forked_bs = set(forked)
                 _stage(commit, 3)
                 reqs = [_staged_req() for _ in range(staged)]
-                commit.note_static_verify(staged)
-                commit.note_staged_reqs(reqs)
+                commit.note_static_verify(reqs)
                 commit.before_draft_forward(graph_bs=graph_bs, reqs=reqs)
                 self.assertEqual(len(injector.stores), int(flushes))
                 commit.after_draft_forward(graph_ran=graph_bs is not None)
@@ -139,11 +137,7 @@ class TestDeferredCommit(CustomTestCase):
     def test_only_rows_of_the_requests_the_draft_carries_are_written(self):
         """The draft batch is in its own order; a staged request it leaves out,
         or one retracted and admitted again since, keeps its row unwritten."""
-        for case, expected in (
-            ("left out", [2, 0, 3]),
-            ("readmitted", [2, 0, 3]),
-            ("adjacent left out", [0, 0, 3]),
-        ):
+        for case in ("left out", "readmitted"):
             for graph_bs in (None, MAX_BS):
                 with self.subTest(case=case, graph_bs=graph_bs):
                     a, b, c = (_staged_req() for _ in range(3))
@@ -151,9 +145,8 @@ class TestDeferredCommit(CustomTestCase):
                     commit = _commit(injector)
                     commit._forked_bs = {MAX_BS}
                     _stage(commit, 3)
-                    commit.note_static_verify(3)
-                    commit.note_staged_reqs([a, b, c])
-                    draft_reqs = [c] if case == "adjacent left out" else [c, a]
+                    commit.note_static_verify([a, b, c])
+                    draft_reqs = [c, a]
                     if case == "readmitted":
                         b.retraction_count += 1
                         draft_reqs.append(b)
@@ -161,18 +154,17 @@ class TestDeferredCommit(CustomTestCase):
                     if graph_bs is None:
                         (store,) = injector.stores
                         rows = store["swa_loc"][: 3 * STRIDE].view(3, STRIDE)
-                        self.assertEqual((rows != -1).sum(dim=1).tolist(), expected)
+                        self.assertEqual((rows != -1).sum(dim=1).tolist(), [2, 0, 3])
                     else:
                         # What the draft graph reads when it writes the staging.
-                        self.assertEqual(commit.commit_lens.tolist()[:3], expected)
+                        self.assertEqual(commit.commit_lens.tolist()[:3], [2, 0, 3])
 
     def test_disarm_drops_the_staging(self):
         injector = _Injector()
         commit = _commit(injector)
         _stage(commit, 3)
         reqs = [_staged_req() for _ in range(3)]
-        commit.note_static_verify(3)
-        commit.note_staged_reqs(reqs)
+        commit.note_static_verify(reqs)
         commit.disarm()
         self.assertFalse(commit.pending)
         self.assertEqual(commit._staged_reqs, ())

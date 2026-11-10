@@ -74,9 +74,8 @@ class DeferredContextCommit:
         self._proj_done: Optional[torch.cuda.Event] = None
         self._store_stream: Optional[torch.cuda.Stream] = None
         self._store_done: Optional[torch.cuda.Event] = None
-        # Host: requests a static verify staged since the last write (0: nothing pending).
-        self.staged_bs = 0
-        # Host: staged requests by row, with their `retraction_count` at staging.
+        # Host: the requests a static verify staged since the last write, by row,
+        # with their `retraction_count` at staging (empty: nothing pending).
         self._staged_reqs: tuple = ()
         # Host: a forked projection the static epilogue has not joined yet.
         self._proj_unjoined = False
@@ -91,7 +90,7 @@ class DeferredContextCommit:
 
     @property
     def pending(self) -> bool:
-        return self.staged_bs > 0
+        return bool(self._staged_reqs)
 
     def _pool(self):
         return self._kv_injector.draft_model_runner.token_to_kv_pool
@@ -170,33 +169,17 @@ class DeferredContextCommit:
         if state_slot is not None:
             self.state_slot[:n].copy_(state_slot[:n])
 
-    def note_static_verify(self, live_bs: int) -> None:
-        """Host, after a static verify graph ran ``live_bs`` requests."""
-        self.staged_bs = live_bs
-
-    def note_staged_reqs(self, reqs) -> None:
-        """Host, after a verify of ``reqs``."""
-        self._staged_reqs = tuple(
-            (req, req.retraction_count) for req in reqs[: self.staged_bs]
-        )
+    def note_static_verify(self, reqs) -> None:
+        """Host, after a static verify graph ran ``reqs``."""
+        self._staged_reqs = tuple((req, req.retraction_count) for req in reqs)
 
     def _skip_rows_not_carried(self, reqs) -> None:
         """Host, before a forward of ``reqs`` writes the staging: zero the rows
         of the requests it does not carry, or that were retracted since."""
         carried = set(reqs)
-        # One launch per run of adjacent rows: an index tensor would need a
-        # host-to-device copy that waits for the stream.
-        run_start = None
         for row, (req, retraction_count) in enumerate(self._staged_reqs):
-            skip = req not in carried or req.retraction_count != retraction_count
-            if skip and run_start is None:
-                run_start = row
-            elif not skip and run_start is not None:
-                self.commit_lens[run_start:row].zero_()
-                run_start = None
-        if run_start is not None:
-            self.commit_lens[run_start : len(self._staged_reqs)].zero_()
-        self._staged_reqs = ()
+            if req not in carried or req.retraction_count != retraction_count:
+                self.commit_lens[row : row + 1].zero_()
 
     # Draft side: the gated stores.
 
@@ -232,7 +215,7 @@ class DeferredContextCommit:
         # A graph captured here would replay the write on every later replay.
         if self.pending and not _capturing():
             self.write()
-            self.staged_bs = 0
+            self._staged_reqs = ()
             self.num_written_eagerly += 1
             self._eager_reasons[reason] = self._eager_reasons.get(reason, 0) + 1
 
@@ -254,13 +237,13 @@ class DeferredContextCommit:
             self._flush("eager draft")
         elif graph_bs not in self._forked_bs:
             self._flush("draft graph without the fork")
-        elif self.staged_bs > graph_bs:
+        elif len(self._staged_reqs) > graph_bs:
             self._flush("draft graph rows")
 
     def after_draft_forward(self, graph_ran: bool) -> None:
         # A pending staging past before_draft_forward is one the graph writes.
         if graph_ran and self.pending:
-            self.staged_bs = 0
+            self._staged_reqs = ()
             self.num_written_in_graph += 1
 
     def capture_head_hook(self, graph_runner, forward_batch) -> None:
@@ -299,7 +282,6 @@ class DeferredContextCommit:
     def disarm(self) -> None:
         """Drop whatever warmups or captures staged on placeholder inputs."""
         self.commit_lens.zero_()
-        self.staged_bs = 0
         self._staged_reqs = ()
         self._fork_unjoined = False
         self._proj_unjoined = False

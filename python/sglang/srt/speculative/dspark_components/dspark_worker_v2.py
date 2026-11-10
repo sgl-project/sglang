@@ -1229,7 +1229,6 @@ class DSparkWorkerV2(BaseSpecWorker):
         # sampling-accept region replayed right after it.
         graph_accept = folded_accept or region_accept is not None
         if region_accept is not None:
-            epilogue.note_static_verify(bs)
             accept = region_accept
         else:
             accept = self._verify_executor.accept_and_finalize(
@@ -1246,8 +1245,8 @@ class DSparkWorkerV2(BaseSpecWorker):
                 simulate_bonus_sampling_info=simulate_bonus_sampling_info,
             )
         commit = self._deferred_commit()
-        if commit is not None:
-            commit.note_staged_reqs(batch.reqs)
+        if graph_accept and commit is not None:
+            commit.note_static_verify(batch.reqs)
         if watermark_rows is not None:
             self.target_worker.model_runner.watermark_state.commit_speculative_chain(
                 req_pool_indices=batch.req_pool_indices,
