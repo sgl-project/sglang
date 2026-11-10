@@ -19,7 +19,7 @@ from sglang.srt.mem_cache.pool_host._kvcacheio import (
 from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
     HostKVCache,
-    host_memory_budget_bytes,
+    host_memory_preflight,
 )
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
@@ -157,12 +157,13 @@ class DSAIndexerPoolHost(HostKVCache):
             self.clear()
             return
 
-        requested_bytes = self.size * self.size_per_token
-        available_bytes = host_memory_budget_bytes(requested_bytes)
-        if requested_bytes > available_bytes:
+        allocation_bytes, available_bytes = host_memory_preflight(
+            self.get_mapping_lengths(), self.allocator, self._buffer_device
+        )
+        if allocation_bytes > available_bytes:
             raise ValueError(
                 f"Not enough host memory for DSA indexer hierarchical cache. "
-                f"Requesting {requested_bytes / 1e9:.2f} GB but only have "
+                f"Requesting {allocation_bytes / 1e9:.2f} GB but only have "
                 f"{available_bytes / 1e9:.2f} GB free."
             )
         draft_layer_num = self.layer_num - self.target_layer_num
@@ -171,7 +172,7 @@ class DSAIndexerPoolHost(HostKVCache):
                 "Allocating %.2f GB host memory for DSA indexer (layout=%s), "
                 "packed MTP layers: "
                 "target_layers=%d, draft_layers=%d, total_layers=%d.",
-                requested_bytes / 1e9,
+                allocation_bytes / 1e9,
                 self.layout,
                 self.target_layer_num,
                 draft_layer_num,
@@ -180,7 +181,7 @@ class DSAIndexerPoolHost(HostKVCache):
         else:
             logger.info(
                 "Allocating %.2f GB host memory for DSA indexer (layout=%s).",
-                requested_bytes / 1e9,
+                allocation_bytes / 1e9,
                 self.layout,
             )
         self.init_kv_buffer()
@@ -205,6 +206,9 @@ class DSAIndexerPoolHost(HostKVCache):
 
     def get_ksize_per_token(self):
         return self.get_size_per_token()
+
+    def get_mapping_lengths(self) -> list[int]:
+        return [self.indexer_page_num * self.layer_num * self.indexer_page_stride_size]
 
     def _is_device_layer_owned(self, device_pool, layer_id: int) -> bool:
         return layer_id in self._device_to_host_layer

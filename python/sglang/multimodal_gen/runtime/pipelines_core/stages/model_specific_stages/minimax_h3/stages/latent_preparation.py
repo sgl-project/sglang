@@ -5,9 +5,6 @@ import torch
 
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
-from sglang.multimodal_gen.runtime.pipelines_core.stages.latent_preparation import (
-    verify_latent_preparation_inputs,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     StageValidators as V,
 )
@@ -29,7 +26,7 @@ class MiniMaxH3LatentPreparationStage(PipelineStage):
                 f"{self.__class__.__name__} is a MiniMax H3 contract stage "
                 "and has no implementation yet."
             )
-        self._prepare_denoise_state_from_plan(batch, plan)
+        self._prepare_denoise_state_from_plan(batch, plan, server_args)
         self._publish_native_latent_state(batch)
         return batch
 
@@ -66,13 +63,18 @@ class MiniMaxH3LatentPreparationStage(PipelineStage):
         batch.raw_latent_shape = (1, 24, latent_t, latent_h, latent_w)
         batch.raw_audio_latent_shape = (2, 32, audio_t)
 
-    def _prepare_denoise_state_from_plan(self, batch: Req, plan) -> None:
+    def _prepare_denoise_state_from_plan(self, batch: Req, plan, server_args) -> None:
         """Direct initial-noise materialization (t2va recipe):
         torch.Generator().manual_seed(seed); video rows drawn first,
         then audio rows, CPU fp32. Every task consumes the final latent grid
-        frozen by the pre-queue shape resolver."""
+        frozen by the pre-queue shape resolver. Image releases draw from the
+        request generator instead (image_noise.py)."""
         from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.constants import (
             MINIMAX_H3_DENOISE_STATE_EXTRA_KEY,
+        )
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.image_noise import (
+            minimax_h3_image_noise,
+            minimax_h3_image_reference_grids,
         )
 
         if MINIMAX_H3_DENOISE_STATE_EXTRA_KEY in batch.extra:
@@ -99,36 +101,46 @@ class MiniMaxH3LatentPreparationStage(PipelineStage):
             seed = 42  # pinned default seed
         video_rows_n = latent_t * (latent_h // 2) * (latent_w // 2)
         audio_rows_n = audio_t * 2
-        # Noise semantics:
-        # - video noise is drawn on the RAW latent tensor
-        #   [1, 24, T, H_lat, W_lat] in tensor layout, then patchified
-        #   into packed row order;
-        # - audio uses an INDEPENDENT generator re-seeded with the same
-        #   seed (each modality re-seeds its own generator);
-        # - no extra cond-frame noise is drawn for image-conditioned
-        #   requests.
-        # The same seed always reproduces the same noise.
-        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.packed_tokens import (
-            minimax_h3_patchify_video_latent,
-        )
+        if plan.output_modality == "image":
+            # Draw 1 of the request generator; audio_t is 0 for image releases.
+            video_noise = minimax_h3_image_noise(
+                batch,
+                plan,
+                server_args,
+                reference_grids=minimax_h3_image_reference_grids(batch),
+            ).target_rows
+            audio_noise = torch.empty((audio_rows_n, 32), dtype=torch.float32)
+        else:
+            # Noise semantics:
+            # - video noise is drawn on the RAW latent tensor
+            #   [1, 24, T, H_lat, W_lat] in tensor layout, then patchified
+            #   into packed row order;
+            # - audio uses an INDEPENDENT generator re-seeded with the same
+            #   seed (each modality re-seeds its own generator);
+            # - no extra cond-frame noise is drawn for image-conditioned
+            #   requests.
+            # The same seed always reproduces the same noise.
+            from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.packed_tokens import (
+                minimax_h3_patchify_video_latent,
+            )
 
-        gen_v = torch.Generator().manual_seed(int(seed))
-        video_tensor = torch.randn(
-            1,
-            24,
-            latent_t,
-            latent_h,
-            latent_w,
-            generator=gen_v,
-            dtype=torch.float32,
-        )
-        video_noise = minimax_h3_patchify_video_latent(
-            video_tensor, patch_size=[1, 2, 2]
-        ).to(torch.float32)
-        gen_a = torch.Generator().manual_seed(int(seed))
-        audio_noise = torch.randn(
-            audio_rows_n, 32, generator=gen_a, dtype=torch.float32
-        )
+            gen_v = torch.Generator().manual_seed(int(seed))
+            video_tensor = torch.randn(
+                1,
+                24,
+                latent_t,
+                latent_h,
+                latent_w,
+                generator=gen_v,
+                dtype=torch.float32,
+            )
+            video_noise = minimax_h3_patchify_video_latent(
+                video_tensor, patch_size=[1, 2, 2]
+            ).to(torch.float32)
+            gen_a = torch.Generator().manual_seed(int(seed))
+            audio_noise = torch.randn(
+                audio_rows_n, 32, generator=gen_a, dtype=torch.float32
+            )
         if list(video_noise.shape) != [video_rows_n, 96]:
             raise ValueError(
                 f"aligned video noise shape {list(video_noise.shape)} != "
@@ -144,7 +156,27 @@ class MiniMaxH3LatentPreparationStage(PipelineStage):
         }
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
-        return verify_latent_preparation_inputs(batch)
+        # The shared checks minus batch.generator: image releases skip the
+        # generic InputValidationStage, and every H3 noise stream is seeded
+        # from the request plan.
+        result = VerificationResult()
+        result.add_check(
+            "prompt_or_embeds",
+            None,
+            lambda _: (
+                V.string_or_list_strings(batch.prompt)
+                or V.list_not_empty(batch.prompt_embeds)
+            ),
+        )
+        result.add_check("prompt_embeds", batch.prompt_embeds, V.list_of_tensors)
+        result.add_check(
+            "num_videos_per_prompt", batch.num_outputs_per_prompt, V.positive_int
+        )
+        result.add_check("num_frames", batch.num_frames, V.positive_int)
+        result.add_check("height", batch.height, V.positive_int)
+        result.add_check("width", batch.width, V.positive_int)
+        result.add_check("latents", batch.latents, V.none_or_tensor)
+        return result
 
     def verify_output(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         result = VerificationResult()
