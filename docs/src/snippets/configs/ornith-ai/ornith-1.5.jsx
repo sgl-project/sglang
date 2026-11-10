@@ -3,7 +3,11 @@
 export const config = {
   modelName: "Ornith-1.5",
 
-  supportedHardware: ["h100", "h200"],
+  supportedHardware: ["h100", "h200", "xeon"],
+  hardware: [
+    { id: "xeon", label: "XEON", vram: "CPU", vendor: "cpu" },
+  ],
+  runModes: (s) => s.hw === "xeon" ? ["python"] : ["python", "docker"],
 
   showPlaygroundLink: false,
 
@@ -68,7 +72,34 @@ export const config = {
     cookbookModel: "ornith-ai/Ornith-1.5",
   },
 
+  playgroundFeatures: {
+    normalizeDeltas: (deltas, derived, base) => base.hw === "xeon" ? {} : deltas,
+  },
+
   cells: [
+    {
+      match: { hw: "xeon", variant: "9b", quant: "bf16", strategy: "balanced", nodes: "single" },
+      verified: true,
+      warn: "Quick generation verified on Intel Xeon 6972P at TP6. The 8,192-token cache does not cover the full context. Playground overrides, dataset accuracy, and performance are unverified.",
+      env: [
+        "SGLANG_USE_CPU_ENGINE=1",
+        "RAYON_NUM_THREADS=1",
+        "TOKENIZERS_PARALLELISM=false",
+        "OPENBLAS_NUM_THREADS=1",
+      ],
+      flags: [
+        "--model ornith-ai/Ornith-1.5-9B",
+        "--device cpu",
+        "--disable-overlap-schedule",
+        "--revision 489cb97981b8654bcfcf30ce1f94ed1b62e07b53",
+        "--served-model-name {{MODEL_NAME}}",
+        "--tp 6",
+        "--dtype bfloat16",
+        "--max-total-tokens 8192",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
     {
       match: { hw: "h100", variant: "122b", quant: "bf16", strategy: "balanced", nodes: "single" },
       env: [],
