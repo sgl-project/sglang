@@ -26,7 +26,8 @@ test(`${name} exposes only validated Python-only Xeon recipes`, () => {
   assert.ok(config.hardware.some((hw) => hw.id === "xeon" && hw.vendor === "cpu"));
   assert.deepEqual(config.runModes, ["python"]);
   const cells = config.cells.filter((cell) => cell.match.hw === "xeon");
-  assert.deepEqual(cells.map((cell) => cell.match.variant), ["0.9b"]);
+  assert.deepEqual(cells.map((cell) => cell.match.variant),
+    name === "k2-horizon" ? ["0.9b", "3.7b"] : ["0.9b"]);
   const api = engine(config);
   const cell = cells[0];
   const command = api.renderCommand(cell, cell.match, {
@@ -67,3 +68,17 @@ test(`${name} hides unvalidated Playground axes and discards stale GPU overrides
   assert.equal(features.normalizeDeltas(stale, {}, { hw: gpu }), stale);
 });
 }
+
+test("K2 Horizon 3.7B emits its independently validated checkpoint and cache limit", async () => {
+  const config = await load("k2-horizon");
+  const cell = config.cells.find((cell) => cell.match.hw === "xeon" && cell.match.variant === "3.7b");
+  const command = engine(config).renderCommand(cell, cell.match, {
+    HOST_IP: "127.0.0.1", PORT: "31001",
+  });
+  for (const flag of [
+    "--model IFM/K2-Horizon-3.7B",
+    "--revision 4525090a8f0fce1026d861701b9bde2fb726b7a0",
+    "--tp 6", "--max-total-tokens 8192", "OPENBLAS_NUM_THREADS=1",
+  ]) assert.ok(command.includes(flag), flag);
+  assert.doesNotMatch(command, /docker|--gpus|fa3|--ep |--nnodes|--reasoning-parser|--speculative/);
+});
