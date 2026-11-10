@@ -93,9 +93,7 @@ class NPUSwigluDeepEPKernel(BaseActivation):
         self.limit = limit
         self._use_oai = alpha is not None and limit is not None
         if self._use_oai:
-            from sgl_kernel_npu.activation.swiglu_oai_quant import (
-                swiglu_oai_quant,
-            )
+            from sgl_kernel_npu.operators.activation import swiglu_oai_quant
 
             self._kernel = swiglu_oai_quant
         else:
