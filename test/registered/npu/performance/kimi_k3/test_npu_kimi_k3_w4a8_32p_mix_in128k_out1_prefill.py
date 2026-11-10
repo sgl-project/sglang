@@ -97,7 +97,8 @@ KIMI_K3_W4A8_32P_MODEL_CONFIG = {
 
 
 class TestNPUKimiK3W4A832PMixIn128kOut1Prefill(TestNpuPerfMultiNodePdMixTestCaseBase):
-    """Pure prefill: cold 131072 in / 1 out, C1/N1, mean TTFT <= 20 s."""
+    """Pure prefill: cold 131072 in / 1 out, C1/N1, mean TTFT <= 20 s and
+    request throughput >= 0.05 req/s."""
 
     model_config = KIMI_K3_W4A8_32P_MODEL_CONFIG
     benchmark_tool = AISBENCHMARK
@@ -111,6 +112,7 @@ class TestNPUKimiK3W4A832PMixIn128kOut1Prefill(TestNpuPerfMultiNodePdMixTestCase
     random_range_ratio = 1
     request_rate = 0
     ttft = 20000.0
+    request_throughput = 0.05
 
     def test_npu_kimi_k3_w4a8_32p_mix_in128k_out1_prefill(self):
         """Run the 128k cold-prefill TTFT acceptance test."""

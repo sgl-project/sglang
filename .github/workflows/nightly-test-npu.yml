@@ -390,7 +390,7 @@ jobs:
           #   node_size: 2
           #   test_case: test/registered/npu/accuracy/glm5_2/test_npu_glm_5_2_w8a8_16p_gpqa.py
           #   test_type: 'accuracy'
-          # PR validation: only the kimi decode prefix case runs here; the
+          # PR validation: only the two kimi_k3 perf cases below run here; the
           # entries below and all regular jobs are skipped on pull_request.
           # Restore main's list before merging.
           # - name: kimi_k3_w4a8_32p_gpqa
@@ -401,10 +401,10 @@ jobs:
           #   node_size: 2
           #   test_case: test/registered/npu/performance/deepseek_v4_pro/test_npu_deepseek_v4_pro_w4a8_16p_in128k_out1k_prefix90_20ms.py
           #   test_type: 'perf'
-          # - name: kimi_k3_w4a8_32p_mix_in128k_out1_prefill
-          #   node_size: 4
-          #   test_case: test/registered/npu/performance/kimi_k3/test_npu_kimi_k3_w4a8_32p_mix_in128k_out1_prefill.py
-          #   test_type: 'perf'
+          - name: kimi_k3_w4a8_32p_mix_in128k_out1_prefill
+            node_size: 4
+            test_case: test/registered/npu/performance/kimi_k3/test_npu_kimi_k3_w4a8_32p_mix_in128k_out1_prefill.py
+            test_type: 'perf'
           - name: kimi_k3_w4a8_32p_mix_in128k_out1k_decode_prefix
             node_size: 4
             test_case: test/registered/npu/performance/kimi_k3/test_npu_kimi_k3_w4a8_32p_mix_in128k_out1k_decode_prefix.py

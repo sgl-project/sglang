@@ -231,6 +231,7 @@ TPOT_TOLERANCE_HIGH = 1.02  # +2%
 TTFT_TOLERANCE = 1.02  # +2%
 E2E_TOLERANCE = 1.02  # +2%
 OUTPUT_TOKEN_THROUGHPUT_TOLERANCE = 0.98  # -2%
+REQUEST_THROUGHPUT_TOLERANCE = 0.98  # -2%
 
 
 def _get_spec_num_draft_tokens(other_args):
@@ -661,6 +662,7 @@ def run_aisbench(
     repeat_rate=None,
     dp=None,
     generation_kwargs=None,
+    seed=None,
 ):
 
     if dataset_type == "sharegpt":
@@ -764,6 +766,8 @@ def run_aisbench(
         cmd += f" --repeat_rate {repeat_rate}"
     if dp is not None:
         cmd += f" --dp {dp}"
+    if seed is not None:
+        cmd += f" --seed {seed}"
     if generation_kwargs:
         cmd += f" --generation-kwargs '{generation_kwargs}'"
 
@@ -964,6 +968,7 @@ def assert_metrics(self, metrics):
     # defensively instead of relying on class attributes.
     tpot = getattr(self, "tpot", None)
     output_token_throughput = getattr(self, "output_token_throughput", None)
+    request_throughput = getattr(self, "request_throughput", None)
     ttft = getattr(self, "ttft", None)
     mean_e2e_latency = getattr(self, "mean_e2e_latency", None)
     if tpot and metrics.get("mean_tpot"):
@@ -997,6 +1002,17 @@ def assert_metrics(self, metrics):
         dump_metric(
             "ttft_baseline",
             float(ttft),
+            labels={"test_case": tc_name, "type": "perf"},
+        )
+    if request_throughput and metrics.get("request_throughput"):
+        dump_metric(
+            "request_throughput",
+            float(metrics["request_throughput"]),
+            labels={"test_case": tc_name, "type": "perf"},
+        )
+        dump_metric(
+            "request_throughput_baseline",
+            float(request_throughput),
             labels={"test_case": tc_name, "type": "perf"},
         )
     if mean_e2e_latency and metrics.get("mean_e2e_latency"):
@@ -1054,6 +1070,15 @@ def assert_metrics(self, metrics):
         self.assertLessEqual(
             float(metrics["mean_ttft"]),
             ttft * TTFT_TOLERANCE,
+        )
+    if request_throughput:
+        self.assertIsNotNone(
+            metrics.get("request_throughput"),
+            "request_throughput not found in benchmark output while a baseline is set",
+        )
+        self.assertGreaterEqual(
+            float(metrics["request_throughput"]),
+            request_throughput * REQUEST_THROUGHPUT_TOLERANCE,
         )
     if mean_e2e_latency:
         self.assertLessEqual(
@@ -1168,6 +1193,7 @@ class TestNpuPerformanceTestCaseBase(CustomTestCase):
     tpot = None
     mean_e2e_latency = None
     output_token_throughput = None
+    request_throughput = None
     # Baseline for accept_length / speculative-num-draft-tokens; None disables
     # the assertion.
     accept_rate = None
@@ -1354,6 +1380,7 @@ class TestNpuPerformanceTestCaseBase(CustomTestCase):
                 repeat_rate=self.repeat_rate,
                 dp=self.dp,
                 generation_kwargs=self.generation_kwargs,
+                seed=self.seed,
             )
             assert_metrics(self, metrics)
 
@@ -1417,6 +1444,7 @@ class TestNpuPerfMultiNodePdMixTestCaseBase(CustomTestCase):
     tpot = None
     mean_e2e_latency = None
     output_token_throughput = None
+    request_throughput = None
 
     dp = None
     generation_kwargs = None
@@ -1487,6 +1515,7 @@ class TestNpuPerfMultiNodePdMixTestCaseBase(CustomTestCase):
                 repeat_rate=self.repeat_rate,
                 dp=self.dp,
                 generation_kwargs=self.generation_kwargs,
+                seed=self.seed,
             )
             assert_metrics(self, metrics)
 
@@ -1550,6 +1579,7 @@ class TestNpuPerfMultiNodePdSepTestCaseBase(CustomTestCase):
     tpot = None
     mean_e2e_latency = None
     output_token_throughput = None
+    request_throughput = None
 
     dp = None
     generation_kwargs = None
@@ -1656,6 +1686,7 @@ class TestNpuPerfMultiNodePdSepTestCaseBase(CustomTestCase):
                 repeat_rate=self.repeat_rate,
                 dp=self.dp,
                 generation_kwargs=self.generation_kwargs,
+                seed=self.seed,
             )
             assert_metrics(self, metrics)
 
