@@ -107,6 +107,20 @@ pub trait MmProcessor: Send + Sync {
         Ok(())
     }
 
+    /// One I/O-backed source the processor already holds (e.g. in a cache),
+    /// its bytes charged to `budget`. Runs on an async worker before the
+    /// source's blocking fetch is scheduled, so it must not block. `None`
+    /// leaves the source to [`MmProcessor::fetch_media`], which also reports
+    /// any failure.
+    fn cached_media(
+        &self,
+        _source: &str,
+        _modality: MmModality,
+        _budget: &crate::MediaByteBudget,
+    ) -> Option<bytes::Bytes> {
+        None
+    }
+
     /// Fetch one I/O-backed source, charging its bytes to `budget`; runs on
     /// the API runtime's blocking pool. `Ok(None)` leaves the source to the
     /// built-in fetcher (`http(s)://`, `file://` and absolute paths), which
@@ -118,6 +132,14 @@ pub trait MmProcessor: Send + Sync {
         _budget: &crate::MediaByteBudget,
     ) -> Result<Option<bytes::Bytes>, MediaError> {
         Ok(None)
+    }
+
+    /// How long one source's blocking fetch (this processor's, then the
+    /// built-in fetcher's) may take before the request fails without
+    /// waiting for it; the fetch thread finishes on its own. `None` waits
+    /// for the fetch to return.
+    fn media_fetch_deadline(&self) -> Option<std::time::Duration> {
+        None
     }
 
     /// Finish item layout after caller hash overrides, before feature publication.
