@@ -50,7 +50,9 @@ jobs:
         run: |
           set -euo pipefail
           date_tag="$(date +%Y%m%d)"
-          commit_hash="$(git rev-parse --short=7 HEAD)"
+          commit="$(git rev-parse HEAD)"
+          commit_hash="${commit:0:7}"
+          echo "commit=${commit}" >> "$GITHUB_OUTPUT"
           image_repo="${{ inputs.image_repo || 'lmsysorg/sglang' }}"
           echo "image_repo=${image_repo}"                                  >> "$GITHUB_OUTPUT"
           echo "tag=nightly-cu134-${date_tag}-${commit_hash}"              >> "$GITHUB_OUTPUT"
@@ -63,6 +65,15 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      - name: Resolve Mega main
+        id: mega
+        run: |
+          set -euo pipefail
+          MEGA_COMMIT="$(git ls-remote --exit-code https://github.com/sgl-project/sgl-nvidia-mega.git refs/heads/main | cut -f1)"
+          [[ "$MEGA_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          echo "commit=$MEGA_COMMIT" >> "$GITHUB_OUTPUT"
+          echo "Mega main: $MEGA_COMMIT" >> "$GITHUB_STEP_SUMMARY"
+
       - name: Build image
         run: |
           set -euo pipefail
@@ -74,6 +85,10 @@ jobs:
             --build-arg BRANCH_TYPE=local \
             --build-arg BUILD_TYPE=all \
             --build-arg BUILD_JOBS="$(nproc)" \
+            --build-arg SGL_NVIDIA_MEGA_REF=${{ steps.mega.outputs.commit }} \
+            --build-arg SGLANG_BUILD_COMMIT=${{ steps.meta.outputs.commit }} \
+            --build-arg SGLANG_BUILD_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            --build-arg SGLANG_IMAGE_TAG="${{ steps.meta.outputs.image_repo }}:${{ steps.meta.outputs.tag }}" \
             -f docker/Dockerfile.cu134 \
             -t "${{ steps.meta.outputs.image_repo }}:${{ steps.meta.outputs.tag }}" \
             -t "${{ steps.meta.outputs.image_repo }}:${{ steps.meta.outputs.tag_rolling }}" \

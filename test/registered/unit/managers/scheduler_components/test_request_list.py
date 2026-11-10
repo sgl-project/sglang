@@ -19,8 +19,10 @@ from sglang.srt.managers.scheduler_components.deferred_responses import (
     DeferredResponses,
 )
 from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
     KeyedReqList,
     ListKind,
+    move,
 )
 from sglang.srt.models.unlimited_ocr_v2_support.document_prefetch import DocPrefetch
 from sglang.srt.models.unlimited_ocr_v2_support.scheduler_runtime import (
@@ -94,6 +96,27 @@ class TestKeyedReqList(CustomTestCase):
 
         self.assertEqual(list(running), [c])
         self.assertNotIn(a, running)
+
+
+def _reqs(rids):
+    return [FakeReq(rid=rid) for rid in rids]
+
+
+class TestMove(CustomTestCase):
+    def test_move_wraps_into_a_wrapper_list_and_keeps_its_index(self):
+        a, b, c = _reqs("abc")
+        src = KeyedReqList(ListKind.PREFILL_LAUNCHED)
+        src.join([a, b, c])
+        dst = IndexedReqList(ListKind.PD_RELEASING, req_of=lambda x: x[0])
+        held = (c, "held")
+        dst.join([held])
+
+        wrapped = [(a, "a"), (b, "b")]
+        move(wrapped, src, dst)
+
+        self.assertEqual(list(src), [c])
+        self.assertEqual(list(dst.items()), [held, *wrapped])
+        self.assertEqual(list(dst), [c, a, b])
 
 
 if __name__ == "__main__":
