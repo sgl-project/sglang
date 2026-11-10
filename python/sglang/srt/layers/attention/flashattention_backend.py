@@ -321,11 +321,23 @@ class FlashAttentionBackend(AttentionBackend):
                 "Use --attention-backend triton on SM8x."
             )
         # FA4 on SM90 reads an fp8 e4m3 cache with unquantized Q, casting K/V in-kernel.
+        # MHA only: absorbed MLA passes qv, which that kernel path does not take.
         self.fa4_casts_fp8_kv = (
             device_capability[0] == 9
             and self.kv_cache_dtype == torch.float8_e4m3fn
             and not self.kv_cache_is_mxfp8
+            and not self.use_mla
         )
+        if (
+            self.fa_impl_ver == 4
+            and self.fa4_casts_fp8_kv
+            and model_head_dim not in (256, 512)
+        ):
+            raise ValueError(
+                "FA4 on SM90 reads an fp8_e4m3 KV cache only at head_dim 256 or "
+                f"512, and this model has head_dim {model_head_dim}. Use a BF16 "
+                "KV cache or the fa3 backend."
+            )
         if (
             self.fa3_upgrades_to_fa4
             and self.kv_cache_dtype != torch.bfloat16

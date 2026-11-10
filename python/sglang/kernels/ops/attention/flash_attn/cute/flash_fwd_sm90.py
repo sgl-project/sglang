@@ -1515,7 +1515,11 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     stage(n_block=n_block_min, K_or_V="V", phase=stage_phase)
                     stage_phase ^= 1
                 else:
-                    for i in cutlass.range(n_block_max - n_block_min, unroll=1):
+                    # The consumer always runs the first block, even on an empty
+                    # tile (n_block_max <= n_block_min), so always stage its pair.
+                    for i in cutlass.range(
+                        cutlass.max(n_block_max - n_block_min, 1), unroll=1
+                    ):
                         n_block = n_block_max - 1 - i
                         stage(n_block=n_block, K_or_V="K", phase=stage_phase)
                         stage_phase ^= 1
