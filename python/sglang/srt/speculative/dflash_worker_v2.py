@@ -629,7 +629,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._out_tokens_bufs: List[torch.Tensor] = []
         self._new_seq_lens_bufs: List[torch.Tensor] = []
         self._sharded_greedy_logits = (
-            is_hip() and envs.SGLANG_MUSE_SHARDED_GREEDY_LOGITS.get()
+            is_hip() and envs.SGLANG_ROCM_MUSE_SHARDED_GREEDY_LOGITS.get()
         )
         self._target_logits_processor = self._defer_target_verify_gather()
 
@@ -1346,7 +1346,7 @@ class DFlashWorkerV2(BaseSpecWorker):
 
     def _draft_kv_full_to_swa_mapping(self) -> Optional[torch.Tensor]:
         """The target's full->SWA id table when the draft pool's rows are the
-        target's sliding-window ids (SGLANG_ENABLE_DFLASH_SWA_DRAFT_KV), else
+        target's sliding-window ids (SGLANG_ROCM_ENABLE_DFLASH_SWA_DRAFT_KV), else
         None. Its compact rows must name those ids, like its writes do."""
         if not self.draft_model_runner.token_to_kv_pool.follows_target_swa_ids:
             return None

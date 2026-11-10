@@ -36,7 +36,7 @@ ENABLE_PLAN_C=1 AITER_ROOT=/sgl-workspace/aiter \
 
 `MUSE_MOE_BACKEND=triton` is the default on HIP. Set it to `flydsl` for the
 optimized FlyDSL experts, or `native` for a correctness fallback. Plan C
-short-window attention remains opt-in with `SGLANG_MUSE_FLYDSL_DECODE=1`; its
+short-window attention remains opt-in with `SGLANG_ROCM_MUSE_FLYDSL_DECODE=1`; its
 aiter kernel is under `patches/experimental`.
 
 Launch the validated TP8/EP8 Plan B configuration:

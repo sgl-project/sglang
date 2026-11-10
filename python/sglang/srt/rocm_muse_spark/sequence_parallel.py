@@ -4,12 +4,12 @@ Plain EXTEND batches of at least ``SP_MIN_TOKENS`` tokens run the norms, residua
 pooler / unpooler on 1/TP of the tokens (each rank keeps a contiguous shard, padded to a multiple of TP).
 Attention and the experts still see every token:
 
-* Ulysses (``SGLANG_MUSE_PREFILL_ULYSSES``): each rank projects its own token shard for every head with the
+* Ulysses (``SGLANG_ROCM_MUSE_PREFILL_ULYSSES``): each rank projects its own token shard for every head with the
   gathered QKV/gate weight, an all-to-all hands every rank all tokens of its own heads, attention and the output
   norm/gate run as under TP, a second all-to-all returns all heads of the rank's tokens and the full O projection
   finishes them without a reduction. Per 16K tokens and layer that moves ~95 MB per rank instead of the
   all-gather + reduce-scatter's ~450 MB. Without it the shard is all-gathered before attention and the
-  attention output reduce-scattered. With ``SGLANG_MUSE_ULYSSES_PIPELINE`` both all-to-alls run in row chunks
+  attention output reduce-scattered. With ``SGLANG_ROCM_MUSE_ULYSSES_PIPELINE`` both all-to-alls run in row chunks
   of the shard on a side stream, each overlapped with the projection of a neighbouring chunk.
 * Experts: the shard's router outputs and expert inputs are all-gathered (as MXFP4 bytes when the a4w4 experts
   run, since per-row quantization commutes with the gather) and the expert output is reduce-scattered.
@@ -46,10 +46,10 @@ ULYSSES_MAX_CHUNKS = 4
 ULYSSES_QKV_SKEW_ROWS = 512
 ULYSSES_QKV_MIN_TAIL_ROWS = 1536
 
-_PREFILL_SP = envs.SGLANG_MUSE_PREFILL_SP.get()
-_PREFILL_ULYSSES = envs.SGLANG_MUSE_PREFILL_ULYSSES.get()
-_ULYSSES_LOCAL_GATE = envs.SGLANG_MUSE_ULYSSES_LOCAL_GATE.get()
-_ULYSSES_PIPELINE = envs.SGLANG_MUSE_ULYSSES_PIPELINE.get()
+_PREFILL_SP = envs.SGLANG_ROCM_MUSE_PREFILL_SP.get()
+_PREFILL_ULYSSES = envs.SGLANG_ROCM_MUSE_PREFILL_ULYSSES.get()
+_ULYSSES_LOCAL_GATE = envs.SGLANG_ROCM_MUSE_ULYSSES_LOCAL_GATE.get()
+_ULYSSES_PIPELINE = envs.SGLANG_ROCM_MUSE_ULYSSES_PIPELINE.get()
 _comm_stream = None
 
 

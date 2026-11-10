@@ -4,9 +4,9 @@
 attention layer with ``save_kv_cache=False``, the usual SGLang pattern for producers that fuse the cache store
 (bailing_moe, gemma4):
 
-* ``qkv_proj_norm_rope_kv_write`` (``SGLANG_MUSE_FUSED_QKV_CACHE``): up to 32 rows, the QKV + output-gate
+* ``qkv_proj_norm_rope_kv_write`` (``SGLANG_ROCM_MUSE_FUSED_QKV_CACHE``): up to 32 rows, the QKV + output-gate
   projection's split-K partials feed the QK-norm / RoPE / cache-store epilogue directly.
-* ``qk_norm_rope_kv_write`` (``SGLANG_MUSE_QK_ROPE_CACHE``): up to 64 rows, from the projected Q/K/V.
+* ``qk_norm_rope_kv_write`` (``SGLANG_ROCM_MUSE_QK_ROPE_CACHE``): up to 64 rows, from the projected Q/K/V.
 
 Both write exactly where and what the backend's own store would (FP8 with the layer's per-tensor scales, through
 the full -> SWA slot mapping on sliding layers), so they only engage when the backend reads K/V from the
@@ -31,8 +31,8 @@ from sglang.srt.model_executor.forward_context import get_attn_backend
 
 logger = logging.getLogger(__name__)
 
-QK_ROPE_CACHE = envs.SGLANG_MUSE_QK_ROPE_CACHE.get()
-FUSED_QKV_CACHE = envs.SGLANG_MUSE_FUSED_QKV_CACHE.get()
+QK_ROPE_CACHE = envs.SGLANG_ROCM_MUSE_QK_ROPE_CACHE.get()
+FUSED_QKV_CACHE = envs.SGLANG_ROCM_MUSE_FUSED_QKV_CACHE.get()
 _logged: set = set()
 
 

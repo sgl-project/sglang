@@ -4,9 +4,9 @@ The Quark checkpoint declares dynamic per-32 MXFP4 activations, so A4W4 is the c
 produce unweighted per-(token, slot) expert rows; Muse's FlyDSL finalize then applies the per-expert RMSNorm
 with input scale before the route-weighted sum, which a combining MoE epilogue cannot express.
 
-* Compact A4 (``SGLANG_MUSE_COMPACT_A4_VERIFY``): target-verify batches (a multiple of 8 rows, up to 512) at
+* Compact A4 (``SGLANG_ROCM_MUSE_COMPACT_A4_VERIFY``): target-verify batches (a multiple of 8 rows, up to 512) at
   TP8 / EP8 or TP4 / EP4 run the Triton ``mxfp4_compact_a4_moe`` experts on the checkpoint weights as stored.
-* a4w4 (``SGLANG_MUSE_A4W4_MOE``): prefill batches of at least ``A4W4_MIN_ROWS`` rows run aiter's FlyDSL
+* a4w4 (``SGLANG_ROCM_MUSE_A4W4_MOE``): prefill batches of at least ``A4W4_MIN_ROWS`` rows run aiter's FlyDSL
   stage-1 / stage-2 MXFP4 kernels on weights shuffled once at load into aiter's preshuffle layout (an extra copy
   beside the native one); stage 1 writes MXFP4 + sorted scales itself.
 """
@@ -35,9 +35,9 @@ def _has_module(name: str) -> bool:
 # aiter without it keeps the Triton expert path.
 _HAS_AITER_MUSE_FINALIZE = _has_module("aiter.ops.flydsl.muse_moe_finalize")
 COMPACT_A4_ENABLED = (
-    envs.SGLANG_MUSE_COMPACT_A4_VERIFY.get() and _HAS_AITER_MUSE_FINALIZE
+    envs.SGLANG_ROCM_MUSE_COMPACT_A4_VERIFY.get() and _HAS_AITER_MUSE_FINALIZE
 )
-A4W4_ENABLED = envs.SGLANG_MUSE_A4W4_MOE.get() and _HAS_AITER_MUSE_FINALIZE
+A4W4_ENABLED = envs.SGLANG_ROCM_MUSE_A4W4_MOE.get() and _HAS_AITER_MUSE_FINALIZE
 A4W4_MIN_ROWS = 256
 # Stage-1 launch (tile_n, async copy, waves per EU), MI355X prefill widths.
 _S1_TILE_N = 128

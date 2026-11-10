@@ -83,7 +83,7 @@ if _is_gfx95:
         conv_prepare,
     )
 
-# MI355X, TP4 Muse Spark draft (SGLANG_MUSE_DFLASH_DENSE): the QKV [2560, 8192], MLP down [8192, 7168] and
+# MI355X, TP4 Muse Spark draft (SGLANG_ROCM_MUSE_DFLASH_DENSE): the QKV [2560, 8192], MLP down [8192, 7168] and
 # gate/up [14336, 8192] weights on the row-major split-K GEMM at the widths it is tuned for (the ROW_MAJOR table);
 # the gate/up from 33 to 128 rows on hipBLASLt, since aiter's tuned table picks a slower split-K kernel there with
 # HBM-resident weights (63.5 vs 48.5 us at 64 rows, with the SiLU-and-mul).
@@ -731,7 +731,7 @@ class DFlashMLP(nn.Module):
             )
         self.gate_up_on_hipblaslt = (
             _is_gfx95
-            and envs.SGLANG_MUSE_DFLASH_DENSE.get()
+            and envs.SGLANG_ROCM_MUSE_DFLASH_DENSE.get()
             and isinstance(self.gate_up_proj.quant_method, UnquantizedLinearMethod)
             and tuple(self.gate_up_proj.weight.shape) in _GFX950_HIPBLASLT_WEIGHTS
         )
@@ -804,9 +804,9 @@ class DFlashGroupedConv(nn.Module):
         self.kernel_projection = ReplicatedLinear(
             hidden_size, 2 * self.taps * self.num_groups, bias=False
         )
-        # MI355X (SGLANG_MUSE_DFLASH_FUSED_CONV): the projection's row-major split-K partials are summed inside the
+        # MI355X (SGLANG_ROCM_MUSE_DFLASH_FUSED_CONV): the projection's row-major split-K partials are summed inside the
         # input convolution kernel, and the output convolution runs inside the next residual add + RMSNorm.
-        self.fused = _is_gfx95 and envs.SGLANG_MUSE_DFLASH_FUSED_CONV.get()
+        self.fused = _is_gfx95 and envs.SGLANG_ROCM_MUSE_DFLASH_FUSED_CONV.get()
 
     def _fused_applies(self, hidden_states: torch.Tensor) -> bool:
         return self.fused and conv_applies(
@@ -1035,7 +1035,7 @@ class DFlashDraftModel(nn.Module):
                 prefix=embed_prefix,
             )
 
-        if _is_gfx95 and envs.SGLANG_MUSE_DFLASH_DENSE.get():
+        if _is_gfx95 and envs.SGLANG_ROCM_MUSE_DFLASH_DENSE.get():
             register_gfx950_unquantized_gemm_shapes(
                 rowmajor_weights=_GFX950_ROWMAJOR_WEIGHTS
             )
@@ -1638,12 +1638,12 @@ class DFlash2DraftModel(DFlashDraftModel):
         # The draft has no head of its own; the worker points this at the target's
         # before capture.
         self.lm_head: Optional[nn.Module] = None
-        # MI355X (SGLANG_MUSE_DFLASH_FUSED_CANDIDATES): under TP the ranks' candidates
+        # MI355X (SGLANG_ROCM_MUSE_DFLASH_FUSED_CANDIDATES): under TP the ranks' candidates
         # travel in one all-gather and one kernel merges them and applies the transform.
         tp_size = int(get_parallel().tp_size)
         self.merge_candidates_fused = (
             _is_gfx95
-            and envs.SGLANG_MUSE_DFLASH_FUSED_CANDIDATES.get()
+            and envs.SGLANG_ROCM_MUSE_DFLASH_FUSED_CANDIDATES.get()
             and tp_size > 1
             and tp_size & (tp_size - 1) == 0
             and int(config.vocab_size) < MAX_PACKED_ID

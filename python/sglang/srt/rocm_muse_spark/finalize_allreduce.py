@@ -1,4 +1,4 @@
-"""Muse Spark decode MoE finalize fused with the TP4 all-reduce (MI355X, ``SGLANG_MUSE_FINALIZE_AR_PUSH``).
+"""Muse Spark decode MoE finalize fused with the TP4 all-reduce (MI355X, ``SGLANG_ROCM_MUSE_FINALIZE_AR_PUSH``).
 
 ``finalize_allreduce.hip`` replaces the FlyDSL finalize + aiter two-stage all-reduce pair of the compact A4
 target-verify MoE with one launch; see its header for the protocol. The code object is built at first use with

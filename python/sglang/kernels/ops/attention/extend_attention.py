@@ -38,7 +38,7 @@ _is_gfx1250 = _is_hip and is_gfx1250_supported()
 logger = logging.getLogger(__name__)
 
 # DFlash draft blocks (Muse Spark DFlash2 at TP8) on gfx950 take the split-KV kernel.
-_use_dflash_block_splitkv = _is_gfx95 and envs.SGLANG_MUSE_DFLASH_SPLITKV.get()
+_use_dflash_block_splitkv = _is_gfx95 and envs.SGLANG_ROCM_MUSE_DFLASH_SPLITKV.get()
 _dflash_block_splitkv_logged: set = set()
 
 try:

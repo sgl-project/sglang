@@ -152,9 +152,9 @@ def _dflash_draft_cell_size(kvc: KVCacheConfigurator) -> int:
 
 def dflash_draft_kv_follows_target_swa(kvc: KVCacheConfigurator) -> bool:
     """Whether the target sizes its compact-window DFLASH draft pool per
-    sliding-window token (SGLANG_ENABLE_DFLASH_SWA_DRAFT_KV). The draft's whole
+    sliding-window token (SGLANG_ROCM_ENABLE_DFLASH_SWA_DRAFT_KV). The draft's whole
     read window must stay inside what the target's SWA eviction retains. ROCm only."""
-    if not _is_hip or not envs.SGLANG_ENABLE_DFLASH_SWA_DRAFT_KV.get():
+    if not _is_hip or not envs.SGLANG_ROCM_ENABLE_DFLASH_SWA_DRAFT_KV.get():
         return False
     if kvc.is_draft_worker or not kvc.spec_algorithm.is_dflash_family():
         return False
@@ -180,7 +180,7 @@ def dflash_draft_kv_follows_target_swa(kvc: KVCacheConfigurator) -> bool:
         reasons.append("DCP widens the draft id space")
     if reasons:
         logger.warning(
-            "SGLANG_ENABLE_DFLASH_SWA_DRAFT_KV ignored: %s", "; ".join(reasons)
+            "SGLANG_ROCM_ENABLE_DFLASH_SWA_DRAFT_KV ignored: %s", "; ".join(reasons)
         )
         return False
     return True

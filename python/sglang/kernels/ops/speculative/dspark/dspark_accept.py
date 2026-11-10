@@ -29,7 +29,7 @@ except ImportError:  # pragma: no cover - a tree without the split kernels
 _SPLIT_ACCEPT = (
     is_hip()
     and chain_speculative_sampling_split is not None
-    and __import__("os").environ.get("SGLANG_DSPARK_SPLIT_ACCEPT", "1") == "1"
+    and __import__("os").environ.get("SGLANG_ROCM_DSPARK_SPLIT_ACCEPT", "1") == "1"
 )
 
 _is_npu = is_npu()

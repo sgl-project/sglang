@@ -143,7 +143,7 @@ class MuseSpark1xLogitsProcessor(OSSLogitsProcessor):
         return logits
 
 
-_FINALIZE_AR_PUSH = envs.SGLANG_MUSE_FINALIZE_AR_PUSH.get()
+_FINALIZE_AR_PUSH = envs.SGLANG_ROCM_MUSE_FINALIZE_AR_PUSH.get()
 
 
 def _is_rocm() -> bool:
@@ -333,14 +333,14 @@ _ROWMAJOR_LINEAR_SHAPES = ((8192, 2048), (8192, 1024))  # O-proj at TP4 / TP8
 # Unquantized linear layers with an FP8 weight copy: the TP4 QKV (+ gate) projection, fed the per-row FP8 copy of
 # the attention input that the previous FFN boundary kernel writes (decode / verify up to 128 rows).
 _FP8W_LINEAR_SHAPES = ((4608, 8192), (2304, 8192))  # QKV at TP4 / TP8
-_DENSE_FP8 = envs.SGLANG_MUSE_DENSE_FP8.get()
+_DENSE_FP8 = envs.SGLANG_ROCM_MUSE_DENSE_FP8.get()
 _FP8_MAX_ROWS = 128
 # Plain extend batches above _FP8_MAX_ROWS run the QKV / O projections and the pooler / unpooler on the FP8
 # weight copies through aiter's CK GEMM from each weight's own minimum width (kernels/ops/gemm/fp8_prefill_gemm);
 # the O projection's copy and the pooler / unpooler copies exist for this path only.
-_PREFILL_DENSE_FP8 = _DENSE_FP8 and envs.SGLANG_MUSE_PREFILL_DENSE_FP8.get()
+_PREFILL_DENSE_FP8 = _DENSE_FP8 and envs.SGLANG_ROCM_MUSE_PREFILL_DENSE_FP8.get()
 # Target verify: the attention partials' split-KV merge runs inside the output norm-gate kernel.
-_VERIFY_REDUCE_NORM_GATE = envs.SGLANG_MUSE_VERIFY_REDUCE_NORM_GATE.get()
+_VERIFY_REDUCE_NORM_GATE = envs.SGLANG_ROCM_MUSE_VERIFY_REDUCE_NORM_GATE.get()
 # Decode-sized fp32 router as one split-K Triton GEMV (+reduce); MUSE_ROUTER_GEMV=0 restores torch.mm.
 _USE_ROUTER_GEMV = (
     os.environ.get("MUSE_ROUTER_GEMV", "1") == "1" and torch.version.hip is not None
@@ -359,15 +359,15 @@ _tgemm = None
 # Pooler / unpooler at the verify widths aiter patch 06 tunes go through aiter's
 # tuned BF16 GEMM (searched hipBLASLt solutions); the FP32 router runs a tuned
 # split-K GEMM (configs in kernels/ops/gemm/configs).
-_DENSE_TUNED = envs.SGLANG_MUSE_DENSE_TUNED.get()
+_DENSE_TUNED = envs.SGLANG_ROCM_MUSE_DENSE_TUNED.get()
 # Tiled 17..64-row GEMMs: the pooler here, unquantized linear layers through
 # register_gfx950_unquantized_gemm_shapes (the O projection, the DFlash draft MLP).
-_DENSE_TILED = envs.SGLANG_MUSE_DENSE_TILED.get()
+_DENSE_TILED = envs.SGLANG_ROCM_MUSE_DENSE_TILED.get()
 # The DFlash draft's gate/up and down GEMMs at the measured M = 24 (TP8) on the
 # aiter Triton a16w16 kernel instead of the tuned table's padded-M pick.
 _DRAFT_TRITON_A16W16_GEMMS = ((24, 7168, 8192), (24, 8192, 3584))
 # Unpooler GEMM fused with the next FFN boundary's norms at decode / verify widths.
-_FUSED_UNPOOL_BOUNDARY = envs.SGLANG_MUSE_FUSED_UNPOOL_BOUNDARY.get()
+_FUSED_UNPOOL_BOUNDARY = envs.SGLANG_ROCM_MUSE_FUSED_UNPOOL_BOUNDARY.get()
 # Device memory left for the KV pool, CUDA graphs and activations beside both MXFP4 expert layouts; below it
 # the experts keep only the a4w4 preshuffled copy. Arbitrary, not tuned.
 _A4W4_RESERVE_BYTES = 64 << 30

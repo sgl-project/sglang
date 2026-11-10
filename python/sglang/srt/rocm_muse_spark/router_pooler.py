@@ -2,9 +2,9 @@
 
 At decode / verify widths (up to 64 rows) the router logits, the sigmoid top-8 routing, the pooler projection
 and the pre-expert RMSNorm share one epilogue (``kernels/ops/moe/router_pooler_topk``) instead of separate
-router GEMM, routing, pooler GEMM and norm launches (``SGLANG_MUSE_SHARED_ROUTER_POOLER``). Verify batches of
+router GEMM, routing, pooler GEMM and norm launches (``SGLANG_ROCM_MUSE_SHARED_ROUTER_POOLER``). Verify batches of
 8 / 16 / 24 rows run the router and the pooler as one GEMM over a packed weight prepared after loading
-(``SGLANG_MUSE_JOINT_ROUTER_POOLER``).
+(``SGLANG_ROCM_MUSE_JOINT_ROUTER_POOLER``).
 """
 
 from __future__ import annotations
@@ -28,11 +28,11 @@ from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
 
-SHARED_ROUTER_POOLER = envs.SGLANG_MUSE_SHARED_ROUTER_POOLER.get()
-JOINT_ROUTER_POOLER = envs.SGLANG_MUSE_JOINT_ROUTER_POOLER.get()
+SHARED_ROUTER_POOLER = envs.SGLANG_ROCM_MUSE_SHARED_ROUTER_POOLER.get()
+JOINT_ROUTER_POOLER = envs.SGLANG_ROCM_MUSE_JOINT_ROUTER_POOLER.get()
 # The joint form's pooler tiles run on an FP8 copy of the pooler when the boundary kernel hands over the FP8
 # activation (same switch as the FP8 dense GEMMs).
-JOINT_POOLER_FP8 = JOINT_ROUTER_POOLER and envs.SGLANG_MUSE_DENSE_FP8.get()
+JOINT_POOLER_FP8 = JOINT_ROUTER_POOLER and envs.SGLANG_ROCM_MUSE_DENSE_FP8.get()
 _JOINT_ROWS = (8, 16, 24)
 _logged: set = set()
 
@@ -117,7 +117,7 @@ def route_with_shared_pooler(moe, x: torch.Tensor, quant_out=None, x_fp8=None):
     if JOINT_ROUTER_POOLER and (
         m in _JOINT_ROWS
         or (
-            envs.SGLANG_MUSE_DENSE_TILED.get()
+            envs.SGLANG_ROCM_MUSE_DENSE_TILED.get()
             and joint_router_pooler_applies(x, moe.router_pooler_packed_weight)
         )
     ):
@@ -161,7 +161,7 @@ def route_with_shared_pooler(moe, x: torch.Tensor, quant_out=None, x_fp8=None):
         float(moe.route_scale),
         float(moe.pre_expert_norm.eps),
         pooler_tiled=getattr(moe.pre_expert_proj, "small_m_tiled_weight", None),
-        pooler_rowmajor=envs.SGLANG_MUSE_DENSE_TILED.get(),
+        pooler_rowmajor=envs.SGLANG_ROCM_MUSE_DENSE_TILED.get(),
         quant_out=quant_out,
     ), quant_out
 

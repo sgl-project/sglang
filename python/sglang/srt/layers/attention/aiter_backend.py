@@ -826,7 +826,7 @@ class AiterAttnBackend(AttentionBackend):
         # FlyDSL kernel. Keep this shape-gated so Qwen/Kimi/DSV4 dispatch is
         # unchanged; full-attention Muse layers retain unified_attention_3d.
         self.use_muse_flydsl_decode = (
-            envs.SGLANG_MUSE_FLYDSL_DECODE.get()
+            envs.SGLANG_ROCM_MUSE_FLYDSL_DECODE.get()
             and muse_paged_gqa_decode_flydsl is not None
             and is_gfx95_supported()
             and self.page_size == 16
@@ -899,53 +899,53 @@ class AiterAttnBackend(AttentionBackend):
             self.needs_cpu_seq_lens = False
         self.muse_reuse_extend_metadata = (
             self.use_muse_attention_paths
-            and envs.SGLANG_MUSE_REUSE_EXTEND_METADATA.get()
+            and envs.SGLANG_ROCM_MUSE_REUSE_EXTEND_METADATA.get()
         )
         self.muse_reuse_verify_lengths = (
             self.use_muse_attention_paths
             and self._use_unified_verify
-            and envs.SGLANG_MUSE_REUSE_VERIFY_LENGTHS.get()
+            and envs.SGLANG_ROCM_MUSE_REUSE_VERIFY_LENGTHS.get()
         )
         # Muse unified verify sizes from its page table and the GPU seq_lens, so spec-v2 can skip the per-step
         # seq_lens_cpu D2H; with it the scheduler blocks on the verify before launching the draft (~1 ms idle).
         if (
             self.use_muse_attention_paths
             and self._use_unified_verify
-            and envs.SGLANG_MUSE_SYNC_FREE_VERIFY.get()
+            and envs.SGLANG_ROCM_MUSE_SYNC_FREE_VERIFY.get()
         ):
             self.needs_cpu_seq_lens = False
         self.muse_extend_fp8_q = (
-            self.use_muse_attention_paths and envs.SGLANG_MUSE_EXTEND_FP8_Q.get()
+            self.use_muse_attention_paths and envs.SGLANG_ROCM_MUSE_EXTEND_FP8_Q.get()
         )
         self.muse_extend_gluon = (
             self.muse_extend_fp8_q
             and muse_extend_attention is not None
             and is_gfx95_supported()
-            and envs.SGLANG_MUSE_EXTEND_GLUON.get()
+            and envs.SGLANG_ROCM_MUSE_EXTEND_GLUON.get()
         )
         self._muse_extend_fp8_logged = False
         self.muse_verify_kernels = frozenset(
             name
             for name, env in (
-                ("swa_splitkv", envs.SGLANG_MUSE_VERIFY_SWA_SPLITKV),
-                ("swa_gqa", envs.SGLANG_MUSE_VERIFY_SWA_GQA),
-                ("full_v2", envs.SGLANG_MUSE_VERIFY_FULL_V2),
-                ("full_v2_fp8", envs.SGLANG_MUSE_VERIFY_FP8),
-                ("full_fly", envs.SGLANG_MUSE_VERIFY_FLYDSL),
-                ("full_gqa", envs.SGLANG_MUSE_VERIFY_FULL_GQA),
+                ("swa_splitkv", envs.SGLANG_ROCM_MUSE_VERIFY_SWA_SPLITKV),
+                ("swa_gqa", envs.SGLANG_ROCM_MUSE_VERIFY_SWA_GQA),
+                ("full_v2", envs.SGLANG_ROCM_MUSE_VERIFY_FULL_V2),
+                ("full_v2_fp8", envs.SGLANG_ROCM_MUSE_VERIFY_FP8),
+                ("full_fly", envs.SGLANG_ROCM_MUSE_VERIFY_FLYDSL),
+                ("full_gqa", envs.SGLANG_ROCM_MUSE_VERIFY_FULL_GQA),
             )
             if self.use_muse_attention_paths and self._use_unified_verify and env.get()
         )
         # Extra unified_attention() arguments for Muse extend / verify calls.
         self.muse_unified_attention_kwargs = {}
         if self.use_muse_attention_paths and _unified_attention_has_muse_tiles:
-            if envs.SGLANG_MUSE_PREFILL_2D_TILES.get():
+            if envs.SGLANG_ROCM_MUSE_PREFILL_2D_TILES.get():
                 self.muse_unified_attention_kwargs["prefill_2d_config"] = (
                     _MUSE_PREFILL_2D_CONFIG
                 )
-            if envs.SGLANG_MUSE_UNMASKED_INTERIOR.get():
+            if envs.SGLANG_ROCM_MUSE_UNMASKED_INTERIOR.get():
                 self.muse_unified_attention_kwargs["unmasked_interior"] = True
-            if envs.SGLANG_MUSE_VERIFY_BM64.get():
+            if envs.SGLANG_ROCM_MUSE_VERIFY_BM64.get():
                 self.muse_unified_attention_kwargs.update(
                     verify_block_m=_MUSE_VERIFY_BLOCK_M,
                     verify_num_segments=_MUSE_VERIFY_NUM_SEGMENTS,

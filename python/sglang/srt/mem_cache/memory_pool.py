@@ -1947,7 +1947,7 @@ class KVCache(abc.ABC):
     # state lives on the request pool instead, and the caller has to move it.
     cpu_copy_carries_mamba: bool = False
     # A draft pool whose rows are the target's sliding-window ids
-    # (SGLANG_ENABLE_DFLASH_SWA_DRAFT_KV), not its full-attention ids.
+    # (SGLANG_ROCM_ENABLE_DFLASH_SWA_DRAFT_KV), not its full-attention ids.
     follows_target_swa_ids: bool = False
 
     @abc.abstractmethod

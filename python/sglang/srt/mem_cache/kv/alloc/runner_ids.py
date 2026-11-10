@@ -107,7 +107,7 @@ def _target_swa_space(token_to_kv_pool_allocator) -> IdSpace:
         or not token_to_kv_pool_allocator.has_window_pool
     ):
         raise ValueError(
-            "SGLANG_ENABLE_DFLASH_SWA_DRAFT_KV: the draft pool follows the "
+            "SGLANG_ROCM_ENABLE_DFLASH_SWA_DRAFT_KV: the draft pool follows the "
             "target's SWA ids, but the target allocator "
             f"({type(token_to_kv_pool_allocator).__name__}) has no SWA pool."
         )
@@ -115,7 +115,7 @@ def _target_swa_space(token_to_kv_pool_allocator) -> IdSpace:
         token_to_kv_pool_allocator, "swa_req_ring", False
     ):
         raise ValueError(
-            "SGLANG_ENABLE_DFLASH_SWA_DRAFT_KV needs the paged full->SWA "
+            "SGLANG_ROCM_ENABLE_DFLASH_SWA_DRAFT_KV needs the paged full->SWA "
             "mapping; the per-request SWA ring and the unified pool have none."
         )
     space = (
@@ -125,7 +125,7 @@ def _target_swa_space(token_to_kv_pool_allocator) -> IdSpace:
     )
     if space is None:
         raise ValueError(
-            "SGLANG_ENABLE_DFLASH_SWA_DRAFT_KV: the target pool has no paged "
+            "SGLANG_ROCM_ENABLE_DFLASH_SWA_DRAFT_KV: the target pool has no paged "
             "sliding-window sub-pool."
         )
     return space

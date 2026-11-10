@@ -107,11 +107,11 @@ _A16W16_TRITON_NARROW_K_MAX_M = 512
 # (the ROCm Muse Spark model registers its attention O projection and its DFlash
 # draft's MLP; see register_gfx950_unquantized_gemm_shapes):
 # * weight shapes (N, K) whose 17..64-row GEMMs run from a tile-contiguous copy
-#   made in process_weights_after_loading (SGLANG_MUSE_DENSE_TILED);
+#   made in process_weights_after_loading (SGLANG_ROCM_MUSE_DENSE_TILED);
 # * weight shapes (N, K) whose tuned 17..128-row GEMMs read the stored weight
 #   through the same split-K kernel (row-major, no copy; same switch);
 # * weight shapes (N, K) that also keep a per-channel FP8 copy for the FP8 small-M
-#   GEMM a model calls itself with pre-quantized activations (SGLANG_MUSE_DENSE_FP8);
+#   GEMM a model calls itself with pre-quantized activations (SGLANG_ROCM_MUSE_DENSE_FP8);
 # * exact (M, N, K) GEMMs routed to the aiter Triton a16w16 kernel (wide K, where
 #   the tuned table's pick for the padded M is slower).
 _gfx950_tiled_weight_shapes: set = set()
@@ -837,7 +837,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
         if (
             _is_gfx95
             and _gfx950_tiled_weight_shapes
-            and envs.SGLANG_MUSE_DENSE_TILED.get()
+            and envs.SGLANG_ROCM_MUSE_DENSE_TILED.get()
             and type(layer.weight.data) is torch.Tensor
             and tuple(layer.weight.shape) in _gfx950_tiled_weight_shapes
         ):
@@ -845,7 +845,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
             layer.small_m_tiled_weight = prepare_tiled_weight(layer.weight.data)
         layer.small_m_rowmajor = (
             _is_gfx95
-            and envs.SGLANG_MUSE_DENSE_TILED.get()
+            and envs.SGLANG_ROCM_MUSE_DENSE_TILED.get()
             and type(layer.weight.data) is torch.Tensor
             and tuple(layer.weight.shape) in _gfx950_rowmajor_weight_shapes
         )
@@ -853,7 +853,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
         layer.small_m_fp8_weight = (
             quantize_fp8w_weight(layer.weight.data)
             if _is_gfx95
-            and envs.SGLANG_MUSE_DENSE_FP8.get()
+            and envs.SGLANG_ROCM_MUSE_DENSE_FP8.get()
             and type(layer.weight.data) is torch.Tensor
             and tuple(layer.weight.shape) in _gfx950_fp8w_weight_shapes
             else None
