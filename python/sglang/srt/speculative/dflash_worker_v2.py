@@ -388,11 +388,12 @@ class DFlashWorkerV2(BaseSpecWorker):
     """DFLASH speculative decoding worker (spec-v2).
 
     Drives both overlap and non-overlap scheduling, same as EAGLE: the
-    scheduler runs it synchronously when overlap is disabled.
+    scheduler runs it synchronously when overlap is disabled. On a pipelined
+    PD prefill, non-last PP stages run only the target; draft state belongs to
+    the last stage.
     """
 
-    # Without pipeline parallelism every worker hosts the draft; __init__ narrows
-    # this to the last PP stage of a pipelined PD prefill.
+    # __init__ narrows this to the last PP stage.
     _hosts_draft: bool = True
 
     def weight_update_runners(self) -> List[Tuple[str, "ModelRunner"]]:
@@ -702,7 +703,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         # Every attn backend a spec_v2 forward touches; consumed by
         # decide_needs_cpu_seq_lens to gate the seq_lens_cpu D2H.
         if not self._hosts_draft:
-            return (self._target_worker.model_runner.attn_backend,)
+            return super().spec_v2_attn_backends
         return (
             self._target_worker.model_runner.attn_backend,
             self.draft_model_runner.attn_backend,
