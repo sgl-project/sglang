@@ -1,0 +1,56 @@
+{
+  "configs": {
+    "reduce_scatter": {
+      "8": {
+        "strategy": "push",
+        "num_blocks": 128,
+        "block_size": 128
+      },
+      "64": {
+        "strategy": "push",
+        "num_blocks": 128,
+        "block_size": 128
+      },
+      "512": {
+        "strategy": "push",
+        "num_blocks": 128,
+        "block_size": 512
+      },
+      "1025": {
+        "strategy": "nccl"
+      }
+    },
+    "all_gather": {
+      "8": {
+        "strategy": "push",
+        "num_blocks": 64,
+        "block_size": 128
+      },
+      "64": {
+        "strategy": "push",
+        "num_blocks": 128,
+        "block_size": 512
+      },
+      "512": {
+        "strategy": "direct",
+        "num_blocks": 4,
+        "block_size": 512
+      },
+      "1025": {
+        "strategy": "nccl"
+      }
+    },
+    "attn_res_all_gather": {
+      "1": {
+        "strategy": "separate"
+      },
+      "512": {
+        "strategy": "fused_direct",
+        "max_blocks": 64
+      },
+      "1025": {
+        "strategy": "separate"
+      }
+    }
+  }
+}

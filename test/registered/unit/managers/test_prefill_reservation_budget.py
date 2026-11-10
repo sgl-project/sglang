@@ -25,7 +25,14 @@ class _Budget:
         return chunk_limit
 
     def fit_chunk(
-        self, *, extend_input_len, max_new_tokens, chunk_limit, state_slots=0
+        self,
+        req,
+        *,
+        extend_input_len,
+        max_new_tokens,
+        chunk_limit,
+        state_slots=0,
+        chunk_align=None,
     ):
         assert state_slots == 0
         return chunk_limit
@@ -75,10 +82,12 @@ class TestPrefillReservationBudget(unittest.TestCase):
         adder.page_size = page
         adder.logical_page_size = page
         adder.mamba_chunk_grid = 1
+        adder.strict_chunk_grid = False
         adder.dllm_config = None
         adder.rem_input_tokens = input_budget
         adder.rem_chunk_tokens = chunk_budget
         adder.chunked_req_limit = None
+        adder.chunked_req_waits = False
         adder.kv_shard_granule = granule
         adder.prefill_delayer_single_pass = None
         adder.memory_budget = _Budget()
@@ -345,7 +354,7 @@ class TestPrefillReservationBudget(unittest.TestCase):
                 req,
                 total_tokens=1024,
                 host_hit_length=0,
-                swa_host_hit_length=0,
+                window_host_hit_lengths={},
                 truncation_align_size=None,
                 has_chunked_req=True,
             )

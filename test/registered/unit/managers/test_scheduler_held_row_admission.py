@@ -73,6 +73,7 @@ class TestHeldRowAdmission(CustomTestCase):
         s.chunked_reqs = IndexedReqList(ListKind.CHUNKED)
         s.chunked_req = final_chunk
         s.min_free_slots_delayer = None
+        s.invariant_checker = Mock()
         s.policy = Mock(calc_priority=lambda waiting, *args, **kwargs: list(waiting))
         s.policy.shortest_prefill_chunk_limit.return_value = None
         s.processed_tokens_counter = 0
@@ -82,6 +83,7 @@ class TestHeldRowAdmission(CustomTestCase):
             model_runner=SimpleNamespace(attn_backend=SimpleNamespace())
         )
         s.get_prefill_adder_class = lambda: _Adder
+        s.request_retirer = None
         s.page_size = 1
         s.tree_cache = SimpleNamespace(
             buffer_pipeline=None, storage_prefetch_retries=None
@@ -97,8 +99,10 @@ class TestHeldRowAdmission(CustomTestCase):
         s.enable_lora = False
         s.disaggregation_mode = disaggregation_mode
         s.disagg_prefill_bootstrap_queue = None
+        s.disagg_prefill_transfer_queue = []
         s.enable_hicache_storage = False
         s.enable_lmcache = False
+        s.enable_unified_cache_external_linker = False
         s.truncation_align_size = None
         s.model_config = None
         s.enable_overlap = False
