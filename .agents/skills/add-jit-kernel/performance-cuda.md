@@ -6,6 +6,8 @@
 
 ## Estimate before implementing
 
+**Start from the best existing implementation, not the one in front of you.** Before optimizing a kernel, time every other implementation of the same contract on the dispatched shapes and compare each with the bound below. When another is already near the bound, migrating the callers and deleting the old kernel is the optimization (kernel-organization, "One implementation per contract").
+
 Classify each shape bucket the kernel serves, including padded sizes (CUDA-graph batch padding), as low latency or high throughput.
 
 **Low latency** (under one wave, or a few CTAs per SM). Time is dominated by dependency chains, not bandwidth:
