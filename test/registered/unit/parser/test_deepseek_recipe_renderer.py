@@ -251,6 +251,21 @@ class TestDeepSeekRecipe(CustomTestCase):
                 )
                 self.assertEqual(full_ids[: len(prefix_ids) - 2], prefix_ids[:-2])
 
+    def test_v4_rejects_tools_declared_in_messages(self):
+        """V4's encoding has no place for message-declared tools and would drop them."""
+        tool = {"type": "function", "function": {"name": "f"}}
+        with self.assertRaisesRegex(ValueError, "tools declared in messages"):
+            renderer.DeepSeekRecipe("dsv4", self.tokenizer).encode(
+                {
+                    "messages": [
+                        {"role": "system", "content": "", "tools": [tool]},
+                        {"role": "user", "content": "x"},
+                    ],
+                    "thinking": False,
+                    "tool_choice": "auto",
+                }
+            )
+
     def test_api_validation_surfaces_as_value_error(self):
         with self.assertRaises(ValueError):
             self.deepseek_recipe.encode(

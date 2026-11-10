@@ -296,6 +296,70 @@ class TestHandlerRequestSemantics(CustomTestCase):
             [image.url for image in processed.image_data], [urls["a"], urls["b"]]
         )
 
+    def test_message_tools_render_where_declared(self):
+        """Tools a system or developer message declares reach the prompt at that
+        message, as the parser expects, unless tool_choice hides them."""
+        from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
+
+        chat = _serving(self, self.tokenizer)
+        search, ticket = (
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": f"{name} tool",
+                    "parameters": {"type": "object"},
+                },
+            }
+            for name in ("search_docs", "create_ticket")
+        )
+        history = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+        ]
+        declaration = {"role": "developer", "content": None, "tools": [ticket]}
+        ask = "<｜User｜>file it"
+
+        def prompt(messages, tools=(search,), tool_choice="auto"):
+            request = ChatCompletionRequest(
+                messages=[*history, *messages, {"role": "user", "content": "file it"}],
+                tools=list(tools) or None,
+                tool_choice=tool_choice,
+                chat_template_kwargs={"thinking": True, "reasoning_effort": 30},
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {"name": "ticket", "schema": {"type": "object"}},
+                },
+            )
+            return self.tokenizer.decode(
+                chat._process_messages(request, False).prompt_ids
+            )
+
+        declared = prompt([]).replace(
+            ask,
+            "<｜System｜>\n\n### Updated Tool Schemas\n\n"
+            + json.dumps(ticket["function"])
+            + ask,
+        )
+        self.assertEqual(prompt([declaration]), declared)
+        # SGLang accepts a tool without its type.
+        untyped = {**declaration, "tools": [{"function": ticket["function"]}]}
+        self.assertEqual(prompt([untyped]), declared)
+        # Without request tools the opening block still teaches the call format.
+        self.assertEqual(
+            prompt([declaration], tools=()),
+            declared.replace(json.dumps(search["function"]), ""),
+        )
+        for choice in (
+            "none",
+            {"type": "function", "function": {"name": "search_docs"}},
+        ):
+            with self.subTest(tool_choice=choice):
+                self.assertEqual(
+                    prompt([declaration], tool_choice=choice),
+                    prompt([], tool_choice=choice),
+                )
+
     def test_request_reaches_the_engine_with_sglang_semantics(self):
         from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 

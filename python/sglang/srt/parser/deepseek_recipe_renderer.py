@@ -7,6 +7,7 @@ import copy
 import functools
 import json
 import logging
+import uuid
 from types import ModuleType
 from typing import Any, Optional, Union
 
@@ -105,6 +106,115 @@ def _error_message(body: Any) -> str:
         return str(body)
 
 
+def _shown_tools(message: dict[str, Any], tool_choice: Any) -> list[dict[str, Any]]:
+    if tool_choice == "none" or message["role"] != "system":
+        return []
+    tools = message.get("tools") or []
+    if isinstance(tool_choice, dict):
+        name = tool_choice["function"]["name"]
+        return [tool for tool in tools if tool["function"]["name"] == name]
+    return tools
+
+
+def _take_message_tools(
+    messages: list[dict[str, Any]], tool_choice: Any
+) -> tuple[list[dict[str, Any]], list[tuple[str, str, list[dict[str, Any]]]]]:
+    """Brackets each declaring message with marker system messages, which conversion
+    keeps even when it drops an empty declaring message."""
+    token = uuid.uuid4().hex
+    rewritten, declarations = [], []
+    for index, message in enumerate(messages):
+        tools = _shown_tools(message, tool_choice)
+        message = {key: value for key, value in message.items() if key != "tools"}
+        if not tools:
+            rewritten.append(message)
+            continue
+        opening = f"<sglang message tools {token} {index}>"
+        closing = f"</sglang message tools {token} {index}>"
+        rewritten += [
+            {"role": "system", "content": opening},
+            message,
+            {"role": "system", "content": closing},
+        ]
+        declarations.append((opening, closing, tools))
+    return rewritten, declarations
+
+
+def _marker_index(messages: list[Any], marker: str) -> int:
+    for index, message in enumerate(messages):
+        if message.role == "system" and message.content == marker:
+            return index
+    raise ValueError("deepseek-recipe dropped a message that declares tools")
+
+
+def _declaring_message(message: Optional[Any], tools: list[Any]) -> Any:
+    """`message` is None when conversion dropped it for its empty content."""
+    recipe = load_deepseek_recipe()
+    if message is None:
+        return recipe.SystemMessage("", tools=tools)
+    # The constructor re-derives image placeholders from the token's spellings.
+    if message.image_sources and message.content.count(IMAGE_TOKEN) != len(
+        message.image_sources
+    ):
+        raise ValueError(
+            f"a message that declares tools cannot spell {IMAGE_TOKEN} as text"
+        )
+    return recipe.SystemMessage(
+        message.content,
+        image_sources=message.image_sources,
+        tools=tools,
+        image_token=IMAGE_TOKEN,
+    )
+
+
+def _declare_message_tools(
+    conversation: Any, declarations: list[tuple[str, str, list[dict[str, Any]]]]
+) -> Any:
+    """Deferred tools render only where a system message declares them; the opening
+    tools block keeps the call format even when every tool is deferred."""
+    recipe = load_deepseek_recipe()
+    declared = {
+        tool["function"]["name"] for _, _, tools in declarations for tool in tools
+    }
+    tools = [
+        (
+            recipe.ToolDefinition(
+                name=tool.name,
+                description=tool.description,
+                parameters=tool.parameters,
+                strict=tool.strict,
+                defer_loading=True,
+            )
+            if tool.name in declared
+            else tool
+        )
+        for tool in conversation.tools
+    ]
+    by_name = {tool.name: tool for tool in tools}
+    messages = list(conversation.messages)
+    for opening, closing, declaration in declarations:
+        start = _marker_index(messages, opening)
+        end = _marker_index(messages, closing)
+        kept = messages[start + 1 : end]
+        messages[start : end + 1] = [
+            _declaring_message(
+                kept[0] if kept else None,
+                tools=[by_name[tool["function"]["name"]] for tool in declaration],
+            )
+        ]
+    response_format = conversation.response_format
+    return recipe.Conversation(
+        messages,
+        thinking_mode=conversation.thinking_mode,
+        tools=tools,
+        tool_choice=conversation.tool_choice,
+        reasoning_effort=conversation.reasoning_effort,
+        response_format="json_object" if response_format == "json_object" else "text",
+        response_schema=conversation.response_schema,
+        response_regex=conversation.response_regex,
+    )
+
+
 class DeepSeekRecipe:
     """`tokenizer` is the checkpoint's `tokenizers.Tokenizer`; recipe encodes prompts
     with its own copy of it, and the SGLang extensions splice ids from the original."""
@@ -184,11 +294,29 @@ class DeepSeekRecipe:
         normalized["model"] = self.model
         if effort_budget is not None:
             normalized["reasoning_effort"] = BUDGET_TIER
+        normalized["messages"], declarations = _take_message_tools(
+            normalized["messages"], tool_choice=body.get("tool_choice")
+        )
+        if declarations:
+            if self.model == MODEL_NAMES["dsv4"]:
+                raise ValueError(
+                    "DeepSeek-V4 cannot render tools declared in messages; declare "
+                    "them in the request's tools"
+                )
+            # Conversion validates and normalizes the declared tools; recipe requires
+            # the type that SGLang defaults and the wire dump omits.
+            normalized["tools"] = normalized.get("tools", []) + [
+                {"type": "function", **tool}
+                for _, _, tools in declarations
+                for tool in tools
+            ]
         try:
             converted = recipe.ChatCompletionRequest(normalized).convert(self._options)
         except recipe.ConversionError as error:
             raise ValueError(_error_message(error.body)) from error
-        return converted.conversation
+        if not declarations:
+            return converted.conversation
+        return _declare_message_tools(converted.conversation, declarations)
 
     def encode_conversation(
         self, conversation: Any, *, effort_budget: Optional[int] = None
