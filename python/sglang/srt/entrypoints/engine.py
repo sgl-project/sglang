@@ -1775,7 +1775,7 @@ class Engine(EngineScoreMixin, EngineBase):
     ):
         """Update weights from distributed source. If there are going to be more updates, set `flush_cache` to be false
         to avoid duplicated cache cleaning operation."""
-        serialized_named_tensors = self._serialize_tensors_per_rank(
+        serialized_named_tensors = self.serialize_tensors_per_rank(
             named_tensors, load_format
         )
         obj = UpdateWeightsFromTensorReqInput(
@@ -1828,7 +1828,7 @@ class Engine(EngineScoreMixin, EngineBase):
             self.tokenizer_manager.get_weights_by_name(obj, None)
         )
 
-    def _serialize_tensors_per_rank(
+    def serialize_tensors_per_rank(
         self,
         tensors,
         load_format: Optional[str],
@@ -1855,9 +1855,7 @@ class Engine(EngineScoreMixin, EngineBase):
         config_dict: Dict,
         load_format: Optional[str] = None,
     ):
-        serialized_named_tensors = self._serialize_tensors_per_rank(
-            tensors, load_format
-        )
+        serialized_named_tensors = self.serialize_tensors_per_rank(tensors, load_format)
         lora_req = LoadLoRAAdapterFromTensorsReqInput(
             lora_name=lora_name,
             config_dict=config_dict,

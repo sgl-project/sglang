@@ -182,6 +182,16 @@ def _lora_load_needs_cleanup(results: List[LoRAUpdateOutput], lora_name: str) ->
     )
 
 
+def check_one_payload_per_engine_rank(payloads: List[bytes]) -> None:
+    parallel = get_parallel()
+    expected = parallel.tp_size * parallel.pp_size
+    if len(payloads) != expected:
+        raise ValueError(
+            "serialized_named_tensors must hold one payload per engine rank "
+            f"(tp_size * pp_size = {expected}), got {len(payloads)}"
+        )
+
+
 class TokenizerControlMixin:
     """Mixin for TokenizerManager's control-plane operations (weights, cache, lora,
     profile, internal state, etc.) -- everything that talks to the scheduler via
@@ -604,6 +614,10 @@ class TokenizerControlMixin:
         obj.serialized_named_tensors = normalize_serialized_named_tensor_payloads(
             obj.serialized_named_tensors
         )
+        try:
+            check_one_payload_per_engine_rank(obj.serialized_named_tensors)
+        except ValueError as e:
+            return False, str(e)
 
         async with self.is_pause_cond:
             is_paused = self.is_pause
@@ -794,6 +808,7 @@ class TokenizerControlMixin:
             obj.serialized_named_tensors = normalize_serialized_named_tensor_payloads(
                 obj.serialized_named_tensors
             )
+            check_one_payload_per_engine_rank(obj.serialized_named_tensors)
 
             async with self.lora_update_lock:
                 if obj.lora_name in self.pending_lora_unloads:
