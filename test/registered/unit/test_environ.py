@@ -16,8 +16,9 @@ register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 
 # The first HARD_GATED children are EnvRuntimeBool: the master is a hard gate.
-HARD_GATED = 0
+HARD_GATED = 1
 NV_MEGA_RUNTIME_CHILDREN = (
+    "SGLANG_OPT_MULTI_CTA_VERIFY_TREE_SAMPLING",
     "SGLANG_DSPARK_FUSED_ACCEPT_TAIL",
     "SGLANG_DSPARK_DEFER_CONTEXT_KV",
     "SGLANG_OPT_DSV41_DSPARK_DRAFT_PREP_FORK",
