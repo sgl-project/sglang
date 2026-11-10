@@ -57,6 +57,9 @@ class AllreduceTuneTable:
                 codecs.append(codec)
         return tuple(codecs)
 
+    def has_backend(self, name: str) -> bool:
+        return any(row.backend == name for row in self.rows)
+
     def backend_for(self, nbytes: int, dtype: str) -> str:
         key = (nbytes, dtype)
         cached = self._cache.get(key)
@@ -83,6 +86,14 @@ def parse_tune_backend(backend: str) -> Optional[str]:
     """
     if backend == "custom_allreduce":
         return "ca"
+    if backend == "sglang_custom_allreduce":
+        return "sglang_ca"
+    if backend == "aiter_custom_allreduce":
+        return "aiter_ca"
+    if backend == "custom_allreduce_v2":
+        # SGLang's JIT custom all-reduce. On ROCm it is opt-in and has
+        # configs for gfx950 (MI355) and gfx1250 (Helios).
+        return "car_v2"
     if backend == "nccl":
         return "nccl"
     if backend == "torch_symm_mem":

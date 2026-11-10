@@ -29,8 +29,23 @@ def create_parser():
         "--use-aiter-allreduce",
         action="store_true",
         help=(
-            "With --allreduce, time AITER's custom all-reduce. That is the "
-            "class the ROCm server runs for a custom_allreduce row."
+            "Accepted for older commands. SGLang custom all-reduce, AITER, "
+            "and custom all-reduce v2 are all timed."
+        ),
+    )
+    parser.add_argument(
+        "--use-car-v2",
+        action="store_true",
+        help=(
+            "Accepted for older commands. Custom all-reduce v2 is always timed."
+        ),
+    )
+    parser.add_argument(
+        "--ignore-acr-max-size",
+        action="store_true",
+        help=(
+            "With --allreduce and --use-aiter-allreduce, ignore "
+            "AITER_CUSTOM_AR_MAX_SIZE."
         ),
     )
     parser.add_argument(
@@ -95,6 +110,8 @@ def auto_tune(args: argparse.Namespace, extra_argv: Optional[list] = None):
             qr_quants=args.qr_quant,
             use_aiter_allreduce=args.use_aiter_allreduce,
             qr_cast_bf16_to_fp16=bool(args.qr_cast_bf16_to_fp16),
+            use_car_v2=args.use_car_v2,
+            ignore_acr_max_size=args.ignore_acr_max_size,
         )
         allreduce_end = time.perf_counter()
         print(f"\nAllreduce tuning took {allreduce_end - allreduce_start:.2f}s")

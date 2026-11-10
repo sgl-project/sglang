@@ -488,6 +488,9 @@ class GroupCoordinator:
             )
 
         self.ca_comm: Optional[Any] = None
+        self.ca_v2_comm: Optional[Any] = None
+        self.ca_sglang_comm: Optional[Any] = None
+        self.ca_aiter_comm: Optional[Any] = None
         self.qr_comm: Optional[QuickAllReduce] = None
         self.qr_by_quant: Dict[str, QuickAllReduce] = {}
         self.allreduce_tune = None
@@ -535,6 +538,82 @@ class GroupCoordinator:
                     f"Setup Custom allreduce failed with {e}. To silence this "
                     "warning, specify --disable-custom-all-reduce explicitly."
                 )
+
+            if (
+                self.allreduce_tune is not None
+                and self.allreduce_tune.has_backend("custom_allreduce_v2")
+            ):
+                try:
+                    from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
+                        CustomAllReduceV2,
+                    )
+
+                    self.ca_v2_comm = CustomAllReduceV2(
+                        group=self.cpu_group,
+                        device=self.device,
+                    )
+                    if self.ca_v2_comm.disabled:
+                        logger.info(
+                            "[AR] Tune table selects custom_allreduce_v2, "
+                            "but CustomAllReduceV2 is disabled on this group."
+                        )
+                        self.ca_v2_comm = None
+                    else:
+                        logger.info(
+                            "[AR] CustomAllReduceV2 opened for tune-table rows"
+                        )
+                except Exception as e:
+                    logger.warning(f"Setup CustomAllReduceV2 failed with {e}.")
+
+            if (
+                self.allreduce_tune is not None
+                and self.allreduce_tune.has_backend("sglang_custom_allreduce")
+            ):
+                try:
+                    from sglang.srt.distributed.device_communicators.custom_all_reduce import (
+                        CustomAllreduce,
+                    )
+
+                    self.ca_sglang_comm = CustomAllreduce(
+                        group=self.cpu_group, device=self.device
+                    )
+                    if self.ca_sglang_comm.disabled:
+                        self.ca_sglang_comm = None
+                        logger.info(
+                            "[AR] Tune table selects sglang_custom_allreduce, "
+                            "but it is disabled on this group."
+                        )
+                    else:
+                        logger.info(
+                            "[AR] SGLang CustomAllreduce opened for tune-table rows"
+                        )
+                except Exception as e:
+                    logger.warning(f"Setup SGLang CustomAllreduce failed with {e}.")
+
+            if (
+                self.allreduce_tune is not None
+                and self.allreduce_tune.has_backend("aiter_custom_allreduce")
+            ):
+                aiter_comm = self.ca_comm
+                aiter_module = getattr(type(aiter_comm), "__module__", "") if aiter_comm else ""
+                if "aiter" in aiter_module and not getattr(aiter_comm, "disabled", True):
+                    self.ca_aiter_comm = aiter_comm
+                else:
+                    try:
+                        from aiter.dist.device_communicators.custom_all_reduce import (
+                            CustomAllreduce as AiterCustomAllreduce,
+                        )
+
+                        self.ca_aiter_comm = AiterCustomAllreduce(
+                            group=self.cpu_group, device=self.device
+                        )
+                        if getattr(self.ca_aiter_comm, "disabled", True):
+                            self.ca_aiter_comm = None
+                    except Exception as e:
+                        logger.warning(f"Setup AITER CustomAllreduce failed with {e}.")
+                        self.ca_aiter_comm = None
+                if self.ca_aiter_comm is not None:
+                    logger.info("[AR] AITER custom all-reduce opened for tune-table rows")
 
             if self.use_quick_allreduce and is_hip():
                 try:
@@ -1023,6 +1102,30 @@ class GroupCoordinator:
                 and comm.should_custom_ar(input_)
             ):
                 return "ca"
+        if method == "sglang_ca":
+            comm = self.ca_sglang_comm
+            if (
+                comm is not None
+                and not comm.disabled
+                and comm.should_custom_ar(input_)
+            ):
+                return "sglang_ca"
+        if method == "aiter_ca":
+            comm = self.ca_aiter_comm
+            if (
+                comm is not None
+                and not comm.disabled
+                and comm.should_custom_ar(input_)
+            ):
+                return "aiter_ca"
+        if method == "car_v2":
+            comm = self.ca_v2_comm
+            if (
+                comm is not None
+                and not comm.disabled
+                and comm.should_custom_ar(input_)
+            ):
+                return "car_v2"
         elif method == "torch_symm_mem":
             comm = self.torch_symm_mem_comm
             if (
@@ -1155,10 +1258,30 @@ class GroupCoordinator:
         qr_comm = self.qr_comm
         pymscclpp_comm = self.pymscclpp_comm
         torch_symm_mem_comm = self.torch_symm_mem_comm
-        assert any([qr_comm, ca_comm, pymscclpp_comm, torch_symm_mem_comm, pynccl_comm])
+        assert any(
+            [
+                qr_comm,
+                ca_comm,
+                self.ca_v2_comm,
+                self.ca_sglang_comm,
+                self.ca_aiter_comm,
+                pymscclpp_comm,
+                torch_symm_mem_comm,
+                pynccl_comm,
+            ]
+        )
         if outplace_all_reduce_method == "ca":
             assert not ca_comm.disabled
             out = ca_comm.custom_all_reduce(input_)
+        elif outplace_all_reduce_method == "sglang_ca":
+            assert self.ca_sglang_comm is not None and not self.ca_sglang_comm.disabled
+            out = self.ca_sglang_comm.custom_all_reduce(input_)
+        elif outplace_all_reduce_method == "aiter_ca":
+            assert self.ca_aiter_comm is not None and not self.ca_aiter_comm.disabled
+            out = self.ca_aiter_comm.custom_all_reduce(input_)
+        elif outplace_all_reduce_method == "car_v2":
+            assert self.ca_v2_comm is not None and not self.ca_v2_comm.disabled
+            out = self.ca_v2_comm.custom_all_reduce(input_)
         elif outplace_all_reduce_method == "qr" or (
             isinstance(outplace_all_reduce_method, str)
             and outplace_all_reduce_method.startswith("qr:")

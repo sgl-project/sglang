@@ -52,10 +52,26 @@ def create_parser() -> argparse.ArgumentParser:
         "--use-aiter-allreduce",
         action="store_true",
         help=(
-            "Time AITER's custom all-reduce as the custom_allreduce backend. "
-            "This is the class the ROCm server dispatches. Without this flag "
-            "the tuner times sglang's own CustomAllreduce, which is a "
-            "different kernel."
+            "Accepted for older commands. SGLang custom all-reduce, AITER, "
+            "and custom all-reduce v2 are all timed; this flag does not "
+            "turn the others off."
+        ),
+    )
+    parser.add_argument(
+        "--use-car-v2",
+        action="store_true",
+        help=(
+            "Accepted for older commands. Custom all-reduce v2 is always "
+            "timed next to SGLang's custom all-reduce and AITER."
+        ),
+    )
+    parser.add_argument(
+        "--ignore-acr-max-size",
+        action="store_true",
+        help=(
+            "Ignore AITER_CUSTOM_AR_MAX_SIZE and time AITER up to its "
+            "registered pool. SGLang custom all-reduce and v2 keep their "
+            "own cutoffs. The server keeps its own cutoff."
         ),
     )
     parser.add_argument(
@@ -202,6 +218,8 @@ def main(argv: list[str] | None = None) -> None:
             qr_ignore_max_size=args.ignore_size_bounds,
             use_aiter_allreduce=args.use_aiter_allreduce,
             qr_cast_bf16_to_fp16=bool(args.qr_cast_bf16_to_fp16),
+            use_car_v2=args.use_car_v2,
+            ignore_acr_max_size=args.ignore_acr_max_size,
         )
         if rank == 0:
             print_allreduce_summary(results)

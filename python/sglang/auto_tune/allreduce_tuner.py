@@ -5,6 +5,7 @@ model and TP configuration.
 
 Supported backends:
 - custom_allreduce: sglang's own all-reduce, or AITER's when --use-aiter-allreduce is set. The ROCm server dispatches AITER.
+- custom_allreduce_v2: SGLang CustomAllReduceV2, with --use-car-v2. ROCm configs cover MI355 and Helios.
 - nccl: standard NCCL allreduce
 - torch_symm_mem: torch symmetric memory all-gather + reduce
 - quick_allreduce_<codec>: AMD QuickReduce. Default codec is INT4. With the default cast, the timed call converts bf16 to fp16 inside that kernel.
@@ -157,8 +158,46 @@ def _class_qualname(cls) -> str:
     )
 
 
+def _relax_aiter_size_cap(car) -> str:
+    """Ignore AITER_CUSTOM_AR_MAX_SIZE. The registered pool still bounds the call.
+
+    The cutoff is read once, into ``_car_max_size``, when the communicator is
+    built. Raising that attribute is enough for a build that has it. An older
+    build bakes 64 MiB into ``should_custom_ar``; the wrapper below keeps the
+    other gates and compares against the pool instead.
+    """
+    pool = int(getattr(car, "max_size", 0) or 0)
+    if hasattr(car, "_car_max_size") and pool > 0:
+        car._car_max_size = pool
+        return f"AITER_CUSTOM_AR_MAX_SIZE ignored; cutoff is the {pool}B pool"
+    from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import (
+        is_weak_contiguous,
+    )
+
+    original = getattr(car, "should_custom_ar", None)
+    if original is None or pool <= 0:
+        return "AITER size cap left unchanged; this build has no cutoff to lift"
+
+    def should(inp, prefill_support=False):
+        if original(inp, prefill_support=prefill_support):
+            return True
+        if getattr(car, "disabled", True):
+            return False
+        nbytes = inp.numel() * inp.element_size()
+        if nbytes % 16 != 0 or nbytes > pool or not is_weak_contiguous(inp):
+            return False
+        if not (
+            getattr(car, "world_size", 0) == 2 or getattr(car, "fully_connected", False)
+        ):
+            return False
+        return True
+
+    car.should_custom_ar = should
+    return f"AITER policy cutoff bypassed; cutoff is the {pool}B pool"
+
+
 def _open_custom_allreduce(
-    cpu_group, device, ignore_max_size=False, use_aiter=False
+    cpu_group, device, ignore_max_size=False, use_aiter=False, ignore_acr_max_size=False
 ):
     """Build one custom all-reduce and time it under the name ``custom_allreduce``.
 
@@ -170,21 +209,13 @@ def _open_custom_allreduce(
     ok = False
     try:
         if use_aiter:
-            from sglang.srt.distributed.device_communicators.custom_all_reduce import (
-                dispatch_custom_allreduce,
+            from aiter.dist.device_communicators.custom_all_reduce import (
+                CustomAllreduce as AiterCustomAllreduce,
             )
 
-            CAClass = dispatch_custom_allreduce(group=cpu_group, device=device)
-            opened = _class_qualname(CAClass)
-            if "aiter" not in opened:
-                logger.warning(
-                    "AITER custom all-reduce was requested, but this host "
-                    "resolved %s. The sglang class is not timed in its place.",
-                    opened,
-                )
-            else:
-                car = CAClass(group=cpu_group, device=device)
-                ok = not getattr(car, "disabled", True)
+            opened = _class_qualname(AiterCustomAllreduce)
+            car = AiterCustomAllreduce(group=cpu_group, device=device)
+            ok = not getattr(car, "disabled", True)
         else:
             from sglang.srt.distributed.device_communicators.custom_all_reduce import (
                 CustomAllreduce,
@@ -204,6 +235,10 @@ def _open_custom_allreduce(
         if car is not None and hasattr(car, "close"):
             car.close()
         return None
+
+    cap_note = ""
+    if use_aiter and ignore_acr_max_size:
+        cap_note = _relax_aiter_size_cap(car)
 
     supported = getattr(car, "_SUPPORTED_DTYPES", None) or torch_float_dtypes()
 
@@ -236,8 +271,54 @@ def _open_custom_allreduce(
         return _time_gpu_calls(timed, num_iters, num_warmup)
 
     run.impl = opened
+    run.note = cap_note
     close = car.close if hasattr(car, "close") else (lambda: None)
     return run, close
+
+
+def _open_car_v2(cpu_group, device):
+    """Time SGLang's CustomAllReduceV2.
+
+    On ROCm the server uses it only when SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2=1.
+    The class itself already carries the MI355 (gfx950) and Helios (gfx1250)
+    configs. A size its heuristic declines is skipped, the same way the server
+    would leave that size to the next backend.
+    """
+    car = None
+    ok = False
+    opened = ""
+    try:
+        from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
+            CustomAllReduceV2,
+        )
+
+        opened = _class_qualname(CustomAllReduceV2)
+        car = CustomAllReduceV2(group=cpu_group, device=device)
+        ok = not getattr(car, "disabled", True)
+    except Exception as e:
+        logger.warning("custom_allreduce_v2 failed: %s", e)
+    if not _agree(ok, cpu_group):
+        if car is not None and hasattr(car, "close"):
+            car.close()
+        return None
+
+    def run(tensor, num_iters, num_warmup=20):
+        if not car.should_custom_ar(tensor):
+            nbytes = tensor.numel() * tensor.element_size()
+            limit = getattr(car, "max_size", None)
+            extra = f" (workspace {limit}B)" if limit is not None else ""
+            raise _Rejected(f"{nbytes}B was declined by custom all-reduce v2{extra}")
+
+        def timed():
+            out = car.custom_all_reduce(tensor)
+            if out is None:
+                raise _Rejected("custom all-reduce v2 declined the tensor")
+            return out
+
+        return _time_gpu_calls(timed, num_iters, num_warmup)
+
+    run.impl = opened
+    return run, car.close if hasattr(car, "close") else (lambda: None)
 
 
 def torch_float_dtypes():
@@ -407,21 +488,37 @@ def _open_backends(
     qr_ignore_max_size: bool = False,
     use_aiter_allreduce: bool = False,
     qr_cast_bf16_to_fp16: bool = True,
+    use_car_v2: bool = False,
+    ignore_acr_max_size: bool = False,
 ) -> Dict[str, Any]:
     """Open every backend once, in the same order on every rank.
 
     Returns name -> (run, close). Backends that cannot start are left out.
     """
+    # All three custom all-reduces are separate entries. A flag does not
+    # drop the others: the run is a competition, and one winner is stored
+    # per size under that kernel's own name.
     openers = [
         (
-            "custom_allreduce",
+            "sglang_custom_allreduce",
             lambda: _open_custom_allreduce(
                 cpu_group,
                 device,
                 ignore_max_size=qr_ignore_max_size,
-                use_aiter=use_aiter_allreduce,
+                use_aiter=False,
             ),
         ),
+        (
+            "aiter_custom_allreduce",
+            lambda: _open_custom_allreduce(
+                cpu_group,
+                device,
+                ignore_max_size=False,
+                use_aiter=True,
+                ignore_acr_max_size=ignore_acr_max_size,
+            ),
+        ),
+        ("custom_allreduce_v2", lambda: _open_car_v2(cpu_group, device)),
         ("nccl", lambda: _open_nccl_allreduce(group, cpu_group, device)),
         ("torch_symm_mem", lambda: _open_torch_symm_mem(group, cpu_group, device)),
     ]
@@ -452,8 +549,11 @@ def _open_backends(
         backends[name] = opened
         if verbose:
             impl = getattr(opened[0], "impl", "")
+            note = getattr(opened[0], "note", "")
             suffix = f" ({impl})" if impl else ""
             print(f"  {name}: ready{suffix}", flush=True)
+            if note:
+                print(f"  {note}", flush=True)
     return backends
 
 
@@ -469,6 +569,8 @@ def tune_allreduce(
     qr_ignore_max_size: bool = False,
     use_aiter_allreduce: bool = False,
     qr_cast_bf16_to_fp16: bool = True,
+    use_car_v2: bool = False,
+    ignore_acr_max_size: bool = False,
 ) -> List[AllreduceConfig]:
     """Tune allreduce algorithm for the given model and TP size.
 
@@ -515,6 +617,8 @@ def tune_allreduce(
         qr_ignore_max_size=qr_ignore_max_size,
         use_aiter_allreduce=use_aiter_allreduce,
         qr_cast_bf16_to_fp16=qr_cast_bf16_to_fp16,
+        use_car_v2=use_car_v2,
+        ignore_acr_max_size=ignore_acr_max_size,
     )
     if verbose:
         print(f"  Backends: {', '.join(backends)}", flush=True)
@@ -531,8 +635,9 @@ def tune_allreduce(
             flush=True,
         )
         print(
-            "  custom_allreduce implementation: "
-            + ("aiter" if use_aiter_allreduce else "sglang"),
+            "  Kernels in this run: sglang custom all-reduce, AITER custom "
+            "all-reduce, and custom all-reduce v2. Each keeps its own size "
+            "cutoff. --ignore-acr-max-size lifts only AITER's.",
             flush=True,
         )
     dtype = model_config.get("dtype", torch.bfloat16)
@@ -636,6 +741,8 @@ def run_allreduce_tuning(
     qr_ignore_max_size: bool = False,
     use_aiter_allreduce: bool = False,
     qr_cast_bf16_to_fp16: bool = True,
+    use_car_v2: bool = False,
+    ignore_acr_max_size: bool = False,
 ) -> Dict[str, Any]:
     """Entry point for allreduce auto-tuning.
 
@@ -661,6 +768,8 @@ def run_allreduce_tuning(
         qr_ignore_max_size=qr_ignore_max_size,
         use_aiter_allreduce=use_aiter_allreduce,
         qr_cast_bf16_to_fp16=qr_cast_bf16_to_fp16,
+        use_car_v2=use_car_v2,
+        ignore_acr_max_size=ignore_acr_max_size,
     )
 
     if not results:
@@ -673,7 +782,9 @@ def run_allreduce_tuning(
         "ep_size": ep_size,
         "qr_quants": qr_quants,
         "qr_cast_bf16_to_fp16": int(qr_cast_bf16_to_fp16),
-        "custom_allreduce_impl": "aiter" if use_aiter_allreduce else "sglang",
+        "custom_allreduce_impl": "sglang+aiter+v2",
+        "use_car_v2": True,
+        "ignore_acr_max_size": bool(ignore_acr_max_size),
         "configs": [r.to_dict() for r in results],
     }
 
