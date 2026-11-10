@@ -12,10 +12,16 @@ from fastapi import HTTPException, Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 
 from sglang.srt.entrypoints.openai.encoding_dsv32 import DS32EncodingError
-from sglang.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingRequest
+from sglang.srt.entrypoints.openai.protocol import (
+    ChatCompletionRequest,
+    CompletionRequest,
+    ErrorResponse,
+    OpenAIServingRequest,
+)
+from sglang.srt.entrypoints.request_headers import resolve_request_priority
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.observability.req_time_stats import monotonic_time
-from sglang.srt.runtime_context import get_observability
+from sglang.srt.runtime_context import get_observability, get_schedule, get_serving
 from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
@@ -102,6 +108,15 @@ class OpenAIServingBase(ABC):
             adapted_request, processed_request = await loop.run_in_executor(
                 None, self._convert_to_internal_request, request, raw_request
             )
+
+            if isinstance(request, (ChatCompletionRequest, CompletionRequest)):
+                adapted_request.priority = resolve_request_priority(
+                    adapted_request.priority,
+                    raw_request.headers if raw_request is not None else None,
+                    body_priority_is_set="priority" in request.model_fields_set,
+                    enabled=get_schedule().enable_priority_scheduling
+                    and get_serving().allow_header_priority is not False,
+                )
 
             if isinstance(adapted_request, (GenerateReqInput, EmbeddingReqInput)):
                 # Only set timing fields if adapted_request supports them
