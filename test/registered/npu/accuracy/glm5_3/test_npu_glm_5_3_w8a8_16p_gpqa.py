@@ -101,12 +101,11 @@ class TestNPUGLM_5_3_W8A8_16P_GPQA(TestNpuAccuracyMultiNodePdMixTestCaseBase):
     max_retries = 1
     accuracy = 0.912
     datasets = ["gpqa_diamond"]
-    # Weekend nightly runs gpqa_diamond, weekday (Mon-Fri) runs gsm8k with a
-    # 200-sample cap; the nightly pipeline selects one through
+    # Weekend nightly runs gpqa_diamond (the dataset above, using `accuracy`),
+    # weekday (Mon-Fri) runs gsm8k with a 200-sample cap through
     # NPU_ACCURACY_DATASET. The gsm8k baseline starts ~5 points below the
     # official 97.2 and is tightened once nightly runs report the Ascend number.
     dataset_baselines = {
-        "gpqa_diamond": 0.912,
         "gsm8k": 0.92,
     }
     eval_batch_size = 32

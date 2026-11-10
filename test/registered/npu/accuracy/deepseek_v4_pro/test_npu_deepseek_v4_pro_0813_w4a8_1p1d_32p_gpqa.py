@@ -199,12 +199,11 @@ class TestNPUDeepSeekV4ProW4A8PDSEPGPQAHigh(TestNpuAccuracyMultiNodePdSepTestCas
     # (reference: Pro W4A8 GPQA Diamond baseline is 0.85).
     accuracy = 0.85
     datasets = ["gpqa_diamond"]
-    # Weekend nightly runs gpqa_diamond, weekday (Mon-Fri) runs gsm8k with a
-    # 200-sample cap, selected through NPU_ACCURACY_DATASET. The gsm8k baseline
-    # starts ~5 points below the official 96.8 and is tightened once nightly
-    # runs report the Ascend number.
+    # Weekend nightly runs gpqa_diamond (the dataset above, using `accuracy`),
+    # weekday (Mon-Fri) runs gsm8k with a 200-sample cap through
+    # NPU_ACCURACY_DATASET. The gsm8k baseline starts ~5 points below the
+    # official 96.8 and is tightened once nightly runs report the Ascend number.
     dataset_baselines = {
-        "gpqa_diamond": 0.85,
         "gsm8k": 0.92,
     }
     generation_config = DEEPSEEK_V4_PRO_W4A8_GENERATION_CONFIG_HIGH

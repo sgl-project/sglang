@@ -120,13 +120,19 @@ def apply_accuracy_dataset_override(test_cls):
     """Apply the dataset selected by the nightly pipeline on `test_cls`.
 
     No-op when NPU_ACCURACY_DATASET is unset (PR/full-test/manual runs keep the
-    dataset declared by the case itself). Cases opt in by declaring
-    `dataset_baselines`; a case without a baseline for the selected dataset
-    keeps its own dataset instead of failing, so enabling the pipeline-wide
-    override never breaks cases that have not been calibrated yet.
+    dataset declared by the case itself), or when it selects the dataset the
+    case already declares, whose baseline is `accuracy`. Cases opt in to the
+    other dataset by declaring its baseline in `dataset_baselines`; a case
+    without one keeps its own dataset instead of failing, so enabling the
+    pipeline-wide override never breaks cases that have not been calibrated yet.
     """
     dataset = os.environ.get(ACCURACY_DATASET_ENV, "").strip()
     if not dataset:
+        return
+
+    # Selecting the dataset the case already declares is a no-op: `accuracy`
+    # is its baseline.
+    if dataset in (getattr(test_cls, "datasets", None) or []):
         return
 
     baselines = getattr(test_cls, "dataset_baselines", None) or {}
@@ -146,10 +152,13 @@ def apply_accuracy_dataset_override(test_cls):
     test_cls.datasets = [dataset]
     test_cls.accuracy = baselines[dataset]
     test_cls.limit = limits.get(dataset, test_cls.limit)
-    # dataset_args (answer filters / system prompts) are dataset-specific; keep
-    # only the entry matching the selected dataset.
-    if getattr(test_cls, "dataset_args", None):
-        test_cls.dataset_args = test_cls.dataset_args.get(dataset)
+    # dataset_args is keyed by dataset name (the evalscope format); keep only
+    # the entry of the selected dataset.
+    dataset_args = getattr(test_cls, "dataset_args", None)
+    if dataset_args:
+        test_cls.dataset_args = (
+            {dataset: dataset_args[dataset]} if dataset in dataset_args else None
+        )
     logger.info(
         f"[accuracy-dataset] {ACCURACY_DATASET_ENV}={dataset}: "
         f"datasets={test_cls.datasets} accuracy={test_cls.accuracy} "
